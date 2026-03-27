@@ -1,0 +1,20 @@
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+  tuning:
+    profile: safe
+
+exports:
+  - name: content_items_full
+    query: >
+      SELECT id, title, body, raw_html, metadata::text as metadata,
+             tags, author_name, author_email, source_url, category,
+             status, priority, view_count, comment_count, word_count,
+             language, published_at, updated_at, created_at,
+             extra_data::text as extra_data
+      FROM content_items
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/output

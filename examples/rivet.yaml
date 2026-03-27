@@ -1,0 +1,32 @@
+source:
+  type: postgres
+  url: "postgresql://user:password@localhost:5432/mydb"
+
+exports:
+  - name: users_full
+    query: "SELECT id, name, email, created_at FROM users"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: ./output
+
+  - name: orders_incremental
+    query: "SELECT id, user_id, total, status, updated_at FROM orders"
+    mode: incremental
+    cursor_column: updated_at
+    format: csv
+    destination:
+      type: s3
+      bucket: my-data-lake
+      prefix: exports/orders/
+      region: us-east-1
+
+  - name: products
+    query: "SELECT id, name, price, category FROM products"
+    mode: full
+    format: parquet
+    destination:
+      type: gcs
+      bucket: my-gcs-bucket
+      prefix: exports/products/

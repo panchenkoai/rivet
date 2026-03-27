@@ -1,0 +1,14 @@
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+  tuning:
+    profile: safe
+
+exports:
+  - name: pg_users_safe
+    query: "SELECT id, name, email, age, balance, is_active, created_at, updated_at FROM users"
+    mode: full
+    format: csv
+    destination:
+      type: local
+      path: ./dev/output

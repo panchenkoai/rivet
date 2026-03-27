@@ -1,0 +1,36 @@
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+
+exports:
+  - name: pg_users_csv
+    query: "SELECT id, name, email, age, balance, is_active, bio, created_at, updated_at FROM users"
+    mode: full
+    format: csv
+    destination:
+      type: local
+      path: ./dev/output
+
+  - name: pg_users_parquet
+    query: "SELECT id, name, email, age, balance, is_active, bio, created_at, updated_at FROM users"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/output
+
+  - name: pg_orders_csv
+    query: "SELECT id, user_id, product, quantity, price, status, notes, ordered_at, updated_at FROM orders"
+    mode: full
+    format: csv
+    destination:
+      type: local
+      path: ./dev/output
+
+  - name: pg_events_parquet
+    query: "SELECT id, user_id, event_type, payload::text as payload, ip_address, created_at FROM events"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/output

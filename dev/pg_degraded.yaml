@@ -1,0 +1,35 @@
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+  tuning:
+    profile: safe
+
+exports:
+  - name: page_views_incremental
+    query: >
+      SELECT id, session_id, user_id, url, referrer, user_agent,
+             ip_address, country_code, region, city, device_type,
+             browser, os, screen_width, screen_height,
+             viewport_width, viewport_height, page_load_ms,
+             dom_ready_ms, time_on_page_ms, scroll_depth_pct,
+             click_count, is_bounce, utm_source, utm_medium,
+             utm_campaign, created_at
+      FROM page_views
+    mode: incremental
+    cursor_column: created_at
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/output
+
+  - name: page_views_full
+    query: >
+      SELECT id, session_id, url, device_type, browser, os,
+             page_load_ms, time_on_page_ms, scroll_depth_pct,
+             is_bounce, created_at
+      FROM page_views
+    mode: full
+    format: csv
+    destination:
+      type: local
+      path: ./dev/output

@@ -1,0 +1,14 @@
+source:
+  type: mysql
+  url: "mysql://rivet:rivet@localhost:3306/rivet"
+  tuning:
+    profile: safe
+
+exports:
+  - name: mysql_users_safe
+    query: "SELECT id, name, email, age, balance, is_active, created_at, updated_at FROM users"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/output

@@ -1,0 +1,22 @@
+source:
+  type: mysql
+  url: "mysql://rivet:rivet@localhost:3306/rivet"
+
+exports:
+  - name: mysql_orders_incremental
+    query: "SELECT id, user_id, product, quantity, price, status, updated_at FROM orders"
+    mode: incremental
+    cursor_column: updated_at
+    format: csv
+    destination:
+      type: local
+      path: ./dev/output
+
+  - name: mysql_events_incremental
+    query: "SELECT id, user_id, event_type, ip_address, created_at FROM events"
+    mode: incremental
+    cursor_column: id
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/output
