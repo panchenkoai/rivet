@@ -1,0 +1,19 @@
+source:
+  type: mysql
+  url: "mysql://rivet:rivet@localhost:3306/rivet"
+  tuning:
+    profile: safe
+
+exports:
+  - name: mysql_content_items
+    query: >
+      SELECT id, title, body, raw_html,
+             tags, author_name, author_email, source_url, category,
+             status, priority, view_count, comment_count, word_count,
+             language, published_at, updated_at, created_at
+      FROM content_items
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/output

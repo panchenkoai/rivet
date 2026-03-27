@@ -8,6 +8,7 @@ pub struct SourceTuning {
     pub max_retries: u32,
     pub retry_backoff_ms: u64,
     pub lock_timeout_s: u64,
+    pub memory_threshold_mb: usize,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -18,7 +19,7 @@ pub enum TuningProfile {
     Safe,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 pub struct TuningConfig {
     pub profile: Option<TuningProfile>,
     pub batch_size: Option<usize>,
@@ -27,6 +28,7 @@ pub struct TuningConfig {
     pub max_retries: Option<u32>,
     pub retry_backoff_ms: Option<u64>,
     pub lock_timeout_s: Option<u64>,
+    pub memory_threshold_mb: Option<usize>,
 }
 
 impl SourceTuning {
@@ -44,6 +46,7 @@ impl SourceTuning {
             if let Some(v) = cfg.max_retries { tuning.max_retries = v; }
             if let Some(v) = cfg.retry_backoff_ms { tuning.retry_backoff_ms = v; }
             if let Some(v) = cfg.lock_timeout_s { tuning.lock_timeout_s = v; }
+            if let Some(v) = cfg.memory_threshold_mb { tuning.memory_threshold_mb = v; }
         }
 
         tuning
@@ -58,6 +61,7 @@ impl SourceTuning {
                 max_retries: 1,
                 retry_backoff_ms: 1_000,
                 lock_timeout_s: 0,
+                memory_threshold_mb: 0,
             },
             TuningProfile::Balanced => Self {
                 batch_size: 10_000,
@@ -66,6 +70,7 @@ impl SourceTuning {
                 max_retries: 3,
                 retry_backoff_ms: 2_000,
                 lock_timeout_s: 30,
+                memory_threshold_mb: 0,
             },
             TuningProfile::Safe => Self {
                 batch_size: 2_000,
@@ -74,6 +79,7 @@ impl SourceTuning {
                 max_retries: 5,
                 retry_backoff_ms: 5_000,
                 lock_timeout_s: 10,
+                memory_threshold_mb: 0,
             },
         }
     }

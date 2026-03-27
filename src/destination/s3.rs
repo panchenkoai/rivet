@@ -29,6 +29,17 @@ impl S3Destination {
             builder = builder.endpoint(endpoint);
         }
 
+        if let Some(env_name) = &config.access_key_env {
+            let key = std::env::var(env_name)
+                .map_err(|_| anyhow::anyhow!("env var '{}' not set for S3 access key", env_name))?;
+            builder = builder.access_key_id(&key);
+        }
+        if let Some(env_name) = &config.secret_key_env {
+            let secret = std::env::var(env_name)
+                .map_err(|_| anyhow::anyhow!("env var '{}' not set for S3 secret key", env_name))?;
+            builder = builder.secret_access_key(&secret);
+        }
+
         let op = Operator::new(builder)?
             .layer(BlockingLayer::create()?)
             .finish()

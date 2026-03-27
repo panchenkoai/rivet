@@ -4,6 +4,7 @@ pub mod error;
 pub mod format;
 pub mod pipeline;
 pub mod preflight;
+pub mod resource;
 pub mod source;
 pub mod state;
 pub mod tuning;

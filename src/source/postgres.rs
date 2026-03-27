@@ -15,75 +15,24 @@ use crate::types::CursorState;
 
 pub struct PostgresSource {
     client: Client,
-    schema: Option<SchemaRef>,
-    columns_cache: Option<Vec<(String, Type)>>,
-    fetch_sql: Option<String>,
-    throttle_ms: u64,
-    batch_size: usize,
-    done: bool,
-    total_rows: usize,
-    pending_batch: Option<RecordBatch>,
 }
 
 impl PostgresSource {
     pub fn connect(url: &str) -> Result<Self> {
         let client = Client::connect(url, NoTls)?;
-        Ok(Self {
-            client,
-            schema: None,
-            columns_cache: None,
-            fetch_sql: None,
-            throttle_ms: 0,
-            batch_size: 0,
-            done: true,
-            total_rows: 0,
-            pending_batch: None,
-        })
-    }
-
-    fn fetch_rows_and_convert(&mut self) -> Result<Option<RecordBatch>> {
-        let fetch_sql = self.fetch_sql.as_ref().unwrap();
-        let rows = self.client.query(fetch_sql, &[])?;
-
-        if rows.is_empty() {
-            self.done = true;
-            return Ok(None);
-        }
-
-        if self.schema.is_none() {
-            let stmt_cols: Vec<(String, Type)> = rows[0]
-                .columns()
-                .iter()
-                .map(|c| (c.name().to_string(), c.type_().clone()))
-                .collect();
-            let s = Arc::new(pg_columns_to_schema(rows[0].columns()));
-            self.schema = Some(s);
-            self.columns_cache = Some(stmt_cols);
-        }
-
-        let row_count = rows.len();
-        self.total_rows += row_count;
-
-        let schema = self.schema.as_ref().unwrap();
-        let cols = self.columns_cache.as_ref().unwrap();
-        let batch = rows_to_record_batch_typed(schema, cols, &rows)?;
-
-        if row_count < self.batch_size {
-            self.done = true;
-        }
-
-        Ok(Some(batch))
+        Ok(Self { client })
     }
 }
 
 impl super::Source for PostgresSource {
-    fn begin_query(
+    fn export(
         &mut self,
         query: &str,
         cursor_column: Option<&str>,
         cursor: Option<&CursorState>,
         tuning: &SourceTuning,
-    ) -> Result<SchemaRef> {
+        sink: &mut dyn super::BatchSink,
+    ) -> Result<()> {
         let effective_query = build_query(query, cursor_column, cursor);
         log::info!("executing query: {}", effective_query);
 
@@ -106,56 +55,80 @@ impl super::Source for PostgresSource {
             effective_query
         ))?;
 
-        self.fetch_sql = Some(format!("FETCH {} FROM _rivet", tuning.batch_size));
-        self.throttle_ms = tuning.throttle_ms;
-        self.batch_size = tuning.batch_size;
-        self.done = false;
-        self.total_rows = 0;
-        self.schema = None;
-        self.columns_cache = None;
-        self.pending_batch = None;
+        let fetch_sql = format!("FETCH {} FROM _rivet", tuning.batch_size);
+        let mut schema: Option<SchemaRef> = None;
+        let mut columns_cache: Option<Vec<(String, Type)>> = None;
+        let mut total_rows: usize = 0;
 
-        // First fetch to discover schema
-        let first_batch = self.fetch_rows_and_convert()?;
-        let schema = self.schema.clone().unwrap_or_else(|| Arc::new(Schema::empty()));
-        self.pending_batch = first_batch;
+        loop {
+            let rows = self.client.query(&fetch_sql, &[])?;
+            if rows.is_empty() {
+                break;
+            }
 
-        Ok(schema)
-    }
+            if schema.is_none() {
+                let stmt_cols: Vec<(String, Type)> = rows[0]
+                    .columns()
+                    .iter()
+                    .map(|c| (c.name().to_string(), c.type_().clone()))
+                    .collect();
+                let s = Arc::new(pg_columns_to_schema(rows[0].columns()));
+                sink.on_schema(s.clone())?;
+                schema = Some(s);
+                columns_cache = Some(stmt_cols);
+            }
 
-    fn fetch_next(&mut self) -> Result<Option<RecordBatch>> {
-        if let Some(batch) = self.pending_batch.take() {
-            log::info!("fetched {} rows so far...", self.total_rows);
-            return Ok(Some(batch));
+            let row_count = rows.len();
+            total_rows += row_count;
+
+            let s = schema.as_ref().unwrap();
+            let cols = columns_cache.as_ref().unwrap();
+            let batch = rows_to_record_batch_typed(s, cols, &rows)?;
+            sink.on_batch(&batch)?;
+
+            log::info!("fetched {} rows so far...", total_rows);
+
+            if row_count < tuning.batch_size {
+                break;
+            }
+
+            if tuning.throttle_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(tuning.throttle_ms));
+            }
         }
 
-        if self.done {
+        self.client.batch_execute("CLOSE _rivet")?;
+        self.client.batch_execute("COMMIT")?;
+        self.client.batch_execute("RESET statement_timeout")?;
+        self.client.batch_execute("RESET lock_timeout")?;
+
+        if schema.is_none() {
+            sink.on_schema(Arc::new(Schema::empty()))?;
+        }
+
+        log::info!("total: {} rows", total_rows);
+        Ok(())
+    }
+
+    fn query_scalar(&mut self, sql: &str) -> Result<Option<String>> {
+        let rows = self.client.query(sql, &[])?;
+        if rows.is_empty() {
             return Ok(None);
         }
-
-        if self.throttle_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(self.throttle_ms));
+        let row = &rows[0];
+        if let Ok(Some(v)) = row.try_get::<_, Option<i64>>(0) {
+            return Ok(Some(v.to_string()));
         }
-
-        let batch = self.fetch_rows_and_convert()?;
-        if batch.is_some() {
-            log::info!("fetched {} rows so far...", self.total_rows);
-        } else {
-            log::info!("total: {} rows", self.total_rows);
+        if let Ok(Some(v)) = row.try_get::<_, Option<i32>>(0) {
+            return Ok(Some(v.to_string()));
         }
-        Ok(batch)
-    }
-
-    fn close_query(&mut self) -> Result<()> {
-        if self.fetch_sql.is_some() {
-            self.client.batch_execute("CLOSE _rivet")?;
-            self.client.batch_execute("COMMIT")?;
-            self.client.batch_execute("RESET statement_timeout")?;
-            self.client.batch_execute("RESET lock_timeout")?;
-            self.fetch_sql = None;
+        if let Ok(Some(v)) = row.try_get::<_, Option<f64>>(0) {
+            return Ok(Some(v.to_string()));
         }
-        self.done = true;
-        Ok(())
+        if let Ok(Some(v)) = row.try_get::<_, Option<String>>(0) {
+            return Ok(Some(v));
+        }
+        Ok(None)
     }
 }
 
@@ -198,9 +171,7 @@ fn pg_type_to_arrow(pg_type: &Type) -> DataType {
         Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => DataType::Utf8,
         Type::BYTEA => DataType::Binary,
         Type::DATE => DataType::Date32,
-        Type::TIMESTAMP | Type::TIMESTAMPTZ => {
-            DataType::Timestamp(TimeUnit::Microsecond, None)
-        }
+        Type::TIMESTAMP | Type::TIMESTAMPTZ => DataType::Timestamp(TimeUnit::Microsecond, None),
         Type::NUMERIC => DataType::Utf8,
         Type::JSON | Type::JSONB => DataType::Utf8,
         Type::UUID => DataType::Utf8,
@@ -229,12 +200,10 @@ fn rows_to_record_batch_typed(
     rows: &[Row],
 ) -> Result<RecordBatch> {
     let mut arrays: Vec<Arc<dyn Array>> = Vec::with_capacity(columns.len());
-
     for (col_idx, (_name, pg_type)) in columns.iter().enumerate() {
         let array = build_array(pg_type, col_idx, rows)?;
         arrays.push(array);
     }
-
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
     Ok(batch)
 }
@@ -242,138 +211,107 @@ fn rows_to_record_batch_typed(
 fn build_array(pg_type: &Type, col_idx: usize, rows: &[Row]) -> Result<Arc<dyn Array>> {
     match *pg_type {
         Type::BOOL => {
-            let mut builder = BooleanBuilder::with_capacity(rows.len());
-            for row in rows {
-                let val: Option<bool> = row.get(col_idx);
-                builder.append_option(val);
-            }
-            Ok(Arc::new(builder.finish()))
+            let mut b = BooleanBuilder::with_capacity(rows.len());
+            for row in rows { b.append_option(row.get(col_idx)); }
+            Ok(Arc::new(b.finish()))
         }
         Type::INT2 => {
-            let mut builder = Int16Builder::with_capacity(rows.len());
-            for row in rows {
-                let val: Option<i16> = row.get(col_idx);
-                builder.append_option(val);
-            }
-            Ok(Arc::new(builder.finish()))
+            let mut b = Int16Builder::with_capacity(rows.len());
+            for row in rows { b.append_option(row.get(col_idx)); }
+            Ok(Arc::new(b.finish()))
         }
         Type::INT4 => {
-            let mut builder = Int32Builder::with_capacity(rows.len());
-            for row in rows {
-                let val: Option<i32> = row.get(col_idx);
-                builder.append_option(val);
-            }
-            Ok(Arc::new(builder.finish()))
+            let mut b = Int32Builder::with_capacity(rows.len());
+            for row in rows { b.append_option(row.get(col_idx)); }
+            Ok(Arc::new(b.finish()))
         }
         Type::INT8 => {
-            let mut builder = Int64Builder::with_capacity(rows.len());
-            for row in rows {
-                let val: Option<i64> = row.get(col_idx);
-                builder.append_option(val);
-            }
-            Ok(Arc::new(builder.finish()))
+            let mut b = Int64Builder::with_capacity(rows.len());
+            for row in rows { b.append_option(row.get(col_idx)); }
+            Ok(Arc::new(b.finish()))
         }
         Type::FLOAT4 => {
-            let mut builder = Float32Builder::with_capacity(rows.len());
-            for row in rows {
-                let val: Option<f32> = row.get(col_idx);
-                builder.append_option(val);
-            }
-            Ok(Arc::new(builder.finish()))
+            let mut b = Float32Builder::with_capacity(rows.len());
+            for row in rows { b.append_option(row.get(col_idx)); }
+            Ok(Arc::new(b.finish()))
         }
         Type::FLOAT8 => {
-            let mut builder = Float64Builder::with_capacity(rows.len());
-            for row in rows {
-                let val: Option<f64> = row.get(col_idx);
-                builder.append_option(val);
-            }
-            Ok(Arc::new(builder.finish()))
+            let mut b = Float64Builder::with_capacity(rows.len());
+            for row in rows { b.append_option(row.get(col_idx)); }
+            Ok(Arc::new(b.finish()))
         }
         Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => {
-            let mut builder = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
+            let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
             for row in rows {
                 let val: Option<String> = row.get(col_idx);
-                builder.append_option(val.as_deref());
+                b.append_option(val.as_deref());
             }
-            Ok(Arc::new(builder.finish()))
+            Ok(Arc::new(b.finish()))
         }
         Type::BYTEA => {
-            let mut builder = BinaryBuilder::with_capacity(rows.len(), rows.len() * 64);
+            let mut b = BinaryBuilder::with_capacity(rows.len(), rows.len() * 64);
             for row in rows {
-                let val: Option<Vec<u8>> = row.get(col_idx);
-                match val {
-                    Some(v) => builder.append_value(&v),
-                    None => builder.append_null(),
+                match row.get::<_, Option<Vec<u8>>>(col_idx) {
+                    Some(v) => b.append_value(&v),
+                    None => b.append_null(),
                 }
             }
-            Ok(Arc::new(builder.finish()))
+            Ok(Arc::new(b.finish()))
         }
         Type::DATE => {
-            let mut builder = Date32Builder::with_capacity(rows.len());
+            let mut b = Date32Builder::with_capacity(rows.len());
             for row in rows {
-                let val: Option<chrono::NaiveDate> = row.get(col_idx);
-                match val {
+                match row.get::<_, Option<chrono::NaiveDate>>(col_idx) {
                     Some(d) => {
                         let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                        let days = (d - epoch).num_days() as i32;
-                        builder.append_value(days);
+                        b.append_value((d - epoch).num_days() as i32);
                     }
-                    None => builder.append_null(),
+                    None => b.append_null(),
                 }
             }
-            Ok(Arc::new(builder.finish()))
+            Ok(Arc::new(b.finish()))
         }
         Type::TIMESTAMP => {
-            let mut builder = TimestampMicrosecondBuilder::with_capacity(rows.len());
+            let mut b = TimestampMicrosecondBuilder::with_capacity(rows.len());
             for row in rows {
-                let val: Option<chrono::NaiveDateTime> = row.get(col_idx);
-                match val {
-                    Some(ts) => {
-                        let micros = ts.and_utc().timestamp_micros();
-                        builder.append_value(micros);
-                    }
-                    None => builder.append_null(),
+                match row.get::<_, Option<chrono::NaiveDateTime>>(col_idx) {
+                    Some(ts) => b.append_value(ts.and_utc().timestamp_micros()),
+                    None => b.append_null(),
                 }
             }
-            Ok(Arc::new(builder.finish()))
+            Ok(Arc::new(b.finish()))
         }
         Type::TIMESTAMPTZ => {
-            let mut builder = TimestampMicrosecondBuilder::with_capacity(rows.len());
+            let mut b = TimestampMicrosecondBuilder::with_capacity(rows.len());
             for row in rows {
-                let val: Option<chrono::DateTime<chrono::Utc>> = row.get(col_idx);
-                match val {
-                    Some(ts) => {
-                        builder.append_value(ts.timestamp_micros());
-                    }
-                    None => builder.append_null(),
+                match row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(col_idx) {
+                    Some(ts) => b.append_value(ts.timestamp_micros()),
+                    None => b.append_null(),
                 }
             }
-            Ok(Arc::new(builder.finish()))
+            Ok(Arc::new(b.finish()))
         }
         Type::NUMERIC | Type::JSON | Type::JSONB | Type::UUID => {
-            let mut builder = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
+            let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
             for row in rows {
                 let val: Option<String> = row.try_get(col_idx).ok().flatten();
-                builder.append_option(val.as_deref());
+                b.append_option(val.as_deref());
             }
-            Ok(Arc::new(builder.finish()))
+            Ok(Arc::new(b.finish()))
         }
         Type::OID => {
-            let mut builder = Int64Builder::with_capacity(rows.len());
-            for row in rows {
-                let val: Option<u32> = row.get(col_idx);
-                builder.append_option(val.map(|v| v as i64));
-            }
-            Ok(Arc::new(builder.finish()))
+            let mut b = Int64Builder::with_capacity(rows.len());
+            for row in rows { b.append_option(row.get::<_, Option<u32>>(col_idx).map(|v| v as i64)); }
+            Ok(Arc::new(b.finish()))
         }
         _ => {
             log::warn!("unmapped PG type {:?}, extracting as text", pg_type);
-            let mut builder = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
+            let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
             for row in rows {
                 let val: Option<String> = row.try_get(col_idx).ok().flatten();
-                builder.append_option(val.as_deref());
+                b.append_option(val.as_deref());
             }
-            Ok(Arc::new(builder.finish()))
+            Ok(Arc::new(b.finish()))
         }
     }
 }
@@ -391,11 +329,7 @@ mod tests {
 
     #[test]
     fn test_build_query_incremental_first_run() {
-        let cursor = CursorState {
-            export_name: "test".to_string(),
-            last_cursor_value: None,
-            last_run_at: None,
-        };
+        let cursor = CursorState { export_name: "t".into(), last_cursor_value: None, last_run_at: None };
         let q = build_query("SELECT * FROM users", Some("updated_at"), Some(&cursor));
         assert!(q.contains("ORDER BY updated_at"));
         assert!(!q.contains("WHERE"));
@@ -404,9 +338,9 @@ mod tests {
     #[test]
     fn test_build_query_incremental_with_cursor() {
         let cursor = CursorState {
-            export_name: "test".to_string(),
-            last_cursor_value: Some("2024-01-01T00:00:00".to_string()),
-            last_run_at: Some("2024-06-01".to_string()),
+            export_name: "t".into(),
+            last_cursor_value: Some("2024-01-01T00:00:00".into()),
+            last_run_at: Some("2024-06-01".into()),
         };
         let q = build_query("SELECT * FROM orders", Some("updated_at"), Some(&cursor));
         assert!(q.contains("WHERE updated_at > '2024-01-01T00:00:00'"), "got: {}", q);

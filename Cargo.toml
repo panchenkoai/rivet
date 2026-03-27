@@ -10,6 +10,8 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 csv = "1"
 env_logger = "0.11"
+libc = "0.2"
+mach2 = "0.4"
 log = "0.4"
 mysql = "25"
 opendal = { version = "0.51", features = ["layers-blocking", "services-fs", "services-s3", "services-gcs"] }
@@ -25,3 +27,9 @@ tempfile = "3"
 
 [dev-dependencies]
 bytes = "1"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+opt-level = "z"

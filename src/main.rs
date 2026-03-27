@@ -4,6 +4,7 @@ mod error;
 mod format;
 mod pipeline;
 mod preflight;
+mod resource;
 mod source;
 mod state;
 mod tuning;
@@ -29,6 +30,9 @@ enum Commands {
         /// Run only a specific export by name
         #[arg(short, long)]
         export: Option<String>,
+        /// Validate output files after writing
+        #[arg(long)]
+        validate: bool,
     },
     /// Preflight check: diagnose source health for each export
     Check {
@@ -68,8 +72,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { config, export } => {
-            pipeline::run(&config, export.as_deref())?;
+        Commands::Run { config, export, validate } => {
+            pipeline::run(&config, export.as_deref(), validate)?;
         }
         Commands::Check { config, export } => {
             preflight::check(&config, export.as_deref())?;

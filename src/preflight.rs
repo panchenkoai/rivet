@@ -23,11 +23,13 @@ impl std::fmt::Display for HealthVerdict {
 struct ExportDiagnostic {
     export_name: String,
     mode: String,
+    #[allow(dead_code)]
     cursor_column: Option<String>,
     row_estimate: Option<i64>,
     cursor_min: Option<String>,
     cursor_max: Option<String>,
     scan_type: Option<String>,
+    #[allow(dead_code)]
     uses_index: bool,
     verdict: HealthVerdict,
     suggestion: Option<String>,
@@ -47,9 +49,10 @@ pub fn check(config_path: &str, export_name: Option<&str>) -> Result<()> {
         config.exports.iter().collect()
     };
 
+    let url = config.source.resolve_url()?;
     match config.source.source_type {
-        SourceType::Postgres => check_postgres(&config.source.url, &exports)?,
-        SourceType::Mysql => check_mysql(&config.source.url, &exports)?,
+        SourceType::Postgres => check_postgres(&url, &exports)?,
+        SourceType::Mysql => check_mysql(&url, &exports)?,
     }
 
     Ok(())
@@ -73,21 +76,32 @@ fn diagnose_pg(client: &mut postgres::Client, export: &ExportConfig) -> Result<E
             "incremental (cursor: {})",
             export.cursor_column.as_deref().unwrap_or("?")
         ),
+        ExportMode::Chunked => format!(
+            "chunked (column: {}, size: {})",
+            export.chunk_column.as_deref().unwrap_or("?"),
+            export.chunk_size
+        ),
+        ExportMode::TimeWindow => format!(
+            "time_window (column: {}, days: {})",
+            export.time_column.as_deref().unwrap_or("?"),
+            export.days_window.unwrap_or(0)
+        ),
     };
 
+    let base_query = export.query.as_deref().unwrap_or("SELECT 1");
     let effective_query = if let Some(col) = &export.cursor_column {
         format!(
             "SELECT * FROM ({}) AS _rivet ORDER BY {}",
-            export.query, col
+            base_query, col
         )
     } else {
-        export.query.clone()
+        base_query.to_string()
     };
 
     let row_estimate = estimate_rows_pg(client, &effective_query);
 
     let (cursor_min, cursor_max) = if let Some(col) = &export.cursor_column {
-        get_cursor_range_pg(client, &export.query, col)
+        get_cursor_range_pg(client, base_query, col)
     } else {
         (None, None)
     };
@@ -206,15 +220,26 @@ fn diagnose_mysql(conn: &mut mysql::PooledConn, export: &ExportConfig) -> Result
             "incremental (cursor: {})",
             export.cursor_column.as_deref().unwrap_or("?")
         ),
+        ExportMode::Chunked => format!(
+            "chunked (column: {}, size: {})",
+            export.chunk_column.as_deref().unwrap_or("?"),
+            export.chunk_size
+        ),
+        ExportMode::TimeWindow => format!(
+            "time_window (column: {}, days: {})",
+            export.time_column.as_deref().unwrap_or("?"),
+            export.days_window.unwrap_or(0)
+        ),
     };
 
+    let base_query = export.query.as_deref().unwrap_or("SELECT 1");
     let effective_query = if let Some(col) = &export.cursor_column {
         format!(
             "SELECT * FROM ({}) AS _rivet ORDER BY {}",
-            export.query, col
+            base_query, col
         )
     } else {
-        export.query.clone()
+        base_query.to_string()
     };
 
     let row_estimate = {
@@ -237,7 +262,7 @@ fn diagnose_mysql(conn: &mut mysql::PooledConn, export: &ExportConfig) -> Result
         let range_query = format!(
             "SELECT CAST(min({col}) AS CHAR), CAST(max({col}) AS CHAR) FROM ({base}) AS _rivet",
             col = col,
-            base = export.query,
+            base = base_query,
         );
         match conn.query_first::<(Option<String>, Option<String>), _>(&range_query) {
             Ok(Some((min_v, max_v))) => (min_v, max_v),
@@ -388,14 +413,21 @@ fn print_diagnostic(diag: &ExportDiagnostic) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DestinationConfig, DestinationType, ExportConfig, ExportMode, FormatType};
+    use crate::config::{DestinationConfig, DestinationType, ExportConfig, ExportMode, FormatType, TimeColumnType};
 
     fn make_export(name: &str, mode: ExportMode, cursor: Option<&str>) -> ExportConfig {
         ExportConfig {
             name: name.to_string(),
-            query: "SELECT * FROM t".to_string(),
+            query: Some("SELECT * FROM t".to_string()),
+            query_file: None,
             mode,
             cursor_column: cursor.map(|s| s.to_string()),
+            chunk_column: None,
+            chunk_size: 100_000,
+            parallel: 1,
+            time_column: None,
+            time_column_type: TimeColumnType::Timestamp,
+            days_window: None,
             format: FormatType::Csv,
             destination: DestinationConfig {
                 destination_type: DestinationType::Local,
@@ -404,6 +436,10 @@ mod tests {
                 path: Some("./out".to_string()),
                 region: None,
                 endpoint: None,
+                credentials_file: None,
+                access_key_env: None,
+                secret_key_env: None,
+                aws_profile: None,
             },
         }
     }

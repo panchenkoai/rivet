@@ -1,0 +1,32 @@
+source:
+  type: mysql
+  url: "mysql://rivet:rivet@localhost:3306/rivet"
+  tuning:
+    profile: safe
+
+exports:
+  - name: mysql_page_views_full
+    query: >
+      SELECT id, session_id, user_id, url, referrer, user_agent,
+             ip_address, country_code, region, city, device_type,
+             browser, os, screen_width, screen_height,
+             page_load_ms, time_on_page_ms, scroll_depth_pct,
+             is_bounce, utm_source, created_at
+      FROM page_views
+    mode: full
+    format: csv
+    destination:
+      type: local
+      path: ./dev/output
+
+  - name: mysql_page_views_incremental
+    query: >
+      SELECT id, session_id, url, device_type, browser,
+             page_load_ms, time_on_page_ms, is_bounce, created_at
+      FROM page_views
+    mode: incremental
+    cursor_column: created_at
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/output

@@ -26,6 +26,12 @@ impl GcsDestination {
             builder = builder.endpoint(endpoint);
         }
 
+        // credentials_file takes priority, then falls back to ADC / GOOGLE_APPLICATION_CREDENTIALS
+        if let Some(cred_file) = &config.credentials_file {
+            builder = builder.credential_path(cred_file);
+            log::info!("GCS: using credentials from {}", cred_file);
+        }
+
         let op = Operator::new(builder)?
             .layer(BlockingLayer::create()?)
             .finish()

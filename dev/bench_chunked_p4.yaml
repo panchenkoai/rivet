@@ -1,0 +1,17 @@
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+  tuning:
+    profile: fast
+
+exports:
+  - name: bench_content_p4
+    query: "SELECT id, title, body, raw_html, tags, author_name, category, status, created_at FROM content_items"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 50000
+    parallel: 4
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/output/bench
