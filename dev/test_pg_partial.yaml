@@ -1,0 +1,17 @@
+source:
+  type: postgres
+  url: "postgresql://rivet_partial:partial@localhost:5432/rivet"
+exports:
+  - name: test_users_ok
+    query: "SELECT id, name, email FROM users LIMIT 5"
+    format: csv
+    destination:
+      type: local
+      path: ./dev/output/perms
+
+  - name: test_orders_denied
+    query: "SELECT id, user_id, product FROM orders LIMIT 5"
+    format: csv
+    destination:
+      type: local
+      path: ./dev/output/perms

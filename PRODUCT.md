@@ -217,7 +217,7 @@ docker-compose.yaml    PG 16 + MySQL 8
 
 ### Test Coverage
 
-128 tests total, 0 failures:
+181 tests total, 0 failures:
 
 | Category | Count | What |
 |---|---|---|
@@ -227,9 +227,10 @@ docker-compose.yaml    PG 16 + MySQL 8
 | preflight.rs | 8 | Verdicts, EXPLAIN parsing, suggestions |
 | source/postgres.rs | 3 | build_query (full, incremental, cursor) |
 | source/mysql.rs | 3 | build_query (same) |
-| state.rs | 6 | SQLite CRUD (in-memory) |
+| state.rs | 18 | SQLite CRUD, metrics recording/query, schema tracking |
 | format_golden.rs | 7 | CSV output + Parquet round-trip |
 | v2_golden.rs | 17 | Chunks, time-window, validate, resource, config |
+| retry_integration.rs | 11 | Error classification: network, timeout, capacity, deadlock, permanent |
 
 ### Tested Scenarios (E2E with databases)
 
@@ -269,25 +270,56 @@ docker-compose.yaml    PG 16 + MySQL 8
 | No Load/Merge step | Extract only. No BigQuery/warehouse loading, no MERGE/upsert |
 | No CDC | No WAL/binlog reading, query-based extraction only |
 | No orchestration | No built-in scheduler, depends on external cron/Airflow |
-| No schema evolution | Does not track schema changes between runs |
-| No data quality checks | No NULL ratio, uniqueness, completeness checks |
+| No data quality checks | No NULL ratio, uniqueness, completeness checks (planned) |
 | No web UI / API | CLI only |
-| No monitoring | No Prometheus metrics, no alerting |
+| No notifications | No Slack/email alerting (planned) |
 | No encryption | Output files are not encrypted |
 | Single-machine | No distributed execution |
 
 ---
 
+## v3 Features (implemented)
+
+### Metrics History (SQLite)
+
+Every export run is recorded in `export_metrics` table:
+- duration_ms, total_rows, peak_rss_mb, status, error_message, tuning_profile, format, mode
+- CLI: `rivet metrics --config rivet.yaml` shows run history
+- Filter by export: `--export orders`, limit: `--last 20`
+
+### Schema Tracking
+
+Automatic column change detection between runs:
+- Stores schema as JSON in `export_schema` table
+- Detects: added columns, removed columns, type changes
+- Logs `[WARN]` on schema change, updates stored schema
+- First run: stores silently, no warning
+
+### Smart Retry with Reconnect
+
+Error classification into 5 categories with appropriate retry behavior:
+
+| Category | Retry | Reconnect | Extra Delay | Examples |
+|---|---|---|---|---|
+| Network | yes | yes | -- | connection reset, broken pipe, no route, DNS, SSL, EOF |
+| MySQL disconnect | yes | yes | -- | gone away, lost connection, server closed |
+| Timeout | yes | no | -- | statement timeout, lock wait, execution time exceeded |
+| Capacity | yes | yes | +15s | too many connections, DB starting/stopping |
+| Deadlock | yes | no | +1s | deadlock detected, serialization failure |
+| Permanent | **no** | -- | -- | syntax error, permission denied, table not found |
+
+Fresh connection on every retry (not reusing failed connection). 26 error patterns covered.
+
+---
+
 ## Roadmap
 
-### v3: Data Quality + Observability
+### v3.1: Data Quality + Notifications (next)
 
 | Feature | Description | Complexity |
 |---|---|---|
-| Data quality checks | NULL ratio, uniqueness check, row count delta between runs. Config: `checks: { null_ratio_max: 0.05, unique_columns: [id] }` | Medium |
-| Prometheus metrics | Endpoint `/metrics`: export duration, rows/sec, peak RSS, error count | Medium |
-| Schema tracking | Save schema in state DB, detect column additions/removals between runs | Low |
-| Notifications | Slack webhook / email on failure, degraded verdict, schema change | Low |
+| Data quality checks | NULL ratio, uniqueness check, row count bounds per export | Medium |
+| Slack notifications | Webhook on failure, degraded verdict, schema change | Low |
 
 ### v4: Load + Transform
 
@@ -335,15 +367,16 @@ docker-compose.yaml    PG 16 + MySQL 8
 | `anyhow` | Error handling |
 | `env_logger` + `log` | Logging |
 | `tempfile` | Temporary file for streaming writes |
-| `libc` | macOS memory monitoring |
+| `libc` + `mach2` | macOS memory monitoring |
 | `rand` | Test data generation (seed tool) |
 
 ## Building
 
 ```bash
-cargo build --release                    # build rivet
+cargo build --release                    # build rivet (9.9MB binary)
 cargo build --release --bin seed         # build seed tool
-cargo test                               # run all 128 tests
+cargo test                               # run all 181 tests
+cargo clippy --all-targets               # lint (0 warnings)
 ```
 
 ## Development Setup

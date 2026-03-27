@@ -1,0 +1,17 @@
+source:
+  type: mysql
+  url: "mysql://rivet_partial:partial@localhost:3306/rivet"
+exports:
+  - name: test_mysql_users_ok
+    query: "SELECT id, name, email FROM users LIMIT 5"
+    format: csv
+    destination:
+      type: local
+      path: ./dev/output/perms
+
+  - name: test_mysql_orders_denied
+    query: "SELECT id, user_id, product FROM orders LIMIT 5"
+    format: csv
+    destination:
+      type: local
+      path: ./dev/output/perms

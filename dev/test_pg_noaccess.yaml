@@ -1,0 +1,10 @@
+source:
+  type: postgres
+  url: "postgresql://rivet_noaccess:noaccess@localhost:5432/rivet"
+exports:
+  - name: test_noaccess
+    query: "SELECT * FROM users LIMIT 1"
+    format: csv
+    destination:
+      type: local
+      path: ./dev/output/perms

@@ -1,0 +1,10 @@
+source:
+  type: mysql
+  url: "mysql://rivet_noaccess:noaccess@localhost:3306/rivet"
+exports:
+  - name: test_mysql_noaccess
+    query: "SELECT * FROM users LIMIT 1"
+    format: csv
+    destination:
+      type: local
+      path: ./dev/output/perms

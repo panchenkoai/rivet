@@ -40,48 +40,88 @@ pub fn run(config_path: &str, export_name: Option<&str>, validate: bool) -> Resu
 
     for export in exports {
         log::info!("starting export '{}'", export.name);
+        let start = std::time::Instant::now();
+        let rss_before = crate::resource::get_rss_mb();
+
         let result = match export.mode {
             ExportMode::Chunked if export.parallel > 1 => {
                 run_chunked_parallel(&config.source, &state, export, &tuning, &config_dir, validate)
             }
             _ => {
-                let mut src = source::create_source(&config.source)?;
-                run_export_with_retry(&mut *src, &state, export, &tuning, &config_dir, validate)
+                run_with_reconnect(&config.source, &state, export, &tuning, &config_dir, validate)
             }
         };
-        if let Err(e) = result {
-            log::error!("export '{}' failed: {:#}", export.name, e);
+
+        let duration_ms = start.elapsed().as_millis() as i64;
+        let rss_after = crate::resource::get_rss_mb();
+        let peak_rss = rss_after.max(rss_before) as i64;
+        let mode_str = format!("{:?}", export.mode).to_lowercase();
+        let fmt_str = format!("{:?}", export.format).to_lowercase();
+
+        match &result {
+            Ok(()) => {
+                let _ = state.record_metric(
+                    &export.name, duration_ms, 0, Some(peak_rss),
+                    "success", None, Some(tuning.profile_name()), Some(&fmt_str), Some(&mode_str),
+                );
+            }
+            Err(e) => {
+                log::error!("export '{}' failed: {:#}", export.name, e);
+                let _ = state.record_metric(
+                    &export.name, duration_ms, 0, Some(peak_rss),
+                    "failed", Some(&format!("{:#}", e)), Some(tuning.profile_name()), Some(&fmt_str), Some(&mode_str),
+                );
+            }
         }
     }
 
     Ok(())
 }
 
-fn run_export_with_retry(
-    src: &mut dyn Source,
+fn run_with_reconnect(
+    source_config: &SourceConfig,
     state: &StateStore,
     export: &ExportConfig,
     tuning: &SourceTuning,
     config_dir: &Path,
     validate: bool,
 ) -> Result<()> {
-    let mut last_err = None;
+    let mut last_err: Option<anyhow::Error> = None;
 
     for attempt in 0..=tuning.max_retries {
         if attempt > 0 {
-            let backoff = tuning.retry_backoff_ms * 2u64.pow(attempt - 1);
+            let (_, needs_reconnect, extra_delay) = last_err
+                .as_ref()
+                .map(classify_error)
+                .unwrap_or((false, false, 0));
+            let backoff = tuning.retry_backoff_ms * 2u64.pow(attempt - 1) + extra_delay;
             log::warn!(
-                "export '{}': retry {}/{} in {}ms ({})",
+                "export '{}': retry {}/{} in {}ms{}({})",
                 export.name, attempt, tuning.max_retries, backoff,
+                if needs_reconnect { " [reconnecting] " } else { " " },
                 last_err.as_ref().map(|e: &anyhow::Error| format!("{:#}", e)).unwrap_or_default(),
             );
             std::thread::sleep(Duration::from_millis(backoff));
         }
 
-        match run_export(src, state, export, tuning, config_dir, validate) {
+        let mut src = match source::create_source(source_config) {
+            Ok(s) => s,
+            Err(e) => {
+                let (transient, _, _) = classify_error(&e);
+                if attempt < tuning.max_retries && transient {
+                    log::warn!("export '{}': connection failed, will retry: {:#}", export.name, e);
+                    last_err = Some(e);
+                    continue;
+                }
+                return Err(e);
+            }
+        };
+
+        match run_export(&mut *src, state, export, tuning, config_dir, validate) {
             Ok(()) => return Ok(()),
             Err(e) => {
-                if attempt < tuning.max_retries && is_transient(&e) {
+                let (transient, _, _) = classify_error(&e);
+                if attempt < tuning.max_retries && transient {
                     last_err = Some(e);
                     continue;
                 }
@@ -93,16 +133,67 @@ fn run_export_with_retry(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("export failed after retries")))
 }
 
-pub(crate) fn is_transient(err: &anyhow::Error) -> bool {
+/// Classifies transient errors into retry categories.
+/// Returns (is_transient, needs_reconnect, extra_delay_ms)
+pub fn classify_error(err: &anyhow::Error) -> (bool, bool, u64) {
     let msg = format!("{:#}", err).to_lowercase();
-    msg.contains("connection reset")
+
+    // Network errors -- need reconnect
+    if msg.contains("connection reset")
         || msg.contains("broken pipe")
-        || msg.contains("timed out")
-        || msg.contains("timeout")
-        || msg.contains("lock timeout")
-        || msg.contains("canceling statement")
-        || msg.contains("gone away")
+        || msg.contains("connection refused")
+        || msg.contains("no route to host")
+        || msg.contains("network is unreachable")
+        || msg.contains("name resolution")
+        || msg.contains("dns")
+        || msg.contains("ssl handshake")
+        || msg.contains("i/o timeout")
+        || msg.contains("unexpected eof")
+        || msg.contains("closed the connection unexpectedly")
+        || msg.contains("got an error reading communication packets")
+    {
+        return (true, true, 0);
+    }
+
+    // MySQL specific -- need reconnect
+    if msg.contains("gone away")
         || msg.contains("lost connection")
+        || msg.contains("the server closed the connection")
+        || msg.contains("can't connect to mysql server")
+    {
+        return (true, true, 0);
+    }
+
+    // Timeout errors -- retry on same connection
+    if msg.contains("timed out")
+        || msg.contains("timeout")
+        || msg.contains("canceling statement")
+        || msg.contains("lock wait timeout")
+        || msg.contains("execution time exceeded")
+    {
+        return (true, false, 0);
+    }
+
+    // Capacity errors -- retry with longer delay
+    if msg.contains("too many connections")
+        || msg.contains("the database system is starting up")
+        || msg.contains("the database system is shutting down")
+    {
+        return (true, true, 15_000);
+    }
+
+    // Deadlock/serialization -- retry once, same connection
+    if msg.contains("deadlock") || msg.contains("could not serialize access") {
+        return (true, false, 1_000);
+    }
+
+    // Not transient
+    (false, false, 0)
+}
+
+#[cfg(test)]
+pub(crate) fn is_transient(err: &anyhow::Error) -> bool {
+    classify_error(err).0
 }
 
 fn run_export(
@@ -117,7 +208,7 @@ fn run_export(
 
     match export.mode {
         ExportMode::Full => {
-            run_single_export(src, &base_query, None, None, export, tuning, validate, None)?;
+            run_single_export(src, &base_query, None, None, export, tuning, validate, Some(state))?;
         }
         ExportMode::Incremental => {
             let cursor_state = state.get(&export.name)?;
@@ -134,7 +225,7 @@ fn run_export(
                 export.time_column_type,
                 export.days_window.unwrap(),
             );
-            run_single_export(src, &windowed_query, None, None, export, tuning, validate, None)?;
+            run_single_export(src, &windowed_query, None, None, export, tuning, validate, Some(state))?;
         }
     }
 
@@ -182,6 +273,33 @@ fn run_single_export(
                 st.update(&export.name, &last_val)?;
                 log::info!("export '{}': cursor updated to '{}'", export.name, last_val);
             }
+
+    // Schema tracking
+    if let (Some(schema), Some(st)) = (&sink.schema, state) {
+        let columns: Vec<crate::state::SchemaColumn> = schema.fields().iter().map(|f| {
+            crate::state::SchemaColumn {
+                name: f.name().clone(),
+                data_type: format!("{:?}", f.data_type()),
+            }
+        }).collect();
+
+        match st.detect_schema_change(&export.name, &columns) {
+            Ok(Some(change)) => {
+                log::warn!("export '{}': schema changed!", export.name);
+                if !change.added.is_empty() {
+                    log::warn!("  added columns: {}", change.added.join(", "));
+                }
+                if !change.removed.is_empty() {
+                    log::warn!("  removed columns: {}", change.removed.join(", "));
+                }
+                for (col, old, new) in &change.type_changed {
+                    log::warn!("  type changed: {} ({} -> {})", col, old, new);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => log::warn!("schema tracking error: {:#}", e),
+        }
+    }
 
     log::info!("export '{}' completed successfully", export.name);
     Ok(())
@@ -565,6 +683,36 @@ pub fn reset_state(config_path: &str, export_name: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn show_metrics(config_path: &str, export_name: Option<&str>, limit: usize) -> Result<()> {
+    let state = StateStore::open(config_path)?;
+    let metrics = state.get_metrics(export_name, limit)?;
+    if metrics.is_empty() {
+        println!("No metrics recorded yet.");
+        return Ok(());
+    }
+    println!(
+        "{:<20} {:<10} {:>10} {:>10} {:>8} RUN AT",
+        "EXPORT", "STATUS", "ROWS", "DURATION", "RSS"
+    );
+    println!("{}", "-".repeat(85));
+    for m in &metrics {
+        let duration = if m.duration_ms >= 1000 {
+            format!("{:.1}s", m.duration_ms as f64 / 1000.0)
+        } else {
+            format!("{}ms", m.duration_ms)
+        };
+        let rss = m.peak_rss_mb.map(|r| format!("{}MB", r)).unwrap_or_else(|| "-".into());
+        println!(
+            "{:<20} {:<10} {:>10} {:>10} {:>8} {}",
+            m.export_name, m.status, m.total_rows, duration, rss, m.run_at
+        );
+        if let Some(err) = &m.error_message {
+            println!("  Error: {}", err);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,5 +787,69 @@ mod tests {
     #[test]
     fn test_is_transient_rejects() {
         assert!(!is_transient(&anyhow::anyhow!("syntax error")));
+        assert!(!is_transient(&anyhow::anyhow!("permission denied")));
+        assert!(!is_transient(&anyhow::anyhow!("table not found")));
+    }
+
+    #[test]
+    fn test_classify_network_errors_need_reconnect() {
+        let cases = [
+            "connection refused",
+            "no route to host",
+            "network is unreachable",
+            "broken pipe",
+            "unexpected eof",
+            "MySQL server has gone away",
+            "lost connection to server",
+            "can't connect to mysql server",
+            "the server closed the connection",
+            "got an error reading communication packets",
+            "ssl handshake failed",
+        ];
+        for msg in cases {
+            let (transient, reconnect, _) = classify_error(&anyhow::anyhow!("{}", msg));
+            assert!(transient, "should be transient: {}", msg);
+            assert!(reconnect, "should need reconnect: {}", msg);
+        }
+    }
+
+    #[test]
+    fn test_classify_timeout_no_reconnect() {
+        let (t, r, _) = classify_error(&anyhow::anyhow!("statement timed out"));
+        assert!(t);
+        assert!(!r, "timeout should not require reconnect");
+
+        let (t, r, _) = classify_error(&anyhow::anyhow!("lock wait timeout exceeded"));
+        assert!(t);
+        assert!(!r);
+    }
+
+    #[test]
+    fn test_classify_capacity_errors_extra_delay() {
+        let (t, r, delay) = classify_error(&anyhow::anyhow!("too many connections"));
+        assert!(t);
+        assert!(r);
+        assert!(delay >= 10_000, "capacity errors should have extra delay, got: {}ms", delay);
+
+        let (t, _, delay) = classify_error(&anyhow::anyhow!("the database system is starting up"));
+        assert!(t);
+        assert!(delay >= 10_000);
+    }
+
+    #[test]
+    fn test_classify_deadlock_retryable() {
+        let (t, r, delay) = classify_error(&anyhow::anyhow!("deadlock detected"));
+        assert!(t);
+        assert!(!r, "deadlock should not require reconnect");
+        assert!(delay >= 1_000, "deadlock should have small extra delay");
+    }
+
+    #[test]
+    fn test_classify_permanent_errors() {
+        let cases = ["syntax error", "permission denied", "relation does not exist", "column not found"];
+        for msg in cases {
+            let (transient, _, _) = classify_error(&anyhow::anyhow!("{}", msg));
+            assert!(!transient, "should NOT be transient: {}", msg);
+        }
     }
 }

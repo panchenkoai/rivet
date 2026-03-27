@@ -1,0 +1,10 @@
+source:
+  type: postgres
+  url: "postgresql://rivet:WRONGPASSWORD@localhost:5432/rivet"
+exports:
+  - name: test_wrong_pass
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: local
+      path: ./dev/output/perms

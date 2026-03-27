@@ -1,0 +1,13 @@
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+  tuning:
+    profile: fast
+
+exports:
+  - name: schema_test
+    query: "SELECT * FROM schema_test_table"
+    format: csv
+    destination:
+      type: local
+      path: ./dev/output/schema

@@ -48,6 +48,18 @@ enum Commands {
         #[command(subcommand)]
         action: StateAction,
     },
+    /// Show export metrics history
+    Metrics {
+        /// Path to YAML config file
+        #[arg(short, long)]
+        config: String,
+        /// Show metrics for a specific export
+        #[arg(short, long)]
+        export: Option<String>,
+        /// Number of recent runs to show
+        #[arg(short, long, default_value = "20")]
+        last: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -77,6 +89,9 @@ fn main() -> Result<()> {
         }
         Commands::Check { config, export } => {
             preflight::check(&config, export.as_deref())?;
+        }
+        Commands::Metrics { config, export, last } => {
+            pipeline::show_metrics(&config, export.as_deref(), last)?;
         }
         Commands::State { action } => match action {
             StateAction::Show { config } => {
