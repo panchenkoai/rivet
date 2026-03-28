@@ -1,5 +1,6 @@
 pub mod config;
 pub mod destination;
+pub mod enrich;
 pub mod error;
 pub mod format;
 pub mod pipeline;

@@ -1,4 +1,5 @@
 pub mod gcs;
+mod gcs_auth;
 pub mod local;
 pub mod s3;
 

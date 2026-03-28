@@ -1,0 +1,17 @@
+# Example: structured DB credentials (no URL string needed)
+source:
+  type: postgres
+  host: localhost
+  port: 5432
+  user: rivet
+  password_env: PGPASSWORD     # reads password from $PGPASSWORD
+  database: rivet
+
+exports:
+  - name: orders_local
+    query: "SELECT * FROM orders"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: ./out

@@ -1,5 +1,6 @@
 mod config;
 mod destination;
+mod enrich;
 mod error;
 mod format;
 mod pipeline;
@@ -42,6 +43,12 @@ enum Commands {
         /// Check only a specific export by name
         #[arg(short, long)]
         export: Option<String>,
+    },
+    /// Verify source and destination auth before running exports
+    Doctor {
+        /// Path to YAML config file
+        #[arg(short, long)]
+        config: String,
     },
     /// Manage export state
     State {
@@ -89,6 +96,9 @@ fn main() -> Result<()> {
         }
         Commands::Check { config, export } => {
             preflight::check(&config, export.as_deref())?;
+        }
+        Commands::Doctor { config } => {
+            preflight::doctor(&config)?;
         }
         Commands::Metrics { config, export, last } => {
             pipeline::show_metrics(&config, export.as_deref(), last)?;

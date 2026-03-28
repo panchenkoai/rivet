@@ -21,3 +21,26 @@ services:
       - "3306:3306"
     volumes:
       - ./dev/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+
+  # GCS JSON API emulator (OpenDAL uses /storage/v1/... under this base URL).
+  fake-gcs:
+    image: fsouza/fake-gcs-server:latest
+    ports:
+      - "4443:4443"
+    command:
+      - "-scheme"
+      - "http"
+      - "-host"
+      - "0.0.0.0"
+      - "-port"
+      - "4443"

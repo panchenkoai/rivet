@@ -1,0 +1,25 @@
+# GCS export against local fake-gcs-server (Google Cloud Storage JSON API emulator).
+# Requires: docker compose up -d fake-gcs postgres
+# Run: ./dev/run_gcs_fake_export.sh
+#
+# allow_anonymous: OpenDAL sends unsigned requests (emulator accepts them).
+# endpoint: base URL only — Rivet/OpenDAL append /storage/v1/... paths.
+
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+
+exports:
+  - name: orders_chunked_gcs_fake
+    query: "SELECT id, user_id, product, quantity, price, status, notes, ordered_at, updated_at FROM orders"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 100000
+    parallel: 1
+    format: parquet
+    destination:
+      type: gcs
+      bucket: rivet-fake
+      prefix: exports/orders/
+      endpoint: http://127.0.0.1:4443
+      allow_anonymous: true

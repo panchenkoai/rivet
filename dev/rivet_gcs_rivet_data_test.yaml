@@ -1,0 +1,40 @@
+# Chunked exports to real GCS bucket rivet_data_test.
+# Uses tables from dev/postgres/init.sql (docker-compose).
+
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+
+exports:
+  - name: orders_chunked_gcs
+    query: "SELECT id, user_id, product, quantity, price, status, notes, ordered_at, updated_at FROM orders"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 100000
+    parallel: 1
+    format: parquet
+    destination:
+      type: gcs
+      bucket: rivet_data_test
+      prefix: exports/orders/
+      credentials_file: /Users/andriipanchenko/rivet/rivet-gcs-sa.json
+
+  - name: page_views_chunked_gcs
+    query: >
+      SELECT id, session_id, user_id, url, referrer, user_agent, ip_address,
+             country_code, region, city, device_type, browser, os,
+             screen_width, screen_height, viewport_width, viewport_height,
+             page_load_ms, dom_ready_ms, time_on_page_ms, scroll_depth_pct,
+             click_count, is_bounce, utm_source, utm_medium, utm_campaign,
+             utm_term, utm_content, custom_props::text as custom_props, created_at
+      FROM page_views
+    mode: chunked
+    chunk_column: id
+    chunk_size: 400000
+    parallel: 5
+    format: parquet
+    destination:
+      type: gcs
+      bucket: rivet_data_test
+      prefix: exports/page_views/
+      credentials_file: /Users/andriipanchenko/rivet/rivet-gcs-sa.json

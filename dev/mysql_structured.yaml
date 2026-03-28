@@ -1,0 +1,17 @@
+# Example: structured MySQL credentials
+source:
+  type: mysql
+  host: localhost
+  port: 3306
+  user: rivet
+  password: rivet
+  database: rivet
+
+exports:
+  - name: orders_local
+    query: "SELECT * FROM orders"
+    mode: full
+    format: csv
+    destination:
+      type: local
+      path: ./out

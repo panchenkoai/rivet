@@ -22,7 +22,12 @@ const INIT_SQL: &str = "
         error_message TEXT,
         tuning_profile TEXT,
         format TEXT,
-        mode TEXT
+        mode TEXT,
+        files_produced INTEGER DEFAULT 0,
+        bytes_written INTEGER DEFAULT 0,
+        retries INTEGER DEFAULT 0,
+        validated INTEGER,
+        schema_changed INTEGER
     );
     CREATE TABLE IF NOT EXISTS export_schema (
         export_name TEXT PRIMARY KEY,
@@ -30,6 +35,24 @@ const INIT_SQL: &str = "
         updated_at TEXT NOT NULL
     );
 ";
+
+fn migrate(conn: &Connection) {
+    let new_cols = [
+        "files_produced INTEGER DEFAULT 0",
+        "bytes_written INTEGER DEFAULT 0",
+        "retries INTEGER DEFAULT 0",
+        "validated INTEGER",
+        "schema_changed INTEGER",
+    ];
+    for col_def in &new_cols {
+        let col_name = col_def.split_whitespace().next().unwrap();
+        let sql = format!("ALTER TABLE export_metrics ADD COLUMN {}", col_def);
+        match conn.execute(&sql, []) {
+            Ok(_) => log::debug!("migration: added column {} to export_metrics", col_name),
+            Err(_) => {} // column already exists
+        }
+    }
+}
 
 pub struct StateStore {
     conn: Connection,
@@ -48,6 +71,11 @@ pub struct ExportMetric {
     pub tuning_profile: Option<String>,
     pub format: Option<String>,
     pub mode: Option<String>,
+    pub files_produced: i64,
+    pub bytes_written: i64,
+    pub retries: i64,
+    pub validated: Option<bool>,
+    pub schema_changed: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -78,6 +106,7 @@ impl StateStore {
         let db_path = config_dir.join(STATE_DB_NAME);
         let conn = Connection::open(db_path)?;
         conn.execute_batch(INIT_SQL)?;
+        migrate(&conn);
         Ok(Self { conn })
     }
 
@@ -151,40 +180,39 @@ impl StateStore {
         tuning_profile: Option<&str>,
         format: Option<&str>,
         mode: Option<&str>,
+        files_produced: i64,
+        bytes_written: i64,
+        retries: i64,
+        validated: Option<bool>,
+        schema_changed: Option<bool>,
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
         self.conn.execute(
             "INSERT INTO export_metrics (export_name, run_at, duration_ms, total_rows, peak_rss_mb,
-             status, error_message, tuning_profile, format, mode)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             status, error_message, tuning_profile, format, mode,
+             files_produced, bytes_written, retries, validated, schema_changed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             rusqlite::params![
                 export_name, now, duration_ms, total_rows, peak_rss_mb,
-                status, error_message, tuning_profile, format, mode
+                status, error_message, tuning_profile, format, mode,
+                files_produced, bytes_written, retries, validated, schema_changed
             ],
         )?;
         Ok(())
     }
 
     pub fn get_metrics(&self, export_name: Option<&str>, limit: usize) -> Result<Vec<ExportMetric>> {
+        let cols = "export_name, run_at, duration_ms, total_rows, peak_rss_mb,
+                    status, error_message, tuning_profile, format, mode,
+                    files_produced, bytes_written, retries, validated, schema_changed";
         let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(name) = export_name {
             (
-                format!(
-                    "SELECT export_name, run_at, duration_ms, total_rows, peak_rss_mb,
-                     status, error_message, tuning_profile, format, mode
-                     FROM export_metrics WHERE export_name = ?1
-                     ORDER BY id DESC LIMIT {}",
-                    limit
-                ),
+                format!("SELECT {} FROM export_metrics WHERE export_name = ?1 ORDER BY id DESC LIMIT {}", cols, limit),
                 vec![Box::new(name.to_string())],
             )
         } else {
             (
-                format!(
-                    "SELECT export_name, run_at, duration_ms, total_rows, peak_rss_mb,
-                     status, error_message, tuning_profile, format, mode
-                     FROM export_metrics ORDER BY id DESC LIMIT {}",
-                    limit
-                ),
+                format!("SELECT {} FROM export_metrics ORDER BY id DESC LIMIT {}", cols, limit),
                 vec![],
             )
         };
@@ -203,6 +231,11 @@ impl StateStore {
                 tuning_profile: row.get(7)?,
                 format: row.get(8)?,
                 mode: row.get(9)?,
+                files_produced: row.get::<_, Option<i64>>(10)?.unwrap_or(0),
+                bytes_written: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
+                retries: row.get::<_, Option<i64>>(12)?.unwrap_or(0),
+                validated: row.get(13)?,
+                schema_changed: row.get(14)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
@@ -292,9 +325,11 @@ impl StateStore {
         }
     }
 
+    #[allow(dead_code)] // used by integration tests (tests/*.rs)
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(INIT_SQL)?;
+        migrate(&conn);
         Ok(Self { conn })
     }
 }
@@ -360,20 +395,25 @@ mod tests {
     #[test]
     fn record_and_query_metrics() {
         let s = store();
-        s.record_metric("orders", 1200, 50000, Some(142), "success", None, Some("safe"), Some("parquet"), Some("full")).unwrap();
-        s.record_metric("orders", 300, 0, Some(30), "failed", Some("timeout"), Some("safe"), Some("parquet"), Some("full")).unwrap();
+        s.record_metric("orders", 1200, 50000, Some(142), "success", None, Some("safe"), Some("parquet"), Some("full"), 1, 4096, 0, Some(true), Some(false)).unwrap();
+        s.record_metric("orders", 300, 0, Some(30), "failed", Some("timeout"), Some("safe"), Some("parquet"), Some("full"), 0, 0, 2, None, None).unwrap();
 
         let metrics = s.get_metrics(Some("orders"), 10).unwrap();
         assert_eq!(metrics.len(), 2);
         assert_eq!(metrics[0].status, "failed"); // most recent first
+        assert_eq!(metrics[0].retries, 2);
         assert_eq!(metrics[1].total_rows, 50000);
+        assert_eq!(metrics[1].files_produced, 1);
+        assert_eq!(metrics[1].bytes_written, 4096);
+        assert_eq!(metrics[1].validated, Some(true));
+        assert_eq!(metrics[1].schema_changed, Some(false));
     }
 
     #[test]
     fn query_metrics_all_exports() {
         let s = store();
-        s.record_metric("orders", 100, 1000, None, "success", None, None, None, None).unwrap();
-        s.record_metric("users", 200, 2000, None, "success", None, None, None, None).unwrap();
+        s.record_metric("orders", 100, 1000, None, "success", None, None, None, None, 1, 500, 0, None, None).unwrap();
+        s.record_metric("users", 200, 2000, None, "success", None, None, None, None, 1, 800, 0, None, None).unwrap();
 
         let metrics = s.get_metrics(None, 10).unwrap();
         assert_eq!(metrics.len(), 2);
@@ -383,7 +423,7 @@ mod tests {
     fn metrics_limit_works() {
         let s = store();
         for i in 0..10 {
-            s.record_metric("t", i * 100, i, None, "success", None, None, None, None).unwrap();
+            s.record_metric("t", i * 100, i, None, "success", None, None, None, None, 0, 0, 0, None, None).unwrap();
         }
         let metrics = s.get_metrics(Some("t"), 3).unwrap();
         assert_eq!(metrics.len(), 3);

@@ -1,14 +1,17 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use opendal::layers::BlockingLayer;
 use opendal::services::Gcs;
 use opendal::BlockingOperator;
 use opendal::Operator;
 
+use super::gcs_auth;
 use crate::config::DestinationConfig;
 use crate::error::Result;
 
 pub struct GcsDestination {
+    _runtime: Arc<tokio::runtime::Runtime>,
     op: BlockingOperator,
     prefix: String,
 }
@@ -26,11 +29,34 @@ impl GcsDestination {
             builder = builder.endpoint(endpoint);
         }
 
-        // credentials_file takes priority, then falls back to ADC / GOOGLE_APPLICATION_CREDENTIALS
-        if let Some(cred_file) = &config.credentials_file {
+        if config.allow_anonymous {
+            builder = builder
+                .allow_anonymous()
+                .disable_vm_metadata()
+                .disable_config_load();
+            log::info!(
+                "GCS: allow_anonymous (emulator mode; no OAuth / service account)"
+            );
+        } else if let Some(cred_file) = &config.credentials_file {
             builder = builder.credential_path(cred_file);
-            log::info!("GCS: using credentials from {}", cred_file);
+            log::info!("GCS: using credentials_file from config: {}", cred_file);
+        } else if let Some(token) = gcs_auth::try_authorized_user_token()? {
+            builder = builder.disable_vm_metadata().token(token);
+            log::info!("GCS: using access token from ADC authorized_user credentials");
+        } else {
+            log::info!(
+                "GCS: using Google default credential chain \
+                 (service account JSON via GOOGLE_APPLICATION_CREDENTIALS, then VM metadata)"
+            );
         }
+
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| anyhow::anyhow!("failed to create tokio runtime for GCS: {}", e))?,
+        );
+        let _guard = runtime.enter();
 
         let op = Operator::new(builder)?
             .layer(BlockingLayer::create()?)
@@ -39,7 +65,7 @@ impl GcsDestination {
 
         let prefix = config.prefix.clone().unwrap_or_default();
 
-        Ok(Self { op, prefix })
+        Ok(Self { _runtime: runtime, op, prefix })
     }
 }
 

@@ -14,18 +14,88 @@ pub struct Config {
 pub struct SourceConfig {
     #[serde(rename = "type")]
     pub source_type: SourceType,
-    /// Direct URL (may contain ${ENV_VAR} placeholders)
+
+    // --- URL-based auth (provide exactly one, or use structured fields instead) ---
     pub url: Option<String>,
-    /// Read URL from this environment variable
     pub url_env: Option<String>,
-    /// Read URL from this file (e.g. /run/secrets/db_url)
     pub url_file: Option<String>,
+
+    // --- Structured auth (alternative to URL) ---
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub user: Option<String>,
+    pub password: Option<String>,
+    /// Name of env var holding the password.
+    pub password_env: Option<String>,
+    pub database: Option<String>,
+
     #[serde(default)]
     pub tuning: Option<TuningConfig>,
 }
 
 impl SourceConfig {
+    fn has_structured_fields(&self) -> bool {
+        self.host.is_some()
+            || self.user.is_some()
+            || self.database.is_some()
+            || self.password.is_some()
+            || self.password_env.is_some()
+    }
+
+    fn has_url_fields(&self) -> bool {
+        self.url.is_some() || self.url_env.is_some() || self.url_file.is_some()
+    }
+
+    fn build_url_from_fields(&self) -> crate::error::Result<String> {
+        let host = self.host.as_deref()
+            .ok_or_else(|| anyhow::anyhow!("source: structured config requires 'host'"))?;
+        let user = self.user.as_deref()
+            .ok_or_else(|| anyhow::anyhow!("source: structured config requires 'user'"))?;
+        let database = self.database.as_deref()
+            .ok_or_else(|| anyhow::anyhow!("source: structured config requires 'database'"))?;
+
+        let password = match (&self.password, &self.password_env) {
+            (Some(_), Some(_)) => {
+                anyhow::bail!("source: specify 'password' or 'password_env', not both");
+            }
+            (Some(p), None) => {
+                log::warn!("source config contains plaintext password -- consider using password_env");
+                resolve_env_vars(p)
+            }
+            (None, Some(env)) => std::env::var(env)
+                .map_err(|_| anyhow::anyhow!("source: env var '{}' not set (password_env)", env))?,
+            (None, None) => String::new(),
+        };
+
+        let default_port = match self.source_type {
+            SourceType::Postgres => 5432,
+            SourceType::Mysql => 3306,
+        };
+        let port = self.port.unwrap_or(default_port);
+
+        let scheme = match self.source_type {
+            SourceType::Postgres => "postgresql",
+            SourceType::Mysql => "mysql",
+        };
+
+        if password.is_empty() {
+            Ok(format!("{}://{}@{}:{}/{}", scheme, user, host, port, database))
+        } else {
+            Ok(format!("{}://{}:{}@{}:{}/{}", scheme, user, password, host, port, database))
+        }
+    }
+
     pub fn resolve_url(&self) -> crate::error::Result<String> {
+        if self.has_url_fields() && self.has_structured_fields() {
+            anyhow::bail!(
+                "source: use either URL-based config (url/url_env/url_file) or structured fields (host/user/database/...), not both"
+            );
+        }
+
+        if self.has_structured_fields() {
+            return self.build_url_from_fields();
+        }
+
         let raw = match (&self.url, &self.url_env, &self.url_file) {
             (Some(u), None, None) => u.clone(),
             (None, Some(env), None) => std::env::var(env)
@@ -34,7 +104,9 @@ impl SourceConfig {
                 .map_err(|e| anyhow::anyhow!("cannot read url_file '{}': {}", file, e))?
                 .trim()
                 .to_string(),
-            _ => anyhow::bail!("source: specify exactly one of 'url', 'url_env', or 'url_file'"),
+            _ => anyhow::bail!(
+                "source: specify exactly one of 'url', 'url_env', 'url_file', or structured fields (host/user/database)"
+            ),
         };
 
         let resolved = resolve_env_vars(&raw);
@@ -76,6 +148,16 @@ pub struct ExportConfig {
     pub days_window: Option<u32>,
     pub format: FormatType,
     pub destination: DestinationConfig,
+    #[serde(default)]
+    pub meta_columns: MetaColumns,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct MetaColumns {
+    #[serde(default)]
+    pub exported_at: bool,
+    #[serde(default)]
+    pub row_hash: bool,
 }
 
 fn default_mode() -> ExportMode {
@@ -126,15 +208,18 @@ pub struct DestinationConfig {
     pub path: Option<String>,
     pub region: Option<String>,
     pub endpoint: Option<String>,
-    /// Path to GCS service account JSON or AWS credentials file
+    /// GCS: service account JSON path; if set, overrides GOOGLE_APPLICATION_CREDENTIALS / ADC.
     pub credentials_file: Option<String>,
-    /// AWS access key (or env var name with access_key_env)
+    /// S3: name of env var holding AWS access key id. Must be paired with secret_key_env, or omit both.
     pub access_key_env: Option<String>,
-    /// AWS secret key env var name
+    /// S3: name of env var holding AWS secret access key. Must be paired with access_key_env, or omit both.
     pub secret_key_env: Option<String>,
     /// AWS profile name (reserved for future use)
     #[allow(dead_code)]
     pub aws_profile: Option<String>,
+    /// GCS only: use unsigned requests (for local emulators such as fake-gcs-server).
+    #[serde(default)]
+    pub allow_anonymous: bool,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -166,7 +251,6 @@ impl ExportConfig {
 /// Replaces `${VAR}` and `$VAR` patterns with environment variable values.
 pub fn resolve_env_vars(input: &str) -> String {
     let mut result = input.to_string();
-    // ${VAR} syntax
     while let Some(start) = result.find("${") {
         if let Some(end) = result[start..].find('}') {
             let var_name = &result[start + 2..start + end];
@@ -193,13 +277,39 @@ impl Config {
     }
 
     fn validate(&self) -> crate::error::Result<()> {
-        let url_sources = [&self.source.url, &self.source.url_env, &self.source.url_file];
-        let url_count = url_sources.iter().filter(|u| u.is_some()).count();
-        if url_count == 0 {
-            anyhow::bail!("source: must specify one of 'url', 'url_env', or 'url_file'");
+        // Structured fields and URL fields are mutually exclusive (checked at resolve_url time).
+        // At parse time, we only need to ensure at least one credential source exists.
+        if !self.source.has_url_fields() && !self.source.has_structured_fields() {
+            anyhow::bail!("source: must specify url, url_env, url_file, or structured fields (host/user/database)");
         }
-        if url_count > 1 {
-            anyhow::bail!("source: specify exactly one of 'url', 'url_env', or 'url_file'");
+
+        if self.source.has_url_fields() {
+            let url_count = [&self.source.url, &self.source.url_env, &self.source.url_file]
+                .iter().filter(|u| u.is_some()).count();
+            if url_count > 1 {
+                anyhow::bail!("source: specify exactly one of 'url', 'url_env', or 'url_file'");
+            }
+        }
+
+        if self.source.has_url_fields() && self.source.has_structured_fields() {
+            anyhow::bail!(
+                "source: use either URL-based config (url/url_env/url_file) or structured fields (host/user/database/...), not both"
+            );
+        }
+
+        if self.source.has_structured_fields() {
+            if self.source.host.is_none() {
+                anyhow::bail!("source: structured config requires 'host'");
+            }
+            if self.source.user.is_none() {
+                anyhow::bail!("source: structured config requires 'user'");
+            }
+            if self.source.database.is_none() {
+                anyhow::bail!("source: structured config requires 'database'");
+            }
+            if self.source.password.is_some() && self.source.password_env.is_some() {
+                anyhow::bail!("source: specify 'password' or 'password_env', not both");
+            }
         }
 
         for export in &self.exports {
@@ -215,6 +325,36 @@ impl Config {
                     export.name
                 );
             }
+            if export.destination.destination_type == DestinationType::S3 {
+                let ak = export.destination.access_key_env.is_some();
+                let sk = export.destination.secret_key_env.is_some();
+                if ak != sk {
+                    anyhow::bail!(
+                        "export '{}': S3 requires both access_key_env and secret_key_env, or neither (use default AWS credential chain)",
+                        export.name
+                    );
+                }
+            }
+
+            if export.destination.destination_type == DestinationType::Gcs
+                && export.destination.allow_anonymous
+                && export.destination.credentials_file.is_some()
+            {
+                anyhow::bail!(
+                    "export '{}': GCS allow_anonymous cannot be used together with credentials_file",
+                    export.name
+                );
+            }
+
+            if let Some(cred_path) = &export.destination.credentials_file {
+                if !std::path::Path::new(cred_path).exists() {
+                    anyhow::bail!(
+                        "export '{}': credentials_file '{}' does not exist",
+                        export.name, cred_path
+                    );
+                }
+            }
+
             match export.mode {
                 ExportMode::Incremental => {
                     if export.cursor_column.is_none() {
@@ -550,7 +690,8 @@ exports:
 
     #[test]
     fn credentials_file_parses() {
-        let cfg = Config::from_yaml(r#"
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let yaml = format!(r#"
 source:
   type: postgres
   url: "postgresql://localhost/test"
@@ -561,12 +702,10 @@ exports:
     destination:
       type: gcs
       bucket: my-bucket
-      credentials_file: /path/to/sa.json
-"#).unwrap();
-        assert_eq!(
-            cfg.exports[0].destination.credentials_file.as_deref(),
-            Some("/path/to/sa.json")
-        );
+      credentials_file: "{}"
+"#, tmp.path().display());
+        let cfg = Config::from_yaml(&yaml).unwrap();
+        assert!(cfg.exports[0].destination.credentials_file.is_some());
     }
 
     #[test]
@@ -588,5 +727,293 @@ exports:
 "#).unwrap();
         assert_eq!(cfg.exports[0].destination.access_key_env.as_deref(), Some("MY_AWS_KEY"));
         assert_eq!(cfg.exports[0].destination.secret_key_env.as_deref(), Some("MY_AWS_SECRET"));
+    }
+
+    #[test]
+    fn s3_only_one_of_access_key_env_rejected() {
+        let err = Config::from_yaml(r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: parquet
+    destination:
+      type: s3
+      bucket: my-bucket
+      region: us-east-1
+      access_key_env: MY_AWS_KEY
+"#).unwrap_err();
+        assert!(err.to_string().contains("access_key_env"));
+        assert!(err.to_string().contains("secret_key_env"));
+    }
+
+    #[test]
+    fn gcs_allow_anonymous_parses() {
+        let cfg = Config::from_yaml(r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: parquet
+    destination:
+      type: gcs
+      bucket: b
+      endpoint: http://127.0.0.1:4443
+      allow_anonymous: true
+"#).unwrap();
+        assert!(cfg.exports[0].destination.allow_anonymous);
+    }
+
+    #[test]
+    fn gcs_allow_anonymous_with_credentials_file_rejected() {
+        let err = Config::from_yaml(r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: parquet
+    destination:
+      type: gcs
+      bucket: b
+      allow_anonymous: true
+      credentials_file: /x/sa.json
+"#).unwrap_err();
+        assert!(err.to_string().contains("allow_anonymous"));
+    }
+
+    // --- A4: Structured DB credentials ---
+
+    #[test]
+    fn structured_pg_credentials_build_url() {
+        let cfg = Config::from_yaml(r#"
+source:
+  type: postgres
+  host: db.example.com
+  port: 5433
+  user: admin
+  password: s3cret
+  database: mydb
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#).unwrap();
+        let url = cfg.source.resolve_url().unwrap();
+        assert_eq!(url, "postgresql://admin:s3cret@db.example.com:5433/mydb");
+    }
+
+    #[test]
+    fn structured_mysql_credentials_default_port() {
+        let cfg = Config::from_yaml(r#"
+source:
+  type: mysql
+  host: localhost
+  user: root
+  database: app
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#).unwrap();
+        let url = cfg.source.resolve_url().unwrap();
+        assert_eq!(url, "mysql://root@localhost:3306/app");
+    }
+
+    #[test]
+    fn structured_with_password_env() {
+        unsafe { std::env::set_var("RIVET_TEST_DBPASS", "topSecret"); }
+        let cfg = Config::from_yaml(r#"
+source:
+  type: postgres
+  host: localhost
+  user: rivet
+  password_env: RIVET_TEST_DBPASS
+  database: rivet
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#).unwrap();
+        let url = cfg.source.resolve_url().unwrap();
+        assert_eq!(url, "postgresql://rivet:topSecret@localhost:5432/rivet");
+        unsafe { std::env::remove_var("RIVET_TEST_DBPASS"); }
+    }
+
+    #[test]
+    fn structured_missing_host_rejected() {
+        let err = Config::from_yaml(r#"
+source:
+  type: postgres
+  user: rivet
+  database: rivet
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#).unwrap_err();
+        assert!(err.to_string().contains("host"));
+    }
+
+    #[test]
+    fn structured_missing_user_rejected() {
+        let err = Config::from_yaml(r#"
+source:
+  type: postgres
+  host: localhost
+  database: rivet
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#).unwrap_err();
+        assert!(err.to_string().contains("user"));
+    }
+
+    #[test]
+    fn structured_missing_database_rejected() {
+        let err = Config::from_yaml(r#"
+source:
+  type: postgres
+  host: localhost
+  user: rivet
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#).unwrap_err();
+        assert!(err.to_string().contains("database"));
+    }
+
+    #[test]
+    fn structured_and_url_both_rejected() {
+        let err = Config::from_yaml(r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+  host: localhost
+  user: rivet
+  database: rivet
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#).unwrap_err();
+        assert!(err.to_string().contains("not both"));
+    }
+
+    #[test]
+    fn gcs_credentials_file_missing_rejected() {
+        let err = Config::from_yaml(r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: parquet
+    destination:
+      type: gcs
+      bucket: b
+      credentials_file: /nonexistent/path/sa.json
+"#).unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "got: {}", err);
+    }
+
+    #[test]
+    fn structured_password_and_password_env_both_rejected() {
+        let err = Config::from_yaml(r#"
+source:
+  type: postgres
+  host: localhost
+  user: rivet
+  password: abc
+  password_env: MY_PASS
+  database: rivet
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#).unwrap_err();
+        assert!(err.to_string().contains("password"));
+    }
+
+    // --- Meta columns ---
+
+    #[test]
+    fn meta_columns_defaults_to_disabled() {
+        let cfg = Config::from_yaml(MINIMAL_YAML).unwrap();
+        assert!(!cfg.exports[0].meta_columns.exported_at);
+        assert!(!cfg.exports[0].meta_columns.row_hash);
+    }
+
+    #[test]
+    fn meta_columns_both_enabled() {
+        let cfg = Config::from_yaml(r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: parquet
+    meta_columns:
+      exported_at: true
+      row_hash: true
+    destination:
+      type: local
+      path: ./out
+"#).unwrap();
+        assert!(cfg.exports[0].meta_columns.exported_at);
+        assert!(cfg.exports[0].meta_columns.row_hash);
+    }
+
+    #[test]
+    fn meta_columns_partial() {
+        let cfg = Config::from_yaml(r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: csv
+    meta_columns:
+      row_hash: true
+    destination:
+      type: local
+      path: ./out
+"#).unwrap();
+        assert!(!cfg.exports[0].meta_columns.exported_at);
+        assert!(cfg.exports[0].meta_columns.row_hash);
     }
 }

@@ -6,14 +6,99 @@ use std::time::Duration;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
-use crate::config::{Config, ExportConfig, ExportMode, FormatType, SourceConfig, TimeColumnType};
+use crate::config::{Config, ExportConfig, ExportMode, FormatType, MetaColumns, SourceConfig, TimeColumnType};
 use crate::destination;
+use crate::enrich;
 use crate::error::Result;
 use crate::format::{self, FormatWriter};
 use crate::resource;
 use crate::source::{self, BatchSink, Source};
 use crate::state::StateStore;
 use crate::tuning::SourceTuning;
+
+/// Collects operational data during an export for end-of-run summary and metrics.
+#[derive(Debug, Clone)]
+pub struct RunSummary {
+    pub export_name: String,
+    pub status: String,
+    pub total_rows: i64,
+    pub files_produced: usize,
+    pub bytes_written: u64,
+    pub duration_ms: i64,
+    pub peak_rss_mb: i64,
+    pub retries: u32,
+    pub validated: Option<bool>,
+    pub schema_changed: Option<bool>,
+    pub error_message: Option<String>,
+    pub tuning_profile: String,
+    pub format: String,
+    pub mode: String,
+}
+
+impl RunSummary {
+    fn new(export: &ExportConfig, tuning: &SourceTuning) -> Self {
+        Self {
+            export_name: export.name.clone(),
+            status: "running".into(),
+            total_rows: 0,
+            files_produced: 0,
+            bytes_written: 0,
+            duration_ms: 0,
+            peak_rss_mb: 0,
+            retries: 0,
+            validated: None,
+            schema_changed: None,
+            error_message: None,
+            tuning_profile: tuning.profile_name().to_string(),
+            format: format!("{:?}", export.format).to_lowercase(),
+            mode: format!("{:?}", export.mode).to_lowercase(),
+        }
+    }
+
+    fn print(&self) {
+        println!();
+        println!("── {} ──", self.export_name);
+        println!("  status:      {}", self.status);
+        println!("  rows:        {}", self.total_rows);
+        println!("  files:       {}", self.files_produced);
+        if self.bytes_written > 0 {
+            println!("  bytes:       {}", format_bytes(self.bytes_written));
+        }
+        let dur = if self.duration_ms >= 1000 {
+            format!("{:.1}s", self.duration_ms as f64 / 1000.0)
+        } else {
+            format!("{}ms", self.duration_ms)
+        };
+        println!("  duration:    {}", dur);
+        if self.peak_rss_mb > 0 {
+            println!("  peak RSS:    {}MB", self.peak_rss_mb);
+        }
+        if self.retries > 0 {
+            println!("  retries:     {}", self.retries);
+        }
+        if let Some(v) = self.validated {
+            println!("  validated:   {}", if v { "pass" } else { "FAIL" });
+        }
+        if let Some(sc) = self.schema_changed {
+            println!("  schema:      {}", if sc { "CHANGED" } else { "unchanged" });
+        }
+        if let Some(err) = &self.error_message {
+            println!("  error:       {}", err);
+        }
+    }
+}
+
+fn format_bytes(b: u64) -> String {
+    if b >= 1_073_741_824 {
+        format!("{:.1} GB", b as f64 / 1_073_741_824.0)
+    } else if b >= 1_048_576 {
+        format!("{:.1} MB", b as f64 / 1_048_576.0)
+    } else if b >= 1024 {
+        format!("{:.1} KB", b as f64 / 1024.0)
+    } else {
+        format!("{} B", b)
+    }
+}
 
 pub fn run(config_path: &str, export_name: Option<&str>, validate: bool) -> Result<()> {
     let config = Config::load(config_path)?;
@@ -42,37 +127,41 @@ pub fn run(config_path: &str, export_name: Option<&str>, validate: bool) -> Resu
         log::info!("starting export '{}'", export.name);
         let start = std::time::Instant::now();
         let rss_before = crate::resource::get_rss_mb();
+        let mut summary = RunSummary::new(export, &tuning);
 
         let result = match export.mode {
             ExportMode::Chunked if export.parallel > 1 => {
-                run_chunked_parallel(&config.source, &state, export, &tuning, &config_dir, validate)
+                run_chunked_parallel(&config.source, &state, export, &tuning, &config_dir, validate, &mut summary)
             }
             _ => {
-                run_with_reconnect(&config.source, &state, export, &tuning, &config_dir, validate)
+                run_with_reconnect(&config.source, &state, export, &tuning, &config_dir, validate, &mut summary)
             }
         };
 
-        let duration_ms = start.elapsed().as_millis() as i64;
         let rss_after = crate::resource::get_rss_mb();
-        let peak_rss = rss_after.max(rss_before) as i64;
-        let mode_str = format!("{:?}", export.mode).to_lowercase();
-        let fmt_str = format!("{:?}", export.format).to_lowercase();
+        summary.duration_ms = start.elapsed().as_millis() as i64;
+        summary.peak_rss_mb = rss_after.max(rss_before) as i64;
 
         match &result {
             Ok(()) => {
-                let _ = state.record_metric(
-                    &export.name, duration_ms, 0, Some(peak_rss),
-                    "success", None, Some(tuning.profile_name()), Some(&fmt_str), Some(&mode_str),
-                );
+                summary.status = "success".into();
             }
             Err(e) => {
+                summary.status = "failed".into();
+                summary.error_message = Some(format!("{:#}", e));
                 log::error!("export '{}' failed: {:#}", export.name, e);
-                let _ = state.record_metric(
-                    &export.name, duration_ms, 0, Some(peak_rss),
-                    "failed", Some(&format!("{:#}", e)), Some(tuning.profile_name()), Some(&fmt_str), Some(&mode_str),
-                );
             }
         }
+
+        let _ = state.record_metric(
+            &summary.export_name, summary.duration_ms, summary.total_rows,
+            Some(summary.peak_rss_mb), &summary.status, summary.error_message.as_deref(),
+            Some(&summary.tuning_profile), Some(&summary.format), Some(&summary.mode),
+            summary.files_produced as i64, summary.bytes_written as i64,
+            summary.retries as i64, summary.validated, summary.schema_changed,
+        );
+
+        summary.print();
     }
 
     Ok(())
@@ -85,11 +174,13 @@ fn run_with_reconnect(
     tuning: &SourceTuning,
     config_dir: &Path,
     validate: bool,
+    summary: &mut RunSummary,
 ) -> Result<()> {
     let mut last_err: Option<anyhow::Error> = None;
 
     for attempt in 0..=tuning.max_retries {
         if attempt > 0 {
+            summary.retries = attempt;
             let (_, needs_reconnect, extra_delay) = last_err
                 .as_ref()
                 .map(classify_error)
@@ -117,7 +208,7 @@ fn run_with_reconnect(
             }
         };
 
-        match run_export(&mut *src, state, export, tuning, config_dir, validate) {
+        match run_export(&mut *src, state, export, tuning, config_dir, validate, summary) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 let (transient, _, _) = classify_error(&e);
@@ -137,6 +228,18 @@ fn run_with_reconnect(
 /// Returns (is_transient, needs_reconnect, extra_delay_ms)
 pub fn classify_error(err: &anyhow::Error) -> (bool, bool, u64) {
     let msg = format!("{:#}", err).to_lowercase();
+
+    // Auth / credential errors are never transient — fix config, not retry
+    if msg.contains("loading credential")
+        || msg.contains("loadcredential")
+        || msg.contains("metadata.google.internal")
+        || msg.contains("permission denied")
+        || msg.contains("access denied")
+        || msg.contains("invalid_grant")
+        || msg.contains("token has been expired or revoked")
+    {
+        return (false, false, 0);
+    }
 
     // Network errors -- need reconnect
     if msg.contains("connection reset")
@@ -203,20 +306,21 @@ fn run_export(
     tuning: &SourceTuning,
     config_dir: &Path,
     validate: bool,
+    summary: &mut RunSummary,
 ) -> Result<()> {
     let base_query = export.resolve_query(config_dir)?;
 
     match export.mode {
         ExportMode::Full => {
-            run_single_export(src, &base_query, None, None, export, tuning, validate, Some(state))?;
+            run_single_export(src, &base_query, None, None, export, tuning, validate, Some(state), summary)?;
         }
         ExportMode::Incremental => {
             let cursor_state = state.get(&export.name)?;
             let cursor_col = export.cursor_column.as_deref();
-            run_single_export(src, &base_query, cursor_col, Some(&cursor_state), export, tuning, validate, Some(state))?;
+            run_single_export(src, &base_query, cursor_col, Some(&cursor_state), export, tuning, validate, Some(state), summary)?;
         }
         ExportMode::Chunked => {
-            run_chunked_sequential(src, &base_query, export, tuning, validate)?;
+            run_chunked_sequential(src, &base_query, export, tuning, validate, summary)?;
         }
         ExportMode::TimeWindow => {
             let windowed_query = build_time_window_query(
@@ -225,7 +329,7 @@ fn run_export(
                 export.time_column_type,
                 export.days_window.unwrap(),
             );
-            run_single_export(src, &windowed_query, None, None, export, tuning, validate, Some(state))?;
+            run_single_export(src, &windowed_query, None, None, export, tuning, validate, Some(state), summary)?;
         }
     }
 
@@ -242,8 +346,9 @@ fn run_single_export(
     tuning: &SourceTuning,
     validate: bool,
     state: Option<&StateStore>,
+    summary: &mut RunSummary,
 ) -> Result<()> {
-    let mut sink = ExportSink::new(export.format)?;
+    let mut sink = ExportSink::new(export.format, export.meta_columns.clone())?;
 
     src.export(query, cursor_column, cursor, tuning, &mut sink)?;
 
@@ -251,6 +356,7 @@ fn run_single_export(
         w.finish()?;
     }
 
+    summary.total_rows += sink.total_rows as i64;
     log::info!("export '{}': {} rows written", export.name, sink.total_rows);
 
     if sink.total_rows == 0 {
@@ -260,7 +366,12 @@ fn run_single_export(
 
     if validate {
         validate_output(sink.tmp.path(), export.format, sink.total_rows)?;
+        summary.validated = Some(true);
     }
+
+    let file_bytes = std::fs::metadata(sink.tmp.path()).map(|m| m.len()).unwrap_or(0);
+    summary.bytes_written += file_bytes;
+    summary.files_produced += 1;
 
     let file_name = build_file_name(&export.name, format::create_format(export.format).file_extension());
     let dest = destination::create_destination(&export.destination)?;
@@ -274,7 +385,6 @@ fn run_single_export(
                 log::info!("export '{}': cursor updated to '{}'", export.name, last_val);
             }
 
-    // Schema tracking
     if let (Some(schema), Some(st)) = (&sink.schema, state) {
         let columns: Vec<crate::state::SchemaColumn> = schema.fields().iter().map(|f| {
             crate::state::SchemaColumn {
@@ -285,6 +395,7 @@ fn run_single_export(
 
         match st.detect_schema_change(&export.name, &columns) {
             Ok(Some(change)) => {
+                summary.schema_changed = Some(true);
                 log::warn!("export '{}': schema changed!", export.name);
                 if !change.added.is_empty() {
                     log::warn!("  added columns: {}", change.added.join(", "));
@@ -296,7 +407,9 @@ fn run_single_export(
                     log::warn!("  type changed: {} ({} -> {})", col, old, new);
                 }
             }
-            Ok(None) => {}
+            Ok(None) => {
+                summary.schema_changed = Some(false);
+            }
             Err(e) => log::warn!("schema tracking error: {:#}", e),
         }
     }
@@ -313,6 +426,7 @@ fn run_chunked_sequential(
     export: &ExportConfig,
     tuning: &SourceTuning,
     validate: bool,
+    summary: &mut RunSummary,
 ) -> Result<()> {
     let col = export.chunk_column.as_deref().unwrap();
     let chunks = detect_and_generate_chunks(src, base_query, col, export.chunk_size)?;
@@ -331,18 +445,24 @@ fn run_chunked_sequential(
         );
         log::info!("export '{}': chunk {}/{} ({}..{})", export.name, i + 1, chunks.len(), start, end);
 
-        let mut sink = ExportSink::new(export.format)?;
+        let mut sink = ExportSink::new(export.format, export.meta_columns.clone())?;
         src.export(&chunk_query, None, None, tuning, &mut sink)?;
         if let Some(w) = sink.writer.take() {
             w.finish()?;
         }
 
+        summary.total_rows += sink.total_rows as i64;
         log::info!("export '{}': chunk {} -- {} rows", export.name, i + 1, sink.total_rows);
 
         if sink.total_rows > 0 {
             if validate {
                 validate_output(sink.tmp.path(), export.format, sink.total_rows)?;
+                summary.validated = Some(true);
             }
+            let file_bytes = std::fs::metadata(sink.tmp.path()).map(|m| m.len()).unwrap_or(0);
+            summary.bytes_written += file_bytes;
+            summary.files_produced += 1;
+
             let fmt = format::create_format(export.format);
             let file_name = format!("{}_{}_chunk{}.{}", export.name, chrono::Utc::now().format("%Y%m%d_%H%M%S"), i, fmt.file_extension());
             let dest = destination::create_destination(&export.destination)?;
@@ -363,6 +483,7 @@ fn run_chunked_parallel(
     tuning: &SourceTuning,
     config_dir: &Path,
     validate: bool,
+    summary: &mut RunSummary,
 ) -> Result<()> {
     let base_query = export.resolve_query(config_dir)?;
     let col = export.chunk_column.as_deref().unwrap();
@@ -376,13 +497,15 @@ fn run_chunked_parallel(
     log::info!("export '{}': {} chunks, {} parallel threads", export.name, total_chunks, parallel);
 
     let completed = AtomicUsize::new(0);
+    let agg_rows = std::sync::atomic::AtomicI64::new(0);
+    let agg_bytes = std::sync::atomic::AtomicU64::new(0);
+    let agg_files = AtomicUsize::new(0);
     let errors = std::sync::Mutex::new(Vec::<String>::new());
     let semaphore = AtomicUsize::new(0);
 
     std::thread::scope(|s| {
 
         for (i, (start, end)) in chunks.iter().enumerate() {
-            // Wait for a slot
             while semaphore.load(Ordering::Relaxed) >= parallel {
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -398,11 +521,15 @@ fn run_chunked_parallel(
 
             let source_config = source_config.clone();
             let tuning = tuning.clone();
+            let meta = export.meta_columns.clone();
             let export_name = &export.name;
             let format_type = export.format;
             let dest_config = &export.destination;
             let base_query = &base_query;
             let completed = &completed;
+            let agg_rows = &agg_rows;
+            let agg_bytes = &agg_bytes;
+            let agg_files = &agg_files;
             let errors = &errors;
             let semaphore = &semaphore;
             let start = *start;
@@ -416,16 +543,22 @@ fn run_chunked_parallel(
                     );
 
                     let mut thread_src = source::create_source(&source_config)?;
-                    let mut sink = ExportSink::new(format_type)?;
+                    let mut sink = ExportSink::new(format_type, meta)?;
                     thread_src.export(&chunk_query, None, None, &tuning, &mut sink)?;
                     if let Some(w) = sink.writer.take() {
                         w.finish()?;
                     }
 
+                    agg_rows.fetch_add(sink.total_rows as i64, Ordering::Relaxed);
+
                     if sink.total_rows > 0 {
                         if validate {
                             validate_output(sink.tmp.path(), format_type, sink.total_rows)?;
                         }
+                        let file_bytes = std::fs::metadata(sink.tmp.path()).map(|m| m.len()).unwrap_or(0);
+                        agg_bytes.fetch_add(file_bytes, Ordering::Relaxed);
+                        agg_files.fetch_add(1, Ordering::Relaxed);
+
                         let fmt = format::create_format(format_type);
                         let file_name = format!(
                             "{}_{}_chunk{}.{}",
@@ -452,6 +585,13 @@ fn run_chunked_parallel(
             });
         }
     });
+
+    summary.total_rows = agg_rows.load(Ordering::Relaxed);
+    summary.bytes_written = agg_bytes.load(Ordering::Relaxed);
+    summary.files_produced = agg_files.load(Ordering::Relaxed);
+    if validate {
+        summary.validated = Some(true);
+    }
 
     let errs = errors.into_inner().unwrap();
     if !errs.is_empty() {
@@ -578,11 +718,15 @@ struct ExportSink {
     total_rows: usize,
     last_batch: Option<RecordBatch>,
     schema: Option<SchemaRef>,
+    meta: MetaColumns,
+    enriched_schema: Option<SchemaRef>,
+    exported_at_us: i64,
 }
 
 impl ExportSink {
-    fn new(format_type: FormatType) -> Result<Self> {
+    fn new(format_type: FormatType, meta: MetaColumns) -> Result<Self> {
         let tmp = tempfile::NamedTempFile::new()?;
+        let exported_at_us = chrono::Utc::now().timestamp_micros();
         Ok(Self {
             writer: None,
             format_type,
@@ -590,24 +734,36 @@ impl ExportSink {
             total_rows: 0,
             last_batch: None,
             schema: None,
+            meta,
+            enriched_schema: None,
+            exported_at_us,
         })
     }
 }
 
 impl BatchSink for ExportSink {
     fn on_schema(&mut self, schema: SchemaRef) -> Result<()> {
+        let enriched = enrich::enrich_schema(&schema, &self.meta);
         let fmt = format::create_format(self.format_type);
         let file = self.tmp.as_file().try_clone()?;
         let buf_writer = BufWriter::new(file);
-        self.writer = Some(fmt.create_writer(&schema, Box::new(buf_writer))?);
+        self.writer = Some(fmt.create_writer(&enriched, Box::new(buf_writer))?);
         self.schema = Some(schema);
+        self.enriched_schema = Some(enriched);
         Ok(())
     }
 
     fn on_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         self.total_rows += batch.num_rows();
+
+        let output = if let Some(es) = &self.enriched_schema {
+            enrich::enrich_batch(batch, &self.meta, es, self.exported_at_us)?
+        } else {
+            batch.clone()
+        };
+
         if let Some(w) = self.writer.as_mut() {
-            w.write_batch(batch)?;
+            w.write_batch(&output)?;
         }
         self.last_batch = Some(batch.clone());
         Ok(())
@@ -691,10 +847,10 @@ pub fn show_metrics(config_path: &str, export_name: Option<&str>, limit: usize) 
         return Ok(());
     }
     println!(
-        "{:<20} {:<10} {:>10} {:>10} {:>8} RUN AT",
-        "EXPORT", "STATUS", "ROWS", "DURATION", "RSS"
+        "{:<20} {:<10} {:>10} {:>10} {:>8} {:>6} {:>10} RUN AT",
+        "EXPORT", "STATUS", "ROWS", "DURATION", "RSS", "FILES", "BYTES"
     );
-    println!("{}", "-".repeat(85));
+    println!("{}", "-".repeat(110));
     for m in &metrics {
         let duration = if m.duration_ms >= 1000 {
             format!("{:.1}s", m.duration_ms as f64 / 1000.0)
@@ -702,12 +858,30 @@ pub fn show_metrics(config_path: &str, export_name: Option<&str>, limit: usize) 
             format!("{}ms", m.duration_ms)
         };
         let rss = m.peak_rss_mb.map(|r| format!("{}MB", r)).unwrap_or_else(|| "-".into());
+        let bytes = if m.bytes_written > 0 {
+            format_bytes(m.bytes_written as u64)
+        } else {
+            "-".into()
+        };
         println!(
-            "{:<20} {:<10} {:>10} {:>10} {:>8} {}",
-            m.export_name, m.status, m.total_rows, duration, rss, m.run_at
+            "{:<20} {:<10} {:>10} {:>10} {:>8} {:>6} {:>10} {}",
+            m.export_name, m.status, m.total_rows, duration, rss, m.files_produced, bytes, m.run_at
         );
         if let Some(err) = &m.error_message {
             println!("  Error: {}", err);
+        }
+        let mut flags = Vec::new();
+        if m.retries > 0 {
+            flags.push(format!("retries={}", m.retries));
+        }
+        if let Some(v) = m.validated {
+            flags.push(format!("validated={}", if v { "pass" } else { "FAIL" }));
+        }
+        if let Some(sc) = m.schema_changed {
+            flags.push(format!("schema={}", if sc { "CHANGED" } else { "ok" }));
+        }
+        if !flags.is_empty() {
+            println!("  {}", flags.join("  "));
         }
     }
     Ok(())
@@ -851,5 +1025,69 @@ mod tests {
             let (transient, _, _) = classify_error(&anyhow::anyhow!("{}", msg));
             assert!(!transient, "should NOT be transient: {}", msg);
         }
+    }
+
+    #[test]
+    fn test_classify_credential_errors_not_transient() {
+        let cases = [
+            "loading credential to sign http request",
+            "error sending request for url (http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token): dns error",
+            "invalid_grant: Token has been expired or revoked",
+            "Access Denied: no permission",
+        ];
+        for msg in cases {
+            let (transient, _, _) = classify_error(&anyhow::anyhow!("{}", msg));
+            assert!(!transient, "credential error should NOT be transient: {}", msg);
+        }
+    }
+
+    #[test]
+    fn test_format_bytes() {
+        assert_eq!(format_bytes(500), "500 B");
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        assert_eq!(format_bytes(1536), "1.5 KB");
+        assert_eq!(format_bytes(1_048_576), "1.0 MB");
+        assert_eq!(format_bytes(1_073_741_824), "1.0 GB");
+        assert_eq!(format_bytes(2_684_354_560), "2.5 GB");
+    }
+
+    #[test]
+    fn test_run_summary_fields() {
+        let export = ExportConfig {
+            name: "test_export".into(),
+            query: Some("SELECT 1".into()),
+            query_file: None,
+            mode: ExportMode::Full,
+            cursor_column: None,
+            chunk_column: None,
+            chunk_size: 100_000,
+            parallel: 1,
+            time_column: None,
+            time_column_type: TimeColumnType::Timestamp,
+            days_window: None,
+            format: FormatType::Parquet,
+            destination: crate::config::DestinationConfig {
+                destination_type: crate::config::DestinationType::Local,
+                bucket: None,
+                prefix: None,
+                path: Some("./out".into()),
+                region: None,
+                endpoint: None,
+                credentials_file: None,
+                access_key_env: None,
+                secret_key_env: None,
+                aws_profile: None,
+                allow_anonymous: false,
+            },
+            meta_columns: MetaColumns::default(),
+        };
+        let tuning = SourceTuning::from_config(None);
+        let summary = RunSummary::new(&export, &tuning);
+        assert_eq!(summary.export_name, "test_export");
+        assert_eq!(summary.status, "running");
+        assert_eq!(summary.total_rows, 0);
+        assert_eq!(summary.files_produced, 0);
+        assert_eq!(summary.format, "parquet");
+        assert_eq!(summary.mode, "full");
     }
 }

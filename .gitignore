@@ -3,4 +3,4 @@
 /dev/output/*
 .cursor/
 .vscode/
-.env
+rivet-gcs-sa.json
