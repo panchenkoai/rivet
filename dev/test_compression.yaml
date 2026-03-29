@@ -1,0 +1,31 @@
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+
+exports:
+  - name: users_snappy
+    query: "SELECT id, name, email, age, created_at FROM users LIMIT 100"
+    mode: full
+    format: parquet
+    compression: snappy
+    destination:
+      type: local
+      path: ./dev/output
+
+  - name: users_none
+    query: "SELECT id, name, email, age, created_at FROM users LIMIT 100"
+    mode: full
+    format: parquet
+    compression: none
+    destination:
+      type: local
+      path: ./dev/output
+
+  - name: users_skip_empty
+    query: "SELECT id, name, email, age, created_at FROM users WHERE id < 0"
+    mode: full
+    format: parquet
+    skip_empty: true
+    destination:
+      type: local
+      path: ./dev/output

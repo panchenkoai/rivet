@@ -11,7 +11,8 @@ mod state;
 mod tuning;
 mod types;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use error::Result;
 
 #[derive(Parser)]
@@ -54,6 +55,12 @@ enum Commands {
     State {
         #[command(subcommand)]
         action: StateAction,
+    },
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: Shell,
     },
     /// Show export metrics history
     Metrics {
@@ -99,6 +106,9 @@ fn main() -> Result<()> {
         }
         Commands::Doctor { config } => {
             preflight::doctor(&config)?;
+        }
+        Commands::Completions { shell } => {
+            clap_complete::generate(shell, &mut Cli::command(), "rivet", &mut std::io::stdout());
         }
         Commands::Metrics { config, export, last } => {
             pipeline::show_metrics(&config, export.as_deref(), last)?;

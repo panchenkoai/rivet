@@ -7,7 +7,7 @@ Rivet is a CLI tool that exports query results from relational databases to file
 ### What Rivet does
 
 - Extracts data from **PostgreSQL** and **MySQL** via standard SQL queries
-- Writes **Parquet** (Snappy-compressed) or **CSV** files
+- Writes **Parquet** (zstd-compressed by default; snappy, gzip, lz4, none) or **CSV** files
 - Uploads to **local disk**, **Amazon S3**, or **Google Cloud Storage**
 - Tracks incremental state in **SQLite** so the next run picks up where the last left off
 - Diagnoses source health **before** extraction (`rivet check`)
@@ -91,6 +91,20 @@ rivet state reset --config <path> --export <name>  # reset cursor
 rivet metrics --config <path>                      # show export run history
 rivet metrics --config <path> --export <name>      # metrics for one export
 rivet metrics --config <path> --last N             # last N runs (default 20)
+rivet completions <shell>                          # generate shell completions (bash|zsh|fish|powershell)
+```
+
+**Shell completions:**
+
+```bash
+# zsh (add to ~/.zshrc)
+rivet completions zsh > ~/.zfunc/_rivet
+
+# bash
+rivet completions bash > /etc/bash_completion.d/rivet
+
+# fish
+rivet completions fish > ~/.config/fish/completions/rivet.fish
 ```
 
 Set `RUST_LOG=info` (or `debug`) for detailed logging:
@@ -261,6 +275,56 @@ QUALIFY ROW_NUMBER() OVER (
 ```
 
 Both fields are optional and default to `false`. When disabled, no extra columns are added.
+
+### Compression
+
+Parquet compression is configurable per export. Default: **zstd** (better compression ratio than Snappy at comparable speed).
+
+```yaml
+exports:
+  - name: orders
+    query: "SELECT * FROM orders"
+    format: parquet
+    compression: zstd            # zstd | snappy | gzip | lz4 | none
+    compression_level: 9         # optional; zstd 1..22 (default 3), gzip 0..10 (default 6)
+    destination:
+      type: local
+      path: ./output
+```
+
+| Codec | Default level | Notes |
+|-------|--------------|-------|
+| `zstd` | 3 | Best ratio/speed tradeoff; new default |
+| `snappy` | — | Fast, modest compression; previous default |
+| `gzip` | 6 | Wide compatibility |
+| `lz4` | — | Very fast decompression |
+| `none` | — | No compression; largest files |
+
+CSV exports ignore the compression setting.
+
+### Skip Empty Exports
+
+When running scheduled/incremental exports, zero new rows often means nothing changed. Use `skip_empty` to avoid creating empty files:
+
+```yaml
+exports:
+  - name: events_inc
+    query: "SELECT * FROM events"
+    mode: incremental
+    cursor_column: updated_at
+    format: parquet
+    skip_empty: true             # no file created when 0 rows; cursor not advanced
+    destination:
+      type: gcs
+      bucket: my-bucket
+```
+
+When `skip_empty: true` and the query returns 0 rows:
+- No output file is created or uploaded
+- Cursor state is **not** advanced (safe to rerun)
+- Run summary shows `status: skipped`
+
+Default: `false` (current behavior; 0-row exports still succeed with no file output).
 
 ### Destinations
 

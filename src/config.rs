@@ -147,6 +147,11 @@ pub struct ExportConfig {
     pub time_column_type: TimeColumnType,
     pub days_window: Option<u32>,
     pub format: FormatType,
+    #[serde(default)]
+    pub compression: CompressionType,
+    pub compression_level: Option<u32>,
+    #[serde(default)]
+    pub skip_empty: bool,
     pub destination: DestinationConfig,
     #[serde(default)]
     pub meta_columns: MetaColumns,
@@ -197,6 +202,22 @@ pub enum TimeColumnType {
 pub enum FormatType {
     Parquet,
     Csv,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CompressionType {
+    Zstd,
+    Snappy,
+    Gzip,
+    Lz4,
+    None,
+}
+
+impl Default for CompressionType {
+    fn default() -> Self {
+        CompressionType::Zstd
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -352,6 +373,33 @@ impl Config {
                         "export '{}': credentials_file '{}' does not exist",
                         export.name, cred_path
                     );
+                }
+            }
+
+            if let Some(level) = export.compression_level {
+                match export.compression {
+                    CompressionType::Zstd => {
+                        if !(1..=22).contains(&level) {
+                            anyhow::bail!(
+                                "export '{}': zstd compression_level must be 1..22, got {}",
+                                export.name, level
+                            );
+                        }
+                    }
+                    CompressionType::Gzip => {
+                        if level > 10 {
+                            anyhow::bail!(
+                                "export '{}': gzip compression_level must be 0..10, got {}",
+                                export.name, level
+                            );
+                        }
+                    }
+                    _ => {
+                        anyhow::bail!(
+                            "export '{}': compression_level is only supported for zstd and gzip",
+                            export.name
+                        );
+                    }
                 }
             }
 
@@ -965,6 +1013,174 @@ exports:
       path: ./out
 "#).unwrap_err();
         assert!(err.to_string().contains("password"));
+    }
+
+    // --- Compression ---
+
+    #[test]
+    fn compression_defaults_to_zstd() {
+        let cfg = Config::from_yaml(MINIMAL_YAML).unwrap();
+        assert_eq!(cfg.exports[0].compression, CompressionType::Zstd);
+        assert!(cfg.exports[0].compression_level.is_none());
+    }
+
+    #[test]
+    fn compression_snappy_parses() {
+        let cfg = Config::from_yaml(r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: parquet
+    compression: snappy
+    destination:
+      type: local
+      path: ./out
+"#).unwrap();
+        assert_eq!(cfg.exports[0].compression, CompressionType::Snappy);
+    }
+
+    #[test]
+    fn compression_zstd_with_level() {
+        let cfg = Config::from_yaml(r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: parquet
+    compression: zstd
+    compression_level: 9
+    destination:
+      type: local
+      path: ./out
+"#).unwrap();
+        assert_eq!(cfg.exports[0].compression, CompressionType::Zstd);
+        assert_eq!(cfg.exports[0].compression_level, Some(9));
+    }
+
+    #[test]
+    fn compression_gzip_with_level() {
+        let cfg = Config::from_yaml(r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: parquet
+    compression: gzip
+    compression_level: 6
+    destination:
+      type: local
+      path: ./out
+"#).unwrap();
+        assert_eq!(cfg.exports[0].compression, CompressionType::Gzip);
+        assert_eq!(cfg.exports[0].compression_level, Some(6));
+    }
+
+    #[test]
+    fn compression_none_parses() {
+        let cfg = Config::from_yaml(r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: parquet
+    compression: none
+    destination:
+      type: local
+      path: ./out
+"#).unwrap();
+        assert_eq!(cfg.exports[0].compression, CompressionType::None);
+    }
+
+    #[test]
+    fn compression_level_rejected_for_snappy() {
+        let err = Config::from_yaml(r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: parquet
+    compression: snappy
+    compression_level: 5
+    destination:
+      type: local
+      path: ./out
+"#).unwrap_err();
+        assert!(err.to_string().contains("compression_level"), "got: {}", err);
+    }
+
+    #[test]
+    fn zstd_compression_level_out_of_range_rejected() {
+        let err = Config::from_yaml(r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: parquet
+    compression: zstd
+    compression_level: 30
+    destination:
+      type: local
+      path: ./out
+"#).unwrap_err();
+        assert!(err.to_string().contains("1..22"), "got: {}", err);
+    }
+
+    #[test]
+    fn gzip_compression_level_out_of_range_rejected() {
+        let err = Config::from_yaml(r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: parquet
+    compression: gzip
+    compression_level: 15
+    destination:
+      type: local
+      path: ./out
+"#).unwrap_err();
+        assert!(err.to_string().contains("0..10"), "got: {}", err);
+    }
+
+    // --- Skip empty ---
+
+    #[test]
+    fn skip_empty_defaults_to_false() {
+        let cfg = Config::from_yaml(MINIMAL_YAML).unwrap();
+        assert!(!cfg.exports[0].skip_empty);
+    }
+
+    #[test]
+    fn skip_empty_true_parses() {
+        let cfg = Config::from_yaml(r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: csv
+    skip_empty: true
+    destination:
+      type: local
+      path: ./out
+"#).unwrap();
+        assert!(cfg.exports[0].skip_empty);
     }
 
     // --- Meta columns ---

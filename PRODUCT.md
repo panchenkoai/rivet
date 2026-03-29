@@ -19,7 +19,7 @@ Rivet is a source-aware data extraction tool written in Rust. It exports data fr
 
 | Format | Compression | Streaming Write | Validation |
 |---|---|---|---|
-| Parquet | Snappy | `ArrowWriter` with flush per batch | Read-back row count verification |
+| Parquet | zstd (default), snappy, gzip, lz4, none — configurable per export | `ArrowWriter` with flush per batch | Read-back row count verification |
 | CSV | None | Append per batch | Line count verification |
 
 ### Destinations
@@ -227,11 +227,11 @@ docker-compose.yaml    PG 16 + MySQL 8
 
 ### Test Coverage
 
-**209** distinct test cases; `cargo test` reports **363** passes (unit tests in `src/` run for both the library and binary targets).
+**222** distinct test cases; `cargo test` reports **387** passes (unit tests in `src/` run for both the library and binary targets).
 
 | Category | Count | What |
 |---|---|---|
-| config.rs | 34 | YAML parsing, validation, structured/URL credentials, GCS/S3 auth config, meta_columns |
+| config.rs | 44 | YAML parsing, validation, structured/URL credentials, GCS/S3 auth config, meta_columns, compression, skip_empty |
 | preflight.rs | 60 | Verdicts, EXPLAIN parsing, suggestions, strategy, profile recommendation, sparse/dense/parallel warnings, doctor categorization |
 | pipeline.rs | 19 | Chunks, time-window, cursor, classify_error, credential errors, format_bytes, RunSummary |
 | state.rs | 14 | SQLite CRUD, metrics, schema tracking |
@@ -239,7 +239,7 @@ docker-compose.yaml    PG 16 + MySQL 8
 | enrich.rs | 6 | Meta columns: exported_at, row_hash, determinism, null vs empty |
 | destination/gcs_auth.rs | 7 | ADC parsing, urlenc, authorized_user validation |
 | source/postgres.rs + mysql.rs | 6 | build_query (full, incremental, cursor) |
-| format_golden.rs | 7 | CSV output + Parquet round-trip |
+| format_golden.rs | 11 | CSV output + Parquet round-trip + compression variants (zstd, snappy, gzip, lz4, none) |
 | v2_golden.rs | 17 | Chunks, time-window, validate, resource, config |
 | retry_integration.rs | 11 | Error classification: network, timeout, capacity, deadlock, permanent |
 | schema_evolution.rs | 16 | Schema diff / state store integration |
@@ -403,17 +403,34 @@ README restructured around real usage decisions:
 
 **Phase 1 "Pilot Alpha Stabilization" (Epics A–E) is complete.** All auth flows are implemented and tested, execution semantics are frozen and documented, run summaries are printed and persisted, and documentation covers real usage decisions.
 
+## v4 Features (implemented)
+
+### Configurable Parquet Compression (Story M1)
+
+- `compression` field per export: `zstd` (new default), `snappy`, `gzip`, `lz4`, `none`
+- Optional `compression_level` for zstd (1..22, default 3) and gzip (0..10, default 6)
+- Invalid codec/level combinations rejected at config parse time
+- CSV exports ignore the compression setting
+
+### Skip Empty Exports (Story M2)
+
+- `skip_empty: true` per export — no file created when query returns 0 rows
+- Cursor state is not advanced (safe for incremental idle runs)
+- Run summary shows `status: skipped` instead of `success`
+
+### Shell Completions (Story M5)
+
+- `rivet completions <shell>` generates completions for bash, zsh, fish, powershell
+- Powered by `clap_complete`
+
 ---
 
 ## Roadmap
 
-### v3.1: Output & CLI Improvements + Data Quality (next)
+### v4.1: Output & CLI Improvements + Data Quality (next)
 
 | Feature | Description | Complexity |
 |---|---|---|
-| Configurable compression | Zstd default, configurable per export (snappy, gzip, lz4, none) | Low |
-| Skip empty exports | `skip_empty: true` — no file on 0 rows (incremental idle runs) | Low |
-| Shell completions | `rivet completions <shell>` for bash/zsh/fish/powershell | Low |
 | File size splitting | `max_file_size: 512MB` — split full/incremental output into parts | Medium |
 | Memory-based batch sizing | `batch_size_memory: 256MB` — predictable RSS regardless of row width | Medium |
 | Parameterized queries | `${ENV_VAR}` in queries, `--param key=value` CLI flag | Medium |

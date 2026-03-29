@@ -4,7 +4,7 @@ pub mod parquet;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
-use crate::config::FormatType;
+use crate::config::{CompressionType, FormatType};
 use crate::error::Result;
 
 /// Streaming writer: receives one RecordBatch at a time.
@@ -23,9 +23,13 @@ pub trait Format {
     fn file_extension(&self) -> &str;
 }
 
-pub fn create_format(format_type: FormatType) -> Box<dyn Format> {
+pub fn create_format(
+    format_type: FormatType,
+    compression: CompressionType,
+    compression_level: Option<u32>,
+) -> Box<dyn Format> {
     match format_type {
         FormatType::Csv => Box::new(csv::CsvFormat),
-        FormatType::Parquet => Box::new(parquet::ParquetFormat),
+        FormatType::Parquet => Box::new(parquet::ParquetFormat::new(compression, compression_level)),
     }
 }

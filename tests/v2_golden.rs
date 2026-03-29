@@ -153,6 +153,7 @@ fn test_validate_parquet_correct_count() {
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use rivet::config::CompressionType;
     use rivet::format::parquet::ParquetFormat;
     use rivet::format::Format;
 
@@ -164,7 +165,7 @@ fn test_validate_parquet_correct_count() {
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.as_file().try_clone().unwrap();
-    let mut writer = ParquetFormat.create_writer(&schema, Box::new(file)).unwrap();
+    let mut writer = ParquetFormat::new(CompressionType::Zstd, None).create_writer(&schema, Box::new(file)).unwrap();
     writer.write_batch(&batch).unwrap();
     writer.finish().unwrap();
 
@@ -209,6 +210,7 @@ fn test_validate_wrong_count_fails() {
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use rivet::config::CompressionType;
     use rivet::format::parquet::ParquetFormat;
     use rivet::format::Format;
 
@@ -220,7 +222,7 @@ fn test_validate_wrong_count_fails() {
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.as_file().try_clone().unwrap();
-    let mut writer = ParquetFormat.create_writer(&schema, Box::new(file)).unwrap();
+    let mut writer = ParquetFormat::new(CompressionType::Zstd, None).create_writer(&schema, Box::new(file)).unwrap();
     writer.write_batch(&batch).unwrap();
     writer.finish().unwrap();
 

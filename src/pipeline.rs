@@ -6,7 +6,7 @@ use std::time::Duration;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
-use crate::config::{Config, ExportConfig, ExportMode, FormatType, MetaColumns, SourceConfig, TimeColumnType};
+use crate::config::{CompressionType, Config, ExportConfig, ExportMode, FormatType, MetaColumns, SourceConfig, TimeColumnType};
 use crate::destination;
 use crate::enrich;
 use crate::error::Result;
@@ -33,6 +33,7 @@ pub struct RunSummary {
     pub tuning_profile: String,
     pub format: String,
     pub mode: String,
+    pub compression: String,
 }
 
 impl RunSummary {
@@ -52,6 +53,7 @@ impl RunSummary {
             tuning_profile: tuning.profile_name().to_string(),
             format: format!("{:?}", export.format).to_lowercase(),
             mode: format!("{:?}", export.mode).to_lowercase(),
+            compression: format!("{:?}", export.compression).to_lowercase(),
         }
     }
 
@@ -72,6 +74,9 @@ impl RunSummary {
         println!("  duration:    {}", dur);
         if self.peak_rss_mb > 0 {
             println!("  peak RSS:    {}MB", self.peak_rss_mb);
+        }
+        if self.format == "parquet" && self.compression != "zstd" {
+            println!("  compression: {}", self.compression);
         }
         if self.retries > 0 {
             println!("  retries:     {}", self.retries);
@@ -144,7 +149,9 @@ pub fn run(config_path: &str, export_name: Option<&str>, validate: bool) -> Resu
 
         match &result {
             Ok(()) => {
-                summary.status = "success".into();
+                if summary.status == "running" {
+                    summary.status = "success".into();
+                }
             }
             Err(e) => {
                 summary.status = "failed".into();
@@ -348,7 +355,7 @@ fn run_single_export(
     state: Option<&StateStore>,
     summary: &mut RunSummary,
 ) -> Result<()> {
-    let mut sink = ExportSink::new(export.format, export.meta_columns.clone())?;
+    let mut sink = ExportSink::new(export)?;
 
     src.export(query, cursor_column, cursor, tuning, &mut sink)?;
 
@@ -360,7 +367,12 @@ fn run_single_export(
     log::info!("export '{}': {} rows written", export.name, sink.total_rows);
 
     if sink.total_rows == 0 {
-        log::info!("export '{}': no data to export", export.name);
+        if export.skip_empty {
+            summary.status = "skipped".into();
+            log::info!("export '{}': skipped (0 rows, skip_empty=true)", export.name);
+        } else {
+            log::info!("export '{}': no data to export", export.name);
+        }
         return Ok(());
     }
 
@@ -373,7 +385,7 @@ fn run_single_export(
     summary.bytes_written += file_bytes;
     summary.files_produced += 1;
 
-    let file_name = build_file_name(&export.name, format::create_format(export.format).file_extension());
+    let file_name = build_file_name(&export.name, format::create_format(export.format, export.compression, export.compression_level).file_extension());
     let dest = destination::create_destination(&export.destination)?;
     dest.write(sink.tmp.path(), &file_name)?;
 
@@ -445,7 +457,7 @@ fn run_chunked_sequential(
         );
         log::info!("export '{}': chunk {}/{} ({}..{})", export.name, i + 1, chunks.len(), start, end);
 
-        let mut sink = ExportSink::new(export.format, export.meta_columns.clone())?;
+        let mut sink = ExportSink::new(export)?;
         src.export(&chunk_query, None, None, tuning, &mut sink)?;
         if let Some(w) = sink.writer.take() {
             w.finish()?;
@@ -463,7 +475,7 @@ fn run_chunked_sequential(
             summary.bytes_written += file_bytes;
             summary.files_produced += 1;
 
-            let fmt = format::create_format(export.format);
+            let fmt = format::create_format(export.format, export.compression, export.compression_level);
             let file_name = format!("{}_{}_chunk{}.{}", export.name, chrono::Utc::now().format("%Y%m%d_%H%M%S"), i, fmt.file_extension());
             let dest = destination::create_destination(&export.destination)?;
             dest.write(sink.tmp.path(), &file_name)?;
@@ -522,6 +534,8 @@ fn run_chunked_parallel(
             let source_config = source_config.clone();
             let tuning = tuning.clone();
             let meta = export.meta_columns.clone();
+            let compression = export.compression;
+            let compression_level = export.compression_level;
             let export_name = &export.name;
             let format_type = export.format;
             let dest_config = &export.destination;
@@ -543,7 +557,23 @@ fn run_chunked_parallel(
                     );
 
                     let mut thread_src = source::create_source(&source_config)?;
-                    let mut sink = ExportSink::new(format_type, meta)?;
+                    let mut sink = {
+                        let tmp = tempfile::NamedTempFile::new()?;
+                        let exported_at_us = chrono::Utc::now().timestamp_micros();
+                        ExportSink {
+                            writer: None,
+                            format_type,
+                            compression,
+                            compression_level,
+                            tmp,
+                            total_rows: 0,
+                            last_batch: None,
+                            schema: None,
+                            meta,
+                            enriched_schema: None,
+                            exported_at_us,
+                        }
+                    };
                     thread_src.export(&chunk_query, None, None, &tuning, &mut sink)?;
                     if let Some(w) = sink.writer.take() {
                         w.finish()?;
@@ -559,7 +589,7 @@ fn run_chunked_parallel(
                         agg_bytes.fetch_add(file_bytes, Ordering::Relaxed);
                         agg_files.fetch_add(1, Ordering::Relaxed);
 
-                        let fmt = format::create_format(format_type);
+                        let fmt = format::create_format(format_type, compression, compression_level);
                         let file_name = format!(
                             "{}_{}_chunk{}.{}",
                             export_name, chrono::Utc::now().format("%Y%m%d_%H%M%S"), i, fmt.file_extension()
@@ -714,6 +744,8 @@ pub fn validate_output(path: &Path, format: FormatType, expected_rows: usize) ->
 struct ExportSink {
     writer: Option<Box<dyn FormatWriter>>,
     format_type: FormatType,
+    compression: CompressionType,
+    compression_level: Option<u32>,
     tmp: tempfile::NamedTempFile,
     total_rows: usize,
     last_batch: Option<RecordBatch>,
@@ -724,17 +756,19 @@ struct ExportSink {
 }
 
 impl ExportSink {
-    fn new(format_type: FormatType, meta: MetaColumns) -> Result<Self> {
+    fn new(export: &ExportConfig) -> Result<Self> {
         let tmp = tempfile::NamedTempFile::new()?;
         let exported_at_us = chrono::Utc::now().timestamp_micros();
         Ok(Self {
             writer: None,
-            format_type,
+            format_type: export.format,
+            compression: export.compression,
+            compression_level: export.compression_level,
             tmp,
             total_rows: 0,
             last_batch: None,
             schema: None,
-            meta,
+            meta: export.meta_columns.clone(),
             enriched_schema: None,
             exported_at_us,
         })
@@ -744,7 +778,7 @@ impl ExportSink {
 impl BatchSink for ExportSink {
     fn on_schema(&mut self, schema: SchemaRef) -> Result<()> {
         let enriched = enrich::enrich_schema(&schema, &self.meta);
-        let fmt = format::create_format(self.format_type);
+        let fmt = format::create_format(self.format_type, self.compression, self.compression_level);
         let file = self.tmp.as_file().try_clone()?;
         let buf_writer = BufWriter::new(file);
         self.writer = Some(fmt.create_writer(&enriched, Box::new(buf_writer))?);
@@ -1066,6 +1100,9 @@ mod tests {
             time_column_type: TimeColumnType::Timestamp,
             days_window: None,
             format: FormatType::Parquet,
+            compression: CompressionType::default(),
+            compression_level: None,
+            skip_empty: false,
             destination: crate::config::DestinationConfig {
                 destination_type: crate::config::DestinationType::Local,
                 bucket: None,

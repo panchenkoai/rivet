@@ -786,7 +786,7 @@ fn print_diagnostic(diag: &ExportDiagnostic) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DestinationConfig, DestinationType, ExportConfig, ExportMode, FormatType, MetaColumns, TimeColumnType};
+    use crate::config::{CompressionType, DestinationConfig, DestinationType, ExportConfig, ExportMode, FormatType, MetaColumns, TimeColumnType};
 
     fn make_export(name: &str, mode: ExportMode, cursor: Option<&str>) -> ExportConfig {
         ExportConfig {
@@ -802,6 +802,9 @@ mod tests {
             time_column_type: TimeColumnType::Timestamp,
             days_window: None,
             format: FormatType::Csv,
+            compression: CompressionType::default(),
+            compression_level: None,
+            skip_empty: false,
             destination: DestinationConfig {
                 destination_type: DestinationType::Local,
                 bucket: None,

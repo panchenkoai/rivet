@@ -4,6 +4,7 @@ use arrow::array::*;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use rivet::format::csv::CsvFormat;
+use rivet::config::CompressionType;
 use rivet::format::parquet::ParquetFormat;
 use rivet::format::Format;
 
@@ -145,7 +146,7 @@ fn test_csv_date_format() {
 #[test]
 fn test_parquet_roundtrip() {
     let (schema, batch) = make_basic_batch();
-    let buf = write_to_vec(&ParquetFormat, &schema, &[batch]);
+    let buf = write_to_vec(&ParquetFormat::new(CompressionType::Zstd, None), &schema, &[batch]);
     let data = bytes::Bytes::from(buf);
 
     assert!(!data.is_empty());
@@ -176,9 +177,9 @@ fn test_parquet_roundtrip() {
 }
 
 #[test]
-fn test_parquet_compression() {
+fn test_parquet_compression_default_zstd() {
     let (schema, batch) = make_basic_batch();
-    let buf = write_to_vec(&ParquetFormat, &schema, &[batch]);
+    let buf = write_to_vec(&ParquetFormat::new(CompressionType::Zstd, None), &schema, &[batch]);
     let data = bytes::Bytes::from(buf);
 
     use parquet::file::reader::FileReader;
@@ -187,8 +188,59 @@ fn test_parquet_compression() {
     let row_group = metadata.row_group(0);
     let col_meta = row_group.column(0);
 
-    assert_eq!(
-        col_meta.compression(),
-        parquet::basic::Compression::SNAPPY,
+    assert!(
+        matches!(col_meta.compression(), parquet::basic::Compression::ZSTD(_)),
+        "expected ZSTD, got: {:?}", col_meta.compression()
     );
+}
+
+#[test]
+fn test_parquet_compression_snappy() {
+    let (schema, batch) = make_basic_batch();
+    let buf = write_to_vec(&ParquetFormat::new(CompressionType::Snappy, None), &schema, &[batch]);
+    let data = bytes::Bytes::from(buf);
+
+    use parquet::file::reader::FileReader;
+    let reader = parquet::file::reader::SerializedFileReader::new(data).unwrap();
+    let col_meta = reader.metadata().row_group(0).column(0);
+    assert_eq!(col_meta.compression(), parquet::basic::Compression::SNAPPY);
+}
+
+#[test]
+fn test_parquet_compression_none() {
+    let (schema, batch) = make_basic_batch();
+    let buf = write_to_vec(&ParquetFormat::new(CompressionType::None, None), &schema, &[batch]);
+    let data = bytes::Bytes::from(buf);
+
+    use parquet::file::reader::FileReader;
+    let reader = parquet::file::reader::SerializedFileReader::new(data).unwrap();
+    let col_meta = reader.metadata().row_group(0).column(0);
+    assert_eq!(col_meta.compression(), parquet::basic::Compression::UNCOMPRESSED);
+}
+
+#[test]
+fn test_parquet_compression_gzip() {
+    let (schema, batch) = make_basic_batch();
+    let buf = write_to_vec(&ParquetFormat::new(CompressionType::Gzip, Some(6)), &schema, &[batch]);
+    let data = bytes::Bytes::from(buf);
+
+    use parquet::file::reader::FileReader;
+    let reader = parquet::file::reader::SerializedFileReader::new(data).unwrap();
+    let col_meta = reader.metadata().row_group(0).column(0);
+    assert!(
+        matches!(col_meta.compression(), parquet::basic::Compression::GZIP(_)),
+        "expected GZIP, got: {:?}", col_meta.compression()
+    );
+}
+
+#[test]
+fn test_parquet_compression_lz4() {
+    let (schema, batch) = make_basic_batch();
+    let buf = write_to_vec(&ParquetFormat::new(CompressionType::Lz4, None), &schema, &[batch]);
+    let data = bytes::Bytes::from(buf);
+
+    use parquet::file::reader::FileReader;
+    let reader = parquet::file::reader::SerializedFileReader::new(data).unwrap();
+    let col_meta = reader.metadata().row_group(0).column(0);
+    assert_eq!(col_meta.compression(), parquet::basic::Compression::LZ4);
 }
