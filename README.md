@@ -694,6 +694,8 @@ See [Execution Semantics](#execution-semantics) for detailed lifecycle, state up
 
 ## Development
 
+For a **manual user acceptance checklist** (CLI, modes, destinations, compression, skip-empty), see [USER_TEST_PLAN.md](USER_TEST_PLAN.md).
+
 ### Local Setup
 
 Start PostgreSQL and MySQL with Docker:
