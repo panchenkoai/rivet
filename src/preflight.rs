@@ -226,6 +226,8 @@ pub(crate) fn derive_strategy(export: &ExportConfig) -> String {
 }
 
 /// B2: Recommend tuning profile based on row estimate and index usage.
+/// No-index (seq scan) never recommends "fast" — at minimum "balanced",
+/// because seq scans are inherently degraded and should not run aggressively.
 pub(crate) fn recommend_profile(
     row_estimate: Option<i64>,
     uses_index: bool,
@@ -237,7 +239,7 @@ pub(crate) fn recommend_profile(
         (true, r) if r <= 10_000_000 => "balanced",
         (true, _) => "safe",
         (false, r) if r <= 100_000 => {
-            if export.parallel > 1 { "balanced" } else { "fast" }
+            if export.parallel > 1 { "safe" } else { "balanced" }
         }
         (false, r) if r <= 1_000_000 => "balanced",
         (false, _) => "safe",
@@ -1131,16 +1133,16 @@ mod tests {
     }
 
     #[test]
-    fn profile_small_no_index_is_fast() {
+    fn profile_small_no_index_is_balanced() {
         let e = make_export("t", ExportMode::Full, None);
-        assert_eq!(recommend_profile(Some(50_000), false, &e), "fast");
+        assert_eq!(recommend_profile(Some(50_000), false, &e), "balanced");
     }
 
     #[test]
-    fn profile_small_no_index_parallel_is_balanced() {
+    fn profile_small_no_index_parallel_is_safe() {
         let mut e = make_export("t", ExportMode::Full, None);
         e.parallel = 4;
-        assert_eq!(recommend_profile(Some(50_000), false, &e), "balanced");
+        assert_eq!(recommend_profile(Some(50_000), false, &e), "safe");
     }
 
     #[test]
