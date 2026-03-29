@@ -1,0 +1,14 @@
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+  tuning:
+    batch_size_memory_mb: 1
+
+exports:
+  - name: users_memory_batch
+    query: "SELECT id, name, email, age, balance, is_active, bio, created_at, updated_at FROM users"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/output

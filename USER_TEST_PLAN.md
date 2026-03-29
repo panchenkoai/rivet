@@ -34,9 +34,9 @@ Sections marked **(optional)** need extra services or longer runs.
 
 | ID  | Scenario       | Command / Steps                         | Expected                                                           | Pass                                  |
 | --- | -------------- | --------------------------------------- | ------------------------------------------------------------------ | ------------------------------------- |
-| A1  | Help           | `rivet --help`                          | Lists subcommands: run, check, doctor, state, metrics, completions | [x]  |
-| A2  | Completions    | `rivet completions zsh \| head`         | Prints `#compdef rivet` or equivalent | [x] |
-| A3  | Invalid config | `rivet check --config nonexistent.yaml` | Clear error, non-zero exit                                         | [x]  |
+| A1  | Help           | `rivet --help`                          | Lists subcommands: run, check, doctor, state, metrics, completions | [x]                                   |
+| A2  | Completions    | `rivet completions zsh                  | head`                                                              | Prints `#compdef rivet` or equivalent |
+| A3  | Invalid config | `rivet check --config nonexistent.yaml` | Clear error, non-zero exit                                         | [x]                                   |
 
 
 ---
@@ -108,10 +108,10 @@ Sections marked **(optional)** need extra services or longer runs.
 ## Suite G — Structured source URL
 
 
-| ID  | Scenario         | Command / Steps                                  | Expected                            | Pass |
-| --- | ---------------- | ------------------------------------------------ | ----------------------------------- | ---- |
+| ID  | Scenario         | Command / Steps                                                | Expected                            | Pass |
+| --- | ---------------- | -------------------------------------------------------------- | ----------------------------------- | ---- |
 | G1  | PG structured    | `PGPASSWORD=rivet rivet check --config dev/pg_structured.yaml` | Parses host/user/database; connects | [x]  |
-| G2  | MySQL structured | `rivet check --config dev/mysql_structured.yaml` | Same                                | [x]  |
+| G2  | MySQL structured | `rivet check --config dev/mysql_structured.yaml`               | Same                                | [x]  |
 
 
 ---
@@ -179,6 +179,106 @@ exports:
 
 ---
 
+## Suite L — Stdout destination (v4.1)
+
+
+| ID  | Scenario      | Command / Steps                                                     | Expected                          | Pass |
+| --- | ------------- | ------------------------------------------------------------------- | --------------------------------- | ---- |
+| L1  | CSV to stdout | `rivet run --config dev/test_stdout.yaml \| head`                   | CSV rows printed to terminal (header + 5 rows) | [x] |
+| L2  | Pipe to file  | `rivet run --config dev/test_stdout.yaml > /tmp/rivet_stdout.csv`   | File created; logs on stderr only | [x]  |
+
+
+---
+
+## Suite M — Parameterized queries (v4.1)
+
+
+| ID  | Scenario           | Command / Steps                                                | Expected                                 | Pass |
+| --- | ------------------ | -------------------------------------------------------------- | ---------------------------------------- | ---- |
+| M1  | Param substitution | `rivet run --config dev/test_params.yaml --param MAX_ID=10`    | CSV with only ids 1-10                   | [x]  |
+| M2  | Multiple params    | `rivet run --config dev/test_params.yaml --param MAX_ID=5`     | CSV with only ids 1-5                    | [x]  |
+| M3  | Param in check     | `rivet check --config dev/test_params.yaml --param MAX_ID=100` | Preflight completes (no unresolved `${}` | [x]  |
+
+
+---
+
+## Suite N — Data quality checks (v4.1)
+
+
+| ID  | Scenario           | Command / Steps                                                                   | Expected                                          | Pass |
+| --- | ------------------ | --------------------------------------------------------------------------------- | ------------------------------------------------- | ---- |
+| N1  | Quality pass       | `rivet run --config dev/test_quality.yaml --export users_quality_pass --validate` | `quality: pass` in summary, file produced         | [x]  |
+| N2  | Quality fail (max) | `rivet run --config dev/test_quality.yaml --export users_quality_fail_max`        | `quality: FAIL`, export aborted, no file uploaded | [x]  |
+
+
+---
+
+## Suite O — Memory-based batch sizing (v4.1)
+
+
+| ID  | Scenario            | Command / Steps                                               | Expected                                                                        | Pass |
+| --- | ------------------- | ------------------------------------------------------------- | ------------------------------------------------------------------------------- | ---- |
+| O1  | Memory batch sizing | `RUST_LOG=info rivet run --config dev/test_memory_batch.yaml` | Log shows `batch_size_memory_mb=1: estimated row ~NNB, computed batch_size=NNN` | [x]  |
+
+
+---
+
+## Suite P — File size splitting (v4.1)
+
+
+| ID  | Scenario         | Command / Steps                                          | Expected                                                                  | Pass |
+| --- | ---------------- | -------------------------------------------------------- | ------------------------------------------------------------------------- | ---- |
+| P1  | Split files      | `rivet run --config dev/test_file_split.yaml --validate` | Multiple `users_split_*_part0.parquet`, `_part1.parquet`, etc. in output  | [x]  |
+| P2  | Check file count | `ls dev/output/users_split_*_part* \| wc -l`             | More than 1 file                                                          | [x]  |
+
+
+---
+
+## Suite Q — Retry resilience with Toxiproxy (optional)
+
+**What is Toxiproxy?** A TCP proxy that sits between Rivet and the database. You can inject faults (latency, connection drops) to verify that Rivet's retry logic works correctly.
+
+```
+  Rivet ──► localhost:15432 (Toxiproxy) ──► postgres:5432 (real DB)
+```
+
+### Setup (one time)
+
+```bash
+# 1. Start Postgres and Toxiproxy
+docker compose up -d postgres toxiproxy
+
+# 2. Wait for Toxiproxy API to be ready (~5 sec)
+sleep 5
+
+# 3. Create proxy endpoints (Postgres on 15432, MySQL on 13306)
+bash dev/setup_toxiproxy.sh
+
+# 4. Make sure the DB is seeded
+cargo run --release --bin seed -- --target pg --users 10000
+```
+
+Verify the proxy API is up: `curl -s http://localhost:8474/proxies | head` should list `pg` and `mysql`.
+
+### Tests
+
+
+| ID  | Scenario                                   | Steps                                                                                                                                                                            | Expected                                                                                                                                  | Pass |
+| --- | ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ---- |
+| Q1  | Baseline: export through proxy (no faults) | `rivet run --config dev/test_toxiproxy_pg.yaml --validate`                                                                                                                       | Completes, `status: success`, same result as direct connection                                                                            | [x]  |
+| Q2  | Latency: add 3 s delay to every packet     | **Inject:** `curl -s -X POST http://localhost:8474/proxies/pg/toxics -H 'Content-Type: application/json' -d '{"name":"latency","type":"latency","attributes":{"latency":3000}}'` | Returns `{"name":"latency",...}`                                                                                                          | [x]  |
+| Q3  | Export under latency                       | `RUST_LOG=info rivet run --config dev/test_toxiproxy_pg.yaml --validate`                                                                                                         | Slower but still succeeds (safe profile allows 120 s statement timeout)                                                                   | [x]  |
+| Q4  | Remove latency                             | `curl -s -X DELETE http://localhost:8474/proxies/pg/toxics/latency`                                                                                                              | Returns empty (toxic removed)                                                                                                             | [x]  |
+| Q5  | Connection kill: cut connection after 5 KB | **Inject:** `curl -s -X POST http://localhost:8474/proxies/pg/toxics -H 'Content-Type: application/json' -d '{"name":"limit","type":"limit_data","attributes":{"bytes":5000}}'`  | Returns `{"name":"limit",...}`                                                                                                            | [x]  |
+| Q6  | Export under connection kill               | `RUST_LOG=info rivet run --config dev/test_toxiproxy_pg.yaml`                                                                                                                    | Logs show retry attempts (`retry 1/3`, `[reconnecting]`). May succeed (if retry gets through) or fail with clear error — no panic or hang | [x]  |
+| Q7  | Remove connection-kill toxic               | `curl -s -X DELETE http://localhost:8474/proxies/pg/toxics/limit`                                                                                                                | Toxic removed                                                                                                                             | [x]  |
+| Q8  | Final: confirm clean proxy works           | `rivet run --config dev/test_toxiproxy_pg.yaml --validate`                                                                                                                       | `status: success` — proxy is back to normal                                                                                               | [x]  |
+
+
+> **Shortcut:** run `bash dev/test_retry_toxiproxy.sh` to execute Q1–Q8 automatically.
+
+---
+
 ## Sign-off
 
 
@@ -188,7 +288,7 @@ exports:
 | Date           | 2026-03-29                               |
 | Rivet commit   | c3788a5eb3a0635dd1dee898d362dfbacb20b0c8 |
 | Postgres image | `dockercompose postgres:16`              |
-| MySQL image    | ```dockercompose postgres:16 ```         |
+| MySQL image    | `dockercompose postgres:16`              |
 | Notes          |                                          |
 
 
@@ -197,20 +297,26 @@ exports:
 ## Reference — Config files
 
 
-| File                                 | Purpose                        |
-| ------------------------------------ | ------------------------------ |
-| `dev/pg_full.yaml`                   | PG full exports, CSV + Parquet |
-| `dev/pg_incremental.yaml`            | PG incremental                 |
-| `dev/mysql_full.yaml`                | MySQL full                     |
-| `dev/mysql_incremental.yaml`         | MySQL incremental              |
-| `dev/pg_structured.yaml`             | PG structured credentials      |
-| `dev/mysql_structured.yaml`          | MySQL structured credentials   |
-| `dev/bench_chunked_seq.yaml`         | Chunked sequential             |
-| `dev/bench_chunked_p4.yaml`          | Chunked parallel               |
-| `dev/test_meta_columns.yaml`         | Meta columns + zstd            |
-| `dev/test_compression.yaml`          | Snappy / none / skip_empty     |
-| `dev/rivet_s3_minio_test.yaml`       | S3-compatible (MinIO)          |
-| `dev/rivet_gcs_fake_test.yaml`       | GCS emulator                   |
-| `dev/rivet_gcs_rivet_data_test.yaml` | Real GCS                       |
+| File                                 | Purpose                          |
+| ------------------------------------ | -------------------------------- |
+| `dev/pg_full.yaml`                   | PG full exports, CSV + Parquet   |
+| `dev/pg_incremental.yaml`            | PG incremental                   |
+| `dev/mysql_full.yaml`                | MySQL full                       |
+| `dev/mysql_incremental.yaml`         | MySQL incremental                |
+| `dev/pg_structured.yaml`             | PG structured credentials        |
+| `dev/mysql_structured.yaml`          | MySQL structured credentials     |
+| `dev/bench_chunked_seq.yaml`         | Chunked sequential               |
+| `dev/bench_chunked_p4.yaml`          | Chunked parallel                 |
+| `dev/test_meta_columns.yaml`         | Meta columns + zstd              |
+| `dev/test_compression.yaml`          | Snappy / none / skip_empty       |
+| `dev/rivet_s3_minio_test.yaml`       | S3-compatible (MinIO)            |
+| `dev/rivet_gcs_fake_test.yaml`       | GCS emulator                     |
+| `dev/rivet_gcs_rivet_data_test.yaml` | Real GCS                         |
+| `dev/test_stdout.yaml`               | Stdout destination (v4.1)        |
+| `dev/test_params.yaml`               | Parameterized queries (v4.1)     |
+| `dev/test_quality.yaml`              | Data quality checks (v4.1)       |
+| `dev/test_file_split.yaml`           | File size splitting (v4.1)       |
+| `dev/test_memory_batch.yaml`         | Memory-based batch sizing (v4.1) |
+| `dev/test_toxiproxy_pg.yaml`         | Retry via Toxiproxy              |
 
 

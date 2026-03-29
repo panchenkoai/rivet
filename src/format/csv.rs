@@ -10,6 +10,7 @@ pub struct CsvFormat;
 
 pub struct CsvFormatWriter {
     writer: Box<dyn Write + Send>,
+    bytes_written: u64,
 }
 
 impl super::Format for CsvFormat {
@@ -24,8 +25,9 @@ impl super::Format for CsvFormat {
             .map(|f| f.name().as_str())
             .collect::<Vec<_>>()
             .join(",");
+        let header_bytes = header.len() as u64 + 1; // +1 for newline
         writeln!(writer, "{}", header)?;
-        Ok(Box::new(CsvFormatWriter { writer }))
+        Ok(Box::new(CsvFormatWriter { writer, bytes_written: header_bytes }))
     }
 
     fn file_extension(&self) -> &str {
@@ -35,22 +37,32 @@ impl super::Format for CsvFormat {
 
 impl super::FormatWriter for CsvFormatWriter {
     fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        let before = self.bytes_written;
+        let _ = before; // suppress unused warning, we count after
+
+        let mut buf = Vec::new();
         for row_idx in 0..batch.num_rows() {
             let mut first = true;
             for col_idx in 0..batch.num_columns() {
                 if !first {
-                    write!(self.writer, ",")?;
+                    write!(buf, ",")?;
                 }
                 first = false;
-                write_csv_value(&mut self.writer, batch.column(col_idx), row_idx)?;
+                write_csv_value(&mut buf, batch.column(col_idx), row_idx)?;
             }
-            writeln!(self.writer)?;
+            writeln!(buf)?;
         }
+        self.bytes_written += buf.len() as u64;
+        self.writer.write_all(&buf)?;
         Ok(())
     }
 
     fn finish(self: Box<Self>) -> Result<()> {
         Ok(())
+    }
+
+    fn bytes_written(&self) -> u64 {
+        self.bytes_written
     }
 }
 

@@ -1,0 +1,17 @@
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:15432/rivet"
+  tuning:
+    profile: safe
+    max_retries: 3
+    retry_backoff_ms: 1000
+    batch_size: 2000
+
+exports:
+  - name: users_toxi
+    query: "SELECT id, name, email, created_at FROM users LIMIT 5000"
+    mode: full
+    format: csv
+    destination:
+      type: local
+      path: ./dev/output

@@ -1,0 +1,12 @@
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+
+exports:
+  - name: users_parameterized
+    query: "SELECT id, name, email FROM users WHERE id <= ${MAX_ID}"
+    mode: full
+    format: csv
+    destination:
+      type: local
+      path: ./dev/output

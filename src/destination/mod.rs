@@ -2,6 +2,7 @@ pub mod gcs;
 mod gcs_auth;
 pub mod local;
 pub mod s3;
+pub mod stdout;
 
 use std::path::Path;
 
@@ -18,5 +19,6 @@ pub fn create_destination(config: &DestinationConfig) -> Result<Box<dyn Destinat
         DestinationType::Local => Ok(Box::new(local::LocalDestination::new(config)?)),
         DestinationType::S3 => Ok(Box::new(s3::S3Destination::new(config)?)),
         DestinationType::Gcs => Ok(Box::new(gcs::GcsDestination::new(config)?)),
+        DestinationType::Stdout => Ok(Box::new(stdout::StdoutDestination::new()?)),
     }
 }

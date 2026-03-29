@@ -53,15 +53,16 @@ impl super::Source for MysqlSource {
 
         sink.on_schema(schema.clone())?;
 
+        let effective_bs = tuning.effective_batch_size(Some(&schema));
         let row_set = result.iter().ok_or_else(|| anyhow::anyhow!("no result set"))?;
-        let mut row_buf: Vec<mysql::Row> = Vec::with_capacity(tuning.batch_size);
+        let mut row_buf: Vec<mysql::Row> = Vec::with_capacity(effective_bs);
         let mut total_rows: usize = 0;
 
         for row_result in row_set {
             let row = row_result?;
             row_buf.push(row);
 
-            if row_buf.len() >= tuning.batch_size {
+            if row_buf.len() >= effective_bs {
                 total_rows += row_buf.len();
                 let batch = rows_to_record_batch_typed(&schema, &arrow_types, &row_buf)?;
                 sink.on_batch(&batch)?;

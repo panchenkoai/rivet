@@ -540,7 +540,228 @@ exports:
 
 ---
 
-## 14. Observability
+## 14. Stdout destination (pipe workflows)
+
+Send export output directly to stdout for piping into other tools:
+
+```yaml
+exports:
+  - name: users_pipe
+    query: "SELECT id, name, email FROM users LIMIT 100"
+    mode: full
+    format: csv
+    destination:
+      type: stdout
+```
+
+Rivet logs go to **stderr**, so stdout is clean data:
+
+```bash
+# Pipe CSV to DuckDB
+rivet run --config rivet.yaml --export users_pipe | duckdb -c "SELECT * FROM read_csv_auto('/dev/stdin')"
+
+# Redirect to file
+rivet run --config rivet.yaml --export users_pipe > users.csv
+
+# Pipe Parquet to a file (binary)
+rivet run --config rivet.yaml --export users_parquet_pipe > users.parquet
+```
+
+> **Note:** Parquet output to stdout is valid binary — redirect to a file or pipe to tools that accept Parquet on stdin (DuckDB, `pqrs`, etc.).
+
+---
+
+## 15. Parameterized queries
+
+Use `--param key=value` (repeatable) to inject values into `${key}` placeholders in queries:
+
+```yaml
+exports:
+  - name: users_by_country
+    query: "SELECT id, name, email FROM users WHERE country = '${COUNTRY}'"
+    mode: full
+    format: csv
+    destination:
+      type: local
+      path: ./output
+```
+
+```bash
+rivet run --config rivet.yaml --param COUNTRY=US
+rivet run --config rivet.yaml --param COUNTRY=DE --param MAX_AGE=30
+```
+
+Params also work with `query_file`:
+
+```yaml
+exports:
+  - name: filtered
+    query_file: sql/filtered_users.sql   # can contain ${COUNTRY}, ${MIN_ID}
+    format: parquet
+    destination:
+      type: local
+      path: ./output
+```
+
+**Priority:** `--param` values take precedence over environment variables. If `${KEY}` matches both a param and an env var, the param wins.
+
+Params work with `rivet check` too:
+
+```bash
+rivet check --config rivet.yaml --param COUNTRY=US
+```
+
+---
+
+## 16. Data quality checks
+
+Add per-export quality gates that run after extraction, before upload:
+
+```yaml
+exports:
+  - name: orders
+    query: "SELECT id, user_id, email, amount FROM orders"
+    mode: full
+    format: parquet
+    quality:
+      row_count_min: 100        # fail if fewer than 100 rows
+      row_count_max: 10000000   # fail if more than 10M rows
+      null_ratio_max:
+        email: 0.05             # fail if >5% of email values are NULL
+        id: 0.0                 # fail if any id is NULL
+      unique_columns: [id]      # fail if id has duplicates
+    destination:
+      type: gcs
+      bucket: my-bucket
+```
+
+If any check with **Fail** severity triggers, the export aborts before uploading:
+
+```
+[WARN] quality FAIL: column 'email': null ratio 0.1200 exceeds threshold 0.0500
+[ERROR] export 'orders': quality checks failed
+```
+
+The summary shows `quality: FAIL` or `quality: pass`:
+
+```
+── orders ──
+  status:      failed
+  quality:     FAIL
+  ...
+```
+
+> **Memory note:** `unique_columns` collects all values into a HashSet. For very high-cardinality columns (>10M), this can use significant memory. Recommended for primary keys and moderate cardinalities.
+
+---
+
+## 17. Memory-based batch sizing
+
+Instead of specifying a fixed `batch_size` (row count), let Rivet auto-compute batch size based on a memory target:
+
+```yaml
+source:
+  type: postgres
+  url_env: DATABASE_URL
+  tuning:
+    batch_size_memory_mb: 256    # target 256MB per batch
+```
+
+Rivet estimates the average row size from the Arrow schema after the first batch, then computes:
+
+```
+target_rows = memory_mb * 1024 * 1024 / estimated_row_bytes
+```
+
+The result is clamped to `[1000, 500000]` rows. This gives predictable memory usage regardless of row width.
+
+```
+# Log output:
+batch_size_memory_mb=256: estimated row ~266B, computed batch_size=500000
+```
+
+> **Note:** `batch_size` and `batch_size_memory_mb` are mutually exclusive. Specify one or the other.
+
+---
+
+## 18. File size splitting
+
+Split large exports into multiple files when they exceed a size threshold:
+
+```yaml
+exports:
+  - name: events_export
+    query: "SELECT * FROM events"
+    mode: full
+    format: parquet
+    max_file_size: 512MB         # split into ~512MB parts
+    destination:
+      type: gcs
+      bucket: my-bucket
+      prefix: raw/events/
+```
+
+When the output reaches the threshold, Rivet finishes the current file, uploads it, and starts a new one:
+
+```
+events_export_20260329_150000_part0.parquet  (512 MB)
+events_export_20260329_150000_part1.parquet  (512 MB)
+events_export_20260329_150000_part2.parquet  (128 MB)
+```
+
+Supported size formats: `100KB`, `512MB`, `1GB`, `1073741824` (bytes).
+
+If the export fits in a single file, no `_partN` suffix is added.
+
+> **Batch boundary:** splitting happens between batches. If your batch size is large relative to `max_file_size`, individual parts may exceed the threshold. Use a smaller `batch_size` for finer-grained splitting.
+
+> **Cursor safety:** for incremental mode, the cursor is updated only after ALL parts are successfully written.
+
+---
+
+## 19. Slack notifications
+
+Get notified on failures, schema changes, or degraded verdicts:
+
+```yaml
+notifications:
+  slack:
+    webhook_url_env: SLACK_WEBHOOK_URL    # read URL from env var
+    on: [failure, schema_change, degraded]
+```
+
+Set the webhook URL in your environment:
+
+```bash
+export SLACK_WEBHOOK_URL="https://hooks.slack.com/services/T.../B.../xxx"
+```
+
+When a trigger condition matches, Rivet POSTs a message with:
+- Export name and run_id
+- Status, row count, duration
+- Error message (if failed)
+- Schema change flag
+
+You can also use `webhook_url` directly (not recommended for shared configs):
+
+```yaml
+notifications:
+  slack:
+    webhook_url: "https://hooks.slack.com/services/T.../B.../xxx"
+    on: [failure]
+```
+
+Available triggers:
+
+| Trigger | Fires when |
+|---------|-----------|
+| `failure` | Export status is `failed` |
+| `schema_change` | Column schema changed since last run |
+| `degraded` | Export status is `degraded` |
+
+---
+
+## 20. Observability
 
 ### Run history
 
@@ -591,7 +812,7 @@ RUST_LOG=debug rivet run --config rivet.yaml     # full detail
 
 ---
 
-## 15. Scheduling with cron
+## 21. Scheduling with cron
 
 Rivet has no built-in scheduler. Use cron, systemd timers, or Airflow:
 
@@ -607,7 +828,7 @@ Rivet has no built-in scheduler. Use cron, systemd timers, or Airflow:
 
 ---
 
-## 16. Schema change detection
+## 22. Schema change detection
 
 Rivet automatically tracks the column schema of each export. When columns are added, removed, or change type between runs, it logs a warning:
 
@@ -622,7 +843,7 @@ The summary shows `schema: CHANGED` and the flag is persisted in metrics. No act
 
 ---
 
-## 17. Error handling and retries
+## 23. Error handling and retries
 
 Rivet classifies errors automatically:
 
@@ -647,7 +868,7 @@ Backoff is exponential: attempt 1 = base, attempt 2 = 2x base, attempt 3 = 4x ba
 
 ---
 
-## 18. Production checklist
+## 24. Production checklist
 
 Before deploying Rivet to production, verify each item:
 
@@ -666,12 +887,20 @@ Before deploying Rivet to production, verify each item:
 - [ ] `rivet doctor` shows all `[OK]`
 - [ ] Row estimates are reasonable (no accidental `SELECT *` on a billion-row table)
 
+### Quality & Notifications
+
+- [ ] `quality` checks configured for critical exports (row count bounds, null ratio, uniqueness)
+- [ ] `notifications.slack` configured for `failure` and `schema_change` events
+- [ ] `max_file_size` set for exports that may produce very large files (>1GB)
+- [ ] `batch_size_memory_mb` used when row width varies across exports
+
 ### Monitoring
 
 - [ ] `rivet metrics` is checked periodically for failed runs
 - [ ] `rivet state files` confirms expected file output
 - [ ] Logs are captured (`RUST_LOG=info` with output redirect)
 - [ ] Schema change warnings are reviewed after database migrations
+- [ ] Slack notifications are tested with a forced failure before go-live
 
 ### Downstream
 
@@ -689,6 +918,8 @@ Before deploying Rivet to production, verify each item:
 | Verify authentication | `rivet doctor --config rivet.yaml` |
 | Run all exports | `rivet run --config rivet.yaml --validate` |
 | Run one export | `rivet run --config rivet.yaml --export orders --validate` |
+| Run with params | `rivet run --config rivet.yaml --param TABLE=users --param LIMIT=1000` |
+| Pipe to stdout | `rivet run --config rivet.yaml --export csv_export \| duckdb` |
 | Check cursor state | `rivet state show --config rivet.yaml` |
 | Reset a cursor | `rivet state reset --config rivet.yaml --export orders` |
 | View run history | `rivet metrics --config rivet.yaml --last 10` |
@@ -705,6 +936,12 @@ source:
   url_env: DATABASE_URL
   tuning:
     profile: safe
+    batch_size_memory_mb: 256    # auto-tune batch size per schema width
+
+notifications:
+  slack:
+    webhook_url_env: SLACK_WEBHOOK_URL
+    on: [failure, schema_change]
 
 exports:
   # Daily full snapshot of reference data
@@ -713,6 +950,11 @@ exports:
     mode: full
     format: parquet
     compression: zstd
+    quality:
+      row_count_min: 1000
+      null_ratio_max:
+        email: 0.01
+      unique_columns: [id]
     destination:
       type: gcs
       bucket: my-data-lake
@@ -725,6 +967,7 @@ exports:
     cursor_column: updated_at
     format: parquet
     skip_empty: true
+    max_file_size: 512MB
     meta_columns:
       exported_at: true
       row_hash: true
@@ -758,6 +1001,7 @@ exports:
     chunk_size: 500000
     parallel: 4
     format: parquet
+    max_file_size: 1GB
     destination:
       type: local
       path: ./output/backfill

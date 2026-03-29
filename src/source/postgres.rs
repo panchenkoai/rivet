@@ -55,7 +55,8 @@ impl super::Source for PostgresSource {
             effective_query
         ))?;
 
-        let fetch_sql = format!("FETCH {} FROM _rivet", tuning.batch_size);
+        let mut fetch_size = tuning.batch_size;
+        let mut fetch_sql = format!("FETCH {} FROM _rivet", fetch_size);
         let mut schema: Option<SchemaRef> = None;
         let mut columns_cache: Option<Vec<(String, Type)>> = None;
         let mut total_rows: usize = 0;
@@ -74,8 +75,14 @@ impl super::Source for PostgresSource {
                     .collect();
                 let s = Arc::new(pg_columns_to_schema(rows[0].columns()));
                 sink.on_schema(s.clone())?;
-                schema = Some(s);
+                schema = Some(s.clone());
                 columns_cache = Some(stmt_cols);
+
+                let effective = tuning.effective_batch_size(Some(&s));
+                if effective != fetch_size {
+                    fetch_size = effective;
+                    fetch_sql = format!("FETCH {} FROM _rivet", fetch_size);
+                }
             }
 
             let row_count = rows.len();
@@ -88,7 +95,7 @@ impl super::Source for PostgresSource {
 
             log::info!("fetched {} rows so far...", total_rows);
 
-            if row_count < tuning.batch_size {
+            if row_count < fetch_size {
                 break;
             }
 

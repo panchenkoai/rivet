@@ -94,6 +94,10 @@ pub fn doctor(config_path: &str) -> Result<()> {
                 "GCS({})",
                 export.destination.bucket.as_deref().unwrap_or("?")
             ),
+            DestinationType::Stdout => {
+                log::info!("  Stdout: no auth check needed");
+                continue;
+            }
         };
 
         match check_destination_auth(&export.destination) {
@@ -180,7 +184,7 @@ fn categorize_dest_error(err: &anyhow::Error, dest: &crate::config::DestinationC
         match dest.destination_type {
             DestinationType::S3 => "bucket not found",
             DestinationType::Gcs => "bucket not found",
-            DestinationType::Local => "path not found",
+            DestinationType::Local | DestinationType::Stdout => "path not found",
         }
     } else if msg.contains("connect") || msg.contains("refused") || msg.contains("timed out")
         || msg.contains("dns") || msg.contains("endpoint")
@@ -367,8 +371,8 @@ fn collect_warnings(
     warnings
 }
 
-pub fn check(config_path: &str, export_name: Option<&str>) -> Result<()> {
-    let config = Config::load(config_path)?;
+pub fn check(config_path: &str, export_name: Option<&str>, params: Option<&std::collections::HashMap<String, String>>) -> Result<()> {
+    let config = Config::load_with_params(config_path, params)?;
 
     let exports: Vec<&ExportConfig> = if let Some(name) = export_name {
         let e = config
@@ -861,6 +865,8 @@ mod tests {
                 allow_anonymous: false,
             },
             meta_columns: MetaColumns::default(),
+            quality: None,
+            max_file_size: None,
         }
     }
 

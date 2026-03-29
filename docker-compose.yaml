@@ -44,3 +44,15 @@ services:
       - "0.0.0.0"
       - "-port"
       - "4443"
+
+  # Toxiproxy — network fault injection proxy for retry/resilience testing.
+  # Postgres is proxied on port 15432; MySQL on port 13306.
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:latest
+    ports:
+      - "8474:8474"   # HTTP API
+      - "15432:15432"  # proxied Postgres
+      - "13306:13306"  # proxied MySQL
+    depends_on:
+      - postgres
+      - mysql

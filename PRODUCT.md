@@ -29,6 +29,7 @@ Rivet is a source-aware data extraction tool written in Rust. It exports data fr
 | Local filesystem | `std::fs` | `type: local`, `path: ./output` |
 | Amazon S3 | OpenDAL blocking | `type: s3`, `bucket`, `prefix`, `region` |
 | Google Cloud Storage | OpenDAL blocking | `type: gcs`, `bucket`, `prefix` |
+| Stdout | `std::io::stdout` | `type: stdout` — pipe to DuckDB, redirect to file |
 
 ### Extraction Modes
 
@@ -122,11 +123,16 @@ Automatic retry on transient errors with exponential backoff:
 rivet run --config <path>                          # run all exports
 rivet run --config <path> --export <name>          # run a specific export
 rivet run --config <path> --validate               # validate output after write
+rivet run --config <path> --param key=value        # inject query parameter (repeatable)
 rivet check --config <path>                        # preflight check all exports
 rivet check --config <path> --export <name>        # preflight check one export
+rivet check --config <path> --param key=value      # check with query parameter
+rivet doctor --config <path>                       # verify source + destination auth
 rivet state show --config <path>                   # show cursor state
 rivet state reset --config <path> --export <name>  # reset cursor
 rivet state files --config <path>                  # show file manifest
+rivet metrics --config <path>                      # show run history
+rivet completions <shell>                          # generate shell completions
 ```
 
 ---
@@ -171,6 +177,7 @@ trait BatchSink {
 trait FormatWriter {
     fn write_batch(&mut self, batch: &RecordBatch) -> Result<()>;
     fn finish(self: Box<Self>) -> Result<()>;
+    fn bytes_written(&self) -> u64;   // for file-size splitting
 }
 
 trait Format {
@@ -196,11 +203,14 @@ src/
   config.rs            YAML config + validation
   pipeline.rs          Orchestration: modes, chunking, parallel, retry, validate
   error.rs             anyhow Result alias
-  tuning.rs            Profiles (safe/balanced/fast)
+  tuning.rs            Profiles (safe/balanced/fast) + memory-based batch sizing
   resource.rs          RSS monitoring (macOS + Linux)
   preflight.rs         EXPLAIN analysis + verdicts
   state.rs             SQLite cursor state
   types.rs             CursorState
+  notify.rs            Slack webhook notifications
+  quality.rs           Data quality checks (row count, null ratio, uniqueness)
+  enrich.rs            Meta columns (_rivet_exported_at, _rivet_row_hash)
   source/
     mod.rs             Source + BatchSink traits
     postgres.rs        PG server-side cursor implementation
@@ -214,6 +224,7 @@ src/
     local.rs           Local filesystem
     s3.rs              S3 via OpenDAL
     gcs.rs             GCS via OpenDAL
+    stdout.rs          Stdout for pipe workflows
   bin/
     seed.rs            Test data generator
 tests/
@@ -223,21 +234,23 @@ dev/
   postgres/init.sql    PG schema (users, orders, events, page_views, content_items)
   mysql/init.sql       MySQL schema (same tables)
   *.yaml               Test configs for various scenarios
-docker-compose.yaml    PG 16 + MySQL 8
+docker-compose.yaml    PG 16 + MySQL 8 + MinIO + fake-GCS + Toxiproxy
 ```
 
 ### Test Coverage
 
-**234** distinct test cases; `cargo test` reports **405** passes (unit tests in `src/` run for both the library and binary targets).
+**265** distinct test cases; `cargo test` reports **449** passes (unit tests in `src/` run for both the library and binary targets).
 
 | Category | Count | What |
 |---|---|---|
-| config.rs | 44 | YAML parsing, validation, structured/URL credentials, GCS/S3 auth config, meta_columns, compression, skip_empty |
+| config.rs | 53 | YAML parsing, validation, credentials, compression, skip_empty, meta_columns, quality, file_size, params, stdout, notifications, batch_size_memory_mb |
 | preflight.rs | 66 | Verdicts, EXPLAIN parsing, suggestions, strategy, profile recommendation, parallelism recommendation, sparse/dense/parallel warnings, doctor categorization |
 | pipeline.rs | 19 | Chunks, time-window, cursor, classify_error, credential errors, format_bytes, RunSummary |
-| state.rs | 18 | SQLite CRUD, metrics, schema tracking, file manifest |
-| tuning.rs | 8 | Profiles, overrides, display |
+| state.rs | 16 | SQLite CRUD, metrics, schema tracking, file manifest |
+| tuning.rs | 12 | Profiles, overrides, display, estimate_row_bytes, compute_batch_size_from_memory, effective_batch_size |
+| quality.rs | 7 | Row count bounds, null ratio, uniqueness, run_checks |
 | enrich.rs | 6 | Meta columns: exported_at, row_hash, determinism, null vs empty |
+| notify.rs | 3 | Slack trigger matching, no-config no-op, success-no-trigger |
 | destination/gcs_auth.rs | 7 | ADC parsing, urlenc, authorized_user validation |
 | source/postgres.rs + mysql.rs | 6 | build_query (full, incremental, cursor) |
 | format_golden.rs | 11 | CSV output + Parquet round-trip + compression variants (zstd, snappy, gzip, lz4, none) |
@@ -284,9 +297,7 @@ docker-compose.yaml    PG 16 + MySQL 8
 | No Load/Merge step | Extract only. No BigQuery/warehouse loading, no MERGE/upsert |
 | No CDC | No WAL/binlog reading, query-based extraction only |
 | No orchestration | No built-in scheduler, depends on external cron/Airflow |
-| No data quality checks | No NULL ratio, uniqueness, completeness checks (planned) |
 | No web UI / API | CLI only |
-| No notifications | No Slack/email alerting (planned) |
 | No encryption | Output files are not encrypted |
 | Single-machine | No distributed execution |
 
@@ -331,7 +342,7 @@ All documented in README under "Execution Semantics".
 
 ### Observability and Run Summary (Epic D)
 
-Every export now prints a structured end-of-run summary to stdout:
+Every export now prints a structured end-of-run summary to stderr (keeps stdout clean for pipe workflows):
 
 ```
 ── orders ──
@@ -404,6 +415,8 @@ README restructured around real usage decisions:
 
 **Phase 1 "Pilot Alpha Stabilization" (Epics A–E + D3/D4/L6) is complete.** All auth flows are implemented and tested, execution semantics are frozen and documented, run summaries are printed and persisted with canonical run IDs, file manifest accounting is in place, parallelism recommendations are provided by the planner, and documentation covers real usage decisions.
 
+**v4.1 "Output Quality & DX" (F1–F6) is complete.** Stdout destination for pipe workflows, parameterized queries, Slack notifications, memory-based batch sizing, data quality checks (row count bounds, null ratio, uniqueness), and file size splitting are all implemented and tested.
+
 ## v4 Features (implemented)
 
 ### Configurable Parquet Compression (Story M1)
@@ -447,20 +460,62 @@ README restructured around real usage decisions:
 - Scale: 1 (too small / no index + large) → 2 (moderate or no-index conservative) → 4 (large indexed)
 - Includes reason string explaining the recommendation
 
+## v4.1 Features (implemented)
+
+### Stdout Destination (F1)
+
+- `destination: { type: stdout }` for pipe workflows
+- CSV to terminal, Parquet to file redirect, pipe to DuckDB
+- Logging to stderr, data to stdout — no mixing
+
+### Parameterized Queries (F2)
+
+- `--param key=value` CLI flag (repeatable) for `rivet run` and `rivet check`
+- `${key}` placeholders substituted in queries and `query_file` contents
+- Params take precedence over env vars of the same name
+
+### Slack Notifications (F3)
+
+- `notifications.slack` config block with `webhook_url` or `webhook_url_env`
+- Triggers: `failure`, `schema_change`, `degraded`
+- POSTs color-coded Slack attachment with run_id, status, rows, error
+
+### Memory-based Batch Sizing (F4)
+
+- `batch_size_memory_mb: 256` in tuning config
+- Auto-computes batch_size from Arrow schema width after first batch
+- Heuristic: fixed-width types are exact, strings estimated at 256B
+- Clamped to `[1000, 500000]` rows
+- Mutually exclusive with explicit `batch_size`
+
+### Data Quality Checks (F5)
+
+- Per-export `quality` config: `row_count_min`, `row_count_max`, `null_ratio_max`, `unique_columns`
+- Runs after extraction, before upload — fail-level issues abort the export
+- Null ratios tracked incrementally (no full data buffering)
+- Uniqueness via streaming HashSet (recommended for <10M cardinality)
+- Summary shows `quality: pass` or `quality: FAIL`
+
+### File Size Splitting (F6)
+
+- `max_file_size: 512MB` per export (supports KB/MB/GB suffixes)
+- After each batch, checks `bytes_written()` on the FormatWriter
+- Splits on batch boundaries — use smaller `batch_size` for finer granularity
+- When threshold exceeded: finishes current file, uploads part, opens new writer
+- File naming: `{export}_{ts}_part{N}.{ext}` (no suffix when single file)
+- Cursor advances only after ALL parts succeed
+
 ---
 
 ## Roadmap
 
-### v4.1: Output & CLI Improvements + Data Quality (next)
+### v4.2: Resilience & Testing (in progress)
 
-| Feature | Description | Complexity |
-|---|---|---|
-| File size splitting | `max_file_size: 512MB` — split full/incremental output into parts | Medium |
-| Memory-based batch sizing | `batch_size_memory: 256MB` — predictable RSS regardless of row width | Medium |
-| Parameterized queries | `${ENV_VAR}` in queries, `--param key=value` CLI flag | Medium |
-| Stdout destination | `destination: stdout` for pipe workflows (`rivet ... \| duckdb`) | Low |
-| Data quality checks | NULL ratio, uniqueness check, row count bounds per export | Medium |
-| Slack notifications | Webhook on failure, degraded verdict, schema change | Low |
+| Feature | Description | Complexity | Status |
+|---|---|---|---|
+| Toxiproxy integration | Network fault injection for retry/resilience testing | Low | **Done** — docker-compose service, setup script, E2E test script (Q1–Q8 all pass) |
+| E2E test harness | Automated test scripts for all v4.1 features | Medium | **Done** — `dev/test_*.yaml` configs, `USER_TEST_PLAN.md` suites L–Q all pass |
+| CI pipeline | GitHub Actions for build, test, lint on every PR | Medium | Pending |
 
 ### v4: Load + Transform
 
@@ -508,6 +563,7 @@ README restructured around real usage decisions:
 | `chrono` | Timestamp handling |
 | `anyhow` | Error handling |
 | `env_logger` + `log` | Logging |
+| `reqwest` | HTTP client (Slack notifications) |
 | `tempfile` | Temporary file for streaming writes |
 | `libc` + `mach2` | macOS memory monitoring |
 | `rand` | Test data generation (seed tool) |

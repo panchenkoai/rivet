@@ -1,8 +1,10 @@
+use arrow::datatypes::{DataType, SchemaRef};
 use serde::Deserialize;
 
 #[derive(Debug, Clone)]
 pub struct SourceTuning {
     pub batch_size: usize,
+    pub batch_size_memory_mb: Option<usize>,
     pub throttle_ms: u64,
     pub statement_timeout_s: u64,
     pub max_retries: u32,
@@ -23,6 +25,8 @@ pub enum TuningProfile {
 pub struct TuningConfig {
     pub profile: Option<TuningProfile>,
     pub batch_size: Option<usize>,
+    /// Target memory per batch in MB. Mutually exclusive with batch_size.
+    pub batch_size_memory_mb: Option<usize>,
     pub throttle_ms: Option<u64>,
     pub statement_timeout_s: Option<u64>,
     pub max_retries: Option<u32>,
@@ -41,6 +45,7 @@ impl SourceTuning {
 
         if let Some(cfg) = config {
             if let Some(v) = cfg.batch_size { tuning.batch_size = v; }
+            tuning.batch_size_memory_mb = cfg.batch_size_memory_mb;
             if let Some(v) = cfg.throttle_ms { tuning.throttle_ms = v; }
             if let Some(v) = cfg.statement_timeout_s { tuning.statement_timeout_s = v; }
             if let Some(v) = cfg.max_retries { tuning.max_retries = v; }
@@ -56,6 +61,7 @@ impl SourceTuning {
         match profile {
             TuningProfile::Fast => Self {
                 batch_size: 50_000,
+                batch_size_memory_mb: None,
                 throttle_ms: 0,
                 statement_timeout_s: 0,
                 max_retries: 1,
@@ -65,6 +71,7 @@ impl SourceTuning {
             },
             TuningProfile::Balanced => Self {
                 batch_size: 10_000,
+                batch_size_memory_mb: None,
                 throttle_ms: 50,
                 statement_timeout_s: 300,
                 max_retries: 3,
@@ -74,6 +81,7 @@ impl SourceTuning {
             },
             TuningProfile::Safe => Self {
                 batch_size: 2_000,
+                batch_size_memory_mb: None,
                 throttle_ms: 500,
                 statement_timeout_s: 120,
                 max_retries: 5,
@@ -107,6 +115,52 @@ impl std::fmt::Display for SourceTuning {
             self.max_retries,
             self.lock_timeout_s,
         )
+    }
+}
+
+/// Estimate average row size in bytes from an Arrow schema.
+pub fn estimate_row_bytes(schema: &SchemaRef) -> usize {
+    const STRING_ESTIMATE: usize = 256;
+    let mut total: usize = 0;
+    for field in schema.fields() {
+        total += match field.data_type() {
+            DataType::Boolean | DataType::Int8 | DataType::UInt8 => 1,
+            DataType::Int16 | DataType::UInt16 => 2,
+            DataType::Int32 | DataType::UInt32 | DataType::Float32 | DataType::Date32 => 4,
+            DataType::Int64 | DataType::UInt64 | DataType::Float64
+            | DataType::Date64 | DataType::Timestamp(_, _) | DataType::Time64(_)
+            | DataType::Duration(_) => 8,
+            DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => 16,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary
+            | DataType::LargeBinary => STRING_ESTIMATE,
+            _ => 64,
+        };
+        total += 1; // validity bitmap overhead (rounded up)
+    }
+    total.max(1)
+}
+
+/// Compute batch_size from a memory target in MB and estimated row size.
+pub fn compute_batch_size_from_memory(memory_mb: usize, schema: &SchemaRef) -> usize {
+    let row_bytes = estimate_row_bytes(schema);
+    let target = memory_mb * 1024 * 1024 / row_bytes;
+    target.clamp(1_000, 500_000)
+}
+
+impl SourceTuning {
+    /// If `batch_size_memory_mb` is set, compute and return an adjusted batch_size
+    /// from the schema; otherwise return the configured `batch_size`.
+    pub fn effective_batch_size(&self, schema: Option<&SchemaRef>) -> usize {
+        if let (Some(mem_mb), Some(schema)) = (self.batch_size_memory_mb, schema) {
+            let computed = compute_batch_size_from_memory(mem_mb, schema);
+            log::info!(
+                "batch_size_memory_mb={}: estimated row ~{}B, computed batch_size={}",
+                mem_mb, estimate_row_bytes(schema), computed
+            );
+            computed
+        } else {
+            self.batch_size
+        }
     }
 }
 
@@ -192,5 +246,61 @@ mod tests {
         assert!(s.contains("timeout=300s"), "missing timeout in: {s}");
         assert!(s.contains("retries=3"), "missing retries in: {s}");
         assert!(s.contains("lock_timeout=30s"), "missing lock_timeout in: {s}");
+    }
+
+    #[test]
+    fn estimate_row_bytes_basic() {
+        use arrow::datatypes::{Field, Schema};
+        use std::sync::Arc;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", arrow::datatypes::DataType::Int64, false),
+            Field::new("name", arrow::datatypes::DataType::Utf8, true),
+        ]));
+        let est = estimate_row_bytes(&schema);
+        // Int64=8+1, Utf8=256+1 = 266
+        assert_eq!(est, 266);
+    }
+
+    #[test]
+    fn compute_batch_size_clamped() {
+        use arrow::datatypes::{Field, Schema};
+        use std::sync::Arc;
+        // 1 tiny column -> huge batch, clamped to 500_000
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("flag", arrow::datatypes::DataType::Boolean, false),
+        ]));
+        assert_eq!(compute_batch_size_from_memory(256, &schema), 500_000);
+
+        // 100 large string columns -> small batch, clamped to 1_000
+        let fields: Vec<Field> = (0..100)
+            .map(|i| Field::new(format!("c{i}"), arrow::datatypes::DataType::Utf8, true))
+            .collect();
+        let schema = Arc::new(Schema::new(fields));
+        assert_eq!(compute_batch_size_from_memory(1, &schema), 1_000);
+    }
+
+    #[test]
+    fn effective_batch_size_without_memory() {
+        let t = SourceTuning::from_config(None);
+        assert_eq!(t.effective_batch_size(None), 10_000);
+    }
+
+    #[test]
+    fn effective_batch_size_with_memory() {
+        use arrow::datatypes::{Field, Schema};
+        use std::sync::Arc;
+        let cfg = TuningConfig {
+            batch_size_memory_mb: Some(256),
+            ..Default::default()
+        };
+        let t = SourceTuning::from_config(Some(&cfg));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", arrow::datatypes::DataType::Int64, false),
+            Field::new("name", arrow::datatypes::DataType::Utf8, true),
+        ]));
+        let bs = t.effective_batch_size(Some(&schema));
+        assert!(bs >= 1_000 && bs <= 500_000, "got {bs}");
+        // 256MB / 266B ≈ 1_009_022, clamped to 500_000
+        assert_eq!(bs, 500_000);
     }
 }

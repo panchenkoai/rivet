@@ -1,0 +1,11 @@
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+
+exports:
+  - name: users_stdout_csv
+    query: "SELECT id, name, email FROM users LIMIT 5"
+    mode: full
+    format: csv
+    destination:
+      type: stdout

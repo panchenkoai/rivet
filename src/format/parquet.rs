@@ -70,4 +70,8 @@ impl super::FormatWriter for ParquetFormatWriter {
         self.inner.close()?;
         Ok(())
     }
+
+    fn bytes_written(&self) -> u64 {
+        self.inner.bytes_written() as u64
+    }
 }

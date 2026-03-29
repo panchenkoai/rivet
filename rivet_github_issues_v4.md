@@ -103,11 +103,11 @@ As an operator, I want Rivet to resolve credentials predictably so I know which 
 - Rivet does not silently choose an unexpected auth source
 
 #### Tasks
-- [ ] Document DB credential precedence
-- [ ] Document GCS credential precedence
-- [ ] Document S3 credential precedence
-- [ ] Add config comments/examples for auth precedence
-- [ ] Add tests for precedence resolution
+- [x] Document DB credential precedence
+- [x] Document GCS credential precedence
+- [x] Document S3 credential precedence
+- [x] Add config comments/examples for auth precedence
+- [x] Add tests for precedence resolution
 
 ---
 
@@ -123,10 +123,10 @@ As a GCP user, I want Rivet to use Application Default Credentials so I can run 
 - Failure mode is explicit if ADC unavailable
 
 #### Tasks
-- [ ] Implement ADC auth path for GCS destination
-- [ ] Add integration test for ADC resolution path
-- [ ] Add explicit error text for missing ADC credentials
-- [ ] Add README example for ADC-based GCS config
+- [x] Implement ADC auth path for GCS destination
+- [x] Add integration test for ADC resolution path
+- [x] Add explicit error text for missing ADC credentials
+- [x] Add README example for ADC-based GCS config
 
 ---
 
@@ -142,11 +142,11 @@ As an operator, I want to provide a service account JSON file explicitly when AD
 - Docs explain when to prefer ADC vs JSON
 
 #### Tasks
-- [ ] Add config field for GCS credentials file
-- [ ] Add env var support for GCS credentials file
-- [ ] Validate file existence and parseability
-- [ ] Add unit tests for bad/missing file
-- [ ] Add docs section for explicit JSON auth
+- [x] Add config field for GCS credentials file
+- [x] Add env var support for GCS credentials file
+- [x] Validate file existence and parseability
+- [x] Add unit tests for bad/missing file
+- [x] Add docs section for explicit JSON auth
 
 ---
 
@@ -162,11 +162,11 @@ As a user, I want to configure PostgreSQL/MySQL either with a URL or structured 
 - Validation errors are clear and actionable
 
 #### Tasks
-- [ ] Define canonical DB credential config schema
-- [ ] Support URL + structured fields for PG
-- [ ] Support URL + structured fields for MySQL
-- [ ] Add config validation errors for missing fields
-- [ ] Add example configs for both styles
+- [x] Define canonical DB credential config schema
+- [x] Support URL + structured fields for PG
+- [x] Support URL + structured fields for MySQL
+- [x] Add config validation errors for missing fields
+- [x] Add example configs for both styles
 
 ---
 
@@ -182,11 +182,11 @@ As an operator, I want a quick way to verify source and destination auth before 
 - Error output clearly distinguishes auth vs connectivity vs permission issues
 
 #### Tasks
-- [ ] Extend `rivet check` or add `rivet doctor`
-- [ ] Add source auth check
-- [ ] Add destination auth check
-- [ ] Add explicit auth failure categorization
-- [ ] Add docs for pre-run auth verification
+- [x] Extend `rivet check` or add `rivet doctor`
+- [x] Add source auth check
+- [x] Add destination auth check
+- [x] Add explicit auth failure categorization
+- [x] Add docs for pre-run auth verification
 
 ---
 
@@ -208,10 +208,10 @@ As a user, I want Rivet to tell me which extraction strategy it plans to use so 
 - Output is stable and user-friendly
 
 #### Tasks
-- [ ] Define strategy names for display
-- [ ] Add strategy selection output to preflight
-- [ ] Add tests for strategy rendering
-- [ ] Document strategy names in docs
+- [x] Define strategy names for display
+- [x] Add strategy selection output to preflight
+- [x] Add tests for strategy rendering
+- [x] Document strategy names in docs
 
 ---
 
@@ -227,10 +227,10 @@ As an operator, I want Rivet to suggest safe/balanced/fast so I do not overload 
 - Recommendation reflects hot/wide/large-table risks when detectable
 
 #### Tasks
-- [ ] Define profile recommendation heuristics
-- [ ] Add recommendation output to check
-- [ ] Add tests for safe/balanced/fast recommendation
-- [ ] Document recommendation rules
+- [x] Define profile recommendation heuristics
+- [x] Add recommendation output to check
+- [x] Add tests for safe/balanced/fast recommendation
+- [x] Document recommendation rules
 
 ---
 
@@ -246,10 +246,10 @@ As a user of chunked mode, I want Rivet to warn me when sparse keys will create 
 - Docs explain tradeoff
 
 #### Tasks
-- [ ] Define sparse-range heuristic
-- [ ] Add sparse-range warning to check
-- [ ] Add warning tests
-- [ ] Link warning to docs/example fixes
+- [x] Define sparse-range heuristic
+- [x] Add sparse-range warning to check
+- [x] Add warning tests
+- [x] Link warning to docs/example fixes
 
 ---
 
@@ -265,10 +265,10 @@ As a user, I want Rivet to warn me that dense surrogate chunking may require sor
 - Appears only when relevant
 
 #### Tasks
-- [ ] Add dense-surrogate warning text
-- [ ] Trigger warning for known workaround patterns
-- [ ] Add docs section for dense surrogate tradeoffs
-- [ ] Add tests for warning emission
+- [x] Add dense-surrogate warning text
+- [x] Trigger warning for known workaround patterns
+- [x] Add docs section for dense surrogate tradeoffs
+- [x] Add tests for warning emission
 
 ---
 
@@ -284,10 +284,10 @@ As an operator, I want Rivet to warn me when parallel mode plus wide rows may ca
 - Docs mention parallel cost for wide-row tables
 
 #### Tasks
-- [ ] Define memory-risk heuristic for preflight
-- [ ] Add parallel risk warning
-- [ ] Add docs for parallel tradeoffs
-- [ ] Add tests for warning paths
+- [x] Define memory-risk heuristic for preflight
+- [x] Add parallel risk warning
+- [x] Add docs for parallel tradeoffs
+- [x] Add tests for warning paths
 
 ---
 
@@ -303,10 +303,10 @@ As a user, I want actionable next steps when Rivet marks a query as degraded or 
 - Suggestions are not generic boilerplate
 
 #### Tasks
-- [ ] Create suggestion catalog by failure/verdict type
-- [ ] Wire suggestions into check output
-- [ ] Add tests for verdict suggestions
-- [ ] Review wording for clarity and brevity
+- [x] Create suggestion catalog by failure/verdict type
+- [x] Wire suggestions into check output
+- [x] Add tests for verdict suggestions
+- [x] Review wording for clarity and brevity
 
 ---
 
@@ -328,10 +328,10 @@ As a user, I want to understand Rivet's execution lifecycle so I know what happe
 - Lifecycle covers read/write/upload/validate/state/finalize
 
 #### Tasks
-- [ ] Write lifecycle spec
-- [ ] Review lifecycle against implementation
-- [ ] Add lifecycle diagram to docs
-- [ ] Add lifecycle references from README/PRODUCT docs
+- [x] Write lifecycle spec
+- [x] Review lifecycle against implementation
+- [x] Add lifecycle diagram to docs
+- [x] Add lifecycle references from README/PRODUCT docs
 
 ---
 
@@ -347,10 +347,10 @@ As an operator, I want to know exactly when Rivet advances cursor/state so I can
 - Review confirms no ambiguous checkpoint movement
 
 #### Tasks
-- [ ] Define checkpoint advancement rule
-- [ ] Audit implementation against rule
-- [ ] Add tests for state advancement timing
-- [ ] Document state update semantics
+- [x] Define checkpoint advancement rule
+- [x] Audit implementation against rule
+- [x] Add tests for state advancement timing
+- [x] Document state update semantics
 
 ---
 
@@ -366,10 +366,10 @@ As a user, I want to know where duplicates may happen so I can design downstream
 - Docs include recommended downstream handling assumptions
 
 #### Tasks
-- [ ] Document duplicate-prone scenarios
-- [ ] Add overlap/time_window duplicate notes
-- [ ] Add rerun duplicate notes
-- [ ] Link duplicate semantics from mode docs
+- [x] Document duplicate-prone scenarios
+- [x] Add overlap/time_window duplicate notes
+- [x] Add rerun duplicate notes
+- [x] Link duplicate semantics from mode docs
 
 ---
 
@@ -385,10 +385,10 @@ As an operator, I want retry behavior to be understandable so I can trust failur
 - CLI messaging aligns with documentation
 
 #### Tasks
-- [ ] Document retry categories
-- [ ] Review retry text in CLI/logging
-- [ ] Add examples of retry vs fail-fast
-- [ ] Add tests for retry messaging if applicable
+- [x] Document retry categories
+- [x] Review retry text in CLI/logging
+- [x] Add examples of retry vs fail-fast
+- [x] Add tests for retry messaging if applicable
 
 ---
 
@@ -404,10 +404,10 @@ As a user, I want to know what `--validate` proves and what it does not prove.
 - Docs distinguish file integrity vs source/output equivalence
 
 #### Tasks
-- [ ] Write validation semantics doc section
-- [ ] Update README wording around validate
-- [ ] Add examples of what validate catches
-- [ ] Add examples of what validate does not catch
+- [x] Write validation semantics doc section
+- [x] Update README wording around validate
+- [x] Add examples of what validate catches
+- [x] Add examples of what validate does not catch
 
 ---
 
@@ -428,10 +428,10 @@ As an operator, I want one consistent summary format so I can quickly inspect ex
 - Same schema used across CLI/logs/metrics where possible
 
 #### Tasks
-- [ ] Define summary fields
-- [ ] Review field usefulness with current metrics
-- [ ] Add schema to docs/spec
-- [ ] Add tests for summary serialization/rendering if needed
+- [x] Define summary fields
+- [x] Review field usefulness with current metrics
+- [x] Add schema to docs/spec
+- [x] Add tests for summary serialization/rendering if needed
 
 ---
 
@@ -447,10 +447,10 @@ As an operator, I want a clear summary after each run so I can see what happened
 - Summary includes validation/retry/schema-change information
 
 #### Tasks
-- [ ] Implement summary rendering
-- [ ] Include summary in CLI output
-- [ ] Ensure summary also appears in log stream
-- [ ] Add output tests/golden tests
+- [x] Implement summary rendering
+- [x] Include summary in CLI output
+- [x] Ensure summary also appears in log stream
+- [x] Add output tests/golden tests
 
 ---
 
@@ -466,10 +466,10 @@ As a user, I want to inspect which files were created by a run so I can reconcil
 - Accounting is stable enough for pilot operations
 
 #### Tasks
-- [ ] Define file accounting schema
-- [ ] Persist file-level output metadata
-- [ ] Add CLI or state inspection path
-- [ ] Add tests for file accounting persistence
+- [x] Define file accounting schema
+- [x] Persist file-level output metadata
+- [x] Add CLI or state inspection path
+- [x] Add tests for file accounting persistence
 
 ---
 
@@ -485,10 +485,10 @@ As an operator, I want `rivet metrics` and end-of-run output to agree on totals 
 - No confusing mismatch between summary and metrics history
 
 #### Tasks
-- [ ] Define canonical run identifier usage
-- [ ] Align summary and metrics storage/output
-- [ ] Add consistency tests
-- [ ] Update docs/examples
+- [x] Define canonical run identifier usage
+- [x] Align summary and metrics storage/output
+- [x] Add consistency tests
+- [x] Update docs/examples
 
 ---
 
@@ -509,10 +509,10 @@ As a new user, I want the README to quickly tell me what Rivet is, when to use i
 - Opening emphasizes lightweight, source-safe, predictable extract-only behavior
 
 #### Tasks
-- [ ] Rewrite README introduction
-- [ ] Add “What Rivet is / is not” section
-- [ ] Add tighter problem statement
-- [ ] Review docs for consistency with README positioning
+- [x] Rewrite README introduction
+- [x] Add “What Rivet is / is not” section
+- [x] Add tighter problem statement
+- [x] Review docs for consistency with README positioning
 
 ---
 
@@ -527,10 +527,10 @@ As a user, I want practical guidance on choosing full, incremental, chunked, or 
 - Includes warnings and tradeoffs, not only happy-path examples
 
 #### Tasks
-- [ ] Write mode decision matrix
-- [ ] Add examples per mode
-- [ ] Add failure/anti-pattern notes
-- [ ] Link from README/config docs
+- [x] Write mode decision matrix
+- [x] Add examples per mode
+- [x] Add failure/anti-pattern notes
+- [x] Link from README/config docs
 
 ---
 
@@ -545,10 +545,10 @@ As an operator, I want practical guidance on when to use safe, balanced, or fast
 - Explicitly warns against using fast in fragile environments
 
 #### Tasks
-- [ ] Write profile guide
-- [ ] Add prod vs replica vs dedicated-source examples
-- [ ] Add wide-row/parallel caution notes
-- [ ] Link from README and check output docs
+- [x] Write profile guide
+- [x] Add prod vs replica vs dedicated-source examples
+- [x] Add wide-row/parallel caution notes
+- [x] Link from README and check output docs
 
 ---
 
@@ -563,11 +563,11 @@ As a user, I want one auth guide so I can configure Rivet without reading source
 - Contains runnable examples
 
 #### Tasks
-- [ ] Write DB auth section
-- [ ] Write GCS ADC section
-- [ ] Write GCS JSON section
-- [ ] Add auth troubleshooting tips
-- [ ] Link from README
+- [x] Write DB auth section
+- [x] Write GCS ADC section
+- [x] Write GCS JSON section
+- [x] Add auth troubleshooting tips
+- [x] Link from README
 
 ---
 
@@ -582,12 +582,14 @@ As a user, I want a plain-language statement of guarantees and limitations so I 
 - Covers extract-only scope, no CDC, no merge/load, duplicate semantics, no exactly-once promise
 
 #### Tasks
-- [ ] Draft guarantees/limitations document
-- [ ] Review against current implementation
-- [ ] Add links from README and PRODUCT docs
-- [ ] Keep wording precise and non-marketing
+- [x] Draft guarantees/limitations document
+- [x] Review against current implementation
+- [x] Add links from README and PRODUCT docs
+- [x] Keep wording precise and non-marketing
 
 ---
+
+> **Status: Phase 1 complete.** All Epics A–E implemented, tested (449 unit tests), and documented. v4.1 features (stdout, params, quality, notifications, memory batch sizing, file splitting) shipped on top.
 
 # Phase 2 — Pilot Readiness & Battle Testing
 
@@ -703,10 +705,10 @@ As a developer, I want a local S3-compatible environment so I can test upload be
 - End-to-end export to MinIO works
 
 #### Tasks
-- [ ] Add MinIO to docker compose
-- [ ] Add sample MinIO config
-- [ ] Add local upload test
-- [ ] Document MinIO quickstart
+- [x] Add MinIO to docker compose
+- [x] Add sample MinIO config
+- [x] Add local upload test
+- [x] Document MinIO quickstart
 
 ---
 
@@ -721,12 +723,15 @@ As a developer, I want to simulate flaky networks so I can validate retry and re
 - Fault tests are repeatable
 
 #### Tasks
-- [ ] Choose fault injection tool
-- [ ] Add tool to dev environment
-- [ ] Create timeout scenario
-- [ ] Create connection reset scenario
-- [ ] Create intermittent latency scenario
-- [ ] Document usage
+- [x] Choose fault injection tool
+- [x] Add tool to dev environment
+- [x] Create timeout scenario
+- [x] Create connection reset scenario
+- [x] Create intermittent latency scenario
+- [x] Document usage
+
+> **Status: G1 + G2 complete.** MinIO in docker-compose, Toxiproxy with E2E test suite (Q1–Q8), all passing.
+
 
 ---
 
@@ -1210,11 +1215,11 @@ As an operator, I want Rivet to suggest a safe and useful parallelism level, so 
 - Docs explain that gains depend on source health, index quality, and row width
 
 #### Tasks
-- [ ] Define heuristics for recommended parallelism
-- [ ] Add recommendation to `rivet check`
-- [ ] Distinguish no-parallel / conservative / performance-oriented recommendations
-- [ ] Add docs for parallelism recommendations
-- [ ] Add tests for recommendation paths
+- [x] Define heuristics for recommended parallelism
+- [x] Add recommendation to `rivet check`
+- [x] Distinguish no-parallel / conservative / performance-oriented recommendations
+- [x] Add docs for parallelism recommendations
+- [x] Add tests for recommendation paths
 
 ---
 

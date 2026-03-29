@@ -1,0 +1,26 @@
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+
+exports:
+  - name: users_quality_pass
+    query: "SELECT id, name, email, created_at FROM users LIMIT 500"
+    mode: full
+    format: parquet
+    quality:
+      row_count_min: 1
+      row_count_max: 1000
+      unique_columns: [id]
+    destination:
+      type: local
+      path: ./dev/output
+
+  - name: users_quality_fail_max
+    query: "SELECT id, name, email FROM users"
+    mode: full
+    format: csv
+    quality:
+      row_count_max: 10
+    destination:
+      type: local
+      path: ./dev/output

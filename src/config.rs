@@ -8,6 +8,29 @@ use crate::tuning::TuningConfig;
 pub struct Config {
     pub source: SourceConfig,
     pub exports: Vec<ExportConfig>,
+    #[serde(default)]
+    pub notifications: Option<NotificationsConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct NotificationsConfig {
+    pub slack: Option<SlackConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SlackConfig {
+    pub webhook_url: Option<String>,
+    pub webhook_url_env: Option<String>,
+    #[serde(default)]
+    pub on: Vec<NotifyEvent>,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyEvent {
+    Failure,
+    SchemaChange,
+    Degraded,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -155,6 +178,20 @@ pub struct ExportConfig {
     pub destination: DestinationConfig,
     #[serde(default)]
     pub meta_columns: MetaColumns,
+    #[serde(default)]
+    pub quality: Option<QualityConfig>,
+    /// Max file size before splitting, e.g. "512MB", "1GB".
+    pub max_file_size: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct QualityConfig {
+    pub row_count_min: Option<usize>,
+    pub row_count_max: Option<usize>,
+    #[serde(default)]
+    pub null_ratio_max: std::collections::HashMap<String, f64>,
+    #[serde(default)]
+    pub unique_columns: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -249,15 +286,34 @@ pub enum DestinationType {
     Local,
     S3,
     Gcs,
+    Stdout,
 }
 
 impl ExportConfig {
-    pub fn resolve_query(&self, config_dir: &Path) -> crate::error::Result<String> {
+    pub fn max_file_size_bytes(&self) -> Option<u64> {
+        self.max_file_size.as_ref().and_then(|s| parse_file_size(s).ok())
+    }
+
+    /// Resolve the query text. If `params` are provided, `${key}` placeholders in
+    /// `query_file` contents are substituted (inline `query` was already substituted
+    /// when the YAML was loaded).
+    pub fn resolve_query(
+        &self,
+        config_dir: &Path,
+        params: Option<&std::collections::HashMap<String, String>>,
+    ) -> crate::error::Result<String> {
         match (&self.query, &self.query_file) {
-            (Some(q), None) => Ok(q.clone()),
+            (Some(q), None) => {
+                if params.is_some() {
+                    Ok(resolve_vars(q, params))
+                } else {
+                    Ok(q.clone())
+                }
+            }
             (None, Some(file)) => {
                 let path = config_dir.join(file);
-                Ok(std::fs::read_to_string(&path)?)
+                let raw = std::fs::read_to_string(&path)?;
+                Ok(resolve_vars(&raw, params))
             }
             (Some(_), Some(_)) => {
                 anyhow::bail!("export '{}': specify either 'query' or 'query_file', not both", self.name)
@@ -269,13 +325,16 @@ impl ExportConfig {
     }
 }
 
-/// Replaces `${VAR}` and `$VAR` patterns with environment variable values.
-pub fn resolve_env_vars(input: &str) -> String {
+/// Replaces `${VAR}` patterns with values from `params` (if provided) or environment variables.
+/// Params take precedence over env vars.
+pub fn resolve_vars(input: &str, params: Option<&std::collections::HashMap<String, String>>) -> String {
     let mut result = input.to_string();
     while let Some(start) = result.find("${") {
         if let Some(end) = result[start..].find('}') {
             let var_name = &result[start + 2..start + end];
-            let value = std::env::var(var_name).unwrap_or_default();
+            let value = params
+                .and_then(|p| p.get(var_name).cloned())
+                .unwrap_or_else(|| std::env::var(var_name).unwrap_or_default());
             result = format!("{}{}{}", &result[..start], value, &result[start + end + 1..]);
         } else {
             break;
@@ -284,10 +343,41 @@ pub fn resolve_env_vars(input: &str) -> String {
     result
 }
 
+/// Convenience wrapper: resolve `${VAR}` from environment only.
+pub fn resolve_env_vars(input: &str) -> String {
+    resolve_vars(input, None)
+}
+
+/// Parse a human-readable file size like "512MB", "1GB", "100KB" into bytes.
+pub fn parse_file_size(s: &str) -> crate::error::Result<u64> {
+    let s = s.trim().to_uppercase();
+    let (num, multiplier) = if let Some(n) = s.strip_suffix("GB") {
+        (n.trim(), 1024u64 * 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix("MB") {
+        (n.trim(), 1024u64 * 1024)
+    } else if let Some(n) = s.strip_suffix("KB") {
+        (n.trim(), 1024u64)
+    } else if let Some(n) = s.strip_suffix('B') {
+        (n.trim(), 1u64)
+    } else {
+        (s.as_str(), 1u64)
+    };
+    let value: f64 = num.parse()
+        .map_err(|_| anyhow::anyhow!("invalid file size: '{}'", s))?;
+    Ok((value * multiplier as f64) as u64)
+}
+
 impl Config {
     pub fn load(path: &str) -> crate::error::Result<Self> {
+        Self::load_with_params(path, None)
+    }
+
+    pub fn load_with_params(
+        path: &str,
+        params: Option<&std::collections::HashMap<String, String>>,
+    ) -> crate::error::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
-        let resolved = resolve_env_vars(&contents);
+        let resolved = resolve_vars(&contents, params);
         Self::from_yaml(&resolved)
     }
 
@@ -298,8 +388,12 @@ impl Config {
     }
 
     fn validate(&self) -> crate::error::Result<()> {
-        // Structured fields and URL fields are mutually exclusive (checked at resolve_url time).
-        // At parse time, we only need to ensure at least one credential source exists.
+        if let Some(t) = &self.source.tuning {
+            if t.batch_size.is_some() && t.batch_size_memory_mb.is_some() {
+                anyhow::bail!("tuning: batch_size and batch_size_memory_mb are mutually exclusive");
+            }
+        }
+
         if !self.source.has_url_fields() && !self.source.has_structured_fields() {
             anyhow::bail!("source: must specify url, url_env, url_file, or structured fields (host/user/database)");
         }
@@ -374,6 +468,12 @@ impl Config {
                         export.name, cred_path
                     );
                 }
+            }
+
+            if let Some(ref size_str) = export.max_file_size {
+                parse_file_size(size_str).map_err(|_| anyhow::anyhow!(
+                    "export '{}': invalid max_file_size '{}'", export.name, size_str
+                ))?;
             }
 
             if let Some(level) = export.compression_level {
@@ -727,6 +827,25 @@ exports:
         let resolved = resolve_env_vars("postgresql://user:${RIVET_TEST_PASS}@localhost/db");
         assert_eq!(resolved, "postgresql://user:s3cret@localhost/db");
         unsafe { std::env::remove_var("RIVET_TEST_PASS"); }
+    }
+
+    #[test]
+    fn param_substitution_overrides_env() {
+        unsafe { std::env::set_var("RIVET_TEST_PARAM", "from_env"); }
+        let mut params = std::collections::HashMap::new();
+        params.insert("RIVET_TEST_PARAM".into(), "from_param".into());
+        let resolved = resolve_vars("val=${RIVET_TEST_PARAM}", Some(&params));
+        assert_eq!(resolved, "val=from_param");
+        unsafe { std::env::remove_var("RIVET_TEST_PARAM"); }
+    }
+
+    #[test]
+    fn param_substitution_falls_back_to_env() {
+        unsafe { std::env::set_var("RIVET_TEST_FALLBACK", "env_val"); }
+        let params = std::collections::HashMap::new();
+        let resolved = resolve_vars("v=${RIVET_TEST_FALLBACK}", Some(&params));
+        assert_eq!(resolved, "v=env_val");
+        unsafe { std::env::remove_var("RIVET_TEST_FALLBACK"); }
     }
 
     #[test]
@@ -1214,6 +1333,22 @@ exports:
     }
 
     #[test]
+    fn stdout_destination_parses() {
+        let cfg = Config::from_yaml(r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: stdout
+"#).unwrap();
+        assert_eq!(cfg.exports[0].destination.destination_type, DestinationType::Stdout);
+    }
+
+    #[test]
     fn meta_columns_partial() {
         let cfg = Config::from_yaml(r#"
 source:
@@ -1231,5 +1366,131 @@ exports:
 "#).unwrap();
         assert!(!cfg.exports[0].meta_columns.exported_at);
         assert!(cfg.exports[0].meta_columns.row_hash);
+    }
+
+    // --- Quality checks config ---
+
+    #[test]
+    fn quality_config_parses() {
+        let cfg = Config::from_yaml(r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: csv
+    quality:
+      row_count_min: 100
+      row_count_max: 1000000
+      null_ratio_max:
+        email: 0.05
+      unique_columns: [id]
+    destination:
+      type: local
+      path: ./out
+"#).unwrap();
+        let q = cfg.exports[0].quality.as_ref().unwrap();
+        assert_eq!(q.row_count_min, Some(100));
+        assert_eq!(q.row_count_max, Some(1_000_000));
+        assert_eq!(q.null_ratio_max.get("email"), Some(&0.05));
+        assert_eq!(q.unique_columns, vec!["id".to_string()]);
+    }
+
+    // --- Max file size ---
+
+    #[test]
+    fn max_file_size_parses() {
+        let cfg = Config::from_yaml(r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: parquet
+    max_file_size: 512MB
+    destination:
+      type: local
+      path: ./out
+"#).unwrap();
+        assert_eq!(cfg.exports[0].max_file_size_bytes(), Some(512 * 1024 * 1024));
+    }
+
+    #[test]
+    fn parse_file_size_variants() {
+        assert_eq!(parse_file_size("1GB").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_file_size("512MB").unwrap(), 512 * 1024 * 1024);
+        assert_eq!(parse_file_size("100KB").unwrap(), 100 * 1024);
+        assert_eq!(parse_file_size("1024B").unwrap(), 1024);
+        assert_eq!(parse_file_size("1024").unwrap(), 1024);
+    }
+
+    // --- Notification config ---
+
+    #[test]
+    fn notification_config_parses() {
+        let cfg = Config::from_yaml(r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+notifications:
+  slack:
+    webhook_url_env: SLACK_WEBHOOK
+    on: [failure, schema_change]
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#).unwrap();
+        let n = cfg.notifications.as_ref().unwrap();
+        let s = n.slack.as_ref().unwrap();
+        assert_eq!(s.webhook_url_env.as_deref(), Some("SLACK_WEBHOOK"));
+        assert_eq!(s.on.len(), 2);
+    }
+
+    // --- batch_size_memory_mb ---
+
+    #[test]
+    fn batch_size_memory_mb_parses() {
+        let cfg = Config::from_yaml(r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+  tuning:
+    batch_size_memory_mb: 256
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#).unwrap();
+        let t = cfg.source.tuning.as_ref().unwrap();
+        assert_eq!(t.batch_size_memory_mb, Some(256));
+    }
+
+    #[test]
+    fn batch_size_and_memory_mb_mutually_exclusive() {
+        let err = Config::from_yaml(r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+  tuning:
+    batch_size: 5000
+    batch_size_memory_mb: 256
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#).unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"), "got: {err}");
     }
 }

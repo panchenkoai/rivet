@@ -3,7 +3,9 @@ mod destination;
 mod enrich;
 mod error;
 mod format;
+mod notify;
 mod pipeline;
+mod quality;
 mod preflight;
 mod resource;
 mod source;
@@ -35,6 +37,9 @@ enum Commands {
         /// Validate output files after writing
         #[arg(long)]
         validate: bool,
+        /// Query parameter: key=value (repeatable, substitutes ${key} in queries)
+        #[arg(short, long = "param", value_name = "KEY=VALUE")]
+        params: Vec<String>,
     },
     /// Preflight check: diagnose source health for each export
     Check {
@@ -44,6 +49,9 @@ enum Commands {
         /// Check only a specific export by name
         #[arg(short, long)]
         export: Option<String>,
+        /// Query parameter: key=value (repeatable, substitutes ${key} in queries)
+        #[arg(short, long = "param", value_name = "KEY=VALUE")]
+        params: Vec<String>,
     },
     /// Verify source and destination auth before running exports
     Doctor {
@@ -104,16 +112,27 @@ enum StateAction {
     },
 }
 
+fn parse_params(raw: &[String]) -> std::collections::HashMap<String, String> {
+    raw.iter()
+        .filter_map(|s| s.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
 fn main() -> Result<()> {
     env_logger::init();
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { config, export, validate } => {
-            pipeline::run(&config, export.as_deref(), validate)?;
+        Commands::Run { config, export, validate, params } => {
+            let p = parse_params(&params);
+            let p = if p.is_empty() { None } else { Some(p) };
+            pipeline::run(&config, export.as_deref(), validate, p.as_ref())?;
         }
-        Commands::Check { config, export } => {
-            preflight::check(&config, export.as_deref())?;
+        Commands::Check { config, export, params } => {
+            let p = parse_params(&params);
+            let p = if p.is_empty() { None } else { Some(p) };
+            preflight::check(&config, export.as_deref(), p.as_ref())?;
         }
         Commands::Doctor { config } => {
             preflight::doctor(&config)?;

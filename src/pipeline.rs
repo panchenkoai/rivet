@@ -30,6 +30,7 @@ pub struct RunSummary {
     pub retries: u32,
     pub validated: Option<bool>,
     pub schema_changed: Option<bool>,
+    pub quality_passed: Option<bool>,
     pub error_message: Option<String>,
     pub tuning_profile: String,
     pub format: String,
@@ -55,6 +56,7 @@ impl RunSummary {
             retries: 0,
             validated: None,
             schema_changed: None,
+            quality_passed: None,
             error_message: None,
             tuning_profile: tuning.profile_name().to_string(),
             format: format!("{:?}", export.format).to_lowercase(),
@@ -64,38 +66,41 @@ impl RunSummary {
     }
 
     fn print(&self) {
-        println!();
-        println!("── {} ──", self.export_name);
-        println!("  run_id:      {}", self.run_id);
-        println!("  status:      {}", self.status);
-        println!("  rows:        {}", self.total_rows);
-        println!("  files:       {}", self.files_produced);
+        eprintln!();
+        eprintln!("── {} ──", self.export_name);
+        eprintln!("  run_id:      {}", self.run_id);
+        eprintln!("  status:      {}", self.status);
+        eprintln!("  rows:        {}", self.total_rows);
+        eprintln!("  files:       {}", self.files_produced);
         if self.bytes_written > 0 {
-            println!("  bytes:       {}", format_bytes(self.bytes_written));
+            eprintln!("  bytes:       {}", format_bytes(self.bytes_written));
         }
         let dur = if self.duration_ms >= 1000 {
             format!("{:.1}s", self.duration_ms as f64 / 1000.0)
         } else {
             format!("{}ms", self.duration_ms)
         };
-        println!("  duration:    {}", dur);
+        eprintln!("  duration:    {}", dur);
         if self.peak_rss_mb > 0 {
-            println!("  peak RSS:    {}MB", self.peak_rss_mb);
+            eprintln!("  peak RSS:    {}MB", self.peak_rss_mb);
         }
         if self.format == "parquet" && self.compression != "zstd" {
-            println!("  compression: {}", self.compression);
+            eprintln!("  compression: {}", self.compression);
         }
         if self.retries > 0 {
-            println!("  retries:     {}", self.retries);
+            eprintln!("  retries:     {}", self.retries);
         }
         if let Some(v) = self.validated {
-            println!("  validated:   {}", if v { "pass" } else { "FAIL" });
+            eprintln!("  validated:   {}", if v { "pass" } else { "FAIL" });
         }
         if let Some(sc) = self.schema_changed {
-            println!("  schema:      {}", if sc { "CHANGED" } else { "unchanged" });
+            eprintln!("  schema:      {}", if sc { "CHANGED" } else { "unchanged" });
+        }
+        if let Some(q) = self.quality_passed {
+            eprintln!("  quality:     {}", if q { "pass" } else { "FAIL" });
         }
         if let Some(err) = &self.error_message {
-            println!("  error:       {}", err);
+            eprintln!("  error:       {}", err);
         }
     }
 }
@@ -112,8 +117,13 @@ fn format_bytes(b: u64) -> String {
     }
 }
 
-pub fn run(config_path: &str, export_name: Option<&str>, validate: bool) -> Result<()> {
-    let config = Config::load(config_path)?;
+pub fn run(
+    config_path: &str,
+    export_name: Option<&str>,
+    validate: bool,
+    params: Option<&std::collections::HashMap<String, String>>,
+) -> Result<()> {
+    let config = Config::load_with_params(config_path, params)?;
     let tuning = SourceTuning::from_config(config.source.tuning.as_ref());
     log::info!("source tuning: {}", tuning);
 
@@ -143,10 +153,10 @@ pub fn run(config_path: &str, export_name: Option<&str>, validate: bool) -> Resu
 
         let result = match export.mode {
             ExportMode::Chunked if export.parallel > 1 => {
-                run_chunked_parallel(&config.source, &state, export, &tuning, &config_dir, validate, &mut summary)
+                run_chunked_parallel(&config.source, &state, export, &tuning, &config_dir, validate, &mut summary, params)
             }
             _ => {
-                run_with_reconnect(&config.source, &state, export, &tuning, &config_dir, validate, &mut summary)
+                run_with_reconnect(&config.source, &state, export, &tuning, &config_dir, validate, &mut summary, params)
             }
         };
 
@@ -176,6 +186,7 @@ pub fn run(config_path: &str, export_name: Option<&str>, validate: bool) -> Resu
         );
 
         summary.print();
+        crate::notify::maybe_send(config.notifications.as_ref(), &summary);
     }
 
     Ok(())
@@ -189,6 +200,7 @@ fn run_with_reconnect(
     config_dir: &Path,
     validate: bool,
     summary: &mut RunSummary,
+    params: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<()> {
     let mut last_err: Option<anyhow::Error> = None;
 
@@ -222,7 +234,7 @@ fn run_with_reconnect(
             }
         };
 
-        match run_export(&mut *src, state, export, tuning, config_dir, validate, summary) {
+        match run_export(&mut *src, state, export, tuning, config_dir, validate, summary, params) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 let (transient, _, _) = classify_error(&e);
@@ -321,8 +333,9 @@ fn run_export(
     config_dir: &Path,
     validate: bool,
     summary: &mut RunSummary,
+    params: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<()> {
-    let base_query = export.resolve_query(config_dir)?;
+    let base_query = export.resolve_query(config_dir, params)?;
 
     match export.mode {
         ExportMode::Full => {
@@ -383,26 +396,63 @@ fn run_single_export(
         return Ok(());
     }
 
-    if validate {
-        validate_output(sink.tmp.path(), export.format, sink.total_rows)?;
-        summary.validated = Some(true);
+    let quality_issues = sink.run_quality_checks();
+    if !quality_issues.is_empty() {
+        for issue in &quality_issues {
+            let level = match issue.severity {
+                crate::quality::Severity::Fail => "FAIL",
+                crate::quality::Severity::Warn => "WARN",
+            };
+            log::warn!("quality {}: {}", level, issue.message);
+        }
+        if quality_issues.iter().any(|i| i.severity == crate::quality::Severity::Fail) {
+            summary.quality_passed = Some(false);
+            anyhow::bail!("export '{}': quality checks failed", export.name);
+        }
+    }
+    if export.quality.is_some() {
+        summary.quality_passed = Some(true);
     }
 
-    let file_bytes = std::fs::metadata(sink.tmp.path()).map(|m| m.len()).unwrap_or(0);
-    summary.bytes_written += file_bytes;
-    summary.files_produced += 1;
+    // Collect the final part (whatever is left in sink.tmp)
+    if sink.part_rows > 0 {
+        sink.completed_parts.push(CompletedPart {
+            tmp: std::mem::replace(&mut sink.tmp, tempfile::NamedTempFile::new()?),
+            rows: sink.part_rows,
+        });
+    }
 
-    let file_name = build_file_name(&export.name, format::create_format(export.format, export.compression, export.compression_level).file_extension());
+    let fmt = format::create_format(export.format, export.compression, export.compression_level);
+    let ext = fmt.file_extension();
     let dest = destination::create_destination(&export.destination)?;
-    dest.write(sink.tmp.path(), &file_name)?;
+    let has_parts = sink.completed_parts.len() > 1;
+    let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
 
-    if let Some(st) = state {
-        let _ = st.record_file(
-            &summary.run_id, &export.name, &file_name,
-            sink.total_rows as i64, file_bytes as i64,
-            &format!("{:?}", export.format).to_lowercase(),
-            Some(&format!("{:?}", export.compression).to_lowercase()),
-        );
+    for (part_idx, part) in sink.completed_parts.iter().enumerate() {
+        if validate {
+            validate_output(part.tmp.path(), export.format, part.rows)?;
+            summary.validated = Some(true);
+        }
+
+        let file_bytes = std::fs::metadata(part.tmp.path()).map(|m| m.len()).unwrap_or(0);
+        summary.bytes_written += file_bytes;
+        summary.files_produced += 1;
+
+        let file_name = if has_parts {
+            format!("{}_{}_part{}.{}", export.name, ts, part_idx, ext)
+        } else {
+            format!("{}_{}.{}", export.name, ts, ext)
+        };
+        dest.write(part.tmp.path(), &file_name)?;
+
+        if let Some(st) = state {
+            let _ = st.record_file(
+                &summary.run_id, &export.name, &file_name,
+                part.rows as i64, file_bytes as i64,
+                &format!("{:?}", export.format).to_lowercase(),
+                Some(&format!("{:?}", export.compression).to_lowercase()),
+            );
+        }
     }
 
     if export.mode == ExportMode::Incremental
@@ -522,8 +572,9 @@ fn run_chunked_parallel(
     config_dir: &Path,
     validate: bool,
     summary: &mut RunSummary,
+    params: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<()> {
-    let base_query = export.resolve_query(config_dir)?;
+    let base_query = export.resolve_query(config_dir, params)?;
     let col = export.chunk_column.as_deref().unwrap();
 
     let mut src = source::create_source(source_config)?;
@@ -561,6 +612,7 @@ fn run_chunked_parallel(
             let source_config = source_config.clone();
             let tuning = tuning.clone();
             let meta = export.meta_columns.clone();
+            let quality = export.quality.clone();
             let compression = export.compression;
             let compression_level = export.compression_level;
             let export_name = &export.name;
@@ -595,11 +647,17 @@ fn run_chunked_parallel(
                             compression_level,
                             tmp,
                             total_rows: 0,
+                            part_rows: 0,
                             last_batch: None,
                             schema: None,
                             meta,
                             enriched_schema: None,
                             exported_at_us,
+                            quality_null_counts: std::collections::HashMap::new(),
+                            quality_unique_sets: std::collections::HashMap::new(),
+                            quality_columns: quality.clone(),
+                            max_file_size: None,
+                            completed_parts: Vec::new(),
                         }
                     };
                     thread_src.export(&chunk_query, None, None, &tuning, &mut sink)?;
@@ -779,6 +837,11 @@ pub fn validate_output(path: &Path, format: FormatType, expected_rows: usize) ->
     Ok(())
 }
 
+struct CompletedPart {
+    tmp: tempfile::NamedTempFile,
+    rows: usize,
+}
+
 struct ExportSink {
     writer: Option<Box<dyn FormatWriter>>,
     format_type: FormatType,
@@ -786,11 +849,17 @@ struct ExportSink {
     compression_level: Option<u32>,
     tmp: tempfile::NamedTempFile,
     total_rows: usize,
+    part_rows: usize,
     last_batch: Option<RecordBatch>,
     schema: Option<SchemaRef>,
     meta: MetaColumns,
     enriched_schema: Option<SchemaRef>,
     exported_at_us: i64,
+    quality_null_counts: std::collections::HashMap<String, usize>,
+    quality_unique_sets: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    quality_columns: Option<crate::config::QualityConfig>,
+    max_file_size: Option<u64>,
+    completed_parts: Vec<CompletedPart>,
 }
 
 impl ExportSink {
@@ -804,12 +873,117 @@ impl ExportSink {
             compression_level: export.compression_level,
             tmp,
             total_rows: 0,
+            part_rows: 0,
             last_batch: None,
             schema: None,
             meta: export.meta_columns.clone(),
             enriched_schema: None,
             exported_at_us,
+            quality_null_counts: std::collections::HashMap::new(),
+            quality_unique_sets: std::collections::HashMap::new(),
+            quality_columns: export.quality.clone(),
+            max_file_size: export.max_file_size_bytes(),
+            completed_parts: Vec::new(),
         })
+    }
+
+    fn maybe_split(&mut self) -> Result<()> {
+        let max = match self.max_file_size {
+            Some(m) => m,
+            None => return Ok(()),
+        };
+        let written = self.writer.as_ref().map(|w| w.bytes_written()).unwrap_or(0);
+        if written < max || self.part_rows == 0 {
+            return Ok(());
+        }
+
+        if let Some(w) = self.writer.take() {
+            w.finish()?;
+        }
+
+        let old_tmp = std::mem::replace(&mut self.tmp, tempfile::NamedTempFile::new()?);
+        self.completed_parts.push(CompletedPart {
+            tmp: old_tmp,
+            rows: self.part_rows,
+        });
+        self.part_rows = 0;
+
+        if let Some(schema) = &self.enriched_schema {
+            let fmt = format::create_format(self.format_type, self.compression, self.compression_level);
+            let file = self.tmp.as_file().try_clone()?;
+            let buf_writer = BufWriter::new(file);
+            self.writer = Some(fmt.create_writer(schema, Box::new(buf_writer))?);
+        }
+
+        log::info!("file split: started part {}", self.completed_parts.len() + 1);
+        Ok(())
+    }
+
+    fn track_quality(&mut self, batch: &RecordBatch) {
+        let qc = match &self.quality_columns {
+            Some(q) => q,
+            None => return,
+        };
+        let schema = batch.schema();
+        for (i, field) in schema.fields().iter().enumerate() {
+            let name = field.name();
+            if qc.null_ratio_max.contains_key(name.as_str()) {
+                *self.quality_null_counts.entry(name.clone()).or_default() += batch.column(i).null_count();
+            }
+            if qc.unique_columns.contains(name) {
+                let col = batch.column(i);
+                let set = self.quality_unique_sets.entry(name.clone()).or_default();
+                if let Ok(formatter) = arrow::util::display::ArrayFormatter::try_new(
+                    col.as_ref(),
+                    &arrow::util::display::FormatOptions::default(),
+                ) {
+                    for row in 0..col.len() {
+                        set.insert(formatter.value(row).to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    fn run_quality_checks(&self) -> Vec<crate::quality::QualityIssue> {
+        let qc = match &self.quality_columns {
+            Some(q) => q,
+            None => return Vec::new(),
+        };
+        let mut issues = Vec::new();
+        issues.extend(crate::quality::check_row_count(self.total_rows, qc));
+
+        if self.total_rows > 0 {
+            for (col, max_ratio) in &qc.null_ratio_max {
+                let nulls = self.quality_null_counts.get(col).copied().unwrap_or(0);
+                let ratio = nulls as f64 / self.total_rows as f64;
+                if ratio > *max_ratio {
+                    issues.push(crate::quality::QualityIssue {
+                        severity: crate::quality::Severity::Fail,
+                        message: format!(
+                            "column '{}': null ratio {:.4} exceeds threshold {:.4}",
+                            col, ratio, max_ratio
+                        ),
+                    });
+                }
+            }
+
+            for col in &qc.unique_columns {
+                if let Some(set) = self.quality_unique_sets.get(col) {
+                    let dupes = self.total_rows.saturating_sub(set.len());
+                    if dupes > 0 {
+                        issues.push(crate::quality::QualityIssue {
+                            severity: crate::quality::Severity::Fail,
+                            message: format!(
+                                "column '{}': {} duplicate values out of {} rows",
+                                col, dupes, self.total_rows
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        issues
     }
 }
 
@@ -827,6 +1001,8 @@ impl BatchSink for ExportSink {
 
     fn on_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         self.total_rows += batch.num_rows();
+        self.part_rows += batch.num_rows();
+        self.track_quality(batch);
 
         let output = if let Some(es) = &self.enriched_schema {
             enrich::enrich_batch(batch, &self.meta, es, self.exported_at_us)?
@@ -838,10 +1014,12 @@ impl BatchSink for ExportSink {
             w.write_batch(&output)?;
         }
         self.last_batch = Some(batch.clone());
+        self.maybe_split()?;
         Ok(())
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn build_file_name(export_name: &str, extension: &str) -> String {
     let now = chrono::Utc::now().format("%Y%m%d_%H%M%S");
     format!("{}_{}.{}", export_name, now, extension)
@@ -1178,6 +1356,8 @@ mod tests {
                 allow_anonymous: false,
             },
             meta_columns: MetaColumns::default(),
+            quality: None,
+            max_file_size: None,
         };
         let tuning = SourceTuning::from_config(None);
         let summary = RunSummary::new(&export, &tuning);

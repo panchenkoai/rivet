@@ -8,13 +8,18 @@ Rivet is a CLI tool that exports query results from relational databases to file
 
 - Extracts data from **PostgreSQL** and **MySQL** via standard SQL queries
 - Writes **Parquet** (zstd-compressed by default; snappy, gzip, lz4, none) or **CSV** files
-- Uploads to **local disk**, **Amazon S3**, or **Google Cloud Storage**
+- Uploads to **local disk**, **Amazon S3**, **Google Cloud Storage**, or **stdout** (pipe workflows)
 - Tracks incremental state in **SQLite** so the next run picks up where the last left off
 - Diagnoses source health **before** extraction (`rivet check`)
 - Verifies auth for all sources and destinations **before** running (`rivet doctor`)
 - Prints a structured **run summary** after each export (run ID, rows, files, bytes, duration, RSS, retries, schema changes)
 - Persists **metrics history**, **schema tracking**, and **file manifest** in SQLite
 - Recommends **parallelism level** and **tuning profile** in preflight checks
+- **Parameterized queries** via `--param key=value` and `${key}` placeholders
+- **Data quality checks** — row count bounds, null ratio thresholds, uniqueness assertions
+- **File size splitting** — `max_file_size: 512MB` automatically splits output into parts
+- **Memory-based batch sizing** — `batch_size_memory_mb: 256` auto-tunes batch size from schema width
+- **Slack notifications** on failure, schema change, or degraded verdict
 
 ### What Rivet does NOT do
 
