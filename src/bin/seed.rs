@@ -5,6 +5,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use clap::Parser;
 use rand::Rng;
+use rand::RngExt;
 
 #[derive(Parser)]
 #[command(name = "seed", about = "Generate test data for rivet")]
@@ -159,7 +160,7 @@ fn seed_postgres(args: &Args) -> Result<()> {
 }
 
 fn seed_pg_users(client: &mut postgres::Client, args: &Args) -> Result<()> {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut tx = client.transaction()?;
 
     let mut batch = String::new();
@@ -167,11 +168,11 @@ fn seed_pg_users(client: &mut postgres::Client, args: &Args) -> Result<()> {
 
     for i in 0..args.users {
         let (name, email) = gen_user(&mut rng, i);
-        let age = rng.r#gen_range(18..=65);
-        let balance = rng.r#gen_range(0.0..200_000.0_f64);
-        let is_active = rng.r#gen_bool(0.9);
-        let bio = if rng.r#gen_bool(0.7) {
-            format!("'{}'", BIOS[rng.r#gen_range(0..BIOS.len())])
+        let age = rng.random_range(18..=65);
+        let balance = rng.random_range(0.0..200_000.0_f64);
+        let is_active = rng.random_bool(0.9);
+        let bio = if rng.random_bool(0.7) {
+            format!("'{}'", BIOS[rng.random_range(0..BIOS.len())])
         } else {
             "NULL".to_string()
         };
@@ -208,7 +209,7 @@ fn seed_pg_users(client: &mut postgres::Client, args: &Args) -> Result<()> {
 }
 
 fn seed_pg_orders(client: &mut postgres::Client, args: &Args) -> Result<usize> {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut tx = client.transaction()?;
 
     let mut batch = String::new();
@@ -219,11 +220,11 @@ fn seed_pg_orders(client: &mut postgres::Client, args: &Args) -> Result<usize> {
         let n_orders = poisson_sample(&mut rng, args.orders_per_user as f64);
 
         for _ in 0..n_orders {
-            let product = PRODUCTS[rng.r#gen_range(0..PRODUCTS.len())].replace('\"', "\\\"");
-            let quantity = rng.r#gen_range(1..=10);
-            let price = rng.r#gen_range(5.0..5000.0_f64);
-            let status = STATUSES[rng.r#gen_range(0..STATUSES.len())];
-            let notes = if rng.r#gen_bool(0.4) {
+            let product = PRODUCTS[rng.random_range(0..PRODUCTS.len())].replace('\"', "\\\"");
+            let quantity = rng.random_range(1..=10);
+            let price = rng.random_range(5.0..5000.0_f64);
+            let status = STATUSES[rng.random_range(0..STATUSES.len())];
+            let notes = if rng.random_bool(0.4) {
                 format!("'{}'", gen_note(&mut rng))
             } else {
                 "NULL".to_string()
@@ -267,7 +268,7 @@ fn seed_pg_orders(client: &mut postgres::Client, args: &Args) -> Result<usize> {
 }
 
 fn seed_pg_events(client: &mut postgres::Client, args: &Args) -> Result<usize> {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut tx = client.transaction()?;
 
     let mut batch = String::new();
@@ -278,7 +279,7 @@ fn seed_pg_events(client: &mut postgres::Client, args: &Args) -> Result<usize> {
         let n_events = poisson_sample(&mut rng, args.events_per_user as f64);
 
         for _ in 0..n_events {
-            let event_type = EVENT_TYPES[rng.r#gen_range(0..EVENT_TYPES.len())];
+            let event_type = EVENT_TYPES[rng.random_range(0..EVENT_TYPES.len())];
             let payload = gen_event_payload(&mut rng, event_type);
             let ip = gen_ip(&mut rng);
             let created = gen_timestamp(&mut rng, 2023, 2024);
@@ -359,18 +360,18 @@ fn seed_mysql(args: &Args) -> Result<()> {
 
 fn seed_mysql_users(conn: &mut mysql::PooledConn, args: &Args) -> Result<()> {
     use mysql::prelude::*;
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     let mut batch = String::new();
     let mut count = 0;
 
     for i in 0..args.users {
         let (name, email) = gen_user(&mut rng, i);
-        let age = rng.r#gen_range(18..=65);
-        let balance = rng.r#gen_range(0.0..200_000.0_f64);
-        let is_active = rng.r#gen_bool(0.9) as u8;
-        let bio = if rng.r#gen_bool(0.7) {
-            format!("'{}'", BIOS[rng.r#gen_range(0..BIOS.len())])
+        let age = rng.random_range(18..=65);
+        let balance = rng.random_range(0.0..200_000.0_f64);
+        let is_active = rng.random_bool(0.9) as u8;
+        let bio = if rng.random_bool(0.7) {
+            format!("'{}'", BIOS[rng.random_range(0..BIOS.len())])
         } else {
             "NULL".to_string()
         };
@@ -407,7 +408,7 @@ fn seed_mysql_users(conn: &mut mysql::PooledConn, args: &Args) -> Result<()> {
 
 fn seed_mysql_orders(conn: &mut mysql::PooledConn, args: &Args) -> Result<usize> {
     use mysql::prelude::*;
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     let mut batch = String::new();
     let mut count = 0;
@@ -417,11 +418,11 @@ fn seed_mysql_orders(conn: &mut mysql::PooledConn, args: &Args) -> Result<usize>
         let n_orders = poisson_sample(&mut rng, args.orders_per_user as f64);
 
         for _ in 0..n_orders {
-            let product = PRODUCTS[rng.r#gen_range(0..PRODUCTS.len())].replace('\"', "\\\"");
-            let quantity = rng.r#gen_range(1..=10);
-            let price = rng.r#gen_range(5.0..5000.0_f64);
-            let status = STATUSES[rng.r#gen_range(0..STATUSES.len())];
-            let notes = if rng.r#gen_bool(0.4) {
+            let product = PRODUCTS[rng.random_range(0..PRODUCTS.len())].replace('\"', "\\\"");
+            let quantity = rng.random_range(1..=10);
+            let price = rng.random_range(5.0..5000.0_f64);
+            let status = STATUSES[rng.random_range(0..STATUSES.len())];
+            let notes = if rng.random_bool(0.4) {
                 format!("'{}'", gen_note(&mut rng))
             } else {
                 "NULL".to_string()
@@ -465,7 +466,7 @@ fn seed_mysql_orders(conn: &mut mysql::PooledConn, args: &Args) -> Result<usize>
 
 fn seed_mysql_events(conn: &mut mysql::PooledConn, args: &Args) -> Result<usize> {
     use mysql::prelude::*;
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     let mut batch = String::new();
     let mut count = 0;
@@ -475,7 +476,7 @@ fn seed_mysql_events(conn: &mut mysql::PooledConn, args: &Args) -> Result<usize>
         let n_events = poisson_sample(&mut rng, args.events_per_user as f64);
 
         for _ in 0..n_events {
-            let event_type = EVENT_TYPES[rng.r#gen_range(0..EVENT_TYPES.len())];
+            let event_type = EVENT_TYPES[rng.random_range(0..EVENT_TYPES.len())];
             let payload = gen_event_payload(&mut rng, event_type);
             let ip = gen_ip(&mut rng);
             let created = gen_timestamp(&mut rng, 2023, 2024);
@@ -517,9 +518,9 @@ fn seed_mysql_events(conn: &mut mysql::PooledConn, args: &Args) -> Result<usize>
 // ─── Data generators ─────────────────────────────────────────
 
 fn gen_user(rng: &mut impl Rng, idx: usize) -> (String, String) {
-    let first = FIRST_NAMES[rng.r#gen_range(0..FIRST_NAMES.len())];
-    let last = LAST_NAMES[rng.r#gen_range(0..LAST_NAMES.len())];
-    let domain = DOMAINS[rng.r#gen_range(0..DOMAINS.len())];
+    let first = FIRST_NAMES[rng.random_range(0..FIRST_NAMES.len())];
+    let last = LAST_NAMES[rng.random_range(0..LAST_NAMES.len())];
+    let domain = DOMAINS[rng.random_range(0..DOMAINS.len())];
     let name = format!("{} {}", first, last);
     let email = format!("{}.{}{}@{}", first.to_lowercase(), last.to_lowercase(), idx, domain);
     (name, email)
@@ -538,7 +539,7 @@ fn gen_timestamp(rng: &mut impl Rng, year_start: i32, year_end: i32) -> String {
         .unwrap()
         .and_utc()
         .timestamp();
-    let ts = rng.r#gen_range(start..=end);
+    let ts = rng.random_range(start..=end);
     chrono::DateTime::from_timestamp(ts, 0)
         .unwrap()
         .format("%Y-%m-%d %H:%M:%S")
@@ -547,47 +548,47 @@ fn gen_timestamp(rng: &mut impl Rng, year_start: i32, year_end: i32) -> String {
 
 fn gen_timestamp_after(rng: &mut impl Rng, base: &str, max_days_after: u32) -> String {
     let base_dt = chrono::NaiveDateTime::parse_from_str(base, "%Y-%m-%d %H:%M:%S").unwrap();
-    let offset_secs = rng.r#gen_range(0..max_days_after as i64 * 86400);
+    let offset_secs = rng.random_range(0..max_days_after as i64 * 86400);
     let result = base_dt + chrono::Duration::seconds(offset_secs);
     result.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 fn gen_ip(rng: &mut impl Rng) -> String {
-    if rng.r#gen_bool(0.5) {
-        format!("192.168.{}.{}", rng.r#gen_range(0..=255), rng.r#gen_range(1..=254))
-    } else if rng.r#gen_bool(0.5) {
-        format!("10.{}.{}.{}", rng.r#gen_range(0..=255), rng.r#gen_range(0..=255), rng.r#gen_range(1..=254))
+    if rng.random_bool(0.5) {
+        format!("192.168.{}.{}", rng.random_range(0..=255), rng.random_range(1..=254))
+    } else if rng.random_bool(0.5) {
+        format!("10.{}.{}.{}", rng.random_range(0..=255), rng.random_range(0..=255), rng.random_range(1..=254))
     } else {
-        format!("172.{}.{}.{}", rng.r#gen_range(16..=31), rng.r#gen_range(0..=255), rng.r#gen_range(1..=254))
+        format!("172.{}.{}.{}", rng.random_range(16..=31), rng.random_range(0..=255), rng.random_range(1..=254))
     }
 }
 
 fn gen_event_payload(rng: &mut impl Rng, event_type: &str) -> String {
     match event_type {
         "login" | "logout" => {
-            let device = DEVICES[rng.r#gen_range(0..DEVICES.len())];
-            let browser = BROWSERS[rng.r#gen_range(0..BROWSERS.len())];
+            let device = DEVICES[rng.random_range(0..DEVICES.len())];
+            let browser = BROWSERS[rng.random_range(0..BROWSERS.len())];
             format!(r#"{{"device": "{device}", "browser": "{browser}"}}"#)
         }
         "page_view" => {
-            let page = PAGES[rng.r#gen_range(0..PAGES.len())];
-            let duration = rng.r#gen_range(500..60000);
+            let page = PAGES[rng.random_range(0..PAGES.len())];
+            let duration = rng.random_range(500..60000);
             format!(r#"{{"page": "{page}", "duration_ms": {duration}}}"#)
         }
         "purchase" => {
-            let order_id = rng.r#gen_range(1..1_000_000);
-            let amount = rng.r#gen_range(5.0..5000.0_f64);
+            let order_id = rng.random_range(1..1_000_000);
+            let amount = rng.random_range(5.0..5000.0_f64);
             format!(r#"{{"order_id": {order_id}, "amount": {amount:.2}}}"#)
         }
         "signup" => {
             let plans = ["free", "pro", "enterprise"];
-            let plan = plans[rng.r#gen_range(0..plans.len())];
+            let plan = plans[rng.random_range(0..plans.len())];
             format!(r#"{{"plan": "{plan}"}}"#)
         }
         "search" => {
             let terms = ["laptop", "keyboard", "monitor", "desk", "cable", "ssd", "gpu"];
-            let term = terms[rng.r#gen_range(0..terms.len())];
-            let results = rng.r#gen_range(0..500);
+            let term = terms[rng.random_range(0..terms.len())];
+            let results = rng.random_range(0..500);
             format!(r#"{{"query": "{term}", "results": {results}}}"#)
         }
         _ => {
@@ -602,7 +603,7 @@ fn gen_note(rng: &mut impl Rng) -> String {
         "Fragile item", "Call before delivery", "No substitutions",
         "Company purchase", "Tax exempt", "Bulk order", "Repeat customer",
     ];
-    notes[rng.r#gen_range(0..notes.len())].to_string()
+    notes[rng.random_range(0..notes.len())].to_string()
 }
 
 /// Simple Poisson-like sample for natural variation around the mean.
@@ -612,7 +613,7 @@ fn poisson_sample(rng: &mut impl Rng, lambda: f64) -> usize {
     let mut p = 1.0_f64;
     loop {
         k += 1;
-        p *= rng.r#gen::<f64>();
+        p *= rng.random::<f64>();
         if p <= l {
             break;
         }
@@ -669,63 +670,63 @@ const UTM_CAMPAIGNS: &[&str] = &[
 fn gen_page_view_row(rng: &mut impl Rng, user_count: usize) -> String {
     let session_id = format!(
         "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        rng.r#gen_range(0u32..u32::MAX),
-        rng.r#gen_range(0u16..u16::MAX),
-        rng.r#gen_range(0u16..u16::MAX),
-        rng.r#gen_range(0u16..u16::MAX),
-        rng.r#gen_range(0u64..0xFFFFFFFFFFFF),
+        rng.random_range(0u32..u32::MAX),
+        rng.random_range(0u16..u16::MAX),
+        rng.random_range(0u16..u16::MAX),
+        rng.random_range(0u16..u16::MAX),
+        rng.random_range(0u64..0xFFFFFFFFFFFF),
     );
 
-    let user_id = if rng.r#gen_bool(0.7) {
-        format!("{}", rng.r#gen_range(1..=user_count))
+    let user_id = if rng.random_bool(0.7) {
+        format!("{}", rng.random_range(1..=user_count))
     } else {
         "NULL".to_string()
     };
 
-    let url = URLS[rng.r#gen_range(0..URLS.len())];
-    let referrer = if rng.r#gen_bool(0.6) {
-        format!("'{}'", REFERRERS[rng.r#gen_range(0..REFERRERS.len())])
+    let url = URLS[rng.random_range(0..URLS.len())];
+    let referrer = if rng.random_bool(0.6) {
+        format!("'{}'", REFERRERS[rng.random_range(0..REFERRERS.len())])
     } else {
         "NULL".to_string()
     };
-    let ua = USER_AGENTS[rng.r#gen_range(0..USER_AGENTS.len())].replace('\'', "''");
+    let ua = USER_AGENTS[rng.random_range(0..USER_AGENTS.len())].replace('\'', "''");
     let ip = gen_ip(rng);
-    let country = COUNTRIES[rng.r#gen_range(0..COUNTRIES.len())];
-    let region = REGIONS[rng.r#gen_range(0..REGIONS.len())];
-    let city = CITIES[rng.r#gen_range(0..CITIES.len())];
-    let device = DEVICE_TYPES[rng.r#gen_range(0..DEVICE_TYPES.len())];
-    let browser = BROWSERS[rng.r#gen_range(0..BROWSERS.len())];
-    let os = OS_NAMES[rng.r#gen_range(0..OS_NAMES.len())];
-    let sw = rng.r#gen_range(320..3840);
-    let sh = rng.r#gen_range(568..2160);
-    let vw = rng.r#gen_range(320..sw + 1);
-    let vh = rng.r#gen_range(400..sh + 1);
-    let page_load = rng.r#gen_range(100..15000);
-    let dom_ready = rng.r#gen_range(50..page_load + 1);
-    let time_on_page = rng.r#gen_range(500..300000);
-    let scroll_depth = rng.r#gen_range(0..=100i16);
-    let clicks = rng.r#gen_range(0..=50i16);
-    let is_bounce = rng.r#gen_bool(0.35);
+    let country = COUNTRIES[rng.random_range(0..COUNTRIES.len())];
+    let region = REGIONS[rng.random_range(0..REGIONS.len())];
+    let city = CITIES[rng.random_range(0..CITIES.len())];
+    let device = DEVICE_TYPES[rng.random_range(0..DEVICE_TYPES.len())];
+    let browser = BROWSERS[rng.random_range(0..BROWSERS.len())];
+    let os = OS_NAMES[rng.random_range(0..OS_NAMES.len())];
+    let sw = rng.random_range(320..3840);
+    let sh = rng.random_range(568..2160);
+    let vw = rng.random_range(320..sw + 1);
+    let vh = rng.random_range(400..sh + 1);
+    let page_load = rng.random_range(100..15000);
+    let dom_ready = rng.random_range(50..page_load + 1);
+    let time_on_page = rng.random_range(500..300000);
+    let scroll_depth = rng.random_range(0..=100i16);
+    let clicks = rng.random_range(0..=50i16);
+    let is_bounce = rng.random_bool(0.35);
 
-    let utm_source = if rng.r#gen_bool(0.4) {
-        format!("'{}'", UTM_SOURCES[rng.r#gen_range(0..UTM_SOURCES.len())])
+    let utm_source = if rng.random_bool(0.4) {
+        format!("'{}'", UTM_SOURCES[rng.random_range(0..UTM_SOURCES.len())])
     } else {
         "NULL".to_string()
     };
     let utm_medium = if utm_source != "NULL" {
-        format!("'{}'", UTM_MEDIUMS[rng.r#gen_range(0..UTM_MEDIUMS.len())])
+        format!("'{}'", UTM_MEDIUMS[rng.random_range(0..UTM_MEDIUMS.len())])
     } else {
         "NULL".to_string()
     };
-    let utm_campaign = if utm_source != "NULL" && rng.r#gen_bool(0.6) {
-        format!("'{}'", UTM_CAMPAIGNS[rng.r#gen_range(0..UTM_CAMPAIGNS.len())])
+    let utm_campaign = if utm_source != "NULL" && rng.random_bool(0.6) {
+        format!("'{}'", UTM_CAMPAIGNS[rng.random_range(0..UTM_CAMPAIGNS.len())])
     } else {
         "NULL".to_string()
     };
 
-    let custom = if rng.r#gen_bool(0.3) {
+    let custom = if rng.random_bool(0.3) {
         let ab = ["control", "variant_a", "variant_b"];
-        let variant = ab[rng.r#gen_range(0..ab.len())];
+        let variant = ab[rng.random_range(0..ab.len())];
         format!("'{{\"ab_test\": \"{variant}\"}}'")
     } else {
         "NULL".to_string()
@@ -750,7 +751,7 @@ const PV_COLS: &str = "(session_id, user_id, url, referrer, user_agent, ip_addre
     utm_term, utm_content, custom_props, created_at)";
 
 fn seed_pg_page_views(client: &mut postgres::Client, args: &Args) -> Result<()> {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut tx = client.transaction()?;
     let mut batch = String::new();
     let mut count = 0;
@@ -783,7 +784,7 @@ fn seed_pg_page_views(client: &mut postgres::Client, args: &Args) -> Result<()> 
 
 fn seed_mysql_page_views(conn: &mut mysql::PooledConn, args: &Args) -> Result<()> {
     use mysql::prelude::*;
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut batch = String::new();
     let mut count = 0;
 
@@ -861,7 +862,7 @@ const CONTENT_TITLES: &[&str] = &[
 fn gen_lorem_text(rng: &mut impl Rng, target_bytes: usize) -> String {
     let mut text = String::with_capacity(target_bytes + 200);
     while text.len() < target_bytes {
-        let sentence = LOREM_SENTENCES[rng.r#gen_range(0..LOREM_SENTENCES.len())];
+        let sentence = LOREM_SENTENCES[rng.random_range(0..LOREM_SENTENCES.len())];
         if !text.is_empty() {
             text.push(' ');
         }
@@ -883,34 +884,34 @@ fn gen_html_wrapper(body: &str) -> String {
 }
 
 fn gen_content_metadata(rng: &mut impl Rng) -> String {
-    let reading_time = rng.r#gen_range(1..30);
-    let version = rng.r#gen_range(1..20);
-    let seo_score = rng.r#gen_range(0..100);
+    let reading_time = rng.random_range(1..30);
+    let version = rng.random_range(1..20);
+    let seo_score = rng.random_range(0..100);
     format!(
         "{{\"reading_time_min\": {reading_time}, \"version\": {version}, \
          \"seo_score\": {seo_score}, \"featured\": {featured}, \
          \"allow_comments\": {comments}, \
          \"og_image\": \"https://cdn.example.com/images/{img}.jpg\", \
          \"canonical_url\": \"https://blog.example.com/posts/{slug}\"}}",
-        featured = rng.r#gen_bool(0.2),
-        comments = rng.r#gen_bool(0.8),
-        img = rng.r#gen_range(1000..9999),
-        slug = rng.r#gen_range(10000..99999),
+        featured = rng.random_bool(0.2),
+        comments = rng.random_bool(0.8),
+        img = rng.random_range(1000..9999),
+        slug = rng.random_range(10000..99999),
     )
 }
 
 fn gen_extra_data(rng: &mut impl Rng) -> String {
-    let revisions = rng.r#gen_range(1..10);
+    let revisions = rng.random_range(1..10);
     let mut editors = String::from("[");
-    for i in 0..rng.r#gen_range(1..4) {
+    for i in 0..rng.random_range(1..4) {
         if i > 0 { editors.push_str(", "); }
-        write!(editors, "\"editor_{}@example.com\"", rng.r#gen_range(1..100)).ok();
+        write!(editors, "\"editor_{}@example.com\"", rng.random_range(1..100)).ok();
     }
     editors.push(']');
     format!(
         "{{\"revisions\": {revisions}, \"editors\": {editors}, \
          \"source_system\": \"cms-v3\", \"import_batch\": \"{batch}\"}}",
-        batch = rng.r#gen_range(100..999),
+        batch = rng.random_range(100..999),
     )
 }
 
@@ -919,27 +920,27 @@ const CI_COLS: &str = "(title, body, raw_html, metadata, tags, author_name, auth
     word_count, language, published_at, updated_at, created_at, extra_data)";
 
 fn gen_content_item_row(rng: &mut impl Rng) -> String {
-    let title = CONTENT_TITLES[rng.r#gen_range(0..CONTENT_TITLES.len())];
-    let body_size = rng.r#gen_range(2000..8000);
+    let title = CONTENT_TITLES[rng.random_range(0..CONTENT_TITLES.len())];
+    let body_size = rng.random_range(2000..8000);
     let body = gen_lorem_text(rng, body_size).replace('\'', "''");
     let html = gen_html_wrapper(&body).replace('\'', "''");
     let metadata = gen_content_metadata(rng);
     let word_count = body.split_whitespace().count();
 
     let tags_list = ["rust", "postgres", "mysql", "data", "etl", "arrow", "parquet", "performance", "tutorial"];
-    let n_tags = rng.r#gen_range(1..5);
-    let tags: Vec<&str> = (0..n_tags).map(|_| tags_list[rng.r#gen_range(0..tags_list.len())]).collect();
+    let n_tags = rng.random_range(1..5);
+    let tags: Vec<&str> = (0..n_tags).map(|_| tags_list[rng.random_range(0..tags_list.len())]).collect();
     let tags_str = tags.join(",");
 
-    let first = FIRST_NAMES[rng.r#gen_range(0..FIRST_NAMES.len())];
-    let last = LAST_NAMES[rng.r#gen_range(0..LAST_NAMES.len())];
-    let domain = DOMAINS[rng.r#gen_range(0..DOMAINS.len())];
-    let category = CONTENT_CATEGORIES[rng.r#gen_range(0..CONTENT_CATEGORIES.len())];
-    let status = CONTENT_STATUSES[rng.r#gen_range(0..CONTENT_STATUSES.len())];
-    let priority = rng.r#gen_range(0..5);
-    let views = rng.r#gen_range(0..100000);
-    let comments = rng.r#gen_range(0..500);
-    let lang = ["en", "de", "fr", "es", "ja"][rng.r#gen_range(0..5)];
+    let first = FIRST_NAMES[rng.random_range(0..FIRST_NAMES.len())];
+    let last = LAST_NAMES[rng.random_range(0..LAST_NAMES.len())];
+    let domain = DOMAINS[rng.random_range(0..DOMAINS.len())];
+    let category = CONTENT_CATEGORIES[rng.random_range(0..CONTENT_CATEGORIES.len())];
+    let status = CONTENT_STATUSES[rng.random_range(0..CONTENT_STATUSES.len())];
+    let priority = rng.random_range(0..5);
+    let views = rng.random_range(0..100000);
+    let comments = rng.random_range(0..500);
+    let lang = ["en", "de", "fr", "es", "ja"][rng.random_range(0..5)];
 
     let created = gen_timestamp(rng, 2022, 2024);
     let updated = gen_timestamp_after(rng, &created, 365);
@@ -957,12 +958,12 @@ fn gen_content_item_row(rng: &mut impl Rng) -> String {
          'https://blog.example.com/posts/{slug}', '{category}', '{status}', \
          {priority}, {views}, {comments}, {word_count}, '{lang}', \
          {published}, '{updated}', '{created}', '{extra}')",
-        slug = rng.r#gen_range(10000..99999),
+        slug = rng.random_range(10000..99999),
     )
 }
 
 fn seed_pg_content_items(client: &mut postgres::Client, args: &Args) -> Result<()> {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut tx = client.transaction()?;
     let mut batch = String::new();
     let mut count = 0;
@@ -995,7 +996,7 @@ fn seed_pg_content_items(client: &mut postgres::Client, args: &Args) -> Result<(
 
 fn seed_mysql_content_items(conn: &mut mysql::PooledConn, args: &Args) -> Result<()> {
     use mysql::prelude::*;
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut batch = String::new();
     let mut count = 0;
     let ci_batch = 200;

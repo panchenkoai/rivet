@@ -1,0 +1,15 @@
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+
+exports:
+  - name: events_window
+    query: "SELECT id, user_id, event_type, created_at FROM events"
+    mode: time_window
+    time_column: created_at
+    time_column_type: timestamp
+    days_window: 7
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/output

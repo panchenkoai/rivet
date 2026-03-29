@@ -19,6 +19,7 @@ use crate::tuning::SourceTuning;
 /// Collects operational data during an export for end-of-run summary and metrics.
 #[derive(Debug, Clone)]
 pub struct RunSummary {
+    pub run_id: String,
     pub export_name: String,
     pub status: String,
     pub total_rows: i64,
@@ -38,7 +39,12 @@ pub struct RunSummary {
 
 impl RunSummary {
     fn new(export: &ExportConfig, tuning: &SourceTuning) -> Self {
+        let run_id = format!(
+            "{}_{}", export.name,
+            chrono::Utc::now().format("%Y%m%dT%H%M%S%.3f"),
+        );
         Self {
+            run_id,
             export_name: export.name.clone(),
             status: "running".into(),
             total_rows: 0,
@@ -60,6 +66,7 @@ impl RunSummary {
     fn print(&self) {
         println!();
         println!("── {} ──", self.export_name);
+        println!("  run_id:      {}", self.run_id);
         println!("  status:      {}", self.status);
         println!("  rows:        {}", self.total_rows);
         println!("  files:       {}", self.files_produced);
@@ -161,7 +168,7 @@ pub fn run(config_path: &str, export_name: Option<&str>, validate: bool) -> Resu
         }
 
         let _ = state.record_metric(
-            &summary.export_name, summary.duration_ms, summary.total_rows,
+            &summary.export_name, &summary.run_id, summary.duration_ms, summary.total_rows,
             Some(summary.peak_rss_mb), &summary.status, summary.error_message.as_deref(),
             Some(&summary.tuning_profile), Some(&summary.format), Some(&summary.mode),
             summary.files_produced as i64, summary.bytes_written as i64,
@@ -327,7 +334,7 @@ fn run_export(
             run_single_export(src, &base_query, cursor_col, Some(&cursor_state), export, tuning, validate, Some(state), summary)?;
         }
         ExportMode::Chunked => {
-            run_chunked_sequential(src, &base_query, export, tuning, validate, summary)?;
+            run_chunked_sequential(src, &base_query, export, tuning, validate, summary, Some(state))?;
         }
         ExportMode::TimeWindow => {
             let windowed_query = build_time_window_query(
@@ -389,6 +396,15 @@ fn run_single_export(
     let dest = destination::create_destination(&export.destination)?;
     dest.write(sink.tmp.path(), &file_name)?;
 
+    if let Some(st) = state {
+        let _ = st.record_file(
+            &summary.run_id, &export.name, &file_name,
+            sink.total_rows as i64, file_bytes as i64,
+            &format!("{:?}", export.format).to_lowercase(),
+            Some(&format!("{:?}", export.compression).to_lowercase()),
+        );
+    }
+
     if export.mode == ExportMode::Incremental
         && let (Some(cursor_col), Some(batch), Some(schema), Some(st)) =
             (&export.cursor_column, &sink.last_batch, &sink.schema, state)
@@ -439,6 +455,7 @@ fn run_chunked_sequential(
     tuning: &SourceTuning,
     validate: bool,
     summary: &mut RunSummary,
+    state: Option<&StateStore>,
 ) -> Result<()> {
     let col = export.chunk_column.as_deref().unwrap();
     let chunks = detect_and_generate_chunks(src, base_query, col, export.chunk_size)?;
@@ -479,6 +496,15 @@ fn run_chunked_sequential(
             let file_name = format!("{}_{}_chunk{}.{}", export.name, chrono::Utc::now().format("%Y%m%d_%H%M%S"), i, fmt.file_extension());
             let dest = destination::create_destination(&export.destination)?;
             dest.write(sink.tmp.path(), &file_name)?;
+
+            if let Some(st) = state {
+                let _ = st.record_file(
+                    &summary.run_id, &export.name, &file_name,
+                    sink.total_rows as i64, file_bytes as i64,
+                    &format!("{:?}", export.format).to_lowercase(),
+                    Some(&format!("{:?}", export.compression).to_lowercase()),
+                );
+            }
         }
     }
 
@@ -490,7 +516,7 @@ fn run_chunked_sequential(
 
 fn run_chunked_parallel(
     source_config: &SourceConfig,
-    _state: &StateStore,
+    state: &StateStore,
     export: &ExportConfig,
     tuning: &SourceTuning,
     config_dir: &Path,
@@ -513,6 +539,7 @@ fn run_chunked_parallel(
     let agg_bytes = std::sync::atomic::AtomicU64::new(0);
     let agg_files = AtomicUsize::new(0);
     let errors = std::sync::Mutex::new(Vec::<String>::new());
+    let file_records: std::sync::Mutex<Vec<(String, i64, i64)>> = std::sync::Mutex::new(Vec::new());
     let semaphore = AtomicUsize::new(0);
 
     std::thread::scope(|s| {
@@ -545,6 +572,7 @@ fn run_chunked_parallel(
             let agg_bytes = &agg_bytes;
             let agg_files = &agg_files;
             let errors = &errors;
+            let file_records = &file_records;
             let semaphore = &semaphore;
             let start = *start;
             let end = *end;
@@ -596,6 +624,7 @@ fn run_chunked_parallel(
                         );
                         let dest = destination::create_destination(dest_config)?;
                         dest.write(sink.tmp.path(), &file_name)?;
+                        file_records.lock().unwrap().push((file_name, sink.total_rows as i64, file_bytes as i64));
                     }
 
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -621,6 +650,15 @@ fn run_chunked_parallel(
     summary.files_produced = agg_files.load(Ordering::Relaxed);
     if validate {
         summary.validated = Some(true);
+    }
+
+    let fmt_name = format!("{:?}", export.format).to_lowercase();
+    let comp_name = format!("{:?}", export.compression).to_lowercase();
+    for (fname, rows, bytes) in file_records.into_inner().unwrap() {
+        let _ = state.record_file(
+            &summary.run_id, &export.name, &fname,
+            rows, bytes, &fmt_name, Some(&comp_name),
+        );
     }
 
     let errs = errors.into_inner().unwrap();
@@ -873,6 +911,28 @@ pub fn reset_state(config_path: &str, export_name: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn show_files(config_path: &str, export_name: Option<&str>, limit: usize) -> Result<()> {
+    let state = StateStore::open(config_path)?;
+    let files = state.get_files(export_name, limit)?;
+    if files.is_empty() {
+        println!("No files recorded yet.");
+        return Ok(());
+    }
+    println!(
+        "{:<35} {:<40} {:>8} {:>10} CREATED",
+        "RUN ID", "FILE", "ROWS", "BYTES"
+    );
+    println!("{}", "-".repeat(110));
+    for f in &files {
+        println!(
+            "{:<35} {:<40} {:>8} {:>10} {}",
+            f.run_id, f.file_name, f.row_count,
+            format_bytes(f.bytes as u64), f.created_at,
+        );
+    }
+    Ok(())
+}
+
 pub fn show_metrics(config_path: &str, export_name: Option<&str>, limit: usize) -> Result<()> {
     let state = StateStore::open(config_path)?;
     let metrics = state.get_metrics(export_name, limit)?;
@@ -881,7 +941,7 @@ pub fn show_metrics(config_path: &str, export_name: Option<&str>, limit: usize) 
         return Ok(());
     }
     println!(
-        "{:<20} {:<10} {:>10} {:>10} {:>8} {:>6} {:>10} RUN AT",
+        "{:<20} {:<10} {:>10} {:>10} {:>8} {:>6} {:>10} RUN ID",
         "EXPORT", "STATUS", "ROWS", "DURATION", "RSS", "FILES", "BYTES"
     );
     println!("{}", "-".repeat(110));
@@ -897,9 +957,10 @@ pub fn show_metrics(config_path: &str, export_name: Option<&str>, limit: usize) 
         } else {
             "-".into()
         };
+        let run_id = m.run_id.as_deref().unwrap_or(&m.run_at);
         println!(
             "{:<20} {:<10} {:>10} {:>10} {:>8} {:>6} {:>10} {}",
-            m.export_name, m.status, m.total_rows, duration, rss, m.files_produced, bytes, m.run_at
+            m.export_name, m.status, m.total_rows, duration, rss, m.files_produced, bytes, run_id
         );
         if let Some(err) = &m.error_message {
             println!("  Error: {}", err);
@@ -1126,5 +1187,6 @@ mod tests {
         assert_eq!(summary.files_produced, 0);
         assert_eq!(summary.format, "parquet");
         assert_eq!(summary.mode, "full");
+        assert!(summary.run_id.starts_with("test_export_"), "run_id should start with export name, got: {}", summary.run_id);
     }
 }

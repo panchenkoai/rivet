@@ -1,9 +1,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use opendal::layers::BlockingLayer;
+use opendal::blocking;
 use opendal::services::S3;
-use opendal::BlockingOperator;
 use opendal::Operator;
 
 use crate::config::DestinationConfig;
@@ -11,7 +10,7 @@ use crate::error::Result;
 
 pub struct S3Destination {
     _runtime: Arc<tokio::runtime::Runtime>,
-    op: BlockingOperator,
+    op: blocking::Operator,
     prefix: String,
 }
 
@@ -50,10 +49,8 @@ impl S3Destination {
         );
         let _guard = runtime.enter();
 
-        let op = Operator::new(builder)?
-            .layer(BlockingLayer::create()?)
-            .finish()
-            .blocking();
+        let async_op = Operator::new(builder)?.finish();
+        let op = blocking::Operator::new(async_op)?;
 
         let prefix = config.prefix.clone().unwrap_or_default();
 

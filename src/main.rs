@@ -91,6 +91,17 @@ enum StateAction {
         #[arg(short, long)]
         export: String,
     },
+    /// Show file manifest (files produced by exports)
+    Files {
+        #[arg(short, long)]
+        config: String,
+        /// Show files for a specific export
+        #[arg(short, long)]
+        export: Option<String>,
+        /// Number of recent files to show
+        #[arg(short, long, default_value = "50")]
+        last: usize,
+    },
 }
 
 fn main() -> Result<()> {
@@ -119,6 +130,9 @@ fn main() -> Result<()> {
             }
             StateAction::Reset { config, export } => {
                 pipeline::reset_state(&config, &export)?;
+            }
+            StateAction::Files { config, export, last } => {
+                pipeline::show_files(&config, export.as_deref(), last)?;
             }
         },
     }

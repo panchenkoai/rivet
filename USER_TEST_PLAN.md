@@ -1,156 +1,153 @@
-# Rivet — User acceptance test plan
+# koRivet — User acceptance test plan
 
 This document is a **manual checklist** for operators and pilot users who want to exercise Rivet end-to-end against the features that already exist. Use it for smoke tests, regression passes before a release, or onboarding.
 
-**Language:** English (same convention as [CONTRIBUTING.md](CONTRIBUTING.md)).
-
----
-
-## How to use this document
-
-1. Work top to bottom for a full pass, or pick a **suite** (e.g. only CLI + Postgres).
-2. Mark each row **Pass / Fail / Skip** and note the Rivet version or git commit.
-3. For failures, capture: command, stderr, config path, and DB/storage state.
+To mark a test: change `[ ]` to `[x]` in the Pass column.
 
 ---
 
 ## Conventions
 
-### Rivet command
+Install `rivet` to your PATH: `cargo install --path .`
 
-If `rivet` is not on your `PATH`, prefix every command with:
+Run all commands from the **repository root**.
 
-```bash
-RIVET='cargo run --release --bin rivet --'
-```
-
-Examples:
-
-```bash
-$RIVET check --config dev/pg_full.yaml
-$RIVET run --config dev/pg_full.yaml --export pg_users_csv --validate
-```
-
-If you installed with `cargo install --path .`, use `rivet` instead of `$RIVET`.
-
-### Working directory
-
-Run commands from the **repository root** unless noted otherwise.
-
-### Optional suites
-
-Sections marked **(optional)** need extra services (MinIO, fake GCS, real GCS credentials) or longer runs. Skip them if you only want a quick smoke test.
+Sections marked **(optional)** need extra services or longer runs.
 
 ---
 
 ## Preconditions
 
-| # | Check | Pass |
-|---|--------|------|
-| P1 | Rust toolchain installed (`cargo --version`) | ☐ |
-| P2 | `docker compose up -d` brings up Postgres + MySQL (see [README](README.md#development)) | ☐ |
-| P3 | Databases seeded (e.g. `cargo run --release --bin seed -- --target both --users 100000`) or at least minimal data from `dev/postgres/init.sql` / `dev/mysql/init.sql` | ☐ |
-| P4 | `dev/output/` exists or is creatable (Rivet writes exports there for many samples) | ☐ |
+
+| ID  | Check                                                                               | Pass |
+| --- | ----------------------------------------------------------------------------------- | ---- |
+| P1  | Rust toolchain installed (`cargo --version`)                                        | [x]  |
+| P2  | `docker compose up -d` brings up Postgres + MySQL                                   | [x]  |
+| P3  | Databases seeded (`cargo run --release --bin seed -- --target both --users 100000`) | [x]  |
+| P4  | `dev/output/` directory exists                                                      | [x]  |
+
 
 ---
 
 ## Suite A — CLI and ergonomics
 
-| ID | Scenario | Steps | Expected | Pass |
-|----|-----------|-------|----------|------|
-| A1 | Help | Run `rivet --help` or `$RIVET --help` | Lists subcommands: `run`, `check`, `doctor`, `state`, `metrics`, `completions` | ☐ |
-| A2 | Completions | `$RIVET completions zsh \| head` | Prints `#compdef rivet` (or equivalent shell header) | ☐ |
-| A3 | Invalid config | Point `check` at a non-existent file | Clear error, non-zero exit | ☐ |
+
+| ID  | Scenario       | Command / Steps                         | Expected                                                           | Pass                                  |
+| --- | -------------- | --------------------------------------- | ------------------------------------------------------------------ | ------------------------------------- |
+| A1  | Help           | `rivet --help`                          | Lists subcommands: run, check, doctor, state, metrics, completions | [x]  |
+| A2  | Completions    | `rivet completions zsh \| head`         | Prints `#compdef rivet` or equivalent | [x] |
+| A3  | Invalid config | `rivet check --config nonexistent.yaml` | Clear error, non-zero exit                                         | [x]  |
+
 
 ---
 
 ## Suite B — Diagnostics (`check`, `doctor`)
 
-| ID | Scenario | Steps | Expected | Pass |
-|----|-----------|-------|----------|------|
-| B1 | Preflight all exports (Postgres) | `$RIVET check --config dev/pg_full.yaml` | Completes; per-export strategy and health verdict printed | ☐ |
-| B2 | Preflight one export | `$RIVET check --config dev/pg_full.yaml --export pg_users_csv` | Only that export is evaluated | ☐ |
-| B3 | Preflight (MySQL) | `$RIVET check --config dev/mysql_full.yaml` | Completes without panic | ☐ |
-| B4 | Doctor (auth) | `$RIVET doctor --config dev/pg_full.yaml` | Source connectivity OK; local destination OK (or clear failure if misconfigured) | ☐ |
+
+| ID  | Scenario             | Command / Steps                                               | Expected                               | Pass |
+| --- | -------------------- | ------------------------------------------------------------- | -------------------------------------- | ---- |
+| B1  | Preflight all (PG)   | `rivet check --config dev/pg_full.yaml`                       | Per-export strategy and health verdict | [x]  |
+| B2  | Preflight one export | `rivet check --config dev/pg_full.yaml --export pg_users_csv` | Only that export evaluated             | [x]  |
+| B3  | Preflight (MySQL)    | `rivet check --config dev/mysql_full.yaml`                    | Completes without panic                | [x]  |
+| B4  | Doctor (auth)        | `rivet doctor --config dev/pg_full.yaml`                      | Source OK; local destination OK        | [x]  |
+
 
 ---
 
 ## Suite C — Run: full and incremental (local disk)
 
-| ID | Scenario | Steps | Expected | Pass |
-|----|-----------|-------|----------|------|
-| C1 | Full CSV + Parquet (Postgres) | `$RIVET run --config dev/pg_full.yaml` | New files under `dev/output/`; run summaries for each export | ☐ |
-| C2 | Validate row counts | `$RIVET run --config dev/pg_full.yaml --export pg_users_parquet --validate` | `validated: pass` in summary; log says validation passed | ☐ |
-| C3 | Incremental first run | `$RIVET run --config dev/pg_incremental.yaml --export pg_orders_incremental` | Parquet written; cursor updated (see Suite D) | ☐ |
-| C4 | Incremental second run | Repeat C3 without changing data | May write 0-row file or skip depending on `skip_empty`; state reflects last cursor | ☐ |
-| C5 | MySQL full | `$RIVET run --config dev/mysql_full.yaml` | Files under `dev/output/` | ☐ |
-| C6 | MySQL incremental | `$RIVET run --config dev/mysql_incremental.yaml` | Completes; state file updated | ☐ |
+
+| ID  | Scenario              | Command / Steps                                                             | Expected                                      | Pass |
+| --- | --------------------- | --------------------------------------------------------------------------- | --------------------------------------------- | ---- |
+| C1  | Full CSV+Parquet (PG) | `rivet run --config dev/pg_full.yaml`                                       | Files in `dev/output/`; run summaries printed | [x]  |
+| C2  | Validate row counts   | `rivet run --config dev/pg_full.yaml --export pg_users_parquet --validate`  | `validated: pass` in summary                  | [x]  |
+| C3  | Incremental 1st run   | `rivet run --config dev/pg_incremental.yaml --export pg_orders_incremental` | Parquet written; cursor updated               | [x]  |
+| C4  | Incremental 2nd run   | Repeat C3 without changing data                                             | 0 rows or skip; state unchanged               | [x]  |
+| C5  | MySQL full            | `rivet run --config dev/mysql_full.yaml`                                    | Files in `dev/output/`                        | [x]  |
+| C6  | MySQL incremental     | `rivet run --config dev/mysql_incremental.yaml`                             | Completes; state updated                      | [x]  |
+
 
 ---
 
 ## Suite D — State and metrics
 
-| ID | Scenario | Steps | Expected | Pass |
-|----|-----------|-------|----------|------|
-| D1 | Show state | `$RIVET state show --config dev/pg_incremental.yaml` | Table lists exports with last cursor where applicable | ☐ |
-| D2 | Metrics history | `$RIVET metrics --config dev/pg_incremental.yaml --last 5` | Recent runs with status, rows, duration | ☐ |
-| D3 | Reset state (careful) | `$RIVET state reset --config dev/pg_incremental.yaml --export pg_orders_incremental` | Confirmation message; next incremental run behaves like first run | ☐ |
+
+| ID  | Scenario        | Command / Steps                                                                     | Expected                                   | Pass |
+| --- | --------------- | ----------------------------------------------------------------------------------- | ------------------------------------------ | ---- |
+| D1  | Show state      | `rivet state show --config dev/pg_incremental.yaml`                                 | Table with exports and last cursor         | [x]  |
+| D2  | Metrics history | `rivet metrics --config dev/pg_incremental.yaml --last 5`                           | Recent runs with status, rows, duration    | [x]  |
+| D3  | Reset state     | `rivet state reset --config dev/pg_incremental.yaml --export pg_orders_incremental` | Confirmation; next run acts like first run | [x]  |
+
 
 ---
 
 ## Suite E — Chunked mode
 
-| ID | Scenario | Steps | Expected | Pass |
-|----|-----------|-------|----------|------|
-| E1 | Chunked sequential | `$RIVET run --config dev/bench_chunked_seq.yaml` (or smaller `chunk_size` if too slow) | Multiple chunk files or one run completing; logs show chunk progress | ☐ |
-| E2 | Chunked parallel | `$RIVET run --config dev/bench_chunked_p4.yaml` **(optional, heavy)** | Parallel chunk logs; all chunks succeed | ☐ |
+
+| ID  | Scenario                        | Command / Steps                                 | Expected                                | Pass |
+| --- | ------------------------------- | ----------------------------------------------- | --------------------------------------- | ---- |
+| E1  | Chunked sequential              | `rivet run --config dev/bench_chunked_seq.yaml` | Chunk files created; logs show progress | [x]  |
+| E2  | Chunked parallel **(optional)** | `rivet run --config dev/bench_chunked_p4.yaml`  | Parallel logs; all chunks succeed       | [x]  |
+
 
 ---
 
 ## Suite F — Compression, skip empty, meta columns
 
-| ID | Scenario | Steps | Expected | Pass |
-|----|-----------|-------|----------|------|
-| F1 | Default zstd Parquet | `$RIVET run --config dev/test_meta_columns.yaml --validate` | File readable; tool like `pyarrow` or `parquet-tools` shows column compression ZSTD | ☐ |
-| F2 | Explicit codecs | `$RIVET run --config dev/test_compression.yaml` | `users_snappy` / `users_none` differ in size; summary shows `compression:` when not default | ☐ |
-| F3 | Skip empty | `$RIVET run --config dev/test_compression.yaml --export users_skip_empty` | `status: skipped`, `files: 0`, no new parquet for that export | ☐ |
-| F4 | Meta columns present | Inspect latest `users_meta_test_*.parquet` from F1 | Schema includes `_rivet_exported_at`, `_rivet_row_hash` when enabled in YAML | ☐ |
+
+| ID  | Scenario        | Command / Steps                                                          | Expected                                                       | Pass |
+| --- | --------------- | ------------------------------------------------------------------------ | -------------------------------------------------------------- | ---- |
+| F1  | Default zstd    | `rivet run --config dev/test_meta_columns.yaml --validate`               | Parquet compression = ZSTD                                     | [x]  |
+| F2  | Explicit codecs | `rivet run --config dev/test_compression.yaml`                           | snappy/none files differ in size; summary shows `compression:` | [x]  |
+| F3  | Skip empty      | `rivet run --config dev/test_compression.yaml --export users_skip_empty` | `status: skipped`, `files: 0`                                  | [x]  |
+| F4  | Meta columns    | Inspect `users_meta_test_*.parquet` from F1                              | Has `_rivet_exported_at` and `_rivet_row_hash`                 | [x]  |
+
 
 ---
 
-## Suite G — Structured source URL (A4-style)
+## Suite G — Structured source URL
 
-| ID | Scenario | Steps | Expected | Pass |
-|----|-----------|-------|----------|------|
-| G1 | Postgres structured | `$RIVET check --config dev/pg_structured.yaml` | Parses host/user/database; connects | ☐ |
-| G2 | MySQL structured | `$RIVET check --config dev/mysql_structured.yaml` | Same | ☐ |
+
+| ID  | Scenario         | Command / Steps                                  | Expected                            | Pass |
+| --- | ---------------- | ------------------------------------------------ | ----------------------------------- | ---- |
+| G1  | PG structured    | `PGPASSWORD=rivet rivet check --config dev/pg_structured.yaml` | Parses host/user/database; connects | [x]  |
+| G2  | MySQL structured | `rivet check --config dev/mysql_structured.yaml` | Same                                | [x]  |
+
 
 ---
 
 ## Suite H — Preflight edge cases (optional)
 
-| ID | Scenario | Steps | Expected | Pass |
-|----|-----------|-------|----------|------|
-| H1 | Degraded scenario | `$RIVET check --config dev/pg_degraded.yaml` | Verdict/suggestions reflect planner output (not necessarily “green”) | ☐ |
-| H2 | Wrong password | `$RIVET doctor --config dev/test_pg_wrongpass.yaml` | Fails with auth/connectivity message, not a panic | ☐ |
+
+| ID  | Scenario          | Command / Steps                                    | Expected                        | Pass |
+| --- | ----------------- | -------------------------------------------------- | ------------------------------- | ---- |
+| H1  | Degraded scenario | `rivet check --config dev/pg_degraded.yaml`        | Verdict and suggestions printed | [x]  |
+| H2  | Wrong password    | `rivet doctor --config dev/test_pg_wrongpass.yaml` | Auth failure message, not panic | [x]  |
+
 
 ---
 
 ## Suite I — Object storage (optional)
 
-| ID | Scenario | Steps | Expected | Pass |
-|----|-----------|-------|----------|------|
-| I1 | MinIO / S3 | `docker compose up -d minio`, follow [README](README.md) + `dev/rivet_s3_minio_test.yaml` / `dev/run_s3_export.sh` | Objects appear in bucket | ☐ |
-| I2 | fake-gcs-server | `docker compose up -d fake-gcs`, `dev/rivet_gcs_fake_test.yaml` / `dev/run_gcs_fake_export.sh` | Upload succeeds with `allow_anonymous` or emulator config | ☐ |
-| I3 | Real GCS | `dev/rivet_gcs_rivet_data_test.yaml` + valid `credentials_file` | Files in bucket under `prefix` | ☐ |
+
+| ID  | Scenario   | Command / Steps                                                   | Expected          | Pass |
+| --- | ---------- | ----------------------------------------------------------------- | ----------------- | ---- |
+| I1  | MinIO / S3 | `docker compose up -d minio` then `dev/run_s3_export.sh`          | Objects in bucket | [x]  |
+| I2  | fake-gcs   | `docker compose up -d fake-gcs` then `dev/run_gcs_fake_export.sh` | Upload succeeds   | [x]  |
+| I3  | Real GCS   | `rivet run --config dev/rivet_gcs_rivet_data_test.yaml`           | Files in bucket   | [x]  |
+
 
 ---
 
 ## Suite J — Time window mode
 
-There is no dedicated sample under `dev/` yet. Use a **minimal config** (adjust table/column names to your seeded DB):
+Save this config as `dev/_uat_time_window.yaml`:
 
 ```yaml
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+
 exports:
   - name: events_window
     query: "SELECT id, user_id, event_type, created_at FROM events"
@@ -164,48 +161,56 @@ exports:
       path: ./dev/output
 ```
 
-| ID | Scenario | Steps | Expected | Pass |
-|----|-----------|-------|----------|------|
-| J1 | Time window run | Add `source:` matching your DB, save as `dev/_uat_time_window.yaml`, run `$RIVET run --config dev/_uat_time_window.yaml` | Completes; file contains only rows in window | ☐ |
+
+| ID  | Scenario        | Command / Steps                                | Expected                                 | Pass |
+| --- | --------------- | ---------------------------------------------- | ---------------------------------------- | ---- |
+| J1  | Time window run | `rivet run --config dev/_uat_time_window.yaml` | Completes; only rows within 7-day window | [x]  |
+
 
 ---
 
-## Suite K — Schema evolution (optional script)
+## Suite K — Schema evolution (optional)
 
-| ID | Scenario | Steps | Expected | Pass |
-|----|-----------|-------|----------|------|
-| K1 | Schema change detection | Run `dev/test_schema_evolution.sh` (read script first) | Second run logs schema change warnings if script mutates columns | ☐ |
+
+| ID  | Scenario      | Command / Steps                                 | Expected                               | Pass |
+| --- | ------------- | ----------------------------------------------- | -------------------------------------- | ---- |
+| K1  | Schema change | Run `dev/test_schema_evolution.sh` (read first) | Second run logs schema change warnings | [x]  |
+
 
 ---
 
 ## Sign-off
 
-| Field | Value |
-|-------|--------|
-| Tester | |
-| Date | |
-| Rivet version / commit | |
-| Postgres image | |
-| MySQL image | |
-| Notes (failed IDs, env quirks) | |
+
+| Field          | Value                                    |
+| -------------- | ---------------------------------------- |
+| Tester         | Andrii Panchenko                         |
+| Date           | 2026-03-29                               |
+| Rivet commit   | c3788a5eb3a0635dd1dee898d362dfbacb20b0c8 |
+| Postgres image | `dockercompose postgres:16`              |
+| MySQL image    | ```dockercompose postgres:16 ```         |
+| Notes          |                                          |
+
 
 ---
 
-## Reference — Config files used above
+## Reference — Config files
 
-| File | Purpose |
-|------|---------|
-| `dev/pg_full.yaml` | Postgres full exports, CSV + Parquet |
-| `dev/pg_incremental.yaml` | Postgres incremental |
-| `dev/mysql_full.yaml` | MySQL full |
-| `dev/mysql_incremental.yaml` | MySQL incremental |
-| `dev/pg_structured.yaml` / `dev/mysql_structured.yaml` | Structured DB credentials |
-| `dev/bench_chunked_seq.yaml` | Chunked sequential (large table) |
-| `dev/bench_chunked_p4.yaml` | Chunked parallel (heavy) |
-| `dev/test_meta_columns.yaml` | Meta columns + default zstd |
-| `dev/test_compression.yaml` | Snappy / none / skip_empty |
-| `dev/rivet_s3_minio_test.yaml` | S3-compatible (MinIO) |
-| `dev/rivet_gcs_fake_test.yaml` | GCS emulator |
-| `dev/rivet_gcs_rivet_data_test.yaml` | Real GCS (credentials required) |
 
-For automated regression, run `cargo test` (see [PRODUCT.md](PRODUCT.md) test coverage).
+| File                                 | Purpose                        |
+| ------------------------------------ | ------------------------------ |
+| `dev/pg_full.yaml`                   | PG full exports, CSV + Parquet |
+| `dev/pg_incremental.yaml`            | PG incremental                 |
+| `dev/mysql_full.yaml`                | MySQL full                     |
+| `dev/mysql_incremental.yaml`         | MySQL incremental              |
+| `dev/pg_structured.yaml`             | PG structured credentials      |
+| `dev/mysql_structured.yaml`          | MySQL structured credentials   |
+| `dev/bench_chunked_seq.yaml`         | Chunked sequential             |
+| `dev/bench_chunked_p4.yaml`          | Chunked parallel               |
+| `dev/test_meta_columns.yaml`         | Meta columns + zstd            |
+| `dev/test_compression.yaml`          | Snappy / none / skip_empty     |
+| `dev/rivet_s3_minio_test.yaml`       | S3-compatible (MinIO)          |
+| `dev/rivet_gcs_fake_test.yaml`       | GCS emulator                   |
+| `dev/rivet_gcs_rivet_data_test.yaml` | Real GCS                       |
+
+

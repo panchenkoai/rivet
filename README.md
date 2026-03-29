@@ -12,8 +12,9 @@ Rivet is a CLI tool that exports query results from relational databases to file
 - Tracks incremental state in **SQLite** so the next run picks up where the last left off
 - Diagnoses source health **before** extraction (`rivet check`)
 - Verifies auth for all sources and destinations **before** running (`rivet doctor`)
-- Prints a structured **run summary** after each export (rows, files, bytes, duration, RSS, retries, schema changes)
-- Persists **metrics history** and **schema tracking** in SQLite
+- Prints a structured **run summary** after each export (run ID, rows, files, bytes, duration, RSS, retries, schema changes)
+- Persists **metrics history**, **schema tracking**, and **file manifest** in SQLite
+- Recommends **parallelism level** and **tuning profile** in preflight checks
 
 ### What Rivet does NOT do
 
@@ -88,6 +89,7 @@ rivet check --config <path> --export <name>        # preflight check one export
 rivet doctor --config <path>                       # verify source + destination auth
 rivet state show --config <path>                   # show cursor state
 rivet state reset --config <path> --export <name>  # reset cursor
+rivet state files --config <path>                  # show file manifest (which run created which files)
 rivet metrics --config <path>                      # show export run history
 rivet metrics --config <path> --export <name>      # metrics for one export
 rivet metrics --config <path> --last N             # last N runs (default 20)
@@ -550,6 +552,7 @@ After each export, Rivet prints a structured summary to stdout:
 
 ```
 ── orders ──
+  run_id:      orders_20260329T125109.336
   status:      success
   rows:        150000
   files:       1
@@ -560,10 +563,11 @@ After each export, Rivet prints a structured summary to stdout:
   schema:      unchanged
 ```
 
-All summary fields are also persisted to the metrics table and visible via `rivet metrics`.
+All summary fields are also persisted to the metrics table and visible via `rivet metrics`. The `run_id` links the summary to the corresponding rows in `export_metrics` and `file_manifest` tables.
 
 | Field | Description |
 |-------|-------------|
+| `run_id` | Canonical identifier for this run (links summary, metrics, and files) |
 | `status` | `success` or `failed` |
 | `rows` | Total rows extracted |
 | `files` | Number of files produced (1 for single-file modes; N for chunked) |
@@ -574,6 +578,20 @@ All summary fields are also persisted to the metrics table and visible via `rive
 | `validated` | `pass` if `--validate` succeeded; omitted if not requested |
 | `schema` | `unchanged` or `CHANGED`; omitted on first run |
 | `error` | Error message (only on failure) |
+
+### File manifest
+
+Every file produced by Rivet is recorded in the `file_manifest` table. Use `rivet state files` to inspect:
+
+```
+$ rivet state files --config rivet.yaml
+RUN ID                              FILE                                         ROWS      BYTES CREATED
+--------------------------------------------------------------------------------------------------------------
+orders_20260329T125143.912          orders_20260329_125200_chunk3.parquet        50000    17.4 MB 2026-03-29T12:52:00+00:00
+orders_20260329T125143.912          orders_20260329_125156_chunk2.parquet        50000    17.4 MB 2026-03-29T12:51:56+00:00
+```
+
+This enables post-run reconciliation: verify which run created which files and confirm row counts match expectations.
 
 ## Execution Semantics
 
@@ -693,6 +711,8 @@ On each retry, a **fresh connection** is created (never reuses a failed connecti
 See [Execution Semantics](#execution-semantics) for detailed lifecycle, state update, duplicate, retry, and validation rules.
 
 ## Development
+
+For a **step-by-step onboarding guide** (from installation to production-ready exports), see [USER_GUIDE.md](USER_GUIDE.md).
 
 For a **manual user acceptance checklist** (CLI, modes, destinations, compression, skip-empty), see [USER_TEST_PLAN.md](USER_TEST_PLAN.md).
 

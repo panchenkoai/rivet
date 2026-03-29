@@ -11,7 +11,7 @@ services:
       - ./dev/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
 
   mysql:
-    image: mysql:8
+    image: postgres:16
     environment:
       MYSQL_ROOT_PASSWORD: rivet
       MYSQL_USER: rivet

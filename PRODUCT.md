@@ -126,6 +126,7 @@ rivet check --config <path>                        # preflight check all exports
 rivet check --config <path> --export <name>        # preflight check one export
 rivet state show --config <path>                   # show cursor state
 rivet state reset --config <path> --export <name>  # reset cursor
+rivet state files --config <path>                  # show file manifest
 ```
 
 ---
@@ -227,14 +228,14 @@ docker-compose.yaml    PG 16 + MySQL 8
 
 ### Test Coverage
 
-**222** distinct test cases; `cargo test` reports **387** passes (unit tests in `src/` run for both the library and binary targets).
+**234** distinct test cases; `cargo test` reports **405** passes (unit tests in `src/` run for both the library and binary targets).
 
 | Category | Count | What |
 |---|---|---|
 | config.rs | 44 | YAML parsing, validation, structured/URL credentials, GCS/S3 auth config, meta_columns, compression, skip_empty |
-| preflight.rs | 60 | Verdicts, EXPLAIN parsing, suggestions, strategy, profile recommendation, sparse/dense/parallel warnings, doctor categorization |
+| preflight.rs | 66 | Verdicts, EXPLAIN parsing, suggestions, strategy, profile recommendation, parallelism recommendation, sparse/dense/parallel warnings, doctor categorization |
 | pipeline.rs | 19 | Chunks, time-window, cursor, classify_error, credential errors, format_bytes, RunSummary |
-| state.rs | 14 | SQLite CRUD, metrics, schema tracking |
+| state.rs | 18 | SQLite CRUD, metrics, schema tracking, file manifest |
 | tuning.rs | 8 | Profiles, overrides, display |
 | enrich.rs | 6 | Meta columns: exported_at, row_hash, determinism, null vs empty |
 | destination/gcs_auth.rs | 7 | ADC parsing, urlenc, authorized_user validation |
@@ -401,7 +402,7 @@ README restructured around real usage decisions:
 
 ---
 
-**Phase 1 "Pilot Alpha Stabilization" (Epics A–E) is complete.** All auth flows are implemented and tested, execution semantics are frozen and documented, run summaries are printed and persisted, and documentation covers real usage decisions.
+**Phase 1 "Pilot Alpha Stabilization" (Epics A–E + D3/D4/L6) is complete.** All auth flows are implemented and tested, execution semantics are frozen and documented, run summaries are printed and persisted with canonical run IDs, file manifest accounting is in place, parallelism recommendations are provided by the planner, and documentation covers real usage decisions.
 
 ## v4 Features (implemented)
 
@@ -422,6 +423,29 @@ README restructured around real usage decisions:
 
 - `rivet completions <shell>` generates completions for bash, zsh, fish, powershell
 - Powered by `clap_complete`
+
+### File Manifest Accounting (Story D3)
+
+- Every file produced by an export is recorded in `file_manifest` SQLite table
+- Tracks: `run_id`, `export_name`, `file_name`, `row_count`, `bytes`, `format`, `compression`, `created_at`
+- CLI: `rivet state files --config <path>` shows recent files
+- Filter by export: `--export orders`, limit: `--last 50`
+- Enables post-run reconciliation: which run created which files with what row counts
+
+### Run ID Alignment (Story D4)
+
+- Each export run gets a canonical `run_id` (format: `{export_name}_{timestamp}`)
+- `run_id` appears in: end-of-run summary, `export_metrics` table, `file_manifest` table
+- `rivet metrics` output shows `run_id` instead of raw `run_at` timestamp
+- Same `run_id` links summary, metrics, and files for full traceability
+
+### Parallelism Recommendation (Story L6)
+
+- `rivet check` now recommends a parallelism level for each export
+- Only chunked mode benefits from parallelism; other modes show `1 (only chunked mode benefits)`
+- Recommendation considers: row estimate, index usage, dataset size
+- Scale: 1 (too small / no index + large) → 2 (moderate or no-index conservative) → 4 (large indexed)
+- Includes reason string explaining the recommendation
 
 ---
 

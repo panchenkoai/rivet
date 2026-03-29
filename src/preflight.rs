@@ -34,6 +34,7 @@ struct ExportDiagnostic {
     uses_index: bool,
     verdict: HealthVerdict,
     recommended_profile: &'static str,
+    recommended_parallel: (u32, &'static str),
     warnings: Vec<String>,
     suggestion: Option<String>,
 }
@@ -315,6 +316,37 @@ pub(crate) fn check_parallel_memory_risk(
     }
 }
 
+/// L6: Recommend parallelism level based on mode, row estimate, index usage, and profile.
+pub(crate) fn recommend_parallelism(
+    export: &ExportConfig,
+    row_estimate: Option<i64>,
+    uses_index: bool,
+) -> (u32, &'static str) {
+    if export.mode != ExportMode::Chunked {
+        return (1, "only chunked mode benefits from parallelism");
+    }
+
+    let rows = row_estimate.unwrap_or(0);
+
+    if rows < 50_000 {
+        return (1, "dataset too small to benefit from parallelism");
+    }
+
+    if !uses_index && rows > 5_000_000 {
+        return (1, "no index — parallel scans would multiply source load");
+    }
+
+    if !uses_index {
+        return (2, "no index — conservative parallelism to limit source impact");
+    }
+
+    match rows {
+        r if r < 500_000 => (2, "moderate dataset — 2 workers sufficient"),
+        r if r < 5_000_000 => (4, "large dataset with index support"),
+        _ => (4, "very large dataset — cap at 4 to control memory; increase with memory_threshold_mb monitoring"),
+    }
+}
+
 /// Collect all warnings (B3-B5) for an export.
 fn collect_warnings(
     export: &ExportConfig,
@@ -415,6 +447,7 @@ fn diagnose_pg(client: &mut postgres::Client, export: &ExportConfig) -> Result<E
     let strategy = derive_strategy(export);
     let verdict = compute_verdict(row_estimate, uses_index, export.cursor_column.is_some());
     let recommended_profile = recommend_profile(row_estimate, uses_index, export);
+    let recommended_parallel = recommend_parallelism(export, row_estimate, uses_index);
     let warnings = collect_warnings(
         export, row_estimate, range_min.as_deref(), range_max.as_deref(),
     );
@@ -432,6 +465,7 @@ fn diagnose_pg(client: &mut postgres::Client, export: &ExportConfig) -> Result<E
         uses_index,
         verdict,
         recommended_profile,
+        recommended_parallel,
         warnings,
         suggestion,
     })
@@ -611,6 +645,7 @@ fn diagnose_mysql(conn: &mut mysql::PooledConn, export: &ExportConfig) -> Result
     let strategy = derive_strategy(export);
     let verdict = compute_verdict(row_estimate, uses_index, export.cursor_column.is_some());
     let recommended_profile = recommend_profile(row_estimate, uses_index, export);
+    let recommended_parallel = recommend_parallelism(export, row_estimate, uses_index);
     let warnings = collect_warnings(
         export, row_estimate, range_min.as_deref(), range_max.as_deref(),
     );
@@ -628,6 +663,7 @@ fn diagnose_mysql(conn: &mut mysql::PooledConn, export: &ExportConfig) -> Result
         uses_index,
         verdict,
         recommended_profile,
+        recommended_parallel,
         warnings,
         suggestion,
     })
@@ -775,6 +811,12 @@ fn print_diagnostic(diag: &ExportDiagnostic) {
     }
     println!("  Verdict:      {}", diag.verdict);
     println!("  Recommended:  tuning.profile: {}", diag.recommended_profile);
+    let (par_level, par_reason) = diag.recommended_parallel;
+    if par_level > 1 {
+        println!("  Recommended:  parallel: {} ({})", par_level, par_reason);
+    } else {
+        println!("  Parallelism:  {} ({})", par_level, par_reason);
+    }
     for w in &diag.warnings {
         println!("  Warning:      {}", w);
     }
@@ -1250,6 +1292,56 @@ mod tests {
         let e = make_export("t", ExportMode::Full, None);
         let s = build_suggestion(&HealthVerdict::Acceptable, Some(20_000_000), true, &e).unwrap();
         assert!(s.contains("incremental"), "got: {s}");
+    }
+
+    // --- L6: recommend_parallelism ---
+
+    #[test]
+    fn parallel_only_for_chunked_mode() {
+        let e = make_export("t", ExportMode::Full, None);
+        let (level, _) = recommend_parallelism(&e, Some(1_000_000), true);
+        assert_eq!(level, 1, "non-chunked mode should recommend 1");
+    }
+
+    #[test]
+    fn parallel_small_dataset_is_one() {
+        let mut e = make_export("t", ExportMode::Chunked, None);
+        e.chunk_column = Some("id".to_string());
+        let (level, _) = recommend_parallelism(&e, Some(10_000), true);
+        assert_eq!(level, 1, "small dataset should recommend 1");
+    }
+
+    #[test]
+    fn parallel_moderate_indexed_is_two() {
+        let mut e = make_export("t", ExportMode::Chunked, None);
+        e.chunk_column = Some("id".to_string());
+        let (level, _) = recommend_parallelism(&e, Some(200_000), true);
+        assert_eq!(level, 2, "moderate indexed dataset should recommend 2");
+    }
+
+    #[test]
+    fn parallel_large_indexed_is_four() {
+        let mut e = make_export("t", ExportMode::Chunked, None);
+        e.chunk_column = Some("id".to_string());
+        let (level, _) = recommend_parallelism(&e, Some(2_000_000), true);
+        assert_eq!(level, 4, "large indexed dataset should recommend 4");
+    }
+
+    #[test]
+    fn parallel_no_index_large_is_one() {
+        let mut e = make_export("t", ExportMode::Chunked, None);
+        e.chunk_column = Some("id".to_string());
+        let (level, reason) = recommend_parallelism(&e, Some(10_000_000), false);
+        assert_eq!(level, 1, "no index + large should recommend 1");
+        assert!(reason.contains("no index"), "got: {reason}");
+    }
+
+    #[test]
+    fn parallel_no_index_moderate_is_conservative() {
+        let mut e = make_export("t", ExportMode::Chunked, None);
+        e.chunk_column = Some("id".to_string());
+        let (level, _) = recommend_parallelism(&e, Some(200_000), false);
+        assert_eq!(level, 2, "no index + moderate should recommend 2 (conservative)");
     }
 
     #[test]

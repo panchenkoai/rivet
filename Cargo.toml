@@ -8,7 +8,7 @@ default-run = "rivet"
 
 [dependencies]
 anyhow = "1"
-arrow = { version = "54", features = ["chrono-tz"] }
+arrow = { version = "58", features = ["chrono-tz"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 csv = "1"
@@ -16,14 +16,14 @@ env_logger = "0.11"
 libc = "0.2"
 mach2 = "0.4"
 log = "0.4"
-mysql = "25"
-opendal = { version = "0.51", features = ["layers-blocking", "services-fs", "services-s3", "services-gcs"] }
-parquet = { version = "54", features = ["arrow", "zstd", "lz4", "flate2"] }
+mysql = "28"
+opendal = { version = "0.55", features = ["blocking", "services-fs", "services-s3", "services-gcs"] }
+parquet = { version = "58", features = ["arrow", "zstd", "lz4", "flate2"] }
 clap_complete = "4"
 postgres = "0.19"
-rand = "0.8"
+rand = "0.10"
 postgres-types = { version = "0.2", features = ["with-chrono-0_4"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
