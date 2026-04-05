@@ -1,8 +1,10 @@
-# koRivet — User acceptance test plan
+# Rivet — User acceptance test plan
 
 This document is a **manual checklist** for operators and pilot users who want to exercise Rivet end-to-end against the features that already exist. Use it for smoke tests, regression passes before a release, or onboarding.
 
 To mark a test: change `[ ]` to `[x]` in the Pass column.
+
+**Stabilization focus (recent features):** complete **Suite R** (chunk checkpoint), **Suite S** (per-export tuning + parallel exports/processes), then optional **T** (monitoring stack) and **U** (sparse chunk demo). Older suites A–Q remain regression coverage.
 
 ---
 
@@ -84,10 +86,11 @@ Sections marked **(optional)** need extra services or longer runs.
 ## Suite E — Chunked mode
 
 
-| ID  | Scenario                        | Command / Steps                                 | Expected                                | Pass |
-| --- | ------------------------------- | ----------------------------------------------- | --------------------------------------- | ---- |
-| E1  | Chunked sequential              | `rivet run --config dev/bench_chunked_seq.yaml` | Chunk files created; logs show progress | [x]  |
-| E2  | Chunked parallel **(optional)** | `rivet run --config dev/bench_chunked_p4.yaml`  | Parallel logs; all chunks succeed       | [x]  |
+| ID  | Scenario                        | Command / Steps                                                                 | Expected                                                                 | Pass |
+| --- | ------------------------------- | ------------------------------------------------------------------------------- | ------------------------------------------------------------------------ | ---- |
+| E1  | Chunked sequential              | `rivet run --config dev/bench_chunked_seq.yaml`                                 | Chunk files created; logs show progress                                  | [x]  |
+| E2  | Chunked parallel + checkpoint   | `rivet run --config dev/bench_chunked_p4.yaml --export bench_content_p4_serial` | `chunk_checkpoint: true`; multiple chunk files; success summary          | [ ]  |
+| E3  | Full bench config (long) **(optional)** | `rivet run --config dev/bench_chunked_p4.yaml`                          | All exports in YAML complete (sequential default); high DB load          | [ ]  |
 
 
 ---
@@ -279,17 +282,68 @@ Verify the proxy API is up: `curl -s http://localhost:8474/proxies | head` shoul
 
 ---
 
+## Suite R — Chunk checkpoint (SQLite plan, resume, CLI)
+
+
+| ID  | Scenario              | Command / Steps                                                                                                                                                                                                 | Expected                                                                                                                                      | Pass |
+| --- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ---- |
+| R1  | Checkpoint completes  | `rivet run --config dev/bench_chunked_p4.yaml --export bench_content_p4_serial --validate`                                                                                                                        | `status: success`; chunk files under `dev/output/bench/`                                                                                      | [ ]  |
+| R2  | Inspect chunk table   | `rivet state chunks --config dev/bench_chunked_p4.yaml --export bench_content_p4_serial`                                                                                                                          | Lists run / tasks (completed); no panic                                                                                                                                       | [ ]  |
+| R3  | Resume after crash    | Start `rivet run --config dev/bench_chunked_p4.yaml --export bench_content_p4` in terminal 1; after a few chunks appear in output, `kill -9` the rivet PID; then `rivet run --config dev/bench_chunked_p4.yaml --export bench_content_p4 --resume` | Second command finishes export; logs show stale `running` reset; no duplicate row loss vs full success run (row count 200k for content_items) | [ ]  |
+| R4  | Reset chunk plan      | `rivet state reset-chunks --config dev/bench_chunked_p4.yaml --export bench_content_p4_serial`                                                                                                                    | Exits 0; next `rivet run … --export bench_content_p4_serial` creates a fresh plan                                                              | [ ]  |
+| R5  | Fingerprint mismatch  | After a **killed** mid-run (in-progress plan exists, like R3), change `chunk_size` for that export in YAML, then `rivet run … --export … --resume`                                                                | Error mentions **chunk plan fingerprint mismatch**; no silent corruption                                                                       | [ ]  |
+
+
+---
+
+## Suite S — Per-export tuning and parallel multi-export
+
+
+| ID  | Scenario                 | Command / Steps                                                                                    | Expected                                                                                                         | Pass |
+| --- | ------------------------ | -------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- | ---- |
+| S1  | Per-export profile       | `rivet run --config dev/bench_chunked_p4.yaml --export bench_content_p4_balanced`                  | Summary `tuning:` shows `profile=balanced` (others default fast from source + batch 1000)                        | [ ]  |
+| S2  | Parallel exports (threads) | `rivet run --config dev/bench_chunked_p4.yaml --parallel-exports`                                | All exports succeed; logs interleave; **peak RSS** lines may look similar (one process)                            | [ ]  |
+| S3  | Parallel exports (processes) | `rivet run --config dev/bench_chunked_p4.yaml --parallel-export-processes`                    | All succeed; **peak RSS** differs per export block; multiple `rivet` PIDs during run (`ps` / Activity Monitor)      | [ ]  |
+| S4  | Single export ignores parallel flags | `rivet run --config dev/bench_chunked_p4.yaml --export bench_content_p4 --parallel-exports` | Same as without flags (one job); no extra workers from multi-export logic                                        | [ ]  |
+| S5  | YAML `parallel_exports`  | Add `parallel_exports: true` at top of a **copy** of bench config (2+ exports), run without CLI flag | Same behavior as S2 (optional; avoid committing temp file)                                                      | [ ]  |
+
+
+---
+
+## Suite T — Dev monitoring stack **(optional)**
+
+
+| ID  | Scenario        | Command / Steps                                                                                       | Expected                                          | Pass |
+| --- | --------------- | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------- | ---- |
+| T1  | Stack up        | `docker compose up -d postgres postgres-exporter prometheus grafana`                                  | `curl -s localhost:9090/-/healthy` OK; Grafana :3000 loads | [ ]  |
+| T2  | Metrics under load | While Grafana dashboard `Postgres Overview` is open, run `rivet run --config dev/bench_chunked_p4.yaml --export bench_content_p4_serial` | Prometheus targets UP; charts show activity spike | [ ]  |
+
+
+---
+
+## Suite U — Sparse chunk / dense surrogate demo **(optional)**
+
+
+| ID  | Scenario        | Command / Steps                                                                                          | Expected                                                | Pass |
+| --- | --------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- | ---- |
+| U1  | Seed sparse ids | `cargo run --release --bin seed -- --target postgres --only-sparse-chunk-demo --sparse-chunk-rows 5000 --sparse-chunk-id-gap 100000` | `orders_sparse` has few rows vs wide `MIN/MAX(id)` band | [ ]  |
+| U2  | Preflight warns | `rivet check --config dev/sparse_chunk_demo.yaml --export orders_sparse_on_id`                           | Sparse / inefficient range warning (wording may vary)   | [ ]  |
+| U3  | Chunked export  | `rivet run --config dev/sparse_chunk_demo.yaml --export orders_sparse_builtin_dense`                      | Completes; output under `dev/output/sparse_chunk/`       | [ ]  |
+
+
+---
+
 ## Sign-off
 
 
-| Field          | Value                                    |
-| -------------- | ---------------------------------------- |
-| Tester         | Andrii Panchenko                         |
-| Date           | 2026-03-29                               |
-| Rivet commit   | c3788a5eb3a0635dd1dee898d362dfbacb20b0c8 |
-| Postgres image | `dockercompose postgres:16`              |
-| MySQL image    | `dockercompose postgres:16`              |
-| Notes          |                                          |
+| Field          | Value                         |
+| -------------- | ----------------------------- |
+| Tester         |                               |
+| Date           |                               |
+| Rivet commit   | `git rev-parse HEAD`          |
+| Postgres image | (e.g. `postgres:16` from compose) |
+| MySQL image    | (e.g. `mysql:8` from compose)    |
+| Notes          | E2/R/S pass before release tag   |
 
 
 ---
@@ -306,7 +360,8 @@ Verify the proxy API is up: `curl -s http://localhost:8474/proxies | head` shoul
 | `dev/pg_structured.yaml`             | PG structured credentials        |
 | `dev/mysql_structured.yaml`          | MySQL structured credentials     |
 | `dev/bench_chunked_seq.yaml`         | Chunked sequential               |
-| `dev/bench_chunked_p4.yaml`          | Chunked parallel                 |
+| `dev/bench_chunked_p4.yaml`          | Chunked parallel + checkpoint bench (several exports) |
+| `dev/sparse_chunk_demo.yaml`         | Sparse `chunk_column` / dense surrogate demo |
 | `dev/test_meta_columns.yaml`         | Meta columns + zstd              |
 | `dev/test_compression.yaml`          | Snappy / none / skip_empty       |
 | `dev/rivet_s3_minio_test.yaml`       | S3-compatible (MinIO)            |

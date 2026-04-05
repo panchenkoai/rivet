@@ -179,9 +179,11 @@ Output:
   files:       1
   bytes:       2.1 MB
   duration:    1.2s
-  peak RSS:    45MB
+  peak RSS:    45MB (sampled during run)
   validated:   pass
 ```
+
+`peak RSS` is the highest resident set size seen while the export ran (background sampling), combined with start/end reads — useful for capacity planning. With **multiple exports in one process** (see §11), each job’s line still reflects process-wide RSS unless you use **separate processes** per export.
 
 Your file is now in `./output/users_full_20260329_143000.parquet`.
 
@@ -223,6 +225,36 @@ You can override individual settings:
     batch_size: 5000       # override the default 2000
     statement_timeout_s: 60
 ```
+
+### Per-export tuning overrides
+
+Defaults live on `source.tuning`. Any export can add an optional `tuning:` block; Rivet **merges** it on top of the source (for each field, the export value wins when set). Handy for comparing `fast` vs `balanced` in one file without duplicating the whole source.
+
+```yaml
+source:
+  type: postgres
+  url_env: DATABASE_URL
+  tuning:
+    profile: fast
+    batch_size: 1000
+
+exports:
+  - name: heavy_table
+    query: "SELECT * FROM big"
+    # inherits fast + batch 1000
+    ...
+
+  - name: careful_copy
+    query: "SELECT * FROM big"
+    tuning:
+      profile: balanced   # only this export switches profile
+    ...
+```
+
+Rules:
+
+- `batch_size` and `batch_size_memory_mb` are **mutually exclusive** in the **effective** config (after merge). Rivet rejects the config if both appear across source + export.
+- The run summary’s `tuning:` line shows the **YAML profile label** (`fast`, `balanced`, `safe`, or `balanced (default)`); SQLite metrics still store the heuristic profile name derived from behavior.
 
 ---
 
@@ -450,7 +482,7 @@ gcloud auth application-default login
 
 ## 11. Multiple exports in one config
 
-A single config file can define many exports. They run sequentially:
+A single config file can define many exports. **By default** they run **sequentially** in order, in **one** Rivet process (one connection to `.rivet_state.db` for state/metrics).
 
 ```yaml
 source:
@@ -507,6 +539,24 @@ Run a single export:
 
 ```bash
 rivet run --config rivet.yaml --export orders_incremental --validate
+```
+
+### Parallel execution of all exports
+
+Only applies when you run **without** `--export` and the config lists **at least two** exports.
+
+| Mode | CLI flag | YAML (optional) | What happens |
+|------|----------|-----------------|--------------|
+| **Threads** | `--parallel-exports` | `parallel_exports: true` | Exports run concurrently in the same process. Faster to start; **peak RSS** in each summary is still **process-wide** (not isolated per export). Each job uses its own SQLite connection (WAL). |
+| **Processes** | `--parallel-export-processes` | `parallel_export_processes: true` | Parent spawns one child `rivet run --config … --export <name>` per export (children do **not** inherit parallel flags). **Peak RSS** per summary reflects that child process. Higher fork/exec overhead. |
+
+If both YAML switches are true, **process mode wins**. You can combine parallel exports with chunked `parallel: N` inside each job — total database load is the product; watch **`max_connections`**, CPU, and I/O.
+
+Example (bench-style config in-repo: `dev/bench_chunked_p4.yaml`):
+
+```bash
+rivet run --config dev/bench_chunked_p4.yaml --parallel-exports
+rivet run --config dev/bench_chunked_p4.yaml --parallel-export-processes
 ```
 
 ---
@@ -828,6 +878,21 @@ EXPORT                         LAST CURSOR                              LAST RUN
 orders_incremental             2026-03-29T16:00:00.000000               2026-03-29T16:00:01+00:00
 ```
 
+### Chunk checkpoint plan
+
+For exports with `chunk_checkpoint: true`, chunk boundaries and status live in `.rivet_state.db` next to the config.
+
+```bash
+rivet state chunks --config rivet.yaml --export big_table
+rivet state reset-chunks --config rivet.yaml --export big_table   # drop plan for this export; next run starts clean
+```
+
+Use `rivet run … --resume` to continue an in-progress checkpointed run (see §8).
+
+### Dev-only: Postgres metrics (Prometheus + Grafana)
+
+The repository `docker-compose.yaml` can start **postgres-exporter**, **Prometheus**, and **Grafana** for observing the database during load tests (ports `9187`, `9090`, `3000`). Config lives under `dev/prometheus/` and `dev/grafana/`. This stack is optional and intended for local benchmarking, not a Rivet runtime requirement.
+
 ### Logging
 
 Set `RUST_LOG` for detailed output:
@@ -903,10 +968,13 @@ Before deploying Rivet to production, verify each item:
 
 - [ ] Credentials are in environment variables, not in the YAML file
 - [ ] `tuning.profile: safe` for production OLTP sources
+- [ ] Per-export `tuning:` overrides (if any) were validated; merged `batch_size` / `batch_size_memory_mb` are not both set
 - [ ] Correct `mode` for each table (incremental for growing tables, full for snapshots)
 - [ ] `skip_empty: true` on incremental exports to avoid empty files
 - [ ] `--validate` flag is used in cron / scheduler
 - [ ] Output directory or bucket exists and has write permissions
+- [ ] Chunked exports with `chunk_checkpoint: true` have a documented **resume** / **reset-chunks** procedure for operators
+- [ ] If using `parallel_exports` or `parallel_export_processes`, database **`max_connections`** and lock capacity are sufficient for summed concurrency (including chunked `parallel` per export)
 
 ### Pre-flight
 
@@ -944,11 +1012,16 @@ Before deploying Rivet to production, verify each item:
 | Validate config and source health | `rivet check --config rivet.yaml` |
 | Verify authentication | `rivet doctor --config rivet.yaml` |
 | Run all exports | `rivet run --config rivet.yaml --validate` |
+| Run all exports in parallel (threads) | `rivet run --config rivet.yaml --parallel-exports` |
+| Run all exports in parallel (processes) | `rivet run --config rivet.yaml --parallel-export-processes` |
+| Resume chunked checkpoint | `rivet run --config rivet.yaml --export big_table --resume` |
 | Run one export | `rivet run --config rivet.yaml --export orders --validate` |
 | Run with params | `rivet run --config rivet.yaml --param TABLE=users --param LIMIT=1000` |
 | Pipe to stdout | `rivet run --config rivet.yaml --export csv_export \| duckdb` |
 | Check cursor state | `rivet state show --config rivet.yaml` |
 | Reset a cursor | `rivet state reset --config rivet.yaml --export orders` |
+| Chunk checkpoint status | `rivet state chunks --config rivet.yaml --export big_table` |
+| Clear chunk plan | `rivet state reset-chunks --config rivet.yaml --export big_table` |
 | View run history | `rivet metrics --config rivet.yaml --last 10` |
 | View file manifest | `rivet state files --config rivet.yaml` |
 | Enable logging | `RUST_LOG=info rivet run --config rivet.yaml` |
