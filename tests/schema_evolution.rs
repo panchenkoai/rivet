@@ -5,10 +5,13 @@ fn store() -> StateStore {
 }
 
 fn cols(pairs: &[(&str, &str)]) -> Vec<SchemaColumn> {
-    pairs.iter().map(|(n, t)| SchemaColumn {
-        name: n.to_string(),
-        data_type: t.to_string(),
-    }).collect()
+    pairs
+        .iter()
+        .map(|(n, t)| SchemaColumn {
+            name: n.to_string(),
+            data_type: t.to_string(),
+        })
+        .collect()
 }
 
 // ─── Basic lifecycle ─────────────────────────────────────────
@@ -16,7 +19,11 @@ fn cols(pairs: &[(&str, &str)]) -> Vec<SchemaColumn> {
 #[test]
 fn first_run_stores_schema_silently() {
     let s = store();
-    let schema = cols(&[("id", "Int64"), ("name", "Utf8"), ("created_at", "Timestamp(Microsecond, None)")]);
+    let schema = cols(&[
+        ("id", "Int64"),
+        ("name", "Utf8"),
+        ("created_at", "Timestamp(Microsecond, None)"),
+    ]);
     let change = s.detect_schema_change("orders", &schema).unwrap();
     assert!(change.is_none(), "first run should not report changes");
 
@@ -33,7 +40,10 @@ fn second_run_same_schema_no_change() {
     s.detect_schema_change("t", &schema).unwrap();
 
     let change = s.detect_schema_change("t", &schema).unwrap();
-    assert!(change.is_none(), "identical schema should not report changes");
+    assert!(
+        change.is_none(),
+        "identical schema should not report changes"
+    );
 }
 
 // ─── Column additions ────────────────────────────────────────
@@ -48,7 +58,11 @@ fn detect_single_column_added() {
     let change = s.detect_schema_change("t", &v2).unwrap().unwrap();
 
     assert_eq!(change.added.len(), 1);
-    assert!(change.added[0].contains("email"), "should report email added: {:?}", change.added);
+    assert!(
+        change.added[0].contains("email"),
+        "should report email added: {:?}",
+        change.added
+    );
     assert!(change.removed.is_empty());
     assert!(change.type_changed.is_empty());
 }
@@ -59,7 +73,12 @@ fn detect_multiple_columns_added() {
     let v1 = cols(&[("id", "Int64")]);
     s.detect_schema_change("t", &v1).unwrap();
 
-    let v2 = cols(&[("id", "Int64"), ("name", "Utf8"), ("email", "Utf8"), ("age", "Int32")]);
+    let v2 = cols(&[
+        ("id", "Int64"),
+        ("name", "Utf8"),
+        ("email", "Utf8"),
+        ("age", "Int32"),
+    ]);
     let change = s.detect_schema_change("t", &v2).unwrap().unwrap();
 
     assert_eq!(change.added.len(), 3);
@@ -118,7 +137,11 @@ fn detect_multiple_type_changes() {
     let v1 = cols(&[("id", "Int32"), ("ts", "Utf8"), ("flag", "Int16")]);
     s.detect_schema_change("t", &v1).unwrap();
 
-    let v2 = cols(&[("id", "Int64"), ("ts", "Timestamp(Microsecond, None)"), ("flag", "Boolean")]);
+    let v2 = cols(&[
+        ("id", "Int64"),
+        ("ts", "Timestamp(Microsecond, None)"),
+        ("flag", "Boolean"),
+    ]);
     let change = s.detect_schema_change("t", &v2).unwrap().unwrap();
 
     assert_eq!(change.type_changed.len(), 3);
@@ -155,7 +178,10 @@ fn schema_updated_after_change_detected() {
 
     // Third run with v2 should show no change (schema was updated)
     let change = s.detect_schema_change("t", &v2).unwrap();
-    assert!(change.is_none(), "after update, same schema should show no change");
+    assert!(
+        change.is_none(),
+        "after update, same schema should show no change"
+    );
 }
 
 #[test]
@@ -232,7 +258,10 @@ fn column_order_change_not_detected_as_change() {
 
     let v2 = cols(&[("name", "Utf8"), ("id", "Int64")]);
     let change = s.detect_schema_change("t", &v2).unwrap();
-    assert!(change.is_none(), "reordering columns should not be a schema change");
+    assert!(
+        change.is_none(),
+        "reordering columns should not be a schema change"
+    );
 }
 
 // ─── Realistic Arrow type names ──────────────────────────────
@@ -265,7 +294,19 @@ fn realistic_pg_schema_evolution() {
     ]);
     let c = s.detect_schema_change("users", &v2).unwrap().unwrap();
 
-    assert!(c.added.iter().any(|a| a.contains("phone")), "phone should be added: {:?}", c.added);
-    assert!(c.removed.contains(&"age".to_string()), "age should be removed: {:?}", c.removed);
-    assert!(c.type_changed.iter().any(|(n, _, _)| n == "balance"), "balance type should change: {:?}", c.type_changed);
+    assert!(
+        c.added.iter().any(|a| a.contains("phone")),
+        "phone should be added: {:?}",
+        c.added
+    );
+    assert!(
+        c.removed.contains(&"age".to_string()),
+        "age should be removed: {:?}",
+        c.removed
+    );
+    assert!(
+        c.type_changed.iter().any(|(n, _, _)| n == "balance"),
+        "balance type should change: {:?}",
+        c.type_changed
+    );
 }

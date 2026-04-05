@@ -31,8 +31,8 @@ pub fn try_authorized_user_token() -> Result<Option<String>> {
 
     let data = std::fs::read_to_string(&path)
         .with_context(|| format!("reading ADC file {}", path.display()))?;
-    let fields = parse_adc_file(&data)
-        .with_context(|| format!("parsing ADC file {}", path.display()))?;
+    let fields =
+        parse_adc_file(&data).with_context(|| format!("parsing ADC file {}", path.display()))?;
     let (client_id, client_secret, refresh_token) = match fields {
         Some(f) => f,
         None => return Ok(None),
@@ -91,22 +91,28 @@ pub(crate) fn adc_path() -> Option<PathBuf> {
         return None;
     };
 
-    Some(config_dir.join("gcloud").join("application_default_credentials.json"))
+    Some(
+        config_dir
+            .join("gcloud")
+            .join("application_default_credentials.json"),
+    )
 }
 
 /// Parse ADC JSON and validate fields without making a network request.
 /// Returns `Ok(None)` when the file is not `authorized_user` type.
 pub(crate) fn parse_adc_file(data: &str) -> Result<Option<(String, String, String)>> {
-    let adc: AdcFile = serde_json::from_str(data)
-        .context("parsing ADC JSON")?;
+    let adc: AdcFile = serde_json::from_str(data).context("parsing ADC JSON")?;
     if adc.cred_type != "authorized_user" {
         return Ok(None);
     }
-    let client_id = adc.client_id
+    let client_id = adc
+        .client_id
         .ok_or_else(|| anyhow::anyhow!("ADC authorized_user: missing client_id"))?;
-    let client_secret = adc.client_secret
+    let client_secret = adc
+        .client_secret
         .ok_or_else(|| anyhow::anyhow!("ADC authorized_user: missing client_secret"))?;
-    let refresh_token = adc.refresh_token
+    let refresh_token = adc
+        .refresh_token
         .ok_or_else(|| anyhow::anyhow!("ADC authorized_user: missing refresh_token"))?;
     Ok(Some((client_id, client_secret, refresh_token)))
 }

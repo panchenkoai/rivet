@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -68,10 +68,14 @@ pub fn get_rss_mb() -> usize {
 #[cfg(target_os = "macos")]
 fn macos_rss_mb() -> usize {
     use std::mem;
+    // SAFETY: `task_info` is a stable macOS kernel API.  We zero-initialise the
+    // struct, pass the correct `count` (struct size / natural_t), and check the
+    // return code before reading the result.  No aliasing or lifetime issues.
     unsafe {
         let mut info: libc::mach_task_basic_info_data_t = mem::zeroed();
         let mut count = (mem::size_of::<libc::mach_task_basic_info_data_t>()
-            / mem::size_of::<libc::natural_t>()) as libc::mach_msg_type_number_t;
+            / mem::size_of::<libc::natural_t>())
+            as libc::mach_msg_type_number_t;
         let kr = libc::task_info(
             mach2::traps::mach_task_self(),
             libc::MACH_TASK_BASIC_INFO,

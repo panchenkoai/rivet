@@ -1,7 +1,10 @@
 [package]
 name = "rivet"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+repository = "https://github.com/rivet-data/rivet"
 description = "CLI tool to export PostgreSQL and MySQL to Parquet/CSV (local, S3, GCS) with tuning, preflight checks, and SQLite-backed state."
 readme = "README.md"
 default-run = "rivet"

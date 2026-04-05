@@ -37,7 +37,10 @@ pub struct TuningConfig {
 
 /// Layer `export` on top of `source`: each field uses export when set, otherwise source.
 /// `None` only when both inputs are `None`.
-pub fn merge_tuning_config(source: Option<&TuningConfig>, export: Option<&TuningConfig>) -> Option<TuningConfig> {
+pub fn merge_tuning_config(
+    source: Option<&TuningConfig>,
+    export: Option<&TuningConfig>,
+) -> Option<TuningConfig> {
     match (source, export) {
         (None, None) => None,
         (Some(s), None) => Some(s.clone()),
@@ -65,14 +68,28 @@ impl SourceTuning {
         let mut tuning = Self::from_profile(profile);
 
         if let Some(cfg) = config {
-            if let Some(v) = cfg.batch_size { tuning.batch_size = v; }
+            if let Some(v) = cfg.batch_size {
+                tuning.batch_size = v;
+            }
             tuning.batch_size_memory_mb = cfg.batch_size_memory_mb;
-            if let Some(v) = cfg.throttle_ms { tuning.throttle_ms = v; }
-            if let Some(v) = cfg.statement_timeout_s { tuning.statement_timeout_s = v; }
-            if let Some(v) = cfg.max_retries { tuning.max_retries = v; }
-            if let Some(v) = cfg.retry_backoff_ms { tuning.retry_backoff_ms = v; }
-            if let Some(v) = cfg.lock_timeout_s { tuning.lock_timeout_s = v; }
-            if let Some(v) = cfg.memory_threshold_mb { tuning.memory_threshold_mb = v; }
+            if let Some(v) = cfg.throttle_ms {
+                tuning.throttle_ms = v;
+            }
+            if let Some(v) = cfg.statement_timeout_s {
+                tuning.statement_timeout_s = v;
+            }
+            if let Some(v) = cfg.max_retries {
+                tuning.max_retries = v;
+            }
+            if let Some(v) = cfg.retry_backoff_ms {
+                tuning.retry_backoff_ms = v;
+            }
+            if let Some(v) = cfg.lock_timeout_s {
+                tuning.lock_timeout_s = v;
+            }
+            if let Some(v) = cfg.memory_threshold_mb {
+                tuning.memory_threshold_mb = v;
+            }
         }
 
         tuning
@@ -148,12 +165,17 @@ pub fn estimate_row_bytes(schema: &SchemaRef) -> usize {
             DataType::Boolean | DataType::Int8 | DataType::UInt8 => 1,
             DataType::Int16 | DataType::UInt16 => 2,
             DataType::Int32 | DataType::UInt32 | DataType::Float32 | DataType::Date32 => 4,
-            DataType::Int64 | DataType::UInt64 | DataType::Float64
-            | DataType::Date64 | DataType::Timestamp(_, _) | DataType::Time64(_)
+            DataType::Int64
+            | DataType::UInt64
+            | DataType::Float64
+            | DataType::Date64
+            | DataType::Timestamp(_, _)
+            | DataType::Time64(_)
             | DataType::Duration(_) => 8,
             DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => 16,
-            DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary
-            | DataType::LargeBinary => STRING_ESTIMATE,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
+                STRING_ESTIMATE
+            }
             _ => 64,
         };
         total += 1; // validity bitmap overhead (rounded up)
@@ -176,7 +198,9 @@ impl SourceTuning {
             let computed = compute_batch_size_from_memory(mem_mb, schema);
             log::info!(
                 "batch_size_memory_mb={}: estimated row ~{}B, computed batch_size={}",
-                mem_mb, estimate_row_bytes(schema), computed
+                mem_mb,
+                estimate_row_bytes(schema),
+                computed
             );
             computed
         } else {
@@ -190,7 +214,10 @@ mod tests {
     use super::*;
 
     fn cfg_with_profile(profile: TuningProfile) -> TuningConfig {
-        TuningConfig { profile: Some(profile), ..Default::default() }
+        TuningConfig {
+            profile: Some(profile),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -235,8 +262,14 @@ mod tests {
         let t = SourceTuning::from_config(Some(&cfg));
         assert_eq!(t.batch_size, 3_000, "explicit batch_size should win");
         assert_eq!(t.throttle_ms, 250, "explicit throttle_ms should win");
-        assert_eq!(t.statement_timeout_s, 120, "non-overridden field stays at safe default");
-        assert_eq!(t.max_retries, 5, "non-overridden field stays at safe default");
+        assert_eq!(
+            t.statement_timeout_s, 120,
+            "non-overridden field stays at safe default"
+        );
+        assert_eq!(
+            t.max_retries, 5,
+            "non-overridden field stays at safe default"
+        );
     }
 
     #[test]
@@ -266,7 +299,10 @@ mod tests {
         assert!(s.contains("throttle=50ms"), "missing throttle in: {s}");
         assert!(s.contains("timeout=300s"), "missing timeout in: {s}");
         assert!(s.contains("retries=3"), "missing retries in: {s}");
-        assert!(s.contains("lock_timeout=30s"), "missing lock_timeout in: {s}");
+        assert!(
+            s.contains("lock_timeout=30s"),
+            "missing lock_timeout in: {s}"
+        );
     }
 
     #[test]
@@ -287,9 +323,11 @@ mod tests {
         use arrow::datatypes::{Field, Schema};
         use std::sync::Arc;
         // 1 tiny column -> huge batch, clamped to 500_000
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("flag", arrow::datatypes::DataType::Boolean, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "flag",
+            arrow::datatypes::DataType::Boolean,
+            false,
+        )]));
         assert_eq!(compute_batch_size_from_memory(256, &schema), 500_000);
 
         // 100 large string columns -> small batch, clamped to 1_000
@@ -315,7 +353,11 @@ mod tests {
         };
         let m = merge_tuning_config(Some(&source), Some(&export)).expect("merged");
         assert_eq!(m.profile, Some(TuningProfile::Safe));
-        assert_eq!(m.batch_size, Some(1_000), "export omitted batch_size -> keep source");
+        assert_eq!(
+            m.batch_size,
+            Some(1_000),
+            "export omitted batch_size -> keep source"
+        );
         assert_eq!(m.throttle_ms, Some(0));
     }
 
@@ -346,7 +388,7 @@ mod tests {
             Field::new("name", arrow::datatypes::DataType::Utf8, true),
         ]));
         let bs = t.effective_batch_size(Some(&schema));
-        assert!(bs >= 1_000 && bs <= 500_000, "got {bs}");
+        assert!((1_000..=500_000).contains(&bs), "got {bs}");
         // 256MB / 266B ≈ 1_009_022, clamped to 500_000
         assert_eq!(bs, 500_000);
     }

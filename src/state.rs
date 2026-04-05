@@ -5,69 +5,45 @@ use crate::types::CursorState;
 
 const STATE_DB_NAME: &str = ".rivet_state.db";
 
-const INIT_SQL: &str = "
-    CREATE TABLE IF NOT EXISTS export_state (
-        export_name TEXT PRIMARY KEY,
-        last_cursor_value TEXT,
-        last_run_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS export_metrics (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        export_name TEXT NOT NULL,
-        run_at TEXT NOT NULL,
-        duration_ms INTEGER NOT NULL,
-        total_rows INTEGER NOT NULL,
-        peak_rss_mb INTEGER,
-        status TEXT NOT NULL,
-        error_message TEXT,
-        tuning_profile TEXT,
-        format TEXT,
-        mode TEXT,
-        files_produced INTEGER DEFAULT 0,
-        bytes_written INTEGER DEFAULT 0,
-        retries INTEGER DEFAULT 0,
-        validated INTEGER,
-        schema_changed INTEGER,
-        run_id TEXT
-    );
-    CREATE TABLE IF NOT EXISTS export_schema (
-        export_name TEXT PRIMARY KEY,
-        columns_json TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS file_manifest (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        run_id TEXT NOT NULL,
-        export_name TEXT NOT NULL,
-        file_name TEXT NOT NULL,
-        row_count INTEGER NOT NULL,
-        bytes INTEGER NOT NULL,
-        format TEXT NOT NULL,
-        compression TEXT,
-        created_at TEXT NOT NULL
-    );
-";
+/// Current schema version.  Bump this and add a matching arm in `MIGRATIONS`.
+#[cfg(test)]
+const SCHEMA_VERSION: i64 = 3;
 
-fn migrate(conn: &Connection) {
-    let metrics_cols = [
-        "files_produced INTEGER DEFAULT 0",
-        "bytes_written INTEGER DEFAULT 0",
-        "retries INTEGER DEFAULT 0",
-        "validated INTEGER",
-        "schema_changed INTEGER",
-        "run_id TEXT",
-    ];
-    for col_def in &metrics_cols {
-        let col_name = col_def.split_whitespace().next().unwrap();
-        let sql = format!("ALTER TABLE export_metrics ADD COLUMN {}", col_def);
-        match conn.execute(&sql, []) {
-            Ok(_) => log::debug!("migration: added column {} to export_metrics", col_name),
-            Err(_) => {}
-        }
-    }
-
-    let _ = conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS file_manifest (
+/// Each entry is `(version, sql)`.  Applied in order when the DB is behind.
+const MIGRATIONS: &[(i64, &str)] = &[
+    // v1: core tables
+    (
+        1,
+        "CREATE TABLE IF NOT EXISTS export_state (
+            export_name TEXT PRIMARY KEY,
+            last_cursor_value TEXT,
+            last_run_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS export_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            export_name TEXT NOT NULL,
+            run_at TEXT NOT NULL,
+            duration_ms INTEGER NOT NULL,
+            total_rows INTEGER NOT NULL,
+            peak_rss_mb INTEGER,
+            status TEXT NOT NULL,
+            error_message TEXT,
+            tuning_profile TEXT,
+            format TEXT,
+            mode TEXT,
+            files_produced INTEGER DEFAULT 0,
+            bytes_written INTEGER DEFAULT 0,
+            retries INTEGER DEFAULT 0,
+            validated INTEGER,
+            schema_changed INTEGER,
+            run_id TEXT
+        );
+        CREATE TABLE IF NOT EXISTS export_schema (
+            export_name TEXT PRIMARY KEY,
+            columns_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS file_manifest (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_id TEXT NOT NULL,
             export_name TEXT NOT NULL,
@@ -77,10 +53,11 @@ fn migrate(conn: &Connection) {
             format TEXT NOT NULL,
             compression TEXT,
             created_at TEXT NOT NULL
-        );"
-    );
-
-    let _ = conn.execute_batch(
+        );",
+    ),
+    // v2: chunk checkpoint tables
+    (
+        2,
         "CREATE TABLE IF NOT EXISTS chunk_run (
             run_id TEXT PRIMARY KEY,
             export_name TEXT NOT NULL,
@@ -107,7 +84,74 @@ fn migrate(conn: &Connection) {
             UNIQUE(run_id, chunk_index)
         );
         CREATE INDEX IF NOT EXISTS idx_chunk_task_run_status ON chunk_task(run_id, status);",
+    ),
+    // v3: index on file_manifest for faster per-export lookups
+    (
+        3,
+        "CREATE INDEX IF NOT EXISTS idx_file_manifest_export ON file_manifest(export_name, id DESC);",
+    ),
+];
+
+fn ensure_schema_version_table(conn: &Connection) {
+    let _ = conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_version (
+            version INTEGER NOT NULL
+        );",
     );
+}
+
+fn get_current_version(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap_or(0)
+}
+
+fn migrate(conn: &Connection) {
+    ensure_schema_version_table(conn);
+
+    let current = get_current_version(conn);
+
+    // Detect pre-versioning databases: if export_state exists but version == 0,
+    // the DB was created by older code before versioned migrations.
+    if current == 0 {
+        let has_export_state: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='export_state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+
+        if has_export_state {
+            // Legacy DB — add any columns that older versions may lack.
+            let metrics_cols = [
+                "files_produced INTEGER DEFAULT 0",
+                "bytes_written INTEGER DEFAULT 0",
+                "retries INTEGER DEFAULT 0",
+                "validated INTEGER",
+                "schema_changed INTEGER",
+                "run_id TEXT",
+            ];
+            for col_def in &metrics_cols {
+                let sql = format!("ALTER TABLE export_metrics ADD COLUMN {}", col_def);
+                let _ = conn.execute(&sql, []);
+            }
+        }
+    }
+
+    for &(ver, sql) in MIGRATIONS {
+        if ver > current {
+            log::debug!("state: applying migration v{}", ver);
+            if let Err(e) = conn.execute_batch(sql) {
+                log::error!("state: migration v{} failed: {}", ver, e);
+                break;
+            }
+            let _ = conn.execute("INSERT INTO schema_version (version) VALUES (?1)", [ver]);
+        }
+    }
 }
 
 /// One row from `chunk_task` for display / debugging.
@@ -190,10 +234,12 @@ impl StateStore {
         let db_path = config_dir.join(STATE_DB_NAME);
         let db_path_buf = db_path.to_path_buf();
         let conn = Connection::open(db_path)?;
-        conn.execute_batch(INIT_SQL)?;
-        migrate(&conn);
         let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
-        Ok(Self { conn, db_path: db_path_buf })
+        migrate(&conn);
+        Ok(Self {
+            conn,
+            db_path: db_path_buf,
+        })
     }
 
     /// Path to `.rivet_state.db` next to the config file (same rules as `open`).
@@ -211,7 +257,10 @@ impl StateStore {
     // ─── Chunk checkpoint (chunked exports) ───────────────────
 
     /// Latest `in_progress` chunk run for this export, if any.
-    pub fn find_in_progress_chunk_run(&self, export_name: &str) -> Result<Option<(String, String)>> {
+    pub fn find_in_progress_chunk_run(
+        &self,
+        export_name: &str,
+    ) -> Result<Option<(String, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT run_id, plan_hash FROM chunk_run
              WHERE export_name = ?1 AND status = 'in_progress'
@@ -396,19 +445,29 @@ impl StateStore {
     /// Remove all chunk runs and tasks for an export (abandon resume).
     pub fn reset_chunk_checkpoint(&self, export_name: &str) -> Result<usize> {
         let run_ids: Vec<String> = {
-            let mut stmt = self.conn.prepare("SELECT run_id FROM chunk_run WHERE export_name = ?1")?;
+            let mut stmt = self
+                .conn
+                .prepare("SELECT run_id FROM chunk_run WHERE export_name = ?1")?;
             let rows = stmt.query_map([export_name], |row| row.get(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
         for rid in &run_ids {
-            let _ = self.conn.execute("DELETE FROM chunk_task WHERE run_id = ?1", [rid]);
+            let _ = self
+                .conn
+                .execute("DELETE FROM chunk_task WHERE run_id = ?1", [rid]);
         }
-        let deleted = self.conn.execute("DELETE FROM chunk_run WHERE export_name = ?1", [export_name])?;
+        let deleted = self.conn.execute(
+            "DELETE FROM chunk_run WHERE export_name = ?1",
+            [export_name],
+        )?;
         Ok(deleted)
     }
 
     /// Latest chunk_run row for an export (any status), for `rivet state chunks`.
-    pub fn get_latest_chunk_run(&self, export_name: &str) -> Result<Option<(String, String, String, String)>> {
+    pub fn get_latest_chunk_run(
+        &self,
+        export_name: &str,
+    ) -> Result<Option<(String, String, String, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT run_id, plan_hash, status, updated_at FROM chunk_run
              WHERE export_name = ?1 ORDER BY updated_at DESC LIMIT 1",
@@ -436,7 +495,8 @@ impl StateStore {
                 file_name: row.get(7)?,
             })
         })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     // ─── Cursor State ────────────────────────────────────────
@@ -477,7 +537,10 @@ impl StateStore {
     }
 
     pub fn reset(&self, export_name: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM export_state WHERE export_name = ?1", [export_name])?;
+        self.conn.execute(
+            "DELETE FROM export_state WHERE export_name = ?1",
+            [export_name],
+        )?;
         Ok(())
     }
 
@@ -492,7 +555,8 @@ impl StateStore {
                 last_run_at: row.get(2)?,
             })
         })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     // ─── Metrics ─────────────────────────────────────────────
@@ -531,24 +595,37 @@ impl StateStore {
         Ok(())
     }
 
-    pub fn get_metrics(&self, export_name: Option<&str>, limit: usize) -> Result<Vec<ExportMetric>> {
+    pub fn get_metrics(
+        &self,
+        export_name: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ExportMetric>> {
         let cols = "export_name, run_id, run_at, duration_ms, total_rows, peak_rss_mb,
                     status, error_message, tuning_profile, format, mode,
                     files_produced, bytes_written, retries, validated, schema_changed";
-        let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(name) = export_name {
+        let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(name) =
+            export_name
+        {
             (
-                format!("SELECT {} FROM export_metrics WHERE export_name = ?1 ORDER BY id DESC LIMIT {}", cols, limit),
+                format!(
+                    "SELECT {} FROM export_metrics WHERE export_name = ?1 ORDER BY id DESC LIMIT {}",
+                    cols, limit
+                ),
                 vec![Box::new(name.to_string())],
             )
         } else {
             (
-                format!("SELECT {} FROM export_metrics ORDER BY id DESC LIMIT {}", cols, limit),
+                format!(
+                    "SELECT {} FROM export_metrics ORDER BY id DESC LIMIT {}",
+                    cols, limit
+                ),
                 vec![],
             )
         };
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
         let rows = stmt.query_map(params_refs.as_slice(), |row| {
             Ok(ExportMetric {
                 export_name: row.get(0)?,
@@ -569,11 +646,13 @@ impl StateStore {
                 schema_changed: row.get(15)?,
             })
         })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     // ─── File Manifest ─────────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record_file(
         &self,
         run_id: &str,
@@ -594,7 +673,9 @@ impl StateStore {
     }
 
     pub fn get_files(&self, export_name: Option<&str>, limit: usize) -> Result<Vec<FileRecord>> {
-        let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(name) = export_name {
+        let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(name) =
+            export_name
+        {
             (
                 format!(
                     "SELECT run_id, export_name, file_name, row_count, bytes, format, compression, created_at
@@ -615,7 +696,8 @@ impl StateStore {
         };
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
         let rows = stmt.query_map(params_refs.as_slice(), |row| {
             Ok(FileRecord {
                 run_id: row.get(0)?,
@@ -628,15 +710,16 @@ impl StateStore {
                 created_at: row.get(7)?,
             })
         })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     // ─── Schema Tracking ─────────────────────────────────────
 
     pub fn get_stored_schema(&self, export_name: &str) -> Result<Option<Vec<SchemaColumn>>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT columns_json FROM export_schema WHERE export_name = ?1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT columns_json FROM export_schema WHERE export_name = ?1")?;
         let result = stmt.query_row([export_name], |row| {
             let json_str: String = row.get(0)?;
             Ok(json_str)
@@ -678,22 +761,29 @@ impl StateStore {
             }
         };
 
-        let stored_map: std::collections::HashMap<&str, &str> =
-            stored.iter().map(|c| (c.name.as_str(), c.data_type.as_str())).collect();
-        let current_map: std::collections::HashMap<&str, &str> =
-            current.iter().map(|c| (c.name.as_str(), c.data_type.as_str())).collect();
+        let stored_map: std::collections::HashMap<&str, &str> = stored
+            .iter()
+            .map(|c| (c.name.as_str(), c.data_type.as_str()))
+            .collect();
+        let current_map: std::collections::HashMap<&str, &str> = current
+            .iter()
+            .map(|c| (c.name.as_str(), c.data_type.as_str()))
+            .collect();
 
-        let added: Vec<String> = current.iter()
+        let added: Vec<String> = current
+            .iter()
             .filter(|c| !stored_map.contains_key(c.name.as_str()))
             .map(|c| format!("{} ({})", c.name, c.data_type))
             .collect();
 
-        let removed: Vec<String> = stored.iter()
+        let removed: Vec<String> = stored
+            .iter()
             .filter(|c| !current_map.contains_key(c.name.as_str()))
             .map(|c| c.name.clone())
             .collect();
 
-        let type_changed: Vec<(String, String, String)> = current.iter()
+        let type_changed: Vec<(String, String, String)> = current
+            .iter()
             .filter_map(|c| {
                 stored_map.get(c.name.as_str()).and_then(|old_type| {
                     if *old_type != c.data_type.as_str() {
@@ -705,7 +795,11 @@ impl StateStore {
             })
             .collect();
 
-        let change = SchemaChange { added, removed, type_changed };
+        let change = SchemaChange {
+            added,
+            removed,
+            type_changed,
+        };
 
         if !change.is_empty() {
             self.store_schema(export_name, current)?;
@@ -718,7 +812,6 @@ impl StateStore {
     #[allow(dead_code)] // used by integration tests (tests/*.rs)
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch(INIT_SQL)?;
         migrate(&conn);
         Ok(Self {
             conn,
@@ -748,7 +841,10 @@ mod tests {
     fn update_then_get_returns_stored_cursor() {
         let s = store();
         s.update("orders", "2024-06-01").unwrap();
-        assert_eq!(s.get("orders").unwrap().last_cursor_value.as_deref(), Some("2024-06-01"));
+        assert_eq!(
+            s.get("orders").unwrap().last_cursor_value.as_deref(),
+            Some("2024-06-01")
+        );
     }
 
     #[test]
@@ -756,7 +852,10 @@ mod tests {
         let s = store();
         s.update("orders", "100").unwrap();
         s.update("orders", "200").unwrap();
-        assert_eq!(s.get("orders").unwrap().last_cursor_value.as_deref(), Some("200"));
+        assert_eq!(
+            s.get("orders").unwrap().last_cursor_value.as_deref(),
+            Some("200")
+        );
     }
 
     #[test]
@@ -788,8 +887,42 @@ mod tests {
     #[test]
     fn record_and_query_metrics() {
         let s = store();
-        s.record_metric("orders", "run_001", 1200, 50000, Some(142), "success", None, Some("safe"), Some("parquet"), Some("full"), 1, 4096, 0, Some(true), Some(false)).unwrap();
-        s.record_metric("orders", "run_002", 300, 0, Some(30), "failed", Some("timeout"), Some("safe"), Some("parquet"), Some("full"), 0, 0, 2, None, None).unwrap();
+        s.record_metric(
+            "orders",
+            "run_001",
+            1200,
+            50000,
+            Some(142),
+            "success",
+            None,
+            Some("safe"),
+            Some("parquet"),
+            Some("full"),
+            1,
+            4096,
+            0,
+            Some(true),
+            Some(false),
+        )
+        .unwrap();
+        s.record_metric(
+            "orders",
+            "run_002",
+            300,
+            0,
+            Some(30),
+            "failed",
+            Some("timeout"),
+            Some("safe"),
+            Some("parquet"),
+            Some("full"),
+            0,
+            0,
+            2,
+            None,
+            None,
+        )
+        .unwrap();
 
         let metrics = s.get_metrics(Some("orders"), 10).unwrap();
         assert_eq!(metrics.len(), 2);
@@ -807,8 +940,16 @@ mod tests {
     #[test]
     fn query_metrics_all_exports() {
         let s = store();
-        s.record_metric("orders", "r1", 100, 1000, None, "success", None, None, None, None, 1, 500, 0, None, None).unwrap();
-        s.record_metric("users", "r2", 200, 2000, None, "success", None, None, None, None, 1, 800, 0, None, None).unwrap();
+        s.record_metric(
+            "orders", "r1", 100, 1000, None, "success", None, None, None, None, 1, 500, 0, None,
+            None,
+        )
+        .unwrap();
+        s.record_metric(
+            "users", "r2", 200, 2000, None, "success", None, None, None, None, 1, 800, 0, None,
+            None,
+        )
+        .unwrap();
 
         let metrics = s.get_metrics(None, 10).unwrap();
         assert_eq!(metrics.len(), 2);
@@ -818,7 +959,24 @@ mod tests {
     fn metrics_limit_works() {
         let s = store();
         for i in 0..10 {
-            s.record_metric("t", &format!("r{}", i), i * 100, i, None, "success", None, None, None, None, 0, 0, 0, None, None).unwrap();
+            s.record_metric(
+                "t",
+                &format!("r{}", i),
+                i * 100,
+                i,
+                None,
+                "success",
+                None,
+                None,
+                None,
+                None,
+                0,
+                0,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
         }
         let metrics = s.get_metrics(Some("t"), 3).unwrap();
         assert_eq!(metrics.len(), 3);
@@ -829,9 +987,36 @@ mod tests {
     #[test]
     fn record_and_query_files() {
         let s = store();
-        s.record_file("run_001", "orders", "orders_20260329.parquet", 50000, 4096, "parquet", Some("zstd")).unwrap();
-        s.record_file("run_001", "orders", "orders_20260329_chunk1.parquet", 25000, 2048, "parquet", Some("zstd")).unwrap();
-        s.record_file("run_002", "users", "users_20260329.csv", 1000, 500, "csv", None).unwrap();
+        s.record_file(
+            "run_001",
+            "orders",
+            "orders_20260329.parquet",
+            50000,
+            4096,
+            "parquet",
+            Some("zstd"),
+        )
+        .unwrap();
+        s.record_file(
+            "run_001",
+            "orders",
+            "orders_20260329_chunk1.parquet",
+            25000,
+            2048,
+            "parquet",
+            Some("zstd"),
+        )
+        .unwrap();
+        s.record_file(
+            "run_002",
+            "users",
+            "users_20260329.csv",
+            1000,
+            500,
+            "csv",
+            None,
+        )
+        .unwrap();
 
         let files = s.get_files(Some("orders"), 10).unwrap();
         assert_eq!(files.len(), 2);
@@ -846,7 +1031,16 @@ mod tests {
     fn files_limit_works() {
         let s = store();
         for i in 0..10 {
-            s.record_file(&format!("r{}", i), "t", &format!("f{}.parquet", i), i, i * 100, "parquet", None).unwrap();
+            s.record_file(
+                &format!("r{}", i),
+                "t",
+                &format!("f{}.parquet", i),
+                i,
+                i * 100,
+                "parquet",
+                None,
+            )
+            .unwrap();
         }
         let files = s.get_files(Some("t"), 3).unwrap();
         assert_eq!(files.len(), 3);
@@ -858,8 +1052,14 @@ mod tests {
     fn first_schema_stored_no_change() {
         let s = store();
         let cols = vec![
-            SchemaColumn { name: "id".into(), data_type: "Int64".into() },
-            SchemaColumn { name: "name".into(), data_type: "Utf8".into() },
+            SchemaColumn {
+                name: "id".into(),
+                data_type: "Int64".into(),
+            },
+            SchemaColumn {
+                name: "name".into(),
+                data_type: "Utf8".into(),
+            },
         ];
         let change = s.detect_schema_change("orders", &cols).unwrap();
         assert!(change.is_none(), "first run should detect no change");
@@ -869,9 +1069,10 @@ mod tests {
     #[test]
     fn same_schema_no_change() {
         let s = store();
-        let cols = vec![
-            SchemaColumn { name: "id".into(), data_type: "Int64".into() },
-        ];
+        let cols = vec![SchemaColumn {
+            name: "id".into(),
+            data_type: "Int64".into(),
+        }];
         s.detect_schema_change("t", &cols).unwrap();
         let change = s.detect_schema_change("t", &cols).unwrap();
         assert!(change.is_none());
@@ -880,12 +1081,21 @@ mod tests {
     #[test]
     fn added_column_detected() {
         let s = store();
-        let v1 = vec![SchemaColumn { name: "id".into(), data_type: "Int64".into() }];
+        let v1 = vec![SchemaColumn {
+            name: "id".into(),
+            data_type: "Int64".into(),
+        }];
         s.detect_schema_change("t", &v1).unwrap();
 
         let v2 = vec![
-            SchemaColumn { name: "id".into(), data_type: "Int64".into() },
-            SchemaColumn { name: "email".into(), data_type: "Utf8".into() },
+            SchemaColumn {
+                name: "id".into(),
+                data_type: "Int64".into(),
+            },
+            SchemaColumn {
+                name: "email".into(),
+                data_type: "Utf8".into(),
+            },
         ];
         let change = s.detect_schema_change("t", &v2).unwrap().unwrap();
         assert_eq!(change.added.len(), 1);
@@ -896,12 +1106,21 @@ mod tests {
     fn removed_column_detected() {
         let s = store();
         let v1 = vec![
-            SchemaColumn { name: "id".into(), data_type: "Int64".into() },
-            SchemaColumn { name: "old_field".into(), data_type: "Utf8".into() },
+            SchemaColumn {
+                name: "id".into(),
+                data_type: "Int64".into(),
+            },
+            SchemaColumn {
+                name: "old_field".into(),
+                data_type: "Utf8".into(),
+            },
         ];
         s.detect_schema_change("t", &v1).unwrap();
 
-        let v2 = vec![SchemaColumn { name: "id".into(), data_type: "Int64".into() }];
+        let v2 = vec![SchemaColumn {
+            name: "id".into(),
+            data_type: "Int64".into(),
+        }];
         let change = s.detect_schema_change("t", &v2).unwrap().unwrap();
         assert_eq!(change.removed, vec!["old_field"]);
     }
@@ -909,13 +1128,22 @@ mod tests {
     #[test]
     fn type_change_detected() {
         let s = store();
-        let v1 = vec![SchemaColumn { name: "price".into(), data_type: "Float64".into() }];
+        let v1 = vec![SchemaColumn {
+            name: "price".into(),
+            data_type: "Float64".into(),
+        }];
         s.detect_schema_change("t", &v1).unwrap();
 
-        let v2 = vec![SchemaColumn { name: "price".into(), data_type: "Utf8".into() }];
+        let v2 = vec![SchemaColumn {
+            name: "price".into(),
+            data_type: "Utf8".into(),
+        }];
         let change = s.detect_schema_change("t", &v2).unwrap().unwrap();
         assert_eq!(change.type_changed.len(), 1);
-        assert_eq!(change.type_changed[0], ("price".into(), "Float64".into(), "Utf8".into()));
+        assert_eq!(
+            change.type_changed[0],
+            ("price".into(), "Float64".into(), "Utf8".into())
+        );
     }
 
     // ─── Chunk checkpoint (needs on-disk DB: separate connections share one file) ─
@@ -931,7 +1159,8 @@ mod tests {
     #[test]
     fn chunk_claim_complete_and_finalize() {
         let (_dir, s) = store_on_disk();
-        s.create_chunk_run("run_a", "orders", "deadbeef", 2).unwrap();
+        s.create_chunk_run("run_a", "orders", "deadbeef", 2)
+            .unwrap();
         s.insert_chunk_tasks("run_a", &[(1, 5), (6, 10)]).unwrap();
 
         let t0 = s.claim_next_chunk_task("run_a").unwrap().expect("claim 0");
@@ -939,11 +1168,13 @@ mod tests {
         assert_eq!(t0.1, "1");
         assert_eq!(t0.2, "5");
 
-        s.complete_chunk_task("run_a", 0, 3, Some("part0.csv")).unwrap();
+        s.complete_chunk_task("run_a", 0, 3, Some("part0.csv"))
+            .unwrap();
 
         let t1 = s.claim_next_chunk_task("run_a").unwrap().expect("claim 1");
         assert_eq!(t1.0, 1);
-        s.complete_chunk_task("run_a", 1, 2, Some("part1.csv")).unwrap();
+        s.complete_chunk_task("run_a", 1, 2, Some("part1.csv"))
+            .unwrap();
 
         assert_eq!(s.count_chunk_tasks_not_completed("run_a").unwrap(), 0);
         s.finalize_chunk_run_completed("run_a").unwrap();
@@ -974,5 +1205,58 @@ mod tests {
         s.insert_chunk_tasks("r1", &[(0, 1)]).unwrap();
         assert_eq!(s.reset_chunk_checkpoint("e").unwrap(), 1);
         assert!(s.find_in_progress_chunk_run("e").unwrap().is_none());
+    }
+
+    // ─── Schema versioning tests ────────────────────────────
+
+    #[test]
+    fn fresh_db_reaches_latest_version() {
+        let s = store();
+        let ver = get_current_version(&s.conn);
+        assert_eq!(ver, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migration_is_idempotent() {
+        let s = store();
+        migrate(&s.conn);
+        migrate(&s.conn);
+        let ver = get_current_version(&s.conn);
+        assert_eq!(ver, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn legacy_db_gets_upgraded() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE export_state (
+                export_name TEXT PRIMARY KEY,
+                last_cursor_value TEXT,
+                last_run_at TEXT
+            );
+            CREATE TABLE export_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                export_name TEXT NOT NULL,
+                run_at TEXT NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                total_rows INTEGER NOT NULL,
+                status TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+
+        migrate(&conn);
+
+        let ver = get_current_version(&conn);
+        assert_eq!(ver, SCHEMA_VERSION);
+
+        let has_chunk_run: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='chunk_run'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_chunk_run);
     }
 }

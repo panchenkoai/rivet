@@ -1,14 +1,12 @@
-use rivet::pipeline::{generate_chunks, build_time_window_query};
 use rivet::config::{Config, ExportMode, TimeColumnType};
+use rivet::pipeline::{build_time_window_query, generate_chunks};
 
 // ─── Chunk Generation Golden Tests ───────────────────────────
 
 #[test]
 fn test_chunks_basic_range() {
     let chunks = generate_chunks(1, 1000, 300);
-    assert_eq!(chunks, vec![
-        (1, 300), (301, 600), (601, 900), (901, 1000)
-    ]);
+    assert_eq!(chunks, vec![(1, 300), (301, 600), (601, 900), (901, 1000)]);
 }
 
 #[test]
@@ -52,16 +50,15 @@ fn test_time_window_timestamp_format() {
 
 #[test]
 fn test_time_window_unix_format() {
-    let q = build_time_window_query(
-        "SELECT * FROM events",
-        "ts",
-        TimeColumnType::Unix,
-        30,
-    );
+    let q = build_time_window_query("SELECT * FROM events", "ts", TimeColumnType::Unix, 30);
     assert!(q.contains("_rivet WHERE ts >= "), "got: {}", q);
     let after_gte = q.split("ts >= ").nth(1).unwrap();
     let num: i64 = after_gte.trim().parse().expect("should be a number");
-    assert!(num > 1_000_000_000, "unix timestamp should be large, got: {}", num);
+    assert!(
+        num > 1_000_000_000,
+        "unix timestamp should be large, got: {}",
+        num
+    );
 }
 
 #[test]
@@ -72,14 +69,19 @@ fn test_time_window_wraps_base_query() {
         TimeColumnType::Timestamp,
         1,
     );
-    assert!(q.contains("FROM (SELECT id, name FROM users) AS _rivet"), "got: {}", q);
+    assert!(
+        q.contains("FROM (SELECT id, name FROM users) AS _rivet"),
+        "got: {}",
+        q
+    );
 }
 
 // ─── Config Parsing Golden Tests ─────────────────────────────
 
 #[test]
 fn test_chunked_config_full_parse() {
-    let cfg = Config::from_yaml(r#"
+    let cfg = Config::from_yaml(
+        r#"
 source:
   type: postgres
   url: "postgresql://localhost/test"
@@ -94,7 +96,9 @@ exports:
     destination:
       type: local
       path: ./out
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     let e = &cfg.exports[0];
     assert_eq!(e.mode, ExportMode::Chunked);
     assert_eq!(e.chunk_column.as_deref(), Some("id"));
@@ -104,7 +108,8 @@ exports:
 
 #[test]
 fn test_time_window_config_full_parse() {
-    let cfg = Config::from_yaml(r#"
+    let cfg = Config::from_yaml(
+        r#"
 source:
   type: mysql
   url: "mysql://localhost/test"
@@ -119,7 +124,9 @@ exports:
     destination:
       type: local
       path: ./out
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     let e = &cfg.exports[0];
     assert_eq!(e.mode, ExportMode::TimeWindow);
     assert_eq!(e.time_column.as_deref(), Some("created_at"));
@@ -129,7 +136,8 @@ exports:
 
 #[test]
 fn test_query_file_config_parses() {
-    let cfg = Config::from_yaml(r#"
+    let cfg = Config::from_yaml(
+        r#"
 source:
   type: postgres
   url: "postgresql://localhost/test"
@@ -140,7 +148,9 @@ exports:
     destination:
       type: local
       path: ./out
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     assert!(cfg.exports[0].query.is_none());
     assert_eq!(cfg.exports[0].query_file.as_deref(), Some("sql/custom.sql"));
 }
@@ -149,47 +159,47 @@ exports:
 
 #[test]
 fn test_validate_parquet_correct_count() {
-    use std::sync::Arc;
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use rivet::config::CompressionType;
-    use rivet::format::parquet::ParquetFormat;
     use rivet::format::Format;
+    use rivet::format::parquet::ParquetFormat;
+    use std::sync::Arc;
 
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-    ).unwrap();
+    )
+    .unwrap();
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.as_file().try_clone().unwrap();
-    let mut writer = ParquetFormat::new(CompressionType::Zstd, None).create_writer(&schema, Box::new(file)).unwrap();
+    let mut writer = ParquetFormat::new(CompressionType::Zstd, None)
+        .create_writer(&schema, Box::new(file))
+        .unwrap();
     writer.write_batch(&batch).unwrap();
     writer.finish().unwrap();
 
-    rivet::pipeline::validate_output(
-        tmp.path(),
-        rivet::config::FormatType::Parquet,
-        3,
-    ).unwrap();
+    rivet::pipeline::validate_output(tmp.path(), rivet::config::FormatType::Parquet, 3).unwrap();
 }
 
 #[test]
 fn test_validate_csv_correct_count() {
-    use std::sync::Arc;
     use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use rivet::format::csv::CsvFormat;
     use rivet::format::Format;
+    use rivet::format::csv::CsvFormat;
+    use std::sync::Arc;
 
     let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(StringArray::from(vec!["alice", "bob"]))],
-    ).unwrap();
+    )
+    .unwrap();
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.as_file().try_clone().unwrap();
@@ -197,42 +207,43 @@ fn test_validate_csv_correct_count() {
     writer.write_batch(&batch).unwrap();
     writer.finish().unwrap();
 
-    rivet::pipeline::validate_output(
-        tmp.path(),
-        rivet::config::FormatType::Csv,
-        2,
-    ).unwrap();
+    rivet::pipeline::validate_output(tmp.path(), rivet::config::FormatType::Csv, 2).unwrap();
 }
 
 #[test]
 fn test_validate_wrong_count_fails() {
-    use std::sync::Arc;
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use rivet::config::CompressionType;
-    use rivet::format::parquet::ParquetFormat;
     use rivet::format::Format;
+    use rivet::format::parquet::ParquetFormat;
+    use std::sync::Arc;
 
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-    ).unwrap();
+    )
+    .unwrap();
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.as_file().try_clone().unwrap();
-    let mut writer = ParquetFormat::new(CompressionType::Zstd, None).create_writer(&schema, Box::new(file)).unwrap();
+    let mut writer = ParquetFormat::new(CompressionType::Zstd, None)
+        .create_writer(&schema, Box::new(file))
+        .unwrap();
     writer.write_batch(&batch).unwrap();
     writer.finish().unwrap();
 
-    let result = rivet::pipeline::validate_output(
-        tmp.path(),
-        rivet::config::FormatType::Parquet,
-        999,
-    );
+    let result =
+        rivet::pipeline::validate_output(tmp.path(), rivet::config::FormatType::Parquet, 999);
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("validation failed"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("validation failed")
+    );
 }
 
 // ─── Resource Monitoring ─────────────────────────────────────
@@ -251,7 +262,12 @@ fn test_rss_peak_sampler_stops_cleanly() {
     let peak = s.stop();
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        assert!(peak >= seed, "peak should be at least seed, got {} < {}", peak, seed);
+        assert!(
+            peak >= seed,
+            "peak should be at least seed, got {} < {}",
+            peak,
+            seed
+        );
     }
 }
 

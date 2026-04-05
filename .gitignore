@@ -1,5 +1,5 @@
 /target
-.rivet_state.db
+.rivet_state.db*
 /dev/output/*
 .cursor/
 .vscode/

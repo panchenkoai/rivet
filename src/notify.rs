@@ -31,15 +31,27 @@ pub fn maybe_send(config: Option<&NotificationsConfig>, summary: &RunSummary) {
         }
     };
 
-    let color = if summary.status == "failed" { "#e74c3c" } else { "#f39c12" };
+    let color = if summary.status == "failed" {
+        "#e74c3c"
+    } else {
+        "#f39c12"
+    };
     let text = format!(
         "*{}* | status: `{}` | rows: {} | duration: {}ms{}{}",
         summary.export_name,
         summary.status,
         summary.total_rows,
         summary.duration_ms,
-        summary.error_message.as_ref().map(|e| format!("\nerror: {}", e)).unwrap_or_default(),
-        if summary.schema_changed == Some(true) { "\nschema changed" } else { "" },
+        summary
+            .error_message
+            .as_ref()
+            .map(|e| format!("\nerror: {}", e))
+            .unwrap_or_default(),
+        if summary.schema_changed == Some(true) {
+            "\nschema changed"
+        } else {
+            ""
+        },
     );
 
     let payload = serde_json::json!({
@@ -71,7 +83,7 @@ pub fn maybe_send(config: Option<&NotificationsConfig>, summary: &RunSummary) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{SlackConfig, NotificationsConfig, NotifyEvent};
+    use crate::config::{NotificationsConfig, NotifyEvent, SlackConfig};
 
     fn stub_summary(status: &str, schema_changed: Option<bool>) -> RunSummary {
         RunSummary {

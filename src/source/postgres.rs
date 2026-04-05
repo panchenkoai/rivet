@@ -43,10 +43,8 @@ impl super::Source for PostgresSource {
             ))?;
         }
         if tuning.lock_timeout_s > 0 {
-            self.client.batch_execute(&format!(
-                "SET lock_timeout = '{}s'",
-                tuning.lock_timeout_s
-            ))?;
+            self.client
+                .batch_execute(&format!("SET lock_timeout = '{}s'", tuning.lock_timeout_s))?;
         }
 
         self.client.batch_execute("BEGIN")?;
@@ -88,8 +86,10 @@ impl super::Source for PostgresSource {
             let row_count = rows.len();
             total_rows += row_count;
 
-            let s = schema.as_ref().unwrap();
-            let cols = columns_cache.as_ref().unwrap();
+            let s = schema.as_ref().expect("schema set on first iteration");
+            let cols = columns_cache
+                .as_ref()
+                .expect("columns set on first iteration");
             let batch = rows_to_record_batch_typed(s, cols, &rows)?;
             sink.on_batch(&batch)?;
 
@@ -149,7 +149,11 @@ pub(crate) fn build_query(
         .is_some();
 
     if let (Some(col), true) = (cursor_column, has_cursor_value) {
-        let cursor_val = cursor.unwrap().last_cursor_value.as_deref().unwrap();
+        let cursor_val = cursor
+            .expect("cursor checked above")
+            .last_cursor_value
+            .as_deref()
+            .expect("cursor value checked above");
         format!(
             "SELECT * FROM ({base}) AS _rivet WHERE {col} > '{val}' ORDER BY {col}",
             base = base_query,
@@ -219,32 +223,44 @@ fn build_array(pg_type: &Type, col_idx: usize, rows: &[Row]) -> Result<Arc<dyn A
     match *pg_type {
         Type::BOOL => {
             let mut b = BooleanBuilder::with_capacity(rows.len());
-            for row in rows { b.append_option(row.get(col_idx)); }
+            for row in rows {
+                b.append_option(row.get(col_idx));
+            }
             Ok(Arc::new(b.finish()))
         }
         Type::INT2 => {
             let mut b = Int16Builder::with_capacity(rows.len());
-            for row in rows { b.append_option(row.get(col_idx)); }
+            for row in rows {
+                b.append_option(row.get(col_idx));
+            }
             Ok(Arc::new(b.finish()))
         }
         Type::INT4 => {
             let mut b = Int32Builder::with_capacity(rows.len());
-            for row in rows { b.append_option(row.get(col_idx)); }
+            for row in rows {
+                b.append_option(row.get(col_idx));
+            }
             Ok(Arc::new(b.finish()))
         }
         Type::INT8 => {
             let mut b = Int64Builder::with_capacity(rows.len());
-            for row in rows { b.append_option(row.get(col_idx)); }
+            for row in rows {
+                b.append_option(row.get(col_idx));
+            }
             Ok(Arc::new(b.finish()))
         }
         Type::FLOAT4 => {
             let mut b = Float32Builder::with_capacity(rows.len());
-            for row in rows { b.append_option(row.get(col_idx)); }
+            for row in rows {
+                b.append_option(row.get(col_idx));
+            }
             Ok(Arc::new(b.finish()))
         }
         Type::FLOAT8 => {
             let mut b = Float64Builder::with_capacity(rows.len());
-            for row in rows { b.append_option(row.get(col_idx)); }
+            for row in rows {
+                b.append_option(row.get(col_idx));
+            }
             Ok(Arc::new(b.finish()))
         }
         Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => {
@@ -270,7 +286,8 @@ fn build_array(pg_type: &Type, col_idx: usize, rows: &[Row]) -> Result<Arc<dyn A
             for row in rows {
                 match row.get::<_, Option<chrono::NaiveDate>>(col_idx) {
                     Some(d) => {
-                        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                        let epoch =
+                            chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch is valid");
                         b.append_value((d - epoch).num_days() as i32);
                     }
                     None => b.append_null(),
@@ -308,7 +325,9 @@ fn build_array(pg_type: &Type, col_idx: usize, rows: &[Row]) -> Result<Arc<dyn A
         }
         Type::OID => {
             let mut b = Int64Builder::with_capacity(rows.len());
-            for row in rows { b.append_option(row.get::<_, Option<u32>>(col_idx).map(|v| v as i64)); }
+            for row in rows {
+                b.append_option(row.get::<_, Option<u32>>(col_idx).map(|v| v as i64));
+            }
             Ok(Arc::new(b.finish()))
         }
         _ => {
@@ -336,7 +355,11 @@ mod tests {
 
     #[test]
     fn test_build_query_incremental_first_run() {
-        let cursor = CursorState { export_name: "t".into(), last_cursor_value: None, last_run_at: None };
+        let cursor = CursorState {
+            export_name: "t".into(),
+            last_cursor_value: None,
+            last_run_at: None,
+        };
         let q = build_query("SELECT * FROM users", Some("updated_at"), Some(&cursor));
         assert!(q.contains("ORDER BY updated_at"));
         assert!(!q.contains("WHERE"));
@@ -350,7 +373,11 @@ mod tests {
             last_run_at: Some("2024-06-01".into()),
         };
         let q = build_query("SELECT * FROM orders", Some("updated_at"), Some(&cursor));
-        assert!(q.contains("WHERE updated_at > '2024-01-01T00:00:00'"), "got: {}", q);
+        assert!(
+            q.contains("WHERE updated_at > '2024-01-01T00:00:00'"),
+            "got: {}",
+            q
+        );
         assert!(q.contains("ORDER BY updated_at"));
     }
 }

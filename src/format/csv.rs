@@ -27,7 +27,10 @@ impl super::Format for CsvFormat {
             .join(",");
         let header_bytes = header.len() as u64 + 1; // +1 for newline
         writeln!(writer, "{}", header)?;
-        Ok(Box::new(CsvFormatWriter { writer, bytes_written: header_bytes }))
+        Ok(Box::new(CsvFormatWriter {
+            writer,
+            bytes_written: header_bytes,
+        }))
     }
 
     fn file_extension(&self) -> &str {
@@ -73,31 +76,52 @@ fn write_csv_value(writer: &mut dyn Write, array: &dyn Array, idx: usize) -> Res
 
     match array.data_type() {
         DataType::Boolean => {
-            let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("DataType/Array mismatch");
             write!(writer, "{}", arr.value(idx))?;
         }
         DataType::Int16 => {
-            let arr = array.as_any().downcast_ref::<Int16Array>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .expect("DataType/Array mismatch");
             write!(writer, "{}", arr.value(idx))?;
         }
         DataType::Int32 => {
-            let arr = array.as_any().downcast_ref::<Int32Array>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("DataType/Array mismatch");
             write!(writer, "{}", arr.value(idx))?;
         }
         DataType::Int64 => {
-            let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("DataType/Array mismatch");
             write!(writer, "{}", arr.value(idx))?;
         }
         DataType::Float32 => {
-            let arr = array.as_any().downcast_ref::<Float32Array>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .expect("DataType/Array mismatch");
             write!(writer, "{}", arr.value(idx))?;
         }
         DataType::Float64 => {
-            let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("DataType/Array mismatch");
             write!(writer, "{}", arr.value(idx))?;
         }
         DataType::Utf8 => {
-            let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("DataType/Array mismatch");
             let val = arr.value(idx);
             if val.contains(',') || val.contains('"') || val.contains('\n') {
                 write!(writer, "\"{}\"", val.replace('"', "\"\""))?;
@@ -106,16 +130,22 @@ fn write_csv_value(writer: &mut dyn Write, array: &dyn Array, idx: usize) -> Res
             }
         }
         DataType::Binary => {
-            let arr = array.as_any().downcast_ref::<BinaryArray>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .expect("DataType/Array mismatch");
             let val = arr.value(idx);
             for byte in val {
                 write!(writer, "{:02x}", byte)?;
             }
         }
         DataType::Date32 => {
-            let arr = array.as_any().downcast_ref::<Date32Array>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .expect("DataType/Array mismatch");
             let days = arr.value(idx);
-            let date = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()
+            let date = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch is valid")
                 + chrono::Duration::days(days as i64);
             write!(writer, "{}", date)?;
         }
@@ -123,7 +153,7 @@ fn write_csv_value(writer: &mut dyn Write, array: &dyn Array, idx: usize) -> Res
             let arr = array
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
-                .unwrap();
+                .expect("DataType/Array mismatch");
             let micros = arr.value(idx);
             let secs = micros / 1_000_000;
             let nsecs = ((micros % 1_000_000) * 1_000) as u32;

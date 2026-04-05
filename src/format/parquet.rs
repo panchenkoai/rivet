@@ -16,7 +16,10 @@ pub struct ParquetFormat {
 
 impl ParquetFormat {
     pub fn new(compression: CompressionType, compression_level: Option<u32>) -> Self {
-        Self { compression, compression_level }
+        Self {
+            compression,
+            compression_level,
+        }
     }
 
     fn build_compression(&self) -> Compression {

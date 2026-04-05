@@ -3,10 +3,10 @@ use std::sync::Arc;
 use arrow::array::*;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use rivet::format::csv::CsvFormat;
 use rivet::config::CompressionType;
-use rivet::format::parquet::ParquetFormat;
 use rivet::format::Format;
+use rivet::format::csv::CsvFormat;
+use rivet::format::parquet::ParquetFormat;
 
 fn make_basic_batch() -> (Arc<Schema>, RecordBatch) {
     let schema = Arc::new(Schema::new(vec![
@@ -30,11 +30,7 @@ fn make_basic_batch() -> (Arc<Schema>, RecordBatch) {
     (schema, batch)
 }
 
-fn write_to_vec(
-    format: &dyn Format,
-    schema: &Arc<Schema>,
-    batches: &[RecordBatch],
-) -> Vec<u8> {
+fn write_to_vec(format: &dyn Format, schema: &Arc<Schema>, batches: &[RecordBatch]) -> Vec<u8> {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.as_file().try_clone().unwrap();
     let mut writer = format.create_writer(schema, Box::new(file)).unwrap();
@@ -86,16 +82,9 @@ id,name
 
 #[test]
 fn test_csv_escaping() {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("text", DataType::Utf8, false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
 
-    let values = StringArray::from(vec![
-        "simple",
-        "has,comma",
-        "has\"quote",
-        "has\nnewline",
-    ]);
+    let values = StringArray::from(vec!["simple", "has,comma", "has\"quote", "has\nnewline"]);
     let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).unwrap();
     let buf = write_to_vec(&CsvFormat, &schema, &[batch]);
     let output = String::from_utf8(buf).unwrap();
@@ -110,9 +99,11 @@ fn test_csv_escaping() {
 
 #[test]
 fn test_csv_timestamp_format() {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "ts",
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+        false,
+    )]));
 
     let micros = 1_700_000_000_000_000i64;
     let array = TimestampMicrosecondArray::from(vec![micros]);
@@ -122,14 +113,16 @@ fn test_csv_timestamp_format() {
 
     let lines: Vec<&str> = output.lines().collect();
     assert_eq!(lines[0], "ts");
-    assert!(lines[1].starts_with("2023-11-14T22:13:20"), "got: {}", lines[1]);
+    assert!(
+        lines[1].starts_with("2023-11-14T22:13:20"),
+        "got: {}",
+        lines[1]
+    );
 }
 
 #[test]
 fn test_csv_date_format() {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("d", DataType::Date32, false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, false)]));
 
     let days = 19723i32;
     let array = Date32Array::from(vec![days]);
@@ -146,7 +139,11 @@ fn test_csv_date_format() {
 #[test]
 fn test_parquet_roundtrip() {
     let (schema, batch) = make_basic_batch();
-    let buf = write_to_vec(&ParquetFormat::new(CompressionType::Zstd, None), &schema, &[batch]);
+    let buf = write_to_vec(
+        &ParquetFormat::new(CompressionType::Zstd, None),
+        &schema,
+        &[batch],
+    );
     let data = bytes::Bytes::from(buf);
 
     assert!(!data.is_empty());
@@ -179,7 +176,11 @@ fn test_parquet_roundtrip() {
 #[test]
 fn test_parquet_compression_default_zstd() {
     let (schema, batch) = make_basic_batch();
-    let buf = write_to_vec(&ParquetFormat::new(CompressionType::Zstd, None), &schema, &[batch]);
+    let buf = write_to_vec(
+        &ParquetFormat::new(CompressionType::Zstd, None),
+        &schema,
+        &[batch],
+    );
     let data = bytes::Bytes::from(buf);
 
     use parquet::file::reader::FileReader;
@@ -190,14 +191,19 @@ fn test_parquet_compression_default_zstd() {
 
     assert!(
         matches!(col_meta.compression(), parquet::basic::Compression::ZSTD(_)),
-        "expected ZSTD, got: {:?}", col_meta.compression()
+        "expected ZSTD, got: {:?}",
+        col_meta.compression()
     );
 }
 
 #[test]
 fn test_parquet_compression_snappy() {
     let (schema, batch) = make_basic_batch();
-    let buf = write_to_vec(&ParquetFormat::new(CompressionType::Snappy, None), &schema, &[batch]);
+    let buf = write_to_vec(
+        &ParquetFormat::new(CompressionType::Snappy, None),
+        &schema,
+        &[batch],
+    );
     let data = bytes::Bytes::from(buf);
 
     use parquet::file::reader::FileReader;
@@ -209,19 +215,30 @@ fn test_parquet_compression_snappy() {
 #[test]
 fn test_parquet_compression_none() {
     let (schema, batch) = make_basic_batch();
-    let buf = write_to_vec(&ParquetFormat::new(CompressionType::None, None), &schema, &[batch]);
+    let buf = write_to_vec(
+        &ParquetFormat::new(CompressionType::None, None),
+        &schema,
+        &[batch],
+    );
     let data = bytes::Bytes::from(buf);
 
     use parquet::file::reader::FileReader;
     let reader = parquet::file::reader::SerializedFileReader::new(data).unwrap();
     let col_meta = reader.metadata().row_group(0).column(0);
-    assert_eq!(col_meta.compression(), parquet::basic::Compression::UNCOMPRESSED);
+    assert_eq!(
+        col_meta.compression(),
+        parquet::basic::Compression::UNCOMPRESSED
+    );
 }
 
 #[test]
 fn test_parquet_compression_gzip() {
     let (schema, batch) = make_basic_batch();
-    let buf = write_to_vec(&ParquetFormat::new(CompressionType::Gzip, Some(6)), &schema, &[batch]);
+    let buf = write_to_vec(
+        &ParquetFormat::new(CompressionType::Gzip, Some(6)),
+        &schema,
+        &[batch],
+    );
     let data = bytes::Bytes::from(buf);
 
     use parquet::file::reader::FileReader;
@@ -229,14 +246,19 @@ fn test_parquet_compression_gzip() {
     let col_meta = reader.metadata().row_group(0).column(0);
     assert!(
         matches!(col_meta.compression(), parquet::basic::Compression::GZIP(_)),
-        "expected GZIP, got: {:?}", col_meta.compression()
+        "expected GZIP, got: {:?}",
+        col_meta.compression()
     );
 }
 
 #[test]
 fn test_parquet_compression_lz4() {
     let (schema, batch) = make_basic_batch();
-    let buf = write_to_vec(&ParquetFormat::new(CompressionType::Lz4, None), &schema, &[batch]);
+    let buf = write_to_vec(
+        &ParquetFormat::new(CompressionType::Lz4, None),
+        &schema,
+        &[batch],
+    );
     let data = bytes::Bytes::from(buf);
 
     use parquet::file::reader::FileReader;

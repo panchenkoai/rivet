@@ -71,7 +71,9 @@ fn capacity_errors_have_extra_delay() {
         assert!(
             delay >= expected_min_delay,
             "'{}' should have delay >= {}ms, got {}ms",
-            msg, expected_min_delay, delay
+            msg,
+            expected_min_delay,
+            delay
         );
     }
 }
@@ -87,7 +89,12 @@ fn deadlock_errors_retry_with_small_delay() {
         let (transient, reconnect, delay) = classify_error(&anyhow::anyhow!("{}", msg));
         assert!(transient, "'{}' should be transient", msg);
         assert!(!reconnect, "'{}' should NOT need reconnect (same tx)", msg);
-        assert!(delay >= 1_000, "'{}' should have delay >= 1000ms, got {}ms", msg, delay);
+        assert!(
+            delay >= 1_000,
+            "'{}' should have delay >= 1000ms, got {}ms",
+            msg,
+            delay
+        );
     }
 }
 
@@ -149,22 +156,36 @@ fn generic_io_error_not_transient() {
 fn all_documented_patterns_covered() {
     let transient_patterns = [
         // Network
-        "connection reset", "broken pipe", "connection refused",
-        "no route to host", "network is unreachable", "name resolution",
-        "dns", "ssl handshake", "i/o timeout", "unexpected eof",
+        "connection reset",
+        "broken pipe",
+        "connection refused",
+        "no route to host",
+        "network is unreachable",
+        "name resolution",
+        "dns",
+        "ssl handshake",
+        "i/o timeout",
+        "unexpected eof",
         "closed the connection unexpectedly",
         "got an error reading communication packets",
         // MySQL
-        "gone away", "lost connection", "the server closed the connection",
+        "gone away",
+        "lost connection",
+        "the server closed the connection",
         "can't connect to mysql server",
         // Timeout
-        "timed out", "timeout", "canceling statement", "lock wait timeout",
+        "timed out",
+        "timeout",
+        "canceling statement",
+        "lock wait timeout",
         "execution time exceeded",
         // Capacity
-        "too many connections", "the database system is starting up",
+        "too many connections",
+        "the database system is starting up",
         "the database system is shutting down",
         // Deadlock
-        "deadlock", "could not serialize access",
+        "deadlock",
+        "could not serialize access",
     ];
 
     for pattern in transient_patterns {

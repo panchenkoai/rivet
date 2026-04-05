@@ -68,11 +68,11 @@ struct Args {
 }
 
 const FIRST_NAMES: &[&str] = &[
-    "Alice", "Bob", "Carol", "Dave", "Eve", "Frank", "Grace", "Hank", "Ivy", "Jack",
-    "Karen", "Leo", "Mia", "Noah", "Olivia", "Paul", "Quinn", "Rachel", "Sam", "Tara",
-    "Uma", "Victor", "Wendy", "Xavier", "Yara", "Zach", "Anna", "Brian", "Clara", "Derek",
-    "Elena", "Felix", "Gina", "Hugo", "Iris", "James", "Kate", "Liam", "Maya", "Nora",
-    "Oscar", "Petra", "Ravi", "Sara", "Tom", "Ursula", "Vlad", "Wanda", "Xena", "Yuri",
+    "Alice", "Bob", "Carol", "Dave", "Eve", "Frank", "Grace", "Hank", "Ivy", "Jack", "Karen",
+    "Leo", "Mia", "Noah", "Olivia", "Paul", "Quinn", "Rachel", "Sam", "Tara", "Uma", "Victor",
+    "Wendy", "Xavier", "Yara", "Zach", "Anna", "Brian", "Clara", "Derek", "Elena", "Felix", "Gina",
+    "Hugo", "Iris", "James", "Kate", "Liam", "Maya", "Nora", "Oscar", "Petra", "Ravi", "Sara",
+    "Tom", "Ursula", "Vlad", "Wanda", "Xena", "Yuri",
 ];
 
 const LAST_NAMES: &[&str] = &[
@@ -85,44 +85,111 @@ const LAST_NAMES: &[&str] = &[
 ];
 
 const DOMAINS: &[&str] = &[
-    "gmail.com", "yahoo.com", "outlook.com", "proton.me", "fastmail.com",
-    "icloud.com", "hey.com", "mail.com", "zoho.com", "tutanota.com",
+    "gmail.com",
+    "yahoo.com",
+    "outlook.com",
+    "proton.me",
+    "fastmail.com",
+    "icloud.com",
+    "hey.com",
+    "mail.com",
+    "zoho.com",
+    "tutanota.com",
 ];
 
 const PRODUCTS: &[&str] = &[
-    "MacBook Pro 16\"", "Dell XPS 15", "ThinkPad X1 Carbon", "Surface Laptop",
-    "Ergonomic Chair", "Standing Desk", "Monitor Arm", "USB-C Hub",
-    "Mechanical Keyboard", "Magic Mouse", "Webcam HD", "Noise Cancelling Headphones",
-    "GPU RTX 4090", "NVMe SSD 2TB", "RAM DDR5 64GB", "UPS Battery Backup",
-    "Cable Management Kit", "Desk Lamp LED", "Monitor 27\" 4K", "Docking Station",
-    "Wireless Mouse", "Keyboard Wrist Rest", "Screen Protector", "Laptop Stand",
-    "External SSD 1TB", "Smart Power Strip", "Blue Light Glasses", "Desk Mat XL",
-    "Portable Charger", "Lightning Cable 3-pack",
+    "MacBook Pro 16\"",
+    "Dell XPS 15",
+    "ThinkPad X1 Carbon",
+    "Surface Laptop",
+    "Ergonomic Chair",
+    "Standing Desk",
+    "Monitor Arm",
+    "USB-C Hub",
+    "Mechanical Keyboard",
+    "Magic Mouse",
+    "Webcam HD",
+    "Noise Cancelling Headphones",
+    "GPU RTX 4090",
+    "NVMe SSD 2TB",
+    "RAM DDR5 64GB",
+    "UPS Battery Backup",
+    "Cable Management Kit",
+    "Desk Lamp LED",
+    "Monitor 27\" 4K",
+    "Docking Station",
+    "Wireless Mouse",
+    "Keyboard Wrist Rest",
+    "Screen Protector",
+    "Laptop Stand",
+    "External SSD 1TB",
+    "Smart Power Strip",
+    "Blue Light Glasses",
+    "Desk Mat XL",
+    "Portable Charger",
+    "Lightning Cable 3-pack",
 ];
 
 const STATUSES: &[&str] = &["pending", "shipped", "delivered", "cancelled"];
 
 const EVENT_TYPES: &[&str] = &[
-    "login", "logout", "page_view", "purchase", "signup",
-    "settings_change", "password_reset", "search", "export", "api_call",
+    "login",
+    "logout",
+    "page_view",
+    "purchase",
+    "signup",
+    "settings_change",
+    "password_reset",
+    "search",
+    "export",
+    "api_call",
 ];
 
 const BIOS: &[&str] = &[
-    "Software engineer", "Product manager", "Data scientist", "DevOps lead",
-    "CTO at startup", "Junior developer", "ML engineer", "Full-stack dev",
-    "Backend engineer", "Frontend specialist", "SRE", "Platform engineer",
-    "Tech lead", "VP of Engineering", "Security researcher", "QA engineer",
-    "Mobile developer", "Cloud architect", "Solutions architect", "DBA",
+    "Software engineer",
+    "Product manager",
+    "Data scientist",
+    "DevOps lead",
+    "CTO at startup",
+    "Junior developer",
+    "ML engineer",
+    "Full-stack dev",
+    "Backend engineer",
+    "Frontend specialist",
+    "SRE",
+    "Platform engineer",
+    "Tech lead",
+    "VP of Engineering",
+    "Security researcher",
+    "QA engineer",
+    "Mobile developer",
+    "Cloud architect",
+    "Solutions architect",
+    "DBA",
 ];
 
 const BROWSERS: &[&str] = &["chrome", "firefox", "safari", "arc", "edge", "brave"];
 const DEVICES: &[&str] = &[
-    "macbook", "macbook_pro", "windows_pc", "linux_desktop",
-    "linux_laptop", "iphone", "android", "ipad",
+    "macbook",
+    "macbook_pro",
+    "windows_pc",
+    "linux_desktop",
+    "linux_laptop",
+    "iphone",
+    "android",
+    "ipad",
 ];
 const PAGES: &[&str] = &[
-    "/dashboard", "/products", "/settings", "/profile", "/orders",
-    "/analytics", "/reports", "/admin", "/search", "/help",
+    "/dashboard",
+    "/products",
+    "/settings",
+    "/profile",
+    "/orders",
+    "/analytics",
+    "/reports",
+    "/admin",
+    "/search",
+    "/help",
 ];
 
 fn main() -> Result<()> {
@@ -189,28 +256,52 @@ fn seed_postgres(args: &Args) -> Result<()> {
 
     let t = Instant::now();
     seed_pg_users(&mut client, args)?;
-    println!("  users:      {:>10} rows in {:.1}s", args.users, t.elapsed().as_secs_f64());
+    println!(
+        "  users:      {:>10} rows in {:.1}s",
+        args.users,
+        t.elapsed().as_secs_f64()
+    );
 
     let t = Instant::now();
     let total_orders = seed_pg_orders(&mut client, args)?;
-    println!("  orders:     {:>10} rows in {:.1}s", total_orders, t.elapsed().as_secs_f64());
+    println!(
+        "  orders:     {:>10} rows in {:.1}s",
+        total_orders,
+        t.elapsed().as_secs_f64()
+    );
 
     let t = Instant::now();
     let total_events = seed_pg_events(&mut client, args)?;
-    println!("  events:     {:>10} rows in {:.1}s", total_events, t.elapsed().as_secs_f64());
+    println!(
+        "  events:     {:>10} rows in {:.1}s",
+        total_events,
+        t.elapsed().as_secs_f64()
+    );
 
     let t = Instant::now();
     seed_pg_page_views(&mut client, args)?;
-    println!("  page_views: {:>10} rows in {:.1}s", args.page_views, t.elapsed().as_secs_f64());
+    println!(
+        "  page_views: {:>10} rows in {:.1}s",
+        args.page_views,
+        t.elapsed().as_secs_f64()
+    );
 
     let t = Instant::now();
     seed_pg_content_items(&mut client, args)?;
-    println!("  content:    {:>10} rows in {:.1}s", args.content_items, t.elapsed().as_secs_f64());
+    println!(
+        "  content:    {:>10} rows in {:.1}s",
+        args.content_items,
+        t.elapsed().as_secs_f64()
+    );
 
     if args.sparse_chunk_demo {
         let t = Instant::now();
         let n = seed_pg_orders_sparse_fill(&mut client, args)?;
-        println!("  orders_sparse: {:>10} rows in {:.1}s", n, t.elapsed().as_secs_f64());
+        println!(
+            "  orders_sparse: {:>10} rows in {:.1}s",
+            n,
+            t.elapsed().as_secs_f64()
+        );
     }
 
     Ok(())
@@ -397,28 +488,52 @@ fn seed_mysql(args: &Args) -> Result<()> {
 
     let t = Instant::now();
     seed_mysql_users(&mut conn, args)?;
-    println!("  users:      {:>10} rows in {:.1}s", args.users, t.elapsed().as_secs_f64());
+    println!(
+        "  users:      {:>10} rows in {:.1}s",
+        args.users,
+        t.elapsed().as_secs_f64()
+    );
 
     let t = Instant::now();
     let total_orders = seed_mysql_orders(&mut conn, args)?;
-    println!("  orders:     {:>10} rows in {:.1}s", total_orders, t.elapsed().as_secs_f64());
+    println!(
+        "  orders:     {:>10} rows in {:.1}s",
+        total_orders,
+        t.elapsed().as_secs_f64()
+    );
 
     let t = Instant::now();
     let total_events = seed_mysql_events(&mut conn, args)?;
-    println!("  events:     {:>10} rows in {:.1}s", total_events, t.elapsed().as_secs_f64());
+    println!(
+        "  events:     {:>10} rows in {:.1}s",
+        total_events,
+        t.elapsed().as_secs_f64()
+    );
 
     let t = Instant::now();
     seed_mysql_page_views(&mut conn, args)?;
-    println!("  page_views: {:>10} rows in {:.1}s", args.page_views, t.elapsed().as_secs_f64());
+    println!(
+        "  page_views: {:>10} rows in {:.1}s",
+        args.page_views,
+        t.elapsed().as_secs_f64()
+    );
 
     let t = Instant::now();
     seed_mysql_content_items(&mut conn, args)?;
-    println!("  content:    {:>10} rows in {:.1}s", args.content_items, t.elapsed().as_secs_f64());
+    println!(
+        "  content:    {:>10} rows in {:.1}s",
+        args.content_items,
+        t.elapsed().as_secs_f64()
+    );
 
     if args.sparse_chunk_demo {
         let t = Instant::now();
         let n = seed_mysql_orders_sparse_fill(&mut conn, args)?;
-        println!("  orders_sparse: {:>10} rows in {:.1}s", n, t.elapsed().as_secs_f64());
+        println!(
+            "  orders_sparse: {:>10} rows in {:.1}s",
+            n,
+            t.elapsed().as_secs_f64()
+        );
     }
 
     Ok(())
@@ -588,7 +703,13 @@ fn gen_user(rng: &mut impl Rng, idx: usize) -> (String, String) {
     let last = LAST_NAMES[rng.random_range(0..LAST_NAMES.len())];
     let domain = DOMAINS[rng.random_range(0..DOMAINS.len())];
     let name = format!("{} {}", first, last);
-    let email = format!("{}.{}{}@{}", first.to_lowercase(), last.to_lowercase(), idx, domain);
+    let email = format!(
+        "{}.{}{}@{}",
+        first.to_lowercase(),
+        last.to_lowercase(),
+        idx,
+        domain
+    );
     (name, email)
 }
 
@@ -621,11 +742,25 @@ fn gen_timestamp_after(rng: &mut impl Rng, base: &str, max_days_after: u32) -> S
 
 fn gen_ip(rng: &mut impl Rng) -> String {
     if rng.random_bool(0.5) {
-        format!("192.168.{}.{}", rng.random_range(0..=255), rng.random_range(1..=254))
+        format!(
+            "192.168.{}.{}",
+            rng.random_range(0..=255),
+            rng.random_range(1..=254)
+        )
     } else if rng.random_bool(0.5) {
-        format!("10.{}.{}.{}", rng.random_range(0..=255), rng.random_range(0..=255), rng.random_range(1..=254))
+        format!(
+            "10.{}.{}.{}",
+            rng.random_range(0..=255),
+            rng.random_range(0..=255),
+            rng.random_range(1..=254)
+        )
     } else {
-        format!("172.{}.{}.{}", rng.random_range(16..=31), rng.random_range(0..=255), rng.random_range(1..=254))
+        format!(
+            "172.{}.{}.{}",
+            rng.random_range(16..=31),
+            rng.random_range(0..=255),
+            rng.random_range(1..=254)
+        )
     }
 }
 
@@ -652,7 +787,9 @@ fn gen_event_payload(rng: &mut impl Rng, event_type: &str) -> String {
             format!(r#"{{"plan": "{plan}"}}"#)
         }
         "search" => {
-            let terms = ["laptop", "keyboard", "monitor", "desk", "cable", "ssd", "gpu"];
+            let terms = [
+                "laptop", "keyboard", "monitor", "desk", "cable", "ssd", "gpu",
+            ];
             let term = terms[rng.random_range(0..terms.len())];
             let results = rng.random_range(0..500);
             format!(r#"{{"query": "{term}", "results": {results}}}"#)
@@ -665,9 +802,16 @@ fn gen_event_payload(rng: &mut impl Rng, event_type: &str) -> String {
 
 fn gen_note(rng: &mut impl Rng) -> String {
     let notes = [
-        "Rush delivery", "Gift wrap requested", "Leave at door",
-        "Fragile item", "Call before delivery", "No substitutions",
-        "Company purchase", "Tax exempt", "Bulk order", "Repeat customer",
+        "Rush delivery",
+        "Gift wrap requested",
+        "Leave at door",
+        "Fragile item",
+        "Call before delivery",
+        "No substitutions",
+        "Company purchase",
+        "Tax exempt",
+        "Bulk order",
+        "Repeat customer",
     ];
     notes[rng.random_range(0..notes.len())].to_string()
 }
@@ -690,19 +834,45 @@ fn poisson_sample(rng: &mut impl Rng, lambda: f64) -> usize {
 // ─── Page Views (wide table, degraded scenario) ──────────────
 
 const URLS: &[&str] = &[
-    "/", "/products", "/products/123", "/products/456/reviews", "/cart",
-    "/checkout", "/checkout/payment", "/checkout/confirm", "/account",
-    "/account/orders", "/account/settings", "/blog", "/blog/rust-is-fast",
-    "/blog/postgres-tips", "/docs", "/docs/getting-started", "/pricing",
-    "/about", "/contact", "/help", "/search?q=keyboard", "/search?q=monitor",
-    "/api/v1/health", "/login", "/signup", "/forgot-password",
+    "/",
+    "/products",
+    "/products/123",
+    "/products/456/reviews",
+    "/cart",
+    "/checkout",
+    "/checkout/payment",
+    "/checkout/confirm",
+    "/account",
+    "/account/orders",
+    "/account/settings",
+    "/blog",
+    "/blog/rust-is-fast",
+    "/blog/postgres-tips",
+    "/docs",
+    "/docs/getting-started",
+    "/pricing",
+    "/about",
+    "/contact",
+    "/help",
+    "/search?q=keyboard",
+    "/search?q=monitor",
+    "/api/v1/health",
+    "/login",
+    "/signup",
+    "/forgot-password",
 ];
 
 const REFERRERS: &[&str] = &[
-    "https://google.com", "https://bing.com", "https://duckduckgo.com",
-    "https://twitter.com", "https://reddit.com/r/programming",
-    "https://news.ycombinator.com", "https://github.com",
-    "(direct)", "(direct)", "(direct)",
+    "https://google.com",
+    "https://bing.com",
+    "https://duckduckgo.com",
+    "https://twitter.com",
+    "https://reddit.com/r/programming",
+    "https://news.ycombinator.com",
+    "https://github.com",
+    "(direct)",
+    "(direct)",
+    "(direct)",
 ];
 
 const USER_AGENTS: &[&str] = &[
@@ -718,19 +888,46 @@ const USER_AGENTS: &[&str] = &[
 
 const COUNTRIES: &[&str] = &["US", "GB", "DE", "FR", "CA", "AU", "JP", "BR", "IN", "NL"];
 const REGIONS: &[&str] = &[
-    "California", "Texas", "New York", "London", "Bavaria",
-    "Ile-de-France", "Ontario", "New South Wales", "Tokyo", "Sao Paulo",
+    "California",
+    "Texas",
+    "New York",
+    "London",
+    "Bavaria",
+    "Ile-de-France",
+    "Ontario",
+    "New South Wales",
+    "Tokyo",
+    "Sao Paulo",
 ];
 const CITIES: &[&str] = &[
-    "San Francisco", "Austin", "New York", "London", "Munich",
-    "Paris", "Toronto", "Sydney", "Tokyo", "Sao Paulo",
+    "San Francisco",
+    "Austin",
+    "New York",
+    "London",
+    "Munich",
+    "Paris",
+    "Toronto",
+    "Sydney",
+    "Tokyo",
+    "Sao Paulo",
 ];
 const DEVICE_TYPES: &[&str] = &["desktop", "mobile", "tablet"];
 const OS_NAMES: &[&str] = &["macOS", "Windows", "Linux", "iOS", "Android"];
-const UTM_SOURCES: &[&str] = &["google", "facebook", "twitter", "newsletter", "reddit", "direct"];
+const UTM_SOURCES: &[&str] = &[
+    "google",
+    "facebook",
+    "twitter",
+    "newsletter",
+    "reddit",
+    "direct",
+];
 const UTM_MEDIUMS: &[&str] = &["cpc", "organic", "social", "email", "referral"];
 const UTM_CAMPAIGNS: &[&str] = &[
-    "spring_sale", "black_friday", "product_launch", "retarget_q4", "brand_awareness",
+    "spring_sale",
+    "black_friday",
+    "product_launch",
+    "retarget_q4",
+    "brand_awareness",
 ];
 
 fn gen_page_view_row(rng: &mut impl Rng, user_count: usize) -> String {
@@ -785,7 +982,10 @@ fn gen_page_view_row(rng: &mut impl Rng, user_count: usize) -> String {
         "NULL".to_string()
     };
     let utm_campaign = if utm_source != "NULL" && rng.random_bool(0.6) {
-        format!("'{}'", UTM_CAMPAIGNS[rng.random_range(0..UTM_CAMPAIGNS.len())])
+        format!(
+            "'{}'",
+            UTM_CAMPAIGNS[rng.random_range(0..UTM_CAMPAIGNS.len())]
+        )
     } else {
         "NULL".to_string()
     };
@@ -901,8 +1101,16 @@ const LOREM_SENTENCES: &[&str] = &[
 ];
 
 const CONTENT_CATEGORIES: &[&str] = &[
-    "engineering", "product", "design", "marketing", "support",
-    "tutorial", "announcement", "changelog", "case-study", "opinion",
+    "engineering",
+    "product",
+    "design",
+    "marketing",
+    "support",
+    "tutorial",
+    "announcement",
+    "changelog",
+    "case-study",
+    "opinion",
 ];
 
 const CONTENT_STATUSES: &[&str] = &["draft", "review", "published", "archived"];
@@ -939,7 +1147,9 @@ fn gen_lorem_text(rng: &mut impl Rng, target_bytes: usize) -> String {
 
 fn gen_html_wrapper(body: &str) -> String {
     let mut html = String::with_capacity(body.len() * 2 + 500);
-    html.push_str("<article><header><h1>Title</h1><meta charset=\"utf-8\"/></header><div class=\"content\">");
+    html.push_str(
+        "<article><header><h1>Title</h1><meta charset=\"utf-8\"/></header><div class=\"content\">",
+    );
     for paragraph in body.split(". ") {
         html.push_str("<p>");
         html.push_str(paragraph);
@@ -970,8 +1180,15 @@ fn gen_extra_data(rng: &mut impl Rng) -> String {
     let revisions = rng.random_range(1..10);
     let mut editors = String::from("[");
     for i in 0..rng.random_range(1..4) {
-        if i > 0 { editors.push_str(", "); }
-        write!(editors, "\"editor_{}@example.com\"", rng.random_range(1..100)).ok();
+        if i > 0 {
+            editors.push_str(", ");
+        }
+        write!(
+            editors,
+            "\"editor_{}@example.com\"",
+            rng.random_range(1..100)
+        )
+        .ok();
     }
     editors.push(']');
     format!(
@@ -993,9 +1210,21 @@ fn gen_content_item_row(rng: &mut impl Rng) -> String {
     let metadata = gen_content_metadata(rng);
     let word_count = body.split_whitespace().count();
 
-    let tags_list = ["rust", "postgres", "mysql", "data", "etl", "arrow", "parquet", "performance", "tutorial"];
+    let tags_list = [
+        "rust",
+        "postgres",
+        "mysql",
+        "data",
+        "etl",
+        "arrow",
+        "parquet",
+        "performance",
+        "tutorial",
+    ];
     let n_tags = rng.random_range(1..5);
-    let tags: Vec<&str> = (0..n_tags).map(|_| tags_list[rng.random_range(0..tags_list.len())]).collect();
+    let tags: Vec<&str> = (0..n_tags)
+        .map(|_| tags_list[rng.random_range(0..tags_list.len())])
+        .collect();
     let tags_str = tags.join(",");
 
     let first = FIRST_NAMES[rng.random_range(0..FIRST_NAMES.len())];
@@ -1137,6 +1366,7 @@ fn insert_pg_orders_sparse(client: &mut postgres::Client, args: &Args) -> Result
         }
         client.execute(&batch, &[])?;
         offset += take;
+        #[allow(clippy::manual_is_multiple_of)]
         if total > 50_000 && (offset == total || offset % progress_every == 0) {
             eprint!("    orders_sparse {}/{}\r", offset, total);
             std::io::stderr().flush().ok();
@@ -1212,6 +1442,7 @@ fn insert_mysql_orders_sparse(conn: &mut mysql::PooledConn, args: &Args) -> Resu
         }
         conn.query_drop(&batch)?;
         offset += take;
+        #[allow(clippy::manual_is_multiple_of)]
         if total > 50_000 && (offset == total || offset % progress_every == 0) {
             eprint!("    orders_sparse {}/{}\r", offset, total);
             std::io::stderr().flush().ok();

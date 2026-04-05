@@ -1,9 +1,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use opendal::Operator;
 use opendal::blocking;
 use opendal::services::S3;
-use opendal::Operator;
 
 use crate::config::DestinationConfig;
 use crate::error::Result;
@@ -54,7 +54,11 @@ impl S3Destination {
 
         let prefix = config.prefix.clone().unwrap_or_default();
 
-        Ok(Self { _runtime: runtime, op, prefix })
+        Ok(Self {
+            _runtime: runtime,
+            op,
+            prefix,
+        })
     }
 }
 

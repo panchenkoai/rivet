@@ -5,8 +5,8 @@ mod error;
 mod format;
 mod notify;
 mod pipeline;
-mod quality;
 mod preflight;
+mod quality;
 mod resource;
 mod source;
 mod state;
@@ -168,7 +168,11 @@ fn main() -> Result<()> {
                 parallel_export_processes,
             )?;
         }
-        Commands::Check { config, export, params } => {
+        Commands::Check {
+            config,
+            export,
+            params,
+        } => {
             let p = parse_params(&params);
             let p = if p.is_empty() { None } else { Some(p) };
             preflight::check(&config, export.as_deref(), p.as_ref())?;
@@ -179,7 +183,11 @@ fn main() -> Result<()> {
         Commands::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "rivet", &mut std::io::stdout());
         }
-        Commands::Metrics { config, export, last } => {
+        Commands::Metrics {
+            config,
+            export,
+            last,
+        } => {
             pipeline::show_metrics(&config, export.as_deref(), last)?;
         }
         Commands::State { action } => match action {
@@ -189,7 +197,11 @@ fn main() -> Result<()> {
             StateAction::Reset { config, export } => {
                 pipeline::reset_state(&config, &export)?;
             }
-            StateAction::Files { config, export, last } => {
+            StateAction::Files {
+                config,
+                export,
+                last,
+            } => {
                 pipeline::show_files(&config, export.as_deref(), last)?;
             }
             StateAction::ResetChunks { config, export } => {

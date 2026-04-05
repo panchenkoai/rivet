@@ -1,9 +1,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use opendal::Operator;
 use opendal::blocking;
 use opendal::services::Gcs;
-use opendal::Operator;
 
 use super::gcs_auth;
 use crate::config::DestinationConfig;
@@ -33,9 +33,7 @@ impl GcsDestination {
                 .allow_anonymous()
                 .disable_vm_metadata()
                 .disable_config_load();
-            log::info!(
-                "GCS: allow_anonymous (emulator mode; no OAuth / service account)"
-            );
+            log::info!("GCS: allow_anonymous (emulator mode; no OAuth / service account)");
         } else if let Some(cred_file) = &config.credentials_file {
             builder = builder.credential_path(cred_file);
             log::info!("GCS: using credentials_file from config: {}", cred_file);
@@ -62,7 +60,11 @@ impl GcsDestination {
 
         let prefix = config.prefix.clone().unwrap_or_default();
 
-        Ok(Self { _runtime: runtime, op, prefix })
+        Ok(Self {
+            _runtime: runtime,
+            op,
+            prefix,
+        })
     }
 }
 

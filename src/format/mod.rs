@@ -32,6 +32,8 @@ pub fn create_format(
 ) -> Box<dyn Format> {
     match format_type {
         FormatType::Csv => Box::new(csv::CsvFormat),
-        FormatType::Parquet => Box::new(parquet::ParquetFormat::new(compression, compression_level)),
+        FormatType::Parquet => {
+            Box::new(parquet::ParquetFormat::new(compression, compression_level))
+        }
     }
 }

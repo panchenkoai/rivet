@@ -20,21 +20,21 @@ pub enum Severity {
 
 pub fn check_row_count(actual: usize, config: &QualityConfig) -> Vec<QualityIssue> {
     let mut issues = Vec::new();
-    if let Some(min) = config.row_count_min {
-        if actual < min {
-            issues.push(QualityIssue {
-                severity: Severity::Fail,
-                message: format!("row_count {} below minimum {}", actual, min),
-            });
-        }
+    if let Some(min) = config.row_count_min
+        && actual < min
+    {
+        issues.push(QualityIssue {
+            severity: Severity::Fail,
+            message: format!("row_count {} below minimum {}", actual, min),
+        });
     }
-    if let Some(max) = config.row_count_max {
-        if actual > max {
-            issues.push(QualityIssue {
-                severity: Severity::Fail,
-                message: format!("row_count {} exceeds maximum {}", actual, max),
-            });
-        }
+    if let Some(max) = config.row_count_max
+        && actual > max
+    {
+        issues.push(QualityIssue {
+            severity: Severity::Fail,
+            message: format!("row_count {} exceeds maximum {}", actual, max),
+        });
     }
     issues
 }
@@ -81,10 +81,7 @@ pub fn check_null_ratios(
 }
 
 #[allow(dead_code)]
-pub fn check_uniqueness(
-    batches: &[RecordBatch],
-    columns: &[String],
-) -> Vec<QualityIssue> {
+pub fn check_uniqueness(batches: &[RecordBatch], columns: &[String]) -> Vec<QualityIssue> {
     if columns.is_empty() {
         return Vec::new();
     }
@@ -101,7 +98,7 @@ pub fn check_uniqueness(
         let mut duplicates = 0usize;
 
         for batch in batches {
-            if let Some(idx) = batch.schema().index_of(col_name).ok() {
+            if let Ok(idx) = batch.schema().index_of(col_name) {
                 let col = batch.column(idx);
                 let string_col = arrow::util::display::ArrayFormatter::try_new(
                     col.as_ref(),
@@ -215,10 +212,7 @@ mod tests {
 
     #[test]
     fn null_ratio_fails() {
-        let batch = make_batch(
-            &[Some(1), Some(2), Some(3)],
-            &[None, None, Some("c")],
-        );
+        let batch = make_batch(&[Some(1), Some(2), Some(3)], &[None, None, Some("c")]);
         let mut thresholds = HashMap::new();
         thresholds.insert("name".into(), 0.5);
         let issues = check_null_ratios(&[batch], &thresholds);

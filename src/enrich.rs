@@ -45,8 +45,8 @@ pub fn enrich_batch(
     let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
 
     if meta.exported_at {
-        let ts_array = TimestampMicrosecondArray::from(vec![Some(exported_at_us); n])
-            .with_timezone("UTC");
+        let ts_array =
+            TimestampMicrosecondArray::from(vec![Some(exported_at_us); n]).with_timezone("UTC");
         columns.push(Arc::new(ts_array));
     }
 
@@ -72,8 +72,7 @@ fn hash_row(batch: &RecordBatch, row: usize) -> i64 {
         if array.is_null(row) {
             buf.extend_from_slice(b"\x00");
         } else {
-            let s = arrow::util::display::array_value_to_string(array, row)
-                .unwrap_or_default();
+            let s = arrow::util::display::array_value_to_string(array, row).unwrap_or_default();
             buf.extend_from_slice(s.as_bytes());
         }
         buf.push(b'\x1f'); // unit separator between fields
@@ -97,7 +96,11 @@ mod tests {
             schema.clone(),
             vec![
                 Arc::new(Int64Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec![Some("alice"), None, Some("charlie")])),
+                Arc::new(StringArray::from(vec![
+                    Some("alice"),
+                    None,
+                    Some("charlie"),
+                ])),
             ],
         )
         .unwrap();
@@ -107,7 +110,10 @@ mod tests {
     #[test]
     fn enrich_disabled_is_noop() {
         let (schema, batch) = sample_batch();
-        let meta = MetaColumns { exported_at: false, row_hash: false };
+        let meta = MetaColumns {
+            exported_at: false,
+            row_hash: false,
+        };
         let enriched_schema = enrich_schema(&schema, &meta);
         assert_eq!(enriched_schema.fields().len(), 2);
         let result = enrich_batch(&batch, &meta, &enriched_schema, 0).unwrap();
@@ -117,18 +123,24 @@ mod tests {
     #[test]
     fn enrich_exported_at_only() {
         let (schema, batch) = sample_batch();
-        let meta = MetaColumns { exported_at: true, row_hash: false };
+        let meta = MetaColumns {
+            exported_at: true,
+            row_hash: false,
+        };
         let enriched_schema = enrich_schema(&schema, &meta);
         assert_eq!(enriched_schema.fields().len(), 3);
         assert_eq!(enriched_schema.field(2).name(), COL_EXPORTED_AT);
 
-        let ts = 1711612800_000_000i64;
+        let ts = 1_711_612_800_000_000i64;
         let result = enrich_batch(&batch, &meta, &enriched_schema, ts).unwrap();
         assert_eq!(result.num_columns(), 3);
         assert_eq!(result.num_rows(), 3);
 
-        let ts_col = result.column(2)
-            .as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+        let ts_col = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
         assert_eq!(ts_col.value(0), ts);
         assert_eq!(ts_col.value(2), ts);
     }
@@ -136,14 +148,20 @@ mod tests {
     #[test]
     fn enrich_row_hash_only() {
         let (schema, batch) = sample_batch();
-        let meta = MetaColumns { exported_at: false, row_hash: true };
+        let meta = MetaColumns {
+            exported_at: false,
+            row_hash: true,
+        };
         let enriched_schema = enrich_schema(&schema, &meta);
         assert_eq!(enriched_schema.field(2).name(), COL_ROW_HASH);
         assert_eq!(*enriched_schema.field(2).data_type(), DataType::Int64);
 
         let result = enrich_batch(&batch, &meta, &enriched_schema, 0).unwrap();
-        let hash_col = result.column(2)
-            .as_any().downcast_ref::<Int64Array>().unwrap();
+        let hash_col = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
 
         // Different rows produce different hashes
         assert_ne!(hash_col.value(0), hash_col.value(1));
@@ -153,7 +171,10 @@ mod tests {
     #[test]
     fn enrich_both_columns() {
         let (schema, batch) = sample_batch();
-        let meta = MetaColumns { exported_at: true, row_hash: true };
+        let meta = MetaColumns {
+            exported_at: true,
+            row_hash: true,
+        };
         let enriched_schema = enrich_schema(&schema, &meta);
         assert_eq!(enriched_schema.fields().len(), 4);
         assert_eq!(enriched_schema.field(2).name(), COL_EXPORTED_AT);
@@ -167,7 +188,10 @@ mod tests {
     #[test]
     fn hash_is_deterministic() {
         let (schema, batch) = sample_batch();
-        let meta = MetaColumns { exported_at: false, row_hash: true };
+        let meta = MetaColumns {
+            exported_at: false,
+            row_hash: true,
+        };
         let enriched_schema = enrich_schema(&schema, &meta);
 
         let r1 = enrich_batch(&batch, &meta, &enriched_schema, 0).unwrap();
@@ -176,24 +200,38 @@ mod tests {
         let h1 = r1.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
         let h2 = r2.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
         for i in 0..3 {
-            assert_eq!(h1.value(i), h2.value(i), "hash should be deterministic for row {i}");
+            assert_eq!(
+                h1.value(i),
+                h2.value(i),
+                "hash should be deterministic for row {i}"
+            );
         }
     }
 
     #[test]
     fn hash_distinguishes_null_from_empty() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("val", DataType::Utf8, true),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Utf8, true)]));
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(StringArray::from(vec![None, Some("")]))],
-        ).unwrap();
+        )
+        .unwrap();
 
-        let meta = MetaColumns { exported_at: false, row_hash: true };
+        let meta = MetaColumns {
+            exported_at: false,
+            row_hash: true,
+        };
         let enriched_schema = enrich_schema(&schema, &meta);
         let result = enrich_batch(&batch, &meta, &enriched_schema, 0).unwrap();
-        let hashes = result.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
-        assert_ne!(hashes.value(0), hashes.value(1), "NULL and empty string should hash differently");
+        let hashes = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_ne!(
+            hashes.value(0),
+            hashes.value(1),
+            "NULL and empty string should hash differently"
+        );
     }
 }
