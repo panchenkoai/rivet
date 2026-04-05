@@ -2,7 +2,7 @@ source:
   type: postgres
   url: "postgresql://rivet:rivet@localhost:5432/rivet"
   tuning:
-    batch_size_memory_mb: 1
+    batch_size_memory_mb: 10
 
 exports:
   - name: users_memory_batch

@@ -89,6 +89,8 @@ mod tests {
             quality_passed: None,
             error_message: None,
             tuning_profile: "balanced".into(),
+            batch_size: 10_000,
+            batch_size_memory_mb: None,
             format: "parquet".into(),
             mode: "full".into(),
             compression: "zstd".into(),

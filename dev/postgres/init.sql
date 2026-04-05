@@ -92,3 +92,16 @@ CREATE TABLE content_items (
     created_at TIMESTAMP NOT NULL DEFAULT now(),
     extra_data JSONB
 );
+
+-- Sparse BIGINT ids (large min..max gap, few rows) — for chunked mode / rivet check demos
+CREATE TABLE orders_sparse (
+    id BIGINT PRIMARY KEY,
+    payload TEXT NOT NULL
+);
+
+CREATE OR REPLACE VIEW orders_sparse_for_export AS
+SELECT
+    id,
+    payload,
+    ROW_NUMBER() OVER (ORDER BY id) AS chunk_rownum
+FROM orders_sparse;

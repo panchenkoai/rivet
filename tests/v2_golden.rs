@@ -244,6 +244,18 @@ fn test_resource_get_rss_returns_nonzero() {
 }
 
 #[test]
+fn test_rss_peak_sampler_stops_cleanly() {
+    let seed = rivet::resource::get_rss_mb();
+    let s = rivet::resource::RssPeakSampler::start(seed, 10);
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    let peak = s.stop();
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        assert!(peak >= seed, "peak should be at least seed, got {} < {}", peak, seed);
+    }
+}
+
+#[test]
 fn test_resource_check_memory_disabled() {
     assert!(rivet::resource::check_memory(0));
 }

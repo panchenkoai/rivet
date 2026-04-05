@@ -246,6 +246,42 @@ pub(crate) fn recommend_profile(
     }
 }
 
+/// Key-range sparsity for chunked `BETWEEN` windows (aligned with `rivet check` B3).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ChunkSparsityInfo {
+    pub is_sparse: bool,
+    pub density: f64,
+    /// `max(chunk_column) - min(chunk_column)`, at least 1.
+    pub range_span: i64,
+    /// Ceil of `range_span / chunk_size` — expected number of ID windows.
+    pub logical_windows: i64,
+    pub row_count: i64,
+}
+
+/// `row_count` should be the number of rows in the export query (e.g. from `COUNT(*)`).
+pub(crate) fn chunk_sparsity_from_counts(
+    row_count: i64,
+    min_i: i64,
+    max_i: i64,
+    chunk_size: usize,
+) -> ChunkSparsityInfo {
+    let range_span = (max_i - min_i).max(1);
+    let density = row_count as f64 / range_span as f64;
+    let logical_windows = if chunk_size == 0 {
+        0
+    } else {
+        (range_span + chunk_size as i64 - 1) / chunk_size as i64
+    };
+    let is_sparse = row_count > 0 && density < 0.1 && logical_windows > 10;
+    ChunkSparsityInfo {
+        is_sparse,
+        density,
+        range_span,
+        logical_windows,
+        row_count,
+    }
+}
+
 /// B3: Detect sparse range risk for chunked mode.
 pub(crate) fn check_sparse_range(
     export: &ExportConfig,
@@ -254,6 +290,9 @@ pub(crate) fn check_sparse_range(
     cursor_max: Option<&str>,
 ) -> Option<String> {
     if export.mode != ExportMode::Chunked {
+        return None;
+    }
+    if export.chunk_dense {
         return None;
     }
     let rows = row_estimate.unwrap_or(0);
@@ -268,27 +307,26 @@ pub(crate) fn check_sparse_range(
 
     let min_i: i64 = min_val.parse().ok()?;
     let max_i: i64 = max_val.parse().ok()?;
-    let range_span = (max_i - min_i).max(1);
-    let num_chunks = range_span / export.chunk_size as i64;
-    let density = rows as f64 / range_span as f64;
-
-    if density < 0.1 && num_chunks > 10 {
-        let empty_pct = ((1.0 - density) * 100.0) as u32;
-        Some(format!(
-            "Sparse key range: ~{}% of chunk windows will be empty (range {}..{}, ~{} rows). \
-             Consider chunking on a dense surrogate (ROW_NUMBER) or switching to incremental mode.",
-            empty_pct, min_val, max_val, rows
-        ))
-    } else {
-        None
+    let info = chunk_sparsity_from_counts(rows, min_i, max_i, export.chunk_size);
+    if !info.is_sparse {
+        return None;
     }
+
+    let empty_pct = ((1.0 - info.density).min(1.0).max(0.0) * 100.0) as u32;
+    Some(format!(
+        "Sparse key range: ~{}% of chunk windows will be empty (range {}..{}, ~{} rows). \
+         Consider chunking on a dense surrogate (ROW_NUMBER) or switching to incremental mode.",
+        empty_pct, min_val, max_val, rows
+    ))
 }
 
 /// B4: Warn about dense surrogate sort cost when query uses ROW_NUMBER.
 pub(crate) fn check_dense_surrogate_cost(export: &ExportConfig) -> Option<String> {
     let query = export.query.as_deref().unwrap_or("");
     let q_upper = query.to_uppercase();
-    if export.mode == ExportMode::Chunked && q_upper.contains("ROW_NUMBER") {
+    if export.mode == ExportMode::Chunked
+        && (q_upper.contains("ROW_NUMBER") || export.chunk_dense)
+    {
         Some(
             "Dense surrogate (ROW_NUMBER) requires a global sort -- this adds CPU and I/O cost \
              proportional to the full result set. For very large or hot tables, consider \
@@ -869,6 +907,10 @@ mod tests {
             meta_columns: MetaColumns::default(),
             quality: None,
             max_file_size: None,
+            chunk_checkpoint: false,
+            chunk_max_attempts: None,
+            tuning: None,
+            chunk_dense: false,
         }
     }
 
@@ -1180,6 +1222,27 @@ mod tests {
         // range 1..100_000, 100k rows -> density 1.0
         let w = check_sparse_range(&e, Some(100_000), Some("1"), Some("100000"));
         assert!(w.is_none(), "should not warn for dense range");
+    }
+
+    #[test]
+    fn sparse_range_skipped_when_chunk_dense() {
+        let mut e = make_export("t", ExportMode::Chunked, None);
+        e.chunk_column = Some("id".to_string());
+        e.chunk_dense = true;
+        e.chunk_size = 100_000;
+        let w = check_sparse_range(&e, Some(100_000), Some("1"), Some("10000000"));
+        assert!(w.is_none(), "chunk_dense uses ordinals, not physical id span");
+    }
+
+    #[test]
+    fn dense_surrogate_warning_when_chunk_dense_builtin() {
+        let mut e = make_export("t", ExportMode::Chunked, None);
+        e.chunk_column = Some("id".to_string());
+        e.chunk_dense = true;
+        e.query = Some("SELECT id FROM orders".to_string());
+        let w = check_dense_surrogate_cost(&e);
+        assert!(w.is_some(), "should warn about built-in ROW_NUMBER cost");
+        assert!(w.unwrap().contains("global sort"));
     }
 
     #[test]

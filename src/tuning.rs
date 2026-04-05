@@ -35,6 +35,27 @@ pub struct TuningConfig {
     pub memory_threshold_mb: Option<usize>,
 }
 
+/// Layer `export` on top of `source`: each field uses export when set, otherwise source.
+/// `None` only when both inputs are `None`.
+pub fn merge_tuning_config(source: Option<&TuningConfig>, export: Option<&TuningConfig>) -> Option<TuningConfig> {
+    match (source, export) {
+        (None, None) => None,
+        (Some(s), None) => Some(s.clone()),
+        (None, Some(e)) => Some(e.clone()),
+        (Some(s), Some(e)) => Some(TuningConfig {
+            profile: e.profile.or(s.profile),
+            batch_size: e.batch_size.or(s.batch_size),
+            batch_size_memory_mb: e.batch_size_memory_mb.or(s.batch_size_memory_mb),
+            throttle_ms: e.throttle_ms.or(s.throttle_ms),
+            statement_timeout_s: e.statement_timeout_s.or(s.statement_timeout_s),
+            max_retries: e.max_retries.or(s.max_retries),
+            retry_backoff_ms: e.retry_backoff_ms.or(s.retry_backoff_ms),
+            lock_timeout_s: e.lock_timeout_s.or(s.lock_timeout_s),
+            memory_threshold_mb: e.memory_threshold_mb.or(s.memory_threshold_mb),
+        }),
+    }
+}
+
 impl SourceTuning {
     pub fn from_config(config: Option<&TuningConfig>) -> Self {
         let profile = config
@@ -277,6 +298,32 @@ mod tests {
             .collect();
         let schema = Arc::new(Schema::new(fields));
         assert_eq!(compute_batch_size_from_memory(1, &schema), 1_000);
+    }
+
+    #[test]
+    fn merge_tuning_export_overrides_source_fields() {
+        let source = TuningConfig {
+            profile: Some(TuningProfile::Fast),
+            batch_size: Some(1_000),
+            throttle_ms: Some(0),
+            ..Default::default()
+        };
+        let export = TuningConfig {
+            profile: Some(TuningProfile::Safe),
+            batch_size: None,
+            ..Default::default()
+        };
+        let m = merge_tuning_config(Some(&source), Some(&export)).expect("merged");
+        assert_eq!(m.profile, Some(TuningProfile::Safe));
+        assert_eq!(m.batch_size, Some(1_000), "export omitted batch_size -> keep source");
+        assert_eq!(m.throttle_ms, Some(0));
+    }
+
+    #[test]
+    fn merge_tuning_export_only() {
+        let e = cfg_with_profile(TuningProfile::Fast);
+        let m = merge_tuning_config(None, Some(&e)).expect("merged");
+        assert_eq!(m.profile, Some(TuningProfile::Fast));
     }
 
     #[test]

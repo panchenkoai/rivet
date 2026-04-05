@@ -333,6 +333,33 @@ Each chunk produces a separate file: `events_chunked_20260329_150001_chunk0.parq
 
 > **Warning:** if `chunk_column` has large gaps (e.g. UUIDs cast to bigint, deleted ranges), most chunk windows will be empty. `rivet check` warns about this as "Sparse key range." Consider using `ROW_NUMBER()` as a dense surrogate — see README for details.
 
+### Chunk checkpoint (SQLite plan, resume, retries)
+
+Set `chunk_checkpoint: true` on a chunked export to store each chunk’s key range and status in `.rivet_state.db` next to your config. After each successful chunk, progress is committed; if the process dies, you can continue with the same `run_id` and completed chunks are skipped.
+
+```yaml
+exports:
+  - name: big_table
+    query: "SELECT id, data FROM big_table"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 50000
+    parallel: 2
+    chunk_checkpoint: true
+    chunk_max_attempts: 5   # optional; per-chunk worker tries (default: tuning max_retries + 1)
+    format: csv
+    destination:
+      type: local
+      path: ./output
+```
+
+- **First run:** `rivet run --config rivet.yaml --export big_table` — builds the plan (same `MIN`/`MAX` ranges as without checkpoint) and processes chunks.
+- **Resume:** `rivet run --config rivet.yaml --export big_table --resume` — continues the in-progress run. The fingerprint of `query` + `chunk_column` + `chunk_size` must match; otherwise Rivet errors (change detection).
+- **Inspect:** `rivet state chunks --config rivet.yaml --export big_table`
+- **Abandon:** `rivet state reset-chunks --config rivet.yaml --export big_table`
+
+Transient errors use the same retry/backoff rules as other exports (`source.tuning`). Stale `running` tasks (e.g. after a crash) are reset to `pending` on resume.
+
 ---
 
 ## 9. Time-window exports

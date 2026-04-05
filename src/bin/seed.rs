@@ -45,6 +45,26 @@ struct Args {
     /// Batch size for inserts
     #[arg(long, default_value = "1000")]
     batch_size: usize,
+
+    /// Fill `orders_sparse` with few rows and huge gaps in `id` (for chunked / sparse-key demos)
+    #[arg(long)]
+    sparse_chunk_demo: bool,
+
+    /// Only create (if needed), truncate, and fill `orders_sparse` — skip users/orders/events/page_views/content
+    #[arg(long)]
+    only_sparse_chunk_demo: bool,
+
+    /// Number of rows in `orders_sparse` (ids: 1, 1+gap, 1+2·gap, …). Use ≥3 to see sparse min..max vs row count
+    #[arg(long, default_value = "3")]
+    sparse_chunk_rows: usize,
+
+    /// Gap between consecutive sparse ids (wider gap ⇒ more empty chunk windows for the same chunk_size)
+    #[arg(long, default_value = "2000000")]
+    sparse_chunk_id_gap: i64,
+
+    /// Rows per INSERT for `orders_sparse` (keep ≤ few thousand if max_allowed_packet / statement size is tight)
+    #[arg(long, default_value = "5000")]
+    sparse_chunk_batch_size: usize,
 }
 
 const FIRST_NAMES: &[&str] = &[
@@ -108,11 +128,37 @@ const PAGES: &[&str] = &[
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    if args.only_sparse_chunk_demo {
+        println!(
+            "Sparse chunk demo: {} row(s), id gap {}",
+            args.sparse_chunk_rows, args.sparse_chunk_id_gap
+        );
+        if args.target == "postgres" || args.target == "both" {
+            println!("\n=== PostgreSQL (orders_sparse only) ===");
+            seed_pg_sparse_only(&args)?;
+        }
+        if args.target == "mysql" || args.target == "both" {
+            println!("\n=== MySQL (orders_sparse only) ===");
+            seed_mysql_sparse_only(&args)?;
+        }
+        println!("\nDone!");
+        return Ok(());
+    }
+
     let total_orders = args.users * args.orders_per_user;
     let total_events = args.users * args.events_per_user;
     println!(
-        "Generating: {} users, {} orders, {} events, {} page_views, {} content_items",
-        args.users, total_orders, total_events, args.page_views, args.content_items
+        "Generating: {} users, {} orders, {} events, {} page_views, {} content_items{}",
+        args.users,
+        total_orders,
+        total_events,
+        args.page_views,
+        args.content_items,
+        if args.sparse_chunk_demo {
+            " + orders_sparse demo"
+        } else {
+            ""
+        }
     );
 
     if args.target == "postgres" || args.target == "both" {
@@ -134,7 +180,12 @@ fn seed_postgres(args: &Args) -> Result<()> {
     let mut client = postgres::Client::connect(&args.pg_url, postgres::NoTls)
         .context("failed to connect to PostgreSQL")?;
 
-    client.execute("TRUNCATE content_items, page_views, events, orders, users RESTART IDENTITY CASCADE", &[])?;
+    ensure_orders_sparse_pg(&mut client)?;
+
+    client.execute(
+        "TRUNCATE orders_sparse, content_items, page_views, events, orders, users RESTART IDENTITY CASCADE",
+        &[],
+    )?;
 
     let t = Instant::now();
     seed_pg_users(&mut client, args)?;
@@ -155,6 +206,12 @@ fn seed_postgres(args: &Args) -> Result<()> {
     let t = Instant::now();
     seed_pg_content_items(&mut client, args)?;
     println!("  content:    {:>10} rows in {:.1}s", args.content_items, t.elapsed().as_secs_f64());
+
+    if args.sparse_chunk_demo {
+        let t = Instant::now();
+        let n = seed_pg_orders_sparse_fill(&mut client, args)?;
+        println!("  orders_sparse: {:>10} rows in {:.1}s", n, t.elapsed().as_secs_f64());
+    }
 
     Ok(())
 }
@@ -327,7 +384,10 @@ fn seed_mysql(args: &Args) -> Result<()> {
     let pool = mysql::Pool::new(mysql::Opts::from_url(&args.mysql_url)?)?;
     let mut conn = pool.get_conn()?;
 
+    ensure_orders_sparse_mysql(&mut conn)?;
+
     conn.query_drop("SET FOREIGN_KEY_CHECKS = 0")?;
+    conn.query_drop("TRUNCATE TABLE orders_sparse")?;
     conn.query_drop("TRUNCATE TABLE content_items")?;
     conn.query_drop("TRUNCATE TABLE page_views")?;
     conn.query_drop("TRUNCATE TABLE events")?;
@@ -354,6 +414,12 @@ fn seed_mysql(args: &Args) -> Result<()> {
     let t = Instant::now();
     seed_mysql_content_items(&mut conn, args)?;
     println!("  content:    {:>10} rows in {:.1}s", args.content_items, t.elapsed().as_secs_f64());
+
+    if args.sparse_chunk_demo {
+        let t = Instant::now();
+        let n = seed_mysql_orders_sparse_fill(&mut conn, args)?;
+        println!("  orders_sparse: {:>10} rows in {:.1}s", n, t.elapsed().as_secs_f64());
+    }
 
     Ok(())
 }
@@ -1022,5 +1088,159 @@ fn seed_mysql_content_items(conn: &mut mysql::PooledConn, args: &Args) -> Result
         }
     }
 
+    Ok(())
+}
+
+// ─── Sparse chunk demo: orders_sparse (wide id gaps) ─────────
+
+fn ensure_orders_sparse_pg(client: &mut postgres::Client) -> Result<()> {
+    client.batch_execute(
+        r#"
+CREATE TABLE IF NOT EXISTS orders_sparse (
+    id BIGINT PRIMARY KEY,
+    payload TEXT NOT NULL
+);
+CREATE OR REPLACE VIEW orders_sparse_for_export AS
+SELECT
+    id,
+    payload,
+    ROW_NUMBER() OVER (ORDER BY id) AS chunk_rownum
+FROM orders_sparse;
+"#,
+    )?;
+    Ok(())
+}
+
+fn sparse_insert_batch_size(args: &Args) -> usize {
+    args.sparse_chunk_batch_size.max(1)
+}
+
+fn insert_pg_orders_sparse(client: &mut postgres::Client, args: &Args) -> Result<usize> {
+    if args.sparse_chunk_rows == 0 {
+        return Ok(0);
+    }
+    let total = args.sparse_chunk_rows;
+    let bs = sparse_insert_batch_size(args);
+    let mut offset = 0usize;
+    let progress_every = 100_000usize;
+    while offset < total {
+        let take = (total - offset).min(bs);
+        let mut batch = String::from("INSERT INTO orders_sparse (id, payload) VALUES ");
+        for j in 0..take {
+            let i = offset + j;
+            let id = 1_i64.saturating_add(i as i64 * args.sparse_chunk_id_gap);
+            if j > 0 {
+                batch.push(',');
+            }
+            // Short payload keeps multi-row statements small for huge `--sparse-chunk-rows`
+            write!(batch, "({}, 's{}')", id, i)?;
+        }
+        client.execute(&batch, &[])?;
+        offset += take;
+        if total > 50_000 && (offset == total || offset % progress_every == 0) {
+            eprint!("    orders_sparse {}/{}\r", offset, total);
+            std::io::stderr().flush().ok();
+        }
+    }
+    if total > 50_000 {
+        eprintln!();
+    }
+    Ok(total)
+}
+
+fn seed_pg_orders_sparse_fill(client: &mut postgres::Client, args: &Args) -> Result<usize> {
+    ensure_orders_sparse_pg(client)?;
+    insert_pg_orders_sparse(client, args)
+}
+
+fn seed_pg_sparse_only(args: &Args) -> Result<()> {
+    let mut client = postgres::Client::connect(&args.pg_url, postgres::NoTls)
+        .context("failed to connect to PostgreSQL")?;
+    ensure_orders_sparse_pg(&mut client)?;
+    client
+        .execute("TRUNCATE orders_sparse", &[])
+        .context("truncate orders_sparse")?;
+    let n = insert_pg_orders_sparse(&mut client, args)?;
+    println!("  inserted {} row(s) into orders_sparse", n);
+    if n > 0 {
+        let row = client.query_one(
+            "SELECT COUNT(*)::bigint, MIN(id), MAX(id) FROM orders_sparse",
+            &[],
+        )?;
+        let cnt: i64 = row.get(0);
+        let lo: Option<i64> = row.get(1);
+        let hi: Option<i64> = row.get(2);
+        println!("  COUNT / MIN(id) / MAX(id): {} / {:?} / {:?}", cnt, lo, hi);
+    }
+    Ok(())
+}
+
+fn ensure_orders_sparse_mysql(conn: &mut mysql::PooledConn) -> Result<()> {
+    use mysql::prelude::*;
+    conn.query_drop(
+        "CREATE TABLE IF NOT EXISTS orders_sparse (
+    id BIGINT PRIMARY KEY,
+    payload TEXT NOT NULL
+)",
+    )?;
+    conn.query_drop(
+        "CREATE OR REPLACE VIEW orders_sparse_for_export AS
+SELECT id, payload, ROW_NUMBER() OVER (ORDER BY id) AS chunk_rownum FROM orders_sparse",
+    )?;
+    Ok(())
+}
+
+fn insert_mysql_orders_sparse(conn: &mut mysql::PooledConn, args: &Args) -> Result<usize> {
+    use mysql::prelude::*;
+    if args.sparse_chunk_rows == 0 {
+        return Ok(0);
+    }
+    let total = args.sparse_chunk_rows;
+    let bs = sparse_insert_batch_size(args);
+    let mut offset = 0usize;
+    let progress_every = 100_000usize;
+    while offset < total {
+        let take = (total - offset).min(bs);
+        let mut batch = String::from("INSERT INTO orders_sparse (id, payload) VALUES ");
+        for j in 0..take {
+            let i = offset + j;
+            let id = 1_i64.saturating_add(i as i64 * args.sparse_chunk_id_gap);
+            if j > 0 {
+                batch.push(',');
+            }
+            write!(batch, "({}, 's{}')", id, i)?;
+        }
+        conn.query_drop(&batch)?;
+        offset += take;
+        if total > 50_000 && (offset == total || offset % progress_every == 0) {
+            eprint!("    orders_sparse {}/{}\r", offset, total);
+            std::io::stderr().flush().ok();
+        }
+    }
+    if total > 50_000 {
+        eprintln!();
+    }
+    Ok(total)
+}
+
+fn seed_mysql_orders_sparse_fill(conn: &mut mysql::PooledConn, args: &Args) -> Result<usize> {
+    ensure_orders_sparse_mysql(conn)?;
+    insert_mysql_orders_sparse(conn, args)
+}
+
+fn seed_mysql_sparse_only(args: &Args) -> Result<()> {
+    use mysql::prelude::*;
+    let pool = mysql::Pool::new(mysql::Opts::from_url(&args.mysql_url)?)?;
+    let mut conn = pool.get_conn()?;
+    ensure_orders_sparse_mysql(&mut conn)?;
+    conn.query_drop("TRUNCATE TABLE orders_sparse")?;
+    let n = insert_mysql_orders_sparse(&mut conn, args)?;
+    println!("  inserted {} row(s) into orders_sparse", n);
+    if n > 0 {
+        let (cnt, lo, hi): (i64, Option<i64>, Option<i64>) = conn
+            .query_first("SELECT COUNT(*), MIN(id), MAX(id) FROM orders_sparse")?
+            .expect("aggregate on non-empty table");
+        println!("  COUNT / MIN(id) / MAX(id): {} / {:?} / {:?}", cnt, lo, hi);
+    }
     Ok(())
 }

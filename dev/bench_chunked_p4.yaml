@@ -1,17 +1,107 @@
+# Bench: default source.tuning (profile + batch_size); optional per-export `tuning:` overrides.
+# Most exports share source tuning; differences isolate duration / peak RSS / DB connections.
+# Example: `bench_content_p4_balanced` sets `tuning.profile: balanced` to compare vs fast in one file.
+#
+# Run all exports at once:
+#   --parallel-exports          → threads (faster spawn; peak RSS is shared across jobs in one process)
+#   --parallel-export-processes → one OS process per export (meaningful peak RSS per summary line)
+# YAML: `parallel_exports: true` / `parallel_export_processes: true` (same rules; ignored with `--export`).
+#
+#   rivet run --config dev/bench_chunked_p4.yaml --export bench_content_p4
+#   rivet run --config dev/bench_chunked_p4.yaml --export bench_content_p4_serial
+#   rivet run --config dev/bench_chunked_p4.yaml --export bench_content_p4_fatchunk
+#   rivet run --config dev/bench_chunked_p4.yaml --export bench_content_p4_no_meta
+#
+# Expected: serial → fewer connections, often lower peak RSS, slower wall time.
+#           fatchunk → fewer chunk round-trips (4 files vs 20 for 200k rows).
+#           no_meta  → less CPU/RSS (no row_hash / exported_at per row).
+
 source:
   type: postgres
   url: "postgresql://rivet:rivet@localhost:5432/rivet"
   tuning:
     profile: fast
+    batch_size: 1000
+
 
 exports:
   - name: bench_content_p4
     query: "SELECT id, title, body, raw_html, tags, author_name, category, status, created_at FROM content_items"
     mode: chunked
     chunk_column: id
-    chunk_size: 50000
-    parallel: 4
+    chunk_size: 10000
+    chunk_checkpoint: true
+    parallel: 10
     format: parquet
+    meta_columns:
+      exported_at: true
+      row_hash: true
+    destination:
+      type: local
+      path: ./dev/output/bench
+
+  # Same query + checkpoint; parallel: 1 — compare peak RSS / duration vs bench_content_p4
+  - name: bench_content_p4_serial
+    query: "SELECT id, title, body, raw_html, tags, author_name, category, status, created_at FROM content_items"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 10000
+    chunk_checkpoint: true
+    parallel: 1
+    format: parquet
+    meta_columns:
+      exported_at: true
+      row_hash: true
+    destination:
+      type: local
+      path: ./dev/output/bench
+
+  # Fewer, larger BETWEEN windows (4 chunks for ~200k dense ids vs 20)
+  - name: bench_content_p4_fatchunk
+    query: "SELECT id, title, body, raw_html, tags, author_name, category, status, created_at FROM content_items"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 50000
+    chunk_checkpoint: true
+    parallel: 10
+    format: parquet
+    meta_columns:
+      exported_at: true
+      row_hash: true
+    destination:
+      type: local
+      path: ./dev/output/bench
+
+  # No enrichment — isolates xxHash + timestamp column cost
+  - name: bench_content_p4_no_meta
+    query: "SELECT id, title, body, raw_html, tags, author_name, category, status, created_at FROM content_items"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 10000
+    chunk_checkpoint: true
+    parallel: 10
+    format: parquet
+    meta_columns:
+      exported_at: false
+      row_hash: false
+    destination:
+      type: local
+      path: ./dev/output/bench
+
+  # Same as bench_content_p4 but balanced profile (source stays fast + batch 1000 for other exports)
+  - name: bench_content_p4_balanced
+    query: "SELECT id, title, body, raw_html, tags, author_name, category, status, created_at FROM content_items"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 10000
+    chunk_checkpoint: true
+    parallel: 10
+    format: parquet
+    tuning:
+      profile: balanced
+    meta_columns:
+      exported_at: true
+      row_hash: true
     destination:
       type: local
       path: ./dev/output/bench

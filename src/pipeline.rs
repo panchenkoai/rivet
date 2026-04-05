@@ -1,12 +1,14 @@
 use std::io::BufWriter;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
 use crate::config::{CompressionType, Config, ExportConfig, ExportMode, FormatType, MetaColumns, SourceConfig, TimeColumnType};
+use crate::preflight::chunk_sparsity_from_counts;
 use crate::destination;
 use crate::enrich;
 use crate::error::Result;
@@ -14,7 +16,7 @@ use crate::format::{self, FormatWriter};
 use crate::resource;
 use crate::source::{self, BatchSink, Source};
 use crate::state::StateStore;
-use crate::tuning::SourceTuning;
+use crate::tuning::{merge_tuning_config, SourceTuning, TuningProfile};
 
 /// Collects operational data during an export for end-of-run summary and metrics.
 #[derive(Debug, Clone)]
@@ -32,14 +34,19 @@ pub struct RunSummary {
     pub schema_changed: Option<bool>,
     pub quality_passed: Option<bool>,
     pub error_message: Option<String>,
+    /// `profile` from YAML, or `balanced (default)` if omitted.
     pub tuning_profile: String,
+    /// Configured `batch_size` from YAML/profile (FETCH cap before `batch_size_memory_mb` override).
+    pub batch_size: usize,
+    /// When set, actual FETCH size is derived from schema (see logs / `SourceTuning::effective_batch_size`).
+    pub batch_size_memory_mb: Option<usize>,
     pub format: String,
     pub mode: String,
     pub compression: String,
 }
 
 impl RunSummary {
-    fn new(export: &ExportConfig, tuning: &SourceTuning) -> Self {
+    fn new(export: &ExportConfig, tuning: &SourceTuning, yaml_profile_label: &str) -> Self {
         let run_id = format!(
             "{}_{}", export.name,
             chrono::Utc::now().format("%Y%m%dT%H%M%S%.3f"),
@@ -58,7 +65,9 @@ impl RunSummary {
             schema_changed: None,
             quality_passed: None,
             error_message: None,
-            tuning_profile: tuning.profile_name().to_string(),
+            tuning_profile: yaml_profile_label.to_string(),
+            batch_size: tuning.batch_size,
+            batch_size_memory_mb: tuning.batch_size_memory_mb,
             format: format!("{:?}", export.format).to_lowercase(),
             mode: format!("{:?}", export.mode).to_lowercase(),
             compression: format!("{:?}", export.compression).to_lowercase(),
@@ -70,6 +79,17 @@ impl RunSummary {
         eprintln!("── {} ──", self.export_name);
         eprintln!("  run_id:      {}", self.run_id);
         eprintln!("  status:      {}", self.status);
+        if let Some(mem) = self.batch_size_memory_mb {
+            eprintln!(
+                "  tuning:      profile={}, batch_size={} (batch_size_memory_mb={}MiB → effective FETCH in logs)",
+                self.tuning_profile, self.batch_size, mem
+            );
+        } else {
+            eprintln!(
+                "  tuning:      profile={}, batch_size={}",
+                self.tuning_profile, self.batch_size
+            );
+        }
         eprintln!("  rows:        {}", self.total_rows);
         eprintln!("  files:       {}", self.files_produced);
         if self.bytes_written > 0 {
@@ -82,7 +102,7 @@ impl RunSummary {
         };
         eprintln!("  duration:    {}", dur);
         if self.peak_rss_mb > 0 {
-            eprintln!("  peak RSS:    {}MB", self.peak_rss_mb);
+            eprintln!("  peak RSS:    {}MB (sampled during run)", self.peak_rss_mb);
         }
         if self.format == "parquet" && self.compression != "zstd" {
             eprintln!("  compression: {}", self.compression);
@@ -117,22 +137,182 @@ fn format_bytes(b: u64) -> String {
     }
 }
 
+fn run_export_job(
+    config_path: &str,
+    config: &Config,
+    export: &ExportConfig,
+    state: &StateStore,
+    config_dir: &Path,
+    validate: bool,
+    resume: bool,
+    params: Option<&std::collections::HashMap<String, String>>,
+) {
+    let merged = merge_tuning_config(config.source.tuning.as_ref(), export.tuning.as_ref());
+    let tuning = SourceTuning::from_config(merged.as_ref());
+    let yaml_profile_label = match merged.as_ref().and_then(|t| t.profile) {
+        Some(TuningProfile::Fast) => "fast",
+        Some(TuningProfile::Balanced) => "balanced",
+        Some(TuningProfile::Safe) => "safe",
+        None => "balanced (default)",
+    };
+    log::info!("starting export '{}' (effective tuning: {})", export.name, tuning);
+
+    let start = std::time::Instant::now();
+    let rss_before = crate::resource::get_rss_mb();
+    let rss_sampler = crate::resource::RssPeakSampler::start(rss_before, 100);
+    let mut summary = RunSummary::new(export, &tuning, yaml_profile_label);
+
+    let result = match export.mode {
+        ExportMode::Chunked if export.parallel > 1 && export.chunk_checkpoint => {
+            run_chunked_parallel_checkpoint(
+                config_path,
+                &config.source,
+                state,
+                export,
+                &tuning,
+                config_dir,
+                validate,
+                &mut summary,
+                params,
+                resume,
+            )
+        }
+        ExportMode::Chunked if export.parallel > 1 => {
+            run_chunked_parallel(&config.source, state, export, &tuning, config_dir, validate, &mut summary, params)
+        }
+        _ => {
+            run_with_reconnect(
+                &config.source,
+                state,
+                export,
+                &tuning,
+                config_dir,
+                validate,
+                &mut summary,
+                params,
+                resume,
+                config_path,
+            )
+        }
+    };
+
+    let rss_peak = rss_sampler.stop();
+    let rss_after = crate::resource::get_rss_mb();
+    summary.duration_ms = start.elapsed().as_millis() as i64;
+    summary.peak_rss_mb = rss_peak.max(rss_after).max(rss_before) as i64;
+
+    let tuning_class = tuning.profile_name().to_string();
+    match &result {
+        Ok(()) => {
+            if summary.status == "running" {
+                summary.status = "success".into();
+            }
+        }
+        Err(e) => {
+            summary.status = "failed".into();
+            summary.error_message = Some(format!("{:#}", e));
+            log::error!("export '{}' failed: {:#}", export.name, e);
+        }
+    }
+
+    let _ = state.record_metric(
+        &summary.export_name, &summary.run_id, summary.duration_ms, summary.total_rows,
+        Some(summary.peak_rss_mb), &summary.status, summary.error_message.as_deref(),
+        Some(&tuning_class), Some(&summary.format), Some(&summary.mode),
+        summary.files_produced as i64, summary.bytes_written as i64,
+        summary.retries as i64, summary.validated, summary.schema_changed,
+    );
+
+    summary.print();
+    crate::notify::maybe_send(config.notifications.as_ref(), &summary);
+}
+
+/// Re-invoke this binary once per export (`run --config … --export <name>` only). Children do not inherit
+/// parallel flags, so there is no recursion. Each process has its own address space → meaningful per-job RSS.
+fn run_exports_as_child_processes(
+    config_path: &str,
+    exports: &[&ExportConfig],
+    validate: bool,
+    resume: bool,
+    params: Option<&std::collections::HashMap<String, String>>,
+) -> Result<()> {
+    use std::process::{Command, Stdio};
+
+    let exe = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("failed to resolve rivet executable for child processes: {:#}", e))?;
+
+    let config_arg = std::path::Path::new(config_path)
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(config_path));
+
+    log::info!(
+        "running {} exports as separate rivet processes (each child: single `--export`; SQLite state WAL allows concurrent writers)",
+        exports.len()
+    );
+
+    let mut children: Vec<(String, std::process::Child)> = Vec::with_capacity(exports.len());
+    for export in exports {
+        let mut cmd = Command::new(&exe);
+        cmd.arg("run")
+            .arg("--config")
+            .arg(&config_arg)
+            .arg("--export")
+            .arg(export.name.as_str());
+        if validate {
+            cmd.arg("--validate");
+        }
+        if resume {
+            cmd.arg("--resume");
+        }
+        if let Some(p) = params {
+            for (k, v) in p {
+                cmd.arg("--param").arg(format!("{k}={v}"));
+            }
+        }
+        cmd.stdin(Stdio::null());
+        log::debug!("spawning child for export '{}': {:?}", export.name, cmd);
+        let child = cmd.spawn().map_err(|e| {
+            anyhow::anyhow!("failed to spawn rivet child for export '{}': {:#}", export.name, e)
+        })?;
+        children.push((export.name.clone(), child));
+    }
+
+    let mut failures = Vec::new();
+    for (name, mut child) in children {
+        let status = match child.wait() {
+            Ok(s) => s,
+            Err(e) => {
+                failures.push(format!("export '{name}': wait failed: {e:#}"));
+                continue;
+            }
+        };
+        if !status.success() {
+            let code = status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string());
+            failures.push(format!("export '{name}' exited with status {code}"));
+        }
+    }
+
+    if !failures.is_empty() {
+        anyhow::bail!("{}", failures.join("; "));
+    }
+    Ok(())
+}
+
 pub fn run(
     config_path: &str,
     export_name: Option<&str>,
     validate: bool,
+    resume: bool,
     params: Option<&std::collections::HashMap<String, String>>,
+    parallel_exports_cli: bool,
+    parallel_export_processes_cli: bool,
 ) -> Result<()> {
     let config = Config::load_with_params(config_path, params)?;
-    let tuning = SourceTuning::from_config(config.source.tuning.as_ref());
-    log::info!("source tuning: {}", tuning);
 
     let config_dir = Path::new(config_path)
         .parent()
         .unwrap_or(Path::new("."))
         .to_path_buf();
-
-    let state = StateStore::open(config_path)?;
 
     let exports: Vec<&ExportConfig> = if let Some(name) = export_name {
         let e = config
@@ -145,48 +325,73 @@ pub fn run(
         config.exports.iter().collect()
     };
 
-    for export in exports {
-        log::info!("starting export '{}'", export.name);
-        let start = std::time::Instant::now();
-        let rss_before = crate::resource::get_rss_mb();
-        let mut summary = RunSummary::new(export, &tuning);
+    let run_parallel_processes = (parallel_export_processes_cli || config.parallel_export_processes)
+        && export_name.is_none()
+        && exports.len() > 1;
 
-        let result = match export.mode {
-            ExportMode::Chunked if export.parallel > 1 => {
-                run_chunked_parallel(&config.source, &state, export, &tuning, &config_dir, validate, &mut summary, params)
+    if run_parallel_processes {
+        return run_exports_as_child_processes(config_path, &exports, validate, resume, params);
+    }
+
+    let run_parallel =
+        (parallel_exports_cli || config.parallel_exports) && export_name.is_none() && exports.len() > 1;
+
+    if run_parallel {
+        log::info!(
+            "running {} exports in parallel (separate state DB connection per export)",
+            exports.len()
+        );
+        let mut state_errors: Vec<anyhow::Error> = Vec::new();
+        std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for &export in &exports {
+                handles.push(s.spawn(|| {
+                    let state = StateStore::open(config_path).map_err(|e| {
+                        anyhow::anyhow!("export '{}': failed to open state database: {:#}", export.name, e)
+                    })?;
+                    run_export_job(
+                        config_path,
+                        &config,
+                        export,
+                        &state,
+                        &config_dir,
+                        validate,
+                        resume,
+                        params,
+                    );
+                    Ok::<(), anyhow::Error>(())
+                }));
             }
-            _ => {
-                run_with_reconnect(&config.source, &state, export, &tuning, &config_dir, validate, &mut summary, params)
-            }
-        };
-
-        let rss_after = crate::resource::get_rss_mb();
-        summary.duration_ms = start.elapsed().as_millis() as i64;
-        summary.peak_rss_mb = rss_after.max(rss_before) as i64;
-
-        match &result {
-            Ok(()) => {
-                if summary.status == "running" {
-                    summary.status = "success".into();
+            for h in handles {
+                match h.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => state_errors.push(e),
+                    Err(payload) => std::panic::resume_unwind(payload),
                 }
             }
-            Err(e) => {
-                summary.status = "failed".into();
-                summary.error_message = Some(format!("{:#}", e));
-                log::error!("export '{}' failed: {:#}", export.name, e);
-            }
+        });
+        if !state_errors.is_empty() {
+            let text = state_errors
+                .into_iter()
+                .map(|e| format!("{e:#}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(anyhow::anyhow!(text));
         }
-
-        let _ = state.record_metric(
-            &summary.export_name, &summary.run_id, summary.duration_ms, summary.total_rows,
-            Some(summary.peak_rss_mb), &summary.status, summary.error_message.as_deref(),
-            Some(&summary.tuning_profile), Some(&summary.format), Some(&summary.mode),
-            summary.files_produced as i64, summary.bytes_written as i64,
-            summary.retries as i64, summary.validated, summary.schema_changed,
-        );
-
-        summary.print();
-        crate::notify::maybe_send(config.notifications.as_ref(), &summary);
+    } else {
+        let state = StateStore::open(config_path)?;
+        for export in exports {
+            run_export_job(
+                config_path,
+                &config,
+                export,
+                &state,
+                &config_dir,
+                validate,
+                resume,
+                params,
+            );
+        }
     }
 
     Ok(())
@@ -201,6 +406,8 @@ fn run_with_reconnect(
     validate: bool,
     summary: &mut RunSummary,
     params: Option<&std::collections::HashMap<String, String>>,
+    resume: bool,
+    config_path: &str,
 ) -> Result<()> {
     let mut last_err: Option<anyhow::Error> = None;
 
@@ -234,7 +441,19 @@ fn run_with_reconnect(
             }
         };
 
-        match run_export(&mut *src, state, export, tuning, config_dir, validate, summary, params) {
+        match run_export(
+            &mut *src,
+            source_config,
+            state,
+            export,
+            tuning,
+            config_dir,
+            validate,
+            summary,
+            params,
+            resume,
+            config_path,
+        ) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 let (transient, _, _) = classify_error(&e);
@@ -327,6 +546,7 @@ pub(crate) fn is_transient(err: &anyhow::Error) -> bool {
 
 fn run_export(
     src: &mut dyn Source,
+    source_config: &SourceConfig,
     state: &StateStore,
     export: &ExportConfig,
     tuning: &SourceTuning,
@@ -334,6 +554,8 @@ fn run_export(
     validate: bool,
     summary: &mut RunSummary,
     params: Option<&std::collections::HashMap<String, String>>,
+    resume: bool,
+    config_path: &str,
 ) -> Result<()> {
     let base_query = export.resolve_query(config_dir, params)?;
 
@@ -347,7 +569,23 @@ fn run_export(
             run_single_export(src, &base_query, cursor_col, Some(&cursor_state), export, tuning, validate, Some(state), summary)?;
         }
         ExportMode::Chunked => {
-            run_chunked_sequential(src, &base_query, export, tuning, validate, summary, Some(state))?;
+            if export.chunk_checkpoint {
+                run_chunked_sequential_checkpoint(
+                    src,
+                    source_config,
+                    state,
+                    &base_query,
+                    export,
+                    tuning,
+                    validate,
+                    summary,
+                    Some(state),
+                    resume,
+                    config_path,
+                )?;
+            } else {
+                run_chunked_sequential(src, &base_query, export, tuning, validate, summary, Some(state))?;
+            }
         }
         ExportMode::TimeWindow => {
             let windowed_query = build_time_window_query(
@@ -508,7 +746,14 @@ fn run_chunked_sequential(
     state: Option<&StateStore>,
 ) -> Result<()> {
     let col = export.chunk_column.as_deref().unwrap();
-    let chunks = detect_and_generate_chunks(src, base_query, col, export.chunk_size)?;
+    let chunks = detect_and_generate_chunks(
+        src,
+        base_query,
+        col,
+        export.chunk_size,
+        &export.name,
+        export.chunk_dense,
+    )?;
 
     log::info!("export '{}': {} chunks to process sequentially", export.name, chunks.len());
 
@@ -518,10 +763,7 @@ fn run_chunked_sequential(
             std::thread::sleep(Duration::from_secs(5));
         }
 
-        let chunk_query = format!(
-            "SELECT * FROM ({base}) AS _rivet WHERE {col} BETWEEN {start} AND {end}",
-            base = base_query, col = col, start = start, end = end,
-        );
+        let chunk_query = build_chunk_query_sql(base_query, col, *start, *end, export.chunk_dense);
         log::info!("export '{}': chunk {}/{} ({}..{})", export.name, i + 1, chunks.len(), start, end);
 
         let mut sink = ExportSink::new(export)?;
@@ -578,7 +820,14 @@ fn run_chunked_parallel(
     let col = export.chunk_column.as_deref().unwrap();
 
     let mut src = source::create_source(source_config)?;
-    let chunks = detect_and_generate_chunks(&mut *src, &base_query, col, export.chunk_size)?;
+    let chunks = detect_and_generate_chunks(
+        &mut *src,
+        &base_query,
+        col,
+        export.chunk_size,
+        &export.name,
+        export.chunk_dense,
+    )?;
     drop(src);
 
     let total_chunks = chunks.len();
@@ -611,10 +860,7 @@ fn run_chunked_parallel(
 
             let source_config = source_config.clone();
             let tuning = tuning.clone();
-            let meta = export.meta_columns.clone();
-            let quality = export.quality.clone();
-            let compression = export.compression;
-            let compression_level = export.compression_level;
+            let export_for_sink = export.clone();
             let export_name = &export.name;
             let format_type = export.format;
             let dest_config = &export.destination;
@@ -631,35 +877,16 @@ fn run_chunked_parallel(
 
             s.spawn(move || {
                 let result = (|| -> Result<()> {
-                    let chunk_query = format!(
-                        "SELECT * FROM ({base}) AS _rivet WHERE {col} BETWEEN {start} AND {end}",
-                        base = base_query, col = col,
+                    let chunk_query = build_chunk_query_sql(
+                        base_query,
+                        col,
+                        start,
+                        end,
+                        export_for_sink.chunk_dense,
                     );
 
                     let mut thread_src = source::create_source(&source_config)?;
-                    let mut sink = {
-                        let tmp = tempfile::NamedTempFile::new()?;
-                        let exported_at_us = chrono::Utc::now().timestamp_micros();
-                        ExportSink {
-                            writer: None,
-                            format_type,
-                            compression,
-                            compression_level,
-                            tmp,
-                            total_rows: 0,
-                            part_rows: 0,
-                            last_batch: None,
-                            schema: None,
-                            meta,
-                            enriched_schema: None,
-                            exported_at_us,
-                            quality_null_counts: std::collections::HashMap::new(),
-                            quality_unique_sets: std::collections::HashMap::new(),
-                            quality_columns: quality.clone(),
-                            max_file_size: None,
-                            completed_parts: Vec::new(),
-                        }
-                    };
+                    let mut sink = ExportSink::new(&export_for_sink)?;
                     thread_src.export(&chunk_query, None, None, &tuning, &mut sink)?;
                     if let Some(w) = sink.writer.take() {
                         w.finish()?;
@@ -675,7 +902,11 @@ fn run_chunked_parallel(
                         agg_bytes.fetch_add(file_bytes, Ordering::Relaxed);
                         agg_files.fetch_add(1, Ordering::Relaxed);
 
-                        let fmt = format::create_format(format_type, compression, compression_level);
+                        let fmt = format::create_format(
+                            format_type,
+                            export_for_sink.compression,
+                            export_for_sink.compression_level,
+                        );
                         let file_name = format!(
                             "{}_{}_chunk{}.{}",
                             export_name, chrono::Utc::now().format("%Y%m%d_%H%M%S"), i, fmt.file_extension()
@@ -728,14 +959,770 @@ fn run_chunked_parallel(
     Ok(())
 }
 
+// ─── Chunk checkpoint (SQLite plan + resume) ─────────────────
+
+pub(crate) fn chunk_plan_fingerprint(
+    base_query: &str,
+    chunk_column: &str,
+    chunk_size: usize,
+    chunk_dense: bool,
+) -> String {
+    use xxhash_rust::xxh3::xxh3_64;
+    let mut buf = String::with_capacity(base_query.len() + chunk_column.len() + 32);
+    buf.push_str(base_query);
+    buf.push('\x1f');
+    buf.push_str(chunk_column);
+    buf.push('\x1f');
+    buf.push_str(&chunk_size.to_string());
+    buf.push('\x1f');
+    buf.push_str(if chunk_dense { "dense_rn" } else { "range" });
+    format!("{:016x}", xxh3_64(buf.as_bytes()))
+}
+
+fn chunk_max_attempts_for_export(export: &ExportConfig, tuning: &SourceTuning) -> u32 {
+    export
+        .chunk_max_attempts
+        .unwrap_or_else(|| tuning.max_retries.saturating_add(1).max(1))
+}
+
+fn ensure_chunk_checkpoint_plan(
+    state: &StateStore,
+    export: &ExportConfig,
+    summary: &mut RunSummary,
+    base_query: &str,
+    col: &str,
+    chunks: &[(i64, i64)],
+    resume: bool,
+    tuning: &SourceTuning,
+) -> Result<String> {
+    let plan_hash = chunk_plan_fingerprint(base_query, col, export.chunk_size, export.chunk_dense);
+    let max_att = chunk_max_attempts_for_export(export, tuning);
+
+    if resume {
+        let Some((rid, stored_hash)) = state.find_in_progress_chunk_run(&export.name)? else {
+            anyhow::bail!(
+                "export '{}': --resume but no in-progress chunk checkpoint; run without --resume first or `rivet state reset-chunks --export {}`",
+                export.name, export.name
+            );
+        };
+        if stored_hash != plan_hash {
+            anyhow::bail!(
+                "export '{}': chunk plan fingerprint mismatch (query, chunk_column, chunk_size, or chunk_dense changed); cannot resume",
+                export.name
+            );
+        }
+        summary.run_id = rid.clone();
+        let n = state.reset_stale_running_chunk_tasks(&rid)?;
+        if n > 0 {
+            log::warn!("export '{}': reset {} stale 'running' chunk task(s) after resume", export.name, n);
+        }
+        return Ok(rid);
+    }
+
+    if let Some((rid, _)) = state.find_in_progress_chunk_run(&export.name)? {
+        anyhow::bail!(
+            "export '{}': chunk checkpoint run '{}' still in progress; use `rivet run --resume` or `rivet state reset-chunks --export {}`",
+            export.name, rid, export.name
+        );
+    }
+
+    state.create_chunk_run(&summary.run_id, &export.name, &plan_hash, max_att)?;
+    state.insert_chunk_tasks(&summary.run_id, chunks)?;
+    log::info!(
+        "export '{}': chunk checkpoint: {} tasks saved (run_id={})",
+        export.name,
+        chunks.len(),
+        summary.run_id
+    );
+    Ok(summary.run_id.clone())
+}
+
+fn export_one_chunk_range(
+    src: &mut dyn Source,
+    base_query: &str,
+    col: &str,
+    start: i64,
+    end: i64,
+    chunk_index: i64,
+    export: &ExportConfig,
+    tuning: &SourceTuning,
+    validate: bool,
+) -> Result<(usize, Option<String>, u64)> {
+    let chunk_query = build_chunk_query_sql(base_query, col, start, end, export.chunk_dense);
+
+    let mut sink = ExportSink::new(export)?;
+    src.export(&chunk_query, None, None, tuning, &mut sink)?;
+    if let Some(w) = sink.writer.take() {
+        w.finish()?;
+    }
+
+    if sink.total_rows == 0 {
+        return Ok((0, None, 0));
+    }
+
+    if validate {
+        validate_output(sink.tmp.path(), export.format, sink.total_rows)?;
+    }
+    let file_bytes = std::fs::metadata(sink.tmp.path()).map(|m| m.len()).unwrap_or(0);
+
+    let fmt = format::create_format(export.format, export.compression, export.compression_level);
+    let file_name = format!(
+        "{}_{}_chunk{}.{}",
+        export.name,
+        chrono::Utc::now().format("%Y%m%d_%H%M%S"),
+        chunk_index,
+        fmt.file_extension()
+    );
+    let dest = destination::create_destination(&export.destination)?;
+    dest.write(sink.tmp.path(), &file_name)?;
+
+    Ok((sink.total_rows, Some(file_name), file_bytes))
+}
+
+fn run_chunk_with_source_retries(
+    source_config: &SourceConfig,
+    base_query: &str,
+    col: &str,
+    start: i64,
+    end: i64,
+    chunk_index: i64,
+    export: &ExportConfig,
+    tuning: &SourceTuning,
+    validate: bool,
+) -> Result<(usize, Option<String>, u64)> {
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..=tuning.max_retries {
+        if attempt > 0 {
+            let (_, _needs_reconnect, extra_delay) = last_err
+                .as_ref()
+                .map(classify_error)
+                .unwrap_or((false, false, 0));
+            let backoff = tuning.retry_backoff_ms * 2u64.pow(attempt - 1) + extra_delay;
+            log::warn!(
+                "export '{}': chunk {} retry {}/{} in {}ms",
+                export.name, chunk_index, attempt, tuning.max_retries, backoff
+            );
+            std::thread::sleep(Duration::from_millis(backoff));
+        }
+
+        let mut src = match source::create_source(source_config) {
+            Ok(s) => s,
+            Err(e) => {
+                let (transient, _, _) = classify_error(&e);
+                if attempt < tuning.max_retries && transient {
+                    last_err = Some(e);
+                    continue;
+                }
+                return Err(e);
+            }
+        };
+
+        match export_one_chunk_range(
+            &mut *src,
+            base_query,
+            col,
+            start,
+            end,
+            chunk_index,
+            export,
+            tuning,
+            validate,
+        ) {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let (transient, _, _) = classify_error(&e);
+                if attempt < tuning.max_retries && transient {
+                    last_err = Some(e);
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("chunk export failed after retries")))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_chunked_sequential_checkpoint(
+    src: &mut dyn Source,
+    source_config: &SourceConfig,
+    state: &StateStore,
+    base_query: &str,
+    export: &ExportConfig,
+    tuning: &SourceTuning,
+    validate: bool,
+    summary: &mut RunSummary,
+    st: Option<&StateStore>,
+    resume: bool,
+    config_path: &str,
+) -> Result<()> {
+    let _ = config_path;
+    let col = export.chunk_column.as_deref().unwrap();
+
+    let chunks = if resume {
+        vec![]
+    } else {
+        detect_and_generate_chunks(
+            src,
+            base_query,
+            col,
+            export.chunk_size,
+            &export.name,
+            export.chunk_dense,
+        )?
+    };
+
+    let run_id = ensure_chunk_checkpoint_plan(state, export, summary, base_query, col, &chunks, resume, tuning)?;
+
+    if !resume && !resource::check_memory(tuning.memory_threshold_mb) {
+        log::warn!("memory threshold exceeded before chunk export; pausing 5s");
+        std::thread::sleep(Duration::from_secs(5));
+    }
+
+    while let Some((chunk_index, sk, ek)) = state.claim_next_chunk_task(&run_id)? {
+        if !resource::check_memory(tuning.memory_threshold_mb) {
+            log::warn!("memory threshold exceeded, pausing 5s before chunk {}", chunk_index);
+            std::thread::sleep(Duration::from_secs(5));
+        }
+
+        let start: i64 = sk
+            .parse()
+            .map_err(|_| anyhow::anyhow!("chunk {}: invalid start_key {:?}", chunk_index, sk))?;
+        let end: i64 = ek
+            .parse()
+            .map_err(|_| anyhow::anyhow!("chunk {}: invalid end_key {:?}", chunk_index, ek))?;
+
+        log::info!("export '{}': checkpoint chunk {} ({}..{})", export.name, chunk_index, start, end);
+
+        match run_chunk_with_source_retries(
+            source_config,
+            base_query,
+            col,
+            start,
+            end,
+            chunk_index,
+            export,
+            tuning,
+            validate,
+        ) {
+            Ok((rows, fname, file_bytes)) => {
+                summary.total_rows += rows as i64;
+                if rows > 0 {
+                    summary.bytes_written += file_bytes;
+                    summary.files_produced += 1;
+                    if let Some(ref name) = fname {
+                        if let Some(store) = st {
+                            let _ = store.record_file(
+                                &summary.run_id,
+                                &export.name,
+                                name,
+                                rows as i64,
+                                file_bytes as i64,
+                                &format!("{:?}", export.format).to_lowercase(),
+                                Some(&format!("{:?}", export.compression).to_lowercase()),
+                            );
+                        }
+                    }
+                }
+                state.complete_chunk_task(&run_id, chunk_index, rows as i64, fname.as_deref())?;
+            }
+            Err(e) => {
+                let msg = format!("{:#}", e);
+                log::error!("export '{}': chunk {} failed: {}", export.name, chunk_index, msg);
+                state.fail_chunk_task(&run_id, chunk_index, &msg)?;
+            }
+        }
+    }
+
+    let pending = state.count_chunk_tasks_not_completed(&run_id)?;
+    if pending > 0 {
+        anyhow::bail!(
+            "export '{}': chunk checkpoint incomplete ({} tasks not completed); fix errors and `rivet run --resume` or `rivet state reset-chunks`",
+            export.name, pending
+        );
+    }
+
+    state.finalize_chunk_run_completed(&run_id)?;
+    log::info!("export '{}': chunk checkpoint run completed (run_id={})", export.name, run_id);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_chunked_parallel_checkpoint(
+    config_path: &str,
+    source_config: &SourceConfig,
+    state: &StateStore,
+    export: &ExportConfig,
+    tuning: &SourceTuning,
+    config_dir: &Path,
+    validate: bool,
+    summary: &mut RunSummary,
+    params: Option<&std::collections::HashMap<String, String>>,
+    resume: bool,
+) -> Result<()> {
+    let base_query = export.resolve_query(config_dir, params)?;
+    let col = export.chunk_column.as_deref().unwrap();
+
+    let chunks = if resume {
+        vec![]
+    } else {
+        let mut src = source::create_source(source_config)?;
+        detect_and_generate_chunks(
+            &mut *src,
+            &base_query,
+            col,
+            export.chunk_size,
+            &export.name,
+            export.chunk_dense,
+        )?
+    };
+
+    let run_id = ensure_chunk_checkpoint_plan(state, export, summary, &base_query, col, &chunks, resume, tuning)?;
+
+    let total_tasks = {
+        let tasks = state.list_chunk_tasks_for_run(&run_id)?;
+        tasks.len().max(1)
+    };
+    let parallel = export.parallel.min(total_tasks);
+    log::info!(
+        "export '{}': chunk checkpoint parallel: {} workers, run_id={}",
+        export.name, parallel, run_id
+    );
+
+    let db_path = state.database_path().to_path_buf();
+    let run_id_arc = std::sync::Arc::new(run_id.clone());
+    let agg_rows = std::sync::atomic::AtomicI64::new(0);
+    let agg_bytes = std::sync::atomic::AtomicU64::new(0);
+    let agg_files = std::sync::atomic::AtomicUsize::new(0);
+    let errors = std::sync::Mutex::new(Vec::<String>::new());
+
+    let export_name = export.name.clone();
+    let export_for_workers = export.clone();
+    let format_type = export.format;
+    let dest_config = export.destination.clone();
+    let tuning_cl = tuning.clone();
+    let source_config_cl = source_config.clone();
+    let base_query_cl = base_query.clone();
+    let col_owned = col.to_string();
+    let config_path_owned = config_path.to_string();
+    let fmt_label = format!("{:?}", export.format).to_lowercase();
+    let comp_label = format!("{:?}", export.compression).to_lowercase();
+
+    std::thread::scope(|s| {
+        for _ in 0..parallel {
+            let db_path = db_path.clone();
+            let run_id_arc = std::sync::Arc::clone(&run_id_arc);
+            let agg_rows = &agg_rows;
+            let agg_bytes = &agg_bytes;
+            let agg_files = &agg_files;
+            let errors = &errors;
+            let export_name = export_name.clone();
+            let export_worker = export_for_workers.clone();
+            let tuning_w = tuning_cl.clone();
+            let source_config_w = source_config_cl.clone();
+            let base_query_w = base_query_cl.clone();
+            let col_w = col_owned.clone();
+            let dest_config = dest_config.clone();
+            let config_path_w = config_path_owned.clone();
+            let fmt_label_w = fmt_label.clone();
+            let comp_label_w = comp_label.clone();
+
+            s.spawn(move || {
+                loop {
+                    let claimed = match StateStore::claim_next_chunk_task_at_path(&db_path, run_id_arc.as_str()) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            errors
+                                .lock()
+                                .unwrap()
+                                .push(format!("claim error: {:#}", e));
+                            break;
+                        }
+                    };
+                    let Some((chunk_index, sk, ek)) = claimed else {
+                        break;
+                    };
+
+                    if !resource::check_memory(tuning_w.memory_threshold_mb) {
+                        log::warn!("memory threshold exceeded in worker; pausing 2s");
+                        std::thread::sleep(Duration::from_secs(2));
+                    }
+
+                    let start: i64 = match sk.parse() {
+                        Ok(v) => v,
+                        Err(_) => {
+                            let _ = StateStore::fail_chunk_task_at_path(
+                                &db_path,
+                                run_id_arc.as_str(),
+                                chunk_index,
+                                "invalid start_key",
+                            );
+                            continue;
+                        }
+                    };
+                    let end: i64 = match ek.parse() {
+                        Ok(v) => v,
+                        Err(_) => {
+                            let _ = StateStore::fail_chunk_task_at_path(
+                                &db_path,
+                                run_id_arc.as_str(),
+                                chunk_index,
+                                "invalid end_key",
+                            );
+                            continue;
+                        }
+                    };
+
+                    let chunk_query = build_chunk_query_sql(
+                        &base_query_w,
+                        &col_w,
+                        start,
+                        end,
+                        export_worker.chunk_dense,
+                    );
+
+                    let result = (|| -> Result<(usize, Option<String>, u64)> {
+                        let mut last_err: Option<anyhow::Error> = None;
+                        for attempt in 0..=tuning_w.max_retries {
+                            if attempt > 0 {
+                                let (_, _, extra_delay) = last_err
+                                    .as_ref()
+                                    .map(classify_error)
+                                    .unwrap_or((false, false, 0));
+                                let backoff =
+                                    tuning_w.retry_backoff_ms * 2u64.pow(attempt - 1) + extra_delay;
+                                std::thread::sleep(Duration::from_millis(backoff));
+                            }
+
+                            let mut thread_src = match source::create_source(&source_config_w) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    let (transient, _, _) = classify_error(&e);
+                                    if attempt < tuning_w.max_retries && transient {
+                                        last_err = Some(e);
+                                        continue;
+                                    }
+                                    return Err(e);
+                                }
+                            };
+
+                            let mut sink = ExportSink::new(&export_worker)?;
+
+                            let export_attempt = (|| -> Result<(usize, Option<String>, u64)> {
+                                thread_src.export(&chunk_query, None, None, &tuning_w, &mut sink)?;
+                                if let Some(w) = sink.writer.take() {
+                                    w.finish()?;
+                                }
+                                if sink.total_rows == 0 {
+                                    return Ok((0, None, 0));
+                                }
+                                if validate {
+                                    validate_output(sink.tmp.path(), format_type, sink.total_rows)?;
+                                }
+                                let file_bytes =
+                                    std::fs::metadata(sink.tmp.path()).map(|m| m.len()).unwrap_or(0);
+                                let fmt = format::create_format(
+                                    format_type,
+                                    export_worker.compression,
+                                    export_worker.compression_level,
+                                );
+                                let file_name = format!(
+                                    "{}_{}_chunk{}.{}",
+                                    export_name,
+                                    chrono::Utc::now().format("%Y%m%d_%H%M%S"),
+                                    chunk_index,
+                                    fmt.file_extension()
+                                );
+                                let dest = destination::create_destination(&dest_config)?;
+                                dest.write(sink.tmp.path(), &file_name)?;
+                                Ok((sink.total_rows, Some(file_name), file_bytes))
+                            })();
+
+                            match export_attempt {
+                                Ok(v) => return Ok(v),
+                                Err(e) => {
+                                    let (transient, _, _) = classify_error(&e);
+                                    if attempt < tuning_w.max_retries && transient {
+                                        last_err = Some(e);
+                                        continue;
+                                    }
+                                    return Err(e);
+                                }
+                            }
+                        }
+                        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("chunk failed after retries")))
+                    })();
+
+                    match result {
+                        Ok((rows, fname, file_bytes)) => {
+                            agg_rows.fetch_add(rows as i64, Ordering::Relaxed);
+                            if rows > 0 {
+                                agg_bytes.fetch_add(file_bytes, Ordering::Relaxed);
+                                agg_files.fetch_add(1, Ordering::Relaxed);
+                                if let (Some(ref name), Ok(store)) = (
+                                    fname.as_ref(),
+                                    StateStore::open(&config_path_w),
+                                ) {
+                                    let _ = store.record_file(
+                                        run_id_arc.as_str(),
+                                        &export_name,
+                                        name,
+                                        rows as i64,
+                                        file_bytes as i64,
+                                        &fmt_label_w,
+                                        Some(comp_label_w.as_str()),
+                                    );
+                                }
+                            }
+                            let _ = StateStore::complete_chunk_task_at_path(
+                                &db_path,
+                                run_id_arc.as_str(),
+                                chunk_index,
+                                rows as i64,
+                                fname.as_deref(),
+                            );
+                        }
+                        Err(e) => {
+                            let msg = format!("{:#}", e);
+                            let _ = StateStore::fail_chunk_task_at_path(
+                                &db_path,
+                                run_id_arc.as_str(),
+                                chunk_index,
+                                &msg,
+                            );
+                            errors.lock().unwrap().push(format!("chunk {}: {}", chunk_index, msg));
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    summary.total_rows = agg_rows.load(Ordering::Relaxed);
+    summary.bytes_written = agg_bytes.load(Ordering::Relaxed);
+    summary.files_produced = agg_files.load(Ordering::Relaxed);
+    if validate {
+        summary.validated = Some(true);
+    }
+
+    let errs = errors.into_inner().unwrap();
+    if !errs.is_empty() {
+        anyhow::bail!(
+            "export '{}': parallel checkpoint worker errors:\n{}",
+            export.name,
+            errs.join("\n")
+        );
+    }
+
+    let pending = state.count_chunk_tasks_not_completed(&run_id)?;
+    if pending > 0 {
+        anyhow::bail!(
+            "export '{}': {} chunk task(s) not completed; `rivet run --resume` or inspect `rivet state chunks --export {}`",
+            export.name, pending, export.name
+        );
+    }
+
+    state.finalize_chunk_run_completed(&run_id)?;
+    log::info!("export '{}': chunk checkpoint parallel run completed", export.name);
+    Ok(())
+}
+
+pub fn reset_chunk_checkpoint(config_path: &str, export_name: &str) -> Result<()> {
+    let state = StateStore::open(config_path)?;
+    let n = state.reset_chunk_checkpoint(export_name)?;
+    println!("Removed {} chunk run record(s) for export '{}'.", n, export_name);
+    Ok(())
+}
+
+pub fn show_chunk_checkpoint(config_path: &str, export_name: &str) -> Result<()> {
+    let state = StateStore::open(config_path)?;
+    println!("database:   {}", StateStore::state_db_path(config_path).display());
+    let Some((run_id, plan_hash, status, updated_at)) = state.get_latest_chunk_run(export_name)? else {
+        println!("No chunk checkpoint data for export '{}'.", export_name);
+        return Ok(());
+    };
+    println!("export:     {}", export_name);
+    println!("run_id:     {}", run_id);
+    println!("plan_hash:  {}", plan_hash);
+    println!("status:     {}", status);
+    println!("updated_at: {}", updated_at);
+    println!();
+    println!(
+        "{:<6} {:<12} {:<18} {:<18} {:>4} {:>8} {}",
+        "IDX", "STATUS", "START", "END", "ATT", "ROWS", "FILE"
+    );
+    println!("{}", "-".repeat(90));
+    for t in state.list_chunk_tasks_for_run(&run_id)? {
+        let file = t.file_name.as_deref().unwrap_or("-");
+        let rows = t.rows_written.map(|r| r.to_string()).unwrap_or_else(|| "-".into());
+        println!(
+            "{:<6} {:<12} {:<18} {:<18} {:>4} {:>8} {}",
+            t.chunk_index, t.status, t.start_key, t.end_key, t.attempts, rows, file
+        );
+        if let Some(e) = &t.last_error {
+            println!("       error: {}", e);
+        }
+    }
+    Ok(())
+}
+
 // ─── Helpers ─────────────────────────────────────────────────
+
+fn parse_scalar_i64(raw: &str) -> Result<i64> {
+    let t = raw.trim();
+    t.parse::<i64>()
+        .or_else(|_| t.parse::<f64>().map(|x| x as i64))
+        .map_err(|_| anyhow::anyhow!("invalid numeric scalar: {:?}", t))
+}
+
+fn query_wrapped_row_count(src: &mut dyn Source, base_query: &str) -> Result<i64> {
+    let sql = format!("SELECT COUNT(*) FROM ({}) AS _rivet_rowcnt", base_query);
+    let raw = src
+        .query_scalar(&sql)?
+        .ok_or_else(|| anyhow::anyhow!("COUNT(*) returned no row"))?;
+    parse_scalar_i64(&raw)
+}
+
+fn log_chunk_boundaries_list(export_name: &str, chunks: &[(i64, i64)]) {
+    const HEAD: usize = 8;
+    const TAIL: usize = 8;
+    if chunks.is_empty() {
+        log::info!("export '{}': no BETWEEN windows (empty key range)", export_name);
+        return;
+    }
+    if chunks.len() <= HEAD + TAIL {
+        for (i, (a, b)) in chunks.iter().enumerate() {
+            log::info!("export '{}':   [{:>5}] {} .. {}", export_name, i, a, b);
+        }
+    } else {
+        for (i, (a, b)) in chunks.iter().enumerate().take(HEAD) {
+            log::info!("export '{}':   [{:>5}] {} .. {}", export_name, i, a, b);
+        }
+        log::info!(
+            "export '{}':   ... {} windows omitted ...",
+            export_name,
+            chunks.len() - HEAD - TAIL
+        );
+        for (i, (a, b)) in chunks.iter().enumerate().skip(chunks.len() - TAIL) {
+            log::info!("export '{}':   [{:>5}] {} .. {}", export_name, i, a, b);
+        }
+    }
+}
+
+fn log_chunk_sparsity_at_run(
+    export_name: &str,
+    chunk_column: &str,
+    chunk_size: usize,
+    min_val: i64,
+    max_val: i64,
+    chunks: &[(i64, i64)],
+    row_count: i64,
+) {
+    if row_count == 0 {
+        log::info!(
+            "export '{}': COUNT(*) = 0 — no rows in export query; {} BETWEEN window(s) from `{}` min..max (runs will skip empty chunks)",
+            export_name,
+            chunks.len(),
+            chunk_column
+        );
+        if !chunks.is_empty() && chunks.len() <= 24 {
+            log_chunk_boundaries_list(export_name, chunks);
+        }
+        return;
+    }
+
+    let info = chunk_sparsity_from_counts(row_count, min_val, max_val, chunk_size);
+    if info.is_sparse {
+        let fill_pct = info.density * 100.0;
+        let empty_hint = ((1.0 - info.density).min(1.0).max(0.0)) * 100.0;
+        log::info!(
+            "export '{}': sparse `{}` range — ~{:.2}% of the min..max ID band contains rows (~{:.1}% of logical windows likely empty). \
+             rows={}, span≈{}, chunk_size={}, ~{} logical windows, {} BETWEEN chunks. Computed boundaries:",
+            export_name,
+            chunk_column,
+            fill_pct,
+            empty_hint,
+            info.row_count,
+            info.range_span,
+            chunk_size,
+            info.logical_windows,
+            chunks.len(),
+        );
+        log_chunk_boundaries_list(export_name, chunks);
+    } else {
+        log::info!(
+            "export '{}': `{}` range looks dense enough for BETWEEN chunking (rows={}, span≈{}, density≈{:.6}, {} chunks); continuing",
+            export_name,
+            chunk_column,
+            info.row_count,
+            info.range_span,
+            info.density,
+            chunks.len(),
+        );
+    }
+}
+
+/// Synthetic ordinal column for `chunk_dense`; stripped before writing files.
+pub(crate) const RIVET_CHUNK_RN_COL: &str = "_rivet_chunk_rn";
+
+pub(crate) fn build_chunk_query_sql(
+    base_query: &str,
+    order_column: &str,
+    start: i64,
+    end: i64,
+    chunk_dense: bool,
+) -> String {
+    if chunk_dense {
+        format!(
+            "SELECT * FROM (SELECT _rivet_i.*, ROW_NUMBER() OVER (ORDER BY _rivet_i.{oc}) AS {rn} FROM ({bq}) AS _rivet_i) AS _rivet_w WHERE _rivet_w.{rn} BETWEEN {s} AND {e}",
+            bq = base_query,
+            oc = order_column,
+            rn = RIVET_CHUNK_RN_COL,
+            s = start,
+            e = end,
+        )
+    } else {
+        format!(
+            "SELECT * FROM ({base}) AS _rivet WHERE {col} BETWEEN {start} AND {end}",
+            base = base_query,
+            col = order_column,
+            start = start,
+            end = end,
+        )
+    }
+}
 
 pub(crate) fn detect_and_generate_chunks(
     src: &mut dyn Source,
     base_query: &str,
     chunk_column: &str,
     chunk_size: usize,
+    export_name: &str,
+    chunk_dense: bool,
 ) -> Result<Vec<(i64, i64)>> {
+    if chunk_dense {
+        let row_count = query_wrapped_row_count(src, base_query)?;
+        log::info!(
+            "export '{}': chunk_dense: ROW_NUMBER() OVER (ORDER BY `{}`) — {} row(s), chunk_size={}",
+            export_name,
+            chunk_column,
+            row_count,
+            chunk_size
+        );
+        let chunks = if row_count <= 0 {
+            vec![]
+        } else {
+            generate_chunks(1, row_count, chunk_size as i64)
+        };
+        log::info!(
+            "export '{}': dense chunk plan: {} window(s) on ordinal 1..{}",
+            export_name,
+            chunks.len(),
+            row_count
+        );
+        return Ok(chunks);
+    }
+
     let min_sql = format!(
         "SELECT min({col}) FROM ({q}) AS _rivet",
         col = chunk_column, q = base_query,
@@ -752,9 +1739,36 @@ pub(crate) fn detect_and_generate_chunks(
         .and_then(|s| s.trim().parse::<i64>().ok())
         .unwrap_or(0);
 
-    log::info!("chunk range: {} .. {} (chunk_size={})", min_val, max_val, chunk_size);
+    log::info!(
+        "export '{}': chunk_column `{}` range {} .. {} (chunk_size={})",
+        export_name, chunk_column, min_val, max_val, chunk_size
+    );
 
-    Ok(generate_chunks(min_val, max_val, chunk_size as i64))
+    let chunks = generate_chunks(min_val, max_val, chunk_size as i64);
+
+    match query_wrapped_row_count(src, base_query) {
+        Ok(row_count) => {
+            log_chunk_sparsity_at_run(export_name, chunk_column, chunk_size, min_val, max_val, &chunks, row_count);
+        }
+        Err(e) => {
+            log::warn!(
+                "export '{}': could not run COUNT(*) for sparsity diagnostics: {:#}; proceeding with {} windows from min/max only",
+                export_name,
+                e,
+                chunks.len()
+            );
+            if chunks.len() <= 24 {
+                log_chunk_boundaries_list(export_name, &chunks);
+            } else {
+                log::info!(
+                    "export '{}': use `RUST_LOG=info rivet run` after fixing COUNT if you need the full boundary list",
+                    export_name
+                );
+            }
+        }
+    }
+
+    Ok(chunks)
 }
 
 pub fn generate_chunks(min: i64, max: i64, chunk_size: i64) -> Vec<(i64, i64)> {
@@ -860,6 +1874,8 @@ struct ExportSink {
     quality_columns: Option<crate::config::QualityConfig>,
     max_file_size: Option<u64>,
     completed_parts: Vec<CompletedPart>,
+    /// When set, this column is removed from Arrow batches before enrichment and write (see `chunk_dense`).
+    strip_internal_column: Option<String>,
 }
 
 impl ExportSink {
@@ -884,7 +1900,33 @@ impl ExportSink {
             quality_columns: export.quality.clone(),
             max_file_size: export.max_file_size_bytes(),
             completed_parts: Vec::new(),
+            strip_internal_column: if export.chunk_dense {
+                Some(RIVET_CHUNK_RN_COL.to_string())
+            } else {
+                None
+            },
         })
+    }
+
+    fn schema_without_internal(schema: &Schema, name: &str) -> Result<SchemaRef> {
+        let idx = schema.index_of(name)?;
+        let fields: Vec<_> = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != idx)
+            .map(|(_, f)| f.as_ref().clone())
+            .collect();
+        Ok(Arc::new(Schema::new(fields)))
+    }
+
+    fn record_batch_without_internal(batch: &RecordBatch, name: &str) -> Result<RecordBatch> {
+        let schema = batch.schema();
+        let idx = schema.index_of(name)?;
+        let indices: Vec<usize> = (0..schema.fields().len()).filter(|&i| i != idx).collect();
+        batch
+            .project(&indices)
+            .map_err(|e| anyhow::anyhow!("project batch without {}: {}", name, e))
     }
 
     fn maybe_split(&mut self) -> Result<()> {
@@ -989,23 +2031,34 @@ impl ExportSink {
 
 impl BatchSink for ExportSink {
     fn on_schema(&mut self, schema: SchemaRef) -> Result<()> {
-        let enriched = enrich::enrich_schema(&schema, &self.meta);
+        let data_schema = if let Some(ref strip) = self.strip_internal_column {
+            Self::schema_without_internal(schema.as_ref(), strip)?
+        } else {
+            schema.clone()
+        };
+        let enriched = enrich::enrich_schema(&data_schema, &self.meta);
         let fmt = format::create_format(self.format_type, self.compression, self.compression_level);
         let file = self.tmp.as_file().try_clone()?;
         let buf_writer = BufWriter::new(file);
         self.writer = Some(fmt.create_writer(&enriched, Box::new(buf_writer))?);
-        self.schema = Some(schema);
+        self.schema = Some(data_schema);
         self.enriched_schema = Some(enriched);
         Ok(())
     }
 
     fn on_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        let batch = if let Some(ref strip) = self.strip_internal_column {
+            Self::record_batch_without_internal(batch, strip)?
+        } else {
+            batch.clone()
+        };
+
         self.total_rows += batch.num_rows();
         self.part_rows += batch.num_rows();
-        self.track_quality(batch);
+        self.track_quality(&batch);
 
         let output = if let Some(es) = &self.enriched_schema {
-            enrich::enrich_batch(batch, &self.meta, es, self.exported_at_us)?
+            enrich::enrich_batch(&batch, &self.meta, es, self.exported_at_us)?
         } else {
             batch.clone()
         };
@@ -1013,7 +2066,7 @@ impl BatchSink for ExportSink {
         if let Some(w) = self.writer.as_mut() {
             w.write_batch(&output)?;
         }
-        self.last_batch = Some(batch.clone());
+        self.last_batch = Some(batch);
         self.maybe_split()?;
         Ok(())
     }
@@ -1191,6 +2244,21 @@ mod tests {
     }
 
     #[test]
+    fn test_build_chunk_query_range_mode() {
+        let q = build_chunk_query_sql("SELECT id FROM t", "id", 1, 100, false);
+        assert!(q.contains("WHERE id BETWEEN 1 AND 100"), "got: {}", q);
+        assert!(!q.contains("ROW_NUMBER()"), "got: {}", q);
+    }
+
+    #[test]
+    fn test_build_chunk_query_dense_mode() {
+        let q = build_chunk_query_sql("SELECT id FROM t", "id", 1, 5000, true);
+        assert!(q.contains("ROW_NUMBER()"), "got: {}", q);
+        assert!(q.contains(RIVET_CHUNK_RN_COL), "got: {}", q);
+        assert!(q.contains("BETWEEN 1 AND 5000"), "got: {}", q);
+    }
+
+    #[test]
     fn test_build_time_window_timestamp() {
         let q = build_time_window_query("SELECT * FROM events", "created_at", TimeColumnType::Timestamp, 7);
         assert!(q.contains("created_at >= '"), "got: {}", q);
@@ -1358,13 +2426,19 @@ mod tests {
             meta_columns: MetaColumns::default(),
             quality: None,
             max_file_size: None,
+            chunk_checkpoint: false,
+            chunk_max_attempts: None,
+            tuning: None,
+            chunk_dense: false,
         };
         let tuning = SourceTuning::from_config(None);
-        let summary = RunSummary::new(&export, &tuning);
+        let summary = RunSummary::new(&export, &tuning, "balanced (default)");
         assert_eq!(summary.export_name, "test_export");
         assert_eq!(summary.status, "running");
         assert_eq!(summary.total_rows, 0);
         assert_eq!(summary.files_produced, 0);
+        assert_eq!(summary.tuning_profile, "balanced (default)");
+        assert_eq!(summary.batch_size, 10_000);
         assert_eq!(summary.format, "parquet");
         assert_eq!(summary.mode, "full");
         assert!(summary.run_id.starts_with("test_export_"), "run_id should start with export name, got: {}", summary.run_id);

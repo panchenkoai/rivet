@@ -1,0 +1,215 @@
+{
+  "uid": "pg-overview",
+  "title": "PostgreSQL Overview",
+  "timezone": "browser",
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "DB Up",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 3, "x": 0, "y": 0 },
+      "targets": [{ "expr": "pg_up", "legendFormat": "" }],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "1": { "text": "UP", "color": "green" }, "0": { "text": "DOWN", "color": "red" } } }
+          ],
+          "thresholds": { "steps": [{ "value": null, "color": "red" }, { "value": 1, "color": "green" }] }
+        }
+      },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+    },
+    {
+      "id": 2,
+      "title": "Active Connections",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 3, "x": 3, "y": 0 },
+      "targets": [{ "expr": "sum(pg_stat_activity_count)", "legendFormat": "connections" }],
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "value": null, "color": "green" }, { "value": 80, "color": "yellow" }, { "value": 150, "color": "red" }] } } },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+    },
+    {
+      "id": 3,
+      "title": "Database Size",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 3, "x": 6, "y": 0 },
+      "targets": [{ "expr": "pg_database_size_bytes{datname=\"rivet\"}", "legendFormat": "" }],
+      "fieldConfig": { "defaults": { "unit": "bytes", "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "value": null, "color": "blue" }] } } },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+    },
+    {
+      "id": 4,
+      "title": "Max TX Duration (s)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 3, "x": 9, "y": 0 },
+      "targets": [{ "expr": "max(pg_stat_activity_max_tx_duration)", "legendFormat": "" }],
+      "fieldConfig": { "defaults": { "unit": "s", "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "value": null, "color": "green" }, { "value": 5, "color": "yellow" }, { "value": 30, "color": "red" }] } } },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+    },
+    {
+      "id": 5,
+      "title": "Locks Count",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 3, "x": 12, "y": 0 },
+      "targets": [{ "expr": "sum(pg_locks_count)", "legendFormat": "" }],
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "value": null, "color": "green" }, { "value": 20, "color": "yellow" }, { "value": 50, "color": "red" }] } } },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+    },
+    {
+      "id": 6,
+      "title": "Deadlocks",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 3, "x": 15, "y": 0 },
+      "targets": [{ "expr": "sum(pg_stat_database_deadlocks{datname=\"rivet\"})", "legendFormat": "" }],
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "value": null, "color": "green" }, { "value": 1, "color": "red" }] } } },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+    },
+    {
+      "id": 7,
+      "title": "Cache Hit Ratio",
+      "type": "gauge",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "targets": [{ "expr": "pg_stat_database_blks_hit{datname=\"rivet\"} / (pg_stat_database_blks_hit{datname=\"rivet\"} + pg_stat_database_blks_read{datname=\"rivet\"} + 1)", "legendFormat": "hit ratio" }],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "thresholds": { "steps": [{ "value": null, "color": "red" }, { "value": 0.9, "color": "yellow" }, { "value": 0.99, "color": "green" }] } } },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+    },
+    {
+      "id": 10,
+      "title": "Transactions / sec (commit vs rollback)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [
+        { "expr": "rate(pg_stat_database_xact_commit{datname=\"rivet\"}[1m])", "legendFormat": "commits/s" },
+        { "expr": "rate(pg_stat_database_xact_rollback{datname=\"rivet\"}[1m])", "legendFormat": "rollbacks/s" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 15, "lineWidth": 2 } } },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+    },
+    {
+      "id": 11,
+      "title": "Tuple Operations / sec",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [
+        { "expr": "rate(pg_stat_database_tup_inserted{datname=\"rivet\"}[1m])", "legendFormat": "inserts/s" },
+        { "expr": "rate(pg_stat_database_tup_updated{datname=\"rivet\"}[1m])", "legendFormat": "updates/s" },
+        { "expr": "rate(pg_stat_database_tup_deleted{datname=\"rivet\"}[1m])", "legendFormat": "deletes/s" },
+        { "expr": "rate(pg_stat_database_tup_fetched{datname=\"rivet\"}[1m])", "legendFormat": "fetches/s" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 10, "lineWidth": 2 } } },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+    },
+    {
+      "id": 12,
+      "title": "Active Connections Over Time",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        { "expr": "sum by (state) (pg_stat_activity_count)", "legendFormat": "{{ state }}" }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "fillOpacity": 20, "lineWidth": 2, "stacking": { "mode": "normal" } } } },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+    },
+    {
+      "id": 13,
+      "title": "Locks by Mode",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        { "expr": "sum by (mode) (pg_locks_count)", "legendFormat": "{{ mode }}" }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "fillOpacity": 15, "lineWidth": 2, "stacking": { "mode": "normal" } } } },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+    },
+    {
+      "id": 14,
+      "title": "Block I/O (hits vs reads)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "targets": [
+        { "expr": "rate(pg_stat_database_blks_hit{datname=\"rivet\"}[1m])", "legendFormat": "cache hits/s" },
+        { "expr": "rate(pg_stat_database_blks_read{datname=\"rivet\"}[1m])", "legendFormat": "disk reads/s" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 15, "lineWidth": 2 } } },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+    },
+    {
+      "id": 15,
+      "title": "Temp Files & Bytes",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "targets": [
+        { "expr": "rate(pg_stat_database_temp_files{datname=\"rivet\"}[1m])", "legendFormat": "temp files/s" },
+        { "expr": "rate(pg_stat_database_temp_bytes{datname=\"rivet\"}[1m])", "legendFormat": "temp bytes/s" }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "fillOpacity": 10, "lineWidth": 2 } },
+        "overrides": [{ "matcher": { "id": "byName", "options": "temp bytes/s" }, "properties": [{ "id": "unit", "value": "Bps" }] }]
+      },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+    },
+    {
+      "id": 16,
+      "title": "Bgwriter: Buffers",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "targets": [
+        { "expr": "rate(pg_stat_bgwriter_buffers_checkpoint_total[1m])", "legendFormat": "checkpoint" },
+        { "expr": "rate(pg_stat_bgwriter_buffers_clean_total[1m])", "legendFormat": "clean" },
+        { "expr": "rate(pg_stat_bgwriter_buffers_backend_total[1m])", "legendFormat": "backend" },
+        { "expr": "rate(pg_stat_bgwriter_buffers_alloc_total[1m])", "legendFormat": "alloc" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 10, "lineWidth": 2 } } },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+    },
+    {
+      "id": 17,
+      "title": "Table: Live vs Dead Tuples (top tables)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+      "targets": [
+        { "expr": "topk(5, pg_stat_user_tables_n_live_tup)", "legendFormat": "{{ relname }} live" },
+        { "expr": "topk(5, pg_stat_user_tables_n_dead_tup)", "legendFormat": "{{ relname }} dead" }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "fillOpacity": 10, "lineWidth": 2 } } },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+    },
+    {
+      "id": 18,
+      "title": "Table Sizes (top 10)",
+      "type": "bargauge",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 36 },
+      "targets": [
+        { "expr": "topk(10, pg_stat_user_tables_table_size_bytes)", "legendFormat": "{{ relname }}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "bytes", "thresholds": { "steps": [{ "value": null, "color": "blue" }, { "value": 104857600, "color": "yellow" }, { "value": 1073741824, "color": "red" }] } } },
+      "options": { "orientation": "horizontal", "displayMode": "gradient" },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+    },
+    {
+      "id": 19,
+      "title": "Seq Scans vs Index Scans / sec",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 36 },
+      "targets": [
+        { "expr": "sum(rate(pg_stat_user_tables_seq_scan[1m]))", "legendFormat": "seq scans/s" },
+        { "expr": "sum(rate(pg_stat_user_tables_idx_scan[1m]))", "legendFormat": "idx scans/s" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 15, "lineWidth": 2 } } },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "text": "Prometheus", "value": "Prometheus" }
+      }
+    ]
+  },
+  "schemaVersion": 39
+}

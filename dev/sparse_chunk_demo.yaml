@@ -1,0 +1,70 @@
+# Requires: orders_sparse filled, e.g.
+#   cargo run --bin seed -- --target postgres --only-sparse-chunk-demo
+# or full seed with:
+#   cargo run --bin seed -- --target postgres --sparse-chunk-demo --users 1000 ...
+#
+# Large sparse table (e.g. 500k rows, wide id band — good for chunked benchmarks):
+#   cargo run --release --bin seed -- --target postgres --only-sparse-chunk-demo \
+#     --sparse-chunk-rows 500000 --sparse-chunk-id-gap 2000000 --sparse-chunk-batch-size 5000
+#
+# Large dense ids in same table (min..max ≈ row count; chunk on `id` is reasonable):
+#   cargo run --release --bin seed -- --target postgres --only-sparse-chunk-demo \
+#     --sparse-chunk-rows 500000 --sparse-chunk-id-gap 1 --sparse-chunk-batch-size 8000
+#
+# `orders_sparse_on_id` — chunk on physical id → wide min..max, many windows (heavy plan).
+# `orders_sparse_builtin_dense` — same query as on_id; Rivet adds ROW_NUMBER() OVER (ORDER BY id)
+#   internally (`chunk_dense: true`). Output files contain only id + payload (no surrogate column).
+# `orders_sparse_dense` — manual view with chunk_rownum (legacy / explicit SQL).
+#
+# Goal: few files / one file — prefer `chunk_dense: true` or a dense key; not sparse BETWEEN on `id`.
+# For one file: chunk_size >= row count on the dense ordinal (see `orders_sparse_dense_onefile`).
+
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+
+exports:
+  - name: orders_sparse_on_id
+    query: "SELECT id, payload FROM orders_sparse"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 500000
+    chunk_checkpoint: true
+    chunk_dense: true
+    format: csv
+    destination:
+      type: local
+      path: ./dev/output/sparse_chunk
+
+  - name: orders_sparse_builtin_dense
+    query: "SELECT id, payload FROM orders_sparse"
+    mode: chunked
+    chunk_column: id
+    chunk_dense: true
+    chunk_size: 10000
+    format: csv
+    destination:
+      type: local
+      path: ./dev/output/sparse_chunk
+
+  - name: orders_sparse_dense
+    query: "SELECT id, payload, chunk_rownum FROM orders_sparse_for_export"
+    mode: chunked
+    chunk_column: chunk_rownum
+    chunk_size: 10000
+    chunk_checkpoint: true
+    format: csv
+    destination:
+      type: local
+      path: ./dev/output/sparse_chunk
+
+  # One output file for the whole table (if rows ≤ chunk_size on dense key). Raise chunk_size for bigger seeds.
+  - name: orders_sparse_dense_onefile
+    query: "SELECT id, payload, chunk_rownum FROM orders_sparse_for_export"
+    mode: chunked
+    chunk_column: chunk_rownum
+    chunk_size: 2000000
+    format: csv
+    destination:
+      type: local
+      path: ./dev/output/sparse_chunk

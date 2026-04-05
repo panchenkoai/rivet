@@ -4,12 +4,18 @@ use serde::Deserialize;
 
 use crate::tuning::TuningConfig;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub source: SourceConfig,
     pub exports: Vec<ExportConfig>,
     #[serde(default)]
     pub notifications: Option<NotificationsConfig>,
+    /// When true (and multiple exports run without `--export`), run each export in its own thread.
+    #[serde(default)]
+    pub parallel_exports: bool,
+    /// Like `parallel_exports`, but spawns a separate `rivet` process per export (accurate peak RSS per job).
+    #[serde(default)]
+    pub parallel_export_processes: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -151,7 +157,7 @@ pub enum SourceType {
     Mysql,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ExportConfig {
     pub name: String,
     #[serde(default)]
@@ -161,6 +167,11 @@ pub struct ExportConfig {
     pub mode: ExportMode,
     pub cursor_column: Option<String>,
     pub chunk_column: Option<String>,
+    /// When `true` (chunked mode only), Rivet wraps the query with
+    /// `ROW_NUMBER() OVER (ORDER BY chunk_column)` and splits on that ordinal; the synthetic
+    /// column is not written to output files. The user query must not define this column.
+    #[serde(default)]
+    pub chunk_dense: bool,
     #[serde(default = "default_chunk_size")]
     pub chunk_size: usize,
     #[serde(default = "default_parallel")]
@@ -182,6 +193,14 @@ pub struct ExportConfig {
     pub quality: Option<QualityConfig>,
     /// Max file size before splitting, e.g. "512MB", "1GB".
     pub max_file_size: Option<String>,
+    /// Persist chunked export plan (boundaries + per-chunk status) in SQLite for resume and retries.
+    #[serde(default)]
+    pub chunk_checkpoint: bool,
+    /// Max worker-level attempts per chunk when `chunk_checkpoint` is on (default: source tuning max_retries + 1).
+    pub chunk_max_attempts: Option<u32>,
+    /// Optional overrides layered on top of `source.tuning` for this export only.
+    #[serde(default)]
+    pub tuning: Option<TuningConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -257,7 +276,7 @@ impl Default for CompressionType {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct DestinationConfig {
     #[serde(rename = "type")]
     pub destination_type: DestinationType,
@@ -391,6 +410,26 @@ impl Config {
         if let Some(t) = &self.source.tuning {
             if t.batch_size.is_some() && t.batch_size_memory_mb.is_some() {
                 anyhow::bail!("tuning: batch_size and batch_size_memory_mb are mutually exclusive");
+            }
+        }
+
+        for export in &self.exports {
+            let merged = crate::tuning::merge_tuning_config(self.source.tuning.as_ref(), export.tuning.as_ref());
+            if let Some(t) = merged {
+                if t.batch_size.is_some() && t.batch_size_memory_mb.is_some() {
+                    anyhow::bail!(
+                        "export '{}': effective tuning has both batch_size and batch_size_memory_mb (mutually exclusive)",
+                        export.name
+                    );
+                }
+            }
+            if let Some(et) = &export.tuning {
+                if et.batch_size.is_some() && et.batch_size_memory_mb.is_some() {
+                    anyhow::bail!(
+                        "export '{}': tuning.batch_size and tuning.batch_size_memory_mb are mutually exclusive",
+                        export.name
+                    );
+                }
             }
         }
 
@@ -536,6 +575,13 @@ impl Config {
                 }
                 ExportMode::Full => {}
             }
+
+            if export.chunk_dense && export.mode != ExportMode::Chunked {
+                anyhow::bail!(
+                    "export '{}': chunk_dense is only valid with mode: chunked",
+                    export.name
+                );
+            }
         }
         Ok(())
     }
@@ -564,6 +610,58 @@ exports:
         assert_eq!(cfg.source.source_type, SourceType::Postgres);
         assert_eq!(cfg.exports.len(), 1);
         assert_eq!(cfg.exports[0].mode, ExportMode::Full);
+        assert!(!cfg.parallel_exports);
+        assert!(!cfg.parallel_export_processes);
+    }
+
+    #[test]
+    fn parallel_exports_parses() {
+        let yaml = r#"
+parallel_exports: true
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: a
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+  - name: b
+    query: "SELECT 2"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#;
+        let cfg = Config::from_yaml(yaml).unwrap();
+        assert!(cfg.parallel_exports);
+    }
+
+    #[test]
+    fn parallel_export_processes_parses() {
+        let yaml = r#"
+parallel_export_processes: true
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: a
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+  - name: b
+    query: "SELECT 2"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#;
+        let cfg = Config::from_yaml(yaml).unwrap();
+        assert!(cfg.parallel_export_processes);
     }
 
     #[test]
@@ -587,6 +685,57 @@ exports:
         let tuning = cfg.source.tuning.as_ref().unwrap();
         assert_eq!(tuning.profile, Some(crate::tuning::TuningProfile::Safe));
         assert_eq!(tuning.batch_size, Some(3000));
+    }
+
+    #[test]
+    fn parse_export_level_tuning_merges_with_source() {
+        let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+  tuning:
+    profile: fast
+    batch_size: 5000
+exports:
+  - name: a
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+    tuning:
+      profile: balanced
+"#;
+        let cfg = Config::from_yaml(yaml).unwrap();
+        let merged = crate::tuning::merge_tuning_config(cfg.source.tuning.as_ref(), cfg.exports[0].tuning.as_ref())
+            .expect("merged");
+        assert_eq!(merged.profile, Some(crate::tuning::TuningProfile::Balanced));
+        assert_eq!(merged.batch_size, Some(5000));
+    }
+
+    #[test]
+    fn effective_tuning_rejects_cross_layer_batch_conflict() {
+        let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+  tuning:
+    batch_size: 1000
+exports:
+  - name: a
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+    tuning:
+      batch_size_memory_mb: 128
+"#;
+        let err = Config::from_yaml(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("effective tuning"),
+            "expected effective tuning error, got: {err}"
+        );
     }
 
     #[test]
@@ -672,6 +821,46 @@ exports:
         assert_eq!(cfg.exports[0].chunk_column.as_deref(), Some("id"));
         assert_eq!(cfg.exports[0].chunk_size, 50000);
         assert_eq!(cfg.exports[0].parallel, 4);
+    }
+
+    #[test]
+    fn chunk_dense_parses() {
+        let cfg = Config::from_yaml(r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: orders
+    query: "SELECT id, payload FROM orders_sparse"
+    mode: chunked
+    chunk_column: id
+    chunk_dense: true
+    chunk_size: 10000
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#).unwrap();
+        assert!(cfg.exports[0].chunk_dense);
+    }
+
+    #[test]
+    fn chunk_dense_rejected_without_chunked_mode() {
+        let err = Config::from_yaml(r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: bad
+    query: "SELECT * FROM t"
+    mode: full
+    chunk_dense: true
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#).unwrap_err();
+        assert!(err.to_string().contains("chunk_dense"));
     }
 
     #[test]
@@ -1492,5 +1681,27 @@ exports:
       path: ./out
 "#).unwrap_err();
         assert!(err.to_string().contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn chunk_checkpoint_fields_parse() {
+        let cfg = Config::from_yaml(r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    query: "SELECT 1"
+    mode: chunked
+    chunk_column: id
+    chunk_checkpoint: true
+    chunk_max_attempts: 7
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#).unwrap();
+        assert!(cfg.exports[0].chunk_checkpoint);
+        assert_eq!(cfg.exports[0].chunk_max_attempts, Some(7));
     }
 }

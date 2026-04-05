@@ -94,3 +94,16 @@ CREATE TABLE content_items (
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     extra_data JSON
 );
+
+-- Sparse BIGINT ids — chunked mode demo (MySQL 8+ window functions)
+CREATE TABLE orders_sparse (
+    id BIGINT PRIMARY KEY,
+    payload TEXT NOT NULL
+);
+
+CREATE OR REPLACE VIEW orders_sparse_for_export AS
+SELECT
+    id,
+    payload,
+    ROW_NUMBER() OVER (ORDER BY id) AS chunk_rownum
+FROM orders_sparse;

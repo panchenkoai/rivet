@@ -37,6 +37,15 @@ enum Commands {
         /// Validate output files after writing
         #[arg(long)]
         validate: bool,
+        /// Resume a chunked export with `chunk_checkpoint: true` (same query/chunk_column/chunk_size)
+        #[arg(long)]
+        resume: bool,
+        /// Run all exports from the config concurrently (ignored with `--export`; needs 2+ exports)
+        #[arg(long)]
+        parallel_exports: bool,
+        /// Run each export as a separate `rivet` child process (parallel; true per-export peak RSS; more overhead than threads)
+        #[arg(long)]
+        parallel_export_processes: bool,
         /// Query parameter: key=value (repeatable, substitutes ${key} in queries)
         #[arg(short, long = "param", value_name = "KEY=VALUE")]
         params: Vec<String>,
@@ -110,6 +119,20 @@ enum StateAction {
         #[arg(short, long, default_value = "50")]
         last: usize,
     },
+    /// Clear persisted chunk plans (SQLite) for an export
+    ResetChunks {
+        #[arg(short, long)]
+        config: String,
+        #[arg(short, long)]
+        export: String,
+    },
+    /// Show chunk checkpoint status for an export
+    Chunks {
+        #[arg(short, long)]
+        config: String,
+        #[arg(short, long)]
+        export: String,
+    },
 }
 
 fn parse_params(raw: &[String]) -> std::collections::HashMap<String, String> {
@@ -124,10 +147,26 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { config, export, validate, params } => {
+        Commands::Run {
+            config,
+            export,
+            validate,
+            resume,
+            parallel_exports,
+            parallel_export_processes,
+            params,
+        } => {
             let p = parse_params(&params);
             let p = if p.is_empty() { None } else { Some(p) };
-            pipeline::run(&config, export.as_deref(), validate, p.as_ref())?;
+            pipeline::run(
+                &config,
+                export.as_deref(),
+                validate,
+                resume,
+                p.as_ref(),
+                parallel_exports,
+                parallel_export_processes,
+            )?;
         }
         Commands::Check { config, export, params } => {
             let p = parse_params(&params);
@@ -152,6 +191,12 @@ fn main() -> Result<()> {
             }
             StateAction::Files { config, export, last } => {
                 pipeline::show_files(&config, export.as_deref(), last)?;
+            }
+            StateAction::ResetChunks { config, export } => {
+                pipeline::reset_chunk_checkpoint(&config, &export)?;
+            }
+            StateAction::Chunks { config, export } => {
+                pipeline::show_chunk_checkpoint(&config, &export)?;
             }
         },
     }
