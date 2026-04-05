@@ -468,6 +468,19 @@ mod tests {
     }
 
     #[test]
+    fn format_bytes_boundary_values() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1), "1 B");
+        assert_eq!(format_bytes(1023), "1023 B");
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        assert_eq!(format_bytes(1025), "1.0 KB");
+        assert_eq!(format_bytes(1_048_575), "1024.0 KB");
+        assert_eq!(format_bytes(1_048_576), "1.0 MB");
+        assert_eq!(format_bytes(1_073_741_823), "1024.0 MB");
+        assert_eq!(format_bytes(1_073_741_824), "1.0 GB");
+    }
+
+    #[test]
     fn test_run_summary_fields() {
         let export = ExportConfig {
             name: "test_export".into(),

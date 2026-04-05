@@ -1270,3 +1270,84 @@ exports:
     assert!(cfg.exports[0].chunk_checkpoint);
     assert_eq!(cfg.exports[0].chunk_max_attempts, Some(7));
 }
+
+// ─── resolve_vars regression tests ───────────────────────────
+
+#[test]
+fn resolve_vars_multiple_vars_in_one_string() {
+    let mut params = std::collections::HashMap::new();
+    params.insert("A".into(), "1".into());
+    params.insert("B".into(), "2".into());
+    let resolved = resolve_vars("${A}-${B}-end", Some(&params));
+    assert_eq!(resolved, "1-2-end");
+}
+
+#[test]
+fn resolve_vars_missing_closing_brace_stops() {
+    let resolved = resolve_vars("before${NO_CLOSE after", None);
+    assert_eq!(resolved, "before${NO_CLOSE after");
+}
+
+#[test]
+fn resolve_vars_empty_var_name() {
+    let resolved = resolve_vars("x=${}y", None);
+    assert_eq!(resolved, "x=y");
+}
+
+#[test]
+fn resolve_vars_no_vars_passthrough() {
+    let resolved = resolve_vars("plain text, no dollars", None);
+    assert_eq!(resolved, "plain text, no dollars");
+}
+
+#[test]
+fn resolve_vars_adjacent_vars() {
+    let mut params = std::collections::HashMap::new();
+    params.insert("X".into(), "hello".into());
+    params.insert("Y".into(), "world".into());
+    let resolved = resolve_vars("${X}${Y}", Some(&params));
+    assert_eq!(resolved, "helloworld");
+}
+
+#[test]
+fn resolve_vars_dollar_without_brace_ignored() {
+    let resolved = resolve_vars("price is $5", None);
+    assert_eq!(resolved, "price is $5");
+}
+
+// ─── parse_file_size regression tests ────────────────────────
+
+#[test]
+fn parse_file_size_fractional() {
+    assert_eq!(
+        parse_file_size("1.5GB").unwrap(),
+        (1.5 * 1024.0 * 1024.0 * 1024.0) as u64
+    );
+    assert_eq!(
+        parse_file_size("0.5MB").unwrap(),
+        (0.5 * 1024.0 * 1024.0) as u64
+    );
+}
+
+#[test]
+fn parse_file_size_whitespace() {
+    assert_eq!(parse_file_size("  512 MB  ").unwrap(), 512 * 1024 * 1024);
+}
+
+#[test]
+fn parse_file_size_lowercase() {
+    assert_eq!(parse_file_size("256mb").unwrap(), 256 * 1024 * 1024);
+    assert_eq!(parse_file_size("1gb").unwrap(), 1024 * 1024 * 1024);
+}
+
+#[test]
+fn parse_file_size_invalid_errors() {
+    assert!(parse_file_size("abc").is_err());
+    assert!(parse_file_size("MB").is_err());
+}
+
+#[test]
+fn parse_file_size_zero() {
+    assert_eq!(parse_file_size("0MB").unwrap(), 0);
+    assert_eq!(parse_file_size("0").unwrap(), 0);
+}

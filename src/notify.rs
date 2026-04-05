@@ -132,4 +132,101 @@ mod tests {
         // should_send = false, so no HTTP call
         maybe_send(Some(&cfg), &stub_summary("success", None));
     }
+
+    #[test]
+    fn degraded_triggers_degraded_event() {
+        let cfg = NotificationsConfig {
+            slack: Some(SlackConfig {
+                webhook_url: Some("http://127.0.0.1:1/noop".into()),
+                webhook_url_env: None,
+                on: vec![NotifyEvent::Degraded],
+            }),
+        };
+        // "degraded" status should match; the HTTP will fail silently (port 1)
+        maybe_send(Some(&cfg), &stub_summary("degraded", None));
+    }
+
+    #[test]
+    fn schema_change_triggers_schema_change_event() {
+        let cfg = NotificationsConfig {
+            slack: Some(SlackConfig {
+                webhook_url: Some("http://127.0.0.1:1/noop".into()),
+                webhook_url_env: None,
+                on: vec![NotifyEvent::SchemaChange],
+            }),
+        };
+        maybe_send(Some(&cfg), &stub_summary("success", Some(true)));
+    }
+
+    #[test]
+    fn schema_change_false_does_not_trigger() {
+        let cfg = NotificationsConfig {
+            slack: Some(SlackConfig {
+                webhook_url: Some("http://127.0.0.1:1/noop".into()),
+                webhook_url_env: None,
+                on: vec![NotifyEvent::SchemaChange],
+            }),
+        };
+        // schema_changed = Some(false) → should_send = false
+        maybe_send(Some(&cfg), &stub_summary("success", Some(false)));
+    }
+
+    #[test]
+    fn missing_webhook_url_env_skips_silently() {
+        unsafe {
+            std::env::remove_var("RIVET_TEST_SLACK_NONEXISTENT");
+        }
+        let cfg = NotificationsConfig {
+            slack: Some(SlackConfig {
+                webhook_url: None,
+                webhook_url_env: Some("RIVET_TEST_SLACK_NONEXISTENT".into()),
+                on: vec![NotifyEvent::Failure],
+            }),
+        };
+        // should_send = true, but env var missing → skips
+        maybe_send(Some(&cfg), &stub_summary("failed", None));
+    }
+
+    #[test]
+    fn no_webhook_url_and_no_env_skips() {
+        let cfg = NotificationsConfig {
+            slack: Some(SlackConfig {
+                webhook_url: None,
+                webhook_url_env: None,
+                on: vec![NotifyEvent::Failure],
+            }),
+        };
+        maybe_send(Some(&cfg), &stub_summary("failed", None));
+    }
+
+    #[test]
+    fn multiple_triggers_any_match_fires() {
+        let cfg = NotificationsConfig {
+            slack: Some(SlackConfig {
+                webhook_url: Some("http://127.0.0.1:1/noop".into()),
+                webhook_url_env: None,
+                on: vec![
+                    NotifyEvent::Failure,
+                    NotifyEvent::SchemaChange,
+                    NotifyEvent::Degraded,
+                ],
+            }),
+        };
+        // "degraded" matches the 3rd trigger
+        maybe_send(Some(&cfg), &stub_summary("degraded", None));
+    }
+
+    #[test]
+    fn error_message_included_in_stub() {
+        let mut s = stub_summary("failed", None);
+        s.error_message = Some("connection refused".into());
+        let cfg = NotificationsConfig {
+            slack: Some(SlackConfig {
+                webhook_url: Some("http://127.0.0.1:1/noop".into()),
+                webhook_url_env: None,
+                on: vec![NotifyEvent::Failure],
+            }),
+        };
+        maybe_send(Some(&cfg), &s);
+    }
 }

@@ -325,7 +325,7 @@ pub(crate) fn extract_last_cursor_value(
 mod tests {
     use super::*;
     use arrow::array::*;
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use std::sync::Arc;
 
     #[test]
@@ -335,8 +335,10 @@ mod tests {
         assert!(name.ends_with(".csv"));
     }
 
+    // ─── extract_last_cursor_value: every Arrow type branch ──────
+
     #[test]
-    fn test_extract_cursor_int64() {
+    fn cursor_int64() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -350,7 +352,122 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_cursor_empty() {
+    fn cursor_int32() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![100, 200]))],
+        )
+        .unwrap();
+        assert_eq!(
+            extract_last_cursor_value(&batch, "id", &schema),
+            Some("200".into())
+        );
+    }
+
+    #[test]
+    fn cursor_int16() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int16, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int16Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        assert_eq!(
+            extract_last_cursor_value(&batch, "id", &schema),
+            Some("3".into())
+        );
+    }
+
+    #[test]
+    fn cursor_float64() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "score",
+            DataType::Float64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Float64Array::from(vec![1.5, 2.7]))],
+        )
+        .unwrap();
+        let val = extract_last_cursor_value(&batch, "score", &schema).unwrap();
+        assert!(val.starts_with("2.7"), "got: {val}");
+    }
+
+    #[test]
+    fn cursor_utf8() {
+        let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["aaa", "zzz"]))],
+        )
+        .unwrap();
+        assert_eq!(
+            extract_last_cursor_value(&batch, "key", &schema),
+            Some("zzz".into())
+        );
+    }
+
+    #[test]
+    fn cursor_timestamp_microsecond() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        )]));
+        let micros = 1_700_000_000_000_000i64; // 2023-11-14T22:13:20
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(TimestampMicrosecondArray::from(vec![micros]))],
+        )
+        .unwrap();
+        let val = extract_last_cursor_value(&batch, "ts", &schema).unwrap();
+        assert!(
+            val.starts_with("2023-11-14T22:13:20"),
+            "unexpected ts: {val}"
+        );
+    }
+
+    #[test]
+    fn cursor_date32() {
+        let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, false)]));
+        let days = 19723i32; // 2024-01-01
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Date32Array::from(vec![days]))],
+        )
+        .unwrap();
+        assert_eq!(
+            extract_last_cursor_value(&batch, "d", &schema),
+            Some("2024-01-01".into())
+        );
+    }
+
+    #[test]
+    fn cursor_null_last_row_returns_none() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![Some(1), None]))],
+        )
+        .unwrap();
+        assert_eq!(extract_last_cursor_value(&batch, "id", &schema), None);
+    }
+
+    #[test]
+    fn cursor_missing_column_returns_none() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1]))])
+            .unwrap();
+        assert_eq!(
+            extract_last_cursor_value(&batch, "nonexistent", &schema),
+            None
+        );
+    }
+
+    #[test]
+    fn cursor_empty_batch_returns_none() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -358,5 +475,181 @@ mod tests {
         )
         .unwrap();
         assert_eq!(extract_last_cursor_value(&batch, "id", &schema), None);
+    }
+
+    #[test]
+    fn cursor_unsupported_type_returns_none() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "bin",
+            DataType::Binary,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(BinaryArray::from(vec![b"hello".as_slice()]))],
+        )
+        .unwrap();
+        assert_eq!(extract_last_cursor_value(&batch, "bin", &schema), None);
+    }
+
+    // ─── schema_without_internal / record_batch_without_internal ──
+
+    #[test]
+    fn strip_internal_column_from_schema() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("_rivet_chunk_rn", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]);
+        let result = ExportSink::schema_without_internal(&schema, "_rivet_chunk_rn").unwrap();
+        assert_eq!(result.fields().len(), 2);
+        assert_eq!(result.field(0).name(), "id");
+        assert_eq!(result.field(1).name(), "name");
+    }
+
+    #[test]
+    fn strip_internal_column_missing_errors() {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        assert!(ExportSink::schema_without_internal(&schema, "nonexistent").is_err());
+    }
+
+    #[test]
+    fn strip_internal_column_from_batch() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("_rivet_chunk_rn", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![100, 200])),
+            ],
+        )
+        .unwrap();
+        let stripped =
+            ExportSink::record_batch_without_internal(&batch, "_rivet_chunk_rn").unwrap();
+        assert_eq!(stripped.num_columns(), 1);
+        assert_eq!(stripped.schema().field(0).name(), "id");
+        let ids = stripped
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ids.value(0), 1);
+        assert_eq!(ids.value(1), 2);
+    }
+
+    // ─── quality tracking ────────────────────────────────────────
+
+    #[test]
+    fn track_quality_counts_nulls() {
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![
+                Some("a"),
+                None,
+                None,
+                Some("d"),
+            ]))],
+        )
+        .unwrap();
+
+        let mut sink = minimal_sink_with_quality(vec!["name".into()], vec![]);
+        sink.track_quality(&batch);
+        assert_eq!(sink.quality_null_counts.get("name"), Some(&2));
+    }
+
+    #[test]
+    fn track_quality_counts_uniques() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 1, 3]))])
+                .unwrap();
+
+        let mut sink = minimal_sink_with_quality(vec![], vec!["id".into()]);
+        sink.track_quality(&batch);
+        assert_eq!(sink.quality_unique_sets.get("id").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn run_quality_checks_no_config_returns_empty() {
+        let sink = ExportSink {
+            quality_columns: None,
+            total_rows: 100,
+            ..minimal_sink()
+        };
+        assert!(sink.run_quality_checks().is_empty());
+    }
+
+    #[test]
+    fn run_quality_checks_detects_excess_nulls() {
+        let mut sink = minimal_sink_with_quality(vec!["col".into()], vec![]);
+        sink.quality_columns
+            .as_mut()
+            .unwrap()
+            .null_ratio_max
+            .insert("col".into(), 0.1);
+        sink.total_rows = 100;
+        sink.quality_null_counts.insert("col".into(), 50);
+        let issues = sink.run_quality_checks();
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].message.contains("null ratio"));
+    }
+
+    #[test]
+    fn run_quality_checks_detects_duplicates() {
+        let mut sink = minimal_sink_with_quality(vec![], vec!["id".into()]);
+        sink.total_rows = 5;
+        let mut set = std::collections::HashSet::new();
+        set.insert("1".into());
+        set.insert("2".into());
+        set.insert("3".into());
+        sink.quality_unique_sets.insert("id".into(), set);
+        let issues = sink.run_quality_checks();
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].message.contains("duplicate"));
+    }
+
+    // ─── helpers ─────────────────────────────────────────────────
+
+    fn minimal_sink() -> ExportSink {
+        ExportSink {
+            writer: None,
+            format_type: crate::config::FormatType::Csv,
+            compression: crate::config::CompressionType::None,
+            compression_level: None,
+            tmp: tempfile::NamedTempFile::new().unwrap(),
+            total_rows: 0,
+            part_rows: 0,
+            last_batch: None,
+            schema: None,
+            meta: crate::config::MetaColumns::default(),
+            enriched_schema: None,
+            exported_at_us: 0,
+            quality_null_counts: std::collections::HashMap::new(),
+            quality_unique_sets: std::collections::HashMap::new(),
+            quality_columns: None,
+            max_file_size: None,
+            completed_parts: Vec::new(),
+            strip_internal_column: None,
+        }
+    }
+
+    fn minimal_sink_with_quality(null_cols: Vec<String>, unique_cols: Vec<String>) -> ExportSink {
+        let mut null_ratio_max = std::collections::HashMap::new();
+        for col in &null_cols {
+            null_ratio_max.insert(col.clone(), 0.5);
+        }
+        ExportSink {
+            quality_columns: Some(crate::config::QualityConfig {
+                row_count_min: None,
+                row_count_max: None,
+                null_ratio_max,
+                unique_columns: unique_cols,
+            }),
+            ..minimal_sink()
+        }
     }
 }

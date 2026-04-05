@@ -240,4 +240,137 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert!(issues[0].message.contains("duplicate"));
     }
+
+    // ─── regression: multi-batch aggregation ─────────────────
+
+    #[test]
+    fn null_ratio_multi_batch_aggregates() {
+        let b1 = make_batch(&[Some(1), Some(2)], &[None, Some("b")]);
+        let b2 = make_batch(&[Some(3), Some(4)], &[None, None]);
+        let mut thresholds = HashMap::new();
+        thresholds.insert("name".into(), 0.5);
+        let issues = check_null_ratios(&[b1, b2], &thresholds);
+        assert_eq!(issues.len(), 1, "3/4 nulls > 0.5 threshold");
+    }
+
+    #[test]
+    fn null_ratio_multi_batch_passes_when_sparse() {
+        let b1 = make_batch(&[Some(1), Some(2)], &[Some("a"), Some("b")]);
+        let b2 = make_batch(&[Some(3)], &[None]);
+        let mut thresholds = HashMap::new();
+        thresholds.insert("name".into(), 0.5);
+        let issues = check_null_ratios(&[b1, b2], &thresholds);
+        assert!(issues.is_empty(), "1/3 nulls < 0.5 threshold");
+    }
+
+    #[test]
+    fn uniqueness_multi_batch_detects_cross_batch_dupes() {
+        let b1 = make_batch(&[Some(1), Some(2)], &[Some("a"), Some("b")]);
+        let b2 = make_batch(&[Some(2), Some(3)], &[Some("c"), Some("d")]);
+        let issues = check_uniqueness(&[b1, b2], &["id".into()]);
+        assert_eq!(issues.len(), 1, "id=2 duplicated across batches");
+    }
+
+    #[test]
+    fn uniqueness_empty_batches() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let empty = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(Vec::<Option<i64>>::new())),
+                Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
+            ],
+        )
+        .unwrap();
+        let issues = check_uniqueness(&[empty], &["id".into()]);
+        assert!(issues.is_empty(), "empty batch → no duplicates");
+    }
+
+    #[test]
+    fn null_ratio_empty_batches() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let empty = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(Vec::<Option<i64>>::new())),
+                Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
+            ],
+        )
+        .unwrap();
+        let mut thresholds = HashMap::new();
+        thresholds.insert("name".into(), 0.0);
+        let issues = check_null_ratios(&[empty], &thresholds);
+        assert!(issues.is_empty(), "0 rows → skip");
+    }
+
+    // ─── regression: run_checks integration ──────────────────
+
+    #[test]
+    fn run_checks_combines_all_results() {
+        let batch = make_batch(&[Some(1), Some(1), Some(1)], &[None, None, Some("c")]);
+        let cfg = QualityConfig {
+            row_count_min: Some(100),
+            row_count_max: None,
+            null_ratio_max: {
+                let mut m = HashMap::new();
+                m.insert("name".into(), 0.1);
+                m
+            },
+            unique_columns: vec!["id".into()],
+        };
+        let issues = run_checks(&cfg, &[batch], 3);
+        assert!(
+            issues.len() >= 3,
+            "row_count + null_ratio + uniqueness, got: {}",
+            issues.len()
+        );
+    }
+
+    #[test]
+    fn run_checks_no_issues_when_clean() {
+        let batch = make_batch(
+            &[Some(1), Some(2), Some(3)],
+            &[Some("a"), Some("b"), Some("c")],
+        );
+        let cfg = QualityConfig {
+            row_count_min: Some(1),
+            row_count_max: Some(10),
+            null_ratio_max: {
+                let mut m = HashMap::new();
+                m.insert("name".into(), 0.5);
+                m
+            },
+            unique_columns: vec!["id".into()],
+        };
+        let issues = run_checks(&cfg, &[batch], 3);
+        assert!(issues.is_empty(), "all clean: {:?}", issues);
+    }
+
+    #[test]
+    fn row_count_exact_boundary() {
+        let cfg = QualityConfig {
+            row_count_min: Some(5),
+            row_count_max: Some(5),
+            null_ratio_max: HashMap::new(),
+            unique_columns: vec![],
+        };
+        assert!(check_row_count(5, &cfg).is_empty(), "exactly on boundary");
+        assert!(!check_row_count(4, &cfg).is_empty(), "one below min");
+        assert!(!check_row_count(6, &cfg).is_empty(), "one above max");
+    }
+
+    #[test]
+    fn null_ratio_exact_threshold_passes() {
+        let batch = make_batch(&[Some(1), Some(2)], &[None, Some("b")]);
+        let mut thresholds = HashMap::new();
+        thresholds.insert("name".into(), 0.5);
+        let issues = check_null_ratios(&[batch], &thresholds);
+        assert!(issues.is_empty(), "0.5 == 0.5, not >, so should pass");
+    }
 }

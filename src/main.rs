@@ -215,3 +215,58 @@ fn main() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_params_basic() {
+        let input = vec!["KEY=value".to_string()];
+        let result = parse_params(&input);
+        assert_eq!(result.get("KEY").unwrap(), "value");
+    }
+
+    #[test]
+    fn parse_params_equals_in_value() {
+        let input = vec!["FILTER=x=1 AND y=2".to_string()];
+        let result = parse_params(&input);
+        assert_eq!(result.get("FILTER").unwrap(), "x=1 AND y=2");
+    }
+
+    #[test]
+    fn parse_params_multiple() {
+        let input = vec!["A=1".to_string(), "B=2".to_string()];
+        let result = parse_params(&input);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result.get("A").unwrap(), "1");
+        assert_eq!(result.get("B").unwrap(), "2");
+    }
+
+    #[test]
+    fn parse_params_empty_input() {
+        let result = parse_params(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_params_no_equals_skipped() {
+        let input = vec!["NO_EQUALS_HERE".to_string()];
+        let result = parse_params(&input);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_params_empty_value() {
+        let input = vec!["KEY=".to_string()];
+        let result = parse_params(&input);
+        assert_eq!(result.get("KEY").unwrap(), "");
+    }
+
+    #[test]
+    fn parse_params_duplicate_last_wins() {
+        let input = vec!["K=first".to_string(), "K=second".to_string()];
+        let result = parse_params(&input);
+        assert_eq!(result.get("K").unwrap(), "second");
+    }
+}
