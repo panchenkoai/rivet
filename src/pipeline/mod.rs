@@ -184,7 +184,10 @@ fn reconcile_source_count(
     let base_query = match &export.query {
         Some(q) => q.clone(),
         None => {
-            log::warn!("reconcile: export '{}' has no inline query, skipping", export.name);
+            log::warn!(
+                "reconcile: export '{}' has no inline query, skipping",
+                export.name
+            );
             return;
         }
     };
@@ -196,7 +199,10 @@ fn reconcile_source_count(
     }
 
     let count_sql = format!("SELECT COUNT(*) FROM ({}) AS _rivet_reconcile", query);
-    log::info!("reconcile: running source count query for '{}'", export.name);
+    log::info!(
+        "reconcile: running source count query for '{}'",
+        export.name
+    );
 
     let mut src = match crate::source::create_source(source_config) {
         Ok(s) => s,
@@ -227,14 +233,21 @@ fn reconcile_source_count(
                     );
                 }
             } else {
-                log::warn!("reconcile: could not parse count result '{}' as integer", val);
+                log::warn!(
+                    "reconcile: could not parse count result '{}' as integer",
+                    val
+                );
             }
         }
         Ok(None) => {
             log::warn!("reconcile: COUNT(*) returned NULL for '{}'", export.name);
         }
         Err(e) => {
-            log::warn!("reconcile: count query failed for '{}': {:#}", export.name, e);
+            log::warn!(
+                "reconcile: count query failed for '{}': {:#}",
+                export.name,
+                e
+            );
         }
     }
 }
@@ -490,7 +503,12 @@ pub fn run(
 
     if run_parallel_processes {
         return run_exports_as_child_processes(
-            config_path, &exports, validate, reconcile, resume, params,
+            config_path,
+            &exports,
+            validate,
+            reconcile,
+            resume,
+            params,
         );
     }
 
