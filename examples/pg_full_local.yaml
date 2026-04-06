@@ -1,0 +1,33 @@
+# Rivet Example: PostgreSQL → Full Export → Local Filesystem
+#
+# Use case: daily snapshot of a reference table to local Parquet files.
+# Run:      rivet run -c examples/pg_full_local.yaml --validate --reconcile
+
+source:
+  type: postgres
+  # Replace with your connection string, or use url_env: DATABASE_URL
+  url: "postgresql://rivet_reader:changeme@localhost:5432/mydb"
+
+exports:
+  - name: users_daily
+    # The SQL query to export. Tip: only SELECT columns you need.
+    query: "SELECT id, name, email, role, created_at, updated_at FROM users"
+
+    mode: full                      # re-export all rows every run
+
+    format: parquet                 # parquet or csv
+    compression: zstd               # zstd (default), snappy, gzip, lz4, none
+
+    skip_empty: true                # don't create a file if 0 rows returned
+
+    meta_columns:
+      exported_at: true             # adds _rivet_exported_at column
+
+    destination:
+      type: local
+      path: ./output                # output directory (created if missing)
+
+    # Optional: tuning overrides (omit to use balanced defaults)
+    # tuning:
+    #   profile: safe               # safe / balanced / fast
+    #   batch_size: 5000            # rows per fetch batch

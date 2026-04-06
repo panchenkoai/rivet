@@ -30,6 +30,13 @@ impl S3Destination {
             builder = builder.endpoint(endpoint);
         }
 
+        if let Some(profile) = &config.aws_profile {
+            // SAFETY: S3Destination is constructed before any parallel chunk workers start,
+            // so no concurrent reads of AWS_PROFILE can race with this write.
+            unsafe { std::env::set_var("AWS_PROFILE", profile) };
+            log::info!("S3: using AWS profile '{}'", profile);
+        }
+
         if let Some(env_name) = &config.access_key_env {
             let key = std::env::var(env_name)
                 .map_err(|_| anyhow::anyhow!("env var '{}' not set for S3 access key", env_name))?;

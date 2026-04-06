@@ -1,0 +1,39 @@
+# Rivet Example: MySQL → Incremental Export → Local Parquet
+#
+# Use case: hourly sync of new order rows from MySQL.
+# Run:      rivet run -c examples/mysql_incremental_local.yaml --validate
+
+source:
+  type: mysql
+  url_env: DATABASE_URL
+
+  tuning:
+    profile: balanced
+
+exports:
+  - name: orders_incremental
+    query: >
+      SELECT id, customer_id, product_id, quantity, total_price,
+             status, created_at, updated_at
+      FROM orders
+
+    mode: incremental
+
+    # cursor_column must be monotonically increasing.
+    # For append-only tables, 'id' (auto-increment) works well.
+    # For tables with updates, use 'updated_at'.
+    cursor_column: id
+
+    format: parquet
+    compression: zstd
+
+    skip_empty: true                # no file on runs with no new orders
+
+    quality:
+      row_count_min: 0              # first run OK with 0 new rows
+      unique_columns:
+        - id                        # verify no duplicate IDs
+
+    destination:
+      type: local
+      path: ./output

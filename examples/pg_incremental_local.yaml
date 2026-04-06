@@ -1,0 +1,35 @@
+# Rivet Example: PostgreSQL → Incremental Export → Local Filesystem
+#
+# Use case: nightly sync of new/updated orders. Only rows newer than the
+#           last cursor are exported on each run.
+# Run:      rivet run -c examples/pg_incremental_local.yaml --validate
+
+source:
+  type: postgres
+  url_env: DATABASE_URL             # reads from $DATABASE_URL at runtime
+
+exports:
+  - name: orders_incremental
+    query: "SELECT id, user_id, product, price, status, created_at, updated_at FROM orders"
+
+    mode: incremental
+
+    # cursor_column must be monotonically increasing and present in the SELECT.
+    # Rivet appends: WHERE updated_at > '<last_cursor_value>'
+    cursor_column: updated_at
+
+    format: parquet
+    compression: zstd
+
+    skip_empty: true                # no file if no new rows since last run
+
+    meta_columns:
+      exported_at: true
+
+    destination:
+      type: local
+      path: ./output
+
+    # Useful quality gate: alert if zero or too few rows on first run
+    # quality:
+    #   row_count_min: 1

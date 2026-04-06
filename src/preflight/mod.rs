@@ -39,13 +39,11 @@ pub(crate) struct ExportDiagnostic {
     pub export_name: String,
     pub strategy: String,
     pub mode: String,
-    #[allow(dead_code)]
     pub cursor_column: Option<String>,
     pub row_estimate: Option<i64>,
     pub cursor_min: Option<String>,
     pub cursor_max: Option<String>,
     pub scan_type: Option<String>,
-    #[allow(dead_code)]
     pub uses_index: bool,
     pub verdict: HealthVerdict,
     pub recommended_profile: &'static str,
@@ -98,8 +96,12 @@ fn print_diagnostic(diag: &ExportDiagnostic) {
     if let (Some(min_v), Some(max_v)) = (&diag.cursor_min, &diag.cursor_max) {
         println!("  Cursor range: {} .. {}", min_v, max_v);
     }
+    if let Some(col) = &diag.cursor_column {
+        println!("  Cursor col:   {}", col);
+    }
     if let Some(scan) = &diag.scan_type {
-        println!("  Scan type:    {}", scan);
+        let idx_label = if diag.uses_index { " (indexed)" } else { "" };
+        println!("  Scan type:    {}{}", scan, idx_label);
     }
     println!("  Verdict:      {}", diag.verdict);
     println!(

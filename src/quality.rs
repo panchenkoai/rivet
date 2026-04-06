@@ -1,3 +1,8 @@
+// Functions in this module are called from pipeline::sink, pipeline::mod, and integration tests
+// via the library crate. The binary re-declares this module but does not call all functions
+// directly, producing dead_code warnings only for the bin target.
+#![allow(dead_code)]
+
 use std::collections::{HashMap, HashSet};
 
 use arrow::array::Array;
@@ -13,7 +18,6 @@ pub struct QualityIssue {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Severity {
-    #[allow(dead_code)]
     Warn,
     Fail,
 }
@@ -80,7 +84,6 @@ pub fn check_null_ratios(
     issues
 }
 
-#[allow(dead_code)]
 pub fn check_uniqueness(batches: &[RecordBatch], columns: &[String]) -> Vec<QualityIssue> {
     if columns.is_empty() {
         return Vec::new();
@@ -130,7 +133,6 @@ pub fn check_uniqueness(batches: &[RecordBatch], columns: &[String]) -> Vec<Qual
 }
 
 /// Run all configured quality checks. Returns issues found.
-#[allow(dead_code)]
 pub fn run_checks(
     config: &QualityConfig,
     batches: &[RecordBatch],

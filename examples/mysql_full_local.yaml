@@ -1,0 +1,28 @@
+# Rivet Example: MySQL → Full Export → Local CSV
+#
+# Use case: daily CSV dump of a MySQL reference table.
+# Run:      rivet run -c examples/mysql_full_local.yaml --validate --reconcile
+
+source:
+  type: mysql
+  # Replace with your connection string, or use url_env: DATABASE_URL
+  url: "mysql://rivet_reader:changeme@localhost:3306/mydb"
+
+  tuning:
+    profile: safe                   # conservative: smaller batches, longer timeouts
+    batch_size: 5000
+
+exports:
+  - name: products_daily
+    query: "SELECT id, name, sku, price, category, stock_qty, updated_at FROM products"
+
+    mode: full
+
+    format: csv
+    compression: none               # plain CSV (no compression) for easy inspection
+
+    skip_empty: true
+
+    destination:
+      type: local
+      path: ./output

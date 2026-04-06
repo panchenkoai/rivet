@@ -1,0 +1,34 @@
+# Rivet Example: PostgreSQL → Time-Window Export → Google Cloud Storage
+#
+# Use case: export the last 30 days of events to GCS for analytics.
+#           Each run produces a fresh file with the rolling window.
+# Run:      rivet run -c examples/pg_time_window_gcs.yaml --validate
+
+source:
+  type: postgres
+  url_env: DATABASE_URL
+
+exports:
+  - name: recent_events
+    query: "SELECT id, user_id, event_type, payload, created_at FROM events"
+
+    mode: time_window
+
+    # time_column: the timestamp column Rivet uses to filter.
+    # Rivet appends: WHERE created_at >= NOW() - INTERVAL '30 days'
+    time_column: created_at
+    time_column_type: timestamp     # timestamp (default) or unix
+    days_window: 30                 # rolling window: last 30 days
+
+    format: parquet
+    compression: zstd
+
+    max_file_size: "256MB"          # split into parts if output is large
+
+    destination:
+      type: gcs
+      bucket: my-analytics-bucket   # bucket must already exist
+      prefix: exports/events/
+      # Credentials: uses Application Default Credentials (ADC).
+      # For a service account key, uncomment:
+      # credentials_file: /path/to/service-account.json

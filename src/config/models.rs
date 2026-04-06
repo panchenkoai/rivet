@@ -321,7 +321,6 @@ pub struct DestinationConfig {
     pub credentials_file: Option<String>,
     pub access_key_env: Option<String>,
     pub secret_key_env: Option<String>,
-    #[allow(dead_code)]
     pub aws_profile: Option<String>,
     #[serde(default)]
     pub allow_anonymous: bool,

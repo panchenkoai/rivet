@@ -163,6 +163,50 @@ impl RunSummary {
     }
 }
 
+/// For chunked mode: quality checks (row_count, null_ratio, uniqueness) cannot run per-batch
+/// inside the chunk workers because each chunk has its own `ExportSink`. This gate runs
+/// row_count bounds after all chunks complete. Null/unique checks are warned-and-skipped.
+fn run_chunked_quality_gate(
+    result: Result<()>,
+    export: &ExportConfig,
+    summary: &mut RunSummary,
+) -> Result<()> {
+    result?;
+
+    if export.mode != ExportMode::Chunked {
+        return Ok(());
+    }
+    let qc = match &export.quality {
+        Some(q) => q,
+        None => return Ok(()),
+    };
+
+    let total = summary.total_rows as usize;
+    let row_issues = crate::quality::check_row_count(total, qc);
+    let has_unsupported = !qc.null_ratio_max.is_empty() || !qc.unique_columns.is_empty();
+
+    if has_unsupported {
+        log::warn!(
+            "export '{}': quality checks null_ratio_max and unique_columns are not supported in chunked mode (each chunk processes independently); only row_count bounds are checked",
+            export.name
+        );
+    }
+
+    if !row_issues.is_empty() {
+        for issue in &row_issues {
+            log::warn!("quality FAIL: {}", issue.message);
+        }
+        summary.quality_passed = Some(false);
+        anyhow::bail!(
+            "export '{}': quality checks failed (chunked aggregate)",
+            export.name
+        );
+    }
+
+    summary.quality_passed = Some(true);
+    Ok(())
+}
+
 /// Run `SELECT COUNT(*) FROM ({query})` against the source and compare with exported rows.
 /// Skips reconciliation for incremental exports that used a cursor (moving target).
 fn reconcile_source_count(
@@ -340,6 +384,7 @@ fn run_export_job(
     summary.peak_rss_mb = rss_peak.max(rss_after).max(rss_before) as i64;
 
     let tuning_class = tuning.profile_name().to_string();
+    let result = run_chunked_quality_gate(result, export, &mut summary);
     let failed = result.is_err();
     match &result {
         Ok(()) => {

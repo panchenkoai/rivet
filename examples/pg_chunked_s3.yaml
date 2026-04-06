@@ -1,0 +1,48 @@
+# Rivet Example: PostgreSQL → Chunked Parallel Export → AWS S3
+#
+# Use case: initial load of a large table (millions of rows) to S3.
+#           The table is split into ranges by the primary key (id)
+#           and 4 chunks are processed in parallel.
+# Run:      rivet run -c examples/pg_chunked_s3.yaml --validate --reconcile
+
+source:
+  type: postgres
+  url_env: DATABASE_URL
+
+  tuning:
+    profile: balanced               # global tuning for all exports
+    batch_size: 10000
+
+exports:
+  - name: events_chunked
+    query: "SELECT id, user_id, event_type, payload, created_at FROM events"
+
+    mode: chunked
+
+    # chunk_column: numeric column for range-splitting (typically primary key).
+    # Rivet queries MIN/MAX then creates ranges of chunk_size rows.
+    chunk_column: id
+    chunk_size: 100000              # rows per chunk (default: 100,000)
+    parallel: 4                     # concurrent workers
+
+    # Enable checkpoint to resume after crash (only incomplete chunks re-run)
+    chunk_checkpoint: true
+    chunk_max_attempts: 3           # retry failed chunks up to 3 times
+
+    format: parquet
+    compression: zstd
+
+    destination:
+      type: s3
+      bucket: my-data-lake          # bucket must already exist
+      prefix: exports/events/       # key prefix (folder-like)
+      region: us-east-1
+      # Credentials: uses AWS default chain (IAM role, ~/.aws/credentials, env vars)
+      # For explicit keys, uncomment:
+      # access_key_env: AWS_ACCESS_KEY_ID
+      # secret_key_env: AWS_SECRET_ACCESS_KEY
+
+    # Override tuning for this specific export
+    tuning:
+      batch_size: 5000              # smaller batches for wide payload column
+      throttle_ms: 100

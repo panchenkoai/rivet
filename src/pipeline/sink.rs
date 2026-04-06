@@ -237,12 +237,6 @@ impl BatchSink for ExportSink {
     }
 }
 
-#[allow(dead_code)]
-pub(crate) fn build_file_name(export_name: &str, extension: &str) -> String {
-    let now = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-    format!("{}_{}.{}", export_name, now, extension)
-}
-
 pub(crate) fn extract_last_cursor_value(
     batch: &RecordBatch,
     cursor_column: &str,
@@ -327,13 +321,6 @@ mod tests {
     use arrow::array::*;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use std::sync::Arc;
-
-    #[test]
-    fn test_build_file_name() {
-        let name = build_file_name("users", "csv");
-        assert!(name.starts_with("users_"));
-        assert!(name.ends_with(".csv"));
-    }
 
     // ─── extract_last_cursor_value: every Arrow type branch ──────
 

@@ -31,6 +31,8 @@ Rivet is a CLI tool that exports query results from relational databases to file
 
 **Documentation language:** English-only. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
+> **New to Rivet?** Start with the [Pilot Documentation](docs/) — step-by-step guides for every export mode, destination, and YAML parameter, plus quickstart templates for your first export.
+
 ## Installation
 
 ```bash
@@ -725,6 +727,8 @@ On each retry, a **fresh connection** is created (never reuses a failed connecti
 See [Execution Semantics](#execution-semantics) for detailed lifecycle, state update, duplicate, retry, and validation rules.
 
 ## Development
+
+For **pilot documentation** (per-mode guides, destination setup, annotated YAML examples), see [docs/](docs/).
 
 For a **step-by-step onboarding guide** (from installation to production-ready exports), see [USER_GUIDE.md](USER_GUIDE.md).
 
