@@ -18,7 +18,6 @@ clap = { version = "4", features = ["derive"] }
 csv = "1"
 env_logger = "0.11"
 libc = "0.2"
-mach2 = "0.4"
 log = "0.4"
 mysql = "28"
 opendal = { version = "0.55", features = ["blocking", "services-fs", "services-s3", "services-gcs"] }
@@ -36,6 +35,9 @@ tikv-jemallocator = { version = "0.6", optional = true }
 tokio = { version = "1.50.0", features = ["rt-multi-thread"] }
 reqwest = { version = "0.13.2", features = ["blocking", "json"] }
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2 = "0.4"
 
 [dev-dependencies]
 bytes = "1"
