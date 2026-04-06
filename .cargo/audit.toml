@@ -1,0 +1,8 @@
+# cargo-audit configuration
+# https://github.com/rustsec/rustsec/tree/main/cargo-audit
+
+[advisories]
+# rsa timing sidechannel — transitive via opendal → reqsign; no fix available upstream.
+# Rivet does not use RSA directly; reqsign uses it for cloud auth signing.
+# paste unmaintained — transitive via parquet; no alternative available.
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2024-0436"]

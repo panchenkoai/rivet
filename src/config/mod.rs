@@ -36,7 +36,7 @@ impl Config {
 
     pub fn from_yaml(yaml: &str) -> crate::error::Result<Self> {
         Self::check_misplaced_tuning_fields(yaml)?;
-        let config: Config = serde_yml::from_str(yaml)?;
+        let config: Config = serde_yaml_ng::from_str(yaml)?;
         config.validate()?;
         Ok(config)
     }
@@ -58,7 +58,7 @@ impl Config {
             "profile",
         ];
 
-        let root: serde_yml::Value = serde_yml::from_str(yaml)?;
+        let root: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml)?;
 
         if let Some(source) = root.get("source") {
             let misplaced: Vec<&str> = TUNING_FIELDS
