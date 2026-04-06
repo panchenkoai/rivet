@@ -1,9 +1,18 @@
 name: Release
 
+# Creates a GitHub Release with prebuilt binaries when EITHER:
+#   1) You push a version tag:  git tag v0.2.0-beta.1 && git push origin v0.2.0-beta.1
+#   2) You run this workflow manually (Actions → Release → Run workflow) after the tag exists on GitHub.
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build (e.g. v0.2.0-beta.1) — create & push the tag first"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -15,23 +24,29 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    env:
+      # Correct tag in tarball names when workflow is started manually (GITHUB_REF is then a branch).
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Linux (glibc) — most servers and desktops
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            archive: tar.gz
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            archive: tar.gz
             cross: true
+          # macOS — Apple Silicon + Intel (GitHub-hosted)
           - target: aarch64-apple-darwin
             os: macos-latest
-            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', github.event.inputs.tag) || github.ref }}
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -57,7 +72,7 @@ jobs:
       - name: Package binary
         shell: bash
         run: |
-          tag="${GITHUB_REF#refs/tags/}"
+          tag="${RELEASE_TAG}"
           bin="rivet"
           dir="rivet-${tag}-${{ matrix.target }}"
           mkdir "$dir"
@@ -76,8 +91,12 @@ jobs:
     name: Create GitHub Release
     needs: build
     runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -93,6 +112,8 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
           generate_release_notes: true
           files: |
             artifacts/*.tar.gz
