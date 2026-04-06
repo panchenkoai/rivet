@@ -57,6 +57,10 @@ pub struct RunSummary {
     pub format: String,
     pub mode: String,
     pub compression: String,
+    /// Source COUNT(*) result for reconciliation (None = not requested or not applicable).
+    pub source_count: Option<i64>,
+    /// Whether reconciliation passed (Some(true) = match, Some(false) = mismatch, None = skipped).
+    pub reconciled: Option<bool>,
 }
 
 impl RunSummary {
@@ -86,6 +90,8 @@ impl RunSummary {
             format: format!("{:?}", export.format).to_lowercase(),
             mode: format!("{:?}", export.mode).to_lowercase(),
             compression: format!("{:?}", export.compression).to_lowercase(),
+            source_count: None,
+            reconciled: None,
         }
     }
 
@@ -137,8 +143,98 @@ impl RunSummary {
         if let Some(q) = self.quality_passed {
             eprintln!("  quality:     {}", if q { "pass" } else { "FAIL" });
         }
+        if let Some(reconciled) = self.reconciled {
+            let src = self
+                .source_count
+                .map(|c| c.to_string())
+                .unwrap_or("?".into());
+            if reconciled {
+                eprintln!("  reconcile:   MATCH ({}/{})", self.total_rows, src);
+            } else {
+                eprintln!(
+                    "  reconcile:   MISMATCH (exported {} vs source {})",
+                    self.total_rows, src
+                );
+            }
+        }
         if let Some(err) = &self.error_message {
             eprintln!("  error:       {}", err);
+        }
+    }
+}
+
+/// Run `SELECT COUNT(*) FROM ({query})` against the source and compare with exported rows.
+/// Skips reconciliation for incremental exports that used a cursor (moving target).
+fn reconcile_source_count(
+    source_config: &crate::config::SourceConfig,
+    export: &ExportConfig,
+    params: Option<&std::collections::HashMap<String, String>>,
+    summary: &mut RunSummary,
+) {
+    use crate::config::ExportMode;
+
+    if export.mode == ExportMode::Incremental {
+        log::info!(
+            "reconcile: skipping for incremental export '{}' (cursor-based, count may differ)",
+            export.name
+        );
+        return;
+    }
+
+    let base_query = match &export.query {
+        Some(q) => q.clone(),
+        None => {
+            log::warn!("reconcile: export '{}' has no inline query, skipping", export.name);
+            return;
+        }
+    };
+    let mut query = base_query;
+    if let Some(p) = params {
+        for (k, v) in p {
+            query = query.replace(&format!("${{{}}}", k), v);
+        }
+    }
+
+    let count_sql = format!("SELECT COUNT(*) FROM ({}) AS _rivet_reconcile", query);
+    log::info!("reconcile: running source count query for '{}'", export.name);
+
+    let mut src = match crate::source::create_source(source_config) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("reconcile: could not connect to source: {:#}", e);
+            return;
+        }
+    };
+
+    match src.query_scalar(&count_sql) {
+        Ok(Some(val)) => {
+            if let Ok(count) = val.parse::<i64>() {
+                summary.source_count = Some(count);
+                summary.reconciled = Some(summary.total_rows == count);
+                if summary.total_rows != count {
+                    log::warn!(
+                        "reconcile MISMATCH for '{}': exported {} rows, source has {}",
+                        export.name,
+                        summary.total_rows,
+                        count
+                    );
+                } else {
+                    log::info!(
+                        "reconcile MATCH for '{}': {}/{}",
+                        export.name,
+                        summary.total_rows,
+                        count
+                    );
+                }
+            } else {
+                log::warn!("reconcile: could not parse count result '{}' as integer", val);
+            }
+        }
+        Ok(None) => {
+            log::warn!("reconcile: COUNT(*) returned NULL for '{}'", export.name);
+        }
+        Err(e) => {
+            log::warn!("reconcile: count query failed for '{}': {:#}", export.name, e);
         }
     }
 }
@@ -163,6 +259,7 @@ fn run_export_job(
     state: &StateStore,
     config_dir: &Path,
     validate: bool,
+    reconcile: bool,
     resume: bool,
     params: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<()> {
@@ -244,6 +341,10 @@ fn run_export_job(
         }
     }
 
+    if reconcile && !failed {
+        reconcile_source_count(&config.source, export, params, &mut summary);
+    }
+
     let _ = state.record_metric(
         &summary.export_name,
         &summary.run_id,
@@ -273,6 +374,7 @@ fn run_exports_as_child_processes(
     config_path: &str,
     exports: &[&ExportConfig],
     validate: bool,
+    reconcile: bool,
     resume: bool,
     params: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<()> {
@@ -304,6 +406,9 @@ fn run_exports_as_child_processes(
             .arg(export.name.as_str());
         if validate {
             cmd.arg("--validate");
+        }
+        if reconcile {
+            cmd.arg("--reconcile");
         }
         if resume {
             cmd.arg("--resume");
@@ -349,10 +454,12 @@ fn run_exports_as_child_processes(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     config_path: &str,
     export_name: Option<&str>,
     validate: bool,
+    reconcile: bool,
     resume: bool,
     params: Option<&std::collections::HashMap<String, String>>,
     parallel_exports_cli: bool,
@@ -382,7 +489,9 @@ pub fn run(
         && exports.len() > 1;
 
     if run_parallel_processes {
-        return run_exports_as_child_processes(config_path, &exports, validate, resume, params);
+        return run_exports_as_child_processes(
+            config_path, &exports, validate, reconcile, resume, params,
+        );
     }
 
     let run_parallel = (parallel_exports_cli || config.parallel_exports)
@@ -413,6 +522,7 @@ pub fn run(
                         &state,
                         &config_dir,
                         validate,
+                        reconcile,
                         resume,
                         params,
                     )
@@ -445,6 +555,7 @@ pub fn run(
                 &state,
                 &config_dir,
                 validate,
+                reconcile,
                 resume,
                 params,
             ) {

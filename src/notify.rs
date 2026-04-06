@@ -106,6 +106,8 @@ mod tests {
             format: "parquet".into(),
             mode: "full".into(),
             compression: "zstd".into(),
+            source_count: None,
+            reconciled: None,
         }
     }
 

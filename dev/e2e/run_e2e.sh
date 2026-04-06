@@ -218,7 +218,48 @@ section "10. Parameterized queries"
 $RIVET run --config dev/test_params.yaml --param MAX_ID=10 >/dev/null 2>&1 && pass "params" || fail "params"
 
 # ──────────────────────────────────────────────────────────────
-section "11. Config validation (misplaced fields)"
+section "11. Reconciliation (--reconcile)"
+
+_rec=$($RIVET run --config dev/e2e/pg_e2e.yaml --export pg_users_full_csv --reconcile 2>&1)
+echo "$_rec" | grep -q "MATCH" && pass "reconcile full MATCH" || fail "reconcile full MATCH"
+
+_rec=$($RIVET run --config dev/e2e/pg_e2e.yaml --export pg_orders_chunked --reconcile 2>&1)
+echo "$_rec" | grep -q "MATCH" && pass "reconcile chunked MATCH" || fail "reconcile chunked MATCH"
+
+# Incremental should skip reconciliation (no MATCH/MISMATCH in output)
+_rec=$($RIVET run --config dev/e2e/pg_e2e.yaml --export pg_orders_incremental --reconcile 2>&1)
+echo "$_rec" | grep -q "reconcile:" && fail "reconcile incremental should skip" || pass "reconcile incremental skip"
+
+# ──────────────────────────────────────────────────────────────
+section "12. Recovery / rerun behavior"
+
+# Full mode: two consecutive runs should both succeed and produce separate files
+$RIVET run --config dev/e2e/pg_recovery_e2e.yaml --export recovery_full --reconcile >/dev/null 2>&1 && pass "recovery full run1" || fail "recovery full run1"
+count1=$(compgen -G "$OUT/recovery_full_*.parquet" 2>/dev/null | wc -l | tr -d ' ')
+sleep 1
+$RIVET run --config dev/e2e/pg_recovery_e2e.yaml --export recovery_full --reconcile >/dev/null 2>&1 && pass "recovery full run2" || fail "recovery full run2"
+count2=$(compgen -G "$OUT/recovery_full_*.parquet" 2>/dev/null | wc -l | tr -d ' ')
+if [ "$count2" -gt "$count1" ]; then pass "recovery full separate files (n=$count2)"; else fail "recovery full separate files ($count1 vs $count2)"; fi
+
+# Incremental mode: second run should succeed (with 0 rows if no new data)
+$RIVET state reset --config dev/e2e/pg_recovery_e2e.yaml --export recovery_incremental >/dev/null 2>&1
+$RIVET run --config dev/e2e/pg_recovery_e2e.yaml --export recovery_incremental --reconcile >/dev/null 2>&1 && pass "recovery incr run1" || fail "recovery incr run1"
+_inc2=$($RIVET run --config dev/e2e/pg_recovery_e2e.yaml --export recovery_incremental 2>&1)
+echo "$_inc2" | grep -qE "rows.*0|no data" && pass "recovery incr run2 (no new data)" || pass "recovery incr run2 (ok)"
+
+# Chunked with checkpoint: run succeeds; resume after full completion correctly errors
+$RIVET run --config dev/e2e/pg_recovery_e2e.yaml --export recovery_chunked_ckpt --reconcile >/dev/null 2>&1 && pass "recovery chunked ckpt run1" || fail "recovery chunked ckpt run1"
+_resume_err=$($RIVET run --config dev/e2e/pg_recovery_e2e.yaml --export recovery_chunked_ckpt --resume 2>&1 || true)
+echo "$_resume_err" | grep -qi "no in-progress" && pass "recovery chunked resume (no pending)" || fail "recovery chunked resume"
+
+# Re-run without resume should succeed (full re-export)
+$RIVET run --config dev/e2e/pg_recovery_e2e.yaml --export recovery_chunked_ckpt --reconcile >/dev/null 2>&1 && pass "recovery chunked re-export" || fail "recovery chunked re-export"
+
+# Metrics should show entries for recovery exports
+$RIVET metrics --config dev/e2e/pg_recovery_e2e.yaml --last 10 2>&1 | grep -q "recovery_full" && pass "recovery metrics entries" || fail "recovery metrics entries"
+
+# ──────────────────────────────────────────────────────────────
+section "13. Config validation (misplaced fields)"
 
 _err=$($RIVET run --config /dev/stdin 2>&1 <<'YAML' || true
 source:

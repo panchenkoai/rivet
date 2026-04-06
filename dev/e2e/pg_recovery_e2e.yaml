@@ -1,0 +1,35 @@
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+  tuning:
+    profile: fast
+
+exports:
+  - name: recovery_full
+    query: "SELECT id, name, email FROM users"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/e2e/output
+
+  - name: recovery_incremental
+    query: "SELECT id, user_id, product, quantity, price, status, updated_at FROM orders"
+    mode: incremental
+    cursor_column: updated_at
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/e2e/output
+
+  - name: recovery_chunked_ckpt
+    query: "SELECT id, user_id, product, quantity, price, status, ordered_at FROM orders"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 2000
+    parallel: 2
+    chunk_checkpoint: true
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/e2e/output

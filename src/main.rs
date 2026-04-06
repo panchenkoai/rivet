@@ -41,6 +41,9 @@ enum Commands {
         /// Validate output files after writing
         #[arg(long)]
         validate: bool,
+        /// Reconcile: run COUNT(*) on source query and compare with exported rows
+        #[arg(long)]
+        reconcile: bool,
         /// Resume a chunked export with `chunk_checkpoint: true` (same query/chunk_column/chunk_size)
         #[arg(long)]
         resume: bool,
@@ -155,6 +158,7 @@ fn main() -> Result<()> {
             config,
             export,
             validate,
+            reconcile,
             resume,
             parallel_exports,
             parallel_export_processes,
@@ -166,6 +170,7 @@ fn main() -> Result<()> {
                 &config,
                 export.as_deref(),
                 validate,
+                reconcile,
                 resume,
                 p.as_ref(),
                 parallel_exports,
