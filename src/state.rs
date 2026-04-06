@@ -109,7 +109,7 @@ fn get_current_version(conn: &Connection) -> i64 {
     .unwrap_or(0)
 }
 
-fn migrate(conn: &Connection) {
+fn migrate(conn: &Connection) -> Result<()> {
     ensure_schema_version_table(conn);
 
     let current = get_current_version(conn);
@@ -126,7 +126,6 @@ fn migrate(conn: &Connection) {
             .unwrap_or(false);
 
         if has_export_state {
-            // Legacy DB — add any columns that older versions may lack.
             let metrics_cols = [
                 "files_produced INTEGER DEFAULT 0",
                 "bytes_written INTEGER DEFAULT 0",
@@ -145,13 +144,13 @@ fn migrate(conn: &Connection) {
     for &(ver, sql) in MIGRATIONS {
         if ver > current {
             log::debug!("state: applying migration v{}", ver);
-            if let Err(e) = conn.execute_batch(sql) {
-                log::error!("state: migration v{} failed: {}", ver, e);
-                break;
-            }
-            let _ = conn.execute("INSERT INTO schema_version (version) VALUES (?1)", [ver]);
+            conn.execute_batch(sql)
+                .map_err(|e| anyhow::anyhow!("state: migration v{} failed: {}", ver, e))?;
+            conn.execute("INSERT INTO schema_version (version) VALUES (?1)", [ver])
+                .map_err(|e| anyhow::anyhow!("state: recording migration v{}: {}", ver, e))?;
         }
     }
+    Ok(())
 }
 
 /// One row from `chunk_task` for display / debugging.
@@ -235,7 +234,7 @@ impl StateStore {
         let db_path_buf = db_path.to_path_buf();
         let conn = Connection::open(db_path)?;
         let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
-        migrate(&conn);
+        migrate(&conn)?;
         Ok(Self {
             conn,
             db_path: db_path_buf,
@@ -812,7 +811,7 @@ impl StateStore {
     #[allow(dead_code)] // used by integration tests (tests/*.rs)
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        migrate(&conn);
+        migrate(&conn)?;
         Ok(Self {
             conn,
             db_path: std::path::PathBuf::from(":memory:"),
@@ -1219,8 +1218,8 @@ mod tests {
     #[test]
     fn migration_is_idempotent() {
         let s = store();
-        migrate(&s.conn);
-        migrate(&s.conn);
+        migrate(&s.conn).unwrap();
+        migrate(&s.conn).unwrap();
         let ver = get_current_version(&s.conn);
         assert_eq!(ver, SCHEMA_VERSION);
     }
@@ -1245,7 +1244,7 @@ mod tests {
         )
         .unwrap();
 
-        migrate(&conn);
+        migrate(&conn).unwrap();
 
         let ver = get_current_version(&conn);
         assert_eq!(ver, SCHEMA_VERSION);

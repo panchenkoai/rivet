@@ -715,26 +715,27 @@ fn gen_user(rng: &mut impl Rng, idx: usize) -> (String, String) {
 
 fn gen_timestamp(rng: &mut impl Rng, year_start: i32, year_end: i32) -> String {
     let start = chrono::NaiveDate::from_ymd_opt(year_start, 1, 1)
-        .unwrap()
+        .expect("valid year_start")
         .and_hms_opt(0, 0, 0)
-        .unwrap()
+        .expect("midnight is always valid")
         .and_utc()
         .timestamp();
     let end = chrono::NaiveDate::from_ymd_opt(year_end, 12, 31)
-        .unwrap()
+        .expect("valid year_end")
         .and_hms_opt(23, 59, 59)
-        .unwrap()
+        .expect("23:59:59 is always valid")
         .and_utc()
         .timestamp();
     let ts = rng.random_range(start..=end);
     chrono::DateTime::from_timestamp(ts, 0)
-        .unwrap()
+        .expect("random timestamp within valid range")
         .format("%Y-%m-%d %H:%M:%S")
         .to_string()
 }
 
 fn gen_timestamp_after(rng: &mut impl Rng, base: &str, max_days_after: u32) -> String {
-    let base_dt = chrono::NaiveDateTime::parse_from_str(base, "%Y-%m-%d %H:%M:%S").unwrap();
+    let base_dt = chrono::NaiveDateTime::parse_from_str(base, "%Y-%m-%d %H:%M:%S")
+        .expect("base timestamp must be valid %Y-%m-%d %H:%M:%S");
     let offset_secs = rng.random_range(0..max_days_after as i64 * 86400);
     let result = base_dt + chrono::Duration::seconds(offset_secs);
     result.format("%Y-%m-%d %H:%M:%S").to_string()

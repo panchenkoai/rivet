@@ -11,6 +11,7 @@ pub struct SourceTuning {
     pub retry_backoff_ms: u64,
     pub lock_timeout_s: u64,
     pub memory_threshold_mb: usize,
+    configured_profile: TuningProfile,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +67,7 @@ impl SourceTuning {
             .unwrap_or(TuningProfile::Balanced);
 
         let mut tuning = Self::from_profile(profile);
+        tuning.configured_profile = profile;
 
         if let Some(cfg) = config {
             if let Some(v) = cfg.batch_size {
@@ -106,6 +108,7 @@ impl SourceTuning {
                 retry_backoff_ms: 1_000,
                 lock_timeout_s: 0,
                 memory_threshold_mb: 0,
+                configured_profile: TuningProfile::Fast,
             },
             TuningProfile::Balanced => Self {
                 batch_size: 10_000,
@@ -116,6 +119,7 @@ impl SourceTuning {
                 retry_backoff_ms: 2_000,
                 lock_timeout_s: 30,
                 memory_threshold_mb: 0,
+                configured_profile: TuningProfile::Balanced,
             },
             TuningProfile::Safe => Self {
                 batch_size: 2_000,
@@ -126,17 +130,16 @@ impl SourceTuning {
                 retry_backoff_ms: 5_000,
                 lock_timeout_s: 10,
                 memory_threshold_mb: 0,
+                configured_profile: TuningProfile::Safe,
             },
         }
     }
 
     pub fn profile_name(&self) -> &'static str {
-        if self.throttle_ms == 0 && self.batch_size >= 50_000 {
-            "fast"
-        } else if self.throttle_ms >= 500 || self.batch_size <= 2_000 {
-            "safe"
-        } else {
-            "balanced"
+        match self.configured_profile {
+            TuningProfile::Fast => "fast",
+            TuningProfile::Balanced => "balanced",
+            TuningProfile::Safe => "safe",
         }
     }
 }

@@ -2,723 +2,262 @@
 
 ## Goal
 
-Shift the next phase from “building the extractor core” to **making Rivet predictable, auditable, and ready for real pilot usage**.
+Shift the next phase from "building the extractor core" to **making Rivet predictable, auditable, and ready for real pilot usage**.
 
-This roadmap is based on the current Rivet state:
+---
+
+## Current State (v0.2.0-beta.1, 2026-04-05)
+
+Rivet core is feature-complete for beta:
 
 - PostgreSQL and MySQL streaming extraction
-- Parquet and CSV output
-- Local, S3, and GCS destinations
+- Parquet and CSV output (zstd default, gzip, lz4, snappy, none)
+- Local, S3, GCS, and **stdout** destinations (streaming uploads)
 - full / incremental / chunked / time_window modes
-- preflight check
-- SQLite state
-- metrics history
-- schema tracking
-- retry with reconnect
-- validation
+- File size splitting (`max_file_size`)
+- Parameterized queries (`--param KEY=VALUE`, `${VAR}` expansion)
+- Skip empty exports (`skip_empty: true`)
+- Shell completions (bash, zsh, fish, powershell)
+- Memory-based batch sizing (`batch_size_memory_mb`)
+- jemalloc allocator (default-on, ~30–40% RSS reduction)
+- preflight check with strategy output, profile recommendation, sparse warnings
+- `rivet doctor` for auth diagnostics
+- SQLite state with versioned migrations
+- metrics history, file manifest, chunk checkpoints
+- schema tracking with change detection
+- retry with typed error classification (SQLSTATE / MySQL error codes)
+- validation (`--validate`)
 - safe / balanced / fast tuning profiles
+- Slack notifications (failure, schema_change, degraded)
+- Data quality checks (row count bounds, null ratio, uniqueness)
+- Meta columns for deduplication
+- Misplaced config field detection with fix suggestions
+- **617 tests** (537 unit + 80 integration), zero clippy warnings
+- CI: rustfmt, clippy, test, release build, cargo audit
 
 ---
 
-## Phase 1 — 1 Week
+## Phase 1 — Pilot Alpha Stabilization ✅ COMPLETE
 
-## Milestone W1: Pilot Alpha Stabilization
+All tasks from the original Phase 1 are done.
 
-### Expected outcome
+### Epic A — Auth and Connectivity ✅
 
-By the end of the week, Rivet should have:
+| Task | Status | Notes |
+|------|--------|-------|
+| A1. Credential precedence matrix | ✅ | README §Credential precedence, 4-layer model |
+| A2. GCS ADC support | ✅ | `gcloud auth application-default login` works |
+| A3. GCS explicit JSON credentials | ✅ | `credentials_file` in config, validated at load |
+| A4. DB credential normalization | ✅ | URL and structured config, mutual exclusion check |
+| A5. Auth diagnostics command | ✅ | `rivet doctor` verifies source + all destinations |
 
-- finished auth and credentials flows
-- stronger preflight and planning output
-- frozen execution semantics
-- clear run/export summary
-- scenario-based docs for first pilot users
+### Epic B — Preflight and Planner 2.0 ✅
 
----
+| Task | Status | Notes |
+|------|--------|-------|
+| B1. Selected strategy output | ✅ | Check shows extraction strategy per export |
+| B2. Profile recommendation | ✅ | Recommends safe/balanced/fast with reason |
+| B3. Sparse range warning | ✅ | Chunk sparsity detection + warning |
+| B4. Dense surrogate / sort cost warning | ✅ | Tradeoff explanation in check |
+| B5. Parallel safety hints | ✅ | Memory/concurrency caution in check |
+| B6. Better verdict suggestions | ✅ | 1–3 actionable steps per degraded verdict |
 
-## Epic A — Auth and Connectivity
+### Epic C — Execution Semantics Freeze ✅
 
-### Objective
+| Task | Status | Notes |
+|------|--------|-------|
+| C1. Export lifecycle spec | ✅ | USER_GUIDE §Pipeline architecture |
+| C2. State update point freeze | ✅ | Cursor advances after successful write+upload |
+| C3. Duplicate semantics | ✅ | At-least-once documented, no exactly-once claim |
+| C4. Retry semantics | ✅ | Typed classification, backoff table in docs |
+| C5. Validation semantics | ✅ | Row-count validation scope clearly documented |
 
-Finish authentication and credential flows so Rivet can be used predictably in real environments.
+### Epic D — Observability and Run Summary ✅
 
-#### Tasks
+| Task | Status | Notes |
+|------|--------|-------|
+| D1. Run summary schema | ✅ | name, rows, files, bytes, duration, RSS, retries, verdict |
+| D2. End-of-run summary output | ✅ | Printed after each export |
+| D3. Manifest-style accounting | ✅ | `rivet state files` links files to run_id |
+| D4. Metrics-summary alignment | ✅ | Same identifiers in summary and `rivet metrics` |
 
-- **A1. Credential precedence matrix**
-  - Define source priority order for credentials:
-    - config
-    - environment variables
-    - ADC
-    - file-based credentials
-  - **Acceptance criteria**
-    - One documented precedence order for DB and cloud credentials
-    - No ambiguous fallback behavior
-- **A2. GCS ADC support**
-  - Implement Google Cloud ADC flow
-  - **Acceptance criteria**
-    - Works with `gcloud auth application-default login`
-    - No JSON key file required in ADC mode
-- **A3. GCS explicit JSON credentials**
-  - Support explicit service account file path
-  - **Acceptance criteria**
-    - User can provide JSON credentials file in config or env
-    - Clear error if file missing or invalid
-- **A4. DB credential normalization**
-  - Unify DB auth model for PostgreSQL/MySQL
-  - Support URL and field-based config
-  - **Acceptance criteria**
-    - Both URL and structured config supported
-    - Errors clearly show missing/invalid fields
-- **A5. Auth diagnostics command**
-  - Extend `rivet check` or add `rivet doctor`
-  - **Acceptance criteria**
-    - Can verify source auth
-    - Can verify destination auth
-    - Failure reason is explicit and non-ambiguous
+### Epic E — Documentation Rewrite ✅
 
----
+| Task | Status | Notes |
+|------|--------|-------|
+| E1. README repositioning | ✅ | Lightweight, source-safe, predictable, extract-only |
+| E2. Choosing a mode guide | ✅ | USER_GUIDE §§3,7,8,9 with decision rules |
+| E3. Choosing a profile guide | ✅ | USER_GUIDE §6 with production/replica examples |
+| E4. Auth guide | ✅ | README + USER_GUIDE: GCS ADC/JSON, DB creds, env vars |
+| E5. Guarantees and limitations | ✅ | README §Limitations, no CDC, no exactly-once |
 
-## Epic B — Preflight and Planner 2.0
+### Epic M — Output & CLI Improvements
 
-### Objective
+| Task | Status | Notes |
+|------|--------|-------|
+| M1. Configurable Parquet compression | ✅ | zstd default, snappy/gzip/lz4/none |
+| M2. Skip empty exports | ✅ | `skip_empty: true`, state not advanced |
+| M3. File size splitting | ✅ | `max_file_size: 512MB` |
+| M4. Memory-based batch sizing | ✅ | `batch_size_memory_mb`, clamped [1000, 500000] |
+| M5. Shell completions | ✅ | bash, zsh, fish, powershell |
+| M6. Stdout destination | ✅ | `destination: { type: stdout }` |
+| M7. Parameterized queries | ✅ | `--param KEY=VALUE`, `${VAR}` expansion |
+| M8. Per-column Parquet encoding | ⏳ | Future — not started |
 
-Turn `rivet check` into a real decision tool, not just an EXPLAIN wrapper.
+### Bonus: Completed items not in original roadmap
 
-#### Tasks
-
-- **B1. Selected strategy output**
-  - Show which extraction strategy Rivet will use
-  - Examples:
-    - `incremental_updated_at`
-    - `append_id`
-    - `chunked_range`
-    - `time_window`
-  - **Acceptance criteria**
-    - Each export shows selected strategy in check output
-- **B2. Profile recommendation**
-  - Recommend `safe`, `balanced`, or `fast`
-  - **Acceptance criteria**
-    - Check output includes recommended tuning profile with reason
-- **B3. Sparse range warning**
-  - Detect likely sparse-key chunking issues
-  - **Acceptance criteria**
-    - Warning shown when `max-min` is disproportionately larger than estimated row count
-- **B4. Dense surrogate / sort cost warning**
-  - Warn when dense chunk workaround implies sort or index-ordered scan cost
-  - **Acceptance criteria**
-    - Check output explains tradeoff, not just recommendation
-- **B5. Parallel safety hints**
-  - Warn when parallel mode is risky for wide rows or high memory pressure
-  - **Acceptance criteria**
-    - Check output includes memory/concurrency caution where applicable
-- **B6. Better verdict suggestions**
-  - Improve guidance for `DEGRADED` and `UNSAFE`
-  - **Acceptance criteria**
-    - Each degraded verdict includes 1–3 actionable next steps
+| Item | Notes |
+|------|-------|
+| jemalloc integration | Optional default-on allocator, ~30–40% RSS reduction |
+| Streaming cloud uploads | S3/GCS/stdout use `std::io::copy`, no peak allocation |
+| Misplaced tuning field detection | Config validation with fix suggestions |
+| Versioned SQLite migrations | `schema_version` table, auto-upgrade |
+| Graceful mutex poisoning | `unwrap_or_else` instead of `expect` for mutexes |
+| Typed error classification | Postgres SQLSTATE + MySQL error codes |
+| CI pipeline | 5 GitHub Actions jobs (fmt, clippy, test, build, audit) |
+| 617 tests | Up from ~274, covering golden, regression, config validation |
+| Slack notifications | failure, schema_change, degraded triggers |
+| Data quality checks | Row count, null ratio, uniqueness per export |
+| `cargo publish` packaging | exclude list, license, repository, rust-version |
 
 ---
 
-## Epic C — Execution Semantics Freeze
+## Phase 2 — Pilot Readiness and Battle Testing
 
-### Objective
+### Epic F — Auditability and Correctness Confidence
 
-Clearly define what success means, when state is updated, and what guarantees Rivet provides.
+| Task | Status | Priority | Notes |
+|------|--------|----------|-------|
+| F1. Export audit model | ✅ Partial | P1 | Rows read/written/validated tracked, but no formal reconciliation mode |
+| F2. Bounded source count verification | ⏳ | P1 | Optional `COUNT(*)` for bounded modes |
+| F3. Per-file row counts | ✅ | — | Every file has row_count in state DB |
+| F4. Export reconciliation summary | ⏳ | P1 | `--reconcile` flag: source COUNT vs output rows |
+| F5. Audit mode tradeoff docs | ⏳ | P2 | Document strict vs cheap verification |
 
-#### Tasks
+### Epic G — Real-World Test Harness
 
-- **C1. Export lifecycle spec**
-  - Describe:
-    - query start
-    - batch read
-    - file write
-    - upload
-    - validation
-    - state update
-    - run finalize
-  - **Acceptance criteria**
-    - Lifecycle documented in one canonical place
-- **C2. State update point freeze**
-  - Decide and document when cursor/state moves forward
-  - **Acceptance criteria**
-    - Code and docs match
-    - No ambiguity around successful export checkpoint
-- **C3. Duplicate semantics**
-  - Document where duplicates may appear
-  - **Acceptance criteria**
-    - Overlap/time_window duplicate behavior clearly documented
-    - No implied exactly-once guarantee
-- **C4. Retry semantics**
-  - Document retryable vs permanent errors and reconnect behavior
-  - **Acceptance criteria**
-    - User can understand when Rivet retries and when it fails fast
-- **C5. Validation semantics**
-  - Clarify what `--validate` proves and what it does not prove
-  - **Acceptance criteria**
-    - Row-count validation clearly separated from full correctness guarantees
+| Task | Status | Priority | Notes |
+|------|--------|----------|-------|
+| G1. MinIO in dev environment | ⏳ | P1 | S3-compatible local storage (have fake-gcs-server for GCS) |
+| G2. Network fault injection | ⏳ | P2 | Toxiproxy for timeout/reset/latency simulation |
+| G3. Mutation runner | ✅ Partial | P1 | `seed.rs` inserts, but no update/late-arrive/sparse mutations |
+| G4. Bad source fixtures | ✅ Partial | P1 | `dev/` has many configs; need no-index, huge-text, lock-contention scenarios |
+| G5. Automated E2E matrix | ⏳ | P0 | `run_uat_smoke.sh` exists, need full Docker Compose matrix |
 
----
+### Epic H — Crash and Recovery Battle Tests
 
-## Epic D — Observability and Run Summary
+| Task | Status | Priority | Notes |
+|------|--------|----------|-------|
+| H1. Crash matrix | ⏳ | P1 | Enumerate failure stages |
+| H2. Failure injection hooks | ⏳ | P2 | Force failures at chosen lifecycle points |
+| H3. Recovery integration tests | ⏳ | P1 | Verify rerun behavior after forced crash |
+| H4. Rerun behavior documentation | ✅ Partial | P1 | Chunk resume documented, but not full crash matrix |
 
-### Objective
+### Epic I — Performance and Capacity Envelope
 
-Expose a clear operational summary for every run.
+| Task | Status | Priority | Notes |
+|------|--------|----------|-------|
+| I1. Benchmark datasets | ✅ Partial | P1 | Manual benchmarks done (narrow, wide, 2GB); need standardized fixtures |
+| I2. Benchmark automation | ⏳ | P1 | One-command benchmark suite |
+| I3. Recommended defaults | ✅ | — | USER_GUIDE §6, §17 with scenario guidance |
+| I4. Memory-heavy warnings | ✅ | — | Check includes memory/concurrency warnings |
+| I5. Capacity notes | ✅ Partial | P2 | Memory benchmarks documented; need formalized capacity guide |
 
-#### Tasks
+### Epic J — Product UX Polish
 
-- **D1. Run summary schema**
-  - Define fields:
-    - export name
-    - rows written
-    - files produced
-    - bytes written
-    - duration
-    - peak RSS
-    - retries count
-    - validation result
-    - schema changed yes/no
-    - final verdict
-  - **Acceptance criteria**
-    - Single agreed summary schema exists
-- **D2. End-of-run summary output**
-  - Print one human-readable summary per export run
-  - **Acceptance criteria**
-    - Summary visible in CLI/logs after each run
-- **D3. Manifest-style accounting**
-  - Store export/file accounting details per run
-  - **Acceptance criteria**
-    - Possible to inspect what files were produced by a given run
-- **D4. Metrics-summary alignment**
-  - Align end-of-run summary with `rivet metrics`
-  - **Acceptance criteria**
-    - Same run identifiers and totals line up across both views
+| Task | Status | Priority | Notes |
+|------|--------|----------|-------|
+| J1. Example configs by scenario | ✅ Partial | P1 | `dev/` has many configs; need curated `examples/` directory |
+| J2. Better error messages | ✅ | — | Typed errors, misplaced field detection |
+| J3. "Next action" failure hints | ✅ | — | Troubleshooting section in USER_GUIDE |
+| J4. `rivet doctor` | ✅ | — | Verifies auth + source + destination + config |
+
+### Epic K — First Pilot Rollout
+
+| Task | Status | Priority | Notes |
+|------|--------|----------|-------|
+| K1. Select pilot tables | ✅ | — | content_items (wide), users, orders tested |
+| K2. Repeated pilot runs | ✅ Partial | P1 | Manual runs done; need multi-day automated runs |
+| K3. Feedback template | ⏳ | P2 | Standard pilot feedback form |
+| K4. Pilot findings document | ⏳ | P2 | Top pain points, wins, unsupported patterns |
 
 ---
 
-## Epic E — Documentation Rewrite for Real Scenarios
+## Phase 3 — Release Engineering & Ecosystem
 
-### Objective
+### Epic L — Release and Distribution
 
-Rewrite docs around real usage scenarios instead of just feature lists.
+| Task | Priority | Notes |
+|------|----------|-------|
+| L1. Cross-platform CI builds | P0 | GitHub Actions matrix: Linux x86_64/arm64, macOS arm64, Windows |
+| L2. GitHub Releases with binaries | P0 | Automated tag → release with prebuilt binaries |
+| L3. `cargo publish` to crates.io | P0 | `exclude` already configured in Cargo.toml |
+| L4. Docker image | P1 | `ghcr.io/rivet-data/rivet` — FROM scratch + binary |
+| L5. Homebrew formula | P2 | `brew install rivet-data/tap/rivet` |
 
-#### Tasks
+### Epic N — Advanced Features (post-pilot)
 
-- **E1. README repositioning**
-  - Refocus on:
-    - lightweight
-    - source-safe
-    - predictable
-    - extract-only
-  - **Acceptance criteria**
-    - README opening explains what Rivet is and is not
-- **E2. Choosing a mode guide**
-  - Explain when to use:
-    - full
-    - incremental
-    - chunked
-    - time_window
-  - **Acceptance criteria**
-    - One dedicated doc with practical decision rules
-- **E3. Choosing a profile guide**
-  - Explain when to use:
-    - safe
-    - balanced
-    - fast
-  - **Acceptance criteria**
-    - Clear production vs replica vs dedicated-source examples
-- **E4. Auth guide**
-  - Cover:
-    - GCS ADC
-    - GCS JSON
-    - DB creds
-    - env vars
-  - **Acceptance criteria**
-    - New user can configure auth without reading code
-- **E5. Guarantees and limitations**
-  - Document:
-    - extract-only scope
-    - no CDC
-    - no load/merge
-    - duplicate semantics
-    - no exactly-once promise
-  - **Acceptance criteria**
-    - One explicit document for guarantees and non-goals
+| Task | Priority | Notes |
+|------|----------|-------|
+| N1. Per-column Parquet encoding | P2 | PLAIN, RLE, DELTA_BINARY_PACKED hints |
+| N2. Data shape drift detection | P2 | Track text column max length across runs |
+| N3. Auto-parallel mode | P3 | Heuristic parallelism from mode/source/profile |
+| N4. `deny_unknown_fields` strict mode | P2 | Opt-in strict YAML validation |
+| N5. Webhook destination | P3 | POST batches to HTTP endpoints |
+| N6. Rate limiting | P3 | Configurable QPS/bandwidth cap per source |
+
+### Epic O — Future Vision
+
+| Task | Priority | Notes |
+|------|----------|-------|
+| O1. Delta / CDC mode | P3 | Logical replication or trigger-based change export |
+| O2. Apache Iceberg / Delta Lake output | P3 | Write directly to lakehouse formats |
+| O3. Multi-source joins | P3 | Export data joined across Postgres + MySQL |
+| O4. Encryption at rest | P3 | AES-256 for output files |
+| O5. Prometheus metrics endpoint | P3 | `/metrics` during long-running exports |
+| O6. Plugin system | P3 | Custom source/destination/format via dynamic libraries |
+| O7. Web UI dashboard | P3 | Monitoring exports |
+| O8. ClickHouse / DuckDB source | P3 | Native source connectors |
+| O9. Arrow Flight destination | P3 | Stream directly to consumers |
+| O10. Serverless mode | P3 | AWS Lambda / Cloud Run compatible |
 
 ---
 
-## Epic M — Output & CLI Improvements
+## Suggested Next Execution Order
 
-### Objective
+### Immediate (this week)
 
-Improve output format flexibility, CLI ergonomics, and pipeline integration. Informed by competitive analysis of odbc2parquet and similar tools.
+1. **G5. Automated E2E matrix** — Docker Compose + `cargo test` for Postgres + MySQL end-to-end
+2. **L1. Cross-platform CI builds** — GitHub Actions release workflow
+3. **L2. GitHub Releases** — tag v0.2.0-beta.1 → prebuilt binaries
 
-#### P0 — Quick wins (this week)
+### Next week
 
-- **M1. Configurable Parquet compression**
-  - Replace hardcoded Snappy with configurable compression
-  - Default to **zstd** (better ratio at comparable decompression speed)
-  - Config field: `compression: zstd | snappy | gzip | lz4 | none`
-  - Optional `compression_level` for zstd/gzip/brotli
-  - **Acceptance criteria**
-    - Zstd is the new default for Parquet output
-    - Users can override compression per export
-    - Existing Snappy outputs continue to be readable
-- **M2. Skip empty exports**
-  - Add `skip_empty: true` config option per export
-  - When query returns 0 rows, do not create output file
-  - Incremental mode with no new data is the primary use case
-  - **Acceptance criteria**
-    - No file created when skip_empty is true and 0 rows returned
-    - State is not advanced on empty result
-    - Run summary shows "skipped (0 rows)" instead of error or empty file
+4. **G1. MinIO** — local S3-compatible storage for E2E tests
+5. **F2 + F4. Source count verification + reconciliation summary** — `--reconcile` flag
+6. **H1 + H3. Crash matrix + recovery tests** — enumerate and test failure modes
+7. **J1. Curated example configs** — `examples/` directory with 5 scenario configs
 
-#### P1 — High-value improvements (this week or next)
+### Following weeks
 
-- **M3. File size splitting for full/incremental modes**
-  - Add `max_file_size` config option (e.g. `max_file_size: 512MB`)
-  - Split output into multiple files when threshold reached
-  - Files named `{export}_{timestamp}_part{N}.{ext}`
-  - Currently only chunked mode produces multiple files
-  - **Acceptance criteria**
-    - Full and incremental exports can produce multiple bounded-size files
-    - Downstream tools (Spark, Athena, DuckDB) work well with split output
-    - Default behavior unchanged (single file) when option not set
-- **M4. Memory-based batch sizing**
-  - Add `batch_size_memory` tuning parameter (e.g. `batch_size_memory: 256MB`)
-  - Calculate max rows per batch based on estimated row size
-  - If both `batch_size` and `batch_size_memory` set, use the smaller limit
-  - **Acceptance criteria**
-    - Memory-based limit produces predictable RSS regardless of row width
-    - Works alongside existing row-based batch_size
-    - Logged in run summary: effective batch size used
-- **M5. Shell completions**
-  - Generate completions for bash, zsh, fish, powershell via `clap_complete`
-  - New subcommand: `rivet completions <shell>`
-  - **Acceptance criteria**
-    - Completions generated for all four shells
-    - Installation instructions in README
-
-#### P2 — Pipeline integration (Phase 2)
-
-- **M6. Stdout destination**
-  - Support `destination: stdout` or `--stdout` flag for ad-hoc use
-  - Enables pipe workflows: `rivet run ... --stdout | duckdb`
-  - Single-export only (multi-export to stdout is ambiguous)
-  - **Acceptance criteria**
-    - Parquet/CSV written to stdout when configured
-    - Works with shell pipes
-    - Error/log output goes to stderr (already true)
-- **M7. Parameterized queries**
-  - Support environment variable substitution in queries: `${ENV_VAR}`
-  - Support CLI parameters: `--param start_date=2024-01-01`
-  - Enables dynamic exports without editing YAML
-  - **Acceptance criteria**
-    - Env vars expanded in query and query_file content
-    - CLI params override env vars
-    - Missing required param produces clear error
-
-#### P3 — Advanced (later)
-
-- **M8. Per-column Parquet encoding**
-  - Allow column-specific encoding hints in config
-  - Encodings: PLAIN, RLE, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY
-  - Config format: `column_encodings: { description: delta_length_byte_array }`
-  - **Acceptance criteria**
-    - Column encoding applied when specified
-    - Invalid encoding names produce clear error
-    - Default encoding unchanged when not specified
+8. **I1 + I2. Standardized benchmarks** — automated benchmark suite
+9. **L3. `cargo publish`** — publish to crates.io
+10. **L4. Docker image** — for non-Rust users
+11. **K2. Multi-day pilot runs** — automated repeated exports
+12. **N2. Data shape drift** — text column width tracking
 
 ---
 
-## Suggested Week-1 Execution Order
-
-1. M1 (zstd compression) + M2 (skip empty) — quick wins, immediate value
-2. A1 → A5
-3. B1 → B6
-4. C1 → C5
-5. D1 → D4
-6. E1 → E5
-7. M5 (shell completions) — low effort, nice polish
-
----
-
-## Phase 2 — 1 Month
-
-## Milestone M1: Pilot Readiness and Battle Testing
-
-### Expected outcome
-
-By the end of the month, Rivet should be ready for 2–3 real pilot use cases with clear operational expectations.
-
----
-
-## Epic F — Auditability and Correctness Confidence
-
-### Objective
-
-Improve confidence that exported data matches the intended source slice.
-
-#### Tasks
-
-- **F1. Export audit model**
-  - Define what Rivet can reconcile:
-    - rows read
-    - rows written
-    - rows validated
-    - expected chunk/window count
-  - **Acceptance criteria**
-    - Audit model documented and reflected in code paths
-- **F2. Bounded source count verification**
-  - Add optional `COUNT(*)` for bounded chunk/window scopes where practical
-  - **Acceptance criteria**
-    - Optional source-vs-output count comparison available for bounded modes
-- **F3. Per-file row counts**
-  - Persist row counts at file level
-  - **Acceptance criteria**
-    - Every exported file has row_count recorded
-- **F4. Export reconciliation summary**
-  - Add summary view:
-    - rows seen
-    - rows written
-    - rows validated
-    - mismatch if any
-  - **Acceptance criteria**
-    - Reconciliation output available post-run or via CLI
-- **F5. Audit mode tradeoff docs**
-  - Document strict vs cheap verification modes
-  - **Acceptance criteria**
-    - User understands cost of stronger checks
-
----
-
-## Epic G — Real-World Test Harness
-
-### Objective
-
-Build a local battle-testing lab around Rivet.
-
-#### Tasks
-
-- **G1. MinIO in dev environment**
-  - Add S3-compatible local object storage
-  - **Acceptance criteria**
-    - Full local upload flow works without real AWS
-- **G2. Network fault injection**
-  - Add Toxiproxy or equivalent
-  - **Acceptance criteria**
-    - Can simulate timeout, reset, latency, intermittent failure
-- **G3. Mutation runner**
-  - Generate:
-    - inserts
-    - updates to old rows
-    - late-arriving data
-    - sparse IDs
-    - wide text payloads
-  - **Acceptance criteria**
-    - Reusable mutation script/tool exists
-- **G4. Bad source fixtures**
-  - Add scenarios:
-    - no cursor index
-    - seq scan
-    - huge text rows
-    - connection churn
-    - lock contention
-  - **Acceptance criteria**
-    - These scenarios are reproducible locally
-- **G5. Automated E2E matrix**
-  - Run core scenarios against PG/MySQL + local/MinIO
-  - **Acceptance criteria**
-    - One command triggers repeatable E2E matrix
-
----
-
-## Epic H — Crash and Recovery Battle Tests
-
-### Objective
-
-Make restart and rerun behavior explicit and tested.
-
-#### Tasks
-
-- **H1. Crash matrix**
-  - Enumerate failure stages:
-    - during read
-    - during write
-    - before upload
-    - during upload
-    - before state update
-    - after validation before finalize
-  - **Acceptance criteria**
-    - Crash matrix documented
-- **H2. Failure injection hooks**
-  - Add hooks to force failures at chosen stages
-  - **Acceptance criteria**
-    - Can intentionally crash/abort at selected lifecycle points
-- **H3. Recovery integration tests**
-  - Verify rerun behavior after forced crash
-  - **Acceptance criteria**
-    - Recovery tests exist and pass for key modes
-- **H4. Rerun behavior documentation**
-  - Explain what user should expect after interrupted runs
-  - **Acceptance criteria**
-    - Duplicate/rerun semantics clearly documented
-
----
-
-## Epic I — Performance and Capacity Envelope
-
-### Objective
-
-Turn benchmark results into operational guidance.
-
-#### Tasks
-
-- **I1. Benchmark datasets**
-  - Standardize datasets:
-    - narrow table
-    - wide text table
-    - sparse ID table
-    - hot mutable table
-  - **Acceptance criteria**
-    - Benchmark fixtures are versioned and repeatable
-- **I2. Benchmark automation**
-  - One command to run benchmark suite
-  - **Acceptance criteria**
-    - Benchmark process reproducible across environments
-- **I3. Recommended defaults**
-  - Produce operational guidance for:
-    - safe
-    - balanced
-    - fast
-    - parallel on/off
-  - **Acceptance criteria**
-    - Docs include practical defaults by scenario
-- **I4. Memory-heavy warnings**
-  - Surface warnings for dangerous parallel + wide-row combinations
-  - **Acceptance criteria**
-    - Check/docs/logs warn clearly about memory risk
-- **I5. Capacity notes**
-  - Capture real limits and observations
-  - **Acceptance criteria**
-    - Docs include practical capacity envelope notes
-
----
-
-## Epic J — Product UX Polish
-
-### Objective
-
-Make Rivet easier to adopt and operate without reading the source code.
-
-#### Tasks
-
-- **J1. Example configs by scenario**
-  - Provide configs for:
-    - prod-safe incremental
-    - bad table chunked
-    - late-data time window
-    - local → GCS
-    - local → S3 / MinIO
-  - **Acceptance criteria**
-    - Scenario examples are runnable and documented
-- **J2. Better error messages**
-  - Improve fatal/retryable error text
-  - **Acceptance criteria**
-    - Auth/permanent errors do not look retryable
-    - Retryable errors explain next attempt behavior
-- **J3. “Next action” failure hints**
-  - Add fix suggestions to common failures
-  - **Acceptance criteria**
-    - User sees suggested next step for common failures
-- **J4. `rivet doctor` or extended check mode**
-  - Centralize sanity checks
-  - **Acceptance criteria**
-    - One command helps diagnose auth + source + destination + config issues
-
----
-
-## Epic K — First Pilot Rollout
-
-### Objective
-
-Run Rivet against a small number of real candidate tables and capture feedback.
-
-#### Tasks
-
-- **K1. Select pilot tables**
-  - Choose at least:
-    - one mutable table with `updated_at`
-    - one bad table needing chunked/range
-    - one wide/text-heavy table
-  - **Acceptance criteria**
-    - 2–3 pilot candidates selected and documented
-- **K2. Repeated pilot runs**
-  - Run for several days
-  - **Acceptance criteria**
-    - Repeated exports completed and tracked
-- **K3. Feedback template**
-  - Capture:
-    - source load acceptable?
-    - result trustworthy?
-    - config understandable?
-    - failures understandable?
-  - **Acceptance criteria**
-    - Standard pilot feedback form exists
-- **K4. Pilot findings document**
-  - Summarize:
-    - top pain points
-    - top wins
-    - unsupported patterns
-    - next fixes
-  - **Acceptance criteria**
-    - Findings doc produced after first pilot cycle
-
----
-
-## Suggested Month Execution Order
-
-### Week 2
-
-- M3 (file size splitting) + M4 (memory-based batch sizing)
-- F1 → F5
-- G1 → G3
-
-### Week 3
-
-- M6 (stdout destination) + M7 (parameterized queries)
-- G4 → G5
-- H1 → H4
-
-### Week 4
-
-- I1 → I5
-- J1 → J4
-- K1 → K4
-
----
-
-## Priorities
-
-### P0 — Start now
-
-- Zstd compression (M1) — immediate file size win
-- Skip empty exports (M2) — immediate UX win
-- Auth and credentials
-- Preflight 2.0
-- Execution semantics
-- Run summary and accounting
-- Docs rewrite
-- Crash/recovery foundation
-
-### P1 — Next layer
-
-- File size splitting (M3)
-- Memory-based batch sizing (M4)
-- Shell completions (M5)
-- Auditability and reconciliation
-- MinIO and fault injection
-- Mutation runner
-- Benchmark harness
-- Product UX polish
-
-### P2 — After first pilots
-
-- Stdout destination (M6)
-- Parameterized queries (M7)
-- Notifications
-- Data quality checks
-- More advanced audit modes
-- Planner intelligence improvements
-
-### P3 — Future
-
-- Per-column Parquet encoding (M8)
-- Insert / load (Parquet → DB)
-
----
-
-### New Story — Recommended parallelism guidance
-
-**User story**  
-As an operator, I want Rivet to suggest a safe and useful parallelism level, so I can improve throughput without guessing and without overloading the source.
-
-**Why it matters**
-Real-world pipelines often get meaningful gains from better parallelism defaults alone. Safe performance tuning is valuable, especially when users do not want to hand-tune every export.
-
-**Tasks**
-
-- Derive recommended parallelism from mode, source, profile, and table shape
-- Surface parallelism recommendation in `rivet check`
-- Distinguish:
-  - parallelism not recommended
-  - conservative parallelism
-  - performance-oriented parallelism
-- Document that gains depend on source health, index quality, and row width
-
-### Future Story — Auto parallel mode
-
-**User story**  
-As a user, I want Rivet to auto-select a reasonable parallelism level for chunked/range exports, so I do not have to tune thread counts manually.
-
-**Tasks**
-
-- Design heuristic for auto parallelism
-- Bound chosen parallelism by tuning profile
-- Respect memory thresholds and wide-row risk
-- Expose final chosen concurrency in logs and run summary
-
----
-
-## Definition of Done for Pilot-Ready
-
-Rivet is considered ready for first battle tests when:
-
-- Auth is predictable and documented
-- `rivet check` gives actionable strategy and safety guidance
-- Execution semantics are frozen and documented
-- Run summary and basic reconciliation exist
-- Crash/recovery behavior is tested
-- Local battle lab exists (MinIO + faults + mutation scenarios)
-- Docs explain real scenarios, not only features
-- 2–3 pilot tables have been run repeatedly for multiple days
-
----
-
-## First Tasks to Start Today
-
-- M1. Configurable Parquet compression (zstd default) — fastest win
-- M2. Skip empty exports — quick UX improvement
-- A1. Credential precedence matrix
-- A2. GCS ADC support
-- A3. GCS explicit JSON credentials
-- B1. Selected strategy output in `rivet check`
-- B2. Profile recommendation in `rivet check`
-- C1. Export lifecycle spec
-- C2. State update point freeze
-- D1. Run summary schema
-- D2. End-of-run summary output
-- E5. Guarantees and limitations document
-- M5. Shell completions
-
-### New Story — Data shape drift detection for growing text columns
-
-**User story**  
-As an operator, I want Rivet to detect when text/string columns grow significantly in observed length, so downstream schemas and load jobs do not fail unexpectedly.
-
-**Why it matters**
-This is not classic schema drift, but it is still a real operational risk:
-
-- downstream targets may have narrower varchar/text assumptions
-- row width and memory pressure can grow sharply
-- file size and load behavior can degrade without any visible schema change
-
-**Tasks**
-
-- Add optional observed max length tracking for text/string/json columns
-- Compare observed max length with previous runs
-- Emit warning on significant width growth
-- Surface width-growth warning in run summary / schema summary
-- Document difference between structural schema drift and data shape drift
-
----
-
+## Definition of Done for Stable Release (v0.2.0)
+
+- [ ] Auth is predictable and documented ✅
+- [ ] `rivet check` gives actionable strategy and safety guidance ✅
+- [ ] Execution semantics are frozen and documented ✅
+- [ ] Run summary and basic reconciliation exist ✅ (reconciliation partial)
+- [ ] Crash/recovery behavior is tested ⏳
+- [ ] Local battle lab exists (MinIO + faults + mutation) ⏳
+- [ ] Docs explain real scenarios, not only features ✅
+- [ ] 2–3 pilot tables have been run repeatedly ✅ (manual)
+- [ ] Cross-platform release binaries available ⏳
+- [ ] E2E test matrix passes ⏳
+- [ ] Published to crates.io ⏳

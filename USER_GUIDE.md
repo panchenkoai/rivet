@@ -6,7 +6,9 @@ A step-by-step guide from zero to production-ready exports. Follow this path to 
 
 ## 1. Installation
 
-Rivet is a single binary written in Rust.
+Rivet is a single binary written in Rust. The repository includes a
+`rust-toolchain.toml` that pins the toolchain to **Rust 1.94** — `rustup` will
+install it automatically on first build.
 
 ```bash
 # Clone and install
@@ -15,6 +17,16 @@ cargo install --path .
 
 # Verify
 rivet --help
+rivet --version    # should print 0.2.0-beta.1
+```
+
+**Memory allocator:** Rivet ships with **jemalloc** enabled by default (feature
+`jemalloc`). jemalloc aggressively returns freed memory to the OS, which is
+especially beneficial for large exports where batch processing can otherwise
+cause the system allocator to retain pages. To build without jemalloc:
+
+```bash
+cargo install --path . --no-default-features
 ```
 
 **Optional:** enable shell completions:
@@ -254,7 +266,24 @@ exports:
 Rules:
 
 - `batch_size` and `batch_size_memory_mb` are **mutually exclusive** in the **effective** config (after merge). Rivet rejects the config if both appear across source + export.
-- The run summary’s `tuning:` line shows the **YAML profile label** (`fast`, `balanced`, `safe`, or `balanced (default)`); SQLite metrics still store the heuristic profile name derived from behavior.
+- The run summary and SQLite metrics both show the **configured profile** (`fast`, `balanced`, `safe`, or `balanced (default)`).
+
+> **Common mistake — misplaced tuning fields.** If you accidentally write
+> `batch_size` (or `profile`, `throttle_ms`, etc.) directly under `source:`
+> instead of `source.tuning:`, YAML silently ignores unknown keys and Rivet
+> falls back to defaults. Since v0.2.0-beta.1, Rivet **detects this** and
+> prints a clear error with a fix suggestion:
+>
+> ```
+> source: field(s) [batch_size] belong under 'source.tuning:',
+> not directly under 'source:'. Example:
+>   source:
+>     tuning:
+>       batch_size: <value>
+> ```
+>
+> The same check applies to tuning fields placed directly in an `exports[]`
+> entry instead of inside `exports[].tuning:`.
 
 ---
 
@@ -759,6 +788,27 @@ batch_size_memory_mb=256: estimated row ~266B, computed batch_size=500000
 
 > **Note:** `batch_size` and `batch_size_memory_mb` are mutually exclusive. Specify one or the other.
 
+### Memory optimization tips
+
+Peak RSS during an export is primarily driven by `batch_size` — each batch
+holds all fetched rows in memory as both raw database rows and Arrow arrays.
+For memory-constrained environments:
+
+| Scenario | Recommended setting | Expected peak RSS |
+|----------|-------------------|------------------|
+| Wide tables (100+ columns, text/json) | `batch_size: 1000` | ~400–500 MB per 2 GB table |
+| Narrow tables, fast replica | `batch_size: 50000` | Higher RSS, maximum throughput |
+| Memory-limited container (512 MB) | `batch_size_memory_mb: 128` | Auto-tuned to fit |
+
+**Why jemalloc matters:** The default macOS/glibc allocator retains freed pages,
+causing RSS to stay high even after a batch is processed. With jemalloc (enabled
+by default), freed memory is returned to the OS between batches, reducing peak
+RSS by ~30–40% at smaller batch sizes.
+
+**Cloud uploads are streamed.** Temporary files are uploaded to S3/GCS via
+streaming I/O (`std::io::copy`), so upload does not add the file size to peak
+memory. This was a significant improvement in v0.2.0-beta.1.
+
 ---
 
 ## 18. File size splitting
@@ -844,6 +894,7 @@ Available triggers:
 
 ```bash
 rivet metrics --config rivet.yaml --last 10
+rivet metrics --config rivet.yaml --export orders   # filter by export name
 ```
 
 Output:
@@ -860,6 +911,8 @@ orders_incremental   skipped           0       12ms      8MB      0          - o
 
 ```bash
 rivet state files --config rivet.yaml
+rivet state files --config rivet.yaml --export orders   # filter by export
+rivet state files --config rivet.yaml --last 50         # limit rows (default: 50)
 ```
 
 Shows every file ever produced, linked to its `run_id` — useful for auditing.
@@ -906,7 +959,10 @@ RUST_LOG=debug rivet run --config rivet.yaml     # full detail
 
 ## 21. Scheduling with cron
 
-Rivet has no built-in scheduler. Use cron, systemd timers, or Airflow:
+Rivet has no built-in scheduler. Use cron, systemd timers, or Airflow.
+
+`rivet run` exits with **non-zero** on any export failure, so standard cron
+error-mail and orchestrator alerting work out of the box:
 
 ```cron
 # Every 15 minutes: incremental orders + events
@@ -936,6 +992,11 @@ The summary shows `schema: CHANGED` and the flag is persisted in metrics. No act
 ---
 
 ## 23. Error handling and retries
+
+**Exit codes:** `rivet run` exits with **non-zero** when any export fails, making
+it safe to use with cron, CI pipelines, and orchestrators that check `$?`. When
+multiple exports run in parallel, all are attempted and the process exits with an
+error only after collecting results from every export.
 
 Rivet classifies errors automatically:
 
@@ -1005,6 +1066,57 @@ Before deploying Rivet to production, verify each item:
 
 ---
 
+## 25. Troubleshooting
+
+### Config loads but tuning has no effect
+
+Tuning fields (`batch_size`, `profile`, `throttle_ms`, etc.) must be nested
+under `source.tuning:` or `exports[].tuning:`. Placing them directly under
+`source:` silently ignores them in older versions. Since v0.2.0-beta.1, Rivet
+detects this and prints a clear error. See §6 for the correct nesting.
+
+### High memory usage during export
+
+1. Lower `batch_size` (e.g. 1000–5000) — this is the single biggest lever.
+2. Ensure jemalloc is enabled (`cargo install --path .` uses it by default).
+3. Use `batch_size_memory_mb` instead of a fixed `batch_size` when row width
+   varies (see §17).
+4. Check that `tuning:` is in the right place (see above) — a misplaced config
+   causes fallback to the default `batch_size=10000`.
+
+### `rivet doctor` shows `[FAIL]` for a destination
+
+- **S3:** check that `access_key_env` / `secret_key_env` are set and the IAM
+  user has `s3:PutObject` + `s3:GetObject` on the bucket prefix.
+- **GCS:** run `gcloud auth application-default login` or set
+  `credentials_file` to a service account JSON. For anonymous access (e.g.
+  fake-gcs-server), set `allow_anonymous: true`.
+- **Local:** check that the output directory exists and is writable.
+
+### Export succeeds but produces zero rows
+
+- Run `rivet check` to verify the query returns data.
+- For incremental mode, check the cursor state: `rivet state show`. If the
+  cursor is ahead of all data, reset it: `rivet state reset --export <name>`.
+- For chunked mode, check chunk status: `rivet state chunks --export <name>`.
+  Completed chunks are skipped; use `--resume` or `reset-chunks` to re-export.
+
+### Retries exhaust and export fails
+
+- Check `RUST_LOG=debug` output for the specific error classification.
+- Switch to `profile: safe` (5 retries, 5s backoff) for unstable sources.
+- For "too many connections" errors, add `throttle_ms: 500` or reduce
+  `parallel` in chunked exports.
+
+### Schema change warning after database migration
+
+Rivet stores the column schema from the last successful run. If columns are
+added, removed, or retyped, the next run logs a warning and fires a
+`schema_change` notification (if configured). The export continues with the
+new schema. Review the change and update downstream consumers accordingly.
+
+---
+
 ## Quick reference
 
 | Task | Command |
@@ -1023,7 +1135,9 @@ Before deploying Rivet to production, verify each item:
 | Chunk checkpoint status | `rivet state chunks --config rivet.yaml --export big_table` |
 | Clear chunk plan | `rivet state reset-chunks --config rivet.yaml --export big_table` |
 | View run history | `rivet metrics --config rivet.yaml --last 10` |
+| View run history for one export | `rivet metrics --config rivet.yaml --export orders` |
 | View file manifest | `rivet state files --config rivet.yaml` |
+| View files for one export | `rivet state files --config rivet.yaml --export orders --last 50` |
 | Enable logging | `RUST_LOG=info rivet run --config rivet.yaml` |
 
 ---

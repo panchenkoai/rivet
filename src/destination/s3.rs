@@ -65,8 +65,10 @@ impl S3Destination {
 impl super::Destination for S3Destination {
     fn write(&self, local_path: &Path, remote_key: &str) -> Result<()> {
         let key = format!("{}{}", self.prefix, remote_key);
-        let data = std::fs::read(local_path)?;
-        self.op.write(&key, data)?;
+        let mut src = std::fs::File::open(local_path)?;
+        let mut dst = self.op.writer(&key)?.into_std_write();
+        std::io::copy(&mut src, &mut dst)?;
+        dst.close()?;
         log::info!("uploaded s3://{}", key);
         Ok(())
     }

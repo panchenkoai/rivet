@@ -497,7 +497,7 @@ pub(super) fn run_chunked_parallel(
                         dest.write(sink.tmp.path(), &file_name)?;
                         file_records
                             .lock()
-                            .expect("file_records mutex poisoned")
+                            .unwrap_or_else(|e| e.into_inner())
                             .push((file_name, sink.total_rows as i64, file_bytes as i64));
                     }
 
@@ -518,7 +518,7 @@ pub(super) fn run_chunked_parallel(
                     log::error!("export '{}': chunk {} failed: {:#}", export_name, i, e);
                     errors
                         .lock()
-                        .expect("errors mutex poisoned")
+                        .unwrap_or_else(|e| e.into_inner())
                         .push(format!("chunk {}: {:#}", i, e));
                 }
             });
@@ -534,10 +534,7 @@ pub(super) fn run_chunked_parallel(
 
     let fmt_name = format!("{:?}", export.format).to_lowercase();
     let comp_name = format!("{:?}", export.compression).to_lowercase();
-    for (fname, rows, bytes) in file_records
-        .into_inner()
-        .expect("file_records mutex poisoned")
-    {
+    for (fname, rows, bytes) in file_records.into_inner().unwrap_or_else(|e| e.into_inner()) {
         let _ = state.record_file(
             &summary.run_id,
             &export.name,
@@ -549,7 +546,7 @@ pub(super) fn run_chunked_parallel(
         );
     }
 
-    let errs = errors.into_inner().expect("errors mutex poisoned");
+    let errs = errors.into_inner().unwrap_or_else(|e| e.into_inner());
     if !errs.is_empty() {
         anyhow::bail!(
             "export '{}': {} chunks failed:\n{}",
@@ -981,7 +978,7 @@ pub(super) fn run_chunked_parallel_checkpoint(
                         Err(e) => {
                             errors
                                 .lock()
-                                .expect("errors mutex poisoned")
+                                .unwrap_or_else(|e| e.into_inner())
                                 .push(format!("claim error: {:#}", e));
                             break;
                         }
@@ -1146,7 +1143,7 @@ pub(super) fn run_chunked_parallel_checkpoint(
                             );
                             errors
                                 .lock()
-                                .expect("errors mutex poisoned")
+                                .unwrap_or_else(|e| e.into_inner())
                                 .push(format!("chunk {}: {}", chunk_index, msg));
                         }
                     }
@@ -1162,7 +1159,7 @@ pub(super) fn run_chunked_parallel_checkpoint(
         summary.validated = Some(true);
     }
 
-    let errs = errors.into_inner().expect("errors mutex poisoned");
+    let errs = errors.into_inner().unwrap_or_else(|e| e.into_inner());
     if !errs.is_empty() {
         anyhow::bail!(
             "export '{}': parallel checkpoint worker errors:\n{}",

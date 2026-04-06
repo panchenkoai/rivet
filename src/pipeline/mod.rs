@@ -165,7 +165,7 @@ fn run_export_job(
     validate: bool,
     resume: bool,
     params: Option<&std::collections::HashMap<String, String>>,
-) {
+) -> Result<()> {
     let merged = merge_tuning_config(config.source.tuning.as_ref(), export.tuning.as_ref());
     let tuning = SourceTuning::from_config(merged.as_ref());
     let yaml_profile_label = match merged.as_ref().and_then(|t| t.profile) {
@@ -230,6 +230,7 @@ fn run_export_job(
     summary.peak_rss_mb = rss_peak.max(rss_after).max(rss_before) as i64;
 
     let tuning_class = tuning.profile_name().to_string();
+    let failed = result.is_err();
     match &result {
         Ok(()) => {
             if summary.status == "running" {
@@ -263,6 +264,8 @@ fn run_export_job(
 
     summary.print();
     crate::notify::maybe_send(config.notifications.as_ref(), &summary);
+
+    if failed { result } else { Ok(()) }
 }
 
 /// Re-invoke this binary once per export. Children do not inherit parallel flags, so there is no recursion.
@@ -391,7 +394,7 @@ pub fn run(
             "running {} exports in parallel (separate state DB connection per export)",
             exports.len()
         );
-        let mut state_errors: Vec<anyhow::Error> = Vec::new();
+        let mut export_errors: Vec<anyhow::Error> = Vec::new();
         std::thread::scope(|s| {
             let mut handles = Vec::new();
             for &export in &exports {
@@ -412,20 +415,19 @@ pub fn run(
                         validate,
                         resume,
                         params,
-                    );
-                    Ok::<(), anyhow::Error>(())
+                    )
                 }));
             }
             for h in handles {
                 match h.join() {
                     Ok(Ok(())) => {}
-                    Ok(Err(e)) => state_errors.push(e),
+                    Ok(Err(e)) => export_errors.push(e),
                     Err(payload) => std::panic::resume_unwind(payload),
                 }
             }
         });
-        if !state_errors.is_empty() {
-            let text = state_errors
+        if !export_errors.is_empty() {
+            let text = export_errors
                 .into_iter()
                 .map(|e| format!("{e:#}"))
                 .collect::<Vec<_>>()
@@ -434,8 +436,9 @@ pub fn run(
         }
     } else {
         let state = StateStore::open(config_path)?;
-        for export in exports {
-            run_export_job(
+        let mut failures = Vec::new();
+        for export in &exports {
+            if let Err(e) = run_export_job(
                 config_path,
                 &config,
                 export,
@@ -444,7 +447,12 @@ pub fn run(
                 validate,
                 resume,
                 params,
-            );
+            ) {
+                failures.push(format!("{:#}", e));
+            }
+        }
+        if !failures.is_empty() {
+            anyhow::bail!("{}", failures.join("; "));
         }
     }
 

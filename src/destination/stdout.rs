@@ -13,10 +13,10 @@ impl StdoutDestination {
 
 impl super::Destination for StdoutDestination {
     fn write(&self, local_path: &Path, _remote_key: &str) -> Result<()> {
-        let data = std::fs::read(local_path)?;
+        let mut src = std::fs::File::open(local_path)?;
         let stdout = std::io::stdout();
         let mut handle = stdout.lock();
-        handle.write_all(&data)?;
+        std::io::copy(&mut src, &mut handle)?;
         handle.flush()?;
         Ok(())
     }

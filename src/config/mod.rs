@@ -35,9 +35,73 @@ impl Config {
     }
 
     pub fn from_yaml(yaml: &str) -> crate::error::Result<Self> {
-        let config: Config = serde_yaml::from_str(yaml)?;
+        Self::check_misplaced_tuning_fields(yaml)?;
+        let config: Config = serde_yml::from_str(yaml)?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Detect tuning-related fields placed directly under `source:` or an
+    /// `exports[]` entry instead of inside the `tuning:` sub-key. Without this
+    /// check serde silently ignores unknown keys and the user gets unexpected
+    /// defaults (e.g. batch_size=10 000 instead of the intended 1 000).
+    fn check_misplaced_tuning_fields(yaml: &str) -> crate::error::Result<()> {
+        const TUNING_FIELDS: &[&str] = &[
+            "batch_size",
+            "batch_size_memory_mb",
+            "throttle_ms",
+            "statement_timeout_s",
+            "max_retries",
+            "retry_backoff_ms",
+            "lock_timeout_s",
+            "memory_threshold_mb",
+            "profile",
+        ];
+
+        let root: serde_yml::Value = serde_yml::from_str(yaml)?;
+
+        if let Some(source) = root.get("source") {
+            let misplaced: Vec<&str> = TUNING_FIELDS
+                .iter()
+                .copied()
+                .filter(|&f| source.get(f).is_some())
+                .collect();
+            if !misplaced.is_empty() {
+                anyhow::bail!(
+                    "source: field(s) [{}] belong under 'source.tuning:', not directly under 'source:'. \
+                     Example:\n  source:\n    tuning:\n      {}: <value>",
+                    misplaced.join(", "),
+                    misplaced[0],
+                );
+            }
+        }
+
+        if let Some(exports) = root.get("exports").and_then(|e| e.as_sequence()) {
+            for (i, export) in exports.iter().enumerate() {
+                let name = export
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("<unnamed>");
+                let misplaced: Vec<&str> = TUNING_FIELDS
+                    .iter()
+                    .copied()
+                    .filter(|&f| export.get(f).is_some())
+                    .collect();
+                if !misplaced.is_empty() {
+                    anyhow::bail!(
+                        "export '{}' (index {}): field(s) [{}] belong under 'exports[].tuning:', \
+                         not directly in the export. Example:\n  exports:\n    - name: {}\n      tuning:\n        {}: <value>",
+                        name,
+                        i,
+                        misplaced.join(", "),
+                        name,
+                        misplaced[0],
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn validate(&self) -> crate::error::Result<()> {

@@ -369,6 +369,15 @@ destination:
 
 **GCS -- credentials:** see [Credential precedence](#credential-precedence). For day-to-day use on a workstation with a Google Cloud project, run `gcloud auth application-default login` and omit `credentials_file`; Rivet then uses **Application Default Credentials** (ADC).
 
+**Stdout (pipe to another tool):**
+
+```yaml
+destination:
+  type: stdout
+```
+
+Writes file contents directly to stdout. Useful for piping into `gzip`, `aws s3 cp -`, or other streaming consumers. Only practical with a single export (multiple exports would interleave output).
+
 ## Credential precedence
 
 Rivet uses one predictable model for *where* secrets come from. Think of four layers (highest priority first). A higher layer **wins** when it applies; Rivet does **not** merge multiple cloud credential sources for the same destination.
@@ -747,11 +756,21 @@ The seed tool supports flags:
 --mysql-url URL                 # MySQL connection URL
 ```
 
+### Toolchain
+
+The project pins Rust **1.94** via `rust-toolchain.toml`. Install with:
+
+```bash
+rustup install 1.94
+```
+
 ### Running Tests
 
 ```bash
-cargo test              # unit + integration tests (no database needed)
+cargo test              # 617 unit + integration tests (no database needed)
 cargo test -- --nocapture  # with output
+cargo clippy --all-targets -- -D warnings  # lint check
+cargo fmt --all -- --check                 # format check
 ```
 
 End-to-end scripts (Docker Compose must be up, `rivet` built):
@@ -760,3 +779,27 @@ End-to-end scripts (Docker Compose must be up, `rivet` built):
 bash dev/test_permissions.sh
 bash dev/test_schema_evolution.sh
 ```
+
+### CI
+
+GitHub Actions runs on every push/PR to `master`/`main`:
+
+- **Rustfmt** — formatting check
+- **Clippy** — lint check with `-D warnings`
+- **Tests** — full test suite
+- **Release build** — ensures `cargo build --release` succeeds
+- **Security audit** — `cargo audit` via `rustsec/audit-check`
+
+---
+
+## Roadmap
+
+See [rivet_roadmap_v3.md](rivet_roadmap_v3.md) for the full roadmap with task breakdown.
+
+**Next milestones:**
+
+| Milestone | Focus |
+|-----------|-------|
+| **v0.2.0** (stable) | Cross-platform release binaries, E2E test matrix, `cargo publish`, Docker image |
+| **v0.3.0** | Source count reconciliation, crash/recovery tests, data shape drift detection, curated example configs |
+| **Future** | CDC mode, Iceberg/Delta output, webhook destination, multi-source joins, plugin system |

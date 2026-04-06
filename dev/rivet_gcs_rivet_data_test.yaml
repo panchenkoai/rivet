@@ -4,15 +4,18 @@
 source:
   type: postgres
   url: "postgresql://rivet:rivet@localhost:5432/rivet"
+  tuning:
+    profile: fast
+  batch_size: 1000
 
 exports:
-  - name: orders_chunked_gcs
-    query: "SELECT id, user_id, product, quantity, price, status, notes, ordered_at, updated_at FROM orders"
+  - name: content_items_gcs
+    query: "SELECT * FROM content_items"
     mode: chunked
     chunk_column: id
     chunk_size: 100000
-    parallel: 1
     format: parquet
+    compression: zstd
     destination:
       type: gcs
       bucket: rivet_data_test

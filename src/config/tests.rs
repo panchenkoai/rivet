@@ -1351,3 +1351,142 @@ fn parse_file_size_zero() {
     assert_eq!(parse_file_size("0MB").unwrap(), 0);
     assert_eq!(parse_file_size("0").unwrap(), 0);
 }
+
+// ─── misplaced tuning field detection ────────────────────────
+
+#[test]
+fn misplaced_batch_size_in_source_rejected() {
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+  batch_size: 1000
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#;
+    let err = Config::from_yaml(yaml).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("batch_size"),
+        "expected batch_size mention: {msg}"
+    );
+    assert!(
+        msg.contains("source.tuning"),
+        "expected hint about tuning: {msg}"
+    );
+}
+
+#[test]
+fn misplaced_profile_in_source_rejected() {
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+  profile: fast
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#;
+    let err = Config::from_yaml(yaml).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("profile"), "expected profile mention: {msg}");
+    assert!(msg.contains("source.tuning"), "expected hint: {msg}");
+}
+
+#[test]
+fn misplaced_multiple_tuning_fields_in_source_all_listed() {
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+  batch_size: 500
+  throttle_ms: 100
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#;
+    let err = Config::from_yaml(yaml).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("batch_size"), "missing batch_size: {msg}");
+    assert!(msg.contains("throttle_ms"), "missing throttle_ms: {msg}");
+}
+
+#[test]
+fn misplaced_batch_size_in_export_rejected() {
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: orders
+    query: "SELECT 1"
+    format: csv
+    batch_size: 2000
+    destination:
+      type: local
+      path: ./out
+"#;
+    let err = Config::from_yaml(yaml).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("batch_size"), "expected batch_size: {msg}");
+    assert!(msg.contains("orders"), "expected export name: {msg}");
+    assert!(msg.contains("exports[].tuning"), "expected hint: {msg}");
+}
+
+#[test]
+fn correct_tuning_placement_accepted() {
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+  tuning:
+    profile: fast
+    batch_size: 1000
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+    tuning:
+      throttle_ms: 50
+"#;
+    Config::from_yaml(yaml).unwrap();
+}
+
+#[test]
+fn misplaced_memory_threshold_in_source_rejected() {
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+  memory_threshold_mb: 512
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#;
+    let err = Config::from_yaml(yaml).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("memory_threshold_mb"),
+        "expected field name: {msg}"
+    );
+}

@@ -91,6 +91,7 @@ impl super::Source for PostgresSource {
                 .as_ref()
                 .expect("columns set on first iteration");
             let batch = rows_to_record_batch_typed(s, cols, &rows)?;
+            drop(rows);
             sink.on_batch(&batch)?;
 
             log::info!("fetched {} rows so far...", total_rows);

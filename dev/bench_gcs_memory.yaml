@@ -1,0 +1,19 @@
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+  tuning:
+    profile: fast
+    batch_size: 1000
+
+exports:
+  - name: content_items_gcs
+    query: "SELECT * FROM content_items"
+    mode: full
+    format: parquet
+    compression: zstd
+    destination:
+      type: gcs
+      bucket: rivet-fake
+      prefix: bench/content_items/
+      endpoint: http://127.0.0.1:4443
+      allow_anonymous: true
