@@ -55,6 +55,45 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
 
+  e2e:
+    name: E2E matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start services
+        run: docker compose up -d postgres mysql minio fake-gcs
+
+      - name: Wait for services
+        run: |
+          echo "Waiting for Postgres..."
+          for i in $(seq 1 30); do docker compose exec -T postgres pg_isready -U rivet && break || sleep 2; done
+          echo "Waiting for MySQL..."
+          for i in $(seq 1 30); do docker compose exec -T mysql mysqladmin ping -h localhost -uroot -privet 2>/dev/null && break || sleep 2; done
+
+      - name: Seed databases
+        run: |
+          cargo run --bin seed -- --target postgres --users 500 --pg-url "postgresql://rivet:rivet@localhost:5432/rivet"
+          cargo run --bin seed -- --target mysql --users 500 --mysql-url "mysql://rivet:rivet@localhost:3306/rivet"
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Run E2E test suite
+        env:
+          MINIO_ACCESS_KEY: minioadmin
+          MINIO_SECRET_KEY: minioadmin
+          RIVET: ./target/release/rivet
+        run: bash dev/e2e/run_e2e.sh
+
+      - name: Stop services
+        if: always()
+        run: docker compose down
+
   audit:
     name: Security audit
     runs-on: ubuntu-latest

@@ -1,0 +1,110 @@
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+  tuning:
+    profile: fast
+
+exports:
+  # --- Full mode: CSV + Parquet ---
+  - name: pg_users_full_csv
+    query: "SELECT id, name, email, age, balance, is_active, created_at FROM users"
+    mode: full
+    format: csv
+    destination:
+      type: local
+      path: ./dev/e2e/output
+
+  - name: pg_users_full_parquet
+    query: "SELECT id, name, email, age, balance, is_active, created_at FROM users"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/e2e/output
+
+  # --- Incremental mode ---
+  - name: pg_orders_incremental
+    query: "SELECT id, user_id, product, quantity, price, status, updated_at FROM orders"
+    mode: incremental
+    cursor_column: updated_at
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/e2e/output
+
+  # --- Chunked mode ---
+  - name: pg_orders_chunked
+    query: "SELECT id, user_id, product, quantity, price, status, ordered_at FROM orders"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 50000
+    parallel: 2
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/e2e/output
+
+  # --- Time-window mode ---
+  - name: pg_events_timewindow
+    query: "SELECT id, user_id, event_type, ip_address, created_at FROM events"
+    mode: time_window
+    time_column: created_at
+    days_window: 1500
+    format: csv
+    destination:
+      type: local
+      path: ./dev/e2e/output
+
+  # --- Compression variants ---
+  - name: pg_users_zstd
+    query: "SELECT id, name, email FROM users"
+    mode: full
+    format: parquet
+    compression: zstd
+    destination:
+      type: local
+      path: ./dev/e2e/output
+
+  - name: pg_users_gzip_csv
+    query: "SELECT id, name, email FROM users"
+    mode: full
+    format: csv
+    compression: gzip
+    destination:
+      type: local
+      path: ./dev/e2e/output
+
+  # --- Skip empty ---
+  - name: pg_empty_skip
+    query: "SELECT id, name FROM users WHERE id < 0"
+    mode: full
+    format: csv
+    skip_empty: true
+    destination:
+      type: local
+      path: ./dev/e2e/output
+
+  # --- Meta columns ---
+  - name: pg_users_meta
+    query: "SELECT id, name, email FROM users LIMIT 100"
+    mode: full
+    format: parquet
+    meta_columns:
+      run_id: true
+      exported_at: true
+      source_file: true
+    destination:
+      type: local
+      path: ./dev/e2e/output
+
+  # --- File splitting ---
+  - name: pg_events_split
+    query: "SELECT id, user_id, event_type, ip_address, created_at FROM events"
+    mode: full
+    format: parquet
+    max_file_size: "20KB"
+    destination:
+      type: local
+      path: ./dev/e2e/output
+    tuning:
+      batch_size: 2000

@@ -9,9 +9,14 @@ services:
       - "5432:5432"
     volumes:
       - ./dev/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rivet"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   mysql:
-    image: postgres:16
+    image: mysql:8.0
     environment:
       MYSQL_ROOT_PASSWORD: rivet
       MYSQL_USER: rivet
@@ -21,6 +26,11 @@ services:
       - "3306:3306"
     volumes:
       - ./dev/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-privet"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   minio:
     image: minio/minio:latest

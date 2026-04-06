@@ -1,0 +1,35 @@
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+  tuning:
+    profile: fast
+
+exports:
+  - name: pg_users_s3
+    query: "SELECT id, name, email, age, balance FROM users"
+    mode: full
+    format: parquet
+    destination:
+      type: s3
+      bucket: rivet-e2e
+      prefix: pg/users/
+      region: us-east-1
+      endpoint: http://localhost:9000
+      access_key_env: MINIO_ACCESS_KEY
+      secret_key_env: MINIO_SECRET_KEY
+
+  - name: pg_orders_s3_chunked
+    query: "SELECT id, user_id, product, quantity, price, status FROM orders"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 50000
+    parallel: 2
+    format: parquet
+    destination:
+      type: s3
+      bucket: rivet-e2e
+      prefix: pg/orders/
+      region: us-east-1
+      endpoint: http://localhost:9000
+      access_key_env: MINIO_ACCESS_KEY
+      secret_key_env: MINIO_SECRET_KEY

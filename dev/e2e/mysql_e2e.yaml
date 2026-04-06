@@ -1,0 +1,56 @@
+source:
+  type: mysql
+  url: "mysql://rivet:rivet@localhost:3306/rivet"
+  tuning:
+    profile: fast
+
+exports:
+  # --- Full mode: CSV + Parquet ---
+  - name: mysql_users_full_csv
+    query: "SELECT id, name, email, age, balance, is_active, created_at FROM users"
+    mode: full
+    format: csv
+    destination:
+      type: local
+      path: ./dev/e2e/output
+
+  - name: mysql_users_full_parquet
+    query: "SELECT id, name, email, age, balance, is_active, created_at FROM users"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/e2e/output
+
+  # --- Incremental mode ---
+  - name: mysql_orders_incremental
+    query: "SELECT id, user_id, product, quantity, price, status, updated_at FROM orders"
+    mode: incremental
+    cursor_column: updated_at
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/e2e/output
+
+  # --- Chunked mode ---
+  - name: mysql_orders_chunked
+    query: "SELECT id, user_id, product, quantity, price, status, ordered_at FROM orders"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 50000
+    parallel: 2
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/e2e/output
+
+  # --- Time-window mode ---
+  - name: mysql_events_timewindow
+    query: "SELECT id, user_id, event_type, ip_address, created_at FROM events"
+    mode: time_window
+    time_column: created_at
+    days_window: 1500
+    format: csv
+    destination:
+      type: local
+      path: ./dev/e2e/output

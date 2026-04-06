@@ -1,0 +1,29 @@
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+  tuning:
+    profile: fast
+
+exports:
+  - name: pg_users_gcs
+    query: "SELECT id, name, email, age, balance FROM users"
+    mode: full
+    format: parquet
+    destination:
+      type: gcs
+      bucket: rivet-e2e
+      prefix: pg/users/
+      endpoint: http://127.0.0.1:4443
+      allow_anonymous: true
+
+  - name: pg_orders_gcs_incremental
+    query: "SELECT id, user_id, product, quantity, price, status, updated_at FROM orders"
+    mode: incremental
+    cursor_column: updated_at
+    format: csv
+    destination:
+      type: gcs
+      bucket: rivet-e2e
+      prefix: pg/orders/
+      endpoint: http://127.0.0.1:4443
+      allow_anonymous: true
