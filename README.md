@@ -35,8 +35,84 @@ Rivet is a CLI tool that exports query results from relational databases to file
 
 ## Installation
 
+### Homebrew (macOS / Linux) — recommended
+
 ```bash
-cargo install --path .
+brew tap panchenkoai/rivet
+brew update
+brew install rivet
+rivet --version
+```
+
+### Pre-built binaries
+
+Download the latest release for your platform from [GitHub Releases](https://github.com/panchenkoai/rivet/releases):
+
+```bash
+# macOS (Apple Silicon)
+curl -L https://github.com/panchenkoai/rivet/releases/latest/download/rivet-aarch64-apple-darwin.tar.gz | tar xz
+sudo mv rivet-*/rivet /usr/local/bin/
+
+# macOS (Intel)
+curl -L https://github.com/panchenkoai/rivet/releases/latest/download/rivet-x86_64-apple-darwin.tar.gz | tar xz
+sudo mv rivet-*/rivet /usr/local/bin/
+
+# Linux (x86_64)
+curl -L https://github.com/panchenkoai/rivet/releases/latest/download/rivet-x86_64-unknown-linux-gnu.tar.gz | tar xz
+sudo mv rivet-*/rivet /usr/local/bin/
+
+# Linux (arm64)
+curl -L https://github.com/panchenkoai/rivet/releases/latest/download/rivet-aarch64-unknown-linux-gnu.tar.gz | tar xz
+sudo mv rivet-*/rivet /usr/local/bin/
+```
+
+Verify:
+
+```bash
+rivet --version
+```
+
+### Docker
+
+Try Rivet without installing anything — mount your config and output directory:
+
+```bash
+docker run --rm \
+  -v $(pwd)/rivet.yaml:/config/rivet.yaml \
+  -v $(pwd)/output:/output \
+  ghcr.io/panchenkoai/rivet:latest \
+  run --config /config/rivet.yaml
+```
+
+Or check the version and explore commands:
+
+```bash
+docker run --rm ghcr.io/panchenkoai/rivet:latest --version
+docker run --rm ghcr.io/panchenkoai/rivet:latest --help
+```
+
+Pass environment variables for credentials:
+
+```bash
+docker run --rm \
+  -e DATABASE_URL="postgresql://user:pass@host:5432/db" \
+  -v $(pwd)/rivet.yaml:/config/rivet.yaml \
+  -v $(pwd)/output:/output \
+  ghcr.io/panchenkoai/rivet:latest \
+  run --config /config/rivet.yaml
+```
+
+> **Note:** To connect to a database running on your host machine, use `host.docker.internal` instead of `localhost` in the connection URL.
+
+### Build from source
+
+Requires Rust 1.94+:
+
+```bash
+git clone https://github.com/panchenkoai/rivet.git
+cd rivet
+cargo build --release
+# binary is at target/release/rivet
 ```
 
 ## Quick Start
@@ -83,6 +159,62 @@ RUST_LOG=info rivet run --config rivet.yaml
 
 ```bash
 rivet state show --config rivet.yaml
+```
+
+## Working with the binary
+
+Once installed, `rivet` is a single self-contained binary with no runtime dependencies (no JVM, no Python, no Docker required).
+
+**Typical workflow:**
+
+```bash
+# 1. Preflight: check that the source DB is reachable and healthy
+rivet check --config rivet.yaml
+
+# 2. Auth: verify credentials for source + all destinations (S3, GCS, etc.)
+rivet doctor --config rivet.yaml
+
+# 3. Export: run all exports defined in the config
+RUST_LOG=info rivet run --config rivet.yaml
+
+# 4. Inspect: view cursor state and file manifest
+rivet state show --config rivet.yaml
+rivet state files --config rivet.yaml
+
+# 5. Re-run: only new/changed rows are exported (incremental mode)
+RUST_LOG=info rivet run --config rivet.yaml
+```
+
+**Useful flags:**
+
+```bash
+rivet run --config rivet.yaml --export users      # run a single export
+rivet run --config rivet.yaml --validate           # reconcile row counts after write
+rivet run --config rivet.yaml --param env=prod     # parameterized queries
+rivet state reset --config rivet.yaml --export users  # reset cursor to re-export from scratch
+```
+
+**Logging:**
+
+Rivet uses `RUST_LOG` for verbosity:
+
+```bash
+RUST_LOG=debug rivet run --config rivet.yaml    # verbose (SQL, batch timings, retries)
+RUST_LOG=info  rivet run --config rivet.yaml    # normal (progress, summary)
+RUST_LOG=warn  rivet run --config rivet.yaml    # quiet (errors and warnings only)
+```
+
+**Shell completions:**
+
+```bash
+# Bash
+rivet completions bash > ~/.local/share/bash-completion/completions/rivet
+
+# Zsh
+rivet completions zsh > ~/.zfunc/_rivet
+
+# Fish
+rivet completions fish > ~/.config/fish/completions/rivet.fish
 ```
 
 ## CLI Reference
@@ -798,7 +930,7 @@ GitHub Actions runs on every push/PR to `master`/`main`:
 
 ## Roadmap
 
-See [rivet_roadmap_v3.md](rivet_roadmap_v3.md) for the full roadmap with task breakdown.
+See [rivet_roadmap.md](rivet_roadmap.md) for the full roadmap (strategy + execution status).
 
 **Next milestones:**
 

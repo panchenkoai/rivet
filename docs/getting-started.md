@@ -2,23 +2,74 @@
 
 ## 1. Install
 
-**From source (requires Rust 1.94+):**
+### Homebrew (macOS / Linux) — recommended
 
 ```bash
-cargo install --git https://github.com/andriipanchenko/rivet.git
+brew tap panchenkoai/rivet
+brew update
+brew install rivet
+rivet --version
 ```
 
-**From a local clone:**
+### Pre-built binaries
+
+Download from [GitHub Releases](https://github.com/panchenkoai/rivet/releases):
 
 ```bash
-git clone https://github.com/andriipanchenko/rivet.git
+# macOS (Apple Silicon)
+curl -L https://github.com/panchenkoai/rivet/releases/latest/download/rivet-aarch64-apple-darwin.tar.gz | tar xz
+sudo mv rivet-*/rivet /usr/local/bin/
+
+# macOS (Intel)
+curl -L https://github.com/panchenkoai/rivet/releases/latest/download/rivet-x86_64-apple-darwin.tar.gz | tar xz
+sudo mv rivet-*/rivet /usr/local/bin/
+
+# Linux (x86_64)
+curl -L https://github.com/panchenkoai/rivet/releases/latest/download/rivet-x86_64-unknown-linux-gnu.tar.gz | tar xz
+sudo mv rivet-*/rivet /usr/local/bin/
+
+# Linux (arm64)
+curl -L https://github.com/panchenkoai/rivet/releases/latest/download/rivet-aarch64-unknown-linux-gnu.tar.gz | tar xz
+sudo mv rivet-*/rivet /usr/local/bin/
+```
+
+```bash
+rivet --version
+```
+
+### Docker — try without installing
+
+```bash
+# Check version
+docker run --rm ghcr.io/panchenkoai/rivet:latest --version
+
+# Run an export (mount your config and output directory)
+docker run --rm \
+  -v $(pwd)/rivet.yaml:/config/rivet.yaml \
+  -v $(pwd)/output:/output \
+  ghcr.io/panchenkoai/rivet:latest \
+  run --config /config/rivet.yaml
+
+# Pass credentials via environment variables
+docker run --rm \
+  -e DATABASE_URL="postgresql://user:pass@host:5432/db" \
+  -v $(pwd)/rivet.yaml:/config/rivet.yaml \
+  -v $(pwd)/output:/output \
+  ghcr.io/panchenkoai/rivet:latest \
+  run --config /config/rivet.yaml
+```
+
+> To connect to a database on your host machine, use `host.docker.internal` instead of `localhost` in the connection URL.
+
+### Build from source
+
+Requires Rust 1.94+:
+
+```bash
+git clone https://github.com/panchenkoai/rivet.git
 cd rivet
-cargo install --path .
-```
-
-Verify the installation:
-
-```bash
+cargo build --release
+sudo mv target/release/rivet /usr/local/bin/
 rivet --version
 ```
 
