@@ -696,11 +696,11 @@ Rivet core is **feature-complete for beta** extraction:
 
 | Task | Priority | Status | Notes |
 |------|----------|--------|-------|
-| L1 | P0 | ✅ Partial | Release workflow + matrix (Linux + macOS); verify on tag |
-| L2 | P0 | ✅ Partial | `softprops/action-gh-release`; needs green run |
+| L1 | P0 | ✅ | Release workflow + matrix (Linux + macOS); green on v0.2.0-beta.2 |
+| L2 | P0 | ✅ | GitHub Release assets published at v0.2.0-beta.2 |
 | L3 | P0 | ⏳ | `cargo publish` |
-| L4 | P1 | ⏳ | Docker image |
-| L5 | P2 | ⏳ | Homebrew tap |
+| L4 | P1 | ✅ | Docker image via Dockerfile + GHCR (ghcr.io/panchenkoai/rivet) |
+| L5 | P2 | ✅ | Homebrew tap panchenkoai/homebrew-rivet; auto-updated on release |
 
 ### Epic N — Advanced features (post-pilot)
 
@@ -720,12 +720,13 @@ Rivet core is **feature-complete for beta** extraction:
 
 Prioritize by stabilization before distribution polish:
 
-1. **Green GitHub Release** — push `v*` (or workflow_dispatch), confirm all matrix jobs + attached assets.
-2. **L3** — `cargo publish` when ready.
+1. ✅ **Green GitHub Release** — v0.2.0-beta.2 published (binaries, Docker, Homebrew tap).
+2. **L3** — `cargo publish` on crates.io.
 3. **F5 + I5** — short docs: audit/reconcile tradeoffs; capacity / memory guidance.
-4. **I2** — scripted benchmark or `cargo xtask`-style harness.
-5. **Epic 4 (§5)** — external/durable state backend when pilots need multi-replica or stateless workers.
-6. **H2, G2** — fault injection and network chaos (lower urgency).
+4. **H4** — link CRASH_MATRIX from USER_GUIDE.
+5. **I2** — scripted benchmark or `cargo xtask`-style harness.
+6. **Epic 4 (§5)** — external/durable state backend when pilots need multi-replica or stateless workers.
+7. **H2, G2** — fault injection and network chaos (lower urgency).
 
 Stale “immediate this week” lists (E2E, reconcile, MinIO) are **done**; ignore old copies if seen elsewhere.
 
@@ -741,6 +742,6 @@ Stale “immediate this week” lists (E2E, reconcile, MinIO) are **done**; igno
 - [x] Local battle lab (MinIO + compose + E2E)
 - [x] Docs for real scenarios (`docs/`, examples, USER_GUIDE)
 - [ ] 2–3 pilot tables repeated on a schedule *(organizational; optional automation K2)*
-- [ ] Cross-platform release binaries **published** (workflow exists — confirm release assets)
+- [x] Cross-platform release binaries **published** (v0.2.0-beta.2: Linux x86_64/arm64, macOS arm64/Intel, Docker GHCR, Homebrew tap)
 - [x] E2E matrix in CI
 - [ ] Published to crates.io
