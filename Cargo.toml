@@ -1,5 +1,5 @@
 [package]
-name = "rivet"
+name = "rivet-cli"
 version = "0.2.0-beta.2"
 edition = "2024"
 rust-version = "1.94"
@@ -8,6 +8,10 @@ repository = "https://github.com/panchenkoai/rivet"
 description = "CLI tool to export PostgreSQL and MySQL to Parquet/CSV (local, S3, GCS) with tuning, preflight checks, and SQLite-backed state."
 readme = "README.md"
 default-run = "rivet"
+
+[[bin]]
+name = "rivet"
+path = "src/main.rs"
 exclude = ["dev/", "USER_TEST_PLAN.md", "tests/", ".github/"]
 
 [dependencies]
