@@ -94,6 +94,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+      HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -132,9 +133,8 @@ jobs:
             ./dev/update_homebrew_formula.sh --tag "${RELEASE_TAG}" --sums-file artifacts/SHA256SUMS.txt
 
       - name: Push formula to Homebrew tap
-        if: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN != '' }}
+        if: env.HOMEBREW_TAP_GITHUB_TOKEN != ''
         env:
-          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
           RELEASE_TAG: ${{ env.RELEASE_TAG }}
           TAP_OWNER: ${{ github.repository_owner }}
         run: |
