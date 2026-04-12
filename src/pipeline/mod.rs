@@ -25,10 +25,10 @@ pub(crate) use retry::is_transient;
 
 use std::path::Path;
 
-use crate::config::{Config, ExportConfig, ExportMode};
+use crate::config::{Config, ExportConfig};
 use crate::error::Result;
+use crate::plan::{ExtractionStrategy, ResolvedRunPlan, build_plan};
 use crate::state::StateStore;
-use crate::tuning::{SourceTuning, TuningProfile, merge_tuning_config};
 
 use chunked::run_chunked_parallel_checkpoint;
 use single::run_with_reconnect;
@@ -65,15 +65,15 @@ pub struct RunSummary {
 }
 
 impl RunSummary {
-    fn new(export: &ExportConfig, tuning: &SourceTuning, yaml_profile_label: &str) -> Self {
+    fn new(plan: &ResolvedRunPlan) -> Self {
         let run_id = format!(
             "{}_{}",
-            export.name,
+            plan.export_name,
             chrono::Utc::now().format("%Y%m%dT%H%M%S%.3f"),
         );
         Self {
             run_id,
-            export_name: export.name.clone(),
+            export_name: plan.export_name.clone(),
             status: "running".into(),
             total_rows: 0,
             files_produced: 0,
@@ -85,12 +85,12 @@ impl RunSummary {
             schema_changed: None,
             quality_passed: None,
             error_message: None,
-            tuning_profile: yaml_profile_label.to_string(),
-            batch_size: tuning.batch_size,
-            batch_size_memory_mb: tuning.batch_size_memory_mb,
-            format: format!("{:?}", export.format).to_lowercase(),
-            mode: format!("{:?}", export.mode).to_lowercase(),
-            compression: format!("{:?}", export.compression).to_lowercase(),
+            tuning_profile: plan.tuning_profile_label.clone(),
+            batch_size: plan.tuning.batch_size,
+            batch_size_memory_mb: plan.tuning.batch_size_memory_mb,
+            format: format!("{:?}", plan.format).to_lowercase(),
+            mode: plan.strategy.mode_label().to_string(),
+            compression: format!("{:?}", plan.compression).to_lowercase(),
             source_count: None,
             reconciled: None,
         }
@@ -169,15 +169,15 @@ impl RunSummary {
 /// row_count bounds after all chunks complete. Null/unique checks are warned-and-skipped.
 fn run_chunked_quality_gate(
     result: Result<()>,
-    export: &ExportConfig,
+    plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
 ) -> Result<()> {
     result?;
 
-    if export.mode != ExportMode::Chunked {
+    if !matches!(plan.strategy, ExtractionStrategy::Chunked(_)) {
         return Ok(());
     }
-    let qc = match &export.quality {
+    let qc = match &plan.quality {
         Some(q) => q,
         None => return Ok(()),
     };
@@ -189,7 +189,7 @@ fn run_chunked_quality_gate(
     if has_unsupported {
         log::warn!(
             "export '{}': quality checks null_ratio_max and unique_columns are not supported in chunked mode (each chunk processes independently); only row_count bounds are checked",
-            export.name
+            plan.export_name
         );
     }
 
@@ -200,7 +200,7 @@ fn run_chunked_quality_gate(
         summary.quality_passed = Some(false);
         anyhow::bail!(
             "export '{}': quality checks failed (chunked aggregate)",
-            export.name
+            plan.export_name
         );
     }
 
@@ -212,41 +212,24 @@ fn run_chunked_quality_gate(
 /// Skips reconciliation for incremental exports that used a cursor (moving target).
 fn reconcile_source_count(
     source_config: &crate::config::SourceConfig,
-    export: &ExportConfig,
-    params: Option<&std::collections::HashMap<String, String>>,
+    plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
 ) {
-    use crate::config::ExportMode;
-
-    if export.mode == ExportMode::Incremental {
+    if matches!(plan.strategy, ExtractionStrategy::Incremental { .. }) {
         log::info!(
             "reconcile: skipping for incremental export '{}' (cursor-based, count may differ)",
-            export.name
+            plan.export_name
         );
         return;
     }
 
-    let base_query = match &export.query {
-        Some(q) => q.clone(),
-        None => {
-            log::warn!(
-                "reconcile: export '{}' has no inline query, skipping",
-                export.name
-            );
-            return;
-        }
-    };
-    let mut query = base_query;
-    if let Some(p) = params {
-        for (k, v) in p {
-            query = query.replace(&format!("${{{}}}", k), v);
-        }
-    }
-
-    let count_sql = format!("SELECT COUNT(*) FROM ({}) AS _rivet_reconcile", query);
+    let count_sql = format!(
+        "SELECT COUNT(*) FROM ({}) AS _rivet_reconcile",
+        plan.base_query
+    );
     log::info!(
         "reconcile: running source count query for '{}'",
-        export.name
+        plan.export_name
     );
 
     let mut src = match crate::source::create_source(source_config) {
@@ -265,14 +248,14 @@ fn reconcile_source_count(
                 if summary.total_rows != count {
                     log::warn!(
                         "reconcile MISMATCH for '{}': exported {} rows, source has {}",
-                        export.name,
+                        plan.export_name,
                         summary.total_rows,
                         count
                     );
                 } else {
                     log::info!(
                         "reconcile MATCH for '{}': {}/{}",
-                        export.name,
+                        plan.export_name,
                         summary.total_rows,
                         count
                     );
@@ -285,12 +268,15 @@ fn reconcile_source_count(
             }
         }
         Ok(None) => {
-            log::warn!("reconcile: COUNT(*) returned NULL for '{}'", export.name);
+            log::warn!(
+                "reconcile: COUNT(*) returned NULL for '{}'",
+                plan.export_name
+            );
         }
         Err(e) => {
             log::warn!(
                 "reconcile: count query failed for '{}': {:#}",
-                export.name,
+                plan.export_name,
                 e
             );
         }
@@ -321,62 +307,29 @@ fn run_export_job(
     resume: bool,
     params: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<()> {
-    let merged = merge_tuning_config(config.source.tuning.as_ref(), export.tuning.as_ref());
-    let tuning = SourceTuning::from_config(merged.as_ref());
-    let yaml_profile_label = match merged.as_ref().and_then(|t| t.profile) {
-        Some(TuningProfile::Fast) => "fast",
-        Some(TuningProfile::Balanced) => "balanced",
-        Some(TuningProfile::Safe) => "safe",
-        None => "balanced (default)",
-    };
+    let plan = build_plan(
+        config, export, config_dir, validate, reconcile, resume, params,
+    )?;
+
     log::info!(
         "starting export '{}' (effective tuning: {})",
-        export.name,
-        tuning
+        plan.export_name,
+        plan.tuning
     );
 
     let start = std::time::Instant::now();
     let rss_before = crate::resource::get_rss_mb();
     let rss_sampler = crate::resource::RssPeakSampler::start(rss_before, 100);
-    let mut summary = RunSummary::new(export, &tuning, yaml_profile_label);
+    let mut summary = RunSummary::new(&plan);
 
-    let result = match export.mode {
-        ExportMode::Chunked if export.parallel > 1 && export.chunk_checkpoint => {
-            run_chunked_parallel_checkpoint(
-                config_path,
-                &config.source,
-                state,
-                export,
-                &tuning,
-                config_dir,
-                validate,
-                &mut summary,
-                params,
-                resume,
-            )
+    let result = match &plan.strategy {
+        ExtractionStrategy::Chunked(cp) if cp.parallel > 1 && cp.checkpoint => {
+            run_chunked_parallel_checkpoint(config_path, &config.source, state, &plan, &mut summary)
         }
-        ExportMode::Chunked if export.parallel > 1 => chunked::run_chunked_parallel(
-            &config.source,
-            state,
-            export,
-            &tuning,
-            config_dir,
-            validate,
-            &mut summary,
-            params,
-        ),
-        _ => run_with_reconnect(
-            &config.source,
-            state,
-            export,
-            &tuning,
-            config_dir,
-            validate,
-            &mut summary,
-            params,
-            resume,
-            config_path,
-        ),
+        ExtractionStrategy::Chunked(cp) if cp.parallel > 1 => {
+            chunked::run_chunked_parallel(&config.source, state, &plan, &mut summary)
+        }
+        _ => run_with_reconnect(&config.source, state, &plan, &mut summary, config_path),
     };
 
     let rss_peak = rss_sampler.stop();
@@ -384,8 +337,8 @@ fn run_export_job(
     summary.duration_ms = start.elapsed().as_millis() as i64;
     summary.peak_rss_mb = rss_peak.max(rss_after).max(rss_before) as i64;
 
-    let tuning_class = tuning.profile_name().to_string();
-    let result = run_chunked_quality_gate(result, export, &mut summary);
+    let tuning_class = plan.tuning.profile_name().to_string();
+    let result = run_chunked_quality_gate(result, &plan, &mut summary);
     let failed = result.is_err();
     match &result {
         Ok(()) => {
@@ -396,12 +349,12 @@ fn run_export_job(
         Err(e) => {
             summary.status = "failed".into();
             summary.error_message = Some(format!("{:#}", e));
-            log::error!("export '{}' failed: {:#}", export.name, e);
+            log::error!("export '{}' failed: {:#}", plan.export_name, e);
         }
     }
 
-    if reconcile && !failed {
-        reconcile_source_count(&config.source, export, params, &mut summary);
+    if plan.reconcile && !failed {
+        reconcile_source_count(&config.source, &plan, &mut summary);
     }
 
     let _ = state.record_metric(
@@ -637,7 +590,10 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CompressionType, FormatType, MetaColumns, TimeColumnType};
+    use crate::config::{
+        CompressionType, DestinationConfig, DestinationType, FormatType, MetaColumns,
+    };
+    use crate::plan::{ExtractionStrategy, ResolvedRunPlan};
     use crate::tuning::SourceTuning;
 
     #[test]
@@ -663,26 +619,19 @@ mod tests {
         assert_eq!(format_bytes(1_073_741_824), "1.0 GB");
     }
 
-    #[test]
-    fn test_run_summary_fields() {
-        let export = ExportConfig {
-            name: "test_export".into(),
-            query: Some("SELECT 1".into()),
-            query_file: None,
-            mode: ExportMode::Full,
-            cursor_column: None,
-            chunk_column: None,
-            chunk_size: 100_000,
-            parallel: 1,
-            time_column: None,
-            time_column_type: TimeColumnType::Timestamp,
-            days_window: None,
+    fn minimal_plan() -> ResolvedRunPlan {
+        ResolvedRunPlan {
+            export_name: "test_export".into(),
+            base_query: "SELECT 1".into(),
+            strategy: ExtractionStrategy::Snapshot,
             format: FormatType::Parquet,
             compression: CompressionType::default(),
             compression_level: None,
+            max_file_size_bytes: None,
             skip_empty: false,
-            destination: crate::config::DestinationConfig {
-                destination_type: crate::config::DestinationType::Local,
+            meta_columns: MetaColumns::default(),
+            destination: DestinationConfig {
+                destination_type: DestinationType::Local,
                 bucket: None,
                 prefix: None,
                 path: Some("./out".into()),
@@ -694,17 +643,19 @@ mod tests {
                 aws_profile: None,
                 allow_anonymous: false,
             },
-            meta_columns: MetaColumns::default(),
             quality: None,
-            max_file_size: None,
-            chunk_checkpoint: false,
-            chunk_max_attempts: None,
-            tuning: None,
-            chunk_dense: false,
-            chunk_by_days: None,
-        };
-        let tuning = SourceTuning::from_config(None);
-        let summary = RunSummary::new(&export, &tuning, "balanced (default)");
+            tuning: SourceTuning::from_config(None),
+            tuning_profile_label: "balanced (default)".into(),
+            validate: false,
+            reconcile: false,
+            resume: false,
+        }
+    }
+
+    #[test]
+    fn test_run_summary_fields() {
+        let plan = minimal_plan();
+        let summary = RunSummary::new(&plan);
         assert_eq!(summary.export_name, "test_export");
         assert_eq!(summary.status, "running");
         assert_eq!(summary.total_rows, 0);

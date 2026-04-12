@@ -10,6 +10,7 @@ mod format;
 mod init;
 mod notify;
 mod pipeline;
+mod plan;
 mod preflight;
 mod quality;
 mod resource;

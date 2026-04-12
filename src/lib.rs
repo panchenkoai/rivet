@@ -13,6 +13,7 @@ pub mod error;
 pub mod format;
 pub mod notify;
 pub mod pipeline;
+pub mod plan;
 pub mod preflight;
 pub mod quality;
 pub mod resource;

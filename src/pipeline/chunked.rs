@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -8,12 +7,12 @@ use super::progress::ChunkProgress;
 use super::retry::classify_error;
 use super::sink::ExportSink;
 use super::validate::validate_output;
-use crate::config::{ExportConfig, SourceConfig};
+use crate::config::SourceConfig;
 use crate::error::Result;
+use crate::plan::{ChunkedPlan, ExtractionStrategy, ResolvedRunPlan};
 use crate::preflight::chunk_sparsity_from_counts;
 use crate::source::{self, Source};
 use crate::state::StateStore;
-use crate::tuning::SourceTuning;
 use crate::{destination, format, resource};
 
 // ─── Chunk math ──────────────────────────────────────────────
@@ -378,56 +377,57 @@ pub(crate) fn detect_and_generate_chunks(
 
 pub(crate) fn run_chunked_sequential(
     src: &mut dyn Source,
-    base_query: &str,
-    export: &ExportConfig,
-    tuning: &SourceTuning,
-    validate: bool,
+    plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
     state: Option<&StateStore>,
 ) -> Result<()> {
-    let col = export
-        .chunk_column
-        .as_deref()
-        .expect("chunk_column required for chunked mode");
+    let cp = chunked_plan(plan);
+
     let chunks = detect_and_generate_chunks(
         src,
-        base_query,
-        col,
-        export.chunk_size,
-        &export.name,
-        export.chunk_dense,
-        export.chunk_by_days,
+        &plan.base_query,
+        &cp.column,
+        cp.chunk_size,
+        &plan.export_name,
+        cp.dense,
+        cp.by_days,
     )?;
 
-    let is_date = export.chunk_by_days.is_some();
+    let is_date = cp.by_days.is_some();
 
     log::info!(
         "export '{}': {} chunks to process sequentially",
-        export.name,
+        plan.export_name,
         chunks.len()
     );
 
-    let pb = ChunkProgress::new(&export.name, chunks.len());
+    let pb = ChunkProgress::new(&plan.export_name, chunks.len());
 
     for (i, (start, end)) in chunks.iter().enumerate() {
-        if !resource::check_memory(tuning.memory_threshold_mb) {
+        if !resource::check_memory(plan.tuning.memory_threshold_mb) {
             log::warn!("memory threshold exceeded, pausing 5s before chunk {}", i);
             std::thread::sleep(Duration::from_secs(5));
         }
 
-        let chunk_query =
-            build_chunk_query_sql(base_query, col, *start, *end, export.chunk_dense, is_date);
+        let chunk_query = build_chunk_query_sql(
+            &plan.base_query,
+            &cp.column,
+            *start,
+            *end,
+            cp.dense,
+            is_date,
+        );
         log::info!(
             "export '{}': chunk {}/{} ({}..{})",
-            export.name,
+            plan.export_name,
             i + 1,
             chunks.len(),
             start,
             end
         );
 
-        let mut sink = ExportSink::new(export)?;
-        src.export(&chunk_query, None, None, tuning, &mut sink)?;
+        let mut sink = ExportSink::new(plan)?;
+        src.export(&chunk_query, None, None, &plan.tuning, &mut sink)?;
         if let Some(w) = sink.writer.take() {
             w.finish()?;
         }
@@ -436,14 +436,14 @@ pub(crate) fn run_chunked_sequential(
         pb.inc(summary.total_rows);
         log::info!(
             "export '{}': chunk {} -- {} rows",
-            export.name,
+            plan.export_name,
             i + 1,
             sink.total_rows
         );
 
         if sink.total_rows > 0 {
-            if validate {
-                validate_output(sink.tmp.path(), export.format, sink.total_rows)?;
+            if plan.validate {
+                validate_output(sink.tmp.path(), plan.format, sink.total_rows)?;
                 summary.validated = Some(true);
             }
             let file_bytes = std::fs::metadata(sink.tmp.path())
@@ -452,75 +452,65 @@ pub(crate) fn run_chunked_sequential(
             summary.bytes_written += file_bytes;
             summary.files_produced += 1;
 
-            let fmt =
-                format::create_format(export.format, export.compression, export.compression_level);
+            let fmt = format::create_format(plan.format, plan.compression, plan.compression_level);
             let file_name = format!(
                 "{}_{}_chunk{}.{}",
-                export.name,
+                plan.export_name,
                 chrono::Utc::now().format("%Y%m%d_%H%M%S"),
                 i,
                 fmt.file_extension()
             );
-            let dest = destination::create_destination(&export.destination)?;
+            let dest = destination::create_destination(&plan.destination)?;
             dest.write(sink.tmp.path(), &file_name)?;
 
             if let Some(st) = state {
                 let _ = st.record_file(
                     &summary.run_id,
-                    &export.name,
+                    &plan.export_name,
                     &file_name,
                     sink.total_rows as i64,
                     file_bytes as i64,
-                    &format!("{:?}", export.format).to_lowercase(),
-                    Some(&format!("{:?}", export.compression).to_lowercase()),
+                    &format!("{:?}", plan.format).to_lowercase(),
+                    Some(&format!("{:?}", plan.compression).to_lowercase()),
                 );
             }
         }
     }
 
     pb.finish(summary.total_rows);
-    log::info!("export '{}': all chunks completed", export.name);
+    log::info!("export '{}': all chunks completed", plan.export_name);
     Ok(())
 }
 
 // ─── Chunked Mode (Parallel) ────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn run_chunked_parallel(
     source_config: &SourceConfig,
     state: &StateStore,
-    export: &ExportConfig,
-    tuning: &SourceTuning,
-    config_dir: &Path,
-    validate: bool,
+    plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
-    params: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<()> {
-    let base_query = export.resolve_query(config_dir, params)?;
-    let col = export
-        .chunk_column
-        .as_deref()
-        .expect("chunk_column required for chunked mode");
+    let cp = chunked_plan(plan);
 
     let mut src = source::create_source(source_config)?;
     let chunks = detect_and_generate_chunks(
         &mut *src,
-        &base_query,
-        col,
-        export.chunk_size,
-        &export.name,
-        export.chunk_dense,
-        export.chunk_by_days,
+        &plan.base_query,
+        &cp.column,
+        cp.chunk_size,
+        &plan.export_name,
+        cp.dense,
+        cp.by_days,
     )?;
     drop(src);
 
-    let is_date = export.chunk_by_days.is_some();
+    let is_date = cp.by_days.is_some();
 
     let total_chunks = chunks.len();
-    let parallel = export.parallel.min(total_chunks);
+    let parallel = cp.parallel.min(total_chunks);
     log::info!(
         "export '{}': {} chunks, {} parallel threads",
-        export.name,
+        plan.export_name,
         total_chunks,
         parallel
     );
@@ -532,7 +522,7 @@ pub(super) fn run_chunked_parallel(
     let errors = std::sync::Mutex::new(Vec::<String>::new());
     let file_records: std::sync::Mutex<Vec<(String, i64, i64)>> = std::sync::Mutex::new(Vec::new());
     let semaphore = AtomicUsize::new(0);
-    let pb = ChunkProgress::new(&export.name, total_chunks);
+    let pb = ChunkProgress::new(&plan.export_name, total_chunks);
     let pb_arc = pb.arc();
 
     std::thread::scope(|s| {
@@ -541,9 +531,9 @@ pub(super) fn run_chunked_parallel(
                 std::thread::sleep(Duration::from_millis(50));
             }
 
-            if !resource::check_memory(tuning.memory_threshold_mb) {
+            if !resource::check_memory(plan.tuning.memory_threshold_mb) {
                 log::warn!("memory threshold exceeded, waiting before chunk {}", i);
-                while !resource::check_memory(tuning.memory_threshold_mb) {
+                while !resource::check_memory(plan.tuning.memory_threshold_mb) {
                     std::thread::sleep(Duration::from_secs(2));
                 }
             }
@@ -551,12 +541,10 @@ pub(super) fn run_chunked_parallel(
             semaphore.fetch_add(1, Ordering::Relaxed);
 
             let source_config = source_config.clone();
-            let tuning = tuning.clone();
-            let export_for_sink = export.clone();
-            let export_name = &export.name;
-            let format_type = export.format;
-            let dest_config = &export.destination;
-            let base_query = &base_query;
+            let plan_for_worker = plan.clone();
+            let export_name = &plan.export_name;
+            let base_query = &plan.base_query;
+            let col = &cp.column;
             let completed = &completed;
             let agg_rows = &agg_rows;
             let agg_bytes = &agg_bytes;
@@ -570,18 +558,18 @@ pub(super) fn run_chunked_parallel(
 
             s.spawn(move || {
                 let result = (|| -> Result<()> {
-                    let chunk_query = build_chunk_query_sql(
-                        base_query,
-                        col,
-                        start,
-                        end,
-                        export_for_sink.chunk_dense,
-                        is_date,
-                    );
+                    let chunk_query =
+                        build_chunk_query_sql(base_query, col, start, end, cp.dense, is_date);
 
                     let mut thread_src = source::create_source(&source_config)?;
-                    let mut sink = ExportSink::new(&export_for_sink)?;
-                    thread_src.export(&chunk_query, None, None, &tuning, &mut sink)?;
+                    let mut sink = ExportSink::new(&plan_for_worker)?;
+                    thread_src.export(
+                        &chunk_query,
+                        None,
+                        None,
+                        &plan_for_worker.tuning,
+                        &mut sink,
+                    )?;
                     if let Some(w) = sink.writer.take() {
                         w.finish()?;
                     }
@@ -589,8 +577,12 @@ pub(super) fn run_chunked_parallel(
                     agg_rows.fetch_add(sink.total_rows as i64, Ordering::Relaxed);
 
                     if sink.total_rows > 0 {
-                        if validate {
-                            validate_output(sink.tmp.path(), format_type, sink.total_rows)?;
+                        if plan_for_worker.validate {
+                            validate_output(
+                                sink.tmp.path(),
+                                plan_for_worker.format,
+                                sink.total_rows,
+                            )?;
                         }
                         let file_bytes = std::fs::metadata(sink.tmp.path())
                             .map(|m| m.len())
@@ -599,9 +591,9 @@ pub(super) fn run_chunked_parallel(
                         agg_files.fetch_add(1, Ordering::Relaxed);
 
                         let fmt = format::create_format(
-                            format_type,
-                            export_for_sink.compression,
-                            export_for_sink.compression_level,
+                            plan_for_worker.format,
+                            plan_for_worker.compression,
+                            plan_for_worker.compression_level,
                         );
                         let file_name = format!(
                             "{}_{}_chunk{}.{}",
@@ -610,7 +602,7 @@ pub(super) fn run_chunked_parallel(
                             i,
                             fmt.file_extension()
                         );
-                        let dest = destination::create_destination(dest_config)?;
+                        let dest = destination::create_destination(&plan_for_worker.destination)?;
                         dest.write(sink.tmp.path(), &file_name)?;
                         file_records
                             .lock()
@@ -648,16 +640,16 @@ pub(super) fn run_chunked_parallel(
     summary.bytes_written = agg_bytes.load(Ordering::Relaxed);
     summary.files_produced = agg_files.load(Ordering::Relaxed);
     pb.finish(summary.total_rows);
-    if validate {
+    if plan.validate {
         summary.validated = Some(true);
     }
 
-    let fmt_name = format!("{:?}", export.format).to_lowercase();
-    let comp_name = format!("{:?}", export.compression).to_lowercase();
+    let fmt_name = format!("{:?}", plan.format).to_lowercase();
+    let comp_name = format!("{:?}", plan.compression).to_lowercase();
     for (fname, rows, bytes) in file_records.into_inner().unwrap_or_else(|e| e.into_inner()) {
         let _ = state.record_file(
             &summary.run_id,
-            &export.name,
+            &plan.export_name,
             &fname,
             rows,
             bytes,
@@ -670,7 +662,7 @@ pub(super) fn run_chunked_parallel(
     if !errs.is_empty() {
         anyhow::bail!(
             "export '{}': {} chunks failed:\n{}",
-            export.name,
+            plan.export_name,
             errs.len(),
             errs.join("\n")
         );
@@ -678,7 +670,7 @@ pub(super) fn run_chunked_parallel(
 
     log::info!(
         "export '{}': all {} chunks completed",
-        export.name,
+        plan.export_name,
         total_chunks
     );
     Ok(())
@@ -686,44 +678,43 @@ pub(super) fn run_chunked_parallel(
 
 // ─── Chunk checkpoint (SQLite plan + resume) ─────────────────
 
-fn chunk_max_attempts_for_export(export: &ExportConfig, tuning: &SourceTuning) -> u32 {
-    export
-        .chunk_max_attempts
-        .unwrap_or_else(|| tuning.max_retries.saturating_add(1).max(1))
+/// Extract the `ChunkedPlan` from a `ResolvedRunPlan`. Panics if the strategy
+/// is not `Chunked` — all callers in this module only run for chunked plans.
+fn chunked_plan(plan: &ResolvedRunPlan) -> &ChunkedPlan {
+    match &plan.strategy {
+        ExtractionStrategy::Chunked(cp) => cp,
+        _ => unreachable!("chunked runner called with non-chunked plan"),
+    }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn ensure_chunk_checkpoint_plan(
     state: &StateStore,
-    export: &ExportConfig,
+    plan: &ResolvedRunPlan,
+    cp: &ChunkedPlan,
     summary: &mut RunSummary,
-    base_query: &str,
-    col: &str,
     chunks: &[(i64, i64)],
-    resume: bool,
-    tuning: &SourceTuning,
 ) -> Result<String> {
     let plan_hash = chunk_plan_fingerprint(
-        base_query,
-        col,
-        export.chunk_size,
-        export.chunk_dense,
-        export.chunk_by_days,
+        &plan.base_query,
+        &cp.column,
+        cp.chunk_size,
+        cp.dense,
+        cp.by_days,
     );
-    let max_att = chunk_max_attempts_for_export(export, tuning);
+    let max_att = cp.max_attempts;
 
-    if resume {
-        let Some((rid, stored_hash)) = state.find_in_progress_chunk_run(&export.name)? else {
+    if plan.resume {
+        let Some((rid, stored_hash)) = state.find_in_progress_chunk_run(&plan.export_name)? else {
             anyhow::bail!(
                 "export '{}': --resume but no in-progress chunk checkpoint; run without --resume first or `rivet state reset-chunks --export {}`",
-                export.name,
-                export.name
+                plan.export_name,
+                plan.export_name
             );
         };
         if stored_hash != plan_hash {
             anyhow::bail!(
                 "export '{}': chunk plan fingerprint mismatch (query, chunk_column, chunk_size, or chunk_dense changed); cannot resume",
-                export.name
+                plan.export_name
             );
         }
         summary.run_id = rid.clone();
@@ -731,56 +722,53 @@ fn ensure_chunk_checkpoint_plan(
         if n > 0 {
             log::warn!(
                 "export '{}': reset {} stale 'running' chunk task(s) after resume",
-                export.name,
+                plan.export_name,
                 n
             );
         }
         return Ok(rid);
     }
 
-    if let Some((rid, _)) = state.find_in_progress_chunk_run(&export.name)? {
+    if let Some((rid, _)) = state.find_in_progress_chunk_run(&plan.export_name)? {
         anyhow::bail!(
             "export '{}': chunk checkpoint run '{}' still in progress; use `rivet run --resume` or `rivet state reset-chunks --export {}`",
-            export.name,
+            plan.export_name,
             rid,
-            export.name
+            plan.export_name
         );
     }
 
-    state.create_chunk_run(&summary.run_id, &export.name, &plan_hash, max_att)?;
+    state.create_chunk_run(&summary.run_id, &plan.export_name, &plan_hash, max_att)?;
     state.insert_chunk_tasks(&summary.run_id, chunks)?;
     log::info!(
         "export '{}': chunk checkpoint: {} tasks saved (run_id={})",
-        export.name,
+        plan.export_name,
         chunks.len(),
         summary.run_id
     );
     Ok(summary.run_id.clone())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn export_one_chunk_range(
     src: &mut dyn Source,
     base_query: &str,
-    col: &str,
+    cp: &ChunkedPlan,
     start: i64,
     end: i64,
     chunk_index: i64,
-    export: &ExportConfig,
-    tuning: &SourceTuning,
-    validate: bool,
+    plan: &ResolvedRunPlan,
 ) -> Result<(usize, Option<String>, u64)> {
     let chunk_query = build_chunk_query_sql(
         base_query,
-        col,
+        &cp.column,
         start,
         end,
-        export.chunk_dense,
-        export.chunk_by_days.is_some(),
+        cp.dense,
+        cp.by_days.is_some(),
     );
 
-    let mut sink = ExportSink::new(export)?;
-    src.export(&chunk_query, None, None, tuning, &mut sink)?;
+    let mut sink = ExportSink::new(plan)?;
+    src.export(&chunk_query, None, None, &plan.tuning, &mut sink)?;
     if let Some(w) = sink.writer.take() {
         w.finish()?;
     }
@@ -789,53 +777,50 @@ fn export_one_chunk_range(
         return Ok((0, None, 0));
     }
 
-    if validate {
-        validate_output(sink.tmp.path(), export.format, sink.total_rows)?;
+    if plan.validate {
+        validate_output(sink.tmp.path(), plan.format, sink.total_rows)?;
     }
     let file_bytes = std::fs::metadata(sink.tmp.path())
         .map(|m| m.len())
         .unwrap_or(0);
 
-    let fmt = format::create_format(export.format, export.compression, export.compression_level);
+    let fmt = format::create_format(plan.format, plan.compression, plan.compression_level);
     let file_name = format!(
         "{}_{}_chunk{}.{}",
-        export.name,
+        plan.export_name,
         chrono::Utc::now().format("%Y%m%d_%H%M%S"),
         chunk_index,
         fmt.file_extension()
     );
-    let dest = destination::create_destination(&export.destination)?;
+    let dest = destination::create_destination(&plan.destination)?;
     dest.write(sink.tmp.path(), &file_name)?;
 
     Ok((sink.total_rows, Some(file_name), file_bytes))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_chunk_with_source_retries(
     source_config: &SourceConfig,
     base_query: &str,
-    col: &str,
+    cp: &ChunkedPlan,
     start: i64,
     end: i64,
     chunk_index: i64,
-    export: &ExportConfig,
-    tuning: &SourceTuning,
-    validate: bool,
+    plan: &ResolvedRunPlan,
 ) -> Result<(usize, Option<String>, u64)> {
     let mut last_err: Option<anyhow::Error> = None;
-    for attempt in 0..=tuning.max_retries {
+    for attempt in 0..=plan.tuning.max_retries {
         if attempt > 0 {
             let (_, _needs_reconnect, extra_delay) = last_err
                 .as_ref()
                 .map(classify_error)
                 .unwrap_or((false, false, 0));
-            let backoff = tuning.retry_backoff_ms * 2u64.pow(attempt - 1) + extra_delay;
+            let backoff = plan.tuning.retry_backoff_ms * 2u64.pow(attempt - 1) + extra_delay;
             log::warn!(
                 "export '{}': chunk {} retry {}/{} in {}ms",
-                export.name,
+                plan.export_name,
                 chunk_index,
                 attempt,
-                tuning.max_retries,
+                plan.tuning.max_retries,
                 backoff
             );
             std::thread::sleep(Duration::from_millis(backoff));
@@ -845,7 +830,7 @@ fn run_chunk_with_source_retries(
             Ok(s) => s,
             Err(e) => {
                 let (transient, _, _) = classify_error(&e);
-                if attempt < tuning.max_retries && transient {
+                if attempt < plan.tuning.max_retries && transient {
                     last_err = Some(e);
                     continue;
                 }
@@ -853,21 +838,11 @@ fn run_chunk_with_source_retries(
             }
         };
 
-        match export_one_chunk_range(
-            &mut *src,
-            base_query,
-            col,
-            start,
-            end,
-            chunk_index,
-            export,
-            tuning,
-            validate,
-        ) {
+        match export_one_chunk_range(&mut *src, base_query, cp, start, end, chunk_index, plan) {
             Ok(v) => return Ok(v),
             Err(e) => {
                 let (transient, _, _) = classify_error(&e);
-                if attempt < tuning.max_retries && transient {
+                if attempt < plan.tuning.max_retries && transient {
                     last_err = Some(e);
                     continue;
                 }
@@ -878,54 +853,42 @@ fn run_chunk_with_source_retries(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("chunk export failed after retries")))
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_chunked_sequential_checkpoint(
     src: &mut dyn Source,
     source_config: &SourceConfig,
     state: &StateStore,
-    base_query: &str,
-    export: &ExportConfig,
-    tuning: &SourceTuning,
-    validate: bool,
+    plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
-    st: Option<&StateStore>,
-    resume: bool,
-    config_path: &str,
+    _config_path: &str,
 ) -> Result<()> {
-    let _ = config_path;
-    let col = export
-        .chunk_column
-        .as_deref()
-        .expect("chunk_column required for chunked mode");
+    let cp = chunked_plan(plan);
 
-    let chunks = if resume {
+    let chunks = if plan.resume {
         vec![]
     } else {
         detect_and_generate_chunks(
             src,
-            base_query,
-            col,
-            export.chunk_size,
-            &export.name,
-            export.chunk_dense,
-            export.chunk_by_days,
+            &plan.base_query,
+            &cp.column,
+            cp.chunk_size,
+            &plan.export_name,
+            cp.dense,
+            cp.by_days,
         )?
     };
 
-    let run_id = ensure_chunk_checkpoint_plan(
-        state, export, summary, base_query, col, &chunks, resume, tuning,
-    )?;
+    let run_id = ensure_chunk_checkpoint_plan(state, plan, cp, summary, &chunks)?;
 
     let total_tasks = state.count_chunk_tasks_total(&run_id).unwrap_or(1);
-    let pb = ChunkProgress::new(&export.name, total_tasks);
+    let pb = ChunkProgress::new(&plan.export_name, total_tasks);
 
-    if !resume && !resource::check_memory(tuning.memory_threshold_mb) {
+    if !plan.resume && !resource::check_memory(plan.tuning.memory_threshold_mb) {
         log::warn!("memory threshold exceeded before chunk export; pausing 5s");
         std::thread::sleep(Duration::from_secs(5));
     }
 
     while let Some((chunk_index, sk, ek)) = state.claim_next_chunk_task(&run_id)? {
-        if !resource::check_memory(tuning.memory_threshold_mb) {
+        if !resource::check_memory(plan.tuning.memory_threshold_mb) {
             log::warn!(
                 "memory threshold exceeded, pausing 5s before chunk {}",
                 chunk_index
@@ -942,7 +905,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
 
         log::info!(
             "export '{}': checkpoint chunk {} ({}..{})",
-            export.name,
+            plan.export_name,
             chunk_index,
             start,
             end
@@ -950,14 +913,12 @@ pub(crate) fn run_chunked_sequential_checkpoint(
 
         match run_chunk_with_source_retries(
             source_config,
-            base_query,
-            col,
+            &plan.base_query,
+            cp,
             start,
             end,
             chunk_index,
-            export,
-            tuning,
-            validate,
+            plan,
         ) {
             Ok((rows, fname, file_bytes)) => {
                 summary.total_rows += rows as i64;
@@ -965,17 +926,15 @@ pub(crate) fn run_chunked_sequential_checkpoint(
                 if rows > 0 {
                     summary.bytes_written += file_bytes;
                     summary.files_produced += 1;
-                    if let Some(name) = &fname
-                        && let Some(store) = st
-                    {
-                        let _ = store.record_file(
+                    if let Some(name) = &fname {
+                        let _ = state.record_file(
                             &summary.run_id,
-                            &export.name,
+                            &plan.export_name,
                             name,
                             rows as i64,
                             file_bytes as i64,
-                            &format!("{:?}", export.format).to_lowercase(),
-                            Some(&format!("{:?}", export.compression).to_lowercase()),
+                            &format!("{:?}", plan.format).to_lowercase(),
+                            Some(&format!("{:?}", plan.compression).to_lowercase()),
                         );
                     }
                 }
@@ -985,7 +944,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
                 let msg = format!("{:#}", e);
                 log::error!(
                     "export '{}': chunk {} failed: {}",
-                    export.name,
+                    plan.export_name,
                     chunk_index,
                     msg
                 );
@@ -998,7 +957,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
     if pending > 0 {
         anyhow::bail!(
             "export '{}': chunk checkpoint incomplete ({} tasks not completed); fix errors and `rivet run --resume` or `rivet state reset-chunks`",
-            export.name,
+            plan.export_name,
             pending
         );
     }
@@ -1007,67 +966,48 @@ pub(crate) fn run_chunked_sequential_checkpoint(
     state.finalize_chunk_run_completed(&run_id)?;
     log::info!(
         "export '{}': chunk checkpoint run completed (run_id={})",
-        export.name,
+        plan.export_name,
         run_id
     );
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn run_chunked_parallel_checkpoint(
     config_path: &str,
     source_config: &SourceConfig,
     state: &StateStore,
-    export: &ExportConfig,
-    tuning: &SourceTuning,
-    config_dir: &Path,
-    validate: bool,
+    plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
-    params: Option<&std::collections::HashMap<String, String>>,
-    resume: bool,
 ) -> Result<()> {
-    let base_query = export.resolve_query(config_dir, params)?;
-    let col = export
-        .chunk_column
-        .as_deref()
-        .expect("chunk_column required for chunked mode");
+    let cp = chunked_plan(plan);
 
-    let chunks = if resume {
+    let chunks = if plan.resume {
         vec![]
     } else {
         let mut src = source::create_source(source_config)?;
         detect_and_generate_chunks(
             &mut *src,
-            &base_query,
-            col,
-            export.chunk_size,
-            &export.name,
-            export.chunk_dense,
-            export.chunk_by_days,
+            &plan.base_query,
+            &cp.column,
+            cp.chunk_size,
+            &plan.export_name,
+            cp.dense,
+            cp.by_days,
         )?
     };
 
-    let run_id = ensure_chunk_checkpoint_plan(
-        state,
-        export,
-        summary,
-        &base_query,
-        col,
-        &chunks,
-        resume,
-        tuning,
-    )?;
+    let run_id = ensure_chunk_checkpoint_plan(state, plan, cp, summary, &chunks)?;
 
     let total_tasks = {
         let tasks = state.list_chunk_tasks_for_run(&run_id)?;
         tasks.len().max(1)
     };
-    let parallel = export.parallel.min(total_tasks);
-    let pb_cp = ChunkProgress::new(&export.name, total_tasks);
+    let parallel = cp.parallel.min(total_tasks);
+    let pb_cp = ChunkProgress::new(&plan.export_name, total_tasks);
     let pb_cp_arc = pb_cp.arc();
     log::info!(
         "export '{}': chunk checkpoint parallel: {} workers, run_id={}",
-        export.name,
+        plan.export_name,
         parallel,
         run_id
     );
@@ -1079,17 +1019,12 @@ pub(super) fn run_chunked_parallel_checkpoint(
     let agg_files = std::sync::atomic::AtomicUsize::new(0);
     let errors = std::sync::Mutex::new(Vec::<String>::new());
 
-    let export_name = export.name.clone();
-    let export_for_workers = export.clone();
-    let format_type = export.format;
-    let dest_config = export.destination.clone();
-    let tuning_cl = tuning.clone();
+    let plan_for_workers = plan.clone();
+    let cp_for_workers = cp.clone();
     let source_config_cl = source_config.clone();
-    let base_query_cl = base_query.clone();
-    let col_owned = col.to_string();
     let config_path_owned = config_path.to_string();
-    let fmt_label = format!("{:?}", export.format).to_lowercase();
-    let comp_label = format!("{:?}", export.compression).to_lowercase();
+    let fmt_label = format!("{:?}", plan.format).to_lowercase();
+    let comp_label = format!("{:?}", plan.compression).to_lowercase();
 
     std::thread::scope(|s| {
         for _ in 0..parallel {
@@ -1099,13 +1034,9 @@ pub(super) fn run_chunked_parallel_checkpoint(
             let agg_bytes = &agg_bytes;
             let agg_files = &agg_files;
             let errors = &errors;
-            let export_name = export_name.clone();
-            let export_worker = export_for_workers.clone();
-            let tuning_w = tuning_cl.clone();
+            let plan_w = plan_for_workers.clone();
+            let cp_w = cp_for_workers.clone();
             let source_config_w = source_config_cl.clone();
-            let base_query_w = base_query_cl.clone();
-            let col_w = col_owned.clone();
-            let dest_config = dest_config.clone();
             let config_path_w = config_path_owned.clone();
             let fmt_label_w = fmt_label.clone();
             let comp_label_w = comp_label.clone();
@@ -1130,7 +1061,7 @@ pub(super) fn run_chunked_parallel_checkpoint(
                         break;
                     };
 
-                    if !resource::check_memory(tuning_w.memory_threshold_mb) {
+                    if !resource::check_memory(plan_w.tuning.memory_threshold_mb) {
                         log::warn!("memory threshold exceeded in worker; pausing 2s");
                         std::thread::sleep(Duration::from_secs(2));
                     }
@@ -1161,24 +1092,25 @@ pub(super) fn run_chunked_parallel_checkpoint(
                     };
 
                     let chunk_query = build_chunk_query_sql(
-                        &base_query_w,
-                        &col_w,
+                        &plan_w.base_query,
+                        &cp_w.column,
                         start,
                         end,
-                        export_worker.chunk_dense,
-                        export_worker.chunk_by_days.is_some(),
+                        cp_w.dense,
+                        cp_w.by_days.is_some(),
                     );
 
                     let result = (|| -> Result<(usize, Option<String>, u64)> {
                         let mut last_err: Option<anyhow::Error> = None;
-                        for attempt in 0..=tuning_w.max_retries {
+                        for attempt in 0..=plan_w.tuning.max_retries {
                             if attempt > 0 {
                                 let (_, _, extra_delay) = last_err
                                     .as_ref()
                                     .map(classify_error)
                                     .unwrap_or((false, false, 0));
-                                let backoff =
-                                    tuning_w.retry_backoff_ms * 2u64.pow(attempt - 1) + extra_delay;
+                                let backoff = plan_w.tuning.retry_backoff_ms
+                                    * 2u64.pow(attempt - 1)
+                                    + extra_delay;
                                 std::thread::sleep(Duration::from_millis(backoff));
                             }
 
@@ -1186,7 +1118,7 @@ pub(super) fn run_chunked_parallel_checkpoint(
                                 Ok(s) => s,
                                 Err(e) => {
                                     let (transient, _, _) = classify_error(&e);
-                                    if attempt < tuning_w.max_retries && transient {
+                                    if attempt < plan_w.tuning.max_retries && transient {
                                         last_err = Some(e);
                                         continue;
                                     }
@@ -1194,14 +1126,14 @@ pub(super) fn run_chunked_parallel_checkpoint(
                                 }
                             };
 
-                            let mut sink = ExportSink::new(&export_worker)?;
+                            let mut sink = ExportSink::new(&plan_w)?;
 
                             let export_attempt = (|| -> Result<(usize, Option<String>, u64)> {
                                 thread_src.export(
                                     &chunk_query,
                                     None,
                                     None,
-                                    &tuning_w,
+                                    &plan_w.tuning,
                                     &mut sink,
                                 )?;
                                 if let Some(w) = sink.writer.take() {
@@ -1210,25 +1142,29 @@ pub(super) fn run_chunked_parallel_checkpoint(
                                 if sink.total_rows == 0 {
                                     return Ok((0, None, 0));
                                 }
-                                if validate {
-                                    validate_output(sink.tmp.path(), format_type, sink.total_rows)?;
+                                if plan_w.validate {
+                                    validate_output(
+                                        sink.tmp.path(),
+                                        plan_w.format,
+                                        sink.total_rows,
+                                    )?;
                                 }
                                 let file_bytes = std::fs::metadata(sink.tmp.path())
                                     .map(|m| m.len())
                                     .unwrap_or(0);
                                 let fmt = format::create_format(
-                                    format_type,
-                                    export_worker.compression,
-                                    export_worker.compression_level,
+                                    plan_w.format,
+                                    plan_w.compression,
+                                    plan_w.compression_level,
                                 );
                                 let file_name = format!(
                                     "{}_{}_chunk{}.{}",
-                                    export_name,
+                                    plan_w.export_name,
                                     chrono::Utc::now().format("%Y%m%d_%H%M%S"),
                                     chunk_index,
                                     fmt.file_extension()
                                 );
-                                let dest = destination::create_destination(&dest_config)?;
+                                let dest = destination::create_destination(&plan_w.destination)?;
                                 dest.write(sink.tmp.path(), &file_name)?;
                                 Ok((sink.total_rows, Some(file_name), file_bytes))
                             })();
@@ -1237,7 +1173,7 @@ pub(super) fn run_chunked_parallel_checkpoint(
                                 Ok(v) => return Ok(v),
                                 Err(e) => {
                                     let (transient, _, _) = classify_error(&e);
-                                    if attempt < tuning_w.max_retries && transient {
+                                    if attempt < plan_w.tuning.max_retries && transient {
                                         last_err = Some(e);
                                         continue;
                                     }
@@ -1260,7 +1196,7 @@ pub(super) fn run_chunked_parallel_checkpoint(
                                 {
                                     let _ = store.record_file(
                                         run_id_arc.as_str(),
-                                        &export_name,
+                                        &plan_w.export_name,
                                         name,
                                         rows as i64,
                                         file_bytes as i64,
@@ -1302,7 +1238,7 @@ pub(super) fn run_chunked_parallel_checkpoint(
     summary.bytes_written = agg_bytes.load(Ordering::Relaxed);
     summary.files_produced = agg_files.load(Ordering::Relaxed);
     pb_cp.finish(summary.total_rows);
-    if validate {
+    if plan.validate {
         summary.validated = Some(true);
     }
 
@@ -1310,7 +1246,7 @@ pub(super) fn run_chunked_parallel_checkpoint(
     if !errs.is_empty() {
         anyhow::bail!(
             "export '{}': parallel checkpoint worker errors:\n{}",
-            export.name,
+            plan.export_name,
             errs.join("\n")
         );
     }
@@ -1319,16 +1255,16 @@ pub(super) fn run_chunked_parallel_checkpoint(
     if pending > 0 {
         anyhow::bail!(
             "export '{}': {} chunk task(s) not completed; `rivet run --resume` or inspect `rivet state chunks --export {}`",
-            export.name,
+            plan.export_name,
             pending,
-            export.name
+            plan.export_name
         );
     }
 
     state.finalize_chunk_run_completed(&run_id)?;
     log::info!(
         "export '{}': chunk checkpoint parallel run completed",
-        export.name
+        plan.export_name
     );
     Ok(())
 }

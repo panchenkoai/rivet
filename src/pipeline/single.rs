@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::time::Duration;
 
 use super::RunSummary;
@@ -6,41 +5,35 @@ use super::chunked::{run_chunked_sequential, run_chunked_sequential_checkpoint};
 use super::retry::classify_error;
 use super::sink::{CompletedPart, ExportSink, extract_last_cursor_value};
 use super::validate::validate_output;
-use crate::config::{ExportConfig, ExportMode, SourceConfig, TimeColumnType};
+use crate::config::{SourceConfig, TimeColumnType};
 use crate::error::Result;
+use crate::plan::{ExtractionStrategy, ResolvedRunPlan};
 use crate::source::{self, Source};
 use crate::state::StateStore;
-use crate::tuning::SourceTuning;
 use crate::{destination, format};
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_with_reconnect(
     source_config: &SourceConfig,
     state: &StateStore,
-    export: &ExportConfig,
-    tuning: &SourceTuning,
-    config_dir: &Path,
-    validate: bool,
+    plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
-    params: Option<&std::collections::HashMap<String, String>>,
-    resume: bool,
     config_path: &str,
 ) -> Result<()> {
     let mut last_err: Option<anyhow::Error> = None;
 
-    for attempt in 0..=tuning.max_retries {
+    for attempt in 0..=plan.tuning.max_retries {
         if attempt > 0 {
             summary.retries = attempt;
             let (_, needs_reconnect, extra_delay) = last_err
                 .as_ref()
                 .map(classify_error)
                 .unwrap_or((false, false, 0));
-            let backoff = tuning.retry_backoff_ms * 2u64.pow(attempt - 1) + extra_delay;
+            let backoff = plan.tuning.retry_backoff_ms * 2u64.pow(attempt - 1) + extra_delay;
             log::warn!(
                 "export '{}': retry {}/{} in {}ms{}({})",
-                export.name,
+                plan.export_name,
                 attempt,
-                tuning.max_retries,
+                plan.tuning.max_retries,
                 backoff,
                 if needs_reconnect {
                     " [reconnecting] "
@@ -59,10 +52,10 @@ pub(crate) fn run_with_reconnect(
             Ok(s) => s,
             Err(e) => {
                 let (transient, _, _) = classify_error(&e);
-                if attempt < tuning.max_retries && transient {
+                if attempt < plan.tuning.max_retries && transient {
                     log::warn!(
                         "export '{}': connection failed, will retry: {:#}",
-                        export.name,
+                        plan.export_name,
                         e
                     );
                     last_err = Some(e);
@@ -72,23 +65,11 @@ pub(crate) fn run_with_reconnect(
             }
         };
 
-        match run_export(
-            &mut *src,
-            source_config,
-            state,
-            export,
-            tuning,
-            config_dir,
-            validate,
-            summary,
-            params,
-            resume,
-            config_path,
-        ) {
+        match run_export(&mut *src, source_config, state, plan, summary, config_path) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 let (transient, _, _) = classify_error(&e);
-                if attempt < tuning.max_retries && transient {
+                if attempt < plan.tuning.max_retries && transient {
                     last_err = Some(e);
                     continue;
                 }
@@ -100,139 +81,98 @@ pub(crate) fn run_with_reconnect(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("export failed after retries")))
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_export(
     src: &mut dyn Source,
     source_config: &SourceConfig,
     state: &StateStore,
-    export: &ExportConfig,
-    tuning: &SourceTuning,
-    config_dir: &Path,
-    validate: bool,
+    plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
-    params: Option<&std::collections::HashMap<String, String>>,
-    resume: bool,
     config_path: &str,
 ) -> Result<()> {
-    let base_query = export.resolve_query(config_dir, params)?;
-
-    match export.mode {
-        ExportMode::Full => {
+    match &plan.strategy {
+        ExtractionStrategy::Snapshot => {
             run_single_export(
                 src,
-                &base_query,
+                &plan.base_query,
                 None,
                 None,
-                export,
-                tuning,
-                validate,
+                plan,
                 Some(state),
                 summary,
             )?;
         }
-        ExportMode::Incremental => {
-            let cursor_state = state.get(&export.name)?;
-            let cursor_col = export.cursor_column.as_deref();
+        ExtractionStrategy::Incremental { cursor_column } => {
+            let cursor_state = state.get(&plan.export_name)?;
             run_single_export(
                 src,
-                &base_query,
-                cursor_col,
+                &plan.base_query,
+                Some(cursor_column.as_str()),
                 Some(&cursor_state),
-                export,
-                tuning,
-                validate,
+                plan,
                 Some(state),
                 summary,
             )?;
         }
-        ExportMode::Chunked => {
-            if export.chunk_checkpoint {
-                run_chunked_sequential_checkpoint(
-                    src,
-                    source_config,
-                    state,
-                    &base_query,
-                    export,
-                    tuning,
-                    validate,
-                    summary,
-                    Some(state),
-                    resume,
-                    config_path,
-                )?;
-            } else {
-                run_chunked_sequential(
-                    src,
-                    &base_query,
-                    export,
-                    tuning,
-                    validate,
-                    summary,
-                    Some(state),
-                )?;
-            }
-        }
-        ExportMode::TimeWindow => {
-            let windowed_query = build_time_window_query(
-                &base_query,
-                export
-                    .time_column
-                    .as_deref()
-                    .expect("time_column required for TimeWindow mode"),
-                export.time_column_type,
-                export
-                    .days_window
-                    .expect("days_window required for TimeWindow mode"),
-            );
-            run_single_export(
+        ExtractionStrategy::Chunked(cp) if cp.checkpoint => {
+            run_chunked_sequential_checkpoint(
                 src,
-                &windowed_query,
-                None,
-                None,
-                export,
-                tuning,
-                validate,
-                Some(state),
+                source_config,
+                state,
+                plan,
                 summary,
+                config_path,
             )?;
+        }
+        ExtractionStrategy::Chunked(_) => {
+            run_chunked_sequential(src, plan, summary, Some(state))?;
+        }
+        ExtractionStrategy::TimeWindow {
+            column,
+            column_type,
+            days_window,
+        } => {
+            let windowed_query =
+                build_time_window_query(&plan.base_query, column, *column_type, *days_window);
+            run_single_export(src, &windowed_query, None, None, plan, Some(state), summary)?;
         }
     }
 
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn run_single_export(
     src: &mut dyn Source,
     query: &str,
     cursor_column: Option<&str>,
     cursor: Option<&crate::types::CursorState>,
-    export: &ExportConfig,
-    tuning: &SourceTuning,
-    validate: bool,
+    plan: &ResolvedRunPlan,
     state: Option<&StateStore>,
     summary: &mut RunSummary,
 ) -> Result<()> {
-    let mut sink = ExportSink::new(export)?;
+    let mut sink = ExportSink::new(plan)?;
 
-    src.export(query, cursor_column, cursor, tuning, &mut sink)?;
+    src.export(query, cursor_column, cursor, &plan.tuning, &mut sink)?;
 
     if let Some(w) = sink.writer.take() {
         w.finish()?;
     }
 
     summary.total_rows += sink.total_rows as i64;
-    log::info!("export '{}': {} rows written", export.name, sink.total_rows);
+    log::info!(
+        "export '{}': {} rows written",
+        plan.export_name,
+        sink.total_rows
+    );
 
     if sink.total_rows == 0 {
-        if export.skip_empty {
+        if plan.skip_empty {
             summary.status = "skipped".into();
             log::info!(
                 "export '{}': skipped (0 rows, skip_empty=true)",
-                export.name
+                plan.export_name
             );
         } else {
-            log::info!("export '{}': no data to export", export.name);
+            log::info!("export '{}': no data to export", plan.export_name);
         }
         return Ok(());
     }
@@ -251,10 +191,10 @@ pub(super) fn run_single_export(
             .any(|i| i.severity == crate::quality::Severity::Fail)
         {
             summary.quality_passed = Some(false);
-            anyhow::bail!("export '{}': quality checks failed", export.name);
+            anyhow::bail!("export '{}': quality checks failed", plan.export_name);
         }
     }
-    if export.quality.is_some() {
+    if plan.quality.is_some() {
         summary.quality_passed = Some(true);
     }
 
@@ -265,15 +205,15 @@ pub(super) fn run_single_export(
         });
     }
 
-    let fmt = format::create_format(export.format, export.compression, export.compression_level);
+    let fmt = format::create_format(plan.format, plan.compression, plan.compression_level);
     let ext = fmt.file_extension();
-    let dest = destination::create_destination(&export.destination)?;
+    let dest = destination::create_destination(&plan.destination)?;
     let has_parts = sink.completed_parts.len() > 1;
     let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
 
     for (part_idx, part) in sink.completed_parts.iter().enumerate() {
-        if validate {
-            validate_output(part.tmp.path(), export.format, part.rows)?;
+        if plan.validate {
+            validate_output(part.tmp.path(), plan.format, part.rows)?;
             summary.validated = Some(true);
         }
 
@@ -284,32 +224,37 @@ pub(super) fn run_single_export(
         summary.files_produced += 1;
 
         let file_name = if has_parts {
-            format!("{}_{}_part{}.{}", export.name, ts, part_idx, ext)
+            format!("{}_{}_part{}.{}", plan.export_name, ts, part_idx, ext)
         } else {
-            format!("{}_{}.{}", export.name, ts, ext)
+            format!("{}_{}.{}", plan.export_name, ts, ext)
         };
         dest.write(part.tmp.path(), &file_name)?;
 
         if let Some(st) = state {
             let _ = st.record_file(
                 &summary.run_id,
-                &export.name,
+                &plan.export_name,
                 &file_name,
                 part.rows as i64,
                 file_bytes as i64,
-                &format!("{:?}", export.format).to_lowercase(),
-                Some(&format!("{:?}", export.compression).to_lowercase()),
+                &format!("{:?}", plan.format).to_lowercase(),
+                Some(&format!("{:?}", plan.compression).to_lowercase()),
             );
         }
     }
 
-    if export.mode == ExportMode::Incremental
-        && let (Some(cursor_col), Some(batch), Some(schema), Some(st)) =
-            (&export.cursor_column, &sink.last_batch, &sink.schema, state)
+    if let ExtractionStrategy::Incremental {
+        cursor_column: cursor_col,
+    } = &plan.strategy
+        && let (Some(batch), Some(schema), Some(st)) = (&sink.last_batch, &sink.schema, state)
         && let Some(last_val) = extract_last_cursor_value(batch, cursor_col, schema)
     {
-        st.update(&export.name, &last_val)?;
-        log::info!("export '{}': cursor updated to '{}'", export.name, last_val);
+        st.update(&plan.export_name, &last_val)?;
+        log::info!(
+            "export '{}': cursor updated to '{}'",
+            plan.export_name,
+            last_val
+        );
     }
 
     if let (Some(schema), Some(st)) = (&sink.schema, state) {
@@ -322,10 +267,10 @@ pub(super) fn run_single_export(
             })
             .collect();
 
-        match st.detect_schema_change(&export.name, &columns) {
+        match st.detect_schema_change(&plan.export_name, &columns) {
             Ok(Some(change)) => {
                 summary.schema_changed = Some(true);
-                log::warn!("export '{}': schema changed!", export.name);
+                log::warn!("export '{}': schema changed!", plan.export_name);
                 if !change.added.is_empty() {
                     log::warn!("  added columns: {}", change.added.join(", "));
                 }
@@ -343,7 +288,7 @@ pub(super) fn run_single_export(
         }
     }
 
-    log::info!("export '{}' completed successfully", export.name);
+    log::info!("export '{}' completed successfully", plan.export_name);
     Ok(())
 }
 

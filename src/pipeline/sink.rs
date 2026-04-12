@@ -5,10 +5,11 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
 use super::chunked::RIVET_CHUNK_RN_COL;
-use crate::config::{CompressionType, ExportConfig, FormatType, MetaColumns};
+use crate::config::{CompressionType, FormatType, MetaColumns};
 use crate::enrich;
 use crate::error::Result;
 use crate::format::{self, FormatWriter};
+use crate::plan::{ExtractionStrategy, ResolvedRunPlan};
 use crate::source::BatchSink;
 
 pub(crate) struct CompletedPart {
@@ -39,32 +40,32 @@ pub(crate) struct ExportSink {
 }
 
 impl ExportSink {
-    pub fn new(export: &ExportConfig) -> Result<Self> {
+    pub fn new(plan: &ResolvedRunPlan) -> Result<Self> {
         let tmp = tempfile::NamedTempFile::new()?;
         let exported_at_us = chrono::Utc::now().timestamp_micros();
+        let strip_internal_column = match &plan.strategy {
+            ExtractionStrategy::Chunked(cp) if cp.dense => Some(RIVET_CHUNK_RN_COL.to_string()),
+            _ => None,
+        };
         Ok(Self {
             writer: None,
-            format_type: export.format,
-            compression: export.compression,
-            compression_level: export.compression_level,
+            format_type: plan.format,
+            compression: plan.compression,
+            compression_level: plan.compression_level,
             tmp,
             total_rows: 0,
             part_rows: 0,
             last_batch: None,
             schema: None,
-            meta: export.meta_columns.clone(),
+            meta: plan.meta_columns.clone(),
             enriched_schema: None,
             exported_at_us,
             quality_null_counts: std::collections::HashMap::new(),
             quality_unique_sets: std::collections::HashMap::new(),
-            quality_columns: export.quality.clone(),
-            max_file_size: export.max_file_size_bytes(),
+            quality_columns: plan.quality.clone(),
+            max_file_size: plan.max_file_size_bytes,
             completed_parts: Vec::new(),
-            strip_internal_column: if export.chunk_dense {
-                Some(RIVET_CHUNK_RN_COL.to_string())
-            } else {
-                None
-            },
+            strip_internal_column,
         })
     }
 
