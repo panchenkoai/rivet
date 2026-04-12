@@ -133,6 +133,16 @@ impl super::Source for PostgresSource {
         if let Ok(Some(v)) = row.try_get::<_, Option<f64>>(0) {
             return Ok(Some(v.to_string()));
         }
+        // TIMESTAMP / DATE / TIMESTAMPTZ — required for MIN/MAX on time columns (e.g. chunk_by_days)
+        if let Ok(Some(v)) = row.try_get::<_, Option<chrono::NaiveDateTime>>(0) {
+            return Ok(Some(v.format("%Y-%m-%d %H:%M:%S").to_string()));
+        }
+        if let Ok(Some(v)) = row.try_get::<_, Option<chrono::NaiveDate>>(0) {
+            return Ok(Some(v.format("%Y-%m-%d").to_string()));
+        }
+        if let Ok(Some(v)) = row.try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(0) {
+            return Ok(Some(v.format("%Y-%m-%d %H:%M:%S").to_string()));
+        }
         if let Ok(Some(v)) = row.try_get::<_, Option<String>>(0) {
             return Ok(Some(v));
         }

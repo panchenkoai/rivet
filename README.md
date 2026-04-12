@@ -2,6 +2,8 @@
 
 **Lightweight, source-safe data extraction from PostgreSQL and MySQL to Parquet/CSV.**
 
+**Names:** the project and CLI are **Rivet**; the command you run is **`rivet`**. On [crates.io](https://crates.io/crates/rivet-cli) the package is published as **`rivet-cli`** because the crate name `rivet` was already taken. Homebrew and release archives still install the **`rivet`** binary.
+
 Rivet is a CLI tool that exports query results from relational databases to files -- locally or in cloud storage (S3, GCS). It is **extract-only**: no loading, no merging, no CDC. It is designed to be gentle on production databases through tuning profiles, preflight health checks, and intelligent retry with backoff.
 
 ### What Rivet does
@@ -215,6 +217,8 @@ RUST_LOG=info  rivet run --config rivet.yaml    # normal (progress, summary)
 RUST_LOG=warn  rivet run --config rivet.yaml    # quiet (errors and warnings only)
 ```
 
+**Chunked mode:** in a normal terminal, **`rivet run`** shows a **progress bar** per chunked export (chunks completed, rows so far, ETA). It does not require **`RUST_LOG`** (that only tunes text logs). If you do not see the bar, you are probably not on a TTY (e.g. piped stderr); use `RUST_LOG=info` to follow progress in the log. Example config: [`dev/bench_chunked_p4_safe.yaml`](dev/bench_chunked_p4_safe.yaml). Details: [docs/modes/chunked.md](docs/modes/chunked.md#progress-bar-chunked-exports).
+
 **Shell completions:**
 
 ```bash
@@ -243,6 +247,7 @@ rivet state files --config <path>                  # show file manifest (which r
 rivet metrics --config <path>                      # show export run history
 rivet metrics --config <path> --export <name>      # metrics for one export
 rivet metrics --config <path> --last N             # last N runs (default 20)
+rivet init --source <url> [--table <name>] [--schema <name>] [-o <file>]   # scaffold YAML from DB (see docs/reference/init.md)
 rivet completions <shell>                          # generate shell completions (bash|zsh|fish|powershell)
 ```
 

@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.2.0-beta.4 (2026-04-12)
+
+### New features
+
+**`rivet init` — YAML scaffolding from a live database**
+
+- **`--table`** — introspect one table (`schema.table` supported on PostgreSQL) and emit a single export with suggested `mode` (`full` / `incremental` / `chunked`) from metadata and row estimates.
+- Omit **`--table`** — emit **one YAML** with an export per **base table and view** in a PostgreSQL schema (default `--schema public`) or in a MySQL database (from the URL path or `--schema` when the URL has no database).
+- Output uses **`url_env: DATABASE_URL`** by default so passwords are not written into the file.
+
+**Chunked export progress bar**
+
+- Terminal progress (chunks completed, cumulative rows, ETA) during **`mode: chunked`** runs when stderr is a TTY (`indicatif`).
+
+### Documentation
+
+- [docs/reference/init.md](docs/reference/init.md) — full `rivet init` guide (Docker Compose, `dev/regenerate_docker_init_configs.sh`)
+- [docs/reference/cli.md](docs/reference/cli.md) — `rivet init` command table
+- [docs/getting-started.md](docs/getting-started.md) — optional “Scaffold with rivet init” step
+- [README.md](README.md) — CLI quick reference; product vs `rivet-cli` crate name; chunked progress + `dev/bench_chunked_p4_safe.yaml` example
+- [USER_GUIDE.md](USER_GUIDE.md) — `rivet init` optional section
+- [docs/modes/chunked.md](docs/modes/chunked.md) — progress bar (independent of `RUST_LOG`), bench config examples
+- [docs/README.md](docs/README.md) — `rivet init` and chunked progress pointers
+- E2E: `dev/e2e/run_e2e.sh` section 16 — `rivet init` against docker-compose Postgres/MySQL
+
+### Fixes
+
+**PostgreSQL `query_scalar` and date-based chunking**
+
+`MIN`/`MAX` on `timestamp` / `timestamptz` / `date` columns were not decoded in `PostgresSource::query_scalar` (only numeric and plain text types were). That returned a false empty result and broke **`chunk_by_days`** (and any path using time-column scalars). Chrono types are now formatted to strings that `parse_date_flexible` accepts.
+
+### Other
+
+- `Cargo.toml` `[package] exclude` moved from invalid `[[bin]]` key to `[package]`
+- `dev/regenerate_docker_init_configs.sh` and sample `dev/init_generated/` YAMLs from docker-compose schemas
+- `.gitignore` — `dev/e2e/.init_e2e_scratch/`
+
+---
+
 ## 0.2.0-beta.3 (2026-04-12)
 
 ### New features

@@ -7,6 +7,7 @@ mod destination;
 mod enrich;
 mod error;
 mod format;
+mod init;
 mod notify;
 mod pipeline;
 mod preflight;
@@ -85,6 +86,21 @@ enum Commands {
         /// Shell to generate completions for
         #[arg(value_enum)]
         shell: Shell,
+    },
+    /// Generate a config scaffold from a live database (connect + introspect)
+    Init {
+        /// Database URL (postgresql:// or mysql://)
+        #[arg(long)]
+        source: String,
+        /// Single table, optionally schema-qualified (e.g. public.orders). Omit to emit all tables/views in a Postgres schema or MySQL database.
+        #[arg(long)]
+        table: Option<String>,
+        /// PostgreSQL: schema to export (default public). MySQL: database name if missing from the URL, or override URL database.
+        #[arg(long)]
+        schema: Option<String>,
+        /// Write output to this file instead of stdout
+        #[arg(short, long)]
+        output: Option<String>,
     },
     /// Show export metrics history
     Metrics {
@@ -188,6 +204,19 @@ fn main() -> Result<()> {
         }
         Commands::Doctor { config } => {
             preflight::doctor(&config)?;
+        }
+        Commands::Init {
+            source,
+            table,
+            schema,
+            output,
+        } => {
+            init::init(
+                &source,
+                table.as_deref(),
+                schema.as_deref(),
+                output.as_deref(),
+            )?;
         }
         Commands::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "rivet", &mut std::io::stdout());

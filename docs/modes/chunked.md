@@ -45,6 +45,22 @@ rivet check --config large_table.yaml
 rivet run --config large_table.yaml --validate --reconcile
 ```
 
+## Progress bar (chunked exports)
+
+In **`mode: chunked`**, Rivet shows a **terminal progress bar** while chunks run: export name, `current/total` chunks, running row count, elapsed time, and ETA. It appears when stderr is an **interactive TTY** (a normal terminal window). The bar does **not** depend on **`RUST_LOG`** (that variable only controls `env_logger` text lines). In CI, or when you **pipe or redirect** stderr, the bar is usually suppressed — then set **`RUST_LOG=info`** (or `debug`) to follow progress in the log instead.
+
+Use a **small `chunk_size`** relative to your table if you want many steps on the bar (each finished chunk advances it once). **`parallel: 1`** still updates the bar after each sequential chunk.
+
+**Ready-made example in this repo:** [`dev/bench_chunked_p4_safe.yaml`](../../dev/bench_chunked_p4_safe.yaml) exports PostgreSQL `content_items` with **`parallel: 4`** and **`tuning.profile: safe`** (good for trying the bar on a wide table without hammering the source). Related variants: `dev/bench_chunked_p2.yaml`, `dev/bench_chunked_p4.yaml`.
+
+```bash
+# From repo root; Postgres up + seeded (e.g. docker compose + cargo run --bin seed ...)
+mkdir -p dev/output/bench
+rivet check --config dev/bench_chunked_p4_safe.yaml
+rivet run --config dev/bench_chunked_p4_safe.yaml
+# Optional: RUST_LOG=info for more log detail; RUST_LOG=warn to reduce log noise (bar unchanged in a TTY)
+```
+
 ## What happens
 
 1. Rivet queries `SELECT MIN(id), MAX(id) FROM orders` to determine the range

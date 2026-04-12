@@ -108,6 +108,38 @@ Output:
 
 ---
 
+## `rivet init`
+
+Generate a YAML config scaffold by connecting to PostgreSQL or MySQL and introspecting tables (read-only). Does **not** run an export.
+
+```bash
+rivet init --source <URL> [--table <NAME>] [--schema <NAME>] [-o <PATH>]
+```
+
+| Flag | Short | Type | Description |
+|------|-------|------|-------------|
+| `--source` | | string | Connection URL: `postgresql://` or `mysql://` **(required)** |
+| `--table` | | string | Single table; optional `schema.table` on PostgreSQL. Omit to scaffold **all** tables/views in a Postgres schema or MySQL database |
+| `--schema` | | string | **PostgreSQL:** schema to list (default `public`). **MySQL:** database name if not in the URL, or override URL database |
+| `--output` | `-o` | string | Write YAML to file (default: print to stdout) |
+
+**Examples**
+
+```bash
+# One table → one export block
+rivet init --source "$DATABASE_URL" --table orders -o rivet.yaml
+
+# PostgreSQL: entire schema (default public)
+rivet init --source "$DATABASE_URL" --schema public -o all_public.yaml
+
+# MySQL: entire database from URL path
+rivet init --source 'mysql://user:pass@host:3306/mydb' -o all_mydb.yaml
+```
+
+Narrative guide, heuristics, and Docker Compose examples: **[init.md](init.md)**.
+
+---
+
 ## `rivet metrics`
 
 Show export run history (duration, row count, file size, status).

@@ -1,8 +1,10 @@
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use super::RunSummary;
+use super::progress::ChunkProgress;
 use super::retry::classify_error;
 use super::sink::ExportSink;
 use super::validate::validate_output;
@@ -405,6 +407,8 @@ pub(crate) fn run_chunked_sequential(
         chunks.len()
     );
 
+    let pb = ChunkProgress::new(&export.name, chunks.len());
+
     for (i, (start, end)) in chunks.iter().enumerate() {
         if !resource::check_memory(tuning.memory_threshold_mb) {
             log::warn!("memory threshold exceeded, pausing 5s before chunk {}", i);
@@ -429,6 +433,7 @@ pub(crate) fn run_chunked_sequential(
         }
 
         summary.total_rows += sink.total_rows as i64;
+        pb.inc(summary.total_rows);
         log::info!(
             "export '{}': chunk {} -- {} rows",
             export.name,
@@ -473,6 +478,7 @@ pub(crate) fn run_chunked_sequential(
         }
     }
 
+    pb.finish(summary.total_rows);
     log::info!("export '{}': all chunks completed", export.name);
     Ok(())
 }
@@ -526,6 +532,8 @@ pub(super) fn run_chunked_parallel(
     let errors = std::sync::Mutex::new(Vec::<String>::new());
     let file_records: std::sync::Mutex<Vec<(String, i64, i64)>> = std::sync::Mutex::new(Vec::new());
     let semaphore = AtomicUsize::new(0);
+    let pb = ChunkProgress::new(&export.name, total_chunks);
+    let pb_arc = pb.arc();
 
     std::thread::scope(|s| {
         for (i, (start, end)) in chunks.iter().enumerate() {
@@ -556,6 +564,7 @@ pub(super) fn run_chunked_parallel(
             let errors = &errors;
             let file_records = &file_records;
             let semaphore = &semaphore;
+            let pb_thread = Arc::clone(&pb_arc);
             let start = *start;
             let end = *end;
 
@@ -610,6 +619,8 @@ pub(super) fn run_chunked_parallel(
                     }
 
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    pb_thread.set_message(format!("{} rows", agg_rows.load(Ordering::Relaxed)));
+                    pb_thread.inc(1);
                     log::info!(
                         "export '{}': chunk {}/{} done ({} rows)",
                         export_name,
@@ -636,6 +647,7 @@ pub(super) fn run_chunked_parallel(
     summary.total_rows = agg_rows.load(Ordering::Relaxed);
     summary.bytes_written = agg_bytes.load(Ordering::Relaxed);
     summary.files_produced = agg_files.load(Ordering::Relaxed);
+    pb.finish(summary.total_rows);
     if validate {
         summary.validated = Some(true);
     }
@@ -904,6 +916,9 @@ pub(crate) fn run_chunked_sequential_checkpoint(
         state, export, summary, base_query, col, &chunks, resume, tuning,
     )?;
 
+    let total_tasks = state.count_chunk_tasks_total(&run_id).unwrap_or(1);
+    let pb = ChunkProgress::new(&export.name, total_tasks);
+
     if !resume && !resource::check_memory(tuning.memory_threshold_mb) {
         log::warn!("memory threshold exceeded before chunk export; pausing 5s");
         std::thread::sleep(Duration::from_secs(5));
@@ -946,6 +961,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
         ) {
             Ok((rows, fname, file_bytes)) => {
                 summary.total_rows += rows as i64;
+                pb.inc(summary.total_rows);
                 if rows > 0 {
                     summary.bytes_written += file_bytes;
                     summary.files_produced += 1;
@@ -987,6 +1003,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
         );
     }
 
+    pb.finish(summary.total_rows);
     state.finalize_chunk_run_completed(&run_id)?;
     log::info!(
         "export '{}': chunk checkpoint run completed (run_id={})",
@@ -1046,6 +1063,8 @@ pub(super) fn run_chunked_parallel_checkpoint(
         tasks.len().max(1)
     };
     let parallel = export.parallel.min(total_tasks);
+    let pb_cp = ChunkProgress::new(&export.name, total_tasks);
+    let pb_cp_arc = pb_cp.arc();
     log::info!(
         "export '{}': chunk checkpoint parallel: {} workers, run_id={}",
         export.name,
@@ -1090,6 +1109,7 @@ pub(super) fn run_chunked_parallel_checkpoint(
             let config_path_w = config_path_owned.clone();
             let fmt_label_w = fmt_label.clone();
             let comp_label_w = comp_label.clone();
+            let pb_w = Arc::clone(&pb_cp_arc);
 
             s.spawn(move || {
                 loop {
@@ -1256,6 +1276,8 @@ pub(super) fn run_chunked_parallel_checkpoint(
                                 rows as i64,
                                 fname.as_deref(),
                             );
+                            pb_w.set_message(format!("{} rows", agg_rows.load(Ordering::Relaxed)));
+                            pb_w.inc(1);
                         }
                         Err(e) => {
                             let msg = format!("{:#}", e);
@@ -1279,6 +1301,7 @@ pub(super) fn run_chunked_parallel_checkpoint(
     summary.total_rows = agg_rows.load(Ordering::Relaxed);
     summary.bytes_written = agg_bytes.load(Ordering::Relaxed);
     summary.files_produced = agg_files.load(Ordering::Relaxed);
+    pb_cp.finish(summary.total_rows);
     if validate {
         summary.validated = Some(true);
     }

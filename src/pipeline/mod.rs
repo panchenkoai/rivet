@@ -1,5 +1,6 @@
 mod chunked;
 mod cli;
+pub(crate) mod progress;
 mod retry;
 mod single;
 mod sink;

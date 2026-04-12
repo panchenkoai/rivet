@@ -1,13 +1,14 @@
 [package]
 name = "rivet-cli"
-version = "0.2.0-beta.3"
+version = "0.2.0-beta.4"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
 repository = "https://github.com/panchenkoai/rivet"
-description = "CLI tool to export PostgreSQL and MySQL to Parquet/CSV (local, S3, GCS) with tuning, preflight checks, and SQLite-backed state."
+description = "Rivet: PostgreSQL/MySQL → Parquet/CSV (local, S3, GCS). Crate name rivet-cli; binary rivet."
 readme = "README.md"
 default-run = "rivet"
+exclude = ["dev/", "USER_TEST_PLAN.md", "tests/", ".github/"]
 
 [lib]
 name = "rivet"
@@ -16,7 +17,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "rivet"
 path = "src/main.rs"
-exclude = ["dev/", "USER_TEST_PLAN.md", "tests/", ".github/"]
 
 [dependencies]
 anyhow = "1"
@@ -43,6 +43,7 @@ tikv-jemallocator = { version = "0.6", optional = true }
 tokio = { version = "1.50.0", features = ["rt-multi-thread"] }
 reqwest = { version = "0.13.2", features = ["blocking", "json"] }
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+indicatif = "0.17"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2 = "0.4"

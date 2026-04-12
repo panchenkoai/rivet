@@ -42,6 +42,23 @@ rivet completions bash > /etc/bash_completion.d/rivet
 rivet completions fish > ~/.config/fish/completions/rivet.fish
 ```
 
+### Optional: generate a starter config (`rivet init`)
+
+Instead of writing YAML by hand, you can **connect to Postgres or MySQL** and emit a scaffold: column lists, rough row estimates, and suggested `mode` (`full` / `incremental` / `chunked`). Output uses `url_env: DATABASE_URL` so passwords are not embedded.
+
+```bash
+export DATABASE_URL='postgresql://user:pass@localhost:5432/mydb'
+rivet init --source "$DATABASE_URL" --table orders -o rivet.yaml
+
+# All tables/views in a PostgreSQL schema (default: public)
+rivet init --source "$DATABASE_URL" --schema public -o rivet_all.yaml
+
+# All tables/views in a MySQL database (name from URL, or --schema if URL has no database)
+rivet init --source 'mysql://user:pass@localhost:3306/mydb' -o rivet_all.yaml
+```
+
+Full guide: [docs/reference/init.md](docs/reference/init.md). Same flow as in [docs/getting-started.md](docs/getting-started.md) § 2.5.
+
 ---
 
 ## 2. Connect to your database

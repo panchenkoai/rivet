@@ -30,6 +30,8 @@ exports:
 
 Replace the connection URL with your actual database credentials.
 
+**Optional:** scaffold a config from a live table or whole schema with [`rivet init`](../reference/init.md) (e.g. `rivet init --source "$DATABASE_URL" --table users -o my_first_export.yaml`).
+
 ## Step 2: Verify connectivity
 
 ```bash

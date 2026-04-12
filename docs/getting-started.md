@@ -73,6 +73,8 @@ sudo mv target/release/rivet /usr/local/bin/
 rivet --version
 ```
 
+From the registry, install the **`rivet-cli`** crate (binary name stays **`rivet`**): `cargo install rivet-cli`.
+
 ### Optional: shell completions
 
 ```bash
@@ -123,6 +125,26 @@ source:
   password_env: DB_PASSWORD   # reads from $DB_PASSWORD
   database: production
 ```
+
+## 2.5 Scaffold a config with `rivet init` (optional)
+
+If you prefer to start from your real tables instead of copying a template, use **`rivet init`**. It connects once, reads column lists and rough row estimates, and writes a YAML file with `url_env: DATABASE_URL` and suggested export modes.
+
+```bash
+# Single table
+export DATABASE_URL='postgresql://user:pass@localhost:5432/mydb'
+rivet init --source "$DATABASE_URL" --table orders -o my_export.yaml
+
+# PostgreSQL: all tables/views in schema public
+rivet init --source "$DATABASE_URL" --schema public -o my_export.yaml
+
+# MySQL: all tables/views in the database from the URL
+rivet init --source 'mysql://user:pass@localhost:3306/mydb' -o my_export.yaml
+```
+
+Then review the file, adjust destinations and tuning, and continue with `rivet doctor` / `rivet check` below.
+
+Full details: [reference/init.md](reference/init.md).
 
 ## 3. Verify connectivity
 

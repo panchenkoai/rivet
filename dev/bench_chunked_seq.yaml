@@ -10,7 +10,7 @@ exports:
     mode: chunked
     chunk_column: id
     chunk_size: 50000
-    parallel: 1
+    parallel: 2
     format: parquet
     destination:
       type: local

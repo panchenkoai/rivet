@@ -423,6 +423,15 @@ impl StateStore {
         Ok(())
     }
 
+    pub fn count_chunk_tasks_total(&self, run_id: &str) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM chunk_task WHERE run_id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
     pub fn count_chunk_tasks_not_completed(&self, run_id: &str) -> Result<i64> {
         let n: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM chunk_task WHERE run_id = ?1 AND status != 'completed'",

@@ -45,6 +45,7 @@ assert_no_file() {
 
 cleanup() {
     rm -rf "$OUT"
+    rm -rf dev/e2e/.init_e2e_scratch
     rm -f dev/e2e/.rivet_state.db*
 }
 
@@ -434,6 +435,72 @@ else
     skip "MySQL date-chunked: run"
     skip "MySQL date-chunked: files"
     skip "MySQL check: date-chunked strategy"
+fi
+
+# ──────────────────────────────────────────────────────────────
+section "16. rivet init (YAML scaffold)"
+
+INIT_TMP="dev/e2e/.init_e2e_scratch"
+rm -rf "$INIT_TMP"
+mkdir -p "$INIT_TMP"
+
+PG_INIT_URL="postgresql://rivet:rivet@localhost:5432/rivet?sslmode=disable"
+MY_INIT_URL="mysql://rivet:rivet@localhost:3306/rivet"
+
+$RIVET init --source "$PG_INIT_URL" --table users -o "$INIT_TMP/pg_users.yaml" >/dev/null 2>&1 \
+    && pass "PG init: single table (users)" \
+    || fail "PG init: single table (users)"
+grep -q "exports:" "$INIT_TMP/pg_users.yaml" \
+    && grep -q "name: users" "$INIT_TMP/pg_users.yaml" \
+    && grep -q "mode:" "$INIT_TMP/pg_users.yaml" \
+    && pass "PG init: users.yaml structure" \
+    || fail "PG init: users.yaml missing exports/name/mode"
+
+$RIVET init --source "$PG_INIT_URL" --schema public -o "$INIT_TMP/pg_schema.yaml" >/dev/null 2>&1 \
+    && pass "PG init: full schema (public)" \
+    || fail "PG init: full schema (public)"
+pg_init_count=$(grep -E '^  - name:' "$INIT_TMP/pg_schema.yaml" 2>/dev/null | wc -l | tr -d '[:space:]')
+if [ "${pg_init_count:-0}" -ge 5 ]; then
+    pass "PG init: multiple exports in schema file (n=$pg_init_count)"
+else
+    fail "PG init: expected >=5 exports in schema file, got ${pg_init_count:-0}"
+fi
+grep -q 'PostgreSQL schema "public"' "$INIT_TMP/pg_schema.yaml" \
+    && pass "PG init: schema banner in header" \
+    || fail "PG init: expected PostgreSQL schema banner"
+
+export DATABASE_URL="$PG_INIT_URL"
+$RIVET check --config "$INIT_TMP/pg_users.yaml" >/dev/null 2>&1 \
+    && pass "PG init: rivet check accepts generated file" \
+    || fail "PG init: rivet check on generated file"
+unset DATABASE_URL
+
+if $mysql_ok; then
+    $RIVET init --source "$MY_INIT_URL" --table orders -o "$INIT_TMP/mysql_orders.yaml" >/dev/null 2>&1 \
+        && pass "MySQL init: single table (orders)" \
+        || fail "MySQL init: single table (orders)"
+    grep -q "name: orders" "$INIT_TMP/mysql_orders.yaml" \
+        && pass "MySQL init: orders.yaml structure" \
+        || fail "MySQL init: orders.yaml missing name"
+
+    $RIVET init --source "$MY_INIT_URL" -o "$INIT_TMP/mysql_db.yaml" >/dev/null 2>&1 \
+        && pass "MySQL init: full database" \
+        || fail "MySQL init: full database"
+    my_init_count=$(grep -E '^  - name:' "$INIT_TMP/mysql_db.yaml" 2>/dev/null | wc -l | tr -d '[:space:]')
+    if [ "${my_init_count:-0}" -ge 5 ]; then
+        pass "MySQL init: multiple exports (n=$my_init_count)"
+    else
+        fail "MySQL init: expected >=5 exports, got ${my_init_count:-0}"
+    fi
+    grep -q 'MySQL database "rivet"' "$INIT_TMP/mysql_db.yaml" \
+        && pass "MySQL init: database banner in header" \
+        || fail "MySQL init: expected MySQL database banner"
+else
+    skip "MySQL init: single table"
+    skip "MySQL init: orders.yaml structure"
+    skip "MySQL init: full database"
+    skip "MySQL init: multiple exports"
+    skip "MySQL init: database banner"
 fi
 
 # ──────────────────────────────────────────────────────────────

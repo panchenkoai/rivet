@@ -2,6 +2,8 @@
 
 Rivet exports data from PostgreSQL and MySQL to Parquet/CSV files on local disk, S3, or GCS.
 
+Install from Rust: `cargo install rivet-cli` (the crates.io name is `rivet-cli`; the binary is `rivet`).
+
 This folder contains modular guides for running your first pilot exports and a complete configuration reference.
 
 ## Start Here
@@ -18,7 +20,7 @@ This folder contains modular guides for running your first pilot exports and a c
 |------|-------------|-------|
 | **full** | Snapshot the entire result set each run | [modes/full.md](modes/full.md) |
 | **incremental** | Only export rows newer than the last cursor | [modes/incremental.md](modes/incremental.md) |
-| **chunked** | Split large tables into parallel ranges by ID | [modes/chunked.md](modes/chunked.md) |
+| **chunked** | Split large tables into parallel ranges by ID; terminal progress bar while chunks run (see guide) | [modes/chunked.md](modes/chunked.md) |
 | **time_window** | Export a rolling N-day window | [modes/time-window.md](modes/time-window.md) |
 
 ## Destinations
@@ -37,6 +39,7 @@ This folder contains modular guides for running your first pilot exports and a c
 | Complete YAML config reference | [reference/config.md](reference/config.md) |
 | Tuning profiles and parameters | [reference/tuning.md](reference/tuning.md) |
 | CLI commands and flags | [reference/cli.md](reference/cli.md) |
+| `rivet init` (scaffold YAML from the database) | [reference/init.md](reference/init.md) |
 
 ## Production
 
@@ -46,7 +49,7 @@ This folder contains modular guides for running your first pilot exports and a c
 
 ## Example Configs
 
-Ready-to-use YAML templates live in the [`examples/`](../examples/) directory.
+Ready-to-use YAML templates live in the [`examples/`](../examples/) directory. To scaffold YAML from a live database (`rivet init`), see [reference/init.md](reference/init.md) and the root [`docker-compose.yaml`](../docker-compose.yaml).
 
 ## Deep Reference
 
