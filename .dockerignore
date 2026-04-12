@@ -1,0 +1,4 @@
+# Keep build context small (otherwise COPY . . ships target/, .git/, etc.)
+target
+.git
+.github

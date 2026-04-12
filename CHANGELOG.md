@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.0-beta.6 (2026-04-11)
+
+### Fixes
+
+- **Docker image:** install `build-essential` in the builder stage so `tikv-jemalloc-sys` can run `make` (slim images previously failed with `ENOENT` during `cargo build --release --locked`).
+- **`.dockerignore`** — ignore `target/`, `.git/`, `.github/` so `docker build` / `buildx` context stays small.
+
+### Documentation
+
+- **`packaging/homebrew/README.md`** — troubleshooting for tap push `Authentication failed` / invalid PAT.
+
+---
+
 ## 0.2.0-beta.4 (2026-04-12)
 
 ### New features

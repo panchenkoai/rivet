@@ -4,6 +4,7 @@ FROM rust:1.94-slim-bookworm AS builder
 WORKDIR /src
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     pkg-config \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*

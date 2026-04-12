@@ -65,6 +65,18 @@ To **push** that formula into the tap automatically:
 
 If the secret is missing, the release still completes; only the tap push step is skipped.
 
+### Troubleshooting: `Authentication failed` / `Invalid username or token`
+
+The job clones `https://github.com/<owner>/homebrew-rivet` with **`HOMEBREW_TAP_GITHUB_TOKEN`**. That error means GitHub rejected the token, not the workflow syntax.
+
+1. **Regenerate the secret** in the **rivet** repo: Settings → Secrets and variables → Actions → edit `HOMEBREW_TAP_GITHUB_TOKEN`.
+2. **Fine-grained PAT:** Resource owner = org or user that owns `homebrew-rivet` → Repository access = **only** `homebrew-rivet` → Permission **Contents: Read and write**. Expiration: choose a date you will renew.
+3. **Classic PAT:** scope **`repo`** (or at least repo access to that repository). SSO: if the org uses SAML, **Authorize** the token for the org.
+4. **Paste:** no extra spaces or newlines when saving the secret.
+5. Confirm the tap repo exists: `https://github.com/<owner>/homebrew-rivet` (same `<owner>` as `github.repository_owner` in the workflow).
+
+Until the token is fixed, update the tap manually (copy `packaging/homebrew/rivet.rb` after release, or run `dev/update_homebrew_formula.sh` locally).
+
 ### Manual / local refresh
 
 Same as before — download checksums from the release or use a local `SHA256SUMS.txt`:
