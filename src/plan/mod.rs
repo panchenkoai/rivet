@@ -1,3 +1,7 @@
+pub mod validate;
+
+pub use validate::{DiagnosticLevel, validate_plan};
+
 use std::collections::HashMap;
 use std::path::Path;
 

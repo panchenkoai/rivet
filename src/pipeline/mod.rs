@@ -27,7 +27,7 @@ use std::path::Path;
 
 use crate::config::{Config, ExportConfig};
 use crate::error::Result;
-use crate::plan::{ExtractionStrategy, ResolvedRunPlan, build_plan};
+use crate::plan::{DiagnosticLevel, ExtractionStrategy, ResolvedRunPlan, build_plan, validate_plan};
 use crate::state::StateStore;
 
 use chunked::run_chunked_parallel_checkpoint;
@@ -310,6 +310,30 @@ fn run_export_job(
     let plan = build_plan(
         config, export, config_dir, validate, reconcile, resume, params,
     )?;
+
+    let diags = validate_plan(&plan);
+    let mut rejected: Vec<String> = Vec::new();
+    for d in &diags {
+        match d.level {
+            DiagnosticLevel::Rejected => {
+                log::error!("[{}] plan validation rejected: {}", d.rule, d.message);
+                rejected.push(d.message.clone());
+            }
+            DiagnosticLevel::Warning => {
+                log::warn!("[{}] plan validation warning: {}", d.rule, d.message);
+            }
+            DiagnosticLevel::Degraded => {
+                log::info!("[{}] plan validation degraded: {}", d.rule, d.message);
+            }
+        }
+    }
+    if !rejected.is_empty() {
+        anyhow::bail!(
+            "export '{}': plan validation failed:\n  {}",
+            plan.export_name,
+            rejected.join("\n  ")
+        );
+    }
 
     log::info!(
         "starting export '{}' (effective tuning: {})",
