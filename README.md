@@ -44,6 +44,17 @@ brew install rivet
 rivet --version
 ```
 
+### cargo install (crates.io)
+
+Requires Rust 1.94+:
+
+```bash
+cargo install rivet-cli
+rivet --version
+```
+
+> The binary is named `rivet`. The crate is published as [`rivet-cli`](https://crates.io/crates/rivet-cli) because the `rivet` name on crates.io is taken.
+
 ### Pre-built binaries
 
 Download the latest release for your platform from [GitHub Releases](https://github.com/panchenkoai/rivet/releases):
