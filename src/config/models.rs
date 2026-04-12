@@ -175,6 +175,7 @@ pub struct ExportConfig {
     pub chunk_dense: bool,
     #[serde(default = "default_chunk_size")]
     pub chunk_size: usize,
+    pub chunk_by_days: Option<u32>,
     #[serde(default = "default_parallel")]
     pub parallel: usize,
     pub time_column: Option<String>,

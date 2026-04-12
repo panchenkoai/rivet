@@ -543,7 +543,7 @@ This section merges the former `rivet_roadmap_v3.md` task tracker. **Strategic p
 | Epic 3 — Recovery | **C**, **H** | Lifecycle semantics, crash matrix, E2E recovery |
 | Epic 4 — Durable state backend | *(none yet)* | Today: SQLite only. Postgres/external state = future |
 | Epic 5 — Batch/fetch/write control | **M**, tuning | `batch_size`, `max_file_size`, streaming; not full split of row-group vs fetch |
-| Epic 6 — Partition intelligence | **B**, modes | `chunked`, `time_window`, dense surrogate guidance |
+| Epic 6 — Partition intelligence | **B**, modes | `chunked`, `time_window`, dense surrogate guidance; `chunk_by_days` date-native partitioning ✅ |
 | Epic 7 — Schema drift | **D** (tracking) | Warnings today; policy hooks (warn/fail) = future |
 | Epic 8 — Shape drift | **N2** (Phase 3 table) | Not started |
 | Epic 9 — Data contracts | `quality:` YAML | Row bounds, null ratio, uniqueness; chunked aggregate rules |
@@ -593,6 +593,7 @@ Rivet core is **feature-complete for beta** extraction:
 | Task | Status | Notes |
 |------|--------|-------|
 | B1–B6 | ✅ | Strategy, profile, sparse/dense warnings, parallel hints, verdict suggestions |
+| B-conn | ✅ | Connection limit warning: `parallel >= max_connections` warns with exact numbers; skipped gracefully if fetch fails |
 
 ### Epic C — Execution semantics ✅
 
@@ -698,7 +699,7 @@ Rivet core is **feature-complete for beta** extraction:
 |------|----------|--------|-------|
 | L1 | P0 | ✅ | Release workflow + matrix (Linux + macOS); green on v0.2.0-beta.2 |
 | L2 | P0 | ✅ | GitHub Release assets published at v0.2.0-beta.2 |
-| L3 | P0 | ⏳ | `cargo publish` |
+| L3 | P0 | ✅ | `cargo publish` — rivet-cli v0.2.0-beta.2 published to crates.io |
 | L4 | P1 | ✅ | Docker image via Dockerfile + GHCR (ghcr.io/panchenkoai/rivet) |
 | L5 | P2 | ✅ | Homebrew tap panchenkoai/homebrew-rivet; auto-updated on release |
 
@@ -721,8 +722,10 @@ Rivet core is **feature-complete for beta** extraction:
 Prioritize by stabilization before distribution polish:
 
 1. ✅ **Green GitHub Release** — v0.2.0-beta.2 published (binaries, Docker, Homebrew tap).
-2. **L3** — `cargo publish` on crates.io.
-3. **F5 + I5** — short docs: audit/reconcile tradeoffs; capacity / memory guidance.
+2. ✅ **L3** — `cargo publish` — rivet-cli v0.2.0-beta.2 on crates.io.
+3. ✅ **Connection limit warning** — `rivet check` warns when `parallel >= max_connections` (v0.2.0-beta.3).
+4. ✅ **Date-native chunking** — `chunk_by_days` with `>= date AND < date` semantics, parallel support, E2E tested (v0.2.0-beta.3).
+5. **F5 + I5** — short docs: audit/reconcile tradeoffs; capacity / memory guidance.
 4. **H4** — link CRASH_MATRIX from USER_GUIDE.
 5. **I2** — scripted benchmark or `cargo xtask`-style harness.
 6. **Epic 4 (§5)** — external/durable state backend when pilots need multi-replica or stateless workers.
@@ -744,4 +747,4 @@ Stale “immediate this week” lists (E2E, reconcile, MinIO) are **done**; igno
 - [ ] 2–3 pilot tables repeated on a schedule *(organizational; optional automation K2)*
 - [x] Cross-platform release binaries **published** (v0.2.0-beta.2: Linux x86_64/arm64, macOS arm64/Intel, Docker GHCR, Homebrew tap)
 - [x] E2E matrix in CI
-- [ ] Published to crates.io
+- [x] Published to crates.io (rivet-cli v0.2.0-beta.2)

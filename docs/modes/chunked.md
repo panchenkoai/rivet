@@ -96,6 +96,47 @@ rivet state reset-chunks --config large_table.yaml --export orders_chunked
 
 Larger chunks = fewer queries but more memory per batch. Smaller chunks = more queries but lower peak RSS.
 
+## Date-based chunking
+
+When your table's natural partition boundary is **time** rather than a numeric ID, use `chunk_by_days` instead of relying on integer ranges.
+
+```yaml
+exports:
+  - name: orders_by_year
+    query: "SELECT id, user_id, product, price, ordered_at FROM orders"
+    mode: chunked
+    chunk_column: ordered_at        # DATE or TIMESTAMP column
+    chunk_by_days: 365              # one chunk per ~year
+    format: parquet
+    destination:
+      type: local
+      path: ./output
+```
+
+Rivet fetches `MIN` / `MAX` of the column as text, parses the dates, then generates non-overlapping windows:
+
+```sql
+-- each chunk window (open-end exclusive):
+WHERE ordered_at >= '2023-01-01' AND ordered_at < '2024-01-01'
+WHERE ordered_at >= '2024-01-01' AND ordered_at < '2025-01-01'
+...
+```
+
+The open-end `< end_date` bound is intentional: it correctly captures all `TIMESTAMP` values within the day, including `23:59:59.999…`.
+
+**When to use date chunking over numeric chunking:**
+
+- The table has no dense numeric PK (UUIDs, composite keys)
+- You want even partitions by time, not by row count
+- The source DB has better statistics / indexes on the timestamp column
+- You want to avoid unix-epoch arithmetic that JDBC tools often get wrong
+
+`chunk_by_days` can be combined with `parallel` for concurrent date windows, and supports `chunk_checkpoint` / `--resume` like numeric chunked mode.
+
+`chunk_dense: true` is incompatible with `chunk_by_days` and will be rejected at config validation.
+
+`rivet check` will report the strategy as `date-chunked(ordered_at, 365d)`.
+
 ## Sparse ID ranges
 
 If IDs have large gaps (e.g. UUIDs cast to BIGINT, or deleted rows), many chunks may be empty. Use `chunk_dense: true` to use `ROW_NUMBER()` ordering instead:

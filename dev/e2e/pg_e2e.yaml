@@ -44,6 +44,17 @@ exports:
       type: local
       path: ./dev/e2e/output
 
+  # --- Chunked mode — date-based partitioning ---
+  - name: pg_orders_date_chunked
+    query: "SELECT id, user_id, product, quantity, price, status, ordered_at FROM orders"
+    mode: chunked
+    chunk_column: ordered_at
+    chunk_by_days: 365
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/e2e/output
+
   # --- Time-window mode ---
   - name: pg_events_timewindow
     query: "SELECT id, user_id, event_type, ip_address, created_at FROM events"

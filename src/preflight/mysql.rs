@@ -6,16 +6,27 @@ use crate::error::Result;
 pub(super) fn check_mysql(url: &str, exports: &[&ExportConfig]) -> Result<()> {
     let pool = mysql::Pool::new(mysql::Opts::from_url(url)?)?;
     let mut conn = pool.get_conn()?;
+    let db_max_connections = fetch_max_connections_mysql(&mut conn);
 
     for export in exports {
-        let diag = diagnose_mysql(&mut conn, export)?;
+        let diag = diagnose_mysql(&mut conn, export, db_max_connections)?;
         super::print_diagnostic(&diag);
     }
 
     Ok(())
 }
 
-fn diagnose_mysql(conn: &mut mysql::PooledConn, export: &ExportConfig) -> Result<ExportDiagnostic> {
+fn fetch_max_connections_mysql(conn: &mut mysql::PooledConn) -> Option<u32> {
+    use mysql::prelude::Queryable;
+    let val: u64 = conn.query_first("SELECT @@max_connections").ok()??;
+    val.try_into().ok()
+}
+
+fn diagnose_mysql(
+    conn: &mut mysql::PooledConn,
+    export: &ExportConfig,
+    db_max_connections: Option<u32>,
+) -> Result<ExportDiagnostic> {
     use mysql::prelude::Queryable;
 
     let mode_str = match export.mode {
@@ -108,6 +119,7 @@ fn diagnose_mysql(conn: &mut mysql::PooledConn, export: &ExportConfig) -> Result
         row_estimate,
         range_min.as_deref(),
         range_max.as_deref(),
+        db_max_connections,
     );
     let suggestion = build_suggestion(&verdict, row_estimate, uses_index, export);
 

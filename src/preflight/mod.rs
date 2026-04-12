@@ -6,8 +6,9 @@ mod postgres;
 pub(crate) use analysis::chunk_sparsity_from_counts;
 #[cfg(test)]
 use analysis::{
-    build_suggestion, check_dense_surrogate_cost, check_parallel_memory_risk, check_sparse_range,
-    compute_verdict, derive_strategy, recommend_parallelism, recommend_profile,
+    build_suggestion, check_connection_limit, check_dense_surrogate_cost,
+    check_parallel_memory_risk, check_sparse_range, compute_verdict, derive_strategy,
+    recommend_parallelism, recommend_profile,
 };
 pub use doctor::doctor;
 #[cfg(test)]
@@ -168,6 +169,7 @@ mod tests {
             chunk_max_attempts: None,
             tuning: None,
             chunk_dense: false,
+            chunk_by_days: None,
         }
     }
 
@@ -728,5 +730,55 @@ mod tests {
         e.chunk_column = Some("id".to_string());
         let s = build_suggestion(&HealthVerdict::Acceptable, Some(20_000_000), true, &e).unwrap();
         assert!(s.contains("parallel"), "got: {s}");
+    }
+
+    #[test]
+    fn connection_limit_warn_when_parallel_meets_max() {
+        let w = check_connection_limit(20, Some(20));
+        assert!(w.is_some(), "should warn when parallel == max_connections");
+        let msg = w.unwrap();
+        assert!(msg.contains("max_connections=20"), "got: {msg}");
+        assert!(msg.contains("parallel=20"), "got: {msg}");
+    }
+
+    #[test]
+    fn connection_limit_warn_when_parallel_exceeds_max() {
+        let w = check_connection_limit(100, Some(20));
+        assert!(w.is_some(), "should warn when parallel > max_connections");
+        let msg = w.unwrap();
+        assert!(msg.contains("max_connections=20"), "got: {msg}");
+    }
+
+    #[test]
+    fn connection_limit_no_warn_when_parallel_below_max() {
+        let w = check_connection_limit(4, Some(100));
+        assert!(w.is_none(), "should not warn when parallel << max_connections");
+    }
+
+    #[test]
+    fn connection_limit_no_warn_when_parallel_is_one() {
+        let w = check_connection_limit(1, Some(5));
+        assert!(w.is_none(), "single worker never triggers connection warning");
+    }
+
+    #[test]
+    fn connection_limit_skipped_note_when_max_unknown_and_parallel_gt_one() {
+        let w = check_connection_limit(100, None);
+        assert!(w.is_some(), "should note that check was skipped");
+        let msg = w.unwrap();
+        assert!(msg.contains("skipped"), "got: {msg}");
+    }
+
+    #[test]
+    fn connection_limit_no_note_when_max_unknown_and_parallel_is_one() {
+        let w = check_connection_limit(1, None);
+        assert!(w.is_none(), "single worker never triggers connection warning");
+    }
+
+    #[test]
+    fn connection_limit_suggests_headroom() {
+        let w = check_connection_limit(25, Some(20)).unwrap();
+        // Suggested safe max should be max_connections - 3 = 17
+        assert!(w.contains("17"), "should suggest leaving headroom, got: {w}");
     }
 }

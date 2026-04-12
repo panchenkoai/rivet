@@ -278,6 +278,165 @@ YAML
 echo "$_err" | grep -q "source.tuning" && pass "misplaced field detection" || fail "misplaced field detection"
 
 # ──────────────────────────────────────────────────────────────
+section "14. Preflight — connection limit warnings"
+
+# PG: parallel well below max_connections (default 100) — no warning expected
+_out=$($RIVET check --config /dev/stdin 2>&1 <<'YAML'
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+exports:
+  - name: check_conn_safe
+    query: "SELECT id FROM users"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 100000
+    parallel: 2
+    format: parquet
+    destination:
+      type: local
+      path: /tmp
+YAML
+)
+echo "$_out" | grep -qi "meets or exceeds\|check skipped" \
+    && fail "PG check: unexpected connection warning at parallel=2" \
+    || pass "PG check: no connection warning at parallel=2"
+
+# PG: parallel >= max_connections (999 >> 100) — must warn with exact numbers
+_out=$($RIVET check --config /dev/stdin 2>&1 <<'YAML'
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+exports:
+  - name: check_conn_high
+    query: "SELECT id FROM users"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 100000
+    parallel: 999
+    format: parquet
+    destination:
+      type: local
+      path: /tmp
+YAML
+)
+echo "$_out" | grep -qi "meets or exceeds" \
+    && pass "PG check: connection limit warning at parallel=999" \
+    || fail "PG check: expected 'meets or exceeds' warning at parallel=999"
+echo "$_out" | grep -qi "max_connections" \
+    && pass "PG check: max_connections value present in warning" \
+    || fail "PG check: max_connections value missing from warning"
+
+# MySQL: parallel below max_connections (default 151) — no warning expected
+if $mysql_ok; then
+    _out=$($RIVET check --config /dev/stdin 2>&1 <<'YAML'
+source:
+  type: mysql
+  url: "mysql://rivet:rivet@localhost:3306/rivet"
+exports:
+  - name: mysql_check_conn_safe
+    query: "SELECT id FROM users"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 100000
+    parallel: 2
+    format: parquet
+    destination:
+      type: local
+      path: /tmp
+YAML
+)
+    echo "$_out" | grep -qi "meets or exceeds\|check skipped" \
+        && fail "MySQL check: unexpected connection warning at parallel=2" \
+        || pass "MySQL check: no connection warning at parallel=2"
+
+    # MySQL: parallel >= max_connections (999 >> 151) — must warn
+    _out=$($RIVET check --config /dev/stdin 2>&1 <<'YAML'
+source:
+  type: mysql
+  url: "mysql://rivet:rivet@localhost:3306/rivet"
+exports:
+  - name: mysql_check_conn_high
+    query: "SELECT id FROM users"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 100000
+    parallel: 999
+    format: parquet
+    destination:
+      type: local
+      path: /tmp
+YAML
+)
+    echo "$_out" | grep -qi "meets or exceeds" \
+        && pass "MySQL check: connection limit warning at parallel=999" \
+        || fail "MySQL check: expected 'meets or exceeds' warning at parallel=999"
+    echo "$_out" | grep -qi "max_connections" \
+        && pass "MySQL check: max_connections value present in warning" \
+        || fail "MySQL check: max_connections value missing from warning"
+else
+    skip "MySQL check: connection limit warning (MySQL not running)"
+    skip "MySQL check: max_connections value present"
+    skip "MySQL check: no connection warning at parallel=2"
+    skip "MySQL check: max_connections value at parallel=999"
+fi
+
+# ──────────────────────────────────────────────────────────────
+section "15. Date-based chunking (chunk_by_days)"
+
+# PG: date-chunked run produces at least one output file
+$RIVET run --config dev/e2e/pg_e2e.yaml --export pg_orders_date_chunked --validate >/dev/null 2>&1 \
+    && pass "PG date-chunked: run succeeded" \
+    || fail "PG date-chunked: run failed"
+assert_file_count_ge "$OUT/pg_orders_date_chunked_*.parquet" 1 "PG date-chunked files"
+
+# PG: preflight shows date-chunked strategy in output
+_out=$($RIVET check --config dev/e2e/pg_e2e.yaml --export pg_orders_date_chunked 2>&1)
+echo "$_out" | grep -qi "date-chunked" \
+    && pass "PG check: date-chunked strategy shown" \
+    || fail "PG check: expected 'date-chunked' in strategy output"
+
+# PG: inline config — verify chunk_by_days rejects chunk_dense combination
+_out=$($RIVET run --config /dev/stdin 2>&1 <<'YAML'
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+exports:
+  - name: invalid_date_dense
+    query: "SELECT id, ordered_at FROM orders"
+    mode: chunked
+    chunk_column: ordered_at
+    chunk_by_days: 30
+    chunk_dense: true
+    format: parquet
+    destination:
+      type: local
+      path: /tmp
+YAML
+)
+echo "$_out" | grep -qi "chunk_dense\|cannot combine\|invalid" \
+    && pass "PG validation: chunk_by_days + chunk_dense rejected" \
+    || fail "PG validation: expected rejection of chunk_by_days + chunk_dense"
+
+if $mysql_ok; then
+    # MySQL: date-chunked run produces at least one output file
+    $RIVET run --config dev/e2e/mysql_e2e.yaml --export mysql_orders_date_chunked --validate >/dev/null 2>&1 \
+        && pass "MySQL date-chunked: run succeeded" \
+        || fail "MySQL date-chunked: run failed"
+    assert_file_count_ge "$OUT/mysql_orders_date_chunked_*.parquet" 1 "MySQL date-chunked files"
+
+    # MySQL: preflight shows date-chunked strategy
+    _out=$($RIVET check --config dev/e2e/mysql_e2e.yaml --export mysql_orders_date_chunked 2>&1)
+    echo "$_out" | grep -qi "date-chunked" \
+        && pass "MySQL check: date-chunked strategy shown" \
+        || fail "MySQL check: expected 'date-chunked' in strategy output"
+else
+    skip "MySQL date-chunked: run"
+    skip "MySQL date-chunked: files"
+    skip "MySQL check: date-chunked strategy"
+fi
+
+# ──────────────────────────────────────────────────────────────
 section "Summary"
 echo ""
 echo "PASS: $PASS | FAIL: $FAIL | SKIP: $SKIP"

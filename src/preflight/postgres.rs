@@ -5,16 +5,28 @@ use crate::error::Result;
 
 pub(super) fn check_postgres(url: &str, exports: &[&ExportConfig]) -> Result<()> {
     let mut client = postgres::Client::connect(url, postgres::NoTls)?;
+    let db_max_connections = fetch_max_connections_pg(&mut client);
 
     for export in exports {
-        let diag = diagnose_pg(&mut client, export)?;
+        let diag = diagnose_pg(&mut client, export, db_max_connections)?;
         super::print_diagnostic(&diag);
     }
 
     Ok(())
 }
 
-fn diagnose_pg(client: &mut postgres::Client, export: &ExportConfig) -> Result<ExportDiagnostic> {
+fn fetch_max_connections_pg(client: &mut postgres::Client) -> Option<u32> {
+    let rows = client
+        .query("SELECT current_setting('max_connections')::int", &[])
+        .ok()?;
+    rows.first()?.get::<_, i32>(0).try_into().ok()
+}
+
+fn diagnose_pg(
+    client: &mut postgres::Client,
+    export: &ExportConfig,
+    db_max_connections: Option<u32>,
+) -> Result<ExportDiagnostic> {
     let mode_str = match export.mode {
         ExportMode::Full => "full".to_string(),
         ExportMode::Incremental => format!(
@@ -65,6 +77,7 @@ fn diagnose_pg(client: &mut postgres::Client, export: &ExportConfig) -> Result<E
         row_estimate,
         range_min.as_deref(),
         range_max.as_deref(),
+        db_max_connections,
     );
     let suggestion = build_suggestion(&verdict, row_estimate, uses_index, export);
 

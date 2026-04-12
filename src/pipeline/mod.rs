@@ -700,6 +700,7 @@ mod tests {
             chunk_max_attempts: None,
             tuning: None,
             chunk_dense: false,
+            chunk_by_days: None,
         };
         let tuning = SourceTuning::from_config(None);
         let summary = RunSummary::new(&export, &tuning, "balanced (default)");

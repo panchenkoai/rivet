@@ -394,6 +394,41 @@ Each chunk produces a separate file: `events_chunked_20260329_150001_chunk0.parq
 
 > **Warning:** if `chunk_column` has large gaps (e.g. UUIDs cast to bigint, deleted ranges), most chunk windows will be empty. `rivet check` warns about this as "Sparse key range." Consider using `ROW_NUMBER()` as a dense surrogate — see README for details.
 
+### Date-based chunking (`chunk_by_days`)
+
+When the natural partition boundary is time rather than a numeric ID, use `chunk_by_days` instead. Rivet splits the table into calendar windows using `>= 'YYYY-MM-DD' AND < 'YYYY-MM-DD'` predicates — no unix-epoch arithmetic, correct semantics for TIMESTAMP columns.
+
+```yaml
+exports:
+  - name: orders_by_year
+    query: "SELECT id, user_id, product, price, ordered_at FROM orders"
+    mode: chunked
+    chunk_column: ordered_at      # DATE or TIMESTAMP column
+    chunk_by_days: 365            # one chunk per ~year
+    parallel: 4                   # process 4 windows concurrently
+    chunk_checkpoint: true        # safe to resume if interrupted
+    format: parquet
+    destination:
+      type: local
+      path: ./output
+```
+
+Rivet queries `MIN(ordered_at)` and `MAX(ordered_at)`, parses both as dates, then generates non-overlapping windows:
+
+```sql
+WHERE ordered_at >= '2023-01-01' AND ordered_at < '2024-01-01'
+WHERE ordered_at >= '2024-01-01' AND ordered_at < '2025-01-01'
+```
+
+`rivet check` will report the strategy as `date-chunked(ordered_at, 365d)`.
+
+**When to use date chunking:**
+- Table has no dense numeric PK (UUIDs, composite keys)
+- You want even partitions by calendar period
+- Source DB has better index coverage on the timestamp column
+
+`chunk_by_days` cannot be combined with `chunk_dense: true` (config validation will reject it).
+
 ### Chunk checkpoint (SQLite plan, resume, retries)
 
 Set `chunk_checkpoint: true` on a chunked export to store each chunk’s key range and status in `.rivet_state.db` next to your config. After each successful chunk, progress is committed; if the process dies, you can continue with the same `run_id` and completed chunks are skipped.

@@ -69,10 +69,11 @@ Each entry in the `exports` list defines one export job.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `chunk_column` | string | **yes** | — | Numeric column to partition by |
-| `chunk_size` | integer | no | `100000` | Rows per chunk |
+| `chunk_column` | string | **yes** | — | Numeric or date/timestamp column to partition by |
+| `chunk_size` | integer | no | `100000` | Rows per chunk (numeric mode) |
+| `chunk_by_days` | integer | no | — | Enable date chunking: window size in days. Mutually exclusive with `chunk_dense`. |
 | `parallel` | integer | no | `1` | Concurrent chunk workers |
-| `chunk_dense` | boolean | no | `false` | Use `ROW_NUMBER()` for sparse IDs |
+| `chunk_dense` | boolean | no | `false` | Use `ROW_NUMBER()` for sparse numeric IDs. Cannot be combined with `chunk_by_days`. |
 | `chunk_checkpoint` | boolean | no | `false` | Persist per-chunk progress for resume |
 | `chunk_max_attempts` | integer | no | — | Max retry attempts per chunk |
 

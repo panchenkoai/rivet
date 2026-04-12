@@ -301,6 +301,27 @@ impl Config {
                     export.name
                 );
             }
+
+            if let Some(days) = export.chunk_by_days {
+                if export.mode != ExportMode::Chunked {
+                    anyhow::bail!(
+                        "export '{}': chunk_by_days requires mode: chunked",
+                        export.name
+                    );
+                }
+                if export.chunk_dense {
+                    anyhow::bail!(
+                        "export '{}': chunk_by_days cannot be combined with chunk_dense",
+                        export.name
+                    );
+                }
+                if days == 0 {
+                    anyhow::bail!(
+                        "export '{}': chunk_by_days must be at least 1",
+                        export.name
+                    );
+                }
+            }
         }
         Ok(())
     }

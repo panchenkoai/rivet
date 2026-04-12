@@ -1,0 +1,66 @@
+# Rivet Example: PostgreSQL → Date-Chunked Export → Local
+#
+# Use case: initial load of a large orders/events table where the natural
+#           partition boundary is time, not a numeric ID.
+#           chunk_by_days splits the table into calendar windows
+#           (e.g. one chunk per year) using >= / < date comparisons, which
+#           works correctly for TIMESTAMP columns and avoids the unix-epoch
+#           arithmetic problem common in JDBC-based tools.
+#
+# When to prefer date chunking over numeric chunking:
+#   - Your table has no dense numeric PK, or IDs are UUIDs
+#   - You want even partitions by time rather than by row count
+#   - The source DB performs better on date-range predicates than BETWEEN int
+#
+# Run:  rivet run -c examples/pg_date_chunked_local.yaml --validate
+
+source:
+  type: postgres
+  url_env: DATABASE_URL
+
+  tuning:
+    profile: balanced
+    batch_size: 10000
+
+exports:
+  - name: orders_by_year
+    query: >
+      SELECT id, user_id, product, quantity, price, status, ordered_at
+      FROM orders
+    mode: chunked
+
+    # chunk_column must be a DATE or TIMESTAMP column when chunk_by_days is set.
+    # Rivet queries MIN/MAX as text, parses the dates, then generates
+    # non-overlapping windows: ordered_at >= 'YYYY-MM-DD' AND ordered_at < 'YYYY-MM-DD'
+    chunk_column: ordered_at
+    chunk_by_days: 365              # one chunk per ~year
+
+    format: parquet
+    compression: zstd
+
+    destination:
+      type: local
+      path: ./output/orders
+
+  - name: events_by_month
+    query: >
+      SELECT id, user_id, event_type, ip_address, created_at
+      FROM events
+    mode: chunked
+    chunk_column: created_at
+    chunk_by_days: 30               # one chunk per ~month
+    parallel: 4                     # process 4 months concurrently
+
+    # Enable checkpoint to resume if the export is interrupted mid-run
+    chunk_checkpoint: true
+    chunk_max_attempts: 3
+
+    format: parquet
+    compression: zstd
+
+    destination:
+      type: local
+      path: ./output/events
+
+    tuning:
+      batch_size: 5000              # smaller batches for wide rows

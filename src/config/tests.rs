@@ -291,6 +291,98 @@ exports:
 }
 
 #[test]
+fn chunk_by_days_parses() {
+    let cfg = Config::from_yaml(
+        r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: events
+    query: "SELECT * FROM events"
+    mode: chunked
+    chunk_column: created_at
+    chunk_by_days: 7
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.exports[0].chunk_by_days, Some(7));
+}
+
+#[test]
+fn chunk_by_days_rejected_without_chunked_mode() {
+    let err = Config::from_yaml(
+        r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: bad
+    query: "SELECT * FROM t"
+    mode: full
+    chunk_by_days: 7
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("chunk_by_days"));
+}
+
+#[test]
+fn chunk_by_days_rejected_with_chunk_dense() {
+    let err = Config::from_yaml(
+        r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: bad
+    query: "SELECT * FROM t"
+    mode: chunked
+    chunk_column: created_at
+    chunk_dense: true
+    chunk_by_days: 7
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("chunk_by_days"));
+}
+
+#[test]
+fn chunk_by_days_zero_rejected() {
+    let err = Config::from_yaml(
+        r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: bad
+    query: "SELECT * FROM t"
+    mode: chunked
+    chunk_column: created_at
+    chunk_by_days: 0
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("chunk_by_days"));
+}
+
+#[test]
 fn time_window_requires_time_column_and_days() {
     let err = Config::from_yaml(
         r#"

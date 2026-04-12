@@ -16,6 +16,28 @@ use crate::{destination, format, resource};
 
 // ─── Chunk math ──────────────────────────────────────────────
 
+/// Parse a date string from the DB into a NaiveDate.
+/// Handles DATE ('2023-01-01'), DATETIME ('2023-01-01 00:00:00'), and ISO-8601 variants.
+pub(crate) fn parse_date_flexible(s: &str) -> Option<chrono::NaiveDate> {
+    use chrono::NaiveDate;
+    let s = s.trim();
+    NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .ok()
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                .ok()
+                .map(|dt| dt.date())
+        })
+        .or_else(|| {
+            // ISO 8601 with T, optional fractional seconds
+            let base = s.split('.').next().unwrap_or(s);
+            let base = base.split('+').next().unwrap_or(base);
+            chrono::NaiveDateTime::parse_from_str(base, "%Y-%m-%dT%H:%M:%S")
+                .ok()
+                .map(|dt| dt.date())
+        })
+}
+
 pub fn generate_chunks(min: i64, max: i64, chunk_size: i64) -> Vec<(i64, i64)> {
     if max < min || chunk_size <= 0 {
         return vec![];
@@ -39,25 +61,40 @@ pub(crate) fn build_chunk_query_sql(
     start: i64,
     end: i64,
     chunk_dense: bool,
+    chunk_by_days: bool,
 ) -> String {
     if chunk_dense {
-        format!(
+        return format!(
             "SELECT * FROM (SELECT _rivet_i.*, ROW_NUMBER() OVER (ORDER BY _rivet_i.{oc}) AS {rn} FROM ({bq}) AS _rivet_i) AS _rivet_w WHERE _rivet_w.{rn} BETWEEN {s} AND {e}",
             bq = base_query,
             oc = order_column,
             rn = RIVET_CHUNK_RN_COL,
             s = start,
             e = end,
-        )
-    } else {
-        format!(
-            "SELECT * FROM ({base}) AS _rivet WHERE {col} BETWEEN {start} AND {end}",
+        );
+    }
+
+    if chunk_by_days {
+        // start/end are days since epoch; end is inclusive so the exclusive upper bound is end+1.
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch is valid");
+        let start_date = epoch + chrono::Duration::days(start);
+        let end_date = epoch + chrono::Duration::days(end + 1);
+        return format!(
+            "SELECT * FROM ({base}) AS _rivet WHERE {col} >= '{start}' AND {col} < '{end}'",
             base = base_query,
             col = order_column,
-            start = start,
-            end = end,
-        )
+            start = start_date.format("%Y-%m-%d"),
+            end = end_date.format("%Y-%m-%d"),
+        );
     }
+
+    format!(
+        "SELECT * FROM ({base}) AS _rivet WHERE {col} BETWEEN {start} AND {end}",
+        base = base_query,
+        col = order_column,
+        start = start,
+        end = end,
+    )
 }
 
 pub(crate) fn chunk_plan_fingerprint(
@@ -65,6 +102,7 @@ pub(crate) fn chunk_plan_fingerprint(
     chunk_column: &str,
     chunk_size: usize,
     chunk_dense: bool,
+    chunk_by_days: Option<u32>,
 ) -> String {
     use xxhash_rust::xxh3::xxh3_64;
     let mut buf = String::with_capacity(base_query.len() + chunk_column.len() + 32);
@@ -74,7 +112,11 @@ pub(crate) fn chunk_plan_fingerprint(
     buf.push('\x1f');
     buf.push_str(&chunk_size.to_string());
     buf.push('\x1f');
-    buf.push_str(if chunk_dense { "dense_rn" } else { "range" });
+    match chunk_by_days {
+        Some(d) => buf.push_str(&format!("date_{}d", d)),
+        None if chunk_dense => buf.push_str("dense_rn"),
+        None => buf.push_str("range"),
+    }
     format!("{:016x}", xxh3_64(buf.as_bytes()))
 }
 
@@ -184,7 +226,51 @@ pub(crate) fn detect_and_generate_chunks(
     chunk_size: usize,
     export_name: &str,
     chunk_dense: bool,
+    chunk_by_days: Option<u32>,
 ) -> Result<Vec<(i64, i64)>> {
+    if let Some(days_per_chunk) = chunk_by_days {
+        let min_sql = format!(
+            "SELECT min({col}) FROM ({q}) AS _rivet",
+            col = chunk_column,
+            q = base_query,
+        );
+        let max_sql = format!(
+            "SELECT max({col}) FROM ({q}) AS _rivet",
+            col = chunk_column,
+            q = base_query,
+        );
+        let min_str = src
+            .query_scalar(&min_sql)?
+            .ok_or_else(|| anyhow::anyhow!("export '{}': min({}) returned NULL — table may be empty", export_name, chunk_column))?;
+        let max_str = src
+            .query_scalar(&max_sql)?
+            .ok_or_else(|| anyhow::anyhow!("export '{}': max({}) returned NULL — table may be empty", export_name, chunk_column))?;
+
+        let min_date = parse_date_flexible(&min_str).ok_or_else(|| {
+            anyhow::anyhow!(
+                "export '{}': could not parse min({}) = {:?} as a date (expected YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)",
+                export_name, chunk_column, min_str
+            )
+        })?;
+        let max_date = parse_date_flexible(&max_str).ok_or_else(|| {
+            anyhow::anyhow!(
+                "export '{}': could not parse max({}) = {:?} as a date (expected YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)",
+                export_name, chunk_column, max_str
+            )
+        })?;
+
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch is valid");
+        let min_days = (min_date - epoch).num_days();
+        let max_days = (max_date - epoch).num_days();
+        let total_days = (max_days - min_days).max(0);
+        let chunks = generate_chunks(min_days, max_days, days_per_chunk as i64);
+        log::info!(
+            "export '{}': date chunk_column `{}` range {} .. {} ({} days, {} days/chunk → {} chunk(s))",
+            export_name, chunk_column, min_date, max_date, total_days, days_per_chunk, chunks.len()
+        );
+        return Ok(chunks);
+    }
+
     if chunk_dense {
         let row_count = query_wrapped_row_count(src, base_query)?;
         log::info!(
@@ -294,7 +380,10 @@ pub(crate) fn run_chunked_sequential(
         export.chunk_size,
         &export.name,
         export.chunk_dense,
+        export.chunk_by_days,
     )?;
+
+    let is_date = export.chunk_by_days.is_some();
 
     log::info!(
         "export '{}': {} chunks to process sequentially",
@@ -308,7 +397,7 @@ pub(crate) fn run_chunked_sequential(
             std::thread::sleep(Duration::from_secs(5));
         }
 
-        let chunk_query = build_chunk_query_sql(base_query, col, *start, *end, export.chunk_dense);
+        let chunk_query = build_chunk_query_sql(base_query, col, *start, *end, export.chunk_dense, is_date);
         log::info!(
             "export '{}': chunk {}/{} ({}..{})",
             export.name,
@@ -400,8 +489,11 @@ pub(super) fn run_chunked_parallel(
         export.chunk_size,
         &export.name,
         export.chunk_dense,
+        export.chunk_by_days,
     )?;
     drop(src);
+
+    let is_date = export.chunk_by_days.is_some();
 
     let total_chunks = chunks.len();
     let parallel = export.parallel.min(total_chunks);
@@ -460,6 +552,7 @@ pub(super) fn run_chunked_parallel(
                         start,
                         end,
                         export_for_sink.chunk_dense,
+                        is_date,
                     );
 
                     let mut thread_src = source::create_source(&source_config)?;
@@ -583,7 +676,7 @@ fn ensure_chunk_checkpoint_plan(
     resume: bool,
     tuning: &SourceTuning,
 ) -> Result<String> {
-    let plan_hash = chunk_plan_fingerprint(base_query, col, export.chunk_size, export.chunk_dense);
+    let plan_hash = chunk_plan_fingerprint(base_query, col, export.chunk_size, export.chunk_dense, export.chunk_by_days);
     let max_att = chunk_max_attempts_for_export(export, tuning);
 
     if resume {
@@ -644,7 +737,7 @@ fn export_one_chunk_range(
     tuning: &SourceTuning,
     validate: bool,
 ) -> Result<(usize, Option<String>, u64)> {
-    let chunk_query = build_chunk_query_sql(base_query, col, start, end, export.chunk_dense);
+    let chunk_query = build_chunk_query_sql(base_query, col, start, end, export.chunk_dense, export.chunk_by_days.is_some());
 
     let mut sink = ExportSink::new(export)?;
     src.export(&chunk_query, None, None, tuning, &mut sink)?;
@@ -775,6 +868,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
             export.chunk_size,
             &export.name,
             export.chunk_dense,
+            export.chunk_by_days,
         )?
     };
 
@@ -904,6 +998,7 @@ pub(super) fn run_chunked_parallel_checkpoint(
             export.chunk_size,
             &export.name,
             export.chunk_dense,
+            export.chunk_by_days,
         )?
     };
 
@@ -1023,6 +1118,7 @@ pub(super) fn run_chunked_parallel_checkpoint(
                         start,
                         end,
                         export_worker.chunk_dense,
+                        export_worker.chunk_by_days.is_some(),
                     );
 
                     let result = (|| -> Result<(usize, Option<String>, u64)> {
@@ -1215,16 +1311,69 @@ mod tests {
 
     #[test]
     fn test_build_chunk_query_range_mode() {
-        let q = build_chunk_query_sql("SELECT id FROM t", "id", 1, 100, false);
+        let q = build_chunk_query_sql("SELECT id FROM t", "id", 1, 100, false, false);
         assert!(q.contains("WHERE id BETWEEN 1 AND 100"), "got: {}", q);
         assert!(!q.contains("ROW_NUMBER()"), "got: {}", q);
     }
 
     #[test]
     fn test_build_chunk_query_dense_mode() {
-        let q = build_chunk_query_sql("SELECT id FROM t", "id", 1, 5000, true);
+        let q = build_chunk_query_sql("SELECT id FROM t", "id", 1, 5000, true, false);
         assert!(q.contains("ROW_NUMBER()"), "got: {}", q);
         assert!(q.contains(RIVET_CHUNK_RN_COL), "got: {}", q);
         assert!(q.contains("BETWEEN 1 AND 5000"), "got: {}", q);
+    }
+
+    #[test]
+    fn test_parse_date_flexible_date_only() {
+        let d = parse_date_flexible("2023-06-15").unwrap();
+        assert_eq!(d.to_string(), "2023-06-15");
+    }
+
+    #[test]
+    fn test_parse_date_flexible_datetime() {
+        let d = parse_date_flexible("2023-06-15 14:32:00").unwrap();
+        assert_eq!(d.to_string(), "2023-06-15");
+    }
+
+    #[test]
+    fn test_parse_date_flexible_iso8601() {
+        let d = parse_date_flexible("2023-06-15T14:32:00").unwrap();
+        assert_eq!(d.to_string(), "2023-06-15");
+    }
+
+    #[test]
+    fn test_parse_date_flexible_iso8601_micros() {
+        let d = parse_date_flexible("2023-06-15T14:32:00.123456").unwrap();
+        assert_eq!(d.to_string(), "2023-06-15");
+    }
+
+    #[test]
+    fn test_parse_date_flexible_invalid() {
+        assert!(parse_date_flexible("not-a-date").is_none());
+        assert!(parse_date_flexible("").is_none());
+        assert!(parse_date_flexible("12345").is_none());
+    }
+
+    #[test]
+    fn test_build_chunk_query_date_mode() {
+        // days since epoch: 2023-01-01 = 19358, 2023-01-07 = 19364
+        // chunk start=19358, end=19364 → >= '2023-01-01' AND < '2023-01-08'
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let start = (chrono::NaiveDate::from_ymd_opt(2023, 1, 1).unwrap() - epoch).num_days();
+        let end = (chrono::NaiveDate::from_ymd_opt(2023, 1, 7).unwrap() - epoch).num_days();
+        let q = build_chunk_query_sql("SELECT * FROM orders", "created_at", start, end, false, true);
+        assert!(q.contains(">= '2023-01-01'"), "got: {q}");
+        assert!(q.contains("< '2023-01-08'"), "got: {q}"); // end+1 day exclusive
+        assert!(!q.contains("BETWEEN"), "should use >= AND <, got: {q}");
+    }
+
+    #[test]
+    fn test_build_chunk_query_date_mode_single_day() {
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let day = (chrono::NaiveDate::from_ymd_opt(2024, 3, 15).unwrap() - epoch).num_days();
+        let q = build_chunk_query_sql("SELECT * FROM t", "ts", day, day, false, true);
+        assert!(q.contains(">= '2024-03-15'"), "got: {q}");
+        assert!(q.contains("< '2024-03-16'"), "got: {q}");
     }
 }

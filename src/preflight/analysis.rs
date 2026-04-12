@@ -17,7 +17,13 @@ pub(crate) fn derive_strategy(export: &ExportConfig) -> String {
         }
         ExportMode::Chunked => {
             let col = export.chunk_column.as_deref().unwrap_or("?");
-            if export.parallel > 1 {
+            if let Some(days) = export.chunk_by_days {
+                if export.parallel > 1 {
+                    format!("date-chunked-parallel({}, {}d, p={})", col, days, export.parallel)
+                } else {
+                    format!("date-chunked({}, {}d)", col, days)
+                }
+            } else if export.parallel > 1 {
                 format!(
                     "chunked-parallel({}, size={}, p={})",
                     col, export.chunk_size, export.parallel
@@ -103,6 +109,10 @@ pub(crate) fn check_sparse_range(
     if export.chunk_dense {
         return None;
     }
+    if export.chunk_by_days.is_some() {
+        // Date chunks iterate by calendar interval; sparsity concept does not apply.
+        return None;
+    }
     let rows = row_estimate.unwrap_or(0);
     if rows == 0 {
         return None;
@@ -142,6 +152,34 @@ pub(crate) fn check_dense_surrogate_cost(export: &ExportConfig) -> Option<String
         )
     } else {
         None
+    }
+}
+
+/// Connections reserved for non-worker use (monitoring, admin, failover).
+const CONNECTION_HEADROOM: u32 = 3;
+
+/// Warn when configured parallelism meets or exceeds the DB's max_connections limit.
+pub(crate) fn check_connection_limit(
+    parallel: usize,
+    db_max_connections: Option<u32>,
+) -> Option<String> {
+    if parallel <= 1 {
+        return None;
+    }
+    match db_max_connections {
+        None => Some(
+            "Could not fetch DB max_connections — connection limit check skipped. \
+             Ask your DBA to verify your user has access to DB server variables, \
+             then verify your parallel setting manually."
+                .to_string(),
+        ),
+        Some(max_conn) if parallel as u32 >= max_conn => Some(format!(
+            "parallel={parallel} meets or exceeds DB max_connections={max_conn} — \
+             workers will compete for connections and some may fail. \
+             Reduce parallel to at most {} (leave headroom for other connections).",
+            max_conn.saturating_sub(CONNECTION_HEADROOM).max(1),
+        )),
+        _ => None,
     }
 }
 
@@ -204,14 +242,18 @@ pub(crate) fn recommend_parallelism(
     }
 }
 
-/// Collect all warnings (B3-B5) for an export.
+/// Collect all warnings (B3-B6) for an export.
 pub(super) fn collect_warnings(
     export: &ExportConfig,
     row_estimate: Option<i64>,
     chunk_min: Option<&str>,
     chunk_max: Option<&str>,
+    db_max_connections: Option<u32>,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
+    if let Some(w) = check_connection_limit(export.parallel, db_max_connections) {
+        warnings.push(w);
+    }
     if let Some(w) = check_sparse_range(export, row_estimate, chunk_min, chunk_max) {
         warnings.push(w);
     }
