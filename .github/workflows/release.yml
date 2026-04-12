@@ -132,7 +132,6 @@ jobs:
             ./dev/update_homebrew_formula.sh --tag "${RELEASE_TAG}" --sums-file artifacts/SHA256SUMS.txt
 
       - name: Push formula to Homebrew tap
-        if: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN != '' }}
         continue-on-error: true
         env:
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
@@ -140,6 +139,10 @@ jobs:
           TAP_OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
+          if [ -z "${HOMEBREW_TAP_GITHUB_TOKEN}" ]; then
+            echo "HOMEBREW_TAP_GITHUB_TOKEN not set, skipping tap push"
+            exit 0
+          fi
           git clone "https://x-access-token:${HOMEBREW_TAP_GITHUB_TOKEN}@github.com/${TAP_OWNER}/homebrew-rivet.git" homebrew-tap
           mkdir -p homebrew-tap/Formula
           cp packaging/homebrew/rivet.rb homebrew-tap/Formula/rivet.rb
