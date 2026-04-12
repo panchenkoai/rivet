@@ -752,13 +752,19 @@ mod tests {
     #[test]
     fn connection_limit_no_warn_when_parallel_below_max() {
         let w = check_connection_limit(4, Some(100));
-        assert!(w.is_none(), "should not warn when parallel << max_connections");
+        assert!(
+            w.is_none(),
+            "should not warn when parallel << max_connections"
+        );
     }
 
     #[test]
     fn connection_limit_no_warn_when_parallel_is_one() {
         let w = check_connection_limit(1, Some(5));
-        assert!(w.is_none(), "single worker never triggers connection warning");
+        assert!(
+            w.is_none(),
+            "single worker never triggers connection warning"
+        );
     }
 
     #[test]
@@ -772,13 +778,19 @@ mod tests {
     #[test]
     fn connection_limit_no_note_when_max_unknown_and_parallel_is_one() {
         let w = check_connection_limit(1, None);
-        assert!(w.is_none(), "single worker never triggers connection warning");
+        assert!(
+            w.is_none(),
+            "single worker never triggers connection warning"
+        );
     }
 
     #[test]
     fn connection_limit_suggests_headroom() {
         let w = check_connection_limit(25, Some(20)).unwrap();
         // Suggested safe max should be max_connections - 3 = 17
-        assert!(w.contains("17"), "should suggest leaving headroom, got: {w}");
+        assert!(
+            w.contains("17"),
+            "should suggest leaving headroom, got: {w}"
+        );
     }
 }

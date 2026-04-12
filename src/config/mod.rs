@@ -316,10 +316,7 @@ impl Config {
                     );
                 }
                 if days == 0 {
-                    anyhow::bail!(
-                        "export '{}': chunk_by_days must be at least 1",
-                        export.name
-                    );
+                    anyhow::bail!("export '{}': chunk_by_days must be at least 1", export.name);
                 }
             }
         }

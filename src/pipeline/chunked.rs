@@ -239,12 +239,20 @@ pub(crate) fn detect_and_generate_chunks(
             col = chunk_column,
             q = base_query,
         );
-        let min_str = src
-            .query_scalar(&min_sql)?
-            .ok_or_else(|| anyhow::anyhow!("export '{}': min({}) returned NULL — table may be empty", export_name, chunk_column))?;
-        let max_str = src
-            .query_scalar(&max_sql)?
-            .ok_or_else(|| anyhow::anyhow!("export '{}': max({}) returned NULL — table may be empty", export_name, chunk_column))?;
+        let min_str = src.query_scalar(&min_sql)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "export '{}': min({}) returned NULL — table may be empty",
+                export_name,
+                chunk_column
+            )
+        })?;
+        let max_str = src.query_scalar(&max_sql)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "export '{}': max({}) returned NULL — table may be empty",
+                export_name,
+                chunk_column
+            )
+        })?;
 
         let min_date = parse_date_flexible(&min_str).ok_or_else(|| {
             anyhow::anyhow!(
@@ -266,7 +274,13 @@ pub(crate) fn detect_and_generate_chunks(
         let chunks = generate_chunks(min_days, max_days, days_per_chunk as i64);
         log::info!(
             "export '{}': date chunk_column `{}` range {} .. {} ({} days, {} days/chunk → {} chunk(s))",
-            export_name, chunk_column, min_date, max_date, total_days, days_per_chunk, chunks.len()
+            export_name,
+            chunk_column,
+            min_date,
+            max_date,
+            total_days,
+            days_per_chunk,
+            chunks.len()
         );
         return Ok(chunks);
     }
@@ -397,7 +411,8 @@ pub(crate) fn run_chunked_sequential(
             std::thread::sleep(Duration::from_secs(5));
         }
 
-        let chunk_query = build_chunk_query_sql(base_query, col, *start, *end, export.chunk_dense, is_date);
+        let chunk_query =
+            build_chunk_query_sql(base_query, col, *start, *end, export.chunk_dense, is_date);
         log::info!(
             "export '{}': chunk {}/{} ({}..{})",
             export.name,
@@ -676,7 +691,13 @@ fn ensure_chunk_checkpoint_plan(
     resume: bool,
     tuning: &SourceTuning,
 ) -> Result<String> {
-    let plan_hash = chunk_plan_fingerprint(base_query, col, export.chunk_size, export.chunk_dense, export.chunk_by_days);
+    let plan_hash = chunk_plan_fingerprint(
+        base_query,
+        col,
+        export.chunk_size,
+        export.chunk_dense,
+        export.chunk_by_days,
+    );
     let max_att = chunk_max_attempts_for_export(export, tuning);
 
     if resume {
@@ -737,7 +758,14 @@ fn export_one_chunk_range(
     tuning: &SourceTuning,
     validate: bool,
 ) -> Result<(usize, Option<String>, u64)> {
-    let chunk_query = build_chunk_query_sql(base_query, col, start, end, export.chunk_dense, export.chunk_by_days.is_some());
+    let chunk_query = build_chunk_query_sql(
+        base_query,
+        col,
+        start,
+        end,
+        export.chunk_dense,
+        export.chunk_by_days.is_some(),
+    );
 
     let mut sink = ExportSink::new(export)?;
     src.export(&chunk_query, None, None, tuning, &mut sink)?;
@@ -1362,7 +1390,14 @@ mod tests {
         let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
         let start = (chrono::NaiveDate::from_ymd_opt(2023, 1, 1).unwrap() - epoch).num_days();
         let end = (chrono::NaiveDate::from_ymd_opt(2023, 1, 7).unwrap() - epoch).num_days();
-        let q = build_chunk_query_sql("SELECT * FROM orders", "created_at", start, end, false, true);
+        let q = build_chunk_query_sql(
+            "SELECT * FROM orders",
+            "created_at",
+            start,
+            end,
+            false,
+            true,
+        );
         assert!(q.contains(">= '2023-01-01'"), "got: {q}");
         assert!(q.contains("< '2023-01-08'"), "got: {q}"); // end+1 day exclusive
         assert!(!q.contains("BETWEEN"), "should use >= AND <, got: {q}");

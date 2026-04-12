@@ -1,5 +1,87 @@
 # Changelog
 
+## 0.2.0-beta.3 (2026-04-12)
+
+### New features
+
+**Connection limit warning in `rivet check`**
+
+`rivet check` now warns when `parallel` meets or exceeds the database's `max_connections` limit. The warning includes exact numbers and a safe recommendation (headroom of 3 reserved connections for monitoring and admin traffic).
+
+```
+WARNING: parallel=20 meets or exceeds DB max_connections=20 —
+workers will compete for connections and some may fail.
+Reduce parallel to at most 17.
+```
+
+If `max_connections` cannot be fetched (restricted user), rivet shows an informative "check skipped" message rather than silently passing.
+
+Works for PostgreSQL (`current_setting('max_connections')`) and MySQL (`@@max_connections`).
+
+**Date-native chunking (`chunk_by_days`)**
+
+New `chunk_by_days` field on chunked exports. Partitions a table into calendar windows on a DATE or TIMESTAMP column — no unix-epoch arithmetic, correct open-end semantics for timestamps.
+
+```yaml
+exports:
+  - name: orders_by_year
+    query: "SELECT id, user_id, product, price, ordered_at FROM orders"
+    mode: chunked
+    chunk_column: ordered_at
+    chunk_by_days: 365
+    parallel: 4
+    format: parquet
+    destination:
+      type: local
+      path: ./output
+```
+
+Generated SQL per chunk:
+```sql
+WHERE ordered_at >= '2023-01-01' AND ordered_at < '2024-01-01'
+```
+
+- Works with `parallel: N` for concurrent date-window workers
+- Compatible with `chunk_checkpoint` / `--resume`
+- `rivet check` reports strategy as `date-chunked(ordered_at, 365d)`
+- `chunk_dense: true` cannot be combined with `chunk_by_days` (rejected at config validation)
+- Sparse-range check is skipped for date mode (calendar gaps ≠ numeric ID sparsity)
+
+### Documentation
+
+- `docs/modes/chunked.md` — new "Date-based chunking" section with SQL example and when-to-use guidance
+- `docs/reference/config.md` — `chunk_by_days` field documented
+- `USER_GUIDE.md` — date chunking section added
+- `examples/pg_date_chunked_local.yaml` — two export examples (orders by year, events by month with parallel + checkpoint)
+
+### Tests
+
+- 11 new unit tests: `check_connection_limit` (7) + `parse_date_flexible` and date chunk query building (4+)
+- 4 config validation tests for `chunk_by_days` edge cases
+- E2E Section 14: connection limit warnings (PG + MySQL, safe and exceeded cases)
+- E2E Section 15: date-chunked run, preflight strategy, `chunk_by_days + chunk_dense` rejection (PG + MySQL)
+
+---
+
+## 0.2.0-beta.2 (2026-03-28)
+
+### New features
+
+- **Homebrew tap** — `brew install panchenkoai/rivet/rivet-cli`
+- **Docker image** — `ghcr.io/panchenkoai/rivet`
+- **`cargo install rivet-cli`** — published to crates.io (crate renamed from `rivet` which was already taken)
+
+### Fixes
+
+- Homebrew tap workflow: moved `HOMEBREW_TAP_GITHUB_TOKEN` to job-level env to pass workflow validation
+- `fastrand` updated to 2.4.1 (2.4.0 was yanked)
+
+### Documentation
+
+- README: added `cargo install` section
+
+---
+
 ## 0.2.0-beta.1 (2026-04-05)
 
 ### Architecture

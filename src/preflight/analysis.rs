@@ -19,7 +19,10 @@ pub(crate) fn derive_strategy(export: &ExportConfig) -> String {
             let col = export.chunk_column.as_deref().unwrap_or("?");
             if let Some(days) = export.chunk_by_days {
                 if export.parallel > 1 {
-                    format!("date-chunked-parallel({}, {}d, p={})", col, days, export.parallel)
+                    format!(
+                        "date-chunked-parallel({}, {}d, p={})",
+                        col, days, export.parallel
+                    )
                 } else {
                     format!("date-chunked({}, {}d)", col, days)
                 }
