@@ -224,8 +224,9 @@ mod tests {
         p.max_file_size_bytes = Some(100 * 1024 * 1024);
         let diags = validate_plan(&p);
         assert!(
-            diags.iter().any(|d| d.rule == "stdout-no-split"
-                && d.level == DiagnosticLevel::Rejected),
+            diags
+                .iter()
+                .any(|d| d.rule == "stdout-no-split" && d.level == DiagnosticLevel::Rejected),
             "expected stdout-no-split rejection, got: {:?}",
             rules(&diags)
         );
@@ -251,8 +252,9 @@ mod tests {
         p.strategy = chunked_plan_strategy(false);
         let diags = validate_plan(&p);
         assert!(
-            diags.iter().any(|d| d.rule == "stdout-no-chunked"
-                && d.level == DiagnosticLevel::Rejected),
+            diags
+                .iter()
+                .any(|d| d.rule == "stdout-no-chunked" && d.level == DiagnosticLevel::Rejected),
             "expected stdout-no-chunked rejection, got: {:?}",
             rules(&diags)
         );
@@ -281,8 +283,10 @@ mod tests {
         p.reconcile = true;
         let diags = validate_plan(&p);
         assert!(
-            diags.iter().any(|d| d.rule == "incremental-reconcile-mismatch"
-                && d.level == DiagnosticLevel::Warning),
+            diags
+                .iter()
+                .any(|d| d.rule == "incremental-reconcile-mismatch"
+                    && d.level == DiagnosticLevel::Warning),
             "expected incremental-reconcile-mismatch warning, got: {:?}",
             rules(&diags)
         );
@@ -294,7 +298,9 @@ mod tests {
         p.reconcile = true;
         let diags = validate_plan(&p);
         assert!(
-            diags.iter().all(|d| d.rule != "incremental-reconcile-mismatch"),
+            diags
+                .iter()
+                .all(|d| d.rule != "incremental-reconcile-mismatch"),
             "unexpected incremental-reconcile-mismatch, got: {:?}",
             rules(&diags)
         );
@@ -347,8 +353,9 @@ mod tests {
         // snapshot strategy — checkpoint not applicable
         let diags = validate_plan(&p);
         assert!(
-            diags.iter().any(|d| d.rule == "resume-no-checkpoint"
-                && d.level == DiagnosticLevel::Warning),
+            diags
+                .iter()
+                .any(|d| d.rule == "resume-no-checkpoint" && d.level == DiagnosticLevel::Warning),
             "expected resume-no-checkpoint warning, got: {:?}",
             rules(&diags)
         );
@@ -387,8 +394,9 @@ mod tests {
         let p = stdout_plan();
         let diags = validate_plan(&p);
         assert!(
-            diags.iter().any(|d| d.rule == "stdout-manifest-phantom"
-                && d.level == DiagnosticLevel::Degraded),
+            diags.iter().any(
+                |d| d.rule == "stdout-manifest-phantom" && d.level == DiagnosticLevel::Degraded
+            ),
             "expected stdout-manifest-phantom degraded, got: {:?}",
             rules(&diags)
         );

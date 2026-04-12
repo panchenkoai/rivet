@@ -27,7 +27,9 @@ use std::path::Path;
 
 use crate::config::{Config, ExportConfig};
 use crate::error::Result;
-use crate::plan::{DiagnosticLevel, ExtractionStrategy, ResolvedRunPlan, build_plan, validate_plan};
+use crate::plan::{
+    DiagnosticLevel, ExtractionStrategy, ResolvedRunPlan, build_plan, validate_plan,
+};
 use crate::state::StateStore;
 
 use chunked::run_chunked_parallel_checkpoint;
