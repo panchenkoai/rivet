@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use crate::config::FormatType;
 use crate::error::Result;
+use crate::plan::FormatType;
 
 pub fn validate_output(path: &Path, format: FormatType, expected_rows: usize) -> Result<()> {
     let actual = match format {

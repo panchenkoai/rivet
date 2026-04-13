@@ -2,13 +2,18 @@ pub mod validate;
 
 pub use validate::{DiagnosticLevel, validate_plan};
 
+// Re-export value types so pipeline modules import from `crate::plan`, not `crate::config`.
+// `DestinationType` is used by validate.rs internally and by external callers of the plan API.
+#[allow(unused_imports)]
+pub use crate::config::{
+    CompressionType, DestinationConfig, DestinationType, FormatType, MetaColumns, QualityConfig,
+    SourceConfig, TimeColumnType,
+};
+
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::config::{
-    CompressionType, Config, DestinationConfig, ExportConfig, ExportMode, FormatType, MetaColumns,
-    QualityConfig, TimeColumnType,
-};
+use crate::config::{Config, ExportConfig, ExportMode};
 use crate::error::Result;
 use crate::tuning::{SourceTuning, TuningProfile, merge_tuning_config};
 
@@ -36,6 +41,9 @@ pub struct ResolvedRunPlan {
     pub validate: bool,
     pub reconcile: bool,
     pub resume: bool,
+    /// Source connection parameters — resolved from config at plan time so pipeline
+    /// functions receive the complete execution contract in a single struct.
+    pub source: SourceConfig,
 }
 
 /// Extraction strategy and all parameters needed to execute it.
@@ -171,6 +179,7 @@ pub fn build_plan(
         validate,
         reconcile,
         resume,
+        source: config.source.clone(),
     })
 }
 

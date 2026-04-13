@@ -5,15 +5,13 @@ use super::chunked::{run_chunked_sequential, run_chunked_sequential_checkpoint};
 use super::retry::classify_error;
 use super::sink::{CompletedPart, ExportSink, extract_last_cursor_value};
 use super::validate::validate_output;
-use crate::config::{SourceConfig, TimeColumnType};
 use crate::error::Result;
-use crate::plan::{ExtractionStrategy, ResolvedRunPlan};
+use crate::plan::{ExtractionStrategy, ResolvedRunPlan, TimeColumnType};
 use crate::source::{self, Source};
 use crate::state::StateStore;
 use crate::{destination, format};
 
 pub(crate) fn run_with_reconnect(
-    source_config: &SourceConfig,
     state: &StateStore,
     plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
@@ -48,7 +46,7 @@ pub(crate) fn run_with_reconnect(
             std::thread::sleep(Duration::from_millis(backoff));
         }
 
-        let mut src = match source::create_source(source_config) {
+        let mut src = match source::create_source(&plan.source) {
             Ok(s) => s,
             Err(e) => {
                 let (transient, _, _) = classify_error(&e);
@@ -65,7 +63,7 @@ pub(crate) fn run_with_reconnect(
             }
         };
 
-        match run_export(&mut *src, source_config, state, plan, summary, config_path) {
+        match run_export(&mut *src, state, plan, summary, config_path) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 let (transient, _, _) = classify_error(&e);
@@ -83,7 +81,6 @@ pub(crate) fn run_with_reconnect(
 
 pub(crate) fn run_export(
     src: &mut dyn Source,
-    source_config: &SourceConfig,
     state: &StateStore,
     plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
@@ -114,14 +111,7 @@ pub(crate) fn run_export(
             )?;
         }
         ExtractionStrategy::Chunked(cp) if cp.checkpoint => {
-            run_chunked_sequential_checkpoint(
-                src,
-                source_config,
-                state,
-                plan,
-                summary,
-                config_path,
-            )?;
+            run_chunked_sequential_checkpoint(src, state, plan, summary, config_path)?;
         }
         ExtractionStrategy::Chunked(_) => {
             run_chunked_sequential(src, plan, summary, Some(state))?;

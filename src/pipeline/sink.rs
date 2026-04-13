@@ -5,11 +5,10 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
 use super::chunked::RIVET_CHUNK_RN_COL;
-use crate::config::{CompressionType, FormatType, MetaColumns};
 use crate::enrich;
 use crate::error::Result;
 use crate::format::{self, FormatWriter};
-use crate::plan::{ExtractionStrategy, ResolvedRunPlan};
+use crate::plan::{CompressionType, ExtractionStrategy, FormatType, MetaColumns, ResolvedRunPlan};
 use crate::source::BatchSink;
 
 pub(crate) struct CompletedPart {

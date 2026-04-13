@@ -149,10 +149,11 @@ fn check_stdout_manifest(diags: &mut Vec<Diagnostic>, plan: &ResolvedRunPlan) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        CompressionType, DestinationConfig, DestinationType, FormatType, MetaColumns, QualityConfig,
+    use crate::config::{SourceConfig, SourceType};
+    use crate::plan::{
+        ChunkedPlan, CompressionType, DestinationConfig, DestinationType, ExtractionStrategy,
+        FormatType, MetaColumns, QualityConfig, ResolvedRunPlan,
     };
-    use crate::plan::{ChunkedPlan, ExtractionStrategy, ResolvedRunPlan};
     use crate::tuning::SourceTuning;
 
     fn base_plan() -> ResolvedRunPlan {
@@ -185,6 +186,19 @@ mod tests {
             validate: false,
             reconcile: false,
             resume: false,
+            source: SourceConfig {
+                source_type: SourceType::Postgres,
+                url: Some("postgresql://localhost/test".into()),
+                url_env: None,
+                url_file: None,
+                host: None,
+                port: None,
+                user: None,
+                password: None,
+                password_env: None,
+                database: None,
+                tuning: None,
+            },
         }
     }
 

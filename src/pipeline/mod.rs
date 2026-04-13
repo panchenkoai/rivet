@@ -212,11 +212,7 @@ fn run_chunked_quality_gate(
 
 /// Run `SELECT COUNT(*) FROM ({query})` against the source and compare with exported rows.
 /// Skips reconciliation for incremental exports that used a cursor (moving target).
-fn reconcile_source_count(
-    source_config: &crate::config::SourceConfig,
-    plan: &ResolvedRunPlan,
-    summary: &mut RunSummary,
-) {
+fn reconcile_source_count(plan: &ResolvedRunPlan, summary: &mut RunSummary) {
     if matches!(plan.strategy, ExtractionStrategy::Incremental { .. }) {
         log::info!(
             "reconcile: skipping for incremental export '{}' (cursor-based, count may differ)",
@@ -234,7 +230,7 @@ fn reconcile_source_count(
         plan.export_name
     );
 
-    let mut src = match crate::source::create_source(source_config) {
+    let mut src = match crate::source::create_source(&plan.source) {
         Ok(s) => s,
         Err(e) => {
             log::warn!("reconcile: could not connect to source: {:#}", e);
@@ -350,12 +346,12 @@ fn run_export_job(
 
     let result = match &plan.strategy {
         ExtractionStrategy::Chunked(cp) if cp.parallel > 1 && cp.checkpoint => {
-            run_chunked_parallel_checkpoint(config_path, &config.source, state, &plan, &mut summary)
+            run_chunked_parallel_checkpoint(config_path, state, &plan, &mut summary)
         }
         ExtractionStrategy::Chunked(cp) if cp.parallel > 1 => {
-            chunked::run_chunked_parallel(&config.source, state, &plan, &mut summary)
+            chunked::run_chunked_parallel(state, &plan, &mut summary)
         }
-        _ => run_with_reconnect(&config.source, state, &plan, &mut summary, config_path),
+        _ => run_with_reconnect(state, &plan, &mut summary, config_path),
     };
 
     let rss_peak = rss_sampler.stop();
@@ -380,7 +376,7 @@ fn run_export_job(
     }
 
     if plan.reconcile && !failed {
-        reconcile_source_count(&config.source, &plan, &mut summary);
+        reconcile_source_count(&plan, &mut summary);
     }
 
     let _ = state.record_metric(
@@ -616,10 +612,11 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        CompressionType, DestinationConfig, DestinationType, FormatType, MetaColumns,
+    use crate::config::{SourceConfig, SourceType};
+    use crate::plan::{
+        CompressionType, DestinationConfig, DestinationType, ExtractionStrategy, FormatType,
+        MetaColumns, ResolvedRunPlan,
     };
-    use crate::plan::{ExtractionStrategy, ResolvedRunPlan};
     use crate::tuning::SourceTuning;
 
     #[test]
@@ -675,6 +672,19 @@ mod tests {
             validate: false,
             reconcile: false,
             resume: false,
+            source: SourceConfig {
+                source_type: SourceType::Postgres,
+                url: Some("postgresql://localhost/test".into()),
+                url_env: None,
+                url_file: None,
+                host: None,
+                port: None,
+                user: None,
+                password: None,
+                password_env: None,
+                database: None,
+                tuning: None,
+            },
         }
     }
 

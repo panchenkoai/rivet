@@ -7,7 +7,6 @@ use super::progress::ChunkProgress;
 use super::retry::classify_error;
 use super::sink::ExportSink;
 use super::validate::validate_output;
-use crate::config::SourceConfig;
 use crate::error::Result;
 use crate::plan::{ChunkedPlan, ExtractionStrategy, ResolvedRunPlan};
 use crate::preflight::chunk_sparsity_from_counts;
@@ -485,14 +484,13 @@ pub(crate) fn run_chunked_sequential(
 // ─── Chunked Mode (Parallel) ────────────────────────────────
 
 pub(super) fn run_chunked_parallel(
-    source_config: &SourceConfig,
     state: &StateStore,
     plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
 ) -> Result<()> {
     let cp = chunked_plan(plan);
 
-    let mut src = source::create_source(source_config)?;
+    let mut src = source::create_source(&plan.source)?;
     let chunks = detect_and_generate_chunks(
         &mut *src,
         &plan.base_query,
@@ -540,7 +538,6 @@ pub(super) fn run_chunked_parallel(
 
             semaphore.fetch_add(1, Ordering::Relaxed);
 
-            let source_config = source_config.clone();
             let plan_for_worker = plan.clone();
             let export_name = &plan.export_name;
             let base_query = &plan.base_query;
@@ -561,7 +558,7 @@ pub(super) fn run_chunked_parallel(
                     let chunk_query =
                         build_chunk_query_sql(base_query, col, start, end, cp.dense, is_date);
 
-                    let mut thread_src = source::create_source(&source_config)?;
+                    let mut thread_src = source::create_source(&plan_for_worker.source)?;
                     let mut sink = ExportSink::new(&plan_for_worker)?;
                     thread_src.export(
                         &chunk_query,
@@ -799,7 +796,6 @@ fn export_one_chunk_range(
 }
 
 fn run_chunk_with_source_retries(
-    source_config: &SourceConfig,
     base_query: &str,
     cp: &ChunkedPlan,
     start: i64,
@@ -826,7 +822,7 @@ fn run_chunk_with_source_retries(
             std::thread::sleep(Duration::from_millis(backoff));
         }
 
-        let mut src = match source::create_source(source_config) {
+        let mut src = match source::create_source(&plan.source) {
             Ok(s) => s,
             Err(e) => {
                 let (transient, _, _) = classify_error(&e);
@@ -855,7 +851,6 @@ fn run_chunk_with_source_retries(
 
 pub(crate) fn run_chunked_sequential_checkpoint(
     src: &mut dyn Source,
-    source_config: &SourceConfig,
     state: &StateStore,
     plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
@@ -911,15 +906,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
             end
         );
 
-        match run_chunk_with_source_retries(
-            source_config,
-            &plan.base_query,
-            cp,
-            start,
-            end,
-            chunk_index,
-            plan,
-        ) {
+        match run_chunk_with_source_retries(&plan.base_query, cp, start, end, chunk_index, plan) {
             Ok((rows, fname, file_bytes)) => {
                 summary.total_rows += rows as i64;
                 pb.inc(summary.total_rows);
@@ -974,7 +961,6 @@ pub(crate) fn run_chunked_sequential_checkpoint(
 
 pub(super) fn run_chunked_parallel_checkpoint(
     config_path: &str,
-    source_config: &SourceConfig,
     state: &StateStore,
     plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
@@ -984,7 +970,7 @@ pub(super) fn run_chunked_parallel_checkpoint(
     let chunks = if plan.resume {
         vec![]
     } else {
-        let mut src = source::create_source(source_config)?;
+        let mut src = source::create_source(&plan.source)?;
         detect_and_generate_chunks(
             &mut *src,
             &plan.base_query,
@@ -1021,7 +1007,6 @@ pub(super) fn run_chunked_parallel_checkpoint(
 
     let plan_for_workers = plan.clone();
     let cp_for_workers = cp.clone();
-    let source_config_cl = source_config.clone();
     let config_path_owned = config_path.to_string();
     let fmt_label = format!("{:?}", plan.format).to_lowercase();
     let comp_label = format!("{:?}", plan.compression).to_lowercase();
@@ -1036,7 +1021,6 @@ pub(super) fn run_chunked_parallel_checkpoint(
             let errors = &errors;
             let plan_w = plan_for_workers.clone();
             let cp_w = cp_for_workers.clone();
-            let source_config_w = source_config_cl.clone();
             let config_path_w = config_path_owned.clone();
             let fmt_label_w = fmt_label.clone();
             let comp_label_w = comp_label.clone();
@@ -1114,7 +1098,7 @@ pub(super) fn run_chunked_parallel_checkpoint(
                                 std::thread::sleep(Duration::from_millis(backoff));
                             }
 
-                            let mut thread_src = match source::create_source(&source_config_w) {
+                            let mut thread_src = match source::create_source(&plan_w.source) {
                                 Ok(s) => s,
                                 Err(e) => {
                                     let (transient, _, _) = classify_error(&e);
