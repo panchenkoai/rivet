@@ -5,9 +5,7 @@
 ### Homebrew (macOS / Linux) — recommended
 
 ```bash
-brew tap panchenkoai/rivet
-brew update
-brew install rivet
+brew install panchenkoai/rivet/rivet
 rivet --version
 ```
 
@@ -43,23 +41,50 @@ rivet --version
 # Check version
 docker run --rm ghcr.io/panchenkoai/rivet:latest --version
 
-# Run an export (mount your config and output directory)
+# Run from the repo root using the bundled example config (no file copy needed)
+mkdir -p output
 docker run --rm \
-  -v $(pwd)/rivet.yaml:/config/rivet.yaml \
+  -e DATABASE_URL="postgresql://user:pass@host.docker.internal:5432/db" \
+  -v $(pwd)/examples/rivet.yaml:/config/rivet.yaml \
   -v $(pwd)/output:/output \
   ghcr.io/panchenkoai/rivet:latest \
   run --config /config/rivet.yaml
 
-# Pass credentials via environment variables
+# Or mount your own config
 docker run --rm \
-  -e DATABASE_URL="postgresql://user:pass@host:5432/db" \
+  -e DATABASE_URL="postgresql://user:pass@host.docker.internal:5432/db" \
   -v $(pwd)/rivet.yaml:/config/rivet.yaml \
   -v $(pwd)/output:/output \
   ghcr.io/panchenkoai/rivet:latest \
   run --config /config/rivet.yaml
 ```
 
-> To connect to a database on your host machine, use `host.docker.internal` instead of `localhost` in the connection URL.
+> **Database on your laptop (not inside the container):** inside the container, `localhost` is the container itself — not your machine. Choose the approach for your OS:
+>
+> **Docker Desktop (macOS / Windows)** — use `host.docker.internal`:
+> ```bash
+> -e DATABASE_URL="mysql://user:pass@host.docker.internal:3306/db"
+> ```
+>
+> **Linux — easiest: `--network host`** — shares the host network stack, so `127.0.0.1` works as-is:
+> ```bash
+> docker run --rm --network host \
+>   -e DATABASE_URL="mysql://user:pass@127.0.0.1:3306/db" \
+>   -v $(pwd)/examples/rivet.yaml:/config/rivet.yaml \
+>   -v $(pwd)/output:/output \
+>   ghcr.io/panchenkoai/rivet:latest \
+>   run --config /config/rivet.yaml
+> ```
+>
+> **Linux — alternative: `host-gateway`** (keeps container isolation):
+> ```bash
+> docker run --rm --add-host=host.docker.internal:host-gateway \
+>   -e DATABASE_URL="mysql://user:pass@host.docker.internal:3306/db" \
+>   ...
+> ```
+> Note: this requires MySQL to listen on `0.0.0.0` (not just `127.0.0.1`). If you still get **connection refused**, `--network host` is simpler.
+>
+> **Do not use the bridge gateway IP** (`172.17.0.1`) directly — MySQL's default `bind-address = 127.0.0.1` means it will refuse connections arriving on that interface.
 
 ### Build from source
 

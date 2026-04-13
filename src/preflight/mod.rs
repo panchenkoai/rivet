@@ -10,6 +10,7 @@ use analysis::{
     check_parallel_memory_risk, check_sparse_range, compute_verdict, derive_strategy,
     recommend_parallelism, recommend_profile,
 };
+#[allow(unused_imports)]
 pub use doctor::doctor;
 #[cfg(test)]
 use postgres::{extract_scan_type, parse_pg_row_estimate};

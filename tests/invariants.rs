@@ -197,6 +197,28 @@ fn i3_cursor_update_is_last_write_wins() {
     );
 }
 
+/// I3 (monotonicity contract) — The StateStore does not enforce that cursor values
+/// advance monotonically; that is the pipeline's responsibility (ADR-0001 I3).
+/// Writing a value that is lexicographically earlier than the previous value succeeds
+/// at the storage layer.  The pipeline prevents this from happening by only calling
+/// `update()` after a successful write, using the last cursor value from the batch.
+///
+/// This test documents the contract boundary: StateStore is a dumb store; the
+/// ordering guarantee lives in the pipeline, not in the storage layer.
+#[test]
+fn i3_state_store_does_not_enforce_cursor_monotonicity() {
+    let state = StateStore::open_in_memory().unwrap();
+    state.update("exp", "2024-06-15T00:00:00Z").unwrap();
+    // Deliberately write an older value — the store accepts it without error.
+    state.update("exp", "2024-01-01T00:00:00Z").unwrap();
+
+    let val = state.get("exp").unwrap().last_cursor_value.unwrap();
+    assert_eq!(
+        val, "2024-01-01T00:00:00Z",
+        "StateStore accepts any update; monotonicity is the pipeline's responsibility (ADR-0001 I3)"
+    );
+}
+
 // ─── I4: Metric After Verdict ─────────────────────────────────────────────────
 
 /// I4 — Metric always records the final terminal status, never an intermediate one.
@@ -294,10 +316,10 @@ fn i2_manifest_absent_before_record_file_is_called() {
     assert_eq!(files[0].file_name, "exp_20240601.parquet");
 }
 
-/// I7 (structural) — Each run produces at most one manifest entry per file written.
-/// Idempotent record_file calls with distinct file names produce distinct entries.
+/// I2 (structural) — Each `record_file` call for a distinct file name produces exactly
+/// one manifest entry.  Two calls with different names → two entries.
 #[test]
-fn i7_manifest_entry_per_file_no_duplication() {
+fn i2_distinct_files_produce_distinct_manifest_entries() {
     let state = StateStore::open_in_memory().unwrap();
 
     state
@@ -328,5 +350,59 @@ fn i7_manifest_entry_per_file_no_duplication() {
         files.len(),
         2,
         "two distinct files must produce two distinct entries"
+    );
+}
+
+// ─── I7: Manifest Failure Is Non-Fatal ───────────────────────────────────────
+
+/// I7 — Manifest write failures are non-fatal (ADR-0001 I7).
+///
+/// All `record_file()` call sites in the pipeline use `let _ = st.record_file(...)`
+/// to explicitly discard errors; this is intentional and documented in ADR-0001.
+///
+/// This test verifies the contract from the state-layer perspective:
+/// - `record_file` returns `Result` (can fail silently),
+/// - discarding the error with `let _ = ...` is safe,
+/// - prior manifest entries committed before a failure remain durable.
+///
+/// Pipeline-level enforcement (`let _ = ...` call sites in `single.rs` and
+/// `chunked.rs`) is verified by code inspection; it cannot be tested via the
+/// public StateStore API without injecting a storage fault.
+#[test]
+fn i7_prior_manifest_entries_survive_subsequent_record_file_calls() {
+    let state = StateStore::open_in_memory().unwrap();
+
+    // First write — committed successfully.
+    state
+        .record_file(
+            "run-z",
+            "exp",
+            "exp_20240601.parquet",
+            100,
+            4096,
+            "parquet",
+            None,
+        )
+        .unwrap();
+
+    // Simulate the pipeline's `let _ = st.record_file(...)` pattern: discard the
+    // result unconditionally.  Whether this call succeeds or fails, the prior
+    // committed entry must remain intact.
+    let _ = state.record_file(
+        "run-z",
+        "exp",
+        "exp_20240602.parquet",
+        200,
+        8192,
+        "parquet",
+        None,
+    );
+
+    // The first manifest entry must still be present — SQLite row-level durability
+    // ensures each committed INSERT survives independent of any later call outcome.
+    let files = state.get_files(Some("exp"), 10).unwrap();
+    assert!(
+        files.iter().any(|f| f.file_name == "exp_20240601.parquet"),
+        "I7: prior committed manifest entry must survive any subsequent record_file call (fatal or not)"
     );
 }

@@ -78,4 +78,13 @@ impl super::Destination for GcsDestination {
         log::info!("uploaded gs://{}", key);
         Ok(())
     }
+
+    fn capabilities(&self) -> super::DestinationCapabilities {
+        super::DestinationCapabilities {
+            commit_protocol: super::WriteCommitProtocol::FinalizeOnClose,
+            idempotent_overwrite: true,
+            retry_safe: true,
+            partial_write_risk: false,
+        }
+    }
 }

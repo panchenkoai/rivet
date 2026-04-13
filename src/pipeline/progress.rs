@@ -1,3 +1,8 @@
+//! **Layer: Observability**
+//!
+//! Terminal progress bar for chunked exports.  Pure display — reads chunk counts
+//! from an `AtomicUsize` counter updated by execution workers, emits no state.
+
 use std::sync::Arc;
 use std::time::Duration;
 

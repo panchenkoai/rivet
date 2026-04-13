@@ -15,6 +15,7 @@ mod preflight;
 mod quality;
 mod resource;
 mod source;
+mod sql;
 mod state;
 mod tuning;
 mod types;

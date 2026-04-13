@@ -1,3 +1,8 @@
+//! **Layer: Execution**
+//!
+//! Post-write output validation.  Opens the written file and counts rows to
+//! verify the expected count.  Triggered only when `plan.validate = true`.
+
 use std::path::Path;
 
 use crate::error::Result;

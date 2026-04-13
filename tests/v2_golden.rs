@@ -1,4 +1,4 @@
-use rivet::config::{Config, ExportMode, TimeColumnType};
+use rivet::config::{Config, ExportMode, SourceType, TimeColumnType};
 use rivet::pipeline::{build_time_window_query, generate_chunks};
 
 // ─── Chunk Generation Golden Tests ───────────────────────────
@@ -43,16 +43,23 @@ fn test_time_window_timestamp_format() {
         "created_at",
         TimeColumnType::Timestamp,
         7,
+        SourceType::Postgres,
     );
-    assert!(q.contains("_rivet WHERE created_at >= '"), "got: {}", q);
+    assert!(q.contains("_rivet WHERE \"created_at\" >= '"), "got: {}", q);
     assert!(q.contains("-"), "should have date format, got: {}", q);
 }
 
 #[test]
 fn test_time_window_unix_format() {
-    let q = build_time_window_query("SELECT * FROM events", "ts", TimeColumnType::Unix, 30);
-    assert!(q.contains("_rivet WHERE ts >= "), "got: {}", q);
-    let after_gte = q.split("ts >= ").nth(1).unwrap();
+    let q = build_time_window_query(
+        "SELECT * FROM events",
+        "ts",
+        TimeColumnType::Unix,
+        30,
+        SourceType::Postgres,
+    );
+    assert!(q.contains("_rivet WHERE \"ts\" >= "), "got: {}", q);
+    let after_gte = q.split("\"ts\" >= ").nth(1).unwrap();
     let num: i64 = after_gte.trim().parse().expect("should be a number");
     assert!(
         num > 1_000_000_000,
@@ -68,6 +75,7 @@ fn test_time_window_wraps_base_query() {
         "updated_at",
         TimeColumnType::Timestamp,
         1,
+        SourceType::Postgres,
     );
     assert!(
         q.contains("FROM (SELECT id, name FROM users) AS _rivet"),

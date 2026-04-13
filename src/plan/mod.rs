@@ -70,6 +70,121 @@ impl ExtractionStrategy {
             ExtractionStrategy::TimeWindow { .. } => "timewindow",
         }
     }
+
+    /// True for strategies that must load the cursor store before execution.
+    ///
+    /// Only `Incremental` reads the last cursor value to build the WHERE clause
+    /// inside the source driver.  All other strategies are stateless at query time.
+    pub fn needs_cursor_state(&self) -> bool {
+        matches!(self, ExtractionStrategy::Incremental { .. })
+    }
+
+    /// True for strategies that spawn parallel worker threads during execution.
+    ///
+    /// Only `Chunked` plans with `parallel > 1` use a thread pool.  All other
+    /// strategies (including sequential chunked) run on the calling thread.
+    pub fn requires_parallel_execution(&self) -> bool {
+        matches!(self, ExtractionStrategy::Chunked(cp) if cp.parallel > 1)
+    }
+
+    /// True for strategies that support crash-resume via a persisted checkpoint.
+    ///
+    /// Only `Chunked` with `checkpoint: true` can resume mid-run.  All other
+    /// strategies restart from scratch on retry.
+    pub fn is_resumable(&self) -> bool {
+        matches!(self, ExtractionStrategy::Chunked(cp) if cp.checkpoint)
+    }
+
+    /// Returns the cursor column name for `Incremental` strategies, `None` otherwise.
+    ///
+    /// The source driver uses this to append a `WHERE <column> > <last_value>` clause.
+    pub fn cursor_column(&self) -> Option<&str> {
+        match self {
+            ExtractionStrategy::Incremental { cursor_column } => Some(cursor_column.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Resolve the concrete SQL query for non-chunked strategies.
+    ///
+    /// Returns `None` for `Chunked` — chunked execution builds per-chunk queries
+    /// inside the chunked pipeline and does not use a single resolved query string.
+    ///
+    /// | Strategy    | Query returned                                               |
+    /// |-------------|--------------------------------------------------------------|
+    /// | Snapshot    | `base_query` unchanged                                       |
+    /// | Incremental | `base_query` unchanged (cursor WHERE added by source driver) |
+    /// | TimeWindow  | `base_query` wrapped with a time-range predicate             |
+    /// | Chunked     | `None`                                                       |
+    pub fn resolve_query(
+        &self,
+        base_query: &str,
+        source_type: crate::config::SourceType,
+    ) -> Option<String> {
+        match self {
+            ExtractionStrategy::Snapshot | ExtractionStrategy::Incremental { .. } => {
+                Some(base_query.to_string())
+            }
+            ExtractionStrategy::TimeWindow {
+                column,
+                column_type,
+                days_window,
+            } => Some(build_time_window_query(
+                base_query,
+                column,
+                *column_type,
+                *days_window,
+                source_type,
+            )),
+            ExtractionStrategy::Chunked(_) => None,
+        }
+    }
+}
+
+/// Wrap `base_query` with a trailing time-range predicate for `TimeWindow` exports.
+///
+/// The predicate anchors to midnight at the start of the window so the boundary is
+/// stable for the entire run regardless of when within the day it executes.
+///
+/// - `Timestamp` columns compare against an ISO-8601 datetime literal.
+/// - `Unix` columns compare against a Unix epoch integer.
+///
+/// The column name is quoted via `crate::sql::quote_ident` to prevent injection
+/// when the name comes from user configuration.
+pub fn build_time_window_query(
+    base_query: &str,
+    time_column: &str,
+    time_type: TimeColumnType,
+    days_window: u32,
+    source_type: crate::config::SourceType,
+) -> String {
+    let quoted_col = crate::sql::quote_ident(source_type, time_column);
+
+    let now = chrono::Utc::now();
+    let window_start = now - chrono::Duration::days(days_window as i64);
+    let truncated = window_start
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is always valid");
+
+    let condition = match time_type {
+        TimeColumnType::Timestamp => {
+            format!(
+                "{} >= '{}'",
+                quoted_col,
+                truncated.format("%Y-%m-%d %H:%M:%S")
+            )
+        }
+        TimeColumnType::Unix => {
+            format!("{} >= {}", quoted_col, truncated.and_utc().timestamp())
+        }
+    };
+
+    format!(
+        "SELECT * FROM ({base}) AS _rivet WHERE {cond}",
+        base = base_query,
+        cond = condition,
+    )
 }
 
 /// Parameters for chunked extraction, pre-resolved from config and tuning.
@@ -423,5 +538,114 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.tuning_profile_label, "balanced (default)");
+    }
+
+    // ─── ExtractionStrategy behavioral contracts ──────────────────────────────
+
+    #[test]
+    fn snapshot_strategy_contracts() {
+        let s = ExtractionStrategy::Snapshot;
+        assert!(!s.needs_cursor_state());
+        assert!(!s.is_resumable());
+        assert!(s.cursor_column().is_none());
+        let q = s.resolve_query("SELECT 1", SourceType::Postgres).unwrap();
+        assert_eq!(q, "SELECT 1");
+    }
+
+    #[test]
+    fn incremental_strategy_contracts() {
+        let s = ExtractionStrategy::Incremental {
+            cursor_column: "updated_at".into(),
+        };
+        assert!(s.needs_cursor_state());
+        assert!(!s.is_resumable());
+        assert_eq!(s.cursor_column(), Some("updated_at"));
+        // base query is passed through; cursor WHERE is added by the source driver
+        let q = s
+            .resolve_query("SELECT * FROM orders", SourceType::Postgres)
+            .unwrap();
+        assert_eq!(q, "SELECT * FROM orders");
+    }
+
+    #[test]
+    fn chunked_without_checkpoint_contracts() {
+        let s = ExtractionStrategy::Chunked(ChunkedPlan {
+            column: "id".into(),
+            chunk_size: 10_000,
+            parallel: 1,
+            dense: false,
+            by_days: None,
+            checkpoint: false,
+            max_attempts: 3,
+        });
+        assert!(!s.needs_cursor_state());
+        assert!(!s.is_resumable());
+        assert!(s.cursor_column().is_none());
+        assert!(s.resolve_query("SELECT 1", SourceType::Postgres).is_none()); // chunked builds per-chunk queries
+    }
+
+    #[test]
+    fn chunked_with_checkpoint_is_resumable() {
+        let s = ExtractionStrategy::Chunked(ChunkedPlan {
+            column: "id".into(),
+            chunk_size: 10_000,
+            parallel: 1,
+            dense: false,
+            by_days: None,
+            checkpoint: true,
+            max_attempts: 3,
+        });
+        assert!(s.is_resumable());
+        assert!(s.resolve_query("SELECT 1", SourceType::Postgres).is_none());
+    }
+
+    #[test]
+    fn time_window_strategy_contracts() {
+        let s = ExtractionStrategy::TimeWindow {
+            column: "created_at".into(),
+            column_type: TimeColumnType::Timestamp,
+            days_window: 7,
+        };
+        assert!(!s.needs_cursor_state());
+        assert!(!s.is_resumable());
+        assert!(s.cursor_column().is_none());
+        let q = s
+            .resolve_query("SELECT * FROM events", SourceType::Postgres)
+            .unwrap();
+        assert!(q.contains("_rivet WHERE"));
+        // Column is now quoted
+        assert!(q.contains("\"created_at\" >="));
+    }
+
+    #[test]
+    fn build_time_window_query_timestamp() {
+        let q = build_time_window_query(
+            "SELECT * FROM events",
+            "created_at",
+            TimeColumnType::Timestamp,
+            7,
+            SourceType::Postgres,
+        );
+        // Column is quoted; value uses single-quoted datetime literal
+        assert!(q.contains("\"created_at\" >= '"), "got: {}", q);
+        assert!(q.contains("_rivet WHERE"));
+    }
+
+    #[test]
+    fn build_time_window_query_unix() {
+        let q = build_time_window_query(
+            "SELECT * FROM events",
+            "ts",
+            TimeColumnType::Unix,
+            30,
+            SourceType::Postgres,
+        );
+        // Column is quoted; Unix timestamps have no surrounding single-quotes
+        assert!(q.contains("\"ts\" >= "), "got: {}", q);
+        assert!(
+            !q.contains("'"),
+            "unix should not have value quotes, got: {}",
+            q
+        );
     }
 }

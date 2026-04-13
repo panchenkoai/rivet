@@ -1,5 +1,11 @@
 name: CI
 
+# Required branch-protection checks (set in Settings → Branches → main):
+#   fmt · clippy · test · test-invariants · test-recovery · test-compatibility
+#
+# The three semantic-gate jobs below run each suite in isolation so GitHub can
+# block merges on named regressions, not just overall build failures.
+
 on:
   push:
     branches: [master, main]
@@ -43,6 +49,39 @@ jobs:
           toolchain: "1.94"
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets
+
+  test-invariants:
+    name: Invariant tests (semantic gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --test invariants --test journal_invariants
+
+  test-recovery:
+    name: Recovery tests (semantic gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --test recovery
+
+  test-compatibility:
+    name: Compatibility matrix tests (semantic gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --lib -- plan::validate::tests
 
   build-release:
     name: Release build

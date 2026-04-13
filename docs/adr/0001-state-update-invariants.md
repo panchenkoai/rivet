@@ -99,7 +99,7 @@ If these stores are updated in the wrong order — or if failures leave them in 
 
 **Rationale**: The manifest is an observability aid, not a write gate. Aborting an otherwise successful export because a SQLite `INSERT` failed would be disproportionate.
 
-**Current implementation**: All `st.record_file(...)` call sites use `let _ = st.record_file(...)` to explicitly discard the error. This is intentional and not a silent bug.
+**Current implementation**: All `st.record_file(...)` call sites use `if let Err(e) = st.record_file(...) { log::warn!(...) }`. The error is logged at `WARN` level so operators can observe manifest drift without causing the run to fail.
 
 ---
 
@@ -118,4 +118,4 @@ If these stores are updated in the wrong order — or if failures leave them in 
 
 ## Test Coverage
 
-Each invariant is covered by at least one automated test in `tests/invariants.rs`.
+Each invariant is covered by at least one automated test. `tests/invariants.rs` covers I1–I7 structural contracts. `tests/journal_invariants.rs` covers the `RunJournal` event-ordering contracts (plan snapshot recorded first, `RunCompleted` recorded last, chunk lifecycle ordering). `tests/recovery.rs` covers chunk checkpoint resume semantics (I5/I6). All three test suites are run as semantic release gates in CI before any binary is produced.

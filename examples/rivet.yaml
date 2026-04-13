@@ -1,6 +1,10 @@
 source:
-  type: postgres
-  url: "postgresql://user:password@localhost:5432/mydb"
+  type: mysql
+  # Pass your connection string via the DATABASE_URL environment variable.
+  # For Docker: docker run -e DATABASE_URL="mysql://user:pass@host:3306/db"
+  # For local:  export DATABASE_URL="mysql://user:pass@localhost:3306/db"
+  # On macOS/Windows Docker Desktop, use host.docker.internal instead of localhost.
+  url_env: DATABASE_URL
 
 exports:
   - name: users_full
@@ -9,7 +13,7 @@ exports:
     format: parquet
     destination:
       type: local
-      path: ./output
+      path: /output             # matches -v $(pwd)/output:/output in Docker
 
   - name: orders_incremental
     query: "SELECT id, user_id, total, status, updated_at FROM orders"

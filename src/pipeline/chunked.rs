@@ -1,8 +1,15 @@
+//! **Layer: Execution**
+//!
+//! Implements chunked extraction: sequential, parallel-simple, and
+//! parallel-checkpoint variants.  Receives a fully resolved `ResolvedRunPlan`
+//! and executes it — no semantic decisions are made here.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use super::RunSummary;
+use super::journal::RunEvent;
 use super::progress::ChunkProgress;
 use super::retry::classify_error;
 use super::sink::ExportSink;
@@ -62,12 +69,15 @@ pub(crate) fn build_chunk_query_sql(
     end: i64,
     chunk_dense: bool,
     chunk_by_days: bool,
+    source_type: crate::config::SourceType,
 ) -> String {
+    let quoted_col = crate::sql::quote_ident(source_type, order_column);
+
     if chunk_dense {
         return format!(
             "SELECT * FROM (SELECT _rivet_i.*, ROW_NUMBER() OVER (ORDER BY _rivet_i.{oc}) AS {rn} FROM ({bq}) AS _rivet_i) AS _rivet_w WHERE _rivet_w.{rn} BETWEEN {s} AND {e}",
             bq = base_query,
-            oc = order_column,
+            oc = quoted_col,
             rn = RIVET_CHUNK_RN_COL,
             s = start,
             e = end,
@@ -82,7 +92,7 @@ pub(crate) fn build_chunk_query_sql(
         return format!(
             "SELECT * FROM ({base}) AS _rivet WHERE {col} >= '{start}' AND {col} < '{end}'",
             base = base_query,
-            col = order_column,
+            col = quoted_col,
             start = start_date.format("%Y-%m-%d"),
             end = end_date.format("%Y-%m-%d"),
         );
@@ -91,7 +101,7 @@ pub(crate) fn build_chunk_query_sql(
     format!(
         "SELECT * FROM ({base}) AS _rivet WHERE {col} BETWEEN {start} AND {end}",
         base = base_query,
-        col = order_column,
+        col = quoted_col,
         start = start,
         end = end,
     )
@@ -219,6 +229,7 @@ fn log_chunk_sparsity_at_run(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn detect_and_generate_chunks(
     src: &mut dyn Source,
     base_query: &str,
@@ -227,16 +238,19 @@ pub(crate) fn detect_and_generate_chunks(
     export_name: &str,
     chunk_dense: bool,
     chunk_by_days: Option<u32>,
+    source_type: crate::config::SourceType,
 ) -> Result<Vec<(i64, i64)>> {
+    let quoted_col = crate::sql::quote_ident(source_type, chunk_column);
+
     if let Some(days_per_chunk) = chunk_by_days {
         let min_sql = format!(
             "SELECT min({col}) FROM ({q}) AS _rivet",
-            col = chunk_column,
+            col = quoted_col,
             q = base_query,
         );
         let max_sql = format!(
             "SELECT max({col}) FROM ({q}) AS _rivet",
-            col = chunk_column,
+            col = quoted_col,
             q = base_query,
         );
         let min_str = src.query_scalar(&min_sql)?.ok_or_else(|| {
@@ -310,12 +324,12 @@ pub(crate) fn detect_and_generate_chunks(
 
     let min_sql = format!(
         "SELECT min({col}) FROM ({q}) AS _rivet",
-        col = chunk_column,
+        col = quoted_col,
         q = base_query,
     );
     let max_sql = format!(
         "SELECT max({col}) FROM ({q}) AS _rivet",
-        col = chunk_column,
+        col = quoted_col,
         q = base_query,
     );
 
@@ -390,6 +404,7 @@ pub(crate) fn run_chunked_sequential(
         &plan.export_name,
         cp.dense,
         cp.by_days,
+        plan.source.source_type,
     )?;
 
     let is_date = cp.by_days.is_some();
@@ -415,6 +430,7 @@ pub(crate) fn run_chunked_sequential(
             *end,
             cp.dense,
             is_date,
+            plan.source.source_type,
         );
         log::info!(
             "export '{}': chunk {}/{} ({}..{})",
@@ -424,6 +440,12 @@ pub(crate) fn run_chunked_sequential(
             start,
             end
         );
+
+        summary.journal.record(RunEvent::ChunkStarted {
+            chunk_index: i as i64,
+            start_key: start.to_string(),
+            end_key: end.to_string(),
+        });
 
         let mut sink = ExportSink::new(plan)?;
         src.export(&chunk_query, None, None, &plan.tuning, &mut sink)?;
@@ -439,6 +461,8 @@ pub(crate) fn run_chunked_sequential(
             i + 1,
             sink.total_rows
         );
+
+        let mut chunk_file_name: Option<String> = None;
 
         if sink.total_rows > 0 {
             if plan.validate {
@@ -462,18 +486,32 @@ pub(crate) fn run_chunked_sequential(
             let dest = destination::create_destination(&plan.destination)?;
             dest.write(sink.tmp.path(), &file_name)?;
 
-            if let Some(st) = state {
-                let _ = st.record_file(
+            if let Some(st) = state
+                && let Err(e) = st.record_file(
                     &summary.run_id,
                     &plan.export_name,
                     &file_name,
                     sink.total_rows as i64,
                     file_bytes as i64,
-                    &format!("{:?}", plan.format).to_lowercase(),
-                    Some(&format!("{:?}", plan.compression).to_lowercase()),
+                    plan.format.label(),
+                    Some(plan.compression.label()),
+                )
+            {
+                log::warn!(
+                    "export '{}': manifest write failed for chunk file '{}' (file was produced): {:#}",
+                    plan.export_name,
+                    file_name,
+                    e
                 );
             }
+            chunk_file_name = Some(file_name);
         }
+
+        summary.journal.record(RunEvent::ChunkCompleted {
+            chunk_index: i as i64,
+            rows: sink.total_rows as i64,
+            file_name: chunk_file_name,
+        });
     }
 
     pb.finish(summary.total_rows);
@@ -499,6 +537,7 @@ pub(super) fn run_chunked_parallel(
         &plan.export_name,
         cp.dense,
         cp.by_days,
+        plan.source.source_type,
     )?;
     drop(src);
 
@@ -555,8 +594,15 @@ pub(super) fn run_chunked_parallel(
 
             s.spawn(move || {
                 let result = (|| -> Result<()> {
-                    let chunk_query =
-                        build_chunk_query_sql(base_query, col, start, end, cp.dense, is_date);
+                    let chunk_query = build_chunk_query_sql(
+                        base_query,
+                        col,
+                        start,
+                        end,
+                        cp.dense,
+                        is_date,
+                        plan_for_worker.source.source_type,
+                    );
 
                     let mut thread_src = source::create_source(&plan_for_worker.source)?;
                     let mut sink = ExportSink::new(&plan_for_worker)?;
@@ -641,18 +687,25 @@ pub(super) fn run_chunked_parallel(
         summary.validated = Some(true);
     }
 
-    let fmt_name = format!("{:?}", plan.format).to_lowercase();
-    let comp_name = format!("{:?}", plan.compression).to_lowercase();
+    let fmt_name = plan.format.label();
+    let comp_name = plan.compression.label();
     for (fname, rows, bytes) in file_records.into_inner().unwrap_or_else(|e| e.into_inner()) {
-        let _ = state.record_file(
+        if let Err(e) = state.record_file(
             &summary.run_id,
             &plan.export_name,
             &fname,
             rows,
             bytes,
-            &fmt_name,
-            Some(&comp_name),
-        );
+            fmt_name,
+            Some(comp_name),
+        ) {
+            log::warn!(
+                "export '{}': manifest write failed for parallel chunk '{}' (file was produced): {:#}",
+                plan.export_name,
+                fname,
+                e
+            );
+        }
     }
 
     let errs = errors.into_inner().unwrap_or_else(|e| e.into_inner());
@@ -762,6 +815,7 @@ fn export_one_chunk_range(
         end,
         cp.dense,
         cp.by_days.is_some(),
+        plan.source.source_type,
     );
 
     let mut sink = ExportSink::new(plan)?;
@@ -869,6 +923,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
             &plan.export_name,
             cp.dense,
             cp.by_days,
+            plan.source.source_type,
         )?
     };
 
@@ -906,6 +961,12 @@ pub(crate) fn run_chunked_sequential_checkpoint(
             end
         );
 
+        summary.journal.record(RunEvent::ChunkStarted {
+            chunk_index,
+            start_key: sk.clone(),
+            end_key: ek.clone(),
+        });
+
         match run_chunk_with_source_retries(&plan.base_query, cp, start, end, chunk_index, plan) {
             Ok((rows, fname, file_bytes)) => {
                 summary.total_rows += rows as i64;
@@ -913,18 +974,30 @@ pub(crate) fn run_chunked_sequential_checkpoint(
                 if rows > 0 {
                     summary.bytes_written += file_bytes;
                     summary.files_produced += 1;
-                    if let Some(name) = &fname {
-                        let _ = state.record_file(
+                    if let Some(name) = &fname
+                        && let Err(e) = state.record_file(
                             &summary.run_id,
                             &plan.export_name,
                             name,
                             rows as i64,
                             file_bytes as i64,
-                            &format!("{:?}", plan.format).to_lowercase(),
-                            Some(&format!("{:?}", plan.compression).to_lowercase()),
+                            plan.format.label(),
+                            Some(plan.compression.label()),
+                        )
+                    {
+                        log::warn!(
+                            "export '{}': manifest write failed for checkpoint chunk '{}' (file was produced): {:#}",
+                            plan.export_name,
+                            name,
+                            e
                         );
                     }
                 }
+                summary.journal.record(RunEvent::ChunkCompleted {
+                    chunk_index,
+                    rows: rows as i64,
+                    file_name: fname.clone(),
+                });
                 state.complete_chunk_task(&run_id, chunk_index, rows as i64, fname.as_deref())?;
             }
             Err(e) => {
@@ -935,6 +1008,11 @@ pub(crate) fn run_chunked_sequential_checkpoint(
                     chunk_index,
                     msg
                 );
+                summary.journal.record(RunEvent::ChunkFailed {
+                    chunk_index,
+                    error: msg.clone(),
+                    attempt: 1,
+                });
                 state.fail_chunk_task(&run_id, chunk_index, &msg)?;
             }
         }
@@ -979,6 +1057,7 @@ pub(super) fn run_chunked_parallel_checkpoint(
             &plan.export_name,
             cp.dense,
             cp.by_days,
+            plan.source.source_type,
         )?
     };
 
@@ -1008,8 +1087,8 @@ pub(super) fn run_chunked_parallel_checkpoint(
     let plan_for_workers = plan.clone();
     let cp_for_workers = cp.clone();
     let config_path_owned = config_path.to_string();
-    let fmt_label = format!("{:?}", plan.format).to_lowercase();
-    let comp_label = format!("{:?}", plan.compression).to_lowercase();
+    let fmt_label = plan.format.label();
+    let comp_label = plan.compression.label();
 
     std::thread::scope(|s| {
         for _ in 0..parallel {
@@ -1022,8 +1101,8 @@ pub(super) fn run_chunked_parallel_checkpoint(
             let plan_w = plan_for_workers.clone();
             let cp_w = cp_for_workers.clone();
             let config_path_w = config_path_owned.clone();
-            let fmt_label_w = fmt_label.clone();
-            let comp_label_w = comp_label.clone();
+            let fmt_label_w = fmt_label;
+            let comp_label_w = comp_label;
             let pb_w = Arc::clone(&pb_cp_arc);
 
             s.spawn(move || {
@@ -1082,6 +1161,7 @@ pub(super) fn run_chunked_parallel_checkpoint(
                         end,
                         cp_w.dense,
                         cp_w.by_days.is_some(),
+                        plan_w.source.source_type,
                     );
 
                     let result = (|| -> Result<(usize, Option<String>, u64)> {
@@ -1175,18 +1255,35 @@ pub(super) fn run_chunked_parallel_checkpoint(
                             if rows > 0 {
                                 agg_bytes.fetch_add(file_bytes, Ordering::Relaxed);
                                 agg_files.fetch_add(1, Ordering::Relaxed);
-                                if let (Some(name), Ok(store)) =
-                                    (fname.as_ref(), StateStore::open(&config_path_w))
-                                {
-                                    let _ = store.record_file(
-                                        run_id_arc.as_str(),
-                                        &plan_w.export_name,
-                                        name,
-                                        rows as i64,
-                                        file_bytes as i64,
-                                        &fmt_label_w,
-                                        Some(comp_label_w.as_str()),
-                                    );
+                                if let Some(name) = fname.as_ref() {
+                                    match StateStore::open(&config_path_w) {
+                                        Ok(store) => {
+                                            if let Err(e) = store.record_file(
+                                                run_id_arc.as_str(),
+                                                &plan_w.export_name,
+                                                name,
+                                                rows as i64,
+                                                file_bytes as i64,
+                                                fmt_label_w,
+                                                Some(comp_label_w),
+                                            ) {
+                                                log::warn!(
+                                                    "export '{}': manifest write failed for parallel checkpoint chunk '{}' (file was produced): {:#}",
+                                                    plan_w.export_name,
+                                                    name,
+                                                    e
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            log::warn!(
+                                                "export '{}': could not open state DB for manifest write of '{}': {:#}",
+                                                plan_w.export_name,
+                                                name,
+                                                e
+                                            );
+                                        }
+                                    }
                                 }
                             }
                             let _ = StateStore::complete_chunk_task_at_path(
@@ -1282,14 +1379,45 @@ mod tests {
 
     #[test]
     fn test_build_chunk_query_range_mode() {
-        let q = build_chunk_query_sql("SELECT id FROM t", "id", 1, 100, false, false);
-        assert!(q.contains("WHERE id BETWEEN 1 AND 100"), "got: {}", q);
+        let q = build_chunk_query_sql(
+            "SELECT id FROM t",
+            "id",
+            1,
+            100,
+            false,
+            false,
+            crate::config::SourceType::Postgres,
+        );
+        // Column name is quoted; numeric bounds are not
+        assert!(q.contains("WHERE \"id\" BETWEEN 1 AND 100"), "got: {}", q);
         assert!(!q.contains("ROW_NUMBER()"), "got: {}", q);
     }
 
     #[test]
+    fn test_build_chunk_query_range_mode_mysql() {
+        let q = build_chunk_query_sql(
+            "SELECT id FROM t",
+            "id",
+            1,
+            100,
+            false,
+            false,
+            crate::config::SourceType::Mysql,
+        );
+        assert!(q.contains("WHERE `id` BETWEEN 1 AND 100"), "got: {}", q);
+    }
+
+    #[test]
     fn test_build_chunk_query_dense_mode() {
-        let q = build_chunk_query_sql("SELECT id FROM t", "id", 1, 5000, true, false);
+        let q = build_chunk_query_sql(
+            "SELECT id FROM t",
+            "id",
+            1,
+            5000,
+            true,
+            false,
+            crate::config::SourceType::Postgres,
+        );
         assert!(q.contains("ROW_NUMBER()"), "got: {}", q);
         assert!(q.contains(RIVET_CHUNK_RN_COL), "got: {}", q);
         assert!(q.contains("BETWEEN 1 AND 5000"), "got: {}", q);
@@ -1340,6 +1468,7 @@ mod tests {
             end,
             false,
             true,
+            crate::config::SourceType::Postgres,
         );
         assert!(q.contains(">= '2023-01-01'"), "got: {q}");
         assert!(q.contains("< '2023-01-08'"), "got: {q}"); // end+1 day exclusive
@@ -1350,7 +1479,15 @@ mod tests {
     fn test_build_chunk_query_date_mode_single_day() {
         let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
         let day = (chrono::NaiveDate::from_ymd_opt(2024, 3, 15).unwrap() - epoch).num_days();
-        let q = build_chunk_query_sql("SELECT * FROM t", "ts", day, day, false, true);
+        let q = build_chunk_query_sql(
+            "SELECT * FROM t",
+            "ts",
+            day,
+            day,
+            false,
+            true,
+            crate::config::SourceType::Postgres,
+        );
         assert!(q.contains(">= '2024-03-15'"), "got: {q}");
         assert!(q.contains("< '2024-03-16'"), "got: {q}");
     }

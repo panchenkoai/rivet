@@ -1,3 +1,9 @@
+//! **Layer: Execution**
+//!
+//! Error classification for retry logic.  `classify_error` maps raw error strings
+//! to retry categories (transient vs permanent, reconnect-needed, extra delay).
+//! No plan data is read here — this is pure error-signal processing.
+
 /// Classifies transient errors into retry categories.
 /// Returns (is_transient, needs_reconnect, extra_delay_ms)
 ///

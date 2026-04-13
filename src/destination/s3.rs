@@ -79,4 +79,13 @@ impl super::Destination for S3Destination {
         log::info!("uploaded s3://{}", key);
         Ok(())
     }
+
+    fn capabilities(&self) -> super::DestinationCapabilities {
+        super::DestinationCapabilities {
+            commit_protocol: super::WriteCommitProtocol::FinalizeOnClose,
+            idempotent_overwrite: true,
+            retry_safe: true,
+            partial_write_risk: false,
+        }
+    }
 }

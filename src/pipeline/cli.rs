@@ -1,3 +1,8 @@
+//! **Layer: Observability**
+//!
+//! CLI display commands for state, metrics, files, and chunk checkpoints.
+//! Reads from the state stores and formats output — no execution or persistence writes.
+
 use super::format_bytes;
 use crate::error::Result;
 use crate::state::StateStore;

@@ -299,6 +299,18 @@ pub enum FormatType {
     Csv,
 }
 
+impl FormatType {
+    /// Stable lowercase string label for persistence and display.
+    /// Prefer this over `format!("{:?}", self).to_lowercase()` — `Debug` output
+    /// is not a stable format contract.
+    pub fn label(self) -> &'static str {
+        match self {
+            FormatType::Parquet => "parquet",
+            FormatType::Csv => "csv",
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CompressionType {
@@ -308,6 +320,19 @@ pub enum CompressionType {
     Gzip,
     Lz4,
     None,
+}
+
+impl CompressionType {
+    /// Stable lowercase string label for persistence and display.
+    pub fn label(self) -> &'static str {
+        match self {
+            CompressionType::Zstd => "zstd",
+            CompressionType::Snappy => "snappy",
+            CompressionType::Gzip => "gzip",
+            CompressionType::Lz4 => "lz4",
+            CompressionType::None => "none",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -334,4 +359,16 @@ pub enum DestinationType {
     S3,
     Gcs,
     Stdout,
+}
+
+impl DestinationType {
+    /// Stable lowercase string label for persistence and display.
+    pub fn label(self) -> &'static str {
+        match self {
+            DestinationType::Local => "local",
+            DestinationType::S3 => "s3",
+            DestinationType::Gcs => "gcs",
+            DestinationType::Stdout => "stdout",
+        }
+    }
 }

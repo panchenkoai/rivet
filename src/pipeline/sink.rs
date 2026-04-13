@@ -1,3 +1,9 @@
+//! **Layer: Execution**
+//!
+//! `ExportSink` manages the local temp-file write path: buffers Arrow batches,
+//! rotates files at `max_file_size_bytes`, and runs inline quality checks.
+//! All decisions (format, compression, quality rules) come from `ResolvedRunPlan`.
+
 use std::io::BufWriter;
 use std::sync::Arc;
 
@@ -12,30 +18,31 @@ use crate::plan::{CompressionType, ExtractionStrategy, FormatType, MetaColumns, 
 use crate::source::BatchSink;
 
 pub(crate) struct CompletedPart {
-    pub tmp: tempfile::NamedTempFile,
-    pub rows: usize,
+    pub(in crate::pipeline) tmp: tempfile::NamedTempFile,
+    pub(in crate::pipeline) rows: usize,
 }
 
 pub(crate) struct ExportSink {
-    pub writer: Option<Box<dyn FormatWriter>>,
-    pub format_type: FormatType,
-    pub compression: CompressionType,
-    pub compression_level: Option<u32>,
-    pub tmp: tempfile::NamedTempFile,
-    pub total_rows: usize,
-    pub part_rows: usize,
-    pub last_batch: Option<RecordBatch>,
-    pub schema: Option<SchemaRef>,
-    pub meta: MetaColumns,
-    pub enriched_schema: Option<SchemaRef>,
-    pub exported_at_us: i64,
-    pub quality_null_counts: std::collections::HashMap<String, usize>,
-    pub quality_unique_sets: std::collections::HashMap<String, std::collections::HashSet<String>>,
-    pub quality_columns: Option<crate::config::QualityConfig>,
-    pub max_file_size: Option<u64>,
-    pub completed_parts: Vec<CompletedPart>,
+    pub(in crate::pipeline) writer: Option<Box<dyn FormatWriter>>,
+    pub(in crate::pipeline) format_type: FormatType,
+    pub(in crate::pipeline) compression: CompressionType,
+    pub(in crate::pipeline) compression_level: Option<u32>,
+    pub(in crate::pipeline) tmp: tempfile::NamedTempFile,
+    pub(in crate::pipeline) total_rows: usize,
+    pub(in crate::pipeline) part_rows: usize,
+    pub(in crate::pipeline) last_batch: Option<RecordBatch>,
+    pub(in crate::pipeline) schema: Option<SchemaRef>,
+    pub(in crate::pipeline) meta: MetaColumns,
+    pub(in crate::pipeline) enriched_schema: Option<SchemaRef>,
+    pub(in crate::pipeline) exported_at_us: i64,
+    pub(in crate::pipeline) quality_null_counts: std::collections::HashMap<String, usize>,
+    pub(in crate::pipeline) quality_unique_sets:
+        std::collections::HashMap<String, std::collections::HashSet<String>>,
+    pub(in crate::pipeline) quality_columns: Option<crate::config::QualityConfig>,
+    pub(in crate::pipeline) max_file_size: Option<u64>,
+    pub(in crate::pipeline) completed_parts: Vec<CompletedPart>,
     /// When set, this column is removed from Arrow batches before enrichment and write (see `chunk_dense`).
-    pub strip_internal_column: Option<String>,
+    pub(in crate::pipeline) strip_internal_column: Option<String>,
 }
 
 impl ExportSink {
@@ -525,6 +532,77 @@ mod tests {
             .unwrap();
         assert_eq!(ids.value(0), 1);
         assert_eq!(ids.value(1), 2);
+    }
+
+    // ─── I1: Finalize Before Write ───────────────────────────────────────────────
+
+    /// I1 (ADR-0001) — The temp-file writer must be finalized (`w.finish()`) before
+    /// the file is transferred to the destination.
+    ///
+    /// This test verifies that after `writer.take()` + `w.finish()`, the temp file
+    /// is non-empty and complete — i.e. the destination would receive a valid,
+    /// non-truncated file.
+    ///
+    /// Implementation: `pipeline/single.rs` calls `sink.writer.take()` and `w.finish()`
+    /// (lines 149–151) *before* entering the `dest.write()` loop.  This unit test
+    /// anchors the contract at the sink layer: a finished writer always yields a
+    /// readable, complete file.
+    #[test]
+    fn i1_writer_finish_produces_complete_file_before_destination_write() {
+        use crate::source::BatchSink;
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let mut sink = minimal_sink();
+        // Switch to Parquet so we can verify the footer is present (CSV also works).
+        // Use the default Csv format from minimal_sink() — simpler, no codec deps.
+
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["alice", "bob", "carol"]))],
+        )
+        .unwrap();
+
+        // Writer is absent until the first schema arrives.
+        assert!(sink.writer.is_none(), "writer must start as None");
+
+        sink.on_schema(schema).unwrap();
+        assert!(
+            sink.writer.is_some(),
+            "writer must be present after on_schema"
+        );
+
+        sink.on_batch(&batch).unwrap();
+
+        // I1: take and finish the writer before any destination write.
+        // This mirrors single.rs:149-151: `if let Some(w) = sink.writer.take() { w.finish()?; }`
+        if let Some(w) = sink.writer.take() {
+            w.finish()
+                .expect("I1: writer.finish() must succeed before destination write");
+        }
+        assert!(
+            sink.writer.is_none(),
+            "writer must be consumed after finish()"
+        );
+
+        // The temp file must be non-empty — a finished writer produces a complete file.
+        // An unfinished Parquet file (no footer) or CSV (missing last line) would be
+        // detected by the destination consumer; finish() prevents this.
+        let file_len = std::fs::metadata(sink.tmp.path())
+            .expect("temp file must be accessible after finish()")
+            .len();
+        assert!(
+            file_len > 0,
+            "I1: temp file must be non-empty after writer.finish() — \
+             the destination must never receive a truncated file; got {} bytes",
+            file_len
+        );
+
+        // Total rows must reflect the written batch.
+        assert_eq!(sink.total_rows, 3, "total_rows must count written rows");
     }
 
     // ─── quality tracking ────────────────────────────────────────

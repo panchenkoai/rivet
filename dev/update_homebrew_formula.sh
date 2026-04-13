@@ -173,7 +173,7 @@ class Rivet < Formula
   end
 
   def install
-    bin.install Dir["rivet-*/rivet"].first => "rivet"
+    bin.install "rivet"
   end
 
   test do

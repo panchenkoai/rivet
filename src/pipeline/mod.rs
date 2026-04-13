@@ -1,9 +1,19 @@
+//! **Layer: Coordinator** (planning → execution → persistence/observability)
+//!
+//! `pipeline/mod.rs` is the only module allowed to bridge all three layers.
+//! It reads a resolved plan (planning), dispatches to execution modules, then
+//! records metrics and sends notifications (persistence/observability).
+//!
+//! See `docs/adr/0003-layer-classification.md` for the full module taxonomy.
+
 mod chunked;
 mod cli;
+pub mod journal;
 pub(crate) mod progress;
 mod retry;
 mod single;
 mod sink;
+mod summary;
 mod validate;
 
 #[allow(unused_imports)]
@@ -14,8 +24,9 @@ pub use cli::{
 };
 #[allow(unused_imports)]
 pub use retry::classify_error;
+// build_time_window_query moved to crate::plan; re-exported here for integration tests.
 #[allow(unused_imports)]
-pub use single::build_time_window_query;
+pub use crate::plan::build_time_window_query;
 #[allow(unused_imports)]
 pub use validate::validate_output;
 
@@ -33,137 +44,22 @@ use crate::plan::{
 use crate::state::StateStore;
 
 use chunked::run_chunked_parallel_checkpoint;
+use journal::RunEvent;
 use single::run_with_reconnect;
+pub use summary::RunSummary;
 
-/// Collects operational data during an export for end-of-run summary and metrics.
-#[derive(Debug, Clone)]
-pub struct RunSummary {
-    pub run_id: String,
-    pub export_name: String,
-    pub status: String,
-    pub total_rows: i64,
-    pub files_produced: usize,
-    pub bytes_written: u64,
-    pub duration_ms: i64,
-    pub peak_rss_mb: i64,
-    pub retries: u32,
-    pub validated: Option<bool>,
-    pub schema_changed: Option<bool>,
-    pub quality_passed: Option<bool>,
-    pub error_message: Option<String>,
-    /// `profile` from YAML, or `balanced (default)` if omitted.
-    pub tuning_profile: String,
-    /// Configured `batch_size` from YAML/profile (FETCH cap before `batch_size_memory_mb` override).
-    pub batch_size: usize,
-    /// When set, actual FETCH size is derived from schema (see logs / `SourceTuning::effective_batch_size`).
-    pub batch_size_memory_mb: Option<usize>,
-    pub format: String,
-    pub mode: String,
-    pub compression: String,
-    /// Source COUNT(*) result for reconciliation (None = not requested or not applicable).
-    pub source_count: Option<i64>,
-    /// Whether reconciliation passed (Some(true) = match, Some(false) = mismatch, None = skipped).
-    pub reconciled: Option<bool>,
-}
-
-impl RunSummary {
-    fn new(plan: &ResolvedRunPlan) -> Self {
-        let run_id = format!(
-            "{}_{}",
-            plan.export_name,
-            chrono::Utc::now().format("%Y%m%dT%H%M%S%.3f"),
-        );
-        Self {
-            run_id,
-            export_name: plan.export_name.clone(),
-            status: "running".into(),
-            total_rows: 0,
-            files_produced: 0,
-            bytes_written: 0,
-            duration_ms: 0,
-            peak_rss_mb: 0,
-            retries: 0,
-            validated: None,
-            schema_changed: None,
-            quality_passed: None,
-            error_message: None,
-            tuning_profile: plan.tuning_profile_label.clone(),
-            batch_size: plan.tuning.batch_size,
-            batch_size_memory_mb: plan.tuning.batch_size_memory_mb,
-            format: format!("{:?}", plan.format).to_lowercase(),
-            mode: plan.strategy.mode_label().to_string(),
-            compression: format!("{:?}", plan.compression).to_lowercase(),
-            source_count: None,
-            reconciled: None,
-        }
-    }
-
-    fn print(&self) {
-        eprintln!();
-        eprintln!("── {} ──", self.export_name);
-        eprintln!("  run_id:      {}", self.run_id);
-        eprintln!("  status:      {}", self.status);
-        if let Some(mem) = self.batch_size_memory_mb {
-            eprintln!(
-                "  tuning:      profile={}, batch_size={} (batch_size_memory_mb={}MiB → effective FETCH in logs)",
-                self.tuning_profile, self.batch_size, mem
-            );
-        } else {
-            eprintln!(
-                "  tuning:      profile={}, batch_size={}",
-                self.tuning_profile, self.batch_size
-            );
-        }
-        eprintln!("  rows:        {}", self.total_rows);
-        eprintln!("  files:       {}", self.files_produced);
-        if self.bytes_written > 0 {
-            eprintln!("  bytes:       {}", format_bytes(self.bytes_written));
-        }
-        let dur = if self.duration_ms >= 1000 {
-            format!("{:.1}s", self.duration_ms as f64 / 1000.0)
-        } else {
-            format!("{}ms", self.duration_ms)
-        };
-        eprintln!("  duration:    {}", dur);
-        if self.peak_rss_mb > 0 {
-            eprintln!("  peak RSS:    {}MB (sampled during run)", self.peak_rss_mb);
-        }
-        if self.format == "parquet" && self.compression != "zstd" {
-            eprintln!("  compression: {}", self.compression);
-        }
-        if self.retries > 0 {
-            eprintln!("  retries:     {}", self.retries);
-        }
-        if let Some(v) = self.validated {
-            eprintln!("  validated:   {}", if v { "pass" } else { "FAIL" });
-        }
-        if let Some(sc) = self.schema_changed {
-            eprintln!(
-                "  schema:      {}",
-                if sc { "CHANGED" } else { "unchanged" }
-            );
-        }
-        if let Some(q) = self.quality_passed {
-            eprintln!("  quality:     {}", if q { "pass" } else { "FAIL" });
-        }
-        if let Some(reconciled) = self.reconciled {
-            let src = self
-                .source_count
-                .map(|c| c.to_string())
-                .unwrap_or("?".into());
-            if reconciled {
-                eprintln!("  reconcile:   MATCH ({}/{})", self.total_rows, src);
-            } else {
-                eprintln!(
-                    "  reconcile:   MISMATCH (exported {} vs source {})",
-                    self.total_rows, src
-                );
-            }
-        }
-        if let Some(err) = &self.error_message {
-            eprintln!("  error:       {}", err);
-        }
-    }
+/// Per-run configuration flags passed from the CLI to the pipeline.
+///
+/// Replaces the previous pattern of threading 4+ positional `bool` arguments
+/// through `run`, `run_export_job`, and child-process invocations.  Named fields
+/// prevent silent argument transposition (e.g., `validate` and `reconcile`
+/// swapped).
+#[derive(Debug, Clone, Copy)]
+pub struct RunOptions<'a> {
+    pub validate: bool,
+    pub reconcile: bool,
+    pub resume: bool,
+    pub params: Option<&'a std::collections::HashMap<String, String>>,
 }
 
 /// For chunked mode: quality checks (row_count, null_ratio, uniqueness) cannot run per-batch
@@ -293,20 +189,22 @@ pub(crate) fn format_bytes(b: u64) -> String {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_export_job(
     config_path: &str,
     config: &Config,
     export: &ExportConfig,
     state: &StateStore,
     config_dir: &Path,
-    validate: bool,
-    reconcile: bool,
-    resume: bool,
-    params: Option<&std::collections::HashMap<String, String>>,
+    opts: &RunOptions<'_>,
 ) -> Result<()> {
     let plan = build_plan(
-        config, export, config_dir, validate, reconcile, resume, params,
+        config,
+        export,
+        config_dir,
+        opts.validate,
+        opts.reconcile,
+        opts.resume,
+        opts.params,
     )?;
 
     let diags = validate_plan(&plan);
@@ -344,14 +242,27 @@ fn run_export_job(
     let rss_sampler = crate::resource::RssPeakSampler::start(rss_before, 100);
     let mut summary = RunSummary::new(&plan);
 
-    let result = match &plan.strategy {
-        ExtractionStrategy::Chunked(cp) if cp.parallel > 1 && cp.checkpoint => {
-            run_chunked_parallel_checkpoint(config_path, state, &plan, &mut summary)
+    // Record plan diagnostics that were already logged above.
+    for d in &diags {
+        if matches!(
+            d.level,
+            DiagnosticLevel::Warning | DiagnosticLevel::Degraded
+        ) {
+            summary.journal.record(RunEvent::PlanWarning {
+                rule: d.rule.to_string(),
+                message: d.message.clone(),
+            });
         }
-        ExtractionStrategy::Chunked(cp) if cp.parallel > 1 => {
+    }
+
+    let result = if plan.strategy.requires_parallel_execution() {
+        if plan.strategy.is_resumable() {
+            run_chunked_parallel_checkpoint(config_path, state, &plan, &mut summary)
+        } else {
             chunked::run_chunked_parallel(state, &plan, &mut summary)
         }
-        _ => run_with_reconnect(state, &plan, &mut summary, config_path),
+    } else {
+        run_with_reconnect(state, &plan, &mut summary, config_path)
     };
 
     let rss_peak = rss_sampler.stop();
@@ -377,9 +288,22 @@ fn run_export_job(
 
     if plan.reconcile && !failed {
         reconcile_source_count(&plan, &mut summary);
+        if let (Some(source_count), Some(matched)) = (summary.source_count, summary.reconciled) {
+            summary.journal.record(RunEvent::ReconciliationResult {
+                source_count,
+                exported_rows: summary.total_rows,
+                matched,
+            });
+        }
     }
 
-    let _ = state.record_metric(
+    summary.journal.record(RunEvent::RunCompleted {
+        status: summary.status.clone(),
+        error_message: summary.error_message.clone(),
+        duration_ms: summary.duration_ms,
+    });
+
+    if let Err(e) = state.record_metric(
         &summary.export_name,
         &summary.run_id,
         summary.duration_ms,
@@ -395,7 +319,13 @@ fn run_export_job(
         summary.retries as i64,
         summary.validated,
         summary.schema_changed,
-    );
+    ) {
+        log::warn!(
+            "export '{}': metrics write failed (run outcome not stored): {:#}",
+            summary.export_name,
+            e
+        );
+    }
 
     summary.print();
     crate::notify::maybe_send(config.notifications.as_ref(), &summary);
@@ -517,6 +447,13 @@ pub fn run(
         config.exports.iter().collect()
     };
 
+    let opts = RunOptions {
+        validate,
+        reconcile,
+        resume,
+        params,
+    };
+
     let run_parallel_processes = (parallel_export_processes_cli
         || config.parallel_export_processes)
         && export_name.is_none()
@@ -554,17 +491,7 @@ pub fn run(
                             e
                         )
                     })?;
-                    run_export_job(
-                        config_path,
-                        &config,
-                        export,
-                        &state,
-                        &config_dir,
-                        validate,
-                        reconcile,
-                        resume,
-                        params,
-                    )
+                    run_export_job(config_path, &config, export, &state, &config_dir, &opts)
                 }));
             }
             for h in handles {
@@ -587,17 +514,8 @@ pub fn run(
         let state = StateStore::open(config_path)?;
         let mut failures = Vec::new();
         for export in &exports {
-            if let Err(e) = run_export_job(
-                config_path,
-                &config,
-                export,
-                &state,
-                &config_dir,
-                validate,
-                reconcile,
-                resume,
-                params,
-            ) {
+            if let Err(e) = run_export_job(config_path, &config, export, &state, &config_dir, &opts)
+            {
                 failures.push(format!("{:#}", e));
             }
         }
@@ -614,8 +532,8 @@ mod tests {
     use super::*;
     use crate::config::{SourceConfig, SourceType};
     use crate::plan::{
-        CompressionType, DestinationConfig, DestinationType, ExtractionStrategy, FormatType,
-        MetaColumns, ResolvedRunPlan,
+        CompressionType, DestinationConfig, DestinationType, DiagnosticLevel, ExtractionStrategy,
+        FormatType, MetaColumns, ResolvedRunPlan, validate_plan,
     };
     use crate::tuning::SourceTuning;
 
@@ -704,6 +622,116 @@ mod tests {
             summary.run_id.starts_with("test_export_"),
             "run_id should start with export name, got: {}",
             summary.run_id
+        );
+    }
+
+    // ─── RunSummary::new() journal invariants ────────────────────────────────
+
+    /// `RunSummary::new()` must immediately record a `PlanResolved` event as the
+    /// first journal entry.  This satisfies the "what was planned?" query from ADR-0001.
+    #[test]
+    fn run_summary_new_records_plan_resolved_as_first_event() {
+        let plan = minimal_plan();
+        let summary = RunSummary::new(&plan);
+
+        assert!(
+            !summary.journal.entries.is_empty(),
+            "journal must have at least one entry after RunSummary::new()"
+        );
+        assert!(
+            matches!(
+                summary.journal.entries[0].event,
+                journal::RunEvent::PlanResolved(_)
+            ),
+            "first journal event must be PlanResolved, got: {:?}",
+            summary.journal.entries[0].event
+        );
+    }
+
+    /// The `PlanSnapshot` recorded inside `PlanResolved` must faithfully capture
+    /// key fields from the `ResolvedRunPlan`.
+    #[test]
+    fn run_summary_plan_snapshot_matches_plan_fields() {
+        let plan = minimal_plan();
+        let summary = RunSummary::new(&plan);
+
+        let snap = summary
+            .journal
+            .plan_snapshot()
+            .expect("plan_snapshot() must be Some after RunSummary::new()");
+
+        assert_eq!(snap.export_name, plan.export_name);
+        assert_eq!(snap.validate, plan.validate);
+        assert_eq!(snap.reconcile, plan.reconcile);
+        assert_eq!(snap.resume, plan.resume);
+        assert_eq!(snap.batch_size, plan.tuning.batch_size);
+    }
+
+    /// The journal's `run_id` must match the `RunSummary`'s `run_id`.
+    #[test]
+    fn run_summary_journal_run_id_matches_summary_run_id() {
+        let plan = minimal_plan();
+        let summary = RunSummary::new(&plan);
+        assert_eq!(
+            summary.journal.run_id, summary.run_id,
+            "journal run_id must match summary run_id"
+        );
+    }
+
+    // ─── Rejected plan gate ──────────────────────────────────────────────────
+
+    /// Gap 7 — `run_export_job` bails before execution when `validate_plan` returns
+    /// a `Rejected` diagnostic.  The wiring is in `run_export_job` (this file,
+    /// ~line 210): if `rejected` is non-empty, the function returns `anyhow::bail!`.
+    ///
+    /// This test verifies the *condition* that triggers the bail: that `validate_plan`
+    /// does in fact produce a `Rejected` diagnostic for the stdout+split combination.
+    /// The gate itself (`run_export_job`) cannot be called directly in tests because
+    /// it requires a live database connection and config; we test its precondition here.
+    #[test]
+    fn rejected_plan_produces_rejected_diagnostic_blocking_run_export_job() {
+        let mut plan = minimal_plan();
+        // stdout + max_file_size triggers check_stdout_split → Rejected.
+        plan.destination.destination_type = DestinationType::Stdout;
+        plan.max_file_size_bytes = Some(10 * 1024 * 1024);
+
+        let diags = validate_plan(&plan);
+        let rejected_count = diags
+            .iter()
+            .filter(|d| d.level == DiagnosticLevel::Rejected)
+            .count();
+
+        assert!(
+            rejected_count > 0,
+            "stdout + max_file_size must produce a Rejected diagnostic so that \
+             run_export_job bails before calling run_with_reconnect; got: {:?}",
+            diags
+                .iter()
+                .map(|d| (&d.rule, &d.level))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// stdout + chunked strategy also triggers a Rejected diagnostic (check_stdout_chunked).
+    #[test]
+    fn rejected_plan_stdout_chunked_blocks_run_export_job() {
+        use crate::plan::ChunkedPlan;
+        let mut plan = minimal_plan();
+        plan.destination.destination_type = DestinationType::Stdout;
+        plan.strategy = ExtractionStrategy::Chunked(ChunkedPlan {
+            column: "id".into(),
+            chunk_size: 1000,
+            parallel: 1,
+            dense: false,
+            by_days: None,
+            max_attempts: 3,
+            checkpoint: false,
+        });
+
+        let diags = validate_plan(&plan);
+        assert!(
+            diags.iter().any(|d| d.level == DiagnosticLevel::Rejected),
+            "stdout + chunked must produce a Rejected diagnostic"
         );
     }
 }

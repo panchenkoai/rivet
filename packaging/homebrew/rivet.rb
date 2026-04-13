@@ -7,33 +7,33 @@
 class Rivet < Formula
   desc "CLI to export PostgreSQL and MySQL to Parquet/CSV (local, S3, GCS)"
   homepage "https://github.com/panchenkoai/rivet"
-  version "0.2.0-beta.2"
+  version "0.2.0-beta.6"
   license "MIT"
 
   on_macos do
     on_arm do
-      url "https://github.com/panchenkoai/rivet/releases/download/v0.2.0-beta.2/rivet-v0.2.0-beta.2-aarch64-apple-darwin.tar.gz"
-      sha256 "48bc17f1c2abb5a960663cddc57664d1409058d5b04821168cde0840493cb1a2"
+      url "https://github.com/panchenkoai/rivet/releases/download/v0.2.0-beta.6/rivet-v0.2.0-beta.6-aarch64-apple-darwin.tar.gz"
+      sha256 "7c511675522de157b0d671143ec3b2890cb7863bbe24c70383d7c129a4382db2"
     end
     on_intel do
-      url "https://github.com/panchenkoai/rivet/releases/download/v0.2.0-beta.2/rivet-v0.2.0-beta.2-x86_64-apple-darwin.tar.gz"
-      sha256 "e9de5bc57453ad789785e577c2f6a5f1ef557a29692d29649e7f9b110010a15b"
+      url "https://github.com/panchenkoai/rivet/releases/download/v0.2.0-beta.6/rivet-v0.2.0-beta.6-x86_64-apple-darwin.tar.gz"
+      sha256 "ad53d22bea57d51a39b96299d040a472b0e587791281856c9eda70dcdc859eed"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/panchenkoai/rivet/releases/download/v0.2.0-beta.2/rivet-v0.2.0-beta.2-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "07e48bc0d8bc9f576d834bd4f7a59cef2c4c9db33b4ea8aa856372be1349f54e"
+      url "https://github.com/panchenkoai/rivet/releases/download/v0.2.0-beta.6/rivet-v0.2.0-beta.6-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "4fc3800d378b5409ef4191b4874008632dd88c4f055750ae9abece61f39602c5"
     end
     on_intel do
-      url "https://github.com/panchenkoai/rivet/releases/download/v0.2.0-beta.2/rivet-v0.2.0-beta.2-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "7c20d0f58e4975ee9f47968d8f289ce58b5ca96394556b60460baabf0557b047"
+      url "https://github.com/panchenkoai/rivet/releases/download/v0.2.0-beta.6/rivet-v0.2.0-beta.6-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "6bb871a52b2db3b5f5a74ff41d45e3f2c6a2ae9cd57847f879cdff21cf4a89be"
     end
   end
 
   def install
-    bin.install Dir["rivet-*/rivet"].first => "rivet"
+    bin.install "rivet"
   end
 
   test do

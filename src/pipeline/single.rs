@@ -1,12 +1,20 @@
+//! **Layer: Execution** (with bounded persistence writes)
+//!
+//! Runs a single-query export for Snapshot, Incremental, and TimeWindow strategies.
+//! After the write completes, this module performs three bounded persistence writes
+//! that are invariant-ordered (see ADR-0001): manifest entry, cursor advance,
+//! schema snapshot.  These are post-execution state updates, not runtime decisions.
+
 use std::time::Duration;
 
 use super::RunSummary;
 use super::chunked::{run_chunked_sequential, run_chunked_sequential_checkpoint};
+use super::journal::RunEvent;
 use super::retry::classify_error;
 use super::sink::{CompletedPart, ExportSink, extract_last_cursor_value};
 use super::validate::validate_output;
 use crate::error::Result;
-use crate::plan::{ExtractionStrategy, ResolvedRunPlan, TimeColumnType};
+use crate::plan::{ExtractionStrategy, ResolvedRunPlan};
 use crate::source::{self, Source};
 use crate::state::StateStore;
 use crate::{destination, format};
@@ -43,6 +51,14 @@ pub(crate) fn run_with_reconnect(
                     .map(|e: &anyhow::Error| format!("{:#}", e))
                     .unwrap_or_default(),
             );
+            summary.journal.record(RunEvent::RetryAttempted {
+                attempt,
+                reason: last_err
+                    .as_ref()
+                    .map(|e| format!("{:#}", e))
+                    .unwrap_or_default(),
+                backoff_ms: backoff,
+            });
             std::thread::sleep(Duration::from_millis(backoff));
         }
 
@@ -86,48 +102,35 @@ pub(crate) fn run_export(
     summary: &mut RunSummary,
     config_path: &str,
 ) -> Result<()> {
-    match &plan.strategy {
-        ExtractionStrategy::Snapshot => {
-            run_single_export(
-                src,
-                &plan.base_query,
-                None,
-                None,
-                plan,
-                Some(state),
-                summary,
-            )?;
-        }
-        ExtractionStrategy::Incremental { cursor_column } => {
-            let cursor_state = state.get(&plan.export_name)?;
-            run_single_export(
-                src,
-                &plan.base_query,
-                Some(cursor_column.as_str()),
-                Some(&cursor_state),
-                plan,
-                Some(state),
-                summary,
-            )?;
-        }
-        ExtractionStrategy::Chunked(cp) if cp.checkpoint => {
-            run_chunked_sequential_checkpoint(src, state, plan, summary, config_path)?;
-        }
-        ExtractionStrategy::Chunked(_) => {
-            run_chunked_sequential(src, plan, summary, Some(state))?;
-        }
-        ExtractionStrategy::TimeWindow {
-            column,
-            column_type,
-            days_window,
-        } => {
-            let windowed_query =
-                build_time_window_query(&plan.base_query, column, *column_type, *days_window);
-            run_single_export(src, &windowed_query, None, None, plan, Some(state), summary)?;
+    // Chunked strategies own their own execution path.
+    if matches!(plan.strategy, ExtractionStrategy::Chunked(_)) {
+        if plan.strategy.is_resumable() {
+            return run_chunked_sequential_checkpoint(src, state, plan, summary, config_path);
+        } else {
+            return run_chunked_sequential(src, plan, summary, Some(state));
         }
     }
 
-    Ok(())
+    // All non-chunked strategies: ask the strategy for its query and cursor needs.
+    let cursor_state = if plan.strategy.needs_cursor_state() {
+        Some(state.get(&plan.export_name)?)
+    } else {
+        None
+    };
+    let query = plan
+        .strategy
+        .resolve_query(&plan.base_query, plan.source.source_type)
+        .expect("non-chunked strategy must return a resolved query");
+
+    run_single_export(
+        src,
+        &query,
+        plan.strategy.cursor_column(),
+        cursor_state.as_ref(),
+        plan,
+        Some(state),
+        summary,
+    )
 }
 
 pub(super) fn run_single_export(
@@ -175,6 +178,10 @@ pub(super) fn run_single_export(
                 crate::quality::Severity::Warn => "WARN",
             };
             log::warn!("quality {}: {}", level, issue.message);
+            summary.journal.record(RunEvent::QualityIssue {
+                severity: level.to_string(),
+                message: issue.message.clone(),
+            });
         }
         if quality_issues
             .iter()
@@ -198,6 +205,29 @@ pub(super) fn run_single_export(
     let fmt = format::create_format(plan.format, plan.compression, plan.compression_level);
     let ext = fmt.file_extension();
     let dest = destination::create_destination(&plan.destination)?;
+
+    // ADR-0004: inspect backend capabilities at runtime.
+    // Logs commit protocol and warns when a non-retry-safe destination is used with retries.
+    {
+        let caps = dest.capabilities();
+        log::debug!(
+            "export '{}': destination commit_protocol={:?} idempotent={} retry_safe={} partial_risk={}",
+            plan.export_name,
+            caps.commit_protocol,
+            caps.idempotent_overwrite,
+            caps.retry_safe,
+            caps.partial_write_risk,
+        );
+        if !caps.retry_safe && summary.retries > 0 {
+            log::warn!(
+                "export '{}': destination is not retry-safe ({} retries used); \
+                 partial artifacts may exist at destination — manual cleanup may be needed",
+                plan.export_name,
+                summary.retries,
+            );
+        }
+    }
+
     let has_parts = sink.completed_parts.len() > 1;
     let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
 
@@ -205,6 +235,9 @@ pub(super) fn run_single_export(
         if plan.validate {
             validate_output(part.tmp.path(), plan.format, part.rows)?;
             summary.validated = Some(true);
+            summary
+                .journal
+                .record(RunEvent::ValidationResult { passed: true });
         }
 
         let file_bytes = std::fs::metadata(part.tmp.path())
@@ -220,15 +253,31 @@ pub(super) fn run_single_export(
         };
         dest.write(part.tmp.path(), &file_name)?;
 
-        if let Some(st) = state {
-            let _ = st.record_file(
+        // ADR-0001 I2–I4 / ADR-0004: state writes happen only after destination.write()
+        // returns Ok(()), which for all current backends is the commit boundary.
+        summary.journal.record(RunEvent::FileWritten {
+            file_name: file_name.clone(),
+            rows: part.rows as i64,
+            bytes: file_bytes,
+            part_index: part_idx,
+        });
+
+        if let Some(st) = state
+            && let Err(e) = st.record_file(
                 &summary.run_id,
                 &plan.export_name,
                 &file_name,
                 part.rows as i64,
                 file_bytes as i64,
-                &format!("{:?}", plan.format).to_lowercase(),
-                Some(&format!("{:?}", plan.compression).to_lowercase()),
+                plan.format.label(),
+                Some(plan.compression.label()),
+            )
+        {
+            log::warn!(
+                "export '{}': manifest write failed for '{}' (file was produced): {:#}",
+                plan.export_name,
+                file_name,
+                e
             );
         }
     }
@@ -270,6 +319,11 @@ pub(super) fn run_single_export(
                 for (col, old, new) in &change.type_changed {
                     log::warn!("  type changed: {} ({} -> {})", col, old, new);
                 }
+                summary.journal.record(RunEvent::SchemaChanged {
+                    added: change.added.clone(),
+                    removed: change.removed.clone(),
+                    type_changed: change.type_changed.clone(),
+                });
             }
             Ok(None) => {
                 summary.schema_changed = Some(false);
@@ -280,61 +334,4 @@ pub(super) fn run_single_export(
 
     log::info!("export '{}' completed successfully", plan.export_name);
     Ok(())
-}
-
-pub fn build_time_window_query(
-    base_query: &str,
-    time_column: &str,
-    time_type: TimeColumnType,
-    days_window: u32,
-) -> String {
-    let now = chrono::Utc::now();
-    let window_start = now - chrono::Duration::days(days_window as i64);
-    let truncated = window_start
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight is always valid");
-
-    let condition = match time_type {
-        TimeColumnType::Timestamp => {
-            format!(
-                "{} >= '{}'",
-                time_column,
-                truncated.format("%Y-%m-%d %H:%M:%S")
-            )
-        }
-        TimeColumnType::Unix => {
-            format!("{} >= {}", time_column, truncated.and_utc().timestamp())
-        }
-    };
-
-    format!(
-        "SELECT * FROM ({base}) AS _rivet WHERE {cond}",
-        base = base_query,
-        cond = condition,
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_build_time_window_timestamp() {
-        let q = build_time_window_query(
-            "SELECT * FROM events",
-            "created_at",
-            TimeColumnType::Timestamp,
-            7,
-        );
-        assert!(q.contains("created_at >= '"), "got: {}", q);
-        assert!(q.contains("_rivet WHERE"));
-    }
-
-    #[test]
-    fn test_build_time_window_unix() {
-        let q = build_time_window_query("SELECT * FROM events", "ts", TimeColumnType::Unix, 30);
-        assert!(q.contains("ts >= "), "got: {}", q);
-        assert!(!q.contains("'"), "unix should not have quotes, got: {}", q);
-    }
 }

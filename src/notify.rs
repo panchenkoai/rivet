@@ -108,6 +108,7 @@ mod tests {
             compression: "zstd".into(),
             source_count: None,
             reconciled: None,
+            journal: crate::pipeline::journal::RunJournal::new("test_run", "test_export"),
         }
     }
 

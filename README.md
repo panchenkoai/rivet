@@ -40,9 +40,7 @@ Rivet is a CLI tool that exports query results from relational databases to file
 ### Homebrew (macOS / Linux) — recommended
 
 ```bash
-brew tap panchenkoai/rivet
-brew update
-brew install rivet
+brew install panchenkoai/rivet/rivet
 rivet --version
 ```
 
@@ -87,11 +85,13 @@ rivet --version
 
 ### Docker
 
-Try Rivet without installing anything — mount your config and output directory:
+Try Rivet without installing anything — run directly from the repo root using the bundled example config:
 
 ```bash
+mkdir -p output
 docker run --rm \
-  -v $(pwd)/rivet.yaml:/config/rivet.yaml \
+  -e DATABASE_URL="postgresql://user:pass@host.docker.internal:5432/db" \
+  -v $(pwd)/examples/rivet.yaml:/config/rivet.yaml \
   -v $(pwd)/output:/output \
   ghcr.io/panchenkoai/rivet:latest \
   run --config /config/rivet.yaml
@@ -104,18 +104,18 @@ docker run --rm ghcr.io/panchenkoai/rivet:latest --version
 docker run --rm ghcr.io/panchenkoai/rivet:latest --help
 ```
 
-Pass environment variables for credentials:
+For your own config file:
 
 ```bash
 docker run --rm \
-  -e DATABASE_URL="postgresql://user:pass@host:5432/db" \
+  -e DATABASE_URL="postgresql://user:pass@host.docker.internal:5432/db" \
   -v $(pwd)/rivet.yaml:/config/rivet.yaml \
   -v $(pwd)/output:/output \
   ghcr.io/panchenkoai/rivet:latest \
   run --config /config/rivet.yaml
 ```
 
-> **Note:** To connect to a database running on your host machine, use `host.docker.internal` instead of `localhost` in the connection URL.
+> **Note:** From a container, `localhost` is not your machine. Use `host.docker.internal` in the URL (Docker Desktop). On **Linux**, add `--add-host=host.docker.internal:host-gateway` to `docker run`. Plain `172.17.0.1` often hits **connection refused** if MySQL only binds `127.0.0.1`. See [Getting Started](docs/getting-started.md) (Docker section).
 
 ### Build from source
 

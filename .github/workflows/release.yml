@@ -22,8 +22,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  semantic-gates:
+    name: Semantic release gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', github.event.inputs.tag) || github.ref }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: semantic-gates
+      - name: Invariant tests
+        run: cargo test --test invariants --test journal_invariants
+      - name: Recovery tests
+        run: cargo test --test recovery
+      - name: Compatibility matrix tests
+        run: cargo test --lib -- plan::validate::tests
+
   build:
     name: Build ${{ matrix.target }}
+    needs: semantic-gates
     runs-on: ${{ matrix.os }}
     env:
       # Correct tag in tarball names when workflow is started manually (GITHUB_REF is then a branch).
