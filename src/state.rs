@@ -826,6 +826,19 @@ impl StateStore {
             db_path: std::path::PathBuf::from(":memory:"),
         })
     }
+
+    /// Open (or create) a state DB at an explicit file path.
+    /// Used by tests that need `claim_next_chunk_task`, which opens separate
+    /// connections and therefore cannot use an in-memory store.
+    #[allow(dead_code)]
+    pub fn open_at_path(db_path: &std::path::Path) -> Result<Self> {
+        let conn = Connection::open(db_path)?;
+        migrate(&conn)?;
+        Ok(Self {
+            conn,
+            db_path: db_path.to_path_buf(),
+        })
+    }
 }
 
 #[cfg(test)]
