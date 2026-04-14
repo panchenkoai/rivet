@@ -46,12 +46,10 @@ This folder contains modular guides for running your first pilot exports and a c
 | Topic | Guide |
 |-------|-------|
 | Production checklist | [pilot/production-checklist.md](pilot/production-checklist.md) |
+| UAT checklist (pilot sign-off) | [pilot/uat-checklist.md](pilot/uat-checklist.md) |
 | Plan/Apply for auditable extraction | [reference/cli.md#rivet-plan](reference/cli.md) · [adr/0005-plan-apply-contracts.md](adr/0005-plan-apply-contracts.md) |
 
 ## Example Configs
 
 Ready-to-use YAML templates live in the [`examples/`](../examples/) directory. To scaffold YAML from a live database (`rivet init`), see [reference/init.md](reference/init.md) and the root [`docker-compose.yaml`](../docker-compose.yaml).
 
-## Deep Reference
-
-For the full 25-section reference manual, see [USER_GUIDE.md](../USER_GUIDE.md).

@@ -151,7 +151,7 @@ source:
   database: production
 ```
 
-## 2.5 Scaffold a config with `rivet init` (optional)
+## 3. Scaffold a config with `rivet init` (optional)
 
 If you prefer to start from your real tables instead of copying a template, use **`rivet init`**. It connects once, reads column lists and rough row estimates, and writes a YAML file with `url_env: DATABASE_URL` and suggested export modes.
 
@@ -171,7 +171,7 @@ Then review the file, adjust destinations and tuning, and continue with `rivet d
 
 Full details: [reference/init.md](reference/init.md).
 
-## 3. Verify connectivity
+## 4. Verify connectivity
 
 ```bash
 rivet doctor --config my_export.yaml
@@ -179,7 +179,7 @@ rivet doctor --config my_export.yaml
 
 This checks that Rivet can connect to the source database and reach all configured destinations. Fix any `[FAIL]` items before proceeding.
 
-## 4. Preflight check
+## 5. Preflight check
 
 ```bash
 rivet check --config my_export.yaml
@@ -187,7 +187,7 @@ rivet check --config my_export.yaml
 
 This runs a dry-run analysis of each export: checks table existence, estimates row counts, detects index availability, and recommends a tuning profile.
 
-## 5. Run your first export
+## 6. Run your first export
 
 ```bash
 rivet run --config my_export.yaml --validate
@@ -201,7 +201,21 @@ Add `--reconcile` to also compare with a `COUNT(*)` on the source:
 rivet run --config my_export.yaml --validate --reconcile
 ```
 
-## 6. Inspect results
+### Optional: auditable execution with plan/apply
+
+For CI/CD pipelines or pre-reviewed production runs, use the plan/apply workflow instead of `rivet run`:
+
+```bash
+# Generate a sealed execution plan (no data exported)
+rivet plan --config my_export.yaml -o plan.json
+
+# Review plan.json, then execute
+rivet apply plan.json
+```
+
+The plan artifact captures config, query fingerprints, and cursors at planning time. `rivet apply` validates that nothing has changed before executing. See [reference/cli.md](reference/cli.md#rivet-plan) for details.
+
+## 7. Inspect results
 
 ```bash
 # View export state (cursors for incremental exports)

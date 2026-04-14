@@ -1,4 +1,9 @@
-# Rivet — User acceptance test plan
+# Rivet — User Acceptance Test Plan
+
+> **Audience:** pilot operators, release validators, and QA contributors.
+> This is an **internal acceptance test checklist**, not a first-run onboarding guide.
+> For onboarding, see [`docs/getting-started.md`](docs/getting-started.md).
+> For a summary UAT checklist suitable for sharing with pilot users, see [`docs/pilot/uat-checklist.md`](docs/pilot/uat-checklist.md).
 
 This document is a **manual checklist** for operators and pilot users who want to exercise Rivet end-to-end against the features that already exist. Use it for smoke tests, regression passes before a release, or onboarding.
 

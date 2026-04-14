@@ -16,6 +16,28 @@ cargo test --all-targets       # 345+ tests, no database needed
 
 All three checks must pass. CI enforces them on every push and PR.
 
+## Documentation governance
+
+The canonical user-facing docs live in `docs/`. Before adding or editing documentation:
+
+1. **One question → one canonical location.** Check whether an existing document already owns the answer. Prefer updating it over creating a new file.
+2. **Know the role of the document you are editing.**
+   - `README.md` — product landing page: description, install, documentation links, milestones. Nothing else.
+   - `docs/README.md` — navigation hub for all user docs.
+   - `docs/getting-started.md` — first-run onboarding only. Linear, no detours.
+   - `docs/modes/*`, `docs/destinations/*`, `docs/pilot/*` — task guides: when to use something, trade-offs, realistic examples.
+   - `docs/reference/*` — exact field/flag/command definitions. No onboarding content.
+   - `PRODUCT.md`, `rivet_roadmap.md` — internal author docs. Not part of the user onboarding path.
+   - `dev/USER_TEST_PLAN.md` — internal UAT checklist. Not user onboarding.
+3. **`docs/` is the only canonical user-facing documentation space.** New user content goes in `docs/`, not in root-level markdown files.
+4. **Do not add onboarding material to reference docs**, and do not add field-by-field reference detail to task guides.
+5. **Every new doc must declare its role** — who it is for, when to read it, and what canonical question it answers.
+
+PR checklist for documentation changes:
+- What role does this doc serve?
+- Why is an existing doc not sufficient?
+- What canonical question does it answer?
+
 ## Documentation language
 
 All **user-facing documentation** must be in **English**, including:

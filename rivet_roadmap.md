@@ -138,6 +138,7 @@ These are the most validated and strategically important problems.
 
 ## Epic 1 — Preflight Planner & Source Safety
 **Priority:** P0  
+**Status:** ✅ DONE — lettered epic B; `rivet check` with strategy output, verdicts, sparse/dense warnings, connection limit warnings, profile recommendations  
 **Pain coverage:** Pain A, Pain B, Pain D
 
 ### Goal
@@ -164,6 +165,7 @@ Users repeatedly describe not wanting to find out too late that:
 
 ## Epic 2 — Auditability, Manifest & Reconciliation
 **Priority:** P0  
+**Status:** ✅ DONE — lettered epics D, F; run summary, file manifest, `rivet metrics`, `rivet state files`, `--reconcile`  
 **Pain coverage:** Pain C, Pain D, Pain E
 
 ### Goal
@@ -188,6 +190,7 @@ After extract-to-bucket works, users immediately ask:
 
 ## Epic 3 — Recovery & Interrupted Run Semantics
 **Priority:** P0  
+**Status:** ✅ DONE — lettered epics C, H; crash matrix, lifecycle docs, E2E recovery paths, `tests/recovery.rs` (10 tests across 5 failure boundaries)  
 **Pain coverage:** Pain D, Pain E
 
 ### Goal
@@ -211,6 +214,7 @@ Without explicit recovery semantics, any interrupted run becomes:
 
 ## Epic 4 — Durable State Backend
 **Priority:** P0  
+**Status:** ⏳ OPEN — SQLite only; external/Postgres backend deferred; domain store split complete (stabilisation Epic 6)  
 **Pain coverage:** Pain D, Pain F
 
 ### Goal
@@ -237,6 +241,7 @@ These strengthen Rivet's core differentiation once the trust layer is solid.
 
 ## Epic 5 — Real Batch / Fetch / Write Control
 **Priority:** P1  
+**Status:** ✅ DONE — lettered epic M; `batch_size`, `batch_size_memory_mb`, `max_file_size`, `throttle_ms`, streaming uploads, per-export tuning overrides  
 **Pain coverage:** Pain A, Pain B, Pain E
 
 ### Goal
@@ -263,6 +268,7 @@ Users repeatedly complain that existing tooling exposes “batch size” in uncl
 
 ## Epic 6 — Date / Timestamp / Range Partition Intelligence
 **Priority:** P1  
+**Status:** ✅ DONE — `chunked` mode with `chunk_by_days`, date-native `>= / <` semantics, sparse range warnings, planner awareness  
 **Pain coverage:** Pain A, Pain B, Pain D
 
 ### Goal
@@ -283,6 +289,7 @@ Users repeatedly hit partitioning pain on 100M+ tables and often need date-based
 
 ## Epic 7 — Schema Drift Visibility & Policy
 **Priority:** P1  
+**Status:** ✅ Partial — column add/remove/type-change tracking and warnings in run summary; policy hooks (warn/fail/continue on drift) not yet implemented  
 **Pain coverage:** Pain C, Pain E
 
 ### Goal
@@ -301,6 +308,7 @@ Users often discover schema drift only after downstream damage is already done.
 
 ## Epic 8 — Data Shape Drift Detection
 **Priority:** P1  
+**Status:** ⏳ OPEN — not started; text/string width tracking not yet implemented  
 **Pain coverage:** Pain C
 
 ### Goal
@@ -319,6 +327,7 @@ Widening text/string payloads are a real downstream failure source and are not c
 
 ## Epic 9 — Data Contract Checks
 **Priority:** P1  
+**Status:** ✅ DONE — `quality:` YAML block; row count bounds, null ratio thresholds, uniqueness assertions; chunked aggregate quality gate  
 **Pain coverage:** Pain C, Pain E
 
 ### Goal
@@ -556,9 +565,11 @@ This section merges the former `rivet_roadmap_v3.md` task tracker. **Strategic p
 
 ---
 
-## 9.2 Current state (v0.2.0-beta.1)
+## 9.2 Current state (v0.2.0-beta.7)
 
-Rivet core is **feature-complete for beta** extraction:
+Rivet core is **feature-complete for beta** extraction. All Wave 1–3 stabilisation epics are shipped.
+
+### Extraction
 
 - PostgreSQL and MySQL streaming extraction
 - Parquet and CSV (zstd default; snappy, gzip, lz4, none)
@@ -569,10 +580,28 @@ Rivet core is **feature-complete for beta** extraction:
 - `rivet check`, `rivet doctor`, SQLite state + migrations, metrics, file manifest, chunk checkpoints
 - Schema tracking, typed retries (SQLSTATE / MySQL codes), `--validate`, `--reconcile`
 - Tuning profiles, Slack, data **quality** checks, meta columns
-- **CI:** rustfmt, clippy, tests, release build, **E2E** (Docker Compose), cargo audit
-- **Release:** `.github/workflows/release.yml` on `v*` tags (Linux x86_64/arm64, macOS arm64/Intel)
-- **Docs:** `docs/` pilot guides, `examples/` scenario YAMLs, `USER_GUIDE.md`
-- **600+ tests** (unit + integration); YAML config via **serde_yaml_ng**
+- Date-native chunking (`chunk_by_days`), connection limit warnings, `rivet init`
+- **Plan/Apply workflow** — sealed execution artifacts (`rivet plan` / `rivet apply`, ADR-0005)
+
+### Architecture (stabilisation plan — all complete)
+
+- `ResolvedRunPlan` planning layer; `RawConfig` / `ValidatedConfig` separation (Epics 1, 3)
+- Centralized `PlanValidator` with compatibility diagnostics (Epic 2)
+- State update invariants + `tests/invariants.rs` (Epic 4, ADR-0001)
+- CLI-product boundary locked, module visibility hardened (Epic 5, ADR-0002)
+- Domain state stores: `CursorStore`, `ManifestStore`, `MetricsStore`, `SchemaHistoryStore` (Epic 6)
+- `ExtractionStrategy` explicit types; Planning / Execution / Persistence layers (Epics 7, 8, ADR-0003)
+- `DestinationCapabilities`, `WriteCommitProtocol` per backend (Epic 9, ADR-0004)
+- `RunJournal` domain model with 13 `RunEvent` variants (Epic 10)
+- Invariant + compatibility matrix + recovery test suites in CI (Epics 11–13)
+- Semantic release gates — `test-invariants`, `test-recovery`, `test-compatibility` required before build (Epic 14)
+
+### Release & distribution
+
+- **CI:** rustfmt, clippy, tests, release build, **E2E** (Docker Compose), cargo audit, semantic gates
+- **Release:** Linux x86_64/arm64, macOS arm64/Intel binaries; Docker GHCR; Homebrew tap
+- **Published:** `rivet-cli` on crates.io
+- **617+ tests** (unit + integration + E2E + invariant + recovery + compatibility matrix)
 
 ---
 
@@ -721,17 +750,20 @@ Rivet core is **feature-complete for beta** extraction:
 
 Prioritize by stabilization before distribution polish:
 
+**Completed (beta.2–beta.7):**
+
 1. ✅ **Green GitHub Release** — v0.2.0-beta.2 published (binaries, Docker, Homebrew tap).
 2. ✅ **L3** — `cargo publish` — rivet-cli v0.2.0-beta.2 on crates.io.
 3. ✅ **Connection limit warning** — `rivet check` warns when `parallel >= max_connections` (v0.2.0-beta.3).
 4. ✅ **Date-native chunking** — `chunk_by_days` with `>= date AND < date` semantics, parallel support, E2E tested (v0.2.0-beta.3).
-5. **F5 + I5** — short docs: audit/reconcile tradeoffs; capacity / memory guidance.
-4. **H4** — link CRASH_MATRIX from USER_GUIDE.
-5. **I2** — scripted benchmark or `cargo xtask`-style harness.
-6. **Epic 4 (§5)** — external/durable state backend when pilots need multi-replica or stateless workers.
-7. **H2, G2** — fault injection and network chaos (lower urgency).
+5. ✅ **Stabilisation plan Waves 1–3** — all 14 epics shipped in v0.2.0-beta.7 (architecture hardening, invariant/recovery/compatibility tests, semantic release gates).
 
-Stale “immediate this week” lists (E2E, reconcile, MinIO) are **done**; ignore old copies if seen elsewhere.
+**Remaining open items:**
+
+1. **F5 + I5** — short docs: audit/reconcile tradeoffs; capacity/memory guidance.
+2. **I2** — scripted benchmark or `cargo xtask`-style harness.
+3. **Epic 4 (§5)** — external/durable state backend when pilots need multi-replica or stateless workers.
+4. **H2, G2** — fault injection and network chaos (lower urgency).
 
 ---
 
@@ -743,8 +775,10 @@ Stale “immediate this week” lists (E2E, reconcile, MinIO) are **done**; igno
 - [x] Run summary + reconciliation (`--reconcile`)
 - [x] Crash/recovery tested (matrix + E2E)
 - [x] Local battle lab (MinIO + compose + E2E)
-- [x] Docs for real scenarios (`docs/`, examples, USER_GUIDE)
+- [x] Docs for real scenarios (`docs/` canonical; `USER_GUIDE.md` deprecated, navigation consolidated)
+- [x] Architecture stabilisation — Waves 1–3 complete (14 epics, invariant/recovery/compatibility tests, semantic release gates)
+- [x] Plan/Apply workflow — sealed execution artifacts, ADR-0005
 - [ ] 2–3 pilot tables repeated on a schedule *(organizational; optional automation K2)*
-- [x] Cross-platform release binaries **published** (v0.2.0-beta.2: Linux x86_64/arm64, macOS arm64/Intel, Docker GHCR, Homebrew tap)
+- [x] Cross-platform release binaries **published** (v0.2.0-beta.7: Linux x86_64/arm64, macOS arm64/Intel, Docker GHCR, Homebrew tap)
 - [x] E2E matrix in CI
-- [x] Published to crates.io (rivet-cli v0.2.0-beta.2)
+- [x] Published to crates.io (rivet-cli)
