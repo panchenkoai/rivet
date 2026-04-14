@@ -105,9 +105,22 @@ pub(crate) fn run_export(
     // Chunked strategies own their own execution path.
     if matches!(plan.strategy, ExtractionStrategy::Chunked(_)) {
         if plan.strategy.is_resumable() {
-            return run_chunked_sequential_checkpoint(src, state, plan, summary, config_path);
+            return run_chunked_sequential_checkpoint(
+                src,
+                state,
+                plan,
+                summary,
+                config_path,
+                super::chunked::ChunkSource::Detect,
+            );
         } else {
-            return run_chunked_sequential(src, plan, summary, Some(state));
+            return run_chunked_sequential(
+                src,
+                plan,
+                summary,
+                Some(state),
+                super::chunked::ChunkSource::Detect,
+            );
         }
     }
 

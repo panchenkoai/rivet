@@ -46,6 +46,7 @@ This folder contains modular guides for running your first pilot exports and a c
 | Topic | Guide |
 |-------|-------|
 | Production checklist | [pilot/production-checklist.md](pilot/production-checklist.md) |
+| Plan/Apply for auditable extraction | [reference/cli.md#rivet-plan](reference/cli.md) · [adr/0005-plan-apply-contracts.md](adr/0005-plan-apply-contracts.md) |
 
 ## Example Configs
 

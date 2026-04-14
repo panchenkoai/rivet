@@ -54,6 +54,20 @@ pub(crate) struct ExportDiagnostic {
     pub suggestion: Option<String>,
 }
 
+/// Return the diagnostic for a single export without printing anything.
+///
+/// Used by `rivet plan` to capture preflight data into a `PlanArtifact`.
+pub(crate) fn get_export_diagnostic(
+    config: &Config,
+    export: &ExportConfig,
+) -> Result<ExportDiagnostic> {
+    let url = config.source.resolve_url()?;
+    match config.source.source_type {
+        SourceType::Postgres => postgres::diagnose_export_pg(&url, export),
+        SourceType::Mysql => mysql::diagnose_export_mysql(&url, export),
+    }
+}
+
 pub fn check(
     config_path: &str,
     export_name: Option<&str>,

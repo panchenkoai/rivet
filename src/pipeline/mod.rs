@@ -6,9 +6,11 @@
 //!
 //! See `docs/adr/0003-layer-classification.md` for the full module taxonomy.
 
+mod apply_cmd;
 mod chunked;
 mod cli;
 pub mod journal;
+mod plan_cmd;
 pub(crate) mod progress;
 mod retry;
 mod single;
@@ -16,12 +18,14 @@ mod sink;
 mod summary;
 mod validate;
 
+pub use apply_cmd::run_apply_command;
 #[allow(unused_imports)]
 pub use chunked::generate_chunks;
 pub use cli::{
     reset_chunk_checkpoint, reset_state, show_chunk_checkpoint, show_files, show_metrics,
     show_state,
 };
+pub use plan_cmd::{PlanOutputFormat, run_plan_command};
 #[allow(unused_imports)]
 pub use retry::classify_error;
 // build_time_window_query moved to crate::plan; re-exported here for integration tests.
@@ -257,9 +261,15 @@ fn run_export_job(
 
     let result = if plan.strategy.requires_parallel_execution() {
         if plan.strategy.is_resumable() {
-            run_chunked_parallel_checkpoint(config_path, state, &plan, &mut summary)
+            run_chunked_parallel_checkpoint(
+                config_path,
+                state,
+                &plan,
+                &mut summary,
+                chunked::ChunkSource::Detect,
+            )
         } else {
-            chunked::run_chunked_parallel(state, &plan, &mut summary)
+            chunked::run_chunked_parallel(state, &plan, &mut summary, chunked::ChunkSource::Detect)
         }
     } else {
         run_with_reconnect(state, &plan, &mut summary, config_path)
@@ -329,6 +339,109 @@ fn run_export_job(
 
     summary.print();
     crate::notify::maybe_send(config.notifications.as_ref(), &summary);
+
+    if failed { result } else { Ok(()) }
+}
+
+/// Execute a pre-resolved plan with a caller-supplied `ChunkSource`.
+///
+/// Used by `rivet apply`: the plan comes from a deserialized `PlanArtifact` so
+/// `build_plan` is skipped.  Everything else — quality gate, metrics, state
+/// persistence — is identical to `run_export_job`.
+pub(crate) fn run_export_job_with_chunk_source(
+    plan: &ResolvedRunPlan,
+    state: &StateStore,
+    chunk_source: chunked::ChunkSource,
+) -> Result<()> {
+    // Re-validate the plan from the artifact (fast, no DB queries).
+    let diags = validate_plan(plan);
+    for d in &diags {
+        match d.level {
+            DiagnosticLevel::Rejected => {
+                anyhow::bail!(
+                    "export '{}': plan validation rejected: {}",
+                    plan.export_name,
+                    d.message
+                );
+            }
+            DiagnosticLevel::Warning => {
+                log::warn!("[{}] plan validation warning: {}", d.rule, d.message);
+            }
+            DiagnosticLevel::Degraded => {
+                log::info!("[{}] plan validation degraded: {}", d.rule, d.message);
+            }
+        }
+    }
+
+    log::info!(
+        "apply: starting export '{}' (tuning: {})",
+        plan.export_name,
+        plan.tuning
+    );
+
+    let start = std::time::Instant::now();
+    let rss_before = crate::resource::get_rss_mb();
+    let rss_sampler = crate::resource::RssPeakSampler::start(rss_before, 100);
+    let mut summary = RunSummary::new(plan);
+
+    let result = if plan.strategy.requires_parallel_execution() {
+        if plan.strategy.is_resumable() {
+            // apply does not support checkpoint-parallel resume; use Detect fallback
+            run_chunked_parallel_checkpoint("", state, plan, &mut summary, chunk_source)
+        } else {
+            chunked::run_chunked_parallel(state, plan, &mut summary, chunk_source)
+        }
+    } else {
+        run_with_reconnect(state, plan, &mut summary, "")
+    };
+
+    let rss_peak = rss_sampler.stop();
+    let rss_after = crate::resource::get_rss_mb();
+    summary.duration_ms = start.elapsed().as_millis() as i64;
+    summary.peak_rss_mb = rss_peak.max(rss_after).max(rss_before) as i64;
+
+    let tuning_class = plan.tuning.profile_name().to_string();
+    let result = run_chunked_quality_gate(result, plan, &mut summary);
+    let failed = result.is_err();
+
+    match &result {
+        Ok(()) => {
+            if summary.status == "running" {
+                summary.status = "success".into();
+            }
+        }
+        Err(e) => {
+            summary.status = "failed".into();
+            summary.error_message = Some(format!("{:#}", e));
+            log::error!("apply '{}' failed: {:#}", plan.export_name, e);
+        }
+    }
+
+    if let Err(e) = state.record_metric(
+        &summary.export_name,
+        &summary.run_id,
+        summary.duration_ms,
+        summary.total_rows,
+        Some(summary.peak_rss_mb),
+        &summary.status,
+        summary.error_message.as_deref(),
+        Some(&tuning_class),
+        Some(&summary.format),
+        Some(&summary.mode),
+        summary.files_produced as i64,
+        summary.bytes_written as i64,
+        summary.retries as i64,
+        summary.validated,
+        summary.schema_changed,
+    ) {
+        log::warn!(
+            "apply '{}': metrics write failed: {:#}",
+            summary.export_name,
+            e
+        );
+    }
+
+    summary.print();
 
     if failed { result } else { Ok(()) }
 }

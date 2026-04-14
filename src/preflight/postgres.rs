@@ -15,6 +15,16 @@ pub(super) fn check_postgres(url: &str, exports: &[&ExportConfig]) -> Result<()>
     Ok(())
 }
 
+/// Diagnose a single export without printing — used by `rivet plan`.
+pub(super) fn diagnose_export_pg(
+    url: &str,
+    export: &ExportConfig,
+) -> Result<super::ExportDiagnostic> {
+    let mut client = postgres::Client::connect(url, postgres::NoTls)?;
+    let db_max_connections = fetch_max_connections_pg(&mut client);
+    diagnose_pg(&mut client, export, db_max_connections)
+}
+
 fn fetch_max_connections_pg(client: &mut postgres::Client) -> Option<u32> {
     let rows = client
         .query("SELECT current_setting('max_connections')::int", &[])

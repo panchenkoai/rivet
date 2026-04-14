@@ -4,7 +4,7 @@ This document is a **manual checklist** for operators and pilot users who want t
 
 To mark a test: change `[ ]` to `[x]` in the **Pass** column.
 
-**Stabilization focus (recent features):** complete **Suite R** (chunk checkpoint), **Suite S** (per-export tuning + parallel exports/processes), then optional **T** (monitoring stack) and **U** (sparse chunk demo). Older suites A–Q remain regression coverage.
+**Stabilization focus (recent features):** complete **Suite R** (chunk checkpoint), **Suite S** (per-export tuning + parallel exports/processes), **Suite V** (plan/apply), then optional **T** (monitoring stack) and **U** (sparse chunk demo). Older suites A–Q remain regression coverage.
 
 ---
 
@@ -444,6 +444,136 @@ Requires an **in_progress** chunk run for export `bench_content_p4` (same as aft
 | MySQL image    | (e.g. `mysql:8` from compose)     |
 | Notes          | Verified: `bash dev/run_uat_smoke.sh` → 31 PASS, 0 FAIL, 3 SKIP (`/tmp/rivet_uat_smoke.txt`). R1 covered with E2; R2–R5 not in script; also S2/S3/S5, full `pg_full` all exports, MySQL rows, object storage, Toxiproxy Q, U. |
 
+
+---
+
+## Suite V — Plan/Apply workflow
+
+**Goal**: verify that `rivet plan` generates a valid artifact and `rivet apply` executes it correctly across all strategy types, and that contract violations (staleness, cursor drift) are rejected as specified in ADR-0005.
+
+**Prerequisites**: Postgres running, seeds loaded (P2–P3), `rivet` on PATH.
+
+### V1 — `rivet plan` pretty output (Snapshot)
+
+```bash
+rivet plan -c dev/pg_full.yaml
+```
+
+| ID | Step | Expected | Actual | Pass |
+|----|------|----------|--------|------|
+| V1 | Run `rivet plan` against a full-scan export | Summary printed: Plan ID, export name, strategy=full, row estimate, verdict, format | | [ ] |
+
+---
+
+### V2 — `rivet plan` JSON artifact (Chunked)
+
+```bash
+rivet plan -c dev/bench_chunked_seq.yaml --format json --output /tmp/plan_chunked.json
+cat /tmp/plan_chunked.json | python3 -m json.tool | head -40
+```
+
+| ID | Step | Expected | Actual | Pass |
+|----|------|----------|--------|------|
+| V2a | JSON file written | `plan_chunked.json` exists, valid JSON | | [ ] |
+| V2b | Chunk ranges present | `computed.chunk_ranges` is non-empty array of `[start, end]` pairs | | [ ] |
+| V2c | Fingerprint non-empty | `plan_fingerprint` is a 16-char hex string | | [ ] |
+| V2d | Diagnostics present | `diagnostics.verdict` is one of `EFFICIENT/ACCEPTABLE/DEGRADED/UNSAFE` | | [ ] |
+
+---
+
+### V3 — `rivet apply` executes the plan (Chunked)
+
+```bash
+rivet apply /tmp/plan_chunked.json
+```
+
+| ID | Step | Expected | Actual | Pass |
+|----|------|----------|--------|------|
+| V3a | Apply completes | Exit 0; summary printed with rows > 0, files > 0 | | [ ] |
+| V3b | No min/max queries | Log does not contain `SELECT min(` at apply time (chunk detection skipped) | | [ ] |
+| V3c | Metrics recorded | `rivet metrics -c dev/bench_chunked_seq.yaml --last 1` shows the apply run | | [ ] |
+
+---
+
+### V4 — Staleness: warn threshold (1–24 h)
+
+Manually backdate the artifact's `created_at` to 2 hours ago in the JSON file, then apply.
+
+```bash
+# Edit /tmp/plan_chunked.json: set created_at to 2 hours ago
+rivet apply /tmp/plan_chunked.json
+```
+
+| ID | Step | Expected | Actual | Pass |
+|----|------|----------|--------|------|
+| V4 | Apply proceeds with warning | Exit 0; log contains `WARN … minutes old` | | [ ] |
+
+---
+
+### V5 — Staleness: error threshold (> 24 h)
+
+Manually set `created_at` to 25 hours ago.
+
+```bash
+rivet apply /tmp/plan_chunked.json
+```
+
+| ID | Step | Expected | Actual | Pass |
+|----|------|----------|--------|------|
+| V5a | Apply rejects | Exit 1; error contains `older than 24 h` | | [ ] |
+| V5b | --force overrides | `rivet apply /tmp/plan_chunked.json --force` exits 0 with a warning logged | | [ ] |
+
+---
+
+### V6 — Cursor drift rejection (Incremental)
+
+```bash
+# 1. Generate plan for an incremental export
+rivet plan -c dev/pg_incremental.yaml --format json -o /tmp/plan_incr.json
+
+# 2. Run the incremental export (advances the cursor)
+rivet run -c dev/pg_incremental.yaml
+
+# 3. Try to apply the now-stale plan
+rivet apply /tmp/plan_incr.json
+```
+
+| ID | Step | Expected | Actual | Pass |
+|----|------|----------|--------|------|
+| V6 | Apply detects cursor drift | Exit 1; error contains `cursor has drifted` with snapshot and current values | | [ ] |
+
+---
+
+### V7 — `rivet plan` when DB is unreachable (graceful degradation)
+
+Stop the database, then run plan.
+
+| ID | Step | Expected | Actual | Pass |
+|----|------|----------|--------|------|
+| V7 | Plan degrades gracefully | Plan artifact still written (or summary printed) with `diagnostics.verdict = "unknown (preflight failed)"` and a warning | | [ ] |
+
+---
+
+### V8 — Round-trip: plan + apply produces same rows as run
+
+```bash
+# Baseline run
+rivet state reset -c dev/pg_full.yaml --export users
+rivet run -c dev/pg_full.yaml -e users
+ROWS_RUN=$(rivet metrics -c dev/pg_full.yaml -e users --last 1 | grep rows | awk '{print $NF}')
+
+# Plan + apply
+rivet state reset -c dev/pg_full.yaml --export users
+rivet plan -c dev/pg_full.yaml -e users --format json -o /tmp/plan_users.json
+rivet apply /tmp/plan_users.json
+ROWS_APPLY=$(rivet metrics -c dev/pg_full.yaml -e users --last 1 | grep rows | awk '{print $NF}')
+
+echo "run=$ROWS_RUN apply=$ROWS_APPLY"
+```
+
+| ID | Step | Expected | Actual | Pass |
+|----|------|----------|--------|------|
+| V8 | Row counts match | `ROWS_RUN == ROWS_APPLY` | | [ ] |
 
 ---
 

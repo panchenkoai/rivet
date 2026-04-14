@@ -68,6 +68,29 @@ Complete this checklist before running Rivet against a production database.
 6. Run again to test incremental/chunked behavior
 7. Set up cron / scheduler
 
+## Auditable extraction (plan/apply)
+
+For CI/CD pipelines, GitOps workflows, or any run that requires a pre-execution review before data is touched:
+
+1. **Generate a plan artifact** — preflight analysis + chunk boundaries pre-computed, no data exported:
+   ```bash
+   rivet plan --config rivet.yaml --format json --output plan.json
+   ```
+2. **Review the plan** — inspect `verdict`, `warnings`, chunk count, row estimate. Commit `plan.json` to a PR or store as a CI artifact.
+3. **Apply the sealed artifact** — executes exactly the pre-computed plan:
+   ```bash
+   rivet apply plan.json
+   ```
+
+Key guarantees:
+- `apply` never re-reads the config file or re-runs preflight queries
+- Plans older than 1 hour emit a warning; older than 24 hours require `--force`
+- For incremental exports, `apply` rejects the artifact if the cursor has advanced since plan time (another run completed in between)
+
+> **Security note:** `plan.json` embeds the full source connection config including credentials. Treat it with the same care as your rivet config file.
+
+See [CLI reference](../reference/cli.md) and [ADR-0005](../adr/0005-plan-apply-contracts.md) for the full contract specification.
+
 ## Memory budgeting
 
 | batch_size | Approximate RSS (narrow table) | Approximate RSS (wide table) |

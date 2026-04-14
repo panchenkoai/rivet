@@ -1028,7 +1028,78 @@ error-mail and orchestrator alerting work out of the box:
 
 ---
 
-## 22. Schema change detection
+## 22. Auditable extraction: plan and apply
+
+`rivet plan` / `rivet apply` is a Terraform-style workflow for data extracts. `rivet plan` captures a complete, sealed execution plan at a point in time — no data is exported. `rivet apply` executes that sealed plan.
+
+**When to use it:**
+- CI/CD pipelines where a human or automated reviewer must approve the plan before data is touched
+- GitOps workflows where the plan artifact is committed to a PR for review
+- Audit trails that require a record of what was planned vs. what was executed
+- Debugging: inspect pre-computed chunk boundaries before committing to an extraction
+
+### Generating a plan
+
+```bash
+# Human-readable summary (no file written)
+rivet plan --config rivet.yaml
+
+# Sealed JSON artifact saved to file
+rivet plan --config rivet.yaml --format json --output plan.json
+
+# Plan a single export
+rivet plan --config rivet.yaml --export orders --format json --output orders_plan.json
+```
+
+The plan summary shows:
+
+```
+  Plan ID  : a1b2c3d4...
+  Created  : 2026-04-14 10:00:00 UTC
+  Expires  : 2026-04-15 10:00:00 UTC
+  Export   : orders
+  Strategy : chunked
+  Chunks   : 42
+  Row est. : ~2,100,000
+  Verdict  : Acceptable
+  Profile  : balanced
+  Warnings :
+    • sparse id range: ~12% fill
+  Output   : local → ./out
+  Format   : parquet + zstd
+```
+
+### Applying a plan
+
+```bash
+rivet apply plan.json
+
+# Override staleness check for an old plan
+rivet apply plan.json --force
+```
+
+### Staleness rules
+
+| Plan age | Behavior |
+|----------|----------|
+| < 1 hour | Proceeds silently |
+| 1–24 hours | Warns and proceeds |
+| > 24 hours | Rejects — use `--force` to override |
+
+### Guarantees
+
+- `apply` never re-reads the config file or re-runs preflight queries
+- Chunk boundaries are replayed verbatim from the artifact — no `SELECT min/max` queries at apply time
+- For incremental exports, `apply` checks that the cursor hasn't advanced since plan time; if it has (another run completed), the artifact is rejected to prevent duplicates
+- Preflight diagnostics (`verdict`, `warnings`) are advisory — they do not block execution at apply time
+
+> **Security note:** the plan artifact (`--format json`) embeds the full source connection config including credentials. Treat it with the same care as your rivet config file.
+
+Full contract specification: [docs/adr/0005-plan-apply-contracts.md](docs/adr/0005-plan-apply-contracts.md).
+
+---
+
+## 23. Schema change detection
 
 Rivet automatically tracks the column schema of each export. When columns are added, removed, or change type between runs, it logs a warning:
 
@@ -1043,7 +1114,7 @@ The summary shows `schema: CHANGED` and the flag is persisted in metrics. No act
 
 ---
 
-## 23. Error handling and retries
+## 24. Error handling and retries
 
 **Exit codes:** `rivet run` exits with **non-zero** when any export fails, making
 it safe to use with cron, CI pipelines, and orchestrators that check `$?`. When
@@ -1073,7 +1144,7 @@ Backoff is exponential: attempt 1 = base, attempt 2 = 2x base, attempt 3 = 4x ba
 
 ---
 
-## 24. Production checklist
+## 25. Production checklist
 
 Before deploying Rivet to production, verify each item:
 
@@ -1118,7 +1189,7 @@ Before deploying Rivet to production, verify each item:
 
 ---
 
-## 25. Troubleshooting
+## 26. Troubleshooting
 
 ### Config loads but tuning has no effect
 
@@ -1175,6 +1246,10 @@ new schema. Review the change and update downstream consumers accordingly.
 |------|---------|
 | Validate config and source health | `rivet check --config rivet.yaml` |
 | Verify authentication | `rivet doctor --config rivet.yaml` |
+| Generate execution plan (no data exported) | `rivet plan --config rivet.yaml` |
+| Generate plan artifact (JSON) | `rivet plan --config rivet.yaml --format json --output plan.json` |
+| Apply a sealed plan | `rivet apply plan.json` |
+| Apply an old plan (skip staleness check) | `rivet apply plan.json --force` |
 | Run all exports | `rivet run --config rivet.yaml --validate` |
 | Run all exports in parallel (threads) | `rivet run --config rivet.yaml --parallel-exports` |
 | Run all exports in parallel (processes) | `rivet run --config rivet.yaml --parallel-export-processes` |

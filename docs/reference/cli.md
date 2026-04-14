@@ -56,6 +56,137 @@ rivet run -c my_export.yaml --parallel-exports
 
 ---
 
+## `rivet plan`
+
+Generate a sealed execution plan artifact — no data is exported.
+
+`rivet plan` runs preflight analysis (row estimate, index check, sparsity), computes chunk boundaries for chunked exports, snapshots the current cursor for incremental exports, and writes everything to a `PlanArtifact` JSON file. The artifact can be reviewed, committed, stored as a CI artifact, or passed to `rivet apply`.
+
+```bash
+rivet plan --config <PATH> [OPTIONS]
+```
+
+| Flag | Short | Type | Default | Description |
+|------|-------|------|---------|-------------|
+| `--config` | `-c` | string | — | Path to YAML config file **(required)** |
+| `--export` | `-e` | string | all | Plan only a specific export |
+| `--param` | `-p` | KEY=VALUE | — | Query parameter (repeatable) |
+| `--output` | `-o` | string | stdout | Write plan JSON to this file |
+| `--format` | | `pretty`\|`json` | `pretty` | `pretty` prints a human summary; `json` writes the full artifact |
+
+### Examples
+
+```bash
+# Human-readable summary (no file written)
+rivet plan -c rivet.yaml
+
+# Write full JSON artifact to a file
+rivet plan -c rivet.yaml --format json --output plan.json
+
+# Plan a single export
+rivet plan -c rivet.yaml -e orders --format json -o orders_plan.json
+```
+
+### Pretty output (example)
+
+```
+  Plan ID  : a1b2c3d4e5f6...
+  Created  : 2026-04-14 10:00:00 UTC
+  Expires  : 2026-04-15 10:00:00 UTC
+  Export   : orders
+  Strategy : chunked
+  Chunks   : 42
+  Row est. : ~2,100,000
+  Verdict  : Acceptable
+  Profile  : balanced
+  Warnings :
+    • sparse id range: ~12% fill
+  Output   : local → ./out
+  Format   : parquet + zstd
+```
+
+### Plan artifact structure
+
+The JSON artifact (`--format json`) contains:
+
+```json
+{
+  "rivet_version": "0.2.0",
+  "plan_id": "a1b2c3d4...",
+  "created_at": "2026-04-14T10:00:00Z",
+  "expires_at": "2026-04-15T10:00:00Z",
+  "export_name": "orders",
+  "strategy": "chunked",
+  "plan_fingerprint": "0123456789abcdef",
+  "resolved_plan": { ... },
+  "computed": {
+    "chunk_ranges": [[1, 50000], [50001, 100000], "..."],
+    "chunk_count": 42,
+    "cursor_snapshot": null,
+    "row_estimate": 2100000
+  },
+  "diagnostics": {
+    "verdict": "Acceptable",
+    "warnings": ["sparse id range: ~12% fill"],
+    "recommended_profile": "balanced"
+  }
+}
+```
+
+> **Security note**: `resolved_plan` embeds the full source connection config including credentials. Treat plan files with the same care as your rivet config file.
+
+---
+
+## `rivet apply`
+
+Execute a previously-generated plan artifact.
+
+`rivet apply` deserializes the artifact, validates staleness and cursor integrity, then executes the export using the pre-computed chunk boundaries from the artifact — no `SELECT min/max` queries are run against the source.
+
+```bash
+rivet apply <PLAN_FILE> [OPTIONS]
+```
+
+| Argument/Flag | Type | Description |
+|---|---|---|
+| `PLAN_FILE` | string | Path to plan JSON file **(required)** |
+| `--force` | bool | Skip staleness check (allow plans older than 24 h) |
+
+### Staleness rules
+
+| Plan age | Behavior |
+|----------|----------|
+| < 1 hour | Proceeds silently |
+| 1–24 hours | Warns and proceeds |
+| > 24 hours | Rejects — use `--force` to override |
+
+### Cursor drift (Incremental exports)
+
+If another `rivet run` completed after the plan was generated, the cursor will have advanced. `rivet apply` detects this and rejects the artifact to prevent re-exporting already-exported rows. Regenerate with `rivet plan`.
+
+### Examples
+
+```bash
+# Apply the plan
+rivet apply plan.json
+
+# Apply an old plan (override staleness check)
+rivet apply plan.json --force
+```
+
+### What apply does NOT do
+
+- Does not re-read the config file
+- Does not re-run preflight queries
+- Does not recompute chunk boundaries (uses pre-computed ranges from the artifact)
+- Does not enforce preflight verdict (diagnostics are advisory — see ADR-0005)
+
+### State location
+
+`rivet apply` opens `.rivet_state.db` from the directory containing the plan file. Place the plan file alongside the config file, or in the same directory, to ensure the correct state database is used.
+
+---
+
 ## `rivet check`
 
 Preflight analysis: diagnose source health, estimate row counts, check indexes, recommend tuning.

@@ -73,6 +73,21 @@ Expected output:
 [users_full] Reconciliation: MATCH (source=5432, exported=5432)
 ```
 
+**Optional: preview before executing.** Use `rivet plan` to inspect the execution plan without exporting any data:
+
+```bash
+rivet plan --config my_first_export.yaml
+```
+
+To save a sealed plan artifact and apply it separately (useful for CI/CD and auditable workflows):
+
+```bash
+rivet plan --config my_first_export.yaml --format json --output plan.json
+rivet apply plan.json
+```
+
+See [CLI reference — rivet plan/apply](../reference/cli.md) for details.
+
 ## Step 5: Inspect the output
 
 ```bash

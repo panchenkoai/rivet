@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::resolve::{parse_file_size, resolve_env_vars, resolve_vars};
 use crate::tuning::TuningConfig;
@@ -26,7 +26,7 @@ pub enum NotifyEvent {
     Degraded,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct SourceConfig {
     #[serde(rename = "type")]
     pub source_type: SourceType,
@@ -154,7 +154,7 @@ impl SourceConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum SourceType {
     Postgres,
@@ -242,7 +242,7 @@ impl ExportConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct QualityConfig {
     pub row_count_min: Option<usize>,
     pub row_count_max: Option<usize>,
@@ -252,7 +252,7 @@ pub struct QualityConfig {
     pub unique_columns: Vec<String>,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct MetaColumns {
     #[serde(default)]
     pub exported_at: bool,
@@ -285,14 +285,14 @@ pub enum ExportMode {
     TimeWindow,
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TimeColumnType {
     Timestamp,
     Unix,
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum FormatType {
     Parquet,
@@ -311,7 +311,7 @@ impl FormatType {
     }
 }
 
-#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CompressionType {
     #[default]
@@ -335,7 +335,7 @@ impl CompressionType {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DestinationConfig {
     #[serde(rename = "type")]
     pub destination_type: DestinationType,
@@ -352,7 +352,7 @@ pub struct DestinationConfig {
     pub allow_anonymous: bool,
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DestinationType {
     Local,

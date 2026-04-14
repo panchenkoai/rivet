@@ -241,6 +241,8 @@ rivet run --config <path> --validate               # verify row counts after wri
 rivet check --config <path>                        # preflight check all exports
 rivet check --config <path> --export <name>        # preflight check one export
 rivet doctor --config <path>                       # verify source + destination auth
+rivet plan --config <path> [--format json] [-o plan.json]  # generate sealed execution plan (no data exported)
+rivet apply plan.json [--force]                    # execute a pre-generated plan artifact
 rivet state show --config <path>                   # show cursor state
 rivet state reset --config <path> --export <name>  # reset cursor
 rivet state files --config <path>                  # show file manifest (which run created which files)

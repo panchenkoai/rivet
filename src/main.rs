@@ -104,6 +104,32 @@ enum Commands {
         #[arg(short, long)]
         output: Option<String>,
     },
+    /// Generate an execution plan artifact (no data exported)
+    Plan {
+        /// Path to YAML config file
+        #[arg(short, long)]
+        config: String,
+        /// Plan only a specific export by name
+        #[arg(short, long)]
+        export: Option<String>,
+        /// Query parameter: key=value (repeatable)
+        #[arg(short, long = "param", value_name = "KEY=VALUE")]
+        params: Vec<String>,
+        /// Write plan JSON to this file (default: print summary to stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+        /// Output format: "pretty" (human summary) or "json" (machine-readable)
+        #[arg(long, default_value = "pretty")]
+        format: PlanFormat,
+    },
+    /// Execute a previously-generated plan artifact
+    Apply {
+        /// Path to plan JSON file produced by `rivet plan`
+        plan_file: String,
+        /// Skip staleness check (allow plans older than 24 h)
+        #[arg(long)]
+        force: bool,
+    },
     /// Show export metrics history
     Metrics {
         /// Path to YAML config file
@@ -158,6 +184,14 @@ enum StateAction {
         #[arg(short, long)]
         export: String,
     },
+}
+
+#[derive(clap::ValueEnum, Clone)]
+enum PlanFormat {
+    /// Human-readable summary printed to stdout
+    Pretty,
+    /// Pretty-printed JSON (written to --output file or stdout)
+    Json,
 }
 
 fn parse_params(raw: &[String]) -> std::collections::HashMap<String, String> {
@@ -219,6 +253,24 @@ fn main() -> Result<()> {
                 schema.as_deref(),
                 output.as_deref(),
             )?;
+        }
+        Commands::Plan {
+            config,
+            export,
+            params,
+            output,
+            format,
+        } => {
+            let p = parse_params(&params);
+            let p = if p.is_empty() { None } else { Some(p) };
+            let fmt = match format {
+                PlanFormat::Pretty => pipeline::PlanOutputFormat::Pretty,
+                PlanFormat::Json => pipeline::PlanOutputFormat::Json(output),
+            };
+            pipeline::run_plan_command(&config, export.as_deref(), p.as_ref(), fmt)?;
+        }
+        Commands::Apply { plan_file, force } => {
+            pipeline::run_apply_command(&plan_file, force)?;
         }
         Commands::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "rivet", &mut std::io::stdout());

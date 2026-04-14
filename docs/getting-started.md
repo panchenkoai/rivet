@@ -220,3 +220,4 @@ rivet state files --config my_export.yaml
 - Configure your destination: [destinations/](destinations/)
 - Tune for your workload: [reference/tuning.md](reference/tuning.md)
 - Full config reference: [reference/config.md](reference/config.md)
+- Auditable execution (plan/apply for CI/CD and pre-reviewed runs): [reference/cli.md](reference/cli.md#rivet-plan)

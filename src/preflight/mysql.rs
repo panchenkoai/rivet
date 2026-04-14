@@ -16,6 +16,17 @@ pub(super) fn check_mysql(url: &str, exports: &[&ExportConfig]) -> Result<()> {
     Ok(())
 }
 
+/// Diagnose a single export without printing — used by `rivet plan`.
+pub(super) fn diagnose_export_mysql(
+    url: &str,
+    export: &ExportConfig,
+) -> Result<super::ExportDiagnostic> {
+    let pool = mysql::Pool::new(mysql::Opts::from_url(url)?)?;
+    let mut conn = pool.get_conn()?;
+    let db_max_connections = fetch_max_connections_mysql(&mut conn);
+    diagnose_mysql(&mut conn, export, db_max_connections)
+}
+
 fn fetch_max_connections_mysql(conn: &mut mysql::PooledConn) -> Option<u32> {
     use mysql::prelude::Queryable;
     let val: u64 = conn.query_first("SELECT @@max_connections").ok()??;

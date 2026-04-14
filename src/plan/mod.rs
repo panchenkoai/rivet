@@ -1,5 +1,7 @@
+pub mod artifact;
 pub mod validate;
 
+pub use artifact::{ComputedPlanData, PlanArtifact, PlanDiagnostics, StalenessCheck};
 pub use validate::{DiagnosticLevel, validate_plan};
 
 // Re-export value types so pipeline modules import from `crate::plan`, not `crate::config`.
@@ -13,6 +15,8 @@ pub use crate::config::{
 use std::collections::HashMap;
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
 use crate::config::{Config, ExportConfig, ExportMode};
 use crate::error::Result;
 use crate::tuning::{SourceTuning, TuningProfile, merge_tuning_config};
@@ -22,7 +26,7 @@ use crate::tuning::{SourceTuning, TuningProfile, merge_tuning_config};
 /// All execution decisions are derived before the pipeline starts.
 /// Pipeline modules must not read raw config structures or CLI flags
 /// once `build_plan` completes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedRunPlan {
     pub export_name: String,
     /// Final query string (params substituted, query_file loaded).
@@ -47,7 +51,7 @@ pub struct ResolvedRunPlan {
 }
 
 /// Extraction strategy and all parameters needed to execute it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExtractionStrategy {
     Snapshot,
     Incremental {
@@ -188,7 +192,7 @@ pub fn build_time_window_query(
 }
 
 /// Parameters for chunked extraction, pre-resolved from config and tuning.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkedPlan {
     pub column: String,
     pub chunk_size: usize,

@@ -1,7 +1,7 @@
 use arrow::datatypes::{DataType, SchemaRef};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceTuning {
     pub batch_size: usize,
     pub batch_size_memory_mb: Option<usize>,
@@ -14,7 +14,7 @@ pub struct SourceTuning {
     configured_profile: TuningProfile,
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TuningProfile {
     Fast,
@@ -22,7 +22,7 @@ pub enum TuningProfile {
     Safe,
 }
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct TuningConfig {
     pub profile: Option<TuningProfile>,
     pub batch_size: Option<usize>,
