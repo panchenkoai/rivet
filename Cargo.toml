@@ -33,7 +33,12 @@ parquet = { version = "58", features = ["arrow", "zstd", "lz4", "flate2"] }
 clap_complete = "4"
 postgres = "0.19"
 postgres-native-tls = "0.5"
-native-tls = "0.2"
+# `vendored` statically links OpenSSL on Linux so `cargo install rivet-cli` works
+# on bare systems and our cross-compiled aarch64-unknown-linux-gnu release
+# builds don't need `libssl-dev`. On macOS `native-tls` uses the system
+# `SecureTransport` framework and the `vendored` flag is a no-op — no OpenSSL
+# is ever compiled or linked there.
+native-tls = { version = "0.2", features = ["vendored"] }
 rand = "0.10"
 postgres-types = { version = "0.2", features = ["with-chrono-0_4"] }
 rusqlite = { version = "0.39", features = ["bundled"] }
