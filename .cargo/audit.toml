@@ -46,5 +46,4 @@ ignore = [
     # `log::set_logger`. The unsafe path is unreachable.
     # Action: drop once upstream PR https://github.com/rust-random/rand/pull/1763
     # lands and crates we depend on pick up the fix.
-    "RUSTSEC-2026-0097",
 ]
