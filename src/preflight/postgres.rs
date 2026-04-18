@@ -1,10 +1,15 @@
 use super::ExportDiagnostic;
 use super::analysis::*;
-use crate::config::{ExportConfig, ExportMode};
+use super::cursor_expr::incremental_key_expr;
+use crate::config::{ExportConfig, ExportMode, SourceType, TlsConfig};
 use crate::error::Result;
 
-pub(super) fn check_postgres(url: &str, exports: &[&ExportConfig]) -> Result<()> {
-    let mut client = postgres::Client::connect(url, postgres::NoTls)?;
+pub(super) fn check_postgres(
+    url: &str,
+    tls: Option<&TlsConfig>,
+    exports: &[&ExportConfig],
+) -> Result<()> {
+    let mut client = crate::source::postgres::connect_client(url, tls)?;
     let db_max_connections = fetch_max_connections_pg(&mut client);
 
     for export in exports {
@@ -18,9 +23,10 @@ pub(super) fn check_postgres(url: &str, exports: &[&ExportConfig]) -> Result<()>
 /// Diagnose a single export without printing — used by `rivet plan`.
 pub(super) fn diagnose_export_pg(
     url: &str,
+    tls: Option<&TlsConfig>,
     export: &ExportConfig,
 ) -> Result<super::ExportDiagnostic> {
-    let mut client = postgres::Client::connect(url, postgres::NoTls)?;
+    let mut client = crate::source::postgres::connect_client(url, tls)?;
     let db_max_connections = fetch_max_connections_pg(&mut client);
     diagnose_pg(&mut client, export, db_max_connections)
 }
@@ -62,15 +68,36 @@ fn diagnose_pg(
         .as_deref()
         .or(export.cursor_column.as_deref());
 
-    let effective_query = if let Some(col) = &export.cursor_column {
-        format!("SELECT * FROM ({}) AS _rivet ORDER BY {}", base_query, col)
+    let effective_query = if let Some(order) = incremental_key_expr(export, SourceType::Postgres) {
+        format!(
+            "SELECT * FROM ({}) AS _rivet ORDER BY {}",
+            base_query, order
+        )
     } else {
         base_query.to_string()
     };
 
     let row_estimate = estimate_rows_pg(client, &effective_query);
 
-    let (range_min, range_max) = if let Some(col) = range_col {
+    let (range_min, range_max) = if export.mode == ExportMode::Incremental {
+        if let Some(expr) = incremental_key_expr(export, SourceType::Postgres) {
+            let range_query = format!(
+                "SELECT min({expr})::text, max({expr})::text FROM ({base}) AS _rivet",
+                expr = expr,
+                base = base_query,
+            );
+            match client.query(&range_query, &[]) {
+                Ok(rows) if !rows.is_empty() => {
+                    let min_val: Option<String> = rows[0].get(0);
+                    let max_val: Option<String> = rows[0].get(1);
+                    (min_val, max_val)
+                }
+                _ => (None, None),
+            }
+        } else {
+            (None, None)
+        }
+    } else if let Some(col) = range_col {
         get_cursor_range_pg(client, base_query, col)
     } else {
         (None, None)

@@ -78,7 +78,7 @@ fn check_stdout_chunked(diags: &mut Vec<Diagnostic>, plan: &ResolvedRunPlan) {
 /// `incremental + reconcile` — reconcile runs COUNT(*) on the full base query but only
 /// new rows (since the cursor) are exported; the count will always appear mismatched.
 fn check_incremental_reconcile(diags: &mut Vec<Diagnostic>, plan: &ResolvedRunPlan) {
-    if plan.reconcile && matches!(&plan.strategy, ExtractionStrategy::Incremental { .. }) {
+    if plan.reconcile && matches!(&plan.strategy, ExtractionStrategy::Incremental(_)) {
         diags.push(Diagnostic {
             level: DiagnosticLevel::Warning,
             rule: "incremental-reconcile-mismatch",
@@ -167,11 +167,20 @@ fn check_stdout_manifest(diags: &mut Vec<Diagnostic>, plan: &ResolvedRunPlan) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::IncrementalCursorMode;
     use crate::config::{SourceConfig, SourceType};
     use crate::plan::{
         ChunkedPlan, CompressionType, DestinationConfig, DestinationType, ExtractionStrategy,
-        FormatType, MetaColumns, QualityConfig, ResolvedRunPlan,
+        FormatType, IncrementalCursorPlan, MetaColumns, QualityConfig, ResolvedRunPlan,
     };
+
+    fn incremental_simple() -> ExtractionStrategy {
+        ExtractionStrategy::Incremental(IncrementalCursorPlan {
+            primary_column: "updated_at".into(),
+            fallback_column: None,
+            mode: IncrementalCursorMode::SingleColumn,
+        })
+    }
     use crate::tuning::SourceTuning;
 
     fn base_plan() -> ResolvedRunPlan {
@@ -216,6 +225,7 @@ mod tests {
                 password_env: None,
                 database: None,
                 tuning: None,
+                tls: None,
             },
         }
     }
@@ -309,9 +319,7 @@ mod tests {
     #[test]
     fn incremental_with_reconcile_warns() {
         let mut p = base_plan();
-        p.strategy = ExtractionStrategy::Incremental {
-            cursor_column: "updated_at".into(),
-        };
+        p.strategy = incremental_simple();
         p.reconcile = true;
         let diags = validate_plan(&p);
         assert!(
@@ -521,9 +529,7 @@ mod tests {
     #[test]
     fn matrix_m5_incremental_local_no_flags_is_clean() {
         let mut p = base_plan();
-        p.strategy = ExtractionStrategy::Incremental {
-            cursor_column: "updated_at".into(),
-        };
+        p.strategy = incremental_simple();
         assert!(
             validate_plan(&p).is_empty(),
             "incremental + local must produce no diagnostics"
@@ -569,9 +575,7 @@ mod tests {
     #[test]
     fn matrix_m10_stdout_incremental_degraded_manifest_only() {
         let mut p = stdout_plan();
-        p.strategy = ExtractionStrategy::Incremental {
-            cursor_column: "updated_at".into(),
-        };
+        p.strategy = incremental_simple();
         let diags = validate_plan(&p);
         assert!(
             diags.iter().any(|d| d.rule == "stdout-manifest-phantom"),
@@ -676,9 +680,7 @@ mod tests {
     #[test]
     fn matrix_m18_incremental_with_resume_warns() {
         let mut p = base_plan();
-        p.strategy = ExtractionStrategy::Incremental {
-            cursor_column: "updated_at".into(),
-        };
+        p.strategy = incremental_simple();
         p.resume = true;
         let diags = validate_plan(&p);
         assert!(
@@ -695,9 +697,7 @@ mod tests {
     #[test]
     fn matrix_m20_stdout_incremental_reconcile_fires_warning_and_degraded() {
         let mut p = stdout_plan();
-        p.strategy = ExtractionStrategy::Incremental {
-            cursor_column: "updated_at".into(),
-        };
+        p.strategy = incremental_simple();
         p.reconcile = true;
         let diags = validate_plan(&p);
         assert!(

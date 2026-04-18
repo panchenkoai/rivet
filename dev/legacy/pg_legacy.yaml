@@ -1,0 +1,51 @@
+# Compatibility smoke test against a legacy Postgres (12/13/14/15).
+#
+# Run as:
+#   DATABASE_URL="postgresql://rivet:rivet@localhost:5412/rivet" \
+#     cargo run --release --bin rivet -- run -c dev/legacy/pg_legacy.yaml --validate --reconcile
+#
+# The port is baked into DATABASE_URL (5412/5413/5414/5415) so a single YAML
+# drives every legacy release.
+source:
+  type: postgres
+  url_env: DATABASE_URL
+  tuning:
+    profile: balanced
+
+exports:
+  - name: legacy_users_full
+    query: "SELECT id, name, email, age, balance, is_active, created_at, updated_at FROM users"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/legacy/output
+
+  - name: legacy_orders_chunked
+    query: "SELECT id, user_id, product, quantity, price, status, ordered_at, updated_at FROM orders"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 5000
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/legacy/output
+
+  - name: legacy_orders_incremental
+    query: "SELECT id, user_id, product, quantity, price, ordered_at, updated_at FROM orders"
+    mode: incremental
+    cursor_column: updated_at
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/legacy/output
+
+  - name: legacy_events_timewindow
+    query: "SELECT id, user_id, event_type, payload::text AS payload, ip_address, created_at FROM events"
+    mode: time_window
+    time_column: created_at
+    days_window: 7
+    format: csv
+    destination:
+      type: local
+      path: ./dev/legacy/output

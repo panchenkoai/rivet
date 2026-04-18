@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::plan::ResolvedRunPlan;
 
+use super::prioritization::{CampaignRecommendation, ExportRecommendation};
+
 /// Fully self-contained plan artifact written by `rivet plan` and consumed by
 /// `rivet apply`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +51,18 @@ pub struct PlanArtifact {
     pub computed: ComputedPlanData,
     /// Preflight diagnostics captured at plan time.
     pub diagnostics: PlanDiagnostics,
+    /// Advisory source-aware prioritization (ADR-0006). Does not affect execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prioritization: Option<PlanPrioritizationSnapshot>,
+}
+
+/// Per-export recommendation and optional multi-export campaign view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanPrioritizationSnapshot {
+    pub export_recommendation: ExportRecommendation,
+    /// Present when `rivet plan` runs on the full config with multiple exports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign: Option<CampaignRecommendation>,
 }
 
 /// Data computed during `rivet plan` that is reused at `rivet apply` time.
@@ -90,14 +104,29 @@ pub enum StalenessCheck {
 
 impl PlanArtifact {
     /// Build a new artifact with default TTL of 24 hours.
+    ///
+    /// **Credential redaction (ADR-0005 PA9):** before the resolved plan is embedded,
+    /// any plaintext `password` or credentials-in-URL are stripped via
+    /// [`crate::config::SourceConfig::redact_for_artifact`]. A warning is logged
+    /// when redaction runs so operators know to provide env/file creds at apply time.
     pub fn new(
         export_name: String,
         strategy: String,
         plan_fingerprint: String,
-        resolved_plan: ResolvedRunPlan,
+        mut resolved_plan: ResolvedRunPlan,
         computed: ComputedPlanData,
         diagnostics: PlanDiagnostics,
     ) -> Self {
+        let (safe_source, was_redacted) = resolved_plan.source.redact_for_artifact();
+        resolved_plan.source = safe_source;
+        if was_redacted {
+            log::warn!(
+                "plan '{}': plaintext credentials stripped from artifact — \
+                 apply time must have equivalent env/file-based auth available",
+                export_name
+            );
+        }
+
         let created_at = Utc::now();
         Self {
             rivet_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -110,6 +139,7 @@ impl PlanArtifact {
             resolved_plan,
             computed,
             diagnostics,
+            prioritization: None,
         }
     }
 
@@ -211,6 +241,37 @@ impl PlanArtifact {
             }
         }
 
+        if let Some(ref p) = self.prioritization {
+            println!(
+                "  Priority   : score {} — {:?} (wave {})",
+                p.export_recommendation.priority_score,
+                p.export_recommendation.priority_class,
+                p.export_recommendation.recommended_wave
+            );
+            if p.export_recommendation.isolate_on_source {
+                println!("  Isolate    : yes (shared source advisory)");
+            }
+            if !p.export_recommendation.reasons.is_empty() {
+                println!("  Prioritize :");
+                for r in &p.export_recommendation.reasons {
+                    println!("    • [{}] {}", r.kind.as_str(), r.message);
+                }
+            }
+            if let Some(ref c) = p.campaign {
+                if c.source_group_warnings.is_empty() {
+                    println!(
+                        "  Campaign   : {} export(s) ordered by advisory score",
+                        c.ordered_exports.len()
+                    );
+                } else {
+                    println!("  Campaign   :");
+                    for w in &c.source_group_warnings {
+                        println!("    • {}", w);
+                    }
+                }
+            }
+        }
+
         // destination
         let dest = &self.resolved_plan.destination;
         let dest_label = dest.destination_type.label();
@@ -305,6 +366,7 @@ mod tests {
                 password_env: None,
                 database: None,
                 tuning: None,
+                tls: None,
             },
         }
     }
@@ -417,5 +479,68 @@ mod tests {
         assert_eq!(super::format_rows(1000), "1,000");
         assert_eq!(super::format_rows(1_000_000), "1,000,000");
         assert_eq!(super::format_rows(42), "42");
+    }
+
+    // ─── ADR-0005 PA9 — artifact credential redaction (end-to-end) ──────
+
+    #[test]
+    fn artifact_strips_plaintext_password_from_source() {
+        let mut plan = minimal_plan();
+        plan.source.password = Some("s3cret!".into());
+        let artifact = PlanArtifact::new(
+            "orders".into(),
+            "full".into(),
+            String::new(),
+            plan,
+            ComputedPlanData {
+                chunk_ranges: vec![],
+                chunk_count: 0,
+                cursor_snapshot: None,
+                row_estimate: None,
+            },
+            PlanDiagnostics {
+                verdict: "Efficient".into(),
+                warnings: vec![],
+                recommended_profile: "balanced".into(),
+            },
+        );
+        assert_eq!(
+            artifact.resolved_plan.source.password, None,
+            "plaintext password must never leave the process"
+        );
+        let json = artifact.to_json_pretty().unwrap();
+        assert!(
+            !json.contains("s3cret"),
+            "secret must not appear anywhere in the JSON"
+        );
+    }
+
+    #[test]
+    fn artifact_strips_credentials_from_url() {
+        let mut plan = minimal_plan();
+        plan.source.url = Some("postgresql://rivet:s3cret@db.example.com/prod".into());
+        let artifact = PlanArtifact::new(
+            "orders".into(),
+            "full".into(),
+            String::new(),
+            plan,
+            ComputedPlanData {
+                chunk_ranges: vec![],
+                chunk_count: 0,
+                cursor_snapshot: None,
+                row_estimate: None,
+            },
+            PlanDiagnostics {
+                verdict: "Efficient".into(),
+                warnings: vec![],
+                recommended_profile: "balanced".into(),
+            },
+        );
+        let url = artifact.resolved_plan.source.url.as_deref().unwrap();
+        assert!(
+            !url.contains("s3cret"),
+            "password must not remain in URL: {url}"
+        );
+        assert!(url.contains("REDACTED@db.example.com/prod"));
     }
 }

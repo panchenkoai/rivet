@@ -1,0 +1,41 @@
+# Compatibility smoke test against MySQL 5.7.
+#
+# Run as:
+#   DATABASE_URL="mysql://rivet:rivet@localhost:3357/rivet" \
+#     cargo run --release --bin rivet -- run -c dev/legacy/mysql_legacy.yaml --validate --reconcile
+#
+# The `time_window` export is intentionally omitted for MySQL 5.7 if the seeded
+# events table is empty — full/chunked/incremental are the core compat surface.
+source:
+  type: mysql
+  url_env: DATABASE_URL
+  tuning:
+    profile: balanced
+
+exports:
+  - name: legacy_users_full
+    query: "SELECT id, name, email, age, balance, is_active, created_at, updated_at FROM users"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/legacy/output
+
+  - name: legacy_orders_chunked
+    query: "SELECT id, user_id, product, quantity, price, status, ordered_at, updated_at FROM orders"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 5000
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/legacy/output
+
+  - name: legacy_orders_incremental
+    query: "SELECT id, user_id, product, quantity, price, ordered_at, updated_at FROM orders"
+    mode: incremental
+    cursor_column: updated_at
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/legacy/output

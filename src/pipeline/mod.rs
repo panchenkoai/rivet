@@ -12,6 +12,8 @@ mod cli;
 pub mod journal;
 mod plan_cmd;
 pub(crate) mod progress;
+mod reconcile_cmd;
+mod repair_cmd;
 mod retry;
 mod single;
 mod sink;
@@ -23,9 +25,11 @@ pub use apply_cmd::run_apply_command;
 pub use chunked::generate_chunks;
 pub use cli::{
     reset_chunk_checkpoint, reset_state, show_chunk_checkpoint, show_files, show_metrics,
-    show_state,
+    show_progression, show_state,
 };
 pub use plan_cmd::{PlanOutputFormat, run_plan_command};
+pub use reconcile_cmd::{ReconcileOutputFormat, run_reconcile_command};
+pub use repair_cmd::{RepairOutputFormat, RepairReportSource, run_repair_command};
 #[allow(unused_imports)]
 pub use retry::classify_error;
 // build_time_window_query moved to crate::plan; re-exported here for integration tests.
@@ -113,10 +117,11 @@ fn run_chunked_quality_gate(
 /// Run `SELECT COUNT(*) FROM ({query})` against the source and compare with exported rows.
 /// Skips reconciliation for incremental exports that used a cursor (moving target).
 fn reconcile_source_count(plan: &ResolvedRunPlan, summary: &mut RunSummary) {
-    if matches!(plan.strategy, ExtractionStrategy::Incremental { .. }) {
+    if let Some(col) = plan.strategy.cursor_column() {
         log::info!(
-            "reconcile: skipping for incremental export '{}' (cursor-based, count may differ)",
-            plan.export_name
+            "reconcile: skipping for incremental export '{}' (cursor column '{}', count may differ)",
+            plan.export_name,
+            col
         );
         return;
     }
@@ -715,6 +720,7 @@ mod tests {
                 password_env: None,
                 database: None,
                 tuning: None,
+                tls: None,
             },
         }
     }

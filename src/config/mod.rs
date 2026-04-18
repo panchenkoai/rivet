@@ -1,6 +1,8 @@
+pub mod cursor;
 mod models;
 pub mod resolve;
 
+pub use cursor::IncrementalCursorMode;
 pub use models::*;
 #[allow(unused_imports)]
 pub(crate) use resolve::resolve_env_vars;
@@ -30,7 +32,7 @@ impl Config {
         params: Option<&std::collections::HashMap<String, String>>,
     ) -> crate::error::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
-        let resolved = resolve_vars(&contents, params);
+        let resolved = resolve_vars(&contents, params)?;
         Self::from_yaml(&resolved)
     }
 
@@ -268,6 +270,24 @@ impl Config {
                             "export '{}': incremental mode requires cursor_column",
                             export.name
                         );
+                    }
+                    match export.incremental_cursor_mode {
+                        IncrementalCursorMode::Coalesce => {
+                            if export.cursor_fallback_column.is_none() {
+                                anyhow::bail!(
+                                    "export '{}': incremental_cursor_mode: coalesce requires cursor_fallback_column",
+                                    export.name
+                                );
+                            }
+                        }
+                        IncrementalCursorMode::SingleColumn => {
+                            if export.cursor_fallback_column.is_some() {
+                                anyhow::bail!(
+                                    "export '{}': cursor_fallback_column is only valid with incremental_cursor_mode: coalesce",
+                                    export.name
+                                );
+                            }
+                        }
                     }
                 }
                 ExportMode::Chunked => {

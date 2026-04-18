@@ -65,6 +65,14 @@ struct Args {
     /// Rows per INSERT for `orders_sparse` (keep ≤ few thousand if max_allowed_packet / statement size is tight)
     #[arg(long, default_value = "5000")]
     sparse_chunk_batch_size: usize,
+
+    /// Number of rows in `orders_coalesce` (composite-cursor demo with NULL updated_at)
+    #[arg(long, default_value = "2000")]
+    coalesce_rows: usize,
+
+    /// Fraction of `orders_coalesce` rows with NULL `updated_at` (range 0.0..1.0)
+    #[arg(long, default_value = "0.35")]
+    coalesce_null_ratio: f64,
 }
 
 const FIRST_NAMES: &[&str] = &[
@@ -248,9 +256,10 @@ fn seed_postgres(args: &Args) -> Result<()> {
         .context("failed to connect to PostgreSQL")?;
 
     ensure_orders_sparse_pg(&mut client)?;
+    ensure_orders_coalesce_pg(&mut client)?;
 
     client.execute(
-        "TRUNCATE orders_sparse, content_items, page_views, events, orders, users RESTART IDENTITY CASCADE",
+        "TRUNCATE orders_coalesce, orders_sparse, content_items, page_views, events, orders, users RESTART IDENTITY CASCADE",
         &[],
     )?;
 
@@ -303,6 +312,15 @@ fn seed_postgres(args: &Args) -> Result<()> {
             t.elapsed().as_secs_f64()
         );
     }
+
+    let t = Instant::now();
+    let n = seed_pg_orders_coalesce(&mut client, args)?;
+    println!(
+        "  orders_coalesce: {:>8} rows in {:.1}s (NULL ratio ~{:.0}%)",
+        n,
+        t.elapsed().as_secs_f64(),
+        args.coalesce_null_ratio * 100.0,
+    );
 
     Ok(())
 }
@@ -476,8 +494,10 @@ fn seed_mysql(args: &Args) -> Result<()> {
     let mut conn = pool.get_conn()?;
 
     ensure_orders_sparse_mysql(&mut conn)?;
+    ensure_orders_coalesce_mysql(&mut conn)?;
 
     conn.query_drop("SET FOREIGN_KEY_CHECKS = 0")?;
+    conn.query_drop("TRUNCATE TABLE orders_coalesce")?;
     conn.query_drop("TRUNCATE TABLE orders_sparse")?;
     conn.query_drop("TRUNCATE TABLE content_items")?;
     conn.query_drop("TRUNCATE TABLE page_views")?;
@@ -535,6 +555,15 @@ fn seed_mysql(args: &Args) -> Result<()> {
             t.elapsed().as_secs_f64()
         );
     }
+
+    let t = Instant::now();
+    let n = seed_mysql_orders_coalesce(&mut conn, args)?;
+    println!(
+        "  orders_coalesce: {:>8} rows in {:.1}s (NULL ratio ~{:.0}%)",
+        n,
+        t.elapsed().as_secs_f64(),
+        args.coalesce_null_ratio * 100.0,
+    );
 
     Ok(())
 }
@@ -1414,10 +1443,28 @@ fn ensure_orders_sparse_mysql(conn: &mut mysql::PooledConn) -> Result<()> {
     payload TEXT NOT NULL
 )",
     )?;
-    conn.query_drop(
-        "CREATE OR REPLACE VIEW orders_sparse_for_export AS
+    // `ROW_NUMBER() OVER (...)` requires MySQL 8.0 — on 5.7 the CREATE VIEW
+    // would fail with `ERROR 1064`. Detect via `SELECT VERSION()` and skip.
+    let version: String = conn
+        .query_first::<String, _>("SELECT VERSION()")
+        .unwrap_or(None)
+        .unwrap_or_default();
+    let supports_windows = !version.starts_with("5.");
+    if supports_windows {
+        conn.query_drop(
+            "CREATE OR REPLACE VIEW orders_sparse_for_export AS
 SELECT id, payload, ROW_NUMBER() OVER (ORDER BY id) AS chunk_rownum FROM orders_sparse",
-    )?;
+        )?;
+    } else {
+        eprintln!(
+            "  note: MySQL {} has no window functions — skipping `orders_sparse_for_export` view",
+            if version.is_empty() {
+                "<unknown>"
+            } else {
+                &version
+            },
+        );
+    }
     Ok(())
 }
 
@@ -1475,4 +1522,177 @@ fn seed_mysql_sparse_only(args: &Args) -> Result<()> {
         println!("  COUNT / MIN(id) / MAX(id): {} / {:?} / {:?}", cnt, lo, hi);
     }
     Ok(())
+}
+
+// ─── Composite-cursor demo: `orders_coalesce` (ADR-0007) ─────────
+
+fn ensure_orders_coalesce_pg(client: &mut postgres::Client) -> Result<()> {
+    client.batch_execute(
+        r#"
+CREATE TABLE IF NOT EXISTS orders_coalesce (
+    id BIGSERIAL PRIMARY KEY,
+    product VARCHAR(200) NOT NULL,
+    quantity INT NOT NULL,
+    price NUMERIC(10,2) NOT NULL,
+    updated_at TIMESTAMP,
+    created_at TIMESTAMP NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_orders_coalesce_updated_at ON orders_coalesce(updated_at);
+CREATE INDEX IF NOT EXISTS idx_orders_coalesce_created_at ON orders_coalesce(created_at);
+"#,
+    )?;
+    Ok(())
+}
+
+fn seed_pg_orders_coalesce(client: &mut postgres::Client, args: &Args) -> Result<usize> {
+    ensure_orders_coalesce_pg(client)?;
+    if args.coalesce_rows == 0 {
+        return Ok(0);
+    }
+    let mut rng = rand::rng();
+    let mut tx = client.transaction()?;
+
+    let mut batch = String::new();
+    let mut count = 0;
+    let null_ratio = args.coalesce_null_ratio.clamp(0.0, 1.0);
+
+    for i in 0..args.coalesce_rows {
+        let product = PRODUCTS[rng.random_range(0..PRODUCTS.len())].replace('\'', "''");
+        let quantity = rng.random_range(1..=10);
+        let price = rng.random_range(5.0..5000.0_f64);
+        // `created_at` always present; chosen sequentially so COALESCE progression is monotonic-ish.
+        let created = gen_timestamp(&mut rng, 2024, 2025);
+        let updated_is_null = rng.random_bool(null_ratio);
+        let updated_sql = if updated_is_null {
+            "NULL".to_string()
+        } else {
+            // Keep updated_at ≥ created_at so COALESCE prefers updated_at when present.
+            format!("'{}'", gen_timestamp(&mut rng, 2025, 2026))
+        };
+
+        if count == 0 {
+            batch.push_str(
+                "INSERT INTO orders_coalesce (product, quantity, price, updated_at, created_at) VALUES ",
+            );
+        } else {
+            batch.push(',');
+        }
+        write!(
+            batch,
+            "('{}', {}, {:.2}, {}, '{}')",
+            product, quantity, price, updated_sql, created
+        )?;
+        count += 1;
+
+        if count >= args.batch_size {
+            tx.batch_execute(&batch)?;
+            batch.clear();
+            count = 0;
+        }
+
+        #[allow(clippy::manual_is_multiple_of)]
+        if i > 0 && i % 10_000 == 0 {
+            eprint!("    orders_coalesce {}/{}\r", i, args.coalesce_rows);
+            std::io::stderr().flush().ok();
+        }
+    }
+
+    if count > 0 {
+        tx.batch_execute(&batch)?;
+    }
+    tx.commit()?;
+    if args.coalesce_rows > 10_000 {
+        eprintln!();
+    }
+    Ok(args.coalesce_rows)
+}
+
+fn ensure_orders_coalesce_mysql(conn: &mut mysql::PooledConn) -> Result<()> {
+    use mysql::prelude::*;
+    conn.query_drop(
+        r#"
+CREATE TABLE IF NOT EXISTS orders_coalesce (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    product VARCHAR(200) NOT NULL,
+    quantity INT NOT NULL,
+    price DECIMAL(10,2) NOT NULL,
+    updated_at DATETIME NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+)
+"#,
+    )?;
+    // MySQL `CREATE INDEX IF NOT EXISTS` requires 8.0.29+, so guard by information_schema lookup.
+    for (idx_name, col) in [
+        ("idx_orders_coalesce_updated_at", "updated_at"),
+        ("idx_orders_coalesce_created_at", "created_at"),
+    ] {
+        let exists: Option<i64> = conn.query_first(format!(
+            "SELECT 1 FROM information_schema.statistics \
+             WHERE table_schema = DATABASE() AND table_name = 'orders_coalesce' AND index_name = '{idx_name}' LIMIT 1"
+        ))?;
+        if exists.is_none() {
+            conn.query_drop(format!("CREATE INDEX {idx_name} ON orders_coalesce({col})"))?;
+        }
+    }
+    Ok(())
+}
+
+fn seed_mysql_orders_coalesce(conn: &mut mysql::PooledConn, args: &Args) -> Result<usize> {
+    use mysql::prelude::*;
+    ensure_orders_coalesce_mysql(conn)?;
+    if args.coalesce_rows == 0 {
+        return Ok(0);
+    }
+    let mut rng = rand::rng();
+
+    let mut batch = String::new();
+    let mut count = 0;
+    let null_ratio = args.coalesce_null_ratio.clamp(0.0, 1.0);
+
+    for i in 0..args.coalesce_rows {
+        let product = PRODUCTS[rng.random_range(0..PRODUCTS.len())].replace('\'', "''");
+        let quantity = rng.random_range(1..=10);
+        let price = rng.random_range(5.0..5000.0_f64);
+        let created = gen_timestamp(&mut rng, 2024, 2025);
+        let updated_is_null = rng.random_bool(null_ratio);
+        let updated_sql = if updated_is_null {
+            "NULL".to_string()
+        } else {
+            format!("'{}'", gen_timestamp(&mut rng, 2025, 2026))
+        };
+
+        if count == 0 {
+            batch.push_str(
+                "INSERT INTO orders_coalesce (product, quantity, price, updated_at, created_at) VALUES ",
+            );
+        } else {
+            batch.push(',');
+        }
+        write!(
+            batch,
+            "('{}', {}, {:.2}, {}, '{}')",
+            product, quantity, price, updated_sql, created
+        )?;
+        count += 1;
+
+        if count >= args.batch_size {
+            conn.query_drop(&batch)?;
+            batch.clear();
+            count = 0;
+        }
+
+        #[allow(clippy::manual_is_multiple_of)]
+        if i > 0 && i % 10_000 == 0 {
+            eprint!("    orders_coalesce {}/{}\r", i, args.coalesce_rows);
+            std::io::stderr().flush().ok();
+        }
+    }
+
+    if count > 0 {
+        conn.query_drop(&batch)?;
+    }
+    if args.coalesce_rows > 10_000 {
+        eprintln!();
+    }
+    Ok(args.coalesce_rows)
 }

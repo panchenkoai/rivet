@@ -2,6 +2,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use super::IncrementalCursorMode;
 use super::resolve::{parse_file_size, resolve_env_vars, resolve_vars};
 use crate::tuning::TuningConfig;
 
@@ -44,9 +45,107 @@ pub struct SourceConfig {
 
     #[serde(default)]
     pub tuning: Option<TuningConfig>,
+
+    /// Transport security settings (ADR: SecOps). When absent, Rivet connects
+    /// without TLS — a warning is emitted so operators are aware. See [`TlsConfig`].
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+}
+
+/// Transport security for the source database connection.
+///
+/// Credentials and exported data cross the wire on every connection; without TLS
+/// they are visible to anyone on the network path (cloud inter-VPC, cross-AZ, or
+/// a compromised upstream). The default for all new connections is
+/// [`TlsMode::Require`] when `tls:` is present; setting `tls: { mode: disable }`
+/// is explicit opt-out.
+///
+/// ```yaml
+/// source:
+///   type: postgres
+///   url_env: DATABASE_URL
+///   tls:
+///     mode: verify-full
+///     ca_file: /etc/ssl/certs/rds-ca-2019-root.pem
+/// ```
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct TlsConfig {
+    /// Enforcement level. See [`TlsMode`].
+    #[serde(default)]
+    pub mode: TlsMode,
+    /// PEM-encoded CA certificate to trust for server verification. Required
+    /// for [`TlsMode::VerifyCa`] and [`TlsMode::VerifyFull`] against a private CA.
+    pub ca_file: Option<String>,
+    /// Accept certificates not chained to a trusted CA. Dangerous — disables
+    /// server authentication — and only honored when explicitly `true`.
+    #[serde(default)]
+    pub accept_invalid_certs: bool,
+    /// Accept certificates whose subjectAltName does not match the connection
+    /// hostname. Dangerous — disables hostname verification.
+    #[serde(default)]
+    pub accept_invalid_hostnames: bool,
+}
+
+/// TLS enforcement mode, mirroring libpq's `sslmode` semantics where possible.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum TlsMode {
+    /// Plaintext. Use only inside trusted networks (loopback, cgroup-private).
+    Disable,
+    /// Require a TLS handshake; accept the server certificate without verifying
+    /// issuer or hostname. Protects against passive sniffing, not MITM.
+    Require,
+    /// TLS + verify certificate chains to the configured / system trust store.
+    /// Does not check hostname (useful for IP-addressed or internal names).
+    VerifyCa,
+    /// TLS + verify chain **and** hostname against the server cert's SAN/CN.
+    /// Recommended default for production.
+    #[default]
+    VerifyFull,
+}
+
+impl TlsMode {
+    pub fn is_enforced(self) -> bool {
+        !matches!(self, TlsMode::Disable)
+    }
 }
 
 impl SourceConfig {
+    /// Return a copy of this config with **all plaintext credential material stripped**,
+    /// safe to embed in a persisted [`crate::plan::PlanArtifact`] (ADR-0005 PA9).
+    ///
+    /// Redaction rules:
+    /// - `password` → always `None` (plaintext password never leaves the process).
+    /// - `url` containing `user[:password]@` → userinfo segment replaced with `"REDACTED"`.
+    /// - `url_env`, `url_file`, `password_env` — kept (env var **names** and file paths
+    ///   are references, not secrets; `apply` needs them to re-resolve credentials).
+    /// - `host`, `port`, `user`, `database` — kept (structured connection metadata).
+    ///
+    /// If a plaintext `password` or `url` is redacted, callers should surface a warning
+    /// to the operator so env/file-based auth is available at apply time.
+    pub fn redact_for_artifact(&self) -> (Self, bool) {
+        let mut out = self.clone();
+        let mut redacted = false;
+
+        if out.password.is_some() {
+            out.password = None;
+            redacted = true;
+        }
+
+        if let Some(ref raw) = out.url
+            && let Some((userinfo_end, scheme_end)) = find_userinfo(raw)
+        {
+            let mut s = String::with_capacity(raw.len());
+            s.push_str(&raw[..scheme_end]); // "postgresql://"
+            s.push_str("REDACTED");
+            s.push_str(&raw[userinfo_end..]); // "@host:port/db…"
+            out.url = Some(s);
+            redacted = true;
+        }
+
+        (out, redacted)
+    }
+
     pub(crate) fn has_structured_fields(&self) -> bool {
         self.host.is_some()
             || self.user.is_some()
@@ -73,20 +172,26 @@ impl SourceConfig {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("source: structured config requires 'database'"))?;
 
-        let password = match (&self.password, &self.password_env) {
-            (Some(_), Some(_)) => {
-                anyhow::bail!("source: specify 'password' or 'password_env', not both");
-            }
-            (Some(p), None) => {
-                log::warn!(
-                    "source config contains plaintext password -- consider using password_env"
-                );
-                resolve_env_vars(p)
-            }
-            (None, Some(env)) => std::env::var(env)
-                .map_err(|_| anyhow::anyhow!("source: env var '{}' not set (password_env)", env))?,
-            (None, None) => String::new(),
-        };
+        // SecOps: keep the plaintext password inside a `Zeroizing<String>` until it
+        // is spliced into the final URL, so the standalone password buffer is
+        // wiped on drop (the final URL still lives as a plain String but is
+        // shorter-lived and dropped by the driver constructor).
+        let password: zeroize::Zeroizing<String> =
+            zeroize::Zeroizing::new(match (&self.password, &self.password_env) {
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("source: specify 'password' or 'password_env', not both");
+                }
+                (Some(p), None) => {
+                    log::warn!(
+                        "source config contains plaintext password -- consider using password_env"
+                    );
+                    resolve_env_vars(p)?
+                }
+                (None, Some(env)) => std::env::var(env).map_err(|_| {
+                    anyhow::anyhow!("source: env var '{}' not set (password_env)", env)
+                })?,
+                (None, None) => String::new(),
+            });
 
         let default_port = match self.source_type {
             SourceType::Postgres => 5432,
@@ -107,7 +212,12 @@ impl SourceConfig {
         } else {
             Ok(format!(
                 "{}://{}:{}@{}:{}/{}",
-                scheme, user, password, host, port, database
+                scheme,
+                user,
+                password.as_str(),
+                host,
+                port,
+                database
             ))
         }
     }
@@ -137,7 +247,7 @@ impl SourceConfig {
             ),
         };
 
-        let resolved = resolve_env_vars(&raw);
+        let resolved = resolve_env_vars(&raw)?;
 
         if resolved.contains('@')
             && resolved.contains(':')
@@ -161,6 +271,26 @@ pub enum SourceType {
     Mysql,
 }
 
+/// Locate `user[:password]@` userinfo inside a standard URL.
+///
+/// Returns `(userinfo_end_index, scheme_end_index)` where:
+/// - `scheme_end_index` points right after `"://"` (start of userinfo)
+/// - `userinfo_end_index` points at the `@` separator (exclusive of `@`)
+///
+/// Returns `None` if the URL has no userinfo segment.
+fn find_userinfo(raw: &str) -> Option<(usize, usize)> {
+    let scheme = raw.find("://")? + 3;
+    let rest = &raw[scheme..];
+    let at = rest.find('@')?;
+    // `@` must appear before the path/query start so we don't match `?foo=a@b` etc.
+    if let Some(path) = rest.find('/')
+        && path < at
+    {
+        return None;
+    }
+    Some((scheme + at, scheme))
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct ExportConfig {
     pub name: String,
@@ -170,6 +300,12 @@ pub struct ExportConfig {
     #[serde(default = "default_mode")]
     pub mode: ExportMode,
     pub cursor_column: Option<String>,
+    /// Secondary column for [`IncrementalCursorMode::Coalesce`] only (see ADR-0007).
+    #[serde(default)]
+    pub cursor_fallback_column: Option<String>,
+    /// How primary (and optional fallback) columns drive incremental progression.
+    #[serde(default)]
+    pub incremental_cursor_mode: IncrementalCursorMode,
     pub chunk_column: Option<String>,
     #[serde(default)]
     pub chunk_dense: bool,
@@ -199,6 +335,13 @@ pub struct ExportConfig {
     pub chunk_max_attempts: Option<u32>,
     #[serde(default)]
     pub tuning: Option<TuningConfig>,
+    /// Optional logical group for shared source capacity (replica, host). Advisory prioritization only.
+    #[serde(default)]
+    pub source_group: Option<String>,
+    /// Hint (Epic C / ADR-0006) that this export should always be treated as reconcile-heavy
+    /// by planning, independent of the `--reconcile` CLI flag. Advisory only.
+    #[serde(default)]
+    pub reconcile_required: bool,
 }
 
 impl ExportConfig {
@@ -216,7 +359,7 @@ impl ExportConfig {
         match (&self.query, &self.query_file) {
             (Some(q), None) => {
                 if params.is_some() {
-                    Ok(resolve_vars(q, params))
+                    resolve_vars(q, params)
                 } else {
                     Ok(q.clone())
                 }
@@ -224,7 +367,7 @@ impl ExportConfig {
             (None, Some(file)) => {
                 let path = config_dir.join(file);
                 let raw = std::fs::read_to_string(&path)?;
-                Ok(resolve_vars(&raw, params))
+                resolve_vars(&raw, params)
             }
             (Some(_), Some(_)) => {
                 anyhow::bail!(

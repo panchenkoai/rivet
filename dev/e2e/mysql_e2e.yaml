@@ -1,6 +1,9 @@
 source:
   type: mysql
-  url: "mysql://rivet:rivet@localhost:3306/rivet"
+  # URL comes from $RIVET_MYSQL_URL — `run_e2e.sh` points this at the primary
+  # mysql (3306) by default and the legacy matrix can re-target it at 3357
+  # (mysql:5.7) without touching this file.
+  url_env: RIVET_MYSQL_URL
   tuning:
     profile: fast
 

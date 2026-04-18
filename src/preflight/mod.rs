@@ -1,4 +1,5 @@
 mod analysis;
+pub(crate) mod cursor_expr;
 mod doctor;
 mod mysql;
 mod postgres;
@@ -62,9 +63,10 @@ pub(crate) fn get_export_diagnostic(
     export: &ExportConfig,
 ) -> Result<ExportDiagnostic> {
     let url = config.source.resolve_url()?;
+    let tls = config.source.tls.as_ref();
     match config.source.source_type {
-        SourceType::Postgres => postgres::diagnose_export_pg(&url, export),
-        SourceType::Mysql => mysql::diagnose_export_mysql(&url, export),
+        SourceType::Postgres => postgres::diagnose_export_pg(&url, tls, export),
+        SourceType::Mysql => mysql::diagnose_export_mysql(&url, tls, export),
     }
 }
 
@@ -87,9 +89,10 @@ pub fn check(
     };
 
     let url = config.source.resolve_url()?;
+    let tls = config.source.tls.as_ref();
     match config.source.source_type {
-        SourceType::Postgres => postgres::check_postgres(&url, &exports)?,
-        SourceType::Mysql => mysql::check_mysql(&url, &exports)?,
+        SourceType::Postgres => postgres::check_postgres(&url, tls, &exports)?,
+        SourceType::Mysql => mysql::check_mysql(&url, tls, &exports)?,
     }
 
     Ok(())
@@ -143,7 +146,7 @@ mod tests {
     use super::*;
     use crate::config::{
         CompressionType, DestinationConfig, DestinationType, ExportConfig, ExportMode, FormatType,
-        MetaColumns, TimeColumnType,
+        IncrementalCursorMode, MetaColumns, TimeColumnType,
     };
     use doctor::{categorize_dest_error, categorize_source_error};
 
@@ -154,6 +157,8 @@ mod tests {
             query_file: None,
             mode,
             cursor_column: cursor.map(|s| s.to_string()),
+            cursor_fallback_column: None,
+            incremental_cursor_mode: IncrementalCursorMode::SingleColumn,
             chunk_column: None,
             chunk_size: 100_000,
             parallel: 1,
@@ -185,6 +190,8 @@ mod tests {
             tuning: None,
             chunk_dense: false,
             chunk_by_days: None,
+            source_group: None,
+            reconcile_required: false,
         }
     }
 

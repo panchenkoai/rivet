@@ -4,9 +4,22 @@
 # Requires: both DBs seeded (cargo run --bin seed -- --target postgres --users 500 ...)
 #
 # Usage: bash dev/e2e/run_e2e.sh
+#
+# Re-targeting to a different server (e.g. a legacy container):
+#     RIVET_PG_URL=postgresql://rivet:rivet@localhost:5412/rivet \
+#     RIVET_MYSQL_URL=mysql://rivet:rivet@localhost:3357/rivet \
+#         bash dev/e2e/run_e2e.sh
+#
+# The e2e YAMLs use `url_env: RIVET_PG_URL` / `url_env: RIVET_MYSQL_URL`, so one
+# suite drives every PG/MySQL version the team supports.
 
 set -uo pipefail
 cd "$(dirname "$0")/../.."
+
+# Default URLs — overridable via env so the legacy compat matrix can re-point
+# the same suite at any version without editing YAMLs.
+export RIVET_PG_URL="${RIVET_PG_URL:-postgresql://rivet:rivet@localhost:5432/rivet}"
+export RIVET_MYSQL_URL="${RIVET_MYSQL_URL:-mysql://rivet:rivet@localhost:3306/rivet}"
 
 RIVET="${RIVET:-cargo run --release --bin rivet --}"
 OUT="dev/e2e/output"
@@ -256,8 +269,19 @@ echo "$_resume_err" | grep -qi "no in-progress" && pass "recovery chunked resume
 # Re-run without resume should succeed (full re-export)
 $RIVET run --config dev/e2e/pg_recovery_e2e.yaml --export recovery_chunked_ckpt --reconcile >/dev/null 2>&1 && pass "recovery chunked re-export" || fail "recovery chunked re-export"
 
-# Metrics should show entries for recovery exports
-$RIVET metrics --config dev/e2e/pg_recovery_e2e.yaml --last 10 2>&1 | grep -q "recovery_full" && pass "recovery metrics entries" || fail "recovery metrics entries"
+# Metrics should show entries for recovery exports. Filter to `recovery_full`
+# explicitly so the assertion doesn't race with an unrelated later run pushing
+# it out of `--last 10`. The brief sleep gives SQLite's WAL a moment to flush
+# the last chunked-ckpt run's metric row before we read it back.
+sleep 0.5
+_metrics_out=$($RIVET metrics --config dev/e2e/pg_recovery_e2e.yaml --export recovery_full --last 10 2>&1)
+if echo "$_metrics_out" | grep -q "recovery_full"; then
+    pass "recovery metrics entries"
+else
+    fail "recovery metrics entries"
+    echo "DEBUG: metrics output was:"
+    echo "$_metrics_out"
+fi
 
 # ──────────────────────────────────────────────────────────────
 section "13. Config validation (misplaced fields)"
@@ -265,7 +289,7 @@ section "13. Config validation (misplaced fields)"
 _err=$($RIVET run --config /dev/stdin 2>&1 <<'YAML' || true
 source:
   type: postgres
-  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+  url_env: RIVET_PG_URL
   batch_size: 1000
 exports:
   - name: t
@@ -285,7 +309,7 @@ section "14. Preflight — connection limit warnings"
 _out=$($RIVET check --config /dev/stdin 2>&1 <<'YAML'
 source:
   type: postgres
-  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+  url_env: RIVET_PG_URL
 exports:
   - name: check_conn_safe
     query: "SELECT id FROM users"
@@ -307,7 +331,7 @@ echo "$_out" | grep -qi "meets or exceeds\|check skipped" \
 _out=$($RIVET check --config /dev/stdin 2>&1 <<'YAML'
 source:
   type: postgres
-  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+  url_env: RIVET_PG_URL
 exports:
   - name: check_conn_high
     query: "SELECT id FROM users"
@@ -333,7 +357,7 @@ if $mysql_ok; then
     _out=$($RIVET check --config /dev/stdin 2>&1 <<'YAML'
 source:
   type: mysql
-  url: "mysql://rivet:rivet@localhost:3306/rivet"
+  url_env: RIVET_MYSQL_URL
 exports:
   - name: mysql_check_conn_safe
     query: "SELECT id FROM users"
@@ -355,7 +379,7 @@ YAML
     _out=$($RIVET check --config /dev/stdin 2>&1 <<'YAML'
 source:
   type: mysql
-  url: "mysql://rivet:rivet@localhost:3306/rivet"
+  url_env: RIVET_MYSQL_URL
 exports:
   - name: mysql_check_conn_high
     query: "SELECT id FROM users"
@@ -401,7 +425,7 @@ echo "$_out" | grep -qi "date-chunked" \
 _out=$($RIVET run --config /dev/stdin 2>&1 <<'YAML'
 source:
   type: postgres
-  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+  url_env: RIVET_PG_URL
 exports:
   - name: invalid_date_dense
     query: "SELECT id, ordered_at FROM orders"
@@ -444,8 +468,11 @@ INIT_TMP="dev/e2e/.init_e2e_scratch"
 rm -rf "$INIT_TMP"
 mkdir -p "$INIT_TMP"
 
-PG_INIT_URL="postgresql://rivet:rivet@localhost:5432/rivet?sslmode=disable"
-MY_INIT_URL="mysql://rivet:rivet@localhost:3306/rivet"
+# `rivet init` takes the URL on the CLI. Use the suite's RIVET_PG_URL /
+# RIVET_MYSQL_URL so this section retargets cleanly when the legacy matrix
+# overrides them.
+PG_INIT_URL="$RIVET_PG_URL"
+MY_INIT_URL="$RIVET_MYSQL_URL"
 
 $RIVET init --source "$PG_INIT_URL" --table users -o "$INIT_TMP/pg_users.yaml" >/dev/null 2>&1 \
     && pass "PG init: single table (users)" \

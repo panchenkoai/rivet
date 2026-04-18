@@ -1,6 +1,9 @@
 source:
   type: postgres
-  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+  # URL comes from $RIVET_PG_URL so the same suite can be pointed at any server
+  # (docker-compose `postgres` on 5432, or `postgres-12/13/14/15` on 5412/…/5415
+  # under the `legacy` profile). `run_e2e.sh` sets a default if unset.
+  url_env: RIVET_PG_URL
   tuning:
     profile: fast
 

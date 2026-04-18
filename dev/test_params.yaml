@@ -1,6 +1,6 @@
 source:
   type: postgres
-  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+  url_env: RIVET_PG_URL
 
 exports:
   - name: users_parameterized

@@ -3,6 +3,8 @@
 /dev/output/*
 /dev/e2e/output/*
 /dev/e2e/.init_e2e_scratch/
+/dev/legacy/output/
+/dev/legacy/.init_*.yaml
 .cursor/
 .vscode/
 rivet-gcs-sa.json

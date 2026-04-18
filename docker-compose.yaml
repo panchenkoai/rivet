@@ -15,6 +15,80 @@ services:
       timeout: 3s
       retries: 10
 
+  # ---- Legacy Postgres versions (compatibility testing) ---------------------
+  # Opt in via `docker compose --profile legacy up -d`. Each listens on a
+  # non-default port so they coexist with the primary `postgres` service.
+  # The same `init.sql` is used — it intentionally avoids features newer than
+  # Postgres 11 so every supported version can run it.
+
+  postgres-12:
+    image: postgres:12
+    profiles: ["legacy"]
+    environment:
+      POSTGRES_USER: rivet
+      POSTGRES_PASSWORD: rivet
+      POSTGRES_DB: rivet
+    ports:
+      - "5412:5432"
+    volumes:
+      - ./dev/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rivet"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres-13:
+    image: postgres:13
+    profiles: ["legacy"]
+    environment:
+      POSTGRES_USER: rivet
+      POSTGRES_PASSWORD: rivet
+      POSTGRES_DB: rivet
+    ports:
+      - "5413:5432"
+    volumes:
+      - ./dev/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rivet"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres-14:
+    image: postgres:14
+    profiles: ["legacy"]
+    environment:
+      POSTGRES_USER: rivet
+      POSTGRES_PASSWORD: rivet
+      POSTGRES_DB: rivet
+    ports:
+      - "5414:5432"
+    volumes:
+      - ./dev/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rivet"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres-15:
+    image: postgres:15
+    profiles: ["legacy"]
+    environment:
+      POSTGRES_USER: rivet
+      POSTGRES_PASSWORD: rivet
+      POSTGRES_DB: rivet
+    ports:
+      - "5415:5432"
+    volumes:
+      - ./dev/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rivet"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   mysql:
     image: mysql:8.0
     environment:
@@ -26,6 +100,37 @@ services:
       - "3306:3306"
     volumes:
       - ./dev/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-privet"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ---- Legacy MySQL ---------------------------------------------------------
+  # MySQL 5.7 is EOL (Oct 2023) but still widely deployed. Use mysql_native_password
+  # as the default auth plugin so older clients (and the `mysql` Rust crate's
+  # pre-caching-sha2 path) connect without tweaks. Listens on 3357.
+
+  mysql-57:
+    image: mysql:5.7
+    profiles: ["legacy"]
+    # MySQL 5.7 has no official arm64 image; run it under x86_64 emulation on
+    # Apple Silicon hosts. Native amd64 hosts ignore this field.
+    platform: linux/amd64
+    command:
+      - "--default-authentication-plugin=mysql_native_password"
+      - "--max-allowed-packet=67108864"
+    environment:
+      MYSQL_ROOT_PASSWORD: rivet
+      MYSQL_USER: rivet
+      MYSQL_PASSWORD: rivet
+      MYSQL_DATABASE: rivet
+    ports:
+      - "3357:3306"
+    volumes:
+      # Dedicated 5.7 init that skips MySQL 8-only features (window functions
+      # in `orders_sparse_for_export`). See dev/mysql/init_57.sql.
+      - ./dev/mysql/init_57.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-privet"]
       interval: 5s

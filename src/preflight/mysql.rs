@@ -1,10 +1,15 @@
 use super::ExportDiagnostic;
 use super::analysis::*;
-use crate::config::{ExportConfig, ExportMode};
+use super::cursor_expr::incremental_key_expr;
+use crate::config::{ExportConfig, ExportMode, SourceType, TlsConfig};
 use crate::error::Result;
 
-pub(super) fn check_mysql(url: &str, exports: &[&ExportConfig]) -> Result<()> {
-    let pool = mysql::Pool::new(mysql::Opts::from_url(url)?)?;
+pub(super) fn check_mysql(
+    url: &str,
+    tls: Option<&TlsConfig>,
+    exports: &[&ExportConfig],
+) -> Result<()> {
+    let pool = crate::source::mysql::connect_pool(url, tls)?;
     let mut conn = pool.get_conn()?;
     let db_max_connections = fetch_max_connections_mysql(&mut conn);
 
@@ -19,9 +24,10 @@ pub(super) fn check_mysql(url: &str, exports: &[&ExportConfig]) -> Result<()> {
 /// Diagnose a single export without printing — used by `rivet plan`.
 pub(super) fn diagnose_export_mysql(
     url: &str,
+    tls: Option<&TlsConfig>,
     export: &ExportConfig,
 ) -> Result<super::ExportDiagnostic> {
-    let pool = mysql::Pool::new(mysql::Opts::from_url(url)?)?;
+    let pool = crate::source::mysql::connect_pool(url, tls)?;
     let mut conn = pool.get_conn()?;
     let db_max_connections = fetch_max_connections_mysql(&mut conn);
     diagnose_mysql(&mut conn, export, db_max_connections)
@@ -59,8 +65,11 @@ fn diagnose_mysql(
     };
 
     let base_query = export.query.as_deref().unwrap_or("SELECT 1");
-    let effective_query = if let Some(col) = &export.cursor_column {
-        format!("SELECT * FROM ({}) AS _rivet ORDER BY {}", base_query, col)
+    let effective_query = if let Some(order) = incremental_key_expr(export, SourceType::Mysql) {
+        format!(
+            "SELECT * FROM ({}) AS _rivet ORDER BY {}",
+            base_query, order
+        )
     } else {
         base_query.to_string()
     };
@@ -86,7 +95,21 @@ fn diagnose_mysql(
         .as_deref()
         .or(export.cursor_column.as_deref());
 
-    let (range_min, range_max) = if let Some(col) = range_col {
+    let (range_min, range_max) = if export.mode == ExportMode::Incremental {
+        if let Some(expr) = incremental_key_expr(export, SourceType::Mysql) {
+            let range_query = format!(
+                "SELECT CAST(min({expr}) AS CHAR), CAST(max({expr}) AS CHAR) FROM ({base}) AS _rivet",
+                expr = expr,
+                base = base_query,
+            );
+            match conn.query_first::<(Option<String>, Option<String>), _>(&range_query) {
+                Ok(Some((min_v, max_v))) => (min_v, max_v),
+                _ => (None, None),
+            }
+        } else {
+            (None, None)
+        }
+    } else if let Some(col) = range_col {
         let range_query = format!(
             "SELECT CAST(min({col}) AS CHAR), CAST(max({col}) AS CHAR) FROM ({base}) AS _rivet",
             col = col,

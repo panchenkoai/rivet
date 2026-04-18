@@ -1,7 +1,31 @@
 pub mod artifact;
+pub mod campaign;
+pub mod history;
+pub mod inputs;
+pub mod prioritization;
+pub mod recommend;
+pub mod reconcile;
+pub mod repair;
 pub mod validate;
 
-pub use artifact::{ComputedPlanData, PlanArtifact, PlanDiagnostics, StalenessCheck};
+#[allow(unused_imports)]
+pub use history::{HistorySnapshot, LastStatus};
+
+pub use artifact::{
+    ComputedPlanData, PlanArtifact, PlanDiagnostics, PlanPrioritizationSnapshot, StalenessCheck,
+};
+#[allow(unused_imports)]
+pub use prioritization::{
+    CampaignRecommendation, CostClass, CursorQuality, ExportRecommendation, PrioritizationInputs,
+    PrioritizationStrategyKind, PriorityClass, RecommendationReason, RecommendationReasonKind,
+    RecommendedWave, RiskClass, SourceFreshnessHint, SourceGroupInfo,
+};
+#[allow(unused_imports)]
+pub use reconcile::{
+    PartitionKind, PartitionResult, PartitionStatus, ReconcileReport, ReconcileSummary,
+};
+#[allow(unused_imports)]
+pub use repair::{RepairAction, RepairOutcome, RepairPlan, RepairReport, RepairSummary};
 pub use validate::{DiagnosticLevel, validate_plan};
 
 // Re-export value types so pipeline modules import from `crate::plan`, not `crate::config`.
@@ -17,7 +41,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, ExportConfig, ExportMode};
+use crate::config::{Config, ExportConfig, ExportMode, IncrementalCursorMode};
 use crate::error::Result;
 use crate::tuning::{SourceTuning, TuningProfile, merge_tuning_config};
 
@@ -50,13 +74,32 @@ pub struct ResolvedRunPlan {
     pub source: SourceConfig,
 }
 
+/// Resolved incremental cursor semantics (Epic D / ADR-0007).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncrementalCursorPlan {
+    pub primary_column: String,
+    pub fallback_column: Option<String>,
+    pub mode: IncrementalCursorMode,
+}
+
+impl IncrementalCursorPlan {
+    /// Synthetic column name in the result set for [`IncrementalCursorMode::Coalesce`] (stripped before write).
+    pub const RIVET_COALESCE_CURSOR_COL: &'static str = "_rivet_coalesced_cursor";
+
+    /// Column to read when advancing stored cursor after export (primary name, or synthetic coalesce column).
+    pub fn column_for_storage_extract(&self) -> &str {
+        match self.mode {
+            IncrementalCursorMode::SingleColumn => self.primary_column.as_str(),
+            IncrementalCursorMode::Coalesce => Self::RIVET_COALESCE_CURSOR_COL,
+        }
+    }
+}
+
 /// Extraction strategy and all parameters needed to execute it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExtractionStrategy {
     Snapshot,
-    Incremental {
-        cursor_column: String,
-    },
+    Incremental(IncrementalCursorPlan),
     Chunked(ChunkedPlan),
     TimeWindow {
         column: String,
@@ -69,7 +112,7 @@ impl ExtractionStrategy {
     pub fn mode_label(&self) -> &'static str {
         match self {
             ExtractionStrategy::Snapshot => "full",
-            ExtractionStrategy::Incremental { .. } => "incremental",
+            ExtractionStrategy::Incremental(_) => "incremental",
             ExtractionStrategy::Chunked(_) => "chunked",
             ExtractionStrategy::TimeWindow { .. } => "timewindow",
         }
@@ -80,7 +123,7 @@ impl ExtractionStrategy {
     /// Only `Incremental` reads the last cursor value to build the WHERE clause
     /// inside the source driver.  All other strategies are stateless at query time.
     pub fn needs_cursor_state(&self) -> bool {
-        matches!(self, ExtractionStrategy::Incremental { .. })
+        matches!(self, ExtractionStrategy::Incremental(_))
     }
 
     /// True for strategies that spawn parallel worker threads during execution.
@@ -99,12 +142,26 @@ impl ExtractionStrategy {
         matches!(self, ExtractionStrategy::Chunked(cp) if cp.checkpoint)
     }
 
-    /// Returns the cursor column name for `Incremental` strategies, `None` otherwise.
-    ///
-    /// The source driver uses this to append a `WHERE <column> > <last_value>` clause.
+    /// Primary cursor column name for incremental exports (`None` for other strategies).
     pub fn cursor_column(&self) -> Option<&str> {
         match self {
-            ExtractionStrategy::Incremental { cursor_column } => Some(cursor_column.as_str()),
+            ExtractionStrategy::Incremental(p) => Some(p.primary_column.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Resolved incremental cursor plan when strategy is incremental.
+    pub fn incremental_plan(&self) -> Option<&IncrementalCursorPlan> {
+        match self {
+            ExtractionStrategy::Incremental(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Column name used to read the last cursor value from the final Arrow batch (may be synthetic).
+    pub fn cursor_extract_column(&self) -> Option<&str> {
+        match self {
+            ExtractionStrategy::Incremental(p) => Some(p.column_for_storage_extract()),
             _ => None,
         }
     }
@@ -126,7 +183,7 @@ impl ExtractionStrategy {
         source_type: crate::config::SourceType,
     ) -> Option<String> {
         match self {
-            ExtractionStrategy::Snapshot | ExtractionStrategy::Incremental { .. } => {
+            ExtractionStrategy::Snapshot | ExtractionStrategy::Incremental(_) => {
                 Some(base_query.to_string())
             }
             ExtractionStrategy::TimeWindow {
@@ -232,13 +289,19 @@ pub fn build_plan(
     let strategy = match export.mode {
         ExportMode::Full => ExtractionStrategy::Snapshot,
         ExportMode::Incremental => {
-            let cursor_column = export.cursor_column.clone().ok_or_else(|| {
+            let primary_column = export.cursor_column.clone().ok_or_else(|| {
                 anyhow::anyhow!(
                     "export '{}': incremental mode requires 'cursor_column'",
                     export.name
                 )
             })?;
-            ExtractionStrategy::Incremental { cursor_column }
+            let fallback_column = export.cursor_fallback_column.clone();
+            let mode = export.incremental_cursor_mode;
+            ExtractionStrategy::Incremental(IncrementalCursorPlan {
+                primary_column,
+                fallback_column,
+                mode,
+            })
         }
         ExportMode::Chunked => {
             let column = export.chunk_column.clone().ok_or_else(|| {
@@ -306,8 +369,8 @@ pub fn build_plan(
 mod tests {
     use super::*;
     use crate::config::{
-        CompressionType, DestinationConfig, DestinationType, FormatType, MetaColumns, SourceConfig,
-        SourceType,
+        CompressionType, DestinationConfig, DestinationType, FormatType, IncrementalCursorMode,
+        MetaColumns, SourceConfig, SourceType,
     };
 
     fn minimal_source_config() -> SourceConfig {
@@ -323,6 +386,7 @@ mod tests {
             password_env: None,
             database: None,
             tuning: None,
+            tls: None,
         }
     }
 
@@ -343,6 +407,8 @@ mod tests {
             query_file: None,
             mode: ExportMode::Full,
             cursor_column: None,
+            cursor_fallback_column: None,
+            incremental_cursor_mode: IncrementalCursorMode::SingleColumn,
             chunk_column: None,
             chunk_size: 100_000,
             chunk_dense: false,
@@ -374,6 +440,8 @@ mod tests {
             chunk_checkpoint: false,
             chunk_max_attempts: None,
             tuning: None,
+            source_group: None,
+            reconcile_required: false,
         }
     }
 
@@ -415,8 +483,9 @@ mod tests {
         )
         .unwrap();
         match &plan.strategy {
-            ExtractionStrategy::Incremental { cursor_column } => {
-                assert_eq!(cursor_column, "updated_at");
+            ExtractionStrategy::Incremental(p) => {
+                assert_eq!(p.primary_column, "updated_at");
+                assert_eq!(p.mode, IncrementalCursorMode::SingleColumn);
             }
             _ => panic!("expected Incremental"),
         }
@@ -558,9 +627,11 @@ mod tests {
 
     #[test]
     fn incremental_strategy_contracts() {
-        let s = ExtractionStrategy::Incremental {
-            cursor_column: "updated_at".into(),
-        };
+        let s = ExtractionStrategy::Incremental(IncrementalCursorPlan {
+            primary_column: "updated_at".into(),
+            fallback_column: None,
+            mode: IncrementalCursorMode::SingleColumn,
+        });
         assert!(s.needs_cursor_state());
         assert!(!s.is_resumable());
         assert_eq!(s.cursor_column(), Some("updated_at"));

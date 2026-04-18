@@ -81,15 +81,15 @@ pub fn doctor(config_path: &str) -> Result<()> {
 
 fn check_source_auth(config: &Config) -> Result<()> {
     let url = config.source.resolve_url()?;
+    let tls = config.source.tls.as_ref();
     match config.source.source_type {
         SourceType::Postgres => {
-            let mut client = postgres::Client::connect(&url, postgres::NoTls)?;
+            let mut client = crate::source::postgres::connect_client(&url, tls)?;
             client.simple_query("SELECT 1")?;
             Ok(())
         }
         SourceType::Mysql => {
-            let opts = mysql::Opts::from_url(&url)?;
-            let pool = mysql::Pool::new(opts)?;
+            let pool = crate::source::mysql::connect_pool(&url, tls)?;
             let mut conn = pool.get_conn()?;
             use mysql::prelude::Queryable;
             conn.query_drop("SELECT 1")?;

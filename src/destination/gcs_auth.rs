@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use zeroize::Zeroizing;
 
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
@@ -29,36 +30,47 @@ pub fn try_authorized_user_token() -> Result<Option<String>> {
         _ => return Ok(None),
     };
 
-    let data = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading ADC file {}", path.display()))?;
+    // SecOps: the raw ADC file contains a long-lived `refresh_token`; wipe the
+    // heap buffer as soon as parsing is done.
+    let data = Zeroizing::new(
+        std::fs::read_to_string(&path)
+            .with_context(|| format!("reading ADC file {}", path.display()))?,
+    );
     let fields =
         parse_adc_file(&data).with_context(|| format!("parsing ADC file {}", path.display()))?;
     let (client_id, client_secret, refresh_token) = match fields {
         Some(f) => f,
         None => return Ok(None),
     };
+    let client_secret = Zeroizing::new(client_secret);
+    let refresh_token = Zeroizing::new(refresh_token);
 
     log::info!("GCS: refreshing access token from ADC authorized_user credentials");
 
-    let body = format!(
+    // SecOps: the POST body carries `client_secret` and `refresh_token` in clear
+    // form-urlencoded. Wrap so the heap buffer is zeroed after the request is
+    // dispatched, and so accidental `Debug` logging of the builder does not leak.
+    let body = Zeroizing::new(format!(
         "grant_type=refresh_token&client_id={}&client_secret={}&refresh_token={}",
         urlenc(&client_id),
         urlenc(&client_secret),
         urlenc(&refresh_token),
-    );
+    ));
 
     let client = reqwest::blocking::Client::new();
     let resp = client
         .post(GOOGLE_TOKEN_URL)
         .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(body)
+        .body(body.as_str().to_string())
         .send()
         .context("ADC token refresh request failed")?;
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().unwrap_or_default();
-        anyhow::bail!("ADC token refresh failed (HTTP {}): {}", status, body);
+        // Do NOT surface the raw response body: Google's OAuth error responses
+        // echo back the submitted `client_id` / `client_secret` in some failure
+        // modes, which would end up in `summary.error_message` → SQLite / Slack.
+        anyhow::bail!("ADC token refresh failed (HTTP {})", status);
     }
 
     let token: TokenResponse = resp.json().context("parsing token response")?;

@@ -115,7 +115,12 @@ rivet completions fish > ~/.config/fish/completions/rivet.fish
 
 ## 2. Connect to your database
 
-Rivet supports PostgreSQL and MySQL. The simplest config uses a connection URL:
+Rivet supports **PostgreSQL 12–16** and **MySQL 5.7 / 8.0**. Every release is
+exercised against the full end-to-end suite on each of these versions — see
+[reference/compatibility.md](reference/compatibility.md) for the matrix and
+engine-specific notes.
+
+The simplest config uses a connection URL:
 
 ```yaml
 source:
@@ -230,8 +235,11 @@ rivet state files --config my_export.yaml
 
 ## Next steps
 
+- **Full pilot walkthrough** — discovery → chunked → reconcile → repair → verified: [pilot/pilot-walkthrough.md](pilot/pilot-walkthrough.md)
 - Choose the right export mode: [modes/](modes/)
 - Configure your destination: [destinations/](destinations/)
 - Tune for your workload: [reference/tuning.md](reference/tuning.md)
 - Full config reference: [reference/config.md](reference/config.md)
 - Auditable execution (plan/apply for CI/CD and pre-reviewed runs): [reference/cli.md](reference/cli.md#rivet-plan)
+- Partition-level reconcile and targeted repair: [reference/cli.md](reference/cli.md#rivet-reconcile) · [ADR-0009](adr/0009-reconcile-and-repair-contracts.md)
+- Committed / verified progression for operator dashboards: [ADR-0008](adr/0008-export-progression.md)

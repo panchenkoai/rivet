@@ -7,9 +7,12 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use mysql::prelude::*;
-use mysql::{Opts, Pool, Value};
+use mysql::{Opts, OptsBuilder, Pool, SslOpts, Value};
 
+use crate::config::{SourceType, TlsConfig, TlsMode};
 use crate::error::Result;
+use crate::plan::IncrementalCursorPlan;
+use crate::source::query::build_incremental_query;
 use crate::tuning::SourceTuning;
 use crate::types::CursorState;
 
@@ -18,24 +21,85 @@ pub struct MysqlSource {
 }
 
 impl MysqlSource {
+    /// Connect with no transport security (legacy path).
     pub fn connect(url: &str) -> Result<Self> {
         let opts = Opts::from_url(url)?;
         let pool = Pool::new(opts)?;
         Ok(Self { pool })
     }
+
+    /// Connect honoring the user's [`TlsConfig`].
+    pub fn connect_with_tls(url: &str, tls: Option<&TlsConfig>) -> Result<Self> {
+        match tls {
+            Some(cfg) if cfg.mode.is_enforced() => {
+                let base = Opts::from_url(url)?;
+                let ssl = build_mysql_ssl_opts(cfg);
+                let opts = Opts::from(OptsBuilder::from_opts(base).ssl_opts(Some(ssl)));
+                let pool = Pool::new(opts)?;
+                Ok(Self { pool })
+            }
+            _ => Self::connect(url),
+        }
+    }
+}
+
+/// Build a MySQL connection pool honoring the configured TLS policy.
+///
+/// Shared by preflight, doctor, init, and anywhere else we need a pool outside
+/// the `Source` trait. `tls = None` falls back to plaintext (legacy behavior).
+pub(crate) fn connect_pool(url: &str, tls: Option<&TlsConfig>) -> Result<Pool> {
+    match tls {
+        Some(cfg) if cfg.mode.is_enforced() => {
+            let base = Opts::from_url(url)?;
+            let ssl = build_mysql_ssl_opts(cfg);
+            let opts = Opts::from(OptsBuilder::from_opts(base).ssl_opts(Some(ssl)));
+            Ok(Pool::new(opts)?)
+        }
+        _ => Ok(Pool::new(Opts::from_url(url)?)?),
+    }
+}
+
+fn build_mysql_ssl_opts(cfg: &TlsConfig) -> SslOpts {
+    let mut ssl = SslOpts::default();
+    if let Some(path) = &cfg.ca_file {
+        ssl = ssl.with_root_cert_path(Some(std::path::PathBuf::from(path)));
+    }
+    match cfg.mode {
+        TlsMode::Require => {
+            ssl = ssl
+                .with_danger_accept_invalid_certs(true)
+                .with_danger_skip_domain_validation(true);
+        }
+        TlsMode::VerifyCa => {
+            ssl = ssl.with_danger_skip_domain_validation(true);
+        }
+        TlsMode::VerifyFull => {
+            // Strict: verify chain + hostname.
+        }
+        TlsMode::Disable => {
+            // Never invoked: gated in connect_with_tls.
+        }
+    }
+    if cfg.accept_invalid_certs {
+        ssl = ssl.with_danger_accept_invalid_certs(true);
+    }
+    if cfg.accept_invalid_hostnames {
+        ssl = ssl.with_danger_skip_domain_validation(true);
+    }
+    ssl
 }
 
 impl super::Source for MysqlSource {
     fn export(
         &mut self,
         query: &str,
-        cursor_column: Option<&str>,
+        incremental: Option<&IncrementalCursorPlan>,
         cursor: Option<&CursorState>,
         tuning: &SourceTuning,
         sink: &mut dyn super::BatchSink,
     ) -> Result<()> {
-        let effective_query = build_query(query, cursor_column, cursor);
-        log::info!("executing query: {}", effective_query);
+        let built = build_incremental_query(query, incremental, cursor, SourceType::Mysql);
+        log::debug!("executing query: {}", built.sql);
 
         let mut conn = self.pool.get_conn()?;
 
@@ -46,7 +110,14 @@ impl super::Source for MysqlSource {
             ))?;
         }
 
-        let mut result = conn.query_iter(&effective_query)?;
+        // SecOps: cursor value is bound via `exec_iter` rather than string-interpolated.
+        // Using `exec_iter` uniformly (even with empty params) keeps the match arms
+        // type-compatible — `query_iter` returns a Text-protocol result, `exec_iter`
+        // returns a Binary-protocol result.
+        let mut result = match built.cursor_param.as_deref() {
+            Some(val) => conn.exec_iter(&built.sql, (val,))?,
+            None => conn.exec_iter(&built.sql, ())?,
+        };
         let columns = result.columns().as_ref().to_vec();
         let schema = Arc::new(mysql_columns_to_schema(&columns));
         let arrow_types: Vec<DataType> = columns.iter().map(mysql_type_to_arrow).collect();
@@ -114,38 +185,6 @@ impl super::Source for MysqlSource {
             }
             None => Ok(None),
         }
-    }
-}
-
-pub(crate) fn build_query(
-    base_query: &str,
-    cursor_column: Option<&str>,
-    cursor: Option<&CursorState>,
-) -> String {
-    let has_cursor_value = cursor
-        .and_then(|c| c.last_cursor_value.as_deref())
-        .is_some();
-
-    if let (Some(col), true) = (cursor_column, has_cursor_value) {
-        let cursor_val = cursor
-            .expect("cursor checked above")
-            .last_cursor_value
-            .as_deref()
-            .expect("cursor value checked above");
-        format!(
-            "SELECT * FROM ({base}) AS _rivet WHERE {col} > '{val}' ORDER BY {col}",
-            base = base_query,
-            col = col,
-            val = cursor_val,
-        )
-    } else if let Some(col) = cursor_column {
-        format!(
-            "SELECT * FROM ({base}) AS _rivet ORDER BY {col}",
-            base = base_query,
-            col = col,
-        )
-    } else {
-        base_query.to_string()
     }
 }
 
@@ -397,43 +436,5 @@ fn build_array(
             }
             Ok(Arc::new(b.finish()))
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::CursorState;
-
-    #[test]
-    fn test_build_query_full() {
-        assert_eq!(
-            build_query("SELECT * FROM users", None, None),
-            "SELECT * FROM users"
-        );
-    }
-
-    #[test]
-    fn test_build_query_incremental_first_run() {
-        let c = CursorState {
-            export_name: "t".into(),
-            last_cursor_value: None,
-            last_run_at: None,
-        };
-        let q = build_query("SELECT * FROM users", Some("id"), Some(&c));
-        assert!(q.contains("ORDER BY id"));
-        assert!(!q.contains("WHERE"));
-    }
-
-    #[test]
-    fn test_build_query_incremental_with_cursor() {
-        let c = CursorState {
-            export_name: "t".into(),
-            last_cursor_value: Some("42".into()),
-            last_run_at: None,
-        };
-        let q = build_query("SELECT * FROM events", Some("id"), Some(&c));
-        assert!(q.contains("WHERE id > '42'"), "got: {}", q);
-        assert!(q.contains("ORDER BY id"));
     }
 }

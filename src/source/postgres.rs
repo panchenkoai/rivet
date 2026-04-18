@@ -9,7 +9,11 @@ use arrow::record_batch::RecordBatch;
 use postgres::types::Type;
 use postgres::{Client, NoTls, Row};
 
+use crate::config::{SourceType, TlsConfig};
 use crate::error::Result;
+use crate::plan::IncrementalCursorPlan;
+use crate::source::query::build_incremental_query;
+use crate::source::tls::build_native_tls;
 use crate::tuning::SourceTuning;
 use crate::types::CursorState;
 
@@ -18,9 +22,42 @@ pub struct PostgresSource {
 }
 
 impl PostgresSource {
+    /// Connect with no transport security (legacy path). Prefer [`Self::connect_with_tls`]
+    /// for production workloads so credentials and result sets are not visible on the wire.
     pub fn connect(url: &str) -> Result<Self> {
         let client = Client::connect(url, NoTls)?;
         Ok(Self { client })
+    }
+
+    /// Connect honoring the user's [`TlsConfig`]. When `tls.mode` is
+    /// [`TlsMode::Disable`] this falls back to [`Self::connect`].
+    pub fn connect_with_tls(url: &str, tls: Option<&TlsConfig>) -> Result<Self> {
+        match tls {
+            Some(cfg) if cfg.mode.is_enforced() => {
+                let connector = build_native_tls(cfg)?;
+                let make_tls = postgres_native_tls::MakeTlsConnector::new(connector);
+                let client = Client::connect(url, make_tls)?;
+                Ok(Self { client })
+            }
+            _ => Self::connect(url),
+        }
+    }
+}
+
+/// Open a bare `postgres::Client` honoring the configured TLS policy.
+///
+/// Shared by preflight, doctor, and init so every code path that connects to
+/// Postgres applies the same transport-security rules. `tls = None` or
+/// `mode: disable` falls back to the insecure `NoTls` transport — a warning is
+/// logged from `create_source` so operators know TLS is off.
+pub(crate) fn connect_client(url: &str, tls: Option<&TlsConfig>) -> Result<Client> {
+    match tls {
+        Some(cfg) if cfg.mode.is_enforced() => {
+            let connector = build_native_tls(cfg)?;
+            let make_tls = postgres_native_tls::MakeTlsConnector::new(connector);
+            Ok(Client::connect(url, make_tls)?)
+        }
+        _ => Ok(Client::connect(url, NoTls)?),
     }
 }
 
@@ -28,13 +65,17 @@ impl super::Source for PostgresSource {
     fn export(
         &mut self,
         query: &str,
-        cursor_column: Option<&str>,
+        incremental: Option<&IncrementalCursorPlan>,
         cursor: Option<&CursorState>,
         tuning: &SourceTuning,
         sink: &mut dyn super::BatchSink,
     ) -> Result<()> {
-        let effective_query = build_query(query, cursor_column, cursor);
-        log::info!("executing query: {}", effective_query);
+        let built = build_incremental_query(query, incremental, cursor, SourceType::Postgres);
+        debug_assert!(
+            built.cursor_param.is_none(),
+            "Postgres path inlines cursor values as E'…' literals — binding is unused"
+        );
+        log::debug!("executing query: {}", built.sql);
 
         if tuning.statement_timeout_s > 0 {
             self.client.batch_execute(&format!(
@@ -50,7 +91,7 @@ impl super::Source for PostgresSource {
         self.client.batch_execute("BEGIN")?;
         self.client.batch_execute(&format!(
             "DECLARE _rivet NO SCROLL CURSOR FOR {}",
-            effective_query
+            built.sql
         ))?;
 
         let mut fetch_size = tuning.batch_size;
@@ -147,38 +188,6 @@ impl super::Source for PostgresSource {
             return Ok(Some(v));
         }
         Ok(None)
-    }
-}
-
-pub(crate) fn build_query(
-    base_query: &str,
-    cursor_column: Option<&str>,
-    cursor: Option<&CursorState>,
-) -> String {
-    let has_cursor_value = cursor
-        .and_then(|c| c.last_cursor_value.as_deref())
-        .is_some();
-
-    if let (Some(col), true) = (cursor_column, has_cursor_value) {
-        let cursor_val = cursor
-            .expect("cursor checked above")
-            .last_cursor_value
-            .as_deref()
-            .expect("cursor value checked above");
-        format!(
-            "SELECT * FROM ({base}) AS _rivet WHERE {col} > '{val}' ORDER BY {col}",
-            base = base_query,
-            col = col,
-            val = cursor_val,
-        )
-    } else if let Some(col) = cursor_column {
-        format!(
-            "SELECT * FROM ({base}) AS _rivet ORDER BY {col}",
-            base = base_query,
-            col = col,
-        )
-    } else {
-        base_query.to_string()
     }
 }
 
@@ -350,45 +359,5 @@ fn build_array(pg_type: &Type, col_idx: usize, rows: &[Row]) -> Result<Arc<dyn A
             }
             Ok(Arc::new(b.finish()))
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::CursorState;
-
-    #[test]
-    fn test_build_query_full() {
-        let q = build_query("SELECT * FROM users", None, None);
-        assert_eq!(q, "SELECT * FROM users");
-    }
-
-    #[test]
-    fn test_build_query_incremental_first_run() {
-        let cursor = CursorState {
-            export_name: "t".into(),
-            last_cursor_value: None,
-            last_run_at: None,
-        };
-        let q = build_query("SELECT * FROM users", Some("updated_at"), Some(&cursor));
-        assert!(q.contains("ORDER BY updated_at"));
-        assert!(!q.contains("WHERE"));
-    }
-
-    #[test]
-    fn test_build_query_incremental_with_cursor() {
-        let cursor = CursorState {
-            export_name: "t".into(),
-            last_cursor_value: Some("2024-01-01T00:00:00".into()),
-            last_run_at: Some("2024-06-01".into()),
-        };
-        let q = build_query("SELECT * FROM orders", Some("updated_at"), Some(&cursor));
-        assert!(
-            q.contains("WHERE updated_at > '2024-01-01T00:00:00'"),
-            "got: {}",
-            q
-        );
-        assert!(q.contains("ORDER BY updated_at"));
     }
 }
