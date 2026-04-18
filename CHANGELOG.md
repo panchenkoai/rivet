@@ -1,5 +1,137 @@
 # Changelog
 
+## 0.3.2 (2026-04-18)
+
+SecOps audit follow-up plus an expanded database-version compatibility matrix.
+No YAML config is deserialized differently; no export artifact changes format.
+The one behavior change that could bite an existing config is the strict
+environment-variable resolver — see **Breaking changes** below.
+
+### Transport security — optional TLS for source connections
+
+New `source.tls` block (defaults to plaintext so existing configs are
+unchanged). Four modes, matching libpq semantics where it makes sense:
+
+```yaml
+source:
+  type: postgres
+  url_env: DATABASE_URL
+  tls:
+    mode: verify-full         # disable | require | verify-ca | verify-full
+    ca_file: /etc/ssl/certs/rds-ca-2019-root.pem
+    accept_invalid_certs: false
+    accept_invalid_hostnames: false
+```
+
+- Postgres via `postgres-native-tls` (new dep).
+- MySQL via `OptsBuilder::ssl_opts` (existing `mysql` crate).
+- When `tls` is absent Rivet emits one startup warn-level log — `credentials
+  and result rows cross the network in plaintext` — so operators aren't
+  silently on NoTls in prod.
+- On Linux, `native-tls` statically links vendored OpenSSL, so
+  `cargo install rivet-cli` works on a bare Ubuntu / Alpine / CI runner
+  without `libssl-dev`. macOS uses `SecureTransport` — no OpenSSL.
+
+### SecOps audit fixes
+
+Addresses the findings from the credential-leak review (see commit 08c16f2).
+
+- **Cursor values are no longer string-interpolated into SQL.** MySQL binds
+  the value via `?`; Postgres embeds it via a dedicated `E'…'` literal
+  helper (`escape_pg_literal`) that escapes both `'` and `\` regardless of
+  `standard_conforming_strings`. Injection-attempt tests (`'; DROP TABLE …`,
+  `O'Brien`, backslash payloads) now live in `src/source/query.rs`.
+- **AWS_PROFILE env mutation is serialized.** Parallel exports with
+  differing `aws_profile` values no longer race — a `static Mutex` plus an
+  RAII guard scopes the override and restores the previous value on drop.
+- **Secrets wrapped in `zeroize::Zeroizing<String>`:** AWS access/secret
+  keys, GCS `client_secret` / `refresh_token` / OAuth POST body, and the
+  resolved DB password. Heap buffers are zeroed on drop.
+- **GCS 4xx response body no longer propagates into anyhow errors.**
+  Google's `/token` endpoint occasionally echoes back `client_id` /
+  `client_secret` on failure; this was landing in `summary.error_message`
+  (SQLite) and Slack notifications.
+- **`executing query: …` lowered from `info` to `debug`** in both source
+  drivers, so `RUST_LOG=info` (the common CI / docs setting) no longer
+  surfaces SQL text that can contain `${VAR}`-expanded secrets.
+
+### `rivet init` — credentials off the command line
+
+New `--source-env <ENV_VAR>` and `--source-file <PATH>` accept the DB URL
+from an env var or a one-line file, keeping the credential out of shell
+history, `ps aux`, and `/proc/<pid>/cmdline`. Mutually exclusive with the
+existing `--source <URL>`, which stays supported for local dev.
+
+```
+rivet init --source-env DATABASE_URL --table orders -o orders.yaml
+rivet init --source-file ~/.rivet/source.url --schema public -o pg_all.yaml
+```
+
+### Database version compatibility matrix
+
+The full end-to-end suite now runs against every supported server version:
+
+| Engine     | Versions                   |
+|------------|----------------------------|
+| PostgreSQL | 12, 13, 14, 15, 16         |
+| MySQL      | 5.7, 8.0                   |
+
+Legacy servers opt in via `docker compose --profile legacy up -d`. Ports
+5412 / 5413 / 5414 / 5415 for PG 12–15; 3357 for MySQL 5.7 (amd64 platform
+on Apple Silicon). Run the full matrix with:
+
+```
+docker compose up -d postgres mysql minio fake-gcs
+docker compose --profile legacy up -d \
+    postgres-12 postgres-13 postgres-14 postgres-15 mysql-57
+cargo build --release --bin rivet --bin seed
+bash dev/legacy/run_full_matrix.sh
+```
+
+Seven targets × 83 e2e assertions = 581 per-version checks, all green.
+`dev/e2e/*.yaml` and `dev/test_*.yaml` now read their URL from
+`RIVET_PG_URL` / `RIVET_MYSQL_URL` (with localhost defaults) so the same
+suite re-targets cleanly without YAML edits.
+
+MySQL 5.7 compat notes (full details in `docs/reference/compatibility.md`):
+
+- `dev/mysql/init_57.sql` ships a view-free init because MySQL 5.7 lacks
+  window functions (`ROW_NUMBER() OVER (…)`); `seed` auto-detects 5.x
+  and skips the corresponding `CREATE VIEW`.
+- Probe uses bash `/dev/tcp/127.0.0.1/<port>` rather than `mysqladmin` —
+  Homebrew's `mysql-client@9` dropped the `mysql_native_password` plugin
+  library, so modern macOS clients can't connect to 5.7 servers, but the
+  Rust `mysql` crate (which Rivet depends on) still can.
+
+### Breaking changes
+
+- **Unset `${VAR}` in config is now a hard error.** Previously
+  `resolve_vars` silently substituted an empty string, so
+  `postgres://u:${DB_PASS}@host/db` with `DB_PASS` unexported would
+  become `postgres://u:@host/db` — a silent auth-bypass footgun. The
+  loader now refuses with a clear message. An explicit empty value
+  (`export DB_PASS=""`) is still accepted. Migrate by either setting the
+  variable or removing the reference; add an explicit empty assignment
+  only when you really mean "no password".
+
+### Docs
+
+- New `docs/reference/compatibility.md` — version-support policy, test
+  matrix, engine-specific notes (window functions, arm64 emulation, auth
+  plugins). Linked from `docs/README.md` and `docs/getting-started.md`.
+
+### Verification
+
+- `cargo test --lib` — 411 passed, 0 failed.
+- `cargo test --tests` (serial, live DBs) — 970 passed, 0 failed.
+- `dev/legacy/run_full_matrix.sh` (7 targets × 83) — 581 passed, 0 failed.
+- `dev/legacy/run_legacy.sh` (compat smoke) — 44 passed, 0 failed.
+- Demo pipelines — 12 PG + 8 MySQL exports succeeded.
+
+**Total: 2026 assertions, zero failures.**
+
+---
+
 ## 0.3.1 (2026-04-18)
 
 Security patch release — closes five advisories raised against `v0.3.0` by
