@@ -16,21 +16,21 @@ exports:
       path: /output             # matches -v $(pwd)/output:/output in Docker
 
   - name: orders_incremental
-    query: "SELECT id, user_id, total, status, updated_at FROM orders"
+    query: "SELECT id, user_id, product, quantity, price, status, updated_at FROM orders"
     mode: incremental
     cursor_column: updated_at
     format: csv
     destination:
       type: s3
-      bucket: my-data-lake
+      bucket: my-data-lake            # replace with your bucket
       prefix: exports/orders/
       region: us-east-1
 
-  - name: products
-    query: "SELECT id, name, price, category FROM products"
+  - name: content_items_full
+    query: "SELECT id, title, category, status, view_count, published_at, updated_at FROM content_items"
     mode: full
     format: parquet
     destination:
       type: gcs
-      bucket: my-gcs-bucket
-      prefix: exports/products/
+      bucket: my-gcs-bucket            # replace with your bucket
+      prefix: exports/content/

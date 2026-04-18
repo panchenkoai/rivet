@@ -24,7 +24,8 @@ See [reference/compatibility.md](reference/compatibility.md) for the version-sup
 | [Getting Started](getting-started.md) | Install Rivet, connect to your database, run your first export |
 | [Quickstart: Postgres](pilot/quickstart-postgres.md) | One-table export in 5 minutes (PostgreSQL) |
 | [Quickstart: MySQL](pilot/quickstart-mysql.md) | One-table export in 5 minutes (MySQL) |
-| [**Pilot walkthrough**](pilot/pilot-walkthrough.md) | **End-to-end pilot**: discovery → plan → chunked run → reconcile → repair → verified. Exercises all ADR contracts. |
+| [**Demo quickstart**](pilot/demo-quickstart.md) | **Scripted pilot demo** on pre-seeded 14-table fixture. Exercises prioritization, composite cursor, reconcile, repair, progression. ≈10 min. |
+| [Pilot walkthrough](pilot/pilot-walkthrough.md) | Conceptual end-to-end tour on your own data. |
 
 ## Export Modes
 

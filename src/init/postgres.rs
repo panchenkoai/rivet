@@ -30,6 +30,19 @@ pub(super) fn introspect(url: &str, schema: &str, table: &str) -> Result<TableIn
         .unwrap_or(0)
         .max(0);
 
+    // Physical size (heap + indexes); None for views and when privileges are missing.
+    let total_bytes: Option<i64> = client
+        .query_opt(
+            "SELECT pg_total_relation_size(c.oid)::bigint
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE c.relname = $1 AND n.nspname = $2 AND c.relkind IN ('r','p','m')",
+            &[&table, &schema],
+        )
+        .ok()
+        .flatten()
+        .and_then(|row| row.get::<_, Option<i64>>(0))
+        .filter(|v| *v > 0);
+
     // Primary key columns
     let pk_rows = client.query(
         "SELECT a.attname
@@ -43,9 +56,9 @@ pub(super) fn introspect(url: &str, schema: &str, table: &str) -> Result<TableIn
     let pk_cols: std::collections::HashSet<String> =
         pk_rows.iter().map(|r| r.get::<_, String>(0)).collect();
 
-    // Column metadata
+    // Column metadata — including NULL-ability (Epic B).
     let col_rows = client.query(
-        "SELECT column_name, data_type
+        "SELECT column_name, data_type, is_nullable
          FROM information_schema.columns
          WHERE table_schema = $1 AND table_name = $2
          ORDER BY ordinal_position",
@@ -64,11 +77,13 @@ pub(super) fn introspect(url: &str, schema: &str, table: &str) -> Result<TableIn
         .map(|row| {
             let name: String = row.get(0);
             let data_type: String = row.get(1);
+            let is_nullable_str: String = row.get(2);
             let is_primary_key = pk_cols.contains(&name);
             ColumnInfo {
                 name,
                 data_type,
                 is_primary_key,
+                is_nullable: is_nullable_str.eq_ignore_ascii_case("YES"),
             }
         })
         .collect();
@@ -77,6 +92,7 @@ pub(super) fn introspect(url: &str, schema: &str, table: &str) -> Result<TableIn
         schema: schema.to_string(),
         table: table.to_string(),
         row_estimate,
+        total_bytes,
         columns,
     })
 }

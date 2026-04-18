@@ -1,5 +1,65 @@
 # Changelog
 
+## 0.3.0 (2026-04-18)
+
+Source-aware planning release — Epics A–I plus credential-hardening follow-ups.
+
+### New features
+
+- **Source-aware extraction prioritization** (Epic A, [ADR-0006](docs/adr/0006-source-aware-prioritization.md)) — `rivet plan` now emits per-export `priority_score` / `priority_class` / `cost_class` / `risk_class` / `recommended_wave` plus explainable `reasons[]`. Multi-export plans embed a full campaign view with ordered exports, grouped waves, and `source_group` collision warnings. Pretty and JSON output.
+- **Metadata-driven discovery** (Epic B) — `rivet init --discover -o out.json` emits a machine-readable artifact with ranked cursor + chunk candidates, nullability, total bytes, and automatic `coalesce` fallback hints when the best cursor is NULL-able.
+- **Composite cursor** (Epic D, [ADR-0007](docs/adr/0007-cursor-policy-contracts.md)) — `incremental_cursor_mode: coalesce` progresses on `COALESCE(primary, fallback)` for tables with a nullable `updated_at`. Synthetic `_rivet_coalesced_cursor` column is stripped before Parquet/CSV write (CC5). Single-level SQL with outer `ORDER BY` so the last batch carries the max coalesced value (CC6).
+- **Partition / window reconciliation** (Epic F, [ADR-0009](docs/adr/0009-reconcile-and-repair-contracts.md)) — new `rivet reconcile -c <cfg> -e <export>` re-counts every chunk partition on the source and emits a structured `ReconcileReport`. Requires `chunk_checkpoint: true` (v1).
+- **Committed / verified progression** (Epic G, [ADR-0008](docs/adr/0008-export-progression.md)) — new schema v4 migration for `export_progression` table plus `rivet state progression` command that surfaces both boundaries per export.
+- **Targeted repair** (Epic H) — `rivet repair -c <cfg> -e <export> [--report rec.json] [--execute]` derives a `RepairPlan` from a `ReconcileReport` and re-runs only the flagged chunk ranges. New files land alongside originals; committed boundary is not re-stamped (RR4).
+- **Historical recommendation refinement** (Epic I) — `rivet plan` folds the last ~20 rows of `export_metrics` into scoring with bounded contribution (≤ ~15 points combined). Adds `high_retry_rate_history`, `recent_failure_history`, `slow_history` reason kinds.
+
+### Security / hardening
+
+- **PA9 — Artifact Credential Redaction** ([ADR-0005](docs/adr/0005-plan-apply-contracts.md#pa9--artifact-credential-redaction-acr)) — `PlanArtifact::new` silently strips plaintext `password:` and rewrites `scheme://user:pass@…` → `scheme://REDACTED@…` before serialization. Operators see a WARN log so they know to migrate to `password_env:` / `url_env:`.
+- Composite-cursor coalesce mode: `@` inside path/query strings is no longer confused with userinfo (dedicated path-aware parser).
+
+### Configuration additions
+
+- `exports[].source_group: <string>` — logical shared-source label driving campaign-level warnings (Epic A).
+- `exports[].reconcile_required: bool` — advisory flag feeding into prioritization risk class (Epic C).
+- `exports[].cursor_fallback_column`, `exports[].incremental_cursor_mode` — composite cursor policy (Epic D).
+
+### CLI additions
+
+- `rivet reconcile`
+- `rivet repair`
+- `rivet state progression`
+- `rivet init --discover`
+
+### Demo assets
+
+- `demo/setup_demo_tables.sql` + `demo/setup_demo_tables_mysql.sql` — reproducible 7-table fixture with varied scale (500 → 800k rows), nullable-cursor coalesce cases, and shared-source collisions.
+- `demo/demo_pipeline.yaml` / `demo_pipeline_mysql.yaml` — 12/8-export showcase configs with `source_group` declarations.
+- `docs/pilot/demo-quickstart.md` — 10-minute scripted pilot demo (discovery → plan → apply → reconcile → repair → verified).
+
+### Documentation
+
+- New ADRs: 0006 (prioritization), 0007 (cursor policy), 0008 (progression), 0009 (reconcile & repair).
+- New pilot guide: `docs/pilot/pilot-walkthrough.md` end-to-end on user data; `docs/pilot/demo-quickstart.md` for the pre-seeded demo.
+- New reference: `docs/modes/incremental-coalesce.md`.
+- Moved planning working docs into `docs/planning/`.
+- PRODUCT.md: v5 (plan/apply) + v6 (Epics A–I) + v6.1 (SecOps) sections.
+
+### Bug fixes
+
+- `ExportSink` was stripping the synthetic coalesce cursor column before capturing `last_batch`/`schema`, so incremental cursors never advanced in `coalesce` mode. Fixed by keeping the raw (with-synthetic) batch + schema for cursor extraction and building a stripped `dest_batch`/`dest_schema` on the fly for the file writer.
+- `on_schema` with an empty schema (zero-row runs) no longer errors when attempting to strip a missing synthetic column.
+
+### Tests
+
+- `cargo test --lib`: 411 passed.
+- `cargo test --tests`: 434 passed.
+- Integration suites (chunked_sparse_ids, format_golden, invariants, journal_invariants, recovery, retry_integration, schema_evolution, v2_golden, validate_regression): 125 passed.
+- Zero failures, zero warnings.
+
+---
+
 ## 0.2.0-beta.6 (2026-04-11)
 
 ### Fixes

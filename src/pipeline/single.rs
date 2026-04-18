@@ -138,7 +138,6 @@ pub(crate) fn run_export(
     run_single_export(
         src,
         &query,
-        plan.strategy.cursor_column(),
         cursor_state.as_ref(),
         plan,
         Some(state),
@@ -149,7 +148,6 @@ pub(crate) fn run_export(
 pub(super) fn run_single_export(
     src: &mut dyn Source,
     query: &str,
-    cursor_column: Option<&str>,
     cursor: Option<&crate::types::CursorState>,
     plan: &ResolvedRunPlan,
     state: Option<&StateStore>,
@@ -157,7 +155,13 @@ pub(super) fn run_single_export(
 ) -> Result<()> {
     let mut sink = ExportSink::new(plan)?;
 
-    src.export(query, cursor_column, cursor, &plan.tuning, &mut sink)?;
+    src.export(
+        query,
+        plan.strategy.incremental_plan(),
+        cursor,
+        &plan.tuning,
+        &mut sink,
+    )?;
 
     if let Some(w) = sink.writer.take() {
         w.finish()?;
@@ -295,9 +299,7 @@ pub(super) fn run_single_export(
         }
     }
 
-    if let ExtractionStrategy::Incremental {
-        cursor_column: cursor_col,
-    } = &plan.strategy
+    if let Some(cursor_col) = plan.strategy.cursor_extract_column()
         && let (Some(batch), Some(schema), Some(st)) = (&sink.last_batch, &sink.schema, state)
         && let Some(last_val) = extract_last_cursor_value(batch, cursor_col, schema)
     {
@@ -307,9 +309,19 @@ pub(super) fn run_single_export(
             plan.export_name,
             last_val
         );
+        // Epic G: record committed boundary for progression reporting.
+        if let Err(e) =
+            st.record_committed_incremental(&plan.export_name, &last_val, &summary.run_id)
+        {
+            log::warn!(
+                "export '{}': committed boundary update failed: {:#}",
+                plan.export_name,
+                e
+            );
+        }
     }
 
-    if let (Some(schema), Some(st)) = (&sink.schema, state) {
+    if let (Some(schema), Some(st)) = (&sink.dest_schema, state) {
         let columns: Vec<crate::state::SchemaColumn> = schema
             .fields()
             .iter()

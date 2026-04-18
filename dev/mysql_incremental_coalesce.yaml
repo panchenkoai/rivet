@@ -1,0 +1,16 @@
+source:
+  type: mysql
+  url: "mysql://rivet:rivet@localhost:3306/rivet"
+
+exports:
+  # ADR-0007 composite cursor — same shape as the Postgres variant.
+  - name: mysql_orders_coalesce
+    query: "SELECT id, product, quantity, price, updated_at, created_at FROM orders_coalesce"
+    mode: incremental
+    cursor_column: updated_at
+    cursor_fallback_column: created_at
+    incremental_cursor_mode: coalesce
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/output

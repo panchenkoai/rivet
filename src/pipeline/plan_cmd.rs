@@ -16,7 +16,11 @@ use std::path::Path;
 use crate::config::Config;
 use crate::error::Result;
 use crate::plan::{
-    ComputedPlanData, ExtractionStrategy, PlanArtifact, PlanDiagnostics, build_plan,
+    ComputedPlanData, ExportRecommendation, ExtractionStrategy, PlanArtifact, PlanDiagnostics,
+    PlanPrioritizationSnapshot, PrioritizationInputs, build_plan,
+    campaign::recommend_campaign,
+    inputs::{PrioritizationHints, build_prioritization_inputs},
+    recommend::recommend_export,
 };
 use crate::state::StateStore;
 use crate::{preflight, source};
@@ -60,8 +64,43 @@ pub fn run_plan_command(
     let state_path = config_dir.join(".rivet_state.db");
     let state = StateStore::open(state_path.to_str().unwrap_or(".rivet_state.db"))?;
 
+    let mut built: Vec<(PlanArtifact, PrioritizationInputs, ExportRecommendation)> = Vec::new();
+
     for export in exports {
-        let artifact = build_plan_artifact(&config, export, config_dir, params, &state)?;
+        built.push(build_plan_artifact(
+            &config, export, config_dir, params, &state,
+        )?);
+    }
+
+    let campaign_opt = if built.len() > 1 {
+        let pairs: Vec<_> = built
+            .iter()
+            .map(|(_, i, r)| (i.clone(), r.clone()))
+            .collect();
+        Some(recommend_campaign(pairs))
+    } else {
+        None
+    };
+
+    for (mut artifact, _inputs, standalone_rec) in built {
+        let snap = if let Some(ref camp) = campaign_opt {
+            let rec = camp
+                .ordered_exports
+                .iter()
+                .find(|e| e.export_name == artifact.export_name)
+                .cloned()
+                .unwrap_or_else(|| standalone_rec.clone());
+            PlanPrioritizationSnapshot {
+                export_recommendation: rec,
+                campaign: Some(camp.clone()),
+            }
+        } else {
+            PlanPrioritizationSnapshot {
+                export_recommendation: standalone_rec,
+                campaign: None,
+            }
+        };
+        artifact.prioritization = Some(snap);
         emit_artifact(&artifact, &format)?;
     }
 
@@ -74,34 +113,40 @@ fn build_plan_artifact(
     config_dir: &Path,
     params: Option<&HashMap<String, String>>,
     state: &StateStore,
-) -> Result<PlanArtifact> {
-    // 1. Resolve execution plan (same path as `rivet run`)
+) -> Result<(PlanArtifact, PrioritizationInputs, ExportRecommendation)> {
     let plan = build_plan(config, export, config_dir, false, false, false, params)?;
 
-    // 2. Preflight diagnostics (DB queries — row estimate, index check, etc.)
-    let diag = match preflight::get_export_diagnostic(config, export) {
-        Ok(d) => d,
+    let (computed, plan_diagnostics, hints) = match preflight::get_export_diagnostic(config, export)
+    {
+        Ok(diag) => {
+            let plan_diagnostics = PlanDiagnostics {
+                verdict: diag.verdict.to_string(),
+                warnings: diag.warnings.clone(),
+                recommended_profile: diag.recommended_profile.to_string(),
+            };
+            let computed = compute_plan_data(&plan, diag.row_estimate, state)?;
+            let hints = PrioritizationHints {
+                incremental_uses_index: diag.uses_index,
+                cursor_range_observed: diag.cursor_min.is_some() && diag.cursor_max.is_some(),
+            };
+            (computed, plan_diagnostics, hints)
+        }
         Err(e) => {
             log::warn!(
                 "plan '{}': preflight diagnostics failed (continuing without them): {:#}",
                 export.name,
                 e
             );
-            // Return a minimal stub so plan generation continues
-            return build_artifact_without_diagnostics(plan, state);
+            let computed = compute_plan_data(&plan, None, state)?;
+            let plan_diagnostics = PlanDiagnostics {
+                verdict: "unknown (preflight failed)".into(),
+                warnings: vec!["preflight diagnostics unavailable".into()],
+                recommended_profile: "balanced".into(),
+            };
+            (computed, plan_diagnostics, PrioritizationHints::default())
         }
     };
 
-    let plan_diagnostics = PlanDiagnostics {
-        verdict: diag.verdict.to_string(),
-        warnings: diag.warnings.clone(),
-        recommended_profile: diag.recommended_profile.to_string(),
-    };
-
-    // 3. Compute strategy-specific data
-    let computed = compute_plan_data(&plan, diag.row_estimate, state)?;
-
-    // 4. Build fingerprint (non-empty for Chunked only)
     let fingerprint = match &plan.strategy {
         ExtractionStrategy::Chunked(cp) => chunk_plan_fingerprint(
             &plan.base_query,
@@ -113,14 +158,33 @@ fn build_plan_artifact(
         _ => String::new(),
     };
 
-    Ok(PlanArtifact::new(
+    // Epic I: fold recent-run history into prioritization (bounded contribution).
+    let history = match state.get_metrics(Some(&export.name), 20) {
+        Ok(metrics) => Some(crate::plan::HistorySnapshot::summarize(&metrics)),
+        Err(e) => {
+            log::warn!(
+                "plan '{}': history lookup failed; proceeding without historical refinement: {:#}",
+                export.name,
+                e
+            );
+            None
+        }
+    };
+
+    let inputs =
+        build_prioritization_inputs(export, &plan, &computed, &plan_diagnostics, hints, history);
+    let recommendation = recommend_export(&inputs, &plan_diagnostics);
+
+    let artifact = PlanArtifact::new(
         plan.export_name.clone(),
         plan.strategy.mode_label().to_string(),
         fingerprint,
         plan,
         computed,
         plan_diagnostics,
-    ))
+    );
+
+    Ok((artifact, inputs, recommendation))
 }
 
 /// Compute the `ComputedPlanData` portion of the artifact.
@@ -157,7 +221,7 @@ fn compute_plan_data(
             })
         }
 
-        ExtractionStrategy::Incremental { .. } => {
+        ExtractionStrategy::Incremental(_) => {
             let cursor_snapshot = state.get(&plan.export_name)?.last_cursor_value;
             Ok(ComputedPlanData {
                 chunk_ranges: vec![],
@@ -176,38 +240,6 @@ fn compute_plan_data(
             })
         }
     }
-}
-
-/// Build a minimal artifact when preflight diagnostics fail (e.g., DB unreachable).
-fn build_artifact_without_diagnostics(
-    plan: crate::plan::ResolvedRunPlan,
-    state: &StateStore,
-) -> Result<PlanArtifact> {
-    let computed = compute_plan_data(&plan, None, state)?;
-    let fingerprint = match &plan.strategy {
-        ExtractionStrategy::Chunked(cp) => chunk_plan_fingerprint(
-            &plan.base_query,
-            &cp.column,
-            cp.chunk_size,
-            cp.dense,
-            cp.by_days,
-        ),
-        _ => String::new(),
-    };
-    let label = plan.strategy.mode_label().to_string();
-    let name = plan.export_name.clone();
-    Ok(PlanArtifact::new(
-        name,
-        label,
-        fingerprint,
-        plan,
-        computed,
-        PlanDiagnostics {
-            verdict: "unknown (preflight failed)".into(),
-            warnings: vec!["preflight diagnostics unavailable".into()],
-            recommended_profile: "balanced".into(),
-        },
-    ))
 }
 
 fn emit_artifact(artifact: &PlanArtifact, format: &PlanOutputFormat) -> Result<()> {

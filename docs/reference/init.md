@@ -77,10 +77,51 @@ Always run **`rivet check --config <file>`** and adjust modes, destinations, and
 
 | Flag | Required | Description |
 |------|----------|-------------|
-| `--source` | yes | `postgresql://` or `mysql://` URL |
+| `--source` | one-of `--source*` | `postgresql://` or `mysql://` URL — **visible in shell history / `ps` output; avoid in production** |
+| `--source-env` | one-of `--source*` | Name of an env var holding the URL (e.g. `DATABASE_URL`). URL never hits the command line. **Recommended.** |
+| `--source-file` | one-of `--source*` | Path to a file containing just the URL on one line. Credentials stay on disk. |
 | `--table` | no | Single table; omit for schema-wide / database-wide scaffold |
 | `--schema` | no | **PostgreSQL:** schema to scan (default `public`). **MySQL:** database name if missing from URL or to override URL database |
-| `-o` / `--output` | no | Write YAML to file; default is stdout |
+| `-o` / `--output` | no | Write output to file; default is stdout |
+| `--discover` | no | Emit a **JSON discovery artifact** (Epic B) instead of a YAML scaffold — see below |
+
+### Avoiding credentials on the command line
+
+Shell history, process listings (`ps`, `/proc/<pid>/cmdline`), and container inspect logs all capture `--source "postgresql://user:pass@host/db"` verbatim. For anything beyond local dev, use `--source-env` or `--source-file`:
+
+```bash
+# Recommended — env var resolved inside the process only.
+export DATABASE_URL='postgresql://user:pass@host:5432/db'
+rivet init --source-env DATABASE_URL --schema public -o cfg.yaml
+
+# File-based — useful when the URL is managed by your secrets mount.
+rivet init --source-file /run/secrets/database_url --table orders -o cfg.yaml
+```
+
+Exactly one of `--source`, `--source-env`, `--source-file` must be provided (enforced by clap's ArgGroup).
+
+## Discovery artifact (`--discover`)
+
+`rivet init --discover` runs the same introspection but emits a machine-readable JSON document (schema described in [`src/init/artifact.rs`](../../src/init/artifact.rs)). Intended consumers: external orchestration tools, code review, and automated config generators.
+
+```bash
+rivet init --source "$PG_URL" --schema public --discover -o discovery.json
+rivet init --source "$MY_URL" --table orders   --discover    # pipes JSON to stdout
+```
+
+Per-table fields (`tables[]`):
+
+| Field | Description |
+|---|---|
+| `schema`, `table`, `row_estimate` | Table identity and cheap row metadata |
+| `total_bytes` | Physical size (`pg_total_relation_size`; `DATA_LENGTH + INDEX_LENGTH`) when available |
+| `suggested_mode` | `full` / `incremental` / `chunked` — same heuristic as the YAML scaffold |
+| `cursor_candidates[]` | Ranked list with `{column, data_type, is_nullable, is_primary_key, score, reasons[]}`. Reasons use a stable snake_case vocabulary: `name_suggests_updated`, `name_suggests_created`, `timestamp_type`, `integer_monotonic`, `primary_key`, `nullable` |
+| `suggested_cursor_fallback_column` | Set when the top cursor is nullable **and** a NOT-NULL timestamp sibling exists — hint to enable [`incremental_cursor_mode: coalesce`](../modes/incremental-coalesce.md) (ADR-0007) |
+| `chunk_candidates[]` | Ranked integer columns for chunked mode |
+| `notes[]` | Advisory strings surfaced to operators reviewing the artifact |
+
+The artifact is advisory — same policy as plan prioritization (ADR-0006): no runtime effect, no auto-application.
 
 ---
 

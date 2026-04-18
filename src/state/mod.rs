@@ -6,6 +6,7 @@ mod checkpoint;
 mod cursor;
 mod manifest;
 mod metrics;
+mod progression;
 mod schema;
 
 // Re-export domain types so callers use `rivet::state::*` unchanged.
@@ -17,6 +18,8 @@ pub use checkpoint::ChunkTaskInfo;
 pub use manifest::FileRecord;
 #[allow(unused_imports)]
 pub use metrics::ExportMetric;
+#[allow(unused_imports)]
+pub use progression::{Boundary, ExportProgression};
 #[allow(unused_imports)]
 pub use schema::{SchemaChange, SchemaColumn};
 
@@ -107,6 +110,23 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (
         3,
         "CREATE INDEX IF NOT EXISTS idx_file_manifest_export ON file_manifest(export_name, id DESC);",
+    ),
+    // v4: committed / verified boundary tracking (ADR-0008, Epic G)
+    (
+        4,
+        "CREATE TABLE IF NOT EXISTS export_progression (
+            export_name TEXT PRIMARY KEY,
+            last_committed_strategy TEXT,
+            last_committed_cursor TEXT,
+            last_committed_chunk_index INTEGER,
+            last_committed_run_id TEXT,
+            last_committed_at TEXT,
+            last_verified_strategy TEXT,
+            last_verified_cursor TEXT,
+            last_verified_chunk_index INTEGER,
+            last_verified_run_id TEXT,
+            last_verified_at TEXT
+        );",
     ),
 ];
 

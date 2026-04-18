@@ -11,10 +11,14 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
 use super::chunked::RIVET_CHUNK_RN_COL;
+use crate::config::IncrementalCursorMode;
 use crate::enrich;
 use crate::error::Result;
 use crate::format::{self, FormatWriter};
-use crate::plan::{CompressionType, ExtractionStrategy, FormatType, MetaColumns, ResolvedRunPlan};
+use crate::plan::{
+    CompressionType, ExtractionStrategy, FormatType, IncrementalCursorPlan, MetaColumns,
+    ResolvedRunPlan,
+};
 use crate::source::BatchSink;
 
 pub(crate) struct CompletedPart {
@@ -30,8 +34,16 @@ pub(crate) struct ExportSink {
     pub(in crate::pipeline) tmp: tempfile::NamedTempFile,
     pub(in crate::pipeline) total_rows: usize,
     pub(in crate::pipeline) part_rows: usize,
+    /// Last batch WITH internal columns still present — used for cursor extraction
+    /// (e.g. `_rivet_coalesced_cursor`). Destination-facing batches (stripped of
+    /// internal columns) are built on the fly in `on_batch`.
     pub(in crate::pipeline) last_batch: Option<RecordBatch>,
+    /// Schema WITH internal columns — matches `last_batch`. `extract_last_cursor_value`
+    /// indexes by column name, so this must include the synthetic coalesce column when present.
     pub(in crate::pipeline) schema: Option<SchemaRef>,
+    /// Destination-facing schema (stripped of internal columns). Used for schema-change
+    /// detection against the stored snapshot.
+    pub(in crate::pipeline) dest_schema: Option<SchemaRef>,
     pub(in crate::pipeline) meta: MetaColumns,
     pub(in crate::pipeline) enriched_schema: Option<SchemaRef>,
     pub(in crate::pipeline) exported_at_us: i64,
@@ -51,6 +63,9 @@ impl ExportSink {
         let exported_at_us = chrono::Utc::now().timestamp_micros();
         let strip_internal_column = match &plan.strategy {
             ExtractionStrategy::Chunked(cp) if cp.dense => Some(RIVET_CHUNK_RN_COL.to_string()),
+            ExtractionStrategy::Incremental(p) if p.mode == IncrementalCursorMode::Coalesce => {
+                Some(IncrementalCursorPlan::RIVET_COALESCE_CURSOR_COL.to_string())
+            }
             _ => None,
         };
         Ok(Self {
@@ -63,6 +78,7 @@ impl ExportSink {
             part_rows: 0,
             last_batch: None,
             schema: None,
+            dest_schema: None,
             meta: plan.meta_columns.clone(),
             enriched_schema: None,
             exported_at_us,
@@ -203,42 +219,52 @@ impl ExportSink {
 
 impl BatchSink for ExportSink {
     fn on_schema(&mut self, schema: SchemaRef) -> Result<()> {
-        let data_schema = if let Some(ref strip) = self.strip_internal_column {
-            Self::schema_without_internal(schema.as_ref(), strip)?
-        } else {
-            schema.clone()
+        // Strip the synthetic column only when it's actually present in the schema —
+        // empty-schema fallbacks (zero-row runs) otherwise error on missing field.
+        let dest_schema = match &self.strip_internal_column {
+            Some(strip) if schema.index_of(strip).is_ok() => {
+                Self::schema_without_internal(schema.as_ref(), strip)?
+            }
+            _ => schema.clone(),
         };
-        let enriched = enrich::enrich_schema(&data_schema, &self.meta);
+        let enriched = enrich::enrich_schema(&dest_schema, &self.meta);
         let fmt = format::create_format(self.format_type, self.compression, self.compression_level);
         let file = self.tmp.as_file().try_clone()?;
         let buf_writer = BufWriter::new(file);
         self.writer = Some(fmt.create_writer(&enriched, Box::new(buf_writer))?);
-        self.schema = Some(data_schema);
+        // `schema` keeps internal columns so cursor extraction (e.g. synthetic
+        // `_rivet_coalesced_cursor`) can index by name. `dest_schema` is what
+        // downstream consumers see — used for schema-change detection.
+        self.schema = Some(schema);
+        self.dest_schema = Some(dest_schema);
         self.enriched_schema = Some(enriched);
         Ok(())
     }
 
     fn on_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        let batch = if let Some(ref strip) = self.strip_internal_column {
-            Self::record_batch_without_internal(batch, strip)?
-        } else {
-            batch.clone()
+        let dest_batch = match &self.strip_internal_column {
+            Some(strip) if batch.schema().index_of(strip).is_ok() => {
+                Self::record_batch_without_internal(batch, strip)?
+            }
+            _ => batch.clone(),
         };
 
-        self.total_rows += batch.num_rows();
-        self.part_rows += batch.num_rows();
-        self.track_quality(&batch);
+        self.total_rows += dest_batch.num_rows();
+        self.part_rows += dest_batch.num_rows();
+        self.track_quality(&dest_batch);
 
         let output = if let Some(es) = &self.enriched_schema {
-            enrich::enrich_batch(&batch, &self.meta, es, self.exported_at_us)?
+            enrich::enrich_batch(&dest_batch, &self.meta, es, self.exported_at_us)?
         } else {
-            batch.clone()
+            dest_batch.clone()
         };
 
         if let Some(w) = self.writer.as_mut() {
             w.write_batch(&output)?;
         }
-        self.last_batch = Some(batch);
+        // Keep the RAW batch (with internal columns) so cursor extraction can
+        // read the synthetic coalesce column after the run finishes.
+        self.last_batch = Some(batch.clone());
         self.maybe_split()?;
         Ok(())
     }
@@ -690,6 +716,7 @@ mod tests {
             part_rows: 0,
             last_batch: None,
             schema: None,
+            dest_schema: None,
             meta: crate::config::MetaColumns::default(),
             enriched_schema: None,
             exported_at_us: 0,

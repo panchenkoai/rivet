@@ -70,7 +70,9 @@ plan 'orders': cursor has drifted since plan was generated
 Regenerate with `rivet plan` or pass --force to skip this check.
 ```
 
-**Scope**: This check applies only to `Incremental` exports (where `cursor_snapshot` is non-`None`). Snapshot, TimeWindow, and Chunked exports have no cursor and are not subject to this check.
+**Scope**: This check applies only to `Incremental` exports (where `cursor_snapshot` is non-`None`). Snapshot, TimeWindow, and Chunked exports have no cursor and are not subject to this check. Chunked exports instead have partition-level progression tracked by [ADR-0008](0008-export-progression.md) (committed) and [ADR-0009](0009-reconcile-and-repair-contracts.md) (verified).
+
+**Cursor policy**: How the snapshot string is produced (single column vs `COALESCE` progression) is defined in [ADR-0007](0007-cursor-policy-contracts.md); PA4 compares opaque strings regardless of mode.
 
 **Current implementation**: `apply_cmd::run_apply_command` calls `PlanArtifact::cursor_matches(current)`. `cursor_matches` returns `true` when `cursor_snapshot` is `None` (all non-incremental strategies).
 
@@ -127,6 +129,27 @@ Regenerate with `rivet plan` or pass --force to skip this check.
 
 ---
 
+### PA9 — Artifact Credential Redaction (ACR)
+
+> A `PlanArtifact` must not contain plaintext credentials. Before the resolved plan is embedded, `PlanArtifact::new` runs `SourceConfig::redact_for_artifact`:
+>
+> - `password` → always stripped (set to `None`).
+> - `url` with `scheme://user[:password]@…` → userinfo replaced with `REDACTED` (host/port/path preserved).
+> - `url_env`, `url_file`, `password_env` — preserved. They are **references** (env var names, file paths) that apply needs to re-resolve credentials at runtime; not secrets themselves.
+> - `host`, `port`, `user`, `database` — preserved (infrastructure metadata, not credentials).
+
+**Rationale**: Plan artifacts are designed to be stored, committed to PRs, or shared for review (PA1, PA2). Historic config patterns with inline `password:` or credentials-in-URL would leak into every artifact. Silently stripping plaintext (rather than failing loudly) keeps the plan/apply workflow operational while making artifacts safe-by-default.
+
+**Operator contract**: When redaction runs, Rivet logs a WARN: `plan '<name>': plaintext credentials stripped from artifact — apply time must have equivalent env/file-based auth available`. Operators must ensure `url_env` / `password_env` / `url_file` equivalents are set in the apply environment. For existing YAML configs with plaintext `password`, migrate to `password_env` before relying on plan/apply.
+
+**Scope of protection**: PA9 covers only the source-side credentials embedded in `ResolvedRunPlan.source`. Destination secrets are already ADR-0004-compliant (S3/GCS use env/file references via `access_key_env`, `secret_key_env`, `credentials_file`; no plaintext equivalents exist in the destination schema).
+
+**Current implementation**: `SourceConfig::redact_for_artifact` in `src/config/models.rs`; called from `PlanArtifact::new` in `src/plan/artifact.rs`. URL parsing uses a path-aware `@` scan so `@` in a query string or path does not trigger false redaction.
+
+**Test coverage**: `redact_plaintext_password_stripped`, `redact_password_embedded_in_url`, `redact_url_without_userinfo_is_unchanged`, `redact_env_references_are_preserved`, `redact_does_not_confuse_at_in_path` in `src/config/tests.rs`; `artifact_strips_plaintext_password_from_source`, `artifact_strips_credentials_from_url` in `src/plan/artifact.rs`.
+
+---
+
 ## Contract Summary Table
 
 | ID | Name | Enforced? | On Violation |
@@ -139,6 +162,7 @@ Regenerate with `rivet plan` or pass --force to skip this check.
 | PA6 | Fingerprint Stability | advisory (logged) | operator responsibility |
 | PA7 | State Writes Unchanged | yes (ADR-0001) | same failure modes as `rivet run` |
 | PA8 | Diagnostics Are Advisory | explicit non-enforcement | verdict visible in artifact; no gate |
+| PA9 | Artifact Credential Redaction | yes (on `PlanArtifact::new`) | plaintext `password`/URL userinfo silently stripped; WARN logged |
 
 ---
 

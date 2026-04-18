@@ -105,3 +105,17 @@ SELECT
     payload,
     ROW_NUMBER() OVER (ORDER BY id) AS chunk_rownum
 FROM orders_sparse;
+
+-- Composite cursor fixture (ADR-0007): some rows have NULL in the primary
+-- `updated_at` column, forcing `COALESCE(updated_at, created_at)` progression.
+CREATE TABLE orders_coalesce (
+    id BIGSERIAL PRIMARY KEY,
+    product VARCHAR(200) NOT NULL,
+    quantity INT NOT NULL,
+    price NUMERIC(10,2) NOT NULL,
+    updated_at TIMESTAMP,                     -- NULL-able: primary cursor column
+    created_at TIMESTAMP NOT NULL DEFAULT now() -- never NULL: fallback
+);
+
+CREATE INDEX idx_orders_coalesce_updated_at ON orders_coalesce(updated_at);
+CREATE INDEX idx_orders_coalesce_created_at ON orders_coalesce(created_at);

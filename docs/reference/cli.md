@@ -187,6 +187,56 @@ rivet apply plan.json --force
 
 ---
 
+## `rivet reconcile`
+
+Partition/window reconciliation — re-runs per-chunk `COUNT(*)` on the source and compares with the stored per-chunk row counts from the last run. Surfaces **matches**, **mismatches**, and **repair candidates** without re-exporting data (Epic F).
+
+```bash
+rivet reconcile --config <PATH> --export <NAME> [OPTIONS]
+```
+
+| Flag | Short | Type | Description |
+|---|---|---|---|
+| `--config` | `-c` | string | Path to YAML config file **(required)** |
+| `--export` | `-e` | string | Export name to reconcile **(required)** |
+| `--format` | | `pretty` \| `json` | Output format (default `pretty`) |
+| `--output` | `-o` | string | Write JSON report to this file (use with `--format json`) |
+| `--param` | `-p` | KEY=VALUE | Query parameter (repeatable) |
+
+### Scope (v1)
+
+- **Chunked exports** — supported. Requires a previous run with `chunk_checkpoint: true` so per-chunk ranges and row counts are persisted in `.rivet_state.db`.
+- **Time-window** — returns an error ("use chunked with `chunk_by_days`" for partition reconcile).
+- **Snapshot / Incremental** — no natural partitions; use `rivet run --reconcile` for a whole-export count check.
+
+### What it does
+
+For each completed chunk task from the latest chunk run:
+
+1. Rebuilds the exact chunk query the pipeline used (same `WHERE` predicate, same dense/range shape — `build_chunk_query_sql`).
+2. Runs `SELECT COUNT(*) FROM (<chunk_query>) AS _rc`.
+3. Compares the source count with the stored `rows_written` for that chunk.
+
+Each partition is classified as:
+
+- `match` — source and exported counts are equal.
+- `mismatch` — counts differ; partition is a repair candidate (note includes `diff`).
+- `unknown` — one of the counts is unavailable (chunk never completed, unparseable chunk keys); also a repair candidate.
+
+### Examples
+
+```bash
+# Human-readable summary
+rivet reconcile -c my_export.yaml -e orders
+
+# JSON report to file
+rivet reconcile -c my_export.yaml -e orders --format json -o reconcile.json
+```
+
+Reports are **advisory** — same policy as prioritization (ADR-0006) and plan artifacts (ADR-0005). They surface what needs repair; they do not re-export on their own.
+
+---
+
 ## `rivet check`
 
 Preflight analysis: diagnose source health, estimate row counts, check indexes, recommend tuning.
@@ -342,6 +392,22 @@ Clear persisted chunk plans for a chunked export (to re-export from scratch).
 ```bash
 rivet state reset-chunks --config <PATH> --export <NAME>
 ```
+
+### `rivet state progression`
+
+Show explicit **committed** and **verified** export boundaries (Epic G / [ADR-0008](../adr/0008-export-progression.md)).
+
+```bash
+rivet state progression --config <PATH> [--export <NAME>]
+```
+
+| Column | Meaning |
+|---|---|
+| `COMM MODE` / `COMMITTED` | Strategy (`incremental` / `chunked`) and boundary value (cursor string or `chunk #N`) durably committed to the destination |
+| `COMMITTED AT` | UTC timestamp of the committing run |
+| `VERI MODE` / `VERIFIED` | Same shape, but only advanced by a full-match `rivet reconcile` (zero mismatches, zero unknowns) |
+
+The progression table is **advisory**: it does not gate `rivet run`, `rivet apply`, or `rivet reconcile`. Consumers are operators and external monitoring.
 
 ---
 

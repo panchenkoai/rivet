@@ -41,20 +41,30 @@ pub(super) fn introspect(url: &str, table: &str) -> Result<TableInfo> {
     let pool = mysql::Pool::new(mysql::Opts::from_url(url)?)?;
     let mut conn = pool.get_conn()?;
 
-    // Row estimate from information_schema (fast, no COUNT(*))
-    let row_estimate: i64 = conn
-        .query_first::<Option<u64>, _>(format!(
-            "SELECT TABLE_ROWS FROM information_schema.TABLES \
-             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{}'",
+    // Row estimate + on-disk size from information_schema (fast, no COUNT(*)).
+    let row_and_size: Option<(Option<u64>, Option<u64>, Option<u64>)> =
+        conn.query_first(format!(
+            "SELECT TABLE_ROWS, DATA_LENGTH, INDEX_LENGTH FROM information_schema.TABLES \
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{}'",
             escape(table)
-        ))?
-        .flatten()
-        .map(|n| n as i64)
-        .unwrap_or(0);
+        ))?;
+    let (row_estimate, total_bytes) = match row_and_size {
+        Some((rows, data, idx)) => {
+            let r = rows.map(|n| n as i64).unwrap_or(0);
+            let bytes = match (data, idx) {
+                (Some(d), Some(i)) => Some((d + i) as i64),
+                (Some(d), None) => Some(d as i64),
+                (None, Some(i)) => Some(i as i64),
+                (None, None) => None,
+            };
+            (r, bytes.filter(|v| *v > 0))
+        }
+        None => (0, None),
+    };
 
-    // Column metadata (includes KEY info for PK detection)
-    let rows: Vec<(String, String, String)> = conn.query(format!(
-        "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_KEY \
+    // Column metadata (includes KEY + IS_NULLABLE for Epic B).
+    let rows: Vec<(String, String, String, String)> = conn.query(format!(
+        "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_KEY, IS_NULLABLE \
          FROM information_schema.COLUMNS \
          WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{}' \
          ORDER BY ORDINAL_POSITION",
@@ -70,8 +80,9 @@ pub(super) fn introspect(url: &str, table: &str) -> Result<TableInfo> {
 
     let columns = rows
         .into_iter()
-        .map(|(name, data_type, column_key)| ColumnInfo {
+        .map(|(name, data_type, column_key, nullable)| ColumnInfo {
             is_primary_key: column_key == "PRI",
+            is_nullable: nullable.eq_ignore_ascii_case("YES"),
             name,
             data_type,
         })
@@ -81,6 +92,7 @@ pub(super) fn introspect(url: &str, table: &str) -> Result<TableInfo> {
         schema: String::new(),
         table: table.to_string(),
         row_estimate,
+        total_bytes,
         columns,
     })
 }

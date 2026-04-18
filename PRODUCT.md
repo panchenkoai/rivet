@@ -507,6 +507,96 @@ README restructured around real usage decisions:
 
 ---
 
+## v5 Features (implemented) — Plan/Apply workflow
+
+Auditable execution: a `rivet plan` produces a sealed JSON artifact (`PlanArtifact`); `rivet apply` executes it with staleness, cursor-drift, and fingerprint guards. See [ADR-0005](docs/adr/0005-plan-apply-contracts.md).
+
+- **PA1–PA8** — artifact is the sole input, immutable, staleness (1h warn / 24h reject), cursor-snapshot integrity, chunk-range monotonicity, fingerprint logging, state writes preserved (I1–I4), diagnostics advisory.
+- **PA9** (ADR-0005, 2026-04) — **artifact credential redaction**: `password:` stripped; `scheme://user:pass@` rewritten to `REDACTED`. WARN logged so operators migrate to `password_env:`.
+
+---
+
+## v6 Features (implemented) — Source-aware planning (Epics A–I)
+
+A new planning layer advises on what to extract first, what to isolate on shared sources, and where to repair. Advisory only — no runtime scheduling. See [ADR-0006](docs/adr/0006-source-aware-prioritization.md) and [planning/prioritization.md](docs/planning/prioritization.md).
+
+### Epic A — Source-aware extraction prioritization
+
+- Per-export `priority_score` / `priority_class` / `cost_class` / `risk_class` / `recommended_wave`.
+- Explainable `reasons[]` — structured kinds (`small_table`, `weak_cursor`, `sparse_range_risk`, `reconcile_required`, …).
+- Campaign view: ordered exports + grouped waves + `source_group_warnings[]` for shared-replica collisions.
+- Surfaces in `rivet plan` (pretty + JSON).
+
+### Epic B — Metadata-driven discovery
+
+- `rivet init --discover -o out.json` — machine-readable `DiscoveryArtifact` with ranked **cursor candidates**, **chunk candidates**, per-column nullability, total bytes, suggested mode, and automatic coalesce-fallback hints.
+- `rivet init --source-env / --source-file` — credentials stay out of shell history / `ps`.
+
+### Epic C — Weak-source awareness
+
+- `reconcile_required: true` in `exports[]` — advisory flag that folds into prioritization risk class independently of the `--reconcile` CLI flag.
+- `CursorQuality` taxonomy (strong_monotonic / weak_time / weak_multi_candidate / fallback_only / none) consumed by the scorer.
+
+### Epic D — Cursor policy model (ADR-0007 CC1–CC10)
+
+- `incremental_cursor_mode: single_column | coalesce` — composite cursor over `COALESCE(primary, fallback)` when the primary is NULL-able.
+- Synthetic result column `_rivet_coalesced_cursor` stripped before Parquet/CSV write (CC5).
+- Single-level SQL with outer `ORDER BY` so the final Arrow batch carries the max coalesced value (CC6).
+- Identifier quoting + cursor-value escaping (CC9, CC10).
+
+### Epic E — Campaign-level planning
+
+- Multi-export `rivet plan` attaches the campaign to every artifact. `source_group` collisions drive `isolate_on_source` flags (advisory).
+
+### Epic F — Partition / window reconciliation (ADR-0009 RC1–RC6)
+
+- `rivet reconcile -c cfg.yaml -e export_name` — re-counts every chunk partition on the source, classifies `match` / `mismatch` / `unknown`, emits a JSON `ReconcileReport`.
+- Requires `chunk_checkpoint: true` (v1); time-window reconcile deferred.
+- Reuses `build_chunk_query_sql` verbatim — apples-to-apples with extraction (RC2).
+
+### Epic G — Committed / verified progression (ADR-0008 PG1–PG8)
+
+- New state table `export_progression` (schema v4 migration) separates three boundaries: observed (preflight/plan), committed (destination write), verified (reconcile all-match).
+- `rivet state progression [--export N]` — operator-facing report.
+- Committed advances at end-of-run (incremental after cursor update; chunked after `finalize_chunk_run_completed`). Verified advances only from clean reconcile (PG5).
+
+### Epic H — Targeted repair (ADR-0009 RR1–RR8)
+
+- `rivet repair -c cfg.yaml -e export_name [--report rec.json] [--execute]` — derives a `RepairPlan` from a `ReconcileReport`, optionally re-runs only the mismatched chunks via `ChunkSource::Precomputed`.
+- New files written alongside originals with `<export>_<ts>_chunk<idx>.<ext>` naming (RR5). Committed boundary untouched (RR4).
+
+### Epic I — Historical recommendation refinement
+
+- `plan::HistorySnapshot` summarizes the last ~20 `export_metrics` rows (success_rate, retry_rate, avg_duration, last_status).
+- Bounded contribution (≤ ~15 points combined) to prioritization scoring — history is a signal, not an oracle.
+
+---
+
+## v6.1 Features (implemented) — SecOps hardening
+
+See commit `08c16f2` and ADR-0005 PA9.
+
+- **TLS for source connections** — `source.tls: { mode: disable|require|verify-ca|verify-full, ca_file, accept_invalid_certs, accept_invalid_hostnames }`. Default is `verify-full` when `tls:` block is present; omitting it connects plaintext with a WARN.
+- **`rivet init --source-env / --source-file`** — URL never hits command line / `ps` / container logs.
+- **Env-var hard error** — `${UNSET}` in YAML now fails at load time instead of silently substituting empty string.
+- **AWS_PROFILE race fix** — `std::env::set_var` guarded by static Mutex + RAII restore.
+- **Zeroize for in-memory secrets** — AWS/GCS keys and resolved DB passwords use `zeroize::Zeroizing<String>`.
+- **Parameterized cursor** — MySQL binds `?`; PostgreSQL uses `E'…'` with escaping regardless of `standard_conforming_strings`.
+- **Query log at debug level** — effective SQL only printed with `RUST_LOG=debug`.
+
+---
+
+## Compatibility
+
+Rivet is exercised against the full end-to-end suite (83 assertions) on:
+
+- **PostgreSQL** 12, 13, 14, 15, 16
+- **MySQL** 5.7, 8.0
+
+See [reference/compatibility.md](docs/reference/compatibility.md) for the support policy, the test matrix (7 targets × 83 assertions = 581 e2e assertions), and engine-specific notes.
+
+---
+
 ## Roadmap
 
 ### v4.2: Resilience & Testing (in progress)

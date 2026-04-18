@@ -1,0 +1,98 @@
+# MySQL demo — parallel to demo_pipeline.yaml (Postgres).
+# Exercises: prioritization, composite cursor (ADR-0007), source-group warnings,
+# chunked+checkpoint, reconcile, progression.
+source:
+  type: mysql
+  url_env: DATABASE_URL
+  tuning:
+    profile: balanced
+
+exports:
+  # --- source_group: replica_primary (3+ → warning) ---
+  - name: transactions
+    source_group: replica_primary
+    query: "SELECT id, user_id, amount, status, created_at, updated_at FROM transactions"
+    mode: incremental
+    cursor_column: updated_at
+    format: parquet
+    destination:
+      type: local
+      path: ./out_mysql
+
+  - name: audit_log
+    source_group: replica_primary
+    query: "SELECT id, actor_id, action_hash, action, logged_at FROM audit_log"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 200000
+    chunk_checkpoint: true
+    chunk_max_attempts: 3
+    parallel: 2
+    reconcile_required: true
+    format: parquet
+    destination:
+      type: local
+      path: ./out_mysql
+
+  - name: sessions
+    source_group: replica_primary
+    query: "SELECT id, session_uuid, user_id, session_start, session_end FROM sessions"
+    mode: incremental
+    cursor_column: session_start
+    format: parquet
+    destination:
+      type: local
+      path: ./out_mysql
+
+  # --- source_group: replica_analytics ---
+  - name: metric_samples
+    source_group: replica_analytics
+    query: "SELECT id, host, metric_name, value, captured_at FROM metric_samples"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 100000
+    chunk_checkpoint: true
+    format: parquet
+    destination:
+      type: local
+      path: ./out_mysql
+
+  - name: logs_archive
+    source_group: replica_analytics
+    query: "SELECT id, payload, created_at, updated_at FROM logs_archive"
+    mode: incremental
+    cursor_column: updated_at
+    cursor_fallback_column: created_at
+    incremental_cursor_mode: coalesce
+    format: parquet
+    destination:
+      type: local
+      path: ./out_mysql
+
+  # --- ungrouped ---
+  - name: orders_coalesce
+    query: "SELECT id, product, quantity, price, updated_at, created_at FROM orders_coalesce"
+    mode: incremental
+    cursor_column: updated_at
+    cursor_fallback_column: created_at
+    incremental_cursor_mode: coalesce
+    format: parquet
+    destination:
+      type: local
+      path: ./out_mysql
+
+  - name: product_catalog
+    query: "SELECT sku, name, category, price, active, updated_at FROM product_catalog"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: ./out_mysql
+
+  - name: email_queue
+    query: "SELECT id, to_email, subject, status, scheduled_at FROM email_queue"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: ./out_mysql

@@ -13,8 +13,8 @@ source:
 exports:
   - name: orders_incremental
     query: >
-      SELECT id, customer_id, product_id, quantity, total_price,
-             status, created_at, updated_at
+      SELECT id, user_id, product, quantity, price,
+             status, ordered_at, updated_at
       FROM orders
 
     mode: incremental

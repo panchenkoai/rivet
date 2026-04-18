@@ -11,7 +11,7 @@ source:
 exports:
   - name: users_daily
     # The SQL query to export. Tip: only SELECT columns you need.
-    query: "SELECT id, name, email, role, created_at, updated_at FROM users"
+    query: "SELECT id, name, email, age, balance, is_active, created_at, updated_at FROM users"
 
     mode: full                      # re-export all rows every run
 

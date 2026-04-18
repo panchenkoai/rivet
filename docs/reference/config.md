@@ -25,15 +25,68 @@ Every field Rivet accepts in a config YAML, grouped by section.
 | `host` | string | for structured | — | Database hostname |
 | `port` | integer | no | `5432` (PG) / `3306` (MySQL) | Database port |
 | `user` | string | for structured | — | Database user |
-| `password` | string | no | — | Password (plaintext — prefer `password_env`) |
-| `password_env` | string | no | — | Env var name containing the password |
+| `password` | string | no | — | **Not recommended** — plaintext; see [Credentials & plan artifacts](#credentials--plan-artifacts) below |
+| `password_env` | string | no | — | Env var name containing the password (recommended) |
 | `database` | string | for structured | — | Database name |
 | `tuning` | object | no | — | Global tuning (see [tuning.md](tuning.md)) |
+| `tls` | object | no | — | Transport security (see [TLS](#tls) below). Omit → plaintext + WARN log. |
 
 **Connection approaches** (mutually exclusive):
 
 1. **URL-based**: provide exactly one of `url`, `url_env`, or `url_file`
 2. **Structured**: provide `host`, `user`, `database` (+ optional `port`, `password`/`password_env`)
+
+### TLS
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `mode` | `disable` \| `require` \| `verify-ca` \| `verify-full` | `verify-full` | Enforcement level (mirrors libpq `sslmode` semantics) |
+| `ca_file` | string | — | PEM-encoded CA certificate for private trust stores; required for `verify-ca`/`verify-full` against custom CAs |
+| `accept_invalid_certs` | boolean | `false` | Dangerous — disables certificate verification. Only honored when explicitly `true`. |
+| `accept_invalid_hostnames` | boolean | `false` | Dangerous — disables hostname (SAN/CN) verification. Only honored when explicitly `true`. |
+
+Example (production):
+
+```yaml
+source:
+  type: postgres
+  url_env: DATABASE_URL
+  tls:
+    mode: verify-full
+    ca_file: /etc/ssl/certs/rds-ca-2019-root.pem
+```
+
+Example (local dev only — no TLS):
+
+```yaml
+source:
+  type: mysql
+  host: 127.0.0.1
+  port: 3306
+  user: dev
+  password_env: DEV_PWD
+  database: rivet
+  tls: { mode: disable }       # explicit opt-out — silences the plaintext WARN
+```
+
+When `tls:` is omitted entirely, Rivet connects without TLS and emits a WARN so you notice. See [reference/compatibility.md](compatibility.md) for which servers ship TLS-ready and Rivet's dev-environment defaults.
+
+### Credentials & plan artifacts
+
+A `PlanArtifact` (produced by `rivet plan`) is designed to be committed / reviewed; it **must not** carry plaintext credentials. Rivet enforces ADR-0005 **PA9** (`SourceConfig::redact_for_artifact`):
+
+- `password:` field → always stripped from the artifact (set to `None`).
+- `url:` containing `scheme://user:pass@…` → userinfo rewritten to `REDACTED`.
+- `password_env` / `url_env` / `url_file` → preserved as **references** so apply-time can re-resolve against the apply-environment.
+
+When redaction runs, `rivet plan` logs:
+
+```
+WARN plan 'orders': plaintext credentials stripped from artifact —
+     apply time must have equivalent env/file-based auth available
+```
+
+**Recommendation**: use `password_env` (or `url_env`) everywhere; only use plaintext `password:` for one-off local scripts. See [ADR-0005 PA9](../adr/0005-plan-apply-contracts.md#pa9--artifact-credential-redaction-acr).
 
 ---
 
@@ -56,14 +109,18 @@ Each entry in the `exports` list defines one export job.
 | `meta_columns` | object | no | — | Extra columns added to output |
 | `quality` | object | no | — | Data quality checks |
 | `tuning` | object | no | — | Per-export tuning overrides |
+| `source_group` | string | no | — | Logical group for shared source capacity (replica, host). Drives campaign-level warnings in `rivet plan` (advisory only — ADR-0006) |
+| `reconcile_required` | boolean | no | `false` | Advisory hint: treat this export as reconcile-sensitive in planning, independent of the `--reconcile` CLI flag (ADR-0006, Epic C) |
 
 ### Mode-specific fields
 
 **Incremental** (`mode: incremental`):
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `cursor_column` | string | **yes** | Column to track progress (must be monotonically increasing) |
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `cursor_column` | string | **yes** | — | Primary progression column (should be monotonically increasing) |
+| `cursor_fallback_column` | string | when `coalesce` | — | Fallback column used when primary is `NULL`. Only valid with `incremental_cursor_mode: coalesce` |
+| `incremental_cursor_mode` | `single_column` \| `coalesce` | no | `single_column` | `coalesce` progresses on `COALESCE(primary, fallback)`. See [modes/incremental-coalesce.md](../modes/incremental-coalesce.md) and [ADR-0007](../adr/0007-cursor-policy-contracts.md). |
 
 **Chunked** (`mode: chunked`):
 

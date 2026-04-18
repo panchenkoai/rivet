@@ -154,22 +154,31 @@ source:
   user: rivet_reader
   password_env: DB_PASSWORD   # reads from $DB_PASSWORD
   database: production
+  tls:
+    mode: verify-full         # production default; ca_file when using private CAs
 ```
+
+### Production security checklist
+
+- `url_env:` / `password_env:` — never commit secrets. Plaintext `password:` is silently stripped from plan artifacts by [ADR-0005 PA9](adr/0005-plan-apply-contracts.md#pa9--artifact-credential-redaction-acr), and the WARN log tells you to migrate.
+- `tls: { mode: verify-full }` — omitting `tls:` connects in plaintext and logs a WARN. See [reference/config.md § TLS](reference/config.md#tls) for `verify-ca` / `require` / `disable` semantics.
+- `rivet init --source-env DATABASE_URL` instead of `--source <url>` — keeps creds out of shell history, `ps`, and container inspect logs.
 
 ## 3. Scaffold a config with `rivet init` (optional)
 
 If you prefer to start from your real tables instead of copying a template, use **`rivet init`**. It connects once, reads column lists and rough row estimates, and writes a YAML file with `url_env: DATABASE_URL` and suggested export modes.
 
 ```bash
-# Single table
 export DATABASE_URL='postgresql://user:pass@localhost:5432/mydb'
-rivet init --source "$DATABASE_URL" --table orders -o my_export.yaml
+
+# Single table
+rivet init --source-env DATABASE_URL --table orders -o my_export.yaml
 
 # PostgreSQL: all tables/views in schema public
-rivet init --source "$DATABASE_URL" --schema public -o my_export.yaml
+rivet init --source-env DATABASE_URL --schema public -o my_export.yaml
 
-# MySQL: all tables/views in the database from the URL
-rivet init --source 'mysql://user:pass@localhost:3306/mydb' -o my_export.yaml
+# JSON discovery artifact instead of YAML (ranked cursor/chunk candidates, sizes)
+rivet init --source-env DATABASE_URL --schema public --discover -o discovery.json
 ```
 
 Then review the file, adjust destinations and tuning, and continue with `rivet doctor` / `rivet check` below.
@@ -235,7 +244,8 @@ rivet state files --config my_export.yaml
 
 ## Next steps
 
-- **Full pilot walkthrough** — discovery → chunked → reconcile → repair → verified: [pilot/pilot-walkthrough.md](pilot/pilot-walkthrough.md)
+- **Demo quickstart** (pre-seeded 14-table fixture, ≈10 min): [pilot/demo-quickstart.md](pilot/demo-quickstart.md)
+- **Full pilot walkthrough** — discovery → chunked → reconcile → repair → verified on your own data: [pilot/pilot-walkthrough.md](pilot/pilot-walkthrough.md)
 - Choose the right export mode: [modes/](modes/)
 - Configure your destination: [destinations/](destinations/)
 - Tune for your workload: [reference/tuning.md](reference/tuning.md)

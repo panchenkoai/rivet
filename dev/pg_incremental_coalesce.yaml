@@ -1,0 +1,18 @@
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+
+exports:
+  # ADR-0007 composite cursor: some rows have NULL updated_at — progress by
+  # COALESCE(updated_at, created_at). Seed fixture lives in `orders_coalesce`
+  # (see dev/postgres/init.sql and `cargo run --bin seed`).
+  - name: pg_orders_coalesce
+    query: "SELECT id, product, quantity, price, updated_at, created_at FROM orders_coalesce"
+    mode: incremental
+    cursor_column: updated_at
+    cursor_fallback_column: created_at
+    incremental_cursor_mode: coalesce
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/output

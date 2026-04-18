@@ -13,8 +13,8 @@ source:
     batch_size: 5000
 
 exports:
-  - name: products_daily
-    query: "SELECT id, name, sku, price, category, stock_qty, updated_at FROM products"
+  - name: users_daily
+    query: "SELECT id, name, email, age, balance, is_active, created_at, updated_at FROM users"
 
     mode: full
 

@@ -27,6 +27,57 @@ pub fn show_state(config_path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Epic G / ADR-0008 — explicit committed / verified boundaries per export.
+pub fn show_progression(config_path: &str, export_name: Option<&str>) -> Result<()> {
+    let state = StateStore::open(config_path)?;
+    let entries = match export_name {
+        Some(name) => vec![state.get_progression(name)?],
+        None => state.list_progression()?,
+    };
+    let has_any = entries
+        .iter()
+        .any(|p| p.committed.is_some() || p.verified.is_some());
+    if !has_any {
+        println!("No progression boundaries recorded yet.");
+        return Ok(());
+    }
+
+    println!(
+        "{:<30} {:<12} {:<30} {:<25} {:<12} {:<30}",
+        "EXPORT", "COMM MODE", "COMMITTED", "COMMITTED AT", "VERI MODE", "VERIFIED"
+    );
+    println!("{}", "-".repeat(145));
+    for p in &entries {
+        let (c_mode, c_val, c_at) = match &p.committed {
+            Some(b) => (
+                b.strategy.as_str().to_string(),
+                boundary_value(b),
+                b.at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+            ),
+            None => ("-".into(), "-".into(), "-".into()),
+        };
+        let (v_mode, v_val) = match &p.verified {
+            Some(b) => (b.strategy.as_str().to_string(), boundary_value(b)),
+            None => ("-".into(), "-".into()),
+        };
+        println!(
+            "{:<30} {:<12} {:<30} {:<25} {:<12} {:<30}",
+            p.export_name, c_mode, c_val, c_at, v_mode, v_val
+        );
+    }
+    Ok(())
+}
+
+fn boundary_value(b: &crate::state::Boundary) -> String {
+    if let Some(c) = &b.cursor {
+        c.clone()
+    } else if let Some(idx) = b.chunk_index {
+        format!("chunk #{idx}")
+    } else {
+        "-".into()
+    }
+}
+
 pub fn reset_state(config_path: &str, export_name: &str) -> Result<()> {
     let state = StateStore::open(config_path)?;
     state.reset(export_name)?;

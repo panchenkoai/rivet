@@ -355,12 +355,44 @@ pub(crate) fn run_chunked_sequential_checkpoint(
 
     pb.finish(summary.total_rows);
     state.finalize_chunk_run_completed(&run_id)?;
+    record_chunked_commit(state, &plan.export_name, &run_id);
     log::info!(
         "export '{}': chunk checkpoint run completed (run_id={})",
         plan.export_name,
         run_id
     );
     Ok(())
+}
+
+/// Epic G: record the highest completed `chunk_index` for this run as the new
+/// committed boundary. Failures are logged — progression is observational and
+/// must not fail the pipeline.
+fn record_chunked_commit(state: &StateStore, export_name: &str, run_id: &str) {
+    let tasks = match state.list_chunk_tasks_for_run(run_id) {
+        Ok(t) => t,
+        Err(e) => {
+            log::warn!(
+                "export '{}': committed boundary: could not read chunk tasks: {:#}",
+                export_name,
+                e
+            );
+            return;
+        }
+    };
+    let highest = tasks
+        .iter()
+        .filter(|t| t.status == "completed")
+        .map(|t| t.chunk_index)
+        .max();
+    if let Some(idx) = highest
+        && let Err(e) = state.record_committed_chunked(export_name, idx, run_id)
+    {
+        log::warn!(
+            "export '{}': committed boundary update failed: {:#}",
+            export_name,
+            e
+        );
+    }
 }
 
 pub(super) fn run_chunked_parallel_checkpoint(
@@ -675,6 +707,7 @@ pub(super) fn run_chunked_parallel_checkpoint(
     }
 
     state.finalize_chunk_run_completed(&run_id)?;
+    record_chunked_commit(state, &plan.export_name, &run_id);
     log::info!(
         "export '{}': chunk checkpoint parallel run completed",
         plan.export_name

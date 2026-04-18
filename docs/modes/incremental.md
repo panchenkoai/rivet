@@ -127,3 +127,9 @@ exports:
 **Data appears duplicated across runs** -- Ensure `cursor_column` updates when rows are modified. If rows are updated without changing `updated_at`, they will be missed.
 
 **Need to re-export all data** -- `rivet state reset --config ... --export <name>` clears the cursor.
+
+**`rivet apply` fails with `invalid configuration: password missing`** -- A prior `rivet plan` silently stripped the plaintext `password:` from the artifact (ADR-0005 PA9). Migrate to `password_env: DB_PASSWORD` in the config and re-generate the plan. See the WARN line in the plan output.
+
+## Composite cursor (nullable primary)
+
+If your primary column can be `NULL` for some rows (e.g. `updated_at` only set on updates), see [incremental-coalesce.md](incremental-coalesce.md) — progression switches to `COALESCE(primary, fallback)` via `incremental_cursor_mode: coalesce`.
