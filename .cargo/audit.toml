@@ -1,8 +1,50 @@
-# cargo-audit configuration
-# https://github.com/rustsec/rustsec/tree/main/cargo-audit
+# cargo-audit configuration — https://github.com/rustsec/rustsec/tree/main/cargo-audit
+#
+# Policy: an advisory stays on this ignore list ONLY if (a) there is no
+# upstream fix AND (b) the vulnerable code path is not reachable from Rivet's
+# runtime (or the risk is practically non-exploitable given how Rivet runs).
+# Each entry below documents the reachability analysis; re-evaluate on every
+# release. Upgrades that remove the ignore are always preferred over keeping
+# it.
+#
+# Removed from this list in 0.3.0:
+# - RUSTSEC-2025-0119 (number_prefix unmaintained) — fixed by bumping
+#   indicatif 0.17 → 0.18, which switched to the maintained `unit-prefix`.
 
 [advisories]
-# rsa timing sidechannel — transitive via opendal → reqsign; no fix available upstream.
-# Rivet does not use RSA directly; reqsign uses it for cloud auth signing.
-# paste unmaintained — transitive via parquet; no alternative available.
-ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2024-0436"]
+ignore = [
+    # ─── RUSTSEC-2023-0071 ── rsa timing sidechannel ──
+    # Path: opendal → reqsign → rsa (GCS service-account JWT signing only;
+    # AWS S3 signing is HMAC-SHA256 and does not touch `rsa`).
+    # Status: no fix upstream in the `rsa` crate.
+    # Reachability: exploited only by a co-located attacker able to measure
+    # per-signature wall-clock timing with sub-microsecond precision. Rivet
+    # is a batch CLI performing a handful of signatures per export; a
+    # network-remote attacker cannot extract key material through this path.
+    # Action: track `rsa` upstream; drop this entry the day a patched release
+    # lands. Until then, documented residual risk.
+    "RUSTSEC-2023-0071",
+
+    # ─── RUSTSEC-2024-0436 ── paste unmaintained ──
+    # Path: parquet → paste (proc-macro).
+    # Reachability: paste is a `proc-macro = true` crate. It runs only at
+    # compile time inside the parquet build; **zero runtime code** ships.
+    # This advisory is an "unmaintained" warning, not a CVE — there is no
+    # vulnerability to exploit.
+    # Action: remove if/when parquet migrates away from paste.
+    "RUSTSEC-2024-0436",
+
+    # ─── RUSTSEC-2026-0097 ── rand unsound under custom logger ──
+    # Required preconditions for the UB to trigger (all of them):
+    #   (1) `rand::rng()` called from a custom `log::Log` implementation
+    #   (2) That call happens during the thread_rng reseed path (every 64 kB
+    #       of generated data)
+    #   (3) Trace-level OR warn-level logging is enabled AND the OS RNG
+    #       (`getrandom`) fails to provide fresh seed material.
+    # Rivet uses `env_logger::init()` (default `log::Log`), which never calls
+    # `rand`. We do not ship a custom logger; no code in `src/` calls
+    # `log::set_logger`. The unsafe path is unreachable.
+    # Action: drop once upstream PR https://github.com/rust-random/rand/pull/1763
+    # lands and crates we depend on pick up the fix.
+    "RUSTSEC-2026-0097",
+]
