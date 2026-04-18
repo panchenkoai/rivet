@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.3.1 (2026-04-18)
+
+Security patch release — closes five advisories raised against `v0.3.0` by
+`rustsec/audit-check@v2` (CI security-audit job).
+
+### Fixed by upgrade
+
+- **RUSTSEC-2026-0098** — `rustls-webpki` name constraints for URI names were
+  incorrectly accepted. `rustls-webpki` 0.103.10 → 0.103.12.
+- **RUSTSEC-2026-0099** — `rustls-webpki` name constraints accepted for
+  wildcard DNS names (similar to CVE-2025-61727). Same bump.
+- **RUSTSEC-2025-0119** — `number_prefix` unmaintained. Fixed by bumping
+  `indicatif` 0.17 → 0.18, which migrated to the maintained `unit-prefix`.
+  `number_prefix` is no longer in `Cargo.lock`.
+- **RUSTSEC-2026-0097** (×3) — `rand` unsound under custom `log::Log` that
+  calls `rand::rng()` in the reseed path. Fixed by the transitive bump
+  `rand` 0.8.5 / 0.9.2 / 0.10.0 → 0.8.6 / 0.9.4 / 0.10.1.
+
+### Policy
+
+`.cargo/audit.toml` rewritten with explicit reachability analysis for each
+remaining entry. Policy:
+
+> An advisory stays here **only** if (a) there is no upstream fix **and**
+> (b) the vulnerable code path is not reachable from Rivet's runtime.
+
+Ignore list is now down to two entries — `RUSTSEC-2023-0071` (rsa timing
+sidechannel; GCS JWT signing only; not practically exploitable for a batch
+CLI) and `RUSTSEC-2024-0436` (`paste` unmaintained; `proc-macro = true`
+crate, zero runtime code). Each is documented in-file with the exact
+preconditions that would trigger the advisory and a pointer to the upstream
+fix to track.
+
+### Other changes
+
+- Bulk transitive `cargo update` (rustls 0.23.37 → 0.23.38, tokio 1.51.0 →
+  1.52.1, wasm-bindgen family, webpki-roots, uuid, lru, pkg-config, misc.).
+- No direct-dependency API changes — all crates in `Cargo.toml` are already
+  at the latest stable major/minor.
+
+### Verification
+
+- `cargo build --release --bin rivet --bin seed` — clean.
+- `cargo test --lib` — 411 passed, 0 failed.
+- `cargo audit` — 479 crates scanned, 0 advisories after ignore.
+
+---
+
 ## 0.3.0 (2026-04-18)
 
 Source-aware planning release — Epics A–I plus credential-hardening follow-ups.
