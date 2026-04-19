@@ -54,6 +54,7 @@ See [reference/compatibility.md](reference/compatibility.md) for the version-sup
 | CLI commands and flags | [reference/cli.md](reference/cli.md) |
 | `rivet init` (scaffold YAML from the database) | [reference/init.md](reference/init.md) |
 | Supported PostgreSQL / MySQL versions & test matrix | [reference/compatibility.md](reference/compatibility.md) |
+| Offline + live test matrix, harness, fault-injection hook | [reference/testing.md](reference/testing.md) |
 
 ## Production
 

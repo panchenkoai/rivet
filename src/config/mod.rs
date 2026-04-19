@@ -107,6 +107,31 @@ impl Config {
     }
 
     fn validate(&self) -> crate::error::Result<()> {
+        // An empty `exports:` list is almost always a typo (wrong config file,
+        // dropped anchor, merged doc with the anchor section missing). Running
+        // with zero exports is a silent no-op that looks like success in CI;
+        // reject fast instead. See QA backlog Task 5.1.
+        if self.exports.is_empty() {
+            anyhow::bail!("exports: at least one export must be defined (got empty list)");
+        }
+
+        // Duplicate export names break state tracking: `export_state`,
+        // `file_manifest`, and `chunk_run` are all keyed by `export_name`, so
+        // two configs with the same name silently share cursor/manifest rows.
+        // QA backlog Task 5.1.
+        {
+            let mut seen: std::collections::HashSet<&str> =
+                std::collections::HashSet::with_capacity(self.exports.len());
+            for e in &self.exports {
+                if !seen.insert(e.name.as_str()) {
+                    anyhow::bail!(
+                        "exports: duplicate export name '{}' (each export must have a unique name; state is keyed by name)",
+                        e.name
+                    );
+                }
+            }
+        }
+
         if let Some(t) = &self.source.tuning
             && t.batch_size.is_some()
             && t.batch_size_memory_mb.is_some()
@@ -294,6 +319,24 @@ impl Config {
                     if export.chunk_column.is_none() {
                         anyhow::bail!(
                             "export '{}': chunked mode requires chunk_column",
+                            export.name
+                        );
+                    }
+                    // chunk_size == 0 would divide the range into zero-width
+                    // slices and (before the saturating fix in generate_chunks)
+                    // either infinite-loop or produce no progress. QA backlog
+                    // Task 5.1.
+                    if export.chunk_size == 0 {
+                        anyhow::bail!(
+                            "export '{}': chunked mode requires chunk_size >= 1 (got 0)",
+                            export.name
+                        );
+                    }
+                    // parallel == 0 means "spawn zero workers". Claiming tasks
+                    // with no workers stalls the pipeline. QA backlog Task 5.1.
+                    if export.parallel == 0 {
+                        anyhow::bail!(
+                            "export '{}': chunked mode requires parallel >= 1 (got 0)",
                             export.name
                         );
                     }

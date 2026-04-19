@@ -485,3 +485,106 @@ fn test_parquet_compression_lz4() {
     let col_meta = reader.metadata().row_group(0).column(0);
     assert_eq!(col_meta.compression(), parquet::basic::Compression::LZ4);
 }
+
+// ─── Extreme value coverage (QA backlog Task 2.4) ────────────
+
+/// Long UTF-8 payload: mix of ASCII, BMP and emoji characters survives CSV
+/// serialization without panic and remains valid UTF-8 on disk.
+#[test]
+fn csv_extreme_long_utf8_string_does_not_panic() {
+    let pieces = ["rivet ", "тест ", "🚀 ", "line\nend ", "quote\" "];
+    let mut huge = String::new();
+    while huge.len() < 100 * 1024 {
+        for p in &pieces {
+            huge.push_str(p);
+        }
+    }
+
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec![huge.as_str()]))],
+    )
+    .unwrap();
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let file = tmp.as_file().try_clone().unwrap();
+    let mut writer = CsvFormat.create_writer(&schema, Box::new(file)).unwrap();
+    writer.write_batch(&batch).unwrap();
+    writer.finish().unwrap();
+
+    let bytes = std::fs::read(tmp.path()).unwrap();
+    let out = std::str::from_utf8(&bytes).expect("CSV output must be valid UTF-8");
+    assert!(out.contains("тест"));
+    assert!(out.contains("🚀"));
+}
+
+/// Backlog allows "unsupported values fail clearly" — so we only assert
+/// "no panic, output is deterministic and UTF-8".  Whether NaN serializes as
+/// "NaN" / "" / errors is format-owned; this test only guards against crashes.
+#[test]
+fn csv_float_nan_and_inf_do_not_panic() {
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, false)]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Float64Array::from(vec![
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.0,
+            -0.0,
+        ]))],
+    )
+    .unwrap();
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let file = tmp.as_file().try_clone().unwrap();
+    let mut writer = CsvFormat.create_writer(&schema, Box::new(file)).unwrap();
+    let _ = writer.write_batch(&batch);
+    let _ = writer.finish();
+    if let Ok(bytes) = std::fs::read(tmp.path()) {
+        assert!(
+            std::str::from_utf8(&bytes).is_ok(),
+            "CSV output must remain valid UTF-8 even for NaN/Inf"
+        );
+    }
+}
+
+/// Parquet/Arrow must treat `""` and NULL as distinct values on round-trip.
+/// QA backlog: "Add empty string vs null coverage."
+#[test]
+fn parquet_preserves_empty_string_vs_null_distinction_on_roundtrip() {
+    let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec![Some(""), None, Some("x")]))],
+    )
+    .unwrap();
+
+    let fmt = ParquetFormat::new(CompressionType::None, None);
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let file = tmp.as_file().try_clone().unwrap();
+    let mut writer = fmt.create_writer(&schema, Box::new(file)).unwrap();
+    writer.write_batch(&batch).unwrap();
+    writer.finish().unwrap();
+
+    let bytes = std::fs::read(tmp.path()).unwrap();
+    let data = bytes::Bytes::from(bytes);
+    let builder =
+        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(data).unwrap();
+    let mut reader = builder.build().unwrap();
+    let read = reader.next().unwrap().unwrap();
+    let col = read
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(col.len(), 3);
+    assert!(
+        !col.is_null(0),
+        "empty string must not be read back as NULL"
+    );
+    assert_eq!(col.value(0), "");
+    assert!(col.is_null(1), "explicit NULL must remain NULL");
+    assert_eq!(col.value(2), "x");
+}

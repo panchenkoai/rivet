@@ -1885,3 +1885,281 @@ exports:
         "expected field name: {msg}"
     );
 }
+
+// =============================================================================
+// Invalid config combinations — QA backlog Task 5.1
+// =============================================================================
+
+#[test]
+fn empty_exports_list_is_rejected() {
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports: []
+"#;
+    let err = Config::from_yaml(yaml).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.to_lowercase().contains("export"),
+        "expected error mentioning 'export' for empty exports list: {msg}"
+    );
+}
+
+#[test]
+fn duplicate_export_names_are_rejected() {
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: orders
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+  - name: orders
+    query: "SELECT 2"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#;
+    let err = Config::from_yaml(yaml).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.to_lowercase().contains("duplicate") || msg.contains("orders"),
+        "expected duplicate-name error mentioning 'orders': {msg}"
+    );
+}
+
+#[test]
+fn chunked_with_parallel_zero_is_rejected() {
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: bad
+    query: "SELECT 1"
+    mode: chunked
+    chunk_column: id
+    parallel: 0
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#;
+    let err = Config::from_yaml(yaml).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("parallel"),
+        "validation must mention 'parallel'"
+    );
+}
+
+#[test]
+fn chunked_with_chunk_size_zero_is_rejected() {
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: bad
+    query: "SELECT 1"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 0
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#;
+    let err = Config::from_yaml(yaml).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("chunk_size"),
+        "validation must mention 'chunk_size'"
+    );
+}
+
+// =============================================================================
+// Placeholder / parameter resolution — QA backlog Task 5.2 (edge cases)
+// =============================================================================
+
+#[test]
+fn resolve_vars_unicode_value_preserved_exactly() {
+    let mut params = std::collections::HashMap::new();
+    params.insert("GREETING".into(), "Привіт 🌍".into());
+    let got = resolve_vars("msg=${GREETING}!", Some(&params)).unwrap();
+    assert_eq!(got, "msg=Привіт 🌍!");
+}
+
+#[test]
+fn resolve_vars_value_with_quotes_newlines_braces_passes_through() {
+    // These characters often break naive substitution (they look "structural"
+    // in YAML and SQL).  `resolve_vars` is a literal text substitution;
+    // downstream escaping is the caller's responsibility.  Values must land
+    // verbatim.
+    let mut params = std::collections::HashMap::new();
+    params.insert(
+        "NASTY".into(),
+        "a \"quote\" and a\nnewline and a {brace}".into(),
+    );
+    let got = resolve_vars("v=[${NASTY}]", Some(&params)).unwrap();
+    assert_eq!(got, "v=[a \"quote\" and a\nnewline and a {brace}]");
+}
+
+#[test]
+fn resolve_vars_long_value_terminates_quickly() {
+    // 1 MiB value exercises any accidental O(n²) substitution.
+    let big = "a".repeat(1024 * 1024);
+    let mut params = std::collections::HashMap::new();
+    params.insert("BIG".into(), big);
+
+    let t0 = std::time::Instant::now();
+    let got = resolve_vars("x=${BIG}y", Some(&params)).unwrap();
+    let dur = t0.elapsed();
+    assert_eq!(got.len(), 2 + 1024 * 1024 + 1);
+    assert!(got.starts_with("x=") && got.ends_with('y'));
+    assert!(
+        dur.as_secs() < 5,
+        "expected sub-5s resolution of a 1MiB value, took {dur:?}"
+    );
+}
+
+#[test]
+fn resolve_vars_repeated_placeholder_uses_value_each_time() {
+    let mut params = std::collections::HashMap::new();
+    params.insert("A".into(), "alpha".into());
+    params.insert("B".into(), "beta".into());
+    let got = resolve_vars("${A}${A}-${B}-${A}", Some(&params)).unwrap();
+    assert_eq!(got, "alphaalpha-beta-alpha");
+}
+
+// =============================================================================
+// parse_file_size boundaries + fuzz — QA backlog Task 2.3
+// =============================================================================
+
+#[test]
+fn parse_file_size_rejects_empty_and_garbage() {
+    assert!(parse_file_size("").is_err());
+    assert!(parse_file_size("not-a-size").is_err());
+    assert!(parse_file_size("MB").is_err());
+    assert!(parse_file_size("GB 1").is_err());
+}
+
+#[test]
+fn parse_file_size_boundary_exact_kb() {
+    assert_eq!(parse_file_size("1023").unwrap(), 1023);
+    assert_eq!(parse_file_size("1024").unwrap(), 1024);
+    assert_eq!(parse_file_size("1KB").unwrap(), 1024);
+}
+
+#[test]
+fn parse_file_size_does_not_panic_on_huge_inputs_and_is_deterministic() {
+    // Absurd inputs either parse (possibly saturating) or return Err — but
+    // never panic.  Same input must produce the same Ok/Err verdict.
+    let inputs = [
+        "1000000000000000000000000GB",
+        "1e308GB",
+        "999999999999999999999999999B",
+        "1.7976931348623157e308MB",
+    ];
+    for s in inputs {
+        let a = parse_file_size(s).is_ok();
+        let b = parse_file_size(s).is_ok();
+        assert_eq!(a, b, "deterministic for input {s:?}");
+    }
+}
+
+#[test]
+fn parse_file_size_negative_values_are_not_huge_positive() {
+    // A negative file size is nonsense; callers rely on max_file_size being
+    // a usable upper bound.  Assert the behaviour is either "error" or "zero",
+    // never a huge positive number that would silently disable splitting.
+    match parse_file_size("-1GB").ok() {
+        None => {}
+        Some(v) => assert_eq!(v, 0, "negative must coerce to 0 if accepted, got {v}"),
+    }
+}
+
+// =============================================================================
+// Full-config parse goldens (migrated from former tests/v2_golden.rs)
+// =============================================================================
+
+#[test]
+fn chunked_config_full_parse_goldens() {
+    let cfg = Config::from_yaml(
+        r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: orders
+    query: "SELECT * FROM orders"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 50000
+    parallel: 4
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#,
+    )
+    .unwrap();
+    let e = &cfg.exports[0];
+    assert_eq!(e.mode, ExportMode::Chunked);
+    assert_eq!(e.chunk_column.as_deref(), Some("id"));
+    assert_eq!(e.chunk_size, 50000);
+    assert_eq!(e.parallel, 4);
+}
+
+#[test]
+fn time_window_config_full_parse_goldens() {
+    let cfg = Config::from_yaml(
+        r#"
+source:
+  type: mysql
+  url: "mysql://localhost/test"
+exports:
+  - name: events
+    query: "SELECT * FROM events"
+    mode: time_window
+    time_column: created_at
+    time_column_type: unix
+    days_window: 30
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#,
+    )
+    .unwrap();
+    let e = &cfg.exports[0];
+    assert_eq!(e.mode, ExportMode::TimeWindow);
+    assert_eq!(e.time_column.as_deref(), Some("created_at"));
+    assert_eq!(e.time_column_type, TimeColumnType::Unix);
+    assert_eq!(e.days_window, Some(30));
+}
+
+#[test]
+fn query_file_config_parses_goldens() {
+    let cfg = Config::from_yaml(
+        r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: custom
+    query_file: sql/custom.sql
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#,
+    )
+    .unwrap();
+    assert!(cfg.exports[0].query.is_none());
+    assert_eq!(cfg.exports[0].query_file.as_deref(), Some("sql/custom.sql"));
+}

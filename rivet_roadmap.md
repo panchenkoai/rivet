@@ -658,6 +658,7 @@ Rivet core is **feature-complete for beta** extraction. All Wave 1–3 stabilisa
 | Versioned SQLite migrations | `schema_version` |
 | `aws_profile` for S3 | Sets `AWS_PROFILE` for OpenDAL chain |
 | Chunked quality gate | Row-count bounds after all chunks; warn on null/unique in chunked mode |
+| QA live-test harness | `tests/common/mod.rs` + 46 live tests across 10 binaries mapped 1:1 to backlog tasks (`rivet_qa_backlog_v2.md`); full offline suite (1096 tests, 21 integration files) runs on every PR via `cargo test`. See [docs/reference/testing.md](docs/reference/testing.md). |
 
 ---
 
@@ -678,17 +679,17 @@ Rivet core is **feature-complete for beta** extraction. All Wave 1–3 stabilisa
 | Task | Status | Priority | Notes |
 |------|--------|----------|-------|
 | G1 | ✅ | P1 | MinIO + E2E |
-| G2 | ⏳ | P2 | Toxiproxy |
+| G2 | ✅ | P2 | Toxiproxy wired into `docker-compose.yaml`, registered via `tests/common/mod.rs::ensure_toxi_proxy`, exercised by `tests/live_retry_and_faults.rs` + `tests/live_chaos.rs`; cross-process flock guard prevents suite races |
 | G3 | ✅ Partial | P1 | `seed` inserts; limited mutations |
 | G4 | ✅ Partial | P1 | `dev/` configs; edge fixtures TBD |
-| G5 | ✅ | P0 | E2E matrix in CI |
+| G5 | ✅ | P0 | E2E matrix in CI — `ci.yml::e2e` now runs both `dev/e2e/run_e2e.sh` **and** `cargo test --release -- --ignored` (46 live tests across 10 `tests/live_*.rs` binaries). See [docs/reference/testing.md](docs/reference/testing.md) for the full matrix. |
 
 ### Epic H — Crash and recovery
 
 | Task | Status | Priority | Notes |
 |------|--------|----------|-------|
 | H1 | ✅ | P1 | `dev/CRASH_MATRIX.md` |
-| H2 | ⏳ | P2 | Failure injection hooks |
+| H2 | ✅ | P2 | Env-var-driven fault-injection hook in `src/test_hook.rs` (`RIVET_TEST_PANIC_AT`); four fault points across the write cycle (`after_source_read`, `after_file_write`, `after_manifest_update`, `after_cursor_commit`); crash-point recovery matrix in `tests/live_crash_recovery.rs`. Zero overhead when env var is unset (one relaxed atomic load per call). |
 | H3 | ✅ | P1 | E2E recovery paths |
 | H4 | ✅ Partial | P1 | Link CRASH_MATRIX from USER_GUIDE if missing |
 

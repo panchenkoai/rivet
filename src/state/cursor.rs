@@ -127,4 +127,76 @@ mod tests {
         assert_eq!(all[0].export_name, "alpha");
         assert_eq!(all[2].export_name, "gamma");
     }
+
+    // ─── Cursor round-trip / monotonicity (QA backlog Task 3.1) ─────────────
+    //
+    // ADR-0001 I3 makes monotonicity a pipeline responsibility, not a storage
+    // one.  These tests pin the *value-preservation* contract on the state
+    // side — the subset the pipeline relies on when reading the stored cursor
+    // back on resume.
+
+    /// Duplicate cursor values across runs are common when the cursor column
+    /// is a low-precision timestamp with ties.  The store must return each
+    /// written value verbatim.
+    #[test]
+    fn duplicate_cursor_values_are_stored_as_written() {
+        let s = store();
+        s.update("orders", "2024-06-01T00:00:00Z").unwrap();
+        s.update("orders", "2024-06-01T00:00:00Z").unwrap();
+        assert_eq!(
+            s.get("orders").unwrap().last_cursor_value.as_deref(),
+            Some("2024-06-01T00:00:00Z")
+        );
+    }
+
+    /// Microsecond/nanosecond precision must not be rounded or truncated on
+    /// round-trip — otherwise the pipeline's strict-greater-than boundary
+    /// check would re-export rows on the microsecond edge.
+    #[test]
+    fn high_precision_timestamp_is_preserved_byte_for_byte() {
+        let s = store();
+        let ts = "2024-06-01T12:34:56.123456789+02:00";
+        s.update("events", ts).unwrap();
+        assert_eq!(
+            s.get("events").unwrap().last_cursor_value.as_deref(),
+            Some(ts)
+        );
+    }
+
+    /// Cursor values can be arbitrary UTF-8: UUID v7, version tokens,
+    /// Cyrillic names, multiline strings, the empty string.
+    #[test]
+    fn unicode_and_binary_like_cursor_values_round_trip() {
+        let s = store();
+        let values = [
+            "2024-06-01",
+            "018f1c0b-7a34-7b54-8e16-1c5a9b3f1c2d", // UUID v7
+            "Русский 🚀 cursor",
+            "v\n\t with whitespace",
+            "",
+        ];
+        for v in values {
+            s.update("t", v).unwrap();
+            assert_eq!(
+                s.get("t").unwrap().last_cursor_value.as_deref(),
+                Some(v),
+                "cursor value {v:?} must round-trip exactly"
+            );
+        }
+    }
+
+    /// Resume-from-zero tooling depends on `reset` producing a state
+    /// indistinguishable from "never ran": both cursor and last_run_at gone.
+    #[test]
+    fn reset_clears_cursor_state_completely() {
+        let s = store();
+        s.update("orders", "2024-06-01").unwrap();
+        s.reset("orders").unwrap();
+        let after = s.get("orders").unwrap();
+        assert!(after.last_cursor_value.is_none());
+        assert!(
+            after.last_run_at.is_none(),
+            "reset must clear last_run_at as well"
+        );
+    }
 }

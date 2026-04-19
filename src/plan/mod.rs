@@ -222,7 +222,14 @@ pub fn build_time_window_query(
     let quoted_col = crate::sql::quote_ident(source_type, time_column);
 
     let now = chrono::Utc::now();
-    let window_start = now - chrono::Duration::days(days_window as i64);
+    // `days_window` is a u32 — at the upper end (~4.3 billion days, i.e. ~12
+    // million years) naive `now - Duration::days(n)` falls outside chrono's
+    // representable range and panics. Use checked arithmetic and saturate
+    // at chrono's MIN_UTC; the resulting SQL literal will be rejected by
+    // the source if it is nonsensical, but the planner never panics.
+    let window_start = chrono::Duration::try_days(days_window as i64)
+        .and_then(|d| now.checked_sub_signed(d))
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
     let truncated = window_start
         .date_naive()
         .and_hms_opt(0, 0, 0)

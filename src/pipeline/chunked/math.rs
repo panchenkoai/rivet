@@ -31,9 +31,17 @@ pub fn generate_chunks(min: i64, max: i64, chunk_size: i64) -> Vec<(i64, i64)> {
     }
     let mut chunks = Vec::new();
     let mut start = min;
-    while start <= max {
-        let end = (start + chunk_size - 1).min(max);
+    loop {
+        // Saturating arithmetic: when `start` is within `chunk_size` of i64::MAX
+        // the naive `start + chunk_size - 1` would overflow and panic. We clamp
+        // at i64::MAX and then `.min(max)` produces the correct inclusive end.
+        let end = start.saturating_add(chunk_size - 1).min(max);
         chunks.push((start, end));
+        // Two exit conditions: the chunk reached `max`, or `end` hit i64::MAX
+        // (next start would overflow). Either way no more chunks remain.
+        if end == max || end == i64::MAX {
+            break;
+        }
         start = end + 1;
     }
     chunks
@@ -258,5 +266,129 @@ mod tests {
         );
         assert!(q.contains(">= '2024-03-15'"), "got: {q}");
         assert!(q.contains("< '2024-03-16'"), "got: {q}");
+    }
+
+    // ─── Property-style invariants (QA backlog Task 3.2) ────────────────────
+    //
+    // Core invariants checked on every non-empty `generate_chunks` output.
+    // Encoded as a helper + wide grid sweep so every boundary condition
+    // the planner encounters in practice is exercised deterministically.
+
+    fn assert_chunk_invariants(min: i64, max: i64, size: i64, chunks: &[(i64, i64)]) {
+        if max < min || size <= 0 {
+            assert!(chunks.is_empty(), "invalid input must yield []: {chunks:?}");
+            return;
+        }
+
+        assert!(
+            !chunks.is_empty(),
+            "valid range must yield at least one chunk"
+        );
+        assert_eq!(chunks.first().unwrap().0, min, "first chunk starts at min");
+        assert_eq!(chunks.last().unwrap().1, max, "last chunk ends at max");
+
+        for (i, (s, e)) in chunks.iter().enumerate() {
+            assert!(s <= e, "chunk {i} well-formed");
+            if i > 0 {
+                let (_, pe) = chunks[i - 1];
+                assert_eq!(*s, pe + 1, "chunks are adjacent, no gap or overlap");
+            }
+        }
+
+        for (i, (s, e)) in chunks.iter().enumerate() {
+            let len = e - s + 1;
+            if i + 1 < chunks.len() {
+                assert_eq!(len, size, "non-final chunks have exactly size elements");
+            } else {
+                assert!(len >= 1 && len <= size, "final chunk is 1..=size");
+            }
+        }
+
+        let total: i64 = chunks.iter().map(|(s, e)| e - s + 1).sum();
+        assert_eq!(total, max - min + 1, "sum of chunks equals total range");
+    }
+
+    #[test]
+    fn generate_chunks_invariants_over_grid() {
+        let mins: [i64; 6] = [-50, -1, 0, 1, 100, 1_000_000];
+        let sizes: [i64; 8] = [1, 2, 3, 7, 10, 33, 100, 10_000];
+        for &min in &mins {
+            for &size in &sizes {
+                for delta in 0..=(4 * size) {
+                    let max = min + delta - 1;
+                    let chunks = generate_chunks(min, max, size);
+                    assert_chunk_invariants(min, max, size, &chunks);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn generate_chunks_empty_on_invalid_inputs() {
+        assert!(generate_chunks(10, 5, 10).is_empty());
+        assert!(generate_chunks(1, 100, 0).is_empty());
+        assert!(generate_chunks(1, 100, -5).is_empty());
+    }
+
+    #[test]
+    fn generate_chunks_single_element_range() {
+        assert_eq!(generate_chunks(42, 42, 100), vec![(42, 42)]);
+        assert_eq!(generate_chunks(42, 42, 1), vec![(42, 42)]);
+    }
+
+    #[test]
+    fn generate_chunks_chunk_size_larger_than_range() {
+        let chunks = generate_chunks(10, 20, 10_000);
+        assert_eq!(chunks, vec![(10, 20)]);
+        assert_chunk_invariants(10, 20, 10_000, &chunks);
+    }
+
+    #[test]
+    fn generate_chunks_boundary_exact_multiple() {
+        let chunks = generate_chunks(1, 100, 25);
+        assert_eq!(chunks, vec![(1, 25), (26, 50), (51, 75), (76, 100)]);
+        assert_chunk_invariants(1, 100, 25, &chunks);
+    }
+
+    #[test]
+    fn generate_chunks_boundary_off_by_one() {
+        let chunks = generate_chunks(1, 101, 25);
+        assert_eq!(chunks.last(), Some(&(101, 101)));
+        assert_chunk_invariants(1, 101, 25, &chunks);
+    }
+
+    /// Regression for the i64::MAX overflow that crashed `start + chunk_size - 1`
+    /// before the saturating fix. See QA backlog Task 3.2 / 4A.2.
+    #[test]
+    fn generate_chunks_does_not_overflow_on_near_i64_max() {
+        let min = i64::MAX - 10;
+        let max = i64::MAX;
+        let chunks = generate_chunks(min, max, 3);
+        assert_chunk_invariants(min, max, 3, &chunks);
+    }
+
+    /// Extreme boundary combinations: each triple must either succeed or
+    /// terminate immediately (empty).  Never panic.  QA backlog Task 4A.2.
+    #[test]
+    fn generate_chunks_does_not_panic_on_extreme_boundaries() {
+        // Every entry generates at most a small bounded number of chunks,
+        // otherwise this test would hang.  "Wide range × tiny chunk_size" is
+        // out of scope for a fuzz smoke — it needs a planner-level cap.
+        let triples: &[(i64, i64, i64)] = &[
+            (0, 0, 1),
+            (i64::MIN, i64::MIN + 1, 1),
+            (i64::MIN, i64::MIN, 1),
+            (i64::MIN, i64::MAX, i64::MAX),
+            (i64::MAX - 2, i64::MAX, 1),
+            (i64::MAX - 2, i64::MAX, 10),
+            (i64::MAX - 2, i64::MAX, i64::MAX),
+            (-10, 10, 3),
+            (0, 0, i64::MAX),
+            (0, 0, i64::MIN),
+            (5, 5, -1),
+        ];
+        for &(min, max, size) in triples {
+            let _ = generate_chunks(min, max, size);
+        }
     }
 }

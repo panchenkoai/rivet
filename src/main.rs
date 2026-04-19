@@ -17,6 +17,7 @@ mod resource;
 mod source;
 mod sql;
 mod state;
+mod test_hook;
 mod tuning;
 mod types;
 

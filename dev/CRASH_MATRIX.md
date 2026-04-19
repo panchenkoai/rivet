@@ -55,3 +55,31 @@ Enumerates failure stages during an export and documents the expected behavior w
 2. Use `chunk_checkpoint: true` for large chunked exports to enable resume
 3. Use `--validate` to verify output file integrity
 4. Downstream consumers should handle duplicate rows (dedup by primary key + `_rivet_run_id`)
+
+## Automated Crash-Point Coverage (test-only fault injection)
+
+The four high-risk boundaries in the write cycle are wired to a lightweight
+env-var-driven hook in `src/test_hook.rs`.  Setting `RIVET_TEST_PANIC_AT=<point>`
+causes the pipeline to panic exactly at the named boundary.  No cargo feature
+flag is required and the runtime cost when the env var is unset is a single
+relaxed atomic load per call (≈ 1 ns).
+
+| Env value | Boundary | ADR-0001 invariant window | Post-crash state expected |
+|-----------|----------|---------------------------|---------------------------|
+| `after_source_read` | After source stream drained, before writer finalise | Pre-I2 | No file, no manifest, no cursor |
+| `after_file_write` | After `dest.write` Ok, before manifest row | I2→I3 crash window | File on disk, manifest empty, cursor absent |
+| `after_manifest_update` | After `record_file`, before cursor advance | I2 written, I3 pending | File + manifest, cursor absent |
+| `after_cursor_commit` | After `state.update`, before final metric | I3 written, I4 pending | File + manifest + cursor; metric may or may not exist |
+
+The crash-point recovery matrix lives in `tests/live_crash_recovery.rs` —
+each row in the table above has an automated test that (1) injects the crash,
+(2) asserts the observable state, (3) re-runs without the injection and
+asserts recovery produces the full export.  Run with:
+
+```bash
+docker compose up -d postgres
+cargo test --test live_crash_recovery -- --ignored
+```
+
+See also: [docs/reference/testing.md](../docs/reference/testing.md) for the
+full offline + live test matrix.

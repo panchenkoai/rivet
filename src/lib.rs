@@ -25,6 +25,10 @@ pub(crate) mod enrich;
 pub(crate) mod error;
 pub(crate) mod notify;
 pub(crate) mod plan;
+// Test-only fault-injection hook used by `tests/live_crash_recovery.rs`.
+// Activated by the `RIVET_TEST_PANIC_AT` env var; no-op otherwise.  See
+// module docs for details.
+pub(crate) mod test_hook;
 // preflight functions are invoked from main.rs (binary), not from the lib target;
 // #[allow(dead_code)] suppresses false-positive lint in the lib compilation unit.
 #[allow(dead_code)]

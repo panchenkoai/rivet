@@ -145,9 +145,17 @@ fn write_csv_value(writer: &mut dyn Write, array: &dyn Array, idx: usize) -> Res
                 .downcast_ref::<Date32Array>()
                 .expect("DataType/Array mismatch");
             let days = arr.value(idx);
-            let date = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch is valid")
-                + chrono::Duration::days(days as i64);
-            write!(writer, "{}", date)?;
+            // `Date32` is "days since 1970-01-01"; a pathological value near
+            // i32::MAX overflows `NaiveDate + Duration` and panics in chrono.
+            // Fall back to checked arithmetic and emit an empty cell on
+            // overflow — matches the null-cell convention for unserialisable
+            // values elsewhere in this writer.
+            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch is valid");
+            let date =
+                chrono::Duration::try_days(days as i64).and_then(|d| epoch.checked_add_signed(d));
+            if let Some(date) = date {
+                write!(writer, "{}", date)?;
+            }
         }
         DataType::Timestamp(TimeUnit::Microsecond, _) => {
             let arr = array

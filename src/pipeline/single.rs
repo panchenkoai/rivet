@@ -163,6 +163,10 @@ pub(super) fn run_single_export(
         &mut sink,
     )?;
 
+    // Test fault-point #1: after the source stream was fully read but
+    // before the writer is finalised.  Exercised by QA backlog Task 1.1.
+    crate::test_hook::maybe_panic_at("after_source_read");
+
     if let Some(w) = sink.writer.take() {
         w.finish()?;
     }
@@ -270,6 +274,12 @@ pub(super) fn run_single_export(
         };
         dest.write(part.tmp.path(), &file_name)?;
 
+        // Test fault-point #2: dest.write() just succeeded, but the manifest
+        // has NOT been updated yet.  Reproduces the ADR-0001 I2→I3 crash
+        // window (file at destination, no record in manifest, cursor not
+        // advanced).  QA backlog Task 1.1.
+        crate::test_hook::maybe_panic_at("after_file_write");
+
         // ADR-0001 I2–I4 / ADR-0004: state writes happen only after destination.write()
         // returns Ok(()), which for all current backends is the commit boundary.
         summary.journal.record(RunEvent::FileWritten {
@@ -297,6 +307,10 @@ pub(super) fn run_single_export(
                 e
             );
         }
+
+        // Test fault-point #3: manifest has just been recorded, but the
+        // cursor has NOT been advanced yet.  QA backlog Task 1.1.
+        crate::test_hook::maybe_panic_at("after_manifest_update");
     }
 
     if let Some(cursor_col) = plan.strategy.cursor_extract_column()
@@ -304,6 +318,12 @@ pub(super) fn run_single_export(
         && let Some(last_val) = extract_last_cursor_value(batch, cursor_col, schema)
     {
         st.update(&plan.export_name, &last_val)?;
+
+        // Test fault-point #4: cursor advanced, but the final run metric
+        // (record_metric at the outer pipeline loop) has NOT been recorded.
+        // QA backlog Task 1.1.
+        crate::test_hook::maybe_panic_at("after_cursor_commit");
+
         log::info!(
             "export '{}': cursor updated to '{}'",
             plan.export_name,

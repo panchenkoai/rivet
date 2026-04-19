@@ -105,7 +105,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Start services
-        run: docker compose up -d postgres mysql minio fake-gcs
+        # Include `toxiproxy` so the retry / chaos / crash-recovery live-test
+        # binaries have the proxy admin API available on :8474.
+        run: docker compose up -d postgres mysql minio fake-gcs toxiproxy
 
       - name: Wait for services
         run: |
@@ -128,6 +130,13 @@ jobs:
           MINIO_SECRET_KEY: minioadmin
           RIVET: ./target/release/rivet
         run: bash dev/e2e/run_e2e.sh
+
+      - name: Run live cargo integration tests
+        # Activates every `tests/live_*.rs` binary that is `#[ignore]`d by
+        # default (Phase A–G of the QA backlog).  Cross-process synchronisation
+        # on the shared Toxiproxy admin API is enforced by an flock-based
+        # `toxiproxy_guard` in `tests/common/mod.rs`.
+        run: cargo test --release -- --ignored
 
       - name: Stop services
         if: always()

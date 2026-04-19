@@ -1,5 +1,132 @@
 # Changelog
 
+## 0.3.3 (2026-04-19)
+
+QA test matrix + panic-safety follow-up. No YAML config deserializes
+differently; no export artifact format changes. Three latent panics in the
+pipeline are now graceful; four config combinations that used to be accepted
+silently are now rejected at validation time (see **Fail-fast validation**
+below — not a YAML-format break, but configs that relied on silent
+acceptance will surface the error they were always hiding).
+
+### Panic-safety fixes
+
+Surfaced by the new fuzz suites (`tests/planner_fuzz.rs`,
+`tests/format_fuzz.rs`) and by `src/pipeline/chunked/math.rs::mod tests`:
+
+- **`generate_chunks` near `i64::MAX`** — `start + chunk_size - 1` overflowed
+  and panicked when the cursor column reached the BIGINT upper bound. Fixed
+  with saturating arithmetic and an explicit exit when `end == i64::MAX`.
+  (`src/pipeline/chunked/math.rs`)
+- **`build_time_window_query` on `days_window: u32::MAX`** — naive
+  `now - Duration::days(u32::MAX as i64)` walks back ~12 million years and
+  falls outside chrono's representable range. Replaced with
+  `Duration::try_days().and_then(checked_sub_signed)` saturating at
+  `DateTime::MIN_UTC`. (`src/plan/mod.rs`)
+- **CSV writer on pathological `Date32` values** — `NaiveDate + Duration::days(i64)`
+  panicked for values near `i32::MAX` (roughly 1.5 million years from
+  1970-01-01). Uses `checked_add_signed` with a fallback to an empty cell
+  (matching the null-cell convention already used by this writer).
+  (`src/format/csv.rs`)
+
+None of these reachable from sensible input, but each was a panic surface the
+fuzz suites turned into deterministic regression tests.
+
+### Fail-fast validation
+
+`Config::validate` now rejects four combinations that previously parsed
+successfully but produced broken runs at execution time:
+
+- empty `exports: []` — used to be a silent no-op that looked like success
+  in schedulers;
+- duplicate export names — would silently share `export_state` /
+  `file_manifest` / `chunk_run` rows (all keyed by name);
+- `mode: chunked` with `parallel: 0` — zero workers never claim a task, so
+  the run hung forever;
+- `mode: chunked` with `chunk_size: 0` — before the saturating fix in
+  `generate_chunks`, this was an infinite loop at the planner level.
+
+All four come with actionable error messages that name the offending field.
+Configs that hit any of these never produced usable output — this is a
+fail-fast, not a breaking change.
+
+### QA test matrix — `rivet_qa_backlog_v2.md` + `docs/reference/testing.md`
+
+The full coverage of QA backlog tasks is now shipped as automated tests. See
+the new `docs/reference/testing.md` for the file-level map and
+`rivet_qa_backlog_v2.md`'s footer for the task-level status.
+
+- **1096 offline tests** across 21 integration files + inline unit modules.
+  Runs on every PR via `cargo test`.
+- **46 live tests** across 10 `tests/live_*.rs` binaries exercising the full
+  `rivet` binary against the docker-compose stack (Postgres 16 + MySQL 8 +
+  MinIO + fake-gcs + Toxiproxy). Gated by `#[ignore]`; activated with
+  `cargo test -- --ignored`.
+- Shared harness in `tests/common/mod.rs`:
+  - `require_alive(service)` — fast TCP reachability probe with actionable
+    failure messages;
+  - RAII `PgTable` / `MysqlTable` guards for per-test unique tables;
+  - `unique_name(prefix)` — PID + atomic counter naming for race-free
+    parallel runs;
+  - Minimal Toxiproxy admin client over raw `TcpStream` (no blocking
+    tokio runtime);
+  - Cross-process `flock(2)` lock on `$TMPDIR/rivet_qa_toxiproxy.lock` so
+    cargo's parallel integration binaries do not race on the shared admin
+    API;
+  - `ensure_minio_bucket` / `ensure_gcs_bucket` idempotent bucket creation.
+
+### Test-only fault-injection hook
+
+New env-var-driven hook in `src/test_hook.rs` reads `RIVET_TEST_PANIC_AT`
+once at startup and panics at one of four named pipeline boundaries if the
+value matches: `after_source_read`, `after_file_write`,
+`after_manifest_update`, `after_cursor_commit`. The `tests/live_crash_recovery.rs`
+suite injects each one, asserts the observable post-crash state, then
+re-runs without the injection and asserts recovery produces the expected
+final state. Zero overhead when unset (one relaxed atomic load per call).
+
+See `dev/CRASH_MATRIX.md` for the boundary table and the invariant windows
+(ADR-0001 I2–I4).
+
+### Slack / webhook internals
+
+- Extracted `build_slack_payload` and `should_notify` from `maybe_send` as
+  `pub(crate)` pure functions so contract tests can pin payload shape
+  without spinning up `reqwest`'s blocking client. Field marker test
+  guarantees notifications include only `export_name` / `status` /
+  `total_rows` / `duration_ms` / `error_message` — not `tuning_profile`,
+  `format`, `mode`, or `compression` (guards against accidental over-
+  exposure in webhooks).
+- Mock HTTP receiver based on `std::net::TcpListener` exercises the
+  webhook path end-to-end for `200 OK`, `429`, `500`, and "no trigger
+  matched — no connection made" cases.
+
+### CI
+
+`.github/workflows/ci.yml`:
+
+- `e2e` job now also starts `toxiproxy` (was only postgres/mysql/minio/fake-gcs);
+- new step runs `cargo test --release -- --ignored` after the bash E2E
+  script, wiring the entire live suite into branch-gate CI.
+
+### Docs
+
+- `docs/reference/testing.md` — new offline + live matrix reference.
+- `docs/README.md` — reference link to the above.
+- `dev/CRASH_MATRIX.md` — automated coverage section with the env-var hook
+  boundary table.
+- `rivet_roadmap.md` — Epic G (Toxiproxy) and Epic H (fault-injection hook)
+  flipped from ⏳ to ✅ with evidence.
+
+### Internal refactoring
+
+- Collapsed `tests/v2_golden.rs` (5-in-1 mixed file) into focused domain
+  files: `tests/time_window.rs`, `tests/resource_smoke.rs`, with
+  validate / chunk parsing tests folded into
+  `tests/validate_regression.rs` and `src/config/tests.rs`.
+
+---
+
 ## 0.3.2 (2026-04-18)
 
 SecOps audit follow-up plus an expanded database-version compatibility matrix.
