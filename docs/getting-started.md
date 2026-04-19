@@ -164,9 +164,19 @@ source:
 - `tls: { mode: verify-full }` — omitting `tls:` connects in plaintext and logs a WARN. See [reference/config.md § TLS](reference/config.md#tls) for `verify-ca` / `require` / `disable` semantics.
 - `rivet init --source-env DATABASE_URL` instead of `--source <url>` — keeps creds out of shell history, `ps`, and container inspect logs.
 
+## Walkthrough at a glance
+
+The full basic workflow (`init` -> `doctor` -> `check` -> `run` -> `state`) in one GIF:
+
+![Basic workflow](gifs/basic.gif)
+
+Source: [docs/gifs/basic.tape](gifs/basic.tape). The step-by-step narrative continues below; individual steps have their own focused GIFs.
+
 ## 3. Scaffold a config with `rivet init` (optional)
 
 If you prefer to start from your real tables instead of copying a template, use **`rivet init`**. It connects once, reads column lists and rough row estimates, and writes a YAML file with `url_env: DATABASE_URL` and suggested export modes.
+
+![rivet init scaffolding a YAML from a live table](gifs/init-scaffold.gif)
 
 ```bash
 export DATABASE_URL='postgresql://user:pass@localhost:5432/mydb'
@@ -201,6 +211,10 @@ rivet check --config my_export.yaml
 
 This runs a dry-run analysis of each export: checks table existence, estimates row counts, detects index availability, and recommends a tuning profile.
 
+![rivet check verdict block](gifs/check-verdict.gif)
+
+Verdicts: `EFFICIENT` (indexed scan on sensible volume) · `ACCEPTABLE` (works but slower than ideal) · `DEGRADED` (full scan / missing index — see the `Suggestion:` line) · `UNSAFE` (estimated cost high enough to hurt production). `DEGRADED` and `UNSAFE` always carry a concrete, mode-aware suggestion.
+
 ## 6. Run your first export
 
 ```bash
@@ -219,17 +233,21 @@ rivet run --config my_export.yaml --validate --reconcile
 
 For CI/CD pipelines or pre-reviewed production runs, use the plan/apply workflow instead of `rivet run`:
 
+![Sealed plan artifact, credential redaction (PA9), apply](gifs/plan-apply.gif)
+
 ```bash
 # Generate a sealed execution plan (no data exported)
-rivet plan --config my_export.yaml -o plan.json
+rivet plan --config my_export.yaml --format json -o plan.json
 
 # Review plan.json, then execute
 rivet apply plan.json
 ```
 
-The plan artifact captures config, query fingerprints, and cursors at planning time. `rivet apply` validates that nothing has changed before executing. See [reference/cli.md](reference/cli.md#rivet-plan) for details.
+The plan artifact captures config, query fingerprints, and cursors at planning time. Plaintext `password:` values and `scheme://user:pass@` userinfo are stripped by [ADR-0005 PA9](adr/0005-plan-apply-contracts.md#pa9--artifact-credential-redaction-acr); references (`password_env` / `url_env` / `url_file`) are preserved so the apply environment can re-resolve them. `rivet apply` validates that nothing has changed before executing. See [reference/cli.md](reference/cli.md#rivet-plan) for details.
 
 ## 7. Inspect results
+
+![Post-run inspection: state show, metrics, state files, state progression](gifs/inspect.gif)
 
 ```bash
 # View export state (cursors for incremental exports)
@@ -240,7 +258,24 @@ rivet metrics --config my_export.yaml --last 10
 
 # View produced files
 rivet state files --config my_export.yaml
+
+# Committed / verified boundaries (advisory; see ADR-0008)
+rivet state progression --config my_export.yaml
 ```
+
+`rivet state show` is empty after a `full` run (no cursor to record); `state progression` and `state files` populate for any run; `metrics` shows one row per run with `run_id`, rows, bytes, duration, peak RSS, and status.
+
+## 8. Optional: reconcile and repair
+
+For chunked exports run with `chunk_checkpoint: true`, Rivet can re-count every partition on the source and compare against the stored per-chunk row counts:
+
+![Chunked export, drift detection, targeted repair](gifs/reconcile-repair.gif)
+
+```bash
+rivet reconcile --config my_export.yaml --export orders
+```
+
+If the report is dirty, `rivet repair --config my_export.yaml --export orders --execute` re-runs only the flagged chunk ranges — new files are written alongside the originals, and the committed boundary is not touched. See [reference/cli.md#rivet-repair](reference/cli.md#rivet-repair) and [ADR-0009](adr/0009-reconcile-and-repair-contracts.md).
 
 ## Next steps
 

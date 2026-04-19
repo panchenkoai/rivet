@@ -85,6 +85,8 @@ If two or more members of the same group land in the **heavy** cost classes, Riv
 
 ## Viewing the output
 
+![Multi-export `rivet plan`: Priority block per export, Campaign with heavy-source collision warning](../gifs/plan-campaign.gif)
+
 **Pretty (default)** — `rivet plan --config ...` prints a `Priority` block per export and a `Campaign` block when multiple exports are planned:
 
 ```
@@ -110,15 +112,12 @@ If two or more members of the same group land in the **heavy** cost classes, Riv
 
 ---
 
-## Out of scope for v1
+## Out of scope
 
-- Runtime scheduling / queueing / throttling.
-- Historical runtime-informed refinement (duration, retries, throughput).
-- Automatic execution reordering based on the campaign view.
-- Business-criticality overrides.
+- Runtime scheduling / queueing / throttling — Rivet recommends; operators schedule.
+- Automatic execution reordering based on the campaign view — the artifact surfaces the order; no runtime component consumes it.
+- Business-criticality overrides — not inferred from the database; express via `source_group` and `reconcile_required`.
 
-See the planning documents for the full roadmap:
+Historical refinement (Epic I) is in scope and implemented — see the section above.
 
-- [rivet-roadmap-source-aware-planning-patch.md](rivet-roadmap-source-aware-planning-patch.md)
-- [source-aware-planning-work-order.md](source-aware-planning-work-order.md)
-- [source-aware-prioritization-implementation-plan.md](source-aware-prioritization-implementation-plan.md)
+For future planning work, see [rivet_roadmap.md](../../rivet_roadmap.md) at the repo root.

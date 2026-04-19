@@ -10,6 +10,8 @@ Generated configs use `url_env: DATABASE_URL` so secrets are not embedded in the
 
 ### Single table
 
+![rivet init generating a YAML for a single table](../gifs/init-scaffold.gif)
+
 Provide `--table` (optionally `schema.table` on PostgreSQL).
 
 ```bash
@@ -101,6 +103,8 @@ rivet init --source-file /run/secrets/database_url --table orders -o cfg.yaml
 Exactly one of `--source`, `--source-env`, `--source-file` must be provided (enforced by clap's ArgGroup).
 
 ## Discovery artifact (`--discover`)
+
+![rivet init --discover + jq: ranked cursor + chunk candidates per table](../gifs/discover-artifact.gif)
 
 `rivet init --discover` runs the same introspection but emits a machine-readable JSON document (schema described in [`src/init/artifact.rs`](../../src/init/artifact.rs)). Intended consumers: external orchestration tools, code review, and automated config generators.
 

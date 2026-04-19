@@ -2,37 +2,23 @@
 
 **Lightweight, source-safe data extraction from PostgreSQL and MySQL to Parquet/CSV.**
 
-**Names:** the project and CLI are **Rivet**; the command you run is **`rivet`**. On [crates.io](https://crates.io/crates/rivet-cli) the package is published as **`rivet-cli`** because the crate name `rivet` was already taken. Homebrew and release archives still install the **`rivet`** binary.
+Rivet is a single-binary CLI that exports query results from relational databases to files — locally, to S3, to GCS, or to stdout. It is **extract-only** (no loading, no merging, no CDC) and designed to be gentle on production databases through tuning profiles, preflight health checks, and intelligent retry with backoff.
 
-Rivet is a CLI tool that exports query results from relational databases to files — locally or in cloud storage (S3, GCS). It is **extract-only**: no loading, no merging, no CDC. It is designed to be gentle on production databases through tuning profiles, preflight health checks, and intelligent retry with backoff.
+> **Names.** The project and CLI are **Rivet**; the command is **`rivet`**. On [crates.io](https://crates.io/crates/rivet-cli) the package is published as **`rivet-cli`** because the crate name `rivet` was already taken. Homebrew and release archives install the **`rivet`** binary.
 
-### What Rivet does
+## What Rivet is (and is not)
 
-- Extracts data from **PostgreSQL** and **MySQL** via standard SQL queries
-- Writes **Parquet** (zstd-compressed by default; snappy, gzip, lz4, none) or **CSV** files
-- Uploads to **local disk**, **Amazon S3**, **Google Cloud Storage**, or **stdout** (pipe workflows)
-- Tracks incremental state in **SQLite** so the next run picks up where the last left off
-- Diagnoses source health **before** extraction (`rivet check`)
-- Verifies auth for all sources and destinations **before** running (`rivet doctor`)
-- Prints a structured **run summary** after each export (run ID, rows, files, bytes, duration, RSS, retries, schema changes)
-- Persists **metrics history**, **schema tracking**, and **file manifest** in SQLite
-- Recommends **parallelism level** and **tuning profile** in preflight checks
-- **Parameterized queries** via `--param key=value` and `${key}` placeholders
-- **Data quality checks** — row count bounds, null ratio thresholds, uniqueness assertions
-- **File size splitting** — `max_file_size: 512MB` automatically splits output into parts
-- **Memory-based batch sizing** — `batch_size_memory_mb: 256` auto-tunes batch size from schema width
-- **Slack notifications** on failure, schema change, or degraded verdict
-- **Plan/Apply workflow** — sealed execution artifacts for auditable, pre-reviewed runs
+Rivet does extraction end-to-end — query, batch, retry, validate, reconcile, checkpoint, plan/apply — from PostgreSQL 12–16 and MySQL 5.7 / 8.0 to Parquet (zstd / snappy / gzip / lz4 / none) or CSV. Destinations: local, Amazon S3, Google Cloud Storage, stdout. See [docs/](docs/) for the full feature list and contracts.
 
-### What Rivet does NOT do
-
-- **No loading/merging** — it produces files; you bring them into a warehouse yourself
-- **No CDC** — no WAL/binlog reading; query-based extraction only
-- **No orchestration** — no built-in scheduler; use cron, Airflow, or similar
-- **No exactly-once delivery** — at-least-once; duplicates are possible on crash recovery
-- **No web UI / API** — CLI and YAML config only
+Rivet is **not** a loader, a CDC platform, an ELT orchestrator, or a SaaS connector marketplace. It deliberately stops at "file on disk / in a bucket" — you bring the warehouse side yourself.
 
 **Documentation language:** English-only. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## See it run
+
+![Rivet basic workflow — init, doctor, check, run, state](docs/gifs/basic.gif)
+
+More walkthroughs: [plan / apply](docs/gifs/plan-apply.gif) · [reconcile + repair](docs/gifs/reconcile-repair.gif). Source scripts in [docs/gifs/](docs/gifs/).
 
 ---
 
@@ -114,28 +100,26 @@ cargo build --release
 
 | Topic | Link |
 |-------|------|
+| All docs (index) | [docs/README.md](docs/README.md) |
 | First run — install, connect, export | [docs/getting-started.md](docs/getting-started.md) |
-| All docs (modes, destinations, reference, pilot) | [docs/README.md](docs/README.md) |
 | Export modes (`full`, `incremental`, `chunked`, `time_window`) | [docs/modes/](docs/modes/) |
 | Destinations (local, S3, GCS, stdout) | [docs/destinations/](docs/destinations/) |
 | Config YAML reference | [docs/reference/config.md](docs/reference/config.md) |
 | CLI commands and flags | [docs/reference/cli.md](docs/reference/cli.md) |
 | Tuning profiles | [docs/reference/tuning.md](docs/reference/tuning.md) |
 | Scaffold config from a live DB (`rivet init`) | [docs/reference/init.md](docs/reference/init.md) |
+| Pipeline, traits, memory model, source layout | [docs/architecture.md](docs/architecture.md) |
 | Quickstart: PostgreSQL | [docs/pilot/quickstart-postgres.md](docs/pilot/quickstart-postgres.md) |
 | Quickstart: MySQL | [docs/pilot/quickstart-mysql.md](docs/pilot/quickstart-mysql.md) |
+| Demo on a pre-seeded 14-table fixture (~10 min) | [docs/pilot/demo-quickstart.md](docs/pilot/demo-quickstart.md) |
+| Pilot walkthrough — discovery → reconcile → repair | [docs/pilot/pilot-walkthrough.md](docs/pilot/pilot-walkthrough.md) |
 | Production checklist | [docs/pilot/production-checklist.md](docs/pilot/production-checklist.md) |
+| Architecture decision records | [docs/adr/](docs/adr/) |
 | Contributing, tests, CI | [CONTRIBUTING.md](CONTRIBUTING.md) |
 
 ---
 
-## Roadmap
+## Releases and roadmap
 
-See [rivet_roadmap.md](rivet_roadmap.md) for the full roadmap (strategy + execution status).
-
-| Milestone | Status | Focus |
-|-----------|--------|-------|
-| **v0.2.0-beta.7** | ✅ Released | Architecture stabilisation (Waves 1–3), plan/apply workflow, invariant/recovery/compatibility tests, semantic release gates |
-| **v0.2.0** (stable) | 🔜 Pending stable tag | Durable state backend (PostgreSQL), pilot schedule automation, docs audit/reconcile tradeoffs |
-| **v0.3.0** | Planned | Schema drift policy hooks, data shape drift detection, benchmark harness, curated example configs |
-| **Future** | Later | CDC mode, Iceberg/Delta output, webhook destination, multi-source joins, plugin system |
+- **Latest release and version history:** [CHANGELOG.md](CHANGELOG.md).
+- **Strategy, pains, and execution tracker:** [rivet_roadmap.md](rivet_roadmap.md) — the single source of truth for what is shipped and what is open.

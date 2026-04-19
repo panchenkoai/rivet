@@ -49,6 +49,10 @@ rivet run --config large_table.yaml --validate --reconcile
 
 In **`mode: chunked`**, Rivet shows a **terminal progress bar** while chunks run: export name, `current/total` chunks, running row count, elapsed time, and ETA. It appears when stderr is an **interactive TTY** (a normal terminal window). The bar does **not** depend on **`RUST_LOG`** (that variable only controls `env_logger` text lines). In CI, or when you **pipe or redirect** stderr, the bar is usually suppressed — then set **`RUST_LOG=info`** (or `debug`) to follow progress in the log instead.
 
+![Per-chunk progress: fetched N rows, chunk k/10, validation, file written, end-of-run summary](../gifs/chunked-progress.gif)
+
+The GIF above was recorded with `RUST_LOG=info` on a 50,000-row fixture (10 chunks of 5,000) so the per-chunk log line `export 'events': chunk N/10 (...)` and the final summary are both visible. On a real interactive terminal you would see the progress bar instead; the log lines appear when stderr is captured.
+
 Use a **small `chunk_size`** relative to your table if you want many steps on the bar (each finished chunk advances it once). **`parallel: 1`** still updates the bar after each sequential chunk.
 
 **Ready-made example in this repo:** [`dev/bench_chunked_p4_safe.yaml`](../../dev/bench_chunked_p4_safe.yaml) exports PostgreSQL `content_items` with **`parallel: 4`** and **`tuning.profile: safe`** (good for trying the bar on a wide table without hammering the source). Related variants: `dev/bench_chunked_p2.yaml`, `dev/bench_chunked_p4.yaml`.

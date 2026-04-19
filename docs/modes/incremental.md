@@ -49,6 +49,8 @@ rivet state reset --config orders.yaml --export orders_incremental
 
 ## What happens
 
+![First run exports all rows and saves cursor; second run is skipped when no new data](../gifs/incremental-cursor.gif)
+
 1. First run: no cursor exists, so all rows matching the query are exported
 2. Rivet records the maximum value of `cursor_column` as the cursor
 3. Subsequent runs: Rivet appends `WHERE updated_at > $cursor` to your query

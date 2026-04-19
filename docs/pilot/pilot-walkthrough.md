@@ -58,6 +58,8 @@ Everything below works with local-dev settings. For a real pilot against a manag
 
 ## Step 1 — Discovery (`rivet init`)
 
+![rivet init scaffolding YAML from a live table](../gifs/init-scaffold.gif)
+
 Scaffold a YAML from the live schema and, in parallel, emit a **machine-readable discovery artifact** for review or automation (Epic B).
 
 ```bash
@@ -127,6 +129,8 @@ rivet doctor --config pilot.yaml
 
 ## Step 3 — Plan (see the full intent)
 
+![Sealed plan artifact + PA9 credential redaction + apply](../gifs/plan-apply.gif)
+
 `rivet plan` seals the execution intent into an auditable artifact (ADR-0005 PA1) and embeds source-aware prioritization (ADR-0006) when multiple exports are planned.
 
 ```bash
@@ -171,6 +175,8 @@ What happens under the hood for chunked:
 
 ## Step 5 — Inspect progression
 
+![Post-run inspection: state show, metrics, state files, state progression](../gifs/inspect.gif)
+
 Get the explicit committed / verified boundary per export:
 
 ```bash
@@ -188,6 +194,10 @@ At this point:
 ---
 
 ## Step 6 — Reconcile (Epic F)
+
+![Chunked + drift injection + reconcile + targeted repair + RR4 committed boundary untouched](../gifs/reconcile-repair.gif)
+
+The GIF above walks through the whole sequence — reconcile clean, simulated drift, targeted repair, and final `state progression` showing RR4 (committed unchanged by repair). Steps 6–8 below expand the same flow in prose.
 
 Partition-level `COUNT(*)` on the source, compared with per-chunk `rows_written` stored in the checkpoint.
 

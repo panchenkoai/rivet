@@ -2,6 +2,10 @@
 
 Export your first table in 5 minutes.
 
+![End-to-end export: doctor -> check -> run (recorded on Postgres; MySQL syntax is identical)](../gifs/basic.gif)
+
+The commands and outputs shown above are exactly what the steps below walk through; only `type: postgres` becomes `type: mysql` and the URL scheme changes.
+
 ## Prerequisites
 
 - A running MySQL database you can connect to
@@ -30,7 +34,7 @@ exports:
 
 Replace the connection URL with your actual database credentials.
 
-**Optional:** scaffold a config with [`rivet init`](../reference/init.md) (e.g. `rivet init --source "$DATABASE_URL" --table orders -o my_first_export.yaml`).
+**Optional:** scaffold a config with [`rivet init`](../reference/init.md) (e.g. `rivet init --source-env DATABASE_URL --table orders -o my_first_export.yaml`). Using `--source-env` keeps the URL out of shell history / `ps`.
 
 ## Step 2: Verify connectivity
 
@@ -41,14 +45,35 @@ rivet doctor --config my_first_export.yaml
 Expected output:
 
 ```
-[OK] Source mysql://localhost:3306/mydb — connected, version 8.0.x
-[OK] Destination './output' — directory writable
+rivet doctor: verifying auth for config 'my_first_export.yaml'
+
+[OK]  Config parsed successfully
+[OK]  Source auth (MySQL)
+[OK]  Destination Local(./output)
+
+All checks passed.
 ```
+
+If you see `[FAIL]`, check your connection string and that the database is reachable.
 
 ## Step 3: Preflight check
 
 ```bash
 rivet check --config my_first_export.yaml
+```
+
+This shows strategy, row estimate, scan type, verdict, recommended tuning profile, and a mode-aware `Suggestion:` when the verdict is `DEGRADED` / `UNSAFE`. Example for a non-indexed full scan:
+
+```
+Export: orders_full
+  Strategy:     full-scan
+  Mode:         full
+  Row estimate: ~12K
+  Scan type:    ALL
+  Verdict:      DEGRADED
+  Recommended:  tuning.profile: balanced
+  Parallelism:  1 (only chunked mode benefits from parallelism)
+  Suggestion:   No index detected -- full table scan. Add an indexed cursor column and switch to incremental mode. Use 'safe' tuning profile to limit database impact.
 ```
 
 ## Step 4: Run the export
@@ -57,13 +82,24 @@ rivet check --config my_first_export.yaml
 rivet run --config my_first_export.yaml --validate --reconcile
 ```
 
+- `--validate` reads the output file back and verifies its row count matches the written count
+- `--reconcile` runs `SELECT COUNT(*)` on the source query and compares with exported rows; the result appears as the last `reconcile:` line of the summary
+
 Expected output:
 
 ```
-[orders_full] mode=full format=csv compression=zstd
-[orders_full] Exported 12,340 rows in 2.1s
-[orders_full] File: ./output/orders_full_20260406_120000.csv.zst (1.2 MB)
-[orders_full] Reconciliation: MATCH (source=12340, exported=12340)
+── orders_full ──
+  run_id:      orders_full_20260419T120000.123
+  status:      success
+  tuning:      profile=balanced (default), batch_size=10000
+  rows:        12340
+  files:       1
+  bytes:       1.2 MB
+  duration:    2.1s
+  peak RSS:    18MB (sampled during run)
+  validated:   pass
+  schema:      unchanged
+  reconcile:   MATCH (12340/12340)
 ```
 
 **Optional: preview before executing.** Use `rivet plan` to inspect the execution plan without exporting any data:

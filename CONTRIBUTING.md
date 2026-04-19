@@ -11,7 +11,7 @@ you have `rustup` installed.
 ```bash
 cargo fmt --all -- --check     # formatting
 cargo clippy --all-targets -- -D warnings  # lints (zero warnings policy)
-cargo test --all-targets       # 345+ tests, no database needed
+cargo test --all-targets       # offline tests, no database needed
 ```
 
 All three checks must pass. CI enforces them on every push and PR.
@@ -27,7 +27,9 @@ The canonical user-facing docs live in `docs/`. Before adding or editing documen
    - `docs/getting-started.md` — first-run onboarding only. Linear, no detours.
    - `docs/modes/*`, `docs/destinations/*`, `docs/pilot/*` — task guides: when to use something, trade-offs, realistic examples.
    - `docs/reference/*` — exact field/flag/command definitions. No onboarding content.
-   - `PRODUCT.md`, `rivet_roadmap.md` — internal author docs. Not part of the user onboarding path.
+   - `docs/architecture.md` — pipeline, traits, memory model, source layout.
+   - `rivet_roadmap.md` — strategy + execution tracker. Not part of the user onboarding path.
+   - `CHANGELOG.md` — release notes only. Feature descriptions belong in `docs/`.
    - `dev/USER_TEST_PLAN.md` — internal UAT checklist. Not user onboarding.
 3. **`docs/` is the only canonical user-facing documentation space.** New user content goes in `docs/`, not in root-level markdown files.
 4. **Do not add onboarding material to reference docs**, and do not add field-by-field reference detail to task guides.
@@ -42,7 +44,7 @@ PR checklist for documentation changes:
 
 All **user-facing documentation** must be in **English**, including:
 
-- Markdown in the repository (`README.md`, `CHANGELOG.md`, `PRODUCT.md`, this file, and any future docs)
+- Markdown in the repository (`README.md`, `CHANGELOG.md`, this file, and any future docs)
 - Comments in `dev/*.sh` and other scripts meant for operators or contributors
 - `clap` help strings and `about` text in `src/main.rs`, `src/bin/seed.rs`, and related binaries
 - Inline comments in example YAML configs when they explain behavior to humans
@@ -63,14 +65,19 @@ The codebase is organized into focused modules:
 | Module | Purpose |
 |--------|---------|
 | `config/` | YAML parsing, validation, variable resolution |
-| `source/` | Database connectors (Postgres, MySQL) |
-| `pipeline/` | Export orchestration, retry, chunking, validation |
+| `source/` | Database connectors (Postgres, MySQL), TLS, query shaping |
+| `pipeline/` | Export orchestration, retry, chunking, validation, plan/apply, reconcile, repair |
+| `plan/` | Plan artifacts, source-aware prioritization, reconcile / repair contracts |
 | `format/` | Parquet and CSV writers |
-| `destination/` | Local, S3, GCS upload |
-| `state.rs` | SQLite state store with versioned migrations |
-| `preflight/` | Health checks, EXPLAIN analysis, recommendations |
-| `tuning.rs` | Tuning profiles (fast/balanced/safe) |
+| `destination/` | Local, S3, GCS, stdout |
+| `state/` | SQLite state store with versioned migrations (cursor, manifest, metrics, checkpoint, progression) |
+| `preflight/` | Health checks, EXPLAIN analysis, recommendations, doctor |
+| `init/` | `rivet init` scaffolding + discovery artifact |
+| `tuning.rs` | Tuning profiles (fast / balanced / safe), memory-adaptive batch sizing |
 | `quality.rs` | Data quality checks (row count, nulls, uniqueness) |
-| `enrich.rs` | Meta columns (_rivet_exported_at, _rivet_row_hash) |
+| `enrich.rs` | Meta columns (_rivet_exported_at, _rivet_row_hash via xxh3_128) |
 | `notify.rs` | Slack notifications |
 | `resource.rs` | RSS memory monitoring |
+
+See [docs/architecture.md](docs/architecture.md) for the data-flow diagram,
+the trait surface, and the memory model.

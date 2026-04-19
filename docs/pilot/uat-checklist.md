@@ -58,6 +58,13 @@ For the full internal acceptance test plan with detailed suites and smoke-test s
 - [ ] Interrupted export can be safely re-run without data loss
 - [ ] `rivet state reset --export <name>` correctly resets cursor for a re-export
 
+## Progression, reconcile, and repair (chunked exports with `chunk_checkpoint: true`)
+
+- [ ] `rivet state progression` shows `COMMITTED` boundary per export after a successful run
+- [ ] `rivet reconcile --export <name>` runs cleanly (all partitions `match`) and advances the `VERIFIED` boundary
+- [ ] Injected mismatch: `rivet reconcile` surfaces it; `rivet repair --execute` writes corrective files without touching `COMMITTED`
+- [ ] Post-repair `rivet reconcile` re-advances `VERIFIED`
+
 ---
 
 ## Next steps

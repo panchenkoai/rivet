@@ -148,8 +148,8 @@ Each entry in the `exports` list defines one export job.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `exported_at` | boolean | `false` | Add `_rivet_exported_at` column (ISO 8601 timestamp) |
-| `row_hash` | boolean | `false` | Add `_rivet_row_hash` column (SHA-256 of row data) |
+| `exported_at` | boolean | `false` | Add `_rivet_exported_at` column (Timestamp UTC; one value per batch) |
+| `row_hash` | boolean | `false` | Add `_rivet_row_hash` column — lower 64 bits of `xxHash3-128` over the row, written as `Int64` for fast `PARTITION BY` / `JOIN`. Deterministic across runs; distinguishes NULL from empty string. |
 
 ---
 
@@ -206,7 +206,9 @@ quality:
 |-------|------|----------|-------------|
 | `bucket` | string | **yes** | GCS bucket name |
 | `prefix` | string | no | Object prefix |
-| `credentials_file` | string | no | Path to service account JSON |
+| `credentials_file` | string | no | Path to service account JSON (otherwise ADC / `GOOGLE_APPLICATION_CREDENTIALS`) |
+| `endpoint` | string | no | Custom GCS endpoint (fake-gcs-server, test doubles) |
+| `allow_anonymous` | boolean | no | Skip authentication (public bucket / emulator) |
 
 ### Stdout
 

@@ -155,6 +155,8 @@ Expected:
 
 ## 3 — Plan / Apply (sealed workflow)
 
+![Sealed plan artifact + PA9 credential redaction + apply](../gifs/plan-apply.gif)
+
 Pick one wave-1 export and run it the plan/apply way:
 
 ```bash
@@ -174,6 +176,10 @@ Expected: `40209 rows, success`, a Parquet in `out/`, and `last_cursor` advanced
 ---
 
 ## 4 — Chunked + reconcile + progression
+
+![Chunked export + reconcile + targeted repair](../gifs/reconcile-repair.gif)
+
+The `reconcile-repair` GIF above shows the mechanics on a smaller 10k-row fixture; the commands below repeat the same flow on the demo's 800k `audit_log` table.
 
 ```bash
 ../target/release/rivet run -c demo_pipeline.yaml -e audit_log
@@ -288,6 +294,6 @@ For a pilot sign-off ([pilot/uat-checklist.md](uat-checklist.md)) the demo above
 1. Output of `rivet state progression` before and after each stage.
 2. The reconcile report (saved JSON from step 4 / 6) for audit.
 3. The `plan` artifact used by apply (confirms PA9 redaction, PA6 fingerprint).
-4. `cargo test` result from your own build (should match `2026 assertions, zero failures` per the release notes).
+4. `cargo test` result from your own build (offline suite, no Docker needed — see [reference/testing.md](../reference/testing.md) for the current per-release count).
 
 If any command above produces output unexpectedly, capture the full log with `RUST_LOG=debug` — that level includes the effective SQL queries and per-chunk state transitions.
