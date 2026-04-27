@@ -85,6 +85,17 @@ data-race.
   `RunSummary::print` emits `Finished` and short-circuits the stderr block
   under `RIVET_IPC_EVENTS=1`.
 
+### Security
+
+- **RUSTSEC-2026-0104** — bumped transitive `rustls-webpki` 0.103.12 → 0.103.13.
+  The advisory describes a reachable panic when parsing CRL extensions with a
+  syntactically valid empty `BIT STRING` in the `onlySomeReasons` element of
+  an `IssuingDistributionPoint`, before the CRL signature is verified. Rivet
+  itself does not consume CRLs directly, but the bump closes the audit
+  warning end-to-end (advisory pulled in via `rustls 0.23.38` →
+  `hyper-rustls`/`tokio-rustls`/`rustls-platform-verifier` → `reqwest` /
+  `opendal`). `cargo audit` is now clean across all 480 dependencies.
+
 ### Compatibility
 
 - No YAML config changes. `rivet check` / `rivet plan` behaviour unchanged.

@@ -168,7 +168,10 @@ impl RunSummary {
         if self.peak_rss_mb > 0 {
             rows.push((
                 "peak RSS",
-                format!("{} MB (sampled during run)", fmt_thousands(self.peak_rss_mb)),
+                format!(
+                    "{} MB (sampled during run)",
+                    fmt_thousands(self.peak_rss_mb)
+                ),
             ));
         }
         if self.format == "parquet" && self.compression != "zstd" {
@@ -183,7 +186,11 @@ impl RunSummary {
         if let Some(sc) = self.schema_changed {
             rows.push((
                 "schema",
-                if sc { "CHANGED".into() } else { "unchanged".into() },
+                if sc {
+                    "CHANGED".into()
+                } else {
+                    "unchanged".into()
+                },
             ));
         }
         if let Some(q) = self.quality_passed {
@@ -403,7 +410,10 @@ mod tests {
         s.peak_rss_mb = 884;
 
         let block = s.render();
-        assert!(block.starts_with('\n'), "block should start with a blank line");
+        assert!(
+            block.starts_with('\n'),
+            "block should start with a blank line"
+        );
         assert!(block.ends_with('\n'), "block should end with a newline");
         assert!(block.contains("── orders "));
         assert!(

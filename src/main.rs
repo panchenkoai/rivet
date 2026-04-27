@@ -127,11 +127,7 @@ enum Commands {
         discover: bool,
         /// Scaffold `destination: type: gcs` with this bucket (each export gets `prefix: exports/<table>/`).
         /// Incompatible with `--s3-bucket` and `--discover`.
-        #[arg(
-            long = "gcs-bucket",
-            value_name = "NAME",
-            conflicts_with = "s3_bucket"
-        )]
+        #[arg(long = "gcs-bucket", value_name = "NAME", conflicts_with = "s3_bucket")]
         gcs_bucket: Option<String>,
         /// Optional path for `credentials_file:` on GCS scaffolds. Omit entirely to use ADC
         /// (`gcloud auth application-default login`) or `GOOGLE_APPLICATION_CREDENTIALS` — no key in YAML.
@@ -146,11 +142,7 @@ enum Commands {
         #[arg(long = "s3-bucket", value_name = "NAME")]
         s3_bucket: Option<String>,
         /// Optional AWS region for S3 scaffolds (when using `--s3-bucket`).
-        #[arg(
-            long = "s3-region",
-            value_name = "REGION",
-            requires = "s3_bucket"
-        )]
+        #[arg(long = "s3-region", value_name = "REGION", requires = "s3_bucket")]
         s3_region: Option<String>,
     },
     /// Generate an execution plan artifact (no data exported)

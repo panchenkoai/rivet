@@ -392,10 +392,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(
-            exists,
-            "v5 migration must create the run_aggregate table"
-        );
+        assert!(exists, "v5 migration must create the run_aggregate table");
 
         let has_index: bool = s
             .conn
@@ -405,6 +402,9 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(has_index, "v5 migration must create idx_run_aggregate_finished");
+        assert!(
+            has_index,
+            "v5 migration must create idx_run_aggregate_finished"
+        );
     }
 }

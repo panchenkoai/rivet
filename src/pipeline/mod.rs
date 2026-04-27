@@ -640,10 +640,7 @@ fn run_exports_as_child_processes(
                 children.push((export.name.clone(), child));
             }
             Err(e) => {
-                spawn_failures.insert(
-                    export.name.clone(),
-                    format!("spawn failed: {e:#}"),
-                );
+                spawn_failures.insert(export.name.clone(), format!("spawn failed: {e:#}"));
             }
         }
     }
@@ -770,12 +767,8 @@ pub fn run(
         // DB here only suppresses the aggregate, not the run itself.
         match StateStore::open(config_path) {
             Ok(state) => {
-                let entries = aggregate::collect_child_entries(
-                    &state,
-                    &exports,
-                    started_at,
-                    &child_failures,
-                );
+                let entries =
+                    aggregate::collect_child_entries(&state, &exports, started_at, &child_failures);
                 let agg = aggregate::build(
                     entries,
                     started_at,
@@ -869,7 +862,10 @@ pub fn run(
         } else {
             "sequential"
         };
-        let entries: Vec<_> = summaries.iter().map(aggregate::entry_from_summary).collect();
+        let entries: Vec<_> = summaries
+            .iter()
+            .map(aggregate::entry_from_summary)
+            .collect();
         let agg = aggregate::build(
             entries,
             started_at,
@@ -890,7 +886,10 @@ pub fn run(
     } else if let Some(out) = summary_output {
         // One export, but the user explicitly asked for a summary file —
         // honour it without polluting the DB or stderr.
-        let entries: Vec<_> = summaries.iter().map(aggregate::entry_from_summary).collect();
+        let entries: Vec<_> = summaries
+            .iter()
+            .map(aggregate::entry_from_summary)
+            .collect();
         let agg = aggregate::build(
             entries,
             started_at,
@@ -898,10 +897,8 @@ pub fn run(
             Some(config_path),
             "sequential",
         );
-        if let Err(e) = std::fs::write(
-            out,
-            serde_json::to_string_pretty(&agg).unwrap_or_default(),
-        ) {
+        if let Err(e) = std::fs::write(out, serde_json::to_string_pretty(&agg).unwrap_or_default())
+        {
             log::warn!(
                 "aggregate: failed to write summary JSON to {}: {:#}",
                 out.display(),

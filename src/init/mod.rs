@@ -552,7 +552,10 @@ fn export_block_lines(
         }
         "incremental" => {
             let cursor = info.best_cursor_column().unwrap_or("updated_at");
-            lines.push(format!("    cursor_column: {}", yaml_quote_if_needed(cursor)));
+            lines.push(format!(
+                "    cursor_column: {}",
+                yaml_quote_if_needed(cursor)
+            ));
         }
         _ => {}
     }
@@ -781,10 +784,7 @@ mod tests {
 
     #[test]
     fn generate_config_gcs_adds_credentials_file_when_set() {
-        let info = make_table(
-            100,
-            vec![col("id", "bigint", true)],
-        );
+        let info = make_table(100, vec![col("id", "bigint", true)]);
         let dest = InitYamlDestination {
             gcs_bucket: Some("b".to_string()),
             gcs_credentials_file: Some("/path/sa.json".to_string()),
@@ -792,7 +792,10 @@ mod tests {
             s3_region: None,
         };
         let yaml = generate_config(&info, "postgresql://localhost/db", &dest).unwrap();
-        assert!(yaml.contains("credentials_file: /path/sa.json"), "got:\n{yaml}");
+        assert!(
+            yaml.contains("credentials_file: /path/sa.json"),
+            "got:\n{yaml}"
+        );
     }
 
     #[test]

@@ -101,7 +101,10 @@ pub(super) fn print(agg: &RunAggregate) {
     if agg.total_bytes > 0 {
         eprintln!("  bytes:       {}", format_bytes(agg.total_bytes));
     }
-    eprintln!("  duration:    {} (wall clock)", format_duration(agg.duration_ms));
+    eprintln!(
+        "  duration:    {} (wall clock)",
+        format_duration(agg.duration_ms)
+    );
     if agg.duration_ms > 0 && agg.total_rows > 0 {
         let rps = agg.total_rows as f64 * 1000.0 / agg.duration_ms as f64;
         eprintln!("  throughput:  {} rows/s", format_rate(rps));
@@ -162,11 +165,7 @@ fn truncate(s: &str, max_chars: usize) -> String {
 /// Persist to state DB and optionally write JSON.  Failures are logged but
 /// **never propagated** — aggregation is observational and must not turn a
 /// successful run into a failed one.
-pub(super) fn persist(
-    state: &StateStore,
-    agg: &RunAggregate,
-    summary_output: Option<&Path>,
-) {
+pub(super) fn persist(state: &StateStore, agg: &RunAggregate, summary_output: Option<&Path>) {
     if let Err(e) = state.record_run_aggregate(agg) {
         log::warn!(
             "aggregate: failed to record run_aggregate (observational, ignored): {:#}",
@@ -201,9 +200,10 @@ fn write_json(path: &Path, agg: &RunAggregate) -> Result<()> {
         std::fs::create_dir_all(parent)
             .map_err(|e| anyhow::anyhow!("create_dir_all({}): {:#}", parent.display(), e))?;
     }
-    let json = serde_json::to_string_pretty(agg)
-        .map_err(|e| anyhow::anyhow!("serde_json: {:#}", e))?;
-    std::fs::write(path, json).map_err(|e| anyhow::anyhow!("write({}): {:#}", path.display(), e))?;
+    let json =
+        serde_json::to_string_pretty(agg).map_err(|e| anyhow::anyhow!("serde_json: {:#}", e))?;
+    std::fs::write(path, json)
+        .map_err(|e| anyhow::anyhow!("write({}): {:#}", path.display(), e))?;
     Ok(())
 }
 
@@ -253,21 +253,23 @@ pub(super) fn collect_child_entries(
             }
         }
 
-        out.push(entry.unwrap_or_else(|| RunAggregateEntry {
-            export_name: export.name.clone(),
-            status: "failed".into(),
-            run_id: String::new(),
-            rows: 0,
-            files: 0,
-            bytes: 0,
-            duration_ms: 0,
-            mode: String::new(),
-            error_message: Some(
-                child_failures
-                    .get(export.name.as_str())
-                    .cloned()
-                    .unwrap_or_else(|| "no metric recorded for this run".into()),
-            ),
+        out.push(entry.unwrap_or_else(|| {
+            RunAggregateEntry {
+                export_name: export.name.clone(),
+                status: "failed".into(),
+                run_id: String::new(),
+                rows: 0,
+                files: 0,
+                bytes: 0,
+                duration_ms: 0,
+                mode: String::new(),
+                error_message: Some(
+                    child_failures
+                        .get(export.name.as_str())
+                        .cloned()
+                        .unwrap_or_else(|| "no metric recorded for this run".into()),
+                ),
+            }
         }));
     }
     out

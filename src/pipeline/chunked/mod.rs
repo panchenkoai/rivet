@@ -454,9 +454,8 @@ pub(super) fn run_chunked_parallel_checkpoint(
     let fmt_label = plan.format.label();
     let comp_label = plan.compression.label();
 
-    let shared_destination = std::sync::Arc::new(destination::create_destination(
-        &plan.destination,
-    )?);
+    let shared_destination =
+        std::sync::Arc::new(destination::create_destination(&plan.destination)?);
 
     std::thread::scope(|s| {
         for _ in 0..parallel {

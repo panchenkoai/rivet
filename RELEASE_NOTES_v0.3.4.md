@@ -60,6 +60,17 @@ a clear compile-time error rather than a runtime data-race.
   per export` subsection embedding `parallel-cards.gif`, the seven-line
   card layout, and a short note on the IPC protocol.
 
+## Security
+
+- **RUSTSEC-2026-0104** — bumped transitive `rustls-webpki`
+  0.103.12 → 0.103.13. Reachable panic when parsing a syntactically
+  valid empty `BIT STRING` in the `onlySomeReasons` element of a CRL
+  `IssuingDistributionPoint` extension, *before* the CRL's signature is
+  verified. Rivet does not consume CRLs directly, but the bump closes
+  the audit warning end-to-end (`rustls` → `hyper-rustls` /
+  `tokio-rustls` / `rustls-platform-verifier` → `reqwest` / `opendal`).
+  `cargo audit` is now clean across all 480 dependencies.
+
 ## Compatibility
 
 - No YAML config changes. `rivet check` / `rivet plan` behaviour

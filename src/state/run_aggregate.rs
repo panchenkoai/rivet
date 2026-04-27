@@ -178,14 +178,20 @@ mod tests {
         assert!(ids.contains(&"agg_001"));
         assert!(ids.contains(&"agg_002"));
 
-        let r = rows.iter().find(|r| r.run_aggregate_id == "agg_001").unwrap();
+        let r = rows
+            .iter()
+            .find(|r| r.run_aggregate_id == "agg_001")
+            .unwrap();
         assert_eq!(r.total_exports, 2);
         assert_eq!(r.success_count, 1);
         assert_eq!(r.failed_count, 1);
         assert_eq!(r.total_rows, 1_500_000);
         assert_eq!(r.per_export.len(), 2);
         assert_eq!(r.per_export[0].export_name, "orders");
-        assert_eq!(r.per_export[1].error_message.as_deref(), Some("connection reset"));
+        assert_eq!(
+            r.per_export[1].error_message.as_deref(),
+            Some("connection reset")
+        );
     }
 
     #[test]

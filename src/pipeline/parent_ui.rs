@@ -507,13 +507,11 @@ fn fmt_thousands(n: i64) -> String {
     let abs = n.unsigned_abs();
     let raw = abs.to_string();
     let mut buf = String::with_capacity(raw.len() + raw.len() / 3);
-    let mut from_end = 0usize;
-    for ch in raw.chars().rev() {
+    for (from_end, ch) in raw.chars().rev().enumerate() {
         if from_end > 0 && from_end.is_multiple_of(3) {
             buf.push(',');
         }
         buf.push(ch);
-        from_end += 1;
     }
     let s: String = buf.chars().rev().collect();
     if n < 0 { format!("-{s}") } else { s }

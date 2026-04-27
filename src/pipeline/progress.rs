@@ -52,10 +52,7 @@ impl ChunkProgress {
         let ipc_on = ipc::ipc_events_enabled();
         let bar = if ipc_on {
             // Child mode: render nothing; the parent draws progress for us.
-            ProgressBar::with_draw_target(
-                Some(total_chunks as u64),
-                ProgressDrawTarget::hidden(),
-            )
+            ProgressBar::with_draw_target(Some(total_chunks as u64), ProgressDrawTarget::hidden())
         } else {
             let b = ProgressBar::new(total_chunks as u64);
             b.set_style(

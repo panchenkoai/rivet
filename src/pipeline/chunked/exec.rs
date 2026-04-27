@@ -214,9 +214,8 @@ pub(crate) fn run_chunked_parallel(
     // One destination (GCS/S3) instance for the whole export: `create_destination` wires a
     // dedicated Tokio runtime; creating one per chunk caused runtime shutdown races under load
     // (`dispatch task is gone: runtime dropped` from the HTTP client).
-    let shared_destination = std::sync::Arc::new(destination::create_destination(
-        &plan.destination,
-    )?);
+    let shared_destination =
+        std::sync::Arc::new(destination::create_destination(&plan.destination)?);
 
     std::thread::scope(|s| {
         for (i, (start, end)) in chunks.iter().enumerate() {
