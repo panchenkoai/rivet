@@ -433,7 +433,7 @@ pub(super) fn run_chunked_parallel_checkpoint(
     };
     let parallel = cp.parallel.min(total_tasks);
     let pb_cp = ChunkProgress::new(&plan.export_name, total_tasks);
-    let pb_cp_arc = pb_cp.arc();
+    let pb_cp_handle = pb_cp.handle();
     log::info!(
         "export '{}': chunk checkpoint parallel: {} workers, run_id={}",
         plan.export_name,
@@ -454,9 +454,14 @@ pub(super) fn run_chunked_parallel_checkpoint(
     let fmt_label = plan.format.label();
     let comp_label = plan.compression.label();
 
+    let shared_destination = std::sync::Arc::new(destination::create_destination(
+        &plan.destination,
+    )?);
+
     std::thread::scope(|s| {
         for _ in 0..parallel {
             let db_path = db_path.clone();
+            let shared_destination = std::sync::Arc::clone(&shared_destination);
             let run_id_arc = std::sync::Arc::clone(&run_id_arc);
             let agg_rows = &agg_rows;
             let agg_bytes = &agg_bytes;
@@ -467,9 +472,10 @@ pub(super) fn run_chunked_parallel_checkpoint(
             let config_path_w = config_path_owned.clone();
             let fmt_label_w = fmt_label;
             let comp_label_w = comp_label;
-            let pb_w = std::sync::Arc::clone(&pb_cp_arc);
+            let pb_w = pb_cp_handle.clone();
 
             s.spawn(move || {
+                let shared_destination = shared_destination;
                 loop {
                     let claimed = match StateStore::claim_next_chunk_task_at_path(
                         &db_path,
@@ -592,8 +598,7 @@ pub(super) fn run_chunked_parallel_checkpoint(
                                     chunk_index,
                                     fmt.file_extension()
                                 );
-                                let dest = destination::create_destination(&plan_w.destination)?;
-                                dest.write(sink.tmp.path(), &file_name)?;
+                                shared_destination.write(sink.tmp.path(), &file_name)?;
                                 Ok((sink.total_rows, Some(file_name), file_bytes))
                             })();
 
@@ -657,8 +662,7 @@ pub(super) fn run_chunked_parallel_checkpoint(
                                 rows as i64,
                                 fname.as_deref(),
                             );
-                            pb_w.set_message(format!("{} rows", agg_rows.load(Ordering::Relaxed)));
-                            pb_w.inc(1);
+                            pb_w.inc(agg_rows.load(Ordering::Relaxed));
                         }
                         Err(e) => {
                             let msg = format!("{:#}", e);

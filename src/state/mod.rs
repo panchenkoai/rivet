@@ -7,6 +7,7 @@ mod cursor;
 mod manifest;
 mod metrics;
 mod progression;
+mod run_aggregate;
 mod schema;
 
 // Re-export domain types so callers use `rivet::state::*` unchanged.
@@ -20,6 +21,8 @@ pub use manifest::FileRecord;
 pub use metrics::ExportMetric;
 #[allow(unused_imports)]
 pub use progression::{Boundary, ExportProgression};
+#[allow(unused_imports)]
+pub use run_aggregate::{RunAggregate, RunAggregateEntry};
 #[allow(unused_imports)]
 pub use schema::{SchemaChange, SchemaColumn};
 
@@ -127,6 +130,31 @@ const MIGRATIONS: &[(i64, &str)] = &[
             last_verified_run_id TEXT,
             last_verified_at TEXT
         );",
+    ),
+    // v5: aggregate run summary — one row per `rivet run` invocation that
+    // executed at least one export.  Per-export breakdown is stored in
+    // `details_json` to keep the relational schema small (we mostly query the
+    // aggregate row by id or by recency).
+    (
+        5,
+        "CREATE TABLE IF NOT EXISTS run_aggregate (
+            run_aggregate_id TEXT PRIMARY KEY,
+            started_at TEXT NOT NULL,
+            finished_at TEXT NOT NULL,
+            duration_ms INTEGER NOT NULL,
+            config_path TEXT,
+            parallel_mode TEXT NOT NULL,
+            total_exports INTEGER NOT NULL,
+            success_count INTEGER NOT NULL,
+            failed_count INTEGER NOT NULL,
+            skipped_count INTEGER NOT NULL,
+            total_rows INTEGER NOT NULL,
+            total_files INTEGER NOT NULL,
+            total_bytes INTEGER NOT NULL,
+            details_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_run_aggregate_finished
+            ON run_aggregate(finished_at DESC);",
     ),
 ];
 
@@ -351,5 +379,32 @@ mod tests {
             )
             .unwrap();
         assert!(has_chunk_run);
+    }
+
+    #[test]
+    fn run_aggregate_table_exists_after_migration() {
+        let s = StateStore::open_in_memory().unwrap();
+        let exists: bool = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='run_aggregate'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            exists,
+            "v5 migration must create the run_aggregate table"
+        );
+
+        let has_index: bool = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='index' AND name='idx_run_aggregate_finished'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_index, "v5 migration must create idx_run_aggregate_finished");
     }
 }

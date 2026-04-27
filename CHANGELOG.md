@@ -1,5 +1,102 @@
 # Changelog
 
+## 0.3.4 (2026-04-27)
+
+Multi-process parallel exports get a real UI: `--parallel-export-processes`
+now renders one card per export with a live progress bar, ETA, and rows, and
+in-place final metrics — instead of four child processes' output stomping on
+each other in the terminal. No YAML changes, no behavioural change for
+single-process or `--parallel-exports` runs.
+
+![Parallel cards UI](docs/gifs/parallel-cards.gif)
+
+### `rivet run --parallel-export-processes` — parent-side cards UI
+
+`--parallel-exports` runs every export as a thread in one process; it has
+worked since 0.2 but shares a global allocator, a single connection pool, and
+a single set of progress bars across exports. `--parallel-export-processes`
+spawns one child `rivet` per export instead — full memory and connection
+isolation — but until 0.3.4 each child wrote its own progress bar to stderr,
+which interleaved badly with the others.
+
+0.3.4 introduces a small NDJSON IPC protocol between parent and children and
+a hand-rolled ANSI renderer in the parent that owns the screen for the
+duration of the run:
+
+- Children spawned with `RIVET_IPC_EVENTS=1` emit four event kinds on stdout
+  — `Started`, `ProgressInit`, `Progress`, `Finished` — with `serde_json`,
+  one event per line. Children also suppress their own progress bars
+  (`ProgressDrawTarget::hidden()`) and skip the per-export stderr
+  `RunSummary` block — that data is carried by `Finished` instead, so the
+  parent has all the metrics without scraping logs.
+- The parent reader thread per child decodes events with `serde_json` and
+  forwards them through an `mpsc::Sender<UiMessage>`. A single dedicated UI
+  thread drains the channel, redraws the card stack on every event, and on a
+  200 ms idle timer so elapsed-time / ETA fields keep ticking even when no
+  IPC arrives.
+- Each card is seven lines: a header (`── orders ─────…`), five fixed-width
+  meta lines (`run_id`, `status`, `mode`, `tuning`, `batch_size`), and a
+  bottom line that is either a live progress bar with ETA or, once
+  `Finished` arrives, the export's final metrics in place. Cards stay in
+  scrollback after the run; below them the existing aggregate `Run summary`
+  block prints exactly once.
+- If a child's stdout closes without a `Finished` event (crash, OOM,
+  `SIGKILL`), the parent marks the card `failed` with a synthetic warning
+  line. The parent never silently loses an export.
+
+The renderer is implemented as raw ANSI escape sequences (`\x1b[nA`, `\r`,
+`\x1b[2K`) instead of `indicatif::MultiProgress` — same observable output in
+real terminals, but deterministic across `vhs` / `ttyd` recordings and CI
+pipes (where the cursor controls become harmless no-ops). See
+`src/pipeline/parent_ui.rs` for the rationale and the corner cases handled.
+
+### `Destination` is now `Send + Sync`
+
+To make the cards UI possible, `Destination` instances are now shared across
+threads via `Arc<dyn Destination + Send + Sync>` instead of being moved per
+job. Every built-in destination (`local`, `s3`, `gcs`, `bigquery`) was
+already thread-safe; the bound is added explicitly so out-of-tree
+destinations get a clear compile-time error rather than a runtime
+data-race.
+
+### Documentation
+
+- New `docs/gifs/parallel-cards.gif` (1280 × 780, ~30 s) recorded against a
+  4-export Postgres fixture (`orders`, `users`, `events`, `sessions`,
+  ~210 k rows total) seeded by `docs/gifs/render.sh`. The tape is
+  reproducible from a clean Docker Compose stack — `./docs/gifs/render.sh
+  parallel-cards`.
+- `docs/reference/cli.md`: new `--parallel-export-processes — one card per
+  export` subsection embedding `parallel-cards.gif`, with the seven-line
+  card layout and a short note on the IPC protocol.
+- `docs/gifs/README.md` lists the new scenario alongside the existing ten.
+
+### Internals
+
+- `src/pipeline/ipc.rs` — `ChildEvent` enum + `emit()` + `ipc_events_enabled()`.
+- `src/pipeline/parent_ui.rs` — `UiMessage`, `Renderer`, `CardState`,
+  cursor-positioned ANSI redraw loop. ~12 unit tests cover header padding,
+  meta-line vertical alignment, progress-bar endpoints, number / duration
+  formatting, and synthetic-failure rendering.
+- `src/pipeline/progress.rs` — `ChunkProgressHandle` cloneable handle that
+  emits `Progress` IPC events on each `inc()` and falls back to the visible
+  `indicatif` bar when IPC is off.
+- `src/pipeline/summary.rs` — `RunSummary::new` emits `Started`,
+  `RunSummary::print` emits `Finished` and short-circuits the stderr block
+  under `RIVET_IPC_EVENTS=1`.
+
+### Compatibility
+
+- No YAML config changes. `rivet check` / `rivet plan` behaviour unchanged.
+- `--parallel-exports` (single-process, multi-thread) prints exactly as
+  before.
+- `--parallel-export-processes` previously had garbled per-export output
+  with no aggregate summary; the new behaviour is strictly better but the
+  on-screen layout is different. Scripts that scraped the per-child
+  `RunSummary` block from stderr should switch to `RIVET_IPC_EVENTS=1` +
+  `Finished` events on stdout — the format is documented in
+  `src/pipeline/ipc.rs` and stable for 0.3.x.
+
 ## 0.3.3 (2026-04-19)
 
 QA test matrix + panic-safety follow-up. No YAML config deserializes

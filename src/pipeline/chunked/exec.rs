@@ -4,7 +4,6 @@
 //! owning checkpoint state. They accept an optional `StateStore` reference
 //! solely for manifest (file-record) writes.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -210,7 +209,14 @@ pub(crate) fn run_chunked_parallel(
     let file_records: std::sync::Mutex<Vec<(String, i64, i64)>> = std::sync::Mutex::new(Vec::new());
     let semaphore = AtomicUsize::new(0);
     let pb = ChunkProgress::new(&plan.export_name, total_chunks);
-    let pb_arc = pb.arc();
+    let pb_handle = pb.handle();
+
+    // One destination (GCS/S3) instance for the whole export: `create_destination` wires a
+    // dedicated Tokio runtime; creating one per chunk caused runtime shutdown races under load
+    // (`dispatch task is gone: runtime dropped` from the HTTP client).
+    let shared_destination = std::sync::Arc::new(destination::create_destination(
+        &plan.destination,
+    )?);
 
     std::thread::scope(|s| {
         for (i, (start, end)) in chunks.iter().enumerate() {
@@ -238,9 +244,10 @@ pub(crate) fn run_chunked_parallel(
             let errors = &errors;
             let file_records = &file_records;
             let semaphore = &semaphore;
-            let pb_thread = Arc::clone(&pb_arc);
+            let pb_thread = pb_handle.clone();
             let start = *start;
             let end = *end;
+            let shared_destination = std::sync::Arc::clone(&shared_destination);
 
             s.spawn(move || {
                 let result = (|| -> Result<()> {
@@ -295,8 +302,7 @@ pub(crate) fn run_chunked_parallel(
                             i,
                             fmt.file_extension()
                         );
-                        let dest = destination::create_destination(&plan_for_worker.destination)?;
-                        dest.write(sink.tmp.path(), &file_name)?;
+                        shared_destination.write(sink.tmp.path(), &file_name)?;
                         file_records
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
@@ -304,8 +310,7 @@ pub(crate) fn run_chunked_parallel(
                     }
 
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                    pb_thread.set_message(format!("{} rows", agg_rows.load(Ordering::Relaxed)));
-                    pb_thread.inc(1);
+                    pb_thread.inc(agg_rows.load(Ordering::Relaxed));
                     log::info!(
                         "export '{}': chunk {}/{} done ({} rows)",
                         export_name,

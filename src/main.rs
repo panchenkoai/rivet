@@ -57,6 +57,9 @@ enum Commands {
         /// Run each export as a separate `rivet` child process (parallel; true per-export peak RSS; more overhead than threads)
         #[arg(long)]
         parallel_export_processes: bool,
+        /// Write the run aggregate summary as JSON to this file (in addition to .rivet_state.db)
+        #[arg(long, value_name = "PATH")]
+        summary_output: Option<String>,
         /// Query parameter: key=value (repeatable, substitutes ${key} in queries)
         #[arg(short, long = "param", value_name = "KEY=VALUE")]
         params: Vec<String>,
@@ -116,8 +119,39 @@ enum Commands {
         output: Option<String>,
         /// Emit a machine-readable JSON discovery artifact (Epic B) instead of a YAML scaffold.
         /// Includes row estimates, size bytes, ranked cursor candidates, chunk candidates, and advisory notes.
-        #[arg(long)]
+        /// Mutually exclusive with the YAML-only `--gcs-bucket` / `--s3-bucket` flags.
+        #[arg(
+            long,
+            conflicts_with_all = ["gcs_bucket", "gcs_credentials_file", "s3_bucket", "s3_region"]
+        )]
         discover: bool,
+        /// Scaffold `destination: type: gcs` with this bucket (each export gets `prefix: exports/<table>/`).
+        /// Incompatible with `--s3-bucket` and `--discover`.
+        #[arg(
+            long = "gcs-bucket",
+            value_name = "NAME",
+            conflicts_with = "s3_bucket"
+        )]
+        gcs_bucket: Option<String>,
+        /// Optional path for `credentials_file:` on GCS scaffolds. Omit entirely to use ADC
+        /// (`gcloud auth application-default login`) or `GOOGLE_APPLICATION_CREDENTIALS` — no key in YAML.
+        #[arg(
+            long = "gcs-credentials-file",
+            value_name = "PATH",
+            requires = "gcs_bucket"
+        )]
+        gcs_credentials_file: Option<String>,
+        /// Scaffold `destination: type: s3` with this bucket (each export gets `prefix: exports/<table>/`).
+        /// Incompatible with `--gcs-bucket` and `--discover`.
+        #[arg(long = "s3-bucket", value_name = "NAME")]
+        s3_bucket: Option<String>,
+        /// Optional AWS region for S3 scaffolds (when using `--s3-bucket`).
+        #[arg(
+            long = "s3-region",
+            value_name = "REGION",
+            requires = "s3_bucket"
+        )]
+        s3_region: Option<String>,
     },
     /// Generate an execution plan artifact (no data exported)
     Plan {
@@ -315,10 +349,12 @@ fn main() -> Result<()> {
             resume,
             parallel_exports,
             parallel_export_processes,
+            summary_output,
             params,
         } => {
             let p = parse_params(&params);
             let p = if p.is_empty() { None } else { Some(p) };
+            let summary_output_path = summary_output.as_ref().map(std::path::PathBuf::from);
             pipeline::run(
                 &config,
                 export.as_deref(),
@@ -328,6 +364,7 @@ fn main() -> Result<()> {
                 p.as_ref(),
                 parallel_exports,
                 parallel_export_processes,
+                summary_output_path.as_deref(),
             )?;
         }
         Commands::Check {
@@ -350,6 +387,10 @@ fn main() -> Result<()> {
             schema,
             output,
             discover,
+            gcs_bucket,
+            gcs_credentials_file,
+            s3_bucket,
+            s3_region,
         } => {
             let fmt = if discover {
                 init::InitFormat::DiscoveryJson
@@ -357,12 +398,19 @@ fn main() -> Result<()> {
                 init::InitFormat::Yaml
             };
             let source_url = resolve_init_source(source, source_env, source_file)?;
+            let yaml_dest = init::InitYamlDestination {
+                gcs_bucket,
+                gcs_credentials_file,
+                s3_bucket,
+                s3_region,
+            };
             init::init(
                 &source_url,
                 table.as_deref(),
                 schema.as_deref(),
                 output.as_deref(),
                 fmt,
+                yaml_dest,
             )?;
         }
         Commands::Plan {
@@ -510,5 +558,168 @@ mod tests {
         let input = vec!["K=first".to_string(), "K=second".to_string()];
         let result = parse_params(&input);
         assert_eq!(result.get("K").unwrap(), "second");
+    }
+
+    /// Helper: try to parse a `rivet init …` invocation through clap. The leading
+    /// `["rivet", "init"]` is added so we exercise the real subcommand router.
+    /// Returns the `clap::error::ErrorKind` so callers can assert without needing
+    /// a `Debug` impl on `Cli`.
+    fn init_parse_kind(extra_args: &[&str]) -> std::result::Result<(), clap::error::ErrorKind> {
+        let mut argv = vec!["rivet", "init"];
+        argv.extend(extra_args);
+        match Cli::try_parse_from(argv) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.kind()),
+        }
+    }
+
+    fn assert_init_err(extra_args: &[&str], expected: clap::error::ErrorKind, what: &str) {
+        match init_parse_kind(extra_args) {
+            Ok(()) => panic!("{what}: expected clap to reject, but parsing succeeded"),
+            Err(kind) => assert_eq!(kind, expected, "{what}"),
+        }
+    }
+
+    fn assert_init_ok(extra_args: &[&str], what: &str) {
+        if let Err(kind) = init_parse_kind(extra_args) {
+            panic!("{what}: expected clap to accept, got error kind {kind:?}");
+        }
+    }
+
+    #[test]
+    fn init_clap_rejects_gcs_and_s3_bucket_together() {
+        assert_init_err(
+            &[
+                "--source",
+                "postgresql://localhost/db",
+                "--gcs-bucket",
+                "g",
+                "--s3-bucket",
+                "s",
+            ],
+            clap::error::ErrorKind::ArgumentConflict,
+            "--gcs-bucket + --s3-bucket",
+        );
+    }
+
+    #[test]
+    fn init_clap_rejects_discover_with_gcs_bucket() {
+        assert_init_err(
+            &[
+                "--source",
+                "postgresql://localhost/db",
+                "--discover",
+                "--gcs-bucket",
+                "g",
+            ],
+            clap::error::ErrorKind::ArgumentConflict,
+            "--discover + --gcs-bucket",
+        );
+    }
+
+    #[test]
+    fn init_clap_rejects_discover_with_s3_bucket() {
+        assert_init_err(
+            &[
+                "--source",
+                "postgresql://localhost/db",
+                "--discover",
+                "--s3-bucket",
+                "s",
+            ],
+            clap::error::ErrorKind::ArgumentConflict,
+            "--discover + --s3-bucket",
+        );
+    }
+
+    #[test]
+    fn init_clap_rejects_discover_with_credentials_or_region() {
+        // `--gcs-credentials-file` requires `--gcs-bucket`, and the bucket conflicts
+        // with `--discover`. Provide the bucket so we cleanly hit the discover×cloud
+        // conflict (not the missing-required-arg path).
+        assert_init_err(
+            &[
+                "--source",
+                "postgresql://localhost/db",
+                "--discover",
+                "--gcs-bucket",
+                "g",
+                "--gcs-credentials-file",
+                "/k.json",
+            ],
+            clap::error::ErrorKind::ArgumentConflict,
+            "--discover + --gcs-credentials-file (with bucket)",
+        );
+        assert_init_err(
+            &[
+                "--source",
+                "postgresql://localhost/db",
+                "--discover",
+                "--s3-bucket",
+                "b",
+                "--s3-region",
+                "eu-west-1",
+            ],
+            clap::error::ErrorKind::ArgumentConflict,
+            "--discover + --s3-region (with bucket)",
+        );
+    }
+
+    #[test]
+    fn init_clap_rejects_gcs_credentials_without_bucket() {
+        assert_init_err(
+            &[
+                "--source",
+                "postgresql://localhost/db",
+                "--gcs-credentials-file",
+                "/k.json",
+            ],
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "--gcs-credentials-file requires --gcs-bucket",
+        );
+    }
+
+    #[test]
+    fn init_clap_rejects_s3_region_without_bucket() {
+        assert_init_err(
+            &[
+                "--source",
+                "postgresql://localhost/db",
+                "--s3-region",
+                "eu-west-1",
+            ],
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "--s3-region requires --s3-bucket",
+        );
+    }
+
+    #[test]
+    fn init_clap_accepts_well_formed_gcs_invocation() {
+        assert_init_ok(
+            &[
+                "--source",
+                "postgresql://localhost/db",
+                "--gcs-bucket",
+                "my-bucket",
+                "--gcs-credentials-file",
+                "/k.json",
+            ],
+            "well-formed --gcs-bucket invocation",
+        );
+    }
+
+    #[test]
+    fn init_clap_accepts_well_formed_s3_invocation() {
+        assert_init_ok(
+            &[
+                "--source",
+                "postgresql://localhost/db",
+                "--s3-bucket",
+                "b",
+                "--s3-region",
+                "eu-west-1",
+            ],
+            "well-formed --s3-bucket invocation",
+        );
     }
 }

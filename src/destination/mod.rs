@@ -54,7 +54,9 @@ pub struct DestinationCapabilities {
     pub partial_write_risk: bool,
 }
 
-pub trait Destination {
+/// Object-safe surface for upload backends. `Send + Sync` so a single `Arc` can be shared
+/// across parallel chunk workers (one OpenDAL/HTTP stack per export, not one Tokio runtime per chunk).
+pub trait Destination: Send + Sync {
     fn write(&self, local_path: &Path, remote_key: &str) -> Result<()>;
 
     /// Describe the operational guarantees of this destination backend.

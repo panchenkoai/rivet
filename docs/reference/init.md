@@ -27,7 +27,7 @@ export DATABASE_URL='mysql://user:pass@localhost:3306/mydb'
 rivet init --source "$DATABASE_URL" --table orders -o rivet.yaml
 ```
 
-Rivet emits **one** export block: `SELECT` of all columns, a suggested `mode` (`full`, `incremental`, or `chunked`) from row estimates and column types, plus `chunk_*` or `cursor_column` when applicable.
+Rivet emits **one** export block: `SELECT` of all columns, a suggested `mode` (`full`, `incremental`, or `chunked`) from row estimates and column types, plus `chunk_*` or `cursor_column` when applicable. Every scaffold uses **`format: parquet`** and, by default, **`meta_columns` with `exported_at: true` and `row_hash: true`** (lineage and row fingerprinting in the output — see [`exports[].meta_columns` in config](config.md)). When the heuristic picks **`chunked`**, the scaffold also includes **`chunk_checkpoint: true`** (resumable runs, `rivet run --resume`, and reconcile/repair — see [chunked mode](../modes/chunked.md)).
 
 ### Whole PostgreSQL schema
 
@@ -66,8 +66,16 @@ rivet init --source 'mysql://user:pass@localhost:3306/' --schema rivet -o rivet_
 | Condition | Suggested mode |
 |-----------|----------------|
 | Estimated rows ≤ 100k | `full` |
-| Rows > 100k and integer PK (or first integer column) | `chunked` with `chunk_column` / `chunk_size` (and sometimes `parallel`) |
+| Rows > 100k and integer PK (or first integer column) | `chunked` with `chunk_column` / `chunk_size`, **`chunk_checkpoint: true` by default**, and sometimes `parallel` |
 | Rows > 100k, no suitable integer chunk key, but a timestamp column | `incremental` with `cursor_column` (`updated_at` / `created_at` preferred) |
+
+### Chunked exports and checkpointing
+
+When the suggested mode is **`chunked`**, the scaffold always includes **`chunk_checkpoint: true`**. That enables resumable chunk runs after crashes or transient errors (`rivet run --resume`), chunk state in `rivet state chunks`, and reconcile/repair workflows. Set it to `false` only if you intentionally do not want checkpoint state on disk.
+
+### Meta columns (defaults)
+
+The YAML scaffold enables **`exported_at`** and **`row_hash`** for every export. Set either to `false`, or remove the `meta_columns` block entirely, to turn them off.
 
 Row estimates are cheap metadata (`pg_class.reltuples` on PostgreSQL, `information_schema.TABLES.TABLE_ROWS` on MySQL), not exact `COUNT(*)`.
 

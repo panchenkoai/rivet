@@ -52,7 +52,43 @@ rivet run -c my_export.yaml -p region=us-east -p year=2026
 
 # Parallel exports (all at once)
 rivet run -c my_export.yaml --parallel-exports
+
+# Parallel exports — one OS process per export, parent-side cards UI
+rivet run -c my_export.yaml --parallel-export-processes
 ```
+
+### `--parallel-export-processes` — one card per export
+
+`--parallel-exports` runs every export in the same Rivet process on a separate
+thread. That keeps logs simple, but every export shares the same source
+connection pool / global allocator, and a panic in one export tears the whole
+run down.
+
+`--parallel-export-processes` instead spawns one `rivet` *child process* per
+export — full memory and connection isolation, no shared allocator. The parent
+process owns the screen and renders one **card** per export with a live
+progress bar, ETA, row count, and elapsed time. When a child finishes, the
+progress bar is replaced *in place* with the export's final metrics, so the
+on-screen card becomes a self-contained per-export summary; below the cards a
+single aggregated `Run summary` block prints once for the whole run.
+
+![Parallel cards UI](../gifs/parallel-cards.gif)
+
+```text
+── orders ──────────────────────────────────────────────
+  run_id:    orders_20260427T120000.069
+  status:    running
+  mode:      chunked
+  tuning:    profile=balanced (default)
+  batch_size: 1,000
+  [====================>--------------] 11/20 chunks | 1.1M rows | 00:02:06 | ETA 66s
+```
+
+Children emit structured NDJSON events (`Started`, `ProgressInit`,
+`Progress`, `Finished`) on stdout via the `RIVET_IPC_EVENTS=1` env var; the
+parent multiplexes them into the cards UI. If a child crashes without a
+`Finished` event, its card is marked `failed` with a synthetic warning so a
+silent crash never leaves the run looking healthy.
 
 ---
 
@@ -334,7 +370,7 @@ Output:
 
 ## `rivet init`
 
-Generate a YAML config scaffold (or a machine-readable discovery artifact) by connecting to PostgreSQL or MySQL and introspecting tables (read-only). Does **not** run an export.
+Generate a YAML config scaffold (or a machine-readable discovery artifact) by connecting to PostgreSQL or MySQL and introspecting tables (read-only). Does **not** run an export. YAML scaffolds include **`meta_columns`** (`exported_at` / `row_hash` **on** by default); scaffolds with heuristic **`mode: chunked`** also include **`chunk_checkpoint: true`** — see [init.md](init.md).
 
 ```bash
 rivet init (--source <URL> | --source-env <ENV_VAR> | --source-file <PATH>)

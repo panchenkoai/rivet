@@ -3001,7 +3001,7 @@ dependencies = [
 
 [[package]]
 name = "rivet-cli"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "arrow",
@@ -3009,6 +3009,7 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
+ "console",
  "csv",
  "env_logger",
  "indicatif",

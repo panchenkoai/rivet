@@ -1,12 +1,17 @@
 # Chunked exports to real GCS bucket rivet_data_test.
 # Uses tables from dev/postgres/init.sql (docker-compose).
+#
+# Use url_env (not url:) so `rivet plan` → plan.json can be applied: credentials in
+# URLs are redacted in the artifact; DATABASE_URL must be set for plan and apply.
+#
+#   export DATABASE_URL='postgresql://rivet:rivet@localhost:5432/rivet'
 
 source:
   type: postgres
-  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+  url_env: DATABASE_URL
   tuning:
     profile: fast
-  batch_size: 1000
+    batch_size: 1000
 
 exports:
   - name: content_items_gcs

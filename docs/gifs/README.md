@@ -27,6 +27,7 @@ Mode / planner spots (embedded in `docs/modes/`, `docs/reference/`, `docs/planni
 | [incremental-cursor.gif](incremental-cursor.gif) | Two-run cursor progression — first run exports 10 k rows and saves cursor, second run is `skipped` via `skip_empty: true` (≈14 s) | [incremental-cursor.tape](incremental-cursor.tape) |
 | [discover-artifact.gif](discover-artifact.gif) | `rivet init --discover` + `jq` over the JSON artifact — ranked cursor + chunk candidates per table (≈8 s) | [discover-artifact.tape](discover-artifact.tape) |
 | [plan-campaign.gif](plan-campaign.gif) | Multi-export `rivet plan`: Priority / Prioritize block per export + Campaign block with `shared_source_heavy_conflict` warning on a shared `source_group` (≈9 s, needs 20 M + 15 M-row fixture) | [plan-campaign.tape](plan-campaign.tape) |
+| [parallel-cards.gif](parallel-cards.gif) | `rivet run --parallel-export-processes` over four chunked exports: one card per export with live progress bar, ETA, rows, and final metrics in place; trailing aggregate Run summary (≈30 s) | [parallel-cards.tape](parallel-cards.tape) |
 
 Destination-specific:
 
@@ -71,6 +72,7 @@ Or just one:
 ./docs/gifs/render.sh incremental-cursor
 ./docs/gifs/render.sh discover-artifact
 ./docs/gifs/render.sh plan-campaign     # creates ~35 M rows in rivet_gif.*
+./docs/gifs/render.sh parallel-cards    # 4 chunked exports, parent-side cards UI
 ./docs/gifs/render.sh doctor-gcs        # real GCS via ADC; see below
 ```
 
@@ -117,7 +119,8 @@ deterministic regardless of the user's shell rc.
   - `inspect.gif` in Step 7 (inspect results).
   - `reconcile-repair.gif` in Step 8 (reconcile / repair).
 - [docs/reference/cli.md](../reference/cli.md) — `plan-apply.gif` next to
-  `rivet plan`, `reconcile-repair.gif` next to `rivet reconcile`.
+  `rivet plan`, `reconcile-repair.gif` next to `rivet reconcile`,
+  `parallel-cards.gif` next to `rivet run --parallel-export-processes`.
 - [docs/destinations/gcs.md](../destinations/gcs.md) — `doctor-gcs.gif` in
   the "Verify" section.
 - [docs/modes/chunked.md](../modes/chunked.md) — `chunked-progress.gif` in

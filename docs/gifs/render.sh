@@ -162,6 +162,99 @@ YAML
 }
 fixture_chunked_progress_teardown() { fixture_chunked_teardown; }
 
+# Multi-export `--parallel-export-processes` demo: four narrow tables seeded
+# under `rivet_gif.*` so the IPC card UI has four cards advancing in parallel.
+fixture_parallel_cards_setup() {
+    psql_ <<'SQL'
+DROP SCHEMA IF EXISTS rivet_gif CASCADE;
+CREATE SCHEMA rivet_gif;
+
+CREATE TABLE rivet_gif.orders (
+    id BIGINT PRIMARY KEY,
+    payload TEXT
+);
+INSERT INTO rivet_gif.orders (id, payload)
+SELECT g, repeat('o', 32) FROM generate_series(1, 60000) AS g;
+
+CREATE TABLE rivet_gif.users (
+    id BIGINT PRIMARY KEY,
+    payload TEXT
+);
+INSERT INTO rivet_gif.users (id, payload)
+SELECT g, repeat('u', 32) FROM generate_series(1, 30000) AS g;
+
+CREATE TABLE rivet_gif.events (
+    id BIGINT PRIMARY KEY,
+    payload TEXT
+);
+INSERT INTO rivet_gif.events (id, payload)
+SELECT g, repeat('e', 32) FROM generate_series(1, 80000) AS g;
+
+CREATE TABLE rivet_gif.sessions (
+    id BIGINT PRIMARY KEY,
+    payload TEXT
+);
+INSERT INTO rivet_gif.sessions (id, payload)
+SELECT g, repeat('s', 32) FROM generate_series(1, 40000) AS g;
+SQL
+
+    local work="/tmp/rivet-gif-parallel-cards"
+    mkdir -p "$work"
+    cat >"$work/parallel-cards.yaml" <<'YAML'
+source:
+  type: postgres
+  url_env: DATABASE_URL
+  tuning:
+    # Small batches + an exaggerated per-batch throttle so each card has
+    # visibly ticking progress bars during the recording window.  Demo
+    # only — production runs use `balanced` / `fast`.
+    batch_size: 1000
+    throttle_ms: 250
+exports:
+  - name: orders
+    query: "SELECT id, payload FROM rivet_gif.orders"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 10000
+    parallel: 1
+    format: parquet
+    destination:
+      type: local
+      path: ./output
+  - name: users
+    query: "SELECT id, payload FROM rivet_gif.users"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 5000
+    parallel: 1
+    format: parquet
+    destination:
+      type: local
+      path: ./output
+  - name: events
+    query: "SELECT id, payload FROM rivet_gif.events"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 10000
+    parallel: 1
+    format: parquet
+    destination:
+      type: local
+      path: ./output
+  - name: sessions
+    query: "SELECT id, payload FROM rivet_gif.sessions"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 5000
+    parallel: 1
+    format: parquet
+    destination:
+      type: local
+      path: ./output
+YAML
+}
+fixture_parallel_cards_teardown() { fixture_chunked_teardown; }
+
 # Reuses the 10k-row rivet_gif.events fixture, adds an incremental YAML.
 fixture_incremental_setup() {
     fixture_chunked_setup    # 10k rows in rivet_gif.events
@@ -423,7 +516,7 @@ render_scenario() {
 
 ensure_prereqs
 
-SCENARIOS=("${@:-basic plan-apply reconcile-repair init-scaffold check-verdict inspect chunked-progress incremental-cursor discover-artifact plan-campaign}")
+SCENARIOS=("${@:-basic plan-apply reconcile-repair init-scaffold check-verdict inspect chunked-progress parallel-cards incremental-cursor discover-artifact plan-campaign}")
 for raw in "${SCENARIOS[@]}"; do
     for name in $raw; do
         case "$name" in
@@ -434,6 +527,7 @@ for raw in "${SCENARIOS[@]}"; do
             check-verdict)         render_scenario check-verdict         fixture_check_setup             fixture_check_teardown ;;
             inspect)               render_scenario inspect               fixture_inspect_setup           fixture_inspect_teardown ;;
             chunked-progress)      render_scenario chunked-progress      fixture_chunked_progress_setup  fixture_chunked_progress_teardown ;;
+            parallel-cards)        render_scenario parallel-cards        fixture_parallel_cards_setup    fixture_parallel_cards_teardown ;;
             incremental-cursor)    render_scenario incremental-cursor    fixture_incremental_setup       fixture_incremental_teardown ;;
             discover-artifact)     render_scenario discover-artifact     fixture_discover_setup          fixture_discover_teardown ;;
             plan-campaign)         render_scenario plan-campaign         fixture_campaign_setup          fixture_campaign_teardown ;;

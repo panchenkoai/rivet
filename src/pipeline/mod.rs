@@ -6,10 +6,13 @@
 //!
 //! See `docs/adr/0003-layer-classification.md` for the full module taxonomy.
 
+mod aggregate;
 mod apply_cmd;
 mod chunked;
 mod cli;
+pub(crate) mod ipc;
 pub mod journal;
+pub(crate) mod parent_ui;
 mod plan_cmd;
 pub(crate) mod progress;
 mod reconcile_cmd;
@@ -198,6 +201,43 @@ pub(crate) fn format_bytes(b: u64) -> String {
     }
 }
 
+/// Synthesize a stand-in `RunSummary` for failures that occur **before** a
+/// real summary can be created (plan-build errors, plan-validation rejection).
+/// Aggregation needs every export accounted for, even those that never reached
+/// `RunSummary::new`.
+fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -> RunSummary {
+    let run_id = format!(
+        "{}_{}",
+        export_name,
+        chrono::Utc::now().format("%Y%m%dT%H%M%S%3f"),
+    );
+    let journal = journal::RunJournal::new(&run_id, export_name);
+    RunSummary {
+        run_id,
+        export_name: export_name.to_string(),
+        status: "failed".into(),
+        total_rows: 0,
+        files_produced: 0,
+        bytes_written: 0,
+        duration_ms: 0,
+        peak_rss_mb: 0,
+        retries: 0,
+        validated: None,
+        schema_changed: None,
+        quality_passed: None,
+        error_message: Some(format!("{:#}", err)),
+        tuning_profile: "balanced (default)".into(),
+        batch_size: 0,
+        batch_size_memory_mb: None,
+        format: String::new(),
+        mode: String::new(),
+        compression: String::new(),
+        source_count: None,
+        reconciled: None,
+        journal,
+    }
+}
+
 fn run_export_job(
     config_path: &str,
     config: &Config,
@@ -205,8 +245,8 @@ fn run_export_job(
     state: &StateStore,
     config_dir: &Path,
     opts: &RunOptions<'_>,
-) -> Result<()> {
-    let plan = build_plan(
+) -> (Result<()>, RunSummary) {
+    let plan = match build_plan(
         config,
         export,
         config_dir,
@@ -214,7 +254,13 @@ fn run_export_job(
         opts.reconcile,
         opts.resume,
         opts.params,
-    )?;
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            let summary = synthetic_failed_summary(&export.name, &e);
+            return (Err(e), summary);
+        }
+    };
 
     let diags = validate_plan(&plan);
     let mut rejected: Vec<String> = Vec::new();
@@ -233,11 +279,13 @@ fn run_export_job(
         }
     }
     if !rejected.is_empty() {
-        anyhow::bail!(
+        let err = anyhow::anyhow!(
             "export '{}': plan validation failed:\n  {}",
             plan.export_name,
             rejected.join("\n  ")
         );
+        let summary = synthetic_failed_summary(&export.name, &err);
+        return (Err(err), summary);
     }
 
     log::info!(
@@ -345,7 +393,8 @@ fn run_export_job(
     summary.print();
     crate::notify::maybe_send(config.notifications.as_ref(), &summary);
 
-    if failed { result } else { Ok(()) }
+    let final_result = if failed { result } else { Ok(()) };
+    (final_result, summary)
 }
 
 /// Execute a pre-resolved plan with a caller-supplied `ChunkSource`.
@@ -452,6 +501,17 @@ pub(crate) fn run_export_job_with_chunk_source(
 }
 
 /// Re-invoke this binary once per export. Children do not inherit parallel flags, so there is no recursion.
+///
+/// Each child has `RIVET_IPC_EVENTS=1` set in its environment and runs with
+/// stdout piped: it emits one JSON line per significant event
+/// ([`ipc::ChildEvent`]) on stdout instead of drawing its own progress bar
+/// or per-export summary.  The parent reads those events in dedicated reader
+/// threads and forwards them through an `mpsc` channel to a single UI thread
+/// that owns an `indicatif::MultiProgress`, drawing one card per export.
+///
+/// Returns `(Result, child_failures)` so the caller can build an aggregate.
+/// `child_failures` maps export name → error message for children that did not
+/// exit cleanly; on success this map is empty.
 fn run_exports_as_child_processes(
     config_path: &str,
     exports: &[&ExportConfig],
@@ -459,26 +519,51 @@ fn run_exports_as_child_processes(
     reconcile: bool,
     resume: bool,
     params: Option<&std::collections::HashMap<String, String>>,
-) -> Result<()> {
+) -> (Result<()>, std::collections::HashMap<String, String>) {
+    use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
+    use std::sync::mpsc;
 
-    let exe = std::env::current_exe().map_err(|e| {
-        anyhow::anyhow!(
-            "failed to resolve rivet executable for child processes: {:#}",
-            e
-        )
-    })?;
+    use super::pipeline::ipc::{ChildEvent, ENV_IPC_EVENTS};
+    use super::pipeline::parent_ui::{ChildWaitStatus, UiMessage};
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                Err(anyhow::anyhow!(
+                    "failed to resolve rivet executable for child processes: {:#}",
+                    e
+                )),
+                std::collections::HashMap::new(),
+            );
+        }
+    };
 
     let config_arg = std::path::Path::new(config_path)
         .canonicalize()
         .unwrap_or_else(|_| std::path::PathBuf::from(config_path));
 
     log::info!(
-        "running {} exports as separate rivet processes (each child: single `--export`; SQLite state WAL allows concurrent writers)",
+        "running {} exports as separate rivet processes (each child: single `--export`; SQLite state WAL allows concurrent writers; IPC card UI on)",
         exports.len()
     );
 
+    // Single channel feeds the UI thread.  Each child gets a stdout reader
+    // thread that parses NDJSON and forwards events with the export name
+    // resolved from the event itself (not from the child handle), so out-of-
+    // order events still route correctly.
+    let (tx, rx) = mpsc::channel::<UiMessage>();
+
+    let ui_handle = std::thread::Builder::new()
+        .name("rivet-ipc-ui".into())
+        .spawn(move || parent_ui::run_ui(rx))
+        .ok();
+
     let mut children: Vec<(String, std::process::Child)> = Vec::with_capacity(exports.len());
+    let mut reader_handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(exports.len());
+    let mut spawn_failures: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for export in exports {
         let mut cmd = Command::new(&exe);
         cmd.arg("run")
@@ -500,24 +585,83 @@ fn run_exports_as_child_processes(
                 cmd.arg("--param").arg(format!("{k}={v}"));
             }
         }
-        cmd.stdin(Stdio::null());
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            // stderr stays inherited so env_logger output still reaches the
+            // user's terminal.  indicatif draws above the log lines via the
+            // standard MultiProgress mechanism.
+            .env(ENV_IPC_EVENTS, "1");
         log::debug!("spawning child for export '{}': {:?}", export.name, cmd);
-        let child = cmd.spawn().map_err(|e| {
-            anyhow::anyhow!(
-                "failed to spawn rivet child for export '{}': {:#}",
-                export.name,
-                e
-            )
-        })?;
-        children.push((export.name.clone(), child));
+        match cmd.spawn() {
+            Ok(mut child) => {
+                if let Some(stdout) = child.stdout.take() {
+                    let tx = tx.clone();
+                    let export_name = export.name.clone();
+                    let h = std::thread::Builder::new()
+                        .name(format!("rivet-ipc-rx-{}", export.name))
+                        .spawn(move || {
+                            let reader = BufReader::new(stdout);
+                            for line in reader.lines() {
+                                let line = match line {
+                                    Ok(l) => l,
+                                    Err(e) => {
+                                        log::debug!(
+                                            "ipc: child '{}' stdout read error: {:#}",
+                                            export_name,
+                                            e
+                                        );
+                                        break;
+                                    }
+                                };
+                                let trimmed = line.trim();
+                                if trimmed.is_empty() {
+                                    continue;
+                                }
+                                match serde_json::from_str::<ChildEvent>(trimmed) {
+                                    Ok(ev) => {
+                                        let _ = tx.send(UiMessage::Event(ev));
+                                    }
+                                    Err(e) => {
+                                        log::debug!(
+                                            "ipc: child '{}' emitted unparsable line: {} ({:#})",
+                                            export_name,
+                                            trimmed,
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                        })
+                        .ok();
+                    if let Some(h) = h {
+                        reader_handles.push(h);
+                    }
+                }
+                children.push((export.name.clone(), child));
+            }
+            Err(e) => {
+                spawn_failures.insert(
+                    export.name.clone(),
+                    format!("spawn failed: {e:#}"),
+                );
+            }
+        }
     }
 
     let mut failures = Vec::new();
+    let mut wait_failures: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for (name, mut child) in children {
         let status = match child.wait() {
             Ok(s) => s,
             Err(e) => {
-                failures.push(format!("export '{name}': wait failed: {e:#}"));
+                let msg = format!("wait failed: {e:#}");
+                failures.push(format!("export '{name}': {msg}"));
+                wait_failures.insert(name.clone(), msg.clone());
+                let _ = tx.send(UiMessage::ChildClosed {
+                    export_name: name,
+                    wait_status: ChildWaitStatus::Failed(msg),
+                });
                 continue;
             }
         };
@@ -526,14 +670,45 @@ fn run_exports_as_child_processes(
                 .code()
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "signal".to_string());
-            failures.push(format!("export '{name}' exited with status {code}"));
+            let msg = format!("exited with status {code}");
+            failures.push(format!("export '{name}' {msg}"));
+            wait_failures.insert(name.clone(), msg.clone());
+            let _ = tx.send(UiMessage::ChildClosed {
+                export_name: name,
+                wait_status: ChildWaitStatus::Failed(msg),
+            });
+        } else {
+            let _ = tx.send(UiMessage::ChildClosed {
+                export_name: name,
+                wait_status: ChildWaitStatus::Success,
+            });
         }
     }
 
-    if !failures.is_empty() {
-        anyhow::bail!("{}", failures.join("; "));
+    // Drop our own sender so the UI thread can observe the channel closing
+    // once every reader thread has also exited.
+    drop(tx);
+    for h in reader_handles {
+        let _ = h.join();
     }
-    Ok(())
+    if let Some(h) = ui_handle {
+        let _ = h.join();
+    }
+
+    let mut all_failures = spawn_failures;
+    all_failures.extend(wait_failures);
+    for (name, msg) in &all_failures {
+        if !failures.iter().any(|f| f.contains(name)) {
+            failures.push(format!("export '{name}': {msg}"));
+        }
+    }
+
+    let result = if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("{}", failures.join("; ")))
+    };
+    (result, all_failures)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -546,6 +721,7 @@ pub fn run(
     params: Option<&std::collections::HashMap<String, String>>,
     parallel_exports_cli: bool,
     parallel_export_processes_cli: bool,
+    summary_output: Option<&Path>,
 ) -> Result<()> {
     let config = Config::load_with_params(config_path, params)?;
 
@@ -577,8 +753,10 @@ pub fn run(
         && export_name.is_none()
         && exports.len() > 1;
 
+    let started_at = chrono::Utc::now();
+
     if run_parallel_processes {
-        return run_exports_as_child_processes(
+        let (result, child_failures) = run_exports_as_child_processes(
             config_path,
             &exports,
             validate,
@@ -586,60 +764,154 @@ pub fn run(
             resume,
             params,
         );
+        let finished_at = chrono::Utc::now();
+        // Best-effort aggregate: open the state DB read-only-ish and reconstruct
+        // entries from the per-child `record_metric` rows.  Failure to open the
+        // DB here only suppresses the aggregate, not the run itself.
+        match StateStore::open(config_path) {
+            Ok(state) => {
+                let entries = aggregate::collect_child_entries(
+                    &state,
+                    &exports,
+                    started_at,
+                    &child_failures,
+                );
+                let agg = aggregate::build(
+                    entries,
+                    started_at,
+                    finished_at,
+                    Some(config_path),
+                    "parallel-processes",
+                );
+                aggregate::print(&agg);
+                aggregate::persist(&state, &agg, summary_output);
+            }
+            Err(e) => log::warn!(
+                "aggregate: cannot open state DB to record run aggregate: {:#}",
+                e
+            ),
+        }
+        return result;
     }
 
     let run_parallel = (parallel_exports_cli || config.parallel_exports)
         && export_name.is_none()
         && exports.len() > 1;
 
+    let mut summaries: Vec<RunSummary> = Vec::with_capacity(exports.len());
+    let mut failures: Vec<String> = Vec::new();
+
     if run_parallel {
         log::info!(
             "running {} exports in parallel (separate state DB connection per export)",
             exports.len()
         );
-        let mut export_errors: Vec<anyhow::Error> = Vec::new();
+        let collected: std::sync::Mutex<Vec<(Result<()>, RunSummary)>> =
+            std::sync::Mutex::new(Vec::with_capacity(exports.len()));
         std::thread::scope(|s| {
             let mut handles = Vec::new();
             for &export in &exports {
                 handles.push(s.spawn(|| {
-                    let state = StateStore::open(config_path).map_err(|e| {
-                        anyhow::anyhow!(
-                            "export '{}': failed to open state database: {:#}",
-                            export.name,
-                            e
-                        )
-                    })?;
+                    let state = match StateStore::open(config_path) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let err = anyhow::anyhow!(
+                                "export '{}': failed to open state database: {:#}",
+                                export.name,
+                                e
+                            );
+                            let summary = synthetic_failed_summary(&export.name, &err);
+                            return (Err(err), summary);
+                        }
+                    };
                     run_export_job(config_path, &config, export, &state, &config_dir, &opts)
                 }));
             }
             for h in handles {
                 match h.join() {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => export_errors.push(e),
+                    Ok(pair) => collected.lock().unwrap().push(pair),
                     Err(payload) => std::panic::resume_unwind(payload),
                 }
             }
         });
-        if !export_errors.is_empty() {
-            let text = export_errors
-                .into_iter()
-                .map(|e| format!("{e:#}"))
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(anyhow::anyhow!(text));
+        for (res, summary) in collected.into_inner().unwrap() {
+            if let Err(e) = res {
+                failures.push(format!("{e:#}"));
+            }
+            summaries.push(summary);
         }
     } else {
         let state = StateStore::open(config_path)?;
-        let mut failures = Vec::new();
         for export in &exports {
-            if let Err(e) = run_export_job(config_path, &config, export, &state, &config_dir, &opts)
-            {
-                failures.push(format!("{:#}", e));
+            let (res, summary) =
+                run_export_job(config_path, &config, export, &state, &config_dir, &opts);
+            if let Err(e) = res {
+                failures.push(format!("{e:#}"));
             }
+            summaries.push(summary);
         }
-        if !failures.is_empty() {
-            anyhow::bail!("{}", failures.join("; "));
+    }
+
+    let finished_at = chrono::Utc::now();
+    // Skip the aggregate for single-export runs.  Two cases this catches:
+    //   1) `rivet run --export X` (manual one-off): the per-export block
+    //      already says everything, an aggregate of one row is just noise.
+    //   2) Children spawned by `--parallel-export-processes`: each child
+    //      enters this code path with exports.len() == 1.  The parent
+    //      (parallel_processes branch above) builds the run-wide aggregate
+    //      from every child's `export_metrics` row, so a child-level
+    //      aggregate would just write a duplicate into `run_aggregate`.
+    // Force-write the JSON file even when skipping, so `--summary-output`
+    // remains useful for one-off runs.
+    if exports.len() > 1 {
+        let parallel_mode = if run_parallel {
+            "parallel-threads"
+        } else {
+            "sequential"
+        };
+        let entries: Vec<_> = summaries.iter().map(aggregate::entry_from_summary).collect();
+        let agg = aggregate::build(
+            entries,
+            started_at,
+            finished_at,
+            Some(config_path),
+            parallel_mode,
+        );
+        aggregate::print(&agg);
+        // Open a fresh state handle for persisting the aggregate so we don't
+        // assume which thread owned the per-export `StateStore` above.
+        match StateStore::open(config_path) {
+            Ok(state) => aggregate::persist(&state, &agg, summary_output),
+            Err(e) => log::warn!(
+                "aggregate: cannot open state DB to record run aggregate: {:#}",
+                e
+            ),
         }
+    } else if let Some(out) = summary_output {
+        // One export, but the user explicitly asked for a summary file —
+        // honour it without polluting the DB or stderr.
+        let entries: Vec<_> = summaries.iter().map(aggregate::entry_from_summary).collect();
+        let agg = aggregate::build(
+            entries,
+            started_at,
+            finished_at,
+            Some(config_path),
+            "sequential",
+        );
+        if let Err(e) = std::fs::write(
+            out,
+            serde_json::to_string_pretty(&agg).unwrap_or_default(),
+        ) {
+            log::warn!(
+                "aggregate: failed to write summary JSON to {}: {:#}",
+                out.display(),
+                e
+            );
+        }
+    }
+
+    if !failures.is_empty() {
+        anyhow::bail!("{}", failures.join("; "));
     }
 
     Ok(())
@@ -852,5 +1124,58 @@ mod tests {
             diags.iter().any(|d| d.level == DiagnosticLevel::Rejected),
             "stdout + chunked must produce a Rejected diagnostic"
         );
+    }
+
+    // ─── synthetic_failed_summary ────────────────────────────────────────────
+
+    /// Pre-`RunSummary::new` failures (plan-build error, plan-validation
+    /// rejection) still need to be aggregated.  `synthetic_failed_summary`
+    /// produces a minimally-populated summary that aggregation can consume
+    /// without panicking.
+    #[test]
+    fn synthetic_failed_summary_carries_error_and_status() {
+        let err = anyhow::anyhow!("could not connect to source: timeout");
+        let s = synthetic_failed_summary("orders", &err);
+        assert_eq!(s.export_name, "orders");
+        assert_eq!(s.status, "failed");
+        assert_eq!(
+            s.error_message.as_deref(),
+            Some("could not connect to source: timeout")
+        );
+        assert!(
+            s.run_id.starts_with("orders_"),
+            "run_id must be derived from export name, got {}",
+            s.run_id
+        );
+        // Aggregation reads these fields directly — they must default to zero.
+        assert_eq!(s.total_rows, 0);
+        assert_eq!(s.files_produced, 0);
+        assert_eq!(s.bytes_written, 0);
+        assert_eq!(s.duration_ms, 0);
+    }
+
+    /// `entry_from_summary` must faithfully copy fields the aggregate cares
+    /// about.  This guards against silent drift if `RunAggregateEntry` or
+    /// `RunSummary` gain new fields.
+    #[test]
+    fn aggregate_entry_from_summary_copies_observable_fields() {
+        let plan = minimal_plan();
+        let mut summary = RunSummary::new(&plan);
+        summary.status = "success".into();
+        summary.total_rows = 12_345;
+        summary.files_produced = 3;
+        summary.bytes_written = 9_876_543;
+        summary.duration_ms = 5_000;
+
+        let entry = aggregate::entry_from_summary(&summary);
+        assert_eq!(entry.export_name, summary.export_name);
+        assert_eq!(entry.status, "success");
+        assert_eq!(entry.run_id, summary.run_id);
+        assert_eq!(entry.rows, 12_345);
+        assert_eq!(entry.files, 3);
+        assert_eq!(entry.bytes, 9_876_543);
+        assert_eq!(entry.duration_ms, 5_000);
+        assert_eq!(entry.mode, summary.mode);
+        assert_eq!(entry.error_message, None);
     }
 }
