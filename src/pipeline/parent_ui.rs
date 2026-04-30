@@ -2,33 +2,29 @@
 //! `rivet run --parallel-export-processes`.
 //!
 //! Receives [`ipc::ChildEvent`]s from spawned children over an `mpsc` channel
-//! and renders one *card* per export directly to stderr using a small ANSI
-//! cursor protocol.  Each card is one header line, five per-field meta
-//! lines, and one progress / final-summary line:
+//! and renders one *line* per export directly to stderr.  Per-run metadata
+//! that is identical for every export (config path, tuning profile, batch
+//! size, `run_id` formats) is intentionally not repeated per row — the run
+//! aggregator at end-of-run already prints it once.
 //!
+//! Running:
 //! ```text
-//! ── orders ──────────────────────────────────────────────
-//!   run_id:     orders_20260427T120000
-//!   status:     running
-//!   mode:       chunked
-//!   tuning:     profile=balanced (default)
-//!   batch_size: 10,000
-//!   [====>--------------] 4/20 chunks | 100K rows | 00:00:09 | ETA 00:00:18
+//! ▸ orders            chunked   3/20 chunks   300K rows   1m 53.8s  ETA 10m 44.9s
 //! ```
 //!
-//! When the child emits `Finished`, the progress bar is replaced *in place*
-//! with the final metrics so each card becomes a self-contained per-export
-//! summary card:
-//!
+//! Finished (success):
 //! ```text
-//! ── orders ──────────────────────────────────────────────
-//!   run_id:     orders_20260427T120000
-//!   status:     success
-//!   mode:       chunked
-//!   tuning:     profile=balanced (default)
-//!   batch_size: 10,000
-//!   rows: 100,000  files: 1  bytes: 1.2 MB  duration: 9.4s  peak RSS: 30 MB
+//! ✓ orders            chunked   1,000,908 rows  11 files  32.4 MB  1m 44.4s  RSS 50 MB
 //! ```
+//!
+//! Finished (failed):
+//! ```text
+//! ✗ metric_samples    chunked   chunk checkpoint run 'metric_samples_2026…' still in progress
+//! ```
+//!
+//! Recovery commands for failed exports are NOT inlined here (they would
+//! wrap and corrupt the cursor-up math).  The run aggregator prints one
+//! consolidated `recovery:` block at the end instead.
 //!
 //! ## Why a hand-rolled renderer (and not `indicatif`)?
 //!
@@ -58,13 +54,13 @@
 //! ANSI sequences become harmless no-ops because no cursor exists to
 //! reposition).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use super::format_bytes;
 use super::ipc::ChildEvent;
+use super::{clamp_line, format_bytes, strip_chunked_recovery_hint};
 
 /// One unit of work for the UI thread.  Children emit raw `ChildEvent`s; the
 /// reader thread for each child wraps them in [`UiMessage::Event`].  When a
@@ -92,27 +88,47 @@ pub(crate) enum ChildWaitStatus {
     Failed(String),
 }
 
-/// Width reserved for the `label:` column in meta lines so values line up
-/// vertically (e.g. `batch_size:` is the longest label at 11 chars including
-/// the colon).
-const META_LABEL_WIDTH: usize = 11;
-
-/// Width of the `=>--` progress bar inside the running card.
-const PROGRESS_BAR_WIDTH: usize = 35;
-
 /// How often the UI redraws when no event arrives (so elapsed-time and ETA
 /// keep ticking on idle children).
 const IDLE_REDRAW_INTERVAL: Duration = Duration::from_millis(200);
 
+/// Minimum padding for the name column so names stay aligned even when only
+/// short ones have been observed so far.
+const MIN_NAME_COL: usize = 12;
+
+/// Minimum padding for the mode column.  Modes are short (`full`, `chunked`,
+/// `incremental`, `timewindow`) so a fixed minimum is fine.
+const MIN_MODE_COL: usize = 7;
+
 /// Drain `rx` until the channel closes, rendering events as multi-line
-/// "cards" on stderr using a hand-rolled ANSI cursor protocol.
+/// "cards" on stderr.
 ///
 /// Width is recomputed once at startup from the terminal size and clamped to
 /// `[60, 100]`.  Terminal resize during a run is not handled (rare, and
 /// `indicatif` didn't handle it either inside our pty stack); the next run
 /// picks up the new width.
+///
+/// Two rendering modes:
+///
+/// - **Interactive (stderr is a tty)**: hand-rolled ANSI cursor protocol
+///   that repaints all cards in place every 200 ms, so progress / ETA tick
+///   forward and finished cards swap their progress bar for a final-metrics
+///   line without scrolling the screen.
+/// - **Linear (stderr is piped/redirected)**: cursor-up sequences would be
+///   no-ops or, worse, line-wrap around long error messages and corrupt the
+///   anchor — so we instead print each card exactly once when it
+///   transitions to its terminal state.
 pub(crate) fn run_ui(rx: Receiver<UiMessage>) {
     let width = pick_width();
+    if console::Term::stderr().features().is_attended() {
+        run_ui_interactive(rx, width);
+    } else {
+        run_ui_linear(rx, width);
+    }
+}
+
+/// In-place card-stack renderer for tty stderr.
+fn run_ui_interactive(rx: Receiver<UiMessage>, width: usize) {
     let mut renderer = Renderer::new(width);
 
     loop {
@@ -139,6 +155,78 @@ pub(crate) fn run_ui(rx: Receiver<UiMessage>) {
     }
     renderer.redraw();
     renderer.commit();
+}
+
+/// Linear renderer for non-tty stderr.  Each card is printed once when it
+/// reaches its terminal state — there is no in-place redraw, so output is
+/// safe to `tee` / capture without phantom duplicates.
+fn run_ui_linear(rx: Receiver<UiMessage>, width: usize) {
+    let mut renderer = Renderer::new(width);
+    let mut printed: HashSet<String> = HashSet::new();
+
+    while let Ok(msg) = rx.recv() {
+        renderer.process_message(msg);
+        flush_finished_cards(&renderer, &mut printed, width);
+    }
+
+    // Channel closed: synthesize failures for anything still pending and
+    // emit them too.
+    let pending: Vec<String> = renderer
+        .order
+        .iter()
+        .filter(|n| !printed.contains(n.as_str()))
+        .cloned()
+        .collect();
+    for name in &pending {
+        if let Some(card) = renderer.cards.get_mut(name)
+            && !card.finished
+        {
+            card.finalize_synthetic("failed", Some("child exited without a final summary"));
+        }
+    }
+    flush_finished_cards(&renderer, &mut printed, width);
+}
+
+/// Append every card that has reached its terminal state but hasn't been
+/// printed yet to stderr, preserving the `Started`-event observation order.
+fn flush_finished_cards(renderer: &Renderer, printed: &mut HashSet<String>, width: usize) {
+    let (name_col, mode_col) = column_widths(&renderer.cards);
+    let mut out = String::new();
+    for name in &renderer.order {
+        if printed.contains(name) {
+            continue;
+        }
+        let Some(card) = renderer.cards.get(name) else {
+            continue;
+        };
+        if !card.finished {
+            continue;
+        }
+        for line in card.live_lines(width, name_col, mode_col) {
+            out.push_str(&line);
+            out.push('\n');
+        }
+        printed.insert(name.clone());
+    }
+    if out.is_empty() {
+        return;
+    }
+    let mut handle = std::io::stderr().lock();
+    let _ = handle.write_all(out.as_bytes());
+    let _ = handle.flush();
+}
+
+/// Pick stable column widths for the name and mode columns by combining the
+/// observed maxima with `MIN_NAME_COL` / `MIN_MODE_COL` floors so the layout
+/// stays aligned even when only short names / modes have been observed yet.
+fn column_widths(cards: &HashMap<String, CardState>) -> (usize, usize) {
+    let mut name = 0usize;
+    let mut mode = 0usize;
+    for c in cards.values() {
+        name = name.max(c.export_name.chars().count());
+        mode = mode.max(c.mode.chars().count());
+    }
+    (name.max(MIN_NAME_COL), mode.max(MIN_MODE_COL))
 }
 
 /// Owns the on-screen state and knows how to repaint it.  `cards` is
@@ -193,20 +281,17 @@ impl Renderer {
         match ev {
             ChildEvent::Started {
                 export_name,
-                run_id,
+                run_id: _,
                 mode,
-                tuning_profile,
-                batch_size,
+                tuning_profile: _,
+                batch_size: _,
             } => {
                 if !self.cards.contains_key(&export_name) {
                     self.order.push(export_name.clone());
                 }
                 let card = CardState {
                     export_name: export_name.clone(),
-                    run_id,
                     mode,
-                    tuning_profile,
-                    batch_size,
                     status: "running".into(),
                     chunks_done: 0,
                     total_chunks: 0,
@@ -237,7 +322,7 @@ impl Renderer {
             }
             ChildEvent::Finished {
                 export_name,
-                run_id,
+                run_id: _,
                 status,
                 total_rows,
                 files_produced,
@@ -248,7 +333,6 @@ impl Renderer {
             } => {
                 if let Some(card) = self.cards.get_mut(&export_name) {
                     card.finalize(
-                        &run_id,
                         &status,
                         total_rows,
                         files_produced,
@@ -278,10 +362,11 @@ impl Renderer {
             out.push('\r');
         }
 
+        let (name_col, mode_col) = column_widths(&self.cards);
         let mut new_lines = 0usize;
         for name in &self.order {
             if let Some(card) = self.cards.get(name) {
-                for line in card.live_lines(self.width) {
+                for line in card.live_lines(self.width, name_col, mode_col) {
                     // CSI 2K — erase entire line so a shorter new line
                     // overwrites the longer previous line cleanly.
                     out.push_str("\x1b[2K");
@@ -324,10 +409,7 @@ impl Renderer {
 /// Pure data for one export's card.  All formatting lives in `live_lines`.
 struct CardState {
     export_name: String,
-    run_id: String,
     mode: String,
-    tuning_profile: String,
-    batch_size: usize,
     status: String,
     chunks_done: u64,
     total_chunks: u64,
@@ -341,7 +423,6 @@ impl CardState {
     #[allow(clippy::too_many_arguments)]
     fn finalize(
         &mut self,
-        run_id: &str,
         status: &str,
         total_rows: i64,
         files_produced: u64,
@@ -351,7 +432,6 @@ impl CardState {
         error_message: Option<&str>,
     ) {
         self.finished = true;
-        self.run_id = run_id.to_string();
         self.status = status.to_string();
         self.rows = total_rows;
         self.final_line = render_final_line(
@@ -366,40 +446,67 @@ impl CardState {
 
     fn finalize_synthetic(&mut self, status: &str, error_message: Option<&str>) {
         self.finished = true;
-        self.status = status.to_string();
-        self.final_line = format!(
-            "  ⚠ {}",
-            error_message.unwrap_or("child exited without a final summary")
-        );
+        self.status = format!("synthetic-{}", status);
+        self.final_line = error_message
+            .unwrap_or("child exited without a final summary")
+            .to_string();
     }
 
-    /// All seven lines the renderer should print for this card on the
-    /// current frame.
-    fn live_lines(&self, width: usize) -> Vec<String> {
-        vec![
-            format_header(width, &self.export_name),
-            meta_line("run_id", &self.run_id),
-            meta_line("status", &self.status),
-            meta_line("mode", &self.mode),
-            meta_line("tuning", &format!("profile={}", self.tuning_profile)),
-            meta_line("batch_size", &fmt_thousands(self.batch_size as i64)),
-            self.bottom_line(),
-        ]
+    /// Lines this card contributes to the current frame.  Compact mode
+    /// emits exactly one line per export so 15 parallel exports take 15
+    /// stderr rows instead of 105.  The line is clamped to `width`
+    /// characters: a wrapped line would corrupt the cursor-up math in the
+    /// in-place renderer and cause cards to drift down the screen across
+    /// redraws.
+    fn live_lines(&self, width: usize, name_col: usize, mode_col: usize) -> Vec<String> {
+        vec![clamp_line(&self.compact_line(name_col, mode_col), width)]
     }
 
-    /// The 7th line: either the running progress bar (with ETA) or, once
-    /// the card is finished, the final metrics / error message.
-    fn bottom_line(&self) -> String {
-        if self.finished {
-            return self.final_line.clone();
+    /// Render the single per-export status line.  Layout:
+    /// `<icon> <name pad> <mode pad>  <body>`
+    fn compact_line(&self, name_col: usize, mode_col: usize) -> String {
+        let icon = self.status_icon();
+        let body = if self.finished {
+            self.final_line.clone()
+        } else {
+            self.running_body()
+        };
+        format!(
+            "{} {:<name$}  {:<mode$}  {}",
+            icon,
+            self.export_name,
+            self.mode,
+            body,
+            name = name_col,
+            mode = mode_col,
+        )
+    }
+
+    fn status_icon(&self) -> &'static str {
+        if !self.finished {
+            return "▸";
         }
-        let elapsed = self.started_at.elapsed();
-        let elapsed_ms = elapsed.as_millis() as i64;
-        let bar = render_progress_bar(self.chunks_done, self.total_chunks);
+        match self.status.as_str() {
+            "success" => "✓",
+            "failed" => "✗",
+            // `finalize_synthetic` rewrites status to `synthetic-<status>`
+            // so we can distinguish a real failure (where the child sent a
+            // `Finished` event) from a child whose stdout closed without
+            // one.  Both still mean "did not succeed", but the glyph
+            // hints at the difference for triage.
+            s if s.starts_with("synthetic-") => "⚠",
+            _ => "•",
+        }
+    }
+
+    /// Body used while the export is still running.  Shape depends on
+    /// whether chunk progress is known yet.
+    fn running_body(&self) -> String {
+        let elapsed_ms = self.started_at.elapsed().as_millis() as i64;
         let chunks_label = if self.total_chunks > 0 {
             format!("{}/{} chunks", self.chunks_done, self.total_chunks)
         } else {
-            "preparing…".into()
+            "preparing…".to_string()
         };
         let eta_label = if self.chunks_done > 0 && self.total_chunks > self.chunks_done {
             let total_ms_est =
@@ -407,47 +514,18 @@ impl CardState {
             let remaining = (total_ms_est - elapsed_ms as f64).max(0.0) as i64;
             fmt_duration_ms(remaining)
         } else if self.total_chunks > 0 && self.chunks_done >= self.total_chunks {
-            "0s".into()
+            "0s".to_string()
         } else {
-            "—".into()
+            "—".to_string()
         };
         format!(
-            "  [{bar}] {chunks_label} | {rows} | {elapsed} | ETA {eta}",
+            "{chunks}   {rows}   {elapsed}  ETA {eta}",
+            chunks = chunks_label,
             rows = fmt_rows(self.rows),
             elapsed = fmt_duration_ms(elapsed_ms),
             eta = eta_label,
         )
     }
-}
-
-/// Render one `  label:       value` line with a fixed-width label column so
-/// values line up vertically across all meta lines in a card.
-fn meta_line(label: &str, value: &str) -> String {
-    let label_with_colon = format!("{label}:");
-    let pad = META_LABEL_WIDTH.saturating_sub(label_with_colon.chars().count());
-    format!("  {label_with_colon}{} {value}", " ".repeat(pad))
-}
-
-fn render_progress_bar(done: u64, total: u64) -> String {
-    let mut s = String::with_capacity(PROGRESS_BAR_WIDTH);
-    if total == 0 {
-        return "-".repeat(PROGRESS_BAR_WIDTH);
-    }
-    let filled = ((done as f64 / total as f64) * PROGRESS_BAR_WIDTH as f64).floor() as usize;
-    let filled = filled.min(PROGRESS_BAR_WIDTH);
-    for i in 0..PROGRESS_BAR_WIDTH {
-        let ch = if i < filled.saturating_sub(1) {
-            '='
-        } else if i == filled.saturating_sub(1) && done < total {
-            '>'
-        } else if i < filled {
-            '='
-        } else {
-            '-'
-        };
-        s.push(ch);
-    }
-    s
 }
 
 fn render_final_line(
@@ -459,31 +537,26 @@ fn render_final_line(
     error_message: Option<&str>,
 ) -> String {
     if let Some(err) = error_message {
-        return format!("  ✗ {}", err);
+        // Drop the inline `rivet …` recovery hint — the run aggregator
+        // prints one consolidated recovery block at the end, and the
+        // long inline command would otherwise wrap and corrupt the
+        // in-place card layout.
+        let (cause, _) = strip_chunked_recovery_hint(err);
+        return cause.to_string();
     }
     let rss = if peak_rss_mb > 0 {
-        format!("  peak RSS: {} MB", fmt_thousands(peak_rss_mb))
+        format!("  RSS {} MB", fmt_thousands(peak_rss_mb))
     } else {
         String::new()
     };
     format!(
-        "  rows: {}  files: {}  bytes: {}  duration: {}{}",
+        "{} rows  {} files  {}  {}{}",
         fmt_thousands(total_rows),
         fmt_thousands(files_produced as i64),
         format_bytes(bytes_written),
         fmt_duration_ms(duration_ms),
         rss
     )
-}
-
-fn format_header(width: usize, name: &str) -> String {
-    // `── name ───────────…` clamped to `width`.
-    let head = format!("── {} ", name);
-    if head.chars().count() >= width {
-        return head;
-    }
-    let pad = width - head.chars().count();
-    format!("{}{}", head, "─".repeat(pad))
 }
 
 fn pick_width() -> usize {
@@ -541,57 +614,53 @@ fn fmt_duration_ms(ms: i64) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn header_padding_matches_width() {
-        let h = format_header(60, "orders");
-        assert!(h.starts_with("── orders "));
-        // Visible width (counting box-drawing dashes as 1 column) is 60.
-        assert_eq!(h.chars().count(), 60);
-    }
-
-    #[test]
-    fn header_truncates_when_name_is_huge() {
-        let h = format_header(20, "this_is_a_very_very_very_long_export_name");
-        // Should not panic, should still start with `── ` and contain the
-        // export name.  May exceed `width` (single-line truncation is
-        // handled by the terminal, not by us).
-        assert!(h.starts_with("── this_is_a_very_very_very_long_export_name "));
-    }
-
-    #[test]
-    fn meta_line_pads_label_column() {
-        let line = meta_line("run_id", "orders_20260427T120000");
-        assert!(line.starts_with("  run_id:"));
-        assert!(line.contains("orders_20260427T120000"));
-        // Layout: `  ` (2) + `run_id:` (7) + 4 padding + ` ` (1 literal
-        // space) + value.  Value's first character starts at index 14.
-        let value_start = line.find('o').unwrap();
-        assert_eq!(value_start, 14);
-    }
-
-    #[test]
-    fn meta_lines_align_values_vertically() {
-        let a = meta_line("run_id", "@@VAL@@");
-        let b = meta_line("batch_size", "@@VAL@@");
-        let pos_a = a.find("@@VAL@@").unwrap();
-        let pos_b = b.find("@@VAL@@").unwrap();
-        assert_eq!(pos_a, pos_b);
+    fn fresh_card(name: &str, mode: &str) -> CardState {
+        CardState {
+            export_name: name.into(),
+            mode: mode.into(),
+            status: "running".into(),
+            chunks_done: 0,
+            total_chunks: 0,
+            rows: 0,
+            started_at: Instant::now(),
+            finished: false,
+            final_line: String::new(),
+        }
     }
 
     #[test]
     fn final_line_includes_metrics() {
         let s = render_final_line(123_456, 5, 1024 * 1024, 9_400, 30, None);
-        assert!(s.contains("rows: 123,456"));
-        assert!(s.contains("files: 5"));
-        assert!(s.contains("duration: 9.4s"));
-        assert!(s.contains("peak RSS: 30 MB"));
+        assert!(s.contains("123,456 rows"));
+        assert!(s.contains("5 files"));
+        assert!(s.contains("9.4s"));
+        assert!(s.contains("RSS 30 MB"));
     }
 
     #[test]
     fn final_line_uses_error_message() {
         let s = render_final_line(0, 0, 0, 0, 0, Some("connection reset"));
-        assert!(s.contains("connection reset"));
-        assert!(s.starts_with("  ✗ "));
+        assert_eq!(s, "connection reset");
+    }
+
+    #[test]
+    fn final_line_strips_chunked_recovery_hint() {
+        let s = render_final_line(
+            0,
+            0,
+            0,
+            0,
+            0,
+            Some(
+                "export 'x': chunk checkpoint run 'rid' still in progress; \
+                  use `rivet run --config foo.yaml --export x --resume` or \
+                  `rivet state reset-chunks --config foo.yaml --export x`",
+            ),
+        );
+        assert_eq!(
+            s,
+            "export 'x': chunk checkpoint run 'rid' still in progress"
+        );
     }
 
     #[test]
@@ -625,90 +694,82 @@ mod tests {
     }
 
     #[test]
-    fn render_progress_bar_endpoints() {
-        let zero = render_progress_bar(0, 10);
-        let full = render_progress_bar(10, 10);
-        assert_eq!(zero.chars().count(), PROGRESS_BAR_WIDTH);
-        assert_eq!(full.chars().count(), PROGRESS_BAR_WIDTH);
-        assert!(zero.contains('-'));
-        assert!(full.starts_with("====="));
-    }
-
-    #[test]
-    fn render_progress_bar_midpoint_has_arrow() {
-        let mid = render_progress_bar(5, 10);
-        assert!(mid.contains('>'));
-    }
-
-    #[test]
-    fn card_bottom_line_running_renders_chunks_or_preparing() {
-        let mut card = CardState {
-            export_name: "orders".into(),
-            run_id: "rid".into(),
-            mode: "chunked".into(),
-            tuning_profile: "balanced (default)".into(),
-            batch_size: 1_000,
-            status: "running".into(),
-            chunks_done: 0,
-            total_chunks: 0,
-            rows: 0,
-            started_at: Instant::now(),
-            finished: false,
-            final_line: String::new(),
-        };
-        let line = card.bottom_line();
+    fn compact_running_card_shows_progress_or_preparing() {
+        let mut card = fresh_card("orders", "chunked");
+        let line = card.compact_line(MIN_NAME_COL, MIN_MODE_COL);
+        assert!(line.starts_with("▸ "), "running uses ▸: {}", line);
+        assert!(line.contains("orders"));
+        assert!(line.contains("chunked"));
         assert!(line.contains("preparing"));
 
         card.total_chunks = 10;
         card.chunks_done = 4;
         card.rows = 40_000;
-        let line = card.bottom_line();
+        let line = card.compact_line(MIN_NAME_COL, MIN_MODE_COL);
         assert!(line.contains("4/10 chunks"));
         assert!(line.contains("40K rows"));
+        assert!(line.contains("ETA "));
     }
 
     #[test]
-    fn card_bottom_line_uses_final_when_finished() {
-        let mut card = CardState {
-            export_name: "orders".into(),
-            run_id: "rid".into(),
-            mode: "chunked".into(),
-            tuning_profile: "balanced".into(),
-            batch_size: 1_000,
-            status: "running".into(),
-            chunks_done: 0,
-            total_chunks: 0,
-            rows: 0,
-            started_at: Instant::now(),
-            finished: false,
-            final_line: String::new(),
-        };
-        card.finalize("rid_final", "success", 100, 1, 1024, 1234, 30, None);
-        let line = card.bottom_line();
-        assert!(line.contains("rows: 100"));
-        assert!(line.contains("duration: 1.2s"));
+    fn compact_finished_card_shows_metrics_with_check() {
+        let mut card = fresh_card("orders", "chunked");
+        card.finalize("success", 100, 1, 1024, 1234, 30, None);
+        let line = card.compact_line(MIN_NAME_COL, MIN_MODE_COL);
+        assert!(line.starts_with("✓ "), "success uses ✓: {}", line);
+        assert!(line.contains("100 rows"));
+        assert!(line.contains("1 files"));
+        assert!(line.contains("1.2s"));
+        assert!(line.contains("RSS 30 MB"));
     }
 
     #[test]
-    fn card_finalize_synthetic_uses_warning_glyph() {
-        let mut card = CardState {
-            export_name: "orders".into(),
-            run_id: "rid".into(),
-            mode: "chunked".into(),
-            tuning_profile: "balanced".into(),
-            batch_size: 1_000,
-            status: "running".into(),
-            chunks_done: 0,
-            total_chunks: 0,
-            rows: 0,
-            started_at: Instant::now(),
-            finished: false,
-            final_line: String::new(),
-        };
+    fn compact_failed_card_shows_cause_only() {
+        let mut card = fresh_card("metric_samples", "chunked");
+        card.finalize(
+            "failed",
+            0,
+            0,
+            0,
+            0,
+            0,
+            Some(
+                "export 'metric_samples': chunk checkpoint run 'rid' still in progress; \
+                  use `rivet run --config foo.yaml --export metric_samples --resume` or \
+                  `rivet state reset-chunks --config foo.yaml --export metric_samples`",
+            ),
+        );
+        let line = card.compact_line(MIN_NAME_COL, MIN_MODE_COL);
+        assert!(line.starts_with("✗ "), "failed uses ✗: {}", line);
+        assert!(line.contains("still in progress"));
+        // The recovery hint must NOT survive into the per-card line.
+        assert!(!line.contains("`rivet "), "hint must be stripped: {}", line);
+    }
+
+    #[test]
+    fn compact_synthetic_failure_uses_warning_glyph() {
+        let mut card = fresh_card("orders", "chunked");
         card.finalize_synthetic("failed", Some("child crashed"));
+        let line = card.compact_line(MIN_NAME_COL, MIN_MODE_COL);
         assert!(card.finished);
-        assert_eq!(card.status, "failed");
-        assert!(card.final_line.contains("⚠"));
-        assert!(card.final_line.contains("child crashed"));
+        assert!(line.starts_with("⚠ "), "synthetic uses ⚠: {}", line);
+        assert!(line.contains("child crashed"));
+    }
+
+    #[test]
+    fn compact_line_pads_columns_for_alignment() {
+        let mut a = fresh_card("a", "full");
+        a.finalize("success", 1, 1, 0, 1000, 0, None);
+        let mut b = fresh_card("longer_name", "incremental");
+        b.finalize("success", 1, 1, 0, 1000, 0, None);
+        let name_col = "longer_name".chars().count();
+        let mode_col = "incremental".chars().count();
+        let la = a.compact_line(name_col, mode_col);
+        let lb = b.compact_line(name_col, mode_col);
+        // The body separator (`{N} rows`) should start at the same column
+        // for both since both name and mode are padded.
+        let pa = la.find(" rows").expect("body present in a");
+        let pb = lb.find(" rows").expect("body present in b");
+        assert_eq!(pa, pb, "alignment broken: a={la:?} b={lb:?}");
     }
 }

@@ -40,24 +40,34 @@ pub(crate) struct ChunkProgressHandle {
 
 struct HandleInner {
     export_name: String,
-    /// Position counter used as the truth source for IPC `chunks_done`,
-    /// because indicatif's internal counter is not directly readable in a
-    /// thread-safe-yet-cheap way and we need a u64 we can ship in events.
+    /// Position counter used as the truth source for the `chunks_done`
+    /// field on emitted events, because indicatif's internal counter is
+    /// not directly readable in a thread-safe-yet-cheap way and we need a
+    /// u64 we can ship through stdout / the in-process channel.
     chunks_done: AtomicU64,
-    ipc: bool,
+    /// True iff this process is publishing events to a unified UI (either
+    /// stdout-IPC for parallel-export-processes children, or the
+    /// in-process channel for `--parallel-exports`).  Worker `inc()` calls
+    /// emit a `Progress` event when this is set.
+    capturing: bool,
 }
 
 impl ChunkProgress {
     pub(crate) fn new(export_name: &str, total_chunks: usize) -> Self {
-        let ipc_on = ipc::ipc_events_enabled();
-        let bar = if ipc_on {
-            // Child mode: render nothing; the parent draws progress for us.
+        let capturing = ipc::capturing_events();
+        let bar = if capturing {
+            // Either a child of `--parallel-export-processes` (parent
+            // renders), or `--parallel-exports` with the in-process UI
+            // thread active.  Either way the indicatif bar is just noise.
             ProgressBar::with_draw_target(Some(total_chunks as u64), ProgressDrawTarget::hidden())
         } else {
+            // Sequential / single-export run: a bare indicatif bar is the
+            // right tool — it owns the bottom of stderr and there is no
+            // other concurrent producer that would step on its redraws.
             let b = ProgressBar::new(total_chunks as u64);
             b.set_style(
                 ProgressStyle::with_template(
-                    "  {prefix:.bold} [{bar:35.cyan/blue}] {pos}/{len} chunks | {msg} | {elapsed_precise} | ETA {eta}",
+                    "  {prefix:.bold} [{bar:30.cyan/blue}] {pos}/{len} chunks | {msg} | {elapsed_precise} | ETA {eta}",
                 )
                 .unwrap_or_else(|_| ProgressStyle::default_bar())
                 .progress_chars("=>-"),
@@ -72,11 +82,11 @@ impl ChunkProgress {
         let inner = Arc::new(HandleInner {
             export_name: export_name.to_string(),
             chunks_done: AtomicU64::new(0),
-            ipc: ipc_on,
+            capturing,
         });
 
-        if ipc_on {
-            ipc::emit(&ChildEvent::ProgressInit {
+        if capturing {
+            ipc::emit_event(&ChildEvent::ProgressInit {
                 export_name: export_name.to_string(),
                 total_chunks: total_chunks as u64,
             });
@@ -119,15 +129,31 @@ impl ChunkProgress {
     }
 }
 
+impl Drop for ChunkProgress {
+    /// Make sure the underlying indicatif bar is finished even when the
+    /// owning function bailed before reaching the success path.
+    ///
+    /// Important in `run_with_reconnect`'s retry loop: each retry creates
+    /// a fresh `ChunkProgress`, and without an explicit `finish_and_clear`
+    /// the dangling bar can leave a partial cursor state behind on a
+    /// subsequent draw.
+    fn drop(&mut self) {
+        if !self.bar.is_finished() {
+            self.bar.finish_and_clear();
+        }
+    }
+}
+
 impl ChunkProgressHandle {
     /// Advance by one chunk.  Updates the local indicatif bar (a no-op in
-    /// hidden mode) and emits a `Progress` IPC event when in child mode.
+    /// hidden mode) and emits a `Progress` event when a unified UI is
+    /// active (parallel-export-processes child or `--parallel-exports`).
     pub(crate) fn inc(&self, total_rows_so_far: i64) {
         self.bar.set_message(fmt_rows(total_rows_so_far));
         self.bar.inc(1);
         let chunks_done = self.inner.chunks_done.fetch_add(1, Ordering::Relaxed) + 1;
-        if self.inner.ipc {
-            ipc::emit(&ChildEvent::Progress {
+        if self.inner.capturing {
+            ipc::emit_event(&ChildEvent::Progress {
                 export_name: self.inner.export_name.clone(),
                 chunks_done,
                 rows: total_rows_so_far,

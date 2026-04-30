@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use opendal::Operator;
 use opendal::blocking;
+use opendal::layers::RetryLayer;
 use opendal::services::S3;
 
 use crate::config::DestinationConfig;
@@ -108,7 +109,18 @@ impl S3Destination {
             scoped_aws_profile(profile)
         });
 
-        let async_op = Operator::new(builder)?.finish();
+        // See gcs.rs for the rationale; same `RetryLayer` is applied to S3
+        // so transient hyper / SDK errors are absorbed inside the operator
+        // instead of escalating to a chunk-level re-fetch.
+        let async_op = Operator::new(builder)?
+            .layer(
+                RetryLayer::new()
+                    .with_max_times(5)
+                    .with_min_delay(std::time::Duration::from_millis(200))
+                    .with_max_delay(std::time::Duration::from_secs(10))
+                    .with_jitter(),
+            )
+            .finish();
         let op = blocking::Operator::new(async_op)?;
         drop(_profile_guard);
 

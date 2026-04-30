@@ -16,11 +16,49 @@
 //! thread that owns the `MultiProgress`.  Stderr (env-logger output) is left
 //! inherited so log messages still flow normally.
 
+use std::sync::Mutex;
+use std::sync::mpsc::Sender;
+
 use serde::{Deserialize, Serialize};
+
+use super::parent_ui::UiMessage;
 
 /// Env var that toggles emitter mode in children.  Set by the parent in
 /// `run_exports_as_child_processes`; absent for stand-alone CLI invocations.
 pub const ENV_IPC_EVENTS: &str = "RIVET_IPC_EVENTS";
+
+/// In-process event channel.  When the orchestrator runs exports
+/// concurrently in threads (`--parallel-exports`), it installs a sender
+/// here and spawns `parent_ui::run_ui` on the receiver side.  Every
+/// `RunSummary::new`, `ChunkProgress::new`, and chunk completion then
+/// goes through [`emit_event`], which routes the event via this channel
+/// instead of indicatif redraws — same renderer as
+/// `--parallel-export-processes`, no scrollback artefacts.
+pub(crate) static IN_PROCESS_TX: Mutex<Option<Sender<UiMessage>>> = Mutex::new(None);
+
+pub(crate) fn install_in_process_tx(tx: Sender<UiMessage>) {
+    *IN_PROCESS_TX.lock().expect("ipc tx mutex poisoned") = Some(tx);
+}
+
+pub(crate) fn clear_in_process_tx() {
+    *IN_PROCESS_TX.lock().expect("ipc tx mutex poisoned") = None;
+}
+
+pub(crate) fn in_process_events_enabled() -> bool {
+    IN_PROCESS_TX
+        .lock()
+        .expect("ipc tx mutex poisoned")
+        .is_some()
+}
+
+/// True if the current process is publishing events somewhere (stdout IPC
+/// for the `--parallel-export-processes` child path or the in-process
+/// channel for `--parallel-exports`).  Renderers consult this to decide
+/// whether to draw their own indicatif bar / per-export summary block, or
+/// stay quiet and let the unified UI take over.
+pub(crate) fn capturing_events() -> bool {
+    ipc_events_enabled() || in_process_events_enabled()
+}
 
 /// One observable event from a child.  The order is always:
 /// `Started → ProgressInit → Progress* → Finished` per export.
@@ -102,6 +140,30 @@ pub fn emit(event: &ChildEvent) {
         return;
     }
     let _ = h.flush();
+}
+
+/// Route an event to whichever sink is active in this process.
+///
+/// - `RIVET_IPC_EVENTS=1` (we are a child of `--parallel-export-processes`):
+///   serialise to stdout for the parent to consume.
+/// - `IN_PROCESS_TX` installed (`--parallel-exports`, threads): forward
+///   through the in-process channel; `parent_ui::run_ui` renders.
+/// - Neither: nothing to do (stand-alone single export, sequential
+///   multi-export — those paths render through the per-export summary
+///   block + standalone indicatif bar instead).
+pub(crate) fn emit_event(event: &ChildEvent) {
+    if ipc_events_enabled() {
+        emit(event);
+        return;
+    }
+    if let Ok(guard) = IN_PROCESS_TX.lock()
+        && let Some(tx) = guard.as_ref()
+    {
+        // Best-effort send: if the UI thread has already exited (channel
+        // disconnected) the export's render cycle is already done — fall
+        // through silently rather than aborting the export.
+        let _ = tx.send(UiMessage::Event(event.clone()));
+    }
 }
 
 #[cfg(test)]

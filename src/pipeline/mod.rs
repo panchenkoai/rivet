@@ -189,6 +189,35 @@ fn reconcile_source_count(plan: &ResolvedRunPlan, summary: &mut RunSummary) {
     }
 }
 
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+/// True when the current process is running more than one export in this
+/// `rivet run` invocation (sequential or `--parallel-exports`).  Per-export
+/// renderers (`RunSummary::print`, `ChunkProgress`) read this to switch to
+/// the compact one-line format and to suppress the indicatif chunk bar
+/// respectively, so 15 exports take 15 lines instead of 100+ and threads
+/// don't stack progress bars on top of each other.
+///
+/// Children of `--parallel-export-processes` always have `exports.len() == 1`
+/// in their own process so this flag stays `false` for them; the parent
+/// renders cards itself via `parent_ui`.
+pub(crate) static MULTI_EXPORT_MODE: AtomicBool = AtomicBool::new(false);
+
+/// True only when multiple exports run **concurrently** in the current
+/// process (i.e. `--parallel-exports`, threads).  Used to suppress
+/// per-export `indicatif` chunk progress bars whose terminal writes
+/// otherwise interleave across threads and corrupt each other.
+pub(crate) static MULTI_EXPORT_CONCURRENT: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn multi_export_mode() -> bool {
+    MULTI_EXPORT_MODE.load(AtomicOrdering::Relaxed)
+}
+
+#[allow(dead_code)] // kept for future renderers; flag is still set in pipeline::run.
+pub(crate) fn multi_export_concurrent() -> bool {
+    MULTI_EXPORT_CONCURRENT.load(AtomicOrdering::Relaxed)
+}
+
 pub(crate) fn format_bytes(b: u64) -> String {
     if b >= 1_073_741_824 {
         format!("{:.1} GB", b as f64 / 1_073_741_824.0)
@@ -199,6 +228,49 @@ pub(crate) fn format_bytes(b: u64) -> String {
     } else {
         format!("{} B", b)
     }
+}
+
+/// Strip the trailing recovery-hint portion of a chunked-pipeline error
+/// message produced by `pipeline::chunked`.  Returns the cause prefix and
+/// whether a chunked-checkpoint hint was detected.
+///
+/// Hints emitted by `pipeline::chunked` always follow the pattern
+/// `<cause>; <connector> \`rivet …\` …`, so we cut at the first `; ` whose
+/// remainder contains a backtick-quoted `rivet` invocation.
+///
+/// Used by both the per-export card renderer (`parent_ui`) and the run
+/// aggregator (`aggregate`) so the long inline command doesn't wrap, distort
+/// the in-place card layout, and doesn't repeat the consolidated recovery
+/// block printed by the aggregator.
+pub(crate) fn strip_chunked_recovery_hint(msg: &str) -> (&str, bool) {
+    let mut pos = 0;
+    while let Some(off) = msg[pos..].find("; ") {
+        let abs = pos + off;
+        let tail = &msg[abs + 2..];
+        if tail.contains("`rivet ") {
+            return (&msg[..abs], true);
+        }
+        pos = abs + 2;
+    }
+    (msg, false)
+}
+
+/// Truncate `s` to at most `max_chars` Unicode characters, appending `…`
+/// when truncated.  Returns `s` unchanged if already short enough.  Used by
+/// the in-place card renderer to keep every line within the chosen
+/// terminal width — line wrapping breaks the cursor-up redraw math and
+/// causes cards to drift down the screen.
+pub(crate) fn clamp_line(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let mut out: String = s.chars().take(keep).collect();
+    out.push('…');
+    out
 }
 
 /// Synthesize a stand-in `RunSummary` for failures that occur **before** a
@@ -509,9 +581,13 @@ pub(crate) fn run_export_job_with_chunk_source(
 /// threads and forwards them through an `mpsc` channel to a single UI thread
 /// that owns an `indicatif::MultiProgress`, drawing one card per export.
 ///
-/// Returns `(Result, child_failures)` so the caller can build an aggregate.
-/// `child_failures` maps export name → error message for children that did not
-/// exit cleanly; on success this map is empty.
+/// Returns `(Result, child_failures, stderr_dump)` so the caller can build
+/// an aggregate, then surface any captured child-process stderr below the
+/// run summary.  `child_failures` maps export name → error message for
+/// children that did not exit cleanly; on success this map is empty.
+/// `stderr_dump` is a pre-rendered block (already terminated by `\n`) that
+/// the caller prints verbatim on stderr; empty when no child wrote
+/// anything to its captured stderr.
 fn run_exports_as_child_processes(
     config_path: &str,
     exports: &[&ExportConfig],
@@ -519,7 +595,11 @@ fn run_exports_as_child_processes(
     reconcile: bool,
     resume: bool,
     params: Option<&std::collections::HashMap<String, String>>,
-) -> (Result<()>, std::collections::HashMap<String, String>) {
+) -> (
+    Result<()>,
+    std::collections::HashMap<String, String>,
+    String,
+) {
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
@@ -536,6 +616,7 @@ fn run_exports_as_child_processes(
                     e
                 )),
                 std::collections::HashMap::new(),
+                String::new(),
             );
         }
     };
@@ -543,6 +624,24 @@ fn run_exports_as_child_processes(
     let config_arg = std::path::Path::new(config_path)
         .canonicalize()
         .unwrap_or_else(|_| std::path::PathBuf::from(config_path));
+
+    // Apply schema migrations once in the parent before spawning children.
+    // Without this, every child would race on `migrate()` and one of them
+    // would surface "database is locked" (SQLite serialises writers, but
+    // each child opens its own connection and runs the migration BEGIN/
+    // COMMIT in parallel).  After this call the DB is at the latest
+    // schema version, so each child's `StateStore::open` finds nothing to
+    // do and proceeds straight to the read/write workload.
+    if let Err(e) = StateStore::open(config_path) {
+        return (
+            Err(anyhow::anyhow!(
+                "failed to open / migrate state DB before spawning children: {:#}",
+                e
+            )),
+            std::collections::HashMap::new(),
+            String::new(),
+        );
+    }
 
     log::info!(
         "running {} exports as separate rivet processes (each child: single `--export`; SQLite state WAL allows concurrent writers; IPC card UI on)",
@@ -559,6 +658,20 @@ fn run_exports_as_child_processes(
         .name("rivet-ipc-ui".into())
         .spawn(move || parent_ui::run_ui(rx))
         .ok();
+
+    // Per-child stderr buffer, drained after the live UI commits.  Children
+    // inherit `env_logger` and would otherwise scribble straight onto our
+    // terminal between card redraws — corrupting the cursor-up math for the
+    // in-place renderer (`parent_ui::Renderer`).  Capping each child's
+    // buffered output prevents a runaway log loop from consuming unbounded
+    // memory.
+    const CHILD_STDERR_LINE_CAP: usize = 5_000;
+    let stderr_buffers: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let stderr_truncated: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
     let mut children: Vec<(String, std::process::Child)> = Vec::with_capacity(exports.len());
     let mut reader_handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(exports.len());
@@ -587,9 +700,11 @@ fn run_exports_as_child_processes(
         }
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
-            // stderr stays inherited so env_logger output still reaches the
-            // user's terminal.  indicatif draws above the log lines via the
-            // standard MultiProgress mechanism.
+            // Child stderr is captured (not inherited) so `env_logger`
+            // output from the children doesn't interleave with — and
+            // corrupt — the in-place card renderer.  Buffered lines are
+            // printed below the run summary once the UI has committed.
+            .stderr(Stdio::piped())
             .env(ENV_IPC_EVENTS, "1");
         log::debug!("spawning child for export '{}': {:?}", export.name, cmd);
         match cmd.spawn() {
@@ -637,6 +752,42 @@ fn run_exports_as_child_processes(
                         reader_handles.push(h);
                     }
                 }
+                if let Some(stderr) = child.stderr.take() {
+                    let export_name = export.name.clone();
+                    let buffers = std::sync::Arc::clone(&stderr_buffers);
+                    let truncated = std::sync::Arc::clone(&stderr_truncated);
+                    let h = std::thread::Builder::new()
+                        .name(format!("rivet-ipc-err-{}", export.name))
+                        .spawn(move || {
+                            let reader = BufReader::new(stderr);
+                            for line in reader.lines() {
+                                let line = match line {
+                                    Ok(l) => l,
+                                    Err(_) => break,
+                                };
+                                let mut guard = match buffers.lock() {
+                                    Ok(g) => g,
+                                    Err(p) => p.into_inner(),
+                                };
+                                let entry =
+                                    guard.entry(export_name.clone()).or_insert_with(Vec::new);
+                                if entry.len() >= CHILD_STDERR_LINE_CAP {
+                                    drop(guard);
+                                    let mut tg = match truncated.lock() {
+                                        Ok(g) => g,
+                                        Err(p) => p.into_inner(),
+                                    };
+                                    *tg.entry(export_name.clone()).or_insert(0) += 1;
+                                    continue;
+                                }
+                                entry.push(line);
+                            }
+                        })
+                        .ok();
+                    if let Some(h) = h {
+                        reader_handles.push(h);
+                    }
+                }
                 children.push((export.name.clone(), child));
             }
             Err(e) => {
@@ -648,8 +799,41 @@ fn run_exports_as_child_processes(
     let mut failures = Vec::new();
     let mut wait_failures: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+
+    // Reap each child in its own dedicated thread so a child that exits
+    // gets `wait()`ed immediately, regardless of which child is at the
+    // head of the spawn order.  The previous loop reaped children
+    // sequentially, which on a 15-export config left up to 14 finished
+    // children sitting around as zombies until the longest-running one
+    // (e.g. `events` with 400 chunks) caught up — visible in `htop` /
+    // `Activity Monitor` as a long stack of `rivet --export …` rows that
+    // had clearly already done their work.
+    type WaitOutcome = (String, std::io::Result<std::process::ExitStatus>);
+    let mut reaper_handles: Vec<std::thread::JoinHandle<WaitOutcome>> =
+        Vec::with_capacity(children.len());
     for (name, mut child) in children {
-        let status = match child.wait() {
+        let handle = std::thread::Builder::new()
+            .name(format!("rivet-reap-{}", name))
+            .spawn(move || {
+                let status = child.wait();
+                (name, status)
+            });
+        match handle {
+            Ok(h) => reaper_handles.push(h),
+            Err(e) => {
+                // We can't spawn a reap thread; fall back to inline wait
+                // so we don't leak the child handle.  The child still
+                // gets reaped, just without the parallelism benefit.
+                log::debug!("ipc: failed to spawn reaper thread: {:#}", e);
+            }
+        }
+    }
+    for h in reaper_handles {
+        let (name, status) = match h.join() {
+            Ok(pair) => pair,
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
+        let status = match status {
             Ok(s) => s,
             Err(e) => {
                 let msg = format!("wait failed: {e:#}");
@@ -692,6 +876,16 @@ fn run_exports_as_child_processes(
         let _ = h.join();
     }
 
+    // Now that the UI has committed, render any captured child stderr.
+    // Caller prints this AFTER the run-summary aggregate so the summary is
+    // immediately below the card stack, with verbose logs at the bottom.
+    let stderr_snapshot = stderr_buffers.lock().map(|g| g.clone()).unwrap_or_default();
+    let truncated_snapshot = stderr_truncated
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    let stderr_dump = render_child_stderr(exports, &stderr_snapshot, &truncated_snapshot);
+
     let mut all_failures = spawn_failures;
     all_failures.extend(wait_failures);
     for (name, msg) in &all_failures {
@@ -705,7 +899,49 @@ fn run_exports_as_child_processes(
     } else {
         Err(anyhow::anyhow!("{}", failures.join("; ")))
     };
-    (result, all_failures)
+    (result, all_failures, stderr_dump)
+}
+
+/// Render captured child-process stderr to a single string, ready to be
+/// written to stderr by the caller (after the run-summary aggregate).
+/// Returns an empty string when no child wrote anything, so successful
+/// quiet runs stay clean.  Lines are emitted with a `  | ` prefix so
+/// they're visually distinct from rivet's own UI lines.
+fn render_child_stderr(
+    exports: &[&ExportConfig],
+    buffers: &std::collections::HashMap<String, Vec<String>>,
+    truncated: &std::collections::HashMap<String, usize>,
+) -> String {
+    let any = exports
+        .iter()
+        .any(|e| buffers.get(&e.name).is_some_and(|v| !v.is_empty()));
+    if !any {
+        return String::new();
+    }
+    let mut out = String::new();
+    out.push('\n');
+    out.push_str("  child stderr (captured to keep the live card stack stable):\n");
+    for export in exports {
+        let Some(lines) = buffers.get(&export.name) else {
+            continue;
+        };
+        if lines.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("  ── {} ──\n", export.name));
+        for line in lines {
+            out.push_str("    | ");
+            out.push_str(line);
+            out.push('\n');
+        }
+        if let Some(extra) = truncated.get(&export.name) {
+            out.push_str(&format!(
+                "    | … (truncated, {} more line(s) dropped)\n",
+                extra
+            ));
+        }
+    }
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -753,7 +989,21 @@ pub fn run(
     let started_at = chrono::Utc::now();
 
     if run_parallel_processes {
-        let (result, child_failures) = run_exports_as_child_processes(
+        // Run schema migrations once in the parent BEFORE forking children.
+        // Otherwise N children race for the exclusive write lock on a
+        // brand-new `.rivet_state.db` and `busy_timeout` is not enough to
+        // serialise them — most fail with `migration v1 failed: database is
+        // locked`.  After this open succeeds the schema is at the latest
+        // version and children's `StateStore::open` calls become idempotent
+        // (the `MIGRATIONS` loop is a no-op when `ver <= current`).
+        if let Err(e) = StateStore::open(config_path) {
+            return Err(anyhow::anyhow!(
+                "state: failed to initialize state DB before spawning children: {:#}",
+                e
+            ));
+        }
+
+        let (result, child_failures, stderr_dump) = run_exports_as_child_processes(
             config_path,
             &exports,
             validate,
@@ -784,12 +1034,38 @@ pub fn run(
                 e
             ),
         }
+        // Captured child stderr is printed AFTER the aggregate so the run
+        // summary stays immediately under the card stack — verbose log
+        // output sits below for triage when needed.
+        if !stderr_dump.is_empty() {
+            use std::io::Write;
+            let mut h = std::io::stderr().lock();
+            let _ = h.write_all(stderr_dump.as_bytes());
+            let _ = h.flush();
+        }
         return result;
     }
 
     let run_parallel = (parallel_exports_cli || config.parallel_exports)
         && export_name.is_none()
         && exports.len() > 1;
+
+    // Compact-rendering hints for the per-export renderers.  Set once here so
+    // every code path below — sequential, `--parallel-exports`, the apply
+    // path, etc. — sees a consistent mode.  Restored at the end of the run
+    // so subsequent invocations within the same process (tests, library
+    // callers) start with a clean slate.
+    let multi_export = export_name.is_none() && exports.len() > 1;
+    let prev_multi = MULTI_EXPORT_MODE.swap(multi_export, AtomicOrdering::Relaxed);
+    let prev_concurrent = MULTI_EXPORT_CONCURRENT.swap(run_parallel, AtomicOrdering::Relaxed);
+    struct ResetMultiExport(bool, bool);
+    impl Drop for ResetMultiExport {
+        fn drop(&mut self) {
+            MULTI_EXPORT_MODE.store(self.0, AtomicOrdering::Relaxed);
+            MULTI_EXPORT_CONCURRENT.store(self.1, AtomicOrdering::Relaxed);
+        }
+    }
+    let _reset_multi = ResetMultiExport(prev_multi, prev_concurrent);
 
     let mut summaries: Vec<RunSummary> = Vec::with_capacity(exports.len());
     let mut failures: Vec<String> = Vec::new();
@@ -799,6 +1075,28 @@ pub fn run(
             "running {} exports in parallel (separate state DB connection per export)",
             exports.len()
         );
+
+        // In threads mode every export emits the same `ChildEvent` stream
+        // that `--parallel-export-processes` children emit, but routed
+        // through an in-process `mpsc` channel.  A single UI thread (the
+        // same `parent_ui::run_ui` used for the process-mode parent) owns
+        // stderr and renders one card line per export — no indicatif, no
+        // multi-bar coordination headache, no scrollback artefacts from
+        // concurrent redraws.  Ensure stderr is also pre-migrated so child
+        // threads opening their own `StateStore` don't race on schema DDL.
+        if let Err(e) = StateStore::open(config_path) {
+            return Err(anyhow::anyhow!(
+                "state: failed to initialize state DB before spawning export threads: {:#}",
+                e
+            ));
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<parent_ui::UiMessage>();
+        ipc::install_in_process_tx(tx);
+        let ui_thread = std::thread::Builder::new()
+            .name("rivet-ui".to_string())
+            .spawn(move || parent_ui::run_ui(rx))
+            .ok();
+
         let collected: std::sync::Mutex<Vec<(Result<()>, RunSummary)>> =
             std::sync::Mutex::new(Vec::with_capacity(exports.len()));
         std::thread::scope(|s| {
@@ -827,6 +1125,17 @@ pub fn run(
                 }
             }
         });
+
+        // All exports are done → drop the sender so `parent_ui::run_ui`
+        // sees the channel close and exits cleanly (committing the final
+        // card stack to scrollback).  Joining is best-effort: even if the
+        // UI thread is wedged we still want to print the run aggregate
+        // below.
+        ipc::clear_in_process_tx();
+        if let Some(t) = ui_thread {
+            let _ = t.join();
+        }
+
         for (res, summary) in collected.into_inner().unwrap() {
             if let Err(e) = res {
                 failures.push(format!("{e:#}"));
@@ -932,6 +1241,50 @@ mod tests {
         assert_eq!(format_bytes(1_048_576), "1.0 MB");
         assert_eq!(format_bytes(1_073_741_824), "1.0 GB");
         assert_eq!(format_bytes(2_684_354_560), "2.5 GB");
+    }
+
+    #[test]
+    fn strip_chunked_recovery_hint_strips_use_form() {
+        let m = "export 'users': chunk checkpoint run 'users_x' still in progress; \
+                 use `rivet run --config foo.yaml --export users --resume` or \
+                 `rivet state reset-chunks --config foo.yaml --export users`";
+        let (cause, hinted) = strip_chunked_recovery_hint(m);
+        assert!(hinted);
+        assert_eq!(
+            cause,
+            "export 'users': chunk checkpoint run 'users_x' still in progress"
+        );
+    }
+
+    #[test]
+    fn strip_chunked_recovery_hint_strips_fix_errors_form() {
+        let m = "export 'a': chunk checkpoint incomplete (3 tasks not completed); \
+                 fix errors and `rivet run --config c.yaml --export a --resume` or \
+                 `rivet state reset-chunks --config c.yaml --export a`";
+        let (cause, hinted) = strip_chunked_recovery_hint(m);
+        assert!(hinted);
+        assert_eq!(
+            cause,
+            "export 'a': chunk checkpoint incomplete (3 tasks not completed)"
+        );
+    }
+
+    #[test]
+    fn strip_chunked_recovery_hint_passthrough_when_no_hint() {
+        let m = "export 'q': source connection refused; retry exhausted";
+        let (cause, hinted) = strip_chunked_recovery_hint(m);
+        assert!(!hinted);
+        assert_eq!(cause, m);
+    }
+
+    #[test]
+    fn clamp_line_truncates_with_ellipsis() {
+        assert_eq!(clamp_line("short", 80), "short");
+        assert_eq!(clamp_line("hello world", 8), "hello w…");
+        let s = "тест".repeat(50);
+        let out = clamp_line(&s, 10);
+        assert_eq!(out.chars().count(), 10);
+        assert!(out.ends_with('…'));
     }
 
     #[test]

@@ -1,8 +1,8 @@
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::TransactionBehavior;
 
 use crate::error::Result;
 
-use super::StateStore;
+use super::{StateStore, open_connection};
 
 /// One row from `chunk_task` for display / debugging.
 #[derive(Debug, Clone)]
@@ -126,7 +126,7 @@ impl StateStore {
         db_path: &std::path::Path,
         run_id: &str,
     ) -> Result<Option<(i64, String, String)>> {
-        let mut conn = Connection::open(db_path)?;
+        let mut conn = open_connection(db_path)?;
         let now = chrono::Utc::now().to_rfc3339();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let res = Self::claim_next_chunk_in_tx(&tx, &now, run_id)?;
@@ -167,7 +167,7 @@ impl StateStore {
         chunk_index: i64,
         err: &str,
     ) -> Result<()> {
-        let conn = Connection::open(db_path)?;
+        let conn = open_connection(db_path)?;
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE chunk_task SET status = 'failed', last_error = ?1, updated_at = ?2
@@ -184,7 +184,7 @@ impl StateStore {
         rows_written: i64,
         file_name: Option<&str>,
     ) -> Result<()> {
-        let conn = Connection::open(db_path)?;
+        let conn = open_connection(db_path)?;
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE chunk_task

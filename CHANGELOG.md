@@ -1,5 +1,130 @@
 # Changelog
 
+## 0.3.5 (2026-04-30)
+
+Polish release on top of 0.3.4: every multi-export mode (`--parallel-exports`
+threads and `--parallel-export-processes` children) now renders the same live
+cards UI, end-of-run summaries collapse to a single compact block instead of
+seven lines per export, the chunked retry path no longer leaves stale progress
+bars or zombie child processes behind, and a few rough edges around recovery
+hints, `database is locked`, and transient OpenDAL errors are gone. No YAML
+config changes; no on-disk artifact changes; `--single-export` and sequential
+runs print exactly as before.
+
+### `--parallel-exports` (threads) shares the cards UI
+
+`--parallel-exports` previously rendered one `indicatif::MultiProgress` bar
+per chunk worker, which interleaved with per-export `RunSummary` blocks and
+left "ghost" 0/N bars behind on retries. 0.3.5 replaces that path with the
+same `parent_ui::run_ui` renderer used by `--parallel-export-processes`:
+
+- A single `mpsc::Sender<UiMessage>` is installed in `pipeline::ipc` for the
+  duration of the run; chunked workers and `RunSummary::print` route their
+  events (`Started`, `ProgressInit`, `Progress`, `Finished`) through that
+  channel instead of writing directly to stderr.
+- A dedicated UI thread drains the channel and redraws the card stack — one
+  card per export — exactly as in `--parallel-export-processes`.
+- Chunked progress bars under multi-export runs are `ProgressDrawTarget::hidden()`;
+  `ChunkProgress` now implements `Drop` and calls `finish_and_clear()` on
+  scope exit so that retries (a fresh `ChunkProgress` per attempt) don't
+  accumulate orphaned bars in the renderer.
+
+Sequential / single-export runs still draw a normal `indicatif` bar to
+stderr — the cards path only activates when more than one export is in
+flight.
+
+### Compact end-of-run summaries
+
+`RunSummary::print` used to emit a 7-line block per export (header, run_id,
+status, mode, tuning, batch_size, metrics). Under multi-export mode that
+turned a 15-export run into ~100 lines of scrollback even on success.
+0.3.5:
+
+- Sets a `MULTI_EXPORT_MODE` flag for the duration of any multi-export
+  invocation; while it's set, `RunSummary::print` short-circuits to a new
+  `render_compact()` path that produces a single status-icon + one-line
+  summary per export.
+- The aggregate `Run summary` block (`pipeline::aggregate::print`) strips
+  per-export recovery hints (`run rivet state reset-chunks --export …`)
+  from individual error messages and prints them once, consolidated, in a
+  single `Recovery` section at the bottom.
+- Long error messages are clamped to a fixed character budget; in
+  particular, `parallel checkpoint worker errors` (which previously dumped
+  every failed chunk's GCS URL into the summary) collapse to a single
+  cause-line via `summary::compact_error` /
+  `summary::summarize_parallel_chunk_errors`.
+
+### Recovery hints always include `--config`
+
+`rivet state reset-chunks --export <name>` and the `--resume` suggestions
+emitted by `pipeline::chunked` previously omitted the `--config <path>`
+flag, so copy-pasting them straight from the error message failed for
+anyone whose YAML wasn't named `rivet.yaml`. Both error paths now go
+through a shared `config_hint(config_path)` helper and emit fully-qualified
+commands.
+
+### `database is locked` on first-time `--parallel-export-processes`
+
+Spawning N children against a brand-new `state.db` raced N copies of the
+v1 schema migration on an exclusive lock; the loser printed
+`migration v1 failed: database is locked` and exited. Fixed in two
+places:
+
+- `pipeline::run_exports_as_child_processes` now opens `StateStore` once
+  in the parent before spawning children, so the migration runs exactly
+  once and every child sees a fully-migrated DB.
+- The ad-hoc connections opened by `state::checkpoint` for parallel chunk
+  workers go through a new `open_connection` helper that applies
+  `journal_mode=WAL` and `busy_timeout = 10_000` per connection. Brief
+  contention on `chunk_task` / `export_metrics` now waits up to 10 s
+  instead of surfacing `SQLITE_BUSY` immediately.
+
+### No more zombie children in `htop`
+
+`--parallel-export-processes` previously reaped children sequentially
+(`for child in children { child.wait()?; }`), so on a 15-export config the
+14 fastest children sat as defunct entries until the slowest one finished.
+0.3.5 spawns one dedicated reaper thread per child (`rivet-reap-<name>`)
+and joins them in any order; each child is `wait()`ed within milliseconds
+of its actual exit. Visible improvement: the long stack of
+`rivet --export …` rows in `htop` / Activity Monitor disappears as soon
+as each card flips to its final metrics.
+
+### OpenDAL transient retries (GCS + S3)
+
+GCS occasionally returns `dispatch task is gone: runtime dropped the
+dispatch task` and other `(temporary)` errors mid-stream; before 0.3.5 a
+single hiccup tore down the chunk worker and forced a fresh connection +
+re-fetch from Postgres. Two layers of fixes:
+
+- `destination::gcs` / `destination::s3` now wrap the async `Operator`
+  with `opendal::layers::RetryLayer::new().max_times(5).min_delay(200ms)
+  .max_delay(10s).jitter()` before converting to `blocking::Operator`.
+  Transient HTTP failures retry inside OpenDAL with no chunk-worker
+  involvement.
+- `pipeline::retry::classify_error` recognises `(temporary)` and
+  `dispatch task is gone` / `runtime dropped the dispatch task` as
+  transient-but-non-reconnecting, with a 500 ms extra delay. The chunk
+  worker keeps its existing connection and retries the chunk write
+  instead of falling back to the outer reconnect loop.
+
+### Documentation
+
+- `docs/gifs/chunked-progress.gif` and `docs/gifs/parallel-cards.gif` were
+  re-recorded against 0.3.5 binaries so the demos reflect the new compact
+  summary, the cleaned-up parallel cards (no interleaving, no ghost
+  bars), and the consolidated recovery section.
+
+### Compatibility
+
+- No YAML config changes. `rivet check` / `rivet plan` behaviour
+  unchanged.
+- Sequential / `--single-export` runs print exactly as before.
+- `--parallel-exports` and `--parallel-export-processes` produce strictly
+  cleaner output; scripts that scraped the per-export `RunSummary` block
+  from stderr should already be on `RIVET_IPC_EVENTS=1` + `Finished`
+  events on stdout (stable since 0.3.4).
+
 ## 0.3.4 (2026-04-27)
 
 Multi-process parallel exports get a real UI: `--parallel-export-processes`

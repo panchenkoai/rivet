@@ -14,9 +14,9 @@
 //! without any signature changes.  In a future epic the relationship will invert:
 //! `RunSummary` will be derived from `RunJournal`.
 
-use super::format_bytes;
 use super::ipc::{self, ChildEvent};
 use super::journal::{PlanSnapshot, RunEvent, RunJournal};
+use super::{format_bytes, multi_export_mode, strip_chunked_recovery_hint};
 use crate::plan::ResolvedRunPlan;
 
 /// Accumulates operational data during a pipeline run for summary and metrics.
@@ -66,15 +66,13 @@ impl RunSummary {
         let mut journal = RunJournal::new(&run_id, &plan.export_name);
         journal.record(RunEvent::PlanResolved(PlanSnapshot::from(plan)));
 
-        if ipc::ipc_events_enabled() {
-            ipc::emit(&ChildEvent::Started {
-                export_name: plan.export_name.clone(),
-                run_id: run_id.clone(),
-                mode: plan.strategy.mode_label().to_string(),
-                tuning_profile: plan.tuning_profile_label.clone(),
-                batch_size: plan.tuning.batch_size,
-            });
-        }
+        ipc::emit_event(&ChildEvent::Started {
+            export_name: plan.export_name.clone(),
+            run_id: run_id.clone(),
+            mode: plan.strategy.mode_label().to_string(),
+            tuning_profile: plan.tuning_profile_label.clone(),
+            batch_size: plan.tuning.batch_size,
+        });
 
         Self {
             run_id,
@@ -103,10 +101,11 @@ impl RunSummary {
     }
 
     pub(super) fn print(&self) {
-        // Child mode: emit a `Finished` IPC event instead of drawing the
-        // stderr block.  The parent will render the final card itself.
-        if ipc::ipc_events_enabled() {
-            ipc::emit(&ChildEvent::Finished {
+        // Capturing mode (IPC child or in-process channel): emit a
+        // `Finished` event and let the unified UI thread render the card.
+        // No stderr block here — the renderer owns the screen.
+        if ipc::capturing_events() {
+            ipc::emit_event(&ChildEvent::Finished {
                 export_name: self.export_name.clone(),
                 run_id: self.run_id.clone(),
                 status: self.status.clone(),
@@ -120,16 +119,76 @@ impl RunSummary {
             return;
         }
 
+        // Compact mode (multiple exports in this run): print one line per
+        // export so 15 exports take 15 stderr rows instead of ~100.
+        // Verbose 7-line block is reserved for single-export `rivet run`
+        // invocations where the extra detail has room to breathe.
+        let block = if multi_export_mode() {
+            self.render_compact()
+        } else {
+            // Render the whole block into a single buffer so the call site
+            // emits one `write_all` to stderr.  Without this, parallel
+            // exports could interleave individual lines from different
+            // `RunSummary::print()` calls — visible as garbled blocks in
+            // `--parallel-exports` runs.
+            self.render().trim_end_matches('\n').to_string()
+        };
+
         use std::io::Write;
-        // Render the whole block into a single buffer so the call site emits
-        // one `write_all` to stderr.  Without this, parallel exports could
-        // interleave individual lines from different `RunSummary::print()`
-        // calls — visible as garbled blocks in `--parallel-exports` runs.
-        let block = self.render();
+        let mut buf = block;
+        buf.push('\n');
         let stderr = std::io::stderr();
         let mut handle = stderr.lock();
-        let _ = handle.write_all(block.as_bytes());
+        let _ = handle.write_all(buf.as_bytes());
         let _ = handle.flush();
+    }
+
+    /// Compact one-line summary used when several exports run in the same
+    /// invocation.  Mirrors the parent_ui card line so `--parallel-exports`
+    /// (threads), sequential, and `--parallel-export-processes` (processes)
+    /// produce visually consistent per-export rows.
+    fn render_compact(&self) -> String {
+        const NAME_COL: usize = 22;
+        const MODE_COL: usize = 8;
+        let icon = match self.status.as_str() {
+            "success" => "✓",
+            "failed" => "✗",
+            _ => "•",
+        };
+        let body = if self.status == "failed" {
+            let err = self
+                .error_message
+                .as_deref()
+                .unwrap_or("(no error message recorded)");
+            let (cause, _) = strip_chunked_recovery_hint(err);
+            // Collapse multi-line / extremely long errors so the compact
+            // line stays one row tall.  Full payload lives in the stderr
+            // log above the run summary.
+            compact_error(cause)
+        } else {
+            let rss = if self.peak_rss_mb > 0 {
+                format!("  RSS {} MB", fmt_thousands(self.peak_rss_mb))
+            } else {
+                String::new()
+            };
+            format!(
+                "{} rows  {} files  {}  {}{}",
+                fmt_thousands(self.total_rows),
+                fmt_thousands(self.files_produced as i64),
+                format_bytes(self.bytes_written),
+                fmt_duration_ms(self.duration_ms),
+                rss
+            )
+        };
+        format!(
+            "{} {:<name$}  {:<mode$}  {}",
+            icon,
+            self.export_name,
+            self.mode,
+            body,
+            name = NAME_COL,
+            mode = MODE_COL,
+        )
     }
 
     /// Build the block as a string.  Public to the module so tests can assert
@@ -210,11 +269,83 @@ impl RunSummary {
             rows.push(("reconcile", value));
         }
         if let Some(err) = &self.error_message {
-            rows.push(("error", err.clone()));
+            // Multi-line errors (e.g. `parallel checkpoint worker errors:\n
+            // chunk 4: …\nchunk 5: …`) wreak havoc on the indented block
+            // because `format_block` only knows how to indent the first
+            // line.  Collapse them to a compact single-line cause; the full
+            // multi-line text is already in the structured logs above.
+            rows.push(("error", compact_error(err)));
         }
 
         format_block(&self.export_name, &rows)
     }
+}
+
+/// Reduce a possibly-multi-line execution error to a single-line, bounded-
+/// length cause suitable for the per-export summary block and the compact
+/// one-liner.  Keeps the user-actionable bit and drops noisy diagnostic
+/// payloads (long URLs, query strings, repeated chunk errors).
+///
+/// Recognised shapes:
+/// - `parallel checkpoint worker errors:\nchunk N: <msg>\nchunk M: <msg>` →
+///   `parallel checkpoint workers failed: K chunk(s) (chunk N: <truncated>)`.
+///   The full per-chunk detail is already in stderr logs.
+/// - Generic multi-line: newlines are replaced with `; ` and the result is
+///   clamped to 240 characters with an ellipsis.
+fn compact_error(raw: &str) -> String {
+    const MAX_CHARS: usize = 240;
+    if let Some(summary) = summarize_parallel_chunk_errors(raw) {
+        return clamp_chars(&summary, MAX_CHARS);
+    }
+    let collapsed: String = raw
+        .lines()
+        .map(str::trim_end)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+    clamp_chars(&collapsed, MAX_CHARS)
+}
+
+fn summarize_parallel_chunk_errors(raw: &str) -> Option<String> {
+    let header_pos = raw.find("parallel checkpoint worker errors:")?;
+    let prefix = raw[..header_pos].trim_end_matches(": ").trim_end();
+    let tail = &raw[header_pos + "parallel checkpoint worker errors:".len()..];
+
+    let chunk_lines: Vec<&str> = tail
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("chunk "))
+        .collect();
+    if chunk_lines.is_empty() {
+        return None;
+    }
+    let first_chunk_full = chunk_lines[0];
+    // Truncate the example chunk message; the URL/payload is in stderr logs.
+    let first_chunk_short = clamp_chars(first_chunk_full, 140);
+    let prefix = if prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{}: ", prefix)
+    };
+    Some(format!(
+        "{}parallel checkpoint workers failed: {} chunk(s) ({}); see stderr for full payloads",
+        prefix,
+        chunk_lines.len(),
+        first_chunk_short
+    ))
+}
+
+fn clamp_chars(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let mut out: String = s.chars().take(keep).collect();
+    out.push('…');
+    out
 }
 
 /// Render a `── name ─────…─` header plus one indented `label:  value` line
@@ -425,5 +556,138 @@ mod tests {
         // No raw progress-bar bleed: header dashes still present, no carriage
         // returns or escape sequences.
         assert!(!block.contains('\r'));
+
+        // Compact one-liner used in multi-export runs.
+        let line = s.render_compact();
+        assert!(line.starts_with("✓ "), "success icon present: {:?}", line);
+        assert!(line.contains("orders"), "export name present: {:?}", line);
+        assert!(line.contains("1,000,908 rows"), "rows present: {:?}", line);
+        assert!(line.contains("32.4 MB"), "bytes present: {:?}", line);
+        assert!(line.contains("1m 08.4s"), "duration present: {:?}", line);
+        assert!(line.contains("RSS 884 MB"), "rss present: {:?}", line);
+        assert!(!line.contains('\n'), "single line: {:?}", line);
+    }
+
+    #[test]
+    fn compact_error_summarises_parallel_chunk_errors() {
+        let raw = "export 'page_views': parallel checkpoint worker errors:\n\
+                   chunk 4: Unexpected (temporary) at write, context: { url: https://storage.googleapis.com/rivet_data_test/exports%2Fpage_views%2Fpage_views_20260430_202442_chunk4.parquet?partNumber=1&uploadId=ABPnzm7RqplA, called: http_util::Client::send } => send http request, source: error sending request: client error (SendRequest): dispatch task is gone\n\
+                   chunk 5: Unexpected (temporary) at write, context: { url: https://storage.googleapis.com/rivet_data_test/exports%2Fpage_views%2Fpage_views_20260430_202443_chunk5.parquet?partNumber=1&uploadId=ABPnzm6q, called: http_util::Client::send } => send http request, source: dispatch task is gone";
+        let out = compact_error(raw);
+        assert!(
+            out.contains("2 chunk(s)"),
+            "should report number of failed chunks: {:?}",
+            out
+        );
+        assert!(
+            out.starts_with("export 'page_views': parallel checkpoint workers failed:"),
+            "should keep export prefix and use compact phrasing: {:?}",
+            out
+        );
+        assert!(
+            out.contains("chunk 4:"),
+            "should include the first chunk as an example: {:?}",
+            out
+        );
+        assert!(!out.contains('\n'), "single line output: {:?}", out);
+        assert!(
+            out.chars().count() <= 240,
+            "must be clamped to <=240 chars, got {}: {:?}",
+            out.chars().count(),
+            out
+        );
+    }
+
+    #[test]
+    fn compact_error_collapses_generic_multiline() {
+        let raw = "first line of trouble\nsecond line with detail\n\nthird line\n";
+        let out = compact_error(raw);
+        assert_eq!(
+            out, "first line of trouble; second line with detail; third line",
+            "newlines should collapse to '; ' and blanks dropped"
+        );
+    }
+
+    #[test]
+    fn compact_error_clamps_excessively_long_lines() {
+        let raw = "x".repeat(1_000);
+        let out = compact_error(&raw);
+        assert_eq!(out.chars().count(), 240);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn render_compact_strips_chunked_recovery_hint_for_failed() {
+        use crate::plan::{
+            CompressionType, DestinationConfig, DestinationType, ExtractionStrategy, FormatType,
+            MetaColumns, ResolvedRunPlan,
+        };
+        use crate::tuning::SourceTuning;
+        let plan = ResolvedRunPlan {
+            export_name: "events".into(),
+            base_query: "SELECT 1".into(),
+            strategy: ExtractionStrategy::Snapshot,
+            format: FormatType::Parquet,
+            compression: CompressionType::default(),
+            compression_level: None,
+            max_file_size_bytes: None,
+            skip_empty: false,
+            meta_columns: MetaColumns::default(),
+            destination: DestinationConfig {
+                destination_type: DestinationType::Local,
+                bucket: None,
+                prefix: None,
+                path: Some("./out".into()),
+                region: None,
+                endpoint: None,
+                credentials_file: None,
+                access_key_env: None,
+                secret_key_env: None,
+                aws_profile: None,
+                allow_anonymous: false,
+            },
+            quality: None,
+            tuning: SourceTuning::from_config(None),
+            tuning_profile_label: "balanced (default)".into(),
+            validate: false,
+            reconcile: false,
+            resume: false,
+            source: crate::config::SourceConfig {
+                source_type: crate::config::SourceType::Postgres,
+                url: Some("postgresql://localhost/test".into()),
+                url_env: None,
+                url_file: None,
+                host: None,
+                port: None,
+                user: None,
+                password: None,
+                password_env: None,
+                database: None,
+                tuning: None,
+                tls: None,
+            },
+        };
+        let mut s = RunSummary::new(&plan);
+        s.status = "failed".into();
+        s.error_message = Some(
+            "export 'events': --resume but no in-progress chunk checkpoint; \
+             run without --resume first or `rivet state reset-chunks --config x.yaml --export events`"
+                .to_string(),
+        );
+
+        let line = s.render_compact();
+        assert!(line.starts_with("✗ "), "failure icon: {:?}", line);
+        assert!(line.contains("events"), "name present: {:?}", line);
+        assert!(
+            line.contains("--resume but no in-progress chunk checkpoint"),
+            "cause kept: {:?}",
+            line
+        );
+        assert!(
+            !line.contains("rivet state reset-chunks"),
+            "recovery hint should be stripped from per-export line: {:?}",
+            line
+        );
+        assert!(!line.contains('\n'), "single line: {:?}", line);
     }
 }

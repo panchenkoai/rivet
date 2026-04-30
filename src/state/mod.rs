@@ -262,6 +262,48 @@ pub struct StateStore {
     pub(super) db_path: std::path::PathBuf,
 }
 
+/// SQLite per-connection lock-wait budget.  Concurrent writers (one
+/// `rivet` child process per export under `--parallel-export-processes`)
+/// can briefly contend on the chunk_task / export_metrics tables; instead
+/// of failing immediately with `SQLITE_BUSY` the connection now retries
+/// for up to this many milliseconds before propagating the error.  Picked
+/// generously because a stalled writer is usually a transient flush, not
+/// an actual deadlock — SQLite WAL only serialises writers, and 10 s is
+/// well above any normal commit latency on local disk.
+pub(crate) const SQLITE_BUSY_TIMEOUT_MS: i64 = 10_000;
+
+/// Open a SQLite connection to the rivet state DB and apply the standard
+/// pragmas: `journal_mode=WAL` (idempotent: first writer wins, every
+/// subsequent open sees the existing mode) and a per-connection
+/// `busy_timeout` so concurrent writers wait briefly instead of erroring
+/// out with "database is locked" on race conditions.
+///
+/// Used by [`StateStore::open`] / [`StateStore::open_at_path`] and by the
+/// fast-path helpers in `state::checkpoint` that open ad-hoc connections
+/// for parallel chunk workers.  Migrations are NOT run here — the caller
+/// is responsible for invoking [`migrate`] once.
+pub(crate) fn open_connection(db_path: &std::path::Path) -> Result<Connection> {
+    let conn = Connection::open(db_path)?;
+    if let Err(e) = conn.execute_batch("PRAGMA journal_mode=WAL;") {
+        log::warn!(
+            "state: WAL journal mode unavailable ({}); \
+             running in default mode — concurrent writes may be slower",
+            e
+        );
+    }
+    if let Err(e) = conn.execute_batch(&format!(
+        "PRAGMA busy_timeout = {};",
+        SQLITE_BUSY_TIMEOUT_MS
+    )) {
+        log::warn!(
+            "state: failed to set busy_timeout ({}); \
+             concurrent writers may surface SQLITE_BUSY immediately",
+            e
+        );
+    }
+    Ok(conn)
+}
+
 impl StateStore {
     /// Open the state DB located next to `config_path`.
     pub fn open(config_path: &str) -> Result<Self> {
@@ -270,16 +312,7 @@ impl StateStore {
             .unwrap_or(std::path::Path::new("."));
         let db_path = config_dir.join(STATE_DB_NAME);
         let db_path_buf = db_path.to_path_buf();
-        let conn = Connection::open(db_path)?;
-        // Enable WAL for better concurrent read/write performance.
-        // Log if unavailable (e.g., network filesystems) rather than silently degrading.
-        if let Err(e) = conn.execute_batch("PRAGMA journal_mode=WAL;") {
-            log::warn!(
-                "state: WAL journal mode unavailable ({}); \
-                 running in default mode — concurrent writes may be slower",
-                e
-            );
-        }
+        let conn = open_connection(&db_path_buf)?;
         migrate(&conn)?;
         Ok(Self {
             conn,
@@ -315,7 +348,7 @@ impl StateStore {
     /// connections and therefore cannot use an in-memory store.
     #[allow(dead_code)]
     pub fn open_at_path(db_path: &std::path::Path) -> Result<Self> {
-        let conn = Connection::open(db_path)?;
+        let conn = open_connection(db_path)?;
         migrate(&conn)?;
         Ok(Self {
             conn,

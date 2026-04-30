@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use opendal::Operator;
 use opendal::blocking;
+use opendal::layers::RetryLayer;
 use opendal::services::Gcs;
 
 use super::gcs_auth;
@@ -55,7 +56,23 @@ impl GcsDestination {
         );
         let _guard = runtime.enter();
 
-        let async_op = Operator::new(builder)?.finish();
+        // OpenDAL's `RetryLayer` retries individual HTTP calls on hyper /
+        // reqwest transient failures (`dispatch task is gone`, server-side
+        // 5xx, partial-upload disconnects, …) without re-running the whole
+        // chunk through the source.  The chunk worker's outer retry loop is
+        // still the safety net for harder failures (auth, region issues,
+        // SQL retries) — this just stops a single TCP blip from poisoning
+        // a 5 MB streaming upload that otherwise costs us another full
+        // SQL fetch + parquet encode.
+        let async_op = Operator::new(builder)?
+            .layer(
+                RetryLayer::new()
+                    .with_max_times(5)
+                    .with_min_delay(std::time::Duration::from_millis(200))
+                    .with_max_delay(std::time::Duration::from_secs(10))
+                    .with_jitter(),
+            )
+            .finish();
         let op = blocking::Operator::new(async_op)?;
 
         let prefix = config.prefix.clone().unwrap_or_default();

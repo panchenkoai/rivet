@@ -21,8 +21,8 @@ use chrono::{DateTime, Utc};
 use crate::error::Result;
 use crate::state::{RunAggregate, RunAggregateEntry, StateStore};
 
-use super::format_bytes;
 use super::summary::RunSummary;
+use super::{format_bytes, strip_chunked_recovery_hint};
 
 /// Convert a per-export summary into an aggregate row.
 pub(super) fn entry_from_summary(s: &RunSummary) -> RunAggregateEntry {
@@ -116,14 +116,40 @@ pub(super) fn print(agg: &RunAggregate) {
     if agg.failed_count > 0 {
         eprintln!();
         eprintln!("  failed exports:");
+        let mut chunked_recovery: Vec<&str> = Vec::new();
         for e in agg.per_export.iter().filter(|e| e.status == "failed") {
             let msg = e
                 .error_message
                 .as_deref()
                 .unwrap_or("(no error message recorded)");
-            eprintln!("    - {}: {}", e.export_name, truncate(msg, 200));
+            let (cause, has_chunked_hint) = strip_chunked_recovery_hint(msg);
+            if has_chunked_hint {
+                chunked_recovery.push(e.export_name.as_str());
+            }
+            eprintln!("    - {}: {}", e.export_name, truncate(cause, 200));
+        }
+        if !chunked_recovery.is_empty() {
+            print_chunked_recovery(&chunked_recovery, agg.config_path.as_deref());
         }
     }
+}
+
+/// Render one consolidated recovery block instead of repeating the same
+/// `rivet run --resume` / `rivet state reset-chunks` commands per failed
+/// export.  `config_path` is taken from the aggregate so the printed
+/// commands are copy-paste runnable.
+fn print_chunked_recovery(exports: &[&str], config_path: Option<&str>) {
+    let cfg = match config_path {
+        Some(p) if !p.is_empty() => format!("--config {}", p),
+        _ => "--config <CONFIG>".to_string(),
+    };
+    eprintln!();
+    eprintln!("  recovery ({} chunked export(s)):", exports.len());
+    eprintln!("    resume in-progress checkpoint runs:");
+    eprintln!("      rivet run {} --resume", cfg);
+    eprintln!("    or reset chunk state and rerun a specific export:");
+    eprintln!("      rivet state reset-chunks {} --export <NAME>", cfg);
+    eprintln!("      NAME ∈ {{{}}}", exports.join(", "));
 }
 
 fn format_duration(ms: i64) -> String {

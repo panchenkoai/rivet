@@ -45,6 +45,26 @@ pub fn classify_error(err: &anyhow::Error) -> (bool, bool, u64) {
         return (false, false, 0);
     }
 
+    // OpenDAL self-classified transient errors: when the underlying service
+    // (GCS, S3, ...) returns a retryable failure OpenDAL renders the error
+    // with the `(temporary)` qualifier — e.g.:
+    //   "Unexpected (temporary) at write, context: { … } => send http request,
+    //    source: error sending request: client error (SendRequest):
+    //    dispatch task is gone: runtime dropped the dispatch task"
+    // These are exactly what the chunk retry loop is designed to ride out;
+    // before this branch was added, hyper/h2 task drops on long uploads
+    // surfaced as permanent errors and aborted the chunk after a single try.
+    if msg.contains("(temporary)")
+        || msg.contains("dispatch task is gone")
+        || msg.contains("runtime dropped the dispatch task")
+        || (msg.contains("client error (sendrequest)") && msg.contains("send http request"))
+    {
+        // Treat as a brief network blip — no reconnect of a SQL session is
+        // needed (this is the destination side) and a small extra delay
+        // gives the http client time to reset its connection pool.
+        return (true, false, 500);
+    }
+
     // Network errors -- need reconnect
     if msg.contains("connection reset")
         || msg.contains("broken pipe")
@@ -276,6 +296,30 @@ mod tests {
             let (transient, _, _) = classify_error(&anyhow::anyhow!("{}", msg));
             assert!(!transient, "should NOT be transient: {}", msg);
         }
+    }
+
+    #[test]
+    fn test_classify_opendal_temporary_errors_retryable() {
+        // The exact shape OpenDAL surfaces for transient cloud failures.  Without
+        // this branch each chunk in a parallel checkpoint run would treat a
+        // hyper dispatch-task drop as permanent and abort the whole worker
+        // after one try, even though the upload usually succeeds on retry.
+        let raw = "Unexpected (temporary) at write, context: { url: https://storage.googleapis.com/bucket/k.parquet?partNumber=1&uploadId=abc, called: http_util::Client::send } => send http request, source: error sending request: client error (SendRequest): dispatch task is gone: runtime dropped the dispatch task";
+        let (transient, reconnect, delay) = classify_error(&anyhow::anyhow!("{}", raw));
+        assert!(transient, "OpenDAL `(temporary)` must be retryable");
+        assert!(
+            !reconnect,
+            "destination-side errors do not affect the SQL session"
+        );
+        assert!(delay > 0, "give the http client a moment to reset its pool");
+    }
+
+    #[test]
+    fn test_classify_dispatch_task_gone_alone_retryable() {
+        let (t, _, _) = classify_error(&anyhow::anyhow!(
+            "client error (SendRequest): dispatch task is gone: runtime dropped"
+        ));
+        assert!(t, "bare hyper dispatch task drop is transient");
     }
 
     #[test]

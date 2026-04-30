@@ -59,12 +59,24 @@ fn chunked_plan(plan: &ResolvedRunPlan) -> &ChunkedPlan {
     }
 }
 
+/// Render the `--config <path>` argument used in user-facing recovery hints,
+/// or a `<CONFIG>` placeholder when the config path is not available (e.g.
+/// the `rivet apply` path which only knows the plan file).
+fn config_hint(config_path: &str) -> String {
+    if config_path.is_empty() {
+        "--config <CONFIG>".to_string()
+    } else {
+        format!("--config {}", config_path)
+    }
+}
+
 fn ensure_chunk_checkpoint_plan(
     state: &StateStore,
     plan: &ResolvedRunPlan,
     cp: &ChunkedPlan,
     summary: &mut RunSummary,
     chunks: &[(i64, i64)],
+    config_path: &str,
 ) -> Result<String> {
     let plan_hash = chunk_plan_fingerprint(
         &plan.base_query,
@@ -78,8 +90,9 @@ fn ensure_chunk_checkpoint_plan(
     if plan.resume {
         let Some((rid, stored_hash)) = state.find_in_progress_chunk_run(&plan.export_name)? else {
             anyhow::bail!(
-                "export '{}': --resume but no in-progress chunk checkpoint; run without --resume first or `rivet state reset-chunks --export {}`",
+                "export '{}': --resume but no in-progress chunk checkpoint; run without --resume first or `rivet state reset-chunks {} --export {}`",
                 plan.export_name,
+                config_hint(config_path),
                 plan.export_name
             );
         };
@@ -103,9 +116,12 @@ fn ensure_chunk_checkpoint_plan(
 
     if let Some((rid, _)) = state.find_in_progress_chunk_run(&plan.export_name)? {
         anyhow::bail!(
-            "export '{}': chunk checkpoint run '{}' still in progress; use `rivet run --resume` or `rivet state reset-chunks --export {}`",
+            "export '{}': chunk checkpoint run '{}' still in progress; use `rivet run {} --export {} --resume` or `rivet state reset-chunks {} --export {}`",
             plan.export_name,
             rid,
+            config_hint(config_path),
+            plan.export_name,
+            config_hint(config_path),
             plan.export_name
         );
     }
@@ -230,7 +246,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
     state: &StateStore,
     plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
-    _config_path: &str,
+    config_path: &str,
     chunk_source: ChunkSource,
 ) -> Result<()> {
     let cp = chunked_plan(plan);
@@ -253,7 +269,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
         }
     };
 
-    let run_id = ensure_chunk_checkpoint_plan(state, plan, cp, summary, &chunks)?;
+    let run_id = ensure_chunk_checkpoint_plan(state, plan, cp, summary, &chunks, config_path)?;
 
     let total_tasks = state.count_chunk_tasks_total(&run_id).unwrap_or(1);
     let pb = ChunkProgress::new(&plan.export_name, total_tasks);
@@ -347,9 +363,13 @@ pub(crate) fn run_chunked_sequential_checkpoint(
     let pending = state.count_chunk_tasks_not_completed(&run_id)?;
     if pending > 0 {
         anyhow::bail!(
-            "export '{}': chunk checkpoint incomplete ({} tasks not completed); fix errors and `rivet run --resume` or `rivet state reset-chunks`",
+            "export '{}': chunk checkpoint incomplete ({} tasks not completed); fix errors and `rivet run {} --export {} --resume` or `rivet state reset-chunks {} --export {}`",
             plan.export_name,
-            pending
+            pending,
+            config_hint(config_path),
+            plan.export_name,
+            config_hint(config_path),
+            plan.export_name
         );
     }
 
@@ -425,7 +445,7 @@ pub(super) fn run_chunked_parallel_checkpoint(
         }
     };
 
-    let run_id = ensure_chunk_checkpoint_plan(state, plan, cp, summary, &chunks)?;
+    let run_id = ensure_chunk_checkpoint_plan(state, plan, cp, summary, &chunks, config_path)?;
 
     let total_tasks = {
         let tasks = state.list_chunk_tasks_for_run(&run_id)?;
@@ -702,9 +722,12 @@ pub(super) fn run_chunked_parallel_checkpoint(
     let pending = state.count_chunk_tasks_not_completed(&run_id)?;
     if pending > 0 {
         anyhow::bail!(
-            "export '{}': {} chunk task(s) not completed; `rivet run --resume` or inspect `rivet state chunks --export {}`",
+            "export '{}': {} chunk task(s) not completed; `rivet run {} --export {} --resume` or inspect `rivet state chunks {} --export {}`",
             plan.export_name,
             pending,
+            config_hint(config_path),
+            plan.export_name,
+            config_hint(config_path),
             plan.export_name
         );
     }
