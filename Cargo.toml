@@ -31,7 +31,10 @@ mysql = "28"
 opendal = { version = "0.55", features = ["blocking", "services-fs", "services-s3", "services-gcs"] }
 parquet = { version = "58", features = ["arrow", "zstd", "lz4", "flate2"] }
 clap_complete = "4"
-postgres = "0.19"
+postgres = {
+    version = "0.19",
+    features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-0_8"],
+}
 postgres-native-tls = "0.5"
 # `vendored` statically links OpenSSL on Linux so `cargo install rivet-cli` works
 # on bare systems and our cross-compiled aarch64-unknown-linux-gnu release
@@ -40,7 +43,13 @@ postgres-native-tls = "0.5"
 # is ever compiled or linked there.
 native-tls = { version = "0.2", features = ["vendored"] }
 rand = "0.10"
-postgres-types = { version = "0.2", features = ["with-chrono-0_4"] }
+postgres-types = {
+    version = "0.2",
+    features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-0_8"],
+}
+bigdecimal = "0.4"
+byteorder = "1"
+uuid = "0.8"
 rusqlite = { version = "0.39", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -59,6 +68,7 @@ mach2 = "0.4"
 
 [dev-dependencies]
 bytes = "1"
+serde_json = "1"
 
 [features]
 default = ["jemalloc"]

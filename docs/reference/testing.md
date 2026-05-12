@@ -8,7 +8,7 @@ Rivet's test suite is organised into two tiers, selected by the standard
 | Tier | Selection | Infrastructure required | What it covers |
 |------|-----------|-------------------------|----------------|
 | **Offline** | `cargo test` | none | Unit tests, pure-function property/fuzz smoke, state-layer contracts, format round-trip, CLI help snapshots, invariants I1–I7, F1–F5 crash-boundary F-matrix, validation regressions |
-| **Live** | `cargo test -- --ignored` | `docker compose up -d` | Full rivet binary against real Postgres/MySQL, MinIO (S3), fake-gcs, Toxiproxy; Parquet round-trip E2E; cross-database parity; destination parity; resume; retry and mid-stream faults; schema drift; performance smoke; crash-point recovery matrix |
+| **Live** | `cargo test -- --ignored` | `docker compose up -d` | Full rivet binary against real Postgres/MySQL, MinIO (S3), fake-gcs, Toxiproxy; Parquet round-trip E2E; **type/trust golden** DB → rivet → Parquet → Arrow read-back (postgres + mysql); cross-database parity; destination parity; resume; retry and mid-stream faults; schema drift; performance smoke; crash-point recovery matrix |
 
 Both tiers run in CI (`.github/workflows/ci.yml`):
 
@@ -22,7 +22,7 @@ under two seconds on a developer laptop.
 
 ```bash
 cargo test
-# → cargo test: 1096 passed, 46 ignored (31 suites, ~2s)
+# → example: cargo test: ~1300 passed, ~55 ignored (~32 suites, ~2s) — counts drift; check your local footer
 ```
 
 Each integration file under `tests/` maps to one domain:
@@ -63,12 +63,13 @@ fail with an actionable message naming the missing container and port
 ```bash
 docker compose up -d
 cargo test -- --ignored
-# → cargo test: 46 passed, 1096 filtered out (31 suites, ~14s)
+# → counts vary (~50+ ignored live tests). Check the cargo footer after `cargo test -- --ignored`.
 ```
 
 | File | Domain | QA backlog task |
 |------|--------|-----------------|
 | `live_harness_canary.rs` | Reachability probe for every service (Postgres primary + via Toxiproxy, MySQL primary + via Toxiproxy, MinIO, fake-gcs, Toxiproxy admin); harness sanity (`PgTable`/`MysqlTable` RAII guards, `unique_name` no-collision, `CARGO_BIN_EXE_rivet` visibility) | Phase A |
+| [`live_type_golden.rs`](#trust-milestone-type-golden-round-trip) | Trust & reproducibility: **paired** Postgres *and* MySQL golden pipelines | Trust milestone §1 (“Golden E2E for type safety”); complements `live_parquet_roundtrip.rs` |
 | `live_parquet_roundtrip.rs` | Postgres → rivet → Parquet → reader; schema/row-count/nullability/unicode/empty-dataset contracts; `--validate` flag | Task 2.2 |
 | `live_cross_db_parity.rs` | Same dataset via Postgres vs MySQL under full and chunked modes; row-count and id-set equivalence | Task 3.3 |
 | `live_destination_parity.rs` | Local vs S3 (MinIO) vs GCS (fake-gcs); per-backend file materialisation + parity row-count | Task 6.3 |
@@ -78,6 +79,28 @@ cargo test -- --ignored
 | `live_schema_drift.rs` | Added column / removed column / stable schema — detection flag in `export_metrics.schema_changed` | Task 7.1, 7.2 |
 | `live_performance_smoke.rs` | 5 000-row + 200B payload finishes within 30 s; split-by-size produces multiple files with no row loss; parallel-4 chunked export materialises every id exactly once | Task 9.1, 9.2 |
 | `live_crash_recovery.rs` | Four fault points (`after_source_read`, `after_file_write`, `after_manifest_update`, `after_cursor_commit`) × expected post-crash state × recovery run | Task 1.1 |
+
+### Trust milestone: type golden round-trip
+
+[`tests/live_type_golden.rs`](../../tests/live_type_golden.rs) implements the roadmap contract **database → Rivet (`rivet run`) → Parquet → Arrow read-back → exact assertions** so type handling stays provable end-to-end, not only in unit tests (`format_golden.rs` covers writers in isolation).
+
+Each test targets **both engines** where the contract applies:
+
+| Scenario | Postgres | MySQL |
+|----------|----------|--------|
+| Decimal exact sums + `Decimal128(p,s)` in Parquet | `NUMERIC(18,2/6)`, YAML `columns: decimal(...)` | `DECIMAL(18,2/6)`, same YAML overrides |
+| Timestamp semantics (`tz=None` vs `UTC` tag + µs parity) | `TIMESTAMP` / `TIMESTAMPTZ` with offset row | `DATETIME(6)` / `TIMESTAMP(6)` (Rivet sets `SET time_zone = '+00:00'` on the MySQL session) |
+| Binary round-trip | `BYTEA` | `BLOB` (avoid reserved identifiers like `blob` as column SQL names) |
+| Canonical UUID-ish text (`Utf8`) | native `UUID` | `VARCHAR(36)` with hyphenated lowercase literal |
+
+CI runs these with the rest of the live matrix (`cargo test --release -- --ignored` in `.github/workflows/ci.yml`). Local:
+
+```bash
+docker compose up -d
+cargo test --test live_type_golden -- --ignored
+```
+
+**Not yet in this matrix** (future roadmap items): JSON logical metadata parity, unsupported-type strict failures, classified schema-drift variants as dedicated goldens (`live_schema_drift.rs` already covers drift telemetry for Postgres).
 
 ## Test-only fault injection
 
@@ -124,10 +147,10 @@ Both command lines are what the corresponding CI jobs execute.  If your
 `cargo test` diverges from the CI matrix, something is out of sync —
 check `.github/workflows/ci.yml` for the exact invocation.
 
-## QA backlog mapping
+## QA / roadmap alignment
 
-The full design of the test matrix lives in `rivet_qa_backlog_v2.md` at the
-repository root.  Each task in that document is annotated with the test file
-and (for tasks that found real bugs) the referenced code fix.  The coverage
-status footer at the bottom of the backlog lists what is shipped, what is
-explicit CI strategy, and what is still open.
+Task IDs in tables above are historical QA labels. **Trust & reproducibility**
+(golden DB → Rivet → Parquet → Arrow read-back, Postgres *and* MySQL) lives in
+[`tests/live_type_golden.rs`](../../tests/live_type_golden.rs) and is described
+above. Strategic tracking: [`rivet_roadmap.md`](../../rivet_roadmap.md) §Phase 1
+(Epic 14 / execution status).

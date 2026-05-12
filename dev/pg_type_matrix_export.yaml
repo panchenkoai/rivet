@@ -1,0 +1,29 @@
+# Export `rivet_type_matrix` → Parquet (decimal, timestamps, BYTEA, UUID, JSONB).
+# Prerequisites: dev/postgres/init.sql applied (fresh compose volume) OR
+# `dev/sql/rivet_type_matrix_postgres.sql` piped through psql.
+#
+# Usage (from repo root):
+#   mkdir -p dev/output/type_matrix/pg
+#   rivet run --config dev/pg_type_matrix_export.yaml --export type_matrix_pg
+#
+# Parquet filenames are timestamped; see dev/bigquery/type_matrix_bigquery.md for load globs.
+
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+
+exports:
+  - name: type_matrix_pg
+    query: >-
+      SELECT id, label, amount, fee, created_at, created_at_tz,
+             raw_bytes, uid, attrs
+      FROM rivet_type_matrix ORDER BY id
+    mode: full
+    format: parquet
+    compression: zstd
+    columns:
+      amount: decimal(18,2)
+      fee: decimal(18,6)
+    destination:
+      type: local
+      path: ./dev/output/type_matrix/pg

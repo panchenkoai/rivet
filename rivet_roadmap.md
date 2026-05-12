@@ -598,6 +598,7 @@ Rivet core is **feature-complete for stable extraction with type safety**. All W
 - BigQuery compatibility layer: NUMERIC, BIGNUMERIC, TIMESTAMP, DATETIME, REPEATED, overflow warnings
 - Per-column overrides: `columns: { col: { decimal_precision, decimal_scale } }`
 - Complex types: Enum, Interval (Postgres), List/Array (Postgres), MySQL TIME/TIME2, MySQL ENUM/SET
+- **Golden E2E trust proof** — [`tests/live_type_golden.rs`](tests/live_type_golden.rs): Postgres *and* MySQL; DB → `rivet run` → Parquet → Arrow read-back; decimal sums, timestamp `tz=None` vs `UTC`, binary, UUID/VARCHAR text. Documented in [docs/reference/testing.md](docs/reference/testing.md#trust-milestone-type-golden-round-trip).
 
 ### Architecture (stabilisation plan — all complete)
 
@@ -673,7 +674,7 @@ Rivet core is **feature-complete for stable extraction with type safety**. All W
 | Versioned SQLite migrations | `schema_version` |
 | `aws_profile` for S3 | Sets `AWS_PROFILE` for OpenDAL chain |
 | Chunked quality gate | Row-count bounds after all chunks; warn on null/unique in chunked mode |
-| QA live-test harness | `tests/common/mod.rs` + 46 live tests across 10 binaries mapped 1:1 to backlog tasks (`rivet_qa_backlog_v2.md`); full offline suite (1096 tests, 21 integration files) runs on every PR via `cargo test`. See [docs/reference/testing.md](docs/reference/testing.md). |
+| QA live-test harness | `tests/common/mod.rs` + **~55** ignored live tests across **11** `tests/live_*.rs` binaries mapped in [docs/reference/testing.md](docs/reference/testing.md); full offline suite (**~1345** tests) runs on every PR via `cargo test`. Includes **golden type round-trip** ([`live_type_golden.rs`](tests/live_type_golden.rs)). |
 
 ---
 
@@ -697,7 +698,7 @@ Rivet core is **feature-complete for stable extraction with type safety**. All W
 | G2 | ✅ | P2 | Toxiproxy wired into `docker-compose.yaml`, registered via `tests/common/mod.rs::ensure_toxi_proxy`, exercised by `tests/live_retry_and_faults.rs` + `tests/live_chaos.rs`; cross-process flock guard prevents suite races |
 | G3 | ✅ Partial | P1 | `seed` inserts; limited mutations |
 | G4 | ✅ Partial | P1 | `dev/` configs; edge fixtures TBD |
-| G5 | ✅ | P0 | E2E matrix in CI — `ci.yml::e2e` now runs both `dev/e2e/run_e2e.sh` **and** `cargo test --release -- --ignored` (46 live tests across 10 `tests/live_*.rs` binaries). See [docs/reference/testing.md](docs/reference/testing.md) for the full matrix. |
+| G5 | ✅ | P0 | E2E matrix in CI — `ci.yml::e2e` runs both `dev/e2e/run_e2e.sh` **and** `cargo test --release -- --ignored` (**~55** ignored live tests across **11** `tests/live_*.rs` binaries, including **Trust golden** parity on Postgres + MySQL in `live_type_golden.rs`). See [docs/reference/testing.md](docs/reference/testing.md). |
 
 ### Epic H — Crash and recovery
 

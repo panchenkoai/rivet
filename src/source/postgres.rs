@@ -10,12 +10,14 @@ use arrow::array::{
 use arrow::datatypes::IntervalMonthDayNano;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use chrono::Timelike as _;
-use postgres::types::{Kind, Type};
+use postgres::types::{FromSql as PgFromSql, Json, Kind, Type};
 use postgres::{Client, NoTls, Row};
+use serde_json::Value as JsonValue;
 
 use crate::config::{SourceType, TlsConfig};
 use crate::error::Result;
 use crate::plan::IncrementalCursorPlan;
+use crate::source::pg_numeric_wire::{PgNumericWire, numeric_wire_normalized_plain};
 use crate::source::query::build_incremental_query;
 use crate::source::tls::build_native_tls;
 use crate::tuning::SourceTuning;
@@ -24,6 +26,47 @@ use crate::types::{
     ColumnOverrides, META_FIDELITY, META_NATIVE_TYPE, RivetType, SourceColumn,
     TimeUnit as RivetTimeUnit, TypeMapping, build_arrow_field,
 };
+
+/// Canonical hyphenated lowercase UUID strings from PostgreSQL `uuid` rows.
+///
+/// Servers usually send UUIDs as 16 raw bytes under the binary protocol, but defensive
+/// text parsing avoids silent null exports if a client ever exposes the text form.
+#[derive(Clone)]
+struct PgUuidDisplayed(String);
+
+impl<'a> PgFromSql<'a> for PgUuidDisplayed {
+    fn accepts(ty: &Type) -> bool {
+        ty == &Type::UUID
+    }
+
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() == 16 {
+            let uuid = uuid::Uuid::from_slice(raw)?;
+            return Ok(Self(uuid.to_hyphenated().to_string()));
+        }
+        let text = std::str::from_utf8(raw)?.trim();
+        Ok(Self(
+            uuid::Uuid::parse_str(text)?.to_hyphenated().to_string(),
+        ))
+    }
+}
+
+fn pg_numeric_optional_utf8_string(row: &Row, col_idx: usize) -> Result<Option<String>> {
+    match row.try_get::<_, Option<PgNumericWire<'_>>>(col_idx)? {
+        None => Ok(None),
+        Some(w) => Ok(numeric_raw_to_optional_decimal_text(w.0)),
+    }
+}
+
+fn numeric_raw_to_optional_decimal_text(raw: &[u8]) -> Option<String> {
+    numeric_wire_normalized_plain(raw).or_else(|| {
+        let text = std::str::from_utf8(raw).ok()?.trim();
+        (!text.is_empty()).then(|| text.to_owned())
+    })
+}
 
 pub struct PostgresSource {
     client: Client,
@@ -537,12 +580,29 @@ fn build_array(
             }
             Ok(Arc::new(b.finish().with_timezone("UTC")))
         }
-        // JSON, JSONB, UUID: always Utf8 with rivet metadata.
-        Type::JSON | Type::JSONB | Type::UUID => {
+        // UUID: hyphenated Utf8 (`uuid::Uuid` only covers the 16‑byte encoding).
+        Type::UUID => {
+            let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 48);
+            for row in rows {
+                match row.try_get::<_, Option<PgUuidDisplayed>>(col_idx)? {
+                    None => b.append_null(),
+                    Some(display) => b.append_value(&display.0),
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        // JSON / JSONB: Utf8 preserving JSON semantics — `postgres` rejects `String` for these OIDs,
+        // so deserialize via [`Json`] rather than emitting silent null arrays.
+        Type::JSON | Type::JSONB => {
             let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
             for row in rows {
-                let val: Option<String> = row.try_get(col_idx).ok().flatten();
-                b.append_option(val.as_deref());
+                match row.try_get::<_, Option<Json<JsonValue>>>(col_idx)? {
+                    None => b.append_null(),
+                    Some(Json(v)) => {
+                        let s = serde_json::to_string(&v)?;
+                        b.append_value(&s);
+                    }
+                }
             }
             Ok(Arc::new(b.finish()))
         }
@@ -555,7 +615,7 @@ fn build_array(
             _ => {
                 let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
                 for row in rows {
-                    let val: Option<String> = row.try_get(col_idx).ok().flatten();
+                    let val = pg_numeric_optional_utf8_string(row, col_idx)?;
                     b.append_option(val.as_deref());
                 }
                 Ok(Arc::new(b.finish()))
@@ -684,31 +744,64 @@ fn build_pg_list_array(
     }
 }
 
-/// Build a `Decimal128Array` from a PostgreSQL `NUMERIC` column read as text.
+/// Decode a single `NUMERIC` cell to a scaled `i128` for Arrow `Decimal128`.
 ///
-/// Roadmap §12: the numeric string "123.45" is converted to the scaled i128
-/// value 12345 (for scale=2) without ever passing through `f64`.
+/// The driver transmits `numeric` columns in Postgres wire binary (`numeric_recv`).
+/// We decode exactly (via [`crate::source::pg_numeric_wire`]), then stringify for
+/// [`crate::types::decimal::decimal_str_to_scaled_i128`] — never through `f64`.
+/// A trivial `Utf8` fallback remains for unconventional cast-to-text callers.
+fn pg_numeric_optional_scaled_i128(row: &Row, col_idx: usize, scale: i8) -> Result<Option<i128>> {
+    use crate::types::decimal::decimal_str_to_scaled_i128;
+
+    match row.try_get::<_, Option<PgNumericWire<'_>>>(col_idx) {
+        Ok(Some(wire)) => match numeric_wire_normalized_plain(wire.0) {
+            Some(plain) => {
+                let t = plain.trim();
+                if t.is_empty() {
+                    return Ok(None);
+                }
+                decimal_str_to_scaled_i128(t, scale)
+                    .map(Some)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "cannot parse DECIMAL {:?} as decimal(scale={scale}) after binary decode",
+                            t
+                        )
+                    })
+            }
+            None => Err(anyhow::anyhow!(
+                "PostgreSQL NUMERIC: unsupported NaN/infinity payload (column idx {col_idx})",
+            )),
+        },
+        Ok(None) => Ok(None),
+        Err(_) => {
+            if let Ok(Some(s)) = row.try_get::<_, Option<String>>(col_idx) {
+                let t = s.trim();
+                if t.is_empty() {
+                    return Ok(None);
+                }
+                return decimal_str_to_scaled_i128(t, scale)
+                    .map(Some)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("cannot parse {:?} as decimal(scale={scale})", t)
+                    });
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// Build a `Decimal128Array` from a PostgreSQL `NUMERIC` column.
 fn pg_numeric_to_decimal128(
     precision: u8,
     scale: i8,
     col_idx: usize,
     rows: &[Row],
 ) -> Result<Arc<dyn Array>> {
-    use crate::types::decimal::decimal_str_to_scaled_i128;
     let mut b = Decimal128Builder::with_capacity(rows.len());
     for row in rows {
-        match row.try_get::<_, Option<String>>(col_idx).ok().flatten() {
-            Some(s) => match decimal_str_to_scaled_i128(&s, scale) {
-                Some(v) => b.append_value(v),
-                None => {
-                    return Err(anyhow::anyhow!(
-                        "cannot parse '{}' as decimal({},{})",
-                        s,
-                        precision,
-                        scale
-                    ));
-                }
-            },
+        match pg_numeric_optional_scaled_i128(row, col_idx, scale)? {
+            Some(v) => b.append_value(v),
             None => b.append_null(),
         }
     }
@@ -724,22 +817,11 @@ fn pg_numeric_to_decimal256(
     col_idx: usize,
     rows: &[Row],
 ) -> Result<Arc<dyn Array>> {
-    use crate::types::decimal::decimal_str_to_scaled_i128;
     use arrow::datatypes::i256;
     let mut b = Decimal256Builder::with_capacity(rows.len());
     for row in rows {
-        match row.try_get::<_, Option<String>>(col_idx).ok().flatten() {
-            Some(s) => match decimal_str_to_scaled_i128(&s, scale) {
-                Some(v) => b.append_value(i256::from_i128(v)),
-                None => {
-                    return Err(anyhow::anyhow!(
-                        "cannot parse '{}' as decimal({},{})",
-                        s,
-                        precision,
-                        scale
-                    ));
-                }
-            },
+        match pg_numeric_optional_scaled_i128(row, col_idx, scale)? {
+            Some(v) => b.append_value(i256::from_i128(v)),
             None => b.append_null(),
         }
     }

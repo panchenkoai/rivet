@@ -1,4 +1,5 @@
 pub mod mysql;
+pub(crate) mod pg_numeric_wire;
 pub mod postgres;
 pub(crate) mod query;
 pub(crate) mod tls;

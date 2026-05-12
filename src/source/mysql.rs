@@ -290,7 +290,15 @@ fn mysql_type_to_rivet(col: &mysql::Column) -> RivetType {
                 .into(),
         },
 
-        MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING => RivetType::String,
+        MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING => {
+            // Charset 63 = "binary"; `BINARY(n)` / `VARBINARY(n)` use STRING/VAR_STRING
+            // metadata in the MySQL protocol, unlike `BLOB` OIDs — still binary bytes.
+            if col.character_set() == 63 {
+                RivetType::Binary
+            } else {
+                RivetType::String
+            }
+        }
         // M6: ENUM/SET → Utf8 + metadata logical=enum (roadmap §15).
         MYSQL_TYPE_ENUM | MYSQL_TYPE_SET => RivetType::Enum,
         MYSQL_TYPE_JSON => RivetType::Json,
