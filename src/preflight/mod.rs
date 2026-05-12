@@ -3,6 +3,7 @@ pub(crate) mod cursor_expr;
 mod doctor;
 mod mysql;
 mod postgres;
+pub mod type_report;
 
 pub(crate) use analysis::chunk_sparsity_from_counts;
 #[cfg(test)]
@@ -18,6 +19,8 @@ use postgres::{extract_scan_type, parse_pg_row_estimate};
 
 use crate::config::{Config, ExportConfig, SourceType};
 use crate::error::Result;
+use crate::types::policy::TypePolicy;
+use crate::types::target::ExportTarget;
 
 #[derive(Debug)]
 pub enum HealthVerdict {
@@ -74,6 +77,10 @@ pub fn check(
     config_path: &str,
     export_name: Option<&str>,
     params: Option<&std::collections::HashMap<String, String>>,
+    show_type_report: bool,
+    strict: bool,
+    json_output: bool,
+    target: Option<ExportTarget>,
 ) -> Result<()> {
     let config = Config::load_with_params(config_path, params)?;
 
@@ -93,6 +100,42 @@ pub fn check(
     match config.source.source_type {
         SourceType::Postgres => postgres::check_postgres(&url, tls, &exports)?,
         SourceType::Mysql => mysql::check_mysql(&url, tls, &exports)?,
+    }
+
+    if show_type_report {
+        let policy = if strict {
+            TypePolicy::strict()
+        } else {
+            TypePolicy::warn_only()
+        };
+
+        let mut any_fatal = false;
+        for export in &exports {
+            let column_overrides =
+                crate::plan::parse_column_overrides_pub(&export.columns, &export.name)?;
+            match type_report::collect_report(&config, export, &column_overrides, &policy, target) {
+                Ok(report) => {
+                    if report.has_fatal() {
+                        any_fatal = true;
+                    }
+                    if target.is_some() && report.has_target_fail() {
+                        any_fatal = true;
+                    }
+                    if json_output {
+                        type_report::print_json(&report)?;
+                    } else {
+                        type_report::print_table(&report, target);
+                    }
+                }
+                Err(e) => {
+                    log::warn!("type report for '{}' failed: {:#}", export.name, e);
+                }
+            }
+        }
+
+        if strict && any_fatal {
+            anyhow::bail!("strict mode: unsafe type mappings found (see report above)");
+        }
     }
 
     Ok(())
@@ -192,6 +235,9 @@ mod tests {
             chunk_by_days: None,
             source_group: None,
             reconcile_required: false,
+            columns: Default::default(),
+            on_schema_drift: Default::default(),
+            shape_drift_warn_factor: None,
         }
     }
 

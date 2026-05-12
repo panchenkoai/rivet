@@ -33,7 +33,7 @@ pub use validate::{DiagnosticLevel, validate_plan};
 #[allow(unused_imports)]
 pub use crate::config::{
     CompressionType, DestinationConfig, DestinationType, FormatType, MetaColumns, QualityConfig,
-    SourceConfig, TimeColumnType,
+    SchemaDriftPolicy, SourceConfig, TimeColumnType,
 };
 
 use std::collections::HashMap;
@@ -72,6 +72,16 @@ pub struct ResolvedRunPlan {
     /// Source connection parameters — resolved from config at plan time so pipeline
     /// functions receive the complete execution contract in a single struct.
     pub source: SourceConfig,
+    /// Per-column type overrides parsed from `exports[].columns:` in `rivet.yaml`
+    /// (roadmap §8). Passed to the source driver so it can use declared
+    /// precision/scale instead of autodetected (often unavailable) metadata.
+    pub column_overrides: crate::types::ColumnOverrides,
+    /// What to do when structural schema drift is detected (Epic 7).
+    pub schema_drift_policy: SchemaDriftPolicy,
+    /// Growth-factor threshold for data shape drift warnings (Epic 8).
+    /// Warn when a column's current-run max byte length exceeds `stored × factor`.
+    /// 0.0 disables shape tracking.
+    pub shape_drift_warn_factor: f64,
 }
 
 /// Resolved incremental cursor semantics (Epic D / ADR-0007).
@@ -369,7 +379,42 @@ pub fn build_plan(
         reconcile,
         resume,
         source: config.source.clone(),
+        column_overrides: parse_column_overrides(&export.columns, &export.name)?,
+        schema_drift_policy: export.on_schema_drift,
+        shape_drift_warn_factor: export.shape_drift_warn_factor.unwrap_or(2.0),
     })
+}
+
+/// Parse the raw `columns:` map from `ExportConfig` into typed [`ColumnOverrides`].
+///
+/// Fails early (at plan-build time) with an actionable error so the user
+/// fixes their `rivet.yaml` before the export runs.
+/// Public re-export for callers outside `plan` (e.g. `preflight::type_report`).
+pub fn parse_column_overrides_pub(
+    raw: &std::collections::HashMap<String, String>,
+    export_name: &str,
+) -> Result<crate::types::ColumnOverrides> {
+    parse_column_overrides(raw, export_name)
+}
+
+fn parse_column_overrides(
+    raw: &std::collections::HashMap<String, String>,
+    export_name: &str,
+) -> Result<crate::types::ColumnOverrides> {
+    raw.iter()
+        .map(|(col, type_str)| {
+            crate::types::parse_type_str(type_str)
+                .map(|t| (col.clone(), t))
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "export '{}': column override for '{}': {}",
+                        export_name,
+                        col,
+                        e
+                    )
+                })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -449,6 +494,9 @@ mod tests {
             tuning: None,
             source_group: None,
             reconcile_required: false,
+            columns: Default::default(),
+            on_schema_drift: Default::default(),
+            shape_drift_warn_factor: None,
         }
     }
 

@@ -1,12 +1,16 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, BinaryBuilder, BooleanBuilder, Date32Builder, Float32Builder, Float64Builder,
-    Int16Builder, Int32Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
+    Array, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Decimal256Builder,
+    Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder,
+    IntervalMonthDayNanoBuilder, ListBuilder, StringBuilder, Time64MicrosecondBuilder,
+    TimestampMicrosecondBuilder,
 };
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
-use arrow::record_batch::RecordBatch;
-use postgres::types::Type;
+use arrow::datatypes::IntervalMonthDayNano;
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use chrono::Timelike as _;
+use postgres::types::{Kind, Type};
 use postgres::{Client, NoTls, Row};
 
 use crate::config::{SourceType, TlsConfig};
@@ -16,6 +20,10 @@ use crate::source::query::build_incremental_query;
 use crate::source::tls::build_native_tls;
 use crate::tuning::SourceTuning;
 use crate::types::CursorState;
+use crate::types::{
+    ColumnOverrides, META_FIDELITY, META_NATIVE_TYPE, RivetType, SourceColumn,
+    TimeUnit as RivetTimeUnit, TypeMapping, build_arrow_field,
+};
 
 pub struct PostgresSource {
     client: Client,
@@ -68,6 +76,7 @@ impl super::Source for PostgresSource {
         incremental: Option<&IncrementalCursorPlan>,
         cursor: Option<&CursorState>,
         tuning: &SourceTuning,
+        column_overrides: &ColumnOverrides,
         sink: &mut dyn super::BatchSink,
     ) -> Result<()> {
         let built = build_incremental_query(query, incremental, cursor, SourceType::Postgres);
@@ -112,7 +121,7 @@ impl super::Source for PostgresSource {
                     .iter()
                     .map(|c| (c.name().to_string(), c.type_().clone()))
                     .collect();
-                let s = Arc::new(pg_columns_to_schema(rows[0].columns()));
+                let s = Arc::new(pg_columns_to_schema(rows[0].columns(), column_overrides));
                 sink.on_schema(s.clone())?;
                 schema = Some(s.clone());
                 columns_cache = Some(stmt_cols);
@@ -189,40 +198,206 @@ impl super::Source for PostgresSource {
         }
         Ok(None)
     }
-}
 
-fn pg_type_to_arrow(pg_type: &Type) -> DataType {
-    match *pg_type {
-        Type::BOOL => DataType::Boolean,
-        Type::INT2 => DataType::Int16,
-        Type::INT4 => DataType::Int32,
-        Type::INT8 => DataType::Int64,
-        Type::FLOAT4 => DataType::Float32,
-        Type::FLOAT8 => DataType::Float64,
-        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => DataType::Utf8,
-        Type::BYTEA => DataType::Binary,
-        Type::DATE => DataType::Date32,
-        Type::TIMESTAMP | Type::TIMESTAMPTZ => DataType::Timestamp(TimeUnit::Microsecond, None),
-        Type::NUMERIC => DataType::Utf8,
-        Type::JSON | Type::JSONB => DataType::Utf8,
-        Type::UUID => DataType::Utf8,
-        Type::OID => DataType::Int64,
-        _ => {
-            log::warn!("unmapped PG type {:?}, falling back to Utf8", pg_type);
-            DataType::Utf8
-        }
+    fn type_mappings(
+        &mut self,
+        query: &str,
+        column_overrides: &ColumnOverrides,
+    ) -> Result<Vec<TypeMapping>> {
+        let wrapped = format!("SELECT * FROM ({}) AS _rivet_type_probe LIMIT 0", query);
+        let stmt = self.client.prepare(&wrapped)?;
+        let mappings = stmt
+            .columns()
+            .iter()
+            .map(|col| {
+                let rivet = column_overrides
+                    .get(col.name())
+                    .cloned()
+                    .unwrap_or_else(|| pg_type_to_rivet(col.type_()));
+                let source = SourceColumn::simple(col.name(), col.type_().name(), true);
+                TypeMapping::from_source(&source, rivet)
+            })
+            .collect();
+        Ok(mappings)
     }
 }
 
-fn pg_columns_to_schema(columns: &[postgres::Column]) -> Schema {
+/// Map a PostgreSQL wire-protocol type to Rivet's canonical type.
+///
+/// This is the authoritative PostgreSQL → RivetType function. All other code
+/// must go through here rather than constructing Arrow types directly.
+///
+/// Key decisions vs. the old `pg_type_to_arrow`:
+/// - `NUMERIC` without declared precision → `Unsupported` (roadmap §12: "never
+///   convert decimal through f64"; unbounded numeric requires explicit policy).
+/// - `TIMESTAMPTZ` → `Timestamp { timezone: Some("UTC") }` instead of `None`
+///   (roadmap §13: TIMESTAMPTZ must carry UTC semantics into Arrow/Parquet).
+/// - `UUID` / `JSON` / `JSONB` → `Uuid` / `Json` variants, so `build_arrow_field`
+///   attaches the `rivet.logical_type` metadata for downstream consumers.
+fn pg_type_to_rivet(t: &Type) -> RivetType {
+    match *t {
+        Type::BOOL => RivetType::Bool,
+        Type::INT2 => RivetType::Int16,
+        Type::INT4 => RivetType::Int32,
+        Type::INT8 => RivetType::Int64,
+        // OID is u32; Int64 is a safe widening and avoids introducing a UInt32
+        // variant that has no natural downstream type in most warehouses.
+        Type::OID => RivetType::Int64,
+        Type::FLOAT4 => RivetType::Float32,
+        Type::FLOAT8 => RivetType::Float64,
+
+        // The postgres wire protocol does NOT carry atttypmod (precision/scale)
+        // in RowDescription for arbitrary queries — only the OID is available.
+        // An unbounded NUMERIC therefore has no safe fixed-precision mapping.
+        // Strict TypePolicy (Chunk 4) will fail-fast here; until then the
+        // fallback in `pg_columns_to_schema` logs a warning and exports Utf8.
+        Type::NUMERIC => RivetType::Unsupported {
+            native_type: "numeric".into(),
+            reason: "precision/scale unavailable from query result metadata; \
+                     add a column override (columns: amount: decimal(18,2)) \
+                     or configure type_policy.decimal.unbounded"
+                .into(),
+        },
+
+        Type::DATE => RivetType::Date,
+        Type::TIME => RivetType::Time {
+            unit: RivetTimeUnit::Microsecond,
+        },
+        Type::TIMESTAMP => RivetType::Timestamp {
+            unit: RivetTimeUnit::Microsecond,
+            timezone: None,
+        },
+        // Roadmap §13: TIMESTAMPTZ is always normalized to UTC.
+        Type::TIMESTAMPTZ => RivetType::Timestamp {
+            unit: RivetTimeUnit::Microsecond,
+            timezone: Some("UTC".into()),
+        },
+
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => RivetType::String,
+        Type::BYTEA => RivetType::Binary,
+
+        // Roadmap §14: JSON/JSONB → Utf8 + rivet.logical_type=json metadata.
+        Type::JSON | Type::JSONB => RivetType::Json,
+        // Roadmap §14: UUID → Utf8 + rivet.logical_type=uuid metadata.
+        Type::UUID => RivetType::Uuid,
+
+        // Roadmap §13: interval → IntervalMonthDayNano.
+        Type::INTERVAL => RivetType::Interval,
+
+        _ => match t.kind() {
+            // M6: PG enum → Utf8 + metadata logical=enum.
+            Kind::Enum(_) => RivetType::Enum,
+            // M6: 1-D arrays → List(inner). Nested arrays fall through to Unsupported.
+            Kind::Array(elem_type) => RivetType::List {
+                inner: Box::new(pg_type_to_rivet(elem_type)),
+            },
+            _ => RivetType::Unsupported {
+                native_type: t.name().to_string(),
+                reason: "no Rivet mapping for this PostgreSQL type".into(),
+            },
+        },
+    }
+}
+
+/// Build an Arrow `Schema` from PostgreSQL `Column` descriptors by routing
+/// each column through the `SourceColumn → RivetType → TypeMapping → Field`
+/// pipeline.
+///
+/// `column_overrides` takes priority over autodetection: if the user declared
+/// e.g. `amount: decimal(18,2)` in `rivet.yaml`, that `RivetType` replaces
+/// the autodetected `Unsupported` for `NUMERIC` columns.
+///
+/// For types that have no safe Rivet mapping and no override, this falls back
+/// to `Utf8` with `rivet.fidelity=unsupported` metadata and logs a warning.
+/// TypePolicy (Chunk 4) will replace this lenient fallback with a configurable
+/// fail/warn/string behaviour.
+fn pg_columns_to_schema(
+    columns: &[postgres::Column],
+    column_overrides: &ColumnOverrides,
+) -> Schema {
     let fields: Vec<Field> = columns
         .iter()
         .map(|col| {
-            let dt = pg_type_to_arrow(col.type_());
-            Field::new(col.name(), dt, true)
+            let rivet = column_overrides
+                .get(col.name())
+                .cloned()
+                .unwrap_or_else(|| pg_type_to_rivet(col.type_()));
+            let source = SourceColumn::simple(col.name(), col.type_().name(), true);
+            let mapping = TypeMapping::from_source(&source, rivet);
+            build_arrow_field(&mapping).unwrap_or_else(|| {
+                log::warn!(
+                    "column '{}': PG type '{}' has no safe Rivet mapping — \
+                     exporting as Utf8 (configure type_policy or add a column \
+                     override to suppress this warning)",
+                    col.name(),
+                    col.type_().name()
+                );
+                let mut meta = HashMap::new();
+                meta.insert(META_NATIVE_TYPE.to_string(), col.type_().name().to_string());
+                meta.insert(META_FIDELITY.to_string(), "unsupported".to_string());
+                Field::new(col.name(), DataType::Utf8, true).with_metadata(meta)
+            })
         })
         .collect();
     Schema::new(fields)
+}
+
+/// Reads a PostgreSQL `INTERVAL` value from its 16-byte binary wire format:
+///   bytes 0–7  (i64 big-endian): microseconds within day
+///   bytes 8–11 (i32 big-endian): days
+///   bytes 12–15 (i32 big-endian): months
+struct PgInterval {
+    microseconds: i64,
+    days: i32,
+    months: i32,
+}
+
+impl<'a> postgres_types::FromSql<'a> for PgInterval {
+    fn from_sql(
+        _ty: &postgres_types::Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() != 16 {
+            return Err(format!("expected 16-byte interval, got {}", raw.len()).into());
+        }
+        let microseconds = i64::from_be_bytes(raw[0..8].try_into()?);
+        let days = i32::from_be_bytes(raw[8..12].try_into()?);
+        let months = i32::from_be_bytes(raw[12..16].try_into()?);
+        Ok(Self {
+            microseconds,
+            days,
+            months,
+        })
+    }
+    fn accepts(ty: &postgres_types::Type) -> bool {
+        *ty == postgres_types::Type::INTERVAL
+    }
+}
+
+/// Build an `IntervalMonthDayNano` from PostgreSQL interval components.
+#[inline]
+fn pack_month_day_nano(months: i32, days: i32, nanoseconds: i64) -> IntervalMonthDayNano {
+    IntervalMonthDayNano {
+        months,
+        days,
+        nanoseconds,
+    }
+}
+
+/// Generic wrapper that reads any Postgres binary value as a UTF-8 string.
+/// Used for enum types whose OID is not a standard text OID.
+struct AnyAsString(String);
+
+impl<'a> postgres_types::FromSql<'a> for AnyAsString {
+    fn from_sql(
+        _ty: &postgres_types::Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(AnyAsString(std::str::from_utf8(raw)?.to_string()))
+    }
+    fn accepts(_ty: &postgres_types::Type) -> bool {
+        true
+    }
 }
 
 fn rows_to_record_batch_typed(
@@ -230,16 +405,23 @@ fn rows_to_record_batch_typed(
     columns: &[(String, Type)],
     rows: &[Row],
 ) -> Result<RecordBatch> {
+    use arrow::record_batch::RecordBatch;
     let mut arrays: Vec<Arc<dyn Array>> = Vec::with_capacity(columns.len());
     for (col_idx, (_name, pg_type)) in columns.iter().enumerate() {
-        let array = build_array(pg_type, col_idx, rows)?;
+        let target_type = schema.field(col_idx).data_type();
+        let array = build_array(pg_type, target_type, col_idx, rows)?;
         arrays.push(array);
     }
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
     Ok(batch)
 }
 
-fn build_array(pg_type: &Type, col_idx: usize, rows: &[Row]) -> Result<Arc<dyn Array>> {
+fn build_array(
+    pg_type: &Type,
+    target_type: &DataType,
+    col_idx: usize,
+    rows: &[Row],
+) -> Result<Arc<dyn Array>> {
     match *pg_type {
         Type::BOOL => {
             let mut b = BooleanBuilder::with_capacity(rows.len());
@@ -262,10 +444,14 @@ fn build_array(pg_type: &Type, col_idx: usize, rows: &[Row]) -> Result<Arc<dyn A
             }
             Ok(Arc::new(b.finish()))
         }
-        Type::INT8 => {
+        Type::INT8 | Type::OID => {
             let mut b = Int64Builder::with_capacity(rows.len());
             for row in rows {
-                b.append_option(row.get(col_idx));
+                if *pg_type == Type::OID {
+                    b.append_option(row.get::<_, Option<u32>>(col_idx).map(|v| v as i64));
+                } else {
+                    b.append_option(row.get(col_idx));
+                }
             }
             Ok(Arc::new(b.finish()))
         }
@@ -315,6 +501,20 @@ fn build_array(pg_type: &Type, col_idx: usize, rows: &[Row]) -> Result<Arc<dyn A
             }
             Ok(Arc::new(b.finish()))
         }
+        Type::TIME => {
+            let mut b = Time64MicrosecondBuilder::with_capacity(rows.len());
+            for row in rows {
+                match row.get::<_, Option<chrono::NaiveTime>>(col_idx) {
+                    Some(t) => {
+                        let micros = t.num_seconds_from_midnight() as i64 * 1_000_000
+                            + t.nanosecond() as i64 / 1_000;
+                        b.append_value(micros);
+                    }
+                    None => b.append_null(),
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
         Type::TIMESTAMP => {
             let mut b = TimestampMicrosecondBuilder::with_capacity(rows.len());
             for row in rows {
@@ -325,6 +525,8 @@ fn build_array(pg_type: &Type, col_idx: usize, rows: &[Row]) -> Result<Arc<dyn A
             }
             Ok(Arc::new(b.finish()))
         }
+        // Roadmap §13: TIMESTAMPTZ is normalized to UTC. The Arrow array carries
+        // the UTC timezone tag so Parquet writes TIMESTAMP_MICROS(isAdjustedToUTC=true).
         Type::TIMESTAMPTZ => {
             let mut b = TimestampMicrosecondBuilder::with_capacity(rows.len());
             for row in rows {
@@ -333,9 +535,10 @@ fn build_array(pg_type: &Type, col_idx: usize, rows: &[Row]) -> Result<Arc<dyn A
                     None => b.append_null(),
                 }
             }
-            Ok(Arc::new(b.finish()))
+            Ok(Arc::new(b.finish().with_timezone("UTC")))
         }
-        Type::NUMERIC | Type::JSON | Type::JSONB | Type::UUID => {
+        // JSON, JSONB, UUID: always Utf8 with rivet metadata.
+        Type::JSON | Type::JSONB | Type::UUID => {
             let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
             for row in rows {
                 let val: Option<String> = row.try_get(col_idx).ok().flatten();
@@ -343,14 +546,59 @@ fn build_array(pg_type: &Type, col_idx: usize, rows: &[Row]) -> Result<Arc<dyn A
             }
             Ok(Arc::new(b.finish()))
         }
-        Type::OID => {
-            let mut b = Int64Builder::with_capacity(rows.len());
-            for row in rows {
-                b.append_option(row.get::<_, Option<u32>>(col_idx).map(|v| v as i64));
+        // NUMERIC: exact Decimal128/256 path when the user declared precision/scale
+        // via a column override; otherwise fall back to Utf8 (schema already carries
+        // rivet.fidelity=unsupported metadata so downstream tooling can detect it).
+        Type::NUMERIC => match target_type {
+            DataType::Decimal128(p, s) => pg_numeric_to_decimal128(*p, *s, col_idx, rows),
+            DataType::Decimal256(p, s) => pg_numeric_to_decimal256(*p, *s, col_idx, rows),
+            _ => {
+                let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
+                for row in rows {
+                    let val: Option<String> = row.try_get(col_idx).ok().flatten();
+                    b.append_option(val.as_deref());
+                }
+                Ok(Arc::new(b.finish()))
             }
-            Ok(Arc::new(b.finish()))
-        }
+        },
         _ => {
+            // M6: INTERVAL → IntervalMonthDayNano
+            if *pg_type == Type::INTERVAL {
+                let mut b = IntervalMonthDayNanoBuilder::with_capacity(rows.len());
+                for row in rows {
+                    match row.try_get::<_, Option<PgInterval>>(col_idx).ok().flatten() {
+                        Some(iv) => b.append_value(pack_month_day_nano(
+                            iv.months,
+                            iv.days,
+                            iv.microseconds * 1_000,
+                        )),
+                        None => b.append_null(),
+                    }
+                }
+                return Ok(Arc::new(b.finish()));
+            }
+
+            // M6: 1-D arrays → Arrow List via Vec<T> deserialization
+            if matches!(pg_type.kind(), Kind::Array(_)) {
+                return build_pg_list_array(target_type, col_idx, rows);
+            }
+
+            // M6: Enum types → Utf8 (read binary enum label as UTF-8)
+            if matches!(pg_type.kind(), Kind::Enum(_)) {
+                let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 16);
+                for row in rows {
+                    match row
+                        .try_get::<_, Option<AnyAsString>>(col_idx)
+                        .ok()
+                        .flatten()
+                    {
+                        Some(s) => b.append_value(&s.0),
+                        None => b.append_null(),
+                    }
+                }
+                return Ok(Arc::new(b.finish()));
+            }
+
             log::warn!("unmapped PG type {:?}, extracting as text", pg_type);
             let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
             for row in rows {
@@ -361,3 +609,145 @@ fn build_array(pg_type: &Type, col_idx: usize, rows: &[Row]) -> Result<Arc<dyn A
         }
     }
 }
+
+/// Build an Arrow `ListArray` from a PostgreSQL array column.
+///
+/// Dispatches to `Vec<T>` deserialization based on the Arrow element type.
+/// Supports: bool, int16/32/64, float32/64, text. Other element types fall
+/// back to a null list.
+fn build_pg_list_array(
+    target_type: &DataType,
+    col_idx: usize,
+    rows: &[Row],
+) -> Result<Arc<dyn Array>> {
+    let inner_dt = if let DataType::List(field_ref) = target_type {
+        field_ref.data_type()
+    } else {
+        anyhow::bail!("build_pg_list_array called with non-List target type");
+    };
+
+    macro_rules! list_of {
+        ($T:ty, $Builder:ty) => {{
+            let mut lb = ListBuilder::new(<$Builder>::new());
+            for row in rows {
+                match row.try_get::<_, Option<Vec<$T>>>(col_idx).ok().flatten() {
+                    Some(v) => {
+                        for x in &v {
+                            lb.values().append_value(*x);
+                        }
+                        lb.append(true);
+                    }
+                    None => lb.append(false),
+                }
+            }
+            Ok(Arc::new(lb.finish()))
+        }};
+    }
+
+    match inner_dt {
+        DataType::Boolean => list_of!(bool, BooleanBuilder),
+        DataType::Int16 => list_of!(i16, Int16Builder),
+        DataType::Int32 => list_of!(i32, Int32Builder),
+        DataType::Int64 => list_of!(i64, Int64Builder),
+        DataType::Float32 => list_of!(f32, Float32Builder),
+        DataType::Float64 => list_of!(f64, Float64Builder),
+        DataType::Utf8 => {
+            let mut lb = ListBuilder::new(StringBuilder::new());
+            for row in rows {
+                match row
+                    .try_get::<_, Option<Vec<String>>>(col_idx)
+                    .ok()
+                    .flatten()
+                {
+                    Some(v) => {
+                        for s in &v {
+                            lb.values().append_value(s);
+                        }
+                        lb.append(true);
+                    }
+                    None => lb.append(false),
+                }
+            }
+            Ok(Arc::new(lb.finish()))
+        }
+        other => {
+            log::warn!(
+                "PG array: unsupported element type {:?}, writing null list",
+                other
+            );
+            let mut lb = ListBuilder::new(StringBuilder::new());
+            for _ in rows {
+                lb.append(false);
+            }
+            Ok(Arc::new(lb.finish()))
+        }
+    }
+}
+
+/// Build a `Decimal128Array` from a PostgreSQL `NUMERIC` column read as text.
+///
+/// Roadmap §12: the numeric string "123.45" is converted to the scaled i128
+/// value 12345 (for scale=2) without ever passing through `f64`.
+fn pg_numeric_to_decimal128(
+    precision: u8,
+    scale: i8,
+    col_idx: usize,
+    rows: &[Row],
+) -> Result<Arc<dyn Array>> {
+    use crate::types::decimal::decimal_str_to_scaled_i128;
+    let mut b = Decimal128Builder::with_capacity(rows.len());
+    for row in rows {
+        match row.try_get::<_, Option<String>>(col_idx).ok().flatten() {
+            Some(s) => match decimal_str_to_scaled_i128(&s, scale) {
+                Some(v) => b.append_value(v),
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "cannot parse '{}' as decimal({},{})",
+                        s,
+                        precision,
+                        scale
+                    ));
+                }
+            },
+            None => b.append_null(),
+        }
+    }
+    Ok(Arc::new(
+        b.finish().with_precision_and_scale(precision, scale)?,
+    ))
+}
+
+/// Build a `Decimal256Array` for precision > 38 (roadmap §12).
+fn pg_numeric_to_decimal256(
+    precision: u8,
+    scale: i8,
+    col_idx: usize,
+    rows: &[Row],
+) -> Result<Arc<dyn Array>> {
+    use crate::types::decimal::decimal_str_to_scaled_i128;
+    use arrow::datatypes::i256;
+    let mut b = Decimal256Builder::with_capacity(rows.len());
+    for row in rows {
+        match row.try_get::<_, Option<String>>(col_idx).ok().flatten() {
+            Some(s) => match decimal_str_to_scaled_i128(&s, scale) {
+                Some(v) => b.append_value(i256::from_i128(v)),
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "cannot parse '{}' as decimal({},{})",
+                        s,
+                        precision,
+                        scale
+                    ));
+                }
+            },
+            None => b.append_null(),
+        }
+    }
+    Ok(Arc::new(
+        b.finish().with_precision_and_scale(precision, scale)?,
+    ))
+}
+
+// RecordBatch is only used inside this file; import it locally to avoid
+// polluting the module-level use block.
+use arrow::record_batch::RecordBatch;

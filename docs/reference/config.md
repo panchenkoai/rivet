@@ -111,6 +111,64 @@ Each entry in the `exports` list defines one export job.
 | `tuning` | object | no | — | Per-export tuning overrides |
 | `source_group` | string | no | — | Logical group for shared source capacity (replica, host). Drives campaign-level warnings in `rivet plan` (advisory only — ADR-0006) |
 | `reconcile_required` | boolean | no | `false` | Advisory hint: treat this export as reconcile-sensitive in planning, independent of the `--reconcile` CLI flag (ADR-0006, Epic C) |
+| `columns` | map | no | — | Per-column type overrides (see below) |
+| `on_schema_drift` | `warn`\|`continue`\|`fail` | no | `warn` | Policy when structural schema drift is detected (see below) |
+| `shape_drift_warn_factor` | float | no | `2.0` | Warn when a string/binary column's max byte length grows beyond `N × stored_max`. Set to `0` to disable shape tracking. |
+
+### `exports[].on_schema_drift` — schema drift policy
+
+Controls what Rivet does when it detects a structural change in the output schema (column added, removed, or retyped) compared to the snapshot stored from the previous run.
+
+| Value | Behavior |
+|---|---|
+| `warn` | **(default)** Log a warning, store the new schema fingerprint, and continue the run. |
+| `continue` | Silently accept — store the new schema, no log output. |
+| `fail` | Abort the run with exit code 1. The schema store is **not** updated, so the next run will detect the same change again. |
+
+`fail` is useful in CI pipelines where schema changes must be reviewed before the new shape is exported downstream.
+
+```yaml
+exports:
+  - name: orders
+    on_schema_drift: fail
+```
+
+When `fail` triggers, the output file has already been written to the destination (schema check happens post-extraction), but no cursor advance or manifest commit occurs. Re-run after confirming the schema change is intentional, or switch to `warn` to accept it.
+
+---
+
+### `exports[].columns` — per-column type overrides
+
+Override the Arrow type Rivet infers for a specific column. Useful when the inferred type is too wide (e.g. Rivet picks `Decimal128(38,10)` but your data fits in `Decimal128(18,4)`) or when you need a narrower precision for BigQuery NUMERIC compatibility.
+
+```yaml
+columns:
+  <column_name>:
+    decimal_precision: <integer>   # override precision for numeric/decimal columns
+    decimal_scale: <integer>       # override scale for numeric/decimal columns
+```
+
+Only `decimal_precision` and `decimal_scale` are supported today. Both must be provided together.
+
+Example:
+
+```yaml
+exports:
+  - name: orders
+    query: "SELECT id, amount, created_at FROM orders"
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+    columns:
+      amount:
+        decimal_precision: 15
+        decimal_scale: 4
+```
+
+Type overrides are applied during the `rows_to_record_batch_typed` conversion and are reflected in `rivet check --type-report` output.
+
+---
 
 ### Mode-specific fields
 

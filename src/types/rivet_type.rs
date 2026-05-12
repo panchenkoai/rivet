@@ -1,6 +1,6 @@
 //! Rivet's canonical internal type system.
 //!
-//! See `rivet_type_safety_roadmap.md` §5 ("Type Mapping Pipeline") and §6
+//! See `rivet_roadmap.md` §Epic 14 (type safety). §5 — Type Mapping Pipeline, §6
 //! ("Internal Type System"). Every database driver maps its native column
 //! metadata into a [`RivetType`] *first*, then a single function maps
 //! [`RivetType`] to `arrow::DataType`. This is the architectural fix for the
@@ -24,14 +24,17 @@
 //! `serde::Serialize` is implemented so the type-report CLI (Chunk 5) can
 //! emit a stable JSON shape.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Time-resolution unit for [`RivetType::Time`] / [`RivetType::Timestamp`].
 ///
 /// Mirrors `arrow::datatypes::TimeUnit` but lives in the Rivet type system
 /// so we don't leak Arrow as a public API surface and so the type-report
 /// CLI can serialize the value without depending on Arrow's types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+// Only `Microsecond` is produced by current drivers; the remaining variants
+// are live once ADBC / other drivers are added (roadmap §4).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TimeUnit {
     Second,
@@ -42,6 +45,7 @@ pub enum TimeUnit {
 
 impl TimeUnit {
     /// Stable lowercase string label for persistence and reports.
+    #[allow(dead_code)]
     pub fn label(self) -> &'static str {
         match self {
             TimeUnit::Second => "second",
@@ -60,7 +64,11 @@ impl TimeUnit {
 /// export a new shape of data"). Anything outside this enum becomes
 /// [`RivetType::Unsupported`] until the type system gains first-class
 /// support for it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+// `UInt64` and `Decimal` are live in MySQL/PG mappers once column overrides
+// (Chunk 6) and exact decimal (Milestone 2) land; `Second`/`Millisecond`/
+// `Nanosecond` TimeUnit variants serve future drivers.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RivetType {
     /// Boolean.
@@ -127,8 +135,24 @@ pub enum RivetType {
     /// switched to FixedSizeBinary(16) by policy later (roadmap §14).
     Uuid,
 
+    // ── M6: Complex Types ─────────────────────────────────────────────────
+    /// Database enum type (PostgreSQL `ENUM`, MySQL `ENUM`/`SET`).
+    /// Stored as `Utf8 + metadata logical=enum` (roadmap §15).
+    Enum,
+
+    /// Time interval (PostgreSQL `interval`).
+    /// Stored as Arrow `IntervalMonthDayNano` which preserves the three
+    /// components (months, days, sub-day nanoseconds) without collapsing
+    /// them into a single integer (roadmap §15).
+    Interval,
+
+    /// One-dimensional array of a scalar Rivet type.
+    /// PostgreSQL `int8[]`, `text[]`, `bool[]`, etc.
+    /// Stored as Arrow `List(inner_type)` (roadmap §15).
+    List { inner: Box<RivetType> },
+
     /// The driver knows about the type but Rivet does not have a safe
-    /// mapping for it (e.g. PostgreSQL `interval`, `geometry`, `hstore`).
+    /// mapping for it (e.g. PostgreSQL `geometry`, `hstore`).
     /// Carries enough context for an actionable error message in the
     /// type-report and policy layer.
     Unsupported { native_type: String, reason: String },
@@ -139,6 +163,7 @@ impl RivetType {
     /// reports. Round-trippable with the JSON shape of the variant when
     /// applicable (e.g. `decimal(18,2)`, `timestamp_tz(microsecond,UTC)`).
     /// Used by the type-report CLI (Chunk 5).
+    #[allow(dead_code)]
     pub fn label(&self) -> String {
         match self {
             RivetType::Bool => "bool".into(),
@@ -164,12 +189,16 @@ impl RivetType {
             RivetType::Binary => "binary".into(),
             RivetType::Json => "json".into(),
             RivetType::Uuid => "uuid".into(),
+            RivetType::Enum => "enum".into(),
+            RivetType::Interval => "interval".into(),
+            RivetType::List { inner } => format!("list<{}>", inner.label()),
             RivetType::Unsupported { native_type, .. } => format!("unsupported({native_type})"),
         }
     }
 
     /// True for the `Unsupported` variant — convenience for the strict-mode
     /// gate so callers don't have to `matches!()` everywhere.
+    #[allow(dead_code)]
     pub fn is_unsupported(&self) -> bool {
         matches!(self, RivetType::Unsupported { .. })
     }

@@ -27,6 +27,26 @@ pub enum NotifyEvent {
     Degraded,
 }
 
+/// What to do when structural schema drift is detected (column added, removed, or retyped).
+///
+/// ```yaml
+/// exports:
+///   - name: orders
+///     on_schema_drift: fail   # warn (default), continue, fail
+/// ```
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaDriftPolicy {
+    /// Log a warning and continue. The new schema fingerprint is stored. (Default.)
+    #[default]
+    Warn,
+    /// Silently accept schema changes — store the new schema, no log output.
+    Continue,
+    /// Abort the run with a non-zero exit. The schema store is NOT updated so the
+    /// next run will detect the same change again.
+    Fail,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct SourceConfig {
     #[serde(rename = "type")]
@@ -342,6 +362,35 @@ pub struct ExportConfig {
     /// by planning, independent of the `--reconcile` CLI flag. Advisory only.
     #[serde(default)]
     pub reconcile_required: bool,
+
+    /// Per-column type overrides (roadmap §8). Keys are column names; values
+    /// are short type strings such as `decimal(18,2)`, `timestamp_tz`, `json`.
+    ///
+    /// ```yaml
+    /// exports:
+    ///   - name: payments
+    ///     columns:
+    ///       amount: decimal(18,2)
+    ///       fee: decimal(18,6)
+    ///       created_at: timestamp_tz
+    /// ```
+    ///
+    /// Overrides take priority over autodetection and are validated at
+    /// plan time — an invalid type string fails before the export runs.
+    #[serde(default)]
+    pub columns: std::collections::HashMap<String, String>,
+
+    /// Policy applied when structural schema drift is detected (column added, removed, or retyped).
+    /// Defaults to `warn`: log a warning and continue.
+    #[serde(default)]
+    pub on_schema_drift: SchemaDriftPolicy,
+
+    /// Growth-factor threshold for data shape drift warnings (Epic 8).
+    /// When a string/binary column's max observed byte length in the current run
+    /// exceeds `stored_max * shape_drift_warn_factor`, Rivet logs a warning.
+    /// `None` uses the default of 2.0. Set to `0.0` to disable shape tracking.
+    #[serde(default)]
+    pub shape_drift_warn_factor: Option<f64>,
 }
 
 impl ExportConfig {

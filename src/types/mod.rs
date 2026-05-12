@@ -1,6 +1,6 @@
 //! Rivet's internal type system.
 //!
-//! See `rivet_type_safety_roadmap.md`. The roadmap's North Star —
+//! See `rivet_roadmap.md` §Epic 14 (Warehouse Load Layer). North Star —
 //! *"No silent type degradation"* — is enforced architecturally by
 //! routing every source-column type through the pipeline:
 //!
@@ -27,32 +27,37 @@
 //! metrics, or hold any pipeline state. Vendor mappers live in
 //! `crate::source::*` and call into this module.
 
-// The Type Safety Foundation (Chunk 1 of the type-safety roadmap) lands the
-// `RivetType` / `SourceColumn` / `TypeMapping` skeleton ahead of the vendor
-// mappers (Chunks 2–3) and policy layer (Chunk 4) that will consume it.
-// Until those chunks land, parts of this module are constructed only by
-// unit tests; the dead-code warnings would otherwise drown out real signal
-// in `cargo build`. Remove these allow's once Chunks 2–4 land.
-#![allow(dead_code, unused_imports)]
-
 mod cursor;
+pub mod decimal;
 mod fidelity;
 mod mapping;
+mod override_type;
+pub mod policy;
 mod rivet_type;
 mod source_column;
+pub mod target;
 
 pub use cursor::CursorState;
 pub use fidelity::TypeFidelity;
-pub use mapping::{
-    META_FIDELITY, META_LOGICAL_TYPE, META_NATIVE_TYPE, TypeMapping, build_arrow_field,
-    derive_fidelity, rivet_type_to_arrow,
-};
+pub use mapping::{META_FIDELITY, META_NATIVE_TYPE, TypeMapping, build_arrow_field};
+pub use override_type::parse_type_str;
 pub use rivet_type::{RivetType, TimeUnit};
-pub use source_column::{ColumnOverride, SourceColumn};
+pub use source_column::SourceColumn;
+// ColumnOverride is the planned public API for column type overrides (Chunk 6).
+#[allow(unused_imports)]
+pub use source_column::ColumnOverride;
+
+/// Per-export column type overrides: column name → declared [`RivetType`].
+///
+/// Built at plan time from the `columns:` map in `rivet.yaml` (roadmap §8).
+/// Passed to [`crate::source::Source::export`] so drivers can use the
+/// declared precision/scale instead of autodetected (often unavailable) metadata.
+pub type ColumnOverrides = std::collections::HashMap<String, RivetType>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::mapping::META_LOGICAL_TYPE;
     use arrow::datatypes::DataType;
 
     /// Top-level smoke test: feeding a typical PostgreSQL `payments` table

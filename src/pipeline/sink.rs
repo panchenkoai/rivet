@@ -55,6 +55,8 @@ pub(crate) struct ExportSink {
     pub(in crate::pipeline) completed_parts: Vec<CompletedPart>,
     /// When set, this column is removed from Arrow batches before enrichment and write (see `chunk_dense`).
     pub(in crate::pipeline) strip_internal_column: Option<String>,
+    /// Running per-column max byte length for string/binary columns (Epic 8).
+    pub(in crate::pipeline) column_max_bytes: std::collections::HashMap<String, u64>,
 }
 
 impl ExportSink {
@@ -88,6 +90,7 @@ impl ExportSink {
             max_file_size: plan.max_file_size_bytes,
             completed_parts: Vec::new(),
             strip_internal_column,
+            column_max_bytes: std::collections::HashMap::new(),
         })
     }
 
@@ -175,6 +178,45 @@ impl ExportSink {
         }
     }
 
+    /// Update the running per-column max byte length for string/binary columns.
+    pub fn track_shape(&mut self, batch: &RecordBatch) {
+        use arrow::array::{BinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
+        use arrow::datatypes::DataType;
+
+        let schema = batch.schema();
+        for (idx, field) in schema.fields().iter().enumerate() {
+            let col = batch.column(idx);
+            let batch_max: Option<u64> = match field.data_type() {
+                DataType::Utf8 => col
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .and_then(|a| a.iter().flatten().map(|s| s.len() as u64).max()),
+                DataType::LargeUtf8 => col
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .and_then(|a| a.iter().flatten().map(|s| s.len() as u64).max()),
+                DataType::Binary => col
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .and_then(|a| a.iter().flatten().map(|b| b.len() as u64).max()),
+                DataType::LargeBinary => col
+                    .as_any()
+                    .downcast_ref::<LargeBinaryArray>()
+                    .and_then(|a| a.iter().flatten().map(|b| b.len() as u64).max()),
+                _ => None,
+            };
+            if let Some(m) = batch_max {
+                let entry = self
+                    .column_max_bytes
+                    .entry(field.name().clone())
+                    .or_insert(0);
+                if m > *entry {
+                    *entry = m;
+                }
+            }
+        }
+    }
+
     pub fn run_quality_checks(&self) -> Vec<crate::quality::QualityIssue> {
         let qc = match &self.quality_columns {
             Some(q) => q,
@@ -252,6 +294,7 @@ impl BatchSink for ExportSink {
         self.total_rows += dest_batch.num_rows();
         self.part_rows += dest_batch.num_rows();
         self.track_quality(&dest_batch);
+        self.track_shape(&dest_batch);
 
         let output = if let Some(es) = &self.enriched_schema {
             enrich::enrich_batch(&dest_batch, &self.meta, es, self.exported_at_us)?
@@ -726,6 +769,7 @@ mod tests {
             max_file_size: None,
             completed_parts: Vec::new(),
             strip_internal_column: None,
+            column_max_bytes: std::collections::HashMap::new(),
         }
     }
 

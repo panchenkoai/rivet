@@ -289,7 +289,7 @@ Users repeatedly hit partitioning pain on 100M+ tables and often need date-based
 
 ## Epic 7 — Schema Drift Visibility & Policy
 **Priority:** P1  
-**Status:** ✅ Partial — column add/remove/type-change tracking and warnings in run summary; policy hooks (warn/fail/continue on drift) not yet implemented  
+**Status:** ✅ DONE — column add/remove/type-change tracking in run summary + `on_schema_drift: warn|continue|fail` policy hook in YAML config  
 **Pain coverage:** Pain C, Pain E
 
 ### Goal
@@ -308,7 +308,7 @@ Users often discover schema drift only after downstream damage is already done.
 
 ## Epic 8 — Data Shape Drift Detection
 **Priority:** P1  
-**Status:** ⏳ OPEN — not started; text/string width tracking not yet implemented  
+**Status:** ✅ DONE — per-column max byte length tracked across runs; `shape_drift_warn_factor` YAML config; warns when growth exceeds threshold  
 **Pain coverage:** Pain C
 
 ### Goal
@@ -428,18 +428,21 @@ Real pain, but infrastructure/security complexity is non-trivial.
 ---
 
 ## Epic 14 — Narrow Warehouse Load Layer
-**Priority:** P3  
+**Priority:** P3 → **P1 (in progress)**  
+**Status:** ✅ Partial — type system, type report, strict mode, BigQuery compat layer, complex types (M1–M6 complete); load path (Parquet → BQ) = future  
 **Pain coverage:** Pain C, Pain E
 
 ### Goal
 Add a narrow, compatibility-aware path from extracted files into selected warehouse targets.
 
 ### Deliverables
-- canonical type system
-- target schema adapters
-- compatibility report
-- strict/permissive mapping policy
-- one narrow target first
+- ✅ canonical type system (`src/types/`: `RivetType`, `TypeMapping`, `TypeFidelity`)
+- ✅ target schema adapters (`ExportTarget::BigQuery`, Arrow→BQ mapping with NUMERIC/BIGNUMERIC/REPEATED/etc.)
+- ✅ compatibility report (`rivet check --type-report --target bigquery`)
+- ✅ strict/permissive mapping policy (`TypePolicy`, `--strict` flag)
+- ✅ column type overrides (`columns:` YAML block)
+- ✅ complex types: Enum, Interval, List (Postgres); Enum/SET, TIME, arrays (MySQL)
+- ⏳ direct load path (write Parquet files directly into BigQuery) = future
 
 ### Why this matters
 Useful, but this opens a new product layer and should follow extraction trust.
@@ -553,21 +556,24 @@ This section merges the former `rivet_roadmap_v3.md` task tracker. **Strategic p
 | Epic 4 — Durable state backend | *(none yet)* | Today: SQLite only. Postgres/external state = future |
 | Epic 5 — Batch/fetch/write control | **M**, tuning | `batch_size`, `max_file_size`, streaming; not full split of row-group vs fetch |
 | Epic 6 — Partition intelligence | **B**, modes | `chunked`, `time_window`, dense surrogate guidance; `chunk_by_days` date-native partitioning ✅ |
-| Epic 7 — Schema drift | **D** (tracking) | Warnings today; policy hooks (warn/fail) = future |
+| Epic 7 — Schema drift | **D** (tracking) | `on_schema_drift: warn\|continue\|fail` ✅ |
 | Epic 8 — Shape drift | **N2** (Phase 3 table) | Not started |
 | Epic 9 — Data contracts | `quality:` YAML | Row bounds, null ratio, uniqueness; chunked aggregate rules |
 | Epic 10 — Config UX | **E**, **J**, misplaced-field validation | Docs + errors |
 | Epic 11 — Packaging | **L** | Release workflow, binaries; Homebrew/Docker = open |
 | Epic 12 — Deployment | docs, `docker-compose` | k8s/Helm, durable state = open |
-| Epics 13–16 | **O**, **N** | SSH, warehouse load, CDC, auto-parallel — later |
+| Epic 13 — SSH | **O** | External tunnel docs first; native SSH = future |
+| Epic 14 — Warehouse load | `src/types/`, M1–M6 | Type system + type report + BQ compat ✅; direct load path = future |
+| Epic 15 — CDC | **N** | WAL/binlog = future |
+| Epic 16 — Auto-parallel | *(none)* | Auto-parallelism = future |
 
 **Auth and connectivity (lettered A)** underpin all runs and map across Epics 1–2 and §7 (niche).
 
 ---
 
-## 9.2 Current state (v0.2.0-beta.7)
+## 9.2 Current state (v0.3.5)
 
-Rivet core is **feature-complete for beta** extraction. All Wave 1–3 stabilisation epics are shipped.
+Rivet core is **feature-complete for stable extraction with type safety**. All Wave 1–3 stabilisation epics are shipped; Epic 14 type safety layer (M1–M6) complete.
 
 ### Extraction
 
@@ -582,6 +588,16 @@ Rivet core is **feature-complete for beta** extraction. All Wave 1–3 stabilisa
 - Tuning profiles, Slack, data **quality** checks, meta columns
 - Date-native chunking (`chunk_by_days`), connection limit warnings, `rivet init`
 - **Plan/Apply workflow** — sealed execution artifacts (`rivet plan` / `rivet apply`, ADR-0005)
+- **Parallel exports** — `--parallel-exports` (threads) and `--parallel-export-processes` (OS processes) with live cards UI
+
+### Type safety (M1–M6, Epic 14)
+
+- Canonical type system: `RivetType`, `TypeMapping`, `TypeFidelity`, `ColumnOverrides`
+- `TypePolicy` with Fail/Warn/Allow per fidelity level; `--strict` CLI gate
+- `rivet check --type-report [--json] [--target bigquery]`
+- BigQuery compatibility layer: NUMERIC, BIGNUMERIC, TIMESTAMP, DATETIME, REPEATED, overflow warnings
+- Per-column overrides: `columns: { col: { decimal_precision, decimal_scale } }`
+- Complex types: Enum, Interval (Postgres), List/Array (Postgres), MySQL TIME/TIME2, MySQL ENUM/SET
 
 ### Architecture (stabilisation plan — all complete)
 
@@ -594,14 +610,13 @@ Rivet core is **feature-complete for beta** extraction. All Wave 1–3 stabilisa
 - `DestinationCapabilities`, `WriteCommitProtocol` per backend (Epic 9, ADR-0004)
 - `RunJournal` domain model with 13 `RunEvent` variants (Epic 10)
 - Invariant + compatibility matrix + recovery test suites in CI (Epics 11–13)
-- Semantic release gates — `test-invariants`, `test-recovery`, `test-compatibility` required before build (Epic 14)
+- Semantic release gates — `test-invariants`, `test-recovery`, `test-compatibility` required before build (Epic 14/arch)
 
 ### Release & distribution
 
 - **CI:** rustfmt, clippy, tests, release build, **E2E** (Docker Compose), cargo audit, semantic gates
 - **Release:** Linux x86_64/arm64, macOS arm64/Intel binaries; Docker GHCR; Homebrew tap
 - **Published:** `rivet-cli` on crates.io
-- **617+ tests** (unit + integration + E2E + invariant + recovery + compatibility matrix)
 
 ---
 
@@ -751,24 +766,28 @@ Rivet core is **feature-complete for beta** extraction. All Wave 1–3 stabilisa
 
 Prioritize by stabilization before distribution polish:
 
-**Completed (beta.2–beta.7):**
+**Completed (v0.2.0-beta.2 → v0.3.5):**
 
 1. ✅ **Green GitHub Release** — v0.2.0-beta.2 published (binaries, Docker, Homebrew tap).
-2. ✅ **L3** — `cargo publish` — rivet-cli v0.2.0-beta.2 on crates.io.
-3. ✅ **Connection limit warning** — `rivet check` warns when `parallel >= max_connections` (v0.2.0-beta.3).
-4. ✅ **Date-native chunking** — `chunk_by_days` with `>= date AND < date` semantics, parallel support, E2E tested (v0.2.0-beta.3).
-5. ✅ **Stabilisation plan Waves 1–3** — all 14 epics shipped in v0.2.0-beta.7 (architecture hardening, invariant/recovery/compatibility tests, semantic release gates).
+2. ✅ **L3** — `cargo publish` — rivet-cli on crates.io.
+3. ✅ **Connection limit warning** — `rivet check` warns when `parallel >= max_connections`.
+4. ✅ **Date-native chunking** — `chunk_by_days` with `>= date AND < date` semantics, parallel support, E2E tested.
+5. ✅ **Stabilisation plan Waves 1–3** — all 14 arch epics shipped (invariant/recovery/compatibility tests, semantic release gates).
+6. ✅ **Parallel export processes** — `--parallel-export-processes` with live cards UI (v0.3.4).
+7. ✅ **Cards UI for `--parallel-exports`** — unified cards renderer + compact summaries (v0.3.5).
+8. ✅ **Type safety layer M1–M6** — `rivet check --type-report`, `TypePolicy`, BigQuery compat, complex types (Enum/Interval/List).
 
-**Remaining open items:**
+**Remaining open items (P1 first):**
 
-1. **F5 + I5** — short docs: audit/reconcile tradeoffs; capacity/memory guidance.
-2. **I2** — scripted benchmark or `cargo xtask`-style harness.
-3. **Epic 4 (§5)** — external/durable state backend when pilots need multi-replica or stateless workers.
-4. **H2, G2** — fault injection and network chaos (lower urgency).
+1. ✅ **Epic 7 schema drift policy** — `on_schema_drift: warn|continue|fail` YAML hook shipped.
+2. ✅ **Epic 8 data shape drift** — `export_shape` SQLite table; `shape_drift_warn_factor` YAML config; warns on `N×` growth.
+3. **F5 + I5** — short docs: audit/reconcile tradeoffs; capacity/memory guidance.
+4. **I2** — scripted benchmark or `cargo xtask`-style harness.
+5. **Epic 4 (§5)** — external/durable state backend when pilots need multi-replica or stateless workers.
 
 ---
 
-## 9.7 Definition of done — stable v0.2.0
+## 9.7 Definition of done — stable v0.3.x
 
 - [x] Auth predictable and documented
 - [x] `rivet check` actionable strategy and safety guidance
@@ -779,7 +798,11 @@ Prioritize by stabilization before distribution polish:
 - [x] Docs for real scenarios (`docs/` canonical; `USER_GUIDE.md` deprecated, navigation consolidated)
 - [x] Architecture stabilisation — Waves 1–3 complete (14 epics, invariant/recovery/compatibility tests, semantic release gates)
 - [x] Plan/Apply workflow — sealed execution artifacts, ADR-0005
+- [x] Parallel exports — `--parallel-exports` + `--parallel-export-processes` with live cards UI
+- [x] Type safety layer — `--type-report`, TypePolicy, BigQuery compat, complex types (M1–M6)
+- [x] Schema drift policy hooks — `on_schema_drift: warn|continue|fail` (Epic 7)
+- [x] Data shape drift detection — string/text width tracking (Epic 8)
 - [ ] 2–3 pilot tables repeated on a schedule *(organizational; optional automation K2)*
-- [x] Cross-platform release binaries **published** (v0.2.0-beta.7: Linux x86_64/arm64, macOS arm64/Intel, Docker GHCR, Homebrew tap)
+- [x] Cross-platform release binaries **published** (v0.3.5: Linux x86_64/arm64, macOS arm64/Intel, Docker GHCR, Homebrew tap)
 - [x] E2E matrix in CI
 - [x] Published to crates.io (rivet-cli)

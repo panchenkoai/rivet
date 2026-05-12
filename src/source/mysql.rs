@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, BinaryBuilder, BooleanBuilder, Date32Builder, Float32Builder, Float64Builder,
-    Int16Builder, Int32Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
+    Array, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Decimal256Builder,
+    Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, StringBuilder,
+    Time64MicrosecondBuilder, TimestampMicrosecondBuilder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -15,6 +17,10 @@ use crate::plan::IncrementalCursorPlan;
 use crate::source::query::build_incremental_query;
 use crate::tuning::SourceTuning;
 use crate::types::CursorState;
+use crate::types::{
+    ColumnOverrides, META_FIDELITY, META_NATIVE_TYPE, RivetType, SourceColumn,
+    TimeUnit as RivetTimeUnit, TypeMapping, build_arrow_field,
+};
 
 pub struct MysqlSource {
     pool: Pool,
@@ -96,12 +102,17 @@ impl super::Source for MysqlSource {
         incremental: Option<&IncrementalCursorPlan>,
         cursor: Option<&CursorState>,
         tuning: &SourceTuning,
+        column_overrides: &ColumnOverrides,
         sink: &mut dyn super::BatchSink,
     ) -> Result<()> {
         let built = build_incremental_query(query, incremental, cursor, SourceType::Mysql);
         log::debug!("executing query: {}", built.sql);
 
         let mut conn = self.pool.get_conn()?;
+
+        // Roadmap §13: normalize TIMESTAMP columns to UTC so Parquet writes
+        // isAdjustedToUTC=true. SET per-connection (not global) to avoid side-effects.
+        conn.query_drop("SET time_zone = '+00:00'")?;
 
         if tuning.statement_timeout_s > 0 {
             conn.query_drop(format!(
@@ -119,8 +130,11 @@ impl super::Source for MysqlSource {
             None => conn.exec_iter(&built.sql, ())?,
         };
         let columns = result.columns().as_ref().to_vec();
-        let schema = Arc::new(mysql_columns_to_schema(&columns));
-        let arrow_types: Vec<DataType> = columns.iter().map(mysql_type_to_arrow).collect();
+
+        // Compute TypeMappings once; derive both the Arrow schema and the
+        // per-column DataType vec from the same source so they can never diverge.
+        let (schema, arrow_types) = mysql_schema_and_arrow_types(&columns, column_overrides);
+        let schema = Arc::new(schema);
 
         sink.on_schema(schema.clone())?;
 
@@ -186,53 +200,187 @@ impl super::Source for MysqlSource {
             None => Ok(None),
         }
     }
-}
 
-fn mysql_type_to_arrow(col: &mysql::Column) -> DataType {
-    use mysql::consts::ColumnType::*;
-    match col.column_type() {
-        MYSQL_TYPE_TINY | MYSQL_TYPE_SHORT => DataType::Int16,
-        MYSQL_TYPE_INT24 | MYSQL_TYPE_LONG => DataType::Int32,
-        MYSQL_TYPE_LONGLONG => DataType::Int64,
-        MYSQL_TYPE_FLOAT => DataType::Float32,
-        MYSQL_TYPE_DOUBLE => DataType::Float64,
-        MYSQL_TYPE_DECIMAL | MYSQL_TYPE_NEWDECIMAL => DataType::Utf8,
-        MYSQL_TYPE_VARCHAR
-        | MYSQL_TYPE_VAR_STRING
-        | MYSQL_TYPE_STRING
-        | MYSQL_TYPE_ENUM
-        | MYSQL_TYPE_SET => DataType::Utf8,
-        MYSQL_TYPE_JSON => DataType::Utf8,
-        MYSQL_TYPE_TINY_BLOB | MYSQL_TYPE_MEDIUM_BLOB | MYSQL_TYPE_LONG_BLOB | MYSQL_TYPE_BLOB => {
-            if col.character_set() == 63 {
-                DataType::Binary
-            } else {
-                DataType::Utf8
-            }
-        }
-        MYSQL_TYPE_DATE | MYSQL_TYPE_NEWDATE => DataType::Date32,
-        MYSQL_TYPE_DATETIME
-        | MYSQL_TYPE_DATETIME2
-        | MYSQL_TYPE_TIMESTAMP
-        | MYSQL_TYPE_TIMESTAMP2 => DataType::Timestamp(TimeUnit::Microsecond, None),
-        MYSQL_TYPE_BIT => DataType::Boolean,
-        MYSQL_TYPE_YEAR => DataType::Int16,
-        _ => {
-            log::warn!(
-                "unmapped MySQL type {:?}, falling back to Utf8",
-                col.column_type()
-            );
-            DataType::Utf8
-        }
+    fn type_mappings(
+        &mut self,
+        query: &str,
+        column_overrides: &ColumnOverrides,
+    ) -> Result<Vec<crate::types::TypeMapping>> {
+        use mysql::prelude::*;
+        let wrapped = format!("SELECT * FROM ({}) AS _rivet_type_probe LIMIT 0", query);
+        let mut conn = self.pool.get_conn()?;
+        let result = conn.exec_iter(&wrapped, ())?;
+        let columns = result.columns().as_ref().to_vec();
+        drop(result);
+        let mappings = columns
+            .iter()
+            .map(|col| {
+                let rivet = column_overrides
+                    .get(col.name_str().as_ref())
+                    .cloned()
+                    .unwrap_or_else(|| mysql_type_to_rivet(col));
+                let source = crate::types::SourceColumn::simple(
+                    col.name_str().as_ref(),
+                    mysql_native_type_name(col),
+                    true,
+                );
+                crate::types::TypeMapping::from_source(&source, rivet)
+            })
+            .collect();
+        Ok(mappings)
     }
 }
 
-fn mysql_columns_to_schema(columns: &[mysql::Column]) -> Schema {
-    let fields: Vec<Field> = columns
-        .iter()
-        .map(|col| Field::new(col.name_str().to_string(), mysql_type_to_arrow(col), true))
-        .collect();
-    Schema::new(fields)
+/// Human-readable MySQL type name for error messages and Arrow metadata.
+fn mysql_native_type_name(col: &mysql::Column) -> &'static str {
+    use mysql::consts::ColumnType::*;
+    match col.column_type() {
+        MYSQL_TYPE_TINY => "tinyint",
+        MYSQL_TYPE_SHORT => "smallint",
+        MYSQL_TYPE_INT24 | MYSQL_TYPE_LONG => "int",
+        MYSQL_TYPE_LONGLONG => "bigint",
+        MYSQL_TYPE_FLOAT => "float",
+        MYSQL_TYPE_DOUBLE => "double",
+        MYSQL_TYPE_DECIMAL | MYSQL_TYPE_NEWDECIMAL => "decimal",
+        MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING => "varchar",
+        MYSQL_TYPE_ENUM => "enum",
+        MYSQL_TYPE_SET => "set",
+        MYSQL_TYPE_JSON => "json",
+        MYSQL_TYPE_TINY_BLOB | MYSQL_TYPE_MEDIUM_BLOB | MYSQL_TYPE_LONG_BLOB | MYSQL_TYPE_BLOB => {
+            "blob"
+        }
+        MYSQL_TYPE_DATE | MYSQL_TYPE_NEWDATE => "date",
+        MYSQL_TYPE_TIME | MYSQL_TYPE_TIME2 => "time",
+        MYSQL_TYPE_DATETIME | MYSQL_TYPE_DATETIME2 => "datetime",
+        MYSQL_TYPE_TIMESTAMP | MYSQL_TYPE_TIMESTAMP2 => "timestamp",
+        MYSQL_TYPE_BIT => "bit",
+        MYSQL_TYPE_YEAR => "year",
+        _ => "unknown",
+    }
+}
+
+/// Map a MySQL column descriptor to Rivet's canonical type.
+///
+/// Key decisions vs. the old `mysql_type_to_arrow`:
+/// - `DECIMAL/NEWDECIMAL` → `Unsupported` (roadmap §12: no silent float fallback;
+///   requires column override or `type_policy.decimal.unbounded`).
+/// - `TIMESTAMP/TIMESTAMP2` → `Timestamp { timezone: Some("UTC") }` (roadmap §13:
+///   MySQL TIMESTAMP is stored as UTC and session tz must be set to +00:00).
+/// - `JSON` → `RivetType::Json` so `build_arrow_field` attaches logical-type metadata.
+/// - `ENUM`/`SET` → `RivetType::String` (Utf8, matching prior behavior).
+/// - `BIT` → `RivetType::Bool` (matching prior behavior; policy-configurable later).
+fn mysql_type_to_rivet(col: &mysql::Column) -> RivetType {
+    use mysql::consts::ColumnType::*;
+    match col.column_type() {
+        MYSQL_TYPE_TINY | MYSQL_TYPE_SHORT => RivetType::Int16,
+        MYSQL_TYPE_INT24 | MYSQL_TYPE_LONG => RivetType::Int32,
+        MYSQL_TYPE_LONGLONG => RivetType::Int64,
+        MYSQL_TYPE_FLOAT => RivetType::Float32,
+        MYSQL_TYPE_DOUBLE => RivetType::Float64,
+
+        // MySQL DECIMAL carries precision/scale but the mysql crate does not
+        // expose them on `Column` — only the OID-equivalent `column_type()` is
+        // available at this layer. Roadmap §12 forbids silent float conversion,
+        // so we mark this Unsupported until a column override supplies p/s.
+        MYSQL_TYPE_DECIMAL | MYSQL_TYPE_NEWDECIMAL => RivetType::Unsupported {
+            native_type: "decimal".into(),
+            reason: "precision/scale unavailable from MySQL column metadata; \
+                     add a column override (columns: amount: decimal(18,2)) \
+                     or configure type_policy.decimal.unbounded"
+                .into(),
+        },
+
+        MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING => RivetType::String,
+        // M6: ENUM/SET → Utf8 + metadata logical=enum (roadmap §15).
+        MYSQL_TYPE_ENUM | MYSQL_TYPE_SET => RivetType::Enum,
+        MYSQL_TYPE_JSON => RivetType::Json,
+
+        MYSQL_TYPE_TINY_BLOB | MYSQL_TYPE_MEDIUM_BLOB | MYSQL_TYPE_LONG_BLOB | MYSQL_TYPE_BLOB => {
+            // charset 63 = binary; everything else is a text blob.
+            if col.character_set() == 63 {
+                RivetType::Binary
+            } else {
+                RivetType::Text
+            }
+        }
+
+        MYSQL_TYPE_DATE | MYSQL_TYPE_NEWDATE => RivetType::Date,
+
+        MYSQL_TYPE_TIME | MYSQL_TYPE_TIME2 => RivetType::Time {
+            unit: RivetTimeUnit::Microsecond,
+        },
+
+        // MySQL DATETIME has no timezone; stored as local/wall-clock time.
+        MYSQL_TYPE_DATETIME | MYSQL_TYPE_DATETIME2 => RivetType::Timestamp {
+            unit: RivetTimeUnit::Microsecond,
+            timezone: None,
+        },
+        // Roadmap §13: MySQL TIMESTAMP is always stored as UTC.
+        // The driver must issue `SET time_zone = '+00:00'` before the query
+        // (Chunk 4 / TypePolicy will enforce this; for now callers are responsible).
+        MYSQL_TYPE_TIMESTAMP | MYSQL_TYPE_TIMESTAMP2 => RivetType::Timestamp {
+            unit: RivetTimeUnit::Microsecond,
+            timezone: Some("UTC".into()),
+        },
+
+        MYSQL_TYPE_BIT => RivetType::Bool,
+        MYSQL_TYPE_YEAR => RivetType::Int16,
+
+        _ => RivetType::Unsupported {
+            native_type: mysql_native_type_name(col).to_string(),
+            reason: "no Rivet mapping for this MySQL type".into(),
+        },
+    }
+}
+
+/// Build an Arrow `Schema` and a parallel `Vec<DataType>` from MySQL column
+/// descriptors. Both are derived from the same `TypeMapping` slice so the
+/// schema field type and the array type used in `build_array` are always
+/// identical — mismatches would cause `RecordBatch::try_new` to panic.
+///
+/// `column_overrides` takes priority over autodetection.
+fn mysql_schema_and_arrow_types(
+    columns: &[mysql::Column],
+    column_overrides: &ColumnOverrides,
+) -> (Schema, Vec<DataType>) {
+    let mut fields: Vec<Field> = Vec::with_capacity(columns.len());
+    let mut arrow_types: Vec<DataType> = Vec::with_capacity(columns.len());
+
+    for col in columns {
+        let native = mysql_native_type_name(col);
+        let rivet = column_overrides
+            .get(col.name_str().as_ref())
+            .cloned()
+            .unwrap_or_else(|| mysql_type_to_rivet(col));
+        let source = SourceColumn::simple(col.name_str().to_string(), native, true);
+        let mapping = TypeMapping::from_source(&source, rivet);
+
+        match (build_arrow_field(&mapping), mapping.arrow_type) {
+            (Some(field), Some(dt)) => {
+                fields.push(field);
+                arrow_types.push(dt);
+            }
+            _ => {
+                log::warn!(
+                    "column '{}': MySQL type '{}' has no safe Rivet mapping — \
+                     exporting as Utf8 (configure type_policy or add a column \
+                     override to suppress this warning)",
+                    col.name_str(),
+                    native
+                );
+                let mut meta = HashMap::new();
+                meta.insert(META_NATIVE_TYPE.to_string(), native.to_string());
+                meta.insert(META_FIDELITY.to_string(), "unsupported".to_string());
+                fields.push(
+                    Field::new(col.name_str().to_string(), DataType::Utf8, true)
+                        .with_metadata(meta),
+                );
+                arrow_types.push(DataType::Utf8);
+            }
+        }
+    }
+
+    (Schema::new(fields), arrow_types)
 }
 
 fn rows_to_record_batch_typed(
@@ -249,6 +397,31 @@ fn rows_to_record_batch_typed(
 
 fn bytes_to_str(b: &[u8]) -> Option<&str> {
     std::str::from_utf8(b).ok()
+}
+
+/// Parse MySQL text-protocol TIME string ("HH:MM:SS", "-HHH:MM:SS", "HH:MM:SS.uuuuuu")
+/// into microseconds since midnight. Negative values are allowed.
+fn parse_time_str_to_micros(s: &str) -> Option<i64> {
+    let (neg, rest) = if let Some(r) = s.strip_prefix('-') {
+        (true, r)
+    } else {
+        (false, s)
+    };
+    let (hms, us_part) = if let Some(pos) = rest.find('.') {
+        let us_str = &rest[pos + 1..];
+        let us_digits = us_str.len().min(6);
+        let us = us_str[..us_digits].parse::<i64>().ok()?;
+        let scale = 10i64.pow((6 - us_digits) as u32);
+        (&rest[..pos], us * scale)
+    } else {
+        (rest, 0i64)
+    };
+    let mut parts = hms.splitn(3, ':');
+    let h: i64 = parts.next()?.parse().ok()?;
+    let m: i64 = parts.next()?.parse().ok()?;
+    let s: i64 = parts.next()?.parse().ok()?;
+    let total = (h * 3_600 + m * 60 + s) * 1_000_000 + us_part;
+    Some(if neg { -total } else { total })
 }
 
 fn build_array(
@@ -378,6 +551,33 @@ fn build_array(
             }
             Ok(Arc::new(b.finish()))
         }
+        DataType::Time64(TimeUnit::Microsecond) => {
+            let mut b = Time64MicrosecondBuilder::with_capacity(rows.len());
+            for row in rows {
+                match row.as_ref(col_idx) {
+                    // MySQL wire protocol delivers TIME as Value::Time(neg, days, h, m, s, us)
+                    Some(Value::Time(neg, days, h, m, s, us)) => {
+                        let total_us = (*days as i64 * 86_400
+                            + *h as i64 * 3_600
+                            + *m as i64 * 60
+                            + *s as i64)
+                            * 1_000_000
+                            + *us as i64;
+                        b.append_value(if *neg { -total_us } else { total_us });
+                    }
+                    Some(Value::Bytes(bv)) => {
+                        // text-protocol fallback: "HH:MM:SS" or "HHH:MM:SS.uuuuuu"
+                        if let Some(us) = bytes_to_str(bv).and_then(parse_time_str_to_micros) {
+                            b.append_value(us);
+                        } else {
+                            b.append_null();
+                        }
+                    }
+                    _ => b.append_null(),
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
         DataType::Date32 => {
             let mut b = Date32Builder::with_capacity(rows.len());
             for row in rows {
@@ -405,7 +605,11 @@ fn build_array(
             }
             Ok(Arc::new(b.finish()))
         }
-        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+        // Both DATETIME (tz=None) and TIMESTAMP (tz=Some("UTC")) share the
+        // same physical i64 microsecond values. The timezone tag on the array
+        // type is what distinguishes them in the Arrow / Parquet schema.
+        DataType::Timestamp(TimeUnit::Microsecond, tz) => {
+            let tz_tag = tz.clone();
             let mut b = TimestampMicrosecondBuilder::with_capacity(rows.len());
             for row in rows {
                 let dt = match row.as_ref(col_idx) {
@@ -423,8 +627,17 @@ fn build_array(
                     None => b.append_null(),
                 }
             }
-            Ok(Arc::new(b.finish()))
+            let arr = b.finish();
+            // Roadmap §13: attach the UTC timezone tag so Parquet writes
+            // TIMESTAMP_MICROS(isAdjustedToUTC=true) for TIMESTAMP columns.
+            match tz_tag {
+                Some(tz_str) => Ok(Arc::new(arr.with_timezone(tz_str.as_ref()))),
+                None => Ok(Arc::new(arr)),
+            }
         }
+        // Exact decimal path: column override declared decimal(p,s) for a MySQL DECIMAL column.
+        DataType::Decimal128(p, s) => mysql_decimal_to_decimal128(*p, *s, col_idx, rows),
+        DataType::Decimal256(p, s) => mysql_decimal_to_decimal256(*p, *s, col_idx, rows),
         _ => {
             log::warn!(
                 "unhandled Arrow type {:?} for MySQL, writing nulls",
@@ -437,4 +650,71 @@ fn build_array(
             Ok(Arc::new(b.finish()))
         }
     }
+}
+
+/// Build a `Decimal128Array` from MySQL DECIMAL column bytes (text protocol).
+fn mysql_decimal_to_decimal128(
+    precision: u8,
+    scale: i8,
+    col_idx: usize,
+    rows: &[mysql::Row],
+) -> Result<Arc<dyn Array>> {
+    use crate::types::decimal::decimal_str_to_scaled_i128;
+    let mut b = Decimal128Builder::with_capacity(rows.len());
+    for row in rows {
+        match row.as_ref(col_idx) {
+            Some(Value::Bytes(bv)) => {
+                let s = bytes_to_str(bv).unwrap_or("");
+                match decimal_str_to_scaled_i128(s, scale) {
+                    Some(v) => b.append_value(v),
+                    None => {
+                        return Err(anyhow::anyhow!(
+                            "cannot parse '{}' as decimal({},{})",
+                            s,
+                            precision,
+                            scale
+                        ));
+                    }
+                }
+            }
+            _ => b.append_null(),
+        }
+    }
+    Ok(Arc::new(
+        b.finish().with_precision_and_scale(precision, scale)?,
+    ))
+}
+
+/// Build a `Decimal256Array` for precision > 38.
+fn mysql_decimal_to_decimal256(
+    precision: u8,
+    scale: i8,
+    col_idx: usize,
+    rows: &[mysql::Row],
+) -> Result<Arc<dyn Array>> {
+    use crate::types::decimal::decimal_str_to_scaled_i128;
+    use arrow::datatypes::i256;
+    let mut b = Decimal256Builder::with_capacity(rows.len());
+    for row in rows {
+        match row.as_ref(col_idx) {
+            Some(Value::Bytes(bv)) => {
+                let s = bytes_to_str(bv).unwrap_or("");
+                match decimal_str_to_scaled_i128(s, scale) {
+                    Some(v) => b.append_value(i256::from_i128(v)),
+                    None => {
+                        return Err(anyhow::anyhow!(
+                            "cannot parse '{}' as decimal({},{})",
+                            s,
+                            precision,
+                            scale
+                        ));
+                    }
+                }
+            }
+            _ => b.append_null(),
+        }
+    }
+    Ok(Arc::new(
+        b.finish().with_precision_and_scale(precision, scale)?,
+    ))
 }

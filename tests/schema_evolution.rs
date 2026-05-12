@@ -175,6 +175,8 @@ fn schema_updated_after_change_detected() {
 
     let v2 = cols(&[("id", "Int64"), ("name", "Utf8")]);
     s.detect_schema_change("t", &v2).unwrap();
+    // Caller must explicitly accept the new schema (simulate warn/continue policy)
+    s.store_schema("t", &v2).unwrap();
 
     // Third run with v2 should show no change (schema was updated)
     let change = s.detect_schema_change("t", &v2).unwrap();

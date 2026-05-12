@@ -9,6 +9,7 @@ mod metrics;
 mod progression;
 mod run_aggregate;
 mod schema;
+mod shape;
 
 // Re-export domain types so callers use `rivet::state::*` unchanged.
 // Items below may not be explicitly named by all internal callers (often used
@@ -25,6 +26,8 @@ pub use progression::{Boundary, ExportProgression};
 pub use run_aggregate::{RunAggregate, RunAggregateEntry};
 #[allow(unused_imports)]
 pub use schema::{SchemaChange, SchemaColumn};
+#[allow(unused_imports)]
+pub use shape::ShapeWarning;
 
 const STATE_DB_NAME: &str = ".rivet_state.db";
 
@@ -155,6 +158,19 @@ const MIGRATIONS: &[(i64, &str)] = &[
         );
         CREATE INDEX IF NOT EXISTS idx_run_aggregate_finished
             ON run_aggregate(finished_at DESC);",
+    ),
+    // v6: per-column data shape stats — tracks max observed byte length for
+    // string/binary columns across runs to surface widening text payloads
+    // that wouldn't be caught by structural schema drift detection (Epic 8).
+    (
+        6,
+        "CREATE TABLE IF NOT EXISTS export_shape (
+            export_name TEXT NOT NULL,
+            column_name TEXT NOT NULL,
+            max_byte_len INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (export_name, column_name)
+        );",
     ),
 ];
 

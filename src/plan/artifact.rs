@@ -368,6 +368,9 @@ mod tests {
                 tuning: None,
                 tls: None,
             },
+            column_overrides: Default::default(),
+            schema_drift_policy: Default::default(),
+            shape_drift_warn_factor: 2.0,
         }
     }
 

@@ -75,6 +75,18 @@ enum Commands {
         /// Query parameter: key=value (repeatable, substitutes ${key} in queries)
         #[arg(short, long = "param", value_name = "KEY=VALUE")]
         params: Vec<String>,
+        /// Show per-column type fidelity report (source type → Rivet type → Arrow type)
+        #[arg(long)]
+        type_report: bool,
+        /// Fail with non-zero exit code if any column has an unsafe type mapping
+        #[arg(long)]
+        strict: bool,
+        /// Output type report as JSON (implies --type-report)
+        #[arg(long)]
+        json: bool,
+        /// Check compatibility against a target warehouse (e.g. bigquery)
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
     },
     /// Verify source and destination auth before running exports
     Doctor {
@@ -363,10 +375,25 @@ fn main() -> Result<()> {
             config,
             export,
             params,
+            type_report,
+            strict,
+            json,
+            target,
         } => {
             let p = parse_params(&params);
             let p = if p.is_empty() { None } else { Some(p) };
-            preflight::check(&config, export.as_deref(), p.as_ref())?;
+            let tgt = target
+                .as_deref()
+                .and_then(crate::types::target::ExportTarget::from_str);
+            preflight::check(
+                &config,
+                export.as_deref(),
+                p.as_ref(),
+                type_report || json || tgt.is_some(),
+                strict,
+                json,
+                tgt,
+            )?;
         }
         Commands::Doctor { config } => {
             preflight::doctor(&config)?;

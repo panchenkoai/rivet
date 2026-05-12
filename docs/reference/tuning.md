@@ -140,3 +140,47 @@ source:
     statement_timeout_s: 60
     memory_threshold_mb: 512
 ```
+
+---
+
+## Capacity and memory planning
+
+### Peak RSS formula
+
+```
+peak_rss ≈ batch_size × avg_row_bytes × parallel_workers
+```
+
+Add ~50–150 MB overhead for the Tokio runtime, the source connection pool, jemalloc bookkeeping, and the OS page cache on the temp file.
+
+### Rule of thumb by table width
+
+| Table type | Avg row bytes | Recommended batch_size | Expected peak RSS |
+|---|---|---|---|
+| Narrow (IDs, timestamps, small text) | ~100 B | 50 000–100 000 | ~50–200 MB |
+| Medium (mixed text, JSON) | ~1 KB | 10 000–25 000 | ~50–250 MB |
+| Wide (TEXT/JSONB payloads ≥ 10 KB avg) | ~10 KB | 500–2 000 | ~50–200 MB |
+
+Use the `safe` profile for wide tables — it caps `batch_size` at 500 automatically.
+
+### How `memory_threshold_mb` works
+
+When `tuning.memory_threshold_mb` is set, Rivet samples RSS after each batch (via `mach_task_basic_info` on macOS, `/proc/self/statm` on Linux). If RSS exceeds the threshold, fetching pauses until RSS drops below 80 % of the limit. This prevents OOM on tables with highly variable row widths.
+
+```yaml
+source:
+  tuning:
+    memory_threshold_mb: 1024   # pause fetching above 1 GB RSS
+```
+
+The guard adds ~1–2 ms of overhead per batch from the RSS syscall; it is zero-overhead when unset.
+
+### Parallelism and source capacity
+
+Each parallel chunk worker opens its own source connection. Postgres `max_connections` is typically 100–200 for shared instances and 20–50 for read replicas. `rivet check` warns when `parallel >= max_connections`.
+
+Safe upper bound: `parallel ≤ max_connections / 4` to leave headroom for application traffic.
+
+### Per-export memory isolation
+
+`--parallel-export-processes` spawns one OS process per export — each export has its own allocator and heap, so peak RSS is per-export rather than aggregate. Use this mode when running many wide-table exports at once on memory-constrained hosts.

@@ -13,6 +13,7 @@ use super::journal::RunEvent;
 use super::retry::classify_error;
 use super::sink::{CompletedPart, ExportSink, extract_last_cursor_value};
 use super::validate::validate_output;
+use crate::config::SchemaDriftPolicy;
 use crate::error::Result;
 use crate::plan::{ExtractionStrategy, ResolvedRunPlan};
 use crate::source::{self, Source};
@@ -160,6 +161,7 @@ pub(super) fn run_single_export(
         plan.strategy.incremental_plan(),
         cursor,
         &plan.tuning,
+        &plan.column_overrides,
         &mut sink,
     )?;
 
@@ -354,26 +356,110 @@ pub(super) fn run_single_export(
         match st.detect_schema_change(&plan.export_name, &columns) {
             Ok(Some(change)) => {
                 summary.schema_changed = Some(true);
-                log::warn!("export '{}': schema changed!", plan.export_name);
-                if !change.added.is_empty() {
-                    log::warn!("  added columns: {}", change.added.join(", "));
-                }
-                if !change.removed.is_empty() {
-                    log::warn!("  removed columns: {}", change.removed.join(", "));
-                }
-                for (col, old, new) in &change.type_changed {
-                    log::warn!("  type changed: {} ({} -> {})", col, old, new);
-                }
                 summary.journal.record(RunEvent::SchemaChanged {
                     added: change.added.clone(),
                     removed: change.removed.clone(),
                     type_changed: change.type_changed.clone(),
                 });
+
+                match plan.schema_drift_policy {
+                    SchemaDriftPolicy::Continue => {
+                        if let Err(e) = st.store_schema(&plan.export_name, &columns) {
+                            log::warn!(
+                                "export '{}': schema store update failed: {:#}",
+                                plan.export_name,
+                                e
+                            );
+                        }
+                    }
+                    SchemaDriftPolicy::Warn => {
+                        log::warn!("export '{}': schema changed!", plan.export_name);
+                        if !change.added.is_empty() {
+                            log::warn!("  added: {}", change.added.join(", "));
+                        }
+                        if !change.removed.is_empty() {
+                            log::warn!("  removed: {}", change.removed.join(", "));
+                        }
+                        for (col, old, new) in &change.type_changed {
+                            log::warn!("  type changed: {} ({} → {})", col, old, new);
+                        }
+                        if let Err(e) = st.store_schema(&plan.export_name, &columns) {
+                            log::warn!(
+                                "export '{}': schema store update failed: {:#}",
+                                plan.export_name,
+                                e
+                            );
+                        }
+                    }
+                    SchemaDriftPolicy::Fail => {
+                        log::error!(
+                            "export '{}': schema drift detected — aborting (on_schema_drift: fail)",
+                            plan.export_name
+                        );
+                        if !change.added.is_empty() {
+                            log::error!("  added: {}", change.added.join(", "));
+                        }
+                        if !change.removed.is_empty() {
+                            log::error!("  removed: {}", change.removed.join(", "));
+                        }
+                        for (col, old, new) in &change.type_changed {
+                            log::error!("  type changed: {} ({} → {})", col, old, new);
+                        }
+                        return Err(anyhow::anyhow!(
+                            "schema drift detected for export '{}': \
+                             {} column(s) added, {} removed, {} retyped — \
+                             set `on_schema_drift: warn` to accept, or fix the schema mismatch",
+                            plan.export_name,
+                            change.added.len(),
+                            change.removed.len(),
+                            change.type_changed.len()
+                        ));
+                    }
+                }
             }
             Ok(None) => {
                 summary.schema_changed = Some(false);
             }
             Err(e) => log::warn!("schema tracking error: {:#}", e),
+        }
+    }
+
+    // Epic 8: data shape drift — warn when string/binary columns grow beyond threshold.
+    if plan.shape_drift_warn_factor > 0.0
+        && !sink.column_max_bytes.is_empty()
+        && let Some(st) = state
+    {
+        match st.detect_shape_drift(
+            &plan.export_name,
+            &sink.column_max_bytes,
+            plan.shape_drift_warn_factor,
+        ) {
+            Ok(warnings) => {
+                for w in &warnings {
+                    log::warn!(
+                        "export '{}': shape drift in column '{}' — \
+                         max byte length grew {:.1}× ({} → {} bytes); \
+                         set `shape_drift_warn_factor` to a higher value to suppress",
+                        plan.export_name,
+                        w.column,
+                        w.growth_factor,
+                        w.stored_max_bytes,
+                        w.current_max_bytes,
+                    );
+                    summary.journal.record(RunEvent::Warning {
+                        context: format!("shape_drift:{}", w.column),
+                        message: format!(
+                            "column '{}' max byte length grew {:.1}× ({} → {} bytes)",
+                            w.column, w.growth_factor, w.stored_max_bytes, w.current_max_bytes
+                        ),
+                    });
+                }
+            }
+            Err(e) => log::warn!(
+                "export '{}': shape tracking error: {:#}",
+                plan.export_name,
+                e
+            ),
         }
     }
 

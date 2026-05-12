@@ -1,6 +1,6 @@
 //! Native database column metadata captured before mapping to a [`RivetType`].
 //!
-//! See `rivet_type_safety_roadmap.md` §6 ("Internal Type System"). The whole
+//! See `rivet_roadmap.md` §Epic 14 (type safety). §6 — Internal Type System.
 //! point of this struct is to keep *enough* native-DB metadata to make a
 //! lossless mapping decision later — in particular `precision` / `scale` for
 //! `numeric(p,s)` / `decimal(p,s)` — instead of going straight to
@@ -64,6 +64,7 @@ impl SourceColumn {
     }
 
     /// Convenience constructor for declared decimal columns.
+    #[allow(dead_code)]
     pub fn decimal(
         name: impl Into<String>,
         native_type: impl Into<String>,
@@ -89,6 +90,7 @@ impl SourceColumn {
 /// type came from autodetect or from an explicit override.
 ///
 /// Wired into the planning pipeline by Chunk 6.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ColumnOverride {
     /// Name of the column the override applies to (case-sensitive — matches

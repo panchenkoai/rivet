@@ -58,6 +58,12 @@ trait Source: Send {
         sink: &mut dyn BatchSink,
     ) -> Result<()>;
     fn query_scalar(&mut self, sql: &str) -> Result<Option<String>>;
+    // Returns column type mappings via a LIMIT-0 probe query (used by `rivet check --type-report`).
+    fn type_mappings(
+        &mut self,
+        query: &str,
+        column_overrides: &ColumnOverrides,
+    ) -> Result<Vec<TypeMapping>>;
 }
 
 // Sink receives schema and batches one at a time.
@@ -155,8 +161,18 @@ src/
     mod.rs, artifact.rs, inputs.rs, recommend.rs, prioritization.rs,
     campaign.rs, history.rs, reconcile.rs, repair.rs, validate.rs
 
-  preflight/              EXPLAIN analysis, verdicts, doctor
+  types/                  Canonical type system (roadmap §14 / M1–M6)
+    mod.rs                  Re-exports: RivetType, TypeMapping, TypeFidelity, ColumnOverrides
+    rivet_type.rs           RivetType enum (Bool, Int*, Float*, Decimal, Date, Time, Timestamp,
+                              String, Text, Binary, Json, Uuid, Enum, Interval, List{inner}, Unsupported)
+    mapping.rs              TypeMapping struct: source_native_type → RivetType → Arrow DataType + fidelity
+    policy.rs               TypePolicy (Fail/Warn/Allow per fidelity); PolicyViolation; `--strict` gate
+    target.rs               ExportTarget (BigQuery); TargetCompat (Ok/Warn/Fail); Arrow→BQ type mapping
+
+  preflight/              EXPLAIN analysis, verdicts, doctor, type reports
     mod.rs, analysis.rs, postgres.rs, mysql.rs, doctor.rs, cursor_expr.rs
+    type_report.rs          `rivet check --type-report`: collects TypeMappings, applies TypePolicy,
+                              checks ExportTarget compat, renders table or NDJSON
 
   state/                  SQLite-backed state store (schema v4)
     mod.rs, cursor.rs, manifest.rs, metrics.rs, checkpoint.rs,

@@ -1,6 +1,6 @@
 //! Type fidelity classification.
 //!
-//! See `rivet_type_safety_roadmap.md` §3 ("Type Fidelity Levels"). Every
+//! See `rivet_roadmap.md` §Epic 14. Type Fidelity Levels: Every
 //! source-column → Arrow mapping is tagged with one of these levels so the
 //! type policy and the type-report CLI can reason about what the user is
 //! actually getting on disk.
@@ -26,6 +26,8 @@ use serde::Serialize;
 /// downstream code (CLI report, strict-mode gate) can compare them with
 /// `PartialOrd` semantics:
 /// `Exact > Compatible > LogicalString > Lossy > Unsupported`.
+// `Lossy` and `is_unsafe_for_strict_mode` are used by TypePolicy (Chunk 4).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TypeFidelity {
@@ -58,7 +60,8 @@ impl TypeFidelity {
 
     /// True when the fidelity level is one that strict mode must reject
     /// without an explicit policy override (roadmap §7 "Strict mode
-    /// behavior").
+    /// behavior"). Used by TypePolicy (Chunk 4).
+    #[allow(dead_code)]
     pub fn is_unsafe_for_strict_mode(self) -> bool {
         matches!(self, TypeFidelity::Lossy | TypeFidelity::Unsupported)
     }

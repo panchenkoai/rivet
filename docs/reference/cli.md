@@ -275,6 +275,21 @@ rivet reconcile -c my_export.yaml -e orders --format json -o reconcile.json
 
 Reports are **advisory** — same policy as prioritization (ADR-0006) and plan artifacts (ADR-0005). They surface what needs repair; they do not re-export on their own.
 
+### Verification strategy tradeoffs
+
+Rivet has three verification mechanisms at different cost/precision tradeoffs:
+
+| Mechanism | What it checks | Cost | When to use |
+|---|---|---|---|
+| `rivet run --reconcile` | `COUNT(*)` source vs exported rows for the whole export | 1 extra query | Snapshot / incremental exports; cheap sanity check after every run |
+| `rivet reconcile` | Per-chunk `COUNT(*)` source vs stored chunk row counts | 1 query per chunk | Chunked exports with `chunk_checkpoint: true`; catches partial writes in individual chunks |
+| `rivet check --type-report` | Column type fidelity + warehouse compatibility | 1 LIMIT-0 probe | Before first export of a new table; after source schema changes |
+
+**Rule of thumb:**
+- Use `--reconcile` always for snapshot/incremental exports — cost is negligible.
+- Use `rivet reconcile` for chunked exports if data correctness is critical or the source is volatile.
+- Use `rivet repair` only when `rivet reconcile` surfaces mismatches — it re-exports only the flagged chunks.
+
 ---
 
 ## `rivet repair`
@@ -318,7 +333,7 @@ rivet repair -c my_export.yaml -e orders --report reconcile.json --execute
 
 ## `rivet check`
 
-Preflight analysis: diagnose source health, estimate row counts, check indexes, recommend tuning.
+Preflight analysis: diagnose source health, estimate row counts, check indexes, recommend tuning. With `--type-report`, also introspects column types and validates them against a target warehouse.
 
 ```bash
 rivet check --config <PATH> [OPTIONS]
@@ -329,12 +344,53 @@ rivet check --config <PATH> [OPTIONS]
 | `--config` | `-c` | string | Path to YAML config file **(required)** |
 | `--export` | `-e` | string | Check only a specific export |
 | `--param` | `-p` | KEY=VALUE | Query parameter (repeatable) |
+| `--type-report` | | bool | Run a type fidelity report: show each column's source type, Rivet type, Arrow type, and fidelity |
+| `--strict` | | bool | Exit non-zero if any column mapping is lossy or unsupported (use with `--type-report`) |
+| `--json` | | bool | Emit type report as newline-delimited JSON instead of a table |
+| `--target` | | string | Validate types against a warehouse target. Currently supported: `bigquery` |
 
-### Example
+### Examples
 
 ```bash
+# Standard preflight check
 rivet check -c my_export.yaml
+
+# Type fidelity report (human-readable table)
+rivet check -c my_export.yaml --type-report
+
+# Type report with BigQuery compatibility column
+rivet check -c my_export.yaml --type-report --target bigquery
+
+# Type report as JSON — pipe-friendly, one object per export
+rivet check -c my_export.yaml --type-report --json
+
+# Strict mode — exits 1 if any lossy or unsupported mapping exists
+rivet check -c my_export.yaml --type-report --strict
 ```
+
+### Type report output
+
+```
+Export: orders  [target: bigquery]
+
+  Column        Source type        Rivet type       Arrow type            Fidelity        Target type   Status
+  ----------    ----------------   ---------------  --------------------  --------------  -----------   ------
+  id            int4               int4             Int32                 exact           INT64         ok
+  amount        numeric(15,4)      decimal(15,4)    Decimal128(15, 4)     exact           NUMERIC       ok
+  created_at    timestamptz        timestamp_tz     Timestamp(us, UTC)    exact           TIMESTAMP     ok
+  metadata      jsonb              json             Utf8                  logical_string  STRING        ok ~
+  tags          text[]             list<text>       List(Utf8)            exact           REPEATED…     ok
+```
+
+Fidelity levels:
+
+| Level | Meaning |
+|---|---|
+| `exact` | Round-trips without loss |
+| `compatible` | Structurally compatible; minor representation difference |
+| `logical_string` | Serialized to STRING/text (no native Arrow type) |
+| `lossy` | Precision or range reduction |
+| `unsupported` | No mapping available; column is skipped |
 
 Output includes: table existence, estimated row count, index analysis, tuning recommendation.
 

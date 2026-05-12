@@ -1,6 +1,6 @@
 //! `RivetType` → `arrow::DataType` + Arrow metadata.
 //!
-//! See `rivet_type_safety_roadmap.md` §5 ("Type Mapping Pipeline") and §14
+//! See `rivet_roadmap.md` §Epic 14. §5 — Type Mapping Pipeline, §14 —
 //! ("Binary, UUID, JSON" — metadata example). This module is intentionally
 //! the *only* place where `RivetType` becomes an `arrow::DataType`. Source
 //! drivers must not poke at `arrow::DataType` directly any more — they
@@ -20,8 +20,9 @@
 
 use std::collections::HashMap;
 
-use arrow::datatypes::{DataType, Field, TimeUnit as ArrowTimeUnit};
+use arrow::datatypes::{DataType, Field, IntervalUnit, TimeUnit as ArrowTimeUnit};
 use serde::Serialize;
+use std::sync::Arc;
 
 use super::{RivetType, SourceColumn, TimeUnit, TypeFidelity};
 
@@ -94,6 +95,7 @@ impl TypeMapping {
     }
 
     /// Append a warning visible to the type-report and to logs.
+    #[allow(dead_code)]
     pub fn with_warning(mut self, msg: impl Into<String>) -> Self {
         self.warnings.push(msg.into());
         self
@@ -137,11 +139,24 @@ pub fn rivet_type_to_arrow(t: &RivetType) -> Option<DataType> {
         )),
         // Logical-string types: physical Arrow is Utf8; the metadata
         // attached by `build_arrow_field` records that the source meant
-        // something more specific (json/uuid).
-        RivetType::String | RivetType::Text | RivetType::Json | RivetType::Uuid => {
-            Some(DataType::Utf8)
-        }
+        // something more specific (json/uuid/enum).
+        RivetType::String
+        | RivetType::Text
+        | RivetType::Json
+        | RivetType::Uuid
+        | RivetType::Enum => Some(DataType::Utf8),
+
         RivetType::Binary => Some(DataType::Binary),
+
+        // Arrow IntervalMonthDayNano preserves all three PostgreSQL interval
+        // components: months (leap-safe), days, and sub-day nanoseconds.
+        RivetType::Interval => Some(DataType::Interval(IntervalUnit::MonthDayNano)),
+
+        // One-dimensional array: recursively resolve the inner element type.
+        // Returns None if the inner type itself is Unsupported.
+        RivetType::List { inner } => rivet_type_to_arrow(inner)
+            .map(|inner_dt| DataType::List(Arc::new(Field::new("item", inner_dt, true)))),
+
         RivetType::Unsupported { .. } => None,
     }
 }
@@ -198,6 +213,17 @@ pub fn derive_fidelity(t: &RivetType) -> TypeFidelity {
         // (object/array tree) are not — call it `logical_string`.
         RivetType::Json => TypeFidelity::LogicalString,
 
+        // Enum labels are text — value preserved, but native enum semantics
+        // (ordered labels, constraint) are not enforced in Arrow.
+        RivetType::Enum => TypeFidelity::Compatible,
+
+        // Interval: Arrow IntervalMonthDayNano preserves all three components
+        // exactly; downstream tools may interpret it differently.
+        RivetType::Interval => TypeFidelity::Compatible,
+
+        // List: Arrow List preserves element values; 1-D only currently.
+        RivetType::List { .. } => TypeFidelity::Compatible,
+
         RivetType::Unsupported { .. } => TypeFidelity::Unsupported,
     }
 }
@@ -229,6 +255,8 @@ fn logical_type_label(t: &RivetType) -> Option<&'static str> {
     match t {
         RivetType::Json => Some("json"),
         RivetType::Uuid => Some("uuid"),
+        RivetType::Enum => Some("enum"),
+        RivetType::Interval => Some("interval"),
         _ => None,
     }
 }

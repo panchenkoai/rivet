@@ -1,5 +1,65 @@
 # Changelog
 
+## Unreleased — Type Safety Layer (M1–M6)
+
+Type fidelity report, strict mode, BigQuery compatibility, and complex-type support for Postgres and MySQL.
+
+### `rivet check --type-report`
+
+New flags on `rivet check` surface the full type pipeline for every column in a query:
+
+- `--type-report` — prints a table: column name, source native type, Rivet type, Arrow type, and fidelity level.
+- `--strict` — exits non-zero if any column mapping is `lossy` or `unsupported`.
+- `--json` — emits the report as newline-delimited JSON (one object per export); pipe-friendly.
+- `--target bigquery` — adds two columns (`Target type`, `Status`) showing how each Arrow type maps into BigQuery (`NUMERIC`, `BIGNUMERIC`, `TIMESTAMP`, `REPEATED …`, etc.), with `ok` / `warn` / `fail` status and inline notes for edge cases (UINT64 overflow, near-limit BIGNUMERIC, negative scale, unsupported types).
+
+### Type fidelity levels
+
+| Level | Meaning |
+|---|---|
+| `exact` | Round-trips without loss |
+| `compatible` | Structurally compatible; minor representation difference |
+| `logical_string` | Serialized to STRING/text — no native Arrow type available |
+| `lossy` | Precision or range reduction |
+| `unsupported` | No mapping; column is skipped in Parquet output |
+
+### Column type overrides (`columns:`)
+
+New per-column override block in the export YAML. Lets you pin `decimal_precision` / `decimal_scale` when the inferred type is wider than needed (e.g. to fit inside BigQuery NUMERIC limits):
+
+```yaml
+exports:
+  - name: orders
+    columns:
+      amount:
+        decimal_precision: 15
+        decimal_scale: 4
+```
+
+Overrides are reflected in `--type-report` output and in the written Parquet files.
+
+### Complex types — Postgres and MySQL
+
+- **Enum columns** (`pg: enum`, `mysql: ENUM/SET`) — represented as `RivetType::Enum`, written as `Utf8` (Arrow `STRING`). Values are read via a universal `AnyAsString` `FromSql` adapter that accepts any OID.
+- **Interval** (`pg: INTERVAL`) — represented as `RivetType::Interval`, written as `IntervalMonthDayNano` (Arrow). The binary wire format (8-byte µs + 4-byte days + 4-byte months) is decoded via a custom `PgInterval` `FromSql` implementation. BigQuery compat: `INTERVAL` with `warn` (limited arithmetic support).
+- **Arrays / lists** (`pg: _text`, `_int8`, etc.) — represented as `RivetType::List { inner }`. Postgres array element type is detected via `Kind::Array(elem_type)` at connection time. Written as Arrow `List(inner_type)`. BigQuery compat: `REPEATED <inner>` with recursive status propagation.
+- **MySQL TIME/TIME2** — mapped to `RivetType::Time { unit: Microsecond }` and written as `Time64(Microsecond)`.
+
+### Architecture
+
+- New `src/types/` module: `RivetType`, `TypeMapping`, `TypeFidelity`, `ColumnOverrides`, `TypePolicy`, `ExportTarget`, `TargetCompat`.
+- `Source` trait gains `type_mappings(&mut self, query, overrides) -> Result<Vec<TypeMapping>>` — implemented by both `PostgresSource` (via `PREPARE` + column descriptions) and `MysqlSource` (via `LIMIT 0` probe).
+- New `src/preflight/type_report.rs`: `collect_report`, `print_table`, `print_json`.
+- MySQL `SET time_zone = '+00:00'` applied before each export to normalise timestamp output.
+
+### Compatibility
+
+- No YAML config changes required; `columns:` is optional.
+- Sequential and parallel export runs are unaffected.
+- Parquet output is unchanged unless `columns:` overrides are present.
+
+---
+
 ## 0.3.5 (2026-04-30)
 
 Polish release on top of 0.3.4: every multi-export mode (`--parallel-exports`

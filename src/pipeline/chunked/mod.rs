@@ -157,7 +157,14 @@ fn export_one_chunk_range(
     );
 
     let mut sink = ExportSink::new(plan)?;
-    src.export(&chunk_query, None, None, &plan.tuning, &mut sink)?;
+    src.export(
+        &chunk_query,
+        None,
+        None,
+        &plan.tuning,
+        &plan.column_overrides,
+        &mut sink,
+    )?;
     if let Some(w) = sink.writer.take() {
         w.finish()?;
     }
@@ -587,6 +594,7 @@ pub(super) fn run_chunked_parallel_checkpoint(
                                     None,
                                     None,
                                     &plan_w.tuning,
+                                    &plan_w.column_overrides,
                                     &mut sink,
                                 )?;
                                 if let Some(w) = sink.writer.take() {

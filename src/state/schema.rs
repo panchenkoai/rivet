@@ -61,6 +61,15 @@ impl StateStore {
         Ok(())
     }
 
+    /// Detect structural drift versus the stored snapshot.
+    ///
+    /// On the first run (no stored snapshot) the current schema is stored and
+    /// `Ok(None)` is returned. On subsequent runs a diff is computed and returned
+    /// as `Ok(Some(change))` when columns differ — but the stored snapshot is
+    /// **not** updated automatically. Callers must call [`store_schema`] explicitly
+    /// after deciding whether to accept the change (policy `warn`/`continue`) or
+    /// reject it (policy `fail`, which intentionally leaves the old snapshot so the
+    /// next run detects the same change again).
     pub fn detect_schema_change(
         &self,
         export_name: &str,
@@ -114,11 +123,10 @@ impl StateStore {
             type_changed,
         };
 
-        if !change.is_empty() {
-            self.store_schema(export_name, current)?;
-            Ok(Some(change))
-        } else {
+        if change.is_empty() {
             Ok(None)
+        } else {
+            Ok(Some(change))
         }
     }
 }
@@ -226,6 +234,76 @@ mod tests {
         assert_eq!(
             change.type_changed[0],
             ("price".into(), "Float64".into(), "Utf8".into())
+        );
+    }
+
+    #[test]
+    fn fail_policy_does_not_store_new_schema() {
+        let s = store();
+        let v1 = vec![SchemaColumn {
+            name: "id".into(),
+            data_type: "Int64".into(),
+        }];
+        s.detect_schema_change("t", &v1).unwrap();
+
+        let v2 = vec![
+            SchemaColumn {
+                name: "id".into(),
+                data_type: "Int64".into(),
+            },
+            SchemaColumn {
+                name: "new_col".into(),
+                data_type: "Utf8".into(),
+            },
+        ];
+        // detect — change is returned but we do NOT call store_schema (simulating Fail policy)
+        let change = s.detect_schema_change("t", &v2).unwrap().unwrap();
+        assert_eq!(change.added.len(), 1);
+
+        // Stored schema should still be v1
+        let stored = s.get_stored_schema("t").unwrap().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].name, "id");
+
+        // Next detect call sees the same change again
+        let change2 = s.detect_schema_change("t", &v2).unwrap().unwrap();
+        assert_eq!(
+            change2.added.len(),
+            1,
+            "fail policy must re-detect on next run"
+        );
+    }
+
+    #[test]
+    fn warn_policy_stores_new_schema_after_change() {
+        let s = store();
+        let v1 = vec![SchemaColumn {
+            name: "id".into(),
+            data_type: "Int64".into(),
+        }];
+        s.detect_schema_change("t", &v1).unwrap();
+
+        let v2 = vec![
+            SchemaColumn {
+                name: "id".into(),
+                data_type: "Int64".into(),
+            },
+            SchemaColumn {
+                name: "extra".into(),
+                data_type: "Utf8".into(),
+            },
+        ];
+        let change = s.detect_schema_change("t", &v2).unwrap().unwrap();
+        assert_eq!(change.added.len(), 1);
+
+        // Warn / Continue policy: explicitly store the new schema
+        s.store_schema("t", &v2).unwrap();
+
+        // Next run: no more change
+        let no_change = s.detect_schema_change("t", &v2).unwrap();
+        assert!(
+            no_change.is_none(),
+            "after store, same schema must produce no change"
         );
     }
 }

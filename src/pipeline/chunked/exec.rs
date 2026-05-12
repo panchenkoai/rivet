@@ -92,7 +92,14 @@ pub(crate) fn run_chunked_sequential(
         });
 
         let mut sink = ExportSink::new(plan)?;
-        src.export(&chunk_query, None, None, &plan.tuning, &mut sink)?;
+        src.export(
+            &chunk_query,
+            None,
+            None,
+            &plan.tuning,
+            &plan.column_overrides,
+            &mut sink,
+        )?;
         if let Some(w) = sink.writer.take() {
             w.finish()?;
         }
@@ -267,6 +274,7 @@ pub(crate) fn run_chunked_parallel(
                         None,
                         None,
                         &plan_for_worker.tuning,
+                        &plan_for_worker.column_overrides,
                         &mut sink,
                     )?;
                     if let Some(w) = sink.writer.take() {
