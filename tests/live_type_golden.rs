@@ -19,8 +19,10 @@ mod common;
 use std::path::Path;
 
 use arrow::array::types::{Decimal128Type, TimestampMicrosecondType};
-use arrow::array::{Array, AsArray, BinaryArray, RecordBatch, StringArray};
-use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+use arrow::array::{
+    Array, AsArray, BinaryArray, BooleanArray, Int16Array, Int64Array, RecordBatch, StringArray,
+};
+use arrow::datatypes::{DataType, IntervalUnit, SchemaRef, TimeUnit};
 use chrono::NaiveDateTime;
 use common::*;
 use mysql::prelude::*;
@@ -1180,4 +1182,327 @@ exports:
         let got = serde_json::from_str::<serde_json::Value>(attrs.value(row)).unwrap();
         assert_eq!(got, exp, "attrs row {}", row);
     }
+}
+
+// ── Full type-matrix: broad schema-coverage goldens ──────────────────────────
+
+/// Verifies that every Rivet-mapped Postgres type produces the correct Arrow
+/// DataType in Parquet: BOOL, INT2, INT4, REAL, DATE, TIME, INTERVAL, ENUM,
+/// TEXT[], INT[].  Row-level anchors confirm the boolean and int2 round-trips.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn pg_golden_full_type_matrix_schema_coverage() {
+    require_alive(LiveService::Postgres);
+
+    let enum_type = unique_name("rivet_status");
+    let table_name = unique_name("golden_full_pg");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        r#"
+        CREATE TYPE {enum_type} AS ENUM ('active', 'inactive', 'pending');
+        CREATE TABLE {table_name} (
+            id           BIGINT PRIMARY KEY,
+            flag         BOOLEAN,
+            int2_col     SMALLINT,
+            int4_col     INTEGER,
+            float4_col   REAL,
+            date_col     DATE,
+            time_col     TIME,
+            interval_col INTERVAL,
+            enum_col     {enum_type},
+            tags         TEXT[],
+            nums         INTEGER[]
+        );
+        INSERT INTO {table_name} VALUES
+          (1, TRUE,  32767,       2147483647,  3.14::real, '2024-03-15', '14:30:00.123456',  INTERVAL '1 year 2 months 3 days', 'active',   ARRAY['alpha','beta'], ARRAY[1,2,3]),
+          (2, FALSE, -32768,     -2147483648, -1.5::real,  '1970-01-01', '00:00:00',         INTERVAL '-1 year',                'inactive', ARRAY['gamma'],        ARRAY[42]),
+          (3, NULL,  NULL,        0,           0.0::real,  '2000-02-29', '23:59:59.999999',  INTERVAL '0',                      NULL,       ARRAY[]::text[],       NULL);
+        "#,
+    ))
+    .unwrap();
+
+    struct Cleanup(String, String);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Ok(mut c) = postgres::Client::connect(POSTGRES_URL, postgres::NoTls) {
+                let _ = c.execute(&format!("DROP TABLE IF EXISTS {} CASCADE", self.0), &[]);
+                let _ = c.execute(&format!("DROP TYPE IF EXISTS {} CASCADE", self.1), &[]);
+            }
+        }
+    }
+    let _guard = Cleanup(table_name.clone(), enum_type.clone());
+
+    let export_name = unique_name("golden_full_pg_run");
+    let out_dir = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        r#"
+source:
+  type: postgres
+  url: "{POSTGRES_URL}"
+exports:
+  - name: {export_name}
+    query: "SELECT * FROM {table_name} ORDER BY id"
+    mode: full
+    format: parquet
+    compression: zstd
+    destination:
+      type: local
+      path: {out_dir}
+"#,
+        out_dir = out_dir.path().display()
+    );
+    let cfg_path = write_config(&cfg_dir, &yaml);
+
+    let out = run_rivet_export(&cfg_path, &export_name);
+    assert!(
+        out.status.success(),
+        "pg full type matrix export: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let files = files_with_extension(out_dir.path(), "parquet");
+    assert_eq!(files.len(), 1);
+    let (schema, batches) = read_parquet_batches(&files[0]);
+
+    assert_eq!(
+        *schema.field_with_name("id").unwrap().data_type(),
+        DataType::Int64
+    );
+    assert_eq!(
+        *schema.field_with_name("flag").unwrap().data_type(),
+        DataType::Boolean
+    );
+    assert_eq!(
+        *schema.field_with_name("int2_col").unwrap().data_type(),
+        DataType::Int16
+    );
+    assert_eq!(
+        *schema.field_with_name("int4_col").unwrap().data_type(),
+        DataType::Int32
+    );
+    assert_eq!(
+        *schema.field_with_name("float4_col").unwrap().data_type(),
+        DataType::Float32
+    );
+    assert_eq!(
+        *schema.field_with_name("date_col").unwrap().data_type(),
+        DataType::Date32
+    );
+    assert_eq!(
+        *schema.field_with_name("time_col").unwrap().data_type(),
+        DataType::Time64(TimeUnit::Microsecond)
+    );
+    assert_eq!(
+        *schema.field_with_name("interval_col").unwrap().data_type(),
+        DataType::Interval(IntervalUnit::MonthDayNano)
+    );
+    assert_eq!(
+        *schema.field_with_name("enum_col").unwrap().data_type(),
+        DataType::Utf8
+    );
+    match schema.field_with_name("tags").unwrap().data_type() {
+        DataType::List(f) => assert_eq!(f.data_type(), &DataType::Utf8, "tags inner type"),
+        dt => panic!("tags: expected List<Utf8>, got {dt:?}"),
+    }
+    match schema.field_with_name("nums").unwrap().data_type() {
+        DataType::List(f) => assert_eq!(f.data_type(), &DataType::Int32, "nums inner type"),
+        dt => panic!("nums: expected List<Int32>, got {dt:?}"),
+    }
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3, "expected 3 rows");
+
+    let b = batches.first().unwrap();
+
+    let flags = b
+        .column_by_name("flag")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap();
+    assert!(flags.value(0), "flag[0] must be true");
+    assert!(!flags.value(1), "flag[1] must be false");
+    assert!(flags.is_null(2), "flag[2] must be null");
+
+    let int2s = b
+        .column_by_name("int2_col")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int16Array>()
+        .unwrap();
+    assert_eq!(int2s.value(0), 32767_i16);
+    assert_eq!(int2s.value(1), -32768_i16);
+    assert!(int2s.is_null(2), "int2_col[2] must be null");
+}
+
+/// Verifies that every Rivet-mapped MySQL type produces the correct Arrow
+/// DataType in Parquet: BOOLEAN/TINYINT(1), BIT(1), BIT(8), TINYINT,
+/// DATE, TIME(6), YEAR, ENUM, VARBINARY, BLOB.  Row-level anchors confirm
+/// the boolean and BIT byte-decoding round-trips.
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn mysql_golden_full_type_matrix_schema_coverage() {
+    require_alive(LiveService::Mysql);
+
+    let table_name = unique_name("golden_full_my");
+    let mut c = mysql_connect();
+    c.query_drop(format!(
+        r#"CREATE TABLE {table_name} (
+            id            BIGINT PRIMARY KEY,
+            flag          BOOLEAN,
+            bit1_col      BIT(1),
+            bit8_col      BIT(8),
+            tiny_col      TINYINT,
+            date_col      DATE,
+            time_col      TIME(6),
+            year_col      YEAR,
+            enum_col      ENUM('a', 'b', 'c'),
+            varbinary_col VARBINARY(4),
+            blob_col      BLOB
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"#,
+    ))
+    .unwrap();
+    c.query_drop(format!(
+        r#"INSERT INTO {table_name}
+            (id, flag, bit1_col, bit8_col, tiny_col, date_col, time_col, year_col, enum_col, varbinary_col, blob_col)
+           VALUES
+            (1, TRUE,  b'1', b'10101010',  127, '2024-03-15', '14:30:00.123456', 2024, 'b', 0xDEADBEEF, 0x0102030405),
+            (2, FALSE, b'0', b'00000001', -128, '1970-01-01', '00:00:00.000000', 2000, 'a', 0x00000000, 0xCAFE),
+            (3, NULL,  NULL, NULL,           0, '2000-02-29', '23:59:59.999999', NULL, NULL, NULL,       NULL)"#,
+    ))
+    .unwrap();
+    let _guard = MysqlCleanup(table_name.clone());
+
+    let export_name = unique_name("golden_full_my_run");
+    let out_dir = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        r#"
+source:
+  type: mysql
+  url: "{MYSQL_URL}"
+exports:
+  - name: {export_name}
+    query: "SELECT * FROM {table_name} ORDER BY id"
+    mode: full
+    format: parquet
+    compression: zstd
+    destination:
+      type: local
+      path: {out_dir}
+"#,
+        out_dir = out_dir.path().display()
+    );
+    let cfg_path = write_config(&cfg_dir, &yaml);
+
+    let out = run_rivet_export(&cfg_path, &export_name);
+    assert!(
+        out.status.success(),
+        "mysql full type matrix export: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let files = files_with_extension(out_dir.path(), "parquet");
+    assert_eq!(files.len(), 1);
+    let (schema, batches) = read_parquet_batches(&files[0]);
+
+    assert_eq!(
+        *schema.field_with_name("id").unwrap().data_type(),
+        DataType::Int64
+    );
+    assert_eq!(
+        *schema.field_with_name("flag").unwrap().data_type(),
+        DataType::Boolean,
+        "BOOLEAN/TINYINT(1) must map to Boolean"
+    );
+    assert_eq!(
+        *schema.field_with_name("bit1_col").unwrap().data_type(),
+        DataType::Boolean,
+        "BIT(1) must map to Boolean"
+    );
+    assert_eq!(
+        *schema.field_with_name("bit8_col").unwrap().data_type(),
+        DataType::Int64,
+        "BIT(8) must map to Int64"
+    );
+    assert_eq!(
+        *schema.field_with_name("tiny_col").unwrap().data_type(),
+        DataType::Int16,
+        "TINYINT must map to Int16"
+    );
+    assert_eq!(
+        *schema.field_with_name("date_col").unwrap().data_type(),
+        DataType::Date32
+    );
+    assert_eq!(
+        *schema.field_with_name("time_col").unwrap().data_type(),
+        DataType::Time64(TimeUnit::Microsecond)
+    );
+    assert_eq!(
+        *schema.field_with_name("year_col").unwrap().data_type(),
+        DataType::Int16,
+        "YEAR must map to Int16"
+    );
+    assert_eq!(
+        *schema.field_with_name("enum_col").unwrap().data_type(),
+        DataType::Utf8,
+        "ENUM must map to Utf8"
+    );
+    assert_eq!(
+        *schema.field_with_name("varbinary_col").unwrap().data_type(),
+        DataType::Binary,
+        "VARBINARY must map to Binary"
+    );
+    assert_eq!(
+        *schema.field_with_name("blob_col").unwrap().data_type(),
+        DataType::Binary,
+        "BLOB must map to Binary"
+    );
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3, "expected 3 rows");
+
+    let b = batches.first().unwrap();
+
+    let flags = b
+        .column_by_name("flag")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap();
+    assert!(flags.value(0), "flag[0] must be true");
+    assert!(!flags.value(1), "flag[1] must be false");
+    assert!(flags.is_null(2), "flag[2] must be null");
+
+    let bit1s = b
+        .column_by_name("bit1_col")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap();
+    assert!(bit1s.value(0), "bit1_col[0]=b'1' must be true");
+    assert!(!bit1s.value(1), "bit1_col[1]=b'0' must be false");
+
+    let bit8s = b
+        .column_by_name("bit8_col")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(
+        bit8s.value(0),
+        0b10101010_i64,
+        "bit8_col[0]=b'10101010'=170"
+    );
+    assert_eq!(bit8s.value(1), 1_i64, "bit8_col[1]=b'00000001'=1");
+
+    let tinys = b
+        .column_by_name("tiny_col")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int16Array>()
+        .unwrap();
+    assert_eq!(tinys.value(0), 127_i16);
+    assert_eq!(tinys.value(1), -128_i16);
 }

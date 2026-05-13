@@ -1,0 +1,22 @@
+# Export `rivet_type_matrix_full` → Parquet (bool, int2/4, float4, date, time,
+# interval, enum, text[], int[]).
+# Prerequisites: dev/postgres/init.sql applied (fresh compose volume) OR
+# `dev/sql/rivet_type_matrix_full_postgres.sql` piped through psql.
+#
+# Usage (from repo root):
+#   mkdir -p dev/output/type_matrix_full/pg
+#   rivet run --config dev/pg_type_matrix_full_export.yaml --export type_matrix_full_pg
+
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+
+exports:
+  - name: type_matrix_full_pg
+    query: "SELECT * FROM rivet_type_matrix_full ORDER BY id"
+    mode: full
+    format: parquet
+    compression: zstd
+    destination:
+      type: local
+      path: ./dev/output/type_matrix_full/pg
