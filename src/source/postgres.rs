@@ -452,8 +452,7 @@ fn rows_to_record_batch_typed(
     let mut arrays: Vec<Arc<dyn Array>> = Vec::with_capacity(columns.len());
     for (col_idx, (_name, pg_type)) in columns.iter().enumerate() {
         let target_type = schema.field(col_idx).data_type();
-        let array = build_array(pg_type, target_type, col_idx, rows)?;
-        arrays.push(array);
+        arrays.push(build_array(pg_type, target_type, col_idx, rows)?);
     }
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
     Ok(batch)
@@ -489,10 +488,12 @@ fn build_array(
         }
         Type::INT8 | Type::OID => {
             let mut b = Int64Builder::with_capacity(rows.len());
-            for row in rows {
-                if *pg_type == Type::OID {
+            if *pg_type == Type::OID {
+                for row in rows {
                     b.append_option(row.get::<_, Option<u32>>(col_idx).map(|v| v as i64));
-                } else {
+                }
+            } else {
+                for row in rows {
                     b.append_option(row.get(col_idx));
                 }
             }
@@ -638,13 +639,14 @@ fn build_array(
                 return Ok(Arc::new(b.finish()));
             }
 
+            let kind = pg_type.kind();
             // M6: 1-D arrays → Arrow List via Vec<T> deserialization
-            if matches!(pg_type.kind(), Kind::Array(_)) {
+            if matches!(kind, Kind::Array(_)) {
                 return build_pg_list_array(target_type, col_idx, rows);
             }
 
             // M6: Enum types → Utf8 (read binary enum label as UTF-8)
-            if matches!(pg_type.kind(), Kind::Enum(_)) {
+            if matches!(kind, Kind::Enum(_)) {
                 let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 16);
                 for row in rows {
                     match row

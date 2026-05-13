@@ -40,20 +40,15 @@ impl super::Format for CsvFormat {
 
 impl super::FormatWriter for CsvFormatWriter {
     fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        let before = self.bytes_written;
-        let _ = before; // suppress unused warning, we count after
-
-        let mut buf = Vec::new();
+        let mut buf = Vec::with_capacity(batch.num_rows() * batch.num_columns() * 8);
         for row_idx in 0..batch.num_rows() {
-            let mut first = true;
             for col_idx in 0..batch.num_columns() {
-                if !first {
-                    write!(buf, ",")?;
+                if col_idx > 0 {
+                    buf.push(b',');
                 }
-                first = false;
                 write_csv_value(&mut buf, batch.column(col_idx), row_idx)?;
             }
-            writeln!(buf)?;
+            buf.push(b'\n');
         }
         self.bytes_written += buf.len() as u64;
         self.writer.write_all(&buf)?;
@@ -124,9 +119,17 @@ fn write_csv_value(writer: &mut dyn Write, array: &dyn Array, idx: usize) -> Res
                 .expect("DataType/Array mismatch");
             let val = arr.value(idx);
             if val.contains(',') || val.contains('"') || val.contains('\n') {
-                write!(writer, "\"{}\"", val.replace('"', "\"\""))?;
+                writer.write_all(b"\"")?;
+                let mut rest = val;
+                while let Some(pos) = rest.find('"') {
+                    writer.write_all(&rest.as_bytes()[..pos])?;
+                    writer.write_all(b"\"\"")?;
+                    rest = &rest[pos + 1..];
+                }
+                writer.write_all(rest.as_bytes())?;
+                writer.write_all(b"\"")?;
             } else {
-                write!(writer, "{}", val)?;
+                writer.write_all(val.as_bytes())?;
             }
         }
         DataType::Binary => {

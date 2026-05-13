@@ -268,10 +268,15 @@ fn mysql_native_type_name(col: &mysql::Column) -> &'static str {
 ///   MySQL TIMESTAMP is stored as UTC and session tz must be set to +00:00).
 /// - `JSON` → `RivetType::Json` so `build_arrow_field` attaches logical-type metadata.
 /// - `ENUM`/`SET` → `RivetType::String` (Utf8, matching prior behavior).
-/// - `BIT` → `RivetType::Bool` (matching prior behavior; policy-configurable later).
+/// - `TINYINT(1)` / `BOOL` / `BOOLEAN` → `RivetType::Bool` (display-width 1 = MySQL boolean convention).
+/// - `TINYINT` (other widths) → `RivetType::Int16`.
+/// - `BIT(1)` → `RivetType::Bool`; `BIT(n>1)` → `RivetType::Int64` (avoids silent bit-truncation).
 fn mysql_type_to_rivet(col: &mysql::Column) -> RivetType {
     use mysql::consts::ColumnType::*;
     match col.column_type() {
+        // BOOL / BOOLEAN in MySQL is TINYINT(1); display width == 1 is the canonical signal.
+        // TINYINT(1) UNSIGNED is also treated as bool (same display-width convention).
+        MYSQL_TYPE_TINY if col.column_length() == 1 => RivetType::Bool,
         MYSQL_TYPE_TINY | MYSQL_TYPE_SHORT => RivetType::Int16,
         MYSQL_TYPE_INT24 | MYSQL_TYPE_LONG => RivetType::Int32,
         MYSQL_TYPE_LONGLONG => RivetType::Int64,
@@ -331,7 +336,12 @@ fn mysql_type_to_rivet(col: &mysql::Column) -> RivetType {
             timezone: Some("UTC".into()),
         },
 
-        MYSQL_TYPE_BIT => RivetType::Bool,
+        // BIT(1) is a single-bit boolean; BIT(n>1) is a multi-bit integer that must not be
+        // truncated to a single boolean — map to Int64 (fits BIT(1)..BIT(63) losslessly).
+        // BIT(64) technically needs u64 but Int64 is the widest signed Arrow integer type;
+        // values using bit 63 as data rather than sign are rare and can use a column override.
+        MYSQL_TYPE_BIT if col.column_length() == 1 => RivetType::Bool,
+        MYSQL_TYPE_BIT => RivetType::Int64,
         MYSQL_TYPE_YEAR => RivetType::Int16,
 
         _ => RivetType::Unsupported {
@@ -407,6 +417,12 @@ fn bytes_to_str(b: &[u8]) -> Option<&str> {
     std::str::from_utf8(b).ok()
 }
 
+/// Interpret raw big-endian bytes from a MySQL BIT column as an unsigned integer.
+/// MySQL sends BIT(n) values as ceil(n/8) big-endian bytes in the binary protocol.
+fn bit_bytes_to_u64(b: &[u8]) -> u64 {
+    b.iter().fold(0u64, |acc, &byte| acc << 8 | u64::from(byte))
+}
+
 /// Parse MySQL text-protocol TIME string ("HH:MM:SS", "-HHH:MM:SS", "HH:MM:SS.uuuuuu")
 /// into microseconds since midnight. Negative values are allowed.
 fn parse_time_str_to_micros(s: &str) -> Option<i64> {
@@ -444,12 +460,8 @@ fn build_array(
                 match row.as_ref(col_idx) {
                     Some(Value::Int(v)) => b.append_value(*v != 0),
                     Some(Value::UInt(v)) => b.append_value(*v != 0),
-                    Some(Value::Bytes(bv)) => {
-                        let v = bytes_to_str(bv)
-                            .and_then(|s| s.parse::<i64>().ok())
-                            .unwrap_or(0);
-                        b.append_value(v != 0);
-                    }
+                    // BIT(1) columns arrive as raw big-endian bytes, not decimal strings.
+                    Some(Value::Bytes(bv)) => b.append_value(bit_bytes_to_u64(bv) != 0),
                     _ => b.append_null(),
                 }
             }
@@ -491,10 +503,14 @@ fn build_array(
                 match row.as_ref(col_idx) {
                     Some(Value::Int(v)) => b.append_value(*v),
                     Some(Value::UInt(v)) => b.append_value(*v as i64),
-                    Some(Value::Bytes(bv)) => match bytes_to_str(bv).and_then(|s| s.parse().ok()) {
-                        Some(v) => b.append_value(v),
-                        None => b.append_null(),
-                    },
+                    Some(Value::Bytes(bv)) => {
+                        // BIT(n>1) columns arrive as raw big-endian bytes; TEXT columns as UTF-8.
+                        // Try decimal parse first; fall back to big-endian uint interpretation.
+                        let v = bytes_to_str(bv)
+                            .and_then(|s| s.parse::<i64>().ok())
+                            .unwrap_or_else(|| bit_bytes_to_u64(bv) as i64);
+                        b.append_value(v);
+                    }
                     _ => b.append_null(),
                 }
             }
@@ -725,4 +741,27 @@ fn mysql_decimal_to_decimal256(
     Ok(Arc::new(
         b.finish().with_precision_and_scale(precision, scale)?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bit_bytes_to_u64;
+
+    #[test]
+    fn bit_bytes_single_byte() {
+        assert_eq!(bit_bytes_to_u64(&[0x00]), 0);
+        assert_eq!(bit_bytes_to_u64(&[0x01]), 1);
+        assert_eq!(bit_bytes_to_u64(&[0xFF]), 255);
+    }
+
+    #[test]
+    fn bit_bytes_multi_byte() {
+        assert_eq!(bit_bytes_to_u64(&[0x01, 0x02]), 258);
+        assert_eq!(bit_bytes_to_u64(&[0xFF; 8]), u64::MAX);
+    }
+
+    #[test]
+    fn bit_bytes_empty() {
+        assert_eq!(bit_bytes_to_u64(&[]), 0);
+    }
 }
