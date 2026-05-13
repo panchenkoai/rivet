@@ -1,10 +1,11 @@
 //! **Layer: Observability**
 //!
-//! CLI display commands for state, metrics, files, and chunk checkpoints.
+//! CLI display commands for state, metrics, files, chunk checkpoints, and journal history.
 //! Reads from the state stores and formats output — no execution or persistence writes.
 
 use super::format_bytes;
 use crate::error::Result;
+use crate::pipeline::journal::RunEvent;
 use crate::state::StateStore;
 
 pub fn show_state(config_path: &str) -> Result<()> {
@@ -208,5 +209,142 @@ pub fn show_chunk_checkpoint(config_path: &str, export_name: &str) -> Result<()>
             println!("       error: {}", e);
         }
     }
+    Ok(())
+}
+
+/// Display recent run journal entries for an export.
+///
+/// Shows up to `limit` most recent runs (newest first), each as a compact
+/// block: run header + per-event summary lines.
+pub fn show_journal(
+    config_path: &str,
+    export_name: &str,
+    limit: usize,
+    run_id: Option<&str>,
+) -> Result<()> {
+    let state = StateStore::open(config_path)?;
+
+    let journals = if let Some(rid) = run_id {
+        match state.load_journal(rid)? {
+            Some(j) => vec![j],
+            None => {
+                println!("No journal found for run_id '{rid}'.");
+                return Ok(());
+            }
+        }
+    } else {
+        state.recent_journals(export_name, limit)?
+    };
+
+    if journals.is_empty() {
+        println!("No journal entries for export '{export_name}' yet.");
+        println!("Journals are recorded after each `rivet run`.");
+        return Ok(());
+    }
+
+    for journal in &journals {
+        // ── run header ────────────────────────────────────────────────────
+        let outcome = journal.final_outcome().and_then(|e| {
+            if let RunEvent::RunCompleted {
+                status,
+                duration_ms,
+                ..
+            } = &e.event
+            {
+                Some((status.as_str(), *duration_ms))
+            } else {
+                None
+            }
+        });
+        let (status_str, duration_str) = match outcome {
+            Some((s, ms)) if ms >= 1000 => (s, format!("{:.1}s", ms as f64 / 1000.0)),
+            Some((s, ms)) => (s, format!("{ms}ms")),
+            None => ("(incomplete)", String::new()),
+        };
+        let icon = match status_str {
+            "success" => "✓",
+            "failed" => "✗",
+            _ => "•",
+        };
+        println!(
+            "\n{icon} {export}  {status}  {dur}",
+            export = journal.export_name,
+            status = status_str,
+            dur = duration_str,
+        );
+        println!("  run_id: {}", journal.run_id);
+
+        // ── event summary lines ────────────────────────────────────────────
+        let files = journal.files();
+        if !files.is_empty() {
+            let total_rows: i64 = files
+                .iter()
+                .filter_map(|e| {
+                    if let RunEvent::FileWritten { rows, .. } = &e.event {
+                        Some(*rows)
+                    } else {
+                        None
+                    }
+                })
+                .sum();
+            let total_bytes: u64 = files
+                .iter()
+                .filter_map(|e| {
+                    if let RunEvent::FileWritten { bytes, .. } = &e.event {
+                        Some(*bytes)
+                    } else {
+                        None
+                    }
+                })
+                .sum();
+            println!(
+                "  files:  {}  rows: {}  size: {}",
+                files.len(),
+                total_rows,
+                format_bytes(total_bytes),
+            );
+        }
+
+        let retries = journal.retries();
+        if !retries.is_empty() {
+            println!("  retries: {}", retries.len());
+        }
+
+        for e in journal.quality_issues() {
+            if let RunEvent::QualityIssue { severity, message } = &e.event {
+                println!("  quality [{severity}]: {message}");
+            }
+        }
+
+        for e in journal.schema_changes() {
+            if let RunEvent::SchemaChanged {
+                added,
+                removed,
+                type_changed,
+            } = &e.event
+            {
+                if !added.is_empty() {
+                    println!("  schema: +{}", added.join(", +"));
+                }
+                if !removed.is_empty() {
+                    println!("  schema: -{}", removed.join(", -"));
+                }
+                for (col, old, new) in type_changed {
+                    println!("  schema: {col} {old}→{new}");
+                }
+            }
+        }
+
+        if let Some(e) = journal.final_outcome()
+            && let RunEvent::RunCompleted {
+                error_message: Some(err),
+                ..
+            } = &e.event
+        {
+            let first_line = err.lines().next().unwrap_or(err);
+            println!("  error:  {first_line}");
+        }
+    }
+    println!();
     Ok(())
 }

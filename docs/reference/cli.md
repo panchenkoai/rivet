@@ -488,6 +488,50 @@ rivet metrics -c my_export.yaml -e orders_daily
 
 ---
 
+## `rivet journal`
+
+Inspect the structured run journal for an export — per-run event log with status, file/row/byte summary, retries, quality issues, schema changes, and the first error line.
+
+```bash
+rivet journal --config <PATH> --export <NAME> [OPTIONS]
+```
+
+| Flag | Short | Type | Default | Description |
+|------|-------|------|---------|-------------|
+| `--config` | `-c` | string | — | Path to YAML config file **(required)** |
+| `--export` | `-e` | string | — | Export name to inspect **(required)** |
+| `--last` | `-l` | integer | 5 | Number of recent runs to show |
+| `--run-id` | | string | — | Show a single specific run by ID |
+
+### Examples
+
+```bash
+# Last 5 runs for the orders export
+rivet journal -c my_export.yaml -e orders
+
+# Last 10 runs
+rivet journal -c my_export.yaml -e orders --last 10
+
+# Single run by ID
+rivet journal -c my_export.yaml -e orders --run-id orders_20260513T120000.123
+```
+
+### Output
+
+Each run is shown as a block:
+
+```
+✓ orders_20260513T120000.123  succeeded  12.3s
+  files: 3  rows: 150,000  bytes: 4.2 MB
+```
+
+`✓` = succeeded · `✗` = failed · `•` = partial / unknown.
+Retries, quality issues, schema changes, and first-line error text are appended when present.
+
+Journal entries are persisted to `.rivet_state.db` (SQLite, migration v7) at the end of every run. An empty result means the export has not run yet in this state DB, or `--run-id` does not match any stored run.
+
+---
+
 ## `rivet state`
 
 Manage export state (cursors, file manifests, chunk checkpoints).

@@ -25,15 +25,13 @@ New flags on `rivet check` surface the full type pipeline for every column in a 
 
 ### Column type overrides (`columns:`)
 
-New per-column override block in the export YAML. Lets you pin `decimal_precision` / `decimal_scale` when the inferred type is wider than needed (e.g. to fit inside BigQuery NUMERIC limits):
+New per-column override block in the export YAML. Lets you pin a decimal type when the inferred type is wider than needed (e.g. to fit inside BigQuery NUMERIC limits):
 
 ```yaml
 exports:
   - name: orders
     columns:
-      amount:
-        decimal_precision: 15
-        decimal_scale: 4
+      amount: decimal(15,4)
 ```
 
 Overrides are reflected in `--type-report` output and in the written Parquet files.
@@ -545,7 +543,7 @@ bash dev/legacy/run_full_matrix.sh
 ```
 
 Seven targets × 83 e2e assertions = 581 per-version checks, all green.
-`dev/e2e/*.yaml` and `dev/test_*.yaml` now read their URL from
+`dev/e2e/*.yaml` and `dev/fixtures/test_*.yaml` now read their URL from
 `RIVET_PG_URL` / `RIVET_MYSQL_URL` (with localhost defaults) so the same
 suite re-targets cleanly without YAML edits.
 
@@ -725,10 +723,10 @@ Source-aware planning release — Epics A–I plus credential-hardening follow-u
 
 ### Documentation
 
-- [docs/reference/init.md](docs/reference/init.md) — full `rivet init` guide (Docker Compose, `dev/regenerate_docker_init_configs.sh`)
+- [docs/reference/init.md](docs/reference/init.md) — full `rivet init` guide (Docker Compose, `dev/scripts/regenerate_docker_init_configs.sh`)
 - [docs/reference/cli.md](docs/reference/cli.md) — `rivet init` command table
 - [docs/getting-started.md](docs/getting-started.md) — optional “Scaffold with rivet init” step
-- [README.md](README.md) — CLI quick reference; product vs `rivet-cli` crate name; chunked progress + `dev/bench_chunked_p4_safe.yaml` example
+- [README.md](README.md) — CLI quick reference; product vs `rivet-cli` crate name; chunked progress + `dev/scenarios/chunked_postgres_bench.yaml` example
 - [USER_GUIDE.md](USER_GUIDE.md) — `rivet init` optional section
 - [docs/modes/chunked.md](docs/modes/chunked.md) — progress bar (independent of `RUST_LOG`), bench config examples
 - [docs/README.md](docs/README.md) — `rivet init` and chunked progress pointers
@@ -743,7 +741,7 @@ Source-aware planning release — Epics A–I plus credential-hardening follow-u
 ### Other
 
 - `Cargo.toml` `[package] exclude` moved from invalid `[[bin]]` key to `[package]`
-- `dev/regenerate_docker_init_configs.sh` and sample `dev/init_generated/` YAMLs from docker-compose schemas
+- `dev/scripts/regenerate_docker_init_configs.sh` — populates gitignored `dev/init_generated/` locally from docker-compose schemas
 - `.gitignore` — `dev/e2e/.init_e2e_scratch/`
 
 ---
