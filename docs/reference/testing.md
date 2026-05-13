@@ -13,7 +13,9 @@ Rivet's test suite is organised into two tiers, selected by the standard
 Both tiers run in CI (`.github/workflows/ci.yml`):
 
 - Offline suite runs in the `test` / `test-invariants` / `test-recovery` / `test-compatibility` jobs on every push and PR.
-- Live suite runs in the `e2e` job, which also executes the bash-driven `dev/e2e/run_e2e.sh` matrix against the same docker-compose stack.
+- Live suite runs in two dedicated jobs:
+  - **`test-type-golden`** — starts only Postgres + MySQL, runs `--test live_type_golden -- --ignored`. Named branch-protection gate for type-contract regressions.
+  - **`e2e`** — full stack (Postgres, MySQL, MinIO, fake-gcs, Toxiproxy); seeds databases, builds release binary, runs `dev/e2e/run_e2e.sh`, then runs all remaining `--ignored` tests.
 
 ## Offline suite
 
@@ -22,7 +24,7 @@ under two seconds on a developer laptop.
 
 ```bash
 cargo test
-# → example: cargo test: ~1300 passed, ~55 ignored (~32 suites, ~2s) — counts drift; check your local footer
+# → example: cargo test: ~1360 passed, ~60 ignored (~32 suites, ~3s) — counts drift; check your local footer
 ```
 
 Each integration file under `tests/` maps to one domain:
@@ -92,8 +94,9 @@ Each test targets **both engines** where the contract applies:
 | Timestamp semantics (`tz=None` vs `UTC` tag + µs parity) | `TIMESTAMP` / `TIMESTAMPTZ` with offset row | `DATETIME(6)` / `TIMESTAMP(6)` (Rivet sets `SET time_zone = '+00:00'` on the MySQL session) |
 | Binary round-trip | `BYTEA` | `BLOB` (avoid reserved identifiers like `blob` as column SQL names) |
 | Canonical UUID-ish text (`Utf8`) | native `UUID` | `VARCHAR(36)` with hyphenated lowercase literal |
+| INTERVAL → ISO 8601 `Utf8` | `INTERVAL '1 year 2 months 3 days'` → `"P1Y2M3D"`, `INTERVAL '-1 year'` → `"P-1Y"`, `INTERVAL '0'` → `"PT0S"` | — (no MySQL INTERVAL type) |
 
-CI runs these with the rest of the live matrix (`cargo test --release -- --ignored` in `.github/workflows/ci.yml`). Local:
+CI runs these in the dedicated `test-type-golden` job (`cargo test --release --test live_type_golden -- --ignored`) as well as in the full `e2e` job. Local:
 
 ```bash
 docker compose up -d

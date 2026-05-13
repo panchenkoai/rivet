@@ -139,34 +139,40 @@ When `fail` triggers, the output file has already been written to the destinatio
 
 ### `exports[].columns` — per-column type overrides
 
-Override the Arrow type Rivet infers for a specific column. Useful when the inferred type is too wide (e.g. Rivet picks `Decimal128(38,10)` but your data fits in `Decimal128(18,4)`) or when you need a narrower precision for BigQuery NUMERIC compatibility.
+Override the Arrow type Rivet infers for a specific column. Useful when:
+- a `NUMERIC` / `DECIMAL` column has no explicit precision/scale in the source schema and Rivet cannot auto-determine the Arrow type, or
+- you need a narrower precision for BigQuery NUMERIC compatibility.
 
 ```yaml
 columns:
-  <column_name>:
-    decimal_precision: <integer>   # override precision for numeric/decimal columns
-    decimal_scale: <integer>       # override scale for numeric/decimal columns
+  <column_name>: decimal(<precision>,<scale>)
 ```
 
-Only `decimal_precision` and `decimal_scale` are supported today. Both must be provided together.
+`decimal(p,s)` is the only supported override today. Both precision and scale are required.
 
 Example:
 
 ```yaml
 exports:
   - name: orders
-    query: "SELECT id, amount, created_at FROM orders"
+    query: "SELECT id, amount, fee FROM orders"
     format: parquet
     destination:
       type: local
       path: ./out
     columns:
-      amount:
-        decimal_precision: 15
-        decimal_scale: 4
+      amount: decimal(18,2)
+      fee: decimal(18,6)
 ```
 
-Type overrides are applied during the `rows_to_record_batch_typed` conversion and are reflected in `rivet check --type-report` output.
+**`rivet init` generates these automatically.** When introspecting a table, `rivet init` reads `numeric_precision` and `numeric_scale` from `information_schema.columns`. If both are present, it emits a concrete override (`decimal(p,s)`). If the column is unbounded (`NUMERIC` without explicit precision), it emits a TODO comment:
+
+```yaml
+    columns:
+      # price: decimal(?,?)  # TODO: specify precision and scale
+```
+
+Type overrides are applied at export time and are reflected in `rivet check --type-report` output.
 
 ---
 

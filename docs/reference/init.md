@@ -81,6 +81,38 @@ Row estimates are cheap metadata (`pg_class.reltuples` on PostgreSQL, `informati
 
 Always run **`rivet check --config <file>`** and adjust modes, destinations, and tuning before production runs.
 
+### DECIMAL / NUMERIC column overrides
+
+Rivet reads `numeric_precision` and `numeric_scale` from `information_schema.columns` during introspection. When a `NUMERIC` or `DECIMAL` column has explicit precision and scale, the scaffold automatically emits a `columns:` block with the correct `decimal(p,s)` override — so exports don't fail at runtime with an "unsupported type" error:
+
+```yaml
+exports:
+  - name: payments
+    query: >
+      SELECT id, amount, fee
+      FROM payments
+    mode: chunked
+    chunk_column: id
+    chunk_size: 100000
+    chunk_checkpoint: true
+    format: parquet
+    columns:
+      amount: decimal(18,2)
+      fee: decimal(18,6)
+    destination:
+      type: local
+      path: ./output
+```
+
+If the column is declared as plain `NUMERIC` (no precision / scale in the DDL), `rivet init` emits a TODO comment instead:
+
+```yaml
+    columns:
+      # price: decimal(?,?)  # TODO: specify precision and scale
+```
+
+Replace `?` with the actual precision and scale your data requires before running.
+
 ---
 
 ## Flags (summary)
