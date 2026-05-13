@@ -62,14 +62,17 @@ pub(super) fn introspect(url: &str, table: &str) -> Result<TableInfo> {
         None => (0, None),
     };
 
-    // Column metadata (includes KEY + IS_NULLABLE for Epic B).
-    let rows: Vec<(String, String, String, String)> = conn.query(format!(
-        "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_KEY, IS_NULLABLE \
-         FROM information_schema.COLUMNS \
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{}' \
-         ORDER BY ORDINAL_POSITION",
-        escape(table)
-    ))?;
+    // Column metadata (includes KEY + IS_NULLABLE + numeric precision/scale for decimal columns).
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(String, String, String, String, Option<u32>, Option<u32>)> =
+        conn.query(format!(
+            "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_KEY, IS_NULLABLE, \
+                    NUMERIC_PRECISION, NUMERIC_SCALE \
+             FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{}' \
+             ORDER BY ORDINAL_POSITION",
+            escape(table)
+        ))?;
 
     if rows.is_empty() {
         anyhow::bail!(
@@ -80,12 +83,18 @@ pub(super) fn introspect(url: &str, table: &str) -> Result<TableInfo> {
 
     let columns = rows
         .into_iter()
-        .map(|(name, data_type, column_key, nullable)| ColumnInfo {
-            is_primary_key: column_key == "PRI",
-            is_nullable: nullable.eq_ignore_ascii_case("YES"),
-            name,
-            data_type,
-        })
+        .map(
+            |(name, data_type, column_key, nullable, numeric_precision, numeric_scale)| {
+                ColumnInfo {
+                    is_primary_key: column_key == "PRI",
+                    is_nullable: nullable.eq_ignore_ascii_case("YES"),
+                    name,
+                    data_type,
+                    numeric_precision,
+                    numeric_scale,
+                }
+            },
+        )
         .collect();
 
     Ok(TableInfo {

@@ -56,9 +56,9 @@ pub(super) fn introspect(url: &str, schema: &str, table: &str) -> Result<TableIn
     let pk_cols: std::collections::HashSet<String> =
         pk_rows.iter().map(|r| r.get::<_, String>(0)).collect();
 
-    // Column metadata — including NULL-ability (Epic B).
+    // Column metadata — including NULL-ability and numeric precision/scale for decimal columns.
     let col_rows = client.query(
-        "SELECT column_name, data_type, is_nullable
+        "SELECT column_name, data_type, is_nullable, numeric_precision, numeric_scale
          FROM information_schema.columns
          WHERE table_schema = $1 AND table_name = $2
          ORDER BY ordinal_position",
@@ -78,12 +78,16 @@ pub(super) fn introspect(url: &str, schema: &str, table: &str) -> Result<TableIn
             let name: String = row.get(0);
             let data_type: String = row.get(1);
             let is_nullable_str: String = row.get(2);
+            let numeric_precision: Option<i32> = row.get(3);
+            let numeric_scale: Option<i32> = row.get(4);
             let is_primary_key = pk_cols.contains(&name);
             ColumnInfo {
                 name,
                 data_type,
                 is_primary_key,
                 is_nullable: is_nullable_str.eq_ignore_ascii_case("YES"),
+                numeric_precision: numeric_precision.map(|v| v as u32),
+                numeric_scale: numeric_scale.map(|v| v as u32),
             }
         })
         .collect();

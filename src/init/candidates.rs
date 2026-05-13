@@ -116,6 +116,8 @@ mod tests {
             data_type: ty.into(),
             is_primary_key: pk,
             is_nullable: nullable,
+            numeric_precision: None,
+            numeric_scale: None,
         }
     }
 

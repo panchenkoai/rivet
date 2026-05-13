@@ -186,6 +186,13 @@ fn yaml_double_quote(v: &str) -> String {
     s
 }
 
+/// Return true for column data types that Rivet cannot safely auto-map without
+/// explicit precision/scale (NUMERIC / DECIMAL family).
+fn is_decimal_type(data_type: &str) -> bool {
+    let t = data_type.to_ascii_lowercase();
+    t == "numeric" || t == "decimal"
+}
+
 fn export_block_lines(
     info: &TableInfo,
     source_type: &str,
@@ -238,6 +245,30 @@ fn export_block_lines(
     lines.push("      row_hash: true".to_string());
     lines.extend(destination_scaffold(info, source_type, dest));
 
+    // Emit `columns:` overrides for NUMERIC/DECIMAL columns so the export
+    // doesn't fail with "precision/scale unavailable".
+    let decimal_cols: Vec<&super::ColumnInfo> = info
+        .columns
+        .iter()
+        .filter(|c| is_decimal_type(&c.data_type))
+        .collect();
+    if !decimal_cols.is_empty() {
+        lines.push("    columns:".to_string());
+        for col in decimal_cols {
+            match (col.numeric_precision, col.numeric_scale) {
+                (Some(p), Some(s)) => {
+                    lines.push(format!("      {}: decimal({p},{s})", col.name));
+                }
+                _ => {
+                    lines.push(format!(
+                        "      # {}: decimal(?,?)  # TODO: specify precision and scale",
+                        col.name
+                    ));
+                }
+            }
+        }
+    }
+
     lines
 }
 
@@ -288,5 +319,85 @@ fn suggest_parallel(rows: i64) -> usize {
         r if r < 500_000 => 1,
         r if r < 5_000_000 => 2,
         _ => 4,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::init::{ColumnInfo, TableInfo};
+
+    fn make_table(cols: Vec<ColumnInfo>) -> TableInfo {
+        TableInfo {
+            schema: "public".into(),
+            table: "payments".into(),
+            row_estimate: 100,
+            total_bytes: None,
+            columns: cols,
+        }
+    }
+
+    fn col(name: &str, ty: &str) -> ColumnInfo {
+        ColumnInfo {
+            name: name.into(),
+            data_type: ty.into(),
+            is_primary_key: false,
+            is_nullable: true,
+            numeric_precision: None,
+            numeric_scale: None,
+        }
+    }
+
+    fn decimal_col(name: &str, p: u32, s: u32) -> ColumnInfo {
+        ColumnInfo {
+            numeric_precision: Some(p),
+            numeric_scale: Some(s),
+            ..col(name, "numeric")
+        }
+    }
+
+    fn unbounded_col(name: &str) -> ColumnInfo {
+        col(name, "numeric")
+    }
+
+    #[test]
+    fn decimal_with_precision_emits_override() {
+        let info = make_table(vec![col("id", "bigint"), decimal_col("amount", 18, 2)]);
+        let dest = InitYamlDestination::default();
+        let yaml =
+            generate_config(&info, "postgresql://rivet:rivet@localhost/rivet", &dest).unwrap();
+        assert!(yaml.contains("    columns:"), "columns block missing");
+        assert!(
+            yaml.contains("      amount: decimal(18,2)"),
+            "decimal override missing:\n{yaml}"
+        );
+        assert!(
+            !yaml.contains("id:"),
+            "non-decimal column must not appear in columns block"
+        );
+    }
+
+    #[test]
+    fn unbounded_decimal_emits_todo_comment() {
+        let info = make_table(vec![col("id", "bigint"), unbounded_col("price")]);
+        let dest = InitYamlDestination::default();
+        let yaml =
+            generate_config(&info, "postgresql://rivet:rivet@localhost/rivet", &dest).unwrap();
+        assert!(
+            yaml.contains("# price: decimal(?,?)"),
+            "TODO comment missing:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn no_decimal_columns_no_columns_block() {
+        let info = make_table(vec![col("id", "bigint"), col("label", "text")]);
+        let dest = InitYamlDestination::default();
+        let yaml =
+            generate_config(&info, "postgresql://rivet:rivet@localhost/rivet", &dest).unwrap();
+        assert!(
+            !yaml.contains("    columns:"),
+            "columns block must not appear:\n{yaml}"
+        );
     }
 }

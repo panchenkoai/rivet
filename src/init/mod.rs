@@ -18,6 +18,10 @@ pub(crate) struct ColumnInfo {
     pub is_primary_key: bool,
     /// `true` when the column can be NULL. Epic B / ADR-0007: used for coalesce cursor hints.
     pub is_nullable: bool,
+    /// Filled for NUMERIC / DECIMAL columns from `information_schema.columns`.
+    /// `None` when not applicable or when precision is unbounded.
+    pub numeric_precision: Option<u32>,
+    pub numeric_scale: Option<u32>,
 }
 
 /// Table metadata used to generate the config scaffold and discovery artifact.
@@ -343,6 +347,8 @@ mod tests {
             data_type: ty.to_string(),
             is_primary_key: pk,
             is_nullable: false,
+            numeric_precision: None,
+            numeric_scale: None,
         }
     }
 
@@ -720,6 +726,8 @@ mod tests {
                     data_type: "timestamp".into(),
                     is_primary_key: false,
                     is_nullable: true,
+                    numeric_precision: None,
+                    numeric_scale: None,
                 },
             ],
         );
