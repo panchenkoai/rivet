@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -18,8 +17,8 @@ use crate::source::query::build_incremental_query;
 use crate::tuning::SourceTuning;
 use crate::types::CursorState;
 use crate::types::{
-    ColumnOverrides, META_FIDELITY, META_NATIVE_TYPE, RivetType, SourceColumn,
-    TimeUnit as RivetTimeUnit, TypeMapping, build_arrow_field,
+    ColumnOverrides, RivetType, SourceColumn, TimeUnit as RivetTimeUnit, TypeMapping,
+    build_arrow_field,
 };
 
 pub struct MysqlSource {
@@ -133,7 +132,7 @@ impl super::Source for MysqlSource {
 
         // Compute TypeMappings once; derive both the Arrow schema and the
         // per-column DataType vec from the same source so they can never diverge.
-        let (schema, arrow_types) = mysql_schema_and_arrow_types(&columns, column_overrides);
+        let (schema, arrow_types) = mysql_schema_and_arrow_types(&columns, column_overrides)?;
         let schema = Arc::new(schema);
 
         sink.on_schema(schema.clone())?;
@@ -360,7 +359,7 @@ fn mysql_type_to_rivet(col: &mysql::Column) -> RivetType {
 fn mysql_schema_and_arrow_types(
     columns: &[mysql::Column],
     column_overrides: &ColumnOverrides,
-) -> (Schema, Vec<DataType>) {
+) -> crate::error::Result<(Schema, Vec<DataType>)> {
     let mut fields: Vec<Field> = Vec::with_capacity(columns.len());
     let mut arrow_types: Vec<DataType> = Vec::with_capacity(columns.len());
 
@@ -379,26 +378,19 @@ fn mysql_schema_and_arrow_types(
                 arrow_types.push(dt);
             }
             _ => {
-                log::warn!(
-                    "column '{}': MySQL type '{}' has no safe Rivet mapping — \
-                     exporting as Utf8 (configure type_policy or add a column \
-                     override to suppress this warning)",
-                    col.name_str(),
-                    native
+                let reason = match &mapping.rivet_type {
+                    RivetType::Unsupported { reason, .. } => reason.clone(),
+                    _ => "no Rivet mapping for this MySQL type".into(),
+                };
+                anyhow::bail!(
+                    "column '{}' (MySQL type '{native}'): {reason}",
+                    col.name_str()
                 );
-                let mut meta = HashMap::new();
-                meta.insert(META_NATIVE_TYPE.to_string(), native.to_string());
-                meta.insert(META_FIDELITY.to_string(), "unsupported".to_string());
-                fields.push(
-                    Field::new(col.name_str().to_string(), DataType::Utf8, true)
-                        .with_metadata(meta),
-                );
-                arrow_types.push(DataType::Utf8);
             }
         }
     }
 
-    (Schema::new(fields), arrow_types)
+    Ok((Schema::new(fields), arrow_types))
 }
 
 fn rows_to_record_batch_typed(

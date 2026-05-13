@@ -39,7 +39,7 @@ pub mod target;
 
 pub use cursor::CursorState;
 pub use fidelity::TypeFidelity;
-pub use mapping::{META_FIDELITY, META_NATIVE_TYPE, TypeMapping, build_arrow_field};
+pub use mapping::{TypeMapping, build_arrow_field};
 pub use override_type::parse_type_str;
 pub use rivet_type::{RivetType, TimeUnit};
 pub use source_column::SourceColumn;
@@ -57,7 +57,7 @@ pub type ColumnOverrides = std::collections::HashMap<String, RivetType>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::mapping::META_LOGICAL_TYPE;
+    use crate::types::mapping::{META_FIDELITY, META_LOGICAL_TYPE, META_NATIVE_TYPE};
     use arrow::datatypes::DataType;
 
     /// Top-level smoke test: feeding a typical PostgreSQL `payments` table

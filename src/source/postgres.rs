@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -21,8 +20,8 @@ use crate::source::tls::build_native_tls;
 use crate::tuning::SourceTuning;
 use crate::types::CursorState;
 use crate::types::{
-    ColumnOverrides, META_FIDELITY, META_NATIVE_TYPE, RivetType, SourceColumn,
-    TimeUnit as RivetTimeUnit, TypeMapping, build_arrow_field,
+    ColumnOverrides, RivetType, SourceColumn, TimeUnit as RivetTimeUnit, TypeMapping,
+    build_arrow_field,
 };
 
 /// Canonical hyphenated lowercase UUID strings from PostgreSQL `uuid` rows.
@@ -162,7 +161,7 @@ impl super::Source for PostgresSource {
                     .iter()
                     .map(|c| (c.name().to_string(), c.type_().clone()))
                     .collect();
-                let s = Arc::new(pg_columns_to_schema(rows[0].columns(), column_overrides));
+                let s = Arc::new(pg_columns_to_schema(rows[0].columns(), column_overrides)?);
                 sink.on_schema(s.clone())?;
                 schema = Some(s.clone());
                 columns_cache = Some(stmt_cols);
@@ -348,39 +347,36 @@ fn pg_type_to_rivet(t: &Type) -> RivetType {
 /// e.g. `amount: decimal(18,2)` in `rivet.yaml`, that `RivetType` replaces
 /// the autodetected `Unsupported` for `NUMERIC` columns.
 ///
-/// For types that have no safe Rivet mapping and no override, this falls back
-/// to `Utf8` with `rivet.fidelity=unsupported` metadata and logs a warning.
-/// TypePolicy (Chunk 4) will replace this lenient fallback with a configurable
-/// fail/warn/string behaviour.
+/// Returns `Err` for any column that has no safe Rivet mapping and no override,
+/// rather than silently exporting wrong data as Utf8.
 fn pg_columns_to_schema(
     columns: &[postgres::Column],
     column_overrides: &ColumnOverrides,
-) -> Schema {
-    let fields: Vec<Field> = columns
-        .iter()
-        .map(|col| {
-            let rivet = column_overrides
-                .get(col.name())
-                .cloned()
-                .unwrap_or_else(|| pg_type_to_rivet(col.type_()));
-            let source = SourceColumn::simple(col.name(), col.type_().name(), true);
-            let mapping = TypeMapping::from_source(&source, rivet);
-            build_arrow_field(&mapping).unwrap_or_else(|| {
-                log::warn!(
-                    "column '{}': PG type '{}' has no safe Rivet mapping — \
-                     exporting as Utf8 (configure type_policy or add a column \
-                     override to suppress this warning)",
+) -> crate::error::Result<Schema> {
+    let mut fields: Vec<Field> = Vec::with_capacity(columns.len());
+    for col in columns {
+        let rivet = column_overrides
+            .get(col.name())
+            .cloned()
+            .unwrap_or_else(|| pg_type_to_rivet(col.type_()));
+        let source = SourceColumn::simple(col.name(), col.type_().name(), true);
+        let mapping = TypeMapping::from_source(&source, rivet);
+        match build_arrow_field(&mapping) {
+            Some(field) => fields.push(field),
+            None => {
+                let reason = match &mapping.rivet_type {
+                    RivetType::Unsupported { reason, .. } => reason.clone(),
+                    _ => "no Rivet mapping for this PostgreSQL type".into(),
+                };
+                anyhow::bail!(
+                    "column '{}' (PG type '{}'): {reason}",
                     col.name(),
                     col.type_().name()
                 );
-                let mut meta = HashMap::new();
-                meta.insert(META_NATIVE_TYPE.to_string(), col.type_().name().to_string());
-                meta.insert(META_FIDELITY.to_string(), "unsupported".to_string());
-                Field::new(col.name(), DataType::Utf8, true).with_metadata(meta)
-            })
-        })
-        .collect();
-    Schema::new(fields)
+            }
+        }
+    }
+    Ok(Schema::new(fields))
 }
 
 /// Reads a PostgreSQL `INTERVAL` value from its 16-byte binary wire format:
