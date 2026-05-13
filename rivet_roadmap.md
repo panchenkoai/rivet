@@ -688,7 +688,7 @@ Rivet core is **feature-complete for stable extraction with type safety**. All W
 | F2 | ✅ | P1 | `--reconcile` |
 | F3 | ✅ | — | Per-file row counts in state |
 | F4 | ✅ | P1 | MATCH/MISMATCH in summary |
-| F5 | ⏳ | P2 | Strict vs cheap verification docs |
+| F5 | ✅ | P2 | Reconcile vs validate tradeoff table added to cli.md |
 
 ### Epic G — Real-world test harness
 
@@ -714,10 +714,10 @@ Rivet core is **feature-complete for stable extraction with type safety**. All W
 | Task | Status | Priority | Notes |
 |------|--------|----------|-------|
 | I1 | ✅ Partial | P1 | Manual runs; standardized datasets TBD |
-| I2 | ⏳ | P1 | One-command benchmarks |
+| I2 | ✅ | P1 | `cargo bench` + `dev/bench.sh` save/compare; column_scan + shape_tracking groups |
 | I3 | ✅ | — | USER_GUIDE defaults |
 | I4 | ✅ | — | Check warnings |
-| I5 | ✅ Partial | P2 | Formal capacity guide TBD |
+| I5 | ✅ | P2 | Capacity/memory planning section in tuning.md (peak RSS formula, table width rules) |
 
 ### Epic J — Product UX
 
@@ -782,8 +782,8 @@ Prioritize by stabilization before distribution polish:
 
 1. ✅ **Epic 7 schema drift policy** — `on_schema_drift: warn|continue|fail` YAML hook shipped.
 2. ✅ **Epic 8 data shape drift** — `export_shape` SQLite table; `shape_drift_warn_factor` YAML config; warns on `N×` growth.
-3. **F5 + I5** — short docs: audit/reconcile tradeoffs; capacity/memory guidance.
-4. **I2** — scripted benchmark or `cargo xtask`-style harness.
+3. ✅ **F5 + I5** — reconcile/validate tradeoffs (cli.md); capacity/memory planning (tuning.md).
+4. ✅ **I2** — `cargo bench` + `dev/bench.sh` save/compare harness; column_scan + shape_tracking groups.
 5. **Epic 4 (§5)** — external/durable state backend when pilots need multi-replica or stateless workers.
 
 ---
