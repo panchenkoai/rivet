@@ -80,10 +80,19 @@ pub(super) fn run_exports_as_child_processes(
         .ok();
 
     const CHILD_STDERR_LINE_CAP: usize = 5_000;
-    let stderr_buffers: std::sync::Arc<std::sync::Mutex<HashMap<String, Vec<String>>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let stderr_truncated: std::sync::Arc<std::sync::Mutex<HashMap<String, usize>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+    // One mutex per export — parallel child threads never contend with each other.
+    type StderrBuf = std::sync::Arc<std::sync::Mutex<(Vec<String>, usize)>>;
+    let stderr_bufs: std::sync::Arc<HashMap<String, StderrBuf>> = std::sync::Arc::new(
+        exports
+            .iter()
+            .map(|e| {
+                (
+                    e.name.clone(),
+                    std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), 0usize))),
+                )
+            })
+            .collect(),
+    );
 
     let mut children: Vec<(String, std::process::Child)> = Vec::with_capacity(exports.len());
     let mut reader_handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(exports.len());
@@ -161,8 +170,9 @@ pub(super) fn run_exports_as_child_processes(
                 }
                 if let Some(stderr) = child.stderr.take() {
                     let export_name = export.name.clone();
-                    let buffers = std::sync::Arc::clone(&stderr_buffers);
-                    let truncated = std::sync::Arc::clone(&stderr_truncated);
+                    let buf = std::sync::Arc::clone(
+                        stderr_bufs.get(&export_name).expect("buf pre-allocated"),
+                    );
                     let h = std::thread::Builder::new()
                         .name(format!("rivet-ipc-err-{}", export.name))
                         .spawn(move || {
@@ -172,22 +182,15 @@ pub(super) fn run_exports_as_child_processes(
                                     Ok(l) => l,
                                     Err(_) => break,
                                 };
-                                let mut guard = match buffers.lock() {
+                                let mut guard = match buf.lock() {
                                     Ok(g) => g,
                                     Err(p) => p.into_inner(),
                                 };
-                                let entry =
-                                    guard.entry(export_name.clone()).or_insert_with(Vec::new);
-                                if entry.len() >= CHILD_STDERR_LINE_CAP {
-                                    drop(guard);
-                                    let mut tg = match truncated.lock() {
-                                        Ok(g) => g,
-                                        Err(p) => p.into_inner(),
-                                    };
-                                    *tg.entry(export_name.clone()).or_insert(0) += 1;
-                                    continue;
+                                if guard.0.len() >= CHILD_STDERR_LINE_CAP {
+                                    guard.1 += 1;
+                                } else {
+                                    guard.0.push(line);
                                 }
-                                entry.push(line);
                             }
                         })
                         .ok();
@@ -269,11 +272,20 @@ pub(super) fn run_exports_as_child_processes(
         let _ = h.join();
     }
 
-    let stderr_snapshot = stderr_buffers.lock().map(|g| g.clone()).unwrap_or_default();
-    let truncated_snapshot = stderr_truncated
-        .lock()
-        .map(|g| g.clone())
-        .unwrap_or_default();
+    let mut stderr_snapshot: HashMap<String, Vec<String>> = HashMap::new();
+    let mut truncated_snapshot: HashMap<String, usize> = HashMap::new();
+    for (name, buf) in stderr_bufs.as_ref() {
+        let guard = match buf.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if !guard.0.is_empty() {
+            stderr_snapshot.insert(name.clone(), guard.0.clone());
+        }
+        if guard.1 > 0 {
+            truncated_snapshot.insert(name.clone(), guard.1);
+        }
+    }
     let stderr_dump = render_child_stderr(exports, &stderr_snapshot, &truncated_snapshot);
 
     let mut all_failures = spawn_failures;

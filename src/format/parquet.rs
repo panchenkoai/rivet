@@ -65,7 +65,6 @@ impl super::Format for ParquetFormat {
 impl super::FormatWriter for ParquetFormatWriter {
     fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         self.inner.write(batch)?;
-        self.inner.flush()?;
         Ok(())
     }
 

@@ -51,6 +51,9 @@ pub(crate) struct ExportSink {
     pub(in crate::pipeline) quality_unique_sets:
         std::collections::HashMap<String, std::collections::HashSet<String>>,
     pub(in crate::pipeline) quality_columns: Option<crate::config::QualityConfig>,
+    /// Column index cache for quality tracking — built once in `on_schema`.
+    pub(in crate::pipeline) quality_null_indices: Vec<(usize, String)>,
+    pub(in crate::pipeline) quality_unique_indices: Vec<(usize, String)>,
     pub(in crate::pipeline) max_file_size: Option<u64>,
     pub(in crate::pipeline) completed_parts: Vec<CompletedPart>,
     /// When set, this column is removed from Arrow batches before enrichment and write (see `chunk_dense`).
@@ -87,6 +90,8 @@ impl ExportSink {
             quality_null_counts: std::collections::HashMap::new(),
             quality_unique_sets: std::collections::HashMap::new(),
             quality_columns: plan.quality.clone(),
+            quality_null_indices: Vec::new(),
+            quality_unique_indices: Vec::new(),
             max_file_size: plan.max_file_size_bytes,
             completed_parts: Vec::new(),
             strip_internal_column,
@@ -152,27 +157,22 @@ impl ExportSink {
     }
 
     pub fn track_quality(&mut self, batch: &RecordBatch) {
-        let qc = match &self.quality_columns {
-            Some(q) => q,
-            None => return,
-        };
-        let schema = batch.schema();
-        for (i, field) in schema.fields().iter().enumerate() {
-            let name = field.name();
-            if qc.null_ratio_max.contains_key(name.as_str()) {
-                *self.quality_null_counts.entry(name.clone()).or_default() +=
-                    batch.column(i).null_count();
-            }
-            if qc.unique_columns.contains(name) {
-                let col = batch.column(i);
-                let set = self.quality_unique_sets.entry(name.clone()).or_default();
-                if let Ok(formatter) = arrow::util::display::ArrayFormatter::try_new(
-                    col.as_ref(),
-                    &arrow::util::display::FormatOptions::default(),
-                ) {
-                    for row in 0..col.len() {
-                        set.insert(formatter.value(row).to_string());
-                    }
+        if self.quality_columns.is_none() {
+            return;
+        }
+        for (i, name) in &self.quality_null_indices {
+            *self.quality_null_counts.entry(name.clone()).or_default() +=
+                batch.column(*i).null_count();
+        }
+        let fmt_options = arrow::util::display::FormatOptions::default();
+        for (i, name) in &self.quality_unique_indices {
+            let col = batch.column(*i);
+            let set = self.quality_unique_sets.entry(name.clone()).or_default();
+            if let Ok(formatter) =
+                arrow::util::display::ArrayFormatter::try_new(col.as_ref(), &fmt_options)
+            {
+                for row in 0..col.len() {
+                    set.insert(formatter.value(row).to_string());
                 }
             }
         }
@@ -274,6 +274,23 @@ impl BatchSink for ExportSink {
         let file = self.tmp.as_file().try_clone()?;
         let buf_writer = BufWriter::new(file);
         self.writer = Some(fmt.create_writer(&enriched, Box::new(buf_writer))?);
+        // Build quality field index cache from dest_schema (after stripping internal cols).
+        if let Some(qc) = &self.quality_columns {
+            self.quality_null_indices = dest_schema
+                .fields()
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| qc.null_ratio_max.contains_key(f.name().as_str()))
+                .map(|(i, f)| (i, f.name().clone()))
+                .collect();
+            self.quality_unique_indices = dest_schema
+                .fields()
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| qc.unique_columns.contains(f.name()))
+                .map(|(i, f)| (i, f.name().clone()))
+                .collect();
+        }
         // `schema` keeps internal columns so cursor extraction (e.g. synthetic
         // `_rivet_coalesced_cursor`) can index by name. `dest_schema` is what
         // downstream consumers see — used for schema-change detection.
@@ -284,20 +301,22 @@ impl BatchSink for ExportSink {
     }
 
     fn on_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        let dest_batch = match &self.strip_internal_column {
+        // Avoid cloning the batch when no internal column needs to be stripped.
+        let stripped: Option<RecordBatch> = match &self.strip_internal_column {
             Some(strip) if batch.schema().index_of(strip).is_ok() => {
-                Self::record_batch_without_internal(batch, strip)?
+                Some(Self::record_batch_without_internal(batch, strip)?)
             }
-            _ => batch.clone(),
+            _ => None,
         };
+        let dest_batch: &RecordBatch = stripped.as_ref().unwrap_or(batch);
 
         self.total_rows += dest_batch.num_rows();
         self.part_rows += dest_batch.num_rows();
-        self.track_quality(&dest_batch);
-        self.track_shape(&dest_batch);
+        self.track_quality(dest_batch);
+        self.track_shape(dest_batch);
 
         let output = if let Some(es) = &self.enriched_schema {
-            enrich::enrich_batch(&dest_batch, &self.meta, es, self.exported_at_us)?
+            enrich::enrich_batch(dest_batch, &self.meta, es, self.exported_at_us)?
         } else {
             dest_batch.clone()
         };
@@ -678,9 +697,10 @@ mod tests {
 
     #[test]
     fn track_quality_counts_nulls() {
+        use crate::source::BatchSink;
         let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
         let batch = RecordBatch::try_new(
-            schema,
+            schema.clone(),
             vec![Arc::new(StringArray::from(vec![
                 Some("a"),
                 None,
@@ -691,18 +711,23 @@ mod tests {
         .unwrap();
 
         let mut sink = minimal_sink_with_quality(vec!["name".into()], vec![]);
+        sink.on_schema(schema).unwrap();
         sink.track_quality(&batch);
         assert_eq!(sink.quality_null_counts.get("name"), Some(&2));
     }
 
     #[test]
     fn track_quality_counts_uniques() {
+        use crate::source::BatchSink;
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 1, 3]))])
-                .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 1, 3]))],
+        )
+        .unwrap();
 
         let mut sink = minimal_sink_with_quality(vec![], vec!["id".into()]);
+        sink.on_schema(schema).unwrap();
         sink.track_quality(&batch);
         assert_eq!(sink.quality_unique_sets.get("id").unwrap().len(), 3);
     }
@@ -766,6 +791,8 @@ mod tests {
             quality_null_counts: std::collections::HashMap::new(),
             quality_unique_sets: std::collections::HashMap::new(),
             quality_columns: None,
+            quality_null_indices: Vec::new(),
+            quality_unique_indices: Vec::new(),
             max_file_size: None,
             completed_parts: Vec::new(),
             strip_internal_column: None,

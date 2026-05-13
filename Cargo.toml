@@ -69,6 +69,11 @@ mach2 = "0.4"
 [dev-dependencies]
 bytes = "1"
 serde_json = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "hot_paths"
+harness = false
 
 [features]
 default = ["jemalloc"]
@@ -78,4 +83,4 @@ jemalloc = ["tikv-jemallocator"]
 strip = true
 lto = true
 codegen-units = 1
-opt-level = "z"
+opt-level = "s"

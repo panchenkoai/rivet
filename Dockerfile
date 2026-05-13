@@ -17,8 +17,11 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 rivet \
+    && useradd --uid 10001 --gid rivet --no-create-home rivet
 
 COPY --from=builder /src/target/release/rivet /usr/local/bin/rivet
 
+USER rivet
 ENTRYPOINT ["rivet"]

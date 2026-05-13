@@ -180,12 +180,14 @@ fn format_rate(r: f64) -> String {
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        return s.to_string();
+    match s.char_indices().nth(max_chars) {
+        None => s.to_owned(),
+        Some((byte_pos, _)) => {
+            let mut out = s[..byte_pos].to_owned();
+            out.push('…');
+            out
+        }
     }
-    let mut out: String = s.chars().take(max_chars).collect();
-    out.push('…');
-    out
 }
 
 /// Persist to state DB and optionally write JSON.  Failures are logged but

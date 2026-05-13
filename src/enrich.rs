@@ -51,34 +51,43 @@ pub fn enrich_batch(
     }
 
     if meta.row_hash {
-        let mut hashes = Vec::with_capacity(n);
-        for row in 0..n {
-            hashes.push(hash_row(batch, row));
-        }
-        columns.push(Arc::new(Int64Array::from(hashes)));
+        columns.push(Arc::new(hash_column(batch, n)));
     }
 
     Ok(RecordBatch::try_new(enriched_schema.clone(), columns)?)
 }
 
-/// Compute a deterministic 64-bit hash of all column values in a row.
-/// Uses the lower 64 bits of xxHash3-128 reinterpreted as signed i64.
-fn hash_row(batch: &RecordBatch, row: usize) -> i64 {
+/// Compute deterministic 64-bit hashes for all rows in a batch.
+/// Creates one ArrayFormatter per column (avoids per-cell String allocations),
+/// then reuses a single scratch buffer across all rows.
+fn hash_column(batch: &RecordBatch, n: usize) -> Int64Array {
+    use std::io::Write as IoWrite;
     use xxhash_rust::xxh3::xxh3_128;
 
+    let options = arrow::util::display::FormatOptions::default();
+    let formatters: Vec<Option<arrow::util::display::ArrayFormatter>> = (0..batch.num_columns())
+        .map(|i| {
+            arrow::util::display::ArrayFormatter::try_new(batch.column(i).as_ref(), &options).ok()
+        })
+        .collect();
+
     let mut buf = Vec::with_capacity(256);
-    for col_idx in 0..batch.num_columns() {
-        let array = batch.column(col_idx);
-        if array.is_null(row) {
-            buf.extend_from_slice(b"\x00");
-        } else {
-            let s = arrow::util::display::array_value_to_string(array, row).unwrap_or_default();
-            buf.extend_from_slice(s.as_bytes());
+    let mut hashes = Vec::with_capacity(n);
+    for row in 0..n {
+        buf.clear();
+        for (col_idx, fmt_opt) in formatters.iter().enumerate() {
+            let array = batch.column(col_idx);
+            if array.is_null(row) {
+                buf.extend_from_slice(b"\x00");
+            } else if let Some(fmt) = fmt_opt {
+                let _ = write!(buf, "{}", fmt.value(row));
+            }
+            buf.push(b'\x1f');
         }
-        buf.push(b'\x1f'); // unit separator between fields
+        let h = xxh3_128(&buf);
+        hashes.push(h as i64);
     }
-    let h = xxh3_128(&buf);
-    h as i64 // lower 64 bits, reinterpreted as signed
+    Int64Array::from(hashes)
 }
 
 #[cfg(test)]
