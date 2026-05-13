@@ -291,6 +291,14 @@ pub(super) fn run_export_job(
         duration_ms: summary.duration_ms,
     });
 
+    if let Err(e) = state.store_journal(&summary.journal) {
+        log::warn!(
+            "export '{}': journal persist failed (run history not stored): {:#}",
+            summary.export_name,
+            e
+        );
+    }
+
     if let Err(e) = state.record_metric(
         &summary.export_name,
         &summary.run_id,

@@ -20,6 +20,7 @@
 //! `RunSummary` is derived from `RunJournal`.
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 use crate::plan::ResolvedRunPlan;
 
@@ -28,7 +29,7 @@ use crate::plan::ResolvedRunPlan;
 /// Owned, serialisable snapshot of the resolved execution plan, captured at
 /// the moment a run starts.  Answers "what was planned?" without requiring the
 /// original `ResolvedRunPlan` to remain in scope.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanSnapshot {
     pub export_name: String,
     pub base_query: String,
@@ -71,7 +72,7 @@ impl From<&ResolvedRunPlan> for PlanSnapshot {
 /// - *Degraded* — `QualityIssue`, `SchemaChanged`, `Warning`
 /// - *Succeeded* — `ValidationResult`, `ReconciliationResult`
 /// - *Outcome* — `RunCompleted`
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RunEvent {
     // ── Planned ──────────────────────────────────────────────
     /// Emitted once at the start of a run with a snapshot of the resolved plan.
@@ -149,7 +150,7 @@ pub enum RunEvent {
 // ─── Journal entry ───────────────────────────────────────────────────────────
 
 /// A timestamped wrapper around a `RunEvent`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalEntry {
     pub recorded_at: DateTime<Utc>,
     pub event: RunEvent,
@@ -161,7 +162,7 @@ pub struct JournalEntry {
 ///
 /// Accumulated during execution via `record()`.  Query methods let callers
 /// answer the four DoD questions without iterating `entries` directly.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunJournal {
     pub run_id: String,
     pub export_name: String,

@@ -4,6 +4,7 @@ use crate::error::Result;
 
 mod checkpoint;
 mod cursor;
+mod journal_store;
 mod manifest;
 mod metrics;
 mod progression;
@@ -171,6 +172,21 @@ const MIGRATIONS: &[(i64, &str)] = &[
             updated_at TEXT NOT NULL,
             PRIMARY KEY (export_name, column_name)
         );",
+    ),
+    // v7: structured run journal — full typed event log persisted at run end.
+    // Stored as a single JSON blob per run for simplicity; `run_id` matches
+    // the value embedded in RunJournal itself.  Indexed by export_name + time
+    // so `rivet journal <export>` queries stay fast on long histories.
+    (
+        7,
+        "CREATE TABLE IF NOT EXISTS run_journal (
+            run_id TEXT PRIMARY KEY,
+            export_name TEXT NOT NULL,
+            finished_at TEXT NOT NULL,
+            journal_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_run_journal_export
+            ON run_journal(export_name, finished_at DESC);",
     ),
 ];
 

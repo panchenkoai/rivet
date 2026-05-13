@@ -1335,6 +1335,21 @@ exports:
     assert_eq!(int2s.value(0), 32767_i16);
     assert_eq!(int2s.value(1), -32768_i16);
     assert!(int2s.is_null(2), "int2_col[2] must be null");
+
+    // INTERVAL values must round-trip as ISO 8601 duration strings.
+    let intervals = b
+        .column_by_name("interval_col")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(
+        intervals.value(0),
+        "P1Y2M3D",
+        "INTERVAL '1 year 2 months 3 days'"
+    );
+    assert_eq!(intervals.value(1), "P-1Y", "INTERVAL '-1 year'");
+    assert_eq!(intervals.value(2), "PT0S", "INTERVAL '0'");
 }
 
 /// Verifies that every Rivet-mapped MySQL type produces the correct Arrow

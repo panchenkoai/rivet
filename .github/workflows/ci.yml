@@ -83,6 +83,33 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --lib -- plan::validate::tests
 
+  test-type-golden:
+    name: Type-golden tests (semantic gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start databases
+        run: docker compose up -d postgres mysql
+
+      - name: Wait for databases
+        run: |
+          echo "Waiting for Postgres..."
+          for i in $(seq 1 30); do docker compose exec -T postgres pg_isready -U rivet && break || sleep 2; done
+          echo "Waiting for MySQL..."
+          for i in $(seq 1 30); do docker compose exec -T mysql mysqladmin ping -h localhost -uroot -privet 2>/dev/null && break || sleep 2; done
+
+      - name: Run type-golden tests
+        run: cargo test --release --test live_type_golden -- --ignored
+
+      - name: Stop services
+        if: always()
+        run: docker compose down
+
   build-release:
     name: Release build
     runs-on: ubuntu-latest
