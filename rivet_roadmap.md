@@ -571,9 +571,9 @@ This section merges the former `rivet_roadmap_v3.md` task tracker. **Strategic p
 
 ---
 
-## 9.2 Current state (v0.3.5)
+## 9.2 Current state (post-v0.3.5)
 
-Rivet core is **feature-complete for stable extraction with type safety**. All Wave 1–3 stabilisation epics are shipped; Epic 14 type safety layer (M1–M6) complete.
+Rivet core is **feature-complete for stable extraction with type safety**. All Wave 1–3 stabilisation epics are shipped; Epic 14 type safety layer (M1–M6) complete; observability layer enhanced with persistent RunJournal.
 
 ### Extraction
 
@@ -596,9 +596,17 @@ Rivet core is **feature-complete for stable extraction with type safety**. All W
 - `TypePolicy` with Fail/Warn/Allow per fidelity level; `--strict` CLI gate
 - `rivet check --type-report [--json] [--target bigquery]`
 - BigQuery compatibility layer: NUMERIC, BIGNUMERIC, TIMESTAMP, DATETIME, REPEATED, overflow warnings
-- Per-column overrides: `columns: { col: { decimal_precision, decimal_scale } }`
-- Complex types: Enum, Interval (Postgres), List/Array (Postgres), MySQL TIME/TIME2, MySQL ENUM/SET
-- **Golden E2E trust proof** — [`tests/live_type_golden.rs`](tests/live_type_golden.rs): Postgres *and* MySQL; DB → `rivet run` → Parquet → Arrow read-back; decimal sums, timestamp `tz=None` vs `UTC`, binary, UUID/VARCHAR text. Documented in [docs/reference/testing.md](docs/reference/testing.md#trust-milestone-type-golden-round-trip).
+- Per-column overrides: `columns: { col: decimal(p,s) }` inline string syntax; `rivet init` auto-generates from `information_schema` precision/scale
+- Complex types: Enum, Interval→Utf8 ISO 8601 (Postgres), List/Array (Postgres), MySQL TIME/TIME2, MySQL ENUM/SET
+- Unsupported-column errors now report **all** unmappable columns in one message (not just the first)
+- **Golden E2E trust proof** — [`tests/live_type_golden.rs`](tests/live_type_golden.rs): Postgres *and* MySQL; DB → `rivet run` → Parquet → Arrow read-back; decimal sums, timestamp `tz=None` vs `UTC`, binary, UUID/VARCHAR text, INTERVAL ISO 8601 values. Dedicated `test-type-golden` CI gate (Postgres + MySQL only, faster than full `e2e` job).
+
+### Observability
+
+- `RunJournal` domain model: 13 `RunEvent` variants (plan snapshot, files, retries, chunks, quality issues, schema changes, outcome)
+- **Persistent** — serialized to `run_journal` SQLite table (migration v7) at end of every run; `store_journal` / `load_journal` / `recent_journals` APIs
+- **`rivet journal --config <file> --export <name>`** — inspect last N runs: per-run header (status, duration, run_id), files/rows/bytes summary, retries, quality issues, schema changes, error first line
+- `--run-id <id>` flag to inspect a specific run
 
 ### Architecture (stabilisation plan — all complete)
 
@@ -606,16 +614,14 @@ Rivet core is **feature-complete for stable extraction with type safety**. All W
 - Centralized `PlanValidator` with compatibility diagnostics (Epic 2)
 - State update invariants + `tests/invariants.rs` (Epic 4, ADR-0001)
 - CLI-product boundary locked, module visibility hardened (Epic 5, ADR-0002)
-- Domain state stores: `CursorStore`, `ManifestStore`, `MetricsStore`, `SchemaHistoryStore` (Epic 6)
+- Domain state stores: `CursorStore`, `ManifestStore`, `MetricsStore`, `SchemaHistoryStore`, `JournalStore` (Epics 6, 10)
 - `ExtractionStrategy` explicit types; Planning / Execution / Persistence layers (Epics 7, 8, ADR-0003)
 - `DestinationCapabilities`, `WriteCommitProtocol` per backend (Epic 9, ADR-0004)
-- `RunJournal` domain model with 13 `RunEvent` variants (Epic 10)
-- Invariant + compatibility matrix + recovery test suites in CI (Epics 11–13)
-- Semantic release gates — `test-invariants`, `test-recovery`, `test-compatibility` required before build (Epic 14/arch)
+- Semantic release gates — `test-invariants`, `test-recovery`, `test-compatibility`, **`test-type-golden`** required before build (Epics 11–14/arch)
 
 ### Release & distribution
 
-- **CI:** rustfmt, clippy, tests, release build, **E2E** (Docker Compose), cargo audit, semantic gates
+- **CI:** rustfmt, clippy, tests, release build, **E2E** (Docker Compose), cargo audit, semantic gates + `test-type-golden`
 - **Release:** Linux x86_64/arm64, macOS arm64/Intel binaries; Docker GHCR; Homebrew tap
 - **Published:** `rivet-cli` on crates.io
 
@@ -714,7 +720,7 @@ Rivet core is **feature-complete for stable extraction with type safety**. All W
 | Task | Status | Priority | Notes |
 |------|--------|----------|-------|
 | I1 | ✅ Partial | P1 | Manual runs; standardized datasets TBD |
-| I2 | ✅ | P1 | `cargo bench` + `dev/bench.sh` save/compare; column_scan + shape_tracking groups |
+| I2 | ✅ | P1 | `cargo bench` + `dev/scripts/bench.sh` save/compare; column_scan + shape_tracking groups |
 | I3 | ✅ | — | USER_GUIDE defaults |
 | I4 | ✅ | — | Check warnings |
 | I5 | ✅ | P2 | Capacity/memory planning section in tuning.md (peak RSS formula, table width rules) |
@@ -783,7 +789,7 @@ Prioritize by stabilization before distribution polish:
 1. ✅ **Epic 7 schema drift policy** — `on_schema_drift: warn|continue|fail` YAML hook shipped.
 2. ✅ **Epic 8 data shape drift** — `export_shape` SQLite table; `shape_drift_warn_factor` YAML config; warns on `N×` growth.
 3. ✅ **F5 + I5** — reconcile/validate tradeoffs (cli.md); capacity/memory planning (tuning.md).
-4. ✅ **I2** — `cargo bench` + `dev/bench.sh` save/compare harness; column_scan + shape_tracking groups.
+4. ✅ **I2** — `cargo bench` + `dev/scripts/bench.sh` save/compare harness; column_scan + shape_tracking groups.
 5. **Epic 4 (§5)** — external/durable state backend when pilots need multi-replica or stateless workers.
 
 ---

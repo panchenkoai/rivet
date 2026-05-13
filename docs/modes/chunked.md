@@ -55,13 +55,13 @@ The GIF above was recorded with `RUST_LOG=info` on a 50,000-row fixture (10 chun
 
 Use a **small `chunk_size`** relative to your table if you want many steps on the bar (each finished chunk advances it once). **`parallel: 1`** still updates the bar after each sequential chunk.
 
-**Ready-made example in this repo:** [`dev/bench_chunked_p4_safe.yaml`](../../dev/bench_chunked_p4_safe.yaml) exports PostgreSQL `content_items` with **`parallel: 4`** and **`tuning.profile: safe`** (good for trying the bar on a wide table without hammering the source). Related variants: `dev/bench_chunked_p2.yaml`, `dev/bench_chunked_p4.yaml`.
+**Ready-made example in this repo:** [`dev/scenarios/chunked_postgres_bench.yaml`](../../dev/scenarios/chunked_postgres_bench.yaml) includes **`bench_content_p4_safe`**: PostgreSQL `content_items` with **`parallel: 4`** and **`tuning.profile: safe`** (good for trying the bar on a wide table without hammering the source). Other exports in the same file cover serial / highly parallel / fatchunk / balanced profiles.
 
 ```bash
 # From repo root; Postgres up + seeded (e.g. docker compose + cargo run --bin seed ...)
 mkdir -p dev/output/bench
-rivet check --config dev/bench_chunked_p4_safe.yaml
-rivet run --config dev/bench_chunked_p4_safe.yaml
+rivet check --config dev/scenarios/chunked_postgres_bench.yaml
+rivet run --config dev/scenarios/chunked_postgres_bench.yaml --export bench_content_p4_safe
 # Optional: RUST_LOG=info for more log detail; RUST_LOG=warn to reduce log noise (bar unchanged in a TTY)
 ```
 

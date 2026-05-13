@@ -1,0 +1,60 @@
+# Postgres preflight stress profiles (one source). Formerly dev/pg_{safe,worst_case,degraded}.yaml.
+#   rivet check --config dev/workbench/pg_preflight_demos.yaml
+#   rivet check --config dev/workbench/pg_preflight_demos.yaml --export page_views_incremental
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+  tuning:
+    profile: safe
+
+exports:
+  - name: pg_users_safe
+    query: "SELECT id, name, email, age, balance, is_active, created_at, updated_at FROM users"
+    mode: full
+    format: csv
+    destination:
+      type: local
+      path: ./dev/output
+
+  - name: content_items_full
+    query: >
+      SELECT id, title, body, raw_html, metadata::text as metadata,
+             tags, author_name, author_email, source_url, category,
+             status, priority, view_count, comment_count, word_count,
+             language, published_at, updated_at, created_at,
+             extra_data::text as extra_data
+      FROM content_items
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/output
+
+  - name: page_views_incremental
+    query: >
+      SELECT id, session_id, user_id, url, referrer, user_agent,
+             ip_address, country_code, region, city, device_type,
+             browser, os, screen_width, screen_height,
+             viewport_width, viewport_height, page_load_ms,
+             dom_ready_ms, time_on_page_ms, scroll_depth_pct,
+             click_count, is_bounce, utm_source, utm_medium,
+             utm_campaign, created_at
+      FROM page_views
+    mode: incremental
+    cursor_column: created_at
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/output
+
+  - name: page_views_full
+    query: >
+      SELECT id, session_id, url, device_type, browser, os,
+             page_load_ms, time_on_page_ms, scroll_depth_pct,
+             is_bounce, created_at
+      FROM page_views
+    mode: full
+    format: csv
+    destination:
+      type: local
+      path: ./dev/output

@@ -21,6 +21,7 @@ See [reference/compatibility.md](reference/compatibility.md) for the version-sup
 
 | Guide | Description |
 |-------|-------------|
+| [Pilot guide — index](pilot/README.md) | **Start here for pilots:** pick quickstart, demo, or full walkthrough; ordered checklist |
 | [Getting Started](getting-started.md) | Install Rivet, connect to your database, run your first export |
 | [Quickstart: Postgres](pilot/quickstart-postgres.md) | One-table export in 5 minutes (PostgreSQL) |
 | [Quickstart: MySQL](pilot/quickstart-mysql.md) | One-table export in 5 minutes (MySQL) |

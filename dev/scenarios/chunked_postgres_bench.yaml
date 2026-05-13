@@ -1,0 +1,122 @@
+# Chunked benchmarking scenario (Postgres `content_items`, docker-compose seed).
+#
+# Config path: use this file for all chunked bench exports (replaces dev/bench_chunked_*.yaml).
+#
+#   rivet run --config dev/scenarios/chunked_postgres_bench.yaml --export bench_content_p4
+#   rivet run --config dev/scenarios/chunked_postgres_bench.yaml --export bench_content_p4_serial
+#   rivet run --config dev/scenarios/chunked_postgres_bench.yaml --export bench_content_seq
+#
+# Run all exports at once:
+#   --parallel-exports / YAML parallel_exports: true  → threads
+#   --parallel-export-processes                         → one OS process per export
+
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+  tuning:
+    profile: fast
+    batch_size: 1000
+
+exports:
+  - name: bench_content_p4
+    query: "SELECT id, title, body, raw_html, tags, author_name, category, status, created_at FROM content_items"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 10000
+    chunk_checkpoint: true
+    parallel: 10
+    format: parquet
+    meta_columns:
+      exported_at: true
+      row_hash: true
+    destination:
+      type: local
+      path: ./dev/output/bench
+
+  - name: bench_content_p4_serial
+    query: "SELECT id, title, body, raw_html, tags, author_name, category, status, created_at FROM content_items"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 10000
+    chunk_checkpoint: true
+    parallel: 1
+    format: parquet
+    meta_columns:
+      exported_at: true
+      row_hash: true
+    destination:
+      type: local
+      path: ./dev/output/bench
+
+  - name: bench_content_p4_fatchunk
+    query: "SELECT id, title, body, raw_html, tags, author_name, category, status, created_at FROM content_items"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 50000
+    chunk_checkpoint: true
+    parallel: 10
+    format: parquet
+    meta_columns:
+      exported_at: true
+      row_hash: true
+    destination:
+      type: local
+      path: ./dev/output/bench
+
+  - name: bench_content_p4_no_meta
+    query: "SELECT id, title, body, raw_html, tags, author_name, category, status, created_at FROM content_items"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 10000
+    chunk_checkpoint: true
+    parallel: 10
+    format: parquet
+    meta_columns:
+      exported_at: false
+      row_hash: false
+    destination:
+      type: local
+      path: ./dev/output/bench
+
+  - name: bench_content_p4_balanced
+    query: "SELECT id, title, body, raw_html, tags, author_name, category, status, created_at FROM content_items"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 10000
+    chunk_checkpoint: true
+    parallel: 10
+    format: parquet
+    tuning:
+      profile: balanced
+    meta_columns:
+      exported_at: true
+      row_hash: true
+    destination:
+      type: local
+      path: ./dev/output/bench
+
+  # From former dev/bench_chunked_seq.yaml — chunked without checkpoint, parallel 2
+  - name: bench_content_seq
+    query: "SELECT id, title, body, raw_html, tags, author_name, category, status, created_at FROM content_items"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 50000
+    parallel: 2
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/output/bench
+
+  # From former dev/bench_chunked_p4_safe.yaml — safe profile, parallel 4
+  - name: bench_content_p4_safe
+    query: "SELECT id, title, body, raw_html, tags, author_name, category, status, created_at FROM content_items"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 50000
+    parallel: 4
+    format: parquet
+    tuning:
+      profile: safe
+    destination:
+      type: local
+      path: ./dev/output/bench

@@ -121,7 +121,7 @@ CREATE INDEX idx_orders_coalesce_updated_at ON orders_coalesce(updated_at);
 CREATE INDEX idx_orders_coalesce_created_at ON orders_coalesce(created_at);
 
 -- ─── Type-matrix demo: golden-style columns for parquet → warehouse checks ───
--- See dev/pg_type_matrix_export.yaml and dev/bigquery/type_matrix_bigquery.md
+-- See dev/workbench/pg_type_matrix.yaml and dev/bigquery/type_matrix_bigquery.md
 CREATE TABLE rivet_type_matrix (
     id BIGINT PRIMARY KEY,
     label TEXT NOT NULL,
@@ -163,7 +163,7 @@ INSERT INTO rivet_type_matrix (
       '{}'::jsonb);
 
 -- ─── Full type-matrix: covers every Rivet-mapped PG type ───────────────────
--- See dev/pg_type_matrix_full_export.yaml and tests/live_type_golden.rs
+-- See dev/workbench/pg_type_matrix.yaml and tests/live_type_golden.rs
 CREATE TYPE rivet_status AS ENUM ('active', 'inactive', 'pending');
 
 CREATE TABLE rivet_type_matrix_full (

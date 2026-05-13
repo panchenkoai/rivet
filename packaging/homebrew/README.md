@@ -19,13 +19,13 @@ After you publish a GitHub Release (tag `v…`, assets + `SHA256SUMS.txt` from C
 
 ```bash
 cd /path/to/rivet
-chmod +x dev/update_homebrew_formula.sh
+chmod +x dev/scripts/update_homebrew_formula.sh
 
 # Uses version from Cargo.toml and repository URL for GitHub owner/repo
-./dev/update_homebrew_formula.sh
+./dev/scripts/update_homebrew_formula.sh
 
 # Or if the app lives under another fork:
-GITHUB_REPOSITORY=panchenkoai/rivet ./dev/update_homebrew_formula.sh
+GITHUB_REPOSITORY=panchenkoai/rivet ./dev/scripts/update_homebrew_formula.sh
 ```
 
 Copy the generated file:
@@ -75,12 +75,12 @@ The job clones `https://github.com/<owner>/homebrew-rivet` with **`HOMEBREW_TAP_
 4. **Paste:** no extra spaces or newlines when saving the secret.
 5. Confirm the tap repo exists: `https://github.com/<owner>/homebrew-rivet` (same `<owner>` as `github.repository_owner` in the workflow).
 
-Until the token is fixed, update the tap manually (copy `packaging/homebrew/rivet.rb` after release, or run `dev/update_homebrew_formula.sh` locally).
+Until the token is fixed, update the tap manually (copy `packaging/homebrew/rivet.rb` after release, or run `dev/scripts/update_homebrew_formula.sh` locally).
 
 ### Manual / local refresh
 
 Same as before — download checksums from the release or use a local `SHA256SUMS.txt`:
 
 ```bash
-./dev/update_homebrew_formula.sh --tag v0.2.0-beta.2 --sums-file path/to/SHA256SUMS.txt
+./dev/scripts/update_homebrew_formula.sh --tag v0.2.0-beta.2 --sums-file path/to/SHA256SUMS.txt
 ```

@@ -123,7 +123,7 @@ CREATE INDEX idx_orders_coalesce_updated_at ON orders_coalesce(updated_at);
 CREATE INDEX idx_orders_coalesce_created_at ON orders_coalesce(created_at);
 
 -- ─── Type-matrix demo (parquet → BigQuery / tooling checks) ───
--- See dev/mysql_type_matrix_export.yaml and dev/bigquery/type_matrix_bigquery.md
+-- See dev/workbench/mysql_type_matrix.yaml and dev/bigquery/type_matrix_bigquery.md
 CREATE TABLE rivet_type_matrix (
     id BIGINT PRIMARY KEY,
     label VARCHAR(200) NOT NULL,
@@ -165,7 +165,7 @@ INSERT INTO rivet_type_matrix (
       CAST('{}' AS JSON));
 
 -- ─── Full type-matrix: covers every Rivet-mapped MySQL type ────────────────
--- See dev/mysql_type_matrix_full_export.yaml and tests/live_type_golden.rs
+-- See dev/workbench/mysql_type_matrix.yaml and tests/live_type_golden.rs
 CREATE TABLE rivet_type_matrix_full (
     id            BIGINT PRIMARY KEY,
     flag          BOOLEAN,                         -- TINYINT(1) → Bool

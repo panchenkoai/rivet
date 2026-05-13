@@ -1,5 +1,7 @@
 # Pilot Walkthrough — From Discovery to Verified Repair
 
+**How to use this page:** work the sections **in order** (Steps 1 → 9). Each step lists the exact Rivet commands and the contracts they satisfy. For a one-page “what to run in what order” summary, start at [Pilot guide (README)](README.md).
+
 This is the end-to-end pilot guide that exercises the full contract stack: discovery, plan/apply, prioritization, chunked extraction with checkpoint, partition-level reconcile, targeted repair, and the committed/verified progression boundary.
 
 If you just want to export one table, start with [Quickstart: Postgres](quickstart-postgres.md) or [Quickstart: MySQL](quickstart-mysql.md). This walkthrough is for pilots preparing a real production rollout.

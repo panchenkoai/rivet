@@ -1,0 +1,34 @@
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+
+exports:
+  - name: pg_orders_incremental
+    query: "SELECT id, user_id, product, quantity, price, status, updated_at FROM orders"
+    mode: incremental
+    cursor_column: updated_at
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/output
+
+  - name: pg_events_incremental
+    query: "SELECT id, user_id, event_type, payload::text as payload, ip_address, created_at FROM events"
+    mode: incremental
+    cursor_column: id
+    format: csv
+    destination:
+      type: local
+      path: ./dev/output
+
+  # ADR-0007 COALESCE(updated_at, created_at); seed: orders_coalesce (dev/postgres/init.sql)
+  - name: pg_orders_coalesce
+    query: "SELECT id, product, quantity, price, updated_at, created_at FROM orders_coalesce"
+    mode: incremental
+    cursor_column: updated_at
+    cursor_fallback_column: created_at
+    incremental_cursor_mode: coalesce
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/output

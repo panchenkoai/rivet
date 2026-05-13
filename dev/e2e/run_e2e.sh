@@ -223,13 +223,13 @@ $RIVET run --config dev/e2e/pg_e2e.yaml --export pg_orders_incremental --validat
 # ──────────────────────────────────────────────────────────────
 section "9. Stdout destination"
 
-_stdout=$($RIVET run --config dev/test_stdout.yaml 2>/dev/null | head -c 100)
+_stdout=$($RIVET run --config dev/fixtures/test_stdout.yaml 2>/dev/null | head -c 100)
 if [ -n "$_stdout" ]; then pass "stdout destination"; else fail "stdout destination"; fi
 
 # ──────────────────────────────────────────────────────────────
 section "10. Parameterized queries"
 
-$RIVET run --config dev/test_params.yaml --param MAX_ID=10 >/dev/null 2>&1 && pass "params" || fail "params"
+$RIVET run --config dev/fixtures/test_params.yaml --param MAX_ID=10 >/dev/null 2>&1 && pass "params" || fail "params"
 
 # ──────────────────────────────────────────────────────────────
 section "11. Reconciliation (--reconcile)"

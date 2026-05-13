@@ -43,15 +43,15 @@ Examples:
 - R5: `exit 1, msg contains "fingerprint mismatch"; then reset-chunks + revert YAML, R3 export OK`
 - B1: `check OK, 4 exports, no UNSAFE`
 
-### Repeatable smoke (`dev/run_uat_smoke.sh`)
+### Repeatable smoke (`dev/scripts/run_uat_smoke.sh`)
 
 From repo root:
 
 ```bash
-bash dev/run_uat_smoke.sh
+bash dev/scripts/run_uat_smoke.sh
 ```
 
-Summaries go to `/tmp/rivet_uat_smoke.txt`. **Actual** below matches **`bash dev/run_uat_smoke.sh`**: **31 PASS, 0 FAIL, 3 SKIP** when Postgres is up and MySQL is absent (B3/C5/C6/G2 skipped). A3/H2/O1 use captured stdout/stderr so pipelines do not false-fail. **P2** part-file count **grows** with repeated split runs (`wc -l` ≥ 2). Re-run after `docker compose up -d` / seed for fuller coverage.
+Summaries go to `/tmp/rivet_uat_smoke.txt`. **Actual** below matches **`bash dev/scripts/run_uat_smoke.sh`**: **31 PASS, 0 FAIL, 3 SKIP** when Postgres is up and MySQL is absent (B3/C5/C6/G2 skipped). A3/H2/O1 use captured stdout/stderr so pipelines do not false-fail. **P2** part-file count **grows** with repeated split runs (`wc -l` ≥ 2). Re-run after `docker compose up -d` / seed for fuller coverage.
 
 ---
 
@@ -85,10 +85,10 @@ Summaries go to `/tmp/rivet_uat_smoke.txt`. **Actual** below matches **`bash dev
 
 | ID  | Scenario             | Command / Steps                                               | Expected                               | Actual | Pass |
 | --- | -------------------- | ------------------------------------------------------------- | -------------------------------------- | ------ | ---- |
-| B1  | Preflight all (PG)   | `rivet check --config dev/pg_full.yaml`                       | Per-export strategy and health verdict | smoke: exit 0, multi-export verdicts | [x]  |
-| B2  | Preflight one export | `rivet check --config dev/pg_full.yaml --export pg_users_csv` | Only that export evaluated             | exit 0 | [x]  |
-| B3  | Preflight (MySQL)    | `rivet check --config dev/mysql_full.yaml`                    | Completes without panic                | **SKIP:** no `mysql` container in compose this run | [ ]  |
-| B4  | Doctor (auth)        | `rivet doctor --config dev/pg_full.yaml`                      | Source OK; local destination OK        | exit 0, `[OK]` source + dest | [x]  |
+| B1  | Preflight all (PG)   | `rivet check --config dev/workbench/pg_full.yaml`                       | Per-export strategy and health verdict | smoke: exit 0, multi-export verdicts | [x]  |
+| B2  | Preflight one export | `rivet check --config dev/workbench/pg_full.yaml --export pg_users_csv` | Only that export evaluated             | exit 0 | [x]  |
+| B3  | Preflight (MySQL)    | `rivet check --config dev/workbench/mysql_full.yaml`                    | Completes without panic                | **SKIP:** no `mysql` container in compose this run | [ ]  |
+| B4  | Doctor (auth)        | `rivet doctor --config dev/workbench/pg_full.yaml`                      | Source OK; local destination OK        | exit 0, `[OK]` source + dest | [x]  |
 
 
 ---
@@ -98,12 +98,12 @@ Summaries go to `/tmp/rivet_uat_smoke.txt`. **Actual** below matches **`bash dev
 
 | ID  | Scenario              | Command / Steps                                                             | Expected                                      | Actual | Pass |
 | --- | --------------------- | --------------------------------------------------------------------------- | --------------------------------------------- | ------ | ---- |
-| C1  | Full CSV+Parquet (PG) | `rivet run --config dev/pg_full.yaml`                                       | Files in `dev/output/`; run summaries printed | 2026-03-30 smoke: `pg_users_csv --validate` exit 0 (C1_sample); **full** multi-export `pg_full` still run manually for complete sign-off | [x]  |
-| C2  | Validate row counts   | `rivet run --config dev/pg_full.yaml --export pg_users_parquet --validate`  | `validated: pass` in summary                  | summary contains validated pass | [x]  |
-| C3  | Incremental 1st run   | `rivet run --config dev/pg_incremental.yaml --export pg_orders_incremental` | Parquet written; cursor updated               | exit 0 | [x]  |
+| C1  | Full CSV+Parquet (PG) | `rivet run --config dev/workbench/pg_full.yaml`                                       | Files in `dev/output/`; run summaries printed | 2026-03-30 smoke: `pg_users_csv --validate` exit 0 (C1_sample); **full** multi-export `pg_full` still run manually for complete sign-off | [x]  |
+| C2  | Validate row counts   | `rivet run --config dev/workbench/pg_full.yaml --export pg_users_parquet --validate`  | `validated: pass` in summary                  | summary contains validated pass | [x]  |
+| C3  | Incremental 1st run   | `rivet run --config dev/workbench/pg_incremental.yaml --export pg_orders_incremental` | Parquet written; cursor updated               | exit 0 | [x]  |
 | C4  | Incremental 2nd run   | Repeat C3 without changing data                                             | 0 rows or skip; state unchanged               | 2nd run exit 0 | [x]  |
-| C5  | MySQL full            | `rivet run --config dev/mysql_full.yaml`                                    | Files in `dev/output/`                        | **SKIP:** no MySQL in compose | [ ]  |
-| C6  | MySQL incremental     | `rivet run --config dev/mysql_incremental.yaml`                             | Completes; state updated                      | **SKIP:** no MySQL in compose | [ ]  |
+| C5  | MySQL full            | `rivet run --config dev/workbench/mysql_full.yaml`                                    | Files in `dev/output/`                        | **SKIP:** no MySQL in compose | [ ]  |
+| C6  | MySQL incremental     | `rivet run --config dev/workbench/mysql_incremental.yaml`                             | Completes; state updated                      | **SKIP:** no MySQL in compose | [ ]  |
 
 
 ---
@@ -113,9 +113,9 @@ Summaries go to `/tmp/rivet_uat_smoke.txt`. **Actual** below matches **`bash dev
 
 | ID  | Scenario        | Command / Steps                                                                     | Expected                                   | Actual | Pass |
 | --- | --------------- | ----------------------------------------------------------------------------------- | ------------------------------------------ | ------ | ---- |
-| D1  | Show state      | `rivet state show --config dev/pg_incremental.yaml`                                 | Table with exports and last cursor         | table printed | [x]  |
-| D2  | Metrics history | `rivet metrics --config dev/pg_incremental.yaml --last 5`                           | Recent runs with status, rows, duration    | exit 0 | [x]  |
-| D3  | Reset state     | `rivet state reset --config dev/pg_incremental.yaml --export pg_orders_incremental` | Confirmation; next run acts like first run | not run (destructive); run manually when needed | [ ]  |
+| D1  | Show state      | `rivet state show --config dev/workbench/pg_incremental.yaml`                                 | Table with exports and last cursor         | table printed | [x]  |
+| D2  | Metrics history | `rivet metrics --config dev/workbench/pg_incremental.yaml --last 5`                           | Recent runs with status, rows, duration    | exit 0 | [x]  |
+| D3  | Reset state     | `rivet state reset --config dev/workbench/pg_incremental.yaml --export pg_orders_incremental` | Confirmation; next run acts like first run | not run (destructive); run manually when needed | [ ]  |
 
 
 ---
@@ -125,9 +125,9 @@ Summaries go to `/tmp/rivet_uat_smoke.txt`. **Actual** below matches **`bash dev
 
 | ID  | Scenario                                | Command / Steps                                                                 | Expected                                                        | Actual | Pass |
 | --- | --------------------------------------- | ------------------------------------------------------------------------------- | --------------------------------------------------------------- | ------ | ---- |
-| E1  | Chunked sequential                      | `rivet run --config dev/bench_chunked_seq.yaml`                                 | Chunk files created; logs show progress                         | exit 0 | [x]  |
-| E2  | Chunked parallel + checkpoint           | `rivet run --config dev/bench_chunked_p4.yaml --export bench_content_p4_serial` | `chunk_checkpoint: true`; multiple chunk files; success summary | exit 0; 20 chunks; 200k rows (see R1) | [x]  |
-| E3  | Full bench config (long) **(optional)** | `rivet run --config dev/bench_chunked_p4.yaml`                                  | All exports in YAML complete (sequential default); high DB load | not run in smoke | [ ]  |
+| E1  | Chunked sequential (no checkpoint)      | `rivet run --config dev/scenarios/chunked_postgres_bench.yaml --export bench_content_seq`      | Chunk files created; logs show progress                         | exit 0 | [x]  |
+| E2  | Chunked parallel + checkpoint           | `rivet run --config dev/scenarios/chunked_postgres_bench.yaml --export bench_content_p4_serial` | `chunk_checkpoint: true`; multiple chunk files; success summary | exit 0; 20 chunks; 200k rows (see R1) | [x]  |
+| E3  | Full bench config (long) **(optional)** | `rivet run --config dev/scenarios/chunked_postgres_bench.yaml`                                  | All exports in YAML complete (sequential default); high DB load | not run in smoke | [ ]  |
 
 
 ---
@@ -137,9 +137,9 @@ Summaries go to `/tmp/rivet_uat_smoke.txt`. **Actual** below matches **`bash dev
 
 | ID  | Scenario        | Command / Steps                                                          | Expected                                                       | Actual | Pass |
 | --- | --------------- | ------------------------------------------------------------------------ | -------------------------------------------------------------- | ------ | ---- |
-| F1  | Default zstd    | `rivet run --config dev/test_meta_columns.yaml --validate`               | Parquet compression = ZSTD                                     | exit 0 | [x]  |
-| F2  | Explicit codecs | `rivet run --config dev/test_compression.yaml`                           | snappy/none files differ in size; summary shows `compression:` | exit 0 | [x]  |
-| F3  | Skip empty      | `rivet run --config dev/test_compression.yaml --export users_skip_empty` | `status: skipped`, `files: 0`                                  | exit 0 | [x]  |
+| F1  | Default zstd    | `rivet run --config dev/fixtures/test_meta_columns.yaml --validate`               | Parquet compression = ZSTD                                     | exit 0 | [x]  |
+| F2  | Explicit codecs | `rivet run --config dev/fixtures/test_compression.yaml`                           | snappy/none files differ in size; summary shows `compression:` | exit 0 | [x]  |
+| F3  | Skip empty      | `rivet run --config dev/fixtures/test_compression.yaml --export users_skip_empty` | `status: skipped`, `files: 0`                                  | exit 0 | [x]  |
 | F4  | Meta columns    | Inspect `users_meta_test_*.parquet` from F1                              | Has `_rivet_exported_at` and `_rivet_row_hash`                 | not auto (use `parquet-tools` / duckdb) | [ ]  |
 
 
@@ -150,8 +150,8 @@ Summaries go to `/tmp/rivet_uat_smoke.txt`. **Actual** below matches **`bash dev
 
 | ID  | Scenario         | Command / Steps                                                | Expected                            | Actual | Pass |
 | --- | ---------------- | -------------------------------------------------------------- | ----------------------------------- | ------ | ---- |
-| G1  | PG structured    | `PGPASSWORD=rivet rivet check --config dev/pg_structured.yaml` | Parses host/user/database; connects | exit 0 | [x]  |
-| G2  | MySQL structured | `rivet check --config dev/mysql_structured.yaml`               | Same                                | **SKIP:** no MySQL | [ ]  |
+| G1  | PG structured    | `PGPASSWORD=rivet rivet check --config dev/workbench/pg_structured.yaml` | Parses host/user/database; connects | exit 0 | [x]  |
+| G2  | MySQL structured | `rivet check --config dev/workbench/mysql_structured.yaml`               | Same                                | **SKIP:** no MySQL | [ ]  |
 
 
 ---
@@ -161,8 +161,8 @@ Summaries go to `/tmp/rivet_uat_smoke.txt`. **Actual** below matches **`bash dev
 
 | ID  | Scenario          | Command / Steps                                    | Expected                        | Actual | Pass |
 | --- | ----------------- | -------------------------------------------------- | ------------------------------- | ------ | ---- |
-| H1  | Degraded scenario | `rivet check --config dev/pg_degraded.yaml`        | Verdict and suggestions printed | exit 0 | [x]  |
-| H2  | Wrong password    | `rivet doctor --config dev/test_pg_wrongpass.yaml` | Auth failure message, not panic | exit 0; `[FAIL] Source error: db error` | [x]  |
+| H1  | Degraded / wide-row preflight | `rivet check --config dev/workbench/pg_preflight_demos.yaml` | Verdict and suggestions printed | exit 0 | [x]  |
+| H2  | Wrong password    | `rivet doctor --config dev/fixtures/test_pg_wrongpass.yaml` | Auth failure message, not panic | exit 0; `[FAIL] Source error: db error` | [x]  |
 
 
 ---
@@ -172,16 +172,16 @@ Summaries go to `/tmp/rivet_uat_smoke.txt`. **Actual** below matches **`bash dev
 
 | ID  | Scenario   | Command / Steps                                                   | Expected          | Actual | Pass |
 | --- | ---------- | ----------------------------------------------------------------- | ----------------- | ------ | ---- |
-| I1  | MinIO / S3 | `docker compose up -d minio` then `dev/run_s3_export.sh`          | Objects in bucket | not in 2026-03-30 smoke | [ ]  |
-| I2  | fake-gcs   | `docker compose up -d fake-gcs` then `dev/run_gcs_fake_export.sh` | Upload succeeds   | not run in smoke | [ ]  |
-| I3  | Real GCS   | `rivet run --config dev/rivet_gcs_rivet_data_test.yaml`           | Files in bucket   | not run in smoke | [ ]  |
+| I1  | MinIO / S3 | `docker compose up -d minio` then `dev/cloud/run_s3_export.sh`          | Objects in bucket | not in 2026-03-30 smoke | [ ]  |
+| I2  | fake-gcs   | `docker compose up -d fake-gcs` then `dev/cloud/run_gcs_fake_export.sh` | Upload succeeds   | not run in smoke | [ ]  |
+| I3  | Real GCS   | `rivet run --config dev/cloud/rivet_gcs_rivet_data_test.yaml`           | Files in bucket   | not run in smoke | [ ]  |
 
 
 ---
 
 ## Suite J — Time window mode
 
-Save this config as `dev/_uat_time_window.yaml`:
+Committed fixture: [`dev/scenarios/time_window_postgres.yaml`](scenarios/time_window_postgres.yaml) (excerpt below).
 
 ```yaml
 source:
@@ -204,7 +204,7 @@ exports:
 
 | ID  | Scenario        | Command / Steps                                | Expected                                 | Actual | Pass |
 | --- | --------------- | ---------------------------------------------- | ---------------------------------------- | ------ | ---- |
-| J1  | Time window run | `rivet run --config dev/_uat_time_window.yaml` | Completes; only rows within 7-day window | smoke: exit 0 | [x]  |
+| J1  | Time window run | `rivet run --config dev/scenarios/time_window_postgres.yaml` | Completes; only rows within 7-day window | smoke: exit 0 | [x]  |
 
 
 ---
@@ -214,7 +214,7 @@ exports:
 
 | ID  | Scenario      | Command / Steps                                 | Expected                               | Actual | Pass |
 | --- | ------------- | ----------------------------------------------- | -------------------------------------- | ------ | ---- |
-| K1  | Schema change | Run `dev/test_schema_evolution.sh` (read first) | Second run logs schema change warnings | not run in smoke | [ ]  |
+| K1  | Schema change | Run `dev/scripts/test_schema_evolution.sh` (read first) | Second run logs schema change warnings | not run in smoke | [ ]  |
 
 
 ---
@@ -224,8 +224,8 @@ exports:
 
 | ID  | Scenario      | Command / Steps                                                   | Expected                          | Actual | Pass |
 | --- | ------------- | ----------------------------------------------------------------- | --------------------------------- | ------ | ---- |
-| L1  | CSV to stdout | `bash -c 'rivet run --config dev/test_stdout.yaml \| head -1'`   | CSV header or row on stdout       | non-empty first line | [x]  |
-| L2  | Pipe to file  | `rivet run --config dev/test_stdout.yaml > /tmp/rivet_stdout.csv` | File created; logs on stderr only | not run in smoke | [ ]  |
+| L1  | CSV to stdout | `bash -c 'rivet run --config dev/fixtures/test_stdout.yaml \| head -1'`   | CSV header or row on stdout       | non-empty first line | [x]  |
+| L2  | Pipe to file  | `rivet run --config dev/fixtures/test_stdout.yaml > /tmp/rivet_stdout.csv` | File created; logs on stderr only | not run in smoke | [ ]  |
 
 
 ---
@@ -235,9 +235,9 @@ exports:
 
 | ID  | Scenario           | Command / Steps                                                | Expected                                 | Actual | Pass |
 | --- | ------------------ | -------------------------------------------------------------- | ---------------------------------------- | ------ | ---- |
-| M1  | Param substitution | `rivet run --config dev/test_params.yaml --param MAX_ID=10`    | CSV with only ids 1-10                   | exit 0 | [x]  |
-| M2  | Multiple params    | `rivet run --config dev/test_params.yaml --param MAX_ID=5`     | CSV with only ids 1-5                    | not run in smoke | [ ]  |
-| M3  | Param in check     | `rivet check --config dev/test_params.yaml --param MAX_ID=100` | Preflight completes; no unresolved `${}` | exit 0 | [x]  |
+| M1  | Param substitution | `rivet run --config dev/fixtures/test_params.yaml --param MAX_ID=10`    | CSV with only ids 1-10                   | exit 0 | [x]  |
+| M2  | Multiple params    | `rivet run --config dev/fixtures/test_params.yaml --param MAX_ID=5`     | CSV with only ids 1-5                    | not run in smoke | [ ]  |
+| M3  | Param in check     | `rivet check --config dev/fixtures/test_params.yaml --param MAX_ID=100` | Preflight completes; no unresolved `${}` | exit 0 | [x]  |
 
 
 ---
@@ -247,8 +247,8 @@ exports:
 
 | ID  | Scenario           | Command / Steps                                                                   | Expected                                          | Actual | Pass |
 | --- | ------------------ | --------------------------------------------------------------------------------- | ------------------------------------------------- | ------ | ---- |
-| N1  | Quality pass       | `rivet run --config dev/test_quality.yaml --export users_quality_pass --validate` | `quality: pass` in summary, file produced         | exit 0 | [x]  |
-| N2  | Quality fail (max) | `rivet run --config dev/test_quality.yaml --export users_quality_fail_max`        | `quality: FAIL`, export aborted, no file uploaded | not run in smoke | [ ]  |
+| N1  | Quality pass       | `rivet run --config dev/fixtures/test_quality.yaml --export users_quality_pass --validate` | `quality: pass` in summary, file produced         | exit 0 | [x]  |
+| N2  | Quality fail (max) | `rivet run --config dev/fixtures/test_quality.yaml --export users_quality_fail_max`        | `quality: FAIL`, export aborted, no file uploaded | not run in smoke | [ ]  |
 
 
 ---
@@ -258,7 +258,7 @@ exports:
 
 | ID  | Scenario            | Command / Steps                                               | Expected                                                                        | Actual | Pass |
 | --- | ------------------- | ------------------------------------------------------------- | ------------------------------------------------------------------------------- | ------ | ---- |
-| O1  | Memory batch sizing | `RUST_LOG=info rivet run --config dev/test_memory_batch.yaml` | Log shows `batch_size_memory_mb=…` and computed batch size | `batch_size_memory_mb=10:` line in log | [x]  |
+| O1  | Memory batch sizing | `RUST_LOG=info rivet run --config dev/fixtures/test_memory_batch.yaml` | Log shows `batch_size_memory_mb=…` and computed batch size | `batch_size_memory_mb=10:` line in log | [x]  |
 
 
 ---
@@ -268,7 +268,7 @@ exports:
 
 | ID  | Scenario         | Command / Steps                                          | Expected                                                                 | Actual           | Pass |
 | --- | ---------------- | -------------------------------------------------------- | ------------------------------------------------------------------------ | ---------------- | ---- |
-| P1  | Split files      | `rivet run --config dev/test_file_split.yaml --validate` | Multiple `users_split_*_part0.parquet`, `_part1.parquet`, etc. in output | exit 0 | [x]  |
+| P1  | Split files      | `rivet run --config dev/fixtures/test_file_split.yaml --validate` | Multiple `users_split_*_part0.parquet`, `_part1.parquet`, etc. in output | exit 0 | [x]  |
 | P2  | Check file count | `bash -c 'ls dev/output/users_split_*_part*.parquet 2>/dev/null \| wc -l'` | More than 1 file | smoke: ≥2 files (e.g. 20 after repeated split runs) | [x]  |
 
 
@@ -292,7 +292,7 @@ docker compose up -d postgres toxiproxy
 sleep 5
 
 # 3. Create proxy endpoints (Postgres on 15432, MySQL on 13306)
-bash dev/setup_toxiproxy.sh
+bash dev/scripts/setup_toxiproxy.sh
 
 # 4. Make sure the DB is seeded
 cargo run --release --bin seed -- --target pg --users 10000
@@ -305,17 +305,17 @@ Verify the proxy API is up: `curl -s http://localhost:8474/proxies | head` shoul
 
 | ID  | Scenario                                   | Steps                                                                                                                                                                            | Expected                                                                                                                                  | Actual | Pass |
 | --- | ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ------ | ---- |
-| Q1  | Baseline: export through proxy (no faults) | `rivet run --config dev/test_toxiproxy_pg.yaml --validate`                                                                                                                       | Completes, `status: success`, same result as direct connection                                                                            | not in smoke | [ ]  |
+| Q1  | Baseline: export through proxy (no faults) | `rivet run --config dev/fixtures/test_toxiproxy_pg.yaml --validate`                                                                                                                       | Completes, `status: success`, same result as direct connection                                                                            | not in smoke | [ ]  |
 | Q2  | Latency: add 3 s delay to every packet     | **Inject:** `curl -s -X POST http://localhost:8474/proxies/pg/toxics -H 'Content-Type: application/json' -d '{"name":"latency","type":"latency","attributes":{"latency":3000}}'` | Returns `{"name":"latency",...}`                                                                                                          | not in smoke | [ ]  |
-| Q3  | Export under latency                       | `RUST_LOG=info rivet run --config dev/test_toxiproxy_pg.yaml --validate`                                                                                                         | Slower but still succeeds (safe profile allows 120 s statement timeout)                                                                   | not in smoke | [ ]  |
+| Q3  | Export under latency                       | `RUST_LOG=info rivet run --config dev/fixtures/test_toxiproxy_pg.yaml --validate`                                                                                                         | Slower but still succeeds (safe profile allows 120 s statement timeout)                                                                   | not in smoke | [ ]  |
 | Q4  | Remove latency                             | `curl -s -X DELETE http://localhost:8474/proxies/pg/toxics/latency`                                                                                                              | Returns empty (toxic removed)                                                                                                             | not in smoke | [ ]  |
 | Q5  | Connection kill: cut connection after 5 KB | **Inject:** `curl -s -X POST http://localhost:8474/proxies/pg/toxics -H 'Content-Type: application/json' -d '{"name":"limit","type":"limit_data","attributes":{"bytes":5000}}'`  | Returns `{"name":"limit",...}`                                                                                                            | not in smoke | [ ]  |
-| Q6  | Export under connection kill               | `RUST_LOG=info rivet run --config dev/test_toxiproxy_pg.yaml`                                                                                                                    | Logs show retry attempts (`retry 1/3`, `[reconnecting]`). May succeed (if retry gets through) or fail with clear error — no panic or hang | not in smoke | [ ]  |
+| Q6  | Export under connection kill               | `RUST_LOG=info rivet run --config dev/fixtures/test_toxiproxy_pg.yaml`                                                                                                                    | Logs show retry attempts (`retry 1/3`, `[reconnecting]`). May succeed (if retry gets through) or fail with clear error — no panic or hang | not in smoke | [ ]  |
 | Q7  | Remove connection-kill toxic               | `curl -s -X DELETE http://localhost:8474/proxies/pg/toxics/limit`                                                                                                                | Toxic removed                                                                                                                             | not in smoke | [ ]  |
-| Q8  | Final: confirm clean proxy works           | `rivet run --config dev/test_toxiproxy_pg.yaml --validate`                                                                                                                       | `status: success` — proxy is back to normal                                                                                               | not in smoke | [ ]  |
+| Q8  | Final: confirm clean proxy works           | `rivet run --config dev/fixtures/test_toxiproxy_pg.yaml --validate`                                                                                                                       | `status: success` — proxy is back to normal                                                                                               | not in smoke | [ ]  |
 
 
-> **Shortcut:** run `bash dev/test_retry_toxiproxy.sh` to execute Q1–Q8 automatically.
+> **Shortcut:** run `bash dev/scripts/test_retry_toxiproxy.sh` to execute Q1–Q8 automatically.
 >
 > **2026-03-30 smoke:** Q1–Q8 not in `run_uat_smoke.sh`; fill **Actual** after Toxiproxy locally.
 
@@ -323,7 +323,7 @@ Verify the proxy API is up: `curl -s http://localhost:8474/proxies | head` shoul
 
 ## Suite R — Chunk checkpoint (SQLite plan, resume, CLI)
 
-Config: `dev/bench_chunked_p4.yaml`. State DB: `dev/.rivet_state.db` (next to the config).
+Config: `dev/scenarios/chunked_postgres_bench.yaml`. State DB: `dev/scenarios/.rivet_state.db` (next to the config).
 
 
 | ID  | Scenario             | Command / steps  | Expected                                                                                                             | Actual | Pass |
@@ -338,27 +338,27 @@ Config: `dev/bench_chunked_p4.yaml`. State DB: `dev/.rivet_state.db` (next to th
 #### R1 — Checkpoint completes
 
 ```bash
-rivet run --config dev/bench_chunked_p4.yaml --export bench_content_p4_serial --validate
+rivet run --config dev/scenarios/chunked_postgres_bench.yaml --export bench_content_p4_serial --validate
 ```
 
 #### R2 — Inspect chunk table
 
 ```bash
-rivet state chunks --config dev/bench_chunked_p4.yaml --export bench_content_p4_serial
+rivet state chunks --config dev/scenarios/chunked_postgres_bench.yaml --export bench_content_p4_serial
 ```
 
 #### R3 — Resume after crash
 
 ```bash
 # Terminal 1 — start parallel chunked export
-rivet run --config dev/bench_chunked_p4.yaml --export bench_content_p4
+rivet run --config dev/scenarios/chunked_postgres_bench.yaml --export bench_content_p4
 
 # Terminal 2 — wait until several *.parquet chunk files appear under dev/output/bench/, then:
-pgrep -f 'rivet run.*bench_chunked_p4.*bench_content_p4'   # note PID (exclude grep if needed)
+pgrep -f 'rivet run.*chunked_postgres_bench.*bench_content_p4'   # note PID (exclude grep if needed)
 kill -9 <PID>
 
 # Terminal 1 — resume same export (same YAML as before)
-rivet run --config dev/bench_chunked_p4.yaml --export bench_content_p4 --resume
+rivet run --config dev/scenarios/chunked_postgres_bench.yaml --export bench_content_p4 --resume
 ```
 
 Optional: `bash -c 'ls dev/output/bench/bench_content_p4_*chunk*.parquet 2>/dev/null | wc -l'` before kill (expect fewer than 20), after resume (expect 20 files for a full 200k run).
@@ -366,10 +366,10 @@ Optional: `bash -c 'ls dev/output/bench/bench_content_p4_*chunk*.parquet 2>/dev/
 #### R4 — Reset chunk plan
 
 ```bash
-rivet state reset-chunks --config dev/bench_chunked_p4.yaml --export bench_content_p4_serial
+rivet state reset-chunks --config dev/scenarios/chunked_postgres_bench.yaml --export bench_content_p4_serial
 
 # Fresh plan on next run
-rivet run --config dev/bench_chunked_p4.yaml --export bench_content_p4_serial --validate
+rivet run --config dev/scenarios/chunked_postgres_bench.yaml --export bench_content_p4_serial --validate
 ```
 
 #### R5 — Fingerprint mismatch
@@ -378,23 +378,23 @@ Requires an **in_progress** chunk run for export `bench_content_p4` (same as aft
 
 1. **Create in-progress state** (pick one):
   - **A.** Repeat R3 up to `kill -9` and **do not** run `--resume` yet; or  
-  - **B.** Start `rivet run --config dev/bench_chunked_p4.yaml --export bench_content_p4`, kill when some chunks exist, stop.
-2. **Change the plan fingerprint** — edit `dev/bench_chunked_p4.yaml`, export `bench_content_p4` only, change one of:
+  - **B.** Start `rivet run --config dev/scenarios/chunked_postgres_bench.yaml --export bench_content_p4`, kill when some chunks exist, stop.
+2. **Change the plan fingerprint** — edit `dev/scenarios/chunked_postgres_bench.yaml`, export `bench_content_p4` only, change one of:
   ```yaml
    chunk_size: 10000    # e.g. change to 15000
   ```
    (Any change to `query`, `chunk_column`, `chunk_size`, or `chunk_dense` invalidates the stored plan.)
 3. **Resume with the modified YAML** (must fail):
   ```bash
-   rivet run --config dev/bench_chunked_p4.yaml --export bench_content_p4 --resume
+   rivet run --config dev/scenarios/chunked_postgres_bench.yaml --export bench_content_p4 --resume
   ```
    **Expected:** process exits non-zero; message includes **chunk plan fingerprint mismatch** (or equivalent wording).
 4. **Cleanup (restore repo + state):**
-  - Revert `chunk_size` to **10000** in `dev/bench_chunked_p4.yaml`.
+  - Revert `chunk_size` to **10000** in `dev/scenarios/chunked_postgres_bench.yaml`.
   - Then either:
     ```bash
-    rivet state reset-chunks --config dev/bench_chunked_p4.yaml --export bench_content_p4
-    rivet run --config dev/bench_chunked_p4.yaml --export bench_content_p4 --validate
+    rivet state reset-chunks --config dev/scenarios/chunked_postgres_bench.yaml --export bench_content_p4
+    rivet run --config dev/scenarios/chunked_postgres_bench.yaml --export bench_content_p4 --validate
     ```
     or, if YAML matches the old plan again, `rivet run ... --export bench_content_p4 --resume` to finish the interrupted run.
 
@@ -405,10 +405,10 @@ Requires an **in_progress** chunk run for export `bench_content_p4` (same as aft
 
 | ID  | Scenario                             | Command / Steps                                                                                      | Expected                                                                                                       | Actual | Pass |
 | --- | ------------------------------------ | ---------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | ------ | ---- |
-| S1  | Per-export profile                   | `rivet run --config dev/bench_chunked_p4.yaml --export bench_content_p4_balanced`                    | Summary `tuning:` shows `profile=balanced` (others default fast from source + batch 1000)                      | exit 0; tuning line `profile=balanced` | [x]  |
-| S2  | Parallel exports (threads)           | `rivet run --config dev/bench_chunked_p4.yaml --parallel-exports`                                    | All exports succeed; logs interleave; **peak RSS** lines may look similar (one process)                        | not run (~5 exports, long) | [ ]  |
-| S3  | Parallel exports (processes)         | `rivet run --config dev/bench_chunked_p4.yaml --parallel-export-processes`                           | All succeed; **peak RSS** differs per export block; multiple `rivet` PIDs during run (`ps` / Activity Monitor) | not run | [ ]  |
-| S4  | Single export ignores parallel flags | `rivet run --config dev/bench_chunked_p4.yaml --export bench_content_p4 --parallel-exports`          | Same as without flags (one job); no extra workers from multi-export logic                                      | exit 0; single export despite flag | [x]  |
+| S1  | Per-export profile                   | `rivet run --config dev/scenarios/chunked_postgres_bench.yaml --export bench_content_p4_balanced`                    | Summary `tuning:` shows `profile=balanced` (others default fast from source + batch 1000)                      | exit 0; tuning line `profile=balanced` | [x]  |
+| S2  | Parallel exports (threads)           | `rivet run --config dev/scenarios/chunked_postgres_bench.yaml --parallel-exports`                                    | All exports succeed; logs interleave; **peak RSS** lines may look similar (one process)                        | not run (~5 exports, long) | [ ]  |
+| S3  | Parallel exports (processes)         | `rivet run --config dev/scenarios/chunked_postgres_bench.yaml --parallel-export-processes`                           | All succeed; **peak RSS** differs per export block; multiple `rivet` PIDs during run (`ps` / Activity Monitor) | not run | [ ]  |
+| S4  | Single export ignores parallel flags | `rivet run --config dev/scenarios/chunked_postgres_bench.yaml --export bench_content_p4 --parallel-exports`          | Same as without flags (one job); no extra workers from multi-export logic                                      | exit 0; single export despite flag | [x]  |
 | S5  | YAML `parallel_exports`              | Add `parallel_exports: true` at top of a **copy** of bench config (2+ exports), run without CLI flag | Same behavior as S2 (optional; avoid committing temp file)                                                     | not run | [ ]  |
 
 
@@ -420,7 +420,7 @@ Requires an **in_progress** chunk run for export `bench_content_p4` (same as aft
 | ID  | Scenario           | Command / Steps                                                                                                                          | Expected                                                   | Actual | Pass |
 | --- | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- | ------ | ---- |
 | T1  | Stack up           | `docker compose up -d postgres postgres-exporter prometheus grafana`                                                                     | `curl -s localhost:9090/-/healthy` OK; Grafana :3000 loads | `curl localhost:9090/-/healthy` OK | [x]  |
-| T2  | Metrics under load | While Grafana dashboard `Postgres Overview` is open, run `rivet run --config dev/bench_chunked_p4.yaml --export bench_content_p4_serial` | Prometheus targets UP; charts show activity spike          | not run | [ ]  |
+| T2  | Metrics under load | While Grafana dashboard `Postgres Overview` is open, run `rivet run --config dev/scenarios/chunked_postgres_bench.yaml --export bench_content_p4_serial` | Prometheus targets UP; charts show activity spike          | not run | [ ]  |
 
 
 ---
@@ -431,8 +431,8 @@ Requires an **in_progress** chunk run for export `bench_content_p4` (same as aft
 | ID  | Scenario        | Command / Steps                                                                                                                      | Expected                                                | Actual | Pass |
 | --- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------- | ------ | ---- |
 | U1  | Seed sparse ids | `cargo run --release --bin seed -- --target postgres --only-sparse-chunk-demo --sparse-chunk-rows 5000 --sparse-chunk-id-gap 100000` | `orders_sparse` has few rows vs wide `MIN/MAX(id)` band |        | [ ]  |
-| U2  | Preflight warns | `rivet check --config dev/sparse_chunk_demo.yaml --export orders_sparse_on_id`                                                       | Sparse / inefficient range warning (wording may vary)   |        | [ ]  |
-| U3  | Chunked export  | `rivet run --config dev/sparse_chunk_demo.yaml --export orders_sparse_builtin_dense`                                                 | Completes; output under `dev/output/sparse_chunk/`      |        | [ ]  |
+| U2  | Preflight warns | `rivet check --config dev/workbench/sparse_chunk_demo.yaml --export orders_sparse_on_id`                                                       | Sparse / inefficient range warning (wording may vary)   |        | [ ]  |
+| U3  | Chunked export  | `rivet run --config dev/workbench/sparse_chunk_demo.yaml --export orders_sparse_builtin_dense`                                                 | Completes; output under `dev/output/sparse_chunk/`      |        | [ ]  |
 
 
 ---
@@ -447,7 +447,7 @@ Requires an **in_progress** chunk run for export `bench_content_p4` (same as aft
 | Rivet commit   | `git rev-parse HEAD`              |
 | Postgres image | (e.g. `postgres:16` from compose) |
 | MySQL image    | (e.g. `mysql:8` from compose)     |
-| Notes          | Verified: `bash dev/run_uat_smoke.sh` → 31 PASS, 0 FAIL, 3 SKIP (`/tmp/rivet_uat_smoke.txt`). R1 covered with E2; R2–R5 not in script; also S2/S3/S5, full `pg_full` all exports, MySQL rows, object storage, Toxiproxy Q, U. |
+| Notes          | Verified: `bash dev/scripts/run_uat_smoke.sh` → 31 PASS, 0 FAIL, 3 SKIP (`/tmp/rivet_uat_smoke.txt`). R1 covered with E2; R2–R5 not in script; also S2/S3/S5, full `pg_full` all exports, MySQL rows, object storage, Toxiproxy Q, U. |
 
 
 ---
@@ -461,7 +461,7 @@ Requires an **in_progress** chunk run for export `bench_content_p4` (same as aft
 ### V1 — `rivet plan` pretty output (Snapshot)
 
 ```bash
-rivet plan -c dev/pg_full.yaml
+rivet plan -c dev/workbench/pg_full.yaml
 ```
 
 | ID | Step | Expected | Actual | Pass |
@@ -473,7 +473,7 @@ rivet plan -c dev/pg_full.yaml
 ### V2 — `rivet plan` JSON artifact (Chunked)
 
 ```bash
-rivet plan -c dev/bench_chunked_seq.yaml --format json --output /tmp/plan_chunked.json
+rivet plan -c dev/scenarios/chunked_postgres_bench.yaml --format json --output /tmp/plan_chunked.json
 cat /tmp/plan_chunked.json | python3 -m json.tool | head -40
 ```
 
@@ -496,7 +496,7 @@ rivet apply /tmp/plan_chunked.json
 |----|------|----------|--------|------|
 | V3a | Apply completes | Exit 0; summary printed with rows > 0, files > 0 | | [ ] |
 | V3b | No min/max queries | Log does not contain `SELECT min(` at apply time (chunk detection skipped) | | [ ] |
-| V3c | Metrics recorded | `rivet metrics -c dev/bench_chunked_seq.yaml --last 1` shows the apply run | | [ ] |
+| V3c | Metrics recorded | `rivet metrics -c dev/scenarios/chunked_postgres_bench.yaml --last 1` shows the apply run | | [ ] |
 
 ---
 
@@ -534,10 +534,10 @@ rivet apply /tmp/plan_chunked.json
 
 ```bash
 # 1. Generate plan for an incremental export
-rivet plan -c dev/pg_incremental.yaml --format json -o /tmp/plan_incr.json
+rivet plan -c dev/workbench/pg_incremental.yaml --format json -o /tmp/plan_incr.json
 
 # 2. Run the incremental export (advances the cursor)
-rivet run -c dev/pg_incremental.yaml
+rivet run -c dev/workbench/pg_incremental.yaml
 
 # 3. Try to apply the now-stale plan
 rivet apply /tmp/plan_incr.json
@@ -563,15 +563,15 @@ Stop the database, then run plan.
 
 ```bash
 # Baseline run
-rivet state reset -c dev/pg_full.yaml --export users
-rivet run -c dev/pg_full.yaml -e users
-ROWS_RUN=$(rivet metrics -c dev/pg_full.yaml -e users --last 1 | grep rows | awk '{print $NF}')
+rivet state reset -c dev/workbench/pg_full.yaml --export users
+rivet run -c dev/workbench/pg_full.yaml -e users
+ROWS_RUN=$(rivet metrics -c dev/workbench/pg_full.yaml -e users --last 1 | grep rows | awk '{print $NF}')
 
 # Plan + apply
-rivet state reset -c dev/pg_full.yaml --export users
-rivet plan -c dev/pg_full.yaml -e users --format json -o /tmp/plan_users.json
+rivet state reset -c dev/workbench/pg_full.yaml --export users
+rivet plan -c dev/workbench/pg_full.yaml -e users --format json -o /tmp/plan_users.json
 rivet apply /tmp/plan_users.json
-ROWS_APPLY=$(rivet metrics -c dev/pg_full.yaml -e users --last 1 | grep rows | awk '{print $NF}')
+ROWS_APPLY=$(rivet metrics -c dev/workbench/pg_full.yaml -e users --last 1 | grep rows | awk '{print $NF}')
 
 echo "run=$ROWS_RUN apply=$ROWS_APPLY"
 ```
@@ -587,25 +587,28 @@ echo "run=$ROWS_RUN apply=$ROWS_APPLY"
 
 | File                                 | Purpose                                               |
 | ------------------------------------ | ----------------------------------------------------- |
-| `dev/pg_full.yaml`                   | PG full exports, CSV + Parquet                        |
-| `dev/pg_incremental.yaml`            | PG incremental                                        |
-| `dev/mysql_full.yaml`                | MySQL full                                            |
-| `dev/mysql_incremental.yaml`         | MySQL incremental                                     |
-| `dev/pg_structured.yaml`             | PG structured credentials                             |
-| `dev/mysql_structured.yaml`          | MySQL structured credentials                          |
-| `dev/bench_chunked_seq.yaml`         | Chunked sequential                                    |
-| `dev/bench_chunked_p4.yaml`          | Chunked parallel + checkpoint bench (several exports) |
-| `dev/sparse_chunk_demo.yaml`         | Sparse `chunk_column` / dense surrogate demo          |
-| `dev/test_meta_columns.yaml`         | Meta columns + zstd                                   |
-| `dev/test_compression.yaml`          | Snappy / none / skip_empty                            |
-| `dev/rivet_s3_minio_test.yaml`       | S3-compatible (MinIO)                                 |
-| `dev/rivet_gcs_fake_test.yaml`       | GCS emulator                                          |
-| `dev/rivet_gcs_rivet_data_test.yaml` | Real GCS                                              |
-| `dev/test_stdout.yaml`               | Stdout destination (v4.1)                             |
-| `dev/test_params.yaml`               | Parameterized queries (v4.1)                          |
-| `dev/test_quality.yaml`              | Data quality checks (v4.1)                            |
-| `dev/test_file_split.yaml`           | File size splitting (v4.1)                            |
-| `dev/test_memory_batch.yaml`         | Memory-based batch sizing (v4.1)                      |
-| `dev/test_toxiproxy_pg.yaml`         | Retry via Toxiproxy                                   |
+| `dev/workbench/pg_full.yaml`                   | PG full exports, CSV + Parquet                        |
+| `dev/workbench/pg_incremental.yaml`            | PG incremental (includes `pg_orders_coalesce`)         |
+| `dev/workbench/mysql_full.yaml`                | MySQL full                                            |
+| `dev/workbench/mysql_incremental.yaml`         | MySQL incremental (includes `mysql_orders_coalesce`)   |
+| `dev/workbench/pg_preflight_demos.yaml`       | PG preflight demos (safe / worst-case / degraded)      |
+| `dev/workbench/mysql_preflight_demos.yaml`    | MySQL preflight demos (same variants)                 |
+| `dev/workbench/pg_type_matrix.yaml`            | PG type matrix (`type_matrix_pg`, `type_matrix_full_pg`) |
+| `dev/workbench/mysql_type_matrix.yaml`         | MySQL type matrix (`type_matrix_mysql`, `type_matrix_full_mysql`) |
+| `dev/workbench/pg_structured.yaml`             | PG structured credentials                             |
+| `dev/workbench/mysql_structured.yaml`          | MySQL structured credentials                          |
+| `dev/scenarios/chunked_postgres_bench.yaml` | Chunked Postgres bench (serial, parallel, checkpoint, safe profile, etc.) |
+| `dev/workbench/sparse_chunk_demo.yaml`         | Sparse `chunk_column` / dense surrogate demo          |
+| `dev/fixtures/test_meta_columns.yaml`         | Meta columns + zstd                                   |
+| `dev/fixtures/test_compression.yaml`          | Snappy / none / skip_empty                            |
+| `dev/cloud/rivet_s3_minio_test.yaml`       | S3-compatible (MinIO)                                 |
+| `dev/cloud/rivet_gcs_fake_test.yaml`       | GCS emulator                                          |
+| `dev/cloud/rivet_gcs_rivet_data_test.yaml` | Real GCS                                              |
+| `dev/fixtures/test_stdout.yaml`               | Stdout destination (v4.1)                             |
+| `dev/fixtures/test_params.yaml`               | Parameterized queries (v4.1)                          |
+| `dev/fixtures/test_quality.yaml`              | Data quality checks (v4.1)                            |
+| `dev/fixtures/test_file_split.yaml`           | File size splitting (v4.1)                            |
+| `dev/fixtures/test_memory_batch.yaml`         | Memory-based batch sizing (v4.1)                      |
+| `dev/fixtures/test_toxiproxy_pg.yaml`         | Retry via Toxiproxy                                   |
 
 

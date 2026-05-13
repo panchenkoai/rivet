@@ -1,6 +1,6 @@
 # Load `rivet_type_matrix` Parquet into BigQuery & verify types
 
-This complements the docker-compose tables in `dev/postgres/init.sql`, `dev/mysql/init.sql`, and the exporters `dev/pg_type_matrix_export.yaml`, `dev/mysql_type_matrix_export.yaml`.
+This complements the docker-compose tables in `dev/postgres/init.sql`, `dev/mysql/init.sql`, and the exporters `dev/workbench/pg_type_matrix.yaml`, `dev/workbench/mysql_type_matrix.yaml`.
 
 ## 1. Create data (local Parquet)
 
@@ -10,16 +10,16 @@ From the repository root:
 
 ```bash
 mkdir -p dev/output/type_matrix/pg
-rivet run --config dev/pg_type_matrix_export.yaml --export type_matrix_pg
+rivet run --config dev/workbench/pg_type_matrix.yaml --export type_matrix_pg
 PG_PARQUET=$(ls -t dev/output/type_matrix/pg/*.parquet | head -1)
 echo "$PG_PARQUET"
 ```
 
-**MySQL** (Parquet columns match PG via aliases in `dev/mysql_type_matrix_export.yaml`)
+**MySQL** (Parquet columns match PG via aliases in `dev/workbench/mysql_type_matrix.yaml`)
 
 ```bash
 mkdir -p dev/output/type_matrix/mysql
-rivet run --config dev/mysql_type_matrix_export.yaml --export type_matrix_mysql
+rivet run --config dev/workbench/mysql_type_matrix.yaml --export type_matrix_mysql
 MYSQL_PARQUET=$(ls -t dev/output/type_matrix/mysql/*.parquet | head -1)
 echo "$MYSQL_PARQUET"
 ```
@@ -64,7 +64,7 @@ Use **two BigQuery table names** if you load both engines side by side, e.g. **`
 
 ### 3a. Load Parquet from Postgres
 
-`dev/pg_type_matrix_export.yaml` → column names `created_at`, `created_at_tz`, `attrs`.
+`dev/workbench/pg_type_matrix.yaml` → column names `created_at`, `created_at_tz`, `attrs`.
 
 ```bash
 export TABLE="type_matrix_pg"
@@ -91,7 +91,7 @@ bq load --project_id="${GCP_PROJECT}" --source_format=PARQUET --replace --autode
 
 ### 3b. Load Parquet from MySQL
 
-`dev/mysql_type_matrix_export.yaml` aliases `created_at_dt` / `created_at_ts` / `extras` to **`created_at`** / **`created_at_tz`** / **`attrs`**, so **the same BigQuery SQL** (§4–6) works after you point `${TABLE}` at the MySQL-loaded table.
+`dev/workbench/mysql_type_matrix.yaml` aliases `created_at_dt` / `created_at_ts` / `extras` to **`created_at`** / **`created_at_tz`** / **`attrs`**, so **the same BigQuery SQL** (§4–6) works after you point `${TABLE}` at the MySQL-loaded table.
 
 ```bash
 export TABLE="type_matrix_mysql"
@@ -248,7 +248,7 @@ That was a PostgreSQL-only bug: older code tried `String` on `json`/`jsonb` OIDs
 **`amount` / `fee` are NULL.**
 
 - **Postgres:** Utf8 fallback used to call `try_get::<String>` on `numeric` OID (rejected silently → null); decimal path requires `columns:` overrides; numeric Utf8 fallback now uses `PgNumericWire`.
-- **MySQL:** `DECIMAL` needs explicit `columns: amount: decimal(18,2)` / `fee: decimal(18,6)` (`dev/mysql_type_matrix_export.yaml`) because the Rust client does not surface precision from column metadata alone.
+- **MySQL:** `DECIMAL` needs explicit `columns: amount: decimal(18,2)` / `fee: decimal(18,6)` (`dev/workbench/mysql_type_matrix.yaml`) because the Rust client does not surface precision from column metadata alone.
 
 For **BigQuery `NUMERIC`** (not STRING), both YAMLs must keep those `decimal(18,*)` overrides so Arrow writes `Decimal128` into Parquet.
 
@@ -260,9 +260,9 @@ The Parquet file has Utf8 physical columns (`BYTE_ARRAY`). Fix: export with **`c
 
 ```bash
 cargo build --release
-./target/release/rivet check --config dev/pg_type_matrix_export.yaml \
+./target/release/rivet check --config dev/workbench/pg_type_matrix.yaml \
   --export type_matrix_pg --type-report --target bigquery
-./target/release/rivet check --config dev/mysql_type_matrix_export.yaml \
+./target/release/rivet check --config dev/workbench/mysql_type_matrix.yaml \
   --export type_matrix_mysql --type-report --target bigquery
 ```
 

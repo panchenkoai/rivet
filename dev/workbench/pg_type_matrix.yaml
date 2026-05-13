@@ -1,0 +1,36 @@
+# rivet_type_matrix + rivet_type_matrix_full → Parquet (one config, two exports).
+# Narrow table: decimal, timestamps, BYTEA, UUID, JSONB — see dev/sql/rivet_type_matrix_postgres.sql
+# Full table: bool, int2/4, float4, date, time, interval, enum, arrays — see dev/sql/rivet_type_matrix_full_postgres.sql
+#
+#   mkdir -p dev/output/type_matrix/pg dev/output/type_matrix_full/pg
+#   rivet run --config dev/workbench/pg_type_matrix.yaml --export type_matrix_pg
+#   rivet run --config dev/workbench/pg_type_matrix.yaml --export type_matrix_full_pg
+
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+
+exports:
+  - name: type_matrix_pg
+    query: >-
+      SELECT id, label, amount, fee, created_at, created_at_tz,
+             raw_bytes, uid, attrs
+      FROM rivet_type_matrix ORDER BY id
+    mode: full
+    format: parquet
+    compression: zstd
+    columns:
+      amount: decimal(18,2)
+      fee: decimal(18,6)
+    destination:
+      type: local
+      path: ./dev/output/type_matrix/pg
+
+  - name: type_matrix_full_pg
+    query: "SELECT * FROM rivet_type_matrix_full ORDER BY id"
+    mode: full
+    format: parquet
+    compression: zstd
+    destination:
+      type: local
+      path: ./dev/output/type_matrix_full/pg

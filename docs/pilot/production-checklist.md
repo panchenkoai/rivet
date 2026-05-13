@@ -1,5 +1,7 @@
 # Production Checklist
 
+For pilot ordering (discovery → run → reconcile → sign-off), use the [Pilot guide](README.md) and [Pilot walkthrough](pilot-walkthrough.md); this page is the **readiness gate** before touching production systems.
+
 Complete this checklist before running Rivet against a production database.
 
 ## Database access

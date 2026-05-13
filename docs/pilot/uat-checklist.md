@@ -1,5 +1,7 @@
 # UAT Checklist
 
+For the full pilot instruction sequence (what to run before you get here), see [Pilot guide](README.md).
+
 **Audience:** pilot users validating Rivet before production use.
 
 **When to use:** at the end of a pilot, before promoting to production, or when verifying a new release.

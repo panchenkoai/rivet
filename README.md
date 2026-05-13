@@ -109,6 +109,7 @@ cargo build --release
 | Tuning profiles | [docs/reference/tuning.md](docs/reference/tuning.md) |
 | Scaffold config from a live DB (`rivet init`) | [docs/reference/init.md](docs/reference/init.md) |
 | Pipeline, traits, memory model, source layout | [docs/architecture.md](docs/architecture.md) |
+| **Pilot guide (ordered instructions)** | [docs/pilot/README.md](docs/pilot/README.md) |
 | Quickstart: PostgreSQL | [docs/pilot/quickstart-postgres.md](docs/pilot/quickstart-postgres.md) |
 | Quickstart: MySQL | [docs/pilot/quickstart-mysql.md](docs/pilot/quickstart-mysql.md) |
 | Demo on a pre-seeded 14-table fixture (~10 min) | [docs/pilot/demo-quickstart.md](docs/pilot/demo-quickstart.md) |

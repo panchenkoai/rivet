@@ -29,8 +29,8 @@ pub use apply_cmd::run_apply_command;
 #[allow(unused_imports)]
 pub use chunked::generate_chunks;
 pub use cli::{
-    reset_chunk_checkpoint, reset_state, show_chunk_checkpoint, show_files, show_metrics,
-    show_progression, show_state,
+    reset_chunk_checkpoint, reset_state, show_chunk_checkpoint, show_files, show_journal,
+    show_metrics, show_progression, show_state,
 };
 pub(crate) use job::run_export_job_with_chunk_source;
 pub use plan_cmd::{PlanOutputFormat, run_plan_command};

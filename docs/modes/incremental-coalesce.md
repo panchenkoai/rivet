@@ -91,8 +91,8 @@ The dev seed (`cargo run --bin seed`) populates a fixture table `orders_coalesce
 cargo run --bin seed -- --target both --coalesce-rows 2000 --coalesce-null-ratio 0.35
 
 # Then:
-rivet plan --config dev/pg_incremental_coalesce.yaml
-rivet run  --config dev/pg_incremental_coalesce.yaml
+rivet plan --config dev/workbench/pg_incremental.yaml --export pg_orders_coalesce
+rivet run  --config dev/workbench/pg_incremental.yaml --export pg_orders_coalesce
 ```
 
 ## Troubleshooting

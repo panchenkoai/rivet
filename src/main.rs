@@ -239,6 +239,21 @@ enum Commands {
         #[arg(short, long, default_value = "20")]
         last: usize,
     },
+    /// Inspect structured run journal (events, files, retries, quality issues)
+    Journal {
+        /// Path to YAML config file
+        #[arg(short, long)]
+        config: String,
+        /// Export name to show journal for
+        #[arg(short, long)]
+        export: String,
+        /// Number of recent runs to show (newest first)
+        #[arg(short, long, default_value = "5")]
+        last: usize,
+        /// Show journal for a specific run_id instead of recent runs
+        #[arg(long, value_name = "RUN_ID")]
+        run_id: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -495,6 +510,14 @@ fn main() -> Result<()> {
             last,
         } => {
             pipeline::show_metrics(&config, export.as_deref(), last)?;
+        }
+        Commands::Journal {
+            config,
+            export,
+            last,
+            run_id,
+        } => {
+            pipeline::show_journal(&config, &export, last, run_id.as_deref())?;
         }
         Commands::State { action } => match action {
             StateAction::Show { config } => {
