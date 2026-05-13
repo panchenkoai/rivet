@@ -223,6 +223,11 @@ pub(crate) fn run_chunked_parallel(
     // (`dispatch task is gone: runtime dropped` from the HTTP client).
     let shared_destination =
         std::sync::Arc::new(destination::create_destination(&plan.destination)?);
+    destination::log_capabilities(
+        &plan.export_name,
+        &**shared_destination,
+        plan.tuning.max_retries,
+    );
 
     std::thread::scope(|s| {
         for (i, (start, end)) in chunks.iter().enumerate() {

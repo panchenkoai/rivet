@@ -229,27 +229,8 @@ pub(super) fn run_single_export(
     let ext = fmt.file_extension();
     let dest = destination::create_destination(&plan.destination)?;
 
-    // ADR-0004: inspect backend capabilities at runtime.
-    // Logs commit protocol and warns when a non-retry-safe destination is used with retries.
-    {
-        let caps = dest.capabilities();
-        log::debug!(
-            "export '{}': destination commit_protocol={:?} idempotent={} retry_safe={} partial_risk={}",
-            plan.export_name,
-            caps.commit_protocol,
-            caps.idempotent_overwrite,
-            caps.retry_safe,
-            caps.partial_write_risk,
-        );
-        if !caps.retry_safe && summary.retries > 0 {
-            log::warn!(
-                "export '{}': destination is not retry-safe ({} retries used); \
-                 partial artifacts may exist at destination — manual cleanup may be needed",
-                plan.export_name,
-                summary.retries,
-            );
-        }
-    }
+    // ADR-0004: log backend capabilities; warn when non-retry-safe destination is configured with retries.
+    destination::log_capabilities(&plan.export_name, dest.as_ref(), plan.tuning.max_retries);
 
     let has_parts = sink.completed_parts.len() > 1;
     let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");

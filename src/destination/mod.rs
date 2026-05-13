@@ -61,14 +61,37 @@ pub trait Destination: Send + Sync {
 
     /// Describe the operational guarantees of this destination backend.
     ///
-    /// Called at runtime before the write loop in `pipeline/single.rs` to log backend
-    /// semantics and warn when a non-retry-safe destination is used after retries.
+    /// Called at runtime via `log_capabilities` in all pipeline entry points (single,
+    /// chunked/exec, chunked/mod) to log backend semantics and warn when a non-retry-safe
+    /// destination is configured with retries.
     ///
     /// State and manifest writes (ADR-0001 invariants I2–I4) must happen only after
     /// `write()` succeeds AND the backend's `commit_protocol` confirms the output is
     /// durably committed.  For `Atomic` and `FinalizeOnClose` backends this means after
     /// `write()` returns `Ok(())`; for `Streaming` there is no safe moment.
     fn capabilities(&self) -> DestinationCapabilities;
+}
+
+/// Log destination capabilities at DEBUG level and emit a WARN when the backend is not
+/// retry-safe but retries are configured.  Call once per export after `create_destination`.
+pub fn log_capabilities(export_name: &str, dest: &dyn Destination, max_retries: u32) {
+    let caps = dest.capabilities();
+    log::debug!(
+        "export '{}': destination commit_protocol={:?} idempotent={} retry_safe={} partial_risk={}",
+        export_name,
+        caps.commit_protocol,
+        caps.idempotent_overwrite,
+        caps.retry_safe,
+        caps.partial_write_risk,
+    );
+    if !caps.retry_safe && max_retries > 0 {
+        log::warn!(
+            "export '{}': destination is not retry-safe (max_retries={}); \
+             partial artifacts may exist at destination on failure — manual cleanup may be needed",
+            export_name,
+            max_retries,
+        );
+    }
 }
 
 pub fn create_destination(config: &DestinationConfig) -> Result<Box<dyn Destination>> {
