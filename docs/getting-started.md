@@ -1,5 +1,16 @@
 # Getting Started
 
+Rivet exports tables from PostgreSQL or MySQL to Parquet (or CSV) files. Point it at a database, scaffold a config from your real tables, then run.
+
+```bash
+brew install panchenkoai/rivet/rivet
+export DATABASE_URL='postgresql://user:pass@localhost:5432/mydb'
+rivet init --source-env DATABASE_URL --table orders -o rivet.yaml
+rivet run --config rivet.yaml --validate
+```
+
+The steps below walk through each command in detail.
+
 ## 1. Install
 
 ### Homebrew (macOS / Linux) — recommended
@@ -115,107 +126,25 @@ rivet completions fish > ~/.config/fish/completions/rivet.fish
 
 ## 2. Connect to your database
 
-Rivet supports **PostgreSQL 12–16** and **MySQL 5.7 / 8.0**. Every release is
-exercised against the full end-to-end suite on each of these versions — see
-[reference/compatibility.md](reference/compatibility.md) for the matrix and
-engine-specific notes.
+Rivet supports **PostgreSQL 12–16** and **MySQL 5.7 / 8.0**.
 
-You choose **one** connection style per config (they must not be mixed):
+The recommended approach: put the connection URL in an environment variable and reference it from the config so no credentials are in the file:
 
-| Style | When it helps | Fields |
-|--------|----------------|--------|
-| **URL in YAML** | Fast local try | `url:` (full string) |
-| **URL from environment** | Production, Docker, CI — no secret in the file | `url_env:` (name of var, e.g. `DATABASE_URL`) |
-| **URL from file** | Secret managers that drop a file on disk (Kubernetes secrets, etc.) | `url_file:` (path; file content is one line, the URL) |
-| **Structured host/user/database** | You do not want a URL string at all; password is separate | `host`, `user`, `database`, optional `port`, and `password` or `password_env` |
-
-**Rules:** Under `source:`, use either **(A)** exactly one of `url` / `url_env` / `url_file`, **or** **(B)** structured `host` + `user` + `database` — never both URL and `host` in the same block. Every field is listed in [reference/config.md](reference/config.md) under **`source`**.
-
-### A — URL-based (pick one of three)
-
-Inline URL (okay for throwaway local configs; avoid in shared repos):
+```bash
+export DATABASE_URL='postgresql://user:pass@localhost:5432/mydb'
+```
 
 ```yaml
 source:
   type: postgres
-  url: "postgresql://user:password@host:5432/dbname"
+  url_env: DATABASE_URL
 ```
 
-MySQL:
+For MySQL, use `type: mysql` and a `mysql://` URL. That's all you need to get started.
 
-```yaml
-source:
-  type: mysql
-  url: "mysql://user:password@host:3306/dbname"
-```
+**Other connection styles** — inline `url:` (quick local test), `url_file:` (secrets mounted to disk), and structured `host` / `user` / `password_env` fields are also supported. Full reference: [reference/config.md § source](reference/config.md#source).
 
-Same URL, but read from an environment variable at runtime (recommended when the URL contains a password):
-
-```yaml
-source:
-  type: postgres
-  url_env: DATABASE_URL   # value of $DATABASE_URL, e.g. postgresql://...
-```
-
-Or read the URL from a file (first line = connection string; path is read when Rivet starts):
-
-```yaml
-source:
-  type: postgres
-  url_file: /run/secrets/database_url
-```
-
-### B — Structured (no URL field)
-
-Use this when you prefer explicit host, database name, and a password from the environment:
-
-```yaml
-source:
-  type: postgres
-  host: db.example.com
-  port: 5432
-  user: rivet_reader
-  password_env: DB_PASSWORD   # reads from $DB_PASSWORD
-  database: production
-  tls:
-    mode: verify-full         # production default; ca_file when using private CAs
-```
-
-MySQL example:
-
-```yaml
-source:
-  type: mysql
-  host: db.example.com
-  port: 3306
-  user: rivet_reader
-  password_env: DB_PASSWORD
-  database: production
-```
-
-### Where to keep configs on disk
-
-- **Pipeline YAML** (`rivet.yaml`, `my_export.yaml`, etc.): keep a **stable path** on the machine that runs Rivet (for example `/opt/rivet/production.yaml` or `deploy/rivet/prod.yaml` in your infra repo). Prefer **one directory per environment** so operators and automation always pass the same `--config` path.
-- **Safe in Git** only when the file has **no secrets**: use `url_env` / `password_env` / `url_file` and let CI or the host inject credentials. Never commit plaintext `password:` or `url:` with real credentials.
-- **State database:** Rivet creates **`.rivet_state.db` in the same directory as the config file** you pass to `run`, `check`, `doctor`, `reconcile`, etc. (if the config is `configs/prod/exports.yaml`, state is `configs/prod/.rivet_state.db`). Treat it as **runtime data** (cursors, chunk checkpoints, manifests): include it in backups for that host, do not edit by hand, and add `.rivet_state.db` to **`.gitignore`** if the folder is under version control. For `rivet apply plan.json`, the state file is next to the **plan** file — keep the plan beside the config or in the same directory if you want a single state DB; details in [reference/cli.md — `rivet apply`](reference/cli.md#rivet-apply).
-- **Secret files** (`url_file`, PEM paths in `tls.ca_file`): store **outside the repo**, with strict file permissions (e.g. `chmod 600`), and mount or sync them only onto the runner.
-- **Exports (Parquet/CSV)** go wherever `exports[].destination` points — independent of where the YAML lives; use a dedicated output directory or bucket prefix per environment.
-
-Example layout:
-
-```text
-/opt/rivet/prod/
-  exports.yaml           # in Git or config mgmt; references url_env / password_env
-  .rivet_state.db         # local only; backup; not in Git
-  plans/                  # optional JSON from `rivet plan` for review / apply
-    2026-05-13.json
-```
-
-### Production security checklist
-
-- `url_env:` / `password_env:` — never commit secrets. Plaintext `password:` is silently stripped from plan artifacts by [ADR-0005 PA9](adr/0005-plan-apply-contracts.md#pa9--artifact-credential-redaction-acr), and the WARN log tells you to migrate.
-- `tls: { mode: verify-full }` — omitting `tls:` connects in plaintext and logs a WARN. See [reference/config.md § TLS](reference/config.md#tls) for `verify-ca` / `require` / `disable` semantics.
-- `rivet init --source-env DATABASE_URL` instead of `--source <url>` — keeps creds out of shell history, `ps`, and container inspect logs.
+> **State database:** Rivet creates `.rivet_state.db` next to the config file (stores cursors, chunk checkpoints, run history). Add it to `.gitignore` if the folder is under version control.
 
 ## Walkthrough at a glance
 
