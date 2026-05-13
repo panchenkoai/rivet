@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 
-use arrow::datatypes::{DataType, Field, IntervalUnit, TimeUnit as ArrowTimeUnit};
+use arrow::datatypes::{DataType, Field, TimeUnit as ArrowTimeUnit};
 use serde::Serialize;
 use std::sync::Arc;
 
@@ -148,9 +148,10 @@ pub fn rivet_type_to_arrow(t: &RivetType) -> Option<DataType> {
 
         RivetType::Binary => Some(DataType::Binary),
 
-        // Arrow IntervalMonthDayNano preserves all three PostgreSQL interval
-        // components: months (leap-safe), days, and sub-day nanoseconds.
-        RivetType::Interval => Some(DataType::Interval(IntervalUnit::MonthDayNano)),
+        // Interval → Utf8 (ISO 8601 duration string, e.g. "P1Y2M3D").
+        // Arrow's Interval(MonthDayNano) cannot be written to Parquet, so we
+        // serialise to a lossless text representation in the source driver.
+        RivetType::Interval => Some(DataType::Utf8),
 
         // One-dimensional array: recursively resolve the inner element type.
         // Returns None if the inner type itself is Unsupported.

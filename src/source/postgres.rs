@@ -3,11 +3,9 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Decimal256Builder,
-    Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder,
-    IntervalMonthDayNanoBuilder, ListBuilder, StringBuilder, Time64MicrosecondBuilder,
-    TimestampMicrosecondBuilder,
+    Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, ListBuilder,
+    StringBuilder, Time64MicrosecondBuilder, TimestampMicrosecondBuilder,
 };
-use arrow::datatypes::IntervalMonthDayNano;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use chrono::Timelike as _;
 use postgres::types::{FromSql as PgFromSql, Json, Kind, Type};
@@ -417,14 +415,54 @@ impl<'a> postgres_types::FromSql<'a> for PgInterval {
     }
 }
 
-/// Build an `IntervalMonthDayNano` from PostgreSQL interval components.
-#[inline]
-fn pack_month_day_nano(months: i32, days: i32, nanoseconds: i64) -> IntervalMonthDayNano {
-    IntervalMonthDayNano {
-        months,
-        days,
-        nanoseconds,
+/// Serialise a PostgreSQL INTERVAL to an ISO 8601 duration string.
+///
+/// Arrow `Interval(MonthDayNano)` cannot be written to Parquet, so we emit
+/// Utf8 instead.  The three components map as:
+///   months → years + months  (e.g. 14 → "P1Y2M")
+///   days   → days            (e.g. 3  → "3D")
+///   µs     → T…H…M…S        (e.g. 90_061_000_000 → "T25H1M1S")
+fn pg_interval_to_iso8601(months: i32, days: i32, microseconds: i64) -> String {
+    use std::fmt::Write as _;
+    let years = months / 12;
+    let m = months % 12;
+    let mut s = String::from("P");
+    if years != 0 {
+        write!(s, "{years}Y").ok();
     }
+    if m != 0 {
+        write!(s, "{m}M").ok();
+    }
+    if days != 0 {
+        write!(s, "{days}D").ok();
+    }
+    if microseconds != 0 {
+        let neg = microseconds < 0;
+        let abs = microseconds.unsigned_abs();
+        let h = abs / 3_600_000_000;
+        let r = abs % 3_600_000_000;
+        let mi = r / 60_000_000;
+        let r2 = r % 60_000_000;
+        let sec = r2 / 1_000_000;
+        let us = r2 % 1_000_000;
+        let sign = if neg { "-" } else { "" };
+        s.push('T');
+        if h != 0 {
+            write!(s, "{sign}{h}H").ok();
+        }
+        if mi != 0 {
+            write!(s, "{sign}{mi}M").ok();
+        }
+        if us != 0 {
+            write!(s, "{sign}{sec}.{us:06}S").ok();
+        } else if sec != 0 || (h == 0 && mi == 0) {
+            write!(s, "{sign}{sec}S").ok();
+        }
+    }
+    if s == "P" {
+        s.push_str("T0S");
+    }
+    s
 }
 
 /// Generic wrapper that reads any Postgres binary value as a UTF-8 string.
@@ -623,15 +661,15 @@ fn build_array(
             }
         },
         _ => {
-            // M6: INTERVAL → IntervalMonthDayNano
+            // INTERVAL → Utf8 ISO 8601 (Interval(MonthDayNano) is not Parquet-writable).
             if *pg_type == Type::INTERVAL {
-                let mut b = IntervalMonthDayNanoBuilder::with_capacity(rows.len());
+                let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 12);
                 for row in rows {
                     match row.try_get::<_, Option<PgInterval>>(col_idx).ok().flatten() {
-                        Some(iv) => b.append_value(pack_month_day_nano(
+                        Some(iv) => b.append_value(pg_interval_to_iso8601(
                             iv.months,
                             iv.days,
-                            iv.microseconds * 1_000,
+                            iv.microseconds,
                         )),
                         None => b.append_null(),
                     }

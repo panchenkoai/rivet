@@ -141,9 +141,9 @@ pub enum RivetType {
     Enum,
 
     /// Time interval (PostgreSQL `interval`).
-    /// Stored as Arrow `IntervalMonthDayNano` which preserves the three
-    /// components (months, days, sub-day nanoseconds) without collapsing
-    /// them into a single integer (roadmap §15).
+    /// Stored as Arrow `Utf8` (ISO 8601 duration string, e.g. `"P1Y2M3D"`).
+    /// `Interval(MonthDayNano)` cannot be written to Parquet, so lossless
+    /// text serialisation is used instead (roadmap §15).
     Interval,
 
     /// One-dimensional array of a scalar Rivet type.

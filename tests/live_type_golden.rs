@@ -22,7 +22,7 @@ use arrow::array::types::{Decimal128Type, TimestampMicrosecondType};
 use arrow::array::{
     Array, AsArray, BinaryArray, BooleanArray, Int16Array, Int64Array, RecordBatch, StringArray,
 };
-use arrow::datatypes::{DataType, IntervalUnit, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use chrono::NaiveDateTime;
 use common::*;
 use mysql::prelude::*;
@@ -1295,7 +1295,8 @@ exports:
     );
     assert_eq!(
         *schema.field_with_name("interval_col").unwrap().data_type(),
-        DataType::Interval(IntervalUnit::MonthDayNano)
+        DataType::Utf8,
+        "interval_col: Interval(MonthDayNano) is not Parquet-writable; must map to Utf8 ISO 8601"
     );
     assert_eq!(
         *schema.field_with_name("enum_col").unwrap().data_type(),
