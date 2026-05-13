@@ -362,6 +362,7 @@ fn mysql_schema_and_arrow_types(
 ) -> crate::error::Result<(Schema, Vec<DataType>)> {
     let mut fields: Vec<Field> = Vec::with_capacity(columns.len());
     let mut arrow_types: Vec<DataType> = Vec::with_capacity(columns.len());
+    let mut errors: Vec<String> = Vec::new();
 
     for col in columns {
         let native = mysql_native_type_name(col);
@@ -379,17 +380,25 @@ fn mysql_schema_and_arrow_types(
             }
             _ => {
                 let reason = match &mapping.rivet_type {
-                    RivetType::Unsupported { reason, .. } => reason.clone(),
-                    _ => "no Rivet mapping for this MySQL type".into(),
+                    RivetType::Unsupported { reason, .. } => reason.as_str(),
+                    _ => "no Rivet mapping for this MySQL type",
                 };
-                anyhow::bail!(
-                    "column '{}' (MySQL type '{native}'): {reason}",
+                errors.push(format!(
+                    "  • {} (MySQL type '{native}'): {reason}",
                     col.name_str()
-                );
+                ));
             }
         }
     }
 
+    if !errors.is_empty() {
+        anyhow::bail!(
+            "{} column(s) have no safe Rivet mapping — add column overrides in rivet.yaml:\n\
+             columns:\n{}",
+            errors.len(),
+            errors.join("\n")
+        );
+    }
     Ok((Schema::new(fields), arrow_types))
 }
 

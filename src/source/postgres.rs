@@ -354,6 +354,7 @@ fn pg_columns_to_schema(
     column_overrides: &ColumnOverrides,
 ) -> crate::error::Result<Schema> {
     let mut fields: Vec<Field> = Vec::with_capacity(columns.len());
+    let mut errors: Vec<String> = Vec::new();
     for col in columns {
         let rivet = column_overrides
             .get(col.name())
@@ -365,16 +366,24 @@ fn pg_columns_to_schema(
             Some(field) => fields.push(field),
             None => {
                 let reason = match &mapping.rivet_type {
-                    RivetType::Unsupported { reason, .. } => reason.clone(),
-                    _ => "no Rivet mapping for this PostgreSQL type".into(),
+                    RivetType::Unsupported { reason, .. } => reason.as_str(),
+                    _ => "no Rivet mapping for this PostgreSQL type",
                 };
-                anyhow::bail!(
-                    "column '{}' (PG type '{}'): {reason}",
+                errors.push(format!(
+                    "  • {} (PG type '{}'): {reason}",
                     col.name(),
                     col.type_().name()
-                );
+                ));
             }
         }
+    }
+    if !errors.is_empty() {
+        anyhow::bail!(
+            "{} column(s) have no safe Rivet mapping — add column overrides in rivet.yaml:\n\
+             columns:\n{}",
+            errors.len(),
+            errors.join("\n")
+        );
     }
     Ok(Schema::new(fields))
 }
