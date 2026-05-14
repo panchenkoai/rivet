@@ -548,8 +548,8 @@ fn bench_mysql_int_bytes(c: &mut Criterion) {
         b.iter(|| {
             inputs
                 .iter()
-                .map(|bv| int_bytes_before(bv))
-                .sum::<Option<i32>>()
+                .map(|bv| int_bytes_before(bv).map(|v| v as i64))
+                .sum::<Option<i64>>()
         })
     });
 
@@ -557,8 +557,8 @@ fn bench_mysql_int_bytes(c: &mut Criterion) {
         b.iter(|| {
             inputs
                 .iter()
-                .map(|bv| int_bytes_after(bv))
-                .sum::<Option<i32>>()
+                .map(|bv| int_bytes_after(bv).map(|v| v as i64))
+                .sum::<Option<i64>>()
         })
     });
 
