@@ -202,3 +202,76 @@ pub(crate) fn extract_scan_type(plan: &str) -> String {
     }
     plan.lines().next().unwrap_or("unknown").trim().to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_pg_row_estimate ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_pg_row_estimate_typical_seq_scan() {
+        let plan = "Seq Scan on orders  (cost=0.00..1250.00 rows=5000 width=120)";
+        assert_eq!(parse_pg_row_estimate(plan), Some(5000));
+    }
+
+    #[test]
+    fn parse_pg_row_estimate_nested_plan_first_rows_wins() {
+        let plan = "Aggregate  (cost=0.00..50.00 rows=1 width=8)\n  ->  Seq Scan on t  (cost=0.00..100.00 rows=10000 width=4)";
+        // First "rows=" is rows=1 from Aggregate
+        assert_eq!(parse_pg_row_estimate(plan), Some(1));
+    }
+
+    #[test]
+    fn parse_pg_row_estimate_large_row_count() {
+        let plan =
+            "Index Scan using idx on orders  (cost=0.00..1234567.00 rows=123456789 width=50)";
+        assert_eq!(parse_pg_row_estimate(plan), Some(123_456_789));
+    }
+
+    #[test]
+    fn parse_pg_row_estimate_no_rows_keyword_returns_none() {
+        assert!(parse_pg_row_estimate("Seq Scan on t (cost=0.00..100.00 width=8)").is_none());
+    }
+
+    #[test]
+    fn parse_pg_row_estimate_empty_plan_returns_none() {
+        assert!(parse_pg_row_estimate("").is_none());
+    }
+
+    // ── extract_scan_type ────────────────────────────────────────────────────
+
+    #[test]
+    fn extract_scan_type_seq_scan() {
+        let plan = "Seq Scan on orders  (cost=0.00..1000.00 rows=50000 width=8)";
+        let result = extract_scan_type(plan);
+        assert!(result.contains("Seq Scan"), "got: {result}");
+    }
+
+    #[test]
+    fn extract_scan_type_index_scan() {
+        let plan = "  ->  Index Scan using orders_pkey on orders  (cost=0.43..8.45 rows=1 width=8)";
+        let result = extract_scan_type(plan);
+        assert!(result.contains("Index Scan"), "got: {result}");
+    }
+
+    #[test]
+    fn extract_scan_type_bitmap_heap_scan() {
+        let plan = "  ->  Bitmap Heap Scan on orders  (cost=4.35..16.20 rows=4 width=8)";
+        let result = extract_scan_type(plan);
+        assert!(result.contains("Bitmap Heap Scan"), "got: {result}");
+    }
+
+    #[test]
+    fn extract_scan_type_no_scan_returns_first_line() {
+        let plan = "Aggregate  (cost=10.00..10.01 rows=1 width=8)\n  ->  Sort  (...)";
+        let result = extract_scan_type(plan);
+        // No "Scan" in any line → returns first line trimmed
+        assert!(result.starts_with("Aggregate"), "got: {result}");
+    }
+
+    #[test]
+    fn extract_scan_type_empty_plan_returns_unknown() {
+        assert_eq!(extract_scan_type(""), "unknown");
+    }
+}

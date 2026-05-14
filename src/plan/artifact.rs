@@ -452,10 +452,40 @@ mod tests {
     }
 
     #[test]
+    fn staleness_warn_between_thresholds() {
+        let mut artifact = minimal_artifact();
+        // Backdate to 2 hours ago: past warn (1h) but before error (24h).
+        artifact.created_at = Utc::now() - Duration::hours(2);
+        let result = artifact.staleness(Duration::hours(1), Duration::hours(24));
+        assert!(
+            matches!(result, StalenessCheck::StaleWarn(_)),
+            "expected StaleWarn, got {result:?}"
+        );
+    }
+
+    #[test]
     fn staleness_expired_artifact() {
         let mut artifact = minimal_artifact();
         // Backdate creation to 25 hours ago
         artifact.created_at = Utc::now() - Duration::hours(25);
+        let result = artifact.staleness(Duration::hours(1), Duration::hours(24));
+        assert!(matches!(result, StalenessCheck::StaleError(_)));
+    }
+
+    #[test]
+    fn staleness_exactly_at_warn_threshold() {
+        let mut artifact = minimal_artifact();
+        // Exactly 1 hour ago → StaleWarn (age >= warn_after).
+        artifact.created_at = Utc::now() - Duration::hours(1) - Duration::seconds(1);
+        let result = artifact.staleness(Duration::hours(1), Duration::hours(24));
+        assert!(matches!(result, StalenessCheck::StaleWarn(_)));
+    }
+
+    #[test]
+    fn staleness_exactly_at_error_threshold() {
+        let mut artifact = minimal_artifact();
+        // Exactly 24h + 1s → StaleError.
+        artifact.created_at = Utc::now() - Duration::hours(24) - Duration::seconds(1);
         let result = artifact.staleness(Duration::hours(1), Duration::hours(24));
         assert!(matches!(result, StalenessCheck::StaleError(_)));
     }

@@ -103,3 +103,109 @@ pub fn create_destination(config: &DestinationConfig) -> Result<Box<dyn Destinat
         DestinationType::Stdout => Ok(Box::new(stdout::StdoutDestination::new()?)),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    struct MockDest {
+        caps: DestinationCapabilities,
+    }
+
+    impl Destination for MockDest {
+        fn write(&self, _local: &Path, _key: &str) -> Result<()> {
+            Ok(())
+        }
+        fn capabilities(&self) -> DestinationCapabilities {
+            self.caps.clone()
+        }
+    }
+
+    fn atomic_safe() -> MockDest {
+        MockDest {
+            caps: DestinationCapabilities {
+                commit_protocol: WriteCommitProtocol::Atomic,
+                idempotent_overwrite: true,
+                retry_safe: true,
+                partial_write_risk: false,
+            },
+        }
+    }
+
+    fn streaming_unsafe() -> MockDest {
+        MockDest {
+            caps: DestinationCapabilities {
+                commit_protocol: WriteCommitProtocol::Streaming,
+                idempotent_overwrite: false,
+                retry_safe: false,
+                partial_write_risk: true,
+            },
+        }
+    }
+
+    // ── log_capabilities smoke tests — just verify no panic ─────────────────
+
+    #[test]
+    fn log_capabilities_retry_safe_no_panic() {
+        log_capabilities("orders", &atomic_safe(), 3);
+    }
+
+    #[test]
+    fn log_capabilities_not_retry_safe_with_retries_no_panic() {
+        log_capabilities("orders", &streaming_unsafe(), 3);
+    }
+
+    #[test]
+    fn log_capabilities_zero_retries_no_panic() {
+        log_capabilities("orders", &streaming_unsafe(), 0);
+    }
+
+    // ── create_destination — local roundtrip ─────────────────────────────────
+
+    #[test]
+    fn create_destination_local_succeeds() {
+        use crate::config::{DestinationConfig, DestinationType};
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = DestinationConfig {
+            destination_type: DestinationType::Local,
+            bucket: None,
+            prefix: None,
+            path: Some(dir.path().to_str().unwrap().to_string()),
+            region: None,
+            endpoint: None,
+            credentials_file: None,
+            access_key_env: None,
+            secret_key_env: None,
+            aws_profile: None,
+            allow_anonymous: false,
+        };
+        let dest = create_destination(&config).unwrap();
+        let caps = dest.capabilities();
+        assert_eq!(caps.commit_protocol, WriteCommitProtocol::Atomic);
+        assert!(caps.idempotent_overwrite);
+    }
+
+    // ── create_destination — stdout succeeds ─────────────────────────────────
+
+    #[test]
+    fn create_destination_stdout_succeeds() {
+        use crate::config::{DestinationConfig, DestinationType};
+        let config = DestinationConfig {
+            destination_type: DestinationType::Stdout,
+            bucket: None,
+            prefix: None,
+            path: None,
+            region: None,
+            endpoint: None,
+            credentials_file: None,
+            access_key_env: None,
+            secret_key_env: None,
+            aws_profile: None,
+            allow_anonymous: false,
+        };
+        let dest = create_destination(&config).unwrap();
+        let caps = dest.capabilities();
+        assert_eq!(caps.commit_protocol, WriteCommitProtocol::Streaming);
+    }
+}

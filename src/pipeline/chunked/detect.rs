@@ -254,3 +254,184 @@ pub(crate) fn detect_and_generate_chunks(
 
     Ok(chunks)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SourceType;
+    use std::collections::VecDeque;
+
+    // ── ScriptedSource ───────────────────────────────────────────────────────
+    // Returns pre-queued replies for query_scalar; panics if queue is exhausted.
+    // export / type_mappings are never called in detect tests.
+
+    struct ScriptedSource(VecDeque<Result<Option<String>>>);
+
+    impl ScriptedSource {
+        fn new(items: impl IntoIterator<Item = Result<Option<String>>>) -> Self {
+            Self(items.into_iter().collect())
+        }
+    }
+
+    fn ok(s: &str) -> Result<Option<String>> {
+        Ok(Some(s.to_string()))
+    }
+    fn null() -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    impl crate::source::Source for ScriptedSource {
+        fn query_scalar(&mut self, _sql: &str) -> Result<Option<String>> {
+            self.0.pop_front().expect("ScriptedSource: queue exhausted")
+        }
+        fn export(
+            &mut self,
+            _query: &str,
+            _incremental: Option<&crate::plan::IncrementalCursorPlan>,
+            _cursor: Option<&crate::types::CursorState>,
+            _tuning: &crate::tuning::SourceTuning,
+            _column_overrides: &crate::types::ColumnOverrides,
+            _sink: &mut dyn crate::source::BatchSink,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+        fn type_mappings(
+            &mut self,
+            _query: &str,
+            _column_overrides: &crate::types::ColumnOverrides,
+        ) -> Result<Vec<crate::types::TypeMapping>> {
+            unimplemented!()
+        }
+    }
+
+    fn detect(
+        src: &mut dyn crate::source::Source,
+        chunk_size: usize,
+        chunk_dense: bool,
+        chunk_by_days: Option<u32>,
+    ) -> Result<Vec<(i64, i64)>> {
+        detect_and_generate_chunks(
+            src,
+            "SELECT id FROM orders",
+            "id",
+            chunk_size,
+            "orders",
+            chunk_dense,
+            chunk_by_days,
+            SourceType::Postgres,
+        )
+    }
+
+    // ── integer range path ──────────────────────────────────────────────────
+
+    #[test]
+    fn integer_range_basic_chunks_computed_correctly() {
+        // min=1, max=1000, COUNT=500 → 10 chunks of size 100
+        let mut src = ScriptedSource::new([ok("1"), ok("1000"), ok("500")]);
+        let chunks = detect(&mut src, 100, false, None).unwrap();
+        assert_eq!(chunks.len(), 10);
+        assert_eq!(chunks[0], (1, 100));
+        assert_eq!(chunks[9], (901, 1000));
+    }
+
+    #[test]
+    fn integer_range_null_minmax_collapses_to_zero_zero() {
+        // NULL min/max → unwrap_or(0) on both → single chunk (0,0)
+        let mut src = ScriptedSource::new([null(), null(), ok("0")]);
+        let chunks = detect(&mut src, 100, false, None).unwrap();
+        assert_eq!(chunks, vec![(0, 0)]);
+    }
+
+    #[test]
+    fn integer_range_count_failure_still_returns_chunks() {
+        // COUNT returns unparseable string → logged as warning; chunks from min/max returned
+        let mut src = ScriptedSource::new([ok("1"), ok("100"), ok("not-a-number")]);
+        let chunks = detect(&mut src, 50, false, None).unwrap();
+        assert_eq!(chunks, vec![(1, 50), (51, 100)]);
+    }
+
+    #[test]
+    fn integer_range_single_chunk_when_range_smaller_than_size() {
+        let mut src = ScriptedSource::new([ok("5"), ok("20"), ok("15")]);
+        let chunks = detect(&mut src, 100, false, None).unwrap();
+        assert_eq!(chunks, vec![(5, 20)]);
+    }
+
+    // ── chunk_dense path ────────────────────────────────────────────────────
+
+    #[test]
+    fn chunk_dense_nonzero_produces_ordinal_chunks() {
+        // COUNT=250, chunk_size=100 → ordinal windows 1..250
+        let mut src = ScriptedSource::new([ok("250")]);
+        let chunks = detect(&mut src, 100, true, None).unwrap();
+        assert_eq!(chunks, vec![(1, 100), (101, 200), (201, 250)]);
+    }
+
+    #[test]
+    fn chunk_dense_zero_rows_returns_empty() {
+        let mut src = ScriptedSource::new([ok("0")]);
+        let chunks = detect(&mut src, 100, true, None).unwrap();
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn chunk_dense_count_returned_no_row_propagates_error() {
+        // COUNT(*) returns no row (None) → error propagated (not just warned)
+        let mut src = ScriptedSource::new([null()]);
+        let result = detect(&mut src, 100, true, None);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("COUNT") || msg.contains("no row"),
+            "got: {msg}"
+        );
+    }
+
+    // ── chunk_by_days path ──────────────────────────────────────────────────
+
+    #[test]
+    fn chunk_by_days_basic_range_produces_windows() {
+        // 2023-01-01 .. 2023-01-31 (31 days), 7 days/chunk → 5 windows
+        let mut src = ScriptedSource::new([ok("2023-01-01"), ok("2023-01-31")]);
+        let chunks = detect(&mut src, 10_000, false, Some(7)).unwrap();
+        assert_eq!(
+            chunks.len(),
+            5,
+            "expected 5 weekly windows, got: {chunks:?}"
+        );
+    }
+
+    #[test]
+    fn chunk_by_days_single_day_returns_one_chunk() {
+        let mut src = ScriptedSource::new([ok("2024-03-15"), ok("2024-03-15")]);
+        let chunks = detect(&mut src, 10_000, false, Some(7)).unwrap();
+        assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    fn chunk_by_days_null_min_returns_error() {
+        let mut src = ScriptedSource::new([null()]);
+        let result = detect(&mut src, 10_000, false, Some(7));
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(msg.contains("NULL") || msg.contains("empty"), "got: {msg}");
+    }
+
+    #[test]
+    fn chunk_by_days_invalid_date_string_returns_error() {
+        let mut src = ScriptedSource::new([ok("not-a-date"), ok("2023-12-31")]);
+        let result = detect(&mut src, 10_000, false, Some(7));
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(msg.contains("parse") || msg.contains("date"), "got: {msg}");
+    }
+
+    #[test]
+    fn chunk_by_days_datetime_format_parsed_correctly() {
+        // DB returns DATETIME strings instead of DATE — still parseable
+        let mut src = ScriptedSource::new([ok("2023-06-01 00:00:00"), ok("2023-06-30 23:59:59")]);
+        let chunks = detect(&mut src, 10_000, false, Some(7)).unwrap();
+        // 30 days / 7 = 5 chunks (days 0..29, each 7 except last)
+        assert_eq!(chunks.len(), 5, "expected 5 windows, got: {chunks:?}");
+    }
+}

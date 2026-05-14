@@ -101,3 +101,172 @@ fn wire_to_big_decimal(wire: &[u8]) -> Option<BigDecimal> {
 
     Some(BigDecimal::new(coef, scale))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a raw PG numeric wire payload from its constituent fields.
+    ///
+    /// Layout (all big-endian):
+    ///   uint16 ndigits | i16 weight | uint16 sign | uint16 dscale | i16 digits[ndigits]
+    fn encode(ndigits: u16, weight: i16, sign: u16, dscale: u16, digits: &[i16]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(8 + digits.len() * 2);
+        buf.extend_from_slice(&ndigits.to_be_bytes());
+        buf.extend_from_slice(&weight.to_be_bytes());
+        buf.extend_from_slice(&sign.to_be_bytes());
+        buf.extend_from_slice(&dscale.to_be_bytes());
+        for &d in digits {
+            buf.extend_from_slice(&d.to_be_bytes());
+        }
+        buf
+    }
+
+    // ── zero / empty ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn zero_ndigits_gives_zero() {
+        // ndigits=0 → early-return BigDecimal::zero()
+        let wire = encode(0, 0, NUMERIC_POS, 0, &[]);
+        assert_eq!(numeric_wire_normalized_plain(&wire).as_deref(), Some("0"));
+    }
+
+    // ── positive integers ────────────────────────────────────────────────────
+
+    #[test]
+    fn value_one() {
+        // 1 * 10000^0 = 1; limb=[1], weight=0
+        let wire = encode(1, 0, NUMERIC_POS, 0, &[1]);
+        assert_eq!(numeric_wire_normalized_plain(&wire).as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn value_one_hundred() {
+        let wire = encode(1, 0, NUMERIC_POS, 0, &[100]);
+        assert_eq!(numeric_wire_normalized_plain(&wire).as_deref(), Some("100"));
+    }
+
+    #[test]
+    fn value_9999_single_limb() {
+        let wire = encode(1, 0, NUMERIC_POS, 0, &[9999]);
+        assert_eq!(
+            numeric_wire_normalized_plain(&wire).as_deref(),
+            Some("9999")
+        );
+    }
+
+    #[test]
+    fn value_10000_two_limbs() {
+        // 10000 = 1 * 10000^1 + 0 * 10000^0; weight=1, limbs=[1, 0]
+        let wire = encode(2, 1, NUMERIC_POS, 0, &[1, 0]);
+        assert_eq!(
+            numeric_wire_normalized_plain(&wire).as_deref(),
+            Some("10000")
+        );
+    }
+
+    // ── negative values ───────────────────────────────────────────────────────
+
+    #[test]
+    fn negative_five() {
+        let wire = encode(1, 0, NUMERIC_NEG, 0, &[5]);
+        assert_eq!(numeric_wire_normalized_plain(&wire).as_deref(), Some("-5"));
+    }
+
+    #[test]
+    fn negative_large() {
+        // -12345: 1 * 10000^1 + 2345 * 10000^0, weight=1
+        let wire = encode(2, 1, NUMERIC_NEG, 0, &[1, 2345]);
+        assert_eq!(
+            numeric_wire_normalized_plain(&wire).as_deref(),
+            Some("-12345")
+        );
+    }
+
+    // ── fractional values ────────────────────────────────────────────────────
+
+    #[test]
+    fn value_point_01() {
+        // 0.01 = 100 * 10000^(-1); weight=-1, limb=[100]
+        // scale = (1 - (-1) - 1) * 4 = 4 → BigDecimal::new(100, 4) = 0.0100 → "0.01"
+        let wire = encode(1, -1, NUMERIC_POS, 2, &[100]);
+        assert_eq!(
+            numeric_wire_normalized_plain(&wire).as_deref(),
+            Some("0.01")
+        );
+    }
+
+    #[test]
+    fn value_12_dot_34() {
+        // 12.34: limbs=[12, 3400], weight=0
+        // scale = (2 - 0 - 1)*4 = 4; cents=[0,12,34,0]; coef=123400
+        // BigDecimal::new(123400, 4) = 12.3400 → normalized "12.34"
+        let wire = encode(2, 0, NUMERIC_POS, 2, &[12, 3400]);
+        assert_eq!(
+            numeric_wire_normalized_plain(&wire).as_deref(),
+            Some("12.34")
+        );
+    }
+
+    #[test]
+    fn negative_fractional() {
+        let wire = encode(2, 0, NUMERIC_NEG, 2, &[12, 3400]);
+        assert_eq!(
+            numeric_wire_normalized_plain(&wire).as_deref(),
+            Some("-12.34")
+        );
+    }
+
+    // ── special values → None ────────────────────────────────────────────────
+
+    #[test]
+    fn nan_returns_none() {
+        let wire = encode(0, 0, NUMERIC_NAN, 0, &[]);
+        assert!(numeric_wire_normalized_plain(&wire).is_none());
+    }
+
+    #[test]
+    fn positive_infinity_returns_none() {
+        let wire = encode(0, 0, NUMERIC_PINF, 0, &[]);
+        assert!(numeric_wire_normalized_plain(&wire).is_none());
+    }
+
+    #[test]
+    fn negative_infinity_returns_none() {
+        let wire = encode(0, 0, NUMERIC_NINF, 0, &[]);
+        assert!(numeric_wire_normalized_plain(&wire).is_none());
+    }
+
+    #[test]
+    fn unknown_sign_field_returns_none() {
+        let wire = encode(0, 0, 0xBEEF, 0, &[]);
+        assert!(numeric_wire_normalized_plain(&wire).is_none());
+    }
+
+    // ── malformed payloads ────────────────────────────────────────────────────
+
+    #[test]
+    fn empty_slice_returns_none() {
+        assert!(numeric_wire_normalized_plain(&[]).is_none());
+    }
+
+    #[test]
+    fn truncated_header_returns_none() {
+        // Only 6 bytes — not enough for the 8-byte header.
+        assert!(numeric_wire_normalized_plain(&[0, 1, 0, 0, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn ndigits_exceeds_actual_data_returns_none() {
+        // Claims ndigits=3 but provides 0 digit limbs.
+        let wire = encode(3, 0, NUMERIC_POS, 0, &[]);
+        assert!(numeric_wire_normalized_plain(&wire).is_none());
+    }
+
+    #[test]
+    fn limb_out_of_range_returns_none() {
+        // Limb value >= 10000 is invalid.
+        let wire = encode(1, 0, NUMERIC_POS, 0, &[10000]);
+        assert!(numeric_wire_normalized_plain(&wire).is_none());
+    }
+}

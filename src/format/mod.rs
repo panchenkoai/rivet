@@ -37,3 +37,57 @@ pub fn create_format(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    fn schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
+    }
+
+    fn batch(schema: &Arc<Schema>) -> arrow::record_batch::RecordBatch {
+        arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1i64, 2]))],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn create_format_csv_extension_and_roundtrip() {
+        let schema = schema();
+        let fmt = create_format(FormatType::Csv, CompressionType::None, None);
+        assert_eq!(fmt.file_extension(), "csv");
+        let mut w = fmt
+            .create_writer(&schema, Box::new(Vec::<u8>::new()))
+            .unwrap();
+        w.write_batch(&batch(&schema)).unwrap();
+        w.finish().unwrap();
+    }
+
+    #[test]
+    fn create_format_parquet_extension_and_roundtrip() {
+        let schema = schema();
+        let fmt = create_format(FormatType::Parquet, CompressionType::Zstd, None);
+        assert_eq!(fmt.file_extension(), "parquet");
+        let mut w = fmt
+            .create_writer(&schema, Box::new(Vec::<u8>::new()))
+            .unwrap();
+        w.write_batch(&batch(&schema)).unwrap();
+        w.finish().unwrap();
+    }
+
+    #[test]
+    fn create_format_parquet_uncompressed_finish_ok() {
+        let schema = schema();
+        let fmt = create_format(FormatType::Parquet, CompressionType::None, None);
+        let w = fmt
+            .create_writer(&schema, Box::new(Vec::<u8>::new()))
+            .unwrap();
+        w.finish().unwrap();
+    }
+}

@@ -71,3 +71,140 @@ pub fn parse_file_size(s: &str) -> crate::error::Result<u64> {
         .map_err(|_| anyhow::anyhow!("invalid file size: '{}'", s))?;
     Ok((value * multiplier as f64) as u64)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // ── resolve_vars — no substitution ──────────────────────────────────────
+
+    #[test]
+    fn no_placeholders_returned_verbatim() {
+        assert_eq!(resolve_vars("SELECT 1", None).unwrap(), "SELECT 1");
+    }
+
+    #[test]
+    fn empty_string_returned_verbatim() {
+        assert_eq!(resolve_vars("", None).unwrap(), "");
+    }
+
+    // ── resolve_vars — param substitution ───────────────────────────────────
+
+    #[test]
+    fn param_substitutes_placeholder() {
+        let mut p = HashMap::new();
+        p.insert("TABLE".into(), "orders".into());
+        let result = resolve_vars("SELECT * FROM ${TABLE}", Some(&p)).unwrap();
+        assert_eq!(result, "SELECT * FROM orders");
+    }
+
+    #[test]
+    fn param_takes_precedence_over_env() {
+        // Set an env var with the same name but different value.
+        unsafe { std::env::set_var("RIVET_TEST_OVERRIDE_VAR", "from_env") };
+        let mut p = HashMap::new();
+        p.insert("RIVET_TEST_OVERRIDE_VAR".into(), "from_param".into());
+        let result = resolve_vars("${RIVET_TEST_OVERRIDE_VAR}", Some(&p)).unwrap();
+        unsafe { std::env::remove_var("RIVET_TEST_OVERRIDE_VAR") };
+        assert_eq!(result, "from_param");
+    }
+
+    #[test]
+    fn multiple_placeholders_all_substituted() {
+        let mut p = HashMap::new();
+        p.insert("A".into(), "hello".into());
+        p.insert("B".into(), "world".into());
+        let result = resolve_vars("${A} ${B}", Some(&p)).unwrap();
+        assert_eq!(result, "hello world");
+    }
+
+    // ── resolve_vars — env var substitution ─────────────────────────────────
+
+    #[test]
+    fn env_var_substituted_when_set() {
+        unsafe { std::env::set_var("RIVET_TEST_RESOLVE_VAR", "secret123") };
+        let result = resolve_vars("pass=${RIVET_TEST_RESOLVE_VAR}", None).unwrap();
+        unsafe { std::env::remove_var("RIVET_TEST_RESOLVE_VAR") };
+        assert_eq!(result, "pass=secret123");
+    }
+
+    #[test]
+    fn missing_env_var_returns_error() {
+        unsafe { std::env::remove_var("RIVET_DEFINITELY_NOT_SET_VAR_XYZ") };
+        let err = resolve_vars("${RIVET_DEFINITELY_NOT_SET_VAR_XYZ}", None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("RIVET_DEFINITELY_NOT_SET_VAR_XYZ"),
+            "got: {msg}"
+        );
+    }
+
+    // ── resolve_vars — empty placeholder ────────────────────────────────────
+
+    #[test]
+    fn empty_placeholder_expands_to_empty_string() {
+        let result = resolve_vars("pre${}post", None).unwrap();
+        assert_eq!(result, "prepost");
+    }
+
+    // ── resolve_vars — unclosed placeholder ─────────────────────────────────
+
+    #[test]
+    fn unclosed_placeholder_left_as_is() {
+        let result = resolve_vars("${UNCLOSED", None).unwrap();
+        assert_eq!(result, "${UNCLOSED");
+    }
+
+    // ── resolve_env_vars wrapper ─────────────────────────────────────────────
+
+    #[test]
+    fn resolve_env_vars_reads_env() {
+        unsafe { std::env::set_var("RIVET_TEST_ENV_WRAPPER", "wrapped") };
+        let result = resolve_env_vars("v=${RIVET_TEST_ENV_WRAPPER}").unwrap();
+        unsafe { std::env::remove_var("RIVET_TEST_ENV_WRAPPER") };
+        assert_eq!(result, "v=wrapped");
+    }
+
+    // ── parse_file_size ──────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_1gb() {
+        assert_eq!(parse_file_size("1GB").unwrap(), 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_512mb() {
+        assert_eq!(parse_file_size("512MB").unwrap(), 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_100kb() {
+        assert_eq!(parse_file_size("100KB").unwrap(), 100 * 1024);
+    }
+
+    #[test]
+    fn parse_bytes_suffix() {
+        assert_eq!(parse_file_size("2048B").unwrap(), 2048);
+    }
+
+    #[test]
+    fn parse_no_suffix_treated_as_bytes() {
+        assert_eq!(parse_file_size("4096").unwrap(), 4096);
+    }
+
+    #[test]
+    fn parse_whitespace_trimmed() {
+        assert_eq!(parse_file_size("  256MB  ").unwrap(), 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_lowercase_accepted() {
+        assert_eq!(parse_file_size("1gb").unwrap(), 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_invalid_returns_error() {
+        assert!(parse_file_size("notanumber").is_err());
+    }
+}

@@ -457,3 +457,234 @@ pub(super) fn run_single_export(
     log::info!("export '{}' completed successfully", plan.export_name);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    use crate::config::{
+        CompressionType, DestinationConfig, DestinationType, FormatType, MetaColumns, SourceConfig,
+        SourceType,
+    };
+    use crate::plan::ExtractionStrategy;
+    use crate::tuning::SourceTuning;
+
+    // ── mock sources ─────────────────────────────────────────────────────────
+
+    /// Source that emits no schema and no batches → sink sees 0 rows.
+    struct EmptySource;
+
+    impl crate::source::Source for EmptySource {
+        fn export(
+            &mut self,
+            _query: &str,
+            _incremental: Option<&crate::plan::IncrementalCursorPlan>,
+            _cursor: Option<&crate::types::CursorState>,
+            _tuning: &SourceTuning,
+            _column_overrides: &crate::types::ColumnOverrides,
+            _sink: &mut dyn crate::source::BatchSink,
+        ) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn query_scalar(&mut self, _sql: &str) -> crate::error::Result<Option<String>> {
+            Ok(None)
+        }
+        fn type_mappings(
+            &mut self,
+            _query: &str,
+            _overrides: &crate::types::ColumnOverrides,
+        ) -> crate::error::Result<Vec<crate::types::TypeMapping>> {
+            Ok(vec![])
+        }
+    }
+
+    /// Source that emits `n` rows with a single `id: Int64` column.
+    struct RowSource(usize);
+
+    impl crate::source::Source for RowSource {
+        fn export(
+            &mut self,
+            _query: &str,
+            _incremental: Option<&crate::plan::IncrementalCursorPlan>,
+            _cursor: Option<&crate::types::CursorState>,
+            _tuning: &SourceTuning,
+            _column_overrides: &crate::types::ColumnOverrides,
+            sink: &mut dyn crate::source::BatchSink,
+        ) -> crate::error::Result<()> {
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+            sink.on_schema(Arc::clone(&schema))?;
+            if self.0 > 0 {
+                let ids: Vec<i64> = (0..self.0 as i64).collect();
+                let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(ids))])
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                sink.on_batch(&batch)?;
+            }
+            Ok(())
+        }
+        fn query_scalar(&mut self, _sql: &str) -> crate::error::Result<Option<String>> {
+            Ok(None)
+        }
+        fn type_mappings(
+            &mut self,
+            _query: &str,
+            _overrides: &crate::types::ColumnOverrides,
+        ) -> crate::error::Result<Vec<crate::types::TypeMapping>> {
+            Ok(vec![])
+        }
+    }
+
+    // ── minimal plan builder ─────────────────────────────────────────────────
+
+    fn minimal_plan() -> ResolvedRunPlan {
+        ResolvedRunPlan {
+            export_name: "test_export".into(),
+            base_query: "SELECT 1".into(),
+            strategy: ExtractionStrategy::Snapshot,
+            format: FormatType::Parquet,
+            compression: CompressionType::None,
+            compression_level: None,
+            max_file_size_bytes: None,
+            skip_empty: false,
+            meta_columns: MetaColumns::default(),
+            destination: DestinationConfig {
+                destination_type: DestinationType::Local,
+                bucket: None,
+                prefix: None,
+                path: Some("/tmp".into()),
+                region: None,
+                endpoint: None,
+                credentials_file: None,
+                access_key_env: None,
+                secret_key_env: None,
+                aws_profile: None,
+                allow_anonymous: false,
+            },
+            quality: None,
+            tuning: SourceTuning::from_config(None),
+            tuning_profile_label: "balanced".into(),
+            validate: false,
+            reconcile: false,
+            resume: false,
+            source: SourceConfig {
+                source_type: SourceType::Postgres,
+                url: Some("postgresql://localhost/test".into()),
+                url_env: None,
+                url_file: None,
+                host: None,
+                port: None,
+                user: None,
+                password: None,
+                password_env: None,
+                database: None,
+                tuning: None,
+                tls: None,
+            },
+            column_overrides: Default::default(),
+            schema_drift_policy: Default::default(),
+            shape_drift_warn_factor: 0.0,
+        }
+    }
+
+    fn run(
+        src: &mut dyn crate::source::Source,
+        plan: &ResolvedRunPlan,
+    ) -> (crate::error::Result<()>, RunSummary) {
+        let mut summary = RunSummary::new(plan);
+        let result = run_single_export(src, "SELECT 1", None, plan, None, &mut summary);
+        (result, summary)
+    }
+
+    // ── zero-rows paths ───────────────────────────────────────────────────────
+
+    /// When there are 0 rows and skip_empty is false, run succeeds and status stays "running".
+    #[test]
+    fn zero_rows_no_skip_empty_succeeds() {
+        let plan = minimal_plan();
+        let (result, summary) = run(&mut EmptySource, &plan);
+        result.expect("0 rows without skip_empty should succeed");
+        assert_eq!(summary.total_rows, 0);
+        assert_ne!(summary.status, "skipped");
+    }
+
+    /// When skip_empty is true and source emits 0 rows, status is "skipped".
+    #[test]
+    fn zero_rows_with_skip_empty_sets_status_skipped() {
+        let mut plan = minimal_plan();
+        plan.skip_empty = true;
+        let (result, summary) = run(&mut EmptySource, &plan);
+        result.expect("skip_empty with 0 rows should succeed");
+        assert_eq!(summary.status, "skipped");
+        assert_eq!(summary.total_rows, 0);
+    }
+
+    /// When there are rows but skip_empty is true, skip_empty must NOT apply.
+    /// Verified without running the full pipeline: the early-return path only
+    /// triggers when `sink.total_rows == 0`, so any non-zero row count bypasses it.
+    /// (We only test the 0-row skip_empty path; the non-zero path needs a live dest.)
+    #[test]
+    fn skip_empty_semantics_zero_rows_only() {
+        // Confirmed by the skip_empty contract: `if sink.total_rows == 0 && skip_empty`.
+        // Non-zero rows cannot set status="skipped" — that branch is gated on total_rows==0.
+        // This test exists to document the invariant; the live behaviour is covered by
+        // live_harness_canary integration tests.
+        let mut plan_skip = minimal_plan();
+        plan_skip.skip_empty = true;
+        let (result_skip, summary_skip) = run(&mut EmptySource, &plan_skip);
+        result_skip.expect("skip_empty+0 rows must succeed");
+        assert_eq!(summary_skip.status, "skipped");
+
+        let mut plan_no_skip = minimal_plan();
+        plan_no_skip.skip_empty = false;
+        let (result_no_skip, summary_no_skip) = run(&mut EmptySource, &plan_no_skip);
+        result_no_skip.expect("no skip_empty+0 rows must succeed");
+        assert_ne!(summary_no_skip.status, "skipped");
+    }
+
+    // ── quality gate ──────────────────────────────────────────────────────────
+
+    /// When quality.row_count_min is set and actual rows fall short, the run fails.
+    #[test]
+    fn quality_row_count_min_fail_aborts_run() {
+        use crate::config::QualityConfig;
+        let mut plan = minimal_plan();
+        plan.quality = Some(QualityConfig {
+            row_count_min: Some(100), // require 100 rows minimum
+            row_count_max: None,
+            null_ratio_max: Default::default(),
+            unique_columns: vec![],
+        });
+        // Source only emits 3 rows → quality gate should fire Severity::Fail
+        let (result, summary) = run(&mut RowSource(3), &plan);
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("quality"),
+            "expected quality error: {err}"
+        );
+        assert_eq!(summary.quality_passed, Some(false));
+    }
+
+    /// When quality.row_count_max is set and actual rows exceed it, the run fails.
+    #[test]
+    fn quality_row_count_max_fail_aborts_run() {
+        use crate::config::QualityConfig;
+        let mut plan = minimal_plan();
+        plan.quality = Some(QualityConfig {
+            row_count_min: None,
+            row_count_max: Some(2), // max 2 rows
+            null_ratio_max: Default::default(),
+            unique_columns: vec![],
+        });
+        // Source emits 10 rows → exceeds max
+        let (result, summary) = run(&mut RowSource(10), &plan);
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("quality"),
+            "expected quality error: {err}"
+        );
+        assert_eq!(summary.quality_passed, Some(false));
+    }
+}

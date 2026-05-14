@@ -348,3 +348,261 @@ pub fn show_journal(
     println!();
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::journal::{RunEvent, RunJournal};
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    fn setup_dir() -> (tempfile::TempDir, String) {
+        let dir = tempfile::TempDir::new().unwrap();
+        // config file itself does not need to exist; StateStore::open uses its parent dir
+        let config_path = dir.path().join("rivet.yaml").to_str().unwrap().to_string();
+        (dir, config_path)
+    }
+
+    fn open_state(dir: &tempfile::TempDir) -> StateStore {
+        let db_path = dir.path().join(".rivet_state.db");
+        StateStore::open_at_path(&db_path).unwrap()
+    }
+
+    fn make_journal(run_id: &str, export: &str) -> RunJournal {
+        let mut j = RunJournal::new(run_id, export);
+        j.record(RunEvent::FileWritten {
+            file_name: "part0.parquet".into(),
+            rows: 1_000,
+            bytes: 65_536,
+            part_index: 0,
+        });
+        j.record(RunEvent::RunCompleted {
+            status: "success".into(),
+            error_message: None,
+            duration_ms: 1_500,
+        });
+        j
+    }
+
+    // ── boundary_value ───────────────────────────────────────────────────────
+
+    fn make_boundary(cursor: Option<&str>, chunk_index: Option<i64>) -> crate::state::Boundary {
+        crate::state::Boundary {
+            strategy: "incremental".into(),
+            run_id: None,
+            cursor: cursor.map(|s| s.to_string()),
+            chunk_index,
+            at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn boundary_value_cursor_takes_precedence_over_chunk_index() {
+        let b = make_boundary(Some("2025-01-15"), Some(42));
+        assert_eq!(boundary_value(&b), "2025-01-15");
+    }
+
+    #[test]
+    fn boundary_value_chunk_index_used_when_no_cursor() {
+        let b = make_boundary(None, Some(7));
+        assert_eq!(boundary_value(&b), "chunk #7");
+    }
+
+    #[test]
+    fn boundary_value_dash_when_neither_set() {
+        let b = make_boundary(None, None);
+        assert_eq!(boundary_value(&b), "-");
+    }
+
+    // ── show_state ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn show_state_empty_db_returns_ok() {
+        let (dir, config_path) = setup_dir();
+        let _ = open_state(&dir); // create the DB file
+        assert!(show_state(&config_path).is_ok());
+    }
+
+    #[test]
+    fn show_state_with_cursor_record_returns_ok() {
+        let (dir, config_path) = setup_dir();
+        let state = open_state(&dir);
+        state.update("orders", "2025-01-15").unwrap();
+        drop(state);
+        assert!(show_state(&config_path).is_ok());
+    }
+
+    // ── show_files ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn show_files_empty_returns_ok() {
+        let (dir, config_path) = setup_dir();
+        let _ = open_state(&dir);
+        assert!(show_files(&config_path, None, 10).is_ok());
+    }
+
+    #[test]
+    fn show_files_with_record_returns_ok() {
+        let (dir, config_path) = setup_dir();
+        let state = open_state(&dir);
+        state
+            .record_file(
+                "r1",
+                "orders",
+                "orders_001.parquet",
+                50_000,
+                4096,
+                "parquet",
+                Some("zstd"),
+            )
+            .unwrap();
+        drop(state);
+        assert!(show_files(&config_path, Some("orders"), 10).is_ok());
+    }
+
+    // ── show_metrics ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn show_metrics_empty_returns_ok() {
+        let (dir, config_path) = setup_dir();
+        let _ = open_state(&dir);
+        assert!(show_metrics(&config_path, None, 10).is_ok());
+    }
+
+    #[test]
+    fn show_metrics_exercises_flag_and_duration_paths() {
+        // Covers retries / validated / schema_changed flag lines and
+        // the ms-vs-seconds duration branch in the formatter.
+        let (dir, config_path) = setup_dir();
+        let state = open_state(&dir);
+        // ≥1000 ms → "X.Xs" branch; retries + validated + schema_changed flags
+        state
+            .record_metric(
+                "orders",
+                "r1",
+                1_500,
+                50_000,
+                Some(42),
+                "success",
+                None,
+                Some("balanced"),
+                Some("parquet"),
+                Some("full"),
+                1,
+                4096,
+                3,
+                Some(true),
+                Some(true),
+            )
+            .unwrap();
+        // <1000 ms → "Xms" branch; error_message line
+        state
+            .record_metric(
+                "orders",
+                "r2",
+                800,
+                0,
+                None,
+                "failed",
+                Some("timeout"),
+                None,
+                None,
+                None,
+                0,
+                0,
+                0,
+                Some(false),
+                None,
+            )
+            .unwrap();
+        drop(state);
+        assert!(show_metrics(&config_path, Some("orders"), 10).is_ok());
+    }
+
+    // ── show_journal ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn show_journal_empty_returns_ok() {
+        let (dir, config_path) = setup_dir();
+        let _ = open_state(&dir);
+        assert!(show_journal(&config_path, "orders", 5, None).is_ok());
+    }
+
+    #[test]
+    fn show_journal_with_entry_returns_ok() {
+        let (dir, config_path) = setup_dir();
+        let state = open_state(&dir);
+        state
+            .store_journal(&make_journal("run_001", "orders"))
+            .unwrap();
+        drop(state);
+        assert!(show_journal(&config_path, "orders", 5, None).is_ok());
+    }
+
+    #[test]
+    fn show_journal_by_run_id_not_found_returns_ok() {
+        let (dir, config_path) = setup_dir();
+        let _ = open_state(&dir);
+        assert!(show_journal(&config_path, "orders", 5, Some("no_such_run")).is_ok());
+    }
+
+    #[test]
+    fn show_journal_by_run_id_found_returns_ok() {
+        let (dir, config_path) = setup_dir();
+        let state = open_state(&dir);
+        state
+            .store_journal(&make_journal("run_xyz", "orders"))
+            .unwrap();
+        drop(state);
+        assert!(show_journal(&config_path, "orders", 5, Some("run_xyz")).is_ok());
+    }
+
+    // ── reset_state ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn reset_state_returns_ok() {
+        let (dir, config_path) = setup_dir();
+        let state = open_state(&dir);
+        state.update("orders", "100").unwrap();
+        drop(state);
+        assert!(reset_state(&config_path, "orders").is_ok());
+    }
+
+    // ── reset_chunk_checkpoint ───────────────────────────────────────────────
+
+    #[test]
+    fn reset_chunk_checkpoint_on_empty_db_returns_ok() {
+        let (dir, config_path) = setup_dir();
+        let _ = open_state(&dir);
+        assert!(reset_chunk_checkpoint(&config_path, "orders").is_ok());
+    }
+
+    // ── show_progression ─────────────────────────────────────────────────────
+
+    #[test]
+    fn show_progression_empty_returns_ok() {
+        let (dir, config_path) = setup_dir();
+        let _ = open_state(&dir);
+        assert!(show_progression(&config_path, None).is_ok());
+    }
+
+    #[test]
+    fn show_progression_with_incremental_boundary_returns_ok() {
+        let (dir, config_path) = setup_dir();
+        let state = open_state(&dir);
+        state
+            .record_committed_incremental("orders", "2025-06-01", "run_001")
+            .unwrap();
+        drop(state);
+        assert!(show_progression(&config_path, Some("orders")).is_ok());
+    }
+
+    // ── show_chunk_checkpoint ────────────────────────────────────────────────
+
+    #[test]
+    fn show_chunk_checkpoint_no_data_returns_ok() {
+        let (dir, config_path) = setup_dir();
+        let _ = open_state(&dir);
+        assert!(show_chunk_checkpoint(&config_path, "orders").is_ok());
+    }
+}

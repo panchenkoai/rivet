@@ -392,3 +392,213 @@ pub(crate) fn run_chunked_parallel(
     );
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        CompressionType, DestinationConfig, DestinationType, FormatType, SourceConfig, SourceType,
+    };
+    use crate::pipeline::journal::RunJournal;
+    use crate::plan::{ChunkedPlan, ExtractionStrategy, ResolvedRunPlan};
+    use crate::source::BatchSink;
+    use crate::state::StateStore;
+    use crate::tuning::SourceTuning;
+
+    // ChunkSource is defined in the parent (chunked) module.
+    use super::super::ChunkSource;
+
+    // ── EmptySource: never calls on_schema / on_batch ────────────────────────
+
+    struct EmptySource;
+
+    impl crate::source::Source for EmptySource {
+        fn query_scalar(&mut self, _sql: &str) -> crate::error::Result<Option<String>> {
+            unimplemented!("not needed in chunked exec tests")
+        }
+        fn export(
+            &mut self,
+            _query: &str,
+            _incremental: Option<&crate::plan::IncrementalCursorPlan>,
+            _cursor: Option<&crate::types::CursorState>,
+            _tuning: &SourceTuning,
+            _column_overrides: &crate::types::ColumnOverrides,
+            _sink: &mut dyn BatchSink,
+        ) -> crate::error::Result<()> {
+            Ok(()) // emits no schema, no batches → total_rows stays 0
+        }
+        fn type_mappings(
+            &mut self,
+            _query: &str,
+            _column_overrides: &crate::types::ColumnOverrides,
+        ) -> crate::error::Result<Vec<crate::types::TypeMapping>> {
+            Ok(vec![])
+        }
+    }
+
+    fn chunked_plan_struct() -> ResolvedRunPlan {
+        ResolvedRunPlan {
+            export_name: "orders".into(),
+            base_query: "SELECT id FROM orders".into(),
+            strategy: ExtractionStrategy::Chunked(ChunkedPlan {
+                column: "id".into(),
+                chunk_size: 100,
+                parallel: 1,
+                dense: false,
+                by_days: None,
+                checkpoint: false,
+                max_attempts: 3,
+            }),
+            format: FormatType::Parquet,
+            compression: CompressionType::None,
+            compression_level: None,
+            max_file_size_bytes: None,
+            skip_empty: false,
+            meta_columns: Default::default(),
+            destination: DestinationConfig {
+                destination_type: DestinationType::Local,
+                bucket: None,
+                prefix: None,
+                path: Some("/tmp".into()),
+                region: None,
+                endpoint: None,
+                credentials_file: None,
+                access_key_env: None,
+                secret_key_env: None,
+                aws_profile: None,
+                allow_anonymous: false,
+            },
+            quality: None,
+            tuning: SourceTuning::from_config(None),
+            tuning_profile_label: "balanced".into(),
+            validate: false,
+            reconcile: false,
+            resume: false,
+            source: SourceConfig {
+                source_type: SourceType::Postgres,
+                url: Some("postgresql://nobody@127.0.0.1:9999/nonexistent".into()),
+                url_env: None,
+                url_file: None,
+                host: None,
+                port: None,
+                user: None,
+                password: None,
+                password_env: None,
+                database: None,
+                tuning: None,
+                tls: None,
+            },
+            column_overrides: Default::default(),
+            schema_drift_policy: Default::default(),
+            shape_drift_warn_factor: 0.0,
+        }
+    }
+
+    fn empty_summary(plan: &ResolvedRunPlan) -> RunSummary {
+        RunSummary {
+            run_id: "test_run".into(),
+            export_name: plan.export_name.clone(),
+            status: "running".into(),
+            total_rows: 0,
+            files_produced: 0,
+            bytes_written: 0,
+            files_committed: 0,
+            duration_ms: 0,
+            peak_rss_mb: 0,
+            retries: 0,
+            validated: None,
+            schema_changed: None,
+            quality_passed: None,
+            error_message: None,
+            tuning_profile: "balanced".into(),
+            batch_size: 10_000,
+            batch_size_memory_mb: None,
+            format: "parquet".into(),
+            mode: "chunked".into(),
+            compression: "none".into(),
+            source_count: None,
+            reconciled: None,
+            journal: RunJournal::new("test_run", &plan.export_name),
+        }
+    }
+
+    // ── sequential ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn sequential_empty_precomputed_returns_ok_with_zero_rows() {
+        let plan = chunked_plan_struct();
+        let mut summary = empty_summary(&plan);
+        let mut src = EmptySource;
+        run_chunked_sequential(
+            &mut src,
+            &plan,
+            &mut summary,
+            None,
+            ChunkSource::Precomputed(vec![]),
+        )
+        .unwrap();
+        assert_eq!(summary.total_rows, 0);
+        assert_eq!(summary.files_produced, 0);
+    }
+
+    #[test]
+    fn sequential_one_chunk_zero_rows_skips_destination_write() {
+        // EmptySource returns no rows → sink.total_rows = 0 → no file written
+        let plan = chunked_plan_struct();
+        let mut summary = empty_summary(&plan);
+        let mut src = EmptySource;
+        run_chunked_sequential(
+            &mut src,
+            &plan,
+            &mut summary,
+            None,
+            ChunkSource::Precomputed(vec![(1, 100)]),
+        )
+        .unwrap();
+        assert_eq!(summary.total_rows, 0);
+        assert_eq!(summary.files_produced, 0);
+    }
+
+    #[test]
+    fn sequential_multiple_empty_chunks_all_processed() {
+        let plan = chunked_plan_struct();
+        let mut summary = empty_summary(&plan);
+        let mut src = EmptySource;
+        // 5 chunks, all empty → no files, no rows, no errors
+        run_chunked_sequential(
+            &mut src,
+            &plan,
+            &mut summary,
+            None,
+            ChunkSource::Precomputed(vec![
+                (1, 100),
+                (101, 200),
+                (201, 300),
+                (301, 400),
+                (401, 500),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(summary.total_rows, 0);
+        assert_eq!(summary.files_produced, 0);
+    }
+
+    // ── parallel ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parallel_empty_precomputed_returns_ok() {
+        // With empty Precomputed, creates destination then runs no threads.
+        let plan = chunked_plan_struct();
+        let mut summary = empty_summary(&plan);
+        let state = StateStore::open_in_memory().unwrap();
+        run_chunked_parallel(
+            &state,
+            &plan,
+            &mut summary,
+            ChunkSource::Precomputed(vec![]),
+        )
+        .unwrap();
+        assert_eq!(summary.total_rows, 0);
+        assert_eq!(summary.files_produced, 0);
+    }
+}

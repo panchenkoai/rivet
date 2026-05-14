@@ -179,3 +179,184 @@ fn write_csv_value(writer: &mut dyn Write, array: &dyn Array, idx: usize) -> Res
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use std::sync::Arc;
+
+    // Helper: render one cell to a String using write_csv_value.
+    fn cell<A: Array + 'static>(array: A, idx: usize) -> String {
+        let mut buf = Vec::new();
+        write_csv_value(&mut buf, &array, idx).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    // Helper: render a null cell from any typed array.
+    fn null_cell(dt: DataType) -> String {
+        use arrow::array::new_null_array;
+        let arr = new_null_array(&dt, 1);
+        let mut buf = Vec::new();
+        write_csv_value(&mut buf, arr.as_ref(), 0).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    // ── null handling ────────────────────────────────────────────────────────
+
+    #[test]
+    fn null_value_writes_empty_string() {
+        assert_eq!(null_cell(DataType::Int64), "");
+        assert_eq!(null_cell(DataType::Utf8), "");
+        assert_eq!(null_cell(DataType::Boolean), "");
+    }
+
+    // ── scalars ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn bool_true_writes_true() {
+        assert_eq!(cell(BooleanArray::from(vec![true]), 0), "true");
+    }
+
+    #[test]
+    fn bool_false_writes_false() {
+        assert_eq!(cell(BooleanArray::from(vec![false]), 0), "false");
+    }
+
+    #[test]
+    fn int16_value() {
+        assert_eq!(cell(Int16Array::from(vec![42i16]), 0), "42");
+    }
+
+    #[test]
+    fn int32_negative() {
+        assert_eq!(cell(Int32Array::from(vec![-7i32]), 0), "-7");
+    }
+
+    #[test]
+    fn int64_large() {
+        assert_eq!(
+            cell(Int64Array::from(vec![9_999_999_999i64]), 0),
+            "9999999999"
+        );
+    }
+
+    #[test]
+    fn float32_value() {
+        let result = cell(Float32Array::from(vec![1.5f32]), 0);
+        assert!(result.starts_with("1.5"), "got: {result}");
+    }
+
+    #[test]
+    fn float64_value() {
+        let result = cell(Float64Array::from(vec![3.14f64]), 0);
+        assert!(result.starts_with("3.14"), "got: {result}");
+    }
+
+    // ── string escaping ──────────────────────────────────────────────────────
+
+    #[test]
+    fn plain_string_no_quoting() {
+        assert_eq!(cell(StringArray::from(vec!["hello"]), 0), "hello");
+    }
+
+    #[test]
+    fn string_with_comma_is_quoted() {
+        assert_eq!(cell(StringArray::from(vec!["a,b"]), 0), "\"a,b\"");
+    }
+
+    #[test]
+    fn string_with_double_quote_is_escaped() {
+        // say "hi" → opening " + say  + "" + hi + "" + closing " = "say ""hi"""
+        let result = cell(StringArray::from(vec![r#"say "hi""#]), 0);
+        assert_eq!(result, r#""say ""hi""""#);
+    }
+
+    #[test]
+    fn string_with_newline_is_quoted() {
+        let result = cell(StringArray::from(vec!["line1\nline2"]), 0);
+        assert!(
+            result.starts_with('"') && result.ends_with('"'),
+            "got: {result}"
+        );
+        assert!(result.contains("line1\nline2"), "got: {result}");
+    }
+
+    // ── binary ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn binary_is_written_as_hex() {
+        let arr = BinaryArray::from_vec(vec![&[0xDE, 0xAD, 0xBE, 0xEF][..]]);
+        assert_eq!(cell(arr, 0), "deadbeef");
+    }
+
+    #[test]
+    fn binary_empty_writes_empty() {
+        let arr = BinaryArray::from_vec(vec![&[][..]]);
+        assert_eq!(cell(arr, 0), "");
+    }
+
+    // ── Date32 ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn date32_epoch_is_1970_01_01() {
+        assert_eq!(cell(Date32Array::from(vec![0i32]), 0), "1970-01-01");
+    }
+
+    #[test]
+    fn date32_positive_offset() {
+        // 365 days after epoch = 1971-01-01
+        assert_eq!(cell(Date32Array::from(vec![365i32]), 0), "1971-01-01");
+    }
+
+    // ── Timestamp(Microsecond) ───────────────────────────────────────────────
+
+    #[test]
+    fn timestamp_micros_formats_as_iso() {
+        // 2023-01-01T00:00:00.000000 = 1672531200_000000 micros since epoch
+        let micros: i64 = 1_672_531_200 * 1_000_000;
+        let _schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        )]));
+        let arr = TimestampMicrosecondArray::from(vec![micros]);
+        let result = cell(arr, 0);
+        assert!(result.starts_with("2023-01-01T"), "got: {result}");
+        assert!(result.contains("00:00:00"), "got: {result}");
+    }
+
+    // ── write_batch via CsvFormat ────────────────────────────────────────────
+
+    #[test]
+    fn csv_format_write_batch_tracks_bytes_and_succeeds() {
+        use crate::format::Format;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2])),
+                Arc::new(StringArray::from(vec![Some("alice"), None])),
+            ],
+        )
+        .unwrap();
+
+        // Pass Vec by value — avoids the &mut T 'static lifetime requirement.
+        let fmt = CsvFormat;
+        let mut writer = fmt
+            .create_writer(&schema, Box::new(Vec::<u8>::new()))
+            .unwrap();
+        writer.write_batch(&batch).unwrap();
+        // Header "id,name\n" + rows "1,alice\n" + "2,\n" = at least 18 bytes
+        assert!(
+            writer.bytes_written() > 10,
+            "expected >10 bytes, got {}",
+            writer.bytes_written()
+        );
+        writer.finish().unwrap();
+    }
+}

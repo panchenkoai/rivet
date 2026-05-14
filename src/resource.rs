@@ -110,3 +110,38 @@ pub fn check_memory(threshold_mb: usize) -> bool {
     }
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_memory_zero_threshold_always_passes() {
+        assert!(check_memory(0));
+    }
+
+    #[test]
+    fn check_memory_huge_threshold_passes() {
+        // No test process will reach 1 TB of RAM.
+        assert!(check_memory(1_024 * 1_024));
+    }
+
+    #[test]
+    fn get_rss_mb_does_not_panic() {
+        let _ = get_rss_mb();
+    }
+
+    #[test]
+    fn rss_peak_sampler_stop_returns_value() {
+        let sampler = RssPeakSampler::start(0, 50);
+        let _peak = sampler.stop();
+    }
+
+    #[test]
+    fn rss_peak_sampler_seed_is_lower_bound() {
+        let high_seed = 9999;
+        let sampler = RssPeakSampler::start(high_seed, 50);
+        let peak = sampler.stop();
+        assert!(peak >= high_seed);
+    }
+}

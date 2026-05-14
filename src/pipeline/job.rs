@@ -433,3 +433,53 @@ pub(crate) fn run_export_job_with_chunk_source(
 
     if failed { result } else { Ok(()) }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synthetic_failed_summary_fields() {
+        let err = anyhow::anyhow!("connection refused");
+        let summary = synthetic_failed_summary("my_export", &err);
+        assert_eq!(summary.export_name, "my_export");
+        assert_eq!(summary.status, "failed");
+        assert_eq!(summary.total_rows, 0);
+        assert_eq!(summary.files_produced, 0);
+        assert_eq!(summary.bytes_written, 0);
+        assert!(
+            summary
+                .error_message
+                .as_ref()
+                .unwrap()
+                .contains("connection refused")
+        );
+    }
+
+    #[test]
+    fn synthetic_failed_summary_run_id_contains_export_name() {
+        let err = anyhow::anyhow!("boom");
+        let summary = synthetic_failed_summary("orders", &err);
+        assert!(
+            summary.run_id.starts_with("orders_"),
+            "run_id was: {}",
+            summary.run_id
+        );
+    }
+
+    #[test]
+    fn synthetic_failed_summary_journal_is_empty() {
+        let err = anyhow::anyhow!("boom");
+        let summary = synthetic_failed_summary("orders", &err);
+        assert!(summary.journal.entries.is_empty());
+    }
+
+    #[test]
+    fn synthetic_failed_summary_no_quality_or_reconcile_state() {
+        let err = anyhow::anyhow!("boom");
+        let summary = synthetic_failed_summary("orders", &err);
+        assert!(summary.quality_passed.is_none());
+        assert!(summary.reconciled.is_none());
+        assert!(summary.validated.is_none());
+    }
+}

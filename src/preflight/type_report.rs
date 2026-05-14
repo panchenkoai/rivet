@@ -265,3 +265,132 @@ fn rivet_type_label(t: &crate::types::RivetType) -> String {
         Unsupported { native_type, .. } => format!("unsupported({native_type})"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{RivetType, TypeFidelity};
+
+    // ── fidelity_marker ──────────────────────────────────────────────────────
+
+    #[test]
+    fn fidelity_marker_lossy_is_cross() {
+        assert_eq!(fidelity_marker(TypeFidelity::Lossy), " ✗");
+    }
+
+    #[test]
+    fn fidelity_marker_unsupported_is_cross() {
+        assert_eq!(fidelity_marker(TypeFidelity::Unsupported), " ✗");
+    }
+
+    #[test]
+    fn fidelity_marker_logical_string_is_tilde() {
+        assert_eq!(fidelity_marker(TypeFidelity::LogicalString), " ~");
+    }
+
+    #[test]
+    fn fidelity_marker_exact_is_empty() {
+        assert_eq!(fidelity_marker(TypeFidelity::Exact), "");
+    }
+
+    #[test]
+    fn fidelity_marker_compatible_is_empty() {
+        assert_eq!(fidelity_marker(TypeFidelity::Compatible), "");
+    }
+
+    // ── rivet_type_label ─────────────────────────────────────────────────────
+
+    #[test]
+    fn label_bool() {
+        assert_eq!(rivet_type_label(&RivetType::Bool), "bool");
+    }
+
+    #[test]
+    fn label_int64() {
+        assert_eq!(rivet_type_label(&RivetType::Int64), "int8");
+    }
+
+    #[test]
+    fn label_float64() {
+        assert_eq!(rivet_type_label(&RivetType::Float64), "float8");
+    }
+
+    #[test]
+    fn label_decimal_with_precision_and_scale() {
+        assert_eq!(
+            rivet_type_label(&RivetType::Decimal {
+                precision: 18,
+                scale: 2
+            }),
+            "decimal(18,2)"
+        );
+    }
+
+    #[test]
+    fn label_text() {
+        assert_eq!(rivet_type_label(&RivetType::Text), "text");
+    }
+
+    #[test]
+    fn label_uuid() {
+        assert_eq!(rivet_type_label(&RivetType::Uuid), "uuid");
+    }
+
+    #[test]
+    fn label_list_of_int64() {
+        let t = RivetType::List {
+            inner: Box::new(RivetType::Int64),
+        };
+        assert_eq!(rivet_type_label(&t), "list<int8>");
+    }
+
+    #[test]
+    fn label_unsupported_native_type() {
+        let t = RivetType::Unsupported {
+            native_type: "tsvector".into(),
+            reason: "not supported".into(),
+        };
+        assert_eq!(rivet_type_label(&t), "unsupported(tsvector)");
+    }
+
+    // ── col_width ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn col_width_empty_returns_minimum_8() {
+        let rows: Vec<TypeReportRow> = vec![];
+        assert_eq!(col_width(&rows, |_r| 0), 8);
+    }
+
+    #[test]
+    fn col_width_short_values_returns_minimum_8() {
+        let row = TypeReportRow {
+            column: "a".into(),
+            source_type: "b".into(),
+            rivet_type: "c".into(),
+            arrow_type: "d".into(),
+            fidelity: TypeFidelity::Exact,
+            warnings: vec![],
+            target_type: None,
+            target_status: None,
+            target_note: None,
+        };
+        assert_eq!(col_width(&[row], |r| r.column.len()), 8);
+    }
+
+    #[test]
+    fn col_width_long_value_returns_that_length() {
+        let row = TypeReportRow {
+            column: "a_very_long_column_name".into(),
+            source_type: "int8".into(),
+            rivet_type: "int8".into(),
+            arrow_type: "Int64".into(),
+            fidelity: TypeFidelity::Exact,
+            warnings: vec![],
+            target_type: None,
+            target_status: None,
+            target_note: None,
+        };
+        let w = col_width(&[row], |r| r.column.len());
+        assert_eq!(w, "a_very_long_column_name".len());
+    }
+}

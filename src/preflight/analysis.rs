@@ -287,6 +287,256 @@ pub(crate) fn compute_verdict(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ExportConfig;
+
+    fn cfg(extra_yaml: &str) -> ExportConfig {
+        let yaml = format!(
+            "name: test\nformat: parquet\ndestination:\n  type: local\n  path: /tmp\n{extra_yaml}"
+        );
+        serde_yaml_ng::from_str(&yaml).expect("parse ExportConfig")
+    }
+
+    // ── derive_strategy ─────────────────────────────────────────────────────
+
+    #[test]
+    fn derive_strategy_full_scan() {
+        assert_eq!(derive_strategy(&cfg("mode: full\n")), "full-scan");
+    }
+
+    #[test]
+    fn derive_strategy_full_parallel() {
+        let e = cfg("mode: full\nparallel: 4\n");
+        assert_eq!(derive_strategy(&e), "full-parallel(4)");
+    }
+
+    #[test]
+    fn derive_strategy_incremental() {
+        let e = cfg("mode: incremental\ncursor_column: updated_at\n");
+        assert_eq!(derive_strategy(&e), "incremental(updated_at)");
+    }
+
+    #[test]
+    fn derive_strategy_chunked_by_size() {
+        let e = cfg("mode: chunked\nchunk_column: id\nchunk_size: 50000\n");
+        assert_eq!(derive_strategy(&e), "chunked(id, size=50000)");
+    }
+
+    #[test]
+    fn derive_strategy_date_chunked() {
+        let e = cfg("mode: chunked\nchunk_column: created_at\nchunk_by_days: 7\n");
+        assert_eq!(derive_strategy(&e), "date-chunked(created_at, 7d)");
+    }
+
+    // ── recommend_profile ───────────────────────────────────────────────────
+
+    #[test]
+    fn recommend_profile_indexed_small_is_fast() {
+        let e = cfg("");
+        assert_eq!(recommend_profile(Some(500_000), true, &e), "fast");
+    }
+
+    #[test]
+    fn recommend_profile_indexed_medium_is_balanced() {
+        let e = cfg("");
+        assert_eq!(recommend_profile(Some(5_000_000), true, &e), "balanced");
+    }
+
+    #[test]
+    fn recommend_profile_indexed_large_is_safe() {
+        let e = cfg("");
+        assert_eq!(recommend_profile(Some(15_000_000), true, &e), "safe");
+    }
+
+    #[test]
+    fn recommend_profile_no_index_small_is_balanced() {
+        let e = cfg(""); // parallel=1 by default
+        assert_eq!(recommend_profile(Some(50_000), false, &e), "balanced");
+    }
+
+    #[test]
+    fn recommend_profile_no_index_large_is_safe() {
+        let e = cfg("");
+        assert_eq!(recommend_profile(Some(5_000_000), false, &e), "safe");
+    }
+
+    // ── chunk_sparsity_from_counts ──────────────────────────────────────────
+
+    #[test]
+    fn chunk_sparsity_dense_range_not_sparse() {
+        // 10_000 rows in a 10_001 span (density ≈ 1.0) → not sparse
+        let info = chunk_sparsity_from_counts(10_000, 0, 10_000, 100);
+        assert!(!info.is_sparse);
+        assert!(info.density > 0.9);
+    }
+
+    #[test]
+    fn chunk_sparsity_very_sparse_range_is_sparse() {
+        // 100 rows in a 1_000_000 span with 100_000 chunk_size → >10 windows, density < 0.1
+        let info = chunk_sparsity_from_counts(100, 0, 1_000_000, 50_000);
+        assert!(
+            info.is_sparse,
+            "expected sparse: density={:.6}",
+            info.density
+        );
+        assert!(info.density < 0.1);
+        assert!(info.logical_windows > 10);
+    }
+
+    #[test]
+    fn chunk_sparsity_zero_rows_never_sparse() {
+        let info = chunk_sparsity_from_counts(0, 0, 1_000_000, 100);
+        assert!(!info.is_sparse);
+    }
+
+    // ── check_sparse_range ──────────────────────────────────────────────────
+
+    #[test]
+    fn check_sparse_range_non_chunked_mode_returns_none() {
+        let e = cfg("mode: full\n");
+        assert!(check_sparse_range(&e, Some(100), Some("1"), Some("1000000")).is_none());
+    }
+
+    #[test]
+    fn check_sparse_range_chunk_dense_returns_none() {
+        let e = cfg("mode: chunked\nchunk_column: id\nchunk_dense: true\n");
+        assert!(check_sparse_range(&e, Some(100), Some("1"), Some("1000000")).is_none());
+    }
+
+    #[test]
+    fn check_sparse_range_chunk_by_days_returns_none() {
+        let e = cfg("mode: chunked\nchunk_column: created_at\nchunk_by_days: 7\n");
+        assert!(check_sparse_range(&e, Some(100), Some("1"), Some("1000000")).is_none());
+    }
+
+    #[test]
+    fn check_sparse_range_sparse_returns_warning() {
+        // 100 rows in a 5_000_000 span with chunk_size=100_000 → 50 windows > 10, density≈2e-5 < 0.1
+        let e = cfg("mode: chunked\nchunk_column: id\nchunk_size: 100000\n");
+        let w = check_sparse_range(&e, Some(100), Some("1"), Some("5000000"));
+        assert!(w.is_some(), "expected sparse warning");
+        let msg = w.unwrap();
+        assert!(msg.contains("Sparse"), "got: {msg}");
+    }
+
+    #[test]
+    fn check_sparse_range_dense_range_returns_none() {
+        // 10_000 rows in 10_001 span → not sparse
+        let e = cfg("mode: chunked\nchunk_column: id\nchunk_size: 100\n");
+        assert!(check_sparse_range(&e, Some(10_000), Some("0"), Some("10000")).is_none());
+    }
+
+    // ── check_dense_surrogate_cost ──────────────────────────────────────────
+
+    #[test]
+    fn check_dense_surrogate_row_number_in_query_returns_warning() {
+        let e = cfg(
+            "mode: chunked\nchunk_column: id\nquery: \"SELECT ROW_NUMBER() OVER (ORDER BY id) FROM t\"\n",
+        );
+        assert!(check_dense_surrogate_cost(&e).is_some());
+    }
+
+    #[test]
+    fn check_dense_surrogate_chunk_dense_flag_returns_warning() {
+        let e = cfg("mode: chunked\nchunk_column: id\nchunk_dense: true\n");
+        assert!(check_dense_surrogate_cost(&e).is_some());
+    }
+
+    #[test]
+    fn check_dense_surrogate_normal_chunked_returns_none() {
+        let e = cfg("mode: chunked\nchunk_column: id\n");
+        assert!(check_dense_surrogate_cost(&e).is_none());
+    }
+
+    // ── check_connection_limit ──────────────────────────────────────────────
+
+    #[test]
+    fn check_connection_limit_parallel_one_returns_none() {
+        assert!(check_connection_limit(1, Some(100)).is_none());
+    }
+
+    #[test]
+    fn check_connection_limit_unknown_max_conn_returns_warning() {
+        let w = check_connection_limit(4, None).unwrap();
+        assert!(
+            w.contains("max_connections") || w.contains("limit check"),
+            "got: {w}"
+        );
+    }
+
+    #[test]
+    fn check_connection_limit_exceeds_max_conn_warns() {
+        let w = check_connection_limit(10, Some(8)).unwrap();
+        assert!(w.contains("10") && w.contains("8"), "got: {w}");
+    }
+
+    #[test]
+    fn check_connection_limit_within_limit_returns_none() {
+        assert!(check_connection_limit(4, Some(100)).is_none());
+    }
+
+    // ── check_parallel_memory_risk ──────────────────────────────────────────
+
+    #[test]
+    fn check_parallel_memory_risk_parallel_one_returns_none() {
+        let e = cfg("parallel: 1\n");
+        assert!(check_parallel_memory_risk(&e, Some(10_000_000)).is_none());
+    }
+
+    #[test]
+    fn check_parallel_memory_risk_small_rows_returns_none() {
+        let e = cfg("parallel: 4\n");
+        assert!(check_parallel_memory_risk(&e, Some(100_000)).is_none());
+    }
+
+    #[test]
+    fn check_parallel_memory_risk_large_rows_returns_warning() {
+        let e = cfg("parallel: 4\n");
+        let w = check_parallel_memory_risk(&e, Some(6_000_000)).unwrap();
+        assert!(
+            w.contains("Parallel=4") || w.contains("arallel"),
+            "got: {w}"
+        );
+    }
+
+    // ── compute_verdict ─────────────────────────────────────────────────────
+
+    #[test]
+    fn compute_verdict_indexed_cursor_small_is_efficient() {
+        assert!(matches!(
+            compute_verdict(Some(1_000_000), true, true),
+            HealthVerdict::Efficient
+        ));
+    }
+
+    #[test]
+    fn compute_verdict_indexed_no_cursor_small_is_acceptable() {
+        assert!(matches!(
+            compute_verdict(Some(1_000_000), true, false),
+            HealthVerdict::Acceptable
+        ));
+    }
+
+    #[test]
+    fn compute_verdict_no_index_small_is_degraded() {
+        assert!(matches!(
+            compute_verdict(Some(500_000), false, true),
+            HealthVerdict::Degraded
+        ));
+    }
+
+    #[test]
+    fn compute_verdict_no_index_very_large_is_unsafe() {
+        // > 1_000_000 rows, no index, no cursor → Unsafe
+        assert!(matches!(
+            compute_verdict(Some(5_000_000), false, false),
+            HealthVerdict::Unsafe
+        ));
+    }
+}
+
 pub(crate) fn build_suggestion(
     verdict: &HealthVerdict,
     row_estimate: Option<i64>,
