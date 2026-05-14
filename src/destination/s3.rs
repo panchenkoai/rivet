@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use opendal::Operator;
 use opendal::blocking;
@@ -13,52 +13,6 @@ pub struct S3Destination {
     _runtime: Arc<tokio::runtime::Runtime>,
     op: blocking::Operator,
     prefix: String,
-}
-
-/// Serializes the brief `AWS_PROFILE` env-var override needed to seed OpenDAL's
-/// AWS credential chain. OpenDAL reads `AWS_PROFILE` from the process env at
-/// `builder.build()` time (see `AwsConfig::from_profile`), and there is no public
-/// builder setter for the profile name in opendal 0.55. Without this lock,
-/// `--parallel-exports` with differing `aws_profile` values would race: the last
-/// writer would win and both exports would silently use the same credentials,
-/// potentially writing to the wrong AWS account.
-///
-/// We hold the lock across the full `Operator::new(builder)?.finish()` call, then
-/// restore the previous `AWS_PROFILE` value before releasing it. A permanent
-/// process-wide mutation is avoided.
-static AWS_PROFILE_LOCK: Mutex<()> = Mutex::new(());
-
-/// RAII guard that restores the previous `AWS_PROFILE` (or removes the var) on drop.
-struct AwsProfileGuard<'a> {
-    _mutex: std::sync::MutexGuard<'a, ()>,
-    previous: Option<String>,
-}
-
-impl Drop for AwsProfileGuard<'_> {
-    fn drop(&mut self) {
-        // SAFETY: the mutex guarantees no other thread is reading or writing
-        // AWS_PROFILE through this code path. External readers of the env are out
-        // of our control regardless of the approach.
-        unsafe {
-            match &self.previous {
-                Some(v) => std::env::set_var("AWS_PROFILE", v),
-                None => std::env::remove_var("AWS_PROFILE"),
-            }
-        }
-    }
-}
-
-fn scoped_aws_profile(profile: &str) -> AwsProfileGuard<'static> {
-    let guard = AWS_PROFILE_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let previous = std::env::var("AWS_PROFILE").ok();
-    // SAFETY: guarded by AWS_PROFILE_LOCK (see module-level doc comment).
-    unsafe { std::env::set_var("AWS_PROFILE", profile) };
-    AwsProfileGuard {
-        _mutex: guard,
-        previous,
-    }
 }
 
 impl S3Destination {
@@ -95,6 +49,22 @@ impl S3Destination {
             builder = builder.secret_access_key(secret.as_str());
         }
 
+        // When `aws_profile` is set in rivet config, build a reqsign credential
+        // loader with the profile name baked in — no `env::set_var` required.
+        // This is safe under `--parallel-exports` because each export gets its
+        // own loader instance; no global state is mutated.
+        if let Some(profile) = &config.aws_profile {
+            log::info!("S3: using AWS profile '{}'", profile);
+            let cred_config = reqsign::AwsConfig {
+                profile: profile.clone(),
+                ..Default::default()
+            }
+            .from_profile()
+            .from_env();
+            let loader = reqsign::AwsDefaultLoader::new(reqwest_012::Client::new(), cred_config);
+            builder = builder.customized_credential_load(Box::new(loader));
+        }
+
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -103,26 +73,20 @@ impl S3Destination {
         );
         let _guard = runtime.enter();
 
-        // Any `AWS_PROFILE` mutation is scoped to the `Operator::new` call below.
-        let _profile_guard = config.aws_profile.as_deref().map(|profile| {
-            log::info!("S3: using AWS profile '{}'", profile);
-            scoped_aws_profile(profile)
-        });
-
         // See gcs.rs for the rationale; same `RetryLayer` is applied to S3
         // so transient hyper / SDK errors are absorbed inside the operator
         // instead of escalating to a chunk-level re-fetch.
-        let async_op = Operator::new(builder)?
-            .layer(
-                RetryLayer::new()
-                    .with_max_times(5)
-                    .with_min_delay(std::time::Duration::from_millis(200))
-                    .with_max_delay(std::time::Duration::from_secs(10))
-                    .with_jitter(),
-            )
-            .finish();
-        let op = blocking::Operator::new(async_op)?;
-        drop(_profile_guard);
+        let op = blocking::Operator::new(
+            Operator::new(builder)?
+                .layer(
+                    RetryLayer::new()
+                        .with_max_times(5)
+                        .with_min_delay(std::time::Duration::from_millis(200))
+                        .with_max_delay(std::time::Duration::from_secs(10))
+                        .with_jitter(),
+                )
+                .finish(),
+        )?;
 
         let prefix = config.prefix.clone().unwrap_or_default();
 

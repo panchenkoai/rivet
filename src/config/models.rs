@@ -414,8 +414,41 @@ impl ExportConfig {
                 }
             }
             (None, Some(file)) => {
-                let path = config_dir.join(file);
-                let raw = std::fs::read_to_string(&path)?;
+                let file_path = std::path::Path::new(file);
+                // SecOps: block absolute paths and `..` traversal components.
+                if file_path.is_absolute() {
+                    anyhow::bail!(
+                        "export '{}': query_file must be a relative path: '{}'",
+                        self.name,
+                        file
+                    );
+                }
+                if file_path
+                    .components()
+                    .any(|c| c == std::path::Component::ParentDir)
+                {
+                    anyhow::bail!(
+                        "export '{}': query_file path must not contain '..': '{}'",
+                        self.name,
+                        file
+                    );
+                }
+                let joined = config_dir.join(file);
+                // Canonicalize-based check catches symlink-based evasion for files
+                // that already exist on disk.
+                if let Ok(canonical) = joined.canonicalize() {
+                    let base = config_dir
+                        .canonicalize()
+                        .unwrap_or_else(|_| config_dir.to_path_buf());
+                    if !canonical.starts_with(&base) {
+                        anyhow::bail!(
+                            "export '{}': query_file '{}' resolves outside the config directory",
+                            self.name,
+                            file
+                        );
+                    }
+                }
+                let raw = std::fs::read_to_string(&joined)?;
                 resolve_vars(&raw, params)
             }
             (Some(_), Some(_)) => {
@@ -965,5 +998,57 @@ mod tests {
             msg.contains("query") || msg.contains("query_file"),
             "got: {msg}"
         );
+    }
+
+    // ── SecOps: query_file path traversal prevention ──────────────────────────
+
+    #[test]
+    fn resolve_query_file_dotdot_is_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let exp = make_export_direct(None, Some("../secret.sql"));
+        let result = exp.resolve_query(dir.path(), None);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("..") || msg.contains("traversal"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_query_file_nested_dotdot_is_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let exp = make_export_direct(None, Some("subdir/../../etc/passwd"));
+        let result = exp.resolve_query(dir.path(), None);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("..") || msg.contains("traversal"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_query_file_absolute_path_is_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let exp = make_export_direct(None, Some("/etc/passwd"));
+        let result = exp.resolve_query(dir.path(), None);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("relative") || msg.contains("absolute"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_query_file_in_subdir_is_allowed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let subdir = dir.path().join("queries");
+        std::fs::create_dir(&subdir).unwrap();
+        std::fs::write(subdir.join("orders.sql"), "SELECT * FROM orders").unwrap();
+        let exp = make_export_direct(None, Some("queries/orders.sql"));
+        let q = exp.resolve_query(dir.path(), None).unwrap();
+        assert_eq!(q, "SELECT * FROM orders");
     }
 }
