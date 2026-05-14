@@ -287,6 +287,105 @@ pub(crate) fn compute_verdict(
     }
 }
 
+pub(crate) fn build_suggestion(
+    verdict: &HealthVerdict,
+    row_estimate: Option<i64>,
+    uses_index: bool,
+    export: &ExportConfig,
+) -> Option<String> {
+    let rows = row_estimate.unwrap_or(0);
+
+    match verdict {
+        HealthVerdict::Efficient => None,
+        HealthVerdict::Acceptable => {
+            if rows > 10_000_000 {
+                let mut msg = format!("Large dataset (~{}M rows).", rows / 1_000_000);
+                match export.mode {
+                    ExportMode::Full => {
+                        msg.push_str(" Switch to incremental mode with an indexed cursor column to avoid re-reading unchanged rows.");
+                    }
+                    ExportMode::Chunked if export.parallel <= 1 => {
+                        msg.push_str(" Add parallel > 1 to speed up chunked extraction.");
+                    }
+                    _ => {
+                        msg.push_str(" Use 'safe' tuning profile to limit database impact.");
+                    }
+                }
+                Some(msg)
+            } else {
+                None
+            }
+        }
+        HealthVerdict::Degraded => {
+            let mut parts = Vec::new();
+            if !uses_index {
+                parts.push("No index detected -- full table scan.".to_string());
+            }
+            match export.mode {
+                ExportMode::Full if export.cursor_column.is_none() => {
+                    parts.push(
+                        "Add an indexed cursor column and switch to incremental mode.".to_string(),
+                    );
+                }
+                ExportMode::Chunked => {
+                    let col = export.chunk_column.as_deref().unwrap_or("chunk_column");
+                    parts.push(format!(
+                        "Create an index on '{}' to speed up range scans.",
+                        col
+                    ));
+                }
+                ExportMode::TimeWindow => {
+                    let col = export.time_column.as_deref().unwrap_or("time_column");
+                    parts.push(format!(
+                        "Create an index on '{}' for efficient time-window filtering.",
+                        col
+                    ));
+                }
+                _ => {
+                    if export.cursor_column.is_none() {
+                        parts.push(
+                            "Consider adding a cursor column for incremental mode.".to_string(),
+                        );
+                    }
+                }
+            }
+            parts.push("Use 'safe' tuning profile to limit database impact.".to_string());
+            Some(parts.join(" "))
+        }
+        HealthVerdict::Unsafe => {
+            let mut parts = vec![format!(
+                "~{}M row scan without index support.",
+                rows / 1_000_000
+            )];
+            match export.mode {
+                ExportMode::Full => {
+                    parts.push("Add an indexed cursor column and use incremental mode to avoid full re-reads.".to_string());
+                }
+                ExportMode::Chunked => {
+                    let col = export.chunk_column.as_deref().unwrap_or("chunk_column");
+                    parts.push(format!(
+                        "Create an index on '{}'. Consider reducing chunk_size or adding parallel workers.",
+                        col
+                    ));
+                }
+                ExportMode::TimeWindow => {
+                    let col = export.time_column.as_deref().unwrap_or("time_column");
+                    parts.push(format!(
+                        "Create an index on '{}'. Reduce days_window if possible.",
+                        col
+                    ));
+                }
+                ExportMode::Incremental => {
+                    let col = export.cursor_column.as_deref().unwrap_or("cursor_column");
+                    parts.push(format!("Create an index on '{}'.", col));
+                }
+            }
+            parts.push("Use 'safe' tuning profile. Extract during off-peak hours.".to_string());
+            Some(parts.join(" "))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,104 +633,5 @@ mod tests {
             compute_verdict(Some(5_000_000), false, false),
             HealthVerdict::Unsafe
         ));
-    }
-}
-
-pub(crate) fn build_suggestion(
-    verdict: &HealthVerdict,
-    row_estimate: Option<i64>,
-    uses_index: bool,
-    export: &ExportConfig,
-) -> Option<String> {
-    let rows = row_estimate.unwrap_or(0);
-
-    match verdict {
-        HealthVerdict::Efficient => None,
-        HealthVerdict::Acceptable => {
-            if rows > 10_000_000 {
-                let mut msg = format!("Large dataset (~{}M rows).", rows / 1_000_000);
-                match export.mode {
-                    ExportMode::Full => {
-                        msg.push_str(" Switch to incremental mode with an indexed cursor column to avoid re-reading unchanged rows.");
-                    }
-                    ExportMode::Chunked if export.parallel <= 1 => {
-                        msg.push_str(" Add parallel > 1 to speed up chunked extraction.");
-                    }
-                    _ => {
-                        msg.push_str(" Use 'safe' tuning profile to limit database impact.");
-                    }
-                }
-                Some(msg)
-            } else {
-                None
-            }
-        }
-        HealthVerdict::Degraded => {
-            let mut parts = Vec::new();
-            if !uses_index {
-                parts.push("No index detected -- full table scan.".to_string());
-            }
-            match export.mode {
-                ExportMode::Full if export.cursor_column.is_none() => {
-                    parts.push(
-                        "Add an indexed cursor column and switch to incremental mode.".to_string(),
-                    );
-                }
-                ExportMode::Chunked => {
-                    let col = export.chunk_column.as_deref().unwrap_or("chunk_column");
-                    parts.push(format!(
-                        "Create an index on '{}' to speed up range scans.",
-                        col
-                    ));
-                }
-                ExportMode::TimeWindow => {
-                    let col = export.time_column.as_deref().unwrap_or("time_column");
-                    parts.push(format!(
-                        "Create an index on '{}' for efficient time-window filtering.",
-                        col
-                    ));
-                }
-                _ => {
-                    if export.cursor_column.is_none() {
-                        parts.push(
-                            "Consider adding a cursor column for incremental mode.".to_string(),
-                        );
-                    }
-                }
-            }
-            parts.push("Use 'safe' tuning profile to limit database impact.".to_string());
-            Some(parts.join(" "))
-        }
-        HealthVerdict::Unsafe => {
-            let mut parts = vec![format!(
-                "~{}M row scan without index support.",
-                rows / 1_000_000
-            )];
-            match export.mode {
-                ExportMode::Full => {
-                    parts.push("Add an indexed cursor column and use incremental mode to avoid full re-reads.".to_string());
-                }
-                ExportMode::Chunked => {
-                    let col = export.chunk_column.as_deref().unwrap_or("chunk_column");
-                    parts.push(format!(
-                        "Create an index on '{}'. Consider reducing chunk_size or adding parallel workers.",
-                        col
-                    ));
-                }
-                ExportMode::TimeWindow => {
-                    let col = export.time_column.as_deref().unwrap_or("time_column");
-                    parts.push(format!(
-                        "Create an index on '{}'. Reduce days_window if possible.",
-                        col
-                    ));
-                }
-                ExportMode::Incremental => {
-                    let col = export.cursor_column.as_deref().unwrap_or("cursor_column");
-                    parts.push(format!("Create an index on '{}'.", col));
-                }
-            }
-            parts.push("Use 'safe' tuning profile. Extract during off-peak hours.".to_string());
-            Some(parts.join(" "))
-        }
     }
 }

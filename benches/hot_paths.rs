@@ -183,7 +183,7 @@ fn csv_write_value_after(writer: &mut Vec<u8>, array: &dyn Array, idx: usize) {
                 writer.extend_from_slice(b"\"");
                 let mut rest = v;
                 while let Some(pos) = rest.find('"') {
-                    writer.extend_from_slice(rest[..pos].as_bytes());
+                    writer.extend_from_slice(&rest.as_bytes()[..pos]);
                     writer.extend_from_slice(b"\"\"");
                     rest = &rest[pos + 1..];
                 }
@@ -458,7 +458,7 @@ fn parse_time_after(s: &str) -> Option<i64> {
     let (hms, us_part) = if let Some(pos) = rest.find('.') {
         let us_str = &rest[pos + 1..];
         let us_digits = us_str.len().min(6);
-        let us = atoi::atoi::<i64>(us_str[..us_digits].as_bytes())?;
+        let us = atoi::atoi::<i64>(&us_str.as_bytes()[..us_digits])?;
         let scale = 10i64.pow((6 - us_digits) as u32);
         (&rest[..pos], us * scale)
     } else {

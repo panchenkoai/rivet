@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn float64_value() {
-        let result = cell(Float64Array::from(vec![3.14f64]), 0);
+        let result = cell(Float64Array::from(vec![std::f64::consts::PI]), 0);
         assert!(result.starts_with("3.14"), "got: {result}");
     }
 
