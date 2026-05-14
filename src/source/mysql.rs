@@ -8,7 +8,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use mysql::prelude::*;
-use mysql::{Opts, OptsBuilder, Pool, SslOpts, Value};
+use mysql::{Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts, Value};
 
 use crate::config::{SourceType, TlsConfig, TlsMode};
 use crate::error::Result;
@@ -25,10 +25,19 @@ pub struct MysqlSource {
     pool: Pool,
 }
 
+/// Pool options that prevent eager pre-connection. The default mysql::Pool
+/// opens `min=10` connections immediately, which overflows MySQL's
+/// max_connections when many parallel exports run simultaneously.
+fn lean_pool_opts() -> PoolOpts {
+    PoolOpts::default()
+        .with_constraints(PoolConstraints::new(1, 100).expect("valid pool constraints"))
+}
+
 impl MysqlSource {
     /// Connect with no transport security (legacy path).
     pub fn connect(url: &str) -> Result<Self> {
-        let opts = Opts::from_url(url)?;
+        let opts =
+            Opts::from(OptsBuilder::from_opts(Opts::from_url(url)?).pool_opts(lean_pool_opts()));
         let pool = Pool::new(opts)?;
         Ok(Self { pool })
     }
@@ -39,7 +48,11 @@ impl MysqlSource {
             Some(cfg) if cfg.mode.is_enforced() => {
                 let base = Opts::from_url(url)?;
                 let ssl = build_mysql_ssl_opts(cfg);
-                let opts = Opts::from(OptsBuilder::from_opts(base).ssl_opts(Some(ssl)));
+                let opts = Opts::from(
+                    OptsBuilder::from_opts(base)
+                        .ssl_opts(Some(ssl))
+                        .pool_opts(lean_pool_opts()),
+                );
                 let pool = Pool::new(opts)?;
                 Ok(Self { pool })
             }
@@ -57,10 +70,19 @@ pub(crate) fn connect_pool(url: &str, tls: Option<&TlsConfig>) -> Result<Pool> {
         Some(cfg) if cfg.mode.is_enforced() => {
             let base = Opts::from_url(url)?;
             let ssl = build_mysql_ssl_opts(cfg);
-            let opts = Opts::from(OptsBuilder::from_opts(base).ssl_opts(Some(ssl)));
+            let opts = Opts::from(
+                OptsBuilder::from_opts(base)
+                    .ssl_opts(Some(ssl))
+                    .pool_opts(lean_pool_opts()),
+            );
             Ok(Pool::new(opts)?)
         }
-        _ => Ok(Pool::new(Opts::from_url(url)?)?),
+        _ => {
+            let opts = Opts::from(
+                OptsBuilder::from_opts(Opts::from_url(url)?).pool_opts(lean_pool_opts()),
+            );
+            Ok(Pool::new(opts)?)
+        }
     }
 }
 
