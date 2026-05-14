@@ -214,7 +214,7 @@ Without explicit recovery semantics, any interrupted run becomes:
 
 ## Epic 4 — Durable State Backend
 **Priority:** P0  
-**Status:** ⏳ OPEN — SQLite only; external/Postgres backend deferred; domain store split complete (stabilisation Epic 6)  
+**Status:** ✅ DONE — `StateConn` enum supports SQLite and PostgreSQL backends; activated via `RIVET_STATE_URL=postgresql://...`; auto-migration on connect; `StateRef` for parallel chunk workers; documented in `docs/reference/cli.md`; `docker-compose.yaml` includes dedicated `postgres-state` service  
 **Pain coverage:** Pain D, Pain F
 
 ### Goal
@@ -553,7 +553,7 @@ This section merges the former `rivet_roadmap_v3.md` task tracker. **Strategic p
 | Epic 1 — Preflight | **B** | Strategy output, profile recommendation, sparse warnings |
 | Epic 2 — Auditability | **D**, **F** | Run summary, manifest, metrics, `--reconcile` |
 | Epic 3 — Recovery | **C**, **H** | Lifecycle semantics, crash matrix, E2E recovery |
-| Epic 4 — Durable state backend | *(none yet)* | Today: SQLite only. Postgres/external state = future |
+| Epic 4 — Durable state backend | `src/state/mod.rs` | `StateConn::Postgres` via `RIVET_STATE_URL`; auto-migration; `StateRef` for workers ✅ |
 | Epic 5 — Batch/fetch/write control | **M**, tuning | `batch_size`, `max_file_size`, streaming; not full split of row-group vs fetch |
 | Epic 6 — Partition intelligence | **B**, modes | `chunked`, `time_window`, dense surrogate guidance; `chunk_by_days` date-native partitioning ✅ |
 | Epic 7 — Schema drift | **D** (tracking) | `on_schema_drift: warn\|continue\|fail` ✅ |
@@ -790,7 +790,7 @@ Prioritize by stabilization before distribution polish:
 2. ✅ **Epic 8 data shape drift** — `export_shape` SQLite table; `shape_drift_warn_factor` YAML config; warns on `N×` growth.
 3. ✅ **F5 + I5** — reconcile/validate tradeoffs (cli.md); capacity/memory planning (tuning.md).
 4. ✅ **I2** — `cargo bench` + `dev/scripts/bench.sh` save/compare harness; column_scan + shape_tracking groups.
-5. **Epic 4 (§5)** — external/durable state backend when pilots need multi-replica or stateless workers.
+5. ✅ **Epic 4 (§5)** — external/durable state backend: `RIVET_STATE_URL` PostgreSQL backend shipped.
 
 ---
 
