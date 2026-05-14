@@ -58,7 +58,7 @@ fn adversarial_strings() -> Vec<Option<String>> {
         Some("\"nested\"\"quotes\"".into()),                // pre-quoted CSV
         Some("\t".into()),                                  // tab
         Some("\u{0001}\u{0002}\u{0003}".into()),            // low control chars
-        Some("🚀 привіт 正體中文".into()),                  // multi-script unicode
+        Some("🚀 ελληνικά 正體中文".into()),                // multi-script unicode
         Some("líne1\nlíne2\nlíne3".into()),                 // multiline accented
         Some("a".repeat(64 * 1024)),                        // 64 KiB single cell
         Some("\u{FEFF}BOM-led string".into()),              // UTF-8 BOM at start

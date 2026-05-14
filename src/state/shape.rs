@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use crate::error::Result;
 
-use super::StateStore;
+use super::{StateConn, StateStore, pg_sql};
 
 /// One column whose observed max byte length grew beyond the configured threshold.
 pub struct ShapeWarning {
@@ -24,32 +24,60 @@ pub struct ShapeWarning {
 impl StateStore {
     /// Return the stored per-column max byte lengths for `export_name`.
     pub fn get_shape_stats(&self, export_name: &str) -> Result<HashMap<String, u64>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT column_name, max_byte_len FROM export_shape WHERE export_name = ?1")?;
-        let rows = stmt.query_map([export_name], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
-        })?;
-        let mut map = HashMap::new();
-        for r in rows {
-            let (k, v) = r?;
-            map.insert(k, v);
+        let sql = "SELECT column_name, max_byte_len FROM export_shape WHERE export_name = ?1";
+        match &self.conn {
+            StateConn::Sqlite(c) => {
+                let mut stmt = c.prepare(sql)?;
+                let rows = stmt.query_map([export_name], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+                })?;
+                let mut map = HashMap::new();
+                for r in rows {
+                    let (k, v) = r?;
+                    map.insert(k, v);
+                }
+                Ok(map)
+            }
+            StateConn::Postgres(client) => {
+                let mut c = client.borrow_mut();
+                let rows = c.query(&pg_sql(sql), &[&export_name])?;
+                let mut map = HashMap::new();
+                for row in rows {
+                    let k: String = row.get(0);
+                    let v: i64 = row.get(1);
+                    map.insert(k, v as u64);
+                }
+                Ok(map)
+            }
         }
-        Ok(map)
     }
 
     /// Upsert per-column max byte lengths, keeping the running maximum.
     pub fn store_shape_stats(&self, export_name: &str, stats: &HashMap<String, u64>) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        for (col, &max_bytes) in stats {
-            self.conn.execute(
-                "INSERT INTO export_shape (export_name, column_name, max_byte_len, updated_at)
+        let sql = "INSERT INTO export_shape (export_name, column_name, max_byte_len, updated_at)
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(export_name, column_name) DO UPDATE SET
                      max_byte_len = MAX(max_byte_len, excluded.max_byte_len),
-                     updated_at   = excluded.updated_at",
-                rusqlite::params![export_name, col, max_bytes as i64, now],
-            )?;
+                     updated_at   = excluded.updated_at";
+        match &self.conn {
+            StateConn::Sqlite(c) => {
+                for (col, &max_bytes) in stats {
+                    c.execute(
+                        sql,
+                        rusqlite::params![export_name, col, max_bytes as i64, now],
+                    )?;
+                }
+            }
+            StateConn::Postgres(client) => {
+                let mut c = client.borrow_mut();
+                for (col, &max_bytes) in stats {
+                    c.execute(
+                        &pg_sql(sql),
+                        &[&export_name, col, &(max_bytes as i64), &now],
+                    )?;
+                }
+            }
         }
         Ok(())
     }
@@ -84,7 +112,6 @@ impl StateStore {
             }
         }
 
-        // Always advance the high-water mark.
         self.store_shape_stats(export_name, current)?;
         Ok(warnings)
     }
@@ -113,7 +140,7 @@ mod tests {
         let v1: HashMap<String, u64> = [("body".into(), 1000u64)].into();
         s.detect_shape_drift("t", &v1, 2.0).unwrap();
 
-        let v2: HashMap<String, u64> = [("body".into(), 1800u64)].into(); // 1.8× < 2.0×
+        let v2: HashMap<String, u64> = [("body".into(), 1800u64)].into();
         let warnings = s.detect_shape_drift("t", &v2, 2.0).unwrap();
         assert!(warnings.is_empty());
     }
@@ -124,7 +151,7 @@ mod tests {
         let v1: HashMap<String, u64> = [("body".into(), 1000u64)].into();
         s.detect_shape_drift("t", &v1, 2.0).unwrap();
 
-        let v2: HashMap<String, u64> = [("body".into(), 2500u64)].into(); // 2.5× > 2.0×
+        let v2: HashMap<String, u64> = [("body".into(), 2500u64)].into();
         let warnings = s.detect_shape_drift("t", &v2, 2.0).unwrap();
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].column, "body");
@@ -139,11 +166,9 @@ mod tests {
         let v1: HashMap<String, u64> = [("text".into(), 100u64)].into();
         s.detect_shape_drift("t", &v1, 2.0).unwrap();
 
-        // 3× growth → warning, stored advances to 300
         let v2: HashMap<String, u64> = [("text".into(), 300u64)].into();
         s.detect_shape_drift("t", &v2, 2.0).unwrap();
 
-        // 450 is 1.5× of 300 → no warning
         let v3: HashMap<String, u64> = [("text".into(), 450u64)].into();
         let warnings = s.detect_shape_drift("t", &v3, 2.0).unwrap();
         assert!(

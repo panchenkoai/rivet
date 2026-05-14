@@ -27,3 +27,6 @@ rivet-gcs-sa.json
 /out/
 /out_mysql/
 /examples_out/
+
+# Local benchmark configs (hyperfine, criterion scratch)
+pilot_bench.yaml

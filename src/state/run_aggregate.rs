@@ -10,7 +10,7 @@
 //! remains the canonical per-export record.
 use crate::error::Result;
 
-use super::StateStore;
+use super::{StateConn, StateStore, pg_sql};
 
 /// One aggregated `rivet run`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -53,68 +53,138 @@ impl StateStore {
     pub fn record_run_aggregate(&self, agg: &RunAggregate) -> Result<()> {
         let details = serde_json::to_string(&agg.per_export)
             .map_err(|e| anyhow::anyhow!("run_aggregate: serialize details_json: {:#}", e))?;
-        self.conn.execute(
-            "INSERT INTO run_aggregate (
+        let sql = "INSERT INTO run_aggregate (
                 run_aggregate_id, started_at, finished_at, duration_ms,
                 config_path, parallel_mode,
                 total_exports, success_count, failed_count, skipped_count,
                 total_rows, total_files, total_bytes, details_json
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            rusqlite::params![
-                agg.run_aggregate_id,
-                agg.started_at,
-                agg.finished_at,
-                agg.duration_ms,
-                agg.config_path,
-                agg.parallel_mode,
-                agg.total_exports as i64,
-                agg.success_count as i64,
-                agg.failed_count as i64,
-                agg.skipped_count as i64,
-                agg.total_rows,
-                agg.total_files,
-                agg.total_bytes as i64,
-                details,
-            ],
-        )?;
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)";
+        match &self.conn {
+            StateConn::Sqlite(c) => {
+                c.execute(
+                    sql,
+                    rusqlite::params![
+                        agg.run_aggregate_id,
+                        agg.started_at,
+                        agg.finished_at,
+                        agg.duration_ms,
+                        agg.config_path,
+                        agg.parallel_mode,
+                        agg.total_exports as i64,
+                        agg.success_count as i64,
+                        agg.failed_count as i64,
+                        agg.skipped_count as i64,
+                        agg.total_rows,
+                        agg.total_files,
+                        agg.total_bytes as i64,
+                        details,
+                    ],
+                )?;
+            }
+            StateConn::Postgres(client) => {
+                let mut c = client.borrow_mut();
+                c.execute(
+                    &pg_sql(sql),
+                    &[
+                        &agg.run_aggregate_id,
+                        &agg.started_at,
+                        &agg.finished_at,
+                        &agg.duration_ms,
+                        &agg.config_path,
+                        &agg.parallel_mode,
+                        &(agg.total_exports as i64),
+                        &(agg.success_count as i64),
+                        &(agg.failed_count as i64),
+                        &(agg.skipped_count as i64),
+                        &agg.total_rows,
+                        &agg.total_files,
+                        &(agg.total_bytes as i64),
+                        &details,
+                    ],
+                )?;
+            }
+        }
         Ok(())
     }
 
     /// Most-recent aggregates first.
-    #[allow(dead_code)] // surfaced via `rivet metrics runs` in a follow-up
+    #[allow(dead_code)]
     pub fn get_recent_run_aggregates(&self, limit: usize) -> Result<Vec<RunAggregate>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT run_aggregate_id, started_at, finished_at, duration_ms,
+        let sql = "SELECT run_aggregate_id, started_at, finished_at, duration_ms,
                     config_path, parallel_mode,
                     total_exports, success_count, failed_count, skipped_count,
                     total_rows, total_files, total_bytes, details_json
              FROM run_aggregate
              ORDER BY finished_at DESC
-             LIMIT ?1",
-        )?;
-        let rows = stmt.query_map([limit as i64], |row| {
-            let details_json: String = row.get(13)?;
-            let per_export: Vec<RunAggregateEntry> =
-                serde_json::from_str(&details_json).unwrap_or_default();
-            Ok(RunAggregate {
-                run_aggregate_id: row.get(0)?,
-                started_at: row.get(1)?,
-                finished_at: row.get(2)?,
-                duration_ms: row.get(3)?,
-                config_path: row.get(4)?,
-                parallel_mode: row.get(5)?,
-                total_exports: row.get::<_, i64>(6)? as usize,
-                success_count: row.get::<_, i64>(7)? as usize,
-                failed_count: row.get::<_, i64>(8)? as usize,
-                skipped_count: row.get::<_, i64>(9)? as usize,
-                total_rows: row.get(10)?,
-                total_files: row.get(11)?,
-                total_bytes: row.get::<_, i64>(12)? as u64,
-                per_export,
-            })
-        })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Into::into)
+             LIMIT ?1";
+        match &self.conn {
+            StateConn::Sqlite(c) => {
+                let mut stmt = c.prepare(sql)?;
+                let rows = stmt.query_map([limit as i64], |row| {
+                    let details_json: String = row.get(13)?;
+                    let per_export: Vec<RunAggregateEntry> =
+                        serde_json::from_str(&details_json).unwrap_or_default();
+                    Ok(RunAggregate {
+                        run_aggregate_id: row.get(0)?,
+                        started_at: row.get(1)?,
+                        finished_at: row.get(2)?,
+                        duration_ms: row.get(3)?,
+                        config_path: row.get(4)?,
+                        parallel_mode: row.get(5)?,
+                        total_exports: row.get::<_, i64>(6)? as usize,
+                        success_count: row.get::<_, i64>(7)? as usize,
+                        failed_count: row.get::<_, i64>(8)? as usize,
+                        skipped_count: row.get::<_, i64>(9)? as usize,
+                        total_rows: row.get(10)?,
+                        total_files: row.get(11)?,
+                        total_bytes: row.get::<_, i64>(12)? as u64,
+                        per_export,
+                    })
+                })?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(Into::into)
+            }
+            StateConn::Postgres(client) => {
+                let mut c = client.borrow_mut();
+                let rows = c.query(
+                    &format!(
+                        "SELECT run_aggregate_id, started_at, finished_at, duration_ms,
+                                config_path, parallel_mode,
+                                total_exports, success_count, failed_count, skipped_count,
+                                total_rows, total_files, total_bytes, details_json
+                         FROM run_aggregate
+                         ORDER BY finished_at DESC
+                         LIMIT {}",
+                        limit
+                    ),
+                    &[],
+                )?;
+                Ok(rows
+                    .iter()
+                    .map(|row| {
+                        let details_json: String = row.get(13);
+                        let per_export: Vec<RunAggregateEntry> =
+                            serde_json::from_str(&details_json).unwrap_or_default();
+                        RunAggregate {
+                            run_aggregate_id: row.get(0),
+                            started_at: row.get(1),
+                            finished_at: row.get(2),
+                            duration_ms: row.get(3),
+                            config_path: row.get(4),
+                            parallel_mode: row.get(5),
+                            total_exports: row.get::<_, i64>(6) as usize,
+                            success_count: row.get::<_, i64>(7) as usize,
+                            failed_count: row.get::<_, i64>(8) as usize,
+                            skipped_count: row.get::<_, i64>(9) as usize,
+                            total_rows: row.get(10),
+                            total_files: row.get(11),
+                            total_bytes: row.get::<_, i64>(12) as u64,
+                            per_export,
+                        }
+                    })
+                    .collect())
+            }
+        }
     }
 }
 
@@ -172,8 +242,6 @@ mod tests {
 
         let rows = s.get_recent_run_aggregates(10).unwrap();
         assert_eq!(rows.len(), 2);
-        // ORDER BY finished_at DESC — both share the same finished_at, so we
-        // only assert the set rather than the order.
         let ids: Vec<_> = rows.iter().map(|r| r.run_aggregate_id.as_str()).collect();
         assert!(ids.contains(&"agg_001"));
         assert!(ids.contains(&"agg_002"));
@@ -204,7 +272,6 @@ mod tests {
         }
         let rows = s.get_recent_run_aggregates(3).unwrap();
         assert_eq!(rows.len(), 3);
-        // Most-recent first: 004, 003, 002.
         assert_eq!(rows[0].run_aggregate_id, "agg_004");
         assert_eq!(rows[1].run_aggregate_id, "agg_003");
         assert_eq!(rows[2].run_aggregate_id, "agg_002");

@@ -15,6 +15,26 @@ services:
       timeout: 3s
       retries: 10
 
+  # ---- Rivet state backend (RIVET_STATE_URL) -----------------------------------
+  # Separate from the source `postgres` service so state is never mixed with
+  # the data being extracted.  Connect with:
+  #   RIVET_STATE_URL=postgresql://rivet:rivet@localhost:5433/rivet_state
+  postgres-state:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: rivet
+      POSTGRES_PASSWORD: rivet
+      POSTGRES_DB: rivet_state
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_state_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rivet -d rivet_state"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   # ---- Legacy Postgres versions (compatibility testing) ---------------------
   # Opt in via `docker compose --profile legacy up -d`. Each listens on a
   # non-default port so they coexist with the primary `postgres` service.
@@ -205,3 +225,6 @@ services:
     depends_on:
       - postgres
       - mysql
+
+volumes:
+  postgres_state_data:

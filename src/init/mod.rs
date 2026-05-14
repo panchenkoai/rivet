@@ -167,7 +167,7 @@ pub fn init(
     yaml_destination: InitYamlDestination,
 ) -> Result<()> {
     yaml_destination.validate()?;
-    let text = match format {
+    let (text, yaml_decimal_review) = match format {
         InitFormat::Yaml => init_yaml(source_url, table, schema, &yaml_destination)?,
         InitFormat::DiscoveryJson => {
             // Defensive backstop for non-CLI callers; the `rivet init` CLI
@@ -178,20 +178,24 @@ pub fn init(
                     "rivet: note: --gcs-bucket / --s3-bucket are ignored for --discover (JSON has no destination)"
                 );
             }
-            init_discovery_json(source_url, table, schema)?
+            (init_discovery_json(source_url, table, schema)?, false)
         }
     };
 
     match output {
         Some(path) => {
             std::fs::write(path, &text)?;
-            eprintln!(
-                "{} written to {path}",
-                match format {
-                    InitFormat::Yaml => "Config",
-                    InitFormat::DiscoveryJson => "Discovery artifact",
-                }
-            );
+            let label_written = match format {
+                InitFormat::Yaml => "Config",
+                InitFormat::DiscoveryJson => "Discovery artifact",
+            };
+            eprintln!("{label_written} written to {path}");
+            if matches!(format, InitFormat::Yaml) && yaml_decimal_review {
+                eprintln!(
+                    "rivet: note: YAML uses default decimal(38,18) for column(s) with NUMERIC without (p,s) in the DDL — search for `{}` under columns: and fix before production.",
+                    yaml_scaffold::INIT_DECIMAL_REVIEW_MARKER
+                );
+            }
         }
         None => print!("{text}"),
     }
@@ -204,7 +208,7 @@ fn init_yaml(
     table: Option<&str>,
     schema: Option<&str>,
     dest: &InitYamlDestination,
-) -> Result<String> {
+) -> Result<(String, bool)> {
     if let Some(t) = table {
         let (sch, table_name) = yaml_scaffold::parse_table(t);
         let info = match source_type(source_url)? {
@@ -212,14 +216,20 @@ fn init_yaml(
             "mysql" => mysql::introspect(source_url, table_name)?,
             _ => unreachable!(),
         };
-        return yaml_scaffold::generate_config(&info, source_url, dest);
+        let hint = yaml_scaffold::table_has_unbounded_decimal_columns(&info);
+        let yaml = yaml_scaffold::generate_config(&info, source_url, dest)?;
+        return Ok((yaml, hint));
     }
     let infos = introspect_all(source_url, schema)?;
     if infos.is_empty() {
         anyhow::bail!("No tables or views found (check --schema and privileges)");
     }
     let label = schema_scope_label(source_url, schema, infos.len())?;
-    yaml_scaffold::generate_schema_config(&infos, source_url, &label, dest)
+    let hint = infos
+        .iter()
+        .any(yaml_scaffold::table_has_unbounded_decimal_columns);
+    let yaml = yaml_scaffold::generate_schema_config(&infos, source_url, &label, dest)?;
+    Ok((yaml, hint))
 }
 
 fn init_discovery_json(

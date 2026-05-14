@@ -143,13 +143,23 @@ fn print_chunked_recovery(exports: &[&str], config_path: Option<&str>) {
         Some(p) if !p.is_empty() => format!("--config {}", p),
         _ => "--config <CONFIG>".to_string(),
     };
+    let names_spaced = exports.join(" ");
     eprintln!();
     eprintln!("  recovery ({} chunked export(s)):", exports.len());
     eprintln!("    resume in-progress checkpoint runs:");
     eprintln!("      rivet run {} --resume", cfg);
-    eprintln!("    or reset chunk state and rerun a specific export:");
-    eprintln!("      rivet state reset-chunks {} --export <NAME>", cfg);
-    eprintln!("      NAME ∈ {{{}}}", exports.join(", "));
+    eprintln!(
+        "    or reset stuck checkpoints for every export in this config (chunk_run.status = in_progress), then resume:"
+    );
+    eprintln!(
+        "      rivet state reset-chunks {} --stuck-checkpoints && rivet run {} --resume",
+        cfg, cfg
+    );
+    eprintln!("    or reset only the exports listed above, then resume:");
+    eprintln!(
+        "      for e in {}; do rivet state reset-chunks {} --export \"$e\"; done && rivet run {} --resume",
+        names_spaced, cfg, cfg
+    );
 }
 
 fn format_duration(ms: i64) -> String {
@@ -406,7 +416,7 @@ mod tests {
 
     #[test]
     fn truncate_respects_char_boundary_with_unicode() {
-        let s = "тест".repeat(100); // cyrillic, 400 chars
+        let s = "αβγδ".repeat(100); // multibyte unicode, 400 chars
         let t = truncate(&s, 10);
         assert_eq!(t.chars().count(), 11); // 10 + ellipsis
     }

@@ -1989,9 +1989,9 @@ exports:
 #[test]
 fn resolve_vars_unicode_value_preserved_exactly() {
     let mut params = std::collections::HashMap::new();
-    params.insert("GREETING".into(), "Привіт 🌍".into());
+    params.insert("GREETING".into(), "Γεια σου 🌍".into());
     let got = resolve_vars("msg=${GREETING}!", Some(&params)).unwrap();
-    assert_eq!(got, "msg=Привіт 🌍!");
+    assert_eq!(got, "msg=Γεια σου 🌍!");
 }
 
 #[test]

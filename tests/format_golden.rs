@@ -492,7 +492,7 @@ fn test_parquet_compression_lz4() {
 /// serialization without panic and remains valid UTF-8 on disk.
 #[test]
 fn csv_extreme_long_utf8_string_does_not_panic() {
-    let pieces = ["rivet ", "тест ", "🚀 ", "line\nend ", "quote\" "];
+    let pieces = ["rivet ", "αβγδ ", "🚀 ", "line\nend ", "quote\" "];
     let mut huge = String::new();
     while huge.len() < 100 * 1024 {
         for p in &pieces {
@@ -515,7 +515,7 @@ fn csv_extreme_long_utf8_string_does_not_panic() {
 
     let bytes = std::fs::read(tmp.path()).unwrap();
     let out = std::str::from_utf8(&bytes).expect("CSV output must be valid UTF-8");
-    assert!(out.contains("тест"));
+    assert!(out.contains("αβγδ"));
     assert!(out.contains("🚀"));
 }
 

@@ -218,7 +218,7 @@ mod tests {
         let dest = dest_at(dir.path());
         let src = source_file_with(b"payload");
 
-        let key = "with space/🚀 файл.csv";
+        let key = "with space/🚀 αρχείο.csv";
         dest.write(src.path(), key).unwrap();
 
         assert!(

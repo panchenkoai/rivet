@@ -104,14 +104,12 @@ exports:
       path: ./output
 ```
 
-If the column is declared as plain `NUMERIC` (no precision / scale in the DDL), `rivet init` emits a TODO comment instead:
+If the column is declared as plain `NUMERIC` (no precision / scale in the DDL), `rivet init` still emits **`columns:`** so exports run: it uses **`decimal(38,18)`** as a wide default (`Decimal128` in Arrow), prefixes the YAML header with a **`# NOTE:`** pointing at these lines, and adds **`# REVIEW:`** inline on each such column — plus a **`rivet: note`** line on stderr when you write **`rivet init -o <file>`**. Replace the defaults with precision/scale from your domain (or constrain the DDL) before trusting the export:
 
 ```yaml
     columns:
-      # price: decimal(?,?)  # TODO: specify precision and scale
+      price: decimal(38,18)  # REVIEW: DDL has no numeric(p,s); edit when you know the real decimal(p,s); …
 ```
-
-Replace `?` with the actual precision and scale your data requires before running.
 
 ---
 

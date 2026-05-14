@@ -395,4 +395,61 @@ mod tests {
             let _ = generate_chunks(min, max, size);
         }
     }
+
+    // ── chunk_plan_fingerprint ────────────────────────────────────────────────
+
+    fn fp(
+        query: &str,
+        col: &str,
+        size: usize,
+        count: Option<usize>,
+        dense: bool,
+        by_days: Option<u32>,
+    ) -> String {
+        chunk_plan_fingerprint(query, col, size, count, dense, by_days)
+    }
+
+    #[test]
+    fn fingerprint_changes_when_chunk_count_changes() {
+        let base = fp("SELECT * FROM t", "id", 10_000, None, false, None);
+        let with_count = fp("SELECT * FROM t", "id", 10_000, Some(10), false, None);
+        assert_ne!(base, with_count, "chunk_count=None vs Some(10) must differ");
+    }
+
+    #[test]
+    fn fingerprint_changes_when_chunk_count_value_changes() {
+        let c5 = fp("SELECT * FROM t", "id", 10_000, Some(5), false, None);
+        let c10 = fp("SELECT * FROM t", "id", 10_000, Some(10), false, None);
+        assert_ne!(c5, c10, "chunk_count=5 vs chunk_count=10 must differ");
+    }
+
+    #[test]
+    fn fingerprint_chunk_count_ignores_chunk_size() {
+        // When chunk_count is set, chunk_size is not encoded in the fingerprint
+        // (it's computed dynamically from min/max). Two configs with different
+        // chunk_size but same chunk_count must produce the same fingerprint.
+        let a = fp("SELECT * FROM t", "id", 1_000, Some(5), false, None);
+        let b = fp("SELECT * FROM t", "id", 50_000, Some(5), false, None);
+        assert_eq!(
+            a, b,
+            "chunk_size is not part of the fingerprint when chunk_count is set"
+        );
+    }
+
+    #[test]
+    fn fingerprint_chunk_count_differs_from_dense_and_by_days() {
+        let count = fp("SELECT * FROM t", "id", 100, Some(4), false, None);
+        let dense = fp("SELECT * FROM t", "id", 100, None, true, None);
+        let by_days = fp("SELECT * FROM t", "id", 100, None, false, Some(7));
+        assert_ne!(count, dense);
+        assert_ne!(count, by_days);
+        assert_ne!(dense, by_days);
+    }
+
+    #[test]
+    fn fingerprint_deterministic_for_same_inputs() {
+        let a = fp("SELECT id FROM orders", "id", 5_000, Some(8), false, None);
+        let b = fp("SELECT id FROM orders", "id", 5_000, Some(8), false, None);
+        assert_eq!(a, b);
+    }
 }

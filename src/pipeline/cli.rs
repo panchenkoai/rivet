@@ -4,6 +4,7 @@
 //! Reads from the state stores and formats output — no execution or persistence writes.
 
 use super::format_bytes;
+use crate::config::Config;
 use crate::error::Result;
 use crate::pipeline::journal::RunEvent;
 use crate::state::StateStore;
@@ -170,6 +171,62 @@ pub fn reset_chunk_checkpoint(config_path: &str, export_name: &str) -> Result<()
         "Removed {} chunk run record(s) for export '{}'.",
         n, export_name
     );
+    Ok(())
+}
+
+/// Clear chunk checkpoints for every export **named in `config_path`'s YAML** that currently has an
+/// `in_progress` chunk run (`chunk_run.status = 'in_progress'`).
+///
+/// Names present only in state (removed from config) are skipped with a printed note.
+pub fn reset_chunk_checkpoints_stuck(config_path: &str) -> Result<()> {
+    let cfg = Config::load(config_path)?;
+    let allowed: std::collections::HashSet<&str> =
+        cfg.exports.iter().map(|e| e.name.as_str()).collect();
+    let state = StateStore::open(config_path)?;
+    let stuck = state.list_export_names_with_in_progress_chunk_runs()?;
+    if stuck.is_empty() {
+        println!("No exports have an in-progress chunk checkpoint run.");
+        println!(
+            "(Nothing with chunk_run.status = 'in_progress' in {}.)",
+            StateStore::state_db_path(config_path).display()
+        );
+        return Ok(());
+    }
+
+    let mut skipped_not_in_config = Vec::new();
+    let mut targets = Vec::new();
+    for name in stuck {
+        if allowed.contains(name.as_str()) {
+            targets.push(name);
+        } else {
+            skipped_not_in_config.push(name);
+        }
+    }
+
+    for name in &skipped_not_in_config {
+        println!(
+            "Skipping '{}' — chunk checkpoint still in_progress but this export is not in the config.",
+            name
+        );
+    }
+
+    if targets.is_empty() {
+        println!(
+            "No matching exports to reset (none of the in-progress runs belong to exports in this config)."
+        );
+        return Ok(());
+    }
+
+    println!(
+        "Resetting chunk checkpoints for {} export(s) with in_progress runs: {}",
+        targets.len(),
+        targets.join(", ")
+    );
+
+    for name in targets {
+        let n = state.reset_chunk_checkpoint(&name)?;
+        println!("Removed {} chunk run record(s) for export '{}'.", n, name);
+    }
     Ok(())
 }
 
@@ -361,6 +418,51 @@ mod tests {
         // config file itself does not need to exist; StateStore::open uses its parent dir
         let config_path = dir.path().join("rivet.yaml").to_str().unwrap().to_string();
         (dir, config_path)
+    }
+
+    fn write_two_export_config(config_path: &str) {
+        std::fs::write(
+            config_path,
+            br#"source:
+  type: postgres
+  url: postgresql://localhost/testdb
+exports:
+  - name: transactions
+    query: "SELECT 1"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+  - name: orders
+    query: "SELECT 1"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#,
+        )
+        .unwrap();
+    }
+
+    fn write_single_export_config(config_path: &str) {
+        std::fs::write(
+            config_path,
+            br#"source:
+  type: postgres
+  url: postgresql://localhost/testdb
+exports:
+  - name: transactions
+    query: "SELECT 1"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#,
+        )
+        .unwrap();
     }
 
     fn open_state(dir: &tempfile::TempDir) -> StateStore {
@@ -575,6 +677,57 @@ mod tests {
         let (dir, config_path) = setup_dir();
         let _ = open_state(&dir);
         assert!(reset_chunk_checkpoint(&config_path, "orders").is_ok());
+    }
+
+    #[test]
+    fn reset_chunk_checkpoints_stuck_no_rows_returns_ok() {
+        let (dir, config_path) = setup_dir();
+        write_two_export_config(&config_path);
+        let _ = open_state(&dir);
+        assert!(reset_chunk_checkpoints_stuck(&config_path).is_ok());
+    }
+
+    #[test]
+    fn reset_chunk_checkpoints_stuck_clears_matching_exports_only() {
+        let (dir, config_path) = setup_dir();
+        write_two_export_config(&config_path);
+        let state = open_state(&dir);
+        state
+            .create_chunk_run("r_tx", "transactions", "plan", 3)
+            .unwrap();
+        state.create_chunk_run("r_g", "ghost", "plan", 3).unwrap();
+        drop(state);
+
+        reset_chunk_checkpoints_stuck(&config_path).unwrap();
+
+        let state = StateStore::open(&config_path).unwrap();
+        assert!(
+            state
+                .find_in_progress_chunk_run("transactions")
+                .unwrap()
+                .is_none()
+        );
+        assert!(state.find_in_progress_chunk_run("ghost").unwrap().is_some());
+        assert_eq!(
+            state.reset_chunk_checkpoint("ghost").unwrap(),
+            1,
+            "cleanup ghost row"
+        );
+    }
+
+    #[test]
+    fn reset_chunk_checkpoints_stuck_skips_when_only_unknown_exports_stuck() {
+        let (dir, config_path) = setup_dir();
+        write_single_export_config(&config_path);
+        let state = open_state(&dir);
+        state.create_chunk_run("r_g", "ghost", "plan", 3).unwrap();
+        drop(state);
+
+        reset_chunk_checkpoints_stuck(&config_path).unwrap();
+
+        let state = StateStore::open(&config_path).unwrap();
+        assert!(state.find_in_progress_chunk_run("ghost").unwrap().is_some());
+        assert_eq!(state.reset_chunk_checkpoint("ghost").unwrap(), 1);
     }
 
     // ── show_progression ─────────────────────────────────────────────────────

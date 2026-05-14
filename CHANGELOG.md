@@ -1,45 +1,46 @@
 # Changelog
 
-## Unreleased — Performance & Safety
+## 0.4.0 (2026-05-14)
 
-### Fixed
+PostgreSQL state backend, type safety layer, destination path templates, and a set of reliability fixes.
 
-- **`memory_threshold_mb` defaults** — `balanced` profile now defaults to 4096 MB and `safe` to 2048 MB (was 0 = disabled for all profiles). Prevents unbounded RSS growth on wide-row tables without any config change. Set `memory_threshold_mb: 0` explicitly to restore the old unlimited behaviour.
-- **Retry safety guard** — transient-error retry now fails fast with a clear message when `dest.write()` already succeeded in a previous attempt (`files_committed > 0`). Prevents silent duplicate-row writes on retry. The error message directs users to `rivet reconcile`.
+### PostgreSQL state backend
 
-### Performance
+`StateStore` now supports PostgreSQL as an alternative to the default SQLite file. Set `RIVET_STATE_URL` to a PostgreSQL connection string to activate:
 
-- **BufWriter 256 KB** — temp-file write buffer increased from 8 KB to 256 KB (32× fewer `write` syscalls per batch). Measured: −37% User CPU on a 1.5 M-row benchmark at the same wall time.
-- **Inline cursor extraction** — `ExportSink` no longer holds a clone of the last Arrow batch in memory after `on_batch` returns. The cursor value is extracted inline and stored as a `String`, freeing all column buffers immediately. Saves one full batch worth of RAM during post-run state writes (schema drift, shape drift, progression).
-- **`insert_chunk_tasks` batch transaction** — chunk task initialisation now wraps all INSERTs in a single SQLite transaction (one WAL sync) instead of one transaction per chunk (N WAL syncs). Eliminates quadratic I/O on large chunk counts (1000+ chunks).
-- **Quality unique tracking** — `HashSet<String>` replaced with `HashSet<u64>` (xxh3-64 of the display value). Eliminates one heap-allocated `String` per non-null row per tracked column in the hot path.
+```bash
+export RIVET_STATE_URL=postgresql://rivet:rivet@localhost:5433/rivet_state
+rivet run --config rivet.yaml
+```
 
-## Unreleased — Type Safety Layer (M1–M6)
+All state tables — cursor, metrics, manifest, schema drift, shape drift, chunk checkpoints, progression, run journal, run aggregate — are created automatically on first connect via versioned `PG_MIGRATIONS`. The same schema version sequence (`v1`–`v7`) is enforced for both backends; the migration runner verifies the final version after each run and cleans up superseded version rows.
 
-Type fidelity report, strict mode, BigQuery compatibility, and complex-type support for Postgres and MySQL.
+**Parallel chunk workers** open their own short-lived connections per `claim` / `complete` / `fail` operation so they do not contend on a shared connection.
 
-### `rivet check --type-report`
+**Security:** passwords are redacted from log and error messages (`postgresql://user:***@host/db`). A `WARN` is emitted when connecting to a non-localhost host without TLS, prompting the use of `sslmode=require`.
+
+A dedicated `postgres-state` service is included in `docker-compose.yaml` (port 5433) for local development.
+
+### Type safety layer (`rivet check --type-report`)
 
 New flags on `rivet check` surface the full type pipeline for every column in a query:
 
 - `--type-report` — prints a table: column name, source native type, Rivet type, Arrow type, and fidelity level.
 - `--strict` — exits non-zero if any column mapping is `lossy` or `unsupported`.
 - `--json` — emits the report as newline-delimited JSON (one object per export); pipe-friendly.
-- `--target bigquery` — adds two columns (`Target type`, `Status`) showing how each Arrow type maps into BigQuery (`NUMERIC`, `BIGNUMERIC`, `TIMESTAMP`, `REPEATED …`, etc.), with `ok` / `warn` / `fail` status and inline notes for edge cases (UINT64 overflow, near-limit BIGNUMERIC, negative scale, unsupported types).
+- `--target bigquery` — adds `Target type` / `Status` columns showing BigQuery mapping (`NUMERIC`, `BIGNUMERIC`, `TIMESTAMP`, `REPEATED …`) with `ok` / `warn` / `fail` and inline notes for edge cases.
 
-### Type fidelity levels
+**Type fidelity levels:**
 
 | Level | Meaning |
 |---|---|
 | `exact` | Round-trips without loss |
 | `compatible` | Structurally compatible; minor representation difference |
-| `logical_string` | Serialized to STRING/text — no native Arrow type available |
+| `logical_string` | Serialised to STRING/text — no native Arrow type available |
 | `lossy` | Precision or range reduction |
 | `unsupported` | No mapping; column is skipped in Parquet output |
 
-### Column type overrides (`columns:`)
-
-New per-column override block in the export YAML. Lets you pin a decimal type when the inferred type is wider than needed (e.g. to fit inside BigQuery NUMERIC limits):
+**Column type overrides (`columns:`)** — per-column override block in the export YAML pins a decimal type when the inferred type is wider than needed:
 
 ```yaml
 exports:
@@ -48,63 +49,86 @@ exports:
       amount: decimal(15,4)
 ```
 
-Overrides are reflected in `--type-report` output and in the written Parquet files.
+**Complex types — Postgres and MySQL:**
 
-### Complex types — Postgres and MySQL
+- **Enum** (`pg: enum`, `mysql: ENUM/SET`) — written as `Utf8`.
+- **Interval** (`pg: INTERVAL`) — written as `Utf8` ISO 8601 string (`P1Y2M3D`, `PT0S`).
+- **Arrays / lists** (`pg: _text`, `_int8`, etc.) — written as Arrow `List(inner_type)`; BigQuery `REPEATED <inner>`.
+- **MySQL TIME/TIME2** — written as `Time64(Microsecond)`.
 
-- **Enum columns** (`pg: enum`, `mysql: ENUM/SET`) — represented as `RivetType::Enum`, written as `Utf8` (Arrow `STRING`). Values are read via a universal `AnyAsString` `FromSql` adapter that accepts any OID.
-- **Interval** (`pg: INTERVAL`) — mapped to `Utf8` (ISO 8601 duration string). `Interval(MonthDayNano)` cannot be written to Parquet; the ISO 8601 representation (`P1Y2M3D`, `P-1Y`, `PT0S`) is Parquet-safe and human-readable. Conversion: `pg_interval_to_iso8601(months, days, microseconds)`.
-- **Arrays / lists** (`pg: _text`, `_int8`, etc.) — represented as `RivetType::List { inner }`. Postgres array element type is detected via `Kind::Array(elem_type)` at connection time. Written as Arrow `List(inner_type)`. BigQuery compat: `REPEATED <inner>` with recursive status propagation.
-- **MySQL TIME/TIME2** — mapped to `RivetType::Time { unit: Microsecond }` and written as `Time64(Microsecond)`.
+**Unsupported-column errors** now collect all unmappable columns before returning (previously failed on the first one).
 
-### Unsupported-column error reporting
+### `rivet run --json`
 
-Previously, an export with an unmappable column type failed on the *first* unsupported column. Now `pg_columns_to_schema` and `mysql_schema_and_arrow_types` collect **all** unmappable columns before returning an error:
+Prints the run aggregate summary as JSON to stdout after the run completes. Useful for CI pipelines and scripted post-processing. Compatible with `--summary-output` (both can be used together).
 
-```
-3 column(s) have no safe Rivet mapping — add column overrides in rivet.yaml:
-columns:
-  • price (PG type 'numeric'): no Rivet mapping for this PostgreSQL type
-  • tax (PG type 'numeric'): no Rivet mapping for this PostgreSQL type
-  • discount (PG type 'numeric'): no Rivet mapping for this PostgreSQL type
+```bash
+rivet run --config rivet.yaml --json | jq '.total_rows'
 ```
 
-### `rivet init` — automatic DECIMAL column overrides
+### Destination path templates
 
-`rivet init` now reads `numeric_precision` and `numeric_scale` from `information_schema.columns` (both Postgres and MySQL) during introspection. For any `NUMERIC` / `DECIMAL` column:
+`path` (local) and `prefix` (S3/GCS) fields now support placeholders substituted at plan-build time:
 
-- If precision and scale are present in the schema, the generated YAML includes a concrete override: `amount: decimal(18,2)`.
-- If the column is declared as plain `NUMERIC` (no explicit bounds), a TODO comment is emitted: `# price: decimal(?,?)  # TODO: specify precision and scale`.
+| Placeholder | Value |
+|---|---|
+| `{date}` | UTC date as `YYYY-MM-DD` |
+| `{export}` | Export name from config |
+| `{table}` | Alias for `{export}` |
 
-This prevents "unsupported type" failures at export time without requiring manual YAML edits for well-typed schemas.
+```yaml
+destination:
+  type: s3
+  bucket: my-data
+  prefix: exports/{date}/{export}/
+```
+
+### `rivet state reset-chunks --stuck-checkpoints`
+
+Clears chunk checkpoint rows for every export in the config that still has `chunk_run.status = 'in_progress'` — a single command to recover from a crash or SIGKILL that left multiple exports stuck. Alias: `--failed`. Exports whose chunk run completed normally are skipped. Names present in state but removed from the YAML are skipped with a printed note.
+
+```bash
+rivet state reset-chunks --config rivet.yaml --stuck-checkpoints
+rivet run --config rivet.yaml --resume
+```
+
+### `rivet init` — unbounded DECIMAL scaffolding
+
+Plain `numeric` / `decimal` columns without `(p,s)` in the DDL now scaffold as `decimal(38,18)` (runs without manual editing), with a `# REVIEW:` marker on each affected line, a `# NOTE:` in the file header, and a `rivet: note` on stderr when writing `-o <file>`. Previously only a commented-out TODO line was emitted.
 
 ### RunJournal persistence
 
-`RunJournal` — the structured per-run event log (plan snapshot, files written, retries, schema changes, quality issues, outcome) — is now persisted to the state SQLite database (`.rivet_state.db`) at the end of every export run.
+`RunJournal` is now persisted to the state database at the end of every export run (state DB migration **v7**: `run_journal` table). `store_journal`, `load_journal`, and `recent_journals` are available for auditing and future `rivet journal` CLI commands.
 
-- New state DB migration **v7**: `run_journal` table with `run_id` PK, `export_name`, `finished_at`, `journal_json`; index on `(export_name, finished_at DESC)` for per-export history queries.
-- `StateStore::store_journal` — called in `job.rs` immediately after `RunCompleted` is recorded; failure is non-fatal (warns, mirrors `record_metric` pattern).
-- `StateStore::load_journal(run_id)` and `StateStore::recent_journals(export_name, limit)` — retrieve persisted journals for debugging, auditing, and future `rivet journal` CLI commands.
-- Journal types (`RunJournal`, `RunEvent`, `JournalEntry`, `PlanSnapshot`) gain `serde::Serialize / Deserialize`.
+### Postgres NUMERIC catalog hints
 
-### CI: type-golden semantic gate
+For simple single-table `SELECT … FROM rel` queries, `rivet` now looks up `NUMERIC(p,s)` precision and scale from `information_schema` at export time. This resolves decimal types automatically without requiring hand-written `columns:` overrides in the common case.
 
-A new `test-type-golden` CI job runs `cargo test --release --test live_type_golden -- --ignored` against only Postgres + MySQL (no MinIO / GCS / Toxiproxy). This provides a faster, targeted named check for type-contract regressions that can be required for branch protection independently of the full `e2e` job.
+### Changed
 
-The `pg_golden_full_type_matrix_schema_coverage` golden test now additionally asserts ISO 8601 string values for INTERVAL columns (`P1Y2M3D`, `P-1Y`, `PT0S`), not only the Arrow schema type.
+- **`rivet run --resume`** — when `--resume` is specified but no in-progress chunk checkpoint exists (e.g. after `reset-chunks` already cleared it), the run now starts fresh with a warning instead of exiting with an error. The previous workflow `reset-chunks && rivet run --resume` now works correctly.
+- **`rivet init` unbounded DECIMAL** — see above; `decimal(38,18)` + `# REVIEW:` replaces the old commented-out `# TODO` line.
 
-### Architecture
+### Fixed
 
-- New `src/types/` module: `RivetType`, `TypeMapping`, `TypeFidelity`, `ColumnOverrides`, `TypePolicy`, `ExportTarget`, `TargetCompat`.
-- `Source` trait gains `type_mappings(&mut self, query, overrides) -> Result<Vec<TypeMapping>>` — implemented by both `PostgresSource` (via `PREPARE` + column descriptions) and `MysqlSource` (via `LIMIT 0` probe).
-- New `src/preflight/type_report.rs`: `collect_report`, `print_table`, `print_json`.
-- MySQL `SET time_zone = '+00:00'` applied before each export to normalise timestamp output.
+- **`memory_threshold_mb` defaults** — `balanced` profile now defaults to 4096 MB and `safe` to 2048 MB (was 0 = disabled). Prevents unbounded RSS growth on wide-row tables without any config change.
+- **Retry safety guard** — transient-error retry fails fast when `dest.write()` already succeeded in a previous attempt. Prevents silent duplicate-row writes on retry.
+- **PG state backend — migrate_pg** — migration runner now verifies the final schema version after migration and cleans up superseded version rows (parity with SQLite behaviour).
+- **PG state backend — password in logs** — PostgreSQL URLs are redacted in all log and error messages. Passwords containing `@` are handled correctly via `rfind('@')`.
+- **`chunk_count` validation** — `chunk_count: 0` is now rejected at plan-build time (would have caused a division by zero at run time). `chunk_count` combined with `chunk_dense: true` or `chunk_by_days` is also rejected (the options are mutually exclusive; previously `chunk_count` was silently ignored when either of the other two was set).
+
+### Performance
+
+- **BufWriter 256 KB** — temp-file write buffer increased from 8 KB to 256 KB (32× fewer `write` syscalls per batch). −37% User CPU on a 1.5 M-row benchmark.
+- **Inline cursor extraction** — `ExportSink` extracts the cursor value inline and frees all column buffers immediately after `on_batch` returns. Saves one full batch worth of RAM during post-run state writes.
+- **`insert_chunk_tasks` batch transaction** — chunk task initialisation wraps all INSERTs in a single SQLite transaction (one WAL sync). Eliminates quadratic I/O on large chunk counts.
+- **Quality unique tracking** — `HashSet<String>` → `HashSet<u64>` (xxh3-64). Eliminates one heap-allocated `String` per non-null row per tracked column in the hot path.
 
 ### Compatibility
 
-- No YAML config changes required; `columns:` is optional.
-- Sequential and parallel export runs are unaffected.
-- Parquet output is unchanged unless `columns:` overrides are present.
+- `RIVET_STATE_URL` is optional; SQLite remains the default.
+- No YAML config changes required for any of the above features.
+- `columns:` overrides are optional; Parquet output is unchanged without them.
 
 ---
 

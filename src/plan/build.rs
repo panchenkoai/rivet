@@ -58,6 +58,23 @@ pub fn build_plan(
                     export.name
                 )
             })?;
+            if let Some(count) = export.chunk_count {
+                if count == 0 {
+                    anyhow::bail!("export '{}': chunk_count must be >= 1 (got 0)", export.name);
+                }
+                if export.chunk_dense {
+                    anyhow::bail!(
+                        "export '{}': chunk_count and chunk_dense are mutually exclusive",
+                        export.name
+                    );
+                }
+                if export.chunk_by_days.is_some() {
+                    anyhow::bail!(
+                        "export '{}': chunk_count and chunk_by_days are mutually exclusive",
+                        export.name
+                    );
+                }
+            }
             let max_attempts = export
                 .chunk_max_attempts
                 .unwrap_or_else(|| tuning.max_retries.saturating_add(1).max(1));
@@ -103,7 +120,7 @@ pub fn build_plan(
         max_file_size_bytes: export.max_file_size_bytes(),
         skip_empty: export.skip_empty,
         meta_columns: export.meta_columns.clone(),
-        destination: export.destination.clone(),
+        destination: expand_destination_templates(export.destination.clone(), &export.name),
         quality: export.quality.clone(),
         tuning,
         tuning_profile_label,
@@ -147,6 +164,32 @@ fn parse_column_overrides(
                 })
         })
         .collect()
+}
+
+/// Substitute placeholders in `destination.path` and `destination.prefix`.
+///
+/// Supported placeholders:
+/// - `{date}`   → UTC date as `YYYY-MM-DD`
+/// - `{export}` → export name from config
+/// - `{table}`  → alias for `{export}`
+fn expand_destination_templates(
+    mut dest: crate::config::DestinationConfig,
+    export_name: &str,
+) -> crate::config::DestinationConfig {
+    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    dest.path = dest
+        .path
+        .map(|s| apply_destination_placeholders(s, &date, export_name));
+    dest.prefix = dest
+        .prefix
+        .map(|s| apply_destination_placeholders(s, &date, export_name));
+    dest
+}
+
+fn apply_destination_placeholders(s: String, date: &str, export_name: &str) -> String {
+    s.replace("{date}", date)
+        .replace("{export}", export_name)
+        .replace("{table}", export_name)
 }
 
 #[cfg(test)]
@@ -398,5 +441,167 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.tuning_profile_label, "balanced (default)");
+    }
+
+    #[test]
+    fn expand_destination_templates_substitutes_all_placeholders() {
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let dest = DestinationConfig {
+            destination_type: DestinationType::Local,
+            bucket: None,
+            prefix: Some("exports/{date}/{export}/".into()),
+            path: Some("/data/{table}/{date}".into()),
+            region: None,
+            endpoint: None,
+            credentials_file: None,
+            access_key_env: None,
+            secret_key_env: None,
+            aws_profile: None,
+            allow_anonymous: false,
+        };
+        let expanded = expand_destination_templates(dest, "orders");
+        assert_eq!(
+            expanded.path.as_deref(),
+            Some(format!("/data/orders/{today}").as_str())
+        );
+        assert_eq!(
+            expanded.prefix.as_deref(),
+            Some(format!("exports/{today}/orders/").as_str())
+        );
+    }
+
+    // ── chunk_count validation ────────────────────────────────────────────────
+
+    fn chunked_export() -> ExportConfig {
+        let mut e = minimal_export();
+        e.mode = ExportMode::Chunked;
+        e.chunk_column = Some("id".into());
+        e
+    }
+
+    #[test]
+    fn chunk_count_zero_is_rejected() {
+        let mut export = chunked_export();
+        export.chunk_count = Some(0);
+        let err = build_plan(
+            &minimal_config(),
+            &export,
+            Path::new("."),
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("chunk_count") && err.to_string().contains("1"),
+            "expected 'chunk_count must be >= 1', got: {err}"
+        );
+    }
+
+    #[test]
+    fn chunk_count_with_chunk_dense_is_rejected() {
+        let mut export = chunked_export();
+        export.chunk_count = Some(10);
+        export.chunk_dense = true;
+        let err = build_plan(
+            &minimal_config(),
+            &export,
+            Path::new("."),
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("mutually exclusive"),
+            "expected 'mutually exclusive', got: {err}"
+        );
+    }
+
+    #[test]
+    fn chunk_count_with_chunk_by_days_is_rejected() {
+        let mut export = chunked_export();
+        export.chunk_count = Some(10);
+        export.chunk_by_days = Some(7);
+        let err = build_plan(
+            &minimal_config(),
+            &export,
+            Path::new("."),
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("mutually exclusive"),
+            "expected 'mutually exclusive', got: {err}"
+        );
+    }
+
+    #[test]
+    fn chunk_count_valid_threads_through_to_plan() {
+        let mut export = chunked_export();
+        export.chunk_count = Some(5);
+        let plan = build_plan(
+            &minimal_config(),
+            &export,
+            Path::new("."),
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        match &plan.strategy {
+            ExtractionStrategy::Chunked(cp) => assert_eq!(cp.chunk_count, Some(5)),
+            _ => panic!("expected Chunked"),
+        }
+    }
+
+    #[test]
+    fn chunk_count_none_is_accepted_with_dense() {
+        let mut export = chunked_export();
+        export.chunk_count = None;
+        export.chunk_dense = true;
+        let plan = build_plan(
+            &minimal_config(),
+            &export,
+            Path::new("."),
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        match &plan.strategy {
+            ExtractionStrategy::Chunked(cp) => {
+                assert!(cp.dense);
+                assert!(cp.chunk_count.is_none());
+            }
+            _ => panic!("expected Chunked"),
+        }
+    }
+
+    #[test]
+    fn expand_destination_templates_no_placeholders_unchanged() {
+        let dest = DestinationConfig {
+            destination_type: DestinationType::Local,
+            bucket: None,
+            prefix: None,
+            path: Some("./out".into()),
+            region: None,
+            endpoint: None,
+            credentials_file: None,
+            access_key_env: None,
+            secret_key_env: None,
+            aws_profile: None,
+            allow_anonymous: false,
+        };
+        let expanded = expand_destination_templates(dest, "orders");
+        assert_eq!(expanded.path.as_deref(), Some("./out"));
+        assert!(expanded.prefix.is_none());
     }
 }

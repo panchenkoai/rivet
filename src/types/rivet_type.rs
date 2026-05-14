@@ -5,7 +5,7 @@
 //! metadata into a [`RivetType`] *first*, then a single function maps
 //! [`RivetType`] to `arrow::DataType`. This is the architectural fix for the
 //! status-quo `DB type → Arrow type` shortcut that silently degrades types
-//! to `Utf8` (roadmap §5 "Неправильный pipeline").
+//! to `Utf8` (roadmap §5 "incorrect pipeline").
 //!
 //! Three invariants enforced by this enum:
 //!

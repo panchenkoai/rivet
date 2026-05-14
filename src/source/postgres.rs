@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -137,6 +138,8 @@ impl super::Source for PostgresSource {
                 .batch_execute(&format!("SET lock_timeout = '{}s'", tuning.lock_timeout_s))?;
         }
 
+        let numeric_hints = pg_numeric_catalog_hints_opt(&mut self.client, query);
+
         self.client.batch_execute("BEGIN")?;
         self.client.batch_execute(&format!(
             "DECLARE _rivet NO SCROLL CURSOR FOR {}",
@@ -161,7 +164,11 @@ impl super::Source for PostgresSource {
                     .iter()
                     .map(|c| (c.name().to_string(), c.type_().clone()))
                     .collect();
-                let s = Arc::new(pg_columns_to_schema(rows[0].columns(), column_overrides)?);
+                let s = Arc::new(pg_columns_to_schema(
+                    rows[0].columns(),
+                    column_overrides,
+                    numeric_hints.as_ref(),
+                )?);
                 sink.on_schema(s.clone())?;
                 schema = Some(s.clone());
                 columns_cache = Some(stmt_cols);
@@ -246,14 +253,12 @@ impl super::Source for PostgresSource {
     ) -> Result<Vec<TypeMapping>> {
         let wrapped = format!("SELECT * FROM ({}) AS _rivet_type_probe LIMIT 0", query);
         let stmt = self.client.prepare(&wrapped)?;
+        let hints = pg_numeric_catalog_hints_opt(&mut self.client, query);
         let mappings = stmt
             .columns()
             .iter()
             .map(|col| {
-                let rivet = column_overrides
-                    .get(col.name())
-                    .cloned()
-                    .unwrap_or_else(|| pg_type_to_rivet(col.type_()));
+                let rivet = rivet_type_for_pg_column(col, column_overrides, hints.as_ref());
                 let source = SourceColumn::simple(col.name(), col.type_().name(), true);
                 TypeMapping::from_source(&source, rivet)
             })
@@ -262,14 +267,320 @@ impl super::Source for PostgresSource {
     }
 }
 
+/// When the query is a single-table `SELECT … FROM rel` (no joins, no subquery
+/// in `FROM`), PostgreSQL result metadata does not carry `NUMERIC` typmod, but
+/// `information_schema` / the table DDL does. We resolve the base relation with
+/// a small parser and fetch declared precision/scale so `rivet init`-style
+/// exports work without hand-written `columns:` overrides.
+fn pg_numeric_catalog_hints_opt(
+    client: &mut Client,
+    query: &str,
+) -> Option<HashMap<String, (u8, i8)>> {
+    match pg_fetch_numeric_catalog_hints(client, query) {
+        Ok(m) => m,
+        Err(e) => {
+            log::debug!("PG numeric catalog lookup skipped: {e}");
+            None
+        }
+    }
+}
+
+fn pg_fetch_numeric_catalog_hints(
+    client: &mut Client,
+    query: &str,
+) -> crate::error::Result<Option<HashMap<String, (u8, i8)>>> {
+    let Some(regclass_lit) = try_parse_pg_simple_from_regclass_literal(query) else {
+        return Ok(None);
+    };
+    let locate_sql = "SELECT n.nspname::text, c.relname::text \
+         FROM pg_catalog.pg_class c \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.oid = $1::regclass";
+    let row_opt = match client.query_opt(locate_sql, &[&regclass_lit]) {
+        Ok(r) => r,
+        Err(e) => {
+            log::debug!("PG numeric catalog: '{regclass_lit}' regclass lookup: {e}");
+            return Ok(None);
+        }
+    };
+    let Some(row) = row_opt else {
+        return Ok(None);
+    };
+    let schema: String = row.get(0);
+    let table: String = row.get(1);
+    let rows = client.query(
+        "SELECT column_name::text, data_type::text, numeric_precision, numeric_scale \
+             FROM information_schema.columns \
+             WHERE table_schema = $1 AND table_name = $2 \
+             ORDER BY ordinal_position",
+        &[&schema, &table],
+    )?;
+
+    let mut map = HashMap::new();
+    for row in rows {
+        let col: String = row.get(0);
+        let dt: String = row.get(1);
+        if !is_pg_numeric_information_type(&dt) {
+            continue;
+        }
+        let p: Option<i32> = row.get(2);
+        let s: Option<i32> = row.get(3);
+        if let (Some(p), Some(s)) = (p, s)
+            && let Some(pair) = catalog_numeric_to_decimal_params(p, s)
+        {
+            map.insert(col, pair);
+        }
+    }
+
+    if map.is_empty() {
+        Ok(None)
+    } else {
+        log::debug!(
+            "PG numeric catalog: resolved {} DECIMAL/NUMERIC column(s) for relation {regclass_lit}",
+            map.len(),
+        );
+        Ok(Some(map))
+    }
+}
+
+fn is_pg_numeric_information_type(dt: &str) -> bool {
+    let d = dt.trim().to_ascii_lowercase();
+    matches!(d.as_str(), "numeric" | "decimal")
+        || d.starts_with("numeric(")
+        || d.starts_with("decimal(")
+}
+
+/// Match Rivet YAML `decimal(p,s)` / Arrow limits (same bound as overrides).
+fn catalog_numeric_to_decimal_params(precision: i32, scale: i32) -> Option<(u8, i8)> {
+    if precision <= 0 || precision > 76 {
+        return None;
+    }
+    let precision_u = precision as u8;
+    if scale < i32::from(i8::MIN) || scale > i32::from(i8::MAX) {
+        return None;
+    }
+    let scale_i = scale as i8;
+    if scale_i > precision as i8 {
+        return None;
+    }
+    Some((precision_u, scale_i))
+}
+
+fn trim_sql_ascii_ws(s: &str) -> &str {
+    s.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r'))
+}
+
+fn sql_keyword_at(haystack: &[u8], idx: usize, kw_lower: &[u8]) -> bool {
+    let n = kw_lower.len();
+    if idx + n > haystack.len() {
+        return false;
+    }
+    if !haystack[idx..idx + n].eq_ignore_ascii_case(kw_lower) {
+        return false;
+    }
+    let before_ok = idx == 0 || !is_sql_ident_byte(haystack[idx - 1]);
+    let after_idx = idx + n;
+    let after_ok = after_idx >= haystack.len() || !is_sql_ident_byte(haystack[after_idx]);
+    before_ok && after_ok
+}
+
+fn is_sql_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn pg_find_outer_from_keyword(sql: &str) -> Option<usize> {
+    let b = sql.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0usize;
+    let mut in_single_quote = false;
+    while i < b.len() {
+        if in_single_quote {
+            if b[i] == b'\'' {
+                if i + 1 < b.len() && b[i + 1] == b'\'' {
+                    i += 2;
+                } else {
+                    in_single_quote = false;
+                    i += 1;
+                }
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if b[i] == b'\'' {
+            in_single_quote = true;
+            i += 1;
+            continue;
+        }
+        if b[i] == b'(' {
+            depth += 1;
+            i += 1;
+            continue;
+        }
+        if b[i] == b')' {
+            depth = depth.saturating_sub(1);
+            i += 1;
+            continue;
+        }
+        if depth == 0 && sql_keyword_at(b, i, b"from") {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_pg_double_quoted_ident(rest: &str) -> Option<(String, &str)> {
+    let mut chars = rest.chars();
+    if chars.next()? != '"' {
+        return None;
+    }
+    let mut out = String::new();
+    while let Some(ch) = chars.next() {
+        if ch == '"' {
+            if chars.as_str().starts_with('"') {
+                chars.next();
+                out.push('"');
+                continue;
+            }
+            return Some((out, chars.as_str()));
+        }
+        out.push(ch);
+    }
+    None
+}
+
+fn parse_pg_ident_piece(rest: &str) -> Option<(String, bool, &str)> {
+    let rest = trim_sql_ascii_ws(rest);
+    if rest.is_empty() {
+        return None;
+    }
+    if rest.starts_with('"') {
+        let (v, tail) = parse_pg_double_quoted_ident(rest)?;
+        return Some((v, true, tail));
+    }
+    let bytes = rest.as_bytes();
+    if !bytes[0].is_ascii_alphabetic() && bytes[0] != b'_' {
+        return None;
+    }
+    let mut i = 1usize;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    let ident = rest.get(0..i)?.to_string();
+    Some((ident, false, rest.get(i..)?))
+}
+
+fn regclass_segment(ident: &str, quoted: bool) -> String {
+    if quoted {
+        format!("\"{}\"", ident.replace('"', "\"\""))
+    } else {
+        ident.to_string()
+    }
+}
+
+fn parse_pg_qualified_table_for_regclass(mut rest: &str) -> Option<(String, &str)> {
+    rest = trim_sql_ascii_ws(rest);
+    let (p1, q1, tail) = parse_pg_ident_piece(rest)?;
+    let tail = trim_sql_ascii_ws(tail);
+    if tail.starts_with('.') {
+        let after = trim_sql_ascii_ws(tail.get(1..)?);
+        let (p2, q2, tail2) = parse_pg_ident_piece(after)?;
+        return Some((
+            format!(
+                "{}.{}",
+                regclass_segment(&p1, q1),
+                regclass_segment(&p2, q2),
+            ),
+            tail2,
+        ));
+    }
+    Some((regclass_segment(&p1, q1), tail))
+}
+
+fn starts_clause_boundary(rest: &str) -> bool {
+    let r = trim_sql_ascii_ws(rest);
+    if r.is_empty() {
+        return true;
+    }
+    const KWS: &[&[u8]] = &[
+        b"where",
+        b"group",
+        b"having",
+        b"order",
+        b"limit",
+        b"offset",
+        b"fetch",
+        b"union",
+        b"intersect",
+        b"except",
+        b"window",
+        b"for",
+    ];
+    let bytes = r.as_bytes();
+    KWS.iter().any(|kw| sql_keyword_at(bytes, 0, kw))
+}
+
+fn joins_or_comma_after_from(rest: &str) -> bool {
+    let r = trim_sql_ascii_ws(rest);
+    if r.starts_with(',') {
+        return true;
+    }
+    let b = r.as_bytes();
+    sql_keyword_at(b, 0, b"inner")
+        || sql_keyword_at(b, 0, b"left")
+        || sql_keyword_at(b, 0, b"right")
+        || sql_keyword_at(b, 0, b"full")
+        || sql_keyword_at(b, 0, b"cross")
+        || sql_keyword_at(b, 0, b"natural")
+        || sql_keyword_at(b, 0, b"join")
+}
+
+fn skip_optional_table_alias(rest: &str) -> Option<&str> {
+    let rest = trim_sql_ascii_ws(rest);
+    if rest.is_empty() || starts_clause_boundary(rest) || joins_or_comma_after_from(rest) {
+        return Some(rest);
+    }
+    let mut rest = rest;
+    if sql_keyword_at(rest.as_bytes(), 0, b"as") {
+        rest = rest.get(2..)?;
+        rest = trim_sql_ascii_ws(rest);
+    }
+    let (_, _, tail) = parse_pg_ident_piece(rest)?;
+    let tail = trim_sql_ascii_ws(tail);
+    if joins_or_comma_after_from(tail) {
+        return None;
+    }
+    Some(tail)
+}
+
+fn try_parse_pg_simple_from_regclass_literal(query: &str) -> Option<String> {
+    let from_idx = pg_find_outer_from_keyword(query)?;
+    let mut tail = query.get(from_idx + 4..)?;
+    tail = trim_sql_ascii_ws(tail);
+    if sql_keyword_at(tail.as_bytes(), 0, b"only") {
+        tail = tail.get(4..)?;
+        tail = trim_sql_ascii_ws(tail);
+    }
+    let (regclass_lit, after_rel) = parse_pg_qualified_table_for_regclass(tail)?;
+    let after_rel = trim_sql_ascii_ws(after_rel);
+    let after_rel = skip_optional_table_alias(after_rel)?;
+    let after_rel = trim_sql_ascii_ws(after_rel);
+    if joins_or_comma_after_from(after_rel) {
+        return None;
+    }
+    Some(regclass_lit)
+}
+
 /// Map a PostgreSQL wire-protocol type to Rivet's canonical type.
 ///
 /// This is the authoritative PostgreSQL → RivetType function. All other code
 /// must go through here rather than constructing Arrow types directly.
 ///
 /// Key decisions vs. the old `pg_type_to_arrow`:
-/// - `NUMERIC` without declared precision → `Unsupported` (roadmap §12: "never
-///   convert decimal through f64"; unbounded numeric requires explicit policy).
+/// - Unbounded server `NUMERIC` (OID only in row metadata) yields `Unsupported`
+///   unless overwritten by YAML `columns:` or by [`pg_fetch_numeric_catalog_hints`]
+///   for simple single-table selects (precision/scale from `information_schema`).
 /// - `TIMESTAMPTZ` → `Timestamp { timezone: Some("UTC") }` instead of `None`
 ///   (roadmap §13: TIMESTAMPTZ must carry UTC semantics into Arrow/Parquet).
 /// - `UUID` / `JSON` / `JSONB` → `Uuid` / `Json` variants, so `build_arrow_field`
@@ -288,14 +599,14 @@ fn pg_type_to_rivet(t: &Type) -> RivetType {
 
         // The postgres wire protocol does NOT carry atttypmod (precision/scale)
         // in RowDescription for arbitrary queries — only the OID is available.
-        // An unbounded NUMERIC therefore has no safe fixed-precision mapping.
-        // Strict TypePolicy (Chunk 4) will fail-fast here; until then the
-        // fallback in `pg_columns_to_schema` logs a warning and exports Utf8.
+        // For unbounded server `NUMERIC`, see [`rivet_type_for_pg_column`] + catalog
+        // hints; this arm is the final fallback when no declared precision exists.
         Type::NUMERIC => RivetType::Unsupported {
             native_type: "numeric".into(),
-            reason: "precision/scale unavailable from query result metadata; \
-                     add a column override (columns: amount: decimal(18,2)) \
-                     or configure type_policy.decimal.unbounded"
+            reason: "precision/scale unavailable from query metadata and catalog lookup; \
+                     use a column override (e.g. columns: amount: decimal(18,2)), \
+                     or a single-table SELECT ... FROM schema.table \
+                     when the DDL declares numeric precision."
                 .into(),
         },
 
@@ -339,6 +650,26 @@ fn pg_type_to_rivet(t: &Type) -> RivetType {
     }
 }
 
+fn rivet_type_for_pg_column(
+    col: &postgres::Column,
+    column_overrides: &ColumnOverrides,
+    numeric_hints: Option<&HashMap<String, (u8, i8)>>,
+) -> RivetType {
+    if let Some(t) = column_overrides.get(col.name()) {
+        return t.clone();
+    }
+    if *col.type_() == Type::NUMERIC
+        && let Some(hints) = numeric_hints
+        && let Some(&(p, s)) = hints.get(col.name())
+    {
+        return RivetType::Decimal {
+            precision: p,
+            scale: s,
+        };
+    }
+    pg_type_to_rivet(col.type_())
+}
+
 /// Build an Arrow `Schema` from PostgreSQL `Column` descriptors by routing
 /// each column through the `SourceColumn → RivetType → TypeMapping → Field`
 /// pipeline.
@@ -348,18 +679,18 @@ fn pg_type_to_rivet(t: &Type) -> RivetType {
 /// the autodetected `Unsupported` for `NUMERIC` columns.
 ///
 /// Returns `Err` for any column that has no safe Rivet mapping and no override,
-/// rather than silently exporting wrong data as Utf8.
+/// rather than silently exporting wrong data as Utf8. When `numeric_catalog_hints`
+/// is populated (simple single-table `SELECT … FROM`), declared `numeric(p,s)` from
+/// the catalog is merged before falling back to `Unsupported`.
 fn pg_columns_to_schema(
     columns: &[postgres::Column],
     column_overrides: &ColumnOverrides,
+    numeric_catalog_hints: Option<&HashMap<String, (u8, i8)>>,
 ) -> crate::error::Result<Schema> {
     let mut fields: Vec<Field> = Vec::with_capacity(columns.len());
     let mut errors: Vec<String> = Vec::new();
     for col in columns {
-        let rivet = column_overrides
-            .get(col.name())
-            .cloned()
-            .unwrap_or_else(|| pg_type_to_rivet(col.type_()));
+        let rivet = rivet_type_for_pg_column(col, column_overrides, numeric_catalog_hints);
         let source = SourceColumn::simple(col.name(), col.type_().name(), true);
         let mapping = TypeMapping::from_source(&source, rivet);
         match build_arrow_field(&mapping) {
@@ -878,3 +1209,59 @@ fn pg_numeric_to_decimal256(
 // RecordBatch is only used inside this file; import it locally to avoid
 // polluting the module-level use block.
 use arrow::record_batch::RecordBatch;
+
+#[cfg(test)]
+mod pg_from_parse_tests {
+    use super::{catalog_numeric_to_decimal_params, try_parse_pg_simple_from_regclass_literal};
+
+    #[test]
+    fn parse_simple_from_unqualified_table_alias_where() {
+        let q = "SELECT id, amount\nFROM transactions t\nWHERE x = 1";
+        assert_eq!(
+            try_parse_pg_simple_from_regclass_literal(q).as_deref(),
+            Some("transactions")
+        );
+    }
+
+    #[test]
+    fn parse_simple_from_qualified() {
+        let q = "SELECT id FROM public.orders WHERE 1=1";
+        assert_eq!(
+            try_parse_pg_simple_from_regclass_literal(q).as_deref(),
+            Some("public.orders")
+        );
+    }
+
+    #[test]
+    fn parse_only_prefix() {
+        let q = "SELECT * FROM ONLY inventory.items";
+        assert_eq!(
+            try_parse_pg_simple_from_regclass_literal(q).as_deref(),
+            Some("inventory.items")
+        );
+    }
+
+    #[test]
+    fn join_rejected() {
+        assert!(
+            try_parse_pg_simple_from_regclass_literal("SELECT * FROM a INNER JOIN b USING (id)")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn subquery_from_rejected() {
+        assert!(
+            try_parse_pg_simple_from_regclass_literal("SELECT * FROM (SELECT * FROM foo) s")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn catalog_decimal_bounds() {
+        assert_eq!(catalog_numeric_to_decimal_params(18, 2), Some((18, 2)));
+        assert!(catalog_numeric_to_decimal_params(0, 2).is_none());
+        assert!(catalog_numeric_to_decimal_params(77, 0).is_none());
+        assert!(catalog_numeric_to_decimal_params(18, 19).is_none());
+    }
+}

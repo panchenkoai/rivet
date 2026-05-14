@@ -29,8 +29,8 @@ pub use apply_cmd::run_apply_command;
 #[allow(unused_imports)]
 pub use chunked::generate_chunks;
 pub use cli::{
-    reset_chunk_checkpoint, reset_state, show_chunk_checkpoint, show_files, show_journal,
-    show_metrics, show_progression, show_state,
+    reset_chunk_checkpoint, reset_chunk_checkpoints_stuck, reset_state, show_chunk_checkpoint,
+    show_files, show_journal, show_metrics, show_progression, show_state,
 };
 pub(crate) use job::run_export_job_with_chunk_source;
 pub use plan_cmd::{PlanOutputFormat, run_plan_command};
@@ -154,6 +154,16 @@ pub(crate) fn clamp_line(s: &str, max_chars: usize) -> String {
     out
 }
 
+fn print_json_summary(agg: &crate::state::RunAggregate) {
+    match serde_json::to_string_pretty(agg) {
+        Ok(json) => println!("{json}"),
+        Err(e) => eprintln!(
+            "rivet: error: failed to serialize run summary as JSON: {:#}",
+            e
+        ),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     config_path: &str,
@@ -165,6 +175,7 @@ pub fn run(
     parallel_exports_cli: bool,
     parallel_export_processes_cli: bool,
     summary_output: Option<&Path>,
+    json_output: bool,
 ) -> Result<()> {
     let config = Config::load_with_params(config_path, params)?;
 
@@ -239,6 +250,9 @@ pub fn run(
                 );
                 aggregate::print(&agg);
                 aggregate::persist(&state, &agg, summary_output);
+                if json_output {
+                    print_json_summary(&agg);
+                }
             }
             Err(e) => log::warn!(
                 "aggregate: cannot open state DB to record run aggregate: {:#}",
@@ -403,9 +417,12 @@ pub fn run(
                 e
             ),
         }
-    } else if let Some(out) = summary_output {
-        // One export, but the user explicitly asked for a summary file —
-        // honour it without polluting the DB or stderr.
+        if json_output {
+            print_json_summary(&agg);
+        }
+    } else if summary_output.is_some() || json_output {
+        // One export, but the user asked for a summary file and/or JSON stdout —
+        // honour both without polluting the DB or stderr.
         let entries: Vec<_> = summaries
             .iter()
             .map(aggregate::entry_from_summary)
@@ -417,13 +434,18 @@ pub fn run(
             Some(config_path),
             "sequential",
         );
-        if let Err(e) = std::fs::write(out, serde_json::to_string_pretty(&agg).unwrap_or_default())
+        if let Some(out) = summary_output
+            && let Err(e) =
+                std::fs::write(out, serde_json::to_string_pretty(&agg).unwrap_or_default())
         {
             log::warn!(
                 "aggregate: failed to write summary JSON to {}: {:#}",
                 out.display(),
                 e
             );
+        }
+        if json_output {
+            print_json_summary(&agg);
         }
     }
 
@@ -492,7 +514,7 @@ mod tests {
     fn clamp_line_truncates_with_ellipsis() {
         assert_eq!(clamp_line("short", 80), "short");
         assert_eq!(clamp_line("hello world", 8), "hello w…");
-        let s = "тест".repeat(50);
+        let s = "αβγδ".repeat(50);
         let out = clamp_line(&s, 10);
         assert_eq!(out.chars().count(), 10);
         assert!(out.ends_with('…'));

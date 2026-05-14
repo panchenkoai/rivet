@@ -89,30 +89,33 @@ fn ensure_chunk_checkpoint_plan(
     let max_att = cp.max_attempts;
 
     if plan.resume {
-        let Some((rid, stored_hash)) = state.find_in_progress_chunk_run(&plan.export_name)? else {
-            anyhow::bail!(
-                "export '{}': --resume but no in-progress chunk checkpoint; run without --resume first or `rivet state reset-chunks {} --export {}`",
-                plan.export_name,
-                config_hint(config_path),
-                plan.export_name
-            );
-        };
-        if stored_hash != plan_hash {
-            anyhow::bail!(
-                "export '{}': chunk plan fingerprint mismatch (query, chunk_column, chunk_size, or chunk_dense changed); cannot resume",
-                plan.export_name
-            );
+        match state.find_in_progress_chunk_run(&plan.export_name)? {
+            Some((rid, stored_hash)) => {
+                if stored_hash != plan_hash {
+                    anyhow::bail!(
+                        "export '{}': chunk plan fingerprint mismatch (query, chunk_column, chunk_size, or chunk_dense changed); cannot resume",
+                        plan.export_name
+                    );
+                }
+                summary.run_id = rid.clone();
+                let n = state.reset_stale_running_chunk_tasks(&rid)?;
+                if n > 0 {
+                    log::warn!(
+                        "export '{}': reset {} stale 'running' chunk task(s) after resume",
+                        plan.export_name,
+                        n
+                    );
+                }
+                return Ok(rid);
+            }
+            None => {
+                log::warn!(
+                    "export '{}': --resume requested but no in-progress checkpoint found; starting a fresh run",
+                    plan.export_name
+                );
+                // fall through to create a new run below
+            }
         }
-        summary.run_id = rid.clone();
-        let n = state.reset_stale_running_chunk_tasks(&rid)?;
-        if n > 0 {
-            log::warn!(
-                "export '{}': reset {} stale 'running' chunk task(s) after resume",
-                plan.export_name,
-                n
-            );
-        }
-        return Ok(rid);
     }
 
     if let Some((rid, _)) = state.find_in_progress_chunk_run(&plan.export_name)? {
@@ -471,7 +474,7 @@ pub(super) fn run_chunked_parallel_checkpoint(
         run_id
     );
 
-    let db_path = state.database_path().to_path_buf();
+    let state_ref = state.state_ref().clone();
     let run_id_arc = std::sync::Arc::new(run_id.clone());
     let agg_rows = std::sync::atomic::AtomicI64::new(0);
     let agg_bytes = std::sync::atomic::AtomicU64::new(0);
@@ -494,7 +497,7 @@ pub(super) fn run_chunked_parallel_checkpoint(
 
     std::thread::scope(|s| {
         for _ in 0..parallel {
-            let db_path = db_path.clone();
+            let state_ref = state_ref.clone();
             let shared_destination = std::sync::Arc::clone(&shared_destination);
             let run_id_arc = std::sync::Arc::clone(&run_id_arc);
             let agg_rows = &agg_rows;
@@ -511,8 +514,8 @@ pub(super) fn run_chunked_parallel_checkpoint(
             s.spawn(move || {
                 let shared_destination = shared_destination;
                 loop {
-                    let claimed = match StateStore::claim_next_chunk_task_at_path(
-                        &db_path,
+                    let claimed = match StateStore::claim_next_chunk_task_at_ref(
+                        &state_ref,
                         run_id_arc.as_str(),
                     ) {
                         Ok(c) => c,
@@ -536,8 +539,8 @@ pub(super) fn run_chunked_parallel_checkpoint(
                     let start: i64 = match sk.parse() {
                         Ok(v) => v,
                         Err(_) => {
-                            let _ = StateStore::fail_chunk_task_at_path(
-                                &db_path,
+                            let _ = StateStore::fail_chunk_task_at_ref(
+                                &state_ref,
                                 run_id_arc.as_str(),
                                 chunk_index,
                                 "invalid start_key",
@@ -548,8 +551,8 @@ pub(super) fn run_chunked_parallel_checkpoint(
                     let end: i64 = match ek.parse() {
                         Ok(v) => v,
                         Err(_) => {
-                            let _ = StateStore::fail_chunk_task_at_path(
-                                &db_path,
+                            let _ = StateStore::fail_chunk_task_at_ref(
+                                &state_ref,
                                 run_id_arc.as_str(),
                                 chunk_index,
                                 "invalid end_key",
@@ -690,8 +693,8 @@ pub(super) fn run_chunked_parallel_checkpoint(
                                     }
                                 }
                             }
-                            let _ = StateStore::complete_chunk_task_at_path(
-                                &db_path,
+                            let _ = StateStore::complete_chunk_task_at_ref(
+                                &state_ref,
                                 run_id_arc.as_str(),
                                 chunk_index,
                                 rows as i64,
@@ -701,8 +704,8 @@ pub(super) fn run_chunked_parallel_checkpoint(
                         }
                         Err(e) => {
                             let msg = format!("{:#}", e);
-                            let _ = StateStore::fail_chunk_task_at_path(
-                                &db_path,
+                            let _ = StateStore::fail_chunk_task_at_ref(
+                                &state_ref,
                                 run_id_arc.as_str(),
                                 chunk_index,
                                 &msg,

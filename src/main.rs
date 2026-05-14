@@ -63,6 +63,9 @@ enum Commands {
         /// Write the run aggregate summary as JSON to this file (in addition to .rivet_state.db)
         #[arg(long, value_name = "PATH")]
         summary_output: Option<String>,
+        /// Print the run aggregate summary as JSON to stdout at the end of the run
+        #[arg(long)]
+        json: bool,
         /// Query parameter: key=value (repeatable, substitutes ${key} in queries)
         #[arg(short, long = "param", value_name = "KEY=VALUE")]
         params: Vec<String>,
@@ -285,12 +288,32 @@ enum StateAction {
         #[arg(short, long, default_value = "50")]
         last: usize,
     },
-    /// Clear persisted chunk plans (SQLite) for an export
+    /// Clear persisted chunk checkpoint rows (`chunk_run` / `chunk_task`).
     ResetChunks {
         #[arg(short, long)]
         config: String,
-        #[arg(short, long)]
-        export: String,
+        /// Export whose chunk checkpoints should be cleared (same as `chunk_checkpoint` runs).
+        #[arg(
+            short,
+            long,
+            conflicts_with = "stuck_checkpoints",
+            required_unless_present = "stuck_checkpoints"
+        )]
+        export: Option<String>,
+        /// Reset checkpoints for **every export named in this config** that currently has
+        /// `chunk_run.status = 'in_progress'` (crash, SIGKILL, stale concurrent worker).
+        ///
+        /// Ignores exports whose latest chunk run already finished (`completed`). Runs listed in the
+        /// database but removed from the YAML are skipped with a printed note.
+        ///
+        /// Alias `--failed` refers to “checkpoint state stuck”, not HTTP-style failures or metric rows.
+        #[arg(
+            long,
+            visible_alias = "failed",
+            conflicts_with = "export",
+            required_unless_present = "export"
+        )]
+        stuck_checkpoints: bool,
     },
     /// Show chunk checkpoint status for an export
     Chunks {
@@ -423,6 +446,7 @@ fn run(command: Commands) -> Result<()> {
             parallel_exports,
             parallel_export_processes,
             summary_output,
+            json,
             params,
         } => {
             let p = parse_params(&params);
@@ -438,6 +462,7 @@ fn run(command: Commands) -> Result<()> {
                 parallel_exports,
                 parallel_export_processes,
                 summary_output_path.as_deref(),
+                json,
             )?;
         }
         Commands::Check {
@@ -587,8 +612,16 @@ fn run(command: Commands) -> Result<()> {
             } => {
                 pipeline::show_files(&config, export.as_deref(), last)?;
             }
-            StateAction::ResetChunks { config, export } => {
-                pipeline::reset_chunk_checkpoint(&config, &export)?;
+            StateAction::ResetChunks {
+                config,
+                export,
+                stuck_checkpoints,
+            } => {
+                if stuck_checkpoints {
+                    pipeline::reset_chunk_checkpoints_stuck(&config)?;
+                } else if let Some(name) = export {
+                    pipeline::reset_chunk_checkpoint(&config, &name)?;
+                }
             }
             StateAction::Chunks { config, export } => {
                 pipeline::show_chunk_checkpoint(&config, &export)?;
@@ -680,6 +713,40 @@ mod tests {
         if let Err(kind) = init_parse_kind(extra_args) {
             panic!("{what}: expected clap to accept, got error kind {kind:?}");
         }
+    }
+
+    fn state_reset_chunks_parse_from(
+        extra_after_config: &[&str],
+    ) -> std::result::Result<(), clap::error::ErrorKind> {
+        let mut argv = vec!["rivet", "state", "reset-chunks", "--config", "c.yaml"];
+        argv.extend(extra_after_config.iter().copied());
+        match Cli::try_parse_from(argv) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.kind()),
+        }
+    }
+
+    #[test]
+    fn state_reset_chunks_accepts_export_or_stuck_or_failed_alias() {
+        assert!(state_reset_chunks_parse_from(&["--export", "x"]).is_ok());
+        assert!(state_reset_chunks_parse_from(&["--stuck-checkpoints"]).is_ok());
+        assert!(state_reset_chunks_parse_from(&["--failed"]).is_ok());
+    }
+
+    #[test]
+    fn state_reset_chunks_rejects_export_with_stuck() {
+        assert_eq!(
+            state_reset_chunks_parse_from(&["--export", "x", "--stuck-checkpoints"]).unwrap_err(),
+            clap::error::ErrorKind::ArgumentConflict,
+        );
+    }
+
+    #[test]
+    fn state_reset_chunks_requires_export_or_stuck() {
+        assert_eq!(
+            state_reset_chunks_parse_from(&[]).unwrap_err(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+        );
     }
 
     #[test]
@@ -829,6 +896,7 @@ mod tests {
             parallel_exports,
             parallel_export_processes,
             summary_output: None,
+            json: false,
             params: vec![],
         }
     }
@@ -883,6 +951,18 @@ mod tests {
     }
 
     #[test]
+    fn validate_reconcile_accepts_output_with_json() {
+        let cmd = Commands::Reconcile {
+            config: "c.yaml".into(),
+            export: "e".into(),
+            format: ReconcileFormat::Json,
+            output: Some("out.json".into()),
+            params: vec![],
+        };
+        assert!(validate_cli(&cmd).is_ok());
+    }
+
+    #[test]
     fn validate_repair_rejects_output_with_pretty() {
         let cmd = Commands::Repair {
             config: "c.yaml".into(),
@@ -894,6 +974,20 @@ mod tests {
             params: vec![],
         };
         assert!(validate_cli(&cmd).is_err());
+    }
+
+    #[test]
+    fn validate_repair_accepts_output_with_json() {
+        let cmd = Commands::Repair {
+            config: "c.yaml".into(),
+            export: "e".into(),
+            report: None,
+            execute: false,
+            format: ReconcileFormat::Json,
+            output: Some("out.json".into()),
+            params: vec![],
+        };
+        assert!(validate_cli(&cmd).is_ok());
     }
 
     #[test]

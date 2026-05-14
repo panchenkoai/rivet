@@ -1,6 +1,6 @@
 use crate::error::Result;
 
-use super::StateStore;
+use super::{StateConn, StateStore, pg_sql};
 
 /// One row from `file_manifest`.
 #[derive(Debug)]
@@ -34,54 +34,117 @@ impl StateStore {
         compression: Option<&str>,
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        self.conn.execute(
-            "INSERT INTO file_manifest (run_id, export_name, file_name, row_count, bytes, format, compression, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![run_id, export_name, file_name, row_count, bytes, format, compression, now],
-        )?;
+        let sql = "INSERT INTO file_manifest (run_id, export_name, file_name, row_count, bytes, format, compression, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
+        match &self.conn {
+            StateConn::Sqlite(c) => {
+                c.execute(
+                    sql,
+                    rusqlite::params![
+                        run_id,
+                        export_name,
+                        file_name,
+                        row_count,
+                        bytes,
+                        format,
+                        compression,
+                        now
+                    ],
+                )?;
+            }
+            StateConn::Postgres(client) => {
+                let mut c = client.borrow_mut();
+                c.execute(
+                    &pg_sql(sql),
+                    &[
+                        &run_id,
+                        &export_name,
+                        &file_name,
+                        &row_count,
+                        &bytes,
+                        &format,
+                        &compression,
+                        &now,
+                    ],
+                )?;
+            }
+        }
         Ok(())
     }
 
     pub fn get_files(&self, export_name: Option<&str>, limit: usize) -> Result<Vec<FileRecord>> {
-        let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(name) =
-            export_name
-        {
-            (
-                    format!(
-                        "SELECT run_id, export_name, file_name, row_count, bytes, format, compression, created_at
-                         FROM file_manifest WHERE export_name = ?1 ORDER BY id DESC LIMIT {}",
-                        limit
-                    ),
-                    vec![Box::new(name.to_string())],
-                )
-        } else {
-            (
-                    format!(
-                        "SELECT run_id, export_name, file_name, row_count, bytes, format, compression, created_at
-                         FROM file_manifest ORDER BY id DESC LIMIT {}",
-                        limit
-                    ),
-                    vec![],
-                )
-        };
-
-        let mut stmt = self.conn.prepare(&sql)?;
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-        let rows = stmt.query_map(params_refs.as_slice(), |row| {
-            Ok(FileRecord {
-                run_id: row.get(0)?,
-                export_name: row.get(1)?,
-                file_name: row.get(2)?,
-                row_count: row.get(3)?,
-                bytes: row.get(4)?,
-                format: row.get(5)?,
-                compression: row.get(6)?,
-                created_at: row.get(7)?,
-            })
-        })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Into::into)
+        let cols =
+            "run_id, export_name, file_name, row_count, bytes, format, compression, created_at";
+        let limit_i64 = limit as i64;
+        match &self.conn {
+            StateConn::Sqlite(c) => {
+                let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(
+                    name,
+                ) = export_name
+                {
+                    (
+                        "SELECT run_id, export_name, file_name, row_count, bytes, format, compression, created_at \
+                             FROM file_manifest WHERE export_name = ?1 ORDER BY id DESC LIMIT ?2",
+                        vec![Box::new(name.to_string()), Box::new(limit_i64)],
+                    )
+                } else {
+                    (
+                        "SELECT run_id, export_name, file_name, row_count, bytes, format, compression, created_at \
+                             FROM file_manifest ORDER BY id DESC LIMIT ?1",
+                        vec![Box::new(limit_i64)],
+                    )
+                };
+                let mut stmt = c.prepare(sql)?;
+                let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(|p| p.as_ref()).collect();
+                let rows = stmt.query_map(params_refs.as_slice(), |row| {
+                    Ok(FileRecord {
+                        run_id: row.get(0)?,
+                        export_name: row.get(1)?,
+                        file_name: row.get(2)?,
+                        row_count: row.get(3)?,
+                        bytes: row.get(4)?,
+                        format: row.get(5)?,
+                        compression: row.get(6)?,
+                        created_at: row.get(7)?,
+                    })
+                })?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(Into::into)
+            }
+            StateConn::Postgres(client) => {
+                // Single borrow for the duration of this call; safe because all Postgres
+                // operations in StateStore are sequential (no re-entrant borrows).
+                let mut c = client.borrow_mut();
+                let rows = if let Some(name) = export_name {
+                    c.query(
+                        &format!("SELECT {} FROM file_manifest WHERE export_name = $1 ORDER BY id DESC LIMIT $2", cols),
+                        &[&name, &limit_i64],
+                    )?
+                } else {
+                    c.query(
+                        &format!(
+                            "SELECT {} FROM file_manifest ORDER BY id DESC LIMIT $1",
+                            cols
+                        ),
+                        &[&limit_i64],
+                    )?
+                };
+                Ok(rows
+                    .iter()
+                    .map(|row| FileRecord {
+                        run_id: row.get(0),
+                        export_name: row.get(1),
+                        file_name: row.get(2),
+                        row_count: row.get(3),
+                        bytes: row.get(4),
+                        format: row.get(5),
+                        compression: row.get(6),
+                        created_at: row.get(7),
+                    })
+                    .collect())
+            }
+        }
     }
 }
 

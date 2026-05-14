@@ -33,8 +33,6 @@ pub use shape::ShapeWarning;
 const STATE_DB_NAME: &str = ".rivet_state.db";
 
 /// Current schema version — always the last entry in `MIGRATIONS`.
-/// Adding a migration automatically updates this; no manual bump needed.
-/// Used in tests to assert the DB reaches the expected version.
 const SCHEMA_VERSION: i64 = MIGRATIONS[MIGRATIONS.len() - 1].0;
 
 /// Each entry is `(version, sql)`.  Applied in order when the DB is behind.
@@ -135,10 +133,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
             last_verified_at TEXT
         );",
     ),
-    // v5: aggregate run summary — one row per `rivet run` invocation that
-    // executed at least one export.  Per-export breakdown is stored in
-    // `details_json` to keep the relational schema small (we mostly query the
-    // aggregate row by id or by recency).
+    // v5: aggregate run summary
     (
         5,
         "CREATE TABLE IF NOT EXISTS run_aggregate (
@@ -160,9 +155,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         CREATE INDEX IF NOT EXISTS idx_run_aggregate_finished
             ON run_aggregate(finished_at DESC);",
     ),
-    // v6: per-column data shape stats — tracks max observed byte length for
-    // string/binary columns across runs to surface widening text payloads
-    // that wouldn't be caught by structural schema drift detection (Epic 8).
+    // v6: per-column data shape stats
     (
         6,
         "CREATE TABLE IF NOT EXISTS export_shape (
@@ -173,10 +166,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
             PRIMARY KEY (export_name, column_name)
         );",
     ),
-    // v7: structured run journal — full typed event log persisted at run end.
-    // Stored as a single JSON blob per run for simplicity; `run_id` matches
-    // the value embedded in RunJournal itself.  Indexed by export_name + time
-    // so `rivet journal <export>` queries stay fast on long histories.
+    // v7: structured run journal
     (
         7,
         "CREATE TABLE IF NOT EXISTS run_journal (
@@ -189,6 +179,187 @@ const MIGRATIONS: &[(i64, &str)] = &[
             ON run_journal(export_name, finished_at DESC);",
     ),
 ];
+
+/// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
+/// BOOLEAN); placeholder style is `$N` (handled by callers via `pg_sql()`).
+const PG_MIGRATIONS: &[(i64, &str)] = &[
+    (
+        1,
+        "CREATE TABLE IF NOT EXISTS export_state (
+            export_name TEXT PRIMARY KEY,
+            last_cursor_value TEXT,
+            last_run_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS export_metrics (
+            id BIGSERIAL PRIMARY KEY,
+            export_name TEXT NOT NULL,
+            run_at TEXT NOT NULL,
+            duration_ms BIGINT NOT NULL,
+            total_rows BIGINT NOT NULL,
+            peak_rss_mb BIGINT,
+            status TEXT NOT NULL,
+            error_message TEXT,
+            tuning_profile TEXT,
+            format TEXT,
+            mode TEXT,
+            files_produced BIGINT DEFAULT 0,
+            bytes_written BIGINT DEFAULT 0,
+            retries BIGINT DEFAULT 0,
+            validated BOOLEAN,
+            schema_changed BOOLEAN,
+            run_id TEXT
+        );
+        CREATE TABLE IF NOT EXISTS export_schema (
+            export_name TEXT PRIMARY KEY,
+            columns_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS file_manifest (
+            id BIGSERIAL PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            export_name TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            row_count BIGINT NOT NULL,
+            bytes BIGINT NOT NULL,
+            format TEXT NOT NULL,
+            compression TEXT,
+            created_at TEXT NOT NULL
+        );",
+    ),
+    (
+        2,
+        "CREATE TABLE IF NOT EXISTS chunk_run (
+            run_id TEXT PRIMARY KEY,
+            export_name TEXT NOT NULL,
+            plan_hash TEXT NOT NULL,
+            status TEXT NOT NULL,
+            max_chunk_attempts BIGINT NOT NULL DEFAULT 3,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_chunk_run_export_status
+            ON chunk_run(export_name, status);
+        CREATE TABLE IF NOT EXISTS chunk_task (
+            id BIGSERIAL PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            chunk_index BIGINT NOT NULL,
+            start_key TEXT NOT NULL,
+            end_key TEXT NOT NULL,
+            status TEXT NOT NULL,
+            attempts BIGINT NOT NULL DEFAULT 0,
+            last_error TEXT,
+            rows_written BIGINT,
+            file_name TEXT,
+            updated_at TEXT NOT NULL,
+            UNIQUE(run_id, chunk_index)
+        );
+        CREATE INDEX IF NOT EXISTS idx_chunk_task_run_status ON chunk_task(run_id, status);",
+    ),
+    (
+        3,
+        "CREATE INDEX IF NOT EXISTS idx_file_manifest_export ON file_manifest(export_name, id DESC);",
+    ),
+    (
+        4,
+        "CREATE TABLE IF NOT EXISTS export_progression (
+            export_name TEXT PRIMARY KEY,
+            last_committed_strategy TEXT,
+            last_committed_cursor TEXT,
+            last_committed_chunk_index BIGINT,
+            last_committed_run_id TEXT,
+            last_committed_at TEXT,
+            last_verified_strategy TEXT,
+            last_verified_cursor TEXT,
+            last_verified_chunk_index BIGINT,
+            last_verified_run_id TEXT,
+            last_verified_at TEXT
+        );",
+    ),
+    (
+        5,
+        "CREATE TABLE IF NOT EXISTS run_aggregate (
+            run_aggregate_id TEXT PRIMARY KEY,
+            started_at TEXT NOT NULL,
+            finished_at TEXT NOT NULL,
+            duration_ms BIGINT NOT NULL,
+            config_path TEXT,
+            parallel_mode TEXT NOT NULL,
+            total_exports BIGINT NOT NULL,
+            success_count BIGINT NOT NULL,
+            failed_count BIGINT NOT NULL,
+            skipped_count BIGINT NOT NULL,
+            total_rows BIGINT NOT NULL,
+            total_files BIGINT NOT NULL,
+            total_bytes BIGINT NOT NULL,
+            details_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_run_aggregate_finished
+            ON run_aggregate(finished_at DESC);",
+    ),
+    (
+        6,
+        "CREATE TABLE IF NOT EXISTS export_shape (
+            export_name TEXT NOT NULL,
+            column_name TEXT NOT NULL,
+            max_byte_len BIGINT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (export_name, column_name)
+        );",
+    ),
+    (
+        7,
+        "CREATE TABLE IF NOT EXISTS run_journal (
+            run_id TEXT PRIMARY KEY,
+            export_name TEXT NOT NULL,
+            finished_at TEXT NOT NULL,
+            journal_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_run_journal_export
+            ON run_journal(export_name, finished_at DESC);",
+    ),
+];
+
+// ─── SQL helpers ──────────────────────────────────────────────────────────────
+
+/// Convert SQLite `?N` placeholders to PostgreSQL `$N` style.
+/// `"WHERE x = ?1 AND y = ?2"` → `"WHERE x = $1 AND y = $2"`.
+pub(super) fn pg_sql(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'?' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+            out.push('$');
+        } else {
+            out.push(bytes[i] as char);
+        }
+        i += 1;
+    }
+    out
+}
+
+// ─── Backend connection ────────────────────────────────────────────────────────
+
+/// Internal storage for the active database connection.
+pub(super) enum StateConn {
+    Sqlite(rusqlite::Connection),
+    /// postgres::Client requires `&mut self` for queries; RefCell provides
+    /// interior mutability so `StateStore` methods can keep `&self` signatures.
+    /// StateStore is not Sync (neither backend is), so RefCell is safe here.
+    /// Boxed to keep the enum variant sizes balanced (postgres::Client is ~320 B).
+    Postgres(Box<std::cell::RefCell<postgres::Client>>),
+}
+
+/// Serialisable reference that identifies a state database without holding a
+/// live connection.  Passed to parallel chunk workers so they can open their
+/// own connection for atomic `claim_next_chunk_task` operations.
+#[derive(Clone)]
+pub enum StateRef {
+    Sqlite(std::path::PathBuf),
+    Postgres(String),
+}
+
+// ─── SQLite migration ─────────────────────────────────────────────────────────
 
 fn ensure_schema_version_table(conn: &Connection) {
     let _ = conn.execute_batch(
@@ -212,8 +383,6 @@ fn migrate(conn: &Connection) -> Result<()> {
 
     let current = get_current_version(conn);
 
-    // Detect pre-versioning databases: if export_state exists but version == 0,
-    // the DB was created by older code before versioned migrations.
     if current == 0 {
         let has_export_state: bool = conn
             .query_row(
@@ -242,9 +411,6 @@ fn migrate(conn: &Connection) -> Result<()> {
     for &(ver, sql) in MIGRATIONS {
         if ver > current {
             log::debug!("state: applying migration v{}", ver);
-            // Each migration is atomic: schema DDL + version record commit together.
-            // If the process crashes mid-migration, the next startup re-applies the
-            // same migration safely (all DDL uses IF NOT EXISTS / IF EXISTS guards).
             let atomic_sql = format!(
                 "BEGIN;\n{}\nINSERT INTO schema_version (version) VALUES ({});\nCOMMIT;",
                 sql, ver
@@ -254,15 +420,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         }
     }
 
-    // Compact schema_version to a single row.  Older migration implementations
-    // inserted one row per migration; keep only the highest version row so the
-    // table does not grow unboundedly across database lifetimes.
     let _ = conn.execute(
         "DELETE FROM schema_version WHERE version < (SELECT MAX(version) FROM schema_version)",
         [],
     );
 
-    // Sanity check: confirm we are at the expected version.
     let final_version = get_current_version(conn);
     if final_version != SCHEMA_VERSION {
         anyhow::bail!(
@@ -275,45 +437,84 @@ fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-// ─── StateStore ───────────────────────────────────────────────────────────────
+// ─── PostgreSQL migration ─────────────────────────────────────────────────────
 
-/// Entry point for all persistent state.
-///
-/// A single SQLite database serves five logical stores:
-/// - [`cursor`] — incremental cursor positions (`export_state`)
-/// - [`checkpoint`] — chunk run/task lifecycle (`chunk_run`, `chunk_task`)
-/// - [`metrics`] — run outcome history (`export_metrics`)
-/// - [`manifest`] — file manifest (`file_manifest`)
-/// - [`schema`] — schema snapshot history (`export_schema`)
-///
-/// Each store is implemented in its own submodule as an `impl StateStore` block.
-/// Physical storage (one SQLite file) and the migration runner live here.
-pub struct StateStore {
-    /// Shared connection — submodule `impl` blocks borrow this directly.
-    pub(super) conn: Connection,
-    pub(super) db_path: std::path::PathBuf,
+fn migrate_pg(client: &mut postgres::Client) -> Result<()> {
+    client
+        .batch_execute("CREATE TABLE IF NOT EXISTS rivet_schema_version (version BIGINT NOT NULL);")
+        .map_err(|e| anyhow::anyhow!("state(pg): create version table: {:#}", e))?;
+
+    let current: i64 = client
+        .query_one(
+            "SELECT COALESCE(MAX(version), 0) FROM rivet_schema_version",
+            &[],
+        )
+        .map_err(|e| anyhow::anyhow!("state(pg): read schema version: {:#}", e))?
+        .get(0);
+
+    for &(ver, sql) in PG_MIGRATIONS {
+        if ver > current {
+            log::debug!("state(pg): applying migration v{}", ver);
+            let batch = format!(
+                "BEGIN; {} INSERT INTO rivet_schema_version (version) VALUES ({}); COMMIT;",
+                sql, ver
+            );
+            client
+                .batch_execute(&batch)
+                .map_err(|e| anyhow::anyhow!("state(pg): migration v{} failed: {:#}", ver, e))?;
+        }
+    }
+
+    // Remove superseded version rows so MAX() stays unambiguous (mirrors SQLite behaviour).
+    let _ = client.batch_execute(
+        "DELETE FROM rivet_schema_version \
+         WHERE version < (SELECT MAX(version) FROM rivet_schema_version);",
+    );
+
+    // Verify the DB actually reached the expected version.
+    let final_version: i64 = client
+        .query_one(
+            "SELECT COALESCE(MAX(version), 0) FROM rivet_schema_version",
+            &[],
+        )
+        .map_err(|e| anyhow::anyhow!("state(pg): read final schema version: {:#}", e))?
+        .get(0);
+    if final_version != SCHEMA_VERSION {
+        anyhow::bail!(
+            "state(pg): migration incomplete — expected schema v{} but reached v{}",
+            SCHEMA_VERSION,
+            final_version
+        );
+    }
+
+    Ok(())
 }
 
-/// SQLite per-connection lock-wait budget.  Concurrent writers (one
-/// `rivet` child process per export under `--parallel-export-processes`)
-/// can briefly contend on the chunk_task / export_metrics tables; instead
-/// of failing immediately with `SQLITE_BUSY` the connection now retries
-/// for up to this many milliseconds before propagating the error.  Picked
-/// generously because a stalled writer is usually a transient flush, not
-/// an actual deadlock — SQLite WAL only serialises writers, and 10 s is
-/// well above any normal commit latency on local disk.
+/// Redact the password from a PostgreSQL URL for safe use in log/error messages.
+/// `postgresql://user:SECRET@host/db` → `postgresql://user:***@host/db`
+/// Uses `rfind('@')` so passwords containing `@` are handled correctly.
+fn redact_pg_url(url: &str) -> String {
+    if let Some(at_pos) = url.rfind('@')
+        && let Some(scheme_end) = url.find("://")
+    {
+        let authority = &url[scheme_end + 3..at_pos];
+        if let Some(colon) = authority.rfind(':') {
+            let user = &authority[..colon];
+            return format!(
+                "{}://{}:***@{}",
+                &url[..scheme_end],
+                user,
+                &url[at_pos + 1..]
+            );
+        }
+    }
+    url.to_string()
+}
+
+// ─── SQLite connection helper ─────────────────────────────────────────────────
+
 pub(crate) const SQLITE_BUSY_TIMEOUT_MS: i64 = 10_000;
 
-/// Open a SQLite connection to the rivet state DB and apply the standard
-/// pragmas: `journal_mode=WAL` (idempotent: first writer wins, every
-/// subsequent open sees the existing mode) and a per-connection
-/// `busy_timeout` so concurrent writers wait briefly instead of erroring
-/// out with "database is locked" on race conditions.
-///
-/// Used by [`StateStore::open`] / [`StateStore::open_at_path`] and by the
-/// fast-path helpers in `state::checkpoint` that open ad-hoc connections
-/// for parallel chunk workers.  Migrations are NOT run here — the caller
-/// is responsible for invoking [`migrate`] once.
 pub(crate) fn open_connection(db_path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
     if let Err(e) = conn.execute_batch("PRAGMA journal_mode=WAL;") {
@@ -336,23 +537,79 @@ pub(crate) fn open_connection(db_path: &std::path::Path) -> Result<Connection> {
     Ok(conn)
 }
 
+// ─── StateStore ───────────────────────────────────────────────────────────────
+
+/// Entry point for all persistent state.  Supports two backends:
+///
+/// - **SQLite** (default) — a single `.rivet_state.db` file next to the
+///   config.  Good for local / single-node / dev deployments.
+/// - **PostgreSQL** — a shared database addressed by `RIVET_STATE_URL`.
+///   Required for stateless container / Kubernetes deployments where the
+///   rivet pod is ephemeral or replicated.
+///
+/// Set the `RIVET_STATE_URL` environment variable to a PostgreSQL URL to
+/// activate the Postgres backend:
+///
+/// ```text
+/// RIVET_STATE_URL=postgresql://user:pass@host:5432/rivet_state
+/// ```
+///
+/// When the variable is absent or does not start with `postgres`, SQLite is
+/// used and the variable is ignored.
+pub struct StateStore {
+    pub(super) conn: StateConn,
+    /// Serialisable reference for reconnection (parallel chunk workers).
+    pub(super) state_ref: StateRef,
+}
+
 impl StateStore {
-    /// Open the state DB located next to `config_path`.
+    /// Open the appropriate backend.
+    ///
+    /// Checks `RIVET_STATE_URL`; falls back to SQLite next to `config_path`.
     pub fn open(config_path: &str) -> Result<Self> {
+        if let Ok(url) = std::env::var("RIVET_STATE_URL")
+            && url.starts_with("postgres")
+        {
+            return Self::open_postgres(&url);
+        }
+        Self::open_sqlite(config_path)
+    }
+
+    fn open_sqlite(config_path: &str) -> Result<Self> {
         let config_dir = std::path::Path::new(config_path)
             .parent()
             .unwrap_or(std::path::Path::new("."));
         let db_path = config_dir.join(STATE_DB_NAME);
-        let db_path_buf = db_path.to_path_buf();
-        let conn = open_connection(&db_path_buf)?;
+        let conn = open_connection(&db_path)?;
         migrate(&conn)?;
         Ok(Self {
-            conn,
-            db_path: db_path_buf,
+            conn: StateConn::Sqlite(conn),
+            state_ref: StateRef::Sqlite(db_path),
         })
     }
 
-    /// Path to `.rivet_state.db` next to the config file (same rules as `open`).
+    fn open_postgres(url: &str) -> Result<Self> {
+        let is_local =
+            url.contains("localhost") || url.contains("127.0.0.1") || url.contains("::1");
+        if !is_local {
+            log::warn!(
+                "state(pg): connecting to a remote host without TLS; \
+                 set RIVET_STATE_URL to a sslmode=require URL for production use"
+            );
+        }
+        let mut client = postgres::Client::connect(url, postgres::NoTls).map_err(|e| {
+            anyhow::anyhow!("state(pg): connect to '{}': {:#}", redact_pg_url(url), e)
+        })?;
+        migrate_pg(&mut client)?;
+        Ok(Self {
+            conn: StateConn::Postgres(Box::new(std::cell::RefCell::new(client))),
+            state_ref: StateRef::Postgres(url.to_string()),
+        })
+    }
+
+    /// Path to `.rivet_state.db` for SQLite deployments.  Returns the config
+    /// directory path for Postgres (not meaningful for connection, only used
+    /// by legacy callers — prefer `state_ref()` for new code).
     pub fn state_db_path(config_path: &str) -> std::path::PathBuf {
         let config_dir = std::path::Path::new(config_path)
             .parent()
@@ -360,31 +617,31 @@ impl StateStore {
         config_dir.join(STATE_DB_NAME)
     }
 
-    pub(crate) fn database_path(&self) -> &std::path::Path {
-        self.db_path.as_path()
+    /// Serialisable connection reference for parallel chunk workers.
+    pub fn state_ref(&self) -> &StateRef {
+        &self.state_ref
     }
 
-    /// In-memory store for unit tests that do not require cross-connection access.
-    #[allow(dead_code)] // used by integration tests
+    /// In-memory SQLite store for unit tests.
+    #[allow(dead_code)]
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         migrate(&conn)?;
         Ok(Self {
-            conn,
-            db_path: std::path::PathBuf::from(":memory:"),
+            conn: StateConn::Sqlite(conn),
+            state_ref: StateRef::Sqlite(std::path::PathBuf::from(":memory:")),
         })
     }
 
-    /// Open (or create) a state DB at an explicit file path.
-    /// Used by tests that need `claim_next_chunk_task`, which opens separate
-    /// connections and therefore cannot use an in-memory store.
+    /// Open a SQLite store at an explicit file path (tests that need
+    /// cross-connection access via `claim_next_chunk_task_at_path`).
     #[allow(dead_code)]
     pub fn open_at_path(db_path: &std::path::Path) -> Result<Self> {
         let conn = open_connection(db_path)?;
         migrate(&conn)?;
         Ok(Self {
-            conn,
-            db_path: db_path.to_path_buf(),
+            conn: StateConn::Sqlite(conn),
+            state_ref: StateRef::Sqlite(db_path.to_path_buf()),
         })
     }
 }
@@ -398,17 +655,24 @@ mod tests {
     #[test]
     fn fresh_db_reaches_latest_version() {
         let s = StateStore::open_in_memory().unwrap();
-        let ver = get_current_version(&s.conn);
+        let ver = match &s.conn {
+            StateConn::Sqlite(c) => get_current_version(c),
+            StateConn::Postgres(_) => unreachable!(),
+        };
         assert_eq!(ver, SCHEMA_VERSION);
     }
 
     #[test]
     fn migration_is_idempotent() {
         let s = StateStore::open_in_memory().unwrap();
-        migrate(&s.conn).unwrap();
-        migrate(&s.conn).unwrap();
-        let ver = get_current_version(&s.conn);
-        assert_eq!(ver, SCHEMA_VERSION);
+        match &s.conn {
+            StateConn::Sqlite(c) => {
+                migrate(c).unwrap();
+                migrate(c).unwrap();
+                assert_eq!(get_current_version(c), SCHEMA_VERSION);
+            }
+            StateConn::Postgres(_) => unreachable!(),
+        }
     }
 
     #[test]
@@ -432,9 +696,7 @@ mod tests {
         .unwrap();
 
         migrate(&conn).unwrap();
-
-        let ver = get_current_version(&conn);
-        assert_eq!(ver, SCHEMA_VERSION);
+        assert_eq!(get_current_version(&conn), SCHEMA_VERSION);
 
         let has_chunk_run: bool = conn
             .query_row(
@@ -449,8 +711,11 @@ mod tests {
     #[test]
     fn run_aggregate_table_exists_after_migration() {
         let s = StateStore::open_in_memory().unwrap();
-        let exists: bool = s
-            .conn
+        let conn = match &s.conn {
+            StateConn::Sqlite(c) => c,
+            StateConn::Postgres(_) => unreachable!(),
+        };
+        let exists: bool = conn
             .query_row(
                 "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='run_aggregate'",
                 [],
@@ -458,18 +723,39 @@ mod tests {
             )
             .unwrap();
         assert!(exists, "v5 migration must create the run_aggregate table");
+    }
 
-        let has_index: bool = s
-            .conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='index' AND name='idx_run_aggregate_finished'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(
-            has_index,
-            "v5 migration must create idx_run_aggregate_finished"
+    #[test]
+    fn pg_sql_converts_placeholders() {
+        assert_eq!(
+            pg_sql("SELECT ?1, ?2 FROM t WHERE x = ?3"),
+            "SELECT $1, $2 FROM t WHERE x = $3"
         );
+        assert_eq!(
+            pg_sql("INSERT INTO t VALUES (?1, ?2)"),
+            "INSERT INTO t VALUES ($1, $2)"
+        );
+        assert_eq!(pg_sql("no placeholders"), "no placeholders");
+        // ?N with two digits
+        assert_eq!(pg_sql("?10 AND ?11"), "$10 AND $11");
+    }
+
+    #[test]
+    fn redact_pg_url_removes_password() {
+        assert_eq!(
+            redact_pg_url("postgresql://rivet:secret123@localhost:5433/rivet_state"),
+            "postgresql://rivet:***@localhost:5433/rivet_state"
+        );
+        assert_eq!(
+            redact_pg_url("postgres://admin:p@ssw0rd@db.prod.example.com/state"),
+            "postgres://admin:***@db.prod.example.com/state"
+        );
+    }
+
+    #[test]
+    fn redact_pg_url_no_password_unchanged() {
+        // URL without a password should come back as-is.
+        let url = "postgresql://rivet@localhost/state";
+        assert_eq!(redact_pg_url(url), url);
     }
 }

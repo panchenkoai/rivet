@@ -1,7 +1,7 @@
 use crate::error::Result;
 use crate::pipeline::journal::RunJournal;
 
-use super::StateStore;
+use super::{StateConn, StateStore};
 
 impl StateStore {
     /// Persist a completed `RunJournal` to the state DB.
@@ -11,46 +11,101 @@ impl StateStore {
     pub fn store_journal(&self, journal: &RunJournal) -> Result<()> {
         let json = serde_json::to_string(journal)?;
         let now = chrono::Utc::now().to_rfc3339();
-        self.conn.execute(
-            "INSERT OR REPLACE INTO run_journal (run_id, export_name, finished_at, journal_json)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![journal.run_id, journal.export_name, now, json],
-        )?;
+        match &self.conn {
+            StateConn::Sqlite(c) => {
+                c.execute(
+                    "INSERT OR REPLACE INTO run_journal (run_id, export_name, finished_at, journal_json)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![journal.run_id, journal.export_name, now, json],
+                )?;
+            }
+            StateConn::Postgres(client) => {
+                let mut c = client.borrow_mut();
+                c.execute(
+                    "INSERT INTO run_journal (run_id, export_name, finished_at, journal_json)
+                     VALUES ($1, $2, $3, $4)
+                     ON CONFLICT (run_id) DO UPDATE SET
+                         export_name  = excluded.export_name,
+                         finished_at  = excluded.finished_at,
+                         journal_json = excluded.journal_json",
+                    &[&journal.run_id, &journal.export_name, &now, &json],
+                )?;
+            }
+        }
         Ok(())
     }
 
     /// Load a journal by `run_id`.  Returns `None` if the run is not found.
     #[allow(dead_code)]
     pub fn load_journal(&self, run_id: &str) -> Result<Option<RunJournal>> {
-        let result = self.conn.query_row(
-            "SELECT journal_json FROM run_journal WHERE run_id = ?1",
-            rusqlite::params![run_id],
-            |row| row.get::<_, String>(0),
-        );
-        match result {
-            Ok(json) => Ok(Some(serde_json::from_str(&json)?)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
+        match &self.conn {
+            StateConn::Sqlite(c) => {
+                let result = c.query_row(
+                    "SELECT journal_json FROM run_journal WHERE run_id = ?1",
+                    rusqlite::params![run_id],
+                    |row| row.get::<_, String>(0),
+                );
+                match result {
+                    Ok(json) => Ok(Some(serde_json::from_str(&json)?)),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                    Err(e) => Err(e.into()),
+                }
+            }
+            StateConn::Postgres(client) => {
+                let mut c = client.borrow_mut();
+                match c.query_opt(
+                    "SELECT journal_json FROM run_journal WHERE run_id = $1",
+                    &[&run_id],
+                )? {
+                    Some(row) => {
+                        let json: String = row.get(0);
+                        Ok(Some(serde_json::from_str(&json)?))
+                    }
+                    None => Ok(None),
+                }
+            }
         }
     }
 
     /// Return the most recent `limit` journal entries for an export, newest first.
     #[allow(dead_code)]
     pub fn recent_journals(&self, export_name: &str, limit: usize) -> Result<Vec<RunJournal>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT journal_json FROM run_journal
+        let sql = "SELECT journal_json FROM run_journal
              WHERE export_name = ?1
              ORDER BY finished_at DESC
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![export_name, limit as i64], |row| {
-            row.get::<_, String>(0)
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(serde_json::from_str::<RunJournal>(&row?)?);
+             LIMIT ?2";
+        match &self.conn {
+            StateConn::Sqlite(c) => {
+                let mut stmt = c.prepare(sql)?;
+                let rows = stmt.query_map(rusqlite::params![export_name, limit as i64], |row| {
+                    row.get::<_, String>(0)
+                })?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(serde_json::from_str::<RunJournal>(&row?)?);
+                }
+                Ok(out)
+            }
+            StateConn::Postgres(client) => {
+                let mut c = client.borrow_mut();
+                let rows = c.query(
+                    &format!(
+                        "SELECT journal_json FROM run_journal
+                         WHERE export_name = $1
+                         ORDER BY finished_at DESC
+                         LIMIT {}",
+                        limit
+                    ),
+                    &[&export_name],
+                )?;
+                let mut out = Vec::new();
+                for row in rows {
+                    let json: String = row.get(0);
+                    out.push(serde_json::from_str::<RunJournal>(&json)?);
+                }
+                Ok(out)
+            }
         }
-        Ok(out)
     }
 }
 
@@ -115,10 +170,7 @@ mod tests {
     #[test]
     fn recent_journals_returns_newest_first() {
         let store = StateStore::open_in_memory().unwrap();
-        // Insert three journals with distinct run_ids (finished_at is set to NOW() in store_journal,
-        // so insert order determines recency).
         for i in 1..=3_u32 {
-            // Tiny sleep ensures distinct timestamps even on fast machines.
             std::thread::sleep(std::time::Duration::from_millis(2));
             store
                 .store_journal(&make_journal(&format!("run_{i:03}"), "events"))

@@ -1,6 +1,6 @@
 use crate::error::Result;
 
-use super::StateStore;
+use super::{StateConn, StateStore, pg_sql};
 
 /// One column in a schema snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -30,34 +30,57 @@ impl SchemaChange {
 /// drift (added/removed/retyped columns) by diffing against the stored snapshot.
 impl StateStore {
     pub fn get_stored_schema(&self, export_name: &str) -> Result<Option<Vec<SchemaColumn>>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT columns_json FROM export_schema WHERE export_name = ?1")?;
-        let result = stmt.query_row([export_name], |row| {
-            let json_str: String = row.get(0)?;
-            Ok(json_str)
-        });
-        match result {
-            Ok(json_str) => {
-                let cols: Vec<SchemaColumn> = serde_json::from_str(&json_str)?;
-                Ok(Some(cols))
+        match &self.conn {
+            StateConn::Sqlite(c) => {
+                let mut stmt =
+                    c.prepare("SELECT columns_json FROM export_schema WHERE export_name = ?1")?;
+                let result = stmt.query_row([export_name], |row| {
+                    let json_str: String = row.get(0)?;
+                    Ok(json_str)
+                });
+                match result {
+                    Ok(json_str) => {
+                        let cols: Vec<SchemaColumn> = serde_json::from_str(&json_str)?;
+                        Ok(Some(cols))
+                    }
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                    Err(e) => Err(e.into()),
+                }
             }
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
+            StateConn::Postgres(client) => {
+                let mut c = client.borrow_mut();
+                match c.query_opt(
+                    "SELECT columns_json FROM export_schema WHERE export_name = $1",
+                    &[&export_name],
+                )? {
+                    Some(row) => {
+                        let json_str: String = row.get(0);
+                        let cols: Vec<SchemaColumn> = serde_json::from_str(&json_str)?;
+                        Ok(Some(cols))
+                    }
+                    None => Ok(None),
+                }
+            }
         }
     }
 
     pub fn store_schema(&self, export_name: &str, columns: &[SchemaColumn]) -> Result<()> {
         let json = serde_json::to_string(columns)?;
         let now = chrono::Utc::now().to_rfc3339();
-        self.conn.execute(
-            "INSERT INTO export_schema (export_name, columns_json, updated_at)
+        let sql = "INSERT INTO export_schema (export_name, columns_json, updated_at)
              VALUES (?1, ?2, ?3)
              ON CONFLICT(export_name) DO UPDATE SET
                 columns_json = excluded.columns_json,
-                updated_at = excluded.updated_at",
-            rusqlite::params![export_name, json, now],
-        )?;
+                updated_at = excluded.updated_at";
+        match &self.conn {
+            StateConn::Sqlite(c) => {
+                c.execute(sql, rusqlite::params![export_name, json, now])?;
+            }
+            StateConn::Postgres(client) => {
+                let mut c = client.borrow_mut();
+                c.execute(&pg_sql(sql), &[&export_name, &json, &now])?;
+            }
+        }
         Ok(())
     }
 
@@ -256,16 +279,13 @@ mod tests {
                 data_type: "Utf8".into(),
             },
         ];
-        // detect — change is returned but we do NOT call store_schema (simulating Fail policy)
         let change = s.detect_schema_change("t", &v2).unwrap().unwrap();
         assert_eq!(change.added.len(), 1);
 
-        // Stored schema should still be v1
         let stored = s.get_stored_schema("t").unwrap().unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].name, "id");
 
-        // Next detect call sees the same change again
         let change2 = s.detect_schema_change("t", &v2).unwrap().unwrap();
         assert_eq!(
             change2.added.len(),
@@ -296,10 +316,8 @@ mod tests {
         let change = s.detect_schema_change("t", &v2).unwrap().unwrap();
         assert_eq!(change.added.len(), 1);
 
-        // Warn / Continue policy: explicitly store the new schema
         s.store_schema("t", &v2).unwrap();
 
-        // Next run: no more change
         let no_change = s.detect_schema_change("t", &v2).unwrap();
         assert!(
             no_change.is_none(),

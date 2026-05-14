@@ -3,12 +3,21 @@
 ## Global
 
 ```
-rivet [COMMAND] [OPTIONS]
+rivet [--json-errors] [COMMAND] [OPTIONS]
 ```
 
 ```bash
 rivet --version       # print version
 rivet --help          # show help
+```
+
+| Flag | Description |
+|------|-------------|
+| `--json-errors` | Output errors as `{"error":"..."}` JSON to stderr instead of plain text. Applies to all subcommands. Useful for machine-readable orchestration and CI pipelines. |
+
+```bash
+rivet --json-errors run --config rivet.yaml
+rivet run --config rivet.yaml --json-errors   # global flag accepted in any position
 ```
 
 ---
@@ -27,9 +36,11 @@ rivet run --config <PATH> [OPTIONS]
 | `--export` | `-e` | string | Run only a specific export by name |
 | `--validate` | | bool | Validate output file row count after writing |
 | `--reconcile` | | bool | Run `COUNT(*)` on source query and compare with exported rows |
-| `--resume` | | bool | Resume a chunked export with `chunk_checkpoint: true` |
+| `--resume` | | bool | Resume an in-progress chunked export. If no in-progress checkpoint exists (e.g. after `reset-chunks` already cleared it), starts a fresh run with a warning instead of erroring |
 | `--parallel-exports` | | bool | Run all exports concurrently (ignored with `--export`) |
 | `--parallel-export-processes` | | bool | Run each export as a separate child process |
+| `--summary-output` | | PATH | Write run aggregate to this file as JSON |
+| `--json` | | bool | Print run aggregate to stdout as JSON after the run |
 | `--param` | `-p` | KEY=VALUE | Query parameter (repeatable). Substitutes `${key}` in queries |
 
 ### Examples
@@ -149,7 +160,7 @@ The JSON artifact (`--format json`) contains:
 
 ```json
 {
-  "rivet_version": "0.3.3",
+  "rivet_version": "0.4.0",
   "plan_id": "a1b2c3d4...",
   "created_at": "2026-04-14T10:00:00Z",
   "expires_at": "2026-04-15T10:00:00Z",
@@ -575,11 +586,27 @@ rivet state chunks --config <PATH> --export <NAME>
 
 ### `rivet state reset-chunks`
 
-Clear persisted chunk plans for a chunked export (to re-export from scratch).
+Clear persisted chunk checkpoint rows (`chunk_run` / `chunk_task`) so the next chunked run starts a fresh plan.
+
+**One export** — same as targeting a single table name:
 
 ```bash
 rivet state reset-chunks --config <PATH> --export <NAME>
 ```
+
+**Every “stuck” export in this config** — resets checkpoints only when `chunk_run.status` is still `'in_progress'` (process killed mid-run, concurrent worker left state behind, etc.). Exports whose chunk run already finished normally (`completed`) are skipped. Names that appear in state but were removed from the YAML are skipped with a printed note.
+
+```bash
+rivet state reset-chunks --config <PATH> --stuck-checkpoints
+```
+
+Alias (same semantics — **checkpoint stuck**, not “last metric row failed”):
+
+```bash
+rivet state reset-chunks --config <PATH> --failed
+```
+
+Then run `rivet run --config <PATH> --resume` (or a normal run without `--resume`) as needed.
 
 ### `rivet state progression`
 
@@ -616,17 +643,61 @@ rivet completions <SHELL>
 
 ---
 
+## State backend
+
+By default Rivet keeps all run state (cursors, metrics, manifests, chunk checkpoints, schema drift, run journal, progression) in a SQLite file — `.rivet_state.db` — placed next to the config file. This works for local and single-node deployments.
+
+For **stateless containers / Kubernetes** where the rivet pod is ephemeral or replicated, set `RIVET_STATE_URL` to a PostgreSQL connection string:
+
+```bash
+export RIVET_STATE_URL=postgresql://rivet:rivet@localhost:5433/rivet_state
+rivet run --config rivet.yaml
+```
+
+Rivet creates all state tables automatically on first connect (migrations `v1`–`v7`, same schema version sequence as SQLite). No manual DDL required.
+
+### Docker Compose (local dev)
+
+`docker-compose.yaml` includes a dedicated `postgres-state` service on port **5433** (separate from the source `postgres` service on port 5432 so data and state never mix):
+
+```bash
+docker compose up -d postgres-state
+export RIVET_STATE_URL=postgresql://rivet:rivet@localhost:5433/rivet_state
+rivet run --config pilot.yaml
+```
+
+### Security
+
+- Passwords are **redacted** from all log and error messages: `postgresql://user:***@host/db`.
+- A `WARN` is emitted when connecting to a non-localhost host **without TLS**. For production use a `sslmode=require` URL:
+
+```bash
+export RIVET_STATE_URL="postgresql://rivet:secret@db.internal/rivet_state?sslmode=require"
+```
+
+- The `RIVET_STATE_URL` value is **not** embedded in plan artifacts or config files. It is resolved from the environment at runtime.
+
+---
+
 ## Environment variables
 
 | Variable | Description |
 |----------|-------------|
 | `RUST_LOG` | Log level: `error`, `warn`, `info`, `debug`, `trace` |
-| `DATABASE_URL` | Commonly used with `url_env: DATABASE_URL` |
+| `DATABASE_URL` | Commonly used with `url_env: DATABASE_URL` in source config |
+| `RIVET_STATE_URL` | PostgreSQL URL for the state backend. When set (and starts with `postgres`), activates the PG backend instead of the default SQLite file. Example: `postgresql://rivet:rivet@localhost:5433/rivet_state` |
 
 ### Example: verbose logging
 
 ```bash
 RUST_LOG=debug rivet run -c my_export.yaml
+```
+
+### Example: PostgreSQL state backend
+
+```bash
+export RIVET_STATE_URL=postgresql://rivet:rivet@localhost:5433/rivet_state
+RUST_LOG=info rivet run -c my_export.yaml
 ```
 
 ---

@@ -108,7 +108,7 @@ fn full_export_preserves_string_and_null_distinction() {
             (1, 'alice'),
             (2, ''),      -- empty string, distinct from NULL
             (3, NULL),
-            (4, 'лат́нь 🚀');"
+            (4, 'ελλάδα 🚀');"
     ))
     .unwrap();
     // RAII cleanup via inline drop at end of test (no PgTable since we built
@@ -149,7 +149,7 @@ fn full_export_preserves_string_and_null_distinction() {
     assert!(strings.is_null(2), "row 3: explicit NULL must stay NULL");
     assert_eq!(
         strings.value(3),
-        "лат́нь 🚀",
+        "ελλάδα 🚀",
         "unicode payload must round-trip byte-for-byte"
     );
 }

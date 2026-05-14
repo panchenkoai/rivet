@@ -140,7 +140,7 @@ When `fail` triggers, the output file has already been written to the destinatio
 ### `exports[].columns` — per-column type overrides
 
 Override the Arrow type Rivet infers for a specific column. Useful when:
-- a `NUMERIC` / `DECIMAL` column has no explicit precision/scale in the source schema and Rivet cannot auto-determine the Arrow type, or
+- a `NUMERIC` / `DECIMAL` column has no explicit precision/scale in the source schema (beyond `rivet init`'s default `decimal(38,18)` placeholder), or
 - you need a narrower precision for BigQuery NUMERIC compatibility.
 
 ```yaml
@@ -165,14 +165,42 @@ exports:
       fee: decimal(18,6)
 ```
 
-**`rivet init` generates these automatically.** When introspecting a table, `rivet init` reads `numeric_precision` and `numeric_scale` from `information_schema.columns`. If both are present, it emits a concrete override (`decimal(p,s)`). If the column is unbounded (`NUMERIC` without explicit precision), it emits a TODO comment:
+**`rivet init` generates these automatically.** When introspecting a table, `rivet init` reads `numeric_precision` and `numeric_scale` from `information_schema.columns`. If both are present, it emits a concrete override (`decimal(p,s)`). If the column is unbounded (`NUMERIC` without explicit precision), `rivet init` emits a **working default** `decimal(38,18)` plus a **`# REVIEW:`** YAML comment — the config header adds a **`# NOTE:`** line, and `rivet init -o …` prints a stderr reminder so you tighten precision when you know the real domain rules:
 
 ```yaml
     columns:
-      # price: decimal(?,?)  # TODO: specify precision and scale
+      price: decimal(38,18)  # REVIEW: DDL has no numeric(p,s); edit to the real decimal(p,s) …
 ```
 
 Type overrides are applied at export time and are reflected in `rivet check --type-report` output.
+
+---
+
+Some PostgreSQL types have no Arrow representation and cannot be exported directly. Rivet will report an error listing all unmappable columns before the run starts.
+
+| PostgreSQL type | Reason | Workaround |
+|---|---|---|
+| `geometry` (PostGIS) | No Arrow equivalent | Cast to text: `ST_AsText(col) AS col` in your query |
+| `geography` (PostGIS) | No Arrow equivalent | Cast to text: `ST_AsText(col) AS col` |
+| `hstore` | No Arrow equivalent | Cast to JSON text: `hstore_to_json(col)::text AS col` |
+| `tsvector`, `tsquery` | No Arrow equivalent | Cast to text: `col::text AS col` |
+| `point`, `line`, `polygon`, etc. | No Arrow equivalent | Cast to text: `col::text AS col` |
+
+Use a SQL expression in your `query` field to work around any unsupported type:
+
+```yaml
+exports:
+  - name: locations
+    query: >
+      SELECT id, name, ST_AsText(geom) AS geom_wkt
+      FROM locations
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+```
+
+Rivet exports the WKT text as a `Utf8` (string) column. Downstream tools (DuckDB, GeoPandas, QGIS) can reconstruct geometry from WKT.
 
 ---
 
@@ -191,10 +219,11 @@ Type overrides are applied at export time and are reflected in `rivet check --ty
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `chunk_column` | string | **yes** | — | Numeric or date/timestamp column to partition by |
-| `chunk_size` | integer | no | `100000` | Rows per chunk (numeric mode) |
-| `chunk_by_days` | integer | no | — | Enable date chunking: window size in days. Mutually exclusive with `chunk_dense`. |
+| `chunk_size` | integer | no | `100000` | Rows per chunk (numeric mode). Ignored when `chunk_count` is set. |
+| `chunk_count` | integer | no | — | Divide the column range into exactly this many equal chunks. `chunk_size` is computed dynamically from `min`/`max`. Must be ≥ 1. Mutually exclusive with `chunk_dense` and `chunk_by_days`. |
+| `chunk_by_days` | integer | no | — | Enable date chunking: window size in days. Mutually exclusive with `chunk_dense` and `chunk_count`. |
 | `parallel` | integer | no | `1` | Concurrent chunk workers |
-| `chunk_dense` | boolean | no | `false` | Use `ROW_NUMBER()` for sparse numeric IDs. Cannot be combined with `chunk_by_days`. |
+| `chunk_dense` | boolean | no | `false` | Use `ROW_NUMBER()` for sparse numeric IDs. Mutually exclusive with `chunk_by_days` and `chunk_count`. |
 | `chunk_checkpoint` | boolean | no | `false` | Persist per-chunk progress for resume |
 | `chunk_max_attempts` | integer | no | — | Max retry attempts per chunk |
 
@@ -277,6 +306,26 @@ quality:
 ### Stdout
 
 No additional fields. Only `type: stdout` is needed.
+
+### Path and prefix placeholders
+
+The `path` (local) and `prefix` (S3 / GCS) fields support template placeholders, substituted at plan-build time:
+
+| Placeholder | Value |
+|---|---|
+| `{date}` | UTC date as `YYYY-MM-DD` |
+| `{export}` | Export name from config |
+| `{table}` | Alias for `{export}` |
+
+```yaml
+destination:
+  type: s3
+  bucket: my-data
+  prefix: exports/{date}/{export}/
+  region: us-east-1
+```
+
+With an export named `orders` running on 2026-05-14, this resolves to `exports/2026-05-14/orders/`.
 
 ---
 

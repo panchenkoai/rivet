@@ -425,7 +425,7 @@ mod tests {
 
     #[test]
     fn binary_stays_binary_not_string() {
-        // Roadmap §14: "Binary больше никогда не экспортируется как Utf8".
+        // Roadmap §14: binary columns must never be silently exported as Utf8.
         let mapping = TypeMapping::from_source(&col("payload", "bytea"), RivetType::Binary);
         let field = build_arrow_field(&mapping).expect("field");
         assert_eq!(field.data_type(), &DataType::Binary);
