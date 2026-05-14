@@ -178,7 +178,7 @@ exports:
     let sum_fee_scaled = sum_decimal128_scaled(&batches, "fee");
 
     assert_eq!(
-        sum_amount_scaled, 999_999_999_900_24_i128,
+        sum_amount_scaled, 99_999_999_990_024_i128,
         "SUM(amount)×10² must equal source golden (decoding must stay exact)"
     );
     assert_eq!(
@@ -512,7 +512,7 @@ exports:
     let sum_amount_scaled = sum_decimal128_scaled(&batches, "amount");
     let sum_fee_scaled = sum_decimal128_scaled(&batches, "fee");
 
-    assert_eq!(sum_amount_scaled, 999_999_999_900_24_i128);
+    assert_eq!(sum_amount_scaled, 99_999_999_990_024_i128);
     assert_eq!(sum_fee_scaled, 10_000_003_i128);
 
     let b0 = &batches[0];
@@ -944,7 +944,7 @@ exports:
 
     assert_eq!(
         sum_decimal128_scaled(&batches, "amount"),
-        999_999_999_900_24_i128,
+        99_999_999_990_024_i128,
     );
     assert_eq!(sum_decimal128_scaled(&batches, "fee"), 10_000_003_i128,);
 
@@ -1129,7 +1129,7 @@ exports:
 
     assert_eq!(
         sum_decimal128_scaled(&batches, "amount"),
-        999_999_999_900_24_i128,
+        99_999_999_990_024_i128,
     );
     assert_eq!(sum_decimal128_scaled(&batches, "fee"), 10_000_003_i128,);
 
