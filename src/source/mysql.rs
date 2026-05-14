@@ -415,7 +415,7 @@ fn rows_to_record_batch_typed(
 }
 
 fn bytes_to_str(b: &[u8]) -> Option<&str> {
-    std::str::from_utf8(b).ok()
+    simdutf8::basic::from_utf8(b).ok()
 }
 
 /// Interpret raw big-endian bytes from a MySQL BIT column as an unsigned integer.
@@ -474,7 +474,7 @@ fn build_array(
                 match row.as_ref(col_idx) {
                     Some(Value::Int(v)) => b.append_value(*v as i16),
                     Some(Value::UInt(v)) => b.append_value(*v as i16),
-                    Some(Value::Bytes(bv)) => match bytes_to_str(bv).and_then(|s| s.parse().ok()) {
+                    Some(Value::Bytes(bv)) => match atoi::atoi::<i16>(bv) {
                         Some(v) => b.append_value(v),
                         None => b.append_null(),
                     },
@@ -489,7 +489,7 @@ fn build_array(
                 match row.as_ref(col_idx) {
                     Some(Value::Int(v)) => b.append_value(*v as i32),
                     Some(Value::UInt(v)) => b.append_value(*v as i32),
-                    Some(Value::Bytes(bv)) => match bytes_to_str(bv).and_then(|s| s.parse().ok()) {
+                    Some(Value::Bytes(bv)) => match atoi::atoi::<i32>(bv) {
                         Some(v) => b.append_value(v),
                         None => b.append_null(),
                     },
@@ -507,9 +507,8 @@ fn build_array(
                     Some(Value::Bytes(bv)) => {
                         // BIT(n>1) columns arrive as raw big-endian bytes; TEXT columns as UTF-8.
                         // Try decimal parse first; fall back to big-endian uint interpretation.
-                        let v = bytes_to_str(bv)
-                            .and_then(|s| s.parse::<i64>().ok())
-                            .unwrap_or_else(|| bit_bytes_to_u64(bv) as i64);
+                        let v =
+                            atoi::atoi::<i64>(bv).unwrap_or_else(|| bit_bytes_to_u64(bv) as i64);
                         b.append_value(v);
                     }
                     _ => b.append_null(),

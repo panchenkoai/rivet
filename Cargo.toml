@@ -65,6 +65,8 @@ reqwest-012 = { package = "reqwest", version = "0.12", default-features = false,
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 indicatif = "0.18"
 console = "0.16"
+atoi = "2"
+simdutf8 = "0.1"
 zeroize = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]

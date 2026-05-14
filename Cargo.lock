@@ -3203,6 +3203,7 @@ version = "0.3.5"
 dependencies = [
  "anyhow",
  "arrow",
+ "atoi",
  "bigdecimal",
  "byteorder",
  "bytes",
@@ -3232,6 +3233,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "simdutf8",
  "tempfile",
  "tikv-jemallocator",
  "tokio",

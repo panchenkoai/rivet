@@ -44,7 +44,7 @@ impl<'a> PgFromSql<'a> for PgUuidDisplayed {
             let uuid = uuid::Uuid::from_slice(raw)?;
             return Ok(Self(uuid.to_hyphenated().to_string()));
         }
-        let text = std::str::from_utf8(raw)?.trim();
+        let text = simdutf8::basic::from_utf8(raw)?.trim();
         Ok(Self(
             uuid::Uuid::parse_str(text)?.to_hyphenated().to_string(),
         ))
@@ -60,7 +60,7 @@ fn pg_numeric_optional_utf8_string(row: &Row, col_idx: usize) -> Result<Option<S
 
 fn numeric_raw_to_optional_decimal_text(raw: &[u8]) -> Option<String> {
     numeric_wire_normalized_plain(raw).or_else(|| {
-        let text = std::str::from_utf8(raw).ok()?.trim();
+        let text = simdutf8::basic::from_utf8(raw).ok()?.trim();
         (!text.is_empty()).then(|| text.to_owned())
     })
 }
@@ -479,7 +479,7 @@ impl<'a> postgres_types::FromSql<'a> for AnyAsString {
         _ty: &postgres_types::Type,
         raw: &'a [u8],
     ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-        Ok(AnyAsString(std::str::from_utf8(raw)?.to_string()))
+        Ok(AnyAsString(simdutf8::basic::from_utf8(raw)?.to_string()))
     }
     fn accepts(_ty: &postgres_types::Type) -> bool {
         true
