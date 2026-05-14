@@ -421,12 +421,158 @@ fn bench_shape_tracking(c: &mut Criterion) {
     group.finish();
 }
 
+// ── MySQL TIME parsing: str::parse vs atoi ───────────────────────────────────
+// Mirrors parse_time_str_to_micros in src/source/mysql.rs.
+// Benchmark result: str::parse wins here (atoi is 45% slower on &str paths).
+// atoi advantage requires working directly on &[u8] — see mysql_int_bytes below.
+
+fn parse_time_before(s: &str) -> Option<i64> {
+    let (neg, rest) = if let Some(r) = s.strip_prefix('-') {
+        (true, r)
+    } else {
+        (false, s)
+    };
+    let (hms, us_part) = if let Some(pos) = rest.find('.') {
+        let us_str = &rest[pos + 1..];
+        let us_digits = us_str.len().min(6);
+        let us = us_str[..us_digits].parse::<i64>().ok()?;
+        let scale = 10i64.pow((6 - us_digits) as u32);
+        (&rest[..pos], us * scale)
+    } else {
+        (rest, 0i64)
+    };
+    let mut parts = hms.splitn(3, ':');
+    let h: i64 = parts.next()?.parse().ok()?;
+    let m: i64 = parts.next()?.parse().ok()?;
+    let s: i64 = parts.next()?.parse().ok()?;
+    let total = (h * 3_600 + m * 60 + s) * 1_000_000 + us_part;
+    Some(if neg { -total } else { total })
+}
+
+fn parse_time_after(s: &str) -> Option<i64> {
+    let (neg, rest) = if let Some(r) = s.strip_prefix('-') {
+        (true, r)
+    } else {
+        (false, s)
+    };
+    let (hms, us_part) = if let Some(pos) = rest.find('.') {
+        let us_str = &rest[pos + 1..];
+        let us_digits = us_str.len().min(6);
+        let us = atoi::atoi::<i64>(us_str[..us_digits].as_bytes())?;
+        let scale = 10i64.pow((6 - us_digits) as u32);
+        (&rest[..pos], us * scale)
+    } else {
+        (rest, 0i64)
+    };
+    let mut parts = hms.splitn(3, ':');
+    let h: i64 = atoi::atoi(parts.next()?.as_bytes())?;
+    let m: i64 = atoi::atoi(parts.next()?.as_bytes())?;
+    let s: i64 = atoi::atoi(parts.next()?.as_bytes())?;
+    let total = (h * 3_600 + m * 60 + s) * 1_000_000 + us_part;
+    Some(if neg { -total } else { total })
+}
+
+fn bench_mysql_parse_time(c: &mut Criterion) {
+    // Realistic TIME strings: plain, with microseconds, negative, large hours
+    let cases: Vec<&str> = vec![
+        "12:30:45",
+        "00:00:00",
+        "08:15:30.123456",
+        "-838:59:59",
+        "100:00:00.000001",
+        "23:59:59.999999",
+        "01:02:03",
+        "10:00:00.500000",
+    ];
+    // Repeat to get N_ROWS total calls
+    let inputs: Vec<&str> = cases.iter().cycle().take(N_ROWS).copied().collect();
+
+    let mut group = c.benchmark_group("mysql_parse_time");
+    group.throughput(Throughput::Elements(N_ROWS as u64));
+
+    group.bench_function("str_parse", |b| {
+        b.iter(|| {
+            inputs
+                .iter()
+                .map(|s| parse_time_before(s))
+                .sum::<Option<i64>>()
+        })
+    });
+
+    group.bench_function("atoi", |b| {
+        b.iter(|| {
+            inputs
+                .iter()
+                .map(|s| parse_time_after(s))
+                .sum::<Option<i64>>()
+        })
+    });
+
+    group.finish();
+}
+
+// ── MySQL integer Bytes path: bytes_to_str+str::parse vs atoi ────────────────
+// Mirrors build_array Int32/Int64 Value::Bytes branch in src/source/mysql.rs.
+// Hit when MySQL sends integers as text (text protocol, CHAR/VARCHAR columns).
+
+fn int_bytes_before(bv: &[u8]) -> Option<i32> {
+    std::str::from_utf8(bv).ok()?.parse::<i32>().ok()
+}
+
+fn int_bytes_after(bv: &[u8]) -> Option<i32> {
+    atoi::atoi::<i32>(bv)
+}
+
+fn bench_mysql_int_bytes(c: &mut Criterion) {
+    // Realistic integer strings stored as MySQL Bytes: short positives, negatives, boundaries
+    let cases: Vec<&[u8]> = vec![
+        b"0",
+        b"1",
+        b"42",
+        b"-1",
+        b"100",
+        b"9999",
+        b"-32768",
+        b"32767",
+        b"2147483647",
+        b"-2147483648",
+        b"12345",
+        b"-9876",
+    ];
+    let inputs: Vec<&[u8]> = cases.iter().cycle().take(N_ROWS).copied().collect();
+
+    let mut group = c.benchmark_group("mysql_int_bytes");
+    group.throughput(Throughput::Elements(N_ROWS as u64));
+
+    group.bench_function("str_parse", |b| {
+        b.iter(|| {
+            inputs
+                .iter()
+                .map(|bv| int_bytes_before(bv))
+                .sum::<Option<i32>>()
+        })
+    });
+
+    group.bench_function("atoi", |b| {
+        b.iter(|| {
+            inputs
+                .iter()
+                .map(|bv| int_bytes_after(bv))
+                .sum::<Option<i32>>()
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_csv,
     bench_hash,
     bench_parquet,
     bench_column_dispatch,
-    bench_shape_tracking
+    bench_shape_tracking,
+    bench_mysql_parse_time,
+    bench_mysql_int_bytes,
 );
 criterion_main!(benches);
