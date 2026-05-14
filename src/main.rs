@@ -30,6 +30,9 @@ use error::Result;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+    /// Output errors as {"error":"..."} JSON to stderr; useful for machine-readable orchestration
+    #[arg(long, global = true)]
+    json_errors: bool,
 }
 
 #[derive(Subcommand)]
@@ -395,12 +398,22 @@ fn resolve_init_source(
     anyhow::bail!("--source, --source-env, or --source-file is required")
 }
 
-fn main() -> Result<()> {
+fn main() {
     env_logger::init();
     let cli = Cli::parse();
-    validate_cli(&cli.command)?;
+    let json_errors = cli.json_errors;
+    if let Err(e) = validate_cli(&cli.command).and_then(|_| run(cli.command)) {
+        if json_errors {
+            eprintln!("{}", serde_json::json!({"error": format!("{e:#}")}));
+        } else {
+            eprintln!("Error: {e:#}");
+        }
+        std::process::exit(1);
+    }
+}
 
-    match cli.command {
+fn run(command: Commands) -> Result<()> {
+    match command {
         Commands::Run {
             config,
             export,
@@ -881,5 +894,34 @@ mod tests {
             params: vec![],
         };
         assert!(validate_cli(&cmd).is_err());
+    }
+
+    #[test]
+    fn json_errors_flag_parsed_before_subcommand() {
+        let cli = Cli::try_parse_from(["rivet", "--json-errors", "run", "--config", "c.yaml"])
+            .expect("should parse");
+        assert!(cli.json_errors);
+    }
+
+    #[test]
+    fn json_errors_flag_parsed_after_subcommand() {
+        let cli = Cli::try_parse_from(["rivet", "run", "--config", "c.yaml", "--json-errors"])
+            .expect("should parse with global flag after subcommand");
+        assert!(cli.json_errors);
+    }
+
+    #[test]
+    fn json_errors_off_by_default() {
+        let cli =
+            Cli::try_parse_from(["rivet", "run", "--config", "c.yaml"]).expect("should parse");
+        assert!(!cli.json_errors);
+    }
+
+    #[test]
+    fn json_error_output_is_valid_json() {
+        let err = anyhow::anyhow!("connection refused");
+        let output = serde_json::json!({"error": format!("{err:#}")}).to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("must be valid JSON");
+        assert_eq!(parsed["error"], "connection refused");
     }
 }
