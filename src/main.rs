@@ -320,6 +320,46 @@ enum ReconcileFormat {
     Json,
 }
 
+fn validate_cli(cmd: &Commands) -> Result<()> {
+    match cmd {
+        Commands::Run {
+            parallel_exports,
+            parallel_export_processes,
+            ..
+        } => {
+            if *parallel_exports && *parallel_export_processes {
+                anyhow::bail!(
+                    "--parallel-exports and --parallel-export-processes are mutually exclusive; \
+                     choose one parallelism mode"
+                );
+            }
+        }
+        Commands::Plan {
+            format: PlanFormat::Pretty,
+            output: Some(_),
+            ..
+        } => {
+            anyhow::bail!("--output requires --format json (output is ignored in pretty mode)");
+        }
+        Commands::Reconcile {
+            format: ReconcileFormat::Pretty,
+            output: Some(_),
+            ..
+        } => {
+            anyhow::bail!("--output requires --format json (output is ignored in pretty mode)");
+        }
+        Commands::Repair {
+            format: ReconcileFormat::Pretty,
+            output: Some(_),
+            ..
+        } => {
+            anyhow::bail!("--output requires --format json (output is ignored in pretty mode)");
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn parse_params(raw: &[String]) -> std::collections::HashMap<String, String> {
     raw.iter()
         .filter_map(|s| s.split_once('='))
@@ -358,6 +398,7 @@ fn resolve_init_source(
 fn main() -> Result<()> {
     env_logger::init();
     let cli = Cli::parse();
+    validate_cli(&cli.command)?;
 
     match cli.command {
         Commands::Run {
@@ -763,5 +804,82 @@ mod tests {
             ],
             "well-formed --s3-bucket invocation",
         );
+    }
+
+    fn make_run(parallel_exports: bool, parallel_export_processes: bool) -> Commands {
+        Commands::Run {
+            config: "c.yaml".into(),
+            export: None,
+            validate: false,
+            reconcile: false,
+            resume: false,
+            parallel_exports,
+            parallel_export_processes,
+            summary_output: None,
+            params: vec![],
+        }
+    }
+
+    #[test]
+    fn validate_run_rejects_both_parallel_flags() {
+        let cmd = make_run(true, true);
+        assert!(validate_cli(&cmd).is_err());
+    }
+
+    #[test]
+    fn validate_run_accepts_single_parallel_flag() {
+        assert!(validate_cli(&make_run(true, false)).is_ok());
+        assert!(validate_cli(&make_run(false, true)).is_ok());
+        assert!(validate_cli(&make_run(false, false)).is_ok());
+    }
+
+    #[test]
+    fn validate_plan_rejects_output_with_pretty() {
+        let cmd = Commands::Plan {
+            config: "c.yaml".into(),
+            export: None,
+            params: vec![],
+            output: Some("out.json".into()),
+            format: PlanFormat::Pretty,
+        };
+        assert!(validate_cli(&cmd).is_err());
+    }
+
+    #[test]
+    fn validate_plan_accepts_output_with_json() {
+        let cmd = Commands::Plan {
+            config: "c.yaml".into(),
+            export: None,
+            params: vec![],
+            output: Some("out.json".into()),
+            format: PlanFormat::Json,
+        };
+        assert!(validate_cli(&cmd).is_ok());
+    }
+
+    #[test]
+    fn validate_reconcile_rejects_output_with_pretty() {
+        let cmd = Commands::Reconcile {
+            config: "c.yaml".into(),
+            export: "e".into(),
+            format: ReconcileFormat::Pretty,
+            output: Some("out.json".into()),
+            params: vec![],
+        };
+        assert!(validate_cli(&cmd).is_err());
+    }
+
+    #[test]
+    fn validate_repair_rejects_output_with_pretty() {
+        let cmd = Commands::Repair {
+            config: "c.yaml".into(),
+            export: "e".into(),
+            report: None,
+            execute: false,
+            format: ReconcileFormat::Pretty,
+            output: Some("out.json".into()),
+            params: vec![],
+        };
+        assert!(validate_cli(&cmd).is_err());
     }
 }
