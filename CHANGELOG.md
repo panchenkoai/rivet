@@ -116,6 +116,7 @@ For simple single-table `SELECT … FROM rel` queries, `rivet` now looks up `NUM
 - **PG state backend — migrate_pg** — migration runner now verifies the final schema version after migration and cleans up superseded version rows (parity with SQLite behaviour).
 - **PG state backend — password in logs** — PostgreSQL URLs are redacted in all log and error messages. Passwords containing `@` are handled correctly via `rfind('@')`.
 - **`chunk_count` validation** — `chunk_count: 0` is now rejected at plan-build time (would have caused a division by zero at run time). `chunk_count` combined with `chunk_dense: true` or `chunk_by_days` is also rejected (the options are mutually exclusive; previously `chunk_count` was silently ignored when either of the other two was set).
+- **MySQL `--parallel-exports` connection exhaustion** — the `mysql` crate's default connection pool eagerly opens `min=10` connections per pool. With many exports running simultaneously each pool was created at startup, causing `Too many connections` when N×10 exceeded MySQL's `max_connections` (default 151). The pool is now configured with `min=1` so connections are opened lazily on demand.
 
 ### Performance
 
