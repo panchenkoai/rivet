@@ -10,6 +10,7 @@ pub struct SourceTuning {
     pub max_retries: u32,
     pub retry_backoff_ms: u64,
     pub lock_timeout_s: u64,
+    /// RSS limit in MB before chunk processing throttles. `0` = no limit (disabled).
     pub memory_threshold_mb: usize,
     configured_profile: TuningProfile,
 }
@@ -118,7 +119,7 @@ impl SourceTuning {
                 max_retries: 3,
                 retry_backoff_ms: 2_000,
                 lock_timeout_s: 30,
-                memory_threshold_mb: 0,
+                memory_threshold_mb: 4_096,
                 configured_profile: TuningProfile::Balanced,
             },
             TuningProfile::Safe => Self {
@@ -129,7 +130,7 @@ impl SourceTuning {
                 max_retries: 5,
                 retry_backoff_ms: 5_000,
                 lock_timeout_s: 10,
-                memory_threshold_mb: 0,
+                memory_threshold_mb: 2_048,
                 configured_profile: TuningProfile::Safe,
             },
         }

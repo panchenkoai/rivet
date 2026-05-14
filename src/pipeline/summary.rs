@@ -32,6 +32,9 @@ pub struct RunSummary {
     pub total_rows: i64,
     pub files_produced: usize,
     pub bytes_written: u64,
+    /// Incremented after each successful `dest.write()`. Non-zero means a previous
+    /// attempt already committed data — retrying from the same cursor would duplicate rows.
+    pub files_committed: usize,
     pub duration_ms: i64,
     pub peak_rss_mb: i64,
     pub retries: u32,
@@ -81,6 +84,7 @@ impl RunSummary {
             total_rows: 0,
             files_produced: 0,
             bytes_written: 0,
+            files_committed: 0,
             duration_ms: 0,
             peak_rss_mb: 0,
             retries: 0,

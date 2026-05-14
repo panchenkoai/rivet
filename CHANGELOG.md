@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased — Performance & Safety
+
+### Fixed
+
+- **`memory_threshold_mb` defaults** — `balanced` profile now defaults to 4096 MB and `safe` to 2048 MB (was 0 = disabled for all profiles). Prevents unbounded RSS growth on wide-row tables without any config change. Set `memory_threshold_mb: 0` explicitly to restore the old unlimited behaviour.
+- **Retry safety guard** — transient-error retry now fails fast with a clear message when `dest.write()` already succeeded in a previous attempt (`files_committed > 0`). Prevents silent duplicate-row writes on retry. The error message directs users to `rivet reconcile`.
+
+### Performance
+
+- **BufWriter 256 KB** — temp-file write buffer increased from 8 KB to 256 KB (32× fewer `write` syscalls per batch). Measured: −37% User CPU on a 1.5 M-row benchmark at the same wall time.
+- **Inline cursor extraction** — `ExportSink` no longer holds a clone of the last Arrow batch in memory after `on_batch` returns. The cursor value is extracted inline and stored as a `String`, freeing all column buffers immediately. Saves one full batch worth of RAM during post-run state writes (schema drift, shape drift, progression).
+- **`insert_chunk_tasks` batch transaction** — chunk task initialisation now wraps all INSERTs in a single SQLite transaction (one WAL sync) instead of one transaction per chunk (N WAL syncs). Eliminates quadratic I/O on large chunk counts (1000+ chunks).
+- **Quality unique tracking** — `HashSet<String>` replaced with `HashSet<u64>` (xxh3-64 of the display value). Eliminates one heap-allocated `String` per non-null row per tracked column in the hot path.
+
 ## Unreleased — Type Safety Layer (M1–M6)
 
 Type fidelity report, strict mode, BigQuery compatibility, and complex-type support for Postgres and MySQL.

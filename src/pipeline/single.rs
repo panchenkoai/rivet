@@ -11,7 +11,7 @@ use super::RunSummary;
 use super::chunked::{run_chunked_sequential, run_chunked_sequential_checkpoint};
 use super::journal::RunEvent;
 use super::retry::classify_error;
-use super::sink::{CompletedPart, ExportSink, extract_last_cursor_value};
+use super::sink::{CompletedPart, ExportSink};
 use super::validate::validate_output;
 use crate::config::SchemaDriftPolicy;
 use crate::error::Result;
@@ -85,6 +85,18 @@ pub(crate) fn run_with_reconnect(
             Err(e) => {
                 let (transient, _, _) = classify_error(&e);
                 if attempt < plan.tuning.max_retries && transient {
+                    // Guard: if a file was already committed to the destination, retrying
+                    // from the same cursor would re-read the same rows and produce duplicates.
+                    if summary.files_committed > 0 {
+                        return Err(anyhow::anyhow!(
+                            "export '{}': transient error after {} file(s) written to destination \
+                             — cannot safely retry (would duplicate rows). \
+                             Run `rivet reconcile` to verify state. Original error: {:#}",
+                            plan.export_name,
+                            summary.files_committed,
+                            e
+                        ));
+                    }
                     last_err = Some(e);
                     continue;
                 }
@@ -256,6 +268,7 @@ pub(super) fn run_single_export(
             format!("{}_{}.{}", plan.export_name, ts, ext)
         };
         dest.write(part.tmp.path(), &file_name)?;
+        summary.files_committed += 1;
 
         // Test fault-point #2: dest.write() just succeeded, but the manifest
         // has NOT been updated yet.  Reproduces the ADR-0001 I2→I3 crash
@@ -296,11 +309,8 @@ pub(super) fn run_single_export(
         crate::test_hook::maybe_panic_at("after_manifest_update");
     }
 
-    if let Some(cursor_col) = plan.strategy.cursor_extract_column()
-        && let (Some(batch), Some(schema), Some(st)) = (&sink.last_batch, &sink.schema, state)
-        && let Some(last_val) = extract_last_cursor_value(batch, cursor_col, schema)
-    {
-        st.update(&plan.export_name, &last_val)?;
+    if let (Some(last_val), Some(st)) = (&sink.last_cursor_value, state) {
+        st.update(&plan.export_name, last_val)?;
 
         // Test fault-point #4: cursor advanced, but the final run metric
         // (record_metric at the outer pipeline loop) has NOT been recorded.
@@ -314,7 +324,7 @@ pub(super) fn run_single_export(
         );
         // Epic G: record committed boundary for progression reporting.
         if let Err(e) =
-            st.record_committed_incremental(&plan.export_name, &last_val, &summary.run_id)
+            st.record_committed_incremental(&plan.export_name, last_val, &summary.run_id)
         {
             log::warn!(
                 "export '{}': committed boundary update failed: {:#}",

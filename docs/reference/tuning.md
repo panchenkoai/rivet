@@ -49,7 +49,7 @@ A profile sets sensible defaults for all tuning parameters. Individual fields ov
 | `max_retries` | 1 | 3 | 5 |
 | `retry_backoff_ms` | 1,000 | 2,000 | 5,000 |
 | `lock_timeout_s` | 0 (none) | 30 | 10 |
-| `memory_threshold_mb` | 0 (none) | 0 (none) | 0 (none) |
+| `memory_threshold_mb` | 0 (none) | 4,096 | 2,048 |
 
 ### When to use each profile
 
@@ -71,7 +71,7 @@ A profile sets sensible defaults for all tuning parameters. Individual fields ov
 | `max_retries` | integer | profile default | Max retry attempts for transient errors |
 | `retry_backoff_ms` | integer | profile default | Base delay between retries in ms (exponential backoff) |
 | `lock_timeout_s` | integer | profile default | Database lock timeout in seconds (0 = no timeout) |
-| `memory_threshold_mb` | integer | 0 | RSS threshold in MB; pauses fetching if exceeded (0 = disabled) |
+| `memory_threshold_mb` | integer | profile default | RSS threshold in MB; pauses fetching if exceeded (0 = disabled). `balanced` defaults to 4096, `safe` to 2048, `fast` to 0 (no limit). |
 
 ## Choosing `batch_size`
 
@@ -173,7 +173,7 @@ source:
     memory_threshold_mb: 1024   # pause fetching above 1 GB RSS
 ```
 
-The guard adds ~1–2 ms of overhead per batch from the RSS syscall; it is zero-overhead when unset.
+The guard adds ~1–2 ms of overhead per batch from the RSS syscall. It is enabled by default on `balanced` (4096 MB) and `safe` (2048 MB) profiles; set `memory_threshold_mb: 0` to disable it.
 
 ### Parallelism and source capacity
 

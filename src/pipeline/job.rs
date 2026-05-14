@@ -144,6 +144,7 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
         total_rows: 0,
         files_produced: 0,
         bytes_written: 0,
+        files_committed: 0,
         duration_ms: 0,
         peak_rss_mb: 0,
         retries: 0,

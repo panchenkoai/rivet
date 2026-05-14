@@ -28,6 +28,7 @@ fn stub_summary(status: &str) -> RunSummary {
         total_rows: 100,
         files_produced: 1,
         bytes_written: 1024,
+        files_committed: 1,
         duration_ms: 500,
         peak_rss_mb: 10,
         retries: 0,

@@ -34,12 +34,13 @@ pub(crate) struct ExportSink {
     pub(in crate::pipeline) tmp: tempfile::NamedTempFile,
     pub(in crate::pipeline) total_rows: usize,
     pub(in crate::pipeline) part_rows: usize,
-    /// Last batch WITH internal columns still present — used for cursor extraction
-    /// (e.g. `_rivet_coalesced_cursor`). Destination-facing batches (stripped of
-    /// internal columns) are built on the fly in `on_batch`.
-    pub(in crate::pipeline) last_batch: Option<RecordBatch>,
-    /// Schema WITH internal columns — matches `last_batch`. `extract_last_cursor_value`
-    /// indexes by column name, so this must include the synthetic coalesce column when present.
+    /// Cursor column name (with internal columns), set from plan at construction.
+    /// When `Some`, `on_batch` extracts the last cursor value inline so we never
+    /// hold a full batch in memory just for post-run cursor commit.
+    pub(in crate::pipeline) cursor_column: Option<String>,
+    /// Last extracted cursor value — set by `on_batch`, consumed by `run_single_export`.
+    pub(in crate::pipeline) last_cursor_value: Option<String>,
+    /// Schema WITH internal columns — used in `on_batch` for inline cursor extraction.
     pub(in crate::pipeline) schema: Option<SchemaRef>,
     /// Destination-facing schema (stripped of internal columns). Used for schema-change
     /// detection against the stored snapshot.
@@ -49,7 +50,7 @@ pub(crate) struct ExportSink {
     pub(in crate::pipeline) exported_at_us: i64,
     pub(in crate::pipeline) quality_null_counts: std::collections::HashMap<String, usize>,
     pub(in crate::pipeline) quality_unique_sets:
-        std::collections::HashMap<String, std::collections::HashSet<String>>,
+        std::collections::HashMap<String, std::collections::HashSet<u64>>,
     pub(in crate::pipeline) quality_columns: Option<crate::config::QualityConfig>,
     /// Column index cache for quality tracking — built once in `on_schema`.
     pub(in crate::pipeline) quality_null_indices: Vec<(usize, String)>,
@@ -81,7 +82,8 @@ impl ExportSink {
             tmp,
             total_rows: 0,
             part_rows: 0,
-            last_batch: None,
+            cursor_column: plan.strategy.cursor_extract_column().map(str::to_string),
+            last_cursor_value: None,
             schema: None,
             dest_schema: None,
             meta: plan.meta_columns.clone(),
@@ -145,7 +147,7 @@ impl ExportSink {
             let fmt =
                 format::create_format(self.format_type, self.compression, self.compression_level);
             let file = self.tmp.as_file().try_clone()?;
-            let buf_writer = BufWriter::new(file);
+            let buf_writer = BufWriter::with_capacity(256 * 1024, file);
             self.writer = Some(fmt.create_writer(schema, Box::new(buf_writer))?);
         }
 
@@ -164,7 +166,13 @@ impl ExportSink {
             *self.quality_null_counts.entry(name.clone()).or_default() +=
                 batch.column(*i).null_count();
         }
+        if self.quality_unique_indices.is_empty() {
+            return;
+        }
+        use std::io::Write as _;
+        use xxhash_rust::xxh3::xxh3_64;
         let fmt_options = arrow::util::display::FormatOptions::default();
+        let mut scratch = Vec::with_capacity(64);
         for (i, name) in &self.quality_unique_indices {
             let col = batch.column(*i);
             let set = self.quality_unique_sets.entry(name.clone()).or_default();
@@ -172,7 +180,9 @@ impl ExportSink {
                 arrow::util::display::ArrayFormatter::try_new(col.as_ref(), &fmt_options)
             {
                 for row in 0..col.len() {
-                    set.insert(formatter.value(row).to_string());
+                    scratch.clear();
+                    let _ = write!(scratch, "{}", formatter.value(row));
+                    set.insert(xxh3_64(&scratch));
                 }
             }
         }
@@ -324,9 +334,11 @@ impl BatchSink for ExportSink {
         if let Some(w) = self.writer.as_mut() {
             w.write_batch(&output)?;
         }
-        // Keep the RAW batch (with internal columns) so cursor extraction can
-        // read the synthetic coalesce column after the run finishes.
-        self.last_batch = Some(batch.clone());
+        // Extract cursor value inline so the batch can be freed immediately after
+        // on_batch returns — avoids holding one full batch in memory for the rest of the run.
+        if let (Some(col), Some(schema)) = (&self.cursor_column, &self.schema) {
+            self.last_cursor_value = extract_last_cursor_value(batch, col, schema);
+        }
         self.maybe_split()?;
         Ok(())
     }
@@ -762,9 +774,9 @@ mod tests {
         let mut sink = minimal_sink_with_quality(vec![], vec!["id".into()]);
         sink.total_rows = 5;
         let mut set = std::collections::HashSet::new();
-        set.insert("1".into());
-        set.insert("2".into());
-        set.insert("3".into());
+        set.insert(0u64);
+        set.insert(1u64);
+        set.insert(2u64);
         sink.quality_unique_sets.insert("id".into(), set);
         let issues = sink.run_quality_checks();
         assert_eq!(issues.len(), 1);
@@ -782,7 +794,8 @@ mod tests {
             tmp: tempfile::NamedTempFile::new().unwrap(),
             total_rows: 0,
             part_rows: 0,
-            last_batch: None,
+            cursor_column: None,
+            last_cursor_value: None,
             schema: None,
             dest_schema: None,
             meta: crate::config::MetaColumns::default(),

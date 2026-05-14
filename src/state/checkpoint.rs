@@ -58,20 +58,28 @@ impl StateStore {
     }
 
     pub fn insert_chunk_tasks(&self, run_id: &str, ranges: &[(i64, i64)]) -> Result<()> {
-        let now = chrono::Utc::now().to_rfc3339();
-        let mut stmt = self.conn.prepare(
-            "INSERT INTO chunk_task (run_id, chunk_index, start_key, end_key, status, attempts, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5)",
-        )?;
-        for (i, (start, end)) in ranges.iter().enumerate() {
-            stmt.execute(rusqlite::params![
-                run_id,
-                i as i64,
-                start.to_string(),
-                end.to_string(),
-                now,
-            ])?;
+        if ranges.is_empty() {
+            return Ok(());
         }
+        let now = chrono::Utc::now().to_rfc3339();
+        // Wrap in an explicit transaction: N inserts become one WAL sync instead of N.
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO chunk_task (run_id, chunk_index, start_key, end_key, status, attempts, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5)",
+            )?;
+            for (i, (start, end)) in ranges.iter().enumerate() {
+                stmt.execute(rusqlite::params![
+                    run_id,
+                    i as i64,
+                    start.to_string(),
+                    end.to_string(),
+                    now,
+                ])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
