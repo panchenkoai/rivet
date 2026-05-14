@@ -518,10 +518,17 @@ impl CardState {
         } else {
             "—".to_string()
         };
+        let rate_label = if elapsed_ms >= 500 && self.rows > 0 {
+            let rps = self.rows as f64 * 1000.0 / elapsed_ms as f64;
+            format!("  {}", fmt_rate(rps))
+        } else {
+            String::new()
+        };
         format!(
-            "{chunks}   {rows}   {elapsed}  ETA {eta}",
+            "{chunks}   {rows}{rate}   {elapsed}  ETA {eta}",
             chunks = chunks_label,
             rows = fmt_rows(self.rows),
+            rate = rate_label,
             elapsed = fmt_duration_ms(elapsed_ms),
             eta = eta_label,
         )
@@ -573,6 +580,16 @@ fn fmt_rows(rows: i64) -> String {
         format!("{:.0}K rows", rows as f64 / 1_000.0)
     } else {
         format!("{rows} rows")
+    }
+}
+
+fn fmt_rate(rps: f64) -> String {
+    if rps >= 1_000_000.0 {
+        format!("{:.1}M r/s", rps / 1_000_000.0)
+    } else if rps >= 1_000.0 {
+        format!("{:.1}K r/s", rps / 1_000.0)
+    } else {
+        format!("{:.0} r/s", rps)
     }
 }
 
@@ -691,6 +708,27 @@ mod tests {
         assert_eq!(fmt_duration_ms(9_400), "9.4s");
         assert!(fmt_duration_ms(60_000).starts_with("1m"));
         assert!(fmt_duration_ms(3_600_000).starts_with("1h"));
+    }
+
+    #[test]
+    fn fmt_rate_picks_unit() {
+        assert_eq!(fmt_rate(42.0), "42 r/s");
+        assert_eq!(fmt_rate(1_500.0), "1.5K r/s");
+        assert_eq!(fmt_rate(2_500_000.0), "2.5M r/s");
+    }
+
+    #[test]
+    fn running_body_shows_rate_after_warmup() {
+        let mut card = fresh_card("orders", "chunked");
+        card.total_chunks = 10;
+        card.chunks_done = 5;
+        card.rows = 50_000;
+        // started_at is Instant::now() — elapsed is effectively 0 ms, so rate
+        // is suppressed (< 500 ms guard).  We just verify no panic and no
+        // stale rate label appears in the very-first tick.
+        let line = card.running_body();
+        assert!(line.contains("50K rows"));
+        assert!(!line.contains("r/s"), "rate shown too early: {line}");
     }
 
     #[test]

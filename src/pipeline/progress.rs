@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
@@ -50,6 +50,7 @@ struct HandleInner {
     /// in-process channel for `--parallel-exports`).  Worker `inc()` calls
     /// emit a `Progress` event when this is set.
     capturing: bool,
+    started_at: Instant,
 }
 
 impl ChunkProgress {
@@ -83,6 +84,7 @@ impl ChunkProgress {
             export_name: export_name.to_string(),
             chunks_done: AtomicU64::new(0),
             capturing,
+            started_at: Instant::now(),
         });
 
         if capturing {
@@ -149,7 +151,14 @@ impl ChunkProgressHandle {
     /// hidden mode) and emits a `Progress` event when a unified UI is
     /// active (parallel-export-processes child or `--parallel-exports`).
     pub(crate) fn inc(&self, total_rows_so_far: i64) {
-        self.bar.set_message(fmt_rows(total_rows_so_far));
+        let elapsed = self.inner.started_at.elapsed().as_secs_f64();
+        let msg = if elapsed >= 0.5 && total_rows_so_far > 0 {
+            let rps = total_rows_so_far as f64 / elapsed;
+            format!("{}  {}", fmt_rows(total_rows_so_far), fmt_rate(rps))
+        } else {
+            fmt_rows(total_rows_so_far)
+        };
+        self.bar.set_message(msg);
         self.bar.inc(1);
         let chunks_done = self.inner.chunks_done.fetch_add(1, Ordering::Relaxed) + 1;
         if self.inner.capturing {
@@ -180,6 +189,16 @@ fn fmt_rows(rows: i64) -> String {
     }
 }
 
+fn fmt_rate(rps: f64) -> String {
+    if rps >= 1_000_000.0 {
+        format!("{:.1}M r/s", rps / 1_000_000.0)
+    } else if rps >= 1_000.0 {
+        format!("{:.1}K r/s", rps / 1_000.0)
+    } else {
+        format!("{:.0} r/s", rps)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +218,12 @@ mod tests {
         assert_eq!(fmt_rows(500), "500 rows");
         assert_eq!(fmt_rows(1_500), "2K rows");
         assert_eq!(fmt_rows(2_500_000), "2.5M rows");
+    }
+
+    #[test]
+    fn fmt_rate_picks_unit() {
+        assert_eq!(fmt_rate(42.0), "42 r/s");
+        assert_eq!(fmt_rate(1_500.0), "1.5K r/s");
+        assert_eq!(fmt_rate(2_500_000.0), "2.5M r/s");
     }
 }
