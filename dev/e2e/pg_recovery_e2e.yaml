@@ -21,6 +21,8 @@ exports:
     destination:
       type: local
       path: ./dev/e2e/output
+    columns:
+      price: decimal(10,2)
 
   - name: recovery_chunked_ckpt
     query: "SELECT id, user_id, product, quantity, price, status, ordered_at FROM orders"
@@ -33,3 +35,5 @@ exports:
     destination:
       type: local
       path: ./dev/e2e/output
+    columns:
+      price: decimal(10,2)

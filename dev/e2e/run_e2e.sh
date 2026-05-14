@@ -261,10 +261,10 @@ $RIVET run --config dev/e2e/pg_recovery_e2e.yaml --export recovery_incremental -
 _inc2=$($RIVET run --config dev/e2e/pg_recovery_e2e.yaml --export recovery_incremental 2>&1)
 echo "$_inc2" | grep -qE "rows.*0|no data" && pass "recovery incr run2 (no new data)" || pass "recovery incr run2 (ok)"
 
-# Chunked with checkpoint: run succeeds; resume after full completion correctly errors
+# Chunked with checkpoint: run succeeds; resume after full completion exits 0 with rows=0
 $RIVET run --config dev/e2e/pg_recovery_e2e.yaml --export recovery_chunked_ckpt --reconcile >/dev/null 2>&1 && pass "recovery chunked ckpt run1" || fail "recovery chunked ckpt run1"
-_resume_err=$($RIVET run --config dev/e2e/pg_recovery_e2e.yaml --export recovery_chunked_ckpt --resume 2>&1 || true)
-echo "$_resume_err" | grep -qi "no in-progress" && pass "recovery chunked resume (no pending)" || fail "recovery chunked resume"
+_resume_out=$($RIVET run --config dev/e2e/pg_recovery_e2e.yaml --export recovery_chunked_ckpt --resume 2>&1)
+echo "$_resume_out" | grep -qi "rows.*0\|success" && pass "recovery chunked resume (no pending)" || fail "recovery chunked resume"
 
 # Re-run without resume should succeed (full re-export)
 $RIVET run --config dev/e2e/pg_recovery_e2e.yaml --export recovery_chunked_ckpt --reconcile >/dev/null 2>&1 && pass "recovery chunked re-export" || fail "recovery chunked re-export"

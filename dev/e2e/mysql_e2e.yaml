@@ -16,6 +16,8 @@ exports:
     destination:
       type: local
       path: ./dev/e2e/output
+    columns:
+      balance: decimal(12,2)
 
   - name: mysql_users_full_parquet
     query: "SELECT id, name, email, age, balance, is_active, created_at FROM users"
@@ -24,6 +26,8 @@ exports:
     destination:
       type: local
       path: ./dev/e2e/output
+    columns:
+      balance: decimal(12,2)
 
   # --- Incremental mode ---
   - name: mysql_orders_incremental
@@ -34,6 +38,8 @@ exports:
     destination:
       type: local
       path: ./dev/e2e/output
+    columns:
+      price: decimal(10,2)
 
   # --- Chunked mode ---
   - name: mysql_orders_chunked
@@ -46,6 +52,8 @@ exports:
     destination:
       type: local
       path: ./dev/e2e/output
+    columns:
+      price: decimal(10,2)
 
   # --- Chunked mode — date-based partitioning ---
   - name: mysql_orders_date_chunked
@@ -57,6 +65,8 @@ exports:
     destination:
       type: local
       path: ./dev/e2e/output
+    columns:
+      price: decimal(10,2)
 
   # --- Time-window mode ---
   - name: mysql_events_timewindow
