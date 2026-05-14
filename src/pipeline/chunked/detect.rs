@@ -104,6 +104,7 @@ pub(crate) fn detect_and_generate_chunks(
     base_query: &str,
     chunk_column: &str,
     chunk_size: usize,
+    chunk_count: Option<usize>,
     export_name: &str,
     chunk_dense: bool,
     chunk_by_days: Option<u32>,
@@ -211,16 +212,27 @@ pub(crate) fn detect_and_generate_chunks(
         .and_then(|s| s.trim().parse::<i64>().ok())
         .unwrap_or(0);
 
+    let effective_chunk_size = if let Some(count) = chunk_count {
+        let span = (max_val - min_val).max(0) as usize + 1;
+        span.div_ceil(count)
+    } else {
+        chunk_size
+    };
+
     log::info!(
-        "export '{}': chunk_column `{}` range {} .. {} (chunk_size={})",
+        "export '{}': chunk_column `{}` range {} .. {} ({})",
         export_name,
         chunk_column,
         min_val,
         max_val,
-        chunk_size
+        if let Some(count) = chunk_count {
+            format!("chunk_count={count}, effective chunk_size={effective_chunk_size}")
+        } else {
+            format!("chunk_size={effective_chunk_size}")
+        }
     );
 
-    let chunks = generate_chunks(min_val, max_val, chunk_size as i64);
+    let chunks = generate_chunks(min_val, max_val, effective_chunk_size as i64);
 
     match query_wrapped_row_count(src, base_query) {
         Ok(row_count) => {
@@ -315,6 +327,7 @@ mod tests {
             "SELECT id FROM orders",
             "id",
             chunk_size,
+            None,
             "orders",
             chunk_dense,
             chunk_by_days,
@@ -433,5 +446,66 @@ mod tests {
         let chunks = detect(&mut src, 10_000, false, Some(7)).unwrap();
         // 30 days / 7 = 5 chunks (days 0..29, each 7 except last)
         assert_eq!(chunks.len(), 5, "expected 5 windows, got: {chunks:?}");
+    }
+
+    // ── chunk_count path ────────────────────────────────────────────────────
+
+    fn detect_with_count(
+        src: &mut dyn crate::source::Source,
+        chunk_count: usize,
+    ) -> Result<Vec<(i64, i64)>> {
+        detect_and_generate_chunks(
+            src,
+            "SELECT id FROM orders",
+            "id",
+            100_000, // chunk_size ignored when chunk_count is Some
+            Some(chunk_count),
+            "orders",
+            false,
+            None,
+            SourceType::Postgres,
+        )
+    }
+
+    #[test]
+    fn chunk_count_divides_range_into_exact_n_chunks() {
+        // min=1, max=1000, COUNT=500 → requested 10 chunks of size 100 each
+        let mut src = ScriptedSource::new([ok("1"), ok("1000"), ok("500")]);
+        let chunks = detect_with_count(&mut src, 10).unwrap();
+        assert_eq!(chunks.len(), 10, "expected 10 chunks: {chunks:?}");
+        assert_eq!(chunks[0].0, 1);
+        assert_eq!(chunks[9].1, 1000);
+    }
+
+    #[test]
+    fn chunk_count_ceiling_division_produces_at_most_n_chunks() {
+        // min=1, max=100 (100 values), chunk_count=7 → ceil(100/7)=15 per chunk → 7 chunks
+        let mut src = ScriptedSource::new([ok("1"), ok("100"), ok("70")]);
+        let chunks = detect_with_count(&mut src, 7).unwrap();
+        assert!(
+            chunks.len() <= 7,
+            "must produce at most 7 chunks, got {}: {chunks:?}",
+            chunks.len()
+        );
+        assert_eq!(chunks.first().unwrap().0, 1);
+        assert_eq!(chunks.last().unwrap().1, 100);
+    }
+
+    #[test]
+    fn chunk_count_1_produces_single_full_range_chunk() {
+        let mut src = ScriptedSource::new([ok("1"), ok("999"), ok("500")]);
+        let chunks = detect_with_count(&mut src, 1).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], (1, 999));
+    }
+
+    #[test]
+    fn chunk_count_larger_than_range_caps_at_range_size() {
+        // min=1, max=5 (5 values), chunk_count=100 → chunk_size=1 → 5 chunks
+        let mut src = ScriptedSource::new([ok("1"), ok("5"), ok("5")]);
+        let chunks = detect_with_count(&mut src, 100).unwrap();
+        assert_eq!(chunks.len(), 5, "got: {chunks:?}");
+        assert_eq!(chunks[0], (1, 1));
+        assert_eq!(chunks[4], (5, 5));
     }
 }

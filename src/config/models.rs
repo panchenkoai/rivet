@@ -331,6 +331,10 @@ pub struct ExportConfig {
     pub chunk_dense: bool,
     #[serde(default = "default_chunk_size")]
     pub chunk_size: usize,
+    /// Divide the column range into exactly this many equal chunks.
+    /// Mutually exclusive with `chunk_dense` and `chunk_by_days`.
+    /// When set, `chunk_size` is computed dynamically from min/max.
+    pub chunk_count: Option<usize>,
     pub chunk_by_days: Option<u32>,
     #[serde(default = "default_parallel")]
     pub parallel: usize,
@@ -857,6 +861,7 @@ mod tests {
             chunk_column: None,
             chunk_dense: false,
             chunk_size: 100_000,
+            chunk_count: None,
             chunk_by_days: None,
             parallel: 1,
             time_column: None,

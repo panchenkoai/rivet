@@ -43,6 +43,7 @@ pub(crate) fn run_chunked_sequential(
             &plan.base_query,
             &cp.column,
             cp.chunk_size,
+            cp.chunk_count,
             &plan.export_name,
             cp.dense,
             cp.by_days,
@@ -186,6 +187,7 @@ pub(crate) fn run_chunked_parallel(
                 &plan.base_query,
                 &cp.column,
                 cp.chunk_size,
+                cp.chunk_count,
                 &plan.export_name,
                 cp.dense,
                 cp.by_days,
@@ -443,6 +445,7 @@ mod tests {
             strategy: ExtractionStrategy::Chunked(ChunkedPlan {
                 column: "id".into(),
                 chunk_size: 100,
+                chunk_count: None,
                 parallel: 1,
                 dense: false,
                 by_days: None,

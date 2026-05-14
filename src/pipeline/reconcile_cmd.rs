@@ -285,6 +285,7 @@ mod tests {
             strategy: ExtractionStrategy::Chunked(ChunkedPlan {
                 column: "id".into(),
                 chunk_size: 100,
+                chunk_count: None,
                 parallel: 1,
                 dense: false,
                 by_days: None,

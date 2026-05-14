@@ -82,6 +82,7 @@ fn ensure_chunk_checkpoint_plan(
         &plan.base_query,
         &cp.column,
         cp.chunk_size,
+        cp.chunk_count,
         cp.dense,
         cp.by_days,
     );
@@ -267,6 +268,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
                 &plan.base_query,
                 &cp.column,
                 cp.chunk_size,
+                cp.chunk_count,
                 &plan.export_name,
                 cp.dense,
                 cp.by_days,
@@ -442,6 +444,7 @@ pub(super) fn run_chunked_parallel_checkpoint(
                     &plan.base_query,
                     &cp.column,
                     cp.chunk_size,
+                    cp.chunk_count,
                     &plan.export_name,
                     cp.dense,
                     cp.by_days,

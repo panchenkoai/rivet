@@ -244,6 +244,7 @@ mod tests {
         ExtractionStrategy::Chunked(ChunkedPlan {
             column: "id".into(),
             chunk_size: 10_000,
+            chunk_count: None,
             parallel: 1,
             dense: false,
             by_days: None,
@@ -546,6 +547,7 @@ mod tests {
         p.strategy = ExtractionStrategy::Chunked(ChunkedPlan {
             column: "id".into(),
             chunk_size: 10_000,
+            chunk_count: None,
             parallel: 4,
             dense: false,
             by_days: None,

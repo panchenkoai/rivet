@@ -13,6 +13,9 @@ use crate::tuning::SourceTuning;
 pub struct ChunkedPlan {
     pub column: String,
     pub chunk_size: usize,
+    /// Divide the column range into exactly this many equal chunks.
+    /// When Some, `chunk_size` is recomputed at detect time from min/max.
+    pub chunk_count: Option<usize>,
     pub parallel: usize,
     pub dense: bool,
     pub by_days: Option<u32>,
@@ -277,6 +280,7 @@ mod tests {
         let s = ExtractionStrategy::Chunked(ChunkedPlan {
             column: "id".into(),
             chunk_size: 10_000,
+            chunk_count: None,
             parallel: 1,
             dense: false,
             by_days: None,
@@ -294,6 +298,7 @@ mod tests {
         let s = ExtractionStrategy::Chunked(ChunkedPlan {
             column: "id".into(),
             chunk_size: 10_000,
+            chunk_count: None,
             parallel: 1,
             dense: false,
             by_days: None,

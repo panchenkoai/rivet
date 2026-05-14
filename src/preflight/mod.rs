@@ -204,6 +204,7 @@ mod tests {
             incremental_cursor_mode: IncrementalCursorMode::SingleColumn,
             chunk_column: None,
             chunk_size: 100_000,
+            chunk_count: None,
             parallel: 1,
             time_column: None,
             time_column_type: TimeColumnType::Timestamp,

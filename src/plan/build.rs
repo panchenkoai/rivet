@@ -64,6 +64,7 @@ pub fn build_plan(
             ExtractionStrategy::Chunked(ChunkedPlan {
                 column,
                 chunk_size: export.chunk_size,
+                chunk_count: export.chunk_count,
                 parallel: export.parallel,
                 dense: export.chunk_dense,
                 by_days: export.chunk_by_days,
@@ -194,6 +195,7 @@ mod tests {
             incremental_cursor_mode: IncrementalCursorMode::SingleColumn,
             chunk_column: None,
             chunk_size: 100_000,
+            chunk_count: None,
             chunk_dense: false,
             chunk_by_days: None,
             parallel: 1,

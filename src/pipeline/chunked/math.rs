@@ -99,6 +99,7 @@ pub(crate) fn chunk_plan_fingerprint(
     base_query: &str,
     chunk_column: &str,
     chunk_size: usize,
+    chunk_count: Option<usize>,
     chunk_dense: bool,
     chunk_by_days: Option<u32>,
 ) -> String {
@@ -108,12 +109,15 @@ pub(crate) fn chunk_plan_fingerprint(
     buf.push('\x1f');
     buf.push_str(chunk_column);
     buf.push('\x1f');
-    buf.push_str(&chunk_size.to_string());
-    buf.push('\x1f');
     match chunk_by_days {
         Some(d) => buf.push_str(&format!("date_{}d", d)),
         None if chunk_dense => buf.push_str("dense_rn"),
-        None => buf.push_str("range"),
+        None if chunk_count.is_some() => buf.push_str(&format!("count_{}", chunk_count.unwrap())),
+        None => {
+            buf.push_str(&chunk_size.to_string());
+            buf.push('\x1f');
+            buf.push_str("range");
+        }
     }
     format!("{:016x}", xxh3_64(buf.as_bytes()))
 }

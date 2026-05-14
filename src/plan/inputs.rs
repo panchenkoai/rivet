@@ -467,6 +467,7 @@ mod tests {
         let plan = minimal_plan(ExtractionStrategy::Chunked(ChunkedPlan {
             column: "id".into(),
             chunk_size: 1000,
+            chunk_count: None,
             parallel: 1,
             dense: false,
             by_days: None,

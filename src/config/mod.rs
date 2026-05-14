@@ -340,6 +340,21 @@ impl Config {
                             export.name
                         );
                     }
+                    if let Some(0) = export.chunk_count {
+                        anyhow::bail!("export '{}': chunk_count must be >= 1", export.name);
+                    }
+                    if export.chunk_count.is_some() && export.chunk_dense {
+                        anyhow::bail!(
+                            "export '{}': chunk_count and chunk_dense are mutually exclusive",
+                            export.name
+                        );
+                    }
+                    if export.chunk_count.is_some() && export.chunk_by_days.is_some() {
+                        anyhow::bail!(
+                            "export '{}': chunk_count and chunk_by_days are mutually exclusive",
+                            export.name
+                        );
+                    }
                 }
                 ExportMode::TimeWindow => {
                     if export.time_column.is_none() {
