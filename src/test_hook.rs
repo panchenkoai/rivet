@@ -13,9 +13,14 @@
 //!
 //! # Fault points
 //!
-//! Each call-site passes a stable string identifier (the "point name").
-//! See the inline `maybe_panic_at` call sites in `src/pipeline/single.rs`
-//! for the complete list.
+//! | Point | Used in | Trigger format |
+//! |---|---|---|
+//! | `after_source_read` | `single.rs` | `RIVET_TEST_PANIC_AT=after_source_read` |
+//! | `after_file_write` | `single.rs` | `RIVET_TEST_PANIC_AT=after_file_write` |
+//! | `after_manifest_update` | `single.rs` | `RIVET_TEST_PANIC_AT=after_manifest_update` |
+//! | `after_cursor_commit` | `single.rs` | `RIVET_TEST_PANIC_AT=after_cursor_commit` |
+//! | `after_chunk_file:{N}` | `chunked/mod.rs` | `RIVET_TEST_PANIC_AT=after_chunk_file:0` |
+//! | `after_chunk_complete:{N}` | `chunked/mod.rs` | `RIVET_TEST_PANIC_AT=after_chunk_complete:0` |
 //!
 //! # Test usage
 //!
@@ -23,6 +28,12 @@
 //! // cause rivet to panic between dest.write() and state.update()
 //! let out = Command::new(RIVET_BIN)
 //!     .env("RIVET_TEST_PANIC_AT", "after_file_write")
+//!     .args(...)
+//!     .output();
+//!
+//! // crash after chunk 0 is marked complete in the state DB
+//! let out = Command::new(RIVET_BIN)
+//!     .env("RIVET_TEST_PANIC_AT", "after_chunk_complete:0")
 //!     .args(...)
 //!     .output();
 //! ```
@@ -46,5 +57,21 @@ pub(crate) fn maybe_panic_at(point: &str) {
         && configured == point
     {
         panic!("rivet test-hook: injected crash at '{point}' (RIVET_TEST_PANIC_AT)");
+    }
+}
+
+/// Panic if the current chunk-level fault point matches `"{point}:{chunk_index}"`.
+///
+/// Configure via `RIVET_TEST_PANIC_AT=after_chunk_complete:0` to crash after
+/// chunk 0 is marked complete, or `after_chunk_file:0` to crash after the file
+/// is written to the destination but before the chunk task is committed.
+#[inline]
+pub(crate) fn maybe_panic_at_chunk(point: &str, chunk_index: i64) {
+    if let Some(configured) = configured_point()
+        && *configured == format!("{point}:{chunk_index}")
+    {
+        panic!(
+            "rivet test-hook: injected crash at '{point}' chunk {chunk_index} (RIVET_TEST_PANIC_AT)"
+        );
     }
 }

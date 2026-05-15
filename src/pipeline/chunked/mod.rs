@@ -353,7 +353,9 @@ pub(crate) fn run_chunked_sequential_checkpoint(
                     rows: rows as i64,
                     file_name: fname.clone(),
                 });
+                crate::test_hook::maybe_panic_at_chunk("after_chunk_file", chunk_index);
                 state.complete_chunk_task(&run_id, chunk_index, rows as i64, fname.as_deref())?;
+                crate::test_hook::maybe_panic_at_chunk("after_chunk_complete", chunk_index);
             }
             Err(e) => {
                 let msg = format!("{:#}", e);
