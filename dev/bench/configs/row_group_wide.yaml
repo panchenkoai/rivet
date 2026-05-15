@@ -20,9 +20,9 @@ exports:
     compression_profile: balanced
     destination:
       type: local
-      path: "${BENCH_OUT:-/tmp/rivet_bench}/row_group_${TARGET_MB:-128}mb"
+      path: "${BENCH_RUN_OUT}"
     parquet:
       row_group_strategy: auto
-      target_row_group_mb: "${TARGET_MB:-128}"
+      target_row_group_mb: ${TARGET_MB}
     tuning:
       batch_size: 10000

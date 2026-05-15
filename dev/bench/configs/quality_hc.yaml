@@ -21,7 +21,7 @@ exports:
     compression_profile: balanced
     destination:
       type: local
-      path: "${BENCH_OUT:-/tmp/rivet_bench}/quality_cap"
+      path: "${BENCH_RUN_OUT}"
     quality:
       unique_columns: [uuid_col, email]
       unique_max_entries: 50000
@@ -35,7 +35,7 @@ exports:
     compression_profile: balanced
     destination:
       type: local
-      path: "${BENCH_OUT:-/tmp/rivet_bench}/quality_no_cap"
+      path: "${BENCH_RUN_OUT}"
     quality:
       unique_columns: [uuid_col, email]
     tuning:

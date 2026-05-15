@@ -17,9 +17,9 @@ exports:
     query: "SELECT id, score, category, flag, created_at FROM bench_narrow"
     mode: full
     format: parquet
-    compression_profile: "${COMPRESSION:-balanced}"
+    compression_profile: "${COMPRESSION}"
     destination:
       type: local
-      path: "${BENCH_OUT:-/tmp/rivet_bench}/compression_${COMPRESSION:-balanced}"
+      path: "${BENCH_RUN_OUT}"
     tuning:
       batch_size: 50000

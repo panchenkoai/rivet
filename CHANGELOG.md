@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.5.1 (2026-05-15)
+
+### Stabilization: correctness tests, benchmark evidence, best-practice docs
+
+This release closes the v0.5.x stabilization roadmap. No new features; all
+changes are tests, documentation, and benchmark infrastructure.
+
+#### Tests added
+
+- **`tests/gremlin.rs`** (G1–G5) — live fault tests covering `row_count_min`
+  on empty tables, exhausted incremental cursors, `unique_max_entries` cap
+  warning, `auto_shrink` + quality gate correctness, and crash-before-quality-check
+  recovery.
+- **`tests/live_chunked_recovery.rs`** (C1–C2) — chunked pipeline crash+resume
+  matrix. C1: crash after `complete_chunk_task` → resume skips completed chunk,
+  no duplicates. C2: crash after file written but before commit → chunk 0 stuck
+  in `running` → resume resets and re-runs it (at-least-once delivery documented).
+- **Chunk-level fault injection** (`src/test_hook.rs`, `src/pipeline/chunked/mod.rs`)
+  — new `maybe_panic_at_chunk("after_chunk_file", N)` and
+  `maybe_panic_at_chunk("after_chunk_complete", N)` hooks, matching
+  `RIVET_TEST_PANIC_AT=after_chunk_file:0` etc.
+
+#### Benchmark evidence
+
+Full Phase 2 benchmark suite run against live Postgres. Report:
+[docs/benchmark_report_v0.5.x.md](docs/benchmark_report_v0.5.x.md).
+
+Key results (measured, not estimated):
+
+| Claim | Result |
+|---|---|
+| `balanced` vs `none`: same wall time, 2.6× smaller output | ✓ confirmed |
+| `compact` adds no compression improvement over `balanced` on numeric data | ✓ confirmed |
+| Smaller row group targets cut RSS with zero wall-time cost | ✓ confirmed |
+| Memory policy cap: zero overhead when cap doesn't trigger | ✓ confirmed |
+| `auto_shrink` on wide real-world table: 5.7× RSS reduction (878 → 154 MB) | ✓ confirmed |
+| xxHash3-64 uniqueness tracking: < 1 MB overhead on 200K-row table | ✓ confirmed |
+
+#### Benchmark infrastructure fixes
+
+- Bench configs used `${VAR:-default}` bash syntax unsupported by Rivet's env
+  interpolation; replaced with plain `${VAR}`.
+- Integer fields (`target_row_group_mb`, `max_batch_memory_mb`) were quoted in
+  YAML, causing `invalid type: string` parse errors; removed quotes so values
+  interpolate as YAML integers.
+- `run_bench.sh`: added `--export` flag support; introduced `BENCH_RUN_OUT`
+  per-scenario output dir so each run writes to a clean, isolated path;
+  added output-dir cleanup before each scenario to prevent file accumulation.
+
+#### Documentation
+
+All v0.5.x best-practice guides are complete:
+
+- [Resource-aware extraction](docs/best-practices/resource-aware-extraction.md)
+- [Parquet tuning](docs/best-practices/parquet-tuning.md)
+- [Compression profiles](docs/best-practices/compression-profiles.md)
+- [Quality checks](docs/best-practices/quality-checks.md)
+- [Low-memory runners](docs/best-practices/low-memory-runners.md) — numbers measured, not estimated
+- [Recovery and resume](docs/best-practices/recovery-and-resume.md)
+- [Benchmark methodology](docs/best-practices/benchmark-methodology.md)
+
+README `Resource-aware extraction` section added. `rivet plan` memory estimate
+documented as advisory heuristic in `docs/reference/cli.md`.
+
+---
+
 ## 0.5.0 (2026-05-15)
 
 ### Parquet row group auto tuning

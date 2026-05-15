@@ -45,15 +45,25 @@ TIME_FMT="%e %U %S %M"    # elapsed real, user, sys, max RSS KB
 
 mkdir -p "$BENCH_OUT"
 
-# run_export LABEL CONFIG_PATH ENV_OVERRIDES...
+# run_export LABEL CONFIG_PATH [--export EXPORT_NAME] ENV_OVERRIDES...
 # Runs rivet export, captures metrics, stores in LAST_* globals.
+# Optional --export EXPORT_NAME selects a single export from the config.
 run_export() {
     local label="$1"
     local config="$2"
     shift 2
+
+    local export_flag=()
+    if [[ "${1:-}" == "--export" ]]; then
+        export_flag=(--export "$2")
+        shift 2
+    fi
+
     local env_args=("$@")
 
     local out_dir="$BENCH_OUT/$(echo "$label" | tr ' /' '__')"
+    # Clean previous run's output so file counts reflect only this run.
+    rm -rf "$out_dir"
     mkdir -p "$out_dir"
 
     local time_out
@@ -62,19 +72,19 @@ run_export() {
     rivet_stderr=$(mktemp)
 
     # Build env args for the child process
-    local env_prefix=()
+    local env_prefix=("BENCH_RUN_OUT=$out_dir")
     for kv in "${env_args[@]:-}"; do
         env_prefix+=("$kv")
     done
 
     local exit_code=0
     if [[ -n "$TIME_CMD" ]]; then
-        env "${env_prefix[@]}" "$TIME_CMD" --format="$TIME_FMT" --output="$time_out" \
-            "$RIVET" run --config "$config" \
+        env ${env_prefix[@]+"${env_prefix[@]}"} "$TIME_CMD" --format="$TIME_FMT" --output="$time_out" \
+            "$RIVET" run --config "$config" ${export_flag[@]+"${export_flag[@]}"} \
             2>"$rivet_stderr" || exit_code=$?
     else
-        env "${env_prefix[@]}" \
-            "$RIVET" run --config "$config" \
+        env ${env_prefix[@]+"${env_prefix[@]}"} \
+            "$RIVET" run --config "$config" ${export_flag[@]+"${export_flag[@]}"} \
             2>"$rivet_stderr" || exit_code=$?
         echo "0 0 0 0" > "$time_out"
     fi
@@ -171,17 +181,17 @@ run_quality() {
     # With cap
     run_export "quality_cap" \
         "dev/bench/configs/quality_hc.yaml" \
+        --export bench_quality_cap \
         "POSTGRES_URL=$POSTGRES_URL" \
-        "BENCH_OUT=$BENCH_OUT" \
-        "RIVET_EXPORT_NAME=bench_quality_cap"
+        "BENCH_OUT=$BENCH_OUT"
     print_row "unique_max_entries: 50 000"
 
     # Without cap (separate export in the same config)
     run_export "quality_no_cap" \
         "dev/bench/configs/quality_hc.yaml" \
+        --export bench_quality_no_cap \
         "POSTGRES_URL=$POSTGRES_URL" \
-        "BENCH_OUT=$BENCH_OUT" \
-        "RIVET_EXPORT_NAME=bench_quality_no_cap"
+        "BENCH_OUT=$BENCH_OUT"
     print_row "no cap"
 }
 

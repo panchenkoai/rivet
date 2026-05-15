@@ -21,11 +21,11 @@ exports:
     compression_profile: balanced
     destination:
       type: local
-      path: "${BENCH_OUT:-/tmp/rivet_bench}/batch_memory_${POLICY:-auto_shrink}"
+      path: "${BENCH_RUN_OUT}"
     parquet:
       row_group_strategy: auto
       target_row_group_mb: 64
     tuning:
       batch_size: 10000
-      max_batch_memory_mb: "${CAP_MB:-64}"
-      on_batch_memory_exceeded: "${POLICY:-auto_shrink}"
+      max_batch_memory_mb: ${CAP_MB}
+      on_batch_memory_exceeded: "${POLICY}"
