@@ -107,6 +107,7 @@ exports:
     mode: chunked
     chunk_column: id
     chunk_size: 50
+    chunk_checkpoint: true
     format: parquet
     destination: {{type: local, path: {dir}}}
 "#,
@@ -210,6 +211,7 @@ exports:
     mode: chunked
     chunk_column: id
     chunk_size: 50
+    chunk_checkpoint: true
     format: parquet
     destination: {{type: local, path: {dir}}}
 "#,
