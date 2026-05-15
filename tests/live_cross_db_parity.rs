@@ -40,6 +40,8 @@ exports:
     destination:
       type: local
       path: {dir}
+    columns:
+      amount: decimal(12,2)
 "#,
         dir = out_dir.display()
     );
@@ -252,6 +254,8 @@ exports:
     destination:
       type: local
       path: {dir}
+    columns:
+      amount: decimal(12,2)
 "#,
             dir = out_dir.display()
         );
