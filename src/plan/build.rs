@@ -110,13 +110,14 @@ pub fn build_plan(
         }
     };
 
+    let (compression, compression_level) = export.effective_compression();
     Ok(ResolvedRunPlan {
         export_name: export.name.clone(),
         base_query,
         strategy,
         format: export.format,
-        compression: export.compression,
-        compression_level: export.compression_level,
+        compression,
+        compression_level,
         max_file_size_bytes: export.max_file_size_bytes(),
         skip_empty: export.skip_empty,
         meta_columns: export.meta_columns.clone(),
@@ -131,6 +132,7 @@ pub fn build_plan(
         column_overrides: parse_column_overrides(&export.columns, &export.name)?,
         schema_drift_policy: export.on_schema_drift,
         shape_drift_warn_factor: export.shape_drift_warn_factor.unwrap_or(2.0),
+        parquet: export.parquet.clone(),
     })
 }
 
@@ -248,6 +250,7 @@ mod tests {
             format: FormatType::Parquet,
             compression: CompressionType::Zstd,
             compression_level: None,
+            compression_profile: None,
             skip_empty: false,
             destination: DestinationConfig {
                 destination_type: DestinationType::Local,
@@ -273,6 +276,7 @@ mod tests {
             columns: Default::default(),
             on_schema_drift: Default::default(),
             shape_drift_warn_factor: None,
+            parquet: None,
         }
     }
 

@@ -5,10 +5,151 @@
 
 use std::collections::{HashMap, HashSet};
 
-use arrow::array::Array;
+use arrow::array::{
+    Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float32Array,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
+    LargeStringArray, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+};
+use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
+use xxhash_rust::xxh3::xxh3_64;
 
 use crate::config::QualityConfig;
+
+/// Hash a single non-null array value using typed dispatch to avoid string formatting.
+/// Returns `None` for null values; caller skips those in uniqueness tracking.
+fn hash_value(array: &dyn Array, row: usize) -> Option<u64> {
+    if array.is_null(row) {
+        return None;
+    }
+    let h = match array.data_type() {
+        DataType::Boolean => {
+            let v = array.as_any().downcast_ref::<BooleanArray>()?.value(row);
+            xxh3_64(&[v as u8])
+        }
+        DataType::Int8 => xxh3_64(
+            &array
+                .as_any()
+                .downcast_ref::<Int8Array>()?
+                .value(row)
+                .to_le_bytes(),
+        ),
+        DataType::Int16 => xxh3_64(
+            &array
+                .as_any()
+                .downcast_ref::<Int16Array>()?
+                .value(row)
+                .to_le_bytes(),
+        ),
+        DataType::Int32 => xxh3_64(
+            &array
+                .as_any()
+                .downcast_ref::<Int32Array>()?
+                .value(row)
+                .to_le_bytes(),
+        ),
+        DataType::Int64 => xxh3_64(
+            &array
+                .as_any()
+                .downcast_ref::<Int64Array>()?
+                .value(row)
+                .to_le_bytes(),
+        ),
+        DataType::UInt8 => xxh3_64(
+            &array
+                .as_any()
+                .downcast_ref::<UInt8Array>()?
+                .value(row)
+                .to_le_bytes(),
+        ),
+        DataType::UInt16 => xxh3_64(
+            &array
+                .as_any()
+                .downcast_ref::<UInt16Array>()?
+                .value(row)
+                .to_le_bytes(),
+        ),
+        DataType::UInt32 => xxh3_64(
+            &array
+                .as_any()
+                .downcast_ref::<UInt32Array>()?
+                .value(row)
+                .to_le_bytes(),
+        ),
+        DataType::UInt64 => xxh3_64(
+            &array
+                .as_any()
+                .downcast_ref::<UInt64Array>()?
+                .value(row)
+                .to_le_bytes(),
+        ),
+        DataType::Float32 => {
+            let bits = array
+                .as_any()
+                .downcast_ref::<Float32Array>()?
+                .value(row)
+                .to_bits();
+            xxh3_64(&bits.to_le_bytes())
+        }
+        DataType::Float64 => {
+            let bits = array
+                .as_any()
+                .downcast_ref::<Float64Array>()?
+                .value(row)
+                .to_bits();
+            xxh3_64(&bits.to_le_bytes())
+        }
+        DataType::Decimal128(_, _) => xxh3_64(
+            &array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()?
+                .value(row)
+                .to_le_bytes(),
+        ),
+        DataType::Date32 => xxh3_64(
+            &array
+                .as_any()
+                .downcast_ref::<Date32Array>()?
+                .value(row)
+                .to_le_bytes(),
+        ),
+        DataType::Date64 => xxh3_64(
+            &array
+                .as_any()
+                .downcast_ref::<Date64Array>()?
+                .value(row)
+                .to_le_bytes(),
+        ),
+        DataType::Utf8 => xxh3_64(
+            array
+                .as_any()
+                .downcast_ref::<StringArray>()?
+                .value(row)
+                .as_bytes(),
+        ),
+        DataType::LargeUtf8 => xxh3_64(
+            array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()?
+                .value(row)
+                .as_bytes(),
+        ),
+        DataType::Binary => xxh3_64(array.as_any().downcast_ref::<BinaryArray>()?.value(row)),
+        DataType::LargeBinary => xxh3_64(
+            array
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()?
+                .value(row),
+        ),
+        _ => {
+            // Fallback for exotic types (Timestamp variants, Duration, etc.)
+            let options = arrow::util::display::FormatOptions::default();
+            let fmt = arrow::util::display::ArrayFormatter::try_new(array, &options).ok()?;
+            xxh3_64(fmt.value(row).to_string().as_bytes())
+        }
+    };
+    Some(h)
+}
 
 #[derive(Debug, Clone)]
 pub struct QualityIssue {
@@ -84,7 +225,11 @@ pub fn check_null_ratios(
     issues
 }
 
-pub fn check_uniqueness(batches: &[RecordBatch], columns: &[String]) -> Vec<QualityIssue> {
+pub fn check_uniqueness(
+    batches: &[RecordBatch],
+    columns: &[String],
+    max_entries: Option<usize>,
+) -> Vec<QualityIssue> {
     if columns.is_empty() {
         return Vec::new();
     }
@@ -97,25 +242,36 @@ pub fn check_uniqueness(batches: &[RecordBatch], columns: &[String]) -> Vec<Qual
     let mut issues = Vec::new();
 
     for col_name in columns {
-        let mut seen = HashSet::new();
+        let mut seen: HashSet<u64> = HashSet::new();
         let mut duplicates = 0usize;
+        let mut capped = false;
 
-        for batch in batches {
+        'batches: for batch in batches {
             if let Ok(idx) = batch.schema().index_of(col_name) {
                 let col = batch.column(idx);
-                let string_col = arrow::util::display::ArrayFormatter::try_new(
-                    col.as_ref(),
-                    &arrow::util::display::FormatOptions::default(),
-                );
-                if let Ok(formatter) = string_col {
-                    for row in 0..col.len() {
-                        let val = formatter.value(row).to_string();
-                        if !seen.insert(val) {
-                            duplicates += 1;
-                        }
+                for row in 0..col.len() {
+                    if max_entries.is_some_and(|limit| seen.len() >= limit) {
+                        capped = true;
+                        break 'batches;
+                    }
+                    if let Some(h) = hash_value(col.as_ref(), row)
+                        && !seen.insert(h)
+                    {
+                        duplicates += 1;
                     }
                 }
             }
+        }
+
+        if capped {
+            issues.push(QualityIssue {
+                severity: Severity::Warn,
+                message: format!(
+                    "column '{}': uniqueness check capped at {} entries; result may be incomplete",
+                    col_name,
+                    max_entries.unwrap_or(0)
+                ),
+            });
         }
 
         if duplicates > 0 {
@@ -141,7 +297,11 @@ pub fn run_checks(
     let mut all = Vec::new();
     all.extend(check_row_count(total_rows, config));
     all.extend(check_null_ratios(batches, &config.null_ratio_max));
-    all.extend(check_uniqueness(batches, &config.unique_columns));
+    all.extend(check_uniqueness(
+        batches,
+        &config.unique_columns,
+        config.unique_max_entries,
+    ));
     all
 }
 
@@ -170,6 +330,7 @@ mod tests {
             row_count_max: Some(100),
             null_ratio_max: HashMap::new(),
             unique_columns: vec![],
+            unique_max_entries: None,
         };
         assert!(check_row_count(50, &cfg).is_empty());
     }
@@ -181,6 +342,7 @@ mod tests {
             row_count_max: None,
             null_ratio_max: HashMap::new(),
             unique_columns: vec![],
+            unique_max_entries: None,
         };
         let issues = check_row_count(50, &cfg);
         assert_eq!(issues.len(), 1);
@@ -195,6 +357,7 @@ mod tests {
             row_count_max: Some(10),
             null_ratio_max: HashMap::new(),
             unique_columns: vec![],
+            unique_max_entries: None,
         };
         let issues = check_row_count(50, &cfg);
         assert_eq!(issues.len(), 1);
@@ -228,7 +391,7 @@ mod tests {
             &[Some(1), Some(2), Some(3)],
             &[Some("a"), Some("b"), Some("c")],
         );
-        let issues = check_uniqueness(&[batch], &["id".into()]);
+        let issues = check_uniqueness(&[batch], &["id".into()], None);
         assert!(issues.is_empty());
     }
 
@@ -238,7 +401,7 @@ mod tests {
             &[Some(1), Some(2), Some(1)],
             &[Some("a"), Some("b"), Some("c")],
         );
-        let issues = check_uniqueness(&[batch], &["id".into()]);
+        let issues = check_uniqueness(&[batch], &["id".into()], None);
         assert_eq!(issues.len(), 1);
         assert!(issues[0].message.contains("duplicate"));
     }
@@ -269,7 +432,7 @@ mod tests {
     fn uniqueness_multi_batch_detects_cross_batch_dupes() {
         let b1 = make_batch(&[Some(1), Some(2)], &[Some("a"), Some("b")]);
         let b2 = make_batch(&[Some(2), Some(3)], &[Some("c"), Some("d")]);
-        let issues = check_uniqueness(&[b1, b2], &["id".into()]);
+        let issues = check_uniqueness(&[b1, b2], &["id".into()], None);
         assert_eq!(issues.len(), 1, "id=2 duplicated across batches");
     }
 
@@ -287,7 +450,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let issues = check_uniqueness(&[empty], &["id".into()]);
+        let issues = check_uniqueness(&[empty], &["id".into()], None);
         assert!(issues.is_empty(), "empty batch → no duplicates");
     }
 
@@ -325,6 +488,7 @@ mod tests {
                 m
             },
             unique_columns: vec!["id".into()],
+            unique_max_entries: None,
         };
         let issues = run_checks(&cfg, &[batch], 3);
         assert!(
@@ -349,6 +513,7 @@ mod tests {
                 m
             },
             unique_columns: vec!["id".into()],
+            unique_max_entries: None,
         };
         let issues = run_checks(&cfg, &[batch], 3);
         assert!(issues.is_empty(), "all clean: {:?}", issues);
@@ -361,10 +526,38 @@ mod tests {
             row_count_max: Some(5),
             null_ratio_max: HashMap::new(),
             unique_columns: vec![],
+            unique_max_entries: None,
         };
         assert!(check_row_count(5, &cfg).is_empty(), "exactly on boundary");
         assert!(!check_row_count(4, &cfg).is_empty(), "one below min");
         assert!(!check_row_count(6, &cfg).is_empty(), "one above max");
+    }
+
+    #[test]
+    fn uniqueness_cap_emits_warn_and_stops() {
+        // 5 unique values but cap=3 → should warn; no duplicate issue since we stopped early
+        let batch = make_batch(
+            &[Some(1), Some(2), Some(3), Some(4), Some(5)],
+            &[Some("a"), Some("b"), Some("c"), Some("d"), Some("e")],
+        );
+        let issues = check_uniqueness(&[batch], &["id".into()], Some(3));
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.severity == Severity::Warn && i.message.contains("capped")),
+            "expected cap warning, got: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn uniqueness_cap_none_means_no_limit() {
+        let batch = make_batch(
+            &[Some(1), Some(2), Some(3)],
+            &[Some("a"), Some("b"), Some("c")],
+        );
+        let issues = check_uniqueness(&[batch], &["id".into()], None);
+        assert!(issues.is_empty(), "no cap → no issues on unique data");
     }
 
     #[test]

@@ -101,8 +101,9 @@ Each entry in the `exports` list defines one export job.
 | `query_file` | string | | — | Path to `.sql` file (relative to config dir) |
 | `mode` | `full` \| `incremental` \| `chunked` \| `time_window` | no | `full` | Export mode |
 | `format` | `parquet` \| `csv` | **yes** | — | Output format |
-| `compression` | `zstd` \| `snappy` \| `gzip` \| `lz4` \| `none` | no | `zstd` | Compression codec |
-| `compression_level` | integer | no | codec default | Compression level |
+| `compression` | `zstd` \| `snappy` \| `gzip` \| `lz4` \| `none` | no | `zstd` | Compression codec (low-level; prefer `compression_profile`) |
+| `compression_level` | integer | no | codec default | Compression level (low-level; prefer `compression_profile`) |
+| `compression_profile` | `none` \| `fast` \| `balanced` \| `compact` | no | — | High-level preset — overrides `compression` and `compression_level`. See [Compression profiles](#compression-profiles) below. |
 | `destination` | object | **yes** | — | Where to write output (see below) |
 | `skip_empty` | boolean | no | `false` | Skip file creation if 0 rows |
 | `max_file_size` | string | no | — | Split output: `"256MB"`, `"1GB"`, etc. |
@@ -114,6 +115,78 @@ Each entry in the `exports` list defines one export job.
 | `columns` | map | no | — | Per-column type overrides (see below) |
 | `on_schema_drift` | `warn`\|`continue`\|`fail` | no | `warn` | Policy when structural schema drift is detected (see below) |
 | `shape_drift_warn_factor` | float | no | `2.0` | Warn when a string/binary column's max byte length grows beyond `N × stored_max`. Set to `0` to disable shape tracking. |
+| `parquet` | object | no | — | Parquet row group tuning (Parquet format only). See [Parquet row group tuning](#parquet-row-group-tuning) below. |
+
+### Compression profiles
+
+`compression_profile` is the recommended way to pick a codec. It maps to a `(codec, level)` pair and takes precedence over any `compression` / `compression_level` fields.
+
+| Profile | Codec | Level | Best for |
+|---|---|---|---|
+| `none` | no compression | — | Debug, local scratch, fast iteration |
+| `fast` | snappy | — | Backfills, pilot runs, low-CPU environments |
+| `balanced` | zstd | 3 | **Default for production** — good ratio, moderate CPU |
+| `compact` | zstd | 9 | Storage- or network-cost-sensitive pipelines |
+
+```yaml
+exports:
+  - name: events
+    format: parquet
+    compression_profile: balanced    # zstd level 3
+    destination: { type: local, path: ./out }
+```
+
+If you need a specific codec that is not covered by the presets, use `compression` + `compression_level` directly and omit `compression_profile`.
+
+---
+
+### Parquet row group tuning
+
+Parquet row groups affect memory usage during write, compression ratio, and downstream query performance (predicate pushdown, column skipping). When `parquet:` is omitted, Rivet uses the library default of 1,048,576 rows per group, which is optimal for narrow tables but can be large for wide tables.
+
+```yaml
+exports:
+  - name: events
+    format: parquet
+    parquet:
+      row_group_strategy: auto          # auto | fixed_rows | fixed_memory
+      target_row_group_mb: 128          # target Arrow buffer size per group (auto + fixed_memory)
+      max_row_group_mb: 256             # optional upper bound (all strategies)
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `row_group_strategy` | `auto` \| `fixed_rows` \| `fixed_memory` | `auto` | How to determine row group size |
+| `row_group_rows` | integer | — | Exact rows per group; used with `fixed_rows` only |
+| `target_row_group_mb` | integer | `128` | Target Arrow buffer per group in MB; used with `auto` and `fixed_memory` |
+| `max_row_group_mb` | integer | — | Hard upper bound on group memory in MB (all strategies) |
+
+| Strategy | Behavior |
+|---|---|
+| `auto` | Estimates row width from schema column types, computes rows-per-group to hit `target_row_group_mb`. Narrow tables get large groups; wide tables get smaller groups. |
+| `fixed_rows` | Use `row_group_rows` exactly. Simple and deterministic, but does not adapt to row width. |
+| `fixed_memory` | Same math as `auto` (target / estimated row bytes), but the strategy name is explicit in logs. |
+
+**Examples:**
+
+```yaml
+# Auto-tune for a wide JSON table — groups sized to ~64 MB
+parquet:
+  row_group_strategy: auto
+  target_row_group_mb: 64
+  max_row_group_mb: 128
+
+# Fixed row count — useful when downstream tooling requires exact group sizes
+parquet:
+  row_group_strategy: fixed_rows
+  row_group_rows: 500000
+```
+
+> **Note:** `rivet plan` shows the selected strategy and target in the Format section when `parquet:` is configured.
+>
+> **`rivet init` auto-generates this block** for chunked exports and large full-mode tables, pre-selecting `target_row_group_mb: 64` for wide schemas (≥ 5 text/JSON/bytea columns) and `128` for narrow ones.
+
+---
 
 ### `exports[].on_schema_drift` — schema drift policy
 
@@ -254,6 +327,9 @@ Rivet exports the WKT text as a `Utf8` (string) column. Downstream tools (DuckDB
 | `row_count_max` | integer | Fail if more rows exported |
 | `null_ratio_max` | map (column → float) | Fail if null ratio exceeds threshold |
 | `unique_columns` | list of strings | Fail if values are not unique |
+| `unique_max_entries` | integer | Cap on distinct values tracked per column during uniqueness checks. When reached, a `Warn` is emitted and checking stops for that column. Prevents unbounded memory growth on high-cardinality columns (UUIDs, email addresses, event IDs). |
+
+Uniqueness tracking uses typed xxHash3-64 internally — numeric and binary columns are hashed directly from raw bytes without string formatting. `unique_max_entries` is the primary knob to control memory on very large tables.
 
 Example:
 
@@ -264,7 +340,13 @@ quality:
     email: 0.05          # email must be <5% null
   unique_columns:
     - id
+    - email
+  unique_max_entries: 1000000   # stop after 1M unique values; warn if limit hit
 ```
+
+**Without `unique_max_entries`** — tracking is unbounded. Safe for tables with hundreds of thousands of rows; may use significant RAM on tables with tens or hundreds of millions of distinct values.
+
+**With `unique_max_entries`** — tracking stops at the limit. The export succeeds but the run summary shows a warning. Use when you want a best-effort uniqueness check without memory risk.
 
 ---
 

@@ -179,6 +179,7 @@ mod tests {
             column_overrides: Default::default(),
             schema_drift_policy: Default::default(),
             shape_drift_warn_factor: 0.0,
+            parquet: None,
         }
     }
 

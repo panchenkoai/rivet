@@ -109,11 +109,12 @@ fn ensure_chunk_checkpoint_plan(
                 return Ok(rid);
             }
             None => {
-                log::warn!(
-                    "export '{}': --resume requested but no in-progress checkpoint found; starting a fresh run",
+                anyhow::bail!(
+                    "export '{}': --resume but no in-progress chunk checkpoint; \
+                     run without --resume first or `rivet state reset-chunks --config <cfg> --export {}`",
+                    plan.export_name,
                     plan.export_name
                 );
-                // fall through to create a new run below
             }
         }
     }
@@ -184,7 +185,7 @@ fn export_one_chunk_range(
         .map(|m| m.len())
         .unwrap_or(0);
 
-    let fmt = format::create_format(plan.format, plan.compression, plan.compression_level);
+    let fmt = format::create_format(plan.format, plan.compression, plan.compression_level, None);
     let file_name = format!(
         "{}_{}_chunk{}.{}",
         plan.export_name,
@@ -628,6 +629,7 @@ pub(super) fn run_chunked_parallel_checkpoint(
                                     plan_w.format,
                                     plan_w.compression,
                                     plan_w.compression_level,
+                                    None,
                                 );
                                 let file_name = format!(
                                     "{}_{}_chunk{}.{}",

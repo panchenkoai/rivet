@@ -29,12 +29,15 @@ pub fn create_format(
     format_type: FormatType,
     compression: CompressionType,
     compression_level: Option<u32>,
+    row_group_rows: Option<usize>,
 ) -> Box<dyn Format> {
     match format_type {
         FormatType::Csv => Box::new(csv::CsvFormat),
-        FormatType::Parquet => {
-            Box::new(parquet::ParquetFormat::new(compression, compression_level))
-        }
+        FormatType::Parquet => Box::new(parquet::ParquetFormat::new(
+            compression,
+            compression_level,
+            row_group_rows,
+        )),
     }
 }
 
@@ -60,7 +63,7 @@ mod tests {
     #[test]
     fn create_format_csv_extension_and_roundtrip() {
         let schema = schema();
-        let fmt = create_format(FormatType::Csv, CompressionType::None, None);
+        let fmt = create_format(FormatType::Csv, CompressionType::None, None, None);
         assert_eq!(fmt.file_extension(), "csv");
         let mut w = fmt
             .create_writer(&schema, Box::new(Vec::<u8>::new()))
@@ -72,7 +75,7 @@ mod tests {
     #[test]
     fn create_format_parquet_extension_and_roundtrip() {
         let schema = schema();
-        let fmt = create_format(FormatType::Parquet, CompressionType::Zstd, None);
+        let fmt = create_format(FormatType::Parquet, CompressionType::Zstd, None, None);
         assert_eq!(fmt.file_extension(), "parquet");
         let mut w = fmt
             .create_writer(&schema, Box::new(Vec::<u8>::new()))
@@ -84,7 +87,7 @@ mod tests {
     #[test]
     fn create_format_parquet_uncompressed_finish_ok() {
         let schema = schema();
-        let fmt = create_format(FormatType::Parquet, CompressionType::None, None);
+        let fmt = create_format(FormatType::Parquet, CompressionType::None, None, None);
         let w = fmt
             .create_writer(&schema, Box::new(Vec::<u8>::new()))
             .unwrap();

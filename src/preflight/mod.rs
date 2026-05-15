@@ -212,6 +212,7 @@ mod tests {
             format: FormatType::Csv,
             compression: CompressionType::default(),
             compression_level: None,
+            compression_profile: None,
             skip_empty: false,
             destination: DestinationConfig {
                 destination_type: DestinationType::Local,
@@ -239,6 +240,7 @@ mod tests {
             columns: Default::default(),
             on_schema_drift: Default::default(),
             shape_drift_warn_factor: None,
+            parquet: None,
         }
     }
 

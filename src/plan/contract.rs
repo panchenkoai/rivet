@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{
     CompressionType, DestinationConfig, FormatType, IncrementalCursorMode, MetaColumns,
-    QualityConfig, SchemaDriftPolicy, SourceConfig, TimeColumnType,
+    ParquetConfig, QualityConfig, SchemaDriftPolicy, SourceConfig, TimeColumnType,
 };
 use crate::tuning::SourceTuning;
 
@@ -61,6 +61,8 @@ pub struct ResolvedRunPlan {
     /// Warn when a column's current-run max byte length exceeds `stored × factor`.
     /// 0.0 disables shape tracking.
     pub shape_drift_warn_factor: f64,
+    /// Parquet row group tuning (resolved from export config). `None` = library default.
+    pub parquet: Option<ParquetConfig>,
 }
 
 /// Resolved incremental cursor semantics (Epic D / ADR-0007).

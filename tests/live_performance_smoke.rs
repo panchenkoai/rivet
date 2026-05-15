@@ -58,8 +58,11 @@ fn seed_wide_table(row_count: i64) -> (String, WideTableCleanup) {
                 sql.push_str(", ");
             }
             let id = base + i;
+            // lpad(id::text, 200, '0') produces a unique 200-char string per row,
+            // preventing Parquet dictionary encoding from collapsing all payloads.
+            // repeat('x', 200) caused the split test to produce < 64KB total.
             sql.push_str(&format!(
-                "({id}, 'name_{id}', {:.2}, repeat('x', 200))",
+                "({id}, 'name_{id}', {:.2}, lpad({id}::text, 200, '0'))",
                 (id as f64) * 0.1
             ));
         }
@@ -94,6 +97,8 @@ exports:
     mode: full
     format: parquet
     compression: zstd
+    columns:
+      amount: "decimal(12,2)"
     destination: {{type: local, path: {dir}}}
     tuning: {{batch_size: 500}}
 "#,
@@ -153,6 +158,13 @@ exports:
     format: parquet
     compression: none  # deterministic size → deterministic split count
     max_file_size: 64KB
+    columns:
+      amount: "decimal(12,2)"
+    # Small row groups so Parquet flushes to disk during the run:
+    # bytes_written() only counts completed row groups, not the in-progress one.
+    parquet:
+      row_group_strategy: fixed_rows
+      row_group_rows: 100
     destination: {{type: local, path: {dir}}}
     tuning: {{batch_size: 250}}
 "#,

@@ -237,7 +237,7 @@ pub(super) fn run_single_export(
         });
     }
 
-    let fmt = format::create_format(plan.format, plan.compression, plan.compression_level);
+    let fmt = format::create_format(plan.format, plan.compression, plan.compression_level, None);
     let ext = fmt.file_extension();
     let dest = destination::create_destination(&plan.destination)?;
 
@@ -586,6 +586,7 @@ mod tests {
             column_overrides: Default::default(),
             schema_drift_policy: Default::default(),
             shape_drift_warn_factor: 0.0,
+            parquet: None,
         }
     }
 
@@ -656,6 +657,7 @@ mod tests {
             row_count_max: None,
             null_ratio_max: Default::default(),
             unique_columns: vec![],
+            unique_max_entries: None,
         });
         // Source only emits 3 rows → quality gate should fire Severity::Fail
         let (result, summary) = run(&mut RowSource(3), &plan);
@@ -677,6 +679,7 @@ mod tests {
             row_count_max: Some(2), // max 2 rows
             null_ratio_max: Default::default(),
             unique_columns: vec![],
+            unique_max_entries: None,
         });
         // Source emits 10 rows → exceeds max
         let (result, summary) = run(&mut RowSource(10), &plan);

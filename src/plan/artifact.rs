@@ -272,6 +272,37 @@ impl PlanArtifact {
             }
         }
 
+        // resource estimates
+        let res = self.resolved_plan.tuning.resource_summary();
+        println!("  Resources:");
+        if let Some(mem_mb) = res.batch_size_memory_mb {
+            println!("    Batch size   : adaptive (target {} MB/batch)", mem_mb);
+        } else {
+            println!(
+                "    Batch size   : {:>7} rows",
+                format_number(res.batch_size)
+            );
+        }
+        println!(
+            "    Batch memory : ~{:.0} MB (narrow) – ~{:.0} MB (wide)",
+            res.batch_narrow_mb, res.batch_wide_mb
+        );
+        if res.memory_threshold_mb > 0 {
+            println!(
+                "    RSS guard    : {} MB",
+                format_number(res.memory_threshold_mb)
+            );
+        }
+        if res.throttle_ms > 0 {
+            println!("    Throttle     : {} ms between batches", res.throttle_ms);
+        }
+        if res.wide_table_risk {
+            println!(
+                "    ⚠ Wide tables may use up to {:.0} MB/batch — consider batch_size_memory_mb or a lower batch_size",
+                res.batch_wide_mb
+            );
+        }
+
         // destination
         let dest = &self.resolved_plan.destination;
         let dest_label = dest.destination_type.label();
@@ -282,10 +313,39 @@ impl PlanArtifact {
             .unwrap_or("(default)");
         println!("  Output   : {} → {}", dest_label, dest_location);
 
-        // format / compression
+        // format / compression / parquet row group
         let fmt = self.resolved_plan.format.label();
         let comp = self.resolved_plan.compression.label();
-        println!("  Format   : {} + {}", fmt, comp);
+        if let Some(level) = self.resolved_plan.compression_level {
+            println!("  Format   : {} + {} (level {})", fmt, comp, level);
+        } else {
+            println!("  Format   : {} + {}", fmt, comp);
+        }
+        if let (crate::config::FormatType::Parquet, Some(pc)) =
+            (self.resolved_plan.format, &self.resolved_plan.parquet)
+        {
+            let strategy = pc.row_group_strategy.unwrap_or_default();
+            match strategy {
+                crate::config::RowGroupStrategy::FixedRows => {
+                    if let Some(rows) = pc.row_group_rows {
+                        println!("  Row group: fixed {} rows", format_number(rows));
+                    }
+                }
+                _ => {
+                    let target_mb = pc
+                        .target_row_group_mb
+                        .unwrap_or(crate::config::ParquetConfig::DEFAULT_TARGET_ROW_GROUP_MB);
+                    println!(
+                        "  Row group: {:?} (target {} MB{})",
+                        strategy,
+                        target_mb,
+                        pc.max_row_group_mb
+                            .map(|m| format!(", max {} MB", m))
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+        }
         println!();
     }
 }
@@ -298,6 +358,20 @@ fn new_plan_id() -> String {
     let hi = rand::random::<u64>();
     let lo = rand::random::<u64>();
     format!("{:016x}{:016x}", hi, lo)
+}
+
+/// Format an integer with thousands separators.
+fn format_number(n: usize) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(b as char);
+    }
+    out
 }
 
 /// Format a row count with thousands separators (US locale style).
@@ -371,6 +445,7 @@ mod tests {
             column_overrides: Default::default(),
             schema_drift_policy: Default::default(),
             shape_drift_warn_factor: 2.0,
+            parquet: None,
         }
     }
 

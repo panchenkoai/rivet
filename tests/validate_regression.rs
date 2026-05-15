@@ -12,7 +12,7 @@ use rivet::pipeline::validate_output;
 
 fn write_parquet(batches: &[RecordBatch]) -> tempfile::NamedTempFile {
     let schema = batches[0].schema();
-    let fmt = ParquetFormat::new(CompressionType::None, None);
+    let fmt = ParquetFormat::new(CompressionType::None, None, None);
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.as_file().try_clone().unwrap();
     let mut writer = fmt.create_writer(&schema, Box::new(file)).unwrap();
@@ -134,7 +134,7 @@ fn validate_parquet_zero_row_file_succeeds_for_zero_and_fails_with_clear_message
         vec![std::sync::Arc::new(Int32Array::from(Vec::<i32>::new()))],
     )
     .unwrap();
-    let fmt = ParquetFormat::new(CompressionType::None, None);
+    let fmt = ParquetFormat::new(CompressionType::None, None, None);
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.as_file().try_clone().unwrap();
     let mut writer = fmt.create_writer(&schema, Box::new(file)).unwrap();
@@ -164,7 +164,7 @@ fn validate_parquet_three_rows_matches_expected() {
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.as_file().try_clone().unwrap();
-    let mut writer = ParquetFormat::new(CompressionType::Zstd, None)
+    let mut writer = ParquetFormat::new(CompressionType::Zstd, None, None)
         .create_writer(&schema, Box::new(file))
         .unwrap();
     writer.write_batch(&batch).unwrap();
@@ -208,7 +208,7 @@ fn validate_wrong_count_fails_with_expected_message() {
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.as_file().try_clone().unwrap();
-    let mut writer = ParquetFormat::new(CompressionType::Zstd, None)
+    let mut writer = ParquetFormat::new(CompressionType::Zstd, None, None)
         .create_writer(&schema, Box::new(file))
         .unwrap();
     writer.write_batch(&batch).unwrap();

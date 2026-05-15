@@ -72,6 +72,33 @@ A profile sets sensible defaults for all tuning parameters. Individual fields ov
 | `retry_backoff_ms` | integer | profile default | Base delay between retries in ms (exponential backoff) |
 | `lock_timeout_s` | integer | profile default | Database lock timeout in seconds (0 = no timeout) |
 | `memory_threshold_mb` | integer | profile default | RSS threshold in MB; pauses fetching if exceeded (0 = disabled). `balanced` defaults to 4096, `safe` to 2048, `fast` to 0 (no limit). |
+| `max_batch_memory_mb` | integer | — | Hard cap on a single Arrow batch in MB. When exceeded, `on_batch_memory_exceeded` determines the response. |
+| `on_batch_memory_exceeded` | `warn` \| `fail` \| `auto_shrink` | `warn` | Policy applied when a batch exceeds `max_batch_memory_mb`. |
+
+### Batch memory cap (`max_batch_memory_mb`)
+
+`memory_threshold_mb` is a process-level RSS guard — it fires after the OS has already committed memory. `max_batch_memory_mb` is an earlier, batch-level guard: it measures the actual Arrow buffer footprint of each batch before it is written.
+
+```yaml
+tuning:
+  max_batch_memory_mb: 128
+  on_batch_memory_exceeded: warn   # warn | fail | auto_shrink
+```
+
+| Policy | Behaviour |
+|---|---|
+| `warn` | **(default)** Log a warning with the actual size, the limit, and a suggested `batch_size`. Continue the export. |
+| `fail` | Return an error immediately. The export stops. Use in strict pipelines where oversized batches indicate a configuration problem. |
+| `auto_shrink` | Split the oversized batch in half recursively until each sub-batch fits within the limit, then write the sub-batches individually. Transparent to the rest of the pipeline — total row count and output are identical. |
+
+The warning and error messages include a suggested `batch_size`:
+
+```
+batch memory 184 MB exceeds max_batch_memory_mb=128 MB (5000 rows).
+Consider lowering batch_size to ~3478.
+```
+
+Use `auto_shrink` when you want protection against accidental wide-table OOM without needing to tune `batch_size` manually. Use `fail` in CI pipelines where any oversized batch should block the run.
 
 ## Choosing `batch_size`
 

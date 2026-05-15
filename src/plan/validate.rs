@@ -230,6 +230,7 @@ mod tests {
             column_overrides: Default::default(),
             schema_drift_policy: Default::default(),
             shape_drift_warn_factor: 2.0,
+            parquet: None,
         }
     }
 
@@ -361,6 +362,7 @@ mod tests {
             row_count_max: None,
             null_ratio_max: Default::default(),
             unique_columns: vec![],
+            unique_max_entries: None,
         });
         let diags = validate_plan(&p);
         assert!(
@@ -379,6 +381,7 @@ mod tests {
             row_count_max: None,
             null_ratio_max: Default::default(),
             unique_columns: vec![],
+            unique_max_entries: None,
         });
         let diags = validate_plan(&p);
         assert!(

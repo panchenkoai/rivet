@@ -12,6 +12,9 @@ pub struct SourceTuning {
     pub lock_timeout_s: u64,
     /// RSS limit in MB before chunk processing throttles. `0` = no limit (disabled).
     pub memory_threshold_mb: usize,
+    /// Hard cap on a single Arrow batch in MB. `None` = no cap.
+    pub max_batch_memory_mb: Option<usize>,
+    pub on_batch_memory_exceeded: BatchMemoryPolicy,
     configured_profile: TuningProfile,
 }
 
@@ -21,6 +24,20 @@ pub enum TuningProfile {
     Fast,
     Balanced,
     Safe,
+}
+
+/// Action taken when a single Arrow batch exceeds `max_batch_memory_mb`.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchMemoryPolicy {
+    /// Log a warning and continue. (default)
+    #[default]
+    Warn,
+    /// Return an error — the export fails immediately.
+    Fail,
+    /// Split the oversized batch in half recursively until each sub-batch fits,
+    /// then process them individually. Transparent to the rest of the pipeline.
+    AutoShrink,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -35,6 +52,11 @@ pub struct TuningConfig {
     pub retry_backoff_ms: Option<u64>,
     pub lock_timeout_s: Option<u64>,
     pub memory_threshold_mb: Option<usize>,
+    /// Hard cap on Arrow batch memory in MB. When a batch exceeds this limit,
+    /// `on_batch_memory_exceeded` determines the response.
+    pub max_batch_memory_mb: Option<usize>,
+    /// Policy applied when a batch exceeds `max_batch_memory_mb`. Default: `warn`.
+    pub on_batch_memory_exceeded: Option<BatchMemoryPolicy>,
 }
 
 /// Layer `export` on top of `source`: each field uses export when set, otherwise source.
@@ -57,6 +79,8 @@ pub fn merge_tuning_config(
             retry_backoff_ms: e.retry_backoff_ms.or(s.retry_backoff_ms),
             lock_timeout_s: e.lock_timeout_s.or(s.lock_timeout_s),
             memory_threshold_mb: e.memory_threshold_mb.or(s.memory_threshold_mb),
+            max_batch_memory_mb: e.max_batch_memory_mb.or(s.max_batch_memory_mb),
+            on_batch_memory_exceeded: e.on_batch_memory_exceeded.or(s.on_batch_memory_exceeded),
         }),
     }
 }
@@ -93,6 +117,10 @@ impl SourceTuning {
             if let Some(v) = cfg.memory_threshold_mb {
                 tuning.memory_threshold_mb = v;
             }
+            tuning.max_batch_memory_mb = cfg.max_batch_memory_mb;
+            if let Some(v) = cfg.on_batch_memory_exceeded {
+                tuning.on_batch_memory_exceeded = v;
+            }
         }
 
         tuning
@@ -109,6 +137,8 @@ impl SourceTuning {
                 retry_backoff_ms: 1_000,
                 lock_timeout_s: 0,
                 memory_threshold_mb: 0,
+                max_batch_memory_mb: None,
+                on_batch_memory_exceeded: BatchMemoryPolicy::Warn,
                 configured_profile: TuningProfile::Fast,
             },
             TuningProfile::Balanced => Self {
@@ -120,6 +150,8 @@ impl SourceTuning {
                 retry_backoff_ms: 2_000,
                 lock_timeout_s: 30,
                 memory_threshold_mb: 4_096,
+                max_batch_memory_mb: None,
+                on_batch_memory_exceeded: BatchMemoryPolicy::Warn,
                 configured_profile: TuningProfile::Balanced,
             },
             TuningProfile::Safe => Self {
@@ -131,6 +163,8 @@ impl SourceTuning {
                 retry_backoff_ms: 5_000,
                 lock_timeout_s: 10,
                 memory_threshold_mb: 2_048,
+                max_batch_memory_mb: None,
+                on_batch_memory_exceeded: BatchMemoryPolicy::Warn,
                 configured_profile: TuningProfile::Safe,
             },
         }
@@ -211,6 +245,64 @@ impl SourceTuning {
             self.batch_size
         }
     }
+
+    /// Return the actual Arrow memory footprint of a batch in bytes.
+    ///
+    /// Sums `get_array_memory_size()` across all columns — includes buffers for
+    /// validity bitmaps, offsets, and value data. Does not include Arrow struct
+    /// overhead (~few hundred bytes) which is negligible at batch scale.
+    pub fn batch_memory_bytes(batch: &arrow::record_batch::RecordBatch) -> usize {
+        batch
+            .columns()
+            .iter()
+            .map(|col| col.get_array_memory_size())
+            .sum()
+    }
+
+    /// Produce a `ResourceSummary` from the resolved tuning settings.
+    ///
+    /// The summary requires no database connection. It reports two batch-memory
+    /// bounds based on narrow-table (~200 B/row) and wide-table (~10 KB/row)
+    /// heuristics. A `wide_table_risk` flag is set when the upper bound exceeds
+    /// 128 MB per batch.
+    pub fn resource_summary(&self) -> ResourceSummary {
+        const NARROW_BYTES: f64 = 200.0;
+        const WIDE_BYTES: f64 = 10_240.0;
+        let batch = self.batch_size as f64;
+        let batch_narrow_mb = batch * NARROW_BYTES / (1024.0 * 1024.0);
+        let batch_wide_mb = batch * WIDE_BYTES / (1024.0 * 1024.0);
+        ResourceSummary {
+            profile: self.profile_name().to_string(),
+            batch_size: self.batch_size,
+            batch_size_memory_mb: self.batch_size_memory_mb,
+            memory_threshold_mb: self.memory_threshold_mb,
+            throttle_ms: self.throttle_ms,
+            batch_narrow_mb,
+            batch_wide_mb,
+            wide_table_risk: batch_wide_mb > 128.0,
+        }
+    }
+}
+
+/// Resource estimate computed from tuning settings alone (no DB connection required).
+///
+/// `batch_narrow_mb` and `batch_wide_mb` bracket the expected per-batch memory:
+/// - narrow table: ~200 B/row (int-heavy, no text blobs)
+/// - wide table  : ~10 KB/row (many text/JSON/binary columns)
+///
+/// Use `wide_table_risk` to decide whether to recommend `adaptive_batch` or a
+/// lower `batch_size`.
+#[derive(Debug, Clone)]
+pub struct ResourceSummary {
+    #[allow(dead_code)]
+    pub profile: String,
+    pub batch_size: usize,
+    pub batch_size_memory_mb: Option<usize>,
+    pub memory_threshold_mb: usize,
+    pub throttle_ms: u64,
+    pub batch_narrow_mb: f64,
+    pub batch_wide_mb: f64,
+    pub wide_table_risk: bool,
 }
 
 #[cfg(test)]
@@ -395,5 +487,50 @@ mod tests {
         assert!((1_000..=500_000).contains(&bs), "got {bs}");
         // 256MB / 266B ≈ 1_009_022, clamped to 500_000
         assert_eq!(bs, 500_000);
+    }
+
+    #[test]
+    fn resource_summary_balanced_profile() {
+        let t = SourceTuning::from_config(None);
+        let r = t.resource_summary();
+        assert_eq!(r.profile, "balanced");
+        assert_eq!(r.batch_size, 10_000);
+        assert!(r.batch_size_memory_mb.is_none());
+        assert_eq!(r.memory_threshold_mb, 4_096);
+        assert_eq!(r.throttle_ms, 50);
+        // narrow: 10_000 × 200 B = ~1.9 MB
+        assert!(
+            r.batch_narrow_mb < 5.0,
+            "narrow too high: {}",
+            r.batch_narrow_mb
+        );
+        // wide: 10_000 × 10 KB = ~95 MB — no risk (< 128 MB)
+        assert!(
+            !r.wide_table_risk,
+            "balanced 10k should not trigger wide_table_risk"
+        );
+    }
+
+    #[test]
+    fn resource_summary_fast_profile_triggers_wide_table_risk() {
+        let t = SourceTuning::from_config(Some(&TuningConfig {
+            profile: Some(TuningProfile::Fast),
+            ..Default::default()
+        }));
+        let r = t.resource_summary();
+        assert_eq!(r.batch_size, 50_000);
+        // wide: 50_000 × 10 KB = ~476 MB → high risk
+        assert!(r.wide_table_risk, "fast 50k should trigger wide_table_risk");
+    }
+
+    #[test]
+    fn resource_summary_with_adaptive_batch() {
+        let cfg = TuningConfig {
+            batch_size_memory_mb: Some(64),
+            ..Default::default()
+        };
+        let t = SourceTuning::from_config(Some(&cfg));
+        let r = t.resource_summary();
+        assert_eq!(r.batch_size_memory_mb, Some(64));
     }
 }

@@ -87,7 +87,7 @@ fn parquet_writer_does_not_panic_on_adversarial_utf8_cells() {
         let Ok(batch) = RecordBatch::try_new(schema.clone(), vec![Arc::new(col)]) else {
             continue;
         };
-        let parquet = ParquetFormat::new(CompressionType::None, None);
+        let parquet = ParquetFormat::new(CompressionType::None, None, None);
         let _tmp = try_write_to_tempfile(&parquet, &schema, &batch);
     }
 }
@@ -164,7 +164,7 @@ fn parquet_writer_handles_numeric_extremes_without_panic() {
     )
     .unwrap();
 
-    let parquet = ParquetFormat::new(CompressionType::Zstd, None);
+    let parquet = ParquetFormat::new(CompressionType::Zstd, None, None);
     let _tmp = try_write_to_tempfile(&parquet, &schema, &batch);
 }
 
@@ -223,7 +223,7 @@ fn csv_and_parquet_writers_accept_zero_row_batch() {
 
     let _csv = try_write_to_tempfile(&CsvFormat, &schema, &batch);
     let _pq = try_write_to_tempfile(
-        &ParquetFormat::new(CompressionType::Snappy, None),
+        &ParquetFormat::new(CompressionType::Snappy, None, None),
         &schema,
         &batch,
     );

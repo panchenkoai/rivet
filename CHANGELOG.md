@@ -1,5 +1,131 @@
 # Changelog
 
+## 0.5.0 (2026-05-15)
+
+### Parquet row group auto tuning
+
+A new `parquet:` block on any Parquet export controls how many rows Rivet places in each row group. Row group size affects memory usage during write, compression ratio, and downstream read performance (predicate pushdown, column skipping).
+
+```yaml
+exports:
+  - name: events
+    format: parquet
+    parquet:
+      row_group_strategy: auto      # auto | fixed_rows | fixed_memory
+      target_row_group_mb: 128
+      max_row_group_mb: 256
+```
+
+The `auto` strategy estimates row width from Arrow schema column types and computes rows-per-group to fit within the target memory budget. Narrow tables (IDs, timestamps) get large groups; wide tables (TEXT/JSON) get smaller groups automatically — no manual tuning required.
+
+| Strategy | Behavior |
+|---|---|
+| `auto` | Compute from schema + `target_row_group_mb` (default 128 MB) |
+| `fixed_rows` | Use `row_group_rows` as a literal row count |
+| `fixed_memory` | Same math as `auto`, explicit label in logs |
+
+When `parquet:` is omitted, Rivet uses the library default (1,048,576 rows/group). `rivet plan` shows the selected strategy and target when the block is present.
+
+### Compression profiles
+
+A new `compression_profile` field replaces the need to manually choose a codec and level. Set it on any export and Rivet picks the right `(codec, level)` pair:
+
+| Profile | Codec | Best for |
+|---|---|---|
+| `none` | uncompressed | Debug / scratch |
+| `fast` | snappy | Backfills, low-CPU |
+| `balanced` | zstd level 3 | Production default |
+| `compact` | zstd level 9 | Storage/network-sensitive |
+
+```yaml
+exports:
+  - name: events
+    format: parquet
+    compression_profile: balanced
+```
+
+`compression_profile` takes precedence over `compression` + `compression_level`. Existing configs are unaffected — those fields still work.
+
+### Batch memory hard cap (`max_batch_memory_mb`)
+
+A new tuning parameter adds a **batch-level** memory guard independent of the process-level `memory_threshold_mb`:
+
+```yaml
+tuning:
+  max_batch_memory_mb: 128
+  on_batch_memory_exceeded: warn   # warn (default) | fail | auto_shrink
+```
+
+Rivet measures the actual Arrow buffer footprint of each batch using `get_array_memory_size()`. When a batch exceeds the limit:
+
+- **`warn`** — logs the actual size, the limit, and a suggested `batch_size`. Export continues.
+- **`fail`** — returns an error immediately. Use in CI to block oversized batches.
+- **`auto_shrink`** — splits the batch in half recursively until each sub-batch fits, then writes them individually. Transparent to the rest of the pipeline — row count and output are identical.
+
+The warning includes an actionable suggestion:
+
+```
+batch memory 184 MB exceeds max_batch_memory_mb=128 MB (5000 rows). Consider lowering batch_size to ~3478.
+```
+
+### Resource plan output
+
+`rivet plan` now shows a **Resources** section in pretty output with per-batch memory estimates:
+
+```
+  Resources:
+    Batch size   :  10,000 rows
+    Batch memory : ~2 MB (narrow) – ~95 MB (wide)
+    RSS guard    : 4,096 MB
+    Throttle     : 50 ms between batches
+```
+
+The narrow/wide bounds bracket the expected per-batch memory at ~200 B/row and ~10 KB/row respectively. A `⚠` advisory appears when the upper bound exceeds 128 MB/batch, suggesting `batch_size_memory_mb` or a lower `batch_size`. No database connection is required to compute the estimate — it is derived from tuning settings alone.
+
+### Quality uniqueness: typed hashing and memory cap
+
+`unique_columns` quality checks now use **typed xxHash3-64** instead of string formatting. Numeric and binary columns are hashed directly from raw bytes — no intermediate string allocation. CPU overhead for quality-enabled runs is ~2.6–2.8× lower on Int64 and Utf8 columns.
+
+A new **`unique_max_entries`** field caps the number of distinct values tracked per column:
+
+```yaml
+quality:
+  unique_columns: [id, email]
+  unique_max_entries: 1000000
+```
+
+When the cap is reached, a `Warn` issue is emitted and tracking stops for that column. Without this field, tracking is still unbounded — the cap is opt-in. This prevents uncontrolled RAM growth on high-cardinality columns (UUIDs, event IDs, email addresses) on very large tables.
+
+### `rivet init` scaffolds `parquet:` auto-tuning
+
+`rivet init` now includes a `parquet:` block in the generated YAML for every chunked export and any full-mode export estimated at more than 100 k rows. The block is pre-filled with the right strategy and a schema-aware target:
+
+- **Narrow tables** (fewer than 5 text/JSON/bytea columns) → `target_row_group_mb: 128`
+- **Wide tables** (5 or more text/JSON/bytea columns) → `target_row_group_mb: 64`
+
+```yaml
+# generated for content_items (2M rows, body + raw_html + metadata jsonb + …)
+  - name: content_items
+    mode: chunked
+    format: parquet
+    parquet:
+      row_group_strategy: auto
+      target_row_group_mb: 64
+```
+
+No action needed for existing configs — the block is only added to newly generated scaffolds.
+
+### Fix: `--resume` with no checkpoint exits non-zero
+
+Previously, running `rivet run --resume` on a chunked export that had no in-progress checkpoint would log a warning and silently start a fresh run. This masked operator mistakes (wrong `--config`, post-`reset-chunks` double-resume). The command now exits non-zero with an actionable message:
+
+```
+error: export 'big_table': --resume but no in-progress chunk checkpoint;
+       run without --resume first or `rivet state reset-chunks --config <cfg> --export big_table`
+```
+
+---
+
 ## 0.4.0 (2026-05-14)
 
 PostgreSQL state backend, type safety layer, destination path templates, and a set of reliability fixes.

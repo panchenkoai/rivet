@@ -34,6 +34,8 @@ exports:
     mode: full
     format: parquet
     compression: zstd
+    columns:
+      amount: "decimal(12,2)"
     destination:
       type: local
       path: {}
@@ -224,6 +226,8 @@ exports:
     query: "SELECT id, name, amount FROM {table_name}"
     mode: full
     format: parquet
+    columns:
+      amount: "decimal(12,2)"
     destination:
       type: local
       path: {dir}

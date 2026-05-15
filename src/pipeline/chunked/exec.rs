@@ -127,7 +127,8 @@ pub(crate) fn run_chunked_sequential(
             summary.bytes_written += file_bytes;
             summary.files_produced += 1;
 
-            let fmt = format::create_format(plan.format, plan.compression, plan.compression_level);
+            let fmt =
+                format::create_format(plan.format, plan.compression, plan.compression_level, None);
             let file_name = format!(
                 "{}_{}_chunk{}.{}",
                 plan.export_name,
@@ -308,6 +309,7 @@ pub(crate) fn run_chunked_parallel(
                             plan_for_worker.format,
                             plan_for_worker.compression,
                             plan_for_worker.compression_level,
+                            None,
                         );
                         let file_name = format!(
                             "{}_{}_chunk{}.{}",
@@ -494,6 +496,7 @@ mod tests {
             column_overrides: Default::default(),
             schema_drift_policy: Default::default(),
             shape_drift_warn_factor: 0.0,
+            parquet: None,
         }
     }
 

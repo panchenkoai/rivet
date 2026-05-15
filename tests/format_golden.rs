@@ -308,7 +308,7 @@ fn test_parquet_multi_batch_roundtrip() {
     )
     .unwrap();
     let buf = write_to_vec(
-        &ParquetFormat::new(CompressionType::Zstd, None),
+        &ParquetFormat::new(CompressionType::Zstd, None, None),
         &schema,
         &[batch1, batch2],
     );
@@ -335,7 +335,7 @@ fn test_parquet_nullable_roundtrip() {
     )
     .unwrap();
     let buf = write_to_vec(
-        &ParquetFormat::new(CompressionType::None, None),
+        &ParquetFormat::new(CompressionType::None, None, None),
         &schema,
         &[batch],
     );
@@ -359,7 +359,7 @@ fn test_parquet_nullable_roundtrip() {
 fn test_parquet_roundtrip() {
     let (schema, batch) = make_basic_batch();
     let buf = write_to_vec(
-        &ParquetFormat::new(CompressionType::Zstd, None),
+        &ParquetFormat::new(CompressionType::Zstd, None, None),
         &schema,
         &[batch],
     );
@@ -396,7 +396,7 @@ fn test_parquet_roundtrip() {
 fn test_parquet_compression_default_zstd() {
     let (schema, batch) = make_basic_batch();
     let buf = write_to_vec(
-        &ParquetFormat::new(CompressionType::Zstd, None),
+        &ParquetFormat::new(CompressionType::Zstd, None, None),
         &schema,
         &[batch],
     );
@@ -419,7 +419,7 @@ fn test_parquet_compression_default_zstd() {
 fn test_parquet_compression_snappy() {
     let (schema, batch) = make_basic_batch();
     let buf = write_to_vec(
-        &ParquetFormat::new(CompressionType::Snappy, None),
+        &ParquetFormat::new(CompressionType::Snappy, None, None),
         &schema,
         &[batch],
     );
@@ -435,7 +435,7 @@ fn test_parquet_compression_snappy() {
 fn test_parquet_compression_none() {
     let (schema, batch) = make_basic_batch();
     let buf = write_to_vec(
-        &ParquetFormat::new(CompressionType::None, None),
+        &ParquetFormat::new(CompressionType::None, None, None),
         &schema,
         &[batch],
     );
@@ -454,7 +454,7 @@ fn test_parquet_compression_none() {
 fn test_parquet_compression_gzip() {
     let (schema, batch) = make_basic_batch();
     let buf = write_to_vec(
-        &ParquetFormat::new(CompressionType::Gzip, Some(6)),
+        &ParquetFormat::new(CompressionType::Gzip, Some(6), None),
         &schema,
         &[batch],
     );
@@ -474,7 +474,7 @@ fn test_parquet_compression_gzip() {
 fn test_parquet_compression_lz4() {
     let (schema, batch) = make_basic_batch();
     let buf = write_to_vec(
-        &ParquetFormat::new(CompressionType::Lz4, None),
+        &ParquetFormat::new(CompressionType::Lz4, None, None),
         &schema,
         &[batch],
     );
@@ -561,7 +561,7 @@ fn parquet_preserves_empty_string_vs_null_distinction_on_roundtrip() {
     )
     .unwrap();
 
-    let fmt = ParquetFormat::new(CompressionType::None, None);
+    let fmt = ParquetFormat::new(CompressionType::None, None, None);
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let file = tmp.as_file().try_clone().unwrap();
     let mut writer = fmt.create_writer(&schema, Box::new(file)).unwrap();

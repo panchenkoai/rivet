@@ -36,7 +36,7 @@ rivet run --config <PATH> [OPTIONS]
 | `--export` | `-e` | string | Run only a specific export by name |
 | `--validate` | | bool | Validate output file row count after writing |
 | `--reconcile` | | bool | Run `COUNT(*)` on source query and compare with exported rows |
-| `--resume` | | bool | Resume an in-progress chunked export. If no in-progress checkpoint exists (e.g. after `reset-chunks` already cleared it), starts a fresh run with a warning instead of erroring |
+| `--resume` | | bool | Resume an in-progress chunked export. Exits non-zero with an actionable message if no in-progress checkpoint exists — run without `--resume` to start fresh, or `rivet state reset-chunks` to clear a stuck run |
 | `--parallel-exports` | | bool | Run all exports concurrently (ignored with `--export`) |
 | `--parallel-export-processes` | | bool | Run each export as a separate child process |
 | `--summary-output` | | PATH | Write run aggregate to this file as JSON |
@@ -150,9 +150,24 @@ rivet plan -c rivet.yaml -e orders --format json -o orders_plan.json
   Profile  : balanced
   Warnings :
     • sparse id range: ~12% fill
+  Resources:
+    Batch size   :  10,000 rows
+    Batch memory : ~2 MB (narrow) – ~95 MB (wide)
+    RSS guard    : 4,096 MB
+    Throttle     : 50 ms between batches
   Output   : local → ./out
   Format   : parquet + zstd
 ```
+
+The **Resources** section shows:
+
+| Line | Meaning |
+|---|---|
+| `Batch size` | Rows fetched per query. `adaptive` if `batch_size_memory_mb` is set. |
+| `Batch memory` | Estimated range: narrow (~200 B/row) to wide (~10 KB/row) tables. |
+| `RSS guard` | Process-level RSS threshold. Fetching pauses if exceeded (0 = disabled). |
+| `Throttle` | Delay between batches to reduce source load (omitted when 0). |
+| `⚠ Wide tables may use…` | Shown when the upper bound exceeds 128 MB/batch — consider `batch_size_memory_mb` or a lower `batch_size`. |
 
 ### Plan artifact structure
 

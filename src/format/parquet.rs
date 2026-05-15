@@ -12,13 +12,20 @@ use crate::error::Result;
 pub struct ParquetFormat {
     compression: CompressionType,
     compression_level: Option<u32>,
+    /// Rows per Parquet row group. `None` = use library default (1,048,576).
+    row_group_rows: Option<usize>,
 }
 
 impl ParquetFormat {
-    pub fn new(compression: CompressionType, compression_level: Option<u32>) -> Self {
+    pub fn new(
+        compression: CompressionType,
+        compression_level: Option<u32>,
+        row_group_rows: Option<usize>,
+    ) -> Self {
         Self {
             compression,
             compression_level,
+            row_group_rows,
         }
     }
 
@@ -49,9 +56,11 @@ impl super::Format for ParquetFormat {
         schema: &SchemaRef,
         writer: Box<dyn Write + Send>,
     ) -> Result<Box<dyn super::FormatWriter>> {
-        let props = WriterProperties::builder()
-            .set_compression(self.build_compression())
-            .build();
+        let mut builder = WriterProperties::builder().set_compression(self.build_compression());
+        if self.row_group_rows.is_some() {
+            builder = builder.set_max_row_group_row_count(self.row_group_rows);
+        }
+        let props = builder.build();
 
         let inner = ArrowWriter::try_new(writer, schema.clone(), Some(props))?;
         Ok(Box::new(ParquetFormatWriter { inner }))
@@ -103,7 +112,7 @@ mod tests {
         level: Option<u32>,
     ) -> Box<dyn crate::format::FormatWriter> {
         let schema = int64_schema();
-        ParquetFormat::new(compression, level)
+        ParquetFormat::new(compression, level, None)
             .create_writer(&schema, Box::new(Vec::<u8>::new()))
             .expect("create_writer should succeed")
     }
@@ -113,7 +122,7 @@ mod tests {
     #[test]
     fn file_extension_is_parquet() {
         assert_eq!(
-            ParquetFormat::new(CompressionType::None, None).file_extension(),
+            ParquetFormat::new(CompressionType::None, None, None).file_extension(),
             "parquet"
         );
     }
@@ -155,7 +164,7 @@ mod tests {
     #[test]
     fn write_batch_and_finish_returns_ok() {
         let schema = int64_schema();
-        let fmt = ParquetFormat::new(CompressionType::Zstd, None);
+        let fmt = ParquetFormat::new(CompressionType::Zstd, None, None);
         // Pass Vec by value — avoids &mut T 'static lifetime requirement.
         let mut writer = fmt
             .create_writer(&schema, Box::new(Vec::<u8>::new()))
@@ -167,11 +176,35 @@ mod tests {
     #[test]
     fn finish_without_write_produces_valid_empty_parquet() {
         let schema = int64_schema();
-        let fmt = ParquetFormat::new(CompressionType::None, None);
+        let fmt = ParquetFormat::new(CompressionType::None, None, None);
         // finish() on a writer with no batches should not panic or error
         let writer = fmt
             .create_writer(&schema, Box::new(Vec::<u8>::new()))
             .unwrap();
+        writer.finish().unwrap();
+    }
+
+    // ── row group size ───────────────────────────────────────────────────────
+
+    #[test]
+    fn row_group_rows_none_uses_library_default() {
+        let schema = int64_schema();
+        let fmt = ParquetFormat::new(CompressionType::None, None, None);
+        let mut writer = fmt
+            .create_writer(&schema, Box::new(Vec::<u8>::new()))
+            .unwrap();
+        writer.write_batch(&one_batch(&schema)).unwrap();
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn row_group_rows_some_succeeds() {
+        let schema = int64_schema();
+        let fmt = ParquetFormat::new(CompressionType::None, None, Some(100));
+        let mut writer = fmt
+            .create_writer(&schema, Box::new(Vec::<u8>::new()))
+            .unwrap();
+        writer.write_batch(&one_batch(&schema)).unwrap();
         writer.finish().unwrap();
     }
 }

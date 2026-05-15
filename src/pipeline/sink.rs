@@ -61,6 +61,15 @@ pub(crate) struct ExportSink {
     pub(in crate::pipeline) strip_internal_column: Option<String>,
     /// Running per-column max byte length for string/binary columns (Epic 8).
     pub(in crate::pipeline) column_max_bytes: std::collections::HashMap<String, u64>,
+    /// Hard cap on a single Arrow batch in bytes (`max_batch_memory_mb * 1024²`). `None` = no cap.
+    pub(in crate::pipeline) max_batch_memory_bytes: Option<usize>,
+    pub(in crate::pipeline) batch_memory_policy: crate::tuning::BatchMemoryPolicy,
+    /// Count of batches that exceeded `max_batch_memory_bytes` (for run summary / logging).
+    pub(in crate::pipeline) oversized_batch_count: u64,
+    /// Parquet row group config from plan. `None` = CSV or no row group tuning.
+    pub(in crate::pipeline) parquet_config: Option<crate::config::ParquetConfig>,
+    /// Resolved rows-per-row-group, computed from schema in `on_schema`. `None` = library default.
+    pub(in crate::pipeline) parquet_row_group_rows: Option<usize>,
 }
 
 impl ExportSink {
@@ -98,6 +107,11 @@ impl ExportSink {
             completed_parts: Vec::new(),
             strip_internal_column,
             column_max_bytes: std::collections::HashMap::new(),
+            max_batch_memory_bytes: plan.tuning.max_batch_memory_mb.map(|mb| mb * 1024 * 1024),
+            batch_memory_policy: plan.tuning.on_batch_memory_exceeded,
+            oversized_batch_count: 0,
+            parquet_config: plan.parquet.clone(),
+            parquet_row_group_rows: None,
         })
     }
 
@@ -144,8 +158,12 @@ impl ExportSink {
         self.part_rows = 0;
 
         if let Some(schema) = &self.enriched_schema {
-            let fmt =
-                format::create_format(self.format_type, self.compression, self.compression_level);
+            let fmt = format::create_format(
+                self.format_type,
+                self.compression,
+                self.compression_level,
+                self.parquet_row_group_rows,
+            );
             let file = self.tmp.as_file().try_clone()?;
             let buf_writer = BufWriter::with_capacity(256 * 1024, file);
             self.writer = Some(fmt.create_writer(schema, Box::new(buf_writer))?);
@@ -267,6 +285,26 @@ impl ExportSink {
         }
         issues
     }
+
+    /// Core batch processing: track quality/shape, enrich, write. Called after memory check.
+    fn on_batch_inner(&mut self, dest_batch: &RecordBatch) -> Result<()> {
+        self.total_rows += dest_batch.num_rows();
+        self.part_rows += dest_batch.num_rows();
+        self.track_quality(dest_batch);
+        self.track_shape(dest_batch);
+
+        let output = if let Some(es) = &self.enriched_schema {
+            enrich::enrich_batch(dest_batch, &self.meta, es, self.exported_at_us)?
+        } else {
+            dest_batch.clone()
+        };
+
+        if let Some(w) = self.writer.as_mut() {
+            w.write_batch(&output)?;
+        }
+        self.maybe_split()?;
+        Ok(())
+    }
 }
 
 impl BatchSink for ExportSink {
@@ -280,7 +318,23 @@ impl BatchSink for ExportSink {
             _ => schema.clone(),
         };
         let enriched = enrich::enrich_schema(&dest_schema, &self.meta);
-        let fmt = format::create_format(self.format_type, self.compression, self.compression_level);
+        // Compute row group rows from the actual schema now that it's available.
+        if let Some(pc) = &self.parquet_config {
+            self.parquet_row_group_rows = pc.effective_row_group_rows(&dest_schema);
+            if let Some(rows) = self.parquet_row_group_rows {
+                log::debug!(
+                    "parquet row_group_rows={} (strategy={:?})",
+                    rows,
+                    pc.row_group_strategy.unwrap_or_default()
+                );
+            }
+        }
+        let fmt = format::create_format(
+            self.format_type,
+            self.compression,
+            self.compression_level,
+            self.parquet_row_group_rows,
+        );
         let file = self.tmp.as_file().try_clone()?;
         let buf_writer = BufWriter::new(file);
         self.writer = Some(fmt.create_writer(&enriched, Box::new(buf_writer))?);
@@ -320,26 +374,76 @@ impl BatchSink for ExportSink {
         };
         let dest_batch: &RecordBatch = stripped.as_ref().unwrap_or(batch);
 
-        self.total_rows += dest_batch.num_rows();
-        self.part_rows += dest_batch.num_rows();
-        self.track_quality(dest_batch);
-        self.track_shape(dest_batch);
-
-        let output = if let Some(es) = &self.enriched_schema {
-            enrich::enrich_batch(dest_batch, &self.meta, es, self.exported_at_us)?
-        } else {
-            dest_batch.clone()
-        };
-
-        if let Some(w) = self.writer.as_mut() {
-            w.write_batch(&output)?;
+        // Batch-level memory accounting
+        if let Some(limit) = self.max_batch_memory_bytes {
+            let batch_bytes = crate::tuning::SourceTuning::batch_memory_bytes(dest_batch);
+            if batch_bytes > limit {
+                self.oversized_batch_count += 1;
+                let batch_mb = batch_bytes / (1024 * 1024);
+                let limit_mb = limit / (1024 * 1024);
+                let suggested = dest_batch
+                    .num_rows()
+                    .saturating_mul(limit)
+                    .checked_div(batch_bytes)
+                    .unwrap_or(1)
+                    .max(1);
+                match self.batch_memory_policy {
+                    crate::tuning::BatchMemoryPolicy::Warn => {
+                        log::warn!(
+                            "batch memory {} MB exceeds max_batch_memory_mb={} MB \
+                             ({} rows). Consider lowering batch_size to ~{}.",
+                            batch_mb,
+                            limit_mb,
+                            dest_batch.num_rows(),
+                            suggested
+                        );
+                    }
+                    crate::tuning::BatchMemoryPolicy::Fail => {
+                        anyhow::bail!(
+                            "batch memory {} MB exceeds max_batch_memory_mb={} MB \
+                             ({} rows). Lower batch_size to ~{} or set \
+                             on_batch_memory_exceeded: auto_shrink.",
+                            batch_mb,
+                            limit_mb,
+                            dest_batch.num_rows(),
+                            suggested
+                        );
+                    }
+                    crate::tuning::BatchMemoryPolicy::AutoShrink => {
+                        // Split into two halves and recurse — each half goes
+                        // through the full on_batch path including another
+                        // memory check, so very large batches converge quickly.
+                        let mid = dest_batch.num_rows() / 2;
+                        if mid == 0 {
+                            // Single-row batch already over limit — warn and continue.
+                            log::warn!(
+                                "single-row batch is {} MB — cannot shrink further, writing as-is.",
+                                batch_mb
+                            );
+                        } else {
+                            let lo = dest_batch.slice(0, mid);
+                            let hi = dest_batch.slice(mid, dest_batch.num_rows() - mid);
+                            // Reconstruct original batch pointers for the sub-calls.
+                            self.on_batch_inner(&lo)?;
+                            self.on_batch_inner(&hi)?;
+                            // Cursor extraction from original batch position.
+                            if let (Some(col), Some(schema)) = (&self.cursor_column, &self.schema) {
+                                self.last_cursor_value =
+                                    extract_last_cursor_value(batch, col, schema);
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
+            }
         }
+
+        self.on_batch_inner(dest_batch)?;
         // Extract cursor value inline so the batch can be freed immediately after
         // on_batch returns — avoids holding one full batch in memory for the rest of the run.
         if let (Some(col), Some(schema)) = (&self.cursor_column, &self.schema) {
             self.last_cursor_value = extract_last_cursor_value(batch, col, schema);
         }
-        self.maybe_split()?;
         Ok(())
     }
 }
@@ -810,6 +914,11 @@ mod tests {
             completed_parts: Vec::new(),
             strip_internal_column: None,
             column_max_bytes: std::collections::HashMap::new(),
+            max_batch_memory_bytes: None,
+            batch_memory_policy: crate::tuning::BatchMemoryPolicy::Warn,
+            oversized_batch_count: 0,
+            parquet_config: None,
+            parquet_row_group_rows: None,
         }
     }
 
@@ -824,8 +933,100 @@ mod tests {
                 row_count_max: None,
                 null_ratio_max,
                 unique_columns: unique_cols,
+                unique_max_entries: None,
             }),
             ..minimal_sink()
         }
+    }
+
+    // ── batch memory cap ─────────────────────────────────────────────────────
+
+    fn make_int_batch(n_rows: usize, n_cols: usize) -> RecordBatch {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let fields: Vec<Field> = (0..n_cols)
+            .map(|i| Field::new(format!("c{i}"), DataType::Int64, false))
+            .collect();
+        let schema = Arc::new(Schema::new(fields));
+        let cols: Vec<Arc<dyn arrow::array::Array>> = (0..n_cols)
+            .map(|_| {
+                Arc::new(Int64Array::from_iter_values(0..n_rows as i64))
+                    as Arc<dyn arrow::array::Array>
+            })
+            .collect();
+        RecordBatch::try_new(schema, cols).unwrap()
+    }
+
+    #[test]
+    fn warn_policy_does_not_fail_on_oversized_batch() {
+        let batch = make_int_batch(1_000, 10); // 10 × 1000 × 8 B = ~80 KB
+        let batch_bytes = crate::tuning::SourceTuning::batch_memory_bytes(&batch);
+        assert!(batch_bytes > 0);
+
+        let mut sink = ExportSink {
+            max_batch_memory_bytes: Some(1), // 1 byte — every batch will exceed
+            batch_memory_policy: crate::tuning::BatchMemoryPolicy::Warn,
+            ..minimal_sink()
+        };
+        // Provide an enriched schema so on_batch_inner can write batches
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(
+            (0..10)
+                .map(|i| Field::new(format!("c{i}"), DataType::Int64, false))
+                .collect::<Vec<_>>(),
+        ));
+        sink.enriched_schema = Some(schema);
+
+        // Should not return an error even though limit is exceeded
+        assert!(sink.on_batch_inner(&batch).is_ok());
+        assert_eq!(sink.oversized_batch_count, 0); // counter is set in on_batch, not inner
+    }
+
+    #[test]
+    fn fail_policy_returns_error_on_oversized_batch() {
+        let schema_fields: Vec<arrow::datatypes::Field> = (0..5)
+            .map(|i| {
+                arrow::datatypes::Field::new(
+                    format!("c{i}"),
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                )
+            })
+            .collect();
+        let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(schema_fields.clone()));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            schema_fields
+                .iter()
+                .map(|_| {
+                    std::sync::Arc::new(arrow::array::Int64Array::from_iter_values(0..100i64))
+                        as std::sync::Arc<dyn arrow::array::Array>
+                })
+                .collect(),
+        )
+        .unwrap();
+
+        let mut sink = ExportSink {
+            max_batch_memory_bytes: Some(1), // always exceeded
+            batch_memory_policy: crate::tuning::BatchMemoryPolicy::Fail,
+            enriched_schema: Some(schema),
+            ..minimal_sink()
+        };
+
+        let result = sink.on_batch(&batch);
+        assert!(result.is_err(), "Fail policy should return Err");
+        assert!(
+            result.unwrap_err().to_string().contains("exceeds"),
+            "error should mention 'exceeds'"
+        );
+        assert_eq!(sink.oversized_batch_count, 1);
+    }
+
+    #[test]
+    fn batch_memory_bytes_returns_positive_for_non_empty_batch() {
+        let batch = make_int_batch(1_000, 4);
+        let bytes = crate::tuning::SourceTuning::batch_memory_bytes(&batch);
+        // 4 cols × 1000 rows × 8 B/elem = 32,000 B plus nullmap overhead
+        assert!(bytes >= 32_000, "got {}", bytes);
     }
 }

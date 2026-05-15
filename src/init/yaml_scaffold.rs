@@ -282,6 +282,18 @@ fn export_block_lines(
     }
 
     lines.push("    format: parquet".to_string());
+
+    // Row-group auto-tuning: emit for chunked (always large) and full-mode
+    // exports big enough for tuning to have measurable effect.
+    if mode == "chunked" || info.row_estimate > 100_000 {
+        lines.push("    parquet:".to_string());
+        lines.push("      row_group_strategy: auto".to_string());
+        lines.push(format!(
+            "      target_row_group_mb: {}",
+            suggest_row_group_mb(info)
+        ));
+    }
+
     lines.push("    meta_columns:".to_string());
     lines.push("      exported_at: true".to_string());
     lines.push("      row_hash: true".to_string());
@@ -351,6 +363,19 @@ fn destination_scaffold(
             "      path: ./output".to_string(),
         ]
     }
+}
+
+/// Suggest `target_row_group_mb` based on column shape.
+/// Wide tables with many text/JSON columns get smaller groups so downstream
+/// readers can push predicates without decoding the full group.
+fn suggest_row_group_mb(info: &TableInfo) -> u64 {
+    let wide_cols = info.columns.iter().filter(|c| {
+        matches!(
+            c.data_type.to_ascii_lowercase().as_str(),
+            "text" | "varchar" | "character varying" | "jsonb" | "json" | "bytea"
+        )
+    });
+    if wide_cols.count() >= 5 { 64 } else { 128 }
 }
 
 fn suggest_parallel(rows: i64) -> usize {
@@ -441,6 +466,78 @@ mod tests {
         assert!(
             !yaml.contains("    columns:"),
             "columns block must not appear:\n{yaml}"
+        );
+    }
+
+    fn chunked_table(rows: i64, cols: Vec<ColumnInfo>) -> TableInfo {
+        TableInfo {
+            schema: "public".into(),
+            table: "events".into(),
+            row_estimate: rows,
+            total_bytes: None,
+            columns: cols,
+        }
+    }
+
+    #[test]
+    fn chunked_large_table_emits_parquet_block() {
+        let info = chunked_table(
+            2_000_000,
+            vec![
+                col("id", "bigint"),
+                col("name", "text"),
+                col("ts", "timestamptz"),
+            ],
+        );
+        let dest = InitYamlDestination::default();
+        let yaml =
+            generate_config(&info, "postgresql://rivet:rivet@localhost/rivet", &dest).unwrap();
+        assert!(
+            yaml.contains("    parquet:"),
+            "parquet block must be emitted for chunked large table:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("      row_group_strategy: auto"),
+            "auto strategy must be present:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("      target_row_group_mb: 128"),
+            "128 MB target expected for narrow table:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn wide_table_suggests_smaller_row_group_mb() {
+        let info = chunked_table(
+            5_000_000,
+            vec![
+                col("id", "bigint"),
+                col("body", "text"),
+                col("raw_html", "text"),
+                col("metadata", "jsonb"),
+                col("extra", "json"),
+                col("notes", "text"),
+            ],
+        );
+        let dest = InitYamlDestination::default();
+        let yaml =
+            generate_config(&info, "postgresql://rivet:rivet@localhost/rivet", &dest).unwrap();
+        assert!(
+            yaml.contains("      target_row_group_mb: 64"),
+            "wide table (≥5 text/json cols) must suggest 64 MB:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn small_full_mode_table_has_no_parquet_block() {
+        let info = make_table(vec![col("id", "bigint"), col("label", "text")]);
+        // row_estimate = 100 (from make_table), mode = full
+        let dest = InitYamlDestination::default();
+        let yaml =
+            generate_config(&info, "postgresql://rivet:rivet@localhost/rivet", &dest).unwrap();
+        assert!(
+            !yaml.contains("    parquet:"),
+            "small full-mode table must not emit parquet block:\n{yaml}"
         );
     }
 }

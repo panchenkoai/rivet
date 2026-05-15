@@ -15,7 +15,7 @@ use arrow::array::*;
 use arrow::datatypes::*;
 use arrow::record_batch::RecordBatch;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use xxhash_rust::xxh3::xxh3_128;
+use xxhash_rust::xxh3::{xxh3_64, xxh3_128};
 
 // ── test fixture ─────────────────────────────────────────────────────────────
 
@@ -565,6 +565,138 @@ fn bench_mysql_int_bytes(c: &mut Criterion) {
     group.finish();
 }
 
+// ── quality uniqueness: string formatter (before) vs typed hash (after) ──────
+// Mirrors check_uniqueness() in src/quality.rs.
+// Before: HashSet<String> built via ArrayFormatter → one String alloc per row.
+// After:  HashSet<u64>   built via xxh3_64 on raw typed bytes — zero allocs.
+
+fn uniqueness_int64_before(batch: &RecordBatch, col_idx: usize) -> usize {
+    use arrow::array::Array;
+    let col = batch.column(col_idx);
+    let options = arrow::util::display::FormatOptions::default();
+    let fmt = arrow::util::display::ArrayFormatter::try_new(col.as_ref(), &options).unwrap();
+    let mut seen = std::collections::HashSet::new();
+    let mut dupes = 0usize;
+    for row in 0..col.len() {
+        if !col.is_null(row) {
+            let s = fmt.value(row).to_string();
+            if !seen.insert(s) {
+                dupes += 1;
+            }
+        }
+    }
+    dupes
+}
+
+fn uniqueness_int64_after(batch: &RecordBatch, col_idx: usize) -> usize {
+    use arrow::array::{Array, Int64Array};
+    let col = batch.column(col_idx);
+    let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut dupes = 0usize;
+    for row in 0..arr.len() {
+        if !arr.is_null(row) {
+            let h = xxh3_64(&arr.value(row).to_le_bytes());
+            if !seen.insert(h) {
+                dupes += 1;
+            }
+        }
+    }
+    dupes
+}
+
+fn uniqueness_string_before(batch: &RecordBatch, col_idx: usize) -> usize {
+    use arrow::array::Array;
+    let col = batch.column(col_idx);
+    let options = arrow::util::display::FormatOptions::default();
+    let fmt = arrow::util::display::ArrayFormatter::try_new(col.as_ref(), &options).unwrap();
+    let mut seen = std::collections::HashSet::new();
+    let mut dupes = 0usize;
+    for row in 0..col.len() {
+        if !col.is_null(row) {
+            let s = fmt.value(row).to_string();
+            if !seen.insert(s) {
+                dupes += 1;
+            }
+        }
+    }
+    dupes
+}
+
+fn uniqueness_string_after(batch: &RecordBatch, col_idx: usize) -> usize {
+    use arrow::array::{Array, StringArray};
+    let col = batch.column(col_idx);
+    let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut dupes = 0usize;
+    for row in 0..arr.len() {
+        if !arr.is_null(row) {
+            let h = xxh3_64(arr.value(row).as_bytes());
+            if !seen.insert(h) {
+                dupes += 1;
+            }
+        }
+    }
+    dupes
+}
+
+fn bench_uniqueness(c: &mut Criterion) {
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    const ROWS: usize = N_ROWS;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("uuid", DataType::Utf8, true),
+    ]));
+
+    let ids: Vec<Option<i64>> = (0..ROWS as i64)
+        .map(|i| if i % 100 == 0 { None } else { Some(i) })
+        .collect();
+
+    let uuids: Vec<Option<String>> = (0..ROWS)
+        .map(|i| {
+            if i % 100 == 0 {
+                None
+            } else {
+                Some(format!("550e8400-e29b-41d4-a716-{:012}", i))
+            }
+        })
+        .collect();
+    let uuid_refs: Vec<Option<&str>> = uuids.iter().map(|s| s.as_deref()).collect();
+
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(uuid_refs)),
+        ],
+    )
+    .unwrap();
+
+    let mut group = c.benchmark_group("quality_uniqueness");
+    group.throughput(Throughput::Elements(ROWS as u64));
+
+    group.bench_function("int64_string_formatter", |b| {
+        b.iter(|| std::hint::black_box(uniqueness_int64_before(&batch, 0)))
+    });
+
+    group.bench_function("int64_typed_hash", |b| {
+        b.iter(|| std::hint::black_box(uniqueness_int64_after(&batch, 0)))
+    });
+
+    group.bench_function("utf8_string_formatter", |b| {
+        b.iter(|| std::hint::black_box(uniqueness_string_before(&batch, 1)))
+    });
+
+    group.bench_function("utf8_typed_hash", |b| {
+        b.iter(|| std::hint::black_box(uniqueness_string_after(&batch, 1)))
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_csv,
@@ -574,5 +706,6 @@ criterion_group!(
     bench_shape_tracking,
     bench_mysql_parse_time,
     bench_mysql_int_bytes,
+    bench_uniqueness,
 );
 criterion_main!(benches);
