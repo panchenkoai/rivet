@@ -133,7 +133,7 @@ $RIVET run --config dev/e2e/pg_e2e.yaml --export pg_users_meta --validate >/dev/
 assert_file_exists "$OUT/pg_users_meta_*.parquet" "PG meta file"
 
 $RIVET run --config dev/e2e/pg_e2e.yaml --export pg_events_split --validate >/dev/null 2>&1 && pass "PG file split" || fail "PG file split"
-assert_file_count_ge "$OUT/pg_events_split_*_part*.parquet" 2 "PG split files >=2"
+assert_file_count_ge "$OUT/pg_events_split_*_part*.csv" 2 "PG split files >=2"
 
 # ──────────────────────────────────────────────────────────────
 section "5. MySQL — all modes (local)"

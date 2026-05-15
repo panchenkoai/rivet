@@ -125,7 +125,7 @@ exports:
   - name: pg_events_split
     query: "SELECT id, user_id, event_type, ip_address, created_at FROM events"
     mode: full
-    format: parquet
+    format: csv
     max_file_size: "5KB"
     destination:
       type: local

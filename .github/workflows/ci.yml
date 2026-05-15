@@ -145,8 +145,8 @@ jobs:
 
       - name: Seed databases
         run: |
-          cargo run --bin seed -- --target postgres --users 500 --pg-url "postgresql://rivet:rivet@localhost:5432/rivet"
-          cargo run --bin seed -- --target mysql --users 500 --mysql-url "mysql://rivet:rivet@localhost:3306/rivet"
+          PGPASSWORD=rivet psql -h localhost -U rivet -d rivet -f dev/e2e/seed_pg.sql
+          mysql -h 127.0.0.1 -u rivet -privet rivet < dev/e2e/seed_mysql.sql
 
       - name: Build release
         run: cargo build --release
