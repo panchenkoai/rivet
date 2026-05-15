@@ -8,6 +8,7 @@ pub(super) fn check_mysql(
     url: &str,
     tls: Option<&TlsConfig>,
     exports: &[&ExportConfig],
+    silent: bool,
 ) -> Result<()> {
     let pool = crate::source::mysql::connect_pool(url, tls)?;
     let mut conn = pool.get_conn()?;
@@ -15,7 +16,9 @@ pub(super) fn check_mysql(
 
     for export in exports {
         let diag = diagnose_mysql(&mut conn, export, db_max_connections)?;
-        super::print_diagnostic(&diag);
+        if !silent {
+            super::print_diagnostic(&diag);
+        }
     }
 
     Ok(())

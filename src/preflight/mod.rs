@@ -98,8 +98,8 @@ pub fn check(
     let url = config.source.resolve_url()?;
     let tls = config.source.tls.as_ref();
     match config.source.source_type {
-        SourceType::Postgres => postgres::check_postgres(&url, tls, &exports)?,
-        SourceType::Mysql => mysql::check_mysql(&url, tls, &exports)?,
+        SourceType::Postgres => postgres::check_postgres(&url, tls, &exports, json_output)?,
+        SourceType::Mysql => mysql::check_mysql(&url, tls, &exports, json_output)?,
     }
 
     if show_type_report {

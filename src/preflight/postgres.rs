@@ -8,13 +8,16 @@ pub(super) fn check_postgres(
     url: &str,
     tls: Option<&TlsConfig>,
     exports: &[&ExportConfig],
+    silent: bool,
 ) -> Result<()> {
     let mut client = crate::source::postgres::connect_client(url, tls)?;
     let db_max_connections = fetch_max_connections_pg(&mut client);
 
     for export in exports {
         let diag = diagnose_pg(&mut client, export, db_max_connections)?;
-        super::print_diagnostic(&diag);
+        if !silent {
+            super::print_diagnostic(&diag);
+        }
     }
 
     Ok(())
