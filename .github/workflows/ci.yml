@@ -143,13 +143,13 @@ jobs:
           echo "Waiting for MySQL..."
           for i in $(seq 1 30); do docker compose exec -T mysql mysqladmin ping -h localhost -uroot -privet 2>/dev/null && break || sleep 2; done
 
+      - name: Build release
+        run: cargo build --release
+
       - name: Seed databases
         run: |
           PGPASSWORD=rivet psql -h localhost -U rivet -d rivet -f dev/e2e/seed_pg.sql
           mysql -h 127.0.0.1 -u rivet -privet rivet < dev/e2e/seed_mysql.sql
-
-      - name: Build release
-        run: cargo build --release
 
       - name: Run E2E test suite
         env:
