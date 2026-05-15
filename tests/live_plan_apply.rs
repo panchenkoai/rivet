@@ -560,16 +560,17 @@ exports:
     );
 
     // Verify exactly 20 rows (ids 0..=19) were written: query the state DB.
+    // total_rows lives in export_metrics, not run_journal (journal stores a JSON blob).
     let db_path = cfg_dir.path().join(".rivet_state.db");
     let conn = rusqlite::Connection::open(&db_path).expect("open state db after apply");
     let rows_written: i64 = conn
         .query_row(
-            "SELECT rows_written FROM run_journal \
-             WHERE export_name = ?1 ORDER BY finished_at DESC LIMIT 1",
+            "SELECT total_rows FROM export_metrics \
+             WHERE export_name = ?1 ORDER BY run_at DESC LIMIT 1",
             [table.name()],
             |r| r.get(0),
         )
-        .expect("query rows_written from run_journal");
+        .expect("query total_rows from export_metrics");
     assert_eq!(
         rows_written, 20,
         "plan --param max_id=19 must export exactly 20 rows (ids 0..=19); got {rows_written}"
