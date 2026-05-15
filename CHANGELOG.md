@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.5.2 (2026-05-15)
+
+### Wave 2 live E2E test suite — full CLI flag coverage with behavioral assertions
+
+56 live integration tests across 5 new test files. Every CLI flag now has at least
+one end-to-end test that verifies observable behavior, not just exit code.
+
+#### New test files
+
+- **`tests/live_init.rs`** (I1–I5) — schema-wide discovery, single-table init,
+  `--out` flag, MySQL init, unreachable-URL error message.
+- **`tests/live_init_extended.rs`** (IE1–IE5) — `--source-env`, `--source-file`,
+  `--schema`, `--discover` JSON artifact, unset env var error.
+- **`tests/live_plan_apply.rs`** (PA-L1–PA-L8) — plan+apply round-trips (full +
+  chunked), credential redaction, staleness gate, `--force`, missing plan file,
+  `--param` substitution with DB row-count verification.
+- **`tests/live_reconcile_repair.rs`** (RR1–RR6 + RR4b) — reconcile pretty/JSON/file
+  output, repair dry-run, `--execute`, `--format json`, and `--report` flag
+  exercising the precomputed reconcile JSON path.
+- **`tests/live_cli_flags.rs`** (31 tests) — `rivet run`, `rivet check`,
+  `rivet doctor`, `rivet state`, `rivet metrics`, `rivet journal`, `rivet completions`.
+
+#### Assertion hardening (previously "conscious compromise")
+
+All 8 previously weak behavioral assertions replaced with concrete checks:
+
+| Test | Before | After |
+|---|---|---|
+| `run_reconcile_flag_exits_zero_when_counts_match` | exit 0 only | `total_rows==25` in JSON + `"MATCH"` in stderr |
+| `check_json_flag_outputs_type_report_as_json` | parse first `{` line | parse full `ExportTypeReport`; verify export name, column names, zero violations |
+| `check_param_flag_substitutes_in_query` | exit 0 only | `--json` verifies column discovery + zero violations |
+| `check_type_report_shows_column_table` | `contains("id") \|\| contains("name")` | `contains("int8")` AND `contains("exact")` |
+| `state_chunks_shows_checkpoint_table` | output text only | DB query: `COUNT(chunk_task WHERE status='completed') == 2` |
+| `metrics_last_flag_limits_output` | fragile `!starts_with("EXPORT")` filter | run_id–based: newer present, older absent |
+| `journal_shows_run_summary` | `"success" \|\| table.name()` | two `&&` assertions: both required |
+| `check_mysql_basic_exits_zero` | `\|\| contains("pass")` matched "password" | removed; asserts `contains(table.name())` only |
+
+#### Source fixes uncovered during test authoring
+
+- `src/init/postgres.rs`: `::regclass` cast → `to_regclass()` for graceful
+  table-disappear handling during schema-wide discovery.
+- `src/init/mod.rs`: `introspect_all` skips "not found or has no columns" errors
+  gracefully instead of aborting the entire init.
+
+---
+
 ## 0.5.1 (2026-05-15)
 
 ### Stabilization: correctness tests, benchmark evidence, best-practice docs
