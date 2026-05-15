@@ -25,7 +25,7 @@ const N_ROWS: usize = 10_000;
 fn narrow_batch(n: usize) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
-        Field::new("score", DataType::Float64, false),
+        Field::new("score", DataType::Int64, false),
         Field::new("cat", DataType::Int64, false),
         Field::new("flag", DataType::Int64, false),
         Field::new("ts", DataType::Int64, false),
