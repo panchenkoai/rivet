@@ -44,12 +44,15 @@ pub(super) fn introspect(url: &str, schema: &str, table: &str) -> Result<TableIn
         .filter(|v| *v > 0);
 
     // Primary key columns
+    // to_regclass() returns NULL (no error) when the table disappears between
+    // list_tables and introspect — possible under concurrent test table drops.
     let pk_rows = client.query(
         "SELECT a.attname
          FROM pg_index i
          JOIN pg_attribute a ON a.attrelid = i.indrelid
              AND a.attnum = ANY(i.indkey)
-         WHERE i.indrelid = ($1 || '.' || $2)::regclass
+         WHERE i.indrelid = to_regclass($1 || '.' || $2)
+           AND i.indrelid IS NOT NULL
            AND i.indisprimary",
         &[&schema, &table],
     )?;

@@ -31,7 +31,7 @@ fn narrow_batch(n: usize) -> RecordBatch {
         Field::new("ts", DataType::Int64, false),
     ]));
     let col = |off: i64| -> Arc<dyn Array> {
-        Arc::new(Int64Array::from_iter_values((off..off + n as i64)))
+        Arc::new(Int64Array::from_iter_values(off..off + n as i64))
     };
     RecordBatch::try_new(
         schema,

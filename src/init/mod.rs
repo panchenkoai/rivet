@@ -311,7 +311,13 @@ fn introspect_all(source_url: &str, schema: Option<&str>) -> Result<Vec<TableInf
             let names = postgres::list_tables(source_url, sch)?;
             let mut out = Vec::with_capacity(names.len());
             for n in names {
-                out.push(postgres::introspect(source_url, sch, &n)?);
+                match postgres::introspect(source_url, sch, &n) {
+                    Ok(info) => out.push(info),
+                    // Table may have been dropped between list_tables and introspect.
+                    // Skip it rather than aborting the whole schema scan.
+                    Err(e) if e.to_string().contains("not found or has no columns") => {}
+                    Err(e) => return Err(e),
+                }
             }
             Ok(out)
         }
