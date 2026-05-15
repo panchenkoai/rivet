@@ -192,19 +192,8 @@ pub(super) fn run_single_export(
         sink.total_rows
     );
 
-    if sink.total_rows == 0 {
-        if plan.skip_empty {
-            summary.status = "skipped".into();
-            log::info!(
-                "export '{}': skipped (0 rows, skip_empty=true)",
-                plan.export_name
-            );
-        } else {
-            log::info!("export '{}': no data to export", plan.export_name);
-        }
-        return Ok(());
-    }
-
+    // Run quality checks BEFORE the empty-export early return so that
+    // row_count_min fires even when the source returned zero rows.
     let quality_issues = sink.run_quality_checks();
     if !quality_issues.is_empty() {
         for issue in &quality_issues {
@@ -228,6 +217,19 @@ pub(super) fn run_single_export(
     }
     if plan.quality.is_some() {
         summary.quality_passed = Some(true);
+    }
+
+    if sink.total_rows == 0 {
+        if plan.skip_empty {
+            summary.status = "skipped".into();
+            log::info!(
+                "export '{}': skipped (0 rows, skip_empty=true)",
+                plan.export_name
+            );
+        } else {
+            log::info!("export '{}': no data to export", plan.export_name);
+        }
+        return Ok(());
     }
 
     if sink.part_rows > 0 {

@@ -169,6 +169,30 @@ The **Resources** section shows:
 | `Throttle` | Delay between batches to reduce source load (omitted when 0). |
 | `⚠ Wide tables may use…` | Shown when the upper bound exceeds 128 MB/batch — consider `batch_size_memory_mb` or a lower `batch_size`. |
 
+### Memory estimate methodology — advisory only
+
+> **The memory estimate in `rivet plan` is a heuristic, not a guarantee.** Treat it as a planning signal, not a hard prediction.
+
+`rivet plan` does not sample the table. It computes the batch memory range using two fixed assumptions:
+
+- **Narrow bound** — 200 B per row (all INTEGER / BIGINT / TIMESTAMPTZ columns)
+- **Wide bound** — 10 KB per row (all TEXT / JSONB / BYTEA columns)
+
+For most real tables the actual per-row size falls between these two bounds. The narrow bound is a reliable floor for numeric-heavy schemas; the wide bound is a reliable ceiling for text-heavy schemas.
+
+**What the estimate does not capture:**
+
+| Factor | Effect on actual RSS |
+|--------|---------------------|
+| Highly variable TEXT/BLOB values | Actual batches can be 2–10× the wide estimate |
+| Sparse nullable columns | Actual batches will be below the narrow estimate |
+| Compression buffers in the Parquet writer | Adds 50–200 MB on top of the Arrow batch size |
+| Tokio runtime, connection pool, jemalloc | Adds 50–150 MB baseline overhead |
+
+**How to get a precise number:** run `rivet run` once with `RUST_LOG=info` against a representative sample, then check the `peak_rss` in the logged summary or in `rivet state metrics`. That measured value from your actual data is more reliable than any pre-run estimate.
+
+**Planned enhancement:** a future `rivet plan --sample N` flag will query up to N rows to compute a data-driven row-width estimate. This will narrow the uncertainty for variable-width schemas without a full table scan.
+
 ### Plan artifact structure
 
 The JSON artifact (`--format json`) contains:

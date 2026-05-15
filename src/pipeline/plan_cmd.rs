@@ -21,6 +21,7 @@ use crate::plan::{
     campaign::recommend_campaign,
     inputs::{PrioritizationHints, build_prioritization_inputs},
     recommend::recommend_export,
+    validate::{DiagnosticLevel, validate_plan},
 };
 use crate::state::StateStore;
 use crate::{preflight, source};
@@ -116,12 +117,28 @@ fn build_plan_artifact(
 ) -> Result<(PlanArtifact, PrioritizationInputs, ExportRecommendation)> {
     let plan = build_plan(config, export, config_dir, false, false, false, params)?;
 
+    // Collect plan-level compatibility diagnostics and emit Rejected ones as errors.
+    let validate_diags = validate_plan(&plan);
+    let mut validate_warnings: Vec<String> = Vec::new();
+    for d in &validate_diags {
+        match d.level {
+            DiagnosticLevel::Rejected => {
+                anyhow::bail!("[{}] {}", d.rule, d.message);
+            }
+            DiagnosticLevel::Warning | DiagnosticLevel::Degraded => {
+                validate_warnings.push(format!("[{}] {}", d.rule, d.message));
+            }
+        }
+    }
+
     let (computed, plan_diagnostics, hints) = match preflight::get_export_diagnostic(config, export)
     {
         Ok(diag) => {
+            let mut warnings = diag.warnings.clone();
+            warnings.extend(validate_warnings);
             let plan_diagnostics = PlanDiagnostics {
                 verdict: diag.verdict.to_string(),
-                warnings: diag.warnings.clone(),
+                warnings,
                 recommended_profile: diag.recommended_profile.to_string(),
             };
             let computed = compute_plan_data(&plan, diag.row_estimate, state)?;
@@ -138,9 +155,11 @@ fn build_plan_artifact(
                 e
             );
             let computed = compute_plan_data(&plan, None, state)?;
+            let mut warnings = vec!["preflight diagnostics unavailable".into()];
+            warnings.extend(validate_warnings);
             let plan_diagnostics = PlanDiagnostics {
                 verdict: "unknown (preflight failed)".into(),
-                warnings: vec!["preflight diagnostics unavailable".into()],
+                warnings,
                 recommended_profile: "balanced".into(),
             };
             (computed, plan_diagnostics, PrioritizationHints::default())

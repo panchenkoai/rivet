@@ -33,6 +33,7 @@ pub fn validate_plan(plan: &ResolvedRunPlan) -> Vec<Diagnostic> {
     check_incremental_reconcile(&mut diags, plan);
     check_time_window_reconcile(&mut diags, plan);
     check_quality_chunked(&mut diags, plan);
+    check_quality_unique_no_cap(&mut diags, plan);
     check_resume_without_checkpoint(&mut diags, plan);
     check_stdout_manifest(&mut diags, plan);
 
@@ -142,6 +143,26 @@ fn check_time_window_reconcile(diags: &mut Vec<Diagnostic>, plan: &ResolvedRunPl
                 "export '{}': reconcile runs COUNT(*) on the full base query but only \
                  rows within the configured time window are exported; the count will always \
                  appear mismatched",
+                plan.export_name
+            ),
+        });
+    }
+}
+
+/// `unique_columns` without `unique_max_entries` — uniqueness tracking on high-cardinality
+/// columns (id, uuid, email) can grow unbounded in memory.  A cap should be set.
+fn check_quality_unique_no_cap(diags: &mut Vec<Diagnostic>, plan: &ResolvedRunPlan) {
+    if let Some(q) = &plan.quality
+        && !q.unique_columns.is_empty()
+        && q.unique_max_entries.is_none()
+    {
+        diags.push(Diagnostic {
+            level: DiagnosticLevel::Warning,
+            rule: "quality-unique-no-cap",
+            message: format!(
+                "export '{}': unique_columns is configured without unique_max_entries — \
+                 uniqueness tracking can grow unbounded on high-cardinality columns. \
+                 Set unique_max_entries to cap memory usage (e.g. unique_max_entries: 1000000).",
                 plan.export_name
             ),
         });
@@ -727,6 +748,75 @@ mod tests {
             diags.len(),
             2,
             "exactly 2 diagnostics expected for this combination, got: {:?}",
+            rules(&diags)
+        );
+    }
+
+    // ── quality-unique-no-cap ──────────────────────────────────────────────────
+
+    #[test]
+    fn unique_columns_without_cap_warns() {
+        let mut p = base_plan();
+        p.quality = Some(QualityConfig {
+            row_count_min: None,
+            row_count_max: None,
+            null_ratio_max: Default::default(),
+            unique_columns: vec!["id".into()],
+            unique_max_entries: None,
+        });
+        let diags = validate_plan(&p);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.rule == "quality-unique-no-cap" && d.level == DiagnosticLevel::Warning),
+            "expected quality-unique-no-cap warning, got: {:?}",
+            rules(&diags)
+        );
+    }
+
+    #[test]
+    fn unique_columns_with_cap_is_clean() {
+        let mut p = base_plan();
+        p.quality = Some(QualityConfig {
+            row_count_min: None,
+            row_count_max: None,
+            null_ratio_max: Default::default(),
+            unique_columns: vec!["id".into()],
+            unique_max_entries: Some(1_000_000),
+        });
+        let diags = validate_plan(&p);
+        assert!(
+            diags.iter().all(|d| d.rule != "quality-unique-no-cap"),
+            "with cap set, no quality-unique-no-cap warning expected; got: {:?}",
+            rules(&diags)
+        );
+    }
+
+    #[test]
+    fn quality_no_unique_columns_does_not_warn_about_cap() {
+        let mut p = base_plan();
+        p.quality = Some(QualityConfig {
+            row_count_min: Some(1),
+            row_count_max: None,
+            null_ratio_max: Default::default(),
+            unique_columns: vec![],
+            unique_max_entries: None,
+        });
+        let diags = validate_plan(&p);
+        assert!(
+            diags.iter().all(|d| d.rule != "quality-unique-no-cap"),
+            "empty unique_columns must not trigger no-cap warning; got: {:?}",
+            rules(&diags)
+        );
+    }
+
+    #[test]
+    fn no_quality_config_does_not_warn_about_cap() {
+        let p = base_plan();
+        let diags = validate_plan(&p);
+        assert!(
+            diags.iter().all(|d| d.rule != "quality-unique-no-cap"),
+            "absent quality config must not trigger no-cap warning; got: {:?}",
             rules(&diags)
         );
     }

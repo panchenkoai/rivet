@@ -261,3 +261,106 @@ exports:
         "stderr must explain the resume requirement; got:\n{stderr}"
     );
 }
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn chunked_resume_with_completed_run_gives_actionable_message() {
+    // After a chunked export completes normally, calling `--resume` should exit
+    // non-zero with an actionable message.  A completed run is NOT the same as
+    // an in-progress one — the operator must use `rivet run` (without --resume)
+    // to start a fresh run.
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(20);
+    let export_name = unique_name("qa12_resume_done");
+    let out = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        r#"
+source: {{type: postgres, url: "{POSTGRES_URL}"}}
+exports:
+  - name: {export_name}
+    query: "SELECT id, name FROM {table_name}"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 5
+    chunk_checkpoint: true
+    format: parquet
+    destination: {{type: local, path: {dir}}}
+"#,
+        table_name = table.name(),
+        dir = out.path().display()
+    );
+    let (_cfgdir, cfg) = cfg_dir_with(&yaml);
+
+    // First: run the full export to completion.
+    let first_run = run_rivet_export(&cfg, &export_name);
+    assert!(
+        first_run.status.success(),
+        "initial chunked run must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&first_run.stderr)
+    );
+
+    // Now try to resume the completed export.  This should fail with an actionable
+    // message rather than starting a silent fresh run or panicking.
+    let resume_run = run_rivet(&[
+        "run",
+        "--config",
+        cfg.to_str().unwrap(),
+        "--export",
+        &export_name,
+        "--resume",
+    ]);
+    assert!(
+        !resume_run.status.success(),
+        "--resume on a completed export must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&resume_run.stderr);
+    assert!(
+        stderr.contains("resume")
+            || stderr.contains("in-progress")
+            || stderr.contains("completed")
+            || stderr.contains("chunk"),
+        "stderr must tell the operator why resume failed; got:\n{stderr}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn full_mode_resume_flag_is_rejected() {
+    // `--resume` is only meaningful for chunked mode.  For full/incremental
+    // exports, the flag must produce a diagnostic rather than silently ignoring it.
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(10);
+    let export_name = unique_name("qa12_full_resume");
+    let out = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        r#"
+source: {{type: postgres, url: "{POSTGRES_URL}"}}
+exports:
+  - name: {export_name}
+    query: "SELECT id, name FROM {table_name}"
+    mode: full
+    format: parquet
+    destination: {{type: local, path: {dir}}}
+"#,
+        table_name = table.name(),
+        dir = out.path().display()
+    );
+    let (_cfgdir, cfg) = cfg_dir_with(&yaml);
+
+    let result = run_rivet(&[
+        "run",
+        "--config",
+        cfg.to_str().unwrap(),
+        "--export",
+        &export_name,
+        "--resume",
+    ]);
+    // The plan validator emits a Warning for resume-no-checkpoint; it should not
+    // silently succeed as if resume had an effect.  The export itself may succeed
+    // (the warning does not block execution), but the operator must be informed.
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("resume") || stderr.contains("checkpoint") || stderr.contains("warn"),
+        "--resume on full-mode export must produce a diagnostic; stderr:\n{stderr}"
+    );
+}

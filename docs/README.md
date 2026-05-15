@@ -63,6 +63,20 @@ Short terminal walkthroughs in [gifs/](gifs/):
 | Supported PostgreSQL / MySQL versions and test matrix | [reference/compatibility.md](reference/compatibility.md) |
 | Offline + live test matrix, harness, fault-injection hook | [reference/testing.md](reference/testing.md) |
 
+## Best Practices
+
+Practical guides explaining *why* settings matter and *when* to use them.
+
+| Guide | What it covers |
+|-------|---------------|
+| [Resource-aware extraction](best-practices/resource-aware-extraction.md) | Memory budgets, `warn`/`fail`/`auto_shrink` policies, RSS formula |
+| [Parquet tuning](best-practices/parquet-tuning.md) | Row group strategies, target sizes, downstream read implications |
+| [Compression profiles](best-practices/compression-profiles.md) | Profile-to-codec mapping, CPU/size trade-offs |
+| [Quality checks](best-practices/quality-checks.md) | Row count gates, null ratio, uniqueness cap (`unique_max_entries`) |
+| [Low-memory runners](best-practices/low-memory-runners.md) | Settings for 512 MB–4 GB hosts; `auto_shrink` guarantees and caveats |
+| [Recovery and resume](best-practices/recovery-and-resume.md) | `--resume` semantics, crash recovery, state inspection |
+| [Benchmark methodology](best-practices/benchmark-methodology.md) | How to run and interpret E2E and Criterion benchmarks; version comparison |
+
 ## Architecture
 
 | Topic | Guide |

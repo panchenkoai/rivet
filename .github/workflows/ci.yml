@@ -1,7 +1,7 @@
 name: CI
 
 # Required branch-protection checks (set in Settings → Branches → main):
-#   fmt · clippy · test · test-invariants · test-recovery · test-compatibility
+#   fmt · clippy · test · test-invariants · test-recovery · test-compatibility · test-stability
 #
 # The three semantic-gate jobs below run each suite in isolation so GitHub can
 # block merges on named regressions, not just overall build failures.
@@ -82,6 +82,22 @@ jobs:
           toolchain: "1.94"
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --lib -- plan::validate::tests
+
+  test-stability:
+    name: Stability tests — Phase 1 (semantic gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+      - name: Format & row-group golden tests
+        run: cargo test --test format_golden
+      - name: Sink unit tests (quality cap, auto_shrink)
+        run: cargo test --lib -- pipeline::sink::tests
+      - name: Plan validate unit tests
+        run: cargo test --lib -- plan::validate::tests
 
   test-type-golden:
     name: Type-golden tests (semantic gate)

@@ -226,6 +226,38 @@ pub fn seed_pg_numeric_table(row_count: i64) -> PgTable {
     PgTable { name }
 }
 
+/// Seed a wide-text Postgres table: `(id BIGINT, payload TEXT, updated_at TIMESTAMPTZ)`
+/// where every row contains `payload_len` repetitions of 'x'.  Useful for triggering the
+/// batch memory cap — with 2000 rows and 600-char payloads the Arrow StringArray
+/// buffer is ~1.2 MB, reliably exceeding a `max_batch_memory_mb: 1` cap.
+///
+/// `payload_len = 0` uses the default of 600 characters.
+pub fn seed_pg_wide_table(row_count: i64, payload_len: usize) -> PgTable {
+    let payload_len = if payload_len == 0 { 600 } else { payload_len };
+    let name = unique_name("rivet_wide_tbl");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {name} (
+            id BIGINT PRIMARY KEY,
+            payload TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );"
+    ))
+    .expect("create wide table");
+
+    if row_count > 0 {
+        c.batch_execute(&format!(
+            "INSERT INTO {name} (id, payload, updated_at)
+             SELECT g, repeat('x', {payload_len}),
+                    now() - (interval '1 second') * ({row_count} + 1 - g)
+             FROM generate_series(1, {row_count}) g;"
+        ))
+        .expect("seed wide table rows");
+    }
+
+    PgTable { name }
+}
+
 // ─── MySQL helpers ─────────────────────────────────────────────────────────
 
 /// Open a fresh MySQL connection to the primary instance.
@@ -309,6 +341,17 @@ pub fn write_config(tmpdir: &tempfile::TempDir, yaml: &str) -> PathBuf {
 pub fn run_rivet(args: &[&str]) -> Output {
     Command::new(RIVET_BIN)
         .args(args)
+        .output()
+        .expect("spawn rivet binary")
+}
+
+/// Like `run_rivet` but sets `RUST_LOG=warn` so that `log::warn!` output is
+/// visible in stderr.  Use this when a test needs to assert on warning messages
+/// emitted via the log crate (plan validation warnings, quality warnings, etc.).
+pub fn run_rivet_with_warn_log(args: &[&str]) -> Output {
+    Command::new(RIVET_BIN)
+        .args(args)
+        .env("RUST_LOG", "warn")
         .output()
         .expect("spawn rivet binary")
 }

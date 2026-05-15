@@ -81,6 +81,10 @@ criterion = { version = "0.5", features = ["html_reports"] }
 name = "hot_paths"
 harness = false
 
+[[bench]]
+name = "resource_aware"
+harness = false
+
 [features]
 default = ["jemalloc"]
 jemalloc = ["tikv-jemallocator"]

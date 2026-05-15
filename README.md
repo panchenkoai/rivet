@@ -120,6 +120,56 @@ cargo build --release
 
 ---
 
+## Resource-aware extraction
+
+Rivet v0.5.x adds explicit controls over how much RAM, CPU, and disk a run is allowed to consume. These are production-safety primitives, not performance knobs.
+
+### Memory controls
+
+| Setting | What it controls |
+|---------|-----------------|
+| `tuning.max_batch_memory_mb` | Hard cap on a single Arrow batch. When exceeded, the `on_batch_memory_exceeded` policy fires. |
+| `tuning.on_batch_memory_exceeded` | `warn` (log + continue) · `fail` (abort) · `auto_shrink` (split batch recursively, then continue) |
+| `tuning.memory_threshold_mb` | Process-level RSS guard — pauses fetching when RSS exceeds the threshold |
+| `tuning.batch_size_memory_mb` | Adaptive batch sizing: Rivet samples the first batch to estimate row width, then adjusts subsequent batch sizes automatically |
+
+### Output controls
+
+| Setting | What it controls |
+|---------|-----------------|
+| `compression_profile` | `none` / `fast` (Snappy) / `balanced` (Zstd-3) / `compact` (Zstd-9) |
+| `parquet.row_group_strategy` | `auto` (schema-based estimate) / `fixed_rows` / `fixed_memory` |
+| `parquet.target_row_group_mb` | Target row group size; lower values reduce peak RSS during Parquet writes |
+
+### Quality gates
+
+| Setting | What it controls |
+|---------|-----------------|
+| `quality.row_count_min` / `row_count_max` | Fail the export if row count is outside this range — fires even when the source returns 0 rows |
+| `quality.null_ratio_max` | Fail the export if the null ratio in a column exceeds the threshold |
+| `quality.unique_columns` | Track column uniqueness via typed xxHash3-64 hashing |
+| `quality.unique_max_entries` | Cap the uniqueness hash set to prevent unbounded memory growth on high-cardinality columns |
+
+### Choosing settings for your environment
+
+| Environment | Recommended starting point |
+|-------------|---------------------------|
+| Production database (shared) | `profile: safe`, `max_batch_memory_mb: 128`, `on_batch_memory_exceeded: warn` |
+| CI / strict pipeline | `max_batch_memory_mb: 128`, `on_batch_memory_exceeded: fail` |
+| Low-memory host (1–2 GB) | `profile: safe`, `max_batch_memory_mb: 64`, `on_batch_memory_exceeded: auto_shrink` |
+| Read replica / fast backfill | `profile: fast`, `compression_profile: fast` |
+
+See the **[Best Practices guides](docs/best-practices/)** for detailed explanations, trade-off analysis, and worked examples:
+
+- [Resource-aware extraction](docs/best-practices/resource-aware-extraction.md) — memory budgets, policies, RSS formula
+- [Parquet tuning](docs/best-practices/parquet-tuning.md) — row group strategies, targets, downstream read implications
+- [Compression profiles](docs/best-practices/compression-profiles.md) — profile-to-codec mapping, CPU/size trade-offs
+- [Quality checks](docs/best-practices/quality-checks.md) — row count gates, null ratio, uniqueness cap
+- [Low-memory runners](docs/best-practices/low-memory-runners.md) — settings for 512 MB–4 GB hosts
+- [Recovery and resume](docs/best-practices/recovery-and-resume.md) — `--resume` semantics, crash recovery
+
+---
+
 ## Releases and roadmap
 
 - **Latest release and version history:** [CHANGELOG.md](CHANGELOG.md).

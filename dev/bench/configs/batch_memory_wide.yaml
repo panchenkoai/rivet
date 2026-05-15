@@ -1,0 +1,31 @@
+# Batch memory policy benchmark — wide text table (100 000 rows × 10 TEXT cols).
+#
+# Demonstrates auto_shrink split overhead vs baseline (no cap).
+# Run three times changing `POLICY`: warn | fail | auto_shrink
+# and once with no cap (comment out tuning block).
+#
+# Metric to capture: wall time, peak RSS, output file size, split count (stderr).
+#
+# Usage (from repo root):
+#   POLICY=auto_shrink ./dev/bench/run_bench.sh batch_memory
+
+source:
+  type: postgres
+  url: "${POSTGRES_URL}"
+
+exports:
+  - name: bench_batch_memory
+    query: "SELECT * FROM bench_wide"
+    mode: full
+    format: parquet
+    compression_profile: balanced
+    destination:
+      type: local
+      path: "${BENCH_OUT:-/tmp/rivet_bench}/batch_memory_${POLICY:-auto_shrink}"
+    parquet:
+      row_group_strategy: auto
+      target_row_group_mb: 64
+    tuning:
+      batch_size: 10000
+      max_batch_memory_mb: "${CAP_MB:-64}"
+      on_batch_memory_exceeded: "${POLICY:-auto_shrink}"

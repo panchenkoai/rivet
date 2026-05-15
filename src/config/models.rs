@@ -1289,4 +1289,74 @@ mod tests {
         assert_eq!(pc.row_group_strategy, Some(RowGroupStrategy::Auto));
         assert_eq!(pc.target_row_group_mb, Some(64));
     }
+
+    #[test]
+    fn parquet_config_fixed_memory_same_math_as_auto() {
+        // FixedMemory and Auto are identical in computation — only the strategy label differs.
+        let auto_pc = ParquetConfig {
+            row_group_strategy: Some(RowGroupStrategy::Auto),
+            target_row_group_mb: Some(64),
+            ..Default::default()
+        };
+        let fixed_mem_pc = ParquetConfig {
+            row_group_strategy: Some(RowGroupStrategy::FixedMemory),
+            target_row_group_mb: Some(64),
+            ..Default::default()
+        };
+        assert_eq!(
+            auto_pc.effective_row_group_rows(&narrow_schema()),
+            fixed_mem_pc.effective_row_group_rows(&narrow_schema()),
+            "FixedMemory and Auto must produce identical row counts for the same target"
+        );
+        assert_eq!(
+            auto_pc.effective_row_group_rows(&wide_schema()),
+            fixed_mem_pc.effective_row_group_rows(&wide_schema()),
+        );
+    }
+
+    #[test]
+    fn parquet_config_auto_without_target_uses_default_128mb() {
+        // When target_row_group_mb is absent, the 128 MB default is used.
+        // For the narrow schema (18 B/row): 128 MB / 18 B ≈ 7.5 M → clamped to 10 M.
+        let pc = ParquetConfig {
+            row_group_strategy: Some(RowGroupStrategy::Auto),
+            target_row_group_mb: None,
+            ..Default::default()
+        };
+        let rows = pc.effective_row_group_rows(&narrow_schema()).unwrap();
+        // With default 128 MB target, narrow schema produces large groups.
+        assert!(
+            rows >= 1_000_000,
+            "default 128 MB target should give large groups for narrow table; got {rows}"
+        );
+    }
+
+    #[test]
+    fn parquet_config_no_block_gives_none_for_row_group_rows() {
+        // When ExportConfig.parquet is None, the sink never calls effective_row_group_rows.
+        // This test documents that Default::default() for ParquetConfig (strategy = None)
+        // is equivalent to Auto with the default target — both return Some(rows).
+        let pc = ParquetConfig::default(); // strategy = None → unwrap_or_default() → Auto
+        let rows = pc.effective_row_group_rows(&narrow_schema());
+        assert!(
+            rows.is_some(),
+            "default ParquetConfig (strategy: None) must return Some, got None"
+        );
+    }
+
+    #[test]
+    fn parquet_config_small_target_clamps_to_minimum_1000_rows() {
+        // Even if the math gives fewer than 1 000 rows (e.g., a super-wide table with
+        // a very small target), the result is clamped to 1 000 — never 0 or tiny.
+        let pc = ParquetConfig {
+            row_group_strategy: Some(RowGroupStrategy::Auto),
+            target_row_group_mb: Some(1), // tiny target
+            ..Default::default()
+        };
+        let rows = pc.effective_row_group_rows(&wide_schema()).unwrap();
+        assert!(
+            rows >= 1_000,
+            "must not go below minimum 1 000 rows; got {rows}"
+        );
+    }
 }

@@ -1,0 +1,42 @@
+# Quality uniqueness benchmark — high-cardinality UUID/email table (200 000 rows).
+#
+# Demonstrates memory cost of uniqueness tracking with and without a cap.
+# Run twice: with `unique_max_entries` set vs. absent (comment out).
+#
+# Metric to capture: wall time, peak RSS.
+#
+# Usage (from repo root):
+#   ./dev/bench/run_bench.sh quality_cap     # with cap
+#   ./dev/bench/run_bench.sh quality_no_cap  # without cap
+
+source:
+  type: postgres
+  url: "${POSTGRES_URL}"
+
+exports:
+  - name: bench_quality_cap
+    query: "SELECT id, uuid_col, email FROM bench_hc"
+    mode: full
+    format: parquet
+    compression_profile: balanced
+    destination:
+      type: local
+      path: "${BENCH_OUT:-/tmp/rivet_bench}/quality_cap"
+    quality:
+      unique_columns: [uuid_col, email]
+      unique_max_entries: 50000
+    tuning:
+      batch_size: 10000
+
+  - name: bench_quality_no_cap
+    query: "SELECT id, uuid_col, email FROM bench_hc"
+    mode: full
+    format: parquet
+    compression_profile: balanced
+    destination:
+      type: local
+      path: "${BENCH_OUT:-/tmp/rivet_bench}/quality_no_cap"
+    quality:
+      unique_columns: [uuid_col, email]
+    tuning:
+      batch_size: 10000
