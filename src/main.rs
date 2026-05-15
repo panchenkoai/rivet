@@ -483,7 +483,7 @@ fn run(command: Commands) -> Result<()> {
                 &config,
                 export.as_deref(),
                 p.as_ref(),
-                type_report || json || tgt.is_some(),
+                type_report || json || strict || tgt.is_some(),
                 strict,
                 json,
                 tgt,
