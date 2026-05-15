@@ -15,6 +15,8 @@ exports:
       prefix: pg/users/
       endpoint: http://127.0.0.1:4443
       allow_anonymous: true
+    columns:
+      balance: decimal(12,2)
 
   - name: pg_orders_gcs_incremental
     query: "SELECT id, user_id, product, quantity, price, status, updated_at FROM orders"
@@ -27,3 +29,5 @@ exports:
       prefix: pg/orders/
       endpoint: http://127.0.0.1:4443
       allow_anonymous: true
+    columns:
+      price: decimal(10,2)

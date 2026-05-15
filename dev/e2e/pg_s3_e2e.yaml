@@ -17,6 +17,8 @@ exports:
       endpoint: http://localhost:9000
       access_key_env: MINIO_ACCESS_KEY
       secret_key_env: MINIO_SECRET_KEY
+    columns:
+      balance: decimal(12,2)
 
   - name: pg_orders_s3_chunked
     query: "SELECT id, user_id, product, quantity, price, status FROM orders"
@@ -33,3 +35,5 @@ exports:
       endpoint: http://localhost:9000
       access_key_env: MINIO_ACCESS_KEY
       secret_key_env: MINIO_SECRET_KEY
+    columns:
+      price: decimal(10,2)

@@ -126,9 +126,9 @@ exports:
     query: "SELECT id, user_id, event_type, ip_address, created_at FROM events"
     mode: full
     format: parquet
-    max_file_size: "20KB"
+    max_file_size: "5KB"
     destination:
       type: local
       path: ./dev/e2e/output
     tuning:
-      batch_size: 2000
+      batch_size: 500
