@@ -18,7 +18,7 @@ use crate::plan::IncrementalCursorPlan;
 use crate::source::pg_numeric_wire::{PgNumericWire, numeric_wire_normalized_plain};
 use crate::source::query::build_incremental_query;
 use crate::source::tls::build_native_tls;
-use crate::tuning::SourceTuning;
+use crate::tuning::{ADAPTIVE_SAMPLE_INTERVAL, SourceTuning, next_adaptive_batch_size};
 use crate::types::CursorState;
 use crate::types::{
     ColumnOverrides, RivetType, SourceColumn, TimeUnit as RivetTimeUnit, TypeMapping,
@@ -136,9 +136,6 @@ impl PostgresSource {
         }
     }
 }
-
-const ADAPTIVE_SAMPLE_INTERVAL: usize = 10;
-const ADAPTIVE_MIN_BATCH: usize = 500;
 
 /// Sample `checkpoints_req` from `pg_stat_bgwriter`.
 ///
@@ -266,11 +263,7 @@ fn pg_run_export(
         {
             let under_pressure = adaptive_last_ckpt.is_some_and(|prev| cur > prev);
             adaptive_last_ckpt = Some(cur);
-            let next = if under_pressure {
-                (fetch_size * 3 / 4).max(ADAPTIVE_MIN_BATCH)
-            } else {
-                (fetch_size * 5 / 4).min(base_fetch_size)
-            };
+            let next = next_adaptive_batch_size(fetch_size, base_fetch_size, under_pressure);
             if next != fetch_size {
                 fetch_size = next;
                 fetch_sql = format!("FETCH {} FROM _rivet", fetch_size);

@@ -591,3 +591,45 @@ fn ascii_table(headers: &[impl AsRef<str>], rows: &[Vec<String>]) -> String {
         format!("{}\n{}\n{}", fmt_row(&header), separator, body)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ascii_table_widens_columns_to_longest_cell() {
+        let headers = ["pid", "state"];
+        let rows = vec![
+            vec!["1".into(), "active".into()],
+            vec!["10000".into(), "idle".into()],
+        ];
+        let out = ascii_table(&headers, &rows);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 4, "header + separator + 2 rows");
+        // pid column widened to 5 (len of "10000"); state column to 6 (len of "active").
+        // Separator uses "-+-" as the cross — adds an extra dash on each side of '+'.
+        assert_eq!(lines[0], "pid   | state ");
+        assert_eq!(lines[1], "------+-------");
+        assert_eq!(lines[2], "1     | active");
+        assert_eq!(lines[3], "10000 | idle  ");
+    }
+
+    #[test]
+    fn ascii_table_renders_header_only_when_no_rows() {
+        let headers = ["col_a", "col_b"];
+        let out = ascii_table(&headers, &[]);
+        // No body line — header + separator only.
+        assert_eq!(out, "col_a | col_b\n------+------");
+    }
+
+    #[test]
+    fn ascii_table_handles_unicode_byte_width() {
+        // String::len() returns byte count, not grapheme count. Cyrillic is 2 bytes/char.
+        // Documenting current behavior so a future width-aware change is intentional.
+        let headers = ["x"];
+        let rows = vec![vec!["ы".into()]]; // 2 bytes
+        let out = ascii_table(&headers, &rows);
+        // Header width = max(1, 2) = 2 bytes — header padded to 2.
+        assert!(out.contains("x "), "header padded to byte-width 2");
+    }
+}

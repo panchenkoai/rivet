@@ -14,15 +14,12 @@ use crate::config::{SourceType, TlsConfig, TlsMode};
 use crate::error::Result;
 use crate::plan::IncrementalCursorPlan;
 use crate::source::query::build_incremental_query;
-use crate::tuning::SourceTuning;
+use crate::tuning::{ADAPTIVE_SAMPLE_INTERVAL, SourceTuning, next_adaptive_batch_size};
 use crate::types::CursorState;
 use crate::types::{
     ColumnOverrides, RivetType, SourceColumn, TimeUnit as RivetTimeUnit, TypeMapping,
     build_arrow_field,
 };
-
-const ADAPTIVE_SAMPLE_INTERVAL: usize = 10;
-const ADAPTIVE_MIN_BATCH: usize = 500;
 
 pub struct MysqlSource {
     pool: Pool,
@@ -249,11 +246,7 @@ fn mysql_run_export(
             {
                 let under_pressure = adaptive_last_waits.is_some_and(|prev| cur > prev);
                 adaptive_last_waits = Some(cur);
-                let next = if under_pressure {
-                    (effective_bs * 3 / 4).max(ADAPTIVE_MIN_BATCH)
-                } else {
-                    (effective_bs * 5 / 4).min(base_fetch_size)
-                };
+                let next = next_adaptive_batch_size(effective_bs, base_fetch_size, under_pressure);
                 if next != effective_bs {
                     effective_bs = next;
                     log::info!(
