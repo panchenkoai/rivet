@@ -59,6 +59,20 @@ impl BatchSink for FailOnFirstBatch {
     }
 }
 
+/// Panics on the first batch — simulates a *non-Result* failure (e.g. an
+/// arithmetic overflow inside a sink) that bypasses `?`-based error handling
+/// entirely.  This is the G1 fault model from the DBA audit: only the RAII
+/// guard's `Drop` can release the cursor + ROLLBACK the txn here.
+struct PanicOnFirstBatch;
+impl BatchSink for PanicOnFirstBatch {
+    fn on_schema(&mut self, _: SchemaRef) -> Result<()> {
+        Ok(())
+    }
+    fn on_batch(&mut self, _: &RecordBatch) -> Result<()> {
+        panic!("injected sink panic — must unwind through pg_run_export");
+    }
+}
+
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
 fn tuning_300s() -> SourceTuning {
@@ -136,6 +150,47 @@ fn pg_connection_usable_and_clean_after_failed_export() {
         timeout, "0",
         "statement_timeout leaked after failed export: got {timeout:?}"
     );
+}
+
+/// **G1 / PgTxnGuard regression test.** Exports against a plain Postgres
+/// connection with a sink that panics on the first batch. The panic unwinds
+/// through `pg_run_export`; only the RAII `PgTxnGuard::drop` can issue
+/// ROLLBACK before the txn leaks into the connection's session state.
+///
+/// We then reuse the same `PostgresSource` for a follow-up query — if the
+/// guard had not rolled back, Postgres would reject the next statement with
+/// `current transaction is aborted` or block on an open BEGIN.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn pg_panic_in_sink_releases_cursor_and_aborts_txn() {
+    use std::panic::AssertUnwindSafe;
+
+    require_alive(LiveService::Postgres);
+
+    let mut source = PostgresSource::connect(POSTGRES_URL).unwrap();
+
+    let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let _ = source.export(
+            "SELECT generate_series(1, 100) AS n",
+            None,
+            None,
+            &tuning_300s(),
+            &ColumnOverrides::default(),
+            &mut PanicOnFirstBatch,
+        );
+    }));
+    assert!(
+        panicked.is_err(),
+        "sink panic must have unwound through pg_run_export"
+    );
+
+    // If PgTxnGuard::drop fired ROLLBACK, the same source's underlying client
+    // is back in autocommit and this scalar query succeeds. If the guard is
+    // absent the connection is stuck in an open or aborted txn.
+    let v = source
+        .query_scalar("SELECT 1::text")
+        .expect("connection is unusable — PgTxnGuard did not roll back on panic");
+    assert_eq!(v.as_deref(), Some("1"));
 }
 
 // ─── MySQL tests ───────────────────────────────────────────────────────────

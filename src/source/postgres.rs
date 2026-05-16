@@ -137,6 +137,50 @@ impl PostgresSource {
     }
 }
 
+/// RAII guard for an open `BEGIN ... COMMIT` block.
+///
+/// `commit()` runs `COMMIT` and marks the txn done; if the guard is dropped
+/// before `commit()` (early return, `?`-bubbled error, or panic-driven unwind),
+/// `Drop` issues a best-effort `ROLLBACK`. Postgres releases any open cursors
+/// as part of ROLLBACK, so the cursor declared inside the txn is also cleaned
+/// up. Closes the **G1** gap from the DBA audit (cursor leak on panic).
+struct PgTxnGuard<'a> {
+    client: &'a mut Client,
+    committed: bool,
+}
+
+impl<'a> PgTxnGuard<'a> {
+    fn begin(client: &'a mut Client) -> Result<Self> {
+        client.batch_execute("BEGIN")?;
+        Ok(Self {
+            client,
+            committed: false,
+        })
+    }
+
+    fn client_mut(&mut self) -> &mut Client {
+        self.client
+    }
+
+    fn commit(mut self) -> Result<()> {
+        self.client.batch_execute("COMMIT")?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for PgTxnGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed
+            && let Err(e) = self.client.batch_execute("ROLLBACK")
+        {
+            // Drop must not panic. Worst case the connection is poisoned and
+            // the pool recycles it; log so operators see it.
+            log::warn!("PgTxnGuard: ROLLBACK during drop failed: {e:#}");
+        }
+    }
+}
+
 /// Sample `checkpoints_req` from `pg_stat_bgwriter`.
 ///
 /// PostgreSQL caches the statistics snapshot at the start of each transaction.
@@ -183,25 +227,25 @@ fn pg_run_export(
     sink: &mut dyn super::BatchSink,
     numeric_hints: Option<&HashMap<String, (u8, i8)>>,
 ) -> Result<(usize, bool)> {
-    client.batch_execute("BEGIN")?;
-
+    // Open the txn under guard *first* — if SET LOCAL or DECLARE fails below,
+    // Drop will roll back. Without the guard, a failure between BEGIN and the
+    // explicit ROLLBACK in the caller would leak a half-set-up txn into the pool.
+    let mut guard = PgTxnGuard::begin(client)?;
     if tuning.statement_timeout_s > 0 {
-        client.batch_execute(&format!(
+        guard.client_mut().batch_execute(&format!(
             "SET LOCAL statement_timeout = '{}s'",
             tuning.statement_timeout_s
         ))?;
     }
     if tuning.lock_timeout_s > 0 {
-        client.batch_execute(&format!(
+        guard.client_mut().batch_execute(&format!(
             "SET LOCAL lock_timeout = '{}s'",
             tuning.lock_timeout_s
         ))?;
     }
-
-    client.batch_execute(&format!(
-        "DECLARE _rivet NO SCROLL CURSOR FOR {}",
-        built_sql
-    ))?;
+    guard
+        .client_mut()
+        .batch_execute(&format!("DECLARE _rivet NO SCROLL CURSOR FOR {built_sql}"))?;
 
     let mut fetch_size = tuning.batch_size;
     let mut fetch_sql = format!("FETCH {} FROM _rivet", fetch_size);
@@ -210,14 +254,14 @@ fn pg_run_export(
     let mut total_rows: usize = 0;
     let mut base_fetch_size = fetch_size;
     let mut adaptive_last_ckpt: Option<i64> = if tuning.adaptive {
-        pg_sample_checkpoints_req(client)
+        pg_sample_checkpoints_req(guard.client_mut())
     } else {
         None
     };
     let mut batch_count: usize = 0;
 
     loop {
-        let rows = client.query(&fetch_sql, &[])?;
+        let rows = guard.client_mut().query(&fetch_sql, &[])?;
         if rows.is_empty() {
             break;
         }
@@ -259,7 +303,7 @@ fn pg_run_export(
         batch_count += 1;
         if tuning.adaptive
             && batch_count.is_multiple_of(ADAPTIVE_SAMPLE_INTERVAL)
-            && let Some(cur) = pg_sample_checkpoints_req(client)
+            && let Some(cur) = pg_sample_checkpoints_req(guard.client_mut())
         {
             let under_pressure = adaptive_last_ckpt.is_some_and(|prev| cur > prev);
             adaptive_last_ckpt = Some(cur);
@@ -290,9 +334,10 @@ fn pg_run_export(
         }
     }
 
-    client.batch_execute("CLOSE _rivet")?;
-    client.batch_execute("COMMIT")?;
-
+    // Explicit CLOSE is technically redundant — COMMIT releases the cursor —
+    // but it documents intent and surfaces any close errors before COMMIT.
+    guard.client_mut().batch_execute("CLOSE _rivet")?;
+    guard.commit()?;
     Ok((total_rows, schema.is_some()))
 }
 
@@ -323,20 +368,16 @@ impl super::Source for PostgresSource {
 
         let numeric_hints = pg_numeric_catalog_hints_opt(&mut self.client, query);
 
-        let result = pg_run_export(
+        // PgTxnGuard inside pg_run_export rolls the txn back automatically on
+        // any error or panic, so no explicit ROLLBACK is needed here.
+        let (total_rows, had_schema) = pg_run_export(
             &mut self.client,
             &built.sql,
             tuning,
             column_overrides,
             sink,
             numeric_hints.as_ref(),
-        );
-
-        if result.is_err() {
-            let _ = self.client.batch_execute("ROLLBACK");
-        }
-
-        let (total_rows, had_schema) = result?;
+        )?;
 
         if !had_schema {
             sink.on_schema(Arc::new(Schema::empty()))?;
