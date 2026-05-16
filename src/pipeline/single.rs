@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use super::RunSummary;
 use super::chunked::{run_chunked_sequential, run_chunked_sequential_checkpoint};
-use super::retry::classify_error;
+use super::retry::{RetryClass, classify_error};
 use super::sink::{CompletedPart, ExportSink};
 use super::validate::validate_output;
 use crate::config::SchemaDriftPolicy;
@@ -31,18 +31,19 @@ pub(crate) fn run_with_reconnect(
     for attempt in 0..=plan.tuning.max_retries {
         if attempt > 0 {
             summary.retries = attempt;
-            let (_, needs_reconnect, extra_delay) = last_err
+            let class = last_err
                 .as_ref()
                 .map(classify_error)
-                .unwrap_or((false, false, 0));
-            let backoff = plan.tuning.retry_backoff_ms * 2u64.pow(attempt - 1) + extra_delay;
+                .unwrap_or(RetryClass::Permanent);
+            let backoff =
+                plan.tuning.retry_backoff_ms * 2u64.pow(attempt - 1) + class.extra_delay_ms();
             log::warn!(
                 "export '{}': retry {}/{} in {}ms{}({})",
                 plan.export_name,
                 attempt,
                 plan.tuning.max_retries,
                 backoff,
-                if needs_reconnect {
+                if class.needs_reconnect() {
                     " [reconnecting] "
                 } else {
                     " "
@@ -66,8 +67,7 @@ pub(crate) fn run_with_reconnect(
         let mut src = match source::create_source(&plan.source) {
             Ok(s) => s,
             Err(e) => {
-                let (transient, _, _) = classify_error(&e);
-                if attempt < plan.tuning.max_retries && transient {
+                if attempt < plan.tuning.max_retries && classify_error(&e).is_transient() {
                     log::warn!(
                         "export '{}': connection failed, will retry: {:#}",
                         plan.export_name,
@@ -83,8 +83,7 @@ pub(crate) fn run_with_reconnect(
         match run_export(&mut *src, state, plan, summary, config_path) {
             Ok(()) => return Ok(()),
             Err(e) => {
-                let (transient, _, _) = classify_error(&e);
-                if attempt < plan.tuning.max_retries && transient {
+                if attempt < plan.tuning.max_retries && classify_error(&e).is_transient() {
                     // Guard: if a file was already committed to the destination, retrying
                     // from the same cursor would re-read the same rows and produce duplicates.
                     if summary.files_committed > 0 {

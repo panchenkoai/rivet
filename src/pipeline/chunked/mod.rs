@@ -41,7 +41,10 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use super::{
-    RunSummary, progress::ChunkProgress, retry::classify_error, sink::ExportSink,
+    RunSummary,
+    progress::ChunkProgress,
+    retry::{RetryClass, classify_error},
+    sink::ExportSink,
     validate::validate_output,
 };
 use crate::error::Result;
@@ -213,11 +216,12 @@ fn run_chunk_with_source_retries(
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..=plan.tuning.max_retries {
         if attempt > 0 {
-            let (_, _needs_reconnect, extra_delay) = last_err
+            let class = last_err
                 .as_ref()
                 .map(classify_error)
-                .unwrap_or((false, false, 0));
-            let backoff = plan.tuning.retry_backoff_ms * 2u64.pow(attempt - 1) + extra_delay;
+                .unwrap_or(RetryClass::Permanent);
+            let backoff =
+                plan.tuning.retry_backoff_ms * 2u64.pow(attempt - 1) + class.extra_delay_ms();
             log::warn!(
                 "export '{}': chunk {} retry {}/{} in {}ms",
                 plan.export_name,
@@ -232,8 +236,7 @@ fn run_chunk_with_source_retries(
         let mut src = match source::create_source(&plan.source) {
             Ok(s) => s,
             Err(e) => {
-                let (transient, _, _) = classify_error(&e);
-                if attempt < plan.tuning.max_retries && transient {
+                if attempt < plan.tuning.max_retries && classify_error(&e).is_transient() {
                     last_err = Some(e);
                     continue;
                 }
@@ -244,8 +247,7 @@ fn run_chunk_with_source_retries(
         match export_one_chunk_range(&mut *src, base_query, cp, start, end, chunk_index, plan) {
             Ok(v) => return Ok(v),
             Err(e) => {
-                let (transient, _, _) = classify_error(&e);
-                if attempt < plan.tuning.max_retries && transient {
+                if attempt < plan.tuning.max_retries && classify_error(&e).is_transient() {
                     last_err = Some(e);
                     continue;
                 }
@@ -581,10 +583,11 @@ pub(super) fn run_chunked_parallel_checkpoint(
                         let mut last_err: Option<anyhow::Error> = None;
                         for attempt in 0..=plan_w.tuning.max_retries {
                             if attempt > 0 {
-                                let (_, _, extra_delay) = last_err
+                                let extra_delay = last_err
                                     .as_ref()
                                     .map(classify_error)
-                                    .unwrap_or((false, false, 0));
+                                    .map(|c| c.extra_delay_ms())
+                                    .unwrap_or(0);
                                 let backoff = plan_w.tuning.retry_backoff_ms
                                     * 2u64.pow(attempt - 1)
                                     + extra_delay;
@@ -594,8 +597,9 @@ pub(super) fn run_chunked_parallel_checkpoint(
                             let mut thread_src = match source::create_source(&plan_w.source) {
                                 Ok(s) => s,
                                 Err(e) => {
-                                    let (transient, _, _) = classify_error(&e);
-                                    if attempt < plan_w.tuning.max_retries && transient {
+                                    if attempt < plan_w.tuning.max_retries
+                                        && classify_error(&e).is_transient()
+                                    {
                                         last_err = Some(e);
                                         continue;
                                     }
@@ -652,8 +656,9 @@ pub(super) fn run_chunked_parallel_checkpoint(
                             match export_attempt {
                                 Ok(v) => return Ok(v),
                                 Err(e) => {
-                                    let (transient, _, _) = classify_error(&e);
-                                    if attempt < plan_w.tuning.max_retries && transient {
+                                    if attempt < plan_w.tuning.max_retries
+                                        && classify_error(&e).is_transient()
+                                    {
                                         last_err = Some(e);
                                         continue;
                                     }

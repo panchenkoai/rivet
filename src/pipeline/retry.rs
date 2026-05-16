@@ -4,13 +4,77 @@
 //! to retry categories (transient vs permanent, reconnect-needed, extra delay).
 //! No plan data is read here — this is pure error-signal processing.
 
+/// Outcome of `classify_error`.
+///
+/// Replaces the prior `(bool, bool, u64)` tuple. Callers used positional
+/// destructuring (`let (transient, _, _) = ...`) which made it easy to
+/// confuse the two booleans. With an enum the type system forces a `match`
+/// or one of the named accessors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryClass {
+    /// Fatal error: retrying will not help (auth failure, bad SQL, etc.).
+    /// The retry loop should propagate immediately.
+    Permanent,
+    /// Worth another attempt. Carries advice for the caller.
+    Transient {
+        /// If true, the existing source connection is suspect (e.g. network
+        /// reset, "gone away") and the caller must open a fresh one before
+        /// retrying. If false, the same connection is fine to reuse.
+        needs_reconnect: bool,
+        /// Extra delay (ms) on top of the standard exponential backoff —
+        /// used for capacity / rate-limit errors that benefit from a longer
+        /// settling period than a transient network blip.
+        extra_delay_ms: u64,
+    },
+}
+
+impl RetryClass {
+    pub fn is_transient(self) -> bool {
+        matches!(self, RetryClass::Transient { .. })
+    }
+
+    pub fn needs_reconnect(self) -> bool {
+        matches!(
+            self,
+            RetryClass::Transient {
+                needs_reconnect: true,
+                ..
+            }
+        )
+    }
+
+    pub fn extra_delay_ms(self) -> u64 {
+        match self {
+            RetryClass::Transient { extra_delay_ms, .. } => extra_delay_ms,
+            RetryClass::Permanent => 0,
+        }
+    }
+}
+
+// Shorthand internal constructors — the older code passed naked tuples and
+// these keep the matchers below short without losing type safety.
+const PERMANENT: RetryClass = RetryClass::Permanent;
+const TRANSIENT_RECONNECT: RetryClass = RetryClass::Transient {
+    needs_reconnect: true,
+    extra_delay_ms: 0,
+};
+const TRANSIENT_SAME_CONN: RetryClass = RetryClass::Transient {
+    needs_reconnect: false,
+    extra_delay_ms: 0,
+};
+fn transient(needs_reconnect: bool, extra_delay_ms: u64) -> RetryClass {
+    RetryClass::Transient {
+        needs_reconnect,
+        extra_delay_ms,
+    }
+}
+
 /// Classifies transient errors into retry categories.
-/// Returns (is_transient, needs_reconnect, extra_delay_ms)
 ///
 /// Checks Postgres SQLSTATE codes and MySQL error codes first, then falls back
 /// to string matching for errors that don't carry structured codes (e.g. IO,
 /// cloud credential errors).
-pub fn classify_error(err: &anyhow::Error) -> (bool, bool, u64) {
+pub fn classify_error(err: &anyhow::Error) -> RetryClass {
     // --- Postgres: check SQLSTATE via the `postgres::Error` downcasted type ---
     if let Some(pg) = err.downcast_ref::<postgres::Error>() {
         if let Some(db) = pg.as_db_error() {
@@ -18,7 +82,7 @@ pub fn classify_error(err: &anyhow::Error) -> (bool, bool, u64) {
         }
         // Connection-level (non-DB) postgres errors → reconnect
         if pg.is_closed() {
-            return (true, true, 0);
+            return TRANSIENT_RECONNECT;
         }
     }
 
@@ -42,7 +106,7 @@ pub fn classify_error(err: &anyhow::Error) -> (bool, bool, u64) {
         || msg.contains("invalid_grant")
         || msg.contains("token has been expired or revoked")
     {
-        return (false, false, 0);
+        return PERMANENT;
     }
 
     // OpenDAL self-classified transient errors: when the underlying service
@@ -62,7 +126,7 @@ pub fn classify_error(err: &anyhow::Error) -> (bool, bool, u64) {
         // Treat as a brief network blip — no reconnect of a SQL session is
         // needed (this is the destination side) and a small extra delay
         // gives the http client time to reset its connection pool.
-        return (true, false, 500);
+        return transient(false, 500);
     }
 
     // Network errors -- need reconnect
@@ -79,7 +143,7 @@ pub fn classify_error(err: &anyhow::Error) -> (bool, bool, u64) {
         || msg.contains("closed the connection unexpectedly")
         || msg.contains("got an error reading communication packets")
     {
-        return (true, true, 0);
+        return TRANSIENT_RECONNECT;
     }
 
     // MySQL specific -- need reconnect
@@ -88,7 +152,7 @@ pub fn classify_error(err: &anyhow::Error) -> (bool, bool, u64) {
         || msg.contains("the server closed the connection")
         || msg.contains("can't connect to mysql server")
     {
-        return (true, true, 0);
+        return TRANSIENT_RECONNECT;
     }
 
     // Timeout errors -- retry on same connection
@@ -98,7 +162,7 @@ pub fn classify_error(err: &anyhow::Error) -> (bool, bool, u64) {
         || msg.contains("lock wait timeout")
         || msg.contains("execution time exceeded")
     {
-        return (true, false, 0);
+        return TRANSIENT_SAME_CONN;
     }
 
     // Capacity errors -- retry with longer delay
@@ -106,21 +170,21 @@ pub fn classify_error(err: &anyhow::Error) -> (bool, bool, u64) {
         || msg.contains("the database system is starting up")
         || msg.contains("the database system is shutting down")
     {
-        return (true, true, 15_000);
+        return transient(true, 15_000);
     }
 
     // Deadlock/serialization -- retry once, same connection
     if msg.contains("deadlock") || msg.contains("could not serialize access") {
-        return (true, false, 1_000);
+        return transient(false, 1_000);
     }
 
     // Not transient
-    (false, false, 0)
+    PERMANENT
 }
 
 /// Classify a Postgres SQLSTATE code.
 /// Reference: <https://www.postgresql.org/docs/current/errcodes-appendix.html>
-fn classify_pg_sqlstate(code: &postgres::error::SqlState) -> (bool, bool, u64) {
+fn classify_pg_sqlstate(code: &postgres::error::SqlState) -> RetryClass {
     use postgres::error::SqlState;
 
     // Class 08 — Connection Exception → reconnect
@@ -131,7 +195,7 @@ fn classify_pg_sqlstate(code: &postgres::error::SqlState) -> (bool, bool, u64) {
         || *code == SqlState::SQLSERVER_REJECTED_ESTABLISHMENT_OF_SQLCONNECTION
         || code.code().starts_with("08")
     {
-        return (true, true, 0);
+        return TRANSIENT_RECONNECT;
     }
 
     // 57P01 admin_shutdown, 57P02 crash_shutdown, 57P03 cannot_connect_now
@@ -139,75 +203,70 @@ fn classify_pg_sqlstate(code: &postgres::error::SqlState) -> (bool, bool, u64) {
         || *code == SqlState::CRASH_SHUTDOWN
         || *code == SqlState::CANNOT_CONNECT_NOW
     {
-        return (true, true, 15_000);
+        return transient(true, 15_000);
     }
 
     // 53300 too_many_connections
     if *code == SqlState::TOO_MANY_CONNECTIONS {
-        return (true, true, 15_000);
+        return transient(true, 15_000);
     }
 
     // 40001 serialization_failure, 40P01 deadlock_detected
     if *code == SqlState::T_R_SERIALIZATION_FAILURE {
-        return (true, false, 1_000);
+        return transient(false, 1_000);
     }
     if *code == SqlState::T_R_DEADLOCK_DETECTED {
-        return (true, false, 1_000);
+        return transient(false, 1_000);
     }
 
     // 57014 query_canceled (statement_timeout)
     if *code == SqlState::QUERY_CANCELED {
-        return (true, false, 0);
+        return TRANSIENT_SAME_CONN;
     }
 
     // Class 53 — Insufficient Resources (disk full, out of memory)
     if code.code().starts_with("53") {
-        return (true, false, 5_000);
+        return transient(false, 5_000);
     }
 
     // 28xxx — Invalid Authorization → permanent
     if code.code().starts_with("28") {
-        return (false, false, 0);
+        return PERMANENT;
     }
 
     // 42xxx — Syntax Error or Access Rule Violation → permanent
     if code.code().starts_with("42") {
-        return (false, false, 0);
+        return PERMANENT;
     }
 
     // All other SQLSTATE codes → not transient by default
-    (false, false, 0)
+    PERMANENT
 }
 
 /// Classify a MySQL error by numeric code.
 /// Reference: <https://dev.mysql.com/doc/mysql-errors/8.0/en/server-error-reference.html>
-fn classify_mysql_error(err: &mysql::Error) -> Option<(bool, bool, u64)> {
+fn classify_mysql_error(err: &mysql::Error) -> Option<RetryClass> {
     match err {
-        mysql::Error::MySqlError(me) => {
-            match me.code {
-                // ER_LOCK_DEADLOCK
-                1213 => Some((true, false, 1_000)),
-                // ER_LOCK_WAIT_TIMEOUT
-                1205 => Some((true, false, 0)),
-                // ER_CON_COUNT_ERROR (too many connections)
-                1040 => Some((true, true, 15_000)),
-                // ER_SERVER_SHUTDOWN
-                1053 => Some((true, true, 15_000)),
-                // ER_ACCESS_DENIED_ERROR, ER_DBACCESS_DENIED_ERROR
-                1045 | 1044 => Some((false, false, 0)),
-                // ER_BAD_DB_ERROR, ER_NO_SUCH_TABLE, ER_PARSE_ERROR
-                1049 | 1146 | 1064 => Some((false, false, 0)),
-                _ => None,
-            }
-        }
-        mysql::Error::IoError(_) => Some((true, true, 0)),
+        mysql::Error::MySqlError(me) => match me.code {
+            // ER_LOCK_DEADLOCK
+            1213 => Some(transient(false, 1_000)),
+            // ER_LOCK_WAIT_TIMEOUT
+            1205 => Some(TRANSIENT_SAME_CONN),
+            // ER_CON_COUNT_ERROR (too many connections) / ER_SERVER_SHUTDOWN
+            1040 | 1053 => Some(transient(true, 15_000)),
+            // ER_ACCESS_DENIED_ERROR, ER_DBACCESS_DENIED_ERROR
+            // ER_BAD_DB_ERROR, ER_NO_SUCH_TABLE, ER_PARSE_ERROR
+            1045 | 1044 | 1049 | 1146 | 1064 => Some(PERMANENT),
+            _ => None,
+        },
+        mysql::Error::IoError(_) => Some(TRANSIENT_RECONNECT),
         _ => None,
     }
 }
 
 #[cfg(test)]
 pub(crate) fn is_transient(err: &anyhow::Error) -> bool {
-    classify_error(err).0
+    classify_error(err).is_transient()
 }
 
 #[cfg(test)]
@@ -243,45 +302,51 @@ mod tests {
             "ssl handshake failed",
         ];
         for msg in cases {
-            let (transient, reconnect, _) = classify_error(&anyhow::anyhow!("{}", msg));
-            assert!(transient, "should be transient: {}", msg);
-            assert!(reconnect, "should need reconnect: {}", msg);
+            let c = classify_error(&anyhow::anyhow!("{}", msg));
+            assert!(c.is_transient(), "should be transient: {}", msg);
+            assert!(c.needs_reconnect(), "should need reconnect: {}", msg);
         }
     }
 
     #[test]
     fn test_classify_timeout_no_reconnect() {
-        let (t, r, _) = classify_error(&anyhow::anyhow!("statement timed out"));
-        assert!(t);
-        assert!(!r, "timeout should not require reconnect");
+        let c = classify_error(&anyhow::anyhow!("statement timed out"));
+        assert!(c.is_transient());
+        assert!(!c.needs_reconnect(), "timeout should not require reconnect");
 
-        let (t, r, _) = classify_error(&anyhow::anyhow!("lock wait timeout exceeded"));
-        assert!(t);
-        assert!(!r);
+        let c = classify_error(&anyhow::anyhow!("lock wait timeout exceeded"));
+        assert!(c.is_transient());
+        assert!(!c.needs_reconnect());
     }
 
     #[test]
     fn test_classify_capacity_errors_extra_delay() {
-        let (t, r, delay) = classify_error(&anyhow::anyhow!("too many connections"));
-        assert!(t);
-        assert!(r);
+        let c = classify_error(&anyhow::anyhow!("too many connections"));
+        assert!(c.is_transient());
+        assert!(c.needs_reconnect());
         assert!(
-            delay >= 10_000,
+            c.extra_delay_ms() >= 10_000,
             "capacity errors should have extra delay, got: {}ms",
-            delay
+            c.extra_delay_ms()
         );
 
-        let (t, _, delay) = classify_error(&anyhow::anyhow!("the database system is starting up"));
-        assert!(t);
-        assert!(delay >= 10_000);
+        let c = classify_error(&anyhow::anyhow!("the database system is starting up"));
+        assert!(c.is_transient());
+        assert!(c.extra_delay_ms() >= 10_000);
     }
 
     #[test]
     fn test_classify_deadlock_retryable() {
-        let (t, r, delay) = classify_error(&anyhow::anyhow!("deadlock detected"));
-        assert!(t);
-        assert!(!r, "deadlock should not require reconnect");
-        assert!(delay >= 1_000, "deadlock should have small extra delay");
+        let c = classify_error(&anyhow::anyhow!("deadlock detected"));
+        assert!(c.is_transient());
+        assert!(
+            !c.needs_reconnect(),
+            "deadlock should not require reconnect"
+        );
+        assert!(
+            c.extra_delay_ms() >= 1_000,
+            "deadlock should have small extra delay"
+        );
     }
 
     #[test]
@@ -293,8 +358,8 @@ mod tests {
             "column not found",
         ];
         for msg in cases {
-            let (transient, _, _) = classify_error(&anyhow::anyhow!("{}", msg));
-            assert!(!transient, "should NOT be transient: {}", msg);
+            let c = classify_error(&anyhow::anyhow!("{}", msg));
+            assert!(!c.is_transient(), "should NOT be transient: {}", msg);
         }
     }
 
@@ -305,21 +370,27 @@ mod tests {
         // hyper dispatch-task drop as permanent and abort the whole worker
         // after one try, even though the upload usually succeeds on retry.
         let raw = "Unexpected (temporary) at write, context: { url: https://storage.googleapis.com/bucket/k.parquet?partNumber=1&uploadId=abc, called: http_util::Client::send } => send http request, source: error sending request: client error (SendRequest): dispatch task is gone: runtime dropped the dispatch task";
-        let (transient, reconnect, delay) = classify_error(&anyhow::anyhow!("{}", raw));
-        assert!(transient, "OpenDAL `(temporary)` must be retryable");
+        let c = classify_error(&anyhow::anyhow!("{}", raw));
+        assert!(c.is_transient(), "OpenDAL `(temporary)` must be retryable");
         assert!(
-            !reconnect,
+            !c.needs_reconnect(),
             "destination-side errors do not affect the SQL session"
         );
-        assert!(delay > 0, "give the http client a moment to reset its pool");
+        assert!(
+            c.extra_delay_ms() > 0,
+            "give the http client a moment to reset its pool"
+        );
     }
 
     #[test]
     fn test_classify_dispatch_task_gone_alone_retryable() {
-        let (t, _, _) = classify_error(&anyhow::anyhow!(
+        let c = classify_error(&anyhow::anyhow!(
             "client error (SendRequest): dispatch task is gone: runtime dropped"
         ));
-        assert!(t, "bare hyper dispatch task drop is transient");
+        assert!(
+            c.is_transient(),
+            "bare hyper dispatch task drop is transient"
+        );
     }
 
     #[test]
@@ -331,9 +402,9 @@ mod tests {
             "Access Denied: no permission",
         ];
         for msg in cases {
-            let (transient, _, _) = classify_error(&anyhow::anyhow!("{}", msg));
+            let c = classify_error(&anyhow::anyhow!("{}", msg));
             assert!(
-                !transient,
+                !c.is_transient(),
                 "credential error should NOT be transient: {}",
                 msg
             );

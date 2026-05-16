@@ -36,7 +36,7 @@ pub use plan_cmd::{PlanOutputFormat, run_plan_command};
 pub use reconcile_cmd::{ReconcileOutputFormat, run_reconcile_command};
 pub use repair_cmd::{RepairOutputFormat, RepairReportSource, run_repair_command};
 #[allow(unused_imports)]
-pub use retry::classify_error;
+pub use retry::{RetryClass, classify_error};
 // build_time_window_query moved to crate::plan; re-exported here for integration tests.
 #[allow(unused_imports)]
 pub use crate::plan::build_time_window_query;

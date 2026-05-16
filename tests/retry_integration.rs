@@ -1,5 +1,9 @@
 use rivet::pipeline::classify_error;
 
+fn classify(msg: &str) -> rivet::pipeline::RetryClass {
+    classify_error(&anyhow::anyhow!("{}", msg))
+}
+
 // ─── classify_error coverage for all patterns ────────────────
 
 #[test]
@@ -19,10 +23,15 @@ fn network_errors_are_transient_and_need_reconnect() {
         "got an error reading communication packets",
     ];
     for msg in cases {
-        let (transient, reconnect, delay) = classify_error(&anyhow::anyhow!("{}", msg));
-        assert!(transient, "'{}' should be transient", msg);
-        assert!(reconnect, "'{}' should need reconnect", msg);
-        assert_eq!(delay, 0, "'{}' should have no extra delay", msg);
+        let c = classify(msg);
+        assert!(c.is_transient(), "'{}' should be transient", msg);
+        assert!(c.needs_reconnect(), "'{}' should need reconnect", msg);
+        assert_eq!(
+            c.extra_delay_ms(),
+            0,
+            "'{}' should have no extra delay",
+            msg
+        );
     }
 }
 
@@ -35,9 +44,9 @@ fn mysql_disconnect_errors_need_reconnect() {
         "can't connect to mysql server on 'localhost'",
     ];
     for msg in cases {
-        let (transient, reconnect, _) = classify_error(&anyhow::anyhow!("{}", msg));
-        assert!(transient, "'{}' should be transient", msg);
-        assert!(reconnect, "'{}' should need reconnect", msg);
+        let c = classify(msg);
+        assert!(c.is_transient(), "'{}' should be transient", msg);
+        assert!(c.needs_reconnect(), "'{}' should need reconnect", msg);
     }
 }
 
@@ -50,10 +59,15 @@ fn timeout_errors_retry_without_reconnect() {
         "query execution was interrupted, maximum execution time exceeded",
     ];
     for msg in cases {
-        let (transient, reconnect, delay) = classify_error(&anyhow::anyhow!("{}", msg));
-        assert!(transient, "'{}' should be transient", msg);
-        assert!(!reconnect, "'{}' should NOT need reconnect", msg);
-        assert_eq!(delay, 0, "'{}' should have no extra delay", msg);
+        let c = classify(msg);
+        assert!(c.is_transient(), "'{}' should be transient", msg);
+        assert!(!c.needs_reconnect(), "'{}' should NOT need reconnect", msg);
+        assert_eq!(
+            c.extra_delay_ms(),
+            0,
+            "'{}' should have no extra delay",
+            msg
+        );
     }
 }
 
@@ -65,15 +79,15 @@ fn capacity_errors_have_extra_delay() {
         ("the database system is shutting down", 15_000),
     ];
     for (msg, expected_min_delay) in cases {
-        let (transient, reconnect, delay) = classify_error(&anyhow::anyhow!("{}", msg));
-        assert!(transient, "'{}' should be transient", msg);
-        assert!(reconnect, "'{}' should need reconnect", msg);
+        let c = classify(msg);
+        assert!(c.is_transient(), "'{}' should be transient", msg);
+        assert!(c.needs_reconnect(), "'{}' should need reconnect", msg);
         assert!(
-            delay >= expected_min_delay,
+            c.extra_delay_ms() >= expected_min_delay,
             "'{}' should have delay >= {}ms, got {}ms",
             msg,
             expected_min_delay,
-            delay
+            c.extra_delay_ms()
         );
     }
 }
@@ -86,14 +100,18 @@ fn deadlock_errors_retry_with_small_delay() {
         "could not serialize access due to concurrent update",
     ];
     for msg in cases {
-        let (transient, reconnect, delay) = classify_error(&anyhow::anyhow!("{}", msg));
-        assert!(transient, "'{}' should be transient", msg);
-        assert!(!reconnect, "'{}' should NOT need reconnect (same tx)", msg);
+        let c = classify(msg);
+        assert!(c.is_transient(), "'{}' should be transient", msg);
         assert!(
-            delay >= 1_000,
+            !c.needs_reconnect(),
+            "'{}' should NOT need reconnect (same tx)",
+            msg
+        );
+        assert!(
+            c.extra_delay_ms() >= 1_000,
             "'{}' should have delay >= 1000ms, got {}ms",
             msg,
-            delay
+            c.extra_delay_ms()
         );
     }
 }
@@ -111,8 +129,11 @@ fn permanent_errors_not_retried() {
         "Table 'mydb.missing_table' doesn't exist",
     ];
     for msg in cases {
-        let (transient, _, _) = classify_error(&anyhow::anyhow!("{}", msg));
-        assert!(!transient, "'{}' should NOT be transient", msg);
+        assert!(
+            !classify(msg).is_transient(),
+            "'{}' should NOT be transient",
+            msg
+        );
     }
 }
 
@@ -120,34 +141,38 @@ fn permanent_errors_not_retried() {
 
 #[test]
 fn case_insensitive_matching() {
-    let (t, _, _) = classify_error(&anyhow::anyhow!("CONNECTION RESET BY PEER"));
-    assert!(t, "should match case-insensitively");
-
-    let (t, _, _) = classify_error(&anyhow::anyhow!("MySQL Server Has Gone Away"));
-    assert!(t, "should match mixed case");
+    assert!(
+        classify("CONNECTION RESET BY PEER").is_transient(),
+        "should match case-insensitively"
+    );
+    assert!(
+        classify("MySQL Server Has Gone Away").is_transient(),
+        "should match mixed case"
+    );
 }
 
 #[test]
 fn embedded_in_longer_message() {
-    let (t, r, _) = classify_error(&anyhow::anyhow!(
-        "db error: ERROR: the database system is starting up (PG server restarting after crash recovery)"
-    ));
-    assert!(t, "should match substring in longer message");
-    assert!(r, "should need reconnect");
+    let c = classify(
+        "db error: ERROR: the database system is starting up (PG server restarting after crash recovery)",
+    );
+    assert!(c.is_transient(), "should match substring in longer message");
+    assert!(c.needs_reconnect(), "should need reconnect");
 }
 
 // ─── Edge cases ──────────────────────────────────────────────
 
 #[test]
 fn empty_error_not_transient() {
-    let (t, _, _) = classify_error(&anyhow::anyhow!(""));
-    assert!(!t);
+    assert!(!classify("").is_transient());
 }
 
 #[test]
 fn generic_io_error_not_transient() {
-    let (t, _, _) = classify_error(&anyhow::anyhow!("file not found: config.yaml"));
-    assert!(!t, "filesystem errors should not be transient");
+    assert!(
+        !classify("file not found: config.yaml").is_transient(),
+        "filesystem errors should not be transient"
+    );
 }
 
 // ─── Verify total pattern count ──────────────────────────────
@@ -189,7 +214,11 @@ fn all_documented_patterns_covered() {
     ];
 
     for pattern in transient_patterns {
-        let (t, _, _) = classify_error(&anyhow::anyhow!("error: {}", pattern));
-        assert!(t, "pattern '{}' should be recognized as transient", pattern);
+        let c = classify(&format!("error: {pattern}"));
+        assert!(
+            c.is_transient(),
+            "pattern '{}' should be recognized as transient",
+            pattern
+        );
     }
 }
