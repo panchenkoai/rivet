@@ -6,7 +6,7 @@
 use super::format_bytes;
 use crate::config::Config;
 use crate::error::Result;
-use crate::pipeline::journal::RunEvent;
+use crate::journal::RunEvent;
 use crate::state::StateStore;
 
 pub fn show_state(config_path: &str) -> Result<()> {
@@ -409,7 +409,7 @@ pub fn show_journal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::journal::{RunEvent, RunJournal};
+    use crate::journal::{RunEvent, RunJournal};
 
     // ── helpers ──────────────────────────────────────────────────────────────
 

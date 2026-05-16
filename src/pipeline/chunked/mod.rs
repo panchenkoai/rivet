@@ -41,10 +41,11 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use super::{
-    RunSummary, journal::RunEvent, progress::ChunkProgress, retry::classify_error,
-    sink::ExportSink, validate::validate_output,
+    RunSummary, progress::ChunkProgress, retry::classify_error, sink::ExportSink,
+    validate::validate_output,
 };
 use crate::error::Result;
+use crate::journal::RunEvent;
 use crate::plan::{ChunkedPlan, ExtractionStrategy, ResolvedRunPlan};
 use crate::source::{self, Source};
 use crate::state::StateStore;

@@ -8,6 +8,7 @@ mod enrich;
 mod error;
 mod format;
 mod init;
+mod journal;
 mod mcp;
 mod notify;
 mod pipeline;

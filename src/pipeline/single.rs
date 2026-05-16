@@ -9,12 +9,12 @@ use std::time::Duration;
 
 use super::RunSummary;
 use super::chunked::{run_chunked_sequential, run_chunked_sequential_checkpoint};
-use super::journal::RunEvent;
 use super::retry::classify_error;
 use super::sink::{CompletedPart, ExportSink};
 use super::validate::validate_output;
 use crate::config::SchemaDriftPolicy;
 use crate::error::Result;
+use crate::journal::RunEvent;
 use crate::plan::{ExtractionStrategy, ResolvedRunPlan};
 use crate::source::{self, Source};
 use crate::state::StateStore;

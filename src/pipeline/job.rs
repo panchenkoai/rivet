@@ -9,9 +9,9 @@ use crate::state::StateStore;
 
 use super::RunOptions;
 use super::chunked::{self, run_chunked_parallel_checkpoint};
-use super::journal::RunEvent;
 use super::single::run_with_reconnect;
 use super::summary::RunSummary;
+use crate::journal::RunEvent;
 
 fn run_chunked_quality_gate(
     result: Result<()>,
@@ -136,7 +136,7 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
         export_name,
         chrono::Utc::now().format("%Y%m%dT%H%M%S%3f"),
     );
-    let journal = super::journal::RunJournal::new(&run_id, export_name);
+    let journal = crate::journal::RunJournal::new(&run_id, export_name);
     RunSummary {
         run_id,
         export_name: export_name.to_string(),

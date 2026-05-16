@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::pipeline::journal::RunJournal;
+use crate::journal::RunJournal;
 
 use super::{StateConn, StateStore};
 
@@ -112,7 +112,7 @@ impl StateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::journal::{RunEvent, RunJournal};
+    use crate::journal::{RunEvent, RunJournal};
 
     fn make_journal(run_id: &str, export: &str) -> RunJournal {
         let mut j = RunJournal::new(run_id, export);

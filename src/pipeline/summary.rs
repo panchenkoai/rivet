@@ -15,9 +15,30 @@
 //! `RunSummary` will be derived from `RunJournal`.
 
 use super::ipc::{self, ChildEvent};
-use super::journal::{PlanSnapshot, RunEvent, RunJournal};
 use super::{format_bytes, multi_export_mode, strip_chunked_recovery_hint};
+use crate::journal::{PlanSnapshot, RunEvent, RunJournal};
 use crate::plan::ResolvedRunPlan;
+
+/// Build a `PlanSnapshot` from a `ResolvedRunPlan`.
+///
+/// Lives here rather than on `journal` itself so that the journal module
+/// stays free of plan/pipeline dependencies (avoids the state→pipeline cycle
+/// we used to have via `state::journal_store`).
+fn plan_snapshot_from(plan: &ResolvedRunPlan) -> PlanSnapshot {
+    PlanSnapshot {
+        export_name: plan.export_name.clone(),
+        base_query: plan.base_query.clone(),
+        strategy: plan.strategy.mode_label().to_string(),
+        format: plan.format.label().to_string(),
+        compression: plan.compression.label().to_string(),
+        destination_type: plan.destination.destination_type.label().to_string(),
+        tuning_profile: plan.tuning_profile_label.clone(),
+        batch_size: plan.tuning.batch_size,
+        validate: plan.validate,
+        reconcile: plan.reconcile,
+        resume: plan.resume,
+    }
+}
 
 /// Accumulates operational data during a pipeline run for summary and metrics.
 ///
@@ -67,7 +88,7 @@ impl RunSummary {
             chrono::Utc::now().format("%Y%m%dT%H%M%S%.3f"),
         );
         let mut journal = RunJournal::new(&run_id, &plan.export_name);
-        journal.record(RunEvent::PlanResolved(PlanSnapshot::from(plan)));
+        journal.record(RunEvent::PlanResolved(plan_snapshot_from(plan)));
 
         ipc::emit_event(&ChildEvent::Started {
             export_name: plan.export_name.clone(),

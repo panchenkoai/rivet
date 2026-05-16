@@ -4,7 +4,7 @@
 //! These tests verify that its query methods correctly filter the event log and that
 //! the ordering guarantees hold.  Each test names the property it protects.
 
-use rivet::pipeline::journal::{PlanSnapshot, RunEvent, RunJournal};
+use rivet::journal::{PlanSnapshot, RunEvent, RunJournal};
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 

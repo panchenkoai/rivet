@@ -16,8 +16,8 @@
 //! rather than `RunSummary::new` (which is `pub(super)` for the pipeline
 //! builders).  The real builder is unit-tested in `src/pipeline/mod.rs`.
 
+use rivet::journal::{PlanSnapshot, RunEvent, RunJournal};
 use rivet::pipeline::RunSummary;
-use rivet::pipeline::journal::{PlanSnapshot, RunEvent, RunJournal};
 
 /// Create a minimally-populated summary for contract checks.
 fn stub_summary(status: &str) -> RunSummary {

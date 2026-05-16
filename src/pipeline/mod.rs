@@ -12,7 +12,6 @@ mod chunked;
 mod cli;
 pub(crate) mod ipc;
 mod job;
-pub mod journal;
 mod parallel_children;
 pub(crate) mod parent_ui;
 mod plan_cmd;
@@ -619,7 +618,7 @@ mod tests {
         assert!(
             matches!(
                 summary.journal.entries[0].event,
-                journal::RunEvent::PlanResolved(_)
+                crate::journal::RunEvent::PlanResolved(_)
             ),
             "first journal event must be PlanResolved, got: {:?}",
             summary.journal.entries[0].event

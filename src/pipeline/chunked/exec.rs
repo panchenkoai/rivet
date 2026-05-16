@@ -8,12 +8,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use super::super::{
-    RunSummary, journal::RunEvent, progress::ChunkProgress, sink::ExportSink,
-    validate::validate_output,
+    RunSummary, progress::ChunkProgress, sink::ExportSink, validate::validate_output,
 };
 use super::detect::detect_and_generate_chunks;
 use super::math::build_chunk_query_sql;
 use crate::error::Result;
+use crate::journal::RunEvent;
 use crate::plan::{ChunkedPlan, ExtractionStrategy, ResolvedRunPlan};
 use crate::source::{self, Source};
 use crate::state::StateStore;
@@ -403,7 +403,7 @@ mod tests {
     use crate::config::{
         CompressionType, DestinationConfig, DestinationType, FormatType, SourceConfig, SourceType,
     };
-    use crate::pipeline::journal::RunJournal;
+    use crate::journal::RunJournal;
     use crate::plan::{ChunkedPlan, ExtractionStrategy, ResolvedRunPlan};
     use crate::source::BatchSink;
     use crate::state::StateStore;

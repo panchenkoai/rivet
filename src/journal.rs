@@ -19,10 +19,15 @@
 //! signature changes.  A future epic will invert the relationship so that
 //! `RunSummary` is derived from `RunJournal`.
 
+//!
+//! This module is the canonical home for journal types. It deliberately has no
+//! dependencies on `plan`, `state`, or `pipeline` so that storage (state) and
+//! orchestration (pipeline) can both depend on it without creating a cycle.
+//! The `From<&ResolvedRunPlan>` conversion lives in `pipeline/summary.rs`
+//! beside the call site that needs it.
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-
-use crate::plan::ResolvedRunPlan;
 
 // ─── Plan snapshot ───────────────────────────────────────────────────────────
 
@@ -42,24 +47,6 @@ pub struct PlanSnapshot {
     pub validate: bool,
     pub reconcile: bool,
     pub resume: bool,
-}
-
-impl From<&ResolvedRunPlan> for PlanSnapshot {
-    fn from(plan: &ResolvedRunPlan) -> Self {
-        Self {
-            export_name: plan.export_name.clone(),
-            base_query: plan.base_query.clone(),
-            strategy: plan.strategy.mode_label().to_string(),
-            format: plan.format.label().to_string(),
-            compression: plan.compression.label().to_string(),
-            destination_type: plan.destination.destination_type.label().to_string(),
-            tuning_profile: plan.tuning_profile_label.clone(),
-            batch_size: plan.tuning.batch_size,
-            validate: plan.validate,
-            reconcile: plan.reconcile,
-            resume: plan.resume,
-        }
-    }
 }
 
 // ─── Events ──────────────────────────────────────────────────────────────────
