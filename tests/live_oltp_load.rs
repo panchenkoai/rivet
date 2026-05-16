@@ -25,7 +25,7 @@ use common::*;
 use rivet::error::Result;
 use rivet::source::mysql::MysqlSource;
 use rivet::source::postgres::PostgresSource;
-use rivet::source::{BatchSink, Source};
+use rivet::source::{BatchSink, ExportRequest, Source};
 use rivet::tuning::{SourceTuning, TuningConfig};
 use rivet::types::ColumnOverrides;
 
@@ -106,11 +106,13 @@ fn pg_export_survives_concurrent_inserts() {
     let mut source = PostgresSource::connect(POSTGRES_URL).unwrap();
     let mut sink = CountingSink::new();
     let result = source.export(
-        &format!("SELECT * FROM {tname}"),
-        None,
-        None,
-        &tuning_balanced(),
-        &ColumnOverrides::default(),
+        &ExportRequest {
+            query: &format!("SELECT * FROM {tname}"),
+            incremental: None,
+            cursor: None,
+            tuning: &tuning_balanced(),
+            column_overrides: &ColumnOverrides::default(),
+        },
         &mut sink,
     );
 
@@ -160,11 +162,13 @@ fn pg_export_adaptive_under_write_pressure() {
     let mut source = PostgresSource::connect(POSTGRES_URL).unwrap();
     let mut sink = CountingSink::new();
     let result = source.export(
-        &format!("SELECT * FROM {tname}"),
-        None,
-        None,
-        &tuning_adaptive(),
-        &ColumnOverrides::default(),
+        &ExportRequest {
+            query: &format!("SELECT * FROM {tname}"),
+            incremental: None,
+            cursor: None,
+            tuning: &tuning_adaptive(),
+            column_overrides: &ColumnOverrides::default(),
+        },
         &mut sink,
     );
 
@@ -215,11 +219,13 @@ fn mysql_export_survives_concurrent_inserts() {
     let mut source = MysqlSource::connect(MYSQL_URL).unwrap();
     let mut sink = CountingSink::new();
     let result = source.export(
-        &format!("SELECT id, name, created_at FROM {tname}"),
-        None,
-        None,
-        &tuning_balanced(),
-        &ColumnOverrides::default(),
+        &ExportRequest {
+            query: &format!("SELECT id, name, created_at FROM {tname}"),
+            incremental: None,
+            cursor: None,
+            tuning: &tuning_balanced(),
+            column_overrides: &ColumnOverrides::default(),
+        },
         &mut sink,
     );
 
@@ -266,11 +272,13 @@ fn mysql_export_adaptive_under_write_pressure() {
     let mut source = MysqlSource::connect(MYSQL_URL).unwrap();
     let mut sink = CountingSink::new();
     let result = source.export(
-        &format!("SELECT id, name, created_at FROM {tname}"),
-        None,
-        None,
-        &tuning_adaptive(),
-        &ColumnOverrides::default(),
+        &ExportRequest {
+            query: &format!("SELECT id, name, created_at FROM {tname}"),
+            incremental: None,
+            cursor: None,
+            tuning: &tuning_adaptive(),
+            column_overrides: &ColumnOverrides::default(),
+        },
         &mut sink,
     );
 

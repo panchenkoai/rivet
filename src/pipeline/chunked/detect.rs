@@ -298,11 +298,7 @@ mod tests {
         }
         fn export(
             &mut self,
-            _query: &str,
-            _incremental: Option<&crate::plan::IncrementalCursorPlan>,
-            _cursor: Option<&crate::types::CursorState>,
-            _tuning: &crate::tuning::SourceTuning,
-            _column_overrides: &crate::types::ColumnOverrides,
+            _request: &crate::source::ExportRequest<'_>,
             _sink: &mut dyn crate::source::BatchSink,
         ) -> Result<()> {
             unimplemented!()

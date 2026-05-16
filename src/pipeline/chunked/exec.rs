@@ -94,11 +94,13 @@ pub(crate) fn run_chunked_sequential(
 
         let mut sink = ExportSink::new(plan)?;
         src.export(
-            &chunk_query,
-            None,
-            None,
-            &plan.tuning,
-            &plan.column_overrides,
+            &source::ExportRequest {
+                query: &chunk_query,
+                incremental: None,
+                cursor: None,
+                tuning: &plan.tuning,
+                column_overrides: &plan.column_overrides,
+            },
             &mut sink,
         )?;
         if let Some(w) = sink.writer.take() {
@@ -278,11 +280,13 @@ pub(crate) fn run_chunked_parallel(
                     let mut thread_src = source::create_source(&plan_for_worker.source)?;
                     let mut sink = ExportSink::new(&plan_for_worker)?;
                     thread_src.export(
-                        &chunk_query,
-                        None,
-                        None,
-                        &plan_for_worker.tuning,
-                        &plan_for_worker.column_overrides,
+                        &source::ExportRequest {
+                            query: &chunk_query,
+                            incremental: None,
+                            cursor: None,
+                            tuning: &plan_for_worker.tuning,
+                            column_overrides: &plan_for_worker.column_overrides,
+                        },
                         &mut sink,
                     )?;
                     if let Some(w) = sink.writer.take() {
@@ -422,11 +426,7 @@ mod tests {
         }
         fn export(
             &mut self,
-            _query: &str,
-            _incremental: Option<&crate::plan::IncrementalCursorPlan>,
-            _cursor: Option<&crate::types::CursorState>,
-            _tuning: &SourceTuning,
-            _column_overrides: &crate::types::ColumnOverrides,
+            _request: &crate::source::ExportRequest<'_>,
             _sink: &mut dyn BatchSink,
         ) -> crate::error::Result<()> {
             Ok(()) // emits no schema, no batches → total_rows stays 0

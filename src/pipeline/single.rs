@@ -169,11 +169,13 @@ pub(super) fn run_single_export(
     let mut sink = ExportSink::new(plan)?;
 
     src.export(
-        query,
-        plan.strategy.incremental_plan(),
-        cursor,
-        &plan.tuning,
-        &plan.column_overrides,
+        &source::ExportRequest {
+            query,
+            incremental: plan.strategy.incremental_plan(),
+            cursor,
+            tuning: &plan.tuning,
+            column_overrides: &plan.column_overrides,
+        },
         &mut sink,
     )?;
 
@@ -483,11 +485,7 @@ mod tests {
     impl crate::source::Source for EmptySource {
         fn export(
             &mut self,
-            _query: &str,
-            _incremental: Option<&crate::plan::IncrementalCursorPlan>,
-            _cursor: Option<&crate::types::CursorState>,
-            _tuning: &SourceTuning,
-            _column_overrides: &crate::types::ColumnOverrides,
+            _request: &crate::source::ExportRequest<'_>,
             _sink: &mut dyn crate::source::BatchSink,
         ) -> crate::error::Result<()> {
             Ok(())
@@ -510,11 +508,7 @@ mod tests {
     impl crate::source::Source for RowSource {
         fn export(
             &mut self,
-            _query: &str,
-            _incremental: Option<&crate::plan::IncrementalCursorPlan>,
-            _cursor: Option<&crate::types::CursorState>,
-            _tuning: &SourceTuning,
-            _column_overrides: &crate::types::ColumnOverrides,
+            _request: &crate::source::ExportRequest<'_>,
             sink: &mut dyn crate::source::BatchSink,
         ) -> crate::error::Result<()> {
             let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));

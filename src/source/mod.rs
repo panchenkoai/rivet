@@ -19,25 +19,30 @@ pub trait BatchSink {
     fn on_batch(&mut self, batch: &RecordBatch) -> Result<()>;
 }
 
+/// Read-only inputs for a single export call.
+///
+/// Packs the parameters that used to live as 5 positional args on
+/// `Source::export` into a named struct. `sink` is **not** part of this struct
+/// — it is `&mut` and conceptually the output channel, separate from the
+/// read-only request configuration.
+pub struct ExportRequest<'a> {
+    /// Already-materialized SQL (after `resolve_query`). The driver still wraps
+    /// it with the dialect-specific incremental predicate via
+    /// [`crate::source::query::build_incremental_query`] when `incremental` is set.
+    pub query: &'a str,
+    pub incremental: Option<&'a IncrementalCursorPlan>,
+    pub cursor: Option<&'a CursorState>,
+    pub tuning: &'a SourceTuning,
+    /// Per-column type declarations from `rivet.yaml` (`exports[].columns:`).
+    /// Drivers apply them during schema building so e.g. a `NUMERIC` column
+    /// without declared precision can still be exported as `Decimal128(18,2)`
+    /// when the user has stated the type explicitly.
+    pub column_overrides: &'a ColumnOverrides,
+}
+
 pub trait Source: Send {
-    /// Execute `query` (already materialized by `resolve_query`) and stream batches into `sink`.
-    ///
-    /// `incremental` / `cursor` are handed to the source driver so it can wrap `query` with
-    /// the dialect-specific incremental predicate via [`crate::source::query::build_incremental_query`].
-    ///
-    /// `column_overrides` carries per-column type declarations from `rivet.yaml`
-    /// (`exports[].columns:`). The driver applies them during schema building so
-    /// that e.g. a `NUMERIC` column without declared precision can still be
-    /// exported as `Decimal128(18,2)` when the user has stated the type explicitly.
-    fn export(
-        &mut self,
-        query: &str,
-        incremental: Option<&IncrementalCursorPlan>,
-        cursor: Option<&CursorState>,
-        tuning: &SourceTuning,
-        column_overrides: &ColumnOverrides,
-        sink: &mut dyn BatchSink,
-    ) -> Result<()>;
+    /// Execute `request.query` and stream batches into `sink`.
+    fn export(&mut self, request: &ExportRequest<'_>, sink: &mut dyn BatchSink) -> Result<()>;
 
     fn query_scalar(&mut self, sql: &str) -> Result<Option<String>>;
 

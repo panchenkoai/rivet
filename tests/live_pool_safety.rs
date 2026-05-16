@@ -31,7 +31,7 @@ use common::*;
 use rivet::error::Result;
 use rivet::source::mysql::MysqlSource;
 use rivet::source::postgres::PostgresSource;
-use rivet::source::{BatchSink, Source};
+use rivet::source::{BatchSink, ExportRequest, Source};
 use rivet::tuning::{SourceTuning, TuningConfig};
 use rivet::types::ColumnOverrides;
 
@@ -99,11 +99,13 @@ fn pg_statement_timeout_not_leaked_after_successful_export() {
     let mut source = PostgresSource::connect(PGBOUNCER_URL).unwrap();
     source
         .export(
-            "SELECT 1 AS n",
-            None,
-            None,
-            &tuning_300s(),
-            &ColumnOverrides::default(),
+            &ExportRequest {
+                query: "SELECT 1 AS n",
+                incremental: None,
+                cursor: None,
+                tuning: &tuning_300s(),
+                column_overrides: &ColumnOverrides::default(),
+            },
             &mut NullSink,
         )
         .expect("export should succeed");
@@ -125,11 +127,13 @@ fn pg_connection_usable_and_clean_after_failed_export() {
 
     let mut source = PostgresSource::connect(PGBOUNCER_URL).unwrap();
     let result = source.export(
-        "SELECT generate_series(1, 1000) AS n",
-        None,
-        None,
-        &tuning_300s(),
-        &ColumnOverrides::default(),
+        &ExportRequest {
+            query: "SELECT generate_series(1, 1000) AS n",
+            incremental: None,
+            cursor: None,
+            tuning: &tuning_300s(),
+            column_overrides: &ColumnOverrides::default(),
+        },
         &mut FailOnFirstBatch,
     );
     assert!(result.is_err(), "export should have failed via sink error");
@@ -171,11 +175,13 @@ fn pg_panic_in_sink_releases_cursor_and_aborts_txn() {
 
     let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| {
         let _ = source.export(
-            "SELECT generate_series(1, 100) AS n",
-            None,
-            None,
-            &tuning_300s(),
-            &ColumnOverrides::default(),
+            &ExportRequest {
+                query: "SELECT generate_series(1, 100) AS n",
+                incremental: None,
+                cursor: None,
+                tuning: &tuning_300s(),
+                column_overrides: &ColumnOverrides::default(),
+            },
             &mut PanicOnFirstBatch,
         );
     }));
@@ -232,11 +238,13 @@ fn mysql_session_vars_clean_after_successful_export() {
 
     source
         .export(
-            "SELECT 1 AS n",
-            None,
-            None,
-            &tuning_300s(),
-            &ColumnOverrides::default(),
+            &ExportRequest {
+                query: "SELECT 1 AS n",
+                incremental: None,
+                cursor: None,
+                tuning: &tuning_300s(),
+                column_overrides: &ColumnOverrides::default(),
+            },
             &mut NullSink,
         )
         .expect("export should succeed");
@@ -264,11 +272,13 @@ fn mysql_session_vars_clean_after_failed_export() {
     let mut source = MysqlSource::from_pool(pool.clone());
 
     let result = source.export(
-        "SELECT 1 AS n UNION ALL SELECT 2",
-        None,
-        None,
-        &tuning_300s(),
-        &ColumnOverrides::default(),
+        &ExportRequest {
+            query: "SELECT 1 AS n UNION ALL SELECT 2",
+            incremental: None,
+            cursor: None,
+            tuning: &tuning_300s(),
+            column_overrides: &ColumnOverrides::default(),
+        },
         &mut FailOnFirstBatch,
     );
     assert!(result.is_err(), "export should have failed via sink error");

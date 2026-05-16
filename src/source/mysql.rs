@@ -12,10 +12,8 @@ use mysql::{Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts, Value};
 
 use crate::config::{SourceType, TlsConfig, TlsMode};
 use crate::error::Result;
-use crate::plan::IncrementalCursorPlan;
 use crate::source::query::build_incremental_query;
 use crate::tuning::{ADAPTIVE_SAMPLE_INTERVAL, SourceTuning, next_adaptive_batch_size};
-use crate::types::CursorState;
 use crate::types::{
     ColumnOverrides, RivetType, SourceColumn, TimeUnit as RivetTimeUnit, TypeMapping,
     build_arrow_field,
@@ -282,14 +280,15 @@ fn mysql_run_export(
 impl super::Source for MysqlSource {
     fn export(
         &mut self,
-        query: &str,
-        incremental: Option<&IncrementalCursorPlan>,
-        cursor: Option<&CursorState>,
-        tuning: &SourceTuning,
-        column_overrides: &ColumnOverrides,
+        request: &super::ExportRequest<'_>,
         sink: &mut dyn super::BatchSink,
     ) -> Result<()> {
-        let built = build_incremental_query(query, incremental, cursor, SourceType::Mysql);
+        let built = build_incremental_query(
+            request.query,
+            request.incremental,
+            request.cursor,
+            SourceType::Mysql,
+        );
         log::debug!(
             "executing query (connection={}): {}",
             if self.proxy_pooler {
@@ -306,14 +305,14 @@ impl super::Source for MysqlSource {
         // isAdjustedToUTC=true. SET per-connection (not global) to avoid side-effects.
         conn.query_drop("SET time_zone = '+00:00'")?;
 
-        if tuning.statement_timeout_s > 0 {
+        if request.tuning.statement_timeout_s > 0 {
             conn.query_drop(format!(
                 "SET SESSION max_execution_time = {}",
-                tuning.statement_timeout_s * 1000
+                request.tuning.statement_timeout_s * 1000
             ))?;
         }
 
-        let sample_pool = if tuning.adaptive {
+        let sample_pool = if request.tuning.adaptive {
             Some(self.pool.clone())
         } else {
             None
@@ -323,15 +322,15 @@ impl super::Source for MysqlSource {
             sample_pool,
             &built.sql,
             built.cursor_param.as_deref(),
-            tuning,
-            column_overrides,
+            request.tuning,
+            request.column_overrides,
             sink,
         );
 
         // Always reset session state before connection returns to pool,
         // regardless of whether the export succeeded or failed.
         let _ = conn.query_drop("SET time_zone = @@global.time_zone");
-        if tuning.statement_timeout_s > 0 {
+        if request.tuning.statement_timeout_s > 0 {
             let _ = conn.query_drop("SET SESSION max_execution_time = 0");
         }
 

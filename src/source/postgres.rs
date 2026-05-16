@@ -14,12 +14,10 @@ use serde_json::Value as JsonValue;
 
 use crate::config::{SourceType, TlsConfig};
 use crate::error::Result;
-use crate::plan::IncrementalCursorPlan;
 use crate::source::pg_numeric_wire::{PgNumericWire, numeric_wire_normalized_plain};
 use crate::source::query::build_incremental_query;
 use crate::source::tls::build_native_tls;
 use crate::tuning::{ADAPTIVE_SAMPLE_INTERVAL, SourceTuning, next_adaptive_batch_size};
-use crate::types::CursorState;
 use crate::types::{
     ColumnOverrides, RivetType, SourceColumn, TimeUnit as RivetTimeUnit, TypeMapping,
     build_arrow_field,
@@ -344,14 +342,15 @@ fn pg_run_export(
 impl super::Source for PostgresSource {
     fn export(
         &mut self,
-        query: &str,
-        incremental: Option<&IncrementalCursorPlan>,
-        cursor: Option<&CursorState>,
-        tuning: &SourceTuning,
-        column_overrides: &ColumnOverrides,
+        request: &super::ExportRequest<'_>,
         sink: &mut dyn super::BatchSink,
     ) -> Result<()> {
-        let built = build_incremental_query(query, incremental, cursor, SourceType::Postgres);
+        let built = build_incremental_query(
+            request.query,
+            request.incremental,
+            request.cursor,
+            SourceType::Postgres,
+        );
         debug_assert!(
             built.cursor_param.is_none(),
             "Postgres path inlines cursor values as E'…' literals — binding is unused"
@@ -366,15 +365,15 @@ impl super::Source for PostgresSource {
             built.sql
         );
 
-        let numeric_hints = pg_numeric_catalog_hints_opt(&mut self.client, query);
+        let numeric_hints = pg_numeric_catalog_hints_opt(&mut self.client, request.query);
 
         // PgTxnGuard inside pg_run_export rolls the txn back automatically on
         // any error or panic, so no explicit ROLLBACK is needed here.
         let (total_rows, had_schema) = pg_run_export(
             &mut self.client,
             &built.sql,
-            tuning,
-            column_overrides,
+            request.tuning,
+            request.column_overrides,
             sink,
             numeric_hints.as_ref(),
         )?;

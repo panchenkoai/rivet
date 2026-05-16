@@ -43,7 +43,7 @@ use arrow::record_batch::RecordBatch;
 use common::*;
 use rivet::error::Result;
 use rivet::source::postgres::PostgresSource;
-use rivet::source::{BatchSink, Source};
+use rivet::source::{BatchSink, ExportRequest, Source};
 use rivet::tuning::{SourceTuning, TuningConfig};
 use rivet::types::ColumnOverrides;
 
@@ -193,11 +193,13 @@ fn pg_content_export_under_update_pressure() {
     // The important property is that the export snapshot is fixed at BEGIN time —
     // INSERTs at id=10_000_000+ must NOT appear in the exported rows.
     let result = source.export(
-        &format!("SELECT id, title, status, view_count, updated_at FROM content_items WHERE id <= {export_limit}"),
-        None,
-        None,
-        &tuning,
-        &ColumnOverrides::default(),
+        &ExportRequest {
+            query: &format!("SELECT id, title, status, view_count, updated_at FROM content_items WHERE id <= {export_limit}"),
+            incremental: None,
+            cursor: None,
+            tuning: &tuning,
+            column_overrides: &ColumnOverrides::default(),
+        },
         &mut sink,
     );
 
@@ -304,11 +306,13 @@ fn pg_full_content_export_max_pressure() {
     let mut source = PostgresSource::connect(POSTGRES_URL).unwrap();
     let mut sink = LoadSink::new();
     let result = source.export(
-        "SELECT id, title, status, view_count, comment_count FROM content_items",
-        None,
-        None,
-        &tuning,
-        &ColumnOverrides::default(),
+        &ExportRequest {
+            query: "SELECT id, title, status, view_count, comment_count FROM content_items",
+            incremental: None,
+            cursor: None,
+            tuning: &tuning,
+            column_overrides: &ColumnOverrides::default(),
+        },
         &mut sink,
     );
 
