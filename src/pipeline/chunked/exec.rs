@@ -219,7 +219,9 @@ pub(crate) fn run_chunked_parallel(
     let agg_files = AtomicUsize::new(0);
     let errors = std::sync::Mutex::new(Vec::<String>::new());
     let file_records: std::sync::Mutex<Vec<(String, i64, i64)>> = std::sync::Mutex::new(Vec::new());
-    let semaphore = AtomicUsize::new(0);
+    // Condvar-backed semaphore: blocked spawners park in the kernel until a
+    // worker calls `release()`, instead of polling an atomic every 50 ms.
+    let semaphore = resource::Semaphore::new(parallel);
     let pb = ChunkProgress::new(&plan.export_name, total_chunks);
     let pb_handle = pb.handle();
 
@@ -236,18 +238,17 @@ pub(crate) fn run_chunked_parallel(
 
     std::thread::scope(|s| {
         for (i, (start, end)) in chunks.iter().enumerate() {
-            while semaphore.load(Ordering::Relaxed) >= parallel {
-                std::thread::sleep(Duration::from_millis(50));
-            }
+            // Block (kernel-park) until a worker slot frees up.
+            semaphore.acquire();
 
+            // Memory throttle stays a poll loop — RSS rising/falling is not
+            // signaled by semaphore release, only observable via the syscall.
             if !resource::check_memory(plan.tuning.memory_threshold_mb) {
                 log::warn!("memory threshold exceeded, waiting before chunk {}", i);
                 while !resource::check_memory(plan.tuning.memory_threshold_mb) {
                     std::thread::sleep(Duration::from_secs(2));
                 }
             }
-
-            semaphore.fetch_add(1, Ordering::Relaxed);
 
             let plan_for_worker = plan.clone();
             let export_name = &plan.export_name;
@@ -341,7 +342,7 @@ pub(crate) fn run_chunked_parallel(
                     Ok(())
                 })();
 
-                semaphore.fetch_sub(1, Ordering::Relaxed);
+                semaphore.release();
 
                 if let Err(e) = result {
                     log::error!("export '{}': chunk {} failed: {:#}", export_name, i, e);

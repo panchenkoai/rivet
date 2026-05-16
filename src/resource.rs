@@ -111,6 +111,62 @@ pub fn check_memory(threshold_mb: usize) -> bool {
     true
 }
 
+/// Counting semaphore built on `Mutex + Condvar` so blocked acquirers park in
+/// the kernel rather than spinning on an atomic.
+///
+/// Replaces the prior pattern in `pipeline::chunked::exec`:
+/// ```ignore
+/// while atomic.load(Relaxed) >= max { thread::sleep(50ms); }
+/// atomic.fetch_add(1, Relaxed);
+/// ```
+/// which polled 20 times/sec per blocked worker. Under N parallel chunks and a
+/// long-running export this burned ~N × 20 wake-ups per second doing nothing.
+///
+/// With `Condvar::wait`, blocked threads consume zero CPU until a `release()`
+/// notifies. The mutex is uncontended whenever traffic is light, so the lock
+/// path adds no measurable overhead vs the atomic.
+pub struct Semaphore {
+    state: std::sync::Mutex<usize>,
+    cond: std::sync::Condvar,
+    max: usize,
+}
+
+impl Semaphore {
+    pub fn new(max: usize) -> Self {
+        Self {
+            state: std::sync::Mutex::new(0),
+            cond: std::sync::Condvar::new(),
+            max,
+        }
+    }
+
+    /// Block until a permit is available, then take one.
+    pub fn acquire(&self) {
+        let mut count = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *count >= self.max {
+            count = self
+                .cond
+                .wait(count)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *count += 1;
+    }
+
+    /// Return a permit and wake one blocked acquirer (if any).
+    pub fn release(&self) {
+        let mut count = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(*count > 0, "release without matching acquire");
+        *count -= 1;
+        self.cond.notify_one();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +199,54 @@ mod tests {
         let sampler = RssPeakSampler::start(high_seed, 50);
         let peak = sampler.stop();
         assert!(peak >= high_seed);
+    }
+
+    // ── Semaphore ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn semaphore_admits_up_to_max_without_blocking() {
+        let sem = Semaphore::new(3);
+        sem.acquire();
+        sem.acquire();
+        sem.acquire();
+        // Three permits taken, no deadlock so far → invariant holds.
+        sem.release();
+        sem.release();
+        sem.release();
+    }
+
+    #[test]
+    fn semaphore_blocks_fourth_until_release() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let sem = Arc::new(Semaphore::new(2));
+        sem.acquire();
+        sem.acquire();
+
+        let entered = Arc::new(AtomicBool::new(false));
+        let entered_w = Arc::clone(&entered);
+        let sem_w = Arc::clone(&sem);
+        let handle = std::thread::spawn(move || {
+            sem_w.acquire();
+            entered_w.store(true, Ordering::Release);
+            sem_w.release();
+        });
+
+        // Worker is parked in `acquire()` — give it a moment and confirm.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !entered.load(Ordering::Acquire),
+            "worker must be blocked while 2/2 permits are taken"
+        );
+
+        // Releasing one permit must wake the worker.
+        sem.release();
+        handle.join().expect("worker thread");
+        assert!(
+            entered.load(Ordering::Acquire),
+            "worker should have entered after release"
+        );
+        sem.release();
     }
 }
