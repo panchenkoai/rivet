@@ -497,14 +497,19 @@ fn seed_mysql(args: &Args) -> Result<()> {
     ensure_orders_coalesce_mysql(&mut conn)?;
 
     conn.query_drop("SET FOREIGN_KEY_CHECKS = 0")?;
-    conn.query_drop("TRUNCATE TABLE orders_coalesce")?;
-    conn.query_drop("TRUNCATE TABLE orders_sparse")?;
-    conn.query_drop("TRUNCATE TABLE content_items")?;
-    conn.query_drop("TRUNCATE TABLE page_views")?;
-    conn.query_drop("TRUNCATE TABLE events")?;
-    conn.query_drop("TRUNCATE TABLE orders")?;
-    conn.query_drop("TRUNCATE TABLE users")?;
+    let truncate_result: Result<()> = (|| {
+        conn.query_drop("TRUNCATE TABLE orders_coalesce")?;
+        conn.query_drop("TRUNCATE TABLE orders_sparse")?;
+        conn.query_drop("TRUNCATE TABLE content_items")?;
+        conn.query_drop("TRUNCATE TABLE page_views")?;
+        conn.query_drop("TRUNCATE TABLE events")?;
+        conn.query_drop("TRUNCATE TABLE orders")?;
+        conn.query_drop("TRUNCATE TABLE users")?;
+        Ok(())
+    })();
+    // Always restore FK checks before propagating any truncation error.
     conn.query_drop("SET FOREIGN_KEY_CHECKS = 1")?;
+    truncate_result?;
 
     let t = Instant::now();
     seed_mysql_users(&mut conn, args)?;

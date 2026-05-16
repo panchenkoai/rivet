@@ -15,6 +15,9 @@ pub struct SourceTuning {
     /// Hard cap on a single Arrow batch in MB. `None` = no cap.
     pub max_batch_memory_mb: Option<usize>,
     pub on_batch_memory_exceeded: BatchMemoryPolicy,
+    /// When true, Rivet samples DB pressure metrics every ADAPTIVE_SAMPLE_INTERVAL
+    /// batches and shrinks/restores the fetch size in response. Default: false.
+    pub adaptive: bool,
     configured_profile: TuningProfile,
 }
 
@@ -57,6 +60,9 @@ pub struct TuningConfig {
     pub max_batch_memory_mb: Option<usize>,
     /// Policy applied when a batch exceeds `max_batch_memory_mb`. Default: `warn`.
     pub on_batch_memory_exceeded: Option<BatchMemoryPolicy>,
+    /// Enable real-time batch size adaptation based on DB pressure metrics.
+    /// Postgres: samples `pg_stat_bgwriter`. MySQL: samples `Innodb_log_waits`.
+    pub adaptive: Option<bool>,
 }
 
 /// Layer `export` on top of `source`: each field uses export when set, otherwise source.
@@ -81,6 +87,7 @@ pub fn merge_tuning_config(
             memory_threshold_mb: e.memory_threshold_mb.or(s.memory_threshold_mb),
             max_batch_memory_mb: e.max_batch_memory_mb.or(s.max_batch_memory_mb),
             on_batch_memory_exceeded: e.on_batch_memory_exceeded.or(s.on_batch_memory_exceeded),
+            adaptive: e.adaptive.or(s.adaptive),
         }),
     }
 }
@@ -121,6 +128,9 @@ impl SourceTuning {
             if let Some(v) = cfg.on_batch_memory_exceeded {
                 tuning.on_batch_memory_exceeded = v;
             }
+            if let Some(v) = cfg.adaptive {
+                tuning.adaptive = v;
+            }
         }
 
         tuning
@@ -139,6 +149,7 @@ impl SourceTuning {
                 memory_threshold_mb: 0,
                 max_batch_memory_mb: None,
                 on_batch_memory_exceeded: BatchMemoryPolicy::Warn,
+                adaptive: false,
                 configured_profile: TuningProfile::Fast,
             },
             TuningProfile::Balanced => Self {
@@ -152,6 +163,7 @@ impl SourceTuning {
                 memory_threshold_mb: 4_096,
                 max_batch_memory_mb: None,
                 on_batch_memory_exceeded: BatchMemoryPolicy::Warn,
+                adaptive: false,
                 configured_profile: TuningProfile::Balanced,
             },
             TuningProfile::Safe => Self {
@@ -165,6 +177,7 @@ impl SourceTuning {
                 memory_threshold_mb: 2_048,
                 max_batch_memory_mb: None,
                 on_batch_memory_exceeded: BatchMemoryPolicy::Warn,
+                adaptive: false,
                 configured_profile: TuningProfile::Safe,
             },
         }

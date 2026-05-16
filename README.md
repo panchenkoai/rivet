@@ -8,9 +8,24 @@ Rivet is a single-binary CLI that exports query results from relational database
 
 ## What Rivet is (and is not)
 
-Rivet does extraction end-to-end — query, batch, retry, validate, reconcile, checkpoint, plan/apply — from PostgreSQL 12–16 and MySQL 5.7 / 8.0 to Parquet (zstd / snappy / gzip / lz4 / none) or CSV. Destinations: local, Amazon S3, Google Cloud Storage, stdout. See [docs/](docs/) for the full feature list and contracts.
+| What Rivet does | What you bring |
+|-----------------|----------------|
+| Queries PostgreSQL 12–16 and MySQL 5.7 / 8.0 | The database and credentials |
+| Streams rows → Arrow → Parquet or CSV | A destination (local path, S3 bucket, GCS bucket) |
+| Retries failed batches with exponential backoff | Orchestration (cron, Airflow, dbt, etc.) |
+| Validates row counts, null ratios, and uniqueness | Your warehouse or downstream pipeline |
+| Checkpoints progress — resume after crashes | Schema management on the warehouse side |
+| Protects the source DB via configurable tuning profiles | — |
 
-Rivet is **not** a loader, a CDC platform, an ELT orchestrator, or a SaaS connector marketplace. It deliberately stops at "file on disk / in a bucket" — you bring the warehouse side yourself.
+Supported destinations: local filesystem, Amazon S3, Google Cloud Storage, stdout.
+Export modes: `full`, `incremental` (cursor-based), `chunked`, `time_window`.
+Formats: Parquet (zstd / snappy / gzip / lz4 / none) and CSV.
+
+**Not for you if you need:**
+- **CDC / streaming** — Rivet reads a snapshot per run; it has no event log or replication slot. Use [Debezium](https://debezium.io/) or [Estuary](https://estuary.dev/) instead.
+- **A SaaS connector marketplace** — no cloud console, no managed infrastructure, no pre-built connectors beyond Postgres and MySQL.
+- **A Kubernetes data platform** — no operator, no Helm chart, no CRD.
+- **Loading or transformation** — Rivet stops at "file on disk or in a bucket"; bring dbt, Spark, or your own loader.
 
 **Documentation language:** English-only. See [CONTRIBUTING.md](CONTRIBUTING.md).
 

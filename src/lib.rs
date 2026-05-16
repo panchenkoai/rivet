@@ -14,15 +14,18 @@
 
 // Public — accessed by integration tests in tests/*.rs
 pub mod config;
+pub mod error;
 pub mod format;
 pub mod pipeline;
 pub mod resource;
+pub mod source;
 pub mod state;
+pub mod tuning;
+pub mod types;
 
 // pub(crate) — internal implementation modules; not part of any external API contract
 pub(crate) mod destination;
 pub(crate) mod enrich;
-pub(crate) mod error;
 pub(crate) mod notify;
 pub(crate) mod plan;
 // Test-only fault-injection hook used by `tests/live_crash_recovery.rs`.
@@ -34,7 +37,4 @@ pub(crate) mod test_hook;
 #[allow(dead_code)]
 pub(crate) mod preflight;
 pub(crate) mod quality;
-pub(crate) mod source;
 pub(crate) mod sql;
-pub(crate) mod tuning;
-pub(crate) mod types;

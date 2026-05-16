@@ -21,8 +21,12 @@ use crate::types::{
     build_arrow_field,
 };
 
+const ADAPTIVE_SAMPLE_INTERVAL: usize = 10;
+const ADAPTIVE_MIN_BATCH: usize = 500;
+
 pub struct MysqlSource {
     pool: Pool,
+    proxy_pooler: bool,
 }
 
 /// Pool options that prevent eager pre-connection. The default mysql::Pool
@@ -33,13 +37,69 @@ fn lean_pool_opts() -> PoolOpts {
         .with_constraints(PoolConstraints::new(1, 100).expect("valid pool constraints"))
 }
 
+/// Detect a MySQL proxy multiplexer (ProxySQL, MaxScale) by checking
+/// `@@version_comment` for the "proxysql" signature and `@@proxy_version`.
+/// Returns false on any error — this is best-effort only.
+fn detect_mysql_proxy(pool: &Pool) -> bool {
+    use mysql::prelude::*;
+    let mut conn = match pool.get_conn() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let version_comment: Option<String> =
+        conn.query_first("SELECT @@version_comment").unwrap_or(None);
+    if let Some(v) = &version_comment
+        && v.to_ascii_lowercase().contains("proxysql")
+    {
+        return true;
+    }
+    // @@proxy_version is a ProxySQL-specific system variable that does not
+    // exist on vanilla MySQL — its presence is a reliable proxy indicator.
+    let proxy_version: Option<String> = conn.query_first("SELECT @@proxy_version").unwrap_or(None);
+    proxy_version.is_some()
+}
+
+/// Sample the global `Innodb_log_waits` counter — increments when InnoDB has to
+/// wait for redo-log buffer space, indicating write pressure.
+fn mysql_sample_innodb_log_waits(pool: &Pool) -> Option<u64> {
+    use mysql::prelude::*;
+    let mut conn = pool.get_conn().ok()?;
+    conn.query_first::<(String, u64), _>("SHOW GLOBAL STATUS LIKE 'Innodb_log_waits'")
+        .ok()
+        .flatten()
+        .map(|(_, v)| v)
+}
+
 impl MysqlSource {
+    /// Build a source from an existing pool. Useful in tests that need to
+    /// share the pool with post-export state inspection.
+    #[allow(dead_code)]
+    pub fn from_pool(pool: Pool) -> Self {
+        let proxy_pooler = detect_mysql_proxy(&pool);
+        if proxy_pooler {
+            log::warn!(
+                "MySQL proxy multiplexer detected (ProxySQL) — session variables \
+                 set per-connection may not survive multiplexing; use direct connections \
+                 for production exports"
+            );
+        }
+        Self { pool, proxy_pooler }
+    }
+
     /// Connect with no transport security (legacy path).
     pub fn connect(url: &str) -> Result<Self> {
         let opts =
             Opts::from(OptsBuilder::from_opts(Opts::from_url(url)?).pool_opts(lean_pool_opts()));
         let pool = Pool::new(opts)?;
-        Ok(Self { pool })
+        let proxy_pooler = detect_mysql_proxy(&pool);
+        if proxy_pooler {
+            log::warn!(
+                "MySQL proxy multiplexer detected (ProxySQL) — session variables \
+                 set per-connection may not survive multiplexing; use direct connections \
+                 for production exports"
+            );
+        }
+        Ok(Self { pool, proxy_pooler })
     }
 
     /// Connect honoring the user's [`TlsConfig`].
@@ -54,7 +114,15 @@ impl MysqlSource {
                         .pool_opts(lean_pool_opts()),
                 );
                 let pool = Pool::new(opts)?;
-                Ok(Self { pool })
+                let proxy_pooler = detect_mysql_proxy(&pool);
+                if proxy_pooler {
+                    log::warn!(
+                        "MySQL proxy multiplexer detected (ProxySQL) — session variables \
+                         set per-connection may not survive multiplexing; use direct connections \
+                         for production exports"
+                    );
+                }
+                Ok(Self { pool, proxy_pooler })
             }
             _ => Self::connect(url),
         }
@@ -116,6 +184,108 @@ fn build_mysql_ssl_opts(cfg: &TlsConfig) -> SslOpts {
     ssl
 }
 
+/// Execute the MySQL query and stream results to sink.
+///
+/// Separated from export() so session-state cleanup (time_zone, max_execution_time)
+/// can run unconditionally in the caller regardless of success or failure.
+///
+/// `sample_pool`: when `tuning.adaptive` is true, a clone of the source pool used
+/// to obtain a second connection for `Innodb_log_waits` sampling without interfering
+/// with the streaming result set on `conn`.
+fn mysql_run_export(
+    conn: &mut mysql::PooledConn,
+    sample_pool: Option<Pool>,
+    sql: &str,
+    cursor_param: Option<&str>,
+    tuning: &SourceTuning,
+    column_overrides: &ColumnOverrides,
+    sink: &mut dyn super::BatchSink,
+) -> Result<usize> {
+    // SecOps: cursor value is bound via exec_iter rather than string-interpolated.
+    // Using exec_iter uniformly (even with empty params) keeps match arms
+    // type-compatible — query_iter returns a Text-protocol result, exec_iter Binary.
+    let mut result = match cursor_param {
+        Some(val) => conn.exec_iter(sql, (val,))?,
+        None => conn.exec_iter(sql, ())?,
+    };
+    let columns = result.columns().as_ref().to_vec();
+
+    // Compute TypeMappings once; derive both the Arrow schema and the
+    // per-column DataType vec from the same source so they can never diverge.
+    let (schema, arrow_types) = mysql_schema_and_arrow_types(&columns, column_overrides)?;
+    let schema = Arc::new(schema);
+
+    sink.on_schema(schema.clone())?;
+
+    let mut effective_bs = tuning.effective_batch_size(Some(&schema));
+    let base_fetch_size = effective_bs;
+    let mut adaptive_last_waits: Option<u64> = if tuning.adaptive {
+        sample_pool.as_ref().and_then(mysql_sample_innodb_log_waits)
+    } else {
+        None
+    };
+    let mut batch_count: usize = 0;
+    let row_set = result
+        .iter()
+        .ok_or_else(|| anyhow::anyhow!("no result set"))?;
+    let mut row_buf: Vec<mysql::Row> = Vec::with_capacity(effective_bs);
+    let mut total_rows: usize = 0;
+
+    for row_result in row_set {
+        let row = row_result?;
+        row_buf.push(row);
+
+        if row_buf.len() >= effective_bs {
+            total_rows += row_buf.len();
+            batch_count += 1;
+            let batch = rows_to_record_batch_typed(&schema, &arrow_types, &row_buf)?;
+            sink.on_batch(&batch)?;
+            row_buf.clear();
+
+            if tuning.adaptive
+                && batch_count.is_multiple_of(ADAPTIVE_SAMPLE_INTERVAL)
+                && let Some(ref pool) = sample_pool
+                && let Some(cur) = mysql_sample_innodb_log_waits(pool)
+            {
+                let under_pressure = adaptive_last_waits.is_some_and(|prev| cur > prev);
+                adaptive_last_waits = Some(cur);
+                let next = if under_pressure {
+                    (effective_bs * 3 / 4).max(ADAPTIVE_MIN_BATCH)
+                } else {
+                    (effective_bs * 5 / 4).min(base_fetch_size)
+                };
+                if next != effective_bs {
+                    effective_bs = next;
+                    log::info!(
+                        "adaptive batch size → {} ({})",
+                        effective_bs,
+                        if under_pressure {
+                            "pressure"
+                        } else {
+                            "recovery"
+                        }
+                    );
+                }
+            }
+
+            log::info!("fetched {} rows so far...", total_rows);
+
+            if tuning.throttle_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(tuning.throttle_ms));
+            }
+        }
+    }
+
+    if !row_buf.is_empty() {
+        total_rows += row_buf.len();
+        let batch = rows_to_record_batch_typed(&schema, &arrow_types, &row_buf)?;
+        sink.on_batch(&batch)?;
+    }
+
+    drop(result);
+    Ok(total_rows)
+}
+
 impl super::Source for MysqlSource {
     fn export(
         &mut self,
@@ -127,7 +297,15 @@ impl super::Source for MysqlSource {
         sink: &mut dyn super::BatchSink,
     ) -> Result<()> {
         let built = build_incremental_query(query, incremental, cursor, SourceType::Mysql);
-        log::debug!("executing query: {}", built.sql);
+        log::debug!(
+            "executing query (connection={}): {}",
+            if self.proxy_pooler {
+                "proxy-multiplexed"
+            } else {
+                "direct"
+            },
+            built.sql
+        );
 
         let mut conn = self.pool.get_conn()?;
 
@@ -142,60 +320,29 @@ impl super::Source for MysqlSource {
             ))?;
         }
 
-        // SecOps: cursor value is bound via `exec_iter` rather than string-interpolated.
-        // Using `exec_iter` uniformly (even with empty params) keeps the match arms
-        // type-compatible — `query_iter` returns a Text-protocol result, `exec_iter`
-        // returns a Binary-protocol result.
-        let mut result = match built.cursor_param.as_deref() {
-            Some(val) => conn.exec_iter(&built.sql, (val,))?,
-            None => conn.exec_iter(&built.sql, ())?,
+        let sample_pool = if tuning.adaptive {
+            Some(self.pool.clone())
+        } else {
+            None
         };
-        let columns = result.columns().as_ref().to_vec();
+        let result = mysql_run_export(
+            &mut conn,
+            sample_pool,
+            &built.sql,
+            built.cursor_param.as_deref(),
+            tuning,
+            column_overrides,
+            sink,
+        );
 
-        // Compute TypeMappings once; derive both the Arrow schema and the
-        // per-column DataType vec from the same source so they can never diverge.
-        let (schema, arrow_types) = mysql_schema_and_arrow_types(&columns, column_overrides)?;
-        let schema = Arc::new(schema);
-
-        sink.on_schema(schema.clone())?;
-
-        let effective_bs = tuning.effective_batch_size(Some(&schema));
-        let row_set = result
-            .iter()
-            .ok_or_else(|| anyhow::anyhow!("no result set"))?;
-        let mut row_buf: Vec<mysql::Row> = Vec::with_capacity(effective_bs);
-        let mut total_rows: usize = 0;
-
-        for row_result in row_set {
-            let row = row_result?;
-            row_buf.push(row);
-
-            if row_buf.len() >= effective_bs {
-                total_rows += row_buf.len();
-                let batch = rows_to_record_batch_typed(&schema, &arrow_types, &row_buf)?;
-                sink.on_batch(&batch)?;
-                row_buf.clear();
-
-                log::info!("fetched {} rows so far...", total_rows);
-
-                if tuning.throttle_ms > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(tuning.throttle_ms));
-                }
-            }
-        }
-
-        if !row_buf.is_empty() {
-            total_rows += row_buf.len();
-            let batch = rows_to_record_batch_typed(&schema, &arrow_types, &row_buf)?;
-            sink.on_batch(&batch)?;
-        }
-
-        drop(result);
-
+        // Always reset session state before connection returns to pool,
+        // regardless of whether the export succeeded or failed.
+        let _ = conn.query_drop("SET time_zone = @@global.time_zone");
         if tuning.statement_timeout_s > 0 {
-            conn.query_drop("SET SESSION max_execution_time = 0")?;
+            let _ = conn.query_drop("SET SESSION max_execution_time = 0");
         }
 
+        let total_rows = result?;
         log::info!("total: {} rows", total_rows);
         Ok(())
     }

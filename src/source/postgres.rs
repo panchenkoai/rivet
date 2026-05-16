@@ -68,14 +68,47 @@ fn numeric_raw_to_optional_decimal_text(raw: &[u8]) -> Option<String> {
 
 pub struct PostgresSource {
     client: Client,
+    /// True when two consecutive pg_backend_pid() calls returned different values,
+    /// indicating a transaction-mode connection pooler (pgBouncer, Odyssey, etc.).
+    transaction_pooler: bool,
+}
+
+/// Detect whether the connection is going through a transaction-mode pooler
+/// (pgBouncer, Odyssey, etc.) by comparing backend PIDs across two implicit
+/// transactions. Returns true when PIDs differ — impossible on a direct
+/// connection or session-mode pooler where the same physical backend is kept.
+///
+/// False negatives are possible when pool_size = 1 (the same backend is always
+/// reused), so this is a best-effort warning rather than a hard guarantee.
+fn detect_pg_transaction_pooler(client: &mut Client) -> bool {
+    let pid1: Option<i32> = client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .ok()
+        .and_then(|r| r.try_get(0).ok());
+    let pid2: Option<i32> = client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .ok()
+        .and_then(|r| r.try_get(0).ok());
+    matches!((pid1, pid2), (Some(a), Some(b)) if a != b)
 }
 
 impl PostgresSource {
     /// Connect with no transport security (legacy path). Prefer [`Self::connect_with_tls`]
     /// for production workloads so credentials and result sets are not visible on the wire.
     pub fn connect(url: &str) -> Result<Self> {
-        let client = Client::connect(url, NoTls)?;
-        Ok(Self { client })
+        let mut client = Client::connect(url, NoTls)?;
+        let transaction_pooler = detect_pg_transaction_pooler(&mut client);
+        if transaction_pooler {
+            log::warn!(
+                "transaction-mode connection pooler detected (pgBouncer/Odyssey) — \
+                 SET LOCAL tuning is transaction-scoped; \
+                 LISTEN/NOTIFY and advisory locks are unavailable"
+            );
+        }
+        Ok(Self {
+            client,
+            transaction_pooler,
+        })
     }
 
     /// Connect honoring the user's [`TlsConfig`]. When `tls.mode` is
@@ -85,12 +118,39 @@ impl PostgresSource {
             Some(cfg) if cfg.mode.is_enforced() => {
                 let connector = build_native_tls(cfg)?;
                 let make_tls = postgres_native_tls::MakeTlsConnector::new(connector);
-                let client = Client::connect(url, make_tls)?;
-                Ok(Self { client })
+                let mut client = Client::connect(url, make_tls)?;
+                let transaction_pooler = detect_pg_transaction_pooler(&mut client);
+                if transaction_pooler {
+                    log::warn!(
+                        "transaction-mode connection pooler detected (pgBouncer/Odyssey) — \
+                         SET LOCAL tuning is transaction-scoped; \
+                         LISTEN/NOTIFY and advisory locks are unavailable"
+                    );
+                }
+                Ok(Self {
+                    client,
+                    transaction_pooler,
+                })
             }
             _ => Self::connect(url),
         }
     }
+}
+
+const ADAPTIVE_SAMPLE_INTERVAL: usize = 10;
+const ADAPTIVE_MIN_BATCH: usize = 500;
+
+/// Sample `checkpoints_req` from `pg_stat_bgwriter`.
+///
+/// PostgreSQL caches the statistics snapshot at the start of each transaction.
+/// We call `pg_stat_clear_snapshot()` first to discard that cache so every
+/// adaptive sample sees fresh counters rather than the frozen value from BEGIN.
+fn pg_sample_checkpoints_req(client: &mut Client) -> Option<i64> {
+    let _ = client.execute("SELECT pg_stat_clear_snapshot()", &[]);
+    client
+        .query_one("SELECT checkpoints_req FROM pg_stat_bgwriter", &[])
+        .ok()
+        .and_then(|r| r.try_get::<_, i64>(0).ok())
 }
 
 /// Open a bare `postgres::Client` honoring the configured TLS policy.
@@ -110,6 +170,139 @@ pub(crate) fn connect_client(url: &str, tls: Option<&TlsConfig>) -> Result<Clien
     }
 }
 
+/// Run the full export transaction against an open Postgres client.
+///
+/// All session-mutating SET commands use SET LOCAL so they are scoped to
+/// the transaction and reset automatically on COMMIT or ROLLBACK. The caller
+/// is responsible for issuing ROLLBACK if this function returns Err.
+///
+/// Returns (total_rows, had_schema). had_schema is false only when the query
+/// returned zero rows; the caller must emit an empty schema in that case.
+fn pg_run_export(
+    client: &mut Client,
+    built_sql: &str,
+    tuning: &SourceTuning,
+    column_overrides: &ColumnOverrides,
+    sink: &mut dyn super::BatchSink,
+    numeric_hints: Option<&HashMap<String, (u8, i8)>>,
+) -> Result<(usize, bool)> {
+    client.batch_execute("BEGIN")?;
+
+    if tuning.statement_timeout_s > 0 {
+        client.batch_execute(&format!(
+            "SET LOCAL statement_timeout = '{}s'",
+            tuning.statement_timeout_s
+        ))?;
+    }
+    if tuning.lock_timeout_s > 0 {
+        client.batch_execute(&format!(
+            "SET LOCAL lock_timeout = '{}s'",
+            tuning.lock_timeout_s
+        ))?;
+    }
+
+    client.batch_execute(&format!(
+        "DECLARE _rivet NO SCROLL CURSOR FOR {}",
+        built_sql
+    ))?;
+
+    let mut fetch_size = tuning.batch_size;
+    let mut fetch_sql = format!("FETCH {} FROM _rivet", fetch_size);
+    let mut schema: Option<SchemaRef> = None;
+    let mut columns_cache: Option<Vec<(String, Type)>> = None;
+    let mut total_rows: usize = 0;
+    let mut base_fetch_size = fetch_size;
+    let mut adaptive_last_ckpt: Option<i64> = if tuning.adaptive {
+        pg_sample_checkpoints_req(client)
+    } else {
+        None
+    };
+    let mut batch_count: usize = 0;
+
+    loop {
+        let rows = client.query(&fetch_sql, &[])?;
+        if rows.is_empty() {
+            break;
+        }
+
+        if schema.is_none() {
+            let stmt_cols: Vec<(String, Type)> = rows[0]
+                .columns()
+                .iter()
+                .map(|c| (c.name().to_string(), c.type_().clone()))
+                .collect();
+            let s = Arc::new(pg_columns_to_schema(
+                rows[0].columns(),
+                column_overrides,
+                numeric_hints,
+            )?);
+            sink.on_schema(s.clone())?;
+            schema = Some(s.clone());
+            columns_cache = Some(stmt_cols);
+
+            let effective = tuning.effective_batch_size(Some(&s));
+            if effective != fetch_size {
+                fetch_size = effective;
+                fetch_sql = format!("FETCH {} FROM _rivet", fetch_size);
+            }
+            base_fetch_size = fetch_size;
+        }
+
+        let row_count = rows.len();
+        total_rows += row_count;
+
+        let s = schema.as_ref().expect("schema set on first iteration");
+        let cols = columns_cache
+            .as_ref()
+            .expect("columns set on first iteration");
+        let batch = rows_to_record_batch_typed(s, cols, &rows)?;
+        drop(rows);
+        sink.on_batch(&batch)?;
+
+        batch_count += 1;
+        if tuning.adaptive
+            && batch_count.is_multiple_of(ADAPTIVE_SAMPLE_INTERVAL)
+            && let Some(cur) = pg_sample_checkpoints_req(client)
+        {
+            let under_pressure = adaptive_last_ckpt.is_some_and(|prev| cur > prev);
+            adaptive_last_ckpt = Some(cur);
+            let next = if under_pressure {
+                (fetch_size * 3 / 4).max(ADAPTIVE_MIN_BATCH)
+            } else {
+                (fetch_size * 5 / 4).min(base_fetch_size)
+            };
+            if next != fetch_size {
+                fetch_size = next;
+                fetch_sql = format!("FETCH {} FROM _rivet", fetch_size);
+                log::info!(
+                    "adaptive batch size → {} ({})",
+                    fetch_size,
+                    if under_pressure {
+                        "pressure"
+                    } else {
+                        "recovery"
+                    }
+                );
+            }
+        }
+
+        log::info!("fetched {} rows so far...", total_rows);
+
+        if row_count < fetch_size {
+            break;
+        }
+
+        if tuning.throttle_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(tuning.throttle_ms));
+        }
+    }
+
+    client.batch_execute("CLOSE _rivet")?;
+    client.batch_execute("COMMIT")?;
+
+    Ok((total_rows, schema.is_some()))
+}
+
 impl super::Source for PostgresSource {
     fn export(
         &mut self,
@@ -125,89 +318,34 @@ impl super::Source for PostgresSource {
             built.cursor_param.is_none(),
             "Postgres path inlines cursor values as E'…' literals — binding is unused"
         );
-        log::debug!("executing query: {}", built.sql);
-
-        if tuning.statement_timeout_s > 0 {
-            self.client.batch_execute(&format!(
-                "SET statement_timeout = '{}s'",
-                tuning.statement_timeout_s
-            ))?;
-        }
-        if tuning.lock_timeout_s > 0 {
-            self.client
-                .batch_execute(&format!("SET lock_timeout = '{}s'", tuning.lock_timeout_s))?;
-        }
+        log::debug!(
+            "executing query (connection={}): {}",
+            if self.transaction_pooler {
+                "transaction-pooler"
+            } else {
+                "direct"
+            },
+            built.sql
+        );
 
         let numeric_hints = pg_numeric_catalog_hints_opt(&mut self.client, query);
 
-        self.client.batch_execute("BEGIN")?;
-        self.client.batch_execute(&format!(
-            "DECLARE _rivet NO SCROLL CURSOR FOR {}",
-            built.sql
-        ))?;
+        let result = pg_run_export(
+            &mut self.client,
+            &built.sql,
+            tuning,
+            column_overrides,
+            sink,
+            numeric_hints.as_ref(),
+        );
 
-        let mut fetch_size = tuning.batch_size;
-        let mut fetch_sql = format!("FETCH {} FROM _rivet", fetch_size);
-        let mut schema: Option<SchemaRef> = None;
-        let mut columns_cache: Option<Vec<(String, Type)>> = None;
-        let mut total_rows: usize = 0;
-
-        loop {
-            let rows = self.client.query(&fetch_sql, &[])?;
-            if rows.is_empty() {
-                break;
-            }
-
-            if schema.is_none() {
-                let stmt_cols: Vec<(String, Type)> = rows[0]
-                    .columns()
-                    .iter()
-                    .map(|c| (c.name().to_string(), c.type_().clone()))
-                    .collect();
-                let s = Arc::new(pg_columns_to_schema(
-                    rows[0].columns(),
-                    column_overrides,
-                    numeric_hints.as_ref(),
-                )?);
-                sink.on_schema(s.clone())?;
-                schema = Some(s.clone());
-                columns_cache = Some(stmt_cols);
-
-                let effective = tuning.effective_batch_size(Some(&s));
-                if effective != fetch_size {
-                    fetch_size = effective;
-                    fetch_sql = format!("FETCH {} FROM _rivet", fetch_size);
-                }
-            }
-
-            let row_count = rows.len();
-            total_rows += row_count;
-
-            let s = schema.as_ref().expect("schema set on first iteration");
-            let cols = columns_cache
-                .as_ref()
-                .expect("columns set on first iteration");
-            let batch = rows_to_record_batch_typed(s, cols, &rows)?;
-            drop(rows);
-            sink.on_batch(&batch)?;
-
-            log::info!("fetched {} rows so far...", total_rows);
-
-            if row_count < fetch_size {
-                break;
-            }
-
-            if tuning.throttle_ms > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(tuning.throttle_ms));
-            }
+        if result.is_err() {
+            let _ = self.client.batch_execute("ROLLBACK");
         }
 
-        self.client.batch_execute("CLOSE _rivet")?;
-        self.client.batch_execute("COMMIT")?;
-        self.client.batch_execute("RESET statement_timeout")?;
-        self.client.batch_execute("RESET lock_timeout")?;
+        let (total_rows, had_schema) = result?;
 
-        if schema.is_none() {
+        if !had_schema {
             sink.on_schema(Arc::new(Schema::empty()))?;
         }
 

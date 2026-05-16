@@ -50,6 +50,10 @@ pub const POSTGRES_URL: &str = "postgresql://rivet:rivet@127.0.0.1:5432/rivet";
 /// RST mid-connection.
 pub const POSTGRES_TOXI_URL: &str = "postgresql://rivet:rivet@127.0.0.1:15432/rivet";
 
+/// pgBouncer in transaction mode with pool_size=1, port :6432.
+/// Opt in: docker compose --profile pool up -d pgbouncer
+pub const PGBOUNCER_URL: &str = "postgresql://rivet:rivet@127.0.0.1:6432/rivet";
+
 pub const MYSQL_URL: &str = "mysql://rivet:rivet@127.0.0.1:3306/rivet";
 pub const MYSQL_TOXI_URL: &str = "mysql://rivet:rivet@127.0.0.1:13306/rivet";
 
@@ -104,6 +108,7 @@ pub enum LiveService {
     Minio,
     FakeGcs,
     Toxiproxy,
+    PgBouncer,
 }
 
 impl LiveService {
@@ -113,6 +118,11 @@ impl LiveService {
                 "127.0.0.1",
                 5432,
                 "service `postgres` in docker-compose.yaml",
+            ),
+            LiveService::PgBouncer => (
+                "127.0.0.1",
+                6432,
+                "service `pgbouncer` — run: docker compose --profile pool up -d pgbouncer",
             ),
             LiveService::PostgresToxi => (
                 "127.0.0.1",

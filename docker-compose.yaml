@@ -216,6 +216,35 @@ services:
 
   # Toxiproxy — network fault injection proxy for retry/resilience testing.
   # Postgres is proxied on port 15432; MySQL on port 13306.
+  # ---- pgBouncer (pool safety tests) ----------------------------------------
+  # Transaction-mode pooler with pool_size=1 so the same physical connection
+  # is always reused — makes session-state leak tests deterministic.
+  # Opt in: docker compose --profile pool up -d pgbouncer
+  pgbouncer:
+    image: bitnami/pgbouncer:latest
+    profiles: ["pool"]
+    environment:
+      POSTGRESQL_HOST: postgres
+      POSTGRESQL_PORT: 5432
+      POSTGRESQL_DATABASE: rivet
+      POSTGRESQL_USERNAME: rivet
+      POSTGRESQL_PASSWORD: rivet
+      PGBOUNCER_POOL_MODE: transaction
+      PGBOUNCER_DEFAULT_POOL_SIZE: 1
+      PGBOUNCER_MAX_CLIENT_CONN: 50
+      PGBOUNCER_SERVER_RESET_QUERY_ALWAYS: "no"
+      PGBOUNCER_AUTH_TYPE: plain
+    ports:
+      - "6432:6432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 -U rivet || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   toxiproxy:
     image: ghcr.io/shopify/toxiproxy:latest
     ports:

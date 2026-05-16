@@ -8,6 +8,7 @@ mod enrich;
 mod error;
 mod format;
 mod init;
+mod mcp;
 mod notify;
 mod pipeline;
 mod plan;
@@ -260,6 +261,19 @@ enum Commands {
         #[arg(long, value_name = "RUN_ID")]
         run_id: Option<String>,
     },
+    /// Start an MCP (Model Context Protocol) server for read-only DB introspection.
+    /// Speaks JSON-RPC 2.0 over stdin/stdout. Integrate with Claude Desktop or Claude Code.
+    Mcp {
+        /// Use stdio transport (required; the only supported transport)
+        #[arg(long, default_value = "true")]
+        stdio: bool,
+        /// Postgres connection URL (overrides DATABASE_URL env var)
+        #[arg(long, env = "DATABASE_URL", value_name = "URL")]
+        pg_url: Option<String>,
+        /// MySQL connection URL (overrides DATABASE_URL for MySQL targets)
+        #[arg(long, value_name = "URL")]
+        mysql_url: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -478,7 +492,7 @@ fn run(command: Commands) -> Result<()> {
             let p = if p.is_empty() { None } else { Some(p) };
             let tgt = target
                 .as_deref()
-                .and_then(crate::types::target::ExportTarget::from_str);
+                .and_then(crate::types::target::ExportTarget::parse);
             preflight::check(
                 &config,
                 export.as_deref(),
@@ -597,6 +611,11 @@ fn run(command: Commands) -> Result<()> {
             run_id,
         } => {
             pipeline::show_journal(&config, &export, last, run_id.as_deref())?;
+        }
+        Commands::Mcp {
+            pg_url, mysql_url, ..
+        } => {
+            mcp::run_stdio(pg_url.as_deref(), mysql_url.as_deref())?;
         }
         Commands::State { action } => match action {
             StateAction::Show { config } => {
