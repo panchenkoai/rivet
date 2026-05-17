@@ -179,10 +179,12 @@ fn pg_content_export_under_update_pressure() {
     std::thread::sleep(Duration::from_millis(800));
 
     // --- Adaptive export ---------------------------------------------------
-    let mut cfg = TuningConfig::default();
-    cfg.adaptive = Some(true);
-    cfg.batch_size = Some(5_000);
-    cfg.statement_timeout_s = Some(300);
+    let cfg = TuningConfig {
+        adaptive: Some(true),
+        batch_size: Some(5_000),
+        statement_timeout_s: Some(300),
+        ..Default::default()
+    };
     let tuning = SourceTuning::from_config(Some(&cfg));
 
     let started = Instant::now();
@@ -296,10 +298,12 @@ fn pg_full_content_export_max_pressure() {
         }
     });
 
-    let mut cfg = TuningConfig::default();
-    cfg.adaptive = Some(true);
-    cfg.batch_size = Some(10_000);
-    cfg.statement_timeout_s = Some(600);
+    let cfg = TuningConfig {
+        adaptive: Some(true),
+        batch_size: Some(10_000),
+        statement_timeout_s: Some(600),
+        ..Default::default()
+    };
     let tuning = SourceTuning::from_config(Some(&cfg));
 
     let started = Instant::now();

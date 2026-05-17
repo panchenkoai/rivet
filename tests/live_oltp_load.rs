@@ -80,9 +80,11 @@ fn tuning_balanced() -> SourceTuning {
 }
 
 fn tuning_adaptive() -> SourceTuning {
-    let mut cfg = TuningConfig::default();
-    cfg.adaptive = Some(true);
-    cfg.batch_size = Some(500);
+    let cfg = TuningConfig {
+        adaptive: Some(true),
+        batch_size: Some(500),
+        ..Default::default()
+    };
     SourceTuning::from_config(Some(&cfg))
 }
 

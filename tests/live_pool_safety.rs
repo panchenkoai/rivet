@@ -76,8 +76,10 @@ impl BatchSink for PanicOnFirstBatch {
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
 fn tuning_300s() -> SourceTuning {
-    let mut cfg = TuningConfig::default();
-    cfg.statement_timeout_s = Some(300);
+    let cfg = TuningConfig {
+        statement_timeout_s: Some(300),
+        ..Default::default()
+    };
     SourceTuning::from_config(Some(&cfg))
 }
 
