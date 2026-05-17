@@ -82,29 +82,64 @@ pub(crate) fn run_with_reconnect(
 
         match run_export(&mut *src, state, plan, summary, config_path) {
             Ok(()) => return Ok(()),
-            Err(e) => {
-                if attempt < plan.tuning.max_retries && classify_error(&e).is_transient() {
-                    // Guard: if a file was already committed to the destination, retrying
-                    // from the same cursor would re-read the same rows and produce duplicates.
-                    if summary.files_committed > 0 {
-                        return Err(anyhow::anyhow!(
-                            "export '{}': transient error after {} file(s) written to destination \
-                             — cannot safely retry (would duplicate rows). \
-                             Run `rivet reconcile` to verify state. Original error: {:#}",
-                            plan.export_name,
-                            summary.files_committed,
-                            e
-                        ));
-                    }
+            Err(e) => match decide_export_retry(
+                attempt,
+                plan.tuning.max_retries,
+                summary.files_committed,
+                &plan.export_name,
+                &e,
+            ) {
+                ExportRetry::Retry => {
                     last_err = Some(e);
                     continue;
                 }
-                return Err(e);
-            }
+                ExportRetry::BailDuplicateGuard(err) => return Err(err),
+                ExportRetry::BailOriginal => return Err(e),
+            },
         }
     }
 
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("export failed after retries")))
+}
+
+/// Outcome of the retry decision in `run_with_reconnect`.
+///
+/// Lifted out of the loop body so the invariant — "do not retry after a file
+/// was committed; that would duplicate rows" — is independently unit-testable.
+#[derive(Debug)]
+enum ExportRetry {
+    /// Caller should consume the error, sleep the backoff, and retry.
+    Retry,
+    /// Caller must propagate this synthesised error: the original failure was
+    /// transient, but at least one file was already committed to the destination
+    /// so retrying from the same cursor would re-read those rows.
+    BailDuplicateGuard(anyhow::Error),
+    /// Caller must propagate the *original* error (either permanent, or we have
+    /// exhausted the retry budget).
+    BailOriginal,
+}
+
+fn decide_export_retry(
+    attempt: u32,
+    max_retries: u32,
+    files_committed: usize,
+    export_name: &str,
+    err: &anyhow::Error,
+) -> ExportRetry {
+    if attempt >= max_retries || !classify_error(err).is_transient() {
+        return ExportRetry::BailOriginal;
+    }
+    if files_committed > 0 {
+        return ExportRetry::BailDuplicateGuard(anyhow::anyhow!(
+            "export '{}': transient error after {} file(s) written to destination \
+             — cannot safely retry (would duplicate rows). \
+             Run `rivet reconcile` to verify state. Original error: {:#}",
+            export_name,
+            files_committed,
+            err
+        ));
+    }
+    ExportRetry::Retry
 }
 
 pub(crate) fn run_export(
@@ -684,5 +719,88 @@ mod tests {
             "expected quality error: {err}"
         );
         assert_eq!(summary.quality_passed, Some(false));
+    }
+
+    // ── decide_export_retry: retry/reconnect decision matrix ────────────────
+    //
+    // These tests exhaustively cover the four-way decision that gates the
+    // retry loop in `run_with_reconnect`. The function is pure (no I/O, no
+    // state) which lets every combination of (attempt, max, files_committed,
+    // error class) be enumerated without touching docker.
+
+    fn transient_err() -> anyhow::Error {
+        // String form matches the network branch in classify_error.
+        anyhow::anyhow!("connection reset by peer")
+    }
+
+    fn permanent_err() -> anyhow::Error {
+        // String form matches the auth branch in classify_error.
+        anyhow::anyhow!("permission denied for table users")
+    }
+
+    #[test]
+    fn decide_retry_transient_with_budget_and_no_files_retries() {
+        let d = decide_export_retry(0, 3, 0, "orders", &transient_err());
+        assert!(matches!(d, ExportRetry::Retry), "got: {d:?}");
+    }
+
+    #[test]
+    fn decide_retry_transient_after_files_committed_is_duplicate_guard() {
+        // After a file has been written, retrying from the same cursor would
+        // re-export those rows. The guard is the highest-value invariant in
+        // the retry loop — losing it would silently corrupt a downstream
+        // warehouse. Test it explicitly.
+        let err = transient_err();
+        let d = decide_export_retry(1, 3, 2, "orders", &err);
+        match d {
+            ExportRetry::BailDuplicateGuard(synth) => {
+                let s = format!("{:#}", synth);
+                assert!(
+                    s.contains("2 file(s) written"),
+                    "must surface how many files were committed: {s}"
+                );
+                assert!(
+                    s.contains("would duplicate rows"),
+                    "must explain the invariant being protected: {s}"
+                );
+                assert!(s.contains("rivet reconcile"), "must hint at recovery: {s}");
+                assert!(
+                    s.contains("connection reset"),
+                    "must chain the original error: {s}"
+                );
+            }
+            other => panic!("expected BailDuplicateGuard, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_retry_transient_after_budget_exhausted_bails_original() {
+        // attempt == max_retries → no more attempts allowed.
+        let d = decide_export_retry(3, 3, 0, "orders", &transient_err());
+        assert!(matches!(d, ExportRetry::BailOriginal), "got: {d:?}");
+    }
+
+    #[test]
+    fn decide_retry_permanent_error_bails_immediately_regardless_of_budget() {
+        // Permanent errors short-circuit even when retry budget remains.
+        let d = decide_export_retry(0, 3, 0, "orders", &permanent_err());
+        assert!(matches!(d, ExportRetry::BailOriginal), "got: {d:?}");
+    }
+
+    #[test]
+    fn decide_retry_permanent_error_after_files_does_not_synthesise_duplicate_guard() {
+        // The duplicate-guard message is reserved for *transient* errors —
+        // a permanent failure should propagate as-is so the operator sees the
+        // real cause, not a wrapped recovery hint.
+        let d = decide_export_retry(0, 3, 5, "orders", &permanent_err());
+        assert!(matches!(d, ExportRetry::BailOriginal), "got: {d:?}");
+    }
+
+    #[test]
+    fn decide_retry_zero_max_retries_never_retries() {
+        // `max_retries = 0` is the "fail fast" config. attempt(0) >= max(0)
+        // must bail immediately even on a transient error.
+        let d = decide_export_retry(0, 0, 0, "orders", &transient_err());
+        assert!(matches!(d, ExportRetry::BailOriginal), "got: {d:?}");
     }
 }
