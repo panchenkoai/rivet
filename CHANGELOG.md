@@ -1,5 +1,109 @@
 # Changelog
 
+## 0.5.3 (2026-05-17)
+
+### Architecture audit pass — fault-tolerance, observability, CI hardening
+
+No new user-facing features. All changes are bug fixes, internal refactors,
+new unit/CI coverage, and ADR-documented design decisions. The CLI surface
+(flags, config schema, output formats) is unchanged.
+
+#### Fixes
+
+- **`fix(postgres)`** — RAII `PgTxnGuard` around the cursor txn. Closes G1
+  from the DBA audit: a panic between `BEGIN` and `COMMIT` (e.g. inside a
+  `BatchSink::on_batch`) used to leak the open transaction back into the
+  pool. The guard's `Drop` now issues a best-effort `ROLLBACK` so the
+  connection is returned clean even on unwind. Regression test
+  `pg_panic_in_sink_releases_cursor_and_aborts_txn` exercises the panic
+  path via `std::panic::catch_unwind`.
+- **`fix(adaptive)`** — call `pg_stat_clear_snapshot()` before each
+  `checkpoints_req` sample. PostgreSQL caches the stats snapshot at
+  transaction start, so every adaptive sample inside the cursor txn was
+  returning the frozen value from `BEGIN` time — making the feature blind
+  to checkpoints that accumulated during the export. Adaptive batch sizing
+  now actually reacts (verified end-to-end: a 200K-row content_items
+  export under WAL pressure goes from `batches=40 min=5000 max=5000` to
+  `batches=121 min=500 max=5000` with `adaptive: true`).
+- **`fix(test)`** — `live_oltp_load.rs` had a long-standing precondition
+  bug: `SELECT *` on a `NUMERIC(12,2)` column loses precision metadata in
+  the subquery wrap. Tests now declare an explicit `amount` decimal
+  override; the property under test (retry/streaming under concurrent
+  inserts) is unrelated to NUMERIC inference.
+
+#### Refactors
+
+- **`refactor(retry)`** — `classify_error` now returns the typed
+  `RetryClass { Permanent | Transient { needs_reconnect, extra_delay_ms } }`
+  instead of a `(bool, bool, u64)` tuple. Positional destructuring made
+  the two booleans easy to confuse; named accessors (`is_transient`,
+  `needs_reconnect`, `extra_delay_ms`) are now used at every call site.
+- **`refactor(source)`** — `Source::export` packs its 5 read-only
+  parameters into a named `ExportRequest` struct. Call sites read like
+  `ExportRequest { query, incremental, cursor, tuning, column_overrides }`
+  instead of relying on positional order.
+- **`refactor(journal)`** — `RunJournal`, `RunEvent`, `JournalEntry`, and
+  `PlanSnapshot` move out of `pipeline::journal` to a new top-level
+  `crate::journal`. This eliminates a layering inversion where
+  `state::journal_store` was importing from `pipeline::*` (state →
+  pipeline is the wrong direction). The `From<&ResolvedRunPlan>` impl
+  moves to `pipeline/summary.rs` beside its sole caller.
+- **`refactor(adaptive)`** — `next_adaptive_batch_size` extracted into a
+  pure function in `tuning.rs` and shared between `PostgresSource` and
+  `MysqlSource`. The shrink/grow decision is now unit-testable without a
+  live database (6 unit tests covering floor, ceiling, oscillation
+  convergence). `ADAPTIVE_SAMPLE_INTERVAL` and `ADAPTIVE_MIN_BATCH`
+  promoted to public constants in `tuning`.
+- **`refactor(sink)`** — `pipeline/sink.rs` converted to `pipeline/sink/`
+  with `extract_last_cursor_value` and its 11 Arrow-type tests moved into
+  `pipeline/sink/cursor.rs`. `sink/mod.rs` drops from 1525 → 1295 LOC.
+
+#### Performance
+
+- **`perf(chunked)`** — replace the busy-wait worker semaphore in
+  `pipeline/chunked/exec.rs` (atomic + 50ms sleep loop) with a
+  `Mutex<usize> + Condvar`-backed `resource::Semaphore`. Blocked
+  acquirers now park in the kernel until a worker calls `release()`,
+  instead of polling 20×/sec per blocked thread.
+
+#### Tests
+
+- **22 new unit tests** covering the previously-zero-coverage checkpoint
+  state machine (`ensure_chunk_checkpoint_plan` 5-transition matrix +
+  `record_chunked_commit` boundary advancement), the duplicate-write
+  guard in `run_with_reconnect` (`decide_export_retry` 6-case matrix),
+  the chunked quality gate (`run_chunked_quality_gate` 7 cases),
+  adaptive batch sizing math, and `mcp::ascii_table` formatter.
+- Coverage delta on critical pipeline files:
+  - `pipeline/chunked/mod.rs`: 0% → 37.26% line coverage
+  - `pipeline/single.rs`: 41% → 48.53%
+  - `pipeline/job.rs`: 21.80% → 56.83%
+  - Total: 66.78% → 69.73%
+
+#### CI / Operational
+
+- **`ci`** — live tests now run on every PR. Swap the upstream-yanked
+  `bitnami/pgbouncer:latest` for `edoburu/pgbouncer:latest` in
+  `docker-compose.yaml`, bring up pgBouncer in the per-PR `e2e` job, and
+  filter the heavy 50K+-row `content_export` tests out of e2e (they ran
+  for minutes and required a separate fixture). The full live suite
+  including `content_load` runs nightly via the new
+  `.github/workflows/nightly-live.yml` workflow (03:30 UTC +
+  `workflow_dispatch`). 151 live tests now gate every merge to `main`.
+
+#### Docs
+
+- **ADR-0010** — "Two parallel execution engines": documents the
+  in-process `thread::scope` engine (chunked-single-table) vs the
+  subprocess engine (`parallel_children`) as a deliberate split, with
+  the conditions that would trigger unification.
+- **ADR-0011** — "`Source: Send` not `Sync`": records that the
+  `Mutex<Client>` prototype produced a measured 1.7× slowdown on a
+  4-thread chunked export, so per-worker connections remain the right
+  shape for blocking SQL drivers.
+
+---
+
 ## 0.5.2 (2026-05-15)
 
 ### Wave 2 live E2E test suite — full CLI flag coverage with behavioral assertions
