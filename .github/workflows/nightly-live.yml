@@ -1,0 +1,103 @@
+name: Nightly Live
+
+# Heavy live tests that would slow down per-PR CI but must be exercised
+# regularly so regressions in checkpoint/recovery/load-aware behaviour are
+# caught before they ship.
+#
+# This workflow:
+#   1. Brings up the full docker-compose stack including pgBouncer.
+#   2. Seeds the `content_items` fixture (~2M rows, several minutes).
+#   3. Runs `live_content_load` AND every other `#[ignore]` live test
+#      against the seeded DB.
+#
+# Triggers: nightly cron (03:30 UTC) + manual dispatch.
+
+on:
+  schedule:
+    # 03:30 UTC = roughly 06:30 CET / 23:30 ET — outside business hours so
+    # a failure email arrives by morning and the dev box is unlikely to be
+    # busy if the matrix is later expanded.
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+    # Manual button in the Actions UI: useful for verifying a fix on the
+    # full live matrix without waiting for the next nightly window.
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  live-full:
+    name: Full live suite (incl. content_load)
+    # Heavier than the per-PR `e2e` job — give it more time.
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start services
+        run: docker compose --profile pool up -d postgres mysql minio fake-gcs toxiproxy pgbouncer
+
+      - name: Wait for services
+        run: |
+          echo "Waiting for Postgres..."
+          for i in $(seq 1 30); do docker compose exec -T postgres pg_isready -U rivet && break || sleep 2; done
+          echo "Waiting for MySQL..."
+          for i in $(seq 1 30); do docker compose exec -T mysql mysqladmin ping -h localhost -uroot -privet 2>/dev/null && break || sleep 2; done
+          echo "Waiting for pgBouncer..."
+          for i in $(seq 1 30); do (exec 3<>/dev/tcp/127.0.0.1/6432) 2>/dev/null && break || sleep 1; done
+
+      - name: Build release (rivet + seed)
+        # `--bin seed` builds the auxiliary src/bin/seed.rs target on top of
+        # the default `rivet` binary so the heavy content_items fixture can
+        # be populated without `cargo run`'s rebuild overhead.
+        run: cargo build --release --bin rivet --bin seed
+
+      - name: Seed light fixtures (orders, etc.)
+        run: |
+          PGPASSWORD=rivet psql -h localhost -U rivet -d rivet -f dev/e2e/seed_pg.sql
+          mysql -h 127.0.0.1 -u rivet -privet rivet < dev/e2e/seed_mysql.sql
+
+      - name: Seed heavy fixture (content_items)
+        # tests/live_content_load.rs asserts count >= 50_000 for the
+        # `pg_content_export_under_update_pressure` test. Use a leaner
+        # 60k-row fixture (~1 min) — that's enough to trigger WAL pressure
+        # without inflating CI wall time with millions of rows.
+        # The `pg_full_content_export_max_pressure` test requires 1M rows
+        # and is intentionally not exercised here (still manual-only).
+        run: |
+          ./target/release/seed \
+            --target postgres \
+            --users 1000 \
+            --orders-per-user 5 \
+            --events-per-user 5 \
+            --page-views 5000 \
+            --content-items 60000
+
+      - name: Run FULL live suite (skip 1M-row stress test)
+        # Everything #[ignore]d — light suite (also covered by per-PR e2e,
+        # which is cheap insurance against docker-compose regressions like
+        # an image tag breaking pgBouncer) plus content_export_under_update.
+        # Skips the 1M-row "max_pressure" test that genuinely takes 3–5 min
+        # even when seeded; leave that one for manual runs.
+        run: cargo test --release -- --ignored --skip full_content_export_max_pressure
+
+      - name: Dump service logs on failure
+        if: failure()
+        run: |
+          echo "::group::postgres"
+          docker compose logs --no-color postgres | tail -200
+          echo "::endgroup::"
+          echo "::group::mysql"
+          docker compose logs --no-color mysql | tail -200
+          echo "::endgroup::"
+          echo "::group::pgbouncer"
+          docker compose logs --no-color pgbouncer | tail -200
+          echo "::endgroup::"
+
+      - name: Stop services
+        if: always()
+        run: docker compose down -v

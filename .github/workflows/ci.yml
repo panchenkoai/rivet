@@ -150,7 +150,10 @@ jobs:
       - name: Start services
         # Include `toxiproxy` so the retry / chaos / crash-recovery live-test
         # binaries have the proxy admin API available on :8474.
-        run: docker compose up -d postgres mysql minio fake-gcs toxiproxy
+        # `--profile pool` brings up pgBouncer (transaction mode, pool_size=1)
+        # for the live_pool_safety regression suite — the F1–F6 / G1 DBA-audit
+        # fixes silently rot without it.
+        run: docker compose --profile pool up -d postgres mysql minio fake-gcs toxiproxy pgbouncer
 
       - name: Wait for services
         run: |
@@ -158,6 +161,8 @@ jobs:
           for i in $(seq 1 30); do docker compose exec -T postgres pg_isready -U rivet && break || sleep 2; done
           echo "Waiting for MySQL..."
           for i in $(seq 1 30); do docker compose exec -T mysql mysqladmin ping -h localhost -uroot -privet 2>/dev/null && break || sleep 2; done
+          echo "Waiting for pgBouncer..."
+          for i in $(seq 1 30); do (exec 3<>/dev/tcp/127.0.0.1/6432) 2>/dev/null && break || sleep 1; done
 
       - name: Build release
         run: cargo build --release
@@ -179,7 +184,11 @@ jobs:
         # default (Phase A–G of the QA backlog).  Cross-process synchronisation
         # on the shared Toxiproxy admin API is enforced by an flock-based
         # `toxiproxy_guard` in `tests/common/mod.rs`.
-        run: cargo test --release -- --ignored
+        #
+        # Skip the heavy `content_export` tests — they assert a 50K+ row
+        # `content_items` fixture that takes minutes to seed and is exercised
+        # by the `nightly-live` workflow instead.
+        run: cargo test --release -- --ignored --skip content_export
 
       - name: Stop services
         if: always()

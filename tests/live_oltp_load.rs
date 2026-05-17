@@ -27,7 +27,24 @@ use rivet::source::mysql::MysqlSource;
 use rivet::source::postgres::PostgresSource;
 use rivet::source::{BatchSink, ExportRequest, Source};
 use rivet::tuning::{SourceTuning, TuningConfig};
-use rivet::types::ColumnOverrides;
+use rivet::types::{ColumnOverrides, RivetType};
+
+/// Column overrides matching the `seed_pg_numeric_table` schema: `amount`
+/// is `NUMERIC(12,2)` but `SELECT *` wrapped in a subquery loses precision
+/// metadata, so Rivet rejects it. Providing the explicit type unblocks the
+/// export under test (the test itself is about retry/streaming behaviour,
+/// not about Rivet's NUMERIC-precision inference).
+fn amount_override() -> ColumnOverrides {
+    let mut o = ColumnOverrides::new();
+    o.insert(
+        "amount".to_string(),
+        RivetType::Decimal {
+            precision: 12,
+            scale: 2,
+        },
+    );
+    o
+}
 
 // ─── Counting sink ─────────────────────────────────────────────────────────
 
@@ -111,7 +128,7 @@ fn pg_export_survives_concurrent_inserts() {
             incremental: None,
             cursor: None,
             tuning: &tuning_balanced(),
-            column_overrides: &ColumnOverrides::default(),
+            column_overrides: &amount_override(),
         },
         &mut sink,
     );
@@ -167,7 +184,7 @@ fn pg_export_adaptive_under_write_pressure() {
             incremental: None,
             cursor: None,
             tuning: &tuning_adaptive(),
-            column_overrides: &ColumnOverrides::default(),
+            column_overrides: &amount_override(),
         },
         &mut sink,
     );

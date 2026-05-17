@@ -487,7 +487,7 @@ impl BatchSink for ExportSink {
 mod tests {
     use super::*;
     use arrow::array::*;
-    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
 
     // ─── extract_last_cursor_value tests live in src/pipeline/sink/cursor.rs
