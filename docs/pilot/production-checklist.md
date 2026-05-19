@@ -10,6 +10,7 @@ Complete this checklist before running Rivet against a production database.
 - [ ] **Credential management**: use `url_env` or `password_env` — never hardcode passwords in YAML
 - [ ] **Read replica**: if available, point Rivet at the replica to avoid load on the primary
 - [ ] **Connection limits**: confirm the database connection pool has room for Rivet's connections (1 per export, +1 for chunked parallel workers)
+- [ ] **Connection pooler / proxy awareness**: if traffic is routed through pgBouncer, Odyssey, ProxySQL, MaxScale, or HAProxy, read the **Connection poolers and proxies** section below before the first run
 
 ## Connectivity
 
@@ -92,6 +93,34 @@ Key guarantees:
 > **Security note:** `plan.json` embeds the resolved source connection config. Plaintext `password:` values and `scheme://user:pass@` userinfo are stripped by ADR-0005 PA9; references (`password_env:` / `url_env:` / `url_file:`) are preserved so the apply environment can re-resolve them. Plans still contain query SQL, schema and cursor state — treat them as sensitive.
 
 See [CLI reference](../reference/cli.md) and [ADR-0005](../adr/0005-plan-apply-contracts.md) for the full contract specification.
+
+## Connection poolers and proxies
+
+Many production stacks place pgBouncer / Odyssey / ProxySQL / MaxScale / HAProxy in front of the database. Rivet detects the connection shape at startup and emits a one-line warning if a pooler or multiplexing proxy is involved. Acting on that warning is the operator's call — the export still runs.
+
+![Direct MySQL vs ProxySQL: connect-time warning fires only behind the proxy](../gifs/pool-detect.gif)
+
+### What Rivet detects, and what it does about it
+
+| Stack in front of the DB | Rivet's classification | What still works | What may silently NOT work |
+|---|---|---|---|
+| Direct connection | Postgres: no warning · MySQL: `MysqlProxyKind::Direct` | Everything | — |
+| pgBouncer / Odyssey (transaction mode) | Postgres: "transaction-mode connection pooler detected" | `SET LOCAL` inside our `BEGIN` … `COMMIT` (each export wraps its work in a txn); destination write; cursor/manifest writes | `LISTEN`/`NOTIFY`, advisory locks, prepared statements that outlive a transaction |
+| pgBouncer / Odyssey (session mode) | No warning (PIDs stay stable) | Everything direct works | — |
+| ProxySQL (default config) | MySQL: `MysqlProxyKind::ProxySql` | Session vars per statement when `transaction_persistent=1` is on the user (we set it in our dev fixture) | Long-lived prepared statements; assumptions that two consecutive queries hit the same backend |
+| MariaDB MaxScale | MySQL: `MysqlProxyKind::MaxScale` | Read-write splitting under `readwritesplit` router | Queries the router decides to reject or rewrite; backend-side statement timeouts may diverge from what `tuning.statement_timeout_s` sets |
+| HAProxy MySQL mode, in-house balancers | MySQL: `MysqlProxyKind::Multiplexed` | Per-statement behaviour | Anything session-scoped |
+
+### Recommended posture for production
+
+1. **Read the startup log line.** A warning like `transaction-mode connection pooler detected (pgBouncer/Odyssey)` or `MySQL proxy multiplexer detected (ProxySQL)` is intentional, one-time per source connect.
+2. **Prefer session mode (Postgres) or `transaction_persistent=1` (ProxySQL)** for any Rivet user that needs `statement_timeout`, `lock_timeout`, or `time_zone` to actually take effect for the full export.
+3. **If you must run through transaction mode**, do not assume per-export tuning that depends on session state is enforced for anything outside Rivet's own `BEGIN ... COMMIT` block. The destination commit and state writes are unaffected — `live_pool_safety.rs` exercises both paths against pgBouncer (`pool_size=1`) and ProxySQL nightly.
+4. **Connection budget**: chunked exports with `parallel: N` open N concurrent backends. Multiply by the number of exports running simultaneously. Verify your pooler / backend `max_connections` headroom — see [ADR-0011](../adr/0011-source-trait-send-not-sync.md) for why we don't share a connection across workers.
+
+The full coverage table is in [docs/reliability-matrix.md § Pool and load pressure](../reliability-matrix.md#pool-and-load-pressure), and the detection internals are described in [docs/architecture.md § Connection pooler / proxy detection](../architecture.md#connection-pooler--proxy-detection).
+
+---
 
 ## Memory budgeting
 

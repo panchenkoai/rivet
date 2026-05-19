@@ -208,6 +208,24 @@ fn is_decimal_type(data_type: &str) -> bool {
     t == "numeric" || t == "decimal"
 }
 
+/// Mirror of the validation in [`crate::config::models::validate_table_shortcut_ident`]:
+/// accepts `<name>` or `<schema>.<name>` with ASCII-only identifier characters.
+fn is_simple_pg_ident(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.is_empty() || parts.len() > 2 {
+        return false;
+    }
+    parts.iter().all(|p| {
+        let mut chars = p.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+                chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+            }
+            _ => false,
+        }
+    })
+}
+
 /// `true` when the table exports at least one `DECIMAL`/`NUMERIC` column whose
 /// precision/scale are missing from introspection (`numeric` without `(p,s)` in DDL).
 pub(super) fn table_has_unbounded_decimal_columns(info: &TableInfo) -> bool {
@@ -249,13 +267,23 @@ fn export_block_lines(
         format!("{}.{}", info.schema, info.table)
     };
 
-    let mut lines = vec![
-        format!("  - name: {}", yaml_quote_if_needed(&info.table)),
-        "    query: >".to_string(),
-        format!("      SELECT {col_list}"),
-        format!("      FROM {qualified_table}"),
-        format!("    mode: {mode}"),
-    ];
+    // For `mode: full` on a plain table, emit the `table:` shortcut: it produces
+    // `SELECT * FROM <schema>.<table>` internally, which is the only form the PG
+    // numeric-catalog-hint resolver recognises — so `numeric(p,s)` columns get
+    // typed correctly even if the user later strips the `columns:` overrides.
+    //
+    // For `chunked` / `incremental` we keep the explicit `SELECT col1, ... FROM`
+    // form: those modes usually start from a curated column set and benefit from
+    // a self-documenting YAML.
+    let mut lines = vec![format!("  - name: {}", yaml_quote_if_needed(&info.table))];
+    if mode == "full" && source_type == "postgres" && is_simple_pg_ident(&qualified_table) {
+        lines.push(format!("    table: {qualified_table}"));
+    } else {
+        lines.push("    query: >".to_string());
+        lines.push(format!("      SELECT {col_list}"));
+        lines.push(format!("      FROM {qualified_table}"));
+    }
+    lines.push(format!("    mode: {mode}"));
 
     match mode {
         "chunked" => {
@@ -538,6 +566,80 @@ mod tests {
         assert!(
             !yaml.contains("    parquet:"),
             "small full-mode table must not emit parquet block:\n{yaml}"
+        );
+    }
+
+    // ── `table:` shortcut emission ───────────────────────────────────────────
+
+    #[test]
+    fn full_mode_pg_emits_table_shortcut_not_select_query() {
+        let info = make_table(vec![col("id", "bigint"), col("name", "text")]);
+        let dest = InitYamlDestination::default();
+        let yaml =
+            generate_config(&info, "postgresql://rivet:rivet@localhost/rivet", &dest).unwrap();
+        assert!(
+            yaml.contains("    table: payments"),
+            "full-mode PG export should emit `table:` shortcut:\n{yaml}"
+        );
+        assert!(
+            !yaml.contains("    query: >"),
+            "explicit SELECT block should be replaced by `table:`:\n{yaml}"
+        );
+        assert!(
+            !yaml.contains("SELECT id"),
+            "no enumerated SELECT for the table-shortcut form:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn full_mode_pg_non_public_schema_emits_qualified_table() {
+        let info = TableInfo {
+            schema: "billing".into(),
+            table: "invoices".into(),
+            row_estimate: 100,
+            total_bytes: None,
+            columns: vec![col("id", "bigint")],
+        };
+        let dest = InitYamlDestination::default();
+        let yaml =
+            generate_config(&info, "postgresql://rivet:rivet@localhost/rivet", &dest).unwrap();
+        assert!(
+            yaml.contains("    table: billing.invoices"),
+            "qualified table name expected for non-public schema:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn full_mode_mysql_keeps_select_query_form() {
+        // MySQL does not benefit from the PG catalog-hint trick and the
+        // `table:` shortcut is documented as PG-first; emit explicit SELECT.
+        let info = make_table(vec![col("id", "bigint"), col("name", "text")]);
+        let dest = InitYamlDestination::default();
+        let yaml = generate_config(&info, "mysql://rivet:rivet@localhost/rivet", &dest).unwrap();
+        assert!(
+            yaml.contains("    query: >"),
+            "MySQL full-mode should keep the explicit SELECT form:\n{yaml}"
+        );
+        assert!(
+            !yaml.contains("    table: "),
+            "no `table:` shortcut for MySQL:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn chunked_mode_keeps_select_query_form() {
+        // chunked is curated; explicit SELECT remains.
+        let info = chunked_table(2_000_000, vec![col("id", "bigint"), col("name", "text")]);
+        let dest = InitYamlDestination::default();
+        let yaml =
+            generate_config(&info, "postgresql://rivet:rivet@localhost/rivet", &dest).unwrap();
+        assert!(
+            yaml.contains("    query: >"),
+            "chunked mode should preserve explicit SELECT:\n{yaml}"
+        );
+        assert!(
+            !yaml.contains("    table: "),
+            "no `table:` shortcut for chunked mode:\n{yaml}"
         );
     }
 }

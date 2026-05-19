@@ -206,16 +206,25 @@ impl Config {
         }
 
         for export in &self.exports {
-            if export.query.is_none() && export.query_file.is_none() {
+            let set_count = [
+                export.query.is_some(),
+                export.query_file.is_some(),
+                export.table.is_some(),
+            ]
+            .iter()
+            .filter(|b| **b)
+            .count();
+            if set_count == 0 {
                 anyhow::bail!(
-                    "export '{}': must specify 'query' or 'query_file'",
+                    "export '{}': must specify exactly one of 'query', 'query_file', or 'table'",
                     export.name
                 );
             }
-            if export.query.is_some() && export.query_file.is_some() {
+            if set_count > 1 {
                 anyhow::bail!(
-                    "export '{}': specify either 'query' or 'query_file', not both",
-                    export.name
+                    "export '{}': specify exactly one of 'query', 'query_file', or 'table' (got {} set)",
+                    export.name,
+                    set_count
                 );
             }
             if export.destination.destination_type == DestinationType::S3 {
@@ -316,9 +325,14 @@ impl Config {
                     }
                 }
                 ExportMode::Chunked => {
-                    if export.chunk_column.is_none() {
+                    // `chunk_column` is mandatory unless the user used the `table:`
+                    // shortcut on a Postgres source — in that case it is auto-resolved
+                    // from the table's single-integer PK at plan-build time (see
+                    // `crate::plan::build::resolve_chunk_column`).
+                    if export.chunk_column.is_none() && export.table.is_none() {
                         anyhow::bail!(
-                            "export '{}': chunked mode requires chunk_column",
+                            "export '{}': chunked mode requires chunk_column \
+                             (or use `table:` shortcut on a Postgres source to auto-resolve from PK)",
                             export.name
                         );
                     }

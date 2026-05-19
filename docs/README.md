@@ -17,16 +17,15 @@ Every release is exercised against the full end-to-end suite on each of the foll
 
 See [reference/compatibility.md](reference/compatibility.md) for the version-support policy, the exact test matrix, and notes on engine-specific features.
 
-## Start Here
+## Start here
 
-| Guide | Description |
-|-------|-------------|
-| [Pilot guide — index](pilot/README.md) | **Start here for pilots:** pick quickstart, demo, or full walkthrough; ordered checklist |
-| [Getting Started](getting-started.md) | Install Rivet, connect to your database, run your first export |
-| [Quickstart: Postgres](pilot/quickstart-postgres.md) | One-table export in 5 minutes (PostgreSQL) |
-| [Quickstart: MySQL](pilot/quickstart-mysql.md) | One-table export in 5 minutes (MySQL) |
-| [Demo quickstart](pilot/demo-quickstart.md) | Scripted pilot demo on a pre-seeded 14-table fixture — prioritization, composite cursor, reconcile, repair, progression (≈10 min) |
-| [Pilot walkthrough](pilot/pilot-walkthrough.md) | Conceptual end-to-end tour on your own data |
+Pick one — they're ordered shortest to deepest. Read top-to-bottom, then come back to this index when you need a reference.
+
+| Guide | What it gives you | Time |
+|-------|-------|------|
+| [Getting Started](getting-started.md) | Install + your first export from a real table | ~3 min read · ~5 min hands-on |
+| [Concepts glossary](concepts.md) | One-page orientation: `run_id`, `cursor`, `chunk`, `manifest`, `journal`, `progression` | ~3 min |
+| [Pilot guide](pilot/README.md) | Operator runbook — full flow on your own database, production-ready guardrails | 1–2 sessions |
 
 Short terminal walkthroughs in [gifs/](gifs/):
 
@@ -40,7 +39,7 @@ Short terminal walkthroughs in [gifs/](gifs/):
 |------|-------------|-------|
 | **full** | Snapshot the entire result set each run | [modes/full.md](modes/full.md) |
 | **incremental** | Only export rows newer than the last cursor | [modes/incremental.md](modes/incremental.md) · [composite cursor](modes/incremental-coalesce.md) |
-| **chunked** | Split large tables into parallel ranges by ID; terminal progress bar while chunks run | [modes/chunked.md](modes/chunked.md) |
+| **chunked** | Split large tables into parallel ranges by ID, **or by date** (`chunk_by_days: 365` → one chunk per ~year, `>= AND <` semantics); checkpoint + `--resume` for crashed runs | [modes/chunked.md](modes/chunked.md) |
 | **time_window** | Export a rolling N-day window | [modes/time-window.md](modes/time-window.md) |
 
 ## Destinations
@@ -60,8 +59,22 @@ Short terminal walkthroughs in [gifs/](gifs/):
 | CLI commands and flags | [reference/cli.md](reference/cli.md) |
 | Tuning profiles and parameters | [reference/tuning.md](reference/tuning.md) |
 | `rivet init` — scaffold YAML from the database | [reference/init.md](reference/init.md) |
+| `rivet init --discover` — machine-readable JSON discovery artifact (ranked cursor / chunk candidates, row estimates, on-disk sizes) for automation and code review | [reference/init.md#discovery-artifact---discover](reference/init.md#discovery-artifact---discover) · [gifs/discover-artifact.gif](gifs/discover-artifact.gif) |
+| `rivet check --type-report --target bigquery` — per-column type fidelity report + warehouse compatibility (NUMERIC / BIGNUMERIC / TIMESTAMP overflow warnings); `--strict` exits non-zero on lossy mappings | [reference/cli.md#rivet-check](reference/cli.md#rivet-check) |
 | Supported PostgreSQL / MySQL versions and test matrix | [reference/compatibility.md](reference/compatibility.md) |
 | Offline + live test matrix, harness, fault-injection hook | [reference/testing.md](reference/testing.md) |
+
+## Trust contracts
+
+The five surfaces a serious operator inspects before adopting Rivet. Same five rows, same order, are mirrored at the top of the project [README](../README.md).
+
+| Topic | Guide |
+|-------|-------|
+| **Execution semantics** — retry, crash, resume, repair, reconcile, known non-guarantees | [semantics.md](semantics.md) |
+| **Reliability matrix** — what runs in PR CI vs nightly vs manual; pgBouncer & ProxySQL coverage | [reliability-matrix.md](reliability-matrix.md) |
+| **Security policy** — what Rivet can access, sensitive artifacts, credential handling, reporting | [../SECURITY.md](../SECURITY.md) |
+| **Compatibility matrix** — PG 12–16, MySQL 5.7 / 8.0 versions actually exercised in CI | [reference/compatibility.md](reference/compatibility.md) |
+| **Cross-tool benchmark harness** — reproducible PG/MySQL → Parquet vs sling, dlt, duckdb, clickhouse-local, odbc2parquet (defaults + steelman) | [bench/README.md](bench/README.md) |
 
 ## Best Practices
 
@@ -108,6 +121,8 @@ Practical guides explaining *why* settings matter and *when* to use them.
 | [0007](adr/0007-cursor-policy-contracts.md) | Cursor policy — single-column / coalesce (CC1–CC10) |
 | [0008](adr/0008-export-progression.md) | Committed / verified progression (PG1–PG8) |
 | [0009](adr/0009-reconcile-and-repair-contracts.md) | Reconcile and targeted repair (RC1–RC6, RR1–RR8) |
+| [0010](adr/0010-two-parallel-engines.md) | Two parallel engines (in-process scoped threads vs subprocess fan-out) |
+| [0011](adr/0011-source-trait-send-not-sync.md) | `Source: Send` (not `Sync`) — one connection per chunk worker |
 
 ## Example Configs
 

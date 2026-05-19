@@ -72,6 +72,13 @@ pub struct RunSummary {
     pub format: String,
     pub mode: String,
     pub compression: String,
+    /// Postgres `pg_stat_database.temp_bytes` delta around the run. `None` for
+    /// non-Postgres sources or when the snapshot probe failed (no admin perms
+    /// not required — the view is readable by any role). When set and large,
+    /// indicates cursor / sort spill to `pgsql_tmp/` — the safe action is to
+    /// shrink `tuning.batch_size` or set `tuning.batch_size_memory_mb` below
+    /// PG's `work_mem`.
+    pub pg_temp_bytes_delta: Option<i64>,
     /// Source COUNT(*) result for reconciliation (None = not requested or not applicable).
     pub source_count: Option<i64>,
     /// Whether reconciliation passed (Some(true) = match, Some(false) = mismatch, None = skipped).
@@ -119,6 +126,7 @@ impl RunSummary {
             format: plan.format.label().to_string(),
             mode: plan.strategy.mode_label().to_string(),
             compression: plan.compression.label().to_string(),
+            pg_temp_bytes_delta: None,
             source_count: None,
             reconciled: None,
             journal,
@@ -257,6 +265,23 @@ impl RunSummary {
                     fmt_thousands(self.peak_rss_mb)
                 ),
             ));
+        }
+        if let Some(temp) = self.pg_temp_bytes_delta {
+            // Skip when the cluster reported no delta — only chatter when there
+            // was actual spill. > 100 MB is annotated with a tuning hint;
+            // smaller numbers are reported as plain info.
+            if temp > 0 {
+                let temp_mb = temp as f64 / (1024.0 * 1024.0);
+                let label = if temp > 100 * 1024 * 1024 {
+                    format!(
+                        "{:.1} MB ⚠ shrink tuning.batch_size or set batch_size_memory_mb",
+                        temp_mb
+                    )
+                } else {
+                    format!("{:.1} MB", temp_mb)
+                };
+                rows.push(("pg temp spill", label));
+            }
         }
         if self.format == "parquet" && self.compression != "zstd" {
             rows.push(("compression", self.compression.clone()));
@@ -553,6 +578,7 @@ mod tests {
                 password: None,
                 password_env: None,
                 database: None,
+                environment: None,
                 tuning: None,
                 tls: None,
             },
@@ -692,6 +718,7 @@ mod tests {
                 password: None,
                 password_env: None,
                 database: None,
+                environment: None,
                 tuning: None,
                 tls: None,
             },

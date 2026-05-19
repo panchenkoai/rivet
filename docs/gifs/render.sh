@@ -279,6 +279,56 @@ YAML
 }
 fixture_incremental_teardown() { fixture_chunked_teardown; }
 
+# Composite cursor (COALESCE) demo: orders with ~35% NULL updated_at so
+# `incremental_cursor_mode: coalesce` is the only way to track progression
+# without losing the NULL-only rows. ADR-0007 CC1–CC6.
+fixture_coalesce_setup() {
+    psql_ <<'SQL'
+DROP SCHEMA IF EXISTS rivet_gif CASCADE;
+CREATE SCHEMA rivet_gif;
+
+CREATE TABLE rivet_gif.orders (
+    id          BIGINT PRIMARY KEY,
+    product     TEXT          NOT NULL,
+    quantity    INT           NOT NULL,
+    price       NUMERIC(10,2) NOT NULL,
+    updated_at  TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+);
+
+-- 200 rows; ~35% with updated_at NULL (deterministic via id % 100 < 35).
+INSERT INTO rivet_gif.orders (id, product, quantity, price, updated_at, created_at)
+SELECT g,
+       'sku-' || g,
+       (g % 10) + 1,
+       (g % 100) + 0.99,
+       CASE WHEN g % 100 < 35 THEN NULL ELSE NOW() - (g || ' minutes')::interval END,
+       NOW() - ((g + 200) || ' minutes')::interval
+FROM generate_series(1, 200) AS g;
+SQL
+
+    local work="/tmp/rivet-gif-coalesce-cursor"
+    mkdir -p "$work"
+    cat >"$work/orders.yaml" <<'YAML'
+source:
+  type: postgres
+  url_env: DATABASE_URL
+exports:
+  - name: orders
+    query: "SELECT id, product, quantity, price, updated_at, created_at FROM rivet_gif.orders"
+    mode: incremental
+    cursor_column: updated_at
+    cursor_fallback_column: created_at
+    incremental_cursor_mode: coalesce
+    format: parquet
+    skip_empty: true
+    destination:
+      type: local
+      path: ./output
+YAML
+}
+fixture_coalesce_teardown() { fixture_chunked_teardown; }
+
 # Discovery artifact demo uses the already-seeded public.* schema. jq must
 # be on PATH (brew install jq).
 fixture_discover_setup() {
@@ -354,6 +404,68 @@ exports:
 YAML
 }
 fixture_campaign_teardown() { fixture_chunked_teardown; }
+
+# Pooler / proxy detection demo. Opt-in: requires the `pool` docker-compose
+# profile to be up so pgBouncer (6432) and ProxySQL (6033) are reachable.
+#   docker compose --profile pool up -d pgbouncer proxysql
+# The four YAML fixtures point at the local docker stack — direct PG (5432),
+# pgBouncer (6432), direct MySQL (3306), ProxySQL (6033).
+fixture_pool_detect_setup() {
+    local work="/tmp/rivet-gif-pool-detect"
+    mkdir -p "$work"
+
+    # Probe-only: each rivet check exits in <1s and emits the connect-time
+    # warning (if any) before the strategy/verdict block. SELECT 1 keeps the
+    # check itself trivial so the warning is the focus.
+    cat >"$work/direct-pg.yaml" <<'YAML'
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+exports:
+  - name: probe
+    query: "SELECT 1 AS n"
+    mode: full
+    format: parquet
+    destination: {type: local, path: ./output}
+YAML
+
+    cat >"$work/bouncer-pg.yaml" <<'YAML'
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:6432/rivet"
+exports:
+  - name: probe
+    query: "SELECT 1 AS n"
+    mode: full
+    format: parquet
+    destination: {type: local, path: ./output}
+YAML
+
+    cat >"$work/direct-mysql.yaml" <<'YAML'
+source:
+  type: mysql
+  url: "mysql://rivet:rivet@127.0.0.1:3306/rivet"
+exports:
+  - name: probe
+    query: "SELECT 1 AS n"
+    mode: full
+    format: parquet
+    destination: {type: local, path: ./output}
+YAML
+
+    cat >"$work/proxysql.yaml" <<'YAML'
+source:
+  type: mysql
+  url: "mysql://rivet:rivet@127.0.0.1:6033/rivet"
+exports:
+  - name: probe
+    query: "SELECT 1 AS n"
+    mode: full
+    format: parquet
+    destination: {type: local, path: ./output}
+YAML
+}
+fixture_pool_detect_teardown() { :; }
 
 # Real GCS via ADC. Requires `gcloud auth application-default login` to have
 # been run and the target bucket ($GCS_DEMO_BUCKET, default rivet_data_test)
@@ -516,7 +628,7 @@ render_scenario() {
 
 ensure_prereqs
 
-SCENARIOS=("${@:-basic plan-apply reconcile-repair init-scaffold check-verdict inspect chunked-progress parallel-cards incremental-cursor discover-artifact plan-campaign}")
+SCENARIOS=("${@:-basic plan-apply reconcile-repair init-scaffold check-verdict inspect chunked-progress parallel-cards incremental-cursor coalesce-cursor discover-artifact plan-campaign}")
 for raw in "${SCENARIOS[@]}"; do
     for name in $raw; do
         case "$name" in
@@ -529,8 +641,10 @@ for raw in "${SCENARIOS[@]}"; do
             chunked-progress)      render_scenario chunked-progress      fixture_chunked_progress_setup  fixture_chunked_progress_teardown ;;
             parallel-cards)        render_scenario parallel-cards        fixture_parallel_cards_setup    fixture_parallel_cards_teardown ;;
             incremental-cursor)    render_scenario incremental-cursor    fixture_incremental_setup       fixture_incremental_teardown ;;
+            coalesce-cursor)       render_scenario coalesce-cursor       fixture_coalesce_setup          fixture_coalesce_teardown ;;
             discover-artifact)     render_scenario discover-artifact     fixture_discover_setup          fixture_discover_teardown ;;
             plan-campaign)         render_scenario plan-campaign         fixture_campaign_setup          fixture_campaign_teardown ;;
+            pool-detect)           render_scenario pool-detect           fixture_pool_detect_setup       fixture_pool_detect_teardown ;;
             doctor-gcs)            render_scenario doctor-gcs            fixture_gcs_setup               fixture_gcs_teardown ;;
             *) echo "unknown scenario: $name" >&2; exit 1 ;;
         esac

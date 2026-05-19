@@ -43,6 +43,7 @@ fn stub_summary(status: &str) -> RunSummary {
         mode: "full".into(),
         compression: "zstd".into(),
         source_count: None,
+        pg_temp_bytes_delta: None,
         reconciled: None,
         journal: RunJournal::new("test_run", "orders"),
     }

@@ -1,0 +1,74 @@
+###############################################################################
+# Minimal ProxySQL config for Rivet pool-safety + multiplexer-detection tests.
+#
+# Single backend (`mysql:3306` from docker-compose), single user mapping, no
+# query rewriting.  Goal: be a thin transaction-mode proxy in front of MySQL
+# so live tests can verify:
+#
+#   1. `detect_mysql_proxy_kind()` classifies this connection as
+#      `MysqlProxyKind::ProxySql` via `@@version_comment` and `@@proxy_version`.
+#   2. Session-state cleanup still works when the export goes through ProxySQL
+#      (variables set per-statement do not leak between backend connections).
+#
+# Keep this file in sync with the `proxysql` service block in
+# `docker-compose.yaml`.  All passwords are local-dev only.
+###############################################################################
+
+datadir = "/var/lib/proxysql"
+
+admin_variables =
+{
+    # Admin-only credentials (port 6032).  Tests never use this account.
+    admin_credentials = "admin:admin"
+    mysql_ifaces = "0.0.0.0:6032"
+    refresh_interval = 2000
+}
+
+mysql_variables =
+{
+    # Client-facing port that test clients connect to.
+    interfaces = "0.0.0.0:6033"
+    # Banner reported by ProxySQL.  Tests don't grep this directly — the
+    # `@@version_comment` / `@@proxy_version` signals classify_mysql_proxy()
+    # checks come from ProxySQL's own internal state, not from this banner.
+    server_version = "8.0.32 (ProxySQL)"
+    default_charset = "utf8mb4"
+    connect_timeout_server = 5000
+    monitor_username = "rivet"
+    monitor_password = "rivet"
+    monitor_history = 60000
+    monitor_connect_interval = 2000
+    monitor_ping_interval = 2000
+    ping_interval_server_msec = 2000
+    ping_timeout_server = 500
+    poll_timeout = 2000
+    default_query_delay = 0
+    default_query_timeout = 36000000
+}
+
+# Backend MySQL servers (single hostgroup 0 → the docker-compose `mysql` service).
+mysql_servers =
+(
+    { address = "mysql" , port = 3306 , hostgroup = 0 , max_connections = 100 }
+)
+
+# Application users: the `rivet/rivet` MySQL account is mapped to hostgroup 0
+# so it reaches the backend MySQL server.  `transaction_persistent = 1`
+# prevents ProxySQL from switching backend connections mid-transaction.
+mysql_users:
+(
+    {
+        username = "rivet"
+        password = "rivet"
+        default_hostgroup = 0
+        max_connections = 100
+        active = 1
+        transaction_persistent = 1
+    }
+)
+
+# No query rules — every statement is passed through to hostgroup 0 unmodified.
+mysql_query_rules: ()
+
+# No replication hostgroups — single backend.
+mysql_replication_hostgroups: ()

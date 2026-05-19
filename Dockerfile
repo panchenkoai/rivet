@@ -22,6 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && useradd --uid 10001 --gid rivet --no-create-home rivet
 
 COPY --from=builder /src/target/release/rivet /usr/local/bin/rivet
+COPY --from=builder /src/target/release/rivet-mcp /usr/local/bin/rivet-mcp
 
 USER rivet
 ENTRYPOINT ["rivet"]

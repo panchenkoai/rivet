@@ -95,10 +95,12 @@ jobs:
         shell: bash
         run: |
           tag="${RELEASE_TAG}"
-          bin="rivet"
           dir="rivet-${tag}-${{ matrix.target }}"
           mkdir "$dir"
-          cp "target/${{ matrix.target }}/release/${bin}" "$dir/"
+          # Ship both binaries: `rivet` (extraction CLI) and `rivet-mcp`
+          # (read-only DB introspection MCP server). Split landed in 0.6.0.
+          cp "target/${{ matrix.target }}/release/rivet"     "$dir/"
+          cp "target/${{ matrix.target }}/release/rivet-mcp" "$dir/"
           cp README.md LICENSE* CHANGELOG.md "$dir/" 2>/dev/null || true
           tar czf "${dir}.tar.gz" "$dir"
           echo "ASSET=${dir}.tar.gz" >> "$GITHUB_ENV"
@@ -131,12 +133,32 @@ jobs:
           cd artifacts
           sha256sum *.tar.gz > SHA256SUMS.txt
 
+      # Pull the release notes for this tag straight out of CHANGELOG.md so
+      # the published release body matches what's in the repo. The awk
+      # program extracts everything from `## <version> ` up to (but not
+      # including) the next `## <version>` heading.
+      - name: Extract release notes from CHANGELOG.md
+        id: notes
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          awk -v ver="$VERSION" '
+            $0 ~ "^## " ver " "    { found = 1; next }
+            found && /^## [0-9]/   { exit }
+            found                  { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error::CHANGELOG.md has no section starting with '## ${VERSION} ' — add one before tagging."
+            exit 1
+          fi
+          echo "Extracted $(wc -l < release-notes.md) lines of notes for ${VERSION}."
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           name: ${{ env.RELEASE_TAG }}
-          generate_release_notes: true
+          body_path: release-notes.md
           files: |
             artifacts/*.tar.gz
             artifacts/SHA256SUMS.txt

@@ -19,8 +19,8 @@
 //! | `after_file_write` | `single.rs` | `RIVET_TEST_PANIC_AT=after_file_write` |
 //! | `after_manifest_update` | `single.rs` | `RIVET_TEST_PANIC_AT=after_manifest_update` |
 //! | `after_cursor_commit` | `single.rs` | `RIVET_TEST_PANIC_AT=after_cursor_commit` |
-//! | `after_chunk_file:{N}` | `chunked/mod.rs` | `RIVET_TEST_PANIC_AT=after_chunk_file:0` |
-//! | `after_chunk_complete:{N}` | `chunked/mod.rs` | `RIVET_TEST_PANIC_AT=after_chunk_complete:0` |
+//! | `after_chunk_file:{N}` | `chunked/mod.rs` (sequential & parallel checkpoint) | `RIVET_TEST_PANIC_AT=after_chunk_file:0` |
+//! | `after_chunk_complete:{N}` | `chunked/mod.rs` (sequential & parallel checkpoint) | `RIVET_TEST_PANIC_AT=after_chunk_complete:0` |
 //!
 //! # Test usage
 //!

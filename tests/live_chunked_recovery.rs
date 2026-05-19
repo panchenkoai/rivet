@@ -14,13 +14,20 @@
 //!
 //! | ID | Scenario | Key invariant |
 //! |---|---|---|
-//! | C1 | Crash after chunk 0 complete → resume | Chunk 0 not re-run; total rows == seeded |
-//! | C2 | Crash after chunk 0 file (before commit) → resume | Chunk 0 re-runs (at-least-once); manifest grows |
+//! | C1 | Sequential: crash after chunk 0 complete → resume | Chunk 0 not re-run; total rows == seeded |
+//! | C2 | Sequential: crash after chunk 0 file (before commit) → resume | Chunk 0 re-runs (at-least-once); manifest grows |
+//! | C3 | Parallel (4 workers): panic after chunk 0 complete → resume | chunk_run not 'completed' until resume finalizes; manifest rows == seeded; no chunk re-recorded |
+//! | C4 | Parallel (1 worker → resume with 2): panic at `after_chunk_file:0` leaves chunk 0 'running' → resume | `reset_stale_running_chunk_tasks` recovers; chunk 0 at-least-once; resume worker count may differ from crash worker count |
 //!
 //! ## Related
 //!
 //! F5 in `tests/recovery.rs` covers the state-layer invariant (completed chunk
 //! data preserved after `reset_stale_running_chunk_tasks`) without a live DB.
+//!
+//! The parallel checkpoint path injects panic hooks at the same fault-point
+//! names as the sequential one (`after_chunk_file:N`, `after_chunk_complete:N`,
+//! see `src/pipeline/chunked/mod.rs` and `src/test_hook.rs`), so C3 exercises
+//! recovery semantics across both paths with a single matrix.
 
 mod common;
 
@@ -301,5 +308,331 @@ exports:
     assert!(
         parquet_files.len() >= 3,
         "at least 3 parquet files must exist (one per chunk); found: {parquet_files:?}"
+    );
+}
+
+// ─── Helpers shared with C3 ──────────────────────────────────────────────────
+
+/// Count chunk_task rows by status for a given run.  Returns
+/// `(completed, running, pending, failed)`.
+///
+/// Splitting the four counts into one query keeps the post-crash snapshot
+/// race-free (a single SQLite transaction sees a consistent view) and avoids
+/// rebinding the same `?1` across four separate `query_row` calls.
+fn chunk_task_status_counts(cfg: &std::path::Path, run_id: &str) -> (i64, i64, i64, i64) {
+    open_state_db(cfg)
+        .query_row(
+            "SELECT
+                COUNT(*) FILTER (WHERE status = 'completed'),
+                COUNT(*) FILTER (WHERE status = 'running'),
+                COUNT(*) FILTER (WHERE status = 'pending'),
+                COUNT(*) FILTER (WHERE status = 'failed')
+             FROM chunk_task WHERE run_id = ?1",
+            [run_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .expect("aggregate chunk_task statuses")
+}
+
+// ─── C3: parallel checkpoint — panic during worker → clean resume ────────────
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn parallel_chunked_crash_after_chunk_complete_resume_finishes_with_no_duplicates() {
+    // Parallel-checkpoint variant of C1: same `after_chunk_complete:0` fault
+    // point, but the run uses `parallel: 4` so the panic fires from a worker
+    // thread inside `std::thread::scope`.
+    //
+    // Important semantic note: `std::thread::scope` defers panic propagation
+    // until the scope joins, so the other workers continue until they exit
+    // their work loop naturally.  In practice this means by the time the
+    // process actually aborts, the surviving workers will usually have drained
+    // every remaining chunk — the pre-crash distribution of statuses is
+    // therefore *non-deterministic*.  We assert only what we can guarantee:
+    //
+    //   * Process exits non-zero (the panic was re-raised after join).
+    //   * Chunk 0 is 'completed' (the panic fires AFTER complete_chunk_task).
+    //   * `chunk_run` is NOT 'completed' (finalize_chunk_run_completed never
+    //     ran), so the resume code path actually has work to do — even if
+    //     every individual chunk_task happens to be done.
+    //
+    // The decisive invariant lives on the *resume* side: the resume must
+    // finalize the run and produce a manifest whose row total exactly equals
+    // the seeded count, with no double-counted completed chunks.
+    require_alive(LiveService::Postgres);
+
+    const ROW_COUNT: i64 = 400;
+    const CHUNK_SIZE: i64 = 50;
+    const EXPECTED_CHUNKS: i64 = ROW_COUNT / CHUNK_SIZE;
+
+    let table = seed_pg_numeric_table(ROW_COUNT);
+    let export = unique_name("c3_parallel_crash_complete");
+    let out = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        r#"
+source: {{type: postgres, url: "{POSTGRES_URL}"}}
+exports:
+  - name: {export}
+    query: "SELECT id, name FROM {table_name}"
+    mode: chunked
+    chunk_column: id
+    chunk_size: {CHUNK_SIZE}
+    chunk_checkpoint: true
+    parallel: 4
+    format: parquet
+    destination: {{type: local, path: {dir}}}
+"#,
+        table_name = table.name(),
+        dir = out.path().display()
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    // ── Crash run ────────────────────────────────────────────────────────────
+    let crash = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+        ])
+        .env("RIVET_TEST_PANIC_AT", "after_chunk_complete:0")
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        !crash.status.success(),
+        "crash run must exit non-zero (worker panic propagated through scope); stderr:\n{}",
+        String::from_utf8_lossy(&crash.stderr)
+    );
+
+    // ── Post-crash snapshot: what we *can* guarantee ─────────────────────────
+    let run_id = chunk_run_id(&cfg, &export).expect("chunk_run must exist after crash");
+    assert_eq!(
+        chunk_task_status(&cfg, &run_id, 0).as_deref(),
+        Some("completed"),
+        "chunk 0 must be 'completed' — panic fires AFTER complete_chunk_task succeeded"
+    );
+    assert_ne!(
+        chunk_run_status(&cfg, &export).as_deref(),
+        Some("completed"),
+        "chunk_run must NOT be 'completed' — finalize_chunk_run_completed never ran"
+    );
+    let (_completed_pre, _running_pre, _pending_pre, failed_pre) =
+        chunk_task_status_counts(&cfg, &run_id);
+    assert_eq!(
+        failed_pre, 0,
+        "no chunk_task should be 'failed' from a panic; got failed={failed_pre}"
+    );
+
+    // Sleep so any chunk files re-written on resume get distinct timestamps
+    // in their filenames (filenames embed `%Y%m%d_%H%M%S`).
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    // ── Resume run ────────────────────────────────────────────────────────────
+    let resume = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+            "--resume",
+        ])
+        .output()
+        .expect("spawn rivet resume");
+    assert!(
+        resume.status.success(),
+        "--resume must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+
+    // ── Final invariants — these are the load-bearing ones ───────────────────
+    assert_eq!(
+        chunk_run_status(&cfg, &export).as_deref(),
+        Some("completed"),
+        "chunk_run must be 'completed' after parallel resume finalizes it"
+    );
+
+    let (completed_post, running_post, pending_post, failed_post) =
+        chunk_task_status_counts(&cfg, &run_id);
+    assert_eq!(
+        completed_post, EXPECTED_CHUNKS,
+        "after resume all {EXPECTED_CHUNKS} chunk_tasks must be 'completed' (got completed={completed_post}, running={running_post}, pending={pending_post}, failed={failed_post})"
+    );
+    assert_eq!(running_post, 0, "no chunk_task should remain 'running'");
+    assert_eq!(pending_post, 0, "no chunk_task should remain 'pending'");
+    assert_eq!(failed_post, 0, "no chunk_task should be 'failed'");
+
+    // The decisive invariant: already-completed chunks (including chunk 0)
+    // are NOT re-run on resume.  Total manifest rows == seeded count, and
+    // manifest entry count == EXPECTED_CHUNKS exactly.
+    assert_eq!(
+        manifest_total_rows(&cfg, &export),
+        ROW_COUNT,
+        "total manifest rows must equal seeded count — no double-counting of completed chunks"
+    );
+    assert_eq!(
+        manifest_count(&cfg, &export),
+        EXPECTED_CHUNKS,
+        "exactly {EXPECTED_CHUNKS} manifest entries expected: no chunk re-recorded"
+    );
+
+    let parquet_files = files_with_extension(out.path(), "parquet");
+    assert!(
+        parquet_files.len() >= EXPECTED_CHUNKS as usize,
+        "at least {EXPECTED_CHUNKS} parquet files must exist; found {}: {parquet_files:?}",
+        parquet_files.len()
+    );
+}
+
+// ─── C4: parallel checkpoint — stuck-running recovery via at-least-once ──────
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn parallel_chunked_crash_after_chunk_file_stuck_running_resume_reruns_chunk() {
+    // Parallel-checkpoint variant of C2: panic at `after_chunk_file:0` leaves
+    // chunk 0 in 'running' status (the panic fires AFTER record_file but
+    // BEFORE complete_chunk_task).  We use `parallel: 1` so this scenario is
+    // *deterministic* — with N workers, surviving workers might race past the
+    // pending tasks and finish them before the scope re-raises the panic, and
+    // the test's value comes from the stuck-running recovery, not from
+    // multi-worker concurrency.  Multi-worker concurrency is covered by C3.
+    //
+    // What we're actually testing in this code path:
+    //
+    //   * The parallel worker loop runs even when `parallel: 1` (no
+    //     accidental fall-back to the sequential checkpoint code path).
+    //   * `reset_stale_running_chunk_tasks` correctly recovers the 'running'
+    //     chunk 0 left behind by the panic.
+    //   * At-least-once semantics: chunk 0's pre-crash manifest entry is
+    //     preserved AND the resumed write produces a fresh manifest entry, so
+    //     row totals grow by exactly one chunk's worth of rows.
+    require_alive(LiveService::Postgres);
+
+    const ROW_COUNT: i64 = 150;
+    const CHUNK_SIZE: i64 = 50;
+    const EXPECTED_CHUNKS: i64 = ROW_COUNT / CHUNK_SIZE;
+
+    let table = seed_pg_numeric_table(ROW_COUNT);
+    let export = unique_name("c4_parallel_stuck_running");
+    let out = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        r#"
+source: {{type: postgres, url: "{POSTGRES_URL}"}}
+exports:
+  - name: {export}
+    query: "SELECT id, name FROM {table_name}"
+    mode: chunked
+    chunk_column: id
+    chunk_size: {CHUNK_SIZE}
+    chunk_checkpoint: true
+    parallel: 1
+    format: parquet
+    destination: {{type: local, path: {dir}}}
+"#,
+        table_name = table.name(),
+        dir = out.path().display()
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    // ── Crash run ────────────────────────────────────────────────────────────
+    let crash = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+        ])
+        .env("RIVET_TEST_PANIC_AT", "after_chunk_file:0")
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        !crash.status.success(),
+        "crash run must exit non-zero; stderr:\n{}",
+        String::from_utf8_lossy(&crash.stderr)
+    );
+
+    // ── Post-crash: chunk 0 stuck in 'running', manifest already has its row ─
+    let run_id = chunk_run_id(&cfg, &export).expect("chunk_run must exist after crash");
+    assert_eq!(
+        chunk_task_status(&cfg, &run_id, 0).as_deref(),
+        Some("running"),
+        "chunk 0 must be 'running' after crash at after_chunk_file:0 (complete_chunk_task never called)"
+    );
+    assert_eq!(
+        manifest_count(&cfg, &export),
+        1,
+        "exactly 1 manifest entry must exist after crash (chunk 0 file was recorded before panic)"
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    // ── Resume with parallel: 2 (exercises both reset path and parallel workers)
+    //
+    // Rewrite the config to use parallel: 2 on resume; this proves that
+    // reset_stale_running_chunk_tasks works regardless of whether the resume
+    // worker count matches the crash worker count.
+    let yaml_resume = yaml.replace("parallel: 1", "parallel: 2");
+    std::fs::write(&cfg, yaml_resume).expect("rewrite config for resume");
+
+    let resume = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+            "--resume",
+        ])
+        .output()
+        .expect("spawn rivet resume");
+    assert!(
+        resume.status.success(),
+        "--resume must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+
+    // ── Final state ──────────────────────────────────────────────────────────
+    assert_eq!(
+        chunk_run_status(&cfg, &export).as_deref(),
+        Some("completed"),
+        "chunk_run must be 'completed' after resume"
+    );
+
+    let (completed_post, running_post, pending_post, failed_post) =
+        chunk_task_status_counts(&cfg, &run_id);
+    assert_eq!(
+        completed_post, EXPECTED_CHUNKS,
+        "all {EXPECTED_CHUNKS} chunk_tasks must be 'completed' (got completed={completed_post}, running={running_post}, pending={pending_post}, failed={failed_post})"
+    );
+    assert_eq!(running_post, 0, "no chunk_task should remain 'running'");
+    assert_eq!(pending_post, 0, "no chunk_task should remain 'pending'");
+    assert_eq!(failed_post, 0, "no chunk_task should be 'failed'");
+
+    // At-least-once for chunk 0: pre-crash manifest entry + post-resume entry
+    // for the same chunk index, plus one entry each for chunks 1 and 2.
+    //
+    // Total manifest entries = 2 + 1 + 1 = 4.
+    // Total rows = 50 (chunk 0 first run) + 50 (chunk 0 retry) + 50 + 50 = 200.
+    assert_eq!(
+        manifest_count(&cfg, &export),
+        EXPECTED_CHUNKS + 1,
+        "{} entries expected (chunk 0 recorded twice due to at-least-once)",
+        EXPECTED_CHUNKS + 1
+    );
+    assert_eq!(
+        manifest_total_rows(&cfg, &export),
+        ROW_COUNT + CHUNK_SIZE,
+        "total manifest rows must equal seeded + one chunk (chunk 0 counted twice)"
+    );
+
+    let parquet_files = files_with_extension(out.path(), "parquet");
+    assert!(
+        parquet_files.len() >= EXPECTED_CHUNKS as usize,
+        "at least {EXPECTED_CHUNKS} parquet files must exist; found {}: {parquet_files:?}",
+        parquet_files.len()
     );
 }

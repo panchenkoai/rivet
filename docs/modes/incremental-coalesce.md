@@ -2,6 +2,8 @@
 
 > See also: [ADR-0007 — Cursor Policy Contracts](../adr/0007-cursor-policy-contracts.md).
 
+![COALESCE(updated_at, created_at) picks up late-arriving rows that plain cursor_column would miss](../gifs/coalesce-cursor.gif)
+
 ## When to use
 
 Use `incremental_cursor_mode: coalesce` when a single column is not a reliable monotonic key, but combining **two** columns with `COALESCE(primary, fallback)` is.

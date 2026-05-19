@@ -47,7 +47,7 @@ Type "rivet check --config orders.yaml"
 Enter
 Sleep 2500ms
 
-Type "rivet run --config orders.yaml --validate"
+Type "rivet run --config orders.yaml --validate --reconcile"
 Enter
 Sleep 3s
 

@@ -11,7 +11,29 @@ Use `mode: chunked` when the table is too large for a single `full` export. Rive
 
 ## Required fields
 
-- `chunk_column` -- a numeric column to partition by (typically the primary key)
+- `chunk_column` -- a numeric, date, or timestamp column to partition by (typically the primary key). **Auto-resolved from the primary key** if you use the `table: schema.name` shortcut on a Postgres source — log line: `auto-resolved chunk_column = 'id' from primary key on public.orders`.
+
+## Chunking strategies — pick one
+
+Four ways to slice the table. They differ in how chunk boundaries are computed; everything below the strategy line (parallel, checkpoint, retry) is orthogonal and combines with any of them.
+
+| Strategy | YAML | How boundaries are computed | When to use | Mutually exclusive with |
+|---|---|---|---|---|
+| **Fixed size** (default) | `chunk_size: 100000` | `SELECT MIN, MAX` → `[min..min+N)`, `[min+N..min+2N)`, ... — `N` rows of range per chunk | Dense numeric PK, predictable size budget per chunk | `chunk_size_memory_mb` |
+| **Fixed count** | `chunk_count: 16` | Range divided into exactly `N` equal slices; per-chunk size derived dynamically | You want exactly *N* workers / files (e.g. = CPU cores) | `chunk_dense`, `chunk_by_days` |
+| **Dense** | `chunk_dense: true` | `ROW_NUMBER() OVER (ORDER BY chunk_column)` instead of range; guarantees equal **row count** per chunk regardless of gaps | Sparse IDs — UUIDs as `BIGINT`, deleted rows, hashed keys | `chunk_by_days` |
+| **Date-native** | `chunk_by_days: 365` | `chunk_column` must be `DATE` / `TIMESTAMP` / `TIMESTAMPTZ`; windows of N days with `>= AND <` (open-end) semantics | Time-series, event logs, historical backfills by period | `chunk_dense` |
+| **Memory-target** (PG only) | `chunk_size_memory_mb: 256` | Auto-computes `chunk_size` from a `pg_class` / `reltuples` row-size estimate; clamped to `[10_000, 5_000_000]` rows. Requires `table:` shortcut | You want to budget by megabytes, not rows; wide tables where row-width is hard to guess | explicit `chunk_size` |
+
+**Orthogonal options that combine with any strategy:**
+
+| Field | Effect |
+|---|---|
+| `parallel: N` | Up to `N` chunks execute concurrently (separate DB connections) |
+| `chunk_checkpoint: true` | Per-chunk row in state DB → `rivet run --resume` skips completed chunks after a crash |
+| `chunk_max_attempts: 3` | Retry failed chunks up to N times before bailing the run |
+
+**Each chunk runs a query of the form:** `SELECT … FROM (<base_query>) WHERE <chunk_column> >= $lo AND <chunk_column> < $hi`. The exact rendering for dense and date-native variants is documented further down.
 
 ## Minimal config
 

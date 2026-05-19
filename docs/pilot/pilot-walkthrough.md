@@ -4,7 +4,7 @@
 
 This is the end-to-end pilot guide that exercises the full contract stack: discovery, plan/apply, prioritization, chunked extraction with checkpoint, partition-level reconcile, targeted repair, and the committed/verified progression boundary.
 
-If you just want to export one table, start with [Quickstart: Postgres](quickstart-postgres.md) or [Quickstart: MySQL](quickstart-mysql.md). This walkthrough is for pilots preparing a real production rollout.
+If you just want to export one table, start with [Getting Started](../getting-started.md) (covers both Postgres and MySQL). This walkthrough is for pilots preparing a real production rollout.
 
 > Contracts referenced below:
 > [PA1–PA8](../adr/0005-plan-apply-contracts.md) plan/apply ·

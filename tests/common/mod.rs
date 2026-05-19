@@ -57,6 +57,11 @@ pub const PGBOUNCER_URL: &str = "postgresql://rivet:rivet@127.0.0.1:6432/rivet";
 pub const MYSQL_URL: &str = "mysql://rivet:rivet@127.0.0.1:3306/rivet";
 pub const MYSQL_TOXI_URL: &str = "mysql://rivet:rivet@127.0.0.1:13306/rivet";
 
+/// ProxySQL in transaction-persistent mode, port :6033.
+/// Opt in: docker compose --profile pool up -d proxysql
+/// Backend forwards to the same `mysql` service used by `MYSQL_URL`.
+pub const PROXYSQL_URL: &str = "mysql://rivet:rivet@127.0.0.1:6033/rivet";
+
 pub const MINIO_ENDPOINT: &str = "http://127.0.0.1:9000";
 pub const MINIO_ACCESS_KEY: &str = "minioadmin";
 pub const MINIO_SECRET_KEY: &str = "minioadmin";
@@ -109,6 +114,7 @@ pub enum LiveService {
     FakeGcs,
     Toxiproxy,
     PgBouncer,
+    ProxySql,
 }
 
 impl LiveService {
@@ -145,6 +151,11 @@ impl LiveService {
                 "127.0.0.1",
                 8474,
                 "service `toxiproxy` HTTP API in docker-compose.yaml",
+            ),
+            LiveService::ProxySql => (
+                "127.0.0.1",
+                6033,
+                "service `proxysql` — run: docker compose --profile pool up -d proxysql",
             ),
         }
     }
@@ -336,6 +347,9 @@ pub fn seed_mysql_numeric_table(row_count: i64) -> MysqlTable {
 
 /// Absolute path to the `rivet` binary built for this integration test.
 pub const RIVET_BIN: &str = env!("CARGO_BIN_EXE_rivet");
+
+/// Absolute path to the `rivet-mcp` binary built for this integration test.
+pub const RIVET_MCP_BIN: &str = env!("CARGO_BIN_EXE_rivet-mcp");
 
 /// Write `yaml` to `<tmpdir>/rivet.yaml` and return the path.  The tempdir is
 /// returned too so the caller can keep it alive for the duration of the run.

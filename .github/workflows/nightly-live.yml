@@ -39,7 +39,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Start services
-        run: docker compose --profile pool up -d postgres mysql minio fake-gcs toxiproxy pgbouncer
+        # `proxysql` lives in the same `pool` docker-compose profile as
+        # `pgbouncer` and is required by tests/live_pool_safety.rs MySQL
+        # tests (`mysql_proxysql_*`); without it those tests fail in
+        # `require_alive(LiveService::ProxySql)` before ever running.
+        run: docker compose --profile pool up -d postgres mysql minio fake-gcs toxiproxy pgbouncer proxysql
 
       - name: Wait for services
         run: |
@@ -49,6 +53,10 @@ jobs:
           for i in $(seq 1 30); do docker compose exec -T mysql mysqladmin ping -h localhost -uroot -privet 2>/dev/null && break || sleep 2; done
           echo "Waiting for pgBouncer..."
           for i in $(seq 1 30); do (exec 3<>/dev/tcp/127.0.0.1/6432) 2>/dev/null && break || sleep 1; done
+          echo "Waiting for ProxySQL..."
+          # 6033 is the client-facing MySQL protocol port; 6032 admin comes
+          # up first but we wait for 6033 so backend wiring is in place.
+          for i in $(seq 1 30); do (exec 3<>/dev/tcp/127.0.0.1/6033) 2>/dev/null && break || sleep 1; done
 
       - name: Build release (rivet + seed)
         # `--bin seed` builds the auxiliary src/bin/seed.rs target on top of
@@ -96,6 +104,9 @@ jobs:
           echo "::endgroup::"
           echo "::group::pgbouncer"
           docker compose logs --no-color pgbouncer | tail -200
+          echo "::endgroup::"
+          echo "::group::proxysql"
+          docker compose logs --no-color proxysql | tail -200
           echo "::endgroup::"
 
       - name: Stop services

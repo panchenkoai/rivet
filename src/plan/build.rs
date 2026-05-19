@@ -26,12 +26,34 @@ pub fn build_plan(
     let base_query = export.resolve_query(config_dir, params)?;
 
     let merged = merge_tuning_config(config.source.tuning.as_ref(), export.tuning.as_ref());
-    let tuning = SourceTuning::from_config(merged.as_ref());
+    // When no `tuning.profile:` is set, fall back to the env-derived default —
+    // `Local` shaves the throttle, `Production` keeps the safety contract.
+    let fallback_profile = config
+        .source
+        .environment
+        .map(|e| e.default_profile())
+        .unwrap_or(TuningProfile::Balanced);
+    let tuning = SourceTuning::from_config_with_default_profile(merged.as_ref(), fallback_profile);
+    let profile_label = |p: TuningProfile| match p {
+        TuningProfile::Fast => "fast",
+        TuningProfile::Balanced => "balanced",
+        TuningProfile::Safe => "safe",
+    };
+    let env_label = |e: crate::config::SourceEnvironment| match e {
+        crate::config::SourceEnvironment::Local => "local",
+        crate::config::SourceEnvironment::Replica => "replica",
+        crate::config::SourceEnvironment::Production => "production",
+    };
     let tuning_profile_label = match merged.as_ref().and_then(|t| t.profile) {
-        Some(TuningProfile::Fast) => "fast".to_string(),
-        Some(TuningProfile::Balanced) => "balanced".to_string(),
-        Some(TuningProfile::Safe) => "safe".to_string(),
-        None => "balanced (default)".to_string(),
+        Some(p) => profile_label(p).to_string(),
+        None => match config.source.environment {
+            Some(env) => format!(
+                "{} (default for environment: {})",
+                profile_label(fallback_profile),
+                env_label(env)
+            ),
+            None => "balanced (default)".to_string(),
+        },
     };
 
     let strategy = match export.mode {
@@ -51,44 +73,7 @@ pub fn build_plan(
                 mode,
             })
         }
-        ExportMode::Chunked => {
-            let column = export.chunk_column.clone().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "export '{}': chunked mode requires 'chunk_column'",
-                    export.name
-                )
-            })?;
-            if let Some(count) = export.chunk_count {
-                if count == 0 {
-                    anyhow::bail!("export '{}': chunk_count must be >= 1 (got 0)", export.name);
-                }
-                if export.chunk_dense {
-                    anyhow::bail!(
-                        "export '{}': chunk_count and chunk_dense are mutually exclusive",
-                        export.name
-                    );
-                }
-                if export.chunk_by_days.is_some() {
-                    anyhow::bail!(
-                        "export '{}': chunk_count and chunk_by_days are mutually exclusive",
-                        export.name
-                    );
-                }
-            }
-            let max_attempts = export
-                .chunk_max_attempts
-                .unwrap_or_else(|| tuning.max_retries.saturating_add(1).max(1));
-            ExtractionStrategy::Chunked(ChunkedPlan {
-                column,
-                chunk_size: export.chunk_size,
-                chunk_count: export.chunk_count,
-                parallel: export.parallel,
-                dense: export.chunk_dense,
-                by_days: export.chunk_by_days,
-                checkpoint: export.chunk_checkpoint,
-                max_attempts,
-            })
-        }
+        ExportMode::Chunked => resolve_chunked_strategy(config, export, &tuning)?,
         ExportMode::TimeWindow => {
             let column = export.time_column.clone().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -136,10 +121,203 @@ pub fn build_plan(
     })
 }
 
-/// Parse the raw `columns:` map from `ExportConfig` into typed [`ColumnOverrides`].
+/// Resolve the strategy for `mode: chunked`.
 ///
-/// Fails early (at plan-build time) with an actionable error so the user
-/// fixes their `rivet.yaml` before the export runs.
+/// Encapsulates three plan-time decisions that all share the same Postgres
+/// introspection round-trip:
+///
+/// 1. **chunk_column** — explicit `chunk_column:` wins; otherwise the `table:`
+///    shortcut on a Postgres source triggers auto-detection of a single
+///    integer-family PK via
+///    [`crate::source::postgres::introspect_pg_table_for_chunking`].
+/// 2. **chunk_size** — explicit `chunk_size:` wins; if `chunk_size_memory_mb:`
+///    is set, derive the row count from `<budget_mb> / avg_row_bytes`,
+///    clamped to `[10_000, 5_000_000]`. Falls back to the YAML-default
+///    `chunk_size` (100k) when neither is helpful.
+/// 3. **small-table escape** — if the planner's `reltuples` estimate is
+///    below the resolved `chunk_size`, downgrade `Chunked → Snapshot` since
+///    a single chunk would offer no benefit and adds ~10 ms of plumbing
+///    overhead per export. The downgrade is informational (log::info!) and
+///    safe (a `Snapshot` writes one file like `mode: full`).
+///
+/// Steps 1–3 each only fire on PG with `table:` shortcut; everything else
+/// falls back to the original "explicit column required" path.
+fn resolve_chunked_strategy(
+    config: &Config,
+    export: &ExportConfig,
+    tuning: &SourceTuning,
+) -> Result<ExtractionStrategy> {
+    // chunk_count / chunk_dense / chunk_by_days mutual-exclusion is shared
+    // between the introspected and non-introspected paths.
+    if let Some(count) = export.chunk_count {
+        if count == 0 {
+            anyhow::bail!("export '{}': chunk_count must be >= 1 (got 0)", export.name);
+        }
+        if export.chunk_dense {
+            anyhow::bail!(
+                "export '{}': chunk_count and chunk_dense are mutually exclusive",
+                export.name
+            );
+        }
+        if export.chunk_by_days.is_some() {
+            anyhow::bail!(
+                "export '{}': chunk_count and chunk_by_days are mutually exclusive",
+                export.name
+            );
+        }
+    }
+
+    let max_attempts = export
+        .chunk_max_attempts
+        .unwrap_or_else(|| tuning.max_retries.saturating_add(1).max(1));
+
+    // Fast path: explicit column AND no memory-budget knob → no DB probe at all.
+    // Preserves the no-network plan-build invariant for users who hand-tune
+    // chunked-mode the old way.
+    if export.chunk_column.is_some() && export.chunk_size_memory_mb.is_none() {
+        return Ok(ExtractionStrategy::Chunked(ChunkedPlan {
+            column: export.chunk_column.clone().unwrap(),
+            chunk_size: export.chunk_size,
+            chunk_count: export.chunk_count,
+            parallel: export.parallel,
+            dense: export.chunk_dense,
+            by_days: export.chunk_by_days,
+            checkpoint: export.chunk_checkpoint,
+            max_attempts,
+        }));
+    }
+
+    // Anything beyond the fast path requires the `table:` shortcut so we have
+    // a known relation to probe in either Postgres or MySQL.
+    let Some(tbl) = export.table.as_ref() else {
+        if export.chunk_size_memory_mb.is_some() {
+            anyhow::bail!(
+                "export '{}': `chunk_size_memory_mb:` only applies with the `table:` shortcut — \
+                 set `table:` (preferred) or remove `chunk_size_memory_mb:` and keep an explicit `chunk_size:`",
+                export.name
+            );
+        }
+        anyhow::bail!(
+            "export '{}': chunked mode requires 'chunk_column' \
+             (auto-resolve from PK is only supported with the `table:` shortcut)",
+            export.name
+        );
+    };
+
+    let url = config.source.resolve_url().map_err(|e| {
+        anyhow::anyhow!(
+            "export '{}': chunked mode needs the source URL for the introspection probe: {e}",
+            export.name
+        )
+    })?;
+    let introspection = match config.source.source_type {
+        crate::config::SourceType::Postgres => {
+            crate::source::postgres::introspect_pg_table_for_chunking(
+                &url,
+                config.source.tls.as_ref(),
+                tbl,
+            )
+        }
+        crate::config::SourceType::Mysql => {
+            crate::source::mysql::introspect_mysql_table_for_chunking(
+                &url,
+                config.source.tls.as_ref(),
+                tbl,
+            )
+        }
+    }
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "export '{}': chunked-mode introspection probe failed: {e}. \
+             Set `chunk_column:` (and `chunk_size:`) explicitly or check connectivity.",
+            export.name
+        )
+    })?;
+
+    // (1) Resolve chunk_column.
+    let column = if let Some(c) = export.chunk_column.clone() {
+        c
+    } else {
+        match introspection.single_int_pk.clone() {
+            Some(col) => {
+                log::info!(
+                    "export '{}': auto-resolved chunk_column = '{}' from primary key on {}",
+                    export.name,
+                    col,
+                    tbl
+                );
+                col
+            }
+            None => {
+                anyhow::bail!(
+                    "export '{}': chunked mode requires 'chunk_column'. \
+                     Tried auto-resolving from PK on {} but found none, a composite PK, \
+                     or a non-integer PK — set `chunk_column:` explicitly.",
+                    export.name,
+                    tbl
+                );
+            }
+        }
+    };
+
+    // (2) Resolve chunk_size — explicit overrides the budget; otherwise compute
+    // from the memory budget and the planner's row-width estimate.
+    let chunk_size = if let Some(mb) = export.chunk_size_memory_mb {
+        let row_bytes = introspection.avg_row_bytes.filter(|b| *b > 0).unwrap_or_else(|| {
+            // Empty / un-analyzed table — fall back to a defensive 512 B so the
+            // computed chunk_size lands near the YAML default of 100k for a
+            // typical narrow table. The user can still override.
+            log::warn!(
+                "export '{}': chunk_size_memory_mb set but {} has no pg_class stats yet (run ANALYZE?) — \
+                 defaulting to 512 B/row for sizing",
+                export.name,
+                tbl
+            );
+            512
+        });
+        let computed = (mb as i64 * 1024 * 1024 / row_bytes).max(1);
+        let clamped = computed.clamp(10_000, 5_000_000) as usize;
+        log::info!(
+            "export '{}': chunk_size_memory_mb={} MB ÷ {} B/row ≈ {} rows (clamped to {})",
+            export.name,
+            mb,
+            row_bytes,
+            computed,
+            clamped
+        );
+        clamped
+    } else {
+        export.chunk_size
+    };
+
+    // (3) Small-table escape: a single chunk has no parallelism benefit and
+    // adds plumbing latency. Downgrade to Snapshot and let the simple path
+    // handle it. Only fires when reltuples is a meaningful positive number —
+    // un-analyzed tables (reltuples=0) keep the chunked plan to preserve
+    // existing semantics.
+    if introspection.row_estimate > 0 && (introspection.row_estimate as usize) <= chunk_size {
+        log::info!(
+            "export '{}': {} has ~{} rows ≤ chunk_size {}; downgrading chunked → snapshot",
+            export.name,
+            tbl,
+            introspection.row_estimate,
+            chunk_size,
+        );
+        return Ok(ExtractionStrategy::Snapshot);
+    }
+
+    Ok(ExtractionStrategy::Chunked(ChunkedPlan {
+        column,
+        chunk_size,
+        chunk_count: export.chunk_count,
+        parallel: export.parallel,
+        dense: export.chunk_dense,
+        by_days: export.chunk_by_days,
+        checkpoint: export.chunk_checkpoint,
+        max_attempts,
+    }))
+}
+
 /// Public re-export for callers outside `plan` (e.g. `preflight::type_report`).
 pub fn parse_column_overrides_pub(
     raw: &std::collections::HashMap<String, String>,
@@ -148,6 +326,10 @@ pub fn parse_column_overrides_pub(
     parse_column_overrides(raw, export_name)
 }
 
+/// Parse the raw `columns:` map from `ExportConfig` into typed [`ColumnOverrides`].
+///
+/// Fails early (at plan-build time) with an actionable error so the user
+/// fixes their `rivet.yaml` before the export runs.
 fn parse_column_overrides(
     raw: &std::collections::HashMap<String, String>,
     export_name: &str,
@@ -214,6 +396,7 @@ mod tests {
             password: None,
             password_env: None,
             database: None,
+            environment: None,
             tuning: None,
             tls: None,
         }
@@ -234,12 +417,14 @@ mod tests {
             name: "test_export".into(),
             query: Some("SELECT 1".into()),
             query_file: None,
+            table: None,
             mode: ExportMode::Full,
             cursor_column: None,
             cursor_fallback_column: None,
             incremental_cursor_mode: IncrementalCursorMode::SingleColumn,
             chunk_column: None,
             chunk_size: 100_000,
+            chunk_size_memory_mb: None,
             chunk_count: None,
             chunk_dense: false,
             chunk_by_days: None,
@@ -379,6 +564,85 @@ mod tests {
             ExtractionStrategy::Chunked(cp) => assert_eq!(cp.max_attempts, 4),
             _ => panic!("expected Chunked"),
         }
+    }
+
+    // ── auto-resolve chunk_column friendly errors (no DB) ─────────────────
+
+    #[test]
+    fn chunked_without_column_or_table_returns_explicit_error() {
+        let mut export = minimal_export();
+        export.mode = ExportMode::Chunked;
+        export.chunk_column = None;
+        export.table = None; // query: form, no auto-resolve possible
+        let err = build_plan(
+            &minimal_config(),
+            &export,
+            Path::new("."),
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("chunked mode requires 'chunk_column'")
+                && msg.contains("`table:` shortcut"),
+            "expected actionable error about table: shortcut; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn chunked_explicit_column_skips_auto_resolve_and_no_db_call() {
+        // Sanity: an explicit chunk_column means we never even try to open a
+        // connection — the resolver short-circuits on the explicit value.
+        // (Otherwise this test would have to hit a real Postgres.)
+        let mut export = minimal_export();
+        export.mode = ExportMode::Chunked;
+        export.chunk_column = Some("explicit_pk".into());
+        export.table = Some("public.something".into());
+        let plan = build_plan(
+            &minimal_config(),
+            &export,
+            Path::new("."),
+            false,
+            false,
+            false,
+            None,
+        )
+        .expect("explicit chunk_column must short-circuit auto-resolve");
+        match &plan.strategy {
+            ExtractionStrategy::Chunked(cp) => assert_eq!(cp.column, "explicit_pk"),
+            _ => panic!("expected Chunked"),
+        }
+    }
+
+    #[test]
+    fn chunked_size_memory_mb_without_table_errors_with_hint() {
+        // `chunk_size_memory_mb:` needs `table:` for the row-size probe.
+        // Without it we should bail with a message that tells the user how
+        // to fix the config, instead of silently falling back to chunk_size.
+        let mut export = minimal_export();
+        export.mode = ExportMode::Chunked;
+        export.chunk_column = Some("id".into());
+        export.chunk_size_memory_mb = Some(256);
+        // No table: shortcut.
+        export.table = None;
+        let err = build_plan(
+            &minimal_config(),
+            &export,
+            Path::new("."),
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("chunk_size_memory_mb") && msg.contains("`table:` shortcut"),
+            "expected actionable error mentioning chunk_size_memory_mb + table:; got: {msg}"
+        );
     }
 
     #[test]

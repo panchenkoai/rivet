@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use super::IncrementalCursorMode;
 use super::resolve::{parse_file_size, resolve_env_vars, resolve_vars};
-use crate::tuning::TuningConfig;
+use crate::tuning::{TuningConfig, TuningProfile};
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct NotificationsConfig {
@@ -63,6 +63,21 @@ pub struct SourceConfig {
     pub password_env: Option<String>,
     pub database: Option<String>,
 
+    /// Operational profile of the source database.
+    ///
+    /// Selects the **default** tuning profile when none is explicitly set in
+    /// `source.tuning.profile` or `export.tuning.profile`:
+    ///
+    /// | `environment`           | default profile |
+    /// |-------------------------|------------------|
+    /// | `production` (default)  | `balanced` (50 ms throttle, 10 k batch, retries) |
+    /// | `replica`               | `balanced` |
+    /// | `local`                 | `fast` (no throttle, 50 k batch — saves ~30% wall on localhost) |
+    ///
+    /// Explicit `tuning.profile:` always wins over this hint.
+    #[serde(default)]
+    pub environment: Option<SourceEnvironment>,
+
     #[serde(default)]
     pub tuning: Option<TuningConfig>,
 
@@ -70,6 +85,33 @@ pub struct SourceConfig {
     /// without TLS — a warning is emitted so operators are aware. See [`TlsConfig`].
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+}
+
+/// Operational environment of the source database — drives the default tuning
+/// profile when none is explicitly set. Opt-in: existing configs without
+/// `environment:` continue to use `balanced` as today.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceEnvironment {
+    /// Localhost / Docker compose / read-only container — no throttle by default
+    /// (compiles to `fast` profile defaults). Use when DB load is not a concern.
+    Local,
+    /// Read replica — `balanced` default. Same throttle as production, but free
+    /// to dial up `tuning.batch_size`.
+    Replica,
+    /// Live production primary — `balanced` default. Bias toward source-safety.
+    Production,
+}
+
+impl SourceEnvironment {
+    /// Default tuning profile selected by this environment when the user has
+    /// not set `tuning.profile:` explicitly.
+    pub fn default_profile(self) -> TuningProfile {
+        match self {
+            SourceEnvironment::Local => TuningProfile::Fast,
+            SourceEnvironment::Replica | SourceEnvironment::Production => TuningProfile::Balanced,
+        }
+    }
 }
 
 /// Transport security for the source database connection.
@@ -317,6 +359,16 @@ pub struct ExportConfig {
     #[serde(default)]
     pub query: Option<String>,
     pub query_file: Option<String>,
+    /// Shortcut for `query: "SELECT * FROM <schema>.<table>"`.
+    ///
+    /// Accepts `table` or `schema.table` with ASCII-only identifiers
+    /// (`[A-Za-z_][A-Za-z0-9_]*`). Generates an unquoted single-table
+    /// query so the Postgres NUMERIC catalog-hint resolver recognises it
+    /// and auto-types `numeric(p,s)` columns without manual overrides.
+    ///
+    /// Mutually exclusive with `query` and `query_file`.
+    #[serde(default)]
+    pub table: Option<String>,
     #[serde(default = "default_mode")]
     pub mode: ExportMode,
     pub cursor_column: Option<String>,
@@ -331,6 +383,23 @@ pub struct ExportConfig {
     pub chunk_dense: bool,
     #[serde(default = "default_chunk_size")]
     pub chunk_size: usize,
+    /// Target memory budget per chunk in MB. When set, `chunk_size` is derived
+    /// from this budget at plan-build time using a `pg_class` row-size estimate
+    /// (`pg_relation_size / reltuples`), clamped to `[10_000, 5_000_000]` rows.
+    ///
+    /// Mutually exclusive with an explicit non-default `chunk_size:`. Only
+    /// applies to `mode: chunked` on a Postgres source using the `table:`
+    /// shortcut (the row-size probe needs a known relation).
+    ///
+    /// ```yaml
+    /// exports:
+    ///   - name: page_views
+    ///     table: public.page_views
+    ///     mode: chunked
+    ///     chunk_size_memory_mb: 256
+    /// ```
+    #[serde(default)]
+    pub chunk_size_memory_mb: Option<u64>,
     /// Divide the column range into exactly this many equal chunks.
     /// Mutually exclusive with `chunk_dense` and `chunk_by_days`.
     /// When set, `chunk_size` is computed dynamically from min/max.
@@ -425,6 +494,12 @@ impl ExportConfig {
         config_dir: &Path,
         params: Option<&std::collections::HashMap<String, String>>,
     ) -> crate::error::Result<String> {
+        // table: shortcut takes precedence — already validated by
+        // `validate_business_rules` to be mutually exclusive with query/query_file.
+        if let Some(tbl) = &self.table {
+            validate_table_shortcut_ident(&self.name, tbl)?;
+            return Ok(format!("SELECT * FROM {tbl}"));
+        }
         match (&self.query, &self.query_file) {
             (Some(q), None) => {
                 if params.is_some() {
@@ -479,12 +554,53 @@ impl ExportConfig {
             }
             (None, None) => {
                 anyhow::bail!(
-                    "export '{}': must specify 'query' or 'query_file'",
+                    "export '{}': must specify exactly one of 'query', 'query_file', or 'table'",
                     self.name
                 )
             }
         }
     }
+}
+
+/// Validate the value of the `table:` YAML shortcut.
+///
+/// Accepts ASCII identifiers in the form `<table>` or `<schema>.<table>`. Each
+/// segment must match `[A-Za-z_][A-Za-z0-9_]*`. Anything else (quoted
+/// identifiers, exotic chars, three-part names, SQL injection attempts) is
+/// rejected — the user should fall back to `query:` for those cases.
+///
+/// The bound on identifier shape keeps generated SQL safe to interpolate
+/// without quoting and ensures the generated `SELECT * FROM <ident>` form is
+/// recognised by the PG catalog-hint parser ([src/source/postgres.rs]).
+fn validate_table_shortcut_ident(export_name: &str, raw: &str) -> crate::error::Result<()> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("export '{export_name}': 'table' is empty");
+    }
+    let parts: Vec<&str> = trimmed.split('.').collect();
+    if parts.len() > 2 {
+        anyhow::bail!(
+            "export '{export_name}': 'table' must be `<name>` or `<schema>.<name>` (got '{raw}')"
+        );
+    }
+    for part in &parts {
+        if part.is_empty() {
+            anyhow::bail!("export '{export_name}': 'table' has an empty segment in '{raw}'");
+        }
+        let mut chars = part.chars();
+        let first = chars.next().unwrap();
+        if !(first.is_ascii_alphabetic() || first == '_') {
+            anyhow::bail!(
+                "export '{export_name}': 'table' segment '{part}' must start with a letter or underscore (use 'query:' for quoted identifiers)"
+            );
+        }
+        if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            anyhow::bail!(
+                "export '{export_name}': 'table' segment '{part}' contains non-identifier characters (use 'query:' for quoted identifiers)"
+            );
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -772,6 +888,7 @@ mod tests {
             password: None,
             password_env: None,
             database: None,
+            environment: None,
             tuning: None,
             tls: None,
         }
@@ -992,6 +1109,7 @@ mod tests {
             name: "test".into(),
             query: query.map(|s| s.to_string()),
             query_file: query_file.map(|s| s.to_string()),
+            table: None,
             mode: ExportMode::Full,
             cursor_column: None,
             cursor_fallback_column: None,
@@ -999,6 +1117,7 @@ mod tests {
             chunk_column: None,
             chunk_dense: false,
             chunk_size: 100_000,
+            chunk_size_memory_mb: None,
             chunk_count: None,
             chunk_by_days: None,
             parallel: 1,
@@ -1104,6 +1223,69 @@ mod tests {
         let p = params(&[("col", "name"), ("tbl", "users")]);
         let q = exp.resolve_query(dir.path(), Some(&p)).unwrap();
         assert_eq!(q, "SELECT name FROM users");
+    }
+
+    // ── `table:` shortcut ───────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_query_table_shortcut_qualified() {
+        let mut exp = make_export_direct(None, None);
+        exp.table = Some("public.users".into());
+        let q = exp.resolve_query(Path::new("/tmp"), None).unwrap();
+        assert_eq!(q, "SELECT * FROM public.users");
+    }
+
+    #[test]
+    fn resolve_query_table_shortcut_unqualified() {
+        let mut exp = make_export_direct(None, None);
+        exp.table = Some("orders".into());
+        let q = exp.resolve_query(Path::new("/tmp"), None).unwrap();
+        assert_eq!(q, "SELECT * FROM orders");
+    }
+
+    #[test]
+    fn resolve_query_table_shortcut_rejects_three_part_name() {
+        let mut exp = make_export_direct(None, None);
+        exp.table = Some("db.public.users".into());
+        let err = exp.resolve_query(Path::new("/tmp"), None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("<schema>.<name>"), "got: {msg}");
+    }
+
+    #[test]
+    fn resolve_query_table_shortcut_rejects_sql_injection() {
+        // Any non-identifier character (semicolon, quote, space, dash) is rejected.
+        // Falls back to `query:` for non-trivial cases.
+        for bad in [
+            "users; DROP TABLE x",
+            "users--",
+            "users'",
+            "users\"",
+            "public.\"My Table\"",
+            "0starts_with_digit",
+            "",
+            ".trailing",
+            "leading.",
+            "two..dots",
+        ] {
+            let mut exp = make_export_direct(None, None);
+            exp.table = Some(bad.into());
+            assert!(
+                exp.resolve_query(Path::new("/tmp"), None).is_err(),
+                "should reject `table:` value '{bad}'",
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_query_table_shortcut_takes_precedence_over_query() {
+        // Mutual exclusion is enforced by validate_business_rules; here we
+        // verify that resolve_query itself prefers `table:` if set, so that
+        // accidental dual-set won't change historical behaviour silently.
+        let mut exp = make_export_direct(Some("SELECT id FROM x"), None);
+        exp.table = Some("public.y".into());
+        let q = exp.resolve_query(Path::new("/tmp"), None).unwrap();
+        assert_eq!(q, "SELECT * FROM public.y");
     }
 
     #[test]

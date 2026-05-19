@@ -491,8 +491,17 @@ mod tests {
         .unwrap();
         assert!(yaml.contains("  - name: users"), "got:\n{yaml}");
         assert!(yaml.contains("  - name: orders"), "got:\n{yaml}");
-        assert!(yaml.contains("FROM users"), "got:\n{yaml}");
-        assert!(yaml.contains("FROM orders"), "got:\n{yaml}");
+        // Each export references its base relation. PG full-mode now uses the
+        // `table:` shortcut (so catalog hints can resolve NUMERIC types); other
+        // modes/dialects keep the `FROM <name>` form.
+        assert!(
+            yaml.contains("    table: users") || yaml.contains("FROM users"),
+            "expected users reference; got:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("    table: orders") || yaml.contains("FROM orders"),
+            "expected orders reference; got:\n{yaml}"
+        );
         assert_eq!(yaml.matches("meta_columns:").count(), 2, "got:\n{yaml}");
     }
 

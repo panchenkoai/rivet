@@ -160,7 +160,12 @@ If the process is killed mid-export:
 
 - **Chunked** — each chunk is committed to state only after it writes
   successfully. A crash mid-chunk means that chunk is retried on `--resume`.
-  Completed chunks are not re-exported.
+  Completed chunks are not re-exported. This holds for both the **sequential**
+  checkpoint loop (`parallel: 1`) and the **parallel** worker pool
+  (`parallel: N` with `chunk_checkpoint: true`); when one parallel worker
+  panics, `reset_stale_running_chunk_tasks` resets every `running` task back
+  to `pending` on resume so no work is lost. Coverage: `live_chunked_recovery`
+  C1–C4 (see [reliability-matrix.md § Failure-mode coverage](../reliability-matrix.md#failure-mode-coverage)).
 
 - **Full** — full exports have no cursor. Re-running after a crash starts from
   the beginning. Partial output files from the crashed run are overwritten.

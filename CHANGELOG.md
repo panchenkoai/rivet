@@ -1,5 +1,158 @@
 # Changelog
 
+## 0.6.0 (2026-05-19)
+
+### Configuration ergonomics, MySQL parity, pooler-awareness, and a published cross-tool benchmark
+
+A user-facing release. Seven new features (the `table:` config shortcut,
+auto-resolved chunk columns from primary keys, memory-budgeted chunking on
+both engines, `work_mem`-aware `FETCH` capping on Postgres, a `MysqlProxyKind`
+classifier for ProxySQL / MaxScale, and a batch-memory-aware MySQL row
+buffer); a packaging change — the MCP server is now shipped as a separate
+binary, `rivet-mcp`; and a published cross-tool benchmark harness with a
+steelman re-run that gives every competitor its best plausible config.
+
+#### Breaking / packaging
+
+- **`rivet-mcp` is now a separate binary.** Previously available as
+  `rivet mcp <…>` subcommands, the MCP (Model Context Protocol) server is
+  now its own crate binary under `src/bin/rivet-mcp.rs`. Homebrew, Docker,
+  GitHub Release tarballs, and `cargo install rivet-cli` all install both
+  `rivet` and `rivet-mcp` from 0.6.0 onwards. Claude Desktop / Claude Code
+  configs that previously invoked `rivet mcp` should be updated to call
+  `rivet-mcp --stdio` directly. The crate name remains `rivet-cli` on
+  crates.io.
+
+#### New features
+
+- **`feat(config)`** — `table:` shortcut + `source.environment`. An export
+  can now be expressed as `table: orders` instead of writing a full
+  `query: "SELECT ... FROM orders"` block; Rivet derives the column list
+  from the catalog and resolves the schema automatically.
+  `source.environment` lets a single config carry per-environment defaults
+  without YAML anchors.
+- **`feat(chunked)`** — `chunk_column` is auto-resolved from the primary
+  key on the `table:` shortcut. No more manually copying the PK name into
+  the YAML.
+- **`feat(chunked)`** — `chunk_size_memory_mb` (memory-budgeted chunk
+  sizing) + a small-table escape path that runs sub-threshold tables in a
+  single chunk instead of forcing the planner to emit a one-row range.
+- **`feat(source)`** — `work_mem`-aware `FETCH` cap on the Postgres server
+  side cursor. The longest single SQL statement Rivet issues on a 2 M-row
+  wide table is now **0.19s** (`FETCH 142 FROM _rive`) instead of the
+  multi-second hold that `FETCH FORWARD 10000` produced under tight
+  `work_mem`. Run summary now includes `pg_temp_bytes` so an operator can
+  see how much spill the export caused.
+- **`feat(mysql)`** — full chunking parity with Postgres: auto-resolved
+  `chunk_column` from the PK + `chunk_size_memory_mb` derived from
+  `information_schema.TABLES.AVG_ROW_LENGTH` (with a `/3` correction
+  above 8 KB to compensate InnoDB's BLOB inflation).
+- **`feat(mysql)`** — batch-memory-aware `row_buf` cap. RSS on the wide
+  MySQL `content_items` fixture no longer scales with chunk size: peak RSS
+  stays at **280 MB** regardless of `chunk_size_memory_mb` setting.
+- **`feat(mysql)`** — `MysqlProxyKind` 4-signal classifier identifies
+  ProxySQL, MaxScale, and generic multiplexers at connect time and emits
+  the pool-safety warning before the export starts (mirrors the existing
+  Postgres pgBouncer / Odyssey PID-flip probe). ProxySQL is now wired into
+  the nightly live test job.
+
+#### Fixes
+
+- **`fix(source)`** — use the requested `FETCH N` size for the cursor
+  exhaustion check on Postgres. Previously the code compared returned-row
+  count against the hard-coded default, so adaptive batch sizing could
+  declare the cursor exhausted one batch early on tables whose row width
+  triggered an early `work_mem` cap.
+- **`fix(lib)`** — drop the blanket `#[allow(dead_code)]` on the
+  `preflight` module by exposing it as `pub mod`. Eliminates 30+ legitimate
+  dead-code warnings that the blanket allow was hiding.
+- **`fix(clippy)`** — struct-init shorthand for `TuningConfig` across
+  live tests (no behavior change).
+
+#### Refactors
+
+- **`refactor(mcp)`** — extract the MCP server into the `rivet-mcp` binary
+  (see "Breaking / packaging" above).
+- **`refactor(cli)`** — split the ~1000-line `src/cli/mod.rs` into
+  `args.rs` / `validate.rs` / `params.rs` / `dispatch.rs` so each file owns
+  a single concern.
+- **`refactor(tuning)`** — split the 678-line `src/tuning.rs` into
+  `tuning/{profile,memory,adaptive}.rs`. `next_adaptive_batch_size` from
+  0.5.3 stays a pure function, now in `adaptive.rs`.
+- **`refactor(chunked)`** — split the 661-line `pipeline/chunked/mod.rs`
+  into sibling `sequential_checkpoint.rs` + `parallel_checkpoint.rs`,
+  with chunk math extracted to `math.rs`. Cuts the largest pipeline file
+  by ~75%.
+- **`refactor(source)`** — extract Arrow-conversion machinery into
+  `source/postgres/arrow_convert.rs` and `source/mysql/arrow_convert.rs`,
+  leaving the `mod.rs` files focused on transport / cursor / chunking.
+- **`refactor(chunked)`** — drop the subquery wrap on min/max/COUNT
+  boundary queries for the `table:` shortcut. Eliminates a planner
+  pessimization on tables with a partial index on the chunk column.
+- **`refactor(mysql)`** — `AVG_ROW_LENGTH / 3` correction above 8 KB to
+  compensate InnoDB BLOB inflation. Wide-MySQL `chunk_size_memory_mb`
+  derivations are now within ~10% of measured per-row width.
+
+#### Tests / CI
+
+- **MySQL symmetry suite** — seven new live test files mirror the
+  Postgres coverage: `live_mysql_chunked_recovery`,
+  `live_mysql_crash_recovery`, `live_mysql_reconcile_repair`,
+  `live_mysql_resume`, `live_mysql_retry_and_faults`,
+  `live_mysql_schema_drift`, `live_mysql_chunked`. The MySQL twin of
+  `live_oltp_load` validates retry / streaming under concurrent INSERTs.
+- **`test(chunked)`** — parallel checkpoint recovery (cases C3, C4) +
+  panic hooks in the parallel worker so a `panic!()` inside `BatchSink`
+  no longer leaks a thread, the run aborts cleanly, and the checkpoint
+  state machine is in a resumable state.
+- **`ci`** — ProxySQL added to `docker-compose.yaml` (`pool` profile) and
+  wired into `.github/workflows/nightly-live.yml` alongside the existing
+  pgBouncer coverage.
+
+#### Benchmarks
+
+- **`bench`** — first published cross-tool benchmark harness in
+  `docs/bench/`. Compares Rivet against `sling`, `dlt`, `duckdb`
+  (`postgres_scanner` / `mysql_scanner`), `clickhouse-local`, and
+  `odbc2parquet` 11.0.0 on a 22-table Postgres fixture (incl. a 2M-row ×
+  20-wide-column `content_items`) and a 17-table MySQL fixture. Reports
+  longest single SQL, peak RSS, wall, failure count, DB-side
+  counter deltas (`pg_stat_database`, `Innodb_rows_read`, `processlist`).
+  Rivet: PG 0.19s / 443 MB peak, MySQL 9s / 280 MB peak, 0 / 22 + 0 / 17
+  table failures.
+- **`bench(steelman)`** — second report that re-runs every competitor at
+  its best plausible configuration (e.g. `odbc2parquet --batch-size-memory
+  256MiB --sequential-fetching`, narrow-table `--column-length-limit`).
+  On narrow tables the gap closes substantially; on wide `content_items`
+  Rivet's edge survives (~58× peak RSS, ~700× longest single query).
+- **`bench(odbc2parquet)`** — numbers refreshed against v11.0.0 (was
+  v6.0.7). Wall improved ~15% on the full suite; architectural shape
+  unchanged.
+
+#### Docs
+
+- **Trust contracts surface** — `docs/semantics.md § Crash semantics` +
+  `§ Known non-guarantees`, `docs/reliability-matrix.md` (PR CI / nightly
+  / manual breakdown), `docs/reference/compatibility.md` (exact PG 12–16,
+  MySQL 5.7 / 8.0 versions exercised), `SECURITY.md § Sensitive local
+  artifacts`, all linked from the README "Trust contracts" table.
+- **Onboarding funnel consolidation** — one canonical document per stage:
+  `getting-started.md` (first run), `docs/concepts.md` (glossary),
+  `docs/pilot/README.md` (operator runbook). Removed parallel
+  `pilot/quickstart-postgres.md` + `pilot/quickstart-mysql.md` whose
+  content was duplicated from `getting-started.md`.
+- **Architecture refresh** — `docs/architecture.md` updated for the
+  `tuning/` and `chunked/` splits and the new `rivet-mcp` binary.
+- **GIFs** — all 12 default scenarios (and the opt-in `pool-detect`)
+  re-rendered against the 0.6.0 binary. New `coalesce-cursor.gif` shows
+  `incremental_cursor_mode: coalesce` correctly tracking 30 late-arriving
+  rows whose `updated_at` is `NULL`.
+- **README** — claims now back-linked to measured numbers (the
+  "Source pressure, measured" table is generated from
+  `docs/bench/reports/REPORT_*.md`).
+
+---
+
 ## 0.5.3 (2026-05-17)
 
 ### Architecture audit pass — fault-tolerance, observability, CI hardening

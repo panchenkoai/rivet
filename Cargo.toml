@@ -1,6 +1,6 @@
 [package]
 name = "rivet-cli"
-version = "0.5.3"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
@@ -17,6 +17,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "rivet"
 path = "src/main.rs"
+
+[[bin]]
+name = "rivet-mcp"
+path = "src/bin/rivet-mcp.rs"
 
 [dependencies]
 anyhow = "1"

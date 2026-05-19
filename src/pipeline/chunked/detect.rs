@@ -3,16 +3,35 @@
 //! Queries min/max (and optionally COUNT) from the source to compute chunk ranges,
 //! logs sparsity diagnostics, and returns the final `Vec<(i64, i64)>` chunk list.
 
-use super::math::{generate_chunks, parse_date_flexible, parse_scalar_i64};
+use super::math::{generate_chunks, parse_date_flexible, parse_scalar_i64, strip_select_star_from};
 use crate::error::Result;
 use crate::source::Source;
 
+/// `SELECT COUNT(*) FROM (<base>) AS _rivet_rowcnt`, with a fast path when
+/// `base_query` is the `SELECT * FROM <ident>` shape produced by the `table:`
+/// shortcut. The wrapped form forces Postgres to materialise the inner result
+/// (we measured ~3.2 GB of `temp_files` on a 8.6 GB table) — the fast path
+/// avoids the wrap entirely so `COUNT(*)` becomes a plain heap-scan / index-only
+/// scan with no spill.
 fn query_wrapped_row_count(src: &mut dyn Source, base_query: &str) -> Result<i64> {
-    let sql = format!("SELECT COUNT(*) FROM ({}) AS _rivet_rowcnt", base_query);
+    let sql = match strip_select_star_from(base_query) {
+        Some(table_ident) => format!("SELECT COUNT(*) FROM {table_ident}"),
+        None => format!("SELECT COUNT(*) FROM ({base_query}) AS _rivet_rowcnt"),
+    };
     let raw = src
         .query_scalar(&sql)?
         .ok_or_else(|| anyhow::anyhow!("COUNT(*) returned no row"))?;
     parse_scalar_i64(&raw)
+}
+
+/// Same wrap-or-direct decision for `SELECT <agg>({col}) FROM …`. Used by both
+/// the integer-range and chunk_by_days paths so they share one strict-ident
+/// gate instead of duplicating the rewrite logic.
+fn aggregate_sql(agg: &str, quoted_col: &str, base_query: &str) -> String {
+    match strip_select_star_from(base_query) {
+        Some(table_ident) => format!("SELECT {agg}({quoted_col}) FROM {table_ident}"),
+        None => format!("SELECT {agg}({quoted_col}) FROM ({base_query}) AS _rivet"),
+    }
 }
 
 fn log_chunk_boundaries_list(export_name: &str, chunks: &[(i64, i64)]) {
@@ -113,16 +132,8 @@ pub(crate) fn detect_and_generate_chunks(
     let quoted_col = crate::sql::quote_ident(source_type, chunk_column);
 
     if let Some(days_per_chunk) = chunk_by_days {
-        let min_sql = format!(
-            "SELECT min({col}) FROM ({q}) AS _rivet",
-            col = quoted_col,
-            q = base_query,
-        );
-        let max_sql = format!(
-            "SELECT max({col}) FROM ({q}) AS _rivet",
-            col = quoted_col,
-            q = base_query,
-        );
+        let min_sql = aggregate_sql("min", &quoted_col, base_query);
+        let max_sql = aggregate_sql("max", &quoted_col, base_query);
         let min_str = src.query_scalar(&min_sql)?.ok_or_else(|| {
             anyhow::anyhow!(
                 "export '{}': min({}) returned NULL — table may be empty",
@@ -192,16 +203,8 @@ pub(crate) fn detect_and_generate_chunks(
         return Ok(chunks);
     }
 
-    let min_sql = format!(
-        "SELECT min({col}) FROM ({q}) AS _rivet",
-        col = quoted_col,
-        q = base_query,
-    );
-    let max_sql = format!(
-        "SELECT max({col}) FROM ({q}) AS _rivet",
-        col = quoted_col,
-        q = base_query,
-    );
+    let min_sql = aggregate_sql("min", &quoted_col, base_query);
+    let max_sql = aggregate_sql("max", &quoted_col, base_query);
 
     let min_val = src
         .query_scalar(&min_sql)?
@@ -277,11 +280,19 @@ mod tests {
     // Returns pre-queued replies for query_scalar; panics if queue is exhausted.
     // export / type_mappings are never called in detect tests.
 
-    struct ScriptedSource(VecDeque<Result<Option<String>>>);
+    /// Sniffs every SQL string that gets queried — lets us assert on the
+    /// rewrite, since that is the whole point of the fast-path patch.
+    struct ScriptedSource {
+        replies: VecDeque<Result<Option<String>>>,
+        seen_sql: Vec<String>,
+    }
 
     impl ScriptedSource {
         fn new(items: impl IntoIterator<Item = Result<Option<String>>>) -> Self {
-            Self(items.into_iter().collect())
+            Self {
+                replies: items.into_iter().collect(),
+                seen_sql: Vec::new(),
+            }
         }
     }
 
@@ -293,8 +304,11 @@ mod tests {
     }
 
     impl crate::source::Source for ScriptedSource {
-        fn query_scalar(&mut self, _sql: &str) -> Result<Option<String>> {
-            self.0.pop_front().expect("ScriptedSource: queue exhausted")
+        fn query_scalar(&mut self, sql: &str) -> Result<Option<String>> {
+            self.seen_sql.push(sql.to_string());
+            self.replies
+                .pop_front()
+                .expect("ScriptedSource: queue exhausted")
         }
         fn export(
             &mut self,
@@ -493,6 +507,90 @@ mod tests {
         let chunks = detect_with_count(&mut src, 1).unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0], (1, 999));
+    }
+
+    // ── Fast-path: subquery wrap is skipped when base is SELECT * FROM <ident> ──
+
+    fn detect_with_base(
+        src: &mut ScriptedSource,
+        base_query: &str,
+        chunk_dense: bool,
+        chunk_by_days: Option<u32>,
+    ) -> Result<Vec<(i64, i64)>> {
+        detect_and_generate_chunks(
+            src,
+            base_query,
+            "id",
+            100,
+            None,
+            "tbl",
+            chunk_dense,
+            chunk_by_days,
+            SourceType::Postgres,
+        )
+    }
+
+    #[test]
+    fn fast_path_select_star_emits_min_max_count_without_subquery_wrap() {
+        // base = simple SELECT * FROM public.users → no `FROM (...) AS _rivet`
+        // anywhere. PG can satisfy these as index-only scans, no temp_files.
+        let mut src = ScriptedSource::new([ok("1"), ok("1000"), ok("500")]);
+        let _ = detect_with_base(&mut src, "SELECT * FROM public.users", false, None).unwrap();
+        for sql in &src.seen_sql {
+            assert!(
+                !sql.contains("_rivet") && !sql.contains("FROM ("),
+                "fast path must not wrap; got: {sql}"
+            );
+        }
+        // min/max are explicit, COUNT is plain.
+        assert!(src.seen_sql.iter().any(|s| s.starts_with("SELECT min(")));
+        assert!(src.seen_sql.iter().any(|s| s.starts_with("SELECT max(")));
+        assert!(
+            src.seen_sql
+                .iter()
+                .any(|s| s.starts_with("SELECT COUNT(*) FROM public.users"))
+        );
+    }
+
+    #[test]
+    fn fallback_keeps_subquery_wrap_for_curated_query() {
+        // Anything that isn't `SELECT * FROM <ident>` → original wrap.
+        let mut src = ScriptedSource::new([ok("1"), ok("1000"), ok("500")]);
+        let _ = detect_with_base(
+            &mut src,
+            "SELECT id FROM public.users WHERE active",
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(src.seen_sql.iter().any(|s| s.contains("AS _rivet_rowcnt")));
+        assert!(src.seen_sql.iter().any(|s| s.contains("AS _rivet")));
+    }
+
+    #[test]
+    fn fast_path_chunk_by_days_also_unwraps() {
+        // chunk_by_days path issues min + max; both should hit the fast path.
+        let mut src = ScriptedSource::new([ok("2024-01-01"), ok("2024-12-31")]);
+        let _ = detect_with_base(&mut src, "SELECT * FROM public.events", false, Some(7)).unwrap();
+        for sql in &src.seen_sql {
+            assert!(
+                !sql.contains("_rivet") && !sql.contains("FROM ("),
+                "chunk_by_days fast path must not wrap; got: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn fast_path_chunk_dense_count_unwraps() {
+        let mut src = ScriptedSource::new([ok("500")]);
+        let _ = detect_with_base(&mut src, "SELECT * FROM public.orders", true, None).unwrap();
+        // Single SQL — the COUNT — must be unwrapped.
+        assert_eq!(src.seen_sql.len(), 1);
+        assert!(
+            src.seen_sql[0].starts_with("SELECT COUNT(*) FROM public.orders"),
+            "got: {}",
+            src.seen_sql[0]
+        );
     }
 
     #[test]

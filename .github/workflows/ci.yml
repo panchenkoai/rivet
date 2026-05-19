@@ -152,8 +152,11 @@ jobs:
         # binaries have the proxy admin API available on :8474.
         # `--profile pool` brings up pgBouncer (transaction mode, pool_size=1)
         # for the live_pool_safety regression suite — the F1–F6 / G1 DBA-audit
-        # fixes silently rot without it.
-        run: docker compose --profile pool up -d postgres mysql minio fake-gcs toxiproxy pgbouncer
+        # fixes silently rot without it. `proxysql` lives in the same `pool`
+        # profile and is required by the new MySQL `mysql_proxysql_*` tests in
+        # tests/live_pool_safety.rs (added in 0.6.0); without it
+        # `require_alive(LiveService::ProxySql)` panics before the test runs.
+        run: docker compose --profile pool up -d postgres mysql minio fake-gcs toxiproxy pgbouncer proxysql
 
       - name: Wait for services
         run: |
@@ -163,6 +166,10 @@ jobs:
           for i in $(seq 1 30); do docker compose exec -T mysql mysqladmin ping -h localhost -uroot -privet 2>/dev/null && break || sleep 2; done
           echo "Waiting for pgBouncer..."
           for i in $(seq 1 30); do (exec 3<>/dev/tcp/127.0.0.1/6432) 2>/dev/null && break || sleep 1; done
+          echo "Waiting for ProxySQL..."
+          # 6033 is the client-facing MySQL protocol port; 6032 admin comes
+          # up first but we wait for 6033 so backend wiring is in place.
+          for i in $(seq 1 30); do (exec 3<>/dev/tcp/127.0.0.1/6033) 2>/dev/null && break || sleep 1; done
 
       - name: Build release
         run: cargo build --release
