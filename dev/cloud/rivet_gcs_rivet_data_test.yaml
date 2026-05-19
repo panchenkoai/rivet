@@ -25,7 +25,7 @@ exports:
       type: gcs
       bucket: rivet_data_test
       prefix: exports/orders/
-      credentials_file: /Users/andriipanchenko/rivet/rivet-gcs-sa.json
+      credentials_file: /Users/andriipanchenko/.config/rivet/rivet-gcs-sa.json
 
   - name: page_views_chunked_gcs
     query: >
@@ -45,4 +45,4 @@ exports:
       type: gcs
       bucket: rivet_data_test
       prefix: exports/page_views/
-      credentials_file: /Users/andriipanchenko/rivet/rivet-gcs-sa.json
+      credentials_file: /Users/andriipanchenko/.config/rivet/rivet-gcs-sa.json

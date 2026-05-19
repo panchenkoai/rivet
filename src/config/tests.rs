@@ -535,7 +535,143 @@ exports:
 "#,
     )
     .unwrap_err();
-    assert!(err.to_string().contains("query"));
+    assert!(err.to_string().contains("query") || err.to_string().contains("table"));
+}
+
+#[test]
+fn source_environment_local_parses() {
+    let cfg = Config::from_yaml(
+        r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+  environment: local
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#,
+    )
+    .expect("environment: local should parse");
+    assert!(matches!(
+        cfg.source.environment,
+        Some(crate::config::SourceEnvironment::Local)
+    ));
+}
+
+#[test]
+fn source_environment_invalid_value_rejected() {
+    let err = Config::from_yaml(
+        r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+  environment: staging
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#,
+    )
+    .unwrap_err();
+    // serde-yaml gives an "unknown variant" error
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("environment") || msg.contains("unknown variant") || msg.contains("staging"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn source_environment_absent_keeps_balanced_default() {
+    // Sanity check: no `environment:` field → still parses, defaults preserved.
+    let cfg = Config::from_yaml(
+        r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#,
+    )
+    .unwrap();
+    assert!(cfg.source.environment.is_none());
+}
+
+#[test]
+fn table_shortcut_parses_and_validates() {
+    let cfg = Config::from_yaml(
+        r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: users_full
+    table: public.users
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#,
+    )
+    .expect("table: shortcut should parse");
+    assert_eq!(cfg.exports[0].table.as_deref(), Some("public.users"));
+    assert!(cfg.exports[0].query.is_none());
+}
+
+#[test]
+fn table_and_query_both_set_rejected() {
+    let err = Config::from_yaml(
+        r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: bad
+    table: public.users
+    query: "SELECT * FROM something_else"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#,
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("exactly one"), "got: {msg}");
+}
+
+#[test]
+fn table_and_query_file_both_set_rejected() {
+    let err = Config::from_yaml(
+        r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: bad
+    table: public.users
+    query_file: sql/x.sql
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#,
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("exactly one"), "got: {msg}");
 }
 
 #[test]
@@ -1673,6 +1809,7 @@ fn src_with_password(password: Option<&str>, url: Option<&str>) -> SourceConfig 
         password: password.map(String::from),
         password_env: Some("DB_PASSWORD".into()),
         database: Some("prod".into()),
+        environment: None,
         tuning: None,
         tls: None,
     }
@@ -1740,6 +1877,7 @@ fn redact_env_references_are_preserved() {
         password: None,
         password_env: Some("DB_PWD".into()),
         database: None,
+        environment: None,
         tuning: None,
         tls: None,
     };

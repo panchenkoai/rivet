@@ -1,7 +1,7 @@
 //! MCP server contract tests — verify the JSON-RPC 2.0 protocol surface
 //! without a live database.
 //!
-//! These tests run the `rivet mcp --stdio` binary as a subprocess and drive it
+//! These tests run the `rivet-mcp --stdio` binary as a subprocess and drive it
 //! via its stdin pipe.  They assert the protocol structure (initialize,
 //! tools/list, error responses) but NOT actual query results — those require
 //! live infrastructure and are covered by live_* tests.
@@ -11,7 +11,7 @@ mod common;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
-use common::RIVET_BIN;
+use common::RIVET_MCP_BIN;
 use serde_json::{Value, json};
 
 struct McpProcess {
@@ -22,13 +22,13 @@ struct McpProcess {
 
 impl McpProcess {
     fn start() -> Self {
-        let mut child = Command::new(RIVET_BIN)
-            .args(["mcp", "--stdio"])
+        let mut child = Command::new(RIVET_MCP_BIN)
+            .args(["--stdio"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn rivet mcp");
+            .expect("spawn rivet-mcp");
         let stdout = child.stdout.take().unwrap();
         let writer = child.stdin.take().unwrap();
         Self {

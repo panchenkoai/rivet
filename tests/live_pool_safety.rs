@@ -20,6 +20,22 @@
 //! docker compose up -d mysql
 //! cargo test --test live_pool_safety -- --include-ignored
 //! ```
+//!
+//! ## MySQL / ProxySQL tests
+//!
+//! Cover the MySQL proxy-detection + cleanup-through-a-proxy paths.  ProxySQL
+//! lives in the `pool` docker-compose profile alongside pgBouncer:
+//!
+//! ```text
+//! docker compose --profile pool up -d proxysql
+//! cargo test --test live_pool_safety mysql_proxysql -- --include-ignored
+//! ```
+//!
+//! What they verify:
+//! - `detect_mysql_proxy_kind()` correctly classifies the connection as
+//!   `MysqlProxyKind::ProxySql` (banner or `@@proxy_version` signal).
+//! - Session-state cleanup still runs to completion when the export traffic
+//!   is routed through ProxySQL (no silent fallback past the proxy).
 
 mod common;
 
@@ -29,7 +45,7 @@ use postgres::{Client as PgClient, NoTls};
 
 use common::*;
 use rivet::error::Result;
-use rivet::source::mysql::MysqlSource;
+use rivet::source::mysql::{MysqlProxyKind, MysqlSource};
 use rivet::source::postgres::PostgresSource;
 use rivet::source::{BatchSink, ExportRequest, Source};
 use rivet::tuning::{SourceTuning, TuningConfig};
@@ -296,5 +312,164 @@ fn mysql_session_vars_clean_after_failed_export() {
     assert_eq!(
         timeout, 0,
         "max_execution_time leaked to pool after failed export: got {timeout}"
+    );
+}
+
+// ─── MySQL / ProxySQL tests ────────────────────────────────────────────────
+//
+// All ProxySQL tests gate on both the `mysql` service (the backend) and the
+// `proxysql` service from the `pool` profile.  The `MysqlProxyKind::ProxySql`
+// classification is the primary contract here; cleanup-through-the-proxy is
+// the regression test for the existing session-state guarantee.
+
+/// Returns a `Pool` configured exactly like the production `MysqlSource`'s
+/// `connect()` path but pointed at ProxySQL.  Used by the proxy-detection
+/// tests so we exercise the *same* signal collection code that runs in
+/// production, not a one-off ad-hoc pool.
+fn proxysql_default_pool() -> mysql::Pool {
+    use mysql::{Opts, OptsBuilder, PoolConstraints, PoolOpts};
+    // PoolConstraints::new(1,1) means: even if the ProxySQL multiplexes
+    // backend connections, our *client-side* pool keeps a single conn open
+    // so post-export inspection sees the same client→ProxySQL session.
+    let opts = Opts::from(
+        OptsBuilder::from_opts(Opts::from_url(PROXYSQL_URL).unwrap()).pool_opts(
+            PoolOpts::default()
+                .with_constraints(PoolConstraints::new(1, 1).expect("valid pool constraints")),
+        ),
+    );
+    mysql::Pool::new(opts).expect("create single-conn proxysql client pool")
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile pool up -d proxysql"]
+fn mysql_proxysql_connection_classified_as_proxysql() {
+    // The decisive test: `MysqlSource::connect()` returns a source whose
+    // `proxy_kind()` is `ProxySql`.  This fails loudly if either
+    //   (a) the classifier regresses (banner/proxy_version signals broken), or
+    //   (b) the ProxySQL config we ship in `dev/proxysql/proxysql.cnf` stops
+    //       advertising the ProxySQL banner.
+    require_alive(LiveService::Mysql);
+    require_alive(LiveService::ProxySql);
+
+    let source = MysqlSource::connect(PROXYSQL_URL).expect("connect through ProxySQL");
+    assert_eq!(
+        source.proxy_kind(),
+        MysqlProxyKind::ProxySql,
+        "ProxySQL connection must be classified as ProxySql; got {:?}",
+        source.proxy_kind()
+    );
+    assert!(
+        source.proxy_kind().is_proxy(),
+        "is_proxy() must be true for a ProxySQL connection"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql (direct backend, no ProxySQL)"]
+fn mysql_direct_connection_classified_as_direct() {
+    // Pair test for `mysql_proxysql_connection_classified_as_proxysql`: a
+    // direct MySQL connection must NOT be misclassified as a proxy.  This is
+    // the false-positive guard for the new CONNECTION_ID() check —
+    // single-conn pools to a direct backend always reuse the same physical
+    // backend, so `cid1 == cid2` and the classifier returns `Direct`.
+    require_alive(LiveService::Mysql);
+
+    let source = MysqlSource::connect(MYSQL_URL).expect("connect directly to MySQL");
+    assert_eq!(
+        source.proxy_kind(),
+        MysqlProxyKind::Direct,
+        "direct MySQL connection must be classified as Direct; got {:?}",
+        source.proxy_kind()
+    );
+    assert!(
+        !source.proxy_kind().is_proxy(),
+        "is_proxy() must be false for a direct connection"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile pool up -d proxysql"]
+fn mysql_proxysql_session_vars_clean_after_successful_export() {
+    // Mirror of `mysql_session_vars_clean_after_successful_export` but
+    // through ProxySQL.  Verifies the cleanup code path executes regardless
+    // of whether the export traffic is direct or proxied — there must be no
+    // silent fallback that skips cleanup on a proxied connection.
+    require_alive(LiveService::Mysql);
+    require_alive(LiveService::ProxySql);
+
+    let pool = proxysql_default_pool();
+    let mut source = MysqlSource::from_pool(pool.clone());
+    assert_eq!(
+        source.proxy_kind(),
+        MysqlProxyKind::ProxySql,
+        "pool→ProxySQL must classify as ProxySql"
+    );
+
+    source
+        .export(
+            &ExportRequest {
+                query: "SELECT 1 AS n",
+                incremental: None,
+                cursor: None,
+                tuning: &tuning_300s(),
+                column_overrides: &ColumnOverrides::default(),
+            },
+            &mut NullSink,
+        )
+        .expect("export through ProxySQL should succeed");
+
+    // ProxySQL with transaction_persistent=1 keeps the same backend conn
+    // throughout a transaction, so the post-export check sees the same
+    // session state the export left behind.  Cleanup must have run.
+    let tz = mysql_session_time_zone(&pool);
+    assert_ne!(
+        tz, "+00:00",
+        "time_zone leaked through ProxySQL after successful export: got {tz:?}"
+    );
+
+    let timeout = mysql_session_max_execution_time(&pool);
+    assert_eq!(
+        timeout, 0,
+        "max_execution_time leaked through ProxySQL after successful export: got {timeout}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile pool up -d proxysql"]
+fn mysql_proxysql_session_vars_clean_after_failed_export() {
+    // Failure-path analog of the above: cleanup must run on the error path
+    // too when the connection is proxied.
+    require_alive(LiveService::Mysql);
+    require_alive(LiveService::ProxySql);
+
+    let pool = proxysql_default_pool();
+    let mut source = MysqlSource::from_pool(pool.clone());
+    assert_eq!(source.proxy_kind(), MysqlProxyKind::ProxySql);
+
+    let result = source.export(
+        &ExportRequest {
+            query: "SELECT 1 AS n UNION ALL SELECT 2",
+            incremental: None,
+            cursor: None,
+            tuning: &tuning_300s(),
+            column_overrides: &ColumnOverrides::default(),
+        },
+        &mut FailOnFirstBatch,
+    );
+    assert!(
+        result.is_err(),
+        "export should have failed via injected sink error"
+    );
+
+    let tz = mysql_session_time_zone(&pool);
+    assert_ne!(
+        tz, "+00:00",
+        "time_zone leaked through ProxySQL after failed export: got {tz:?}"
+    );
+
+    let timeout = mysql_session_max_execution_time(&pool);
+    assert_eq!(
+        timeout, 0,
+        "max_execution_time leaked through ProxySQL after failed export: got {timeout}"
     );
 }

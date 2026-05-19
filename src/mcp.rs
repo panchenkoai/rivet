@@ -1,31 +1,11 @@
 //! MCP (Model Context Protocol) server — read-only DB introspection tools.
 //!
-//! Entry point: `rivet mcp --stdio [--pg-url URL] [--mysql-url URL]`
+//! The public entry point is [`run_stdio`]; it is invoked by the `rivet-mcp`
+//! binary in `src/bin/rivet-mcp.rs`. See that file for client integration
+//! examples (Claude Desktop, Claude Code).
 //!
 //! The server speaks JSON-RPC 2.0 over stdin/stdout (one object per line).
 //! All tools are read-only — no writes, no DDL.
-//!
-//! ## Claude Desktop integration
-//!
-//! Add to `~/Library/Application\ Support/Claude/claude_desktop_config.json`:
-//! ```json
-//! {
-//!   "mcpServers": {
-//!     "rivet": {
-//!       "command": "rivet",
-//!       "args": ["mcp", "--stdio"],
-//!       "env": { "DATABASE_URL": "postgresql://user:pass@localhost/db" }
-//!     }
-//!   }
-//! }
-//! ```
-//!
-//! ## Claude Code integration
-//!
-//! ```bash
-//! claude mcp add rivet -- rivet mcp --stdio
-//! # then set DATABASE_URL in your shell
-//! ```
 
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};

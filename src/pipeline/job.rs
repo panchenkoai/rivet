@@ -54,6 +54,20 @@ fn run_chunked_quality_gate(
     Ok(())
 }
 
+/// Snapshot `pg_stat_database.temp_bytes` for the run's source DB.
+///
+/// `None` for non-Postgres sources (no equivalent counter), or when the
+/// snapshot probe fails (URL unresolvable, connection refused, view filtered).
+/// Failures are silent — this is an observability metric, not a correctness
+/// signal, so a failed probe must never block the actual export.
+fn pg_temp_bytes_snapshot(plan: &ResolvedRunPlan) -> Option<i64> {
+    if !matches!(plan.source.source_type, crate::config::SourceType::Postgres) {
+        return None;
+    }
+    let url = plan.source.resolve_url().ok()?;
+    crate::source::postgres::sample_temp_bytes(&url, plan.source.tls.as_ref())
+}
+
 /// Run `SELECT COUNT(*) FROM ({query})` against the source and compare with exported rows.
 /// Skips reconciliation for incremental exports that used a cursor (moving target).
 fn reconcile_source_count(plan: &ResolvedRunPlan, summary: &mut RunSummary) {
@@ -159,6 +173,7 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
         mode: String::new(),
         compression: String::new(),
         source_count: None,
+        pg_temp_bytes_delta: None,
         reconciled: None,
         journal,
     }
@@ -225,6 +240,11 @@ pub(super) fn run_export_job(
     let rss_sampler = crate::resource::RssPeakSampler::start(rss_before, 100);
     let mut summary = RunSummary::new(&plan);
 
+    // PG cursor / sort spill probe — captured around the actual run window.
+    // Cluster-level counter, so this is a noisy upper bound on a shared host
+    // but accurate on the single-tenant test DBs pilots typically use.
+    let pg_temp_bytes_before = pg_temp_bytes_snapshot(&plan);
+
     // Record plan diagnostics that were already logged above.
     for d in &diags {
         if matches!(
@@ -258,6 +278,25 @@ pub(super) fn run_export_job(
     let rss_after = crate::resource::get_rss_mb();
     summary.duration_ms = start.elapsed().as_millis() as i64;
     summary.peak_rss_mb = rss_peak.max(rss_after).max(rss_before) as i64;
+
+    // Compute the temp_bytes delta only when both snapshots succeeded — partial
+    // failures (e.g. dropped connection between runs) leave the field None so
+    // the summary card omits the line entirely.
+    if let Some(before) = pg_temp_bytes_before
+        && let Some(after) = pg_temp_bytes_snapshot(&plan)
+    {
+        let delta = (after - before).max(0);
+        summary.pg_temp_bytes_delta = Some(delta);
+        if delta > 100 * 1024 * 1024 {
+            log::warn!(
+                "export '{}': PG temp_bytes spill +{:.1} MB during run — cursor / sort overflow. \
+                 Consider lowering `tuning.batch_size` or setting `tuning.batch_size_memory_mb` \
+                 below PG's `work_mem`.",
+                plan.export_name,
+                delta as f64 / (1024.0 * 1024.0),
+            );
+        }
+    }
 
     let tuning_class = plan.tuning.profile_name().to_string();
     let result = run_chunked_quality_gate(result, &plan, &mut summary);
@@ -551,6 +590,7 @@ mod tests {
                 password: None,
                 password_env: None,
                 database: None,
+                environment: None,
                 tuning: None,
                 tls: None,
             },
@@ -584,6 +624,7 @@ mod tests {
             mode: "chunked".into(),
             compression: "none".into(),
             source_count: None,
+            pg_temp_bytes_delta: None,
             reconciled: None,
             journal: RunJournal::new("r", &plan.export_name),
         }

@@ -1,5 +1,15 @@
-use arrow::datatypes::{DataType, SchemaRef};
+//! Tuning profiles and the resolved `SourceTuning` config.
+//!
+//! Three baked-in profiles (`Fast`, `Balanced`, `Safe`) ship per-field defaults;
+//! a YAML `TuningConfig` can override individual fields and the chosen profile.
+//! `from_config_with_default_profile` is the production entry point and is
+//! wired in [`crate::plan::build`] to honour `source.environment:` —
+//! `Local` → `Fast`, `Replica`/`Production` → `Balanced`.
+
+use arrow::datatypes::SchemaRef;
 use serde::{Deserialize, Serialize};
+
+use super::memory::{compute_batch_size_from_memory, estimate_row_bytes};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceTuning {
@@ -15,8 +25,9 @@ pub struct SourceTuning {
     /// Hard cap on a single Arrow batch in MB. `None` = no cap.
     pub max_batch_memory_mb: Option<usize>,
     pub on_batch_memory_exceeded: BatchMemoryPolicy,
-    /// When true, Rivet samples DB pressure metrics every ADAPTIVE_SAMPLE_INTERVAL
-    /// batches and shrinks/restores the fetch size in response. Default: false.
+    /// When true, Rivet samples DB pressure metrics every
+    /// [`super::ADAPTIVE_SAMPLE_INTERVAL`] batches and shrinks/restores the
+    /// fetch size in response. Default: false.
     pub adaptive: bool,
     configured_profile: TuningProfile,
 }
@@ -93,10 +104,22 @@ pub fn merge_tuning_config(
 }
 
 impl SourceTuning {
+    /// Build tuning with the legacy `Balanced` fallback. Public for downstream
+    /// callers and tests; production resolution in [`crate::plan::build`] uses
+    /// [`Self::from_config_with_default_profile`] so that `source.environment:`
+    /// can pick the right default.
+    #[allow(dead_code)]
     pub fn from_config(config: Option<&TuningConfig>) -> Self {
-        let profile = config
-            .and_then(|c| c.profile)
-            .unwrap_or(TuningProfile::Balanced);
+        Self::from_config_with_default_profile(config, TuningProfile::Balanced)
+    }
+
+    /// Like [`Self::from_config`] but lets the caller override the fallback
+    /// profile used when `config.profile` is unset.
+    pub fn from_config_with_default_profile(
+        config: Option<&TuningConfig>,
+        fallback_profile: TuningProfile,
+    ) -> Self {
+        let profile = config.and_then(|c| c.profile).unwrap_or(fallback_profile);
 
         let mut tuning = Self::from_profile(profile);
         tuning.configured_profile = profile;
@@ -190,58 +213,7 @@ impl SourceTuning {
             TuningProfile::Safe => "safe",
         }
     }
-}
 
-impl std::fmt::Display for SourceTuning {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "profile={}, batch_size={}, throttle={}ms, timeout={}s, retries={}, lock_timeout={}s",
-            self.profile_name(),
-            self.batch_size,
-            self.throttle_ms,
-            self.statement_timeout_s,
-            self.max_retries,
-            self.lock_timeout_s,
-        )
-    }
-}
-
-/// Estimate average row size in bytes from an Arrow schema.
-pub fn estimate_row_bytes(schema: &SchemaRef) -> usize {
-    const STRING_ESTIMATE: usize = 256;
-    let mut total: usize = 0;
-    for field in schema.fields() {
-        total += match field.data_type() {
-            DataType::Boolean | DataType::Int8 | DataType::UInt8 => 1,
-            DataType::Int16 | DataType::UInt16 => 2,
-            DataType::Int32 | DataType::UInt32 | DataType::Float32 | DataType::Date32 => 4,
-            DataType::Int64
-            | DataType::UInt64
-            | DataType::Float64
-            | DataType::Date64
-            | DataType::Timestamp(_, _)
-            | DataType::Time64(_)
-            | DataType::Duration(_) => 8,
-            DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => 16,
-            DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
-                STRING_ESTIMATE
-            }
-            _ => 64,
-        };
-        total += 1; // validity bitmap overhead (rounded up)
-    }
-    total.max(1)
-}
-
-/// Compute batch_size from a memory target in MB and estimated row size.
-pub fn compute_batch_size_from_memory(memory_mb: usize, schema: &SchemaRef) -> usize {
-    let row_bytes = estimate_row_bytes(schema);
-    let target = memory_mb * 1024 * 1024 / row_bytes;
-    target.clamp(1_000, 500_000)
-}
-
-impl SourceTuning {
     /// If `batch_size_memory_mb` is set, compute and return an adjusted batch_size
     /// from the schema; otherwise return the configured `batch_size`.
     pub fn effective_batch_size(&self, schema: Option<&SchemaRef>) -> usize {
@@ -297,24 +269,18 @@ impl SourceTuning {
     }
 }
 
-/// Number of batches between adaptive pressure samples.
-pub const ADAPTIVE_SAMPLE_INTERVAL: usize = 10;
-/// Hard floor for the adaptive fetch size — the loop never shrinks below this.
-pub const ADAPTIVE_MIN_BATCH: usize = 500;
-
-/// Decide the next adaptive fetch size from current pressure state.
-///
-/// - Under pressure: shrink to 75 %, but never below [`ADAPTIVE_MIN_BATCH`].
-/// - Otherwise: grow to 125 %, but never above the schema-chosen `base` ceiling
-///   (so we recover toward the initial fetch size without overshooting it).
-///
-/// Pure function — exported so adaptive batch-sizing can be unit-tested without
-/// a live database. Both `PostgresSource` and `MysqlSource` call this.
-pub fn next_adaptive_batch_size(current: usize, base: usize, under_pressure: bool) -> usize {
-    if under_pressure {
-        (current * 3 / 4).max(ADAPTIVE_MIN_BATCH)
-    } else {
-        (current * 5 / 4).min(base)
+impl std::fmt::Display for SourceTuning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "profile={}, batch_size={}, throttle={}ms, timeout={}s, retries={}, lock_timeout={}s",
+            self.profile_name(),
+            self.batch_size,
+            self.throttle_ms,
+            self.statement_timeout_s,
+            self.max_retries,
+            self.lock_timeout_s,
+        )
     }
 }
 
@@ -359,6 +325,29 @@ mod tests {
         assert_eq!(t.max_retries, 3);
         assert_eq!(t.retry_backoff_ms, 2_000);
         assert_eq!(t.lock_timeout_s, 30);
+    }
+
+    #[test]
+    fn fallback_profile_used_when_no_profile_in_config() {
+        let t = SourceTuning::from_config_with_default_profile(None, TuningProfile::Fast);
+        assert_eq!(t.batch_size, 50_000);
+        assert_eq!(t.throttle_ms, 0, "fallback to Fast must zero the throttle");
+        assert_eq!(t.profile_name(), "fast");
+
+        let t = SourceTuning::from_config_with_default_profile(None, TuningProfile::Safe);
+        assert_eq!(t.throttle_ms, 500);
+        assert_eq!(t.profile_name(), "safe");
+    }
+
+    #[test]
+    fn explicit_profile_wins_over_fallback() {
+        let cfg = cfg_with_profile(TuningProfile::Balanced);
+        let t = SourceTuning::from_config_with_default_profile(Some(&cfg), TuningProfile::Fast);
+        assert_eq!(
+            t.throttle_ms, 50,
+            "explicit balanced profile must keep its throttle"
+        );
+        assert_eq!(t.profile_name(), "balanced");
     }
 
     #[test]
@@ -436,39 +425,6 @@ mod tests {
     }
 
     #[test]
-    fn estimate_row_bytes_basic() {
-        use arrow::datatypes::{Field, Schema};
-        use std::sync::Arc;
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", arrow::datatypes::DataType::Int64, false),
-            Field::new("name", arrow::datatypes::DataType::Utf8, true),
-        ]));
-        let est = estimate_row_bytes(&schema);
-        // Int64=8+1, Utf8=256+1 = 266
-        assert_eq!(est, 266);
-    }
-
-    #[test]
-    fn compute_batch_size_clamped() {
-        use arrow::datatypes::{Field, Schema};
-        use std::sync::Arc;
-        // 1 tiny column -> huge batch, clamped to 500_000
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "flag",
-            arrow::datatypes::DataType::Boolean,
-            false,
-        )]));
-        assert_eq!(compute_batch_size_from_memory(256, &schema), 500_000);
-
-        // 100 large string columns -> small batch, clamped to 1_000
-        let fields: Vec<Field> = (0..100)
-            .map(|i| Field::new(format!("c{i}"), arrow::datatypes::DataType::Utf8, true))
-            .collect();
-        let schema = Arc::new(Schema::new(fields));
-        assert_eq!(compute_batch_size_from_memory(1, &schema), 1_000);
-    }
-
-    #[test]
     fn merge_tuning_export_overrides_source_fields() {
         let source = TuningConfig {
             profile: Some(TuningProfile::Fast),
@@ -506,7 +462,7 @@ mod tests {
 
     #[test]
     fn effective_batch_size_with_memory() {
-        use arrow::datatypes::{Field, Schema};
+        use arrow::datatypes::{DataType, Field, Schema};
         use std::sync::Arc;
         let cfg = TuningConfig {
             batch_size_memory_mb: Some(256),
@@ -514,8 +470,8 @@ mod tests {
         };
         let t = SourceTuning::from_config(Some(&cfg));
         let schema = Arc::new(Schema::new(vec![
-            Field::new("id", arrow::datatypes::DataType::Int64, false),
-            Field::new("name", arrow::datatypes::DataType::Utf8, true),
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
         ]));
         let bs = t.effective_batch_size(Some(&schema));
         assert!((1_000..=500_000).contains(&bs), "got {bs}");
@@ -566,72 +522,5 @@ mod tests {
         let t = SourceTuning::from_config(Some(&cfg));
         let r = t.resource_summary();
         assert_eq!(r.batch_size_memory_mb, Some(64));
-    }
-
-    // ── next_adaptive_batch_size ────────────────────────────────────────────
-
-    #[test]
-    fn adaptive_shrinks_by_25_percent_under_pressure() {
-        assert_eq!(next_adaptive_batch_size(10_000, 10_000, true), 7_500);
-        assert_eq!(next_adaptive_batch_size(8_000, 10_000, true), 6_000);
-    }
-
-    #[test]
-    fn adaptive_grows_by_25_percent_when_idle() {
-        // 4_000 × 5/4 = 5_000; well under base ceiling.
-        assert_eq!(next_adaptive_batch_size(4_000, 10_000, false), 5_000);
-    }
-
-    #[test]
-    fn adaptive_recovery_caps_at_base_ceiling() {
-        // 9_000 × 5/4 = 11_250, but base is 10_000 — must clamp.
-        assert_eq!(next_adaptive_batch_size(9_000, 10_000, false), 10_000);
-        // Already at base: stays there.
-        assert_eq!(next_adaptive_batch_size(10_000, 10_000, false), 10_000);
-    }
-
-    #[test]
-    fn adaptive_shrink_respects_min_floor() {
-        // 600 × 3/4 = 450, but ADAPTIVE_MIN_BATCH = 500 — must clamp up.
-        assert_eq!(
-            next_adaptive_batch_size(600, 10_000, true),
-            ADAPTIVE_MIN_BATCH
-        );
-        // Already at floor: stays at floor.
-        assert_eq!(
-            next_adaptive_batch_size(ADAPTIVE_MIN_BATCH, 10_000, true),
-            ADAPTIVE_MIN_BATCH
-        );
-    }
-
-    #[test]
-    fn adaptive_pressure_path_ignores_base_uses_only_floor() {
-        // Pressure path never consults base: shrink is computed from current,
-        // then clamped only to ADAPTIVE_MIN_BATCH. A pathologically low base
-        // does not artificially pin us lower than the floor.
-        // current=ADAPTIVE_MIN_BATCH already at floor; 500*3/4=375 → max(375,500)=500.
-        assert_eq!(
-            next_adaptive_batch_size(ADAPTIVE_MIN_BATCH, 100, true),
-            ADAPTIVE_MIN_BATCH
-        );
-    }
-
-    #[test]
-    fn adaptive_steady_state_oscillation_stays_bounded() {
-        // Simulate 50 sample cycles under sustained pressure, then sustained recovery.
-        // Verifies: the loop never wanders below floor or above base, and converges.
-        let base = 5_000;
-        let mut s = base;
-        for _ in 0..50 {
-            s = next_adaptive_batch_size(s, base, true);
-        }
-        assert_eq!(
-            s, ADAPTIVE_MIN_BATCH,
-            "sustained pressure must converge to floor"
-        );
-        for _ in 0..50 {
-            s = next_adaptive_batch_size(s, base, false);
-        }
-        assert_eq!(s, base, "sustained recovery must converge to base ceiling");
     }
 }

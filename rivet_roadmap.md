@@ -5,6 +5,7 @@ This document is the **single source of truth** for Rivet planning. It consolida
 - the current product direction and validated user pains
 - the **numbered** strategic epics (§5, P0–P3)
 - **execution status**: lettered epics (A–O, M), phase completion, task ✅/⏳, and Definition of Done (§9)
+- packaging, security, trust, release, and external-adoption work that used to live in a separate roadmap
 
 The purpose is to keep Rivet focused on recurring problems in database-first extraction while tracking what is shipped vs open.
 
@@ -371,16 +372,18 @@ These are real annoyances, but they are secondary to safety and trust.
 
 ## Epic 11 — Installation & Packaging
 **Priority:** P2  
+**Status:** ✅ DONE for current distribution baseline — GitHub release binaries, Docker GHCR image, Homebrew tap, crates.io package  
 **Pain coverage:** Pain F
 
 ### Goal
 Make trying and adopting Rivet easier.
 
 ### Deliverables
-- GitHub release binaries
-- Homebrew tap support
-- Docker image
-- improved local quickstart
+- ✅ GitHub release binaries
+- ✅ Homebrew tap support
+- ✅ Docker image
+- ✅ crates.io package (`rivet-cli`)
+- ✅ improved local quickstart and pilot docs
 
 ### Why this matters
 Install friction is real, but only worth optimizing after product direction is clear.
@@ -389,6 +392,7 @@ Install friction is real, but only worth optimizing after product direction is c
 
 ## Epic 12 — Deployment Modes Guidance
 **Priority:** P2  
+**Status:** ✅ Partial — pilot guide, production checklist, Docker/Compose docs, and state backend guidance exist; k8s/Helm remains future  
 **Pain coverage:** Pain F
 
 ### Goal
@@ -397,7 +401,7 @@ Help users choose the right deployment model.
 ### Deliverables
 - docs for local/dev vs durable/prod modes
 - Docker/Compose examples
-- k8s/Helm guidance
+- ⏳ k8s/Helm guidance
 - state backend recommendations
 
 ### Why this matters
@@ -484,6 +488,127 @@ Parallelism is valuable, but automation should come after better planner guidanc
 
 ---
 
+# 5.1 Packaging, Trust, and External Adoption Track
+
+This track replaces the former standalone `rivet_packaging_trust_roadmap.md`.
+Its purpose is not to add extraction surface area; it makes the existing product
+credible to a team evaluating Rivet without help from the author.
+
+## Product trust message
+
+Rivet should be positioned as:
+
+> Safe, resumable, observable database extraction under failure and resource constraints.
+
+Not as:
+
+> PostgreSQL/MySQL to Parquet/CSV exporter.
+
+The stronger message is backed by explicit docs and code paths: plan/apply,
+preflight diagnostics, tuning profiles, state, journal, manifest, reconciliation,
+recovery semantics, quality gates, resource controls, and reliability coverage.
+
+## Completed trust hygiene
+
+| Item | Status | Evidence |
+|---|---|---|
+| Version consistency discipline | ✅ Active | release workflow, `rivet --version`, release tags, changelog/release docs |
+| Security policy | ✅ Done | `SECURITY.md` documents access, artifacts, credentials, TLS, supply chain, reporting |
+| Sensitive artifact hygiene | ✅ Done | README/security docs warn about `.rivet_state.db`, plans, journals, configs, outputs |
+| README top positioning | ✅ Done | README leads with source-safe extraction, scope, non-goals, core promise |
+| Fit / non-fit boundaries | ✅ Done | README and semantics explicitly exclude CDC, SaaS marketplace, k8s platform, loading |
+| Execution semantics contract | ✅ Done | `docs/semantics.md` covers retry, crash, resume, repair, reconcile, non-guarantees |
+| Reliability matrix | ✅ Done | `docs/reliability-matrix.md` separates PR CI, nightly, and manual coverage |
+| Compatibility matrix | ✅ Done | `docs/reference/compatibility.md` covers PG 12-16 and MySQL 5.7/8.0 |
+| Pilot kit | ✅ Done | `docs/pilot/README.md`, quickstarts, demo, walkthrough, production checklist |
+| Benchmark methodology | ✅ Done | `docs/bench/` and best-practices methodology docs capture DB-side signals |
+
+## Remaining trust work
+
+| Work | Priority | Status | Definition of done |
+|---|---|---|---|
+| Release checksums (`SHA256SUMS`) | P1 | ⏳ Open | Every release publishes checksums and README verification instructions |
+| Signed releases / attestations | P2 | ⏳ Open | Release artifacts can be cryptographically verified |
+| SBOM | P2 | ⏳ Open | Release includes SBOM artifact and security docs mention it |
+| 24h+ soak tests | P2 | ⏳ Open | Long-horizon extraction run documented in reliability matrix |
+| Real-cloud destination release smoke | P2 | ⏳ Open | Manual release checklist records real S3/GCS smoke before publish |
+| k8s/Helm deployment guidance | P3 | ⏳ Open | Docs explain supported pattern and non-goals without implying an operator |
+
+## Demo/adoption priorities
+
+The current GIFs and pilot docs cover the minimum adoption story:
+
+1. `docs/gifs/basic.gif` — init, doctor, check, run, state.
+2. `docs/gifs/plan-apply.gif` — sealed plan/apply with credential redaction.
+3. `docs/gifs/reconcile-repair.gif` — chunked reconcile and targeted repair.
+4. `docs/pilot/demo-quickstart.md` — scripted 14-table pilot fixture.
+
+Next demos should focus on proof under pressure rather than happy-path export:
+
+1. **Wide-table memory protection** — show RSS before/after batch caps and `work_mem`-aware FETCH sizing.
+2. **Source-pressure run** — show export under concurrent OLTP writes with DB-side signals.
+3. **Release verification** — once checksums/signing ship, document a clean install verification flow.
+
+---
+
+# 5.2 Production Feedback, v0.5 Stabilization, and Performance Track
+
+This track consolidates the former `rivet_reddit_feedback_roadmap.md`,
+`rivet_v0_5_stabilization_roadmap.md`, and `rivet_performance_roadmap.md`.
+It keeps the production-viability feedback visible without fragmenting planning
+across multiple roadmap files.
+
+## Production feedback status
+
+| Feedback item | Status | Current answer |
+|---|---|---|
+| pgBouncer / pooler safety | ✅ Done | Postgres transaction-pooler detection, `SET LOCAL` scoped inside guarded transactions, pgBouncer live tests, pool-safety coverage |
+| MySQL pooler / multiplexer detection | ✅ Done | `MysqlProxyKind` (Direct, ProxySql, MaxScale, Multiplexed); 4-signal classifier (`PROXYSQL INTERNAL SESSION`, `@@version_comment`, `@@proxy_version`, `CONNECTION_ID()` drift) with 13 unit tests + ProxySQL live tests (`docker compose --profile pool up -d proxysql`) |
+| MySQL live-test symmetry with PG | ✅ Done | 5 paired suites (`live_mysql_crash_recovery`, `live_mysql_chunked_recovery`, `live_mysql_resume`, `live_mysql_schema_drift`, `live_mysql_retry_and_faults`, `live_mysql_reconcile_repair`) — 29 MySQL tests mirror the PG matrix 1:1 for crash points / chunked recovery / resume / schema drift / retry+toxiproxy / reconcile+repair |
+| Session-state cleanup | ✅ Done | Postgres RAII transaction guard; MySQL session variables reset on all paths; seed FK checks cleaned up |
+| OLTP load tests | ✅ Done / ongoing | `live_oltp_load` plus `live_content_load` exercise concurrent writes, checkpoint pressure, MVCC snapshot behavior |
+| Adaptive runtime feedback | ✅ Partial | `tuning.adaptive` reacts to Postgres `checkpoints_req` and MySQL `Innodb_log_waits`; still no `pg_stat_io` / tablespace-level controller |
+| MCP operational visibility | ✅ Done | `rivet-mcp --stdio` (separate binary) exposes read-only Postgres, MySQL, and pgBouncer diagnostics |
+| README/product boundaries | ✅ Done | README states no CDC, no SaaS marketplace, no k8s platform, no loading/transformation |
+
+Open edge: feedback-loop guarantees are intentionally bounded. Rivet is still a
+batch SELECT extractor with adaptive guardrails, not CDC, Arrow Flight SQL, or a
+DB-resource governor.
+
+## v0.5.x stabilization status
+
+| Area | Status | Notes |
+|---|---|---|
+| Batch memory policies | ✅ Done | `max_batch_memory_mb` with `warn`, `fail`, `auto_shrink`; tests and best-practices docs |
+| Row group tuning | ✅ Done | `parquet.row_group_strategy`, target/max row group settings, docs and golden tests |
+| Compression profiles | ✅ Done | `none`, `fast`, `balanced`, `compact`; docs explain CPU/size trade-offs |
+| Quality memory control | ✅ Partial | typed hashing and `unique_max_entries`; future: approximate distinct / default caps |
+| Resume semantics | ✅ Done | stricter `--resume`, recovery docs, chunk checkpoint tests |
+| Resource estimates | ✅ Partial | `rivet plan` shows advisory estimates; future: optional sampling (`plan --sample N`) |
+| Benchmark evidence | ✅ Partial | `docs/bench/` cross-tool harness and DB-side signals; future: release-gated perf budget |
+
+## Performance/resource-control status
+
+| Area | Status | Current implementation / next step |
+|---|---|---|
+| Benchmark matrix | ✅ Partial | `docs/bench/harness/` captures wall/RSS/CPU/output and DB-side signals; keep manual before release |
+| Adaptive batch by row width | ✅ Done | `batch_size_memory_mb`, first-batch observation, Postgres `work_mem` cap, MySQL row buffer cap |
+| Hard Arrow batch cap | ✅ Done | actual Arrow buffer accounting via `get_array_memory_size()` |
+| Quality unique hot path | ✅ Done | typed xxHash3-64 hashing; cap support remains opt-in |
+| Compression presets | ✅ Done | profile-to-codec mapping shipped |
+| Parquet row group tuning | ✅ Done | auto/fixed rows/fixed memory modes |
+| PostgreSQL state optimization | ✅ Done | chunk task/state paths use structured stores and transactional writes |
+| Direct multipart upload | ⏳ Future | optional complexity; current S3/GCS paths use streaming writes |
+
+Near-term resource-control priorities:
+
+1. Add optional `rivet plan --sample N` to replace purely heuristic memory estimates when users can afford a small source probe.
+2. Add a warning when `quality.unique_columns` is configured without `unique_max_entries`.
+3. Promote the DB-signal benchmark harness into the release checklist so source-friendliness regressions are visible before publishing.
+4. Keep `pg_stat_io` / tablespace / IO-concurrency adaptation as future DBA-grade work, not a v0.x guarantee.
+
+---
+
 # 6. Suggested execution order
 
 ## Phase 1 — Make Rivet trustworthy
@@ -557,11 +682,11 @@ This section merges the former `rivet_roadmap_v3.md` task tracker. **Strategic p
 | Epic 5 — Batch/fetch/write control | **M**, tuning | `batch_size`, `max_file_size`, streaming; not full split of row-group vs fetch |
 | Epic 6 — Partition intelligence | **B**, modes | `chunked`, `time_window`, dense surrogate guidance; `chunk_by_days` date-native partitioning ✅ |
 | Epic 7 — Schema drift | **D** (tracking) | `on_schema_drift: warn\|continue\|fail` ✅ |
-| Epic 8 — Shape drift | **N2** (Phase 3 table) | Not started |
+| Epic 8 — Shape drift | **N2** (Phase 3 table) | `export_shape` + `shape_drift_warn_factor` ✅ |
 | Epic 9 — Data contracts | `quality:` YAML | Row bounds, null ratio, uniqueness; chunked aggregate rules |
 | Epic 10 — Config UX | **E**, **J**, misplaced-field validation | Docs + errors |
-| Epic 11 — Packaging | **L** | Release workflow, binaries; Homebrew/Docker = open |
-| Epic 12 — Deployment | docs, `docker-compose` | k8s/Helm, durable state = open |
+| Epic 11 — Packaging | **L** | Release workflow, binaries, Docker GHCR, Homebrew, crates.io ✅ |
+| Epic 12 — Deployment | docs, `docker-compose`, state backend | pilot/production checklist + durable state ✅; k8s/Helm = future |
 | Epic 13 — SSH | **O** | External tunnel docs first; native SSH = future |
 | Epic 14 — Warehouse load | `src/types/`, M1–M6 | Type system + type report + BQ compat ✅; direct load path = future |
 | Epic 15 — CDC | **N** | WAL/binlog = future |
@@ -571,9 +696,9 @@ This section merges the former `rivet_roadmap_v3.md` task tracker. **Strategic p
 
 ---
 
-## 9.2 Current state (post-v0.3.5)
+## 9.2 Current state (0.6.0)
 
-Rivet core is **feature-complete for stable extraction with type safety**. All Wave 1–3 stabilisation epics are shipped; Epic 14 type safety layer (M1–M6) complete; observability layer enhanced with persistent RunJournal.
+Rivet core is **feature-complete for stable extraction with type safety, resource controls, and external trust documentation**. All Wave 1–3 stabilisation epics are shipped; Epic 14 type safety layer (M1–M6) complete; observability layer includes persistent RunJournal; packaging/trust docs now cover security, semantics, reliability, compatibility, pilots, and benchmarks. 0.6.0 adds the `table:` config shortcut, MySQL chunking/memory parity with Postgres, `work_mem`-aware `FETCH` capping, ProxySQL / MaxScale detection, the first published cross-tool benchmark harness (defaults + steelman), and ships the MCP server as a separate `rivet-mcp` binary.
 
 ### Extraction
 
@@ -607,6 +732,7 @@ Rivet core is **feature-complete for stable extraction with type safety**. All W
 - **Persistent** — serialized to `run_journal` SQLite table (migration v7) at end of every run; `store_journal` / `load_journal` / `recent_journals` APIs
 - **`rivet journal --config <file> --export <name>`** — inspect last N runs: per-run header (status, duration, run_id), files/rows/bytes summary, retries, quality issues, schema changes, error first line
 - `--run-id <id>` flag to inspect a specific run
+- **MCP server** — read-only DB introspection tools for Postgres/MySQL/pgBouncer (`pg_stat_activity`, checkpoint pressure, table stats, locks, `pg_stat_statements` IO, processlist, key metrics)
 
 ### Architecture (stabilisation plan — all complete)
 
@@ -624,6 +750,7 @@ Rivet core is **feature-complete for stable extraction with type safety**. All W
 - **CI:** rustfmt, clippy, tests, release build, **E2E** (Docker Compose), cargo audit, semantic gates + `test-type-golden`
 - **Release:** Linux x86_64/arm64, macOS arm64/Intel binaries; Docker GHCR; Homebrew tap
 - **Published:** `rivet-cli` on crates.io
+- **Trust docs:** `SECURITY.md`, `docs/semantics.md`, `docs/reliability-matrix.md`, `docs/reference/compatibility.md`, `docs/pilot/`, `docs/bench/`
 
 ---
 
@@ -794,7 +921,7 @@ Prioritize by stabilization before distribution polish:
 
 ---
 
-## 9.7 Definition of done — stable v0.3.x
+## 9.7 Definition of done — stable v0.5.x
 
 - [x] Auth predictable and documented
 - [x] `rivet check` actionable strategy and safety guidance
@@ -813,3 +940,10 @@ Prioritize by stabilization before distribution polish:
 - [x] Cross-platform release binaries **published** (v0.3.5: Linux x86_64/arm64, macOS arm64/Intel, Docker GHCR, Homebrew tap)
 - [x] E2E matrix in CI
 - [x] Published to crates.io (rivet-cli)
+- [x] Security policy and sensitive-artifact guidance
+- [x] Execution semantics and known non-guarantees documented
+- [x] Reliability and compatibility matrices published
+- [x] Pilot and production-readiness docs published
+- [ ] Release checksums
+- [ ] Signed releases / attestations
+- [ ] SBOM

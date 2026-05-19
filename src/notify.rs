@@ -123,6 +123,7 @@ mod tests {
             mode: "full".into(),
             compression: "zstd".into(),
             source_count: None,
+            pg_temp_bytes_delta: None,
             reconciled: None,
             journal: crate::journal::RunJournal::new("test_run", "test_export"),
         }

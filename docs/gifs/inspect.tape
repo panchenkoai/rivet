@@ -1,9 +1,9 @@
 # Rivet — post-run inspection commands.
-# Attach to docs/getting-started.md § "Inspect results".
+# Attach to docs/getting-started.md § "Inspect & iterate".
 #
-# Fixture: render.sh seeds an incremental export YAML, runs it once against
-# rivet_gif.events so state show / metrics / state files / state progression
-# all have data to display.
+# Fixture: render.sh seeds a chunked export with chunk_checkpoint: true and
+# runs it once against rivet_gif.events so state show / metrics / state files
+# / state progression / journal all have data to display.
 
 Output inspect.gif
 
@@ -43,3 +43,7 @@ Sleep 3s
 Type "rivet state progression --config orders_incremental.yaml"
 Enter
 Sleep 3s
+
+Type "rivet journal --config orders_incremental.yaml --export events --last 1"
+Enter
+Sleep 4s

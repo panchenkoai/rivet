@@ -491,6 +491,7 @@ mod tests {
                 password: None,
                 password_env: None,
                 database: None,
+                environment: None,
                 tuning: None,
                 tls: None,
             },
@@ -524,6 +525,7 @@ mod tests {
             mode: "chunked".into(),
             compression: "none".into(),
             source_count: None,
+            pg_temp_bytes_delta: None,
             reconciled: None,
             journal: RunJournal::new("test_run", &plan.export_name),
         }

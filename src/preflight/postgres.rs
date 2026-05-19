@@ -35,9 +35,13 @@ pub(super) fn diagnose_export_pg(
 }
 
 fn fetch_max_connections_pg(client: &mut postgres::Client) -> Option<u32> {
-    let rows = client
-        .query("SELECT current_setting('max_connections')::int", &[])
-        .ok()?;
+    let rows = match client.query("SELECT current_setting('max_connections')::int", &[]) {
+        Ok(r) => r,
+        Err(e) => {
+            log::debug!("preflight: max_connections probe failed: {e}");
+            return None;
+        }
+    };
     rows.first()?.get::<_, i32>(0).try_into().ok()
 }
 
@@ -84,18 +88,29 @@ fn diagnose_pg(
 
     let (range_min, range_max) = if export.mode == ExportMode::Incremental {
         if let Some(expr) = incremental_key_expr(export, SourceType::Postgres) {
-            let range_query = format!(
-                "SELECT min({expr})::text, max({expr})::text FROM ({base}) AS _rivet",
-                expr = expr,
-                base = base_query,
-            );
+            // Direct min/max on the relation when the user used the `table:`
+            // shortcut — avoids the subquery wrap that PG would materialise
+            // (3.2 GB of temp_files on a 8.6 GB table in our content_items bench).
+            let range_query = match crate::pipeline::chunked::strip_select_star_from(base_query) {
+                Some(tbl) => format!("SELECT min({expr})::text, max({expr})::text FROM {tbl}"),
+                None => format!(
+                    "SELECT min({expr})::text, max({expr})::text FROM ({base_query}) AS _rivet"
+                ),
+            };
             match client.query(&range_query, &[]) {
                 Ok(rows) if !rows.is_empty() => {
                     let min_val: Option<String> = rows[0].get(0);
                     let max_val: Option<String> = rows[0].get(1);
                     (min_val, max_val)
                 }
-                _ => (None, None),
+                Ok(_) => (None, None),
+                Err(e) => {
+                    log::debug!(
+                        "preflight: incremental key range probe failed for export '{}': {e}",
+                        export.name
+                    );
+                    (None, None)
+                }
             }
         } else {
             (None, None)
@@ -141,7 +156,16 @@ fn diagnose_pg(
 
 fn estimate_rows_pg(client: &mut postgres::Client, query: &str) -> Option<i64> {
     let explain = format!("EXPLAIN {}", query);
-    let rows = client.query(&explain, &[]).ok()?;
+    let rows = match client.query(&explain, &[]) {
+        Ok(r) => r,
+        Err(e) => {
+            // Preflight is non-fatal, but a silent .ok()? would hide a real
+            // issue (lock_timeout, missing privilege, syntax in user query) —
+            // surface at debug so `RUST_LOG=debug rivet check` reveals it.
+            log::debug!("preflight: EXPLAIN for row-estimate failed: {e}");
+            return None;
+        }
+    };
     let lines: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
     let plan_text = lines.join("\n");
     parse_pg_row_estimate(&plan_text)
@@ -165,18 +189,23 @@ fn get_cursor_range_pg(
     base_query: &str,
     cursor_col: &str,
 ) -> (Option<String>, Option<String>) {
-    let range_query = format!(
-        "SELECT min({col})::text, max({col})::text FROM ({base}) AS _rivet",
-        col = cursor_col,
-        base = base_query,
-    );
+    let range_query = match crate::pipeline::chunked::strip_select_star_from(base_query) {
+        Some(tbl) => format!("SELECT min({cursor_col})::text, max({cursor_col})::text FROM {tbl}"),
+        None => format!(
+            "SELECT min({cursor_col})::text, max({cursor_col})::text FROM ({base_query}) AS _rivet"
+        ),
+    };
     match client.query(&range_query, &[]) {
         Ok(rows) if !rows.is_empty() => {
             let min_val: Option<String> = rows[0].get(0);
             let max_val: Option<String> = rows[0].get(1);
             (min_val, max_val)
         }
-        _ => (None, None),
+        Ok(_) => (None, None),
+        Err(e) => {
+            log::debug!("preflight: cursor range probe on '{cursor_col}' failed: {e}");
+            (None, None)
+        }
     }
 }
 
@@ -192,7 +221,10 @@ fn analyze_plan_pg(client: &mut postgres::Client, query: &str) -> (Option<String
             let scan_type = extract_scan_type(&plan_text);
             (Some(scan_type), uses_index)
         }
-        Err(_) => (None, false),
+        Err(e) => {
+            log::debug!("preflight: EXPLAIN for plan analysis failed: {e}");
+            (None, false)
+        }
     }
 }
 

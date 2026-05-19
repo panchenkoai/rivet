@@ -13,6 +13,27 @@ use crate::plan::IncrementalCursorPlan;
 use crate::tuning::SourceTuning;
 use crate::types::{ColumnOverrides, CursorState, TypeMapping};
 
+/// Summary of a source table relevant to chunked-mode planning. Source-neutral
+/// shape so plan-build can ask either Postgres or MySQL for the same answer.
+///
+/// Populated by `crate::source::postgres::introspect_pg_table_for_chunking` and
+/// `crate::source::mysql::introspect_mysql_table_for_chunking`. Both helpers
+/// rely on catalog stats (`pg_class` / `information_schema.TABLES`) so the
+/// numbers are only as fresh as the last `ANALYZE` / autoanalyse.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TableIntrospection {
+    /// Name of the single integer-family PK column, if present and safe to
+    /// range-chunk. `None` when the table has no PK, has a composite PK, or
+    /// the PK type is not an integer family (text, uuid, decimal, …).
+    pub single_int_pk: Option<String>,
+    /// Best-effort row count: PG `reltuples`, MySQL `TABLE_ROWS`. `0` means
+    /// the table is empty or stats are unavailable.
+    pub row_estimate: i64,
+    /// Heap-size-per-row in bytes. `None` for empty / unanalysed tables.
+    /// Used to convert `chunk_size_memory_mb` into a row count.
+    pub avg_row_bytes: Option<i64>,
+}
+
 /// Receives schema and batches from a source, one at a time.
 pub trait BatchSink {
     fn on_schema(&mut self, schema: SchemaRef) -> Result<()>;

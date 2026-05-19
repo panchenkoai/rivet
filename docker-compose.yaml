@@ -111,6 +111,15 @@ services:
 
   mysql:
     image: mysql:8.0
+    # `mysql_native_password` is required so the `pool` profile's ProxySQL
+    # service can authenticate to MySQL as `rivet`. ProxySQL 2.5 talks to
+    # backend MySQL over plain TCP, where MySQL 8's default
+    # `caching_sha2_password` requires either TLS or an RSA key exchange that
+    # the backend connection path does not perform. The rust `mysql` driver
+    # used by direct tests handles both plugins, so this only affects auth
+    # — query semantics, performance, and tuning are unchanged.
+    command:
+      - "--default-authentication-plugin=mysql_native_password"
     environment:
       MYSQL_ROOT_PASSWORD: rivet
       MYSQL_USER: rivet
@@ -243,6 +252,38 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  # ---- ProxySQL (MySQL pool safety + multiplexing detection tests) ---------
+  # Single-backend ProxySQL configured to forward to `mysql:3306`.  The
+  # docker-entry config sets up:
+  #   - one backend server (`mysql:3306`, hostgroup 0)
+  #   - one mysql_users row for `rivet/rivet` mapped to hostgroup 0
+  #   - admin user proxysql/admin on the admin interface (port 6032)
+  # so a `mysql -h 127.0.0.1 -P 6033 -urivet -privet` session reaches MySQL.
+  #
+  # Opt in: `docker compose --profile pool up -d proxysql`
+  # The mysql:3306 service is depends_on so it must already exist (it is the
+  # default profile, started by `docker compose up -d mysql`).
+  proxysql:
+    image: proxysql/proxysql:2.5.5
+    profiles: ["pool"]
+    ports:
+      # 6033: client-facing MySQL protocol port; 6032: ProxySQL admin SQL.
+      - "6033:6033"
+      - "6032:6032"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    volumes:
+      - ./dev/proxysql/proxysql.cnf:/etc/proxysql.cnf:ro
+    healthcheck:
+      # Wait for the client-facing 6033 port to accept connections.  ProxySQL's
+      # admin port (6032) comes up first; using 6033 ensures backend wiring is
+      # in place before tests dial in.
+      test: ["CMD-SHELL", "(echo > /dev/tcp/127.0.0.1/6033) >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   toxiproxy:
     image: ghcr.io/shopify/toxiproxy:latest

@@ -48,10 +48,31 @@ fn init_pg_schema_wide_discovers_seeded_table() {
         "seeded table '{}' must appear in emitted YAML; got:\n{yaml}",
         table.name()
     );
-    // Sanity: emitted YAML must mention at least one of our canonical columns.
+    // Stronger than a bare substring check: every export block starts with
+    // `  - name: <export_name>` and `rivet init` defaults the export name to
+    // the table name. If the line is present the seeded table was discovered
+    // *and* turned into its own export — not just mentioned in passing.
+    let expected_export_header = format!("  - name: {}", table.name());
     assert!(
-        yaml.contains("id") && yaml.contains("name"),
-        "emitted YAML must include columns 'id' and 'name' from the seeded table"
+        yaml.contains(&expected_export_header),
+        "seeded table '{}' must own a dedicated export block; expected line `{expected_export_header}`; got:\n{yaml}",
+        table.name()
+    );
+    // 10 rows → `full` is the only mode the planner can pick for a table this
+    // small. Since 0.6.0 (`feat(config): table: shortcut`) full-mode PG
+    // exports on simple identifiers use the `table:` shortcut instead of an
+    // explicit `SELECT col1, col2, ... FROM <table>` block, so we no longer
+    // assert on `id` / `name` column substrings — see CHANGELOG § 0.6.0.
+    assert!(
+        yaml.contains("mode: full"),
+        "schema-wide init must emit `mode: full` for the tiny seeded table; got:\n{yaml}"
+    );
+    // Scaffolded YAML must be structurally complete — every export gets a
+    // `format:` and a `destination:` block. If either is missing the
+    // emitted YAML wouldn't survive `rivet check`.
+    assert!(
+        yaml.contains("    format: parquet") && yaml.contains("    destination:"),
+        "scaffolded YAML must include `format:` + `destination:` for each export; got:\n{yaml}"
     );
 }
 

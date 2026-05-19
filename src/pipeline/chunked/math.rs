@@ -72,6 +72,41 @@ pub(crate) fn build_chunk_query_sql(
         );
     }
 
+    // Fast path: when base_query is the `SELECT * FROM <simple-ident>` form
+    // (typically produced by the `table:` YAML shortcut), append the WHERE
+    // directly instead of wrapping it in a subquery. Three reasons:
+    //
+    // 1. The PG numeric catalog-hint parser only recognises the simple form,
+    //    so declared `numeric(p,s)` types resolve automatically — wrapping
+    //    in `SELECT * FROM (...) AS _rivet` would force every NUMERIC column
+    //    to need a manual `columns:` override.
+    // 2. PG's planner inlines the trivial subquery anyway, but skipping it
+    //    keeps the EXPLAIN output (and chunk_plan_fingerprint) cleaner.
+    // 3. The `table:` form is the only one we can reason about syntactically;
+    //    arbitrary `query:` payloads still go through the subquery wrap so
+    //    we don't accidentally rewrite the user's SQL.
+    if let Some(table_ident) = strip_select_star_from(base_query) {
+        if chunk_by_days {
+            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch is valid");
+            let start_date = epoch + chrono::Duration::days(start);
+            let end_date = epoch + chrono::Duration::days(end + 1);
+            return format!(
+                "SELECT * FROM {table} WHERE {col} >= '{s}' AND {col} < '{e}'",
+                table = table_ident,
+                col = quoted_col,
+                s = start_date.format("%Y-%m-%d"),
+                e = end_date.format("%Y-%m-%d"),
+            );
+        }
+        return format!(
+            "SELECT * FROM {table} WHERE {col} BETWEEN {s} AND {e}",
+            table = table_ident,
+            col = quoted_col,
+            s = start,
+            e = end,
+        );
+    }
+
     if chunk_by_days {
         // start/end are days since epoch; end is inclusive so the exclusive upper bound is end+1.
         let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch is valid");
@@ -93,6 +128,62 @@ pub(crate) fn build_chunk_query_sql(
         start = start,
         end = end,
     )
+}
+
+/// Return the table ident from a `SELECT * FROM <ident>` base query if it
+/// exactly matches that simple shape, otherwise None. Used by the chunked
+/// SQL builder to avoid wrapping the user's query in a subquery when we know
+/// it is just a single-table select — see [`build_chunk_query_sql`] and
+/// [`crate::pipeline::chunked::detect`] for the min/max/COUNT fast-paths.
+///
+/// Acceptance criteria are deliberately strict: any trailing clause (WHERE,
+/// JOIN, comma, alias) → None, so we never rewrite a query the user thought
+/// was filtered.
+pub(crate) fn strip_select_star_from(base_query: &str) -> Option<&str> {
+    let trimmed = base_query.trim();
+    // Case-insensitive prefix match on "SELECT * FROM "
+    let after = strip_prefix_ascii_ci(trimmed, "select")
+        .map(str::trim_start)
+        .and_then(|s| s.strip_prefix('*'))
+        .map(str::trim_start)
+        .and_then(|s| strip_prefix_ascii_ci(s, "from"))?;
+    let rest = after.trim_start();
+    // Ident: `<word>` or `<word>.<word>` with ASCII identifier characters.
+    // Anything more (WHERE, JOIN, alias, comma, semicolon, parenthesis) → None.
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+        .unwrap_or(rest.len());
+    let ident = &rest[..end];
+    // Must look like `name` or `schema.name`, each segment a valid identifier.
+    let parts: Vec<&str> = ident.split('.').collect();
+    if !(1..=2).contains(&parts.len()) {
+        return None;
+    }
+    for p in &parts {
+        let mut chars = p.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+                if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    // No trailing payload allowed (WHERE/JOIN/etc.) — `table:` shortcut
+    // produces nothing after the ident, and that's the only form we promote.
+    if !rest[end..].trim().is_empty() {
+        return None;
+    }
+    Some(ident)
+}
+
+fn strip_prefix_ascii_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        Some(&s[prefix.len()..])
+    } else {
+        None
+    }
 }
 
 pub(crate) fn chunk_plan_fingerprint(
@@ -171,6 +262,89 @@ mod tests {
         // Column name is quoted; numeric bounds are not
         assert!(q.contains("WHERE \"id\" BETWEEN 1 AND 100"), "got: {}", q);
         assert!(!q.contains("ROW_NUMBER()"), "got: {}", q);
+    }
+
+    // ── Fast-path: `SELECT * FROM <ident>` is rewritten in place ──────────
+
+    #[test]
+    fn chunk_query_fast_path_select_star_from_simple_table() {
+        let q = build_chunk_query_sql(
+            "SELECT * FROM public.users",
+            "id",
+            1,
+            100,
+            false,
+            false,
+            crate::config::SourceType::Postgres,
+        );
+        // Fast path: no subquery wrapper — the catalog-hint parser can see
+        // `FROM public.users` and resolve declared numeric(p,s) types.
+        assert_eq!(
+            q,
+            "SELECT * FROM public.users WHERE \"id\" BETWEEN 1 AND 100"
+        );
+    }
+
+    #[test]
+    fn chunk_query_fast_path_unqualified_table() {
+        let q = build_chunk_query_sql(
+            "SELECT * FROM orders",
+            "id",
+            1,
+            10,
+            false,
+            false,
+            crate::config::SourceType::Postgres,
+        );
+        assert_eq!(q, "SELECT * FROM orders WHERE \"id\" BETWEEN 1 AND 10");
+    }
+
+    #[test]
+    fn chunk_query_wraps_when_query_is_not_select_star() {
+        // Anything that's not the exact `SELECT * FROM <ident>` form falls
+        // back to the subquery wrap.
+        for not_fast in [
+            "SELECT id, name FROM users",
+            "SELECT * FROM users u",
+            "SELECT * FROM users WHERE deleted_at IS NULL",
+            "SELECT * FROM users JOIN orders ON users.id = orders.user_id",
+            "SELECT * FROM (SELECT * FROM users) sub",
+        ] {
+            let q = build_chunk_query_sql(
+                not_fast,
+                "id",
+                1,
+                10,
+                false,
+                false,
+                crate::config::SourceType::Postgres,
+            );
+            assert!(
+                q.starts_with("SELECT * FROM ("),
+                "fallback wrap expected for `{not_fast}`; got: {q}"
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_query_fast_path_by_days() {
+        let q = build_chunk_query_sql(
+            "SELECT * FROM public.events",
+            "created_at",
+            18000, // 2019-04-14
+            18001,
+            false,
+            true,
+            crate::config::SourceType::Postgres,
+        );
+        assert!(
+            q.starts_with("SELECT * FROM public.events WHERE \"created_at\" >= '"),
+            "expected fast-path date range; got: {q}"
+        );
+        assert!(
+            !q.contains("AS _rivet"),
+            "fast path should not wrap in subquery; got: {q}"
+        );
     }
 
     #[test]

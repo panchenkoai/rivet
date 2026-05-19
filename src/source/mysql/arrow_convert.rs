@@ -1,3 +1,22 @@
+//! MySQL → Arrow conversion machinery — twin of `postgres/arrow_convert.rs`.
+//!
+//! Everything that turns a `mysql::Row` (driver type) into an Arrow
+//! `RecordBatch` lives here:
+//!
+//! - the `mysql::Column → RivetType → DataType` mapping pipeline
+//!   (`mysql_type_to_rivet`, `mysql_native_type_name`,
+//!   `mysql_schema_and_arrow_types`),
+//! - per-cell decoders for BIT (`bit_bytes_to_u64`), TIME
+//!   (`parse_time_str_to_micros`), and DECIMAL (`mysql_decimal_to_*`),
+//! - the row → array builders (`rows_to_record_batch_typed`, `build_array`).
+//!
+//! Five names cross the module boundary back into [`super`]: the schema +
+//! types factory `mysql_schema_and_arrow_types`, the batch builder
+//! `rows_to_record_batch_typed`, the type-name helper `mysql_native_type_name`
+//! and `mysql_type_to_rivet` (both used by the `Source::type_mappings` impl
+//! in `mod.rs`), and `bit_bytes_to_u64` (referenced by unit tests in
+//! `mod.rs::tests`). Everything else is private to this file.
+
 use std::sync::Arc;
 
 use arrow::array::{
@@ -7,392 +26,17 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use mysql::prelude::*;
-use mysql::{Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts, Value};
+use mysql::Value;
 
-use crate::config::{SourceType, TlsConfig, TlsMode};
 use crate::error::Result;
-use crate::source::query::build_incremental_query;
-use crate::tuning::{ADAPTIVE_SAMPLE_INTERVAL, SourceTuning, next_adaptive_batch_size};
 use crate::types::{
     ColumnOverrides, RivetType, SourceColumn, TimeUnit as RivetTimeUnit, TypeMapping,
     build_arrow_field,
 };
 
-pub struct MysqlSource {
-    pool: Pool,
-    proxy_pooler: bool,
-}
+// ─── Native type names + Rivet type mapping ──────────────────────────────────
 
-/// Pool options that prevent eager pre-connection. The default mysql::Pool
-/// opens `min=10` connections immediately, which overflows MySQL's
-/// max_connections when many parallel exports run simultaneously.
-fn lean_pool_opts() -> PoolOpts {
-    PoolOpts::default()
-        .with_constraints(PoolConstraints::new(1, 100).expect("valid pool constraints"))
-}
-
-/// Detect a MySQL proxy multiplexer (ProxySQL, MaxScale) by checking
-/// `@@version_comment` for the "proxysql" signature and `@@proxy_version`.
-/// Returns false on any error — this is best-effort only.
-fn detect_mysql_proxy(pool: &Pool) -> bool {
-    use mysql::prelude::*;
-    let mut conn = match pool.get_conn() {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let version_comment: Option<String> =
-        conn.query_first("SELECT @@version_comment").unwrap_or(None);
-    if let Some(v) = &version_comment
-        && v.to_ascii_lowercase().contains("proxysql")
-    {
-        return true;
-    }
-    // @@proxy_version is a ProxySQL-specific system variable that does not
-    // exist on vanilla MySQL — its presence is a reliable proxy indicator.
-    let proxy_version: Option<String> = conn.query_first("SELECT @@proxy_version").unwrap_or(None);
-    proxy_version.is_some()
-}
-
-/// Sample the global `Innodb_log_waits` counter — increments when InnoDB has to
-/// wait for redo-log buffer space, indicating write pressure.
-fn mysql_sample_innodb_log_waits(pool: &Pool) -> Option<u64> {
-    use mysql::prelude::*;
-    let mut conn = pool.get_conn().ok()?;
-    conn.query_first::<(String, u64), _>("SHOW GLOBAL STATUS LIKE 'Innodb_log_waits'")
-        .ok()
-        .flatten()
-        .map(|(_, v)| v)
-}
-
-impl MysqlSource {
-    /// Build a source from an existing pool. Useful in tests that need to
-    /// share the pool with post-export state inspection.
-    #[allow(dead_code)]
-    pub fn from_pool(pool: Pool) -> Self {
-        let proxy_pooler = detect_mysql_proxy(&pool);
-        if proxy_pooler {
-            log::warn!(
-                "MySQL proxy multiplexer detected (ProxySQL) — session variables \
-                 set per-connection may not survive multiplexing; use direct connections \
-                 for production exports"
-            );
-        }
-        Self { pool, proxy_pooler }
-    }
-
-    /// Connect with no transport security (legacy path).
-    pub fn connect(url: &str) -> Result<Self> {
-        let opts =
-            Opts::from(OptsBuilder::from_opts(Opts::from_url(url)?).pool_opts(lean_pool_opts()));
-        let pool = Pool::new(opts)?;
-        let proxy_pooler = detect_mysql_proxy(&pool);
-        if proxy_pooler {
-            log::warn!(
-                "MySQL proxy multiplexer detected (ProxySQL) — session variables \
-                 set per-connection may not survive multiplexing; use direct connections \
-                 for production exports"
-            );
-        }
-        Ok(Self { pool, proxy_pooler })
-    }
-
-    /// Connect honoring the user's [`TlsConfig`].
-    pub fn connect_with_tls(url: &str, tls: Option<&TlsConfig>) -> Result<Self> {
-        match tls {
-            Some(cfg) if cfg.mode.is_enforced() => {
-                let base = Opts::from_url(url)?;
-                let ssl = build_mysql_ssl_opts(cfg);
-                let opts = Opts::from(
-                    OptsBuilder::from_opts(base)
-                        .ssl_opts(Some(ssl))
-                        .pool_opts(lean_pool_opts()),
-                );
-                let pool = Pool::new(opts)?;
-                let proxy_pooler = detect_mysql_proxy(&pool);
-                if proxy_pooler {
-                    log::warn!(
-                        "MySQL proxy multiplexer detected (ProxySQL) — session variables \
-                         set per-connection may not survive multiplexing; use direct connections \
-                         for production exports"
-                    );
-                }
-                Ok(Self { pool, proxy_pooler })
-            }
-            _ => Self::connect(url),
-        }
-    }
-}
-
-/// Build a MySQL connection pool honoring the configured TLS policy.
-///
-/// Shared by preflight, doctor, init, and anywhere else we need a pool outside
-/// the `Source` trait. `tls = None` falls back to plaintext (legacy behavior).
-pub(crate) fn connect_pool(url: &str, tls: Option<&TlsConfig>) -> Result<Pool> {
-    match tls {
-        Some(cfg) if cfg.mode.is_enforced() => {
-            let base = Opts::from_url(url)?;
-            let ssl = build_mysql_ssl_opts(cfg);
-            let opts = Opts::from(
-                OptsBuilder::from_opts(base)
-                    .ssl_opts(Some(ssl))
-                    .pool_opts(lean_pool_opts()),
-            );
-            Ok(Pool::new(opts)?)
-        }
-        _ => {
-            let opts = Opts::from(
-                OptsBuilder::from_opts(Opts::from_url(url)?).pool_opts(lean_pool_opts()),
-            );
-            Ok(Pool::new(opts)?)
-        }
-    }
-}
-
-fn build_mysql_ssl_opts(cfg: &TlsConfig) -> SslOpts {
-    let mut ssl = SslOpts::default();
-    if let Some(path) = &cfg.ca_file {
-        ssl = ssl.with_root_cert_path(Some(std::path::PathBuf::from(path)));
-    }
-    match cfg.mode {
-        TlsMode::Require => {
-            ssl = ssl
-                .with_danger_accept_invalid_certs(true)
-                .with_danger_skip_domain_validation(true);
-        }
-        TlsMode::VerifyCa => {
-            ssl = ssl.with_danger_skip_domain_validation(true);
-        }
-        TlsMode::VerifyFull => {
-            // Strict: verify chain + hostname.
-        }
-        TlsMode::Disable => {
-            // Never invoked: gated in connect_with_tls.
-        }
-    }
-    if cfg.accept_invalid_certs {
-        ssl = ssl.with_danger_accept_invalid_certs(true);
-    }
-    if cfg.accept_invalid_hostnames {
-        ssl = ssl.with_danger_skip_domain_validation(true);
-    }
-    ssl
-}
-
-/// Execute the MySQL query and stream results to sink.
-///
-/// Separated from export() so session-state cleanup (time_zone, max_execution_time)
-/// can run unconditionally in the caller regardless of success or failure.
-///
-/// `sample_pool`: when `tuning.adaptive` is true, a clone of the source pool used
-/// to obtain a second connection for `Innodb_log_waits` sampling without interfering
-/// with the streaming result set on `conn`.
-fn mysql_run_export(
-    conn: &mut mysql::PooledConn,
-    sample_pool: Option<Pool>,
-    sql: &str,
-    cursor_param: Option<&str>,
-    tuning: &SourceTuning,
-    column_overrides: &ColumnOverrides,
-    sink: &mut dyn super::BatchSink,
-) -> Result<usize> {
-    // SecOps: cursor value is bound via exec_iter rather than string-interpolated.
-    // Using exec_iter uniformly (even with empty params) keeps match arms
-    // type-compatible — query_iter returns a Text-protocol result, exec_iter Binary.
-    let mut result = match cursor_param {
-        Some(val) => conn.exec_iter(sql, (val,))?,
-        None => conn.exec_iter(sql, ())?,
-    };
-    let columns = result.columns().as_ref().to_vec();
-
-    // Compute TypeMappings once; derive both the Arrow schema and the
-    // per-column DataType vec from the same source so they can never diverge.
-    let (schema, arrow_types) = mysql_schema_and_arrow_types(&columns, column_overrides)?;
-    let schema = Arc::new(schema);
-
-    sink.on_schema(schema.clone())?;
-
-    let mut effective_bs = tuning.effective_batch_size(Some(&schema));
-    let base_fetch_size = effective_bs;
-    let mut adaptive_last_waits: Option<u64> = if tuning.adaptive {
-        sample_pool.as_ref().and_then(mysql_sample_innodb_log_waits)
-    } else {
-        None
-    };
-    let mut batch_count: usize = 0;
-    let row_set = result
-        .iter()
-        .ok_or_else(|| anyhow::anyhow!("no result set"))?;
-    let mut row_buf: Vec<mysql::Row> = Vec::with_capacity(effective_bs);
-    let mut total_rows: usize = 0;
-
-    for row_result in row_set {
-        let row = row_result?;
-        row_buf.push(row);
-
-        if row_buf.len() >= effective_bs {
-            total_rows += row_buf.len();
-            batch_count += 1;
-            let batch = rows_to_record_batch_typed(&schema, &arrow_types, &row_buf)?;
-            sink.on_batch(&batch)?;
-            row_buf.clear();
-
-            if tuning.adaptive
-                && batch_count.is_multiple_of(ADAPTIVE_SAMPLE_INTERVAL)
-                && let Some(ref pool) = sample_pool
-                && let Some(cur) = mysql_sample_innodb_log_waits(pool)
-            {
-                let under_pressure = adaptive_last_waits.is_some_and(|prev| cur > prev);
-                adaptive_last_waits = Some(cur);
-                let next = next_adaptive_batch_size(effective_bs, base_fetch_size, under_pressure);
-                if next != effective_bs {
-                    effective_bs = next;
-                    log::info!(
-                        "adaptive batch size → {} ({})",
-                        effective_bs,
-                        if under_pressure {
-                            "pressure"
-                        } else {
-                            "recovery"
-                        }
-                    );
-                }
-            }
-
-            log::info!("fetched {} rows so far...", total_rows);
-
-            if tuning.throttle_ms > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(tuning.throttle_ms));
-            }
-        }
-    }
-
-    if !row_buf.is_empty() {
-        total_rows += row_buf.len();
-        let batch = rows_to_record_batch_typed(&schema, &arrow_types, &row_buf)?;
-        sink.on_batch(&batch)?;
-    }
-
-    drop(result);
-    Ok(total_rows)
-}
-
-impl super::Source for MysqlSource {
-    fn export(
-        &mut self,
-        request: &super::ExportRequest<'_>,
-        sink: &mut dyn super::BatchSink,
-    ) -> Result<()> {
-        let built = build_incremental_query(
-            request.query,
-            request.incremental,
-            request.cursor,
-            SourceType::Mysql,
-        );
-        log::debug!(
-            "executing query (connection={}): {}",
-            if self.proxy_pooler {
-                "proxy-multiplexed"
-            } else {
-                "direct"
-            },
-            built.sql
-        );
-
-        let mut conn = self.pool.get_conn()?;
-
-        // Roadmap §13: normalize TIMESTAMP columns to UTC so Parquet writes
-        // isAdjustedToUTC=true. SET per-connection (not global) to avoid side-effects.
-        conn.query_drop("SET time_zone = '+00:00'")?;
-
-        if request.tuning.statement_timeout_s > 0 {
-            conn.query_drop(format!(
-                "SET SESSION max_execution_time = {}",
-                request.tuning.statement_timeout_s * 1000
-            ))?;
-        }
-
-        let sample_pool = if request.tuning.adaptive {
-            Some(self.pool.clone())
-        } else {
-            None
-        };
-        let result = mysql_run_export(
-            &mut conn,
-            sample_pool,
-            &built.sql,
-            built.cursor_param.as_deref(),
-            request.tuning,
-            request.column_overrides,
-            sink,
-        );
-
-        // Always reset session state before connection returns to pool,
-        // regardless of whether the export succeeded or failed.
-        let _ = conn.query_drop("SET time_zone = @@global.time_zone");
-        if request.tuning.statement_timeout_s > 0 {
-            let _ = conn.query_drop("SET SESSION max_execution_time = 0");
-        }
-
-        let total_rows = result?;
-        log::info!("total: {} rows", total_rows);
-        Ok(())
-    }
-
-    fn query_scalar(&mut self, sql: &str) -> Result<Option<String>> {
-        use mysql::prelude::*;
-        let mut conn = self.pool.get_conn()?;
-        let row: Option<mysql::Row> = conn.query_first(sql)?;
-        match row {
-            Some(r) => {
-                let val: Option<mysql::Value> = r.get(0);
-                match val {
-                    Some(mysql::Value::Bytes(b)) => {
-                        Ok(Some(String::from_utf8_lossy(&b).into_owned()))
-                    }
-                    Some(mysql::Value::Int(v)) => Ok(Some(v.to_string())),
-                    Some(mysql::Value::UInt(v)) => Ok(Some(v.to_string())),
-                    Some(mysql::Value::Float(v)) => Ok(Some(v.to_string())),
-                    Some(mysql::Value::Double(v)) => Ok(Some(v.to_string())),
-                    _ => Ok(None),
-                }
-            }
-            None => Ok(None),
-        }
-    }
-
-    fn type_mappings(
-        &mut self,
-        query: &str,
-        column_overrides: &ColumnOverrides,
-    ) -> Result<Vec<crate::types::TypeMapping>> {
-        use mysql::prelude::*;
-        let wrapped = format!("SELECT * FROM ({}) AS _rivet_type_probe LIMIT 0", query);
-        let mut conn = self.pool.get_conn()?;
-        let result = conn.exec_iter(&wrapped, ())?;
-        let columns = result.columns().as_ref().to_vec();
-        drop(result);
-        let mappings = columns
-            .iter()
-            .map(|col| {
-                let rivet = column_overrides
-                    .get(col.name_str().as_ref())
-                    .cloned()
-                    .unwrap_or_else(|| mysql_type_to_rivet(col));
-                let source = crate::types::SourceColumn::simple(
-                    col.name_str().as_ref(),
-                    mysql_native_type_name(col),
-                    true,
-                );
-                crate::types::TypeMapping::from_source(&source, rivet)
-            })
-            .collect();
-        Ok(mappings)
-    }
-}
-
-/// Human-readable MySQL type name for error messages and Arrow metadata.
-fn mysql_native_type_name(col: &mysql::Column) -> &'static str {
+pub(super) fn mysql_native_type_name(col: &mysql::Column) -> &'static str {
     use mysql::consts::ColumnType::*;
     match col.column_type() {
         MYSQL_TYPE_TINY => "tinyint",
@@ -431,7 +75,7 @@ fn mysql_native_type_name(col: &mysql::Column) -> &'static str {
 /// - `TINYINT(1)` / `BOOL` / `BOOLEAN` → `RivetType::Bool` (display-width 1 = MySQL boolean convention).
 /// - `TINYINT` (other widths) → `RivetType::Int16`.
 /// - `BIT(1)` → `RivetType::Bool`; `BIT(n>1)` → `RivetType::Int64` (avoids silent bit-truncation).
-fn mysql_type_to_rivet(col: &mysql::Column) -> RivetType {
+pub(super) fn mysql_type_to_rivet(col: &mysql::Column) -> RivetType {
     use mysql::consts::ColumnType::*;
     match col.column_type() {
         // BOOL / BOOLEAN in MySQL is TINYINT(1); display width == 1 is the canonical signal.
@@ -517,7 +161,7 @@ fn mysql_type_to_rivet(col: &mysql::Column) -> RivetType {
 /// identical — mismatches would cause `RecordBatch::try_new` to panic.
 ///
 /// `column_overrides` takes priority over autodetection.
-fn mysql_schema_and_arrow_types(
+pub(super) fn mysql_schema_and_arrow_types(
     columns: &[mysql::Column],
     column_overrides: &ColumnOverrides,
 ) -> crate::error::Result<(Schema, Vec<DataType>)> {
@@ -563,7 +207,9 @@ fn mysql_schema_and_arrow_types(
     Ok((Schema::new(fields), arrow_types))
 }
 
-fn rows_to_record_batch_typed(
+// ─── Row → RecordBatch dispatcher + per-type builders ────────────────────────
+
+pub(super) fn rows_to_record_batch_typed(
     schema: &SchemaRef,
     arrow_types: &[DataType],
     rows: &[mysql::Row],
@@ -581,7 +227,7 @@ fn bytes_to_str(b: &[u8]) -> Option<&str> {
 
 /// Interpret raw big-endian bytes from a MySQL BIT column as an unsigned integer.
 /// MySQL sends BIT(n) values as ceil(n/8) big-endian bytes in the binary protocol.
-fn bit_bytes_to_u64(b: &[u8]) -> u64 {
+pub(super) fn bit_bytes_to_u64(b: &[u8]) -> u64 {
     b.iter().fold(0u64, |acc, &byte| acc << 8 | u64::from(byte))
 }
 
@@ -837,6 +483,8 @@ fn build_array(
     }
 }
 
+// ─── DECIMAL → Decimal128 / Decimal256 ───────────────────────────────────────
+
 /// Build a `Decimal128Array` from MySQL DECIMAL column bytes (text protocol).
 fn mysql_decimal_to_decimal128(
     precision: u8,
@@ -902,27 +550,4 @@ fn mysql_decimal_to_decimal256(
     Ok(Arc::new(
         b.finish().with_precision_and_scale(precision, scale)?,
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::bit_bytes_to_u64;
-
-    #[test]
-    fn bit_bytes_single_byte() {
-        assert_eq!(bit_bytes_to_u64(&[0x00]), 0);
-        assert_eq!(bit_bytes_to_u64(&[0x01]), 1);
-        assert_eq!(bit_bytes_to_u64(&[0xFF]), 255);
-    }
-
-    #[test]
-    fn bit_bytes_multi_byte() {
-        assert_eq!(bit_bytes_to_u64(&[0x01, 0x02]), 258);
-        assert_eq!(bit_bytes_to_u64(&[0xFF; 8]), u64::MAX);
-    }
-
-    #[test]
-    fn bit_bytes_empty() {
-        assert_eq!(bit_bytes_to_u64(&[]), 0);
-    }
 }

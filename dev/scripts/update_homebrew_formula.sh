@@ -173,7 +173,9 @@ class Rivet < Formula
   end
 
   def install
+    # Both binaries shipped from 0.6.0 onwards.
     bin.install "rivet"
+    bin.install "rivet-mcp" if File.exist?("rivet-mcp")
   end
 
   test do

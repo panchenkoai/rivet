@@ -8,7 +8,7 @@
 
 mod aggregate;
 mod apply_cmd;
-mod chunked;
+pub(crate) mod chunked;
 mod cli;
 pub(crate) mod ipc;
 mod job;
@@ -573,6 +573,7 @@ mod tests {
                 password: None,
                 password_env: None,
                 database: None,
+                environment: None,
                 tuning: None,
                 tls: None,
             },

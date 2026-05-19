@@ -24,6 +24,10 @@ pub mod state;
 pub mod tuning;
 pub mod types;
 
+// Public for the `rivet-mcp` binary in src/bin/. Not part of any external
+// API contract — same "internal, may change at any patch" disclaimer applies.
+pub mod mcp;
+
 // pub(crate) — internal implementation modules; not part of any external API contract
 pub(crate) mod destination;
 pub(crate) mod enrich;
@@ -33,9 +37,16 @@ pub(crate) mod plan;
 // Activated by the `RIVET_TEST_PANIC_AT` env var; no-op otherwise.  See
 // module docs for details.
 pub(crate) mod test_hook;
-// preflight functions are invoked from main.rs (binary), not from the lib target;
-// #[allow(dead_code)] suppresses false-positive lint in the lib compilation unit.
-#[allow(dead_code)]
-pub(crate) mod preflight;
+// Preflight diagnostics. The `check` and `doctor` entry points are invoked
+// from `src/cli/dispatch.rs` (binary-only) and the internal
+// `get_export_diagnostic` is used by `pipeline::plan_cmd` (lib + binary).
+//
+// We expose this as `pub mod` rather than `pub(crate) mod` so dead-code
+// analysis sees the entry points as part of the crate's public API. Without
+// that, the lib compilation unit (which doesn't depend on `cli::dispatch`)
+// would mark the entire transitive surface as dead and force a blanket
+// `#[allow(dead_code)]` that silences genuine dead code inside the module.
+// Same "no external API contract" disclaimer as the other lib modules.
+pub mod preflight;
 pub(crate) mod quality;
 pub(crate) mod sql;

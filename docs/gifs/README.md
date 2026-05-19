@@ -35,6 +35,12 @@ Destination-specific:
 |-----|----------|--------|
 | [doctor-gcs.gif](doctor-gcs.gif) | `rivet doctor` + `rivet run` against real Google Cloud Storage via Application Default Credentials; final `gcloud storage ls` confirms `.rivet_doctor_probe` + Parquet (≈18 s). Requires `gcloud auth application-default login` and write access to `$GCS_DEMO_BUCKET` (default `rivet_data_test`). | [doctor-gcs.tape](doctor-gcs.tape) |
 
+Operational warnings:
+
+| GIF | Scenario | Source |
+|-----|----------|--------|
+| [pool-detect.gif](pool-detect.gif) | Connect-time pooler / proxy detection: direct PG (silent) → pgBouncer (transaction-mode warning) → direct MySQL (silent) → ProxySQL (`MysqlProxyKind::ProxySql` warning). Requires the `pool` docker-compose profile (`docker compose --profile pool up -d pgbouncer proxysql`); ≈18 s. | [pool-detect.tape](pool-detect.tape) |
+
 They are linked from the user-facing guides (see "Where they appear" below)
 and are intentionally terminal-only: no narration, no cursor movement, no UI
 chrome. They show exactly what `rivet` prints.
@@ -73,16 +79,23 @@ Or just one:
 ./docs/gifs/render.sh discover-artifact
 ./docs/gifs/render.sh plan-campaign     # creates ~35 M rows in rivet_gif.*
 ./docs/gifs/render.sh parallel-cards    # 4 chunked exports, parent-side cards UI
+./docs/gifs/render.sh pool-detect       # connect-time pooler/proxy warnings; see below
 ./docs/gifs/render.sh doctor-gcs        # real GCS via ADC; see below
 ```
 
-The default `render.sh` invocation (no args) renders the ten "always
+The default `render.sh` invocation (no args) renders the eleven "always
 reproducible" scenarios against Docker Compose (setup per scenario is
 ephemeral — tables live under a dedicated `rivet_gif` schema that is
-dropped on teardown). `doctor-gcs` is **not** in that list — it needs
-`gcloud auth application-default login` and a writable bucket, so it is
-opt-in. `plan-campaign` takes ~60 s because it seeds 35 M narrow rows so
-the cost-class classifier triggers `shared_source_heavy_conflict`.
+dropped on teardown). Two scenarios are opt-in:
+
+- **`pool-detect`** needs the `pool` docker-compose profile up so
+  pgBouncer (6432) and ProxySQL (6033) are reachable:
+  `docker compose --profile pool up -d pgbouncer proxysql`.
+- **`doctor-gcs`** needs `gcloud auth application-default login` and a
+  writable bucket.
+
+`plan-campaign` takes ~60 s because it seeds 35 M narrow rows so the
+cost-class classifier triggers `shared_source_heavy_conflict`.
 
 `render.sh` creates an ephemeral `/tmp/rivet-gif-<name>` workdir, seeds any
 fixture the scenario needs (the `reconcile-repair` tape uses a dedicated
@@ -110,14 +123,11 @@ deterministic regardless of the user's shell rc.
 ## Where they appear
 
 - [README.md](../../README.md) — top-level table of contents.
-- [docs/README.md](../README.md) — "Start Here" section.
-- [docs/getting-started.md](../getting-started.md):
-  - `basic.gif` at "Walkthrough at a glance".
-  - `init-scaffold.gif` in Step 3 (`rivet init`).
-  - `check-verdict.gif` in Step 5 (`rivet check`).
-  - `plan-apply.gif` in Step 6 (optional plan/apply).
-  - `inspect.gif` in Step 7 (inspect results).
-  - `reconcile-repair.gif` in Step 8 (reconcile / repair).
+- [docs/README.md](../README.md) — "Start here" section.
+- [docs/getting-started.md](../getting-started.md) (current 4-step layout):
+  - `basic.gif` in §3 "Preflight & run".
+  - `check-verdict.gif` in §3 (right after the `rivet check` block).
+  - `inspect.gif` in §4 "Inspect & iterate".
 - [docs/reference/cli.md](../reference/cli.md) — `plan-apply.gif` next to
   `rivet plan`, `reconcile-repair.gif` next to `rivet reconcile`,
   `parallel-cards.gif` next to `rivet run --parallel-export-processes`.
@@ -132,14 +142,13 @@ deterministic regardless of the user's shell rc.
   "Discovery artifact".
 - [docs/planning/prioritization.md](../planning/prioritization.md) —
   `plan-campaign.gif` in "Viewing the output".
-- [docs/pilot/quickstart-postgres.md](../pilot/quickstart-postgres.md) /
-  [docs/pilot/quickstart-mysql.md](../pilot/quickstart-mysql.md) —
-  `basic.gif` at the top.
 - [docs/pilot/pilot-walkthrough.md](../pilot/pilot-walkthrough.md) —
   `init-scaffold.gif` (Step 1), `plan-apply.gif` (Step 3),
   `inspect.gif` (Step 5), `reconcile-repair.gif` (Steps 6–8).
 - [docs/pilot/demo-quickstart.md](../pilot/demo-quickstart.md) —
   `plan-apply.gif` (Step 3), `reconcile-repair.gif` (Step 4).
+- [docs/pilot/production-checklist.md](../pilot/production-checklist.md) —
+  `pool-detect.gif` in "Connection poolers and proxies".
 
 If you update a tape, re-render, and commit **both** the `.tape` and the
 `.gif` together. The tape is the source; the GIF is the build artifact.
