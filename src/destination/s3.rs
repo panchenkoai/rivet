@@ -61,7 +61,7 @@ impl S3Destination {
             }
             .from_profile()
             .from_env();
-            let loader = reqsign::AwsDefaultLoader::new(reqwest_012::Client::new(), cred_config);
+            let loader = reqsign::AwsDefaultLoader::new(reqwest::Client::new(), cred_config);
             builder = builder.customized_credential_load(Box::new(loader));
         }
 
