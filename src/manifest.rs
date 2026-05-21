@@ -37,6 +37,50 @@ pub const SUCCESS_FILENAME: &str = "_SUCCESS";
 /// Layout: `<prefix>/_quarantine/<run_id>/<original-name>`.
 pub const QUARANTINE_PREFIX: &str = "_quarantine";
 
+/// Compute the body of the `_SUCCESS` marker for a given serialized manifest.
+///
+/// Format: a single line `"xxh3:<16-hex>\n"`.  ADR-0012 M2 — `_SUCCESS`
+/// carries the manifest fingerprint so an orchestrator can detect manifest
+/// changes (rerun, resume that completed, repair) with a cheap `GET _SUCCESS`
+/// instead of refetching the full manifest body.
+///
+/// `manifest_bytes` must be the exact bytes that were written to `manifest.json`
+/// — usually the result of `serde_json::to_vec_pretty(&RunManifest)`.  The
+/// caller is responsible for using the same bytes for both writes; computing
+/// the fingerprint from a re-serialized struct would risk encoding drift
+/// (key ordering, whitespace) producing a different hash.
+pub fn success_marker_body(manifest_bytes: &[u8]) -> String {
+    use xxhash_rust::xxh3::xxh3_64;
+    format!("xxh3:{:016x}\n", xxh3_64(manifest_bytes))
+}
+
+/// Parse the fingerprint out of a `_SUCCESS` marker body.
+///
+/// Returns `Some("xxh3:<hex>")` on a well-formed marker, `None` on anything
+/// else (empty file, missing prefix, wrong length, non-hex body).  Trailing
+/// whitespace and newlines are tolerated to match the on-wire shape produced
+/// by [`success_marker_body`].
+///
+/// Used by `--validate` and by external polling consumers (Airflow sensors,
+/// CI checks) to decide whether a cached manifest is still current.
+pub fn parse_success_marker(body: &str) -> Option<&str> {
+    let trimmed = body.trim_end_matches(|c: char| c.is_ascii_whitespace());
+    if trimmed.len() != "xxh3:".len() + 16 {
+        return None;
+    }
+    let (prefix, hex) = trimmed.split_at("xxh3:".len());
+    if prefix != "xxh3:" {
+        return None;
+    }
+    if !hex
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
+        return None;
+    }
+    Some(trimmed)
+}
+
 /// Public, stable JSON shape for the run manifest.
 ///
 /// One manifest is written per `run_id` per export.  See ADR-0012 M4
@@ -362,6 +406,68 @@ mod tests {
         m.status = ManifestStatus::Interrupted;
         let json = serde_json::to_string(&m).unwrap();
         assert!(json.contains("\"status\":\"interrupted\""));
+    }
+
+    // ── success marker ─────────────────────────────────────────────────────
+
+    #[test]
+    fn success_marker_body_is_xxh3_prefix_plus_16_hex_plus_newline() {
+        let body = success_marker_body(b"some manifest bytes");
+        assert!(body.starts_with("xxh3:"), "body = {body:?}");
+        assert!(body.ends_with('\n'), "body = {body:?}");
+        let trimmed = body.trim_end();
+        let hex = &trimmed["xxh3:".len()..];
+        assert_eq!(hex.len(), 16, "body = {body:?}");
+        assert!(
+            hex.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+    }
+
+    #[test]
+    fn success_marker_body_is_deterministic_for_same_input() {
+        let a = success_marker_body(b"hello");
+        let b = success_marker_body(b"hello");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn success_marker_body_differs_for_different_manifest_bytes() {
+        let a = success_marker_body(b"manifest one");
+        let b = success_marker_body(b"manifest two");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn parse_success_marker_roundtrips_with_writer() {
+        let body = success_marker_body(b"some manifest bytes");
+        let fp = parse_success_marker(&body).expect("must parse");
+        assert!(fp.starts_with("xxh3:"));
+        assert_eq!(fp.len(), "xxh3:".len() + 16);
+    }
+
+    #[test]
+    fn parse_success_marker_rejects_malformed_bodies() {
+        assert_eq!(parse_success_marker(""), None);
+        assert_eq!(parse_success_marker("\n"), None);
+        assert_eq!(parse_success_marker("sha256:0123456789abcdef"), None);
+        // Wrong hex length:
+        assert_eq!(parse_success_marker("xxh3:0123\n"), None);
+        // Uppercase hex (we emit lowercase; reject to keep the format strict):
+        assert_eq!(parse_success_marker("xxh3:0123456789ABCDEF\n"), None);
+        // Non-hex body:
+        assert_eq!(parse_success_marker("xxh3:zzzzzzzzzzzzzzzz\n"), None);
+        // Missing prefix:
+        assert_eq!(parse_success_marker("0123456789abcdef\n"), None);
+    }
+
+    #[test]
+    fn parse_success_marker_tolerates_trailing_whitespace() {
+        let body = "xxh3:0123456789abcdef\n";
+        assert_eq!(parse_success_marker(body), Some("xxh3:0123456789abcdef"));
+        // CRLF on Windows, double newline, trailing spaces — all fine.
+        let body = "xxh3:0123456789abcdef\r\n";
+        assert_eq!(parse_success_marker(body), Some("xxh3:0123456789abcdef"));
     }
 
     #[test]

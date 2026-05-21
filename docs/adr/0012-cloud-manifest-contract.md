@@ -66,13 +66,15 @@ Rationale: `_SUCCESS` is the single observable signal an external orchestrator (
 
 Recovery: a process killed between manifest-write and `_SUCCESS`-write leaves the prefix with a manifest but no `_SUCCESS`. Resume treats this as "candidate complete; re-verify before finalizing". Re-verification reads the manifest, checks each part, and writes `_SUCCESS` only if all checks pass.
 
+`_SUCCESS` body: a single line `xxh3:<16-hex>\n` carrying the manifest's content fingerprint (xxh3_64 over the exact bytes of `manifest.json`). This lets a polling consumer detect manifest changes (rerun, resume, repair) with a cheap `GET _SUCCESS` instead of re-reading the full manifest. The Hadoop empty-marker convention is **not** followed — Rivet does not target the Hadoop ecosystem and the fingerprint pays for itself the first time an Airflow sensor needs to distinguish "same successful run" from "new successful run at the same prefix".
+
 ### M3 — Part Identity Triple (PIT)
 
 > Every part referenced by the manifest is uniquely identified by `(path, size_bytes, content_fingerprint)`.
 
 The triple is recorded for each part. On resume, a part is considered the same as the manifested part if and only if all three components match. A part whose path matches but whose size or fingerprint differs is treated as corrupt or stale and quarantined (M9).
 
-`content_fingerprint` is xxh3_64 over the part body. xxh3 was chosen because the codebase already depends on `xxhash-rust` and it is fast enough to compute alongside the write.
+`content_fingerprint` is `xxh3_64` over the part body, formatted `"xxh3:<16-hex>"`. xxh3 was chosen because (a) the codebase already depends on `xxhash-rust`, (b) it streams at ~2 GB/s so the per-part cost is negligible against destination upload latency, and (c) **the manifest is a trust contract for integrity, not for security** — cryptographic hashes (sha256, blake3) are explicitly out of scope. The encryption / tamper-evidence track is deferred to a separate ADR if and when needed; until then, the `xxh3:` prefix in the on-wire format reserves the syntactic slot so a future cryptographic hasher can coexist without a schema break.
 
 For 0.7.0, fingerprint is mandatory for new manifests. Pre-0.7.0 runs have no fingerprint and fall under M6.
 
@@ -132,15 +134,17 @@ Decision matrix per part name:
 
 `_SUCCESS` present + no `--force` → refuse to start (operator must opt in to overwrite a successful run).
 
-### M9 — Untracked / Corrupt Parts Are Quarantined, Not Deleted
+### M9 — Untracked / Corrupt Parts Are Quarantined Best-Effort, Never Deleted
 
-> When resume finds an unknown or fingerprint-mismatch part, it is moved to a quarantine prefix and a warning is emitted. Rivet does not delete unknown objects.
+> When resume finds an unknown or fingerprint-mismatch part, Rivet attempts to move it to a quarantine prefix and emits a warning. The move is **best-effort**: if it fails, the run still proceeds, the warning escalates, and the object stays where it was. Rivet never deletes unknown objects.
 
 Quarantine layout: `<prefix>/_quarantine/<run_id>/<original-name>`.
 
-Rationale: defensive. The unknown part may be the operator's own intentional artifact, or evidence of a bug. Either way, Rivet preserves it and shifts the cost of cleanup to the operator's decision.
+Rationale — defensive: the unknown part may be the operator's own intentional artifact, or evidence of a bug. Either way, Rivet preserves it and shifts the cost of cleanup to the operator.
 
-If the destination backend does not support cheap move (S3 cross-prefix copy + delete is two operations), the operation is best-effort: failure to move is logged but does not block the run. The unknown object stays in place and the run still proceeds, but the warning escalates.
+Rationale — best-effort: on S3 / GCS the move decomposes into copy + delete, two non-atomic operations. A partial failure (copy succeeds, delete fails; or copy fails outright on a permissions issue) must not abort an otherwise-recoverable run. The reported warning carries enough detail (source path, destination quarantine path, failure reason) for the operator to finish the move manually. If the move never happens, the untracked part remains in place and re-trips M9 on the next resume — that is acceptable; an unmovable artifact is not a correctness problem, just a clutter problem.
+
+Local FS gets the same best-effort behaviour: `rename(2)` is atomic but can still fail (different mount point, permissions, file-in-use on Windows). The semantics are uniform across backends — never bail on a quarantine failure.
 
 ---
 
@@ -204,11 +208,17 @@ These are intentionally outside the manifest. A manifest that tries to be a cata
 
 ---
 
+## Decisions locked at ADR review
+
+These items were open in the first draft of this ADR; they are now decided.
+
+1. **`_SUCCESS` body** — *decided: carries the manifest fingerprint.* See M2. A polling orchestrator can detect manifest changes between two successful runs (a rerun, a resume that completed, a repair) by reading the `_SUCCESS` body alone, without re-fetching the manifest. The Hadoop empty-marker convention is rejected — Rivet does not target the Hadoop ecosystem.
+2. **Run-id segmentation in the destination prefix** — *decided: no automatic segmentation.* Rivet writes parts, manifest, and `_SUCCESS` directly under the operator-configured destination prefix. Two successive runs against the same prefix produce one observable dataset whose manifest reflects the latest run; the prior run's parts are reused (M8 skip), rewritten, or quarantined (M9) as the matrix dictates. Operators who want time-segregated historical runs include `{run_id}` (or `{date}`) in their destination URI themselves — that policy lives in the destination config, not in the manifest contract. Resume across overwrite is handled by the `_SUCCESS` gate plus `--force` (M8).
+3. **Cryptographic / encryption-aware fingerprinting** — *decided: out of scope for 0.7.0.* See M3. The `xxh3:` prefix reserves the slot.
+
 ## Open questions deferred to implementation
 
-1. **`_SUCCESS` body**: empty file (matches Hadoop/Spark convention) vs single line with the manifest fingerprint (lets a polling consumer detect manifest changes without re-reading). Lean toward empty for portability; revisit if a concrete consumer asks for the fingerprint.
-2. **Per-table-per-run prefixing**: today the destination layout is config-driven. The manifest's `destination.uri` records what was used; layout policy stays in destination config, not in this ADR.
-3. **Quarantine TTL**: Rivet does not delete quarantined objects. Operators may want a cleanup helper (`rivet state remote --gc`) — out of scope for 0.7.0.
+1. **Quarantine TTL**: Rivet does not delete quarantined objects. Operators may want a cleanup helper (`rivet state remote --gc`) — out of scope for 0.7.0.
 
 ---
 
