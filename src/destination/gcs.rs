@@ -165,4 +165,12 @@ impl super::Destination for GcsDestination {
             Err(e) => Err(e.into()),
         }
     }
+
+    fn r#move(&self, from: &str, to: &str) -> Result<()> {
+        // GCS rewrite (server-side copy) + delete; opendal abstracts this.
+        let from_full = format!("{}{}", self.prefix, from);
+        let to_full = format!("{}{}", self.prefix, to);
+        self.op.rename(&from_full, &to_full)?;
+        Ok(())
+    }
 }

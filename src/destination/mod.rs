@@ -129,6 +129,25 @@ pub trait Destination: Send + Sync {
         let _ = key;
         anyhow::bail!("head is not supported by this destination backend")
     }
+
+    /// Move `from` to `to` at the destination prefix.
+    ///
+    /// ADR-0012 M9 quarantine: a part the resume preamble can't reuse
+    /// (size drift, fingerprint mismatch, untracked surplus) gets
+    /// moved out of the way to `_quarantine/<run_id>/<original-name>`
+    /// so the next write doesn't have to share the prefix with stale
+    /// data, and so a future operator can investigate.
+    ///
+    /// Best-effort semantics: the caller treats every failure as
+    /// non-fatal (M9: "never bail on a quarantine failure").  The
+    /// operation is allowed to be non-atomic on object stores
+    /// (copy + delete inside opendal's `rename`); a partial failure
+    /// leaves the object reachable at both paths and is a
+    /// "clutter problem, not a correctness problem" per the ADR.
+    fn r#move(&self, from: &str, to: &str) -> Result<()> {
+        let _ = (from, to);
+        anyhow::bail!("move is not supported by this destination backend")
+    }
 }
 
 /// Log destination capabilities at DEBUG level and emit a WARN when the backend is not

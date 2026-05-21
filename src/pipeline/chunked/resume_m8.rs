@@ -30,8 +30,9 @@
 
 use std::collections::HashMap;
 
+use crate::destination::Destination;
 use crate::error::Result;
-use crate::manifest::{MANIFEST_FILENAME, RunManifest};
+use crate::manifest::{MANIFEST_FILENAME, QUARANTINE_PREFIX, RunManifest};
 use crate::pipeline::RunSummary;
 use crate::pipeline::resume_decisions::{ResumeDecision, build_resume_plan};
 use crate::plan::ResolvedRunPlan;
@@ -52,10 +53,21 @@ pub struct M8Stats {
     /// the resume run will re-export.
     pub reset_for_rewrite: usize,
     /// Manifest parts the matrix flagged for quarantine (size mismatch,
-    /// fingerprint drift).  Currently equivalent to `reset_for_rewrite`
-    /// from the executor's perspective; the M9 quarantine move is
-    /// Phase C-δ and will subtract these from the rewrite count.
+    /// fingerprint drift).  After Phase C-δ, the divergent destination
+    /// object is also moved to `_quarantine/<run_id>/` (best-effort —
+    /// see `quarantined_moved` for the count of successful moves).
     pub reset_for_quarantine: usize,
+    /// Quarantine-move successes — count of objects relocated to
+    /// `_quarantine/<run_id>/` so the next write doesn't share the
+    /// prefix with stale data.  ADR-0012 M9: best-effort, never
+    /// fatal.  `quarantined_moved <= reset_for_quarantine + untracked
+    /// surplus` — failures stay in `quarantine_move_failures`.
+    pub quarantined_moved: usize,
+    /// Quarantine-move failures.  Logged but the run proceeds — the
+    /// next write may overwrite the original key (atomic backends),
+    /// or the operator can clean up by hand.  Each failure is logged
+    /// at WARN with source/destination/reason.
+    pub quarantine_move_failures: usize,
     /// Manifest parts whose `path` did not match any chunk_task's
     /// `file_name`.  Means the manifest references a file we don't
     /// know about (foreign manifest, or chunk_task table missing the
@@ -271,23 +283,78 @@ pub(crate) fn apply_m8_resume_decisions(
                 if n > 0 {
                     stats.reset_for_quarantine += 1;
                 }
+                // M9: move the divergent destination object out of the way.
+                // Best-effort — see `quarantine_move` below.
+                quarantine_move(&*dest, path, run_id, &plan.export_name, &mut stats);
             }
         }
     }
 
+    // ── 6. M9: move untracked surplus objects ──────────────────────────
+    //
+    // Surplus = objects under the destination prefix that don't belong
+    // to any committed part in the manifest.  Most likely leftovers from
+    // a prior resume that wrote with a different timestamp.  Best-effort
+    // move to `_quarantine/<run_id>/<original-name>` — never fatal,
+    // never deletes (M9 §"never deletes unknown objects").
+    for key in resume_plan.untracked.keys() {
+        quarantine_move(&*dest, key, run_id, &plan.export_name, &mut stats);
+    }
+
     log::info!(
         "M8 resume preamble: export '{}' run_id '{}' — {} skipped, {} reset for rewrite, \
-         {} reset for quarantine, {} orphan part(s), {} untracked surplus object(s)",
+         {} reset for quarantine, {} quarantined ({} move failure(s)), {} orphan part(s), \
+         {} untracked surplus object(s)",
         plan.export_name,
         run_id,
         stats.skipped,
         stats.reset_for_rewrite,
         stats.reset_for_quarantine,
+        stats.quarantined_moved,
+        stats.quarantine_move_failures,
         stats.orphan_parts,
         resume_plan.untracked.len(),
     );
 
     Ok(stats)
+}
+
+/// ADR-0012 M9 — best-effort move of a destination object to the
+/// quarantine prefix.  Layout: `_quarantine/<run_id>/<original-key>`.
+/// On failure: log at WARN, increment counter, continue.  Never fatal,
+/// never deletes the source on a partial failure (the underlying
+/// `Destination::move` is allowed to be non-atomic for object stores —
+/// see ADR-0012 M9 §"copy + delete").
+fn quarantine_move(
+    dest: &dyn Destination,
+    src_key: &str,
+    run_id: &str,
+    export_name: &str,
+    stats: &mut M8Stats,
+) {
+    let quarantine_key = format!("{}/{}/{}", QUARANTINE_PREFIX, run_id, src_key);
+    match dest.r#move(src_key, &quarantine_key) {
+        Ok(()) => {
+            stats.quarantined_moved += 1;
+            log::info!(
+                "M9 quarantine: export '{}' moved '{}' → '{}'",
+                export_name,
+                src_key,
+                quarantine_key,
+            );
+        }
+        Err(e) => {
+            stats.quarantine_move_failures += 1;
+            log::warn!(
+                "M9 quarantine: export '{}' could not move '{}' → '{}' (not fatal — \
+                 next resume will re-trip M9 on this object): {:#}",
+                export_name,
+                src_key,
+                quarantine_key,
+                e,
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -114,6 +114,27 @@ impl super::Destination for LocalDestination {
             Err(e) => Err(e.into()),
         }
     }
+
+    fn r#move(&self, from: &str, to: &str) -> Result<()> {
+        // POSIX `rename` is atomic on the same filesystem; fall back to
+        // copy + delete when the rename crosses devices (rare on a
+        // single destination prefix but cheap to handle).
+        let src = Path::new(&self.base_path).join(from);
+        let dst = Path::new(&self.base_path).join(to);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match std::fs::rename(&src, &dst) {
+            Ok(()) => Ok(()),
+            Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+                // cross-device fallback
+                std::fs::copy(&src, &dst)?;
+                std::fs::remove_file(&src)?;
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 // ─── ADR-0004 capability contract tests ──────────────────────────────────────
@@ -405,5 +426,59 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = dest_at(dir.path());
         assert!(dest.read("nope.json").is_err());
+    }
+
+    // ── ADR-0012 M9 quarantine: move primitive ─────────────────────────
+
+    #[test]
+    fn move_relocates_file_and_creates_parent_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dest_at(dir.path());
+        std::fs::write(dir.path().join("part-000001.parquet"), b"payload").unwrap();
+
+        dest.r#move(
+            "part-000001.parquet",
+            "_quarantine/run_xyz/part-000001.parquet",
+        )
+        .unwrap();
+
+        // Source gone; destination present at new key with same body.
+        assert!(!dir.path().join("part-000001.parquet").exists());
+        let body = std::fs::read(
+            dir.path()
+                .join("_quarantine")
+                .join("run_xyz")
+                .join("part-000001.parquet"),
+        )
+        .unwrap();
+        assert_eq!(body, b"payload");
+    }
+
+    #[test]
+    fn move_returns_err_on_missing_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dest_at(dir.path());
+        let result = dest.r#move("absent.parquet", "_quarantine/r/absent.parquet");
+        assert!(
+            result.is_err(),
+            "moving a non-existent file must surface as Err so the caller logs it"
+        );
+    }
+
+    #[test]
+    fn move_overwrites_existing_destination_object() {
+        // POSIX rename overwrites the target if it exists; mirror that
+        // contract so a second resume cleaning the same prefix doesn't
+        // bail out on "destination already exists in quarantine".
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dest_at(dir.path());
+        std::fs::write(dir.path().join("a"), b"new").unwrap();
+        std::fs::create_dir_all(dir.path().join("_quarantine/r")).unwrap();
+        std::fs::write(dir.path().join("_quarantine/r/a"), b"old").unwrap();
+
+        dest.r#move("a", "_quarantine/r/a").unwrap();
+        assert!(!dir.path().join("a").exists());
+        let body = std::fs::read(dir.path().join("_quarantine/r/a")).unwrap();
+        assert_eq!(body, b"new", "rename overwrites target");
     }
 }

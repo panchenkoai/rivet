@@ -188,6 +188,18 @@ impl super::Destination for S3Destination {
             Err(e) => Err(e.into()),
         }
     }
+
+    fn r#move(&self, from: &str, to: &str) -> Result<()> {
+        // S3 is not POSIX — `rename` is opendal's "best-effort native
+        // rename if the backend supports it, otherwise copy + delete".
+        // For S3 it's always copy + delete; we keep the call here so a
+        // future region/backend gain (FSx, R2 native rename) is picked
+        // up automatically.
+        let from_full = format!("{}{}", self.prefix, from);
+        let to_full = format!("{}{}", self.prefix, to);
+        self.op.rename(&from_full, &to_full)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
