@@ -167,10 +167,17 @@ impl super::Destination for GcsDestination {
     }
 
     fn r#move(&self, from: &str, to: &str) -> Result<()> {
-        // GCS rewrite (server-side copy) + delete; opendal abstracts this.
+        // opendal's `rename` returns `Unsupported` on GCS (opendal 0.55
+        // does not auto-fall-back to copy + delete for the GCS service),
+        // so do it ourselves: server-side copy (GCS rewrite) + delete.
+        // ADR-0012 M9 best-effort: the copy can succeed and the delete
+        // can fail — that's a clutter problem, not a correctness one
+        // (the source object stays reachable at the original path until
+        // the next resume re-trips M9 on it).
         let from_full = format!("{}{}", self.prefix, from);
         let to_full = format!("{}{}", self.prefix, to);
-        self.op.rename(&from_full, &to_full)?;
+        self.op.copy(&from_full, &to_full)?;
+        self.op.delete(&from_full)?;
         Ok(())
     }
 }

@@ -190,14 +190,15 @@ impl super::Destination for S3Destination {
     }
 
     fn r#move(&self, from: &str, to: &str) -> Result<()> {
-        // S3 is not POSIX — `rename` is opendal's "best-effort native
-        // rename if the backend supports it, otherwise copy + delete".
-        // For S3 it's always copy + delete; we keep the call here so a
-        // future region/backend gain (FSx, R2 native rename) is picked
-        // up automatically.
+        // S3 is not POSIX — no native rename.  Mirrors the GCS path:
+        // explicit copy + delete instead of `op.rename` (which opendal
+        // 0.55 returns Unsupported for both S3 and GCS).  ADR-0012 M9
+        // best-effort: a partial copy-ok / delete-fail leaves the
+        // source reachable at both paths and re-trips M9 next resume.
         let from_full = format!("{}{}", self.prefix, from);
         let to_full = format!("{}{}", self.prefix, to);
-        self.op.rename(&from_full, &to_full)?;
+        self.op.copy(&from_full, &to_full)?;
+        self.op.delete(&from_full)?;
         Ok(())
     }
 }
