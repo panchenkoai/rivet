@@ -48,6 +48,7 @@ fn local_destination_config(base: &Path) -> DestinationConfig {
         access_key_env: None,
         secret_key_env: None,
         aws_profile: None,
+        session_token_env: None,
         allow_anonymous: false,
     }
 }
@@ -436,6 +437,7 @@ fn streaming_destination_writes_nothing_and_does_not_error() {
         access_key_env: None,
         secret_key_env: None,
         aws_profile: None,
+        session_token_env: None,
         allow_anonymous: false,
     };
     let dest = rivet::destination_for_tests::create_destination(&cfg).unwrap();
@@ -1652,6 +1654,7 @@ fn streaming_destination_never_writes_success_marker_even_on_success_status() {
         access_key_env: None,
         secret_key_env: None,
         aws_profile: None,
+        session_token_env: None,
         allow_anonymous: false,
     };
     let dest = rivet::destination_for_tests::create_destination(&cfg).unwrap();

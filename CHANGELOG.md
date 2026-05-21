@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.7.1 (unreleased)
+
+### AWS S3 — STS/SSO/AssumeRole/MFA support + auth-flow docs
+
+Found while live-testing 0.7.0 against a real S3 bucket (`s3://rivet-data-test/`,
+`eu-north-1`): the `aws_profile:` config path uses reqsign's default-chain
+loader, which silently falls through to EC2 IMDS on developer laptops when
+the named profile carries an AWS IAM Identity Center / "AWS Login" session
+(short-lived creds in `~/.aws/login/cache/`, not in `~/.aws/credentials`).
+IMDS is unreachable off-EC2 → ~3 minutes of retries → confusing hang.
+
+- **`feat(config)`** — new `session_token_env` field on `DestinationConfig`.
+  Pair with `access_key_env` + `secret_key_env` to authenticate as a
+  short-lived STS session (any access key starting with `ASIA…`):
+  AWS IAM Identity Center / SSO, `aws sts assume-role`, MFA-protected
+  sessions, EKS IRSA, GitHub Actions OIDC, etc.
+
+  ```yaml
+  destination:
+    type: s3
+    bucket: my-bucket
+    region: eu-north-1
+    access_key_env: AWS_ACCESS_KEY_ID
+    secret_key_env: AWS_SECRET_ACCESS_KEY
+    session_token_env: AWS_SESSION_TOKEN
+  ```
+
+  Bridge from AWS CLI v2 (any auth flow):
+  ```bash
+  eval "$(aws configure export-credentials --profile default --format env)"
+  ```
+
+- **`docs(cloud-auth.md)`** — new auth-flow matrix covering all six
+  S3/GCS paths (static IAM key, STS/SSO temporary creds, `aws_profile`
+  static, ADC for GCS, service-account JSON, anonymous/emulator) plus
+  a troubleshooting table for the most common operator-confusing errors
+  (IMDS timeout, `InvalidAccessKeyId`, region mismatch, ADC expired).
+
+- **`docs(s3.rs)`** — added a warning at the `aws_profile` code site
+  pointing at `docs/cloud-auth.md` when the operator sees an IMDS
+  timeout, and clarifying the chain's failure mode.
+
 ## 0.7.0 (2026-05-21)
 
 ### Cloud manifest contract — write, verify, resume, quarantine

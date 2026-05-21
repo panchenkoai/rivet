@@ -309,6 +309,7 @@ mod tests {
                 access_key_env: None,
                 secret_key_env: None,
                 aws_profile: None,
+                session_token_env: None,
                 allow_anonymous: false,
             },
             quality: None,

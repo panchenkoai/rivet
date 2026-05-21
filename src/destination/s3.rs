@@ -48,13 +48,42 @@ impl S3Destination {
             })?);
             builder = builder.secret_access_key(secret.as_str());
         }
+        // STS session token for temporary credentials (AWS IAM Identity
+        // Center / SSO, AssumeRole, MFA, EKS IAM Roles for Service
+        // Accounts, etc.).  Required whenever `access_key_id` starts
+        // with `ASIA…` rather than `AKIA…`.  See `docs/cloud-auth.md`.
+        // SecOps: same `Zeroizing<String>` treatment as the access keys
+        // — token is a credential and must not linger in heap pages.
+        if let Some(env_name) = &config.session_token_env {
+            let token = zeroize::Zeroizing::new(std::env::var(env_name).map_err(|_| {
+                anyhow::anyhow!("env var '{}' not set for S3 session token", env_name)
+            })?);
+            builder = builder.session_token(token.as_str());
+        }
 
         // When `aws_profile` is set in rivet config, build a reqsign credential
         // loader with the profile name baked in — no `env::set_var` required.
         // This is safe under `--parallel-exports` because each export gets its
         // own loader instance; no global state is mutated.
+        //
+        // ⚠ Warning: this path uses reqsign's `AwsDefaultLoader`, which falls
+        // through to the EC2 instance-metadata service (IMDS) on a developer
+        // laptop if the profile turns out to be empty (e.g. AWS CLI v2's
+        // "AWS Login" profiles store sessions in `~/.aws/login/cache/`,
+        // a format reqsign 0.16 does not understand).  IMDS is unreachable
+        // off-EC2 and the connect attempt times out only after several
+        // retries, surfacing as a confusing hang.  When that happens the
+        // operator should either (a) use the static `access_key_env` +
+        // `secret_key_env` (+ `session_token_env` for STS/SSO/AssumeRole)
+        // path, or (b) bridge their AWS Login session via
+        // `aws configure export-credentials --format env`.  See
+        // `docs/cloud-auth.md` for the full matrix.
         if let Some(profile) = &config.aws_profile {
-            log::info!("S3: using AWS profile '{}'", profile);
+            log::info!(
+                "S3: using AWS profile '{}' (reqsign default-chain — see docs/cloud-auth.md \
+                 if you see IMDS timeouts: switch to access_key_env+secret_key_env+session_token_env)",
+                profile
+            );
             let cred_config = reqsign::AwsConfig {
                 profile: profile.clone(),
                 ..Default::default()

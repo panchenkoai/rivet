@@ -830,6 +830,12 @@ pub struct DestinationConfig {
     pub credentials_file: Option<String>,
     pub access_key_env: Option<String>,
     pub secret_key_env: Option<String>,
+    /// Name of an env var holding an AWS STS session token, for use with
+    /// short-lived credentials issued by AWS IAM Identity Center / SSO,
+    /// `aws sts assume-role`, MFA-protected sessions, EKS IAM Roles for
+    /// Service Accounts, etc.  Pair with `access_key_env` + `secret_key_env`.
+    /// See `docs/cloud-auth.md` for the AWS auth-flow matrix.
+    pub session_token_env: Option<String>,
     pub aws_profile: Option<String>,
     #[serde(default)]
     pub allow_anonymous: bool,
@@ -1140,6 +1146,7 @@ mod tests {
                 access_key_env: None,
                 secret_key_env: None,
                 aws_profile: None,
+                session_token_env: None,
                 allow_anonymous: false,
             },
             meta_columns: MetaColumns::default(),
