@@ -1,15 +1,165 @@
 # Changelog
 
-## 0.6.1 (unreleased)
+## 0.7.0 (2026-05-21)
 
-### Per-run reports and resume hints
+### Cloud manifest contract — write, verify, resume, quarantine
 
-A small, additive release focused on **trust polish**: every run now leaves
-behind an inspectable on-disk report, and interrupted runs print a clear
-resume command pointing back at it.
+A trust-contract release.  Every export now leaves behind an inspectable
+on-disk run report, **and** every cloud-or-local-file destination gains a
+public JSON manifest + `_SUCCESS` marker that downstream consumers
+(Airflow sensors, CI gating, custom verifiers) can read directly.
+`--validate` and `--resume` now consult the manifest to certify the
+dataset and to reconcile prior committed parts before re-running work.
 
-This release introduces no new commands and no breaking config changes; the
-new artifacts are written automatically next to the existing state DB.
+ADR-0012 ("Cloud manifest contract") and ADR-0013 ("Trust flag contract")
+are the wire-format and operator-facing CLI contracts respectively.
+Both lock the surface so future releases can extend semantics without
+breaking existing automation.
+
+#### Per-run reports
+
+- **`feat(report)`** — every run writes two files under
+  `.rivet/runs/<run_id>/` (next to `.rivet_state.db`):
+  - `summary.json` — machine-readable run report with a stable JSON
+    schema (`run_id`, `status`, timing, plan, throughput counters,
+    validation / reconciliation verdicts, error message, resume hint,
+    manifest verification verdict).
+  - `summary.md` — operator-friendly Markdown for pull requests, support
+    tickets, and incident reviews.
+  - Failures to write are non-fatal (ADR-0001 §I7): the pipeline keeps
+    its exit code and the resume hint is still surfaced to stderr even
+    when disk-full prevents the report from landing.
+- **`feat(cli)`** — the stderr run-summary block is followed by a
+  `report:` line pointing at the on-disk Markdown, and (on a failed run
+  with at least one committed file) a `resume:` line containing a
+  copy-pasteable `rivet run --config <path> --resume` command.
+
+#### Cloud manifest + `_SUCCESS` (ADR-0012)
+
+- **`feat(manifest)`** — every export to a non-streaming destination
+  writes:
+  - `<dest>/manifest.json` — versioned JSON with `run_id`, `export_name`,
+    `started_at`/`finished_at`, `status`, `source.{engine,schema,table}`,
+    `destination.{kind,uri}`, `format`, `compression`, `schema_fingerprint`,
+    `row_count`, `part_count`, and a `parts[]` array (`part_id`, `path`,
+    `rows`, `size_bytes`, `content_fingerprint`, `status`).
+  - `<dest>/_SUCCESS` — single-line `xxh3:<16-hex>` body whose value is
+    the xxh3 of the just-written `manifest.json` bytes.  An orchestrator
+    can poll `_SUCCESS` (cheap GET) to detect manifest changes between
+    runs (ADR-0012 §M2).
+- **M1/M2 ordering**: parts before manifest; manifest before `_SUCCESS`.
+  Both writes use the destination's atomic-PUT path (S3 / GCS) or
+  `fs::copy` (local).  `_SUCCESS` is written iff `status: success`.
+- **M3 fingerprints**: schema fingerprint (`xxh3` over sorted
+  `[{name, type}]`) and per-part content fingerprint (`xxh3` over the
+  written bytes) — both `xxh3:<16-hex>` shape, prefix reserved so future
+  sha256/blake3 hashers can coexist without a schema break.
+- **M4 atomicity**: a given `run_id` produces exactly one manifest;
+  resumed runs that complete additional parts write a fresh manifest
+  atomically (server-side replace on cloud, `rename` on local) — never
+  amended in place.
+
+#### Manifest-aware `--validate` (ADR-0012 §M5/M6, ADR-0013)
+
+- **`feat(validate)`** — `rivet run --validate` now extends the existing
+  per-file row-count check with manifest-aware verification:
+  - Reads `manifest.json` from the destination.
+  - For each committed part: confirms the object exists at the recorded
+    `size_bytes`.
+  - Verifies `_SUCCESS` body matches `xxh3(manifest.json bytes)`.
+  - Surfaces self-consistency violations (declared `row_count` vs
+    actual sum, duplicate `part_id`, unsupported `manifest_version`).
+  - Lists the prefix and flags untracked surplus objects.
+- **M6 legacy fallback**: when no manifest is present at the prefix
+  (pre-0.7.0 export), the report carries `legacy_run: true` so an
+  operator sees the reduced assurance explicitly — silent fallback is
+  forbidden.
+- **`feat(rivet validate)`** — new standalone subcommand:
+  `rivet validate [--config path] [--export name] [--format pretty|json]`
+  re-runs the same M5/M6 checks against an existing destination
+  without performing an extraction.  Useful for between-run polling
+  (Airflow sensors, CI gating, triage on a suspected-broken dataset).
+  Exit 0 when every export passed (or when only legacy_run labels were
+  emitted); exit non-zero on any explicit M5 failure.  Failure variants
+  in the JSON report carry a `kind` discriminator for stable consumer
+  parsing.
+
+#### Manifest-aware `--reconcile`
+
+- **`fix(reconcile)`** — `--reconcile` now compares the source's
+  `SELECT COUNT(*)` against the manifest's *cumulative* row total
+  (sum of committed parts), not just this run's writes.  Before this
+  fix, a resume run that re-exported only a single chunk would falsely
+  report MISMATCH because `total_rows` reflected just the resumed
+  chunk's rows.  Now: cumulative-vs-source is the correct invariant.
+
+#### Manifest-aware `--resume` (ADR-0012 §M8/M9)
+
+- **`feat(--resume)`** — chunked-checkpoint resume now reconciles state
+  with destination: at resume start, read `manifest.json` + listing,
+  apply ADR-0012 M8's decision matrix per part:
+  - `Skip` (manifest part exists at recorded size) → state row stays
+    `completed`, no re-export.
+  - `Rewrite` (manifest part missing) → state row reset to `pending`
+    so the worker re-exports it.
+  - `Quarantine` (size or fingerprint drift) → state row reset, AND
+    the divergent destination object is moved to
+    `_quarantine/<run_id>/<original-name>` so the active prefix stays
+    clean for the new write.
+  - Untracked surplus objects (under prefix but not in manifest) are
+    quarantined too, never deleted.
+- **M9 quarantine** is best-effort per ADR (`Destination::r#move` —
+  `fs::rename` on local, server-side rewrite + delete on S3/GCS).
+  Failures are logged at WARN and never fatal — a clutter problem
+  is never escalated to an extraction failure.
+- **`feat(--force)`** — new safety override on `rivet run`.
+  Required when `--resume`'s gate refuses to start (destination prefix
+  already has `_SUCCESS` from a prior completed run).  Per ADR-0013
+  this is the *one* `--force` flag, scoped per-gate; future gates
+  reuse the same flag rather than adding `--force-overwrite`,
+  `--force-resume`, etc.
+
+#### CLI surface
+
+- **`rivet run`** flags: `--validate`, `--reconcile`, `--resume`,
+  `--force` — pinned by ADR-0013 acceptance criterion.  M5/M6/M8/M9
+  land entirely under existing flags; no new trust noun on `run`.
+- **`rivet validate`** is the only new top-level subcommand.  Standalone
+  driver for the manifest-verify flow (ADR-0013 "Subcommand carveouts").
+- An anchor test in `tests/trust_artifacts_integration.rs` §24 pins
+  the exact flag set on `rivet run --help`; future PRs that add a
+  trust-related flag will trip the test until ADR-0013 is amended.
+
+#### Internal: layer hygiene + state schema v8
+
+- The internal SQLite file ledger was renamed from `file_manifest` to
+  `file_log` (schema migration v8) to free the `manifest` name for the
+  0.7.0 public JSON contract.  Existing 0.6.0 state DBs migrate
+  transparently.
+- Layer assignments updated in ADR-0003: a new "Trust contract types"
+  category covers `manifest.rs`, `pipeline::resume_decisions`, and
+  `destination::ObjectMeta` (pure data + pure functions, no L1-L4
+  classification).
+- `pipeline::finalize` extracted from `pipeline::job` so the four
+  end-of-run hooks (manifest write, validate-against-destination, run
+  report, notification) sit in one focused module.  ADR-0001 §I8
+  (Finalize Order: Manifest → Verification → Report) pins the call
+  order so future refactors can't silently re-order observability
+  artifacts.
+- `pipeline::for_tests` module — public CLI surface vs test-only window
+  cleanly separated.  Tests reach internal items via
+  `rivet::pipeline::for_tests::*`; the public `rivet::pipeline::*` API
+  shrank to just the CLI command drivers + `RunSummary`.
+- `RunSummary::stub_for_testing` + chainable setters — one canonical
+  builder shared by 7+ test sites.  Adding a field to `RunSummary` now
+  costs one default-value entry rather than a 9-place edit.
+
+## 0.6.1 (folded into 0.7.0)
+
+The trust-polish work originally scoped for 0.6.1 (per-run reports,
+schema-evidence storage, resume-command hints) ships as part of 0.7.0
+above.  Releasing 0.6.1 separately would have left the report
+unaware of the manifest, which is most of its operator value.
 
 #### New artifacts
 
