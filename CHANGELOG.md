@@ -1,6 +1,59 @@
 # Changelog
 
-## 0.7.1 (unreleased)
+## 0.7.1 (2026-05-21)
+
+### Highlights
+
+- **Azure Blob Storage destination** (new) — third cloud target after S3 / GCS, opendal-backed, full M1–M9 trust-contract parity (manifest + `_SUCCESS` + resume + quarantine).  Verified end-to-end against a real Azure account (`belgiumcentral`).
+- **AWS S3 STS / SSO / IAM Identity Center / AssumeRole / MFA** support via `session_token_env`.  Verified against a real S3 bucket.
+- **Cross-cloud bug fix**: `rivet validate` and `rivet doctor` now substitute `{date}` / `{export}` / `{table}` placeholders in `destination.prefix` (previously only `rivet run` did, so validate/doctor mis-read prefixes with templates).
+- **Cohesion pass** on `DestinationConfig`: `#[derive(Default)]` + `..Default::default()` in test fixtures.  Adding a new optional field now touches ~5 helper functions, not ~28 init sites.
+
+### Azure Blob Storage
+
+A new `type: azure` destination, behaviourally on par with S3 and GCS:
+
+```yaml
+destination:
+  type: azure
+  bucket: my-container          # Azure container name (rivet reuses the `bucket` field across S3/GCS/Azure)
+  account_name: mystorageacct    # the `<acct>` in `<acct>.blob.core.windows.net`
+  account_key_env: RIVET_AZURE_KEY
+```
+
+- **`feat(destination/azure)`** — new `AzureDestination` (write / list / read / head / move) on top of `opendal::services::Azblob`.  Same `RetryLayer` and `FinalizeOnClose` capability profile as GCS/S3.  Server-side copy + delete fallback for `r#move` (opendal 0.55 returns Unsupported on `rename` for Azure Blob — same as S3/GCS).
+- **`feat(config)`** — new `account_name` (public string) and `account_key_env` (env-var name) fields on `DestinationConfig`.  Key is wrapped in `Zeroizing<String>` on read — same SecOps treatment as `access_key_env`.
+- **`feat(destination/azure)`** — endpoint is auto-derived from `account_name` (`https://<account_name>.blob.core.windows.net`); explicit `endpoint:` still wins (needed for Azurite, sovereign clouds, custom DNS).
+- **`feat(config)`** — `allow_anonymous: true` for [Azurite](https://learn.microsoft.com/azure/storage/common/storage-use-azurite) emulator and public read-only containers.  Refuses to combine with explicit `account_name` / `account_key_env`.
+- **`feat(pipeline/finalize)`** — manifest's `destination.uri` field renders as `az://<container>/<prefix>` (HDFS / azcopy convention).
+- **`feat(preflight/doctor)`** — Azure-aware label (`Azure(<container>)`) and error category (`container not found`).
+- **`docs(cloud-auth.md)`** — new Azure section: Path A (account_key) + Path B (Azurite) + troubleshooting + use-case recommendations.  Reserved 0.7.2 surface documented: SAS token, service principal, managed identity, connection string — all additive, no breaking changes.
+
+Not in 0.7.1 (planned for 0.7.2, additive):
+- SAS token (`sas_token_env`)
+- Service principal (`tenant_id` / `client_id` / `client_secret_env`)
+- Managed identity (when rivet runs inside Azure VM / AKS / Functions)
+- Connection string (`connection_string_env`)
+
+### `--validate` and `doctor` now expand placeholders
+
+Found while live-testing Azure on 2026-05-21: `rivet validate` against a
+config with `prefix: "runs/{date}/{export}/"` returned `status: legacy_run`
+because the verifier looked at the literal template, not the substituted
+`runs/2026-05-21/orders_azure_smoke/` path where data actually lives.
+`doctor` exhibited the same symptom by writing a probe at the literal
+`runs/{date}/{export}/.rivet_doctor_probe`.
+
+- **`fix(validate)`** — `run_validate_command` now applies `{date}`/`{export}`/`{table}` substitution via `plan::build::expand_destination_templates` before constructing the destination.  Same expansion `rivet run` already used.
+- **`fix(doctor)`** — same substitution applied at the `check_destination_auth` probe site so doctor no longer leaves literal-template stub objects in cloud buckets.
+- This is **cross-cloud** — the bug affected S3 / GCS / Azure equally.  No engine-specific code touched.
+- The substitution uses **today's UTC date**.  If validate is invoked the day after a run, the operator should inline the absolute prefix in config; a planned `--run-id` / `--date` flag (0.7.2) will allow re-targeting historical runs.
+
+### Cohesion pass on `DestinationConfig`
+
+- **`refactor(config)`** — `#[derive(Default)]` on `DestinationType` (Local) and `DestinationConfig`.
+- **`refactor(destination/s3)`** — extracted `read_credential_env(env_name, label) -> Result<Zeroizing<String>>` helper, used in all three credential paths (access key, secret key, session token).  Trimmed the 13-line inline IMDS warning down to a 4-line pointer at `docs/cloud-auth.md`.
+- **`refactor(tests)`** — all 28 literal `DestinationConfig { ... }` init sites across `pipeline/*`, `plan/*`, `destination/*`, `preflight/*`, and integration tests converted to `..Default::default()`.  Net **−227 lines**.
 
 ### AWS S3 — STS/SSO/AssumeRole/MFA support + auth-flow docs
 
