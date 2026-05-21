@@ -16,7 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::journal::RunEvent;
@@ -36,7 +36,7 @@ pub fn report_dir(config_path: &str, run_id: &str) -> PathBuf {
 /// Field additions are backwards-compatible (consumers must ignore unknown
 /// fields); field removals or type changes require a versioned bump and are
 /// avoided where possible.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunReport {
     pub run_id: String,
     pub export_name: String,
@@ -76,26 +76,26 @@ pub struct RunReport {
     pub resume_command: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidationOutcome {
     pub passed: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReconciliationOutcome {
     pub source_count: Option<i64>,
     pub exported_rows: i64,
     pub matched: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaChangeEntry {
     pub added: Vec<String>,
     pub removed: Vec<String>,
     pub type_changed: Vec<(String, String, String)>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanWarningEntry {
     pub rule: String,
     pub message: String,

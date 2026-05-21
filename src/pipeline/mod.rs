@@ -45,6 +45,15 @@ pub use crate::plan::build_time_window_query;
 #[allow(unused_imports)]
 pub use validate::validate_output;
 
+// 0.7.0 trust-contract artifacts — surfaced so integration tests in `tests/`
+// can exercise the writers without spinning up a full pipeline.  Internal
+// implementation details (compute_part_fingerprint, record_committed_part)
+// stay `pub(crate)`.
+#[allow(unused_imports)]
+pub use manifest_writer::{ManifestBuilder, WriteOutcome, write_manifest};
+#[allow(unused_imports)]
+pub use report::{RunReport, report_dir, write_run_report};
+
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use retry::is_transient;
