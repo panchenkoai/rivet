@@ -406,6 +406,56 @@ impl StateStore {
         Ok(())
     }
 
+    /// Reset a single completed chunk task back to `pending` so the next
+    /// `--resume` run re-exports it.
+    ///
+    /// Used by ADR-0012 M8 reconciliation: when the destination's manifest
+    /// says a part was committed but the actual object is missing or has
+    /// drifted (size mismatch), the chunk_task that produced it must run
+    /// again.  Without this reset, `claim_next_chunk_task` would skip the
+    /// completed row and the destination would stay broken across resumes.
+    ///
+    /// Distinct from `reset_chunk_checkpoint(export_name)` (which wipes
+    /// every run+task for an export — the operator-facing "abandon resume"
+    /// nuke) and from `reset_stale_running_chunk_tasks` (which only
+    /// rescues tasks left in 'running' after a crash).  This one is
+    /// surgical: a single (run_id, chunk_index) goes from completed
+    /// back to pending, attempts reset to 0, file_name cleared, and
+    /// last_error annotated with the M8 reason so the journal/audit
+    /// trail records why.
+    ///
+    /// Returns the number of rows updated (0 or 1).  Idempotent —
+    /// calling it on a non-completed task is a no-op.
+    pub fn reset_chunk_task_for_re_export(
+        &self,
+        run_id: &str,
+        chunk_index: i64,
+        reason: &str,
+    ) -> Result<usize> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let sql = "UPDATE chunk_task
+             SET status = 'pending',
+                 attempts = 0,
+                 file_name = NULL,
+                 rows_written = NULL,
+                 last_error = ?1,
+                 updated_at = ?2
+             WHERE run_id = ?3
+               AND chunk_index = ?4
+               AND status = 'completed'";
+        match &self.conn {
+            StateConn::Sqlite(c) => {
+                let n = c.execute(sql, rusqlite::params![reason, now, run_id, chunk_index])?;
+                Ok(n)
+            }
+            StateConn::Postgres(client) => {
+                let mut c = client.borrow_mut();
+                let n = c.execute(&pg_sql(sql), &[&reason, &now, &run_id, &chunk_index])?;
+                Ok(n as usize)
+            }
+        }
+    }
+
     /// Remove all chunk runs and tasks for an export (abandon resume).
     pub fn reset_chunk_checkpoint(&self, export_name: &str) -> Result<usize> {
         match &self.conn {

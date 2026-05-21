@@ -116,8 +116,8 @@ impl Config {
         }
 
         // Duplicate export names break state tracking: `export_state`,
-        // `file_manifest`, and `chunk_run` are all keyed by `export_name`, so
-        // two configs with the same name silently share cursor/manifest rows.
+        // `file_log`, and `chunk_run` are all keyed by `export_name`, so
+        // two configs with the same name silently share cursor/file-log rows.
         // QA backlog Task 5.1.
         {
             let mut seen: std::collections::HashSet<&str> =
@@ -246,6 +246,24 @@ impl Config {
                     "export '{}': GCS allow_anonymous cannot be used together with credentials_file",
                     export.name
                 );
+            }
+
+            if export.destination.destination_type == DestinationType::Azure {
+                let has_name = export.destination.account_name.is_some();
+                let has_key = export.destination.account_key_env.is_some();
+                if export.destination.allow_anonymous {
+                    if has_name || has_key {
+                        anyhow::bail!(
+                            "export '{}': Azure allow_anonymous cannot be combined with account_name/account_key_env",
+                            export.name
+                        );
+                    }
+                } else if has_name != has_key {
+                    anyhow::bail!(
+                        "export '{}': Azure requires both account_name and account_key_env, or neither (with allow_anonymous: true for Azurite)",
+                        export.name
+                    );
+                }
             }
 
             if let Some(cred_path) = &export.destination.credentials_file

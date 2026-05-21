@@ -53,17 +53,29 @@ pub fn doctor(config_path: &str) -> Result<()> {
                 "GCS({})",
                 export.destination.bucket.as_deref().unwrap_or("?")
             ),
+            DestinationType::Azure => format!(
+                "Azure({})",
+                export.destination.bucket.as_deref().unwrap_or("?")
+            ),
             DestinationType::Stdout => {
                 log::info!("  Stdout: no auth check needed");
                 continue;
             }
         };
 
-        match check_destination_auth(&export.destination) {
+        // Apply `{date}`/`{export}`/`{table}` substitution so the probe
+        // write lands at the same prefix `run` would use — otherwise we
+        // leave a literal `runs/{date}/{export}/.rivet_doctor_probe` object
+        // at the destination (visible on 2026-05-21 against real Azure).
+        let expanded_dest = crate::plan::build::expand_destination_templates(
+            export.destination.clone(),
+            &export.name,
+        );
+        match check_destination_auth(&expanded_dest) {
             Ok(()) => println!("[OK]  Destination {}", label),
             Err(e) => {
                 all_ok = false;
-                let category = categorize_dest_error(&e, &export.destination);
+                let category = categorize_dest_error(&e, &expanded_dest);
                 println!("[FAIL] Destination {} -- {}: {}", label, category, e);
             }
         }
@@ -151,6 +163,7 @@ pub(super) fn categorize_dest_error(
         match dest.destination_type {
             DestinationType::S3 => "bucket not found",
             DestinationType::Gcs => "bucket not found",
+            DestinationType::Azure => "container not found",
             DestinationType::Local | DestinationType::Stdout => "path not found",
         }
     } else if msg.contains("connect")

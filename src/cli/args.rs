@@ -37,6 +37,14 @@ pub enum Commands {
         /// Resume a chunked export with `chunk_checkpoint: true` (same query/chunk_column/chunk_size)
         #[arg(long)]
         resume: bool,
+        /// Override safety gates that would otherwise refuse the run.
+        ///
+        /// Today: with `--resume`, allows starting against a destination prefix
+        /// whose `_SUCCESS` marker is already present (ADR-0012 M8).  Without
+        /// `--force`, resume against a complete run refuses so an operator
+        /// cannot accidentally re-export over a verified dataset.
+        #[arg(long)]
+        force: bool,
         /// Run all exports from the config concurrently (ignored with `--export`; needs 2+ exports)
         #[arg(long)]
         parallel_exports: bool,
@@ -197,6 +205,27 @@ pub enum Commands {
         #[arg(short, long = "param", value_name = "KEY=VALUE")]
         params: Vec<String>,
     },
+    /// Re-run manifest-aware verification against an existing destination, no extraction.
+    ///
+    /// Same M5/M6 checks `rivet run --validate` performs at end-of-run, exposed
+    /// as a standalone command for between-run polling and triage.  Reads
+    /// manifest.json + _SUCCESS at the destination, head-checks every committed
+    /// part for presence and recorded size_bytes.  Source is not queried (use
+    /// `rivet reconcile` for that).  See ADR-0013 §"Subcommand carveouts".
+    Validate {
+        /// Path to YAML config file
+        #[arg(short, long)]
+        config: String,
+        /// Validate only this export (default: every export in the config)
+        #[arg(short, long)]
+        export: Option<String>,
+        /// Output format: "pretty" (human summary) or "json" (machine-readable)
+        #[arg(long, default_value = "pretty")]
+        format: ValidateFormat,
+        /// Write JSON report to this file (only with `--format json`)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
     /// Partition/window reconciliation: re-count per-partition on source and report mismatches (Epic F).
     /// Requires a chunked export previously run with `chunk_checkpoint: true`.
     Reconcile {
@@ -325,6 +354,12 @@ pub enum PlanFormat {
 
 #[derive(clap::ValueEnum, Clone)]
 pub enum ReconcileFormat {
+    Pretty,
+    Json,
+}
+
+#[derive(clap::ValueEnum, Clone)]
+pub enum ValidateFormat {
     Pretty,
     Json,
 }

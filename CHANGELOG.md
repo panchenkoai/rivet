@@ -1,5 +1,291 @@
 # Changelog
 
+## 0.7.1 (2026-05-21)
+
+### Highlights
+
+- **Azure Blob Storage destination** (new) — third cloud target after S3 / GCS, opendal-backed, full M1–M9 trust-contract parity (manifest + `_SUCCESS` + resume + quarantine).  Verified end-to-end against a real Azure account (`belgiumcentral`).
+- **AWS S3 STS / SSO / IAM Identity Center / AssumeRole / MFA** support via `session_token_env`.  Verified against a real S3 bucket.
+- **Cross-cloud bug fix**: `rivet validate` and `rivet doctor` now substitute `{date}` / `{export}` / `{table}` placeholders in `destination.prefix` (previously only `rivet run` did, so validate/doctor mis-read prefixes with templates).
+- **Cohesion pass** on `DestinationConfig`: `#[derive(Default)]` + `..Default::default()` in test fixtures.  Adding a new optional field now touches ~5 helper functions, not ~28 init sites.
+
+### Azure Blob Storage
+
+A new `type: azure` destination, behaviourally on par with S3 and GCS:
+
+```yaml
+destination:
+  type: azure
+  bucket: my-container          # Azure container name (rivet reuses the `bucket` field across S3/GCS/Azure)
+  account_name: mystorageacct    # the `<acct>` in `<acct>.blob.core.windows.net`
+  account_key_env: RIVET_AZURE_KEY
+```
+
+- **`feat(destination/azure)`** — new `AzureDestination` (write / list / read / head / move) on top of `opendal::services::Azblob`.  Same `RetryLayer` and `FinalizeOnClose` capability profile as GCS/S3.  Server-side copy + delete fallback for `r#move` (opendal 0.55 returns Unsupported on `rename` for Azure Blob — same as S3/GCS).
+- **`feat(config)`** — new `account_name` (public string) and `account_key_env` (env-var name) fields on `DestinationConfig`.  Key is wrapped in `Zeroizing<String>` on read — same SecOps treatment as `access_key_env`.
+- **`feat(destination/azure)`** — endpoint is auto-derived from `account_name` (`https://<account_name>.blob.core.windows.net`); explicit `endpoint:` still wins (needed for Azurite, sovereign clouds, custom DNS).
+- **`feat(config)`** — `allow_anonymous: true` for [Azurite](https://learn.microsoft.com/azure/storage/common/storage-use-azurite) emulator and public read-only containers.  Refuses to combine with explicit `account_name` / `account_key_env`.
+- **`feat(pipeline/finalize)`** — manifest's `destination.uri` field renders as `az://<container>/<prefix>` (HDFS / azcopy convention).
+- **`feat(preflight/doctor)`** — Azure-aware label (`Azure(<container>)`) and error category (`container not found`).
+- **`docs(cloud-auth.md)`** — new Azure section: Path A (account_key) + Path B (Azurite) + troubleshooting + use-case recommendations.  Reserved 0.7.2 surface documented: SAS token, service principal, managed identity, connection string — all additive, no breaking changes.
+
+Not in 0.7.1 (planned for 0.7.2, additive):
+- SAS token (`sas_token_env`)
+- Service principal (`tenant_id` / `client_id` / `client_secret_env`)
+- Managed identity (when rivet runs inside Azure VM / AKS / Functions)
+- Connection string (`connection_string_env`)
+
+### `--validate` and `doctor` now expand placeholders
+
+Found while live-testing Azure on 2026-05-21: `rivet validate` against a
+config with `prefix: "runs/{date}/{export}/"` returned `status: legacy_run`
+because the verifier looked at the literal template, not the substituted
+`runs/2026-05-21/orders_azure_smoke/` path where data actually lives.
+`doctor` exhibited the same symptom by writing a probe at the literal
+`runs/{date}/{export}/.rivet_doctor_probe`.
+
+- **`fix(validate)`** — `run_validate_command` now applies `{date}`/`{export}`/`{table}` substitution via `plan::build::expand_destination_templates` before constructing the destination.  Same expansion `rivet run` already used.
+- **`fix(doctor)`** — same substitution applied at the `check_destination_auth` probe site so doctor no longer leaves literal-template stub objects in cloud buckets.
+- This is **cross-cloud** — the bug affected S3 / GCS / Azure equally.  No engine-specific code touched.
+- The substitution uses **today's UTC date**.  If validate is invoked the day after a run, the operator should inline the absolute prefix in config; a planned `--run-id` / `--date` flag (0.7.2) will allow re-targeting historical runs.
+
+### Cohesion pass on `DestinationConfig`
+
+- **`refactor(config)`** — `#[derive(Default)]` on `DestinationType` (Local) and `DestinationConfig`.
+- **`refactor(destination/s3)`** — extracted `read_credential_env(env_name, label) -> Result<Zeroizing<String>>` helper, used in all three credential paths (access key, secret key, session token).  Trimmed the 13-line inline IMDS warning down to a 4-line pointer at `docs/cloud-auth.md`.
+- **`refactor(tests)`** — all 28 literal `DestinationConfig { ... }` init sites across `pipeline/*`, `plan/*`, `destination/*`, `preflight/*`, and integration tests converted to `..Default::default()`.  Net **−227 lines**.
+
+### AWS S3 — STS/SSO/AssumeRole/MFA support + auth-flow docs
+
+Found while live-testing 0.7.0 against a real S3 bucket (`s3://rivet-data-test/`,
+`eu-north-1`): the `aws_profile:` config path uses reqsign's default-chain
+loader, which silently falls through to EC2 IMDS on developer laptops when
+the named profile carries an AWS IAM Identity Center / "AWS Login" session
+(short-lived creds in `~/.aws/login/cache/`, not in `~/.aws/credentials`).
+IMDS is unreachable off-EC2 → ~3 minutes of retries → confusing hang.
+
+- **`feat(config)`** — new `session_token_env` field on `DestinationConfig`.
+  Pair with `access_key_env` + `secret_key_env` to authenticate as a
+  short-lived STS session (any access key starting with `ASIA…`):
+  AWS IAM Identity Center / SSO, `aws sts assume-role`, MFA-protected
+  sessions, EKS IRSA, GitHub Actions OIDC, etc.
+
+  ```yaml
+  destination:
+    type: s3
+    bucket: my-bucket
+    region: eu-north-1
+    access_key_env: AWS_ACCESS_KEY_ID
+    secret_key_env: AWS_SECRET_ACCESS_KEY
+    session_token_env: AWS_SESSION_TOKEN
+  ```
+
+  Bridge from AWS CLI v2 (any auth flow):
+  ```bash
+  eval "$(aws configure export-credentials --profile default --format env)"
+  ```
+
+- **`docs(cloud-auth.md)`** — new auth-flow matrix covering all six
+  S3/GCS paths (static IAM key, STS/SSO temporary creds, `aws_profile`
+  static, ADC for GCS, service-account JSON, anonymous/emulator) plus
+  a troubleshooting table for the most common operator-confusing errors
+  (IMDS timeout, `InvalidAccessKeyId`, region mismatch, ADC expired).
+
+- **`docs(s3.rs)`** — added a warning at the `aws_profile` code site
+  pointing at `docs/cloud-auth.md` when the operator sees an IMDS
+  timeout, and clarifying the chain's failure mode.
+
+## 0.7.0 (2026-05-21)
+
+### Cloud manifest contract — write, verify, resume, quarantine
+
+A trust-contract release.  Every export now leaves behind an inspectable
+on-disk run report, **and** every cloud-or-local-file destination gains a
+public JSON manifest + `_SUCCESS` marker that downstream consumers
+(Airflow sensors, CI gating, custom verifiers) can read directly.
+`--validate` and `--resume` now consult the manifest to certify the
+dataset and to reconcile prior committed parts before re-running work.
+
+ADR-0012 ("Cloud manifest contract") and ADR-0013 ("Trust flag contract")
+are the wire-format and operator-facing CLI contracts respectively.
+Both lock the surface so future releases can extend semantics without
+breaking existing automation.
+
+#### Per-run reports
+
+- **`feat(report)`** — every run writes two files under
+  `.rivet/runs/<run_id>/` (next to `.rivet_state.db`):
+  - `summary.json` — machine-readable run report with a stable JSON
+    schema (`run_id`, `status`, timing, plan, throughput counters,
+    validation / reconciliation verdicts, error message, resume hint,
+    manifest verification verdict).
+  - `summary.md` — operator-friendly Markdown for pull requests, support
+    tickets, and incident reviews.
+  - Failures to write are non-fatal (ADR-0001 §I7): the pipeline keeps
+    its exit code and the resume hint is still surfaced to stderr even
+    when disk-full prevents the report from landing.
+- **`feat(cli)`** — the stderr run-summary block is followed by a
+  `report:` line pointing at the on-disk Markdown, and (on a failed run
+  with at least one committed file) a `resume:` line containing a
+  copy-pasteable `rivet run --config <path> --resume` command.
+
+#### Cloud manifest + `_SUCCESS` (ADR-0012)
+
+- **`feat(manifest)`** — every export to a non-streaming destination
+  writes:
+  - `<dest>/manifest.json` — versioned JSON with `run_id`, `export_name`,
+    `started_at`/`finished_at`, `status`, `source.{engine,schema,table}`,
+    `destination.{kind,uri}`, `format`, `compression`, `schema_fingerprint`,
+    `row_count`, `part_count`, and a `parts[]` array (`part_id`, `path`,
+    `rows`, `size_bytes`, `content_fingerprint`, `status`).
+  - `<dest>/_SUCCESS` — single-line `xxh3:<16-hex>` body whose value is
+    the xxh3 of the just-written `manifest.json` bytes.  An orchestrator
+    can poll `_SUCCESS` (cheap GET) to detect manifest changes between
+    runs (ADR-0012 §M2).
+- **M1/M2 ordering**: parts before manifest; manifest before `_SUCCESS`.
+  Both writes use the destination's atomic-PUT path (S3 / GCS) or
+  `fs::copy` (local).  `_SUCCESS` is written iff `status: success`.
+- **M3 fingerprints**: schema fingerprint (`xxh3` over sorted
+  `[{name, type}]`) and per-part content fingerprint (`xxh3` over the
+  written bytes) — both `xxh3:<16-hex>` shape, prefix reserved so future
+  sha256/blake3 hashers can coexist without a schema break.
+- **M4 atomicity**: a given `run_id` produces exactly one manifest;
+  resumed runs that complete additional parts write a fresh manifest
+  atomically (server-side replace on cloud, `rename` on local) — never
+  amended in place.
+
+#### Manifest-aware `--validate` (ADR-0012 §M5/M6, ADR-0013)
+
+- **`feat(validate)`** — `rivet run --validate` now extends the existing
+  per-file row-count check with manifest-aware verification:
+  - Reads `manifest.json` from the destination.
+  - For each committed part: confirms the object exists at the recorded
+    `size_bytes`.
+  - Verifies `_SUCCESS` body matches `xxh3(manifest.json bytes)`.
+  - Surfaces self-consistency violations (declared `row_count` vs
+    actual sum, duplicate `part_id`, unsupported `manifest_version`).
+  - Lists the prefix and flags untracked surplus objects.
+- **M6 legacy fallback**: when no manifest is present at the prefix
+  (pre-0.7.0 export), the report carries `legacy_run: true` so an
+  operator sees the reduced assurance explicitly — silent fallback is
+  forbidden.
+- **`feat(rivet validate)`** — new standalone subcommand:
+  `rivet validate [--config path] [--export name] [--format pretty|json]`
+  re-runs the same M5/M6 checks against an existing destination
+  without performing an extraction.  Useful for between-run polling
+  (Airflow sensors, CI gating, triage on a suspected-broken dataset).
+  Exit 0 when every export passed (or when only legacy_run labels were
+  emitted); exit non-zero on any explicit M5 failure.  Failure variants
+  in the JSON report carry a `kind` discriminator for stable consumer
+  parsing.
+
+#### Manifest-aware `--reconcile`
+
+- **`fix(reconcile)`** — `--reconcile` now compares the source's
+  `SELECT COUNT(*)` against the manifest's *cumulative* row total
+  (sum of committed parts), not just this run's writes.  Before this
+  fix, a resume run that re-exported only a single chunk would falsely
+  report MISMATCH because `total_rows` reflected just the resumed
+  chunk's rows.  Now: cumulative-vs-source is the correct invariant.
+
+#### Manifest-aware `--resume` (ADR-0012 §M8/M9)
+
+- **`feat(--resume)`** — chunked-checkpoint resume now reconciles state
+  with destination: at resume start, read `manifest.json` + listing,
+  apply ADR-0012 M8's decision matrix per part:
+  - `Skip` (manifest part exists at recorded size) → state row stays
+    `completed`, no re-export.
+  - `Rewrite` (manifest part missing) → state row reset to `pending`
+    so the worker re-exports it.
+  - `Quarantine` (size or fingerprint drift) → state row reset, AND
+    the divergent destination object is moved to
+    `_quarantine/<run_id>/<original-name>` so the active prefix stays
+    clean for the new write.
+  - Untracked surplus objects (under prefix but not in manifest) are
+    quarantined too, never deleted.
+- **M9 quarantine** is best-effort per ADR (`Destination::r#move` —
+  `fs::rename` on local, server-side rewrite + delete on S3/GCS).
+  Failures are logged at WARN and never fatal — a clutter problem
+  is never escalated to an extraction failure.
+- **`feat(--force)`** — new safety override on `rivet run`.
+  Required when `--resume`'s gate refuses to start (destination prefix
+  already has `_SUCCESS` from a prior completed run).  Per ADR-0013
+  this is the *one* `--force` flag, scoped per-gate; future gates
+  reuse the same flag rather than adding `--force-overwrite`,
+  `--force-resume`, etc.
+
+#### CLI surface
+
+- **`rivet run`** flags: `--validate`, `--reconcile`, `--resume`,
+  `--force` — pinned by ADR-0013 acceptance criterion.  M5/M6/M8/M9
+  land entirely under existing flags; no new trust noun on `run`.
+- **`rivet validate`** is the only new top-level subcommand.  Standalone
+  driver for the manifest-verify flow (ADR-0013 "Subcommand carveouts").
+- An anchor test in `tests/trust_artifacts_integration.rs` §24 pins
+  the exact flag set on `rivet run --help`; future PRs that add a
+  trust-related flag will trip the test until ADR-0013 is amended.
+
+#### Internal: layer hygiene + state schema v8
+
+- The internal SQLite file ledger was renamed from `file_manifest` to
+  `file_log` (schema migration v8) to free the `manifest` name for the
+  0.7.0 public JSON contract.  Existing 0.6.0 state DBs migrate
+  transparently.
+- Layer assignments updated in ADR-0003: a new "Trust contract types"
+  category covers `manifest.rs`, `pipeline::resume_decisions`, and
+  `destination::ObjectMeta` (pure data + pure functions, no L1-L4
+  classification).
+- `pipeline::finalize` extracted from `pipeline::job` so the four
+  end-of-run hooks (manifest write, validate-against-destination, run
+  report, notification) sit in one focused module.  ADR-0001 §I8
+  (Finalize Order: Manifest → Verification → Report) pins the call
+  order so future refactors can't silently re-order observability
+  artifacts.
+- `pipeline::for_tests` module — public CLI surface vs test-only window
+  cleanly separated.  Tests reach internal items via
+  `rivet::pipeline::for_tests::*`; the public `rivet::pipeline::*` API
+  shrank to just the CLI command drivers + `RunSummary`.
+- `RunSummary::stub_for_testing` + chainable setters — one canonical
+  builder shared by 7+ test sites.  Adding a field to `RunSummary` now
+  costs one default-value entry rather than a 9-place edit.
+
+## 0.6.1 (folded into 0.7.0)
+
+The trust-polish work originally scoped for 0.6.1 (per-run reports,
+schema-evidence storage, resume-command hints) ships as part of 0.7.0
+above.  Releasing 0.6.1 separately would have left the report
+unaware of the manifest, which is most of its operator value.
+
+#### New artifacts
+
+- **`feat(report)`** — every run now writes two files under
+  `.rivet/runs/<run_id>/` (placed next to `.rivet_state.db`):
+  - `summary.json` — machine-readable run report with a stable JSON schema
+    (`run_id`, `status`, timing, plan, throughput counters, validation /
+    reconciliation verdicts, error message, resume hint).
+  - `summary.md` — operator-friendly Markdown for pull requests, support
+    tickets, and incident reviews.
+  - Source: `src/pipeline/report.rs`. Failures to write are non-fatal: the
+    pipeline keeps its exit code and the resume hint is still surfaced to
+    stderr even when disk-full prevents the report from landing.
+- **`feat(cli)`** — the stderr run-summary block is now followed by a
+  `report:` line pointing at the on-disk Markdown, and (when the run failed
+  after committing at least one file) a `resume:` line containing a
+  copy-pasteable `rivet run --config <path> --resume` command.
+
+#### Internal: state schema v8 — `file_manifest` → `file_log`
+
+The internal SQLite ledger of files written by an export has been renamed
+from `file_manifest` to `file_log`. The name **`manifest`** is reclaimed for
+the 0.7.0 cloud-output JSON contract (a separate, public artifact); the
+internal log retains the same shape and is migrated automatically on first
+open via schema migration v8 (`ALTER TABLE … RENAME TO …`, plus a rename of
+the supporting index).
+
+Existing 0.6.0 state DBs are upgraded transparently; no operator action is
+required. The Rust module is now `src/state/file_log.rs`; the `FileRecord`
+re-export at `rivet::state::FileRecord` is unchanged.
+
 ## 0.6.0 (2026-05-19)
 
 ### Configuration ergonomics, MySQL parity, pooler-awareness, and a published cross-tool benchmark

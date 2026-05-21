@@ -218,16 +218,8 @@ mod tests {
             skip_empty: false,
             destination: DestinationConfig {
                 destination_type: DestinationType::Local,
-                bucket: None,
-                prefix: None,
                 path: Some("./out".to_string()),
-                region: None,
-                endpoint: None,
-                credentials_file: None,
-                access_key_env: None,
-                secret_key_env: None,
-                aws_profile: None,
-                allow_anonymous: false,
+                ..Default::default()
             },
             meta_columns: MetaColumns::default(),
             quality: None,
@@ -378,15 +370,7 @@ mod tests {
         DestinationConfig {
             destination_type: dtype,
             bucket: Some("b".to_string()),
-            prefix: None,
-            path: None,
-            region: None,
-            endpoint: None,
-            credentials_file: None,
-            access_key_env: None,
-            secret_key_env: None,
-            aws_profile: None,
-            allow_anonymous: false,
+            ..Default::default()
         }
     }
 

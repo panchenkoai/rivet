@@ -10,6 +10,65 @@ pub struct SchemaColumn {
     pub data_type: String,
 }
 
+/// Compute the canonical schema fingerprint for a set of columns.
+///
+/// The fingerprint is `"xxh3:<16-char-lowercase-hex>"`.  The algorithm prefix
+/// is part of the format so future hashers (sha256, blake3) can coexist —
+/// readers MUST verify the prefix before interpreting the hex body.
+///
+/// Canonicalization: columns are sorted by name (case-sensitive) and
+/// serialized as `<name>\t<data_type>\n` joined with no separator.  Column
+/// **order** in the source schema does not affect the fingerprint, but
+/// column **names** and **types** do; renaming or retyping a column changes
+/// the fingerprint.
+///
+/// This is the value written to the manifest's `schema_fingerprint` field
+/// (ADR-0012 M3) and is what `--validate` compares against to detect
+/// schema drift between the time of write and the time of verify.
+pub fn schema_fingerprint(columns: &[SchemaColumn]) -> String {
+    use xxhash_rust::xxh3::Xxh3;
+
+    let mut sorted: Vec<&SchemaColumn> = columns.iter().collect();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut h = Xxh3::new();
+    for c in &sorted {
+        h.update(c.name.as_bytes());
+        h.update(b"\t");
+        h.update(c.data_type.as_bytes());
+        h.update(b"\n");
+    }
+    format!("xxh3:{:016x}", h.digest())
+}
+
+/// Convert an Arrow schema (the dest-facing one, after internal columns are
+/// stripped — see `pipeline::sink`) into the `Vec<SchemaColumn>` the rest of
+/// the trust contract uses (`schema_fingerprint`, `store_schema`,
+/// `detect_schema_change`).
+///
+/// This is the canonical bridge between the Arrow type system and Rivet's
+/// schema-evidence representation.  It used to be inlined in three places
+/// (`pipeline/single.rs`, `pipeline/chunked/exec.rs`,
+/// `pipeline/chunked/parallel_checkpoint.rs`); each copy was a regression
+/// risk because changing the data-type representation in one would silently
+/// shift the fingerprint there but not in the others.  Centralising the
+/// conversion keeps the fingerprint stable across executors.
+///
+/// Format note: `data_type` is rendered with `{:?}` (Arrow's `Debug`), e.g.
+/// `Int64`, `Utf8`, `Timestamp(Microsecond, None)`.  This is what every
+/// existing manifest already records; switching to `Display` would shift
+/// every fingerprint in the world and is intentionally avoided.
+pub fn arrow_schema_to_columns(schema: &arrow::datatypes::Schema) -> Vec<SchemaColumn> {
+    schema
+        .fields()
+        .iter()
+        .map(|f| SchemaColumn {
+            name: f.name().clone(),
+            data_type: format!("{:?}", f.data_type()),
+        })
+        .collect()
+}
+
 /// Diff between two schema snapshots.
 #[derive(Debug)]
 pub struct SchemaChange {
@@ -323,5 +382,86 @@ mod tests {
             no_change.is_none(),
             "after store, same schema must produce no change"
         );
+    }
+
+    // ── schema_fingerprint ───────────────────────────────────────────────────
+
+    fn col(name: &str, ty: &str) -> SchemaColumn {
+        SchemaColumn {
+            name: name.into(),
+            data_type: ty.into(),
+        }
+    }
+
+    #[test]
+    fn fingerprint_format_is_xxh3_prefix_plus_16_hex() {
+        let fp = schema_fingerprint(&[col("id", "Int64")]);
+        assert!(fp.starts_with("xxh3:"), "fp = {fp}");
+        let hex = &fp["xxh3:".len()..];
+        assert_eq!(hex.len(), 16, "fp = {fp}");
+        assert!(
+            hex.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "fp = {fp}"
+        );
+    }
+
+    #[test]
+    fn fingerprint_is_order_independent() {
+        let a = vec![col("id", "Int64"), col("name", "Utf8")];
+        let b = vec![col("name", "Utf8"), col("id", "Int64")];
+        assert_eq!(schema_fingerprint(&a), schema_fingerprint(&b));
+    }
+
+    #[test]
+    fn fingerprint_changes_on_rename() {
+        let a = vec![col("id", "Int64")];
+        let b = vec![col("user_id", "Int64")];
+        assert_ne!(schema_fingerprint(&a), schema_fingerprint(&b));
+    }
+
+    #[test]
+    fn fingerprint_changes_on_retype() {
+        let a = vec![col("price", "Int64")];
+        let b = vec![col("price", "Float64")];
+        assert_ne!(schema_fingerprint(&a), schema_fingerprint(&b));
+    }
+
+    #[test]
+    fn fingerprint_changes_on_column_add_or_remove() {
+        let a = vec![col("id", "Int64")];
+        let b = vec![col("id", "Int64"), col("email", "Utf8")];
+        assert_ne!(schema_fingerprint(&a), schema_fingerprint(&b));
+    }
+
+    #[test]
+    fn fingerprint_is_stable_across_invocations() {
+        // Guards against accidental non-determinism (HashMap iteration order,
+        // process-local randomness in a future xxh3 update, etc).  This is
+        // the value written to manifests — it MUST be reproducible.
+        let cols = vec![col("a", "Int64"), col("b", "Utf8"), col("c", "Float64")];
+        let fp1 = schema_fingerprint(&cols);
+        let fp2 = schema_fingerprint(&cols);
+        let fp3 = schema_fingerprint(&cols);
+        assert_eq!(fp1, fp2);
+        assert_eq!(fp2, fp3);
+    }
+
+    #[test]
+    fn fingerprint_distinguishes_split_columns() {
+        // Defends against a naive concat-without-separator implementation:
+        // "ab" + "c" must hash differently from "a" + "bc".
+        let a = vec![col("ab", "Int64"), col("c", "Utf8")];
+        let b = vec![col("a", "Int64"), col("bc", "Utf8")];
+        assert_ne!(schema_fingerprint(&a), schema_fingerprint(&b));
+    }
+
+    #[test]
+    fn fingerprint_empty_input_is_well_defined() {
+        // Empty schema (no columns) must produce a deterministic value
+        // rather than panicking; the manifest writer may need to emit a
+        // placeholder fingerprint for degenerate plans.
+        let fp = schema_fingerprint(&[]);
+        assert!(fp.starts_with("xxh3:"));
     }
 }

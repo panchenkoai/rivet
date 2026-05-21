@@ -101,19 +101,36 @@ fn reconcile_source_count(plan: &ResolvedRunPlan, summary: &mut RunSummary) {
         Ok(Some(val)) => {
             if let Ok(count) = val.parse::<i64>() {
                 summary.source_count = Some(count);
-                summary.reconciled = Some(summary.total_rows == count);
-                if summary.total_rows != count {
+                // ADR-0012 manifest-aware reconcile: compare source COUNT(*)
+                // against the manifest's *cumulative* row total (sum of
+                // committed parts), not just this run's writes.  In a
+                // resume scenario, `summary.total_rows` reflects only the
+                // chunks that re-ran in this invocation (e.g. 500 for one
+                // chunk), while the on-disk dataset is everything that
+                // ever committed (e.g. 2500 across resume attempts).
+                // Comparing total_rows would falsely report MISMATCH on
+                // every resume.  The manifest_parts accumulator already
+                // holds the cumulative count (Phase C-γ hydration); use
+                // its sum for the comparison.
+                let committed_rows: i64 = summary.manifest_parts.iter().map(|p| p.rows).sum();
+                let exported_total = if committed_rows > 0 {
+                    committed_rows
+                } else {
+                    summary.total_rows
+                };
+                summary.reconciled = Some(exported_total == count);
+                if exported_total != count {
                     log::warn!(
-                        "reconcile MISMATCH for '{}': exported {} rows, source has {}",
+                        "reconcile MISMATCH for '{}': committed {} rows, source has {}",
                         plan.export_name,
-                        summary.total_rows,
+                        exported_total,
                         count
                     );
                 } else {
                     log::info!(
                         "reconcile MATCH for '{}': {}/{}",
                         plan.export_name,
-                        summary.total_rows,
+                        exported_total,
                         count
                     );
                 }
@@ -175,6 +192,9 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
         source_count: None,
         pg_temp_bytes_delta: None,
         reconciled: None,
+        manifest_parts: Vec::new(),
+        schema_fingerprint: None,
+        manifest_verification: None,
         journal,
     }
 }
@@ -227,6 +247,19 @@ pub(super) fn run_export_job(
         );
         let summary = synthetic_failed_summary(&export.name, &err);
         return (Err(err), summary);
+    }
+
+    // ADR-0012 M8 / ADR-0013: refuse `--resume` against a destination whose
+    // `_SUCCESS` marker is already present unless the operator explicitly
+    // overrode the gate with `--force`.  Re-exporting over a verified
+    // dataset is almost never what the operator meant; the gate makes the
+    // override an audited decision.
+    if opts.resume
+        && !opts.force
+        && let Err(e) = check_success_gate_for_resume(&plan)
+    {
+        let summary = synthetic_failed_summary(&export.name, &e);
+        return (Err(e), summary);
     }
 
     log::info!(
@@ -364,11 +397,29 @@ pub(super) fn run_export_job(
     }
 
     summary.print();
+    // Order matters: write the manifest first, then run the manifest-aware
+    // `--validate` pass against the destination, then write the run report.
+    // The report sees the verification verdict only because we run it before
+    // `finalize_run_report`.  The notification fires last so it carries the
+    // most complete summary.
+    finalize_manifest(&plan, state, &summary, "export");
+    if plan.validate {
+        finalize_validate_manifest(&plan, &mut summary, "export");
+    }
+    finalize_run_report(config_path, &summary, "export");
     crate::notify::maybe_send(config.notifications.as_ref(), &summary);
 
     let final_result = if failed { result } else { Ok(()) };
     (final_result, summary)
 }
+
+// `finalize_*` and the M8 success-gate live in `pipeline::finalize` so this
+// file stays focused on orchestration (build plan → dispatch → record
+// metric → call finalize hooks).  Imports below give us local names.
+use super::finalize::{
+    check_success_gate_for_resume, finalize_manifest, finalize_run_report,
+    finalize_validate_manifest,
+};
 
 /// Execute a pre-resolved plan with a caller-supplied `ChunkSource`.
 ///
@@ -379,6 +430,7 @@ pub(crate) fn run_export_job_with_chunk_source(
     plan: &ResolvedRunPlan,
     state: &StateStore,
     chunk_source: chunked::ChunkSource,
+    config_path: &str,
 ) -> Result<()> {
     // Re-validate the plan from the artifact (fast, no DB queries).
     let diags = validate_plan(plan);
@@ -469,6 +521,11 @@ pub(crate) fn run_export_job_with_chunk_source(
     }
 
     summary.print();
+    finalize_manifest(plan, state, &summary, "apply");
+    if plan.validate {
+        finalize_validate_manifest(plan, &mut summary, "apply");
+    }
+    finalize_run_report(config_path, &summary, "apply");
 
     if failed { result } else { Ok(()) }
 }
@@ -536,7 +593,6 @@ mod tests {
         CompressionType, DestinationConfig, DestinationType, FormatType, MetaColumns, SourceConfig,
         SourceType,
     };
-    use crate::journal::RunJournal;
     use crate::plan::{ChunkedPlan, ExtractionStrategy, ResolvedRunPlan};
     use crate::tuning::SourceTuning;
 
@@ -562,16 +618,8 @@ mod tests {
             meta_columns: MetaColumns::default(),
             destination: DestinationConfig {
                 destination_type: DestinationType::Local,
-                bucket: None,
-                prefix: None,
                 path: Some("/tmp".into()),
-                region: None,
-                endpoint: None,
-                credentials_file: None,
-                access_key_env: None,
-                secret_key_env: None,
-                aws_profile: None,
-                allow_anonymous: false,
+                ..Default::default()
             },
             quality,
             tuning: SourceTuning::from_config(None),
@@ -602,32 +650,12 @@ mod tests {
     }
 
     fn fresh_summary(plan: &ResolvedRunPlan, total_rows: i64) -> RunSummary {
-        RunSummary {
-            run_id: "r".into(),
-            export_name: plan.export_name.clone(),
-            status: "running".into(),
-            total_rows,
-            files_produced: 0,
-            bytes_written: 0,
-            files_committed: 0,
-            duration_ms: 0,
-            peak_rss_mb: 0,
-            retries: 0,
-            validated: None,
-            schema_changed: None,
-            quality_passed: None,
-            error_message: None,
-            tuning_profile: "balanced".into(),
-            batch_size: 10_000,
-            batch_size_memory_mb: None,
-            format: "parquet".into(),
-            mode: "chunked".into(),
-            compression: "none".into(),
-            source_count: None,
-            pg_temp_bytes_delta: None,
-            reconciled: None,
-            journal: RunJournal::new("r", &plan.export_name),
-        }
+        let mut s = RunSummary::stub_for_testing("r", plan.export_name.clone());
+        s.total_rows = total_rows;
+        s.batch_size = 10_000;
+        s.mode = "chunked".into();
+        s.compression = "none".into();
+        s
     }
 
     #[test]

@@ -82,7 +82,7 @@ pub fn run_apply_command(plan_file: &str, force: bool) -> Result<()> {
 
     // 6. Execute using the plan from the artifact
     let plan = artifact.resolved_plan.clone();
-    super::run_export_job_with_chunk_source(&plan, &state, chunk_source)
+    super::run_export_job_with_chunk_source(&plan, &state, chunk_source, plan_file)
 }
 
 #[cfg(test)]
@@ -111,16 +111,8 @@ mod tests {
             meta_columns: MetaColumns::default(),
             destination: DestinationConfig {
                 destination_type: DestinationType::Local,
-                bucket: None,
-                prefix: None,
                 path: Some("/tmp/rivet_apply_test".into()),
-                region: None,
-                endpoint: None,
-                credentials_file: None,
-                access_key_env: None,
-                secret_key_env: None,
-                aws_profile: None,
-                allow_anonymous: false,
+                ..Default::default()
             },
             quality: None,
             tuning: SourceTuning::from_config(None),

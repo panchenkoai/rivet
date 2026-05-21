@@ -68,6 +68,16 @@ pub(crate) fn run_chunked_parallel_checkpoint(
 
     let run_id = ensure_chunk_checkpoint_plan(state, plan, cp, summary, &chunks, config_path)?;
 
+    // ADR-0012 M8: when resuming a chunked run, reconcile the destination's
+    // prior-run manifest with the local chunk_task state.  Parts whose
+    // manifest entry diverges from what's actually on the destination
+    // (missing object, size drift) get their chunk_task reset to `pending`
+    // so the worker loop below re-exports them.  No-op for fresh prefixes
+    // and pre-0.7.0 destinations.  See `pipeline/chunked/resume_m8.rs`.
+    if plan.resume {
+        let _stats = super::apply_m8_resume_decisions(state, &run_id, plan, summary)?;
+    }
+
     let total_tasks = {
         let tasks = state.list_chunk_tasks_for_run(&run_id)?;
         tasks.len().max(1)
@@ -88,6 +98,9 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     let agg_bytes = std::sync::atomic::AtomicU64::new(0);
     let agg_files = std::sync::atomic::AtomicUsize::new(0);
     let errors = std::sync::Mutex::new(Vec::<String>::new());
+    // ADR-0012 M3: schema fingerprint captured once across workers.  None
+    // until any worker exports a non-empty chunk and resolves the dest schema.
+    let shared_fingerprint: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
     let plan_for_workers = plan.clone();
     let cp_for_workers = cp.clone();
@@ -112,6 +125,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
             let agg_bytes = &agg_bytes;
             let agg_files = &agg_files;
             let errors = &errors;
+            let shared_fingerprint = &shared_fingerprint;
             let plan_w = plan_for_workers.clone();
             let cp_w = cp_for_workers.clone();
             let config_path_w = config_path_owned.clone();
@@ -222,6 +236,14 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                 )?;
                                 if let Some(w) = sink.writer.take() {
                                     w.finish()?;
+                                }
+                                // ADR-0012 M3: fingerprint the schema as soon
+                                // as the sink resolves it.  Race-free across
+                                // workers thanks to OnceLock::set semantics.
+                                if let Some(s) = sink.dest_schema.as_deref() {
+                                    let columns = crate::state::arrow_schema_to_columns(s);
+                                    let _ = shared_fingerprint
+                                        .set(crate::state::schema_fingerprint(&columns));
                                 }
                                 if sink.total_rows == 0 {
                                     return Ok((0, None, 0));
@@ -353,6 +375,9 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     pb_cp.finish(summary.total_rows);
     if plan.validate {
         summary.validated = Some(true);
+    }
+    if let Some(fp) = shared_fingerprint.into_inner() {
+        summary.schema_fingerprint = Some(fp);
     }
 
     let errs = errors.into_inner().unwrap_or_else(|e| e.into_inner());

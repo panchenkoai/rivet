@@ -106,6 +106,12 @@ pub(crate) fn run_chunked_sequential(
         if let Some(w) = sink.writer.take() {
             w.finish()?;
         }
+        // ADR-0012 M3: capture the dest schema fingerprint as soon as the
+        // sink resolves a schema (first non-empty chunk).  Idempotent across
+        // subsequent chunks since the schema is identical run-wide.
+        if let Some(s) = sink.dest_schema.as_deref() {
+            super::super::manifest_writer::record_run_schema_fingerprint(summary, s);
+        }
 
         summary.total_rows += sink.total_rows as i64;
         pb.inc(summary.total_rows);
@@ -141,6 +147,15 @@ pub(crate) fn run_chunked_sequential(
             let dest = destination::create_destination(&plan.destination)?;
             dest.write(sink.tmp.path(), &file_name)?;
 
+            // ADR-0012 M1: record the committed chunk part for the manifest.
+            super::super::manifest_writer::record_committed_part(
+                summary,
+                file_name.clone(),
+                sink.total_rows as i64,
+                file_bytes,
+                sink.tmp.path(),
+            );
+
             if let Some(st) = state
                 && let Err(e) = st.record_file(
                     &summary.run_id,
@@ -153,7 +168,7 @@ pub(crate) fn run_chunked_sequential(
                 )
             {
                 log::warn!(
-                    "export '{}': manifest write failed for chunk file '{}' (file was produced): {:#}",
+                    "export '{}': file_log write failed for chunk file '{}' (file was produced): {:#}",
                     plan.export_name,
                     file_name,
                     e
@@ -218,7 +233,14 @@ pub(crate) fn run_chunked_parallel(
     let agg_bytes = std::sync::atomic::AtomicU64::new(0);
     let agg_files = AtomicUsize::new(0);
     let errors = std::sync::Mutex::new(Vec::<String>::new());
-    let file_records: std::sync::Mutex<Vec<(String, i64, i64)>> = std::sync::Mutex::new(Vec::new());
+    // (file_name, rows, bytes, content_fingerprint)
+    let file_records: std::sync::Mutex<Vec<(String, i64, i64, String)>> =
+        std::sync::Mutex::new(Vec::new());
+    // Schema fingerprint captured by whichever worker resolves the dest
+    // schema first.  ADR-0012 M3 — stays None for empty runs (no chunk
+    // produced rows so no schema was seen).  Drained into `summary` after
+    // the parallel scope joins.
+    let shared_fingerprint: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     // Condvar-backed semaphore: blocked spawners park in the kernel until a
     // worker calls `release()`, instead of polling an atomic every 50 ms.
     let semaphore = resource::Semaphore::new(parallel);
@@ -260,6 +282,7 @@ pub(crate) fn run_chunked_parallel(
             let agg_files = &agg_files;
             let errors = &errors;
             let file_records = &file_records;
+            let shared_fingerprint = &shared_fingerprint;
             let semaphore = &semaphore;
             let pb_thread = pb_handle.clone();
             let start = *start;
@@ -293,6 +316,14 @@ pub(crate) fn run_chunked_parallel(
                     if let Some(w) = sink.writer.take() {
                         w.finish()?;
                     }
+                    // ADR-0012 M3: capture the dest schema fingerprint once
+                    // per run.  `OnceLock::set` is a no-op after the first
+                    // successful set, so all later workers race-free.
+                    if let Some(s) = sink.dest_schema.as_deref() {
+                        let columns = crate::state::arrow_schema_to_columns(s);
+                        let _ = shared_fingerprint
+                            .set(crate::state::schema_fingerprint(&columns));
+                    }
 
                     agg_rows.fetch_add(sink.total_rows as i64, Ordering::Relaxed);
 
@@ -324,10 +355,27 @@ pub(crate) fn run_chunked_parallel(
                             fmt.file_extension()
                         );
                         shared_destination.write(sink.tmp.path(), &file_name)?;
-                        file_records
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push((file_name, sink.total_rows as i64, file_bytes as i64));
+                        // ADR-0012 M3: compute the part fingerprint while the
+                        // local tmp file still exists in this worker scope.
+                        let fingerprint = super::super::manifest_writer::compute_part_fingerprint(
+                            sink.tmp.path(),
+                        )
+                        .unwrap_or_else(|e| {
+                            log::warn!(
+                                "export '{}': chunk {} fingerprint failed for '{}' (not fatal): {:#}",
+                                export_name,
+                                i,
+                                file_name,
+                                e
+                            );
+                            "xxh3:0000000000000000".to_string()
+                        });
+                        file_records.lock().unwrap_or_else(|e| e.into_inner()).push((
+                            file_name,
+                            sink.total_rows as i64,
+                            file_bytes as i64,
+                            fingerprint,
+                        ));
                     }
 
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -362,10 +410,18 @@ pub(crate) fn run_chunked_parallel(
     if plan.validate {
         summary.validated = Some(true);
     }
+    // Drain the worker-shared fingerprint into summary.  Stays None for
+    // empty runs (no worker saw a schema) — finalize_manifest then falls
+    // through to the state lookup / placeholder path for those.
+    if let Some(fp) = shared_fingerprint.into_inner() {
+        summary.schema_fingerprint = Some(fp);
+    }
 
     let fmt_name = plan.format.label();
     let comp_name = plan.compression.label();
-    for (fname, rows, bytes) in file_records.into_inner().unwrap_or_else(|e| e.into_inner()) {
+    for (fname, rows, bytes, fingerprint) in
+        file_records.into_inner().unwrap_or_else(|e| e.into_inner())
+    {
         if let Err(e) = state.record_file(
             &summary.run_id,
             &plan.export_name,
@@ -376,12 +432,20 @@ pub(crate) fn run_chunked_parallel(
             Some(comp_name),
         ) {
             log::warn!(
-                "export '{}': manifest write failed for parallel chunk '{}' (file was produced): {:#}",
+                "export '{}': file_log write failed for parallel chunk '{}' (file was produced): {:#}",
                 plan.export_name,
                 fname,
                 e
             );
         }
+        // ADR-0012 M1: aggregate the worker's recorded part into the manifest.
+        super::super::manifest_writer::record_committed_part_with_fingerprint(
+            summary,
+            fname,
+            rows,
+            bytes as u64,
+            fingerprint,
+        );
     }
 
     let errs = errors.into_inner().unwrap_or_else(|e| e.into_inner());
@@ -408,7 +472,6 @@ mod tests {
     use crate::config::{
         CompressionType, DestinationConfig, DestinationType, FormatType, SourceConfig, SourceType,
     };
-    use crate::journal::RunJournal;
     use crate::plan::{ChunkedPlan, ExtractionStrategy, ResolvedRunPlan};
     use crate::source::BatchSink;
     use crate::state::StateStore;
@@ -463,16 +526,8 @@ mod tests {
             meta_columns: Default::default(),
             destination: DestinationConfig {
                 destination_type: DestinationType::Local,
-                bucket: None,
-                prefix: None,
                 path: Some("/tmp".into()),
-                region: None,
-                endpoint: None,
-                credentials_file: None,
-                access_key_env: None,
-                secret_key_env: None,
-                aws_profile: None,
-                allow_anonymous: false,
+                ..Default::default()
             },
             quality: None,
             tuning: SourceTuning::from_config(None),
@@ -503,32 +558,11 @@ mod tests {
     }
 
     fn empty_summary(plan: &ResolvedRunPlan) -> RunSummary {
-        RunSummary {
-            run_id: "test_run".into(),
-            export_name: plan.export_name.clone(),
-            status: "running".into(),
-            total_rows: 0,
-            files_produced: 0,
-            bytes_written: 0,
-            files_committed: 0,
-            duration_ms: 0,
-            peak_rss_mb: 0,
-            retries: 0,
-            validated: None,
-            schema_changed: None,
-            quality_passed: None,
-            error_message: None,
-            tuning_profile: "balanced".into(),
-            batch_size: 10_000,
-            batch_size_memory_mb: None,
-            format: "parquet".into(),
-            mode: "chunked".into(),
-            compression: "none".into(),
-            source_count: None,
-            pg_temp_bytes_delta: None,
-            reconciled: None,
-            journal: RunJournal::new("test_run", &plan.export_name),
-        }
+        let mut s = RunSummary::stub_for_testing("test_run", plan.export_name.clone());
+        s.batch_size = 10_000;
+        s.mode = "chunked".into();
+        s.compression = "none".into();
+        s
     }
 
     // ── sequential ───────────────────────────────────────────────────────────

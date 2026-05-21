@@ -101,32 +101,17 @@ mod tests {
     use crate::config::{NotificationsConfig, NotifyEvent, SlackConfig};
 
     fn stub_summary(status: &str, schema_changed: Option<bool>) -> RunSummary {
-        RunSummary {
-            run_id: "test_run".into(),
-            export_name: "test_export".into(),
-            status: status.into(),
-            total_rows: 100,
-            files_produced: 1,
-            bytes_written: 1024,
-            files_committed: 1,
-            duration_ms: 500,
-            peak_rss_mb: 10,
-            retries: 0,
-            validated: None,
-            schema_changed,
-            quality_passed: None,
-            error_message: None,
-            tuning_profile: "balanced".into(),
-            batch_size: 10_000,
-            batch_size_memory_mb: None,
-            format: "parquet".into(),
-            mode: "full".into(),
-            compression: "zstd".into(),
-            source_count: None,
-            pg_temp_bytes_delta: None,
-            reconciled: None,
-            journal: crate::journal::RunJournal::new("test_run", "test_export"),
-        }
+        let mut s = RunSummary::stub_for_testing("test_run", "test_export");
+        s.total_rows = 100;
+        s.files_produced = 1;
+        s.bytes_written = 1024;
+        s.files_committed = 1;
+        s.duration_ms = 500;
+        s.peak_rss_mb = 10;
+        s.batch_size = 10_000;
+        s.mode = "full".into();
+        s.schema_changed = schema_changed;
+        s.with_status(status)
     }
 
     #[test]

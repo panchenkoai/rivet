@@ -29,12 +29,14 @@ use super::parent_ui::{ChildWaitStatus, UiMessage};
 /// `stderr_dump` is a pre-rendered block (already terminated by `\n`) that
 /// the caller prints verbatim on stderr; empty when no child wrote
 /// anything to its captured stderr.
+#[allow(clippy::too_many_arguments)] // forwarding parent's flag set to children
 pub(super) fn run_exports_as_child_processes(
     config_path: &str,
     exports: &[&ExportConfig],
     validate: bool,
     reconcile: bool,
     resume: bool,
+    force: bool,
     params: Option<&std::collections::HashMap<String, String>>,
 ) -> (Result<()>, HashMap<String, String>, String) {
     let exe = match std::env::current_exe() {
@@ -112,6 +114,9 @@ pub(super) fn run_exports_as_child_processes(
         }
         if resume {
             cmd.arg("--resume");
+        }
+        if force {
+            cmd.arg("--force");
         }
         if let Some(p) = params {
             for (k, v) in p {

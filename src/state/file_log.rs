@@ -2,7 +2,7 @@ use crate::error::Result;
 
 use super::{StateConn, StateStore, pg_sql};
 
-/// One row from `file_manifest`.
+/// One row from `file_log` (formerly `file_manifest`; renamed in schema v8).
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct FileRecord {
@@ -16,11 +16,15 @@ pub struct FileRecord {
     pub created_at: String,
 }
 
-/// File manifest store — reads and writes `file_manifest`.
+/// File log store — reads and writes `file_log`.
 ///
-/// Invariant I2 (Write Before Manifest) governs when `record_file` is called:
-/// only after a destination write succeeds.  Failed writes produce no manifest entry.
-/// Invariant I7 (Manifest Failure Is Non-Fatal) means callers use `let _ = record_file(...)`.
+/// Historical note: this table was named `file_manifest` prior to schema v8.
+/// The name was reclaimed for the 0.7.0 cloud-output JSON manifest contract;
+/// the internal SQLite log was renamed to `file_log` to remove the overload.
+///
+/// Invariant I2 (Write Before Log) governs when `record_file` is called:
+/// only after a destination write succeeds.  Failed writes produce no log entry.
+/// Invariant I7 (File-Log Failure Is Non-Fatal) means callers use `let _ = record_file(...)`.
 impl StateStore {
     #[allow(clippy::too_many_arguments)]
     pub fn record_file(
@@ -34,7 +38,7 @@ impl StateStore {
         compression: Option<&str>,
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        let sql = "INSERT INTO file_manifest (run_id, export_name, file_name, row_count, bytes, format, compression, created_at)
+        let sql = "INSERT INTO file_log (run_id, export_name, file_name, row_count, bytes, format, compression, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
         match &self.conn {
             StateConn::Sqlite(c) => {
@@ -84,13 +88,13 @@ impl StateStore {
                 {
                     (
                         "SELECT run_id, export_name, file_name, row_count, bytes, format, compression, created_at \
-                             FROM file_manifest WHERE export_name = ?1 ORDER BY id DESC LIMIT ?2",
+                             FROM file_log WHERE export_name = ?1 ORDER BY id DESC LIMIT ?2",
                         vec![Box::new(name.to_string()), Box::new(limit_i64)],
                     )
                 } else {
                     (
                         "SELECT run_id, export_name, file_name, row_count, bytes, format, compression, created_at \
-                             FROM file_manifest ORDER BY id DESC LIMIT ?1",
+                             FROM file_log ORDER BY id DESC LIMIT ?1",
                         vec![Box::new(limit_i64)],
                     )
                 };
@@ -118,15 +122,12 @@ impl StateStore {
                 let mut c = client.borrow_mut();
                 let rows = if let Some(name) = export_name {
                     c.query(
-                        &format!("SELECT {} FROM file_manifest WHERE export_name = $1 ORDER BY id DESC LIMIT $2", cols),
+                        &format!("SELECT {} FROM file_log WHERE export_name = $1 ORDER BY id DESC LIMIT $2", cols),
                         &[&name, &limit_i64],
                     )?
                 } else {
                     c.query(
-                        &format!(
-                            "SELECT {} FROM file_manifest ORDER BY id DESC LIMIT $1",
-                            cols
-                        ),
+                        &format!("SELECT {} FROM file_log ORDER BY id DESC LIMIT $1", cols),
                         &[&limit_i64],
                     )?
                 };

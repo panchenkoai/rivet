@@ -61,7 +61,7 @@ Responsible for: durable state across runs. No execution logic.
 | `state/cursor.rs` | Incremental cursor positions (`export_state`) |
 | `state/checkpoint.rs` | Chunk run/task lifecycle (`chunk_run`, `chunk_task`) |
 | `state/metrics.rs` | Run outcome history (`export_metrics`) |
-| `state/manifest.rs` | File manifest (`file_manifest`) |
+| `state/file_log.rs` | Per-export file ledger (`file_log`; renamed from `file_manifest` in schema v8) |
 | `state/schema.rs` | Schema snapshot history (`export_schema`) |
 
 **Rule**: Persistence modules must not contain execution logic or make semantic decisions about when to write.
@@ -90,10 +90,27 @@ Responsible for: surfacing what happened without affecting execution or state.
 | Module | Responsibility |
 |--------|---------------|
 | `pipeline/mod.rs` | Reads config → builds plan → dispatches execution → records metric → notifies |
+| `pipeline/job.rs` | Per-export coordinator: builds plan → dispatches single/chunked → finalizes manifest/report/notification |
+| `pipeline/{validate_cmd,reconcile_cmd,repair_cmd}.rs` | Standalone subcommand drivers — re-run a single check (manifest verify / source COUNT / repair) against an existing destination, no extraction. Do not bridge layers as freely as `pipeline/mod.rs`; each is a thin Coordinator-shaped driver for one ADR-0012 concern. |
 
 `pipeline/mod.rs` is the only module permitted to touch all three layers. It must remain thin: its role is orchestration, not logic ownership.
 
-**`RunOptions<'a>`** is defined in `pipeline/mod.rs` and passed through the execution stack. It bundles the per-run CLI flags (`validate`, `reconcile`, `resume`, `params`) as a named struct, replacing a sequence of positional `bool` arguments that were invisible at call sites and prone to transposition bugs. The coordinator constructs `RunOptions` once from the public `run()` signature, then passes it to `run_export_job` and (via individual fields) to `run_exports_as_child_processes`.
+**`RunOptions<'a>`** is defined in `pipeline/mod.rs` and passed through the execution stack. It bundles the per-run CLI flags (`validate`, `reconcile`, `resume`, `force`, `params`) as a named struct, replacing a sequence of positional `bool` arguments that were invisible at call sites and prone to transposition bugs. The coordinator constructs `RunOptions` once from the public `run()` signature, then passes it to `run_export_job` and (via individual fields) to `run_exports_as_child_processes`.
+
+### Trust contract types (no layer — shared schema)
+
+A small set of modules holds **wire-format types** that cross every layer
+boundary without making decisions of their own.  They are not classified
+under L1–L4 because they are pure data carriers + pure functions.
+
+| Module | Responsibility |
+|--------|---------------|
+| `manifest.rs` (top-level) | `RunManifest` / `ManifestPart` / `ManifestStatus` wire schema; `validate_self_consistency`, `success_marker_body`, `parse_success_marker` pure helpers |
+| `pipeline/resume_decisions.rs` | Pure M8 decision matrix (`ResumePlan`, `ResumeDecision`); no I/O — fits L1 Planning by classification but is grouped here because its contract is the decision schema |
+| `destination::ObjectMeta` | Read-side metadata the Observability layer (`validate_manifest`) and Planning layer (`resume_decisions`) both consume |
+
+**Rule**: trust-contract modules must not depend on L2/L3/L4 modules.
+They are leaves of the dependency graph; everything else may import them.
 
 ---
 

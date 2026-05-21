@@ -17,6 +17,7 @@
 use super::ipc::{self, ChildEvent};
 use super::{format_bytes, multi_export_mode, strip_chunked_recovery_hint};
 use crate::journal::{PlanSnapshot, RunEvent, RunJournal};
+use crate::manifest::ManifestPart;
 use crate::plan::ResolvedRunPlan;
 
 /// Build a `PlanSnapshot` from a `ResolvedRunPlan`.
@@ -83,6 +84,31 @@ pub struct RunSummary {
     pub source_count: Option<i64>,
     /// Whether reconciliation passed (Some(true) = match, Some(false) = mismatch, None = skipped).
     pub reconciled: Option<bool>,
+    /// Committed parts accumulated during the run, in commit order.  Populated by
+    /// `pipeline::manifest_writer::record_committed_part` at each `dest.write`
+    /// site (ADR-0012 M1 — Parts Before Manifest).  Drained at finalize into a
+    /// `RunManifest` by [`crate::pipeline::manifest_writer::write_manifest`].
+    pub manifest_parts: Vec<ManifestPart>,
+    /// xxh3 fingerprint of the dest-facing column schema for this run, in the
+    /// canonical `xxh3:<16-hex>` form produced by [`crate::state::schema_fingerprint`].
+    ///
+    /// Recorded by [`crate::pipeline::manifest_writer::record_run_schema_fingerprint`]
+    /// the first time the sink has resolved a schema (i.e. on the first batch
+    /// of any chunk).  Idempotent within a run — the schema is identical across
+    /// chunks, so later writes are no-ops.
+    ///
+    /// `finalize_manifest` reads this directly so the manifest's
+    /// `schema_fingerprint` no longer depends on the per-export schema row
+    /// happening to land in `state` before the manifest write.  The state
+    /// lookup remains a fallback for resume scenarios where the summary was
+    /// reconstructed without ever seeing a live schema.
+    pub schema_fingerprint: Option<String>,
+    /// Result of the manifest-aware `--validate` pass (ADR-0012 M5/M6,
+    /// ADR-0013).  Populated by `pipeline::job::finalize_validate_manifest`
+    /// after `finalize_manifest` succeeds; `None` when the run targeted a
+    /// streaming destination, when `--validate` was not requested, or when
+    /// the run failed before any manifest could be written.
+    pub manifest_verification: Option<crate::pipeline::ManifestVerification>,
     /// Structured event log for this run.  Answers the four DoD observability questions.
     pub journal: RunJournal,
 }
@@ -129,8 +155,134 @@ impl RunSummary {
             pg_temp_bytes_delta: None,
             source_count: None,
             reconciled: None,
+            manifest_parts: Vec::new(),
+            schema_fingerprint: None,
+            manifest_verification: None,
             journal,
         }
+    }
+
+    /// One canonical builder for tests across the crate + integration suite.
+    ///
+    /// Every field is filled with a sensible default; callers tweak only what
+    /// the test cares about via the chainable setters below.  This replaces
+    /// the seven copies of `stub_summary` / `fresh_summary` / `make_summary`
+    /// / `dummy_summary` / `empty_summary` that used to live in `notify.rs`,
+    /// `report.rs`, `chunked/{exec,mod}.rs`, `manifest_writer.rs`, and the
+    /// two integration-test files.  When `RunSummary` gains a field, it is
+    /// updated here once instead of across nine sites.
+    ///
+    /// Available outside `pipeline` (`pub` not `pub(crate)`) so integration
+    /// tests in `tests/` can use it via `RunSummary::stub_for_testing(...)`.
+    /// The `_for_testing` suffix is the convention from elsewhere in the
+    /// codebase (`destination_for_tests`, etc.) — production code should
+    /// never call it.
+    ///
+    /// `#[allow(dead_code)]` on each helper because the bin target's
+    /// dead-code analysis doesn't see uses from integration tests in `tests/`.
+    /// The lib's unit tests + the integration suite together exercise every
+    /// helper; the attribute is a no-op for them.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn stub_for_testing(run_id: impl Into<String>, export_name: impl Into<String>) -> Self {
+        let run_id = run_id.into();
+        let export_name = export_name.into();
+        let journal = RunJournal::new(&run_id, &export_name);
+        Self {
+            run_id,
+            export_name,
+            status: "running".into(),
+            total_rows: 0,
+            files_produced: 0,
+            bytes_written: 0,
+            files_committed: 0,
+            duration_ms: 0,
+            peak_rss_mb: 0,
+            retries: 0,
+            validated: None,
+            schema_changed: None,
+            quality_passed: None,
+            error_message: None,
+            tuning_profile: "balanced".into(),
+            batch_size: 1000,
+            batch_size_memory_mb: None,
+            format: "parquet".into(),
+            mode: "snapshot".into(),
+            compression: "zstd".into(),
+            pg_temp_bytes_delta: None,
+            source_count: None,
+            reconciled: None,
+            manifest_parts: Vec::new(),
+            schema_fingerprint: None,
+            manifest_verification: None,
+            journal,
+        }
+    }
+
+    /// Test-only chainable setter for the run's status field.
+    ///
+    /// Used to build success/failed/running variants without re-listing every
+    /// field.  Keeps the journal in sync: terminal statuses get a matching
+    /// `RunCompleted` event recorded so consumers reading
+    /// `journal.final_outcome()` see the right shape.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn with_status(mut self, status: impl Into<String>) -> Self {
+        let s = status.into();
+        if (s == "success" || s == "failed") && self.journal.final_outcome().is_none() {
+            self.journal.record(RunEvent::RunCompleted {
+                status: s.clone(),
+                error_message: self.error_message.clone(),
+                duration_ms: self.duration_ms,
+            });
+        }
+        self.status = s;
+        self
+    }
+
+    /// Test-only setter — record `files_committed` so resume-hint logic
+    /// (`pipeline::report`) can detect the "failed run with committed files"
+    /// path that produces a resume command.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn with_files_committed(mut self, n: usize) -> Self {
+        self.files_committed = n;
+        self
+    }
+
+    /// Test-only setter — replace the recorded manifest parts (and adjust
+    /// `total_rows` / `bytes_written` / `files_produced` to keep them
+    /// consistent with the parts list, the way real production code does).
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn with_manifest_parts(mut self, parts: Vec<crate::manifest::ManifestPart>) -> Self {
+        self.total_rows = parts.iter().map(|p| p.rows).sum();
+        self.bytes_written = parts.iter().map(|p| p.size_bytes).sum();
+        self.files_produced = parts.len();
+        self.files_committed = parts.len();
+        self.manifest_parts = parts;
+        self
+    }
+
+    /// Test-only setter — error_message + (optionally) status.  Common
+    /// shape for the "failed-run" fixtures that populated 4+ existing
+    /// stubs.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn with_error(mut self, msg: impl Into<String>) -> Self {
+        self.error_message = Some(msg.into());
+        self
+    }
+
+    /// Test-only setter — record a PlanResolved event in the journal so
+    /// downstream observability paths (`journal.plan_snapshot()`,
+    /// `RunReport::from_summary` plan_origin lookup) see the same shape
+    /// they would on a real run.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn with_plan_snapshot(mut self, snap: PlanSnapshot) -> Self {
+        self.journal.record(RunEvent::PlanResolved(snap));
+        self
     }
 
     pub(super) fn print(&self) {
@@ -550,16 +702,8 @@ mod tests {
             meta_columns: MetaColumns::default(),
             destination: DestinationConfig {
                 destination_type: DestinationType::Local,
-                bucket: None,
-                prefix: None,
                 path: Some("./out".into()),
-                region: None,
-                endpoint: None,
-                credentials_file: None,
-                access_key_env: None,
-                secret_key_env: None,
-                aws_profile: None,
-                allow_anonymous: false,
+                ..Default::default()
             },
             quality: None,
             tuning: SourceTuning::from_config(None),
@@ -690,16 +834,8 @@ mod tests {
             meta_columns: MetaColumns::default(),
             destination: DestinationConfig {
                 destination_type: DestinationType::Local,
-                bucket: None,
-                prefix: None,
                 path: Some("./out".into()),
-                region: None,
-                endpoint: None,
-                credentials_file: None,
-                access_key_env: None,
-                secret_key_env: None,
-                aws_profile: None,
-                allow_anonymous: false,
+                ..Default::default()
             },
             quality: None,
             tuning: SourceTuning::from_config(None),

@@ -27,7 +27,7 @@ Source (PG / MySQL)
   │
   ├─ close_query / COMMIT
   │
-  └─ Destination.write(temp_file) ─► local / S3 / GCS / stdout
+  └─ Destination.write(temp_file) ─► local / S3 / GCS / Azure / stdout
 ```
 
 No batch accumulates in memory beyond the current `FETCH`. Parquet
@@ -100,7 +100,7 @@ Implementations:
 | `Source` | `PostgresSource` (DECLARE CURSOR + FETCH N), `MysqlSource` (`query_iter`) |
 | `Format` | `CsvFormat`, `ParquetFormat` |
 | `FormatWriter` | `CsvWriter` (`csv::Writer`), `ParquetArrowWriter` |
-| `Destination` | `LocalDest`, `S3Dest` (OpenDAL), `GcsDest` (OpenDAL), `StdoutDest` |
+| `Destination` | `LocalDest`, `S3Dest` (OpenDAL), `GcsDest` (OpenDAL), `AzureDest` (OpenDAL), `StdoutDest` |
 
 ---
 
@@ -232,7 +232,7 @@ src/
     mod.rs, csv.rs, parquet.rs
 
   destination/            Output backends
-    mod.rs, local.rs, s3.rs, gcs.rs, gcs_auth.rs, stdout.rs
+    mod.rs, local.rs, s3.rs, gcs.rs, gcs_auth.rs, azure.rs, stdout.rs
 
   pipeline/               Orchestration — the actual export work
     mod.rs, cli.rs            Pipeline entry points called by cli::dispatch
@@ -281,7 +281,7 @@ src/
   state/                  SQLite-backed state store (schema v4+)
     mod.rs                  StateStore facade; transaction management
     cursor.rs               export_state.last_cursor_value (incremental cursor persistence)
-    manifest.rs             file_manifest (per-export file ledger)
+    file_log.rs             file_log (per-export file ledger; renamed from file_manifest in v8)
     metrics.rs              export_metrics history (CLI: `rivet metrics`)
     checkpoint.rs           chunk_run / chunk_task tables (chunked checkpoint state machine)
     progression.rs          export_progression (committed / verified boundaries — ADR-0008)

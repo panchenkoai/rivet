@@ -34,13 +34,13 @@ Output: Parquet files in `./output/`. Full walkthrough: [docs/getting-started.md
 | What Rivet does | What you bring |
 |-----------------|----------------|
 | Queries PostgreSQL 12–16 and MySQL 5.7 / 8.0 | The database and credentials |
-| Streams rows → Arrow → Parquet or CSV | A destination (local path, S3 bucket, GCS bucket) |
+| Streams rows → Arrow → Parquet or CSV | A destination (local path, S3 bucket, GCS bucket, Azure container) |
 | Retries failed batches with exponential backoff | Orchestration (cron, Airflow, dbt, etc.) |
 | Validates row counts, null ratios, and uniqueness | Your warehouse or downstream pipeline |
 | Checkpoints progress — resume after crashes | Schema management on the warehouse side |
 | Protects the source DB — chunked + cursor + memory cap → longest single query ~0.2s on PG / ~9s on MySQL on a 2 M-row wide table ([benchmarks](docs/bench/)) | — |
 
-Supported destinations: local filesystem, Amazon S3, Google Cloud Storage, stdout.
+Supported destinations: local filesystem, Amazon S3, Google Cloud Storage, Azure Blob Storage, stdout.
 Export modes: `full`, `incremental` (cursor-based), `chunked`, `time_window`.
 Formats: Parquet (zstd / snappy / gzip / lz4 / none) and CSV.
 
@@ -217,7 +217,7 @@ cargo build --release
 | **Security policy** (credentials, sensitive artifacts, disclosure) | [SECURITY.md](SECURITY.md) |
 | **Cross-tool benchmark harness** (rivet vs sling, dlt, duckdb, clickhouse-local, odbc2parquet) | [docs/bench/](docs/bench/) |
 | Export modes (`full`, `incremental`, `chunked`, `time_window`) | [docs/modes/](docs/modes/) |
-| Destinations (local, S3, GCS, stdout) | [docs/destinations/](docs/destinations/) |
+| Destinations (local, S3, GCS, Azure, stdout) | [docs/destinations/](docs/destinations/) |
 | Config YAML reference | [docs/reference/config.md](docs/reference/config.md) |
 | CLI commands and flags | [docs/reference/cli.md](docs/reference/cli.md) |
 | Tuning profiles | [docs/reference/tuning.md](docs/reference/tuning.md) |

@@ -316,6 +316,15 @@ pub(super) fn run_single_export(
 
         // ADR-0001 I2–I4 / ADR-0004: state writes happen only after destination.write()
         // returns Ok(()), which for all current backends is the commit boundary.
+        // ADR-0012 M1: record the committed part on the run summary so the
+        // finalizer can assemble a RunManifest covering all parts.
+        crate::pipeline::manifest_writer::record_committed_part(
+            summary,
+            file_name.clone(),
+            part.rows as i64,
+            file_bytes,
+            part.tmp.path(),
+        );
         summary.journal.record(RunEvent::FileWritten {
             file_name: file_name.clone(),
             rows: part.rows as i64,
@@ -372,15 +381,16 @@ pub(super) fn run_single_export(
         }
     }
 
+    // ADR-0012 M3: pin the dest schema fingerprint on the summary so
+    // `finalize_manifest` does not have to round-trip through the state
+    // store (which is only populated by the drift-detect path below, and
+    // not at all in chunked mode).
+    if let Some(schema) = sink.dest_schema.as_deref() {
+        super::manifest_writer::record_run_schema_fingerprint(summary, schema);
+    }
+
     if let (Some(schema), Some(st)) = (&sink.dest_schema, state) {
-        let columns: Vec<crate::state::SchemaColumn> = schema
-            .fields()
-            .iter()
-            .map(|f| crate::state::SchemaColumn {
-                name: f.name().clone(),
-                data_type: format!("{:?}", f.data_type()),
-            })
-            .collect();
+        let columns = crate::state::arrow_schema_to_columns(schema);
 
         match st.detect_schema_change(&plan.export_name, &columns) {
             Ok(Some(change)) => {
@@ -582,16 +592,8 @@ mod tests {
             meta_columns: MetaColumns::default(),
             destination: DestinationConfig {
                 destination_type: DestinationType::Local,
-                bucket: None,
-                prefix: None,
                 path: Some("/tmp".into()),
-                region: None,
-                endpoint: None,
-                credentials_file: None,
-                access_key_env: None,
-                secret_key_env: None,
-                aws_profile: None,
-                allow_anonymous: false,
+                ..Default::default()
             },
             quality: None,
             tuning: SourceTuning::from_config(None),

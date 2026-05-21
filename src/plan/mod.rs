@@ -36,7 +36,7 @@ pub use crate::config::{
     SchemaDriftPolicy, SourceConfig, TimeColumnType,
 };
 
-mod build;
+pub(crate) mod build;
 mod contract;
 
 pub use build::{build_plan, parse_column_overrides_pub};

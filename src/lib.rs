@@ -17,6 +17,7 @@ pub mod config;
 pub mod error;
 pub mod format;
 pub mod journal;
+pub mod manifest;
 pub mod pipeline;
 pub mod resource;
 pub mod source;
@@ -30,6 +31,21 @@ pub mod mcp;
 
 // pub(crate) — internal implementation modules; not part of any external API contract
 pub(crate) mod destination;
+
+/// Test-only re-exports of the otherwise `pub(crate)` `destination` module.
+///
+/// Integration tests in `tests/` need to construct a `Box<dyn Destination>`
+/// to drive `pipeline::write_manifest` end-to-end, but the trait and factory
+/// stay `pub(crate)` to keep the destination surface internal.  This window
+/// re-exports just the two items required (`Destination`, `create_destination`)
+/// behind a clearly-marked module name so the public crate API doesn't grow.
+///
+/// Not part of any external API contract — same "internal, may change at any
+/// patch" disclaimer as the other lib modules in this file.
+#[doc(hidden)]
+pub mod destination_for_tests {
+    pub use crate::destination::{Destination, ObjectMeta, create_destination};
+}
 pub(crate) mod enrich;
 pub(crate) mod notify;
 pub(crate) mod plan;

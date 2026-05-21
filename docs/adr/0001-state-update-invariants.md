@@ -103,6 +103,50 @@ If these stores are updated in the wrong order — or if failures leave them in 
 
 ---
 
+### I8 — Finalize Order: Manifest → Verification → Report (FOR)
+
+> The end-of-run finalization hooks run in a fixed order:
+> 1. **Manifest write** — `pipeline::finalize::finalize_manifest` writes
+>    `manifest.json` and (for `success` runs) `_SUCCESS` to the destination.
+>    M1/M2/M7 from ADR-0012 ride on this step.
+> 2. **Manifest-aware validate** — when `--validate` is set,
+>    `pipeline::finalize::finalize_validate_manifest` verifies the just-written
+>    manifest against the destination listing (M5).  Populates
+>    `summary.manifest_verification`.
+> 3. **Run report** — `pipeline::finalize::finalize_run_report` writes
+>    `.rivet/runs/<run_id>/{summary.md,summary.json}`.  The report includes the
+>    manifest-verification verdict only because step 2 ran first.
+> 4. **Notification** — `notify::maybe_send` fires last so the Slack/webhook
+>    payload reflects the most complete summary.
+
+**Rationale**: Reordering breaks the trust contract.  If the report writes
+before the manifest is verified, downstream consumers (Airflow sensors,
+PR comments) read a verdict-less report.  If the verification runs before
+the manifest is written, it has nothing to verify and falls back to the
+M6 legacy_run path on every clean run.  If notification fires before the
+verification populates the summary, the message claims "validation passed"
+when in fact it ran on a stale snapshot.
+
+**Failure mode if violated**: silent loss of the verdict in observability
+artifacts.  The exit code stays correct (the per-file row check has
+already set `summary.validated`), but the verdict an operator opens the
+report for is missing or stale.
+
+**Current implementation**: `pipeline::job::run_export_job` and
+`run_export_job_with_chunk_source` call the finalize hooks in this order
+explicitly.  The hooks themselves live in `pipeline::finalize` so the
+order is visible in one place.  Each step is best-effort and non-fatal
+per I7, but the order itself is enforced by the call sites.
+
+**Recovery behaviour**: any single step failing is logged at WARN and
+the next step still runs.  A failure at step 1 means step 2 will see a
+manifest from the prior run (or none, triggering M6); step 3's report
+labels it accordingly.  A failure at step 2 leaves
+`summary.manifest_verification = None`, which the JSON serializer omits
+(`skip_serializing_if = Option::is_none`), preserving 0.6.x report shape.
+
+---
+
 ## Failure Point Map
 
 | Failure point | Cursor | Manifest | Metric | Recovery |
@@ -118,4 +162,4 @@ If these stores are updated in the wrong order — or if failures leave them in 
 
 ## Test Coverage
 
-Each invariant is covered by at least one automated test. `tests/invariants.rs` covers I1–I7 structural contracts. `tests/journal_invariants.rs` covers the `RunJournal` event-ordering contracts (plan snapshot recorded first, `RunCompleted` recorded last, chunk lifecycle ordering). `tests/recovery.rs` covers chunk checkpoint resume semantics (I5/I6). All three test suites are run as semantic release gates in CI before any binary is produced.
+Each invariant is covered by at least one automated test. `tests/invariants.rs` covers I1–I7 structural contracts. `tests/journal_invariants.rs` covers the `RunJournal` event-ordering contracts (plan snapshot recorded first, `RunCompleted` recorded last, chunk lifecycle ordering). `tests/recovery.rs` covers chunk checkpoint resume semantics (I5/I6). I8 (finalize order) is exercised by `tests/trust_artifacts_integration.rs` §14: the run report's `validation.manifest` sub-object is populated only when the verification step ran between the manifest write and the report write — the order test passes by virtue of the verdict appearing in the JSON. All test suites are run as semantic release gates in CI before any binary is produced.

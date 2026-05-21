@@ -23,6 +23,7 @@ mod detect;
 mod exec;
 pub(crate) mod math;
 mod parallel_checkpoint;
+mod resume_m8;
 mod sequential_checkpoint;
 
 // ─── Re-exports for callers in pipeline:: ────────────────────────────────────
@@ -35,6 +36,14 @@ pub(crate) use math::{
     RIVET_CHUNK_RN_COL, build_chunk_query_sql, chunk_plan_fingerprint, strip_select_star_from,
 };
 pub(crate) use parallel_checkpoint::run_chunked_parallel_checkpoint;
+pub(crate) use resume_m8::apply_m8_resume_decisions;
+// `M8Stats` is intentionally not re-exported yet — Phase C-γ keeps it
+// internal until Phase C-δ surfaces it via summary.json.  Listed here
+// in a `#[cfg(test)]` re-export so unit tests in `tests/*` can pin
+// the wire shape without growing the public API prematurely.
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use resume_m8::M8Stats;
 pub(crate) use sequential_checkpoint::run_chunked_sequential_checkpoint;
 
 // ─── Chunk source selection ───────────────────────────────────────────────────
@@ -195,7 +204,6 @@ mod tests {
     use crate::config::{
         CompressionType, DestinationConfig, DestinationType, FormatType, SourceConfig, SourceType,
     };
-    use crate::journal::RunJournal;
     use crate::plan::{ChunkedPlan, ExtractionStrategy, ResolvedRunPlan};
     use crate::tuning::SourceTuning;
 
@@ -221,16 +229,8 @@ mod tests {
             meta_columns: Default::default(),
             destination: DestinationConfig {
                 destination_type: DestinationType::Local,
-                bucket: None,
-                prefix: None,
                 path: Some("/tmp".into()),
-                region: None,
-                endpoint: None,
-                credentials_file: None,
-                access_key_env: None,
-                secret_key_env: None,
-                aws_profile: None,
-                allow_anonymous: false,
+                ..Default::default()
             },
             quality: None,
             tuning: SourceTuning::from_config(None),
@@ -261,32 +261,11 @@ mod tests {
     }
 
     fn make_summary(plan: &ResolvedRunPlan, run_id: &str) -> RunSummary {
-        RunSummary {
-            run_id: run_id.into(),
-            export_name: plan.export_name.clone(),
-            status: "running".into(),
-            total_rows: 0,
-            files_produced: 0,
-            bytes_written: 0,
-            files_committed: 0,
-            duration_ms: 0,
-            peak_rss_mb: 0,
-            retries: 0,
-            validated: None,
-            schema_changed: None,
-            quality_passed: None,
-            error_message: None,
-            tuning_profile: "balanced".into(),
-            batch_size: 10_000,
-            batch_size_memory_mb: None,
-            format: "parquet".into(),
-            mode: "chunked".into(),
-            compression: "none".into(),
-            source_count: None,
-            pg_temp_bytes_delta: None,
-            reconciled: None,
-            journal: RunJournal::new(run_id, &plan.export_name),
-        }
+        let mut s = RunSummary::stub_for_testing(run_id, plan.export_name.clone());
+        s.batch_size = 10_000;
+        s.mode = "chunked".into();
+        s.compression = "none".into();
+        s
     }
 
     // ── config_hint ────────────────────────────────────────────────────────

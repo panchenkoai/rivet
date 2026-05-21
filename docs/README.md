@@ -1,6 +1,6 @@
 # Rivet Documentation
 
-Rivet exports data from PostgreSQL and MySQL to Parquet/CSV files on local disk, S3, GCS, or stdout.
+Rivet exports data from PostgreSQL and MySQL to Parquet/CSV files on local disk, S3, GCS, Azure Blob Storage, or stdout.
 
 Install from Rust: `cargo install rivet-cli` (crates.io name is `rivet-cli`; the binary is `rivet`). Other install options live in the repo [README](../README.md).
 
@@ -49,6 +49,7 @@ Short terminal walkthroughs in [gifs/](gifs/):
 | Local filesystem | [destinations/local.md](destinations/local.md) |
 | AWS S3 / MinIO / R2 | [destinations/s3.md](destinations/s3.md) |
 | Google Cloud Storage | [destinations/gcs.md](destinations/gcs.md) |
+| Azure Blob Storage | [destinations/azure.md](destinations/azure.md) |
 | Stdout (pipe) | [destinations/stdout.md](destinations/stdout.md) |
 
 ## Reference

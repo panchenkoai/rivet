@@ -65,7 +65,7 @@ fn chunk_run_status(cfg: &std::path::Path, export: &str) -> Option<String> {
 fn manifest_count(cfg: &std::path::Path, export: &str) -> i64 {
     open_state_db(cfg)
         .query_row(
-            "SELECT COUNT(*) FROM file_manifest WHERE export_name = ?1",
+            "SELECT COUNT(*) FROM file_log WHERE export_name = ?1",
             [export],
             |r| r.get(0),
         )
@@ -75,7 +75,7 @@ fn manifest_count(cfg: &std::path::Path, export: &str) -> i64 {
 fn manifest_total_rows(cfg: &std::path::Path, export: &str) -> i64 {
     open_state_db(cfg)
         .query_row(
-            "SELECT COALESCE(SUM(row_count), 0) FROM file_manifest WHERE export_name = ?1",
+            "SELECT COALESCE(SUM(row_count), 0) FROM file_log WHERE export_name = ?1",
             [export],
             |r| r.get(0),
         )

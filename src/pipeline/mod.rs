@@ -10,50 +10,106 @@ mod aggregate;
 mod apply_cmd;
 pub(crate) mod chunked;
 mod cli;
+mod finalize;
 pub(crate) mod ipc;
 mod job;
+mod manifest_writer;
 mod parallel_children;
 pub(crate) mod parent_ui;
 mod plan_cmd;
 pub(crate) mod progress;
 mod reconcile_cmd;
 mod repair_cmd;
+pub(crate) mod report;
+mod resume_decisions;
 mod retry;
 mod single;
 mod sink;
 mod summary;
 mod validate;
+mod validate_cmd;
+mod validate_manifest;
+
+// ── Public API surface (consumed by `src/cli/dispatch.rs` + binaries) ──────
+//
+// These items are the contract the binary depends on.  Adding to this list
+// is an API change that requires a release-note entry; removing or
+// renaming requires a deprecation cycle.
 
 pub use apply_cmd::run_apply_command;
-#[allow(unused_imports)]
-pub use chunked::generate_chunks;
 pub use cli::{
     reset_chunk_checkpoint, reset_chunk_checkpoints_stuck, reset_state, show_chunk_checkpoint,
     show_files, show_journal, show_metrics, show_progression, show_state,
 };
-pub(crate) use job::run_export_job_with_chunk_source;
 pub use plan_cmd::{PlanOutputFormat, run_plan_command};
 pub use reconcile_cmd::{ReconcileOutputFormat, run_reconcile_command};
 pub use repair_cmd::{RepairOutputFormat, RepairReportSource, run_repair_command};
-#[allow(unused_imports)]
-pub use retry::{RetryClass, classify_error};
-// build_time_window_query moved to crate::plan; re-exported here for integration tests.
-#[allow(unused_imports)]
-pub use crate::plan::build_time_window_query;
-#[allow(unused_imports)]
-pub use validate::validate_output;
+pub use validate_cmd::{ValidateOutputFormat, run_validate_command};
 
+// `RunSummary` is consumed by `notify::*` (via the Coordinator path) plus
+// integration-test fixtures.  It is the canonical observability struct so
+// it stays in the regular public surface.
+pub use summary::RunSummary;
+
+// ── Crate-internal cross-module use ────────────────────────────────────────
+
+pub(crate) use job::run_export_job_with_chunk_source;
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use retry::is_transient;
+
+// ── Test-only surface ──────────────────────────────────────────────────────
+//
+// The integration tests in `tests/*.rs` exercise the trust-contract writers,
+// readers, and decision logic without spinning up a full pipeline.  These
+// items are NOT part of the public CLI contract — operators get them only
+// transitively (via `summary.json`, `manifest.json`, `--validate`, etc.).
+//
+// Hidden behind `#[doc(hidden)] pub mod for_tests` so they don't pollute
+// the rendered crate docs and so a renaming refactor here is a clear
+// "test-only" change rather than appearing as a public API break.
+//
+// Convention matches the existing `destination_for_tests` window in
+// `lib.rs`: tests reach these via `rivet::pipeline::for_tests::*`.
+
+#[doc(hidden)]
+pub mod for_tests {
+    pub use super::chunked::generate_chunks;
+    pub use super::manifest_writer::{ManifestBuilder, WriteOutcome, write_manifest};
+    pub use super::report::{RunReport, report_dir, write_run_report};
+    pub use super::resume_decisions::{
+        PartDecision, QuarantineReason, ResumeDecision, ResumePlan, UntrackedDecision,
+        build_resume_plan,
+    };
+    pub use super::retry::{RetryClass, classify_error};
+    pub use super::validate::validate_output;
+    pub use super::validate_manifest::{
+        Failure as ManifestVerificationFailure, ManifestVerification, verify_at_destination,
+    };
+    pub use crate::plan::build_time_window_query;
+}
+
+// Backwards-compat re-exports at the crate root so existing test files
+// keep compiling without a sweeping import-site update.  Each is delegated
+// to `for_tests::*`; new test code should import from `for_tests` directly.
+//
+// `#[allow(unused_imports)]` because the bin target's dead-code analysis
+// doesn't see the integration tests that consume these — same situation
+// as `RunSummary::stub_for_testing`.
+#[doc(hidden)]
+#[allow(unused_imports)]
+pub use for_tests::{
+    ManifestBuilder, ManifestVerification, ManifestVerificationFailure, PartDecision,
+    QuarantineReason, ResumeDecision, ResumePlan, RetryClass, RunReport, UntrackedDecision,
+    WriteOutcome, build_resume_plan, build_time_window_query, classify_error, generate_chunks,
+    report_dir, validate_output, verify_at_destination, write_manifest, write_run_report,
+};
 
 use std::path::Path;
 
 use crate::config::{Config, ExportConfig};
 use crate::error::Result;
 use crate::state::StateStore;
-
-pub use summary::RunSummary;
 
 /// Per-run configuration flags passed from the CLI to the pipeline.
 ///
@@ -66,6 +122,14 @@ pub struct RunOptions<'a> {
     pub validate: bool,
     pub reconcile: bool,
     pub resume: bool,
+    /// Override safety gates that would otherwise refuse to start the run.
+    ///
+    /// Currently used by ADR-0012 M8 — `--resume` against a prefix whose
+    /// `_SUCCESS` marker is present is refused unless `--force` is given,
+    /// so an operator cannot accidentally re-export over a verified
+    /// dataset.  Other gates may share the same flag in the future
+    /// (per ADR-0013: one `--force`, scoped to whichever gate it overrides).
+    pub force: bool,
     pub params: Option<&'a std::collections::HashMap<String, String>>,
 }
 
@@ -163,13 +227,14 @@ fn print_json_summary(agg: &crate::state::RunAggregate) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // CLI fan-in; surface stays stable per ADR-0013
 pub fn run(
     config_path: &str,
     export_name: Option<&str>,
     validate: bool,
     reconcile: bool,
     resume: bool,
+    force: bool,
     params: Option<&std::collections::HashMap<String, String>>,
     parallel_exports_cli: bool,
     parallel_export_processes_cli: bool,
@@ -198,6 +263,7 @@ pub fn run(
         validate,
         reconcile,
         resume,
+        force,
         params,
     };
 
@@ -230,6 +296,7 @@ pub fn run(
                 validate,
                 reconcile,
                 resume,
+                force,
                 params,
             );
         let finished_at = chrono::Utc::now();
@@ -545,16 +612,8 @@ mod tests {
             meta_columns: MetaColumns::default(),
             destination: DestinationConfig {
                 destination_type: DestinationType::Local,
-                bucket: None,
-                prefix: None,
                 path: Some("./out".into()),
-                region: None,
-                endpoint: None,
-                credentials_file: None,
-                access_key_env: None,
-                secret_key_env: None,
-                aws_profile: None,
-                allow_anonymous: false,
+                ..Default::default()
             },
             quality: None,
             tuning: SourceTuning::from_config(None),
