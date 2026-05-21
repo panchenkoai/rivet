@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.6.1 (unreleased)
+
+### Per-run reports and resume hints
+
+A small, additive release focused on **trust polish**: every run now leaves
+behind an inspectable on-disk report, and interrupted runs print a clear
+resume command pointing back at it.
+
+This release introduces no new commands and no breaking config changes; the
+new artifacts are written automatically next to the existing state DB.
+
+#### New artifacts
+
+- **`feat(report)`** — every run now writes two files under
+  `.rivet/runs/<run_id>/` (placed next to `.rivet_state.db`):
+  - `summary.json` — machine-readable run report with a stable JSON schema
+    (`run_id`, `status`, timing, plan, throughput counters, validation /
+    reconciliation verdicts, error message, resume hint).
+  - `summary.md` — operator-friendly Markdown for pull requests, support
+    tickets, and incident reviews.
+  - Source: `src/pipeline/report.rs`. Failures to write are non-fatal: the
+    pipeline keeps its exit code and the resume hint is still surfaced to
+    stderr even when disk-full prevents the report from landing.
+- **`feat(cli)`** — the stderr run-summary block is now followed by a
+  `report:` line pointing at the on-disk Markdown, and (when the run failed
+  after committing at least one file) a `resume:` line containing a
+  copy-pasteable `rivet run --config <path> --resume` command.
+
+#### Internal: state schema v8 — `file_manifest` → `file_log`
+
+The internal SQLite ledger of files written by an export has been renamed
+from `file_manifest` to `file_log`. The name **`manifest`** is reclaimed for
+the 0.7.0 cloud-output JSON contract (a separate, public artifact); the
+internal log retains the same shape and is migrated automatically on first
+open via schema migration v8 (`ALTER TABLE … RENAME TO …`, plus a rename of
+the supporting index).
+
+Existing 0.6.0 state DBs are upgraded transparently; no operator action is
+required. The Rust module is now `src/state/file_log.rs`; the `FileRecord`
+re-export at `rivet::state::FileRecord` is unchanged.
+
 ## 0.6.0 (2026-05-19)
 
 ### Configuration ergonomics, MySQL parity, pooler-awareness, and a published cross-tool benchmark

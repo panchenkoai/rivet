@@ -61,7 +61,7 @@ Responsible for: durable state across runs. No execution logic.
 | `state/cursor.rs` | Incremental cursor positions (`export_state`) |
 | `state/checkpoint.rs` | Chunk run/task lifecycle (`chunk_run`, `chunk_task`) |
 | `state/metrics.rs` | Run outcome history (`export_metrics`) |
-| `state/manifest.rs` | File manifest (`file_manifest`) |
+| `state/file_log.rs` | Per-export file ledger (`file_log`; renamed from `file_manifest` in schema v8) |
 | `state/schema.rs` | Schema snapshot history (`export_schema`) |
 
 **Rule**: Persistence modules must not contain execution logic or make semantic decisions about when to write.

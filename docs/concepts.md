@@ -31,7 +31,7 @@ The same export can be extracted by many runs over time. Each run gets its own `
 
 | Term | What it is | Table in `.rivet_state.db` | CLI |
 |---|---|---|---|
-| **Manifest** | The per-export ledger of files actually written — file name, row count, bytes, format, compression. Authoritative answer to "what files did this export produce?" | `file_manifest` | `rivet state files --export NAME` |
+| **File log** | The per-export ledger of files actually written — file name, row count, bytes, format, compression. Authoritative answer to "what files did this export produce?" Renamed from `file_manifest` in schema v8; the **Manifest** term is reserved for the forthcoming 0.7.0 cloud-output JSON contract. | `file_log` | `rivet state files --export NAME` |
 | **Metrics** | One row per run per export — `run_id`, status, rows, bytes, duration, peak RSS, retries, validation / reconcile result. Authoritative answer to "how did this export perform over time?" | `export_metrics` | `rivet metrics --export NAME --last N` |
 | **Journal** | Per-run event stream — every chunk start / complete / fail, every retry, every quality-gate decision, the first-line error text. Authoritative answer to "what happened during this *specific* run?" | `run_journal` table + per-run `*.jsonl` on disk | `rivet journal --export NAME --run_id ID` |
 | **Progression** | The committed / verified boundary per export — for chunked, the highest contiguous chunk index that fully succeeded; for incremental, the high-water cursor value that has been reconciled. **Advisory only** (operator-readable; nothing in the pipeline depends on it). | `export_progression` | `rivet state progression` |

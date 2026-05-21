@@ -281,7 +281,7 @@ src/
   state/                  SQLite-backed state store (schema v4+)
     mod.rs                  StateStore facade; transaction management
     cursor.rs               export_state.last_cursor_value (incremental cursor persistence)
-    manifest.rs             file_manifest (per-export file ledger)
+    file_log.rs             file_log (per-export file ledger; renamed from file_manifest in v8)
     metrics.rs              export_metrics history (CLI: `rivet metrics`)
     checkpoint.rs           chunk_run / chunk_task tables (chunked checkpoint state machine)
     progression.rs          export_progression (committed / verified boundaries — ADR-0008)

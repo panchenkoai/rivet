@@ -82,7 +82,7 @@ pub fn run_apply_command(plan_file: &str, force: bool) -> Result<()> {
 
     // 6. Execute using the plan from the artifact
     let plan = artifact.resolved_plan.clone();
-    super::run_export_job_with_chunk_source(&plan, &state, chunk_source)
+    super::run_export_job_with_chunk_source(&plan, &state, chunk_source, plan_file)
 }
 
 #[cfg(test)]

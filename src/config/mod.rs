@@ -116,8 +116,8 @@ impl Config {
         }
 
         // Duplicate export names break state tracking: `export_state`,
-        // `file_manifest`, and `chunk_run` are all keyed by `export_name`, so
-        // two configs with the same name silently share cursor/manifest rows.
+        // `file_log`, and `chunk_run` are all keyed by `export_name`, so
+        // two configs with the same name silently share cursor/file-log rows.
         // QA backlog Task 5.1.
         {
             let mut seen: std::collections::HashSet<&str> =

@@ -18,6 +18,7 @@ mod plan_cmd;
 pub(crate) mod progress;
 mod reconcile_cmd;
 mod repair_cmd;
+pub(crate) mod report;
 mod retry;
 mod single;
 mod sink;

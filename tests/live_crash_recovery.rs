@@ -67,7 +67,7 @@ fn open_state_db(cfg: &std::path::Path) -> rusqlite::Connection {
 fn manifest_count(cfg: &std::path::Path, export: &str) -> i64 {
     open_state_db(cfg)
         .query_row(
-            "SELECT COUNT(*) FROM file_manifest WHERE export_name = ?1",
+            "SELECT COUNT(*) FROM file_log WHERE export_name = ?1",
             [export],
             |r| r.get(0),
         )

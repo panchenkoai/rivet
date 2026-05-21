@@ -364,10 +364,56 @@ pub(super) fn run_export_job(
     }
 
     summary.print();
+    finalize_run_report(config_path, &summary, "export");
     crate::notify::maybe_send(config.notifications.as_ref(), &summary);
 
     let final_result = if failed { result } else { Ok(()) };
     (final_result, summary)
+}
+
+/// Write `.rivet/runs/<run_id>/{summary.md,summary.json}` and surface a stderr
+/// hint pointing at the report (plus a resume command, when applicable).
+///
+/// Failures to write are non-fatal: the run keeps its existing exit code, the
+/// reason is logged, and the resume hint is still shown so the operator can
+/// recover even if disk-full prevents the report itself from landing.
+fn finalize_run_report(config_path: &str, summary: &RunSummary, kind: &str) {
+    use std::io::Write;
+
+    let dir = crate::pipeline::report::report_dir(config_path, &summary.run_id);
+    let written = match crate::pipeline::report::write_run_report(config_path, summary) {
+        Ok(_) => true,
+        Err(e) => {
+            log::warn!(
+                "{} '{}': run report write failed (not fatal): {:#}",
+                kind,
+                summary.export_name,
+                e
+            );
+            false
+        }
+    };
+
+    if crate::pipeline::ipc::capturing_events() {
+        // The parent UI owns the screen in capturing mode; an extra stderr
+        // tail here would interleave with the rendered cards.  The JSON/MD
+        // files are still on disk for whoever wants them.
+        return;
+    }
+
+    let stderr = std::io::stderr();
+    let mut h = stderr.lock();
+    if written {
+        let _ = writeln!(h, "report:    {}", dir.join("summary.md").display());
+    }
+    if summary.status == "failed" && summary.files_committed > 0 {
+        let _ = writeln!(
+            h,
+            "resume:    rivet run --config {} --resume",
+            crate::pipeline::report::shell_quote(config_path)
+        );
+    }
+    let _ = h.flush();
 }
 
 /// Execute a pre-resolved plan with a caller-supplied `ChunkSource`.
@@ -379,6 +425,7 @@ pub(crate) fn run_export_job_with_chunk_source(
     plan: &ResolvedRunPlan,
     state: &StateStore,
     chunk_source: chunked::ChunkSource,
+    config_path: &str,
 ) -> Result<()> {
     // Re-validate the plan from the artifact (fast, no DB queries).
     let diags = validate_plan(plan);
@@ -469,6 +516,7 @@ pub(crate) fn run_export_job_with_chunk_source(
     }
 
     summary.print();
+    finalize_run_report(config_path, &summary, "apply");
 
     if failed { result } else { Ok(()) }
 }
