@@ -26,7 +26,7 @@ pub use progression::{Boundary, ExportProgression};
 #[allow(unused_imports)]
 pub use run_aggregate::{RunAggregate, RunAggregateEntry};
 #[allow(unused_imports)]
-pub use schema::{SchemaChange, SchemaColumn};
+pub use schema::{SchemaChange, SchemaColumn, schema_fingerprint};
 #[allow(unused_imports)]
 pub use shape::ShapeWarning;
 
