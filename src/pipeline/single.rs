@@ -381,6 +381,14 @@ pub(super) fn run_single_export(
         }
     }
 
+    // ADR-0012 M3: pin the dest schema fingerprint on the summary so
+    // `finalize_manifest` does not have to round-trip through the state
+    // store (which is only populated by the drift-detect path below, and
+    // not at all in chunked mode).
+    if let Some(schema) = sink.dest_schema.as_deref() {
+        super::manifest_writer::record_run_schema_fingerprint(summary, schema);
+    }
+
     if let (Some(schema), Some(st)) = (&sink.dest_schema, state) {
         let columns: Vec<crate::state::SchemaColumn> = schema
             .fields()

@@ -484,6 +484,7 @@ mod tests {
             source_count: None,
             reconciled: None,
             manifest_parts: Vec::new(),
+            schema_fingerprint: None,
             journal,
         }
     }

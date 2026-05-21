@@ -217,6 +217,40 @@ pub fn record_committed_part(
     record_committed_part_with_fingerprint(summary, relative_path, rows, size_bytes, fingerprint);
 }
 
+/// Capture the run's schema fingerprint on the summary.
+///
+/// Computed from the dest-facing Arrow schema (the one downstream consumers
+/// see — internal columns already stripped) using
+/// [`crate::state::schema_fingerprint`].  Idempotent: the schema is identical
+/// across chunks of a single run, so callers safely invoke this on every
+/// chunk and only the first call has effect.
+///
+/// Why this exists: `finalize_manifest` previously derived the manifest's
+/// `schema_fingerprint` from `state.get_stored_schema()`, which is only
+/// populated by `single.rs::run_with_reconnect`'s schema-drift block.  The
+/// chunked path never wrote a stored schema, so `manifest.schema_fingerprint`
+/// landed as the placeholder `xxh3:0000000000000000` — defeating the trust
+/// contract's drift-detection goal (ADR-0012 M3).  Capturing the fingerprint
+/// here, at the point the schema is first seen by the sink, decouples the
+/// manifest writer from the state's incidental schema cache.
+pub fn record_run_schema_fingerprint(
+    summary: &mut crate::pipeline::summary::RunSummary,
+    dest_schema: &arrow::datatypes::Schema,
+) {
+    if summary.schema_fingerprint.is_some() {
+        return;
+    }
+    let columns: Vec<crate::state::SchemaColumn> = dest_schema
+        .fields()
+        .iter()
+        .map(|f| crate::state::SchemaColumn {
+            name: f.name().clone(),
+            data_type: format!("{:?}", f.data_type()),
+        })
+        .collect();
+    summary.schema_fingerprint = Some(crate::state::schema_fingerprint(&columns));
+}
+
 /// Same as [`record_committed_part`] but with a precomputed fingerprint.
 ///
 /// Used by parallel-chunked aggregation, where workers compute fingerprints
@@ -585,5 +619,122 @@ mod tests {
         let m = build_manifest(ManifestStatus::Success);
         let outcome = write_manifest(&dest, &m).unwrap();
         assert!(matches!(outcome, WriteOutcome::SkippedStreaming));
+    }
+
+    // ── record_run_schema_fingerprint ──────────────────────────────────────
+
+    fn dummy_summary() -> crate::pipeline::summary::RunSummary {
+        // Construct a RunSummary by direct field init (the public ctor is
+        // pub(super) and requires a full ResolvedRunPlan).  Mirrors
+        // synthetic_failed_summary in shape.
+        crate::pipeline::summary::RunSummary {
+            run_id: "r".into(),
+            export_name: "orders".into(),
+            status: "running".into(),
+            total_rows: 0,
+            files_produced: 0,
+            bytes_written: 0,
+            files_committed: 0,
+            duration_ms: 0,
+            peak_rss_mb: 0,
+            retries: 0,
+            validated: None,
+            schema_changed: None,
+            quality_passed: None,
+            error_message: None,
+            tuning_profile: "balanced".into(),
+            batch_size: 1000,
+            batch_size_memory_mb: None,
+            format: "parquet".into(),
+            mode: "snapshot".into(),
+            compression: "zstd".into(),
+            pg_temp_bytes_delta: None,
+            source_count: None,
+            reconciled: None,
+            manifest_parts: Vec::new(),
+            schema_fingerprint: None,
+            journal: crate::journal::RunJournal::new("r", "orders"),
+        }
+    }
+
+    fn schema_with(fields: &[(&str, arrow::datatypes::DataType)]) -> arrow::datatypes::Schema {
+        let f: Vec<arrow::datatypes::Field> = fields
+            .iter()
+            .map(|(n, t)| arrow::datatypes::Field::new(*n, t.clone(), false))
+            .collect();
+        arrow::datatypes::Schema::new(f)
+    }
+
+    #[test]
+    fn record_run_schema_fingerprint_sets_field_on_first_call() {
+        use arrow::datatypes::DataType;
+        let mut s = dummy_summary();
+        let schema = schema_with(&[("id", DataType::Int64), ("name", DataType::Utf8)]);
+        record_run_schema_fingerprint(&mut s, &schema);
+        let fp = s.schema_fingerprint.as_deref().expect("must be set");
+        assert!(fp.starts_with("xxh3:"));
+        assert_eq!(fp.len(), "xxh3:".len() + 16);
+    }
+
+    #[test]
+    fn record_run_schema_fingerprint_is_idempotent() {
+        // Across chunks of one run the schema is identical; later calls
+        // must not overwrite.  Pin this so a future "always overwrite"
+        // refactor can't silently make the fingerprint depend on which
+        // chunk happened to land last.
+        use arrow::datatypes::DataType;
+        let mut s = dummy_summary();
+        let schema_a = schema_with(&[("id", DataType::Int64)]);
+        record_run_schema_fingerprint(&mut s, &schema_a);
+        let first = s.schema_fingerprint.clone();
+
+        // Record-call with a *different* schema — should be a no-op.
+        let schema_b = schema_with(&[("id", DataType::Int64), ("extra", DataType::Utf8)]);
+        record_run_schema_fingerprint(&mut s, &schema_b);
+        assert_eq!(s.schema_fingerprint, first, "later call must not overwrite");
+    }
+
+    #[test]
+    fn record_run_schema_fingerprint_matches_state_helper_output() {
+        // The helper must produce the same value as `state::schema_fingerprint`
+        // applied to the same column list — finalize_manifest depends on this
+        // equivalence to validate manifests against stored schemas.
+        use arrow::datatypes::DataType;
+        let mut s = dummy_summary();
+        let schema = schema_with(&[("id", DataType::Int64), ("email", DataType::Utf8)]);
+        record_run_schema_fingerprint(&mut s, &schema);
+
+        let cols = vec![
+            crate::state::SchemaColumn {
+                name: "id".into(),
+                data_type: format!("{:?}", DataType::Int64),
+            },
+            crate::state::SchemaColumn {
+                name: "email".into(),
+                data_type: format!("{:?}", DataType::Utf8),
+            },
+        ];
+        assert_eq!(
+            s.schema_fingerprint.unwrap(),
+            crate::state::schema_fingerprint(&cols)
+        );
+    }
+
+    #[test]
+    fn record_run_schema_fingerprint_is_order_insensitive() {
+        // The helper hashes a sorted-by-name column list (state::schema_fingerprint
+        // contract).  Two schemas with reordered fields must produce the same fp.
+        use arrow::datatypes::DataType;
+        let mut s1 = dummy_summary();
+        let mut s2 = dummy_summary();
+        record_run_schema_fingerprint(
+            &mut s1,
+            &schema_with(&[("id", DataType::Int64), ("name", DataType::Utf8)]),
+        );
+        record_run_schema_fingerprint(
+            &mut s2,
+            &schema_with(&[("name", DataType::Utf8), ("id", DataType::Int64)]),
+        );
+        assert_eq!(s1.schema_fingerprint, s2.schema_fingerprint);
     }
 }

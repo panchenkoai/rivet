@@ -106,6 +106,12 @@ pub(crate) fn run_chunked_sequential(
         if let Some(w) = sink.writer.take() {
             w.finish()?;
         }
+        // ADR-0012 M3: capture the dest schema fingerprint as soon as the
+        // sink resolves a schema (first non-empty chunk).  Idempotent across
+        // subsequent chunks since the schema is identical run-wide.
+        if let Some(s) = sink.dest_schema.as_deref() {
+            super::super::manifest_writer::record_run_schema_fingerprint(summary, s);
+        }
 
         summary.total_rows += sink.total_rows as i64;
         pb.inc(summary.total_rows);
@@ -230,6 +236,11 @@ pub(crate) fn run_chunked_parallel(
     // (file_name, rows, bytes, content_fingerprint)
     let file_records: std::sync::Mutex<Vec<(String, i64, i64, String)>> =
         std::sync::Mutex::new(Vec::new());
+    // Schema fingerprint captured by whichever worker resolves the dest
+    // schema first.  ADR-0012 M3 — stays None for empty runs (no chunk
+    // produced rows so no schema was seen).  Drained into `summary` after
+    // the parallel scope joins.
+    let shared_fingerprint: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     // Condvar-backed semaphore: blocked spawners park in the kernel until a
     // worker calls `release()`, instead of polling an atomic every 50 ms.
     let semaphore = resource::Semaphore::new(parallel);
@@ -271,6 +282,7 @@ pub(crate) fn run_chunked_parallel(
             let agg_files = &agg_files;
             let errors = &errors;
             let file_records = &file_records;
+            let shared_fingerprint = &shared_fingerprint;
             let semaphore = &semaphore;
             let pb_thread = pb_handle.clone();
             let start = *start;
@@ -303,6 +315,21 @@ pub(crate) fn run_chunked_parallel(
                     )?;
                     if let Some(w) = sink.writer.take() {
                         w.finish()?;
+                    }
+                    // ADR-0012 M3: capture the dest schema fingerprint once
+                    // per run.  `OnceLock::set` is a no-op after the first
+                    // successful set, so all later workers race-free.
+                    if let Some(s) = sink.dest_schema.as_deref() {
+                        let columns: Vec<crate::state::SchemaColumn> = s
+                            .fields()
+                            .iter()
+                            .map(|f| crate::state::SchemaColumn {
+                                name: f.name().clone(),
+                                data_type: format!("{:?}", f.data_type()),
+                            })
+                            .collect();
+                        let _ = shared_fingerprint
+                            .set(crate::state::schema_fingerprint(&columns));
                     }
 
                     agg_rows.fetch_add(sink.total_rows as i64, Ordering::Relaxed);
@@ -389,6 +416,12 @@ pub(crate) fn run_chunked_parallel(
     pb.finish(summary.total_rows);
     if plan.validate {
         summary.validated = Some(true);
+    }
+    // Drain the worker-shared fingerprint into summary.  Stays None for
+    // empty runs (no worker saw a schema) — finalize_manifest then falls
+    // through to the state lookup / placeholder path for those.
+    if let Some(fp) = shared_fingerprint.into_inner() {
+        summary.schema_fingerprint = Some(fp);
     }
 
     let fmt_name = plan.format.label();
@@ -566,6 +599,7 @@ mod tests {
             pg_temp_bytes_delta: None,
             reconciled: None,
             manifest_parts: Vec::new(),
+            schema_fingerprint: None,
             journal: RunJournal::new("test_run", &plan.export_name),
         }
     }

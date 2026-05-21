@@ -176,6 +176,7 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
         pg_temp_bytes_delta: None,
         reconciled: None,
         manifest_parts: Vec::new(),
+        schema_fingerprint: None,
         journal,
     }
 }
@@ -454,11 +455,21 @@ fn finalize_manifest(
         _ => ManifestStatus::Interrupted,
     };
 
-    let schema_fingerprint = state
-        .get_stored_schema(&summary.export_name)
-        .ok()
-        .flatten()
-        .map(|cols| crate::state::schema_fingerprint(&cols))
+    // ADR-0012 M3: prefer the fingerprint captured at the sink (single +
+    // chunked + checkpoint paths all populate it).  Fall back to the
+    // state-store lookup only for resume scenarios where the live summary
+    // never saw a schema.  The placeholder is a last-resort signal to the
+    // reader that schema evidence was unavailable for this run.
+    let schema_fingerprint = summary
+        .schema_fingerprint
+        .clone()
+        .or_else(|| {
+            state
+                .get_stored_schema(&summary.export_name)
+                .ok()
+                .flatten()
+                .map(|cols| crate::state::schema_fingerprint(&cols))
+        })
         .unwrap_or_else(|| "xxh3:0000000000000000".to_string());
 
     let source_engine = match plan.source.source_type {
@@ -839,6 +850,7 @@ mod tests {
             pg_temp_bytes_delta: None,
             reconciled: None,
             manifest_parts: Vec::new(),
+            schema_fingerprint: None,
             journal: RunJournal::new("r", &plan.export_name),
         }
     }

@@ -89,6 +89,20 @@ pub struct RunSummary {
     /// site (ADR-0012 M1 — Parts Before Manifest).  Drained at finalize into a
     /// `RunManifest` by [`crate::pipeline::manifest_writer::write_manifest`].
     pub manifest_parts: Vec<ManifestPart>,
+    /// xxh3 fingerprint of the dest-facing column schema for this run, in the
+    /// canonical `xxh3:<16-hex>` form produced by [`crate::state::schema_fingerprint`].
+    ///
+    /// Recorded by [`crate::pipeline::manifest_writer::record_run_schema_fingerprint`]
+    /// the first time the sink has resolved a schema (i.e. on the first batch
+    /// of any chunk).  Idempotent within a run — the schema is identical across
+    /// chunks, so later writes are no-ops.
+    ///
+    /// `finalize_manifest` reads this directly so the manifest's
+    /// `schema_fingerprint` no longer depends on the per-export schema row
+    /// happening to land in `state` before the manifest write.  The state
+    /// lookup remains a fallback for resume scenarios where the summary was
+    /// reconstructed without ever seeing a live schema.
+    pub schema_fingerprint: Option<String>,
     /// Structured event log for this run.  Answers the four DoD observability questions.
     pub journal: RunJournal,
 }
@@ -136,6 +150,7 @@ impl RunSummary {
             source_count: None,
             reconciled: None,
             manifest_parts: Vec::new(),
+            schema_fingerprint: None,
             journal,
         }
     }

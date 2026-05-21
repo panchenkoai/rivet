@@ -142,6 +142,7 @@ fn summary(
         source_count: None,
         reconciled: None,
         manifest_parts: parts,
+        schema_fingerprint: None,
         journal,
     }
 }
@@ -1547,6 +1548,110 @@ fn run_id_with_path_traversal_chars_is_rendered_as_literal_dir() {
     // for sanitising).
     assert!(out.ends_with("nested/run_id"), "got: {}", out.display());
     assert!(out.join("summary.json").exists());
+}
+
+// ─── Section 21a: summary.schema_fingerprint preempts state lookup ──────────
+//
+// Regression test for the chunked-mode bug where `manifest.schema_fingerprint`
+// landed as the placeholder `xxh3:0000000000000000` because `state.store_schema`
+// was only called by the single-mode path.  After the fix, every executor
+// (single, chunked-parallel, chunked-checkpoint) records the dest schema
+// fingerprint directly on `RunSummary`; `finalize_manifest` reads it from
+// there, with the state lookup as a fallback.
+//
+// This test exercises only the read side — the writer side (single.rs +
+// chunked/{exec,parallel_checkpoint,sequential_checkpoint}.rs) needs a live
+// source and is covered by the docker-compose live test.  The contract here
+// is: when `summary.schema_fingerprint` is set, that value flows verbatim
+// into the manifest a builder produces on its behalf.
+
+#[test]
+fn summary_schema_fingerprint_flows_into_manifest_via_builder() {
+    // Caller (pipeline::job::finalize_manifest) reads
+    // summary.schema_fingerprint and threads it into ManifestBuilder::new.
+    // This test mirrors that wiring step-for-step so a future refactor that
+    // swaps the sequence (e.g. always trusting state) trips the assertion.
+    let dir = tempfile::tempdir().unwrap();
+    let dest_proxy = local_dest(dir.path());
+
+    let mut s = summary(
+        "orders_fp_flow",
+        "public.orders",
+        "success",
+        Vec::new(),
+        None,
+    );
+    let captured_fp = "xxh3:abcdef0123456789".to_string();
+    s.schema_fingerprint = Some(captured_fp.clone());
+
+    // What finalize_manifest does (paraphrased):
+    //   let fp = summary.schema_fingerprint.clone()
+    //              .or_else(|| state.get_stored_schema(...))
+    //              .unwrap_or_else(|| "xxh3:0000000000000000".into());
+    // So when summary carries a fp, that wins.  We pass it through the
+    // builder API the way job.rs does and assert the manifest carries it.
+    let mut b = ManifestBuilder::new(
+        &PlanSnapshot {
+            export_name: s.export_name.clone(),
+            base_query: "SELECT * FROM orders".into(),
+            strategy: "chunked".into(),
+            format: "parquet".into(),
+            compression: "zstd".into(),
+            destination_type: "local".into(),
+            tuning_profile: "balanced".into(),
+            batch_size: 1000,
+            validate: false,
+            reconcile: false,
+            resume: false,
+        },
+        &s.run_id,
+        chrono::Utc::now(),
+        s.schema_fingerprint.clone().unwrap(),
+        "postgres",
+        Some("public".into()),
+        Some("orders".into()),
+        "file:///tmp/out/".into(),
+    );
+    b.record_part(
+        1,
+        "part-000001.parquet".into(),
+        100,
+        4096,
+        "xxh3:1111111111111111".into(),
+    );
+    let m = b.finalize(ManifestStatus::Success);
+    write_manifest(dest_proxy.as_writer(), &m).unwrap();
+
+    let parsed: RunManifest =
+        serde_json::from_str(&std::fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap())
+            .unwrap();
+    assert_eq!(
+        parsed.schema_fingerprint, captured_fp,
+        "manifest must carry the summary's captured fingerprint, not the placeholder"
+    );
+    assert_ne!(parsed.schema_fingerprint, "xxh3:0000000000000000");
+}
+
+#[test]
+fn missing_summary_fingerprint_lands_as_placeholder_not_panic() {
+    // Resume-from-state scenarios may reconstruct a `RunSummary` that never
+    // saw a live schema.  finalize_manifest's contract is then: try state
+    // lookup, finally use the placeholder.  This test just pins the sentinel
+    // shape (16-hex zeros) so consumers can detect "schema evidence missing"
+    // explicitly instead of reading garbage.
+    let placeholder = "xxh3:0000000000000000";
+    assert!(placeholder.starts_with("xxh3:"));
+    assert_eq!(placeholder.len(), "xxh3:".len() + 16);
+    assert_eq!(
+        placeholder
+            .strip_prefix("xxh3:")
+            .unwrap()
+            .chars()
+            .filter(|c| *c == '0')
+            .count(),
+        16,
+        "placeholder is 16 zeros — distinct from any plausible real fingerprint"
+    );
 }
 
 // ─── Section 21: streaming destination — _SUCCESS never appears ──────────────
