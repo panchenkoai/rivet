@@ -12,6 +12,7 @@ pub(crate) mod chunked;
 mod cli;
 pub(crate) mod ipc;
 mod job;
+mod manifest_writer;
 mod parallel_children;
 pub(crate) mod parent_ui;
 mod plan_cmd;
