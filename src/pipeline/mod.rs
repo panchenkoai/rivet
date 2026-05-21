@@ -10,6 +10,7 @@ mod aggregate;
 mod apply_cmd;
 pub(crate) mod chunked;
 mod cli;
+mod finalize;
 pub(crate) mod ipc;
 mod job;
 mod manifest_writer;
@@ -29,55 +30,86 @@ mod validate;
 mod validate_cmd;
 mod validate_manifest;
 
+// ── Public API surface (consumed by `src/cli/dispatch.rs` + binaries) ──────
+//
+// These items are the contract the binary depends on.  Adding to this list
+// is an API change that requires a release-note entry; removing or
+// renaming requires a deprecation cycle.
+
 pub use apply_cmd::run_apply_command;
-#[allow(unused_imports)]
-pub use chunked::generate_chunks;
 pub use cli::{
     reset_chunk_checkpoint, reset_chunk_checkpoints_stuck, reset_state, show_chunk_checkpoint,
     show_files, show_journal, show_metrics, show_progression, show_state,
 };
-pub(crate) use job::run_export_job_with_chunk_source;
 pub use plan_cmd::{PlanOutputFormat, run_plan_command};
 pub use reconcile_cmd::{ReconcileOutputFormat, run_reconcile_command};
 pub use repair_cmd::{RepairOutputFormat, RepairReportSource, run_repair_command};
-#[allow(unused_imports)]
-pub use retry::{RetryClass, classify_error};
 pub use validate_cmd::{ValidateOutputFormat, run_validate_command};
-// build_time_window_query moved to crate::plan; re-exported here for integration tests.
-#[allow(unused_imports)]
-pub use crate::plan::build_time_window_query;
-#[allow(unused_imports)]
-pub use validate::validate_output;
 
-// 0.7.0 trust-contract artifacts — surfaced so integration tests in `tests/`
-// can exercise the writers without spinning up a full pipeline.  Internal
-// implementation details (compute_part_fingerprint, record_committed_part)
-// stay `pub(crate)`.
-#[allow(unused_imports)]
-pub use manifest_writer::{ManifestBuilder, WriteOutcome, write_manifest};
-#[allow(unused_imports)]
-pub use report::{RunReport, report_dir, write_run_report};
-#[allow(unused_imports)]
-pub use resume_decisions::{
-    PartDecision, QuarantineReason, ResumeDecision, ResumePlan, UntrackedDecision,
-    build_resume_plan,
-};
-#[allow(unused_imports)]
-pub use validate_manifest::{
-    Failure as ManifestVerificationFailure, ManifestVerification, verify_at_destination,
-};
+// `RunSummary` is consumed by `notify::*` (via the Coordinator path) plus
+// integration-test fixtures.  It is the canonical observability struct so
+// it stays in the regular public surface.
+pub use summary::RunSummary;
 
+// ── Crate-internal cross-module use ────────────────────────────────────────
+
+pub(crate) use job::run_export_job_with_chunk_source;
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use retry::is_transient;
+
+// ── Test-only surface ──────────────────────────────────────────────────────
+//
+// The integration tests in `tests/*.rs` exercise the trust-contract writers,
+// readers, and decision logic without spinning up a full pipeline.  These
+// items are NOT part of the public CLI contract — operators get them only
+// transitively (via `summary.json`, `manifest.json`, `--validate`, etc.).
+//
+// Hidden behind `#[doc(hidden)] pub mod for_tests` so they don't pollute
+// the rendered crate docs and so a renaming refactor here is a clear
+// "test-only" change rather than appearing as a public API break.
+//
+// Convention matches the existing `destination_for_tests` window in
+// `lib.rs`: tests reach these via `rivet::pipeline::for_tests::*`.
+
+#[doc(hidden)]
+pub mod for_tests {
+    pub use super::chunked::generate_chunks;
+    pub use super::manifest_writer::{ManifestBuilder, WriteOutcome, write_manifest};
+    pub use super::report::{RunReport, report_dir, write_run_report};
+    pub use super::resume_decisions::{
+        PartDecision, QuarantineReason, ResumeDecision, ResumePlan, UntrackedDecision,
+        build_resume_plan,
+    };
+    pub use super::retry::{RetryClass, classify_error};
+    pub use super::validate::validate_output;
+    pub use super::validate_manifest::{
+        Failure as ManifestVerificationFailure, ManifestVerification, verify_at_destination,
+    };
+    pub use crate::plan::build_time_window_query;
+}
+
+// Backwards-compat re-exports at the crate root so existing test files
+// keep compiling without a sweeping import-site update.  Each is delegated
+// to `for_tests::*`; new test code should import from `for_tests` directly.
+//
+// `#[allow(unused_imports)]` because the bin target's dead-code analysis
+// doesn't see the integration tests that consume these — same situation
+// as `RunSummary::stub_for_testing`.
+#[doc(hidden)]
+#[allow(unused_imports)]
+pub use for_tests::{
+    ManifestBuilder, ManifestVerification, ManifestVerificationFailure, PartDecision,
+    QuarantineReason, ResumeDecision, ResumePlan, RetryClass, RunReport, UntrackedDecision,
+    WriteOutcome, build_resume_plan, build_time_window_query, classify_error, generate_chunks,
+    report_dir, validate_output, verify_at_destination, write_manifest, write_run_report,
+};
 
 use std::path::Path;
 
 use crate::config::{Config, ExportConfig};
 use crate::error::Result;
 use crate::state::StateStore;
-
-pub use summary::RunSummary;
 
 /// Per-run configuration flags passed from the CLI to the pipeline.
 ///
