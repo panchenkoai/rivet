@@ -182,22 +182,11 @@ mod tests {
 
     // ─── Local destination edge cases (QA backlog Task 6.1) ────────────────
 
-    /// Build a `LocalDestination` rooted at `base_path` without touching the
-    /// full `DestinationConfig` schema; every field except `path` is None.
     fn dest_at(base_path: &std::path::Path) -> LocalDestination {
         LocalDestination::new(&DestinationConfig {
             destination_type: DestinationType::Local,
-            bucket: None,
-            prefix: None,
             path: Some(base_path.to_string_lossy().into_owned()),
-            region: None,
-            endpoint: None,
-            credentials_file: None,
-            access_key_env: None,
-            secret_key_env: None,
-            aws_profile: None,
-            session_token_env: None,
-            allow_anonymous: false,
+            ..Default::default()
         })
         .unwrap()
     }

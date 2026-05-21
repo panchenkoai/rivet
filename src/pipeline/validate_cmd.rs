@@ -71,7 +71,17 @@ pub fn run_validate_command(
     let mut hard_failures: Vec<String> = Vec::new();
 
     for export in &exports {
-        let dest = match crate::destination::create_destination(&export.destination) {
+        // Apply the same `{date}`/`{export}`/`{table}` substitution `run`
+        // applies via the plan builder, so validate looks at the actual
+        // data prefix instead of a literal `runs/{date}/{export}/` path.
+        // Today's UTC date is used — if validate is invoked the day after
+        // a run, the operator can either inline the absolute prefix in
+        // config or wait for the planned `--run-id` / `--date` flag.
+        let expanded_dest = crate::plan::build::expand_destination_templates(
+            export.destination.clone(),
+            &export.name,
+        );
+        let dest = match crate::destination::create_destination(&expanded_dest) {
             Ok(d) => d,
             Err(e) => {
                 let msg = format!(

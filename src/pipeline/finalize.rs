@@ -354,6 +354,18 @@ fn destination_uri_for_manifest(cfg: &DestinationConfig) -> String {
                 format!("gs://{bucket}/{prefix}")
             }
         }
+        DestinationType::Azure => {
+            // `az://<container>/<prefix>` — same Hadoop/HDFS-style scheme that
+            // azcopy and most Azure-native tools recognise.  Manifest URI is
+            // operator-facing, not used for opendal addressing.
+            let container = cfg.bucket.as_deref().unwrap_or("");
+            let prefix = cfg.prefix.as_deref().unwrap_or("");
+            if prefix.is_empty() {
+                format!("az://{container}/")
+            } else {
+                format!("az://{container}/{prefix}")
+            }
+        }
         DestinationType::Stdout => "stdout".to_string(),
     }
 }
@@ -366,17 +378,9 @@ mod tests {
     fn cfg_local(path: Option<&str>, prefix: Option<&str>) -> DestinationConfig {
         DestinationConfig {
             destination_type: DestinationType::Local,
-            bucket: None,
             prefix: prefix.map(str::to_string),
             path: path.map(str::to_string),
-            region: None,
-            endpoint: None,
-            credentials_file: None,
-            access_key_env: None,
-            secret_key_env: None,
-            aws_profile: None,
-            session_token_env: None,
-            allow_anonymous: false,
+            ..Default::default()
         }
     }
 
@@ -385,21 +389,19 @@ mod tests {
             destination_type: DestinationType::S3,
             bucket: Some(bucket.into()),
             prefix: prefix.map(str::to_string),
-            path: None,
-            region: None,
-            endpoint: None,
-            credentials_file: None,
-            access_key_env: None,
-            secret_key_env: None,
-            aws_profile: None,
-            session_token_env: None,
-            allow_anonymous: false,
+            ..Default::default()
         }
     }
 
     fn cfg_gcs(bucket: &str, prefix: Option<&str>) -> DestinationConfig {
         let mut c = cfg_s3(bucket, prefix);
         c.destination_type = DestinationType::Gcs;
+        c
+    }
+
+    fn cfg_azure(container: &str, prefix: Option<&str>) -> DestinationConfig {
+        let mut c = cfg_s3(container, prefix);
+        c.destination_type = DestinationType::Azure;
         c
     }
 
@@ -438,6 +440,18 @@ mod tests {
         assert_eq!(
             destination_uri_for_manifest(&cfg_gcs("b", Some("k/"))),
             "gs://b/k/"
+        );
+    }
+
+    #[test]
+    fn destination_uri_azure_with_and_without_prefix() {
+        assert_eq!(
+            destination_uri_for_manifest(&cfg_azure("c", None)),
+            "az://c/"
+        );
+        assert_eq!(
+            destination_uri_for_manifest(&cfg_azure("c", Some("runs/2026/"))),
+            "az://c/runs/2026/"
         );
     }
 

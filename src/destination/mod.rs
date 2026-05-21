@@ -4,6 +4,7 @@
 //! Each backend declares its `DestinationCapabilities` so the pipeline can reason
 //! about commit boundaries and recovery semantics without inspecting backend internals.
 
+pub mod azure;
 pub mod gcs;
 mod gcs_auth;
 pub mod local;
@@ -178,6 +179,7 @@ pub fn create_destination(config: &DestinationConfig) -> Result<Box<dyn Destinat
         DestinationType::Local => Ok(Box::new(local::LocalDestination::new(config)?)),
         DestinationType::S3 => Ok(Box::new(s3::S3Destination::new(config)?)),
         DestinationType::Gcs => Ok(Box::new(gcs::GcsDestination::new(config)?)),
+        DestinationType::Azure => Ok(Box::new(azure::AzureDestination::new(config)?)),
         DestinationType::Stdout => Ok(Box::new(stdout::StdoutDestination::new()?)),
     }
 }
@@ -247,17 +249,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let config = DestinationConfig {
             destination_type: DestinationType::Local,
-            bucket: None,
-            prefix: None,
             path: Some(dir.path().to_str().unwrap().to_string()),
-            region: None,
-            endpoint: None,
-            credentials_file: None,
-            access_key_env: None,
-            secret_key_env: None,
-            aws_profile: None,
-            session_token_env: None,
-            allow_anonymous: false,
+            ..Default::default()
         };
         let dest = create_destination(&config).unwrap();
         let caps = dest.capabilities();
@@ -272,17 +265,7 @@ mod tests {
         use crate::config::{DestinationConfig, DestinationType};
         let config = DestinationConfig {
             destination_type: DestinationType::Stdout,
-            bucket: None,
-            prefix: None,
-            path: None,
-            region: None,
-            endpoint: None,
-            credentials_file: None,
-            access_key_env: None,
-            secret_key_env: None,
-            aws_profile: None,
-            session_token_env: None,
-            allow_anonymous: false,
+            ..Default::default()
         };
         let dest = create_destination(&config).unwrap();
         let caps = dest.capabilities();

@@ -15,6 +15,18 @@ pub struct S3Destination {
     prefix: String,
 }
 
+/// Read a credential from an env var into a `Zeroizing<String>`.
+///
+/// SecOps: the underlying heap buffer is zeroed on drop instead of lingering
+/// in freed memory (visible via core dump, ptrace, or heap reuse). OpenDAL
+/// stores its own copy inside `reqsign`; the `Zeroizing` wrapper only protects
+/// our transient handle.
+fn read_credential_env(env_name: &str, label: &str) -> Result<zeroize::Zeroizing<String>> {
+    let value = std::env::var(env_name)
+        .map_err(|_| anyhow::anyhow!("env var '{}' not set for S3 {}", env_name, label))?;
+    Ok(zeroize::Zeroizing::new(value))
+}
+
 impl S3Destination {
     pub fn new(config: &DestinationConfig) -> Result<Self> {
         let bucket = config
@@ -31,59 +43,27 @@ impl S3Destination {
             builder = builder.endpoint(endpoint);
         }
 
-        // SecOps: wrap AWS credentials in `Zeroizing<String>` so the underlying
-        // heap buffer is zeroed the moment the value is dropped, rather than
-        // lingering in freed memory pages (visible via core dump, ptrace, or
-        // heap reuse). `&key` / `&secret` are still passed verbatim to OpenDAL,
-        // which stores its own copy inside `reqsign`.
         if let Some(env_name) = &config.access_key_env {
-            let key = zeroize::Zeroizing::new(std::env::var(env_name).map_err(|_| {
-                anyhow::anyhow!("env var '{}' not set for S3 access key", env_name)
-            })?);
+            let key = read_credential_env(env_name, "access key")?;
             builder = builder.access_key_id(key.as_str());
         }
         if let Some(env_name) = &config.secret_key_env {
-            let secret = zeroize::Zeroizing::new(std::env::var(env_name).map_err(|_| {
-                anyhow::anyhow!("env var '{}' not set for S3 secret key", env_name)
-            })?);
+            let secret = read_credential_env(env_name, "secret key")?;
             builder = builder.secret_access_key(secret.as_str());
         }
-        // STS session token for temporary credentials (AWS IAM Identity
-        // Center / SSO, AssumeRole, MFA, EKS IAM Roles for Service
-        // Accounts, etc.).  Required whenever `access_key_id` starts
-        // with `ASIA…` rather than `AKIA…`.  See `docs/cloud-auth.md`.
-        // SecOps: same `Zeroizing<String>` treatment as the access keys
-        // — token is a credential and must not linger in heap pages.
+        // STS session token: required whenever `access_key_id` starts with
+        // `ASIA…` rather than `AKIA…`.  See `docs/cloud-auth.md`.
         if let Some(env_name) = &config.session_token_env {
-            let token = zeroize::Zeroizing::new(std::env::var(env_name).map_err(|_| {
-                anyhow::anyhow!("env var '{}' not set for S3 session token", env_name)
-            })?);
+            let token = read_credential_env(env_name, "session token")?;
             builder = builder.session_token(token.as_str());
         }
 
-        // When `aws_profile` is set in rivet config, build a reqsign credential
-        // loader with the profile name baked in — no `env::set_var` required.
-        // This is safe under `--parallel-exports` because each export gets its
-        // own loader instance; no global state is mutated.
-        //
-        // ⚠ Warning: this path uses reqsign's `AwsDefaultLoader`, which falls
-        // through to the EC2 instance-metadata service (IMDS) on a developer
-        // laptop if the profile turns out to be empty (e.g. AWS CLI v2's
-        // "AWS Login" profiles store sessions in `~/.aws/login/cache/`,
-        // a format reqsign 0.16 does not understand).  IMDS is unreachable
-        // off-EC2 and the connect attempt times out only after several
-        // retries, surfacing as a confusing hang.  When that happens the
-        // operator should either (a) use the static `access_key_env` +
-        // `secret_key_env` (+ `session_token_env` for STS/SSO/AssumeRole)
-        // path, or (b) bridge their AWS Login session via
-        // `aws configure export-credentials --format env`.  See
-        // `docs/cloud-auth.md` for the full matrix.
+        // `aws_profile` uses reqsign's per-instance loader (no `env::set_var`,
+        // so it's safe under `--parallel-exports`).  Caveat: the default chain
+        // falls through to IMDS, which hangs off-EC2 — see `docs/cloud-auth.md`
+        // for the AWS SSO / Identity Center bridge.
         if let Some(profile) = &config.aws_profile {
-            log::info!(
-                "S3: using AWS profile '{}' (reqsign default-chain — see docs/cloud-auth.md \
-                 if you see IMDS timeouts: switch to access_key_env+secret_key_env+session_token_env)",
-                profile
-            );
+            log::info!("S3: using AWS profile '{}'", profile);
             let cred_config = reqsign::AwsConfig {
                 profile: profile.clone(),
                 ..Default::default()
@@ -296,5 +276,51 @@ aws_profile: staging
 "#;
         let config: DestinationConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(config.aws_profile.as_deref(), Some("staging"));
+    }
+
+    // ── session_token_env (STS / SSO / AssumeRole credentials) ────────────────
+
+    #[test]
+    fn session_token_env_field_parsed_from_destination_config() {
+        use crate::config::DestinationConfig;
+        let yaml = r#"
+type: s3
+bucket: my-bucket
+access_key_env: AWS_ACCESS_KEY_ID
+secret_key_env: AWS_SECRET_ACCESS_KEY
+session_token_env: AWS_SESSION_TOKEN
+"#;
+        let config: DestinationConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(
+            config.session_token_env.as_deref(),
+            Some("AWS_SESSION_TOKEN")
+        );
+    }
+
+    #[test]
+    fn read_credential_env_missing_var_errors_with_label() {
+        // Reach a unique env-var name that is guaranteed unset across runners.
+        let name = "RIVET_TEST_S3_TOKEN_DEFINITELY_UNSET_XYZ";
+        // SAFETY: test-only; binary is single-threaded in this test context.
+        unsafe { std::env::remove_var(name) };
+        let err = super::read_credential_env(name, "session token").unwrap_err();
+        let msg = format!("{err:#}");
+        // The error must surface both the env-var name (operator can grep)
+        // and the credential label (operator knows which slot is empty).
+        assert!(msg.contains(name), "missing env var name in error: {msg}");
+        assert!(
+            msg.contains("session token"),
+            "missing credential label in error: {msg}"
+        );
+    }
+
+    #[test]
+    fn read_credential_env_reads_value_into_zeroizing() {
+        let name = "RIVET_TEST_S3_TOKEN_PRESENT_XYZ";
+        // SAFETY: test-only; binary is single-threaded in this test context.
+        unsafe { std::env::set_var(name, "fake-token-value") };
+        let zeroizing = super::read_credential_env(name, "session token").unwrap();
+        assert_eq!(zeroizing.as_str(), "fake-token-value");
+        unsafe { std::env::remove_var(name) };
     }
 }

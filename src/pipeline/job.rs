@@ -618,17 +618,8 @@ mod tests {
             meta_columns: MetaColumns::default(),
             destination: DestinationConfig {
                 destination_type: DestinationType::Local,
-                bucket: None,
-                prefix: None,
                 path: Some("/tmp".into()),
-                region: None,
-                endpoint: None,
-                credentials_file: None,
-                access_key_env: None,
-                secret_key_env: None,
-                aws_profile: None,
-                session_token_env: None,
-                allow_anonymous: false,
+                ..Default::default()
             },
             quality,
             tuning: SourceTuning::from_config(None),

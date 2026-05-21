@@ -356,7 +356,11 @@ fn parse_column_overrides(
 /// - `{date}`   → UTC date as `YYYY-MM-DD`
 /// - `{export}` → export name from config
 /// - `{table}`  → alias for `{export}`
-fn expand_destination_templates(
+///
+/// `pub(crate)` so `validate_cmd` and `doctor` can apply the same expansion
+/// `run` does — otherwise validate/doctor would look at the literal
+/// `runs/{date}/{export}/` path and miss the actual data prefix.
+pub(crate) fn expand_destination_templates(
     mut dest: crate::config::DestinationConfig,
     export_name: &str,
 ) -> crate::config::DestinationConfig {
@@ -439,17 +443,8 @@ mod tests {
             skip_empty: false,
             destination: DestinationConfig {
                 destination_type: DestinationType::Local,
-                bucket: None,
-                prefix: None,
                 path: Some("./out".into()),
-                region: None,
-                endpoint: None,
-                credentials_file: None,
-                access_key_env: None,
-                secret_key_env: None,
-                aws_profile: None,
-                session_token_env: None,
-                allow_anonymous: false,
+                ..Default::default()
             },
             meta_columns: MetaColumns::default(),
             quality: None,
@@ -717,17 +712,9 @@ mod tests {
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let dest = DestinationConfig {
             destination_type: DestinationType::Local,
-            bucket: None,
             prefix: Some("exports/{date}/{export}/".into()),
             path: Some("/data/{table}/{date}".into()),
-            region: None,
-            endpoint: None,
-            credentials_file: None,
-            access_key_env: None,
-            secret_key_env: None,
-            aws_profile: None,
-            session_token_env: None,
-            allow_anonymous: false,
+            ..Default::default()
         };
         let expanded = expand_destination_templates(dest, "orders");
         assert_eq!(
@@ -859,20 +846,34 @@ mod tests {
     fn expand_destination_templates_no_placeholders_unchanged() {
         let dest = DestinationConfig {
             destination_type: DestinationType::Local,
-            bucket: None,
-            prefix: None,
             path: Some("./out".into()),
-            region: None,
-            endpoint: None,
-            credentials_file: None,
-            access_key_env: None,
-            secret_key_env: None,
-            aws_profile: None,
-            session_token_env: None,
-            allow_anonymous: false,
+            ..Default::default()
         };
         let expanded = expand_destination_templates(dest, "orders");
         assert_eq!(expanded.path.as_deref(), Some("./out"));
         assert!(expanded.prefix.is_none());
+    }
+
+    #[test]
+    fn expand_destination_templates_is_idempotent_on_already_expanded_strings() {
+        // Regression guard for the validate/doctor wiring (2026-05-21):
+        // both commands now call `expand_destination_templates` on the same
+        // config `run` already expanded for.  Calling twice must NOT mangle
+        // a string that has no remaining placeholders.
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let once = expand_destination_templates(
+            DestinationConfig {
+                destination_type: DestinationType::Local,
+                prefix: Some("runs/{date}/{export}/".into()),
+                ..Default::default()
+            },
+            "orders",
+        );
+        let twice = expand_destination_templates(once.clone(), "orders");
+        assert_eq!(once.prefix, twice.prefix);
+        assert_eq!(
+            once.prefix.as_deref(),
+            Some(format!("runs/{today}/orders/").as_str())
+        );
     }
 }

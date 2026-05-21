@@ -353,17 +353,8 @@ mod tests {
     fn local_dest(base: &Path) -> LocalDestination {
         LocalDestination::new(&DestinationConfig {
             destination_type: DestinationType::Local,
-            bucket: None,
-            prefix: None,
             path: Some(base.to_string_lossy().into_owned()),
-            region: None,
-            endpoint: None,
-            credentials_file: None,
-            access_key_env: None,
-            secret_key_env: None,
-            aws_profile: None,
-            session_token_env: None,
-            allow_anonymous: false,
+            ..Default::default()
         })
         .expect("build LocalDestination")
     }

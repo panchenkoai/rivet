@@ -818,7 +818,7 @@ impl CompressionProfile {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct DestinationConfig {
     #[serde(rename = "type")]
     pub destination_type: DestinationType,
@@ -837,16 +837,26 @@ pub struct DestinationConfig {
     /// See `docs/cloud-auth.md` for the AWS auth-flow matrix.
     pub session_token_env: Option<String>,
     pub aws_profile: Option<String>,
+    /// Azure storage account name (the prefix in `<account>.blob.core.windows.net`).
+    /// Plain string — not a secret. Pair with `account_key_env`.
+    /// See `docs/cloud-auth.md` for the Azure auth-flow matrix.
+    pub account_name: Option<String>,
+    /// Name of an env var holding the Azure Storage account key.  Treated as
+    /// a credential and wiped from heap on drop — same SecOps treatment as
+    /// `access_key_env`.  Pair with `account_name`.
+    pub account_key_env: Option<String>,
     #[serde(default)]
     pub allow_anonymous: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum DestinationType {
+    #[default]
     Local,
     S3,
     Gcs,
+    Azure,
     Stdout,
 }
 
@@ -857,6 +867,7 @@ impl DestinationType {
             DestinationType::Local => "local",
             DestinationType::S3 => "s3",
             DestinationType::Gcs => "gcs",
+            DestinationType::Azure => "azure",
             DestinationType::Stdout => "stdout",
         }
     }
@@ -1101,6 +1112,7 @@ mod tests {
         assert_eq!(DestinationType::Local.label(), "local");
         assert_eq!(DestinationType::S3.label(), "s3");
         assert_eq!(DestinationType::Gcs.label(), "gcs");
+        assert_eq!(DestinationType::Azure.label(), "azure");
         assert_eq!(DestinationType::Stdout.label(), "stdout");
     }
 
@@ -1137,17 +1149,8 @@ mod tests {
             skip_empty: false,
             destination: DestinationConfig {
                 destination_type: DestinationType::Local,
-                bucket: None,
-                prefix: None,
                 path: Some("/tmp".into()),
-                region: None,
-                endpoint: None,
-                credentials_file: None,
-                access_key_env: None,
-                secret_key_env: None,
-                aws_profile: None,
-                session_token_env: None,
-                allow_anonymous: false,
+                ..Default::default()
             },
             meta_columns: MetaColumns::default(),
             quality: None,

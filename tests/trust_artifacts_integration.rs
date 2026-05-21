@@ -39,17 +39,8 @@ use rivet::state::{SchemaColumn, schema_fingerprint};
 fn local_destination_config(base: &Path) -> DestinationConfig {
     DestinationConfig {
         destination_type: DestinationType::Local,
-        bucket: None,
-        prefix: None,
         path: Some(base.to_string_lossy().into_owned()),
-        region: None,
-        endpoint: None,
-        credentials_file: None,
-        access_key_env: None,
-        secret_key_env: None,
-        aws_profile: None,
-        session_token_env: None,
-        allow_anonymous: false,
+        ..Default::default()
     }
 }
 
@@ -428,17 +419,7 @@ fn streaming_destination_writes_nothing_and_does_not_error() {
     // note rather than aborting the run.
     let cfg = DestinationConfig {
         destination_type: DestinationType::Stdout,
-        bucket: None,
-        prefix: None,
-        path: None,
-        region: None,
-        endpoint: None,
-        credentials_file: None,
-        access_key_env: None,
-        secret_key_env: None,
-        aws_profile: None,
-        session_token_env: None,
-        allow_anonymous: false,
+        ..Default::default()
     };
     let dest = rivet::destination_for_tests::create_destination(&cfg).unwrap();
     let m = build_manifest(
@@ -1645,17 +1626,7 @@ fn streaming_destination_never_writes_success_marker_even_on_success_status() {
     // exists for stdout destinations under any status.
     let cfg = DestinationConfig {
         destination_type: DestinationType::Stdout,
-        bucket: None,
-        prefix: None,
-        path: None,
-        region: None,
-        endpoint: None,
-        credentials_file: None,
-        access_key_env: None,
-        secret_key_env: None,
-        aws_profile: None,
-        session_token_env: None,
-        allow_anonymous: false,
+        ..Default::default()
     };
     let dest = rivet::destination_for_tests::create_destination(&cfg).unwrap();
     let m = build_manifest(
