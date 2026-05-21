@@ -141,6 +141,15 @@ pub(crate) fn run_chunked_sequential(
             let dest = destination::create_destination(&plan.destination)?;
             dest.write(sink.tmp.path(), &file_name)?;
 
+            // ADR-0012 M1: record the committed chunk part for the manifest.
+            super::super::manifest_writer::record_committed_part(
+                summary,
+                file_name.clone(),
+                sink.total_rows as i64,
+                file_bytes,
+                sink.tmp.path(),
+            );
+
             if let Some(st) = state
                 && let Err(e) = st.record_file(
                     &summary.run_id,
@@ -153,7 +162,7 @@ pub(crate) fn run_chunked_sequential(
                 )
             {
                 log::warn!(
-                    "export '{}': manifest write failed for chunk file '{}' (file was produced): {:#}",
+                    "export '{}': file_log write failed for chunk file '{}' (file was produced): {:#}",
                     plan.export_name,
                     file_name,
                     e
@@ -218,7 +227,9 @@ pub(crate) fn run_chunked_parallel(
     let agg_bytes = std::sync::atomic::AtomicU64::new(0);
     let agg_files = AtomicUsize::new(0);
     let errors = std::sync::Mutex::new(Vec::<String>::new());
-    let file_records: std::sync::Mutex<Vec<(String, i64, i64)>> = std::sync::Mutex::new(Vec::new());
+    // (file_name, rows, bytes, content_fingerprint)
+    let file_records: std::sync::Mutex<Vec<(String, i64, i64, String)>> =
+        std::sync::Mutex::new(Vec::new());
     // Condvar-backed semaphore: blocked spawners park in the kernel until a
     // worker calls `release()`, instead of polling an atomic every 50 ms.
     let semaphore = resource::Semaphore::new(parallel);
@@ -324,10 +335,27 @@ pub(crate) fn run_chunked_parallel(
                             fmt.file_extension()
                         );
                         shared_destination.write(sink.tmp.path(), &file_name)?;
-                        file_records
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push((file_name, sink.total_rows as i64, file_bytes as i64));
+                        // ADR-0012 M3: compute the part fingerprint while the
+                        // local tmp file still exists in this worker scope.
+                        let fingerprint = super::super::manifest_writer::compute_part_fingerprint(
+                            sink.tmp.path(),
+                        )
+                        .unwrap_or_else(|e| {
+                            log::warn!(
+                                "export '{}': chunk {} fingerprint failed for '{}' (not fatal): {:#}",
+                                export_name,
+                                i,
+                                file_name,
+                                e
+                            );
+                            "xxh3:0000000000000000".to_string()
+                        });
+                        file_records.lock().unwrap_or_else(|e| e.into_inner()).push((
+                            file_name,
+                            sink.total_rows as i64,
+                            file_bytes as i64,
+                            fingerprint,
+                        ));
                     }
 
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -365,7 +393,9 @@ pub(crate) fn run_chunked_parallel(
 
     let fmt_name = plan.format.label();
     let comp_name = plan.compression.label();
-    for (fname, rows, bytes) in file_records.into_inner().unwrap_or_else(|e| e.into_inner()) {
+    for (fname, rows, bytes, fingerprint) in
+        file_records.into_inner().unwrap_or_else(|e| e.into_inner())
+    {
         if let Err(e) = state.record_file(
             &summary.run_id,
             &plan.export_name,
@@ -376,12 +406,20 @@ pub(crate) fn run_chunked_parallel(
             Some(comp_name),
         ) {
             log::warn!(
-                "export '{}': manifest write failed for parallel chunk '{}' (file was produced): {:#}",
+                "export '{}': file_log write failed for parallel chunk '{}' (file was produced): {:#}",
                 plan.export_name,
                 fname,
                 e
             );
         }
+        // ADR-0012 M1: aggregate the worker's recorded part into the manifest.
+        super::super::manifest_writer::record_committed_part_with_fingerprint(
+            summary,
+            fname,
+            rows,
+            bytes as u64,
+            fingerprint,
+        );
     }
 
     let errs = errors.into_inner().unwrap_or_else(|e| e.into_inner());
@@ -527,6 +565,7 @@ mod tests {
             source_count: None,
             pg_temp_bytes_delta: None,
             reconciled: None,
+            manifest_parts: Vec::new(),
             journal: RunJournal::new("test_run", &plan.export_name),
         }
     }

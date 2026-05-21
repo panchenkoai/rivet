@@ -125,6 +125,7 @@ mod tests {
             source_count: None,
             pg_temp_bytes_delta: None,
             reconciled: None,
+            manifest_parts: Vec::new(),
             journal: crate::journal::RunJournal::new("test_run", "test_export"),
         }
     }

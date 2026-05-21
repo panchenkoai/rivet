@@ -45,6 +45,7 @@ fn stub_summary(status: &str) -> RunSummary {
         source_count: None,
         pg_temp_bytes_delta: None,
         reconciled: None,
+        manifest_parts: Vec::new(),
         journal: RunJournal::new("test_run", "orders"),
     }
 }

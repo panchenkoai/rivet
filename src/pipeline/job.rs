@@ -175,6 +175,7 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
         source_count: None,
         pg_temp_bytes_delta: None,
         reconciled: None,
+        manifest_parts: Vec::new(),
         journal,
     }
 }
@@ -365,6 +366,7 @@ pub(super) fn run_export_job(
 
     summary.print();
     finalize_run_report(config_path, &summary, "export");
+    finalize_manifest(&plan, state, &summary, "export");
     crate::notify::maybe_send(config.notifications.as_ref(), &summary);
 
     let final_result = if failed { result } else { Ok(()) };
@@ -414,6 +416,167 @@ fn finalize_run_report(config_path: &str, summary: &RunSummary, kind: &str) {
         );
     }
     let _ = h.flush();
+}
+
+/// Build the cloud-output manifest from the run's accumulated parts and write
+/// it (plus `_SUCCESS` for clean runs) to the destination.
+///
+/// ADR-0012 M1 / M2 / M7: parts are already committed, manifest is written
+/// next, then `_SUCCESS` only when status == Success.  Failures are non-fatal
+/// — the run keeps its exit code and operators can investigate via the local
+/// run report.
+fn finalize_manifest(
+    plan: &crate::plan::ResolvedRunPlan,
+    state: &StateStore,
+    summary: &RunSummary,
+    kind: &str,
+) {
+    use crate::manifest::ManifestStatus;
+    use crate::pipeline::manifest_writer::{ManifestBuilder, WriteOutcome, write_manifest};
+
+    let snapshot = match summary.journal.plan_snapshot() {
+        Some(s) => s,
+        None => {
+            // Synthetic-failure summaries never recorded a PlanResolved event.
+            // There is no committed work to manifest; just log and return.
+            log::debug!(
+                "{} '{}': no plan snapshot, manifest skipped",
+                kind,
+                summary.export_name
+            );
+            return;
+        }
+    };
+
+    let status = match summary.status.as_str() {
+        "success" => ManifestStatus::Success,
+        "failed" => ManifestStatus::Failed,
+        _ => ManifestStatus::Interrupted,
+    };
+
+    let schema_fingerprint = state
+        .get_stored_schema(&summary.export_name)
+        .ok()
+        .flatten()
+        .map(|cols| crate::state::schema_fingerprint(&cols))
+        .unwrap_or_else(|| "xxh3:0000000000000000".to_string());
+
+    let source_engine = match plan.source.source_type {
+        crate::config::SourceType::Postgres => "postgres",
+        crate::config::SourceType::Mysql => "mysql",
+    };
+
+    // `export_name` is often `schema.table`; split for the manifest fields
+    // without fabricating values for free-form queries.
+    let (source_schema, source_table) = match summary.export_name.split_once('.') {
+        Some((s, t)) if !s.is_empty() && !t.is_empty() => {
+            (Some(s.to_string()), Some(t.to_string()))
+        }
+        _ => (None, None),
+    };
+
+    let started_at = summary
+        .journal
+        .entries
+        .first()
+        .map(|e| e.recorded_at)
+        .unwrap_or_else(chrono::Utc::now);
+
+    let mut builder = ManifestBuilder::new(
+        snapshot,
+        &summary.run_id,
+        started_at,
+        schema_fingerprint,
+        source_engine,
+        source_schema,
+        source_table,
+        destination_uri_for_manifest(&plan.destination),
+    );
+    for part in &summary.manifest_parts {
+        builder.record_part(
+            part.part_id,
+            part.path.clone(),
+            part.rows,
+            part.size_bytes,
+            part.content_fingerprint.clone(),
+        );
+    }
+    let manifest = builder.finalize(status);
+
+    let dest = match crate::destination::create_destination(&plan.destination) {
+        Ok(d) => d,
+        Err(e) => {
+            log::warn!(
+                "{} '{}': could not create destination for manifest write (not fatal): {:#}",
+                kind,
+                summary.export_name,
+                e
+            );
+            return;
+        }
+    };
+
+    match write_manifest(&*dest, &manifest) {
+        Ok(WriteOutcome::Written { success_marker }) => {
+            log::info!(
+                "{} '{}': manifest.json written ({} parts, {} rows){}",
+                kind,
+                summary.export_name,
+                manifest.part_count,
+                manifest.row_count,
+                if success_marker { " + _SUCCESS" } else { "" },
+            );
+        }
+        Ok(WriteOutcome::SkippedStreaming) => {
+            log::info!(
+                "{} '{}': manifest skipped (streaming destination)",
+                kind,
+                summary.export_name,
+            );
+        }
+        Err(e) => {
+            log::warn!(
+                "{} '{}': manifest write failed (not fatal): {:#}",
+                kind,
+                summary.export_name,
+                e
+            );
+        }
+    }
+}
+
+/// Best-effort textual URI for the manifest's `destination.uri` field.  The
+/// manifest is a record of where data was written, so the URI must reflect
+/// what an operator would type to find the prefix again.
+fn destination_uri_for_manifest(cfg: &crate::config::DestinationConfig) -> String {
+    use crate::config::DestinationType;
+    match cfg.destination_type {
+        DestinationType::Local => cfg
+            .path
+            .clone()
+            .or_else(|| cfg.prefix.clone())
+            .map(|p| format!("file://{p}"))
+            .unwrap_or_else(|| "file://.".to_string()),
+        DestinationType::S3 => {
+            let bucket = cfg.bucket.as_deref().unwrap_or("");
+            let prefix = cfg.prefix.as_deref().unwrap_or("");
+            if prefix.is_empty() {
+                format!("s3://{bucket}/")
+            } else {
+                format!("s3://{bucket}/{prefix}")
+            }
+        }
+        DestinationType::Gcs => {
+            let bucket = cfg.bucket.as_deref().unwrap_or("");
+            let prefix = cfg.prefix.as_deref().unwrap_or("");
+            if prefix.is_empty() {
+                format!("gs://{bucket}/")
+            } else {
+                format!("gs://{bucket}/{prefix}")
+            }
+        }
+        DestinationType::Stdout => "stdout".to_string(),
+    }
 }
 
 /// Execute a pre-resolved plan with a caller-supplied `ChunkSource`.
@@ -517,6 +680,7 @@ pub(crate) fn run_export_job_with_chunk_source(
 
     summary.print();
     finalize_run_report(config_path, &summary, "apply");
+    finalize_manifest(plan, state, &summary, "apply");
 
     if failed { result } else { Ok(()) }
 }
@@ -674,6 +838,7 @@ mod tests {
             source_count: None,
             pg_temp_bytes_delta: None,
             reconciled: None,
+            manifest_parts: Vec::new(),
             journal: RunJournal::new("r", &plan.export_name),
         }
     }

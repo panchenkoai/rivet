@@ -285,6 +285,7 @@ mod tests {
             source_count: None,
             pg_temp_bytes_delta: None,
             reconciled: None,
+            manifest_parts: Vec::new(),
             journal: RunJournal::new(run_id, &plan.export_name),
         }
     }

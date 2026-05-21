@@ -33,6 +33,12 @@ use crate::{destination, format, resource};
 
 use super::math::build_chunk_query_sql;
 
+/// Returns `(rows, file_name, file_bytes, content_fingerprint)`.
+///
+/// The fingerprint is computed while the local tmp file still exists inside
+/// this function (it is dropped on return); ADR-0012 M3 requires every
+/// committed manifest part to carry one.  An empty chunk returns `None`s
+/// where a real chunk would carry a file name and fingerprint.
 fn export_one_chunk_range(
     src: &mut dyn Source,
     base_query: &str,
@@ -41,7 +47,7 @@ fn export_one_chunk_range(
     end: i64,
     chunk_index: i64,
     plan: &ResolvedRunPlan,
-) -> Result<(usize, Option<String>, u64)> {
+) -> Result<(usize, Option<String>, u64, Option<String>)> {
     let chunk_query = build_chunk_query_sql(
         base_query,
         &cp.column,
@@ -68,7 +74,7 @@ fn export_one_chunk_range(
     }
 
     if sink.total_rows == 0 {
-        return Ok((0, None, 0));
+        return Ok((0, None, 0, None));
     }
 
     if plan.validate {
@@ -88,8 +94,24 @@ fn export_one_chunk_range(
     );
     let dest = destination::create_destination(&plan.destination)?;
     dest.write(sink.tmp.path(), &file_name)?;
+    let fingerprint = super::super::manifest_writer::compute_part_fingerprint(sink.tmp.path())
+        .unwrap_or_else(|e| {
+            log::warn!(
+                "export '{}': checkpoint chunk {} fingerprint failed for '{}' (not fatal): {:#}",
+                plan.export_name,
+                chunk_index,
+                file_name,
+                e
+            );
+            "xxh3:0000000000000000".to_string()
+        });
 
-    Ok((sink.total_rows, Some(file_name), file_bytes))
+    Ok((
+        sink.total_rows,
+        Some(file_name),
+        file_bytes,
+        Some(fingerprint),
+    ))
 }
 
 fn run_chunk_with_source_retries(
@@ -99,7 +121,7 @@ fn run_chunk_with_source_retries(
     end: i64,
     chunk_index: i64,
     plan: &ResolvedRunPlan,
-) -> Result<(usize, Option<String>, u64)> {
+) -> Result<(usize, Option<String>, u64, Option<String>)> {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..=plan.tuning.max_retries {
         if attempt > 0 {
@@ -215,7 +237,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
         });
 
         match run_chunk_with_source_retries(&plan.base_query, cp, start, end, chunk_index, plan) {
-            Ok((rows, fname, file_bytes)) => {
+            Ok((rows, fname, file_bytes, fingerprint)) => {
                 summary.total_rows += rows as i64;
                 pb.inc(summary.total_rows);
                 if rows > 0 {
@@ -233,10 +255,20 @@ pub(crate) fn run_chunked_sequential_checkpoint(
                         )
                     {
                         log::warn!(
-                            "export '{}': manifest write failed for checkpoint chunk '{}' (file was produced): {:#}",
+                            "export '{}': file_log write failed for checkpoint chunk '{}' (file was produced): {:#}",
                             plan.export_name,
                             name,
                             e
+                        );
+                    }
+                    // ADR-0012 M1: record this committed checkpoint chunk for the manifest.
+                    if let (Some(name), Some(fp)) = (fname.as_ref(), fingerprint) {
+                        super::super::manifest_writer::record_committed_part_with_fingerprint(
+                            summary,
+                            name.clone(),
+                            rows as i64,
+                            file_bytes,
+                            fp,
                         );
                     }
                 }

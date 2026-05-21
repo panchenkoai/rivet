@@ -316,6 +316,15 @@ pub(super) fn run_single_export(
 
         // ADR-0001 I2–I4 / ADR-0004: state writes happen only after destination.write()
         // returns Ok(()), which for all current backends is the commit boundary.
+        // ADR-0012 M1: record the committed part on the run summary so the
+        // finalizer can assemble a RunManifest covering all parts.
+        crate::pipeline::manifest_writer::record_committed_part(
+            summary,
+            file_name.clone(),
+            part.rows as i64,
+            file_bytes,
+            part.tmp.path(),
+        );
         summary.journal.record(RunEvent::FileWritten {
             file_name: file_name.clone(),
             rows: part.rows as i64,

@@ -21,8 +21,6 @@
 //! Resume-aware part skipping (M8 decision matrix) and `_SUCCESS` overwrite
 //! refusal (M8) live elsewhere; this module is purely a writer.
 
-#![allow(dead_code)] // first caller (pipeline integration) lands in a follow-up commit
-
 use std::io::Read;
 use std::path::Path;
 
@@ -33,6 +31,7 @@ use crate::manifest::{
     MANIFEST_FILENAME, ManifestDestination, ManifestPart, ManifestSource, ManifestStatus,
     PartStatus, RunManifest, SUCCESS_FILENAME, success_marker_body,
 };
+use crate::pipeline::summary::RunSummary;
 
 /// Per-run accumulator for manifest parts.
 ///
@@ -64,9 +63,11 @@ impl ManifestBuilder {
     /// `source_engine` is the resolved engine label (`"postgres"` / `"mysql"`).
     /// `source_schema` / `source_table` are the logical names extracted from
     /// the plan; pass `None` for queries that do not resolve to a single table.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         plan: &PlanSnapshot,
         run_id: &str,
+        started_at: chrono::DateTime<chrono::Utc>,
         schema_fingerprint: String,
         source_engine: &str,
         source_schema: Option<String>,
@@ -76,7 +77,7 @@ impl ManifestBuilder {
         Self {
             run_id: run_id.to_string(),
             export_name: plan.export_name.clone(),
-            started_at: chrono::Utc::now(),
+            started_at,
             source: ManifestSource {
                 engine: source_engine.to_string(),
                 schema: source_schema,
@@ -179,6 +180,66 @@ pub fn compute_part_fingerprint(path: &Path) -> Result<String> {
     Ok(format!("xxh3:{:016x}", h.digest()))
 }
 
+/// Record a committed part on the run summary.
+///
+/// Called at every `dest.write()` site, immediately after the write succeeds
+/// — the same I2/I3 window that already drives `state.record_file()`.
+///
+/// Computes the part content fingerprint from the local temp file (still
+/// extant at this point) and appends a `ManifestPart` to
+/// `summary.manifest_parts` for the finalizer to assemble into a
+/// `RunManifest`.
+///
+/// Fingerprint failure is non-fatal: a placeholder zero fingerprint is
+/// pushed and a `WARN` is logged.  M3 verification will later reject the
+/// part as corrupt; this preserves the manifest contract under read while
+/// not blocking the write path (consistent with ADR-0001 I7 — observability
+/// failures must not abort exports).
+pub fn record_committed_part(
+    summary: &mut RunSummary,
+    relative_path: String,
+    rows: i64,
+    size_bytes: u64,
+    local_tmp_path: &Path,
+) {
+    let fingerprint = match compute_part_fingerprint(local_tmp_path) {
+        Ok(fp) => fp,
+        Err(e) => {
+            log::warn!(
+                "export '{}': part fingerprint failed for '{}' (not fatal): {:#}",
+                summary.export_name,
+                relative_path,
+                e
+            );
+            "xxh3:0000000000000000".to_string()
+        }
+    };
+    record_committed_part_with_fingerprint(summary, relative_path, rows, size_bytes, fingerprint);
+}
+
+/// Same as [`record_committed_part`] but with a precomputed fingerprint.
+///
+/// Used by parallel-chunked aggregation, where workers compute fingerprints
+/// inside their thread (the local tmp file is dropped at thread exit) and
+/// the parent iterates over the shared `file_records` collection.
+pub fn record_committed_part_with_fingerprint(
+    summary: &mut RunSummary,
+    relative_path: String,
+    rows: i64,
+    size_bytes: u64,
+    content_fingerprint: String,
+) {
+    let part_id = (summary.manifest_parts.len() + 1) as u32;
+    summary.manifest_parts.push(ManifestPart {
+        part_id,
+        path: relative_path,
+        rows,
+        size_bytes,
+        content_fingerprint,
+        status: PartStatus::Committed,
+    });
+}
+
 /// Outcome of a manifest-write attempt.
 #[derive(Debug)]
 pub enum WriteOutcome {
@@ -272,6 +333,7 @@ mod tests {
         let b = ManifestBuilder::new(
             &plan_snapshot(),
             "run_001",
+            chrono::Utc::now(),
             "xxh3:0000000000000000".into(),
             "postgres",
             Some("public".into()),
@@ -290,6 +352,7 @@ mod tests {
         let mut b = ManifestBuilder::new(
             &plan_snapshot(),
             "run_002",
+            chrono::Utc::now(),
             "xxh3:0123456789abcdef".into(),
             "postgres",
             None,
@@ -323,6 +386,7 @@ mod tests {
         let b = ManifestBuilder::new(
             &plan_snapshot(),
             "run_003",
+            chrono::Utc::now(),
             "xxh3:0".into(),
             "postgres",
             None,
@@ -342,6 +406,7 @@ mod tests {
         let b = ManifestBuilder::new(
             &plan_snapshot(),
             "run_004",
+            chrono::Utc::now(),
             "xxh3:0".into(),
             "postgres",
             None,
@@ -414,6 +479,7 @@ mod tests {
         let mut b = ManifestBuilder::new(
             &plan_snapshot(),
             "run_001",
+            chrono::Utc::now(),
             "xxh3:0123456789abcdef".into(),
             "postgres",
             Some("public".into()),

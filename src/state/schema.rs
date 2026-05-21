@@ -25,7 +25,6 @@ pub struct SchemaColumn {
 /// This is the value written to the manifest's `schema_fingerprint` field
 /// (ADR-0012 M3) and is what `--validate` compares against to detect
 /// schema drift between the time of write and the time of verify.
-#[allow(dead_code)] // first caller lands with the manifest writer (ADR-0012 §Manifest schema)
 pub fn schema_fingerprint(columns: &[SchemaColumn]) -> String {
     use xxhash_rust::xxh3::Xxh3;
 

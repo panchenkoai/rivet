@@ -483,6 +483,7 @@ mod tests {
             pg_temp_bytes_delta: None,
             source_count: None,
             reconciled: None,
+            manifest_parts: Vec::new(),
             journal,
         }
     }

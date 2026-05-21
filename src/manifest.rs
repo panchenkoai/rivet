@@ -19,7 +19,14 @@
 //! Field additions are non-breaking; field removals or type changes require
 //! a [`MANIFEST_VERSION`] bump.
 
-#![allow(dead_code)] // first callers ship with the writer in a follow-up commit
+// The wire types (RunManifest, ManifestPart, ...) and the writer-side
+// helpers (success_marker_body) are already wired into the pipeline; the
+// reader-side helpers (validate_self_consistency, committed_rows,
+// committed_part_count, parse_success_marker, ManifestInconsistency) ship
+// next when `--validate` / `--reconcile` learn to inspect the manifest.
+// Mark the whole module as dead-code-tolerant until then so the bin crate
+// (which doesn't compile tests) stays clean.
+#![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 

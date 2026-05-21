@@ -17,6 +17,7 @@
 use super::ipc::{self, ChildEvent};
 use super::{format_bytes, multi_export_mode, strip_chunked_recovery_hint};
 use crate::journal::{PlanSnapshot, RunEvent, RunJournal};
+use crate::manifest::ManifestPart;
 use crate::plan::ResolvedRunPlan;
 
 /// Build a `PlanSnapshot` from a `ResolvedRunPlan`.
@@ -83,6 +84,11 @@ pub struct RunSummary {
     pub source_count: Option<i64>,
     /// Whether reconciliation passed (Some(true) = match, Some(false) = mismatch, None = skipped).
     pub reconciled: Option<bool>,
+    /// Committed parts accumulated during the run, in commit order.  Populated by
+    /// `pipeline::manifest_writer::record_committed_part` at each `dest.write`
+    /// site (ADR-0012 M1 — Parts Before Manifest).  Drained at finalize into a
+    /// `RunManifest` by [`crate::pipeline::manifest_writer::write_manifest`].
+    pub manifest_parts: Vec<ManifestPart>,
     /// Structured event log for this run.  Answers the four DoD observability questions.
     pub journal: RunJournal,
 }
@@ -129,6 +135,7 @@ impl RunSummary {
             pg_temp_bytes_delta: None,
             source_count: None,
             reconciled: None,
+            manifest_parts: Vec::new(),
             journal,
         }
     }
