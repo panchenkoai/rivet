@@ -224,16 +224,16 @@ These items were open in the first draft of this ADR; they are now decided.
 
 ## Test coverage plan
 
-| Invariant | Test |
-|---|---|
-| M1 | kill after N parts, before manifest → resume re-derives state |
-| M2 | kill after manifest, before `_SUCCESS` → resume reverifies and finalizes |
-| M3 | corrupt one part (different fingerprint) → resume quarantines |
-| M4 | resume followed by a second resume → exactly one manifest, latest run_id |
-| M5 | `_SUCCESS` present but one part deleted → `--validate` FAILS |
-| M6 | legacy prefix (no manifest) → operations succeed with `legacy_run: true` |
-| M7 | concurrent read during manifest rename → never observes partial JSON |
-| M8 | re-run after `_SUCCESS` without `--force` → refuses; with `--force` → restarts |
-| M9 | unknown part in prefix → moved to `_quarantine/`, run proceeds |
+| Invariant | Status (2026-05-21) | Test |
+|---|---|---|
+| M1 | ✅ writer side covered | manifest writer commits parts before manifest (`pipeline::manifest_writer`); kill-mid-write integration test deferred to Phase C-γ |
+| M2 | ✅ writer side covered | `_SUCCESS` written iff status==Success; body = `xxh3(manifest.json bytes)`; covered by `success_marker_*` tests + `tests/trust_artifacts_integration.rs` §4 |
+| M3 | ✅ write side; ⚠️ resume-time fingerprint compare deferred | per-part `content_fingerprint` recorded at write; resume-time re-fingerprint is the future `--validate --deep`; size-only quarantine covered by `pipeline::resume_decisions::tests` |
+| M4 | ✅ | `tests/trust_artifacts_integration.rs §6 — writing_manifest_twice_replaces_the_previous_artifact` |
+| M5 | ✅ | `pipeline::validate_manifest` + `tests/trust_artifacts_integration.rs` §22 (manifest read, part presence, size match) |
+| M6 | ✅ | `legacy_run: true` label surfaced by `verify_at_destination` when no manifest present; covered in `validate_manifest` unit + integration tests |
+| M7 | ✅ writer relies on `Destination::write` atomicity | local: `fs::copy`; S3/GCS: single PUT (opendal); covered by destination capability tests |
+| M8 | partial: gate ✅, decision matrix ✅ pure logic, ⚠️ chunked-resume executor wiring deferred to Phase C-γ | `--resume` against `_SUCCESS` refuses without `--force` (covered §26); pure matrix tested per row in `pipeline::resume_decisions::tests` and end-to-end against real Destination listing in §27 |
+| M9 | ⚠️ deferred to Phase C-δ | best-effort move on resume; `UntrackedDecision::Quarantine` already produced by `build_resume_plan`; executor side not yet wired |
 
 Each invariant lands with at least one unit test (local FS, fast) and one integration test (S3-compat via MinIO or GCS-compat; nightly).

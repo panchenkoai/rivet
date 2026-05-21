@@ -41,6 +41,34 @@ pub fn schema_fingerprint(columns: &[SchemaColumn]) -> String {
     format!("xxh3:{:016x}", h.digest())
 }
 
+/// Convert an Arrow schema (the dest-facing one, after internal columns are
+/// stripped — see `pipeline::sink`) into the `Vec<SchemaColumn>` the rest of
+/// the trust contract uses (`schema_fingerprint`, `store_schema`,
+/// `detect_schema_change`).
+///
+/// This is the canonical bridge between the Arrow type system and Rivet's
+/// schema-evidence representation.  It used to be inlined in three places
+/// (`pipeline/single.rs`, `pipeline/chunked/exec.rs`,
+/// `pipeline/chunked/parallel_checkpoint.rs`); each copy was a regression
+/// risk because changing the data-type representation in one would silently
+/// shift the fingerprint there but not in the others.  Centralising the
+/// conversion keeps the fingerprint stable across executors.
+///
+/// Format note: `data_type` is rendered with `{:?}` (Arrow's `Debug`), e.g.
+/// `Int64`, `Utf8`, `Timestamp(Microsecond, None)`.  This is what every
+/// existing manifest already records; switching to `Display` would shift
+/// every fingerprint in the world and is intentionally avoided.
+pub fn arrow_schema_to_columns(schema: &arrow::datatypes::Schema) -> Vec<SchemaColumn> {
+    schema
+        .fields()
+        .iter()
+        .map(|f| SchemaColumn {
+            name: f.name().clone(),
+            data_type: format!("{:?}", f.data_type()),
+        })
+        .collect()
+}
+
 /// Diff between two schema snapshots.
 #[derive(Debug)]
 pub struct SchemaChange {

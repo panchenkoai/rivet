@@ -320,14 +320,7 @@ pub(crate) fn run_chunked_parallel(
                     // per run.  `OnceLock::set` is a no-op after the first
                     // successful set, so all later workers race-free.
                     if let Some(s) = sink.dest_schema.as_deref() {
-                        let columns: Vec<crate::state::SchemaColumn> = s
-                            .fields()
-                            .iter()
-                            .map(|f| crate::state::SchemaColumn {
-                                name: f.name().clone(),
-                                data_type: format!("{:?}", f.data_type()),
-                            })
-                            .collect();
+                        let columns = crate::state::arrow_schema_to_columns(s);
                         let _ = shared_fingerprint
                             .set(crate::state::schema_fingerprint(&columns));
                     }
@@ -479,7 +472,6 @@ mod tests {
     use crate::config::{
         CompressionType, DestinationConfig, DestinationType, FormatType, SourceConfig, SourceType,
     };
-    use crate::journal::RunJournal;
     use crate::plan::{ChunkedPlan, ExtractionStrategy, ResolvedRunPlan};
     use crate::source::BatchSink;
     use crate::state::StateStore;
@@ -574,35 +566,11 @@ mod tests {
     }
 
     fn empty_summary(plan: &ResolvedRunPlan) -> RunSummary {
-        RunSummary {
-            run_id: "test_run".into(),
-            export_name: plan.export_name.clone(),
-            status: "running".into(),
-            total_rows: 0,
-            files_produced: 0,
-            bytes_written: 0,
-            files_committed: 0,
-            duration_ms: 0,
-            peak_rss_mb: 0,
-            retries: 0,
-            validated: None,
-            schema_changed: None,
-            quality_passed: None,
-            error_message: None,
-            tuning_profile: "balanced".into(),
-            batch_size: 10_000,
-            batch_size_memory_mb: None,
-            format: "parquet".into(),
-            mode: "chunked".into(),
-            compression: "none".into(),
-            source_count: None,
-            pg_temp_bytes_delta: None,
-            reconciled: None,
-            manifest_parts: Vec::new(),
-            schema_fingerprint: None,
-            manifest_verification: None,
-            journal: RunJournal::new("test_run", &plan.export_name),
-        }
+        let mut s = RunSummary::stub_for_testing("test_run", plan.export_name.clone());
+        s.batch_size = 10_000;
+        s.mode = "chunked".into();
+        s.compression = "none".into();
+        s
     }
 
     // ── sequential ───────────────────────────────────────────────────────────

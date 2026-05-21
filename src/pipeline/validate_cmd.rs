@@ -1,3 +1,5 @@
+//! **Layer: Coordinator** (config → destination → verification → render)
+//!
 //! `rivet validate` — re-run the manifest-aware `--validate` pass against
 //! an existing destination, without performing an extraction.
 //!
@@ -191,8 +193,10 @@ fn render_pretty(results: &[(String, ManifestVerification)], hard_failures: &[St
                 "INCONSISTENT (see failures)"
             }
         );
-        for f in &v.failures {
-            let _ = writeln!(h, "  failure:   {}", render_failure(f));
+        for failure in &v.failures {
+            // `Failure: Display` is the single source of truth for these
+            // lines; same string the run report's "failure:" entry uses.
+            let _ = writeln!(h, "  failure:   {}", failure);
         }
     }
 
@@ -234,37 +238,4 @@ fn render_json(
         }
     }
     Ok(())
-}
-
-fn render_failure(f: &crate::pipeline::ManifestVerificationFailure) -> String {
-    use crate::pipeline::ManifestVerificationFailure as F;
-    match f {
-        F::PartMissing { part_id, path } => format!("part {} missing at {}", part_id, path),
-        F::PartSizeMismatch {
-            part_id,
-            path,
-            expected,
-            actual,
-        } => format!(
-            "part {} size mismatch at {} (manifest {}, dest {})",
-            part_id, path, expected, actual
-        ),
-        F::SuccessMarkerMalformed { body_preview } => {
-            format!("_SUCCESS body malformed: {body_preview:?}")
-        }
-        F::SuccessMarkerStale {
-            marker_fingerprint,
-            manifest_fingerprint,
-        } => format!(
-            "_SUCCESS body {} != manifest fingerprint {} (stale)",
-            marker_fingerprint, manifest_fingerprint
-        ),
-        F::ManifestSelfInconsistent { detail } => format!("manifest self-consistency: {detail}"),
-        F::ManifestReadError { detail } => format!("manifest read error: {detail}"),
-        F::SuccessMarkerReadError { detail } => format!("_SUCCESS read error: {detail}"),
-        F::ListPrefixError { detail } => format!("destination listing error: {detail}"),
-        F::UntrackedObject { key, size_bytes } => {
-            format!("untracked object: {} ({} bytes)", key, size_bytes)
-        }
-    }
 }

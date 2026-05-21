@@ -390,14 +390,7 @@ pub(super) fn run_single_export(
     }
 
     if let (Some(schema), Some(st)) = (&sink.dest_schema, state) {
-        let columns: Vec<crate::state::SchemaColumn> = schema
-            .fields()
-            .iter()
-            .map(|f| crate::state::SchemaColumn {
-                name: f.name().clone(),
-                data_type: format!("{:?}", f.data_type()),
-            })
-            .collect();
+        let columns = crate::state::arrow_schema_to_columns(schema);
 
         match st.detect_schema_change(&plan.export_name, &columns) {
             Ok(Some(change)) => {

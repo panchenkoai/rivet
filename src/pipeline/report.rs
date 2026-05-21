@@ -348,8 +348,10 @@ pub fn render_markdown(r: &RunReport) -> String {
                 }
             ));
             out.push('\n');
-            for f in &m.failures {
-                out.push_str(&format!("    - {}\n", render_manifest_failure(f)));
+            for failure in &m.failures {
+                // Failure has its own `Display` impl in `validate_manifest.rs`
+                // — single source of truth for operator-facing failure lines.
+                out.push_str(&format!("    - {}\n", failure));
             }
         }
     }
@@ -431,43 +433,6 @@ pub fn render_markdown(r: &RunReport) -> String {
     out
 }
 
-fn render_manifest_failure(f: &crate::pipeline::ManifestVerificationFailure) -> String {
-    use crate::pipeline::ManifestVerificationFailure as F;
-    match f {
-        F::PartMissing { part_id, path } => {
-            format!("part {} missing at {}", part_id, path)
-        }
-        F::PartSizeMismatch {
-            part_id,
-            path,
-            expected,
-            actual,
-        } => format!(
-            "part {} size mismatch at {}: manifest {}, dest {}",
-            part_id, path, expected, actual
-        ),
-        F::SuccessMarkerMalformed { body_preview } => {
-            format!("_SUCCESS body malformed: {body_preview:?}")
-        }
-        F::SuccessMarkerStale {
-            marker_fingerprint,
-            manifest_fingerprint,
-        } => format!(
-            "_SUCCESS body {} != manifest fingerprint {} (stale marker)",
-            marker_fingerprint, manifest_fingerprint
-        ),
-        F::ManifestSelfInconsistent { detail } => {
-            format!("manifest self-consistency: {detail}")
-        }
-        F::ManifestReadError { detail } => format!("manifest read error: {detail}"),
-        F::SuccessMarkerReadError { detail } => format!("_SUCCESS read error: {detail}"),
-        F::ListPrefixError { detail } => format!("destination listing error: {detail}"),
-        F::UntrackedObject { key, size_bytes } => {
-            format!("untracked object: {} ({} bytes)", key, size_bytes)
-        }
-    }
-}
-
 fn verdict_badge(status: &str) -> &'static str {
     match status {
         "success" => "SUCCESS",
@@ -502,68 +467,36 @@ pub(super) fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::journal::{PlanSnapshot, RunEvent, RunJournal};
+    use crate::journal::PlanSnapshot;
 
     fn fresh_summary(status: &str, files_committed: usize) -> RunSummary {
-        // Build a minimal RunSummary without going through the public ctor
-        // (which requires a full ResolvedRunPlan).  Field shape mirrors
-        // pipeline/job.rs::synthetic_failed_summary.
-        let run_id = "test_run_001".to_string();
-        let export_name = "orders".to_string();
-        let mut journal = RunJournal::new(&run_id, &export_name);
-        journal.record(RunEvent::PlanResolved(PlanSnapshot {
-            export_name: export_name.clone(),
-            base_query: "SELECT * FROM orders".into(),
-            strategy: "snapshot".into(),
-            format: "parquet".into(),
-            compression: "zstd".into(),
-            destination_type: "local".into(),
-            tuning_profile: "balanced".into(),
-            batch_size: 1000,
-            validate: true,
-            reconcile: false,
-            resume: false,
-        }));
-        if status == "success" || status == "failed" {
-            journal.record(RunEvent::RunCompleted {
-                status: status.into(),
-                error_message: None,
-                duration_ms: 100,
-            });
-        }
-        RunSummary {
-            run_id,
-            export_name,
-            status: status.into(),
-            total_rows: 12_345,
-            files_produced: 3,
-            bytes_written: 4096,
-            files_committed,
-            duration_ms: 100,
-            peak_rss_mb: 50,
-            retries: 0,
-            validated: Some(true),
-            schema_changed: Some(false),
-            quality_passed: None,
-            error_message: if status == "failed" {
-                Some("connection reset".into())
-            } else {
-                None
+        let mut s = RunSummary::stub_for_testing("test_run_001", "orders").with_plan_snapshot(
+            PlanSnapshot {
+                export_name: "orders".into(),
+                base_query: "SELECT * FROM orders".into(),
+                strategy: "snapshot".into(),
+                format: "parquet".into(),
+                compression: "zstd".into(),
+                destination_type: "local".into(),
+                tuning_profile: "balanced".into(),
+                batch_size: 1000,
+                validate: true,
+                reconcile: false,
+                resume: false,
             },
-            tuning_profile: "balanced".into(),
-            batch_size: 1000,
-            batch_size_memory_mb: None,
-            format: "parquet".into(),
-            mode: "snapshot".into(),
-            compression: "zstd".into(),
-            pg_temp_bytes_delta: None,
-            source_count: None,
-            reconciled: None,
-            manifest_parts: Vec::new(),
-            schema_fingerprint: None,
-            manifest_verification: None,
-            journal,
+        );
+        s.total_rows = 12_345;
+        s.files_produced = 3;
+        s.bytes_written = 4096;
+        s.files_committed = files_committed;
+        s.duration_ms = 100;
+        s.peak_rss_mb = 50;
+        s.validated = Some(true);
+        s.schema_changed = Some(false);
+        if status == "failed" {
+            s = s.with_error("connection reset");
         }
+        s.with_status(status)
     }
 
     #[test]

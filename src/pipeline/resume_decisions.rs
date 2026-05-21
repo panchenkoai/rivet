@@ -1,7 +1,13 @@
-//! **Layer: Trust contract**
+//! **Layer: Planning** (decision-only, no I/O)
 //!
 //! Pure decision logic for ADR-0012 M8 — "given the prior manifest and the
 //! current destination listing, what should resume do with each part?".
+//!
+//! No I/O, no state reads, no `Destination` calls.  The caller (in the
+//! Execution layer) gathers the inputs (manifest body via `dest.read`,
+//! prefix listing via `dest.list_prefix`), passes them in, and consumes
+//! the resulting `ResumePlan`.  This separation lets every row of the M8
+//! decision matrix be unit-tested without spinning up a destination.
 //!
 //! This module is intentionally side-effect-free: it consumes a `RunManifest`
 //! plus a `Vec<ObjectMeta>` listing of the destination prefix and returns a

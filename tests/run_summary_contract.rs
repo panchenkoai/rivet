@@ -20,36 +20,22 @@ use rivet::journal::{PlanSnapshot, RunEvent, RunJournal};
 use rivet::pipeline::RunSummary;
 
 /// Create a minimally-populated summary for contract checks.
+///
+/// Delegates to the canonical `RunSummary::stub_for_testing` builder so this
+/// suite stays aligned with the per-field defaults the rest of the test
+/// fixtures use.  Tweaks the few values this contract suite cares about
+/// (totals, files, batch_size).
 fn stub_summary(status: &str) -> RunSummary {
-    RunSummary {
-        run_id: "test_run".into(),
-        export_name: "orders".into(),
-        status: status.into(),
-        total_rows: 100,
-        files_produced: 1,
-        bytes_written: 1024,
-        files_committed: 1,
-        duration_ms: 500,
-        peak_rss_mb: 10,
-        retries: 0,
-        validated: None,
-        schema_changed: None,
-        quality_passed: None,
-        error_message: None,
-        tuning_profile: "balanced".into(),
-        batch_size: 10_000,
-        batch_size_memory_mb: None,
-        format: "parquet".into(),
-        mode: "full".into(),
-        compression: "zstd".into(),
-        source_count: None,
-        pg_temp_bytes_delta: None,
-        reconciled: None,
-        manifest_parts: Vec::new(),
-        schema_fingerprint: None,
-        manifest_verification: None,
-        journal: RunJournal::new("test_run", "orders"),
-    }
+    let mut s = RunSummary::stub_for_testing("test_run", "orders");
+    s.total_rows = 100;
+    s.files_produced = 1;
+    s.bytes_written = 1024;
+    s.files_committed = 1;
+    s.duration_ms = 500;
+    s.peak_rss_mb = 10;
+    s.batch_size = 10_000;
+    s.mode = "full".into();
+    s.with_status(status)
 }
 
 // ─── Required fields contract ────────────────────────────────

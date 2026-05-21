@@ -199,7 +199,20 @@ Both are worse than a thin subcommand.
 - Run report renders a single "Verdicts" section that names the strongest
   check the operator asked for, not a column per ADR letter.
 - Adding M5, M6, M8, M9 to the codebase causes **zero** changes to
-  `rivet run`'s `clap` derive struct.
+  `rivet run`'s `clap` derive struct beyond `--force` (the safety override).
+- Subcommand carveouts (see amendment below) are limited to standalone
+  drivers that re-run an existing flag's semantics.  `rivet validate` is
+  the first such carveout; future carveouts must clear the same bar.
+
+### Status (2026-05-21)
+
+- `--validate` extended with M5/M6 semantics: ✅ `feat(0.7.0): manifest-aware --validate (1ef2fbb)`
+- Standalone `rivet validate` subcommand: ✅ `feat(0.7.0): rivet validate subcommand (20b849a)`
+- `--force` safety override + `_SUCCESS` gate: ✅ `feat(0.7.0): _SUCCESS gate + pure resume decision matrix (9b510c7)`
+- M8 chunked-resume executor wiring (no new flag): ⚠️ Phase C-γ
+- M9 quarantine on resume (no new flag): ⚠️ Phase C-δ
+- Integration anchor test (`§24` in `trust_artifacts_integration`)
+  pins the `rivet run` flag set; refuses any flag outside the contract.
 
 ---
 

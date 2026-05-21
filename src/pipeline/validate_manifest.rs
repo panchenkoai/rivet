@@ -1,8 +1,15 @@
-//! **Layer: Trust contract**
+//! **Layer: Observability**
 //!
 //! Manifest-aware verification for `--validate` (ADR-0012 §M5 / §M6,
 //! constrained by the ADR-0013 trust-flag contract that says: no new flags;
 //! manifest-aware checks live under the existing `--validate`).
+//!
+//! Although this module reads from a `Destination` (technically L2 surface),
+//! it makes **no execution decisions**: it does not write data, advance
+//! cursors, mutate state, or change the pipeline path.  Its only output is
+//! a structured `ManifestVerification` verdict the run report renders.
+//! Per ADR-0003, that places it firmly in L4 Observability — the
+//! destination read surface is just the carrier.
 //!
 //! Inputs (read-only):
 //! - the destination's `manifest.json` body
@@ -110,6 +117,60 @@ pub enum Failure {
     /// references it.  M9-adjacent: `--validate` only flags it; quarantine
     /// belongs to `--resume`.
     UntrackedObject { key: String, size_bytes: u64 },
+}
+
+impl std::fmt::Display for Failure {
+    /// One operator-facing line per failure variant.  Used by:
+    /// - `pipeline::report::render_markdown` (summary.md "failure:" lines)
+    /// - `pipeline::validate_cmd::render_pretty` (`rivet validate` stdout)
+    /// - any future consumer that wants a human-readable failure label
+    ///
+    /// The wire format (`failures[].kind` + per-variant fields) lives in
+    /// the `Serialize` derive above and is the contract Airflow / CI
+    /// consumers branch on.  This `Display` impl is for humans only.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Failure::PartMissing { part_id, path } => {
+                write!(f, "part {} missing at {}", part_id, path)
+            }
+            Failure::PartSizeMismatch {
+                part_id,
+                path,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "part {} size mismatch at {}: manifest {}, dest {}",
+                part_id, path, expected, actual
+            ),
+            Failure::SuccessMarkerMalformed { body_preview } => {
+                write!(f, "_SUCCESS body malformed: {body_preview:?}")
+            }
+            Failure::SuccessMarkerStale {
+                marker_fingerprint,
+                manifest_fingerprint,
+            } => write!(
+                f,
+                "_SUCCESS body {} != manifest fingerprint {} (stale marker)",
+                marker_fingerprint, manifest_fingerprint
+            ),
+            Failure::ManifestSelfInconsistent { detail } => {
+                write!(f, "manifest self-consistency: {detail}")
+            }
+            Failure::ManifestReadError { detail } => {
+                write!(f, "manifest read error: {detail}")
+            }
+            Failure::SuccessMarkerReadError { detail } => {
+                write!(f, "_SUCCESS read error: {detail}")
+            }
+            Failure::ListPrefixError { detail } => {
+                write!(f, "destination listing error: {detail}")
+            }
+            Failure::UntrackedObject { key, size_bytes } => {
+                write!(f, "untracked object: {} ({} bytes)", key, size_bytes)
+            }
+        }
+    }
 }
 
 impl ManifestVerification {

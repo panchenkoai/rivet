@@ -195,7 +195,6 @@ mod tests {
     use crate::config::{
         CompressionType, DestinationConfig, DestinationType, FormatType, SourceConfig, SourceType,
     };
-    use crate::journal::RunJournal;
     use crate::plan::{ChunkedPlan, ExtractionStrategy, ResolvedRunPlan};
     use crate::tuning::SourceTuning;
 
@@ -261,35 +260,11 @@ mod tests {
     }
 
     fn make_summary(plan: &ResolvedRunPlan, run_id: &str) -> RunSummary {
-        RunSummary {
-            run_id: run_id.into(),
-            export_name: plan.export_name.clone(),
-            status: "running".into(),
-            total_rows: 0,
-            files_produced: 0,
-            bytes_written: 0,
-            files_committed: 0,
-            duration_ms: 0,
-            peak_rss_mb: 0,
-            retries: 0,
-            validated: None,
-            schema_changed: None,
-            quality_passed: None,
-            error_message: None,
-            tuning_profile: "balanced".into(),
-            batch_size: 10_000,
-            batch_size_memory_mb: None,
-            format: "parquet".into(),
-            mode: "chunked".into(),
-            compression: "none".into(),
-            source_count: None,
-            pg_temp_bytes_delta: None,
-            reconciled: None,
-            manifest_parts: Vec::new(),
-            schema_fingerprint: None,
-            manifest_verification: None,
-            journal: RunJournal::new(run_id, &plan.export_name),
-        }
+        let mut s = RunSummary::stub_for_testing(run_id, plan.export_name.clone());
+        s.batch_size = 10_000;
+        s.mode = "chunked".into();
+        s.compression = "none".into();
+        s
     }
 
     // ── config_hint ────────────────────────────────────────────────────────

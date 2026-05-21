@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 
 use rivet::config::{DestinationConfig, DestinationType};
-use rivet::journal::{PlanSnapshot, RunEvent, RunJournal};
+use rivet::journal::PlanSnapshot;
 use rivet::manifest::{
     self, MANIFEST_FILENAME, MANIFEST_VERSION, ManifestDestination, ManifestPart, ManifestSource,
     ManifestStatus, PartStatus, RunManifest, SUCCESS_FILENAME, parse_success_marker,
@@ -89,7 +89,10 @@ mod rivet_destination_proxy {
     }
 }
 
-/// Build a minimal `RunSummary` for a finished run.
+/// Build a minimal `RunSummary` for a finished run via the canonical
+/// `RunSummary::stub_for_testing` builder.  Adds a `PlanResolved` event so
+/// the report renderer's plan_origin lookup finds something, then
+/// composes status / parts / error / duration with chainable setters.
 fn summary(
     run_id: &str,
     export_name: &str,
@@ -97,57 +100,31 @@ fn summary(
     parts: Vec<ManifestPart>,
     error: Option<String>,
 ) -> RunSummary {
-    let mut journal = RunJournal::new(run_id, export_name);
-    journal.record(RunEvent::PlanResolved(PlanSnapshot {
-        export_name: export_name.into(),
-        base_query: format!("SELECT * FROM {export_name}"),
-        strategy: "snapshot".into(),
-        format: "parquet".into(),
-        compression: "zstd".into(),
-        destination_type: "local".into(),
-        tuning_profile: "balanced".into(),
-        batch_size: 1000,
-        validate: false,
-        reconcile: false,
-        resume: false,
-    }));
-    if status == "success" || status == "failed" {
-        journal.record(RunEvent::RunCompleted {
-            status: status.into(),
-            error_message: error.clone(),
-            duration_ms: 100,
-        });
+    let mut s = RunSummary::stub_for_testing(run_id, export_name)
+        .with_plan_snapshot(PlanSnapshot {
+            export_name: export_name.into(),
+            base_query: format!("SELECT * FROM {export_name}"),
+            strategy: "snapshot".into(),
+            format: "parquet".into(),
+            compression: "zstd".into(),
+            destination_type: "local".into(),
+            tuning_profile: "balanced".into(),
+            batch_size: 1000,
+            validate: false,
+            reconcile: false,
+            resume: false,
+        })
+        .with_manifest_parts(parts);
+    s.duration_ms = 100;
+    s.peak_rss_mb = 32;
+    s.validated = Some(true);
+    s.schema_changed = Some(false);
+    if let Some(msg) = error {
+        s = s.with_error(msg);
     }
-    let files_committed = parts.len();
-    RunSummary {
-        run_id: run_id.into(),
-        export_name: export_name.into(),
-        status: status.into(),
-        total_rows: parts.iter().map(|p| p.rows).sum(),
-        files_produced: files_committed,
-        bytes_written: parts.iter().map(|p| p.size_bytes).sum(),
-        files_committed,
-        duration_ms: 100,
-        peak_rss_mb: 32,
-        retries: 0,
-        validated: Some(true),
-        schema_changed: Some(false),
-        quality_passed: None,
-        error_message: error,
-        tuning_profile: "balanced".into(),
-        batch_size: 1000,
-        batch_size_memory_mb: None,
-        format: "parquet".into(),
-        mode: "snapshot".into(),
-        compression: "zstd".into(),
-        pg_temp_bytes_delta: None,
-        source_count: None,
-        reconciled: None,
-        manifest_parts: parts,
-        schema_fingerprint: None,
-        manifest_verification: None,
-        journal,
-    }
+    // `with_status` records the matching `RunCompleted` event for terminal
+    // statuses, mirroring the journal shape a real run produces.
+    s.with_status(status)
 }
 
 fn part(part_id: u32, rows: i64, size: u64, fp: &str) -> ManifestPart {

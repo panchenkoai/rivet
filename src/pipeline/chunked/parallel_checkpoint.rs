@@ -231,14 +231,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                 // as the sink resolves it.  Race-free across
                                 // workers thanks to OnceLock::set semantics.
                                 if let Some(s) = sink.dest_schema.as_deref() {
-                                    let columns: Vec<crate::state::SchemaColumn> = s
-                                        .fields()
-                                        .iter()
-                                        .map(|f| crate::state::SchemaColumn {
-                                            name: f.name().clone(),
-                                            data_type: format!("{:?}", f.data_type()),
-                                        })
-                                        .collect();
+                                    let columns = crate::state::arrow_schema_to_columns(s);
                                     let _ = shared_fingerprint
                                         .set(crate::state::schema_fingerprint(&columns));
                                 }

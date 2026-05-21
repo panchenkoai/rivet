@@ -240,14 +240,7 @@ pub fn record_run_schema_fingerprint(
     if summary.schema_fingerprint.is_some() {
         return;
     }
-    let columns: Vec<crate::state::SchemaColumn> = dest_schema
-        .fields()
-        .iter()
-        .map(|f| crate::state::SchemaColumn {
-            name: f.name().clone(),
-            data_type: format!("{:?}", f.data_type()),
-        })
-        .collect();
+    let columns = crate::state::arrow_schema_to_columns(dest_schema);
     summary.schema_fingerprint = Some(crate::state::schema_fingerprint(&columns));
 }
 
@@ -624,38 +617,7 @@ mod tests {
     // ── record_run_schema_fingerprint ──────────────────────────────────────
 
     fn dummy_summary() -> crate::pipeline::summary::RunSummary {
-        // Construct a RunSummary by direct field init (the public ctor is
-        // pub(super) and requires a full ResolvedRunPlan).  Mirrors
-        // synthetic_failed_summary in shape.
-        crate::pipeline::summary::RunSummary {
-            run_id: "r".into(),
-            export_name: "orders".into(),
-            status: "running".into(),
-            total_rows: 0,
-            files_produced: 0,
-            bytes_written: 0,
-            files_committed: 0,
-            duration_ms: 0,
-            peak_rss_mb: 0,
-            retries: 0,
-            validated: None,
-            schema_changed: None,
-            quality_passed: None,
-            error_message: None,
-            tuning_profile: "balanced".into(),
-            batch_size: 1000,
-            batch_size_memory_mb: None,
-            format: "parquet".into(),
-            mode: "snapshot".into(),
-            compression: "zstd".into(),
-            pg_temp_bytes_delta: None,
-            source_count: None,
-            reconciled: None,
-            manifest_parts: Vec::new(),
-            schema_fingerprint: None,
-            manifest_verification: None,
-            journal: crate::journal::RunJournal::new("r", "orders"),
-        }
+        crate::pipeline::summary::RunSummary::stub_for_testing("r", "orders")
     }
 
     fn schema_with(fields: &[(&str, arrow::datatypes::DataType)]) -> arrow::datatypes::Schema {

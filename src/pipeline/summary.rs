@@ -162,6 +162,129 @@ impl RunSummary {
         }
     }
 
+    /// One canonical builder for tests across the crate + integration suite.
+    ///
+    /// Every field is filled with a sensible default; callers tweak only what
+    /// the test cares about via the chainable setters below.  This replaces
+    /// the seven copies of `stub_summary` / `fresh_summary` / `make_summary`
+    /// / `dummy_summary` / `empty_summary` that used to live in `notify.rs`,
+    /// `report.rs`, `chunked/{exec,mod}.rs`, `manifest_writer.rs`, and the
+    /// two integration-test files.  When `RunSummary` gains a field, it is
+    /// updated here once instead of across nine sites.
+    ///
+    /// Available outside `pipeline` (`pub` not `pub(crate)`) so integration
+    /// tests in `tests/` can use it via `RunSummary::stub_for_testing(...)`.
+    /// The `_for_testing` suffix is the convention from elsewhere in the
+    /// codebase (`destination_for_tests`, etc.) — production code should
+    /// never call it.
+    ///
+    /// `#[allow(dead_code)]` on each helper because the bin target's
+    /// dead-code analysis doesn't see uses from integration tests in `tests/`.
+    /// The lib's unit tests + the integration suite together exercise every
+    /// helper; the attribute is a no-op for them.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn stub_for_testing(run_id: impl Into<String>, export_name: impl Into<String>) -> Self {
+        let run_id = run_id.into();
+        let export_name = export_name.into();
+        let journal = RunJournal::new(&run_id, &export_name);
+        Self {
+            run_id,
+            export_name,
+            status: "running".into(),
+            total_rows: 0,
+            files_produced: 0,
+            bytes_written: 0,
+            files_committed: 0,
+            duration_ms: 0,
+            peak_rss_mb: 0,
+            retries: 0,
+            validated: None,
+            schema_changed: None,
+            quality_passed: None,
+            error_message: None,
+            tuning_profile: "balanced".into(),
+            batch_size: 1000,
+            batch_size_memory_mb: None,
+            format: "parquet".into(),
+            mode: "snapshot".into(),
+            compression: "zstd".into(),
+            pg_temp_bytes_delta: None,
+            source_count: None,
+            reconciled: None,
+            manifest_parts: Vec::new(),
+            schema_fingerprint: None,
+            manifest_verification: None,
+            journal,
+        }
+    }
+
+    /// Test-only chainable setter for the run's status field.
+    ///
+    /// Used to build success/failed/running variants without re-listing every
+    /// field.  Keeps the journal in sync: terminal statuses get a matching
+    /// `RunCompleted` event recorded so consumers reading
+    /// `journal.final_outcome()` see the right shape.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn with_status(mut self, status: impl Into<String>) -> Self {
+        let s = status.into();
+        if (s == "success" || s == "failed") && self.journal.final_outcome().is_none() {
+            self.journal.record(RunEvent::RunCompleted {
+                status: s.clone(),
+                error_message: self.error_message.clone(),
+                duration_ms: self.duration_ms,
+            });
+        }
+        self.status = s;
+        self
+    }
+
+    /// Test-only setter — record `files_committed` so resume-hint logic
+    /// (`pipeline::report`) can detect the "failed run with committed files"
+    /// path that produces a resume command.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn with_files_committed(mut self, n: usize) -> Self {
+        self.files_committed = n;
+        self
+    }
+
+    /// Test-only setter — replace the recorded manifest parts (and adjust
+    /// `total_rows` / `bytes_written` / `files_produced` to keep them
+    /// consistent with the parts list, the way real production code does).
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn with_manifest_parts(mut self, parts: Vec<crate::manifest::ManifestPart>) -> Self {
+        self.total_rows = parts.iter().map(|p| p.rows).sum();
+        self.bytes_written = parts.iter().map(|p| p.size_bytes).sum();
+        self.files_produced = parts.len();
+        self.files_committed = parts.len();
+        self.manifest_parts = parts;
+        self
+    }
+
+    /// Test-only setter — error_message + (optionally) status.  Common
+    /// shape for the "failed-run" fixtures that populated 4+ existing
+    /// stubs.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn with_error(mut self, msg: impl Into<String>) -> Self {
+        self.error_message = Some(msg.into());
+        self
+    }
+
+    /// Test-only setter — record a PlanResolved event in the journal so
+    /// downstream observability paths (`journal.plan_snapshot()`,
+    /// `RunReport::from_summary` plan_origin lookup) see the same shape
+    /// they would on a real run.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn with_plan_snapshot(mut self, snap: PlanSnapshot) -> Self {
+        self.journal.record(RunEvent::PlanResolved(snap));
+        self
+    }
+
     pub(super) fn print(&self) {
         // Capturing mode (IPC child or in-process channel): emit a
         // `Finished` event and let the unified UI thread render the card.
