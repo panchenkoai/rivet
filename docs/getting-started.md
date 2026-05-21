@@ -2,7 +2,7 @@ _Last updated: 2026-05-19._
 
 # Getting Started
 
-Rivet exports tables from PostgreSQL or MySQL to Parquet (or CSV) files — locally, to S3, or to GCS. Point it at a database, scaffold a config from your real tables, then run.
+Rivet exports tables from PostgreSQL or MySQL to Parquet (or CSV) files — locally, to S3, GCS, or Azure Blob Storage. Point it at a database, scaffold a config from your real tables, then run.
 
 ```bash
 brew install panchenkoai/rivet/rivet
@@ -123,7 +123,7 @@ Subsequent `rivet run` invocations will only fetch rows with `updated_at >` the 
 | When you need to … | Go to |
 |---|---|
 | Pick the right export mode for each table | [modes/](modes/) — full · incremental · chunked · time_window |
-| Configure S3 / GCS / stdout destinations | [destinations/](destinations/) |
+| Configure S3 / GCS / Azure / stdout destinations | [destinations/](destinations/) |
 | Look up a YAML field or a CLI flag | [reference/config.md](reference/config.md) · [reference/cli.md](reference/cli.md) |
 | Understand `run_id` / cursor / chunk / manifest / journal | [concepts.md](concepts.md) |
 | Tune for memory, throughput, source pressure | [reference/tuning.md](reference/tuning.md) · [best-practices/](best-practices/) |

@@ -11,7 +11,7 @@ This page is a user-facing summary. The binding contracts live in the [ADRs](adr
 This document describes guarantees and known non-guarantees for:
 
 - single-table exports (full, incremental, chunked, time-window),
-- destination writes (local, S3, GCS, stdout),
+- destination writes (local, S3, GCS, Azure Blob Storage, stdout),
 - state and journal updates,
 - automatic retries and `--resume` after crashes,
 - `rivet reconcile` and `rivet repair`,
@@ -73,7 +73,7 @@ A retried batch starts from the **same cursor position** as the failed attempt â
 
 | Destination | `retry_safe` |
 |---|---|
-| S3, GCS | `true` (no partial visible objects; safe to retry) |
+| S3, GCS, Azure | `true` (no partial visible objects; safe to retry) |
 | Local filesystem | `false` (a failed copy may leave a partial file; manual cleanup) |
 | stdout | `false` (no commit boundary; retry produces duplicate/corrupt output) |
 
@@ -170,7 +170,7 @@ When `quality:` is configured, the pipeline evaluates row-count, null-ratio, and
 
 | Destination | Commit protocol | What "Ok" means |
 |---|---|---|
-| S3 / GCS | `FinalizeOnClose` | Object is committed only after writer close; a mid-upload failure leaves nothing visible |
+| S3 / GCS / Azure | `FinalizeOnClose` | Object is committed only after writer close; a mid-upload failure leaves nothing visible |
 | Local filesystem | `Atomic` | `Ok` means the full file is present; a failure may leave a partial file (`partial_write_risk: true`) |
 | stdout | `Streaming` | No atomic commit boundary; partial output may be observable before `write()` returns |
 
