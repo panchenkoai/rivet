@@ -177,6 +177,7 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
         reconciled: None,
         manifest_parts: Vec::new(),
         schema_fingerprint: None,
+        manifest_verification: None,
         journal,
     }
 }
@@ -366,8 +367,16 @@ pub(super) fn run_export_job(
     }
 
     summary.print();
-    finalize_run_report(config_path, &summary, "export");
+    // Order matters: write the manifest first, then run the manifest-aware
+    // `--validate` pass against the destination, then write the run report.
+    // The report sees the verification verdict only because we run it before
+    // `finalize_run_report`.  The notification fires last so it carries the
+    // most complete summary.
     finalize_manifest(&plan, state, &summary, "export");
+    if plan.validate {
+        finalize_validate_manifest(&plan, &mut summary, "export");
+    }
+    finalize_run_report(config_path, &summary, "export");
     crate::notify::maybe_send(config.notifications.as_ref(), &summary);
 
     let final_result = if failed { result } else { Ok(()) };
@@ -556,6 +565,89 @@ fn finalize_manifest(
     }
 }
 
+/// Run the manifest-aware `--validate` pass against the destination prefix
+/// (ADR-0012 M5/M6, ADR-0013).  Populates `summary.manifest_verification`;
+/// failures are logged and non-fatal — the existing per-file row check has
+/// already set `summary.validated`, and the operator gets a richer report
+/// regardless of whether destination I/O succeeded here.
+///
+/// Streaming destinations (stdout) have no prefix to verify; skipped silently
+/// since `finalize_manifest` has already logged its own "skipped streaming"
+/// note for that case.
+fn finalize_validate_manifest(
+    plan: &crate::plan::ResolvedRunPlan,
+    summary: &mut RunSummary,
+    kind: &str,
+) {
+    use crate::destination::WriteCommitProtocol;
+    use crate::pipeline::validate_manifest::verify_at_destination;
+
+    let dest = match crate::destination::create_destination(&plan.destination) {
+        Ok(d) => d,
+        Err(e) => {
+            log::warn!(
+                "{} '{}': could not create destination for --validate manifest pass (not fatal): {:#}",
+                kind,
+                summary.export_name,
+                e
+            );
+            return;
+        }
+    };
+    if dest.capabilities().commit_protocol == WriteCommitProtocol::Streaming {
+        log::debug!(
+            "{} '{}': streaming destination — skipping manifest-aware --validate",
+            kind,
+            summary.export_name
+        );
+        return;
+    }
+
+    match verify_at_destination(&*dest, "") {
+        Ok(v) => {
+            // Compose the file-row check (already on summary.validated) with
+            // the manifest-aware verdict.  Legacy runs (M6) keep their existing
+            // row-count verdict — manifest verification only DOWNgrades when
+            // it has explicit failures.
+            if v.has_failures()
+                && let Some(false) | None = summary.validated
+            {
+                // already false — leave alone
+            } else if v.has_failures() {
+                summary.validated = Some(false);
+            }
+            log::info!(
+                "{} '{}': --validate manifest pass: {} parts verified, {} failed{}{}",
+                kind,
+                summary.export_name,
+                v.parts_verified,
+                v.parts_failed,
+                if v.success_marker_consistent {
+                    " (_SUCCESS consistent)"
+                } else if v.manifest_found {
+                    ""
+                } else {
+                    " (legacy_run: no manifest)"
+                },
+                if v.has_failures() {
+                    format!(" — {} issue(s)", v.failures.len())
+                } else {
+                    String::new()
+                },
+            );
+            summary.manifest_verification = Some(v);
+        }
+        Err(e) => {
+            log::warn!(
+                "{} '{}': --validate manifest pass failed (not fatal): {:#}",
+                kind,
+                summary.export_name,
+                e
+            );
+        }
+    }
+}
+
 /// Best-effort textual URI for the manifest's `destination.uri` field.  The
 /// manifest is a record of where data was written, so the URI must reflect
 /// what an operator would type to find the prefix again.
@@ -690,8 +782,11 @@ pub(crate) fn run_export_job_with_chunk_source(
     }
 
     summary.print();
-    finalize_run_report(config_path, &summary, "apply");
     finalize_manifest(plan, state, &summary, "apply");
+    if plan.validate {
+        finalize_validate_manifest(plan, &mut summary, "apply");
+    }
+    finalize_run_report(config_path, &summary, "apply");
 
     if failed { result } else { Ok(()) }
 }
@@ -851,6 +946,7 @@ mod tests {
             reconciled: None,
             manifest_parts: Vec::new(),
             schema_fingerprint: None,
+            manifest_verification: None,
             journal: RunJournal::new("r", &plan.export_name),
         }
     }

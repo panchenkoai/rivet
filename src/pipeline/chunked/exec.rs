@@ -600,6 +600,7 @@ mod tests {
             reconciled: None,
             manifest_parts: Vec::new(),
             schema_fingerprint: None,
+            manifest_verification: None,
             journal: RunJournal::new("test_run", &plan.export_name),
         }
     }

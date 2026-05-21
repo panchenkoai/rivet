@@ -37,6 +37,83 @@ impl super::Destination for LocalDestination {
             partial_write_risk: true,
         }
     }
+
+    // ── ADR-0013 read surface ────────────────────────────────────────────
+    //
+    // Local FS is the simplest backend: walk recursively under `base_path`
+    // joined with `prefix`, return every regular file's relative path and
+    // size.  The walk is depth-first via a small stack; opendal would also
+    // work but introduces a tokio dependency for what is a five-line
+    // POSIX walk.
+
+    fn list_prefix(&self, prefix: &str) -> Result<Vec<super::ObjectMeta>> {
+        let root = Path::new(&self.base_path).join(prefix);
+        if !root.exists() {
+            return Ok(Vec::new());
+        }
+        let base = Path::new(&self.base_path);
+        let mut out = Vec::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            // A non-directory `prefix` (e.g. a single file) is a degenerate
+            // call but should still report that file rather than 404.
+            let meta = std::fs::metadata(&dir)?;
+            if meta.is_file() {
+                let rel = dir
+                    .strip_prefix(base)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| dir.to_string_lossy().into_owned());
+                out.push(super::ObjectMeta {
+                    key: rel,
+                    size_bytes: meta.len(),
+                });
+                continue;
+            }
+            for entry in std::fs::read_dir(&dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                let ftype = entry.file_type()?;
+                if ftype.is_dir() {
+                    stack.push(path);
+                } else if ftype.is_file() {
+                    let m = entry.metadata()?;
+                    let rel = path
+                        .strip_prefix(base)
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+                    out.push(super::ObjectMeta {
+                        key: rel,
+                        size_bytes: m.len(),
+                    });
+                }
+                // Other file types (symlinks loops, sockets) — silently
+                // skipped.  Symlinks pointing at regular files would be
+                // reported via their followed metadata above; cyclic
+                // symlinks are intentionally not handled here.
+            }
+        }
+        Ok(out)
+    }
+
+    fn read(&self, key: &str) -> Result<Vec<u8>> {
+        let path = Path::new(&self.base_path).join(key);
+        Ok(std::fs::read(path)?)
+    }
+
+    fn head(&self, key: &str) -> Result<Option<super::ObjectMeta>> {
+        let path = Path::new(&self.base_path).join(key);
+        match std::fs::metadata(&path) {
+            Ok(m) if m.is_file() => Ok(Some(super::ObjectMeta {
+                key: key.to_string(),
+                size_bytes: m.len(),
+            })),
+            // Treat "is a directory" the same as absent for our purposes —
+            // M5 only cares about file-shaped objects.
+            Ok(_) => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 // ─── ADR-0004 capability contract tests ──────────────────────────────────────
@@ -225,5 +302,108 @@ mod tests {
             dir.path().join(key).exists(),
             "unicode-and-space key must be preserved verbatim"
         );
+    }
+
+    // ── ADR-0013 Phase A: read surface ───────────────────────────────────
+
+    #[test]
+    fn list_prefix_returns_files_with_relative_keys_and_sizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dest_at(dir.path());
+        std::fs::write(dir.path().join("a.txt"), b"abc").unwrap();
+        std::fs::create_dir_all(dir.path().join("nested/sub")).unwrap();
+        std::fs::write(dir.path().join("nested/b.txt"), b"hello").unwrap();
+        std::fs::write(dir.path().join("nested/sub/c.bin"), b"\0\0\0\0").unwrap();
+
+        let mut listed = dest.list_prefix("").unwrap();
+        listed.sort_by(|x, y| x.key.cmp(&y.key));
+        let names: Vec<_> = listed.iter().map(|m| m.key.clone()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "a.txt".to_string(),
+                "nested/b.txt".to_string(),
+                "nested/sub/c.bin".to_string(),
+            ]
+        );
+        let sizes: Vec<_> = listed.iter().map(|m| m.size_bytes).collect();
+        assert_eq!(sizes, vec![3u64, 5u64, 4u64]);
+    }
+
+    #[test]
+    fn list_prefix_scopes_to_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dest_at(dir.path());
+        std::fs::write(dir.path().join("top.txt"), b"x").unwrap();
+        std::fs::create_dir_all(dir.path().join("only_me")).unwrap();
+        std::fs::write(dir.path().join("only_me/a.parquet"), b"yy").unwrap();
+        std::fs::write(dir.path().join("only_me/b.parquet"), b"zzz").unwrap();
+
+        let listed = dest.list_prefix("only_me").unwrap();
+        let names: std::collections::HashSet<_> = listed.iter().map(|m| m.key.clone()).collect();
+        assert_eq!(
+            names,
+            ["only_me/a.parquet", "only_me/b.parquet"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        );
+    }
+
+    #[test]
+    fn list_prefix_missing_returns_empty_not_error() {
+        // Resume / validate must distinguish "no manifest yet" from "I/O
+        // failure".  Local FS surfaces the former as Ok(empty).
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dest_at(dir.path());
+        let listed = dest.list_prefix("does_not_exist").unwrap();
+        assert!(listed.is_empty());
+    }
+
+    #[test]
+    fn read_round_trips_bytes_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dest_at(dir.path());
+        let payload: &[u8] = b"manifest body goes here\n";
+        std::fs::write(dir.path().join("manifest.json"), payload).unwrap();
+        let got = dest.read("manifest.json").unwrap();
+        assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn head_returns_some_for_existing_file_with_correct_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dest_at(dir.path());
+        std::fs::write(dir.path().join("part-000001.parquet"), [42u8; 1234]).unwrap();
+        let m = dest.head("part-000001.parquet").unwrap().unwrap();
+        assert_eq!(m.key, "part-000001.parquet");
+        assert_eq!(m.size_bytes, 1234);
+    }
+
+    #[test]
+    fn head_returns_none_for_absent_file_not_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dest_at(dir.path());
+        assert!(dest.head("missing.txt").unwrap().is_none());
+    }
+
+    #[test]
+    fn head_returns_none_for_directory_not_file() {
+        // M5 only checks file-shaped keys; a directory at the same path
+        // is treated as absent so the "missing part" branch is taken.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dest_at(dir.path());
+        std::fs::create_dir_all(dir.path().join("subdir")).unwrap();
+        assert!(dest.head("subdir").unwrap().is_none());
+    }
+
+    #[test]
+    fn read_returns_err_on_missing_key() {
+        // Symmetric with head's None: read of a missing key surfaces an
+        // I/O error rather than empty bytes.  The validation layer relies
+        // on this to fail loudly.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dest_at(dir.path());
+        assert!(dest.read("nope.json").is_err());
     }
 }

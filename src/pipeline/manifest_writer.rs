@@ -653,6 +653,7 @@ mod tests {
             reconciled: None,
             manifest_parts: Vec::new(),
             schema_fingerprint: None,
+            manifest_verification: None,
             journal: crate::journal::RunJournal::new("r", "orders"),
         }
     }

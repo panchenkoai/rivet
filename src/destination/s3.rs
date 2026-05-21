@@ -117,6 +117,77 @@ impl super::Destination for S3Destination {
             partial_write_risk: false,
         }
     }
+
+    // ── ADR-0013 read surface (delegates to opendal) ─────────────────────
+    //
+    // The `prefix` arg is configured-prefix-relative; we apply the same
+    // `self.prefix` join the writer applies so callers see a consistent
+    // namespace.  Returned `key` values are *also* configured-prefix-
+    // relative — symmetric with `write`'s `remote_key` argument.
+
+    fn list_prefix(&self, prefix: &str) -> Result<Vec<super::ObjectMeta>> {
+        let full = format!("{}{}", self.prefix, prefix);
+        // opendal expects a trailing `/` for directory listings.  For a
+        // bucket root the empty string is fine; for any non-empty prefix
+        // we add `/` if the caller didn't.
+        let listed = if full.is_empty() || full.ends_with('/') {
+            self.op.list_options(
+                &full,
+                opendal::options::ListOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            )?
+        } else {
+            self.op.list_options(
+                &format!("{}/", full),
+                opendal::options::ListOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            )?
+        };
+        let mut out = Vec::with_capacity(listed.len());
+        for entry in listed {
+            if entry.metadata().mode() != opendal::EntryMode::FILE {
+                continue;
+            }
+            // entry.path() returns a bucket-root-absolute key; strip our
+            // configured prefix so the returned `key` is comparable to
+            // values the caller passed to `write`.
+            let abs = entry.path().to_string();
+            let rel = abs
+                .strip_prefix(self.prefix.as_str())
+                .unwrap_or(abs.as_str())
+                .to_string();
+            out.push(super::ObjectMeta {
+                key: rel,
+                size_bytes: entry.metadata().content_length(),
+            });
+        }
+        Ok(out)
+    }
+
+    fn read(&self, key: &str) -> Result<Vec<u8>> {
+        let full = format!("{}{}", self.prefix, key);
+        let buf = self.op.read(&full)?;
+        Ok(buf.to_vec())
+    }
+
+    fn head(&self, key: &str) -> Result<Option<super::ObjectMeta>> {
+        let full = format!("{}{}", self.prefix, key);
+        // `stat` returns NotFound for absent keys; opendal exposes the
+        // discriminator on the returned error so we can keep our
+        // contract "Ok(None) is unambiguous absence".
+        match self.op.stat(&full) {
+            Ok(meta) => Ok(Some(super::ObjectMeta {
+                key: key.to_string(),
+                size_bytes: meta.content_length(),
+            })),
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 #[cfg(test)]

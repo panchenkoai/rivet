@@ -44,7 +44,7 @@ pub(crate) mod destination;
 /// patch" disclaimer as the other lib modules in this file.
 #[doc(hidden)]
 pub mod destination_for_tests {
-    pub use crate::destination::{Destination, create_destination};
+    pub use crate::destination::{Destination, ObjectMeta, create_destination};
 }
 pub(crate) mod enrich;
 pub(crate) mod notify;

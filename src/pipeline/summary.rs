@@ -103,6 +103,12 @@ pub struct RunSummary {
     /// lookup remains a fallback for resume scenarios where the summary was
     /// reconstructed without ever seeing a live schema.
     pub schema_fingerprint: Option<String>,
+    /// Result of the manifest-aware `--validate` pass (ADR-0012 M5/M6,
+    /// ADR-0013).  Populated by `pipeline::job::finalize_validate_manifest`
+    /// after `finalize_manifest` succeeds; `None` when the run targeted a
+    /// streaming destination, when `--validate` was not requested, or when
+    /// the run failed before any manifest could be written.
+    pub manifest_verification: Option<crate::pipeline::ManifestVerification>,
     /// Structured event log for this run.  Answers the four DoD observability questions.
     pub journal: RunJournal,
 }
@@ -151,6 +157,7 @@ impl RunSummary {
             reconciled: None,
             manifest_parts: Vec::new(),
             schema_fingerprint: None,
+            manifest_verification: None,
             journal,
         }
     }

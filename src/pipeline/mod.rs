@@ -25,6 +25,7 @@ mod single;
 mod sink;
 mod summary;
 mod validate;
+mod validate_manifest;
 
 pub use apply_cmd::run_apply_command;
 #[allow(unused_imports)]
@@ -53,6 +54,10 @@ pub use validate::validate_output;
 pub use manifest_writer::{ManifestBuilder, WriteOutcome, write_manifest};
 #[allow(unused_imports)]
 pub use report::{RunReport, report_dir, write_run_report};
+#[allow(unused_imports)]
+pub use validate_manifest::{
+    Failure as ManifestVerificationFailure, ManifestVerification, verify_at_destination,
+};
 
 #[cfg(test)]
 #[allow(unused_imports)]

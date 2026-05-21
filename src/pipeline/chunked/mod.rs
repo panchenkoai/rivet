@@ -287,6 +287,7 @@ mod tests {
             reconciled: None,
             manifest_parts: Vec::new(),
             schema_fingerprint: None,
+            manifest_verification: None,
             journal: RunJournal::new(run_id, &plan.export_name),
         }
     }

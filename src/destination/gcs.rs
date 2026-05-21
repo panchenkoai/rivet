@@ -104,4 +104,65 @@ impl super::Destination for GcsDestination {
             partial_write_risk: false,
         }
     }
+
+    // ── ADR-0013 read surface (delegates to opendal) ─────────────────────
+    //
+    // Identical implementation shape to S3; opendal abstracts the
+    // backend-specific listing semantics.  Trailing slash required for
+    // directory listings (mirrored from blocking::Operator::list docs).
+
+    fn list_prefix(&self, prefix: &str) -> Result<Vec<super::ObjectMeta>> {
+        let full = format!("{}{}", self.prefix, prefix);
+        let listed = if full.is_empty() || full.ends_with('/') {
+            self.op.list_options(
+                &full,
+                opendal::options::ListOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            )?
+        } else {
+            self.op.list_options(
+                &format!("{}/", full),
+                opendal::options::ListOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            )?
+        };
+        let mut out = Vec::with_capacity(listed.len());
+        for entry in listed {
+            if entry.metadata().mode() != opendal::EntryMode::FILE {
+                continue;
+            }
+            let abs = entry.path().to_string();
+            let rel = abs
+                .strip_prefix(self.prefix.as_str())
+                .unwrap_or(abs.as_str())
+                .to_string();
+            out.push(super::ObjectMeta {
+                key: rel,
+                size_bytes: entry.metadata().content_length(),
+            });
+        }
+        Ok(out)
+    }
+
+    fn read(&self, key: &str) -> Result<Vec<u8>> {
+        let full = format!("{}{}", self.prefix, key);
+        let buf = self.op.read(&full)?;
+        Ok(buf.to_vec())
+    }
+
+    fn head(&self, key: &str) -> Result<Option<super::ObjectMeta>> {
+        let full = format!("{}{}", self.prefix, key);
+        match self.op.stat(&full) {
+            Ok(meta) => Ok(Some(super::ObjectMeta {
+                key: key.to_string(),
+                size_bytes: meta.content_length(),
+            })),
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
 }

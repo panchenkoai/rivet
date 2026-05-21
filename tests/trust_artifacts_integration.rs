@@ -27,8 +27,8 @@ use rivet::manifest::{
     success_marker_body,
 };
 use rivet::pipeline::{
-    ManifestBuilder, RunReport, RunSummary, WriteOutcome, report_dir, write_manifest,
-    write_run_report,
+    ManifestBuilder, ManifestVerification, ManifestVerificationFailure, RunReport, RunSummary,
+    WriteOutcome, report_dir, verify_at_destination, write_manifest, write_run_report,
 };
 use rivet::state::{SchemaColumn, schema_fingerprint};
 
@@ -143,6 +143,7 @@ fn summary(
         reconciled: None,
         manifest_parts: parts,
         schema_fingerprint: None,
+        manifest_verification: None,
         journal,
     }
 }
@@ -1688,4 +1689,406 @@ fn streaming_destination_never_writes_success_marker_even_on_success_status() {
     let cwd = std::env::current_dir().unwrap();
     assert!(!cwd.join(MANIFEST_FILENAME).exists());
     assert!(!cwd.join(SUCCESS_FILENAME).exists());
+}
+
+// ─── Section 22: manifest-aware --validate (ADR-0012 M5/M6, ADR-0013) ───────
+//
+// End-to-end coverage for `pipeline::verify_at_destination` driven through
+// the same Destination + ManifestBuilder + write_manifest path the pipeline
+// uses at runtime.  The unit tests in `pipeline/validate_manifest.rs` cover
+// each verdict variant in isolation; this section pins the cross-module
+// wiring (ADR-0013 acceptance criterion: no new flag added; existing
+// `--validate` semantics now subsume M5/M6).
+
+fn dataset_dir() -> tempfile::TempDir {
+    tempfile::tempdir().unwrap()
+}
+
+fn parts_with_payloads(payloads: &[&[u8]]) -> Vec<ManifestPart> {
+    payloads
+        .iter()
+        .enumerate()
+        .map(|(i, b)| ManifestPart {
+            part_id: (i + 1) as u32,
+            path: format!("part-{:06}.parquet", i + 1),
+            rows: 10 * (i as i64 + 1),
+            size_bytes: b.len() as u64,
+            content_fingerprint: format!("xxh3:{:016x}", xxhash_rust::xxh3::xxh3_64(b)),
+            status: PartStatus::Committed,
+        })
+        .collect()
+}
+
+/// Lay out a clean dataset on the local destination using the same
+/// `Destination::write` + `write_manifest` API the pipeline uses.  Returns
+/// the destination proxy so the test can also drive the verifier through
+/// it.
+fn lay_out_clean_dataset(
+    base: &Path,
+    parts: &[ManifestPart],
+    payloads: &[&[u8]],
+) -> Box<dyn rivet_destination_proxy::DestinationProxy> {
+    assert_eq!(parts.len(), payloads.len());
+    let dest_proxy = local_dest(base);
+    // Write each part body with the destination's `write` method so the
+    // sizes on disk match what the manifest records.
+    for (p, body) in parts.iter().zip(payloads.iter()) {
+        let tmp = tempfile::NamedTempFile::new_in(base).unwrap();
+        std::fs::write(tmp.path(), body).unwrap();
+        // The proxy doesn't expose `write` directly; fall back to a plain
+        // copy under the destination root which is what local_dest's `write`
+        // reduces to.
+        std::fs::copy(tmp.path(), base.join(&p.path)).unwrap();
+    }
+    let manifest = build_manifest("verify_e2e", ManifestStatus::Success, parts.to_vec());
+    write_manifest(dest_proxy.as_writer(), &manifest).unwrap();
+    dest_proxy
+}
+
+#[test]
+fn verify_at_destination_certifies_a_clean_writer_output() {
+    let dir = dataset_dir();
+    let payloads: &[&[u8]] = &[b"payload-1", b"payload-2-bigger"];
+    let parts = parts_with_payloads(payloads);
+    let dest = lay_out_clean_dataset(dir.path(), &parts, payloads);
+
+    let v: ManifestVerification = verify_at_destination(dest.as_writer(), "").unwrap();
+    assert!(v.manifest_found);
+    assert!(!v.legacy_run);
+    assert!(v.manifest_self_consistent);
+    assert!(v.success_marker_consistent);
+    assert_eq!(v.parts_verified, parts.len());
+    assert_eq!(v.parts_failed, 0);
+    assert!(v.passed);
+    assert!(v.failures.is_empty());
+}
+
+#[test]
+fn verify_at_destination_legacy_run_when_manifest_absent() {
+    // No write_manifest call at all → an existing prefix with parquet
+    // artifacts but no manifest mimics a pre-0.7.0 export.  The verifier
+    // must surface `legacy_run: true` so the operator-facing report can
+    // explicitly downgrade its assurance language (M6: silent fallback
+    // is forbidden).
+    let dir = dataset_dir();
+    std::fs::write(dir.path().join("part-000001.parquet"), b"data").unwrap();
+    let dest_proxy = local_dest(dir.path());
+
+    let v = verify_at_destination(dest_proxy.as_writer(), "").unwrap();
+    assert!(!v.manifest_found);
+    assert!(v.legacy_run);
+    assert!(v.failures.is_empty(), "legacy is a label, not a failure");
+    assert!(
+        !v.passed,
+        "legacy verifier alone cannot certify; caller composes"
+    );
+}
+
+#[test]
+fn verify_at_destination_flags_missing_part_with_part_id() {
+    // ADR-0012 M5: a part listed in the manifest but absent at the
+    // destination must surface as `Failure::PartMissing` carrying the
+    // part_id so an orchestrator can locate it.
+    let dir = dataset_dir();
+    let payloads: &[&[u8]] = &[b"keep", b"will-be-deleted"];
+    let parts = parts_with_payloads(payloads);
+    let dest = lay_out_clean_dataset(dir.path(), &parts, payloads);
+    std::fs::remove_file(dir.path().join(&parts[1].path)).unwrap();
+
+    let v = verify_at_destination(dest.as_writer(), "").unwrap();
+    assert!(!v.passed);
+    assert_eq!(v.parts_verified, 1);
+    assert_eq!(v.parts_failed, 1);
+    let missing = v.failures.iter().find_map(|f| match f {
+        ManifestVerificationFailure::PartMissing { part_id, path } => {
+            Some((*part_id, path.clone()))
+        }
+        _ => None,
+    });
+    assert_eq!(missing, Some((2, parts[1].path.clone())));
+}
+
+#[test]
+fn verify_at_destination_flags_size_drift_with_expected_and_actual() {
+    let dir = dataset_dir();
+    let payloads: &[&[u8]] = &[b"original-12B"];
+    let parts = parts_with_payloads(payloads);
+    let dest = lay_out_clean_dataset(dir.path(), &parts, payloads);
+    // Mutate the part body so its size on disk diverges from the manifest's
+    // recorded `size_bytes`.
+    std::fs::write(dir.path().join(&parts[0].path), b"shorter").unwrap();
+
+    let v = verify_at_destination(dest.as_writer(), "").unwrap();
+    assert!(!v.passed);
+    let mismatch = v.failures.iter().find_map(|f| match f {
+        ManifestVerificationFailure::PartSizeMismatch {
+            part_id,
+            expected,
+            actual,
+            ..
+        } => Some((*part_id, *expected, *actual)),
+        _ => None,
+    });
+    assert_eq!(
+        mismatch,
+        Some((1, payloads[0].len() as u64, b"shorter".len() as u64))
+    );
+}
+
+#[test]
+fn verify_at_destination_flags_stale_success_marker_after_manifest_rewrite() {
+    // _SUCCESS was written by a previous successful run; then someone
+    // rewrote `manifest.json` (resume / repair / hand-edit) without
+    // refreshing _SUCCESS.  The verifier must surface this since
+    // orchestrators rely on `_SUCCESS` carrying the *current* manifest's
+    // fingerprint (ADR-0012 M2).
+    let dir = dataset_dir();
+    let payloads: &[&[u8]] = &[b"part-payload"];
+    let parts = parts_with_payloads(payloads);
+    let dest = lay_out_clean_dataset(dir.path(), &parts, payloads);
+    // Hand-edit the manifest to a different (still self-consistent) body.
+    let m2 = build_manifest("verify_e2e_v2", ManifestStatus::Success, parts.clone());
+    let body = serde_json::to_vec_pretty(&m2).unwrap();
+    std::fs::write(dir.path().join(MANIFEST_FILENAME), &body).unwrap();
+    // Note: _SUCCESS file is NOT updated — it still carries the prior fp.
+
+    let v = verify_at_destination(dest.as_writer(), "").unwrap();
+    assert!(!v.passed);
+    assert!(
+        v.failures
+            .iter()
+            .any(|f| matches!(f, ManifestVerificationFailure::SuccessMarkerStale { .. }))
+    );
+}
+
+#[test]
+fn verify_at_destination_tolerates_absent_success_marker_for_failed_run() {
+    // ADR-0012 M2: `_SUCCESS` exists iff status == Success.  A failed
+    // (status: failed) manifest without `_SUCCESS` is the *correct*
+    // shape — the verifier must NOT flag the absent marker as a failure.
+    let dir = dataset_dir();
+    let dest_proxy = local_dest(dir.path());
+    let payloads: &[&[u8]] = &[b"committed-before-failure"];
+    let parts = parts_with_payloads(payloads);
+    for (p, body) in parts.iter().zip(payloads.iter()) {
+        std::fs::write(dir.path().join(&p.path), body).unwrap();
+    }
+    let manifest = build_manifest("verify_failed", ManifestStatus::Failed, parts.clone());
+    write_manifest(dest_proxy.as_writer(), &manifest).unwrap();
+    assert!(
+        !dir.path().join(SUCCESS_FILENAME).exists(),
+        "writer must skip _SUCCESS for Failed status"
+    );
+
+    let v = verify_at_destination(dest_proxy.as_writer(), "").unwrap();
+    assert!(v.manifest_found);
+    assert!(
+        !v.success_marker_consistent,
+        "no marker → no signal, not a failure"
+    );
+    assert!(v.passed, "absent marker on a failed manifest is allowed");
+    assert!(v.failures.is_empty());
+}
+
+#[test]
+fn verify_at_destination_flags_untracked_object_but_keeps_passed_true() {
+    // Untracked objects under the prefix are surfaced for operator audit
+    // (and for resume's M9 quarantine pass), but `--validate` alone does
+    // not flip the verdict — the tracked parts and marker are fine.
+    let dir = dataset_dir();
+    let payloads: &[&[u8]] = &[b"tracked"];
+    let parts = parts_with_payloads(payloads);
+    let dest = lay_out_clean_dataset(dir.path(), &parts, payloads);
+    std::fs::write(dir.path().join("rogue-leftover.parquet"), b"X").unwrap();
+
+    let v = verify_at_destination(dest.as_writer(), "").unwrap();
+    assert!(
+        v.passed,
+        "tracked parts and marker pass — surplus is informational"
+    );
+    assert!(v.failures.iter().any(|f| matches!(
+        f,
+        ManifestVerificationFailure::UntrackedObject { key, .. } if key == "rogue-leftover.parquet"
+    )));
+}
+
+#[test]
+fn verify_at_destination_serialises_failures_with_kind_tag_for_consumers() {
+    // The on-wire shape of `failures` must keep its `kind` discriminator
+    // so an Airflow / CI consumer can match on the string variant rather
+    // than parsing free-form messages.  Pin the JSON shape.
+    let dir = dataset_dir();
+    let payloads: &[&[u8]] = &[b"x"];
+    let parts = parts_with_payloads(payloads);
+    let dest = lay_out_clean_dataset(dir.path(), &parts, payloads);
+    std::fs::remove_file(dir.path().join(&parts[0].path)).unwrap();
+
+    let v = verify_at_destination(dest.as_writer(), "").unwrap();
+    let json = serde_json::to_value(&v).unwrap();
+    let failures = json["failures"].as_array().expect("failures is an array");
+    assert!(!failures.is_empty(), "must surface at least one failure");
+    let kind = failures[0]["kind"]
+        .as_str()
+        .expect("each failure must carry a `kind` string");
+    assert_eq!(kind, "part_missing");
+    // And the field accessors a consumer would use are present:
+    assert_eq!(failures[0]["part_id"], 1);
+    assert!(failures[0]["path"].is_string());
+}
+
+// ─── Section 23: ValidationOutcome wire contract (ADR-0013) ─────────────────
+
+#[test]
+fn validation_outcome_in_summary_json_carries_manifest_subobject_when_set() {
+    // ADR-0013 acceptance: when --validate ran the manifest pass, the
+    // serialized `summary.json` must carry a nested `validation.manifest`
+    // object — same flag, richer payload, no schema break vs 0.6.x readers
+    // (which simply ignore the new sub-object since `deny_unknown_fields`
+    // is intentionally NOT set on RunReport).
+    let dir = dataset_dir();
+    let cfg = touch_config(dir.path());
+    let mut s = summary("verify_outcome", "orders", "success", Vec::new(), None);
+    s.manifest_verification = Some(ManifestVerification {
+        manifest_found: true,
+        legacy_run: false,
+        parts_verified: 3,
+        parts_failed: 0,
+        success_marker_consistent: true,
+        manifest_self_consistent: true,
+        passed: true,
+        failures: Vec::new(),
+    });
+
+    let out = write_run_report(cfg.to_str().unwrap(), &s).unwrap();
+    let raw = std::fs::read_to_string(out.join("summary.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert!(json["validation"].is_object());
+    let manifest = &json["validation"]["manifest"];
+    assert!(
+        manifest.is_object(),
+        "validation.manifest must serialise as a nested object"
+    );
+    assert_eq!(manifest["manifest_found"], true);
+    assert_eq!(manifest["parts_verified"], 3);
+    assert_eq!(manifest["parts_failed"], 0);
+    assert_eq!(manifest["success_marker_consistent"], true);
+    assert_eq!(manifest["legacy_run"], false);
+    assert_eq!(manifest["passed"], true);
+    assert!(manifest["failures"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn validation_outcome_omits_manifest_subobject_when_unset() {
+    // Backward-compat: a run that did NOT run --validate's manifest pass
+    // (--validate not requested, or streaming destination) must produce
+    // a summary.json identical in shape to 0.6.x — no `manifest` key at
+    // all under `validation`, so 0.6.x consumers read it the same.
+    let dir = dataset_dir();
+    let cfg = touch_config(dir.path());
+    let s = summary(
+        "verify_outcome_legacy",
+        "orders",
+        "success",
+        Vec::new(),
+        None,
+    );
+    // Note: summary fixture leaves manifest_verification = None and
+    // validated = Some(true) (file-row check ran).
+
+    let out = write_run_report(cfg.to_str().unwrap(), &s).unwrap();
+    let raw = std::fs::read_to_string(out.join("summary.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert!(json["validation"].is_object());
+    assert!(
+        json["validation"].get("manifest").is_none(),
+        "validation.manifest must be omitted (skip_serializing_if = Option::is_none) for backward-compat readers"
+    );
+}
+
+// ─── Section 24: ADR-0013 acceptance — no new flags ─────────────────────────
+//
+// Anchor test: if a future PR adds a CLI flag for M5/M6/M8/M9, this test
+// trips and forces a discussion.  The clap derive struct has a stable
+// shape today; we pin the count of arg names on the `Run` subcommand.
+
+#[test]
+fn rivet_run_subcommand_has_exactly_the_adr_0013_flag_set() {
+    // This test reads the binary's --help output via clap's Command
+    // structure indirectly — we re-derive the same shape through the
+    // existing public API.  If a new flag appears, the assertion below
+    // fails with a clear "expected N, got N+1" message.
+    //
+    // Implementation note: rivet's `Cli` struct is in a binary-only
+    // module (`src/cli/args.rs`) so the integration test can't reach
+    // it directly.  Instead, invoke the binary with `--help` and count
+    // the flags.  The test is gated on the binary existing; CI builds
+    // it before tests run.
+    let bin = std::env::var("CARGO_BIN_EXE_rivet")
+        .ok()
+        .or_else(|| {
+            std::env::var("CARGO_TARGET_DIR")
+                .ok()
+                .map(|d| format!("{d}/debug/rivet"))
+        })
+        .unwrap_or_else(|| "target/debug/rivet".into());
+    if !std::path::Path::new(&bin).exists() {
+        eprintln!("skipping flag-count test: binary not built at {bin}");
+        return;
+    }
+    let output = std::process::Command::new(&bin)
+        .args(["run", "--help"])
+        .output()
+        .expect("run rivet run --help");
+    let help = String::from_utf8_lossy(&output.stdout);
+    // Count occurrences of `--<name>` at line start (clap formats one
+    // flag per line in the Options block).  Allow leading whitespace.
+    let flag_lines: Vec<&str> = help
+        .lines()
+        .filter(|l| l.trim_start().starts_with("--"))
+        .collect();
+    let flag_names: std::collections::BTreeSet<String> = flag_lines
+        .iter()
+        .filter_map(|l| {
+            let trimmed = l.trim_start();
+            // Take chars while alphanum / dash, after the leading "--"
+            let after = trimmed.trim_start_matches("--");
+            let name: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            (!name.is_empty()).then_some(name)
+        })
+        .collect();
+    // ADR-0013 contract: trust + safety + I/O ergonomics — pin the set,
+    // not the count, so adding a non-trust flag (e.g. a new --json toggle)
+    // is allowed but adding `--verify` / `--check-manifest` etc. trips.
+    let expected: std::collections::BTreeSet<String> = [
+        // trust flags (ADR-0013):
+        "validate",
+        "reconcile",
+        "resume",
+        // run-shape:
+        "config",
+        "export",
+        "parallel-exports",
+        "parallel-export-processes",
+        "summary-output",
+        "json",
+        "param",
+        // global (clap-derived):
+        "json-errors",
+        "help",
+        "version",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let unexpected: Vec<_> = flag_names.difference(&expected).cloned().collect();
+    assert!(
+        unexpected.is_empty(),
+        "ADR-0013 contract: `rivet run` grew unexpected flag(s): {unexpected:?} \
+         — every ADR-0012 invariant must land under existing --validate / \
+         --reconcile / --resume.  If a new top-level flag is genuinely needed, \
+         supersede ADR-0013 first, then update this set."
+    );
 }

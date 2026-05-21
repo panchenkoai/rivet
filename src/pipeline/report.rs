@@ -78,7 +78,16 @@ pub struct RunReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidationOutcome {
+    /// Composite verdict: per-file row counts pass AND, when applicable,
+    /// manifest-aware verification (M5) passes.  Stays `true` for the
+    /// legacy-run path where only row counts ran.
     pub passed: bool,
+    /// Embedded manifest-aware verdict (ADR-0012 M5/M6, ADR-0013 — same
+    /// `--validate` flag, no new flag added).  `None` for runs that didn't
+    /// reach the manifest-write step (e.g. failed-before-any-part) or that
+    /// targeted streaming destinations where no manifest exists.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub manifest: Option<crate::pipeline::ManifestVerification>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,7 +151,10 @@ impl RunReport {
 
             pg_temp_bytes_delta: summary.pg_temp_bytes_delta,
 
-            validation: summary.validated.map(|passed| ValidationOutcome { passed }),
+            validation: summary.validated.map(|passed| ValidationOutcome {
+                passed,
+                manifest: summary.manifest_verification.clone(),
+            }),
             reconciliation: summary.reconciled.map(|matched| ReconciliationOutcome {
                 source_count: summary.source_count,
                 exported_rows: summary.total_rows,
@@ -314,6 +326,33 @@ pub fn render_markdown(r: &RunReport) -> String {
             None => "not requested",
         }
     ));
+    if let Some(v) = &r.validation
+        && let Some(m) = &v.manifest
+    {
+        if m.legacy_run {
+            out.push_str("  - Manifest: not present (legacy_run: true)\n");
+        } else if m.manifest_found {
+            out.push_str(&format!(
+                "  - Manifest: {} parts verified",
+                m.parts_verified
+            ));
+            if m.parts_failed > 0 {
+                out.push_str(&format!(", {} failed", m.parts_failed));
+            }
+            out.push_str(&format!(
+                ", _SUCCESS {}",
+                if m.success_marker_consistent {
+                    "consistent"
+                } else {
+                    "absent"
+                }
+            ));
+            out.push('\n');
+            for f in &m.failures {
+                out.push_str(&format!("    - {}\n", render_manifest_failure(f)));
+            }
+        }
+    }
     let reconciliation_line = match &r.reconciliation {
         Some(rc) if rc.matched => "MATCHED".to_string(),
         Some(rc) => format!(
@@ -390,6 +429,43 @@ pub fn render_markdown(r: &RunReport) -> String {
     }
 
     out
+}
+
+fn render_manifest_failure(f: &crate::pipeline::ManifestVerificationFailure) -> String {
+    use crate::pipeline::ManifestVerificationFailure as F;
+    match f {
+        F::PartMissing { part_id, path } => {
+            format!("part {} missing at {}", part_id, path)
+        }
+        F::PartSizeMismatch {
+            part_id,
+            path,
+            expected,
+            actual,
+        } => format!(
+            "part {} size mismatch at {}: manifest {}, dest {}",
+            part_id, path, expected, actual
+        ),
+        F::SuccessMarkerMalformed { body_preview } => {
+            format!("_SUCCESS body malformed: {body_preview:?}")
+        }
+        F::SuccessMarkerStale {
+            marker_fingerprint,
+            manifest_fingerprint,
+        } => format!(
+            "_SUCCESS body {} != manifest fingerprint {} (stale marker)",
+            marker_fingerprint, manifest_fingerprint
+        ),
+        F::ManifestSelfInconsistent { detail } => {
+            format!("manifest self-consistency: {detail}")
+        }
+        F::ManifestReadError { detail } => format!("manifest read error: {detail}"),
+        F::SuccessMarkerReadError { detail } => format!("_SUCCESS read error: {detail}"),
+        F::ListPrefixError { detail } => format!("destination listing error: {detail}"),
+        F::UntrackedObject { key, size_bytes } => {
+            format!("untracked object: {} ({} bytes)", key, size_bytes)
+        }
+    }
 }
 
 fn verdict_badge(status: &str) -> &'static str {
@@ -485,6 +561,7 @@ mod tests {
             reconciled: None,
             manifest_parts: Vec::new(),
             schema_fingerprint: None,
+            manifest_verification: None,
             journal,
         }
     }

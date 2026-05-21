@@ -47,6 +47,7 @@ fn stub_summary(status: &str) -> RunSummary {
         reconciled: None,
         manifest_parts: Vec::new(),
         schema_fingerprint: None,
+        manifest_verification: None,
         journal: RunJournal::new("test_run", "orders"),
     }
 }

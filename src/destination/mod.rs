@@ -54,6 +54,22 @@ pub struct DestinationCapabilities {
     pub partial_write_risk: bool,
 }
 
+/// Read-side metadata for a single object at the destination.
+///
+/// Returned by [`Destination::list_prefix`] and [`Destination::head`].  The
+/// minimal field set is what ADR-0012 M5 verification needs: the relative
+/// `key` (so the caller can correlate with `manifest.parts[].path`) and the
+/// `size_bytes` (so M5's "size matches recorded value" check is one
+/// comparison).  More fields (etag, last_modified, content_type) can be
+/// added later without breaking the trait.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectMeta {
+    /// Object key relative to the destination's configured prefix —
+    /// the same shape `Destination::write`'s `remote_key` argument uses.
+    pub key: String,
+    pub size_bytes: u64,
+}
+
 /// Object-safe surface for upload backends. `Send + Sync` so a single `Arc` can be shared
 /// across parallel chunk workers (one OpenDAL/HTTP stack per export, not one Tokio runtime per chunk).
 pub trait Destination: Send + Sync {
@@ -70,6 +86,49 @@ pub trait Destination: Send + Sync {
     /// durably committed.  For `Atomic` and `FinalizeOnClose` backends this means after
     /// `write()` returns `Ok(())`; for `Streaming` there is no safe moment.
     fn capabilities(&self) -> DestinationCapabilities;
+
+    // ── Read-side surface (ADR-0013 / Phase A for ADR-0012 M5/M8) ──────────
+    //
+    // Every cloud-or-local-file destination needs to be readable so that
+    // post-run `--validate` (M5), `--reconcile` (M5 + source compare), and
+    // `--resume` (M8 decision matrix) can inspect the prefix without keeping
+    // a parallel local cache.  Streaming destinations (stdout) have no
+    // coherent prefix and must surface a clear "unsupported" error from
+    // every read method — the manifest writer already short-circuits the
+    // streaming case (`SkippedStreaming`), so callers should never reach
+    // these methods on stdout in practice.
+    //
+    // Default implementations return "unsupported" so adding a new backend
+    // doesn't have to opt in immediately; the readers will surface the
+    // gap explicitly the first time they need it.
+
+    /// List every object at or below `prefix`, in **unspecified** order.
+    ///
+    /// `prefix` is relative to the destination root, mirrors the `remote_key`
+    /// shape of [`write`].  Empty `prefix` lists everything under the root.
+    /// Implementations may walk recursively (local FS) or use a single
+    /// listing call (S3/GCS object stores).
+    fn list_prefix(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
+        let _ = prefix;
+        anyhow::bail!("list_prefix is not supported by this destination backend")
+    }
+
+    /// Read the full body of `key` into memory.  Used for small artifacts
+    /// only (`manifest.json`, `_SUCCESS`).  Per-part reads should go through
+    /// a future streaming reader if and when `--validate --deep` lands.
+    fn read(&self, key: &str) -> Result<Vec<u8>> {
+        let _ = key;
+        anyhow::bail!("read is not supported by this destination backend")
+    }
+
+    /// Stat `key`, returning `None` if the object does not exist and the
+    /// underlying backend can disambiguate "absent" from a hard error.
+    /// Implementations that cannot disambiguate must surface the underlying
+    /// error rather than swallow it as `None`.
+    fn head(&self, key: &str) -> Result<Option<ObjectMeta>> {
+        let _ = key;
+        anyhow::bail!("head is not supported by this destination backend")
+    }
 }
 
 /// Log destination capabilities at DEBUG level and emit a WARN when the backend is not
