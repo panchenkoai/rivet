@@ -28,8 +28,10 @@ use rivet::manifest::{
 };
 use rivet::pipeline::{
     ManifestBuilder, ManifestVerification, ManifestVerificationFailure, RunReport, RunSummary,
-    WriteOutcome, report_dir, verify_at_destination, write_manifest, write_run_report,
+    WriteOutcome, build_resume_plan, report_dir, verify_at_destination, write_manifest,
+    write_run_report,
 };
+use rivet::pipeline::{QuarantineReason, ResumeDecision, UntrackedDecision};
 use rivet::state::{SchemaColumn, schema_fingerprint};
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────
@@ -2067,6 +2069,8 @@ fn rivet_run_subcommand_has_exactly_the_adr_0013_flag_set() {
         "validate",
         "reconcile",
         "resume",
+        // safety override (ADR-0013 — one --force scoped to gates):
+        "force",
         // run-shape:
         "config",
         "export",
@@ -2285,6 +2289,262 @@ fn rivet_validate_subcommand_legacy_run_exits_zero() {
     assert_eq!(v["manifest_found"], false);
     assert_eq!(v["parts_verified"], 0);
     assert!(v["failures"].as_array().unwrap().is_empty());
+}
+
+// ─── Section 26: ADR-0012 M8 — _SUCCESS gate on --resume ────────────────────
+
+#[test]
+fn rivet_run_resume_refuses_when_success_marker_present_without_force() {
+    // ADR-0012 M8: a destination prefix whose `_SUCCESS` is already on disk
+    // signals "verified successful run".  `--resume` against that prefix
+    // would overwrite a known-good dataset; the gate refuses unless
+    // `--force` is given.  This test pins the refusal end-to-end.
+    let bin = locate_rivet_bin();
+    let Some(bin) = bin else {
+        eprintln!("skipping success-gate test: binary not built");
+        return;
+    };
+
+    let outer = tempfile::tempdir().unwrap();
+    let dest_dir = outer.path().join("dest");
+    std::fs::create_dir_all(&dest_dir).unwrap();
+
+    // Plant a manifest + _SUCCESS marker — same shape as a completed run.
+    let dest_proxy = local_dest(&dest_dir);
+    let parts = vec![part(1, 100, 4096, "xxh3:1111111111111111")];
+    std::fs::write(dest_dir.join(&parts[0].path), vec![0u8; 4096]).unwrap();
+    let m = build_manifest("prior_run", ManifestStatus::Success, parts);
+    write_manifest(dest_proxy.as_writer(), &m).unwrap();
+    assert!(
+        dest_dir.join(SUCCESS_FILENAME).exists(),
+        "marker must exist"
+    );
+
+    // Build a config whose destination points at the prefix above.  We
+    // give the source a deliberately-unreachable URL — the gate must fire
+    // BEFORE any source connection is attempted, so no real PG needed.
+    let cfg_path = outer.path().join("rivet.yaml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            "source:\n  type: postgres\n  url: postgresql://nope-on-purpose@127.0.0.1:1/never\n\
+             exports:\n  - name: public.orders\n    query: \"SELECT 1\"\n    mode: full\n    format: parquet\n    destination:\n      type: local\n      path: {}\n",
+            dest_dir.display()
+        ),
+    )
+    .unwrap();
+
+    // 1. Without --force: gate refuses, exit non-zero, error message
+    //    explicitly mentions _SUCCESS and --force.
+    let output = std::process::Command::new(&bin)
+        .args([
+            "run",
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--export",
+            "public.orders",
+            "--resume",
+        ])
+        .output()
+        .expect("run rivet run --resume");
+    assert!(
+        !output.status.success(),
+        "exit code must be non-zero when _SUCCESS gate refuses"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("_SUCCESS"),
+        "error message must mention _SUCCESS so the operator knows why; got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--force"),
+        "error message must point operators at --force as the override"
+    );
+
+    // 2. With --force: gate is overridden.  The source URL is intentionally
+    //    unreachable, so the run will fail later (during source connect),
+    //    but it must NOT fail with the gate's "_SUCCESS" message — proves
+    //    the gate let the run through.
+    let output = std::process::Command::new(&bin)
+        .args([
+            "run",
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--export",
+            "public.orders",
+            "--resume",
+            "--force",
+        ])
+        .output()
+        .expect("run rivet run --resume --force");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("--resume refused"),
+        "with --force the gate must NOT trip; got stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn rivet_run_resume_proceeds_when_no_success_marker() {
+    // Pre-0.7.0 destinations and failed-then-rewritten destinations both
+    // legitimately lack `_SUCCESS`.  The gate must NOT trip on those —
+    // refusing would break the resume use-case the gate is supposed to
+    // protect.
+    let bin = locate_rivet_bin();
+    let Some(bin) = bin else {
+        eprintln!("skipping success-gate-absent test: binary not built");
+        return;
+    };
+
+    let outer = tempfile::tempdir().unwrap();
+    let dest_dir = outer.path().join("dest");
+    std::fs::create_dir_all(&dest_dir).unwrap();
+    // No _SUCCESS — bare parquet only (legacy run).
+    std::fs::write(dest_dir.join("legacy.parquet"), b"data").unwrap();
+
+    let cfg_path = outer.path().join("rivet.yaml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            "source:\n  type: postgres\n  url: postgresql://nope-on-purpose@127.0.0.1:1/never\n\
+             exports:\n  - name: public.orders\n    query: \"SELECT 1\"\n    mode: full\n    format: parquet\n    destination:\n      type: local\n      path: {}\n",
+            dest_dir.display()
+        ),
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(&bin)
+        .args([
+            "run",
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--export",
+            "public.orders",
+            "--resume",
+        ])
+        .output()
+        .expect("run rivet run --resume");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("--resume refused"),
+        "no _SUCCESS at destination → gate must let the run through; \
+         the run may still fail later for unrelated reasons (unreachable source), \
+         but the failure must NOT be the gate's message; got stderr:\n{stderr}"
+    );
+}
+
+// ─── Section 27: ADR-0012 M8 — resume decision matrix end-to-end ────────────
+//
+// Phase C-β: pure decision logic exists and is unit-tested per row in
+// `pipeline::resume_decisions::tests`.  This section pins the matrix
+// against a *real* Destination listing produced by `local_dest`, so a
+// regression that breaks listing-key shape (e.g. a future change in how
+// LocalDestination::list_prefix joins paths) trips here too.
+
+#[test]
+fn resume_plan_skips_committed_parts_present_at_destination() {
+    let dir = dataset_dir();
+    let payloads: &[&[u8]] = &[b"AAAA", b"BBBBB"];
+    let parts = parts_with_payloads(payloads);
+    let dest = lay_out_clean_dataset(dir.path(), &parts, payloads);
+
+    let manifest = build_manifest("e2e_skip", ManifestStatus::Success, parts);
+    let listing = dest.as_writer().list_prefix("").unwrap();
+    let plan = build_resume_plan(&manifest, &listing);
+
+    assert_eq!(
+        plan.skipped(),
+        2,
+        "both committed parts must be skipped on resume"
+    );
+    assert_eq!(plan.rewrites(), 0);
+    assert_eq!(plan.quarantines(), 0);
+    assert!(plan.untracked.is_empty());
+    for d in plan.per_part.values() {
+        assert_eq!(d.decision, ResumeDecision::Skip);
+    }
+}
+
+#[test]
+fn resume_plan_rewrites_part_missing_at_destination() {
+    let dir = dataset_dir();
+    let payloads: &[&[u8]] = &[b"present", b"will-be-deleted"];
+    let parts = parts_with_payloads(payloads);
+    let dest = lay_out_clean_dataset(dir.path(), &parts, payloads);
+    std::fs::remove_file(dir.path().join(&parts[1].path)).unwrap();
+
+    let manifest = build_manifest("e2e_rewrite", ManifestStatus::Success, parts.clone());
+    let listing = dest.as_writer().list_prefix("").unwrap();
+    let plan = build_resume_plan(&manifest, &listing);
+
+    assert_eq!(plan.skipped(), 1);
+    assert_eq!(plan.rewrites(), 1);
+    assert_eq!(
+        plan.per_part[&parts[1].path].decision,
+        ResumeDecision::Rewrite
+    );
+}
+
+#[test]
+fn resume_plan_quarantines_part_with_size_drift() {
+    let dir = dataset_dir();
+    let payloads: &[&[u8]] = &[b"original-12B"];
+    let parts = parts_with_payloads(payloads);
+    let dest = lay_out_clean_dataset(dir.path(), &parts, payloads);
+    // Mutate the part body — same path, different size.
+    std::fs::write(dir.path().join(&parts[0].path), b"shorter").unwrap();
+
+    let manifest = build_manifest("e2e_drift", ManifestStatus::Success, parts.clone());
+    let listing = dest.as_writer().list_prefix("").unwrap();
+    let plan = build_resume_plan(&manifest, &listing);
+
+    assert_eq!(plan.quarantines(), 1);
+    assert_eq!(
+        plan.per_part[&parts[0].path].decision,
+        ResumeDecision::Quarantine {
+            reason: QuarantineReason::SizeMismatch
+        }
+    );
+}
+
+#[test]
+fn resume_plan_quarantines_untracked_object_under_prefix() {
+    let dir = dataset_dir();
+    let payloads: &[&[u8]] = &[b"committed"];
+    let parts = parts_with_payloads(payloads);
+    let dest = lay_out_clean_dataset(dir.path(), &parts, payloads);
+    std::fs::write(dir.path().join("rogue.parquet"), b"X").unwrap();
+
+    let manifest = build_manifest("e2e_untracked", ManifestStatus::Success, parts);
+    let listing = dest.as_writer().list_prefix("").unwrap();
+    let plan = build_resume_plan(&manifest, &listing);
+
+    assert_eq!(plan.untracked.len(), 1);
+    assert_eq!(
+        plan.untracked["rogue.parquet"],
+        UntrackedDecision::Quarantine
+    );
+}
+
+#[test]
+fn resume_plan_does_not_quarantine_manifest_or_success_marker() {
+    // The trust-contract files are part of the `listing` — must be
+    // excluded from "untracked surplus" classification.
+    let dir = dataset_dir();
+    let payloads: &[&[u8]] = &[b"x"];
+    let parts = parts_with_payloads(payloads);
+    let dest = lay_out_clean_dataset(dir.path(), &parts, payloads);
+
+    let manifest = build_manifest("e2e_trustfiles", ManifestStatus::Success, parts);
+    let listing = dest.as_writer().list_prefix("").unwrap();
+    // listing must contain the trust-contract files (the writer just put
+    // them there) — proves they reach the matrix and are correctly skipped.
+    let keys: std::collections::HashSet<&str> = listing.iter().map(|m| m.key.as_str()).collect();
+    assert!(keys.contains(MANIFEST_FILENAME));
+    assert!(keys.contains(SUCCESS_FILENAME));
+
+    let plan = build_resume_plan(&manifest, &listing);
+    assert!(plan.untracked.is_empty());
 }
 
 /// Locate the freshly-built `rivet` binary or return None when the test

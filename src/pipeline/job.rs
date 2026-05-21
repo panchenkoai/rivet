@@ -232,6 +232,19 @@ pub(super) fn run_export_job(
         return (Err(err), summary);
     }
 
+    // ADR-0012 M8 / ADR-0013: refuse `--resume` against a destination whose
+    // `_SUCCESS` marker is already present unless the operator explicitly
+    // overrode the gate with `--force`.  Re-exporting over a verified
+    // dataset is almost never what the operator meant; the gate makes the
+    // override an audited decision.
+    if opts.resume
+        && !opts.force
+        && let Err(e) = check_success_gate_for_resume(&plan)
+    {
+        let summary = synthetic_failed_summary(&export.name, &e);
+        return (Err(e), summary);
+    }
+
     log::info!(
         "starting export '{}' (effective tuning: {})",
         plan.export_name,
@@ -645,6 +658,35 @@ fn finalize_validate_manifest(
                 e
             );
         }
+    }
+}
+
+/// ADR-0012 M8 — refuse to start a `--resume` run against a destination prefix
+/// whose `_SUCCESS` marker is already present, unless the operator passed
+/// `--force`.  The marker is the unambiguous signal that the prefix already
+/// holds a verified dataset; quietly overwriting it is the kind of mistake
+/// that costs a re-extraction window's worth of source pressure.
+///
+/// Streaming destinations (stdout) have no prefix to gate on; permitted.
+/// I/O failures probing `_SUCCESS` (e.g. permission denied on the bucket
+/// we're about to write to) bubble up as `Err` so the operator sees the
+/// real problem before the run starts spending source query time.
+fn check_success_gate_for_resume(plan: &crate::plan::ResolvedRunPlan) -> Result<()> {
+    use crate::destination::WriteCommitProtocol;
+    use crate::manifest::SUCCESS_FILENAME;
+
+    let dest = crate::destination::create_destination(&plan.destination)?;
+    if dest.capabilities().commit_protocol == WriteCommitProtocol::Streaming {
+        return Ok(());
+    }
+    match dest.head(SUCCESS_FILENAME)? {
+        Some(_) => anyhow::bail!(
+            "export '{}': --resume refused — destination prefix already has _SUCCESS \
+             from a prior completed run.  Re-running would overwrite a verified dataset. \
+             Pass --force to override, or use a different destination prefix.",
+            plan.export_name
+        ),
+        None => Ok(()),
     }
 }
 

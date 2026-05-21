@@ -69,6 +69,7 @@ mod tests {
             validate: false,
             reconcile: false,
             resume: false,
+            force: false,
             parallel_exports,
             parallel_export_processes,
             summary_output: None,

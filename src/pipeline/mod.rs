@@ -20,6 +20,7 @@ pub(crate) mod progress;
 mod reconcile_cmd;
 mod repair_cmd;
 pub(crate) mod report;
+mod resume_decisions;
 mod retry;
 mod single;
 mod sink;
@@ -57,6 +58,11 @@ pub use manifest_writer::{ManifestBuilder, WriteOutcome, write_manifest};
 #[allow(unused_imports)]
 pub use report::{RunReport, report_dir, write_run_report};
 #[allow(unused_imports)]
+pub use resume_decisions::{
+    PartDecision, QuarantineReason, ResumeDecision, ResumePlan, UntrackedDecision,
+    build_resume_plan,
+};
+#[allow(unused_imports)]
 pub use validate_manifest::{
     Failure as ManifestVerificationFailure, ManifestVerification, verify_at_destination,
 };
@@ -84,6 +90,14 @@ pub struct RunOptions<'a> {
     pub validate: bool,
     pub reconcile: bool,
     pub resume: bool,
+    /// Override safety gates that would otherwise refuse to start the run.
+    ///
+    /// Currently used by ADR-0012 M8 — `--resume` against a prefix whose
+    /// `_SUCCESS` marker is present is refused unless `--force` is given,
+    /// so an operator cannot accidentally re-export over a verified
+    /// dataset.  Other gates may share the same flag in the future
+    /// (per ADR-0013: one `--force`, scoped to whichever gate it overrides).
+    pub force: bool,
     pub params: Option<&'a std::collections::HashMap<String, String>>,
 }
 
@@ -181,13 +195,14 @@ fn print_json_summary(agg: &crate::state::RunAggregate) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // CLI fan-in; surface stays stable per ADR-0013
 pub fn run(
     config_path: &str,
     export_name: Option<&str>,
     validate: bool,
     reconcile: bool,
     resume: bool,
+    force: bool,
     params: Option<&std::collections::HashMap<String, String>>,
     parallel_exports_cli: bool,
     parallel_export_processes_cli: bool,
@@ -216,6 +231,7 @@ pub fn run(
         validate,
         reconcile,
         resume,
+        force,
         params,
     };
 
@@ -248,6 +264,7 @@ pub fn run(
                 validate,
                 reconcile,
                 resume,
+                force,
                 params,
             );
         let finished_at = chrono::Utc::now();

@@ -37,6 +37,14 @@ pub enum Commands {
         /// Resume a chunked export with `chunk_checkpoint: true` (same query/chunk_column/chunk_size)
         #[arg(long)]
         resume: bool,
+        /// Override safety gates that would otherwise refuse the run.
+        ///
+        /// Today: with `--resume`, allows starting against a destination prefix
+        /// whose `_SUCCESS` marker is already present (ADR-0012 M8).  Without
+        /// `--force`, resume against a complete run refuses so an operator
+        /// cannot accidentally re-export over a verified dataset.
+        #[arg(long)]
+        force: bool,
         /// Run all exports from the config concurrently (ignored with `--export`; needs 2+ exports)
         #[arg(long)]
         parallel_exports: bool,
