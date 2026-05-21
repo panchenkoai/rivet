@@ -217,6 +217,12 @@ pub(crate) fn run_chunked_sequential_checkpoint(
 
     let run_id = ensure_chunk_checkpoint_plan(state, plan, cp, summary, &chunks, config_path)?;
 
+    // ADR-0012 M8: same manifest-aware preamble as the parallel runner —
+    // reconcile destination state with chunk_task table before claiming work.
+    if plan.resume {
+        let _stats = super::apply_m8_resume_decisions(state, &run_id, plan, summary)?;
+    }
+
     let total_tasks = state.count_chunk_tasks_total(&run_id).unwrap_or(1);
     let pb = ChunkProgress::new(&plan.export_name, total_tasks);
 

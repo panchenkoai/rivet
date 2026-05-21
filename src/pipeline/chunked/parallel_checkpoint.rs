@@ -68,6 +68,16 @@ pub(crate) fn run_chunked_parallel_checkpoint(
 
     let run_id = ensure_chunk_checkpoint_plan(state, plan, cp, summary, &chunks, config_path)?;
 
+    // ADR-0012 M8: when resuming a chunked run, reconcile the destination's
+    // prior-run manifest with the local chunk_task state.  Parts whose
+    // manifest entry diverges from what's actually on the destination
+    // (missing object, size drift) get their chunk_task reset to `pending`
+    // so the worker loop below re-exports them.  No-op for fresh prefixes
+    // and pre-0.7.0 destinations.  See `pipeline/chunked/resume_m8.rs`.
+    if plan.resume {
+        let _stats = super::apply_m8_resume_decisions(state, &run_id, plan, summary)?;
+    }
+
     let total_tasks = {
         let tasks = state.list_chunk_tasks_for_run(&run_id)?;
         tasks.len().max(1)

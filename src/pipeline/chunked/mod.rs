@@ -23,6 +23,7 @@ mod detect;
 mod exec;
 pub(crate) mod math;
 mod parallel_checkpoint;
+mod resume_m8;
 mod sequential_checkpoint;
 
 // ─── Re-exports for callers in pipeline:: ────────────────────────────────────
@@ -35,6 +36,14 @@ pub(crate) use math::{
     RIVET_CHUNK_RN_COL, build_chunk_query_sql, chunk_plan_fingerprint, strip_select_star_from,
 };
 pub(crate) use parallel_checkpoint::run_chunked_parallel_checkpoint;
+pub(crate) use resume_m8::apply_m8_resume_decisions;
+// `M8Stats` is intentionally not re-exported yet — Phase C-γ keeps it
+// internal until Phase C-δ surfaces it via summary.json.  Listed here
+// in a `#[cfg(test)]` re-export so unit tests in `tests/*` can pin
+// the wire shape without growing the public API prematurely.
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use resume_m8::M8Stats;
 pub(crate) use sequential_checkpoint::run_chunked_sequential_checkpoint;
 
 // ─── Chunk source selection ───────────────────────────────────────────────────

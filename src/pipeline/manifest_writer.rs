@@ -256,7 +256,21 @@ pub fn record_committed_part_with_fingerprint(
     size_bytes: u64,
     content_fingerprint: String,
 ) {
-    let part_id = (summary.manifest_parts.len() + 1) as u32;
+    // ADR-0012 M4: part_id must be unique within the manifest.  Before the
+    // M8 resume-hydration work, `summary.manifest_parts.len() + 1` was a
+    // safe ordinal because the list was always built from scratch this run.
+    // After M8 hydrates parts inherited from the prior manifest, simple
+    // length-based numbering can collide (hydrated has [1,2,4,5]; the next
+    // write at len()=4 would get part_id=5 — duplicate).  Take max+1 of
+    // existing part_ids instead.  Empty list → 1, matching the historical
+    // first-part value.
+    let part_id = summary
+        .manifest_parts
+        .iter()
+        .map(|p| p.part_id)
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(1);
     summary.manifest_parts.push(ManifestPart {
         part_id,
         path: relative_path,

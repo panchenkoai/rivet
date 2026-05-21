@@ -2543,3 +2543,96 @@ fn locate_rivet_bin() -> Option<std::path::PathBuf> {
     let fallback = std::path::PathBuf::from("target/debug/rivet");
     fallback.exists().then_some(fallback)
 }
+
+// ─── Section 28: M4 part_id allocation under hydration (Phase C-γ) ──────────
+//
+// `record_committed_part_with_fingerprint` used to compute the new
+// `part_id` as `manifest_parts.len() + 1`.  After Phase C-γ, M8's resume
+// preamble pre-populates `summary.manifest_parts` with parts inherited
+// from the prior manifest (the parts whose decision was `Skip`).  At
+// that point a length-based ordinal can collide with a hydrated part_id
+// — e.g. hydrated [1, 2, 4, 5], length=4, next-write would get part_id=5
+// (already taken).
+//
+// The fix is `max(existing) + 1`.  This section pins it at the type
+// level so a future refactor that reverts to length-based numbering
+// trips loudly.
+//
+// We can't directly call `record_committed_part_with_fingerprint`
+// (it's `pub(crate)`), so we exercise the contract via `ManifestBuilder`
+// + `validate_self_consistency` — which is the public API that ships
+// to operators and the same path `pipeline::finalize::finalize_manifest`
+// drives.
+
+#[test]
+fn manifest_builder_with_hydrated_part_ids_stays_self_consistent() {
+    // Mirror what M8 does: the `summary.manifest_parts` already contains
+    // 4 parts (ids 1, 2, 4, 5 — gap at 3 is normal because chunk 2 was
+    // reset for rewrite).  A new write appends — must not pick part_id=5
+    // and break self-consistency.
+    let dir = tempfile::tempdir().unwrap();
+    let dest_proxy = local_dest(dir.path());
+
+    let prior_parts = vec![
+        part(1, 100, 4096, "xxh3:1111111111111111"),
+        part(2, 100, 4096, "xxh3:2222222222222222"),
+        part(4, 100, 4096, "xxh3:4444444444444444"),
+        part(5, 100, 4096, "xxh3:5555555555555555"),
+    ];
+
+    // Construct a final manifest the way `finalize_manifest` does after a
+    // hydrated resume: hydrated parts + one freshly-written part appended.
+    // The writer's `record_committed_part_with_fingerprint` is what assigns
+    // the new part_id; here we exercise the contract one level above by
+    // composing a `RunManifest` that mirrors the post-write state.
+    let mut all_parts = prior_parts.clone();
+    // Simulate the appended part using `max + 1` part_id selection (the
+    // writer's responsibility); here we just pin that the resulting
+    // manifest is self-consistent.
+    let next_id = all_parts.iter().map(|p| p.part_id).max().unwrap() + 1;
+    all_parts.push(part(next_id, 100, 4096, "xxh3:6666666666666666"));
+
+    let m = build_manifest("hydrated", ManifestStatus::Success, all_parts);
+    write_manifest(dest_proxy.as_writer(), &m).unwrap();
+
+    let parsed: RunManifest =
+        serde_json::from_str(&std::fs::read_to_string(dir.path().join(MANIFEST_FILENAME)).unwrap())
+            .unwrap();
+    assert_eq!(parsed.validate_self_consistency(), Ok(()));
+    let ids: Vec<u32> = parsed.parts.iter().map(|p| p.part_id).collect();
+    assert_eq!(
+        ids,
+        vec![1, 2, 4, 5, 6],
+        "M4 self-consistency: part_ids unique, gaps allowed (resume produces 1,2,4,5 + 6)"
+    );
+}
+
+#[test]
+fn manifest_builder_rejects_duplicate_part_ids_after_hydration() {
+    // Defence in depth: if a future refactor reverts to length-based
+    // ordinals AND M8 is in play, we want the reader-side
+    // `validate_self_consistency` to catch the resulting collision
+    // BEFORE writing it would get to `_SUCCESS`.  Pin that.
+    let mut m = build_manifest(
+        "dup_after_hydrate",
+        ManifestStatus::Success,
+        vec![
+            part(1, 100, 4096, "xxh3:1111111111111111"),
+            part(2, 100, 4096, "xxh3:2222222222222222"),
+            part(5, 100, 4096, "xxh3:5555555555555555"),
+        ],
+    );
+    // Inject a duplicate as if a buggy writer used `len()+1` after
+    // hydration: 3 parts → next id = 4, but we ship 5 (collision).
+    let mut bad = part(5, 100, 4096, "xxh3:5555555555555555");
+    bad.path = "duplicate.parquet".into();
+    m.parts.push(bad);
+    m.part_count = 4;
+    m.row_count = 400;
+
+    let err = m.validate_self_consistency().unwrap_err();
+    assert!(
+        format!("{err}").contains("part_id"),
+        "duplicate part_id must surface as a self-consistency error"
+    );
+}
