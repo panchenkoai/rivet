@@ -220,9 +220,16 @@ pub fn verify_at_destination(
     let success_key = join_key(manifest_dir, SUCCESS_FILENAME);
 
     // ── 1. Manifest read ───────────────────────────────────────────────
-    let manifest_bytes = match dest.head(&manifest_key)? {
-        None => return Ok(ManifestVerification::legacy()),
-        Some(_) => match dest.read(&manifest_key) {
+    //
+    // Error-consistency contract: every I/O outcome here surfaces as a
+    // structured `Failure` variant rather than as `Err`.  An operator gets
+    // one verdict shape regardless of whether the destination is missing,
+    // permission-denied, or temporarily unreachable.  The bubbled `Err`
+    // path is reserved for *programmer* errors (caller passes a malformed
+    // `manifest_dir`, a future destination breaks an internal invariant).
+    let manifest_bytes = match dest.head(&manifest_key) {
+        Ok(None) => return Ok(ManifestVerification::legacy()),
+        Ok(Some(_)) => match dest.read(&manifest_key) {
             Ok(b) => b,
             Err(e) => {
                 let mut v = ManifestVerification::legacy();
@@ -234,6 +241,19 @@ pub fn verify_at_destination(
                 return Ok(v);
             }
         },
+        Err(e) => {
+            // `head` failure is symmetric to a `read` failure — same kind
+            // (`ManifestReadError`) so consumers don't have to branch on
+            // which method tripped.  Distinct from "manifest absent"
+            // (Ok(None) above) which legitimately means "legacy prefix".
+            let mut v = ManifestVerification::legacy();
+            v.legacy_run = false;
+            v.failures.push(Failure::ManifestReadError {
+                detail: format!("manifest head failed: {e:#}"),
+            });
+            v.passed = false;
+            return Ok(v);
+        }
     };
 
     let manifest: RunManifest = match serde_json::from_slice(&manifest_bytes) {
@@ -321,7 +341,22 @@ pub fn verify_at_destination(
     }
 
     // ── 4. _SUCCESS marker consistency ─────────────────────────────────
-    match dest.head(&success_key)? {
+    //
+    // Same error-consistency contract as step 1: head/read failures become
+    // `Failure::SuccessMarkerReadError`, not bubbled `Err`.  Absent marker
+    // (Ok(None)) stays informational, not a failure (M2: only successful
+    // runs land _SUCCESS, so its absence on a failed manifest is correct).
+    let success_head = match dest.head(&success_key) {
+        Ok(h) => h,
+        Err(e) => {
+            out.passed = false;
+            out.failures.push(Failure::SuccessMarkerReadError {
+                detail: format!("_SUCCESS head failed: {e:#}"),
+            });
+            return Ok(out);
+        }
+    };
+    match success_head {
         None => {
             // Absent _SUCCESS is informational, not a failure: per ADR-0012
             // M2, only successful runs land it.  A failed-then-rewritten
