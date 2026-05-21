@@ -101,19 +101,36 @@ fn reconcile_source_count(plan: &ResolvedRunPlan, summary: &mut RunSummary) {
         Ok(Some(val)) => {
             if let Ok(count) = val.parse::<i64>() {
                 summary.source_count = Some(count);
-                summary.reconciled = Some(summary.total_rows == count);
-                if summary.total_rows != count {
+                // ADR-0012 manifest-aware reconcile: compare source COUNT(*)
+                // against the manifest's *cumulative* row total (sum of
+                // committed parts), not just this run's writes.  In a
+                // resume scenario, `summary.total_rows` reflects only the
+                // chunks that re-ran in this invocation (e.g. 500 for one
+                // chunk), while the on-disk dataset is everything that
+                // ever committed (e.g. 2500 across resume attempts).
+                // Comparing total_rows would falsely report MISMATCH on
+                // every resume.  The manifest_parts accumulator already
+                // holds the cumulative count (Phase C-γ hydration); use
+                // its sum for the comparison.
+                let committed_rows: i64 = summary.manifest_parts.iter().map(|p| p.rows).sum();
+                let exported_total = if committed_rows > 0 {
+                    committed_rows
+                } else {
+                    summary.total_rows
+                };
+                summary.reconciled = Some(exported_total == count);
+                if exported_total != count {
                     log::warn!(
-                        "reconcile MISMATCH for '{}': exported {} rows, source has {}",
+                        "reconcile MISMATCH for '{}': committed {} rows, source has {}",
                         plan.export_name,
-                        summary.total_rows,
+                        exported_total,
                         count
                     );
                 } else {
                     log::info!(
                         "reconcile MATCH for '{}': {}/{}",
                         plan.export_name,
-                        summary.total_rows,
+                        exported_total,
                         count
                     );
                 }
