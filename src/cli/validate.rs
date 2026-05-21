@@ -5,7 +5,7 @@
 //! flag. Anything expressible via clap attributes (mutual exclusion,
 //! `requires`, argument groups) should stay on the type in `args.rs`.
 
-use super::args::{Commands, PlanFormat, ReconcileFormat};
+use super::args::{Commands, PlanFormat, ReconcileFormat, ValidateFormat};
 use crate::error::Result;
 
 /// Validate cross-flag invariants on the parsed [`Commands`]. Returns `Err`
@@ -34,6 +34,13 @@ pub(super) fn validate_cli(cmd: &Commands) -> Result<()> {
         }
         Commands::Reconcile {
             format: ReconcileFormat::Pretty,
+            output: Some(_),
+            ..
+        } => {
+            anyhow::bail!("--output requires --format json (output is ignored in pretty mode)");
+        }
+        Commands::Validate {
+            format: ValidateFormat::Pretty,
             output: Some(_),
             ..
         } => {

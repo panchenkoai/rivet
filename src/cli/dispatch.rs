@@ -8,7 +8,7 @@
 
 use clap::CommandFactory;
 
-use super::args::{Cli, Commands, PlanFormat, ReconcileFormat, StateAction};
+use super::args::{Cli, Commands, PlanFormat, ReconcileFormat, StateAction, ValidateFormat};
 use super::params::{parse_params, resolve_init_source};
 use super::validate::validate_cli;
 use crate::error::Result;
@@ -86,6 +86,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             format,
         } => dispatch_plan(config, export, params, output, format),
         Commands::Apply { plan_file, force } => pipeline::run_apply_command(&plan_file, force),
+        Commands::Validate {
+            config,
+            export,
+            format,
+            output,
+        } => dispatch_validate(config, export, format, output),
         Commands::Reconcile {
             config,
             export,
@@ -226,6 +232,19 @@ fn dispatch_plan(
         PlanFormat::Json => pipeline::PlanOutputFormat::Json(output),
     };
     pipeline::run_plan_command(&config, export.as_deref(), p.as_ref(), fmt)
+}
+
+fn dispatch_validate(
+    config: String,
+    export: Option<String>,
+    format: ValidateFormat,
+    output: Option<String>,
+) -> Result<()> {
+    let fmt = match format {
+        ValidateFormat::Pretty => pipeline::ValidateOutputFormat::Pretty,
+        ValidateFormat::Json => pipeline::ValidateOutputFormat::Json(output),
+    };
+    pipeline::run_validate_command(&config, export.as_deref(), fmt)
 }
 
 fn dispatch_reconcile(

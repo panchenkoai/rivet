@@ -141,7 +141,9 @@ Why keep `--validate` rather than the conceptually cleaner `--check`:
 These are explicitly **not** going to ship, in 0.7.0 or later, unless this
 ADR is superseded:
 
-- `rivet verify` subcommand.
+- `rivet verify` subcommand as a **higher-level umbrella** that subsumes
+  validate + reconcile + manifest + schema under one new noun.  See the
+  carveout below for the narrower allowance.
 - `--verify`, `--audit`, `--check-output`, `--full` flags on `rivet run`.
 - Per-invariant flags (`--check-m5`, `--validate-manifest`, `--require-success`).
 - Behaviour where `--validate` triggers a source query.
@@ -151,6 +153,40 @@ ADR is superseded:
 
 If a use case appears that these rule out, the right move is to reopen this
 ADR and amend it, not to slip a new flag in under the radar.
+
+## Subcommand carveouts (amendment 2026-05-21)
+
+The contract above pins the **flag surface** of `rivet run`.  It does not
+forbid subcommands whose only job is to **re-drive existing flag semantics
+standalone**, without introducing new trust nouns.  Two examples:
+
+- `rivet reconcile <export>` — already exists; standalone driver for the
+  `--reconcile` semantics that `rivet run --reconcile` performs at end-of-run.
+- `rivet validate [--export <name>]` — added 2026-05-21; standalone driver
+  for the M5/M6 semantics that `rivet run --validate` performs at end-of-run.
+  Runs the same `pipeline::validate_manifest::verify_at_destination` code
+  path against an existing destination prefix, no source query, no
+  extraction, no state writes.
+
+Allowed subcommand patterns:
+
+- The subcommand's verdict **must** be expressible by an existing flag.
+  `rivet validate` produces the same `ManifestVerification` shape that
+  `validation.manifest` carries in `summary.json`; an Airflow consumer
+  reads it identically from either source.
+- The subcommand **must not** introduce a new trust noun in the
+  operator-facing language.  "Validate" maps to `--validate`; "reconcile"
+  maps to `--reconcile`.  A `rivet verify` subcommand was rejected above
+  precisely because "verify" is *not* an existing flag.
+- The subcommand **must not** depend on having run an extraction.  These
+  are between-run inspection tools, not retroactive run mutators.
+
+Rationale: between-run polling (Airflow sensors, CI gating, operator
+triage) is a real workflow that the existing `--validate` flag cannot
+serve — it only fires at end-of-run.  Refusing to ship a standalone
+driver would force operators to either re-run the entire export to
+re-verify, or to reimplement M5 in shell against the manifest schema.
+Both are worse than a thin subcommand.
 
 ---
 

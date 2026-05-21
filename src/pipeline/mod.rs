@@ -25,6 +25,7 @@ mod single;
 mod sink;
 mod summary;
 mod validate;
+mod validate_cmd;
 mod validate_manifest;
 
 pub use apply_cmd::run_apply_command;
@@ -40,6 +41,7 @@ pub use reconcile_cmd::{ReconcileOutputFormat, run_reconcile_command};
 pub use repair_cmd::{RepairOutputFormat, RepairReportSource, run_repair_command};
 #[allow(unused_imports)]
 pub use retry::{RetryClass, classify_error};
+pub use validate_cmd::{ValidateOutputFormat, run_validate_command};
 // build_time_window_query moved to crate::plan; re-exported here for integration tests.
 #[allow(unused_imports)]
 pub use crate::plan::build_time_window_query;

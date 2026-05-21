@@ -2092,3 +2092,217 @@ fn rivet_run_subcommand_has_exactly_the_adr_0013_flag_set() {
          supersede ADR-0013 first, then update this set."
     );
 }
+
+// ─── Section 25: standalone `rivet validate` subcommand (ADR-0013 carveout) ─
+
+#[test]
+fn rivet_validate_subcommand_drives_existing_m5_semantics_passing_path() {
+    // ADR-0013 §"Subcommand carveouts": `rivet validate` is allowed
+    // because it re-drives the same M5/M6 semantics `rivet run --validate`
+    // performs at end-of-run.  No new trust noun, no source query.
+    //
+    // This test pins the contract end-to-end: clean dataset → subcommand
+    // exits 0, JSON report carries the same `verification` block shape
+    // a `summary.json[validation][manifest]` consumer already parses.
+    let bin = locate_rivet_bin();
+    let Some(bin) = bin else {
+        eprintln!("skipping rivet_validate_subcommand test: binary not built");
+        return;
+    };
+
+    let outer = tempfile::tempdir().unwrap();
+    let dest_dir = outer.path().join("dest");
+    std::fs::create_dir_all(&dest_dir).unwrap();
+
+    // Lay out a clean dataset using the public Destination + write_manifest
+    // API — same shape `rivet run` produces.
+    let dest_proxy = local_dest(&dest_dir);
+    let parts = vec![
+        part(1, 100, 4096, "xxh3:1111111111111111"),
+        part(2, 200, 8192, "xxh3:2222222222222222"),
+    ];
+    for p in &parts {
+        let body = vec![0u8; p.size_bytes as usize];
+        std::fs::write(dest_dir.join(&p.path), body).unwrap();
+    }
+    let m = build_manifest("rivet_validate_e2e", ManifestStatus::Success, parts.clone());
+    write_manifest(dest_proxy.as_writer(), &m).unwrap();
+
+    // Synthesize a minimal config that points the export's destination at
+    // the prepared dir.  `rivet validate` must not touch the source — we
+    // give it a clearly non-resolvable URL to prove that.
+    let cfg_path = outer.path().join("rivet.yaml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            "source:\n  type: postgres\n  url: postgresql://nope-on-purpose@127.0.0.1:1/never\n\
+             exports:\n  - name: public.orders\n    query: \"SELECT 1\"\n    mode: full\n    format: parquet\n    destination:\n      type: local\n      path: {}\n",
+            dest_dir.display()
+        ),
+    )
+    .unwrap();
+
+    let out_json = outer.path().join("verdict.json");
+    let status = std::process::Command::new(&bin)
+        .args([
+            "validate",
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--export",
+            "public.orders",
+            "--format",
+            "json",
+            "--output",
+            out_json.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run rivet validate");
+    assert!(status.success(), "exit code must be 0 on a clean dataset");
+
+    // Parse the report and confirm the `verification` shape matches
+    // `summary.json[validation][manifest]` (so consumers can share code).
+    let body = std::fs::read_to_string(&out_json).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let exports = json["exports"].as_array().unwrap();
+    assert_eq!(exports.len(), 1);
+    let v = &exports[0]["verification"];
+    assert_eq!(v["manifest_found"], true);
+    assert_eq!(v["legacy_run"], false);
+    assert_eq!(v["parts_verified"], 2);
+    assert_eq!(v["parts_failed"], 0);
+    assert_eq!(v["success_marker_consistent"], true);
+    assert_eq!(v["passed"], true);
+    assert!(v["failures"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn rivet_validate_subcommand_exits_nonzero_on_missing_part() {
+    // Same dataset as above, but with one part deleted post-write.  The
+    // standalone driver MUST exit non-zero so an Airflow / CI step can
+    // branch on the exit code without parsing JSON.
+    let bin = locate_rivet_bin();
+    let Some(bin) = bin else {
+        eprintln!("skipping rivet_validate_subcommand failure test: binary not built");
+        return;
+    };
+
+    let outer = tempfile::tempdir().unwrap();
+    let dest_dir = outer.path().join("dest");
+    std::fs::create_dir_all(&dest_dir).unwrap();
+    let dest_proxy = local_dest(&dest_dir);
+    let parts = vec![
+        part(1, 100, 4096, "xxh3:1111111111111111"),
+        part(2, 200, 8192, "xxh3:2222222222222222"),
+    ];
+    for p in &parts {
+        std::fs::write(dest_dir.join(&p.path), vec![0u8; p.size_bytes as usize]).unwrap();
+    }
+    let m = build_manifest(
+        "rivet_validate_fail",
+        ManifestStatus::Success,
+        parts.clone(),
+    );
+    write_manifest(dest_proxy.as_writer(), &m).unwrap();
+    std::fs::remove_file(dest_dir.join(&parts[1].path)).unwrap();
+
+    let cfg_path = outer.path().join("rivet.yaml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            "source:\n  type: postgres\n  url: postgresql://nope-on-purpose@127.0.0.1:1/never\n\
+             exports:\n  - name: public.orders\n    query: \"SELECT 1\"\n    mode: full\n    format: parquet\n    destination:\n      type: local\n      path: {}\n",
+            dest_dir.display()
+        ),
+    )
+    .unwrap();
+
+    let status = std::process::Command::new(&bin)
+        .args([
+            "validate",
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--export",
+            "public.orders",
+        ])
+        .status()
+        .expect("run rivet validate");
+    assert!(
+        !status.success(),
+        "exit code must be non-zero when M5 surfaces an explicit failure"
+    );
+}
+
+#[test]
+fn rivet_validate_subcommand_legacy_run_exits_zero() {
+    // ADR-0012 M6: a legacy prefix (no manifest) is *labeled*, not failed.
+    // The standalone driver must mirror that: exit code 0 (no explicit
+    // failures), JSON carries `legacy_run: true`, parts_verified = 0.
+    let bin = locate_rivet_bin();
+    let Some(bin) = bin else {
+        eprintln!("skipping rivet_validate_subcommand legacy test: binary not built");
+        return;
+    };
+
+    let outer = tempfile::tempdir().unwrap();
+    let dest_dir = outer.path().join("dest");
+    std::fs::create_dir_all(&dest_dir).unwrap();
+    // No manifest, no _SUCCESS — bare parquet only.
+    std::fs::write(dest_dir.join("legacy.parquet"), b"data").unwrap();
+
+    let cfg_path = outer.path().join("rivet.yaml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            "source:\n  type: postgres\n  url: postgresql://nope-on-purpose@127.0.0.1:1/never\n\
+             exports:\n  - name: public.orders\n    query: \"SELECT 1\"\n    mode: full\n    format: parquet\n    destination:\n      type: local\n      path: {}\n",
+            dest_dir.display()
+        ),
+    )
+    .unwrap();
+
+    let out_json = outer.path().join("legacy.json");
+    let status = std::process::Command::new(&bin)
+        .args([
+            "validate",
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--format",
+            "json",
+            "--output",
+            out_json.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run rivet validate");
+    assert!(
+        status.success(),
+        "legacy prefix is a label, not a failure — exit code must be 0"
+    );
+
+    let body = std::fs::read_to_string(&out_json).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let v = &json["exports"][0]["verification"];
+    assert_eq!(v["legacy_run"], true);
+    assert_eq!(v["manifest_found"], false);
+    assert_eq!(v["parts_verified"], 0);
+    assert!(v["failures"].as_array().unwrap().is_empty());
+}
+
+/// Locate the freshly-built `rivet` binary or return None when the test
+/// is being run outside `cargo test` (e.g. in IDE).  Mirrors the locator
+/// used by the ADR-0013 anchor test in §24.
+fn locate_rivet_bin() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_rivet") {
+        let path = std::path::PathBuf::from(p);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    if let Ok(d) = std::env::var("CARGO_TARGET_DIR") {
+        let path = std::path::PathBuf::from(format!("{d}/debug/rivet"));
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    let fallback = std::path::PathBuf::from("target/debug/rivet");
+    fallback.exists().then_some(fallback)
+}
