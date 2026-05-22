@@ -1,17 +1,20 @@
 use std::path::Path;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::IncrementalCursorMode;
 use super::resolve::{parse_file_size, resolve_env_vars, resolve_vars};
 use crate::tuning::{TuningConfig, TuningProfile};
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, JsonSchema, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct NotificationsConfig {
     pub slack: Option<SlackConfig>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, JsonSchema, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SlackConfig {
     pub webhook_url: Option<String>,
     pub webhook_url_env: Option<String>,
@@ -19,7 +22,7 @@ pub struct SlackConfig {
     pub on: Vec<NotifyEvent>,
 }
 
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, JsonSchema, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NotifyEvent {
     Failure,
@@ -34,7 +37,7 @@ pub enum NotifyEvent {
 ///   - name: orders
 ///     on_schema_drift: fail   # warn (default), continue, fail
 /// ```
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SchemaDriftPolicy {
     /// Log a warning and continue. The new schema fingerprint is stored. (Default.)
@@ -47,7 +50,8 @@ pub enum SchemaDriftPolicy {
     Fail,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SourceConfig {
     #[serde(rename = "type")]
     pub source_type: SourceType,
@@ -90,7 +94,7 @@ pub struct SourceConfig {
 /// Operational environment of the source database — drives the default tuning
 /// profile when none is explicitly set. Opt-in: existing configs without
 /// `environment:` continue to use `balanced` as today.
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum SourceEnvironment {
     /// Localhost / Docker compose / read-only container — no throttle by default
@@ -130,7 +134,8 @@ impl SourceEnvironment {
 ///     mode: verify-full
 ///     ca_file: /etc/ssl/certs/rds-ca-2019-root.pem
 /// ```
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     /// Enforcement level. See [`TlsMode`].
     #[serde(default)]
@@ -149,7 +154,7 @@ pub struct TlsConfig {
 }
 
 /// TLS enforcement mode, mirroring libpq's `sslmode` semantics where possible.
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum TlsMode {
     /// Plaintext. Use only inside trusted networks (loopback, cgroup-private).
@@ -326,7 +331,7 @@ impl SourceConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum SourceType {
     Postgres,
@@ -353,7 +358,8 @@ fn find_userinfo(raw: &str) -> Option<(usize, usize)> {
     Some((scheme + at, scheme))
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, JsonSchema, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ExportConfig {
     pub name: String,
     #[serde(default)]
@@ -603,7 +609,8 @@ fn validate_table_shortcut_ident(export_name: &str, raw: &str) -> crate::error::
     Ok(())
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct QualityConfig {
     pub row_count_min: Option<usize>,
     pub row_count_max: Option<usize>,
@@ -617,7 +624,8 @@ pub struct QualityConfig {
     pub unique_max_entries: Option<usize>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct MetaColumns {
     #[serde(default)]
     pub exported_at: bool,
@@ -641,7 +649,7 @@ fn default_time_column_type() -> TimeColumnType {
     TimeColumnType::Timestamp
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, JsonSchema, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExportMode {
     Full,
@@ -650,14 +658,14 @@ pub enum ExportMode {
     TimeWindow,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TimeColumnType {
     Timestamp,
     Unix,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum FormatType {
     Parquet,
@@ -676,7 +684,7 @@ impl FormatType {
     }
 }
 
-#[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CompressionType {
     #[default]
@@ -717,7 +725,7 @@ impl CompressionType {
 ///       # row_group_rows: 500000          # used with fixed_rows
 ///       # row_group_strategy: fixed_memory  # same math as auto, made explicit
 /// ```
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RowGroupStrategy {
     /// Compute rows-per-group from schema column types and `target_row_group_mb`.
@@ -732,7 +740,8 @@ pub enum RowGroupStrategy {
 }
 
 /// Parquet-specific tuning for row group sizing.
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ParquetConfig {
     /// How to determine the row group size. Default: `auto`.
     pub row_group_strategy: Option<RowGroupStrategy>,
@@ -788,7 +797,7 @@ impl ParquetConfig {
 /// ```
 ///
 /// When set, takes precedence over `compression` and `compression_level`.
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CompressionProfile {
     None,
@@ -818,7 +827,8 @@ impl CompressionProfile {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct DestinationConfig {
     #[serde(rename = "type")]
     pub destination_type: DestinationType,
@@ -862,7 +872,7 @@ pub struct DestinationConfig {
     pub allow_anonymous: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum DestinationType {
     #[default]

@@ -1,16 +1,26 @@
 pub mod cursor;
+mod lints;
 mod models;
 pub mod resolve;
+pub mod schema;
 
 pub use cursor::IncrementalCursorMode;
 pub use models::*;
 #[allow(unused_imports)]
 pub(crate) use resolve::resolve_env_vars;
 pub use resolve::{parse_file_size, resolve_vars};
+pub use schema::generate_config_schema_pretty;
 
+use schemars::JsonSchema;
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize, Clone)]
+/// Top-level Rivet configuration root.
+///
+/// Operators write this struct as YAML (typically `rivet.yaml`).  The
+/// `JsonSchema` derive is the source of truth for the `schemas/rivet.schema.json`
+/// artifact and the `rivet schema config` command's output (v0.7.3 P0).
+#[derive(Debug, Deserialize, JsonSchema, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub source: SourceConfig,
     pub exports: Vec<ExportConfig>,
@@ -38,7 +48,7 @@ impl Config {
 
     pub fn from_yaml(yaml: &str) -> crate::error::Result<Self> {
         Self::check_misplaced_tuning_fields(yaml)?;
-        let config: Config = serde_yaml_ng::from_str(yaml)?;
+        let config: Config = serde_yaml_ng::from_str(yaml).map_err(lints::enhance_parse_error)?;
         config.validate()?;
         Ok(config)
     }

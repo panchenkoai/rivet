@@ -1,5 +1,88 @@
 # Changelog
 
+## 0.7.3 (unreleased) — Developer Experience Polish
+
+> Focus: make Rivet easier to configure, inspect, and try correctly.
+> No new extraction modes — every change reduces first-touch friction
+> for new operators.
+
+### Highlights so far
+
+- **JSON Schema for `rivet.yaml`** — `schemas/rivet.schema.json` (and the
+  stable `schemas/latest/` mirror) ships in-tree so editors with the YAML
+  Language Server (VS Code, Neovim, Helix) autocomplete fields, flag
+  typos, and surface required keys.  Reference it from a config via:
+
+      # yaml-language-server: $schema=https://raw.githubusercontent.com/panchenkoai/rivet/main/schemas/latest/rivet.schema.json
+
+- **`rivet schema config`** — emits the JSON Schema for the running
+  binary's Config types to stdout.  Pipe to a file or check it in to
+  pin a per-version schema in your own repo.
+
+### Changes
+
+- **`feat(config)`** — `#[derive(JsonSchema)]` propagated across the
+  full `Config` type tree (`SourceConfig`, `ExportConfig`,
+  `DestinationConfig`, `TuningConfig`, `TlsConfig`, every nested enum).
+  The schema embeds the binary's `CARGO_PKG_VERSION` in its `title` so
+  drift is detectable by inspection.
+- **`feat(cli)`** — new `rivet schema config` subcommand.  Output
+  format: pretty-printed JSON Schema (draft 2020-12), trailing newline.
+- **`docs(examples)`** — `examples/pg_full_local.yaml` now carries a
+  `# yaml-language-server: $schema=…` header so editor validation is
+  on by default for any operator who runs that example.
+- **`test`** — `tests/schema_drift.rs` pins the in-tree schema artifact
+  to the runtime output; CI fails when a Config change forgets to
+  regenerate the schema.  Three guard checks: byte-equality vs the
+  generated schema, byte-equality between primary and `latest/`
+  mirrors, and `CARGO_PKG_VERSION` presence in the title.
+- **`feat(config)`** — strict-mode YAML parsing (P1.2).  Eleven
+  Config-tree structs now carry `#[serde(deny_unknown_fields)]`:
+  `Config`, `SourceConfig`, `TlsConfig`, `ExportConfig`,
+  `DestinationConfig`, `TuningConfig`, `QualityConfig`, `MetaColumns`,
+  `ParquetConfig`, `NotificationsConfig`, `SlackConfig`.  Previously
+  silent-drop typos (`acccess_key_env`, `database_name`, `profil`,
+  `expoorts`) now fail fast at parse time.  The schema artifact
+  reflects this: 11 new `"additionalProperties": false` declarations.
+- **`feat(config)`** — did-you-mean suggestions on parse errors
+  (P1.2).  New `crate::config::lints` module post-processes serde's
+  `unknown field` error and appends a one-line `Did you mean \`X\`?`
+  hint when the typo is lexically close to a real field name
+  (Levenshtein ≤ longer/3 OR substring relation).  The
+  `closest_match` heuristic prefers prefix/suffix matches (so
+  `database_name` correctly suggests `database`) but stays
+  conservative — no suggestion is shown when nothing is close enough.
+- **`docs(examples)`** — new `examples/README.md` clarifies that the
+  YAML files are CLI sample configs, not `cargo run --example`
+  targets, lists each file's source/mode/destination at a glance,
+  and points operators to `demo/` for turn-key Docker setups
+  (roadmap P1.1; physical directory move deferred to preserve URLs
+  already linked from blog posts and external docs).
+- **`test`** — `tests/config_parse_errors.rs` pins the
+  unknown-field + did-you-mean contract across every level operators
+  can mistype (top-level, `source:`, `exports[]`, `destination:`,
+  `tuning:`), plus the absence of a suggestion when nothing is
+  close enough, plus the preservation of the existing dedicated
+  misplaced-tuning hint.
+- **`ci`** — bump `actions/checkout`, `actions/upload-artifact`, and
+  `actions/download-artifact` from v4 → v5 for Node 24 compatibility
+  (the Node 20 runtime is on the GitHub deprecation path).  No
+  behavior change for the workflow shape itself.
+- **`ci`** — `Swatinem/rust-cache@v2` now also caches the `fmt` job's
+  toolchain extraction (with `cache-targets: false` since `cargo fmt`
+  never touches `target/`).  Small win — one fewer cold-start cost
+  on a PR push.
+- **`ci(release)`** — Docker image now built on **native amd64 + arm64
+  runners** instead of QEMU-emulated arm64.  The `docker-build`
+  matrix pushes per-arch digests (`name=…,push-by-digest=true`); a
+  follow-on `docker-manifest` job downloads both digests and stitches
+  them into the final multi-arch tag via
+  `docker buildx imagetools create`.  Expected arm64 build wall-time
+  drops from ~25 min (QEMU) to ~6 min (native).  Pattern follows the
+  upstream
+  [`docker/build-push-action`](https://github.com/docker/build-push-action)
+  "Distribute build across multiple runners" recipe.
+
 ## 0.7.2 (unreleased) — Cloud Landing Polish
 
 > Focus: make cloud outputs historically verifiable and safer to operate.

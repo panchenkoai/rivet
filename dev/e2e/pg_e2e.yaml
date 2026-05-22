@@ -109,14 +109,17 @@ exports:
       path: ./dev/e2e/output
 
   # --- Meta columns ---
+  # `MetaColumns` only ships `exported_at` and `row_hash` today.
+  # `run_id` and `source_file` used to be silently dropped (pre-0.7.3)
+  # — `deny_unknown_fields` now refuses them.  When/if they're added
+  # to the struct, re-enable here.
   - name: pg_users_meta
     query: "SELECT id, name, email FROM users LIMIT 100"
     mode: full
     format: parquet
     meta_columns:
-      run_id: true
       exported_at: true
-      source_file: true
+      row_hash: true
     destination:
       type: local
       path: ./dev/e2e/output

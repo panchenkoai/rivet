@@ -4,10 +4,11 @@
 //! plus [`IncrementalCursorMode::Coalesce`] uses `COALESCE(primary, fallback)` for the
 //! incremental predicate and stored cursor value (single scalar string in state).
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// How the primary (and optional fallback) column(s) participate in incremental extraction.
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum IncrementalCursorMode {
     /// `WHERE primary > last ORDER BY primary` — optional fallback column is ignored for execution.

@@ -8,7 +8,9 @@
 
 use clap::CommandFactory;
 
-use super::args::{Cli, Commands, PlanFormat, ReconcileFormat, StateAction, ValidateFormat};
+use super::args::{
+    Cli, Commands, PlanFormat, ReconcileFormat, SchemaKind, StateAction, ValidateFormat,
+};
 use super::params::{parse_params, resolve_init_source};
 use super::validate::validate_cli;
 use crate::error::Result;
@@ -128,7 +130,21 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             last,
             run_id,
         } => pipeline::show_journal(&config, &export, last, run_id.as_deref()),
+        Commands::Schema { what } => dispatch_schema(what),
         Commands::State { action } => dispatch_state(action),
+    }
+}
+
+fn dispatch_schema(what: SchemaKind) -> Result<()> {
+    match what {
+        SchemaKind::Config => {
+            let schema = crate::config::generate_config_schema_pretty()?;
+            // `print!` (not `println!`) — the schema string already
+            // terminates with a newline; doubling it would diff
+            // against the in-tree artifact.
+            print!("{schema}");
+            Ok(())
+        }
     }
 }
 

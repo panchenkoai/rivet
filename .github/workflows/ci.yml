@@ -20,18 +20,27 @@ jobs:
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
           components: rustfmt
+      # `cargo fmt --check` only needs the source tree, but we share a
+      # cache key with the other jobs so a cold runner doesn't pay the
+      # toolchain-extract cost twice on the same PR.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fmt
+          # `cargo fmt` doesn't touch `target/`; skip caching it to keep
+          # the cache restore cheap.
+          cache-targets: "false"
       - run: cargo fmt --all -- --check
 
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
@@ -43,7 +52,7 @@ jobs:
     name: Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
@@ -54,7 +63,7 @@ jobs:
     name: Invariant tests (semantic gate)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
@@ -65,7 +74,7 @@ jobs:
     name: Recovery tests (semantic gate)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
@@ -76,7 +85,7 @@ jobs:
     name: Compatibility matrix tests (semantic gate)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
@@ -87,7 +96,7 @@ jobs:
     name: Stability tests — Phase 1 (semantic gate)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
@@ -103,7 +112,7 @@ jobs:
     name: Type-golden tests (semantic gate)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
@@ -130,7 +139,7 @@ jobs:
     name: Release build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
@@ -141,7 +150,7 @@ jobs:
     name: E2E matrix
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
@@ -208,7 +217,7 @@ jobs:
       checks: write
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ github.token }}
