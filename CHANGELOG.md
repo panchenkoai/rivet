@@ -64,6 +64,24 @@
   `tuning:`), plus the absence of a suggestion when nothing is
   close enough, plus the preservation of the existing dedicated
   misplaced-tuning hint.
+- **`ci`** — bump `actions/checkout`, `actions/upload-artifact`, and
+  `actions/download-artifact` from v4 → v5 for Node 24 compatibility
+  (the Node 20 runtime is on the GitHub deprecation path).  No
+  behavior change for the workflow shape itself.
+- **`ci`** — `Swatinem/rust-cache@v2` now also caches the `fmt` job's
+  toolchain extraction (with `cache-targets: false` since `cargo fmt`
+  never touches `target/`).  Small win — one fewer cold-start cost
+  on a PR push.
+- **`ci(release)`** — Docker image now built on **native amd64 + arm64
+  runners** instead of QEMU-emulated arm64.  The `docker-build`
+  matrix pushes per-arch digests (`name=…,push-by-digest=true`); a
+  follow-on `docker-manifest` job downloads both digests and stitches
+  them into the final multi-arch tag via
+  `docker buildx imagetools create`.  Expected arm64 build wall-time
+  drops from ~25 min (QEMU) to ~6 min (native).  Pattern follows the
+  upstream
+  [`docker/build-push-action`](https://github.com/docker/build-push-action)
+  "Distribute build across multiple runners" recipe.
 
 ## 0.7.2 (unreleased) — Cloud Landing Polish
 
