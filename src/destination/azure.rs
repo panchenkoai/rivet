@@ -71,14 +71,30 @@ impl AzureDestination {
             })?;
             builder = builder.account_name(account_name);
 
-            if let Some(env_name) = &config.account_key_env {
-                let key = read_credential_env(env_name, "account key")?;
-                builder = builder.account_key(key.as_str());
-            } else {
-                anyhow::bail!(
-                    "Azure destination requires 'account_key_env' (or 'allow_anonymous: true' for Azurite). \
-                     SAS-token / service-principal auth paths planned for 0.7.2 — see docs/cloud-auth.md."
-                );
+            // v0.7.2 P0.4: account_key_env XOR sas_token_env.  Both being
+            // set means the operator copy-pasted two auth blocks and we
+            // can't safely pick one — fail loud.
+            match (&config.account_key_env, &config.sas_token_env) {
+                (Some(_), Some(_)) => anyhow::bail!(
+                    "Azure destination: 'account_key_env' and 'sas_token_env' are mutually exclusive — pick one auth mode"
+                ),
+                (Some(env_name), None) => {
+                    let key = read_credential_env(env_name, "account key")?;
+                    builder = builder.account_key(key.as_str());
+                }
+                (None, Some(env_name)) => {
+                    let raw = read_credential_env(env_name, "SAS token")?;
+                    // Operators copy the full `?sv=…&sig=…` URL fragment from
+                    // the portal — trim the leading `?` so opendal's
+                    // signer sees the raw token body.  Defensive: opendal
+                    // currently tolerates the `?`, but a future version
+                    // may not.
+                    let token = raw.trim_start_matches('?');
+                    builder = builder.sas_token(token);
+                }
+                (None, None) => anyhow::bail!(
+                    "Azure destination requires 'account_key_env' or 'sas_token_env' (or 'allow_anonymous: true' for Azurite)"
+                ),
             }
         }
 
@@ -400,5 +416,116 @@ account_key_env: AZURE_STORAGE_KEY
         assert_eq!(cfg.bucket.as_deref(), Some("my-container"));
         assert_eq!(cfg.account_name.as_deref(), Some("mystorageacct"));
         assert_eq!(cfg.account_key_env.as_deref(), Some("AZURE_STORAGE_KEY"));
+    }
+
+    // ── v0.7.2 P0.4: SAS-token auth ───────────────────────────────────────
+
+    #[test]
+    fn azure_destination_sas_token_env_satisfies_auth() {
+        // With `sas_token_env` set (and `account_key_env` unset), the
+        // build path must reach *past* the credential validation — i.e.
+        // no "account_key_env required" error.
+        let cfg = DestinationConfig {
+            destination_type: DestinationType::Azure,
+            bucket: Some("data".into()),
+            account_name: Some("mystorageacct".into()),
+            sas_token_env: Some("RIVET_TEST_AZURE_SAS_OK".into()),
+            ..Default::default()
+        };
+        // SAFETY: test-only; binary is single-threaded in this test context.
+        unsafe { std::env::set_var("RIVET_TEST_AZURE_SAS_OK", "sv=2021-08-06&sig=fake") };
+        let result = AzureDestination::new(&cfg);
+        if let Err(e) = result {
+            let msg = format!("{e:#}");
+            assert!(
+                !msg.contains("account_key_env"),
+                "SAS-token auth must bypass account_key_env requirement; got: {msg}"
+            );
+        }
+        unsafe { std::env::remove_var("RIVET_TEST_AZURE_SAS_OK") };
+    }
+
+    #[test]
+    fn azure_destination_rejects_account_key_and_sas_token_together() {
+        // Both auth modes set → can't safely pick one.  Fail with an
+        // actionable message that names both fields.
+        let cfg = DestinationConfig {
+            destination_type: DestinationType::Azure,
+            bucket: Some("data".into()),
+            account_name: Some("acct".into()),
+            account_key_env: Some("RIVET_TEST_AZURE_BOTH_KEY".into()),
+            sas_token_env: Some("RIVET_TEST_AZURE_BOTH_SAS".into()),
+            ..Default::default()
+        };
+        unsafe { std::env::set_var("RIVET_TEST_AZURE_BOTH_KEY", "fake") };
+        unsafe { std::env::set_var("RIVET_TEST_AZURE_BOTH_SAS", "fake") };
+        let msg = expect_err(&cfg);
+        assert!(
+            msg.contains("account_key_env") && msg.contains("sas_token_env"),
+            "error must name both fields: {msg}"
+        );
+        assert!(
+            msg.contains("mutually exclusive"),
+            "error must say mutually exclusive: {msg}"
+        );
+        unsafe { std::env::remove_var("RIVET_TEST_AZURE_BOTH_KEY") };
+        unsafe { std::env::remove_var("RIVET_TEST_AZURE_BOTH_SAS") };
+    }
+
+    #[test]
+    fn azure_destination_missing_both_account_key_and_sas_token_errors() {
+        // Updated error message must name BOTH auth modes so the
+        // operator knows the alternatives.
+        let cfg = DestinationConfig {
+            destination_type: DestinationType::Azure,
+            bucket: Some("data".into()),
+            account_name: Some("acct".into()),
+            ..Default::default()
+        };
+        let msg = expect_err(&cfg);
+        assert!(
+            msg.contains("account_key_env") && msg.contains("sas_token_env"),
+            "error must name both auth modes: {msg}"
+        );
+    }
+
+    #[test]
+    fn azure_destination_sas_token_env_missing_var_errors_with_label() {
+        let cfg = DestinationConfig {
+            destination_type: DestinationType::Azure,
+            bucket: Some("data".into()),
+            account_name: Some("acct".into()),
+            sas_token_env: Some("RIVET_TEST_AZURE_SAS_UNSET".into()),
+            ..Default::default()
+        };
+        unsafe { std::env::remove_var("RIVET_TEST_AZURE_SAS_UNSET") };
+        let msg = expect_err(&cfg);
+        assert!(
+            msg.contains("RIVET_TEST_AZURE_SAS_UNSET"),
+            "missing env var name in error: {msg}"
+        );
+        assert!(
+            msg.contains("SAS token"),
+            "credential label must mention SAS token: {msg}"
+        );
+    }
+
+    #[test]
+    fn azure_destination_sas_token_config_parses_from_yaml() {
+        let yaml = r#"
+type: azure
+bucket: my-container
+account_name: mystorageacct
+sas_token_env: AZURE_STORAGE_SAS_TOKEN
+"#;
+        let cfg: DestinationConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(cfg.destination_type, DestinationType::Azure);
+        assert_eq!(cfg.bucket.as_deref(), Some("my-container"));
+        assert_eq!(cfg.account_name.as_deref(), Some("mystorageacct"));
+        assert_eq!(
+            cfg.sas_token_env.as_deref(),
+            Some("AZURE_STORAGE_SAS_TOKEN")
+        );
+        assert!(cfg.account_key_env.is_none());
     }
 }

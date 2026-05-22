@@ -53,6 +53,30 @@
   idempotent, doesn't damage non-URL prose, walks `anyhow::Context`
   chains, and that `summary.json` / `summary.md` written via the
   public run-report writer never carry the URL-embedded password.
+- **`feat(destination/azure)`** — Azure SAS-token auth (P0.4).  New
+  `sas_token_env` field on the destination config alongside the
+  existing `account_key_env`.  Mutually exclusive with `account_key_env`
+  — both being set is refused with an actionable error.  Leading `?` on
+  the operator-supplied token is trimmed transparently so either the
+  full `?sv=…&sig=…` query string or the raw token body works.  The
+  token value receives the same `Zeroizing<String>` SecOps treatment
+  as `account_key_env`.
+
+  Example:
+
+  ```yaml
+  destination:
+    type: azure
+    bucket: my-container
+    account_name: mystorageacct
+    sas_token_env: AZURE_STORAGE_SAS_TOKEN
+  ```
+- **`docs(cloud-destinations)`** — new `docs/cloud-destinations.md`
+  consolidates the local / S3 / GCS / Azure auth-and-output contract
+  in one place: shared output contract (`manifest.json` + `_SUCCESS`),
+  per-backend auth matrix (key/SAS/anonymous for Azure;
+  env/profile/session-token for S3; ADC/service-account for GCS),
+  resume / validate / quarantine behavior, and known limitations.
 
 ## 0.7.1 (2026-05-21)
 
