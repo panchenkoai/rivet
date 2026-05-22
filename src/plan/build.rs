@@ -352,32 +352,18 @@ fn parse_column_overrides(
 
 /// Substitute placeholders in `destination.path` and `destination.prefix`.
 ///
-/// Supported placeholders:
-/// - `{date}`   → UTC date as `YYYY-MM-DD`
-/// - `{export}` → export name from config
-/// - `{table}`  → alias for `{export}`
-///
-/// `pub(crate)` so `validate_cmd` and `doctor` can apply the same expansion
-/// `run` does — otherwise validate/doctor would look at the literal
-/// `runs/{date}/{export}/` path and miss the actual data prefix.
+/// Thin wrapper around [`crate::destination::placeholder::expand_destination`]
+/// anchored at today's UTC date.  Kept here so existing call sites
+/// (`run`, the in-process plan builder) keep their stable signature; callers
+/// that need to re-target an earlier run's prefix (e.g. `validate --date`,
+/// `validate --run-id`) should construct a `PlaceholderContext` directly
+/// and call [`crate::destination::placeholder::expand_destination`].
 pub(crate) fn expand_destination_templates(
-    mut dest: crate::config::DestinationConfig,
+    dest: crate::config::DestinationConfig,
     export_name: &str,
 ) -> crate::config::DestinationConfig {
-    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    dest.path = dest
-        .path
-        .map(|s| apply_destination_placeholders(s, &date, export_name));
-    dest.prefix = dest
-        .prefix
-        .map(|s| apply_destination_placeholders(s, &date, export_name));
-    dest
-}
-
-fn apply_destination_placeholders(s: String, date: &str, export_name: &str) -> String {
-    s.replace("{date}", date)
-        .replace("{export}", export_name)
-        .replace("{table}", export_name)
+    let ctx = crate::destination::placeholder::PlaceholderContext::for_today(export_name);
+    crate::destination::placeholder::expand_destination(dest, &ctx)
 }
 
 #[cfg(test)]

@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.7.2 (unreleased) — Cloud Landing Polish
+
+> Focus: make cloud outputs historically verifiable and safer to operate.
+> No new extraction modes, no new database sources — every change tightens
+> the existing cloud-output contract.
+
+### Highlights so far
+
+- **`rivet validate --date / --run-id / --prefix`** — re-verify a prior run
+  without re-running the export.  Lifts the implicit "today only" anchor
+  that previously made `rivet validate` blind to yesterday's `{date}` prefix.
+- **Shared placeholder resolver** (`crate::destination::placeholder`) — one
+  module substitutes `{date}` / `{export}` / `{table}` / `{run_id}` for
+  every command that resolves a destination prefix (`run`, `doctor`,
+  `validate`, future `reconcile` / `repair`).  New `{run_id}` token; unknown
+  `{token}`s are preserved verbatim so a typo fails loudly at open time.
+
+### Changes
+
+- **`feat(validate)`** — `rivet validate` accepts:
+  - `--date YYYY-MM-DD`: anchor `{date}` substitution at a prior day.
+  - `--run-id <RID>`: substitute `{run_id}` in destination templates.
+    Composes with `--date`.
+  - `--prefix <STRING>`: bypass placeholder resolution and verify exactly
+    this prefix.  Rejected when scope spans multiple exports
+    (`--prefix requires --export <name>`).
+  - Resolved physical prefix is surfaced in both pretty and JSON output
+    (`resolved_prefix`) so operators can confirm at a glance which bytes
+    were checked.  Hard-failure error messages include it too.
+- **`refactor(destination)`** — new `destination::placeholder` module with
+  `PlaceholderContext::{for_today, for_date, with_run_id}` and
+  `expand_destination(dest, &ctx)`.  Old `plan::build::expand_destination_templates`
+  becomes a thin wrapper that delegates to the new module.
+- **`test`** — `tests/validate_historical.rs` regression-tests the anchor
+  scenario: "run happened yesterday, validate runs today, `--date` still
+  hits the correct physical prefix".
+
 ## 0.7.1 (2026-05-21)
 
 ### Highlights

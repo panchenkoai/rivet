@@ -15,6 +15,9 @@
 //! - "Did someone delete a part by mistake?" — operator triage on a
 //!   suspected-broken dataset.
 //! - "Does this legacy prefix have a manifest yet?" — fast check for M6.
+//! - "Was yesterday's run complete?" — `--date YYYY-MM-DD` or `--run-id`
+//!   re-targets a prior day's prefix without re-running the export
+//!   (v0.7.2 historical-validation flags).
 //!
 //! Out of scope:
 //! - Source-side reconciliation (`COUNT(*)`).  That's `--reconcile` /
@@ -27,7 +30,10 @@
 
 use std::path::Path;
 
+use chrono::NaiveDate;
+
 use crate::config::Config;
+use crate::destination::placeholder::PlaceholderContext;
 use crate::error::Result;
 use crate::pipeline::ManifestVerification;
 use crate::pipeline::validate_manifest::verify_at_destination;
@@ -38,6 +44,35 @@ pub enum ValidateOutputFormat {
     Pretty,
     /// JSON to the given path or stdout if `None`.
     Json(Option<String>),
+}
+
+/// Re-targeting overrides for `rivet validate`.
+///
+/// Default (`ValidateTarget::default()`) reproduces the v0.7.1 behaviour:
+/// resolve `{date}` against today's UTC date, with no `{run_id}`
+/// substitution, and use the config's destination prefix/path unchanged.
+#[derive(Debug, Default, Clone)]
+pub struct ValidateTarget {
+    /// `--date YYYY-MM-DD` — override the date used for `{date}`.
+    pub date: Option<NaiveDate>,
+    /// `--run-id RID` — substitute `{run_id}` in the destination template.
+    pub run_id: Option<String>,
+    /// `--prefix STRING` — bypass placeholder resolution entirely and
+    /// verify exactly this prefix.  Replaces both `prefix` and `path`.
+    pub prefix_override: Option<String>,
+}
+
+impl ValidateTarget {
+    fn placeholder_context(&self, export_name: &str) -> PlaceholderContext {
+        let mut ctx = match self.date {
+            Some(d) => PlaceholderContext::for_date(d, export_name),
+            None => PlaceholderContext::for_today(export_name),
+        };
+        if let Some(rid) = &self.run_id {
+            ctx = ctx.with_run_id(rid.clone());
+        }
+        ctx
+    }
 }
 
 /// Driver for `rivet validate <export>` (or every export when
@@ -52,6 +87,7 @@ pub fn run_validate_command(
     config_path: &str,
     export_name: Option<&str>,
     format: ValidateOutputFormat,
+    target: ValidateTarget,
 ) -> Result<()> {
     let config = Config::load_with_params(config_path, None)?;
 
@@ -67,26 +103,41 @@ pub fn run_validate_command(
         anyhow::bail!("no exports defined in config — nothing to validate");
     }
 
-    let mut all_results: Vec<(String, ManifestVerification)> = Vec::with_capacity(exports.len());
+    // `--prefix` only makes sense for a single export; with multiple
+    // exports it would silently re-point all of them at the same physical
+    // bytes.  Catch this at the boundary so we never head-check the wrong
+    // dataset under operator triage pressure.
+    if target.prefix_override.is_some() && exports.len() > 1 {
+        anyhow::bail!(
+            "--prefix requires --export <name>: cannot apply one override to {} exports",
+            exports.len()
+        );
+    }
+
+    let mut all_results: Vec<ExportVerdict> = Vec::with_capacity(exports.len());
     let mut hard_failures: Vec<String> = Vec::new();
 
     for export in &exports {
-        // Apply the same `{date}`/`{export}`/`{table}` substitution `run`
-        // applies via the plan builder, so validate looks at the actual
-        // data prefix instead of a literal `runs/{date}/{export}/` path.
-        // Today's UTC date is used — if validate is invoked the day after
-        // a run, the operator can either inline the absolute prefix in
-        // config or wait for the planned `--run-id` / `--date` flag.
-        let expanded_dest = crate::plan::build::expand_destination_templates(
-            export.destination.clone(),
-            &export.name,
-        );
+        // Apply the operator-supplied re-targeting if any, else fall back
+        // to today's UTC date (same shape `rivet run` resolves at write
+        // time).
+        let ctx = target.placeholder_context(&export.name);
+        let mut expanded_dest =
+            crate::destination::placeholder::expand_destination(export.destination.clone(), &ctx);
+        if let Some(p) = &target.prefix_override {
+            // Bypass placeholder resolution: trust the operator's literal
+            // prefix.  Replace both `path` (local) and `prefix` (cloud)
+            // so whichever the backend reads picks up the override.
+            expanded_dest.path = Some(p.clone());
+            expanded_dest.prefix = Some(p.clone());
+        }
+        let resolved_prefix = resolved_prefix_for_display(&expanded_dest);
         let dest = match crate::destination::create_destination(&expanded_dest) {
             Ok(d) => d,
             Err(e) => {
                 let msg = format!(
-                    "export '{}': could not open destination: {:#}",
-                    export.name, e
+                    "export '{}' (prefix: {}): could not open destination: {:#}",
+                    export.name, resolved_prefix, e
                 );
                 hard_failures.push(msg);
                 continue;
@@ -103,12 +154,16 @@ pub fn run_validate_command(
         }
         match verify_at_destination(&*dest, "") {
             Ok(v) => {
-                all_results.push((export.name.clone(), v));
+                all_results.push(ExportVerdict {
+                    name: export.name.clone(),
+                    resolved_prefix,
+                    verification: v,
+                });
             }
             Err(e) => {
                 hard_failures.push(format!(
-                    "export '{}': verify_at_destination failed: {:#}",
-                    export.name, e
+                    "export '{}' (prefix: {}): verify_at_destination failed: {:#}",
+                    export.name, resolved_prefix, e
                 ));
             }
         }
@@ -136,27 +191,51 @@ pub fn run_validate_command(
     // cannot certify", not "verifier found a problem".
     let any_failed = all_results
         .iter()
-        .any(|(_, v)| v.manifest_found && !v.passed);
+        .any(|r| r.verification.manifest_found && !r.verification.passed);
     if !hard_failures.is_empty() || any_failed {
         anyhow::bail!(
             "rivet validate: {} export(s) failed verification",
             hard_failures.len()
                 + all_results
                     .iter()
-                    .filter(|(_, v)| v.manifest_found && !v.passed)
+                    .filter(|r| r.verification.manifest_found && !r.verification.passed)
                     .count()
         );
     }
     Ok(())
 }
 
-fn render_pretty(results: &[(String, ManifestVerification)], hard_failures: &[String]) {
+/// Per-export verdict plus the resolved physical prefix the verifier
+/// looked at — surfaced in both pretty and JSON output so an operator can
+/// confirm at a glance which bytes were checked.
+struct ExportVerdict {
+    name: String,
+    resolved_prefix: String,
+    verification: ManifestVerification,
+}
+
+/// Render the destination's resolved prefix for human/JSON output.
+///
+/// Cloud backends carry the data location in `prefix`; the local backend
+/// uses `path`.  Falling back to `<unresolved>` should never fire under
+/// normal config (clap + Config::load enforce one of the two) but keeps
+/// `validate` from panicking if a future config shape lands here.
+fn resolved_prefix_for_display(dest: &crate::config::DestinationConfig) -> String {
+    dest.prefix
+        .clone()
+        .or_else(|| dest.path.clone())
+        .unwrap_or_else(|| "<unresolved>".into())
+}
+
+fn render_pretty(results: &[ExportVerdict], hard_failures: &[String]) {
     use std::io::Write;
     let stdout = std::io::stdout();
     let mut h = stdout.lock();
 
-    for (name, v) in results {
-        let _ = writeln!(h, "── {} ──", name);
+    for r in results {
+        let _ = writeln!(h, "── {} ──", r.name);
+        let _ = writeln!(h, "  prefix:    {}", r.resolved_prefix);
+        let v = &r.verification;
         if v.legacy_run {
             let _ = writeln!(
                 h,
@@ -221,17 +300,18 @@ fn render_pretty(results: &[(String, ManifestVerification)], hard_failures: &[St
 }
 
 fn render_json(
-    results: &[(String, ManifestVerification)],
+    results: &[ExportVerdict],
     hard_failures: &[String],
     out_path: Option<String>,
 ) -> Result<()> {
     let payload = serde_json::json!({
         "exports": results
             .iter()
-            .map(|(name, v)| {
+            .map(|r| {
                 serde_json::json!({
-                    "export_name": name,
-                    "verification": v,
+                    "export_name": r.name,
+                    "resolved_prefix": r.resolved_prefix,
+                    "verification": r.verification,
                 })
             })
             .collect::<Vec<_>>(),
@@ -248,4 +328,73 @@ fn render_json(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── ValidateTarget::placeholder_context ────────────────────────────────
+
+    #[test]
+    fn target_default_uses_today() {
+        let target = ValidateTarget::default();
+        let ctx = target.placeholder_context("orders");
+        assert_eq!(ctx.date, chrono::Utc::now().date_naive());
+        assert_eq!(ctx.export_name, "orders");
+        assert!(ctx.run_id.is_none());
+    }
+
+    #[test]
+    fn target_with_date_overrides_today() {
+        let target = ValidateTarget {
+            date: Some(NaiveDate::from_ymd_opt(2026, 5, 21).unwrap()),
+            ..Default::default()
+        };
+        let ctx = target.placeholder_context("orders");
+        assert_eq!(ctx.date, NaiveDate::from_ymd_opt(2026, 5, 21).unwrap());
+        assert!(ctx.run_id.is_none());
+    }
+
+    #[test]
+    fn target_composes_date_and_run_id() {
+        // Regression for the "run yesterday, validate today" scenario:
+        // operator passes both --date and --run-id; the resolver must see
+        // both.
+        let target = ValidateTarget {
+            date: Some(NaiveDate::from_ymd_opt(2026, 5, 21).unwrap()),
+            run_id: Some("r-abc123".into()),
+            prefix_override: None,
+        };
+        let ctx = target.placeholder_context("orders");
+        assert_eq!(ctx.date, NaiveDate::from_ymd_opt(2026, 5, 21).unwrap());
+        assert_eq!(ctx.run_id.as_deref(), Some("r-abc123"));
+    }
+
+    // ── resolved_prefix_for_display ────────────────────────────────────────
+
+    #[test]
+    fn resolved_prefix_prefers_cloud_prefix_over_path() {
+        let dest = crate::config::DestinationConfig {
+            destination_type: crate::config::DestinationType::S3,
+            prefix: Some("exports/2026-05-21/orders/".into()),
+            path: Some("/scratch".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolved_prefix_for_display(&dest),
+            "exports/2026-05-21/orders/",
+        );
+    }
+
+    #[test]
+    fn resolved_prefix_falls_back_to_path_when_prefix_missing() {
+        let dest = crate::config::DestinationConfig {
+            destination_type: crate::config::DestinationType::Local,
+            prefix: None,
+            path: Some("/data/out".into()),
+            ..Default::default()
+        };
+        assert_eq!(resolved_prefix_for_display(&dest), "/data/out");
+    }
 }

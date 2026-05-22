@@ -212,6 +212,10 @@ pub enum Commands {
     /// manifest.json + _SUCCESS at the destination, head-checks every committed
     /// part for presence and recorded size_bytes.  Source is not queried (use
     /// `rivet reconcile` for that).  See ADR-0013 §"Subcommand carveouts".
+    ///
+    /// By default `validate` resolves the destination prefix the same way
+    /// `run` does — `{date}` becomes today's UTC date.  Use `--date`,
+    /// `--run-id`, or `--prefix` to point at a prior run instead of today.
     Validate {
         /// Path to YAML config file
         #[arg(short, long)]
@@ -225,6 +229,28 @@ pub enum Commands {
         /// Write JSON report to this file (only with `--format json`)
         #[arg(short, long)]
         output: Option<String>,
+        /// Resolve `{date}` to this ISO-8601 day (e.g. `2026-05-21`) instead of today.
+        ///
+        /// Use when a run that landed on a prior day's prefix needs to be
+        /// re-verified — without this flag `validate` looks at today's
+        /// resolved prefix and reports "no manifest" for yesterday's data.
+        #[arg(long, value_name = "YYYY-MM-DD", conflicts_with = "prefix")]
+        date: Option<String>,
+        /// Substitute `{run_id}` in the destination template with this value.
+        ///
+        /// Composes with `--date`.  Has no effect if the template does not
+        /// contain `{run_id}`.
+        #[arg(long, value_name = "RUN_ID", conflicts_with = "prefix")]
+        run_id: Option<String>,
+        /// Skip placeholder resolution entirely and verify exactly this prefix.
+        ///
+        /// Use when the resolved template no longer matches the physical
+        /// layout (e.g. data was relocated, or the template changed since
+        /// the run landed).  The destination *type* still comes from
+        /// config (`local`, `s3`, `gcs`, `azure`); only the resolved
+        /// `path`/`prefix` string is overridden.
+        #[arg(long, value_name = "PREFIX")]
+        prefix: Option<String>,
     },
     /// Partition/window reconciliation: re-count per-partition on source and report mismatches (Epic F).
     /// Requires a chunked export previously run with `chunk_checkpoint: true`.

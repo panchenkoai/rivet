@@ -93,7 +93,10 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             export,
             format,
             output,
-        } => dispatch_validate(config, export, format, output),
+            date,
+            run_id,
+            prefix,
+        } => dispatch_validate(config, export, format, output, date, run_id, prefix),
         Commands::Reconcile {
             config,
             export,
@@ -243,12 +246,30 @@ fn dispatch_validate(
     export: Option<String>,
     format: ValidateFormat,
     output: Option<String>,
+    date: Option<String>,
+    run_id: Option<String>,
+    prefix: Option<String>,
 ) -> Result<()> {
     let fmt = match format {
         ValidateFormat::Pretty => pipeline::ValidateOutputFormat::Pretty,
         ValidateFormat::Json => pipeline::ValidateOutputFormat::Json(output),
     };
-    pipeline::run_validate_command(&config, export.as_deref(), fmt)
+    // Parse --date once here so a malformed value fails before we open a
+    // destination — the pipeline layer never sees a half-validated date.
+    let parsed_date = match date {
+        Some(s) => Some(
+            chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").map_err(|e| {
+                anyhow::anyhow!("invalid --date '{}': expected YYYY-MM-DD ({})", s, e)
+            })?,
+        ),
+        None => None,
+    };
+    let target = pipeline::ValidateTarget {
+        date: parsed_date,
+        run_id,
+        prefix_override: prefix,
+    };
+    pipeline::run_validate_command(&config, export.as_deref(), fmt, target)
 }
 
 fn dispatch_reconcile(
