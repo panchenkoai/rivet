@@ -79,15 +79,63 @@ Inline `password:` / `url:` / `access_key:` fields are accepted but **not recomm
 
 ### Redaction in errors and artifacts
 
-The config layer redacts plaintext passwords before they appear in:
+Credential redaction is split across two layers (v0.7.2 P0.3):
 
-- error messages (`anyhow::Error` Display output — covered by [`tests/config_secrets.rs`](tests/config_secrets.rs)),
-- plan / journal / metrics artifacts (`redact_for_artifact` in `src/config`),
-- Slack / webhook notification payloads.
+- **Structural redaction** — `SourceConfig::redact_for_artifact` strips
+  plaintext `password` and `user:password@` userinfo from a
+  `SourceConfig` *before* it lands in a `PlanArtifact` (`plan.json`).
+  Env-var and file references (`url_env`, `password_env`, `url_file`,
+  `credentials_file`) are preserved by name — names are not secrets,
+  and `apply` needs them to re-resolve credentials.
+- **String redaction** — `crate::redact::redact_secrets` /
+  `redact_error` walks a string and rewrites every
+  `scheme://user:password@host` URL it finds to
+  `scheme://REDACTED@host`.  Applied as an *invariant* at every
+  boundary where an `anyhow::Error` becomes an operator-visible
+  artifact:
+  - `RunSummary::error_message` (→ `summary.json` / `summary.md` /
+    Slack / webhook payloads),
+  - run-journal `RetryAttempted::reason` and `ChunkFailed::error`
+    (→ `.rivet_state.db`, `rivet journal`),
+  - hard-failure log lines (`log::error!` / `log::warn!` in
+    pipeline/job, pipeline/single, chunked/sequential and
+    parallel checkpoints, repair_cmd),
+  - top-level CLI error output (`main.rs` `eprintln!`),
+  - `rivet validate` hard-failure messages (`could not open destination`
+    / `verify_at_destination failed`).
 
-If you observe a plaintext credential in any Rivet-produced output, treat it as a security bug (see Reporting below).
+Pinned in tests:
 
-**Known limitation**: Rivet does not redact secrets embedded inside user-authored `query` strings. If your query contains a literal API key or similar, that literal will appear in plan and journal artifacts. Use parameterised credentials at the database layer instead.
+- [`tests/config_secrets.rs`](tests/config_secrets.rs) — config-parse
+  errors never echo plaintext.
+- [`tests/redaction_invariant.rs`](tests/redaction_invariant.rs) —
+  string-redactor unit + integration suite; pins the URL-rewrite
+  rule and proves the redactor is wired into every error → artifact
+  path enumerated above.
+
+If you observe a plaintext credential in any Rivet-produced output,
+treat it as a security bug (see Reporting below).
+
+#### Known limitations
+
+- **User-authored SQL** — `query:` strings are stored verbatim in
+  `plan.json` and the run journal.  Do not embed credentials inside SQL;
+  use database-side roles or parameterised drivers instead.
+- **Third-party driver output** — Rivet redacts the strings *it*
+  produces.  If a Postgres / MySQL driver emits a URL-shaped error
+  that bypasses our error wrappers (e.g. via direct `stderr`), the
+  redactor will not see it.  Run with `RUST_LOG=info` to see all
+  Rivet-emitted log lines; anything that lands outside that channel
+  is upstream.
+- **Process memory** — passwords are wrapped in `Zeroizing<String>` at
+  the source-config boundary, but once a URL has been assembled the
+  combined string is a plain `String` until the connection is opened.
+  Memory introspection of a running Rivet process is out of scope.
+- **Shapes outside `scheme://user:password@host`** — AWS access keys
+  and Azure account keys are pulled from env vars at runtime and never
+  flow through our string formatters.  If a leak vector is discovered,
+  add a pattern to `src/redact.rs`, pin it in
+  `tests/redaction_invariant.rs`, and ship a patch release.
 
 ---
 

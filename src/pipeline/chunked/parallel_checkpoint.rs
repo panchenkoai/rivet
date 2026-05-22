@@ -351,7 +351,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                             pb_w.inc(agg_rows.load(Ordering::Relaxed));
                         }
                         Err(e) => {
-                            let msg = format!("{:#}", e);
+                            let msg = crate::redact::redact_error(&e);
                             let _ = StateStore::fail_chunk_task_at_ref(
                                 &state_ref,
                                 run_id_arc.as_str(),

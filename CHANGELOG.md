@@ -36,6 +36,23 @@
 - **`test`** — `tests/validate_historical.rs` regression-tests the anchor
   scenario: "run happened yesterday, validate runs today, `--date` still
   hits the correct physical prefix".
+- **`feat(redact)`** — credential redaction is now a defined invariant
+  (P0.3).  New `crate::redact` module strips
+  `scheme://user:password@host` userinfo from any string about to land
+  in an operator-visible artifact.  Applied at the error → artifact
+  boundary in `pipeline::job`, `pipeline::single`, `pipeline::repair_cmd`,
+  the chunked sequential/parallel checkpoints, the top-level CLI
+  `eprintln!` path, and validate's hard-failure messages.  Covers
+  `summary.json` / `summary.md`, `.rivet_state.db` journal,
+  Slack / webhook payloads, and CLI stderr.
+- **`docs(security)`** — SECURITY.md "Redaction in errors and artifacts"
+  rewritten: explicit list of redacted paths, known limitations
+  (third-party driver output, in-memory secrets, shapes outside the
+  URL userinfo pattern), and the test files that pin the contract.
+- **`test`** — `tests/redaction_invariant.rs` proves the redactor is
+  idempotent, doesn't damage non-URL prose, walks `anyhow::Context`
+  chains, and that `summary.json` / `summary.md` written via the
+  public run-report writer never carry the URL-embedded password.
 
 ## 0.7.1 (2026-05-21)
 

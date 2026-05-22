@@ -49,6 +49,11 @@ pub mod destination_for_tests {
 pub(crate) mod enrich;
 pub(crate) mod notify;
 pub(crate) mod plan;
+// Credential redaction invariant (ADR-0014, v0.7.2 P0.3).  `pub` so the
+// integration test `tests/redaction_invariant.rs` can drive it directly
+// — same "internal, may change at any patch" disclaimer as the rest of
+// the public-by-necessity surface.
+pub mod redact;
 // Test-only fault-injection hook used by `tests/live_crash_recovery.rs`.
 // Activated by the `RIVET_TEST_PANIC_AT` env var; no-op otherwise.  See
 // module docs for details.

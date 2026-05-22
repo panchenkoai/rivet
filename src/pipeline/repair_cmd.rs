@@ -191,7 +191,7 @@ fn execute_repair(
                 }
             }
             Err(e) => {
-                let msg = format!("{:#}", e);
+                let msg = crate::redact::redact_error(&e);
                 for a in repair_plan.actions.iter().filter(|a| {
                     a.start_key.parse::<i64>().is_ok() && a.end_key.parse::<i64>().is_ok()
                 }) {
