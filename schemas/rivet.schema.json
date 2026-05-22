@@ -32,6 +32,7 @@
       "default": false
     }
   },
+  "additionalProperties": false,
   "required": [
     "source",
     "exports"
@@ -136,6 +137,7 @@
           "default": null
         }
       },
+      "additionalProperties": false,
       "required": [
         "type"
       ]
@@ -272,7 +274,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "TuningProfile": {
       "type": "string",
@@ -328,7 +331,8 @@
           "type": "boolean",
           "default": false
         }
-      }
+      },
+      "additionalProperties": false
     },
     "TlsMode": {
       "description": "TLS enforcement mode, mirroring libpq's `sslmode` semantics where possible.",
@@ -598,6 +602,7 @@
           "default": null
         }
       },
+      "additionalProperties": false,
       "required": [
         "name",
         "format",
@@ -755,6 +760,7 @@
           "default": false
         }
       },
+      "additionalProperties": false,
       "required": [
         "type"
       ]
@@ -780,7 +786,8 @@
           "type": "boolean",
           "default": false
         }
-      }
+      },
+      "additionalProperties": false
     },
     "QualityConfig": {
       "type": "object",
@@ -825,7 +832,8 @@
           "format": "uint",
           "minimum": 0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "SchemaDriftPolicy": {
       "description": "What to do when structural schema drift is detected (column added, removed, or retyped).\n\n```yaml\nexports:\n  - name: orders\n    on_schema_drift: fail   # warn (default), continue, fail\n```",
@@ -889,7 +897,8 @@
           "format": "uint",
           "minimum": 0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "RowGroupStrategy": {
       "description": "Parquet row group tuning strategy.\n\nControls how many rows Rivet places in each Parquet row group. Row group size\naffects memory usage during write, compression ratio, and downstream read\nperformance (predicate pushdown, column skipping).\n\n```yaml\nexports:\n  - name: events\n    parquet:\n      row_group_strategy: auto          # compute from schema + target_row_group_mb\n      target_row_group_mb: 128          # default target; auto + fixed_memory only\n      max_row_group_mb: 256             # optional upper bound (all strategies)\n      # row_group_strategy: fixed_rows  # exact row count\n      # row_group_rows: 500000          # used with fixed_rows\n      # row_group_strategy: fixed_memory  # same math as auto, made explicit\n```",
@@ -924,7 +933,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "SlackConfig": {
       "type": "object",
@@ -947,7 +957,8 @@
             "$ref": "#/$defs/NotifyEvent"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "NotifyEvent": {
       "type": "string",

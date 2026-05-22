@@ -8,11 +8,13 @@ use super::resolve::{parse_file_size, resolve_env_vars, resolve_vars};
 use crate::tuning::{TuningConfig, TuningProfile};
 
 #[derive(Debug, Deserialize, JsonSchema, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct NotificationsConfig {
     pub slack: Option<SlackConfig>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SlackConfig {
     pub webhook_url: Option<String>,
     pub webhook_url_env: Option<String>,
@@ -49,6 +51,7 @@ pub enum SchemaDriftPolicy {
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SourceConfig {
     #[serde(rename = "type")]
     pub source_type: SourceType,
@@ -132,6 +135,7 @@ impl SourceEnvironment {
 ///     ca_file: /etc/ssl/certs/rds-ca-2019-root.pem
 /// ```
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     /// Enforcement level. See [`TlsMode`].
     #[serde(default)]
@@ -355,6 +359,7 @@ fn find_userinfo(raw: &str) -> Option<(usize, usize)> {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ExportConfig {
     pub name: String,
     #[serde(default)]
@@ -605,6 +610,7 @@ fn validate_table_shortcut_ident(export_name: &str, raw: &str) -> crate::error::
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct QualityConfig {
     pub row_count_min: Option<usize>,
     pub row_count_max: Option<usize>,
@@ -619,6 +625,7 @@ pub struct QualityConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct MetaColumns {
     #[serde(default)]
     pub exported_at: bool,
@@ -734,6 +741,7 @@ pub enum RowGroupStrategy {
 
 /// Parquet-specific tuning for row group sizing.
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ParquetConfig {
     /// How to determine the row group size. Default: `auto`.
     pub row_group_strategy: Option<RowGroupStrategy>,
@@ -820,6 +828,7 @@ impl CompressionProfile {
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct DestinationConfig {
     #[serde(rename = "type")]
     pub destination_type: DestinationType,

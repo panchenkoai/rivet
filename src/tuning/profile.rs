@@ -56,6 +56,7 @@ pub enum BatchMemoryPolicy {
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct TuningConfig {
     pub profile: Option<TuningProfile>,
     pub batch_size: Option<usize>,
