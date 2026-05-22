@@ -315,7 +315,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
                 crate::test_hook::maybe_panic_at_chunk("after_chunk_complete", chunk_index);
             }
             Err(e) => {
-                let msg = format!("{:#}", e);
+                let msg = crate::redact::redact_error(&e);
                 log::error!(
                     "export '{}': chunk {} failed: {}",
                     plan.export_name,

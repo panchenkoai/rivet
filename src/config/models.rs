@@ -843,8 +843,21 @@ pub struct DestinationConfig {
     pub account_name: Option<String>,
     /// Name of an env var holding the Azure Storage account key.  Treated as
     /// a credential and wiped from heap on drop — same SecOps treatment as
-    /// `access_key_env`.  Pair with `account_name`.
+    /// `access_key_env`.  Pair with `account_name`.  Mutually exclusive with
+    /// `sas_token_env`.
     pub account_key_env: Option<String>,
+    /// Name of an env var holding an Azure Storage **SAS token** — typically
+    /// a short-lived, scope-limited credential issued out-of-band (Azure
+    /// portal / `az storage container generate-sas` / Azure SDK).  Use this
+    /// instead of `account_key_env` when the operator does not have the
+    /// long-lived account key or wants per-job scoped access.  Pair with
+    /// `account_name`.  Mutually exclusive with `account_key_env`.
+    ///
+    /// The token value is wiped from heap on drop via the same
+    /// `Zeroizing<String>` wrapper as `account_key_env`.  Leading `?` is
+    /// trimmed transparently so the operator can paste either the full
+    /// `?sv=…&sig=…` query string or the raw token body.
+    pub sas_token_env: Option<String>,
     #[serde(default)]
     pub allow_anonymous: bool,
 }

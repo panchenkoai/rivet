@@ -50,14 +50,14 @@ pub(crate) fn run_with_reconnect(
                 },
                 last_err
                     .as_ref()
-                    .map(|e: &anyhow::Error| format!("{:#}", e))
+                    .map(crate::redact::redact_error)
                     .unwrap_or_default(),
             );
             summary.journal.record(RunEvent::RetryAttempted {
                 attempt,
                 reason: last_err
                     .as_ref()
-                    .map(|e| format!("{:#}", e))
+                    .map(crate::redact::redact_error)
                     .unwrap_or_default(),
                 backoff_ms: backoff,
             });
@@ -69,9 +69,9 @@ pub(crate) fn run_with_reconnect(
             Err(e) => {
                 if attempt < plan.tuning.max_retries && classify_error(&e).is_transient() {
                     log::warn!(
-                        "export '{}': connection failed, will retry: {:#}",
+                        "export '{}': connection failed, will retry: {}",
                         plan.export_name,
-                        e
+                        crate::redact::redact_error(&e)
                     );
                     last_err = Some(e);
                     continue;

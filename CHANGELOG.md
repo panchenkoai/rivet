@@ -1,5 +1,83 @@
 # Changelog
 
+## 0.7.2 (unreleased) — Cloud Landing Polish
+
+> Focus: make cloud outputs historically verifiable and safer to operate.
+> No new extraction modes, no new database sources — every change tightens
+> the existing cloud-output contract.
+
+### Highlights so far
+
+- **`rivet validate --date / --run-id / --prefix`** — re-verify a prior run
+  without re-running the export.  Lifts the implicit "today only" anchor
+  that previously made `rivet validate` blind to yesterday's `{date}` prefix.
+- **Shared placeholder resolver** (`crate::destination::placeholder`) — one
+  module substitutes `{date}` / `{export}` / `{table}` / `{run_id}` for
+  every command that resolves a destination prefix (`run`, `doctor`,
+  `validate`, future `reconcile` / `repair`).  New `{run_id}` token; unknown
+  `{token}`s are preserved verbatim so a typo fails loudly at open time.
+
+### Changes
+
+- **`feat(validate)`** — `rivet validate` accepts:
+  - `--date YYYY-MM-DD`: anchor `{date}` substitution at a prior day.
+  - `--run-id <RID>`: substitute `{run_id}` in destination templates.
+    Composes with `--date`.
+  - `--prefix <STRING>`: bypass placeholder resolution and verify exactly
+    this prefix.  Rejected when scope spans multiple exports
+    (`--prefix requires --export <name>`).
+  - Resolved physical prefix is surfaced in both pretty and JSON output
+    (`resolved_prefix`) so operators can confirm at a glance which bytes
+    were checked.  Hard-failure error messages include it too.
+- **`refactor(destination)`** — new `destination::placeholder` module with
+  `PlaceholderContext::{for_today, for_date, with_run_id}` and
+  `expand_destination(dest, &ctx)`.  Old `plan::build::expand_destination_templates`
+  becomes a thin wrapper that delegates to the new module.
+- **`test`** — `tests/validate_historical.rs` regression-tests the anchor
+  scenario: "run happened yesterday, validate runs today, `--date` still
+  hits the correct physical prefix".
+- **`feat(redact)`** — credential redaction is now a defined invariant
+  (P0.3).  New `crate::redact` module strips
+  `scheme://user:password@host` userinfo from any string about to land
+  in an operator-visible artifact.  Applied at the error → artifact
+  boundary in `pipeline::job`, `pipeline::single`, `pipeline::repair_cmd`,
+  the chunked sequential/parallel checkpoints, the top-level CLI
+  `eprintln!` path, and validate's hard-failure messages.  Covers
+  `summary.json` / `summary.md`, `.rivet_state.db` journal,
+  Slack / webhook payloads, and CLI stderr.
+- **`docs(security)`** — SECURITY.md "Redaction in errors and artifacts"
+  rewritten: explicit list of redacted paths, known limitations
+  (third-party driver output, in-memory secrets, shapes outside the
+  URL userinfo pattern), and the test files that pin the contract.
+- **`test`** — `tests/redaction_invariant.rs` proves the redactor is
+  idempotent, doesn't damage non-URL prose, walks `anyhow::Context`
+  chains, and that `summary.json` / `summary.md` written via the
+  public run-report writer never carry the URL-embedded password.
+- **`feat(destination/azure)`** — Azure SAS-token auth (P0.4).  New
+  `sas_token_env` field on the destination config alongside the
+  existing `account_key_env`.  Mutually exclusive with `account_key_env`
+  — both being set is refused with an actionable error.  Leading `?` on
+  the operator-supplied token is trimmed transparently so either the
+  full `?sv=…&sig=…` query string or the raw token body works.  The
+  token value receives the same `Zeroizing<String>` SecOps treatment
+  as `account_key_env`.
+
+  Example:
+
+  ```yaml
+  destination:
+    type: azure
+    bucket: my-container
+    account_name: mystorageacct
+    sas_token_env: AZURE_STORAGE_SAS_TOKEN
+  ```
+- **`docs(cloud-destinations)`** — new `docs/cloud-destinations.md`
+  consolidates the local / S3 / GCS / Azure auth-and-output contract
+  in one place: shared output contract (`manifest.json` + `_SUCCESS`),
+  per-backend auth matrix (key/SAS/anonymous for Azure;
+  env/profile/session-token for S3; ADC/service-account for GCS),
+  resume / validate / quarantine behavior, and known limitations.
+
 ## 0.7.1 (2026-05-21)
 
 ### Highlights

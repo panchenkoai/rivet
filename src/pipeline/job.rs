@@ -182,7 +182,7 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
         validated: None,
         schema_changed: None,
         quality_passed: None,
-        error_message: Some(format!("{:#}", err)),
+        error_message: Some(crate::redact::redact_error(err)),
         tuning_profile: "balanced (default)".into(),
         batch_size: 0,
         batch_size_memory_mb: None,
@@ -342,8 +342,9 @@ pub(super) fn run_export_job(
         }
         Err(e) => {
             summary.status = "failed".into();
-            summary.error_message = Some(format!("{:#}", e));
-            log::error!("export '{}' failed: {:#}", plan.export_name, e);
+            let redacted = crate::redact::redact_error(e);
+            summary.error_message = Some(redacted.clone());
+            log::error!("export '{}' failed: {}", plan.export_name, redacted);
         }
     }
 
@@ -491,8 +492,9 @@ pub(crate) fn run_export_job_with_chunk_source(
         }
         Err(e) => {
             summary.status = "failed".into();
-            summary.error_message = Some(format!("{:#}", e));
-            log::error!("apply '{}' failed: {:#}", plan.export_name, e);
+            let redacted = crate::redact::redact_error(e);
+            summary.error_message = Some(redacted.clone());
+            log::error!("apply '{}' failed: {}", plan.export_name, redacted);
         }
     }
 

@@ -16,6 +16,7 @@ mod pipeline;
 mod plan;
 mod preflight;
 mod quality;
+mod redact;
 mod resource;
 mod source;
 mod sql;
@@ -31,10 +32,11 @@ fn main() {
     let cli = cli::Cli::parse();
     let json_errors = cli.json_errors;
     if let Err(e) = cli::dispatch(cli) {
+        let msg = redact::redact_error(&e);
         if json_errors {
-            eprintln!("{}", serde_json::json!({"error": format!("{e:#}")}));
+            eprintln!("{}", serde_json::json!({ "error": msg }));
         } else {
-            eprintln!("Error: {e:#}");
+            eprintln!("Error: {msg}");
         }
         std::process::exit(1);
     }

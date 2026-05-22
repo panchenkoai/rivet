@@ -8,6 +8,7 @@ pub mod azure;
 pub mod gcs;
 mod gcs_auth;
 pub mod local;
+pub mod placeholder;
 pub mod s3;
 pub mod stdout;
 
