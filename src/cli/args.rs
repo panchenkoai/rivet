@@ -283,6 +283,19 @@ pub enum Commands {
         #[arg(short, long, default_value = "20")]
         last: usize,
     },
+    /// Emit machine-readable schemas for Rivet's data contracts.
+    ///
+    /// Today: `rivet schema config` prints the JSON Schema for the
+    /// `rivet.yaml` config to stdout.  Operators pipe this into a file
+    /// and reference it via a `# yaml-language-server: $schema=...`
+    /// header so VS Code / Neovim's YAML language server highlights
+    /// invalid keys, suggests enum values, and surfaces required
+    /// fields as the YAML is edited.  See
+    /// `docs/cloud-destinations.md` for the broader contract.
+    Schema {
+        #[command(subcommand)]
+        what: SchemaKind,
+    },
     /// Inspect structured run journal (events, files, retries, quality issues)
     Journal {
         /// Path to YAML config file
@@ -298,6 +311,19 @@ pub enum Commands {
         #[arg(long, value_name = "RUN_ID")]
         run_id: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+pub enum SchemaKind {
+    /// Print the JSON Schema describing `rivet.yaml` to stdout.
+    ///
+    /// The schema is generated from the running binary's Rust types,
+    /// so it always matches the config grammar this version accepts.
+    /// Pipe to a file and reference it via a
+    /// `# yaml-language-server: $schema=…` header in your config:
+    ///
+    ///     rivet schema config > rivet.schema.json
+    Config,
 }
 
 #[derive(Subcommand)]

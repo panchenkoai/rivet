@@ -1,7 +1,14 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/panchenkoai/rivet/main/schemas/latest/rivet.schema.json
+#
 # Rivet Example: PostgreSQL → Full Export → Local Filesystem
 #
 # Use case: daily snapshot of a reference table to local Parquet files.
 # Run:      rivet run -c examples/pg_full_local.yaml --validate --reconcile
+#
+# Editor validation: the `$schema` directive on the line above tells the
+# YAML Language Server (VS Code, Neovim, Helix) to autocomplete fields,
+# flag typos, and surface required keys.  Regenerate the schema with:
+#     rivet schema config > schemas/rivet.schema.json
 
 source:
   type: postgres

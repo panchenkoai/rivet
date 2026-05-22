@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.7.3 (unreleased) — Developer Experience Polish
+
+> Focus: make Rivet easier to configure, inspect, and try correctly.
+> No new extraction modes — every change reduces first-touch friction
+> for new operators.
+
+### Highlights so far
+
+- **JSON Schema for `rivet.yaml`** — `schemas/rivet.schema.json` (and the
+  stable `schemas/latest/` mirror) ships in-tree so editors with the YAML
+  Language Server (VS Code, Neovim, Helix) autocomplete fields, flag
+  typos, and surface required keys.  Reference it from a config via:
+
+      # yaml-language-server: $schema=https://raw.githubusercontent.com/panchenkoai/rivet/main/schemas/latest/rivet.schema.json
+
+- **`rivet schema config`** — emits the JSON Schema for the running
+  binary's Config types to stdout.  Pipe to a file or check it in to
+  pin a per-version schema in your own repo.
+
+### Changes
+
+- **`feat(config)`** — `#[derive(JsonSchema)]` propagated across the
+  full `Config` type tree (`SourceConfig`, `ExportConfig`,
+  `DestinationConfig`, `TuningConfig`, `TlsConfig`, every nested enum).
+  The schema embeds the binary's `CARGO_PKG_VERSION` in its `title` so
+  drift is detectable by inspection.
+- **`feat(cli)`** — new `rivet schema config` subcommand.  Output
+  format: pretty-printed JSON Schema (draft 2020-12), trailing newline.
+- **`docs(examples)`** — `examples/pg_full_local.yaml` now carries a
+  `# yaml-language-server: $schema=…` header so editor validation is
+  on by default for any operator who runs that example.
+- **`test`** — `tests/schema_drift.rs` pins the in-tree schema artifact
+  to the runtime output; CI fails when a Config change forgets to
+  regenerate the schema.  Three guard checks: byte-equality vs the
+  generated schema, byte-equality between primary and `latest/`
+  mirrors, and `CARGO_PKG_VERSION` presence in the title.
+
 ## 0.7.2 (unreleased) — Cloud Landing Polish
 
 > Focus: make cloud outputs historically verifiable and safer to operate.

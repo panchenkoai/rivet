@@ -1,0 +1,961 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Rivet config (rivet-cli 0.7.3)",
+  "description": "Top-level Rivet configuration root.\n\nOperators write this struct as YAML (typically `rivet.yaml`).  The\n`JsonSchema` derive is the source of truth for the `schemas/rivet.schema.json`\nartifact and the `rivet schema config` command's output (v0.7.3 P0).",
+  "type": "object",
+  "properties": {
+    "source": {
+      "$ref": "#/$defs/SourceConfig"
+    },
+    "exports": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ExportConfig"
+      }
+    },
+    "notifications": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/NotificationsConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "parallel_exports": {
+      "type": "boolean",
+      "default": false
+    },
+    "parallel_export_processes": {
+      "type": "boolean",
+      "default": false
+    }
+  },
+  "required": [
+    "source",
+    "exports"
+  ],
+  "$defs": {
+    "SourceConfig": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "$ref": "#/$defs/SourceType"
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "url_env": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "url_file": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "host": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "port": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "user": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "password": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "password_env": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "database": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "environment": {
+          "description": "Operational profile of the source database.\n\nSelects the **default** tuning profile when none is explicitly set in\n`source.tuning.profile` or `export.tuning.profile`:\n\n| `environment`           | default profile |\n|-------------------------|------------------|\n| `production` (default)  | `balanced` (50 ms throttle, 10 k batch, retries) |\n| `replica`               | `balanced` |\n| `local`                 | `fast` (no throttle, 50 k batch — saves ~30% wall on localhost) |\n\nExplicit `tuning.profile:` always wins over this hint.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceEnvironment"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "tuning": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TuningConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "tls": {
+          "description": "Transport security settings (ADR: SecOps). When absent, Rivet connects\nwithout TLS — a warning is emitted so operators are aware. See [`TlsConfig`].",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TlsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "type"
+      ]
+    },
+    "SourceType": {
+      "type": "string",
+      "enum": [
+        "postgres",
+        "mysql"
+      ]
+    },
+    "SourceEnvironment": {
+      "description": "Operational environment of the source database — drives the default tuning\nprofile when none is explicitly set. Opt-in: existing configs without\n`environment:` continue to use `balanced` as today.",
+      "oneOf": [
+        {
+          "description": "Localhost / Docker compose / read-only container — no throttle by default\n(compiles to `fast` profile defaults). Use when DB load is not a concern.",
+          "type": "string",
+          "const": "local"
+        },
+        {
+          "description": "Read replica — `balanced` default. Same throttle as production, but free\nto dial up `tuning.batch_size`.",
+          "type": "string",
+          "const": "replica"
+        },
+        {
+          "description": "Live production primary — `balanced` default. Bias toward source-safety.",
+          "type": "string",
+          "const": "production"
+        }
+      ]
+    },
+    "TuningConfig": {
+      "type": "object",
+      "properties": {
+        "profile": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TuningProfile"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "batch_size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "batch_size_memory_mb": {
+          "description": "Target memory per batch in MB. Mutually exclusive with batch_size.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "throttle_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "statement_timeout_s": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_retries": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "retry_backoff_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "lock_timeout_s": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "memory_threshold_mb": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "max_batch_memory_mb": {
+          "description": "Hard cap on Arrow batch memory in MB. When a batch exceeds this limit,\n`on_batch_memory_exceeded` determines the response.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "on_batch_memory_exceeded": {
+          "description": "Policy applied when a batch exceeds `max_batch_memory_mb`. Default: `warn`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BatchMemoryPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "adaptive": {
+          "description": "Enable real-time batch size adaptation based on DB pressure metrics.\nPostgres: samples `pg_stat_bgwriter`. MySQL: samples `Innodb_log_waits`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "TuningProfile": {
+      "type": "string",
+      "enum": [
+        "fast",
+        "balanced",
+        "safe"
+      ]
+    },
+    "BatchMemoryPolicy": {
+      "description": "Action taken when a single Arrow batch exceeds `max_batch_memory_mb`.",
+      "oneOf": [
+        {
+          "description": "Log a warning and continue. (default)",
+          "type": "string",
+          "const": "warn"
+        },
+        {
+          "description": "Return an error — the export fails immediately.",
+          "type": "string",
+          "const": "fail"
+        },
+        {
+          "description": "Split the oversized batch in half recursively until each sub-batch fits,\nthen process them individually. Transparent to the rest of the pipeline.",
+          "type": "string",
+          "const": "auto_shrink"
+        }
+      ]
+    },
+    "TlsConfig": {
+      "description": "Transport security for the source database connection.\n\nCredentials and exported data cross the wire on every connection; without TLS\nthey are visible to anyone on the network path (cloud inter-VPC, cross-AZ, or\na compromised upstream). The default for all new connections is\n[`TlsMode::Require`] when `tls:` is present; setting `tls: { mode: disable }`\nis explicit opt-out.\n\n```yaml\nsource:\n  type: postgres\n  url_env: DATABASE_URL\n  tls:\n    mode: verify-full\n    ca_file: /etc/ssl/certs/rds-ca-2019-root.pem\n```",
+      "type": "object",
+      "properties": {
+        "mode": {
+          "description": "Enforcement level. See [`TlsMode`].",
+          "$ref": "#/$defs/TlsMode",
+          "default": "verify-full"
+        },
+        "ca_file": {
+          "description": "PEM-encoded CA certificate to trust for server verification. Required\nfor [`TlsMode::VerifyCa`] and [`TlsMode::VerifyFull`] against a private CA.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "accept_invalid_certs": {
+          "description": "Accept certificates not chained to a trusted CA. Dangerous — disables\nserver authentication — and only honored when explicitly `true`.",
+          "type": "boolean",
+          "default": false
+        },
+        "accept_invalid_hostnames": {
+          "description": "Accept certificates whose subjectAltName does not match the connection\nhostname. Dangerous — disables hostname verification.",
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "TlsMode": {
+      "description": "TLS enforcement mode, mirroring libpq's `sslmode` semantics where possible.",
+      "oneOf": [
+        {
+          "description": "Plaintext. Use only inside trusted networks (loopback, cgroup-private).",
+          "type": "string",
+          "const": "disable"
+        },
+        {
+          "description": "Require a TLS handshake; accept the server certificate without verifying\nissuer or hostname. Protects against passive sniffing, not MITM.",
+          "type": "string",
+          "const": "require"
+        },
+        {
+          "description": "TLS + verify certificate chains to the configured / system trust store.\nDoes not check hostname (useful for IP-addressed or internal names).",
+          "type": "string",
+          "const": "verify-ca"
+        },
+        {
+          "description": "TLS + verify chain **and** hostname against the server cert's SAN/CN.\nRecommended default for production.",
+          "type": "string",
+          "const": "verify-full"
+        }
+      ]
+    },
+    "ExportConfig": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "query": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "query_file": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "table": {
+          "description": "Shortcut for `query: \"SELECT * FROM <schema>.<table>\"`.\n\nAccepts `table` or `schema.table` with ASCII-only identifiers\n(`[A-Za-z_][A-Za-z0-9_]*`). Generates an unquoted single-table\nquery so the Postgres NUMERIC catalog-hint resolver recognises it\nand auto-types `numeric(p,s)` columns without manual overrides.\n\nMutually exclusive with `query` and `query_file`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "mode": {
+          "$ref": "#/$defs/ExportMode"
+        },
+        "cursor_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cursor_fallback_column": {
+          "description": "Secondary column for [`IncrementalCursorMode::Coalesce`] only (see ADR-0007).",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "incremental_cursor_mode": {
+          "description": "How primary (and optional fallback) columns drive incremental progression.",
+          "$ref": "#/$defs/IncrementalCursorMode",
+          "default": "single_column"
+        },
+        "chunk_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "chunk_dense": {
+          "type": "boolean",
+          "default": false
+        },
+        "chunk_size": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 100000
+        },
+        "chunk_size_memory_mb": {
+          "description": "Target memory budget per chunk in MB. When set, `chunk_size` is derived\nfrom this budget at plan-build time using a `pg_class` row-size estimate\n(`pg_relation_size / reltuples`), clamped to `[10_000, 5_000_000]` rows.\n\nMutually exclusive with an explicit non-default `chunk_size:`. Only\napplies to `mode: chunked` on a Postgres source using the `table:`\nshortcut (the row-size probe needs a known relation).\n\n```yaml\nexports:\n  - name: page_views\n    table: public.page_views\n    mode: chunked\n    chunk_size_memory_mb: 256\n```",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0,
+          "default": null
+        },
+        "chunk_count": {
+          "description": "Divide the column range into exactly this many equal chunks.\nMutually exclusive with `chunk_dense` and `chunk_by_days`.\nWhen set, `chunk_size` is computed dynamically from min/max.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "chunk_by_days": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "parallel": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 1
+        },
+        "time_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_column_type": {
+          "$ref": "#/$defs/TimeColumnType",
+          "default": "timestamp"
+        },
+        "days_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "format": {
+          "$ref": "#/$defs/FormatType"
+        },
+        "compression": {
+          "$ref": "#/$defs/CompressionType",
+          "default": "zstd"
+        },
+        "compression_level": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "compression_profile": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CompressionProfile"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "skip_empty": {
+          "type": "boolean",
+          "default": false
+        },
+        "destination": {
+          "$ref": "#/$defs/DestinationConfig"
+        },
+        "meta_columns": {
+          "$ref": "#/$defs/MetaColumns",
+          "default": {
+            "exported_at": false,
+            "row_hash": false
+          }
+        },
+        "quality": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/QualityConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "max_file_size": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "chunk_checkpoint": {
+          "type": "boolean",
+          "default": false
+        },
+        "chunk_max_attempts": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "tuning": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TuningConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "source_group": {
+          "description": "Optional logical group for shared source capacity (replica, host). Advisory prioritization only.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "reconcile_required": {
+          "description": "Hint (Epic C / ADR-0006) that this export should always be treated as reconcile-heavy\nby planning, independent of the `--reconcile` CLI flag. Advisory only.",
+          "type": "boolean",
+          "default": false
+        },
+        "columns": {
+          "description": "Per-column type overrides (roadmap §8). Keys are column names; values\nare short type strings such as `decimal(18,2)`, `timestamp_tz`, `json`.\n\n```yaml\nexports:\n  - name: payments\n    columns:\n      amount: decimal(18,2)\n      fee: decimal(18,6)\n      created_at: timestamp_tz\n```\n\nOverrides take priority over autodetection and are validated at\nplan time — an invalid type string fails before the export runs.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "on_schema_drift": {
+          "description": "Policy applied when structural schema drift is detected (column added, removed, or retyped).\nDefaults to `warn`: log a warning and continue.",
+          "$ref": "#/$defs/SchemaDriftPolicy",
+          "default": "warn"
+        },
+        "shape_drift_warn_factor": {
+          "description": "Growth-factor threshold for data shape drift warnings (Epic 8).\nWhen a string/binary column's max observed byte length in the current run\nexceeds `stored_max * shape_drift_warn_factor`, Rivet logs a warning.\n`None` uses the default of 2.0. Set to `0.0` to disable shape tracking.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "default": null
+        },
+        "parquet": {
+          "description": "Parquet row group tuning. Only meaningful when `format: parquet`.\nWhen absent, the parquet library default (1,048,576 rows/group) is used.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ParquetConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "name",
+        "format",
+        "destination"
+      ]
+    },
+    "ExportMode": {
+      "type": "string",
+      "enum": [
+        "full",
+        "incremental",
+        "chunked",
+        "time_window"
+      ]
+    },
+    "IncrementalCursorMode": {
+      "description": "How the primary (and optional fallback) column(s) participate in incremental extraction.",
+      "oneOf": [
+        {
+          "description": "`WHERE primary > last ORDER BY primary` — optional fallback column is ignored for execution.",
+          "type": "string",
+          "const": "single_column"
+        },
+        {
+          "description": "`WHERE COALESCE(primary, fallback) > last` with a synthetic result column for cursor extraction.",
+          "type": "string",
+          "const": "coalesce"
+        }
+      ]
+    },
+    "TimeColumnType": {
+      "type": "string",
+      "enum": [
+        "timestamp",
+        "unix"
+      ]
+    },
+    "FormatType": {
+      "type": "string",
+      "enum": [
+        "parquet",
+        "csv"
+      ]
+    },
+    "CompressionType": {
+      "type": "string",
+      "enum": [
+        "zstd",
+        "snappy",
+        "gzip",
+        "lz4",
+        "none"
+      ]
+    },
+    "CompressionProfile": {
+      "description": "High-level compression preset. Maps to a `(CompressionType, level)` pair.\n\n```yaml\nexports:\n  - name: events\n    compression_profile: fast   # snappy — fastest, larger files\n    # compression_profile: balanced  # zstd level 3 — default for production\n    # compression_profile: compact   # zstd level 9 — smallest files, more CPU\n    # compression_profile: none      # no compression\n```\n\nWhen set, takes precedence over `compression` and `compression_level`.",
+      "type": "string",
+      "enum": [
+        "none",
+        "fast",
+        "balanced",
+        "compact"
+      ]
+    },
+    "DestinationConfig": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "$ref": "#/$defs/DestinationType"
+        },
+        "bucket": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "prefix": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "region": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "endpoint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "credentials_file": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "access_key_env": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "secret_key_env": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_token_env": {
+          "description": "Name of an env var holding an AWS STS session token, for use with\nshort-lived credentials issued by AWS IAM Identity Center / SSO,\n`aws sts assume-role`, MFA-protected sessions, EKS IAM Roles for\nService Accounts, etc.  Pair with `access_key_env` + `secret_key_env`.\nSee `docs/cloud-auth.md` for the AWS auth-flow matrix.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "aws_profile": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "account_name": {
+          "description": "Azure storage account name (the prefix in `<account>.blob.core.windows.net`).\nPlain string — not a secret. Pair with `account_key_env`.\nSee `docs/cloud-auth.md` for the Azure auth-flow matrix.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "account_key_env": {
+          "description": "Name of an env var holding the Azure Storage account key.  Treated as\na credential and wiped from heap on drop — same SecOps treatment as\n`access_key_env`.  Pair with `account_name`.  Mutually exclusive with\n`sas_token_env`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sas_token_env": {
+          "description": "Name of an env var holding an Azure Storage **SAS token** — typically\na short-lived, scope-limited credential issued out-of-band (Azure\nportal / `az storage container generate-sas` / Azure SDK).  Use this\ninstead of `account_key_env` when the operator does not have the\nlong-lived account key or wants per-job scoped access.  Pair with\n`account_name`.  Mutually exclusive with `account_key_env`.\n\nThe token value is wiped from heap on drop via the same\n`Zeroizing<String>` wrapper as `account_key_env`.  Leading `?` is\ntrimmed transparently so the operator can paste either the full\n`?sv=…&sig=…` query string or the raw token body.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "allow_anonymous": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "type"
+      ]
+    },
+    "DestinationType": {
+      "type": "string",
+      "enum": [
+        "local",
+        "s3",
+        "gcs",
+        "azure",
+        "stdout"
+      ]
+    },
+    "MetaColumns": {
+      "type": "object",
+      "properties": {
+        "exported_at": {
+          "type": "boolean",
+          "default": false
+        },
+        "row_hash": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "QualityConfig": {
+      "type": "object",
+      "properties": {
+        "row_count_min": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "row_count_max": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "null_ratio_max": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "number",
+            "format": "double"
+          },
+          "default": {}
+        },
+        "unique_columns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "unique_max_entries": {
+          "description": "Cap on the number of distinct values tracked per column during uniqueness checks.\nWhen the limit is hit, a Warn issue is emitted and tracking stops for that column.\nPrevents unbounded HashSet growth on high-cardinality columns.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        }
+      }
+    },
+    "SchemaDriftPolicy": {
+      "description": "What to do when structural schema drift is detected (column added, removed, or retyped).\n\n```yaml\nexports:\n  - name: orders\n    on_schema_drift: fail   # warn (default), continue, fail\n```",
+      "oneOf": [
+        {
+          "description": "Log a warning and continue. The new schema fingerprint is stored. (Default.)",
+          "type": "string",
+          "const": "warn"
+        },
+        {
+          "description": "Silently accept schema changes — store the new schema, no log output.",
+          "type": "string",
+          "const": "continue"
+        },
+        {
+          "description": "Abort the run with a non-zero exit. The schema store is NOT updated so the\nnext run will detect the same change again.",
+          "type": "string",
+          "const": "fail"
+        }
+      ]
+    },
+    "ParquetConfig": {
+      "description": "Parquet-specific tuning for row group sizing.",
+      "type": "object",
+      "properties": {
+        "row_group_strategy": {
+          "description": "How to determine the row group size. Default: `auto`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RowGroupStrategy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "row_group_rows": {
+          "description": "Exact number of rows per group (`fixed_rows` only).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "target_row_group_mb": {
+          "description": "Target Arrow buffer memory per row group in MB (`auto` and `fixed_memory`). Default: 128.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "max_row_group_mb": {
+          "description": "Hard upper bound on row group memory in MB. When set, further reduces computed row count.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        }
+      }
+    },
+    "RowGroupStrategy": {
+      "description": "Parquet row group tuning strategy.\n\nControls how many rows Rivet places in each Parquet row group. Row group size\naffects memory usage during write, compression ratio, and downstream read\nperformance (predicate pushdown, column skipping).\n\n```yaml\nexports:\n  - name: events\n    parquet:\n      row_group_strategy: auto          # compute from schema + target_row_group_mb\n      target_row_group_mb: 128          # default target; auto + fixed_memory only\n      max_row_group_mb: 256             # optional upper bound (all strategies)\n      # row_group_strategy: fixed_rows  # exact row count\n      # row_group_rows: 500000          # used with fixed_rows\n      # row_group_strategy: fixed_memory  # same math as auto, made explicit\n```",
+      "oneOf": [
+        {
+          "description": "Compute rows-per-group from schema column types and `target_row_group_mb`.\nFor narrow tables this produces large groups (efficient). For wide tables\nit reduces group size to stay within the memory target.",
+          "type": "string",
+          "const": "auto"
+        },
+        {
+          "description": "Use `row_group_rows` as a literal row count. Ignores memory targets.",
+          "type": "string",
+          "const": "fixed_rows"
+        },
+        {
+          "description": "Identical math to `auto`, but the strategy label is explicit in logs.",
+          "type": "string",
+          "const": "fixed_memory"
+        }
+      ]
+    },
+    "NotificationsConfig": {
+      "type": "object",
+      "properties": {
+        "slack": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SlackConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "SlackConfig": {
+      "type": "object",
+      "properties": {
+        "webhook_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "webhook_url_env": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "on": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/NotifyEvent"
+          }
+        }
+      }
+    },
+    "NotifyEvent": {
+      "type": "string",
+      "enum": [
+        "failure",
+        "schema_change",
+        "degraded"
+      ]
+    }
+  }
+}

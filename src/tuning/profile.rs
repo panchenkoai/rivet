@@ -7,6 +7,7 @@
 //! `Local` → `Fast`, `Replica`/`Production` → `Balanced`.
 
 use arrow::datatypes::SchemaRef;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::memory::{compute_batch_size_from_memory, estimate_row_bytes};
@@ -32,7 +33,7 @@ pub struct SourceTuning {
     configured_profile: TuningProfile,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TuningProfile {
     Fast,
@@ -41,7 +42,7 @@ pub enum TuningProfile {
 }
 
 /// Action taken when a single Arrow batch exceeds `max_batch_memory_mb`.
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum BatchMemoryPolicy {
     /// Log a warning and continue. (default)
@@ -54,7 +55,7 @@ pub enum BatchMemoryPolicy {
     AutoShrink,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Default, Clone)]
 pub struct TuningConfig {
     pub profile: Option<TuningProfile>,
     pub batch_size: Option<usize>,

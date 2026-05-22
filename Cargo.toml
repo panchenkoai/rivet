@@ -1,6 +1,6 @@
 [package]
 name = "rivet-cli"
-version = "0.7.2"
+version = "0.7.3"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
@@ -58,6 +58,12 @@ rusqlite = { version = "0.39", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
+# JSON Schema generation for `rivet schema config` and the
+# `schemas/rivet.schema.json` checked-in artifact (v0.7.3 P0.1/P0.2).
+# `derive` feature gives us `#[derive(JsonSchema)]`; the `preserve_order`
+# feature keeps Config field order stable across rebuilds so the
+# generated schema diff is reviewable.
+schemars = { version = "1", features = ["preserve_order"] }
 tempfile = "3"
 tikv-jemallocator = { version = "0.6", optional = true }
 tokio = { version = "1.50.0", features = ["rt-multi-thread"] }
