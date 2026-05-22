@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.7.3 (unreleased) — Developer Experience Polish
+## 0.7.3 (2026-05-22) — Developer Experience Polish
 
 > Focus: make Rivet easier to configure, inspect, and try correctly.
 > No new extraction modes — every change reduces first-touch friction
@@ -83,7 +83,7 @@
   [`docker/build-push-action`](https://github.com/docker/build-push-action)
   "Distribute build across multiple runners" recipe.
 
-## 0.7.2 (unreleased) — Cloud Landing Polish
+## 0.7.2 (2026-05-22) — Cloud Landing Polish
 
 > Focus: make cloud outputs historically verifiable and safer to operate.
 > No new extraction modes, no new database sources — every change tightens
