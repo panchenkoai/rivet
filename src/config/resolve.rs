@@ -14,6 +14,24 @@ pub fn resolve_vars(
     input: &str,
     params: Option<&std::collections::HashMap<String, String>>,
 ) -> crate::error::Result<String> {
+    // F10 (0.7.5 audit): warn loudly when `--param key=value` was
+    // passed but `${key}` never appears in the config.  A common typo
+    // (`--param maxid=…` vs `${max_id}`) is otherwise silently
+    // ignored and the operator gets unexpected results.
+    if let Some(p) = params {
+        for key in p.keys() {
+            let placeholder = format!("${{{key}}}");
+            if !input.contains(&placeholder) {
+                log::warn!(
+                    "--param '{}' was not referenced by any `${{{}}}` placeholder in the config — \
+                     check the parameter name (case-sensitive) or remove the unused --param",
+                    key,
+                    key
+                );
+            }
+        }
+    }
+
     let mut result = input.to_string();
     let mut search_from = 0;
     while let Some(rel_start) = result[search_from..].find("${") {

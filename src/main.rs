@@ -28,7 +28,14 @@ mod types;
 use clap::Parser;
 
 fn main() {
-    env_logger::init();
+    // F-NEW-F (0.7.5 audit): default log level was `error`, so every
+    // `log::warn!(...)` in the codebase (unused --param, --force as
+    // no-op, schema-drift advisories, redaction notices, plaintext
+    // credentials in URL, ...) was silently dropped unless the
+    // operator set RUST_LOG=warn.  Showing warns by default makes
+    // these guardrails visible without changing anything for
+    // operators that already override RUST_LOG.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let cli = cli::Cli::parse();
     let json_errors = cli.json_errors;
     if let Err(e) = cli::dispatch(cli) {

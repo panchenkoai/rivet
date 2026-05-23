@@ -69,7 +69,12 @@ pub fn run_plan_command(
 
     for export in exports {
         built.push(build_plan_artifact(
-            &config, export, config_dir, params, &state,
+            &config,
+            export,
+            config_path,
+            config_dir,
+            params,
+            &state,
         )?);
     }
 
@@ -111,6 +116,7 @@ pub fn run_plan_command(
 fn build_plan_artifact(
     config: &Config,
     export: &crate::config::ExportConfig,
+    config_path: &str,
     config_dir: &Path,
     params: Option<&HashMap<String, String>>,
     state: &StateStore,
@@ -136,6 +142,23 @@ fn build_plan_artifact(
         Ok(diag) => {
             let mut warnings = diag.warnings.clone();
             warnings.extend(validate_warnings);
+            // F3 (0.7.5 audit): the JSON artifact's `diagnostics`
+            // exposed a non-Efficient verdict with `warnings: []`, so a
+            // machine consumer could not see *why* the plan was flagged.
+            // If preflight emitted no specific warning, fall back to the
+            // build_suggestion text (the same line shown in `rivet check`)
+            // so the JSON always carries at least one human-readable
+            // reason matching the verdict.
+            if warnings.is_empty() && !matches!(diag.verdict, preflight::HealthVerdict::Efficient) {
+                if let Some(s) = diag.suggestion.clone() {
+                    warnings.push(s);
+                } else {
+                    warnings.push(format!(
+                        "verdict {} but preflight collected no specific warnings — review `rivet check` output for context",
+                        diag.verdict
+                    ));
+                }
+            }
             let plan_diagnostics = PlanDiagnostics {
                 verdict: diag.verdict.to_string(),
                 warnings,
@@ -195,13 +218,27 @@ fn build_plan_artifact(
         build_prioritization_inputs(export, &plan, &computed, &plan_diagnostics, hints, history);
     let recommendation = recommend_export(&inputs, &plan_diagnostics);
 
-    let artifact = PlanArtifact::new(
+    let mut artifact = PlanArtifact::new(
         plan.export_name.clone(),
         plan.strategy.mode_label().to_string(),
         fingerprint,
         plan,
         computed,
         plan_diagnostics,
+    );
+
+    // F13 (0.7.5 audit): record the absolute config path so `rivet
+    // apply` can locate the matching `.rivet_state.db` (cursors,
+    // manifest history) even when the plan JSON is stored in a
+    // different directory.  `canonicalize` resolves symlinks and
+    // produces an absolute path; we fall back to the original string
+    // if the path no longer resolves (rare, e.g. config deleted
+    // between plan and apply).
+    artifact.config_path = Some(
+        Path::new(config_path)
+            .canonicalize()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| config_path.to_string()),
     );
 
     Ok((artifact, inputs, recommendation))
@@ -234,11 +271,21 @@ fn compute_plan_data(
                 plan.source.source_type,
             )?;
             let chunk_count = chunk_ranges.len();
+            // F4 (0.7.5 audit): for chunked exports the artifact already
+            // contains the exact key span (`chunk_ranges[0].0` ..
+            // `chunk_ranges[-1].1`).  Using that as `row_estimate`
+            // beats `pg_class.reltuples` (which is `1130` on a fresh
+            // 30-row PG table because `ANALYZE` hasn't run).  This
+            // makes PG and MySQL agree on the same artifact.
+            let chunked_estimate = chunk_ranges
+                .first()
+                .zip(chunk_ranges.last())
+                .map(|(first, last)| (last.1 - first.0 + 1).max(0));
             Ok(ComputedPlanData {
                 chunk_ranges,
                 chunk_count,
                 cursor_snapshot: None,
-                row_estimate,
+                row_estimate: chunked_estimate.or(row_estimate),
             })
         }
 

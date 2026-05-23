@@ -1,0 +1,9 @@
+source:
+  type: postgres
+  url_env: PG_URL
+
+exports:
+  - name: broken
+    query: "SELECT
+    mode: this_is_not_a_real_mode
+    format: parquet

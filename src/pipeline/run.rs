@@ -92,6 +92,17 @@ pub fn run(
     summary_output: Option<&Path>,
     json_output: bool,
 ) -> Result<()> {
+    // F-NEW-B (0.7.5 audit): `--force` is scoped to whichever gate it
+    // overrides (today: the `_SUCCESS`-already-present refusal on
+    // resume).  When the operator passes `--force` without `--resume`,
+    // the flag is a no-op — surface that explicitly so a typo or
+    // copy-paste mistake does not pass silently.
+    if force && !resume {
+        log::warn!(
+            "--force without --resume is a no-op today (force only overrides the resume safety \
+             gate against a destination prefix whose _SUCCESS is already present)"
+        );
+    }
     let config = Config::load_with_params(config_path, params)?;
 
     let config_dir = Path::new(config_path)

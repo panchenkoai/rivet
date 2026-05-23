@@ -1,5 +1,74 @@
 # Changelog
 
+## 0.7.5 (unreleased) — Plan/Apply UX Audit + Regression Harness
+
+> Focus: drive the binary through every subcommand × flag combination
+> against PostgreSQL and MySQL fixtures, capture the actual behaviour,
+> and fix the inconsistencies that showed up.  Tests pinned by
+> observed output, not by code reading.  The harness lives in
+> `dev/cli_matrix/` and is now the regression guard for future
+> releases — diff per-scenario `stdout`/`stderr`/exit codes between
+> the previous and next release before tagging.
+
+### Bug fixes (apply path)
+
+- **`fix(pipeline/apply)`** [F1] — `--force` now correctly bypasses the
+  cursor-drift gate (previously the error message claimed it would,
+  but the code never honoured the flag).
+- **`fix(pipeline/apply)`** [F13] — apply resolves state DB from the
+  original config's directory (recorded in `PlanArtifact.config_path`
+  at plan time), not the plan file's directory.  Storing a plan JSON
+  separately from its config no longer produces bogus *cursor drift
+  (current: None)* on every incremental apply.  Pre-0.7.5 artifacts
+  fall back to the plan file's directory with a `WARN`.
+- **`feat(pipeline/summary)`** [F5] — every apply run records an
+  `apply_context: { plan_id, forced, force_bypassed }` block in
+  `summary.json`.  Closes the audit-trail gap surfaced by the 0.7.5
+  audit.
+
+### Bug fixes (UX polish)
+
+- **`fix(redact)`** [F-NEW-C] — `redact_url_passwords` no longer
+  double-encodes multi-byte UTF-8 codepoints.  Every error message
+  containing an em-dash, Cyrillic, or any non-ASCII glyph passing
+  through the redactor came out mojibaked.  Pinned by tests.
+- **`fix(preflight/doctor)`** [F-NEW-A] — `rivet doctor` exits
+  non-zero when any probe fails.  Previously printed `[FAIL]` but
+  exited 0 so cron/CI could not detect a broken environment by rc.
+- **`fix(config)`** [F11, F12] — config-file-not-found and YAML
+  parse errors now name the file path.
+- **`fix(plan/artifact)`** [F8] — `apply` on a non-JSON file produces
+  a Rivet-shaped message instead of the raw `expected ident at line
+  1 column 2`.
+- **`fix(pipeline/apply)`** [F6] — stale-plan error switches to days
+  + creation date for ages ≥ 48 h ("2334 days old (created 2020-01-01)")
+  instead of "56035 hours old".
+- **`fix(plan)`** [F3] — `diagnostics.warnings` populates from
+  `build_suggestion` when the verdict is non-Efficient and no specific
+  warning was collected.  JSON consumers no longer see `DEGRADED`
+  with `warnings: []`.
+- **`fix(plan/chunked)`** [F4] — chunked `row_estimate` is derived
+  from `chunk_ranges` instead of `pg_class.reltuples` (stale before
+  `ANALYZE`).  PG and MySQL artifacts of the same fixture now agree.
+- **`fix(config/resolve)`** [F10] — warns when `--param key=value`
+  is passed but `${key}` never appears in the config.
+- **`fix(pipeline/run)`** [F-NEW-B] — `run --force` without `--resume`
+  warns that the flag is a no-op in this combination.
+- **`feat(main)`** [F-NEW-F] — `env_logger` default level is now
+  `warn` (was implicit `error`).  Every `log::warn!` surfaces by
+  default; `RUST_LOG` still overrides.
+
+### Regression harness
+
+- **`feat(dev/cli_matrix)`** — new harness drives 75 scenarios across
+  13 subcommands × {PG, MySQL} × flag combinations.  Each scenario
+  captures `stdout`, `stderr`, exit code, command line, and description.
+  Used as a release gate: diff per-scenario rc between previous and
+  next release before tagging.  See `dev/cli_matrix/README.md`.
+- **`ci`** — new `cli-matrix` job runs the harness against the docker
+  compose fixtures on every PR and the nightly schedule.  Failures
+  block merge.
+
 ## 0.7.4 (unreleased) — Trust Hardening + First-User Story
 
 > Focus: close the trust-documentation layer, add a small high-leverage

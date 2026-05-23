@@ -52,19 +52,37 @@ pub fn redact_url_passwords(s: &str) -> String {
     // Find `scheme://userinfo@` segments.  We don't pull in a regex
     // crate just for this one pattern — a hand-rolled walk is faster
     // and avoids a dep that grows the binary.
+    //
+    // F-NEW-C (0.7.5 audit): the previous version copied non-matching
+    // bytes one at a time via `out.push(bytes[i] as char)`, which
+    // re-interpreted each UTF-8 byte as a Unicode code point and
+    // re-encoded it.  Every multi-byte glyph (em-dash, Cyrillic, …)
+    // became double-encoded mojibake (`—` → `â\u{80}\u{94}`) in any
+    // error message that hit the redactor.  Correct fix: copy the
+    // next UTF-8 codepoint as a whole slice of `s`, not byte-by-byte.
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
     while i < bytes.len() {
-        if let Some(end) = try_redact_at(bytes, i) {
-            // `try_redact_at` already wrote into `out`; advance to `end`.
-            // The `out` parameter is mutated via the helper for clarity.
-            let (rewritten, advance) = end;
+        if let Some((rewritten, advance)) = try_redact_at(bytes, i) {
             out.push_str(&rewritten);
             i = advance;
-        } else {
-            out.push(bytes[i] as char);
+            continue;
+        }
+        let b = bytes[i];
+        if b.is_ascii() {
+            out.push(b as char);
             i += 1;
+        } else {
+            // Multi-byte UTF-8 codepoint starting at `i`; continuation
+            // bytes have the form 10xxxxxx.  Copy the whole codepoint
+            // verbatim from the source string.
+            let start = i;
+            i += 1;
+            while i < bytes.len() && (bytes[i] & 0xC0) == 0x80 {
+                i += 1;
+            }
+            out.push_str(&s[start..i]);
         }
     }
     out
@@ -209,5 +227,36 @@ mod tests {
         let out = redact_error(&e);
         assert!(!out.contains("s3cret"));
         assert!(out.contains("REDACTED@db.prod"));
+    }
+
+    // ── F-NEW-C: multi-byte UTF-8 must round-trip ─────────────────────────────
+
+    #[test]
+    fn preserves_em_dash_and_other_multibyte_glyphs() {
+        // Before the F-NEW-C fix, the byte-by-byte loop in
+        // `redact_url_passwords` double-encoded every non-ASCII codepoint:
+        // the em-dash `—` (UTF-8 e2 80 94) came out as `â\u{80}\u{94}`
+        // (c3 a2 c2 80 c2 94).  This test pins the round-trip so the
+        // regression cannot return silently in any error message.
+        let s = "export 'orders': --resume refused — destination prefix has _SUCCESS";
+        assert_eq!(
+            redact_url_passwords(s),
+            s,
+            "non-URL text containing an em-dash must pass through unchanged"
+        );
+
+        let s2 = "сообщение об ошибке: cannot connect";
+        assert_eq!(
+            redact_url_passwords(s2),
+            s2,
+            "Cyrillic text must pass through unchanged"
+        );
+
+        // And it must still redact correctly when the string contains
+        // BOTH multi-byte glyphs and a redactable URL.
+        let s3 = "ошибка — postgresql://u:p@host/db: dropped";
+        let out = redact_url_passwords(s3);
+        assert!(out.contains("ошибка — postgresql://REDACTED@host/db"));
+        assert!(!out.contains("u:p@"));
     }
 }

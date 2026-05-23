@@ -74,6 +74,14 @@ pub struct RunReport {
     /// Suggested invocation to continue an interrupted run, or `None` when the
     /// run completed successfully.
     pub resume_command: Option<String>,
+
+    /// Apply-time context (plan_id, --force usage, bypassed checks).  `None`
+    /// when this run came from `rivet run` rather than `rivet apply`.  Added
+    /// in 0.7.5 to close the audit-trail gap surfaced by finding F5 (forced
+    /// applies left no record).  Existing consumers that ignore unknown
+    /// fields are unaffected.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub apply_context: Option<crate::pipeline::summary::ApplyContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +175,8 @@ impl RunReport {
             error_message: summary.error_message.clone(),
             resumable,
             resume_command,
+
+            apply_context: summary.apply_context.clone(),
         }
     }
 }

@@ -41,6 +41,26 @@ fn plan_snapshot_from(plan: &ResolvedRunPlan) -> PlanSnapshot {
     }
 }
 
+/// Context recorded when a run was launched via `rivet apply` rather than
+/// `rivet run`.  Provides the audit trail for **F5**: which plan artifact
+/// was applied, whether `--force` was passed, and which preflight checks
+/// `--force` actually bypassed.
+///
+/// `None` on `RunSummary` means the run came from `rivet run` (no plan
+/// artifact was applied).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ApplyContext {
+    /// `plan_id` from the applied `PlanArtifact`.
+    pub plan_id: String,
+    /// Was `--force` passed to `rivet apply`?
+    pub forced: bool,
+    /// Names of preflight checks that `--force` actually overrode for this
+    /// run.  Possible values: `"staleness"`, `"cursor_drift"`.  Empty when
+    /// `forced` is true but no check actually had to be bypassed (the plan
+    /// was fresh and the cursor matched).
+    pub force_bypassed: Vec<String>,
+}
+
 /// Accumulates operational data during a pipeline run for summary and metrics.
 ///
 /// The embedded `journal` is the structured event log for this run.  Use
@@ -109,6 +129,10 @@ pub struct RunSummary {
     /// streaming destination, when `--validate` was not requested, or when
     /// the run failed before any manifest could be written.
     pub manifest_verification: Option<crate::pipeline::ManifestVerification>,
+    /// Apply-time context (plan_id, --force usage, bypassed checks).
+    /// `None` when the run came from `rivet run` rather than `rivet apply`.
+    /// See [`ApplyContext`] and finding **F5** of the 0.7.5 audit.
+    pub apply_context: Option<ApplyContext>,
     /// Structured event log for this run.  Answers the four DoD observability questions.
     pub journal: RunJournal,
 }
@@ -158,6 +182,7 @@ impl RunSummary {
             manifest_parts: Vec::new(),
             schema_fingerprint: None,
             manifest_verification: None,
+            apply_context: None,
             journal,
         }
     }
@@ -215,6 +240,7 @@ impl RunSummary {
             manifest_parts: Vec::new(),
             schema_fingerprint: None,
             manifest_verification: None,
+            apply_context: None,
             journal,
         }
     }
