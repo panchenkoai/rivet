@@ -51,3 +51,13 @@ pilot_bench.yaml
 
 # Seed benchmark logs — large, machine-generated, not part of the source record
 /dev/*.log
+
+# CLI matrix harness — captured stdout/stderr/exit codes per scenario;
+# generated fresh on every `matrix.sh` run, not part of the source record.
+# The harness scripts (matrix.sh, seed.sh, README.md, cfg/) ARE committed.
+/dev/cli_matrix/logs/
+/dev/cli_matrix/out/
+/dev/cli_matrix/rivet
+/dev/cli_matrix/cfg/pg/
+/dev/cli_matrix/cfg/my/
+/dev/cli_matrix/cfg/.rivet/

@@ -17,11 +17,17 @@ use crate::plan::{PlanArtifact, StalenessCheck};
 use crate::state::StateStore;
 
 use super::chunked::ChunkSource;
+use super::summary::ApplyContext;
 
 /// Entry point for `rivet apply <plan-file> [--force]`.
 pub fn run_apply_command(plan_file: &str, force: bool) -> Result<()> {
     // 1. Load artifact
     let artifact = PlanArtifact::from_file(plan_file)?;
+
+    // Track which preflight checks --force actually overrode for this run.
+    // Threaded into RunSummary.apply_context so the run report carries an
+    // auditable record of bypassed gates (finding F5 of the 0.7.5 audit).
+    let mut force_bypassed: Vec<String> = Vec::new();
 
     // 2. Staleness check
     let warn_threshold = Duration::hours(1);
@@ -36,36 +42,104 @@ pub fn run_apply_command(plan_file: &str, force: bool) -> Result<()> {
             );
         }
         StalenessCheck::StaleError(age) => {
+            // F6 (0.7.5 audit): "56035 hours old" is mathematically
+            // correct but unreadable.  For ages above 48 h switch to
+            // days + the actual `created_at` date; below that keep
+            // hours so the boundary right above 24 h reads cleanly.
+            let age_phrase = if age.num_hours() >= 48 {
+                format!(
+                    "{} days old (created {})",
+                    age.num_days(),
+                    artifact.created_at.format("%Y-%m-%d")
+                )
+            } else {
+                format!("{} hours old", age.num_hours())
+            };
             if !force {
                 anyhow::bail!(
-                    "plan '{}' is {} hours old (limit: 24 h). Regenerate with `rivet plan` or pass --force to override.",
+                    "plan '{}' is {} (limit: 24 h). Regenerate with `rivet plan` or pass --force to override.",
                     artifact.export_name,
-                    age.num_hours()
+                    age_phrase,
                 );
             }
+            force_bypassed.push("staleness".into());
             log::warn!(
-                "plan '{}': ignoring staleness ({} h) because --force was passed",
+                "plan '{}': ignoring staleness ({}) because --force was passed",
                 artifact.export_name,
-                age.num_hours()
+                age_phrase,
             );
         }
     }
 
-    // 3. Open StateStore from the plan file's directory (no config file needed)
+    // 3. Open StateStore — F13 (0.7.5 audit) resolution policy:
+    //    a) If the artifact recorded the original config path AND that
+    //       directory exists, open state next to it.  This is the only
+    //       path that keeps `apply` consistent with `rivet run`'s state
+    //       location, so cursors, manifests, and schema history line up.
+    //    b) Otherwise fall back to the plan file's own directory — the
+    //       pre-0.7.5 behaviour, which is the right answer when the
+    //       config has been deleted or moved and the operator just
+    //       wants to replay the artifact in isolation.
+    //
+    //    The fallback path also emits a WARN so the operator notices
+    //    the divergence (e.g. plan files stored separately from
+    //    configs without explicit intent).
     let plan_dir = Path::new(plan_file)
         .parent()
         .unwrap_or_else(|| Path::new("."));
-    let state_path = plan_dir.join(".rivet_state.db");
+    let state_dir = match artifact
+        .config_path
+        .as_deref()
+        .map(Path::new)
+        .and_then(Path::parent)
+    {
+        Some(dir) if dir.exists() => dir.to_path_buf(),
+        Some(dir) => {
+            log::warn!(
+                "plan '{}': original config dir '{}' no longer exists; opening state next to plan file instead. \
+                 Cursors and manifest history from the original run will not be visible.",
+                artifact.export_name,
+                dir.display(),
+            );
+            plan_dir.to_path_buf()
+        }
+        None => {
+            log::warn!(
+                "plan '{}': artifact has no recorded config path (pre-0.7.5 plan?). \
+                 Opening state next to the plan file; this may diverge from the state \
+                 used by `rivet run` for the same config.",
+                artifact.export_name,
+            );
+            plan_dir.to_path_buf()
+        }
+    };
+    let state_path = state_dir.join(".rivet_state.db");
     let state = StateStore::open(state_path.to_str().unwrap_or(".rivet_state.db"))?;
 
     // 4. Cursor drift check for Incremental exports
+    //
+    // Finding F1 of the 0.7.5 audit: the error message has always told the
+    // user "pass --force to skip this check", but until 0.7.5 the code did
+    // not actually honour `--force` here.  The flag now bypasses the bail
+    // with a WARN log, matching the documented contract and the analogous
+    // staleness path above.
     if artifact.computed.cursor_snapshot.is_some() {
         let current = state.get(&artifact.export_name)?.last_cursor_value;
         if !artifact.cursor_matches(current.as_deref()) {
-            anyhow::bail!(
-                "plan '{}': cursor has drifted since plan was generated \
-                 (plan snapshot: {:?}, current: {:?}). \
-                 Regenerate with `rivet plan` or pass --force to skip this check.",
+            if !force {
+                anyhow::bail!(
+                    "plan '{}': cursor has drifted since plan was generated \
+                     (plan snapshot: {:?}, current: {:?}). \
+                     Regenerate with `rivet plan` or pass --force to skip this check.",
+                    artifact.export_name,
+                    artifact.computed.cursor_snapshot,
+                    current,
+                );
+            }
+            force_bypassed.push("cursor_drift".into());
+            log::warn!(
+                "plan '{}': cursor has drifted (plan snapshot: {:?}, current: {:?}) — \
+                 proceeding because --force was passed",
                 artifact.export_name,
                 artifact.computed.cursor_snapshot,
                 current,
@@ -80,9 +154,21 @@ pub fn run_apply_command(plan_file: &str, force: bool) -> Result<()> {
         ChunkSource::Precomputed(artifact.computed.chunk_ranges.clone())
     };
 
-    // 6. Execute using the plan from the artifact
+    // 6. Execute using the plan from the artifact, carrying the apply audit
+    // context into the run report (F5).
+    let apply_context = ApplyContext {
+        plan_id: artifact.plan_id.clone(),
+        forced: force,
+        force_bypassed,
+    };
     let plan = artifact.resolved_plan.clone();
-    super::run_export_job_with_chunk_source(&plan, &state, chunk_source, plan_file)
+    super::run_export_job_with_chunk_source(
+        &plan,
+        &state,
+        chunk_source,
+        plan_file,
+        Some(apply_context),
+    )
 }
 
 #[cfg(test)]

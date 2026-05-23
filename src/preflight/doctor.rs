@@ -90,11 +90,17 @@ pub fn doctor(config_path: &str) -> Result<()> {
     println!();
     if all_ok {
         println!("All checks passed.");
+        Ok(())
     } else {
+        // F-NEW-A (0.7.5 audit): previously `doctor` printed
+        // "Some checks failed" and returned `Ok(())`, so the exit
+        // code was 0 even when source auth or destination probe
+        // failed.  CI / cron orchestration that only inspects rc
+        // could not tell a healthy environment from a broken one.
+        // The fail-line is still printed; the exit code now matches.
         println!("Some checks failed. Fix the issues above before running exports.");
+        anyhow::bail!("doctor: one or more preflight checks failed (see output above)")
     }
-
-    Ok(())
 }
 
 fn check_source_auth(config: &Config) -> Result<()> {

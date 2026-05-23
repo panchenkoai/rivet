@@ -41,9 +41,24 @@ impl Config {
         path: &str,
         params: Option<&std::collections::HashMap<String, String>>,
     ) -> crate::error::Result<Self> {
-        let contents = std::fs::read_to_string(path)?;
+        // F11 (0.7.5 audit): raw `std::io::Error` lost the path on
+        // not-found.  Wrap with the file path + a hint so the operator
+        // can see *which* config the tool could not open.
+        let contents = std::fs::read_to_string(path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!(
+                    "config file '{}' not found.\n  Hint: check the path, or run `rivet init` to generate one.",
+                    path
+                )
+            } else {
+                anyhow::anyhow!("cannot read config file '{}': {}", path, e)
+            }
+        })?;
         let resolved = resolve_vars(&contents, params)?;
-        Self::from_yaml(&resolved)
+        // F12 (0.7.5 audit): YAML parse errors did not name the config
+        // file.  When loading from disk we know the path — thread it
+        // into the parse error.
+        Self::from_yaml(&resolved).map_err(|e| anyhow::anyhow!("config file '{}': {:#}", path, e))
     }
 
     pub fn from_yaml(yaml: &str) -> crate::error::Result<Self> {

@@ -1,0 +1,14 @@
+source:
+  type: mysql
+  url_env: MY_URL
+
+exports:
+  - name: pa_audit
+    query: "SELECT id, name FROM pa_audit"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 10
+    format: parquet
+    destination:
+      type: local
+      path: ./out/my_chunked

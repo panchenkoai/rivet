@@ -210,6 +210,68 @@ jobs:
         if: always()
         run: docker compose down
 
+  cli-matrix:
+    name: CLI behaviour matrix (regression guard)
+    runs-on: ubuntu-latest
+    # The harness drives the actual binary through every subcommand x
+    # flag combination against the docker fixtures and pins exit
+    # codes per scenario.  Catches UX regressions that unit tests and
+    # focused `tests/live_*.rs` integration tests miss — e.g. an exit
+    # code drift (F-NEW-A in the 0.7.5 audit) or a default-flag
+    # behaviour change.  See dev/cli_matrix/README.md for rationale.
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start databases
+        run: docker compose up -d postgres mysql
+
+      - name: Wait for databases
+        run: |
+          echo "Waiting for Postgres..."
+          for i in $(seq 1 30); do docker compose exec -T postgres pg_isready -U rivet && break || sleep 2; done
+          echo "Waiting for MySQL..."
+          for i in $(seq 1 30); do docker compose exec -T mysql mysqladmin ping -h localhost -uroot -privet 2>/dev/null && break || sleep 2; done
+
+      - name: Build release rivet
+        run: cargo build --bin rivet --release
+
+      - name: Stage rivet inside matrix dir
+        run: cp target/release/rivet dev/cli_matrix/rivet
+
+      - name: Seed pa_audit fixture
+        run: bash dev/cli_matrix/seed.sh
+
+      - name: Run CLI matrix
+        # `--output` directories are created by the harness from the
+        # cfg/*.yaml files; logs go under dev/cli_matrix/logs/matrix/.
+        # Failure here means an exit code or stderr/stdout shape
+        # diverged from what the baseline expects.
+        run: bash dev/cli_matrix/matrix.sh | tee dev/cli_matrix/run.log
+
+      - name: Verify no scenario regressed exit code
+        # Pins the per-scenario exit codes captured during the 0.7.5
+        # audit.  Any divergence is either an intentional change
+        # (update this list in the same PR + CHANGELOG entry) or a
+        # regression (block the PR).  See
+        # dev/cli_matrix/expected_rc.txt for the baseline.
+        run: bash dev/cli_matrix/check_rc.sh
+
+      - name: Upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-matrix-logs
+          path: dev/cli_matrix/logs/matrix/
+          retention-days: 14
+
+      - name: Stop services
+        if: always()
+        run: docker compose down
+
   audit:
     name: Security audit
     runs-on: ubuntu-latest

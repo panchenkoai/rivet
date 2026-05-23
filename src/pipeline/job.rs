@@ -195,6 +195,7 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
         manifest_parts: Vec::new(),
         schema_fingerprint: None,
         manifest_verification: None,
+        apply_context: None,
         journal,
     }
 }
@@ -432,6 +433,7 @@ pub(crate) fn run_export_job_with_chunk_source(
     state: &StateStore,
     chunk_source: chunked::ChunkSource,
     config_path: &str,
+    apply_context: Option<crate::pipeline::summary::ApplyContext>,
 ) -> Result<()> {
     // Re-validate the plan from the artifact (fast, no DB queries).
     let diags = validate_plan(plan);
@@ -463,6 +465,7 @@ pub(crate) fn run_export_job_with_chunk_source(
     let rss_before = crate::resource::get_rss_mb();
     let rss_sampler = crate::resource::RssPeakSampler::start(rss_before, 100);
     let mut summary = RunSummary::new(plan);
+    summary.apply_context = apply_context;
 
     let result = if plan.strategy.requires_parallel_execution() {
         if plan.strategy.is_resumable() {

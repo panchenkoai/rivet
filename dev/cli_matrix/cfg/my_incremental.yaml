@@ -1,0 +1,13 @@
+source:
+  type: mysql
+  url_env: MY_URL
+
+exports:
+  - name: pa_audit
+    query: "SELECT id, name FROM pa_audit"
+    mode: incremental
+    cursor_column: id
+    format: parquet
+    destination:
+      type: local
+      path: ./out/my_incremental
