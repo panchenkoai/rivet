@@ -212,7 +212,7 @@ fn copy_pg_orders_worker(
                     ],
                 );
                 count += 1;
-                if count % batch_size == 0 {
+                if count.is_multiple_of(batch_size) {
                     w.write_all(&buf)?;
                     buf.clear();
                 }
@@ -292,7 +292,7 @@ fn copy_pg_events_worker(
                     ],
                 );
                 count += 1;
-                if count % batch_size == 0 {
+                if count.is_multiple_of(batch_size) {
                     w.write_all(&buf)?;
                     buf.clear();
                 }
@@ -358,7 +358,7 @@ fn copy_pg_page_views_worker(
             buf.extend_from_slice(copy_row.as_bytes());
             buf.push(b'\n');
             count += 1;
-            if count % batch_size == 0 {
+            if count.is_multiple_of(batch_size) {
                 w.write_all(&buf)?;
                 buf.clear();
             }
