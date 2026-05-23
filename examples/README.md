@@ -21,8 +21,10 @@ documentation.
 | [`pg_chunked_s3.yaml`](pg_chunked_s3.yaml) | PostgreSQL | chunked | S3 |
 | [`pg_date_chunked_local.yaml`](pg_date_chunked_local.yaml) | PostgreSQL | chunked-by-days | local |
 | [`pg_time_window_gcs.yaml`](pg_time_window_gcs.yaml) | PostgreSQL | time-window | GCS |
+| [`pg_full_azure_sas.yaml`](pg_full_azure_sas.yaml) | PostgreSQL | full | Azure Blob (SAS token) |
 | [`mysql_full_local.yaml`](mysql_full_local.yaml) | MySQL | full | local |
 | [`mysql_incremental_local.yaml`](mysql_incremental_local.yaml) | MySQL | incremental | local |
+| [`mysql_full_azure_sas.yaml`](mysql_full_azure_sas.yaml) | MySQL | full | Azure Blob (SAS token) |
 
 Every example carries a header comment explaining the use case and
 the exact command to run it.

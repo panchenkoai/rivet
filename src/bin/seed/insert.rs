@@ -3,77 +3,10 @@ use std::io::Write;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use clap::Parser;
 use rand::Rng;
 use rand::RngExt;
 
-#[derive(Parser)]
-#[command(name = "seed", about = "Generate test data for rivet")]
-struct Args {
-    /// Target database: postgres, mysql, or both
-    #[arg(short, long, default_value = "both")]
-    target: String,
-
-    /// Number of users to generate
-    #[arg(long, default_value = "100000")]
-    users: usize,
-
-    /// Average orders per user
-    #[arg(long, default_value = "10")]
-    orders_per_user: usize,
-
-    /// Average events per user
-    #[arg(long, default_value = "50")]
-    events_per_user: usize,
-
-    /// Number of page_views to generate (wide table, degraded scenario)
-    #[arg(long, default_value = "2000000")]
-    page_views: usize,
-
-    /// Number of content_items to generate (heavy text, worst case for memory)
-    #[arg(long, default_value = "200000")]
-    content_items: usize,
-
-    /// PostgreSQL connection URL
-    #[arg(long, default_value = "postgresql://rivet:rivet@localhost:5432/rivet")]
-    pg_url: String,
-
-    /// MySQL connection URL
-    #[arg(long, default_value = "mysql://rivet:rivet@localhost:3306/rivet")]
-    mysql_url: String,
-
-    /// Batch size for inserts
-    #[arg(long, default_value = "1000")]
-    batch_size: usize,
-
-    /// Fill `orders_sparse` with few rows and huge gaps in `id` (for chunked / sparse-key demos)
-    #[arg(long)]
-    sparse_chunk_demo: bool,
-
-    /// Only create (if needed), truncate, and fill `orders_sparse` — skip users/orders/events/page_views/content
-    #[arg(long)]
-    only_sparse_chunk_demo: bool,
-
-    /// Number of rows in `orders_sparse` (ids: 1, 1+gap, 1+2·gap, …). Use ≥3 to see sparse min..max vs row count
-    #[arg(long, default_value = "3")]
-    sparse_chunk_rows: usize,
-
-    /// Gap between consecutive sparse ids (wider gap ⇒ more empty chunk windows for the same chunk_size)
-    #[arg(long, default_value = "2000000")]
-    sparse_chunk_id_gap: i64,
-
-    /// Rows per INSERT for `orders_sparse` (keep ≤ few thousand if max_allowed_packet / statement size is tight)
-    #[arg(long, default_value = "5000")]
-    sparse_chunk_batch_size: usize,
-
-    /// Number of rows in `orders_coalesce` (composite-cursor demo with NULL updated_at)
-    #[arg(long, default_value = "2000")]
-    coalesce_rows: usize,
-
-    /// Fraction of `orders_coalesce` rows with NULL `updated_at` (range 0.0..1.0)
-    #[arg(long, default_value = "0.35")]
-    coalesce_null_ratio: f64,
-}
+use crate::args::Args;
 
 const FIRST_NAMES: &[&str] = &[
     "Alice", "Bob", "Carol", "Dave", "Eve", "Frank", "Grace", "Hank", "Ivy", "Jack", "Karen",
@@ -105,7 +38,7 @@ const DOMAINS: &[&str] = &[
     "tutanota.com",
 ];
 
-const PRODUCTS: &[&str] = &[
+pub(crate) const PRODUCTS: &[&str] = &[
     "MacBook Pro 16\"",
     "Dell XPS 15",
     "ThinkPad X1 Carbon",
@@ -138,9 +71,9 @@ const PRODUCTS: &[&str] = &[
     "Lightning Cable 3-pack",
 ];
 
-const STATUSES: &[&str] = &["pending", "shipped", "delivered", "cancelled"];
+pub(crate) const STATUSES: &[&str] = &["pending", "shipped", "delivered", "cancelled"];
 
-const EVENT_TYPES: &[&str] = &[
+pub(crate) const EVENT_TYPES: &[&str] = &[
     "login",
     "logout",
     "page_view",
@@ -153,7 +86,7 @@ const EVENT_TYPES: &[&str] = &[
     "api_call",
 ];
 
-const BIOS: &[&str] = &[
+pub(crate) const BIOS: &[&str] = &[
     "Software engineer",
     "Product manager",
     "Data scientist",
@@ -200,58 +133,9 @@ const PAGES: &[&str] = &[
     "/help",
 ];
 
-fn main() -> Result<()> {
-    let args = Args::parse();
+// ─── PostgreSQL (legacy INSERT path) ─────────────────────────
 
-    if args.only_sparse_chunk_demo {
-        println!(
-            "Sparse chunk demo: {} row(s), id gap {}",
-            args.sparse_chunk_rows, args.sparse_chunk_id_gap
-        );
-        if args.target == "postgres" || args.target == "both" {
-            println!("\n=== PostgreSQL (orders_sparse only) ===");
-            seed_pg_sparse_only(&args)?;
-        }
-        if args.target == "mysql" || args.target == "both" {
-            println!("\n=== MySQL (orders_sparse only) ===");
-            seed_mysql_sparse_only(&args)?;
-        }
-        println!("\nDone!");
-        return Ok(());
-    }
-
-    let total_orders = args.users * args.orders_per_user;
-    let total_events = args.users * args.events_per_user;
-    println!(
-        "Generating: {} users, {} orders, {} events, {} page_views, {} content_items{}",
-        args.users,
-        total_orders,
-        total_events,
-        args.page_views,
-        args.content_items,
-        if args.sparse_chunk_demo {
-            " + orders_sparse demo"
-        } else {
-            ""
-        }
-    );
-
-    if args.target == "postgres" || args.target == "both" {
-        println!("\n=== PostgreSQL ===");
-        seed_postgres(&args)?;
-    }
-    if args.target == "mysql" || args.target == "both" {
-        println!("\n=== MySQL ===");
-        seed_mysql(&args)?;
-    }
-
-    println!("\nDone!");
-    Ok(())
-}
-
-// ─── PostgreSQL ──────────────────────────────────────────────
-
-fn seed_postgres(args: &Args) -> Result<()> {
+pub fn seed_postgres(args: &Args) -> Result<()> {
     let mut client = postgres::Client::connect(&args.pg_url, postgres::NoTls)
         .context("failed to connect to PostgreSQL")?;
 
@@ -487,7 +371,7 @@ fn seed_pg_events(client: &mut postgres::Client, args: &Args) -> Result<usize> {
 
 // ─── MySQL ───────────────────────────────────────────────────
 
-fn seed_mysql(args: &Args) -> Result<()> {
+pub fn seed_mysql(args: &Args) -> Result<()> {
     use mysql::prelude::*;
 
     let pool = mysql::Pool::new(mysql::Opts::from_url(&args.mysql_url)?)?;
@@ -732,7 +616,7 @@ fn seed_mysql_events(conn: &mut mysql::PooledConn, args: &Args) -> Result<usize>
 
 // ─── Data generators ─────────────────────────────────────────
 
-fn gen_user(rng: &mut impl Rng, idx: usize) -> (String, String) {
+pub(crate) fn gen_user(rng: &mut impl Rng, idx: usize) -> (String, String) {
     let first = FIRST_NAMES[rng.random_range(0..FIRST_NAMES.len())];
     let last = LAST_NAMES[rng.random_range(0..LAST_NAMES.len())];
     let domain = DOMAINS[rng.random_range(0..DOMAINS.len())];
@@ -747,7 +631,7 @@ fn gen_user(rng: &mut impl Rng, idx: usize) -> (String, String) {
     (name, email)
 }
 
-fn gen_timestamp(rng: &mut impl Rng, year_start: i32, year_end: i32) -> String {
+pub(crate) fn gen_timestamp(rng: &mut impl Rng, year_start: i32, year_end: i32) -> String {
     let start = chrono::NaiveDate::from_ymd_opt(year_start, 1, 1)
         .expect("valid year_start")
         .and_hms_opt(0, 0, 0)
@@ -767,7 +651,7 @@ fn gen_timestamp(rng: &mut impl Rng, year_start: i32, year_end: i32) -> String {
         .to_string()
 }
 
-fn gen_timestamp_after(rng: &mut impl Rng, base: &str, max_days_after: u32) -> String {
+pub(crate) fn gen_timestamp_after(rng: &mut impl Rng, base: &str, max_days_after: u32) -> String {
     let base_dt = chrono::NaiveDateTime::parse_from_str(base, "%Y-%m-%d %H:%M:%S")
         .expect("base timestamp must be valid %Y-%m-%d %H:%M:%S");
     let offset_secs = rng.random_range(0..max_days_after as i64 * 86400);
@@ -775,7 +659,7 @@ fn gen_timestamp_after(rng: &mut impl Rng, base: &str, max_days_after: u32) -> S
     result.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-fn gen_ip(rng: &mut impl Rng) -> String {
+pub(crate) fn gen_ip(rng: &mut impl Rng) -> String {
     if rng.random_bool(0.5) {
         format!(
             "192.168.{}.{}",
@@ -799,7 +683,7 @@ fn gen_ip(rng: &mut impl Rng) -> String {
     }
 }
 
-fn gen_event_payload(rng: &mut impl Rng, event_type: &str) -> String {
+pub(crate) fn gen_event_payload(rng: &mut impl Rng, event_type: &str) -> String {
     match event_type {
         "login" | "logout" => {
             let device = DEVICES[rng.random_range(0..DEVICES.len())];
@@ -835,7 +719,7 @@ fn gen_event_payload(rng: &mut impl Rng, event_type: &str) -> String {
     }
 }
 
-fn gen_note(rng: &mut impl Rng) -> String {
+pub(crate) fn gen_note(rng: &mut impl Rng) -> String {
     let notes = [
         "Rush delivery",
         "Gift wrap requested",
@@ -852,7 +736,7 @@ fn gen_note(rng: &mut impl Rng) -> String {
 }
 
 /// Simple Poisson-like sample for natural variation around the mean.
-fn poisson_sample(rng: &mut impl Rng, lambda: f64) -> usize {
+pub(crate) fn poisson_sample(rng: &mut impl Rng, lambda: f64) -> usize {
     let l = (-lambda).exp();
     let mut k = 0usize;
     let mut p = 1.0_f64;
@@ -965,7 +849,7 @@ const UTM_CAMPAIGNS: &[&str] = &[
     "brand_awareness",
 ];
 
-fn gen_page_view_row(rng: &mut impl Rng, user_count: usize) -> String {
+pub(crate) fn gen_page_view_row(rng: &mut impl Rng, user_count: usize) -> String {
     let session_id = format!(
         "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
         rng.random_range(0u32..u32::MAX),
@@ -1044,7 +928,7 @@ fn gen_page_view_row(rng: &mut impl Rng, user_count: usize) -> String {
     )
 }
 
-const PV_COLS: &str = "(session_id, user_id, url, referrer, user_agent, ip_address, \
+pub(crate) const PV_COLS: &str = "(session_id, user_id, url, referrer, user_agent, ip_address, \
     country_code, region, city, device_type, browser, os, \
     screen_width, screen_height, viewport_width, viewport_height, \
     page_load_ms, dom_ready_ms, time_on_page_ms, scroll_depth_pct, \
@@ -1233,11 +1117,11 @@ fn gen_extra_data(rng: &mut impl Rng) -> String {
     )
 }
 
-const CI_COLS: &str = "(title, body, raw_html, metadata, tags, author_name, author_email, \
+pub(crate) const CI_COLS: &str = "(title, body, raw_html, metadata, tags, author_name, author_email, \
     source_url, category, status, priority, view_count, comment_count, \
     word_count, language, published_at, updated_at, created_at, extra_data)";
 
-fn gen_content_item_row(rng: &mut impl Rng) -> String {
+pub(crate) fn gen_content_item_row(rng: &mut impl Rng) -> String {
     let title = CONTENT_TITLES[rng.random_range(0..CONTENT_TITLES.len())];
     let body_size = rng.random_range(2000..8000);
     let body = gen_lorem_text(rng, body_size).replace('\'', "''");
@@ -1357,7 +1241,7 @@ fn seed_mysql_content_items(conn: &mut mysql::PooledConn, args: &Args) -> Result
 
 // ─── Sparse chunk demo: orders_sparse (wide id gaps) ─────────
 
-fn ensure_orders_sparse_pg(client: &mut postgres::Client) -> Result<()> {
+pub fn ensure_orders_sparse_pg(client: &mut postgres::Client) -> Result<()> {
     client.batch_execute(
         r#"
 CREATE TABLE IF NOT EXISTS orders_sparse (
@@ -1413,12 +1297,12 @@ fn insert_pg_orders_sparse(client: &mut postgres::Client, args: &Args) -> Result
     Ok(total)
 }
 
-fn seed_pg_orders_sparse_fill(client: &mut postgres::Client, args: &Args) -> Result<usize> {
+pub fn seed_pg_orders_sparse_fill(client: &mut postgres::Client, args: &Args) -> Result<usize> {
     ensure_orders_sparse_pg(client)?;
     insert_pg_orders_sparse(client, args)
 }
 
-fn seed_pg_sparse_only(args: &Args) -> Result<()> {
+pub fn seed_pg_sparse_only(args: &Args) -> Result<()> {
     let mut client = postgres::Client::connect(&args.pg_url, postgres::NoTls)
         .context("failed to connect to PostgreSQL")?;
     ensure_orders_sparse_pg(&mut client)?;
@@ -1440,7 +1324,7 @@ fn seed_pg_sparse_only(args: &Args) -> Result<()> {
     Ok(())
 }
 
-fn ensure_orders_sparse_mysql(conn: &mut mysql::PooledConn) -> Result<()> {
+pub fn ensure_orders_sparse_mysql(conn: &mut mysql::PooledConn) -> Result<()> {
     use mysql::prelude::*;
     conn.query_drop(
         "CREATE TABLE IF NOT EXISTS orders_sparse (
@@ -1507,12 +1391,12 @@ fn insert_mysql_orders_sparse(conn: &mut mysql::PooledConn, args: &Args) -> Resu
     Ok(total)
 }
 
-fn seed_mysql_orders_sparse_fill(conn: &mut mysql::PooledConn, args: &Args) -> Result<usize> {
+pub fn seed_mysql_orders_sparse_fill(conn: &mut mysql::PooledConn, args: &Args) -> Result<usize> {
     ensure_orders_sparse_mysql(conn)?;
     insert_mysql_orders_sparse(conn, args)
 }
 
-fn seed_mysql_sparse_only(args: &Args) -> Result<()> {
+pub fn seed_mysql_sparse_only(args: &Args) -> Result<()> {
     use mysql::prelude::*;
     let pool = mysql::Pool::new(mysql::Opts::from_url(&args.mysql_url)?)?;
     let mut conn = pool.get_conn()?;
@@ -1531,7 +1415,7 @@ fn seed_mysql_sparse_only(args: &Args) -> Result<()> {
 
 // ─── Composite-cursor demo: `orders_coalesce` (ADR-0007) ─────────
 
-fn ensure_orders_coalesce_pg(client: &mut postgres::Client) -> Result<()> {
+pub fn ensure_orders_coalesce_pg(client: &mut postgres::Client) -> Result<()> {
     client.batch_execute(
         r#"
 CREATE TABLE IF NOT EXISTS orders_coalesce (
@@ -1549,7 +1433,7 @@ CREATE INDEX IF NOT EXISTS idx_orders_coalesce_created_at ON orders_coalesce(cre
     Ok(())
 }
 
-fn seed_pg_orders_coalesce(client: &mut postgres::Client, args: &Args) -> Result<usize> {
+pub fn seed_pg_orders_coalesce(client: &mut postgres::Client, args: &Args) -> Result<usize> {
     ensure_orders_coalesce_pg(client)?;
     if args.coalesce_rows == 0 {
         return Ok(0);
@@ -1612,7 +1496,7 @@ fn seed_pg_orders_coalesce(client: &mut postgres::Client, args: &Args) -> Result
     Ok(args.coalesce_rows)
 }
 
-fn ensure_orders_coalesce_mysql(conn: &mut mysql::PooledConn) -> Result<()> {
+pub fn ensure_orders_coalesce_mysql(conn: &mut mysql::PooledConn) -> Result<()> {
     use mysql::prelude::*;
     conn.query_drop(
         r#"
@@ -1642,7 +1526,7 @@ CREATE TABLE IF NOT EXISTS orders_coalesce (
     Ok(())
 }
 
-fn seed_mysql_orders_coalesce(conn: &mut mysql::PooledConn, args: &Args) -> Result<usize> {
+pub fn seed_mysql_orders_coalesce(conn: &mut mysql::PooledConn, args: &Args) -> Result<usize> {
     use mysql::prelude::*;
     ensure_orders_coalesce_mysql(conn)?;
     if args.coalesce_rows == 0 {

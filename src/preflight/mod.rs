@@ -191,7 +191,9 @@ mod tests {
         CompressionType, DestinationConfig, DestinationType, ExportConfig, ExportMode, FormatType,
         IncrementalCursorMode, MetaColumns, TimeColumnType,
     };
-    use doctor::{categorize_dest_error, categorize_source_error};
+    use doctor::{
+        categorize_dest_error, categorize_source_error, destination_error_hint, source_error_hint,
+    };
 
     fn make_export(name: &str, mode: ExportMode, cursor: Option<&str>) -> ExportConfig {
         ExportConfig {
@@ -849,5 +851,136 @@ mod tests {
             w.contains("17"),
             "should suggest leaving headroom, got: {w}"
         );
+    }
+
+    // ── v0.7.4: actionable hints next to categorised errors ───────────
+
+    fn src_hint(msg: &str, st: SourceType) -> Option<&'static str> {
+        let err = anyhow::anyhow!("{}", msg);
+        let cat = categorize_source_error(&err);
+        source_error_hint(cat, &err, &st)
+    }
+
+    fn dest_hint(msg: &str, dt: DestinationType) -> Option<&'static str> {
+        let err = anyhow::anyhow!("{}", msg);
+        let dest = DestinationConfig {
+            destination_type: dt,
+            bucket: Some("b".into()),
+            ..Default::default()
+        };
+        let cat = categorize_dest_error(&err, &dest);
+        destination_error_hint(cat, &dest)
+    }
+
+    #[test]
+    fn source_tls_handshake_returns_pg_specific_tls_hint() {
+        let h = src_hint("TLS handshake failed", SourceType::Postgres).expect("hint");
+        assert!(h.contains("tls.mode") && h.contains("ca_file"), "got: {h}");
+    }
+
+    #[test]
+    fn source_tls_handshake_returns_mysql_specific_tls_hint() {
+        let h = src_hint("certificate verify failed", SourceType::Mysql).expect("hint");
+        assert!(h.contains("tls.mode"), "got: {h}");
+    }
+
+    #[test]
+    fn source_auth_error_postgres_mentions_pg_hba() {
+        let h = src_hint("password authentication failed", SourceType::Postgres).expect("hint");
+        assert!(h.contains("pg_hba") && h.contains("SELECT"), "got: {h}");
+    }
+
+    #[test]
+    fn source_auth_error_mysql_mentions_grant() {
+        let h = src_hint(
+            "Access denied for user 'rivet'@'localhost'",
+            SourceType::Mysql,
+        )
+        .expect("hint");
+        assert!(h.contains("GRANT") && h.contains("FLUSH"), "got: {h}");
+    }
+
+    #[test]
+    fn source_connectivity_error_mentions_bastion_and_network() {
+        let h = src_hint("connection refused", SourceType::Postgres).expect("hint");
+        assert!(h.contains("bastion") || h.contains("VPN"), "got: {h}");
+    }
+
+    #[test]
+    fn source_unknown_error_returns_no_hint() {
+        // Generic "error" category should yield no hint — better to
+        // print the raw driver message than to mislead.
+        let h = src_hint("totally unexpected", SourceType::Postgres);
+        assert!(h.is_none(), "unknown errors should not produce a hint");
+    }
+
+    #[test]
+    fn dest_s3_auth_error_names_concrete_actions() {
+        let h = dest_hint("permission denied", DestinationType::S3).expect("hint");
+        assert!(
+            h.contains("s3:PutObject") && h.contains("cloud-permissions"),
+            "got: {h}"
+        );
+    }
+
+    #[test]
+    fn dest_gcs_auth_error_names_concrete_actions() {
+        let h = dest_hint("403 Forbidden", DestinationType::Gcs).expect("hint");
+        assert!(
+            h.contains("storage.objects") && h.contains("cloud-permissions"),
+            "got: {h}"
+        );
+    }
+
+    #[test]
+    fn categorize_dest_error_sas_expired_message_returns_sas_expired_category() {
+        // Guard the load-bearing ordering in categorize_dest_error: the
+        // "sas expired" early-return must fire before the generic "token"
+        // branch, or destination_error_hint produces the wrong hint.
+        // This test pins the *category string*, not just the final hint text.
+        let err = anyhow::anyhow!(
+            "Azure SAS token already expired (se=2024-01-01T00:00:00Z). Generate a new SAS and re-export."
+        );
+        let dest = DestinationConfig {
+            destination_type: DestinationType::Azure,
+            bucket: Some("c".into()),
+            ..Default::default()
+        };
+        let cat = categorize_dest_error(&err, &dest);
+        assert_eq!(
+            cat, "sas expired",
+            "expired-SAS error must categorise as 'sas expired', not '{cat}' — ordering in categorize_dest_error is load-bearing"
+        );
+    }
+
+    #[test]
+    fn dest_azure_sas_expired_returns_regenerate_hint() {
+        // The Azure preflight (v0.7.4) bails with "expired (se=…)" —
+        // the hint must steer the operator to `az storage container
+        // generate-sas` not "your IAM role is broken".
+        let h = dest_hint(
+            "Azure SAS token already expired (se=2024-01-01T00:00:00Z)",
+            DestinationType::Azure,
+        )
+        .expect("hint");
+        assert!(
+            h.contains("generate-sas") && h.contains("AZURE_STORAGE_SAS_TOKEN"),
+            "got: {h}"
+        );
+    }
+
+    #[test]
+    fn dest_s3_bucket_not_found_says_no_auto_create() {
+        let h = dest_hint("NoSuchBucket", DestinationType::S3).expect("hint");
+        assert!(
+            h.contains("does NOT auto-create") && h.contains("aws s3 mb"),
+            "got: {h}"
+        );
+    }
+
+    #[test]
+    fn dest_s3_connectivity_error_warns_about_region_mismatch() {
+        let h = dest_hint("dns error", DestinationType::S3).expect("hint");
+        assert!(h.contains("region") || h.contains("endpoint"), "got: {h}");
     }
 }

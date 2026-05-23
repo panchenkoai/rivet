@@ -1,0 +1,97 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/panchenkoai/rivet/main/schemas/latest/rivet.schema.json
+#
+# Rivet Example: MySQL → Full Export → Azure Blob Storage (SAS token)
+#
+# Use case: daily snapshot of MySQL production tables to Azure Blob using
+#           a short-lived SAS token.
+#
+# Prerequisites:
+#   1. Create the container in the Azure portal.
+#   2. Generate a SAS token:
+#
+#        az storage container generate-sas \
+#          --account-name <account> \
+#          --name <container> \
+#          --permissions rwdl \
+#          --expiry $(date -u -v+7d +%Y-%m-%dT%H:%MZ) \
+#          --account-key "$AZURE_ACCOUNT_KEY" \
+#          -o tsv
+#
+#   3. Export credentials:
+#        export MYSQL_DATABASE_URL="mysql://rivet:rivet@127.0.0.1:3306/rivet"
+#        export AZURE_STORAGE_SAS_TOKEN="sv=2021-08-06&ss=b&srt=o&sp=rwdl&..."
+#
+# Run:
+#   rivet doctor   -c examples/mysql_full_azure_sas.yaml
+#   rivet run      -c examples/mysql_full_azure_sas.yaml
+#   rivet validate -c examples/mysql_full_azure_sas.yaml
+
+source:
+  type: mysql
+  url_env: MYSQL_DATABASE_URL
+  environment: production
+  tuning:
+    profile: balanced
+    batch_size: 10000
+    throttle_ms: 50
+
+exports:
+  - name: users
+    query: >
+      SELECT id, name, email, age, balance, is_active, bio, created_at, updated_at
+      FROM users
+    mode: full
+    format: parquet
+    compression: zstd
+
+    columns:
+      balance: decimal(12,2)
+
+    meta_columns:
+      exported_at: true
+
+    destination:
+      type: azure
+      bucket: test-container
+      account_name: rivet
+      sas_token_env: AZURE_STORAGE_SAS_TOKEN
+      prefix: "mysql/{date}/"
+
+  - name: orders
+    query: >
+      SELECT id, user_id, product, quantity, price, status, notes, ordered_at, updated_at
+      FROM orders
+    mode: full
+    format: parquet
+    compression: zstd
+
+    columns:
+      price: decimal(10,2)
+
+    meta_columns:
+      exported_at: true
+
+    destination:
+      type: azure
+      bucket: test-container
+      account_name: rivet
+      sas_token_env: AZURE_STORAGE_SAS_TOKEN
+      prefix: "mysql/{date}/"
+
+  - name: events
+    query: >
+      SELECT id, user_id, event_type, payload, ip_address, created_at
+      FROM events
+    mode: full
+    format: parquet
+    compression: zstd
+
+    meta_columns:
+      exported_at: true
+
+    destination:
+      type: azure
+      bucket: test-container
+      account_name: rivet
+      sas_token_env: AZURE_STORAGE_SAS_TOKEN
+      prefix: "mysql/{date}/"

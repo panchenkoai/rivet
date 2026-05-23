@@ -83,19 +83,73 @@ docker run -d --name rivet-azurite -p 10000:10000 \
   azurite-blob --blobHost 0.0.0.0
 ```
 
-### Reserved for 0.7.2 (planned additive)
+### Option 3: SAS token (added in 0.7.2)
 
-Not in 0.7.1.  These will land as additive optional fields with no
-breaking change:
+A Shared Access Signature token scopes access to a specific container
+and time window — useful when you cannot or should not share the
+full account key.
 
-- **SAS token** (`sas_token_env`) — pre-signed URLs, time-limited scope.
+Shell:
+
+```bash
+export AZURE_STORAGE_SAS_TOKEN="sv=2021-08-06&ss=b&srt=o&sp=rwdlacupitfx&se=2026-06-01T00:00:00Z&st=2026-05-21T00:00:00Z&spr=https&sig=..."
+```
+
+Config:
+
+```yaml
+destination:
+  type: azure
+  bucket: my-container
+  account_name: mystorageacct
+  sas_token_env: AZURE_STORAGE_SAS_TOKEN
+```
+
+`account_key_env` and `sas_token_env` are **mutually exclusive** — Rivet
+rejects configs that specify both.  The leading `?` is stripped
+automatically if you paste the token directly from the Azure portal.
+
+Generate a SAS token via the Azure CLI:
+
+```bash
+az storage container generate-sas \
+  --account-name <account> --name <container> \
+  --permissions rwdl --expiry 2026-06-01 \
+  --account-key "$RIVET_AZURE_KEY" -o tsv
+```
+
+#### SAS expiry preflight (added in 0.7.4)
+
+Rivet parses the `se=` (signed-expiry) field from the token at construction
+time — before any network call is made:
+
+- **Already expired** — Rivet fails fast with:
+  ```
+  Azure SAS token already expired (se=2026-05-21T00:00:00+00:00). Generate a new SAS and re-export.
+  ```
+  `rivet doctor` surfaces this as a named category (`sas expired`) with the
+  `az storage container generate-sas` hint, so the operator knows exactly
+  what to do.
+
+- **Within 60 minutes of expiry** — Rivet logs a `WARN` and continues.
+  Useful when a long export was started close to the expiry boundary.
+
+- **No `se=` field** — the token likely uses a stored-access-policy whose
+  expiry is server-side.  Rivet accepts it without a warning.
+
+URL-encoded characters in the expiry value (`%3A` for `:`, `%2B` for `+`)
+are decoded automatically, so tokens pasted directly from the Azure portal
+or from `az storage container generate-sas -o tsv` work without manual
+editing.
+
+### Still planned (future releases)
+
+These auth modes are not yet implemented:
+
 - **Service principal** (`tenant_id`, `client_id`, `client_secret_env`) — unattended automation.
 - **Managed identity** — Rivet running inside Azure VM / AKS / Functions.
 - **Connection string** (`connection_string_env`) — the all-in-one
   `DefaultEndpointsProtocol=https;AccountName=…;AccountKey=…` blob.
-
-Until those land, extract the `AccountKey` value into an env var and
-use Option 1.
 
 ## Required RBAC
 
@@ -107,8 +161,8 @@ Predefined roles that work:
 
 The Azure storage **account key** path bypasses RBAC entirely and grants
 full access to every container in the account — that's the trade-off
-for the simpler 0.7.1 auth flow.  Use SAS or service principal (0.7.2)
-when you want least-privilege access.
+for simplicity.  Use SAS token (`sas_token_env`) for least-privilege
+access scoped to one container and time window.
 
 ## Output keys
 

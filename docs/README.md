@@ -23,6 +23,7 @@ Pick one — they're ordered shortest to deepest. Read top-to-bottom, then come 
 
 | Guide | What it gives you | Time |
 |-------|-------|------|
+| [Who is Rivet for?](who-is-this-for.md) | Yes / no fit-check with named alternatives (Debezium / Airbyte / Fivetran / dbt / DuckDB) | ~1 min |
 | [Getting Started](getting-started.md) | Install + your first export from a real table | ~3 min read · ~5 min hands-on |
 | [Concepts glossary](concepts.md) | One-page orientation: `run_id`, `cursor`, `chunk`, `manifest`, `journal`, `progression` | ~3 min |
 | [Pilot guide](pilot/README.md) | Operator runbook — full flow on your own database, production-ready guardrails | 1–2 sessions |
@@ -73,6 +74,9 @@ The five surfaces a serious operator inspects before adopting Rivet. Same five r
 |-------|-------|
 | **Execution semantics** — retry, crash, resume, repair, reconcile, known non-guarantees | [semantics.md](semantics.md) |
 | **Reliability matrix** — what runs in PR CI vs nightly vs manual; pgBouncer & ProxySQL coverage | [reliability-matrix.md](reliability-matrix.md) |
+| **Cloud smoke tests** — last-verified real-cloud matrix per release (S3 / GCS / Azure) | [cloud-smoke-tests.md](cloud-smoke-tests.md) |
+| **Release checklist** — every gate every tag must clear before publish | [release-checklist.md](release-checklist.md) |
+| **Cloud permissions** — least-privilege IAM / RBAC / SAS scopes for each backend | [cloud-permissions.md](cloud-permissions.md) |
 | **Security policy** — what Rivet can access, sensitive artifacts, credential handling, reporting | [../SECURITY.md](../SECURITY.md) |
 | **Compatibility matrix** — PG 12–16, MySQL 5.7 / 8.0 versions actually exercised in CI | [reference/compatibility.md](reference/compatibility.md) |
 | **Cross-tool benchmark harness** — reproducible PG/MySQL → Parquet vs sling, dlt, duckdb, clickhouse-local, odbc2parquet (defaults + steelman) | [bench/README.md](bench/README.md) |
@@ -108,6 +112,15 @@ Practical guides explaining *why* settings matter and *when* to use them.
 | Plan/Apply for auditable extraction | [reference/cli.md#rivet-plan](reference/cli.md#rivet-plan) · [adr/0005-plan-apply-contracts.md](adr/0005-plan-apply-contracts.md) |
 | Reconcile / targeted repair | [reference/cli.md#rivet-reconcile](reference/cli.md#rivet-reconcile) · [adr/0009-reconcile-and-repair-contracts.md](adr/0009-reconcile-and-repair-contracts.md) |
 | Committed / verified progression | [reference/cli.md#rivet-state-progression](reference/cli.md#rivet-state-progression) · [adr/0008-export-progression.md](adr/0008-export-progression.md) |
+
+### Operator recipes
+
+Action-first cookbooks for the most common production scenarios.
+
+| Recipe | What it covers |
+|--------|----------------|
+| [recipes/recover-interrupted-run.md](recipes/recover-interrupted-run.md) | Resume after kill / crash, drive `validate` / `reconcile` / `repair`, unstick a stalled state DB |
+| [recipes/idempotent-warehouse-load.md](recipes/idempotent-warehouse-load.md) | Build an idempotent BigQuery / Snowflake loader on top of `manifest.json` + `_SUCCESS` |
 
 ## Architecture Decision Records
 

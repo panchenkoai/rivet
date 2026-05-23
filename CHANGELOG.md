@@ -1,5 +1,162 @@
 # Changelog
 
+## 0.7.4 (unreleased) — Trust Hardening + First-User Story
+
+> Focus: close the trust-documentation layer, add a small high-leverage
+> cloud-safety preflight, and remove the most common first-user
+> footguns.  No new extraction modes, no new destinations.  This
+> release tightens what the existing product already does and removes
+> the time-to-first-success friction that previously bounced
+> evaluators back to the docs.
+
+### Highlights
+
+- **Azure SAS-token expiry preflight.**  When a destination uses
+  `sas_token_env`, Rivet now parses `se=` (signed-expiry) at
+  construction time.  Already-expired tokens fail fast with a
+  named-field error message; tokens within 60 minutes of expiry
+  log a warning so an operator knows before kicking off a
+  multi-hour export.  Unparseable `se=` values warn instead of
+  crashing — the token may still authenticate.  Closes the
+  known-limitation note in `docs/cloud-destinations.md` § Known
+  limitations.
+- **First-user-friendly error messages.**  Every config-layer
+  and `rivet doctor` error a first-time operator hits now carries
+  a `Hint:` line with a concrete next action — the exact `export
+  VAR=…` command for missing env vars, the `tls.mode: prefer` /
+  `tls.ca_file` knob for TLS handshake failures, the per-backend
+  `cloud-permissions.md` link for IAM denials, the
+  `az storage container generate-sas` invocation for expired SAS,
+  and so on.  The wording is pinned by 15 unit tests so dropping
+  a hint accidentally trips CI.
+- **`docs/who-is-this-for.md`.**  Explicit Yes / No fit-check with
+  named alternatives (Debezium, Airbyte, Fivetran, dbt, DuckDB,
+  Trino) so visitors with the wrong problem leave fast and the
+  ones who stay are pre-qualified.  Surfaced as a callout block
+  at the top of the README.
+- **README reorganization.**  Workflow story (`init → doctor → check
+  → plan → run → validate`) now precedes the dense benchmark
+  methodology section.  Hero numbers stay in the headline; the
+  cross-tool tables move below "Trust contracts" so first-time
+  visitors see the product narrative before the speeds-and-feeds.
+- **Trust-documentation layer.**  Five new evergreen artifacts
+  consolidate operator discipline that previously lived in
+  individual maintainer's heads:
+  - `docs/release-checklist.md` — every gate every tag must clear.
+  - `docs/cloud-smoke-tests.md` — manual real-cloud verification
+    matrix with last-verified dates per backend.
+  - `docs/cloud-permissions.md` — least-privilege IAM / RBAC / SAS
+    scopes for S3 / GCS / Azure split per Rivet command.
+  - `docs/recipes/recover-interrupted-run.md` — action-first
+    cookbook: resume, validate, reconcile, repair, state reset.
+  - `docs/recipes/idempotent-warehouse-load.md` — manifest-driven
+    BigQuery / Snowflake load patterns layered over Rivet's
+    at-least-once delivery contract.
+
+### Changes
+
+- **`feat(destination/azure)`** — `parse_sas_expiry_status` plus
+  `enforce_sas_expiry` preflight in `AzureDestination::new`.  Ten
+  new unit tests cover RFC3339 parsing, URL-encoded colons,
+  threshold boundaries, the no-`se=` (stored-access-policy) path,
+  and the wire path through the destination constructor.
+- **`feat(config/error-messages)`** — the most common first-run
+  failures now carry actionable `Hint:` lines:
+  - missing source block → "Add `url_env: DATABASE_URL`" with the
+    full alternatives matrix (url / url_env / url_file / structured);
+  - `url_env` referencing an unset env var → the concrete
+    `export DATABASE_URL='postgresql://…'` shell command;
+  - `password_env` referencing an unset env var → the concrete
+    `export <NAME>='your-password'` shell command;
+  - mixed URL + structured fields → "remove whichever block you
+    don't want; mixing the two is ambiguous";
+  - structured config missing `host` / `user` / `database` → the
+    concrete YAML edit and the URL-based alternative.
+- **`feat(preflight/doctor)`** — `source_error_hint` and
+  `destination_error_hint` map a categorised error to a concrete
+  next-step hint, printed below the failure line in `rivet doctor`.
+  Covers TLS handshake (PG and MySQL), auth errors (`pg_hba.conf`
+  for PG, `GRANT … FLUSH PRIVILEGES` for MySQL,
+  `s3:PutObject` / `storage.objects.*` /
+  `az storage container generate-sas` for the cloud backends),
+  bucket / container "does NOT auto-create" + the exact
+  `aws s3 mb` / `gcloud storage buckets create` /
+  `az storage container create` invocation, and connectivity
+  errors (`region:` mismatch, bastion / VPN reminders).
+- **`docs(README)`** — new "Is this for you?" callout above
+  `## Why Rivet`, linking to `docs/who-is-this-for.md`.  The
+  "Source pressure, measured" benchmark section moves below
+  "Trust contracts" so the workflow story comes first; the
+  cross-reference in the Trust contracts table now uses
+  `[Source pressure, measured](#…) below`.
+- **`docs(who-is-this-for)`** — new doc with explicit Yes / No
+  rows and named alternatives (Debezium / Estuary / Materialize
+  for CDC; Airbyte / Fivetran / Stitch for connector
+  marketplaces; Fivetran / Airbyte Cloud / dlt / Sling for
+  managed extract+load; dbt / SQLMesh for transforms; Airflow /
+  Dagster / Prefect for orchestration; DuckDB / Trino /
+  ClickHouse for query-time integration).  Edge-case section
+  covers very-large dumps, weak primary keys, replication lag,
+  SSH bastions, and stateless runners.
+- **`test`** — 15 new unit tests pin the error-message contract:
+  5 in `src/config/tests.rs` (no-source-block, missing host with
+  hint, missing url_env, missing password_env, mixed-fields), and
+  10 in `src/preflight/mod.rs::tests` (TLS hint per engine, auth
+  hint per engine, connectivity hint, no-hint for unknown errors,
+  and the four destination categories with their backend-specific
+  guidance).  Existing `no_url_at_all_rejected` updated to assert
+  the new `connection method` + `url_env` + `DATABASE_URL`
+  wording.
+- **`docs(README)`** — new `## Core workflow` section between the
+  30-second quickstart and "What Rivet is" surfaces the canonical
+  command path (`init → doctor → check → plan → run → validate`,
+  with `apply` and `reconcile`/`repair` branches).  Documentation
+  table extended with rows for cloud smoke tests, release
+  checklist, cloud permissions, and operator recipes.
+- **`docs(reliability-matrix)`** — new "Manual / release-gated
+  coverage" section names the cloud backends with their
+  last-verified dates and links to `docs/cloud-smoke-tests.md`.
+  Resolves the long-standing tension between "what's in CI" and
+  "what was hand-verified before publish".
+- **`docs(README index)`** — new "Trust contracts" rows for cloud
+  smoke tests, release checklist, and cloud permissions; new
+  "Operator recipes" sub-section under Production.
+
+### Bug fixes (preflight hardening)
+
+- **`fix(destination/azure)`** — URL-encoded `%2B` / `%2b` (plus sign) in the
+  `se=` expiry value is now decoded alongside `%3A` / `%3a` (colon), so
+  timezone offsets like `+00:00` in tokens from `az … -o tsv` parse
+  correctly.
+- **`fix(destination/azure)`** — Near-expiry threshold comparison changed from
+  `<` to `<=`: a token whose remaining validity is exactly 60 minutes now
+  correctly triggers the `NearExpiry` warning (previously slipped through as
+  `Healthy`).
+- **`fix(preflight/doctor)`** — `categorize_dest_error` now returns the
+  dedicated `"sas expired"` category before the generic `"auth error"` check.
+  Prior ordering let the token-keyword match in `"auth error"` win and route
+  expired-SAS errors to the wrong hint.
+- **`fix(preflight/doctor)`** — `destination_error_hint` signature simplified:
+  the unused `err: &anyhow::Error` parameter (formerly `_err`) has been
+  removed; the Azure SAS guard is now the `"sas expired"` match arm instead
+  of a pre-match string scan.
+- **`test`** — direct test for `categorize_dest_error` category ordering: pins
+  that an expired-SAS error message returns `"sas expired"`, not `"auth
+  error"`, with a descriptive assertion message that calls out the
+  load-bearing nature of the ordering.
+- **`chore`** — `cargo update`: 20 packages refreshed including openssl 0.10.80,
+  serde_json 1.0.150, mysql_common 0.37.2, winnow 1.0.3, tokio 1.50.0.
+
+### Notes
+
+The Azure SAS preflight runs at destination construction, so
+`rivet doctor` and `rivet run` both pick it up without any new
+flag.  An expired token now produces a Rivet-shaped error message
+("Azure SAS token already expired (se=…)") instead of an opaque
+opendal 403 on the first PUT.  The 60-minute near-expiry threshold
+is fixed in this release; making it operator-tunable is tracked
+for a future minor.
+
 ## 0.7.3 (2026-05-22) — Developer Experience Polish
 
 > Focus: make Rivet easier to configure, inspect, and try correctly.

@@ -175,8 +175,12 @@ impl Config {
         }
 
         if !self.source.has_url_fields() && !self.source.has_structured_fields() {
+            // First-run footgun: a config that forgot the source block
+            // entirely.  Show the recommended path (`url_env`) up-front;
+            // operators who actually want structured fields know to look
+            // for them.
             anyhow::bail!(
-                "source: must specify url, url_env, url_file, or structured fields (host/user/database)"
+                "source: no connection method configured. Add one of:\n  url_env: DATABASE_URL                          (URL from env var — recommended)\n  url: 'postgresql://user:pass@host:5432/db'      (inline — not recommended for committed configs)\n  url_file: /etc/rivet/source.url                 (URL from file — rotation-friendly)\n  host/user/database/...                          (structured fields under `source:`)"
             );
         }
 
@@ -190,28 +194,39 @@ impl Config {
             .filter(|u| u.is_some())
             .count();
             if url_count > 1 {
-                anyhow::bail!("source: specify exactly one of 'url', 'url_env', or 'url_file'");
+                anyhow::bail!(
+                    "source: specify exactly one of 'url', 'url_env', or 'url_file' (got {} set).\n  Hint: pick one — `url_env` is recommended so credentials never enter the YAML.",
+                    url_count
+                );
             }
         }
 
         if self.source.has_url_fields() && self.source.has_structured_fields() {
             anyhow::bail!(
-                "source: use either URL-based config (url/url_env/url_file) or structured fields (host/user/database/...), not both"
+                "source: pick either URL-based config (url/url_env/url_file) OR structured fields (host/user/database/port/password_env), not both.\n  Hint: remove whichever block you don't want; mixing the two is ambiguous."
             );
         }
 
         if self.source.has_structured_fields() {
             if self.source.host.is_none() {
-                anyhow::bail!("source: structured config requires 'host'");
+                anyhow::bail!(
+                    "source: structured config is missing 'host'.\n  Hint: add `host: localhost` (or your DB host) under `source:` in rivet.yaml.\n  Or switch to URL-based config: `url_env: DATABASE_URL`."
+                );
             }
             if self.source.user.is_none() {
-                anyhow::bail!("source: structured config requires 'user'");
+                anyhow::bail!(
+                    "source: structured config is missing 'user'.\n  Hint: add `user: <username>` under `source:` in rivet.yaml."
+                );
             }
             if self.source.database.is_none() {
-                anyhow::bail!("source: structured config requires 'database'");
+                anyhow::bail!(
+                    "source: structured config is missing 'database'.\n  Hint: add `database: <dbname>` under `source:` in rivet.yaml."
+                );
             }
             if self.source.password.is_some() && self.source.password_env.is_some() {
-                anyhow::bail!("source: specify 'password' or 'password_env', not both");
+                anyhow::bail!(
+                    "source: specify 'password' OR 'password_env', not both.\n  Hint: prefer `password_env: DB_PASSWORD` so credentials never enter the YAML."
+                );
             }
         }
 
@@ -261,16 +276,27 @@ impl Config {
             if export.destination.destination_type == DestinationType::Azure {
                 let has_name = export.destination.account_name.is_some();
                 let has_key = export.destination.account_key_env.is_some();
+                let has_sas = export.destination.sas_token_env.is_some();
                 if export.destination.allow_anonymous {
-                    if has_name || has_key {
+                    if has_name || has_key || has_sas {
                         anyhow::bail!(
-                            "export '{}': Azure allow_anonymous cannot be combined with account_name/account_key_env",
+                            "export '{}': Azure allow_anonymous cannot be combined with account_name/account_key_env/sas_token_env",
                             export.name
                         );
                     }
-                } else if has_name != has_key {
+                } else if has_key && has_sas {
                     anyhow::bail!(
-                        "export '{}': Azure requires both account_name and account_key_env, or neither (with allow_anonymous: true for Azurite)",
+                        "export '{}': Azure account_key_env and sas_token_env are mutually exclusive — pick one auth mode",
+                        export.name
+                    );
+                } else if !has_name {
+                    anyhow::bail!(
+                        "export '{}': Azure requires account_name (plus account_key_env or sas_token_env), or allow_anonymous: true for Azurite",
+                        export.name
+                    );
+                } else if !has_key && !has_sas {
+                    anyhow::bail!(
+                        "export '{}': Azure requires account_key_env or sas_token_env (or allow_anonymous: true for Azurite)",
                         export.name
                     );
                 }

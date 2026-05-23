@@ -1,8 +1,17 @@
-# Rivet
+<p align="center">
+  <img src="docs/assets/rivet_logo.png" alt="Rivet" width="480">
+</p>
 
-**Lightweight, source-safe data extraction from PostgreSQL and MySQL to Parquet/CSV.**
+<p align="center">
+  <a href="https://github.com/panchenkoai/rivet/actions/workflows/ci.yml"><img src="https://github.com/panchenkoai/rivet/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/panchenkoai/rivet/releases/latest"><img src="https://img.shields.io/github/v/release/panchenkoai/rivet?label=release" alt="release"></a>
+  <a href="docs/reliability-matrix.md"><img src="https://img.shields.io/badge/coverage-reliability%20matrix-blue" alt="coverage"></a>
+  <a href="https://github.com/panchenkoai/rivet/blob/main/LICENSE"><img src="https://img.shields.io/github/license/panchenkoai/rivet" alt="license"></a>
+</p>
 
-One Rust binary, ~10 MB. **Sub-second longest SQL on a 2 M-row wide table, ~280 MB peak RSS** ([reproducible cross-tool bench](docs/bench/)). Extract-only — no CDC, no SaaS console, no Kubernetes operator.
+<p align="center"><strong>Lightweight, source-safe data extraction from PostgreSQL and MySQL to Parquet/CSV.</strong></p>
+
+<p align="center">One Rust binary, ~10 MB. <strong>Sub-second longest SQL on a 2 M-row wide table, ~280 MB peak RSS</strong> (<a href="docs/bench/">reproducible cross-tool bench</a>). Extract-only — no CDC, no SaaS console, no Kubernetes operator.</p>
 
 ![rivet basic workflow — init, doctor, check, run, state](docs/gifs/basic.gif)
 

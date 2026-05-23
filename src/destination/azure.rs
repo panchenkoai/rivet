@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use opendal::Operator;
 use opendal::blocking;
 use opendal::layers::RetryLayer;
@@ -8,6 +9,145 @@ use opendal::services::Azblob;
 
 use crate::config::DestinationConfig;
 use crate::error::Result;
+
+/// Threshold under which a SAS token is considered "near expiry" and a
+/// warning is logged.  A long export that finishes in < `WARN_THRESHOLD`
+/// will *probably* succeed, but the operator should know.  60 minutes is
+/// a deliberate compromise:
+///
+/// - Long enough to cover a typical large chunked export.
+/// - Short enough that drive-by token paste (e.g. a portal-generated SAS
+///   with default 1-hour validity) is flagged before it expires
+///   mid-flight.
+///
+/// The 0.7.4 release-gate matrix in `docs/cloud-smoke-tests.md` records
+/// "near-expiry warn at 60 min" as the verified contract.
+const SAS_NEAR_EXPIRY_THRESHOLD: chrono::Duration = chrono::Duration::minutes(60);
+
+/// Result of parsing `se=` (signed-expiry) out of an Azure SAS token.
+///
+/// This is the input to the preflight in `AzureDestination::new`: the
+/// destination either rejects the token (expired), warns and continues
+/// (near-expiry / unparseable), or stays silent (healthy / token has no
+/// `se=` at all).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SasExpiryStatus {
+    /// `se=` parsed and is in the future by more than `SAS_NEAR_EXPIRY_THRESHOLD`.
+    Healthy { expires_at: DateTime<Utc> },
+    /// `se=` parsed and is within `SAS_NEAR_EXPIRY_THRESHOLD` of `now` (still in the future).
+    NearExpiry {
+        expires_at: DateTime<Utc>,
+        remaining: chrono::Duration,
+    },
+    /// `se=` parsed and is in the past — the destination cannot be opened.
+    Expired { expires_at: DateTime<Utc> },
+    /// `se=` is missing (legacy SAS signed by a stored access policy, or
+    /// a non-standard token shape).  Cannot warn meaningfully.
+    NoExpiry,
+    /// `se=` is present but the value did not parse as RFC3339.
+    Unparseable { raw: String },
+}
+
+/// Parse `se=` (signed-expiry) out of a SAS token and classify it.
+///
+/// SAS tokens are URL-encoded query strings: `sv=…&se=2026-06-01T00:00:00Z&sig=…`.
+/// The `se=` value is RFC3339 with `Z` suffix (UTC).  A leading `?` is
+/// tolerated — `AzureDestination::new` strips it before delegating to
+/// opendal, but we want this preflight to be safe to call on raw input.
+///
+/// Returns `NoExpiry` rather than an error when `se=` is missing — Azure
+/// permits SAS tokens whose lifetime is governed by a server-side stored
+/// access policy and Rivet has no opinion about those.
+pub(crate) fn parse_sas_expiry_status(token: &str, now: DateTime<Utc>) -> SasExpiryStatus {
+    // Trim the leading `?` operators sometimes copy from the portal URL.
+    let body = token.trim_start_matches('?');
+
+    for pair in body.split('&') {
+        let mut kv = pair.splitn(2, '=');
+        let Some(key) = kv.next() else { continue };
+        if key != "se" {
+            continue;
+        }
+        let Some(raw) = kv.next() else {
+            return SasExpiryStatus::Unparseable { raw: String::new() };
+        };
+
+        // The portal-generated form is `2026-06-01T00:00:00Z` — already
+        // RFC3339.  Some CLIs URL-encode colons (`%3A`) or the `+` sign in
+        // timezone offsets (`%2B`); decode both before parsing.
+        let decoded = raw
+            .replace("%3A", ":")
+            .replace("%3a", ":")
+            .replace("%2B", "+")
+            .replace("%2b", "+");
+
+        match DateTime::parse_from_rfc3339(&decoded) {
+            Ok(dt) => {
+                let expires_at = dt.with_timezone(&Utc);
+                if expires_at <= now {
+                    return SasExpiryStatus::Expired { expires_at };
+                }
+                let remaining = expires_at - now;
+                if remaining <= SAS_NEAR_EXPIRY_THRESHOLD {
+                    return SasExpiryStatus::NearExpiry {
+                        expires_at,
+                        remaining,
+                    };
+                }
+                return SasExpiryStatus::Healthy { expires_at };
+            }
+            Err(_) => {
+                return SasExpiryStatus::Unparseable {
+                    raw: decoded.to_string(),
+                };
+            }
+        }
+    }
+
+    SasExpiryStatus::NoExpiry
+}
+
+/// Inspect a SAS token's `se=` and act on it: fail-fast on expired,
+/// log::warn on near-expiry / unparseable, stay silent otherwise.
+///
+/// Centralised so `AzureDestination::new` and any future direct caller
+/// (e.g. a JSON-format `rivet doctor`) share one decision.
+fn enforce_sas_expiry(token: &str) -> Result<()> {
+    match parse_sas_expiry_status(token, Utc::now()) {
+        SasExpiryStatus::Healthy { .. } | SasExpiryStatus::NoExpiry => Ok(()),
+        SasExpiryStatus::NearExpiry {
+            expires_at,
+            remaining,
+        } => {
+            // Total minutes is the operator-friendly unit; sub-minute
+            // precision is noise (clock skew dominates anyway).
+            let mins = remaining.num_minutes().max(0);
+            log::warn!(
+                "Azure SAS token expires in {} minute{} ({}). Long exports may fail mid-run; rotate the token before extraction.",
+                mins,
+                if mins == 1 { "" } else { "s" },
+                expires_at.to_rfc3339()
+            );
+            Ok(())
+        }
+        SasExpiryStatus::Expired { expires_at } => {
+            // CONTRACT: preflight/doctor.rs::categorize_dest_error matches on
+            // "already expired" + "sas" to assign the "sas expired" category.
+            // Keep those words present if this message is ever rephrased.
+            anyhow::bail!(
+                "Azure SAS token already expired (se={}). Generate a new SAS and re-export.",
+                expires_at.to_rfc3339()
+            )
+        }
+        SasExpiryStatus::Unparseable { raw } => {
+            log::warn!(
+                "Azure SAS token has unparseable 'se=' value ({:?}); skipping expiry check. The token may still authenticate, but Rivet cannot warn on near-expiry.",
+                raw
+            );
+            Ok(())
+        }
+    }
+}
 
 pub struct AzureDestination {
     _runtime: Arc<tokio::runtime::Runtime>,
@@ -90,6 +230,12 @@ impl AzureDestination {
                     // currently tolerates the `?`, but a future version
                     // may not.
                     let token = raw.trim_start_matches('?');
+                    // Preflight `se=` (v0.7.4): fail fast on already-expired
+                    // tokens, warn on near-expiry, stay silent otherwise.
+                    // This runs before opendal touches the wire so a stale
+                    // SAS produces a Rivet-shaped error message instead of
+                    // an opaque 403 on the first PUT.
+                    enforce_sas_expiry(token)?;
                     builder = builder.sas_token(token);
                 }
                 (None, None) => anyhow::bail!(
@@ -527,5 +673,207 @@ sas_token_env: AZURE_STORAGE_SAS_TOKEN
             Some("AZURE_STORAGE_SAS_TOKEN")
         );
         assert!(cfg.account_key_env.is_none());
+    }
+
+    // ── v0.7.4 P1: SAS-token expiry preflight ─────────────────────────────
+
+    use chrono::TimeZone;
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn sas_expiry_parses_far_future_as_healthy() {
+        let token = "sv=2021-08-06&se=2099-01-01T00:00:00Z&sig=fake";
+        let now = Utc.with_ymd_and_hms(2026, 5, 23, 12, 0, 0).unwrap();
+        match parse_sas_expiry_status(token, now) {
+            SasExpiryStatus::Healthy { expires_at } => {
+                assert_eq!(expires_at, ts("2099-01-01T00:00:00Z"));
+            }
+            other => panic!("expected Healthy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sas_expiry_parses_within_threshold_as_near_expiry() {
+        // 30 minutes < 60-minute threshold → NearExpiry.
+        let token = "sv=2021-08-06&se=2026-05-23T12:30:00Z&sig=fake";
+        let now = Utc.with_ymd_and_hms(2026, 5, 23, 12, 0, 0).unwrap();
+        match parse_sas_expiry_status(token, now) {
+            SasExpiryStatus::NearExpiry {
+                expires_at,
+                remaining,
+            } => {
+                assert_eq!(expires_at, ts("2026-05-23T12:30:00Z"));
+                assert_eq!(remaining.num_minutes(), 30);
+            }
+            other => panic!("expected NearExpiry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sas_expiry_parses_past_as_expired() {
+        let token = "sv=2021-08-06&se=2024-01-01T00:00:00Z&sig=fake";
+        let now = Utc.with_ymd_and_hms(2026, 5, 23, 12, 0, 0).unwrap();
+        match parse_sas_expiry_status(token, now) {
+            SasExpiryStatus::Expired { expires_at } => {
+                assert_eq!(expires_at, ts("2024-01-01T00:00:00Z"));
+            }
+            other => panic!("expected Expired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sas_expiry_treats_now_equals_se_as_expired() {
+        // Boundary: a token whose `se=` exactly equals `now` cannot be
+        // used for any subsequent request, so it must be Expired.
+        let token = "sv=2021-08-06&se=2026-05-23T12:00:00Z&sig=fake";
+        let now = Utc.with_ymd_and_hms(2026, 5, 23, 12, 0, 0).unwrap();
+        match parse_sas_expiry_status(token, now) {
+            SasExpiryStatus::Expired { .. } => {}
+            other => panic!("expected Expired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sas_expiry_handles_url_encoded_colons() {
+        // `az` CLI sometimes emits `%3A` for `:`.  Both forms must
+        // produce the same status.
+        let token = "sv=2021-08-06&se=2099-01-01T00%3A00%3A00Z&sig=fake";
+        let now = Utc.with_ymd_and_hms(2026, 5, 23, 12, 0, 0).unwrap();
+        assert!(matches!(
+            parse_sas_expiry_status(token, now),
+            SasExpiryStatus::Healthy { .. }
+        ));
+    }
+
+    #[test]
+    fn sas_expiry_handles_url_encoded_plus_in_timezone_offset() {
+        // Some tooling emits `+00:00` as `%2B00:00` in the se= value.
+        // An expired token with this encoding must still be caught.
+        let token = "sv=2021-08-06&se=2024-01-01T00%3A00%3A00%2B00%3A00&sig=fake";
+        let now = Utc.with_ymd_and_hms(2026, 5, 23, 12, 0, 0).unwrap();
+        assert!(matches!(
+            parse_sas_expiry_status(token, now),
+            SasExpiryStatus::Expired { .. }
+        ));
+    }
+
+    #[test]
+    fn sas_expiry_returns_no_expiry_when_se_missing() {
+        // Tokens signed by a stored access policy have no `se=` of
+        // their own — the policy on the server enforces lifetime.
+        let token = "sv=2021-08-06&si=mypolicy&sig=fake";
+        let now = Utc.with_ymd_and_hms(2026, 5, 23, 12, 0, 0).unwrap();
+        assert_eq!(
+            parse_sas_expiry_status(token, now),
+            SasExpiryStatus::NoExpiry
+        );
+    }
+
+    #[test]
+    fn sas_expiry_returns_unparseable_for_bad_format() {
+        let token = "sv=2021-08-06&se=NOT_A_DATE&sig=fake";
+        let now = Utc.with_ymd_and_hms(2026, 5, 23, 12, 0, 0).unwrap();
+        match parse_sas_expiry_status(token, now) {
+            SasExpiryStatus::Unparseable { raw } => assert_eq!(raw, "NOT_A_DATE"),
+            other => panic!("expected Unparseable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sas_expiry_tolerates_leading_question_mark() {
+        // Operators paste `?sv=…&se=…&sig=…` straight from the portal.
+        let token = "?sv=2021-08-06&se=2099-01-01T00:00:00Z&sig=fake";
+        let now = Utc.with_ymd_and_hms(2026, 5, 23, 12, 0, 0).unwrap();
+        assert!(matches!(
+            parse_sas_expiry_status(token, now),
+            SasExpiryStatus::Healthy { .. }
+        ));
+    }
+
+    #[test]
+    fn sas_expiry_at_threshold_is_near_expiry() {
+        // Boundary: a token expiring exactly at the threshold (60 min)
+        // must trigger NearExpiry — NearExpiry uses `<=`.
+        let now = Utc.with_ymd_and_hms(2026, 5, 23, 12, 0, 0).unwrap();
+        let exactly_at_threshold = now + SAS_NEAR_EXPIRY_THRESHOLD;
+        let token = format!(
+            "sv=2021-08-06&se={}&sig=fake",
+            exactly_at_threshold.to_rfc3339()
+        );
+        assert!(matches!(
+            parse_sas_expiry_status(&token, now),
+            SasExpiryStatus::NearExpiry { .. }
+        ));
+    }
+
+    #[test]
+    fn sas_expiry_one_second_above_threshold_is_healthy() {
+        // One second above the 60-minute threshold must be Healthy.
+        let now = Utc.with_ymd_and_hms(2026, 5, 23, 12, 0, 0).unwrap();
+        let above_threshold = now + SAS_NEAR_EXPIRY_THRESHOLD + chrono::Duration::seconds(1);
+        let token = format!("sv=2021-08-06&se={}&sig=fake", above_threshold.to_rfc3339());
+        assert!(matches!(
+            parse_sas_expiry_status(&token, now),
+            SasExpiryStatus::Healthy { .. }
+        ));
+    }
+
+    #[test]
+    fn azure_destination_rejects_expired_sas_token() {
+        // Wire test: a token whose `se=` is in the past must fail fast
+        // in `AzureDestination::new`, *before* opendal touches the wire.
+        // The error message must name the field so the operator knows
+        // what to rotate.
+        let cfg = DestinationConfig {
+            destination_type: DestinationType::Azure,
+            bucket: Some("data".into()),
+            account_name: Some("mystorageacct".into()),
+            sas_token_env: Some("RIVET_TEST_AZURE_SAS_EXPIRED".into()),
+            ..Default::default()
+        };
+        unsafe {
+            std::env::set_var(
+                "RIVET_TEST_AZURE_SAS_EXPIRED",
+                "sv=2021-08-06&se=2024-01-01T00:00:00Z&sig=fake",
+            )
+        };
+        let msg = expect_err(&cfg);
+        assert!(
+            msg.contains("expired") || msg.contains("Expired"),
+            "expired SAS must surface as expiry error: {msg}"
+        );
+        unsafe { std::env::remove_var("RIVET_TEST_AZURE_SAS_EXPIRED") };
+    }
+
+    #[test]
+    fn azure_destination_accepts_far_future_sas_token() {
+        // Healthy path: a token whose `se=` is far in the future must
+        // *not* fail at the expiry preflight.  We can't assert the
+        // build succeeds (no live Azure), but we can assert the error
+        // — if any — is *not* the expiry one.
+        let cfg = DestinationConfig {
+            destination_type: DestinationType::Azure,
+            bucket: Some("data".into()),
+            account_name: Some("mystorageacct".into()),
+            sas_token_env: Some("RIVET_TEST_AZURE_SAS_HEALTHY".into()),
+            ..Default::default()
+        };
+        unsafe {
+            std::env::set_var(
+                "RIVET_TEST_AZURE_SAS_HEALTHY",
+                "sv=2021-08-06&se=2099-01-01T00:00:00Z&sig=fake",
+            )
+        };
+        if let Err(e) = AzureDestination::new(&cfg) {
+            let msg = format!("{e:#}");
+            assert!(
+                !msg.contains("expired") && !msg.contains("Expired"),
+                "healthy SAS must pass expiry preflight; got: {msg}"
+            );
+        }
+        unsafe { std::env::remove_var("RIVET_TEST_AZURE_SAS_HEALTHY") };
     }
 }
