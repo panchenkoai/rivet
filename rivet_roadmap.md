@@ -486,6 +486,52 @@ Move from warning-based guidance to controlled automatic parallelism selection.
 ### Why this matters
 Parallelism is valuable, but automation should come after better planner guidance and safety semantics.
 
+## Epic 17 — MySQL Source Parity (COM_STMT_FETCH)
+**Priority:** P1
+**Pain coverage:** Pain A, Pain B
+
+### Goal
+
+Close the source-pressure gap between MySQL and PostgreSQL.
+
+PostgreSQL issues a single `DECLARE cursor FOR SELECT …` and then repeats `FETCH N` — every round-trip returns a small batch, and the longest single SQL statement on a 2M-row wide table is **0.19s**.
+
+MySQL uses chunked `SELECT … WHERE pk BETWEEN start AND end` queries, one per chunk.  The longest single statement on the same fixture is **~9s** — still 15–23× better than sling/dlt defaults, but far from PostgreSQL parity and potentially above a DBA's `max_execution_time`.
+
+### Root cause
+
+MySQL exposes server-side cursors via the binary protocol: `COM_STMT_EXECUTE` with flag `CURSOR_TYPE_READ_ONLY = 0x01`, followed by `COM_STMT_FETCH N`.  The `mysql` Rust crate v28 does not surface this flag in its public API — `exec_iter()` opens a fresh query per call with no persistent cursor.
+
+### Deliverables (two-phase)
+
+**Phase A — Adaptive time-feedback chunking** (1–2 weeks, no protocol changes)
+
+- After each chunk, measure wall time.  If last chunk exceeded a configurable `chunk_max_statement_s` (default: 2s), halve `effective_bs` for the next chunk.
+- Cap: do not shrink below `chunk_min_rows` (default: 1000) to avoid pathological overhead.
+- Add `RIVET_MYSQL_CHUNK_TIME_FEEDBACK=1` env flag to enable the adaptive path explicitly during benchmarking.
+- Expected result: longest single query on 2M-row table drops from ~9s to ~1–2s without protocol changes.
+- Update benchmark tables in README to reflect new numbers once measured.
+
+**Phase B — COM_STMT_FETCH server-side cursor** (4–8 weeks, protocol-level)
+
+- Investigate `mysql` crate internals: determine whether `CURSOR_TYPE_READ_ONLY` can be set via an existing low-level API or requires a fork/PR.
+- If crate supports it: implement a single-cursor extraction path for MySQL that mirrors the PostgreSQL `DECLARE … FETCH N` loop.  Path: prepare statement → execute with `CURSOR_TYPE_READ_ONLY` → `FETCH chunk_size` in a loop → `COM_STMT_CLOSE`.
+- If crate does not support it: open upstream PR to `blackbeard/mysql_rust` exposing `CursorType` on `StatementParams`; track until merged; vendor if needed for near-term delivery.
+- Known MySQL cursor limitations to test: `ORDER BY` in cursor context, temp-table creation on large result sets, `max_execution_time` interaction.
+- Expected result: longest single query drops to sub-second on wide tables, matching PostgreSQL story.
+
+### Definition of done
+
+- [ ] Phase A: adaptive chunk feedback implemented and unit-tested; `chunk_max_statement_s` config field documented.
+- [ ] Phase A: new benchmark numbers measured and README benchmark tables updated.
+- [ ] Phase B: `mysql` crate cursor path investigated; upstream PR opened or workaround documented.
+- [ ] Phase B: integration test covering the `FETCH N` loop against a live MySQL fixture.
+- [ ] README note "MySQL parity roadmap" replaced with concrete timing numbers.
+
+### Why this matters
+
+The current README is honest about the 9s MySQL number, but it creates an asymmetric product story: "sub-second on Postgres, 9s on MySQL."  Many teams run MySQL exclusively.  Closing this gap removes the biggest technical objection for MySQL-first users and makes the benchmark headline symmetric.
+
 ---
 
 # 5.1 Packaging, Trust, and External Adoption Track
@@ -629,6 +675,9 @@ Near-term resource-control priorities:
 11. Epic 11 — Installation & Packaging
 12. Epic 12 — Deployment Modes Guidance
 
+## Phase 3.5 — Source-engine parity
+17. Epic 17 — MySQL Source Parity (COM_STMT_FETCH)
+
 ## Phase 4 — Expand carefully
 13. Epic 13 — SSH / Jump Host Access
 14. Epic 14 — Narrow Warehouse Load Layer
@@ -691,6 +740,7 @@ This section merges the former `rivet_roadmap_v3.md` task tracker. **Strategic p
 | Epic 14 — Warehouse load | `src/types/`, M1–M6 | Type system + type report + BQ compat ✅; direct load path = future |
 | Epic 15 — CDC | **N** | WAL/binlog = future |
 | Epic 16 — Auto-parallel | *(none)* | Auto-parallelism = future |
+| Epic 17 — MySQL parity | *(none yet)* | Phase A: adaptive chunk timing; Phase B: COM_STMT_FETCH |
 
 **Auth and connectivity (lettered A)** underpin all runs and map across Epics 1–2 and §7 (niche).
 
