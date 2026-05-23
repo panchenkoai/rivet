@@ -226,18 +226,25 @@ impl SourceConfig {
     }
 
     fn build_url_from_fields(&self) -> crate::error::Result<String> {
-        let host = self
-            .host
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("source: structured config requires 'host'"))?;
-        let user = self
-            .user
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("source: structured config requires 'user'"))?;
-        let database = self
-            .database
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("source: structured config requires 'database'"))?;
+        // First-user-friendly errors: name the missing field, suggest a
+        // concrete value, and remind the operator that `url_env` is the
+        // alternative path so they don't bounce.  See
+        // `docs/getting-started.md` for the full onboarding flow.
+        let host = self.host.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "source: structured config is missing 'host'.\n  Hint: add `host: localhost` (or your DB host) under `source:` in rivet.yaml.\n  Or switch to URL-based config: `url_env: DATABASE_URL`."
+            )
+        })?;
+        let user = self.user.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "source: structured config is missing 'user'.\n  Hint: add `user: <username>` under `source:` in rivet.yaml."
+            )
+        })?;
+        let database = self.database.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "source: structured config is missing 'database'.\n  Hint: add `database: <dbname>` under `source:` in rivet.yaml."
+            )
+        })?;
 
         // SecOps: keep the plaintext password inside a `Zeroizing<String>` until it
         // is spliced into the final URL, so the standalone password buffer is
@@ -255,7 +262,10 @@ impl SourceConfig {
                     resolve_env_vars(p)?
                 }
                 (None, Some(env)) => std::env::var(env).map_err(|_| {
-                    anyhow::anyhow!("source: env var '{}' not set (password_env)", env)
+                    anyhow::anyhow!(
+                        "source: env var '{0}' is not set (referenced by password_env).\n  Hint: export the value before running, e.g.\n      export {0}='your-database-password'",
+                        env
+                    )
                 })?,
                 (None, None) => String::new(),
             });
@@ -292,7 +302,7 @@ impl SourceConfig {
     pub fn resolve_url(&self) -> crate::error::Result<String> {
         if self.has_url_fields() && self.has_structured_fields() {
             anyhow::bail!(
-                "source: use either URL-based config (url/url_env/url_file) or structured fields (host/user/database/...), not both"
+                "source: pick either URL-based config (url/url_env/url_file) OR structured fields (host/user/database/port/password_env), not both.\n  Hint: remove whichever block you don't want; mixing the two is ambiguous."
             );
         }
 
@@ -302,15 +312,24 @@ impl SourceConfig {
 
         let raw = match (&self.url, &self.url_env, &self.url_file) {
             (Some(u), None, None) => u.clone(),
-            (None, Some(env), None) => {
-                std::env::var(env).map_err(|_| anyhow::anyhow!("env var '{}' not set", env))?
-            }
+            (None, Some(env), None) => std::env::var(env).map_err(|_| {
+                anyhow::anyhow!(
+                    "source: env var '{0}' is not set (referenced by url_env).\n  Hint: export the value before running, e.g.\n      export {0}='postgresql://user:pass@host:5432/dbname'\n  Or change `url_env: {0}` in your config to a different env var name.",
+                    env
+                )
+            })?,
             (None, None, Some(file)) => std::fs::read_to_string(file)
-                .map_err(|e| anyhow::anyhow!("cannot read url_file '{}': {}", file, e))?
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "source: cannot read url_file '{}': {}.\n  Hint: ensure the file exists and is readable; the file should contain only the URL on a single line.",
+                        file,
+                        e
+                    )
+                })?
                 .trim()
                 .to_string(),
             _ => anyhow::bail!(
-                "source: specify exactly one of 'url', 'url_env', 'url_file', or structured fields (host/user/database)"
+                "source: configure exactly one connection method:\n  url_env: DATABASE_URL                          (URL from env var — recommended)\n  url: 'postgresql://user:pass@host:5432/db'      (inline — not recommended for committed configs)\n  url_file: /etc/rivet/source.url                 (URL from file — rotation-friendly)\n  host/user/database/...                          (structured fields under `source:`)"
             ),
         };
 

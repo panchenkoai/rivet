@@ -718,6 +718,9 @@ exports:
 
 #[test]
 fn no_url_at_all_rejected() {
+    // First-user-friendly error: a source: block with no connection
+    // method must guide the operator to `url_env` + an example
+    // `DATABASE_URL` rather than just rejecting silently.
     let err = Config::from_yaml(
         r#"
 source:
@@ -732,7 +735,15 @@ exports:
 "#,
     )
     .unwrap_err();
-    assert!(err.to_string().contains("must specify"));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("source") && msg.contains("connection method"),
+        "must explain the user has to configure a connection method: {msg}"
+    );
+    assert!(
+        msg.contains("url_env") && msg.contains("DATABASE_URL"),
+        "must guide to recommended url_env + DATABASE_URL: {msg}"
+    );
 }
 
 #[test]
@@ -2433,4 +2444,221 @@ fn compression_profile_label_strings() {
     assert_eq!(CompressionProfile::Fast.label(), "fast");
     assert_eq!(CompressionProfile::Balanced.label(), "balanced");
     assert_eq!(CompressionProfile::Compact.label(), "compact");
+}
+
+// ── Azure config validation (v0.7.2 P0.4) ────────────────────────────────────
+
+const AZURE_BASE: &str = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: parquet
+    destination:
+      type: azure
+      bucket: mycontainer
+"#;
+
+#[test]
+fn azure_sas_token_env_accepted() {
+    let yaml = format!(
+        "{AZURE_BASE}      account_name: mystorageacct\n      sas_token_env: AZURE_STORAGE_SAS_TOKEN\n"
+    );
+    let cfg = Config::from_yaml(&yaml).unwrap();
+    assert_eq!(
+        cfg.exports[0].destination.sas_token_env.as_deref(),
+        Some("AZURE_STORAGE_SAS_TOKEN")
+    );
+}
+
+#[test]
+fn azure_account_key_env_accepted() {
+    let yaml = format!(
+        "{AZURE_BASE}      account_name: mystorageacct\n      account_key_env: AZURE_STORAGE_KEY\n"
+    );
+    assert!(Config::from_yaml(&yaml).is_ok());
+}
+
+#[test]
+fn azure_missing_account_name_rejected() {
+    let yaml = format!("{AZURE_BASE}      sas_token_env: AZURE_STORAGE_SAS_TOKEN\n");
+    let err = Config::from_yaml(&yaml).unwrap_err();
+    assert!(
+        err.to_string().contains("account_name"),
+        "missing account_name must be reported: {err}"
+    );
+}
+
+#[test]
+fn azure_missing_auth_rejected() {
+    let yaml = format!("{AZURE_BASE}      account_name: mystorageacct\n");
+    let err = Config::from_yaml(&yaml).unwrap_err();
+    assert!(
+        err.to_string().contains("account_key_env") && err.to_string().contains("sas_token_env"),
+        "error must name both auth options: {err}"
+    );
+}
+
+#[test]
+fn azure_both_key_and_sas_rejected() {
+    let yaml = format!(
+        "{AZURE_BASE}      account_name: mystorageacct\n      account_key_env: K\n      sas_token_env: S\n"
+    );
+    let err = Config::from_yaml(&yaml).unwrap_err();
+    assert!(
+        err.to_string().contains("mutually exclusive"),
+        "error must say mutually exclusive: {err}"
+    );
+}
+
+#[test]
+fn azure_allow_anonymous_accepted() {
+    let yaml = format!(
+        "{AZURE_BASE}      endpoint: http://127.0.0.1:10000/devstoreaccount1\n      allow_anonymous: true\n"
+    );
+    assert!(Config::from_yaml(&yaml).is_ok());
+}
+
+#[test]
+fn azure_allow_anonymous_with_sas_rejected() {
+    let yaml = format!(
+        "{AZURE_BASE}      endpoint: http://127.0.0.1:10000/devstoreaccount1\n      allow_anonymous: true\n      sas_token_env: S\n"
+    );
+    let err = Config::from_yaml(&yaml).unwrap_err();
+    assert!(
+        err.to_string().contains("allow_anonymous"),
+        "error must mention allow_anonymous: {err}"
+    );
+}
+
+// ── v0.7.4: first-user-friendly error messages ───────────────────────
+//
+// These tests pin the *content* of the error messages a first-time
+// operator sees when they make the most common config mistakes.  The
+// exact wording is allowed to evolve, but every test asserts at least
+// one Hint phrase the README / getting-started docs reference, so
+// dropping the hint accidentally trips the test.
+//
+// Note: the no-source-block-at-all path is covered by
+// `no_url_at_all_rejected` above (updated in v0.7.4 to also assert
+// the new url_env + DATABASE_URL guidance).
+
+#[test]
+fn structured_source_missing_host_includes_actionable_hint() {
+    let yaml = r#"
+source:
+  type: postgres
+  user: rivet
+  database: rivetdb
+exports:
+  - name: u
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#;
+    let err = Config::from_yaml(yaml).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("host"), "must name 'host': {msg}");
+    assert!(
+        msg.contains("Hint") && msg.contains("localhost"),
+        "must include 'Hint:' with a concrete suggestion (localhost): {msg}"
+    );
+    assert!(
+        msg.contains("url_env") || msg.contains("DATABASE_URL"),
+        "must offer the URL-based alternative: {msg}"
+    );
+}
+
+#[test]
+fn url_env_missing_var_lists_export_command_and_alternative() {
+    // The most common first-run failure: env var simply not exported.
+    // The error must show *the exact shell command* to fix it.
+    unsafe { std::env::remove_var("RIVET_DOCTEST_DATABASE_URL_X") };
+    let yaml = r#"
+source:
+  type: postgres
+  url_env: RIVET_DOCTEST_DATABASE_URL_X
+exports:
+  - name: u
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#;
+    let cfg = Config::from_yaml(yaml).unwrap();
+    let err = cfg.source.resolve_url().unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("RIVET_DOCTEST_DATABASE_URL_X") && msg.contains("not set"),
+        "must name the missing var: {msg}"
+    );
+    assert!(
+        msg.contains("export"),
+        "must show the `export VAR=...` shell hint: {msg}"
+    );
+    assert!(
+        msg.contains("postgresql://"),
+        "must include a concrete URL example: {msg}"
+    );
+}
+
+#[test]
+fn password_env_missing_var_includes_export_hint() {
+    unsafe { std::env::remove_var("RIVET_DOCTEST_PASSWORD_Y") };
+    let yaml = r#"
+source:
+  type: postgres
+  host: localhost
+  user: rivet
+  database: rivetdb
+  password_env: RIVET_DOCTEST_PASSWORD_Y
+exports:
+  - name: u
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#;
+    let cfg = Config::from_yaml(yaml).unwrap();
+    let err = cfg.source.resolve_url().unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("RIVET_DOCTEST_PASSWORD_Y") && msg.contains("password_env"),
+        "must name the missing var + the field that referenced it: {msg}"
+    );
+    assert!(
+        msg.contains("export"),
+        "must show the `export VAR=...` shell hint: {msg}"
+    );
+}
+
+#[test]
+fn mixed_url_and_structured_fields_error_explains_choice() {
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+  host: otherhost
+  user: u
+  database: d
+exports:
+  - name: u
+    query: "SELECT 1"
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#;
+    let err = Config::from_yaml(yaml).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Hint") && msg.contains("ambiguous"),
+        "must explain why mixing is rejected: {msg}"
+    );
 }

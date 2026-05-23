@@ -29,6 +29,11 @@ exports:
 
     skip_empty: true                # no file on runs with no new orders
 
+    # MySQL does not expose `DECIMAL` precision/scale via column metadata;
+    # declare it explicitly so the export schema is stable run-to-run.
+    columns:
+      price: decimal(10,2)
+
     quality:
       row_count_min: 0              # first run OK with 0 new rows
       unique_columns:

@@ -67,7 +67,7 @@ PR CI defines branch protection — the named gates (`fmt`, `clippy`, `test`, `t
 | Local filesystem | ✅ | ✅ | ✅ | Default for unit + e2e |
 | S3 (MinIO container) | ✅ | ✅ | partial | `live_destination_parity` |
 | GCS (fake-gcs container) | ✅ | ✅ | partial | `live_destination_parity` |
-| Azure Blob Storage | — | — | ✅ | Added 0.7.1; live-verified against a real Azure account on 2026-05-21.  No Azurite container in CI yet — planned for 0.7.2 alongside SAS / service-principal auth. |
+| Azure Blob Storage | — | — | ✅ | Added 0.7.1; live-verified against a real Azure account on 2026-05-21.  SAS token auth added 0.7.2 (unit-tested; no Azurite container in CI yet). |
 | stdout | ✅ | ✅ | — | Constrained — rejects chunked + max_file_size |
 
 Per-backend commit contracts: [ADR-0004](adr/0004-destination-write-contracts.md). Production credentials for real S3 / GCS / Azure endpoints are not exercised in CI.
@@ -144,12 +144,25 @@ Release-artifact signing and checksums are roadmap (see [SECURITY.md § Supply c
 
 These remain operator-driven:
 
-- **Real S3 / GCS / Azure production endpoints** with real IAM / RBAC. CI uses MinIO and fake-gcs containers; the real-cloud path (incl. Azure Blob Storage end-to-end) is exercised manually before each release.
+- **Real S3 / GCS / Azure production endpoints** with real IAM / RBAC. CI uses MinIO and fake-gcs containers; the real-cloud path (incl. Azure Blob Storage end-to-end) is exercised manually before each release. The manual matrix and last-verified dates live in [docs/cloud-smoke-tests.md](cloud-smoke-tests.md); the release process gates on it via [docs/release-checklist.md § Cloud smoke](release-checklist.md#3-cloud-smoke-manual).
 - **Cross-platform binaries.** Release builds run on the matrix in [.github/workflows/release.yml](../.github/workflows/release.yml); the **per-PR** `build-release` job only builds for Linux x86_64.
 - **Long-horizon soak tests** (24h+ continuous extraction). Not run; planned for future hardware.
 - **Real production-shape datasets** beyond the 60k content_items fixture and operator-seeded fixtures from `dev/`.
 
 If your environment depends on any of the above, run the corresponding scripts under `dev/` before adopting Rivet.
+
+---
+
+## Manual / release-gated coverage
+
+Coverage that lives *outside* automated tiers but is gated on the release checklist.
+
+| Area | How verified | Last verified |
+|---|---|---|
+| Real S3 destination (env keys, session token, profile) | Manual smoke per [cloud-smoke-tests.md](cloud-smoke-tests.md) | 2026-05-22 |
+| Real GCS destination (ADC, service account JSON) | Manual smoke per [cloud-smoke-tests.md](cloud-smoke-tests.md) | 2026-05-22 |
+| Real Azure Blob destination (account key + SAS token) | Manual smoke per [cloud-smoke-tests.md](cloud-smoke-tests.md) | 2026-05-22 |
+| Cross-platform release binaries (macOS arm64/Intel, Linux arm64) | `.github/workflows/release.yml` matrix on tag push | per-release |
 
 ---
 

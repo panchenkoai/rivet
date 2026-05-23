@@ -20,6 +20,9 @@ exports:
     mode: incremental
     cursor_column: updated_at
     format: csv
+    # MySQL does not expose DECIMAL precision/scale, so declare it.
+    columns:
+      price: decimal(10,2)
     destination:
       type: s3
       bucket: my-data-lake            # replace with your bucket

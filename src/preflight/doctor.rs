@@ -24,6 +24,9 @@ pub fn doctor(config_path: &str) -> Result<()> {
             all_ok = false;
             let category = categorize_source_error(&e);
             println!("[FAIL] Source {}: {}", category, e);
+            if let Some(hint) = source_error_hint(category, &e, &config.source.source_type) {
+                println!("       Hint: {}", hint);
+            }
         }
     }
 
@@ -77,6 +80,9 @@ pub fn doctor(config_path: &str) -> Result<()> {
                 all_ok = false;
                 let category = categorize_dest_error(&e, &expanded_dest);
                 println!("[FAIL] Destination {} -- {}: {}", label, category, e);
+                if let Some(hint) = destination_error_hint(category, &expanded_dest) {
+                    println!("       Hint: {}", hint);
+                }
             }
         }
     }
@@ -150,6 +156,13 @@ pub(super) fn categorize_dest_error(
     dest: &crate::config::DestinationConfig,
 ) -> &'static str {
     let msg = err.to_string().to_lowercase();
+    // CONTRACT: the pattern below must match the error text emitted by
+    // `enforce_sas_expiry` in destination/azure.rs:
+    //   "Azure SAS token already expired (se=…)"
+    // If that message ever changes, update both places together.
+    if msg.contains("already expired") && msg.contains("sas") {
+        return "sas expired";
+    }
     if msg.contains("credential")
         || msg.contains("permission denied")
         || msg.contains("access denied")
@@ -175,5 +188,113 @@ pub(super) fn categorize_dest_error(
         "connectivity error"
     } else {
         "error"
+    }
+}
+
+/// Map a categorised source error (+ raw text) to an actionable hint.
+///
+/// Returns `None` when nothing more useful than the underlying error
+/// itself can be said.  The output is intentionally short — `doctor`
+/// already prints the full driver message; the hint should add the
+/// *next action*, not re-explain the failure.
+///
+/// Categories come from [`categorize_source_error`].
+pub(super) fn source_error_hint(
+    category: &'static str,
+    err: &anyhow::Error,
+    source_type: &crate::config::SourceType,
+) -> Option<&'static str> {
+    use crate::config::SourceType;
+    let msg = err.to_string().to_lowercase();
+
+    // TLS misconfig leaks through every category — check first so a
+    // generic "error" with a TLS root cause still gets the right hint.
+    if msg.contains("tls")
+        || msg.contains("ssl")
+        || msg.contains("certificate")
+        || msg.contains("handshake")
+    {
+        return Some(match source_type {
+            SourceType::Postgres => {
+                "TLS handshake failed. Try `tls.mode: prefer` (downgrade gracefully) or set `tls.ca_file: /path/to/ca-bundle.pem` if your DB uses a private CA."
+            }
+            SourceType::Mysql => {
+                "TLS handshake failed. Try `tls.mode: prefer` or set `tls.ca_file: /path/to/ca-bundle.pem` to trust the DB's certificate authority."
+            }
+        });
+    }
+
+    match category {
+        "auth error" => Some(match source_type {
+            SourceType::Postgres => {
+                "Verify the user/password and that pg_hba.conf permits your client IP. The user also needs SELECT on the target tables and USAGE on the schema."
+            }
+            SourceType::Mysql => {
+                "Verify the user/password and that the user has SELECT grants on the target tables. MySQL `GRANT SELECT ON db.* TO 'user'@'host'` plus `FLUSH PRIVILEGES`."
+            }
+        }),
+        "connectivity error" => Some(
+            "Verify host/port reachability from this machine. If the DB is behind a bastion or VPN, ensure the tunnel is up before running rivet. `rivet doctor` must run from the same network as `rivet run` will.",
+        ),
+        _ => None,
+    }
+}
+
+/// Map a categorised destination error (+ raw text) to an actionable hint.
+///
+/// Mirrors [`source_error_hint`] but with backend-specific guidance
+/// (S3 region / IAM / endpoint, GCS service account / ADC, Azure key /
+/// SAS / RBAC).  Returns `None` when nothing better than the raw error
+/// applies.
+pub(super) fn destination_error_hint(
+    category: &'static str,
+    dest: &crate::config::DestinationConfig,
+) -> Option<&'static str> {
+    match category {
+        "sas expired" => Some(
+            "Azure SAS token is expired or near-expiry. Generate a new SAS via `az storage container generate-sas --permissions rwdlc --expiry <future-date>` and re-export AZURE_STORAGE_SAS_TOKEN.",
+        ),
+        "auth error" => Some(match dest.destination_type {
+            DestinationType::S3 => {
+                "Verify AWS credentials resolve (env / profile / instance role) and that the role has s3:PutObject + s3:GetObject + s3:ListBucket on the prefix. See docs/cloud-permissions.md."
+            }
+            DestinationType::Gcs => {
+                "Verify the service account credentials resolve (ADC / env / explicit credentials_file) and that the principal has storage.objects.{create,get,list} on the bucket. See docs/cloud-permissions.md."
+            }
+            DestinationType::Azure => {
+                "Verify Azure credentials. Account-key auth: check account_key_env. SAS auth: regenerate the SAS with rwdlc permissions and a future expiry. See docs/cloud-permissions.md."
+            }
+            DestinationType::Local | DestinationType::Stdout => {
+                "Verify filesystem permissions on the destination directory."
+            }
+        }),
+        "bucket not found" | "container not found" => Some(match dest.destination_type {
+            DestinationType::S3 => {
+                "Bucket must already exist; rivet does NOT auto-create. `aws s3 mb s3://<bucket>` (with the right region) before running."
+            }
+            DestinationType::Gcs => {
+                "Bucket must already exist; rivet does NOT auto-create. `gcloud storage buckets create gs://<bucket>` before running."
+            }
+            DestinationType::Azure => {
+                "Container must already exist; rivet does NOT auto-create. `az storage container create --account-name <acct> --name <container>` before running."
+            }
+            _ => "Path / bucket / container must already exist.",
+        }),
+        "connectivity error" => Some(match dest.destination_type {
+            DestinationType::S3 => {
+                "Verify endpoint and region. For non-AWS endpoints (MinIO / R2 / Wasabi) set `endpoint:` explicitly. For AWS, ensure `region:` matches the bucket's region — cross-region writes fail with a confusing redirect error."
+            }
+            DestinationType::Gcs => {
+                "Verify network reachability to storage.googleapis.com. If using a custom endpoint, set `endpoint:` explicitly."
+            }
+            DestinationType::Azure => {
+                "Verify network reachability to <account>.blob.core.windows.net. For Azurite or sovereign clouds, set `endpoint:` explicitly."
+            }
+            _ => "Verify network reachability to the destination.",
+        }),
+        "path not found" => Some(
+            "Parent directory must exist. Create it with `mkdir -p` before running, or use a different `path:` in your config.",
+        ),
+        _ => None,
     }
 }

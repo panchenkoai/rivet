@@ -38,6 +38,15 @@ exports:
     format: parquet
     compression: zstd
 
+    # Postgres exposes numeric(precision, scale) via the catalog, but only
+    # for plain `SELECT ... FROM <table>` queries. In chunked mode Rivet
+    # wraps the user query and the catalog lookup loses the qualifier, so
+    # `price` (numeric) must be declared explicitly here. The simpler
+    # `pg_incremental_local.yaml` does not need this because Rivet reads
+    # precision directly from the un-wrapped query metadata.
+    columns:
+      price: decimal(10,2)
+
     destination:
       type: local
       path: ./output/orders
