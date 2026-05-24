@@ -1,0 +1,137 @@
+{
+  "rivet_version": "0.7.5",
+  "plan_id": "f496c9e9c4de8b557c6e7e54ccc787da",
+  "created_at": "2026-05-24T07:11:48.392414Z",
+  "expires_at": "2026-05-25T07:11:48.392414Z",
+  "export_name": "pa_audit",
+  "strategy": "chunked",
+  "plan_fingerprint": "bad174cfacb8d554",
+  "resolved_plan": {
+    "export_name": "pa_audit",
+    "base_query": "SELECT id, name FROM pa_audit",
+    "strategy": {
+      "Chunked": {
+        "column": "id",
+        "chunk_size": 10,
+        "chunk_count": null,
+        "parallel": 1,
+        "dense": false,
+        "by_days": null,
+        "checkpoint": false,
+        "max_attempts": 4
+      }
+    },
+    "format": "parquet",
+    "compression": "zstd",
+    "compression_level": null,
+    "max_file_size_bytes": null,
+    "skip_empty": false,
+    "meta_columns": {
+      "exported_at": false,
+      "row_hash": false
+    },
+    "destination": {
+      "type": "local",
+      "bucket": null,
+      "prefix": null,
+      "path": "./out/pg_chunked",
+      "region": null,
+      "endpoint": null,
+      "credentials_file": null,
+      "access_key_env": null,
+      "secret_key_env": null,
+      "session_token_env": null,
+      "aws_profile": null,
+      "account_name": null,
+      "account_key_env": null,
+      "sas_token_env": null,
+      "allow_anonymous": false
+    },
+    "quality": null,
+    "tuning": {
+      "batch_size": 10000,
+      "batch_size_memory_mb": null,
+      "throttle_ms": 50,
+      "statement_timeout_s": 300,
+      "max_retries": 3,
+      "retry_backoff_ms": 2000,
+      "lock_timeout_s": 30,
+      "memory_threshold_mb": 4096,
+      "max_batch_memory_mb": null,
+      "on_batch_memory_exceeded": "warn",
+      "adaptive": false,
+      "configured_profile": "balanced"
+    },
+    "tuning_profile_label": "balanced (default)",
+    "validate": false,
+    "reconcile": false,
+    "resume": false,
+    "source": {
+      "type": "postgres",
+      "url": null,
+      "url_env": "PG_URL",
+      "url_file": null,
+      "host": null,
+      "port": null,
+      "user": null,
+      "password": null,
+      "password_env": null,
+      "database": null,
+      "environment": null,
+      "tuning": null,
+      "tls": null
+    },
+    "column_overrides": {},
+    "schema_drift_policy": "warn",
+    "shape_drift_warn_factor": 2.0,
+    "parquet": null
+  },
+  "computed": {
+    "chunk_ranges": [
+      [
+        1,
+        10
+      ],
+      [
+        11,
+        20
+      ],
+      [
+        21,
+        30
+      ]
+    ],
+    "chunk_count": 3,
+    "cursor_snapshot": null,
+    "row_estimate": 30
+  },
+  "diagnostics": {
+    "verdict": "DEGRADED",
+    "warnings": [
+      "No index detected -- full table scan. Create an index on 'id' to speed up range scans. Use 'safe' tuning profile to limit database impact."
+    ],
+    "recommended_profile": "balanced"
+  },
+  "prioritization": {
+    "export_recommendation": {
+      "export_name": "pa_audit",
+      "priority_score": 36,
+      "priority_class": "low",
+      "cost_class": "low",
+      "risk_class": "medium",
+      "recommended_wave": 3,
+      "isolate_on_source": false,
+      "reasons": [
+        {
+          "kind": "small_table",
+          "message": "Smaller estimated row count (~30) — lower extraction cost."
+        },
+        {
+          "kind": "chunking_heavy",
+          "message": "Chunked extraction (3 chunk windows) — higher source load and runtime."
+        }
+      ]
+    }
+  },
+  "config_path": "/Users/andriipanchenko/rivet/dev/cli_matrix/cfg/pg/pg_chunked.yaml"
+}

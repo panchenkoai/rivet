@@ -1,0 +1,8 @@
+source: { type: postgres, url_env: PG_URL }
+exports:
+  - name: pa_audit
+    query: "SELECT 1"
+    query_file: ../export/query_c04.sql
+    mode: full
+    format: parquet
+    destination: { type: local, path: ./out/g04 }

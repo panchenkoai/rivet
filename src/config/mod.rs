@@ -54,6 +54,11 @@ impl Config {
                 anyhow::anyhow!("cannot read config file '{}': {}", path, e)
             }
         })?;
+        // Warn about typo'd `--param` keys once per CLI invocation, using the
+        // un-resolved YAML as the haystack so the placeholders are still there.
+        // We pass the raw `contents` (not `resolved`) on purpose: after
+        // resolution the placeholders are gone, and every key would look unused.
+        resolve::warn_unused_params(&contents, params);
         let resolved = resolve_vars(&contents, params)?;
         // F12 (0.7.5 audit): YAML parse errors did not name the config
         // file.  When loading from disk we know the path — thread it
@@ -266,6 +271,28 @@ impl Config {
                     export.name,
                     set_count
                 );
+            }
+            // SecOps: syntactic `query_file` checks must run at config-validate
+            // time so `rivet check` / `rivet doctor` catch them before any
+            // plan step. The same checks repeat (with a canonicalize-based
+            // symlink probe) in `ExportConfig::resolve_query` because the
+            // file may have been swapped between validation and read.
+            if let Some(file) = &export.query_file {
+                let p = std::path::Path::new(file);
+                if p.is_absolute() {
+                    anyhow::bail!(
+                        "export '{}': query_file must be a relative path: '{}'",
+                        export.name,
+                        file
+                    );
+                }
+                if p.components().any(|c| c == std::path::Component::ParentDir) {
+                    anyhow::bail!(
+                        "export '{}': query_file path must not contain '..': '{}'",
+                        export.name,
+                        file
+                    );
+                }
             }
             if export.destination.destination_type == DestinationType::S3 {
                 let ak = export.destination.access_key_env.is_some();

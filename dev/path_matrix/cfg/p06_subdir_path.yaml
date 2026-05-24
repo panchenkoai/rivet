@@ -1,0 +1,10 @@
+# A nested relative path. We assert that the leaf directory ./out/p06/nested/run
+# is created (not just ./out/p06), so any future change that strips intermediate
+# path components from `destination.path` is caught.
+source: { type: postgres, url_env: PG_URL }
+exports:
+  - name: pa_audit
+    query: "SELECT id, name FROM pa_audit"
+    mode: full
+    format: parquet
+    destination: { type: local, path: ./out/p06/nested/run }

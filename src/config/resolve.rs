@@ -14,24 +14,6 @@ pub fn resolve_vars(
     input: &str,
     params: Option<&std::collections::HashMap<String, String>>,
 ) -> crate::error::Result<String> {
-    // F10 (0.7.5 audit): warn loudly when `--param key=value` was
-    // passed but `${key}` never appears in the config.  A common typo
-    // (`--param maxid=…` vs `${max_id}`) is otherwise silently
-    // ignored and the operator gets unexpected results.
-    if let Some(p) = params {
-        for key in p.keys() {
-            let placeholder = format!("${{{key}}}");
-            if !input.contains(&placeholder) {
-                log::warn!(
-                    "--param '{}' was not referenced by any `${{{}}}` placeholder in the config — \
-                     check the parameter name (case-sensitive) or remove the unused --param",
-                    key,
-                    key
-                );
-            }
-        }
-    }
-
     let mut result = input.to_string();
     let mut search_from = 0;
     while let Some(rel_start) = result[search_from..].find("${") {
@@ -68,6 +50,51 @@ pub fn resolve_vars(
 /// Convenience wrapper: resolve `${VAR}` from environment only.
 pub fn resolve_env_vars(input: &str) -> crate::error::Result<String> {
     resolve_vars(input, None)
+}
+
+/// Return the names of `--param key=value` entries whose `${key}` placeholder
+/// does not appear in `haystack`. Sorted for deterministic warning order.
+///
+/// Used by [`warn_unused_params`]; exposed separately so tests can assert the
+/// set of unused keys without needing to capture log output.
+pub fn find_unused_params(
+    haystack: &str,
+    params: Option<&std::collections::HashMap<String, String>>,
+) -> Vec<String> {
+    let Some(p) = params else {
+        return Vec::new();
+    };
+    let mut unused: Vec<String> = p
+        .keys()
+        .filter(|k| !haystack.contains(&format!("${{{k}}}")))
+        .cloned()
+        .collect();
+    unused.sort();
+    unused
+}
+
+/// F10 (0.7.5 audit): warn loudly when `--param key=value` was passed but
+/// `${key}` never appears anywhere the resolver searched.  A common typo
+/// (`--param maxid=…` vs `${max_id}`) is otherwise silently ignored and the
+/// operator gets unexpected results.
+///
+/// Decoupled from `resolve_vars` because the same params object flows through
+/// the YAML body resolve AND each `ExportConfig::resolve_query` call — emitting
+/// the warning inside `resolve_vars` itself fired it N+1 times per `--param`.
+/// Call this exactly once per CLI invocation, passing the original (un-resolved)
+/// YAML text as the haystack so placeholders are still present.
+pub fn warn_unused_params(
+    haystack: &str,
+    params: Option<&std::collections::HashMap<String, String>>,
+) {
+    for key in find_unused_params(haystack, params) {
+        log::warn!(
+            "--param '{}' was not referenced by any `${{{}}}` placeholder in the config — \
+             check the parameter name (case-sensitive) or remove the unused --param",
+            key,
+            key
+        );
+    }
 }
 
 /// Parse a human-readable file size like "512MB", "1GB", "100KB" into bytes.
@@ -172,6 +199,56 @@ mod tests {
     fn unclosed_placeholder_left_as_is() {
         let result = resolve_vars("${UNCLOSED", None).unwrap();
         assert_eq!(result, "${UNCLOSED");
+    }
+
+    // ── find_unused_params — regression: F-NEW after 0.7.5 audit ────────────
+    //
+    // Before splitting the warning out of `resolve_vars`, the unused-param
+    // warning was emitted N+1 times per `--param` (once at YAML resolve,
+    // once per `ExportConfig::resolve_query` call), AND every `--param` was
+    // wrongly flagged unused at the resolve_query stage because the YAML
+    // pass had already substituted the placeholders out. These tests pin
+    // the new behavior: `find_unused_params` flags only genuinely-unused
+    // keys, against an un-resolved (placeholder-bearing) haystack.
+
+    #[test]
+    fn find_unused_params_returns_empty_when_no_params() {
+        assert!(find_unused_params("SELECT 1", None).is_empty());
+    }
+
+    #[test]
+    fn find_unused_params_used_key_not_flagged() {
+        let mut p = HashMap::new();
+        p.insert("max_id".into(), "20".into());
+        let unused = find_unused_params("SELECT * FROM t WHERE id <= ${max_id}", Some(&p));
+        assert!(unused.is_empty(), "got: {unused:?}");
+    }
+
+    #[test]
+    fn find_unused_params_unused_key_flagged_once() {
+        let mut p = HashMap::new();
+        p.insert("typo_id".into(), "20".into());
+        let unused = find_unused_params("SELECT * FROM t WHERE id <= ${max_id}", Some(&p));
+        assert_eq!(unused, vec!["typo_id".to_string()]);
+    }
+
+    #[test]
+    fn find_unused_params_mixed_used_and_unused() {
+        let mut p = HashMap::new();
+        p.insert("col".into(), "id".into());
+        p.insert("typo".into(), "x".into());
+        let unused = find_unused_params("SELECT ${col} FROM t", Some(&p));
+        assert_eq!(unused, vec!["typo".to_string()]);
+    }
+
+    #[test]
+    fn find_unused_params_partial_match_does_not_count() {
+        // A param named `max` is NOT used by a `${max_id}` placeholder —
+        // substring overlap must not satisfy the check.
+        let mut p = HashMap::new();
+        p.insert("max".into(), "20".into());
+        let unused = find_unused_params("SELECT * FROM t WHERE id <= ${max_id}", Some(&p));
+        assert_eq!(unused, vec!["max".to_string()]);
     }
 
     // ── resolve_env_vars wrapper ─────────────────────────────────────────────

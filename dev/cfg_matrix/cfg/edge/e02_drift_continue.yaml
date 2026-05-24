@@ -1,0 +1,8 @@
+source: { type: postgres, url_env: PG_URL }
+exports:
+  - name: pa_audit
+    query: "SELECT id, name FROM pa_audit"
+    mode: full
+    format: parquet
+    on_schema_drift: continue
+    destination: { type: local, path: ./out/e02 }

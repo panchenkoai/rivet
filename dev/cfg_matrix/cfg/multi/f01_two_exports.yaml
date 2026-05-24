@@ -1,0 +1,12 @@
+source: { type: postgres, url_env: PG_URL }
+exports:
+  - name: pa_audit_a
+    query: "SELECT id, name FROM pa_audit WHERE id <= 10"
+    mode: full
+    format: parquet
+    destination: { type: local, path: ./out/f01_a }
+  - name: pa_audit_b
+    query: "SELECT id, name FROM pa_audit WHERE id > 10"
+    mode: full
+    format: parquet
+    destination: { type: local, path: ./out/f01_b }

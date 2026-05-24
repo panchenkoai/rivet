@@ -1,0 +1,3 @@
+source: { type: postgres, url_env: PG_URL
+exports:
+  - name: pa_audit

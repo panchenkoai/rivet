@@ -1,0 +1,10 @@
+source: { type: postgres, url_env: PG_URL }
+exports:
+  - name: pa_audit
+    query: "SELECT id, name FROM pa_audit"
+    mode: full
+    format: parquet
+    quality:
+      row_count_min: 1
+      row_count_max: 1000
+    destination: { type: local, path: ./out/e04 }

@@ -1,0 +1,6 @@
+.rivet
+.rivet/runs
+.rivet/runs/pa_audit_<RUNID>
+.rivet/runs/pa_audit_<RUNID>/summary.json
+.rivet/runs/pa_audit_<RUNID>/summary.md
+.rivet_state.db

@@ -1,0 +1,10 @@
+# lz4 is in the enum but was not exercised by the original sweep — pin so
+# a downstream parquet-writer refactor that drops a codec is caught.
+source: { type: postgres, url_env: PG_URL }
+exports:
+  - name: pa_audit
+    query: "SELECT id, name FROM pa_audit"
+    mode: full
+    format: parquet
+    compression: lz4
+    destination: { type: local, path: ./out/e15 }

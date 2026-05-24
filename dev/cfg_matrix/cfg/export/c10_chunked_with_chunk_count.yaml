@@ -1,0 +1,9 @@
+source: { type: postgres, url_env: PG_URL }
+exports:
+  - name: pa_audit
+    table: pa_audit
+    mode: chunked
+    chunk_column: id
+    chunk_count: 4
+    format: parquet
+    destination: { type: local, path: ./out/c10 }

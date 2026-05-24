@@ -2662,3 +2662,74 @@ exports:
         "must explain why mixing is rejected: {msg}"
     );
 }
+
+// ── F-NEW (cfg_matrix Issue 3): query_file syntactic validation at load ──
+//
+// Before this regression, `query_file: ../../../../etc/passwd` (or any
+// absolute path) passed `Config::validate` and `rivet check`, and was only
+// rejected at plan-build time when `ExportConfig::resolve_query` was
+// called.  Operators running `rivet check` saw rc=0 and assumed the YAML
+// was safe.  These tests pin the eager check.
+
+#[test]
+fn query_file_traversal_rejected_at_load() {
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: u
+    query_file: ../../../../etc/passwd
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#;
+    let err = Config::from_yaml(yaml).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("must not contain '..'") && msg.contains("query_file"),
+        "expected traversal-rejection at config-load; got: {msg}"
+    );
+}
+
+#[test]
+fn query_file_absolute_path_rejected_at_load() {
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: u
+    query_file: /etc/passwd
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#;
+    let err = Config::from_yaml(yaml).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("must be a relative path") && msg.contains("query_file"),
+        "expected absolute-path rejection at config-load; got: {msg}"
+    );
+}
+
+#[test]
+fn query_file_relative_path_accepted_at_load() {
+    // Sanity: a sane relative path passes the syntactic check even when
+    // the file doesn't exist on disk (the I/O is deferred to plan time).
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: u
+    query_file: queries/users.sql
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#;
+    Config::from_yaml(yaml).expect("relative path must pass validation");
+}

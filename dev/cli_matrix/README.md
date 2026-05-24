@@ -57,6 +57,17 @@ Before tagging a release:
    shrinks usually mean a message got dropped; large growth usually
    means a new warning was added (check it's intended).
 
+Two automated guards complement the manual diff:
+
+- `check_rc.sh` — exit-code contract from `expected_rc.txt`.
+- `check_msg.sh` — substring contract from `expected_msg.txt`.
+
+`check_rc.sh` catches "command stopped failing where it should fail" or
+vice versa. `check_msg.sh` catches the class of regression that rc=0
+masks: a key WARN silently dropped, a noisy log printed N times, an
+error hint reworded, JSON-errors mode polluted by a stray log line.
+Run both in CI; either failing blocks the release.
+
 Scenarios cover doctor, check, run (all flag combos), plan
 (format/output/param), apply (stale ± force, drift ± force, corrupt,
 missing), state, metrics, schema, journal, validate, reconcile,

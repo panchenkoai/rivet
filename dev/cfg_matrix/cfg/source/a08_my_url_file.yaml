@@ -1,0 +1,9 @@
+source:
+  type: mysql
+  url_file: ../../cfg_matrix/_my_url.txt
+exports:
+  - name: pa_audit
+    query: "SELECT id, name FROM pa_audit"
+    mode: full
+    format: parquet
+    destination: { type: local, path: ./out/a08 }

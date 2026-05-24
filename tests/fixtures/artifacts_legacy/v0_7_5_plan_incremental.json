@@ -1,0 +1,117 @@
+{
+  "rivet_version": "0.7.5",
+  "plan_id": "83dae951d26f2c44e5edc224c3f7f91f",
+  "created_at": "2026-05-24T07:11:48.360451Z",
+  "expires_at": "2026-05-25T07:11:48.360451Z",
+  "export_name": "pa_audit",
+  "strategy": "incremental",
+  "plan_fingerprint": "",
+  "resolved_plan": {
+    "export_name": "pa_audit",
+    "base_query": "SELECT id, name FROM pa_audit",
+    "strategy": {
+      "Incremental": {
+        "primary_column": "id",
+        "fallback_column": null,
+        "mode": "single_column"
+      }
+    },
+    "format": "parquet",
+    "compression": "zstd",
+    "compression_level": null,
+    "max_file_size_bytes": null,
+    "skip_empty": false,
+    "meta_columns": {
+      "exported_at": false,
+      "row_hash": false
+    },
+    "destination": {
+      "type": "local",
+      "bucket": null,
+      "prefix": null,
+      "path": "./out/pg_incremental",
+      "region": null,
+      "endpoint": null,
+      "credentials_file": null,
+      "access_key_env": null,
+      "secret_key_env": null,
+      "session_token_env": null,
+      "aws_profile": null,
+      "account_name": null,
+      "account_key_env": null,
+      "sas_token_env": null,
+      "allow_anonymous": false
+    },
+    "quality": null,
+    "tuning": {
+      "batch_size": 10000,
+      "batch_size_memory_mb": null,
+      "throttle_ms": 50,
+      "statement_timeout_s": 300,
+      "max_retries": 3,
+      "retry_backoff_ms": 2000,
+      "lock_timeout_s": 30,
+      "memory_threshold_mb": 4096,
+      "max_batch_memory_mb": null,
+      "on_batch_memory_exceeded": "warn",
+      "adaptive": false,
+      "configured_profile": "balanced"
+    },
+    "tuning_profile_label": "balanced (default)",
+    "validate": false,
+    "reconcile": false,
+    "resume": false,
+    "source": {
+      "type": "postgres",
+      "url": null,
+      "url_env": "PG_URL",
+      "url_file": null,
+      "host": null,
+      "port": null,
+      "user": null,
+      "password": null,
+      "password_env": null,
+      "database": null,
+      "environment": null,
+      "tuning": null,
+      "tls": null
+    },
+    "column_overrides": {},
+    "schema_drift_policy": "warn",
+    "shape_drift_warn_factor": 2.0,
+    "parquet": null
+  },
+  "computed": {
+    "chunk_ranges": [],
+    "chunk_count": 0,
+    "cursor_snapshot": "30",
+    "row_estimate": 1130
+  },
+  "diagnostics": {
+    "verdict": "EFFICIENT",
+    "warnings": [],
+    "recommended_profile": "fast"
+  },
+  "prioritization": {
+    "export_recommendation": {
+      "export_name": "pa_audit",
+      "priority_score": 88,
+      "priority_class": "high",
+      "cost_class": "low",
+      "risk_class": "low",
+      "recommended_wave": 1,
+      "isolate_on_source": false,
+      "reasons": [
+        {
+          "kind": "small_table",
+          "message": "Smaller estimated row count (~1130) — lower extraction cost."
+        },
+        {
+          "kind": "strong_cursor",
+          "message": "Incremental export with indexed cursor — reliable continuation."
+        }
+      ]
+    }
+  },
+  "config_path": "/Users/andriipanchenko/rivet/dev/cli_matrix/cfg/pg/pg_incremental.yaml"
+}

@@ -1,0 +1,13 @@
+.rivet
+.rivet/runs
+.rivet/runs/pa_audit_<RUNID>
+.rivet/runs/pa_audit_<RUNID>/summary.json
+.rivet/runs/pa_audit_<RUNID>/summary.md
+.rivet_state.db
+out
+out/p03
+out/p03/_SUCCESS
+out/p03/manifest.json
+out/p03/pa_audit_<TS>_chunk0.parquet
+out/p03/pa_audit_<TS>_chunk1.parquet
+out/p03/pa_audit_<TS>_chunk2.parquet
