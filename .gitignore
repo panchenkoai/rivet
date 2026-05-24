@@ -78,3 +78,10 @@ pilot_bench.yaml
 /dev/cross_version_matrix/logs/
 /dev/cross_version_matrix/out/
 /dev/cross_version_matrix/rivet
+
+# Doctor probe artifacts that leak when running cfg_matrix in-place
+/dev/cfg_matrix/out/
+
+# .rivet/runs artifacts that leak when running tests against frozen plan
+# fixtures (apply creates run dirs next to the plan file)
+/tests/fixtures/artifacts_legacy/.rivet/
