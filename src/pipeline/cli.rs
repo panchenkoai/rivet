@@ -81,6 +81,27 @@ fn boundary_value(b: &crate::state::Boundary) -> String {
 }
 
 pub fn reset_state(config_path: &str, export_name: &str) -> Result<()> {
+    // Validate the export name against the config BEFORE touching state, so a
+    // typo (`--export pa_audi` instead of `pa_audit`) produces a hint with the
+    // declared names instead of silently DELETE-ing zero rows and printing
+    // "State reset for export 'pa_audi'" as if it worked.  Without this guard
+    // a stray `--export <unknown>` looked like success but did nothing — a
+    // genuine ops footgun under "I reset it, why did the cursor not move".
+    let config = crate::config::Config::load(config_path)?;
+    if !config.exports.iter().any(|e| e.name == export_name) {
+        let known: Vec<String> = config.exports.iter().map(|e| e.name.clone()).collect();
+        anyhow::bail!(
+            "export '{}' not found in config '{}'.\n  Known exports: {}\n  Hint: check the spelling, or run `rivet state show -c {}` to see what is currently tracked.",
+            export_name,
+            config_path,
+            if known.is_empty() {
+                "(none defined)".to_string()
+            } else {
+                known.join(", ")
+            },
+            config_path,
+        );
+    }
     let state = StateStore::open(config_path)?;
     state.reset(export_name)?;
     println!("State reset for export '{}'", export_name);
@@ -664,10 +685,36 @@ exports:
     #[test]
     fn reset_state_returns_ok() {
         let (dir, config_path) = setup_dir();
+        write_two_export_config(&config_path);
         let state = open_state(&dir);
         state.update("orders", "100").unwrap();
         drop(state);
         assert!(reset_state(&config_path, "orders").is_ok());
+    }
+
+    // F-NEW (0.7.7 audit): `state reset` on an export that is not declared
+    // in the config used to silently succeed (DELETE WHERE export_name = X
+    // affects 0 rows; "State reset for export 'X'" printed; rc=0). A typo'd
+    // `--export pa_audi` looked like success but did nothing. This pins the
+    // hint-emitting bail.
+    #[test]
+    fn reset_state_unknown_export_bails_with_hint() {
+        let (_dir, config_path) = setup_dir();
+        write_two_export_config(&config_path);
+        let err = reset_state(&config_path, "ghost").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("export 'ghost' not found"),
+            "must name the missing export: {msg}"
+        );
+        assert!(
+            msg.contains("orders") && msg.contains("transactions"),
+            "must list the declared exports so the user can spot the typo: {msg}"
+        );
+        assert!(
+            msg.contains("rivet state show"),
+            "must point at a follow-up command: {msg}"
+        );
     }
 
     // ── reset_chunk_checkpoint ───────────────────────────────────────────────
