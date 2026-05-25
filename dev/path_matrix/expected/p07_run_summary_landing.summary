@@ -1,0 +1,1 @@
+export=pa_audit	status=success	format=parquet	compression=zstd	total_rows=5	files_produced=1
