@@ -81,7 +81,7 @@ pg_state_help 0
 pg_state_progression 0
 pg_state_reset 0
 pg_state_reset_chunks_stuck 0
-pg_state_reset_unknown 0
+pg_state_reset_unknown 1
 pg_state_show 0
 pg_validate 0
 schema_config 0

@@ -16,6 +16,7 @@ set -u
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 R="${RIVET_BIN:-$ROOT/rivet}"
 NORMALIZE="$ROOT/normalize.sh"
+EXTRACT_SUMMARY="$ROOT/extract_summary.sh"
 LOGS="$ROOT/logs"
 EXPECTED="$ROOT/expected"
 
@@ -59,18 +60,45 @@ for yaml in $(find "$ROOT/cfg" -name '*.yaml' | sort); do
     find . -mindepth 1 -not -name 'rivet.yaml' | sed 's|^\./||'
   ) | "$NORMALIZE" > "$LOGS/$sid/layout"
 
-  # Compare against baseline if one exists.
+  # Extract data-accounting fields from each summary.json. This is the matrix-
+  # level counterpart to tests/live_reconcile_repair.rs — a code-path that
+  # exports 0 rows where 30 were expected stays at rc=0 but the snapshot
+  # diverges. Scenarios where rc != 0 (run failed) skip this step.
+  if [[ "$rc" == "0" ]]; then
+    "$EXTRACT_SUMMARY" "$work" > "$LOGS/$sid/summary" 2>/dev/null || : > "$LOGS/$sid/summary"
+  else
+    : > "$LOGS/$sid/summary"
+  fi
+
+  # Compare against baselines if they exist.
+  layout_status="NEW"
   if [[ -f "$EXPECTED/$sid.layout" ]]; then
     if diff -u "$EXPECTED/$sid.layout" "$LOGS/$sid/layout" > "$LOGS/$sid/layout.diff" 2>&1; then
-      printf '%-32s  rc=%-3s  PASS    layout matches expected\n' "$sid" "$rc"
-      pass=$((pass+1))
+      layout_status="OK"
     else
-      printf '%-32s  rc=%-3s  FAIL    layout diverged (see logs/%s/layout.diff)\n' "$sid" "$rc" "$sid"
-      fail=$((fail+1))
+      layout_status="DIVERGED"
     fi
-  else
-    printf '%-32s  rc=%-3s  NEW     no baseline (review logs/%s/layout, copy to expected/)\n' "$sid" "$rc" "$sid"
+  fi
+  summary_status="NEW"
+  if [[ -f "$EXPECTED/$sid.summary" ]]; then
+    if diff -u "$EXPECTED/$sid.summary" "$LOGS/$sid/summary" > "$LOGS/$sid/summary.diff" 2>&1; then
+      summary_status="OK"
+    else
+      summary_status="DIVERGED"
+    fi
+  fi
+
+  if [[ "$layout_status" == "DIVERGED" || "$summary_status" == "DIVERGED" ]]; then
+    printf '%-32s  rc=%-3s  FAIL    layout=%s summary=%s (see logs/%s/*.diff)\n' \
+      "$sid" "$rc" "$layout_status" "$summary_status" "$sid"
+    fail=$((fail+1))
+  elif [[ "$layout_status" == "NEW" || "$summary_status" == "NEW" ]]; then
+    printf '%-32s  rc=%-3s  NEW     layout=%s summary=%s (review logs/%s/, copy baselines)\n' \
+      "$sid" "$rc" "$layout_status" "$summary_status" "$sid"
     new=$((new+1))
+  else
+    printf '%-32s  rc=%-3s  PASS    layout+summary match expected\n' "$sid" "$rc"
+    pass=$((pass+1))
   fi
 done
 

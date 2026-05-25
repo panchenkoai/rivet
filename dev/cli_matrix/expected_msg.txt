@@ -62,3 +62,11 @@ pg_apply_json_errors stderr + {"error":
 pg_apply_json_errors stderr - WARN
 pg_plan_json_errors  stderr + {"error":
 pg_plan_json_errors  stderr - WARN
+
+# ── 0.7.7 audit: state reset on a typo'd export bails with hint ───────────
+# Previously silently DELETE'd 0 rows + printed "State reset for export 'X'"
+# as if it worked. Now lists declared exports + points at `state show`.
+pg_state_reset_unknown stderr + not found in config
+pg_state_reset_unknown stderr + Known exports:
+pg_state_reset_unknown stderr + Hint: check the spelling
+pg_state_reset_unknown stderr + rivet state show

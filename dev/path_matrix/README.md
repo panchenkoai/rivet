@@ -1,8 +1,15 @@
-# Path-topology matrix — on-disk layout regression guard
+# Path-topology + data-accounting matrix
 
 Third matrix in the family (after `dev/cli_matrix/` and `dev/cfg_matrix/`).
 Where the other two pin **exit codes** and **error messages**, this one
-pins the **shape of what lands on disk** after a successful `rivet run`.
+pins two complementary contracts after a successful `rivet run`:
+
+1. **On-disk file layout** (`expected/<id>.layout`) — what files / dirs
+   ended up where.
+2. **Per-export accounting** (`expected/<id>.summary`) — row counts,
+   files produced, status, format/compression — extracted from each
+   `summary.json`. Catches "exported 0 rows where 30 were expected"
+   regressions that stay at rc=0.
 
 ## Why
 

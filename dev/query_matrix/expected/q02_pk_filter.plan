@@ -1,0 +1,4 @@
+Bitmap Heap Scan on pa_audit
+  Recheck Cond: (id <= 10)
+  ->  Bitmap Index Scan on pa_audit_pkey
+        Index Cond: (id <= 10)

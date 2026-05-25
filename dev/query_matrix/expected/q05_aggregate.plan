@@ -1,0 +1,2 @@
+Aggregate
+  ->  Seq Scan on pa_audit

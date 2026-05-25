@@ -79,6 +79,10 @@ pilot_bench.yaml
 /dev/cross_version_matrix/out/
 /dev/cross_version_matrix/rivet
 
+# Query-shape matrix
+/dev/query_matrix/logs/
+/dev/query_matrix/rivet
+
 # Doctor probe artifacts that leak when running cfg_matrix in-place
 /dev/cfg_matrix/out/
 
