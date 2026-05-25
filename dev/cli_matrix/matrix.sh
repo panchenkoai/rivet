@@ -133,7 +133,7 @@ run my_apply_incr      "apply MySQL incremental" -- "$R" apply "$LM/my_plan_incr
 run my_apply_chunked   "apply MySQL chunked"    -- "$R" apply "$LM/my_plan_chunked/plan.json"
 # Frozen v0.7.5 plan must still apply with --force (stale by definition once
 # committed). Catches plan-schema regressions visible only at apply-time.
-run pg_apply_legacy_frozen "apply frozen v0.7.5 plan --force" -- "$R" apply --force /Users/andriipanchenko/rivet/tests/fixtures/artifacts_legacy/v0_7_5_plan_full.json
+run pg_apply_legacy_frozen "apply frozen v0.7.5 plan --force" -- "$R" apply --force "$ROOT/../../tests/fixtures/artifacts_legacy/v0_7_5_plan_full.json"
 
 echo "================== state =================="
 run pg_state_help      "state --help"           -- "$R" state --help
