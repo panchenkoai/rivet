@@ -1,0 +1,48 @@
+# Docker Compose profiles required by each matrix harness.
+#
+# Primary services (always-on in CI):
+#   postgres  → rivet-postgres-1 (PG 16)
+#   mysql     → rivet-mysql-1 (8.0)
+#
+# Legacy profile (--profile legacy):
+#   postgres-12 .. postgres-15, mysql-57
+
+matrices:
+  cli:
+    services: [postgres, mysql]
+    seed: seed_pa_audit.sh
+  cfg:
+    services: [postgres, mysql]
+    seed: null
+  path:
+    services: [postgres]
+    seed: seed_pa_audit.sh --engines=postgres
+  query:
+    services: [postgres]
+    seed: seed_pa_audit.sh --engines=postgres
+  soak:
+    services: [postgres]
+    seed: seed_pa_soak.sh
+  cross_version:
+    services: [postgres, mysql, postgres-12, postgres-13, postgres-14, postgres-15, mysql-57]
+    compose_profile: legacy
+    seed: seed_pa_audit_all.sh
+
+tiers:
+  pr:
+    - cli
+    - cfg
+    - path
+  nightly:
+    - cli
+    - cfg
+    - path
+    - query
+    - soak
+  release:
+    - cli
+    - cfg
+    - path
+    - query
+    - soak
+    - cross_version

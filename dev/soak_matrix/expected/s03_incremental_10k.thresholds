@@ -1,0 +1,10 @@
+# Soak thresholds for s03 (incremental-mode first run, 10k rows).
+#
+# Healthy baseline on a quiet dev machine: dur ~ 205ms, rss ~ 19MB.
+# Effectively identical perf characteristics to a full export on the
+# first incremental run — there's no cursor history yet, so the WHERE
+# clause is unbounded. Same generous thresholds as s01.
+
+total_rows_min=10000
+duration_ms_max=3000
+peak_rss_mb_max=100

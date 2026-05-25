@@ -1,0 +1,13 @@
+# Soak thresholds for s01 (full-mode, 10k rows).
+#
+# Healthy baseline on a quiet dev machine: dur ~ 200ms, rss ~ 19MB.
+# Thresholds are deliberately generous (~15x dur, ~5x rss) so CI runner
+# noise does not flap them. The goal here is to catch ORDER-OF-MAGNITUDE
+# regressions — a 50x-slower full export, a 10x-larger RSS — not micro
+# perf changes (those belong in cargo bench).
+#
+# When intentionally tuning perf, re-promote from a clean run.
+
+total_rows_min=10000
+duration_ms_max=3000
+peak_rss_mb_max=100

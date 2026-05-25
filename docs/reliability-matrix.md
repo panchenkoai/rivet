@@ -117,6 +117,7 @@ Each legacy target runs the full 83-assertion e2e suite when selected. Status ta
 
 | Area | PR CI | Nightly | Manual | Suite |
 |---|:---:|:---:|:---:|---|
+| Shell regression matrices (cli / cfg / path / …) | ✅ | partial | ✅ | [`dev/matrices/`](../dev/matrices/README.md) |
 | CLI flag contract (no silent flag drift) | ✅ | ✅ | — | `cli_contract`, `live_cli_flags` |
 | `rivet init` scaffolding | ✅ | ✅ | — | `live_init`, `live_init_extended` |
 | `rivet doctor` preflight | ✅ | ✅ | — | covered in `live_cli_flags` |

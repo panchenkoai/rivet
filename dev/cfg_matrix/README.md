@@ -1,5 +1,7 @@
 # YAML config matrix — coverage + regression guard
 
+Part of the matrix family under [`dev/matrices/`](../matrices/README.md).
+
 Sister of `dev/cli_matrix/`. That one stresses the CLI surface (flag
 combinations, exit codes, error messages per subcommand); this one
 stresses the **YAML configuration surface** — every connection method,
