@@ -1,0 +1,6 @@
+exports:
+  - name: pa_audit
+    query: "SELECT 1"
+    mode: full
+    format: parquet
+    destination: { type: local, path: ./out/g06 }

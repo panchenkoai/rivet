@@ -102,6 +102,39 @@ pub fn check(
         SourceType::Mysql => mysql::check_mysql(&url, tls, &exports, json_output)?,
     }
 
+    // Destination credential-resolution preflight.  Until 0.7.6 `check` only
+    // probed the source: a config with `AWS_ACCESS_KEY_ID` unset would pass
+    // `rivet check` (rc=0) and then explode on `run`, while `rivet doctor`
+    // caught it.  We don't issue a write-probe here (that is `doctor`'s job
+    // and has side effects) — but we *do* call `create_destination`, which
+    // resolves env vars / credentials_file existence at construction time.
+    // Each unique destination is probed once per `check` to keep multi-export
+    // configs cheap.
+    let mut seen_destinations: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for export in &exports {
+        let dest_key = format!(
+            "{:?}:{}:{}:{}",
+            export.destination.destination_type,
+            export.destination.bucket.as_deref().unwrap_or("-"),
+            export.destination.endpoint.as_deref().unwrap_or("-"),
+            export.destination.path.as_deref().unwrap_or("-"),
+        );
+        if !seen_destinations.insert(dest_key) {
+            continue;
+        }
+        let expanded = crate::plan::build::expand_destination_templates(
+            export.destination.clone(),
+            &export.name,
+        );
+        crate::destination::create_destination(&expanded).map_err(|e| {
+            anyhow::anyhow!(
+                "export '{}': destination preflight failed: {:#}",
+                export.name,
+                e
+            )
+        })?;
+    }
+
     if show_type_report {
         let policy = if strict {
             TypePolicy::strict()

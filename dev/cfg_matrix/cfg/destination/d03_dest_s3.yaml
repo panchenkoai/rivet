@@ -1,0 +1,13 @@
+source: { type: postgres, url_env: PG_URL }
+exports:
+  - name: pa_audit
+    query: "SELECT id, name FROM pa_audit"
+    mode: full
+    format: parquet
+    destination:
+      type: s3
+      bucket: rivet-cfg-matrix-test
+      prefix: d03/
+      region: us-east-1
+      access_key_env: AWS_ACCESS_KEY_ID
+      secret_key_env: AWS_SECRET_ACCESS_KEY

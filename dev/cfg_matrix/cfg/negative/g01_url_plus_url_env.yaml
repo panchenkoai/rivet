@@ -1,0 +1,10 @@
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@127.0.0.1:5432/rivet"
+  url_env: PG_URL
+exports:
+  - name: pa_audit
+    query: "SELECT id, name FROM pa_audit"
+    mode: full
+    format: parquet
+    destination: { type: local, path: ./out/g01 }

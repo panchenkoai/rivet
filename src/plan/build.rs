@@ -240,8 +240,16 @@ fn resolve_chunked_strategy(
     } else {
         match introspection.single_int_pk.clone() {
             Some(col) => {
-                log::info!(
-                    "export '{}': auto-resolved chunk_column = '{}' from primary key on {}",
+                // `info!` was below the default `warn` log level — operators
+                // never saw which column the planner had picked, so a config
+                // that intended `mode: chunked` + `chunk_column: created_at`
+                // but typo'd the column name silently fell back to PK with
+                // no signal. Elevate to `warn!` so the implicit choice is
+                // visible in every run; tell the operator how to silence it.
+                log::warn!(
+                    "export '{}': chunk_column not set — auto-resolved to '{}' \
+                     from the single-integer primary key on {}. \
+                     Set `chunk_column:` explicitly to pin the choice and silence this warning.",
                     export.name,
                     col,
                     tbl

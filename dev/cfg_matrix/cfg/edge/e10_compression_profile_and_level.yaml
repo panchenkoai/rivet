@@ -1,0 +1,11 @@
+# profile is supposed to take precedence over (compression + compression_level)
+source: { type: postgres, url_env: PG_URL }
+exports:
+  - name: pa_audit
+    query: "SELECT id, name FROM pa_audit"
+    mode: full
+    format: parquet
+    compression: gzip
+    compression_level: 3
+    compression_profile: compact
+    destination: { type: local, path: ./out/e10 }

@@ -1,0 +1,12 @@
+source:
+  type: postgres
+  url_env: PG_URL
+  tuning:
+    profile: fast
+    batch_size: 500
+exports:
+  - name: pa_audit
+    query: "SELECT id, name FROM pa_audit"
+    mode: full
+    format: parquet
+    destination: { type: local, path: ./out/e11 }

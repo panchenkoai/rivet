@@ -1,0 +1,10 @@
+source:
+  type: postgres
+  url_env: PG_URL
+  tls: { mode: verify-full }
+exports:
+  - name: pa_audit
+    query: "SELECT id, name FROM pa_audit"
+    mode: full
+    format: parquet
+    destination: { type: local, path: ./out/b04 }

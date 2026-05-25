@@ -1,0 +1,11 @@
+source: { type: postgres, url_env: PG_URL }
+notifications:
+  slack:
+    webhook_url_env: SLACK_WEBHOOK_URL
+    on: [failure]
+exports:
+  - name: pa_audit
+    query: "SELECT id, name FROM pa_audit"
+    mode: full
+    format: parquet
+    destination: { type: local, path: ./out/f05 }

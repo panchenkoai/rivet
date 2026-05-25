@@ -1,0 +1,12 @@
+source:
+  type: postgres
+  url_env: PG_URL
+
+exports:
+  - name: pa_audit
+    query: "SELECT id, name FROM pa_audit WHERE id <= ${max_id}"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: ./out/pg_param

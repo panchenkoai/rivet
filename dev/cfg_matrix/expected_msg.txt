@@ -1,0 +1,50 @@
+# cfg_matrix substring contract.  Same format as dev/cli_matrix/expected_msg.txt:
+#
+#   <scenario_id> <probe>/<stream> <op> <substring...>
+#
+# <probe> in {doctor, check, plan}; <stream> in {stdout, stderr}.
+# <op> in {+, -, =N}: must-appear / must-NOT-appear / exact-count.
+#
+# Pins the four regressions caught by the first cfg_matrix sweep so they
+# stay fixed:
+#   B1  — MySQL+TLS panic when mysql crate built without TLS feature.
+#   B2  — chunked auto-resolves chunk_column silently from PK.
+#   I3  — query_file path traversal only caught at plan time.
+#   I4  — `rivet check` skipped destination credential preflight.
+
+# ── B1: MySQL TLS no longer panics, modes resolve appropriately ───────────
+# rc=0 was rc=101 (panic) before; now connects cleanly under tls.mode=require.
+b07_my_tls_require   doctor/stderr - panicked
+b07_my_tls_require   check/stderr  - panicked
+b07_my_tls_require   plan/stderr   - panicked
+b08_my_tls_verify_ca doctor/stderr - panicked
+b09_my_tls_verify_full doctor/stderr - panicked
+
+# ── B2: chunk_column auto-resolve emits visible WARN ──────────────────────
+g18_chunked_no_column plan/stderr + chunk_column not set
+g18_chunked_no_column plan/stderr + auto-resolved to 'id'
+g18_chunked_no_column plan/stderr + Set `chunk_column:` explicitly
+
+# Sanity: when chunk_column IS set, the auto-resolve warning must NOT fire.
+c06_chunked_parquet  plan/stderr - chunk_column not set
+c10_chunked_with_chunk_count plan/stderr - chunk_column not set
+
+# ── I3: query_file traversal/absolute path rejected at config-load ────────
+# All three probes must catch the bad path; previously only plan did.
+g16_query_file_traversal doctor/stderr + query_file path must not contain '..'
+g16_query_file_traversal check/stderr  + query_file path must not contain '..'
+g16_query_file_traversal plan/stderr   + query_file path must not contain '..'
+
+# ── I4: `check` now performs destination credential preflight ────────────
+d03_dest_s3 check/stderr + destination preflight failed
+d03_dest_s3 check/stderr + AWS_ACCESS_KEY_ID
+
+# ── Background (pinned from previous PR): warning dedup still holds ──────
+# `cfg_matrix` invokes 3 probes per scenario; warnings still fire once per
+# probe process (Once::call_once is process-scoped). The plan probe for
+# full-mode exports never connects to the source (no introspection needed),
+# so the TLS warning only fires on chunked-mode plans where introspection
+# runs.  We assert against c06_chunked_parquet where the plan probe DOES
+# call create_source.
+c01_full_query_parquet plan/stderr =1 source URL contains plaintext password
+c06_chunked_parquet    plan/stderr =1 TLS is not enforced

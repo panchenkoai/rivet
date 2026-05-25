@@ -24,6 +24,7 @@ pg_apply_drift_no_force 1
 pg_apply_full 0
 pg_apply_incr 0
 pg_apply_json_errors 1
+pg_apply_legacy_frozen 0
 pg_apply_missing 1
 pg_apply_no_arg 2
 pg_apply_stale_force 0
@@ -31,6 +32,10 @@ pg_apply_stale_no_force 1
 pg_check_chunked 0
 pg_check_full 0
 pg_check_incr 0
+pg_check_strict 0
+pg_check_target_bq 0
+pg_check_type_report 0
+pg_check_type_report_json 0
 pg_check_unknown 1
 pg_doctor_ok 0
 pg_doctor_unset 1
@@ -38,6 +43,9 @@ pg_init_no_table 0
 pg_init_table 0
 pg_init_unset 1
 pg_journal 0
+pg_journal_last1 0
+pg_journal_missing_run_id 0
+pg_journal_unknown_export 0
 pg_metrics 0
 pg_metrics_export 0
 pg_plan_bad_format 2
@@ -68,8 +76,13 @@ pg_run_unknown 1
 pg_run_val_rec 0
 pg_run_validate 0
 pg_state_files 0
+pg_state_files_export 0
 pg_state_help 0
 pg_state_progression 0
+pg_state_reset 0
+pg_state_reset_chunks_stuck 0
+pg_state_reset_unknown 0
+pg_state_show 0
 pg_validate 0
 schema_config 0
 schema_help 0

@@ -1,0 +1,12 @@
+# `coalesce` mode is what `cursor_fallback_column` requires — pin the happy
+# path so a refactor that drops the COALESCE rewrite is caught.
+source: { type: postgres, url_env: PG_URL }
+exports:
+  - name: pa_audit
+    table: pa_audit
+    mode: incremental
+    cursor_column: id
+    cursor_fallback_column: id
+    incremental_cursor_mode: coalesce
+    format: parquet
+    destination: { type: local, path: ./out/e19 }

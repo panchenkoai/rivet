@@ -1,0 +1,8 @@
+source: { type: postgres, url_env: PG_URL }
+exports:
+  - name: pa_audit
+    query: "SELECT id, name FROM pa_audit WHERE 1=0"
+    mode: full
+    skip_empty: true
+    format: parquet
+    destination: { type: local, path: ./out/c12 }

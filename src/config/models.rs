@@ -256,9 +256,12 @@ impl SourceConfig {
                     anyhow::bail!("source: specify 'password' or 'password_env', not both");
                 }
                 (Some(p), None) => {
-                    log::warn!(
-                        "source config contains plaintext password -- consider using password_env"
-                    );
+                    static WARNED: std::sync::Once = std::sync::Once::new();
+                    WARNED.call_once(|| {
+                        log::warn!(
+                            "source config contains plaintext password -- consider using password_env"
+                        );
+                    });
                     resolve_env_vars(p)?
                 }
                 (None, Some(env)) => std::env::var(env).map_err(|_| {
@@ -341,9 +344,16 @@ impl SourceConfig {
             && userinfo.contains(':')
             && !userinfo.ends_with(':')
         {
-            log::warn!(
-                "source URL contains plaintext password -- consider using url_env or url_file"
-            );
+            // `resolve_url` is called from many places per run (plan build,
+            // doctor, every export, every chunk worker).  Fire this warning
+            // exactly once per process so operators see one clean nudge,
+            // not 3-4 stacked copies in stderr.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                log::warn!(
+                    "source URL contains plaintext password -- consider using url_env or url_file"
+                );
+            });
         }
 
         Ok(resolved)

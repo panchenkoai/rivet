@@ -1,0 +1,13 @@
+.rivet
+.rivet/runs
+.rivet/runs/pa_audit_<RUNID>
+.rivet/runs/pa_audit_<RUNID>/summary.json
+.rivet/runs/pa_audit_<RUNID>/summary.md
+.rivet_state.db
+out
+out/p06
+out/p06/nested
+out/p06/nested/run
+out/p06/nested/run/_SUCCESS
+out/p06/nested/run/manifest.json
+out/p06/nested/run/pa_audit_<TS>.parquet
