@@ -1,0 +1,10 @@
+# PK-bounded query — should plan as Index Scan on the id PK (or Seq Scan
+# with Filter, but never as Bitmap Heap on a 30-row fixture). The exact
+# plan body is the contract.
+source: { type: postgres, url_env: PG_URL }
+exports:
+  - name: pa_audit
+    query: "SELECT id, name FROM pa_audit WHERE id <= 10"
+    mode: full
+    format: parquet
+    destination: { type: local, path: ./out/q02 }

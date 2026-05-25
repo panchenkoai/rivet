@@ -1,0 +1,10 @@
+# Ordering on the PK — small tables may sort in-memory or use the index.
+# Pin whichever PG 16 picks for the fixture; future regression that wraps
+# the ORDER BY in a Materialize / Sort step diverges.
+source: { type: postgres, url_env: PG_URL }
+exports:
+  - name: pa_audit
+    query: "SELECT id, name FROM pa_audit ORDER BY id"
+    mode: full
+    format: parquet
+    destination: { type: local, path: ./out/q04 }

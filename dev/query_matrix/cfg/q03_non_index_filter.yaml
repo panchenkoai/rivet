@@ -1,0 +1,9 @@
+# Non-indexed predicate — should plan as Seq Scan with Filter. A regression
+# that adds a "helpful" subquery / CTE wrapper changes the EXPLAIN shape.
+source: { type: postgres, url_env: PG_URL }
+exports:
+  - name: pa_audit
+    query: "SELECT id, name FROM pa_audit WHERE name LIKE 'row_1%'"
+    mode: full
+    format: parquet
+    destination: { type: local, path: ./out/q03 }

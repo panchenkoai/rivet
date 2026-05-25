@@ -1,0 +1,9 @@
+# Aggregate — should plan as Aggregate over Seq Scan. Catches "did the
+# planner push down predicate" / "did we wrap in a subquery" regressions.
+source: { type: postgres, url_env: PG_URL }
+exports:
+  - name: pa_audit
+    query: "SELECT COUNT(*)::INTEGER AS n FROM pa_audit"
+    mode: full
+    format: parquet
+    destination: { type: local, path: ./out/q05 }

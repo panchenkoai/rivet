@@ -1,0 +1,2 @@
+Seq Scan on pa_audit
+  Filter: (name ~~ 'row_1%'::text)
