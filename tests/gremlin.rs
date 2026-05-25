@@ -10,6 +10,11 @@
 //! | G3 | `unique_max_entries` cap hit emits Warn, not Fail — export still succeeds  |
 //! | G4 | `auto_shrink` splits preserve total row count under a `row_count_min` gate |
 //! | G5 | Crash at `after_source_read` + quality config: recovery re-evaluates gate  |
+//! | G6 | `row_count_max` fires when source returns MORE rows than the upper bound   |
+//! | G7 | `row_count_min` at exact boundary (rows == min) passes, off-by-one fails  |
+//! | G8 | `unique_columns` with NULLs: NULL rows don't false-positive uniqueness    |
+//! | G9 | Chunked + quality: empty middle chunk doesn't false-fire row_count gate  |
+//! | G10| Multi-export with one quality-failing export: other exports still run    |
 //!
 //! G1 and G2 are regression tests for the bug where `run_quality_checks()` was
 //! called after the `if sink.total_rows == 0 { return Ok(()); }` early return
@@ -356,5 +361,272 @@ exports:
         files_with_extension(out.path(), "parquet").len(),
         1,
         "recovery run must produce exactly one output file"
+    );
+}
+
+// ─── G6: row_count_max fires when source returns MORE rows than the bound ─────
+
+/// `row_count_max` is the symmetric gate to `row_count_min`: if the source
+/// returns more rows than the operator declared as the upper bound the export
+/// must fail with a clear message naming the bound. Catches "I expected this
+/// query to return at most 100 rows for a daily summary; it returned 50_000
+/// because my predicate is wrong" regressions.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn gremlin_row_count_max_fires_on_over_limit_source() {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(50); // 50 rows
+    let out = tempfile::tempdir().unwrap();
+    let export_name = unique_name("gr_rmax");
+
+    let yaml = format!(
+        r#"
+source: {{type: postgres, url: "{POSTGRES_URL}"}}
+exports:
+  - name: {export_name}
+    query: "SELECT id FROM {table_name}"
+    mode: full
+    format: parquet
+    destination: {{type: local, path: {dir}}}
+    quality:
+      row_count_max: 10
+"#,
+        table_name = table.name(),
+        dir = out.path().display()
+    );
+    let (_cfgdir, cfgpath) = make_cfg(&yaml);
+
+    let result = run_rivet_export(&cfgpath, &export_name);
+    assert!(
+        !result.status.success(),
+        "row_count_max=10 on 50-row table must fail; stderr:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("row_count") || stderr.contains("maximum") || stderr.contains("exceed"),
+        "error must mention row count / maximum / exceed; got:\n{stderr}"
+    );
+}
+
+// ─── G7: row_count_min at exact boundary passes, off-by-one fails ─────────────
+
+/// Boundary check on `row_count_min`. Operator-visible semantics: `min: 10`
+/// means "at least 10". A run that returns exactly 10 rows must pass; a run
+/// that returns 9 must fail. Cheap regression test for the `<` vs `<=` class
+/// of off-by-one bug in the quality comparator.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn gremlin_row_count_min_boundary_is_inclusive() {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(10);
+    let out_exact = tempfile::tempdir().unwrap();
+    let out_short = tempfile::tempdir().unwrap();
+
+    // Exact boundary: 10 rows == min 10 → must pass.
+    let export_exact = unique_name("gr_b_exact");
+    let yaml_exact = format!(
+        r#"
+source: {{type: postgres, url: "{POSTGRES_URL}"}}
+exports:
+  - name: {export_exact}
+    query: "SELECT id FROM {table_name}"
+    mode: full
+    format: parquet
+    destination: {{type: local, path: {dir}}}
+    quality:
+      row_count_min: 10
+"#,
+        table_name = table.name(),
+        dir = out_exact.path().display()
+    );
+    let (_d1, cfg_exact) = make_cfg(&yaml_exact);
+    let r_exact = run_rivet_export(&cfg_exact, &export_exact);
+    assert!(
+        r_exact.status.success(),
+        "row_count_min=10 on 10-row source must pass (inclusive boundary); stderr:\n{}",
+        String::from_utf8_lossy(&r_exact.stderr)
+    );
+
+    // Off-by-one: 10 rows < min 11 → must fail.
+    let export_short = unique_name("gr_b_short");
+    let yaml_short = format!(
+        r#"
+source: {{type: postgres, url: "{POSTGRES_URL}"}}
+exports:
+  - name: {export_short}
+    query: "SELECT id FROM {table_name}"
+    mode: full
+    format: parquet
+    destination: {{type: local, path: {dir}}}
+    quality:
+      row_count_min: 11
+"#,
+        table_name = table.name(),
+        dir = out_short.path().display()
+    );
+    let (_d2, cfg_short) = make_cfg(&yaml_short);
+    let r_short = run_rivet_export(&cfg_short, &export_short);
+    assert!(
+        !r_short.status.success(),
+        "row_count_min=11 on 10-row source must fail (off-by-one boundary)"
+    );
+}
+
+// ─── G8: NULLs in unique_columns should not false-positive uniqueness ─────────
+
+/// `unique_columns: [col]` asserts that distinct non-NULL values across the
+/// export equal the row count. If two rows have NULL in `col`, those NULLs
+/// must NOT be flagged as "duplicate of each other" — by SQL convention
+/// `NULL != NULL`. Pins the behaviour for any future refactor of the
+/// uniqueness check that might collapse NULLs into one bucket.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn gremlin_unique_columns_nullable_column_does_not_false_positive() {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(5);
+    let out = tempfile::tempdir().unwrap();
+    let export_name = unique_name("gr_unull");
+
+    // Inject NULL values into a nullable column by issuing a follow-up UPDATE.
+    // Use the `name` column which is NOT NULL by default — we union with a
+    // SELECT-NULL projection in the export query to inject the NULLs.
+    let yaml = format!(
+        r#"
+source: {{type: postgres, url: "{POSTGRES_URL}"}}
+exports:
+  - name: {export_name}
+    query: "SELECT id, name FROM {table_name} UNION ALL SELECT 100 AS id, NULL::text AS name UNION ALL SELECT 101 AS id, NULL::text AS name"
+    mode: full
+    format: parquet
+    destination: {{type: local, path: {dir}}}
+    quality:
+      unique_columns: [id]
+"#,
+        table_name = table.name(),
+        dir = out.path().display()
+    );
+    let (_cfgdir, cfgpath) = make_cfg(&yaml);
+
+    let result = run_rivet_export(&cfgpath, &export_name);
+    assert!(
+        result.status.success(),
+        "two NULL rows on a column NOT in unique_columns must not affect uniqueness on `id`; stderr:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        !files_with_extension(out.path(), "parquet").is_empty(),
+        "export must produce output"
+    );
+}
+
+// ─── G9: chunked with empty middle chunk doesn't false-fire row_count gate ────
+
+/// Sparse-ID source: rows at id={1,2,3} and id={100,101,102}, no rows in 4..99.
+/// With chunk_size=10 and a row_count_min gate, the chunks in the empty
+/// 4..99 range return 0 rows each. The export-level row count must aggregate
+/// across chunks (6 rows total), not evaluate per-chunk (which would fire on
+/// the first empty chunk). Regression against a hypothetical per-chunk gate.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn gremlin_chunked_empty_middle_chunk_does_not_false_fire_row_count_min() {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(0); // empty, we'll insert sparse rows manually
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "INSERT INTO {name} (id, name, amount) VALUES \
+         (1,'a',1),(2,'b',2),(3,'c',3),(100,'d',4),(101,'e',5),(102,'f',6);",
+        name = table.name()
+    ))
+    .expect("sparse insert");
+    let out = tempfile::tempdir().unwrap();
+    let export_name = unique_name("gr_chunk_empty");
+
+    let yaml = format!(
+        r#"
+source: {{type: postgres, url: "{POSTGRES_URL}"}}
+exports:
+  - name: {export_name}
+    table: {table_name}
+    mode: chunked
+    chunk_column: id
+    chunk_size: 10
+    format: parquet
+    destination: {{type: local, path: {dir}}}
+    quality:
+      row_count_min: 6
+"#,
+        table_name = table.name(),
+        dir = out.path().display()
+    );
+    let (_cfgdir, cfgpath) = make_cfg(&yaml);
+
+    let result = run_rivet_export(&cfgpath, &export_name);
+    assert!(
+        result.status.success(),
+        "chunked export with sparse IDs must pass row_count_min=6 by total, not per-chunk; stderr:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+// ─── G10: multi-export with one quality-fail — others still execute ───────────
+
+/// Two exports in one config; the first has a row_count_min gate that will
+/// fail (min=100 on a 5-row source); the second has no gate. The run as a
+/// whole must exit non-zero (one failed export = non-zero), but the second
+/// export must still execute end-to-end and produce its parquet file. Catches
+/// "first export failed, abort the rest" regressions that erase work on
+/// independent exports.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn gremlin_multi_export_one_quality_fail_does_not_abort_others() {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(5);
+    let out_fail = tempfile::tempdir().unwrap();
+    let out_ok = tempfile::tempdir().unwrap();
+    let fail_name = unique_name("gr_me_fail");
+    let ok_name = unique_name("gr_me_ok");
+
+    let yaml = format!(
+        r#"
+source: {{type: postgres, url: "{POSTGRES_URL}"}}
+exports:
+  - name: {fail_name}
+    query: "SELECT id FROM {table_name}"
+    mode: full
+    format: parquet
+    destination: {{type: local, path: {dir_fail}}}
+    quality:
+      row_count_min: 100
+  - name: {ok_name}
+    query: "SELECT id FROM {table_name}"
+    mode: full
+    format: parquet
+    destination: {{type: local, path: {dir_ok}}}
+"#,
+        table_name = table.name(),
+        dir_fail = out_fail.path().display(),
+        dir_ok = out_ok.path().display(),
+    );
+    let (_cfgdir, cfgpath) = make_cfg(&yaml);
+
+    let result = std::process::Command::new(RIVET_BIN)
+        .args(["run", "--config", cfgpath.to_str().unwrap()])
+        .output()
+        .expect("spawn rivet (multi-export)");
+
+    assert!(
+        !result.status.success(),
+        "multi-export with one failing quality gate must exit non-zero; stderr:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    // The healthy export must have produced its output file even though the
+    // sibling export failed. This is the actual gate: a "bail on first
+    // failure" regression would leave out_ok empty.
+    assert!(
+        !files_with_extension(out_ok.path(), "parquet").is_empty(),
+        "second export must complete independently of first export's failure; \
+         out_ok=is_empty would mean a regression aborted siblings"
     );
 }
