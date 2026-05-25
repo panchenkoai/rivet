@@ -1,5 +1,127 @@
 # Changelog
 
+## 0.7.6 (2026-05-25) — Operator-Surface Test Matrices
+
+> Focus: close the test-coverage gaps that let the 0.7.5 audit
+> findings live for so long.  Tests in 0.7.6 pin the *operator
+> surface* — exit codes, stderr/stdout text, file layout, log
+> dedup, artifact wire format — not just function return values.
+> Four new matrix harnesses under `dev/` codify what every release
+> must clear.
+
+### Bug fixes — config + preflight + source
+
+- **`fix(source/mysql)`** — MySQL connections panicked from inside
+  the `mysql` crate ("Client had asked for TLS connection but TLS
+  support is disabled") whenever `tls.mode != disable`.  Switch the
+  crate to `default-features = false, features = ["minimal",
+  "native-tls"]` so MySQL + TLS works the same way Postgres + TLS
+  already does (shared OpenSSL stack the workspace already vendors).
+  Net `Cargo.lock` reduction: drops `mysql-common-derive` +
+  `darling` transitive macro deps.
+- **`fix(plan/build)`** — `mode: chunked` with the `table:` shortcut
+  silently auto-resolved `chunk_column` from the primary key with
+  no operator-visible signal (the log was `info!`, below the
+  default `warn` level).  A typo'd `chunk_column` fell back to PK
+  without any indication.  Elevated to `warn!` with "Set
+  `chunk_column:` explicitly to silence."
+- **`fix(config)`** — `query_file: ../../../etc/passwd` passed
+  `rivet check` and `rivet doctor` and was only caught at plan
+  time inside `ExportConfig::resolve_query`.  Syntactic checks
+  (absolute path, `..` traversal) lifted into `Config::validate`
+  so check/doctor reject early at config-load.  `resolve_query`
+  keeps its `canonicalize`-based symlink check for the read-time
+  race.
+- **`fix(preflight/check)`** — `rivet check` previously skipped
+  destination credential preflight: a config with
+  `AWS_ACCESS_KEY_ID` unset returned rc=0 from check and died on
+  run.  Doctor caught it; check did not.  `check` now calls
+  `create_destination` per unique destination so env-var resolution
+  and `credentials_file` existence are validated up-front.  No
+  write-probe side effect — that stays doctor-only.
+
+### Bug fixes — log dedup
+
+- **`fix(config/resolve)`** — the F10 warning ("`--param X was not
+  referenced`") fired once per code path that touched param
+  resolution — twice or more per `--param` for typical exports.
+  Split `warn_unused_params` out of `resolve_vars` and call it
+  exactly once in `Config::load_with_params`.  Adds
+  `find_unused_params` as the testable kernel; 5 new unit tests
+  pin used/unused/partial/mixed/None.
+- **`fix(config/models)`** — "source URL contains plaintext password
+  — consider using url_env or url_file" warning emitted 3–4× per
+  run.  Gated with `Once::call_once` so it fires once per process.
+- **`fix(source/mod)`** — same `Once::call_once` dedup applied to
+  the "TLS is not enforced" warning.
+
+### Bug fixes — state
+
+- **`fix(state/reset)`** — `rivet state reset --export <name>` now
+  bails with an informative hint when `<name>` is not defined in
+  the config (previously a silent no-op that looked like success).
+
+### Regression harnesses (new under `dev/`)
+
+The 0.7.5 audit revealed that unit + live tests pinned code
+behaviour, not the operator-facing surface.  These four matrices
+cover that gap and are wired into CI so a regression of any kind
+— exit code, file layout, stderr text, version skew — blocks merge.
+
+- **`dev/cli_matrix/`** — expanded to **88 scenarios** across
+  doctor / check / run / plan / apply / state / metrics / schema /
+  journal / validate / reconcile / repair / init.  New
+  `check_msg.sh` adds **32 message-substring assertions**
+  (positive / negative / exact-count) on stderr+stdout per
+  scenario, plus state sub-actions, type-report variants, journal
+  flags, frozen-plan apply.
+- **`dev/cfg_matrix/`** [NEW] — **83 YAML fixtures** across 7 axes
+  (source / TLS / export-mode / destination / edge / multi /
+  negative) each probed with `doctor` + `check` + `plan`.  17
+  msg-substring assertions pinning what the four config/preflight
+  fixes above changed.
+- **`dev/path_matrix/`** [NEW] — **7 scenarios** that run `rivet
+  run` and diff produced file layout against frozen, timestamp-
+  normalized baselines.  Catches `_SUCCESS` drops, chunk naming
+  renames, `.rivet_state.db` relocation, stdout-leaks-into-out/.
+  Subsequent commits added per-scenario data-accounting assertions
+  from `summary.json` (rows / files / bytes / status) and EXPLAIN
+  plan-shape pins per representative query.
+- **`dev/cross_version_matrix/`** [NEW] — `doctor` / `check` /
+  `plan` against PG 12/13/14/15/16 + MySQL 5.7/8.0; asserts rc
+  agreement across versions of the same engine.  Designed for CI
+  as a fast smoke gate (lighter than the full live matrix).
+
+### Regression tests
+
+- **`tests/artifact_legacy_compat.rs`** [NEW] + 4 frozen v0.7.5
+  artifacts under `tests/fixtures/artifacts_legacy/`.  Pins the
+  wire format of `plan.json` / `summary.json` so a future serde
+  rename that breaks committed plan artifacts is caught before
+  users hit it on disk.
+- **`tests/gremlin.rs`** — 5 new boundary scenarios (G6–G10):
+  - **G6** `row_count_max` symmetric with `row_count_min` (catches
+    "my predicate is wrong, daily summary returned 50 000 rows").
+  - **G7** Off-by-one boundary: 10 rows ≥ min=10 passes; 10 rows
+    < min=11 fails.  Pins the `>=` vs `>` choice in the
+    comparator.
+  - **G8** NULL on a non-uniqueness column does not false-positive
+    on the indexed column (SQL `NULL != NULL` convention).
+  - **G9** Sparse-ID chunks aggregate at export level, not per
+    chunk.  Pins aggregation semantics against per-chunk gate
+    refactors.
+  - **G10** Multi-export with one failing + one healthy export:
+    the healthy parquet still lands even though the run exits
+    non-zero.
+
+### Notes
+
+The 0.7.5 audit's `F-NEW-E` (reconcile/repair require `--export`
+while run/check/plan do not) was reviewed in this cycle and left
+as the documented contract — these commands need a single chunked
+target by design.  See `dev/cli_matrix/expected_rc.txt` and
+`dev/cfg_matrix/README.md` for the rationale.
+
 ## 0.7.5 (unreleased) — Plan/Apply UX Audit + Regression Harness
 
 > Focus: drive the binary through every subcommand × flag combination
