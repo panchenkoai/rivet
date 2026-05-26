@@ -6,17 +6,21 @@
 //!   transaction-pooler detector, `PgTxnGuard`, sampling helpers
 //!   (`sample_temp_bytes`, `pg_sample_checkpoints_req`, `pg_fetch_work_mem_bytes`),
 //!   `introspect_pg_table_for_chunking`, the cursor + FETCH export loop
-//!   (`pg_run_export`), the `Source` trait impl, and the
-//!   simple-`SELECT ... FROM`-table catalog-hint resolver with its tiny SQL
-//!   parser.
+//!   (`pg_run_export`), the `Source` trait impl, and the catalog-hint
+//!   resolver that bridges parsed FROM clauses to `pg_catalog`.
 //! - [`arrow_convert`] — the entire row → Arrow `RecordBatch` pipeline: type
 //!   mapping (`pg_columns_to_schema`, `rivet_type_for_pg_column`), per-cell
 //!   decoders (INTERVAL, UUID, enum, NUMERIC), and the array builders. Kept
 //!   in a sibling because it is the largest single-purpose cluster in this
 //!   driver (~620 LoC) and has zero reverse dependency back into the
 //!   connection / cursor layer.
+//! - [`from_parse`] — pure `&str`/`&[u8]` parser that extracts the simple
+//!   `<schema>.<table>` literal from a user query so the catalog-hint path
+//!   can cast it to `regclass`.  Zero postgres-crate dependency, fully
+//!   unit-tested in isolation.
 
 mod arrow_convert;
+mod from_parse;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,6 +37,7 @@ use crate::tuning::{ADAPTIVE_SAMPLE_INTERVAL, SourceTuning, next_adaptive_batch_
 use crate::types::{ColumnOverrides, SourceColumn, TypeMapping};
 
 use arrow_convert::{pg_columns_to_schema, rivet_type_for_pg_column, rows_to_record_batch_typed};
+use from_parse::try_parse_pg_simple_from_regclass_literal;
 
 pub struct PostgresSource {
     client: Client,
@@ -722,258 +727,11 @@ fn catalog_numeric_to_decimal_params(precision: i32, scale: i32) -> Option<(u8, 
     Some((precision_u, scale_i))
 }
 
-fn trim_sql_ascii_ws(s: &str) -> &str {
-    s.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r'))
-}
-
-fn sql_keyword_at(haystack: &[u8], idx: usize, kw_lower: &[u8]) -> bool {
-    let n = kw_lower.len();
-    if idx + n > haystack.len() {
-        return false;
-    }
-    if !haystack[idx..idx + n].eq_ignore_ascii_case(kw_lower) {
-        return false;
-    }
-    let before_ok = idx == 0 || !is_sql_ident_byte(haystack[idx - 1]);
-    let after_idx = idx + n;
-    let after_ok = after_idx >= haystack.len() || !is_sql_ident_byte(haystack[after_idx]);
-    before_ok && after_ok
-}
-
-fn is_sql_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
-fn pg_find_outer_from_keyword(sql: &str) -> Option<usize> {
-    let b = sql.as_bytes();
-    let mut i = 0usize;
-    let mut depth = 0usize;
-    let mut in_single_quote = false;
-    while i < b.len() {
-        if in_single_quote {
-            if b[i] == b'\'' {
-                if i + 1 < b.len() && b[i + 1] == b'\'' {
-                    i += 2;
-                } else {
-                    in_single_quote = false;
-                    i += 1;
-                }
-                continue;
-            }
-            i += 1;
-            continue;
-        }
-        if b[i] == b'\'' {
-            in_single_quote = true;
-            i += 1;
-            continue;
-        }
-        if b[i] == b'(' {
-            depth += 1;
-            i += 1;
-            continue;
-        }
-        if b[i] == b')' {
-            depth = depth.saturating_sub(1);
-            i += 1;
-            continue;
-        }
-        if depth == 0 && sql_keyword_at(b, i, b"from") {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
-fn parse_pg_double_quoted_ident(rest: &str) -> Option<(String, &str)> {
-    let mut chars = rest.chars();
-    if chars.next()? != '"' {
-        return None;
-    }
-    let mut out = String::new();
-    while let Some(ch) = chars.next() {
-        if ch == '"' {
-            if chars.as_str().starts_with('"') {
-                chars.next();
-                out.push('"');
-                continue;
-            }
-            return Some((out, chars.as_str()));
-        }
-        out.push(ch);
-    }
-    None
-}
-
-fn parse_pg_ident_piece(rest: &str) -> Option<(String, bool, &str)> {
-    let rest = trim_sql_ascii_ws(rest);
-    if rest.is_empty() {
-        return None;
-    }
-    if rest.starts_with('"') {
-        let (v, tail) = parse_pg_double_quoted_ident(rest)?;
-        return Some((v, true, tail));
-    }
-    let bytes = rest.as_bytes();
-    if !bytes[0].is_ascii_alphabetic() && bytes[0] != b'_' {
-        return None;
-    }
-    let mut i = 1usize;
-    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-        i += 1;
-    }
-    let ident = rest.get(0..i)?.to_string();
-    Some((ident, false, rest.get(i..)?))
-}
-
-fn regclass_segment(ident: &str, quoted: bool) -> String {
-    if quoted {
-        format!("\"{}\"", ident.replace('"', "\"\""))
-    } else {
-        ident.to_string()
-    }
-}
-
-fn parse_pg_qualified_table_for_regclass(mut rest: &str) -> Option<(String, &str)> {
-    rest = trim_sql_ascii_ws(rest);
-    let (p1, q1, tail) = parse_pg_ident_piece(rest)?;
-    let tail = trim_sql_ascii_ws(tail);
-    if tail.starts_with('.') {
-        let after = trim_sql_ascii_ws(tail.get(1..)?);
-        let (p2, q2, tail2) = parse_pg_ident_piece(after)?;
-        return Some((
-            format!(
-                "{}.{}",
-                regclass_segment(&p1, q1),
-                regclass_segment(&p2, q2),
-            ),
-            tail2,
-        ));
-    }
-    Some((regclass_segment(&p1, q1), tail))
-}
-
-fn starts_clause_boundary(rest: &str) -> bool {
-    let r = trim_sql_ascii_ws(rest);
-    if r.is_empty() {
-        return true;
-    }
-    const KWS: &[&[u8]] = &[
-        b"where",
-        b"group",
-        b"having",
-        b"order",
-        b"limit",
-        b"offset",
-        b"fetch",
-        b"union",
-        b"intersect",
-        b"except",
-        b"window",
-        b"for",
-    ];
-    let bytes = r.as_bytes();
-    KWS.iter().any(|kw| sql_keyword_at(bytes, 0, kw))
-}
-
-fn joins_or_comma_after_from(rest: &str) -> bool {
-    let r = trim_sql_ascii_ws(rest);
-    if r.starts_with(',') {
-        return true;
-    }
-    let b = r.as_bytes();
-    sql_keyword_at(b, 0, b"inner")
-        || sql_keyword_at(b, 0, b"left")
-        || sql_keyword_at(b, 0, b"right")
-        || sql_keyword_at(b, 0, b"full")
-        || sql_keyword_at(b, 0, b"cross")
-        || sql_keyword_at(b, 0, b"natural")
-        || sql_keyword_at(b, 0, b"join")
-}
-
-fn skip_optional_table_alias(rest: &str) -> Option<&str> {
-    let rest = trim_sql_ascii_ws(rest);
-    if rest.is_empty() || starts_clause_boundary(rest) || joins_or_comma_after_from(rest) {
-        return Some(rest);
-    }
-    let mut rest = rest;
-    if sql_keyword_at(rest.as_bytes(), 0, b"as") {
-        rest = rest.get(2..)?;
-        rest = trim_sql_ascii_ws(rest);
-    }
-    let (_, _, tail) = parse_pg_ident_piece(rest)?;
-    let tail = trim_sql_ascii_ws(tail);
-    if joins_or_comma_after_from(tail) {
-        return None;
-    }
-    Some(tail)
-}
-
-fn try_parse_pg_simple_from_regclass_literal(query: &str) -> Option<String> {
-    let from_idx = pg_find_outer_from_keyword(query)?;
-    let mut tail = query.get(from_idx + 4..)?;
-    tail = trim_sql_ascii_ws(tail);
-    if sql_keyword_at(tail.as_bytes(), 0, b"only") {
-        tail = tail.get(4..)?;
-        tail = trim_sql_ascii_ws(tail);
-    }
-    let (regclass_lit, after_rel) = parse_pg_qualified_table_for_regclass(tail)?;
-    let after_rel = trim_sql_ascii_ws(after_rel);
-    let after_rel = skip_optional_table_alias(after_rel)?;
-    let after_rel = trim_sql_ascii_ws(after_rel);
-    if joins_or_comma_after_from(after_rel) {
-        return None;
-    }
-    Some(regclass_lit)
-}
-
 #[cfg(test)]
-mod pg_from_parse_tests {
-    use super::{catalog_numeric_to_decimal_params, try_parse_pg_simple_from_regclass_literal};
+mod tests {
+    use super::catalog_numeric_to_decimal_params;
 
-    #[test]
-    fn parse_simple_from_unqualified_table_alias_where() {
-        let q = "SELECT id, amount\nFROM transactions t\nWHERE x = 1";
-        assert_eq!(
-            try_parse_pg_simple_from_regclass_literal(q).as_deref(),
-            Some("transactions")
-        );
-    }
-
-    #[test]
-    fn parse_simple_from_qualified() {
-        let q = "SELECT id FROM public.orders WHERE 1=1";
-        assert_eq!(
-            try_parse_pg_simple_from_regclass_literal(q).as_deref(),
-            Some("public.orders")
-        );
-    }
-
-    #[test]
-    fn parse_only_prefix() {
-        let q = "SELECT * FROM ONLY inventory.items";
-        assert_eq!(
-            try_parse_pg_simple_from_regclass_literal(q).as_deref(),
-            Some("inventory.items")
-        );
-    }
-
-    #[test]
-    fn join_rejected() {
-        assert!(
-            try_parse_pg_simple_from_regclass_literal("SELECT * FROM a INNER JOIN b USING (id)")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn subquery_from_rejected() {
-        assert!(
-            try_parse_pg_simple_from_regclass_literal("SELECT * FROM (SELECT * FROM foo) s")
-                .is_none()
-        );
-    }
+    // FROM-clause parser tests live in `from_parse.rs` alongside the parser.
 
     #[test]
     fn catalog_decimal_bounds() {
