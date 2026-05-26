@@ -60,7 +60,12 @@ while IFS= read -r raw || [[ -n "$raw" ]]; do
   id=$(printf '%s' "$line" | awk '{print $1}')
   col2=$(printf '%s' "$line" | awk '{print $2}')
   op=$(printf '%s' "$line" | awk '{print $3}')
-  substr=$(printf '%s' "$line" | awk '{for (i=4; i<=NF; i++) printf "%s%s", $i, (i==NF?"":" ")}')
+  # The substring runs to end-of-line and may legitimately contain multiple
+  # consecutive spaces (e.g. column-aligned validator output like
+  # `status:    PASSED`). awk's field reassembly collapses runs of whitespace
+  # to a single space, so use sed to strip exactly the first three
+  # whitespace-delimited tokens and keep the rest of the line byte-verbatim.
+  substr=$(printf '%s' "$line" | sed -E 's/^[[:space:]]*[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+//')
 
   if [[ -z "$id" || -z "$col2" || -z "$op" || -z "$substr" ]]; then
     echo "MALFORMED  $raw" >&2

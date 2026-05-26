@@ -100,3 +100,29 @@ pg_check_target_bq stdout + Target type
 pg_check_target_bq stdout + INT64
 pg_check_target_bq stdout + STRING
 pg_check_target_bq stdout + ok
+
+# ── 0.7.7 audit: `rivet validate` output shape (PG + MySQL) ───────────────
+# Previously `pg_validate` / `my_validate` had rc=0 with NO content checks.
+# A regression that dropped one of the structural lines (`_SUCCESS:`,
+# `manifest:`, `parts:`) or flipped the verifier so it reported `PASSED`
+# on a corrupt prefix would stay at rc=0 and never surface — operators
+# would only catch the silent break by inspecting their data downstream.
+pg_validate stdout + pa_audit
+pg_validate stdout + prefix:
+pg_validate stdout + status:    PASSED
+pg_validate stdout + parts:
+pg_validate stdout + verified
+pg_validate stdout + _SUCCESS:  consistent
+pg_validate stdout + manifest:  self-consistent
+my_validate stdout + pa_audit
+my_validate stdout + prefix:
+my_validate stdout + status:    PASSED
+my_validate stdout + parts:
+my_validate stdout + _SUCCESS:  consistent
+my_validate stdout + manifest:  self-consistent
+
+# `rivet run --validate` chains the validator after the export. The summary
+# block lands on stderr (env_logger sink); use looser substrings since the
+# column-alignment width differs from `rivet validate`'s output.
+pg_run_validate stderr + run_id:
+pg_run_validate stderr + success
