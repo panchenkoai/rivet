@@ -1,5 +1,8 @@
 # CLI behavior matrix — regression guard
 
+Part of the matrix family under [`dev/matrices/`](../matrices/README.md).
+Run the full PR tier with `dev/matrices/run.sh --tier=pr`.
+
 Reproduces the 0.7.5 audit: drives the rivet binary through every
 subcommand with realistic flag combinations against PostgreSQL and
 MySQL fixtures, captures `stdout` / `stderr` / `exit code` per

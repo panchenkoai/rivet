@@ -56,7 +56,8 @@ check_agreement() {
     echo "  $family: only ${#versions[@]} version reachable, nothing to compare"
     return 0
   fi
-  for probe in doctor check plan_full doctor_chunked check_chunked plan_full_chunked; do
+  for probe in doctor check plan_full run \
+               doctor_chunked check_chunked plan_full_chunked run_chunked; do
     local pairs
     pairs="$(collect_rcs "$probe" "${versions[@]}")"
     if [[ -z "$pairs" ]]; then
@@ -76,6 +77,39 @@ check_agreement() {
       fail=$((fail+1))
     fi
   done
+
+  # Row-count agreement: every version that ran `rivet run` must have
+  # produced the SAME total_rows from the SAME source query (pa_audit, 30
+  # rows on every seeded fixture). A divergence here means one version
+  # is silently losing rows on a path the rc-only check doesn't see.
+  for kind in "" "_chunked"; do
+    local rowpairs=""
+    for v in "${versions[@]}"; do
+      local f="$LOGS/$v/run${kind}/total_rows"
+      if [[ -f "$f" ]]; then
+        local n
+        n="$(cat "$f")"
+        [[ -n $n ]] && rowpairs+="${v}=${n}"$'\n'
+      fi
+    done
+    if [[ -n $rowpairs ]]; then
+      local uniq_rows
+      uniq_rows="$(printf '%s' "$rowpairs" | awk -F= '{print $2}' | sort -u | tr '\n' ' ')"
+      local distinct_rows
+      distinct_rows="$(printf '%s\n' "$uniq_rows" | tr -s ' ' '\n' | grep -c .)"
+      local probe_label="run${kind}.total_rows"
+      if [[ "$distinct_rows" == "1" ]]; then
+        printf '  %-10s %-22s OK (rows=%s)\n' "$family" "$probe_label" "${uniq_rows% }"
+      else
+        printf '  %-10s %-22s DIVERGED row counts: { %s} -- per version:\n' "$family" "$probe_label" "$uniq_rows"
+        printf '%s' "$rowpairs" | while IFS='=' read -r v rows; do
+          printf '      %-10s rows=%s\n' "$v" "$rows"
+        done
+        fail=$((fail+1))
+      fi
+    fi
+  done
+
   return $fail
 }
 

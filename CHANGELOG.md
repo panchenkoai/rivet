@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.7.7 (unreleased) — Audit-Gap Closure
+
+> Closes the five remaining audit gaps from the 0.7.6 sweep.
+
+### Fixes
+
+- **`fix(state/reset)`** — `state reset --export <X>` validates the export
+  against the loaded config before touching state. A typo (`--export
+  pa_audi` for declared `pa_audit`) now bails with a hint listing the
+  declared names and a follow-up `rivet state show` command instead of
+  silently DELETE-ing zero rows and printing "State reset for export ..."
+  as if it worked.
+
+### Test infrastructure
+
+- **`test(path_matrix)`** — pin data-accounting fields (`total_rows`,
+  `files_produced`, `status`, `format`, `compression`, `export_name`)
+  from every `summary.json` produced by `rivet run`. Catches the class
+  of regression where layout matches but row count is wrong.
+- **`test(query_matrix)`** — NEW. Fourth matrix. Pins PG `EXPLAIN
+  (COSTS OFF)` plan shape per representative query. Catches operator
+  query wrapped in subquery / CTE, planner dropping the PK index, sort
+  steps appearing without intent.
+- **`test(gremlin)`** — added 5 new scenarios (G6–G10): `row_count_max`
+  upper bound, `row_count_min` boundary inclusivity, NULL handling in
+  `unique_columns`, chunked + sparse-ID quality, multi-export
+  one-fails-others-continue.
+- **`test(soak_matrix)`** — NEW. Fifth matrix. Pins order-of-magnitude
+  perf and memory thresholds on a 10k-row PG table per export mode
+  (full / chunked / incremental). Catches "50x slower" / "10x memory"
+  regressions; tunable thresholds, deliberately generous to avoid
+  CI runner noise.
+- **`test(dev/matrices)`** — orchestrator + taxonomy (Surface /
+  Execution / Resources / Compatibility layers) + shared `_common/lib/`
+  for helpers used by ≥2 matrices. `run.sh --tier=pr|nightly|release`
+  binds each matrix to a CI tier.
+
 ## 0.7.6 (2026-05-25) — Operator-Surface Test Matrices
 
 > Focus: close the test-coverage gaps that let the 0.7.5 audit

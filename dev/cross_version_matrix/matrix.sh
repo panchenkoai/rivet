@@ -89,7 +89,10 @@ probe_version() {
     local cfg="$LOGS/_probe${kind}.yaml"
     local k="${kind:-flat}"
 
-    # Each probe: doctor + check + plan. Capture rc + stderr.
+    # Each probe: doctor + check + plan + run + apply. Capture rc + stderr +
+    # (for `run`) extracted total_rows from summary.json so cross-version
+    # comparator can assert every version produced the SAME row count from
+    # the SAME source query — pa_audit has 30 rows on every seeded version.
     for cmd in doctor check plan_full; do
       local dir="$vlog/${cmd}${kind}"
       mkdir -p "$dir"
@@ -101,6 +104,34 @@ probe_version() {
       local rc=$?
       printf '%s\n' "$rc" > "$dir/exit_code"
     done
+
+    # `rivet run` — full export end to end. Isolate each (version, mode) in
+    # its own workdir so .rivet/runs/ + the output dir don't bleed between
+    # iterations. Pull total_rows out of summary.json for the comparator.
+    local rundir="$vlog/run${kind}"
+    mkdir -p "$rundir/work"
+    cp "$cfg" "$rundir/work/rivet.yaml"
+    (cd "$rundir/work" && "$R" run -c rivet.yaml) > "$rundir/stdout" 2> "$rundir/stderr"
+    local run_rc=$?
+    printf '%s\n' "$run_rc" > "$rundir/exit_code"
+    if [[ $run_rc -eq 0 ]]; then
+      local summary
+      summary="$(find "$rundir/work/.rivet/runs" -name 'summary.json' 2>/dev/null | head -1)"
+      if [[ -n $summary ]] && command -v jq >/dev/null 2>&1; then
+        jq -r '.total_rows' "$summary" > "$rundir/total_rows" 2>/dev/null || echo '' > "$rundir/total_rows"
+      fi
+    fi
+
+    # NOTE on apply: `rivet apply` needs the original config_path stored
+    # inside the plan artifact to resolve the password / state DB
+    # location (ADR-0005 + F13 fix). Replaying that in a fresh workdir
+    # per (version, mode) is fiddly and the gymnastics drown the
+    # signal. Apply correctness is already pinned at the artifact /
+    # wire-format level by `tests/artifact_legacy_compat.rs` (frozen
+    # v0.7.5 fixture deserializes under the current schema) and at the
+    # CLI level by `dev/cli_matrix/pg_apply_*` against the primary PG
+    # pair. The cross-version dimension here is row-count correctness
+    # of `rivet run`, which IS pinned below via run.total_rows.
   done
 
   printf '%-12s done\n' "$ver"

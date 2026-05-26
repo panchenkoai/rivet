@@ -1,0 +1,8 @@
+source: { type: postgres, url_env: PG_URL }
+exports:
+  - name: pa_soak
+    query: "SELECT id, name, payload, updated_at FROM pa_soak"
+    mode: incremental
+    cursor_column: updated_at
+    format: parquet
+    destination: { type: local, path: ./out/s03 }

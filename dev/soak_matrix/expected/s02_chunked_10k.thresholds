@@ -1,0 +1,10 @@
+# Soak thresholds for s02 (chunked-mode, 10k rows, chunk_size=1000 → 10 files).
+#
+# Healthy baseline on a quiet dev machine: dur ~ 820ms, rss ~ 15MB.
+# Chunked is intentionally slower than full at this row count because of
+# the per-chunk RANGE query overhead + extra file-close calls (10 files vs 1).
+# A 5x regression beyond 4s would suggest a real degradation worth flagging.
+
+total_rows_min=10000
+duration_ms_max=4000
+peak_rss_mb_max=100

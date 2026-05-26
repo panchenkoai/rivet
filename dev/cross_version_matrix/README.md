@@ -1,5 +1,7 @@
 # Cross-version PG/MySQL smoke matrix
 
+Part of the matrix family under [`dev/matrices/`](../matrices/README.md).
+
 Light-weight regression guard that asserts every supported PG version
 (12-16) and MySQL version (5.7, 8.0) agrees on the exit code of a small
 core probe set: `doctor`, `check`, `plan` against a full-mode and a

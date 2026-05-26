@@ -150,6 +150,21 @@ Both command lines are what the corresponding CI jobs execute.  If your
 `cargo test` diverges from the CI matrix, something is out of sync —
 check `.github/workflows/ci.yml` for the exact invocation.
 
+## Shell regression matrices
+
+Binary-level regression guards under [`dev/matrices/`](../dev/matrices/README.md)
+complement the Rust integration tests above. They drive the release `rivet`
+binary through fixture scenarios and diff stdout/stderr/exit codes, file
+layouts, EXPLAIN plans, and perf thresholds against committed baselines.
+
+```bash
+bash dev/matrices/setup_links.sh   # one-time
+dev/matrices/run.sh --tier=pr      # cli + cfg + path (PR CI)
+```
+
+See [`dev/matrices/README.md`](../dev/matrices/README.md) for the full taxonomy
+and tier map.
+
 ## QA / roadmap alignment
 
 Task IDs in tables above are historical QA labels. **Trust & reproducibility**

@@ -42,6 +42,25 @@ jobs:
       - name: Compatibility matrix tests
         run: cargo test --lib -- plan::validate::tests
 
+  publish-crate:
+    name: Publish to crates.io
+    needs: semantic-gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', github.event.inputs.tag) || github.ref }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: publish-crate
+      - name: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
+
   build:
     name: Build ${{ matrix.target }}
     needs: semantic-gates

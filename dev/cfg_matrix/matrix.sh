@@ -56,7 +56,6 @@ run_probe() {
 }
 
 count=0
-declare -A summary
 
 for yaml in $(find "$ROOT/cfg" -name '*.yaml' | sort); do
   sid=$(basename "$yaml" .yaml)

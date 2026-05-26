@@ -1,5 +1,7 @@
 # Query-shape matrix
 
+Part of the matrix family under [`dev/matrices/`](../matrices/README.md).
+
 Fourth matrix in the family. Where cli_matrix / cfg_matrix / path_matrix
 pin **what the CLI does**, this one pins **what the DB planner does**
 with the query that came out of `rivet plan`.

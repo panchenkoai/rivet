@@ -1,0 +1,7 @@
+source: { type: postgres, url_env: PG_URL }
+exports:
+  - name: pa_soak
+    query: "SELECT id, name, payload FROM pa_soak"
+    mode: full
+    format: parquet
+    destination: { type: local, path: ./out/s01 }

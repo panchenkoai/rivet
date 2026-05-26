@@ -113,6 +113,31 @@ Each legacy target runs the full 83-assertion e2e suite when selected. Status ta
 
 ---
 
+## Shell regression matrices (`dev/matrices/`)
+
+Five harnesses that drive the **release binary** against docker fixtures and
+diff captured artifacts against committed baselines. Each one is bound to a
+specific CI tier; the orchestrator at `dev/matrices/run.sh --tier=<tier>`
+runs the right set per gate.
+
+| Matrix | Layer | What it pins | Tier | Trigger |
+|---|---|---|---|---|
+| [`cli`](../dev/cli_matrix/) | Surface | CLI exit codes (88) + 36 stderr/stdout substring assertions per scenario | **PR (mandatory)** | every push |
+| [`cfg`](../dev/cfg_matrix/) | Surface | 83 YAML × 3 probes (doctor/check/plan) + 17 message substrings | **PR (mandatory)** | every push |
+| [`path`](../dev/path_matrix/) | Execution | 7 scenarios × on-disk layout snapshot + `summary.json` row/file accounting | **PR (mandatory)** | every push |
+| [`query`](../dev/query_matrix/) | Execution | 5 representative queries × PG `EXPLAIN (COSTS OFF)` plan shape | **Nightly** | 03:30 UTC cron |
+| [`soak`](../dev/soak_matrix/) | Resources | 3 modes × 10k-row PG × per-scenario `duration_ms`/`peak_rss_mb` thresholds | **Nightly** | 03:30 UTC cron |
+| [`cross_version`](../dev/cross_version_matrix/) | Compatibility | doctor/check/plan rc agreement across PG 12–16 + MySQL 5.7/8.0 | **Release** | before tag |
+| [`legacy`](../dev/legacy/) | Compatibility | Full e2e (83 assertions) per DB version | **Manual** | operator-invoked |
+
+Branch-protection guarantees: the **PR** row must stay green to merge — the
+job is named `cli-matrix` in [.github/workflows/ci.yml](../.github/workflows/ci.yml).
+**Nightly** matrices run from [.github/workflows/nightly-live.yml](../.github/workflows/nightly-live.yml);
+a red nightly emails the on-call. **Release** matrices run as part of the
+release checklist; the artifact is the matrix log in
+[docs/release-checklist.md § Cross-version smoke](release-checklist.md).
+**Manual** matrices are operator-invoked from `dev/`.
+
 ## Operational tooling
 
 | Area | PR CI | Nightly | Manual | Suite |

@@ -1,15 +1,23 @@
 pub mod cursor;
+mod destination;
+mod export;
+mod format;
 mod lints;
-mod models;
+mod notifications;
 pub mod resolve;
 pub mod schema;
+mod source;
 
 pub use cursor::IncrementalCursorMode;
-pub use models::*;
+pub use destination::*;
+pub use export::*;
+pub use format::*;
+pub use notifications::*;
 #[allow(unused_imports)]
 pub(crate) use resolve::resolve_env_vars;
 pub use resolve::{parse_file_size, resolve_vars};
 pub use schema::generate_config_schema_pretty;
+pub use source::*;
 
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -513,5 +521,4 @@ impl Config {
 }
 
 #[cfg(test)]
-#[path = "tests.rs"]
 mod tests;

@@ -55,6 +55,7 @@ Rust API docs (`///` on public items) should also be English when added.
 
 - Run `cargo test` before submitting changes.
 - For database-dependent behavior, use the Docker Compose services and scripts under `dev/`.
+- Regression matrix harnesses live under [`dev/matrices/`](dev/matrices/README.md) — run `dev/matrices/run.sh --tier=pr` before release.
 - New code should include unit tests. Integration tests go in `tests/`.
 - Golden tests (exact output comparisons) are preferred for format/serialization code.
 

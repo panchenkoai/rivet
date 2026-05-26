@@ -1,0 +1,9 @@
+source: { type: postgres, url_env: PG_URL }
+exports:
+  - name: pa_soak
+    table: pa_soak
+    mode: chunked
+    chunk_column: id
+    chunk_size: 1000
+    format: parquet
+    destination: { type: local, path: ./out/s02 }

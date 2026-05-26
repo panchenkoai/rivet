@@ -70,3 +70,59 @@ pg_state_reset_unknown stderr + not found in config
 pg_state_reset_unknown stderr + Known exports:
 pg_state_reset_unknown stderr + Hint: check the spelling
 pg_state_reset_unknown stderr + rivet state show
+
+# ── 0.7.7 audit: --type-report output shape ───────────────────────────────
+# Type-report scenarios previously had rc=0 with NO content checks — a
+# regression that dropped the type report entirely / silently renamed a
+# fidelity tier ("exact" → "exact_match") / lost the Arrow mapping would
+# stay at rc=0 unnoticed. These pin the structural skeleton.
+pg_check_type_report stdout + Export: pa_audit
+pg_check_type_report stdout + Source type
+pg_check_type_report stdout + Rivet type
+pg_check_type_report stdout + Arrow type
+pg_check_type_report stdout + Fidelity
+pg_check_type_report stdout + int4
+pg_check_type_report stdout + Int32
+pg_check_type_report stdout + text
+pg_check_type_report stdout + Utf8
+pg_check_type_report stdout + exact
+
+# JSON variant: same payload, machine-readable.
+pg_check_type_report_json stdout + "export":"pa_audit"
+pg_check_type_report_json stdout + "source_type":"int4"
+pg_check_type_report_json stdout + "arrow_type":"Int32"
+pg_check_type_report_json stdout + "fidelity":"exact"
+pg_check_type_report_json stdout + "violations":[]
+
+# --target bigquery: extra Target type column appears with INT64/STRING.
+pg_check_target_bq stdout + [target: bigquery]
+pg_check_target_bq stdout + Target type
+pg_check_target_bq stdout + INT64
+pg_check_target_bq stdout + STRING
+pg_check_target_bq stdout + ok
+
+# ── 0.7.7 audit: `rivet validate` output shape (PG + MySQL) ───────────────
+# Previously `pg_validate` / `my_validate` had rc=0 with NO content checks.
+# A regression that dropped one of the structural lines (`_SUCCESS:`,
+# `manifest:`, `parts:`) or flipped the verifier so it reported `PASSED`
+# on a corrupt prefix would stay at rc=0 and never surface — operators
+# would only catch the silent break by inspecting their data downstream.
+pg_validate stdout + pa_audit
+pg_validate stdout + prefix:
+pg_validate stdout + status:    PASSED
+pg_validate stdout + parts:
+pg_validate stdout + verified
+pg_validate stdout + _SUCCESS:  consistent
+pg_validate stdout + manifest:  self-consistent
+my_validate stdout + pa_audit
+my_validate stdout + prefix:
+my_validate stdout + status:    PASSED
+my_validate stdout + parts:
+my_validate stdout + _SUCCESS:  consistent
+my_validate stdout + manifest:  self-consistent
+
+# `rivet run --validate` chains the validator after the export. The summary
+# block lands on stderr (env_logger sink); use looser substrings since the
+# column-alignment width differs from `rivet validate`'s output.
+pg_run_validate stderr + run_id:
+pg_run_validate stderr + success

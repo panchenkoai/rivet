@@ -1,5 +1,7 @@
 # Path-topology + data-accounting matrix
 
+Part of the matrix family under [`dev/matrices/`](../matrices/README.md).
+
 Third matrix in the family (after `dev/cli_matrix/` and `dev/cfg_matrix/`).
 Where the other two pin **exit codes** and **error messages**, this one
 pins two complementary contracts after a successful `rivet run`:
