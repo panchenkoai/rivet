@@ -1,10 +1,13 @@
 use std::io::Write;
 
+use arrow::array::Time64MicrosecondArray;
+use arrow::array::types::Decimal128Type;
 use arrow::array::*;
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
 use crate::error::Result;
+use crate::types::decimal::scaled_i128_to_decimal_str;
 
 pub struct CsvFormat;
 
@@ -98,6 +101,18 @@ fn write_csv_value(writer: &mut dyn Write, array: &dyn Array, idx: usize) -> Res
                 .expect("DataType/Array mismatch");
             write!(writer, "{}", arr.value(idx))?;
         }
+        DataType::UInt64 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("DataType/Array mismatch");
+            write!(writer, "{}", arr.value(idx))?;
+        }
+        DataType::Decimal128(_, scale) => {
+            let arr = array.as_primitive::<Decimal128Type>();
+            let text = scaled_i128_to_decimal_str(arr.value(idx), *scale);
+            writer.write_all(text.as_bytes())?;
+        }
         DataType::Float32 => {
             let arr = array
                 .as_any()
@@ -142,6 +157,23 @@ fn write_csv_value(writer: &mut dyn Write, array: &dyn Array, idx: usize) -> Res
                 write!(writer, "{:02x}", byte)?;
             }
         }
+        // FixedSizeBinary today only carries 16-byte UUIDs (see
+        // `RivetType::Uuid` → `DataType::FixedSizeBinary(16)` in
+        // `src/types/mapping.rs`). CSV has no native binary cell; emit the
+        // canonical hyphenated lowercase form so downstream readers can
+        // recognise it as a UUID rather than 16 bytes of mojibake. Any
+        // future FixedSizeBinary use that is not a UUID should branch on
+        // the size argument before reaching this arm.
+        DataType::FixedSizeBinary(16) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .expect("DataType/Array mismatch");
+            let val = arr.value(idx);
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(val);
+            write!(writer, "{}", uuid::Uuid::from_bytes(bytes).to_hyphenated())?;
+        }
         DataType::Date32 => {
             let arr = array
                 .as_any()
@@ -159,6 +191,23 @@ fn write_csv_value(writer: &mut dyn Write, array: &dyn Array, idx: usize) -> Res
             if let Some(date) = date {
                 write!(writer, "{}", date)?;
             }
+        }
+        DataType::Time64(TimeUnit::Microsecond) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Time64MicrosecondArray>()
+                .expect("DataType/Array mismatch");
+            let micros = arr.value(idx);
+            let secs = micros / 1_000_000;
+            let frac_us = micros % 1_000_000;
+            write!(
+                writer,
+                "{:02}:{:02}:{:02}.{:06}",
+                secs / 3600,
+                (secs % 3600) / 60,
+                secs % 60,
+                frac_us
+            )?;
         }
         DataType::Timestamp(TimeUnit::Microsecond, _) => {
             let arr = array
@@ -231,6 +280,20 @@ mod tests {
     #[test]
     fn int32_negative() {
         assert_eq!(cell(Int32Array::from(vec![-7i32]), 0), "-7");
+    }
+
+    #[test]
+    fn decimal128_writes_exact_text() {
+        let arr = Decimal128Array::from(vec![10i128])
+            .with_precision_and_scale(18, 2)
+            .unwrap();
+        assert_eq!(cell(arr, 0), "0.10");
+        let scaled =
+            crate::types::decimal::decimal_str_to_scaled_i128("999999999999.99", 2).unwrap();
+        let arr = Decimal128Array::from(vec![scaled])
+            .with_precision_and_scale(18, 2)
+            .unwrap();
+        assert_eq!(cell(arr, 0), "999999999999.99");
     }
 
     #[test]

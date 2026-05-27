@@ -92,6 +92,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --lib -- plan::validate::tests
 
+  test-types:
+    name: Type mapping contracts (semantic gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --test type_roundtrip contract_
+
   test-stability:
     name: Stability tests — Phase 1 (semantic gate)
     runs-on: ubuntu-latest

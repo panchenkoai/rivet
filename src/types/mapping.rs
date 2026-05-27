@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 
 use arrow::datatypes::{DataType, Field, TimeUnit as ArrowTimeUnit};
+use arrow_schema::extension::{Json as ArrowJson, Uuid as ArrowUuid};
 use serde::Serialize;
 use std::sync::Arc;
 
@@ -137,14 +138,20 @@ pub fn rivet_type_to_arrow(t: &RivetType) -> Option<DataType> {
             arrow_unit(*unit),
             timezone.as_deref().map(Into::into),
         )),
+        // UUID: 16-byte canonical binary representation. Paired with the
+        // `arrow.uuid` extension type metadata in `build_arrow_field`, this
+        // lets parquet-rs emit native `LogicalType::Uuid` instead of
+        // `String`. Downstream Parquet readers (DuckDB / ClickHouse /
+        // pyarrow / BigQuery autodetect) recognise UUID natively without
+        // an extra cast.
+        RivetType::Uuid => Some(DataType::FixedSizeBinary(16)),
+
         // Logical-string types: physical Arrow is Utf8; the metadata
         // attached by `build_arrow_field` records that the source meant
-        // something more specific (json/uuid/enum).
-        RivetType::String
-        | RivetType::Text
-        | RivetType::Json
-        | RivetType::Uuid
-        | RivetType::Enum => Some(DataType::Utf8),
+        // something more specific (json/enum).
+        RivetType::String | RivetType::Text | RivetType::Json | RivetType::Enum => {
+            Some(DataType::Utf8)
+        }
 
         RivetType::Binary => Some(DataType::Binary),
 
@@ -206,9 +213,12 @@ pub fn derive_fidelity(t: &RivetType) -> TypeFidelity {
         | RivetType::Text
         | RivetType::Binary => TypeFidelity::Exact,
 
-        // UUID round-trips losslessly as text but the physical type is not
-        // the canonical FixedSizeBinary(16) — call it `compatible`.
-        RivetType::Uuid => TypeFidelity::Compatible,
+        // UUID now exports as canonical `FixedSizeBinary(16)` + the
+        // `arrow.uuid` extension type (parquet-rs emits native
+        // `LogicalType::Uuid`). Both value and physical type match the
+        // canonical Parquet representation — `Exact`. Bumped from
+        // `Compatible` when we still wrote the hyphenated text.
+        RivetType::Uuid => TypeFidelity::Exact,
 
         // JSON is preserved byte-for-byte but its native semantics
         // (object/array tree) are not — call it `logical_string`.
@@ -244,7 +254,33 @@ pub fn build_arrow_field(mapping: &TypeMapping) -> Option<Field> {
     if let Some(logical) = logical_type_label(&mapping.rivet_type) {
         metadata.insert(META_LOGICAL_TYPE.into(), logical.into());
     }
-    Some(Field::new(&mapping.column_name, dt, mapping.nullable).with_metadata(metadata))
+    let mut field = Field::new(&mapping.column_name, dt, mapping.nullable).with_metadata(metadata);
+
+    // Attach the Arrow canonical extension type so that parquet-rs emits the
+    // matching native Parquet `LogicalType` (Uuid / Json) instead of falling
+    // back to `String`. The Rivet-side metadata (`rivet.logical_type=...`)
+    // stays for Rivet-aware consumers; the extension type metadata is what
+    // downstream generic engines (DuckDB, ClickHouse, pyarrow, BigQuery
+    // autodetect) actually read.
+    //
+    // arrow-rs encodes the extension type as the `ARROW:extension:name`
+    // metadata key on the Field; `try_with_extension_type` does the right
+    // thing including any per-extension metadata (Json carries an empty
+    // metadata object today).
+    match mapping.rivet_type {
+        RivetType::Json => {
+            field
+                .try_with_extension_type(ArrowJson::default())
+                .expect("Json extension only valid on Utf8/LargeUtf8 — invariant in mapping");
+        }
+        RivetType::Uuid => {
+            field
+                .try_with_extension_type(ArrowUuid)
+                .expect("Uuid extension only valid on FixedSizeBinary(16) — invariant in mapping");
+        }
+        _ => {}
+    }
+    Some(field)
 }
 
 /// Return the `rivet.logical_type` value for types whose physical Arrow
@@ -389,9 +425,15 @@ mod tests {
     }
 
     #[test]
-    fn uuid_is_compatible_with_logical_metadata() {
+    fn uuid_is_exact_fixed_size_binary_with_logical_metadata() {
+        // UUID exports as canonical FixedSizeBinary(16) + the `arrow.uuid`
+        // extension; this combo lets parquet-rs emit native
+        // `LogicalType::Uuid` (downstream engines autoload as UUID type).
+        // Fidelity bumped from `compatible` to `exact` to reflect the
+        // canonical Parquet representation.
         let mapping = TypeMapping::from_source(&col("id", "uuid"), RivetType::Uuid);
-        assert_eq!(mapping.fidelity, TypeFidelity::Compatible);
+        assert_eq!(mapping.fidelity, TypeFidelity::Exact);
+        assert_eq!(mapping.arrow_type, Some(DataType::FixedSizeBinary(16)));
 
         let field = build_arrow_field(&mapping).expect("field");
         assert_eq!(
@@ -400,7 +442,15 @@ mod tests {
         );
         assert_eq!(
             field.metadata().get(META_FIDELITY).map(String::as_str),
-            Some("compatible")
+            Some("exact")
+        );
+        // The Arrow extension key drives the Parquet native logical type.
+        assert_eq!(
+            field
+                .metadata()
+                .get("ARROW:extension:name")
+                .map(String::as_str),
+            Some("arrow.uuid")
         );
     }
 

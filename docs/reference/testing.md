@@ -71,6 +71,7 @@ cargo test -- --ignored
 | File | Domain | QA backlog task |
 |------|--------|-----------------|
 | `live_harness_canary.rs` | Reachability probe for every service (Postgres primary + via Toxiproxy, MySQL primary + via Toxiproxy, MinIO, fake-gcs, Toxiproxy admin); harness sanity (`PgTable`/`MysqlTable` RAII guards, `unique_name` no-collision, `CARGO_BIN_EXE_rivet` visibility) | Phase A |
+| [`type_roundtrip`](../tests/type_roundtrip/) (`make test-types` / `make test-types-live`) | v0.7.8 type matrix: offline YAML contracts + live PG/MySQL × Parquet/CSV | [`docs/type-mapping.md`](../type-mapping.md) |
 | [`live_type_golden.rs`](#trust-milestone-type-golden-round-trip) | Trust & reproducibility: **paired** Postgres *and* MySQL golden pipelines | Trust milestone §1 (“Golden E2E for type safety”); complements `live_parquet_roundtrip.rs` |
 | `live_parquet_roundtrip.rs` | Postgres → rivet → Parquet → reader; schema/row-count/nullability/unicode/empty-dataset contracts; `--validate` flag | Task 2.2 |
 | `live_cross_db_parity.rs` | Same dataset via Postgres vs MySQL under full and chunked modes; row-count and id-set equivalence | Task 3.3 |

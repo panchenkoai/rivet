@@ -21,12 +21,14 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Decimal256Builder,
-    Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, StringBuilder,
-    Time64MicrosecondBuilder, TimestampMicrosecondBuilder,
+    FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder,
+    Int64Builder, StringBuilder, Time64MicrosecondBuilder, TimestampMicrosecondBuilder,
+    UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use mysql::Value;
+use mysql::consts::ColumnFlags;
 
 use crate::error::Result;
 use crate::types::{
@@ -36,30 +38,67 @@ use crate::types::{
 
 // ─── Native type names + Rivet type mapping ──────────────────────────────────
 
-pub(super) fn mysql_native_type_name(col: &mysql::Column) -> &'static str {
+pub(super) fn mysql_native_type_name(col: &mysql::Column) -> String {
     use mysql::consts::ColumnType::*;
-    match col.column_type() {
-        MYSQL_TYPE_TINY => "tinyint",
-        MYSQL_TYPE_SHORT => "smallint",
-        MYSQL_TYPE_INT24 | MYSQL_TYPE_LONG => "int",
-        MYSQL_TYPE_LONGLONG => "bigint",
-        MYSQL_TYPE_FLOAT => "float",
-        MYSQL_TYPE_DOUBLE => "double",
-        MYSQL_TYPE_DECIMAL | MYSQL_TYPE_NEWDECIMAL => "decimal",
-        MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING => "varchar",
-        MYSQL_TYPE_ENUM => "enum",
-        MYSQL_TYPE_SET => "set",
-        MYSQL_TYPE_JSON => "json",
-        MYSQL_TYPE_TINY_BLOB | MYSQL_TYPE_MEDIUM_BLOB | MYSQL_TYPE_LONG_BLOB | MYSQL_TYPE_BLOB => {
-            "blob"
+    let unsigned = col.flags().contains(ColumnFlags::UNSIGNED_FLAG);
+    // Helper for integer types where we care about both the base name and an
+    // optional ` unsigned` suffix. Round-trips through `expected_contracts.yaml`
+    // which lists the canonical names `tinyint`, `tinyint unsigned`, …
+    let int_name = |base: &str| -> String {
+        if unsigned {
+            format!("{base} unsigned")
+        } else {
+            base.into()
         }
-        MYSQL_TYPE_DATE | MYSQL_TYPE_NEWDATE => "date",
-        MYSQL_TYPE_TIME | MYSQL_TYPE_TIME2 => "time",
-        MYSQL_TYPE_DATETIME | MYSQL_TYPE_DATETIME2 => "datetime",
-        MYSQL_TYPE_TIMESTAMP | MYSQL_TYPE_TIMESTAMP2 => "timestamp",
-        MYSQL_TYPE_BIT => "bit",
-        MYSQL_TYPE_YEAR => "year",
-        _ => "unknown",
+    };
+    match col.column_type() {
+        // TINYINT(1) is the MySQL boolean convention — surface the display
+        // width so downstream tooling can tell it apart from a plain TINYINT.
+        MYSQL_TYPE_TINY if col.column_length() == 1 => "tinyint(1)".into(),
+        MYSQL_TYPE_TINY => int_name("tinyint"),
+        MYSQL_TYPE_SHORT => int_name("smallint"),
+        MYSQL_TYPE_INT24 | MYSQL_TYPE_LONG => int_name("int"),
+        MYSQL_TYPE_LONGLONG => int_name("bigint"),
+        MYSQL_TYPE_FLOAT => "float".into(),
+        MYSQL_TYPE_DOUBLE => "double".into(),
+        MYSQL_TYPE_DECIMAL | MYSQL_TYPE_NEWDECIMAL => "decimal".into(),
+        // ENUM and SET arrive on the wire as MYSQL_TYPE_STRING /
+        // MYSQL_TYPE_VAR_STRING with the ENUM_FLAG / SET_FLAG set; the
+        // dedicated MYSQL_TYPE_ENUM / MYSQL_TYPE_SET OIDs are rarely seen.
+        // Check flags *before* falling through to the generic string family
+        // so the native_type label reflects the actual semantic.
+        MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING
+            if col.flags().contains(ColumnFlags::ENUM_FLAG) =>
+        {
+            "enum".into()
+        }
+        MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING
+            if col.flags().contains(ColumnFlags::SET_FLAG) =>
+        {
+            "set".into()
+        }
+        // Charset 63 = binary protocol; BINARY(n) uses MYSQL_TYPE_STRING and
+        // VARBINARY(n) uses MYSQL_TYPE_VAR_STRING. Surface the distinction.
+        MYSQL_TYPE_STRING if col.character_set() == 63 => "binary".into(),
+        MYSQL_TYPE_VAR_STRING if col.character_set() == 63 => "varbinary".into(),
+        MYSQL_TYPE_STRING => "char".into(),
+        MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING => "varchar".into(),
+        MYSQL_TYPE_ENUM => "enum".into(),
+        MYSQL_TYPE_SET => "set".into(),
+        MYSQL_TYPE_JSON => "json".into(),
+        MYSQL_TYPE_TINY_BLOB | MYSQL_TYPE_MEDIUM_BLOB | MYSQL_TYPE_LONG_BLOB | MYSQL_TYPE_BLOB => {
+            "blob".into()
+        }
+        MYSQL_TYPE_DATE | MYSQL_TYPE_NEWDATE => "date".into(),
+        MYSQL_TYPE_TIME | MYSQL_TYPE_TIME2 => "time".into(),
+        MYSQL_TYPE_DATETIME | MYSQL_TYPE_DATETIME2 => "datetime".into(),
+        MYSQL_TYPE_TIMESTAMP | MYSQL_TYPE_TIMESTAMP2 => "timestamp".into(),
+        // BIT(1) and BIT(n>1) map to different Rivet types; carry the bit-
+        // width through native_type so the type-report reflects it.
+        MYSQL_TYPE_BIT if col.column_length() == 1 => "bit(1)".into(),
+        MYSQL_TYPE_BIT => "bit".into(),
+        MYSQL_TYPE_YEAR => "year".into(),
+        _ => "unknown".into(),
     }
 }
 
@@ -70,8 +109,15 @@ pub(super) fn mysql_native_type_name(col: &mysql::Column) -> &'static str {
 ///   requires column override or `type_policy.decimal.unbounded`).
 /// - `TIMESTAMP/TIMESTAMP2` → `Timestamp { timezone: Some("UTC") }` (roadmap §13:
 ///   MySQL TIMESTAMP is stored as UTC and session tz must be set to +00:00).
-/// - `JSON` → `RivetType::Json` so `build_arrow_field` attaches logical-type metadata.
-/// - `ENUM`/`SET` → `RivetType::String` (Utf8, matching prior behavior).
+/// - `JSON` → `RivetType::Json` so `build_arrow_field` attaches both the
+///   `rivet.logical_type=json` field metadata and the `arrow.json` extension
+///   type (parquet-rs then emits native `LogicalType::Json`).
+/// - `ENUM`/`SET` → `RivetType::Enum`. MySQL surfaces them as
+///   `MYSQL_TYPE_STRING` / `MYSQL_TYPE_VAR_STRING` with the
+///   `ENUM_FLAG` / `SET_FLAG` set (the dedicated `MYSQL_TYPE_ENUM` /
+///   `MYSQL_TYPE_SET` OIDs are rare in the text protocol); we check the
+///   flag *before* falling through to the generic string family so the
+///   `rivet.logical_type=enum` metadata survives.
 /// - `TINYINT(1)` / `BOOL` / `BOOLEAN` → `RivetType::Bool` (display-width 1 = MySQL boolean convention).
 /// - `TINYINT` (other widths) → `RivetType::Int16`.
 /// - `BIT(1)` → `RivetType::Bool`; `BIT(n>1)` → `RivetType::Int64` (avoids silent bit-truncation).
@@ -81,8 +127,16 @@ pub(super) fn mysql_type_to_rivet(col: &mysql::Column) -> RivetType {
         // BOOL / BOOLEAN in MySQL is TINYINT(1); display width == 1 is the canonical signal.
         // TINYINT(1) UNSIGNED is also treated as bool (same display-width convention).
         MYSQL_TYPE_TINY if col.column_length() == 1 => RivetType::Bool,
-        MYSQL_TYPE_TINY | MYSQL_TYPE_SHORT => RivetType::Int16,
-        MYSQL_TYPE_INT24 | MYSQL_TYPE_LONG => RivetType::Int32,
+        MYSQL_TYPE_TINY => RivetType::Int16,
+        MYSQL_TYPE_SHORT if col.flags().contains(ColumnFlags::UNSIGNED_FLAG) => RivetType::Int32,
+        MYSQL_TYPE_SHORT => RivetType::Int16,
+        MYSQL_TYPE_INT24 if col.flags().contains(ColumnFlags::UNSIGNED_FLAG) => RivetType::Int64,
+        MYSQL_TYPE_LONG if col.flags().contains(ColumnFlags::UNSIGNED_FLAG) => RivetType::Int64,
+        MYSQL_TYPE_INT24 => RivetType::Int32,
+        MYSQL_TYPE_LONG => RivetType::Int32,
+        MYSQL_TYPE_LONGLONG if col.flags().contains(ColumnFlags::UNSIGNED_FLAG) => {
+            RivetType::UInt64
+        }
         MYSQL_TYPE_LONGLONG => RivetType::Int64,
         MYSQL_TYPE_FLOAT => RivetType::Float32,
         MYSQL_TYPE_DOUBLE => RivetType::Float64,
@@ -99,6 +153,16 @@ pub(super) fn mysql_type_to_rivet(col: &mysql::Column) -> RivetType {
                 .into(),
         },
 
+        // ENUM and SET arrive on the wire as MYSQL_TYPE_STRING /
+        // MYSQL_TYPE_VAR_STRING with the ENUM_FLAG / SET_FLAG set.
+        // Without this check they would be misclassified as String and the
+        // `rivet.logical_type=enum` Parquet metadata would be lost.
+        MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING
+            if col.flags().contains(ColumnFlags::ENUM_FLAG)
+                || col.flags().contains(ColumnFlags::SET_FLAG) =>
+        {
+            RivetType::Enum
+        }
         MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING => {
             // Charset 63 = "binary"; `BINARY(n)` / `VARBINARY(n)` use STRING/VAR_STRING
             // metadata in the MySQL protocol, unlike `BLOB` OIDs — still binary bytes.
@@ -108,7 +172,9 @@ pub(super) fn mysql_type_to_rivet(col: &mysql::Column) -> RivetType {
                 RivetType::String
             }
         }
-        // M6: ENUM/SET → Utf8 + metadata logical=enum (roadmap §15).
+        // Belt-and-suspenders for drivers/protocols that *do* surface the
+        // dedicated MYSQL_TYPE_ENUM / MYSQL_TYPE_SET OIDs (rare in the
+        // text protocol but seen with some configurations).
         MYSQL_TYPE_ENUM | MYSQL_TYPE_SET => RivetType::Enum,
         MYSQL_TYPE_JSON => RivetType::Json,
 
@@ -149,7 +215,7 @@ pub(super) fn mysql_type_to_rivet(col: &mysql::Column) -> RivetType {
         MYSQL_TYPE_YEAR => RivetType::Int16,
 
         _ => RivetType::Unsupported {
-            native_type: mysql_native_type_name(col).to_string(),
+            native_type: mysql_native_type_name(col),
             reason: "no Rivet mapping for this MySQL type".into(),
         },
     }
@@ -175,7 +241,7 @@ pub(super) fn mysql_schema_and_arrow_types(
             .get(col.name_str().as_ref())
             .cloned()
             .unwrap_or_else(|| mysql_type_to_rivet(col));
-        let source = SourceColumn::simple(col.name_str().to_string(), native, true);
+        let source = SourceColumn::simple(col.name_str().to_string(), native.clone(), true);
         let mapping = TypeMapping::from_source(&source, rivet);
 
         match (build_arrow_field(&mapping), mapping.arrow_type) {
@@ -305,6 +371,24 @@ fn build_array(
             }
             Ok(Arc::new(b.finish()))
         }
+        DataType::UInt64 => {
+            let mut b = UInt64Builder::with_capacity(rows.len());
+            for row in rows {
+                match row.as_ref(col_idx) {
+                    Some(Value::UInt(v)) => b.append_value(*v),
+                    Some(Value::Int(v)) if *v >= 0 => b.append_value(*v as u64),
+                    Some(Value::Bytes(bv)) => {
+                        if let Some(v) = atoi::atoi::<u64>(bv) {
+                            b.append_value(v);
+                        } else {
+                            b.append_null();
+                        }
+                    }
+                    _ => b.append_null(),
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
         DataType::Int64 => {
             let mut b = Int64Builder::with_capacity(rows.len());
             for row in rows {
@@ -378,6 +462,36 @@ fn build_array(
                 match row.as_ref(col_idx) {
                     Some(Value::Bytes(bv)) => b.append_value(bv),
                     _ => b.append_null(),
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        // FixedSizeBinary(16) is the Arrow type for `RivetType::Uuid`. MySQL
+        // has no native UUID OID, so the column has to arrive here via a
+        // `columns: { uid: uuid }` override; the wire-side payload is a
+        // canonical 36-char text UUID stored in CHAR/VARCHAR/BINARY.
+        // Parsing the text into 16 bytes lets us hand parquet-rs a value
+        // that pairs with the `arrow.uuid` extension and produces native
+        // `LogicalType::Uuid` in the Parquet file.
+        DataType::FixedSizeBinary(16) => {
+            let mut b = FixedSizeBinaryBuilder::with_capacity(rows.len(), 16);
+            for row in rows {
+                let bytes = match row.as_ref(col_idx) {
+                    Some(Value::Bytes(bv)) if bv.len() == 16 => {
+                        let mut a = [0u8; 16];
+                        a.copy_from_slice(bv);
+                        Some(a)
+                    }
+                    Some(Value::Bytes(bv)) => bytes_to_str(bv)
+                        .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
+                        .map(|u| *u.as_bytes()),
+                    _ => None,
+                };
+                match bytes {
+                    Some(a) => b
+                        .append_value(a)
+                        .expect("16 bytes always fits FixedSizeBinary(16)"),
+                    None => b.append_null(),
                 }
             }
             Ok(Arc::new(b.finish()))

@@ -1,0 +1,14 @@
+<!--
+  ClickHouse config patch for the Rivet Parquet-validator role.
+
+  The default `user_files_path` is `/var/lib/clickhouse/user_files/`; the
+  `file()` table function refuses paths outside it (DATABASE_ACCESS_DENIED).
+  Our docker-compose bind-mounts the host `tests/.live-tmp` dir as `/work`
+  inside the container so tests can hand the same Parquet file to both
+  DuckDB and ClickHouse. This patch points `user_files_path` at `/work` so
+  test SQL can write `file('pg_matrix/foo.parquet', 'Parquet')` directly,
+  matching the DuckDB shape.
+-->
+<clickhouse>
+    <user_files_path>/work</user_files_path>
+</clickhouse>

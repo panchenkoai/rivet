@@ -433,7 +433,7 @@ Real pain, but infrastructure/security complexity is non-trivial.
 
 ## Epic 14 — Narrow Warehouse Load Layer
 **Priority:** P3 → **P1 (in progress)**  
-**Status:** ✅ Partial — type system, type report, strict mode, BigQuery compat layer, complex types (M1–M6 complete); load path (Parquet → BQ) = future  
+**Status:** ✅ Partial — type system, type report, strict mode, BigQuery compat layer, complex types (M1–M6 complete); **v0.7.8 Type Roundtrip Proof shipped** (Phase 1 of the type/verify/UX track — 4 independent reader validators + native Parquet UUID/JSON logical types + type-fidelity benchmark); load path (Parquet → BQ) = future  
 **Pain coverage:** Pain C, Pain E
 
 ### Goal
@@ -446,6 +446,9 @@ Add a narrow, compatibility-aware path from extracted files into selected wareho
 - ✅ strict/permissive mapping policy (`TypePolicy`, `--strict` flag)
 - ✅ column type overrides (`columns:` YAML block)
 - ✅ complex types: Enum, Interval, List (Postgres); Enum/SET, TIME, arrays (MySQL)
+- ✅ **type roundtrip proof (v0.7.8)** — PG/MySQL → Parquet/CSV matrix tested through 4 independent readers (DuckDB, ClickHouse, pyarrow, BigQuery), 31 live tests in `tests/type_roundtrip/`, `make test-types-validators`. Documented in [`docs/type-mapping.md`](docs/type-mapping.md), [ADR-0014](docs/adr/0014-target-type-materialization.md), and per-tool benchmark reports under [`docs/bench/reports/REPORT_types*.md`](docs/bench/reports/)
+- ✅ **native Parquet logical types (v0.7.8)** — UUID → `FixedSizeBinary(16) + LogicalType::Uuid` via `arrow.uuid` extension; JSON → `LogicalType::Json` via `arrow.json` extension. Downstream engines (DuckDB, ClickHouse 25.x+, pyarrow) recognise UUID/JSON natively without a cast; BigQuery autoload promotes UUID→BYTES exact (one documented gap: BQ does not lift `LogicalType::Json` to native `JSON` without an explicit `--schema=attrs:JSON`)
+- ✅ **MySQL driver fidelity fixes (v0.7.8)** — PG arrays preserve NULL elements; MySQL `ENUM`/`SET` flag detection so `rivet.logical_type=enum` survives; `native_type` distinguishes UNSIGNED, `TINYINT(1)`, `BIT(1)`, CHAR vs VARCHAR, BINARY vs VARBINARY
 - ⏳ direct load path (write Parquet files directly into BigQuery) = future
 
 ### Why this matters
@@ -960,6 +963,7 @@ Prioritize by stabilization before distribution polish:
 6. ✅ **Parallel export processes** — `--parallel-export-processes` with live cards UI (v0.3.4).
 7. ✅ **Cards UI for `--parallel-exports`** — unified cards renderer + compact summaries (v0.3.5).
 8. ✅ **Type safety layer M1–M6** — `rivet check --type-report`, `TypePolicy`, BigQuery compat, complex types (Enum/Interval/List).
+9. ✅ **Type Roundtrip Proof (v0.7.8)** — PG/MySQL → Parquet/CSV preserved through 4 independent reader validators (DuckDB, ClickHouse, pyarrow, BigQuery); native Parquet `LogicalType::Uuid` / `LogicalType::Json` via `arrow.uuid` / `arrow.json` extension types; 31 live tests; cross-tool fidelity benchmark. Three real driver bugs fixed along the way: PG arrays losing NULL elements, MySQL ENUM/SET misclassified as String, MySQL `native_type` collapsing UNSIGNED / `TINYINT(1)` / `BIT(1)` / CHAR / VARCHAR variants.
 
 **Remaining open items (P1 first):**
 
@@ -968,6 +972,8 @@ Prioritize by stabilization before distribution polish:
 3. ✅ **F5 + I5** — reconcile/validate tradeoffs (cli.md); capacity/memory planning (tuning.md).
 4. ✅ **I2** — `cargo bench` + `dev/scripts/bench.sh` save/compare harness; column_scan + shape_tracking groups.
 5. ✅ **Epic 4 (§5)** — external/durable state backend: `RIVET_STATE_URL` PostgreSQL backend shipped.
+6. ⏳ **Verify / Validation Layer (v0.7.9, next focus)** — new top-level `rivet verify` command answering *"are produced files + manifest + state + summary internally consistent?"*. Three depth levels (light file/size/schema-hash check → sample row read → full file scan), stable error codes `RIVET_VERIFY_*`, read-only (mutating fixes stay in `repair`). Catches missing/partial files, size mismatch, orphan output, manifest/state divergence, schema-hash mismatch. JSON output for automation. Builds on the Type Roundtrip Proof: type contract is now provable, next we need *artifact* consistency to be provable too.
+7. ⏳ **Operator UX & Diagnostics (v0.8.0)** — structured diagnostics with stable codes (`RIVET_CONFIG_*`, `RIVET_SOURCE_*`, `RIVET_VERIFY_*`, …), severity (low / medium / high / blocking), actionable hints; `--json` everywhere; strategy explanation in `rivet plan` (why this chunk size, why this mode, what risk remains); `doctor` capability + blocker report.
 
 ---
 
@@ -984,6 +990,7 @@ Prioritize by stabilization before distribution polish:
 - [x] Plan/Apply workflow — sealed execution artifacts, ADR-0005
 - [x] Parallel exports — `--parallel-exports` + `--parallel-export-processes` with live cards UI
 - [x] Type safety layer — `--type-report`, TypePolicy, BigQuery compat, complex types (M1–M6)
+- [x] **Type roundtrip proof (v0.7.8)** — PG/MySQL × Parquet/CSV validated through DuckDB + ClickHouse + pyarrow + BigQuery; native Parquet `LogicalType::Uuid` / `LogicalType::Json`; `make test-types-validators`; per-tool fidelity benchmark in [`docs/bench/reports/`](docs/bench/reports/)
 - [x] Schema drift policy hooks — `on_schema_drift: warn|continue|fail` (Epic 7)
 - [x] Data shape drift detection — string/text width tracking (Epic 8)
 - [ ] 2–3 pilot tables repeated on a schedule *(organizational; optional automation K2)*

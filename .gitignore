@@ -96,3 +96,8 @@ pilot_bench.yaml
 # .rivet/runs artifacts that leak when running tests against frozen plan
 # fixtures (apply creates run dirs next to the plan file)
 /tests/fixtures/artifacts_legacy/.rivet/
+
+# Shared host↔container bind mount used by live type-roundtrip tests
+# (DuckDB + ClickHouse read the same Parquet from here — see
+# docker-compose.yaml).
+/tests/.live-tmp/

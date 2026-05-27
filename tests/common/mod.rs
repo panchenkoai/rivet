@@ -51,6 +51,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // Keeping `mod mysql` private avoids shadowing the external `mysql` crate
 // when downstream tests do `use common::*;`.  Same idea for `env` vs
 // `std::env`.
+mod clickhouse;
+mod duckdb;
 mod env;
 mod mysql;
 mod pg;
@@ -58,6 +60,8 @@ mod runner;
 mod storage;
 mod toxi;
 
+pub use clickhouse::*;
+pub use duckdb::*;
 pub use env::*;
 pub use mysql::*;
 pub use pg::*;
