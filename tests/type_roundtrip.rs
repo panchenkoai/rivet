@@ -10,6 +10,8 @@
 
 mod common;
 
+#[path = "type_roundtrip/bigquery_load.rs"]
+mod bigquery_load;
 #[path = "type_roundtrip/clickhouse_load.rs"]
 mod clickhouse_load;
 #[path = "type_roundtrip/compression_matrix.rs"]

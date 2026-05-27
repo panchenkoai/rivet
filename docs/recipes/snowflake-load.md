@@ -303,3 +303,19 @@ versus what we need:
 BigQuery's `bq load` (with `--parquet_enable_list_inference`) handles items 4–7
 natively. Snowflake autoload behavior may improve in future releases; treat
 this recipe as a snapshot.
+
+### Continuous proof
+
+The BigQuery half of this table is pinned by an end-to-end validator that
+exports the canonical type matrices, runs `bq load`, and asserts the schema
++ key values against the same expectations documented above:
+
+```sh
+gcloud auth application-default login
+BIGQUERY_TEST_PROJECT=<your-gcp-project> make test-types-bigquery
+```
+
+Skips silently without `BIGQUERY_TEST_PROJECT`. Implementation:
+`tests/type_roundtrip/bigquery_load.rs`. The Snowflake half is currently
+verified manually against this recipe — a similar oracle would be welcome
+once a service-account login path exists for new Snowflake trial accounts.
