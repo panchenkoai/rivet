@@ -972,8 +972,41 @@ Prioritize by stabilization before distribution polish:
 3. ✅ **F5 + I5** — reconcile/validate tradeoffs (cli.md); capacity/memory planning (tuning.md).
 4. ✅ **I2** — `cargo bench` + `dev/scripts/bench.sh` save/compare harness; column_scan + shape_tracking groups.
 5. ✅ **Epic 4 (§5)** — external/durable state backend: `RIVET_STATE_URL` PostgreSQL backend shipped.
-6. ⏳ **Verify / Validation Layer (v0.7.9, next focus)** — new top-level `rivet verify` command answering *"are produced files + manifest + state + summary internally consistent?"*. Three depth levels (light file/size/schema-hash check → sample row read → full file scan), stable error codes `RIVET_VERIFY_*`, read-only (mutating fixes stay in `repair`). Catches missing/partial files, size mismatch, orphan output, manifest/state divergence, schema-hash mismatch. JSON output for automation. Builds on the Type Roundtrip Proof: type contract is now provable, next we need *artifact* consistency to be provable too.
+6. ⏳ **Verify / Validation Layer (v0.7.9, next focus)** — new top-level `rivet verify` command answering *"are produced files + manifest + state + summary internally consistent?"*. Three depth levels (light file/size/schema-hash check → sample row read → full file scan), stable error codes `RIVET_VERIFY_*`, read-only (mutating fixes stay in `repair`). Catches missing/partial files, size mismatch, orphan output, manifest/state divergence, schema-hash mismatch. JSON output for automation. Builds on the Type Roundtrip Proof: type contract is now provable, next we need *artifact* consistency to be provable too. **Design open:** extend existing `--validate` (per ADR-0013 "no new flags") vs new top-level `rivet verify` command — pick before implementation.
 7. ⏳ **Operator UX & Diagnostics (v0.8.0)** — structured diagnostics with stable codes (`RIVET_CONFIG_*`, `RIVET_SOURCE_*`, `RIVET_VERIFY_*`, …), severity (low / medium / high / blocking), actionable hints; `--json` everywhere; strategy explanation in `rivet plan` (why this chunk size, why this mode, what risk remains); `doctor` capability + blocker report.
+
+### 9.6.1 UX hardening backlog (v0.7.8 walk-through findings)
+
+The fast-track + pilot blessed-path walk in the v0.7.8 session found three
+P1-class bugs (already fixed and folded into item 9 above) plus a longer
+list of P2/P3 friction worth addressing while polishing for v0.7.9 /
+v0.8.0. Each line is one focused change; pick off in order or interleave
+with verify-layer work as bandwidth allows.
+
+**Fixed in v0.7.8 session** (evidence in [`src/preflight/{postgres,mysql,analysis}.rs`](src/preflight/), [`src/config/source.rs`](src/config/source.rs), [`src/pipeline/cli.rs`](src/pipeline/cli.rs), [`src/pipeline/chunked/{sequential,parallel}_checkpoint.rs`](src/pipeline/chunked/)):
+
+- ✅ `rivet check` no longer reports "No index detected" for indexed `chunk_column` / `cursor_column` — catalog-based btree probe overrides the EXPLAIN-of-base-query heuristic; verdict thresholds relaxed so indexed > 10 M rows is ACCEPTABLE not DEGRADED.
+- ✅ `WARN: source URL contains plaintext password` no longer fires when the user already chose `url_env:` / `url_file:` — only inline `url:` (the misconfig case) triggers it.
+- ✅ `rivet state show` after chunked-only runs no longer says "No export state recorded yet" — distinguishes "never ran" from "ran chunked, look at metrics / state files" and prints the right next-step pointer.
+- ✅ `summary.retries` now actually increments in chunked exports (sequential + parallel paths) — was silently stuck at 0, masking flaky-link runs that only worked because backoff covered for them. Visible in console summary card, `rivet metrics`, and `export_metrics.retries`.
+
+**P2 — friction, not bugs** (tackle before v0.7.9 release if time permits):
+
+- ⏳ **`check` verdict pessimism vs actual run.** UNSAFE / DEGRADED predicts high RSS on parallel reads against no-index tables, but the actual run frequently sits well under the predicted budget (e.g. 10 M-row chunked-parallel orders ran in 12 s at 117 MB RSS while check said UNSAFE). Either make the predictor use estimated row width + chunk batch size for a tighter bound, or downgrade UNSAFE to DEGRADED when the verdict can't show a concrete budget breach.
+- ⏳ **`destination is not retry-safe` WARN spams local-destination runs.** `type: local` is the canonical dev/test destination but each run prints a retry-safety WARN. Either suppress for `local` (partial artifact = one failed-rewrite file, not silent data loss) or have `rivet init` add the right opt-in so the warn does not fire on defaults.
+- ⏳ **TLS warning only in `run`, not in `doctor`/`check`.** Security warnings should surface in preflight commands — that's what `doctor` is for. Today the operator only learns about the missing `tls:` block when they start a real extract.
+- ⏳ **`rivet init --schema X` includes ad-hoc / test tables.** Schema-wide init dumps every relation in the schema (140 entries in our dev DB, most of them leftover test artifacts). Add an `--exclude '<glob>'` flag or a heuristic that skips tables whose names match common temp/test patterns (`tmp_*`, `*_temp`, tables with PID-shaped suffixes).
+
+**P3 — polish & doc clarity** (good v0.8.0 fodder):
+
+- ⏳ **`rivet init` does not explain *why* it picked a mode.** Generated YAML says `mode: chunked` but not "(auto-selected because rows estimate ≥ 500 K)". One-line inline comment in the rendered config would close the loop.
+- ⏳ **`rivet journal --export X` does not show retry events.** Doc promises "per-run events / retries / quality issues"; today it only shows status + duration. Plumb per-chunk retry attempts into the structured journal so post-mortem doesn't require digging in stderr WARNs.
+- ⏳ **100 files per 10 M-row chunked export.** Default `chunk_size: 100_000` × big table = many small files. `rivet init` could scale `chunk_size` logarithmically with the row estimate (e.g. ≥ 10 M → 1 M chunk_size) so default file counts stay reasonable.
+- ⏳ **`status: skipped` summary is sparse.** Incremental-mode skipped run shows `status: skipped` with no context; add `(no new rows since cursor <X>)` so the operator does not have to guess.
+- ⏳ **Doc note: re-running `chunked` re-extracts everything.** `--resume` skips completed chunks after a crash, but a clean re-run re-does the full table. Worth one paragraph in `modes/chunked.md` so operators do not assume idempotency.
+- ⏳ **Doc note: `time_window` re-runs duplicate output.** Rolling window mode does not persist "we did this window already", so frequent re-runs produce duplicate files. Worth a paragraph in `modes/time-window.md`.
+- ⏳ **Retry / I3 (Write Before Cursor) at-least-once dupe scenario** not yet covered by tests. The contract documents the duplicate possibility (`ADR-0001 I3`), and toxiproxy-based retry testing showed counters work; a dedicated SIGKILL-between-write-and-commit recovery test would pin the actual dupe behavior end-to-end.
+- ⏳ **Stale roadmap items inherited from earlier sessions:** "2–3 pilot tables repeated on a schedule" in §9.7 (organizational), release checksums / SBOM / signed release attestations (also §9.7 unchecked).
 
 ---
 

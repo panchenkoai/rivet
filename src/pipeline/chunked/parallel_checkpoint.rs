@@ -97,6 +97,12 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     let agg_rows = std::sync::atomic::AtomicI64::new(0);
     let agg_bytes = std::sync::atomic::AtomicU64::new(0);
     let agg_files = std::sync::atomic::AtomicUsize::new(0);
+    // Per-attempt retry counter bumped from inside each worker's retry
+    // loop and folded into `summary.retries` after the scope joins, so the
+    // console summary card / `rivet metrics` / `export_metrics.retries`
+    // reflect chunked-parallel retries the same way the sequential path
+    // already does.
+    let agg_retries = std::sync::atomic::AtomicU32::new(0);
     let errors = std::sync::Mutex::new(Vec::<String>::new());
     // ADR-0012 M3: schema fingerprint captured once across workers.  None
     // until any worker exports a non-empty chunk and resolves the dest schema.
@@ -124,6 +130,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
             let agg_rows = &agg_rows;
             let agg_bytes = &agg_bytes;
             let agg_files = &agg_files;
+            let agg_retries = &agg_retries;
             let errors = &errors;
             let shared_fingerprint = &shared_fingerprint;
             let plan_w = plan_for_workers.clone();
@@ -197,6 +204,13 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                         let mut last_err: Option<anyhow::Error> = None;
                         for attempt in 0..=plan_w.tuning.max_retries {
                             if attempt > 0 {
+                                // Bump the shared retry counter so summary
+                                // card + metrics see chunked-parallel retries
+                                // (sequential path bumps `summary.retries`
+                                // directly; here we go through the atomic
+                                // and fold once after the scope joins).
+                                agg_retries
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 let extra_delay = last_err
                                     .as_ref()
                                     .map(classify_error)
@@ -372,6 +386,9 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     summary.total_rows = agg_rows.load(Ordering::Relaxed);
     summary.bytes_written = agg_bytes.load(Ordering::Relaxed);
     summary.files_produced = agg_files.load(Ordering::Relaxed);
+    summary.retries = summary
+        .retries
+        .saturating_add(agg_retries.load(Ordering::Relaxed));
     pb_cp.finish(summary.total_rows);
     if plan.validate {
         summary.validated = Some(true);

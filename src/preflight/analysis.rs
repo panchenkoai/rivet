@@ -279,11 +279,16 @@ pub(crate) fn compute_verdict(
     match (uses_index, has_cursor, rows) {
         (true, true, r) if r <= 10_000_000 => HealthVerdict::Efficient,
         (true, true, _) => HealthVerdict::Acceptable,
-        (true, false, r) if r <= 10_000_000 => HealthVerdict::Acceptable,
+        // Indexed + no cursor of any size stays Acceptable. The cursor
+        // requirement is for incremental mode; chunked mode (the
+        // canonical large-table path) *is* the cursor and doesn't need
+        // one declared. Without this arm a 10_000_001-row indexed
+        // chunked export falls through to `_ => Degraded`, which the
+        // operator reads as "your config is wrong" — but it's fine.
+        (true, false, _) => HealthVerdict::Acceptable,
         (false, _, r) if r <= 1_000_000 => HealthVerdict::Degraded,
         (false, true, r) if r <= 50_000_000 => HealthVerdict::Degraded,
         (false, _, _) => HealthVerdict::Unsafe,
-        _ => HealthVerdict::Degraded,
     }
 }
 
@@ -327,14 +332,19 @@ pub(crate) fn build_suggestion(
                         "Add an indexed cursor column and switch to incremental mode.".to_string(),
                     );
                 }
-                ExportMode::Chunked => {
+                // Only suggest creating an index when we believe there isn't
+                // one — `uses_index` already accounts for both the EXPLAIN
+                // hint and the catalog-side probe (preflight::{postgres,
+                // mysql}::column_has_*_*), so saying "create an index" when
+                // a btree already exists would be a false alarm.
+                ExportMode::Chunked if !uses_index => {
                     let col = export.chunk_column.as_deref().unwrap_or("chunk_column");
                     parts.push(format!(
                         "Create an index on '{}' to speed up range scans.",
                         col
                     ));
                 }
-                ExportMode::TimeWindow => {
+                ExportMode::TimeWindow if !uses_index => {
                     let col = export.time_column.as_deref().unwrap_or("time_column");
                     parts.push(format!(
                         "Create an index on '{}' for efficient time-window filtering.",
@@ -342,7 +352,8 @@ pub(crate) fn build_suggestion(
                     ));
                 }
                 _ => {
-                    if export.cursor_column.is_none() {
+                    if export.cursor_column.is_none() && !matches!(export.mode, ExportMode::Chunked)
+                    {
                         parts.push(
                             "Consider adding a cursor column for incremental mode.".to_string(),
                         );

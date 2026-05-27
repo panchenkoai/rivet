@@ -121,7 +121,34 @@ fn diagnose_pg(
         (None, None)
     };
 
-    let (scan_type, uses_index) = analyze_plan_pg(client, &effective_query);
+    let (scan_type, plan_uses_index) = analyze_plan_pg(client, &effective_query);
+
+    // The EXPLAIN above runs against the *base* query (the whole table,
+    // typically). PostgreSQL picks `Seq Scan` for a full-table read even
+    // when there's a perfect btree on the chunk column — the index path is
+    // genuinely slower for a full read. But the chunked/incremental run
+    // does NOT issue the base query; it issues `WHERE chunk_col >= $lo
+    // AND chunk_col < $hi`, which *will* use the btree.
+    //
+    // So for those modes, ask the catalog directly: is there a btree index
+    // whose leading column is the range column? If yes, treat it as
+    // indexed regardless of what EXPLAIN said for the base query. This
+    // collapses the most common false-DEGRADED case (chunked on a PK).
+    let uses_index = if matches!(export.mode, ExportMode::Chunked | ExportMode::Incremental)
+        && let Some(col) = range_col
+        && let Some(table) = export
+            .table
+            .as_deref()
+            .or_else(|| table_from_simple_query(base_query))
+    {
+        match column_has_btree_pg(client, table, col) {
+            Some(true) => true,
+            Some(false) => plan_uses_index,
+            None => plan_uses_index,
+        }
+    } else {
+        plan_uses_index
+    };
 
     let strategy = derive_strategy(export);
     let verdict = compute_verdict(row_estimate, uses_index, export.cursor_column.is_some());
@@ -205,6 +232,152 @@ fn get_cursor_range_pg(
         Err(e) => {
             log::debug!("preflight: cursor range probe on '{cursor_col}' failed: {e}");
             (None, None)
+        }
+    }
+}
+
+/// Extract a `schema.table` (or bare `table`) from a single-relation
+/// `SELECT … FROM <name>` query. Conservative on purpose — anything with
+/// JOIN, a subquery, an alias, a CTE, or a non-identifier table name
+/// returns `None` and callers fall back to the EXPLAIN-based heuristic.
+///
+/// Exists because `rivet init` generates `query: SELECT cols FROM tbl`
+/// (not `table: tbl`) to lock the column list, so the index probe needs
+/// to recover the table name from the rendered query.
+pub(crate) fn table_from_simple_query(query: &str) -> Option<&str> {
+    // Walk tokens after the first FROM that is *not* inside parens.
+    let mut depth = 0u32;
+    let mut chars = query.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => {
+                // Match `from` (case-insensitive) at this position when
+                // bounded by whitespace.
+                let rest = &query[idx..];
+                let head_ok = idx == 0
+                    || matches!(
+                        query.as_bytes()[idx - 1],
+                        b' ' | b'\t' | b'\n' | b'\r' | b')'
+                    );
+                if head_ok && rest.len() >= 5 && rest[..4].eq_ignore_ascii_case("from") {
+                    let after = rest[4..].chars().next();
+                    if matches!(after, Some(c) if c.is_whitespace() || c == '(') {
+                        // skip 'from' + whitespace
+                        let mut j = idx + 4;
+                        let bytes = query.as_bytes();
+                        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        // Read one identifier (with optional `schema.` prefix);
+                        // reject anything with quotes / subquery / comma.
+                        let id_start = j;
+                        while j < bytes.len() {
+                            let b = bytes[j];
+                            let id_char = b.is_ascii_alphanumeric() || b == b'_' || b == b'.';
+                            if id_char {
+                                j += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        if j == id_start {
+                            return None;
+                        }
+                        let token = &query[id_start..j];
+                        // Reject only when this is genuinely multi-relation:
+                        //   `FROM users JOIN orders …`  ← any JOIN flavor
+                        //   `FROM users, orders`         ← comma list
+                        // Plain aliases (`FROM users u`, `FROM users AS u`)
+                        // and trailing clauses (`WHERE`, `ORDER BY`, `LIMIT`)
+                        // do not change the relation — `users` is still the
+                        // table the catalog probe should index-check.
+                        let mut k = j;
+                        while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                            k += 1;
+                        }
+                        if k < bytes.len() {
+                            let rest = &query[k..];
+                            if rest.starts_with(',') {
+                                return None;
+                            }
+                            let next_word: String = rest
+                                .chars()
+                                .take_while(|c| c.is_ascii_alphabetic())
+                                .collect::<String>()
+                                .to_ascii_lowercase();
+                            // Standard SQL JOIN keywords (any prefix that
+                            // precedes the join itself counts).
+                            if matches!(
+                                next_word.as_str(),
+                                "join"
+                                    | "inner"
+                                    | "left"
+                                    | "right"
+                                    | "outer"
+                                    | "full"
+                                    | "cross"
+                                    | "natural"
+                            ) {
+                                return None;
+                            }
+                        }
+                        return Some(token);
+                    }
+                }
+            }
+            _ => {}
+        }
+        let _ = chars.peek();
+    }
+    None
+}
+
+/// True when `column` is the leading key of a `btree` index on `table`.
+///
+/// Range chunking (`WHERE col >= $lo AND col < $hi`) and incremental cursor
+/// reads (`WHERE col > $last ORDER BY col`) only benefit from an index when
+/// the column is the leading key of a btree. `gist`/`gin`/`hash`/`brin`
+/// indexes do not help here. Composite btrees where our column is leading
+/// (`(col, x, y)`) still do — the planner can use the leading prefix.
+///
+/// Returns `Some(true)` when an index is found, `Some(false)` when the
+/// catalog probe ran and found none, `None` when the probe failed (e.g.
+/// the `table:` shortcut wasn't used so we don't have a qualified name to
+/// look up, or the user lacks SELECT on `pg_index`). Callers fall back to
+/// the EXPLAIN-based heuristic in the `None` case.
+pub(crate) fn column_has_btree_pg(
+    client: &mut postgres::Client,
+    qualified_table: &str,
+    column: &str,
+) -> Option<bool> {
+    let (schema, table) = match qualified_table.split_once('.') {
+        Some((s, t)) => (s, t),
+        None => ("public", qualified_table),
+    };
+    // Find every btree index on (schema.table) whose attnum-0 (first key)
+    // is our column. `i.indkey[0]` is the leading key's attnum;
+    // `a.attnum = i.indkey[0]` joins it to the column name.
+    let sql = "SELECT 1 \
+               FROM pg_index i \
+               JOIN pg_class c ON c.oid = i.indrelid \
+               JOIN pg_namespace n ON n.oid = c.relnamespace \
+               JOIN pg_class ic ON ic.oid = i.indexrelid \
+               JOIN pg_am am ON am.oid = ic.relam \
+               JOIN pg_attribute a ON a.attrelid = i.indrelid \
+                                  AND a.attnum  = i.indkey[0] \
+               WHERE n.nspname = $1::text \
+                 AND c.relname = $2::text \
+                 AND a.attname = $3::text \
+                 AND am.amname = 'btree' \
+                 AND i.indisvalid AND i.indisready \
+               LIMIT 1";
+    match client.query(sql, &[&schema, &table, &column]) {
+        Ok(rows) => Some(!rows.is_empty()),
+        Err(e) => {
+            log::debug!("preflight: btree index probe failed for {schema}.{table}.{column}: {e}");
+            None
         }
     }
 }
@@ -308,5 +481,157 @@ mod tests {
     #[test]
     fn extract_scan_type_empty_plan_returns_unknown() {
         assert_eq!(extract_scan_type(""), "unknown");
+    }
+
+    // ── table_from_simple_query ──────────────────────────────────────────────
+    //
+    // Drives the index-probe fallback that recovers the table name from
+    // `query: SELECT … FROM <name>` configs (rivet init emits this shape
+    // instead of `table:` to lock the column list — see preflight P1 #1).
+    // The parser is intentionally conservative: anything that isn't a single
+    // `SELECT cols FROM ident` must return None so we don't catalog-probe
+    // the wrong relation and falsely promote a verdict.
+
+    #[test]
+    fn table_from_simple_query_bare_select() {
+        assert_eq!(
+            table_from_simple_query("SELECT id, name FROM users"),
+            Some("users")
+        );
+    }
+
+    #[test]
+    fn table_from_simple_query_schema_qualified() {
+        assert_eq!(
+            table_from_simple_query("SELECT * FROM public.orders"),
+            Some("public.orders")
+        );
+    }
+
+    #[test]
+    fn table_from_simple_query_multiline_rivet_init_shape() {
+        // `rivet init` renders YAML with a `query: >` folded block that
+        // becomes a single line with surrounding whitespace + newlines;
+        // make sure the parser tolerates that exact shape.
+        let q =
+            "\nSELECT id, name, email, age, balance,\n  is_active, bio, created_at\nFROM users\n";
+        assert_eq!(table_from_simple_query(q), Some("users"));
+    }
+
+    #[test]
+    fn table_from_simple_query_case_insensitive_keyword() {
+        assert_eq!(
+            table_from_simple_query("select * from Users"),
+            Some("Users")
+        );
+        assert_eq!(
+            table_from_simple_query("Select * From users"),
+            Some("users")
+        );
+    }
+
+    #[test]
+    fn table_from_simple_query_rejects_join() {
+        // Multi-relation queries must fall back to the EXPLAIN heuristic —
+        // catalog probing one of the tables would mislead the verdict.
+        assert_eq!(
+            table_from_simple_query("SELECT * FROM users JOIN orders USING (id)"),
+            None
+        );
+        assert_eq!(table_from_simple_query("SELECT * FROM users, orders"), None);
+    }
+
+    #[test]
+    fn table_from_simple_query_accepts_aliased_table() {
+        // `FROM users u` and `FROM users AS u` are single-relation queries
+        // with a local alias — the table is still `users`, which is what
+        // the catalog probe needs to index-check. Aliases are harmless.
+        assert_eq!(
+            table_from_simple_query("SELECT * FROM users u"),
+            Some("users")
+        );
+        assert_eq!(
+            table_from_simple_query("SELECT * FROM users AS u"),
+            Some("users")
+        );
+    }
+
+    #[test]
+    fn table_from_simple_query_accepts_trailing_clauses() {
+        // WHERE / ORDER BY / LIMIT don't change the relation; the table
+        // before them is still the one to probe.
+        assert_eq!(
+            table_from_simple_query("SELECT * FROM users WHERE id > 0"),
+            Some("users")
+        );
+        assert_eq!(
+            table_from_simple_query("SELECT * FROM users ORDER BY id"),
+            Some("users")
+        );
+        assert_eq!(
+            table_from_simple_query("SELECT * FROM users LIMIT 100"),
+            Some("users")
+        );
+    }
+
+    #[test]
+    fn table_from_simple_query_rejects_all_join_flavors() {
+        for kw in [
+            "JOIN",
+            "INNER JOIN",
+            "LEFT JOIN",
+            "LEFT OUTER JOIN",
+            "RIGHT JOIN",
+            "FULL OUTER JOIN",
+            "CROSS JOIN",
+            "NATURAL JOIN",
+        ] {
+            let q = format!("SELECT * FROM users {kw} orders ON users.id = orders.user_id");
+            assert_eq!(
+                table_from_simple_query(&q),
+                None,
+                "{kw}: should reject multi-relation"
+            );
+        }
+    }
+
+    #[test]
+    fn table_from_simple_query_skips_subquery_from() {
+        // `SELECT (SELECT max(x) FROM events) FROM users` — the `FROM events`
+        // is inside parens (depth>0), so the parser should reach the outer
+        // `FROM users`.
+        assert_eq!(
+            table_from_simple_query("SELECT (SELECT max(x) FROM events) FROM users"),
+            Some("users")
+        );
+    }
+
+    #[test]
+    fn table_from_simple_query_subquery_only_returns_none() {
+        // No top-level FROM at all → None.
+        assert_eq!(
+            table_from_simple_query("SELECT (SELECT max(x) FROM events)"),
+            None
+        );
+    }
+
+    #[test]
+    fn table_from_simple_query_handles_no_from_clause() {
+        // `SELECT 1` — preflight uses this as the fallback when the user
+        // hasn't supplied a query yet. Must not crash, must return None.
+        assert_eq!(table_from_simple_query("SELECT 1"), None);
+        assert_eq!(table_from_simple_query(""), None);
+    }
+
+    #[test]
+    fn table_from_simple_query_rejects_quoted_identifier() {
+        // `FROM "User Table"` — the parser only accepts bare identifier
+        // chars (alnum / _ / .), so a double-quoted name returns None and
+        // the catalog probe falls back to the EXPLAIN hint. Conservative
+        // — quoted identifiers are uncommon in `rivet init` output.
+        assert_eq!(
+            table_from_simple_query("SELECT * FROM \"User Table\""),
+            None
+        );
     }
 }

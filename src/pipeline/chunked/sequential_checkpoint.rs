@@ -135,6 +135,11 @@ fn run_chunk_with_source_retries(
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..=plan.tuning.max_retries {
         if attempt > 0 {
+            // Bump the per-run retry counter on every retry attempt so the
+            // console summary card and `rivet metrics` show how often the
+            // export had to re-try (it would otherwise stay at 0, masking
+            // a flaky link that worked only because backoff covered for it).
+            summary.retries = summary.retries.saturating_add(1);
             let class = last_err
                 .as_ref()
                 .map(classify_error)
