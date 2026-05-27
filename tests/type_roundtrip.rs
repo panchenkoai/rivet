@@ -26,6 +26,8 @@ mod helpers;
 mod mysql_csv_roundtrip;
 #[path = "type_roundtrip/mysql_parquet_roundtrip.rs"]
 mod mysql_parquet_roundtrip;
+#[path = "type_roundtrip/mysql_uint64_decimal_override.rs"]
+mod mysql_uint64_decimal_override;
 #[path = "type_roundtrip/parquet_metadata.rs"]
 mod parquet_metadata;
 #[path = "type_roundtrip/parquet_schema.rs"]

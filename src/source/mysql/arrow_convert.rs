@@ -599,7 +599,12 @@ fn build_array(
 
 // ─── DECIMAL → Decimal128 / Decimal256 ───────────────────────────────────────
 
-/// Build a `Decimal128Array` from MySQL DECIMAL column bytes (text protocol).
+/// Build a `Decimal128Array` from MySQL DECIMAL column bytes (text protocol),
+/// or from a MySQL integer column when the operator declared a Decimal override.
+/// Integer-source path: a column override (e.g. `c_bigint_u: decimal(20,0)`)
+/// against `BIGINT UNSIGNED` lets unsigned values up to `u64::MAX` ride as
+/// Decimal128 — Snowflake and BigQuery both reject Parquet UINT64 > 2^63-1
+/// from the raw INT64 view, so this is the canonical workaround for that.
 fn mysql_decimal_to_decimal128(
     precision: u8,
     scale: i8,
@@ -624,6 +629,28 @@ fn mysql_decimal_to_decimal128(
                     }
                 }
             }
+            Some(Value::Int(v)) => match scale_int_to_i128(*v as i128, scale) {
+                Some(scaled) => b.append_value(scaled),
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "decimal({},{}) overflow scaling integer {}",
+                        precision,
+                        scale,
+                        v
+                    ));
+                }
+            },
+            Some(Value::UInt(v)) => match scale_int_to_i128(*v as i128, scale) {
+                Some(scaled) => b.append_value(scaled),
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "decimal({},{}) overflow scaling unsigned integer {}",
+                        precision,
+                        scale,
+                        v
+                    ));
+                }
+            },
             _ => b.append_null(),
         }
     }
@@ -632,7 +659,21 @@ fn mysql_decimal_to_decimal128(
     ))
 }
 
-/// Build a `Decimal256Array` for precision > 38.
+/// Scale an integer value (already widened to `i128`) by `10^scale` for
+/// storage as a fixed-point Decimal. Returns `None` on overflow or negative
+/// scale (Arrow's Parquet writer rejects negative scale at the time of writing,
+/// so callers should not try to materialize one).
+fn scale_int_to_i128(v: i128, scale: i8) -> Option<i128> {
+    if scale < 0 {
+        return None;
+    }
+    10i128
+        .checked_pow(scale as u32)
+        .and_then(|mult| v.checked_mul(mult))
+}
+
+/// Build a `Decimal256Array` for precision > 38. Same integer-override
+/// handling as `mysql_decimal_to_decimal128`.
 fn mysql_decimal_to_decimal256(
     precision: u8,
     scale: i8,
@@ -658,6 +699,28 @@ fn mysql_decimal_to_decimal256(
                     }
                 }
             }
+            Some(Value::Int(v)) => match scale_int_to_i128(*v as i128, scale) {
+                Some(scaled) => b.append_value(i256::from_i128(scaled)),
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "decimal({},{}) overflow scaling integer {}",
+                        precision,
+                        scale,
+                        v
+                    ));
+                }
+            },
+            Some(Value::UInt(v)) => match scale_int_to_i128(*v as i128, scale) {
+                Some(scaled) => b.append_value(i256::from_i128(scaled)),
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "decimal({},{}) overflow scaling unsigned integer {}",
+                        precision,
+                        scale,
+                        v
+                    ));
+                }
+            },
             _ => b.append_null(),
         }
     }
