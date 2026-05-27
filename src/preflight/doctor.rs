@@ -106,6 +106,14 @@ pub fn doctor(config_path: &str) -> Result<()> {
 fn check_source_auth(config: &Config) -> Result<()> {
     let url = config.source.resolve_url()?;
     let tls = config.source.tls.as_ref();
+    // `doctor` is meant to surface security misconfigurations *before*
+    // the operator runs a real export. Plaintext-source connections are
+    // a security misconfiguration; the warn was previously only
+    // emitted from `create_source` (the `run` path), so an operator
+    // could pass `doctor` clean and only learn about the TLS gap on
+    // first `rivet run`. The helper is `Once`-gated so duplicate calls
+    // from later phases don't restack the line.
+    crate::source::warn_if_tls_disabled(&config.source);
     match config.source.source_type {
         SourceType::Postgres => {
             let mut client = crate::source::postgres::connect_client(&url, tls)?;

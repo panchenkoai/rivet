@@ -119,6 +119,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     destination::log_capabilities(
         &plan.export_name,
         &**shared_destination,
+        plan.destination.destination_type,
         plan.tuning.max_retries,
     );
 

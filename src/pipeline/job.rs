@@ -191,6 +191,7 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
         compression: String::new(),
         source_count: None,
         pg_temp_bytes_delta: None,
+        skip_reason: None,
         reconciled: None,
         manifest_parts: Vec::new(),
         schema_fingerprint: None,

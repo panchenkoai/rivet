@@ -154,7 +154,21 @@ pub trait Destination: Send + Sync {
 
 /// Log destination capabilities at DEBUG level and emit a WARN when the backend is not
 /// retry-safe but retries are configured.  Call once per export after `create_destination`.
-pub fn log_capabilities(export_name: &str, dest: &dyn Destination, max_retries: u32) {
+///
+/// `dest_kind` lets the WARN distinguish "partial file overwritten on next
+/// retry" (local) from "partial output stream that can never be reverted"
+/// (stdout). For `local` the previous warning fired on every run with the
+/// default destination (the canonical dev/test target), training operators
+/// to ignore it; `idempotent_overwrite` already guarantees a clean
+/// rewrite on retry, so the partial-file window is benign — demote to
+/// DEBUG. `stdout` keeps the WARN because a duplicate / corrupt output
+/// stream cannot be undone.
+pub fn log_capabilities(
+    export_name: &str,
+    dest: &dyn Destination,
+    dest_kind: crate::config::DestinationType,
+    max_retries: u32,
+) {
     let caps = dest.capabilities();
     log::debug!(
         "export '{}': destination commit_protocol={:?} idempotent={} retry_safe={} partial_risk={}",
@@ -165,12 +179,26 @@ pub fn log_capabilities(export_name: &str, dest: &dyn Destination, max_retries: 
         caps.partial_write_risk,
     );
     if !caps.retry_safe && max_retries > 0 {
-        log::warn!(
-            "export '{}': destination is not retry-safe (max_retries={}); \
-             partial artifacts may exist at destination on failure — manual cleanup may be needed",
-            export_name,
-            max_retries,
-        );
+        // Local destination: partial file is overwritten cleanly on the
+        // next attempt (`idempotent_overwrite == true`). The warn was a
+        // false alarm for the most common dev/test setup — log at DEBUG
+        // so it's still discoverable for forensics.
+        if matches!(dest_kind, crate::config::DestinationType::Local) {
+            log::debug!(
+                "export '{}': local destination is not formally retry-safe \
+                 (fs::copy can leave a partial file on crash), but \
+                 idempotent_overwrite=true means the next retry rewrites \
+                 the file cleanly — no operator action needed",
+                export_name,
+            );
+        } else {
+            log::warn!(
+                "export '{}': destination is not retry-safe (max_retries={}); \
+                 partial artifacts may exist at destination on failure — manual cleanup may be needed",
+                export_name,
+                max_retries,
+            );
+        }
     }
 }
 
@@ -229,17 +257,50 @@ mod tests {
 
     #[test]
     fn log_capabilities_retry_safe_no_panic() {
-        log_capabilities("orders", &atomic_safe(), 3);
+        // Any non-local dest kind exercises the WARN branch when the
+        // backend reports retry_safe=false; here retry_safe=true so the
+        // branch is skipped — kind is irrelevant.
+        log_capabilities(
+            "orders",
+            &atomic_safe(),
+            crate::config::DestinationType::S3,
+            3,
+        );
     }
 
     #[test]
     fn log_capabilities_not_retry_safe_with_retries_no_panic() {
-        log_capabilities("orders", &streaming_unsafe(), 3);
+        // Stdout: WARN actually fires (idempotent overwrite not available).
+        log_capabilities(
+            "orders",
+            &streaming_unsafe(),
+            crate::config::DestinationType::Stdout,
+            3,
+        );
+    }
+
+    #[test]
+    fn log_capabilities_local_unsafe_demoted_to_debug() {
+        // Local destination is formally not retry-safe but idempotent
+        // overwrite makes the partial-file window benign; WARN must be
+        // demoted to DEBUG so it stops nagging dev/test workflows. No
+        // panic + no observable WARN in the default log level.
+        log_capabilities(
+            "orders",
+            &streaming_unsafe(),
+            crate::config::DestinationType::Local,
+            3,
+        );
     }
 
     #[test]
     fn log_capabilities_zero_retries_no_panic() {
-        log_capabilities("orders", &streaming_unsafe(), 0);
+        log_capabilities(
+            "orders",
+            &streaming_unsafe(),
+            crate::config::DestinationType::Stdout,
+            0,
+        );
     }
 
     // ── create_destination — local roundtrip ─────────────────────────────────

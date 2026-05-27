@@ -258,6 +258,15 @@ pub(super) fn run_single_export(
     if sink.total_rows == 0 {
         if plan.skip_empty {
             summary.status = "skipped".into();
+            // Attach a short, mode-specific reason so the operator can see
+            // *why* nothing was written, not just `status: skipped` with
+            // an empty surrounding. Incremental no-op is the common case
+            // (no rows past the recorded cursor); other modes get a
+            // generic 0-rows note.
+            summary.skip_reason = Some(match plan.strategy.cursor_column() {
+                Some(col) => format!("no new rows since cursor '{col}'"),
+                None => "source returned 0 rows".into(),
+            });
             log::info!(
                 "export '{}': skipped (0 rows, skip_empty=true)",
                 plan.export_name
@@ -280,7 +289,12 @@ pub(super) fn run_single_export(
     let dest = destination::create_destination(&plan.destination)?;
 
     // ADR-0004: log backend capabilities; warn when non-retry-safe destination is configured with retries.
-    destination::log_capabilities(&plan.export_name, dest.as_ref(), plan.tuning.max_retries);
+    destination::log_capabilities(
+        &plan.export_name,
+        dest.as_ref(),
+        plan.destination.destination_type,
+        plan.tuning.max_retries,
+    );
 
     let has_parts = sink.completed_parts.len() > 1;
     let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");

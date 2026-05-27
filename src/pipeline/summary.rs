@@ -100,6 +100,12 @@ pub struct RunSummary {
     /// shrink `tuning.batch_size` or set `tuning.batch_size_memory_mb` below
     /// PG's `work_mem`.
     pub pg_temp_bytes_delta: Option<i64>,
+    /// Human-readable parenthetical attached to `status: skipped` so the
+    /// operator knows *why* there was nothing to export this run (e.g.
+    /// `"no new rows since cursor 'updated_at'"`). Always `None` when
+    /// `status != "skipped"`. Surfaced in the console summary card as
+    /// `status: skipped (<reason>)`.
+    pub skip_reason: Option<String>,
     /// Source COUNT(*) result for reconciliation (None = not requested or not applicable).
     pub source_count: Option<i64>,
     /// Whether reconciliation passed (Some(true) = match, Some(false) = mismatch, None = skipped).
@@ -177,6 +183,7 @@ impl RunSummary {
             mode: plan.strategy.mode_label().to_string(),
             compression: plan.compression.label().to_string(),
             pg_temp_bytes_delta: None,
+            skip_reason: None,
             source_count: None,
             reconciled: None,
             manifest_parts: Vec::new(),
@@ -235,6 +242,7 @@ impl RunSummary {
             mode: "snapshot".into(),
             compression: "zstd".into(),
             pg_temp_bytes_delta: None,
+            skip_reason: None,
             source_count: None,
             reconciled: None,
             manifest_parts: Vec::new(),
@@ -411,7 +419,11 @@ impl RunSummary {
         // look uniform regardless of which optional fields are present.
         let mut rows: Vec<(&'static str, String)> = Vec::with_capacity(16);
         rows.push(("run_id", self.run_id.clone()));
-        rows.push(("status", self.status.clone()));
+        let status_value = match (&self.status, &self.skip_reason) {
+            (s, Some(reason)) if s == "skipped" => format!("{s} ({reason})"),
+            (s, _) => s.clone(),
+        };
+        rows.push(("status", status_value));
 
         let tuning_value = match self.batch_size_memory_mb {
             Some(mem) => format!(
