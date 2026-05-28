@@ -96,6 +96,30 @@ impl PipelinedSink {
         })
     }
 
+    /// Test-only: wrap an already-built `ExportSink` (bypasses plan
+    /// construction). Same worker loop as `spawn`.
+    #[cfg(test)]
+    pub(crate) fn spawn_with_sink(sink: ExportSink) -> Self {
+        let (tx, rx) = sync_channel::<SinkMsg>(DEFAULT_CHANNEL_DEPTH);
+        let worker = std::thread::Builder::new()
+            .name("rivet-encode-test".to_string())
+            .spawn(move || -> Result<ExportSink> {
+                let mut sink = sink;
+                while let Ok(msg) = rx.recv() {
+                    match msg {
+                        SinkMsg::Schema(s) => sink.on_schema(s)?,
+                        SinkMsg::Batch(b) => sink.on_batch(&b)?,
+                    }
+                }
+                Ok(sink)
+            })
+            .expect("spawn test encode worker");
+        Self {
+            tx: Some(tx),
+            worker: Some(worker),
+        }
+    }
+
     fn send(&mut self, msg: SinkMsg) -> Result<()> {
         match self.tx.as_ref() {
             // A send error means the worker hit an error and dropped the
