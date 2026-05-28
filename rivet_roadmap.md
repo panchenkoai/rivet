@@ -433,7 +433,7 @@ Real pain, but infrastructure/security complexity is non-trivial.
 
 ## Epic 14 — Narrow Warehouse Load Layer
 **Priority:** P3 → **P1 (in progress)**  
-**Status:** ✅ Partial — type system, type report, strict mode, BigQuery compat layer, complex types (M1–M6 complete); load path (Parquet → BQ) = future  
+**Status:** ✅ Partial — type system, type report, strict mode, BigQuery compat layer, complex types (M1–M6 complete); **v0.7.8 Type Roundtrip Proof shipped** (Phase 1 of the type/verify/UX track — 4 independent reader validators + native Parquet UUID/JSON logical types + type-fidelity benchmark); load path (Parquet → BQ) = future  
 **Pain coverage:** Pain C, Pain E
 
 ### Goal
@@ -446,6 +446,9 @@ Add a narrow, compatibility-aware path from extracted files into selected wareho
 - ✅ strict/permissive mapping policy (`TypePolicy`, `--strict` flag)
 - ✅ column type overrides (`columns:` YAML block)
 - ✅ complex types: Enum, Interval, List (Postgres); Enum/SET, TIME, arrays (MySQL)
+- ✅ **type roundtrip proof (v0.7.8)** — PG/MySQL → Parquet/CSV matrix tested through 4 independent readers (DuckDB, ClickHouse, pyarrow, BigQuery), 31 live tests in `tests/type_roundtrip/`, `make test-types-validators`. Documented in [`docs/type-mapping.md`](docs/type-mapping.md), [ADR-0014](docs/adr/0014-target-type-materialization.md), and per-tool benchmark reports under [`docs/bench/reports/REPORT_types*.md`](docs/bench/reports/)
+- ✅ **native Parquet logical types (v0.7.8)** — UUID → `FixedSizeBinary(16) + LogicalType::Uuid` via `arrow.uuid` extension; JSON → `LogicalType::Json` via `arrow.json` extension. Downstream engines (DuckDB, ClickHouse 25.x+, pyarrow) recognise UUID/JSON natively without a cast; BigQuery autoload promotes UUID→BYTES exact (one documented gap: BQ does not lift `LogicalType::Json` to native `JSON` without an explicit `--schema=attrs:JSON`)
+- ✅ **MySQL driver fidelity fixes (v0.7.8)** — PG arrays preserve NULL elements; MySQL `ENUM`/`SET` flag detection so `rivet.logical_type=enum` survives; `native_type` distinguishes UNSIGNED, `TINYINT(1)`, `BIT(1)`, CHAR vs VARCHAR, BINARY vs VARBINARY
 - ⏳ direct load path (write Parquet files directly into BigQuery) = future
 
 ### Why this matters
@@ -960,6 +963,7 @@ Prioritize by stabilization before distribution polish:
 6. ✅ **Parallel export processes** — `--parallel-export-processes` with live cards UI (v0.3.4).
 7. ✅ **Cards UI for `--parallel-exports`** — unified cards renderer + compact summaries (v0.3.5).
 8. ✅ **Type safety layer M1–M6** — `rivet check --type-report`, `TypePolicy`, BigQuery compat, complex types (Enum/Interval/List).
+9. ✅ **Type Roundtrip Proof (v0.7.8)** — PG/MySQL → Parquet/CSV preserved through 4 independent reader validators (DuckDB, ClickHouse, pyarrow, BigQuery); native Parquet `LogicalType::Uuid` / `LogicalType::Json` via `arrow.uuid` / `arrow.json` extension types; 31 live tests; cross-tool fidelity benchmark. Three real driver bugs fixed along the way: PG arrays losing NULL elements, MySQL ENUM/SET misclassified as String, MySQL `native_type` collapsing UNSIGNED / `TINYINT(1)` / `BIT(1)` / CHAR / VARCHAR variants.
 
 **Remaining open items (P1 first):**
 
@@ -968,6 +972,41 @@ Prioritize by stabilization before distribution polish:
 3. ✅ **F5 + I5** — reconcile/validate tradeoffs (cli.md); capacity/memory planning (tuning.md).
 4. ✅ **I2** — `cargo bench` + `dev/scripts/bench.sh` save/compare harness; column_scan + shape_tracking groups.
 5. ✅ **Epic 4 (§5)** — external/durable state backend: `RIVET_STATE_URL` PostgreSQL backend shipped.
+6. ⏳ **Verify / Validation Layer (v0.7.9, next focus)** — new top-level `rivet verify` command answering *"are produced files + manifest + state + summary internally consistent?"*. Three depth levels (light file/size/schema-hash check → sample row read → full file scan), stable error codes `RIVET_VERIFY_*`, read-only (mutating fixes stay in `repair`). Catches missing/partial files, size mismatch, orphan output, manifest/state divergence, schema-hash mismatch. JSON output for automation. Builds on the Type Roundtrip Proof: type contract is now provable, next we need *artifact* consistency to be provable too. **Design open:** extend existing `--validate` (per ADR-0013 "no new flags") vs new top-level `rivet verify` command — pick before implementation.
+7. ⏳ **Operator UX & Diagnostics (v0.8.0)** — structured diagnostics with stable codes (`RIVET_CONFIG_*`, `RIVET_SOURCE_*`, `RIVET_VERIFY_*`, …), severity (low / medium / high / blocking), actionable hints; `--json` everywhere; strategy explanation in `rivet plan` (why this chunk size, why this mode, what risk remains); `doctor` capability + blocker report.
+
+### 9.6.1 UX hardening backlog (v0.7.8 walk-through findings)
+
+The fast-track + pilot blessed-path walk in the v0.7.8 session found three
+P1-class bugs (already fixed and folded into item 9 above) plus a longer
+list of P2/P3 friction worth addressing while polishing for v0.7.9 /
+v0.8.0. Each line is one focused change; pick off in order or interleave
+with verify-layer work as bandwidth allows.
+
+**Fixed in v0.7.8 session** (evidence in [`src/preflight/{postgres,mysql,analysis}.rs`](src/preflight/), [`src/config/source.rs`](src/config/source.rs), [`src/pipeline/cli.rs`](src/pipeline/cli.rs), [`src/pipeline/chunked/{sequential,parallel}_checkpoint.rs`](src/pipeline/chunked/)):
+
+- ✅ `rivet check` no longer reports "No index detected" for indexed `chunk_column` / `cursor_column` — catalog-based btree probe overrides the EXPLAIN-of-base-query heuristic; verdict thresholds relaxed so indexed > 10 M rows is ACCEPTABLE not DEGRADED.
+- ✅ `WARN: source URL contains plaintext password` no longer fires when the user already chose `url_env:` / `url_file:` — only inline `url:` (the misconfig case) triggers it.
+- ✅ `rivet state show` after chunked-only runs no longer says "No export state recorded yet" — distinguishes "never ran" from "ran chunked, look at metrics / state files" and prints the right next-step pointer.
+- ✅ `summary.retries` now actually increments in chunked exports (sequential + parallel paths) — was silently stuck at 0, masking flaky-link runs that only worked because backoff covered for them. Visible in console summary card, `rivet metrics`, and `export_metrics.retries`.
+
+**P2 — friction, not bugs** (tackle before v0.7.9 release if time permits):
+
+- ⏳ **`check` verdict pessimism vs actual run.** UNSAFE / DEGRADED predicts high RSS on parallel reads against no-index tables, but the actual run frequently sits well under the predicted budget (e.g. 10 M-row chunked-parallel orders ran in 12 s at 117 MB RSS while check said UNSAFE). Either make the predictor use estimated row width + chunk batch size for a tighter bound, or downgrade UNSAFE to DEGRADED when the verdict can't show a concrete budget breach.
+- ⏳ **`destination is not retry-safe` WARN spams local-destination runs.** `type: local` is the canonical dev/test destination but each run prints a retry-safety WARN. Either suppress for `local` (partial artifact = one failed-rewrite file, not silent data loss) or have `rivet init` add the right opt-in so the warn does not fire on defaults.
+- ⏳ **TLS warning only in `run`, not in `doctor`/`check`.** Security warnings should surface in preflight commands — that's what `doctor` is for. Today the operator only learns about the missing `tls:` block when they start a real extract.
+- ⏳ **`rivet init --schema X` includes ad-hoc / test tables.** Schema-wide init dumps every relation in the schema (140 entries in our dev DB, most of them leftover test artifacts). Add an `--exclude '<glob>'` flag or a heuristic that skips tables whose names match common temp/test patterns (`tmp_*`, `*_temp`, tables with PID-shaped suffixes).
+
+**P3 — polish & doc clarity** (good v0.8.0 fodder):
+
+- ⏳ **`rivet init` does not explain *why* it picked a mode.** Generated YAML says `mode: chunked` but not "(auto-selected because rows estimate ≥ 500 K)". One-line inline comment in the rendered config would close the loop.
+- ⏳ **`rivet journal --export X` does not show retry events.** Doc promises "per-run events / retries / quality issues"; today it only shows status + duration. Plumb per-chunk retry attempts into the structured journal so post-mortem doesn't require digging in stderr WARNs.
+- ⏳ **100 files per 10 M-row chunked export.** Default `chunk_size: 100_000` × big table = many small files. `rivet init` could scale `chunk_size` logarithmically with the row estimate (e.g. ≥ 10 M → 1 M chunk_size) so default file counts stay reasonable.
+- ⏳ **`status: skipped` summary is sparse.** Incremental-mode skipped run shows `status: skipped` with no context; add `(no new rows since cursor <X>)` so the operator does not have to guess.
+- ⏳ **Doc note: re-running `chunked` re-extracts everything.** `--resume` skips completed chunks after a crash, but a clean re-run re-does the full table. Worth one paragraph in `modes/chunked.md` so operators do not assume idempotency.
+- ⏳ **Doc note: `time_window` re-runs duplicate output.** Rolling window mode does not persist "we did this window already", so frequent re-runs produce duplicate files. Worth a paragraph in `modes/time-window.md`.
+- ⏳ **Retry / I3 (Write Before Cursor) at-least-once dupe scenario** not yet covered by tests. The contract documents the duplicate possibility (`ADR-0001 I3`), and toxiproxy-based retry testing showed counters work; a dedicated SIGKILL-between-write-and-commit recovery test would pin the actual dupe behavior end-to-end.
+- ⏳ **Stale roadmap items inherited from earlier sessions:** "2–3 pilot tables repeated on a schedule" in §9.7 (organizational), release checksums / SBOM / signed release attestations (also §9.7 unchecked).
 
 ---
 
@@ -984,6 +1023,7 @@ Prioritize by stabilization before distribution polish:
 - [x] Plan/Apply workflow — sealed execution artifacts, ADR-0005
 - [x] Parallel exports — `--parallel-exports` + `--parallel-export-processes` with live cards UI
 - [x] Type safety layer — `--type-report`, TypePolicy, BigQuery compat, complex types (M1–M6)
+- [x] **Type roundtrip proof (v0.7.8)** — PG/MySQL × Parquet/CSV validated through DuckDB + ClickHouse + pyarrow + BigQuery; native Parquet `LogicalType::Uuid` / `LogicalType::Json`; `make test-types-validators`; per-tool fidelity benchmark in [`docs/bench/reports/`](docs/bench/reports/)
 - [x] Schema drift policy hooks — `on_schema_drift: warn|continue|fail` (Epic 7)
 - [x] Data shape drift detection — string/text width tracking (Epic 8)
 - [ ] 2–3 pilot tables repeated on a schedule *(organizational; optional automation K2)*

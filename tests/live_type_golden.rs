@@ -364,7 +364,15 @@ exports:
 
 #[test]
 #[ignore = "live: requires docker compose postgres"]
-fn golden_uuid_utf8_roundtrip_expected_canonical_lower() {
+fn golden_uuid_fixed_size_binary_roundtrip_canonical_bytes() {
+    // Renamed from `golden_uuid_utf8_roundtrip_expected_canonical_lower` —
+    // v0.7.8 switched the Arrow representation of `RivetType::Uuid` from
+    // `Utf8` (36-char hyphenated text) to `FixedSizeBinary(16)` so that
+    // parquet-rs emits native `LogicalType::Uuid` via the `arrow.uuid`
+    // canonical extension. Bytes round-trip exactly; downstream readers
+    // (DuckDB / ClickHouse 25.x / pyarrow / BigQuery autodetect) recover
+    // the UUID type without a cast. Test now reads the 16 raw bytes and
+    // re-renders them as the canonical hyphenated form before comparing.
     require_alive(LiveService::Postgres);
 
     let table_name = unique_name("golden_uid");
@@ -408,25 +416,30 @@ exports:
     let files = files_with_extension(out_dir.path(), "parquet");
     let (_, batches) = read_parquet_batches(&files[0]);
 
-    let col = batches[0]
-        .column_by_name("uid")
-        .unwrap()
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .expect("uuid maps to Utf8");
     assert!(matches!(
         batches[0]
             .schema()
             .field_with_name("uid")
             .unwrap()
             .data_type(),
-        DataType::Utf8
+        DataType::FixedSizeBinary(16)
     ));
 
+    let col = batches[0]
+        .column_by_name("uid")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+        .expect("uuid now maps to FixedSizeBinary(16)");
+
+    let bytes = col.value(0);
+    assert_eq!(bytes.len(), 16, "UUID is 16 bytes");
+    let mut arr = [0u8; 16];
+    arr.copy_from_slice(bytes);
     assert_eq!(
-        col.value(0),
+        uuid::Uuid::from_bytes(arr).to_hyphenated().to_string(),
         "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380011",
-        "PostgreSQL canonical uuid text form must survive export"
+        "PostgreSQL canonical uuid bytes must round-trip via FixedSizeBinary(16)"
     );
 }
 
@@ -981,14 +994,23 @@ exports:
     assert_eq!(rb.value(2), &[0xca, 0xfe]);
     assert_eq!(rb.value(3), &[0x00]);
 
+    // UUID is now `FixedSizeBinary(16)` (was Utf8) — see
+    // `golden_uuid_fixed_size_binary_roundtrip_canonical_bytes` for the
+    // single-column variant + rationale. Read raw bytes, hex-render for
+    // the comparison so the test still pins the canonical UUID value.
     let uid_arr = b
         .column_by_name("uid")
         .unwrap()
         .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    assert_eq!(uid_arr.value(0), "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380011");
-    assert_eq!(uid_arr.value(3), "d0eebc99-9c0b-4ef8-bb6d-6bb9bd380044");
+        .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+        .expect("uuid maps to FixedSizeBinary(16)");
+    let to_str = |idx: usize| {
+        let mut a = [0u8; 16];
+        a.copy_from_slice(uid_arr.value(idx));
+        uuid::Uuid::from_bytes(a).to_hyphenated().to_string()
+    };
+    assert_eq!(to_str(0), "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380011");
+    assert_eq!(to_str(3), "d0eebc99-9c0b-4ef8-bb6d-6bb9bd380044");
 
     let attrs = b
         .column_by_name("attrs")

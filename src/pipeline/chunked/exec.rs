@@ -255,6 +255,7 @@ pub(crate) fn run_chunked_parallel(
     destination::log_capabilities(
         &plan.export_name,
         &**shared_destination,
+        plan.destination.destination_type,
         plan.tuning.max_retries,
     );
 

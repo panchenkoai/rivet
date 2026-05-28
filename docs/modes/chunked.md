@@ -128,6 +128,25 @@ rivet state chunks --config large_table.yaml --export orders_chunked
 rivet state reset-chunks --config large_table.yaml --export orders_chunked
 ```
 
+### Clean re-runs are NOT idempotent
+
+Chunked mode is **not** "extract once, skip on the next clean run". Two
+plain `rivet run` invocations against the same table re-extract every
+chunk both times — `chunk_checkpoint: true` only matters for `--resume`
+after a crashed run. Each clean run produces a new file set with a
+fresh `run_id` and timestamp suffix.
+
+| Invocation | Behaviour |
+|---|---|
+| `rivet run` (fresh) | extracts all chunks, writes files with `run_id` A |
+| `rivet run` (again, no crash) | extracts all chunks **again**, writes files with `run_id` B |
+| `rivet run --resume` (after a crash) | extracts only the chunks `chunk_state` says are incomplete |
+
+If you want skip-on-no-change semantics, use **`mode: incremental`**
+with a `cursor_column` instead — that mode persists the cursor between
+runs and uses `skip_empty: true` to avoid emitting files when nothing
+new arrived.
+
 ## Chunk sizing guidance
 
 | Table size | Suggested `chunk_size` | `parallel` |

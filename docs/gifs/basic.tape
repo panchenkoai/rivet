@@ -19,6 +19,8 @@ Set Theme "Dracula"
 Hide
 Type `export PATH=$RIVET_BIN_DIR:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`
 Enter
+Type "export RUST_LOG=error"
+Enter
 Type `export PS1='rivet-demo $ '`
 Enter
 Type "clear"
@@ -49,7 +51,7 @@ Sleep 2500ms
 
 Type "rivet run --config orders.yaml --validate --reconcile"
 Enter
-Sleep 3s
+Sleep 12s
 
 Type "rivet state show --config orders.yaml"
 Enter

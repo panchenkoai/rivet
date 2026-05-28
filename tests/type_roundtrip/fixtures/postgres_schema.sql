@@ -1,0 +1,32 @@
+-- Extended PostgreSQL type matrix (docs + roadmap edge cases).
+-- Requires companion enum type: CREATE TYPE {enum_type} AS ENUM (...);
+CREATE TABLE {table_name} (
+    id BIGINT PRIMARY KEY,
+    c_smallint SMALLINT NOT NULL,
+    c_integer INTEGER NOT NULL,
+    c_bigint BIGINT NOT NULL,
+    amount NUMERIC(18, 2),
+    fee NUMERIC(20, 6),
+    price NUMERIC(10, 2),
+    c_real REAL NOT NULL,
+    c_double DOUBLE PRECISION NOT NULL,
+    c_date DATE NOT NULL,
+    c_time TIME NOT NULL,
+    created_at TIMESTAMP NOT NULL,
+    created_at_tz TIMESTAMPTZ NOT NULL,
+    label TEXT NOT NULL,
+    c_varchar VARCHAR(50) NOT NULL,
+    c_bpchar CHAR(10) NOT NULL,
+    raw_bytes BYTEA NOT NULL,
+    uid UUID NOT NULL,
+    attrs JSONB,
+    attrs_json JSON NOT NULL,
+    c_bool BOOLEAN NOT NULL,
+    interval_col INTERVAL NOT NULL,
+    enum_col {enum_type} NOT NULL,
+    tags TEXT[] NOT NULL,
+    nums INTEGER[] NOT NULL,
+    large_text TEXT NOT NULL,
+    note_nullable TEXT,
+    note_all_null TEXT
+);

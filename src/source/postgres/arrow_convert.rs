@@ -23,8 +23,9 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Decimal256Builder,
-    Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, ListBuilder,
-    StringBuilder, Time64MicrosecondBuilder, TimestampMicrosecondBuilder,
+    FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder,
+    Int64Builder, ListBuilder, StringBuilder, Time64MicrosecondBuilder,
+    TimestampMicrosecondBuilder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -42,14 +43,21 @@ use crate::types::{
 
 // ─── Wire-type adapters ──────────────────────────────────────────────────────
 
-/// Canonical hyphenated lowercase UUID strings from PostgreSQL `uuid` rows.
+/// PostgreSQL `uuid` rows materialised as their canonical 16-byte form.
 ///
-/// Servers usually send UUIDs as 16 raw bytes under the binary protocol, but defensive
-/// text parsing avoids silent null exports if a client ever exposes the text form.
+/// Targets Arrow `FixedSizeBinary(16)` per ADR-0014: with the `arrow.uuid`
+/// extension type attached in [`crate::types::mapping::build_arrow_field`],
+/// parquet-rs emits native `LogicalType::Uuid` and downstream engines
+/// (DuckDB, ClickHouse, pyarrow, BigQuery autodetect) recover UUID
+/// semantics without a cast.
+///
+/// Most servers transmit UUIDs as 16 raw bytes under the binary protocol;
+/// the text branch covers the rare client/proxy that surfaces the
+/// hyphenated form instead, so we never silently null an export.
 #[derive(Clone)]
-struct PgUuidDisplayed(String);
+struct PgUuidBytes([u8; 16]);
 
-impl<'a> PgFromSql<'a> for PgUuidDisplayed {
+impl<'a> PgFromSql<'a> for PgUuidBytes {
     fn accepts(ty: &Type) -> bool {
         ty == &Type::UUID
     }
@@ -59,13 +67,12 @@ impl<'a> PgFromSql<'a> for PgUuidDisplayed {
         raw: &'a [u8],
     ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
         if raw.len() == 16 {
-            let uuid = uuid::Uuid::from_slice(raw)?;
-            return Ok(Self(uuid.to_hyphenated().to_string()));
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(raw);
+            return Ok(Self(bytes));
         }
         let text = simdutf8::basic::from_utf8(raw)?.trim();
-        Ok(Self(
-            uuid::Uuid::parse_str(text)?.to_hyphenated().to_string(),
-        ))
+        Ok(Self(*uuid::Uuid::parse_str(text)?.as_bytes()))
     }
 }
 
@@ -474,13 +481,17 @@ fn build_array(
             }
             Ok(Arc::new(b.finish().with_timezone("UTC")))
         }
-        // UUID: hyphenated Utf8 (`uuid::Uuid` only covers the 16‑byte encoding).
+        // UUID: 16-byte FixedSizeBinary so the `arrow.uuid` extension type
+        // attached upstream lets parquet-rs emit native `LogicalType::Uuid`
+        // (see ADR-0014 §4 and [`crate::types::mapping::build_arrow_field`]).
         Type::UUID => {
-            let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 48);
+            let mut b = FixedSizeBinaryBuilder::with_capacity(rows.len(), 16);
             for row in rows {
-                match row.try_get::<_, Option<PgUuidDisplayed>>(col_idx)? {
+                match row.try_get::<_, Option<PgUuidBytes>>(col_idx)? {
                     None => b.append_null(),
-                    Some(display) => b.append_value(&display.0),
+                    Some(PgUuidBytes(bytes)) => b
+                        .append_value(bytes)
+                        .expect("16 bytes always matches FixedSizeBinary(16)"),
                 }
             }
             Ok(Arc::new(b.finish()))
@@ -581,14 +592,27 @@ fn build_pg_list_array(
         anyhow::bail!("build_pg_list_array called with non-List target type");
     };
 
+    // PG arrays can legally contain NULL elements (`ARRAY[1, NULL, 3]`).
+    // The `postgres` crate's `Vec<T>` deserializer rejects such arrays with
+    // an error; `try_get::<Vec<T>>` then returns `Err`, the `.ok().flatten()`
+    // collapses that to `None`, and a *whole-row NULL* gets written — silent
+    // data loss. The fix is to deserialize as `Vec<Option<T>>` so NULL inner
+    // elements survive into the Arrow `ListBuilder` via `append_null()`.
     macro_rules! list_of {
         ($T:ty, $Builder:ty) => {{
             let mut lb = ListBuilder::new(<$Builder>::new());
             for row in rows {
-                match row.try_get::<_, Option<Vec<$T>>>(col_idx).ok().flatten() {
+                match row
+                    .try_get::<_, Option<Vec<Option<$T>>>>(col_idx)
+                    .ok()
+                    .flatten()
+                {
                     Some(v) => {
                         for x in &v {
-                            lb.values().append_value(*x);
+                            match x {
+                                Some(val) => lb.values().append_value(*val),
+                                None => lb.values().append_null(),
+                            }
                         }
                         lb.append(true);
                     }
@@ -610,13 +634,16 @@ fn build_pg_list_array(
             let mut lb = ListBuilder::new(StringBuilder::new());
             for row in rows {
                 match row
-                    .try_get::<_, Option<Vec<String>>>(col_idx)
+                    .try_get::<_, Option<Vec<Option<String>>>>(col_idx)
                     .ok()
                     .flatten()
                 {
                     Some(v) => {
                         for s in &v {
-                            lb.values().append_value(s);
+                            match s {
+                                Some(val) => lb.values().append_value(val),
+                                None => lb.values().append_null(),
+                            }
                         }
                         lb.append(true);
                     }

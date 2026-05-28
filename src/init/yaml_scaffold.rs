@@ -283,17 +283,27 @@ fn export_block_lines(
         lines.push(format!("      SELECT {col_list}"));
         lines.push(format!("      FROM {qualified_table}"));
     }
+    // Inline rationale above `mode:` so the operator can see *why* this
+    // mode got picked, not just *what*. Easy to delete; the suggestion
+    // is documentation, not a contract.
+    lines.push(format!("    # {}", info.mode_rationale(mode)));
     lines.push(format!("    mode: {mode}"));
 
     match mode {
         "chunked" => {
             let chunk_col = info.best_chunk_column().unwrap_or("id");
             let parallel = suggest_parallel(info.row_estimate);
+            let chunk_size = info.suggest_chunk_size();
             lines.push(format!(
                 "    chunk_column: {}",
                 yaml_quote_if_needed(chunk_col)
             ));
-            lines.push("    chunk_size: 100000".to_string());
+            // Scale chunk_size by row estimate so the per-table file count
+            // stays in a humane range. See `TableInfo::suggest_chunk_size`
+            // for the bands. A 10 M-row export used to produce 100 files;
+            // it now lands at ~10. Operators who want different geometry
+            // override this line directly.
+            lines.push(format!("    chunk_size: {chunk_size}"));
             lines.push("    chunk_checkpoint: true".to_string());
             if parallel > 1 {
                 lines.push(format!("    parallel: {parallel}"));

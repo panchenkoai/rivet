@@ -30,6 +30,28 @@
 /// assert_eq!(decimal_str_to_scaled_i128("1200",   -2), Some(12));
 /// assert_eq!(decimal_str_to_scaled_i128("",        2), None);
 /// ```
+/// Format a scaled `Decimal128` value as exact decimal text (no float).
+pub fn scaled_i128_to_decimal_str(value: i128, scale: i8) -> String {
+    if scale < 0 {
+        let factor = 10i128.pow(scale.unsigned_abs() as u32);
+        return (value * factor).to_string();
+    }
+    let scale_u = scale as u32;
+    if scale_u == 0 {
+        return value.to_string();
+    }
+    let factor = 10i128.pow(scale_u);
+    let negative = value < 0;
+    let abs = value.abs();
+    let int_part = abs / factor;
+    let frac = abs % factor;
+    format!(
+        "{sign}{int_part}.{frac:0width$}",
+        sign = if negative { "-" } else { "" },
+        width = scale_u as usize
+    )
+}
+
 pub fn decimal_str_to_scaled_i128(s: &str, scale: i8) -> Option<i128> {
     let s = s.trim();
     if s.is_empty() {
@@ -95,6 +117,14 @@ pub fn decimal_str_to_scaled_i128(s: &str, scale: i8) -> Option<i128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scaled_to_str_roundtrip_financial() {
+        assert_eq!(scaled_i128_to_decimal_str(10, 2), "0.10");
+        assert_eq!(scaled_i128_to_decimal_str(12345, 2), "123.45");
+        assert_eq!(scaled_i128_to_decimal_str(-123, 2), "-1.23");
+        assert_eq!(scaled_i128_to_decimal_str(10_123_456, 6), "10.123456");
+    }
 
     #[test]
     fn standard_financial_values() {

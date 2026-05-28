@@ -1,6 +1,72 @@
 # Changelog
 
-## 0.7.7 (unreleased) — Audit-Gap Closure
+## 0.7.8 (unreleased) — Type Round-Trip Proof + Validation Fidelity
+
+> Proves Parquet type fidelity end-to-end with four independent readers
+> (DuckDB, ClickHouse, pyarrow, BigQuery), emits native Parquet logical
+> types for UUID/JSON, and closes two validation-surface bugs uncovered
+> while walking the documented golden paths.
+
+### Types — native Parquet logical types + round-trip proof
+
+- **`feat(types)`** — UUID columns now emit native Parquet
+  `LogicalType::Uuid` as `FixedSizeBinary(16)` carrying the Arrow canonical
+  `arrow.uuid` extension type; JSON/JSONB carry `arrow.json`. Downstream
+  engines (DuckDB → native `UUID`, ClickHouse → `Nullable(UUID)`,
+  BigQuery) load these without a cast. Enabled via the parquet
+  `arrow_canonical_extension_types` feature. See `src/types/mapping.rs`.
+- **`test(types)`** — four-reader validator matrix: every PG/MySQL type
+  round-trips through Parquet and is read back by DuckDB, ClickHouse,
+  pyarrow, and (live) BigQuery to pin field metadata + row-group stats
+  (`tests/type_roundtrip/`).
+- **`fix(types/mysql)`** — `UNSIGNED BIGINT` (UINT64) overflows `INT64`;
+  now mapped to `Decimal128` so the full range survives.
+
+### Bug fixes — validation surface
+
+- **`fix(pipeline/chunked)`** — the sequential checkpoint path ran
+  `--validate` on every chunk file but never recorded the result, so
+  `mode: chunked` + `chunk_checkpoint: true` + default `parallel: 1` runs
+  stored `validated = NULL` in `export_metrics` and dropped the
+  `validated: pass` line from the run summary. It now sets the flag like
+  the other three export paths (regression test in
+  `tests/live_chunked_recovery.rs`).
+- **`fix(preflight/doctor)`** — `rivet doctor` drops a `.rivet_doctor_probe`
+  writability test object at the destination and never removes it. A
+  subsequent `rivet run --validate` flagged it as an `untracked_object`
+  and downgraded the run to `validated: FAIL`. The probe is now a
+  recognised Rivet sidecar (`manifest::DOCTOR_PROBE_FILENAME`) and skipped
+  by the manifest-aware `--validate` pass (regression test in
+  `src/pipeline/validate_manifest.rs`).
+
+### Preflight + UX
+
+- **`fix(preflight)`** — chunked / incremental exports on an indexed
+  cursor / chunk column no longer report a false `DEGRADED` verdict. A
+  catalog `btree` probe replaces the `EXPLAIN`-on-base-query heuristic, so
+  an indexed PK reads as `ACCEPTABLE` with an `(indexed)` scan-type
+  suffix.
+- **`polish(ux)`** — `rivet init` explains its mode choice inline
+  (`# auto: ~N rows ≥ 100K threshold and chunk column 'id' is available`)
+  and scales `chunk_size` to the row estimate; skipped incremental runs
+  print `status: skipped (no new rows since cursor 'X')`; the plaintext-
+  password and TLS warnings fire from `doctor` / `check`; the retry-safe
+  WARN is demoted to DEBUG for local destinations.
+
+### Docs + assets
+
+- **`docs`** — validated every command in the user-facing guides against
+  the binary; fixed drift (the `file_log` state table, real `rivet doctor`
+  output, the pilot walkthrough's missing `decimal(10,2)` override).
+- **`docs(gifs)`** — regenerated all instructional GIFs against current
+  behavior (card UI, `(indexed)` scan type, `validated: pass`).
+
+### Dependencies
+
+- Bumped `mach2` 0.4 → 0.6, `tikv-jemallocator` 0.6 → 0.7,
+  `criterion` 0.5 → 0.8 (dev), `brotli` 8.0.2 → 8.0.3.
+
+## 0.7.7 (2026-05-26) — Audit-Gap Closure
 
 > Closes the five remaining audit gaps from the 0.7.6 sweep.
 

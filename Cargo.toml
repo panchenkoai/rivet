@@ -1,6 +1,6 @@
 [package]
 name = "rivet-cli"
-version = "0.7.7"
+version = "0.7.8"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
@@ -28,7 +28,14 @@ path = "src/bin/seed/main.rs"
 
 [dependencies]
 anyhow = "1"
-arrow = "58"
+# `canonical_extension_types` enables Arrow's canonical extension wrappers
+# (`arrow_schema::extension::{Uuid, Json}`) — see Cargo dep on `parquet`
+# below for the writer-side pairing.
+arrow = { version = "58", features = ["canonical_extension_types"] }
+# Direct dep on `arrow-schema` so we can use the `extension` module — the
+# `arrow` facade re-exports `DataType` / `Field` but not the `extension`
+# submodule. Version is pinned to match `arrow`'s transitive choice.
+arrow-schema = { version = "58", features = ["canonical_extension_types"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 csv = "1"
@@ -43,7 +50,13 @@ log = "0.4"
 # but TLS support is disabled" — operator-facing panic, no recoverable error.
 mysql = { version = "28", default-features = false, features = ["minimal", "native-tls"] }
 opendal = { version = "0.55", features = ["blocking", "services-fs", "services-s3", "services-gcs", "services-azblob"] }
-parquet = { version = "58", features = ["arrow", "zstd", "lz4", "flate2"] }
+# `arrow_canonical_extension_types` enables parquet-rs to emit native Parquet
+# `LogicalType::Uuid` / `LogicalType::Json` whenever an Arrow field carries the
+# corresponding `arrow.uuid` / `arrow.json` extension type metadata. Without
+# this flag, those columns would fall back to `String` and our downstream
+# autoload story (DuckDB → native UUID, ClickHouse → Nullable(UUID), …)
+# stays one cast away. See `src/types/mapping.rs` for the emission site.
+parquet = { version = "58", features = ["arrow", "zstd", "lz4", "flate2", "arrow_canonical_extension_types"] }
 clap_complete = "4"
 postgres = {
     version = "0.19",
@@ -75,7 +88,7 @@ serde_yaml_ng = "0.10"
 # generated schema diff is reviewable.
 schemars = { version = "1", features = ["preserve_order"] }
 tempfile = "3"
-tikv-jemallocator = { version = "0.6", optional = true }
+tikv-jemallocator = { version = "0.7", optional = true }
 tokio = { version = "1.50.0", features = ["rt-multi-thread"] }
 reqsign = "0.16"
 # Single reqwest version (0.12) shared with the one reqsign 0.16 / opendal pull
@@ -91,12 +104,14 @@ simdutf8 = "0.1"
 zeroize = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-mach2 = "0.4"
+mach2 = "0.6"
 
 [dev-dependencies]
 bytes = "1"
+csv = "1"
 serde_json = "1"
-criterion = { version = "0.5", features = ["html_reports"] }
+serde_yaml_ng = "0.10"
+criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]
 name = "hot_paths"

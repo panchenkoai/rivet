@@ -105,6 +105,8 @@ exports:
     destination:
       type: local
       path: ./output
+    columns:
+      price: decimal(10,2)          # bare NUMERIC needs an explicit precision/scale
 
   # Composite cursor fixture — `updated_at` is nullable, fall back to `created_at`.
   - name: orders_coalesce
@@ -118,6 +120,8 @@ exports:
     destination:
       type: local
       path: ./output
+    columns:
+      price: decimal(10,2)
 ```
 
 Validate structural constraints:

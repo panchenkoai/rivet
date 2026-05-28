@@ -48,6 +48,21 @@ rivet run --config events.yaml --validate
 
 Unlike `incremental`, this mode produces overlapping data across runs (the last 30 days always overlap with yesterday's last 30 days).
 
+### Re-runs always emit a new file (intentional)
+
+`time_window` does not persist "we already exported this window" anywhere.
+Each `rivet run` re-evaluates the rolling window relative to `NOW()` and
+writes a fresh file. Two back-to-back runs inside the same minute will
+produce two near-identical files — same rows, different `run_id` /
+timestamp suffix. That is the contract: this mode is built for *rolling
+recent activity* (alerting, daily syncs), not for *exactly-once
+delivery*. If you need the latter, switch to `mode: incremental` with a
+`cursor_column` and `skip_empty: true`.
+
+Downstream consumers that need deduplication should key off the
+`id` / business key inside the rows themselves, not on file name or
+`run_id`.
+
 ## Time column types
 
 By default, Rivet assumes a `TIMESTAMP`/`DATETIME` column. For Unix epoch integers, set `time_column_type`:

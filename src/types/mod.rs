@@ -39,7 +39,9 @@ pub mod target;
 
 pub use cursor::CursorState;
 pub use fidelity::TypeFidelity;
-pub use mapping::{TypeMapping, build_arrow_field};
+// Public surface for contract/integration tests; not referenced from the binary.
+#[allow(unused_imports)]
+pub use mapping::{TypeMapping, build_arrow_field, derive_fidelity, rivet_type_to_arrow};
 pub use override_type::parse_type_str;
 pub use rivet_type::{RivetType, TimeUnit};
 pub use source_column::SourceColumn;
@@ -142,5 +144,20 @@ mod tests {
                 .map(String::as_str),
             Some("json")
         );
+    }
+
+    /// Keep `rivet_type_to_arrow` / `derive_fidelity` re-exports live for
+    /// `tests/type_roundtrip` contract tests and downstream tooling.
+    #[test]
+    fn mapping_helpers_reexported_for_contract_tests() {
+        let dec = RivetType::Decimal {
+            precision: 18,
+            scale: 2,
+        };
+        assert!(matches!(
+            rivet_type_to_arrow(&dec),
+            Some(DataType::Decimal128(18, 2))
+        ));
+        assert_eq!(derive_fidelity(&dec), TypeFidelity::Exact);
     }
 }

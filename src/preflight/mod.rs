@@ -67,6 +67,7 @@ pub(crate) fn get_export_diagnostic(
 ) -> Result<ExportDiagnostic> {
     let url = config.source.resolve_url()?;
     let tls = config.source.tls.as_ref();
+    crate::source::warn_if_tls_disabled(&config.source);
     match config.source.source_type {
         SourceType::Postgres => postgres::diagnose_export_pg(&url, tls, export),
         SourceType::Mysql => mysql::diagnose_export_mysql(&url, tls, export),
@@ -97,6 +98,12 @@ pub fn check(
 
     let url = config.source.resolve_url()?;
     let tls = config.source.tls.as_ref();
+    // Surface the plaintext-transport warning at preflight time too —
+    // operators should hear it from `rivet check` before they wait
+    // through a full `rivet run` to learn the same thing. `Once` inside
+    // the helper keeps emission to one line per process even when both
+    // `check` and `run` flow through it.
+    crate::source::warn_if_tls_disabled(&config.source);
     match config.source.source_type {
         SourceType::Postgres => postgres::check_postgres(&url, tls, &exports, json_output)?,
         SourceType::Mysql => mysql::check_mysql(&url, tls, &exports, json_output)?,

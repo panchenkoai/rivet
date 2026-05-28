@@ -137,6 +137,9 @@ Action-first cookbooks for the most common production scenarios.
 | [0009](adr/0009-reconcile-and-repair-contracts.md) | Reconcile and targeted repair (RC1–RC6, RR1–RR8) |
 | [0010](adr/0010-two-parallel-engines.md) | Two parallel engines (in-process scoped threads vs subprocess fan-out) |
 | [0011](adr/0011-source-trait-send-not-sync.md) | `Source: Send` (not `Sync`) — one connection per chunk worker |
+| [0012](adr/0012-cloud-manifest-contract.md) | Cloud manifest contract (M1–M9) |
+| [0013](adr/0013-trust-flag-contract.md) | Trust flag contract (`--validate`, `--reconcile`, `--resume`) |
+| [0014](adr/0014-target-type-materialization.md) | Target type materialization (interchange vs native load; DuckDB/BQ/…) |
 
 ## Example Configs
 

@@ -269,24 +269,46 @@ impl SourceConfig {
             return self.build_url_from_fields();
         }
 
-        let raw = match (&self.url, &self.url_env, &self.url_file) {
-            (Some(u), None, None) => u.clone(),
-            (None, Some(env), None) => std::env::var(env).map_err(|_| {
-                anyhow::anyhow!(
-                    "source: env var '{0}' is not set (referenced by url_env).\n  Hint: export the value before running, e.g.\n      export {0}='postgresql://user:pass@host:5432/dbname'\n  Or change `url_env: {0}` in your config to a different env var name.",
-                    env
-                )
-            })?,
-            (None, None, Some(file)) => std::fs::read_to_string(file)
-                .map_err(|e| {
+        // Capture *where* the URL came from so the password warning below
+        // can be specific: scolding an operator who already used
+        // `url_env:` (the recommendation!) for "considering url_env" is
+        // misleading and trains them to tune out our warnings.
+        //
+        // The `EnvVar(&str)` / `File(&str)` payloads are retained for
+        // future use (e.g. mentioning the env-var name in a richer
+        // diagnostic later) — `#[allow(dead_code)]` keeps clippy quiet
+        // while we keep the slot open. Renaming the variants to unit
+        // would lose the documentation that "this came from <name>".
+        #[allow(dead_code)]
+        enum UrlSource<'a> {
+            InlineYaml,
+            EnvVar(&'a str),
+            File(&'a str),
+        }
+        let (raw, source) = match (&self.url, &self.url_env, &self.url_file) {
+            (Some(u), None, None) => (u.clone(), UrlSource::InlineYaml),
+            (None, Some(env), None) => (
+                std::env::var(env).map_err(|_| {
                     anyhow::anyhow!(
-                        "source: cannot read url_file '{}': {}.\n  Hint: ensure the file exists and is readable; the file should contain only the URL on a single line.",
-                        file,
-                        e
+                        "source: env var '{0}' is not set (referenced by url_env).\n  Hint: export the value before running, e.g.\n      export {0}='postgresql://user:pass@host:5432/dbname'\n  Or change `url_env: {0}` in your config to a different env var name.",
+                        env
                     )
-                })?
-                .trim()
-                .to_string(),
+                })?,
+                UrlSource::EnvVar(env),
+            ),
+            (None, None, Some(file)) => (
+                std::fs::read_to_string(file)
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "source: cannot read url_file '{}': {}.\n  Hint: ensure the file exists and is readable; the file should contain only the URL on a single line.",
+                            file,
+                            e
+                        )
+                    })?
+                    .trim()
+                    .to_string(),
+                UrlSource::File(file),
+            ),
             _ => anyhow::bail!(
                 "source: configure exactly one connection method:\n  url_env: DATABASE_URL                          (URL from env var — recommended)\n  url: 'postgresql://user:pass@host:5432/db'      (inline — not recommended for committed configs)\n  url_file: /etc/rivet/source.url                 (URL from file — rotation-friendly)\n  host/user/database/...                          (structured fields under `source:`)"
             ),
@@ -301,15 +323,31 @@ impl SourceConfig {
             && !userinfo.ends_with(':')
         {
             // `resolve_url` is called from many places per run (plan build,
-            // doctor, every export, every chunk worker).  Fire this warning
-            // exactly once per process so operators see one clean nudge,
-            // not 3-4 stacked copies in stderr.
-            static WARNED: std::sync::Once = std::sync::Once::new();
-            WARNED.call_once(|| {
-                log::warn!(
-                    "source URL contains plaintext password -- consider using url_env or url_file"
-                );
-            });
+            // doctor, every export, every chunk worker). Fire each variant
+            // of this warning exactly once per process so operators see
+            // one clean nudge, not 3-4 stacked copies in stderr.
+            //
+            // Only the InlineYaml case is a real misconfiguration to flag:
+            // the password is sitting in a committed file. EnvVar / File
+            // sources are explicitly the recommended forms — scolding an
+            // operator who already uses them for "considering url_env"
+            // would be a false alarm.
+            match source {
+                UrlSource::InlineYaml => {
+                    static WARNED: std::sync::Once = std::sync::Once::new();
+                    WARNED.call_once(|| {
+                        log::warn!(
+                            "source: inline `url:` in YAML contains a plaintext password — \
+                             move it to `url_env: DATABASE_URL` (or `url_file:`) to keep \
+                             credentials out of committed configs"
+                        );
+                    });
+                }
+                UrlSource::EnvVar(_) | UrlSource::File(_) => {
+                    // The recommended forms — no warning. Operator hygiene
+                    // for shell history / file permissions is out of scope.
+                }
+            }
         }
 
         Ok(resolved)

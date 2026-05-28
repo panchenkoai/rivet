@@ -1,10 +1,14 @@
 name: CI
 
 # Required branch-protection checks (set in Settings → Branches → main):
-#   fmt · clippy · test · test-invariants · test-recovery · test-compatibility · test-stability
+#   fmt · clippy · test · test-invariants · test-recovery · test-compatibility ·
+#   test-stability · test-type-validators
 #
-# The three semantic-gate jobs below run each suite in isolation so GitHub can
+# The semantic-gate jobs below run each suite in isolation so GitHub can
 # block merges on named regressions, not just overall build failures.
+# `test-type-validators` brings up the DuckDB/ClickHouse oracle containers so
+# the type round-trip suite (previously only runnable by hand via the Makefile)
+# is enforced on every PR.
 
 on:
   push:
@@ -92,6 +96,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --lib -- plan::validate::tests
 
+  test-types:
+    name: Type mapping contracts (semantic gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --test type_roundtrip contract_
+
   test-stability:
     name: Stability tests — Phase 1 (semantic gate)
     runs-on: ubuntu-latest
@@ -130,6 +145,54 @@ jobs:
 
       - name: Run type-golden tests
         run: cargo test --release --test live_type_golden -- --ignored
+
+      - name: Stop services
+        if: always()
+        run: docker compose down
+
+  test-type-validators:
+    name: Type round-trip validators — DuckDB · ClickHouse · pyarrow (semantic gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Pre-create shared bind-mount dir (runner-owned)
+        # The duckdb/clickhouse services mount ./tests/.live-tmp:/work. On Linux
+        # the docker daemon creates a missing bind-mount source as root:root,
+        # which then blocks the test process (runner user) from creating
+        # per-test workdirs under it (`create_dir_all` → EACCES). Pre-creating
+        # it makes the mount source runner-owned; the root containers only read
+        # the Parquet the test writes there.
+        run: mkdir -p tests/.live-tmp
+
+      - name: Start source + oracle containers
+        # postgres/mysql are the sources; duckdb + clickhouse are independent
+        # Parquet *readers* (ADR-0014 oracles) that read back what rivet wrote
+        # and assert field-by-field type fidelity. The duckdb image pip-installs
+        # duckdb/pytz/pyarrow on boot, so `--wait` blocks on its healthcheck
+        # (start_period 30s) before tests run. All four share the
+        # ./tests/.live-tmp:/work bind mount the readers glob over.
+        run: docker compose up -d --wait postgres mysql duckdb clickhouse
+
+      - name: Reopen shared mount after ClickHouse chowns it
+        # ClickHouse chowns its user_files_path (/work = ./tests/.live-tmp) to
+        # the clickhouse uid (101) on startup. On Linux that propagates to the
+        # host and re-locks the dir the runner just created, so `create_dir_all`
+        # still fails with EACCES. Re-open it after the stack is up; the test
+        # writes per-run workdirs (world-readable), the reader containers read
+        # them back.
+        run: sudo chmod -R 0777 tests/.live-tmp
+
+      - name: Run type round-trip validators
+        # Force the `#[ignore]`d live validators to run. `--skip bigquery`
+        # drops the two cloud-warehouse tests — they need a real GCP project +
+        # `bq` CLI that CI has no credentials for (covered by the manual
+        # `make test-types-bigquery` target instead).
+        run: cargo test --release --test type_roundtrip -- --include-ignored --skip bigquery
 
       - name: Stop services
         if: always()
@@ -204,7 +267,13 @@ jobs:
         # Skip the heavy `content_export` tests — they assert a 50K+ row
         # `content_items` fixture that takes minutes to seed and is exercised
         # by the `nightly-live` workflow instead.
-        run: cargo test --release -- --ignored --skip content_export
+        #
+        # Skip the type round-trip oracle tests (`validates` = duckdb/clickhouse/
+        # pyarrow readers; `pg_edge` = duckdb-backed edge cases). They need the
+        # DuckDB/ClickHouse containers this job does not start and run in the
+        # dedicated `test-type-validators` job instead. Both substrings are
+        # unique to the `type_roundtrip` binary.
+        run: cargo test --release -- --ignored --skip content_export --skip validates --skip pg_edge
 
       - name: Stop services
         if: always()

@@ -1,0 +1,121 @@
+# All types from docs/type-mapping.md (offline contract layer).
+version: 1
+contracts:
+  # ── PostgreSQL ──────────────────────────────────────────────────────────
+  - { source: postgres, source_type: smallint, rivet_type: { kind: int16 }, arrow: Int16, fidelity: exact, tested: contract }
+  - { source: postgres, source_type: integer, rivet_type: { kind: int32 }, arrow: Int32, fidelity: exact, tested: contract }
+  - { source: postgres, source_type: bigint, rivet_type: { kind: int64 }, arrow: Int64, fidelity: exact, tested: contract }
+  - source: postgres
+    source_type: numeric(18,2)
+    rivet_type: { kind: decimal, precision: 18, scale: 2 }
+    arrow: Decimal128(18, 2)
+    fidelity: exact
+    tested: contract
+  - source: postgres
+    source_type: numeric(20,6)
+    rivet_type: { kind: decimal, precision: 20, scale: 6 }
+    arrow: Decimal128(20, 6)
+    fidelity: exact
+    tested: contract
+  - { source: postgres, source_type: real, rivet_type: { kind: float32 }, arrow: Float32, fidelity: exact, tested: contract }
+  - { source: postgres, source_type: double precision, rivet_type: { kind: float64 }, arrow: Float64, fidelity: exact, tested: contract }
+  - { source: postgres, source_type: date, rivet_type: { kind: date }, arrow: Date32, fidelity: exact, tested: contract }
+  - source: postgres
+    source_type: time
+    rivet_type: { kind: time, unit: microsecond }
+    arrow: Time64(Microsecond)
+    fidelity: exact
+    tested: contract
+  - source: postgres
+    source_type: timestamp
+    rivet_type: { kind: timestamp, unit: microsecond }
+    arrow: Timestamp(Microsecond, None)
+    fidelity: exact
+    tested: contract
+  - source: postgres
+    source_type: timestamptz
+    rivet_type: { kind: timestamp, unit: microsecond, timezone: UTC }
+    arrow: Timestamp(Microsecond, Some("UTC"))
+    fidelity: exact
+    tested: contract
+  - { source: postgres, source_type: text, rivet_type: { kind: string }, arrow: Utf8, fidelity: exact, tested: contract }
+  - { source: postgres, source_type: varchar, rivet_type: { kind: string }, arrow: Utf8, fidelity: exact, tested: contract }
+  - { source: postgres, source_type: bytea, rivet_type: { kind: binary }, arrow: Binary, fidelity: exact, tested: contract }
+  - { source: postgres, source_type: jsonb, rivet_type: { kind: json }, arrow: Utf8, fidelity: logical_string, tested: contract }
+  - { source: postgres, source_type: json, rivet_type: { kind: json }, arrow: Utf8, fidelity: logical_string, tested: contract }
+  - { source: postgres, source_type: uuid, rivet_type: { kind: uuid }, arrow: FixedSizeBinary(16), fidelity: exact, tested: contract }
+  - { source: postgres, source_type: boolean, rivet_type: { kind: bool }, arrow: Boolean, fidelity: exact, tested: contract }
+  - source: postgres
+    source_type: numeric(10,2)
+    rivet_type: { kind: decimal, precision: 10, scale: 2 }
+    arrow: Decimal128(10, 2)
+    fidelity: exact
+    tested: contract
+  - { source: postgres, source_type: bpchar, rivet_type: { kind: string }, arrow: Utf8, fidelity: exact, tested: contract }
+  - { source: postgres, source_type: interval, rivet_type: { kind: interval }, arrow: Utf8, fidelity: compatible, tested: contract }
+  - { source: postgres, source_type: enum, rivet_type: { kind: enum }, arrow: Utf8, fidelity: compatible, tested: contract }
+
+  # ── MySQL ─────────────────────────────────────────────────────────────────
+  - { source: mysql, source_type: tinyint, rivet_type: { kind: int16 }, arrow: Int16, fidelity: exact, tested: contract }
+  - { source: mysql, source_type: tinyint(1), rivet_type: { kind: bool }, arrow: Boolean, fidelity: exact, tested: contract }
+  - { source: mysql, source_type: smallint, rivet_type: { kind: int16 }, arrow: Int16, fidelity: exact, tested: contract }
+  - { source: mysql, source_type: int, rivet_type: { kind: int32 }, arrow: Int32, fidelity: exact, tested: contract }
+  - { source: mysql, source_type: bigint, rivet_type: { kind: int64 }, arrow: Int64, fidelity: exact, tested: contract }
+  - { source: mysql, source_type: bigint unsigned, rivet_type: { kind: u_int64 }, arrow: UInt64, fidelity: exact, tested: contract }
+  - source: mysql
+    source_type: decimal(18,2)
+    rivet_type: { kind: decimal, precision: 18, scale: 2 }
+    arrow: Decimal128(18, 2)
+    fidelity: exact
+    tested: contract
+  - source: mysql
+    source_type: decimal(20,6)
+    rivet_type: { kind: decimal, precision: 20, scale: 6 }
+    arrow: Decimal128(20, 6)
+    fidelity: exact
+    tested: contract
+  - { source: mysql, source_type: float, rivet_type: { kind: float32 }, arrow: Float32, fidelity: exact, tested: contract }
+  - { source: mysql, source_type: double, rivet_type: { kind: float64 }, arrow: Float64, fidelity: exact, tested: contract }
+  - { source: mysql, source_type: date, rivet_type: { kind: date }, arrow: Date32, fidelity: exact, tested: contract }
+  - source: mysql
+    source_type: time
+    rivet_type: { kind: time, unit: microsecond }
+    arrow: Time64(Microsecond)
+    fidelity: exact
+    tested: contract
+  - source: mysql
+    source_type: datetime
+    rivet_type: { kind: timestamp, unit: microsecond }
+    arrow: Timestamp(Microsecond, None)
+    fidelity: exact
+    tested: contract
+  - source: mysql
+    source_type: timestamp
+    rivet_type: { kind: timestamp, unit: microsecond, timezone: UTC }
+    arrow: Timestamp(Microsecond, Some("UTC"))
+    fidelity: exact
+    tested: contract
+  - { source: mysql, source_type: varchar, rivet_type: { kind: string }, arrow: Utf8, fidelity: exact, tested: contract }
+  - { source: mysql, source_type: text, rivet_type: { kind: text }, arrow: Utf8, fidelity: exact, tested: contract }
+  - { source: mysql, source_type: json, rivet_type: { kind: json }, arrow: Utf8, fidelity: logical_string, tested: contract }
+  - { source: mysql, source_type: binary, rivet_type: { kind: binary }, arrow: Binary, fidelity: exact, tested: contract }
+  - { source: mysql, source_type: varbinary, rivet_type: { kind: binary }, arrow: Binary, fidelity: exact, tested: contract }
+  - { source: mysql, source_type: blob, rivet_type: { kind: binary }, arrow: Binary, fidelity: exact, note: binary blob UNHEX payload, tested: contract }
+  - { source: mysql, source_type: bit(1), rivet_type: { kind: bool }, arrow: Boolean, fidelity: exact, tested: contract }
+  - { source: mysql, source_type: bit(8), rivet_type: { kind: int64 }, arrow: Int64, fidelity: exact, tested: contract }
+  - source: mysql
+    source_type: decimal(10,2)
+    rivet_type: { kind: decimal, precision: 10, scale: 2 }
+    arrow: Decimal128(10, 2)
+    fidelity: exact
+    tested: contract
+  - { source: mysql, source_type: tinyint unsigned, rivet_type: { kind: int16 }, arrow: Int16, fidelity: exact, tested: contract }
+  - { source: mysql, source_type: smallint unsigned, rivet_type: { kind: int32 }, arrow: Int32, fidelity: exact, tested: contract }
+  - { source: mysql, source_type: int unsigned, rivet_type: { kind: int64 }, arrow: Int64, fidelity: exact, tested: contract }
+  - { source: mysql, source_type: char, rivet_type: { kind: string }, arrow: Utf8, fidelity: exact, tested: contract }
+  - { source: mysql, source_type: longtext, rivet_type: { kind: text }, arrow: Utf8, fidelity: exact, tested: contract }
+  - { source: mysql, source_type: mediumtext, rivet_type: { kind: text }, arrow: Utf8, fidelity: exact, tested: contract }
+  - { source: mysql, source_type: enum, rivet_type: { kind: enum }, arrow: Utf8, fidelity: compatible, tested: contract }
+  - { source: mysql, source_type: set, rivet_type: { kind: enum }, arrow: Utf8, fidelity: compatible, tested: contract }
+  - { source: mysql, source_type: year, rivet_type: { kind: int16 }, arrow: Int16, fidelity: exact, tested: contract }
+  - { source: mysql, source_type: boolean, rivet_type: { kind: bool }, arrow: Boolean, fidelity: exact, tested: contract }

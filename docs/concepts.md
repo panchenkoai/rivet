@@ -72,7 +72,7 @@ If you want to track a concept from this glossary back to the implementation:
 - `Source` trait + `ExportRequest` — `src/source/mod.rs`
 - Cursor / incremental — `src/source/query.rs` (predicate builder) + `src/state/cursor.rs`
 - Chunked / checkpoint — `src/pipeline/chunked/{mod, sequential_checkpoint, parallel_checkpoint}.rs` + `src/state/checkpoint.rs`
-- Manifest + Metrics — `src/state/{manifest, metrics}.rs`
+- File log + Metrics — `src/state/{file_log, metrics}.rs`
 - Journal — `src/journal.rs` (top-level) + `src/state/journal_store.rs`
 - Progression — `src/state/progression.rs` ([ADR-0008](adr/0008-export-progression.md))
 - Validate / reconcile (CLI) — `src/pipeline/{validate, reconcile_cmd}.rs`

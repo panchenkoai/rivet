@@ -44,6 +44,12 @@ pub const SUCCESS_FILENAME: &str = "_SUCCESS";
 /// Layout: `<prefix>/_quarantine/<run_id>/<original-name>`.
 pub const QUARANTINE_PREFIX: &str = "_quarantine";
 
+/// Writability probe `rivet doctor` drops at the destination prefix.  It is a
+/// Rivet-internal sidecar (like [`MANIFEST_FILENAME`] / [`SUCCESS_FILENAME`]),
+/// so the manifest-aware `--validate` pass must not flag it as an untracked
+/// foreign object when a run follows a `doctor` against the same prefix.
+pub const DOCTOR_PROBE_FILENAME: &str = ".rivet_doctor_probe";
+
 /// Compute the body of the `_SUCCESS` marker for a given serialized manifest.
 ///
 /// Format: a single line `"xxh3:<16-hex>\n"`.  ADR-0012 M2 — `_SUCCESS`

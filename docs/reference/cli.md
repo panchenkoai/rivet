@@ -467,10 +467,16 @@ rivet doctor -c my_export.yaml
 Output:
 
 ```
-[OK] Source postgres://host:5432/db — connected, version 16.2
-[OK] Destination './output' — directory writable
-[OK] Destination 's3://bucket/prefix/' — bucket accessible
+rivet doctor: verifying auth for config 'my_export.yaml'
+
+[OK]  Config parsed successfully
+[OK]  Source auth (Postgres)
+[OK]  Destination Local(./output)
+
+All checks passed.
 ```
+
+When `tls:` is omitted from `source:`, an extra line appears before the source check: `[WARN] source: TLS is not enforced — credentials and result rows cross the network in plaintext.` Silence it by adding `tls: { mode: disable }` (local dev only) or fix it for prod with `tls: { mode: verify-full }` — see [reference/config.md § TLS](config.md#tls).
 
 ---
 

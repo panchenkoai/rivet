@@ -13,7 +13,33 @@ pub fn show_state(config_path: &str) -> Result<()> {
     let state = StateStore::open(config_path)?;
     let states = state.list_all()?;
     if states.is_empty() {
-        println!("No export state recorded yet.");
+        // `state.list_all()` returns only incremental-cursor rows. Chunked
+        // and full runs land in different tables (`export_metrics`,
+        // `export_files`, `chunk_state`), so an empty cursor list does not
+        // mean "this config never ran". Distinguish the two cases:
+        //   - never ran    → tell the operator to run first
+        //   - ran chunked  → point at `rivet metrics` / `rivet state files`
+        // Anything else here is misleading ("No state" after a successful
+        // chunked run sounds like data loss).
+        let any_run = state
+            .get_metrics(None, 1)
+            .map(|m| !m.is_empty())
+            .unwrap_or(false);
+        if any_run {
+            println!(
+                "No incremental cursor recorded yet.\n  \
+                 This command shows incremental-mode cursors only.\n  \
+                 For chunked / full runs, see:\n  \
+                 • rivet metrics      — per-run history (status, rows, duration)\n  \
+                 • rivet state files  — every produced file with row count + size"
+            );
+        } else {
+            println!(
+                "No exports have been run yet.\n  \
+                 Run `rivet run --config {}` first, then try `rivet state` again.",
+                config_path
+            );
+        }
         return Ok(());
     }
     println!("{:<30} {:<40} LAST RUN", "EXPORT", "LAST CURSOR");

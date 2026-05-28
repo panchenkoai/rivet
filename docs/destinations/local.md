@@ -80,7 +80,7 @@ rivet doctor --config my_export.yaml
 Output:
 
 ```
-[OK] Destination './output' — directory writable
+[OK]  Destination Local(./output)
 ```
 
 ## List exported files

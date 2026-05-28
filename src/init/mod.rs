@@ -77,6 +77,44 @@ impl TableInfo {
         "full"
     }
 
+    /// One-line rationale for [`suggest_mode`]'s choice — emitted as an
+    /// inline comment in the generated YAML so the operator can see *why*
+    /// chunked / incremental / full was picked, not just *what*. Wording
+    /// stays short because it lives in the YAML directly above `mode:`.
+    pub(crate) fn mode_rationale(&self, mode: &str) -> String {
+        match mode {
+            "chunked" => format!(
+                "auto: ~{} rows ≥ 100K threshold and chunk column '{}' is available",
+                fmt_row_estimate(self.row_estimate),
+                self.best_chunk_column().unwrap_or("id"),
+            ),
+            "incremental" => format!(
+                "auto: ~{} rows ≥ 100K threshold; chunk column missing, falling back to incremental on '{}'",
+                fmt_row_estimate(self.row_estimate),
+                self.best_cursor_column().unwrap_or("updated_at"),
+            ),
+            "full" => format!(
+                "auto: ~{} rows below 100K chunked threshold",
+                fmt_row_estimate(self.row_estimate),
+            ),
+            _ => format!("mode={mode}"),
+        }
+    }
+
+    /// Default chunk_size scaled by the row estimate. Goal: keep the
+    /// per-table file count in a humane range (~10–50 files) regardless
+    /// of how large the table is. The previous hard-coded `100_000`
+    /// produced 100 files for a 10 M-row table and 1000+ for 100 M;
+    /// operators read that as noise rather than progress.
+    pub(crate) fn suggest_chunk_size(&self) -> u64 {
+        match self.row_estimate {
+            r if r < 1_000_000 => 100_000,     // < 1 M  → up to 10 files
+            r if r < 10_000_000 => 250_000,    // 1–10 M → 4–40 files
+            r if r < 100_000_000 => 1_000_000, // 10–100 M → 10–100 files
+            _ => 2_500_000,                    // ≥ 100 M → 40+ files
+        }
+    }
+
     /// Enumerate ranked cursor candidates with structured reasons.
     pub(crate) fn cursor_candidates(&self) -> Vec<CursorCandidate> {
         candidates::cursor_candidates(self)
@@ -85,6 +123,19 @@ impl TableInfo {
     /// Enumerate chunk candidates (integer-typed columns, PK preferred).
     pub(crate) fn chunk_candidates(&self) -> Vec<ChunkCandidate> {
         candidates::chunk_candidates(self)
+    }
+}
+
+/// Render a row estimate as a short human-readable string for inline
+/// YAML comments (`"1.0M"`, `"10K"`, `"950"`). Stays compact because the
+/// rationale comment must fit on one line above `mode:`.
+fn fmt_row_estimate(rows: i64) -> String {
+    if rows >= 1_000_000 {
+        format!("{:.1}M", rows as f64 / 1_000_000.0)
+    } else if rows >= 1_000 {
+        format!("{}K", rows / 1_000)
+    } else {
+        rows.to_string()
     }
 }
 

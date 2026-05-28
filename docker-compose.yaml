@@ -295,5 +295,77 @@ services:
       - postgres
       - mysql
 
+  # ---- DuckDB & ClickHouse — Parquet validators (ADR-0014) ─────────────────
+  # These two services are kept running so live type-roundtrip tests can pipe
+  # the *same* Parquet artifact through two independent readers and assert
+  # round-trip on values + Parquet-level type semantics (decimals, JSON, UUID,
+  # tz-aware timestamps, binary, lists). They are not productive components —
+  # they are oracles for the Rivet → Parquet layer.
+  #
+  # Shared bind mount `./tests/.live-tmp` is the handoff: Rivet tests write a
+  # Parquet file there from the host, then `docker exec` reads it inside the
+  # container at the same path under `/work`.
+  duckdb:
+    image: python:3.12-slim
+    # Holds a `duckdb` Python install — talked to via `docker exec rivet-duckdb
+    # python -c "..."`. No port is published; tests reach it through `docker
+    # exec`, not over TCP.
+    entrypoint:
+      - bash
+      - -lc
+      # `pytz` is required by the duckdb Python adapter to materialise
+      # TIMESTAMP WITH TIME ZONE values — without it, every `SELECT *` over
+      # a Parquet with a tz-aware timestamp column raises ModuleNotFoundError.
+      # `pyarrow` is the third independent Parquet reader used by tests
+      # (alongside duckdb and clickhouse) — it is the reference Arrow
+      # implementation, so it sees field metadata and statistics exactly
+      # the way we wrote them.
+      - "pip install --quiet --disable-pip-version-check \
+           duckdb==1.4.1 pytz==2024.1 pyarrow==18.1.0 && \
+         python -c 'import duckdb, pytz, pyarrow; print(\"duckdb\", duckdb.__version__, \"pyarrow\", pyarrow.__version__)' && \
+         exec tail -f /dev/null"
+    container_name: rivet-duckdb
+    init: true
+    volumes:
+      - ./tests/.live-tmp:/work
+    healthcheck:
+      # Healthy once the python `duckdb` module imports — pip install finished.
+      test: ["CMD", "python", "-c", "import duckdb; duckdb.sql('select 1')"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: rivet-clickhouse
+    # `ulimits` are required by the official image at runtime.
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    environment:
+      CLICKHOUSE_USER: rivet
+      CLICKHOUSE_PASSWORD: rivet
+      CLICKHOUSE_DB: rivet
+    ports:
+      # MinIO already publishes 9000 (S3) and 9001 (console), so the ClickHouse
+      # native protocol is exposed on 9002 to avoid collisions. Tests use the
+      # HTTP interface on 8123 anyway.
+      - "8123:8123"
+      - "9002:9000"
+    volumes:
+      - ./tests/.live-tmp:/work
+      # Allow the `file()` table function to read Parquet from /work — by
+      # default ClickHouse only trusts /var/lib/clickhouse/user_files.
+      - ./dev/clickhouse/user_files.xml:/etc/clickhouse-server/config.d/user_files.xml:ro
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider",
+             "http://127.0.0.1:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+
 volumes:
   postgres_state_data:
