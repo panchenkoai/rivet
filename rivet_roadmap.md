@@ -1058,14 +1058,22 @@ and the two-engine separation with explicit revisit triggers (ADR-0010).
 
 ## 10.1 Findings summary
 
+> **Validated against the source — see
+> [`docs/planning/optimization-backlog-validation.md`](docs/planning/optimization-backlog-validation.md)**
+> for per-item verdicts, file:line evidence, and implementation plans. A
+> line-by-line pass corrected OPT-4 and OPT-5 substantially (a deterministic
+> per-part content hash already exists; MySQL hard-refuses rather than silently
+> degrading) and narrowed OPT-1/OPT-2. The validation doc is authoritative over
+> the prose below.
+
 | ID | Area | Priority | Status | One-line |
 |---|---|---|---|---|
 | OPT-1 | Memory safety | P2 | ⏳ Open | Adaptive byte-budget cap **already exists** (both engines); residual: probe-batch warmup, single-outlier value, soft target × threads |
 | OPT-2 | Adaptive concurrency | P1 | ⏳ Open | Batch-size adaptation **already exists**; gap is governing *parallelism/connections* + using the richer `rivet-mcp` signal set |
-| OPT-3 | Type fidelity | P1 | ⏳ Open | Round-trip proof is enumerated-fixture, not by-construction; add property-based testing |
-| OPT-4 | MySQL parity | P1 | ⏳ Open | "Source-safe" is architecturally weaker on MySQL (no server-side cursor) — make degradation explicit |
-| OPT-5 | Dedup ergonomics | P2 | ⏳ Open | At-least-once pushes all dedup to consumer; no idempotency token in manifest |
-| OPT-6 | Engine debt | P2 | ⏳ Open | Two engines = double maintenance; verify crash-matrix symmetry across both |
+| OPT-3 | Type fidelity | P1 | ⏳ Open (validated) | Round-trip proof is enumerated-fixture; no proptest type test exists — confirmed |
+| OPT-4 | MySQL parity | P1 | ⏳ Open (**corrected**) | Hard-*refuses* (not silent); real gap = no keyset chunking ⇒ non-int-PK MySQL has no safe shape |
+| OPT-5 | Dedup ergonomics | P2 | ⏳ Open (**corrected**) | Deterministic per-part `content_fingerprint` **already exists** (`manifest.rs:160`); gap = guarantee/expose + parquet byte-determinism |
+| OPT-6 | Engine debt | P2 | ⏳ Open (validated) | Subprocess fan-out engine has **zero** crash tests; no signal handling — confirmed gap |
 | OPT-7 | Doc/roadmap drift | P1 | ⏳ Open | Several ⏳ items already shipped in 0.7.8; checksums ship but docs say "rebuild from source" |
 
 ---
