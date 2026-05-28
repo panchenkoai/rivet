@@ -267,7 +267,13 @@ jobs:
         # Skip the heavy `content_export` tests — they assert a 50K+ row
         # `content_items` fixture that takes minutes to seed and is exercised
         # by the `nightly-live` workflow instead.
-        run: cargo test --release -- --ignored --skip content_export
+        #
+        # Skip the type round-trip oracle tests (`validates` = duckdb/clickhouse/
+        # pyarrow readers; `pg_edge` = duckdb-backed edge cases). They need the
+        # DuckDB/ClickHouse containers this job does not start and run in the
+        # dedicated `test-type-validators` job instead. Both substrings are
+        # unique to the `type_roundtrip` binary.
+        run: cargo test --release -- --ignored --skip content_export --skip validates --skip pg_edge
 
       - name: Stop services
         if: always()

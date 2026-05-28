@@ -101,6 +101,26 @@ pub fn live_shared_workdir(label: &str) -> (std::path::PathBuf, String) {
     (host, container)
 }
 
+/// Make everything the test wrote under the shared bind mount readable by any
+/// uid, so reader containers running as a *different* user can open it.
+///
+/// rivet writes output files as `0600` (inherited from the tempfile it copies
+/// from), owned by the test process. The ClickHouse container reads as the
+/// `clickhouse` user (uid 101), so on Linux `file()` hits `EACCES` opening the
+/// Parquet. macOS Docker Desktop virtualises bind-mount ownership and hides
+/// this. Call this from the reader helpers before the container touches
+/// `/work`. Best-effort and recursive: the chmod of the mount root itself may
+/// fail (ClickHouse chowns it to uid 101 on startup) but `-R` still relaxes the
+/// test-owned subdirs and files underneath, which is what the readers open.
+pub fn make_shared_world_readable() {
+    let root = live_shared_tmp_host();
+    let _ = std::process::Command::new("chmod")
+        .arg("-R")
+        .arg("a+rX")
+        .arg(&root)
+        .status();
+}
+
 // ─── Live-gate: fast reachability probe ────────────────────────────────────
 
 /// Attempt a TCP connect with a short timeout.  Returns `true` if reachable.

@@ -30,6 +30,11 @@ pub use super::env::live_shared_workdir as clickhouse_shared_workdir;
 /// `FORMAT JSONEachRow` so each result row is a self-contained object; this
 /// keeps types stable across query shapes.
 pub fn clickhouse_run_sql_json(sql: &str) -> Vec<serde_json::Value> {
+    // rivet writes Parquet as 0600/owner-only; ClickHouse reads as uid 101 and
+    // would hit EACCES on Linux. Relax the test-owned files first (no-op on
+    // macOS where Docker Desktop virtualises ownership).
+    super::env::make_shared_world_readable();
+
     // Append `FORMAT JSONEachRow` unless the caller already specified a format.
     let lower = sql.to_lowercase();
     let final_sql = if lower.contains(" format ") {
