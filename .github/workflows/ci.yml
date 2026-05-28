@@ -160,6 +160,15 @@ jobs:
           toolchain: "1.94"
       - uses: Swatinem/rust-cache@v2
 
+      - name: Pre-create shared bind-mount dir (runner-owned)
+        # The duckdb/clickhouse services mount ./tests/.live-tmp:/work. On Linux
+        # the docker daemon creates a missing bind-mount source as root:root,
+        # which then blocks the test process (runner user) from creating
+        # per-test workdirs under it (`create_dir_all` → EACCES). Pre-creating
+        # it makes the mount source runner-owned; the root containers only read
+        # the Parquet the test writes there.
+        run: mkdir -p tests/.live-tmp
+
       - name: Start source + oracle containers
         # postgres/mysql are the sources; duckdb + clickhouse are independent
         # Parquet *readers* (ADR-0014 oracles) that read back what rivet wrote
