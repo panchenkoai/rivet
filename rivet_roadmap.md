@@ -1060,8 +1060,8 @@ and the two-engine separation with explicit revisit triggers (ADR-0010).
 
 | ID | Area | Priority | Status | One-line |
 |---|---|---|---|---|
-| OPT-1 | Memory safety | P0 | ⏳ Open | Memory guard is reactive sampling, not a hard bound — one wide row/batch can blow the budget |
-| OPT-2 | Adaptive concurrency | P1 | ⏳ Open | Close the `rivet-mcp` sensing loop: drive parallelism from observed source pressure |
+| OPT-1 | Memory safety | P2 | ⏳ Open | Adaptive byte-budget cap **already exists** (both engines); residual: probe-batch warmup, single-outlier value, soft target × threads |
+| OPT-2 | Adaptive concurrency | P1 | ⏳ Open | Batch-size adaptation **already exists**; gap is governing *parallelism/connections* + using the richer `rivet-mcp` signal set |
 | OPT-3 | Type fidelity | P1 | ⏳ Open | Round-trip proof is enumerated-fixture, not by-construction; add property-based testing |
 | OPT-4 | MySQL parity | P1 | ⏳ Open | "Source-safe" is architecturally weaker on MySQL (no server-side cursor) — make degradation explicit |
 | OPT-5 | Dedup ergonomics | P2 | ⏳ Open | At-least-once pushes all dedup to consumer; no idempotency token in manifest |
@@ -1070,67 +1070,86 @@ and the two-engine separation with explicit revisit triggers (ADR-0010).
 
 ---
 
-## OPT-1 — Hard memory bound (byte-budgeted batches + per-value cap)
+## OPT-1 — Memory-bound hardening (residual gaps on an existing adaptive cap)
 
-**Priority: P0** — this is debt directly under the headline "won't OOM your box" promise.
+**Priority: P2** — *corrected after reading the source.* An earlier draft of this
+item claimed there was "no hard byte budget, only reactive sampling." **That was
+wrong.** A row-width-adaptive byte-budget cap already exists on both engines and
+genuinely backs the headline claim. This item is now narrow edge-case hardening,
+not foundational debt.
 
-**Problem.** Memory protection is a *reactive sampler*, not a hard bound.
-`resource::check_memory(memory_threshold_mb)` is polled at chunk-dispatch and
-batch boundaries (`src/pipeline/chunked/exec.rs:66,269,271`;
-`sequential_checkpoint.rs:235,241`; `parallel_checkpoint.rs:164`), and peak RSS
-is tracked by a background sampler thread (`src/resource.rs`). But a single
-`FETCH N` materialises a full Arrow `RecordBatch` into memory *before* the guard
-runs. The documented model `peak ≈ batch_size × avg_row_size × parallel_threads`
-(`docs/architecture.md § Memory model`) uses the **average** row size — variance
-is the killer. One pathological wide value (a 200 MB JSONB / `bytea`), or a burst
-of wide rows in one batch, overshoots the budget between two samples.
+**What already exists (do not re-build):**
+- **MySQL** (`src/source/mysql/mod.rs:385-440`): a 500-row `PROBE_BATCH_SIZE`
+  first batch measures real Arrow bytes/row (`SourceTuning::batch_memory_bytes`),
+  then caps `effective_bs` so each flush fits `tuning.batch_size_memory_mb`
+  (default `MYSQL_BATCH_TARGET_MB_DEFAULT = 64` MB), never exceeding the
+  configured `batch_size`.
+- **PostgreSQL** (`src/source/postgres/mod.rs:380-440`): a 500-row
+  `PROBE_FETCH_SIZE` first FETCH, then `FETCH N` is capped under
+  `work_mem × 0.7` (`pg_fetch_work_mem_bytes`) so the server-side cursor never
+  spills to `pgsql_tmp/`. The in-code comment explicitly anticipates the
+  "single huge FETCH triggers spill" case — that is *why* the probe exists.
+- Plus a reactive RSS sampler (`src/resource.rs`) and `memory_threshold_mb`
+  pause-gate (`src/pipeline/chunked/exec.rs:66,269,271`) as a backstop.
 
-**Evidence.** `src/resource.rs` (sampling + `get_rss_mb`), guard call sites above,
-memory model in `docs/architecture.md`. The §9.6.1 finding *"check verdict
-pessimism vs actual run"* is the same root cause seen from the predictor side:
-the budget math doesn't use row width.
+**Residual gaps (the actual scope of this item):**
+1. **Probe-batch warmup is uncapped.** The first 500 rows are buffered before
+   bytes/row is known. The code assumes "500 × ~4 KB ≈ 2 MB"; 500 genuinely
+   huge rows (e.g. 500 × 1 MB) overshoot before the cap is computed.
+2. **Single-outlier value.** The cap is based on *average* bytes/row in a batch.
+   One 200 MB JSONB/`bytea` cell among normal rows still lands in a single
+   batch; an average-based cap doesn't bound a lone giant value. There is no
+   hard per-value ceiling with a typed error.
+3. **Soft target × threads.** The cap is a per-batch *target* (~64 MB), and with
+   `parallel` threads peak is ×N. It is not a hard process-level ceiling.
 
 **Proposed change.**
-- Byte-budgeted batches: cap `FETCH N` by cumulative serialized bytes, not row
-  count — adapt N downward when observed row width is high.
-- Hard per-value size limit with a typed error (`RIVET_VALUE_TOO_LARGE`) instead
-  of letting a single fat cell drive an OOM.
+- A hard per-value size limit with a typed error (`RIVET_VALUE_TOO_LARGE`) so a
+  single fat cell fails cleanly instead of risking OOM.
+- Optionally shrink the probe batch when `avg_row_bytes` (already estimated in
+  preflight) is large, so warmup respects the budget too.
 - Feed the measured row width back into the `check` predictor (tightens the
   pessimistic UNSAFE/DEGRADED verdict, §9.6.1).
 
 **Definition of done.** A fixture with a deliberately fat value column
-(e.g. 256 MB JSONB rows) exports under a set `memory_threshold_mb` without RSS
-exceeding the budget by more than one batch's worth; regression test in the
-soak matrix.
+(e.g. 256 MB JSONB rows) either exports under the configured budget or fails
+with `RIVET_VALUE_TOO_LARGE` — never OOMs; regression test in the soak matrix.
 
 ---
 
-## OPT-2 — Adaptive concurrency governor (close the `rivet-mcp` sensing loop)
+## OPT-2 — Adaptive concurrency governor (extend existing adaptation to parallelism)
 
-**Priority: P1** — the single most *differentiating* item. dlt / sling don't have it.
+**Priority: P1** — the differentiating item. *Scope corrected after reading the
+source:* batch-size adaptation under source pressure **already exists** — this
+item is the next step, not a greenfield build.
 
-**Problem.** `Source: Send` not `Sync` (ADR-0011) means each chunk thread holds
-its own connection, so `parallel=16` burns 16 connections against exactly the
-fragile, low-`max_connections` source the tool exists to protect. Today this is
-a one-shot warning (`rivet check`), not a runtime control. The thing that makes
-Rivet fast is the thing a fragile source cannot afford — and the throttle is
-static.
+**What already exists (do not re-build):** `tuning.adaptive` already samples a
+source-side pressure proxy each `ADAPTIVE_SAMPLE_INTERVAL` batches and resizes
+the batch via `next_adaptive_batch_size` — PG via `pg_sample_checkpoints_req`
+(`src/source/postgres/mod.rs`), MySQL via `mysql_sample_innodb_log_waits`
+(`src/source/mysql/mod.rs:444-464`). So the control loop exists; it adjusts
+*batch size* off *one* proxy signal.
 
-**Opportunity.** `rivet-mcp` already reads the live pressure signals
-(`pg_stat_activity` active/lock-wait/idle-in-txn, pgBouncer saturation; MySQL
-`SHOW PROCESSLIST`) — the *sensing half* of a control loop is already built but
-not wired to execution. Close the loop: a dynamic governor that backs off
-parallelism / increases `throttle_ms` when source pressure rises (lock waits,
-replication lag, active-query count) and ramps back when it clears.
+**The actual gap (two dimensions the current loop doesn't cover):**
+1. **It governs batch size, not parallelism / connection count.**
+   `Source: Send` not `Sync` (ADR-0011) means `parallel=16` holds 16 connections
+   against exactly the fragile, low-`max_connections` source the tool protects.
+   That count is static — the governor never backs it off. Extend the loop to
+   adjust the in-process semaphore permit count (and `throttle_ms`) within
+   `[min, max]`, not just batch size.
+2. **It reads one proxy signal, not the richer `rivet-mcp` set.** `rivet-mcp`
+   already exposes `pg_stat_activity` (active / lock-wait / idle-in-txn),
+   pgBouncer saturation, and MySQL `SHOW PROCESSLIST`. Feed those into the same
+   governor so back-off reacts to real contention (lock waits, replication lag,
+   active-query count), not just checkpoint/log-wait pressure. One pressure
+   model shared between `rivet-mcp` and the run loop.
 
 **Proposed change.**
-- A `tuning.adaptive` opt-in that periodically samples source-side pressure and
-  adjusts the in-process semaphore permit count + inter-FETCH throttle within
-  configured `[min, max]` bounds.
-- Reuse the `rivet-mcp` read-only query surface so there is one pressure model,
-  not two.
-- Surface governor decisions in the run journal ("backed off 16→8 at T+45s:
-  lock_waits=12").
+- Promote the existing adaptive loop from "resize batch" to a governor that also
+  resizes the active permit count + throttle.
+- Reuse the `rivet-mcp` read-only query surface as the pressure source.
+- Surface governor decisions in the run journal ("backed off parallel 16→8 at
+  T+45s: lock_waits=12").
 
 **Definition of done.** Under a synthetic concurrent-OLTP load fixture, an
 adaptive run keeps a source-side pressure metric below a threshold that a
@@ -1261,11 +1280,12 @@ v0.7.8; README/SECURITY document checksum verification against the published
 
 ## 10.2 Suggested execution order
 
-By impact ÷ effort:
+By impact ÷ effort (revised after source audit — the memory cap already exists,
+so OPT-1 drops from the top spot):
 
 1. **OPT-7** (doc/roadmap sync) — hours, removes a trust leak, unblocks accurate planning.
-2. **OPT-1** (hard memory bound) — foundational debt under the headline claim.
-3. **OPT-3** (property-based types) — most autonomous; immediately strengthens the trust story.
-4. **OPT-2** (adaptive governor) — the differentiating bet; do once the foundation is solid.
-5. **OPT-4** (MySQL parity / explicit degrade) — closes the engine asymmetry.
+2. **OPT-3** (property-based types) — most autonomous; immediately strengthens the trust story.
+3. **OPT-2** (adaptive governor → parallelism) — the differentiating bet; builds on the existing adaptive loop.
+4. **OPT-4** (MySQL parity / explicit degrade) — closes the engine asymmetry.
+5. **OPT-1** (memory residual: per-value cap + probe warmup) — edge-case hardening on an existing cap.
 6. **OPT-5 / OPT-6** — ergonomics + debt paydown, interleave as bandwidth allows.
