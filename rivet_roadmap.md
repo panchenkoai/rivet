@@ -1132,11 +1132,15 @@ the batch via `next_adaptive_batch_size` — PG via `pg_sample_checkpoints_req`
 
 **The actual gap (two dimensions the current loop doesn't cover):**
 1. **It governs batch size, not parallelism / connection count.**
-   `Source: Send` not `Sync` (ADR-0011) means `parallel=16` holds 16 connections
-   against exactly the fragile, low-`max_connections` source the tool protects.
-   That count is static — the governor never backs it off. Extend the loop to
-   adjust the in-process semaphore permit count (and `throttle_ms`) within
-   `[min, max]`, not just batch size.
+   The default `parallel` is **1** (`src/config/export.rs:319`, conservative),
+   but each chunk worker opens its *own* source connection inside `s.spawn`
+   (`src/pipeline/chunked/exec.rs:305`, gated by `Semaphore::new(parallel)` at
+   `exec.rs:246`) — `Source: Send` not `Sync` (ADR-0011). So a user who dials
+   `parallel: N` holds up to N connections against exactly the fragile,
+   low-`max_connections` source the tool protects. Preflight only *warns*
+   (`src/preflight/analysis.rs:164-182`); the count is static at runtime — the
+   governor never backs it off. Extend the loop to adjust the semaphore permit
+   count (and `throttle_ms`) within `[min, max]`, not just batch size.
 2. **It reads one proxy signal, not the richer `rivet-mcp` set.** `rivet-mcp`
    already exposes `pg_stat_activity` (active / lock-wait / idle-in-txn),
    pgBouncer saturation, and MySQL `SHOW PROCESSLIST`. Feed those into the same
