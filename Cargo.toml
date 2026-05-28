@@ -8,7 +8,7 @@ repository = "https://github.com/panchenkoai/rivet"
 description = "Rivet: PostgreSQL/MySQL → Parquet/CSV (local, S3, GCS). Crate name rivet-cli; binary rivet."
 readme = "README.md"
 default-run = "rivet"
-exclude = ["dev/", "USER_TEST_PLAN.md", "tests/", ".github/"]
+exclude = ["dev/", "USER_TEST_PLAN.md", "tests/", ".github/", "docs/gifs/"]
 
 [lib]
 name = "rivet"

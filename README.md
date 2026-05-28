@@ -15,7 +15,7 @@
 
 > Not sure if Rivet fits your problem? [docs/who-is-this-for.md](docs/who-is-this-for.md) is a 60-second fit-check.
 
-![rivet basic workflow — init, doctor, check, run, state](docs/gifs/basic.gif)
+![rivet basic workflow — init, doctor, check, run, state](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/basic.gif)
 
 ## 30-second quickstart
 
@@ -175,7 +175,7 @@ rivet run -c rivet.yaml
 
 ## More walkthroughs
 
-[plan / apply](docs/gifs/plan-apply.gif) · [plan campaign — multi-export waves](docs/gifs/plan-campaign.gif) · [reconcile + repair](docs/gifs/reconcile-repair.gif) · [parallel cards UI](docs/gifs/parallel-cards.gif) · [composite cursor (COALESCE fallback)](docs/gifs/coalesce-cursor.gif) · [pool detection](docs/gifs/pool-detect.gif) · [discovery artifact (`rivet init --discover`)](docs/gifs/discover-artifact.gif) · [post-run inspect](docs/gifs/inspect.gif). Source scripts in [docs/gifs/](docs/gifs/).
+[plan / apply](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/plan-apply.gif) · [plan campaign — multi-export waves](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/plan-campaign.gif) · [reconcile + repair](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/reconcile-repair.gif) · [parallel cards UI](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/parallel-cards.gif) · [composite cursor (COALESCE fallback)](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/coalesce-cursor.gif) · [pool detection](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/pool-detect.gif) · [discovery artifact (`rivet init --discover`)](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/discover-artifact.gif) · [post-run inspect](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/inspect.gif). Source scripts in [docs/gifs/](https://github.com/panchenkoai/rivet/tree/main/docs/gifs).
 
 ---
 
