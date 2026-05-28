@@ -5,7 +5,9 @@
 //! All decisions (format, compression, quality rules) come from `ResolvedRunPlan`.
 
 mod cursor;
+mod pipelined;
 pub(crate) use cursor::extract_last_cursor_value;
+pub(crate) use pipelined::PipelinedSink;
 
 use std::io::BufWriter;
 use std::sync::Arc;
@@ -30,7 +32,7 @@ pub(crate) struct CompletedPart {
 }
 
 pub(crate) struct ExportSink {
-    pub(in crate::pipeline) writer: Option<Box<dyn FormatWriter>>,
+    pub(in crate::pipeline) writer: Option<Box<dyn FormatWriter + Send>>,
     pub(in crate::pipeline) format_type: FormatType,
     pub(in crate::pipeline) compression: CompressionType,
     pub(in crate::pipeline) compression_level: Option<u32>,

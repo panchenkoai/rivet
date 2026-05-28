@@ -200,18 +200,30 @@ pub(super) fn run_single_export(
     state: Option<&StateStore>,
     summary: &mut RunSummary,
 ) -> Result<()> {
-    let mut sink = ExportSink::new(plan)?;
+    let request = source::ExportRequest {
+        query,
+        incremental: plan.strategy.incremental_plan(),
+        cursor,
+        tuning: &plan.tuning,
+        column_overrides: &plan.column_overrides,
+    };
 
-    src.export(
-        &source::ExportRequest {
-            query,
-            incremental: plan.strategy.incremental_plan(),
-            cursor,
-            tuning: &plan.tuning,
-            column_overrides: &plan.column_overrides,
-        },
-        &mut sink,
-    )?;
+    // Pipelined path (experimental, `RIVET_PIPELINE_WRITES`): the source thread
+    // only fetches + converts; a worker thread owns the ExportSink and does the
+    // parquet encode/compress so DB I/O overlaps with compression CPU. The
+    // worker error (if any) is recovered by `finish()` and takes precedence
+    // over the source-side error.
+    let mut sink = if super::sink::PipelinedSink::enabled() {
+        let mut psink = super::sink::PipelinedSink::spawn(plan)?;
+        let export_result = src.export(&request, &mut psink);
+        let sink = psink.finish()?;
+        export_result?;
+        sink
+    } else {
+        let mut sink = ExportSink::new(plan)?;
+        src.export(&request, &mut sink)?;
+        sink
+    };
 
     // Test fault-point #1: after the source stream was fully read but
     // before the writer is finalised.  Exercised by QA backlog Task 1.1.

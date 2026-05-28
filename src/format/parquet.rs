@@ -55,7 +55,7 @@ impl super::Format for ParquetFormat {
         &self,
         schema: &SchemaRef,
         writer: Box<dyn Write + Send>,
-    ) -> Result<Box<dyn super::FormatWriter>> {
+    ) -> Result<Box<dyn super::FormatWriter + Send>> {
         let mut builder = WriterProperties::builder().set_compression(self.build_compression());
         if self.row_group_rows.is_some() {
             builder = builder.set_max_row_group_row_count(self.row_group_rows);
