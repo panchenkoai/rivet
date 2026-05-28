@@ -445,6 +445,17 @@ pub fn verify_at_destination(
                 if obj.key.contains(crate::manifest::QUARANTINE_PREFIX) {
                     continue;
                 }
+                // Skip `rivet doctor`'s writability probe — a Rivet-internal
+                // sidecar, not foreign data.  A `doctor` → `run --validate`
+                // sequence against the same prefix would otherwise flag it.
+                if obj
+                    .key
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|name| name == crate::manifest::DOCTOR_PROBE_FILENAME)
+                {
+                    continue;
+                }
                 out.failures.push(Failure::UntrackedObject {
                     key: obj.key,
                     size_bytes: obj.size_bytes,
@@ -826,6 +837,35 @@ mod tests {
                 .any(|f| matches!(f, Failure::UntrackedObject { .. })),
             "quarantine_prefix is the legitimate home for these — must not flag"
         );
+    }
+
+    #[test]
+    fn doctor_probe_is_not_flagged_as_untracked() {
+        // Regression: `rivet doctor` writes `.rivet_doctor_probe` at the
+        // destination prefix and never removes it.  A subsequent
+        // `rivet run --validate` against the same prefix must treat it as a
+        // Rivet sidecar, not foreign data — otherwise `has_failures()` trips
+        // and the run's `validated` flag is downgraded to FAIL.
+        let dir = tempfile::tempdir().unwrap();
+        let m = build_manifest(
+            vec![part(1, 10, 4, "xxh3:1111111111111111")],
+            ManifestStatus::Success,
+        );
+        write_dataset(dir.path(), &m, &[("part-000001.parquet", b"AAAA")]);
+        std::fs::write(
+            dir.path().join(crate::manifest::DOCTOR_PROBE_FILENAME),
+            b"ok",
+        )
+        .unwrap();
+        let dest = local_dest(dir.path());
+
+        let v = verify_at_destination(&dest, "").unwrap();
+        assert!(
+            !v.has_failures(),
+            "doctor probe must not surface as a failure: {:?}",
+            v.failures
+        );
+        assert!(v.passed);
     }
 
     // ── manifest_dir join semantics ─────────────────────────────────────

@@ -31,7 +31,7 @@ It does not cover database / network / disk failures whose mode is external to R
 | **Batch** | One `FETCH` worth of rows materialized as an Arrow `RecordBatch`. Streamed; never accumulated in memory. |
 | **Chunk** | A row range (chunked mode) processed as one unit. Produces one output file. Has a checkpoint row in the state DB. |
 | **Cursor** | The last extracted value for incremental exports. Stored in `export_state.last_cursor_value`. |
-| **Manifest** | The per-export record of files written to the destination (`export_files` table). |
+| **File log** | The per-export ledger of files written to the destination (`file_log` table, renamed from `file_manifest` in schema v8). |
 | **Journal** | A per-run event log (`*.jsonl`). Authoritative for "what happened when" during one run. |
 | **Progression** | The committed / verified boundary per export (`export_progression` table). Advisory only. |
 

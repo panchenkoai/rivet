@@ -87,6 +87,7 @@ fn export_one_chunk_range(
 
     if plan.validate {
         validate_output(sink.tmp.path(), plan.format, sink.total_rows)?;
+        summary.validated = Some(true);
     }
     let file_bytes = std::fs::metadata(sink.tmp.path())
         .map(|m| m.len())

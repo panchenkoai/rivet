@@ -146,11 +146,10 @@ fn pg_edge_decimal_boundaries_round_trip() {
     let stdout = duckdb_run_python(&format!(
         r#"
 import pyarrow.parquet as pq, glob
-paths = sorted(glob.glob({glob_repr}))
+paths = sorted(glob.glob('{glob}'))
 t = pq.read_table(paths[0])
 print(str(t.column('d39_10').to_pylist()[0]))
 "#,
-        glob_repr = format!("'{glob}'"),
     ));
     assert_eq!(
         stdout.trim(),

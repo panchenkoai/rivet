@@ -62,9 +62,10 @@ impl ChunkProgress {
             // thread active.  Either way the indicatif bar is just noise.
             ProgressBar::with_draw_target(Some(total_chunks as u64), ProgressDrawTarget::hidden())
         } else {
-            // Sequential / single-export run: a bare indicatif bar is the
-            // right tool — it owns the bottom of stderr and there is no
-            // other concurrent producer that would step on its redraws.
+            // Sequential run with piped/non-attended stderr (CI): a bare
+            // indicatif bar is fine — no concurrent producer would step on
+            // its redraws.  Attended sequential runs install the in-process
+            // card UI in `run.rs` and take the `capturing` branch above.
             let b = ProgressBar::new(total_chunks as u64);
             b.set_style(
                 ProgressStyle::with_template(

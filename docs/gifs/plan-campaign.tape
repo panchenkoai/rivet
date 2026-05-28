@@ -31,4 +31,4 @@ Sleep 1500ms
 
 Type "rivet plan --config campaign.yaml"
 Enter
-Sleep 6s
+Sleep 12s

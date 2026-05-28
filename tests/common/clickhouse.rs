@@ -2,9 +2,9 @@
 //!
 //! Tests reach the long-running `rivet-clickhouse` container via the HTTP
 //! interface on :8123 (see `docker-compose.yaml`). The native protocol on
-//! :9002 is published too but no Rust ClickHouse client is used here — HTTP
-//! + `FORMAT JSON` is enough for read-back validation and avoids pulling a
-//! new dep.
+//! :9002 is published too but no Rust ClickHouse client is used here — an
+//! HTTP request with `FORMAT JSON` is enough for read-back validation and
+//! avoids pulling a new dep.
 //!
 //! Path / workdir helpers (`live_container_path`, `live_shared_workdir`)
 //! live in [`super::env`] because they are shared with the DuckDB validator

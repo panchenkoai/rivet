@@ -32,7 +32,16 @@ PG_DB="${PGDATABASE:-rivet}"
 DATABASE_URL="postgresql://${PG_USER}:${PG_PASSWORD}@${PG_HOST}:${PG_PORT}/${PG_DB}"
 
 export PGPASSWORD="$PG_PASSWORD"
-psql_() { psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -v ON_ERROR_STOP=1 "$@"; }
+psql_() {
+    if command -v psql >/dev/null 2>&1; then
+        psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -v ON_ERROR_STOP=1 "$@"
+    elif [[ -x /opt/homebrew/opt/libpq/bin/psql ]]; then
+        /opt/homebrew/opt/libpq/bin/psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -v ON_ERROR_STOP=1 "$@"
+    else
+        docker compose -f "$REPO_ROOT/docker-compose.yaml" exec -T postgres \
+            psql -U "$PG_USER" -d "$PG_DB" -v ON_ERROR_STOP=1 "$@"
+    fi
+}
 
 log() { printf '\033[1;34m[gifs]\033[0m %s\n' "$*" >&2; }
 
@@ -55,9 +64,22 @@ ensure_prereqs() {
 # ----- Fixture management ----------------------------------------------------
 
 fixture_basic_setup() {
-    # Basic scenario uses the already-seeded public.orders from dev/postgres/init.sql.
-    # No extra work needed.
-    :
+    # Keep `public.orders` in the chunked band (~250K rows) so `rivet init`
+    # picks chunked mode and `rivet run` finishes inside the GIF window.
+    psql_ <<'SQL'
+TRUNCATE orders RESTART IDENTITY CASCADE;
+INSERT INTO orders (user_id, product, quantity, price, status, notes, ordered_at, updated_at)
+SELECT (g % 500) + 1,
+       'sku-' || g,
+       (g % 5) + 1,
+       (g % 100) + 0.99,
+       'pending',
+       'gif-fixture',
+       NOW() - (g || ' minutes')::interval,
+       NOW() - (g || ' minutes')::interval
+FROM generate_series(1, 250000) AS g;
+ANALYZE orders;
+SQL
 }
 fixture_basic_teardown() { :; }
 

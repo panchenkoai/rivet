@@ -265,6 +265,6 @@ fn clickhouse_validates_mysql_type_matrix_parquet() {
     let bits = ch_one(&format!(
         "SELECT c_bit1, toString(c_bit8) AS bit8 FROM file('{glob}', 'Parquet') WHERE id = 1"
     ));
-    assert_eq!(bits["c_bit1"].as_bool().unwrap(), true);
+    assert!(bits["c_bit1"].as_bool().unwrap());
     assert_eq!(bits["bit8"].as_str().unwrap(), "255");
 }

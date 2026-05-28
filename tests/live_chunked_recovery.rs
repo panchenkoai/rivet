@@ -91,6 +91,18 @@ fn manifest_total_rows(cfg: &std::path::Path, export: &str) -> i64 {
         .unwrap_or(0)
 }
 
+/// `validated` flag from the latest `export_metrics` row (NULL → None).
+fn latest_metric_validated(cfg: &std::path::Path, export: &str) -> Option<bool> {
+    open_state_db(cfg)
+        .query_row(
+            "SELECT validated FROM export_metrics WHERE export_name = ?1 ORDER BY id DESC LIMIT 1",
+            [export],
+            |r| r.get::<_, Option<bool>>(0),
+        )
+        .ok()
+        .flatten()
+}
+
 // ─── C1: crash after chunk 0 complete → resume skips chunk 0 ─────────────────
 
 #[test]
@@ -634,5 +646,64 @@ exports:
         parquet_files.len() >= EXPECTED_CHUNKS as usize,
         "at least {EXPECTED_CHUNKS} parquet files must exist; found {}: {parquet_files:?}",
         parquet_files.len()
+    );
+}
+
+// ─── C5: clean sequential checkpoint run records `validated` ──────────────────
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn chunked_sequential_checkpoint_validate_records_validated_metric() {
+    // Regression: the sequential checkpoint path ran `validate_output` but never
+    // set `summary.validated`, so chunked + `chunk_checkpoint: true` + default
+    // `parallel: 1` runs stored `validated = NULL` in `export_metrics` and the
+    // summary block dropped the `validated: pass` line — even though every chunk
+    // file was validated.  The other three chunked paths (exec, parallel
+    // checkpoint) set the flag; this pins the sequential one to match.
+    require_alive(LiveService::Postgres);
+
+    let table = seed_pg_numeric_table(150);
+    let export = unique_name("c5_seq_validated");
+    let out = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        r#"
+source: {{type: postgres, url: "{POSTGRES_URL}"}}
+exports:
+  - name: {export}
+    query: "SELECT id, name FROM {table_name}"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 50
+    chunk_checkpoint: true
+    format: parquet
+    destination: {{type: local, path: {dir}}}
+"#,
+        table_name = table.name(),
+        dir = out.path().display()
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    let run = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+            "--validate",
+        ])
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        run.status.success(),
+        "clean validated run must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    assert_eq!(
+        latest_metric_validated(&cfg, &export),
+        Some(true),
+        "sequential checkpoint + --validate must record validated=true in export_metrics"
     );
 }

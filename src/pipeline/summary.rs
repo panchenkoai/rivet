@@ -338,10 +338,14 @@ impl RunSummary {
             return;
         }
 
-        // Compact mode (multiple exports in this run): print one line per
-        // export so 15 exports take 15 stderr rows instead of ~100.
-        // Verbose 7-line block is reserved for single-export `rivet run`
-        // invocations where the extra detail has room to breathe.
+        self.print_stderr_block();
+    }
+
+    /// Write the per-export summary block to stderr, bypassing IPC capture.
+    /// Used after the in-process card UI finishes on single-export sequential
+    /// runs so operators still get the detailed `── name ──` block below the
+    /// live card line.
+    pub(super) fn print_stderr_block(&self) {
         let block = if multi_export_mode() {
             self.render_compact()
         } else {

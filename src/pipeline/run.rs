@@ -297,6 +297,18 @@ pub fn run(
         }
     } else {
         let state = StateStore::open(config_path)?;
+
+        // Always route through `parent_ui` — same as `--parallel-exports`.
+        // Gating on `is_attended()` left VHS/ttyd on indicatif when the
+        // attended bit is unset; `run_ui` already falls back to linear
+        // mode for piped stderr.
+        let (tx, rx) = std::sync::mpsc::channel::<parent_ui::UiMessage>();
+        ipc::install_in_process_tx(tx);
+        let ui_thread = std::thread::Builder::new()
+            .name("rivet-ui".to_string())
+            .spawn(move || parent_ui::run_ui(rx))
+            .ok();
+
         for export in &exports {
             let (res, summary) =
                 job::run_export_job(config_path, &config, export, &state, &config_dir, &opts);
@@ -304,6 +316,18 @@ pub fn run(
                 failures.push(format!("{e:#}"));
             }
             summaries.push(summary);
+        }
+
+        ipc::clear_in_process_tx();
+        if let Some(t) = ui_thread {
+            let _ = t.join();
+        }
+        // Single-export sequential runs still emit the detailed block after
+        // the card commits to scrollback.
+        if exports.len() == 1
+            && let Some(summary) = summaries.last()
+        {
+            summary.print_stderr_block();
         }
     }
 

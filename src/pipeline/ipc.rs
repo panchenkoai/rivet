@@ -148,9 +148,8 @@ pub fn emit(event: &ChildEvent) {
 ///   serialise to stdout for the parent to consume.
 /// - `IN_PROCESS_TX` installed (`--parallel-exports`, threads): forward
 ///   through the in-process channel; `parent_ui::run_ui` renders.
-/// - Neither: nothing to do (stand-alone single export, sequential
-///   multi-export — those paths render through the per-export summary
-///   block + standalone indicatif bar instead).
+/// - Neither: nothing to do (non-tty stderr / CI pipes — those paths fall
+///   back to the per-export summary block + standalone indicatif bar).
 pub(crate) fn emit_event(event: &ChildEvent) {
     if ipc_events_enabled() {
         emit(event);

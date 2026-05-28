@@ -133,7 +133,7 @@ fn check_source_auth(config: &Config) -> Result<()> {
 fn check_destination_auth(dest: &crate::config::DestinationConfig) -> Result<()> {
     use crate::destination::create_destination;
     let d = create_destination(dest)?;
-    let probe_key = ".rivet_doctor_probe";
+    let probe_key = crate::manifest::DOCTOR_PROBE_FILENAME;
     let tmp = std::env::temp_dir().join(probe_key);
     std::fs::write(&tmp, b"ok")?;
     match d.write(&tmp, probe_key) {

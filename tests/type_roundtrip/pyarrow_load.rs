@@ -49,7 +49,7 @@ fn pyarrow_validates_postgres_field_metadata_and_stats() {
 import json, glob, sys
 import pyarrow.parquet as pq
 
-paths = sorted(glob.glob({glob_repr}))
+paths = sorted(glob.glob('{glob}'))
 assert paths, "no parquet matched"
 table = pq.read_table(paths[0])
 schema = table.schema
@@ -97,7 +97,6 @@ for rg_idx in range(pqf.num_row_groups):
 
 print(json.dumps({{"fields": fields, "stats": stats}}))
 "#,
-        glob_repr = format!("'{glob}'"),
     );
     let v = duckdb_run_python_json(&py);
     let fields = &v["fields"];
@@ -156,9 +155,8 @@ print(json.dumps({{"fields": fields, "stats": stats}}))
         "note_all_null null_count: {nall:?}"
     );
     // Min/max are unset for an all-null column — pyarrow has_min_max == false.
-    assert_eq!(
-        nall["has_min_max"].as_bool().unwrap_or(true),
-        false,
+    assert!(
+        !nall["has_min_max"].as_bool().unwrap_or(true),
         "note_all_null must report has_min_max=false"
     );
 
@@ -198,7 +196,7 @@ fn pyarrow_validates_mysql_field_metadata_and_stats() {
 import json, glob
 import pyarrow.parquet as pq
 
-paths = sorted(glob.glob({glob_repr}))
+paths = sorted(glob.glob('{glob}'))
 table = pq.read_table(paths[0])
 pqf = pq.ParquetFile(paths[0])
 
@@ -232,7 +230,6 @@ for i in range(rg.num_columns):
     }}
 print(json.dumps({{"fields": fields, "stats": stats}}))
 "#,
-        glob_repr = format!("'{glob}'"),
     );
     let v = duckdb_run_python_json(&py);
     let fields = &v["fields"];
