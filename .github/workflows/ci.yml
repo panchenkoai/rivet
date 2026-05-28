@@ -1,10 +1,14 @@
 name: CI
 
 # Required branch-protection checks (set in Settings → Branches → main):
-#   fmt · clippy · test · test-invariants · test-recovery · test-compatibility · test-stability
+#   fmt · clippy · test · test-invariants · test-recovery · test-compatibility ·
+#   test-stability · test-type-validators
 #
-# The three semantic-gate jobs below run each suite in isolation so GitHub can
+# The semantic-gate jobs below run each suite in isolation so GitHub can
 # block merges on named regressions, not just overall build failures.
+# `test-type-validators` brings up the DuckDB/ClickHouse oracle containers so
+# the type round-trip suite (previously only runnable by hand via the Makefile)
+# is enforced on every PR.
 
 on:
   push:
@@ -141,6 +145,36 @@ jobs:
 
       - name: Run type-golden tests
         run: cargo test --release --test live_type_golden -- --ignored
+
+      - name: Stop services
+        if: always()
+        run: docker compose down
+
+  test-type-validators:
+    name: Type round-trip validators — DuckDB · ClickHouse · pyarrow (semantic gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start source + oracle containers
+        # postgres/mysql are the sources; duckdb + clickhouse are independent
+        # Parquet *readers* (ADR-0014 oracles) that read back what rivet wrote
+        # and assert field-by-field type fidelity. The duckdb image pip-installs
+        # duckdb/pytz/pyarrow on boot, so `--wait` blocks on its healthcheck
+        # (start_period 30s) before tests run. All four share the
+        # ./tests/.live-tmp:/work bind mount the readers glob over.
+        run: docker compose up -d --wait postgres mysql duckdb clickhouse
+
+      - name: Run type round-trip validators
+        # Force the `#[ignore]`d live validators to run. `--skip bigquery`
+        # drops the two cloud-warehouse tests — they need a real GCP project +
+        # `bq` CLI that CI has no credentials for (covered by the manual
+        # `make test-types-bigquery` target instead).
+        run: cargo test --release --test type_roundtrip -- --include-ignored --skip bigquery
 
       - name: Stop services
         if: always()
