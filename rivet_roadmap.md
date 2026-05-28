@@ -1037,3 +1037,235 @@ with verify-layer work as bandwidth allows.
 - [ ] Release checksums
 - [ ] Signed releases / attestations
 - [ ] SBOM
+
+---
+
+# 10. Engineering Optimization Backlog (v0.7.8 release + code audit)
+
+This section captures findings from a code-level audit conducted against the
+v0.7.8 release (tag, release notes, artifacts) and the live source tree. Unlike
+§5–§9 (feature epics), these are **hardening / optimization releases**: each one
+closes a gap between a documented promise and what the engine actually
+guarantees, or removes a structural risk. They are ordered by
+**impact ÷ uniqueness** — OPT-1 is foundational debt under the headline claim;
+OPT-2 is the most differentiating new capability.
+
+The audit also confirmed what is *already sound* and should not be re-litigated:
+the I1–I8 invariant model + failure-point map (ADR-0001), SQLite `WAL` +
+`busy_timeout` (`src/state/mod.rs:537-549`), the single-held-runtime async bridge
+for OpenDAL destinations (`src/destination/gcs.rs:51-76`, no `block_on`-per-call),
+and the two-engine separation with explicit revisit triggers (ADR-0010).
+
+## 10.1 Findings summary
+
+| ID | Area | Priority | Status | One-line |
+|---|---|---|---|---|
+| OPT-1 | Memory safety | P0 | ⏳ Open | Memory guard is reactive sampling, not a hard bound — one wide row/batch can blow the budget |
+| OPT-2 | Adaptive concurrency | P1 | ⏳ Open | Close the `rivet-mcp` sensing loop: drive parallelism from observed source pressure |
+| OPT-3 | Type fidelity | P1 | ⏳ Open | Round-trip proof is enumerated-fixture, not by-construction; add property-based testing |
+| OPT-4 | MySQL parity | P1 | ⏳ Open | "Source-safe" is architecturally weaker on MySQL (no server-side cursor) — make degradation explicit |
+| OPT-5 | Dedup ergonomics | P2 | ⏳ Open | At-least-once pushes all dedup to consumer; no idempotency token in manifest |
+| OPT-6 | Engine debt | P2 | ⏳ Open | Two engines = double maintenance; verify crash-matrix symmetry across both |
+| OPT-7 | Doc/roadmap drift | P1 | ⏳ Open | Several ⏳ items already shipped in 0.7.8; checksums ship but docs say "rebuild from source" |
+
+---
+
+## OPT-1 — Hard memory bound (byte-budgeted batches + per-value cap)
+
+**Priority: P0** — this is debt directly under the headline "won't OOM your box" promise.
+
+**Problem.** Memory protection is a *reactive sampler*, not a hard bound.
+`resource::check_memory(memory_threshold_mb)` is polled at chunk-dispatch and
+batch boundaries (`src/pipeline/chunked/exec.rs:66,269,271`;
+`sequential_checkpoint.rs:235,241`; `parallel_checkpoint.rs:164`), and peak RSS
+is tracked by a background sampler thread (`src/resource.rs`). But a single
+`FETCH N` materialises a full Arrow `RecordBatch` into memory *before* the guard
+runs. The documented model `peak ≈ batch_size × avg_row_size × parallel_threads`
+(`docs/architecture.md § Memory model`) uses the **average** row size — variance
+is the killer. One pathological wide value (a 200 MB JSONB / `bytea`), or a burst
+of wide rows in one batch, overshoots the budget between two samples.
+
+**Evidence.** `src/resource.rs` (sampling + `get_rss_mb`), guard call sites above,
+memory model in `docs/architecture.md`. The §9.6.1 finding *"check verdict
+pessimism vs actual run"* is the same root cause seen from the predictor side:
+the budget math doesn't use row width.
+
+**Proposed change.**
+- Byte-budgeted batches: cap `FETCH N` by cumulative serialized bytes, not row
+  count — adapt N downward when observed row width is high.
+- Hard per-value size limit with a typed error (`RIVET_VALUE_TOO_LARGE`) instead
+  of letting a single fat cell drive an OOM.
+- Feed the measured row width back into the `check` predictor (tightens the
+  pessimistic UNSAFE/DEGRADED verdict, §9.6.1).
+
+**Definition of done.** A fixture with a deliberately fat value column
+(e.g. 256 MB JSONB rows) exports under a set `memory_threshold_mb` without RSS
+exceeding the budget by more than one batch's worth; regression test in the
+soak matrix.
+
+---
+
+## OPT-2 — Adaptive concurrency governor (close the `rivet-mcp` sensing loop)
+
+**Priority: P1** — the single most *differentiating* item. dlt / sling don't have it.
+
+**Problem.** `Source: Send` not `Sync` (ADR-0011) means each chunk thread holds
+its own connection, so `parallel=16` burns 16 connections against exactly the
+fragile, low-`max_connections` source the tool exists to protect. Today this is
+a one-shot warning (`rivet check`), not a runtime control. The thing that makes
+Rivet fast is the thing a fragile source cannot afford — and the throttle is
+static.
+
+**Opportunity.** `rivet-mcp` already reads the live pressure signals
+(`pg_stat_activity` active/lock-wait/idle-in-txn, pgBouncer saturation; MySQL
+`SHOW PROCESSLIST`) — the *sensing half* of a control loop is already built but
+not wired to execution. Close the loop: a dynamic governor that backs off
+parallelism / increases `throttle_ms` when source pressure rises (lock waits,
+replication lag, active-query count) and ramps back when it clears.
+
+**Proposed change.**
+- A `tuning.adaptive` opt-in that periodically samples source-side pressure and
+  adjusts the in-process semaphore permit count + inter-FETCH throttle within
+  configured `[min, max]` bounds.
+- Reuse the `rivet-mcp` read-only query surface so there is one pressure model,
+  not two.
+- Surface governor decisions in the run journal ("backed off 16→8 at T+45s:
+  lock_waits=12").
+
+**Definition of done.** Under a synthetic concurrent-OLTP load fixture, an
+adaptive run keeps a source-side pressure metric below a threshold that a
+static `parallel=N` run breaches; decisions visible in `rivet journal`.
+
+---
+
+## OPT-3 — Property-based type round-trip (proof by construction)
+
+**Priority: P1** — converts type rigor from "many tests" to "provable".
+
+**Problem.** The four-reader round-trip matrix (`tests/type_roundtrip/`) is
+excellent but proves only the **enumerated** types. `UNSIGNED BIGINT → Decimal128`
+was found *by example* in 0.7.8 — a symptom that integer-width / precision
+overflow is a *class* found one funeral at a time. The long tail
+(`numeric(1000,…)`, arrays-of-composite, domains, ranges, `citext`/`hstore`/
+PostGIS, MySQL `ZEROFILL`/`BIT`/`SET` edge cases) is where silent corruption
+lives.
+
+**Proposed change.** A property-based harness that generates random schemas +
+values for the supported type universe, exports, reads back through ≥1
+independent reader, and asserts value + metadata equality. Shrink failing cases
+to a minimal reproducer.
+
+**Definition of done.** `make test-types-property` runs N generated schemas in CI
+(PR tier: small N; nightly: large N) and any discovered mismatch fails the gate
+with a minimized fixture checked into `tests/type_roundtrip/`.
+
+---
+
+## OPT-4 — MySQL safety parity (or explicit degraded mode)
+
+**Priority: P1** — the headline "source-safe" property is asymmetric across engines.
+
+**Problem.** PostgreSQL gets `DECLARE CURSOR` + `work_mem`-aware `FETCH N`
+(0.19 s longest query). MySQL has no widely-supported server-side cursor in the
+current client stack, so safety rests on PK-range chunking (9 s), which *requires*
+a clean monotonic numeric PK. On a MySQL table with composite / UUID / no PK the
+"don't hold a long query, don't OOM" guarantee silently degrades to a buffered
+read or an expensive global sort. The weaker engine is also the more common
+"fragile shared prod" case in the SMB segment.
+
+**Proposed change.**
+- Either: pursue a streaming read shape on MySQL that bounds memory without a
+  clean PK (e.g. keyset pagination on the best available index).
+- Or (cheaper first step): make the unsafe shape an explicit `opt-in` —
+  `rivet check` / `rivet run` refuses the buffered/sort path on MySQL unless the
+  operator acknowledges the degraded guarantee, instead of falling into it.
+
+**Definition of done.** A MySQL table with no usable PK either exports under a
+bounded memory budget, or fails preflight with a clear degraded-mode
+acknowledgement requirement — never silently buffers the whole table.
+
+---
+
+## OPT-5 — Deterministic dedup token in the manifest
+
+**Priority: P2** — makes "boring" boring all the way downstream.
+
+**Problem.** I3 (Write-Before-Cursor) is correct, but a crash between write and
+cursor advance produces a duplicate file, and the manifest carries no run-scoped
+idempotency key / content hash a downstream `MERGE` can dedup on deterministically.
+"Boring extraction" that needs a hand-written dedup recipe
+(`recipes/idempotent-warehouse-load.md`) isn't fully boring.
+
+**Proposed change.** Stamp each manifest entry (and optionally the filename) with
+a deterministic content hash + `(chunk_id, cursor_range)` so downstream dedup is
+mechanical, not convention-based. Pairs naturally with the existing xxHash3 used
+in quality gates.
+
+**Definition of done.** Two runs that re-extract the same window after a simulated
+SIGKILL produce files whose manifest dedup keys collide, so a consumer can drop
+the duplicate by key alone. Closes the §9.6.1 open *"I3 at-least-once dupe
+scenario not covered by tests"* with an end-to-end SIGKILL-between-write-and-commit
+test.
+
+---
+
+## OPT-6 — Two-engine maintenance debt + crash-matrix symmetry
+
+**Priority: P2** — accepted debt (ADR-0010), but it compounds.
+
+**Problem.** ADR-0010 honestly lists the cost: two retry loops, two progress UIs,
+two error-aggregation paths. Every cross-cutting feature (graceful shutdown,
+tracing, OPT-2 governor, OPT-5 dedup token) must be built twice or it drifts. The
+highest-risk corner is SIGTERM / parquet-footer finalization in the subprocess
+engine — the classic "killed mid-run leaves a corrupt parquet" regression site.
+
+**Proposed change.**
+- Audit `dev/CRASH_MATRIX.md` for **symmetry**: every crash scenario should run
+  against both the in-process thread engine (`src/pipeline/chunked/exec.rs`) and
+  the subprocess fan-out engine (`src/pipeline/parallel_children.rs`).
+- Add the OPT-2/OPT-5 cross-cutting features to a shared layer where possible so
+  they are not implemented twice.
+
+**Definition of done.** The crash matrix asserts no corrupt/footerless output
+file under SIGTERM/SIGKILL for *both* engines, and the gap (if any) is documented
+as a known non-guarantee.
+
+---
+
+## OPT-7 — Doc / roadmap drift sync (cheap, do first)
+
+**Priority: P1** — near-zero effort, removes a credibility leak, and prevents
+re-planning work that is already done.
+
+**Findings.**
+- **Checksums already ship, docs say otherwise.** `release.yml:153` generates
+  `SHA256SUMS.txt`, and the v0.7.8 release publishes it as an asset — yet
+  `SECURITY.md:165-169` still tells users *"until checksums and signatures are
+  published, verify by rebuilding from source… `git checkout v0.6.0`"* (also a
+  stale tag), and §5.1 (line ~579) marks "Release checksums" as `⏳ Open / P1`.
+  The v0.7.8 release notes don't mention the checksums at all. → Add verification
+  instructions to README/SECURITY, mention checksums in release notes, flip
+  §5.1 + §9.7 to done.
+- **Several §9.6.1 ⏳ items were already fixed in 0.7.8 but not struck:** retry-safe
+  WARN demoted to DEBUG for local (line ~996), TLS warning now fires from
+  `doctor`/`check` (~997), `rivet init` explains its mode choice inline (~1002),
+  `chunk_size` scaled to row estimate (~1004), `status: skipped (no new rows since
+  cursor X)` (~1005). The 0.7.8 release notes' `polish(ux)` bullet is the evidence.
+  → Strike these so the backlog stops overstating remaining work.
+
+**Definition of done.** §5.1, §9.6.1, and §9.7 reflect the actual shipped state of
+v0.7.8; README/SECURITY document checksum verification against the published
+`SHA256SUMS.txt`.
+
+---
+
+## 10.2 Suggested execution order
+
+By impact ÷ effort:
+
+1. **OPT-7** (doc/roadmap sync) — hours, removes a trust leak, unblocks accurate planning.
+2. **OPT-1** (hard memory bound) — foundational debt under the headline claim.
+3. **OPT-3** (property-based types) — most autonomous; immediately strengthens the trust story.
+4. **OPT-2** (adaptive governor) — the differentiating bet; do once the foundation is solid.
+5. **OPT-4** (MySQL parity / explicit degrade) — closes the engine asymmetry.
+6. **OPT-5 / OPT-6** — ergonomics + debt paydown, interleave as bandwidth allows.
