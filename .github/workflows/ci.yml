@@ -178,6 +178,15 @@ jobs:
         # ./tests/.live-tmp:/work bind mount the readers glob over.
         run: docker compose up -d --wait postgres mysql duckdb clickhouse
 
+      - name: Reopen shared mount after ClickHouse chowns it
+        # ClickHouse chowns its user_files_path (/work = ./tests/.live-tmp) to
+        # the clickhouse uid (101) on startup. On Linux that propagates to the
+        # host and re-locks the dir the runner just created, so `create_dir_all`
+        # still fails with EACCES. Re-open it after the stack is up; the test
+        # writes per-run workdirs (world-readable), the reader containers read
+        # them back.
+        run: sudo chmod -R 0777 tests/.live-tmp
+
       - name: Run type round-trip validators
         # Force the `#[ignore]`d live validators to run. `--skip bigquery`
         # drops the two cloud-warehouse tests — they need a real GCP project +
