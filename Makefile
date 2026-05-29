@@ -1,7 +1,7 @@
 # Rivet developer shortcuts.
 # Requires Rust 1.94+ (see rust-toolchain.toml if present).
 
-.PHONY: test-types test-types-live test-types-validators test-types-bigquery
+.PHONY: test-types test-types-live test-types-property test-types-validators test-types-bigquery
 
 # PR-fast: offline type-mapping contracts (no docker).
 test-types:
@@ -10,6 +10,12 @@ test-types:
 # Full type matrix: MySQL + PostgreSQL × Parquet + CSV (docker required).
 test-types-live:
 	cargo test --test type_roundtrip -- --include-ignored
+
+# Property-based value round-trip (OPT-3): random in-range values → MySQL →
+# Parquet → read-back, asserting every value survives. Requires `docker compose
+# up -d mysql`. Tune case count with PROPTEST_CASES (default 12).
+test-types-property:
+	cargo test --test type_roundtrip mysql_value_roundtrip -- --ignored
 
 # Independent-reader validators: PG/MySQL matrix → Parquet → {DuckDB, ClickHouse}.
 # Requires `docker compose up -d postgres mysql duckdb clickhouse` first.
