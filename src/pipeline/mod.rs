@@ -10,6 +10,7 @@ mod aggregate;
 mod apply_cmd;
 pub(crate) mod chunked;
 mod cli;
+mod commit;
 mod finalize;
 pub(crate) mod ipc;
 mod job;

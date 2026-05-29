@@ -23,7 +23,6 @@ use super::manifest_writer;
 use super::{RunSummary, sink::ExportSink, validate::validate_output};
 use crate::config::IncrementalCursorMode;
 use crate::error::Result;
-use crate::journal::RunEvent;
 use crate::plan::{ExtractionStrategy, IncrementalCursorPlan, KeysetPlan, ResolvedRunPlan};
 use crate::source::{self, Source};
 use crate::state::StateStore;
@@ -100,11 +99,6 @@ pub(crate) fn run_keyset(
             validate_output(sink.tmp.path(), plan.format, rows)?;
             summary.validated = Some(true);
         }
-        let file_bytes = std::fs::metadata(sink.tmp.path())
-            .map(|m| m.len())
-            .unwrap_or(0);
-        summary.bytes_written += file_bytes;
-        summary.files_produced += 1;
 
         let fmt =
             format::create_format(plan.format, plan.compression, plan.compression_level, None);
@@ -116,41 +110,18 @@ pub(crate) fn run_keyset(
             fmt.file_extension()
         );
         let dest = destination::create_destination(&plan.destination)?;
-        dest.write(sink.tmp.path(), &file_name)?;
-
-        // ADR-0012 M1: record the committed part for the manifest.
-        manifest_writer::record_committed_part(
+        // Shared commit path (I1→I2→I7 + counters + journal + fault hooks).
+        let rec =
+            super::commit::write_part_file(dest.as_ref(), sink.tmp.path(), rows as i64, file_name)?;
+        super::commit::record_part(
+            plan,
             summary,
-            file_name.clone(),
-            rows as i64,
-            file_bytes,
-            sink.tmp.path(),
+            state,
+            &rec,
+            super::commit::PartKind::Chunk {
+                chunk_index: pages as i64,
+            },
         );
-
-        if let Some(st) = state
-            && let Err(e) = st.record_file(
-                &summary.run_id,
-                &plan.export_name,
-                &file_name,
-                rows as i64,
-                file_bytes as i64,
-                plan.format.label(),
-                Some(plan.compression.label()),
-            )
-        {
-            log::warn!(
-                "export '{}': file_log write failed for keyset page '{}' (file was produced): {:#}",
-                plan.export_name,
-                file_name,
-                e
-            );
-        }
-
-        summary.journal.record(RunEvent::ChunkCompleted {
-            chunk_index: pages as i64,
-            rows: rows as i64,
-            file_name: Some(file_name),
-        });
         log::info!(
             "export '{}': keyset page {} — {} rows",
             plan.export_name,

@@ -326,66 +326,30 @@ pub(super) fn run_single_export(
                 .record(RunEvent::ValidationResult { passed: true });
         }
 
-        let file_bytes = std::fs::metadata(part.tmp.path())
-            .map(|m| m.len())
-            .unwrap_or(0);
-        summary.bytes_written += file_bytes;
-        summary.files_produced += 1;
-
         let file_name = if has_parts {
             format!("{}_{}_part{}.{}", plan.export_name, ts, part_idx, ext)
         } else {
             format!("{}_{}.{}", plan.export_name, ts, ext)
         };
-        dest.write(part.tmp.path(), &file_name)?;
-        summary.files_committed += 1;
 
-        // Test fault-point #2: dest.write() just succeeded, but the manifest
-        // has NOT been updated yet.  Reproduces the ADR-0001 I2→I3 crash
-        // window (file at destination, no record in manifest, cursor not
-        // advanced).  QA backlog Task 1.1.
-        crate::test_hook::maybe_panic_at("after_file_write");
-
-        // ADR-0001 I2–I4 / ADR-0004: state writes happen only after destination.write()
-        // returns Ok(()), which for all current backends is the commit boundary.
-        // ADR-0012 M1: record the committed part on the run summary so the
-        // finalizer can assemble a RunManifest covering all parts.
-        crate::pipeline::manifest_writer::record_committed_part(
-            summary,
-            file_name.clone(),
-            part.rows as i64,
-            file_bytes,
+        // ADR-0001 I1→I2→I7 + the I2/I3 fault windows + the manifest/journal/
+        // counters all live in `commit::{write_part_file,record_part}` now (one
+        // home for the ordering that used to be copied across runners).
+        let rec = super::commit::write_part_file(
+            dest.as_ref(),
             part.tmp.path(),
+            part.rows as i64,
+            file_name,
+        )?;
+        super::commit::record_part(
+            plan,
+            summary,
+            state,
+            &rec,
+            super::commit::PartKind::File {
+                part_index: part_idx,
+            },
         );
-        summary.journal.record(RunEvent::FileWritten {
-            file_name: file_name.clone(),
-            rows: part.rows as i64,
-            bytes: file_bytes,
-            part_index: part_idx,
-        });
-
-        if let Some(st) = state
-            && let Err(e) = st.record_file(
-                &summary.run_id,
-                &plan.export_name,
-                &file_name,
-                part.rows as i64,
-                file_bytes as i64,
-                plan.format.label(),
-                Some(plan.compression.label()),
-            )
-        {
-            log::warn!(
-                "export '{}': manifest write failed for '{}' (file was produced): {:#}",
-                plan.export_name,
-                file_name,
-                e
-            );
-        }
-
-        // Test fault-point #3: manifest has just been recorded, but the
-        // cursor has NOT been advanced yet.  QA backlog Task 1.1.
-        crate::test_hook::maybe_panic_at("after_manifest_update");
     }
 
     if let (Some(last_val), Some(st)) = (&sink.last_cursor_value, state) {
