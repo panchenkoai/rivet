@@ -246,6 +246,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                         cursor: None,
                                         tuning: &plan_w.tuning,
                                         column_overrides: &plan_w.column_overrides,
+                                        page_limit: None,
                                     },
                                     &mut sink,
                                 )?;

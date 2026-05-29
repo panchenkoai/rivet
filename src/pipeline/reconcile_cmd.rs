@@ -61,7 +61,9 @@ pub fn run_reconcile_command(
                  Convert to chunked mode with `chunk_by_days` for partition-level reconcile."
             );
         }
-        ExtractionStrategy::Snapshot | ExtractionStrategy::Incremental(_) => {
+        ExtractionStrategy::Snapshot
+        | ExtractionStrategy::Incremental(_)
+        | ExtractionStrategy::Keyset(_) => {
             anyhow::bail!(
                 "reconcile: '{}' mode has no natural partitions — use `rivet run --reconcile` for a whole-export count check",
                 plan.strategy.mode_label()

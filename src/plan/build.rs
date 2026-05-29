@@ -7,7 +7,9 @@ use crate::config::{Config, ExportConfig, ExportMode};
 use crate::error::Result;
 use crate::tuning::{SourceTuning, TuningProfile, merge_tuning_config};
 
-use super::contract::{ChunkedPlan, ExtractionStrategy, IncrementalCursorPlan, ResolvedRunPlan};
+use super::contract::{
+    ChunkedPlan, ExtractionStrategy, IncrementalCursorPlan, KeysetPlan, ResolvedRunPlan,
+};
 
 /// Build a [`ResolvedRunPlan`] from config and CLI flags.
 ///
@@ -167,6 +169,26 @@ fn resolve_chunked_strategy(
         }
     }
 
+    // Keyset (OPT-4) is its own shape — incompatible with the range / dense /
+    // date / count knobs. Validated up front so the conflict is reported
+    // regardless of which downstream path runs.
+    if export.chunk_by_key.is_some() {
+        for (conflict, name) in [
+            (export.chunk_column.is_some(), "chunk_column"),
+            (export.chunk_dense, "chunk_dense"),
+            (export.chunk_by_days.is_some(), "chunk_by_days"),
+            (export.chunk_count.is_some(), "chunk_count"),
+        ] {
+            if conflict {
+                anyhow::bail!(
+                    "export '{}': chunk_by_key and {} are mutually exclusive",
+                    export.name,
+                    name
+                );
+            }
+        }
+    }
+
     let max_attempts = export
         .chunk_max_attempts
         .unwrap_or_else(|| tuning.max_retries.saturating_add(1).max(1));
@@ -190,6 +212,14 @@ fn resolve_chunked_strategy(
     // Anything beyond the fast path requires the `table:` shortcut so we have
     // a known relation to probe in either Postgres or MySQL.
     let Some(tbl) = export.table.as_ref() else {
+        if export.chunk_by_key.is_some() {
+            anyhow::bail!(
+                "export '{}': `chunk_by_key:` needs the `table:` shortcut so the planner can \
+                 verify the key is backed by a unique index (an unindexed ORDER BY key would \
+                 filesort the whole table). Set `table:` instead of `query:`.",
+                export.name
+            );
+        }
         if export.chunk_size_memory_mb.is_some() {
             anyhow::bail!(
                 "export '{}': `chunk_size_memory_mb:` only applies with the `table:` shortcut — \
@@ -234,42 +264,9 @@ fn resolve_chunked_strategy(
         )
     })?;
 
-    // (1) Resolve chunk_column.
-    let column = if let Some(c) = export.chunk_column.clone() {
-        c
-    } else {
-        match introspection.single_int_pk.clone() {
-            Some(col) => {
-                // `info!` was below the default `warn` log level — operators
-                // never saw which column the planner had picked, so a config
-                // that intended `mode: chunked` + `chunk_column: created_at`
-                // but typo'd the column name silently fell back to PK with
-                // no signal. Elevate to `warn!` so the implicit choice is
-                // visible in every run; tell the operator how to silence it.
-                log::warn!(
-                    "export '{}': chunk_column not set — auto-resolved to '{}' \
-                     from the single-integer primary key on {}. \
-                     Set `chunk_column:` explicitly to pin the choice and silence this warning.",
-                    export.name,
-                    col,
-                    tbl
-                );
-                col
-            }
-            None => {
-                anyhow::bail!(
-                    "export '{}': chunked mode requires 'chunk_column'. \
-                     Tried auto-resolving from PK on {} but found none, a composite PK, \
-                     or a non-integer PK — set `chunk_column:` explicitly.",
-                    export.name,
-                    tbl
-                );
-            }
-        }
-    };
-
-    // (2) Resolve chunk_size — explicit overrides the budget; otherwise compute
-    // from the memory budget and the planner's row-width estimate.
+    // (1) Resolve chunk_size — explicit overrides the budget; otherwise compute
+    // from the memory budget and the planner's row-width estimate. Shared by the
+    // range-chunked and keyset paths.
     let chunk_size = if let Some(mb) = export.chunk_size_memory_mb {
         let row_bytes = introspection.avg_row_bytes.filter(|b| *b > 0).unwrap_or_else(|| {
             // Empty / un-analyzed table — fall back to a defensive 512 B so the
@@ -298,11 +295,10 @@ fn resolve_chunked_strategy(
         export.chunk_size
     };
 
-    // (3) Small-table escape: a single chunk has no parallelism benefit and
-    // adds plumbing latency. Downgrade to Snapshot and let the simple path
-    // handle it. Only fires when reltuples is a meaningful positive number —
-    // un-analyzed tables (reltuples=0) keep the chunked plan to preserve
-    // existing semantics.
+    // (2) Small-table escape: a single chunk/page has no benefit and adds
+    // plumbing latency. Downgrade to Snapshot (bounded + simplest). Only fires
+    // when reltuples is a meaningful positive number — un-analyzed tables
+    // (reltuples=0) keep the chunked/keyset plan to preserve existing semantics.
     if introspection.row_estimate > 0 && (introspection.row_estimate as usize) <= chunk_size {
         log::info!(
             "export '{}': {} has ~{} rows ≤ chunk_size {}; downgrading chunked → snapshot",
@@ -313,6 +309,91 @@ fn resolve_chunked_strategy(
         );
         return Ok(ExtractionStrategy::Snapshot);
     }
+
+    // (3) Explicit keyset key (OPT-4): page by a single index-backed unique key.
+    // Validate it is a usable keyset key (single-column, NOT NULL, UNIQUE/PK);
+    // refuse otherwise rather than emit a full-scan + filesort `ORDER BY` query.
+    if let Some(key) = export.chunk_by_key.as_deref() {
+        if !introspection.is_usable_keyset_key(key) {
+            anyhow::bail!(
+                "export '{}': chunk_by_key '{}' is not a usable keyset key on {} — it must be a \
+                 single-column, NOT NULL, UNIQUE or PRIMARY key. Without a unique index, \
+                 `ORDER BY {} LIMIT n` would full-scan + filesort the table. Add a unique index \
+                 on it, pick another key, or use `mode: full` to accept one long snapshot query.",
+                export.name,
+                key,
+                tbl,
+                key
+            );
+        }
+        log::info!(
+            "export '{}': keyset (seek) pagination on '{}' (chunk_size={})",
+            export.name,
+            key,
+            chunk_size
+        );
+        return Ok(ExtractionStrategy::Keyset(KeysetPlan {
+            key_column: key.to_string(),
+            chunk_size,
+        }));
+    }
+
+    // (4) Resolve chunk_column for range chunking, with an auto-keyset fallback
+    // on MySQL when there is no single-integer PK but a usable unique key exists.
+    let column = if let Some(c) = export.chunk_column.clone() {
+        c
+    } else {
+        match introspection.single_int_pk.clone() {
+            Some(col) => {
+                // `info!` was below the default `warn` log level — operators
+                // never saw which column the planner had picked, so a config
+                // that intended `mode: chunked` + `chunk_column: created_at`
+                // but typo'd the column name silently fell back to PK with
+                // no signal. Elevate to `warn!` so the implicit choice is
+                // visible in every run; tell the operator how to silence it.
+                log::warn!(
+                    "export '{}': chunk_column not set — auto-resolved to '{}' \
+                     from the single-integer primary key on {}. \
+                     Set `chunk_column:` explicitly to pin the choice and silence this warning.",
+                    export.name,
+                    col,
+                    tbl
+                );
+                col
+            }
+            None => {
+                // MySQL has no server-side cursor, so a non-int-PK table has no
+                // safe range-chunk shape. If a single-column unique key exists,
+                // page it with keyset instead of refusing (OPT-4). PG keeps
+                // refusing — its `DECLARE CURSOR` snapshot is already bounded, so
+                // `mode: full` is the safe answer there.
+                if config.source.source_type == crate::config::SourceType::Mysql
+                    && let Some(key) = introspection.auto_keyset_key()
+                {
+                    log::warn!(
+                        "export '{}': {} has no single-integer PK — auto-selected keyset \
+                         (seek) pagination on unique key '{}'. Set `chunk_by_key:` explicitly \
+                         to pin the choice and silence this warning.",
+                        export.name,
+                        tbl,
+                        key
+                    );
+                    return Ok(ExtractionStrategy::Keyset(KeysetPlan {
+                        key_column: key.to_string(),
+                        chunk_size,
+                    }));
+                }
+                anyhow::bail!(
+                    "export '{}': chunked mode found no safe shape on {} — no single-integer PK \
+                     to range-chunk and no single-column UNIQUE/PRIMARY key to keyset-page. \
+                     Set `chunk_column:` (integer) or `chunk_by_key:` (unique key) explicitly, \
+                     add a unique index, or use `mode: full` to accept one long snapshot query.",
+                    export.name,
+                    tbl
+                );
+            }
+        }
+    };
 
     Ok(ExtractionStrategy::Chunked(ChunkedPlan {
         column,
@@ -426,6 +507,7 @@ mod tests {
             chunk_count: None,
             chunk_dense: false,
             chunk_by_days: None,
+            chunk_by_key: None,
             parallel: 1,
             time_column: None,
             time_column_type: TimeColumnType::Timestamp,
@@ -554,6 +636,52 @@ mod tests {
             ExtractionStrategy::Chunked(cp) => assert_eq!(cp.max_attempts, 4),
             _ => panic!("expected Chunked"),
         }
+    }
+
+    // ── keyset (OPT-4) planner gates (no DB) ──────────────────────────────
+
+    #[test]
+    fn chunk_by_key_conflicts_with_chunk_column() {
+        let mut export = minimal_export();
+        export.mode = ExportMode::Chunked;
+        export.chunk_by_key = Some("uuid".into());
+        export.chunk_column = Some("id".into());
+        let err = build_plan(
+            &minimal_config(),
+            &export,
+            Path::new("."),
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("mutually exclusive"), "got: {msg}");
+    }
+
+    #[test]
+    fn chunk_by_key_without_table_requires_table_shortcut() {
+        let mut export = minimal_export();
+        export.mode = ExportMode::Chunked;
+        export.chunk_by_key = Some("uuid".into());
+        export.table = None;
+        export.chunk_column = None;
+        let err = build_plan(
+            &minimal_config(),
+            &export,
+            Path::new("."),
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("table:") && msg.contains("chunk_by_key"),
+            "should require the table shortcut to verify the index, got: {msg}"
+        );
     }
 
     // ── auto-resolve chunk_column friendly errors (no DB) ─────────────────

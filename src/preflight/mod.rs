@@ -271,6 +271,7 @@ mod tests {
             tuning: None,
             chunk_dense: false,
             chunk_by_days: None,
+            chunk_by_key: None,
             source_group: None,
             reconcile_required: false,
             columns: Default::default(),

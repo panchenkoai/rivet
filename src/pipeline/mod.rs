@@ -13,6 +13,7 @@ mod cli;
 mod finalize;
 pub(crate) mod ipc;
 mod job;
+mod keyset;
 mod manifest_writer;
 mod parallel_children;
 pub(crate) mod parent_ui;

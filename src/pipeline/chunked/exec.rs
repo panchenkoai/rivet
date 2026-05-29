@@ -107,6 +107,7 @@ pub(crate) fn run_chunked_sequential(
                 cursor: None,
                 tuning: &plan.tuning,
                 column_overrides: &plan.column_overrides,
+                page_limit: None,
             },
             &mut sink,
         )?;
@@ -410,6 +411,7 @@ pub(crate) fn run_chunked_parallel(
                             cursor: None,
                             tuning: &plan_for_worker.tuning,
                             column_overrides: &plan_for_worker.column_overrides,
+                            page_limit: None,
                         },
                         &mut sink,
                     )?;

@@ -68,6 +68,7 @@ fn export_one_chunk_range(
             cursor: None,
             tuning: &plan.tuning,
             column_overrides: &plan.column_overrides,
+            page_limit: None,
         },
         &mut sink,
     )?;

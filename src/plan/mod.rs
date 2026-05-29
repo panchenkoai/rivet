@@ -41,6 +41,6 @@ mod contract;
 
 pub use build::{build_plan, parse_column_overrides_pub};
 pub use contract::{
-    ChunkedPlan, ExtractionStrategy, IncrementalCursorPlan, ResolvedRunPlan,
+    ChunkedPlan, ExtractionStrategy, IncrementalCursorPlan, KeysetPlan, ResolvedRunPlan,
     build_time_window_query,
 };

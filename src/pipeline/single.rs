@@ -149,6 +149,11 @@ pub(crate) fn run_export(
     summary: &mut RunSummary,
     config_path: &str,
 ) -> Result<()> {
+    // Keyset (seek) pagination owns its own sequential paging loop (OPT-4).
+    if matches!(plan.strategy, ExtractionStrategy::Keyset(_)) {
+        return super::keyset::run_keyset(src, plan, summary, Some(state));
+    }
+
     // Chunked strategies own their own execution path.
     if matches!(plan.strategy, ExtractionStrategy::Chunked(_)) {
         if plan.strategy.is_resumable() {
@@ -206,6 +211,7 @@ pub(super) fn run_single_export(
         cursor,
         tuning: &plan.tuning,
         column_overrides: &plan.column_overrides,
+        page_limit: None,
     };
 
     // Pipelined path (experimental, `RIVET_PIPELINE_WRITES`): the source thread

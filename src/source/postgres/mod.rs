@@ -31,7 +31,7 @@ use postgres::{Client, NoTls};
 
 use crate::config::{SourceType, TlsConfig};
 use crate::error::Result;
-use crate::source::query::build_incremental_query;
+use crate::source::query::build_export_query;
 use crate::source::tls::build_native_tls;
 use crate::tuning::{ADAPTIVE_SAMPLE_INTERVAL, SourceTuning, next_adaptive_batch_size};
 use crate::types::{ColumnOverrides, SourceColumn, TypeMapping};
@@ -310,8 +310,33 @@ pub(crate) fn introspect_pg_table_for_chunking(
         None
     };
 
+    // ── keyset keys (OPT-4): single-column, NOT NULL, UNIQUE indexes ────
+    // `indnkeyatts = 1` keeps single-column indexes; `indkey[0] = a.attnum`
+    // binds to a real column (not an expression index); `attnotnull` removes
+    // NULL-ordering ambiguity. Index-backed + unique ⇒ keyset's `ORDER BY key
+    // LIMIT n` is a range scan and `WHERE key > last` never skips dup keys.
+    let keyset_rows = client.query(
+        "SELECT a.attname::text, i.indisprimary \
+         FROM pg_index i \
+         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0] \
+         WHERE i.indrelid = (($1::text || '.' || $2::text)::regclass) \
+           AND i.indisunique AND i.indnkeyatts = 1 AND a.attnotnull",
+        &[&schema, &table],
+    )?;
+    let mut keyset_keys: Vec<String> = Vec::new();
+    for primary in [true, false] {
+        for row in &keyset_rows {
+            let col: String = row.get(0);
+            let is_primary: bool = row.get(1);
+            if is_primary == primary && !keyset_keys.contains(&col) {
+                keyset_keys.push(col);
+            }
+        }
+    }
+
     Ok(crate::source::TableIntrospection {
         single_int_pk,
+        keyset_keys,
         row_estimate,
         avg_row_bytes,
     })
@@ -528,12 +553,7 @@ impl super::Source for PostgresSource {
         request: &super::ExportRequest<'_>,
         sink: &mut dyn super::BatchSink,
     ) -> Result<()> {
-        let built = build_incremental_query(
-            request.query,
-            request.incremental,
-            request.cursor,
-            SourceType::Postgres,
-        );
+        let built = build_export_query(request, SourceType::Postgres);
         debug_assert!(
             built.cursor_param.is_none(),
             "Postgres path inlines cursor values as E'…' literals — binding is unused"

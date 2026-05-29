@@ -26,12 +26,33 @@ pub(crate) struct TableIntrospection {
     /// range-chunk. `None` when the table has no PK, has a composite PK, or
     /// the PK type is not an integer family (text, uuid, decimal, …).
     pub single_int_pk: Option<String>,
+    /// Single-column, NOT NULL, **unique** index columns usable as a keyset
+    /// (seek) pagination key — PK first (any type), then other UNIQUE indexes
+    /// (OPT-4). Index-backed and unique by construction, so `ORDER BY key
+    /// LIMIT n` is a bounded index range scan (never a filesort) and
+    /// `WHERE key > last` never skips rows with a duplicate key. Empty when the
+    /// table has no such key.
+    pub keyset_keys: Vec<String>,
     /// Best-effort row count: PG `reltuples`, MySQL `TABLE_ROWS`. `0` means
     /// the table is empty or stats are unavailable.
     pub row_estimate: i64,
     /// Heap-size-per-row in bytes. `None` for empty / unanalysed tables.
     /// Used to convert `chunk_size_memory_mb` into a row count.
     pub avg_row_bytes: Option<i64>,
+}
+
+impl TableIntrospection {
+    /// The auto-selected keyset key: the first usable single-column unique
+    /// NOT NULL key (PK preferred). `None` when the table has none.
+    pub fn auto_keyset_key(&self) -> Option<&str> {
+        self.keyset_keys.first().map(String::as_str)
+    }
+
+    /// Whether `col` is a usable keyset key (single-column, unique, NOT NULL,
+    /// index-backed). Used to validate an explicit `chunk_by_key`.
+    pub fn is_usable_keyset_key(&self, col: &str) -> bool {
+        self.keyset_keys.iter().any(|k| k == col)
+    }
 }
 
 /// Receives schema and batches from a source, one at a time.
@@ -59,6 +80,11 @@ pub struct ExportRequest<'a> {
     /// without declared precision can still be exported as `Decimal128(18,2)`
     /// when the user has stated the type explicitly.
     pub column_overrides: &'a ColumnOverrides,
+    /// Keyset (seek) pagination page size (OPT-4). When `Some(n)` *and*
+    /// `incremental` carries the key plan, the driver builds one keyset page
+    /// (`WHERE key > cursor ORDER BY key LIMIT n`) instead of the unbounded
+    /// incremental/snapshot query. The keyset runner drives the outer loop.
+    pub page_limit: Option<usize>,
 }
 
 pub trait Source: Send {

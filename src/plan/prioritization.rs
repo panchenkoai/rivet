@@ -24,7 +24,11 @@ impl PrioritizationStrategyKind {
         match strategy {
             super::ExtractionStrategy::Snapshot => Self::Snapshot,
             super::ExtractionStrategy::Incremental(_) => Self::Incremental,
-            super::ExtractionStrategy::Chunked(_) => Self::Chunked,
+            // Keyset is a bounded multi-part extraction like chunked — same
+            // prioritization/cost class.
+            super::ExtractionStrategy::Chunked(_) | super::ExtractionStrategy::Keyset(_) => {
+                Self::Chunked
+            }
             super::ExtractionStrategy::TimeWindow { .. } => Self::TimeWindow,
         }
     }

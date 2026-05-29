@@ -29,7 +29,7 @@ use mysql::{Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts};
 
 use crate::config::{SourceType, TlsConfig, TlsMode};
 use crate::error::Result;
-use crate::source::query::build_incremental_query;
+use crate::source::query::build_export_query;
 use crate::tuning::{ADAPTIVE_SAMPLE_INTERVAL, SourceTuning, next_adaptive_batch_size};
 use crate::types::ColumnOverrides;
 
@@ -298,8 +298,43 @@ pub(crate) fn introspect_mysql_table_for_chunking(
         None
     };
 
+    // (3) Keyset keys (OPT-4): single-column, NOT NULL, UNIQUE index columns —
+    // usable as a seek-pagination key. NON_UNIQUE=0 filters to unique indexes
+    // (PRIMARY included); SEQ_IN_INDEX=1 with no SEQ_IN_INDEX=2 row keeps only
+    // single-column indexes; IS_NULLABLE='NO' guarantees `> last` never has to
+    // reason about NULL ordering. Index-backed by definition, so keyset's
+    // `ORDER BY key LIMIT n` is a range scan, not a filesort.
+    let keyset_rows: Vec<(String, String, String)> = conn.exec(
+        "SELECT s.COLUMN_NAME, s.INDEX_NAME, c.IS_NULLABLE \
+         FROM information_schema.STATISTICS s \
+         JOIN information_schema.COLUMNS c \
+           ON c.TABLE_SCHEMA = s.TABLE_SCHEMA AND c.TABLE_NAME = s.TABLE_NAME \
+              AND c.COLUMN_NAME = s.COLUMN_NAME \
+         WHERE s.TABLE_SCHEMA = ? AND s.TABLE_NAME = ? AND s.NON_UNIQUE = 0 \
+           AND s.SEQ_IN_INDEX = 1 \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM information_schema.STATISTICS s2 \
+             WHERE s2.TABLE_SCHEMA = s.TABLE_SCHEMA AND s2.TABLE_NAME = s.TABLE_NAME \
+               AND s2.INDEX_NAME = s.INDEX_NAME AND s2.SEQ_IN_INDEX = 2)",
+        (&schema, &table),
+    )?;
+    let mut keyset_keys: Vec<String> = Vec::new();
+    // PRIMARY first (most efficient — clustered), then other unique indexes.
+    for primary in [true, false] {
+        for (col, index_name, is_nullable) in &keyset_rows {
+            let is_primary = index_name == "PRIMARY";
+            if is_primary == primary
+                && is_nullable.eq_ignore_ascii_case("NO")
+                && !keyset_keys.contains(col)
+            {
+                keyset_keys.push(col.clone());
+            }
+        }
+    }
+
     Ok(crate::source::TableIntrospection {
         single_int_pk,
+        keyset_keys,
         row_estimate,
         avg_row_bytes,
     })
@@ -487,12 +522,7 @@ impl super::Source for MysqlSource {
         request: &super::ExportRequest<'_>,
         sink: &mut dyn super::BatchSink,
     ) -> Result<()> {
-        let built = build_incremental_query(
-            request.query,
-            request.incremental,
-            request.cursor,
-            SourceType::Mysql,
-        );
+        let built = build_export_query(request, SourceType::Mysql);
         log::debug!(
             "executing query (connection={}): {}",
             self.proxy_kind.log_label(),

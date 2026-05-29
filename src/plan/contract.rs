@@ -24,6 +24,18 @@ pub struct ChunkedPlan {
     pub max_attempts: u32,
 }
 
+/// Parameters for keyset (seek) pagination — the source-safe shape for tables
+/// without a single-integer PK (OPT-4). Pages the table by one index-backed,
+/// NOT NULL unique key with `WHERE key > last ORDER BY key LIMIT chunk_size`,
+/// bounding both peak RSS and longest-query time. The key is index-backed by
+/// construction (see `plan::build`), so the `ORDER BY` is an index range scan,
+/// never a filesort.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeysetPlan {
+    pub key_column: String,
+    pub chunk_size: usize,
+}
+
 /// Fully resolved execution plan for a single export.
 ///
 /// All execution decisions are derived before the pipeline starts.
@@ -92,6 +104,7 @@ pub enum ExtractionStrategy {
     Snapshot,
     Incremental(IncrementalCursorPlan),
     Chunked(ChunkedPlan),
+    Keyset(KeysetPlan),
     TimeWindow {
         column: String,
         column_type: TimeColumnType,
@@ -105,6 +118,7 @@ impl ExtractionStrategy {
             ExtractionStrategy::Snapshot => "full",
             ExtractionStrategy::Incremental(_) => "incremental",
             ExtractionStrategy::Chunked(_) => "chunked",
+            ExtractionStrategy::Keyset(_) => "keyset",
             ExtractionStrategy::TimeWindow { .. } => "timewindow",
         }
     }
@@ -153,6 +167,9 @@ impl ExtractionStrategy {
     pub fn cursor_extract_column(&self) -> Option<&str> {
         match self {
             ExtractionStrategy::Incremental(p) => Some(p.column_for_storage_extract()),
+            // Keyset pages by this key; the sink tracks its per-page max so the
+            // runner can advance to the next page (OPT-4).
+            ExtractionStrategy::Keyset(k) => Some(k.key_column.as_str()),
             _ => None,
         }
     }
@@ -188,7 +205,7 @@ impl ExtractionStrategy {
                 *days_window,
                 source_type,
             )),
-            ExtractionStrategy::Chunked(_) => None,
+            ExtractionStrategy::Chunked(_) | ExtractionStrategy::Keyset(_) => None,
         }
     }
 }

@@ -24,6 +24,7 @@ Four ways to slice the table. They differ in how chunk boundaries are computed; 
 | **Dense** | `chunk_dense: true` | `ROW_NUMBER() OVER (ORDER BY chunk_column)` instead of range; guarantees equal **row count** per chunk regardless of gaps | Sparse IDs — UUIDs as `BIGINT`, deleted rows, hashed keys | `chunk_by_days` |
 | **Date-native** | `chunk_by_days: 365` | `chunk_column` must be `DATE` / `TIMESTAMP` / `TIMESTAMPTZ`; windows of N days with `>= AND <` (open-end) semantics | Time-series, event logs, historical backfills by period | `chunk_dense` |
 | **Memory-target** (PG only) | `chunk_size_memory_mb: 256` | Auto-computes `chunk_size` from a `pg_class` / `reltuples` row-size estimate; clamped to `[10_000, 5_000_000]` rows. Requires `table:` shortcut | You want to budget by megabytes, not rows; wide tables where row-width is hard to guess | explicit `chunk_size` |
+| **Keyset** (seek) | `chunk_by_key: uid` | Pages with `WHERE key > last ORDER BY key LIMIT chunk_size` on a unique index — **sequential**; each page is one part file | **MySQL** tables with no single-integer PK (UUID / string / composite PK) — the only bounded shape without a server cursor. See [Keyset pagination](#keyset-seek-pagination--the-safe-shape-without-an-integer-pk) below | `chunk_column`, `chunk_dense`, `chunk_by_days`, `chunk_count` |
 
 **Orthogonal options that combine with any strategy:**
 
@@ -217,6 +218,76 @@ exports:
 ```
 
 `rivet check` will warn you about sparse ranges.
+
+## Keyset (seek) pagination — the safe shape without an integer PK
+
+Range chunking needs a **single integer PK** to slice `MIN..MAX`. A MySQL table
+whose PK is a UUID, string, or composite key has no such column, and — unlike
+PostgreSQL — MySQL has **no server-side cursor** to bound a `mode: full`
+snapshot. That left a real hole: such tables could only be exported as one
+long-held `SELECT *` (the exact "don't hold a long query on prod" risk Rivet
+exists to avoid).
+
+**Keyset pagination** closes it. Rivet pages the table by a unique, NOT NULL,
+**index-backed** key:
+
+```sql
+-- first page
+SELECT * FROM (<base>) AS _rivet ORDER BY `uid` LIMIT 1000
+-- subsequent pages (cursor = last page's max key)
+SELECT * FROM (<base>) AS _rivet WHERE `uid` > ? ORDER BY `uid` LIMIT 1000
+```
+
+Each page is a bounded, **index range scan** (verified `EXPLAIN`: `type: range`
+on the PK, no `filesort`, no full scan) and becomes one part file. This bounds
+**both** peak RSS (`≤ chunk_size` rows in flight) and longest-query time.
+
+```yaml
+exports:
+  - name: events
+    table: app.events            # `table:` shortcut required (index check)
+    mode: chunked
+    chunk_by_key: event_uuid     # single-column UNIQUE / PRIMARY, NOT NULL
+    chunk_size: 1000             # rows per page
+    format: parquet
+    destination:
+      type: local
+      path: ./output
+```
+
+Output files: one per page, e.g. `events_20260529_120000_keyset0.parquet`.
+
+**Auto-resolution (MySQL).** With the `table:` shortcut and **no** `chunk_by_key`,
+if the table has no single-integer PK but *does* have a usable single-column
+unique key, Rivet auto-selects keyset on it and logs a `warn` naming the key
+(set `chunk_by_key:` to pin the choice and silence the warning). On PostgreSQL,
+auto-resolution stays off — its `DECLARE CURSOR` snapshot is already bounded, so
+`mode: full` is the safe answer there; `chunk_by_key:` still works if you want
+per-page files.
+
+**The key must be index-backed.** This is the load-bearing safety property: an
+`ORDER BY` on a non-indexed column degrades to a full-scan + `filesort` — worse
+than the snapshot it replaces. Rivet **refuses** a `chunk_by_key` that is not a
+single-column, NOT NULL, `UNIQUE`/`PRIMARY` key rather than emit such a query:
+
+```
+chunk_by_key 'payload' is not a usable keyset key on app.events — it must be a
+single-column, NOT NULL, UNIQUE or PRIMARY key. Without a unique index,
+`ORDER BY payload LIMIT n` would full-scan + filesort the table. Add a unique
+index on it, pick another key, or use `mode: full` to accept one long snapshot
+query.
+```
+
+**Required privileges:** read-only is sufficient — the introspection probe reads
+`information_schema` index metadata, no elevated grants needed.
+
+**Limitations (current):**
+
+- **Sequential only** — each page depends on the previous page's last key, so
+  keyset does not parallelize (`parallel` is ignored). Range chunking remains the
+  parallel path for integer-PK tables.
+- **Single-column keys only** — composite unique keys are not yet supported.
+- **No `--resume` checkpoint yet** — a keyset run restarts from the first page.
 
 ## Troubleshooting
 
