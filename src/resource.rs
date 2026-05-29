@@ -125,45 +125,82 @@ pub fn check_memory(threshold_mb: usize) -> bool {
 /// With `Condvar::wait`, blocked threads consume zero CPU until a `release()`
 /// notifies. The mutex is uncontended whenever traffic is light, so the lock
 /// path adds no measurable overhead vs the atomic.
+///
+/// The permit ceiling is mutable at runtime via [`Semaphore::resize`] so the
+/// OPT-2 concurrency governor can back parallelism off (and recover it) under
+/// source pressure without tearing down the worker pool.
 pub struct Semaphore {
-    state: std::sync::Mutex<usize>,
+    state: std::sync::Mutex<SemState>,
     cond: std::sync::Condvar,
+}
+
+struct SemState {
+    /// Permits currently held by live acquirers.
+    count: usize,
+    /// Permit ceiling. Mutable via `resize`.
     max: usize,
 }
 
 impl Semaphore {
     pub fn new(max: usize) -> Self {
         Self {
-            state: std::sync::Mutex::new(0),
+            state: std::sync::Mutex::new(SemState { count: 0, max }),
             cond: std::sync::Condvar::new(),
-            max,
         }
     }
 
     /// Block until a permit is available, then take one.
     pub fn acquire(&self) {
-        let mut count = self
+        let mut st = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while *count >= self.max {
-            count = self
+        while st.count >= st.max {
+            st = self
                 .cond
-                .wait(count)
+                .wait(st)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
-        *count += 1;
+        st.count += 1;
     }
 
     /// Return a permit and wake one blocked acquirer (if any).
     pub fn release(&self) {
-        let mut count = self
+        let mut st = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        debug_assert!(*count > 0, "release without matching acquire");
-        *count -= 1;
+        debug_assert!(st.count > 0, "release without matching acquire");
+        st.count -= 1;
         self.cond.notify_one();
+    }
+
+    /// Change the permit ceiling at runtime.
+    ///
+    /// Raising it wakes every parked acquirer so the freshly available permits
+    /// are taken promptly. Lowering it takes effect lazily: in-flight permits
+    /// are honored to completion, and new `acquire()` calls block until `count`
+    /// falls below the new ceiling. The caller is responsible for keeping
+    /// `new_max >= 1` (a `0` ceiling parks all acquirers indefinitely).
+    pub fn resize(&self, new_max: usize) {
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let raised = new_max > st.max;
+        st.max = new_max;
+        if raised {
+            self.cond.notify_all();
+        }
+    }
+
+    /// The current permit ceiling. Test-only observability accessor.
+    #[cfg(test)]
+    pub fn current_max(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .max
     }
 }
 
@@ -248,5 +285,90 @@ mod tests {
             "worker should have entered after release"
         );
         sem.release();
+    }
+
+    #[test]
+    fn semaphore_current_max_reports_resize() {
+        let sem = Semaphore::new(2);
+        assert_eq!(sem.current_max(), 2);
+        sem.resize(5);
+        assert_eq!(sem.current_max(), 5);
+        sem.resize(1);
+        assert_eq!(sem.current_max(), 1);
+    }
+
+    #[test]
+    fn semaphore_resize_up_wakes_parked_acquirer() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // 1/1 permits taken → a second acquirer parks.
+        let sem = Arc::new(Semaphore::new(1));
+        sem.acquire();
+
+        let entered = Arc::new(AtomicBool::new(false));
+        let entered_w = Arc::clone(&entered);
+        let sem_w = Arc::clone(&sem);
+        let handle = std::thread::spawn(move || {
+            sem_w.acquire();
+            entered_w.store(true, Ordering::Release);
+            sem_w.release();
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !entered.load(Ordering::Acquire),
+            "worker must be parked while 1/1 permits are taken"
+        );
+
+        // Raising the ceiling (not a release) must wake the parked worker.
+        sem.resize(2);
+        handle.join().expect("worker thread");
+        assert!(
+            entered.load(Ordering::Acquire),
+            "raising the ceiling should admit the parked worker"
+        );
+        sem.release();
+    }
+
+    #[test]
+    fn semaphore_resize_down_blocks_new_acquire_until_count_drops() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // 2/2 taken, then shrink ceiling to 1.
+        let sem = Arc::new(Semaphore::new(2));
+        sem.acquire();
+        sem.acquire();
+        sem.resize(1);
+
+        // Releasing one leaves count=1, which is still >= the new max=1, so a
+        // fresh acquirer must block.
+        sem.release();
+
+        let entered = Arc::new(AtomicBool::new(false));
+        let entered_w = Arc::clone(&entered);
+        let sem_w = Arc::clone(&sem);
+        let handle = std::thread::spawn(move || {
+            sem_w.acquire();
+            entered_w.store(true, Ordering::Release);
+            sem_w.release();
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !entered.load(Ordering::Acquire),
+            "count(1) >= new max(1): acquirer must block after shrink"
+        );
+
+        // Dropping count to 0 frees a slot under the lowered ceiling. The woken
+        // worker then takes and returns that permit itself, so accounting stays
+        // balanced (3 acquires / 3 releases) — no trailing release here.
+        sem.release();
+        handle.join().expect("worker thread");
+        assert!(
+            entered.load(Ordering::Acquire),
+            "acquirer should proceed once count falls below the new ceiling"
+        );
     }
 }

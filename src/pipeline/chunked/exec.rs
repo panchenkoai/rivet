@@ -5,7 +5,7 @@
 //! solely for manifest (file-record) writes.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::super::{
     RunSummary, progress::ChunkProgress, sink::ExportSink, validate::validate_output,
@@ -17,7 +17,14 @@ use crate::journal::RunEvent;
 use crate::plan::{ChunkedPlan, ExtractionStrategy, ResolvedRunPlan};
 use crate::source::{self, Source};
 use crate::state::StateStore;
+use crate::tuning::{GOVERNOR_SAMPLE_INTERVAL_MS, GovernorState};
 use crate::{destination, format, resource};
+
+/// How often the governor checks whether the run has finished. Kept much
+/// shorter than [`GOVERNOR_SAMPLE_INTERVAL_MS`] so the governor thread exits
+/// promptly once the last chunk completes, instead of lingering for a full
+/// sample interval.
+const GOVERNOR_POLL_MS: u64 = 200;
 
 /// Extract the `ChunkedPlan` from a `ResolvedRunPlan`. Panics if the strategy
 /// is not `Chunked` — all callers in this module only run for chunked plans.
@@ -242,10 +249,54 @@ pub(crate) fn run_chunked_parallel(
     // the parallel scope joins.
     let shared_fingerprint: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     // Condvar-backed semaphore: blocked spawners park in the kernel until a
-    // worker calls `release()`, instead of polling an atomic every 50 ms.
+    // worker calls `release()`, instead of polling an atomic every 50 ms. Its
+    // permit ceiling is mutable so the OPT-2 governor can back parallelism off
+    // and recover it under source pressure.
     let semaphore = resource::Semaphore::new(parallel);
     let pb = ChunkProgress::new(&plan.export_name, total_chunks);
     let pb_handle = pb.handle();
+
+    // OPT-2 adaptive concurrency governor. Armed only when the user opted into
+    // adaptation (`tuning.adaptive`) and there is real parallelism to govern
+    // (`parallel > 1`). Floor defaults to 1; ceiling is the configured
+    // `parallel`. A failed monitoring connection degrades gracefully to static
+    // parallelism rather than failing the export.
+    // `parallel` can be 0 when there are no chunks; `.max(1)` keeps `clamp`'s
+    // bounds valid (the governor is off in that case anyway).
+    let governor_floor = plan
+        .tuning
+        .min_parallel
+        .unwrap_or(1)
+        .clamp(1, parallel.max(1));
+    let governor_on = plan.tuning.adaptive && parallel > 1;
+    let governor_monitor: Option<Box<dyn Source>> = if governor_on {
+        match source::create_source(&plan.source) {
+            Ok(s) => {
+                log::info!(
+                    "export '{}': adaptive concurrency governor active (parallel {}..{})",
+                    plan.export_name,
+                    governor_floor,
+                    parallel
+                );
+                Some(s)
+            }
+            Err(e) => {
+                log::warn!(
+                    "export '{}': governor monitoring connection failed; parallelism stays static at {}: {:#}",
+                    plan.export_name,
+                    parallel,
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Governor decisions buffered here (the journal is not thread-shared) and
+    // drained into `summary.journal` after the scope joins.
+    let governor_log: std::sync::Mutex<Vec<(usize, usize, String)>> =
+        std::sync::Mutex::new(Vec::new());
 
     // One destination (GCS/S3) instance for the whole export: `create_destination` wires a
     // dedicated Tokio runtime; creating one per chunk caused runtime shutdown races under load
@@ -260,6 +311,54 @@ pub(crate) fn run_chunked_parallel(
     );
 
     std::thread::scope(|s| {
+        // Governor thread: samples source pressure on its own monitoring
+        // connection and resizes the semaphore within [floor, parallel]. It
+        // self-terminates once every chunk has completed. Holds parallelism
+        // flat whenever the engine can't sample (`sample_pressure` → None).
+        if let Some(mut monitor) = governor_monitor {
+            let semaphore = &semaphore;
+            let completed = &completed;
+            let governor_log = &governor_log;
+            let total = total_chunks;
+            let ceiling = parallel;
+            let floor = governor_floor;
+            let export_name = plan.export_name.as_str();
+            s.spawn(move || {
+                let mut gov = GovernorState::new(ceiling, floor, ceiling);
+                let interval = Duration::from_millis(GOVERNOR_SAMPLE_INTERVAL_MS);
+                let mut last_sample = Instant::now();
+                while completed.load(Ordering::Relaxed) < total {
+                    std::thread::sleep(Duration::from_millis(GOVERNOR_POLL_MS));
+                    if completed.load(Ordering::Relaxed) >= total {
+                        break;
+                    }
+                    if last_sample.elapsed() < interval {
+                        continue;
+                    }
+                    last_sample = Instant::now();
+                    if let Some((from, to)) = gov.observe(monitor.sample_pressure()) {
+                        semaphore.resize(to);
+                        let reason = if to < from {
+                            "source pressure rising: backed off"
+                        } else {
+                            "source pressure eased: recovered"
+                        };
+                        log::info!(
+                            "export '{}': governor parallelism {} → {} ({})",
+                            export_name,
+                            from,
+                            to,
+                            reason
+                        );
+                        governor_log
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push((from, to, reason.to_string()));
+                    }
+                }
+            });
+        }
+
         for (i, (start, end)) in chunks.iter().enumerate() {
             // Block (kernel-park) until a worker slot frees up.
             semaphore.acquire();
@@ -408,6 +507,13 @@ pub(crate) fn run_chunked_parallel(
     summary.bytes_written = agg_bytes.load(Ordering::Relaxed);
     summary.files_produced = agg_files.load(Ordering::Relaxed);
     pb.finish(summary.total_rows);
+
+    // Drain governor decisions (recorded off-thread) into the run journal.
+    for (from, to, reason) in governor_log.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        summary
+            .journal
+            .record(RunEvent::ParallelismAdjusted { from, to, reason });
+    }
     if plan.validate {
         summary.validated = Some(true);
     }

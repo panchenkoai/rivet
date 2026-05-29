@@ -74,6 +74,8 @@ A profile sets sensible defaults for all tuning parameters. Individual fields ov
 | `memory_threshold_mb` | integer | profile default | RSS threshold in MB; pauses fetching if exceeded (0 = disabled). `balanced` defaults to 4096, `safe` to 2048, `fast` to 0 (no limit). |
 | `max_batch_memory_mb` | integer | — | Hard cap on a single Arrow batch in MB. When exceeded, `on_batch_memory_exceeded` determines the response. |
 | `on_batch_memory_exceeded` | `warn` \| `fail` \| `auto_shrink` | `warn` | Policy applied when a batch exceeds `max_batch_memory_mb`. |
+| `adaptive` | boolean | `false` | Sample source write-pressure at runtime and react: shrink/restore the fetch batch size, and — in chunked mode with `parallel > 1` — drive the [concurrency governor](#adaptive-concurrency-governor). |
+| `min_parallel` | integer | `1` | Floor for the concurrency governor: the fewest workers it will back down to under pressure. Ceiling is the export's `parallel`. Only consulted when `adaptive` is on and `parallel > 1`. |
 
 ### Batch memory cap (`max_batch_memory_mb`)
 
@@ -123,6 +125,60 @@ tuning:
 ```
 
 Rivet samples the first batch to estimate row size, then adjusts subsequent batches. Cannot be used together with `batch_size`.
+
+## Adaptive concurrency governor
+
+In **chunked mode with `parallel > 1`**, setting `adaptive: true` arms a governor that adjusts how many chunk workers (and therefore source connections) run concurrently, in response to source write-pressure. It backs parallelism down when the source is under load and recovers it when the load eases, staying within `[min_parallel, parallel]`.
+
+```yaml
+source:
+  type: postgres
+  url_env: DATABASE_URL
+  tuning:
+    adaptive: true        # arm batch-size adaptation + the governor
+    min_parallel: 2       # never drop below 2 workers (default 1)
+
+exports:
+  - name: orders
+    mode: chunked
+    chunk_column: id
+    parallel: 8           # ceiling — governor varies the live count in [2, 8]
+```
+
+**How it decides.** A dedicated monitoring connection polls a source write-pressure counter every ~1.5 s and compares it to the previous reading. A *rising* counter means pressure is climbing, so the governor sheds one worker; a flat/falling counter lets it recover one. The counter is:
+
+| Engine | Pressure proxy | Read via |
+|--------|----------------|----------|
+| PostgreSQL | `pg_stat_bgwriter.checkpoints_req` | `SELECT checkpoints_req FROM pg_stat_bgwriter` (preceded by `pg_stat_clear_snapshot()`) |
+| MySQL | global `Innodb_log_waits` | `SHOW GLOBAL STATUS LIKE 'Innodb_log_waits'` |
+
+It is the **same proxy** the adaptive batch loop uses — enabling the governor adds no new query beyond what `adaptive: true` already runs.
+
+### Required privileges (read-only is enough)
+
+The governor needs **no elevated privileges**. A plain read-only role can run every query it issues — verified against PostgreSQL 16 and MySQL 8:
+
+- **PostgreSQL** — a role with only `CONNECT` + `USAGE ON SCHEMA` + `SELECT ON TABLES` can read `pg_stat_bgwriter` and call `pg_stat_clear_snapshot()` (both are available to `PUBLIC`). No `pg_read_all_stats`, no superuser.
+
+  ```sql
+  CREATE ROLE rivet_ro LOGIN PASSWORD '…';
+  GRANT CONNECT ON DATABASE mydb TO rivet_ro;
+  GRANT USAGE ON SCHEMA public TO rivet_ro;
+  GRANT SELECT ON ALL TABLES IN SCHEMA public TO rivet_ro;
+  ```
+
+- **MySQL** — a user with only `SELECT` on the target schema can run `SHOW GLOBAL STATUS`; it needs no `PROCESS` or other global privilege.
+
+  ```sql
+  CREATE USER 'rivet_ro'@'%' IDENTIFIED BY '…';
+  GRANT SELECT ON mydb.* TO 'rivet_ro'@'%';
+  ```
+
+**Graceful degradation.** If the pressure query ever fails or returns nothing (locked-down role, unsupported engine view), the governor *holds parallelism flat* rather than failing the run — the export proceeds at the static `parallel` count. A failed monitoring connection logs a warning and disables the governor for that run; it never aborts the export.
+
+> **Note on richer signals.** A future iteration may read lock waits / `idle in transaction` from `pg_stat_activity` or `SHOW PROCESSLIST`. Those *do* require elevated privileges (`pg_read_all_stats` on PostgreSQL; the `PROCESS` privilege on MySQL) to observe sessions other than your own. The current proxy was chosen specifically so the default least-privilege, read-only setup keeps working. When the richer signals land, this section will document the additional grants.
+
+**Visibility.** Each adjustment is recorded in the run journal as a `ParallelismAdjusted` event (`from`, `to`, `reason`) and logged at `info` (`governor parallelism 8 → 7 (source pressure rising: backed off)`).
 
 ## Memory optimization tips
 

@@ -268,11 +268,20 @@
           ]
         },
         "adaptive": {
-          "description": "Enable real-time batch size adaptation based on DB pressure metrics.\nPostgres: samples `pg_stat_bgwriter`. MySQL: samples `Innodb_log_waits`.",
+          "description": "Enable real-time batch size adaptation based on DB pressure metrics.\nPostgres: samples `pg_stat_bgwriter`. MySQL: samples `Innodb_log_waits`.\nAlso arms the OPT-2 concurrency governor when `parallel > 1`.",
           "type": [
             "boolean",
             "null"
           ]
+        },
+        "min_parallel": {
+          "description": "Floor for the concurrency governor (lowest parallelism under pressure).\nDefault 1. Ceiling is the export's `parallel`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
         }
       },
       "additionalProperties": false

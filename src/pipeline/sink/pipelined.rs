@@ -66,7 +66,12 @@ impl PipelinedSink {
     fn configured_depth() -> Option<usize> {
         match std::env::var("RIVET_PIPELINE_WRITES") {
             Ok(v) if v.is_empty() || v == "0" => None,
-            Ok(v) => Some(v.parse::<usize>().ok().filter(|&n| n > 0).unwrap_or(DEFAULT_CHANNEL_DEPTH)),
+            Ok(v) => Some(
+                v.parse::<usize>()
+                    .ok()
+                    .filter(|&n| n > 0)
+                    .unwrap_or(DEFAULT_CHANNEL_DEPTH),
+            ),
             Err(_) => None,
         }
     }

@@ -78,6 +78,18 @@ pub trait Source: Send {
         query: &str,
         column_overrides: &ColumnOverrides,
     ) -> Result<Vec<TypeMapping>>;
+
+    /// Sample a monotonic source-pressure counter for the OPT-2 concurrency
+    /// governor (`pipeline::chunked::exec`).
+    ///
+    /// Higher = more pressure. The governor compares successive samples
+    /// (`cur > prev` ⇒ under pressure) — the same convention the adaptive
+    /// batch-size loop already uses. Returns `None` when the engine can't
+    /// cheaply sample a pressure proxy, in which case the governor holds
+    /// parallelism flat. Default: `None`.
+    fn sample_pressure(&mut self) -> Option<u64> {
+        None
+    }
 }
 
 pub fn create_source(config: &SourceConfig) -> Result<Box<dyn Source>> {

@@ -619,6 +619,13 @@ impl super::Source for PostgresSource {
             .collect();
         Ok(mappings)
     }
+
+    /// Governor pressure proxy: `pg_stat_bgwriter.checkpoints_req` — the same
+    /// monotonic counter the adaptive batch loop samples. Rising between samples
+    /// means the source is checkpointing harder under write pressure.
+    fn sample_pressure(&mut self) -> Option<u64> {
+        pg_sample_checkpoints_req(&mut self.client).map(|v| v.max(0) as u64)
+    }
 }
 
 /// When the query is a single-table `SELECT … FROM rel` (no joins, no subquery

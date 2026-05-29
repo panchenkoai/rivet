@@ -594,6 +594,13 @@ impl super::Source for MysqlSource {
             .collect();
         Ok(mappings)
     }
+
+    /// Governor pressure proxy: global `Innodb_log_waits` — the same monotonic
+    /// counter the adaptive batch loop samples. Rising between samples means
+    /// InnoDB is stalling on redo-log buffer space under write pressure.
+    fn sample_pressure(&mut self) -> Option<u64> {
+        mysql_sample_innodb_log_waits(&self.pool)
+    }
 }
 
 #[cfg(test)]
