@@ -70,6 +70,11 @@ pub(crate) struct ExportSink {
     pub(in crate::pipeline) column_max_bytes: std::collections::HashMap<String, u64>,
     /// Hard cap on a single Arrow batch in bytes (`max_batch_memory_mb * 1024²`). `None` = no cap.
     pub(in crate::pipeline) max_batch_memory_bytes: Option<usize>,
+    /// Hard ceiling on a single cell/value in bytes (`max_value_mb * 1024²`).
+    /// `None` = no guard. Unlike `max_batch_memory_bytes` (an average-based
+    /// batch cap), this bounds one giant text/JSON/blob value that would
+    /// otherwise OOM the process (OPT-1).
+    pub(in crate::pipeline) max_value_bytes: Option<usize>,
     pub(in crate::pipeline) batch_memory_policy: crate::tuning::BatchMemoryPolicy,
     /// Count of batches that exceeded `max_batch_memory_bytes` (for run summary / logging).
     pub(in crate::pipeline) oversized_batch_count: u64,
@@ -116,6 +121,12 @@ impl ExportSink {
             strip_internal_column,
             column_max_bytes: std::collections::HashMap::new(),
             max_batch_memory_bytes: plan.tuning.max_batch_memory_mb.map(|mb| mb * 1024 * 1024),
+            // `0` (or None) disables the per-value guard; otherwise convert MB→bytes.
+            max_value_bytes: plan
+                .tuning
+                .max_value_mb
+                .filter(|&mb| mb > 0)
+                .map(|mb| mb * 1024 * 1024),
             batch_memory_policy: plan.tuning.on_batch_memory_exceeded,
             oversized_batch_count: 0,
             parquet_config: plan.parquet.clone(),
@@ -225,6 +236,57 @@ impl ExportSink {
                 }
             }
         }
+    }
+
+    /// Hard per-value guard (OPT-1): abort with `RIVET_VALUE_TOO_LARGE` when a
+    /// single variable-length cell exceeds `max_value_bytes`. Only Utf8 /
+    /// LargeUtf8 / Binary / LargeBinary values can be individually huge; fixed-
+    /// width types (ints, floats, dates) cannot, so they need no check. Runs
+    /// before the batch is split/encoded so the giant cell never reaches the
+    /// row-group writer or the auto-shrink splitter (which can't divide one
+    /// oversized value). `O(rows × var-length-cols)` length reads — no copies.
+    fn check_value_ceiling(&self, batch: &RecordBatch) -> Result<()> {
+        use arrow::array::{BinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
+        use arrow::datatypes::DataType;
+
+        let Some(limit) = self.max_value_bytes else {
+            return Ok(());
+        };
+        let schema = batch.schema();
+        for (idx, field) in schema.fields().iter().enumerate() {
+            let col = batch.column(idx);
+            let over: Option<usize> = match field.data_type() {
+                DataType::Utf8 => col
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .and_then(|a| a.iter().flatten().map(|s| s.len()).find(|&n| n > limit)),
+                DataType::LargeUtf8 => col
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .and_then(|a| a.iter().flatten().map(|s| s.len()).find(|&n| n > limit)),
+                DataType::Binary => col
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .and_then(|a| a.iter().flatten().map(|b| b.len()).find(|&n| n > limit)),
+                DataType::LargeBinary => col
+                    .as_any()
+                    .downcast_ref::<LargeBinaryArray>()
+                    .and_then(|a| a.iter().flatten().map(|b| b.len()).find(|&n| n > limit)),
+                _ => None,
+            };
+            if let Some(value_bytes) = over {
+                anyhow::bail!(
+                    "RIVET_VALUE_TOO_LARGE: column '{}' has a single value of {:.1} MB, exceeding the \
+                     per-value ceiling of {} MB. One oversized cell can OOM the process regardless of \
+                     batch size. Raise `tuning.max_value_mb` (or set it to 0 to disable the guard) if \
+                     this value is expected.",
+                    field.name(),
+                    value_bytes as f64 / (1024.0 * 1024.0),
+                    limit / (1024 * 1024),
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Update the running per-column max byte length for string/binary columns.
@@ -466,6 +528,10 @@ impl BatchSink for ExportSink {
             _ => None,
         };
         let dest_batch: &RecordBatch = stripped.as_ref().unwrap_or(batch);
+
+        // OPT-1: fail fast on a single oversized cell, before the batch is split
+        // or encoded (the auto-shrink splitter can't divide one giant value).
+        self.check_value_ceiling(dest_batch)?;
 
         // Count original batches that exceed the memory cap (before any splitting).
         if let Some(limit) = self.max_batch_memory_bytes

@@ -74,6 +74,7 @@ A profile sets sensible defaults for all tuning parameters. Individual fields ov
 | `memory_threshold_mb` | integer | profile default | RSS threshold in MB; pauses fetching if exceeded (0 = disabled). `balanced` defaults to 4096, `safe` to 2048, `fast` to 0 (no limit). |
 | `max_batch_memory_mb` | integer | — | Hard cap on a single Arrow batch in MB. When exceeded, `on_batch_memory_exceeded` determines the response. |
 | `on_batch_memory_exceeded` | `warn` \| `fail` \| `auto_shrink` | `warn` | Policy applied when a batch exceeds `max_batch_memory_mb`. |
+| `max_value_mb` | integer | `256` | Hard ceiling on a **single cell** (text/JSON/blob) in MB. A value larger than this aborts the run with `RIVET_VALUE_TOO_LARGE`. Guards against one giant cell OOM-ing the process — the batch cap is average-based and can't bound a lone outlier. Set `0` to disable. See [Per-value ceiling](#per-value-ceiling-max_value_mb). |
 | `adaptive` | boolean | `false` | Sample source write-pressure at runtime and react: shrink/restore the fetch batch size, and — in chunked mode with `parallel > 1` — drive the [concurrency governor](#adaptive-concurrency-governor). |
 | `min_parallel` | integer | `1` | Floor for the concurrency governor: the fewest workers it will back down to under pressure. Ceiling is the export's `parallel`. Only consulted when `adaptive` is on and `parallel > 1`. |
 
@@ -101,6 +102,20 @@ Consider lowering batch_size to ~3478.
 ```
 
 Use `auto_shrink` when you want protection against accidental wide-table OOM without needing to tune `batch_size` manually. Use `fail` in CI pipelines where any oversized batch should block the run.
+
+### Per-value ceiling (`max_value_mb`)
+
+`max_batch_memory_mb` and the adaptive byte budget are **average-based** — they size a batch from its mean row width. Neither bounds a *single* pathological cell: one 300 MB JSONB document or `bytea` blob among otherwise-small rows still lands whole in memory and can OOM the process (and the `auto_shrink` splitter can't divide a single oversized value).
+
+`max_value_mb` is a hard per-value ceiling. Before a batch is split or encoded, Rivet checks every variable-length cell (text / JSON / binary — fixed-width types can't be individually huge); a value over the limit aborts the run:
+
+```
+RIVET_VALUE_TOO_LARGE: column 'body' has a single value of 301.2 MB, exceeding the
+per-value ceiling of 256 MB. ...Raise `tuning.max_value_mb` (or set it to 0 to
+disable the guard) if this value is expected.
+```
+
+It is **on by default at 256 MB** — high enough to never trip on realistic data, low enough to catch a runaway cell before it OOMs. Raise it for tables that legitimately store large blobs, or set `max_value_mb: 0` to disable the guard entirely.
 
 ## Choosing `batch_size`
 

@@ -35,6 +35,12 @@ pub struct SourceTuning {
     /// ⇒ 1. The ceiling is the export's configured `parallel`. Only consulted
     /// when `adaptive` is on and `parallel > 1`.
     pub min_parallel: Option<usize>,
+    /// Hard ceiling on a single cell/value in MB (OPT-1 memory hardening): a
+    /// variable-length value (text/JSON/blob) larger than this aborts the run
+    /// with `RIVET_VALUE_TOO_LARGE` instead of risking OOM, since the
+    /// average-based batch cap can't bound one giant cell. `Some(0)` / `None`
+    /// disable the guard. Default: 256 MiB.
+    pub max_value_mb: Option<usize>,
     configured_profile: TuningProfile,
 }
 
@@ -85,6 +91,10 @@ pub struct TuningConfig {
     /// Floor for the concurrency governor (lowest parallelism under pressure).
     /// Default 1. Ceiling is the export's `parallel`.
     pub min_parallel: Option<usize>,
+    /// Hard per-value size ceiling in MB. A single text/JSON/blob cell larger
+    /// than this aborts the run with `RIVET_VALUE_TOO_LARGE`. `0` disables the
+    /// guard. Default: 256.
+    pub max_value_mb: Option<usize>,
 }
 
 /// Layer `export` on top of `source`: each field uses export when set, otherwise source.
@@ -111,6 +121,7 @@ pub fn merge_tuning_config(
             on_batch_memory_exceeded: e.on_batch_memory_exceeded.or(s.on_batch_memory_exceeded),
             adaptive: e.adaptive.or(s.adaptive),
             min_parallel: e.min_parallel.or(s.min_parallel),
+            max_value_mb: e.max_value_mb.or(s.max_value_mb),
         }),
     }
 }
@@ -169,6 +180,9 @@ impl SourceTuning {
             if cfg.min_parallel.is_some() {
                 tuning.min_parallel = cfg.min_parallel;
             }
+            if cfg.max_value_mb.is_some() {
+                tuning.max_value_mb = cfg.max_value_mb;
+            }
         }
 
         tuning
@@ -189,6 +203,7 @@ impl SourceTuning {
                 on_batch_memory_exceeded: BatchMemoryPolicy::Warn,
                 adaptive: false,
                 min_parallel: None,
+                max_value_mb: Some(256),
                 configured_profile: TuningProfile::Fast,
             },
             TuningProfile::Balanced => Self {
@@ -204,6 +219,7 @@ impl SourceTuning {
                 on_batch_memory_exceeded: BatchMemoryPolicy::Warn,
                 adaptive: false,
                 min_parallel: None,
+                max_value_mb: Some(256),
                 configured_profile: TuningProfile::Balanced,
             },
             TuningProfile::Safe => Self {
@@ -219,6 +235,7 @@ impl SourceTuning {
                 on_batch_memory_exceeded: BatchMemoryPolicy::Warn,
                 adaptive: false,
                 min_parallel: None,
+                max_value_mb: Some(256),
                 configured_profile: TuningProfile::Safe,
             },
         }

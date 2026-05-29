@@ -320,6 +320,58 @@ fn unique_cap_column_skipped_in_subsequent_batches() {
     );
 }
 
+// ─── per-value ceiling (OPT-1) ────────────────────────────────
+
+fn utf8_batch(values: Vec<&str>) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, true)]));
+    RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values))]).unwrap()
+}
+
+#[test]
+fn value_ceiling_rejects_oversized_cell() {
+    let mut sink = minimal_sink();
+    sink.max_value_bytes = Some(1024); // 1 KiB ceiling for the test
+    let big = "x".repeat(2048);
+    let batch = utf8_batch(vec!["small", &big]);
+    let err = sink.check_value_ceiling(&batch).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("RIVET_VALUE_TOO_LARGE"), "got: {msg}");
+    assert!(msg.contains("body"), "should name the column: {msg}");
+}
+
+#[test]
+fn value_ceiling_passes_under_limit() {
+    let mut sink = minimal_sink();
+    sink.max_value_bytes = Some(1024);
+    let batch = utf8_batch(vec!["a", "bb", "ccc"]);
+    assert!(sink.check_value_ceiling(&batch).is_ok());
+}
+
+#[test]
+fn value_ceiling_disabled_when_none() {
+    let mut sink = minimal_sink();
+    sink.max_value_bytes = None; // guard off
+    let big = "x".repeat(10 * 1024 * 1024);
+    let batch = utf8_batch(vec![&big]);
+    assert!(
+        sink.check_value_ceiling(&batch).is_ok(),
+        "None must disable the guard entirely"
+    );
+}
+
+#[test]
+fn value_ceiling_ignores_null_cells() {
+    let mut sink = minimal_sink();
+    sink.max_value_bytes = Some(1024);
+    let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, true)]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(StringArray::from(vec![Some("ok"), None]))],
+    )
+    .unwrap();
+    assert!(sink.check_value_ceiling(&batch).is_ok());
+}
+
 // ─── helpers ─────────────────────────────────────────────────
 
 fn minimal_sink() -> ExportSink {
@@ -349,6 +401,7 @@ fn minimal_sink() -> ExportSink {
         strip_internal_column: None,
         column_max_bytes: std::collections::HashMap::new(),
         max_batch_memory_bytes: None,
+        max_value_bytes: None,
         batch_memory_policy: crate::tuning::BatchMemoryPolicy::Warn,
         oversized_batch_count: 0,
         parquet_config: None,
