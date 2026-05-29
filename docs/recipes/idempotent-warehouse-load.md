@@ -54,6 +54,19 @@ recover from raw object listing:
 2. A **content-addressable identity** per part (`content_fingerprint`)
    that survives object renames, lifecycle migrations, and CDN copies.
 
+`content_fingerprint` is the **supported dedup key**: it is an xxh3 over the
+exact part bytes, computed deterministically. Because rivet pins the Parquet
+`created_by` to a version-independent constant, **identical rows produce
+identical bytes — and therefore the same `content_fingerprint` — across rivet
+releases**, not just within one build. So a re-extraction of the same window
+(e.g. a crash + `--resume`, or a deliberate re-run) yields parts a downstream
+`MERGE` can dedup on by fingerprint alone. Two parts with the same
+`content_fingerprint` are byte-identical and interchangeable; drop one.
+
+(The fingerprint is over file *bytes*, not logical rows — so it is stable for
+the same rows + schema + compression settings. Changing `compression:` or the
+column projection changes the bytes, hence the fingerprint.)
+
 ---
 
 ## Recommended pattern
