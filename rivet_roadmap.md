@@ -576,7 +576,7 @@ recovery semantics, quality gates, resource controls, and reliability coverage.
 
 | Work | Priority | Status | Definition of done |
 |---|---|---|---|
-| Release checksums (`SHA256SUMS`) | P1 | ⏳ Open | Every release publishes checksums and README verification instructions |
+| Release checksums (`SHA256SUMS`) | P1 | ✅ Done | `release.yml` publishes `SHA256SUMS.txt` per release; verification documented in README + SECURITY.md |
 | Signed releases / attestations | P2 | ⏳ Open | Release artifacts can be cryptographically verified |
 | SBOM | P2 | ⏳ Open | Release includes SBOM artifact and security docs mention it |
 | 24h+ soak tests | P2 | ⏳ Open | Long-horizon extraction run documented in reliability matrix |
@@ -994,7 +994,7 @@ with verify-layer work as bandwidth allows.
 
 - ⏳ **`check` verdict pessimism vs actual run.** UNSAFE / DEGRADED predicts high RSS on parallel reads against no-index tables, but the actual run frequently sits well under the predicted budget (e.g. 10 M-row chunked-parallel orders ran in 12 s at 117 MB RSS while check said UNSAFE). Either make the predictor use estimated row width + chunk batch size for a tighter bound, or downgrade UNSAFE to DEGRADED when the verdict can't show a concrete budget breach.
 - ⏳ **`destination is not retry-safe` WARN spams local-destination runs.** `type: local` is the canonical dev/test destination but each run prints a retry-safety WARN. Either suppress for `local` (partial artifact = one failed-rewrite file, not silent data loss) or have `rivet init` add the right opt-in so the warn does not fire on defaults.
-- ⏳ **TLS warning only in `run`, not in `doctor`/`check`.** Security warnings should surface in preflight commands — that's what `doctor` is for. Today the operator only learns about the missing `tls:` block when they start a real extract.
+- ✅ **TLS warning now surfaces in `doctor`/`check`** (v0.7.8) — preflight calls `warn_if_tls_disabled` ([src/preflight/doctor.rs](src/preflight/doctor.rs), [src/preflight/mod.rs](src/preflight/mod.rs)), so the missing-`tls:` warning fires before a real extract, not only in `run`.
 - ⏳ **`rivet init --schema X` includes ad-hoc / test tables.** Schema-wide init dumps every relation in the schema (140 entries in our dev DB, most of them leftover test artifacts). Add an `--exclude '<glob>'` flag or a heuristic that skips tables whose names match common temp/test patterns (`tmp_*`, `*_temp`, tables with PID-shaped suffixes).
 
 **P3 — polish & doc clarity** (good v0.8.0 fodder):
@@ -1002,11 +1002,11 @@ with verify-layer work as bandwidth allows.
 - ⏳ **`rivet init` does not explain *why* it picked a mode.** Generated YAML says `mode: chunked` but not "(auto-selected because rows estimate ≥ 500 K)". One-line inline comment in the rendered config would close the loop.
 - ⏳ **`rivet journal --export X` does not show retry events.** Doc promises "per-run events / retries / quality issues"; today it only shows status + duration. Plumb per-chunk retry attempts into the structured journal so post-mortem doesn't require digging in stderr WARNs.
 - ⏳ **100 files per 10 M-row chunked export.** Default `chunk_size: 100_000` × big table = many small files. `rivet init` could scale `chunk_size` logarithmically with the row estimate (e.g. ≥ 10 M → 1 M chunk_size) so default file counts stay reasonable.
-- ⏳ **`status: skipped` summary is sparse.** Incremental-mode skipped run shows `status: skipped` with no context; add `(no new rows since cursor <X>)` so the operator does not have to guess.
-- ⏳ **Doc note: re-running `chunked` re-extracts everything.** `--resume` skips completed chunks after a crash, but a clean re-run re-does the full table. Worth one paragraph in `modes/chunked.md` so operators do not assume idempotency.
+- ✅ **`status: skipped` now names the cursor** (v0.7.8) — shows `(no new rows since cursor '<col>')` ([src/pipeline/single.rs](src/pipeline/single.rs)) so the operator doesn't have to guess.
+- ✅ **Doc note added: re-running `chunked` re-extracts everything** — [`docs/modes/chunked.md`](docs/modes/chunked.md) § "Clean re-runs are NOT idempotent" spells out that `--resume` only skips completed chunks after a crash.
 - ⏳ **Doc note: `time_window` re-runs duplicate output.** Rolling window mode does not persist "we did this window already", so frequent re-runs produce duplicate files. Worth a paragraph in `modes/time-window.md`.
 - ⏳ **Retry / I3 (Write Before Cursor) at-least-once dupe scenario** not yet covered by tests. The contract documents the duplicate possibility (`ADR-0001 I3`), and toxiproxy-based retry testing showed counters work; a dedicated SIGKILL-between-write-and-commit recovery test would pin the actual dupe behavior end-to-end.
-- ⏳ **Stale roadmap items inherited from earlier sessions:** "2–3 pilot tables repeated on a schedule" in §9.7 (organizational), release checksums / SBOM / signed release attestations (also §9.7 unchecked).
+- ⏳ **Stale roadmap items inherited from earlier sessions:** "2–3 pilot tables repeated on a schedule" in §9.7 (organizational), SBOM / signed release attestations (also §9.7 unchecked). *(Release checksums shipped in v0.7.8 — now checked.)*
 
 ---
 
@@ -1034,7 +1034,7 @@ with verify-layer work as bandwidth allows.
 - [x] Execution semantics and known non-guarantees documented
 - [x] Reliability and compatibility matrices published
 - [x] Pilot and production-readiness docs published
-- [ ] Release checksums
+- [x] Release checksums *(v0.7.8 — `SHA256SUMS.txt` published per release; verify with `sha256sum -c`)*
 - [ ] Signed releases / attestations
 - [ ] SBOM
 
@@ -1068,13 +1068,13 @@ and the two-engine separation with explicit revisit triggers (ADR-0010).
 
 | ID | Area | Priority | Status | One-line |
 |---|---|---|---|---|
-| OPT-1 | Memory safety | P2 | ⏳ Open | Adaptive byte-budget cap **already exists** (both engines); residual: probe-batch warmup, single-outlier value, soft target × threads |
-| OPT-2 | Adaptive concurrency | P1 | ⏳ Open | Batch-size adaptation **already exists**; gap is governing *parallelism/connections* + using the richer `rivet-mcp` signal set |
+| OPT-1 | Memory safety | P2 | ✅ Done (core) | Per-value ceiling `RIVET_VALUE_TOO_LARGE` shipped (189d915, default 256 MB). Follow-ups: probe-batch warmup shrink, check-predictor feedback |
+| OPT-2 | Adaptive concurrency | P1 | ✅ Done | Adaptive parallelism governor shipped (141bf33) — resizes worker count in `[min, parallel]` under source pressure (in-process engine). Follow-ups: subprocess engine (after OPT-6), richer `rivet-mcp` signals |
 | OPT-3 | Type fidelity | P1 | ⏳ Open (validated) | Round-trip proof is enumerated-fixture; no proptest type test exists — confirmed |
-| OPT-4 | MySQL parity | P1 | ⏳ Open (**corrected**) | Hard-*refuses* (not silent); real gap = no keyset chunking ⇒ non-int-PK MySQL has no safe shape |
+| OPT-4 | MySQL parity | P1 | ✅ Done | MySQL keyset (seek) pagination shipped (40433a0) — single-column unique key, sequential, EXPLAIN-verified index range scan. Follow-ups: composite keys, parallel keyset, resume |
 | OPT-5 | Dedup ergonomics | P2 | ⏳ Open (**corrected**) | Deterministic per-part `content_fingerprint` **already exists** (`manifest.rs:160`); gap = guarantee/expose + parquet byte-determinism |
 | OPT-6 | Engine debt | P2 | ⏳ Open (validated) | Subprocess fan-out engine has **zero** crash tests; no signal handling — confirmed gap |
-| OPT-7 | Doc/roadmap drift | P1 | ⏳ Open | Several ⏳ items already shipped in 0.7.8; checksums ship but docs say "rebuild from source" |
+| OPT-7 | Doc/roadmap drift | P1 | ✅ Done | Checksums documented as shipped (SECURITY.md + README + §5.1/§9.7); 3 §9.6.1 items struck. *Verified 3 other claimed-shipped §9.6.1 items (local-retry WARN, init mode-comment, init chunk_size scaling) are NOT shipped — left open.* |
 
 ---
 

@@ -7,6 +7,33 @@
 > types for UUID/JSON, and closes two validation-surface bugs uncovered
 > while walking the documented golden paths.
 
+### Extraction & memory hardening (optimization backlog)
+
+- **`feat(pipeline)`** — **adaptive concurrency governor** (OPT-2): in chunked
+  mode with `parallel > 1` and `tuning.adaptive: true`, a governor samples
+  source write-pressure on a dedicated monitoring connection and resizes the
+  live worker/connection count within `[min_parallel, parallel]` — backing off
+  under load, recovering when it eases. Decisions land in the run journal
+  (`ParallelismAdjusted`). Read-only credentials suffice.
+- **`feat(pipeline)`** — **MySQL keyset (seek) pagination** (OPT-4): tables with
+  a UUID / string / composite (non-integer) PK now have a safe chunked shape via
+  `chunk_by_key:` (auto-resolved on MySQL when there's no single-int PK but a
+  usable unique key). Pages by an index-backed unique key
+  (`WHERE key > last ORDER BY key LIMIT n`) — bounded RSS *and* bounded
+  longest-query time, EXPLAIN-verified as an index range scan (never a
+  full-scan + filesort). A non-indexed `chunk_by_key` is refused.
+- **`feat(sink)`** — **per-value size ceiling** (OPT-1): `tuning.max_value_mb`
+  (default 256 MB; `0` disables) aborts with `RIVET_VALUE_TOO_LARGE` when a
+  single text/JSON/blob cell would OOM the process — the average-based batch
+  cap can't bound a lone giant value.
+
+### Supply chain
+
+- **`docs(security)`** — documented release-checksum verification. Every release
+  already publishes `SHA256SUMS.txt`; README + SECURITY.md now show
+  `sha256sum -c` / `shasum -a 256 -c` (the docs previously said "rebuild from
+  source"). Signing/SBOM remain on the roadmap.
+
 ### Types — native Parquet logical types + round-trip proof
 
 - **`feat(types)`** — UUID columns now emit native Parquet

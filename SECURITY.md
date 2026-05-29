@@ -162,11 +162,22 @@ The pilot guide covers this end-to-end: [docs/pilot/production-checklist.md](doc
 |---|---|---|
 | RustSec advisory audit | **Active** | `audit` job in [.github/workflows/ci.yml](.github/workflows/ci.yml) runs `rustsec/audit-check` on every PR |
 | Dependency review | **Active** | Cargo.lock is committed; bumps land in dedicated PRs |
-| Release checksums (`SHA256SUMS`) | Roadmap | Tracked in the packaging trust roadmap (Phase 6.1) |
+| Release checksums (`SHA256SUMS`) | **Active** | Every release publishes `SHA256SUMS.txt` as an asset ([`.github/workflows/release.yml`](.github/workflows/release.yml)); verification below |
 | Signed releases (cosign / GPG / attestation) | Roadmap | Phase 6.2 |
 | SBOM | Roadmap | Phase 6.3 |
 
-Until checksums and signatures are published, verify release binaries by rebuilding from source at the tagged commit (`cargo build --release` after `git checkout v0.6.0`).
+**Verify a downloaded release** against the published checksums:
+
+```bash
+# Download the release tarball(s) and SHA256SUMS.txt from the GitHub release, then:
+sha256sum -c SHA256SUMS.txt        # Linux
+shasum -a 256 -c SHA256SUMS.txt    # macOS
+```
+
+Signatures/attestations are not yet published — until then, checksums confirm
+integrity (the file matches what CI built) but not provenance. For the strongest
+guarantee you can still rebuild from source at the tagged commit
+(`cargo build --release` after `git checkout <tag>`).
 
 ---
 

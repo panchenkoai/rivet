@@ -225,6 +225,14 @@ sudo mv rivet-*/rivet /usr/local/bin/
 rivet --version
 ```
 
+**Verify the download** against the published checksums (every release ships `SHA256SUMS.txt`):
+
+```bash
+# Download the tarball + SHA256SUMS.txt from the same release, then:
+sha256sum -c SHA256SUMS.txt        # Linux
+shasum -a 256 -c SHA256SUMS.txt    # macOS
+```
+
 ### Docker
 
 ```bash
