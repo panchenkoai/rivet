@@ -237,6 +237,13 @@ pub(crate) fn run_chunked_parallel(
     );
 
     let completed = AtomicUsize::new(0);
+    // Every worker bumps this exactly once — on success OR failure — so the
+    // governor thread can tell when the run is *done* regardless of outcome.
+    // `completed` counts only successes (progress bar / summary); using it for
+    // the governor's exit condition deadlocks the `thread::scope` whenever a
+    // chunk fails (the governor would loop forever waiting for a success count
+    // that never arrives).
+    let finished = AtomicUsize::new(0);
     let agg_rows = std::sync::atomic::AtomicI64::new(0);
     let agg_bytes = std::sync::atomic::AtomicU64::new(0);
     let agg_files = AtomicUsize::new(0);
@@ -314,11 +321,13 @@ pub(crate) fn run_chunked_parallel(
     std::thread::scope(|s| {
         // Governor thread: samples source pressure on its own monitoring
         // connection and resizes the semaphore within [floor, parallel]. It
-        // self-terminates once every chunk has completed. Holds parallelism
-        // flat whenever the engine can't sample (`sample_pressure` → None).
+        // self-terminates once every chunk worker has finished (success OR
+        // failure) — keyed on `finished`, not `completed`, so a failing chunk
+        // can't strand it and deadlock the scope. Holds parallelism flat
+        // whenever the engine can't sample (`sample_pressure` → None).
         if let Some(mut monitor) = governor_monitor {
             let semaphore = &semaphore;
-            let completed = &completed;
+            let finished = &finished;
             let governor_log = &governor_log;
             let total = total_chunks;
             let ceiling = parallel;
@@ -326,11 +335,22 @@ pub(crate) fn run_chunked_parallel(
             let export_name = plan.export_name.as_str();
             s.spawn(move || {
                 let mut gov = GovernorState::new(ceiling, floor, ceiling);
-                let interval = Duration::from_millis(GOVERNOR_SAMPLE_INTERVAL_MS);
+                // `RIVET_GOVERNOR_INTERVAL_MS` shrinks the sample cadence for
+                // deterministic live tests (same env-seam convention as
+                // `RIVET_TEST_PANIC_AT`). Unset → production default. The poll
+                // sleep is clamped to the interval so a small override actually
+                // samples that fast (otherwise GOVERNOR_POLL_MS would cap it).
+                let sample_ms = std::env::var("RIVET_GOVERNOR_INTERVAL_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|&n| n > 0)
+                    .unwrap_or(GOVERNOR_SAMPLE_INTERVAL_MS);
+                let poll_ms = GOVERNOR_POLL_MS.min(sample_ms);
+                let interval = Duration::from_millis(sample_ms);
                 let mut last_sample = Instant::now();
-                while completed.load(Ordering::Relaxed) < total {
-                    std::thread::sleep(Duration::from_millis(GOVERNOR_POLL_MS));
-                    if completed.load(Ordering::Relaxed) >= total {
+                while finished.load(Ordering::Relaxed) < total {
+                    std::thread::sleep(Duration::from_millis(poll_ms));
+                    if finished.load(Ordering::Relaxed) >= total {
                         break;
                     }
                     if last_sample.elapsed() < interval {
@@ -378,6 +398,7 @@ pub(crate) fn run_chunked_parallel(
             let base_query = &plan.base_query;
             let col = &cp.column;
             let completed = &completed;
+            let finished = &finished;
             let agg_rows = &agg_rows;
             let agg_bytes = &agg_bytes;
             let agg_files = &agg_files;
@@ -501,6 +522,10 @@ pub(crate) fn run_chunked_parallel(
                         .unwrap_or_else(|e| e.into_inner())
                         .push(format!("chunk {}: {:#}", i, e));
                 }
+
+                // Mark this worker done (success OR failure) so the governor
+                // thread can terminate — must run on every exit path.
+                finished.fetch_add(1, Ordering::Relaxed);
             });
         }
     });
