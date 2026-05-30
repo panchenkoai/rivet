@@ -573,6 +573,24 @@ impl RunSummary {
                 self.files_committed
             ));
         }
+        // Invariant audit gap #1, weak form: a successful run that produced
+        // rows for THIS invocation must have committed at least one file.
+        // The strict form ("rows_written <= rows_read") would require a
+        // separate source-side row counter we do not track, and concurrent
+        // INSERTs on the source (live_oltp_load) make a source_count
+        // comparison brittle. This weak form catches a fabrication shape:
+        // total_rows accumulated but nothing reached the destination — a
+        // runner that fetched and silently dropped rows produces exactly
+        // this signature. Resume-safe: total_rows reflects only this
+        // invocation, so a resume with no work to do legitimately ends at
+        // total_rows=0 / files_committed=0 and the guard does not fire.
+        if self.status == "success" && self.total_rows > 0 && self.files_committed == 0 {
+            return Err(format!(
+                "summary.total_rows={} but files_committed=0 — rows extracted from \
+                 source but no files committed (no output reached the destination)",
+                self.total_rows
+            ));
+        }
         Ok(())
     }
 }
