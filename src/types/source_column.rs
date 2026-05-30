@@ -31,6 +31,18 @@ pub struct SourceColumn {
     /// `"jsonb"`). Always present.
     pub native_type: String,
     /// True when the source schema declares the column nullable.
+    ///
+    /// **Current limitation (see ADR-0016):** every driver passes `true`
+    /// here unconditionally — Rivet does not query
+    /// `information_schema.columns.is_nullable` (MySQL) /
+    /// `pg_attribute.attnotnull` (PostgreSQL), so source `NOT NULL`
+    /// constraints are *not* propagated to the output Parquet schema.
+    /// Downstream catalog tools therefore see every column as nullable
+    /// regardless of source declaration. Conservative for write paths
+    /// (any value passes), lossy for read paths (cannot distinguish
+    /// "schema-mandated NOT NULL" from "allows NULL but happened to have
+    /// no NULLs in this run"). Tracked for v0.8 Phase A type-report
+    /// extension (per ADR-0014).
     pub nullable: bool,
     /// Decimal precision — number of total significant digits. Only present
     /// for fixed-precision numeric types where the source actually declared
