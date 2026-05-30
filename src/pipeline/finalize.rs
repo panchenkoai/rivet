@@ -90,6 +90,19 @@ pub(super) fn finalize_manifest(
     use crate::manifest::ManifestStatus;
     use crate::pipeline::manifest_writer::{ManifestBuilder, WriteOutcome, write_manifest};
 
+    // CI gate: catch any future runner that drifts summary aggregates away
+    // from manifest_parts (the bug parallel_checkpoint had before e9b0796).
+    // Debug-build only — compiled out in release.
+    if cfg!(debug_assertions)
+        && let Err(e) = summary.check_post_run_invariants()
+    {
+        panic!(
+            "summary↔manifest coherence violated at finalize_manifest \
+             for {} '{}': {}",
+            kind, summary.export_name, e
+        );
+    }
+
     let snapshot = match summary.journal.plan_snapshot() {
         Some(s) => s,
         None => {

@@ -523,6 +523,58 @@ impl RunSummary {
 
         format_block(&self.export_name, &rows)
     }
+
+    /// Sanity-check the post-run summary ↔ manifest_parts coherence. Used as
+    /// a `debug_assert!`-style runtime gate from `finalize_manifest` so any
+    /// future runner that bumps `bytes_written` / `files_committed` /
+    /// `files_produced` without going through `pipeline::commit::record_part`
+    /// is caught the moment it finishes a real export. Compiled out in
+    /// release builds via the `cfg!(debug_assertions)` guard at the call site.
+    ///
+    /// **Resume-safe inequalities only**: on resume, `manifest_parts` carries
+    /// prior runs' parts via `chunked::resume_m8` while `bytes_written` /
+    /// `files_committed` reflect only the current invocation — so strict
+    /// equality is wrong across resume boundaries. Strict equality on the
+    /// non-resume path is pinned by `pipeline::commit::tests`.
+    ///
+    /// Returns `Ok(())` when the summary satisfies the invariants, else an
+    /// `Err(String)` naming which one was violated and by how much.
+    pub fn check_post_run_invariants(&self) -> Result<(), String> {
+        let parts_bytes: u64 = self.manifest_parts.iter().map(|p| p.size_bytes).sum();
+
+        if self.files_committed > self.manifest_parts.len() {
+            return Err(format!(
+                "summary.files_committed ({}) > manifest_parts.len() ({}) — \
+                 a runner bumped files_committed without commit::record_part",
+                self.files_committed,
+                self.manifest_parts.len()
+            ));
+        }
+        if self.files_produced > self.manifest_parts.len() {
+            return Err(format!(
+                "summary.files_produced ({}) > manifest_parts.len() ({}) — \
+                 a runner bumped files_produced without commit::record_part",
+                self.files_produced,
+                self.manifest_parts.len()
+            ));
+        }
+        if self.bytes_written > parts_bytes {
+            return Err(format!(
+                "summary.bytes_written ({}) > sum(manifest_parts.size_bytes) ({}) — \
+                 a runner bumped bytes_written without commit::record_part",
+                self.bytes_written, parts_bytes
+            ));
+        }
+        if self.status == "success" && self.files_committed > 0 && self.manifest_parts.is_empty() {
+            return Err(format!(
+                "success run with files_committed={} has empty manifest_parts — \
+                 cloud manifest (ADR-0012 M1) would ship with no part list \
+                 (this is the gap parallel_checkpoint had before commit e9b0796)",
+                self.files_committed
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Reduce a possibly-multi-line execution error to a single-line, bounded-

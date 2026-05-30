@@ -359,4 +359,107 @@ mod tests {
         assert_eq!(summary.manifest_parts.len(), 1);
         assert_eq!(summary.journal.chunk_events().len(), 1);
     }
+
+    // ── summary ↔ manifest coherence (CI gate, gaps #2 + #3 in invariant audit)
+    //
+    // record_part is the single home that mutates summary.bytes_written,
+    // summary.files_produced, summary.files_committed, and
+    // summary.manifest_parts. The seam exists so the four cannot drift. This
+    // test pins the contract: after N record_part calls on a freshly stubbed
+    // summary (no resume hydration), the four aggregates must agree with
+    // manifest_parts byte-for-byte. If a future runner bypasses record_part
+    // and bumps a counter inline, this test still passes — but the
+    // finalize_manifest runtime debug_assert (see assert_summary_post_run)
+    // will fire the moment that runner finishes a real export. Two layers,
+    // both CI-enforced via `cargo test`.
+
+    fn synthetic_parts(n: usize) -> Vec<PartRecord> {
+        (0..n)
+            .map(|i| PartRecord {
+                file_name: format!("part_{i}.parquet"),
+                rows: 100 + (i as i64) * 10,
+                bytes: 1024 * ((i as u64) + 1),
+                fingerprint: format!("xxh3:{i:016x}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn record_part_keeps_summary_aggregates_coherent_with_manifest_parts() {
+        let plan = test_plan();
+        let mut summary = test_summary(&plan);
+        let parts = synthetic_parts(5);
+
+        // Simulate a runner: bump total_rows then record_part for each chunk.
+        // record_part does NOT touch total_rows; the runner owns that bump,
+        // so we model both halves of the contract here.
+        for (i, p) in parts.iter().enumerate() {
+            summary.total_rows += p.rows;
+            record_part(
+                &plan,
+                &mut summary,
+                None,
+                p,
+                PartKind::Chunk {
+                    chunk_index: i as i64,
+                },
+            );
+        }
+
+        let parts_rows: i64 = summary.manifest_parts.iter().map(|p| p.rows).sum();
+        let parts_bytes: u64 = summary.manifest_parts.iter().map(|p| p.size_bytes).sum();
+
+        assert_eq!(
+            summary.total_rows, parts_rows,
+            "non-resume run: summary.total_rows must equal sum(manifest_parts.rows)"
+        );
+        assert_eq!(
+            summary.bytes_written, parts_bytes,
+            "non-resume run: summary.bytes_written must equal sum(manifest_parts.size_bytes)"
+        );
+        assert_eq!(
+            summary.files_produced,
+            summary.manifest_parts.len(),
+            "files_produced must equal manifest_parts.len() (record_part bumps both)"
+        );
+        assert_eq!(
+            summary.files_committed,
+            summary.manifest_parts.len(),
+            "files_committed must equal manifest_parts.len() (record_part bumps both)"
+        );
+    }
+
+    #[test]
+    fn nonempty_successful_run_must_have_nonempty_manifest_parts() {
+        // Contrapositive of M1: a successful run that committed at least one
+        // file must surface that file in the cloud manifest. Before
+        // commit e9b0796 parallel_checkpoint violated this — its
+        // manifest_parts stayed empty for every run while files_committed
+        // and bytes_written reported real work. This test pins the
+        // contract: if files_committed > 0 then manifest_parts is non-empty.
+        let plan = test_plan();
+        let mut summary = test_summary(&plan);
+        let part = test_part("orders_chunk0.parquet");
+
+        summary.total_rows += part.rows;
+        record_part(
+            &plan,
+            &mut summary,
+            None,
+            &part,
+            PartKind::Chunk { chunk_index: 0 },
+        );
+        summary.status = "success".into();
+
+        assert!(summary.files_committed > 0, "test premise: work committed");
+        assert!(
+            !summary.manifest_parts.is_empty(),
+            "non-empty success run must surface files in manifest_parts"
+        );
+        assert_eq!(
+            summary.files_committed,
+            summary.manifest_parts.len(),
+            "files_committed and manifest_parts.len() locked together by record_part"
+        );
+    }
 }
