@@ -33,12 +33,10 @@ use crate::{destination, format, resource};
 
 use super::math::build_chunk_query_sql;
 
-/// Returns `(rows, file_name, file_bytes, content_fingerprint)`.
-///
-/// The fingerprint is computed while the local tmp file still exists inside
-/// this function (it is dropped on return); ADR-0012 M3 requires every
-/// committed manifest part to carry one.  An empty chunk returns `None`s
-/// where a real chunk would carry a file name and fingerprint.
+/// Returns `(rows, Some(part))` for a non-empty chunk or `(0, None)` for an
+/// empty one.  Uses [`commit::write_part_file`] for the worker-safe I1 →
+/// dest.write → fingerprint half; the caller threads the resulting
+/// [`PartRecord`] through [`commit::record_part`].
 #[allow(clippy::too_many_arguments)] // chunk + plan + summary threading is the actual arity here
 fn export_one_chunk_range(
     src: &mut dyn Source,
@@ -49,7 +47,7 @@ fn export_one_chunk_range(
     chunk_index: i64,
     plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
-) -> Result<(usize, Option<String>, u64, Option<String>)> {
+) -> Result<(usize, Option<super::super::commit::PartRecord>)> {
     let chunk_query = build_chunk_query_sql(
         base_query,
         &cp.column,
@@ -83,16 +81,13 @@ fn export_one_chunk_range(
     }
 
     if sink.total_rows == 0 {
-        return Ok((0, None, 0, None));
+        return Ok((0, None));
     }
 
     if plan.validate {
         validate_output(sink.tmp.path(), plan.format, sink.total_rows)?;
         summary.validated = Some(true);
     }
-    let file_bytes = std::fs::metadata(sink.tmp.path())
-        .map(|m| m.len())
-        .unwrap_or(0);
 
     let fmt = format::create_format(plan.format, plan.compression, plan.compression_level, None);
     let file_name = format!(
@@ -103,25 +98,15 @@ fn export_one_chunk_range(
         fmt.file_extension()
     );
     let dest = destination::create_destination(&plan.destination)?;
-    dest.write(sink.tmp.path(), &file_name)?;
-    let fingerprint = super::super::manifest_writer::compute_part_fingerprint(sink.tmp.path())
-        .unwrap_or_else(|e| {
-            log::warn!(
-                "export '{}': checkpoint chunk {} fingerprint failed for '{}' (not fatal): {:#}",
-                plan.export_name,
-                chunk_index,
-                file_name,
-                e
-            );
-            "xxh3:0000000000000000".to_string()
-        });
+    // Worker-safe half of commit (I1 + dest.write + fingerprint).
+    let rec = super::super::commit::write_part_file(
+        dest.as_ref(),
+        sink.tmp.path(),
+        sink.total_rows as i64,
+        file_name,
+    )?;
 
-    Ok((
-        sink.total_rows,
-        Some(file_name),
-        file_bytes,
-        Some(fingerprint),
-    ))
+    Ok((sink.total_rows, Some(rec)))
 }
 
 #[allow(clippy::too_many_arguments)] // mirrors export_one_chunk_range's arity for retry wrapping
@@ -133,7 +118,7 @@ fn run_chunk_with_source_retries(
     chunk_index: i64,
     plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
-) -> Result<(usize, Option<String>, u64, Option<String>)> {
+) -> Result<(usize, Option<super::super::commit::PartRecord>)> {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..=plan.tuning.max_retries {
         if attempt > 0 {
@@ -277,46 +262,34 @@ pub(crate) fn run_chunked_sequential_checkpoint(
             plan,
             summary,
         ) {
-            Ok((rows, fname, file_bytes, fingerprint)) => {
+            Ok((rows, part)) => {
                 summary.total_rows += rows as i64;
                 pb.inc(summary.total_rows);
-                if rows > 0 {
-                    summary.bytes_written += file_bytes;
-                    summary.files_produced += 1;
-                    if let Some(name) = &fname
-                        && let Err(e) = state.record_file(
-                            &summary.run_id,
-                            &plan.export_name,
-                            name,
-                            rows as i64,
-                            file_bytes as i64,
-                            plan.format.label(),
-                            Some(plan.compression.label()),
-                        )
-                    {
-                        log::warn!(
-                            "export '{}': file_log write failed for checkpoint chunk '{}' (file was produced): {:#}",
-                            plan.export_name,
-                            name,
-                            e
-                        );
-                    }
-                    // ADR-0012 M1: record this committed checkpoint chunk for the manifest.
-                    if let (Some(name), Some(fp)) = (fname.as_ref(), fingerprint) {
-                        super::super::manifest_writer::record_committed_part_with_fingerprint(
+                // Shared commit path for the non-empty branch (I2/M1 + counters
+                // + ChunkCompleted journal + I7 file-log + fault hooks).
+                // Empty chunks have no file to record but still need to journal
+                // completion + finalize the chunk_task so the run accounts for
+                // every claimed index.
+                let fname: Option<String> = match &part {
+                    Some(rec) => {
+                        super::super::commit::record_part(
+                            plan,
                             summary,
-                            name.clone(),
-                            rows as i64,
-                            file_bytes,
-                            fp,
+                            Some(state),
+                            rec,
+                            super::super::commit::PartKind::Chunk { chunk_index },
                         );
+                        Some(rec.file_name.clone())
                     }
-                }
-                summary.journal.record(RunEvent::ChunkCompleted {
-                    chunk_index,
-                    rows: rows as i64,
-                    file_name: fname.clone(),
-                });
+                    None => {
+                        summary.journal.record(RunEvent::ChunkCompleted {
+                            chunk_index,
+                            rows: 0,
+                            file_name: None,
+                        });
+                        None
+                    }
+                };
                 crate::test_hook::maybe_panic_at_chunk("after_chunk_file", chunk_index);
                 state.complete_chunk_task(&run_id, chunk_index, rows as i64, fname.as_deref())?;
                 crate::test_hook::maybe_panic_at_chunk("after_chunk_complete", chunk_index);

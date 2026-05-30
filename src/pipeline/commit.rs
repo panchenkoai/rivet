@@ -130,3 +130,233 @@ pub(crate) fn record_part(
     // ADR-0001 I3 crash window: manifest recorded, cursor not yet advanced.
     crate::test_hook::maybe_panic_at("after_manifest_update");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        CompressionType, DestinationConfig, DestinationType, FormatType, SourceConfig, SourceType,
+    };
+    use crate::destination::local::LocalDestination;
+    use crate::journal::RunEvent;
+    use crate::pipeline::summary::RunSummary;
+    use crate::plan::{ExtractionStrategy, ResolvedRunPlan};
+    use crate::state::StateStore;
+    use crate::tuning::SourceTuning;
+    use std::io::Write;
+
+    fn test_plan() -> ResolvedRunPlan {
+        ResolvedRunPlan {
+            export_name: "orders".into(),
+            base_query: "SELECT 1".into(),
+            strategy: ExtractionStrategy::Snapshot,
+            format: FormatType::Parquet,
+            compression: CompressionType::None,
+            compression_level: None,
+            max_file_size_bytes: None,
+            skip_empty: false,
+            meta_columns: Default::default(),
+            destination: DestinationConfig {
+                destination_type: DestinationType::Local,
+                path: Some("/tmp".into()),
+                ..Default::default()
+            },
+            quality: None,
+            tuning: SourceTuning::from_config(None),
+            tuning_profile_label: "balanced".into(),
+            validate: false,
+            reconcile: false,
+            resume: false,
+            source: SourceConfig {
+                source_type: SourceType::Postgres,
+                url: Some("postgresql://nobody@127.0.0.1:9999/nonexistent".into()),
+                url_env: None,
+                url_file: None,
+                host: None,
+                port: None,
+                user: None,
+                password: None,
+                password_env: None,
+                database: None,
+                environment: None,
+                tuning: None,
+                tls: None,
+            },
+            column_overrides: Default::default(),
+            schema_drift_policy: Default::default(),
+            shape_drift_warn_factor: 0.0,
+            parquet: None,
+        }
+    }
+
+    fn test_summary(plan: &ResolvedRunPlan) -> RunSummary {
+        let mut s = RunSummary::stub_for_testing("test_run", plan.export_name.clone());
+        s.batch_size = 10_000;
+        s.mode = "snapshot".into();
+        s.compression = "none".into();
+        s
+    }
+
+    fn test_part(file_name: &str) -> PartRecord {
+        PartRecord {
+            file_name: file_name.into(),
+            rows: 42,
+            bytes: 1024,
+            fingerprint: "xxh3:1234567890abcdef".into(),
+        }
+    }
+
+    // ── write_part_file ──────────────────────────────────────────────────────
+
+    #[test]
+    fn write_part_file_copies_to_destination_and_returns_real_bytes_and_fingerprint() {
+        // Stage a fixture file with known content; write it through LocalDestination.
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let src_path = src_dir.path().join("part.parquet");
+        let payload: &[u8] = b"hello rivet";
+        std::fs::File::create(&src_path)
+            .unwrap()
+            .write_all(payload)
+            .unwrap();
+
+        let dest = LocalDestination::new(&DestinationConfig {
+            destination_type: DestinationType::Local,
+            path: Some(dst_dir.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let rec =
+            write_part_file(&dest, &src_path, 7, "out/part.parquet".into()).expect("write ok");
+
+        assert_eq!(rec.file_name, "out/part.parquet");
+        assert_eq!(rec.rows, 7);
+        assert_eq!(rec.bytes, payload.len() as u64);
+        assert!(
+            rec.fingerprint.starts_with("xxh3:") && rec.fingerprint.len() == 21,
+            "fingerprint should be xxh3:<16 hex chars>, got {:?}",
+            rec.fingerprint
+        );
+        let written = dst_dir.path().join("out").join("part.parquet");
+        assert_eq!(std::fs::read(&written).unwrap(), payload);
+    }
+
+    // ── record_part: counters + journal + manifest ────────────────────────────
+
+    #[test]
+    fn record_part_file_kind_bumps_counters_and_journals_file_written() {
+        let plan = test_plan();
+        let mut summary = test_summary(&plan);
+        let part = test_part("orders_chunk0.parquet");
+
+        record_part(
+            &plan,
+            &mut summary,
+            None,
+            &part,
+            PartKind::File { part_index: 0 },
+        );
+
+        assert_eq!(summary.bytes_written, part.bytes);
+        assert_eq!(summary.files_produced, 1);
+        assert_eq!(summary.files_committed, 1);
+        assert_eq!(summary.manifest_parts.len(), 1);
+        assert_eq!(summary.manifest_parts[0].path, part.file_name);
+        assert_eq!(summary.manifest_parts[0].rows, part.rows);
+
+        let file_events = summary.journal.files();
+        assert_eq!(file_events.len(), 1, "must journal one FileWritten");
+        assert!(
+            matches!(
+                &file_events[0].event,
+                RunEvent::FileWritten { part_index: 0, .. }
+            ),
+            "expected FileWritten{{part_index:0}}, got {:?}",
+            file_events[0].event
+        );
+        assert!(
+            summary.journal.chunk_events().is_empty(),
+            "File kind must not journal ChunkCompleted"
+        );
+    }
+
+    #[test]
+    fn record_part_chunk_kind_journals_chunk_completed_with_file_name() {
+        let plan = test_plan();
+        let mut summary = test_summary(&plan);
+        let part = test_part("orders_chunk7.parquet");
+
+        record_part(
+            &plan,
+            &mut summary,
+            None,
+            &part,
+            PartKind::Chunk { chunk_index: 7 },
+        );
+
+        let events = summary.journal.chunk_events();
+        assert_eq!(events.len(), 1, "must journal one ChunkCompleted");
+        match &events[0].event {
+            RunEvent::ChunkCompleted {
+                chunk_index,
+                rows,
+                file_name,
+            } => {
+                assert_eq!(*chunk_index, 7);
+                assert_eq!(*rows, part.rows);
+                assert_eq!(file_name.as_deref(), Some(part.file_name.as_str()));
+            }
+            other => panic!("expected ChunkCompleted, got {other:?}"),
+        }
+        assert!(
+            summary.journal.files().is_empty(),
+            "Chunk kind must not journal FileWritten"
+        );
+    }
+
+    // ── I7: state.record_file is optional and warn-on-fail ───────────────────
+
+    #[test]
+    fn record_part_with_state_writes_file_log_entry() {
+        let plan = test_plan();
+        let mut summary = test_summary(&plan);
+        let state = StateStore::open_in_memory().expect("in-memory state");
+        let part = test_part("orders_chunk0.parquet");
+
+        record_part(
+            &plan,
+            &mut summary,
+            Some(&state),
+            &part,
+            PartKind::Chunk { chunk_index: 0 },
+        );
+
+        let files = state.get_files(Some(&plan.export_name), 16).unwrap();
+        assert_eq!(files.len(), 1, "I7: file_log must carry exactly one entry");
+        assert_eq!(files[0].file_name, part.file_name);
+        assert_eq!(files[0].row_count, part.rows);
+    }
+
+    #[test]
+    fn record_part_with_none_state_is_a_bypass_not_a_failure() {
+        // ADR-0001 I7 says state.record_file is non-fatal. The None case is the
+        // strictest form: no state to write to → the manifest/journal/counters
+        // half must still complete cleanly.
+        let plan = test_plan();
+        let mut summary = test_summary(&plan);
+        let part = test_part("orders_chunk0.parquet");
+
+        record_part(
+            &plan,
+            &mut summary,
+            None,
+            &part,
+            PartKind::Chunk { chunk_index: 0 },
+        );
+
+        assert_eq!(summary.files_committed, 1);
+        assert_eq!(summary.manifest_parts.len(), 1);
+        assert_eq!(summary.journal.chunk_events().len(), 1);
+    }
+}
