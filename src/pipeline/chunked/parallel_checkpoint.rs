@@ -95,8 +95,6 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     let state_ref = state.state_ref().clone();
     let run_id_arc = std::sync::Arc::new(run_id.clone());
     let agg_rows = std::sync::atomic::AtomicI64::new(0);
-    let agg_bytes = std::sync::atomic::AtomicU64::new(0);
-    let agg_files = std::sync::atomic::AtomicUsize::new(0);
     // Per-attempt retry counter bumped from inside each worker's retry
     // loop and folded into `summary.retries` after the scope joins, so the
     // console summary card / `rivet metrics` / `export_metrics.retries`
@@ -104,12 +102,26 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     // already does.
     let agg_retries = std::sync::atomic::AtomicU32::new(0);
     let errors = std::sync::Mutex::new(Vec::<String>::new());
+    // PartRecords pushed by workers, drained post-scope through
+    // `commit::record_part` so I2/M1 + counters + journal + I7 + fault hooks
+    // live once in the seam. Before this, workers opened a fresh StateStore
+    // per chunk just to call `record_file` and *no one* populated
+    // `summary.manifest_parts` — so the cloud manifest (ADR-0012 M1) was
+    // silently empty for every `parallel>1 + chunk_checkpoint:true` run.
+    // Tuple second is the chunk_index used by the ChunkCompleted journal.
+    let file_records: std::sync::Mutex<Vec<(super::super::commit::PartRecord, i64)>> =
+        std::sync::Mutex::new(Vec::new());
     // ADR-0012 M3: schema fingerprint captured once across workers.  None
     // until any worker exports a non-empty chunk and resolves the dest schema.
     let shared_fingerprint: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
     let plan_for_workers = plan.clone();
     let cp_for_workers = cp.clone();
+    // Per-chunk file_log writes need a state path + label strings the workers
+    // capture into their thread closure. Each worker opens its own StateStore
+    // per chunk against the same on-disk SQLite (the connection is not Sync).
+    // The post-scope drain uses the main-thread `state` reference + state=None
+    // to commit::record_part so file_log is not double-written.
     let config_path_owned = config_path.to_string();
     let fmt_label = plan.format.label();
     let comp_label = plan.compression.label();
@@ -129,10 +141,9 @@ pub(crate) fn run_chunked_parallel_checkpoint(
             let shared_destination = std::sync::Arc::clone(&shared_destination);
             let run_id_arc = std::sync::Arc::clone(&run_id_arc);
             let agg_rows = &agg_rows;
-            let agg_bytes = &agg_bytes;
-            let agg_files = &agg_files;
             let agg_retries = &agg_retries;
             let errors = &errors;
+            let file_records = &file_records;
             let shared_fingerprint = &shared_fingerprint;
             let plan_w = plan_for_workers.clone();
             let cp_w = cp_for_workers.clone();
@@ -201,7 +212,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                         plan_w.source.source_type,
                     );
 
-                    let result = (|| -> Result<(usize, Option<String>, u64)> {
+                    let result = (|| -> Result<(usize, Option<super::super::commit::PartRecord>)> {
                         let mut last_err: Option<anyhow::Error> = None;
                         for attempt in 0..=plan_w.tuning.max_retries {
                             if attempt > 0 {
@@ -238,7 +249,10 @@ pub(crate) fn run_chunked_parallel_checkpoint(
 
                             let mut sink = ExportSink::new(&plan_w)?;
 
-                            let export_attempt = (|| -> Result<(usize, Option<String>, u64)> {
+                            let export_attempt = (|| -> Result<(
+                                usize,
+                                Option<super::super::commit::PartRecord>,
+                            )> {
                                 thread_src.export(
                                     &source::ExportRequest {
                                         query: &chunk_query,
@@ -262,7 +276,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                         .set(crate::state::schema_fingerprint(&columns));
                                 }
                                 if sink.total_rows == 0 {
-                                    return Ok((0, None, 0));
+                                    return Ok((0, None));
                                 }
                                 if plan_w.validate {
                                     validate_output(
@@ -271,9 +285,6 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                         sink.total_rows,
                                     )?;
                                 }
-                                let file_bytes = std::fs::metadata(sink.tmp.path())
-                                    .map(|m| m.len())
-                                    .unwrap_or(0);
                                 let fmt = format::create_format(
                                     plan_w.format,
                                     plan_w.compression,
@@ -287,8 +298,17 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                     chunk_index,
                                     fmt.file_extension()
                                 );
-                                shared_destination.write(sink.tmp.path(), &file_name)?;
-                                Ok((sink.total_rows, Some(file_name), file_bytes))
+                                // Worker-safe half of commit (I1 + dest.write
+                                // + fingerprint). The parent drains the
+                                // resulting PartRecord through
+                                // commit::record_part post-scope.
+                                let rec = super::super::commit::write_part_file(
+                                    &**shared_destination,
+                                    sink.tmp.path(),
+                                    sink.total_rows as i64,
+                                    file_name,
+                                )?;
+                                Ok((sink.total_rows, Some(rec)))
                             })();
 
                             match export_attempt {
@@ -309,25 +329,32 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                     })();
 
                     match result {
-                        Ok((rows, fname, file_bytes)) => {
+                        Ok((rows, part)) => {
                             agg_rows.fetch_add(rows as i64, Ordering::Relaxed);
-                            if rows > 0 {
-                                agg_bytes.fetch_add(file_bytes, Ordering::Relaxed);
-                                agg_files.fetch_add(1, Ordering::Relaxed);
-                                if let Some(name) = fname.as_ref() {
+                            // Non-empty chunk: write file_log NOW (per-chunk
+                            // durable manifest — the recovery flows in
+                            // live_chunked_recovery.rs C3 read it after a
+                            // mid-run crash to reconstruct the manifest) AND
+                            // push the PartRecord for the parent drain. The
+                            // drain calls commit::record_part(state=None) so
+                            // file_log is not double-written; manifest_parts +
+                            // counters + journal still get populated for the
+                            // cloud manifest M1 contract.
+                            let fname_for_state: Option<String> = if let Some(rec) = part {
+                                if let Some(name) = Some(rec.file_name.as_str()) {
                                     match StateStore::open(&config_path_w) {
                                         Ok(store) => {
                                             if let Err(e) = store.record_file(
                                                 run_id_arc.as_str(),
                                                 &plan_w.export_name,
                                                 name,
-                                                rows as i64,
-                                                file_bytes as i64,
+                                                rec.rows,
+                                                rec.bytes as i64,
                                                 fmt_label_w,
                                                 Some(comp_label_w),
                                             ) {
                                                 log::warn!(
-                                                    "export '{}': manifest write failed for parallel checkpoint chunk '{}' (file was produced): {:#}",
+                                                    "export '{}': file_log write failed for parallel checkpoint chunk '{}' (file was produced): {:#}",
                                                     plan_w.export_name,
                                                     name,
                                                     e
@@ -336,7 +363,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                         }
                                         Err(e) => {
                                             log::warn!(
-                                                "export '{}': could not open state DB for manifest write of '{}': {:#}",
+                                                "export '{}': could not open state DB for file_log write of '{}': {:#}",
                                                 plan_w.export_name,
                                                 name,
                                                 e
@@ -344,7 +371,15 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                         }
                                     }
                                 }
-                            }
+                                let name = rec.file_name.clone();
+                                file_records
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .push((rec, chunk_index));
+                                Some(name)
+                            } else {
+                                None
+                            };
                             // Mirror of the sequential checkpoint hooks (search for
                             // `maybe_panic_at_chunk` in sequential_checkpoint.rs): same
                             // fault-point names so `RIVET_TEST_PANIC_AT=after_chunk_file:N`
@@ -358,7 +393,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                 run_id_arc.as_str(),
                                 chunk_index,
                                 rows as i64,
-                                fname.as_deref(),
+                                fname_for_state.as_deref(),
                             );
                             crate::test_hook::maybe_panic_at_chunk(
                                 "after_chunk_complete",
@@ -386,8 +421,6 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     });
 
     summary.total_rows = agg_rows.load(Ordering::Relaxed);
-    summary.bytes_written = agg_bytes.load(Ordering::Relaxed);
-    summary.files_produced = agg_files.load(Ordering::Relaxed);
     summary.retries = summary
         .retries
         .saturating_add(agg_retries.load(Ordering::Relaxed));
@@ -397,6 +430,27 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     }
     if let Some(fp) = shared_fingerprint.into_inner() {
         summary.schema_fingerprint = Some(fp);
+    }
+
+    // Drain each worker-written part through the shared commit path: bumps
+    // bytes/files counters, adds the manifest part (ADR-0012 M1), journals
+    // ChunkCompleted, fires the after_file_write / after_manifest_update
+    // fault hooks. `state=None` because workers already wrote each chunk's
+    // file_log entry synchronously (the per-chunk durable manifest the
+    // recovery tests depend on); calling state.record_file again here would
+    // double-insert.
+    //
+    // Before this migration nothing populated `summary.manifest_parts` for
+    // parallel_checkpoint runs at all — the cloud manifest M1 contract was
+    // silently empty for every `parallel>1 + chunk_checkpoint:true` run.
+    for (rec, chunk_index) in file_records.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        super::super::commit::record_part(
+            plan,
+            summary,
+            None,
+            &rec,
+            super::super::commit::PartKind::Chunk { chunk_index },
+        );
     }
 
     let errs = errors.into_inner().unwrap_or_else(|e| e.into_inner());
