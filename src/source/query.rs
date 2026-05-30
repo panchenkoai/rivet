@@ -129,6 +129,73 @@ pub(crate) fn build_incremental_query(
     }
 }
 
+/// Pick the right query builder for an export request: a keyset page when
+/// `page_limit` is set with a key plan (OPT-4), otherwise the
+/// incremental/snapshot shape. Centralizes the choice so both source drivers
+/// stay identical.
+pub(crate) fn build_export_query(
+    request: &crate::source::ExportRequest<'_>,
+    source_type: SourceType,
+) -> BuiltQuery {
+    match (request.page_limit, request.incremental) {
+        (Some(limit), Some(plan)) => build_keyset_query(
+            request.query,
+            &plan.primary_column,
+            request.cursor.and_then(|c| c.last_cursor_value.as_deref()),
+            limit,
+            source_type,
+        ),
+        _ => build_incremental_query(
+            request.query,
+            request.incremental,
+            request.cursor,
+            source_type,
+        ),
+    }
+}
+
+/// Build one keyset (seek) pagination page (OPT-4).
+///
+/// * First page (`last = None`): `SELECT * FROM (base) AS _rivet ORDER BY <key> LIMIT n`.
+/// * Subsequent pages: `… WHERE <key> > <rhs> ORDER BY <key> LIMIT n`.
+///
+/// `<key>` MUST be an index-backed, unique, NOT NULL column — enforced by the
+/// planner ([`crate::plan::build`]) — so the `ORDER BY` is an index range scan
+/// (never a filesort) and `> <last>` never skips rows that share the last key.
+/// `<rhs>` reuses the same injection-safe handling as
+/// [`build_incremental_query`] (MySQL `?` bind, Postgres escaped `E'…'`).
+/// `limit` is a `usize`, inlined as a plain integer literal.
+pub(crate) fn build_keyset_query(
+    base_query: &str,
+    key_column: &str,
+    last: Option<&str>,
+    limit: usize,
+    source_type: SourceType,
+) -> BuiltQuery {
+    let key = quote_ident(source_type, key_column);
+    match last {
+        Some(val) => {
+            let (rhs, cursor_param) = cursor_rhs(source_type, val);
+            BuiltQuery {
+                sql: format!(
+                    "SELECT * FROM ({base}) AS _rivet WHERE {k} > {rhs} ORDER BY {k} LIMIT {n}",
+                    base = base_query,
+                    k = key,
+                    rhs = rhs,
+                    n = limit,
+                ),
+                cursor_param,
+            }
+        }
+        None => BuiltQuery::without_param(format!(
+            "SELECT * FROM ({base}) AS _rivet ORDER BY {k} LIMIT {n}",
+            base = base_query,
+            k = key,
+            n = limit,
+        )),
+    }
+}
+
 /// Produce the `>` right-hand side for the cursor predicate plus any bind value.
 ///
 /// * MySQL → `("?", Some(val))`: bind parameter, no escaping needed.
@@ -355,6 +422,66 @@ mod tests {
         assert!(q.sql.contains("WHERE COALESCE"), "{}", q.sql);
         assert!(q.sql.contains("> E'2024-01-01'"), "{}", q.sql);
         assert_eq!(q.cursor_param, None);
+    }
+
+    // ── build_keyset_query (OPT-4) ────────────────────────────────────────────
+
+    #[test]
+    fn keyset_first_page_orders_and_limits_no_where_no_param() {
+        let q = build_keyset_query("SELECT * FROM t", "id", None, 1000, SourceType::Postgres);
+        assert!(
+            !q.sql.contains("WHERE"),
+            "first page has no WHERE: {}",
+            q.sql
+        );
+        assert!(q.sql.contains("ORDER BY \"id\""), "{}", q.sql);
+        assert!(q.sql.contains("LIMIT 1000"), "{}", q.sql);
+        assert_eq!(q.cursor_param, None);
+    }
+
+    #[test]
+    fn keyset_subsequent_page_mysql_binds_value() {
+        let q = build_keyset_query("SELECT * FROM t", "id", Some("42"), 500, SourceType::Mysql);
+        assert!(q.sql.contains("WHERE `id` > ?"), "{}", q.sql);
+        assert!(q.sql.contains("ORDER BY `id`"), "{}", q.sql);
+        assert!(q.sql.contains("LIMIT 500"), "{}", q.sql);
+        assert!(
+            !q.sql.contains("'42'"),
+            "value must not be inlined: {}",
+            q.sql
+        );
+        assert_eq!(q.cursor_param.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn keyset_subsequent_page_postgres_embeds_escaped_literal() {
+        let q = build_keyset_query(
+            "SELECT * FROM t",
+            "uuid",
+            Some("a-b-c"),
+            500,
+            SourceType::Postgres,
+        );
+        assert!(q.sql.contains("WHERE \"uuid\" > E'a-b-c'"), "{}", q.sql);
+        assert!(q.sql.contains("ORDER BY \"uuid\""), "{}", q.sql);
+        assert!(q.sql.contains("LIMIT 500"), "{}", q.sql);
+        assert_eq!(q.cursor_param, None);
+    }
+
+    #[test]
+    fn keyset_value_with_quote_is_escaped_pg_and_bound_mysql() {
+        let evil = "O'Brien";
+        let pg = build_keyset_query("SELECT * FROM t", "k", Some(evil), 10, SourceType::Postgres);
+        assert!(pg.sql.contains(r"E'O\'Brien'"), "{}", pg.sql);
+        assert_eq!(pg.cursor_param, None);
+
+        let my = build_keyset_query("SELECT * FROM t", "k", Some(evil), 10, SourceType::Mysql);
+        assert!(
+            !my.sql.contains("O'Brien"),
+            "value must be bound: {}",
+            my.sql
+        );
+        assert_eq!(my.cursor_param.as_deref(), Some(evil));
     }
 
     #[test]

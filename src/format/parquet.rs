@@ -55,8 +55,17 @@ impl super::Format for ParquetFormat {
         &self,
         schema: &SchemaRef,
         writer: Box<dyn Write + Send>,
-    ) -> Result<Box<dyn super::FormatWriter>> {
-        let mut builder = WriterProperties::builder().set_compression(self.build_compression());
+    ) -> Result<Box<dyn super::FormatWriter + Send>> {
+        // OPT-5: pin a version-independent `created_by`. By default parquet-rs
+        // stamps each file with its own version (e.g. "parquet-rs version
+        // 58.0.0"); that string changes on a lib bump, so identical rows would
+        // produce different bytes — breaking the manifest `content_fingerprint`
+        // as a *cross-release* dedup key. A constant keeps identical rows
+        // byte-identical across rivet/parquet-rs versions. Writer provenance
+        // lives in the run manifest/journal, not the file footer.
+        let mut builder = WriterProperties::builder()
+            .set_compression(self.build_compression())
+            .set_created_by("rivet".to_string());
         if self.row_group_rows.is_some() {
             builder = builder.set_max_row_group_row_count(self.row_group_rows);
         }
@@ -206,5 +215,48 @@ mod tests {
             .unwrap();
         writer.write_batch(&one_batch(&schema)).unwrap();
         writer.finish().unwrap();
+    }
+
+    // ── OPT-5: byte-determinism for the manifest content_fingerprint ──────────
+
+    fn write_batch_to_bytes(compression: CompressionType) -> Vec<u8> {
+        let schema = int64_schema();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let file = std::fs::File::create(tmp.path()).unwrap();
+        let mut w = ParquetFormat::new(compression, None, None)
+            .create_writer(&schema, Box::new(file))
+            .unwrap();
+        w.write_batch(&one_batch(&schema)).unwrap();
+        w.finish().unwrap();
+        std::fs::read(tmp.path()).unwrap()
+    }
+
+    #[test]
+    fn output_is_byte_deterministic_for_identical_rows() {
+        // Identical rows must produce byte-identical Parquet so the manifest
+        // `content_fingerprint` (xxh3 of the file bytes) is a stable dedup key.
+        let a = write_batch_to_bytes(CompressionType::Zstd);
+        let b = write_batch_to_bytes(CompressionType::Zstd);
+        assert_eq!(a, b, "identical rows must yield byte-identical parquet");
+    }
+
+    #[test]
+    fn created_by_is_pinned_and_version_free() {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        let bytes = write_batch_to_bytes(CompressionType::None);
+        let reader = SerializedFileReader::new(bytes::Bytes::from(bytes)).unwrap();
+        let created_by = reader.metadata().file_metadata().created_by();
+        assert_eq!(
+            created_by,
+            Some("rivet"),
+            "created_by must be the pinned constant"
+        );
+        // Must not leak the parquet-rs version — that's the cross-release drift
+        // that would break the fingerprint as a dedup key.
+        let cb = created_by.unwrap();
+        assert!(
+            !cb.contains("version") && !cb.contains("parquet"),
+            "created_by must not embed the library version: {cb:?}"
+        );
     }
 }

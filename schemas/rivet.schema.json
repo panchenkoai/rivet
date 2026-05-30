@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Rivet config (rivet-cli 0.7.8)",
+  "title": "Rivet config (rivet-cli 0.7.9)",
   "description": "Top-level Rivet configuration root.\n\nOperators write this struct as YAML (typically `rivet.yaml`).  The\n`JsonSchema` derive is the source of truth for the `schemas/rivet.schema.json`\nartifact and the `rivet schema config` command's output (v0.7.3 P0).",
   "type": "object",
   "properties": {
@@ -268,11 +268,29 @@
           ]
         },
         "adaptive": {
-          "description": "Enable real-time batch size adaptation based on DB pressure metrics.\nPostgres: samples `pg_stat_bgwriter`. MySQL: samples `Innodb_log_waits`.",
+          "description": "Enable real-time batch size adaptation based on DB pressure metrics.\nPostgres: samples `pg_stat_bgwriter`. MySQL: samples `Innodb_log_waits`.\nAlso arms the OPT-2 concurrency governor when `parallel > 1`.",
           "type": [
             "boolean",
             "null"
           ]
+        },
+        "min_parallel": {
+          "description": "Floor for the concurrency governor (lowest parallelism under pressure).\nDefault 1. Ceiling is the export's `parallel`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "max_value_mb": {
+          "description": "Hard per-value size ceiling in MB. A single text/JSON/blob cell larger\nthan this aborts the run with `RIVET_VALUE_TOO_LARGE`. `0` disables the\nguard. Default: 256.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
         }
       },
       "additionalProperties": false
@@ -450,6 +468,13 @@
           ],
           "format": "uint32",
           "minimum": 0
+        },
+        "chunk_by_key": {
+          "description": "Keyset (seek) pagination on this single index-backed unique key — the\nsource-safe shape for tables without a single-integer PK (OPT-4). The\ncolumn MUST be backed by a usable index (PK or unique); the planner\nrefuses a non-indexed key rather than emit a full-scan + filesort query.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "parallel": {
           "type": "integer",

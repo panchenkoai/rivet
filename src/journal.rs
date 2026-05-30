@@ -114,6 +114,14 @@ pub enum RunEvent {
     },
     /// A non-fatal warning that does not fit another variant.
     Warning { context: String, message: String },
+    /// The OPT-2 concurrency governor changed the active parallelism in
+    /// response to source pressure. `from`/`to` are permit counts; `reason`
+    /// describes the trigger (e.g. `"pressure rising: backed off"`).
+    ParallelismAdjusted {
+        from: usize,
+        to: usize,
+        reason: String,
+    },
 
     // ── Succeeded ────────────────────────────────────────────
     /// Output file row-count validation completed.

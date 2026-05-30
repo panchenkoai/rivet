@@ -21,7 +21,7 @@ impl super::Format for CsvFormat {
         &self,
         schema: &SchemaRef,
         mut writer: Box<dyn Write + Send>,
-    ) -> Result<Box<dyn super::FormatWriter>> {
+    ) -> Result<Box<dyn super::FormatWriter + Send>> {
         let header = schema
             .fields()
             .iter()

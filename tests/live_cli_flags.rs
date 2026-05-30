@@ -1908,3 +1908,164 @@ fn completions_bash_outputs_nonempty_script() {
         &stdout[..stdout.len().min(100)]
     );
 }
+
+// ─── OPT-6: subprocess fan-out engine crash coverage ─────────────────────────
+//
+// The in-process engines have a fault-injection crash matrix; the
+// `--parallel-export-processes` engine had only a happy-path smoke test. These
+// pin the two residual risks: (1) one child failing must not take down healthy
+// siblings or leave a partial file, and (2) a hard crash must never push a
+// footerless/partial Parquet to the destination (I1 + NamedTempFile).
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn parallel_processes_one_child_failure_isolated_from_siblings() {
+    require_alive(LiveService::Postgres);
+
+    let good = seed_pg_numeric_table(10);
+    let bad_name = unique_name("rivet_missing");
+    let out_good = tempfile::tempdir().unwrap();
+    let out_bad = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+
+    // The second export queries a table that does not exist — its child fails at
+    // run time (not parent plan time), exercising parent-side failure aggregation.
+    let yaml = format!(
+        r#"
+source:
+  type: postgres
+  url: "{POSTGRES_URL}"
+exports:
+  - name: {good}
+    query: "SELECT id, name FROM {good}"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: {og}
+  - name: {bad}
+    query: "SELECT id FROM {bad}"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: {ob}
+"#,
+        good = good.name(),
+        og = out_good.path().display(),
+        bad = bad_name,
+        ob = out_bad.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    let result = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--parallel-export-processes",
+            "--json",
+        ])
+        .output()
+        .expect("spawn rivet run --parallel-export-processes");
+
+    // A failed child must surface as a non-zero parent exit.
+    assert!(
+        !result.status.success(),
+        "partial failure must exit non-zero; stderr:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    // Isolation: the healthy export still produced its file.
+    assert_eq!(
+        files_with_extension(out_good.path(), "parquet").len(),
+        1,
+        "healthy export must complete despite a sibling child failing"
+    );
+    // The failed export left no partial file.
+    assert!(
+        files_with_extension(out_bad.path(), "parquet").is_empty(),
+        "failed export must not leave a partial file at its destination"
+    );
+    // The aggregate JSON is still emitted and reports exactly one success.
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+        assert_eq!(
+            json["parallel_mode"].as_str().unwrap_or(""),
+            "parallel-processes"
+        );
+        assert_eq!(
+            json["success_count"].as_i64().unwrap_or(-1),
+            1,
+            "exactly one export should succeed"
+        );
+    }
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn parallel_processes_hard_crash_writes_no_partial_file() {
+    require_alive(LiveService::Postgres);
+
+    let t1 = seed_pg_numeric_table(50);
+    let t2 = seed_pg_numeric_table(50);
+    let out1 = tempfile::tempdir().unwrap();
+    let out2 = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+
+    let yaml = format!(
+        r#"
+source:
+  type: postgres
+  url: "{POSTGRES_URL}"
+exports:
+  - name: {n1}
+    query: "SELECT id, name FROM {n1}"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: {o1}
+  - name: {n2}
+    query: "SELECT id, name FROM {n2}"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: {o2}
+"#,
+        n1 = t1.name(),
+        o1 = out1.path().display(),
+        n2 = t2.name(),
+        o2 = out2.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    // `after_source_read` panics each child mid-export — after the rows are read
+    // but before the writer is finalized and the file is copied to the
+    // destination. The env is inherited by every spawned child.
+    let result = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--parallel-export-processes",
+        ])
+        .env("RIVET_TEST_PANIC_AT", "after_source_read")
+        .output()
+        .expect("spawn rivet run --parallel-export-processes");
+
+    assert!(
+        !result.status.success(),
+        "a hard child crash must exit non-zero"
+    );
+    // I1 + NamedTempFile: the footerless/partial Parquet is written to a temp
+    // file and only copied to the destination AFTER finalize — a crash before
+    // that point must leave the destination empty (no corrupt file downstream).
+    for dir in [out1.path(), out2.path()] {
+        assert!(
+            files_with_extension(dir, "parquet").is_empty(),
+            "crashed export must leave no Parquet at the destination: {}",
+            dir.display()
+        );
+    }
+}

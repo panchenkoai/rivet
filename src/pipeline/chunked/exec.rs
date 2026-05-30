@@ -17,6 +17,7 @@ use crate::journal::RunEvent;
 use crate::plan::{ChunkedPlan, ExtractionStrategy, ResolvedRunPlan};
 use crate::source::{self, Source};
 use crate::state::StateStore;
+use crate::tuning::Governor;
 use crate::{destination, format, resource};
 
 /// Extract the `ChunkedPlan` from a `ResolvedRunPlan`. Panics if the strategy
@@ -100,6 +101,7 @@ pub(crate) fn run_chunked_sequential(
                 cursor: None,
                 tuning: &plan.tuning,
                 column_overrides: &plan.column_overrides,
+                page_limit: None,
             },
             &mut sink,
         )?;
@@ -122,19 +124,11 @@ pub(crate) fn run_chunked_sequential(
             sink.total_rows
         );
 
-        let mut chunk_file_name: Option<String> = None;
-
         if sink.total_rows > 0 {
             if plan.validate {
                 validate_output(sink.tmp.path(), plan.format, sink.total_rows)?;
                 summary.validated = Some(true);
             }
-            let file_bytes = std::fs::metadata(sink.tmp.path())
-                .map(|m| m.len())
-                .unwrap_or(0);
-            summary.bytes_written += file_bytes;
-            summary.files_produced += 1;
-
             let fmt =
                 format::create_format(plan.format, plan.compression, plan.compression_level, None);
             let file_name = format!(
@@ -145,43 +139,33 @@ pub(crate) fn run_chunked_sequential(
                 fmt.file_extension()
             );
             let dest = destination::create_destination(&plan.destination)?;
-            dest.write(sink.tmp.path(), &file_name)?;
-
-            // ADR-0012 M1: record the committed chunk part for the manifest.
-            super::super::manifest_writer::record_committed_part(
-                summary,
-                file_name.clone(),
-                sink.total_rows as i64,
-                file_bytes,
+            // Shared commit path (I1→I2→I7 + counters + journal + fault hooks).
+            // record_part journals the ChunkCompleted event with file_name=Some.
+            let rec = super::super::commit::write_part_file(
+                dest.as_ref(),
                 sink.tmp.path(),
+                sink.total_rows as i64,
+                file_name,
+            )?;
+            super::super::commit::record_part(
+                plan,
+                summary,
+                state,
+                &rec,
+                super::super::commit::PartKind::Chunk {
+                    chunk_index: i as i64,
+                },
             );
-
-            if let Some(st) = state
-                && let Err(e) = st.record_file(
-                    &summary.run_id,
-                    &plan.export_name,
-                    &file_name,
-                    sink.total_rows as i64,
-                    file_bytes as i64,
-                    plan.format.label(),
-                    Some(plan.compression.label()),
-                )
-            {
-                log::warn!(
-                    "export '{}': file_log write failed for chunk file '{}' (file was produced): {:#}",
-                    plan.export_name,
-                    file_name,
-                    e
-                );
-            }
-            chunk_file_name = Some(file_name);
+        } else {
+            // Empty chunk: no file, but still journal completion so the run
+            // record covers every chunk index. record_part only handles the
+            // non-empty case (it always writes a part), so we record inline.
+            summary.journal.record(RunEvent::ChunkCompleted {
+                chunk_index: i as i64,
+                rows: 0,
+                file_name: None,
+            });
         }
-
-        summary.journal.record(RunEvent::ChunkCompleted {
-            chunk_index: i as i64,
-            rows: sink.total_rows as i64,
-            file_name: chunk_file_name,
-        });
     }
 
     pb.finish(summary.total_rows);
@@ -229,12 +213,21 @@ pub(crate) fn run_chunked_parallel(
     );
 
     let completed = AtomicUsize::new(0);
+    // Every worker bumps this exactly once — on success OR failure — so the
+    // governor thread can tell when the run is *done* regardless of outcome.
+    // `completed` counts only successes (progress bar / summary); using it for
+    // the governor's exit condition deadlocks the `thread::scope` whenever a
+    // chunk fails (the governor would loop forever waiting for a success count
+    // that never arrives).
+    let finished = AtomicUsize::new(0);
     let agg_rows = std::sync::atomic::AtomicI64::new(0);
-    let agg_bytes = std::sync::atomic::AtomicU64::new(0);
-    let agg_files = AtomicUsize::new(0);
     let errors = std::sync::Mutex::new(Vec::<String>::new());
-    // (file_name, rows, bytes, content_fingerprint)
-    let file_records: std::sync::Mutex<Vec<(String, i64, i64, String)>> =
+    // PartRecords pushed by workers, drained into record_part post-scope so the
+    // I2/M1 → I7 → counters ordering lives once in commit::record_part. Tuple
+    // second is the chunk_index used by the ChunkCompleted journal event. The
+    // bytes_written / files_produced / files_committed counters are no longer
+    // accumulated worker-side — record_part bumps them in the drain.
+    let file_records: std::sync::Mutex<Vec<(super::super::commit::PartRecord, i64)>> =
         std::sync::Mutex::new(Vec::new());
     // Schema fingerprint captured by whichever worker resolves the dest
     // schema first.  ADR-0012 M3 — stays None for empty runs (no chunk
@@ -242,10 +235,54 @@ pub(crate) fn run_chunked_parallel(
     // the parallel scope joins.
     let shared_fingerprint: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     // Condvar-backed semaphore: blocked spawners park in the kernel until a
-    // worker calls `release()`, instead of polling an atomic every 50 ms.
+    // worker calls `release()`, instead of polling an atomic every 50 ms. Its
+    // permit ceiling is mutable so the OPT-2 governor can back parallelism off
+    // and recover it under source pressure.
     let semaphore = resource::Semaphore::new(parallel);
     let pb = ChunkProgress::new(&plan.export_name, total_chunks);
     let pb_handle = pb.handle();
+
+    // OPT-2 adaptive concurrency governor. Armed only when the user opted into
+    // adaptation (`tuning.adaptive`) and there is real parallelism to govern
+    // (`parallel > 1`). Floor defaults to 1; ceiling is the configured
+    // `parallel`. A failed monitoring connection degrades gracefully to static
+    // parallelism rather than failing the export.
+    // `parallel` can be 0 when there are no chunks; `.max(1)` keeps `clamp`'s
+    // bounds valid (the governor is off in that case anyway).
+    let governor_floor = plan
+        .tuning
+        .min_parallel
+        .unwrap_or(1)
+        .clamp(1, parallel.max(1));
+    let governor_on = plan.tuning.adaptive && parallel > 1;
+    let governor_monitor: Option<Box<dyn Source>> = if governor_on {
+        match source::create_source(&plan.source) {
+            Ok(s) => {
+                log::info!(
+                    "export '{}': adaptive concurrency governor active (parallel {}..{})",
+                    plan.export_name,
+                    governor_floor,
+                    parallel
+                );
+                Some(s)
+            }
+            Err(e) => {
+                log::warn!(
+                    "export '{}': governor monitoring connection failed; parallelism stays static at {}: {:#}",
+                    plan.export_name,
+                    parallel,
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Governor decisions buffered here (the journal is not thread-shared) and
+    // drained into `summary.journal` after the scope joins.
+    let governor_log: std::sync::Mutex<Vec<(usize, usize, String)>> =
+        std::sync::Mutex::new(Vec::new());
 
     // One destination (GCS/S3) instance for the whole export: `create_destination` wires a
     // dedicated Tokio runtime; creating one per chunk caused runtime shutdown races under load
@@ -260,6 +297,58 @@ pub(crate) fn run_chunked_parallel(
     );
 
     std::thread::scope(|s| {
+        // Governor thread: samples source pressure on its own monitoring
+        // connection and resizes the semaphore within [floor, parallel]. It
+        // self-terminates once every chunk worker has finished (success OR
+        // failure) — keyed on `finished`, not `completed`, so a failing chunk
+        // can't strand it and deadlock the scope. Holds parallelism flat
+        // whenever the engine can't sample (`sample_pressure` → None).
+        if let Some(mut monitor) = governor_monitor {
+            let semaphore = &semaphore;
+            let finished = &finished;
+            let governor_log = &governor_log;
+            let total = total_chunks;
+            let ceiling = parallel;
+            let floor = governor_floor;
+            let export_name = plan.export_name.as_str();
+            s.spawn(move || {
+                // The decision loop lives in [`tuning::Governor`]; the
+                // callback below is the only runner-specific binding
+                // (resize the kernel-park semaphore, log the transition,
+                // append it to the off-thread decision log so the parent
+                // can drain it into the run journal post-scope).
+                //
+                // `RIVET_GOVERNOR_INTERVAL_MS` is read inside
+                // [`Governor::new`]; the poll interval is clamped to the
+                // sample interval so a tiny override (deterministic live
+                // tests) actually polls that fast.
+                let mut gov = Governor::new(ceiling, floor, ceiling);
+                gov.run(
+                    &mut monitor,
+                    || finished.load(Ordering::Relaxed) >= total,
+                    |from, to| {
+                        semaphore.resize(to);
+                        let reason = if to < from {
+                            "source pressure rising: backed off"
+                        } else {
+                            "source pressure eased: recovered"
+                        };
+                        log::info!(
+                            "export '{}': governor parallelism {} → {} ({})",
+                            export_name,
+                            from,
+                            to,
+                            reason
+                        );
+                        governor_log
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push((from, to, reason.to_string()));
+                    },
+                );
+            });
+        }
+
         for (i, (start, end)) in chunks.iter().enumerate() {
             // Block (kernel-park) until a worker slot frees up.
             semaphore.acquire();
@@ -278,9 +367,8 @@ pub(crate) fn run_chunked_parallel(
             let base_query = &plan.base_query;
             let col = &cp.column;
             let completed = &completed;
+            let finished = &finished;
             let agg_rows = &agg_rows;
-            let agg_bytes = &agg_bytes;
-            let agg_files = &agg_files;
             let errors = &errors;
             let file_records = &file_records;
             let shared_fingerprint = &shared_fingerprint;
@@ -311,6 +399,7 @@ pub(crate) fn run_chunked_parallel(
                             cursor: None,
                             tuning: &plan_for_worker.tuning,
                             column_overrides: &plan_for_worker.column_overrides,
+                            page_limit: None,
                         },
                         &mut sink,
                     )?;
@@ -322,8 +411,7 @@ pub(crate) fn run_chunked_parallel(
                     // successful set, so all later workers race-free.
                     if let Some(s) = sink.dest_schema.as_deref() {
                         let columns = crate::state::arrow_schema_to_columns(s);
-                        let _ = shared_fingerprint
-                            .set(crate::state::schema_fingerprint(&columns));
+                        let _ = shared_fingerprint.set(crate::state::schema_fingerprint(&columns));
                     }
 
                     agg_rows.fetch_add(sink.total_rows as i64, Ordering::Relaxed);
@@ -336,12 +424,6 @@ pub(crate) fn run_chunked_parallel(
                                 sink.total_rows,
                             )?;
                         }
-                        let file_bytes = std::fs::metadata(sink.tmp.path())
-                            .map(|m| m.len())
-                            .unwrap_or(0);
-                        agg_bytes.fetch_add(file_bytes, Ordering::Relaxed);
-                        agg_files.fetch_add(1, Ordering::Relaxed);
-
                         let fmt = format::create_format(
                             plan_for_worker.format,
                             plan_for_worker.compression,
@@ -355,28 +437,18 @@ pub(crate) fn run_chunked_parallel(
                             i,
                             fmt.file_extension()
                         );
-                        shared_destination.write(sink.tmp.path(), &file_name)?;
-                        // ADR-0012 M3: compute the part fingerprint while the
-                        // local tmp file still exists in this worker scope.
-                        let fingerprint = super::super::manifest_writer::compute_part_fingerprint(
+                        // Worker-safe half of commit (I1 + dest.write + fingerprint).
+                        // Touches no shared run state; record_part runs in the drain.
+                        let rec = super::super::commit::write_part_file(
+                            &**shared_destination,
                             sink.tmp.path(),
-                        )
-                        .unwrap_or_else(|e| {
-                            log::warn!(
-                                "export '{}': chunk {} fingerprint failed for '{}' (not fatal): {:#}",
-                                export_name,
-                                i,
-                                file_name,
-                                e
-                            );
-                            "xxh3:0000000000000000".to_string()
-                        });
-                        file_records.lock().unwrap_or_else(|e| e.into_inner()).push((
-                            file_name,
                             sink.total_rows as i64,
-                            file_bytes as i64,
-                            fingerprint,
-                        ));
+                            file_name,
+                        )?;
+                        file_records
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push((rec, i as i64));
                     }
 
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -400,14 +472,23 @@ pub(crate) fn run_chunked_parallel(
                         .unwrap_or_else(|e| e.into_inner())
                         .push(format!("chunk {}: {:#}", i, e));
                 }
+
+                // Mark this worker done (success OR failure) so the governor
+                // thread can terminate — must run on every exit path.
+                finished.fetch_add(1, Ordering::Relaxed);
             });
         }
     });
 
     summary.total_rows = agg_rows.load(Ordering::Relaxed);
-    summary.bytes_written = agg_bytes.load(Ordering::Relaxed);
-    summary.files_produced = agg_files.load(Ordering::Relaxed);
     pb.finish(summary.total_rows);
+
+    // Drain governor decisions (recorded off-thread) into the run journal.
+    for (from, to, reason) in governor_log.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        summary
+            .journal
+            .record(RunEvent::ParallelismAdjusted { from, to, reason });
+    }
     if plan.validate {
         summary.validated = Some(true);
     }
@@ -418,34 +499,16 @@ pub(crate) fn run_chunked_parallel(
         summary.schema_fingerprint = Some(fp);
     }
 
-    let fmt_name = plan.format.label();
-    let comp_name = plan.compression.label();
-    for (fname, rows, bytes, fingerprint) in
-        file_records.into_inner().unwrap_or_else(|e| e.into_inner())
-    {
-        if let Err(e) = state.record_file(
-            &summary.run_id,
-            &plan.export_name,
-            &fname,
-            rows,
-            bytes,
-            fmt_name,
-            Some(comp_name),
-        ) {
-            log::warn!(
-                "export '{}': file_log write failed for parallel chunk '{}' (file was produced): {:#}",
-                plan.export_name,
-                fname,
-                e
-            );
-        }
-        // ADR-0012 M1: aggregate the worker's recorded part into the manifest.
-        super::super::manifest_writer::record_committed_part_with_fingerprint(
+    // Drain each worker-written part through the shared commit path: I2/M1 +
+    // bytes/files counters + ChunkCompleted journal + I7 file-log. All summary
+    // and state mutation happens here on the parent thread, post-join.
+    for (rec, chunk_index) in file_records.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        super::super::commit::record_part(
+            plan,
             summary,
-            fname,
-            rows,
-            bytes as u64,
-            fingerprint,
+            Some(state),
+            &rec,
+            super::super::commit::PartKind::Chunk { chunk_index },
         );
     }
 

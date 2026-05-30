@@ -182,7 +182,7 @@ Full per-backend table and rationale: **[ADR-0004 — Destination Write Contract
 
 Rivet does **not** currently guarantee:
 
-- **Exactly-once delivery to the destination.** Crashes between destination write and cursor advancement can produce duplicate files. Plan downstream dedup or idempotent ingestion.
+- **Exactly-once delivery to the destination.** Crashes between destination write and cursor advancement can produce duplicate files. Plan downstream dedup or idempotent ingestion — the manifest's per-part `content_fingerprint` is the supported dedup key: identical rows produce byte-identical parts (and the same fingerprint) across rivet releases, so a duplicate is safely droppable by fingerprint. See [recipes/idempotent-warehouse-load.md](recipes/idempotent-warehouse-load.md).
 - **CDC or near-real-time replication.** Rivet reads a snapshot per run; there is no replication slot, WAL tail, or event log.
 - **Automatic cleanup of partial artifacts** on `Atomic` destinations after a crash mid-write. A partial local file may persist and must be removed manually.
 - **Schema migration handling.** If the source schema changes between runs, Rivet does not migrate the destination; it surfaces a schema-drift error (see [tests/live_schema_drift.rs](../tests/live_schema_drift.rs)).

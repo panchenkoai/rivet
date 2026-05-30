@@ -86,6 +86,11 @@ pub struct ExportConfig {
     /// When set, `chunk_size` is computed dynamically from min/max.
     pub chunk_count: Option<usize>,
     pub chunk_by_days: Option<u32>,
+    /// Keyset (seek) pagination on this single index-backed unique key — the
+    /// source-safe shape for tables without a single-integer PK (OPT-4). The
+    /// column MUST be backed by a usable index (PK or unique); the planner
+    /// refuses a non-indexed key rather than emit a full-scan + filesort query.
+    pub chunk_by_key: Option<String>,
     #[serde(default = "default_parallel")]
     pub parallel: usize,
     pub time_column: Option<String>,
@@ -400,6 +405,7 @@ mod tests {
             chunk_size_memory_mb: None,
             chunk_count: None,
             chunk_by_days: None,
+            chunk_by_key: None,
             parallel: 1,
             time_column: None,
             time_column_type: TimeColumnType::Timestamp,

@@ -299,14 +299,16 @@ fn compute_plan_data(
             })
         }
 
-        ExtractionStrategy::Snapshot | ExtractionStrategy::TimeWindow { .. } => {
-            Ok(ComputedPlanData {
-                chunk_ranges: vec![],
-                chunk_count: 0,
-                cursor_snapshot: None,
-                row_estimate,
-            })
-        }
+        // Keyset pages are computed dynamically at run time (seek pagination),
+        // so there are no precomputed ranges to describe here — like a snapshot.
+        ExtractionStrategy::Snapshot
+        | ExtractionStrategy::TimeWindow { .. }
+        | ExtractionStrategy::Keyset(_) => Ok(ComputedPlanData {
+            chunk_ranges: vec![],
+            chunk_count: 0,
+            cursor_snapshot: None,
+            row_estimate,
+        }),
     }
 }
 

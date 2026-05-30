@@ -576,7 +576,7 @@ recovery semantics, quality gates, resource controls, and reliability coverage.
 
 | Work | Priority | Status | Definition of done |
 |---|---|---|---|
-| Release checksums (`SHA256SUMS`) | P1 | ⏳ Open | Every release publishes checksums and README verification instructions |
+| Release checksums (`SHA256SUMS`) | P1 | ✅ Done | `release.yml` publishes `SHA256SUMS.txt` per release; verification documented in README + SECURITY.md |
 | Signed releases / attestations | P2 | ⏳ Open | Release artifacts can be cryptographically verified |
 | SBOM | P2 | ⏳ Open | Release includes SBOM artifact and security docs mention it |
 | 24h+ soak tests | P2 | ⏳ Open | Long-horizon extraction run documented in reliability matrix |
@@ -994,7 +994,7 @@ with verify-layer work as bandwidth allows.
 
 - ⏳ **`check` verdict pessimism vs actual run.** UNSAFE / DEGRADED predicts high RSS on parallel reads against no-index tables, but the actual run frequently sits well under the predicted budget (e.g. 10 M-row chunked-parallel orders ran in 12 s at 117 MB RSS while check said UNSAFE). Either make the predictor use estimated row width + chunk batch size for a tighter bound, or downgrade UNSAFE to DEGRADED when the verdict can't show a concrete budget breach.
 - ⏳ **`destination is not retry-safe` WARN spams local-destination runs.** `type: local` is the canonical dev/test destination but each run prints a retry-safety WARN. Either suppress for `local` (partial artifact = one failed-rewrite file, not silent data loss) or have `rivet init` add the right opt-in so the warn does not fire on defaults.
-- ⏳ **TLS warning only in `run`, not in `doctor`/`check`.** Security warnings should surface in preflight commands — that's what `doctor` is for. Today the operator only learns about the missing `tls:` block when they start a real extract.
+- ✅ **TLS warning now surfaces in `doctor`/`check`** (v0.7.8) — preflight calls `warn_if_tls_disabled` ([src/preflight/doctor.rs](src/preflight/doctor.rs), [src/preflight/mod.rs](src/preflight/mod.rs)), so the missing-`tls:` warning fires before a real extract, not only in `run`.
 - ⏳ **`rivet init --schema X` includes ad-hoc / test tables.** Schema-wide init dumps every relation in the schema (140 entries in our dev DB, most of them leftover test artifacts). Add an `--exclude '<glob>'` flag or a heuristic that skips tables whose names match common temp/test patterns (`tmp_*`, `*_temp`, tables with PID-shaped suffixes).
 
 **P3 — polish & doc clarity** (good v0.8.0 fodder):
@@ -1002,11 +1002,11 @@ with verify-layer work as bandwidth allows.
 - ⏳ **`rivet init` does not explain *why* it picked a mode.** Generated YAML says `mode: chunked` but not "(auto-selected because rows estimate ≥ 500 K)". One-line inline comment in the rendered config would close the loop.
 - ⏳ **`rivet journal --export X` does not show retry events.** Doc promises "per-run events / retries / quality issues"; today it only shows status + duration. Plumb per-chunk retry attempts into the structured journal so post-mortem doesn't require digging in stderr WARNs.
 - ⏳ **100 files per 10 M-row chunked export.** Default `chunk_size: 100_000` × big table = many small files. `rivet init` could scale `chunk_size` logarithmically with the row estimate (e.g. ≥ 10 M → 1 M chunk_size) so default file counts stay reasonable.
-- ⏳ **`status: skipped` summary is sparse.** Incremental-mode skipped run shows `status: skipped` with no context; add `(no new rows since cursor <X>)` so the operator does not have to guess.
-- ⏳ **Doc note: re-running `chunked` re-extracts everything.** `--resume` skips completed chunks after a crash, but a clean re-run re-does the full table. Worth one paragraph in `modes/chunked.md` so operators do not assume idempotency.
+- ✅ **`status: skipped` now names the cursor** (v0.7.8) — shows `(no new rows since cursor '<col>')` ([src/pipeline/single.rs](src/pipeline/single.rs)) so the operator doesn't have to guess.
+- ✅ **Doc note added: re-running `chunked` re-extracts everything** — [`docs/modes/chunked.md`](docs/modes/chunked.md) § "Clean re-runs are NOT idempotent" spells out that `--resume` only skips completed chunks after a crash.
 - ⏳ **Doc note: `time_window` re-runs duplicate output.** Rolling window mode does not persist "we did this window already", so frequent re-runs produce duplicate files. Worth a paragraph in `modes/time-window.md`.
 - ⏳ **Retry / I3 (Write Before Cursor) at-least-once dupe scenario** not yet covered by tests. The contract documents the duplicate possibility (`ADR-0001 I3`), and toxiproxy-based retry testing showed counters work; a dedicated SIGKILL-between-write-and-commit recovery test would pin the actual dupe behavior end-to-end.
-- ⏳ **Stale roadmap items inherited from earlier sessions:** "2–3 pilot tables repeated on a schedule" in §9.7 (organizational), release checksums / SBOM / signed release attestations (also §9.7 unchecked).
+- ⏳ **Stale roadmap items inherited from earlier sessions:** "2–3 pilot tables repeated on a schedule" in §9.7 (organizational), SBOM / signed release attestations (also §9.7 unchecked). *(Release checksums shipped in v0.7.8 — now checked.)*
 
 ---
 
@@ -1034,6 +1034,270 @@ with verify-layer work as bandwidth allows.
 - [x] Execution semantics and known non-guarantees documented
 - [x] Reliability and compatibility matrices published
 - [x] Pilot and production-readiness docs published
-- [ ] Release checksums
+- [x] Release checksums *(v0.7.8 — `SHA256SUMS.txt` published per release; verify with `sha256sum -c`)*
 - [ ] Signed releases / attestations
 - [ ] SBOM
+
+---
+
+# 10. Engineering Optimization Backlog (v0.7.8 release + code audit)
+
+This section captures findings from a code-level audit conducted against the
+v0.7.8 release (tag, release notes, artifacts) and the live source tree. Unlike
+§5–§9 (feature epics), these are **hardening / optimization releases**: each one
+closes a gap between a documented promise and what the engine actually
+guarantees, or removes a structural risk. They are ordered by
+**impact ÷ uniqueness** — OPT-1 is foundational debt under the headline claim;
+OPT-2 is the most differentiating new capability.
+
+The audit also confirmed what is *already sound* and should not be re-litigated:
+the I1–I8 invariant model + failure-point map (ADR-0001), SQLite `WAL` +
+`busy_timeout` (`src/state/mod.rs:537-549`), the single-held-runtime async bridge
+for OpenDAL destinations (`src/destination/gcs.rs:51-76`, no `block_on`-per-call),
+and the two-engine separation with explicit revisit triggers (ADR-0010).
+
+## 10.1 Findings summary
+
+> **Validated against the source — see
+> [`docs/planning/optimization-backlog-validation.md`](docs/planning/optimization-backlog-validation.md)**
+> for per-item verdicts, file:line evidence, and implementation plans. A
+> line-by-line pass corrected OPT-4 and OPT-5 substantially (a deterministic
+> per-part content hash already exists; MySQL hard-refuses rather than silently
+> degrading) and narrowed OPT-1/OPT-2. The validation doc is authoritative over
+> the prose below.
+
+| ID | Area | Priority | Status | One-line |
+|---|---|---|---|---|
+| OPT-1 | Memory safety | P2 | ✅ Done (core) | Per-value ceiling `RIVET_VALUE_TOO_LARGE` shipped (189d915, default 256 MB). Follow-ups: probe-batch warmup shrink, check-predictor feedback |
+| OPT-2 | Adaptive concurrency | P1 | ✅ Done | Adaptive parallelism governor shipped (141bf33) — resizes worker count in `[min, parallel]` under source pressure (in-process engine). Follow-ups: subprocess engine (after OPT-6), richer `rivet-mcp` signals |
+| OPT-3 | Type fidelity | P1 | ⏳ Open (validated) | Round-trip proof is enumerated-fixture; no proptest type test exists — confirmed |
+| OPT-4 | MySQL parity | P1 | ✅ Done | MySQL keyset (seek) pagination shipped (40433a0) — single-column unique key, sequential, EXPLAIN-verified index range scan. Follow-ups: composite keys, parallel keyset, resume |
+| OPT-5 | Dedup ergonomics | P2 | ⏳ Open (**corrected**) | Deterministic per-part `content_fingerprint` **already exists** (`manifest.rs:160`); gap = guarantee/expose + parquet byte-determinism |
+| OPT-6 | Engine debt | P2 | ⏳ Open (validated) | Subprocess fan-out engine has **zero** crash tests; no signal handling — confirmed gap |
+| OPT-7 | Doc/roadmap drift | P1 | ✅ Done | Checksums documented as shipped (SECURITY.md + README + §5.1/§9.7); 3 §9.6.1 items struck. *Verified 3 other claimed-shipped §9.6.1 items (local-retry WARN, init mode-comment, init chunk_size scaling) are NOT shipped — left open.* |
+
+---
+
+## OPT-1 — Memory-bound hardening (residual gaps on an existing adaptive cap)
+
+**Priority: P2** — *corrected after reading the source.* An earlier draft of this
+item claimed there was "no hard byte budget, only reactive sampling." **That was
+wrong.** A row-width-adaptive byte-budget cap already exists on both engines and
+genuinely backs the headline claim. This item is now narrow edge-case hardening,
+not foundational debt.
+
+**What already exists (do not re-build):**
+- **MySQL** (`src/source/mysql/mod.rs:385-440`): a 500-row `PROBE_BATCH_SIZE`
+  first batch measures real Arrow bytes/row (`SourceTuning::batch_memory_bytes`),
+  then caps `effective_bs` so each flush fits `tuning.batch_size_memory_mb`
+  (default `MYSQL_BATCH_TARGET_MB_DEFAULT = 64` MB), never exceeding the
+  configured `batch_size`.
+- **PostgreSQL** (`src/source/postgres/mod.rs:380-440`): a 500-row
+  `PROBE_FETCH_SIZE` first FETCH, then `FETCH N` is capped under
+  `work_mem × 0.7` (`pg_fetch_work_mem_bytes`) so the server-side cursor never
+  spills to `pgsql_tmp/`. The in-code comment explicitly anticipates the
+  "single huge FETCH triggers spill" case — that is *why* the probe exists.
+- Plus a reactive RSS sampler (`src/resource.rs`) and `memory_threshold_mb`
+  pause-gate (`src/pipeline/chunked/exec.rs:66,269,271`) as a backstop.
+
+**Residual gaps (the actual scope of this item):**
+1. **Probe-batch warmup is uncapped.** The first 500 rows are buffered before
+   bytes/row is known. The code assumes "500 × ~4 KB ≈ 2 MB"; 500 genuinely
+   huge rows (e.g. 500 × 1 MB) overshoot before the cap is computed.
+2. **Single-outlier value.** The cap is based on *average* bytes/row in a batch.
+   One 200 MB JSONB/`bytea` cell among normal rows still lands in a single
+   batch; an average-based cap doesn't bound a lone giant value. There is no
+   hard per-value ceiling with a typed error.
+3. **Soft target × threads.** The cap is a per-batch *target* (~64 MB), and with
+   `parallel` threads peak is ×N. It is not a hard process-level ceiling.
+
+**Proposed change.**
+- A hard per-value size limit with a typed error (`RIVET_VALUE_TOO_LARGE`) so a
+  single fat cell fails cleanly instead of risking OOM.
+- Optionally shrink the probe batch when `avg_row_bytes` (already estimated in
+  preflight) is large, so warmup respects the budget too.
+- Feed the measured row width back into the `check` predictor (tightens the
+  pessimistic UNSAFE/DEGRADED verdict, §9.6.1).
+
+**Definition of done.** A fixture with a deliberately fat value column
+(e.g. 256 MB JSONB rows) either exports under the configured budget or fails
+with `RIVET_VALUE_TOO_LARGE` — never OOMs; regression test in the soak matrix.
+
+---
+
+## OPT-2 — Adaptive concurrency governor (extend existing adaptation to parallelism)
+
+**Priority: P1** — the differentiating item. *Scope corrected after reading the
+source:* batch-size adaptation under source pressure **already exists** — this
+item is the next step, not a greenfield build.
+
+**What already exists (do not re-build):** `tuning.adaptive` already samples a
+source-side pressure proxy each `ADAPTIVE_SAMPLE_INTERVAL` batches and resizes
+the batch via `next_adaptive_batch_size` — PG via `pg_sample_checkpoints_req`
+(`src/source/postgres/mod.rs`), MySQL via `mysql_sample_innodb_log_waits`
+(`src/source/mysql/mod.rs:444-464`). So the control loop exists; it adjusts
+*batch size* off *one* proxy signal.
+
+**The actual gap (two dimensions the current loop doesn't cover):**
+1. **It governs batch size, not parallelism / connection count.**
+   The default `parallel` is **1** (`src/config/export.rs:319`, conservative),
+   but each chunk worker opens its *own* source connection inside `s.spawn`
+   (`src/pipeline/chunked/exec.rs:305`, gated by `Semaphore::new(parallel)` at
+   `exec.rs:246`) — `Source: Send` not `Sync` (ADR-0011). So a user who dials
+   `parallel: N` holds up to N connections against exactly the fragile,
+   low-`max_connections` source the tool protects. Preflight only *warns*
+   (`src/preflight/analysis.rs:164-182`); the count is static at runtime — the
+   governor never backs it off. Extend the loop to adjust the semaphore permit
+   count (and `throttle_ms`) within `[min, max]`, not just batch size.
+2. **It reads one proxy signal, not the richer `rivet-mcp` set.** `rivet-mcp`
+   already exposes `pg_stat_activity` (active / lock-wait / idle-in-txn),
+   pgBouncer saturation, and MySQL `SHOW PROCESSLIST`. Feed those into the same
+   governor so back-off reacts to real contention (lock waits, replication lag,
+   active-query count), not just checkpoint/log-wait pressure. One pressure
+   model shared between `rivet-mcp` and the run loop.
+
+**Proposed change.**
+- Promote the existing adaptive loop from "resize batch" to a governor that also
+  resizes the active permit count + throttle.
+- Reuse the `rivet-mcp` read-only query surface as the pressure source.
+- Surface governor decisions in the run journal ("backed off parallel 16→8 at
+  T+45s: lock_waits=12").
+
+**Definition of done.** Under a synthetic concurrent-OLTP load fixture, an
+adaptive run keeps a source-side pressure metric below a threshold that a
+static `parallel=N` run breaches; decisions visible in `rivet journal`.
+
+---
+
+## OPT-3 — Property-based type round-trip (proof by construction)
+
+**Priority: P1** — converts type rigor from "many tests" to "provable".
+
+**Problem.** The four-reader round-trip matrix (`tests/type_roundtrip/`) is
+excellent but proves only the **enumerated** types. `UNSIGNED BIGINT → Decimal128`
+was found *by example* in 0.7.8 — a symptom that integer-width / precision
+overflow is a *class* found one funeral at a time. The long tail
+(`numeric(1000,…)`, arrays-of-composite, domains, ranges, `citext`/`hstore`/
+PostGIS, MySQL `ZEROFILL`/`BIT`/`SET` edge cases) is where silent corruption
+lives.
+
+**Proposed change.** A property-based harness that generates random schemas +
+values for the supported type universe, exports, reads back through ≥1
+independent reader, and asserts value + metadata equality. Shrink failing cases
+to a minimal reproducer.
+
+**Definition of done.** `make test-types-property` runs N generated schemas in CI
+(PR tier: small N; nightly: large N) and any discovered mismatch fails the gate
+with a minimized fixture checked into `tests/type_roundtrip/`.
+
+---
+
+## OPT-4 — MySQL safety parity (or explicit degraded mode)
+
+**Priority: P1** — the headline "source-safe" property is asymmetric across engines.
+
+**Problem.** PostgreSQL gets `DECLARE CURSOR` + `work_mem`-aware `FETCH N`
+(0.19 s longest query). MySQL has no widely-supported server-side cursor in the
+current client stack, so safety rests on PK-range chunking (9 s), which *requires*
+a clean monotonic numeric PK. On a MySQL table with composite / UUID / no PK the
+"don't hold a long query, don't OOM" guarantee silently degrades to a buffered
+read or an expensive global sort. The weaker engine is also the more common
+"fragile shared prod" case in the SMB segment.
+
+**Proposed change.**
+- Either: pursue a streaming read shape on MySQL that bounds memory without a
+  clean PK (e.g. keyset pagination on the best available index).
+- Or (cheaper first step): make the unsafe shape an explicit `opt-in` —
+  `rivet check` / `rivet run` refuses the buffered/sort path on MySQL unless the
+  operator acknowledges the degraded guarantee, instead of falling into it.
+
+**Definition of done.** A MySQL table with no usable PK either exports under a
+bounded memory budget, or fails preflight with a clear degraded-mode
+acknowledgement requirement — never silently buffers the whole table.
+
+---
+
+## OPT-5 — Deterministic dedup token in the manifest
+
+**Priority: P2** — makes "boring" boring all the way downstream.
+
+**Problem.** I3 (Write-Before-Cursor) is correct, but a crash between write and
+cursor advance produces a duplicate file, and the manifest carries no run-scoped
+idempotency key / content hash a downstream `MERGE` can dedup on deterministically.
+"Boring extraction" that needs a hand-written dedup recipe
+(`recipes/idempotent-warehouse-load.md`) isn't fully boring.
+
+**Proposed change.** Stamp each manifest entry (and optionally the filename) with
+a deterministic content hash + `(chunk_id, cursor_range)` so downstream dedup is
+mechanical, not convention-based. Pairs naturally with the existing xxHash3 used
+in quality gates.
+
+**Definition of done.** Two runs that re-extract the same window after a simulated
+SIGKILL produce files whose manifest dedup keys collide, so a consumer can drop
+the duplicate by key alone. Closes the §9.6.1 open *"I3 at-least-once dupe
+scenario not covered by tests"* with an end-to-end SIGKILL-between-write-and-commit
+test.
+
+---
+
+## OPT-6 — Two-engine maintenance debt + crash-matrix symmetry
+
+**Priority: P2** — accepted debt (ADR-0010), but it compounds.
+
+**Problem.** ADR-0010 honestly lists the cost: two retry loops, two progress UIs,
+two error-aggregation paths. Every cross-cutting feature (graceful shutdown,
+tracing, OPT-2 governor, OPT-5 dedup token) must be built twice or it drifts. The
+highest-risk corner is SIGTERM / parquet-footer finalization in the subprocess
+engine — the classic "killed mid-run leaves a corrupt parquet" regression site.
+
+**Proposed change.**
+- Audit `dev/CRASH_MATRIX.md` for **symmetry**: every crash scenario should run
+  against both the in-process thread engine (`src/pipeline/chunked/exec.rs`) and
+  the subprocess fan-out engine (`src/pipeline/parallel_children.rs`).
+- Add the OPT-2/OPT-5 cross-cutting features to a shared layer where possible so
+  they are not implemented twice.
+
+**Definition of done.** The crash matrix asserts no corrupt/footerless output
+file under SIGTERM/SIGKILL for *both* engines, and the gap (if any) is documented
+as a known non-guarantee.
+
+---
+
+## OPT-7 — Doc / roadmap drift sync (cheap, do first)
+
+**Priority: P1** — near-zero effort, removes a credibility leak, and prevents
+re-planning work that is already done.
+
+**Findings.**
+- **Checksums already ship, docs say otherwise.** `release.yml:153` generates
+  `SHA256SUMS.txt`, and the v0.7.8 release publishes it as an asset — yet
+  `SECURITY.md:165-169` still tells users *"until checksums and signatures are
+  published, verify by rebuilding from source… `git checkout v0.6.0`"* (also a
+  stale tag), and §5.1 (line ~579) marks "Release checksums" as `⏳ Open / P1`.
+  The v0.7.8 release notes don't mention the checksums at all. → Add verification
+  instructions to README/SECURITY, mention checksums in release notes, flip
+  §5.1 + §9.7 to done.
+- **Several §9.6.1 ⏳ items were already fixed in 0.7.8 but not struck:** retry-safe
+  WARN demoted to DEBUG for local (line ~996), TLS warning now fires from
+  `doctor`/`check` (~997), `rivet init` explains its mode choice inline (~1002),
+  `chunk_size` scaled to row estimate (~1004), `status: skipped (no new rows since
+  cursor X)` (~1005). The 0.7.8 release notes' `polish(ux)` bullet is the evidence.
+  → Strike these so the backlog stops overstating remaining work.
+
+**Definition of done.** §5.1, §9.6.1, and §9.7 reflect the actual shipped state of
+v0.7.8; README/SECURITY document checksum verification against the published
+`SHA256SUMS.txt`.
+
+---
+
+## 10.2 Suggested execution order
+
+By impact ÷ effort (revised after source audit — the memory cap already exists,
+so OPT-1 drops from the top spot):
+
+1. **OPT-7** (doc/roadmap sync) — hours, removes a trust leak, unblocks accurate planning.
+2. **OPT-3** (property-based types) — most autonomous; immediately strengthens the trust story.
+3. **OPT-2** (adaptive governor → parallelism) — the differentiating bet; builds on the existing adaptive loop.
+4. **OPT-4** (MySQL parity / explicit degrade) — closes the engine asymmetry.
+5. **OPT-1** (memory residual: per-value cap + probe warmup) — edge-case hardening on an existing cap.
+6. **OPT-5 / OPT-6** — ergonomics + debt paydown, interleave as bandwidth allows.

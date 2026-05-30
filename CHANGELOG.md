@@ -1,11 +1,128 @@
 # Changelog
 
-## 0.7.8 (unreleased) — Type Round-Trip Proof + Validation Fidelity
+## 0.7.9 (2026-05-30) — Optimization Backlog + Seam Consolidation + CI Invariant Gates
 
-> Proves Parquet type fidelity end-to-end with four independent readers
-> (DuckDB, ClickHouse, pyarrow, BigQuery), emits native Parquet logical
-> types for UUID/JSON, and closes two validation-surface bugs uncovered
-> while walking the documented golden paths.
+> Closes the §10 optimization backlog (OPT-1…OPT-7), proves Parquet type
+> fidelity end-to-end with four independent readers (DuckDB, ClickHouse,
+> pyarrow, BigQuery) with native logical types for UUID/JSON, and
+> consolidates the per-runner commit + post-finalize state-write paths
+> behind two shared seams (`commit::record_part` for the per-part write
+> ordering, `RunStore` for the cursor + progression tail) so the
+> ADR-0001 / ADR-0008 ordering invariants live in interfaces rather
+> than in per-runner conventions. Adds CI debug-build invariant gates
+> that catch the next M1-shape bug at finalize time. Six new ADRs
+> (0015–0020) document the architectural decisions made along the way
+> and the deferred work (nullability propagation, PG UUID-PK
+> auto-keyset).
+
+### Architecture — seam consolidation
+
+- **`refactor(pipeline)`** — `pipeline::commit::record_part` is the
+  single home for the per-part commit ordering: I1 finalize → dest.write
+  → ADR-0012 M1 manifest add → counters → journal event → I7 file-log
+  warn-on-fail → fault hooks. Six runners (`single`, `keyset`,
+  `chunked::run_chunked_sequential`, `chunked::run_chunked_parallel`,
+  `chunked::sequential_checkpoint`, `chunked::parallel_checkpoint`)
+  now share one body each instead of hand-copying. See ADR-0018.
+- **`fix(pipeline)`** — `chunked::parallel_checkpoint` previously
+  populated `state.file_log` per chunk but never appended to
+  `summary.manifest_parts`, so the cloud manifest (ADR-0012 M1) shipped
+  empty for every `parallel>1 + chunk_checkpoint:true` run. Migration
+  onto `commit::record_part` (with `state=None` in the drain to avoid
+  double-writing the per-chunk durable file_log) closes the gap.
+- **`refactor(pipeline)`** — `pipeline::run_store::RunStore` is the
+  builder facade for the post-finalize cursor + progression writes
+  (`with_cursor` is fatal-on-error per ADR-0001 I3; `with_progression`
+  is warn-on-fail per ADR-0008 PG2 / PG7). Four runners use it; the
+  ordering contract is now an interface property, not a convention.
+  See ADR-0018. Schema-drift stays in `single.rs` because it's a
+  policy state machine, not a persistence ordering.
+- **`refactor(tuning)`** — `tuning::Governor` extracts the OPT-2
+  adaptive-concurrency loop out of an inline `thread::scope` closure
+  in `chunked::exec::run_chunked_parallel`. The loop is now
+  unit-testable on a fake `PressureSource` in microseconds instead of
+  a 2-4 s live test. See ADR-0019.
+
+### Extraction & memory hardening (optimization backlog)
+
+- **`feat(pipeline)`** — **adaptive concurrency governor** (OPT-2): in chunked
+  mode with `parallel > 1` and `tuning.adaptive: true`, a governor samples
+  source write-pressure on a dedicated monitoring connection and resizes the
+  live worker/connection count within `[min_parallel, parallel]` — backing off
+  under load, recovering when it eases. Decisions land in the run journal
+  (`ParallelismAdjusted`). Read-only credentials suffice.
+- **`fix(pipeline)`** — **governor deadlock under chunk failure** (OPT-2):
+  workers bumped the `completed` counter only on success, but the governor's
+  exit condition was keyed on it — so any failing chunk left the governor
+  spinning forever and `thread::scope` could never join. Workers now bump a
+  separate `finished` counter on every exit path (success or failure).
+- **`test(pipeline)`** — **governor concurrent-write back-off** (OPT-2):
+  deterministic live coverage of the closed-loop reaction to source pressure
+  — a background `UPDATE`/`CHECKPOINT` writer drives `checkpoints_req` past
+  the 80 ms sampler, and the governor's `backed off` log lines fire as
+  expected.
+- **`feat(pipeline)`** — **MySQL keyset (seek) pagination** (OPT-4): tables with
+  a UUID / string / composite (non-integer) PK now have a safe chunked shape via
+  `chunk_by_key:` (auto-resolved on MySQL when there's no single-int PK but a
+  usable unique key). Pages by an index-backed unique key
+  (`WHERE key > last ORDER BY key LIMIT n`) — bounded RSS *and* bounded
+  longest-query time, EXPLAIN-verified as an index range scan (never a
+  full-scan + filesort). A non-indexed `chunk_by_key` is refused.
+- **`feat(pipeline)`** — **PG UUID-PK keyset via explicit `chunk_by_key:`**:
+  `extract_last_cursor_value` learned the `FixedSizeBinary(16)` arm so PG
+  `uuid` columns (ADR-0014 → arrow.uuid extension → native Parquet
+  `LogicalType::Uuid`) now serve as keyset cursors. Auto-resolution on PG
+  remains scoped to integer PKs (see ADR-0020 for the asymmetry rationale
+  vs MySQL); operators with UUID-PK tables can opt into keyset paging by
+  declaring `chunk_by_key: <uuid_col>`.
+- **`feat(sink)`** — **per-value size ceiling** (OPT-1): `tuning.max_value_mb`
+  (default 256 MB; `0` disables) aborts with `RIVET_VALUE_TOO_LARGE` when a
+  single text/JSON/blob cell would OOM the process — the average-based batch
+  cap can't bound a lone giant value.
+- **`test(types)`** — **proptest MySQL value round-trip** (OPT-3): 1000
+  randomized values per supported type prove Rivet's MySQL value-decoder
+  contract under the property-testing fuzzer.
+- **`test(pipeline)`** — **subprocess crash coverage** (OPT-6): every chunked
+  fault point (`after_chunk_file`, `after_chunk_complete`) now has crash-
+  recovery coverage on the `parallel-export-processes` engine. Brings the two
+  engines to per-fault symmetry.
+- **`feat(format)`** — **stable Parquet `created_by`** (OPT-5): pinned to a
+  release-stable string so per-part `content_fingerprint` survives across
+  builds and the manifest dedup token is reliable.
+
+### Supply chain
+
+- **`docs(security)`** — documented release-checksum verification. Every release
+  already publishes `SHA256SUMS.txt`; README + SECURITY.md now show
+  `sha256sum -c` / `shasum -a 256 -c` (the docs previously said "rebuild from
+  source"). Signing/SBOM remain on the roadmap.
+
+### Types — native Parquet logical types + round-trip proof
+
+- **`feat(pipeline)`** — **adaptive concurrency governor** (OPT-2): in chunked
+  mode with `parallel > 1` and `tuning.adaptive: true`, a governor samples
+  source write-pressure on a dedicated monitoring connection and resizes the
+  live worker/connection count within `[min_parallel, parallel]` — backing off
+  under load, recovering when it eases. Decisions land in the run journal
+  (`ParallelismAdjusted`). Read-only credentials suffice.
+- **`feat(pipeline)`** — **MySQL keyset (seek) pagination** (OPT-4): tables with
+  a UUID / string / composite (non-integer) PK now have a safe chunked shape via
+  `chunk_by_key:` (auto-resolved on MySQL when there's no single-int PK but a
+  usable unique key). Pages by an index-backed unique key
+  (`WHERE key > last ORDER BY key LIMIT n`) — bounded RSS *and* bounded
+  longest-query time, EXPLAIN-verified as an index range scan (never a
+  full-scan + filesort). A non-indexed `chunk_by_key` is refused.
+- **`feat(sink)`** — **per-value size ceiling** (OPT-1): `tuning.max_value_mb`
+  (default 256 MB; `0` disables) aborts with `RIVET_VALUE_TOO_LARGE` when a
+  single text/JSON/blob cell would OOM the process — the average-based batch
+  cap can't bound a lone giant value.
+
+### Supply chain
+
+- **`docs(security)`** — documented release-checksum verification. Every release
+  already publishes `SHA256SUMS.txt`; README + SECURITY.md now show
+  `sha256sum -c` / `shasum -a 256 -c` (the docs previously said "rebuild from
+  source"). Signing/SBOM remain on the roadmap.
 
 ### Types — native Parquet logical types + round-trip proof
 
@@ -60,6 +177,85 @@
   output, the pilot walkthrough's missing `decimal(10,2)` override).
 - **`docs(gifs)`** — regenerated all instructional GIFs against current
   behavior (card UI, `(indexed)` scan type, `validated: pass`).
+
+### Invariant audit — CI gates and paper trail
+
+- **`test(invariants)`** — `RunSummary::check_post_run_invariants` runs
+  as a `cfg!(debug_assertions)` gate at the top of
+  `pipeline::finalize::finalize_manifest`. Catches the next M1-shape
+  bug (runner bumps `files_committed` / `bytes_written` without going
+  through `commit::record_part`) the moment a debug-build test
+  finishes a run. Closes gaps #2 + #3 ("completed table must have
+  manifest entries"; "summary totals derivable from manifest") from
+  the release-checklist invariant audit.
+- **`test(invariants)`** — companion gates close gaps #1
+  (`success && total_rows > 0 ⇒ files_committed > 0` — no rows
+  extracted-then-dropped on the floor) and #4 (live test
+  `successful_run_writes_summary_artifacts_under_dot_rivet` asserts
+  `.rivet/runs/<run_id>/summary.{json,md}` exist on disk after every
+  successful run, pinning ADR-0001 I8 at the on-disk layer).
+
+### Cloud destinations — consolidate retry / runtime / read surface
+
+- **`refactor(destination)`** — `CloudBackend` trait + generic
+  `CloudDestination<B>` consolidate retry policy, blocking-operator
+  wrap, prefix join, and the ADR-0013 read surface
+  (`write` / `list_prefix` / `read` / `head` / `move`) across S3,
+  GCS, and Azure. Per-backend modules now only supply `build_operator`
+  + a label and a scheme. Net: -424 LoC duplication across the three
+  cloud backends. The local filesystem destination stays separate
+  (no OpenDAL runtime, partial-write semantics genuinely differ).
+
+### CI / infra
+
+- **`ci`** — `jlumbroso/free-disk-space@main` runs before the heavy
+  build + test-profile rebuild in the `e2e` job (ci.yml) and the
+  nightly-live job, freeing ~30 GB by pruning .NET / Android SDK /
+  Haskell GHC / CodeQL / tool-cache (Rivet never touches them).
+  Recent nightly-live failures (`Process completed with exit code
+  101` with no test annotation because cargo's stderr garbled under
+  ENOSPC) are the prompt; `df -h /` snapshots before and after
+  surface any future regression directly in the run log.
+
+### Architecture decisions
+
+- **`docs(adr)`** — ADR-0015: Source introspection is a data-shape
+  seam, not a trait. Documents the dismissal of the recurrent "unify
+  `introspect_pg_table_for_chunking` + `introspect_mysql_table_for_chunking`
+  under a trait" suggestion — the two functions share a return type
+  but no implementation logic (different catalogs, dialects, quirks).
+- **`docs(adr)`** — ADR-0016: Nullability propagation deferred to v0.8
+  Phase A. Replaces the earlier "by design" dismissal of Gap #5 with
+  an honest deferred-decision record; names the four
+  `SourceColumn::simple(…, true)` hardcode sites, the per-query-shape
+  resolvability matrix, the operator workaround, and the revisit
+  trigger.
+- **`docs(adr)`** — ADR-0017: Per-runner durability ordering map.
+  Documents the asymmetric file_log timing (four runners inline
+  per part; `chunked_parallel` post-scope drain;
+  `parallel_checkpoint` split sync-worker + post-scope), names the
+  C3 live-test invariant that forced the split, and acknowledges
+  the per-chunk `StateStore::open` smell that the split kept.
+- **`docs(adr)`** — ADR-0018: Builder facades for runner-level
+  invariant ordering. Positive paper trail for `commit::record_part`
+  + `RunStore`: why builder over single-method / type-state, why
+  facades and not traits, what stays *outside* the facade (schema
+  drift in single.rs, metrics in job.rs).
+- **`docs(adr)`** — ADR-0019: Governor as extracted policy with
+  injectable `PressureSource`. Documents the testability win, why the
+  trait lives in `tuning::` not `source::`, and the deadlock-class
+  regression cover.
+- **`docs(adr)`** — ADR-0020: PostgreSQL UUID-PK chunking asymmetry
+  vs MySQL. Two-layer gap: layer 1 (planner's PG-no-auto-keyset
+  default — deferred design choice; `DECLARE CURSOR` is RAM-bounded
+  but not wall-time-bounded) and layer 2 (sink runtime missing
+  `FixedSizeBinary(16)` arm — closed in this release).
+- **`docs(CLAUDE.md)`** — added "Verify before publishing agent-walk
+  claims" process rule: when an Agent(Explore, …) walk returns
+  claims with specific file paths / line numbers, the next action
+  is a `Read` / graph query on the named site before writing the
+  claim into a deliverable. Lesson from a real architecture-review
+  walk that produced six false claims unverified.
 
 ### Dependencies
 

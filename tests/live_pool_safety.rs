@@ -123,6 +123,7 @@ fn pg_statement_timeout_not_leaked_after_successful_export() {
                 cursor: None,
                 tuning: &tuning_300s(),
                 column_overrides: &ColumnOverrides::default(),
+                page_limit: None,
             },
             &mut NullSink,
         )
@@ -151,6 +152,7 @@ fn pg_connection_usable_and_clean_after_failed_export() {
             cursor: None,
             tuning: &tuning_300s(),
             column_overrides: &ColumnOverrides::default(),
+            page_limit: None,
         },
         &mut FailOnFirstBatch,
     );
@@ -199,6 +201,7 @@ fn pg_panic_in_sink_releases_cursor_and_aborts_txn() {
                 cursor: None,
                 tuning: &tuning_300s(),
                 column_overrides: &ColumnOverrides::default(),
+                page_limit: None,
             },
             &mut PanicOnFirstBatch,
         );
@@ -262,6 +265,7 @@ fn mysql_session_vars_clean_after_successful_export() {
                 cursor: None,
                 tuning: &tuning_300s(),
                 column_overrides: &ColumnOverrides::default(),
+                page_limit: None,
             },
             &mut NullSink,
         )
@@ -296,6 +300,7 @@ fn mysql_session_vars_clean_after_failed_export() {
             cursor: None,
             tuning: &tuning_300s(),
             column_overrides: &ColumnOverrides::default(),
+            page_limit: None,
         },
         &mut FailOnFirstBatch,
     );
@@ -413,6 +418,7 @@ fn mysql_proxysql_session_vars_clean_after_successful_export() {
                 cursor: None,
                 tuning: &tuning_300s(),
                 column_overrides: &ColumnOverrides::default(),
+                page_limit: None,
             },
             &mut NullSink,
         )
@@ -453,6 +459,7 @@ fn mysql_proxysql_session_vars_clean_after_failed_export() {
             cursor: None,
             tuning: &tuning_300s(),
             column_overrides: &ColumnOverrides::default(),
+            page_limit: None,
         },
         &mut FailOnFirstBatch,
     );

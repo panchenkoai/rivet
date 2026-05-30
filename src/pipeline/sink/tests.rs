@@ -320,6 +320,58 @@ fn unique_cap_column_skipped_in_subsequent_batches() {
     );
 }
 
+// ─── per-value ceiling (OPT-1) ────────────────────────────────
+
+fn utf8_batch(values: Vec<&str>) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, true)]));
+    RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values))]).unwrap()
+}
+
+#[test]
+fn value_ceiling_rejects_oversized_cell() {
+    let mut sink = minimal_sink();
+    sink.max_value_bytes = Some(1024); // 1 KiB ceiling for the test
+    let big = "x".repeat(2048);
+    let batch = utf8_batch(vec!["small", &big]);
+    let err = sink.check_value_ceiling(&batch).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("RIVET_VALUE_TOO_LARGE"), "got: {msg}");
+    assert!(msg.contains("body"), "should name the column: {msg}");
+}
+
+#[test]
+fn value_ceiling_passes_under_limit() {
+    let mut sink = minimal_sink();
+    sink.max_value_bytes = Some(1024);
+    let batch = utf8_batch(vec!["a", "bb", "ccc"]);
+    assert!(sink.check_value_ceiling(&batch).is_ok());
+}
+
+#[test]
+fn value_ceiling_disabled_when_none() {
+    let mut sink = minimal_sink();
+    sink.max_value_bytes = None; // guard off
+    let big = "x".repeat(10 * 1024 * 1024);
+    let batch = utf8_batch(vec![&big]);
+    assert!(
+        sink.check_value_ceiling(&batch).is_ok(),
+        "None must disable the guard entirely"
+    );
+}
+
+#[test]
+fn value_ceiling_ignores_null_cells() {
+    let mut sink = minimal_sink();
+    sink.max_value_bytes = Some(1024);
+    let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, true)]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(StringArray::from(vec![Some("ok"), None]))],
+    )
+    .unwrap();
+    assert!(sink.check_value_ceiling(&batch).is_ok());
+}
+
 // ─── helpers ─────────────────────────────────────────────────
 
 fn minimal_sink() -> ExportSink {
@@ -349,6 +401,7 @@ fn minimal_sink() -> ExportSink {
         strip_internal_column: None,
         column_max_bytes: std::collections::HashMap::new(),
         max_batch_memory_bytes: None,
+        max_value_bytes: None,
         batch_memory_policy: crate::tuning::BatchMemoryPolicy::Warn,
         oversized_batch_count: 0,
         parquet_config: None,
@@ -799,5 +852,45 @@ fn gremlin_zero_row_batch_does_not_panic_or_increment_rows() {
     assert_eq!(
         sink.total_rows, 0,
         "zero-row batch must not increment total_rows"
+    );
+}
+
+// ── pipelined sink equivalence ───────────────────────────────────────────
+
+#[test]
+fn pipelined_sink_output_is_byte_identical_to_synchronous() {
+    use crate::pipeline::manifest_writer::compute_part_fingerprint;
+    use crate::source::BatchSink;
+
+    let batches: Vec<RecordBatch> = (0..3).map(|_| make_int_batch(100, 4)).collect();
+    let schema_ref = batches[0].schema();
+
+    // Synchronous reference.
+    let mut sync_sink = minimal_sink();
+    sync_sink.on_schema(schema_ref.clone()).unwrap();
+    for b in &batches {
+        sync_sink.on_batch(b).unwrap();
+    }
+    let sync_writer = sync_sink.writer.take().unwrap();
+    sync_writer.finish().unwrap();
+    let sync_fp = compute_part_fingerprint(sync_sink.tmp.path()).unwrap();
+    let sync_rows = sync_sink.total_rows;
+
+    // Pipelined path through the worker thread.
+    let mut p = PipelinedSink::spawn_with_sink(minimal_sink());
+    p.on_schema(schema_ref.clone()).unwrap();
+    for b in &batches {
+        p.on_batch(b).unwrap();
+    }
+    let mut rec = p.finish().unwrap();
+    let p_writer = rec.writer.take().unwrap();
+    p_writer.finish().unwrap();
+    let p_fp = compute_part_fingerprint(rec.tmp.path()).unwrap();
+
+    assert_eq!(sync_rows, 300);
+    assert_eq!(rec.total_rows, sync_rows, "row count must match");
+    assert_eq!(
+        sync_fp, p_fp,
+        "pipelined output must be byte-identical to synchronous"
     );
 }

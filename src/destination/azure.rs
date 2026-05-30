@@ -1,12 +1,8 @@
-use std::path::Path;
-use std::sync::Arc;
-
 use chrono::{DateTime, Utc};
 use opendal::Operator;
-use opendal::blocking;
-use opendal::layers::RetryLayer;
 use opendal::services::Azblob;
 
+use super::cloud::{CloudBackend, CloudDestination};
 use crate::config::DestinationConfig;
 use crate::error::Result;
 
@@ -149,11 +145,13 @@ fn enforce_sas_expiry(token: &str) -> Result<()> {
     }
 }
 
-pub struct AzureDestination {
-    _runtime: Arc<tokio::runtime::Runtime>,
-    op: blocking::Operator,
-    prefix: String,
-}
+/// Azure Blob Storage destination. The retry policy, blocking wrap, and
+/// ADR-0013 read surface live in [`CloudDestination`]; this type only knows
+/// how to authenticate against Azure (account key, SAS token, or anonymous).
+pub type AzureDestination = CloudDestination<AzureBackend>;
+
+/// Zero-sized backend marker carrying Azure's operator construction.
+pub struct AzureBackend;
 
 /// Read a credential from an env var into a `Zeroizing<String>`.
 ///
@@ -166,8 +164,11 @@ fn read_credential_env(env_name: &str, label: &str) -> Result<zeroize::Zeroizing
     Ok(zeroize::Zeroizing::new(value))
 }
 
-impl AzureDestination {
-    pub fn new(config: &DestinationConfig) -> Result<Self> {
+impl CloudBackend for AzureBackend {
+    const RUNTIME_LABEL: &'static str = "Azure";
+    const SCHEME: &'static str = "az";
+
+    fn build_operator(config: &DestinationConfig) -> Result<Operator> {
         // Azure's "container" is the equivalent of S3's bucket — reuse the
         // existing `bucket` config field rather than introducing a second
         // synonym at the YAML layer.
@@ -244,128 +245,7 @@ impl AzureDestination {
             }
         }
 
-        let runtime = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| anyhow::anyhow!("failed to create tokio runtime for Azure: {}", e))?,
-        );
-        let _guard = runtime.enter();
-
-        // Same RetryLayer as S3/GCS — opendal absorbs transient hyper/reqwest
-        // failures (5xx, 429, TCP blips) so we don't escalate to a chunk-level
-        // re-fetch.  See gcs.rs for the rationale.
-        let async_op = Operator::new(builder)?
-            .layer(
-                RetryLayer::new()
-                    .with_max_times(5)
-                    .with_min_delay(std::time::Duration::from_millis(200))
-                    .with_max_delay(std::time::Duration::from_secs(10))
-                    .with_jitter(),
-            )
-            .finish();
-        let op = blocking::Operator::new(async_op)?;
-
-        let prefix = config.prefix.clone().unwrap_or_default();
-
-        Ok(Self {
-            _runtime: runtime,
-            op,
-            prefix,
-        })
-    }
-}
-
-impl super::Destination for AzureDestination {
-    fn write(&self, local_path: &Path, remote_key: &str) -> Result<()> {
-        let key = format!("{}{}", self.prefix, remote_key);
-        let mut src = std::fs::File::open(local_path)?;
-        let mut dst = self.op.writer(&key)?.into_std_write();
-        std::io::copy(&mut src, &mut dst)?;
-        dst.close()?;
-        log::info!("uploaded az://{}", key);
-        Ok(())
-    }
-
-    fn capabilities(&self) -> super::DestinationCapabilities {
-        super::DestinationCapabilities {
-            commit_protocol: super::WriteCommitProtocol::FinalizeOnClose,
-            idempotent_overwrite: true,
-            retry_safe: true,
-            partial_write_risk: false,
-        }
-    }
-
-    // ── ADR-0013 read surface (delegates to opendal) ─────────────────────
-    //
-    // Identical shape to S3/GCS; opendal abstracts the backend-specific
-    // listing semantics.  Trailing slash required for directory listings.
-
-    fn list_prefix(&self, prefix: &str) -> Result<Vec<super::ObjectMeta>> {
-        let full = format!("{}{}", self.prefix, prefix);
-        let listed = if full.is_empty() || full.ends_with('/') {
-            self.op.list_options(
-                &full,
-                opendal::options::ListOptions {
-                    recursive: true,
-                    ..Default::default()
-                },
-            )?
-        } else {
-            self.op.list_options(
-                &format!("{}/", full),
-                opendal::options::ListOptions {
-                    recursive: true,
-                    ..Default::default()
-                },
-            )?
-        };
-        let mut out = Vec::with_capacity(listed.len());
-        for entry in listed {
-            if entry.metadata().mode() != opendal::EntryMode::FILE {
-                continue;
-            }
-            let abs = entry.path().to_string();
-            let rel = abs
-                .strip_prefix(self.prefix.as_str())
-                .unwrap_or(abs.as_str())
-                .to_string();
-            out.push(super::ObjectMeta {
-                key: rel,
-                size_bytes: entry.metadata().content_length(),
-            });
-        }
-        Ok(out)
-    }
-
-    fn read(&self, key: &str) -> Result<Vec<u8>> {
-        let full = format!("{}{}", self.prefix, key);
-        let buf = self.op.read(&full)?;
-        Ok(buf.to_vec())
-    }
-
-    fn head(&self, key: &str) -> Result<Option<super::ObjectMeta>> {
-        let full = format!("{}{}", self.prefix, key);
-        match self.op.stat(&full) {
-            Ok(meta) => Ok(Some(super::ObjectMeta {
-                key: key.to_string(),
-                size_bytes: meta.content_length(),
-            })),
-            Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    fn r#move(&self, from: &str, to: &str) -> Result<()> {
-        // opendal 0.55 returns `Unsupported` for `rename` on Azure Blob (same
-        // shape as S3/GCS).  Fall back to copy + delete.  ADR-0012 M9
-        // best-effort: a partial copy-ok / delete-fail leaves the source
-        // reachable at both paths and re-trips M9 on the next resume.
-        let from_full = format!("{}{}", self.prefix, from);
-        let to_full = format!("{}{}", self.prefix, to);
-        self.op.copy(&from_full, &to_full)?;
-        self.op.delete(&from_full)?;
-        Ok(())
+        Ok(Operator::new(builder)?.finish())
     }
 }
 

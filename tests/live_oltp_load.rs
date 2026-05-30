@@ -131,6 +131,7 @@ fn pg_export_survives_concurrent_inserts() {
             cursor: None,
             tuning: &tuning_balanced(),
             column_overrides: &amount_override(),
+            page_limit: None,
         },
         &mut sink,
     );
@@ -187,6 +188,7 @@ fn pg_export_adaptive_under_write_pressure() {
             cursor: None,
             tuning: &tuning_adaptive(),
             column_overrides: &amount_override(),
+            page_limit: None,
         },
         &mut sink,
     );
@@ -244,6 +246,7 @@ fn mysql_export_survives_concurrent_inserts() {
             cursor: None,
             tuning: &tuning_balanced(),
             column_overrides: &ColumnOverrides::default(),
+            page_limit: None,
         },
         &mut sink,
     );
@@ -297,6 +300,7 @@ fn mysql_export_adaptive_under_write_pressure() {
             cursor: None,
             tuning: &tuning_adaptive(),
             column_overrides: &ColumnOverrides::default(),
+            page_limit: None,
         },
         &mut sink,
     );

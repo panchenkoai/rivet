@@ -214,6 +214,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+
+      # GitHub-hosted ubuntu-latest ships with ~14 GB free on `/`. This job
+      # then asks for ~3 GB of toolchain + ~3-4 GB of `cargo build --release`
+      # target + another ~3-5 GB of test-profile rebuild + 7 docker images
+      # (postgres / mysql / minio / fake-gcs / toxiproxy / pgbouncer /
+      # proxysql) + seed fixtures + per-test temp output. Headroom is gone
+      # before the test step starts, and a worker hitting ENOSPC mid-run
+      # surfaces as a non-obvious `Process completed with exit code 101`
+      # because cargo's diagnostic gets garbled when stderr write fails.
+      # The action below removes the pre-installed .NET / Android SDK /
+      # Haskell GHC / CodeQL / dotnet caches Rivet never touches, freeing
+      # ~30 GB. Cheap (~15 s wall) and the recommended fix per
+      # https://github.com/actions/runner-images/issues/2840.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          large-packages: false # keeps the action fast; the big wins are below
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          swap-storage: false # leave swap (host may need it under load)
+      - name: Disk snapshot — pre-build
+        run: df -h /
+
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
@@ -257,6 +282,12 @@ jobs:
           MINIO_SECRET_KEY: minioadmin
           RIVET: ./target/release/rivet
         run: bash dev/e2e/run_e2e.sh
+
+      - name: Disk snapshot — post-build
+        # Surfaces remaining headroom for the test-profile recompile + per-
+        # test output below. If a future regression burns through the buffer,
+        # the diff between pre/post is the smoking gun.
+        run: df -h /
 
       - name: Run live cargo integration tests
         # Activates every `tests/live_*.rs` binary that is `#[ignore]`d by

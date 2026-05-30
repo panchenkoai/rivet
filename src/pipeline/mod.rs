@@ -10,9 +10,11 @@ mod aggregate;
 mod apply_cmd;
 pub(crate) mod chunked;
 mod cli;
+mod commit;
 mod finalize;
 pub(crate) mod ipc;
 mod job;
+mod keyset;
 mod manifest_writer;
 mod parallel_children;
 pub(crate) mod parent_ui;
@@ -29,6 +31,7 @@ mod retry;
 // the type namespace, fns in the value namespace) and unambiguous at
 // every call site (`pipeline::run(...)` is the function).
 mod run;
+mod run_store;
 mod single;
 mod sink;
 mod summary;

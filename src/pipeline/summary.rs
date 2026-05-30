@@ -523,6 +523,76 @@ impl RunSummary {
 
         format_block(&self.export_name, &rows)
     }
+
+    /// Sanity-check the post-run summary ↔ manifest_parts coherence. Used as
+    /// a `debug_assert!`-style runtime gate from `finalize_manifest` so any
+    /// future runner that bumps `bytes_written` / `files_committed` /
+    /// `files_produced` without going through `pipeline::commit::record_part`
+    /// is caught the moment it finishes a real export. Compiled out in
+    /// release builds via the `cfg!(debug_assertions)` guard at the call site.
+    ///
+    /// **Resume-safe inequalities only**: on resume, `manifest_parts` carries
+    /// prior runs' parts via `chunked::resume_m8` while `bytes_written` /
+    /// `files_committed` reflect only the current invocation — so strict
+    /// equality is wrong across resume boundaries. Strict equality on the
+    /// non-resume path is pinned by `pipeline::commit::tests`.
+    ///
+    /// Returns `Ok(())` when the summary satisfies the invariants, else an
+    /// `Err(String)` naming which one was violated and by how much.
+    pub fn check_post_run_invariants(&self) -> Result<(), String> {
+        let parts_bytes: u64 = self.manifest_parts.iter().map(|p| p.size_bytes).sum();
+
+        if self.files_committed > self.manifest_parts.len() {
+            return Err(format!(
+                "summary.files_committed ({}) > manifest_parts.len() ({}) — \
+                 a runner bumped files_committed without commit::record_part",
+                self.files_committed,
+                self.manifest_parts.len()
+            ));
+        }
+        if self.files_produced > self.manifest_parts.len() {
+            return Err(format!(
+                "summary.files_produced ({}) > manifest_parts.len() ({}) — \
+                 a runner bumped files_produced without commit::record_part",
+                self.files_produced,
+                self.manifest_parts.len()
+            ));
+        }
+        if self.bytes_written > parts_bytes {
+            return Err(format!(
+                "summary.bytes_written ({}) > sum(manifest_parts.size_bytes) ({}) — \
+                 a runner bumped bytes_written without commit::record_part",
+                self.bytes_written, parts_bytes
+            ));
+        }
+        if self.status == "success" && self.files_committed > 0 && self.manifest_parts.is_empty() {
+            return Err(format!(
+                "success run with files_committed={} has empty manifest_parts — \
+                 cloud manifest (ADR-0012 M1) would ship with no part list \
+                 (this is the gap parallel_checkpoint had before commit e9b0796)",
+                self.files_committed
+            ));
+        }
+        // Invariant audit gap #1, weak form: a successful run that produced
+        // rows for THIS invocation must have committed at least one file.
+        // The strict form ("rows_written <= rows_read") would require a
+        // separate source-side row counter we do not track, and concurrent
+        // INSERTs on the source (live_oltp_load) make a source_count
+        // comparison brittle. This weak form catches a fabrication shape:
+        // total_rows accumulated but nothing reached the destination — a
+        // runner that fetched and silently dropped rows produces exactly
+        // this signature. Resume-safe: total_rows reflects only this
+        // invocation, so a resume with no work to do legitimately ends at
+        // total_rows=0 / files_committed=0 and the guard does not fire.
+        if self.status == "success" && self.total_rows > 0 && self.files_committed == 0 {
+            return Err(format!(
+                "summary.total_rows={} but files_committed=0 — rows extracted from \
+                 source but no files committed (no output reached the destination)",
+                self.total_rows
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Reduce a possibly-multi-line execution error to a single-line, bounded-

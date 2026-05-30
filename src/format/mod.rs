@@ -20,7 +20,7 @@ pub trait Format {
         &self,
         schema: &SchemaRef,
         writer: Box<dyn std::io::Write + Send>,
-    ) -> Result<Box<dyn FormatWriter>>;
+    ) -> Result<Box<dyn FormatWriter + Send>>;
 
     fn file_extension(&self) -> &str;
 }

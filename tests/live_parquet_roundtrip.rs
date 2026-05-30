@@ -264,3 +264,95 @@ exports:
         .sum();
     assert_eq!(total, 13, "--validate must not alter row count");
 }
+
+/// Invariant audit gap #4: no successful run without final summary.
+///
+/// After a successful run, the per-run report artifacts
+/// `<config_dir>/.rivet/runs/<run_id>/{summary.json,summary.md}` must
+/// exist on disk. ADR-0001 I8 (Finalize Order) places the run-report
+/// write last in the finalize sequence, but `finalize_run_report`
+/// treats a write failure as non-fatal — the run keeps its success exit
+/// code, and the operator loses observability silently. The runtime
+/// invariant being pinned here is the existence of those files as a
+/// consequence of `status == "success"`: any reordering of finalize
+/// hooks that bypasses the report write would land in this test as a
+/// missing-file assertion failure.
+///
+/// Complements the gap #2 / #3 unit gates: those pin the in-memory
+/// shape of the `RunSummary`; this one pins the on-disk artifact.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn successful_run_writes_summary_artifacts_under_dot_rivet() {
+    require_alive(LiveService::Postgres);
+
+    let table = seed_pg_numeric_table(10);
+    let out_dir = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let export_name = unique_name("gap4_summary_artifacts");
+    let yaml = format!(
+        r#"
+source:
+  type: postgres
+  url: "{POSTGRES_URL}"
+exports:
+  - name: {export_name}
+    query: "SELECT id, name FROM {table_name}"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: {dir}
+"#,
+        table_name = table.name(),
+        dir = out_dir.path().display()
+    );
+    let cfg_path = write_config(&cfg_dir, &yaml);
+    let out = run_rivet_export(&cfg_path, &export_name);
+    assert!(
+        out.status.success(),
+        "rivet must exit zero; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let runs_dir = cfg_dir.path().join(".rivet").join("runs");
+    assert!(
+        runs_dir.is_dir(),
+        "I8: the run-report dir {runs_dir:?} must exist after a successful run"
+    );
+
+    let run_dirs: Vec<_> = std::fs::read_dir(&runs_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .collect();
+    assert!(
+        !run_dirs.is_empty(),
+        "I8: at least one run subdirectory must exist under {runs_dir:?}"
+    );
+
+    for entry in &run_dirs {
+        let dir = entry.path();
+        let json_path = dir.join("summary.json");
+        let md_path = dir.join("summary.md");
+        assert!(
+            json_path.is_file(),
+            "I8 / gap #4: summary.json missing for run dir {dir:?}"
+        );
+        assert!(
+            md_path.is_file(),
+            "I8 / gap #4: summary.md missing for run dir {dir:?}"
+        );
+
+        // Sanity-check that the persisted summary reflects a successful run —
+        // catches a regression where the JSON is written but the status field
+        // got dropped or mis-serialized.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap())
+                .unwrap_or_else(|e| panic!("summary.json at {json_path:?} must parse: {e}"));
+        assert_eq!(
+            parsed.get("status").and_then(|v| v.as_str()),
+            Some("success"),
+            "summary.json at {json_path:?} must report status=success for a successful run"
+        );
+    }
+}

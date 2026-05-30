@@ -16,7 +16,7 @@ mod adaptive;
 mod memory;
 mod profile;
 
-pub use adaptive::{ADAPTIVE_SAMPLE_INTERVAL, next_adaptive_batch_size};
+pub use adaptive::{ADAPTIVE_SAMPLE_INTERVAL, Governor, next_adaptive_batch_size};
 pub use memory::estimate_row_bytes;
 pub use profile::{
     BatchMemoryPolicy, SourceTuning, TuningConfig, TuningProfile, merge_tuning_config,

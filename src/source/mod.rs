@@ -20,18 +20,61 @@ use crate::types::{ColumnOverrides, CursorState, TypeMapping};
 /// `crate::source::mysql::introspect_mysql_table_for_chunking`. Both helpers
 /// rely on catalog stats (`pg_class` / `information_schema.TABLES`) so the
 /// numbers are only as fresh as the last `ANALYZE` / autoanalyse.
+///
+/// # Why this is a data-shape seam, not a trait
+///
+/// The two per-engine introspection functions have identical signatures
+/// (`fn(url, tls, qualified_table) -> Result<TableIntrospection>`) and return
+/// this shared struct. The parallel shape sometimes invites a refactor along
+/// the lines of `trait Introspector { fn introspect_table(...) }` with one
+/// impl per engine — that refactor adds ceremony without reducing duplication,
+/// because the *bodies* share nothing useful: PG queries `pg_class` /
+/// `pg_index` / `pg_attribute` / `pg_type` (PG-specific type names like
+/// `int2`/`int4`/`int8`) via the `postgres` client; MySQL queries
+/// `information_schema.TABLES` / `STATISTICS` with the InnoDB
+/// `AVG_ROW_LENGTH` overflow correction via the `mysql` client. No shared
+/// implementation logic exists to extract into trait-default methods. A
+/// trait would only rename where the engine match happens
+/// (`match config.source.source_type { … }` at the call site → factory
+/// returning `Box<dyn Introspector>`); the match doesn't disappear.
+///
+/// The seam therefore lives at the **data shape**: this struct is the
+/// shared contract, the two free functions are the adapters, the per-call
+/// dispatch is an `enum`-driven `match`. See ADR-0015 for the full
+/// rationale and the architecture-review walks that led here.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TableIntrospection {
     /// Name of the single integer-family PK column, if present and safe to
     /// range-chunk. `None` when the table has no PK, has a composite PK, or
     /// the PK type is not an integer family (text, uuid, decimal, …).
     pub single_int_pk: Option<String>,
+    /// Single-column, NOT NULL, **unique** index columns usable as a keyset
+    /// (seek) pagination key — PK first (any type), then other UNIQUE indexes
+    /// (OPT-4). Index-backed and unique by construction, so `ORDER BY key
+    /// LIMIT n` is a bounded index range scan (never a filesort) and
+    /// `WHERE key > last` never skips rows with a duplicate key. Empty when the
+    /// table has no such key.
+    pub keyset_keys: Vec<String>,
     /// Best-effort row count: PG `reltuples`, MySQL `TABLE_ROWS`. `0` means
     /// the table is empty or stats are unavailable.
     pub row_estimate: i64,
     /// Heap-size-per-row in bytes. `None` for empty / unanalysed tables.
     /// Used to convert `chunk_size_memory_mb` into a row count.
     pub avg_row_bytes: Option<i64>,
+}
+
+impl TableIntrospection {
+    /// The auto-selected keyset key: the first usable single-column unique
+    /// NOT NULL key (PK preferred). `None` when the table has none.
+    pub fn auto_keyset_key(&self) -> Option<&str> {
+        self.keyset_keys.first().map(String::as_str)
+    }
+
+    /// Whether `col` is a usable keyset key (single-column, unique, NOT NULL,
+    /// index-backed). Used to validate an explicit `chunk_by_key`.
+    pub fn is_usable_keyset_key(&self, col: &str) -> bool {
+        self.keyset_keys.iter().any(|k| k == col)
+    }
 }
 
 /// Receives schema and batches from a source, one at a time.
@@ -59,6 +102,11 @@ pub struct ExportRequest<'a> {
     /// without declared precision can still be exported as `Decimal128(18,2)`
     /// when the user has stated the type explicitly.
     pub column_overrides: &'a ColumnOverrides,
+    /// Keyset (seek) pagination page size (OPT-4). When `Some(n)` *and*
+    /// `incremental` carries the key plan, the driver builds one keyset page
+    /// (`WHERE key > cursor ORDER BY key LIMIT n`) instead of the unbounded
+    /// incremental/snapshot query. The keyset runner drives the outer loop.
+    pub page_limit: Option<usize>,
 }
 
 pub trait Source: Send {
@@ -78,6 +126,18 @@ pub trait Source: Send {
         query: &str,
         column_overrides: &ColumnOverrides,
     ) -> Result<Vec<TypeMapping>>;
+
+    /// Sample a monotonic source-pressure counter for the OPT-2 concurrency
+    /// governor (`pipeline::chunked::exec`).
+    ///
+    /// Higher = more pressure. The governor compares successive samples
+    /// (`cur > prev` ⇒ under pressure) — the same convention the adaptive
+    /// batch-size loop already uses. Returns `None` when the engine can't
+    /// cheaply sample a pressure proxy, in which case the governor holds
+    /// parallelism flat. Default: `None`.
+    fn sample_pressure(&mut self) -> Option<u64> {
+        None
+    }
 }
 
 pub fn create_source(config: &SourceConfig) -> Result<Box<dyn Source>> {

@@ -40,5 +40,7 @@ mod pg_edge_cases;
 mod postgres_csv_roundtrip;
 #[path = "type_roundtrip/postgres_parquet_roundtrip.rs"]
 mod postgres_parquet_roundtrip;
+#[path = "type_roundtrip/property.rs"]
+mod property;
 #[path = "type_roundtrip/pyarrow_load.rs"]
 mod pyarrow_load;
