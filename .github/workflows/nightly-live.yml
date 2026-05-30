@@ -33,6 +33,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+
+      # ubuntu-latest ships ~14 GB free. This job runs a release build +
+      # release test rebuild + 7 docker images + the 60K-row content_items
+      # fixture. Without freeing pre-installed toolchains the worker has
+      # been hitting disk pressure mid-test (cf. recent failures at
+      # 6a4c5af landing — exit 101 with no clear test annotation because
+      # cargo's stderr write fails under ENOSPC). Same fix as the `e2e`
+      # job in ci.yml; ~30 GB headroom for ~15 s wall.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          large-packages: false
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          swap-storage: false
+      - name: Disk snapshot — pre-build
+        run: df -h /
+
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
@@ -84,6 +104,9 @@ jobs:
             --events-per-user 5 \
             --page-views 5000 \
             --content-items 60000
+
+      - name: Disk snapshot — post-build
+        run: df -h /
 
       - name: Run FULL live suite (skip 1M-row stress test)
         # Everything #[ignore]d — light suite (also covered by per-PR e2e,
