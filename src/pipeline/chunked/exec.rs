@@ -5,7 +5,7 @@
 //! solely for manifest (file-record) writes.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::super::{
     RunSummary, progress::ChunkProgress, sink::ExportSink, validate::validate_output,
@@ -17,14 +17,8 @@ use crate::journal::RunEvent;
 use crate::plan::{ChunkedPlan, ExtractionStrategy, ResolvedRunPlan};
 use crate::source::{self, Source};
 use crate::state::StateStore;
-use crate::tuning::{GOVERNOR_SAMPLE_INTERVAL_MS, GovernorState};
+use crate::tuning::Governor;
 use crate::{destination, format, resource};
-
-/// How often the governor checks whether the run has finished. Kept much
-/// shorter than [`GOVERNOR_SAMPLE_INTERVAL_MS`] so the governor thread exits
-/// promptly once the last chunk completes, instead of lingering for a full
-/// sample interval.
-const GOVERNOR_POLL_MS: u64 = 200;
 
 /// Extract the `ChunkedPlan` from a `ResolvedRunPlan`. Panics if the strategy
 /// is not `Chunked` — all callers in this module only run for chunked plans.
@@ -318,30 +312,21 @@ pub(crate) fn run_chunked_parallel(
             let floor = governor_floor;
             let export_name = plan.export_name.as_str();
             s.spawn(move || {
-                let mut gov = GovernorState::new(ceiling, floor, ceiling);
-                // `RIVET_GOVERNOR_INTERVAL_MS` shrinks the sample cadence for
-                // deterministic live tests (same env-seam convention as
-                // `RIVET_TEST_PANIC_AT`). Unset → production default. The poll
-                // sleep is clamped to the interval so a small override actually
-                // samples that fast (otherwise GOVERNOR_POLL_MS would cap it).
-                let sample_ms = std::env::var("RIVET_GOVERNOR_INTERVAL_MS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .filter(|&n| n > 0)
-                    .unwrap_or(GOVERNOR_SAMPLE_INTERVAL_MS);
-                let poll_ms = GOVERNOR_POLL_MS.min(sample_ms);
-                let interval = Duration::from_millis(sample_ms);
-                let mut last_sample = Instant::now();
-                while finished.load(Ordering::Relaxed) < total {
-                    std::thread::sleep(Duration::from_millis(poll_ms));
-                    if finished.load(Ordering::Relaxed) >= total {
-                        break;
-                    }
-                    if last_sample.elapsed() < interval {
-                        continue;
-                    }
-                    last_sample = Instant::now();
-                    if let Some((from, to)) = gov.observe(monitor.sample_pressure()) {
+                // The decision loop lives in [`tuning::Governor`]; the
+                // callback below is the only runner-specific binding
+                // (resize the kernel-park semaphore, log the transition,
+                // append it to the off-thread decision log so the parent
+                // can drain it into the run journal post-scope).
+                //
+                // `RIVET_GOVERNOR_INTERVAL_MS` is read inside
+                // [`Governor::new`]; the poll interval is clamped to the
+                // sample interval so a tiny override (deterministic live
+                // tests) actually polls that fast.
+                let mut gov = Governor::new(ceiling, floor, ceiling);
+                gov.run(
+                    &mut monitor,
+                    || finished.load(Ordering::Relaxed) >= total,
+                    |from, to| {
                         semaphore.resize(to);
                         let reason = if to < from {
                             "source pressure rising: backed off"
@@ -359,8 +344,8 @@ pub(crate) fn run_chunked_parallel(
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .push((from, to, reason.to_string()));
-                    }
-                }
+                    },
+                );
             });
         }
 

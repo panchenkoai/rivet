@@ -4,6 +4,17 @@
 //! [`ADAPTIVE_SAMPLE_INTERVAL`] batches (`pg_stat_bgwriter.checkpoints_req` for
 //! PG; `Innodb_log_waits` for MySQL) and call [`next_adaptive_batch_size`] to
 //! pick the next fetch size.
+//!
+//! The OPT-2 [`Governor`] runs the same idea at the *parallelism* layer: every
+//! [`GOVERNOR_SAMPLE_INTERVAL_MS`] it samples a [`PressureSource`], folds the
+//! reading through [`GovernorState`], and emits each `(from, to)` transition
+//! through a callback. Extracted from an inline `thread::scope` closure so the
+//! decision loop is unit-testable on a fake `PressureSource` without
+//! requiring a live database + a multi-second wait for two real sample
+//! intervals. The runner binds the callback to its own semaphore-resize +
+//! log + decision-log machinery.
+
+use std::time::{Duration, Instant};
 
 /// Number of batches between adaptive pressure samples.
 pub const ADAPTIVE_SAMPLE_INTERVAL: usize = 10;
@@ -107,6 +118,136 @@ impl GovernorState {
             Some((from, next))
         }
     }
+}
+
+/// How often the governor's `run` loop wakes to check the stop condition.
+/// Kept much shorter than [`GOVERNOR_SAMPLE_INTERVAL_MS`] so the thread exits
+/// promptly when the run finishes, instead of lingering for a full sample
+/// interval after the last chunk completes.
+pub const GOVERNOR_POLL_MS: u64 = 200;
+
+/// Narrow seam the [`Governor`] needs from a source: hand it one pressure
+/// reading. Implemented for `Box<dyn crate::source::Source>` so the
+/// production runner can pass its already-built monitor connection in
+/// directly; tests pass a small in-memory adapter (see `VecSource` in
+/// this module's `tests`) so the decision loop is exercised without
+/// touching a live database.
+///
+/// `Send` because the runner spawns the governor on its own thread
+/// inside `thread::scope`.
+pub trait PressureSource: Send {
+    /// Return the source's current pressure reading, or `None` when the
+    /// source cannot sample this tick (the governor then holds parallelism
+    /// flat — see [`GovernorState::observe`]).
+    fn sample_pressure(&mut self) -> Option<u64>;
+}
+
+impl PressureSource for Box<dyn crate::source::Source> {
+    fn sample_pressure(&mut self) -> Option<u64> {
+        crate::source::Source::sample_pressure(self.as_mut())
+    }
+}
+
+/// The adaptive concurrency governor — the inline `thread::scope` closure
+/// that used to live in [`crate::pipeline::chunked::exec::run_chunked_parallel`]
+/// turned into a self-contained, testable abstraction.
+///
+/// Why a struct (not just functions): the decision policy
+/// ([`GovernorState`]) and the sample cadence (sample/poll intervals,
+/// `RIVET_GOVERNOR_INTERVAL_MS` env override) are runtime-coupled — the
+/// poll interval must be clamped to the sample interval, and the decision
+/// state is mutated across ticks. Bundling them into one type makes the
+/// "what to test, what to fake" boundary obvious: the source is the
+/// dependency, the runner-side side effects are a callback.
+pub struct Governor {
+    state: GovernorState,
+    sample_interval: Duration,
+    poll_interval: Duration,
+}
+
+impl Governor {
+    /// Build a governor that starts at `start`, clamped into `[floor,
+    /// ceiling]`, and uses the env-tunable sample cadence
+    /// (`RIVET_GOVERNOR_INTERVAL_MS`; falls back to
+    /// [`GOVERNOR_SAMPLE_INTERVAL_MS`]). The poll interval is clamped to
+    /// the sample interval so a tiny override (used in deterministic live
+    /// tests) actually polls that fast, instead of being capped at the
+    /// default [`GOVERNOR_POLL_MS`].
+    pub fn new(start: usize, floor: usize, ceiling: usize) -> Self {
+        let sample_ms = sample_interval_ms_from_env();
+        let poll_ms = GOVERNOR_POLL_MS.min(sample_ms);
+        Self {
+            state: GovernorState::new(start, floor, ceiling),
+            sample_interval: Duration::from_millis(sample_ms),
+            poll_interval: Duration::from_millis(poll_ms),
+        }
+    }
+
+    /// Build a governor with explicit intervals — bypasses the env-var
+    /// read so unit tests can drive the loop deterministically without
+    /// mutating process-global state.
+    #[cfg(test)]
+    pub fn with_intervals(
+        start: usize,
+        floor: usize,
+        ceiling: usize,
+        sample_interval: Duration,
+        poll_interval: Duration,
+    ) -> Self {
+        Self {
+            state: GovernorState::new(start, floor, ceiling),
+            sample_interval,
+            poll_interval,
+        }
+    }
+
+    /// Pure decision step: fold one sample into the state. Returns
+    /// `Some((from, to))` on a parallelism transition, `None` otherwise.
+    /// Mirrors [`GovernorState::observe`]; exposed at the [`Governor`]
+    /// surface so tests can drive the policy without entering `run`.
+    pub fn tick(&mut self, sample: Option<u64>) -> Option<(usize, usize)> {
+        self.state.observe(sample)
+    }
+
+    /// Drive the sample loop until `stop` returns true. On every
+    /// parallelism transition the `on_decision(from, to)` callback fires
+    /// — the runner binds it to its semaphore-resize + log +
+    /// decision-log machinery. Polls every `poll_interval`, samples
+    /// every `sample_interval`. The stop predicate is re-checked after
+    /// each poll sleep so a finished run exits within one poll quantum.
+    pub fn run<S, Stop, Decide>(&mut self, source: &mut S, stop: Stop, mut on_decision: Decide)
+    where
+        S: PressureSource + ?Sized,
+        Stop: Fn() -> bool,
+        Decide: FnMut(usize, usize),
+    {
+        let mut last_sample = Instant::now();
+        while !stop() {
+            std::thread::sleep(self.poll_interval);
+            if stop() {
+                break;
+            }
+            if last_sample.elapsed() < self.sample_interval {
+                continue;
+            }
+            last_sample = Instant::now();
+            if let Some((from, to)) = self.tick(source.sample_pressure()) {
+                on_decision(from, to);
+            }
+        }
+    }
+}
+
+/// Read `RIVET_GOVERNOR_INTERVAL_MS` and fall back to the production default.
+/// Lives next to [`Governor`] so live tests and the production runner share
+/// one resolution path — extracted from the inline read in
+/// `run_chunked_parallel` so tests can verify the cadence policy.
+fn sample_interval_ms_from_env() -> u64 {
+    std::env::var("RIVET_GOVERNOR_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(GOVERNOR_SAMPLE_INTERVAL_MS)
 }
 
 #[cfg(test)]
@@ -270,6 +411,108 @@ mod tests {
             g.observe(Some(300)),
             Some((5, 4)),
             "rising vs preserved baseline"
+        );
+    }
+
+    // ── Governor (the loop, not just the decision) ────────────────────────────
+
+    /// In-memory [`PressureSource`] that hands out canned samples in order
+    /// and reports `None` once exhausted (mimics a source that lost its
+    /// connection mid-run). Bumps a shared counter on every call so the
+    /// test's `stop` predicate can fire after a fixed number of samples
+    /// — keying off decisions instead would deadlock the loop when the
+    /// first sample only sets the baseline (no decision → no signal).
+    struct VecSource {
+        samples: std::collections::VecDeque<Option<u64>>,
+        sample_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl VecSource {
+        fn new(
+            samples: impl IntoIterator<Item = Option<u64>>,
+            sample_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        ) -> Self {
+            Self {
+                samples: samples.into_iter().collect(),
+                sample_count,
+            }
+        }
+    }
+
+    impl PressureSource for VecSource {
+        fn sample_pressure(&mut self) -> Option<u64> {
+            self.sample_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.samples.pop_front().unwrap_or(None)
+        }
+    }
+
+    #[test]
+    fn governor_tick_mirrors_governor_state_observe() {
+        // The `tick` method must be a faithful surface for the policy; if it
+        // ever diverges from GovernorState::observe, the runner-side
+        // unit-test guarantee breaks. Drive both with the same sequence and
+        // assert identical outputs.
+        let samples = [Some(100u64), Some(200), Some(150), None, Some(400)];
+        let mut g =
+            Governor::with_intervals(6, 2, 6, Duration::from_millis(1), Duration::from_millis(1));
+        let mut s = GovernorState::new(6, 2, 6);
+        for sample in samples {
+            assert_eq!(g.tick(sample), s.observe(sample));
+        }
+    }
+
+    #[test]
+    fn governor_run_emits_decisions_for_every_rising_sample_until_stop() {
+        // Polls at 1 ms, samples at 1 ms — every wake fires a sample so the
+        // 5 canned samples produce exactly the 4 transitions the policy
+        // would emit (the first sample only sets the baseline, hence one
+        // fewer decision than samples). Stop predicate is keyed on the
+        // *sample* counter — keying it on decisions would deadlock because
+        // the first sample never emits one.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let sample_count = Arc::new(AtomicUsize::new(0));
+        let mut source = VecSource::new(
+            [
+                Some(100),
+                Some(200), // rising → 6→5
+                Some(300), // rising → 5→4
+                Some(400), // rising → 4→3
+                Some(500), // rising → 3→2 (clamped at floor)
+            ],
+            Arc::clone(&sample_count),
+        );
+        let mut gov =
+            Governor::with_intervals(6, 2, 6, Duration::from_millis(1), Duration::from_millis(1));
+        let stop_count = Arc::clone(&sample_count);
+        let stop = move || stop_count.load(Ordering::Relaxed) >= 5;
+        let mut decisions: Vec<(usize, usize)> = Vec::new();
+        gov.run(&mut source, stop, |from, to| {
+            decisions.push((from, to));
+        });
+
+        // First sample (100) only seeds the baseline → no decision.
+        // Samples 2..5 all rise → four shed-one decisions.
+        assert_eq!(decisions, vec![(6, 5), (5, 4), (4, 3), (3, 2)]);
+    }
+
+    #[test]
+    fn governor_run_stops_promptly_within_one_poll_quantum() {
+        // `stop` flips before the first sleep returns; `run` must observe it
+        // immediately on the next stop-check rather than waiting a full
+        // sample interval. Asserts the loop honours the stop predicate as a
+        // hot exit condition (the deadlock-class bug from 16fc662 would
+        // re-surface here as a non-terminating test if regressed).
+        let sample_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut source = VecSource::new([Some(100)], sample_count);
+        let mut gov =
+            Governor::with_intervals(6, 2, 6, Duration::from_millis(50), Duration::from_millis(5));
+        let start = std::time::Instant::now();
+        gov.run(&mut source, || true, |_, _| {});
+        assert!(
+            start.elapsed() < Duration::from_millis(40),
+            "run() must exit on stop without sleeping a full sample interval"
         );
     }
 }
