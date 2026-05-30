@@ -6,20 +6,30 @@
 //! 1. `governor_activates_and_run_completes` — with `adaptive: true` + `parallel > 1`
 //!    the governor thread spins up on its own monitoring connection, the run
 //!    completes, and every row round-trips.
-//! 2. `governor_does_not_deadlock_when_chunks_fail` — regression: a failing chunk
+//! 2. `governor_backs_off_under_concurrent_write_pressure` — the real thing: a
+//!    background writer hammers the exported table (concurrent INSERTs +
+//!    periodic CHECKPOINT, which is what bumps `pg_stat_bgwriter.checkpoints_req`,
+//!    the governor's PG pressure proxy). A wide payload + small batches make the
+//!    run last long enough — and the governor backing off to `min_parallel`
+//!    lengthens it further — so the sampler fires repeatedly under rising
+//!    pressure and we observe a real back-off in the run journal / log.
+//! 3. `governor_does_not_deadlock_when_chunks_fail` — regression: a failing chunk
 //!    must not strand the governor and deadlock `thread::scope` (it did before the
 //!    `finished`-counter fix — the worker only bumped `completed` on success).
 //!
-//! Observing an actual *back-off* live is timing-dependent (it needs a run long
-//! enough to sample twice under rising pressure). The deterministic home for that
-//! assertion is a hermetic test of an extracted `Governor` loop driven by a fake
-//! pressure source — a follow-up to the "extract Governor" architecture-review item.
+//! Note on the pressure signal: organic INSERT load only moves `checkpoints_req`
+//! once WAL exceeds `max_wal_size` (1 GB by default) — impractical to churn in a
+//! test without mutating shared server config. A periodic explicit `CHECKPOINT`
+//! is the deterministic mover and faithfully models a checkpoint-heavy write
+//! workload, so the writer thread does both real INSERTs and CHECKPOINTs.
 //!
 //! Run: `docker compose up -d postgres && cargo test --test live_governor -- --ignored`.
 
 mod common;
 use common::*;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -99,6 +109,142 @@ exports:
         total_parquet_rows(out_dir.path()),
         N,
         "every row must round-trip through the governed parallel run"
+    );
+}
+
+/// The value-proof: under a real concurrent write workload the governor must
+/// actually shed workers. A background thread hammers the *very rows being
+/// exported* with UPDATEs (real WAL + dirty pages + dead tuples) and a periodic
+/// CHECKPOINT — the CHECKPOINT is what moves `pg_stat_bgwriter.checkpoints_req`
+/// (the PG pressure proxy) faster than the 80 ms sampler, so pressure reads as
+/// monotonically rising and the governor steps parallelism down toward
+/// `min_parallel`. We UPDATE rather than INSERT so the exported id range
+/// `[1, ROWS]` (and thus the round-trip row count) stays deterministic.
+///
+/// Spawned under a 120 s watchdog so a regression (e.g. the governor deadlock)
+/// trips a timeout instead of hanging the whole test binary.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn governor_backs_off_under_concurrent_write_pressure() {
+    require_alive(LiveService::Postgres);
+
+    // Wide payload + small batches + a throttle make each chunk's write
+    // non-trivial, so the run lasts long enough for the 80 ms governor to
+    // sample repeatedly while the writer drives pressure up — and the governor
+    // backing off to `min_parallel` lengthens it further.
+    const ROWS: i64 = 20_000;
+    let table = seed_pg_wide_table(ROWS, 1024);
+    let out_dir = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        r#"
+source:
+  type: postgres
+  url: "{POSTGRES_URL}"
+  tuning:
+    adaptive: true
+    min_parallel: 2
+    batch_size: 250
+    throttle_ms: 30
+exports:
+  - name: {name}
+    query: "SELECT id, payload FROM {name}"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 1000
+    parallel: 8
+    format: parquet
+    destination:
+      type: local
+      path: {out}
+"#,
+        name = table.name(),
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    // Background writer: concurrent UPDATEs on the rows being exported plus a
+    // CHECKPOINT every ~70 ms (faster than the governor's 80 ms sample). The
+    // UPDATEs are real write contention; the CHECKPOINT is the deterministic
+    // signal mover. Organic INSERT load alone only bumps `checkpoints_req` once
+    // WAL exceeds `max_wal_size` (1 GB) — impractical here, and mutating that
+    // shared server setting is off-limits — so an explicit CHECKPOINT stands in
+    // for a checkpoint-heavy workload.
+    let stop = Arc::new(AtomicBool::new(false));
+    let table_name = table.name().to_string();
+    let writer = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut c = pg_connect();
+            let mut k: i64 = 1;
+            while !stop.load(Ordering::Relaxed) {
+                let _ = c.batch_execute(&format!(
+                    "UPDATE {table_name} SET payload = repeat('z', 1024), updated_at = now() \
+                     WHERE id BETWEEN {k} AND {k} + 999; CHECKPOINT;"
+                ));
+                k += 1000;
+                if k > ROWS {
+                    k = 1;
+                }
+                std::thread::sleep(Duration::from_millis(70));
+            }
+        })
+    };
+
+    // Watchdog: redirect stderr to a file so we can both assert on it and avoid
+    // a piped-buffer deadlock while polling for exit.
+    let log_path = cfg_dir.path().join("rivet.stderr");
+    let log_file = std::fs::File::create(&log_path).unwrap();
+    let mut child = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            table.name(),
+        ])
+        .env("RUST_LOG", "info")
+        .env("RIVET_GOVERNOR_INTERVAL_MS", "80")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(log_file))
+        .spawn()
+        .expect("spawn rivet run");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let status = loop {
+        match child.try_wait().expect("try_wait on rivet child") {
+            Some(s) => break s,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                stop.store(true, Ordering::Relaxed);
+                let _ = writer.join();
+                panic!("governed run under concurrent write pressure did not finish within 120s");
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    };
+
+    stop.store(true, Ordering::Relaxed);
+    writer.join().expect("writer thread");
+
+    let stderr = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        status.success(),
+        "governed run under concurrent write pressure must still complete; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("adaptive concurrency governor active"),
+        "governor must arm for adaptive + parallel>1; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("backed off"),
+        "under rising checkpoint pressure the governor must shed at least one worker \
+         (a 'backed off' parallelism adjustment); stderr:\n{stderr}"
+    );
+    assert_eq!(
+        total_parquet_rows(out_dir.path()),
+        ROWS as usize,
+        "every exported row must round-trip despite concurrent writes to the same rows"
     );
 }
 
