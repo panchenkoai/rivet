@@ -20,6 +20,28 @@ use crate::types::{ColumnOverrides, CursorState, TypeMapping};
 /// `crate::source::mysql::introspect_mysql_table_for_chunking`. Both helpers
 /// rely on catalog stats (`pg_class` / `information_schema.TABLES`) so the
 /// numbers are only as fresh as the last `ANALYZE` / autoanalyse.
+///
+/// # Why this is a data-shape seam, not a trait
+///
+/// The two per-engine introspection functions have identical signatures
+/// (`fn(url, tls, qualified_table) -> Result<TableIntrospection>`) and return
+/// this shared struct. The parallel shape sometimes invites a refactor along
+/// the lines of `trait Introspector { fn introspect_table(...) }` with one
+/// impl per engine — that refactor adds ceremony without reducing duplication,
+/// because the *bodies* share nothing useful: PG queries `pg_class` /
+/// `pg_index` / `pg_attribute` / `pg_type` (PG-specific type names like
+/// `int2`/`int4`/`int8`) via the `postgres` client; MySQL queries
+/// `information_schema.TABLES` / `STATISTICS` with the InnoDB
+/// `AVG_ROW_LENGTH` overflow correction via the `mysql` client. No shared
+/// implementation logic exists to extract into trait-default methods. A
+/// trait would only rename where the engine match happens
+/// (`match config.source.source_type { … }` at the call site → factory
+/// returning `Box<dyn Introspector>`); the match doesn't disappear.
+///
+/// The seam therefore lives at the **data shape**: this struct is the
+/// shared contract, the two free functions are the adapters, the per-call
+/// dispatch is an `enum`-driven `match`. See ADR-0015 for the full
+/// rationale and the architecture-review walks that led here.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TableIntrospection {
     /// Name of the single integer-family PK column, if present and safe to
