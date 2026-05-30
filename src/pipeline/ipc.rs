@@ -124,7 +124,13 @@ pub fn ipc_events_enabled() -> bool {
 
 /// Emit one event to stdout as a single JSON line.  Errors are logged at
 /// `debug` and otherwise swallowed — IPC failures must not abort an export.
-pub fn emit(event: &ChildEvent) {
+///
+/// Module-private: the only legal caller is [`emit_event`] below, which
+/// dispatches between this stdout path and the in-process channel. Direct
+/// stdout emission from anywhere else would bypass the in-process renderer
+/// when `--parallel-exports` is in effect — a footgun this visibility
+/// closes.
+fn emit(event: &ChildEvent) {
     use std::io::Write;
     let line = match serde_json::to_string(event) {
         Ok(s) => s,
