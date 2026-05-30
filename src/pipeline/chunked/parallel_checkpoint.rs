@@ -25,7 +25,7 @@ use super::super::{
 };
 use super::{
     ChunkSource, chunked_plan, config_hint, detect_and_generate_chunks,
-    ensure_chunk_checkpoint_plan, record_chunked_commit,
+    ensure_chunk_checkpoint_plan,
 };
 use crate::error::Result;
 use crate::plan::ResolvedRunPlan;
@@ -476,7 +476,10 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     }
 
     state.finalize_chunk_run_completed(&run_id)?;
-    record_chunked_commit(state, &plan.export_name, &run_id);
+    // ADR-0008 PG2 committed boundary via the shared finalize seam.
+    super::super::run_store::RunStore::finalize(state, plan, summary)
+        .with_progression(super::super::run_store::Progression::Chunked)
+        .commit()?;
     log::info!(
         "export '{}': chunk checkpoint parallel run completed",
         plan.export_name

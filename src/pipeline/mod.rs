@@ -31,6 +31,7 @@ mod retry;
 // the type namespace, fns in the value namespace) and unambiguous at
 // every call site (`pipeline::run(...)` is the function).
 mod run;
+mod run_store;
 mod single;
 mod sink;
 mod summary;

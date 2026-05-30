@@ -163,7 +163,12 @@ pub(super) fn ensure_chunk_checkpoint_plan(
 /// Epic G: record the highest completed `chunk_index` for this run as the new
 /// committed boundary. Failures are logged — progression is observational and
 /// must not fail the pipeline.
-pub(super) fn record_chunked_commit(state: &StateStore, export_name: &str, run_id: &str) {
+///
+/// Visibility `pub(crate)` so [`super::run_store::RunStore`] can dispatch
+/// the chunked variant of `Progression` through this helper. The walk of
+/// `chunk_task` is chunked-mode-specific, so the logic stays in this
+/// module rather than moving to `state::progression`.
+pub(crate) fn record_chunked_commit(state: &StateStore, export_name: &str, run_id: &str) {
     let tasks = match state.list_chunk_tasks_for_run(run_id) {
         Ok(t) => t,
         Err(e) => {

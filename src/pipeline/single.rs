@@ -352,29 +352,19 @@ pub(super) fn run_single_export(
         );
     }
 
+    // ADR-0001 I3 cursor advance + ADR-0008 PG2 committed boundary — both
+    // go through the shared seam in `super::run_store::RunStore` so the
+    // ordering rule (cursor first, fatal; progression second, warn-on-fail)
+    // is the interface, not a convention. The `after_cursor_commit` fault
+    // hook now fires inside `RunStore::commit()` so every runner that uses
+    // the facade inherits it.
     if let (Some(last_val), Some(st)) = (&sink.last_cursor_value, state) {
-        st.update(&plan.export_name, last_val)?;
-
-        // Test fault-point #4: cursor advanced, but the final run metric
-        // (record_metric at the outer pipeline loop) has NOT been recorded.
-        // QA backlog Task 1.1.
-        crate::test_hook::maybe_panic_at("after_cursor_commit");
-
-        log::info!(
-            "export '{}': cursor updated to '{}'",
-            plan.export_name,
-            last_val
-        );
-        // Epic G: record committed boundary for progression reporting.
-        if let Err(e) =
-            st.record_committed_incremental(&plan.export_name, last_val, &summary.run_id)
-        {
-            log::warn!(
-                "export '{}': committed boundary update failed: {:#}",
-                plan.export_name,
-                e
-            );
-        }
+        super::run_store::RunStore::finalize(st, plan, summary)
+            .with_cursor(last_val.clone())
+            .with_progression(super::run_store::Progression::Incremental {
+                last_value: last_val.clone(),
+            })
+            .commit()?;
     }
 
     // ADR-0012 M3: pin the dest schema fingerprint on the summary so
