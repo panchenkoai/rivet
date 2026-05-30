@@ -180,43 +180,6 @@ pub fn compute_part_fingerprint(path: &Path) -> Result<String> {
     Ok(format!("xxh3:{:016x}", h.digest()))
 }
 
-/// Record a committed part on the run summary.
-///
-/// Called at every `dest.write()` site, immediately after the write succeeds
-/// — the same I2/I3 window that already drives `state.record_file()`.
-///
-/// Computes the part content fingerprint from the local temp file (still
-/// extant at this point) and appends a `ManifestPart` to
-/// `summary.manifest_parts` for the finalizer to assemble into a
-/// `RunManifest`.
-///
-/// Fingerprint failure is non-fatal: a placeholder zero fingerprint is
-/// pushed and a `WARN` is logged.  M3 verification will later reject the
-/// part as corrupt; this preserves the manifest contract under read while
-/// not blocking the write path (consistent with ADR-0001 I7 — observability
-/// failures must not abort exports).
-pub fn record_committed_part(
-    summary: &mut RunSummary,
-    relative_path: String,
-    rows: i64,
-    size_bytes: u64,
-    local_tmp_path: &Path,
-) {
-    let fingerprint = match compute_part_fingerprint(local_tmp_path) {
-        Ok(fp) => fp,
-        Err(e) => {
-            log::warn!(
-                "export '{}': part fingerprint failed for '{}' (not fatal): {:#}",
-                summary.export_name,
-                relative_path,
-                e
-            );
-            "xxh3:0000000000000000".to_string()
-        }
-    };
-    record_committed_part_with_fingerprint(summary, relative_path, rows, size_bytes, fingerprint);
-}
-
 /// Capture the run's schema fingerprint on the summary.
 ///
 /// Computed from the dest-facing Arrow schema (the one downstream consumers
