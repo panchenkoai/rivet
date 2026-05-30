@@ -143,7 +143,7 @@ pub(crate) fn run_keyset(
             None => anyhow::bail!(
                 "export '{}': keyset could not read the '{}' value from the last row of page {} \
                  (NULL or unsupported type) — cannot advance safely. The key must be NOT NULL and \
-                 one of: integer, float, string, timestamp, date.",
+                 one of: integer, float, string, timestamp, date, uuid.",
                 plan.export_name,
                 kp.key_column,
                 pages - 1

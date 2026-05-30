@@ -7,8 +7,8 @@
 
 use arrow::array::Array;
 use arrow::array::{
-    Date32Array, Float64Array, Int16Array, Int32Array, Int64Array, StringArray,
-    TimestampMicrosecondArray,
+    Date32Array, FixedSizeBinaryArray, Float64Array, Int16Array, Int32Array, Int64Array,
+    StringArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -20,7 +20,8 @@ use arrow::record_batch::RecordBatch;
 /// - the batch is empty,
 /// - the last value is NULL,
 /// - the column's Arrow type is not one of the supported cursor types
-///   (int16/32/64, float64, utf8, timestamp(µs), date32).
+///   (int16/32/64, float64, utf8, timestamp(µs), date32,
+///   FixedSizeBinary(16) for PG `uuid` per ADR-0014).
 pub(crate) fn extract_last_cursor_value(
     batch: &RecordBatch,
     cursor_column: &str,
@@ -88,6 +89,50 @@ pub(crate) fn extract_last_cursor_value(
             let date =
                 chrono::NaiveDate::from_ymd_opt(1970, 1, 1)? + chrono::Duration::days(days as i64);
             Some(date.to_string())
+        }
+        // PG `uuid` lands in Arrow as `FixedSizeBinary(16)` (with the
+        // `arrow.uuid` extension type metadata for native Parquet
+        // `LogicalType::Uuid`), per ADR-0014. Decode to the canonical
+        // 8-4-4-4-12 hex form so the keyset query builder can format
+        // `WHERE <key> > '<uuid>'::uuid` on the wire — same shape as the
+        // Utf8 path that already works for MySQL's `CHAR(36)` UUIDs.
+        DataType::FixedSizeBinary(16) => {
+            let bytes = array
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()?
+                .value(last_row);
+            // Validate the length to keep the index-into-`bytes` arithmetic
+            // honest if a 16-typed array somehow yields a different slice.
+            if bytes.len() != 16 {
+                log::warn!(
+                    "cursor extract: FixedSizeBinary slice was {} bytes, expected 16",
+                    bytes.len()
+                );
+                return None;
+            }
+            Some(format!(
+                "{:02x}{:02x}{:02x}{:02x}-\
+                 {:02x}{:02x}-\
+                 {:02x}{:02x}-\
+                 {:02x}{:02x}-\
+                 {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                bytes[0],
+                bytes[1],
+                bytes[2],
+                bytes[3],
+                bytes[4],
+                bytes[5],
+                bytes[6],
+                bytes[7],
+                bytes[8],
+                bytes[9],
+                bytes[10],
+                bytes[11],
+                bytes[12],
+                bytes[13],
+                bytes[14],
+                bytes[15],
+            ))
         }
         _ => {
             log::warn!("cannot extract cursor for type {:?}", array.data_type());
@@ -208,6 +253,46 @@ mod tests {
             extract_last_cursor_value(&batch, "d", &schema),
             Some("2024-01-01".into())
         );
+    }
+
+    #[test]
+    fn cursor_fixed_size_binary_16_decodes_to_canonical_uuid_string() {
+        // Pins PG `uuid` → Arrow `FixedSizeBinary(16)` keyset support
+        // (ADR-0014 + ADR-0020). Without this arm, PG UUID PK + explicit
+        // `chunk_by_key: id` fails at page 0 with "unsupported type".
+        use arrow::array::FixedSizeBinaryArray;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::FixedSizeBinary(16),
+            false,
+        )]));
+        // 00000000-0000-0000-0000-00000000000a
+        let bytes: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0a];
+        let arr = FixedSizeBinaryArray::try_from_iter(std::iter::once(bytes.to_vec())).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).unwrap();
+        assert_eq!(
+            extract_last_cursor_value(&batch, "id", &schema),
+            Some("00000000-0000-0000-0000-00000000000a".into())
+        );
+    }
+
+    #[test]
+    fn cursor_fixed_size_binary_wrong_length_returns_none() {
+        // Defensive: a non-16 FixedSizeBinary array is not a UUID under
+        // our type mapping; refuse rather than emit a malformed UUID
+        // string the keyset query builder would then embed in a SQL
+        // literal.
+        use arrow::array::FixedSizeBinaryArray;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::FixedSizeBinary(8),
+            false,
+        )]));
+        let arr =
+            FixedSizeBinaryArray::try_from_iter(std::iter::once(vec![1u8, 2, 3, 4, 5, 6, 7, 8]))
+                .unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).unwrap();
+        assert_eq!(extract_last_cursor_value(&batch, "id", &schema), None);
     }
 
     #[test]
