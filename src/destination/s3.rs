@@ -1,19 +1,17 @@
-use std::path::Path;
-use std::sync::Arc;
-
 use opendal::Operator;
-use opendal::blocking;
-use opendal::layers::RetryLayer;
 use opendal::services::S3;
 
+use super::cloud::{CloudBackend, CloudDestination};
 use crate::config::DestinationConfig;
 use crate::error::Result;
 
-pub struct S3Destination {
-    _runtime: Arc<tokio::runtime::Runtime>,
-    op: blocking::Operator,
-    prefix: String,
-}
+/// S3 object-store destination. The retry policy, blocking wrap, and ADR-0013
+/// read surface live in [`CloudDestination`]; this type only knows how to
+/// authenticate against S3 (and S3-compatible endpoints).
+pub type S3Destination = CloudDestination<S3Backend>;
+
+/// Zero-sized backend marker carrying S3's operator construction.
+pub struct S3Backend;
 
 /// Read a credential from an env var into a `Zeroizing<String>`.
 ///
@@ -27,8 +25,11 @@ fn read_credential_env(env_name: &str, label: &str) -> Result<zeroize::Zeroizing
     Ok(zeroize::Zeroizing::new(value))
 }
 
-impl S3Destination {
-    pub fn new(config: &DestinationConfig) -> Result<Self> {
+impl CloudBackend for S3Backend {
+    const RUNTIME_LABEL: &'static str = "S3";
+    const SCHEME: &'static str = "s3";
+
+    fn build_operator(config: &DestinationConfig) -> Result<Operator> {
         let bucket = config
             .bucket
             .as_deref()
@@ -74,141 +75,7 @@ impl S3Destination {
             builder = builder.customized_credential_load(Box::new(loader));
         }
 
-        let runtime = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| anyhow::anyhow!("failed to create tokio runtime for S3: {}", e))?,
-        );
-        let _guard = runtime.enter();
-
-        // See gcs.rs for the rationale; same `RetryLayer` is applied to S3
-        // so transient hyper / SDK errors are absorbed inside the operator
-        // instead of escalating to a chunk-level re-fetch.
-        let op = blocking::Operator::new(
-            Operator::new(builder)?
-                .layer(
-                    RetryLayer::new()
-                        .with_max_times(5)
-                        .with_min_delay(std::time::Duration::from_millis(200))
-                        .with_max_delay(std::time::Duration::from_secs(10))
-                        .with_jitter(),
-                )
-                .finish(),
-        )?;
-
-        let prefix = config.prefix.clone().unwrap_or_default();
-
-        Ok(Self {
-            _runtime: runtime,
-            op,
-            prefix,
-        })
-    }
-}
-
-impl super::Destination for S3Destination {
-    fn write(&self, local_path: &Path, remote_key: &str) -> Result<()> {
-        let key = format!("{}{}", self.prefix, remote_key);
-        let mut src = std::fs::File::open(local_path)?;
-        let mut dst = self.op.writer(&key)?.into_std_write();
-        std::io::copy(&mut src, &mut dst)?;
-        dst.close()?;
-        log::info!("uploaded s3://{}", key);
-        Ok(())
-    }
-
-    fn capabilities(&self) -> super::DestinationCapabilities {
-        super::DestinationCapabilities {
-            commit_protocol: super::WriteCommitProtocol::FinalizeOnClose,
-            idempotent_overwrite: true,
-            retry_safe: true,
-            partial_write_risk: false,
-        }
-    }
-
-    // ── ADR-0013 read surface (delegates to opendal) ─────────────────────
-    //
-    // The `prefix` arg is configured-prefix-relative; we apply the same
-    // `self.prefix` join the writer applies so callers see a consistent
-    // namespace.  Returned `key` values are *also* configured-prefix-
-    // relative — symmetric with `write`'s `remote_key` argument.
-
-    fn list_prefix(&self, prefix: &str) -> Result<Vec<super::ObjectMeta>> {
-        let full = format!("{}{}", self.prefix, prefix);
-        // opendal expects a trailing `/` for directory listings.  For a
-        // bucket root the empty string is fine; for any non-empty prefix
-        // we add `/` if the caller didn't.
-        let listed = if full.is_empty() || full.ends_with('/') {
-            self.op.list_options(
-                &full,
-                opendal::options::ListOptions {
-                    recursive: true,
-                    ..Default::default()
-                },
-            )?
-        } else {
-            self.op.list_options(
-                &format!("{}/", full),
-                opendal::options::ListOptions {
-                    recursive: true,
-                    ..Default::default()
-                },
-            )?
-        };
-        let mut out = Vec::with_capacity(listed.len());
-        for entry in listed {
-            if entry.metadata().mode() != opendal::EntryMode::FILE {
-                continue;
-            }
-            // entry.path() returns a bucket-root-absolute key; strip our
-            // configured prefix so the returned `key` is comparable to
-            // values the caller passed to `write`.
-            let abs = entry.path().to_string();
-            let rel = abs
-                .strip_prefix(self.prefix.as_str())
-                .unwrap_or(abs.as_str())
-                .to_string();
-            out.push(super::ObjectMeta {
-                key: rel,
-                size_bytes: entry.metadata().content_length(),
-            });
-        }
-        Ok(out)
-    }
-
-    fn read(&self, key: &str) -> Result<Vec<u8>> {
-        let full = format!("{}{}", self.prefix, key);
-        let buf = self.op.read(&full)?;
-        Ok(buf.to_vec())
-    }
-
-    fn head(&self, key: &str) -> Result<Option<super::ObjectMeta>> {
-        let full = format!("{}{}", self.prefix, key);
-        // `stat` returns NotFound for absent keys; opendal exposes the
-        // discriminator on the returned error so we can keep our
-        // contract "Ok(None) is unambiguous absence".
-        match self.op.stat(&full) {
-            Ok(meta) => Ok(Some(super::ObjectMeta {
-                key: key.to_string(),
-                size_bytes: meta.content_length(),
-            })),
-            Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    fn r#move(&self, from: &str, to: &str) -> Result<()> {
-        // S3 is not POSIX — no native rename.  Mirrors the GCS path:
-        // explicit copy + delete instead of `op.rename` (which opendal
-        // 0.55 returns Unsupported for both S3 and GCS).  ADR-0012 M9
-        // best-effort: a partial copy-ok / delete-fail leaves the
-        // source reachable at both paths and re-trips M9 next resume.
-        let from_full = format!("{}{}", self.prefix, from);
-        let to_full = format!("{}{}", self.prefix, to);
-        self.op.copy(&from_full, &to_full)?;
-        self.op.delete(&from_full)?;
-        Ok(())
+        Ok(Operator::new(builder)?.finish())
     }
 }
 

@@ -5,6 +5,7 @@
 //! about commit boundaries and recovery semantics without inspecting backend internals.
 
 pub mod azure;
+mod cloud;
 pub mod gcs;
 mod gcs_auth;
 pub mod local;
