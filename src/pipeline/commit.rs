@@ -1,13 +1,16 @@
 //! **Layer: Execution** — the single home for committing one output part.
 //!
-//! Every runner (single, chunked-sequential, keyset, chunked-parallel) produces
-//! parts and must commit each to the destination in the ADR-0001 order: the
-//! temp writer is finalized (I1), the file is written to the destination, the
-//! manifest part is recorded (I2/M1), the file log advances (I7, warn-on-fail),
-//! and the part is journaled. Before this module that sequence — plus the
-//! `files_committed` counter and the crash-injection fault points — was
-//! hand-copied into each runner and had already drifted (the keyset runner never
-//! bumped `files_committed` and had no fault hooks; only `single` did both).
+//! Every runner (single, chunked-sequential, keyset, chunked-parallel,
+//! sequential_checkpoint, parallel_checkpoint) produces parts and must commit
+//! each to the destination in the ADR-0001 order: the temp writer is finalized
+//! (I1), the file is written to the destination, the manifest part is recorded
+//! (I2/M1), the file log advances (I7, warn-on-fail), and the part is
+//! journaled. Before this module that sequence — plus the `files_committed`
+//! counter and the crash-injection fault points — was hand-copied into each
+//! runner and had already drifted (the keyset runner never bumped
+//! `files_committed` and had no fault hooks; only `single` did both;
+//! parallel_checkpoint never populated `summary.manifest_parts` at all,
+//! producing an empty cloud manifest — see commit e9b0796).
 //!
 //! Split at the line where the parallel engine forks: the WORKER writes the file
 //! ([`write_part_file`] — I1 + `dest.write` + fingerprint, safe off-thread) and
@@ -15,6 +18,27 @@
 //! Sequential runners call both inline; the parallel engine writes in the worker
 //! and records in the drained parent loop, so the I2/I7 ordering lives once for
 //! both engines.
+//!
+//! ## In-step ordering within [`record_part`]
+//!
+//! The four side effects fire in this fixed order:
+//!
+//! 1. byte / file counter bumps on `summary` (`bytes_written`,
+//!    `files_produced`, `files_committed`)
+//! 2. **ADR-0012 M1** — `manifest_writer::record_committed_part_with_fingerprint`
+//!    appends to `summary.manifest_parts`
+//! 3. `summary.journal.record` (`FileWritten` or `ChunkCompleted`)
+//! 4. **ADR-0001 I7** — `state.record_file` (warn-on-fail; non-fatal)
+//!
+//! Pre-commit_part, some runners had I7 before M1 (the chunked-parallel
+//! engine in particular called `state.record_file` from each worker then
+//! appended to `manifest_parts` in the post-scope drain). Both orderings
+//! are correct because no externally-observable durability contract exists
+//! *between* the two writes — the run has not finalized, so neither the
+//! cloud manifest nor the cursor have advanced past the part. Picking one
+//! order at the seam keeps all five runners consistent and makes the
+//! `cfg!(debug_assertions)` coherence check in
+//! [`crate::pipeline::finalize::finalize_manifest`] meaningful.
 
 use std::path::Path;
 
@@ -35,11 +59,25 @@ pub(crate) struct PartRecord {
     pub fingerprint: String,
 }
 
-/// How a committed part is journaled: `single` reports `FileWritten`, the
-/// chunk/keyset paths report `ChunkCompleted`.
+/// How a committed part is journaled.
+///
+/// - `File { part_index }` — written by the single-file (snapshot / incremental)
+///   runner: emits `RunEvent::FileWritten`.
+/// - `Chunk { chunk_index }` — the chunked runners (sequential / parallel /
+///   sequential_checkpoint / parallel_checkpoint): emits
+///   `RunEvent::ChunkCompleted` with the real chunk window's index.
+/// - `Page { page_index }` — keyset (seek-paginated) runner: emits
+///   `RunEvent::ChunkCompleted` *for backward journal compatibility* but
+///   conceptually a keyset page is **not** a chunk (no `[start, end]`
+///   integer window, no chunk-task lifecycle row in `chunk_task`). Carrying
+///   it as a distinct seam variant keeps the caller's intent visible at
+///   the call site and leaves room to fork to a dedicated
+///   `RunEvent::KeysetPageWritten` later without touching the runners —
+///   only the match arm in [`record_part`] would change.
 pub(crate) enum PartKind {
     File { part_index: usize },
     Chunk { chunk_index: i64 },
+    Page { page_index: i64 },
 }
 
 /// Seam 1 — ADR-0001 I1 + the destination-write boundary. Writes the
@@ -101,6 +139,15 @@ pub(crate) fn record_part(
         }),
         PartKind::Chunk { chunk_index } => summary.journal.record(RunEvent::ChunkCompleted {
             chunk_index,
+            rows: part.rows,
+            file_name: Some(part.file_name.clone()),
+        }),
+        // Keyset pages reuse ChunkCompleted to preserve journal-on-disk
+        // backward compatibility. See [`PartKind::Page`] for the rationale
+        // and the upgrade path if/when downstream observability needs to
+        // distinguish keyset pages from chunked windows.
+        PartKind::Page { page_index } => summary.journal.record(RunEvent::ChunkCompleted {
+            chunk_index: page_index,
             rows: part.rows,
             file_name: Some(part.file_name.clone()),
         }),

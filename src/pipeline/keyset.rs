@@ -118,8 +118,8 @@ pub(crate) fn run_keyset(
             summary,
             state,
             &rec,
-            super::commit::PartKind::Chunk {
-                chunk_index: pages as i64,
+            super::commit::PartKind::Page {
+                page_index: pages as i64,
             },
         );
         log::info!(
