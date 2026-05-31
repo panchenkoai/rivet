@@ -350,9 +350,26 @@ pub(super) fn rows_to_record_batch_typed(
     rows: &[Row],
 ) -> Result<RecordBatch> {
     let mut arrays: Vec<Arc<dyn Array>> = Vec::with_capacity(columns.len());
-    for (col_idx, (_name, pg_type)) in columns.iter().enumerate() {
+    for (col_idx, (name, pg_type)) in columns.iter().enumerate() {
         let target_type = schema.field(col_idx).data_type();
-        arrays.push(build_array(pg_type, target_type, col_idx, rows)?);
+        let arr = build_array(pg_type, target_type, col_idx, rows)?;
+        // Guard (slice A): the value converter dispatches on the wire type, while
+        // the schema field carries the resolved/overridden target type. If a
+        // column override retyped the column to something the converter can't
+        // produce (e.g. `uuid: string` — the wire UUID arm still builds
+        // FixedSizeBinary(16) while the field is Utf8), the two disagree. Fail
+        // loud with a column-named message instead of the opaque downstream
+        // `RecordBatch::try_new` type-mismatch error.
+        if arr.data_type() != target_type {
+            anyhow::bail!(
+                "column '{name}' (PG wire type {pg_type:?}): the value converter produced \
+                 {:?} but the resolved column type is {target_type:?} — a column override \
+                 retyped it to something the converter cannot build; remove the override \
+                 or choose a compatible target type",
+                arr.data_type(),
+            );
+        }
+        arrays.push(arr);
     }
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
     Ok(batch)

@@ -140,6 +140,21 @@ pub struct ExportConfig {
     #[serde(default)]
     pub columns: std::collections::HashMap<String, String>,
 
+    /// Downstream warehouse this export targets (`bigquery` / `bq`,
+    /// `duckdb`). When set, `rivet check --type-report` resolves each column
+    /// against it (native type, honest autoload type, recovery hint) without
+    /// needing `--target` on the CLI — the CLI flag still wins when both are
+    /// present. The Parquet interchange stays target-neutral (ADR-0014 T2);
+    /// `target:` only drives guidance and the future load-schema artifact.
+    ///
+    /// ```yaml
+    /// exports:
+    ///   - name: payments
+    ///     target: bigquery
+    /// ```
+    #[serde(default)]
+    pub target: Option<String>,
+
     /// Policy applied when structural schema drift is detected (column added, removed, or retyped).
     /// Defaults to `warn`: log a warning and continue.
     #[serde(default)]
@@ -392,6 +407,7 @@ mod tests {
     fn make_export_direct(query: Option<&str>, query_file: Option<&str>) -> ExportConfig {
         ExportConfig {
             name: "test".into(),
+            target: None,
             query: query.map(|s| s.to_string()),
             query_file: query_file.map(|s| s.to_string()),
             table: None,

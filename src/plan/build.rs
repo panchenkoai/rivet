@@ -494,6 +494,7 @@ mod tests {
     fn minimal_export() -> ExportConfig {
         ExportConfig {
             name: "test_export".into(),
+            target: None,
             query: Some("SELECT 1".into()),
             query_file: None,
             table: None,

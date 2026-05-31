@@ -153,18 +153,36 @@ pub fn check(
         for export in &exports {
             let column_overrides =
                 crate::plan::parse_column_overrides_pub(&export.columns, &export.name)?;
-            match type_report::collect_report(&config, export, &column_overrides, &policy, target) {
+            // CLI `--target` wins; otherwise fall back to the per-export
+            // `target:` from the config (slice #2a). A declared-but-unknown
+            // target is a loud error — never silently ignored.
+            if let Some(t) = export.target.as_deref()
+                && crate::types::target::ExportTarget::parse(t).is_none()
+            {
+                anyhow::bail!(
+                    "export '{}': unknown target '{t}' (expected: bigquery, duckdb)",
+                    export.name
+                );
+            }
+            let eff_target = target.or_else(|| {
+                export
+                    .target
+                    .as_deref()
+                    .and_then(crate::types::target::ExportTarget::parse)
+            });
+            match type_report::collect_report(&config, export, &column_overrides, &policy, eff_target)
+            {
                 Ok(report) => {
                     if report.has_fatal() {
                         any_fatal = true;
                     }
-                    if target.is_some() && report.has_target_fail() {
+                    if eff_target.is_some() && report.has_target_fail() {
                         any_fatal = true;
                     }
                     if json_output {
                         type_report::print_json(&report)?;
                     } else {
-                        type_report::print_table(&report, target);
+                        type_report::print_table(&report, eff_target);
                     }
                 }
                 Err(e) => {
@@ -238,6 +256,7 @@ mod tests {
     fn make_export(name: &str, mode: ExportMode, cursor: Option<&str>) -> ExportConfig {
         ExportConfig {
             name: name.to_string(),
+            target: None,
             query: Some("SELECT * FROM t".to_string()),
             query_file: None,
             table: None,
