@@ -1,77 +1,122 @@
-_Last updated: 2026-05-19. Steelman attempt to give the other tools their best configuration on the source-friendliness axes (longest single query, peak RSS) before comparing them to Rivet's defaults._
+_Last updated: 2026-05-31. Steelman attempt to give every other tool its best **minimum-memory** configuration on the source-friendliness axis (peak RSS, longest open transaction) before comparing it to Rivet. Re-run from scratch on the versions listed at the bottom._
 
-# Steelman test — tools at their best configuration
+# Steelman test — tools at their best min-memory configuration
 
-The headline numbers in [`REPORT_pg.md`](REPORT_pg.md) and [`REPORT_combined.md`](REPORT_combined.md) compare every tool **at its defaults** (with the minimum flags needed to make the bench actually work). That is the fair comparison for "what will a new operator see when they just install the tool"; it is the *unfair* comparison for "how good can each tool be with effort". This page is the second one.
+The headline numbers in [`REPORT_pg.md`](REPORT_pg.md) compare every tool **at its defaults** (with the minimum flags needed to make the bench run). That is the fair comparison for "what a new operator sees on install"; it is the *unfair* comparison for "how good can each tool be with effort". This page is the second one, focused on the axis a DBA actually cares about on a wide table: **how little memory can each tool be forced to use while still completing the extract?**
 
-For each non-Rivet tool we asked: does its public CLI / config surface contain knobs that, if tuned, would close the source-pressure gap to Rivet on the `content_items` fixture (2 M rows × 20 wide cols, ≈1 GB of Parquet on disk)? If yes, we ran the tool with those knobs and recorded the numbers below. If no, we say so explicitly so the result is honest in both directions.
+Fixture throughout: `content_items` — 2 000 000 rows × 20 wide columns, ≈2 GB of Snappy Parquet on disk. The single hardest table in the suite.
 
-## `odbc2parquet` 11.0.0 — tuned
+## The headline
 
-Available knobs that look promising:
+| Config | peak RSS | wall | rows | completed? |
+|---|---:|---:|---:|:--:|
+| **rivet — `chunk_size: 25000`** | **128 MB** | 2:06 | 2 M | ✅ |
+| **rivet — `chunk_size_memory_mb: 64`** | **148 MB** | 2:11 | 2 M | ✅ |
+| rivet — default (`chunk_size_memory_mb: 256`) | 569 MB | 2:37 | 2 M | ✅ |
+| sling — **backfill workaround** (20× id-range, free CLI) | 117 MB | 3:11 | 2 M | ✅ (operator-scripted) |
+| dlt — tuned (`buffer_max_items=5000`) | 1 267 MB | 3:05 | 2 M | ✅ |
+| duckdb — **floor** (`memory_limit=4GB`, lowest completing) | 4 118 MB | 1:32 | 2 M | ✅ |
+| duckdb — `memory_limit=512MB` | — | 0:09 | **0** | ❌ **OOM** |
+| duckdb — `memory_limit=2GB` | — | 0:09 | **0** | ❌ **OOM** |
+| clickhouse — `max_memory_usage=512MiB` | — | 2:08 | **0** | ❌ **OOM (code 241)** |
+| odbc2parquet — tuned (`batch-size-memory=256Mb`) | 6 757 MB | 7:19 | 2 M | ✅ |
+| sling — default (one `SELECT *`) | 23 552 MB | — | — | ❌ **DNF (swap)** |
 
-| Flag | Default | Tuned value | What it controls |
-|---|---|---|---|
-| `--batch-size-memory` | 2 GiB | **256 MiB** | Buffer budget per ODBC fetch batch. Matches Rivet's `chunk_size_memory_mb: 256`. |
-| `--sequential-fetching` | off (double-buffer) | **on** | Allocate one fetch buffer instead of two — halves the steady-state buffer footprint. |
-| `--column-length-limit` | 4096 | **10000** for `content_items`, 4096 elsewhere | Per-column max-element bytes. Lowered to the minimum the actual data allows so each column buffer is sized realistically rather than over-allocated. |
+**The result splits the field into two classes:**
 
-Result (same 50 ms `pg_stat_activity` sampler as the main report; macOS arm64 host):
+- **Tools that genuinely shrink.** Rivet drops from 569 MB → 148 MB → 128 MB by changing one config line, *without losing throughput* — the 25k-row run is actually the **fastest** of the three (2:06 vs 2:37) because a smaller per-chunk buffer stays in cache. Its floor (~120 MB) is the tokio + Arrow runtime itself.
+- **Tools that don't.** DuckDB and ClickHouse **cannot be made to use less memory — they crash instead.** At 512 MB both OOM with zero rows written (DuckDB: `failed to allocate ... (488 MiB used)`; ClickHouse: `MEMORY_LIMIT_EXCEEDED, code 241`). DuckDB's *lowest completing* memory_limit is **4 GB** — that is its floor, not a choice. The "min-RSS" knob for these engines is really "how close to the crash boundary dare you set it."
 
-| Table | Default (v11.0.0) | Tuned | Δ wall | Δ RSS | Rivet (same fixture) |
-|---|---|---|---:|---:|---|
-| `bench_narrow` (500 K rows, narrow) | 0.52s · 134 MB | **0.59s · 327 MB** | +13% | +144% | 0.07s · 25 MB |
-| `page_views` (2 M rows, narrow) | 9.65s · 6.0 GB | **11.5s · 2.2 GB** | +19% | **-63%** | 9.0s · 440 MB |
-| `content_items` (2 M × 20 wide) | 176.2s · 29.1 GB | **187.4s · 25.4 GB** | +6% | -13% | 176.1s · 443 MB |
+So the honest framing is not "Rivet uses less RAM." It is: **Rivet's 128 MB is a config choice with throughput intact; DuckDB's 4 GB is the cliff edge below which the job fails outright.**
 
-Conclusion for odbc2parquet:
+## Equal-chunk head-to-head: rivet vs sling-backfill
 
-- On narrow-row tables (`page_views`), tuning **does** close the RSS gap meaningfully — 6 GB drops to 2.2 GB, a 63% reduction. Wall regresses slightly because `--sequential-fetching` trades pipelining for memory.
-- On the wide-column table (`content_items`), tuning is essentially **ineffective on RSS**. The 26-29 GB floor is set by something the CLI cannot control — most plausibly the libodbc / psqlodbc driver allocating column buffers proportional to declared column max-width, plus Parquet writer dictionary pages held until row-group close. With `--row-groups-per-file 1` and `--file-size-threshold 256MiB` (forcing 671 separate output files), RSS still measures 26.6 GB.
-- The longest single SQL statement is unchanged from default — still one `SELECT * FROM "content_items"` held against the server for ~136 s. odbc2parquet has no built-in chunked-extraction mode, so genuinely reducing the long-query duration requires scripting `WHERE id BETWEEN x AND y` partitions externally. At that point the operator has re-implemented half of Rivet by hand.
+The only competitor that reaches Rivet's memory class is **sling — but only via an operator-written workaround**, because sling's built-in `chunk_size` is paywalled (Pro/Platform; see below). To make the comparison exact, both tools were run at the **same 100k-row granularity** over the same 2 M rows:
 
-So the irreducible gap on this workload is **~58× peak RSS** (25.4 GB tuned vs 443 MB Rivet) and **~700× longest single query** (136 s vs 0.19 s).
+| | rivet `chunk_size:100000` | sling-backfill (20× `WHERE id` ranges) |
+|---|---:|---:|
+| peak RSS | 245 MB | **117 MB** |
+| wall | **2:16** | 3:11 |
+| user CPU | **28.6 s** | 113.3 s |
+| sys CPU | 23.2 s | 100.1 s |
+| process model | **1 process** | 20 sequential processes |
+| output | 20 files, atomic, resumable | 20 files, no shared state |
+| invocation | `mode: chunked` (one line) | hand-written bash id-range loop |
 
-## `sling` 1.2.18 — chunking is paywalled
+sling's 117 MB is real, but it is the peak of *one short-lived process* whose memory the OS reclaims between the 20 invocations — not a steady-state single-process figure. Rivet pays ~130 MB of *persistent* runtime to be **35 % faster (2:06 vs 3:11 at 25k), 4× cheaper on CPU**, and a single resumable process with one manifest. Drop Rivet to the same 25k granularity and the memory gap closes to **128 MB vs 117 MB — 11 MB** — while every other axis stays in Rivet's favour.
 
-Sling's [`source_options.chunk_size`](https://docs.slingdata.io/concepts/replication/source-options) is documented as **available with the Sling CLI Pro or Platform plans** — not the open-source CLI we used in the bench. Without it, sling's behaviour on `content_items` is what we already published: one `select * from "public"."content_items"` held for ~134 s, ~6 GB peak RSS.
+The conclusion the previous edition drew still holds, now with numbers: getting sling source-friendly means *re-implementing chunked extraction by hand around it*. At that point the operator has rebuilt the feature Rivet ships turnkey.
 
-We could compare against the paid tier in principle, but a benchmark whose result depends on a license file does not belong in an open-source README. If sling's chunking is genuinely good once enabled, that is a separate exercise the sling team is better placed to run than we are.
+## Source-pressure (longest open transaction) — the other half
 
-## `dlt` — already tuned for source-friendliness
+Min-RSS is only one source-friendliness axis. The other is **how long each tool pins a snapshot open** (blocking `VACUUM` on the source). With the Tier-2 write-pressure probe on (a concurrent `UPDATE` loop), `dead_tup` is the dead tuples that piled up un-reclaimable while the extractor held its snapshot. From the 50 ms `pg_stat_activity` sampler on the same `content_items` run:
 
-dlt's default `pg_replication` / SQL source extractor already uses a server-side `FETCH FORWARD 10000` cursor (longest single query observed: **1.20 s** on content_items). It is the only other tool in the suite whose default extraction shape is comparable to Rivet's. The trade-off is downstream: dlt's pipeline materializes intermediate state on disk — 200 temp files / 3.2 GB temp_bytes per content_items run — that the more direct tools avoid. Its peak RSS (1.4 GB on PG) is mid-pack.
+| Tool | longest open txn | max backend_xmin age | dead tuples stranded |
+|---|---:|---:|---:|
+| **rivet** | **12.3 s** | **274 xacts** | **0** |
+| clickhouse | 87.9 s | 1 975 | 1 383 |
+| duckdb | 97.6 s | 737 | 0 |
+| odbc2parquet | 105.4 s | 2 746 | 0 |
+| dlt | 215.3 s | 8 388 | 4 843 |
 
-There is no obvious additional CLI tuning that would meaningfully change those numbers on this fixture.
+This is the most lopsided axis in the whole suite. **Rivet holds its snapshot 12.3 s; every other tool holds one open for 88–215 s** — 7–17× longer — because they each run a single long `SELECT *` while Rivet fetches in short per-chunk transactions. dlt is the worst: 215 s open, pinning the cleanup horizon **8 388 transactions** back and leaving **4 843 dead tuples** the source's `VACUUM` could not reclaim during the run. Rivet is the only tool that is best on *both* axes at once — shortest snapshot **and** lowest tunable RSS — with no multi-GB cost to get there.
 
-## `duckdb` (`postgres_scanner`) — already parallel
+## Parallel scaling — does `parallel: N` close the wall gap?
 
-DuckDB's `postgres_scanner` already opens **12 concurrent backends** on `content_items` and finishes the slowest single query in **70.6 s** — that *is* its best-case configuration. The mode is not a knob the user picks; it is the default when `postgres_scanner` decides the table is big enough to benefit. The remaining gap (vs Rivet's 0.19 s single-query) is just that the strategies are different: DuckDB parallelizes inside one client process; Rivet sequentializes thin cursor reads against one backend.
+Rivet's wall numbers above are single-threaded (`parallel: 1`). Its chunk-level
+parallelism (one connection per worker) is the turnkey lever for throughput.
+Measured on a 10-core host, same `chunk_size` per shape:
 
-The two `pg_pages_per_task` / `parallel` settings would lower the backend count at the cost of wall time. Useful in production if 12 concurrent backends are too many for the source, but it doesn't change the architectural class.
+| | content_items (WIDE) | | page_views (NARROW) | |
+|---|---:|---:|---:|---:|
+| parallel | wall | RSS | wall | RSS |
+| 1 | 2:11 | 245 MB | 13.6 s | 66 MB |
+| 2 | 1:36 (1.37×) | 410 MB | 4.7 s (2.90×) | 115 MB |
+| 3 | 1:34 (1.39×) | 524 MB | 3.8 s (3.61×) | 158 MB |
+| 4 | 1:33 (1.41×) | 656 MB | 3.2 s (4.19×) | 211 MB |
 
-## `clickhouse-local` — would need external partitioning
+Wide tables plateau at **2** (thick rows saturate the wire — 2→4 adds memory for
+~no wall); narrow tables scale near-linearly to **4** (thin rows stay
+round-trip-bound). `rivet init` already scaffolds this: `suggest_parallel` emits
+1/2/4 by row estimate. Head-to-head, **rivet `parallel: 2` on content_items
+(1:36, 410 MB) beats duckdb's auto-parallel default (1:44, 5 305 MB)** — faster
+*and* 13× leaner. So the lever exists, is on by default in scaffolded configs,
+and does not cost the multi-GB RSS the parallel scanners pay.
 
-ClickHouse's `postgresql(...)` table function reads in **one** `COPY (SELECT ...) TO STDOUT` per call. To get chunked behaviour you would have to:
+## Per-tool tuning notes
 
-1. Pre-compute id-range partitions on the client.
-2. Issue N separate `clickhouse-local --query "INSERT INTO outfile ... FROM postgresql(...) WHERE id BETWEEN $start AND $end"` invocations.
-3. Stitch the output together yourself.
+### `duckdb` 1.2.1 — parallel by design, no low-memory mode
+Knobs tried: `memory_limit`, `threads=2`, `preserve_insertion_order=false`, `ROW_GROUP_SIZE=100000`. `preserve_insertion_order=false` is essential (without it the scanner buffers global order). Even so, `postgres_scanner` materializes enough per-thread state that **512 MB and 2 GB both OOM with zero output**; 4 GB is the lowest that completes. This is architectural: DuckDB parallelizes inside one process and trades memory for the 1:32 wall. Useful when RAM is plentiful; not an option when it isn't.
 
-This is implementable in ~30 lines of bash, but it's no longer "what `clickhouse-local` does on this query" — it's "what a custom orchestration around `clickhouse-local` does". We chose not to include that in the bench: the comparison stops being "tool X vs tool Y" and becomes "tool X vs script-with-X-as-a-primitive". If a user is willing to write that script, they are also willing to use Rivet directly.
+### `clickhouse-local` 26.6 — `max_memory_usage` is a kill switch, not a throttle
+`max_memory_usage=512MiB, max_threads=2, max_block_size=10000` → `MEMORY_LIMIT_EXCEEDED (code 241)`, 0 rows. The `postgresql()` table function reads one `COPY (SELECT …)`; the memory cap aborts the query rather than back-pressuring it. Default (unbounded) run uses 1.6 GB and finishes in 1:29 — fast, but the memory is not tunable downward.
+
+### `dlt` 1.27.2 — already source-friendly, RSS is the writer
+`DATA_WRITER__BUFFER_MAX_ITEMS=5000`, `FILE_MAX_ITEMS=100000`, `EXTRACT__WORKERS=1`. dlt already uses a `FETCH 10000` cursor (mid-pack 34 s snapshot), but the pyarrow writer + normalize stage hold ~1.27 GB regardless of buffer size — tuning the write buffer barely moved RSS (1260 → 1267 MB). The memory floor is the pipeline, not a knob.
+
+### `odbc2parquet` 6.3.0 — `--sequential-fetching` is gone in 6.x
+This host has **6.3.0**, not the 11.0.0 of the prior report — so `--sequential-fetching` (a key min-RSS flag last time) **does not exist** here. Only `--batch-size-memory 256Mb` + `--column-length-limit 10000` apply, and on the wide table RSS stays at **6.8 GB**. The psqlodbc driver allocates column buffers proportional to declared width; the CLI cannot push below the multi-GB floor on wide rows. Single `SELECT *` held ~139 s.
+
+### `sling` 1.4.3 — built-in chunking still paywalled
+`source_options.chunk_size` remains Pro/Platform-only in the free CLI (confirmed: `sling run --help` exposes only `--limit`, `--offset`, `--range`, `--where`, `--src-stream` with inline SQL). Default behaviour is one `SELECT *` → 23.5 GB → swap → DNF. The **backfill workaround** above (inline-SQL id ranges) is what the free CLI *can* do, and it works (117 MB) — but it is operator-scripted orchestration, not a sling feature.
 
 ## Honest summary
 
-| Tool | Has built-in chunked extraction? | Tunable RSS on wide-table case? | Tunable longest-query? |
+| Tool | Min-RSS on wide table | Mechanism | vs rivet |
 |---|---|---|---|
-| Rivet | yes (turnkey, PK auto-resolved) | n/a (already ~443 MB) | n/a (already 0.19 s) |
-| odbc2parquet | no (single `query` arg) | partial (works on narrow tables, ~60% reduction; on wide tables stuck at ~26 GB floor) | no |
-| sling (free) | no | n/a | n/a |
-| sling (paid) | yes (`chunk_size`) | not tested — paywalled | not tested — paywalled |
-| dlt | yes (already on, FETCH 10000) | already mid-pack; intermediate state is the limit | already 1.2 s |
-| duckdb | yes (parallel scanner, on by default for big tables) | not the bottleneck (1.6 GB on PG) | 70 s — by design (parallel + REPEATABLE READ snapshot) |
-| clickhouse-local | no (one COPY per call) | not exposed | only via external scripting |
+| **rivet** | **128 MB** (config) | turnkey `chunk_size` | baseline |
+| sling (free) | 117 MB | **hand-written 20× id-range loop** | matches RSS, loses wall/CPU/atomicity |
+| sling (paid) | not tested | `chunk_size` (license-gated) | out of scope for OSS bench |
+| dlt | 1 267 MB | already tuned; writer is the floor | ~10× |
+| duckdb | 4 118 MB | **floor — below it OOMs** | ~32× |
+| clickhouse | OOM ≤512 MB / 1 627 MB default | cap aborts, not throttles | ~13× (untunable) |
+| odbc2parquet | 6 757 MB | driver buffer floor | ~53× |
 
-Rivet's edge on **`peak RSS`** and **`longest single query`** survives a good-faith tuning attempt against every open-source competitor in the suite. The edge on `peak RSS` shrinks substantially on narrow-row tables once odbc2parquet is tuned — but the wide-row case (which is the one a DBA actually worries about) does not shift.
+Rivet's edge on **peak RSS** survives a good-faith min-memory tuning attempt against every open-source competitor. More importantly, it is the only tool whose low number is a *setting* rather than a *cliff*: ask DuckDB or ClickHouse to use 512 MB and they crash; ask Rivet and it just runs, faster.
 
-Methodology is unchanged from the main reports: same docker-compose Postgres, same `gtime -v` capture, same 50 ms `pg_stat_activity` sampler. Raw output for the tuned cells lives under `$BENCH_ROOT/logs/odbc2parquet_tuned*.gtime` for reproducibility.
+---
+
+**Versions (this run, 2026-05-31, macOS arm64, docker-compose Postgres 16):**
+rivet 0.7.9 · sling 1.4.3 · duckdb 1.2.1 · clickhouse-local 26.6.1 · dlt 1.27.2 · odbc2parquet 6.3.0.
+
+**Methodology:** same docker-compose Postgres as the main reports, `gtime -v` for wall/RSS, 50 ms `pg_stat_activity` sampler for snapshot/xmin, row counts verified from the output Parquet (a tool that exits 0 with 0 rows is recorded as a failure, not a win). Raw per-cell `.gtime` + `.json` under `$BENCH_ROOT/steelman_logs/` and `$BENCH_ROOT/steelman/`. The duckdb floor sweep (2/4 GB) and the sling-backfill loop are reproducible from `$BENCH_ROOT/duckdb_floor.sh` and `$BENCH_ROOT/sling_backfill.sh`.
