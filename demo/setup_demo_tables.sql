@@ -80,6 +80,9 @@ SELECT
     CASE WHEN (i % 3) = 0 THEN NULL ELSE (TIMESTAMP '2024-06-01' + (i * INTERVAL '45 seconds'))::timestamp END AS updated_at
 FROM generate_series(1, 100000) AS s(i);
 ALTER TABLE logs_archive ADD PRIMARY KEY (id);
+-- created_at is always populated; mark it NOT NULL so discovery's auto-coalesce
+-- hint fires (best cursor `updated_at` is nullable, NOT NULL sibling `created_at`).
+ALTER TABLE logs_archive ALTER COLUMN created_at SET NOT NULL;
 CREATE INDEX idx_logs_archive_created ON logs_archive(created_at);
 
 -- 6) email_queue — 20k rows, pending/sent, no timestamp cursor.

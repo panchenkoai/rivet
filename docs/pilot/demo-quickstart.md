@@ -34,7 +34,8 @@ A scripted, reproducible end-to-end demo that exercises every post-Epic feature 
   cargo build --release --bin rivet --bin seed
   ```
 
-- `python3` and `jq` (both used only for pretty-printing JSON artifacts below).
+- `python3` and `jq` (used for pretty-printing JSON artifacts below). The §5
+  Parquet-schema peek also needs `pyarrow` (`pip install pyarrow`).
 
 Container quick check:
 
@@ -65,6 +66,15 @@ cargo run --release --bin seed -- --target postgres \
     --sparse-chunk-demo --sparse-chunk-rows 500 --sparse-chunk-id-gap 5000 \
     --coalesce-rows 5000 --coalesce-null-ratio 0.35
 ```
+
+> **Base schema first.** The seeder *fills* the bundled dev tables (`users`,
+> `orders`, `events`, `page_views`, `content_items`) — it does not create them.
+> They are created by `dev/postgres/init.sql` (and `dev/mysql/init.sql`), which
+> the bundled `docker compose` runs automatically the first time each container
+> initializes. So this works against the bundled `rivet` database out of the box.
+> If you point `--pg-url` / `--mysql-url` at a **fresh** database instead, apply
+> that `init.sql` there first, or the seeder's `TRUNCATE` fails with
+> `relation "content_items" does not exist`.
 
 Verify the landscape (PostgreSQL):
 
@@ -149,8 +159,9 @@ PY
 
 Expected:
 - **Wave 1** (score 76–88) — indexed-cursor incrementals: `events`, `sessions`, `transactions`.
-- **Wave 3** — small full exports.
-- **Wave 4** — heavy chunked exports; `audit_log` lowest (reconcile_required + chunking_heavy + degraded verdict).
+- **Wave 2** — `orders_coalesce` (composite-cursor incremental).
+- **Wave 3** — small full exports plus the lighter chunked ones (`metric_samples`, `page_views`).
+- **Wave 4** — the heaviest chunked exports at the bottom: `audit_log` and `logs_archive` (reconcile_required + chunking_heavy + degraded verdict).
 - Warning: `Source group 'replica_primary': 3 exports share this source — stagger large runs`.
 
 ---
@@ -173,7 +184,7 @@ grep -E '"password":\s*"[^"]+"' plan_events.json || echo "✅ no plaintext passw
 ../target/release/rivet apply plan_events.json
 ```
 
-Expected: `40209 rows, success`, a Parquet in `out/`, and `last_cursor` advanced.
+Expected: `40000 rows, success`, a Parquet in `out/`, and `last_cursor` advanced.
 
 ---
 
@@ -266,7 +277,7 @@ export DATABASE_URL='mysql://rivet:rivet@localhost:3306/rivet'
 
 A few MySQL notes:
 - The same `source_group` warnings fire when 3+ exports share a replica.
-- `rivet preflight` gives weaker cursor signals on MySQL than on PostgreSQL (MySQL `EXPLAIN` doesn't always annotate `type=range` for indexed incrementals), so scores tilt slightly lower. This is an observable difference, not a bug.
+- `rivet check` gives weaker cursor signals on MySQL than on PostgreSQL (MySQL `EXPLAIN` doesn't always annotate `type=range` for indexed incrementals), so some scores shift. This is an observable difference, not a bug.
 - Composite cursor SQL uses backticks (`` `updated_at` ``) instead of double-quoted identifiers — same contract, different dialect (ADR-0007 CC9).
 
 ---
