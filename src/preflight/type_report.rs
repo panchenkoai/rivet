@@ -12,7 +12,7 @@ use crate::source;
 use crate::types::{
     ColumnOverrides, TypeFidelity,
     policy::{PolicyViolation, TypePolicy},
-    target::{ExportTarget, TargetCompat, TargetStatus, check_target_compat},
+    target::{ExportTarget, TargetInput, TargetStatus},
 };
 
 /// One row in the type report (and the JSON output — roadmap §9).
@@ -32,6 +32,14 @@ pub struct TypeReportRow {
     pub target_status: Option<TargetStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_note: Option<String>,
+    /// Type a generic Parquet reader infers without a declared schema, surfaced
+    /// only when it diverges from `target_type` (e.g. BigQuery autoloads JSON
+    /// as BYTES). Present when `--target` is set and autoload ≠ native.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub autoload_type: Option<String>,
+    /// Materialization / load-schema hint (L5) to recover the native type.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cast_sql: Option<String>,
 }
 
 /// One export's type-report data.
@@ -85,15 +93,26 @@ pub fn collect_report(
     let rows = mappings
         .iter()
         .map(|m| {
-            let (target_type, target_status, target_note) = if let Some(tgt) = target {
-                let compat: TargetCompat = check_target_compat(m.arrow_type.as_ref(), tgt);
-                if compat.status == TargetStatus::Fail {
-                    target_failures = true;
-                }
-                (Some(compat.target_type), Some(compat.status), compat.note)
-            } else {
-                (None, None, None)
-            };
+            let (target_type, target_status, target_note, autoload_type, cast_sql) =
+                if let Some(tgt) = target {
+                    let spec = tgt.resolve_column(TargetInput::from(m));
+                    if spec.status == TargetStatus::Fail {
+                        target_failures = true;
+                    }
+                    // Surface the autoloaded type only when it diverges from the
+                    // native type — that divergence is the operator-facing point.
+                    let autoload = (spec.autoload_type != spec.target_type)
+                        .then_some(spec.autoload_type);
+                    (
+                        Some(spec.target_type),
+                        Some(spec.status),
+                        spec.note,
+                        autoload,
+                        spec.cast_sql,
+                    )
+                } else {
+                    (None, None, None, None, None)
+                };
             TypeReportRow {
                 column: m.column_name.clone(),
                 source_type: m.source_native_type.clone(),
@@ -108,6 +127,8 @@ pub fn collect_report(
                 target_type,
                 target_status,
                 target_note,
+                autoload_type,
+                cast_sql,
             }
         })
         .collect();
@@ -177,8 +198,14 @@ pub fn print_table(report: &ExportTypeReport, target: Option<ExportTarget>) {
                 status_marker,
                 rest = fid_w - row.fidelity.label().len(),
             );
+            if let Some(autoload) = &row.autoload_type {
+                println!("  {:<col_w$}    autoload: {}", "", autoload);
+            }
             if let Some(note) = &row.target_note {
                 println!("  {:<col_w$}    note: {}", "", note);
+            }
+            if let Some(cast) = &row.cast_sql {
+                println!("  {:<col_w$}    recover: {}", "", cast);
             }
             for w in &row.warnings {
                 println!("  {:<col_w$}    warning: {}", "", w);
@@ -373,6 +400,8 @@ mod tests {
             target_type: None,
             target_status: None,
             target_note: None,
+            autoload_type: None,
+            cast_sql: None,
         };
         assert_eq!(col_width(&[row], |r| r.column.len()), 8);
     }
@@ -389,6 +418,8 @@ mod tests {
             target_type: None,
             target_status: None,
             target_note: None,
+            autoload_type: None,
+            cast_sql: None,
         };
         let w = col_width(&[row], |r| r.column.len());
         assert_eq!(w, "a_very_long_column_name".len());

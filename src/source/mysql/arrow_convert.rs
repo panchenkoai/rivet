@@ -291,6 +291,20 @@ fn bytes_to_str(b: &[u8]) -> Option<&str> {
     simdutf8::basic::from_utf8(b).ok()
 }
 
+/// Narrow a value already widened to `i128` into a smaller signed integer,
+/// erroring on overflow instead of silently wrapping the way `as iN` does.
+/// MySQL column typing means valid rows always fit; a failure here is a genuine
+/// type mismatch (e.g. an override that mis-declares the width, or a BIGINT
+/// UNSIGNED value > i64::MAX routed through a signed builder) and must surface
+/// loudly — never corrupt into a wrap. See CLAUDE.md "Remediation hints must
+/// recover from the degraded state".
+fn narrow<T>(v: i128, column_type: &str) -> Result<T>
+where
+    T: TryFrom<i128>,
+{
+    T::try_from(v).map_err(|_| anyhow::anyhow!("value {v} overflows {column_type} column"))
+}
+
 /// Interpret raw big-endian bytes from a MySQL BIT column as an unsigned integer.
 /// MySQL sends BIT(n) values as ceil(n/8) big-endian bytes in the binary protocol.
 pub(super) fn bit_bytes_to_u64(b: &[u8]) -> u64 {
@@ -345,10 +359,12 @@ fn build_array(
             let mut b = Int16Builder::with_capacity(rows.len());
             for row in rows {
                 match row.as_ref(col_idx) {
-                    Some(Value::Int(v)) => b.append_value(*v as i16),
-                    Some(Value::UInt(v)) => b.append_value(*v as i16),
-                    Some(Value::Bytes(bv)) => match atoi::atoi::<i16>(bv) {
-                        Some(v) => b.append_value(v),
+                    Some(Value::Int(v)) => b.append_value(narrow::<i16>(*v as i128, "smallint")?),
+                    Some(Value::UInt(v)) => b.append_value(narrow::<i16>(*v as i128, "smallint")?),
+                    // Parse to i128 first so an out-of-range numeric string errors
+                    // (overflow) rather than nulling like a non-numeric one.
+                    Some(Value::Bytes(bv)) => match atoi::atoi::<i128>(bv) {
+                        Some(v) => b.append_value(narrow::<i16>(v, "smallint")?),
                         None => b.append_null(),
                     },
                     _ => b.append_null(),
@@ -360,10 +376,10 @@ fn build_array(
             let mut b = Int32Builder::with_capacity(rows.len());
             for row in rows {
                 match row.as_ref(col_idx) {
-                    Some(Value::Int(v)) => b.append_value(*v as i32),
-                    Some(Value::UInt(v)) => b.append_value(*v as i32),
-                    Some(Value::Bytes(bv)) => match atoi::atoi::<i32>(bv) {
-                        Some(v) => b.append_value(v),
+                    Some(Value::Int(v)) => b.append_value(narrow::<i32>(*v as i128, "int")?),
+                    Some(Value::UInt(v)) => b.append_value(narrow::<i32>(*v as i128, "int")?),
+                    Some(Value::Bytes(bv)) => match atoi::atoi::<i128>(bv) {
+                        Some(v) => b.append_value(narrow::<i32>(v, "int")?),
                         None => b.append_null(),
                     },
                     _ => b.append_null(),
@@ -394,7 +410,10 @@ fn build_array(
             for row in rows {
                 match row.as_ref(col_idx) {
                     Some(Value::Int(v)) => b.append_value(*v),
-                    Some(Value::UInt(v)) => b.append_value(*v as i64),
+                    // A BIGINT UNSIGNED value > i64::MAX cannot ride a signed
+                    // builder — error loudly (the operator should map it to
+                    // `decimal(20,0)`) rather than wrap into a negative.
+                    Some(Value::UInt(v)) => b.append_value(narrow::<i64>(*v as i128, "bigint")?),
                     Some(Value::Bytes(bv)) => {
                         // BIT(n>1) columns arrive as raw big-endian bytes; TEXT columns as UTF-8.
                         // Try decimal parse first; fall back to big-endian uint interpretation.
@@ -583,17 +602,15 @@ fn build_array(
         // Exact decimal path: column override declared decimal(p,s) for a MySQL DECIMAL column.
         DataType::Decimal128(p, s) => mysql_decimal_to_decimal128(*p, *s, col_idx, rows),
         DataType::Decimal256(p, s) => mysql_decimal_to_decimal256(*p, *s, col_idx, rows),
-        _ => {
-            log::warn!(
-                "unhandled Arrow type {:?} for MySQL, writing nulls",
-                arrow_type
-            );
-            let mut b = StringBuilder::with_capacity(rows.len(), 0);
-            for _ in rows {
-                b.append_null();
-            }
-            Ok(Arc::new(b.finish()))
-        }
+        // Fail loud (slice A), symmetric with the PostgreSQL path.
+        // `mysql_schema_and_arrow_types` already proved every column resolves to
+        // a supported Arrow type, so an unhandled type here is a should-never-
+        // happen — writing a null array silently hid it. Surface it.
+        _ => anyhow::bail!(
+            "no value converter for MySQL column → Arrow {:?} (column index {col_idx}); \
+             this Arrow type has no builder — report it as a type-support gap",
+            arrow_type,
+        ),
     }
 }
 
@@ -727,4 +744,63 @@ fn mysql_decimal_to_decimal256(
     Ok(Arc::new(
         b.finish().with_precision_and_scale(precision, scale)?,
     ))
+}
+
+#[cfg(test)]
+mod scale_int_overflow_tests {
+    use super::{narrow, scale_int_to_i128};
+
+    #[test]
+    fn negative_scale_is_rejected() {
+        // Parquet rejects negative-scale decimals; the scaler refuses too.
+        assert_eq!(scale_int_to_i128(123, -1), None);
+    }
+
+    #[test]
+    fn scale_zero_is_identity_and_u64_max_rides_losslessly() {
+        assert_eq!(scale_int_to_i128(123, 0), Some(123));
+        // The `bigint unsigned: decimal(20,0)` case: u64::MAX must survive whole.
+        assert_eq!(
+            scale_int_to_i128(u64::MAX as i128, 0),
+            Some(u64::MAX as i128)
+        );
+    }
+
+    #[test]
+    fn normal_scaling() {
+        assert_eq!(scale_int_to_i128(5, 2), Some(500));
+        assert_eq!(scale_int_to_i128(-7, 3), Some(-7000));
+    }
+
+    #[test]
+    fn overflow_returns_none_not_wrap() {
+        // u64::MAX (~1.8e19) scaled by 10^20 (~1.8e39) exceeds i128::MAX → None.
+        assert_eq!(scale_int_to_i128(u64::MAX as i128, 20), None);
+        // 10^39 overflows i128 in checked_pow itself → None, not a panic.
+        assert_eq!(scale_int_to_i128(1, 39), None);
+        // Multiplication overflow on an already-max operand.
+        assert_eq!(scale_int_to_i128(i128::MAX, 1), None);
+    }
+
+    // ── narrow(): the `as iN` truncation footgun, now checked ────────────────
+
+    #[test]
+    fn narrow_fits_in_range() {
+        assert_eq!(narrow::<i16>(100, "smallint").unwrap(), 100i16);
+        assert_eq!(narrow::<i32>(-5, "int").unwrap(), -5i32);
+        assert_eq!(
+            narrow::<i64>(u32::MAX as i128, "bigint").unwrap(),
+            u32::MAX as i64
+        );
+    }
+
+    #[test]
+    fn narrow_overflow_errors_not_wraps() {
+        assert!(narrow::<i16>(40_000, "smallint").is_err()); // > i16::MAX 32767
+        assert!(narrow::<i16>(-40_000, "smallint").is_err());
+        assert!(narrow::<i32>(5_000_000_000, "int").is_err()); // > i32::MAX
+        // The real bug: a BIGINT UNSIGNED value > i64::MAX would wrap to a
+        // negative with `as i64`; narrow turns it into a loud error instead.
+        assert!(narrow::<i64>(u64::MAX as i128, "bigint").is_err());
+    }
 }

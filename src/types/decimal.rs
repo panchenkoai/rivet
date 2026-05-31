@@ -208,4 +208,24 @@ mod tests {
             Some(999_999_999_999_999_999i128)
         );
     }
+
+    /// Overflow edge cases: a value beyond `i128` range must return `None`,
+    /// never panic or wrap. Guards the `checked_mul`/`checked_add` + parse
+    /// paths. See CLAUDE.md "Remediation hints must recover from the degraded
+    /// state" — a wrapped decimal is exactly the silent corruption we forbid.
+    #[test]
+    fn value_beyond_i128_returns_none_not_panic() {
+        // 40-digit integer cannot fit i128 → parse fails → None.
+        let too_big = format!("1{}", "0".repeat(40));
+        assert_eq!(decimal_str_to_scaled_i128(&too_big, 0), None);
+
+        // 38 nines fits i128 (~1e38 < i128::MAX ~1.7e38) at scale 0 …
+        let max_digits = "9".repeat(38);
+        assert!(decimal_str_to_scaled_i128(&max_digits, 0).is_some());
+        // … but scaling it by 10^2 overflows i128 → None, not a wrap.
+        assert_eq!(decimal_str_to_scaled_i128(&max_digits, 2), None);
+
+        // Fractional overflow: huge integer part + any scale.
+        assert_eq!(decimal_str_to_scaled_i128(&format!("{max_digits}.5"), 5), None);
+    }
 }

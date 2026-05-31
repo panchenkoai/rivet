@@ -565,13 +565,22 @@ fn build_array(
                 return Ok(Arc::new(b.finish()));
             }
 
-            log::warn!("unmapped PG type {:?}, extracting as text", pg_type);
-            let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
-            for row in rows {
-                let val: Option<String> = row.try_get(col_idx).ok().flatten();
-                b.append_option(val.as_deref());
-            }
-            Ok(Arc::new(b.finish()))
+            // Fail loud (slice A). `pg_columns_to_schema` already proved every
+            // column maps to a supported type, so reaching here means a (wire
+            // type, target type) pair with no value converter — almost always an
+            // override that retyped a column to something this dispatch can't
+            // read. The previous behaviour was `try_get::<String>` which silently
+            // nulled every non-text value; that silent corruption is exactly what
+            // CLAUDE.md "Remediation hints must recover from the degraded state"
+            // forbids. Surface it instead of writing nulls.
+            anyhow::bail!(
+                "no value converter for PostgreSQL wire type {:?} → Arrow {:?} \
+                 (column index {col_idx}); the column's source type and its \
+                 resolved/overridden target type do not line up — adjust the \
+                 column override so they match",
+                pg_type,
+                target_type,
+            );
         }
     }
 }
