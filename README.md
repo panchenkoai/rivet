@@ -11,7 +11,7 @@
 
 <p align="center"><strong>Make database extraction boring.</strong></p>
 
-<p align="center">One Rust binary, ~10 MB. Extracts PostgreSQL and MySQL to Parquet/CSV — locally, on S3, GCS, or Azure Blob — without holding long queries open on your production database. Resumable, auditable, source-safe.</p>
+<p align="center">One Rust binary, ~14 MB. Extracts PostgreSQL and MySQL to Parquet/CSV — locally, on S3, GCS, or Azure Blob — without holding long queries open on your production database. Resumable, auditable, source-safe.</p>
 
 > Not sure if Rivet fits your problem? [docs/who-is-this-for.md](docs/who-is-this-for.md) is a 60-second fit-check.
 
@@ -107,7 +107,8 @@ Exposed read-only surfaces:
 Works out-of-the-box with [Claude Desktop](https://claude.ai/), [Claude Code](https://claude.ai/code), and any MCP-compatible client. Runs as a separate binary — never requires write access to the source database.
 
 ```bash
-rivet-mcp --source-env DATABASE_URL
+export DATABASE_URL="postgresql://..."
+rivet-mcp        # reads DATABASE_URL from the environment
 ```
 
 Add to your MCP client config:
