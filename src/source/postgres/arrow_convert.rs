@@ -501,18 +501,37 @@ fn build_array(
         // UUID: 16-byte FixedSizeBinary so the `arrow.uuid` extension type
         // attached upstream lets parquet-rs emit native `LogicalType::Uuid`
         // (see ADR-0014 §4 and [`crate::types::mapping::build_arrow_field`]).
-        Type::UUID => {
-            let mut b = FixedSizeBinaryBuilder::with_capacity(rows.len(), 16);
-            for row in rows {
-                match row.try_get::<_, Option<PgUuidBytes>>(col_idx)? {
-                    None => b.append_null(),
-                    Some(PgUuidBytes(bytes)) => b
-                        .append_value(bytes)
-                        .expect("16 bytes always matches FixedSizeBinary(16)"),
+        // UUID honours the schema's resolved target (like the NUMERIC arm):
+        // the default `FixedSizeBinary(16)`, or `Utf8` when an operator wrote
+        // `columns: { uid: string }` to retype it to canonical text. The wire
+        // read is the same; only the array we build follows `target_type`, so
+        // the value dispatch can never disagree with the schema.
+        Type::UUID => match target_type {
+            DataType::Utf8 | DataType::LargeUtf8 => {
+                let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 36);
+                for row in rows {
+                    match row.try_get::<_, Option<PgUuidBytes>>(col_idx)? {
+                        None => b.append_null(),
+                        Some(PgUuidBytes(bytes)) => {
+                            b.append_value(uuid::Uuid::from_bytes(bytes).to_string())
+                        }
+                    }
                 }
+                Ok(Arc::new(b.finish()))
             }
-            Ok(Arc::new(b.finish()))
-        }
+            _ => {
+                let mut b = FixedSizeBinaryBuilder::with_capacity(rows.len(), 16);
+                for row in rows {
+                    match row.try_get::<_, Option<PgUuidBytes>>(col_idx)? {
+                        None => b.append_null(),
+                        Some(PgUuidBytes(bytes)) => b
+                            .append_value(bytes)
+                            .expect("16 bytes always matches FixedSizeBinary(16)"),
+                    }
+                }
+                Ok(Arc::new(b.finish()))
+            }
+        },
         // JSON / JSONB: Utf8 preserving JSON semantics — `postgres` rejects `String` for these OIDs,
         // so deserialize via [`Json`] rather than emitting silent null arrays.
         Type::JSON | Type::JSONB => {

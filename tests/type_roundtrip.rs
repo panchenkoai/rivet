@@ -36,6 +36,8 @@ mod parquet_metadata;
 mod parquet_schema;
 #[path = "type_roundtrip/pg_edge_cases.rs"]
 mod pg_edge_cases;
+#[path = "type_roundtrip/pg_uuid_string_override.rs"]
+mod pg_uuid_string_override;
 #[path = "type_roundtrip/postgres_csv_roundtrip.rs"]
 mod postgres_csv_roundtrip;
 #[path = "type_roundtrip/postgres_parquet_roundtrip.rs"]
