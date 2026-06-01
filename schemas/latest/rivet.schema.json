@@ -600,6 +600,14 @@
           },
           "default": {}
         },
+        "target": {
+          "description": "Downstream warehouse this export targets (`bigquery` / `bq`,\n`duckdb`). When set, `rivet check --type-report` resolves each column\nagainst it (native type, honest autoload type, recovery hint) without\nneeding `--target` on the CLI — the CLI flag still wins when both are\npresent. The Parquet interchange stays target-neutral (ADR-0014 T2);\n`target:` only drives guidance and the future load-schema artifact.\n\n```yaml\nexports:\n  - name: payments\n    target: bigquery\n```",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "on_schema_drift": {
           "description": "Policy applied when structural schema drift is detected (column added, removed, or retyped).\nDefaults to `warn`: log a warning and continue.",
           "$ref": "#/$defs/SchemaDriftPolicy",
