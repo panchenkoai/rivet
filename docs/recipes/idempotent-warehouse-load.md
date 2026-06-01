@@ -126,6 +126,17 @@ contains exactly the manifest's parts (i.e. there is no concurrent
 write into the same prefix), but the explicit list is what lets you
 prove which bytes were loaded.
 
+> **Native types.**  Bare autoload degrades several columns: `json` / `uuid`
+> load as `BYTES`, a naive `timestamp` as `TIMESTAMP` (an instant, not
+> wall-clock `DATETIME`), and arrays as a nested `RECORD`.  BigQuery will
+> **not** coerce these on load — declaring native types in a load schema is
+> rejected — so recover them with a post-load `CREATE TABLE … AS SELECT` over
+> the staging table.  Load the staging table with
+> `--parquet_enable_list_inference` (so arrays flatten with `UNNEST`), then run
+> the recovery SQL that `rivet check --type-report --target bigquery` prints
+> per export.  Full table:
+> [type-mapping.md § BigQuery autoload & recovery](../type-mapping.md#bigquery-autoload--recovery-verified-live).
+
 ---
 
 ## Snowflake pattern

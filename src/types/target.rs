@@ -261,7 +261,8 @@ fn bigquery_recovery_sql(specs: &[TargetColumnSpec], table: &str) -> String {
         })
         .collect();
     format!(
-        "-- 1) bq load --autodetect --source_format=PARQUET {table}__staging <parquet>\n\
+        "-- 1) bq load --autodetect --parquet_enable_list_inference \
+         --source_format=PARQUET {table}__staging <parquet>\n\
          -- 2) recover native types:\n\
          CREATE OR REPLACE TABLE `{table}` AS\n\
          SELECT\n{cols}\n\
@@ -369,15 +370,18 @@ mod bigquery {
         if inner_r.status == TargetStatus::Fail {
             return Resolved::fail(format!("REPEATED of unsupported element: {}", inner_r.target_type));
         }
-        // Arrow 3-level lists autoload as a nested RECORD in BigQuery (verified);
-        // recover a clean REPEATED column with an UNNEST after load. The exact
-        // path depends on the loader's list nesting, so no auto cast is emitted.
+        // Rivet writes the Parquet list element as `item` (arrow-rs default,
+        // not the spec's `element`), so BigQuery loads arrays as
+        // REPEATED RECORD{item} even with `--parquet_enable_list_inference`
+        // (without the flag they nest one level deeper as RECORD{list:...}).
+        // Verified live: flattening with `UNNEST(col)` + `el.item` recovers a
+        // clean REPEATED scalar.
         Resolved::diverge(
             format!("REPEATED {}", inner_r.target_type),
             format!("REPEATED RECORD{{item {}}}", inner_r.autoload_type),
-            "arrays autoload as a nested RECORD; recover REPEATED with \
-             ARRAY(SELECT item FROM UNNEST(col)) after load",
-            None,
+            "arrays load as REPEATED RECORD{item}; load the staging table with \
+             --parquet_enable_list_inference, then flatten with UNNEST after load",
+            Some("ARRAY(SELECT el.item FROM UNNEST({col}) AS el)"),
         )
     }
 }
@@ -754,6 +758,12 @@ mod tests {
                 &SourceColumn::simple("created_at", "timestamp", true),
                 naive,
             ),
+            TypeMapping::from_source(
+                &SourceColumn::simple("tags", "_text", true),
+                RivetType::List {
+                    inner: Box::new(RivetType::String),
+                },
+            ),
         ];
         let specs = ExportTarget::BigQuery.resolve_table(&mappings);
         let sql = ExportTarget::BigQuery
@@ -764,6 +774,10 @@ mod tests {
         assert!(sql.contains("PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING(attrs)) AS attrs"));
         assert!(sql.contains("TO_HEX(uid) AS uid"));
         assert!(sql.contains("DATETIME(created_at) AS created_at"));
+        // Arrays flatten via UNNEST (verified live; staging loaded with
+        // --parquet_enable_list_inference).
+        assert!(sql.contains("ARRAY(SELECT el.item FROM UNNEST(tags) AS el) AS tags"));
+        assert!(sql.contains("--parquet_enable_list_inference"));
         // OK columns pass through unchanged.
         assert!(sql.contains("SELECT\n  id"));
         // Reads the autoload staging table, writes the recovered table.

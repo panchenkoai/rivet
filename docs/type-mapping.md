@@ -288,3 +288,31 @@ columns compare byte-for-byte (`hex(...)`); the empty list survives; null
 bitmaps propagate. The MySQL `BIGINT UNSIGNED` max value (`2^64 − 1`) is the
 load-bearing assertion that exact-width unsigned ints are not silently
 overflowed to i64.
+
+### BigQuery autoload & recovery (verified live)
+
+BigQuery's Parquet loader is weaker than DuckDB's: it ignores several Parquet
+logical types on autoload and — critically — **will not coerce a column to a
+different declared type on load**. A `bq load` into a table that declares
+`JSON`/`DATETIME` is *rejected* (`Field x has changed type from JSON to BYTES`),
+so native types are recovered with a **post-load transform, not a load schema**.
+
+| RivetType | BigQuery autoload | Native | Recovery (post-load) |
+|-----------|-------------------|--------|----------------------|
+| `json`    | `BYTES`           | `JSON` | `PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING(col))` |
+| `uuid`    | `BYTES` (16 raw)  | `STRING` | `TO_HEX(col)` |
+| `timestamp` (naive) | `TIMESTAMP` (instant) | `DATETIME` | `DATETIME(col)` |
+| `list<inner>` | `RECORD{item}` | `REPEATED inner` | load staging with `--parquet_enable_list_inference`, then `ARRAY(SELECT el.item FROM UNNEST(col) AS el)` |
+| `u_int64` | `INT64` (overflows > 2^63−1) | `NUMERIC` | none post-load — fix at source: `columns: { c: decimal(20,0) }` |
+| `timestamp_tz`, `decimal`, `string`, `binary`, `bool`, ints | native | same | — |
+
+Rivet writes the Parquet list element as `item` (arrow-rs default, not the
+spec's `element`), so even `--parquet_enable_list_inference` yields
+`REPEATED RECORD{item}` rather than a clean `REPEATED <scalar>` — the `UNNEST`
+flatten above is required.
+
+`rivet check --type-report --target bigquery` prints the per-column autoload
+type, the native type, and a ready-to-run recovery `CREATE TABLE … AS SELECT`
+over the autoloaded `<table>__staging`. Set `exports[].target: bigquery` to get
+it without the CLI flag. DuckDB needs none of this — it autoloads every logical
+type natively.
