@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.8.0 (unreleased) — Type-Support Resolver + No-Download Content Integrity
+## 0.8.0 (2026-06-01) — Type-Support Resolver + No-Download Content Integrity
 
 > Two arcs. **Type support** gains a per-target type resolver (DuckDB,
 > BigQuery, Snowflake) that maps every column to its native type, the
