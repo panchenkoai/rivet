@@ -70,3 +70,20 @@ an operator or future direct loader runs (L5). The stateful **direct load**
 (Epic 14) reuses the same resolver behind a `TargetLoader: TargetResolver` split,
 introduced only when the first real connection lands.
 _Avoid_: loading, ingestion.
+
+**Manifest reconciliation**:
+The single pure walk that compares a `RunManifest` against a destination
+listing — per committed part `Present` / `Missing` / `SizeMismatch`, plus
+untracked surplus (`reconcile_manifest_against_listing`). Size-only by
+construction: a listing yields `{key, size_bytes}`, so size is the strongest
+signal without fetching the object. Both consumers are thin mappers — destination
+verify (`Presence → Failure`) and chunked resume (`Presence → ResumeDecision`).
+_Avoid_: diff, compare, validate (overloaded).
+
+**Integrity level**:
+How deep an integrity verdict went — the strongest assertion it makes.
+`Structural` = presence + size at the destination + manifest self-consistency,
+with rows already checked at export against the local file; content is not
+re-read. `Rows` / `Fingerprint` (re-download, `--validate --deep`) are reserved.
+Makes `passed: true` say *what* it certified, not just *that* it did.
+_Avoid_: validation depth, check level.

@@ -50,6 +50,20 @@ pub const QUARANTINE_PREFIX: &str = "_quarantine";
 /// foreign object when a run follows a `doctor` against the same prefix.
 pub const DOCTOR_PROBE_FILENAME: &str = ".rivet_doctor_probe";
 
+/// Join a manifest-relative key (e.g. a part `path`, [`MANIFEST_FILENAME`])
+/// onto a destination sub-directory.  An empty `dir` returns `key` unchanged
+/// — the common case, since production callers pass `""` (the manifest lives
+/// at the prefix root).  Shared by the destination-verification and
+/// resume-reconciliation paths so both speak the same key namespace.
+pub fn join_key(dir: &str, key: &str) -> String {
+    let dir = dir.trim_end_matches('/');
+    if dir.is_empty() {
+        key.to_string()
+    } else {
+        format!("{dir}/{key}")
+    }
+}
+
 /// Compute the body of the `_SUCCESS` marker for a given serialized manifest.
 ///
 /// Format: a single line `"xxh3:<16-hex>\n"`.  ADR-0012 M2 — `_SUCCESS`
