@@ -83,8 +83,9 @@ impl ExportTarget {
     }
 
     /// Resolve a whole table's worth of columns, one spec per column in order.
-    /// This is the dominant entry point (type-report, future plan-load).
-    #[allow(dead_code)] // public L4 entry point; consumed by plan-load (Phase B)
+    /// Consumed today by the type-report's recovery-SQL emission
+    /// (`preflight::type_report`); `plan-load` (ADR-0014 Phase B) would be a
+    /// second consumer.
     pub fn resolve_table(self, mappings: &[TypeMapping]) -> Vec<TargetColumnSpec> {
         mappings
             .iter()
