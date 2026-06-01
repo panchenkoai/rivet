@@ -96,16 +96,15 @@ pub(crate) fn write_part_file(
 ) -> Result<PartRecord> {
     let bytes = std::fs::metadata(tmp_path).map(|m| m.len()).unwrap_or(0);
     dest.write(tmp_path, &file_name)?;
-    let fingerprint = manifest_writer::compute_part_fingerprint(tmp_path).unwrap_or_else(|e| {
-        log::warn!("part fingerprint failed for '{file_name}' (not fatal): {e:#}");
-        "xxh3:0000000000000000".to_string()
-    });
-    // Base64 MD5 for no-download destination verification (GCS md5Hash).
-    // Non-fatal: an empty value degrades that part's check to size-only.
-    let md5 = manifest_writer::compute_part_md5(tmp_path).unwrap_or_else(|e| {
-        log::warn!("part md5 failed for '{file_name}' (not fatal): {e:#}");
-        String::new()
-    });
+    // Both body hashes in one read: xxh3 fingerprint (ADR-0012 M3) + base64 MD5
+    // (no-download destination verification, GCS md5Hash encoding).  Non-fatal —
+    // on failure the fingerprint falls back to the zero placeholder and the md5
+    // to empty (that part then verifies size-only).
+    let (fingerprint, md5) =
+        manifest_writer::compute_part_checksums(tmp_path).unwrap_or_else(|e| {
+            log::warn!("part checksums failed for '{file_name}' (not fatal): {e:#}");
+            ("xxh3:0000000000000000".to_string(), String::new())
+        });
     Ok(PartRecord {
         file_name,
         rows,

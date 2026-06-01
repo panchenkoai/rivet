@@ -136,21 +136,17 @@ pub fn reconcile_manifest_against_listing(
                 // Blob`; rivet one-shots small parts to get it, streams large
                 // ones), a local FS `None`, a legacy value — is not comparable,
                 // so the part degrades to size-only.
-                match meta.content_md5.as_deref().and_then(md5_digest_bytes) {
-                    Some(actual) => match md5_digest_bytes(&part.content_md5) {
-                        // Both sides comparable → content confirmed or refuted.
-                        Some(expected) if expected == actual => {
-                            PartPresence::Present { md5_verified: true }
-                        }
-                        Some(_) => PartPresence::ChecksumMismatch {
-                            expected: part.content_md5.clone(),
-                            actual: meta.content_md5.clone().unwrap_or_default(),
-                        },
-                        // Manifest carries no comparable MD5 → size-only.
-                        None => PartPresence::Present { md5_verified: false },
+                // Compare digests only when BOTH sides carry a parsable MD5;
+                // any absent/unparsable side → size-only.
+                let want = md5_digest_bytes(&part.content_md5);
+                let got = meta.content_md5.as_deref().and_then(md5_digest_bytes);
+                match (want, got) {
+                    (Some(a), Some(b)) if a == b => PartPresence::Present { md5_verified: true },
+                    (Some(_), Some(_)) => PartPresence::ChecksumMismatch {
+                        expected: part.content_md5.clone(),
+                        actual: meta.content_md5.clone().unwrap_or_default(),
                     },
-                    // Listing carries no MD5 → size-only.
-                    None => PartPresence::Present { md5_verified: false },
+                    _ => PartPresence::Present { md5_verified: false },
                 }
             }
             Some(meta) => PartPresence::SizeMismatch {

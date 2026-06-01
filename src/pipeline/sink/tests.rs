@@ -859,7 +859,7 @@ fn gremlin_zero_row_batch_does_not_panic_or_increment_rows() {
 
 #[test]
 fn pipelined_sink_output_is_byte_identical_to_synchronous() {
-    use crate::pipeline::manifest_writer::compute_part_fingerprint;
+    use crate::pipeline::manifest_writer::compute_part_checksums;
     use crate::source::BatchSink;
 
     let batches: Vec<RecordBatch> = (0..3).map(|_| make_int_batch(100, 4)).collect();
@@ -873,7 +873,7 @@ fn pipelined_sink_output_is_byte_identical_to_synchronous() {
     }
     let sync_writer = sync_sink.writer.take().unwrap();
     sync_writer.finish().unwrap();
-    let sync_fp = compute_part_fingerprint(sync_sink.tmp.path()).unwrap();
+    let sync_fp = compute_part_checksums(sync_sink.tmp.path()).unwrap().0;
     let sync_rows = sync_sink.total_rows;
 
     // Pipelined path through the worker thread.
@@ -885,7 +885,7 @@ fn pipelined_sink_output_is_byte_identical_to_synchronous() {
     let mut rec = p.finish().unwrap();
     let p_writer = rec.writer.take().unwrap();
     p_writer.finish().unwrap();
-    let p_fp = compute_part_fingerprint(rec.tmp.path()).unwrap();
+    let p_fp = compute_part_checksums(rec.tmp.path()).unwrap().0;
 
     assert_eq!(sync_rows, 300);
     assert_eq!(rec.total_rows, sync_rows, "row count must match");
