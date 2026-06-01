@@ -137,6 +137,10 @@ pub enum Failure {
     /// references it.  M9-adjacent: `--validate` only flags it; quarantine
     /// belongs to `--resume`.
     UntrackedObject { key: String, size_bytes: u64 },
+    /// The export declared `verify: content` but some parts could only be
+    /// size-verified (no comparable content checksum from the store) — the
+    /// declared integrity contract was not met.
+    ContentVerificationUnmet { size_only: usize, total: usize },
 }
 
 impl Failure {
@@ -212,6 +216,12 @@ impl std::fmt::Display for Failure {
             Failure::UntrackedObject { key, size_bytes } => {
                 write!(f, "untracked object: {} ({} bytes)", key, size_bytes)
             }
+            Failure::ContentVerificationUnmet { size_only, total } => write!(
+                f,
+                "verify: content not met — {size_only} of {total} part(s) only \
+                 size-verified (no store checksum); lower max_file_size so parts \
+                 upload as a single PUT, or the backend exposes no checksum"
+            ),
         }
     }
 }
@@ -241,6 +251,24 @@ impl ManifestVerification {
     /// call this once, rather than flipping `passed` by hand at every site.
     fn recompute_passed(&mut self) {
         self.passed = self.manifest_found && !self.failures.iter().any(Failure::is_fatal);
+    }
+
+    /// Apply the export's `verify` policy (ADR-0013 / review D).  When content
+    /// verification is required but some parts were only size-verified, record
+    /// a fatal [`Failure::ContentVerificationUnmet`] and re-derive `passed`.
+    /// Policy lives here (one place); the composers — run finalize and the
+    /// `rivet validate` command — just call it with their export's intent.
+    pub fn enforce_content_policy(&mut self, require_content: bool) {
+        if require_content && self.manifest_found {
+            let size_only = self.parts_verified.saturating_sub(self.parts_md5_verified);
+            if size_only > 0 {
+                self.failures.push(Failure::ContentVerificationUnmet {
+                    size_only,
+                    total: self.parts_verified,
+                });
+                self.recompute_passed();
+            }
+        }
     }
 
     /// Construct the M6 (legacy run) verdict for a destination that has no
@@ -999,5 +1027,44 @@ mod tests {
         let mut legacy = ManifestVerification::empty();
         legacy.recompute_passed();
         assert!(!legacy.passed, "no manifest found → cannot certify");
+    }
+
+    #[test]
+    fn verify_content_policy_fails_only_size_only_parts() {
+        // 3 parts, 2 content-checked, 1 size-only.
+        let base = ManifestVerification {
+            manifest_found: true,
+            parts_verified: 3,
+            parts_md5_verified: 2,
+            ..ManifestVerification::empty()
+        };
+        // verify: size → size-only is acceptable, passes.
+        let mut sz = base.clone();
+        sz.recompute_passed();
+        sz.enforce_content_policy(false);
+        assert!(sz.passed, "size-only OK under verify: size");
+
+        // verify: content → the 1 size-only part is a fatal failure.
+        let mut ct = base.clone();
+        ct.recompute_passed();
+        ct.enforce_content_policy(true);
+        assert!(!ct.passed, "a size-only part fails verify: content");
+        assert!(
+            ct.failures.iter().any(|f| matches!(
+                f,
+                Failure::ContentVerificationUnmet { size_only: 1, total: 3 }
+            )),
+            "expected ContentVerificationUnmet, got: {:?}",
+            ct.failures
+        );
+
+        // verify: content with every part md5-checked → satisfied.
+        let mut all = ManifestVerification {
+            parts_md5_verified: 3,
+            ..base
+        };
+        all.recompute_passed();
+        all.enforce_content_policy(true);
+        assert!(all.passed && all.failures.is_empty(), "all md5 meets verify: content");
     }
 }

@@ -532,6 +532,11 @@
         "destination": {
           "$ref": "#/$defs/DestinationConfig"
         },
+        "verify": {
+          "description": "Integrity depth required of `--validate` for this export's parts.\n`size` (default) accepts size-only verification; `content` requires every\npart's content MD5 to be checked against the store's listing (no\ndownload) and **fails** validation for any part that could only be\nsize-verified — e.g. a part too large to upload as a single PUT (raise\n`max_file_size` down so it fits), or a backend that exposes no checksum.",
+          "$ref": "#/$defs/VerifyMode",
+          "default": "size"
+        },
         "meta_columns": {
           "$ref": "#/$defs/MetaColumns",
           "default": {
@@ -808,6 +813,21 @@
         "stdout"
       ]
     },
+    "VerifyMode": {
+      "description": "What to do when structural schema drift is detected (column added, removed, or retyped).\n\n```yaml\nexports:\n  - name: orders\n    on_schema_drift: fail   # warn (default), continue, fail\n```\nHow deep `--validate` must verify each part's integrity.",
+      "oneOf": [
+        {
+          "description": "Accept size-only verification when no content checksum is available.",
+          "type": "string",
+          "const": "size"
+        },
+        {
+          "description": "Require every part's content to be MD5-verified against the store's\nlisting; fail validation for any part that is only size-verified.",
+          "type": "string",
+          "const": "content"
+        }
+      ]
+    },
     "MetaColumns": {
       "type": "object",
       "properties": {
@@ -869,7 +889,6 @@
       "additionalProperties": false
     },
     "SchemaDriftPolicy": {
-      "description": "What to do when structural schema drift is detected (column added, removed, or retyped).\n\n```yaml\nexports:\n  - name: orders\n    on_schema_drift: fail   # warn (default), continue, fail\n```",
       "oneOf": [
         {
           "description": "Log a warning and continue. The new schema fingerprint is stored. (Default.)",

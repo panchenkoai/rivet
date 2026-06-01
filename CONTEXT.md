@@ -94,6 +94,16 @@ threshold (`cloud.rs`) is what makes Azure md5 work for small parts. Encodings a
 to raw digest bytes (`md5_digest_bytes`) so base64 and hex of the same digest
 compare equal. _Avoid_: checksum, hash (use for the xxh3 `content_fingerprint`).
 
+**Verify mode**:
+The integrity depth an export declares it requires (`exports[].verify`): `size`
+(default — accept size-only) or `content` (every part must be content-MD5
+verified). `content` turns a size-only part into a fatal verdict failure
+(`ContentVerificationUnmet`), so the operator gets a loud, actionable error
+(lower `max_file_size` so parts upload as a single PUT) instead of a silent
+size-only cliff. Enforced once via `enforce_content_policy`, called by both the
+run `--validate` finalize and the `rivet validate` command. _Avoid_: validate
+level, deep (that meant re-download, which we never do).
+
 **Verdict coverage**:
 How much a `--validate` pass actually certified, carried by the `ManifestVerification`
 counters rather than a label: `parts_verified` with `parts_md5_verified` as the

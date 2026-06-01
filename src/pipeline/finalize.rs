@@ -264,12 +264,15 @@ pub(super) fn finalize_validate_manifest(
     }
 
     match verify_at_destination(&*dest, "") {
-        Ok(v) => {
+        Ok(mut v) => {
+            // Apply the export's `verify` policy: `content` turns size-only
+            // parts into a fatal failure (review D).
+            v.enforce_content_policy(plan.verify.requires_content());
             // Compose the file-row check (already on summary.validated) with
-            // the manifest-aware verdict.  Legacy runs (M6) keep their existing
-            // row-count verdict — manifest verification only DOWNgrades when
-            // it has explicit failures.
-            if v.has_failures() && summary.validated == Some(true) {
+            // the manifest-aware verdict.  Downgrade on a *fatal* verdict
+            // (`!passed`) — advisory failures (untracked surplus) don't fail
+            // the run; legacy runs (M6) keep their row-count verdict.
+            if !v.passed && v.manifest_found && summary.validated == Some(true) {
                 summary.validated = Some(false);
             }
             log::info!(

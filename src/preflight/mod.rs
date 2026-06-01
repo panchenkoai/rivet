@@ -267,6 +267,7 @@ mod tests {
         ExportConfig {
             name: name.to_string(),
             target: None,
+            verify: crate::config::VerifyMode::Size,
             query: Some("SELECT * FROM t".to_string()),
             query_file: None,
             table: None,

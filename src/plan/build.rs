@@ -115,6 +115,7 @@ pub fn build_plan(
         validate,
         reconcile,
         resume,
+        verify: export.verify,
         source: config.source.clone(),
         column_overrides: parse_column_overrides(&export.columns, &export.name)?,
         schema_drift_policy: export.on_schema_drift,
@@ -495,6 +496,7 @@ mod tests {
         ExportConfig {
             name: "test_export".into(),
             target: None,
+            verify: crate::config::VerifyMode::Size,
             query: Some("SELECT 1".into()),
             query_file: None,
             table: None,
