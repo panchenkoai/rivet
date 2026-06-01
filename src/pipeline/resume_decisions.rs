@@ -145,7 +145,7 @@ pub fn build_resume_plan(manifest: &RunManifest, listing: &[ObjectMeta]) -> Resu
         // compare is `--validate --deep`, deliberately not paid on the hot
         // resume path).  Missing → re-export; size drift → quarantine + rewrite.
         let decision = match check.presence {
-            PartPresence::Present => ResumeDecision::Skip,
+            PartPresence::Present { .. } => ResumeDecision::Skip,
             PartPresence::Missing => ResumeDecision::Rewrite,
             PartPresence::SizeMismatch { .. } => ResumeDecision::Quarantine {
                 reason: QuarantineReason::SizeMismatch,

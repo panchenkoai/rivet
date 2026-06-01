@@ -254,8 +254,11 @@ fn render_pretty(results: &[ExportVerdict], hard_failures: &[String]) {
         );
         let _ = writeln!(
             h,
-            "  parts:     {} verified, {} failed",
-            v.parts_verified, v.parts_failed
+            "  parts:     {} verified ({} md5, {} size-only), {} failed",
+            v.parts_verified,
+            v.parts_md5_verified,
+            v.parts_verified.saturating_sub(v.parts_md5_verified),
+            v.parts_failed
         );
         let _ = writeln!(
             h,

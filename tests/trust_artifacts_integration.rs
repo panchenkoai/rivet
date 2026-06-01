@@ -1915,6 +1915,7 @@ fn validation_outcome_in_summary_json_carries_manifest_subobject_when_set() {
         manifest_found: true,
         legacy_run: false,
         parts_verified: 3,
+        parts_md5_verified: 3,
         parts_failed: 0,
         success_marker_consistent: true,
         manifest_self_consistent: true,

@@ -59,6 +59,12 @@ pub struct ManifestVerification {
     /// Manifest parts whose presence and recorded `size_bytes` were
     /// confirmed at the destination.  0 when no manifest was found.
     pub parts_verified: usize,
+    /// Subset of `parts_verified` whose **content** was confirmed via an MD5
+    /// the store surfaced in its listing (no download) — the rest are size-only.
+    /// Lets `passed: true` say how much of the dataset was content-checked
+    /// rather than implying all of it was.  `#[serde(default)]` for back-compat.
+    #[serde(default)]
+    pub parts_md5_verified: usize,
     /// Manifest parts that were declared `committed` but not actually
     /// present, present at a different size, or otherwise mismatched.
     pub parts_failed: usize,
@@ -226,21 +232,32 @@ impl ManifestVerification {
     /// Construct the M6 (legacy run) verdict for a destination that has no
     /// manifest at all.  Caller composes this with the existing per-file
     /// row-count check; together they form the legacy `--validate` result.
-    pub fn legacy() -> Self {
+    /// Base verdict: nothing checked yet (no manifest, all counts zero, all
+    /// sub-checks false, `passed = false`).  Every constructor builds on this
+    /// and overrides only what differs, so a new field lands in **one** place
+    /// rather than three near-identical literals.
+    fn empty() -> Self {
         Self {
             manifest_found: false,
-            legacy_run: true,
+            legacy_run: false,
             parts_verified: 0,
+            parts_md5_verified: 0,
             parts_failed: 0,
             success_marker_consistent: false,
             manifest_self_consistent: false,
-            // `passed = false` here is intentional — it does NOT mean
-            // "validation failed", it means "this verifier cannot certify".
-            // The caller layers per-file row counts on top and composes
-            // a final verdict for the report.
             passed: false,
             failures: Vec::new(),
             level: IntegrityLevel::Structural,
+        }
+    }
+
+    pub fn legacy() -> Self {
+        // `passed = false` is intentional — not "validation failed" but "this
+        // verifier cannot certify"; the caller layers per-file row counts on
+        // top and composes the final verdict.
+        Self {
+            legacy_run: true,
+            ..Self::empty()
         }
     }
 
@@ -315,30 +332,21 @@ pub fn verify_at_destination(
             // explicit on the wire.
             return Ok(ManifestVerification {
                 manifest_found: true,
-                legacy_run: false,
-                parts_verified: 0,
-                parts_failed: 0,
-                success_marker_consistent: false,
-                manifest_self_consistent: false,
-                passed: false,
                 failures: vec![Failure::ManifestSelfInconsistent {
                     detail: format!("manifest.json parse failed: {e}"),
                 }],
-                level: IntegrityLevel::Structural,
+                ..ManifestVerification::empty()
             });
         }
     };
 
+    // Optimistic base: a found, self-consistent manifest that passes until a
+    // check below flips it.  Overrides only what differs from `empty()`.
     let mut out = ManifestVerification {
         manifest_found: true,
-        legacy_run: false,
-        parts_verified: 0,
-        parts_failed: 0,
-        success_marker_consistent: false,
         manifest_self_consistent: true,
         passed: true,
-        failures: Vec::new(),
-        level: IntegrityLevel::Structural,
+        ..ManifestVerification::empty()
     };
 
     // ── 2. Self-consistency ─────────────────────────────────────────────
@@ -385,7 +393,12 @@ pub fn verify_at_destination(
     if let Some(rec) = &reconciliation {
         for check in &rec.per_part {
             match &check.presence {
-                PartPresence::Present => out.parts_verified += 1,
+                PartPresence::Present { md5_verified } => {
+                    out.parts_verified += 1;
+                    if *md5_verified {
+                        out.parts_md5_verified += 1;
+                    }
+                }
                 PartPresence::SizeMismatch { expected, actual } => {
                     out.parts_failed += 1;
                     out.passed = false;
