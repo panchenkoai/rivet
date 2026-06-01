@@ -170,8 +170,18 @@ pub fn check(
                     .as_deref()
                     .and_then(crate::types::target::ExportTarget::parse)
             });
-            match type_report::collect_report(&config, export, &column_overrides, &policy, eff_target)
-            {
+            let config_dir = std::path::Path::new(config_path)
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
+            match type_report::collect_report(
+                &config,
+                export,
+                &column_overrides,
+                &policy,
+                eff_target,
+                config_dir,
+                params,
+            ) {
                 Ok(report) => {
                     if report.has_fatal() {
                         any_fatal = true;

@@ -85,6 +85,20 @@ impl ExportTarget {
             .map(|m| self.resolve_column(TargetInput::from(m)))
             .collect()
     }
+
+    /// SQL that recovers target-native types after a bare autoload degraded
+    /// them (ADR-0014 L5). For BigQuery this is a `CREATE TABLE … AS SELECT`
+    /// over the autoloaded staging table applying per-column casts — BigQuery's
+    /// Parquet loader will NOT coerce a *declared* native type on load (verified
+    /// against live BQ: BYTES→JSON, TIMESTAMP→DATETIME loads are rejected), so
+    /// the recovery has to be a post-load transform, not a load schema. `None`
+    /// when the target reads the interchange Parquet faithfully (DuckDB).
+    pub fn recovery_sql(self, specs: &[TargetColumnSpec], table: &str) -> Option<String> {
+        match self {
+            ExportTarget::BigQuery => Some(bigquery_recovery_sql(specs, table)),
+            ExportTarget::DuckDb => None,
+        }
+    }
 }
 
 /// Status of a column's resolution against a specific target.
@@ -229,6 +243,33 @@ fn unsupported_reason(t: &RivetType) -> String {
     }
 }
 
+/// Emit a BigQuery type-recovery statement (ADR-0014 L5): load the interchange
+/// Parquet with `--autodetect` into `<table>__staging`, then run this CTAS to
+/// materialise the native types that bare autoload degrades (JSON/UUID→BYTES,
+/// naive timestamp→TIMESTAMP). Columns with a `cast_sql` get that cast; the
+/// rest pass through unchanged.
+///
+/// Verified against live BigQuery: a load schema that *declares* native types
+/// is rejected (the Parquet loader won't coerce a column's type on load), so
+/// the recovery must be this post-load transform.
+fn bigquery_recovery_sql(specs: &[TargetColumnSpec], table: &str) -> String {
+    let cols: Vec<String> = specs
+        .iter()
+        .map(|s| match &s.cast_sql {
+            Some(cast) => format!("  {cast} AS {name}", name = s.column_name),
+            None => format!("  {name}", name = s.column_name),
+        })
+        .collect();
+    format!(
+        "-- 1) bq load --autodetect --source_format=PARQUET {table}__staging <parquet>\n\
+         -- 2) recover native types:\n\
+         CREATE OR REPLACE TABLE `{table}` AS\n\
+         SELECT\n{cols}\n\
+         FROM `{table}__staging`;",
+        cols = cols.join(",\n")
+    )
+}
+
 // ── BigQuery ─────────────────────────────────────────────────────────────────
 
 mod bigquery {
@@ -249,16 +290,15 @@ mod bigquery {
         match t {
             RivetType::Bool => Resolved::ok("BOOL"),
             RivetType::Int16 | RivetType::Int32 | RivetType::Int64 => Resolved::ok("INT64"),
-            // u64 > 2^63-1 cannot ride as INT64; recommend NUMERIC, but a bare
-            // Parquet UINT64 autoloads as INT64 and overflows.
-            // No post-load cast: once a u64 > INT64_MAX autoloads as INT64 it
-            // has already overflowed, so recovery is only possible by declaring
-            // NUMERIC in the load schema (L5), not a SELECT-time cast.
+            // u64 > i64::MAX overflows the INT64 autoload and cannot be
+            // recovered post-load (the bits are already wrong). The only fix is
+            // source-side: map the column to decimal(20,0) with a column
+            // override so it rides as Parquet DECIMAL → BigQuery NUMERIC.
             RivetType::UInt64 => Resolved::diverge(
                 "NUMERIC",
                 "INT64",
-                "UINT64 has no BigQuery type; values > INT64_MAX overflow on INT64 autoload — \
-                 declare NUMERIC in the load schema",
+                "UINT64 > INT64_MAX overflows the INT64 autoload and cannot be recovered after \
+                 load — map the column to decimal(20,0) with a source column override",
                 None,
             ),
             RivetType::Float32 | RivetType::Float64 => Resolved::ok("FLOAT64"),
@@ -271,13 +311,13 @@ mod bigquery {
             } => Resolved::ok("TIMESTAMP"),
             // naive timestamp → wall-clock → DATETIME, but BigQuery autoload
             // ignores Parquet isAdjustedToUTC=false and yields TIMESTAMP
-            // (verified). Declare DATETIME to preserve wall-clock semantics.
+            // (verified). `DATETIME(ts)` recovers the wall-clock after load.
             RivetType::Timestamp { timezone: None, .. } => Resolved::diverge(
                 "DATETIME",
                 "TIMESTAMP",
-                "naive timestamp autoloads as TIMESTAMP (an instant); declare DATETIME in the \
-                 load schema to keep wall-clock semantics",
-                None,
+                "naive timestamp autoloads as TIMESTAMP (an instant); recover wall-clock with \
+                 DATETIME(col) after load",
+                Some("DATETIME({col})"),
             ),
             RivetType::String | RivetType::Text | RivetType::Enum => Resolved::ok("STRING"),
             RivetType::Binary => Resolved::ok("BYTES"),
@@ -286,8 +326,8 @@ mod bigquery {
             RivetType::Json => Resolved::diverge(
                 "JSON",
                 "BYTES",
-                "Parquet JSON logical type autoloads as BYTES in BigQuery; declare JSON in the \
-                 load schema",
+                "Parquet JSON logical type autoloads as BYTES in BigQuery; recover native JSON \
+                 with PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING(col)) after load",
                 Some("PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING({col}))"),
             ),
             // UUID rides as FixedSizeBinary(16) + UUIDType; BigQuery has no UUID
@@ -296,8 +336,8 @@ mod bigquery {
             RivetType::Uuid => Resolved::diverge(
                 "STRING",
                 "BYTES",
-                "UUID autoloads as 16-byte BYTES in BigQuery; declare STRING and format, \
-                 or keep BYTES",
+                "UUID autoloads as 16-byte BYTES in BigQuery; recover hex text with TO_HEX(col) \
+                 after load (or keep BYTES)",
                 Some("TO_HEX({col})"),
             ),
             RivetType::Interval => Resolved::ok("STRING"),
@@ -329,13 +369,14 @@ mod bigquery {
         if inner_r.status == TargetStatus::Fail {
             return Resolved::fail(format!("REPEATED of unsupported element: {}", inner_r.target_type));
         }
-        // Arrow 3-level lists autoload as REPEATED RECORD{item ...} in BigQuery
-        // (verified); declare REPEATED <element> in the load schema for a clean
-        // array.
+        // Arrow 3-level lists autoload as a nested RECORD in BigQuery (verified);
+        // recover a clean REPEATED column with an UNNEST after load. The exact
+        // path depends on the loader's list nesting, so no auto cast is emitted.
         Resolved::diverge(
             format!("REPEATED {}", inner_r.target_type),
             format!("REPEATED RECORD{{item {}}}", inner_r.autoload_type),
-            "arrays autoload as REPEATED RECORD{item …}; declare REPEATED <type> in the load schema",
+            "arrays autoload as a nested RECORD; recover REPEATED with \
+             ARRAY(SELECT item FROM UNNEST(col)) after load",
             None,
         )
     }
@@ -604,42 +645,40 @@ mod tests {
     #[test]
     fn cast_sql_is_none_when_post_load_recovery_is_impossible() {
         // UINT64 > INT64_MAX has already overflowed by the time it autoloads as
-        // INT64; a SELECT-time cast would operate on corrupted data. Recovery is
-        // load-schema only — cast_sql MUST be None and the note point at it.
+        // INT64; a SELECT-time cast would operate on corrupted bits. The only
+        // fix is source-side (a decimal override) — cast_sql MUST be None and
+        // the note must point there, not promise a post-load cast.
         let u = bq(&RivetType::UInt64);
         assert!(
             u.cast_sql.is_none(),
             "overflowed UINT64 has no lossless post-load recovery"
         );
-        assert!(u.note.unwrap().to_lowercase().contains("load schema"));
-
-        // A naive timestamp loses its wall-clock identity at autoload (becomes an
-        // instant); the micros are reinterpreted, not recoverable by a cast.
-        let naive = RivetType::Timestamp {
-            unit: super::super::TimeUnit::Microsecond,
-            timezone: None,
-        };
-        let t = bq(&naive);
+        let note = u.note.unwrap().to_lowercase();
         assert!(
-            t.cast_sql.is_none(),
-            "naive timestamp has no lossless post-load recovery"
+            note.contains("override"),
+            "UINT64 note must point to the source-side override, got: {note}"
         );
-        assert!(t.note.unwrap().to_lowercase().contains("load schema"));
     }
 
     #[test]
     fn cast_sql_present_only_when_lossless_post_load() {
-        // JSON/UUID autoload as BYTES but the bytes still hold the value
-        // losslessly, so a post-load cast genuinely recovers it.
+        // JSON/UUID/naive-timestamp autoload to a degraded type but still hold
+        // the value losslessly, so a post-load cast genuinely recovers it.
         assert!(bq(&RivetType::Json).cast_sql.unwrap().contains("PARSE_JSON"));
         assert!(bq(&RivetType::Uuid).cast_sql.unwrap().contains("TO_HEX"));
+        let naive = RivetType::Timestamp {
+            unit: super::super::TimeUnit::Microsecond,
+            timezone: None,
+        };
+        assert!(bq(&naive).cast_sql.unwrap().contains("DATETIME"));
     }
 
     #[test]
     fn every_divergence_offers_a_recovery_path() {
         // Invariant: whenever BigQuery autoload diverges from the native type the
-        // operator is given SOME recovery — a lossless post-load `cast_sql`, or a
-        // note pointing at the load schema. Never a silent no-op (the bug class).
+        // operator gets SOME recovery — a lossless post-load `cast_sql`, or a
+        // note describing the fix (post-load transform, or a source override).
+        // Never a silent no-op (the bug class).
         let naive = RivetType::Timestamp {
             unit: super::super::TimeUnit::Microsecond,
             timezone: None,
@@ -657,14 +696,11 @@ mod tests {
             let s = bq(&rt);
             assert_ne!(s.autoload_type, s.target_type, "case must diverge: {rt:?}");
             let has_cast = s.cast_sql.is_some();
-            let points_to_load_schema = s
-                .note
-                .as_deref()
-                .map(|n| n.to_lowercase().contains("load schema"))
-                .unwrap_or(false);
+            let note = s.note.as_deref().unwrap_or("").to_lowercase();
+            let describes_recovery = note.contains("after load") || note.contains("override");
             assert!(
-                has_cast || points_to_load_schema,
-                "divergent {rt:?} must offer a recovery (cast_sql or load-schema note)"
+                has_cast || describes_recovery,
+                "divergent {rt:?} must offer a recovery (cast_sql or a recovery note)"
             );
         }
     }
@@ -699,5 +735,52 @@ mod tests {
     fn duckdb_decimal_over_38_warns_not_silently_clamps() {
         let s = duck(&RivetType::Decimal { precision: 40, scale: 2 });
         assert_eq!(s.status, TargetStatus::Warn);
+    }
+
+    // ── L5 recovery SQL (the post-load transform for BigQuery autoload) ───────
+
+    #[test]
+    fn bq_recovery_sql_casts_native_types() {
+        use super::super::{SourceColumn, TimeUnit};
+        let naive = RivetType::Timestamp {
+            unit: TimeUnit::Microsecond,
+            timezone: None,
+        };
+        let mappings = vec![
+            TypeMapping::from_source(&SourceColumn::simple("id", "int8", true), RivetType::Int64),
+            TypeMapping::from_source(&SourceColumn::simple("attrs", "jsonb", true), RivetType::Json),
+            TypeMapping::from_source(&SourceColumn::simple("uid", "uuid", true), RivetType::Uuid),
+            TypeMapping::from_source(
+                &SourceColumn::simple("created_at", "timestamp", true),
+                naive,
+            ),
+        ];
+        let specs = ExportTarget::BigQuery.resolve_table(&mappings);
+        let sql = ExportTarget::BigQuery
+            .recovery_sql(&specs, "payments")
+            .expect("BigQuery has a recovery SQL");
+        // The post-load casts that actually recover native types (verified live
+        // against BigQuery — a declared-type load is rejected, a cast is not).
+        assert!(sql.contains("PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING(attrs)) AS attrs"));
+        assert!(sql.contains("TO_HEX(uid) AS uid"));
+        assert!(sql.contains("DATETIME(created_at) AS created_at"));
+        // OK columns pass through unchanged.
+        assert!(sql.contains("SELECT\n  id"));
+        // Reads the autoload staging table, writes the recovered table.
+        assert!(sql.contains("CREATE OR REPLACE TABLE `payments`"));
+        assert!(sql.contains("FROM `payments__staging`"));
+    }
+
+    #[test]
+    fn duckdb_needs_no_recovery() {
+        let mappings = vec![TypeMapping::from_source(
+            &super::super::SourceColumn::simple("attrs", "json", true),
+            RivetType::Json,
+        )];
+        let specs = ExportTarget::DuckDb.resolve_table(&mappings);
+        assert!(
+            ExportTarget::DuckDb.recovery_sql(&specs, "t").is_none(),
+            "DuckDB autoloads every logical type natively — no recovery needed"
+        );
     }
 }

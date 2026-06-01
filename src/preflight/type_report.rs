@@ -51,6 +51,12 @@ pub struct ExportTypeReport {
     /// True when any column failed target-compatibility.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub target_failures: bool,
+    /// Target-native recovery SQL (ADR-0014 L5): a post-load transform that
+    /// recovers types bare autoload degrades (BigQuery JSON/UUID/DATETIME).
+    /// `None` for targets that autoload faithfully (DuckDB) or when no target
+    /// is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_sql: Option<String>,
 }
 
 impl ExportTypeReport {
@@ -70,14 +76,15 @@ pub fn collect_report(
     column_overrides: &ColumnOverrides,
     policy: &TypePolicy,
     target: Option<ExportTarget>,
+    config_dir: &std::path::Path,
+    params: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<ExportTypeReport> {
     let url = config.source.resolve_url()?;
     let tls = config.source.tls.as_ref();
-    let query = export
-        .query
-        .as_deref()
-        .or(export.query_file.as_deref())
-        .unwrap_or("");
+    // Resolve the effective query the same way the export pipeline does, so the
+    // `table:` shortcut (and `query_file:` / `${var}` params) produce a real
+    // query instead of an empty string.
+    let query = export.resolve_query(config_dir, params)?;
 
     let mut src: Box<dyn source::Source> = match config.source.source_type {
         SourceType::Postgres => Box::new(source::postgres::PostgresSource::connect_with_tls(
@@ -86,7 +93,7 @@ pub fn collect_report(
         SourceType::Mysql => Box::new(source::mysql::MysqlSource::connect_with_tls(&url, tls)?),
     };
 
-    let mappings = src.type_mappings(query, column_overrides)?;
+    let mappings = src.type_mappings(&query, column_overrides)?;
     let violations = policy.validate(&mappings);
 
     let mut target_failures = false;
@@ -133,11 +140,18 @@ pub fn collect_report(
         })
         .collect();
 
+    // L5 recovery SQL (ADR-0014): a post-load transform for operators whose
+    // bare autoload would degrade types. `None` for DuckDB (faithful autoload)
+    // or when no target is set.
+    let recovery_sql =
+        target.and_then(|t| t.recovery_sql(&t.resolve_table(&mappings), &export.name));
+
     Ok(ExportTypeReport {
         export: export.name.clone(),
         columns: rows,
         violations,
         target_failures,
+        recovery_sql,
     })
 }
 
@@ -241,6 +255,18 @@ pub fn print_table(report: &ExportTypeReport, target: Option<ExportTarget>) {
         for v in &report.violations {
             let prefix = if v.fatal { "  FAIL" } else { "  WARN" };
             println!("{}: {}", prefix, v.message);
+        }
+    }
+
+    if let Some(sql) = &report.recovery_sql {
+        println!();
+        println!(
+            "  {} type recovery — bare autoload degrades JSON/UUID→BYTES, naive",
+            target.map(|t| t.label()).unwrap_or("target")
+        );
+        println!("  timestamp→TIMESTAMP, array→RECORD; load with --autodetect then run:");
+        for line in sql.lines() {
+            println!("    {line}");
         }
     }
 }
