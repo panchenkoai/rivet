@@ -28,6 +28,11 @@ path = "src/bin/seed/main.rs"
 
 [dependencies]
 anyhow = "1"
+# Part-body MD5 (RustCrypto) + base64 to match GCS's `md5Hash` encoding, so
+# integrity can be verified against the object's listing metadata with no
+# download (both already in the tree transitively).
+base64 = "0.22"
+md-5 = "0.10"
 # `canonical_extension_types` enables Arrow's canonical extension wrappers
 # (`arrow_schema::extension::{Uuid, Json}`) — see Cargo dep on `parquet`
 # below for the writer-side pairing.

@@ -71,6 +71,12 @@ pub struct ObjectMeta {
     /// the same shape `Destination::write`'s `remote_key` argument uses.
     pub key: String,
     pub size_bytes: u64,
+    /// Base64 MD5 of the object body when the backend exposes it in listing /
+    /// stat metadata (GCS `md5Hash`, S3/Azure equivalents), else `None`.
+    /// Lets verification compare content against `manifest.parts[].content_md5`
+    /// with no download.  `None` for local FS and for composite/multipart
+    /// objects a store leaves without an MD5 — the check degrades to size-only.
+    pub content_md5: Option<String>,
 }
 
 /// Object-safe surface for upload backends. `Send + Sync` so a single `Arc` can be shared

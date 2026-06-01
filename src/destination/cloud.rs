@@ -178,6 +178,7 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
             out.push(super::ObjectMeta {
                 key: rel,
                 size_bytes: entry.metadata().content_length(),
+                content_md5: entry.metadata().content_md5().map(str::to_string),
             });
         }
         Ok(out)
@@ -198,6 +199,7 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
             Ok(meta) => Ok(Some(super::ObjectMeta {
                 key: key.to_string(),
                 size_bytes: meta.content_length(),
+                content_md5: meta.content_md5().map(str::to_string),
             })),
             Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),

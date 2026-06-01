@@ -73,17 +73,27 @@ _Avoid_: loading, ingestion.
 
 **Manifest reconciliation**:
 The single pure walk that compares a `RunManifest` against a destination
-listing — per committed part `Present` / `Missing` / `SizeMismatch`, plus
-untracked surplus (`reconcile_manifest_against_listing`). Size-only by
-construction: a listing yields `{key, size_bytes}`, so size is the strongest
-signal without fetching the object. Both consumers are thin mappers — destination
-verify (`Presence → Failure`) and chunked resume (`Presence → ResumeDecision`).
-_Avoid_: diff, compare, validate (overloaded).
+listing — per committed part `Present` / `Missing` / `SizeMismatch` /
+`ChecksumMismatch`, plus untracked surplus (`reconcile_manifest_against_listing`).
+The listing yields `{key, size_bytes, content_md5}`; when both the manifest and
+the listing carry an MD5 the content is verified too — with **no download**,
+since GCS/S3 surface the digest in the listing. Both consumers are thin
+mappers — destination verify (`Presence → Failure`) and chunked resume
+(`Presence → ResumeDecision`). _Avoid_: diff, compare, validate (overloaded).
+
+**Content MD5**:
+The part-body MD5 rivet computes locally before upload and records in the
+manifest (base64, GCS `md5Hash` encoding). Destination verification compares it
+to the object's listing metadata to confirm content without downloading. Stores
+encode it differently — GCS base64, S3 single-part ETag hex — so both sides are
+normalised to raw digest bytes (`md5_digest_bytes`) before comparing; an S3
+multipart composite ETag (`<hash>-<N>`) is not a plain MD5 and degrades the part
+to size-only. _Avoid_: checksum, hash (use for the xxh3 `content_fingerprint`).
 
 **Integrity level**:
-How deep an integrity verdict went — the strongest assertion it makes.
-`Structural` = presence + size at the destination + manifest self-consistency,
-with rows already checked at export against the local file; content is not
-re-read. `Rows` / `Fingerprint` (re-download, `--validate --deep`) are reserved.
-Makes `passed: true` say *what* it certified, not just *that* it did.
-_Avoid_: validation depth, check level.
+The strongest assertion a verdict makes. `Structural` = presence + size +
+manifest self-consistency + the **content MD5 match when the store provides one
+in its listing** (no download); rows are already checked at export against the
+local file. There is deliberately no re-download level — content is verified
+pre-upload and via free listing metadata, never by pulling bytes back. Makes
+`passed: true` say *what* it certified. _Avoid_: validation depth, check level.

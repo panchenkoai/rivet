@@ -172,6 +172,14 @@ pub struct ManifestPart {
     /// `"xxh3:<16-hex>"`.  Algorithm prefix MUST be checked before interpreting
     /// the hex body (sha256/blake3 reserved for future hashers).
     pub content_fingerprint: String,
+    /// Base64 MD5 of the part body, in GCS's `md5Hash` encoding — lets
+    /// destination verification compare against the object's listing metadata
+    /// with **no download** (GCS/S3/Azure surface this; the comparison rides
+    /// the listing `--validate` already does).  Empty for legacy manifests and
+    /// for parts whose MD5 could not be computed; the check then degrades to
+    /// size-only.  `#[serde(default)]` keeps pre-0.7.x manifests parseable.
+    #[serde(default)]
+    pub content_md5: String,
     pub status: PartStatus,
 }
 
@@ -286,6 +294,7 @@ mod tests {
             rows,
             size_bytes: size,
             content_fingerprint: format!("xxh3:{:016x}", id as u64),
+            content_md5: String::new(),
             status: PartStatus::Committed,
         }
     }

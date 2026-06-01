@@ -107,6 +107,7 @@ impl ManifestBuilder {
         rows: i64,
         size_bytes: u64,
         content_fingerprint: String,
+        content_md5: String,
     ) {
         self.parts.push(ManifestPart {
             part_id,
@@ -114,6 +115,7 @@ impl ManifestBuilder {
             rows,
             size_bytes,
             content_fingerprint,
+            content_md5,
             status: PartStatus::Committed,
         });
     }
@@ -180,6 +182,27 @@ pub fn compute_part_fingerprint(path: &Path) -> Result<String> {
     Ok(format!("xxh3:{:016x}", h.digest()))
 }
 
+/// Compute the base64 MD5 of a local file in GCS's `md5Hash` encoding.
+///
+/// Streamed in 64 KiB chunks like [`compute_part_fingerprint`].  The result is
+/// directly comparable to the `content_md5` a GCS/S3/Azure listing returns, so
+/// destination verification can confirm part content with no download.
+pub fn compute_part_md5(path: &Path) -> Result<String> {
+    use base64::Engine as _;
+    use md5::{Digest, Md5};
+    let mut f = std::fs::File::open(path)?;
+    let mut h = Md5::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(base64::engine::general_purpose::STANDARD.encode(h.finalize()))
+}
+
 /// Capture the run's schema fingerprint on the summary.
 ///
 /// Computed from the dest-facing Arrow schema (the one downstream consumers
@@ -218,6 +241,7 @@ pub fn record_committed_part_with_fingerprint(
     rows: i64,
     size_bytes: u64,
     content_fingerprint: String,
+    content_md5: String,
 ) {
     // ADR-0012 M4: part_id must be unique within the manifest.  Before the
     // M8 resume-hydration work, `summary.manifest_parts.len() + 1` was a
@@ -240,6 +264,7 @@ pub fn record_committed_part_with_fingerprint(
         rows,
         size_bytes,
         content_fingerprint,
+        content_md5,
         status: PartStatus::Committed,
     });
 }
@@ -361,6 +386,7 @@ mod tests {
             50_000,
             4096,
             "xxh3:aaaaaaaaaaaaaaaa".into(),
+            String::new(),
         );
         b.record_part(
             2,
@@ -368,6 +394,7 @@ mod tests {
             25_000,
             2048,
             "xxh3:bbbbbbbbbbbbbbbb".into(),
+            String::new(),
         );
 
         let m = b.finalize(ManifestStatus::Success);
@@ -488,6 +515,7 @@ mod tests {
             100,
             4096,
             "xxh3:1111111111111111".into(),
+            String::new(),
         );
         b.record_part(
             2,
@@ -495,6 +523,7 @@ mod tests {
             200,
             8192,
             "xxh3:2222222222222222".into(),
+            String::new(),
         );
         b.finalize(status)
     }

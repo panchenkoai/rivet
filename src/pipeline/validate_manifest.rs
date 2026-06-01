@@ -89,19 +89,20 @@ pub struct ManifestVerification {
 
 /// How deep an integrity verdict went — the strongest assertion it makes.
 ///
-/// Today the verifier only ever produces [`IntegrityLevel::Structural`]:
-/// object presence + `size_bytes` at the destination plus manifest
-/// self-consistency, with per-part **row** counts already checked at export
-/// against the local file (`pipeline::validate::validate_output`).  It does
-/// **not** re-read part bodies from the destination, so a same-size content
-/// corruption is out of scope.  `--validate --deep` will add `Rows`
-/// (re-count from the part) and `Fingerprint` (re-hash the body); reserving
-/// the slot now lets `passed: true` carry its own strength.
+/// The verifier produces [`IntegrityLevel::Structural`]: object presence +
+/// `size_bytes` + manifest self-consistency, **plus a content MD5 comparison
+/// whenever the store surfaces `md5Hash` in its listing** (GCS/S3/Azure) and
+/// the manifest recorded one.  Per-part **row** counts are already verified at
+/// export against the local file (`pipeline::validate::validate_output`).
+/// Crucially this never re-reads a part body from the destination — the MD5
+/// check rides the listing `--validate` already does, so content verification
+/// stays free and download-free.  No deeper (re-download) level exists by
+/// design; the slot is kept only so `passed: true` carries its own strength.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IntegrityLevel {
-    /// Presence + size at the destination, manifest self-consistency.
-    /// Content (rows, bytes) is not re-read from the destination.
+    /// Presence + size + manifest self-consistency, and a content MD5 match
+    /// when both the manifest and the store's listing carry one (no download).
     #[default]
     Structural,
 }
@@ -117,6 +118,15 @@ pub enum Failure {
         path: String,
         expected: u64,
         actual: u64,
+    },
+    /// Part present at the recorded size but its content MD5 (from the store's
+    /// listing metadata) differs from the manifest's — transit / at-rest
+    /// corruption, caught with no download.
+    PartChecksumMismatch {
+        part_id: u32,
+        path: String,
+        expected: String,
+        actual: String,
     },
     /// `_SUCCESS` exists but its body is malformed (not `xxh3:<16-hex>` after
     /// trim).  ADR-0012 M2 — orchestrators rely on this format being strict.
@@ -170,6 +180,16 @@ impl std::fmt::Display for Failure {
             } => write!(
                 f,
                 "part {} size mismatch at {}: manifest {}, dest {}",
+                part_id, path, expected, actual
+            ),
+            Failure::PartChecksumMismatch {
+                part_id,
+                path,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "part {} content mismatch at {}: manifest md5 {}, dest {}",
                 part_id, path, expected, actual
             ),
             Failure::SuccessMarkerMalformed { body_preview } => {
@@ -384,6 +404,16 @@ pub fn verify_at_destination(
                         path: check.path.clone(),
                     });
                 }
+                PartPresence::ChecksumMismatch { expected, actual } => {
+                    out.parts_failed += 1;
+                    out.passed = false;
+                    out.failures.push(Failure::PartChecksumMismatch {
+                        part_id: check.part_id,
+                        path: check.path.clone(),
+                        expected: expected.clone(),
+                        actual: actual.clone(),
+                    });
+                }
             }
         }
     }
@@ -516,6 +546,7 @@ mod tests {
             rows,
             size_bytes: size,
             content_fingerprint: fp.into(),
+            content_md5: String::new(),
             status: PartStatus::Committed,
         }
     }

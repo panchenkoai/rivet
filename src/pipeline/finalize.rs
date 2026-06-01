@@ -178,6 +178,7 @@ pub(super) fn finalize_manifest(
             part.rows,
             part.size_bytes,
             part.content_fingerprint.clone(),
+            part.content_md5.clone(),
         );
     }
     let manifest = builder.finalize(status);

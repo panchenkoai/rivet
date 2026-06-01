@@ -25,6 +25,26 @@ use crate::manifest::{
     SUCCESS_FILENAME, join_key,
 };
 
+/// Normalise a stored MD5 to its 16 raw digest bytes so encodings from
+/// different backends compare equal.  Handles GCS's base64 `md5Hash` and S3's
+/// hex single-part ETag.  Returns `None` for anything that is not a plain
+/// 16-byte MD5 — an S3 multipart composite ETag (`<hash>-<N>`), an empty or
+/// legacy value — signalling "not comparable, fall back to size-only".
+fn md5_digest_bytes(s: &str) -> Option<[u8; 16]> {
+    // Hex (S3 single-part ETag): exactly 32 hex chars.
+    if s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let mut out = [0u8; 16];
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+        }
+        return Some(out);
+    }
+    // Base64 (GCS md5Hash): must decode to exactly 16 bytes.
+    use base64::Engine as _;
+    let decoded = base64::engine::general_purpose::STANDARD.decode(s).ok()?;
+    decoded.try_into().ok()
+}
+
 /// Presence verdict for one committed manifest part against the listing.
 ///
 /// Size-only by construction (see module docs).  `Present` means the object
@@ -32,12 +52,19 @@ use crate::manifest::{
 /// content — that is the `--deep` tier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PartPresence {
-    /// Object exists and its size matches the manifest.
+    /// Object exists and its size matches the manifest — and, when both the
+    /// manifest and the listing carry a base64 MD5, the content matches too.
     Present,
     /// Manifest declares the part but no object exists at its key.
     Missing,
     /// Object exists but its size differs from the manifest's record.
     SizeMismatch { expected: u64, actual: u64 },
+    /// Object exists at the recorded size, but its content MD5 (from the
+    /// listing metadata — GCS `md5Hash`, etc.) differs from the manifest's.
+    /// Catches transit / at-rest corruption with **no download**.  Only
+    /// produced when both sides carry an MD5; absent either, the part is
+    /// `Present` (size-only).
+    ChecksumMismatch { expected: String, actual: String },
 }
 
 /// One committed part's reconciliation outcome.  `path` is manifest-relative
@@ -93,7 +120,27 @@ pub fn reconcile_manifest_against_listing(
         let key = join_key(manifest_dir, &part.path);
         let presence = match listed.get(key.as_str()) {
             None => PartPresence::Missing,
-            Some(meta) if meta.size_bytes == part.size_bytes => PartPresence::Present,
+            Some(meta) if meta.size_bytes == part.size_bytes => {
+                // Size matches.  When both the manifest and the listing carry
+                // a comparable MD5, the content must match too — a free
+                // no-download integrity check.  Stores encode it differently
+                // (GCS `md5Hash` is base64; S3's single-part ETag is hex), so
+                // both sides are normalised to raw digest bytes before
+                // comparing.  Anything that isn't a plain 16-byte MD5 — an S3
+                // multipart composite ETag (`<hash>-<N>`), an empty/legacy
+                // value, a local FS `None` — is not comparable, so the part
+                // degrades to size-only (`Present`).
+                match meta.content_md5.as_deref().and_then(md5_digest_bytes) {
+                    Some(actual) => match md5_digest_bytes(&part.content_md5) {
+                        Some(expected) if expected != actual => PartPresence::ChecksumMismatch {
+                            expected: part.content_md5.clone(),
+                            actual: meta.content_md5.clone().unwrap_or_default(),
+                        },
+                        _ => PartPresence::Present,
+                    },
+                    None => PartPresence::Present,
+                }
+            }
             Some(meta) => PartPresence::SizeMismatch {
                 expected: part.size_bytes,
                 actual: meta.size_bytes,
@@ -136,12 +183,17 @@ mod tests {
     };
 
     fn part(id: u32, size: u64) -> ManifestPart {
+        part_md5(id, size, "")
+    }
+
+    fn part_md5(id: u32, size: u64, md5: &str) -> ManifestPart {
         ManifestPart {
             part_id: id,
             path: format!("part-{id:06}.parquet"),
             rows: 10,
             size_bytes: size,
             content_fingerprint: "xxh3:0".into(),
+            content_md5: md5.into(),
             status: PartStatus::Committed,
         }
     }
@@ -166,7 +218,11 @@ mod tests {
     }
 
     fn obj(key: &str, size: u64) -> ObjectMeta {
-        ObjectMeta { key: key.into(), size_bytes: size }
+        ObjectMeta { key: key.into(), size_bytes: size, content_md5: None }
+    }
+
+    fn obj_md5(key: &str, size: u64, md5: &str) -> ObjectMeta {
+        ObjectMeta { key: key.into(), size_bytes: size, content_md5: Some(md5.into()) }
     }
 
     #[test]
@@ -226,5 +282,55 @@ mod tests {
         let rec = reconcile_manifest_against_listing(&m, &listing, "");
         assert_eq!(rec.per_part.len(), 1, "only the committed part is checked");
         assert_eq!(rec.per_part[0].part_id, 1);
+    }
+
+    // A real MD5 digest in both encodings (verified live: rivet export →
+    // GCS md5Hash base64, S3 ETag hex — same 16 bytes).
+    const MD5_B64: &str = "9jgqdWB0dO+/XMZGVIiAfA==";
+    const MD5_HEX: &str = "f6382a75607474efbf5cc6465488807c";
+    const ZEROS_B64: &str = "AAAAAAAAAAAAAAAAAAAAAA=="; // 16 zero bytes, a valid but different digest
+
+    #[test]
+    fn md5_mismatch_at_matching_size_is_caught_without_download() {
+        // Both sides carry an MD5; the size matches but the digest differs —
+        // corruption a size check alone would miss.
+        let m = manifest(vec![part_md5(0, 100, MD5_B64), part_md5(1, 100, MD5_B64)]);
+        let listing = vec![
+            obj_md5("part-000000.parquet", 100, MD5_B64),  // match → Present
+            obj_md5("part-000001.parquet", 100, ZEROS_B64), // drift → ChecksumMismatch
+        ];
+        let rec = reconcile_manifest_against_listing(&m, &listing, "");
+        assert_eq!(rec.per_part[0].presence, PartPresence::Present);
+        assert!(matches!(
+            rec.per_part[1].presence,
+            PartPresence::ChecksumMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn md5_compares_across_encodings_gcs_base64_vs_s3_hex() {
+        // The S3 bug: manifest stores base64, an S3 listing returns hex ETag —
+        // same digest must NOT be a mismatch (regression for the live finding).
+        let m = manifest(vec![part_md5(0, 100, MD5_B64)]);
+        let rec =
+            reconcile_manifest_against_listing(&m, &[obj_md5("part-000000.parquet", 100, MD5_HEX)], "");
+        assert_eq!(rec.per_part[0].presence, PartPresence::Present);
+    }
+
+    #[test]
+    fn md5_check_degrades_to_size_only_when_not_comparable() {
+        // Manifest has MD5, listing does not (local FS) → Present (size-only).
+        let m = manifest(vec![part_md5(0, 100, MD5_B64)]);
+        let rec = reconcile_manifest_against_listing(&m, &[obj("part-000000.parquet", 100)], "");
+        assert_eq!(rec.per_part[0].presence, PartPresence::Present);
+        // Listing carries an S3 multipart composite ETag (`<hash>-<N>`), which
+        // is not a plain MD5 → not comparable → Present (size-only).
+        let composite = format!("{MD5_HEX}-3");
+        let rec2 = reconcile_manifest_against_listing(
+            &m,
+            &[obj_md5("part-000000.parquet", 100, &composite)],
+            "",
+        );
+        assert_eq!(rec2.per_part[0].presence, PartPresence::Present);
     }
 }

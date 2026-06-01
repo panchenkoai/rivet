@@ -57,6 +57,10 @@ pub(crate) struct PartRecord {
     pub rows: i64,
     pub bytes: u64,
     pub fingerprint: String,
+    /// Base64 MD5 of the part body (GCS `md5Hash` encoding), computed from the
+    /// local temp file alongside the fingerprint.  Empty if it could not be
+    /// computed — verification degrades to size-only for that part.
+    pub md5: String,
 }
 
 /// How a committed part is journaled.
@@ -96,11 +100,18 @@ pub(crate) fn write_part_file(
         log::warn!("part fingerprint failed for '{file_name}' (not fatal): {e:#}");
         "xxh3:0000000000000000".to_string()
     });
+    // Base64 MD5 for no-download destination verification (GCS md5Hash).
+    // Non-fatal: an empty value degrades that part's check to size-only.
+    let md5 = manifest_writer::compute_part_md5(tmp_path).unwrap_or_else(|e| {
+        log::warn!("part md5 failed for '{file_name}' (not fatal): {e:#}");
+        String::new()
+    });
     Ok(PartRecord {
         file_name,
         rows,
         bytes,
         fingerprint,
+        md5,
     })
 }
 
@@ -128,6 +139,7 @@ pub(crate) fn record_part(
         part.rows,
         part.bytes,
         part.fingerprint.clone(),
+        part.md5.clone(),
     );
 
     match kind {
@@ -250,6 +262,7 @@ mod tests {
             rows: 42,
             bytes: 1024,
             fingerprint: "xxh3:1234567890abcdef".into(),
+            md5: String::new(),
         }
     }
 
@@ -427,6 +440,7 @@ mod tests {
                 rows: 100 + (i as i64) * 10,
                 bytes: 1024 * ((i as u64) + 1),
                 fingerprint: format!("xxh3:{i:016x}"),
+                md5: String::new(),
             })
             .collect()
     }

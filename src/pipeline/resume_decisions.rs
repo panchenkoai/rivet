@@ -72,12 +72,9 @@ pub enum UntrackedDecision {
 pub enum QuarantineReason {
     /// `size_bytes` on the destination differs from the manifest entry.
     SizeMismatch,
-    /// Caller compared content fingerprints out-of-band and they diverge.
-    /// Not used in this module today (we don't re-fingerprint at resume
-    /// time — too expensive without `--validate --deep`), but reserved so
-    /// a future caller can plumb fingerprint-aware decisions through the
-    /// same enum.
-    #[allow(dead_code)]
+    /// The object's content MD5 (from the listing metadata) diverged from
+    /// the manifest's — corruption at the same size, caught with no download.
+    /// Produced when the reconciliation surfaces a `ChecksumMismatch`.
     FingerprintMismatch,
 }
 
@@ -153,6 +150,11 @@ pub fn build_resume_plan(manifest: &RunManifest, listing: &[ObjectMeta]) -> Resu
             PartPresence::SizeMismatch { .. } => ResumeDecision::Quarantine {
                 reason: QuarantineReason::SizeMismatch,
             },
+            // Content drift at the same size — quarantine the corrupt object
+            // and re-export, same as a size mismatch.
+            PartPresence::ChecksumMismatch { .. } => ResumeDecision::Quarantine {
+                reason: QuarantineReason::FingerprintMismatch,
+            },
         };
         plan.per_part.insert(
             check.path,
@@ -183,6 +185,7 @@ mod tests {
             rows: 100,
             size_bytes: size,
             content_fingerprint: format!("xxh3:{:016x}", part_id as u64),
+            content_md5: String::new(),
             status: PartStatus::Committed,
         }
     }
@@ -226,6 +229,7 @@ mod tests {
         ObjectMeta {
             key: key.into(),
             size_bytes: size,
+            content_md5: None,
         }
     }
 

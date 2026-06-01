@@ -66,6 +66,7 @@ impl super::Destination for LocalDestination {
                 out.push(super::ObjectMeta {
                     key: rel,
                     size_bytes: meta.len(),
+                    content_md5: None, // local FS exposes no checksum in metadata
                 });
                 continue;
             }
@@ -84,6 +85,7 @@ impl super::Destination for LocalDestination {
                     out.push(super::ObjectMeta {
                         key: rel,
                         size_bytes: m.len(),
+                        content_md5: None,
                     });
                 }
                 // Other file types (symlinks loops, sockets) — silently
@@ -106,6 +108,7 @@ impl super::Destination for LocalDestination {
             Ok(m) if m.is_file() => Ok(Some(super::ObjectMeta {
                 key: key.to_string(),
                 size_bytes: m.len(),
+                content_md5: None,
             })),
             // Treat "is a directory" the same as absent for our purposes —
             // M5 only cares about file-shaped objects.
