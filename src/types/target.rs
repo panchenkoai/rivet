@@ -43,6 +43,9 @@ pub enum ExportTarget {
     /// Cloud warehouse. Its Parquet autoloader is weaker than DuckDB's: see
     /// the per-type `autoload_type` notes in [`bigquery`].
     BigQuery,
+    /// Cloud warehouse. Like BigQuery, its Parquet autoload degrades JSON,
+    /// UUID, naive timestamps and TIME — see [`snowflake`]. Verified live.
+    Snowflake,
 }
 
 impl ExportTarget {
@@ -50,6 +53,7 @@ impl ExportTarget {
         match s.to_lowercase().as_str() {
             "bigquery" | "bq" => Some(Self::BigQuery),
             "duckdb" | "duck" => Some(Self::DuckDb),
+            "snowflake" | "sf" => Some(Self::Snowflake),
             _ => None,
         }
     }
@@ -58,6 +62,7 @@ impl ExportTarget {
         match self {
             Self::BigQuery => "bigquery",
             Self::DuckDb => "duckdb",
+            Self::Snowflake => "snowflake",
         }
     }
 
@@ -66,6 +71,7 @@ impl ExportTarget {
         let mut spec = match self {
             ExportTarget::BigQuery => bigquery::resolve(&input),
             ExportTarget::DuckDb => duckdb::resolve(&input),
+            ExportTarget::Snowflake => snowflake::resolve(&input),
         };
         // Fidelity floor (ADR-0014 T6): the target status must not be rosier
         // than the source fidelity warrants — a lossy/unsupported source column
@@ -96,6 +102,7 @@ impl ExportTarget {
     pub fn recovery_sql(self, specs: &[TargetColumnSpec], table: &str) -> Option<String> {
         match self {
             ExportTarget::BigQuery => Some(bigquery_recovery_sql(specs, table)),
+            ExportTarget::Snowflake => Some(snowflake_recovery_sql(specs, table)),
             ExportTarget::DuckDb => None,
         }
     }
@@ -267,6 +274,34 @@ fn bigquery_recovery_sql(specs: &[TargetColumnSpec], table: &str) -> String {
          CREATE OR REPLACE TABLE `{table}` AS\n\
          SELECT\n{cols}\n\
          FROM `{table}__staging`;",
+        cols = cols.join(",\n")
+    )
+}
+
+/// Emit a Snowflake type-recovery script (ADR-0014 L5). Snowflake's Parquet
+/// autoload degrades JSON→TEXT, UUID→BINARY, naive timestamp→NUMBER (µs) and
+/// TIME→NUMBER, so the recovery is a post-load CTAS over a `MATCH_BY_COLUMN_NAME`
+/// staging table. INFER_SCHEMA emits lowercase, case-sensitive names, so every
+/// reference is double-quoted. Verified live (2026-06-01) via the `snow` CLI.
+fn snowflake_recovery_sql(specs: &[TargetColumnSpec], table: &str) -> String {
+    let cols: Vec<String> = specs
+        .iter()
+        .map(|s| match &s.cast_sql {
+            Some(cast) => format!("  {cast} AS {name}", name = s.column_name),
+            None => format!("  \"{name}\" AS {name}", name = s.column_name),
+        })
+        .collect();
+    format!(
+        "-- 1) ALTER SESSION SET TIMEZONE='UTC';\n\
+         -- 2) CREATE OR REPLACE FILE FORMAT rivet_pq TYPE=PARQUET BINARY_AS_TEXT=FALSE;\n\
+         -- 3) PUT file://<parquet> @<stage> AUTO_COMPRESS=FALSE;\n\
+         -- 4) CREATE OR REPLACE TABLE {table}__staging USING TEMPLATE (SELECT ARRAY_AGG(\n\
+         --      OBJECT_CONSTRUCT(*)) FROM TABLE(INFER_SCHEMA(LOCATION=>'@<stage>', FILE_FORMAT=>'rivet_pq')));\n\
+         --    COPY INTO {table}__staging FROM @<stage> FILE_FORMAT=(FORMAT_NAME='rivet_pq') MATCH_BY_COLUMN_NAME=CASE_INSENSITIVE;\n\
+         -- 5) recover native types:\n\
+         CREATE OR REPLACE TABLE {table} AS\n\
+         SELECT\n{cols}\n\
+         FROM {table}__staging;",
         cols = cols.join(",\n")
     )
 }
@@ -446,6 +481,104 @@ mod duckdb {
     }
 }
 
+// ── Snowflake ────────────────────────────────────────────────────────────────
+
+mod snowflake {
+    use super::*;
+
+    pub(super) fn resolve(input: &TargetInput<'_>) -> TargetColumnSpec {
+        native(input.rivet_type).into_spec(input)
+    }
+
+    /// Snowflake autoload (INFER_SCHEMA / COPY) + recovery casts — verified live
+    /// (2026-06-01). Needs `BINARY_AS_TEXT=FALSE` in the file format; cast column
+    /// refs are double-quoted because INFER_SCHEMA names are lowercase and
+    /// case-sensitive.
+    fn native(t: &RivetType) -> Resolved {
+        match t {
+            RivetType::Bool => Resolved::ok("BOOLEAN"),
+            RivetType::Int16 | RivetType::Int32 | RivetType::Int64 => Resolved::ok("NUMBER(38,0)"),
+            // u64 > INT64_MAX overflows the Parquet read; fix at source.
+            RivetType::UInt64 => Resolved::diverge(
+                "NUMBER(20,0)",
+                "NUMBER(38,0)",
+                "UINT64 > INT64_MAX overflows the Parquet read; map to decimal(20,0) at source",
+                None,
+            ),
+            RivetType::Float32 | RivetType::Float64 => Resolved::ok("FLOAT"),
+            RivetType::Decimal { precision, scale } => {
+                if *scale < 0 {
+                    Resolved::warn(
+                        "NUMBER",
+                        format!(
+                            "Snowflake NUMBER has no negative scale; decimal({precision},{scale}) loads via cast"
+                        ),
+                    )
+                } else {
+                    Resolved::ok(format!("NUMBER({precision},{scale})"))
+                }
+            }
+            RivetType::Date => Resolved::ok("DATE"),
+            // TIME autoloads as NUMBER (µs of day); rebuild with TIME_FROM_PARTS.
+            RivetType::Time { .. } => Resolved::diverge(
+                "TIME",
+                "NUMBER(38,0)",
+                "TIME autoloads as NUMBER (µs of day); recover with TIME_FROM_PARTS after load",
+                Some(r#"TIME_FROM_PARTS(0,0,FLOOR("{col}"/1000000),MOD("{col}",1000000)*1000)"#),
+            ),
+            // tz timestamp lands as TIMESTAMP_NTZ holding the UTC instant.
+            RivetType::Timestamp {
+                timezone: Some(_), ..
+            } => Resolved::diverge(
+                "TIMESTAMP_TZ",
+                "TIMESTAMP_NTZ",
+                "tz timestamp autoloads as TIMESTAMP_NTZ — ALTER SESSION SET TIMEZONE='UTC' before COPY so the instant matches",
+                None,
+            ),
+            // naive timestamp autoloads as NUMBER (µs since epoch).
+            RivetType::Timestamp { timezone: None, .. } => Resolved::diverge(
+                "TIMESTAMP_NTZ",
+                "NUMBER(38,0)",
+                "naive timestamp autoloads as NUMBER (µs since epoch); recover with TO_TIMESTAMP_NTZ after load",
+                Some(r#"TO_TIMESTAMP_NTZ("{col}", 6)"#),
+            ),
+            RivetType::String | RivetType::Text | RivetType::Enum => Resolved::ok("TEXT"),
+            // bytea/blob needs BINARY_AS_TEXT=FALSE or non-UTF8 bytes fail.
+            RivetType::Binary => Resolved::warn(
+                "BINARY",
+                "set BINARY_AS_TEXT=FALSE in the Parquet FILE FORMAT or non-UTF8 bytes fail to load",
+            ),
+            // JSON autoloads as TEXT; PARSE_JSON recovers native VARIANT.
+            RivetType::Json => Resolved::diverge(
+                "VARIANT",
+                "TEXT",
+                "JSON autoloads as TEXT; recover native VARIANT with PARSE_JSON after load",
+                Some(r#"PARSE_JSON("{col}")"#),
+            ),
+            // UUID (FixedSizeBinary 16) autoloads as 16-byte BINARY.
+            RivetType::Uuid => Resolved::diverge(
+                "TEXT",
+                "BINARY",
+                "UUID autoloads as 16-byte BINARY; recover canonical text with HEX_ENCODE + REGEXP after load",
+                Some(
+                    r#"REGEXP_REPLACE(LOWER(HEX_ENCODE("{col}")),'^(.{8})(.{4})(.{4})(.{4})(.{12})$','\\1-\\2-\\3-\\4-\\5')"#,
+                ),
+            ),
+            RivetType::Interval => Resolved::ok("TEXT"),
+            // Snowflake reads a Parquet list as a native ARRAY.
+            RivetType::List { inner } => {
+                let inner_r = native(inner);
+                if inner_r.status == TargetStatus::Fail {
+                    Resolved::fail(format!("ARRAY of unsupported element: {}", inner_r.target_type))
+                } else {
+                    Resolved::ok("ARRAY")
+                }
+            }
+            RivetType::Unsupported { .. } => Resolved::fail(unsupported_reason(t)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,6 +597,9 @@ mod tests {
     }
     fn duck(rt: &RivetType) -> TargetColumnSpec {
         ExportTarget::DuckDb.resolve_column(input(rt))
+    }
+    fn sf(rt: &RivetType) -> TargetColumnSpec {
+        ExportTarget::Snowflake.resolve_column(input(rt))
     }
 
     // ── dispatch on RivetType, not Arrow — the headline fix ──────────────────
@@ -844,5 +980,75 @@ mod tests {
         assert!(body.contains("TO_HEX(uid) AS uid"));
         assert!(body.contains("DATETIME(created_at) AS created_at"));
         assert!(body.contains("UNNEST(tags) AS el) AS tags"));
+    }
+
+    // ── Snowflake (verified live 2026-06-01) ─────────────────────────────────
+
+    #[test]
+    fn snowflake_autoload_degradations_and_native_casts() {
+        // JSON → TEXT autoload / VARIANT native, recover PARSE_JSON.
+        let j = sf(&RivetType::Json);
+        assert_eq!(j.target_type, "VARIANT");
+        assert_eq!(j.autoload_type, "TEXT");
+        assert!(j.cast_sql.unwrap().starts_with("PARSE_JSON"));
+        // UUID → BINARY autoload / TEXT native, recover via HEX_ENCODE + REGEXP.
+        let u = sf(&RivetType::Uuid);
+        assert_eq!(u.target_type, "TEXT");
+        assert_eq!(u.autoload_type, "BINARY");
+        assert!(u.cast_sql.unwrap().contains("HEX_ENCODE"));
+        // naive timestamp → NUMBER autoload / TIMESTAMP_NTZ native.
+        let naive = RivetType::Timestamp {
+            unit: super::super::TimeUnit::Microsecond,
+            timezone: None,
+        };
+        let t = sf(&naive);
+        assert_eq!(t.target_type, "TIMESTAMP_NTZ");
+        assert_eq!(t.autoload_type, "NUMBER(38,0)");
+        assert!(t.cast_sql.unwrap().contains("TO_TIMESTAMP_NTZ"));
+        // TIME → NUMBER autoload, recover TIME_FROM_PARTS.
+        let tm = sf(&RivetType::Time {
+            unit: super::super::TimeUnit::Microsecond,
+        });
+        assert_eq!(tm.target_type, "TIME");
+        assert!(tm.cast_sql.unwrap().contains("TIME_FROM_PARTS"));
+        // decimal is native NUMBER(p,s) — no cast.
+        let d = sf(&RivetType::Decimal { precision: 18, scale: 2 });
+        assert_eq!(d.target_type, "NUMBER(18,2)");
+        assert!(d.cast_sql.is_none());
+    }
+
+    #[test]
+    fn snowflake_recovery_sql_quotes_columns_and_casts() {
+        use super::super::{SourceColumn, TimeUnit};
+        let naive = RivetType::Timestamp {
+            unit: TimeUnit::Microsecond,
+            timezone: None,
+        };
+        let mappings = vec![
+            TypeMapping::from_source(&SourceColumn::simple("id", "int8", true), RivetType::Int64),
+            TypeMapping::from_source(&SourceColumn::simple("attrs", "jsonb", true), RivetType::Json),
+            TypeMapping::from_source(&SourceColumn::simple("uid", "uuid", true), RivetType::Uuid),
+            TypeMapping::from_source(
+                &SourceColumn::simple("created_at", "timestamp", true),
+                naive,
+            ),
+        ];
+        let specs = ExportTarget::Snowflake.resolve_table(&mappings);
+        let sql = ExportTarget::Snowflake.recovery_sql(&specs, "t").unwrap();
+        // Staging columns are lowercase + quoted; passthrough quotes the source.
+        assert!(sql.contains("\"id\" AS id"));
+        assert!(sql.contains("PARSE_JSON(\"attrs\") AS attrs"));
+        assert!(sql.contains("HEX_ENCODE(\"uid\")"));
+        assert!(sql.contains("TO_TIMESTAMP_NTZ(\"created_at\", 6) AS created_at"));
+        // The load preamble the recovery depends on.
+        assert!(sql.contains("BINARY_AS_TEXT=FALSE"));
+        assert!(sql.contains("MATCH_BY_COLUMN_NAME"));
+        assert!(sql.contains("FROM t__staging"));
+    }
+
+    #[test]
+    fn parse_accepts_snowflake() {
+        assert_eq!(ExportTarget::parse("snowflake"), Some(ExportTarget::Snowflake));
+        assert_eq!(ExportTarget::parse("sf"), Some(ExportTarget::Snowflake));
     }
 }

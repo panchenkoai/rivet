@@ -351,3 +351,30 @@ type, the native type, and a ready-to-run recovery `CREATE TABLE … AS SELECT`
 over the autoloaded `<table>__staging`. Set `exports[].target: bigquery` to get
 it without the CLI flag. DuckDB needs none of this — it autoloads every logical
 type natively.
+
+### Snowflake autoload & recovery (verified live)
+
+Snowflake's `INFER_SCHEMA` + `COPY` infers physical types only, so the same
+semantic types degrade — and the `INFER_SCHEMA` column names come back
+**lowercase and case-sensitive**, so the recovery `SELECT` must double-quote
+every source reference (`"col"`).
+
+| RivetType | Snowflake autoload | Native | Recovery (post-load) |
+|-----------|--------------------|--------|----------------------|
+| `json`    | `TEXT`             | `VARIANT` | `PARSE_JSON("col")` |
+| `uuid`    | `BINARY` (16 raw)  | `TEXT` | `REGEXP_REPLACE(LOWER(HEX_ENCODE("col")), …)` → canonical UUID |
+| `timestamp` (naive) | `NUMBER` (µs) | `TIMESTAMP_NTZ` | `TO_TIMESTAMP_NTZ("col", 6)` |
+| `time`    | `NUMBER` (µs of day) | `TIME` | `TIME_FROM_PARTS(0,0,FLOOR("col"/1000000),MOD("col",1000000)*1000)` |
+| `binary`  | `BINARY` *(needs `BINARY_AS_TEXT=FALSE`)* | `BINARY` | — (set the file-format option) |
+| `timestamp_tz` | `TIMESTAMP_TZ` *(pin session `TIMEZONE='UTC'`)* | `TIMESTAMP_TZ` | — (autoload uses session offset otherwise) |
+| `u_int64` | `NUMBER` (overflows > 2^63−1) | `NUMBER(20,0)` | none post-load — fix at source: `columns: { c: decimal(20,0) }` |
+| `decimal`, `string`, `bool`, `date`, ints, `list` | native | same | — |
+
+The load preamble the recovery depends on: `CREATE FILE FORMAT … TYPE=PARQUET
+BINARY_AS_TEXT=FALSE`, `ALTER SESSION SET TIMEZONE='UTC'`, `CREATE TABLE … USING
+TEMPLATE (… INFER_SCHEMA …)`, `COPY … MATCH_BY_COLUMN_NAME=CASE_INSENSITIVE`.
+
+`rivet check --type-report --target snowflake` (`--target sf`) emits the
+per-column autoload/native types and the post-load `CREATE OR REPLACE TABLE …`
+recovery over `<table>__staging`. Set `exports[].target: snowflake` to skip the
+flag.
