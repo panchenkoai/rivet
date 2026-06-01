@@ -259,22 +259,31 @@ fn unsupported_reason(t: &RivetType) -> String {
 /// Verified against live BigQuery: a load schema that *declares* native types
 /// is rejected (the Parquet loader won't coerce a column's type on load), so
 /// the recovery must be this post-load transform.
-fn bigquery_recovery_sql(specs: &[TargetColumnSpec], table: &str) -> String {
-    let cols: Vec<String> = specs
+/// The recovery `SELECT` body, shared by every degrading target. The cast
+/// branch *is* the materialization contract (ADR-0014 L5) and is identical
+/// across targets — only the passthrough form (identifier quoting, alias)
+/// differs, so each target supplies that as `passthrough`. Deleting this and
+/// inlining the fold would re-scatter the cast logic across N targets.
+fn recovery_projection(specs: &[TargetColumnSpec], passthrough: impl Fn(&str) -> String) -> String {
+    specs
         .iter()
         .map(|s| match &s.cast_sql {
             Some(cast) => format!("  {cast} AS {name}", name = s.column_name),
-            None => format!("  {name}", name = s.column_name),
+            None => passthrough(&s.column_name),
         })
-        .collect();
+        .collect::<Vec<_>>()
+        .join(",\n")
+}
+
+fn bigquery_recovery_sql(specs: &[TargetColumnSpec], table: &str) -> String {
+    let cols = recovery_projection(specs, |name| format!("  {name}"));
     format!(
         "-- 1) bq load --autodetect --parquet_enable_list_inference \
          --source_format=PARQUET {table}__staging <parquet>\n\
          -- 2) recover native types:\n\
          CREATE OR REPLACE TABLE `{table}` AS\n\
          SELECT\n{cols}\n\
-         FROM `{table}__staging`;",
-        cols = cols.join(",\n")
+         FROM `{table}__staging`;"
     )
 }
 
@@ -284,13 +293,7 @@ fn bigquery_recovery_sql(specs: &[TargetColumnSpec], table: &str) -> String {
 /// staging table. INFER_SCHEMA emits lowercase, case-sensitive names, so every
 /// reference is double-quoted. Verified live (2026-06-01) via the `snow` CLI.
 fn snowflake_recovery_sql(specs: &[TargetColumnSpec], table: &str) -> String {
-    let cols: Vec<String> = specs
-        .iter()
-        .map(|s| match &s.cast_sql {
-            Some(cast) => format!("  {cast} AS {name}", name = s.column_name),
-            None => format!("  \"{name}\" AS {name}", name = s.column_name),
-        })
-        .collect();
+    let cols = recovery_projection(specs, |name| format!("  \"{name}\" AS {name}"));
     format!(
         "-- 1) ALTER SESSION SET TIMEZONE='UTC';\n\
          -- 2) CREATE OR REPLACE FILE FORMAT rivet_pq TYPE=PARQUET BINARY_AS_TEXT=FALSE;\n\
@@ -301,8 +304,7 @@ fn snowflake_recovery_sql(specs: &[TargetColumnSpec], table: &str) -> String {
          -- 5) recover native types:\n\
          CREATE OR REPLACE TABLE {table} AS\n\
          SELECT\n{cols}\n\
-         FROM {table}__staging;",
-        cols = cols.join(",\n")
+         FROM {table}__staging;"
     )
 }
 
@@ -565,13 +567,21 @@ mod snowflake {
                 ),
             ),
             RivetType::Interval => Resolved::ok("TEXT"),
-            // Snowflake reads a Parquet list as a native ARRAY.
+            // A Parquet list autoloads as VARIANT (holding the JSON array), not
+            // native ARRAY — verified live 2026-06-01: INFER_SCHEMA reports
+            // VARIANT for both `tags` (text[]) and `nums` (int[]). Recover the
+            // native ARRAY with `::ARRAY` after load.
             RivetType::List { inner } => {
                 let inner_r = native(inner);
                 if inner_r.status == TargetStatus::Fail {
                     Resolved::fail(format!("ARRAY of unsupported element: {}", inner_r.target_type))
                 } else {
-                    Resolved::ok("ARRAY")
+                    Resolved::diverge(
+                        "ARRAY",
+                        "VARIANT",
+                        "list autoloads as VARIANT (the JSON array); recover native ARRAY with ::ARRAY after load",
+                        Some(r#""{col}"::ARRAY"#),
+                    )
                 }
             }
             RivetType::Unsupported { .. } => Resolved::fail(unsupported_reason(t)),
@@ -1015,6 +1025,13 @@ mod tests {
         let d = sf(&RivetType::Decimal { precision: 18, scale: 2 });
         assert_eq!(d.target_type, "NUMBER(18,2)");
         assert!(d.cast_sql.is_none());
+        // list autoloads as VARIANT (verified live), recover native ARRAY with ::ARRAY.
+        let l = sf(&RivetType::List {
+            inner: Box::new(RivetType::Int64),
+        });
+        assert_eq!(l.target_type, "ARRAY");
+        assert_eq!(l.autoload_type, "VARIANT");
+        assert!(l.cast_sql.unwrap().ends_with("::ARRAY"));
     }
 
     #[test]
