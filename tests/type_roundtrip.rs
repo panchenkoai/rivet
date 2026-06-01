@@ -26,6 +26,8 @@ mod duckdb_load;
 mod helpers;
 #[path = "type_roundtrip/mysql_csv_roundtrip.rs"]
 mod mysql_csv_roundtrip;
+#[path = "type_roundtrip/mysql_decimal_auto_resolve.rs"]
+mod mysql_decimal_auto_resolve;
 #[path = "type_roundtrip/mysql_parquet_roundtrip.rs"]
 mod mysql_parquet_roundtrip;
 #[path = "type_roundtrip/mysql_uint64_decimal_override.rs"]
