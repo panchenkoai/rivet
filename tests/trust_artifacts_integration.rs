@@ -1921,7 +1921,6 @@ fn validation_outcome_in_summary_json_carries_manifest_subobject_when_set() {
         manifest_self_consistent: true,
         passed: true,
         failures: Vec::new(),
-        level: rivet::pipeline::IntegrityLevel::Structural,
     });
 
     let out = write_run_report(cfg.to_str().unwrap(), &s).unwrap();

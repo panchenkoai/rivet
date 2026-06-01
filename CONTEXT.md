@@ -94,10 +94,12 @@ threshold (`cloud.rs`) is what makes Azure md5 work for small parts. Encodings a
 to raw digest bytes (`md5_digest_bytes`) so base64 and hex of the same digest
 compare equal. _Avoid_: checksum, hash (use for the xxh3 `content_fingerprint`).
 
-**Integrity level**:
-The strongest assertion a verdict makes. `Structural` = presence + size +
-manifest self-consistency + the **content MD5 match when the store provides one
-in its listing** (no download); rows are already checked at export against the
-local file. There is deliberately no re-download level — content is verified
-pre-upload and via free listing metadata, never by pulling bytes back. Makes
-`passed: true` say *what* it certified. _Avoid_: validation depth, check level.
+**Verdict coverage**:
+How much a `--validate` pass actually certified, carried by the `ManifestVerification`
+counters rather than a label: `parts_verified` with `parts_md5_verified` as the
+content-checked subset (the rest size-only). Content is verified pre-upload and,
+at the destination, via the free listing MD5 — never by re-download. `passed` is
+**derived** (`manifest_found` and no fatal failure — advisory `UntrackedObject`
+doesn't count), computed once via `recompute_passed`, not hand-flipped per site.
+_Avoid_: integrity level (removed — a single-variant enum that duplicated the
+md5/size-only counters), validation depth.

@@ -366,13 +366,6 @@ pub fn render_markdown(r: &RunReport) -> String {
                     "absent"
                 }
             ));
-            // Spell out what "verified" certifies — size + manifest, not a
-            // re-read of part bodies — so the verdict is self-describing.
-            out.push_str(match m.level {
-                crate::pipeline::IntegrityLevel::Structural => {
-                    " (level: structural — presence + size; content not re-read)"
-                }
-            });
             out.push('\n');
             for failure in &m.failures {
                 // Failure has its own `Display` impl in `validate_manifest.rs`

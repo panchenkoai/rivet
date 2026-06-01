@@ -94,8 +94,7 @@ pub mod for_tests {
     pub use super::retry::{RetryClass, classify_error};
     pub use super::validate::validate_output;
     pub use super::validate_manifest::{
-        Failure as ManifestVerificationFailure, IntegrityLevel, ManifestVerification,
-        verify_at_destination,
+        Failure as ManifestVerificationFailure, ManifestVerification, verify_at_destination,
     };
     pub use crate::plan::build_time_window_query;
 }
@@ -110,7 +109,7 @@ pub mod for_tests {
 #[doc(hidden)]
 #[allow(unused_imports)]
 pub use for_tests::{
-    IntegrityLevel, ManifestBuilder, ManifestVerification, ManifestVerificationFailure, PartDecision,
+    ManifestBuilder, ManifestVerification, ManifestVerificationFailure, PartDecision,
     QuarantineReason, ResumeDecision, ResumePlan, RetryClass, RunReport, UntrackedDecision,
     WriteOutcome, build_resume_plan, build_time_window_query, classify_error, generate_chunks,
     report_dir, validate_output, verify_at_destination, write_manifest, write_run_report,
