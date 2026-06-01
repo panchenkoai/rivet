@@ -178,19 +178,20 @@ pub(super) fn rivet_type_for_pg_column(
     column_overrides: &ColumnOverrides,
     numeric_hints: Option<&HashMap<String, (u8, i8)>>,
 ) -> RivetType {
-    if let Some(t) = column_overrides.get(col.name()) {
-        return t.clone();
-    }
-    if *col.type_() == Type::NUMERIC
-        && let Some(hints) = numeric_hints
-        && let Some(&(p, s)) = hints.get(col.name())
-    {
-        return RivetType::Decimal {
-            precision: p,
-            scale: s,
-        };
-    }
-    pg_type_to_rivet(col.type_())
+    crate::types::resolve_or(column_overrides, col.name(), || {
+        // Autodetect: a NUMERIC catalog hint (only available for a single-table
+        // SELECT) supplies the precision/scale the wire protocol omits;
+        // otherwise map the wire type directly.
+        if *col.type_() == Type::NUMERIC
+            && let Some(&(p, s)) = numeric_hints.and_then(|h| h.get(col.name()))
+        {
+            return RivetType::Decimal {
+                precision: p,
+                scale: s,
+            };
+        }
+        pg_type_to_rivet(col.type_())
+    })
 }
 
 /// Build an Arrow `Schema` from PostgreSQL `Column` descriptors by routing

@@ -797,4 +797,52 @@ mod tests {
             "DuckDB autoloads every logical type natively — no recovery needed"
         );
     }
+
+    #[test]
+    fn recovery_sql_projects_every_column_once_and_only_casts_divergent() {
+        use super::super::{SourceColumn, TimeUnit};
+        let naive = RivetType::Timestamp {
+            unit: TimeUnit::Microsecond,
+            timezone: None,
+        };
+        let cols: [(&str, RivetType); 6] = [
+            ("id", RivetType::Int64),                               // ok → passthrough
+            ("amount", RivetType::Decimal { precision: 18, scale: 2 }), // ok → passthrough
+            ("attrs", RivetType::Json),                            // divergent → cast
+            ("uid", RivetType::Uuid),                              // divergent → cast
+            ("created_at", naive),                                 // divergent → cast
+            ("tags", RivetType::List { inner: Box::new(RivetType::String) }), // divergent → cast
+        ];
+        let mappings: Vec<_> = cols
+            .iter()
+            .cloned()
+            .map(|(n, rt)| TypeMapping::from_source(&SourceColumn::simple(n, "x", true), rt))
+            .collect();
+        let specs = ExportTarget::BigQuery.resolve_table(&mappings);
+        let sql = ExportTarget::BigQuery.recovery_sql(&specs, "t").unwrap();
+
+        // The SELECT projects exactly one item per input column — nothing dropped,
+        // nothing duplicated.
+        let body = sql
+            .split("SELECT\n")
+            .nth(1)
+            .and_then(|s| s.split("\nFROM").next())
+            .expect("recovery SQL has a SELECT … FROM body");
+        assert_eq!(
+            body.split(",\n").count(),
+            cols.len(),
+            "one projection per column, got:\n{body}"
+        );
+        for (name, _) in &cols {
+            assert!(body.contains(name), "column {name} missing:\n{body}");
+        }
+        // OK columns pass through unchanged (bare `  name,`); divergent ones
+        // carry their cast (`… AS name`).
+        assert!(body.contains("  id,") && !body.contains("AS id"));
+        assert!(body.contains("  amount,") && !body.contains("AS amount"));
+        assert!(body.contains("PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING(attrs)) AS attrs"));
+        assert!(body.contains("TO_HEX(uid) AS uid"));
+        assert!(body.contains("DATETIME(created_at) AS created_at"));
+        assert!(body.contains("UNNEST(tags) AS el) AS tags"));
+    }
 }

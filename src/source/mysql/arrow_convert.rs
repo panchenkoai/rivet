@@ -260,10 +260,9 @@ pub(super) fn mysql_schema_and_arrow_types(
 
     for col in columns {
         let native = mysql_native_type_name(col);
-        let rivet = column_overrides
-            .get(col.name_str().as_ref())
-            .cloned()
-            .unwrap_or_else(|| mysql_type_to_rivet(col));
+        let rivet = crate::types::resolve_or(column_overrides, col.name_str().as_ref(), || {
+            mysql_type_to_rivet(col)
+        });
         let source = SourceColumn::simple(col.name_str().to_string(), native.clone(), true);
         let mapping = TypeMapping::from_source(&source, rivet);
 
@@ -359,6 +358,13 @@ fn parse_time_str_to_micros(s: &str) -> Option<i64> {
     Some(if neg { -total } else { total })
 }
 
+// Structurally parallel to `postgres::arrow_convert::build_array` — both
+// dispatch on the resolved target Arrow type (the schema's single decision) and
+// read the wire value into the matching builder. The dispatch skeletons look
+// like duplication, but the per-value read is irreducibly engine-specific
+// (`mysql::Value` is a tagged enum coerced into the target; PostgreSQL reads via
+// type-driven `FromSql`), so a shared generic would be a shallow seam — kept
+// separate deliberately.
 fn build_array(
     arrow_type: &DataType,
     col_idx: usize,

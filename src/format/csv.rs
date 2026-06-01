@@ -486,4 +486,60 @@ mod tests {
         assert!(msg.contains("tags"), "error must name the column: {msg}");
         assert!(msg.to_lowercase().contains("csv"), "{msg}");
     }
+
+    /// Consistency guard: every type `csv_serializable` admits must actually be
+    /// handled by `write_csv_value` (not hit its `other => bail` fallthrough).
+    /// Keeps the whitelist and the writer in lock-step so one can't drift.
+    #[test]
+    fn every_serializable_type_is_actually_written() {
+        use crate::format::Format;
+        let cols: Vec<(&str, ArrayRef)> = vec![
+            ("b", Arc::new(BooleanArray::from(vec![true]))),
+            ("i16", Arc::new(Int16Array::from(vec![1i16]))),
+            ("i32", Arc::new(Int32Array::from(vec![1i32]))),
+            ("i64", Arc::new(Int64Array::from(vec![1i64]))),
+            ("u64", Arc::new(UInt64Array::from(vec![1u64]))),
+            (
+                "dec",
+                Arc::new(
+                    Decimal128Array::from(vec![100i128])
+                        .with_precision_and_scale(18, 2)
+                        .unwrap(),
+                ),
+            ),
+            ("f32", Arc::new(Float32Array::from(vec![1.0f32]))),
+            ("f64", Arc::new(Float64Array::from(vec![1.0f64]))),
+            ("s", Arc::new(StringArray::from(vec!["x"]))),
+            ("bin", Arc::new(BinaryArray::from_vec(vec![&[1u8][..]]))),
+            (
+                "uuid",
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_iter(std::iter::once(vec![0u8; 16])).unwrap(),
+                ),
+            ),
+            ("d", Arc::new(Date32Array::from(vec![0i32]))),
+            ("t", Arc::new(Time64MicrosecondArray::from(vec![0i64]))),
+            ("ts", Arc::new(TimestampMicrosecondArray::from(vec![0i64]))),
+        ];
+        let fields: Vec<Field> = cols
+            .iter()
+            .map(|(n, a)| Field::new(*n, a.data_type().clone(), true))
+            .collect();
+        // Sanity: each column's type is on the whitelist.
+        for f in &fields {
+            assert!(
+                csv_serializable(f.data_type()),
+                "test type {:?} not in csv_serializable",
+                f.data_type()
+            );
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let arrays: Vec<ArrayRef> = cols.into_iter().map(|(_, a)| a).collect();
+        let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
+        let mut w = CsvFormat
+            .create_writer(&schema, Box::new(Vec::<u8>::new()))
+            .unwrap();
+        w.write_batch(&batch)
+            .expect("every serializable type must write without hitting the fallthrough");
+    }
 }
