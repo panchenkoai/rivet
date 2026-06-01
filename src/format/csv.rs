@@ -22,6 +22,22 @@ impl super::Format for CsvFormat {
         schema: &SchemaRef,
         mut writer: Box<dyn Write + Send>,
     ) -> Result<Box<dyn super::FormatWriter + Send>> {
+        // Fail loud: arrays and other nested/wide Arrow types have no CSV cell
+        // representation. Reject them up front, naming the column, instead of
+        // silently writing empty values for every row — `format: parquet` or
+        // excluding the column from the query is the fix.
+        if let Some(field) = schema
+            .fields()
+            .iter()
+            .find(|f| !csv_serializable(f.data_type()))
+        {
+            anyhow::bail!(
+                "CSV cannot serialize column '{}' (Arrow type {:?}); use `format: parquet` \
+                 or drop the column from the query",
+                field.name(),
+                field.data_type()
+            );
+        }
         let header = schema
             .fields()
             .iter()
@@ -65,6 +81,30 @@ impl super::FormatWriter for CsvFormatWriter {
     fn bytes_written(&self) -> u64 {
         self.bytes_written
     }
+}
+
+/// Arrow types `write_csv_value` can serialize. Everything else — lists,
+/// structs, maps, `Decimal256`, non-UUID fixed binary, … — has no CSV cell
+/// representation and is rejected at writer creation rather than silently
+/// emitted as an empty value.
+fn csv_serializable(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Boolean
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt64
+            | DataType::Decimal128(_, _)
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::Binary
+            | DataType::FixedSizeBinary(16)
+            | DataType::Date32
+            | DataType::Time64(TimeUnit::Microsecond)
+            | DataType::Timestamp(TimeUnit::Microsecond, _)
+    )
 }
 
 fn write_csv_value(writer: &mut dyn Write, array: &dyn Array, idx: usize) -> Result<()> {
@@ -222,7 +262,10 @@ fn write_csv_value(writer: &mut dyn Write, array: &dyn Array, idx: usize) -> Res
             }
         }
         other => {
-            log::warn!("CSV: unhandled Arrow type {:?}, skipping value", other);
+            // Defensive: `create_writer` rejects unsupported types up front, so
+            // this should be unreachable. Bail rather than silently skip if a
+            // new type slips through.
+            anyhow::bail!("CSV: no serializer for Arrow type {other:?} (column should have been rejected at writer creation)");
         }
     }
 
@@ -421,5 +464,26 @@ mod tests {
             writer.bytes_written()
         );
         writer.finish().unwrap();
+    }
+
+    // ── fail loud on types CSV can't represent ───────────────────────────────
+
+    #[test]
+    fn csv_rejects_array_columns_loudly() {
+        use crate::format::Format;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+        ]));
+        let Err(err) = CsvFormat.create_writer(&schema, Box::new(Vec::<u8>::new())) else {
+            panic!("CSV must reject array columns, not silently drop them");
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("tags"), "error must name the column: {msg}");
+        assert!(msg.to_lowercase().contains("csv"), "{msg}");
     }
 }
