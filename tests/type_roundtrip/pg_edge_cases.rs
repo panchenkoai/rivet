@@ -5,7 +5,7 @@
 //!
 //! Categories covered (ADR-0014 §4 extended):
 //!
-//!   * Decimal: `numeric(38,0)` (Decimal128 max precision); `numeric(39,10)`
+//!   * Decimal: `numeric(38,0)` (Decimal128 max precision); `numeric(50,10)`
 //!     (escalates to Decimal256); `numeric(5,-2)` (negative scale).
 //!   * Timestamp: pre-epoch (1700), far-future (9999), non-UTC offset
 //!     normalised to UTC at the wire.
@@ -99,20 +99,20 @@ fn pg_edge_decimal_boundaries_round_trip() {
         "CREATE TABLE {table_name} (
             id INT PRIMARY KEY,
             d38_0 NUMERIC(38, 0),
-            d39_10 NUMERIC(39, 10)
+            d50_10 NUMERIC(50, 10)
          );
          INSERT INTO {table_name} VALUES
             (1, 99999999999999999999999999999999999999, -- 38 nines, Decimal128 max
-                12345678901234567890123456789.0123456789)",
-        "SELECT id, d38_0, d39_10 FROM {table_name} ORDER BY id",
+                1234567890123456789012345678901234567890.0123456789)",
+        "SELECT id, d38_0, d50_10 FROM {table_name} ORDER BY id",
         "pg_edge_dec",
         // Ad-hoc SELECT queries do not let the driver reach numeric
         // precision/scale through the catalog; column overrides are the
         // documented escape hatch (roadmap §12).
-        "    columns:\n      d38_0: decimal(38,0)\n      d39_10: decimal(39,10)\n",
+        "    columns:\n      d38_0: decimal(38,0)\n      d50_10: decimal(50,10)\n",
     );
 
-    // Schema-level: precision 38 stays Decimal128, precision 39 escalates.
+    // Schema-level: precision 38 stays Decimal128, precision 50 escalates.
     let described = duckdb_run_sql_json(&format!("DESCRIBE SELECT * FROM read_parquet('{glob}')"));
     let actual = duckdb_parse_describe(&described);
     assert_eq!(actual["d38_0"], "DECIMAL(38,0)", "Decimal128 boundary");
@@ -123,7 +123,7 @@ fn pg_edge_decimal_boundaries_round_trip() {
     // `LogicalType::Decimal(39, 10)` — pyarrow reads it as Decimal256.
     // See `parquet_schema.rs` for the physical-type contract.
     assert_eq!(
-        actual["d39_10"], "DOUBLE",
+        actual["d50_10"], "DOUBLE",
         "DuckDB downgrades precision-39 DECIMAL to DOUBLE; \
          if this ever becomes DECIMAL(...), DuckDB grew Decimal256 support — \
          update the test"
@@ -140,20 +140,20 @@ fn pg_edge_decimal_boundaries_round_trip() {
         "Decimal128 max precision value"
     );
 
-    // Cross-check d39_10 round-trip through pyarrow (the reference reader
+    // Cross-check d50_10 round-trip through pyarrow (the reference reader
     // that handles Decimal256 properly). The seed value rendered as a
-    // string with 10 fractional digits is `12345678901234567890123456789.0123456789`.
+    // string with 10 fractional digits is `1234567890123456789012345678901234567890.0123456789`.
     let stdout = duckdb_run_python(&format!(
         r#"
 import pyarrow.parquet as pq, glob
 paths = sorted(glob.glob('{glob}'))
 t = pq.read_table(paths[0])
-print(str(t.column('d39_10').to_pylist()[0]))
+print(str(t.column('d50_10').to_pylist()[0]))
 "#,
     ));
     assert_eq!(
         stdout.trim(),
-        "12345678901234567890123456789.0123456789",
+        "1234567890123456789012345678901234567890.0123456789",
         "Decimal256 value must round-trip exactly through pyarrow"
     );
 }

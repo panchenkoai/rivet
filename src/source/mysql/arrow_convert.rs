@@ -726,15 +726,16 @@ fn mysql_decimal_to_decimal256(
     col_idx: usize,
     rows: &[mysql::Row],
 ) -> Result<Arc<dyn Array>> {
-    use crate::types::decimal::decimal_str_to_scaled_i128;
-    use arrow::datatypes::i256;
+    // Decimal256 (precision > 38): scale straight into i256 so values beyond
+    // i128 are not truncated.
+    use crate::types::decimal::{decimal_str_to_scaled_i256, scale_int_to_i256};
     let mut b = Decimal256Builder::with_capacity(rows.len());
     for row in rows {
         match row.as_ref(col_idx) {
             Some(Value::Bytes(bv)) => {
                 let s = bytes_to_str(bv).unwrap_or("");
-                match decimal_str_to_scaled_i128(s, scale) {
-                    Some(v) => b.append_value(i256::from_i128(v)),
+                match decimal_str_to_scaled_i256(s, scale) {
+                    Some(v) => b.append_value(v),
                     None => {
                         return Err(anyhow::anyhow!(
                             "cannot parse '{}' as decimal({},{})",
@@ -745,8 +746,8 @@ fn mysql_decimal_to_decimal256(
                     }
                 }
             }
-            Some(Value::Int(v)) => match scale_int_to_i128(*v as i128, scale) {
-                Some(scaled) => b.append_value(i256::from_i128(scaled)),
+            Some(Value::Int(v)) => match scale_int_to_i256(*v as i128, scale) {
+                Some(scaled) => b.append_value(scaled),
                 None => {
                     return Err(anyhow::anyhow!(
                         "decimal({},{}) overflow scaling integer {}",
@@ -756,8 +757,8 @@ fn mysql_decimal_to_decimal256(
                     ));
                 }
             },
-            Some(Value::UInt(v)) => match scale_int_to_i128(*v as i128, scale) {
-                Some(scaled) => b.append_value(i256::from_i128(scaled)),
+            Some(Value::UInt(v)) => match scale_int_to_i256(*v as i128, scale) {
+                Some(scaled) => b.append_value(scaled),
                 None => {
                     return Err(anyhow::anyhow!(
                         "decimal({},{}) overflow scaling unsigned integer {}",

@@ -3,9 +3,11 @@
 //! DuckDB (and pyarrow for Decimal256).
 //!
 //! Categories:
-//!   * Decimal: `DECIMAL(38,0)` (Decimal128 max), `DECIMAL(40,10)` (Decimal256)
-//!     — resolved **without an override** (MySQL carries precision/scale on the
-//!     wire, unlike PostgreSQL's catalog-only path; this is the parity test).
+//!   * Decimal: `DECIMAL(38,0)` (Decimal128 max), `DECIMAL(50,10)` (Decimal256,
+//!     50 significant digits — past the i128 ceiling, exercising the i256
+//!     parse) — resolved **without an override** (MySQL carries precision/scale
+//!     on the wire, unlike PostgreSQL's catalog-only path; this is the parity
+//!     test).
 //!   * Datetime: pre-1970 + far-future `DATETIME` (naive), `TIMESTAMP` (UTC).
 //!   * JSON: deep nesting, unicode keys, i64-edge numbers, mixed-type arrays.
 //!   * String: empty, whitespace, 100 KB single cell.
@@ -83,12 +85,12 @@ fn mysql_edge_decimal_boundaries_resolve_without_override() {
         "CREATE TABLE {table_name} (
             id INT PRIMARY KEY,
             d38_0 DECIMAL(38, 0),
-            d40_10 DECIMAL(40, 10)
+            d50_10 DECIMAL(50, 10)
          );
          INSERT INTO {table_name} VALUES
             (1, 99999999999999999999999999999999999999,
-                1234567890123456789012345678.0123456789)",
-        "SELECT id, d38_0, d40_10 FROM {table_name} ORDER BY id",
+                1234567890123456789012345678901234567890.0123456789)",
+        "SELECT id, d38_0, d50_10 FROM {table_name} ORDER BY id",
         "my_edge_dec",
         // No `columns:` override — MySQL derives precision/scale from the wire.
         "",
@@ -99,7 +101,7 @@ fn mysql_edge_decimal_boundaries_resolve_without_override() {
     assert_eq!(actual["d38_0"], "DECIMAL(38,0)", "Decimal128 boundary");
     // DuckDB downgrades precision > 38 to DOUBLE (same as the PG edge test);
     // the Parquet still carries Decimal256, checked via pyarrow below.
-    assert_eq!(actual["d40_10"], "DOUBLE", "DuckDB downgrades precision-40 to DOUBLE");
+    assert_eq!(actual["d50_10"], "DOUBLE", "DuckDB downgrades precision-50 to DOUBLE");
 
     let v = duckdb_run_sql_json(&format!(
         "SELECT d38_0::VARCHAR FROM read_parquet('{glob}') WHERE id = 1"
@@ -115,12 +117,12 @@ fn mysql_edge_decimal_boundaries_resolve_without_override() {
 import pyarrow.parquet as pq, glob
 paths = sorted(glob.glob('{glob}'))
 t = pq.read_table(paths[0])
-print(str(t.column('d40_10').to_pylist()[0]))
+print(str(t.column('d50_10').to_pylist()[0]))
 "#,
     ));
     assert_eq!(
         stdout.trim(),
-        "1234567890123456789012345678.0123456789",
+        "1234567890123456789012345678901234567890.0123456789",
         "Decimal256 value must round-trip exactly through pyarrow (no override needed)"
     );
 }

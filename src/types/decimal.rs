@@ -5,9 +5,12 @@
 //! Arrow Decimal128 stores a value as `i128 * 10^(-scale)`. So to
 //! represent "123.45" in `Decimal128(18, 2)` we need `i128 = 12345`.
 //!
-//! This module provides one pure function — [`decimal_str_to_scaled_i128`] —
-//! that converts a DB text-protocol decimal string to the scaled i128 Arrow
-//! needs without ever touching floating-point arithmetic.
+//! This module converts a DB text-protocol decimal string to the scaled
+//! integer Arrow needs without ever touching floating-point arithmetic —
+//! `i128` for `Decimal128` (precision ≤ 38) and `i256` for `Decimal256`
+//! (precision 39–76).
+
+use arrow::datatypes::i256;
 
 /// Convert a decimal string (as returned by the database text protocol) to
 /// a scaled `i128` ready to be stored in an Arrow `Decimal128` array.
@@ -112,6 +115,72 @@ pub fn decimal_str_to_scaled_i128(s: &str, scale: i8) -> Option<i128> {
         .checked_mul(scale_factor)?
         .checked_add(frac_aligned)?;
     Some(if negative { -result } else { result })
+}
+
+/// `Decimal256` analogue of [`decimal_str_to_scaled_i128`] — parses straight
+/// into `i256` so values beyond `i128` (precision 39–76) are not truncated.
+/// Returns `None` for empty / non-numeric strings or `i256` overflow.
+pub fn decimal_str_to_scaled_i256(s: &str, scale: i8) -> Option<i256> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let negative = s.starts_with('-');
+    let s = if negative {
+        &s[1..]
+    } else {
+        s.trim_start_matches('+')
+    };
+
+    if scale < 0 {
+        let divisor = pow10_i256(scale.unsigned_abs() as u32)?;
+        let int_val = i256::from_string(s.split('.').next()?.trim())?;
+        let result = int_val.checked_div(divisor)?;
+        return Some(if negative { -result } else { result });
+    }
+
+    let scale_u = scale as u32;
+    let (int_part, frac_part) = match s.find('.') {
+        Some(dot) => (&s[..dot], &s[dot + 1..]),
+        None => (s, ""),
+    };
+    let int_val = if int_part.is_empty() {
+        i256::ZERO
+    } else {
+        i256::from_string(int_part)?
+    };
+    let frac_aligned = if scale_u == 0 {
+        i256::ZERO
+    } else if frac_part.len() < scale_u as usize {
+        let mut buf = String::with_capacity(scale_u as usize);
+        buf.push_str(frac_part);
+        for _ in 0..(scale_u as usize - frac_part.len()) {
+            buf.push('0');
+        }
+        i256::from_string(&buf)?
+    } else {
+        i256::from_string(&frac_part[..scale_u as usize])?
+    };
+
+    let scale_factor = pow10_i256(scale_u)?;
+    let result = int_val.checked_mul(scale_factor)?.checked_add(frac_aligned)?;
+    Some(if negative { -result } else { result })
+}
+
+/// Scale an integer (already widened to `i128`) by `10^scale` into `i256` — the
+/// `Decimal256` analogue of the source drivers' `scale_int_to_i128`. `None` on
+/// negative scale or `i256` overflow.
+pub fn scale_int_to_i256(v: i128, scale: i8) -> Option<i256> {
+    if scale < 0 {
+        return None;
+    }
+    i256::from_i128(v).checked_mul(pow10_i256(scale as u32)?)
+}
+
+/// `10^n` as `i256` (up to 10^76, the `Decimal256` scale ceiling); `None` if it
+/// would exceed `i256`.
+fn pow10_i256(n: u32) -> Option<i256> {
+    i256::from_string(&format!("1{}", "0".repeat(n as usize)))
 }
 
 #[cfg(test)]
@@ -227,5 +296,45 @@ mod tests {
 
         // Fractional overflow: huge integer part + any scale.
         assert_eq!(decimal_str_to_scaled_i128(&format!("{max_digits}.5"), 5), None);
+    }
+
+    // ── i256 (Decimal256) path: the i128 bottleneck is gone ──────────────────
+
+    #[test]
+    fn i256_handles_values_beyond_i128() {
+        // A 45-digit integer overflows i128 (~38 digits) but fits i256.
+        let big = "123456789012345678901234567890123456789012345";
+        assert_eq!(decimal_str_to_scaled_i128(big, 0), None, "i128 overflows");
+        assert_eq!(
+            decimal_str_to_scaled_i256(big, 0).unwrap(),
+            i256::from_string(big).unwrap()
+        );
+        // With a fractional part scaled in.
+        let v = decimal_str_to_scaled_i256("123456789012345678901234567890123456789012.345", 3)
+            .unwrap();
+        assert_eq!(
+            v,
+            i256::from_string("123456789012345678901234567890123456789012345").unwrap()
+        );
+    }
+
+    #[test]
+    fn i256_matches_i128_for_in_range_values() {
+        for (s, scale) in [("123.45", 2i8), ("-1.23", 2), ("0.10", 2), ("1200", -2)] {
+            let small = decimal_str_to_scaled_i128(s, scale).unwrap();
+            assert_eq!(
+                decimal_str_to_scaled_i256(s, scale).unwrap(),
+                i256::from_i128(small),
+                "i256 and i128 must agree for in-range value {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn scale_int_to_i256_scales_beyond_i128() {
+        // u64::MAX (~1.8e19) scaled by 10^30 ≈ 1.8e49 — fits i256.
+        assert!(scale_int_to_i256(u64::MAX as i128, 30).is_some());
+        assert_eq!(scale_int_to_i256(5, 2), Some(i256::from_i128(500)));
+        assert_eq!(scale_int_to_i256(123, -1), None, "negative scale rejected");
     }
 }

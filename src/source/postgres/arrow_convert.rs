@@ -704,24 +704,16 @@ fn build_pg_list_array(
 /// We decode exactly (via [`crate::source::pg_numeric_wire`]), then stringify for
 /// [`crate::types::decimal::decimal_str_to_scaled_i128`] — never through `f64`.
 /// A trivial `Utf8` fallback remains for unconventional cast-to-text callers.
-fn pg_numeric_optional_scaled_i128(row: &Row, col_idx: usize, scale: i8) -> Result<Option<i128>> {
-    use crate::types::decimal::decimal_str_to_scaled_i128;
-
+/// Read one PG `NUMERIC` cell to its exact plain-text form (e.g. `"123.45"`),
+/// decoding the wire binary (`numeric_recv`) without `f64`. `None` for SQL NULL.
+/// Shared by the Decimal128 (i128) and Decimal256 (i256) scaling paths so the
+/// wire-read isn't duplicated.
+fn pg_numeric_optional_plain(row: &Row, col_idx: usize) -> Result<Option<String>> {
     match row.try_get::<_, Option<PgNumericWire<'_>>>(col_idx) {
         Ok(Some(wire)) => match numeric_wire_normalized_plain(wire.0) {
             Some(plain) => {
                 let t = plain.trim();
-                if t.is_empty() {
-                    return Ok(None);
-                }
-                decimal_str_to_scaled_i128(t, scale)
-                    .map(Some)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "cannot parse DECIMAL {:?} as decimal(scale={scale}) after binary decode",
-                            t
-                        )
-                    })
+                Ok((!t.is_empty()).then(|| t.to_string()))
             }
             None => Err(anyhow::anyhow!(
                 "PostgreSQL NUMERIC: unsupported NaN/infinity payload (column idx {col_idx})",
@@ -729,19 +721,22 @@ fn pg_numeric_optional_scaled_i128(row: &Row, col_idx: usize, scale: i8) -> Resu
         },
         Ok(None) => Ok(None),
         Err(_) => {
+            // Fallback for unconventional cast-to-text callers.
             if let Ok(Some(s)) = row.try_get::<_, Option<String>>(col_idx) {
                 let t = s.trim();
-                if t.is_empty() {
-                    return Ok(None);
-                }
-                return decimal_str_to_scaled_i128(t, scale)
-                    .map(Some)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("cannot parse {:?} as decimal(scale={scale})", t)
-                    });
+                return Ok((!t.is_empty()).then(|| t.to_string()));
             }
             Ok(None)
         }
+    }
+}
+
+fn pg_numeric_optional_scaled_i128(row: &Row, col_idx: usize, scale: i8) -> Result<Option<i128>> {
+    match pg_numeric_optional_plain(row, col_idx)? {
+        Some(t) => crate::types::decimal::decimal_str_to_scaled_i128(&t, scale)
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("cannot parse DECIMAL {t:?} as decimal(scale={scale})")),
+        None => Ok(None),
     }
 }
 
@@ -771,11 +766,16 @@ fn pg_numeric_to_decimal256(
     col_idx: usize,
     rows: &[Row],
 ) -> Result<Arc<dyn Array>> {
-    use arrow::datatypes::i256;
+    use crate::types::decimal::decimal_str_to_scaled_i256;
     let mut b = Decimal256Builder::with_capacity(rows.len());
     for row in rows {
-        match pg_numeric_optional_scaled_i128(row, col_idx, scale)? {
-            Some(v) => b.append_value(i256::from_i128(v)),
+        match pg_numeric_optional_plain(row, col_idx)? {
+            Some(t) => {
+                let v = decimal_str_to_scaled_i256(&t, scale).ok_or_else(|| {
+                    anyhow::anyhow!("cannot parse DECIMAL {t:?} as decimal({precision},{scale})")
+                })?;
+                b.append_value(v);
+            }
             None => b.append_null(),
         }
     }
