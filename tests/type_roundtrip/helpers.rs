@@ -55,6 +55,15 @@ pub const PG_MATRIX_COLUMNS: &str = "\
     raw_bytes, uid, attrs, attrs_json, c_bool, interval_col, enum_col, tags, nums, \
     large_text, note_nullable, note_all_null";
 
+/// Same as [`PG_MATRIX_COLUMNS`] without the `List` columns (`tags`, `nums`):
+/// CSV has no array cell, so a CSV export of those fails loudly by design.
+/// Parquet keeps them.
+pub const PG_MATRIX_COLUMNS_CSV: &str = "\
+    id, c_smallint, c_integer, c_bigint, amount, fee, price, c_real, c_double, \
+    c_date, c_time, created_at, created_at_tz, label, c_varchar, c_bpchar, \
+    raw_bytes, uid, attrs, attrs_json, c_bool, interval_col, enum_col, \
+    large_text, note_nullable, note_all_null";
+
 pub const MYSQL_MATRIX_COLUMNS: &str = "\
     id, c_tinyint, c_tinyint_u, c_bool, c_boolean, c_smallint, c_smallint_u, c_int, c_int_u, \
     c_bigint, c_bigint_u, amount, fee, price, c_float, c_double, c_date, c_time, \
@@ -471,6 +480,12 @@ exports:
 pub fn run_pg_matrix_export(table_name: &str, format: &str, out_dir: &Path) {
     let export_name = unique_name("type_rt_pg");
     let cfg_dir = tempfile::tempdir().unwrap();
+    // CSV has no array cell — drop the List columns (Parquet keeps them).
+    let columns = if format == "csv" {
+        PG_MATRIX_COLUMNS_CSV
+    } else {
+        PG_MATRIX_COLUMNS
+    };
     let yaml = format!(
         r#"
 source:
@@ -479,7 +494,7 @@ source:
 exports:
   - name: {export_name}
     query: >-
-      SELECT {PG_MATRIX_COLUMNS}
+      SELECT {columns}
       FROM {table_name} ORDER BY id
     mode: full
     format: {format}
