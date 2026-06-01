@@ -30,7 +30,7 @@ use crate::manifest::{
 /// hex single-part ETag.  Returns `None` for anything that is not a plain
 /// 16-byte MD5 — an S3 multipart composite ETag (`<hash>-<N>`), an empty or
 /// legacy value — signalling "not comparable, fall back to size-only".
-fn md5_digest_bytes(s: &str) -> Option<[u8; 16]> {
+pub(crate) fn md5_digest_bytes(s: &str) -> Option<[u8; 16]> {
     // Hex (S3 single-part ETag): exactly 32 hex chars.
     if s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
         let mut out = [0u8; 16];

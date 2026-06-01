@@ -933,7 +933,7 @@ mod tests {
     /// so a listing we cannot read means the audit cannot certify the parts.
     struct ListFails(LocalDestination);
     impl crate::destination::Destination for ListFails {
-        fn write(&self, p: &Path, k: &str) -> Result<()> {
+        fn write(&self, p: &Path, k: &str) -> Result<crate::destination::WriteOutcome> {
             self.0.write(p, k)
         }
         fn capabilities(&self) -> crate::destination::DestinationCapabilities {

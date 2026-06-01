@@ -157,7 +157,7 @@ impl<B: CloudBackend> CloudDestination<B> {
 }
 
 impl<B: CloudBackend> super::Destination for CloudDestination<B> {
-    fn write(&self, local_path: &Path, remote_key: &str) -> Result<()> {
+    fn write(&self, local_path: &Path, remote_key: &str) -> Result<super::WriteOutcome> {
         let key = format!("{}{}", self.prefix, remote_key);
         let size = std::fs::metadata(local_path)?.len();
         // One-shot upload when the part fits the shared memory budget: a single
@@ -168,17 +168,28 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
         // single `Put Blob`, never for the `Put Block List` the streaming
         // writer produces (each `write()` past the first stages a block).
         // Otherwise stream — memory-bounded, size-only for those parts.
-        if let Some(_reservation) = reserve_oneshot(size) {
+        let outcome = if let Some(_reservation) = reserve_oneshot(size) {
             let body = std::fs::read(local_path)?;
-            self.op.write(&key, body)?;
+            let meta = self.op.write(&key, body)?;
+            // The single-PUT response carries the store's own checksum: GCS /
+            // Azure as `content_md5` (base64), S3 as the ETag (hex MD5).  Hand
+            // it back for the commit-time transit check.
+            super::WriteOutcome {
+                content_md5: meta
+                    .content_md5()
+                    .map(str::to_string)
+                    .or_else(|| meta.etag().map(|e| e.trim_matches('"').to_string())),
+            }
         } else {
             let mut src = std::fs::File::open(local_path)?;
             let mut dst = self.op.writer(&key)?.into_std_write();
             std::io::copy(&mut src, &mut dst)?;
             dst.close()?;
-        }
+            // Streamed (multipart / block-list): no full-object checksum.
+            super::WriteOutcome::opaque()
+        };
         log::info!("uploaded {}://{} ({size} bytes)", B::SCHEME, key);
-        Ok(())
+        Ok(outcome)
     }
 
     fn capabilities(&self) -> super::DestinationCapabilities {

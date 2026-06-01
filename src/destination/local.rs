@@ -19,14 +19,14 @@ impl LocalDestination {
 }
 
 impl super::Destination for LocalDestination {
-    fn write(&self, local_path: &Path, remote_key: &str) -> Result<()> {
+    fn write(&self, local_path: &Path, remote_key: &str) -> Result<super::WriteOutcome> {
         let target = Path::new(&self.base_path).join(remote_key);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::copy(local_path, &target)?;
         log::info!("wrote {}", target.display());
-        Ok(())
+        Ok(super::WriteOutcome::opaque()) // local FS reports no content checksum
     }
 
     fn capabilities(&self) -> super::DestinationCapabilities {
