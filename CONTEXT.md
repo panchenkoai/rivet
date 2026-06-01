@@ -87,9 +87,10 @@ manifest (base64, GCS `md5Hash` encoding). Destination verification compares it
 to the object's listing metadata to confirm content without downloading. Backend
 coverage (verified live unless noted): **GCS** base64 `md5Hash` (always);
 **S3** single-part ETag hex (always; multipart composite `<hash>-<N>` → size-only);
-**Azure** size-only in practice — Azure auto-computes a `Content-MD5` only for a
-single-shot `Put Blob`, but rivet's uploads land as `Put Block List` block blobs
-(verified live) for which Azure sets none; **local FS** size-only. Encodings are normalised
+**Azure** md5 for parts rivet uploads as a single `Put Blob` (Azure auto-computes
+`Content-MD5` only then — verified live), size-only for parts large enough to
+stream as `Put Block List`; **local FS** size-only. The one-shot vs stream
+threshold (`cloud.rs`) is what makes Azure md5 work for small parts. Encodings are normalised
 to raw digest bytes (`md5_digest_bytes`) so base64 and hex of the same digest
 compare equal. _Avoid_: checksum, hash (use for the xxh3 `content_fingerprint`).
 

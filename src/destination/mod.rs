@@ -77,10 +77,11 @@ pub struct ObjectMeta {
     /// - **GCS** — always (`md5Hash`, base64).
     /// - **S3** — single-part objects (ETag, hex); multipart composite ETags
     ///   (`<hash>-<N>`) are not an MD5 and verify size-only.
-    /// - **Azure** — only when the blob carries a `Content-MD5`. Azure
-    ///   auto-computes one *only* for a single-shot `Put Blob`; rivet's uploads
-    ///   land as `Put Block List` block blobs (verified live — no `Content-MD5`
-    ///   header), for which Azure sets none, so Azure verifies size-only.
+    /// - **Azure** — when the blob carries a `Content-MD5`. Azure auto-computes
+    ///   one *only* for a single-shot `Put Blob`, so rivet one-shots parts that
+    ///   fit in memory (verified live: `Content-MD5` present → md5-checked);
+    ///   parts large enough to stream upload as `Put Block List`, which carries
+    ///   no `Content-MD5` → those verify size-only.
     /// - **Local FS** — never.
     pub content_md5: Option<String>,
 }

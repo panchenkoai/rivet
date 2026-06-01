@@ -114,11 +114,27 @@ impl<B: CloudBackend> CloudDestination<B> {
 impl<B: CloudBackend> super::Destination for CloudDestination<B> {
     fn write(&self, local_path: &Path, remote_key: &str) -> Result<()> {
         let key = format!("{}{}", self.prefix, remote_key);
-        let mut src = std::fs::File::open(local_path)?;
-        let mut dst = self.op.writer(&key)?.into_std_write();
-        std::io::copy(&mut src, &mut dst)?;
-        dst.close()?;
-        log::info!("uploaded {}://{}", B::SCHEME, key);
+        let size = std::fs::metadata(local_path)?.len();
+        // One-shot upload for parts that fit comfortably in memory: a single
+        // PUT (S3 `PutObject` / GCS upload / Azure `Put Blob`) makes the store
+        // compute and store a content checksum that the listing then exposes
+        // for no-download verification.  This is what lets `--validate`
+        // md5-check Azure parts at all: Azure auto-computes `Content-MD5` only
+        // for a single `Put Blob`, never for the `Put Block List` that the
+        // streaming writer produces (each `write()` call past the first stages
+        // a block).  Above the threshold we stream — bounding memory at the
+        // cost of size-only verification for those (large) parts.
+        const ONE_SHOT_MAX: u64 = 256 * 1024 * 1024;
+        if size <= ONE_SHOT_MAX {
+            let body = std::fs::read(local_path)?;
+            self.op.write(&key, body)?;
+        } else {
+            let mut src = std::fs::File::open(local_path)?;
+            let mut dst = self.op.writer(&key)?.into_std_write();
+            std::io::copy(&mut src, &mut dst)?;
+            dst.close()?;
+        }
+        log::info!("uploaded {}://{} ({size} bytes)", B::SCHEME, key);
         Ok(())
     }
 
