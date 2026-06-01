@@ -368,7 +368,8 @@ every source reference (`"col"`).
 | `binary`  | `BINARY` *(needs `BINARY_AS_TEXT=FALSE`)* | `BINARY` | — (set the file-format option) |
 | `timestamp_tz` | `TIMESTAMP_TZ` *(pin session `TIMEZONE='UTC'`)* | `TIMESTAMP_TZ` | — (autoload uses session offset otherwise) |
 | `u_int64` | `NUMBER` (overflows > 2^63−1) | `NUMBER(20,0)` | none post-load — fix at source: `columns: { c: decimal(20,0) }` |
-| `decimal`, `string`, `bool`, `date`, ints, `list` | native | same | — |
+| `list<inner>` | `VARIANT` (the JSON array) | `ARRAY` | `"col"::ARRAY` |
+| `decimal`, `string`, `bool`, `date`, ints | native | same | — |
 
 The load preamble the recovery depends on: `CREATE FILE FORMAT … TYPE=PARQUET
 BINARY_AS_TEXT=FALSE`, `ALTER SESSION SET TIMEZONE='UTC'`, `CREATE TABLE … USING

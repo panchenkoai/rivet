@@ -50,3 +50,5 @@ mod postgres_parquet_roundtrip;
 mod property;
 #[path = "type_roundtrip/pyarrow_load.rs"]
 mod pyarrow_load;
+#[path = "type_roundtrip/snowflake_load.rs"]
+mod snowflake_load;
