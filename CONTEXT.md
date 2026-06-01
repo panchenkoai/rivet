@@ -84,11 +84,13 @@ mappers — destination verify (`Presence → Failure`) and chunked resume
 **Content MD5**:
 The part-body MD5 rivet computes locally before upload and records in the
 manifest (base64, GCS `md5Hash` encoding). Destination verification compares it
-to the object's listing metadata to confirm content without downloading. Stores
-encode it differently — GCS base64, S3 single-part ETag hex — so both sides are
-normalised to raw digest bytes (`md5_digest_bytes`) before comparing; an S3
-multipart composite ETag (`<hash>-<N>`) is not a plain MD5 and degrades the part
-to size-only. _Avoid_: checksum, hash (use for the xxh3 `content_fingerprint`).
+to the object's listing metadata to confirm content without downloading. Backend
+coverage (verified live unless noted): **GCS** base64 `md5Hash` (always);
+**S3** single-part ETag hex (always; multipart composite `<hash>-<N>` → size-only);
+**Azure** only when the blob has a `Content-MD5`, which OpenDAL doesn't set on
+upload → size-only in practice; **local FS** size-only. Encodings are normalised
+to raw digest bytes (`md5_digest_bytes`) so base64 and hex of the same digest
+compare equal. _Avoid_: checksum, hash (use for the xxh3 `content_fingerprint`).
 
 **Integrity level**:
 The strongest assertion a verdict makes. `Structural` = presence + size +

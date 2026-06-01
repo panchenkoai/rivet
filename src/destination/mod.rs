@@ -71,11 +71,16 @@ pub struct ObjectMeta {
     /// the same shape `Destination::write`'s `remote_key` argument uses.
     pub key: String,
     pub size_bytes: u64,
-    /// Base64 MD5 of the object body when the backend exposes it in listing /
-    /// stat metadata (GCS `md5Hash`, S3/Azure equivalents), else `None`.
-    /// Lets verification compare content against `manifest.parts[].content_md5`
-    /// with no download.  `None` for local FS and for composite/multipart
-    /// objects a store leaves without an MD5 — the check degrades to size-only.
+    /// The object's content MD5 from listing / stat metadata, when the backend
+    /// exposes one — `None` otherwise.  Lets verification compare content
+    /// against `manifest.parts[].content_md5` with no download.  Coverage:
+    /// - **GCS** — always (`md5Hash`, base64).
+    /// - **S3** — single-part objects (ETag, hex); multipart composite ETags
+    ///   (`<hash>-<N>`) are not an MD5 and verify size-only.
+    /// - **Azure** — only when the blob carries a `Content-MD5`; Azure does not
+    ///   compute one server-side and OpenDAL 0.55 cannot set it on upload, so
+    ///   in practice Azure blobs rivet writes have none → size-only.
+    /// - **Local FS** — never.
     pub content_md5: Option<String>,
 }
 

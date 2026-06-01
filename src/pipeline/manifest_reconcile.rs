@@ -124,11 +124,12 @@ pub fn reconcile_manifest_against_listing(
                 // Size matches.  When both the manifest and the listing carry
                 // a comparable MD5, the content must match too — a free
                 // no-download integrity check.  Stores encode it differently
-                // (GCS `md5Hash` is base64; S3's single-part ETag is hex), so
-                // both sides are normalised to raw digest bytes before
-                // comparing.  Anything that isn't a plain 16-byte MD5 — an S3
-                // multipart composite ETag (`<hash>-<N>`), an empty/legacy
-                // value, a local FS `None` — is not comparable, so the part
+                // (GCS `md5Hash` base64; S3 single-part ETag hex), so both
+                // sides normalise to raw digest bytes before comparing.
+                // Anything that isn't a plain 16-byte MD5 — an S3 multipart
+                // composite ETag (`<hash>-<N>`), an Azure blob with no
+                // Content-MD5 (OpenDAL doesn't set one on upload), a local FS
+                // `None`, a legacy value — is not comparable, so the part
                 // degrades to size-only (`Present`).
                 match meta.content_md5.as_deref().and_then(md5_digest_bytes) {
                     Some(actual) => match md5_digest_bytes(&part.content_md5) {
