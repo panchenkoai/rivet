@@ -353,13 +353,12 @@ pub(super) fn rows_to_record_batch_typed(
     for (col_idx, (name, pg_type)) in columns.iter().enumerate() {
         let target_type = schema.field(col_idx).data_type();
         let arr = build_array(pg_type, target_type, col_idx, rows)?;
-        // Guard (slice A): the value converter dispatches on the wire type, while
-        // the schema field carries the resolved/overridden target type. If a
-        // column override retyped the column to something the converter can't
-        // produce (e.g. `uuid: string` — the wire UUID arm still builds
-        // FixedSizeBinary(16) while the field is Utf8), the two disagree. Fail
-        // loud with a column-named message instead of the opaque downstream
-        // `RecordBatch::try_new` type-mismatch error.
+        // Defensive invariant: `build_array` now dispatches on `target_type`, so
+        // the produced array matches the schema field by construction. This
+        // guard turns any future arm that builds the wrong width/unit into a
+        // clear column-named error instead of the opaque downstream
+        // `RecordBatch::try_new` type-mismatch — it should never fire for
+        // correct code.
         if arr.data_type() != target_type {
             anyhow::bail!(
                 "column '{name}' (PG wire type {pg_type:?}): the value converter produced \
@@ -381,29 +380,36 @@ fn build_array(
     col_idx: usize,
     rows: &[Row],
 ) -> Result<Arc<dyn Array>> {
-    match *pg_type {
-        Type::BOOL => {
+    // Dispatch on the schema's resolved TARGET type — the single decision site.
+    // `pg_type` only chooses *how* to read the wire value (which `FromSql`),
+    // never *what* array to build, so the produced array always matches the
+    // schema field by construction. (The old dispatch-on-`pg_type` path was a
+    // second type-decision site that re-derived the Arrow type and could drift
+    // from the schema on overrides; slice A collapses it.)
+    match target_type {
+        DataType::Boolean => {
             let mut b = BooleanBuilder::with_capacity(rows.len());
             for row in rows {
                 b.append_option(row.get(col_idx));
             }
             Ok(Arc::new(b.finish()))
         }
-        Type::INT2 => {
+        DataType::Int16 => {
             let mut b = Int16Builder::with_capacity(rows.len());
             for row in rows {
                 b.append_option(row.get(col_idx));
             }
             Ok(Arc::new(b.finish()))
         }
-        Type::INT4 => {
+        DataType::Int32 => {
             let mut b = Int32Builder::with_capacity(rows.len());
             for row in rows {
                 b.append_option(row.get(col_idx));
             }
             Ok(Arc::new(b.finish()))
         }
-        Type::INT8 | Type::OID => {
+        DataType::Int64 => {
+            // INT8 reads i64; OID reads u32 widened to i64.
             let mut b = Int64Builder::with_capacity(rows.len());
             if *pg_type == Type::OID {
                 for row in rows {
@@ -416,29 +422,24 @@ fn build_array(
             }
             Ok(Arc::new(b.finish()))
         }
-        Type::FLOAT4 => {
+        DataType::Float32 => {
             let mut b = Float32Builder::with_capacity(rows.len());
             for row in rows {
                 b.append_option(row.get(col_idx));
             }
             Ok(Arc::new(b.finish()))
         }
-        Type::FLOAT8 => {
+        DataType::Float64 => {
             let mut b = Float64Builder::with_capacity(rows.len());
             for row in rows {
                 b.append_option(row.get(col_idx));
             }
             Ok(Arc::new(b.finish()))
         }
-        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => {
-            let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
-            for row in rows {
-                let val: Option<String> = row.get(col_idx);
-                b.append_option(val.as_deref());
-            }
-            Ok(Arc::new(b.finish()))
-        }
-        Type::BYTEA => {
+        // Exact decimal — precision/scale come from the resolved target.
+        DataType::Decimal128(p, s) => pg_numeric_to_decimal128(*p, *s, col_idx, rows),
+        DataType::Decimal256(p, s) => pg_numeric_to_decimal256(*p, *s, col_idx, rows),
+        DataType::Binary => {
             let mut b = BinaryBuilder::with_capacity(rows.len(), rows.len() * 64);
             for row in rows {
                 match row.get::<_, Option<Vec<u8>>>(col_idx) {
@@ -448,7 +449,7 @@ fn build_array(
             }
             Ok(Arc::new(b.finish()))
         }
-        Type::DATE => {
+        DataType::Date32 => {
             let mut b = Date32Builder::with_capacity(rows.len());
             for row in rows {
                 match row.get::<_, Option<chrono::NaiveDate>>(col_idx) {
@@ -462,7 +463,7 @@ fn build_array(
             }
             Ok(Arc::new(b.finish()))
         }
-        Type::TIME => {
+        DataType::Time64(_) => {
             let mut b = Time64MicrosecondBuilder::with_capacity(rows.len());
             for row in rows {
                 match row.get::<_, Option<chrono::NaiveTime>>(col_idx) {
@@ -476,149 +477,132 @@ fn build_array(
             }
             Ok(Arc::new(b.finish()))
         }
-        Type::TIMESTAMP => {
+        // Read by wire type — TIMESTAMPTZ as an instant, TIMESTAMP as wall-clock;
+        // the micros are identical, the UTC tag comes from the target type
+        // (roadmap §13: TIMESTAMPTZ carries isAdjustedToUTC=true).
+        DataType::Timestamp(_, tz) => {
             let mut b = TimestampMicrosecondBuilder::with_capacity(rows.len());
+            if *pg_type == Type::TIMESTAMPTZ {
+                for row in rows {
+                    match row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(col_idx) {
+                        Some(ts) => b.append_value(ts.timestamp_micros()),
+                        None => b.append_null(),
+                    }
+                }
+            } else {
+                for row in rows {
+                    match row.get::<_, Option<chrono::NaiveDateTime>>(col_idx) {
+                        Some(ts) => b.append_value(ts.and_utc().timestamp_micros()),
+                        None => b.append_null(),
+                    }
+                }
+            }
+            let arr = b.finish();
+            Ok(match tz {
+                Some(tz) => Arc::new(arr.with_timezone(tz.as_ref())),
+                None => Arc::new(arr),
+            })
+        }
+        // UUID → 16-byte FixedSizeBinary (+ the `arrow.uuid` extension attached
+        // upstream lets parquet-rs emit native `LogicalType::Uuid`).
+        DataType::FixedSizeBinary(16) => {
+            let mut b = FixedSizeBinaryBuilder::with_capacity(rows.len(), 16);
             for row in rows {
-                match row.get::<_, Option<chrono::NaiveDateTime>>(col_idx) {
-                    Some(ts) => b.append_value(ts.and_utc().timestamp_micros()),
+                match row.try_get::<_, Option<PgUuidBytes>>(col_idx)? {
                     None => b.append_null(),
+                    Some(PgUuidBytes(bytes)) => b
+                        .append_value(bytes)
+                        .expect("16 bytes always matches FixedSizeBinary(16)"),
                 }
             }
             Ok(Arc::new(b.finish()))
         }
-        // Roadmap §13: TIMESTAMPTZ is normalized to UTC. The Arrow array carries
-        // the UTC timezone tag so Parquet writes TIMESTAMP_MICROS(isAdjustedToUTC=true).
-        Type::TIMESTAMPTZ => {
-            let mut b = TimestampMicrosecondBuilder::with_capacity(rows.len());
+        // Utf8 target: several wire types render to text. The read is chosen by
+        // `pg_type`, so this is where `col: string` overrides land (numeric/uuid
+        // → text) alongside the natural text/json/enum/interval columns.
+        DataType::Utf8 => build_pg_text_array(pg_type, col_idx, rows),
+        DataType::List(_) => build_pg_list_array(target_type, col_idx, rows),
+        other => anyhow::bail!(
+            "no PostgreSQL value converter for target Arrow type {other:?} \
+             (wire type {pg_type:?}, column index {col_idx})"
+        ),
+    }
+}
+
+/// Build a `Utf8` array from whichever PostgreSQL wire type the schema resolved
+/// to text: the natural text types, JSON, an enum, an interval, or a numeric /
+/// uuid column an operator retyped to `string` via a `columns:` override. Bails
+/// on a wire type with no text rendering (fail-loud, slice A) instead of the old
+/// silent `try_get::<String>` → null.
+fn build_pg_text_array(pg_type: &Type, col_idx: usize, rows: &[Row]) -> Result<Arc<dyn Array>> {
+    let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
+    match *pg_type {
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => {
             for row in rows {
-                match row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(col_idx) {
-                    Some(ts) => b.append_value(ts.timestamp_micros()),
-                    None => b.append_null(),
-                }
+                let val: Option<String> = row.get(col_idx);
+                b.append_option(val.as_deref());
             }
-            Ok(Arc::new(b.finish().with_timezone("UTC")))
         }
-        // UUID: 16-byte FixedSizeBinary so the `arrow.uuid` extension type
-        // attached upstream lets parquet-rs emit native `LogicalType::Uuid`
-        // (see ADR-0014 §4 and [`crate::types::mapping::build_arrow_field`]).
-        // UUID honours the schema's resolved target (like the NUMERIC arm):
-        // the default `FixedSizeBinary(16)`, or `Utf8` when an operator wrote
-        // `columns: { uid: string }` to retype it to canonical text. The wire
-        // read is the same; only the array we build follows `target_type`, so
-        // the value dispatch can never disagree with the schema.
-        Type::UUID => match target_type {
-            DataType::Utf8 | DataType::LargeUtf8 => {
-                let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 36);
-                for row in rows {
-                    match row.try_get::<_, Option<PgUuidBytes>>(col_idx)? {
-                        None => b.append_null(),
-                        Some(PgUuidBytes(bytes)) => {
-                            b.append_value(uuid::Uuid::from_bytes(bytes).to_string())
-                        }
-                    }
-                }
-                Ok(Arc::new(b.finish()))
-            }
-            _ => {
-                let mut b = FixedSizeBinaryBuilder::with_capacity(rows.len(), 16);
-                for row in rows {
-                    match row.try_get::<_, Option<PgUuidBytes>>(col_idx)? {
-                        None => b.append_null(),
-                        Some(PgUuidBytes(bytes)) => b
-                            .append_value(bytes)
-                            .expect("16 bytes always matches FixedSizeBinary(16)"),
-                    }
-                }
-                Ok(Arc::new(b.finish()))
-            }
-        },
-        // JSON / JSONB: Utf8 preserving JSON semantics — `postgres` rejects `String` for these OIDs,
-        // so deserialize via [`Json`] rather than emitting silent null arrays.
+        // `postgres` rejects `String` for these OIDs — read via `Json`.
         Type::JSON | Type::JSONB => {
-            let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
             for row in rows {
                 match row.try_get::<_, Option<Json<JsonValue>>>(col_idx)? {
                     None => b.append_null(),
-                    Some(Json(v)) => {
-                        let s = serde_json::to_string(&v)?;
-                        b.append_value(&s);
-                    }
+                    Some(Json(v)) => b.append_value(&serde_json::to_string(&v)?),
                 }
             }
-            Ok(Arc::new(b.finish()))
         }
-        // NUMERIC: exact Decimal128/256 path when the user declared precision/scale
-        // via a column override; otherwise fall back to Utf8 (schema already carries
-        // rivet.fidelity=unsupported metadata so downstream tooling can detect it).
-        Type::NUMERIC => match target_type {
-            DataType::Decimal128(p, s) => pg_numeric_to_decimal128(*p, *s, col_idx, rows),
-            DataType::Decimal256(p, s) => pg_numeric_to_decimal256(*p, *s, col_idx, rows),
-            _ => {
-                let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
-                for row in rows {
-                    let val = pg_numeric_optional_utf8_string(row, col_idx)?;
-                    b.append_option(val.as_deref());
-                }
-                Ok(Arc::new(b.finish()))
+        // `numeric: string` override — exact text, never via float.
+        Type::NUMERIC => {
+            for row in rows {
+                let val = pg_numeric_optional_utf8_string(row, col_idx)?;
+                b.append_option(val.as_deref());
             }
-        },
-        _ => {
-            // INTERVAL → Utf8 ISO 8601 (Interval(MonthDayNano) is not Parquet-writable).
-            if *pg_type == Type::INTERVAL {
-                let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 12);
-                for row in rows {
-                    match row.try_get::<_, Option<PgInterval>>(col_idx).ok().flatten() {
-                        Some(iv) => b.append_value(pg_interval_to_iso8601(
-                            iv.months,
-                            iv.days,
-                            iv.microseconds,
-                        )),
-                        None => b.append_null(),
-                    }
-                }
-                return Ok(Arc::new(b.finish()));
-            }
-
-            let kind = pg_type.kind();
-            // M6: 1-D arrays → Arrow List via Vec<T> deserialization
-            if matches!(kind, Kind::Array(_)) {
-                return build_pg_list_array(target_type, col_idx, rows);
-            }
-
-            // M6: Enum types → Utf8 (read binary enum label as UTF-8)
-            if matches!(kind, Kind::Enum(_)) {
-                let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 16);
-                for row in rows {
-                    match row
-                        .try_get::<_, Option<AnyAsString>>(col_idx)
-                        .ok()
-                        .flatten()
-                    {
-                        Some(s) => b.append_value(&s.0),
-                        None => b.append_null(),
-                    }
-                }
-                return Ok(Arc::new(b.finish()));
-            }
-
-            // Fail loud (slice A). `pg_columns_to_schema` already proved every
-            // column maps to a supported type, so reaching here means a (wire
-            // type, target type) pair with no value converter — almost always an
-            // override that retyped a column to something this dispatch can't
-            // read. The previous behaviour was `try_get::<String>` which silently
-            // nulled every non-text value; that silent corruption is exactly what
-            // CLAUDE.md "Remediation hints must recover from the degraded state"
-            // forbids. Surface it instead of writing nulls.
-            anyhow::bail!(
-                "no value converter for PostgreSQL wire type {:?} → Arrow {:?} \
-                 (column index {col_idx}); the column's source type and its \
-                 resolved/overridden target type do not line up — adjust the \
-                 column override so they match",
-                pg_type,
-                target_type,
-            );
         }
+        // `uuid: string` override — canonical hyphenated text.
+        Type::UUID => {
+            for row in rows {
+                match row.try_get::<_, Option<PgUuidBytes>>(col_idx)? {
+                    None => b.append_null(),
+                    Some(PgUuidBytes(bytes)) => {
+                        b.append_value(uuid::Uuid::from_bytes(bytes).to_string())
+                    }
+                }
+            }
+        }
+        // INTERVAL → ISO 8601 (Arrow Interval(MonthDayNano) is not Parquet-writable).
+        Type::INTERVAL => {
+            for row in rows {
+                match row.try_get::<_, Option<PgInterval>>(col_idx).ok().flatten() {
+                    Some(iv) => b.append_value(pg_interval_to_iso8601(
+                        iv.months,
+                        iv.days,
+                        iv.microseconds,
+                    )),
+                    None => b.append_null(),
+                }
+            }
+        }
+        // Enum labels arrive as binary; read as UTF-8.
+        _ if matches!(pg_type.kind(), Kind::Enum(_)) => {
+            for row in rows {
+                match row
+                    .try_get::<_, Option<AnyAsString>>(col_idx)
+                    .ok()
+                    .flatten()
+                {
+                    Some(s) => b.append_value(&s.0),
+                    None => b.append_null(),
+                }
+            }
+        }
+        _ => anyhow::bail!(
+            "no text rendering for PostgreSQL wire type {pg_type:?} (column index \
+             {col_idx}); a `string` override is supported only for \
+             text/json/enum/interval/numeric/uuid columns"
+        ),
     }
+    Ok(Arc::new(b.finish()))
 }
 
 /// Build an Arrow `ListArray` from a PostgreSQL array column.
