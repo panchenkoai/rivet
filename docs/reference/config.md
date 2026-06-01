@@ -105,6 +105,7 @@ Each entry in the `exports` list defines one export job.
 | `compression_level` | integer | no | codec default | Compression level (low-level; prefer `compression_profile`) |
 | `compression_profile` | `none` \| `fast` \| `balanced` \| `compact` | no | — | High-level preset — overrides `compression` and `compression_level`. See [Compression profiles](#compression-profiles) below. |
 | `destination` | object | **yes** | — | Where to write output (see below) |
+| `verify` | `size` \| `content` | no | `size` | Integrity depth required of `--validate`. `content` checks every part's MD5 against the store's listing (no download) and **fails** validation for any part only size-verified — e.g. a part too large to upload as a single PUT (lower `max_file_size` so it fits) or a backend that exposes no checksum (local FS, streamed multipart). See [Verification depth](#verification-depth) below. |
 | `skip_empty` | boolean | no | `false` | Skip file creation if 0 rows |
 | `max_file_size` | string | no | — | Split output: `"256MB"`, `"1GB"`, etc. |
 | `meta_columns` | object | no | — | Extra columns added to output |
@@ -137,6 +138,32 @@ exports:
 ```
 
 If you need a specific codec that is not covered by the presets, use `compression` + `compression_level` directly and omit `compression_profile`.
+
+---
+
+### Verification depth
+
+`verify` controls how thoroughly `--validate` (and `rivet validate`) checks each
+part at the destination:
+
+- **`size`** (default) — confirm each part exists at its recorded `size_bytes`,
+  plus manifest self-consistency and `_SUCCESS`. Content is also MD5-checked for
+  free whenever the store surfaces a checksum in its listing, but a part without
+  one is accepted as size-only.
+- **`content`** — require every part's content MD5 to match the store's listing
+  checksum (no download). Any part that could only be size-verified **fails**
+  validation with an actionable message.
+
+How content verification works: Rivet computes each part's MD5 before upload and
+records it in the manifest; the store computes its own (GCS `md5Hash`, S3/Azure
+single-PUT ETag) and returns it in object listings. `--validate` compares the two
+with **no download**. Parts that upload as a single PUT get a checksum; parts
+large enough to stream as multipart / block-list do not — so under
+`verify: content`, lower `max_file_size` until parts fit a single PUT (≤ ~64 MiB
+by default), or use a backend that exposes a checksum (local FS never does).
+
+The run report and `rivet validate` show coverage explicitly, e.g.
+`3 verified (2 md5, 1 size-only)`.
 
 ---
 

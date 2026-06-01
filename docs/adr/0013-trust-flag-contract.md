@@ -72,7 +72,7 @@ does not change between versions — only what it does internally.
 | 0.6.x (current) | Per-file row count check (parquet rows / CSV lines minus header) |
 | 0.7.0 | Above, **plus** ADR-0012 M5: read `manifest.json` from the destination, verify every listed part exists at the recorded `size_bytes`, verify `_SUCCESS` body matches the manifest fingerprint. |
 | 0.7.0 (M6) | When the destination prefix has no manifest (legacy run), the new checks degrade to the 0.6.x file-row check and the report carries `legacy_run: true` so the reduction is explicit, not silent. |
-| 0.7.x (future) | Optional `--validate --deep` re-fingerprints every part (heavy; gated). |
+| 0.7.x (shipped) | `--validate` also confirms each part's **content** via the MD5 the store surfaces in its listing (GCS `md5Hash`, S3/Azure single-PUT) — **no download**. The earlier "`--validate --deep` re-fingerprints every part" projection was **rejected** (re-downloading a whole dataset to recompute a hash we already verified pre-upload is wasteful and partial). Verification depth is instead a per-export config — `verify: size` (default) / `verify: content` (content MD5 required; size-only parts fail) — not a CLI flag, which keeps the no-new-trust-flag contract. |
 | 0.7.2+ (encryption track) | When parts are encrypted, metadata-only verify (no key needed) is the default; `--validate --identity ./key.txt` adds the decrypting verify. |
 
 The flag stays `--validate`.  No `--validate-manifest`, no `--check-success`,
@@ -232,12 +232,12 @@ Both are worse than a thin subcommand.
 
    Bikeshed-friendly; not part of this ADR's contract.
 
-2. The `--validate --deep` and encryption-aware `--validate --identity ...`
-   behaviour-modifiers above are a single-flag-with-modifiers pattern
-   (`--validate <mode>`).  Whether to spell them as positional sub-modes
-   (`--validate=deep`) or boolean co-flags (`--validate --deep`) is a
-   future ADR decision, not this one.  Either form keeps the contract:
-   no new top-level trust flag.
+2. Verification *depth* turned out **not** to be a `--validate` modifier at
+   all: it's the per-export `verify: size | content` config (shipped 0.7.x).
+   The `--validate --deep` re-download idea was rejected — content is verified
+   pre-upload and via the free listing MD5, never by pulling bytes back. The
+   encryption-aware `--validate --identity ...` modifier remains a future
+   decision. Either way the contract holds: no new top-level trust flag.
 
 ---
 

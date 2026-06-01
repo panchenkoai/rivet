@@ -40,7 +40,14 @@ Add a `capabilities()` method to the `Destination` trait so each backend declare
 
 ### `WriteCommitProtocol` semantics
 
-- **`Atomic`**: `write()` returning `Ok(())` means the full file is present at the destination. A failure may leave a partial artifact (`partial_write_risk = true`); the caller must clean it up before retrying.
+`write()` returns `Ok(WriteOutcome)` (not `Ok(())`): on success the file is
+present per the commit protocol below, and the outcome carries the store's own
+content checksum when the upload reported one (GCS/Azure single `Put Blob` MD5,
+S3 single `PutObject` ETag), which the commit path compares to the locally
+computed MD5 for a fail-fast, no-download transit-integrity check. `None` for
+backends/paths that report none (local FS, streamed multipart).
+
+- **`Atomic`**: a successful `write()` means the full file is present at the destination. A failure may leave a partial artifact (`partial_write_risk = true`); the caller must clean it up before retrying.
 - **`FinalizeOnClose`**: The object is committed only when the internal writer handle is closed. A mid-upload failure leaves nothing at the destination — the object is never partially visible to readers. `retry_safe = true` because a failed upload can be retried from scratch with no cleanup needed.
 - **`Streaming`**: Data is written to an unbuffered output with no atomic commit boundary. Partial output may be observable before `write()` returns. Retrying after failure produces duplicate or corrupt output. There is no safe commit moment.
 

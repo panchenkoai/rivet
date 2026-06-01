@@ -22,7 +22,8 @@ test-types-property:
 # See ADR-0014; the duckdb + clickhouse services are oracles for the Parquet
 # layer, not productive components.
 test-types-validators:
-	cargo test --test type_roundtrip duckdb_validates clickhouse_validates -- --ignored
+	cargo test --test type_roundtrip duckdb_validates -- --ignored --test-threads=1
+	cargo test --test type_roundtrip clickhouse_validates -- --ignored --test-threads=1
 
 # Cloud validator: PG/MySQL matrix → Parquet → BigQuery (real warehouse oracle).
 # Requires:
