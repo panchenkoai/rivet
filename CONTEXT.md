@@ -87,8 +87,9 @@ manifest (base64, GCS `md5Hash` encoding). Destination verification compares it
 to the object's listing metadata to confirm content without downloading. Backend
 coverage (verified live unless noted): **GCS** base64 `md5Hash` (always);
 **S3** single-part ETag hex (always; multipart composite `<hash>-<N>` → size-only);
-**Azure** only when the blob has a `Content-MD5`, which OpenDAL doesn't set on
-upload → size-only in practice; **local FS** size-only. Encodings are normalised
+**Azure** size-only in practice — Azure auto-computes a `Content-MD5` only for a
+single-shot `Put Blob`, but rivet's uploads land as `Put Block List` block blobs
+(verified live) for which Azure sets none; **local FS** size-only. Encodings are normalised
 to raw digest bytes (`md5_digest_bytes`) so base64 and hex of the same digest
 compare equal. _Avoid_: checksum, hash (use for the xxh3 `content_fingerprint`).
 

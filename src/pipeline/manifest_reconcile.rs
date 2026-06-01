@@ -127,10 +127,10 @@ pub fn reconcile_manifest_against_listing(
                 // (GCS `md5Hash` base64; S3 single-part ETag hex), so both
                 // sides normalise to raw digest bytes before comparing.
                 // Anything that isn't a plain 16-byte MD5 — an S3 multipart
-                // composite ETag (`<hash>-<N>`), an Azure blob with no
-                // Content-MD5 (OpenDAL doesn't set one on upload), a local FS
-                // `None`, a legacy value — is not comparable, so the part
-                // degrades to size-only (`Present`).
+                // composite ETag (`<hash>-<N>`), an Azure block blob with no
+                // Content-MD5 (Azure auto-MD5s only single `Put Blob`; rivet
+                // uploads via `Put Block List`), a local FS `None`, a legacy
+                // value — is not comparable, so the part degrades to size-only.
                 match meta.content_md5.as_deref().and_then(md5_digest_bytes) {
                     Some(actual) => match md5_digest_bytes(&part.content_md5) {
                         Some(expected) if expected != actual => PartPresence::ChecksumMismatch {
