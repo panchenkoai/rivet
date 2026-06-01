@@ -228,10 +228,19 @@ defects in the PG / MySQL drivers; all have been fixed in v0.7.8:
 
 ## Known gaps (tracked)
 
-1. **MySQL `DECIMAL` without override**: autodetect yields `Unsupported` until
-   `columns:` or `type_policy.decimal.unbounded` is set — by design (no float fallback).
-2. **Nested arrays, ranges, inet, PostGIS**: not in v0.7.8 matrix (see roadmap).
-3. **CSV `List` columns**: not serialized yet (Parquet only for array types).
+1. **Nested arrays, ranges, inet, PostGIS, geometry**: not in the type matrix —
+   they resolve to `Unsupported` and fail at schema build unless a `columns:`
+   override maps them.
+2. **Nullability**: every exported column is `OPTIONAL`; a source `NOT NULL`
+   constraint is not propagated into the Parquet schema (ADR-0016, deferred to
+   v0.8 Phase A).
+3. **CSV complex types**: arrays (`List`), `Decimal256` (precision > 38), and
+   non-UUID fixed binary have no CSV cell — the export **fails loudly** naming
+   the column (see [CSV serialization](#csv-serialization)) rather than silently
+   writing empty values.
+
+(MySQL `DECIMAL` now resolves its precision/scale from the wire column
+definition — no override needed; see the MySQL section.)
 
 ## Fidelity labels
 
@@ -244,6 +253,32 @@ defects in the PG / MySQL drivers; all have been fixed in v0.7.8:
 | `unsupported` | Requires policy override |
 
 See [`src/types/fidelity.rs`](../src/types/fidelity.rs).
+
+## CSV serialization
+
+CSV shares the same Arrow `RecordBatch` as Parquet, so values are identical —
+only the text rendering differs ([`src/format/csv.rs`](../src/format/csv.rs)):
+
+| RivetType | CSV rendering |
+|-----------|---------------|
+| ints / `float` / `bool` / `decimal` | plain text (`decimal` exact, never via float) |
+| `string` / `text` / `json` / `enum` / `interval` | text, RFC-4180 quoted/escaped when needed |
+| `uuid` | canonical hyphenated lowercase (`a0eebc99-…`) |
+| `binary` (`bytea` / `BLOB`) | lowercase hex (`deadbeef`) |
+| `date` / `time` / `timestamp` | ISO 8601 (`2026-01-01T12:00:00.000000`) |
+| `timestamp_tz` | same ISO text as a naive timestamp — the UTC offset is **not** rendered (the instant is preserved, but a reader can't distinguish it from a naive value) |
+
+CSV has **no cell representation** for `list` (arrays), `Decimal256`
+(precision > 38), or non-UUID fixed binary. Rather than silently write an empty
+value, the export **fails at writer creation** naming the column — use
+`format: parquet` or drop the column from the query.
+
+**Loading CSV into a warehouse:** unlike Parquet (whose loader will not coerce a
+declared type — see below), BigQuery's CSV loader *honors* a declared `--schema`.
+Bare `--autodetect` infers `decimal` text as `FLOAT` (precision-lossy) and every
+semantic type (`uuid` / `json` / `bytea`) as `STRING`; declare `NUMERIC` / `JSON`
+in the load schema, or recover post-load with `PARSE_JSON` / `FROM_HEX` as for
+Parquet.
 
 ## Downstream targets (autoload vs native)
 
