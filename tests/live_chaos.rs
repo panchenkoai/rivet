@@ -62,9 +62,12 @@ exports:
 #[test]
 #[ignore = "live: requires docker compose postgres + toxiproxy"]
 fn chunked_export_completes_through_temporary_proxy_disable() {
-    // Chunked mode with retries enabled must recover from a mid-stream
-    // proxy disable.  Each chunk is a separate query, so reconnect happens
-    // on the next chunk after the proxy is re-enabled.
+    // Chunked mode must converge through a mid-stream proxy disable.  Each
+    // chunk is a separate query, so in-process retry reconnects on the next
+    // attempt once the proxy is back; if the outage straddles a chunk-commit
+    // boundary the run instead fails safely and `--resume` finishes it from the
+    // last committed chunk (hence `chunk_checkpoint: true`).  The assertion
+    // below pins convergence + integrity, not the timing-dependent one-shot.
     let _g = toxiproxy_guard();
     require_alive(LiveService::Postgres);
     require_alive(LiveService::Toxiproxy);
@@ -84,6 +87,7 @@ exports:
     mode: chunked
     chunk_column: id
     chunk_size: 10
+    chunk_checkpoint: true
     format: parquet
     destination: {{type: local, path: {dir}}}
     tuning: {{max_retries: 3, retry_backoff_ms: 200}}
@@ -104,10 +108,46 @@ exports:
     let _ = bg.join();
     toxi_reset_toxics("postgres");
 
+    // Chunked mode's contract for a mid-stream blip is *convergence*, not
+    // one-shot success.  In-process retry recovers the common case, but if the
+    // outage straddles a chunk-commit boundary the run fails SAFELY — it refuses
+    // to re-run a chunk whose file already committed (that would duplicate rows)
+    // and points the operator at `--resume`.  That safe-fail is correct
+    // behaviour, not a regression, so asserting one-shot success made this test
+    // timing-dependent.  Assert the real guarantee instead: a transient blip
+    // never corrupts; the export reaches a complete, duplicate-free state,
+    // via `--resume` if the single shot bailed.
+    let cfg_str = cfg.to_str().unwrap();
+    if !out_run.status.success() {
+        let stderr = String::from_utf8_lossy(&out_run.stderr);
+        assert!(
+            stderr.contains("cannot safely retry")
+                || stderr.contains("reconcile")
+                || stderr.contains("resume"),
+            "a transient blip must fail safely (resumable), not crash; stderr:\n{stderr}"
+        );
+        let resume = run_rivet(&[
+            "run",
+            "--config",
+            cfg_str,
+            "--export",
+            &export_name,
+            "--resume",
+        ]);
+        assert!(
+            resume.status.success(),
+            "--resume must converge after a transient mid-stream blip; stderr:\n{}",
+            String::from_utf8_lossy(&resume.stderr)
+        );
+    }
+
+    // No data loss and no duplicates: rivet's own reconcile (source COUNT(*) vs
+    // committed rows) must agree exactly, whichever recovery path was taken.
+    let reconcile = run_rivet(&["reconcile", "--config", cfg_str, "--export", &export_name]);
     assert!(
-        out_run.status.success(),
-        "chunked export must recover from transient outage; stderr:\n{}",
-        String::from_utf8_lossy(&out_run.stderr)
+        reconcile.status.success(),
+        "reconcile must confirm the export is complete and duplicate-free; stderr:\n{}",
+        String::from_utf8_lossy(&reconcile.stderr)
     );
 }
 
