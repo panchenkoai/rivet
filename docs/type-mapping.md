@@ -228,10 +228,19 @@ defects in the PG / MySQL drivers; all have been fixed in v0.7.8:
 
 ## Known gaps (tracked)
 
-1. **MySQL `DECIMAL` without override**: autodetect yields `Unsupported` until
-   `columns:` or `type_policy.decimal.unbounded` is set — by design (no float fallback).
-2. **Nested arrays, ranges, inet, PostGIS**: not in v0.7.8 matrix (see roadmap).
-3. **CSV `List` columns**: not serialized yet (Parquet only for array types).
+1. **Nested arrays, ranges, inet, PostGIS, geometry**: not in the type matrix —
+   they resolve to `Unsupported` and fail at schema build unless a `columns:`
+   override maps them.
+2. **Nullability**: every exported column is `OPTIONAL`; a source `NOT NULL`
+   constraint is not propagated into the Parquet schema (ADR-0016, deferred to
+   v0.8 Phase A).
+3. **CSV complex types**: arrays (`List`), `Decimal256` (precision > 38), and
+   non-UUID fixed binary have no CSV cell — the export **fails loudly** naming
+   the column (see [CSV serialization](#csv-serialization)) rather than silently
+   writing empty values.
+
+(MySQL `DECIMAL` now resolves its precision/scale from the wire column
+definition — no override needed; see the MySQL section.)
 
 ## Fidelity labels
 
@@ -244,6 +253,32 @@ defects in the PG / MySQL drivers; all have been fixed in v0.7.8:
 | `unsupported` | Requires policy override |
 
 See [`src/types/fidelity.rs`](../src/types/fidelity.rs).
+
+## CSV serialization
+
+CSV shares the same Arrow `RecordBatch` as Parquet, so values are identical —
+only the text rendering differs ([`src/format/csv.rs`](../src/format/csv.rs)):
+
+| RivetType | CSV rendering |
+|-----------|---------------|
+| ints / `float` / `bool` / `decimal` | plain text (`decimal` exact, never via float) |
+| `string` / `text` / `json` / `enum` / `interval` | text, RFC-4180 quoted/escaped when needed |
+| `uuid` | canonical hyphenated lowercase (`a0eebc99-…`) |
+| `binary` (`bytea` / `BLOB`) | lowercase hex (`deadbeef`) |
+| `date` / `time` / `timestamp` | ISO 8601 (`2026-01-01T12:00:00.000000`) |
+| `timestamp_tz` | same ISO text as a naive timestamp — the UTC offset is **not** rendered (the instant is preserved, but a reader can't distinguish it from a naive value) |
+
+CSV has **no cell representation** for `list` (arrays), `Decimal256`
+(precision > 38), or non-UUID fixed binary. Rather than silently write an empty
+value, the export **fails at writer creation** naming the column — use
+`format: parquet` or drop the column from the query.
+
+**Loading CSV into a warehouse:** unlike Parquet (whose loader will not coerce a
+declared type — see below), BigQuery's CSV loader *honors* a declared `--schema`.
+Bare `--autodetect` infers `decimal` text as `FLOAT` (precision-lossy) and every
+semantic type (`uuid` / `json` / `bytea`) as `STRING`; declare `NUMERIC` / `JSON`
+in the load schema, or recover post-load with `PARSE_JSON` / `FROM_HEX` as for
+Parquet.
 
 ## Downstream targets (autoload vs native)
 
@@ -288,3 +323,59 @@ columns compare byte-for-byte (`hex(...)`); the empty list survives; null
 bitmaps propagate. The MySQL `BIGINT UNSIGNED` max value (`2^64 − 1`) is the
 load-bearing assertion that exact-width unsigned ints are not silently
 overflowed to i64.
+
+### BigQuery autoload & recovery (verified live)
+
+BigQuery's Parquet loader is weaker than DuckDB's: it ignores several Parquet
+logical types on autoload and — critically — **will not coerce a column to a
+different declared type on load**. A `bq load` into a table that declares
+`JSON`/`DATETIME` is *rejected* (`Field x has changed type from JSON to BYTES`),
+so native types are recovered with a **post-load transform, not a load schema**.
+
+| RivetType | BigQuery autoload | Native | Recovery (post-load) |
+|-----------|-------------------|--------|----------------------|
+| `json`    | `BYTES`           | `JSON` | `PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING(col))` |
+| `uuid`    | `BYTES` (16 raw)  | `STRING` | `TO_HEX(col)` |
+| `timestamp` (naive) | `TIMESTAMP` (instant) | `DATETIME` | `DATETIME(col)` |
+| `list<inner>` | `RECORD{item}` | `REPEATED inner` | load staging with `--parquet_enable_list_inference`, then `ARRAY(SELECT el.item FROM UNNEST(col) AS el)` |
+| `u_int64` | `INT64` (overflows > 2^63−1) | `NUMERIC` | none post-load — fix at source: `columns: { c: decimal(20,0) }` |
+| `timestamp_tz`, `decimal`, `string`, `binary`, `bool`, ints | native | same | — |
+
+Rivet writes the Parquet list element as `item` (arrow-rs default, not the
+spec's `element`), so even `--parquet_enable_list_inference` yields
+`REPEATED RECORD{item}` rather than a clean `REPEATED <scalar>` — the `UNNEST`
+flatten above is required.
+
+`rivet check --type-report --target bigquery` prints the per-column autoload
+type, the native type, and a ready-to-run recovery `CREATE TABLE … AS SELECT`
+over the autoloaded `<table>__staging`. Set `exports[].target: bigquery` to get
+it without the CLI flag. DuckDB needs none of this — it autoloads every logical
+type natively.
+
+### Snowflake autoload & recovery (verified live)
+
+Snowflake's `INFER_SCHEMA` + `COPY` infers physical types only, so the same
+semantic types degrade — and the `INFER_SCHEMA` column names come back
+**lowercase and case-sensitive**, so the recovery `SELECT` must double-quote
+every source reference (`"col"`).
+
+| RivetType | Snowflake autoload | Native | Recovery (post-load) |
+|-----------|--------------------|--------|----------------------|
+| `json`    | `TEXT`             | `VARIANT` | `PARSE_JSON("col")` |
+| `uuid`    | `BINARY` (16 raw)  | `TEXT` | `REGEXP_REPLACE(LOWER(HEX_ENCODE("col")), …)` → canonical UUID |
+| `timestamp` (naive) | `NUMBER` (µs) | `TIMESTAMP_NTZ` | `TO_TIMESTAMP_NTZ("col", 6)` |
+| `time`    | `NUMBER` (µs of day) | `TIME` | `TIME_FROM_PARTS(0,0,FLOOR("col"/1000000),MOD("col",1000000)*1000)` |
+| `binary`  | `BINARY` *(needs `BINARY_AS_TEXT=FALSE`)* | `BINARY` | — (set the file-format option) |
+| `timestamp_tz` | `TIMESTAMP_TZ` *(pin session `TIMEZONE='UTC'`)* | `TIMESTAMP_TZ` | — (autoload uses session offset otherwise) |
+| `u_int64` | `NUMBER` (overflows > 2^63−1) | `NUMBER(20,0)` | none post-load — fix at source: `columns: { c: decimal(20,0) }` |
+| `list<inner>` | `VARIANT` (the JSON array) | `ARRAY` | `"col"::ARRAY` |
+| `decimal`, `string`, `bool`, `date`, ints | native | same | — |
+
+The load preamble the recovery depends on: `CREATE FILE FORMAT … TYPE=PARQUET
+BINARY_AS_TEXT=FALSE`, `ALTER SESSION SET TIMEZONE='UTC'`, `CREATE TABLE … USING
+TEMPLATE (… INFER_SCHEMA …)`, `COPY … MATCH_BY_COLUMN_NAME=CASE_INSENSITIVE`.
+
+`rivet check --type-report --target snowflake` (`--target sf`) emits the
+per-column autoload/native types and the post-load `CREATE OR REPLACE TABLE …`
+recovery over `<table>__staging`. Set `exports[].target: snowflake` to skip the
+flag.

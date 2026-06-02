@@ -2956,12 +2956,13 @@ dependencies = [
 
 [[package]]
 name = "rivet-cli"
-version = "0.7.9"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "arrow",
  "arrow-schema",
  "atoi",
+ "base64",
  "bigdecimal",
  "byteorder",
  "bytes",
@@ -2976,6 +2977,7 @@ dependencies = [
  "libc",
  "log",
  "mach2",
+ "md-5 0.10.6",
  "mysql",
  "native-tls",
  "opendal",

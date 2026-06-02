@@ -60,6 +60,10 @@ pub struct ResolvedRunPlan {
     pub validate: bool,
     pub reconcile: bool,
     pub resume: bool,
+    /// Integrity depth `--validate` must reach for this export's parts
+    /// (`exports[].verify`).  `Content` makes size-only parts a verification
+    /// failure.
+    pub verify: crate::config::VerifyMode,
     /// Source connection parameters — resolved from config at plan time so pipeline
     /// functions receive the complete execution contract in a single struct.
     pub source: SourceConfig,

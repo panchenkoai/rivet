@@ -57,6 +57,10 @@ pub(crate) struct PartRecord {
     pub rows: i64,
     pub bytes: u64,
     pub fingerprint: String,
+    /// Base64 MD5 of the part body (GCS `md5Hash` encoding), computed from the
+    /// local temp file alongside the fingerprint.  Empty if it could not be
+    /// computed — verification degrades to size-only for that part.
+    pub md5: String,
 }
 
 /// How a committed part is journaled.
@@ -91,16 +95,38 @@ pub(crate) fn write_part_file(
     file_name: String,
 ) -> Result<PartRecord> {
     let bytes = std::fs::metadata(tmp_path).map(|m| m.len()).unwrap_or(0);
-    dest.write(tmp_path, &file_name)?;
-    let fingerprint = manifest_writer::compute_part_fingerprint(tmp_path).unwrap_or_else(|e| {
-        log::warn!("part fingerprint failed for '{file_name}' (not fatal): {e:#}");
-        "xxh3:0000000000000000".to_string()
-    });
+    let outcome = dest.write(tmp_path, &file_name)?;
+    // Both body hashes in one read: xxh3 fingerprint (ADR-0012 M3) + base64 MD5
+    // (no-download destination verification, GCS md5Hash encoding).  Non-fatal —
+    // on failure the fingerprint falls back to the zero placeholder and the md5
+    // to empty (that part then verifies size-only).
+    let (fingerprint, md5) =
+        manifest_writer::compute_part_checksums(tmp_path).unwrap_or_else(|e| {
+            log::warn!("part checksums failed for '{file_name}' (not fatal): {e:#}");
+            ("xxh3:0000000000000000".to_string(), String::new())
+        });
+    // Fail-fast transit check (ADR-0001 I1): when the store reported its own
+    // checksum, it computed it from the bytes it received — a mismatch with our
+    // locally-computed MD5 means the upload corrupted in flight.  Free (no
+    // round-trip): the checksum rode the write response.  Encodings differ
+    // (GCS base64, S3 hex ETag), so compare normalised digest bytes.
+    if let Some(stored) = &outcome.content_md5 {
+        use crate::pipeline::manifest_reconcile::md5_digest_bytes;
+        if let (Some(local), Some(remote)) = (md5_digest_bytes(&md5), md5_digest_bytes(stored))
+            && local != remote
+        {
+            anyhow::bail!(
+                "upload integrity check failed for '{file_name}': local MD5 differs from \
+                 the store-reported checksum — the part corrupted in transit"
+            );
+        }
+    }
     Ok(PartRecord {
         file_name,
         rows,
         bytes,
         fingerprint,
+        md5,
     })
 }
 
@@ -128,6 +154,7 @@ pub(crate) fn record_part(
         part.rows,
         part.bytes,
         part.fingerprint.clone(),
+        part.md5.clone(),
     );
 
     match kind {
@@ -230,6 +257,7 @@ mod tests {
                 tls: None,
             },
             column_overrides: Default::default(),
+            verify: crate::config::VerifyMode::Size,
             schema_drift_policy: Default::default(),
             shape_drift_warn_factor: 0.0,
             parquet: None,
@@ -250,6 +278,7 @@ mod tests {
             rows: 42,
             bytes: 1024,
             fingerprint: "xxh3:1234567890abcdef".into(),
+            md5: String::new(),
         }
     }
 
@@ -287,6 +316,64 @@ mod tests {
         );
         let written = dst_dir.path().join("out").join("part.parquet");
         assert_eq!(std::fs::read(&written).unwrap(), payload);
+    }
+
+    // ── write_part_file: store-reported checksum transit check ─────────────────
+
+    /// A destination that reports a fixed content checksum (no real upload).
+    struct ChecksumDest(Option<String>);
+    impl crate::destination::Destination for ChecksumDest {
+        fn write(&self, _p: &Path, _k: &str) -> Result<crate::destination::WriteOutcome> {
+            Ok(crate::destination::WriteOutcome {
+                content_md5: self.0.clone(),
+            })
+        }
+        fn capabilities(&self) -> crate::destination::DestinationCapabilities {
+            crate::destination::DestinationCapabilities {
+                commit_protocol: crate::destination::WriteCommitProtocol::FinalizeOnClose,
+                idempotent_overwrite: true,
+                retry_safe: true,
+                partial_write_risk: false,
+            }
+        }
+    }
+
+    fn stage(payload: &[u8]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("part.parquet");
+        std::fs::write(&p, payload).unwrap();
+        (dir, p)
+    }
+
+    #[test]
+    fn transit_check_bails_when_store_checksum_differs() {
+        let (_d, src) = stage(b"hello rivet");
+        // A bogus store checksum (valid base64, wrong digest) must fail the write.
+        let dest = ChecksumDest(Some("AAAAAAAAAAAAAAAAAAAAAA==".into()));
+        match write_part_file(&dest, &src, 1, "part.parquet".into()) {
+            Ok(_) => panic!("mismatched checksum must fail"),
+            Err(e) => assert!(
+                e.to_string().contains("transit"),
+                "expected a transit-corruption error, got: {e}"
+            ),
+        }
+    }
+
+    #[test]
+    fn transit_check_passes_on_match_and_when_store_is_silent() {
+        use base64::Engine as _;
+        use md5::{Digest, Md5};
+        let payload = b"hello rivet";
+        let (_d, src) = stage(payload);
+        // Matching checksum (real MD5 of the bytes) → OK.
+        let mut h = Md5::new();
+        h.update(payload);
+        let real = base64::engine::general_purpose::STANDARD.encode(h.finalize());
+        write_part_file(&ChecksumDest(Some(real)), &src, 1, "p.parquet".into())
+            .expect("matching checksum passes");
+        // No store checksum (local FS / streamed) → no check, OK.
+        write_part_file(&ChecksumDest(None), &src, 1, "p.parquet".into())
+            .expect("silent store passes");
     }
 
     // ── record_part: counters + journal + manifest ────────────────────────────
@@ -427,6 +514,7 @@ mod tests {
                 rows: 100 + (i as i64) * 10,
                 bytes: 1024 * ((i as u64) + 1),
                 fingerprint: format!("xxh3:{i:016x}"),
+                md5: String::new(),
             })
             .collect()
     }

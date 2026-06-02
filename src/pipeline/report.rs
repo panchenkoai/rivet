@@ -346,6 +346,15 @@ pub fn render_markdown(r: &RunReport) -> String {
                 "  - Manifest: {} parts verified",
                 m.parts_verified
             ));
+            // Spell out content coverage: how many were md5-checked vs size-only,
+            // so "verified" doesn't imply content verification it didn't do.
+            if m.parts_verified > 0 {
+                let size_only = m.parts_verified.saturating_sub(m.parts_md5_verified);
+                out.push_str(&format!(
+                    " ({} md5, {} size-only)",
+                    m.parts_md5_verified, size_only
+                ));
+            }
             if m.parts_failed > 0 {
                 out.push_str(&format!(", {} failed", m.parts_failed));
             }

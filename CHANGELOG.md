@@ -1,5 +1,97 @@
 # Changelog
 
+## 0.8.0 (2026-06-01) — Type-Support Resolver + No-Download Content Integrity
+
+> Two arcs. **Type support** gains a per-target type resolver (DuckDB,
+> BigQuery, Snowflake) that maps every column to its native type, the
+> degraded type a generic loader autoloads, and the SQL to recover the
+> difference — with Snowflake added and live-verified, BigQuery array/JSON
+> recovery, MySQL decimal precision read from the wire, `Decimal256`/`i256`
+> past the old ~38-digit ceiling, and CSV failing loud on unsupported
+> columns instead of writing silent empties. **Integrity** gains
+> **no-download content verification**: each part's MD5, computed once before
+> upload, is compared to the checksum the store already exposes in its
+> listing (GCS `md5Hash`, S3 single-PUT ETag, Azure single `Put Blob`
+> `Content-MD5`) — so `--validate` confirms content, not just size, without
+> pulling a byte back. A new per-export `verify: size | content` makes that
+> a declarable contract. Verified end-to-end on live GCS, S3, and Azure.
+>
+> No breaking changes for operators: `verify` defaults to `size`, the new
+> `summary.json` fields are additive, and the type pipeline is unchanged for
+> existing exports.
+
+### Type support
+
+- **`feat(types)`** — `src/types/target.rs`: a `RivetType` → target resolver.
+  `ExportTarget::{DuckDb, BigQuery, Snowflake}` each map a column to a
+  `TargetColumnSpec` (native type, autoload type, status, note, recovery
+  `cast_sql`). Dispatch keys off the semantic `RivetType`, not the physical
+  Arrow type, so `json` / `uuid` / `enum` resolve correctly. Total and
+  infallible — an unmappable column is a `status: Fail` row, never an error.
+  Per-export `target:` config + `rivet check --type-report --target <t>`
+  prints the autoload-vs-native table and a ready-to-run recovery
+  `CREATE TABLE … AS SELECT` over the staging table.
+- **`feat(types)`** — **Snowflake** target added and **live-verified**
+  (`snowflake_validates_*` harness): json→TEXT/`PARSE_JSON`, uuid→BINARY/
+  `HEX_ENCODE`+`REGEXP`, naive ts→NUMBER/`TO_TIMESTAMP_NTZ`, time→NUMBER/
+  `TIME_FROM_PARTS`, list→VARIANT/`::ARRAY`, plus the `BINARY_AS_TEXT=FALSE`
+  load-format requirement.
+- **`feat(types)`** — BigQuery type-recovery SQL (L5, post-load CTAS — BQ
+  rejects declared native types on load) and array recovery via
+  `--parquet_enable_list_inference` + `UNNEST`.
+- **`fix(types)`** — `Decimal256` parses straight into `i256`, removing the
+  i128 ~38-digit bottleneck (now up to 76 digits).
+- **`feat(types)`** — MySQL `DECIMAL` precision/scale read from wire metadata
+  (works for any query, unlike PG's catalog-only path).
+- **`fix(csv)`** — CSV fails loud on array / unsupported columns instead of
+  writing a silent empty value; `uuid: string` and similar overrides honoured.
+
+### Integrity — no-download content verification
+
+- **`feat(validate)`** — `--validate` confirms each part's **content** by
+  comparing its manifest MD5 to the checksum the store surfaces in object
+  listings — **no download**. Encodings are normalised to raw digest bytes so
+  GCS base64 `md5Hash` and S3 hex ETag of the same content compare equal; an
+  S3 multipart composite ETag or a checksum-less object degrades to size-only.
+- **`feat(destination)`** — small parts upload as a single PUT
+  (`op.write`) so the store computes and stores a content checksum the listing
+  exposes; this is the only way to get a `Content-MD5` on **Azure** (a single
+  `Put Blob`, never `Put Block List`). A process-wide byte budget bounds the
+  RAM held in one-shot buffers regardless of upload concurrency; larger parts
+  stream (size-only).
+- **`feat(destination)`** — `Destination::write` returns `WriteOutcome`
+  carrying the store's upload-response checksum; the commit path compares it to
+  the locally computed MD5 for a fail-fast, no-round-trip transit-integrity
+  check (catches a part corrupted in flight at write time).
+- **`feat(validate)`** — per-export **`verify: size | content`**. `content`
+  fails validation for any part only size-verified, with an actionable message
+  (lower `max_file_size` so parts fit a single PUT, or the backend exposes no
+  checksum). The run report and `rivet validate` show coverage explicitly:
+  `N verified (M md5, K size-only)`.
+
+### Architecture — verification seam
+
+- **`refactor(pipeline)`** — one pure `reconcile_manifest_against_listing`
+  (manifest × destination listing) with two thin consumers: destination verify
+  (`Presence → Failure`) and chunked resume (`Presence → ResumeDecision`).
+  Replaces two near-identical walks; destination verify now derives part
+  presence from a single `list_prefix` instead of per-part HEADs.
+- **`refactor(validate)`** — `ManifestVerification.passed` is derived
+  (`manifest_found` and no *fatal* failure — advisory `UntrackedObject` does
+  not count) in one place, so a new failure variant is fatal by default rather
+  than relying on every site to flip a bool. Per-run `parts_md5_verified`
+  reports content coverage. The single-variant `IntegrityLevel` (a no-op after
+  re-download verification was rejected) was removed.
+- **`refactor(pipeline)`** — part xxh3 fingerprint + MD5 computed in a single
+  streamed read (`compute_part_checksums`).
+
+### Live verification
+
+- Type fidelity re-confirmed on DuckDB, ClickHouse, **BigQuery**, and
+  **Snowflake** after the integrity changes. Content verification + transit
+  check + `verify` policy verified end-to-end on live **GCS**, **AWS S3**
+  (eu-north-1), and **Azure** buckets, including manifest-tamper detection.
+
 ## 0.7.9 (2026-05-30) — Optimization Backlog + Seam Consolidation + CI Invariant Gates
 
 > Closes the §10 optimization backlog (OPT-1…OPT-7), proves Parquet type

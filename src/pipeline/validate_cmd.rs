@@ -153,7 +153,10 @@ pub fn run_validate_command(
             continue;
         }
         match verify_at_destination(&*dest, "") {
-            Ok(v) => {
+            Ok(mut v) => {
+                // Apply this export's `verify` policy: `content` fails the
+                // verdict when any part is only size-verified (review D).
+                v.enforce_content_policy(export.verify.requires_content());
                 all_results.push(ExportVerdict {
                     name: export.name.clone(),
                     resolved_prefix,
@@ -254,8 +257,11 @@ fn render_pretty(results: &[ExportVerdict], hard_failures: &[String]) {
         );
         let _ = writeln!(
             h,
-            "  parts:     {} verified, {} failed",
-            v.parts_verified, v.parts_failed
+            "  parts:     {} verified ({} md5, {} size-only), {} failed",
+            v.parts_verified,
+            v.parts_md5_verified,
+            v.parts_verified.saturating_sub(v.parts_md5_verified),
+            v.parts_failed
         );
         let _ = writeln!(
             h,

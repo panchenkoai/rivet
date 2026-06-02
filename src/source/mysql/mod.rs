@@ -610,10 +610,10 @@ impl super::Source for MysqlSource {
         let mappings = columns
             .iter()
             .map(|col| {
-                let rivet = column_overrides
-                    .get(col.name_str().as_ref())
-                    .cloned()
-                    .unwrap_or_else(|| mysql_type_to_rivet(col));
+                let rivet =
+                    crate::types::resolve_or(column_overrides, col.name_str().as_ref(), || {
+                        mysql_type_to_rivet(col)
+                    });
                 let source = crate::types::SourceColumn::simple(
                     col.name_str().as_ref(),
                     mysql_native_type_name(col),

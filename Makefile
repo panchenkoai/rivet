@@ -1,7 +1,7 @@
 # Rivet developer shortcuts.
 # Requires Rust 1.94+ (see rust-toolchain.toml if present).
 
-.PHONY: test-types test-types-live test-types-property test-types-validators test-types-bigquery
+.PHONY: test-types test-types-live test-types-property test-types-validators test-types-bigquery test-types-snowflake
 
 # PR-fast: offline type-mapping contracts (no docker).
 test-types:
@@ -22,7 +22,8 @@ test-types-property:
 # See ADR-0014; the duckdb + clickhouse services are oracles for the Parquet
 # layer, not productive components.
 test-types-validators:
-	cargo test --test type_roundtrip duckdb_validates clickhouse_validates -- --ignored
+	cargo test --test type_roundtrip duckdb_validates -- --ignored --test-threads=1
+	cargo test --test type_roundtrip clickhouse_validates -- --ignored --test-threads=1
 
 # Cloud validator: PG/MySQL matrix → Parquet → BigQuery (real warehouse oracle).
 # Requires:
@@ -35,3 +36,16 @@ test-types-validators:
 # Example: `BIGQUERY_TEST_PROJECT=my-proj make test-types-bigquery`.
 test-types-bigquery:
 	cargo test --test type_roundtrip bigquery_validates -- --include-ignored --test-threads=1
+
+# Cloud validator: PG matrix → Parquet → Snowflake (real warehouse oracle).
+# The CI guardian for the Snowflake resolver claims in src/types/target.rs —
+# asserts INFER_SCHEMA autoload degradations + the recovery casts against a
+# live account. Requires:
+#   - `snow` CLI on PATH (NOT `snowsql`).
+#   - SNOWFLAKE_TEST_CONNECTION env (the connection name). Optional:
+#     SNOWFLAKE_TEST_PRIVATE_KEY (absolute .p8 path if the connection's
+#     private_key_file uses a literal `~`), SNOWFLAKE_TEST_DATABASE / _SCHEMA.
+#   - docker-compose postgres for the source database.
+# Example: `SNOWFLAKE_TEST_CONNECTION=rivet make test-types-snowflake`.
+test-types-snowflake:
+	cargo test --test type_roundtrip snowflake_validates -- --include-ignored --test-threads=1

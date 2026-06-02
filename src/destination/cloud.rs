@@ -23,6 +23,7 @@
 use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use opendal::Operator;
@@ -31,6 +32,50 @@ use opendal::layers::RetryLayer;
 
 use crate::config::DestinationConfig;
 use crate::error::Result;
+
+/// Process-wide ceiling on RAM held in one-shot upload buffers.
+///
+/// A single-PUT upload (`op.write`) must buffer the whole part so the store
+/// computes and stores a content MD5 the listing exposes (the only way to get
+/// `Content-MD5` on Azure — a single `Put Blob`, not `Put Block List`).  That
+/// buffering is unavoidable, so the risk is buffer × upload concurrency
+/// (`parallel`, default 4, operator-tunable).  Rather than a per-part magic
+/// threshold that still multiplies by concurrency, a part one-shots only if it
+/// fits in the *remaining* shared budget; otherwise it streams (memory-bounded,
+/// size-only verification).  Total one-shot RAM is thus capped here regardless
+/// of how many workers upload at once, and any part larger than the whole
+/// budget always streams.
+const ONESHOT_BUDGET_BYTES: i64 = 64 * 1024 * 1024;
+static ONESHOT_BUDGET: AtomicI64 = AtomicI64::new(ONESHOT_BUDGET_BYTES);
+
+/// Releases the reserved bytes back to [`ONESHOT_BUDGET`] on drop — so the
+/// budget is restored even if the upload errors out.
+struct OneShotReservation(i64);
+impl Drop for OneShotReservation {
+    fn drop(&mut self) {
+        ONESHOT_BUDGET.fetch_add(self.0, Ordering::Relaxed);
+    }
+}
+
+/// Reserve `size` bytes for a one-shot buffer if the budget allows, else `None`
+/// (caller streams).  Parts larger than the whole budget never fit, so they
+/// always stream.
+fn reserve_oneshot(size: u64) -> Option<OneShotReservation> {
+    let size = i64::try_from(size).unwrap_or(i64::MAX);
+    take_from(&ONESHOT_BUDGET, size).then_some(OneShotReservation(size))
+}
+
+/// Optimistic atomic reserve: subtract `size`; if that would overdraw, undo and
+/// fail.  Concurrency-safe — a transient negative from a racing subtract just
+/// makes one caller stream (a benign false-negative), never an overdraw.
+fn take_from(budget: &AtomicI64, size: i64) -> bool {
+    if budget.fetch_sub(size, Ordering::Relaxed) >= size {
+        true
+    } else {
+        budget.fetch_add(size, Ordering::Relaxed);
+        false
+    }
+}
 
 /// A backend's contribution to a cloud destination: how to build its OpenDAL
 /// operator and how to name itself in logs/errors. Everything else lives in
@@ -112,14 +157,39 @@ impl<B: CloudBackend> CloudDestination<B> {
 }
 
 impl<B: CloudBackend> super::Destination for CloudDestination<B> {
-    fn write(&self, local_path: &Path, remote_key: &str) -> Result<()> {
+    fn write(&self, local_path: &Path, remote_key: &str) -> Result<super::WriteOutcome> {
         let key = format!("{}{}", self.prefix, remote_key);
-        let mut src = std::fs::File::open(local_path)?;
-        let mut dst = self.op.writer(&key)?.into_std_write();
-        std::io::copy(&mut src, &mut dst)?;
-        dst.close()?;
-        log::info!("uploaded {}://{}", B::SCHEME, key);
-        Ok(())
+        let size = std::fs::metadata(local_path)?.len();
+        // One-shot upload when the part fits the shared memory budget: a single
+        // PUT (S3 `PutObject` / GCS upload / Azure `Put Blob`) makes the store
+        // compute and store a content checksum the listing then exposes for
+        // no-download verification.  This is what lets `--validate` md5-check
+        // Azure parts at all — Azure auto-computes `Content-MD5` only for a
+        // single `Put Blob`, never for the `Put Block List` the streaming
+        // writer produces (each `write()` past the first stages a block).
+        // Otherwise stream — memory-bounded, size-only for those parts.
+        let outcome = if let Some(_reservation) = reserve_oneshot(size) {
+            let body = std::fs::read(local_path)?;
+            let meta = self.op.write(&key, body)?;
+            // The single-PUT response carries the store's own checksum: GCS /
+            // Azure as `content_md5` (base64), S3 as the ETag (hex MD5).  Hand
+            // it back for the commit-time transit check.
+            super::WriteOutcome {
+                content_md5: meta
+                    .content_md5()
+                    .map(str::to_string)
+                    .or_else(|| meta.etag().map(|e| e.trim_matches('"').to_string())),
+            }
+        } else {
+            let mut src = std::fs::File::open(local_path)?;
+            let mut dst = self.op.writer(&key)?.into_std_write();
+            std::io::copy(&mut src, &mut dst)?;
+            dst.close()?;
+            // Streamed (multipart / block-list): no full-object checksum.
+            super::WriteOutcome::opaque()
+        };
+        log::info!("uploaded {}://{} ({size} bytes)", B::SCHEME, key);
+        Ok(outcome)
     }
 
     fn capabilities(&self) -> super::DestinationCapabilities {
@@ -178,6 +248,7 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
             out.push(super::ObjectMeta {
                 key: rel,
                 size_bytes: entry.metadata().content_length(),
+                content_md5: entry.metadata().content_md5().map(str::to_string),
             });
         }
         Ok(out)
@@ -198,6 +269,7 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
             Ok(meta) => Ok(Some(super::ObjectMeta {
                 key: key.to_string(),
                 size_bytes: meta.content_length(),
+                content_md5: meta.content_md5().map(str::to_string),
             })),
             Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
@@ -216,5 +288,38 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
         self.op.copy(&from_full, &to_full)?;
         self.op.delete(&from_full)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AtomicI64, Ordering, take_from};
+
+    #[test]
+    fn oneshot_budget_reserves_until_exhausted_then_streams() {
+        let budget = AtomicI64::new(100);
+        // Two parts that fit are reserved; the third overdraws and streams.
+        assert!(take_from(&budget, 60), "first fits");
+        assert!(take_from(&budget, 30), "second fits (10 left)");
+        assert!(!take_from(&budget, 30), "third overdraws → stream");
+        // The failed reservation must NOT have consumed budget.
+        assert_eq!(
+            budget.load(Ordering::Relaxed),
+            10,
+            "budget intact after overdraw"
+        );
+        // Releasing the 60-byte reservation frees it for the next part.
+        budget.fetch_add(60, Ordering::Relaxed);
+        assert!(take_from(&budget, 30), "fits again after release");
+    }
+
+    #[test]
+    fn part_larger_than_whole_budget_never_reserves() {
+        let budget = AtomicI64::new(64);
+        assert!(
+            !take_from(&budget, 1_000),
+            "part bigger than budget streams"
+        );
+        assert_eq!(budget.load(Ordering::Relaxed), 64, "budget untouched");
     }
 }

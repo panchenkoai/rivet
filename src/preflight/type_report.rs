@@ -12,7 +12,7 @@ use crate::source;
 use crate::types::{
     ColumnOverrides, TypeFidelity,
     policy::{PolicyViolation, TypePolicy},
-    target::{ExportTarget, TargetCompat, TargetStatus, check_target_compat},
+    target::{ExportTarget, TargetInput, TargetStatus},
 };
 
 /// One row in the type report (and the JSON output — roadmap §9).
@@ -32,6 +32,14 @@ pub struct TypeReportRow {
     pub target_status: Option<TargetStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_note: Option<String>,
+    /// Type a generic Parquet reader infers without a declared schema, surfaced
+    /// only when it diverges from `target_type` (e.g. BigQuery autoloads JSON
+    /// as BYTES). Present when `--target` is set and autoload ≠ native.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub autoload_type: Option<String>,
+    /// Materialization / load-schema hint (L5) to recover the native type.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cast_sql: Option<String>,
 }
 
 /// One export's type-report data.
@@ -43,6 +51,12 @@ pub struct ExportTypeReport {
     /// True when any column failed target-compatibility.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub target_failures: bool,
+    /// Target-native recovery SQL (ADR-0014 L5): a post-load transform that
+    /// recovers types bare autoload degrades (BigQuery JSON/UUID/DATETIME).
+    /// `None` for targets that autoload faithfully (DuckDB) or when no target
+    /// is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_sql: Option<String>,
 }
 
 impl ExportTypeReport {
@@ -62,14 +76,15 @@ pub fn collect_report(
     column_overrides: &ColumnOverrides,
     policy: &TypePolicy,
     target: Option<ExportTarget>,
+    config_dir: &std::path::Path,
+    params: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<ExportTypeReport> {
     let url = config.source.resolve_url()?;
     let tls = config.source.tls.as_ref();
-    let query = export
-        .query
-        .as_deref()
-        .or(export.query_file.as_deref())
-        .unwrap_or("");
+    // Resolve the effective query the same way the export pipeline does, so the
+    // `table:` shortcut (and `query_file:` / `${var}` params) produce a real
+    // query instead of an empty string.
+    let query = export.resolve_query(config_dir, params)?;
 
     let mut src: Box<dyn source::Source> = match config.source.source_type {
         SourceType::Postgres => Box::new(source::postgres::PostgresSource::connect_with_tls(
@@ -78,22 +93,33 @@ pub fn collect_report(
         SourceType::Mysql => Box::new(source::mysql::MysqlSource::connect_with_tls(&url, tls)?),
     };
 
-    let mappings = src.type_mappings(query, column_overrides)?;
+    let mappings = src.type_mappings(&query, column_overrides)?;
     let violations = policy.validate(&mappings);
 
     let mut target_failures = false;
     let rows = mappings
         .iter()
         .map(|m| {
-            let (target_type, target_status, target_note) = if let Some(tgt) = target {
-                let compat: TargetCompat = check_target_compat(m.arrow_type.as_ref(), tgt);
-                if compat.status == TargetStatus::Fail {
-                    target_failures = true;
-                }
-                (Some(compat.target_type), Some(compat.status), compat.note)
-            } else {
-                (None, None, None)
-            };
+            let (target_type, target_status, target_note, autoload_type, cast_sql) =
+                if let Some(tgt) = target {
+                    let spec = tgt.resolve_column(TargetInput::from(m));
+                    if spec.status == TargetStatus::Fail {
+                        target_failures = true;
+                    }
+                    // Surface the autoloaded type only when it diverges from the
+                    // native type — that divergence is the operator-facing point.
+                    let autoload =
+                        (spec.autoload_type != spec.target_type).then_some(spec.autoload_type);
+                    (
+                        Some(spec.target_type),
+                        Some(spec.status),
+                        spec.note,
+                        autoload,
+                        spec.cast_sql,
+                    )
+                } else {
+                    (None, None, None, None, None)
+                };
             TypeReportRow {
                 column: m.column_name.clone(),
                 source_type: m.source_native_type.clone(),
@@ -108,15 +134,24 @@ pub fn collect_report(
                 target_type,
                 target_status,
                 target_note,
+                autoload_type,
+                cast_sql,
             }
         })
         .collect();
+
+    // L5 recovery SQL (ADR-0014): a post-load transform for operators whose
+    // bare autoload would degrade types. `None` for DuckDB (faithful autoload)
+    // or when no target is set.
+    let recovery_sql =
+        target.and_then(|t| t.recovery_sql(&t.resolve_table(&mappings), &export.name));
 
     Ok(ExportTypeReport {
         export: export.name.clone(),
         columns: rows,
         violations,
         target_failures,
+        recovery_sql,
     })
 }
 
@@ -177,8 +212,14 @@ pub fn print_table(report: &ExportTypeReport, target: Option<ExportTarget>) {
                 status_marker,
                 rest = fid_w - row.fidelity.label().len(),
             );
+            if let Some(autoload) = &row.autoload_type {
+                println!("  {:<col_w$}    autoload: {}", "", autoload);
+            }
             if let Some(note) = &row.target_note {
                 println!("  {:<col_w$}    note: {}", "", note);
+            }
+            if let Some(cast) = &row.cast_sql {
+                println!("  {:<col_w$}    recover: {}", "", cast);
             }
             for w in &row.warnings {
                 println!("  {:<col_w$}    warning: {}", "", w);
@@ -214,6 +255,18 @@ pub fn print_table(report: &ExportTypeReport, target: Option<ExportTarget>) {
         for v in &report.violations {
             let prefix = if v.fatal { "  FAIL" } else { "  WARN" };
             println!("{}: {}", prefix, v.message);
+        }
+    }
+
+    if let Some(sql) = &report.recovery_sql {
+        println!();
+        println!(
+            "  {} type recovery — bare autoload degrades JSON/UUID→BYTES, naive",
+            target.map(|t| t.label()).unwrap_or("target")
+        );
+        println!("  timestamp→TIMESTAMP, array→RECORD; load with --autodetect then run:");
+        for line in sql.lines() {
+            println!("    {line}");
         }
     }
 }
@@ -373,6 +426,8 @@ mod tests {
             target_type: None,
             target_status: None,
             target_note: None,
+            autoload_type: None,
+            cast_sql: None,
         };
         assert_eq!(col_width(&[row], |r| r.column.len()), 8);
     }
@@ -389,6 +444,8 @@ mod tests {
             target_type: None,
             target_status: None,
             target_note: None,
+            autoload_type: None,
+            cast_sql: None,
         };
         let w = col_width(&[row], |r| r.column.len());
         assert_eq!(w, "a_very_long_column_name".len());

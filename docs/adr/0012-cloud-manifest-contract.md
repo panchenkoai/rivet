@@ -90,7 +90,7 @@ Resume across multiple interruptions does not produce multiple manifests for the
 
 > If `_SUCCESS` exists, then for every part listed in the manifest, the part is present at the destination at the recorded byte length.
 
-This is the contract `--validate` checks on the metadata-only path: it lists the prefix, reads the manifest, and verifies M5 part-by-part. It does **not** require fingerprint re-check — that is the heavier-weight `--validate --deep` (future flag, not in 0.7.0).
+This is the contract `--validate` checks on the metadata-only path: it lists the prefix, reads the manifest, and verifies M5 part-by-part. The listing also carries each object's content MD5 (GCS `md5Hash`, S3/Azure single-PUT ETag), so `--validate` confirms **content**, not just size, with **no download** — the original "re-download to re-fingerprint" idea (`--validate --deep`) was rejected as wasteful. A part whose store gives no checksum (streamed multipart, local FS) verifies size-only; `exports[].verify: content` makes that a failure.
 
 `--reconcile` adds: row counts in the manifest sum to the source `COUNT(*)` for the export's row range.
 
@@ -228,7 +228,7 @@ These items were open in the first draft of this ADR; they are now decided.
 |---|---|---|
 | M1 | ✅ writer side covered | manifest writer commits parts before manifest (`pipeline::manifest_writer`); kill-mid-write integration test deferred to Phase C-γ |
 | M2 | ✅ writer side covered | `_SUCCESS` written iff status==Success; body = `xxh3(manifest.json bytes)`; covered by `success_marker_*` tests + `tests/trust_artifacts_integration.rs` §4 |
-| M3 | ✅ write side; ⚠️ resume-time fingerprint compare deferred | per-part `content_fingerprint` recorded at write; resume-time re-fingerprint is the future `--validate --deep`; size-only quarantine covered by `pipeline::resume_decisions::tests` |
+| M3 | ✅ write side + no-download content verify | per-part `content_fingerprint` (xxh3) and `content_md5` recorded at write in one pass; `--validate` confirms content by comparing `content_md5` to the store's listing checksum (no download); resume still trusts size for skip decisions (quarantine on size drift) — covered by `pipeline::resume_decisions::tests` and `pipeline::manifest_reconcile::tests` |
 | M4 | ✅ | `tests/trust_artifacts_integration.rs §6 — writing_manifest_twice_replaces_the_previous_artifact` |
 | M5 | ✅ | `pipeline::validate_manifest` + `tests/trust_artifacts_integration.rs` §22 (manifest read, part presence, size match) |
 | M6 | ✅ | `legacy_run: true` label surfaced by `verify_at_destination` when no manifest present; covered in `validate_manifest` unit + integration tests |

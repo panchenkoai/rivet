@@ -19,14 +19,14 @@ impl LocalDestination {
 }
 
 impl super::Destination for LocalDestination {
-    fn write(&self, local_path: &Path, remote_key: &str) -> Result<()> {
+    fn write(&self, local_path: &Path, remote_key: &str) -> Result<super::WriteOutcome> {
         let target = Path::new(&self.base_path).join(remote_key);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::copy(local_path, &target)?;
         log::info!("wrote {}", target.display());
-        Ok(())
+        Ok(super::WriteOutcome::opaque()) // local FS reports no content checksum
     }
 
     fn capabilities(&self) -> super::DestinationCapabilities {
@@ -66,6 +66,7 @@ impl super::Destination for LocalDestination {
                 out.push(super::ObjectMeta {
                     key: rel,
                     size_bytes: meta.len(),
+                    content_md5: None, // local FS exposes no checksum in metadata
                 });
                 continue;
             }
@@ -84,6 +85,7 @@ impl super::Destination for LocalDestination {
                     out.push(super::ObjectMeta {
                         key: rel,
                         size_bytes: m.len(),
+                        content_md5: None,
                     });
                 }
                 // Other file types (symlinks loops, sockets) — silently
@@ -106,6 +108,7 @@ impl super::Destination for LocalDestination {
             Ok(m) if m.is_file() => Ok(Some(super::ObjectMeta {
                 key: key.to_string(),
                 size_bytes: m.len(),
+                content_md5: None,
             })),
             // Treat "is a directory" the same as absent for our purposes —
             // M5 only cares about file-shaped objects.

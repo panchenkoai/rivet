@@ -102,6 +102,21 @@ pub(super) fn mysql_native_type_name(col: &mysql::Column) -> String {
     }
 }
 
+/// Derive DECIMAL `(precision, scale)` from a MySQL wire column definition.
+/// `column_length` is the display width = precision + 1 (decimal point, when
+/// `scale > 0`) + 1 (sign, when `signed`). Returns `None` when the arithmetic
+/// can't yield a precision in MySQL's `1..=65` DECIMAL range, so the caller
+/// keeps the column `Unsupported` rather than guess.
+fn derive_decimal_ps(column_length: u32, scale: u8, signed: bool) -> Option<(u8, i8)> {
+    let point = u32::from(scale > 0);
+    let sign = u32::from(signed);
+    let precision = column_length.checked_sub(point + sign)?;
+    if !(1..=65).contains(&precision) {
+        return None;
+    }
+    Some((u8::try_from(precision).ok()?, i8::try_from(scale).ok()?))
+}
+
 /// Map a MySQL column descriptor to Rivet's canonical type.
 ///
 /// Key decisions vs. the old `mysql_type_to_arrow`:
@@ -141,17 +156,25 @@ pub(super) fn mysql_type_to_rivet(col: &mysql::Column) -> RivetType {
         MYSQL_TYPE_FLOAT => RivetType::Float32,
         MYSQL_TYPE_DOUBLE => RivetType::Float64,
 
-        // MySQL DECIMAL carries precision/scale but the mysql crate does not
-        // expose them on `Column` — only the OID-equivalent `column_type()` is
-        // available at this layer. Roadmap §12 forbids silent float conversion,
-        // so we mark this Unsupported until a column override supplies p/s.
-        MYSQL_TYPE_DECIMAL | MYSQL_TYPE_NEWDECIMAL => RivetType::Unsupported {
-            native_type: "decimal".into(),
-            reason: "precision/scale unavailable from MySQL column metadata; \
-                     add a column override (columns: amount: decimal(18,2)) \
-                     or configure type_policy.decimal.unbounded"
-                .into(),
-        },
+        // MySQL DECIMAL precision/scale ARE recoverable from the wire column
+        // definition: `decimals()` is the scale and `column_length()` is the
+        // display width (precision + 1 for the point when scale>0 + 1 for the
+        // sign when signed). Roadmap §12 forbids silent float conversion, so we
+        // resolve exact p/s here — matching PostgreSQL's catalog-hint path —
+        // and only fall back to Unsupported when the arithmetic can't yield a
+        // sane precision.
+        MYSQL_TYPE_DECIMAL | MYSQL_TYPE_NEWDECIMAL => {
+            let signed = !col.flags().contains(ColumnFlags::UNSIGNED_FLAG);
+            match derive_decimal_ps(col.column_length(), col.decimals(), signed) {
+                Some((precision, scale)) => RivetType::Decimal { precision, scale },
+                None => RivetType::Unsupported {
+                    native_type: "decimal".into(),
+                    reason: "could not derive precision/scale from the MySQL column metadata; \
+                             add a column override (columns: amount: decimal(18,2))"
+                        .into(),
+                },
+            }
+        }
 
         // ENUM and SET arrive on the wire as MYSQL_TYPE_STRING /
         // MYSQL_TYPE_VAR_STRING with the ENUM_FLAG / SET_FLAG set.
@@ -237,10 +260,9 @@ pub(super) fn mysql_schema_and_arrow_types(
 
     for col in columns {
         let native = mysql_native_type_name(col);
-        let rivet = column_overrides
-            .get(col.name_str().as_ref())
-            .cloned()
-            .unwrap_or_else(|| mysql_type_to_rivet(col));
+        let rivet = crate::types::resolve_or(column_overrides, col.name_str().as_ref(), || {
+            mysql_type_to_rivet(col)
+        });
         let source = SourceColumn::simple(col.name_str().to_string(), native.clone(), true);
         let mapping = TypeMapping::from_source(&source, rivet);
 
@@ -291,6 +313,20 @@ fn bytes_to_str(b: &[u8]) -> Option<&str> {
     simdutf8::basic::from_utf8(b).ok()
 }
 
+/// Narrow a value already widened to `i128` into a smaller signed integer,
+/// erroring on overflow instead of silently wrapping the way `as iN` does.
+/// MySQL column typing means valid rows always fit; a failure here is a genuine
+/// type mismatch (e.g. an override that mis-declares the width, or a BIGINT
+/// UNSIGNED value > i64::MAX routed through a signed builder) and must surface
+/// loudly — never corrupt into a wrap. See CLAUDE.md "Remediation hints must
+/// recover from the degraded state".
+fn narrow<T>(v: i128, column_type: &str) -> Result<T>
+where
+    T: TryFrom<i128>,
+{
+    T::try_from(v).map_err(|_| anyhow::anyhow!("value {v} overflows {column_type} column"))
+}
+
 /// Interpret raw big-endian bytes from a MySQL BIT column as an unsigned integer.
 /// MySQL sends BIT(n) values as ceil(n/8) big-endian bytes in the binary protocol.
 pub(super) fn bit_bytes_to_u64(b: &[u8]) -> u64 {
@@ -322,6 +358,13 @@ fn parse_time_str_to_micros(s: &str) -> Option<i64> {
     Some(if neg { -total } else { total })
 }
 
+// Structurally parallel to `postgres::arrow_convert::build_array` — both
+// dispatch on the resolved target Arrow type (the schema's single decision) and
+// read the wire value into the matching builder. The dispatch skeletons look
+// like duplication, but the per-value read is irreducibly engine-specific
+// (`mysql::Value` is a tagged enum coerced into the target; PostgreSQL reads via
+// type-driven `FromSql`), so a shared generic would be a shallow seam — kept
+// separate deliberately.
 fn build_array(
     arrow_type: &DataType,
     col_idx: usize,
@@ -345,10 +388,12 @@ fn build_array(
             let mut b = Int16Builder::with_capacity(rows.len());
             for row in rows {
                 match row.as_ref(col_idx) {
-                    Some(Value::Int(v)) => b.append_value(*v as i16),
-                    Some(Value::UInt(v)) => b.append_value(*v as i16),
-                    Some(Value::Bytes(bv)) => match atoi::atoi::<i16>(bv) {
-                        Some(v) => b.append_value(v),
+                    Some(Value::Int(v)) => b.append_value(narrow::<i16>(*v as i128, "smallint")?),
+                    Some(Value::UInt(v)) => b.append_value(narrow::<i16>(*v as i128, "smallint")?),
+                    // Parse to i128 first so an out-of-range numeric string errors
+                    // (overflow) rather than nulling like a non-numeric one.
+                    Some(Value::Bytes(bv)) => match atoi::atoi::<i128>(bv) {
+                        Some(v) => b.append_value(narrow::<i16>(v, "smallint")?),
                         None => b.append_null(),
                     },
                     _ => b.append_null(),
@@ -360,10 +405,10 @@ fn build_array(
             let mut b = Int32Builder::with_capacity(rows.len());
             for row in rows {
                 match row.as_ref(col_idx) {
-                    Some(Value::Int(v)) => b.append_value(*v as i32),
-                    Some(Value::UInt(v)) => b.append_value(*v as i32),
-                    Some(Value::Bytes(bv)) => match atoi::atoi::<i32>(bv) {
-                        Some(v) => b.append_value(v),
+                    Some(Value::Int(v)) => b.append_value(narrow::<i32>(*v as i128, "int")?),
+                    Some(Value::UInt(v)) => b.append_value(narrow::<i32>(*v as i128, "int")?),
+                    Some(Value::Bytes(bv)) => match atoi::atoi::<i128>(bv) {
+                        Some(v) => b.append_value(narrow::<i32>(v, "int")?),
                         None => b.append_null(),
                     },
                     _ => b.append_null(),
@@ -394,7 +439,10 @@ fn build_array(
             for row in rows {
                 match row.as_ref(col_idx) {
                     Some(Value::Int(v)) => b.append_value(*v),
-                    Some(Value::UInt(v)) => b.append_value(*v as i64),
+                    // A BIGINT UNSIGNED value > i64::MAX cannot ride a signed
+                    // builder — error loudly (the operator should map it to
+                    // `decimal(20,0)`) rather than wrap into a negative.
+                    Some(Value::UInt(v)) => b.append_value(narrow::<i64>(*v as i128, "bigint")?),
                     Some(Value::Bytes(bv)) => {
                         // BIT(n>1) columns arrive as raw big-endian bytes; TEXT columns as UTF-8.
                         // Try decimal parse first; fall back to big-endian uint interpretation.
@@ -583,17 +631,15 @@ fn build_array(
         // Exact decimal path: column override declared decimal(p,s) for a MySQL DECIMAL column.
         DataType::Decimal128(p, s) => mysql_decimal_to_decimal128(*p, *s, col_idx, rows),
         DataType::Decimal256(p, s) => mysql_decimal_to_decimal256(*p, *s, col_idx, rows),
-        _ => {
-            log::warn!(
-                "unhandled Arrow type {:?} for MySQL, writing nulls",
-                arrow_type
-            );
-            let mut b = StringBuilder::with_capacity(rows.len(), 0);
-            for _ in rows {
-                b.append_null();
-            }
-            Ok(Arc::new(b.finish()))
-        }
+        // Fail loud (slice A), symmetric with the PostgreSQL path.
+        // `mysql_schema_and_arrow_types` already proved every column resolves to
+        // a supported Arrow type, so an unhandled type here is a should-never-
+        // happen — writing a null array silently hid it. Surface it.
+        _ => anyhow::bail!(
+            "no value converter for MySQL column → Arrow {:?} (column index {col_idx}); \
+             this Arrow type has no builder — report it as a type-support gap",
+            arrow_type,
+        ),
     }
 }
 
@@ -680,15 +726,16 @@ fn mysql_decimal_to_decimal256(
     col_idx: usize,
     rows: &[mysql::Row],
 ) -> Result<Arc<dyn Array>> {
-    use crate::types::decimal::decimal_str_to_scaled_i128;
-    use arrow::datatypes::i256;
+    // Decimal256 (precision > 38): scale straight into i256 so values beyond
+    // i128 are not truncated.
+    use crate::types::decimal::{decimal_str_to_scaled_i256, scale_int_to_i256};
     let mut b = Decimal256Builder::with_capacity(rows.len());
     for row in rows {
         match row.as_ref(col_idx) {
             Some(Value::Bytes(bv)) => {
                 let s = bytes_to_str(bv).unwrap_or("");
-                match decimal_str_to_scaled_i128(s, scale) {
-                    Some(v) => b.append_value(i256::from_i128(v)),
+                match decimal_str_to_scaled_i256(s, scale) {
+                    Some(v) => b.append_value(v),
                     None => {
                         return Err(anyhow::anyhow!(
                             "cannot parse '{}' as decimal({},{})",
@@ -699,8 +746,8 @@ fn mysql_decimal_to_decimal256(
                     }
                 }
             }
-            Some(Value::Int(v)) => match scale_int_to_i128(*v as i128, scale) {
-                Some(scaled) => b.append_value(i256::from_i128(scaled)),
+            Some(Value::Int(v)) => match scale_int_to_i256(*v as i128, scale) {
+                Some(scaled) => b.append_value(scaled),
                 None => {
                     return Err(anyhow::anyhow!(
                         "decimal({},{}) overflow scaling integer {}",
@@ -710,8 +757,8 @@ fn mysql_decimal_to_decimal256(
                     ));
                 }
             },
-            Some(Value::UInt(v)) => match scale_int_to_i128(*v as i128, scale) {
-                Some(scaled) => b.append_value(i256::from_i128(scaled)),
+            Some(Value::UInt(v)) => match scale_int_to_i256(*v as i128, scale) {
+                Some(scaled) => b.append_value(scaled),
                 None => {
                     return Err(anyhow::anyhow!(
                         "decimal({},{}) overflow scaling unsigned integer {}",
@@ -727,4 +774,85 @@ fn mysql_decimal_to_decimal256(
     Ok(Arc::new(
         b.finish().with_precision_and_scale(precision, scale)?,
     ))
+}
+
+#[cfg(test)]
+mod scale_int_overflow_tests {
+    use super::{derive_decimal_ps, narrow, scale_int_to_i128};
+
+    #[test]
+    fn negative_scale_is_rejected() {
+        // Parquet rejects negative-scale decimals; the scaler refuses too.
+        assert_eq!(scale_int_to_i128(123, -1), None);
+    }
+
+    #[test]
+    fn scale_zero_is_identity_and_u64_max_rides_losslessly() {
+        assert_eq!(scale_int_to_i128(123, 0), Some(123));
+        // The `bigint unsigned: decimal(20,0)` case: u64::MAX must survive whole.
+        assert_eq!(
+            scale_int_to_i128(u64::MAX as i128, 0),
+            Some(u64::MAX as i128)
+        );
+    }
+
+    #[test]
+    fn normal_scaling() {
+        assert_eq!(scale_int_to_i128(5, 2), Some(500));
+        assert_eq!(scale_int_to_i128(-7, 3), Some(-7000));
+    }
+
+    #[test]
+    fn overflow_returns_none_not_wrap() {
+        // u64::MAX (~1.8e19) scaled by 10^20 (~1.8e39) exceeds i128::MAX → None.
+        assert_eq!(scale_int_to_i128(u64::MAX as i128, 20), None);
+        // 10^39 overflows i128 in checked_pow itself → None, not a panic.
+        assert_eq!(scale_int_to_i128(1, 39), None);
+        // Multiplication overflow on an already-max operand.
+        assert_eq!(scale_int_to_i128(i128::MAX, 1), None);
+    }
+
+    // ── narrow(): the `as iN` truncation footgun, now checked ────────────────
+
+    #[test]
+    fn narrow_fits_in_range() {
+        assert_eq!(narrow::<i16>(100, "smallint").unwrap(), 100i16);
+        assert_eq!(narrow::<i32>(-5, "int").unwrap(), -5i32);
+        assert_eq!(
+            narrow::<i64>(u32::MAX as i128, "bigint").unwrap(),
+            u32::MAX as i64
+        );
+    }
+
+    #[test]
+    fn narrow_overflow_errors_not_wraps() {
+        assert!(narrow::<i16>(40_000, "smallint").is_err()); // > i16::MAX 32767
+        assert!(narrow::<i16>(-40_000, "smallint").is_err());
+        assert!(narrow::<i32>(5_000_000_000, "int").is_err()); // > i32::MAX
+        // The real bug: a BIGINT UNSIGNED value > i64::MAX would wrap to a
+        // negative with `as i64`; narrow turns it into a loud error instead.
+        assert!(narrow::<i64>(u64::MAX as i128, "bigint").is_err());
+    }
+
+    // ── derive_decimal_ps: MySQL wire display-width → precision/scale ─────────
+
+    #[test]
+    fn derive_decimal_ps_signed_and_unsigned() {
+        // DECIMAL(10,2) signed: "-99999999.99" = 12 chars (p + point + sign).
+        assert_eq!(derive_decimal_ps(12, 2, true), Some((10, 2)));
+        // DECIMAL(10,0) signed: "-9999999999" = 11 chars (no decimal point).
+        assert_eq!(derive_decimal_ps(11, 0, true), Some((10, 0)));
+        // DECIMAL(10,2) unsigned: "99999999.99" = 11 chars (no sign).
+        assert_eq!(derive_decimal_ps(11, 2, false), Some((10, 2)));
+        // Fixture columns: DECIMAL(18,2), DECIMAL(20,6) signed.
+        assert_eq!(derive_decimal_ps(20, 2, true), Some((18, 2)));
+        assert_eq!(derive_decimal_ps(22, 6, true), Some((20, 6)));
+    }
+
+    #[test]
+    fn derive_decimal_ps_rejects_insane_widths() {
+        assert_eq!(derive_decimal_ps(1, 2, true), None); // underflow → None, not panic
+        assert_eq!(derive_decimal_ps(0, 0, false), None); // precision 0
+        assert_eq!(derive_decimal_ps(100, 0, false), None); // > 65 MySQL max
+    }
 }

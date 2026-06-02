@@ -107,6 +107,7 @@ impl ManifestBuilder {
         rows: i64,
         size_bytes: u64,
         content_fingerprint: String,
+        content_md5: String,
     ) {
         self.parts.push(ManifestPart {
             part_id,
@@ -114,6 +115,7 @@ impl ManifestBuilder {
             rows,
             size_bytes,
             content_fingerprint,
+            content_md5,
             status: PartStatus::Committed,
         });
     }
@@ -154,30 +156,35 @@ impl ManifestBuilder {
     }
 }
 
-/// Compute the xxh3 content fingerprint of a local file.
+/// Compute both part-body hashes in a **single pass** over the file: the xxh3
+/// `content_fingerprint` (`"xxh3:<16-hex>"`, ADR-0012 M3) and the base64 MD5
+/// (GCS `md5Hash` encoding) used for no-download destination verification.
+/// Returns `(fingerprint, md5_base64)`.
 ///
-/// Streams the file in 64 KiB chunks so multi-GB parts do not require a
-/// matching memory allocation.  Returns the `"xxh3:<16-hex>"` format per
-/// ADR-0012 M3.
-///
-/// Called immediately after `dest.write` succeeds, while the local
-/// temp file still exists.  The roundtrip cost (one file re-read at
-/// disk-cache speed) is negligible compared to the destination upload
-/// it follows — for local FS the OS buffer cache makes the re-read
-/// essentially free.
-pub fn compute_part_fingerprint(path: &Path) -> Result<String> {
+/// Streams in 64 KiB chunks so multi-GB parts don't require a matching
+/// allocation, and reads the file **once** for both digests.  Called right
+/// after `dest.write` succeeds while the local temp file still exists; the
+/// re-read is disk-cache cheap relative to the upload it follows.
+pub fn compute_part_checksums(path: &Path) -> Result<(String, String)> {
+    use base64::Engine as _;
+    use md5::{Digest, Md5};
     use xxhash_rust::xxh3::Xxh3;
     let mut f = std::fs::File::open(path)?;
-    let mut h = Xxh3::new();
+    let mut xxh = Xxh3::new();
+    let mut md5 = Md5::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
         let n = f.read(&mut buf)?;
         if n == 0 {
             break;
         }
-        h.update(&buf[..n]);
+        xxh.update(&buf[..n]);
+        md5.update(&buf[..n]);
     }
-    Ok(format!("xxh3:{:016x}", h.digest()))
+    Ok((
+        format!("xxh3:{:016x}", xxh.digest()),
+        base64::engine::general_purpose::STANDARD.encode(md5.finalize()),
+    ))
 }
 
 /// Capture the run's schema fingerprint on the summary.
@@ -218,6 +225,7 @@ pub fn record_committed_part_with_fingerprint(
     rows: i64,
     size_bytes: u64,
     content_fingerprint: String,
+    content_md5: String,
 ) {
     // ADR-0012 M4: part_id must be unique within the manifest.  Before the
     // M8 resume-hydration work, `summary.manifest_parts.len() + 1` was a
@@ -240,6 +248,7 @@ pub fn record_committed_part_with_fingerprint(
         rows,
         size_bytes,
         content_fingerprint,
+        content_md5,
         status: PartStatus::Committed,
     });
 }
@@ -361,6 +370,7 @@ mod tests {
             50_000,
             4096,
             "xxh3:aaaaaaaaaaaaaaaa".into(),
+            String::new(),
         );
         b.record_part(
             2,
@@ -368,6 +378,7 @@ mod tests {
             25_000,
             2048,
             "xxh3:bbbbbbbbbbbbbbbb".into(),
+            String::new(),
         );
 
         let m = b.finalize(ManifestStatus::Success);
@@ -413,14 +424,36 @@ mod tests {
         assert_eq!(m.status, ManifestStatus::Failed);
     }
 
-    // ── compute_part_fingerprint ────────────────────────────────────────────
+    // ── compute_part_checksums ──────────────────────────────────────────────
+
+    #[test]
+    fn single_pass_checksums_equal_independent_recompute() {
+        use base64::Engine as _;
+        use md5::{Digest, Md5};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("part.bin");
+        let data = b"the quick brown fox jumps over the lazy dog";
+        std::fs::write(&p, data).unwrap();
+        let (fp, md5) = compute_part_checksums(&p).unwrap();
+        // The single-read path must equal hashing the bytes independently.
+        assert_eq!(
+            fp,
+            format!("xxh3:{:016x}", xxhash_rust::xxh3::xxh3_64(data))
+        );
+        let mut h = Md5::new();
+        h.update(data);
+        assert_eq!(
+            md5,
+            base64::engine::general_purpose::STANDARD.encode(h.finalize())
+        );
+    }
 
     #[test]
     fn fingerprint_format_matches_adr_0012() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("part.bin");
         std::fs::write(&p, b"hello world").unwrap();
-        let fp = compute_part_fingerprint(&p).unwrap();
+        let (fp, _) = compute_part_checksums(&p).unwrap();
         assert!(fp.starts_with("xxh3:"));
         assert_eq!(fp.len(), "xxh3:".len() + 16);
         let hex = &fp["xxh3:".len()..];
@@ -438,8 +471,8 @@ mod tests {
         std::fs::write(&a, b"alpha").unwrap();
         std::fs::write(&b, b"beta").unwrap();
         assert_ne!(
-            compute_part_fingerprint(&a).unwrap(),
-            compute_part_fingerprint(&b).unwrap()
+            compute_part_checksums(&a).unwrap().0,
+            compute_part_checksums(&b).unwrap().0
         );
     }
 
@@ -448,8 +481,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("part.bin");
         std::fs::write(&p, b"deterministic").unwrap();
-        let fp1 = compute_part_fingerprint(&p).unwrap();
-        let fp2 = compute_part_fingerprint(&p).unwrap();
+        let fp1 = compute_part_checksums(&p).unwrap().0;
+        let fp2 = compute_part_checksums(&p).unwrap().0;
         assert_eq!(fp1, fp2);
     }
 
@@ -464,7 +497,7 @@ mod tests {
             let mut f = std::fs::File::create(&p).unwrap();
             f.write_all(&payload).unwrap();
         }
-        let fp = compute_part_fingerprint(&p).unwrap();
+        let (fp, _) = compute_part_checksums(&p).unwrap();
         let one_shot = format!("xxh3:{:016x}", xxhash_rust::xxh3::xxh3_64(&payload));
         assert_eq!(fp, one_shot);
     }
@@ -488,6 +521,7 @@ mod tests {
             100,
             4096,
             "xxh3:1111111111111111".into(),
+            String::new(),
         );
         b.record_part(
             2,
@@ -495,6 +529,7 @@ mod tests {
             200,
             8192,
             "xxh3:2222222222222222".into(),
+            String::new(),
         );
         b.finalize(status)
     }

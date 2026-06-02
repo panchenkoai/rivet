@@ -30,10 +30,11 @@
 // every individual item.
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 use crate::destination::ObjectMeta;
-use crate::manifest::{PartStatus, RunManifest};
+use crate::manifest::RunManifest;
+use crate::pipeline::manifest_reconcile::{PartPresence, reconcile_manifest_against_listing};
 
 /// What `--resume` should do with a single part on the next run.
 ///
@@ -69,12 +70,9 @@ pub enum UntrackedDecision {
 pub enum QuarantineReason {
     /// `size_bytes` on the destination differs from the manifest entry.
     SizeMismatch,
-    /// Caller compared content fingerprints out-of-band and they diverge.
-    /// Not used in this module today (we don't re-fingerprint at resume
-    /// time — too expensive without `--validate --deep`), but reserved so
-    /// a future caller can plumb fingerprint-aware decisions through the
-    /// same enum.
-    #[allow(dead_code)]
+    /// The object's content MD5 (from the listing metadata) diverged from
+    /// the manifest's — corruption at the same size, caught with no download.
+    /// Produced when the reconciliation surfaces a `ChecksumMismatch`.
     FingerprintMismatch,
 }
 
@@ -135,63 +133,39 @@ impl ResumePlan {
 /// The function does **not** mutate either input.  A chunked executor may
 /// run this once at the start of a resume to populate its skip-set.
 pub fn build_resume_plan(manifest: &RunManifest, listing: &[ObjectMeta]) -> ResumePlan {
+    // Resume reads the destination at the prefix root (`list_prefix("")`), so
+    // part keys are the bare `part.path` — `manifest_dir = ""`.
+    let rec = reconcile_manifest_against_listing(manifest, listing, "");
+
     let mut plan = ResumePlan::default();
-
-    // Index the listing by key for O(1) per-part lookup.  Skip the
-    // quarantine prefix outright — its contents are audit artifacts and
-    // must never be reused or re-quarantined.
-    let listed: BTreeMap<&str, &ObjectMeta> = listing
-        .iter()
-        .filter(|m| !m.key.contains(crate::manifest::QUARANTINE_PREFIX))
-        .map(|m| (m.key.as_str(), m))
-        .collect();
-
-    let mut listed_seen: HashSet<&str> = HashSet::new();
-
-    // Per-part: walk the manifest's `Committed` parts and decide.
-    for part in &manifest.parts {
-        if part.status != PartStatus::Committed {
-            continue; // quarantined entries are audit-only; no resume action
-        }
-        let decision = match listed.get(part.path.as_str()) {
-            None => ResumeDecision::Rewrite,
-            Some(meta) => {
-                listed_seen.insert(meta.key.as_str());
-                if meta.size_bytes == part.size_bytes {
-                    // Resume time skips the fingerprint re-check by design
-                    // (ADR-0012 M3 — fingerprint compare is `--validate --deep`).
-                    // If the size matches, we trust the prior write.
-                    ResumeDecision::Skip
-                } else {
-                    ResumeDecision::Quarantine {
-                        reason: QuarantineReason::SizeMismatch,
-                    }
-                }
-            }
+    for check in rec.per_part {
+        // Resume time trusts a size match (ADR-0012 M3 — the fingerprint
+        // compare is `--validate --deep`, deliberately not paid on the hot
+        // resume path).  Missing → re-export; size drift → quarantine + rewrite.
+        let decision = match check.presence {
+            PartPresence::Present { .. } => ResumeDecision::Skip,
+            PartPresence::Missing => ResumeDecision::Rewrite,
+            PartPresence::SizeMismatch { .. } => ResumeDecision::Quarantine {
+                reason: QuarantineReason::SizeMismatch,
+            },
+            // Content drift at the same size — quarantine the corrupt object
+            // and re-export, same as a size mismatch.
+            PartPresence::ChecksumMismatch { .. } => ResumeDecision::Quarantine {
+                reason: QuarantineReason::FingerprintMismatch,
+            },
         };
         plan.per_part.insert(
-            part.path.clone(),
+            check.path,
             PartDecision {
-                part_id: part.part_id,
+                part_id: check.part_id,
                 decision,
             },
         );
     }
-
-    // Surplus: every listed key the manifest didn't claim.  Filter out
-    // `manifest.json` and `_SUCCESS` themselves — they are not "untracked
-    // data" at the prefix; they're the trust contract.
-    for (key, _) in listed {
-        if listed_seen.contains(key) {
-            continue;
-        }
-        if key == crate::manifest::MANIFEST_FILENAME || key == crate::manifest::SUCCESS_FILENAME {
-            continue;
-        }
+    for obj in rec.untracked {
         plan.untracked
-            .insert(key.to_string(), UntrackedDecision::Quarantine);
+            .insert(obj.key, UntrackedDecision::Quarantine);
     }
-
     plan
 }
 
@@ -200,7 +174,7 @@ mod tests {
     use super::*;
     use crate::manifest::{
         MANIFEST_FILENAME, MANIFEST_VERSION, ManifestDestination, ManifestPart, ManifestSource,
-        ManifestStatus, RunManifest, SUCCESS_FILENAME,
+        ManifestStatus, PartStatus, RunManifest, SUCCESS_FILENAME,
     };
 
     fn part(part_id: u32, path: &str, size: u64) -> ManifestPart {
@@ -210,6 +184,7 @@ mod tests {
             rows: 100,
             size_bytes: size,
             content_fingerprint: format!("xxh3:{:016x}", part_id as u64),
+            content_md5: String::new(),
             status: PartStatus::Committed,
         }
     }
@@ -253,6 +228,7 @@ mod tests {
         ObjectMeta {
             key: key.into(),
             size_bytes: size,
+            content_md5: None,
         }
     }
 

@@ -22,6 +22,22 @@ impl super::Format for CsvFormat {
         schema: &SchemaRef,
         mut writer: Box<dyn Write + Send>,
     ) -> Result<Box<dyn super::FormatWriter + Send>> {
+        // Fail loud: arrays and other nested/wide Arrow types have no CSV cell
+        // representation. Reject them up front, naming the column, instead of
+        // silently writing empty values for every row — `format: parquet` or
+        // excluding the column from the query is the fix.
+        if let Some(field) = schema
+            .fields()
+            .iter()
+            .find(|f| !csv_serializable(f.data_type()))
+        {
+            anyhow::bail!(
+                "CSV cannot serialize column '{}' (Arrow type {:?}); use `format: parquet` \
+                 or drop the column from the query",
+                field.name(),
+                field.data_type()
+            );
+        }
         let header = schema
             .fields()
             .iter()
@@ -65,6 +81,30 @@ impl super::FormatWriter for CsvFormatWriter {
     fn bytes_written(&self) -> u64 {
         self.bytes_written
     }
+}
+
+/// Arrow types `write_csv_value` can serialize. Everything else — lists,
+/// structs, maps, `Decimal256`, non-UUID fixed binary, … — has no CSV cell
+/// representation and is rejected at writer creation rather than silently
+/// emitted as an empty value.
+fn csv_serializable(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Boolean
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt64
+            | DataType::Decimal128(_, _)
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::Binary
+            | DataType::FixedSizeBinary(16)
+            | DataType::Date32
+            | DataType::Time64(TimeUnit::Microsecond)
+            | DataType::Timestamp(TimeUnit::Microsecond, _)
+    )
 }
 
 fn write_csv_value(writer: &mut dyn Write, array: &dyn Array, idx: usize) -> Result<()> {
@@ -222,7 +262,12 @@ fn write_csv_value(writer: &mut dyn Write, array: &dyn Array, idx: usize) -> Res
             }
         }
         other => {
-            log::warn!("CSV: unhandled Arrow type {:?}, skipping value", other);
+            // Defensive: `create_writer` rejects unsupported types up front, so
+            // this should be unreachable. Bail rather than silently skip if a
+            // new type slips through.
+            anyhow::bail!(
+                "CSV: no serializer for Arrow type {other:?} (column should have been rejected at writer creation)"
+            );
         }
     }
 
@@ -421,5 +466,82 @@ mod tests {
             writer.bytes_written()
         );
         writer.finish().unwrap();
+    }
+
+    // ── fail loud on types CSV can't represent ───────────────────────────────
+
+    #[test]
+    fn csv_rejects_array_columns_loudly() {
+        use crate::format::Format;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+        ]));
+        let Err(err) = CsvFormat.create_writer(&schema, Box::new(Vec::<u8>::new())) else {
+            panic!("CSV must reject array columns, not silently drop them");
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("tags"), "error must name the column: {msg}");
+        assert!(msg.to_lowercase().contains("csv"), "{msg}");
+    }
+
+    /// Consistency guard: every type `csv_serializable` admits must actually be
+    /// handled by `write_csv_value` (not hit its `other => bail` fallthrough).
+    /// Keeps the whitelist and the writer in lock-step so one can't drift.
+    #[test]
+    fn every_serializable_type_is_actually_written() {
+        use crate::format::Format;
+        let cols: Vec<(&str, ArrayRef)> = vec![
+            ("b", Arc::new(BooleanArray::from(vec![true]))),
+            ("i16", Arc::new(Int16Array::from(vec![1i16]))),
+            ("i32", Arc::new(Int32Array::from(vec![1i32]))),
+            ("i64", Arc::new(Int64Array::from(vec![1i64]))),
+            ("u64", Arc::new(UInt64Array::from(vec![1u64]))),
+            (
+                "dec",
+                Arc::new(
+                    Decimal128Array::from(vec![100i128])
+                        .with_precision_and_scale(18, 2)
+                        .unwrap(),
+                ),
+            ),
+            ("f32", Arc::new(Float32Array::from(vec![1.0f32]))),
+            ("f64", Arc::new(Float64Array::from(vec![1.0f64]))),
+            ("s", Arc::new(StringArray::from(vec!["x"]))),
+            ("bin", Arc::new(BinaryArray::from_vec(vec![&[1u8][..]]))),
+            (
+                "uuid",
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_iter(std::iter::once(vec![0u8; 16])).unwrap(),
+                ),
+            ),
+            ("d", Arc::new(Date32Array::from(vec![0i32]))),
+            ("t", Arc::new(Time64MicrosecondArray::from(vec![0i64]))),
+            ("ts", Arc::new(TimestampMicrosecondArray::from(vec![0i64]))),
+        ];
+        let fields: Vec<Field> = cols
+            .iter()
+            .map(|(n, a)| Field::new(*n, a.data_type().clone(), true))
+            .collect();
+        // Sanity: each column's type is on the whitelist.
+        for f in &fields {
+            assert!(
+                csv_serializable(f.data_type()),
+                "test type {:?} not in csv_serializable",
+                f.data_type()
+            );
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let arrays: Vec<ArrayRef> = cols.into_iter().map(|(_, a)| a).collect();
+        let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
+        let mut w = CsvFormat
+            .create_writer(&schema, Box::new(Vec::<u8>::new()))
+            .unwrap();
+        w.write_batch(&batch)
+            .expect("every serializable type must write without hitting the fallthrough");
     }
 }

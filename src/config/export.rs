@@ -21,6 +21,25 @@ use crate::tuning::TuningConfig;
 ///   - name: orders
 ///     on_schema_drift: fail   # warn (default), continue, fail
 /// ```
+/// How deep `--validate` must verify each part's integrity.
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyMode {
+    /// Accept size-only verification when no content checksum is available.
+    #[default]
+    Size,
+    /// Require every part's content to be MD5-verified against the store's
+    /// listing; fail validation for any part that is only size-verified.
+    Content,
+}
+
+impl VerifyMode {
+    /// Whether content (not just size) verification is required.
+    pub fn requires_content(self) -> bool {
+        matches!(self, VerifyMode::Content)
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SchemaDriftPolicy {
@@ -105,6 +124,14 @@ pub struct ExportConfig {
     #[serde(default)]
     pub skip_empty: bool,
     pub destination: DestinationConfig,
+    /// Integrity depth required of `--validate` for this export's parts.
+    /// `size` (default) accepts size-only verification; `content` requires every
+    /// part's content MD5 to be checked against the store's listing (no
+    /// download) and **fails** validation for any part that could only be
+    /// size-verified — e.g. a part too large to upload as a single PUT (raise
+    /// `max_file_size` down so it fits), or a backend that exposes no checksum.
+    #[serde(default)]
+    pub verify: VerifyMode,
     #[serde(default)]
     pub meta_columns: MetaColumns,
     #[serde(default)]
@@ -139,6 +166,21 @@ pub struct ExportConfig {
     /// plan time — an invalid type string fails before the export runs.
     #[serde(default)]
     pub columns: std::collections::HashMap<String, String>,
+
+    /// Downstream warehouse this export targets (`bigquery` / `bq`,
+    /// `duckdb`). When set, `rivet check --type-report` resolves each column
+    /// against it (native type, honest autoload type, recovery hint) without
+    /// needing `--target` on the CLI — the CLI flag still wins when both are
+    /// present. The Parquet interchange stays target-neutral (ADR-0014 T2);
+    /// `target:` only drives guidance and the future load-schema artifact.
+    ///
+    /// ```yaml
+    /// exports:
+    ///   - name: payments
+    ///     target: bigquery
+    /// ```
+    #[serde(default)]
+    pub target: Option<String>,
 
     /// Policy applied when structural schema drift is detected (column added, removed, or retyped).
     /// Defaults to `warn`: log a warning and continue.
@@ -392,6 +434,8 @@ mod tests {
     fn make_export_direct(query: Option<&str>, query_file: Option<&str>) -> ExportConfig {
         ExportConfig {
             name: "test".into(),
+            target: None,
+            verify: VerifyMode::Size,
             query: query.map(|s| s.to_string()),
             query_file: query_file.map(|s| s.to_string()),
             table: None,

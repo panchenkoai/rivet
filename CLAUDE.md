@@ -59,3 +59,30 @@ named site**. Only then write the claim into a deliverable.
 
 The grep is cheap. The wrong claim in a report wastes a future
 contributor's day chasing a smell that does not exist.
+
+## Remediation hints must recover from the degraded state
+
+When emitting a fix-it suggestion — a `cast_sql`, a repair query, a
+"run this to recover" hint — verify it actually works **from the
+already-degraded state**, not from the original value. If the
+degradation is lossy (integer overflow, truncation, a naive-vs-instant
+timestamp ambiguity, a dropped logical type) no post-hoc cast can
+recover it: the only valid remediation is upstream (a declared load
+schema / target-native column), and the hint must say exactly that —
+never a SELECT-time cast that silently runs on corrupted data.
+
+This bit the target resolver (`src/types/target.rs`): a `UINT64`
+column was given `cast_sql = CAST(col AS NUMERIC)`, but once it
+autoloads as `INT64` it has already overflowed, so the cast recovers
+nothing. The fix: `cast_sql` is `Some(..)` **only** when the autoloaded
+value still holds the information losslessly (JSON bytes → `PARSE_JSON`,
+UUID bytes → `TO_HEX`); for overflow (`UINT64`) and naive-timestamp the
+value is gone at autoload, so `cast_sql` is `None` and the note points
+to the load schema.
+
+Process rule: **every lossy degradation that surfaces a remediation
+gets a regression edge-case test** asserting the recovery is real — a
+post-load cast only where it is lossless, otherwise `None` + an
+upstream (load-schema) note, and never a silent no-op. When self-review
+catches a bug of this shape, add the edge-case test alongside the fix,
+not just the fix.

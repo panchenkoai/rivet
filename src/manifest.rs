@@ -50,6 +50,20 @@ pub const QUARANTINE_PREFIX: &str = "_quarantine";
 /// foreign object when a run follows a `doctor` against the same prefix.
 pub const DOCTOR_PROBE_FILENAME: &str = ".rivet_doctor_probe";
 
+/// Join a manifest-relative key (e.g. a part `path`, [`MANIFEST_FILENAME`])
+/// onto a destination sub-directory.  An empty `dir` returns `key` unchanged
+/// — the common case, since production callers pass `""` (the manifest lives
+/// at the prefix root).  Shared by the destination-verification and
+/// resume-reconciliation paths so both speak the same key namespace.
+pub fn join_key(dir: &str, key: &str) -> String {
+    let dir = dir.trim_end_matches('/');
+    if dir.is_empty() {
+        key.to_string()
+    } else {
+        format!("{dir}/{key}")
+    }
+}
+
 /// Compute the body of the `_SUCCESS` marker for a given serialized manifest.
 ///
 /// Format: a single line `"xxh3:<16-hex>\n"`.  ADR-0012 M2 — `_SUCCESS`
@@ -158,6 +172,14 @@ pub struct ManifestPart {
     /// `"xxh3:<16-hex>"`.  Algorithm prefix MUST be checked before interpreting
     /// the hex body (sha256/blake3 reserved for future hashers).
     pub content_fingerprint: String,
+    /// Base64 MD5 of the part body, in GCS's `md5Hash` encoding — lets
+    /// destination verification compare against the object's listing metadata
+    /// with **no download** (GCS/S3/Azure surface this; the comparison rides
+    /// the listing `--validate` already does).  Empty for legacy manifests and
+    /// for parts whose MD5 could not be computed; the check then degrades to
+    /// size-only.  `#[serde(default)]` keeps pre-0.7.x manifests parseable.
+    #[serde(default)]
+    pub content_md5: String,
     pub status: PartStatus,
 }
 
@@ -272,6 +294,7 @@ mod tests {
             rows,
             size_bytes: size,
             content_fingerprint: format!("xxh3:{:016x}", id as u64),
+            content_md5: String::new(),
             status: PartStatus::Committed,
         }
     }

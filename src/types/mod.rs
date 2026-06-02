@@ -56,9 +56,48 @@ pub use source_column::ColumnOverride;
 /// declared precision/scale instead of autodetected (often unavailable) metadata.
 pub type ColumnOverrides = std::collections::HashMap<String, RivetType>;
 
+/// The override precedence shared by every source engine: a `columns:` override
+/// wins; otherwise fall back to the engine's autodetected type. Keeping it in
+/// one place is why PostgreSQL and MySQL resolution can't drift on precedence —
+/// each driver supplies only its own `autodetect` closure.
+pub fn resolve_or(
+    overrides: &ColumnOverrides,
+    column: &str,
+    autodetect: impl FnOnce() -> RivetType,
+) -> RivetType {
+    overrides.get(column).cloned().unwrap_or_else(autodetect)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_or_prefers_override_then_autodetect() {
+        let mut ov = ColumnOverrides::new();
+        ov.insert(
+            "amount".into(),
+            RivetType::Decimal {
+                precision: 18,
+                scale: 2,
+            },
+        );
+        // Override wins, autodetect not even called.
+        assert_eq!(
+            resolve_or(&ov, "amount", || panic!(
+                "autodetect must not run when overridden"
+            )),
+            RivetType::Decimal {
+                precision: 18,
+                scale: 2
+            }
+        );
+        // No override → autodetect.
+        assert_eq!(
+            resolve_or(&ov, "other", || RivetType::Int64),
+            RivetType::Int64
+        );
+    }
     use crate::types::mapping::{META_FIDELITY, META_LOGICAL_TYPE, META_NATIVE_TYPE};
     use arrow::datatypes::DataType;
 

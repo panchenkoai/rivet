@@ -71,12 +71,48 @@ pub struct ObjectMeta {
     /// the same shape `Destination::write`'s `remote_key` argument uses.
     pub key: String,
     pub size_bytes: u64,
+    /// The object's content MD5 from listing / stat metadata, when the backend
+    /// exposes one — `None` otherwise.  Lets verification compare content
+    /// against `manifest.parts[].content_md5` with no download.  Coverage:
+    /// - **GCS** — always (`md5Hash`, base64).
+    /// - **S3** — single-part objects (ETag, hex); multipart composite ETags
+    ///   (`<hash>-<N>`) are not an MD5 and verify size-only.
+    /// - **Azure** — when the blob carries a `Content-MD5`. Azure auto-computes
+    ///   one *only* for a single-shot `Put Blob`, so rivet one-shots parts that
+    ///   fit in memory (verified live: `Content-MD5` present → md5-checked);
+    ///   parts large enough to stream upload as `Put Block List`, which carries
+    ///   no `Content-MD5` → those verify size-only.
+    /// - **Local FS** — never.
+    pub content_md5: Option<String>,
+}
+
+/// What a [`Destination::write`] reports about the object it just stored.
+///
+/// Surfaces the store's *own* content checksum from the upload response when
+/// one is available — GCS / Azure single `Put Blob` compute an MD5 from the
+/// received bytes, S3 single `PutObject` returns the MD5 as the ETag.  The
+/// commit path compares it to the locally computed MD5 for a fail-fast,
+/// no-download transit-integrity check.  `None` when the backend / upload path
+/// doesn't report one (local FS, streamed multipart / block-list).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WriteOutcome {
+    /// The store-reported content checksum (base64 MD5 or hex ETag), or `None`.
+    pub content_md5: Option<String>,
+}
+
+impl WriteOutcome {
+    /// A write that reported no content checksum (local FS, streamed uploads).
+    pub fn opaque() -> Self {
+        Self { content_md5: None }
+    }
 }
 
 /// Object-safe surface for upload backends. `Send + Sync` so a single `Arc` can be shared
 /// across parallel chunk workers (one OpenDAL/HTTP stack per export, not one Tokio runtime per chunk).
 pub trait Destination: Send + Sync {
-    fn write(&self, local_path: &Path, remote_key: &str) -> Result<()>;
+    /// Write `local_path` to `remote_key`, returning what the store reported
+    /// about the stored object (see [`WriteOutcome`]).
+    fn write(&self, local_path: &Path, remote_key: &str) -> Result<WriteOutcome>;
 
     /// Describe the operational guarantees of this destination backend.
     ///
@@ -224,8 +260,8 @@ mod tests {
     }
 
     impl Destination for MockDest {
-        fn write(&self, _local: &Path, _key: &str) -> Result<()> {
-            Ok(())
+        fn write(&self, _local: &Path, _key: &str) -> Result<WriteOutcome> {
+            Ok(WriteOutcome::opaque())
         }
         fn capabilities(&self) -> DestinationCapabilities {
             self.caps.clone()

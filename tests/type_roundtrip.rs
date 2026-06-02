@@ -26,6 +26,10 @@ mod duckdb_load;
 mod helpers;
 #[path = "type_roundtrip/mysql_csv_roundtrip.rs"]
 mod mysql_csv_roundtrip;
+#[path = "type_roundtrip/mysql_decimal_auto_resolve.rs"]
+mod mysql_decimal_auto_resolve;
+#[path = "type_roundtrip/mysql_edge_cases.rs"]
+mod mysql_edge_cases;
 #[path = "type_roundtrip/mysql_parquet_roundtrip.rs"]
 mod mysql_parquet_roundtrip;
 #[path = "type_roundtrip/mysql_uint64_decimal_override.rs"]
@@ -36,6 +40,8 @@ mod parquet_metadata;
 mod parquet_schema;
 #[path = "type_roundtrip/pg_edge_cases.rs"]
 mod pg_edge_cases;
+#[path = "type_roundtrip/pg_uuid_string_override.rs"]
+mod pg_uuid_string_override;
 #[path = "type_roundtrip/postgres_csv_roundtrip.rs"]
 mod postgres_csv_roundtrip;
 #[path = "type_roundtrip/postgres_parquet_roundtrip.rs"]
@@ -44,3 +50,5 @@ mod postgres_parquet_roundtrip;
 mod property;
 #[path = "type_roundtrip/pyarrow_load.rs"]
 mod pyarrow_load;
+#[path = "type_roundtrip/snowflake_load.rs"]
+mod snowflake_load;

@@ -137,7 +137,7 @@ fn check_destination_auth(dest: &crate::config::DestinationConfig) -> Result<()>
     let tmp = std::env::temp_dir().join(probe_key);
     std::fs::write(&tmp, b"ok")?;
     match d.write(&tmp, probe_key) {
-        Ok(()) => {
+        Ok(_) => {
             log::debug!("doctor: probe write succeeded, cleaning up");
         }
         Err(e) => {

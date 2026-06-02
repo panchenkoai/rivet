@@ -12,13 +12,13 @@ impl StdoutDestination {
 }
 
 impl super::Destination for StdoutDestination {
-    fn write(&self, local_path: &Path, _remote_key: &str) -> Result<()> {
+    fn write(&self, local_path: &Path, _remote_key: &str) -> Result<super::WriteOutcome> {
         let mut src = std::fs::File::open(local_path)?;
         let stdout = std::io::stdout();
         let mut handle = stdout.lock();
         std::io::copy(&mut src, &mut handle)?;
         handle.flush()?;
-        Ok(())
+        Ok(super::WriteOutcome::opaque())
     }
 
     fn capabilities(&self) -> super::DestinationCapabilities {

@@ -120,13 +120,26 @@ jobs:
       - name: Disk snapshot — post-build
         run: df -h /
 
-      - name: Run FULL live suite (skip 1M-row stress test)
+      - name: Run FULL live suite (skip 1M-row stress + the type-validator job's tests)
         # Everything #[ignore]d — light suite (also covered by per-PR e2e,
         # which is cheap insurance against docker-compose regressions like
         # an image tag breaking pgBouncer) plus content_export_under_update.
         # Skips the 1M-row "max_pressure" test that genuinely takes 3–5 min
         # even when seeded; leave that one for manual runs.
-        run: cargo test --release -- --ignored --skip full_content_export_max_pressure
+        #
+        # `validates` + `edge_cases` are skipped: they write under the shared
+        # tests/.live-tmp bind mount, which the docker daemon creates root:root
+        # on `compose up` (so the runner-owned workdir create_dir_all EACCESes),
+        # and the DuckDB/ClickHouse reader containers they need aren't even in
+        # the service set this job starts. (`edge_cases` covers BOTH the
+        # pg_edge_cases and mysql_edge_cases modules — the latter is duckdb-
+        # backed too.) They have a dedicated, correctly provisioned home in
+        # ci.yml's `test-type-validators` job (pre-create + chmod the mount,
+        # start the reader containers) that runs on every PR.
+        run: |
+          cargo test --release -- --ignored \
+            --skip full_content_export_max_pressure \
+            --skip validates --skip edge_cases
 
       - name: Dump service logs on failure
         if: failure()

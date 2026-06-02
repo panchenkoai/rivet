@@ -36,8 +36,10 @@ use serde::{Deserialize, Serialize};
 use crate::destination::Destination;
 use crate::error::Result;
 use crate::manifest::{
-    MANIFEST_FILENAME, RunManifest, SUCCESS_FILENAME, parse_success_marker, success_marker_body,
+    MANIFEST_FILENAME, RunManifest, SUCCESS_FILENAME, join_key, parse_success_marker,
+    success_marker_body,
 };
+use crate::pipeline::manifest_reconcile::{PartPresence, reconcile_manifest_against_listing};
 
 /// Outcome of a single `--validate` pass over a destination prefix.
 ///
@@ -55,6 +57,12 @@ pub struct ManifestVerification {
     /// Manifest parts whose presence and recorded `size_bytes` were
     /// confirmed at the destination.  0 when no manifest was found.
     pub parts_verified: usize,
+    /// Subset of `parts_verified` whose **content** was confirmed via an MD5
+    /// the store surfaced in its listing (no download) — the rest are size-only.
+    /// Lets `passed: true` say how much of the dataset was content-checked
+    /// rather than implying all of it was.  `#[serde(default)]` for back-compat.
+    #[serde(default)]
+    pub parts_md5_verified: usize,
     /// Manifest parts that were declared `committed` but not actually
     /// present, present at a different size, or otherwise mismatched.
     pub parts_failed: usize,
@@ -66,14 +74,15 @@ pub struct ManifestVerification {
     /// Self-consistency of the manifest (`row_count`, `part_count`,
     /// duplicate `part_id`s).  Skipped when `manifest_found = false`.
     pub manifest_self_consistent: bool,
-    /// Final verdict.  `true` only when every applicable sub-check passed.
-    /// Legacy-run prefixes do **not** produce `passed = true` from this
-    /// module — `pipeline::validate::validate_output` is the row-count
-    /// fallback for those, and the caller composes the two.
+    /// Final verdict, **derived** (not hand-maintained) — `manifest_found` and
+    /// no *fatal* failure ([`Failure::is_fatal`]).  Stored so it stays in the
+    /// `summary.json` contract, but computed in one place
+    /// ([`ManifestVerification::recompute_passed`]) so a new failure variant is
+    /// fatal by default rather than relying on every site to flip a bool.
     pub passed: bool,
-    /// Per-failure detail.  Empty when `passed = true` (modulo legacy_run,
-    /// which has its own bool).  Stable variant set; new variants land
-    /// under a new manifest version per ADR-0012.
+    /// Per-failure detail.  May be non-empty with `passed = true` for advisory
+    /// (non-fatal) failures like [`Failure::UntrackedObject`].  Stable variant
+    /// set; new variants land under a new manifest version per ADR-0012.
     pub failures: Vec<Failure>,
 }
 
@@ -88,6 +97,15 @@ pub enum Failure {
         path: String,
         expected: u64,
         actual: u64,
+    },
+    /// Part present at the recorded size but its content MD5 (from the store's
+    /// listing metadata) differs from the manifest's — transit / at-rest
+    /// corruption, caught with no download.
+    PartChecksumMismatch {
+        part_id: u32,
+        path: String,
+        expected: String,
+        actual: String,
     },
     /// `_SUCCESS` exists but its body is malformed (not `xxh3:<16-hex>` after
     /// trim).  ADR-0012 M2 — orchestrators rely on this format being strict.
@@ -117,6 +135,23 @@ pub enum Failure {
     /// references it.  M9-adjacent: `--validate` only flags it; quarantine
     /// belongs to `--resume`.
     UntrackedObject { key: String, size_bytes: u64 },
+    /// The export declared `verify: content` but some parts could only be
+    /// size-verified (no comparable content checksum from the store) — the
+    /// declared integrity contract was not met.
+    ContentVerificationUnmet { size_only: usize, total: usize },
+}
+
+impl Failure {
+    /// Whether this failure invalidates the dataset (flips `passed` to false).
+    ///
+    /// Every variant is fatal **except** [`Failure::UntrackedObject`]: surplus
+    /// objects are an audit signal whose cleanup is `--resume`'s job (ADR-0012
+    /// M9), not a corruption of the manifest-listed parts.  New variants are
+    /// fatal by default — opt out here explicitly, so a forgotten case fails
+    /// closed (safe) rather than silently passing.
+    pub fn is_fatal(&self) -> bool {
+        !matches!(self, Failure::UntrackedObject { .. })
+    }
 }
 
 impl std::fmt::Display for Failure {
@@ -141,6 +176,16 @@ impl std::fmt::Display for Failure {
             } => write!(
                 f,
                 "part {} size mismatch at {}: manifest {}, dest {}",
+                part_id, path, expected, actual
+            ),
+            Failure::PartChecksumMismatch {
+                part_id,
+                path,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "part {} content mismatch at {}: manifest md5 {}, dest {}",
                 part_id, path, expected, actual
             ),
             Failure::SuccessMarkerMalformed { body_preview } => {
@@ -169,28 +214,71 @@ impl std::fmt::Display for Failure {
             Failure::UntrackedObject { key, size_bytes } => {
                 write!(f, "untracked object: {} ({} bytes)", key, size_bytes)
             }
+            Failure::ContentVerificationUnmet { size_only, total } => write!(
+                f,
+                "verify: content not met — {size_only} of {total} part(s) only \
+                 size-verified (no store checksum); lower max_file_size so parts \
+                 upload as a single PUT, or the backend exposes no checksum"
+            ),
         }
     }
 }
 
 impl ManifestVerification {
+    /// Base verdict: nothing checked yet (no manifest, all counts zero, all
+    /// sub-checks false, `passed = false`).  Every constructor builds on this
+    /// and overrides only what differs, so a new field lands in **one** place
+    /// rather than several near-identical literals.
+    fn empty() -> Self {
+        Self {
+            manifest_found: false,
+            legacy_run: false,
+            parts_verified: 0,
+            parts_md5_verified: 0,
+            parts_failed: 0,
+            success_marker_consistent: false,
+            manifest_self_consistent: false,
+            passed: false,
+            failures: Vec::new(),
+        }
+    }
+
+    /// Recompute `passed` from the verdict's facts: a manifest was found and no
+    /// **fatal** failure was recorded (advisory failures like `UntrackedObject`
+    /// don't count).  The single source of truth — callers set failures and
+    /// call this once, rather than flipping `passed` by hand at every site.
+    fn recompute_passed(&mut self) {
+        self.passed = self.manifest_found && !self.failures.iter().any(Failure::is_fatal);
+    }
+
+    /// Apply the export's `verify` policy (ADR-0013 / review D).  When content
+    /// verification is required but some parts were only size-verified, record
+    /// a fatal [`Failure::ContentVerificationUnmet`] and re-derive `passed`.
+    /// Policy lives here (one place); the composers — run finalize and the
+    /// `rivet validate` command — just call it with their export's intent.
+    pub fn enforce_content_policy(&mut self, require_content: bool) {
+        if require_content && self.manifest_found {
+            let size_only = self.parts_verified.saturating_sub(self.parts_md5_verified);
+            if size_only > 0 {
+                self.failures.push(Failure::ContentVerificationUnmet {
+                    size_only,
+                    total: self.parts_verified,
+                });
+                self.recompute_passed();
+            }
+        }
+    }
+
     /// Construct the M6 (legacy run) verdict for a destination that has no
     /// manifest at all.  Caller composes this with the existing per-file
     /// row-count check; together they form the legacy `--validate` result.
     pub fn legacy() -> Self {
+        // `passed = false` is intentional — not "validation failed" but "this
+        // verifier cannot certify"; the caller layers per-file row counts on
+        // top and composes the final verdict.
         Self {
-            manifest_found: false,
             legacy_run: true,
-            parts_verified: 0,
-            parts_failed: 0,
-            success_marker_consistent: false,
-            manifest_self_consistent: false,
-            // `passed = false` here is intentional — it does NOT mean
-            // "validation failed", it means "this verifier cannot certify".
-            // The caller layers per-file row counts on top and composes
-            // a final verdict for the report.
-            passed: false,
-            failures: Vec::new(),
+            ..Self::empty()
         }
     }
 
@@ -265,34 +353,26 @@ pub fn verify_at_destination(
             // explicit on the wire.
             return Ok(ManifestVerification {
                 manifest_found: true,
-                legacy_run: false,
-                parts_verified: 0,
-                parts_failed: 0,
-                success_marker_consistent: false,
-                manifest_self_consistent: false,
-                passed: false,
                 failures: vec![Failure::ManifestSelfInconsistent {
                     detail: format!("manifest.json parse failed: {e}"),
                 }],
+                ..ManifestVerification::empty()
             });
         }
     };
 
+    // Optimistic base: a found, self-consistent manifest that passes until a
+    // check below flips it.  Overrides only what differs from `empty()`.
     let mut out = ManifestVerification {
         manifest_found: true,
-        legacy_run: false,
-        parts_verified: 0,
-        parts_failed: 0,
-        success_marker_consistent: false,
         manifest_self_consistent: true,
         passed: true,
-        failures: Vec::new(),
+        ..ManifestVerification::empty()
     };
 
     // ── 2. Self-consistency ─────────────────────────────────────────────
     if let Err(e) = manifest.validate_self_consistency() {
         out.manifest_self_consistent = false;
-        out.passed = false;
         out.failures.push(Failure::ManifestSelfInconsistent {
             detail: format!("{e}"),
         });
@@ -301,41 +381,68 @@ pub fn verify_at_destination(
         // once rather than fix-then-rerun.
     }
 
-    // ── 3. Per-part presence + size ────────────────────────────────────
-    for part in &manifest.parts {
-        if part.status != crate::manifest::PartStatus::Committed {
-            continue; // quarantined / other audit-only entries are M9, not M5
+    // ── 3. Reconcile parts + surplus against ONE prefix listing ────────
+    //
+    // Presence and untracked-surplus both fall out of a single
+    // `reconcile_manifest_against_listing` over one `list_prefix` — the same
+    // pure walk chunked resume uses (`build_resume_plan`).  This replaces the
+    // old per-part `HEAD` loop (N round-trips) and its separate untracked
+    // listing.  Per-part failures are emitted here (step 3); untracked is
+    // emitted at step 5 so the failure ordering an operator reads is stable.
+    //
+    // Trade-off: presence now rides the listing, not per-part `HEAD`.  If the
+    // listing cannot be read, an audit cannot certify the parts — so a list
+    // failure flips `passed = false` (a `ListPrefixError`), rather than the
+    // old behaviour where per-part HEAD still "verified" parts a failed
+    // listing couldn't enumerate.  Every Rivet destination backend offers
+    // strong read-after-write list consistency, so the happy path is one call.
+    let reconciliation = match dest.list_prefix(manifest_dir) {
+        Ok(listing) => Some(reconcile_manifest_against_listing(
+            &manifest,
+            &listing,
+            manifest_dir,
+        )),
+        Err(e) => {
+            out.failures.push(Failure::ListPrefixError {
+                detail: format!("{e:#}"),
+            });
+            None
         }
-        let part_key = join_key(manifest_dir, &part.path);
-        match dest.head(&part_key) {
-            Ok(Some(meta)) if meta.size_bytes == part.size_bytes => {
-                out.parts_verified += 1;
-            }
-            Ok(Some(meta)) => {
-                out.parts_failed += 1;
-                out.passed = false;
-                out.failures.push(Failure::PartSizeMismatch {
-                    part_id: part.part_id,
-                    path: part.path.clone(),
-                    expected: part.size_bytes,
-                    actual: meta.size_bytes,
-                });
-            }
-            Ok(None) => {
-                out.parts_failed += 1;
-                out.passed = false;
-                out.failures.push(Failure::PartMissing {
-                    part_id: part.part_id,
-                    path: part.path.clone(),
-                });
-            }
-            Err(e) => {
-                out.parts_failed += 1;
-                out.passed = false;
-                out.failures.push(Failure::PartMissing {
-                    part_id: part.part_id,
-                    path: format!("{} (head failed: {e})", part.path),
-                });
+    };
+    if let Some(rec) = &reconciliation {
+        for check in &rec.per_part {
+            match &check.presence {
+                PartPresence::Present { md5_verified } => {
+                    out.parts_verified += 1;
+                    if *md5_verified {
+                        out.parts_md5_verified += 1;
+                    }
+                }
+                PartPresence::SizeMismatch { expected, actual } => {
+                    out.parts_failed += 1;
+                    out.failures.push(Failure::PartSizeMismatch {
+                        part_id: check.part_id,
+                        path: check.path.clone(),
+                        expected: *expected,
+                        actual: *actual,
+                    });
+                }
+                PartPresence::Missing => {
+                    out.parts_failed += 1;
+                    out.failures.push(Failure::PartMissing {
+                        part_id: check.part_id,
+                        path: check.path.clone(),
+                    });
+                }
+                PartPresence::ChecksumMismatch { expected, actual } => {
+                    out.parts_failed += 1;
+                    out.failures.push(Failure::PartChecksumMismatch {
+                        part_id: check.part_id,
+                        path: check.path.clone(),
+                        expected: expected.clone(),
+                        actual: actual.clone(),
+                    });
+                }
             }
         }
     }
@@ -349,10 +456,10 @@ pub fn verify_at_destination(
     let success_head = match dest.head(&success_key) {
         Ok(h) => h,
         Err(e) => {
-            out.passed = false;
             out.failures.push(Failure::SuccessMarkerReadError {
                 detail: format!("_SUCCESS head failed: {e:#}"),
             });
+            out.recompute_passed();
             return Ok(out);
         }
     };
@@ -366,7 +473,6 @@ pub fn verify_at_destination(
         }
         Some(_) => match dest.read(&success_key) {
             Err(e) => {
-                out.passed = false;
                 out.failures.push(Failure::SuccessMarkerReadError {
                     detail: format!("{e:#}"),
                 });
@@ -375,16 +481,15 @@ pub fn verify_at_destination(
                 let body_str = match std::str::from_utf8(&body) {
                     Ok(s) => s,
                     Err(_) => {
-                        out.passed = false;
                         out.failures.push(Failure::SuccessMarkerMalformed {
                             body_preview: format!("(non-utf8, {} bytes)", body.len()),
                         });
+                        out.recompute_passed();
                         return Ok(out);
                     }
                 };
                 match parse_success_marker(body_str) {
                     None => {
-                        out.passed = false;
                         out.failures.push(Failure::SuccessMarkerMalformed {
                             body_preview: preview(body_str),
                         });
@@ -398,7 +503,6 @@ pub fn verify_at_destination(
                         if marker_fp == manifest_fp_trimmed {
                             out.success_marker_consistent = true;
                         } else {
-                            out.passed = false;
                             out.failures.push(Failure::SuccessMarkerStale {
                                 marker_fingerprint: marker_fp.to_string(),
                                 manifest_fingerprint: manifest_fp_trimmed.to_string(),
@@ -410,73 +514,23 @@ pub fn verify_at_destination(
         },
     }
 
-    // ── 5. Untracked objects under prefix ──────────────────────────────
+    // ── 5. Untracked surplus ───────────────────────────────────────────
     //
-    // Best-effort: list the prefix and surface anything that isn't the
-    // manifest, the success marker, or a manifest-listed part.  A list
-    // failure is logged as a Failure::ListPrefixError but does not
-    // invalidate the rest of the run — `passed` already reflects part
-    // and marker outcomes.
-    match dest.list_prefix(manifest_dir) {
-        Err(e) => {
-            out.failures.push(Failure::ListPrefixError {
-                detail: format!("{e:#}"),
+    // Already computed by the step-3 reconciliation (sidecars, quarantine,
+    // and the doctor probe are filtered there).  Emit it last so the failure
+    // ordering stays parts → marker → untracked.  A list failure left
+    // `reconciliation = None` and already flipped `passed` above.
+    if let Some(rec) = reconciliation {
+        for obj in rec.untracked {
+            out.failures.push(Failure::UntrackedObject {
+                key: obj.key,
+                size_bytes: obj.size_bytes,
             });
-            // We don't flip `passed` — the parts we DID verify are still
-            // verified; we just couldn't enumerate the surplus.
-        }
-        Ok(listing) => {
-            let known: std::collections::HashSet<String> = std::iter::once(manifest_key.clone())
-                .chain(std::iter::once(success_key.clone()))
-                .chain(
-                    manifest
-                        .parts
-                        .iter()
-                        .filter(|p| p.status == crate::manifest::PartStatus::Committed)
-                        .map(|p| join_key(manifest_dir, &p.path)),
-                )
-                .collect();
-            for obj in listing {
-                if known.contains(&obj.key) {
-                    continue;
-                }
-                // Skip the quarantine prefix — it's the right place for
-                // legitimate untracked artifacts (resume's M9 destination).
-                if obj.key.contains(crate::manifest::QUARANTINE_PREFIX) {
-                    continue;
-                }
-                // Skip `rivet doctor`'s writability probe — a Rivet-internal
-                // sidecar, not foreign data.  A `doctor` → `run --validate`
-                // sequence against the same prefix would otherwise flag it.
-                if obj
-                    .key
-                    .rsplit('/')
-                    .next()
-                    .is_some_and(|name| name == crate::manifest::DOCTOR_PROBE_FILENAME)
-                {
-                    continue;
-                }
-                out.failures.push(Failure::UntrackedObject {
-                    key: obj.key,
-                    size_bytes: obj.size_bytes,
-                });
-            }
         }
     }
 
+    out.recompute_passed();
     Ok(out)
-}
-
-/// Join a destination-relative dir prefix with a child key, normalising the
-/// separator.  Empty `dir` is the root (no leading `/`); a trailing `/` on
-/// `dir` is collapsed.
-fn join_key(dir: &str, key: &str) -> String {
-    let dir = dir.trim_end_matches('/');
-    if dir.is_empty() {
-        key.to_string()
-    } else {
-        format!("{}/{}", dir, key)
-    }
 }
 
 /// Truncate `s` to a small printable preview for error messages.
@@ -516,6 +570,7 @@ mod tests {
             rows,
             size_bytes: size,
             content_fingerprint: fp.into(),
+            content_md5: String::new(),
             status: PartStatus::Committed,
         }
     }
@@ -895,5 +950,128 @@ mod tests {
         // Trailing slash is normalised — same outcome.
         let v2 = verify_at_destination(&dest, "sub/run/").unwrap();
         assert!(v2.passed);
+    }
+
+    // ── list-failure semantics (presence now rides the listing) ──────────
+
+    /// Wraps a real `LocalDestination` but fails every `list_prefix`. Used to
+    /// pin the post-refactor contract: presence is derived from the listing,
+    /// so a listing we cannot read means the audit cannot certify the parts.
+    struct ListFails(LocalDestination);
+    impl crate::destination::Destination for ListFails {
+        fn write(&self, p: &Path, k: &str) -> Result<crate::destination::WriteOutcome> {
+            self.0.write(p, k)
+        }
+        fn capabilities(&self) -> crate::destination::DestinationCapabilities {
+            self.0.capabilities()
+        }
+        fn head(&self, k: &str) -> Result<Option<crate::destination::ObjectMeta>> {
+            self.0.head(k)
+        }
+        fn read(&self, k: &str) -> Result<Vec<u8>> {
+            self.0.read(k)
+        }
+        fn list_prefix(&self, _: &str) -> Result<Vec<crate::destination::ObjectMeta>> {
+            anyhow::bail!("listing unavailable")
+        }
+    }
+
+    #[test]
+    fn list_failure_cannot_certify_parts_and_fails_the_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = build_manifest(vec![part(0, 3, 3, "xxh3:0")], ManifestStatus::Success);
+        write_dataset(dir.path(), &m, &[("part-000000.parquet", b"abc")]);
+        let dest = ListFails(local_dest(dir.path()));
+
+        let v = verify_at_destination(&dest, "").unwrap();
+        // The manifest itself reads + parses fine (HEAD/read still work)…
+        assert!(v.manifest_found);
+        assert!(v.manifest_self_consistent);
+        // …but with no listing we verify zero parts and refuse to pass.
+        assert!(
+            !v.passed,
+            "an audit that cannot list the prefix must not pass"
+        );
+        assert_eq!(v.parts_verified, 0);
+        assert!(
+            v.failures
+                .iter()
+                .any(|f| matches!(f, Failure::ListPrefixError { .. })),
+            "expected a ListPrefixError, got: {:?}",
+            v.failures
+        );
+    }
+
+    #[test]
+    fn passed_is_derived_advisory_failures_do_not_fail() {
+        // An advisory failure (untracked surplus) keeps the verdict passing…
+        let mut v = ManifestVerification {
+            manifest_found: true,
+            ..ManifestVerification::empty()
+        };
+        v.failures.push(Failure::UntrackedObject {
+            key: "stray.parquet".into(),
+            size_bytes: 9,
+        });
+        v.recompute_passed();
+        assert!(v.passed, "untracked surplus is advisory, not fatal");
+
+        // …while any fatal failure flips it.
+        v.failures.push(Failure::PartMissing {
+            part_id: 1,
+            path: "part-000001.parquet".into(),
+        });
+        v.recompute_passed();
+        assert!(!v.passed, "a missing part is fatal");
+
+        // No manifest → never passes regardless of failures.
+        let mut legacy = ManifestVerification::empty();
+        legacy.recompute_passed();
+        assert!(!legacy.passed, "no manifest found → cannot certify");
+    }
+
+    #[test]
+    fn verify_content_policy_fails_only_size_only_parts() {
+        // 3 parts, 2 content-checked, 1 size-only.
+        let base = ManifestVerification {
+            manifest_found: true,
+            parts_verified: 3,
+            parts_md5_verified: 2,
+            ..ManifestVerification::empty()
+        };
+        // verify: size → size-only is acceptable, passes.
+        let mut sz = base.clone();
+        sz.recompute_passed();
+        sz.enforce_content_policy(false);
+        assert!(sz.passed, "size-only OK under verify: size");
+
+        // verify: content → the 1 size-only part is a fatal failure.
+        let mut ct = base.clone();
+        ct.recompute_passed();
+        ct.enforce_content_policy(true);
+        assert!(!ct.passed, "a size-only part fails verify: content");
+        assert!(
+            ct.failures.iter().any(|f| matches!(
+                f,
+                Failure::ContentVerificationUnmet {
+                    size_only: 1,
+                    total: 3
+                }
+            )),
+            "expected ContentVerificationUnmet, got: {:?}",
+            ct.failures
+        );
+
+        // verify: content with every part md5-checked → satisfied.
+        let mut all = ManifestVerification {
+            parts_md5_verified: 3,
+            ..base
+        };
+        all.recompute_passed();
+        all.enforce_content_policy(true);
+        assert!(
+            all.passed && all.failures.is_empty(),
+            "all md5 meets verify: content"
+        );
     }
 }
