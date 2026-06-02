@@ -300,11 +300,11 @@ jobs:
         # by the `nightly-live` workflow instead.
         #
         # Skip the type round-trip oracle tests (`validates` = duckdb/clickhouse/
-        # pyarrow readers; `pg_edge` = duckdb-backed edge cases). They need the
-        # DuckDB/ClickHouse containers this job does not start and run in the
-        # dedicated `test-type-validators` job instead. Both substrings are
-        # unique to the `type_roundtrip` binary.
-        run: cargo test --release -- --ignored --skip content_export --skip validates --skip pg_edge
+        # pyarrow readers; `edge_cases` = the duckdb-backed pg_edge_cases AND
+        # mysql_edge_cases modules). They need the DuckDB/ClickHouse containers
+        # this job does not start and run in the dedicated `test-type-validators`
+        # job instead. Both substrings are unique to the `type_roundtrip` binary.
+        run: cargo test --release -- --ignored --skip content_export --skip validates --skip edge_cases
 
       - name: Stop services
         if: always()
