@@ -116,9 +116,11 @@ exports:
 /// actually shed workers. A background thread hammers the *very rows being
 /// exported* with UPDATEs (real WAL + dirty pages + dead tuples) and a periodic
 /// CHECKPOINT — the CHECKPOINT is what moves `pg_stat_bgwriter.checkpoints_req`
-/// (the PG pressure proxy) faster than the 80 ms sampler, so pressure reads as
-/// monotonically rising and the governor steps parallelism down toward
-/// `min_parallel`. We UPDATE rather than INSERT so the exported id range
+/// (the PG pressure proxy). The governor samples slower than the checkpoint
+/// cadence, so pressure reads as monotonically rising sample-over-sample and
+/// the governor steps parallelism down toward `min_parallel`. We pre-warm the
+/// writer before launching the run so even the first sample-pair is rising. We
+/// UPDATE rather than INSERT so the exported id range
 /// `[1, ROWS]` (and thus the round-trip row count) stays deterministic.
 ///
 /// Spawned under a 120 s watchdog so a regression (e.g. the governor deadlock)
@@ -128,10 +130,10 @@ exports:
 fn governor_backs_off_under_concurrent_write_pressure() {
     require_alive(LiveService::Postgres);
 
-    // Wide payload + small batches + a throttle make each chunk's write
-    // non-trivial, so the run lasts long enough for the 80 ms governor to
-    // sample repeatedly while the writer drives pressure up — and the governor
-    // backing off to `min_parallel` lengthens it further.
+    // Wide payload + small batches + a deliberately large per-batch throttle
+    // make the run last a hardware-independent ~2 s+ (the throttle is a fixed
+    // sleep, so a fast disk/CPU can't shorten it below the governor's reaction
+    // window), giving the sampler many ticks under rising pressure.
     const ROWS: i64 = 20_000;
     let table = seed_pg_wide_table(ROWS, 1024);
     let out_dir = tempfile::tempdir().unwrap();
@@ -145,7 +147,7 @@ source:
     adaptive: true
     min_parallel: 2
     batch_size: 250
-    throttle_ms: 30
+    throttle_ms: 100
 exports:
   - name: {name}
     query: "SELECT id, payload FROM {name}"
@@ -164,12 +166,17 @@ exports:
     let cfg = write_config(&cfg_dir, &yaml);
 
     // Background writer: concurrent UPDATEs on the rows being exported plus a
-    // CHECKPOINT every ~70 ms (faster than the governor's 80 ms sample). The
-    // UPDATEs are real write contention; the CHECKPOINT is the deterministic
-    // signal mover. Organic INSERT load alone only bumps `checkpoints_req` once
-    // WAL exceeds `max_wal_size` (1 GB) — impractical here, and mutating that
-    // shared server setting is off-limits — so an explicit CHECKPOINT stands in
-    // for a checkpoint-heavy workload.
+    // CHECKPOINT every ~70 ms. The governor samples every 200 ms (set below),
+    // comfortably *slower* than the checkpoint cadence, so every sample gap
+    // captures at least one new checkpoint and `checkpoints_req` reads as
+    // strictly rising pair-over-pair — the condition `GovernorState::observe`
+    // needs to shed a worker. (At the old 80 ms ≈ 70 ms the two cadences raced,
+    // so adjacent samples were often flat and the back-off was a coin flip on
+    // fast hardware.) The UPDATEs are real write contention; the CHECKPOINT is
+    // the deterministic signal mover. Organic INSERT load alone only bumps
+    // `checkpoints_req` once WAL exceeds `max_wal_size` (1 GB) — impractical
+    // here, and mutating that shared server setting is off-limits — so an
+    // explicit CHECKPOINT stands in for a checkpoint-heavy workload.
     let stop = Arc::new(AtomicBool::new(false));
     let table_name = table.name().to_string();
     let writer = {
@@ -191,6 +198,12 @@ exports:
         })
     };
 
+    // Pre-warm the pressure signal: let the writer connect and drive
+    // `checkpoints_req` up before rivet launches, so the governor's first
+    // sample-pair already sees rising pressure — no startup race where the
+    // early samples land before the writer's first checkpoint completes.
+    std::thread::sleep(Duration::from_millis(400));
+
     // Watchdog: redirect stderr to a file so we can both assert on it and avoid
     // a piped-buffer deadlock while polling for exit.
     let log_path = cfg_dir.path().join("rivet.stderr");
@@ -204,7 +217,7 @@ exports:
             table.name(),
         ])
         .env("RUST_LOG", "info")
-        .env("RIVET_GOVERNOR_INTERVAL_MS", "80")
+        .env("RIVET_GOVERNOR_INTERVAL_MS", "200")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::from(log_file))
         .spawn()
