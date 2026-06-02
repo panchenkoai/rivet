@@ -265,7 +265,9 @@ fn write_csv_value(writer: &mut dyn Write, array: &dyn Array, idx: usize) -> Res
             // Defensive: `create_writer` rejects unsupported types up front, so
             // this should be unreachable. Bail rather than silently skip if a
             // new type slips through.
-            anyhow::bail!("CSV: no serializer for Arrow type {other:?} (column should have been rejected at writer creation)");
+            anyhow::bail!(
+                "CSV: no serializer for Arrow type {other:?} (column should have been rejected at writer creation)"
+            );
         }
     }
 

@@ -406,7 +406,10 @@ mod bigquery {
     fn list(inner: &RivetType) -> Resolved {
         let inner_r = native(inner);
         if inner_r.status == TargetStatus::Fail {
-            return Resolved::fail(format!("REPEATED of unsupported element: {}", inner_r.target_type));
+            return Resolved::fail(format!(
+                "REPEATED of unsupported element: {}",
+                inner_r.target_type
+            ));
         }
         // Rivet writes the Parquet list element as `item` (arrow-rs default,
         // not the spec's `element`), so BigQuery loads arrays as
@@ -448,7 +451,9 @@ mod duckdb {
                 if *scale < 0 {
                     Resolved::warn(
                         "DECIMAL",
-                        format!("DuckDB has no negative scale; decimal({precision},{scale}) loads via cast"),
+                        format!(
+                            "DuckDB has no negative scale; decimal({precision},{scale}) loads via cast"
+                        ),
                     )
                 } else if *precision <= 38 {
                     Resolved::ok(format!("DECIMAL({precision},{scale})"))
@@ -474,7 +479,10 @@ mod duckdb {
             RivetType::List { inner } => {
                 let inner_r = native(inner);
                 if inner_r.status == TargetStatus::Fail {
-                    Resolved::fail(format!("LIST of unsupported element: {}", inner_r.target_type))
+                    Resolved::fail(format!(
+                        "LIST of unsupported element: {}",
+                        inner_r.target_type
+                    ))
                 } else {
                     Resolved::ok(format!("{}[]", inner_r.target_type))
                 }
@@ -575,7 +583,10 @@ mod snowflake {
             RivetType::List { inner } => {
                 let inner_r = native(inner);
                 if inner_r.status == TargetStatus::Fail {
-                    Resolved::fail(format!("ARRAY of unsupported element: {}", inner_r.target_type))
+                    Resolved::fail(format!(
+                        "ARRAY of unsupported element: {}",
+                        inner_r.target_type
+                    ))
                 } else {
                     Resolved::diverge(
                         "ARRAY",
@@ -662,21 +673,30 @@ mod tests {
 
     #[test]
     fn bq_decimal_within_numeric_is_numeric() {
-        let s = bq(&RivetType::Decimal { precision: 18, scale: 2 });
+        let s = bq(&RivetType::Decimal {
+            precision: 18,
+            scale: 2,
+        });
         assert_eq!(s.target_type, "NUMERIC");
         assert_eq!(s.status, TargetStatus::Ok);
     }
 
     #[test]
     fn bq_decimal_escalates_to_bignumeric() {
-        let s = bq(&RivetType::Decimal { precision: 38, scale: 9 });
+        let s = bq(&RivetType::Decimal {
+            precision: 38,
+            scale: 9,
+        });
         assert_eq!(s.target_type, "BIGNUMERIC");
         assert_eq!(s.status, TargetStatus::Ok);
     }
 
     #[test]
     fn bq_decimal_negative_scale_fails() {
-        let s = bq(&RivetType::Decimal { precision: 5, scale: -2 });
+        let s = bq(&RivetType::Decimal {
+            precision: 5,
+            scale: -2,
+        });
         assert_eq!(s.status, TargetStatus::Fail);
     }
 
@@ -690,7 +710,9 @@ mod tests {
 
     #[test]
     fn bq_list_is_repeated_native_record_autoload() {
-        let t = RivetType::List { inner: Box::new(RivetType::String) };
+        let t = RivetType::List {
+            inner: Box::new(RivetType::String),
+        };
         let s = bq(&t);
         assert_eq!(s.target_type, "REPEATED STRING");
         assert!(s.autoload_type.contains("REPEATED RECORD"));
@@ -739,7 +761,9 @@ mod tests {
             RivetType::Uuid,
             RivetType::UInt64,
             naive,
-            RivetType::List { inner: Box::new(RivetType::Int64) },
+            RivetType::List {
+                inner: Box::new(RivetType::Int64),
+            },
         ] {
             let s = duck(&rt);
             assert_eq!(
@@ -756,11 +780,18 @@ mod tests {
         assert_eq!(duck(&RivetType::Uuid).target_type, "UUID");
         assert_eq!(duck(&RivetType::UInt64).target_type, "UBIGINT");
         assert_eq!(
-            duck(&RivetType::Decimal { precision: 18, scale: 2 }).target_type,
+            duck(&RivetType::Decimal {
+                precision: 18,
+                scale: 2
+            })
+            .target_type,
             "DECIMAL(18,2)"
         );
         assert_eq!(
-            duck(&RivetType::List { inner: Box::new(RivetType::Int64) }).target_type,
+            duck(&RivetType::List {
+                inner: Box::new(RivetType::Int64)
+            })
+            .target_type,
             "BIGINT[]"
         );
     }
@@ -768,7 +799,10 @@ mod tests {
     #[test]
     fn parse_accepts_aliases() {
         assert_eq!(ExportTarget::parse("bq"), Some(ExportTarget::BigQuery));
-        assert_eq!(ExportTarget::parse("BigQuery"), Some(ExportTarget::BigQuery));
+        assert_eq!(
+            ExportTarget::parse("BigQuery"),
+            Some(ExportTarget::BigQuery)
+        );
         assert_eq!(ExportTarget::parse("duckdb"), Some(ExportTarget::DuckDb));
         assert_eq!(ExportTarget::parse("nope"), None);
     }
@@ -815,7 +849,12 @@ mod tests {
     fn cast_sql_present_only_when_lossless_post_load() {
         // JSON/UUID/naive-timestamp autoload to a degraded type but still hold
         // the value losslessly, so a post-load cast genuinely recovers it.
-        assert!(bq(&RivetType::Json).cast_sql.unwrap().contains("PARSE_JSON"));
+        assert!(
+            bq(&RivetType::Json)
+                .cast_sql
+                .unwrap()
+                .contains("PARSE_JSON")
+        );
         assert!(bq(&RivetType::Uuid).cast_sql.unwrap().contains("TO_HEX"));
         let naive = RivetType::Timestamp {
             unit: super::super::TimeUnit::Microsecond,
@@ -862,29 +901,48 @@ mod tests {
     fn bq_decimal_limit_boundaries() {
         // Exact BIGNUMERIC ceiling is ok.
         assert_eq!(
-            bq(&RivetType::Decimal { precision: 76, scale: 38 }).status,
+            bq(&RivetType::Decimal {
+                precision: 76,
+                scale: 38
+            })
+            .status,
             TargetStatus::Ok
         );
         // One past precision overflows BIGNUMERIC → Fail, never a silent clamp.
         assert_eq!(
-            bq(&RivetType::Decimal { precision: 77, scale: 38 }).status,
+            bq(&RivetType::Decimal {
+                precision: 77,
+                scale: 38
+            })
+            .status,
             TargetStatus::Fail
         );
         // One past scale → Fail.
         assert_eq!(
-            bq(&RivetType::Decimal { precision: 76, scale: 39 }).status,
+            bq(&RivetType::Decimal {
+                precision: 76,
+                scale: 39
+            })
+            .status,
             TargetStatus::Fail
         );
         // Between NUMERIC and BIGNUMERIC escalates rather than overflowing NUMERIC.
         assert_eq!(
-            bq(&RivetType::Decimal { precision: 30, scale: 0 }).target_type,
+            bq(&RivetType::Decimal {
+                precision: 30,
+                scale: 0
+            })
+            .target_type,
             "BIGNUMERIC"
         );
     }
 
     #[test]
     fn duckdb_decimal_over_38_warns_not_silently_clamps() {
-        let s = duck(&RivetType::Decimal { precision: 40, scale: 2 });
+        let s = duck(&RivetType::Decimal {
+            precision: 40,
+            scale: 2,
+        });
         assert_eq!(s.status, TargetStatus::Warn);
     }
 
@@ -899,7 +957,10 @@ mod tests {
         };
         let mappings = vec![
             TypeMapping::from_source(&SourceColumn::simple("id", "int8", true), RivetType::Int64),
-            TypeMapping::from_source(&SourceColumn::simple("attrs", "jsonb", true), RivetType::Json),
+            TypeMapping::from_source(
+                &SourceColumn::simple("attrs", "jsonb", true),
+                RivetType::Json,
+            ),
             TypeMapping::from_source(&SourceColumn::simple("uid", "uuid", true), RivetType::Uuid),
             TypeMapping::from_source(
                 &SourceColumn::simple("created_at", "timestamp", true),
@@ -953,12 +1014,23 @@ mod tests {
             timezone: None,
         };
         let cols: [(&str, RivetType); 6] = [
-            ("id", RivetType::Int64),                               // ok → passthrough
-            ("amount", RivetType::Decimal { precision: 18, scale: 2 }), // ok → passthrough
-            ("attrs", RivetType::Json),                            // divergent → cast
-            ("uid", RivetType::Uuid),                              // divergent → cast
-            ("created_at", naive),                                 // divergent → cast
-            ("tags", RivetType::List { inner: Box::new(RivetType::String) }), // divergent → cast
+            ("id", RivetType::Int64), // ok → passthrough
+            (
+                "amount",
+                RivetType::Decimal {
+                    precision: 18,
+                    scale: 2,
+                },
+            ), // ok → passthrough
+            ("attrs", RivetType::Json), // divergent → cast
+            ("uid", RivetType::Uuid), // divergent → cast
+            ("created_at", naive),    // divergent → cast
+            (
+                "tags",
+                RivetType::List {
+                    inner: Box::new(RivetType::String),
+                },
+            ), // divergent → cast
         ];
         let mappings: Vec<_> = cols
             .iter()
@@ -1023,7 +1095,10 @@ mod tests {
         assert_eq!(tm.target_type, "TIME");
         assert!(tm.cast_sql.unwrap().contains("TIME_FROM_PARTS"));
         // decimal is native NUMBER(p,s) — no cast.
-        let d = sf(&RivetType::Decimal { precision: 18, scale: 2 });
+        let d = sf(&RivetType::Decimal {
+            precision: 18,
+            scale: 2,
+        });
         assert_eq!(d.target_type, "NUMBER(18,2)");
         assert!(d.cast_sql.is_none());
         // list autoloads as VARIANT (verified live), recover native ARRAY with ::ARRAY.
@@ -1044,7 +1119,10 @@ mod tests {
         };
         let mappings = vec![
             TypeMapping::from_source(&SourceColumn::simple("id", "int8", true), RivetType::Int64),
-            TypeMapping::from_source(&SourceColumn::simple("attrs", "jsonb", true), RivetType::Json),
+            TypeMapping::from_source(
+                &SourceColumn::simple("attrs", "jsonb", true),
+                RivetType::Json,
+            ),
             TypeMapping::from_source(&SourceColumn::simple("uid", "uuid", true), RivetType::Uuid),
             TypeMapping::from_source(
                 &SourceColumn::simple("created_at", "timestamp", true),
@@ -1066,7 +1144,10 @@ mod tests {
 
     #[test]
     fn parse_accepts_snowflake() {
-        assert_eq!(ExportTarget::parse("snowflake"), Some(ExportTarget::Snowflake));
+        assert_eq!(
+            ExportTarget::parse("snowflake"),
+            Some(ExportTarget::Snowflake)
+        );
         assert_eq!(ExportTarget::parse("sf"), Some(ExportTarget::Snowflake));
     }
 }

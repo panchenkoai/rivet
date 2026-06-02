@@ -436,10 +436,16 @@ mod tests {
         std::fs::write(&p, data).unwrap();
         let (fp, md5) = compute_part_checksums(&p).unwrap();
         // The single-read path must equal hashing the bytes independently.
-        assert_eq!(fp, format!("xxh3:{:016x}", xxhash_rust::xxh3::xxh3_64(data)));
+        assert_eq!(
+            fp,
+            format!("xxh3:{:016x}", xxhash_rust::xxh3::xxh3_64(data))
+        );
         let mut h = Md5::new();
         h.update(data);
-        assert_eq!(md5, base64::engine::general_purpose::STANDARD.encode(h.finalize()));
+        assert_eq!(
+            md5,
+            base64::engine::general_purpose::STANDARD.encode(h.finalize())
+        );
     }
 
     #[test]

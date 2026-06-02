@@ -102,6 +102,21 @@ pub(super) fn mysql_native_type_name(col: &mysql::Column) -> String {
     }
 }
 
+/// Derive DECIMAL `(precision, scale)` from a MySQL wire column definition.
+/// `column_length` is the display width = precision + 1 (decimal point, when
+/// `scale > 0`) + 1 (sign, when `signed`). Returns `None` when the arithmetic
+/// can't yield a precision in MySQL's `1..=65` DECIMAL range, so the caller
+/// keeps the column `Unsupported` rather than guess.
+fn derive_decimal_ps(column_length: u32, scale: u8, signed: bool) -> Option<(u8, i8)> {
+    let point = u32::from(scale > 0);
+    let sign = u32::from(signed);
+    let precision = column_length.checked_sub(point + sign)?;
+    if !(1..=65).contains(&precision) {
+        return None;
+    }
+    Some((u8::try_from(precision).ok()?, i8::try_from(scale).ok()?))
+}
+
 /// Map a MySQL column descriptor to Rivet's canonical type.
 ///
 /// Key decisions vs. the old `mysql_type_to_arrow`:
@@ -121,21 +136,6 @@ pub(super) fn mysql_native_type_name(col: &mysql::Column) -> String {
 /// - `TINYINT(1)` / `BOOL` / `BOOLEAN` → `RivetType::Bool` (display-width 1 = MySQL boolean convention).
 /// - `TINYINT` (other widths) → `RivetType::Int16`.
 /// - `BIT(1)` → `RivetType::Bool`; `BIT(n>1)` → `RivetType::Int64` (avoids silent bit-truncation).
-/// Derive DECIMAL `(precision, scale)` from a MySQL wire column definition.
-/// `column_length` is the display width = precision + 1 (decimal point, when
-/// `scale > 0`) + 1 (sign, when `signed`). Returns `None` when the arithmetic
-/// can't yield a precision in MySQL's `1..=65` DECIMAL range, so the caller
-/// keeps the column `Unsupported` rather than guess.
-fn derive_decimal_ps(column_length: u32, scale: u8, signed: bool) -> Option<(u8, i8)> {
-    let point = u32::from(scale > 0);
-    let sign = u32::from(signed);
-    let precision = column_length.checked_sub(point + sign)?;
-    if !(1..=65).contains(&precision) {
-        return None;
-    }
-    Some((u8::try_from(precision).ok()?, i8::try_from(scale).ok()?))
-}
-
 pub(super) fn mysql_type_to_rivet(col: &mysql::Column) -> RivetType {
     use mysql::consts::ColumnType::*;
     match col.column_type() {

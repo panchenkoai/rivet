@@ -75,14 +75,28 @@ mod tests {
     #[test]
     fn resolve_or_prefers_override_then_autodetect() {
         let mut ov = ColumnOverrides::new();
-        ov.insert("amount".into(), RivetType::Decimal { precision: 18, scale: 2 });
+        ov.insert(
+            "amount".into(),
+            RivetType::Decimal {
+                precision: 18,
+                scale: 2,
+            },
+        );
         // Override wins, autodetect not even called.
         assert_eq!(
-            resolve_or(&ov, "amount", || panic!("autodetect must not run when overridden")),
-            RivetType::Decimal { precision: 18, scale: 2 }
+            resolve_or(&ov, "amount", || panic!(
+                "autodetect must not run when overridden"
+            )),
+            RivetType::Decimal {
+                precision: 18,
+                scale: 2
+            }
         );
         // No override → autodetect.
-        assert_eq!(resolve_or(&ov, "other", || RivetType::Int64), RivetType::Int64);
+        assert_eq!(
+            resolve_or(&ov, "other", || RivetType::Int64),
+            RivetType::Int64
+        );
     }
     use crate::types::mapping::{META_FIDELITY, META_LOGICAL_TYPE, META_NATIVE_TYPE};
     use arrow::datatypes::DataType;

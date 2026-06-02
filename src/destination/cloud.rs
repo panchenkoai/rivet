@@ -293,7 +293,7 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
 
 #[cfg(test)]
 mod tests {
-    use super::{take_from, AtomicI64, Ordering};
+    use super::{AtomicI64, Ordering, take_from};
 
     #[test]
     fn oneshot_budget_reserves_until_exhausted_then_streams() {
@@ -303,7 +303,11 @@ mod tests {
         assert!(take_from(&budget, 30), "second fits (10 left)");
         assert!(!take_from(&budget, 30), "third overdraws → stream");
         // The failed reservation must NOT have consumed budget.
-        assert_eq!(budget.load(Ordering::Relaxed), 10, "budget intact after overdraw");
+        assert_eq!(
+            budget.load(Ordering::Relaxed),
+            10,
+            "budget intact after overdraw"
+        );
         // Releasing the 60-byte reservation frees it for the next part.
         budget.fetch_add(60, Ordering::Relaxed);
         assert!(take_from(&budget, 30), "fits again after release");
@@ -312,7 +316,10 @@ mod tests {
     #[test]
     fn part_larger_than_whole_budget_never_reserves() {
         let budget = AtomicI64::new(64);
-        assert!(!take_from(&budget, 1_000), "part bigger than budget streams");
+        assert!(
+            !take_from(&budget, 1_000),
+            "part bigger than budget streams"
+        );
         assert_eq!(budget.load(Ordering::Relaxed), 64, "budget untouched");
     }
 }

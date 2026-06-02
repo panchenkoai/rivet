@@ -66,7 +66,11 @@ impl SfConfig {
     /// JSON output. Callers append `-q <sql>` (or `-f <file>`).
     fn snow(&self) -> Command {
         let mut c = Command::new("snow");
-        c.arg("sql").arg("-c").arg(&self.connection).arg("--format").arg("json");
+        c.arg("sql")
+            .arg("-c")
+            .arg(&self.connection)
+            .arg("--format")
+            .arg("json");
         if let Some(pk) = &self.private_key {
             c.arg("--private-key-file").arg(pk);
         }
@@ -108,9 +112,7 @@ impl SfConfig {
     /// PUT a local Parquet file onto an internal stage (no compression — the
     /// file is already zstd Parquet; `OVERWRITE` so reruns are idempotent).
     fn put(&self, parquet: &Path, stage: &str) {
-        let abs = parquet
-            .canonicalize()
-            .expect("parquet path canonicalizes");
+        let abs = parquet.canonicalize().expect("parquet path canonicalizes");
         let sql = format!(
             "PUT file://{} @{stage} AUTO_COMPRESS=FALSE OVERWRITE=TRUE",
             abs.display()
@@ -159,8 +161,7 @@ fn infer_type<'a>(rows: &'a serde_json::Value, col: &str) -> &'a str {
         .expect("INFER_SCHEMA returns an array")
         .iter()
         .find(|r| r["COLUMN_NAME"].as_str() == Some(col))
-        .unwrap_or_else(|| panic!("INFER_SCHEMA has no column `{col}`; saw: {rows}"))
-        ["TYPE"]
+        .unwrap_or_else(|| panic!("INFER_SCHEMA has no column `{col}`; saw: {rows}"))["TYPE"]
         .as_str()
         .expect("INFER_SCHEMA TYPE is a string")
 }
@@ -206,7 +207,9 @@ fn snowflake_validates_postgres_type_matrix_parquet() {
     cfg.run_sql(&format!(
         "CREATE OR REPLACE FILE FORMAT {file_format} TYPE=PARQUET BINARY_AS_TEXT=FALSE"
     ));
-    cfg.run_sql(&format!("CREATE OR REPLACE STAGE {stage} FILE_FORMAT={file_format}"));
+    cfg.run_sql(&format!(
+        "CREATE OR REPLACE STAGE {stage} FILE_FORMAT={file_format}"
+    ));
     cfg.run_sql("ALTER SESSION SET TIMEZONE='UTC'");
     cfg.put(&parquet, &stage);
 

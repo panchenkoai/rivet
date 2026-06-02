@@ -39,9 +39,7 @@ use crate::manifest::{
     MANIFEST_FILENAME, RunManifest, SUCCESS_FILENAME, join_key, parse_success_marker,
     success_marker_body,
 };
-use crate::pipeline::manifest_reconcile::{
-    PartPresence, reconcile_manifest_against_listing,
-};
+use crate::pipeline::manifest_reconcile::{PartPresence, reconcile_manifest_against_listing};
 
 /// Outcome of a single `--validate` pass over a destination prefix.
 ///
@@ -982,7 +980,7 @@ mod tests {
     fn list_failure_cannot_certify_parts_and_fails_the_audit() {
         let dir = tempfile::tempdir().unwrap();
         let m = build_manifest(vec![part(0, 3, 3, "xxh3:0")], ManifestStatus::Success);
-        write_dataset(&dir.path(), &m, &[("part-000000.parquet", b"abc")]);
+        write_dataset(dir.path(), &m, &[("part-000000.parquet", b"abc")]);
         let dest = ListFails(local_dest(dir.path()));
 
         let v = verify_at_destination(&dest, "").unwrap();
@@ -990,7 +988,10 @@ mod tests {
         assert!(v.manifest_found);
         assert!(v.manifest_self_consistent);
         // …but with no listing we verify zero parts and refuse to pass.
-        assert!(!v.passed, "an audit that cannot list the prefix must not pass");
+        assert!(
+            !v.passed,
+            "an audit that cannot list the prefix must not pass"
+        );
         assert_eq!(v.parts_verified, 0);
         assert!(
             v.failures
@@ -1052,7 +1053,10 @@ mod tests {
         assert!(
             ct.failures.iter().any(|f| matches!(
                 f,
-                Failure::ContentVerificationUnmet { size_only: 1, total: 3 }
+                Failure::ContentVerificationUnmet {
+                    size_only: 1,
+                    total: 3
+                }
             )),
             "expected ContentVerificationUnmet, got: {:?}",
             ct.failures
@@ -1065,6 +1069,9 @@ mod tests {
         };
         all.recompute_passed();
         all.enforce_content_policy(true);
-        assert!(all.passed && all.failures.is_empty(), "all md5 meets verify: content");
+        assert!(
+            all.passed && all.failures.is_empty(),
+            "all md5 meets verify: content"
+        );
     }
 }

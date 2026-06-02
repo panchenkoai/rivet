@@ -34,9 +34,7 @@ use std::collections::BTreeMap;
 
 use crate::destination::ObjectMeta;
 use crate::manifest::RunManifest;
-use crate::pipeline::manifest_reconcile::{
-    PartPresence, reconcile_manifest_against_listing,
-};
+use crate::pipeline::manifest_reconcile::{PartPresence, reconcile_manifest_against_listing};
 
 /// What `--resume` should do with a single part on the next run.
 ///
@@ -165,7 +163,8 @@ pub fn build_resume_plan(manifest: &RunManifest, listing: &[ObjectMeta]) -> Resu
         );
     }
     for obj in rec.untracked {
-        plan.untracked.insert(obj.key, UntrackedDecision::Quarantine);
+        plan.untracked
+            .insert(obj.key, UntrackedDecision::Quarantine);
     }
     plan
 }

@@ -146,7 +146,9 @@ pub fn reconcile_manifest_against_listing(
                         expected: part.content_md5.clone(),
                         actual: meta.content_md5.clone().unwrap_or_default(),
                     },
-                    _ => PartPresence::Present { md5_verified: false },
+                    _ => PartPresence::Present {
+                        md5_verified: false,
+                    },
                 }
             }
             Some(meta) => PartPresence::SizeMismatch {
@@ -186,8 +188,8 @@ pub fn reconcile_manifest_against_listing(
 mod tests {
     use super::*;
     use crate::manifest::{
-        ManifestDestination, ManifestPart, ManifestSource, ManifestStatus, RunManifest,
-        MANIFEST_VERSION,
+        MANIFEST_VERSION, ManifestDestination, ManifestPart, ManifestSource, ManifestStatus,
+        RunManifest,
     };
 
     fn part(id: u32, size: u64) -> ManifestPart {
@@ -214,8 +216,15 @@ mod tests {
             started_at: "t".into(),
             finished_at: "t".into(),
             status: ManifestStatus::Success,
-            source: ManifestSource { engine: "pg".into(), schema: None, table: None },
-            destination: ManifestDestination { kind: "local".into(), uri: "file:///x".into() },
+            source: ManifestSource {
+                engine: "pg".into(),
+                schema: None,
+                table: None,
+            },
+            destination: ManifestDestination {
+                kind: "local".into(),
+                uri: "file:///x".into(),
+            },
             format: "parquet".into(),
             compression: "zstd".into(),
             schema_fingerprint: "xxh3:0".into(),
@@ -226,11 +235,19 @@ mod tests {
     }
 
     fn obj(key: &str, size: u64) -> ObjectMeta {
-        ObjectMeta { key: key.into(), size_bytes: size, content_md5: None }
+        ObjectMeta {
+            key: key.into(),
+            size_bytes: size,
+            content_md5: None,
+        }
     }
 
     fn obj_md5(key: &str, size: u64, md5: &str) -> ObjectMeta {
-        ObjectMeta { key: key.into(), size_bytes: size, content_md5: Some(md5.into()) }
+        ObjectMeta {
+            key: key.into(),
+            size_bytes: size,
+            content_md5: Some(md5.into()),
+        }
     }
 
     #[test]
@@ -239,14 +256,22 @@ mod tests {
         let listing = vec![
             obj("part-000000.parquet", 100), // present
             obj("part-000002.parquet", 999), // size drift
-            // part-000001 absent → missing
+                                             // part-000001 absent → missing
         ];
         let rec = reconcile_manifest_against_listing(&m, &listing, "");
-        assert_eq!(rec.per_part[0].presence, PartPresence::Present { md5_verified: false });
+        assert_eq!(
+            rec.per_part[0].presence,
+            PartPresence::Present {
+                md5_verified: false
+            }
+        );
         assert_eq!(rec.per_part[1].presence, PartPresence::Missing);
         assert_eq!(
             rec.per_part[2].presence,
-            PartPresence::SizeMismatch { expected: 300, actual: 999 }
+            PartPresence::SizeMismatch {
+                expected: 300,
+                actual: 999
+            }
         );
         assert!(rec.untracked.is_empty());
     }
@@ -276,7 +301,12 @@ mod tests {
             obj("sub/run/foreign.parquet", 9),
         ];
         let rec = reconcile_manifest_against_listing(&m, &listing, "sub/run");
-        assert_eq!(rec.per_part[0].presence, PartPresence::Present { md5_verified: false });
+        assert_eq!(
+            rec.per_part[0].presence,
+            PartPresence::Present {
+                md5_verified: false
+            }
+        );
         assert_eq!(rec.untracked.len(), 1);
         assert_eq!(rec.untracked[0].key, "sub/run/foreign.parquet");
     }
@@ -304,12 +334,15 @@ mod tests {
         // corruption a size check alone would miss.
         let m = manifest(vec![part_md5(0, 100, MD5_B64), part_md5(1, 100, MD5_B64)]);
         let listing = vec![
-            obj_md5("part-000000.parquet", 100, MD5_B64),  // match → Present
+            obj_md5("part-000000.parquet", 100, MD5_B64), // match → Present
             obj_md5("part-000001.parquet", 100, ZEROS_B64), // drift → ChecksumMismatch
         ];
         let rec = reconcile_manifest_against_listing(&m, &listing, "");
         // md5 present on both sides and matching → content confirmed.
-        assert_eq!(rec.per_part[0].presence, PartPresence::Present { md5_verified: true });
+        assert_eq!(
+            rec.per_part[0].presence,
+            PartPresence::Present { md5_verified: true }
+        );
         assert!(matches!(
             rec.per_part[1].presence,
             PartPresence::ChecksumMismatch { .. }
@@ -321,10 +354,16 @@ mod tests {
         // The S3 bug: manifest stores base64, an S3 listing returns hex ETag —
         // same digest must NOT be a mismatch (regression for the live finding).
         let m = manifest(vec![part_md5(0, 100, MD5_B64)]);
-        let rec =
-            reconcile_manifest_against_listing(&m, &[obj_md5("part-000000.parquet", 100, MD5_HEX)], "");
+        let rec = reconcile_manifest_against_listing(
+            &m,
+            &[obj_md5("part-000000.parquet", 100, MD5_HEX)],
+            "",
+        );
         // base64 manifest vs hex listing of the same digest → still md5-verified.
-        assert_eq!(rec.per_part[0].presence, PartPresence::Present { md5_verified: true });
+        assert_eq!(
+            rec.per_part[0].presence,
+            PartPresence::Present { md5_verified: true }
+        );
     }
 
     #[test]
@@ -332,7 +371,12 @@ mod tests {
         // Manifest has MD5, listing does not (local FS) → Present (size-only).
         let m = manifest(vec![part_md5(0, 100, MD5_B64)]);
         let rec = reconcile_manifest_against_listing(&m, &[obj("part-000000.parquet", 100)], "");
-        assert_eq!(rec.per_part[0].presence, PartPresence::Present { md5_verified: false });
+        assert_eq!(
+            rec.per_part[0].presence,
+            PartPresence::Present {
+                md5_verified: false
+            }
+        );
         // Listing carries an S3 multipart composite ETag (`<hash>-<N>`), which
         // is not a plain MD5 → not comparable → Present (size-only).
         let composite = format!("{MD5_HEX}-3");
@@ -341,6 +385,11 @@ mod tests {
             &[obj_md5("part-000000.parquet", 100, &composite)],
             "",
         );
-        assert_eq!(rec2.per_part[0].presence, PartPresence::Present { md5_verified: false });
+        assert_eq!(
+            rec2.per_part[0].presence,
+            PartPresence::Present {
+                md5_verified: false
+            }
+        );
     }
 }

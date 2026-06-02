@@ -29,7 +29,8 @@ fn mysql_edge_export(
     let table = unique_name(label);
     let pool = mysql::Pool::new(MYSQL_URL).expect("mysql pool");
     let mut conn = pool.get_conn().expect("mysql conn");
-    conn.query_drop(format!("DROP TABLE IF EXISTS {table}")).unwrap();
+    conn.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
     for stmt in setup_sql.replace("{table_name}", &table).split(';') {
         let s = stmt.trim();
         if !s.is_empty() {
@@ -101,7 +102,10 @@ fn mysql_edge_decimal_boundaries_resolve_without_override() {
     assert_eq!(actual["d38_0"], "DECIMAL(38,0)", "Decimal128 boundary");
     // DuckDB downgrades precision > 38 to DOUBLE (same as the PG edge test);
     // the Parquet still carries Decimal256, checked via pyarrow below.
-    assert_eq!(actual["d50_10"], "DOUBLE", "DuckDB downgrades precision-50 to DOUBLE");
+    assert_eq!(
+        actual["d50_10"], "DOUBLE",
+        "DuckDB downgrades precision-50 to DOUBLE"
+    );
 
     let v = duckdb_run_sql_json(&format!(
         "SELECT d38_0::VARCHAR FROM read_parquet('{glob}') WHERE id = 1"
@@ -157,9 +161,21 @@ fn mysql_edge_datetime_boundaries_round_trip() {
          FROM read_parquet('{glob}') WHERE id = 1"
     ));
     let r = row["rows"][0].as_array().unwrap();
-    assert_eq!(r[0].as_str().unwrap(), "1700-01-01 12:00:00.000000", "pre-1970 DATETIME");
-    assert_eq!(r[1].as_str().unwrap(), "9999-12-31 23:59:59.999999", "far-future DATETIME");
-    assert_eq!(r[2].as_str().unwrap(), "2024-06-15 07:00:00.000000", "UTC TIMESTAMP instant");
+    assert_eq!(
+        r[0].as_str().unwrap(),
+        "1700-01-01 12:00:00.000000",
+        "pre-1970 DATETIME"
+    );
+    assert_eq!(
+        r[1].as_str().unwrap(),
+        "9999-12-31 23:59:59.999999",
+        "far-future DATETIME"
+    );
+    assert_eq!(
+        r[2].as_str().unwrap(),
+        "2024-06-15 07:00:00.000000",
+        "UTC TIMESTAMP instant"
+    );
 }
 
 // ─── JSON edge content ──────────────────────────────────────────────────────
@@ -191,7 +207,11 @@ fn mysql_edge_json_content_round_trip() {
     let row = r["rows"][0].as_array().unwrap();
     assert_eq!(row[0].as_str().unwrap(), "deep");
     assert_eq!(row[1].as_str().unwrap(), "value", "JSON unicode key");
-    assert_eq!(row[2].as_str().unwrap(), "9223372036854775807", "i64 max in JSON");
+    assert_eq!(
+        row[2].as_str().unwrap(),
+        "9223372036854775807",
+        "i64 max in JSON"
+    );
     assert_eq!(row[3].as_str().unwrap(), "6", "mixed-type array length");
 }
 
@@ -218,8 +238,16 @@ fn mysql_edge_string_extremes_round_trip() {
     ));
     let row = r["rows"][0].as_array().unwrap();
     assert_eq!(row[0].as_str().unwrap(), "0", "empty string");
-    assert_eq!(row[1].as_str().unwrap(), "8", "whitespace string length (3+1+1+3)");
-    assert_eq!(row[2].as_str().unwrap(), "100000", "100k-char string preserved");
+    assert_eq!(
+        row[1].as_str().unwrap(),
+        "8",
+        "whitespace string length (3+1+1+3)"
+    );
+    assert_eq!(
+        row[2].as_str().unwrap(),
+        "100000",
+        "100k-char string preserved"
+    );
     assert_eq!(row[3].as_str().unwrap(), "X");
 }
 
@@ -252,7 +280,11 @@ fn mysql_edge_native_types_round_trip() {
     assert_eq!(row[0].as_str().unwrap(), "255", "BIT(8) all-ones = 255");
     assert_eq!(row[1].as_str().unwrap(), "1901", "YEAR min");
     assert_eq!(row[2].as_str().unwrap(), "2155", "YEAR max");
-    assert_eq!(row[3].as_str().unwrap(), "x,z", "SET preserves multi-value text");
+    assert_eq!(
+        row[3].as_str().unwrap(),
+        "x,z",
+        "SET preserves multi-value text"
+    );
     assert_eq!(row[4].as_str().unwrap(), "true", "TINYINT(1) = bool true");
     assert_eq!(row[5].as_str().unwrap(), "1", "all-NULL column stays NULL");
 }

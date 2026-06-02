@@ -163,7 +163,9 @@ pub fn decimal_str_to_scaled_i256(s: &str, scale: i8) -> Option<i256> {
     };
 
     let scale_factor = pow10_i256(scale_u)?;
-    let result = int_val.checked_mul(scale_factor)?.checked_add(frac_aligned)?;
+    let result = int_val
+        .checked_mul(scale_factor)?
+        .checked_add(frac_aligned)?;
     Some(if negative { -result } else { result })
 }
 
@@ -295,7 +297,10 @@ mod tests {
         assert_eq!(decimal_str_to_scaled_i128(&max_digits, 2), None);
 
         // Fractional overflow: huge integer part + any scale.
-        assert_eq!(decimal_str_to_scaled_i128(&format!("{max_digits}.5"), 5), None);
+        assert_eq!(
+            decimal_str_to_scaled_i128(&format!("{max_digits}.5"), 5),
+            None
+        );
     }
 
     // ── i256 (Decimal256) path: the i128 bottleneck is gone ──────────────────

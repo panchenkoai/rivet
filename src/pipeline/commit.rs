@@ -112,13 +112,13 @@ pub(crate) fn write_part_file(
     // (GCS base64, S3 hex ETag), so compare normalised digest bytes.
     if let Some(stored) = &outcome.content_md5 {
         use crate::pipeline::manifest_reconcile::md5_digest_bytes;
-        if let (Some(local), Some(remote)) = (md5_digest_bytes(&md5), md5_digest_bytes(stored)) {
-            if local != remote {
-                anyhow::bail!(
-                    "upload integrity check failed for '{file_name}': local MD5 differs from \
-                     the store-reported checksum — the part corrupted in transit"
-                );
-            }
+        if let (Some(local), Some(remote)) = (md5_digest_bytes(&md5), md5_digest_bytes(stored))
+            && local != remote
+        {
+            anyhow::bail!(
+                "upload integrity check failed for '{file_name}': local MD5 differs from \
+                 the store-reported checksum — the part corrupted in transit"
+            );
         }
     }
     Ok(PartRecord {

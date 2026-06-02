@@ -108,8 +108,8 @@ pub fn collect_report(
                     }
                     // Surface the autoloaded type only when it diverges from the
                     // native type — that divergence is the operator-facing point.
-                    let autoload = (spec.autoload_type != spec.target_type)
-                        .then_some(spec.autoload_type);
+                    let autoload =
+                        (spec.autoload_type != spec.target_type).then_some(spec.autoload_type);
                     (
                         Some(spec.target_type),
                         Some(spec.status),

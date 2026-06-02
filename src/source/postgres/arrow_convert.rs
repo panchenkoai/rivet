@@ -575,11 +575,9 @@ fn build_pg_text_array(pg_type: &Type, col_idx: usize, rows: &[Row]) -> Result<A
         Type::INTERVAL => {
             for row in rows {
                 match row.try_get::<_, Option<PgInterval>>(col_idx).ok().flatten() {
-                    Some(iv) => b.append_value(pg_interval_to_iso8601(
-                        iv.months,
-                        iv.days,
-                        iv.microseconds,
-                    )),
+                    Some(iv) => {
+                        b.append_value(pg_interval_to_iso8601(iv.months, iv.days, iv.microseconds))
+                    }
                     None => b.append_null(),
                 }
             }
