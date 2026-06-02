@@ -217,7 +217,12 @@ jobs:
             exit 0
           fi
           git commit -m "rivet ${RELEASE_TAG}"
-          git push
+          # actions/checkout sets a *global* http.<github>.extraheader carrying
+          # the repo-scoped GITHUB_TOKEN; it overrides the PAT embedded in the
+          # clone URL and makes the cross-repo push fail with "password
+          # authentication is not supported". Blank it for this push so git uses
+          # the tap PAT from the origin URL.
+          git -c http.https://github.com/.extraheader= push origin HEAD
 
   # Multi-arch Docker build using native runners.
   #
