@@ -434,6 +434,69 @@ fn run_reconcile_flag_exits_zero_when_counts_match() {
 
 #[test]
 #[ignore = "live: requires docker compose postgres"]
+fn run_reconcile_reports_mismatch_when_source_grows_after_snapshot() {
+    // `run --reconcile` reconciles what it exported (a consistent source
+    // snapshot) against a *fresh* source COUNT(*). There is no deterministic
+    // single-snapshot mismatch — by construction the export and the recount read
+    // the same source moments apart — so a real mismatch is a concurrency event.
+    // We construct it deterministically: full mode holds one snapshot for the
+    // whole read; a throttle keeps the run alive while a writer inserts 50 rows
+    // *after* the snapshot opens but *before* the end-of-run recount. The export
+    // therefore sees 200 and reconcile sees 250 → MISMATCH.
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(200);
+    let out = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        r#"
+source:
+  type: postgres
+  url: "{POSTGRES_URL}"
+  tuning: {{batch_size: 10, throttle_ms: 60}}
+exports:
+  - name: {name}
+    query: "SELECT id, name FROM {name}"
+    mode: full
+    format: parquet
+    destination: {{type: local, path: {dir}}}
+"#,
+        name = table.name(),
+        dir = out.path().display()
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    // Writer: after the snapshot has opened (and while the throttled export is
+    // still running), commit 50 new rows the export's snapshot can't see.
+    let table_name = table.name().to_string();
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let mut c = pg_connect();
+        let _ = c.batch_execute(&format!(
+            "INSERT INTO {table_name} (id, name, amount) \
+             SELECT g, 'late', 1.0 FROM generate_series(201, 250) g"
+        ));
+    });
+
+    let result = run_rivet(&[
+        "run",
+        "--config",
+        cfg.to_str().unwrap(),
+        "--export",
+        table.name(),
+        "--reconcile",
+    ]);
+    let _ = writer.join();
+
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("MISMATCH"),
+        "run --reconcile must report MISMATCH when the source grew (250) past what \
+         was exported (200); stderr:\n{stderr}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
 fn run_parallel_exports_flag_runs_both_exports() {
     require_alive(LiveService::Postgres);
 
