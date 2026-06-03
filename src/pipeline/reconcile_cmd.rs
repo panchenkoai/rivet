@@ -15,8 +15,8 @@ use std::path::Path;
 use crate::config::{Config, ExportConfig};
 use crate::error::Result;
 use crate::plan::{
-    ExtractionStrategy, PartitionKind, PartitionResult, ReconcileReport, ResolvedRunPlan,
-    build_plan,
+    ExtractionStrategy, PartitionKind, PartitionResult, ReconcileReport, ReconcileSummary,
+    ResolvedRunPlan, build_plan,
 };
 use crate::source;
 use crate::state::{ChunkTaskInfo, StateStore};
@@ -72,6 +72,40 @@ pub fn run_reconcile_command(
     };
 
     emit_report(&report, &format)?;
+    enforce_reconcile_exit(&report.summary)
+}
+
+/// Exit-code contract for `rivet reconcile`.
+///
+/// A detected **mismatch** fails the command (non-zero exit) so an operator can
+/// gate on it — `rivet reconcile && <next step>` must not proceed when the
+/// export disagrees with the source. This mirrors `rivet validate`, which
+/// already exits non-zero on a failed verdict; before this, `reconcile` printed
+/// the mismatch but returned `Ok`, so the gate silently passed.
+///
+/// **Unknown** partitions are *not* a failure: they mean reconcile could not
+/// obtain one of the two counts — an incomplete chunk (never recorded
+/// `rows_written`) or a non-integer keyset key it cannot re-count in the source.
+/// That is "could not verify", not "verified wrong"; a keyset export is
+/// structurally all-unknown and must not read as a hard failure. They are
+/// surfaced as a warning so "0 mismatches, N unknown" is not mistaken for a
+/// clean audit.
+fn enforce_reconcile_exit(summary: &ReconcileSummary) -> Result<()> {
+    if summary.unknown > 0 {
+        log::warn!(
+            "reconcile: {} of {} partition(s) could not be verified (incomplete chunk or \
+             non-integer keyset key — no source re-count); not counted as a mismatch",
+            summary.unknown,
+            summary.total_partitions
+        );
+    }
+    if summary.mismatches > 0 {
+        anyhow::bail!(
+            "reconcile: {} of {} partition(s) disagree with the source — see the report above",
+            summary.mismatches,
+            summary.total_partitions
+        );
+    }
     Ok(())
 }
 
@@ -413,5 +447,49 @@ mod tests {
             captured.contains("\"id\""),
             "identifier must be quoted: {captured}"
         );
+    }
+
+    // ─── Exit-code contract (regression: reconcile gated silently passed) ──────
+
+    fn summary(matches: usize, mismatches: usize, unknown: usize) -> ReconcileSummary {
+        ReconcileSummary {
+            total_partitions: matches + mismatches + unknown,
+            matches,
+            mismatches,
+            unknown,
+            total_source_rows: 0,
+            total_exported_rows: 0,
+        }
+    }
+
+    #[test]
+    fn reconcile_exit_fails_on_mismatch() {
+        // The gate: a detected mismatch must be a non-zero exit so
+        // `rivet reconcile && <next>` does not proceed on disagreeing data.
+        // Before the fix this returned Ok and the audit silently passed.
+        let err = enforce_reconcile_exit(&summary(3, 1, 0)).unwrap_err();
+        assert!(
+            err.to_string().contains("disagree with the source"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn reconcile_exit_passes_when_all_match() {
+        assert!(enforce_reconcile_exit(&summary(4, 0, 0)).is_ok());
+    }
+
+    #[test]
+    fn reconcile_exit_does_not_fail_on_unknown_only() {
+        // Unknown = "could not verify" (incomplete chunk / non-integer keyset
+        // key), not "verified wrong" — must NOT fail, else every keyset export
+        // (structurally all-unknown) would error.
+        assert!(enforce_reconcile_exit(&summary(2, 0, 3)).is_ok());
+    }
+
+    #[test]
+    fn reconcile_exit_fails_when_mismatch_and_unknown_coexist() {
+        // A real mismatch still gates even when other partitions are unverifiable.
+        assert!(enforce_reconcile_exit(&summary(0, 1, 2)).is_err());
     }
 }
