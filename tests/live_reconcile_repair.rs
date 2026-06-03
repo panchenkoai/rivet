@@ -380,3 +380,109 @@ fn repair_format_json_emits_valid_json_plan() {
         "repair JSON must have 'actions' or 'export_name' field; got:\n{stdout}"
     );
 }
+
+// ─── RR7: reconcile exits non-zero on a real mismatch (gate, not just report) ──
+//
+// Regression: `reconcile` printed `N mismatch` but returned Ok → exit 0, so
+// `rivet reconcile && <next>` proceeded on disagreeing data. The audit must gate.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn reconcile_exits_nonzero_on_mismatch() {
+    require_alive(LiveService::Postgres);
+    let (table, _out, _cfg_dir, cfg) = seed_and_run_chunked(100, 50);
+
+    // Drift the source under chunk 0 [1..50]: delete 20 rows → source 30 vs exported 50.
+    let mut c = pg_connect();
+    c.batch_execute(&format!("DELETE FROM {} WHERE id <= 20", table.name()))
+        .expect("drift source");
+
+    let out = std::process::Command::new(RIVET_BIN)
+        .args([
+            "reconcile",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            table.name(),
+        ])
+        .output()
+        .expect("spawn rivet reconcile");
+
+    assert!(
+        !out.status.success(),
+        "reconcile must exit non-zero on a detected mismatch; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("disagree with the source"),
+        "must name the mismatch in the error; stderr:\n{stderr}"
+    );
+}
+
+// ─── RR8: repair --execute re-exports a real mismatch AND preserves the original ──
+//
+// The repair path was only covered for the no-mismatch case. This pins the real
+// recovery + ADR-0009 RR5: the re-exported chunk lands as a NEW file alongside
+// the original (collision-proof naming), and the original is never overwritten.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn repair_execute_reexports_mismatch_and_preserves_original_file() {
+    require_alive(LiveService::Postgres);
+    let (table, out_dir, _cfg_dir, cfg) = seed_and_run_chunked(100, 50);
+
+    let chunk0 = |dir: &std::path::Path| -> Vec<std::path::PathBuf> {
+        files_with_extension(dir, "parquet")
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().contains("chunk0"))
+                    .unwrap_or(false)
+            })
+            .collect()
+    };
+
+    let before = chunk0(out_dir.path());
+    assert_eq!(before.len(), 1, "exactly one chunk0 file after export");
+    let original = before[0].clone();
+    let original_size = std::fs::metadata(&original).unwrap().len();
+
+    // Drift source under chunk 0 → mismatch that repair will re-export.
+    let mut c = pg_connect();
+    c.batch_execute(&format!("DELETE FROM {} WHERE id <= 20", table.name()))
+        .expect("drift source");
+
+    let out = std::process::Command::new(RIVET_BIN)
+        .args([
+            "repair",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            table.name(),
+            "--execute",
+        ])
+        .output()
+        .expect("spawn rivet repair --execute");
+    assert!(
+        out.status.success(),
+        "repair --execute must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    // RR5: the original file survives, byte-for-byte unchanged.
+    assert!(
+        original.exists(),
+        "RR5: repair must NOT delete the original chunk0 file"
+    );
+    assert_eq!(
+        std::fs::metadata(&original).unwrap().len(),
+        original_size,
+        "RR5: repair must NOT overwrite the original chunk0 file"
+    );
+    // The re-export landed as a distinct new file alongside it.
+    assert_eq!(
+        chunk0(out_dir.path()).len(),
+        2,
+        "repair must add a new chunk0 file alongside the original (collision-proof naming)"
+    );
+}
