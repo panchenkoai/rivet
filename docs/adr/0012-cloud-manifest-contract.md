@@ -1,7 +1,7 @@
 # ADR-0012: Cloud Manifest Contract
 
-**Status**: Proposed
-**Date**: 2026-05-21
+**Status**: Accepted
+**Date**: 2026-05-21 (accepted; M1–M9 landed, incl. M8 chunked-resume executor and M9 best-effort quarantine move — see test-coverage table)
 **Context**: Rivet 0.7.0 introduces a public JSON manifest as the trust contract for cloud-output runs (local / S3 / GCS). The manifest is the operator-visible record of what was written, and the input to resume, validation, and reconciliation. Its invariants must be locked before the writer, the resume logic, and the verification extensions are coded — otherwise we will rewrite them.
 
 This ADR defines those invariants. The shipping target is Rivet 0.7.0. Schema v8 has already reclaimed the `manifest` name by renaming the internal SQLite ledger to `file_log` (ADR refs: see CHANGELOG 0.6.1).
@@ -233,7 +233,7 @@ These items were open in the first draft of this ADR; they are now decided.
 | M5 | ✅ | `pipeline::validate_manifest` + `tests/trust_artifacts_integration.rs` §22 (manifest read, part presence, size match) |
 | M6 | ✅ | `legacy_run: true` label surfaced by `verify_at_destination` when no manifest present; covered in `validate_manifest` unit + integration tests |
 | M7 | ✅ writer relies on `Destination::write` atomicity | local: `fs::copy`; S3/GCS: single PUT (opendal); covered by destination capability tests |
-| M8 | partial: gate ✅, decision matrix ✅ pure logic, ⚠️ chunked-resume executor wiring deferred to Phase C-γ | `--resume` against `_SUCCESS` refuses without `--force` (covered §26); pure matrix tested per row in `pipeline::resume_decisions::tests` and end-to-end against real Destination listing in §27 |
-| M9 | ⚠️ deferred to Phase C-δ | best-effort move on resume; `UntrackedDecision::Quarantine` already produced by `build_resume_plan`; executor side not yet wired |
+| M8 | ✅ gate + matrix + chunked-resume executor wired | `--resume` against `_SUCCESS` refuses without `--force` (covered §26); pure matrix tested per row in `pipeline::resume_decisions::tests` and end-to-end against real Destination listing in §27; executor `apply_m8_resume_decisions` runs as the resume preamble in both chunked runners (`pipeline/chunked/resume_m8.rs`, called from `sequential_checkpoint` + `parallel_checkpoint`) |
+| M9 | ✅ best-effort quarantine move wired | `quarantine_move` → `Destination::move` for divergent manifest parts (size/fingerprint) and untracked surplus objects; never fatal, never deletes on partial failure; counted on `M8ResumeStats.{quarantined_moved, quarantine_move_failures}` (`pipeline/chunked/resume_m8.rs`) |
 
 Each invariant lands with at least one unit test (local FS, fast) and one integration test (S3-compat via MinIO or GCS-compat; nightly).

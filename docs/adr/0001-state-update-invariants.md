@@ -43,7 +43,7 @@ If these stores are updated in the wrong order — or if failures leave them in 
 
 **Rationale**: The manifest represents files that are durably available at the destination. An entry for a file that was never written is a phantom record.
 
-**Current implementation**: `st.record_file(...)` is called immediately after `dest.write(...)` returns `Ok` in `pipeline/single.rs:run_single_export` and in the chunked paths.
+**Current implementation**: the manifest entry is recorded immediately after `dest.write(...)` returns `Ok`, via the shared `pipeline/commit.rs:record_part` seam (which calls `st.record_file`). `record_part` is invoked from `run_single_export` and every chunked runner, so the after-write ordering lives in one place rather than copied per runner.
 
 **Recovery behavior**: If the process is killed between `dest.write` and `record_file`, the file exists at the destination but is absent from the manifest. This is safe — the file is not lost, only untracked. The manifest can be reconstructed.
 
@@ -55,7 +55,7 @@ If these stores are updated in the wrong order — or if failures leave them in 
 
 **Rationale**: If the cursor were advanced before the write, a subsequent run would skip rows that were never durably written. Keeping the cursor behind ensures at-least-once extraction semantics.
 
-**Current implementation**: `st.update(...)` is called after the file-writing loop in `pipeline/single.rs:run_single_export`. If any `dest.write` returns `Err`, execution exits via `?` before reaching the cursor update.
+**Current implementation**: the cursor advance runs after the file-writing loop, via the shared `pipeline/run_store.rs:RunStore` seam (ADR-0018) called from `run_single_export`. If any `dest.write` returns `Err`, execution exits via `?` before reaching the cursor update.
 
 **Consequence**: On retry after a write failure, the same rows are re-extracted and re-written. Consumers of the destination must tolerate duplicate files.
 
@@ -67,7 +67,7 @@ If these stores are updated in the wrong order — or if failures leave them in 
 
 **Rationale**: A metric recorded before all artifacts are committed will show a misleading status. The status field in `export_metrics` always reflects the terminal state of the run.
 
-**Current implementation**: `state.record_metric(...)` is called at the end of `pipeline/mod.rs:run_export_job`, after `run_chunked_quality_gate` has resolved the result and the status field is set to `"success"` or `"failed"`.
+**Current implementation**: `state.record_metric(...)` is called near the end of `pipeline/job.rs:run_export_job` (and `run_export_job_with_chunk_source` for apply), after the quality gate has resolved the result and the status field is set to `"success"` or `"failed"`.
 
 ---
 
@@ -89,7 +89,7 @@ If these stores are updated in the wrong order — or if failures leave them in 
 
 **Rationale**: A chunk run finalized with incomplete tasks cannot be reliably resumed. The final state would show `completed` while some data windows were never exported.
 
-**Current implementation**: `pipeline/chunked.rs:run_chunked_sequential_checkpoint` checks `count_chunk_tasks_not_completed` and calls `anyhow::bail!` if any tasks remain. `finalize_chunk_run_completed` is only reached if that check passes.
+**Current implementation**: `pipeline/chunked/sequential_checkpoint.rs:run_chunked_sequential_checkpoint` checks `count_chunk_tasks_not_completed` and calls `anyhow::bail!` if any tasks remain. `finalize_chunk_run_completed` is only reached if that check passes.
 
 ---
 
