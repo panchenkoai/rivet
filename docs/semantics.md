@@ -142,6 +142,7 @@ Scope and limits:
 - **Chunked mode only in v1.** `time_window` and `incremental` exports surface a clear "not supported" error.
 - **`COUNT(*)` based.** No hash-based partition verification yet.
 - **Verified boundary advances only on a fully clean report** — zero mismatches and zero unknowns ([ADR-0008 § PG5](adr/0008-export-progression.md)).
+- **Exit code gates on mismatch.** `rivet reconcile` exits **non-zero** when any partition is a `mismatch`, so `rivet reconcile && <next step>` does not proceed on disagreeing data (mirrors `rivet validate`). `unknown` partitions (an incomplete chunk, or a non-integer keyset key with no source re-count) are surfaced as a **warning** but do **not** fail the command — "could not verify" is not "verified wrong", and a keyset export is structurally all-`unknown`. The mismatch detail is always in the printed report regardless of exit code.
 
 Reconcile reads from the same source and never writes files itself.
 
