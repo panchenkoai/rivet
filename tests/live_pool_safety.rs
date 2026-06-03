@@ -119,6 +119,7 @@ fn pg_statement_timeout_not_leaked_after_successful_export() {
         .export(
             &ExportRequest {
                 query: "SELECT 1 AS n",
+                catalog_hint_query: None,
                 incremental: None,
                 cursor: None,
                 tuning: &tuning_300s(),
@@ -148,6 +149,7 @@ fn pg_connection_usable_and_clean_after_failed_export() {
     let result = source.export(
         &ExportRequest {
             query: "SELECT generate_series(1, 1000) AS n",
+            catalog_hint_query: None,
             incremental: None,
             cursor: None,
             tuning: &tuning_300s(),
@@ -197,6 +199,7 @@ fn pg_panic_in_sink_releases_cursor_and_aborts_txn() {
         let _ = source.export(
             &ExportRequest {
                 query: "SELECT generate_series(1, 100) AS n",
+                catalog_hint_query: None,
                 incremental: None,
                 cursor: None,
                 tuning: &tuning_300s(),
@@ -261,6 +264,7 @@ fn mysql_session_vars_clean_after_successful_export() {
         .export(
             &ExportRequest {
                 query: "SELECT 1 AS n",
+                catalog_hint_query: None,
                 incremental: None,
                 cursor: None,
                 tuning: &tuning_300s(),
@@ -296,6 +300,7 @@ fn mysql_session_vars_clean_after_failed_export() {
     let result = source.export(
         &ExportRequest {
             query: "SELECT 1 AS n UNION ALL SELECT 2",
+            catalog_hint_query: None,
             incremental: None,
             cursor: None,
             tuning: &tuning_300s(),
@@ -414,6 +419,7 @@ fn mysql_proxysql_session_vars_clean_after_successful_export() {
         .export(
             &ExportRequest {
                 query: "SELECT 1 AS n",
+                catalog_hint_query: None,
                 incremental: None,
                 cursor: None,
                 tuning: &tuning_300s(),
@@ -455,6 +461,7 @@ fn mysql_proxysql_session_vars_clean_after_failed_export() {
     let result = source.export(
         &ExportRequest {
             query: "SELECT 1 AS n UNION ALL SELECT 2",
+            catalog_hint_query: None,
             incremental: None,
             cursor: None,
             tuning: &tuning_300s(),

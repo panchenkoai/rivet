@@ -127,6 +127,7 @@ fn pg_export_survives_concurrent_inserts() {
     let result = source.export(
         &ExportRequest {
             query: &format!("SELECT * FROM {tname}"),
+            catalog_hint_query: None,
             incremental: None,
             cursor: None,
             tuning: &tuning_balanced(),
@@ -184,6 +185,7 @@ fn pg_export_adaptive_under_write_pressure() {
     let result = source.export(
         &ExportRequest {
             query: &format!("SELECT * FROM {tname}"),
+            catalog_hint_query: None,
             incremental: None,
             cursor: None,
             tuning: &tuning_adaptive(),
@@ -242,6 +244,7 @@ fn mysql_export_survives_concurrent_inserts() {
     let result = source.export(
         &ExportRequest {
             query: &format!("SELECT id, name, created_at FROM {tname}"),
+            catalog_hint_query: None,
             incremental: None,
             cursor: None,
             tuning: &tuning_balanced(),
@@ -296,6 +299,7 @@ fn mysql_export_adaptive_under_write_pressure() {
     let result = source.export(
         &ExportRequest {
             query: &format!("SELECT id, name, created_at FROM {tname}"),
+            catalog_hint_query: None,
             incremental: None,
             cursor: None,
             tuning: &tuning_adaptive(),

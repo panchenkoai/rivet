@@ -382,3 +382,78 @@ exports:
         "expected stderr to mention 'fast (default for environment: local)'; got:\n{stderr}",
     );
 }
+
+/// Regression: chunked mode wraps the base query in a `SELECT … FROM (<base>) …`
+/// subquery, which hides the source table from the PG NUMERIC catalog-hint
+/// parser. Before the fix, a chunked export of a *non*-`SELECT * FROM <ident>`
+/// query with an undeclared `NUMERIC` column failed ("no safe Rivet mapping"),
+/// while `check` and full mode reported it safe — a check↔run inconsistency. The
+/// fix resolves hints from the unwrapped base query
+/// (`ExportRequest.catalog_hint_query`), so chunked now resolves without an
+/// override and consistently with `check`/full.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn chunked_nonsimple_query_resolves_numeric_via_base_catalog_hint() {
+    require_alive(LiveService::Postgres);
+    let tbl = seed_pg_numeric_table(60);
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let yaml = format!(
+        r#"source: {{type: postgres, url: "{POSTGRES_URL}"}}
+exports:
+  - name: {name}
+    query: "SELECT id, amount FROM {name}"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 25
+    chunk_checkpoint: true
+    format: parquet
+    destination: {{type: local, path: {out}}}
+"#,
+        name = tbl.name(),
+        out = tmp.path().join("o").display(),
+    );
+    let cfg = write_config(&tmp, &yaml);
+    let out = run_rivet(&["run", "-c", cfg.to_str().unwrap(), "--export", tbl.name()]);
+    assert!(
+        out.status.success(),
+        "chunked non-simple query with an undeclared NUMERIC must resolve via the \
+         base-query catalog hint (no override); stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+/// Same regression for the `chunk_dense: true` path, which wraps the base query
+/// in a ROW_NUMBER() subquery *even for the simple `SELECT * FROM <ident>` form*
+/// — so it lost the NUMERIC catalog hint before the fix even on the fast-path
+/// query shape.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn chunked_dense_resolves_numeric_via_base_catalog_hint() {
+    require_alive(LiveService::Postgres);
+    let tbl = seed_pg_numeric_table(60);
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let yaml = format!(
+        r#"source: {{type: postgres, url: "{POSTGRES_URL}"}}
+exports:
+  - name: {name}
+    query: "SELECT * FROM {name}"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 25
+    chunk_dense: true
+    chunk_checkpoint: true
+    format: parquet
+    destination: {{type: local, path: {out}}}
+"#,
+        name = tbl.name(),
+        out = tmp.path().join("o").display(),
+    );
+    let cfg = write_config(&tmp, &yaml);
+    let out = run_rivet(&["run", "-c", cfg.to_str().unwrap(), "--export", tbl.name()]);
+    assert!(
+        out.status.success(),
+        "chunked dense export with an undeclared NUMERIC must resolve via the \
+         base-query catalog hint (no override); stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+}

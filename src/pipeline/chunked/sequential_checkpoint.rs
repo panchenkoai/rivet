@@ -62,6 +62,7 @@ fn export_one_chunk_range(
     src.export(
         &source::ExportRequest {
             query: &chunk_query,
+            catalog_hint_query: Some(base_query),
             incremental: None,
             cursor: None,
             tuning: &plan.tuning,

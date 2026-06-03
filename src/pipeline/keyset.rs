@@ -72,6 +72,10 @@ pub(crate) fn run_keyset(
         src.export(
             &source::ExportRequest {
                 query: &plan.base_query,
+                // `query` is the unwrapped base; the driver wraps it with the
+                // keyset predicate internally, so the catalog parser still sees
+                // the source table — resolve hints from `query`.
+                catalog_hint_query: None,
                 incremental: Some(&key_plan),
                 cursor: cursor.as_ref(),
                 tuning: &plan.tuning,

@@ -207,6 +207,7 @@ pub(super) fn run_single_export(
 ) -> Result<()> {
     let request = source::ExportRequest {
         query,
+        catalog_hint_query: None, // `query` is already the unwrapped base
         incremental: plan.strategy.incremental_plan(),
         cursor,
         tuning: &plan.tuning,

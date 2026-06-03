@@ -568,7 +568,11 @@ impl super::Source for PostgresSource {
             built.sql
         );
 
-        let numeric_hints = pg_numeric_catalog_hints_opt(&mut self.client, request.query);
+        // Resolve NUMERIC precision from the *unwrapped* base query when the
+        // caller wrapped `query` in a chunk/keyset subquery (which hides the
+        // source table from the catalog parser). Falls back to `query`.
+        let hint_query = request.catalog_hint_query.unwrap_or(request.query);
+        let numeric_hints = pg_numeric_catalog_hints_opt(&mut self.client, hint_query);
 
         // PgTxnGuard inside pg_run_export rolls the txn back automatically on
         // any error or panic, so no explicit ROLLBACK is needed here.

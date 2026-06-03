@@ -97,6 +97,9 @@ pub(crate) fn run_chunked_sequential(
         src.export(
             &source::ExportRequest {
                 query: &chunk_query,
+                // `chunk_query` wraps the base in a subquery → resolve NUMERIC
+                // catalog hints from the unwrapped base instead.
+                catalog_hint_query: Some(&plan.base_query),
                 incremental: None,
                 cursor: None,
                 tuning: &plan.tuning,
@@ -389,6 +392,7 @@ pub(crate) fn run_chunked_parallel(
                     thread_src.export(
                         &source::ExportRequest {
                             query: &chunk_query,
+                            catalog_hint_query: Some(&plan_for_worker.base_query),
                             incremental: None,
                             cursor: None,
                             tuning: &plan_for_worker.tuning,

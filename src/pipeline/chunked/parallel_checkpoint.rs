@@ -256,6 +256,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                 thread_src.export(
                                     &source::ExportRequest {
                                         query: &chunk_query,
+                                        catalog_hint_query: Some(&plan_w.base_query),
                                         incremental: None,
                                         cursor: None,
                                         tuning: &plan_w.tuning,

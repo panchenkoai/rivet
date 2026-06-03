@@ -94,6 +94,15 @@ pub struct ExportRequest<'a> {
     /// it with the dialect-specific incremental predicate via
     /// [`crate::source::query::build_incremental_query`] when `incremental` is set.
     pub query: &'a str,
+    /// The *unwrapped* base query to resolve catalog-dependent type hints from
+    /// (PostgreSQL `NUMERIC` precision/scale, which the wire protocol omits — the
+    /// driver parses the `FROM` clause and asks `pg_catalog`). Chunked, dense and
+    /// keyset runners wrap `query` in a `SELECT … FROM (<base>) …` subquery that
+    /// hides the source table from the catalog parser, so they pass the original
+    /// base query here. `None` ⇒ resolve from `query` (full/incremental, where it
+    /// is already the unwrapped form). Drivers that read precision from the wire
+    /// (MySQL) ignore this field.
+    pub catalog_hint_query: Option<&'a str>,
     pub incremental: Option<&'a IncrementalCursorPlan>,
     pub cursor: Option<&'a CursorState>,
     pub tuning: &'a SourceTuning,
