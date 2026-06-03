@@ -232,8 +232,19 @@ pub fn derive_fidelity(t: &RivetType) -> TypeFidelity {
         // exactly; downstream tools may interpret it differently.
         RivetType::Interval => TypeFidelity::Compatible,
 
-        // List: Arrow List preserves element values; 1-D only currently.
-        RivetType::List { .. } => TypeFidelity::Compatible,
+        // List: Arrow List preserves element values (1-D only currently), but a
+        // list is never *better* than its element — and never worse than
+        // `Compatible` for a supported element. A list of an **Unsupported**
+        // element (e.g. PG `numeric[]`, whose element precision can't be
+        // resolved and has no override — array overrides aren't accepted) is
+        // itself Unsupported: the run can't build the field, so `--strict` and
+        // the type-report must say so too (otherwise `check` reports it safe
+        // while `run` fails — a check↔run inconsistency). A Lossy element drags
+        // the list to Lossy likewise.
+        RivetType::List { inner } => match derive_fidelity(inner) {
+            f @ (TypeFidelity::Unsupported | TypeFidelity::Lossy) => f,
+            _ => TypeFidelity::Compatible,
+        },
 
         RivetType::Unsupported { .. } => TypeFidelity::Unsupported,
     }
@@ -301,6 +312,31 @@ fn logical_type_label(t: &RivetType) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_fidelity_propagates_unsupported_element() {
+        // PG `numeric[]`: the element precision can't be resolved and array
+        // overrides aren't accepted → `List<Unsupported>`. A list is never
+        // better than its element, so the whole column is Unsupported —
+        // `--strict` and the type-report must agree with `run`, which fails to
+        // build the field. Regression: this was hardcoded `Compatible`, so
+        // `check --strict` passed while `run` failed (a check↔run gap).
+        let bad = RivetType::List {
+            inner: Box::new(RivetType::Unsupported {
+                native_type: "numeric".into(),
+                reason: "precision unavailable".into(),
+            }),
+        };
+        assert_eq!(derive_fidelity(&bad), TypeFidelity::Unsupported);
+        assert!(bad.is_unsupported());
+
+        // A list of a supported element stays `Compatible` (e.g. `int[]`).
+        let good = RivetType::List {
+            inner: Box::new(RivetType::Int32),
+        };
+        assert_eq!(derive_fidelity(&good), TypeFidelity::Compatible);
+        assert!(!good.is_unsupported());
+    }
 
     fn col(name: &str, native: &str) -> SourceColumn {
         SourceColumn::simple(name, native, true)

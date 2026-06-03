@@ -200,7 +200,13 @@ impl RivetType {
     /// gate so callers don't have to `matches!()` everywhere.
     #[allow(dead_code)]
     pub fn is_unsupported(&self) -> bool {
-        matches!(self, RivetType::Unsupported { .. })
+        match self {
+            RivetType::Unsupported { .. } => true,
+            // A list of an unsupported element is itself unsupported — the run
+            // can't build the field. Keep consistent with `derive_fidelity`.
+            RivetType::List { inner } => inner.is_unsupported(),
+            _ => false,
+        }
     }
 }
 
