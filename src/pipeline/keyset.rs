@@ -70,18 +70,17 @@ pub(crate) fn run_keyset(
 
         let mut sink = ExportSink::new(plan)?;
         src.export(
-            &source::ExportRequest {
-                query: &plan.base_query,
-                // `query` is the unwrapped base; the driver wraps it with the
-                // keyset predicate internally, so the catalog parser still sees
-                // the source table — resolve hints from `query`.
-                catalog_hint_query: None,
-                incremental: Some(&key_plan),
-                cursor: cursor.as_ref(),
-                tuning: &plan.tuning,
-                column_overrides: &plan.column_overrides,
-                page_limit: Some(kp.chunk_size),
-            },
+            // `query` is the unwrapped base; the driver wraps it with the keyset
+            // predicate internally, so the catalog parser still sees the source
+            // table and hints resolve from `query` (`unwrapped`).
+            &source::ExportRequest::unwrapped(
+                &plan.base_query,
+                &plan.tuning,
+                &plan.column_overrides,
+            )
+            .with_incremental(Some(&key_plan))
+            .with_cursor(cursor.as_ref())
+            .with_page_limit(kp.chunk_size),
             &mut sink,
         )?;
         if let Some(w) = sink.writer.take() {

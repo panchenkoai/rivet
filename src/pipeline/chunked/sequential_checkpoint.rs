@@ -60,15 +60,12 @@ fn export_one_chunk_range(
 
     let mut sink = ExportSink::new(plan)?;
     src.export(
-        &source::ExportRequest {
-            query: &chunk_query,
-            catalog_hint_query: Some(base_query),
-            incremental: None,
-            cursor: None,
-            tuning: &plan.tuning,
-            column_overrides: &plan.column_overrides,
-            page_limit: None,
-        },
+        &source::ExportRequest::wrapped(
+            &chunk_query,
+            base_query,
+            &plan.tuning,
+            &plan.column_overrides,
+        ),
         &mut sink,
     )?;
     if let Some(w) = sink.writer.take() {

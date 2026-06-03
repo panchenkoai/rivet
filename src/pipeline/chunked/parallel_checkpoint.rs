@@ -254,15 +254,12 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                 Option<super::super::commit::PartRecord>,
                             )> {
                                 thread_src.export(
-                                    &source::ExportRequest {
-                                        query: &chunk_query,
-                                        catalog_hint_query: Some(&plan_w.base_query),
-                                        incremental: None,
-                                        cursor: None,
-                                        tuning: &plan_w.tuning,
-                                        column_overrides: &plan_w.column_overrides,
-                                        page_limit: None,
-                                    },
+                                    &source::ExportRequest::wrapped(
+                                        &chunk_query,
+                                        &plan_w.base_query,
+                                        &plan_w.tuning,
+                                        &plan_w.column_overrides,
+                                    ),
                                     &mut sink,
                                 )?;
                                 if let Some(w) = sink.writer.take() {

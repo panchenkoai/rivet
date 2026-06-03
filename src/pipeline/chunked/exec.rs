@@ -95,17 +95,14 @@ pub(crate) fn run_chunked_sequential(
 
         let mut sink = ExportSink::new(plan)?;
         src.export(
-            &source::ExportRequest {
-                query: &chunk_query,
-                // `chunk_query` wraps the base in a subquery → resolve NUMERIC
-                // catalog hints from the unwrapped base instead.
-                catalog_hint_query: Some(&plan.base_query),
-                incremental: None,
-                cursor: None,
-                tuning: &plan.tuning,
-                column_overrides: &plan.column_overrides,
-                page_limit: None,
-            },
+            // `chunk_query` wraps the base in a subquery → resolve NUMERIC
+            // catalog hints from the unwrapped base (`wrapped`).
+            &source::ExportRequest::wrapped(
+                &chunk_query,
+                &plan.base_query,
+                &plan.tuning,
+                &plan.column_overrides,
+            ),
             &mut sink,
         )?;
         if let Some(w) = sink.writer.take() {
@@ -390,15 +387,12 @@ pub(crate) fn run_chunked_parallel(
                     let mut thread_src = source::create_source(&plan_for_worker.source)?;
                     let mut sink = ExportSink::new(&plan_for_worker)?;
                     thread_src.export(
-                        &source::ExportRequest {
-                            query: &chunk_query,
-                            catalog_hint_query: Some(&plan_for_worker.base_query),
-                            incremental: None,
-                            cursor: None,
-                            tuning: &plan_for_worker.tuning,
-                            column_overrides: &plan_for_worker.column_overrides,
-                            page_limit: None,
-                        },
+                        &source::ExportRequest::wrapped(
+                            &chunk_query,
+                            &plan_for_worker.base_query,
+                            &plan_for_worker.tuning,
+                            &plan_for_worker.column_overrides,
+                        ),
                         &mut sink,
                     )?;
                     if let Some(w) = sink.writer.take() {
