@@ -52,9 +52,11 @@ Two-seam split keyed on the parallel-engine fork:
 - `commit::record_part(plan, summary, state, &PartRecord, kind) -> ()` —
   ADR-0001 I2 fault hook + counters (`bytes_written`,
   `files_produced`, `files_committed`) + ADR-0012 M1
-  `manifest_parts.push` + `RunEvent::FileWritten` / `ChunkCompleted` /
-  `KeysetPageWritten` journal (variant chosen by `PartKind`) + ADR-0001
-  I7 `state.record_file` (warn-on-fail) + I3 fault hook. **Parent-only**:
+  `manifest_parts.push` + journal event (variant chosen by `PartKind`:
+  `RunEvent::FileWritten` for `File`, `RunEvent::ChunkCompleted` for
+  `Chunk`; `Page` reuses `ChunkCompleted` for journal-on-disk
+  back-compat — there is no separate `KeysetPageWritten` variant) +
+  ADR-0001 I7 `state.record_file` (warn-on-fail) + I3 fault hook. **Parent-only**:
   touches `&mut summary` and `Option<&StateStore>`.
 
 Sequential runners call both inline per part; the parallel engine
