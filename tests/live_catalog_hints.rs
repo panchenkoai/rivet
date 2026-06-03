@@ -457,3 +457,37 @@ exports:
         String::from_utf8_lossy(&out.stderr),
     );
 }
+
+/// Same regression for `time_window` mode: its `resolve_query` wraps the base in
+/// a `SELECT * FROM (base) WHERE <ts> BETWEEN …` subquery (single-query path),
+/// which — like chunked — hides the source table from the NUMERIC catalog-hint
+/// parser. The fix resolves hints from `plan.base_query` in the single runner.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn time_window_resolves_numeric_via_base_catalog_hint() {
+    require_alive(LiveService::Postgres);
+    let tbl = seed_pg_numeric_table(40);
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let yaml = format!(
+        r#"source: {{type: postgres, url: "{POSTGRES_URL}"}}
+exports:
+  - name: {name}
+    query: "SELECT id, amount, created_at FROM {name}"
+    mode: time_window
+    time_column: created_at
+    days_window: 1
+    format: parquet
+    destination: {{type: local, path: {out}}}
+"#,
+        name = tbl.name(),
+        out = tmp.path().join("o").display(),
+    );
+    let cfg = write_config(&tmp, &yaml);
+    let out = run_rivet(&["run", "-c", cfg.to_str().unwrap(), "--export", tbl.name()]);
+    assert!(
+        out.status.success(),
+        "time_window export with an undeclared NUMERIC must resolve via the \
+         base-query catalog hint (no override); stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+}

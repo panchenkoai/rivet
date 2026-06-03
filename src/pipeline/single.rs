@@ -207,7 +207,12 @@ pub(super) fn run_single_export(
 ) -> Result<()> {
     let request = source::ExportRequest {
         query,
-        catalog_hint_query: None, // `query` is already the unwrapped base
+        // Resolve catalog hints from the unwrapped base. For Snapshot/Incremental
+        // `query == base_query` (the incremental predicate is applied inside the
+        // driver), so this is a no-op; for TimeWindow `resolve_query` wraps the
+        // base in a `SELECT * FROM (base) WHERE <ts> BETWEEN …` subquery that
+        // hides the source table, so the base is needed to resolve PG NUMERIC.
+        catalog_hint_query: Some(&plan.base_query),
         incremental: plan.strategy.incremental_plan(),
         cursor,
         tuning: &plan.tuning,
