@@ -318,8 +318,10 @@ Rivet exports the WKT text as a `Utf8` (string) column. Downstream tools (DuckDB
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `chunk_column` | string | **yes** | — | Numeric or date/timestamp column to partition by |
-| `chunk_size` | integer | no | `100000` | Rows per chunk (numeric mode). Ignored when `chunk_count` is set. |
+| `chunk_column` | string | yes* | — | Numeric or date/timestamp column to partition by. *Required unless `chunk_by_key` is set (mutually exclusive). |
+| `chunk_by_key` | string | yes* | — | Single index-backed UNIQUE NOT NULL column for **keyset (seek)** pagination — the source-safe shape for tables with no single-integer PK (UUID / string / composite). Requires the `table:` shortcut; mutually exclusive with `chunk_column`. See [chunked modes](../modes/chunked.md) and [ADR-0020](../adr/0020-pg-uuid-pk-chunking-asymmetry.md). |
+| `chunk_size` | integer | no | `100000` | Rows per chunk (numeric mode), or page size for keyset. Ignored when `chunk_count` is set. |
+| `chunk_size_memory_mb` | integer | no | — | Target memory budget per chunk in MB; `chunk_size` is derived from a `pg_class` row-size estimate (`pg_relation_size / reltuples`), clamped to `[10000, 5000000]` rows. **PostgreSQL only**, requires the `table:` shortcut, mutually exclusive with an explicit non-default `chunk_size:`. |
 | `chunk_count` | integer | no | — | Divide the column range into exactly this many equal chunks. `chunk_size` is computed dynamically from `min`/`max`. Must be ≥ 1. Mutually exclusive with `chunk_dense` and `chunk_by_days`. |
 | `chunk_by_days` | integer | no | — | Enable date chunking: window size in days. Mutually exclusive with `chunk_dense` and `chunk_count`. |
 | `parallel` | integer | no | `1` | Concurrent chunk workers |
