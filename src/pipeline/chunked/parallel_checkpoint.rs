@@ -254,14 +254,12 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                 Option<super::super::commit::PartRecord>,
                             )> {
                                 thread_src.export(
-                                    &source::ExportRequest {
-                                        query: &chunk_query,
-                                        incremental: None,
-                                        cursor: None,
-                                        tuning: &plan_w.tuning,
-                                        column_overrides: &plan_w.column_overrides,
-                                        page_limit: None,
-                                    },
+                                    &source::ExportRequest::wrapped(
+                                        &chunk_query,
+                                        &plan_w.base_query,
+                                        &plan_w.tuning,
+                                        &plan_w.column_overrides,
+                                    ),
                                     &mut sink,
                                 )?;
                                 if let Some(w) = sink.writer.take() {
@@ -291,12 +289,10 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                     plan_w.compression_level,
                                     None,
                                 );
-                                let file_name = format!(
-                                    "{}_{}_chunk{}.{}",
-                                    plan_w.export_name,
-                                    chrono::Utc::now().format("%Y%m%d_%H%M%S"),
+                                let file_name = super::chunk_part_filename(
+                                    &plan_w.export_name,
                                     chunk_index,
-                                    fmt.file_extension()
+                                    fmt.file_extension(),
                                 );
                                 // Worker-safe half of commit (I1 + dest.write
                                 // + fingerprint). The parent drains the

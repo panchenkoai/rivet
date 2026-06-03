@@ -37,8 +37,8 @@ Responsible for: running the resolved plan. Reads source data, writes destinatio
 | Module | Responsibility |
 |--------|---------------|
 | `pipeline/single.rs` | Single-query export (Snapshot, Incremental, TimeWindow) |
-| `pipeline/chunked.rs` | Chunked export: sequential, parallel-simple, parallel-checkpoint |
-| `pipeline/sink.rs` | Local temp-file write path; inline quality checks |
+| `pipeline/chunked/` | Chunked export: sequential, parallel-simple, parallel-checkpoint (`exec.rs`, `sequential_checkpoint.rs`, `parallel_checkpoint.rs`, `resume_m8.rs`, …) |
+| `pipeline/sink/` | Local temp-file write path; inline quality checks (`mod.rs`, `cursor.rs`, `pipelined.rs`) |
 | `pipeline/retry.rs` | Error classification for retry decisions |
 | `pipeline/validate.rs` | Post-write row-count verification |
 | `source/` | DB connection and Arrow batch extraction |

@@ -364,3 +364,83 @@ exports:
         "--resume on full-mode export must produce a diagnostic; stderr:\n{stderr}"
     );
 }
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn chunked_resume_force_overrides_success_gate() {
+    // ADR-0013 / ADR-0012 M8: `--resume` against a completed run (`_SUCCESS`
+    // present) refuses; `--resume --force` overrides the gate and proceeds. The
+    // refuse direction is `chunked_resume_with_completed_run_gives_actionable_message`;
+    // this pins the override — the previously-untested direction of `--force`.
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(20);
+    let export_name = unique_name("qa12_resume_force");
+    let out = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        r#"
+source: {{type: postgres, url: "{POSTGRES_URL}"}}
+exports:
+  - name: {export_name}
+    query: "SELECT id, name FROM {table_name}"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 5
+    chunk_checkpoint: true
+    format: parquet
+    destination: {{type: local, path: {dir}}}
+"#,
+        table_name = table.name(),
+        dir = out.path().display()
+    );
+    let (_cfgdir, cfg) = cfg_dir_with(&yaml);
+
+    // Run to completion → `_SUCCESS` written, every chunk completed.
+    let first = run_rivet_export(&cfg, &export_name);
+    assert!(
+        first.status.success(),
+        "initial chunked run must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    // Plain `--resume` is refused by the `_SUCCESS` gate (the prefix already
+    // has a `_SUCCESS` marker from the completed run).
+    let refused = run_rivet(&[
+        "run",
+        "--config",
+        cfg.to_str().unwrap(),
+        "--export",
+        &export_name,
+        "--resume",
+    ]);
+    assert!(!refused.status.success(), "plain --resume must refuse");
+    let refused_err = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        refused_err.contains("_SUCCESS"),
+        "plain --resume must be refused *by the _SUCCESS gate*; stderr:\n{refused_err}"
+    );
+
+    // `--force` overrides that gate. We prove the override by the failure
+    // *reason changing*: with `--force` the run gets PAST the `_SUCCESS` gate
+    // (no `_SUCCESS` refusal) and only then hits the legitimate "nothing
+    // in-progress to resume" state of a cleanly-completed run. (A success
+    // outcome isn't reachable here precisely because a completed run has no
+    // outstanding chunks — that is a different, correct refusal, not the gate.)
+    let forced = run_rivet(&[
+        "run",
+        "--config",
+        cfg.to_str().unwrap(),
+        "--export",
+        &export_name,
+        "--resume",
+        "--force",
+    ]);
+    let forced_err = String::from_utf8_lossy(&forced.stderr);
+    assert!(
+        !forced_err.contains("_SUCCESS"),
+        "--force must bypass the _SUCCESS gate (no _SUCCESS refusal expected); stderr:\n{forced_err}"
+    );
+    assert!(
+        forced_err.contains("in-progress") || forced_err.contains("reset-chunks"),
+        "--force should reach the real 'nothing to resume' state past the gate; stderr:\n{forced_err}"
+    );
+}

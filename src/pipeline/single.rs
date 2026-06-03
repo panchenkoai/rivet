@@ -205,14 +205,20 @@ pub(super) fn run_single_export(
     state: Option<&StateStore>,
     summary: &mut RunSummary,
 ) -> Result<()> {
-    let request = source::ExportRequest {
+    // Resolve catalog hints from the unwrapped base. For Snapshot/Incremental
+    // `query == base_query` (the incremental predicate is applied inside the
+    // driver); for TimeWindow `resolve_query` wraps the base in a
+    // `SELECT * FROM (base) WHERE <ts> BETWEEN …` subquery that hides the source
+    // table, so the base is needed to resolve PG NUMERIC. Passing it through
+    // `wrapped` is correct for both (no-op when query == base).
+    let request = source::ExportRequest::wrapped(
         query,
-        incremental: plan.strategy.incremental_plan(),
-        cursor,
-        tuning: &plan.tuning,
-        column_overrides: &plan.column_overrides,
-        page_limit: None,
-    };
+        &plan.base_query,
+        &plan.tuning,
+        &plan.column_overrides,
+    )
+    .with_incremental(plan.strategy.incremental_plan())
+    .with_cursor(cursor);
 
     // Pipelined path (experimental, `RIVET_PIPELINE_WRITES`): the source thread
     // only fetches + converts; a worker thread owns the ExportSink and does the

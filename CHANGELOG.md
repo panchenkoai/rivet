@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.8.1 (2026-06-03) — Check↔Run Consistency + Trust-Gate Fixes
+
+> A correctness pass over the export pipeline: wherever `check` (or a contract,
+> or a doc) promised one thing and `run` did another, they now agree. Every fix
+> was reproduced on live PostgreSQL/MySQL + DuckDB/ClickHouse/BigQuery and is
+> closed by a test. Plus a full reality-check of the ADRs and the CLI/config
+> references against the code.
+>
+> **Two operator-visible behaviour changes** (both fixes restoring the intended
+> contract): `rivet reconcile` now **exits non-zero on a detected mismatch** (an
+> `unknown` partition warns but does not fail) so CI/orchestrators can gate on
+> it, and `run --reconcile` again **implies `--validate`** (ADR-0013). Everything
+> else is additive or internal.
+
+### Correctness — `check` ↔ `run`
+
+- **`fix(chunked)`** — chunked / dense / keyset exports of a PostgreSQL
+  `NUMERIC(p,s)` column now resolve precision/scale correctly. These modes wrap
+  the query in `SELECT * FROM (base) WHERE …`, which hid the source table from
+  the catalog-hint parser (PG omits NUMERIC precision from the wire), so the
+  driver now resolves hints from the unwrapped base query.
+- **`fix(time_window)`** — same NUMERIC resolution for `time_window` (its
+  `resolve_query` wraps too).
+- **`fix(types)`** — a list of an unsupported element type is itself reported
+  `Unsupported` in `check`, matching what `run` does — no more `numeric[]`
+  showing "compatible" in preflight then failing the run.
+- **`fix(check)`** — `check --type-report --strict` is now CSV-format-aware: a
+  column CSV cannot serialize (e.g. `int[]`) is flagged at preflight using the
+  exact predicate the CSV writer uses, instead of being called safe and then
+  failing the run.
+
+### Trust & exit codes
+
+- **`fix(reconcile)`** — `reconcile` exits non-zero on a detected mismatch (the
+  audit gate now gates; `unknown` warns).
+- **`fix(run)`** — `--reconcile` implies `--validate` again (ADR-0013
+  subsumption restored).
+- **`fix(repair)`** — collision-proof chunk filenames (random nonce) so a
+  `repair --execute` re-export can never overwrite the original part on a
+  sub-second filename collision.
+
+### Docs & `--help`
+
+- **`docs(adr)`** — reality-checked all 20 ADRs against the code. Fixed real
+  drift: ADR-0012 (an in-code comment claimed M9 quarantine-move "not wired"
+  while the file implements and calls it), ADR-0002 (module-visibility table
+  out of sync with `lib.rs`), ADR-0014 (`uuid` listed as Arrow `Utf8`; it is
+  `FixedSizeBinary(16)` + `arrow.uuid` / native `LogicalType::Uuid`).
+- **`docs(reference)`** — documented the `validate` and `schema` subcommands and
+  `run --force`; added the `chunk_by_key` and `chunk_size_memory_mb` config
+  fields.
+- **`docs(cli)`** — `rivet --help` now states that `run --reconcile` implies
+  `--validate` and that `reconcile` exits non-zero on mismatch.
+
+### Internal
+
+- **`refactor(source)`** — `ExportRequest::{unwrapped, wrapped}` constructors
+  replace hand-written struct literals across the runners; a query-wrapping
+  runner must supply the unwrapped base, so the NUMERIC-hint regression cannot
+  silently return.
+- **`test(governor)`** — the deadlock-when-chunks-fail regression now forces the
+  failure at the destination-write stage (chunked `NUMERIC(p,s)` resolves and
+  succeeds now, so the old "numeric has no safe mapping" premise no longer
+  fails any chunk).
+
 ## 0.8.0 (2026-06-01) — Type-Support Resolver + No-Download Content Integrity
 
 > Two arcs. **Type support** gains a per-target type resolver (DuckDB,

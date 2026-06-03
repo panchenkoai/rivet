@@ -6,12 +6,12 @@
 
 use serde::Serialize;
 
-use crate::config::{Config, ExportConfig, SourceType};
+use crate::config::{Config, ExportConfig, FormatType, SourceType};
 use crate::error::Result;
 use crate::source;
 use crate::types::{
     ColumnOverrides, TypeFidelity,
-    policy::{PolicyViolation, TypePolicy},
+    policy::{PolicyAction, PolicyViolation, TypePolicy},
     target::{ExportTarget, TargetInput, TargetStatus},
 };
 
@@ -94,7 +94,33 @@ pub fn collect_report(
     };
 
     let mappings = src.type_mappings(&query, column_overrides)?;
-    let violations = policy.validate(&mappings);
+    let mut violations = policy.validate(&mappings);
+
+    // Format-awareness: type resolution above is for the Parquet representation,
+    // but a CSV export rejects columns CSV can't serialize (lists, etc.) up front
+    // at writer creation. Surface those here so `check`/`--strict` agree with the
+    // run — otherwise a list column reports "safe" only for the CSV run to fail
+    // loud ("CSV cannot serialize column …"). Fatality follows the unsupported
+    // policy action (Fail under `--strict`, Warn otherwise).
+    if export.format == FormatType::Csv {
+        let fatal = policy.on_unsupported_type == PolicyAction::Fail;
+        for m in &mappings {
+            if let Some(dt) = m.arrow_type.as_ref()
+                && !crate::format::csv::csv_serializable(dt)
+            {
+                violations.push(PolicyViolation {
+                    column_name: m.column_name.clone(),
+                    fidelity: TypeFidelity::Unsupported,
+                    message: format!(
+                        "column '{}' (Arrow {dt:?}) cannot be serialized to CSV — \
+                         use `format: parquet` or drop it from the query",
+                        m.column_name
+                    ),
+                    fatal,
+                });
+            }
+        }
+    }
 
     let mut target_failures = false;
     let rows = mappings

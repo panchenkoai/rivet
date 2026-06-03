@@ -37,6 +37,7 @@ rivet run --config <PATH> [OPTIONS]
 | `--validate` | | bool | Validate output file row count after writing |
 | `--reconcile` | | bool | Run `COUNT(*)` on source query and compare with exported rows |
 | `--resume` | | bool | Resume an in-progress chunked export. Exits non-zero with an actionable message if no in-progress checkpoint exists — run without `--resume` to start fresh, or `rivet state reset-chunks` to clear a stuck run |
+| `--force` | | bool | Override safety gates that would otherwise refuse the run. Today: with `--resume`, allows starting against a destination prefix whose `_SUCCESS` marker is already present (ADR-0012 M8). Without it, resume against a complete run refuses so an operator cannot accidentally re-export over a verified dataset |
 | `--parallel-exports` | | bool | Run all exports concurrently (ignored with `--export`) |
 | `--parallel-export-processes` | | bool | Run each export as a separate child process |
 | `--summary-output` | | PATH | Write run aggregate to this file as JSON |
@@ -274,6 +275,40 @@ rivet apply plan.json --force
 `rivet apply` opens `.rivet_state.db` from the directory containing the plan file. Place the plan file alongside the config file, or in the same directory, to ensure the correct state database is used.
 
 ---
+
+## `rivet validate`
+
+Re-run manifest-aware verification against an existing destination — **no extraction**.
+
+```bash
+rivet validate --config <PATH> [OPTIONS]
+```
+
+The same M5/M6 checks `rivet run --validate` performs at end-of-run, exposed as a standalone command for between-run polling and triage. Reads `manifest.json` + `_SUCCESS` at the destination and head-checks every committed part for presence and recorded `size_bytes`. The **source is not queried** (use `rivet reconcile` for that). See [ADR-0013](../adr/0013-trust-flag-contract.md) §"Subcommand carveouts" and [ADR-0012](../adr/0012-cloud-manifest-contract.md) M5/M6.
+
+By default `validate` resolves the destination prefix the same way `run` does (`{date}` becomes today's UTC date). Use `--date`, `--run-id`, or `--prefix` to point at a prior run instead.
+
+| Flag | Short | Type | Description |
+|------|-------|------|-------------|
+| `--config` | `-c` | string | Path to YAML config file **(required)** |
+| `--export` | `-e` | string | Validate only a specific export by name |
+| `--format` | | string | Override the format used to resolve the part layout |
+| `--output` | `-o` | PATH | Write the verification report to this file as JSON |
+| `--date` | | YYYY-MM-DD | Resolve `{date}` to this date instead of today (UTC) |
+| `--run-id` | | string | Point at a prior run's prefix by run id |
+| `--prefix` | | string | Point at an explicit destination prefix |
+
+Exits non-zero when the manifest references a part that is missing or whose size does not match. A legacy prefix (no manifest) falls back to the M6 reduced-guarantee path and is labelled `legacy_run: true`.
+
+### Examples
+
+```bash
+# Verify today's run at the configured destination
+rivet validate -c my_export.yaml
+
+# Verify a prior run by id, JSON report to a file
+rivet validate -c my_export.yaml --run-id orders_20260521T120000 -o verdict.json
+```
 
 ## `rivet reconcile`
 
@@ -687,6 +722,22 @@ rivet completions <SHELL>
 | PowerShell | `rivet completions powershell > _rivet.ps1` |
 
 ---
+
+## `rivet schema`
+
+Emit machine-readable schemas for Rivet's data contracts.
+
+```bash
+rivet schema config
+```
+
+Today `rivet schema config` prints the JSON Schema for the `rivet.yaml` config to stdout. The schema is generated from the running binary's Rust types, so it always matches the config grammar this version accepts. Pipe it to a file and reference it via a `# yaml-language-server: $schema=…` header so VS Code / Neovim's YAML language server highlights invalid keys, suggests enum values, and surfaces required fields as you edit:
+
+```bash
+rivet schema config > rivet.schema.json
+# then, at the top of rivet.yaml:
+# yaml-language-server: $schema=./rivet.schema.json
+```
 
 ## State backend
 

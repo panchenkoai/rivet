@@ -36,7 +36,13 @@ Add a `capabilities()` method to the `Destination` trait so each backend declare
 | `LocalDestination` | `Atomic` | `true` | `false` | `true` |
 | `S3Destination` | `FinalizeOnClose` | `true` | `true` | `false` |
 | `GcsDestination` | `FinalizeOnClose` | `true` | `true` | `false` |
+| `AzureDestination` | `FinalizeOnClose` | `true` | `true` | `false` |
 | `StdoutDestination` | `Streaming` | `false` | `false` | `true` |
+
+`S3Destination` / `GcsDestination` / `AzureDestination` are all type aliases for
+`CloudDestination<B>` (`src/destination/{s3,gcs,azure}.rs`); they share one
+`capabilities()` body in `cloud.rs`, so the three cloud rows are identical by
+construction, not by coincidence.
 
 ### `WriteCommitProtocol` semantics
 

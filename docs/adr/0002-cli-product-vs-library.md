@@ -33,25 +33,35 @@ Rust's integration tests (`tests/` directory) must link against a library target
 
 ## Module Visibility Rules
 
+Reflects `src/lib.rs` as of v0.8.0. `pub` modules are reachable cross-crate
+**only** so `tests/*.rs` (and the in-crate MCP surface) can link them — none
+carry a stability guarantee (see Consequences #1). `pub` here means "the test
+harness needs it", not "public API".
+
 | Module | `lib.rs` visibility | Reason |
 |--------|--------------------|----|
 | `config` | `pub` | Integration tests import config types (`Config`, `ExportMode`, …) |
+| `error` | `pub` | `Result` alias surfaced for the test harness |
 | `format` | `pub` | Integration tests validate format output (`CsvFormat`, `ParquetFormat`, …) |
+| `journal` | `pub` | `RunJournal` event log — trust-contract type asserted in tests |
+| `manifest` | `pub` | `RunManifest` wire schema (ADR-0012) — asserted in trust-artifact tests |
 | `pipeline` | `pub` | Integration tests call pipeline functions (`generate_chunks`, `classify_error`, …) |
+| `preflight` | `pub` | Integration tests exercise diagnostics / type-report |
 | `resource` | `pub` | Integration tests verify memory utilities (`get_rss_mb`, `check_memory`, …) |
+| `source` | `pub` | Live integration tests construct `ExportRequest` / introspection directly |
 | `state` | `pub` | Integration tests verify state invariants (`StateStore`, `SchemaColumn`) |
-| `destination` | `pub(crate)` | Internal pipeline module — not tested cross-crate |
+| `tuning` | `pub` | Governor / adaptive tuning tests link it (ADR-0019) |
+| `types` | `pub` | Type-roundtrip tests assert `RivetType` / fidelity mappings (ADR-0014) |
+| `mcp` | `pub` | In-crate MCP server surface (code-review-graph integration) |
+| `redact` | `pub` | Cross-cutting credential-redaction helper, asserted in tests |
+| `destination_for_tests` | `pub` | Thin test-only shim over the `pub(crate)` `destination` module |
+| `destination` | `pub(crate)` | Internal write backends — exercised via `destination_for_tests` |
 | `enrich` | `pub(crate)` | Internal pipeline module |
-| `error` | `pub(crate)` | Internal error type — tests use `.unwrap()`, not the type |
 | `notify` | `pub(crate)` | Internal notification module |
 | `plan` | `pub(crate)` | Internal execution contract — consumed by pipeline, not by tests |
-| `preflight` | `pub(crate)` | Internal preflight checks |
 | `quality` | `pub(crate)` | Internal quality gate |
-| `resource` | `pub(crate)` | Internal resource measurement |
-| `source` | `pub(crate)` | Internal source connector |
 | `sql` | `pub(crate)` | SQL identifier quoting (`quote_ident`) — internal utility, not a product surface |
-| `tuning` | `pub(crate)` | Internal tuning profiles |
-| `types` | `pub(crate)` | Internal shared types |
+| `test_hook` | `pub(crate)` | Internal fault-injection points for tests |
 
 ---
 

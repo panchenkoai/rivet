@@ -14,15 +14,24 @@
 //! that is exactly what the existing chunk_checkpoint resume already
 //! does (skip completed tasks).
 //!
+//! **M9 quarantine (wired):** for each `Quarantine` decision — a manifest
+//! part whose destination object diverged on size/fingerprint, or an
+//! untracked surplus object under the prefix — this layer resets the
+//! `chunk_task` to `pending` AND moves the offending object to
+//! `_quarantine/<run_id>/<original-key>` via `quarantine_move` →
+//! `Destination::r#move` (copy+delete on S3/GCS, `rename` on local).  The
+//! move is **best-effort** (ADR-0012 M9): a failure is counted in
+//! `M8ResumeStats.quarantine_move_failures`, escalated to a WARN, and never
+//! aborts the resume.  Successful moves land in `quarantined_moved`.
+//!
 //! **What this layer does not do:**
-//! - It does NOT physically move quarantined parts.  ADR-0012 M9
-//!   (`_quarantine/` move) is Phase C-δ, slotted as the next-step.
-//!   This module records the intent (state row reset to pending,
-//!   `last_error` annotated with the M8 reason); the actual move
-//!   lands on top.
-//! - It does NOT delete the on-destination part.  The next worker run
-//!   will overwrite it via `dest.write` — `Atomic` and `FinalizeOnClose`
-//!   backends both support clean replacement (ADR-0004).
+//! - It never *deletes* an unknown object outright (M9 §"never deletes
+//!   unknown objects").  Quarantine is a move; a failed move leaves the
+//!   object in place to re-trip M9 on the next resume.
+//! - For a `Rewrite` decision (manifest part lost at the destination) it
+//!   does NOT pre-clean the slot: the next worker run overwrites it via
+//!   `dest.write` — `Atomic` and `FinalizeOnClose` backends both support
+//!   clean replacement (ADR-0004).
 //!
 //! Behaviour with no manifest at destination (fresh prefix or pre-0.7.0
 //! legacy run): no-op.  The runner falls back to the existing
@@ -371,6 +380,90 @@ mod tests {
         assert_eq!(s.reset_for_rewrite, 0);
         assert_eq!(s.reset_for_quarantine, 0);
         assert_eq!(s.orphan_parts, 0);
+    }
+
+    /// ADR-0012 M9 — `quarantine_move` is best-effort at the executor
+    /// site: a successful `Destination::move` lands the object under
+    /// `_quarantine/<run_id>/` and bumps `quarantined_moved`; a failing
+    /// move is swallowed into `quarantine_move_failures` and never panics
+    /// or bails ("never bail on a quarantine failure").  The decision
+    /// matrix that *produces* the Quarantine verdict is covered in
+    /// `trust_artifacts_integration` §27; this pins the move half.
+    #[test]
+    fn quarantine_move_is_best_effort_on_success_and_failure() {
+        use crate::destination::{
+            Destination, DestinationCapabilities, WriteCommitProtocol, WriteOutcome,
+        };
+        use std::path::Path;
+        use std::sync::Mutex;
+
+        struct MoveMock {
+            fail: bool,
+            calls: Mutex<Vec<(String, String)>>,
+        }
+        impl Destination for MoveMock {
+            fn write(&self, _p: &Path, _k: &str) -> Result<WriteOutcome> {
+                unreachable!("quarantine_move must never call write")
+            }
+            fn capabilities(&self) -> DestinationCapabilities {
+                DestinationCapabilities {
+                    commit_protocol: WriteCommitProtocol::Atomic,
+                    idempotent_overwrite: true,
+                    retry_safe: false,
+                    partial_write_risk: true,
+                }
+            }
+            fn r#move(&self, from: &str, to: &str) -> Result<()> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((from.to_string(), to.to_string()));
+                if self.fail {
+                    anyhow::bail!("simulated move failure")
+                }
+                Ok(())
+            }
+        }
+
+        // Success: moved under `_quarantine/<run_id>/`, credited as moved.
+        let ok = MoveMock {
+            fail: false,
+            calls: Mutex::new(Vec::new()),
+        };
+        let mut stats = M8Stats::default();
+        quarantine_move(
+            &ok,
+            "part-000003.parquet",
+            "run_xyz",
+            "public.orders",
+            &mut stats,
+        );
+        assert_eq!(stats.quarantined_moved, 1);
+        assert_eq!(stats.quarantine_move_failures, 0);
+        assert_eq!(
+            ok.calls.lock().unwrap().as_slice(),
+            &[(
+                "part-000003.parquet".to_string(),
+                format!("{QUARANTINE_PREFIX}/run_xyz/part-000003.parquet"),
+            )],
+            "successful move targets _quarantine/<run_id>/<original-key>"
+        );
+
+        // Failure: swallowed into the failure counter — no panic, no credit.
+        let bad = MoveMock {
+            fail: true,
+            calls: Mutex::new(Vec::new()),
+        };
+        let mut stats = M8Stats::default();
+        quarantine_move(
+            &bad,
+            "orphan.parquet",
+            "run_xyz",
+            "public.orders",
+            &mut stats,
+        );
+        assert_eq!(stats.quarantined_moved, 0);
+        assert_eq!(stats.quarantine_move_failures, 1);
     }
 
     /// Cross-check: the in-memory `by_file` index this module builds is

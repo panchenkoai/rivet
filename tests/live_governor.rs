@@ -264,10 +264,16 @@ exports:
 /// Regression for the governor deadlock: the worker bumps `completed` only on
 /// success, but the governor's exit condition was keyed on it — so a *failing*
 /// chunk left the governor spinning forever and `thread::scope` could never
-/// join. Here every chunk fails (a `numeric` column with no override has no
-/// safe Rivet mapping) with adaptive on + parallel>1. The run MUST terminate
-/// (with an error), not hang. Spawned under a watchdog so a regression trips
-/// the timeout instead of hanging the whole test binary.
+/// join. Here every chunk fails at the destination-write stage — the local
+/// path sits *under a regular file*, so each `dest.write` hits ENOTDIR — with
+/// adaptive on + parallel>1. The run MUST terminate (with an error), not hang.
+/// Spawned under a watchdog so a regression trips the timeout instead of
+/// hanging the whole test binary.
+///
+/// NB: the failure is forced at the write stage on purpose. The original
+/// version relied on a `NUMERIC` column having no safe mapping, but chunked
+/// `NUMERIC(p,s)` now resolves its precision from the base query (catalog-hint
+/// fix) and succeeds — so a numeric column no longer fails any chunk.
 #[test]
 #[ignore = "live: requires docker compose up -d postgres"]
 fn governor_does_not_deadlock_when_chunks_fail() {
@@ -275,6 +281,12 @@ fn governor_does_not_deadlock_when_chunks_fail() {
 
     let table = seed_pg_numeric_table(500);
     let out_dir = tempfile::tempdir().unwrap();
+    // Point the local destination *under a regular file* so every chunk's
+    // `dest.write` fails with ENOTDIR — a genuine per-chunk write failure that
+    // drives the all-chunks-fail path through the real parallel write stage.
+    let blocker = out_dir.path().join("not_a_dir");
+    std::fs::write(&blocker, b"x").expect("write blocker file");
+    let dest_path = blocker.join("sub");
     let cfg_dir = tempfile::tempdir().unwrap();
     let yaml = format!(
         r#"
@@ -297,7 +309,7 @@ exports:
       path: {out}
 "#,
         name = table.name(),
-        out = out_dir.path().display(),
+        out = dest_path.display(),
     );
     let cfg = write_config(&cfg_dir, &yaml);
 

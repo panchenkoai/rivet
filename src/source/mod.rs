@@ -94,6 +94,15 @@ pub struct ExportRequest<'a> {
     /// it with the dialect-specific incremental predicate via
     /// [`crate::source::query::build_incremental_query`] when `incremental` is set.
     pub query: &'a str,
+    /// The *unwrapped* base query to resolve catalog-dependent type hints from
+    /// (PostgreSQL `NUMERIC` precision/scale, which the wire protocol omits — the
+    /// driver parses the `FROM` clause and asks `pg_catalog`). Chunked, dense and
+    /// keyset runners wrap `query` in a `SELECT … FROM (<base>) …` subquery that
+    /// hides the source table from the catalog parser, so they pass the original
+    /// base query here. `None` ⇒ resolve from `query` (full/incremental, where it
+    /// is already the unwrapped form). Drivers that read precision from the wire
+    /// (MySQL) ignore this field.
+    pub catalog_hint_query: Option<&'a str>,
     pub incremental: Option<&'a IncrementalCursorPlan>,
     pub cursor: Option<&'a CursorState>,
     pub tuning: &'a SourceTuning,
@@ -107,6 +116,73 @@ pub struct ExportRequest<'a> {
     /// (`WHERE key > cursor ORDER BY key LIMIT n`) instead of the unbounded
     /// incremental/snapshot query. The keyset runner drives the outer loop.
     pub page_limit: Option<usize>,
+}
+
+impl<'a> ExportRequest<'a> {
+    /// A request whose `query` is already the **unwrapped base** form, so
+    /// catalog type hints resolve directly from it. Use for snapshot,
+    /// incremental and keyset runners: the driver applies any incremental /
+    /// keyset predicate internally, so the source table stays visible to the
+    /// catalog parser and `catalog_hint_query` is `None`.
+    pub fn unwrapped(
+        query: &'a str,
+        tuning: &'a SourceTuning,
+        column_overrides: &'a ColumnOverrides,
+    ) -> Self {
+        Self {
+            query,
+            catalog_hint_query: None,
+            incremental: None,
+            cursor: None,
+            tuning,
+            column_overrides,
+            page_limit: None,
+        }
+    }
+
+    /// A request whose `query` is a `SELECT … FROM (<base>) …` **wrapper** that
+    /// hides the source table (chunked / dense / time-window). `base` — the
+    /// unwrapped query catalog hints resolve from — is a required argument, so a
+    /// wrapping runner cannot silently fall back to the table-hiding wrapper and
+    /// lose PG `NUMERIC` precision (the bug the catalog-hint fix / ADR-0020
+    /// closed). Drivers that read precision from the wire (MySQL) ignore it.
+    pub fn wrapped(
+        query: &'a str,
+        base: &'a str,
+        tuning: &'a SourceTuning,
+        column_overrides: &'a ColumnOverrides,
+    ) -> Self {
+        Self {
+            query,
+            catalog_hint_query: Some(base),
+            incremental: None,
+            cursor: None,
+            tuning,
+            column_overrides,
+            page_limit: None,
+        }
+    }
+
+    /// Attach the incremental cursor plan (the driver builds the `WHERE cursor >
+    /// ? ORDER BY` predicate). Pass-through `Option` so mode-polymorphic callers
+    /// can forward `strategy.incremental_plan()` directly.
+    pub fn with_incremental(mut self, plan: Option<&'a IncrementalCursorPlan>) -> Self {
+        self.incremental = plan;
+        self
+    }
+
+    /// Attach the last committed cursor value the next run resumes after.
+    pub fn with_cursor(mut self, cursor: Option<&'a CursorState>) -> Self {
+        self.cursor = cursor;
+        self
+    }
+
+    /// Set the keyset (seek) page size — one bounded `… WHERE key > cursor ORDER
+    /// BY key LIMIT n` page instead of the unbounded query.
+    pub fn with_page_limit(mut self, page_limit: usize) -> Self {
+        self.page_limit = Some(page_limit);
+        self
+    }
 }
 
 pub trait Source: Send {

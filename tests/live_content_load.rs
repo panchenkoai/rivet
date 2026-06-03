@@ -197,7 +197,7 @@ fn pg_content_export_under_update_pressure() {
     let result = source.export(
         &ExportRequest {
             query: &format!("SELECT id, title, status, view_count, updated_at FROM content_items WHERE id <= {export_limit}"),
-            incremental: None,
+            catalog_hint_query: None,            incremental: None,
             cursor: None,
             tuning: &tuning,
             column_overrides: &ColumnOverrides::default(),
@@ -313,6 +313,7 @@ fn pg_full_content_export_max_pressure() {
     let result = source.export(
         &ExportRequest {
             query: "SELECT id, title, status, view_count, comment_count FROM content_items",
+            catalog_hint_query: None,
             incremental: None,
             cursor: None,
             tuning: &tuning,

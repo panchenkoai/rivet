@@ -95,14 +95,14 @@ pub(crate) fn run_chunked_sequential(
 
         let mut sink = ExportSink::new(plan)?;
         src.export(
-            &source::ExportRequest {
-                query: &chunk_query,
-                incremental: None,
-                cursor: None,
-                tuning: &plan.tuning,
-                column_overrides: &plan.column_overrides,
-                page_limit: None,
-            },
+            // `chunk_query` wraps the base in a subquery → resolve NUMERIC
+            // catalog hints from the unwrapped base (`wrapped`).
+            &source::ExportRequest::wrapped(
+                &chunk_query,
+                &plan.base_query,
+                &plan.tuning,
+                &plan.column_overrides,
+            ),
             &mut sink,
         )?;
         if let Some(w) = sink.writer.take() {
@@ -131,13 +131,7 @@ pub(crate) fn run_chunked_sequential(
             }
             let fmt =
                 format::create_format(plan.format, plan.compression, plan.compression_level, None);
-            let file_name = format!(
-                "{}_{}_chunk{}.{}",
-                plan.export_name,
-                chrono::Utc::now().format("%Y%m%d_%H%M%S"),
-                i,
-                fmt.file_extension()
-            );
+            let file_name = super::chunk_part_filename(&plan.export_name, i, fmt.file_extension());
             let dest = destination::create_destination(&plan.destination)?;
             // Shared commit path (I1→I2→I7 + counters + journal + fault hooks).
             // record_part journals the ChunkCompleted event with file_name=Some.
@@ -393,14 +387,12 @@ pub(crate) fn run_chunked_parallel(
                     let mut thread_src = source::create_source(&plan_for_worker.source)?;
                     let mut sink = ExportSink::new(&plan_for_worker)?;
                     thread_src.export(
-                        &source::ExportRequest {
-                            query: &chunk_query,
-                            incremental: None,
-                            cursor: None,
-                            tuning: &plan_for_worker.tuning,
-                            column_overrides: &plan_for_worker.column_overrides,
-                            page_limit: None,
-                        },
+                        &source::ExportRequest::wrapped(
+                            &chunk_query,
+                            &plan_for_worker.base_query,
+                            &plan_for_worker.tuning,
+                            &plan_for_worker.column_overrides,
+                        ),
                         &mut sink,
                     )?;
                     if let Some(w) = sink.writer.take() {
@@ -430,13 +422,8 @@ pub(crate) fn run_chunked_parallel(
                             plan_for_worker.compression_level,
                             None,
                         );
-                        let file_name = format!(
-                            "{}_{}_chunk{}.{}",
-                            export_name,
-                            chrono::Utc::now().format("%Y%m%d_%H%M%S"),
-                            i,
-                            fmt.file_extension()
-                        );
+                        let file_name =
+                            super::chunk_part_filename(export_name, i, fmt.file_extension());
                         // Worker-safe half of commit (I1 + dest.write + fingerprint).
                         // Touches no shared run state; record_part runs in the drain.
                         let rec = super::super::commit::write_part_file(

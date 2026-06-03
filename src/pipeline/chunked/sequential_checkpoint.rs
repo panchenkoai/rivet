@@ -60,14 +60,12 @@ fn export_one_chunk_range(
 
     let mut sink = ExportSink::new(plan)?;
     src.export(
-        &source::ExportRequest {
-            query: &chunk_query,
-            incremental: None,
-            cursor: None,
-            tuning: &plan.tuning,
-            column_overrides: &plan.column_overrides,
-            page_limit: None,
-        },
+        &source::ExportRequest::wrapped(
+            &chunk_query,
+            base_query,
+            &plan.tuning,
+            &plan.column_overrides,
+        ),
         &mut sink,
     )?;
     if let Some(w) = sink.writer.take() {
@@ -90,13 +88,8 @@ fn export_one_chunk_range(
     }
 
     let fmt = format::create_format(plan.format, plan.compression, plan.compression_level, None);
-    let file_name = format!(
-        "{}_{}_chunk{}.{}",
-        plan.export_name,
-        chrono::Utc::now().format("%Y%m%d_%H%M%S"),
-        chunk_index,
-        fmt.file_extension()
-    );
+    let file_name =
+        super::chunk_part_filename(&plan.export_name, chunk_index, fmt.file_extension());
     let dest = destination::create_destination(&plan.destination)?;
     // Worker-safe half of commit (I1 + dest.write + fingerprint).
     let rec = super::super::commit::write_part_file(

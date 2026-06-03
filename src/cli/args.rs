@@ -31,7 +31,9 @@ pub enum Commands {
         /// Validate output files after writing
         #[arg(long)]
         validate: bool,
-        /// Reconcile: run COUNT(*) on source query and compare with exported rows
+        /// Reconcile: run COUNT(*) on source query and compare with exported rows.
+        /// Implies `--validate` (ADR-0013): a reconcile run also performs the
+        /// end-of-run manifest verification.
         #[arg(long)]
         reconcile: bool,
         /// Resume a chunked export with `chunk_checkpoint: true` (same query/chunk_column/chunk_size)
@@ -254,6 +256,8 @@ pub enum Commands {
     },
     /// Partition/window reconciliation: re-count per-partition on source and report mismatches (Epic F).
     /// Requires a chunked export previously run with `chunk_checkpoint: true`.
+    /// Exits non-zero when a mismatch is detected, so CI / orchestrators can gate on it
+    /// (an `unknown` partition warns but does not fail).
     Reconcile {
         /// Path to YAML config file
         #[arg(short, long)]

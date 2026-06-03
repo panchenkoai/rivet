@@ -434,6 +434,109 @@ fn run_reconcile_flag_exits_zero_when_counts_match() {
 
 #[test]
 #[ignore = "live: requires docker compose postgres"]
+fn run_reconcile_reports_mismatch_when_source_grows_after_snapshot() {
+    // `run --reconcile` reconciles what it exported (a consistent source
+    // snapshot) against a *fresh* source COUNT(*). There is no deterministic
+    // single-snapshot mismatch — by construction the export and the recount read
+    // the same source moments apart — so a real mismatch is a concurrency event.
+    // We construct it deterministically: full mode holds one snapshot for the
+    // whole read; a throttle keeps the run alive while a writer inserts 50 rows
+    // *after* the snapshot opens but *before* the end-of-run recount. The export
+    // therefore sees 200 and reconcile sees 250 → MISMATCH.
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(200);
+    let out = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        r#"
+source:
+  type: postgres
+  url: "{POSTGRES_URL}"
+  tuning: {{batch_size: 10, throttle_ms: 60}}
+exports:
+  - name: {name}
+    query: "SELECT id, name FROM {name}"
+    mode: full
+    format: parquet
+    destination: {{type: local, path: {dir}}}
+"#,
+        name = table.name(),
+        dir = out.path().display()
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    // Writer: after the snapshot has opened (and while the throttled export is
+    // still running), commit 50 new rows the export's snapshot can't see.
+    let table_name = table.name().to_string();
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let mut c = pg_connect();
+        let _ = c.batch_execute(&format!(
+            "INSERT INTO {table_name} (id, name, amount) \
+             SELECT g, 'late', 1.0 FROM generate_series(201, 250) g"
+        ));
+    });
+
+    let result = run_rivet(&[
+        "run",
+        "--config",
+        cfg.to_str().unwrap(),
+        "--export",
+        table.name(),
+        "--reconcile",
+    ]);
+    let _ = writer.join();
+
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("MISMATCH"),
+        "run --reconcile must report MISMATCH when the source grew (250) past what \
+         was exported (200); stderr:\n{stderr}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn run_reconcile_implies_validate_produces_manifest_verdict() {
+    // ADR-0013: `--reconcile` *subsumes* `--validate` — a reconcile run must also
+    // produce the manifest validation verdict (M5/M6) without the operator
+    // passing `--validate`. Before the fix `plan.validate` and `plan.reconcile`
+    // were independent, so a reconcile-only run skipped validation entirely and
+    // had no `validated` verdict. A plain `rivet run` shows no `validated:` line;
+    // a `--reconcile` run must.
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(25);
+    let out = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let cfg = write_config(&cfg_dir, &simple_config(table.name(), out.path()));
+
+    let result = run_rivet(&[
+        "run",
+        "--config",
+        cfg.to_str().unwrap(),
+        "--export",
+        table.name(),
+        "--reconcile",
+    ]);
+    assert!(
+        result.status.success(),
+        "run --reconcile must succeed on a clean export; stderr:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("validated:"),
+        "ADR-0013: --reconcile must also produce the --validate verdict (a `validated:` \
+         line on the run card) without --validate; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("MATCH"),
+        "and still report the reconcile result; stderr:\n{stderr}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
 fn run_parallel_exports_flag_runs_both_exports() {
     require_alive(LiveService::Postgres);
 
@@ -2068,4 +2171,86 @@ exports:
             dir.display()
         );
     }
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn check_strict_flags_csv_unserializable_column_consistently_with_run() {
+    // Format-awareness regression: `check` resolves types for the Parquet
+    // representation, but a CSV export rejects columns CSV can't serialize
+    // (lists, …) at writer creation. Before the fix `check --strict` reported an
+    // `int[]` column safe while the CSV run failed ("CSV cannot serialize column
+    // …") — a check↔run gap. `check` must now flag it under CSV, and pass it
+    // under Parquet (proving it's format-specific).
+    require_alive(LiveService::Postgres);
+    let name = unique_name("rivet_csvarr");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {name} (id INT PRIMARY KEY, arr INT[]); INSERT INTO {name} VALUES (1, ARRAY[1,2]);"
+    ))
+    .expect("create csv-array table");
+    struct DropTable(String);
+    impl Drop for DropTable {
+        fn drop(&mut self) {
+            if let Ok(mut c) = postgres::Client::connect(POSTGRES_URL, postgres::NoTls) {
+                let _ = c.execute(&format!("DROP TABLE IF EXISTS {}", self.0), &[]);
+            }
+        }
+    }
+    let _cleanup = DropTable(name.clone());
+
+    let out = tempfile::tempdir().unwrap();
+    let mk = |fmt: &str| {
+        format!(
+            "source: {{type: postgres, url: \"{POSTGRES_URL}\"}}\n\
+             exports:\n  - {{name: {name}, query: \"SELECT id, arr FROM {name}\", \
+             mode: full, format: {fmt}, destination: {{type: local, path: {out}}}}}\n",
+            out = out.path().display()
+        )
+    };
+    let csv_dir = tempfile::tempdir().unwrap();
+    let csv_cfg = write_config(&csv_dir, &mk("csv"));
+
+    // CSV: `check --strict` flags the list column, AND the run fails the same way.
+    let chk = run_rivet(&[
+        "check",
+        "--config",
+        csv_cfg.to_str().unwrap(),
+        "--export",
+        &name,
+        "--strict",
+    ]);
+    assert!(
+        !chk.status.success(),
+        "check --strict must flag an int[] column under CSV format; stderr:\n{}",
+        String::from_utf8_lossy(&chk.stderr)
+    );
+    let run = run_rivet(&[
+        "run",
+        "--config",
+        csv_cfg.to_str().unwrap(),
+        "--export",
+        &name,
+    ]);
+    assert!(
+        !run.status.success(),
+        "the CSV run of the same export must also fail (consistency)"
+    );
+
+    // Parquet: the SAME column is fine — the flag is format-specific.
+    let pq_dir = tempfile::tempdir().unwrap();
+    let pq_cfg = write_config(&pq_dir, &mk("parquet"));
+    let chk_pq = run_rivet(&[
+        "check",
+        "--config",
+        pq_cfg.to_str().unwrap(),
+        "--export",
+        &name,
+        "--strict",
+    ]);
+    assert!(
+        chk_pq.status.success(),
+        "check --strict must pass the same int[] column under Parquet; stderr:\n{}",
+        String::from_utf8_lossy(&chk_pq.stderr)
+    );
 }
