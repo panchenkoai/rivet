@@ -91,7 +91,7 @@ Documented in [type-mapping.md](../type-mapping.md). Summary:
 | Source (examples) | Rivet | Parquet (Arrow) | Parquet metadata |
 |-------------------|-------|-----------------|------------------|
 | `json` / `jsonb` | `Json` | `Utf8` | `logical_type=json`, `fidelity=logical_string` |
-| `uuid` | `Uuid` | `Utf8` | `logical_type=uuid` |
+| `uuid` | `Uuid` | `FixedSizeBinary(16)` | `arrow.uuid` ext → native `LogicalType::Uuid`, `fidelity=exact` |
 | `numeric(p,s)` | `Decimal` | `Decimal128/256` | `fidelity=exact` |
 | `timestamptz` | `Timestamp` + UTC | `Timestamp(µs, UTC)` | `fidelity=exact` |
 | PG `enum` | `Enum` | `Utf8` | `logical_type=enum` |
@@ -138,7 +138,7 @@ Resolver **must** consider `rivet.logical_type` when physical type is `Utf8` / `
 | RivetType | DuckDB native | DuckDB autoload | BigQuery native | BQ autoload | Snowflake native | ClickHouse native |
 |-----------|---------------|-----------------|-----------------|-------------|------------------|-------------------|
 | `Json` | `JSON` | `VARCHAR` | `JSON` | `STRING` | `VARIANT` | `JSON`† |
-| `Uuid` | `UUID` | `VARCHAR` | `STRING` | `STRING` | `STRING` | `UUID` |
+| `Uuid` | `UUID` | `UUID` | `STRING` | `BYTES` ⚠ | `TEXT` | `UUID` |
 | `Enum` | `VARCHAR` | `VARCHAR` | `STRING` | `STRING` | `STRING` | `String` |
 | `Decimal(p,s)` | `DECIMAL(p,s)` | `DECIMAL(p,s)` | `NUMERIC`/`BIGNUMERIC`‡ | same | `NUMBER(p,s)` | `Decimal(p,s)` |
 | `UInt64` | `UBIGINT` | `UBIGINT`/`HUGEINT` | `INT64` ⚠ | `INT64` | `NUMBER` | `UInt64` |
