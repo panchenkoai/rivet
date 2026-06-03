@@ -46,6 +46,35 @@ pub(crate) use resume_m8::apply_m8_resume_decisions;
 pub(crate) use resume_m8::M8Stats;
 pub(crate) use sequential_checkpoint::run_chunked_sequential_checkpoint;
 
+// ─── Chunk part file naming ──────────────────────────────────────────────────
+
+/// Build a chunk output filename that is **collision-proof**.
+///
+/// A 64-bit random nonce guarantees that two writes of the same
+/// `(export, chunk_index)` never produce the same name — e.g. a `repair
+/// --execute` re-export landing in the same wall-clock second as the original
+/// run (the second-granularity timestamp alone would collide and silently
+/// overwrite), or two runs of one export within the same second to a flat
+/// prefix. The new file therefore always lands *alongside* the original and can
+/// never overwrite it — the hard guarantee behind ADR-0009 RR5 ("additive") and
+/// ADR-0012 additive parts. The UTC timestamp is kept purely for human-readable
+/// recency; uniqueness comes from the nonce, not the clock.
+pub(crate) fn chunk_part_filename(
+    export_name: &str,
+    chunk_index: impl std::fmt::Display,
+    ext: &str,
+) -> String {
+    use rand::RngExt;
+    format!(
+        "{}_{}_chunk{}_{:016x}.{}",
+        export_name,
+        chrono::Utc::now().format("%Y%m%d_%H%M%S"),
+        chunk_index,
+        rand::rng().random::<u64>(),
+        ext,
+    )
+}
+
 // ─── Chunk source selection ───────────────────────────────────────────────────
 
 /// Determines how chunk ranges are obtained at execution time.
@@ -206,6 +235,23 @@ mod tests {
     //! for this file's recovery logic; everything that touches a live
     //! `Source` is exercised by `tests/live_*.rs` instead.
     use super::*;
+
+    #[test]
+    fn chunk_part_filename_is_collision_proof_for_same_chunk() {
+        // The hard guarantee behind RR5: two writes of the same (export, chunk)
+        // — e.g. a repair re-export in the same wall-clock second as the
+        // original — must NEVER produce the same name, or the new file would
+        // overwrite the original. The nonce, not the clock, guarantees this.
+        let a = chunk_part_filename("orders", 0usize, "parquet");
+        let b = chunk_part_filename("orders", 0usize, "parquet");
+        assert_ne!(a, b, "same (export, chunk) must yield distinct filenames");
+        for n in [&a, &b] {
+            assert!(n.starts_with("orders_"), "keeps export prefix: {n}");
+            assert!(n.contains("_chunk0_"), "keeps chunk index: {n}");
+            assert!(n.ends_with(".parquet"), "keeps extension: {n}");
+        }
+    }
+
     use crate::config::{
         CompressionType, DestinationConfig, DestinationType, FormatType, SourceConfig, SourceType,
     };

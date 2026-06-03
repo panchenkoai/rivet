@@ -131,13 +131,7 @@ pub(crate) fn run_chunked_sequential(
             }
             let fmt =
                 format::create_format(plan.format, plan.compression, plan.compression_level, None);
-            let file_name = format!(
-                "{}_{}_chunk{}.{}",
-                plan.export_name,
-                chrono::Utc::now().format("%Y%m%d_%H%M%S"),
-                i,
-                fmt.file_extension()
-            );
+            let file_name = super::chunk_part_filename(&plan.export_name, i, fmt.file_extension());
             let dest = destination::create_destination(&plan.destination)?;
             // Shared commit path (I1→I2→I7 + counters + journal + fault hooks).
             // record_part journals the ChunkCompleted event with file_name=Some.
@@ -430,13 +424,8 @@ pub(crate) fn run_chunked_parallel(
                             plan_for_worker.compression_level,
                             None,
                         );
-                        let file_name = format!(
-                            "{}_{}_chunk{}.{}",
-                            export_name,
-                            chrono::Utc::now().format("%Y%m%d_%H%M%S"),
-                            i,
-                            fmt.file_extension()
-                        );
+                        let file_name =
+                            super::chunk_part_filename(export_name, i, fmt.file_extension());
                         // Worker-safe half of commit (I1 + dest.write + fingerprint).
                         // Touches no shared run state; record_part runs in the drain.
                         let rec = super::super::commit::write_part_file(

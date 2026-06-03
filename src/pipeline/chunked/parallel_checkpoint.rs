@@ -291,12 +291,10 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                     plan_w.compression_level,
                                     None,
                                 );
-                                let file_name = format!(
-                                    "{}_{}_chunk{}.{}",
-                                    plan_w.export_name,
-                                    chrono::Utc::now().format("%Y%m%d_%H%M%S"),
+                                let file_name = super::chunk_part_filename(
+                                    &plan_w.export_name,
                                     chunk_index,
-                                    fmt.file_extension()
+                                    fmt.file_extension(),
                                 );
                                 // Worker-safe half of commit (I1 + dest.write
                                 // + fingerprint). The parent drains the

@@ -90,13 +90,8 @@ fn export_one_chunk_range(
     }
 
     let fmt = format::create_format(plan.format, plan.compression, plan.compression_level, None);
-    let file_name = format!(
-        "{}_{}_chunk{}.{}",
-        plan.export_name,
-        chrono::Utc::now().format("%Y%m%d_%H%M%S"),
-        chunk_index,
-        fmt.file_extension()
-    );
+    let file_name =
+        super::chunk_part_filename(&plan.export_name, chunk_index, fmt.file_extension());
     let dest = destination::create_destination(&plan.destination)?;
     // Worker-safe half of commit (I1 + dest.write + fingerprint).
     let rec = super::super::commit::write_part_file(
