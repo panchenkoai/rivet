@@ -213,6 +213,13 @@ Both are worse than a thin subcommand.
 - M9 quarantine on resume (no new flag): ⚠️ Phase C-δ
 - Integration anchor test (`§24` in `trust_artifacts_integration`)
   pins the `rivet run` flag set; refuses any flag outside the contract.
+- `--reconcile` implies `--validate`: ✅ enforced at plan build
+  (`plan.validate = validate || reconcile` in `plan/build.rs`). Previously the
+  two flags were gated independently downstream, so `run --reconcile` ran only
+  the source-count check and skipped the M5/M6 manifest verdict — a drift from
+  the acceptance criterion above. Pinned by
+  `run_reconcile_implies_validate_produces_manifest_verdict` (a reconcile-only
+  run must produce the `validated:` verdict; a plain run must not).
 
 ---
 

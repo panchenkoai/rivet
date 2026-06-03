@@ -497,6 +497,46 @@ exports:
 
 #[test]
 #[ignore = "live: requires docker compose postgres"]
+fn run_reconcile_implies_validate_produces_manifest_verdict() {
+    // ADR-0013: `--reconcile` *subsumes* `--validate` — a reconcile run must also
+    // produce the manifest validation verdict (M5/M6) without the operator
+    // passing `--validate`. Before the fix `plan.validate` and `plan.reconcile`
+    // were independent, so a reconcile-only run skipped validation entirely and
+    // had no `validated` verdict. A plain `rivet run` shows no `validated:` line;
+    // a `--reconcile` run must.
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(25);
+    let out = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let cfg = write_config(&cfg_dir, &simple_config(table.name(), out.path()));
+
+    let result = run_rivet(&[
+        "run",
+        "--config",
+        cfg.to_str().unwrap(),
+        "--export",
+        table.name(),
+        "--reconcile",
+    ]);
+    assert!(
+        result.status.success(),
+        "run --reconcile must succeed on a clean export; stderr:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("validated:"),
+        "ADR-0013: --reconcile must also produce the --validate verdict (a `validated:` \
+         line on the run card) without --validate; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("MATCH"),
+        "and still report the reconcile result; stderr:\n{stderr}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
 fn run_parallel_exports_flag_runs_both_exports() {
     require_alive(LiveService::Postgres);
 

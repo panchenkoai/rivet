@@ -112,7 +112,13 @@ pub fn build_plan(
         quality: export.quality.clone(),
         tuning,
         tuning_profile_label,
-        validate,
+        // ADR-0013: `--reconcile` *implies* `--validate` — it must produce a
+        // verdict that subsumes everything `--validate` does (per-file row check
+        // + manifest M5/M6) and adds the source comparison. The two flags are
+        // gated independently downstream (`if plan.validate { … }` /
+        // `if plan.reconcile { … }`), so the implication lives here at plan
+        // build: a reconcile run is also a validate run.
+        validate: validate || reconcile,
         reconcile,
         resume,
         verify: export.verify,
