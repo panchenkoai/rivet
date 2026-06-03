@@ -2172,3 +2172,85 @@ exports:
         );
     }
 }
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn check_strict_flags_csv_unserializable_column_consistently_with_run() {
+    // Format-awareness regression: `check` resolves types for the Parquet
+    // representation, but a CSV export rejects columns CSV can't serialize
+    // (lists, …) at writer creation. Before the fix `check --strict` reported an
+    // `int[]` column safe while the CSV run failed ("CSV cannot serialize column
+    // …") — a check↔run gap. `check` must now flag it under CSV, and pass it
+    // under Parquet (proving it's format-specific).
+    require_alive(LiveService::Postgres);
+    let name = unique_name("rivet_csvarr");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {name} (id INT PRIMARY KEY, arr INT[]); INSERT INTO {name} VALUES (1, ARRAY[1,2]);"
+    ))
+    .expect("create csv-array table");
+    struct DropTable(String);
+    impl Drop for DropTable {
+        fn drop(&mut self) {
+            if let Ok(mut c) = postgres::Client::connect(POSTGRES_URL, postgres::NoTls) {
+                let _ = c.execute(&format!("DROP TABLE IF EXISTS {}", self.0), &[]);
+            }
+        }
+    }
+    let _cleanup = DropTable(name.clone());
+
+    let out = tempfile::tempdir().unwrap();
+    let mk = |fmt: &str| {
+        format!(
+            "source: {{type: postgres, url: \"{POSTGRES_URL}\"}}\n\
+             exports:\n  - {{name: {name}, query: \"SELECT id, arr FROM {name}\", \
+             mode: full, format: {fmt}, destination: {{type: local, path: {out}}}}}\n",
+            out = out.path().display()
+        )
+    };
+    let csv_dir = tempfile::tempdir().unwrap();
+    let csv_cfg = write_config(&csv_dir, &mk("csv"));
+
+    // CSV: `check --strict` flags the list column, AND the run fails the same way.
+    let chk = run_rivet(&[
+        "check",
+        "--config",
+        csv_cfg.to_str().unwrap(),
+        "--export",
+        &name,
+        "--strict",
+    ]);
+    assert!(
+        !chk.status.success(),
+        "check --strict must flag an int[] column under CSV format; stderr:\n{}",
+        String::from_utf8_lossy(&chk.stderr)
+    );
+    let run = run_rivet(&[
+        "run",
+        "--config",
+        csv_cfg.to_str().unwrap(),
+        "--export",
+        &name,
+    ]);
+    assert!(
+        !run.status.success(),
+        "the CSV run of the same export must also fail (consistency)"
+    );
+
+    // Parquet: the SAME column is fine — the flag is format-specific.
+    let pq_dir = tempfile::tempdir().unwrap();
+    let pq_cfg = write_config(&pq_dir, &mk("parquet"));
+    let chk_pq = run_rivet(&[
+        "check",
+        "--config",
+        pq_cfg.to_str().unwrap(),
+        "--export",
+        &name,
+        "--strict",
+    ]);
+    assert!(
+        chk_pq.status.success(),
+        "check --strict must pass the same int[] column under Parquet; stderr:\n{}",
+        String::from_utf8_lossy(&chk_pq.stderr)
+    );
+}

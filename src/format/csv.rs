@@ -87,7 +87,7 @@ impl super::FormatWriter for CsvFormatWriter {
 /// structs, maps, `Decimal256`, non-UUID fixed binary, … — has no CSV cell
 /// representation and is rejected at writer creation rather than silently
 /// emitted as an empty value.
-fn csv_serializable(dt: &DataType) -> bool {
+pub(crate) fn csv_serializable(dt: &DataType) -> bool {
     matches!(
         dt,
         DataType::Boolean
