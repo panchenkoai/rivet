@@ -49,6 +49,11 @@
 - **`refactor(test)`** — the three hand-written full-field `ExportConfig` test
   fixtures are consolidated into one `config::sample_export()`; adding a config
   field is now a single-site edit.
+- **`refactor(sql)`** — dialect-aware SQL string helpers shared across layers
+  (`parse_date_flexible`, `strip_select_star_from`, `aggregate_sql`) now live in
+  the `sql` leaf module instead of being duplicated between `pipeline::chunked`,
+  `preflight`, and `plan::partition`. Behaviour-preserving; the `table:` fast
+  path now also applies to partition min/max probes.
 
 ## 0.8.1 (2026-06-03) — Check↔Run Consistency + Trust-Gate Fixes
 

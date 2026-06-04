@@ -85,16 +85,6 @@ pub(crate) fn build_null_query(base_query: &str, col: &str, source_type: SourceT
     format!("SELECT * FROM ({base_query}) AS _rivet_part WHERE {q} IS NULL")
 }
 
-/// `SELECT <agg>({col}) FROM (base)` — `agg` is `min` or `max`, used to find the
-/// partition span. NULLs are ignored by SQL aggregates, so the span reflects
-/// only the value rows; the NULL bucket is probed separately by
-/// [`build_null_count_query`]. Parse the result with
-/// [`crate::sql::parse_date_flexible`].
-pub(crate) fn build_aggregate_query(agg: &str, base_query: &str, col: &str, source_type: SourceType) -> String {
-    let q = crate::sql::quote_ident(source_type, col);
-    format!("SELECT {agg}({q}) FROM ({base_query}) AS _rivet_mm")
-}
-
 /// `SELECT count(*) … WHERE {col} IS NULL` — non-zero ⇒ emit a NULL bucket.
 pub(crate) fn build_null_count_query(base_query: &str, col: &str, source_type: SourceType) -> String {
     let q = crate::sql::quote_ident(source_type, col);
@@ -315,17 +305,12 @@ mod tests {
     }
 
     #[test]
-    fn min_max_null_count_queries_shape() {
-        let base = "SELECT * FROM events";
-        assert_eq!(
-            build_aggregate_query("min", base, "created_at", SourceType::Postgres),
-            "SELECT min(\"created_at\") FROM (SELECT * FROM events) AS _rivet_mm"
+    fn null_count_query_filters_is_null() {
+        // min/max aggregate SQL is shared (`crate::sql::aggregate_sql`) and
+        // tested there; the NULL-count probe is partition-specific.
+        assert!(
+            build_null_count_query("SELECT * FROM events", "created_at", SourceType::Postgres)
+                .contains("WHERE \"created_at\" IS NULL")
         );
-        assert_eq!(
-            build_aggregate_query("max", base, "created_at", SourceType::Postgres),
-            "SELECT max(\"created_at\") FROM (SELECT * FROM events) AS _rivet_mm"
-        );
-        assert!(build_null_count_query(base, "created_at", SourceType::Postgres)
-            .contains("WHERE \"created_at\" IS NULL"));
     }
 }

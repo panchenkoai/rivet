@@ -24,16 +24,6 @@ fn query_wrapped_row_count(src: &mut dyn Source, base_query: &str) -> Result<i64
     parse_scalar_i64(&raw)
 }
 
-/// Same wrap-or-direct decision for `SELECT <agg>({col}) FROM …`. Used by both
-/// the integer-range and chunk_by_days paths so they share one strict-ident
-/// gate instead of duplicating the rewrite logic.
-fn aggregate_sql(agg: &str, quoted_col: &str, base_query: &str) -> String {
-    match strip_select_star_from(base_query) {
-        Some(table_ident) => format!("SELECT {agg}({quoted_col}) FROM {table_ident}"),
-        None => format!("SELECT {agg}({quoted_col}) FROM ({base_query}) AS _rivet"),
-    }
-}
-
 fn log_chunk_boundaries_list(export_name: &str, chunks: &[(i64, i64)]) {
     const HEAD: usize = 8;
     const TAIL: usize = 8;
@@ -129,11 +119,9 @@ pub(crate) fn detect_and_generate_chunks(
     chunk_by_days: Option<u32>,
     source_type: crate::config::SourceType,
 ) -> Result<Vec<(i64, i64)>> {
-    let quoted_col = crate::sql::quote_ident(source_type, chunk_column);
-
     if let Some(days_per_chunk) = chunk_by_days {
-        let min_sql = aggregate_sql("min", &quoted_col, base_query);
-        let max_sql = aggregate_sql("max", &quoted_col, base_query);
+        let min_sql = crate::sql::aggregate_sql(source_type, "min", chunk_column, base_query);
+        let max_sql = crate::sql::aggregate_sql(source_type, "max", chunk_column, base_query);
         let min_str = src.query_scalar(&min_sql)?.ok_or_else(|| {
             anyhow::anyhow!(
                 "export '{}': min({}) returned NULL — table may be empty",
@@ -203,8 +191,8 @@ pub(crate) fn detect_and_generate_chunks(
         return Ok(chunks);
     }
 
-    let min_sql = aggregate_sql("min", &quoted_col, base_query);
-    let max_sql = aggregate_sql("max", &quoted_col, base_query);
+    let min_sql = crate::sql::aggregate_sql(source_type, "min", chunk_column, base_query);
+    let max_sql = crate::sql::aggregate_sql(source_type, "max", chunk_column, base_query);
 
     let min_val = src
         .query_scalar(&min_sql)?

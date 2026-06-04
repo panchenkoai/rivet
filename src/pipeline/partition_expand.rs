@@ -106,8 +106,8 @@ fn fetch_value_span(
     base_query: &str,
     st: crate::config::SourceType,
 ) -> Result<Option<(chrono::NaiveDate, chrono::NaiveDate)>> {
-    let min_raw = src.query_scalar(&partition::build_aggregate_query("min", base_query, col, st))?;
-    let max_raw = src.query_scalar(&partition::build_aggregate_query("max", base_query, col, st))?;
+    let min_raw = src.query_scalar(&crate::sql::aggregate_sql(st, "min", col, base_query))?;
+    let max_raw = src.query_scalar(&crate::sql::aggregate_sql(st, "max", col, base_query))?;
     let (Some(min_s), Some(max_s)) = (min_raw.as_deref(), max_raw.as_deref()) else {
         return Ok(None);
     };
