@@ -17,7 +17,7 @@ use crate::error::Result;
 use crate::state::StateStore;
 
 use super::summary::RunSummary;
-use super::{aggregate, ipc, job, parallel_children, parent_ui};
+use super::{aggregate, ipc, job, parallel_children, parent_ui, partition_expand};
 
 /// Per-run configuration flags passed from the CLI to the pipeline.
 ///
@@ -110,7 +110,7 @@ pub fn run(
         .unwrap_or(Path::new("."))
         .to_path_buf();
 
-    let exports: Vec<&ExportConfig> = if let Some(name) = export_name {
+    let selected: Vec<&ExportConfig> = if let Some(name) = export_name {
         let e = config
             .exports
             .iter()
@@ -121,6 +121,24 @@ pub fn run(
         config.exports.iter().collect()
     };
 
+    // Value-based partitioning: rewrite any `partition_by` export into one
+    // concrete child export per bucket *before* the run loop. Non-partitioned
+    // exports pass through. The owned vec must outlive the borrowed `exports`
+    // view rebuilt over it, so it is declared in the enclosing scope.
+    let partitioned = partition_expand::any_partitioned(&selected);
+    let expanded_owned: Vec<ExportConfig>;
+    let exports: Vec<&ExportConfig> = if partitioned {
+        expanded_owned = partition_expand::expand_partitioned_exports(
+            &selected,
+            &config.source,
+            &config_dir,
+            params,
+        )?;
+        expanded_owned.iter().collect()
+    } else {
+        selected
+    };
+
     let opts = RunOptions {
         validate,
         reconcile,
@@ -129,10 +147,20 @@ pub fn run(
         params,
     };
 
-    let run_parallel_processes = (parallel_export_processes_cli
-        || config.parallel_export_processes)
-        && export_name.is_none()
-        && exports.len() > 1;
+    let process_mode_requested =
+        parallel_export_processes_cli || config.parallel_export_processes;
+    // Process-mode children re-exec `rivet run --export <name>` and re-load the
+    // config from disk, so they cannot see the synthesised partition child
+    // names. Force in-process execution when partitioning is active.
+    if partitioned && process_mode_requested {
+        log::warn!(
+            "partition_by: --parallel-export-processes is disabled with partitioned exports \
+             (child processes re-load the config and can't see synthesised partitions); \
+             running in-process"
+        );
+    }
+    let run_parallel_processes =
+        process_mode_requested && export_name.is_none() && exports.len() > 1 && !partitioned;
 
     let started_at = chrono::Utc::now();
 

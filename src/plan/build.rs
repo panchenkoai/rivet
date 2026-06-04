@@ -466,8 +466,8 @@ pub(crate) fn expand_destination_templates(
 mod tests {
     use super::*;
     use crate::config::{
-        CompressionType, DestinationConfig, DestinationType, FormatType, IncrementalCursorMode,
-        MetaColumns, SourceConfig, SourceType, TimeColumnType,
+        CompressionType, DestinationConfig, DestinationType, IncrementalCursorMode, SourceConfig,
+        SourceType, TimeColumnType,
     };
 
     fn minimal_source_config() -> SourceConfig {
@@ -499,50 +499,16 @@ mod tests {
     }
 
     fn minimal_export() -> ExportConfig {
+        // Baseline from the canonical test fixture; override only what these
+        // plan-build tests care about (zstd compression, ./out destination).
         ExportConfig {
-            name: "test_export".into(),
-            target: None,
-            verify: crate::config::VerifyMode::Size,
-            query: Some("SELECT 1".into()),
-            query_file: None,
-            table: None,
-            mode: ExportMode::Full,
-            cursor_column: None,
-            cursor_fallback_column: None,
-            incremental_cursor_mode: IncrementalCursorMode::SingleColumn,
-            chunk_column: None,
-            chunk_size: 100_000,
-            chunk_size_memory_mb: None,
-            chunk_count: None,
-            chunk_dense: false,
-            chunk_by_days: None,
-            chunk_by_key: None,
-            parallel: 1,
-            time_column: None,
-            time_column_type: TimeColumnType::Timestamp,
-            days_window: None,
-            format: FormatType::Parquet,
             compression: CompressionType::Zstd,
-            compression_level: None,
-            compression_profile: None,
-            skip_empty: false,
             destination: DestinationConfig {
                 destination_type: DestinationType::Local,
                 path: Some("./out".into()),
                 ..Default::default()
             },
-            meta_columns: MetaColumns::default(),
-            quality: None,
-            max_file_size: None,
-            chunk_checkpoint: false,
-            chunk_max_attempts: None,
-            tuning: None,
-            source_group: None,
-            reconcile_required: false,
-            columns: Default::default(),
-            on_schema_drift: Default::default(),
-            shape_drift_warn_factor: None,
-            parquet: None,
+            ..crate::config::sample_export("test_export")
         }
     }
 

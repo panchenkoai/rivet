@@ -18,6 +18,7 @@ mod keyset;
 mod manifest_reconcile;
 mod manifest_writer;
 mod parallel_children;
+mod partition_expand;
 pub(crate) mod parent_ui;
 mod plan_cmd;
 pub(crate) mod progress;

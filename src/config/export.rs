@@ -116,6 +116,35 @@ pub struct ExportConfig {
     #[serde(default = "default_time_column_type")]
     pub time_column_type: TimeColumnType,
     pub days_window: Option<u32>,
+
+    /// Value-based output partitioning: split this export's rows into one
+    /// destination sub-prefix per distinct bucket of this column's value
+    /// (Hive-style `col=value/` layout). The bucket width is
+    /// `partition_granularity`. Requires a `{partition}` token in
+    /// `destination.path` / `destination.prefix`.
+    ///
+    /// Orthogonal to `mode`: each partition runs the export's own mode, so
+    /// `mode: chunked` chunks *within* a day. Rows whose partition column is
+    /// NULL land in `col=__HIVE_DEFAULT_PARTITION__/` (Hive default partition)
+    /// so no row is silently dropped. Not compatible with `mode: time_window`.
+    ///
+    /// ```yaml
+    /// exports:
+    ///   - name: events
+    ///     table: events
+    ///     partition_by: created_at
+    ///     partition_granularity: day
+    ///     destination:
+    ///       type: s3
+    ///       bucket: my-bucket
+    ///       prefix: "events/{partition}/"   # → events/created_at=2023-01-01/
+    /// ```
+    #[serde(default)]
+    pub partition_by: Option<String>,
+
+    /// Bucket width for [`partition_by`](Self::partition_by). Default `day`.
+    #[serde(default)]
+    pub partition_granularity: PartitionGranularity,
     pub format: FormatType,
     #[serde(default)]
     pub compression: CompressionType,
@@ -387,10 +416,76 @@ pub enum TimeColumnType {
     Unix,
 }
 
+/// Bucket width for value-based output partitioning ([`ExportConfig::partition_by`]).
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PartitionGranularity {
+    #[default]
+    Day,
+    Month,
+    Year,
+}
+
+/// Canonical fully-populated [`ExportConfig`] for tests across the crate.
+///
+/// One place lists every field, so adding a field is a single-site edit (the
+/// compiler still flags this literal if a field is missing). Test call sites
+/// take this baseline and override only the fields they exercise, rather than
+/// hand-writing the full struct — see `plan::build` and `preflight` tests.
+#[cfg(test)]
+pub(crate) fn sample_export(name: &str) -> ExportConfig {
+    ExportConfig {
+        name: name.into(),
+        target: None,
+        verify: VerifyMode::Size,
+        query: Some("SELECT 1".into()),
+        query_file: None,
+        table: None,
+        mode: ExportMode::Full,
+        cursor_column: None,
+        cursor_fallback_column: None,
+        incremental_cursor_mode: Default::default(),
+        chunk_column: None,
+        chunk_dense: false,
+        chunk_size: 100_000,
+        chunk_size_memory_mb: None,
+        chunk_count: None,
+        chunk_by_days: None,
+        chunk_by_key: None,
+        parallel: 1,
+        time_column: None,
+        time_column_type: TimeColumnType::Timestamp,
+        days_window: None,
+        partition_by: None,
+        partition_granularity: PartitionGranularity::Day,
+        format: FormatType::Parquet,
+        compression: CompressionType::None,
+        compression_level: None,
+        compression_profile: None,
+        skip_empty: false,
+        destination: crate::config::DestinationConfig {
+            destination_type: crate::config::DestinationType::Local,
+            path: Some("/tmp".into()),
+            ..Default::default()
+        },
+        meta_columns: MetaColumns::default(),
+        quality: None,
+        max_file_size: None,
+        chunk_checkpoint: false,
+        chunk_max_attempts: None,
+        tuning: None,
+        source_group: None,
+        reconcile_required: false,
+        columns: Default::default(),
+        on_schema_drift: Default::default(),
+        shape_drift_warn_factor: None,
+        parquet: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DestinationConfig, DestinationType};
 
     // ── ExportConfig::max_file_size_bytes ───────────────────────────────────
 
@@ -433,49 +528,9 @@ mod tests {
     // top-level validator.
     fn make_export_direct(query: Option<&str>, query_file: Option<&str>) -> ExportConfig {
         ExportConfig {
-            name: "test".into(),
-            target: None,
-            verify: VerifyMode::Size,
             query: query.map(|s| s.to_string()),
             query_file: query_file.map(|s| s.to_string()),
-            table: None,
-            mode: ExportMode::Full,
-            cursor_column: None,
-            cursor_fallback_column: None,
-            incremental_cursor_mode: Default::default(),
-            chunk_column: None,
-            chunk_dense: false,
-            chunk_size: 100_000,
-            chunk_size_memory_mb: None,
-            chunk_count: None,
-            chunk_by_days: None,
-            chunk_by_key: None,
-            parallel: 1,
-            time_column: None,
-            time_column_type: TimeColumnType::Timestamp,
-            days_window: None,
-            format: FormatType::Parquet,
-            compression: CompressionType::None,
-            compression_level: None,
-            compression_profile: None,
-            skip_empty: false,
-            destination: DestinationConfig {
-                destination_type: DestinationType::Local,
-                path: Some("/tmp".into()),
-                ..Default::default()
-            },
-            meta_columns: MetaColumns::default(),
-            quality: None,
-            max_file_size: None,
-            chunk_checkpoint: false,
-            chunk_max_attempts: None,
-            tuning: None,
-            source_group: None,
-            reconcile_required: false,
-            columns: Default::default(),
-            on_schema_drift: Default::default(),
-            shape_drift_warn_factor: None,
-            parquet: None,
+            ..sample_export("test")
         }
     }
 

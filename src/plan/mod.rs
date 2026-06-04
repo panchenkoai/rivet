@@ -2,6 +2,7 @@ pub mod artifact;
 pub mod campaign;
 pub mod history;
 pub mod inputs;
+pub mod partition;
 pub mod prioritization;
 pub mod recommend;
 pub mod reconcile;

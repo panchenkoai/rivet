@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased — Value-Based Output Partitioning
+
+> **`partition_by`** splits one export's rows into one destination sub-folder
+> per value bucket of a date column — the Hive `col=value/` layout that
+> Snowflake external tables, BigQuery, Spark, DuckDB, and Athena discover
+> automatically. Verified end-to-end on live PostgreSQL.
+
+### Features
+
+- **`feat(partition)`** — new per-export `partition_by:` (+ `partition_granularity:`
+  `day` | `month` | `year`). Rivet reads the column's `[min, max]` span, expands
+  the export into one child per bucket (`WHERE col >= lo AND col < hi`,
+  half-open), and resolves a required `{partition}` destination token to
+  `col=value`. Each partition is an independent prefix with its own
+  `manifest.json` + `_SUCCESS`, so `--validate` and downstream consumers work
+  per-partition with no new machinery. Orthogonal to `mode`: `mode: chunked`
+  chunks *within* a partition. See [docs/partitioning.md](docs/partitioning.md).
+- **`feat(partition)`** — rows with a **NULL** partition value land in
+  `col=__HIVE_DEFAULT_PARTITION__/` (Hive default-partition convention) so no
+  row is silently dropped; the NULL bucket is queryable by Hive/Spark/DuckDB
+  partition discovery.
+
+### Notes
+
+- `partition_by` is rejected without a `{partition}` token in
+  `destination.path`/`prefix` (every partition would otherwise overwrite the
+  same prefix), and is not compatible with `mode: time_window`.
+- `--parallel-export-processes` is disabled while partitioning is active (child
+  processes re-load the config and can't see synthesised partitions); the run
+  executes in-process.
+- Validating every partition of an export by its parent name in one command is
+  not yet wired — point `validate --prefix` at a concrete partition prefix.
+
+### Internal
+
+- **`refactor(test)`** — the three hand-written full-field `ExportConfig` test
+  fixtures are consolidated into one `config::sample_export()`; adding a config
+  field is now a single-site edit.
+
 ## 0.8.1 (2026-06-03) — Check↔Run Consistency + Trust-Gate Fixes
 
 > A correctness pass over the export pipeline: wherever `check` (or a contract,
