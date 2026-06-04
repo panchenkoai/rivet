@@ -1,13 +1,25 @@
 #!/usr/bin/env bash
+# Pre-commit gate — mirrors the CI fmt + clippy steps (.github/workflows/ci.yml)
+# byte-for-byte, so a commit can't introduce drift that CI would later reject.
+#
+# Enable once per clone (these hooks are version-controlled under .githooks/,
+# not auto-installed):
+#
+#     git config core.hooksPath .githooks
+#
+# Bypass in an emergency with `git commit --no-verify` (CI still enforces it).
 set -euo pipefail
 
-echo "pre-commit: fmt check..."
-cargo fmt --check
+echo "pre-commit: cargo fmt --all -- --check"
+cargo fmt --all -- --check
 
-echo "pre-commit: clippy..."
-cargo clippy -- -D warnings
+echo "pre-commit: cargo clippy --all-targets -- -D warnings"
+cargo clippy --all-targets -- -D warnings
 
-echo "pre-commit: tests..."
-cargo test --all-targets --quiet
+# Best-effort knowledge-graph refresh — no-op when the tool isn't installed,
+# so this hook stays portable for contributors who don't use code-review-graph.
+if command -v code-review-graph >/dev/null 2>&1; then
+    code-review-graph update || true
+fi
 
 echo "pre-commit: ok"

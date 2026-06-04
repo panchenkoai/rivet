@@ -16,6 +16,16 @@ cargo test --all-targets       # offline tests, no database needed
 
 All three checks must pass. CI enforces them on every push and PR.
 
+To catch the fmt + clippy failures locally *before* committing, enable the
+version-controlled git hooks (once per clone):
+
+```bash
+git config core.hooksPath .githooks
+```
+
+`.githooks/pre-commit` then runs the exact CI fmt + clippy commands on every
+commit (bypass with `git commit --no-verify` in an emergency).
+
 ## Documentation governance
 
 The canonical user-facing docs live in `docs/`. Before adding or editing documentation:
