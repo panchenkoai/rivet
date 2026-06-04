@@ -69,12 +69,12 @@ fn expand_one(
 
     // Span of the value (non-NULL) rows. SQL aggregates skip NULLs, so this is
     // the value span; the NULL bucket is probed independently below.
-    let min_raw = src.query_scalar(&partition::build_min_query(&base_query, col, st))?;
-    let max_raw = src.query_scalar(&partition::build_max_query(&base_query, col, st))?;
+    let min_raw = src.query_scalar(&partition::build_aggregate_query("min", &base_query, col, st))?;
+    let max_raw = src.query_scalar(&partition::build_aggregate_query("max", &base_query, col, st))?;
 
     let mut child_count = 0usize;
     if let (Some(min_s), Some(max_s)) = (min_raw.as_deref(), max_raw.as_deref()) {
-        let min_day = partition::parse_scalar_day(min_s).ok_or_else(|| {
+        let min_day = crate::sql::parse_date_flexible(min_s).ok_or_else(|| {
             anyhow::anyhow!(
                 "export '{}': could not parse partition min '{}' from column '{}' as a date",
                 export.name,
@@ -82,7 +82,7 @@ fn expand_one(
                 col
             )
         })?;
-        let max_day = partition::parse_scalar_day(max_s).ok_or_else(|| {
+        let max_day = crate::sql::parse_date_flexible(max_s).ok_or_else(|| {
             anyhow::anyhow!(
                 "export '{}': could not parse partition max '{}' from column '{}' as a date",
                 export.name,
@@ -166,6 +166,18 @@ fn validate_partitionable(export: &ExportConfig, col: &str) -> Result<()> {
             export.name
         );
     }
+    if export.chunk_by_key.is_some() {
+        // Keyset needs the `table:` shortcut so the planner can verify the key
+        // is index-backed; partitioning rewrites the export into a `query:`
+        // subquery (the date predicate), which keyset refuses. Fail fast with a
+        // clear message instead of a per-partition keyset error.
+        anyhow::bail!(
+            "export '{}': partition_by is not compatible with chunk_by_key — keyset requires the \
+             `table:` shortcut to verify the index, but partitioning rewrites the query. Use a range \
+             `chunk_column` (dense/correlated key), a smaller `partition_granularity`, or `mode: full`.",
+            export.name
+        );
+    }
     let has_token = export
         .destination
         .path
@@ -239,6 +251,17 @@ mod tests {
         e.mode = ExportMode::TimeWindow;
         let err = validate_partitionable(&e, "created_at").unwrap_err();
         assert!(err.to_string().contains("time_window"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_chunk_by_key() {
+        // Keyset needs `table:` introspection; partitioning rewrites into a
+        // `query:` subquery, so the two cannot compose — fail fast.
+        let mut e = part_export(true);
+        e.mode = ExportMode::Chunked;
+        e.chunk_by_key = Some("id".into());
+        let err = validate_partitionable(&e, "created_at").unwrap_err();
+        assert!(err.to_string().contains("chunk_by_key"), "got: {err}");
     }
 
     #[test]

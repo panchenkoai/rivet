@@ -96,27 +96,47 @@ GROUP BY 1;
 
 ## Notes and limits
 
-- **Index the partition column.** Each bucket is a separate range scan over your
-  query. Without an index on `partition_by`, a wide span means many scans.
-- **`partition_by` + `mode: chunked` — mind `chunk_size`.** Chunking runs
-  *inside* each partition, but the chunk-key (`chunk_column`) range is taken from
-  that partition's `[min, max]` of the key, **not** its row count. When the key
-  (e.g. a global `id`) is not correlated with the partition key, a partition's
-  few rows can still span most of the key range — so a small `chunk_size`
-  explodes into one tiny file per row. Keep the default (`chunk_size: 100000`)
-  or larger, set a `chunk_size` close to the *per-partition* row count, or use
-  `chunk_dense: true` (ROW_NUMBER) when the key is sparse within a partition.
-  Row counts stay correct either way; only the file fan-out is affected.
+- **Index the partition column.** Expansion runs three probes over the base
+  query (`min`, `max`, NULL-count). Without an index on `partition_by` those are
+  up to three full scans before the first row is exported.
 - **Time zones.** Bucket bounds are emitted as `YYYY-MM-DD` literals. For a
   `TIMESTAMPTZ` column the comparison happens at the session time zone — pin it
   (e.g. MySQL `SET time_zone = '+00:00'`) when the exact day boundary matters.
 - **Not compatible with `mode: time_window`** (time_window already filters by a
   rolling window). Use `partition_by` with `full`, `chunked`, or `incremental`.
+- **Not compatible with `chunk_by_key` (keyset).** Keyset pagination needs the
+  `table:` shortcut so the planner can confirm the key is index-backed;
+  partitioning rewrites the export into a `query:` subquery, so the two can't
+  compose — Rivet rejects the combination up front.
 - **`--parallel-export-processes` is disabled** while partitioning is active
   (child processes re-load the config and can't see the synthesised partitions);
   the run executes in-process.
+- **`plan` / `check` do not expand partitions yet.** They report the *parent*
+  export as one un-partitioned job (its `{partition}` token stays literal in the
+  shown path, the row estimate is the whole span, strategy is the base mode).
+  Treat their output as the per-partition shape, not the campaign.
 - **Validating a single partition today:** point `validate` at the concrete
   prefix —
   `rivet validate --config c.yaml --export events --prefix events/created_at=2023-01-01`.
   Validating every partition of an export by its parent name in one command is
   not yet wired.
+
+## Choosing a chunking strategy per partition (large partitions)
+
+`partition_by` is orthogonal to `mode`, so each partition runs the export's mode
+*inside* itself. The right choice depends on how big a single partition is and
+whether the chunk key is dense within it. Consider a date that holds **100 M
+rows**:
+
+| Setup | Source load | Use when |
+|-------|-------------|----------|
+| `mode: chunked`, range `chunk_column`, key **dense/correlated** within the partition (e.g. the day ≈ the whole table) | One logical pass: `ceil(key_span / chunk_size)` indexed range scans, bounded memory. **Good.** | The common big-partition case. Keep `chunk_size` ≈ 100 k+. |
+| `mode: chunked`, range `chunk_column`, key **sparse** within the partition (rows interleaved with other days across the key range) | Chunk windows are computed over the partition's `[min,max]` of the key, **not** its row count → many windows read key-range rows then discard out-of-partition ones. **Query + I/O amplification.** | Avoid — pick a key correlated with the partition, or a finer `partition_granularity` so each partition's key range tightens. |
+| `chunk_dense: true` | Each chunk re-runs `ROW_NUMBER()` over the **whole** partition → `O(chunks × partition_rows)`. Fine for *small* sparse partitions, **catastrophic at 100 M**. | Small partitions with a sparse key only. |
+| `mode: full` (no chunking) | One streaming `SELECT`. **Postgres:** server-side cursor, bounded memory, but a single long-running transaction (watch vacuum / replication lag). **MySQL:** buffers the whole result client-side — **OOM on 100 M**. | PG partitions that fit a long read; never MySQL at this scale. |
+
+Row counts are always exact regardless of the choice — these trade-offs are about
+source load and file fan-out, not correctness. There is **no keyset/seek option
+for a partition today** (see the `chunk_by_key` limit above), so for a genuinely
+huge partition with a sparse key the practical levers are a correlated range key
+or a finer granularity.

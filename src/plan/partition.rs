@@ -85,32 +85,20 @@ pub fn build_null_query(base_query: &str, col: &str, source_type: SourceType) ->
     format!("SELECT * FROM ({base_query}) AS _rivet_part WHERE {q} IS NULL")
 }
 
-/// `SELECT min({col}) FROM (base)` — used to find the partition span. Pairs
-/// with [`build_max_query`]. NULLs are ignored by SQL aggregates, so the span
-/// reflects only the value rows; the NULL bucket is probed separately.
-pub fn build_min_query(base_query: &str, col: &str, source_type: SourceType) -> String {
+/// `SELECT <agg>({col}) FROM (base)` — `agg` is `min` or `max`, used to find the
+/// partition span. NULLs are ignored by SQL aggregates, so the span reflects
+/// only the value rows; the NULL bucket is probed separately by
+/// [`build_null_count_query`]. Parse the result with
+/// [`crate::sql::parse_date_flexible`].
+pub fn build_aggregate_query(agg: &str, base_query: &str, col: &str, source_type: SourceType) -> String {
     let q = crate::sql::quote_ident(source_type, col);
-    format!("SELECT min({q}) FROM ({base_query}) AS _rivet_mm")
-}
-
-/// `SELECT max({col}) FROM (base)` — see [`build_min_query`].
-pub fn build_max_query(base_query: &str, col: &str, source_type: SourceType) -> String {
-    let q = crate::sql::quote_ident(source_type, col);
-    format!("SELECT max({q}) FROM ({base_query}) AS _rivet_mm")
+    format!("SELECT {agg}({q}) FROM ({base_query}) AS _rivet_mm")
 }
 
 /// `SELECT count(*) … WHERE {col} IS NULL` — non-zero ⇒ emit a NULL bucket.
 pub fn build_null_count_query(base_query: &str, col: &str, source_type: SourceType) -> String {
     let q = crate::sql::quote_ident(source_type, col);
     format!("SELECT count(*) FROM ({base_query}) AS _rivet_nc WHERE {q} IS NULL")
-}
-
-/// Parse the `YYYY-MM-DD` day out of a scalar `min`/`max` result, which may be
-/// a bare date (`2023-01-01`) or a timestamp (`2023-01-01 12:00:00[.us][+tz]`).
-/// Returns `None` for an unparseable / empty value.
-pub fn parse_scalar_day(raw: &str) -> Option<NaiveDate> {
-    let head = raw.get(..10)?;
-    NaiveDate::parse_from_str(head, "%Y-%m-%d").ok()
 }
 
 fn day_ranges(min_day: NaiveDate, max_day: NaiveDate) -> Vec<PartitionRange> {
@@ -330,26 +318,14 @@ mod tests {
     fn min_max_null_count_queries_shape() {
         let base = "SELECT * FROM events";
         assert_eq!(
-            build_min_query(base, "created_at", SourceType::Postgres),
+            build_aggregate_query("min", base, "created_at", SourceType::Postgres),
             "SELECT min(\"created_at\") FROM (SELECT * FROM events) AS _rivet_mm"
         );
         assert_eq!(
-            build_max_query(base, "created_at", SourceType::Postgres),
+            build_aggregate_query("max", base, "created_at", SourceType::Postgres),
             "SELECT max(\"created_at\") FROM (SELECT * FROM events) AS _rivet_mm"
         );
         assert!(build_null_count_query(base, "created_at", SourceType::Postgres)
             .contains("WHERE \"created_at\" IS NULL"));
-    }
-
-    #[test]
-    fn parse_scalar_day_handles_date_and_timestamp_forms() {
-        assert_eq!(parse_scalar_day("2023-01-01"), Some(d("2023-01-01")));
-        assert_eq!(parse_scalar_day("2023-01-01 12:09:00"), Some(d("2023-01-01")));
-        assert_eq!(
-            parse_scalar_day("2024-12-30 00:00:00.123456+00"),
-            Some(d("2024-12-30"))
-        );
-        assert_eq!(parse_scalar_day(""), None);
-        assert_eq!(parse_scalar_day("not-a-date"), None);
     }
 }

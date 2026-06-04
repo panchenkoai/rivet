@@ -30,11 +30,17 @@
 - `--parallel-export-processes` is disabled while partitioning is active (child
   processes re-load the config and can't see synthesised partitions); the run
   executes in-process.
-- With `mode: chunked`, chunking runs inside each partition but the chunk-key
-  range is the partition's `[min, max]` of the key, not its row count — keep a
-  sane `chunk_size` (or `chunk_dense`) when the key is sparse within a partition,
-  or a small `chunk_size` fans out into one tiny file per row (row counts stay
-  correct). See [docs/partitioning.md](docs/partitioning.md).
+- Not compatible with `chunk_by_key` (keyset needs the `table:` shortcut to
+  verify the index; partitioning rewrites the export into a `query:` subquery) —
+  rejected up front. `plan` / `check` do not expand partitions yet (they show the
+  parent as one un-partitioned job).
+- **Per-partition chunking trade-offs (source load, not correctness):** with
+  `mode: chunked`, chunk windows come from the partition's key `[min,max]`, not
+  its row count. A range key that is *dense/correlated* within the partition is
+  one clean pass; a *sparse* key amplifies queries/I/O; `chunk_dense` is
+  `O(chunks × rows)` (fine for small partitions, not for huge ones); `mode: full`
+  is a long PG transaction / MySQL client-side OOM at scale. Row counts stay
+  exact in every case. See [docs/partitioning.md](docs/partitioning.md).
 - Validating every partition of an export by its parent name in one command is
   not yet wired — point `validate --prefix` at a concrete partition prefix.
 
