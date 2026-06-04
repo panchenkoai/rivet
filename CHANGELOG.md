@@ -30,6 +30,11 @@
 - `--parallel-export-processes` is disabled while partitioning is active (child
   processes re-load the config and can't see synthesised partitions); the run
   executes in-process.
+- With `mode: chunked`, chunking runs inside each partition but the chunk-key
+  range is the partition's `[min, max]` of the key, not its row count — keep a
+  sane `chunk_size` (or `chunk_dense`) when the key is sparse within a partition,
+  or a small `chunk_size` fans out into one tiny file per row (row counts stay
+  correct). See [docs/partitioning.md](docs/partitioning.md).
 - Validating every partition of an export by its parent name in one command is
   not yet wired — point `validate --prefix` at a concrete partition prefix.
 

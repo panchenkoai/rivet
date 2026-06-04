@@ -98,6 +98,15 @@ GROUP BY 1;
 
 - **Index the partition column.** Each bucket is a separate range scan over your
   query. Without an index on `partition_by`, a wide span means many scans.
+- **`partition_by` + `mode: chunked` — mind `chunk_size`.** Chunking runs
+  *inside* each partition, but the chunk-key (`chunk_column`) range is taken from
+  that partition's `[min, max]` of the key, **not** its row count. When the key
+  (e.g. a global `id`) is not correlated with the partition key, a partition's
+  few rows can still span most of the key range — so a small `chunk_size`
+  explodes into one tiny file per row. Keep the default (`chunk_size: 100000`)
+  or larger, set a `chunk_size` close to the *per-partition* row count, or use
+  `chunk_dense: true` (ROW_NUMBER) when the key is sparse within a partition.
+  Row counts stay correct either way; only the file fan-out is affected.
 - **Time zones.** Bucket bounds are emitted as `YYYY-MM-DD` literals. For a
   `TIMESTAMPTZ` column the comparison happens at the session time zone — pin it
   (e.g. MySQL `SET time_zone = '+00:00'`) when the exact day boundary matters.
