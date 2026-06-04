@@ -67,52 +67,18 @@ fn expand_one(
 
     let mut src = crate::source::create_source(source)?;
 
-    // Span of the value (non-NULL) rows. SQL aggregates skip NULLs, so this is
-    // the value span; the NULL bucket is probed independently below.
-    let min_raw = src.query_scalar(&partition::build_aggregate_query("min", &base_query, col, st))?;
-    let max_raw = src.query_scalar(&partition::build_aggregate_query("max", &base_query, col, st))?;
-
-    let mut child_count = 0usize;
-    if let (Some(min_s), Some(max_s)) = (min_raw.as_deref(), max_raw.as_deref()) {
-        let min_day = crate::sql::parse_date_flexible(min_s).ok_or_else(|| {
-            anyhow::anyhow!(
-                "export '{}': could not parse partition min '{}' from column '{}' as a date",
-                export.name,
-                min_s,
-                col
-            )
-        })?;
-        let max_day = crate::sql::parse_date_flexible(max_s).ok_or_else(|| {
-            anyhow::anyhow!(
-                "export '{}': could not parse partition max '{}' from column '{}' as a date",
-                export.name,
-                max_s,
-                col
-            )
-        })?;
-
-        let ranges = partition::generate_ranges(min_day, max_day, export.partition_granularity);
-        for range in &ranges {
-            let query = partition::build_range_query(&base_query, col, range, st);
-            out.push(make_child(export, col, &range.label_value, &range.label_value, query));
-            child_count += 1;
-        }
-    }
-
-    // NULL bucket: a range predicate can never match NULL, so any NULL rows
-    // would be lost without this. `__HIVE_DEFAULT_PARTITION__` keeps them
-    // queryable by Hive/Spark/duckdb partition discovery.
-    let null_count = src
+    // I/O: the value span (SQL aggregates skip NULLs) + whether any NULLs exist.
+    // The pure child-building below is split out so it is unit-testable without
+    // a live source.
+    let bounds = fetch_value_span(src.as_mut(), export, col, &base_query, st)?;
+    let has_nulls = src
         .query_scalar(&partition::build_null_count_query(&base_query, col, st))?
         .and_then(|s| s.trim().parse::<i64>().ok())
-        .unwrap_or(0);
-    if null_count > 0 {
-        let query = partition::build_null_query(&base_query, col, st);
-        out.push(make_child(export, col, HIVE_NULL_PARTITION, "null", query));
-        child_count += 1;
-    }
+        .unwrap_or(0)
+        > 0;
 
-    if child_count == 0 {
+    let children = build_partition_children(export, col, &base_query, st, bounds, has_nulls);
+    if children.is_empty() {
         log::warn!(
             "export '{}': partition_by '{}' found no rows (no value span, no NULLs) — nothing to export",
             export.name,
@@ -123,10 +89,68 @@ fn expand_one(
             "export '{}': partition_by '{}' expanded into {} partition(s)",
             export.name,
             col,
-            child_count
+            children.len()
         );
+        out.extend(children);
     }
     Ok(())
+}
+
+/// Fetch the `[min, max]` day span of the partition column over `base_query`,
+/// or `None` when there are no non-NULL rows. The NULL bucket is probed
+/// separately by the caller.
+fn fetch_value_span(
+    src: &mut dyn crate::source::Source,
+    export: &ExportConfig,
+    col: &str,
+    base_query: &str,
+    st: crate::config::SourceType,
+) -> Result<Option<(chrono::NaiveDate, chrono::NaiveDate)>> {
+    let min_raw = src.query_scalar(&partition::build_aggregate_query("min", base_query, col, st))?;
+    let max_raw = src.query_scalar(&partition::build_aggregate_query("max", base_query, col, st))?;
+    let (Some(min_s), Some(max_s)) = (min_raw.as_deref(), max_raw.as_deref()) else {
+        return Ok(None);
+    };
+    let parse = |raw: &str, which: &str| {
+        crate::sql::parse_date_flexible(raw).ok_or_else(|| {
+            anyhow::anyhow!(
+                "export '{}': could not parse partition {} '{}' from column '{}' as a date",
+                export.name,
+                which,
+                raw,
+                col
+            )
+        })
+    };
+    Ok(Some((parse(min_s, "min")?, parse(max_s, "max")?)))
+}
+
+/// Pure: build the concrete per-bucket child exports from an already-fetched
+/// value span and NULL flag. No I/O — this is the unit-tested heart of the
+/// expansion (range generation, child synthesis, the NULL bucket).
+fn build_partition_children(
+    parent: &ExportConfig,
+    col: &str,
+    base_query: &str,
+    st: crate::config::SourceType,
+    bounds: Option<(chrono::NaiveDate, chrono::NaiveDate)>,
+    has_nulls: bool,
+) -> Vec<ExportConfig> {
+    let mut children = Vec::new();
+    if let Some((min_day, max_day)) = bounds {
+        for range in partition::generate_ranges(min_day, max_day, parent.partition_granularity) {
+            let query = partition::build_range_query(base_query, col, &range, st);
+            children.push(make_child(parent, col, &range.label_value, &range.label_value, query));
+        }
+    }
+    // NULL bucket: a range predicate can never match NULL, so any NULL rows
+    // would be lost without this. `__HIVE_DEFAULT_PARTITION__` keeps them
+    // queryable by Hive/Spark/duckdb partition discovery.
+    if has_nulls {
+        let query = partition::build_null_query(base_query, col, st);
+        children.push(make_child(parent, col, HIVE_NULL_PARTITION, "null", query));
+    }
+    children
 }
 
 /// Build one concrete child export for a single bucket.
@@ -300,5 +324,84 @@ mod tests {
         let np = base_export();
         assert!(any_partitioned(&[&p]));
         assert!(!any_partitioned(&[&np]));
+    }
+
+    // ── build_partition_children (pure expansion core, offline) ──────────────
+
+    fn day(s: &str) -> chrono::NaiveDate {
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+
+    fn child_names(children: &[ExportConfig]) -> Vec<String> {
+        children.iter().map(|c| c.name.clone()).collect()
+    }
+
+    #[test]
+    fn children_one_per_day_plus_null_bucket() {
+        let parent = part_export(true);
+        let children = build_partition_children(
+            &parent,
+            "created_at",
+            "SELECT * FROM events",
+            crate::config::SourceType::Postgres,
+            Some((day("2023-01-01"), day("2023-01-03"))),
+            true,
+        );
+        assert_eq!(
+            child_names(&children),
+            [
+                "events__2023-01-01",
+                "events__2023-01-02",
+                "events__2023-01-03",
+                "events__null",
+            ]
+        );
+        // last is the NULL bucket → Hive default partition path.
+        assert_eq!(
+            children.last().unwrap().destination.path.as_deref(),
+            Some("./out/events/created_at=__HIVE_DEFAULT_PARTITION__")
+        );
+    }
+
+    #[test]
+    fn children_no_null_bucket_when_no_nulls() {
+        let parent = part_export(true);
+        let children = build_partition_children(
+            &parent,
+            "created_at",
+            "SELECT * FROM events",
+            crate::config::SourceType::Postgres,
+            Some((day("2023-01-01"), day("2023-01-02"))),
+            false,
+        );
+        assert_eq!(child_names(&children), ["events__2023-01-01", "events__2023-01-02"]);
+    }
+
+    #[test]
+    fn children_only_null_bucket_when_no_value_span() {
+        let parent = part_export(true);
+        let children = build_partition_children(
+            &parent,
+            "created_at",
+            "SELECT * FROM events",
+            crate::config::SourceType::Postgres,
+            None,
+            true,
+        );
+        assert_eq!(child_names(&children), ["events__null"]);
+    }
+
+    #[test]
+    fn children_empty_when_no_rows_at_all() {
+        let parent = part_export(true);
+        let children = build_partition_children(
+            &parent,
+            "created_at",
+            "SELECT * FROM events",
+            crate::config::SourceType::Postgres,
+            None,
+            false,
+        );
+        assert!(children.is_empty());
     }
 }

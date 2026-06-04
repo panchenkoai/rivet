@@ -18,19 +18,19 @@ use crate::config::{PartitionGranularity, SourceType};
 /// Hive's conventional partition label for rows whose partition key is NULL.
 /// Spark, Hive, and duckdb's `hive_partitioning` all recognise this token, so
 /// a NULL bucket stays queryable instead of silently dropping rows.
-pub const HIVE_NULL_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
+pub(crate) const HIVE_NULL_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
 
 /// One partition bucket: a Hive `col=value` value label and its half-open
 /// `[lo, hi)` date bounds (inclusive `lo`, exclusive `hi`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PartitionRange {
+pub(crate) struct PartitionRange {
     /// The value side of the `col=value` path segment, formatted per
     /// granularity (`2023-01-01` / `2023-01` / `2023`).
-    pub label_value: String,
+    pub(crate) label_value: String,
     /// Inclusive lower bound (`col >= lo`).
-    pub lo: NaiveDate,
+    pub(crate) lo: NaiveDate,
     /// Exclusive upper bound (`col < hi`).
-    pub hi: NaiveDate,
+    pub(crate) hi: NaiveDate,
 }
 
 /// Generate the ordered, gap-free list of partition buckets covering
@@ -40,7 +40,7 @@ pub struct PartitionRange {
 /// bucket. The expansion layer decides whether to skip empties. Returns an
 /// empty vec when `max_day < min_day` (e.g. the source has zero non-NULL
 /// partition values).
-pub fn generate_ranges(
+pub(crate) fn generate_ranges(
     min_day: NaiveDate,
     max_day: NaiveDate,
     granularity: PartitionGranularity,
@@ -62,7 +62,7 @@ pub fn generate_ranges(
 /// coerce them against a `DATE` / `TIMESTAMP` / `TIMESTAMPTZ` column. For a
 /// timestamptz column the literal is interpreted at the session time zone —
 /// callers that need a fixed zone must pin it (`SET time_zone='+00:00'`).
-pub fn build_range_query(
+pub(crate) fn build_range_query(
     base_query: &str,
     col: &str,
     range: &PartitionRange,
@@ -80,7 +80,7 @@ pub fn build_range_query(
 /// Wrap `base_query` for the NULL bucket — rows whose partition column is NULL,
 /// which a range predicate can never match. These land in the Hive default
 /// partition so they are never silently dropped.
-pub fn build_null_query(base_query: &str, col: &str, source_type: SourceType) -> String {
+pub(crate) fn build_null_query(base_query: &str, col: &str, source_type: SourceType) -> String {
     let q = crate::sql::quote_ident(source_type, col);
     format!("SELECT * FROM ({base_query}) AS _rivet_part WHERE {q} IS NULL")
 }
@@ -90,13 +90,13 @@ pub fn build_null_query(base_query: &str, col: &str, source_type: SourceType) ->
 /// only the value rows; the NULL bucket is probed separately by
 /// [`build_null_count_query`]. Parse the result with
 /// [`crate::sql::parse_date_flexible`].
-pub fn build_aggregate_query(agg: &str, base_query: &str, col: &str, source_type: SourceType) -> String {
+pub(crate) fn build_aggregate_query(agg: &str, base_query: &str, col: &str, source_type: SourceType) -> String {
     let q = crate::sql::quote_ident(source_type, col);
     format!("SELECT {agg}({q}) FROM ({base_query}) AS _rivet_mm")
 }
 
 /// `SELECT count(*) … WHERE {col} IS NULL` — non-zero ⇒ emit a NULL bucket.
-pub fn build_null_count_query(base_query: &str, col: &str, source_type: SourceType) -> String {
+pub(crate) fn build_null_count_query(base_query: &str, col: &str, source_type: SourceType) -> String {
     let q = crate::sql::quote_ident(source_type, col);
     format!("SELECT count(*) FROM ({base_query}) AS _rivet_nc WHERE {q} IS NULL")
 }
