@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
-# Pre-push gate — runs the offline test suite (CI parity: `cargo test
-# --all-targets`, .github/workflows/ci.yml) before code leaves the machine.
-# Lives here rather than in pre-commit because the full suite is too slow to
-# run on every commit; fmt + clippy stay in pre-commit for fast feedback.
+# Pre-push gate — runs the offline test suite (lib unit + integration tests)
+# before code leaves the machine. Lives here rather than in pre-commit because
+# the suite is too slow per-commit; fmt + clippy stay in pre-commit for fast
+# feedback.
+#
+# Scope is `--tests` (NOT `--all-targets`): that deliberately excludes the
+# criterion benchmarks, which `--all-targets` would *execute* and add minutes
+# for zero correctness signal. CI (`cargo test --all-targets`) is the backstop
+# that also compiles benches/examples; doctests are skipped both here and there.
 #
 # Enable once per clone:  git config core.hooksPath .githooks
 # Bypass in an emergency: git push --no-verify  (CI still enforces).
@@ -11,7 +16,7 @@
 # gate — run them explicitly with `cargo test -- --ignored`.
 set -euo pipefail
 
-echo "pre-push: cargo test --all-targets (offline)"
-cargo test --all-targets --quiet
+echo "pre-push: cargo test --tests (offline; benches excluded)"
+cargo test --tests --quiet
 
 echo "pre-push: ok"

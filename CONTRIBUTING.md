@@ -27,8 +27,9 @@ With the hooks enabled:
 
 - **`pre-commit`** runs the exact CI fmt + clippy commands on every commit
   (fast feedback) — bypass with `git commit --no-verify`.
-- **`pre-push`** runs the offline test suite (`cargo test --all-targets`) before
-  the push leaves your machine — bypass with `git push --no-verify`.
+- **`pre-push`** runs the offline test suite (`cargo test --tests` — lib +
+  integration, benches excluded) before the push leaves your machine — bypass
+  with `git push --no-verify`.
 
 CI still enforces all of them regardless.
 
