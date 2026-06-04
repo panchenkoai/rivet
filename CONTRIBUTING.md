@@ -23,8 +23,14 @@ version-controlled git hooks (once per clone):
 git config core.hooksPath .githooks
 ```
 
-`.githooks/pre-commit` then runs the exact CI fmt + clippy commands on every
-commit (bypass with `git commit --no-verify` in an emergency).
+With the hooks enabled:
+
+- **`pre-commit`** runs the exact CI fmt + clippy commands on every commit
+  (fast feedback) — bypass with `git commit --no-verify`.
+- **`pre-push`** runs the offline test suite (`cargo test --all-targets`) before
+  the push leaves your machine — bypass with `git push --no-verify`.
+
+CI still enforces all of them regardless.
 
 ## Documentation governance
 
