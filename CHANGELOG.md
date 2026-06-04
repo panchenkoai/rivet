@@ -1,11 +1,14 @@
 # Changelog
 
-## Unreleased — Value-Based Output Partitioning
+## 0.9.0 (2026-06-04) — Value-Based Output Partitioning
 
 > **`partition_by`** splits one export's rows into one destination sub-folder
 > per value bucket of a date column — the Hive `col=value/` layout that
 > Snowflake external tables, BigQuery, Spark, DuckDB, and Athena discover
-> automatically. Verified end-to-end on live PostgreSQL.
+> automatically. Verified end-to-end on live PostgreSQL and on object storage
+> (MinIO + GCS) with both `--reconcile` (per-partition source `COUNT(*)` ==
+> exported) and per-partition `--validate` (manifest + `_SUCCESS`, content-MD5
+> with no download — confirmed against live GCS).
 
 ### Features
 
