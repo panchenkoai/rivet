@@ -177,9 +177,18 @@ mod tests {
     #[test]
     fn parse_date_flexible_handles_db_scalar_forms() {
         assert_eq!(parse_date_flexible("2023-06-15"), Some(d("2023-06-15")));
-        assert_eq!(parse_date_flexible("2023-06-15 14:32:00"), Some(d("2023-06-15")));
-        assert_eq!(parse_date_flexible("2023-06-15T14:32:00"), Some(d("2023-06-15")));
-        assert_eq!(parse_date_flexible("2023-06-15T14:32:00.123456"), Some(d("2023-06-15")));
+        assert_eq!(
+            parse_date_flexible("2023-06-15 14:32:00"),
+            Some(d("2023-06-15"))
+        );
+        assert_eq!(
+            parse_date_flexible("2023-06-15T14:32:00"),
+            Some(d("2023-06-15"))
+        );
+        assert_eq!(
+            parse_date_flexible("2023-06-15T14:32:00.123456"),
+            Some(d("2023-06-15"))
+        );
         // PostgreSQL timestamptz text form — covered by the lenient fallback.
         assert_eq!(
             parse_date_flexible("2024-12-30 00:00:00.123456+00"),
@@ -196,8 +205,14 @@ mod tests {
 
     #[test]
     fn strip_select_star_from_accepts_simple_table_forms() {
-        assert_eq!(strip_select_star_from("SELECT * FROM events"), Some("events"));
-        assert_eq!(strip_select_star_from("select *  from  public.orders"), Some("public.orders"));
+        assert_eq!(
+            strip_select_star_from("SELECT * FROM events"),
+            Some("events")
+        );
+        assert_eq!(
+            strip_select_star_from("select *  from  public.orders"),
+            Some("public.orders")
+        );
     }
 
     #[test]
@@ -212,7 +227,12 @@ mod tests {
     #[test]
     fn aggregate_sql_fast_path_on_table_shortcut() {
         assert_eq!(
-            aggregate_sql(SourceType::Postgres, "min", "created_at", "SELECT * FROM events"),
+            aggregate_sql(
+                SourceType::Postgres,
+                "min",
+                "created_at",
+                "SELECT * FROM events"
+            ),
             "SELECT min(\"created_at\") FROM events"
         );
     }
@@ -220,11 +240,18 @@ mod tests {
     #[test]
     fn aggregate_sql_wraps_a_real_query() {
         assert_eq!(
-            aggregate_sql(SourceType::Postgres, "max", "created_at", "SELECT id, created_at FROM events WHERE x"),
+            aggregate_sql(
+                SourceType::Postgres,
+                "max",
+                "created_at",
+                "SELECT id, created_at FROM events WHERE x"
+            ),
             "SELECT max(\"created_at\") FROM (SELECT id, created_at FROM events WHERE x) AS _rivet"
         );
         // dialect quoting flows through.
-        assert!(aggregate_sql(SourceType::Mysql, "min", "d", "SELECT d FROM t WHERE 1")
-            .contains("min(`d`)"));
+        assert!(
+            aggregate_sql(SourceType::Mysql, "min", "d", "SELECT d FROM t WHERE 1")
+                .contains("min(`d`)")
+        );
     }
 }

@@ -147,8 +147,7 @@ pub fn run(
         params,
     };
 
-    let process_mode_requested =
-        parallel_export_processes_cli || config.parallel_export_processes;
+    let process_mode_requested = parallel_export_processes_cli || config.parallel_export_processes;
     // Process-mode children re-exec `rivet run --export <name>` and re-load the
     // config from disk, so they cannot see the synthesised partition child
     // names. Force in-process execution when partitioning is active.

@@ -140,7 +140,13 @@ fn build_partition_children(
     if let Some((min_day, max_day)) = bounds {
         for range in partition::generate_ranges(min_day, max_day, parent.partition_granularity) {
             let query = partition::build_range_query(base_query, col, &range, st);
-            children.push(make_child(parent, col, &range.label_value, &range.label_value, query));
+            children.push(make_child(
+                parent,
+                col,
+                &range.label_value,
+                &range.label_value,
+                query,
+            ));
         }
     }
     // NULL bucket: a range predicate can never match NULL, so any NULL rows
@@ -174,7 +180,8 @@ fn make_child(
     child.query_file = None;
     child.table = None;
     let segment = format!("{col}={path_value}");
-    child.destination = placeholder::expand_destination_partition(parent.destination.clone(), &segment);
+    child.destination =
+        placeholder::expand_destination_partition(parent.destination.clone(), &segment);
     child
 }
 
@@ -310,7 +317,13 @@ mod tests {
     #[test]
     fn make_child_null_bucket_uses_hive_default() {
         let parent = part_export(true);
-        let child = make_child(&parent, "created_at", HIVE_NULL_PARTITION, "null", "Q".into());
+        let child = make_child(
+            &parent,
+            "created_at",
+            HIVE_NULL_PARTITION,
+            "null",
+            "Q".into(),
+        );
         assert_eq!(child.name, "events__null");
         assert_eq!(
             child.destination.path.as_deref(),
@@ -374,7 +387,10 @@ mod tests {
             Some((day("2023-01-01"), day("2023-01-02"))),
             false,
         );
-        assert_eq!(child_names(&children), ["events__2023-01-01", "events__2023-01-02"]);
+        assert_eq!(
+            child_names(&children),
+            ["events__2023-01-01", "events__2023-01-02"]
+        );
     }
 
     #[test]

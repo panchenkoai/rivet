@@ -18,7 +18,11 @@ use common::*;
 
 /// 3-day window of `content_items.created_at` → exactly 3 day partitions.
 const WINDOW: &str = "created_at >= '2023-01-01' AND created_at < '2023-01-04'";
-const PART_DAYS: [&str; 3] = ["created_at=2023-01-01", "created_at=2023-01-02", "created_at=2023-01-03"];
+const PART_DAYS: [&str; 3] = [
+    "created_at=2023-01-01",
+    "created_at=2023-01-02",
+    "created_at=2023-01-03",
+];
 
 /// Skip-guard: `content_items` must be present and cover the window. Panics with
 /// an actionable message (the table is a `seed.rs` fixture, not seeded here).

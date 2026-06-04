@@ -151,7 +151,11 @@ exports:
 
     // Integrity: every source row lands in exactly one partition — no loss,
     // no duplication.
-    assert_eq!(parquet_rows_recursive(root), 7, "sum of partitions == source");
+    assert_eq!(
+        parquet_rows_recursive(root),
+        7,
+        "sum of partitions == source"
+    );
 
     // Each partition is an independent, complete prefix.
     for seg in [
@@ -271,7 +275,11 @@ exports:
     let root = out_dir.path();
     assert_eq!(partition_rows(root, "created_at=2023-01-01"), 3, "day 1");
     assert_eq!(partition_rows(root, "created_at=2023-01-02"), 3, "day 2");
-    assert_eq!(parquet_rows_recursive(root), 6, "chunked partitions: no loss/dup");
+    assert_eq!(
+        parquet_rows_recursive(root),
+        6,
+        "chunked partitions: no loss/dup"
+    );
 }
 
 #[test]

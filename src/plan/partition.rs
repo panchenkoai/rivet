@@ -86,7 +86,11 @@ pub(crate) fn build_null_query(base_query: &str, col: &str, source_type: SourceT
 }
 
 /// `SELECT count(*) … WHERE {col} IS NULL` — non-zero ⇒ emit a NULL bucket.
-pub(crate) fn build_null_count_query(base_query: &str, col: &str, source_type: SourceType) -> String {
+pub(crate) fn build_null_count_query(
+    base_query: &str,
+    col: &str,
+    source_type: SourceType,
+) -> String {
     let q = crate::sql::quote_ident(source_type, col);
     format!("SELECT count(*) FROM ({base_query}) AS _rivet_nc WHERE {q} IS NULL")
 }
@@ -205,7 +209,11 @@ mod tests {
 
     #[test]
     fn month_spans_three_months_snaps_to_month_edges() {
-        let r = generate_ranges(d("2023-01-15"), d("2023-03-05"), PartitionGranularity::Month);
+        let r = generate_ranges(
+            d("2023-01-15"),
+            d("2023-03-05"),
+            PartitionGranularity::Month,
+        );
         assert_eq!(labels(&r), ["2023-01", "2023-02", "2023-03"]);
         // first lo snaps back to the 1st; last hi is the 1st of the next month.
         assert_eq!(r[0].lo, d("2023-01-01"));
@@ -214,7 +222,11 @@ mod tests {
 
     #[test]
     fn month_single_when_within_one_month() {
-        let r = generate_ranges(d("2023-06-10"), d("2023-06-20"), PartitionGranularity::Month);
+        let r = generate_ranges(
+            d("2023-06-10"),
+            d("2023-06-20"),
+            PartitionGranularity::Month,
+        );
         assert_eq!(labels(&r), ["2023-06"]);
         assert_eq!(r[0].lo, d("2023-06-01"));
         assert_eq!(r[0].hi, d("2023-07-01"));
@@ -222,7 +234,11 @@ mod tests {
 
     #[test]
     fn month_crosses_year_boundary() {
-        let r = generate_ranges(d("2023-12-15"), d("2024-01-10"), PartitionGranularity::Month);
+        let r = generate_ranges(
+            d("2023-12-15"),
+            d("2024-01-10"),
+            PartitionGranularity::Month,
+        );
         assert_eq!(labels(&r), ["2023-12", "2024-01"]);
         assert_eq!(r[1].hi, d("2024-02-01"));
     }

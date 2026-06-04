@@ -255,9 +255,7 @@ fn print_diagnostic(diag: &ExportDiagnostic) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        DestinationConfig, DestinationType, ExportConfig, ExportMode, FormatType,
-    };
+    use crate::config::{DestinationConfig, DestinationType, ExportConfig, ExportMode, FormatType};
     use doctor::{
         categorize_dest_error, categorize_source_error, destination_error_hint, source_error_hint,
     };
