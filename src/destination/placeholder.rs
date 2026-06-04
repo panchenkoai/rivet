@@ -23,6 +23,9 @@
 //!   one.  An unsubstituted `{run_id}` is left verbatim so a downstream
 //!   open / head-object call fails loudly instead of silently pointing at
 //!   a wrong prefix.
+//! - `{partition}` → Hive `col=value` segment for value-based partitioning.
+//!   Resolved out-of-band by [`expand_destination_partition`] during `run`'s
+//!   partition expansion, not by the [`PlaceholderContext`] pass below.
 
 use chrono::{NaiveDate, Utc};
 
@@ -86,6 +89,23 @@ pub fn apply(s: &str, ctx: &PlaceholderContext) -> String {
         out = out.replace("{run_id}", rid);
     }
     out
+}
+
+/// Substitute **only** the `{partition}` token in `destination.path` /
+/// `destination.prefix` with a Hive-style `col=value` segment.
+///
+/// This is a targeted pre-pass owned by `pipeline::partition_expand`: when
+/// `partition_by` is set, `run` expands one export into one concrete export
+/// per bucket and resolves `{partition}` here, *before* the normal plan-build
+/// pass resolves `{date}` / `{run_id}` / `{export}`. Keeping it separate avoids
+/// resolving the date twice and leaves every other token untouched.
+pub fn expand_destination_partition(
+    mut dest: DestinationConfig,
+    segment: &str,
+) -> DestinationConfig {
+    dest.path = dest.path.map(|s| s.replace("{partition}", segment));
+    dest.prefix = dest.prefix.map(|s| s.replace("{partition}", segment));
+    dest
 }
 
 /// Expand placeholders in `destination.path` and `destination.prefix`.

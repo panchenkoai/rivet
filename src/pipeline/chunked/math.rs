@@ -3,27 +3,14 @@
 //! Date parsing, range generation, SQL query building, plan fingerprinting.
 //! All functions in this module are deterministic and side-effect-free.
 
-/// Parse a date string from the DB into a NaiveDate.
-/// Handles DATE ('2023-01-01'), DATETIME ('2023-01-01 00:00:00'), and ISO-8601 variants.
-pub(crate) fn parse_date_flexible(s: &str) -> Option<chrono::NaiveDate> {
-    use chrono::NaiveDate;
-    let s = s.trim();
-    NaiveDate::parse_from_str(s, "%Y-%m-%d")
-        .ok()
-        .or_else(|| {
-            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
-                .ok()
-                .map(|dt| dt.date())
-        })
-        .or_else(|| {
-            // ISO 8601 with T, optional fractional seconds
-            let base = s.split('.').next().unwrap_or(s);
-            let base = base.split('+').next().unwrap_or(base);
-            chrono::NaiveDateTime::parse_from_str(base, "%Y-%m-%dT%H:%M:%S")
-                .ok()
-                .map(|dt| dt.date())
-        })
-}
+// Date parsing of DB scalars is shared with `plan::partition` (a different
+// layer), so it lives in the `sql` leaf module. Re-exported here so the existing
+// `super::math::parse_date_flexible` call sites in `chunked` stay unchanged.
+pub(crate) use crate::sql::parse_date_flexible;
+// `strip_select_star_from` also moved to the `sql` leaf (shared with preflight
+// and plan::partition); re-exported so `chunked`'s call sites and the
+// `chunked::strip_select_star_from` re-export are unchanged.
+pub(crate) use crate::sql::strip_select_star_from;
 
 pub fn generate_chunks(min: i64, max: i64, chunk_size: i64) -> Vec<(i64, i64)> {
     if max < min || chunk_size <= 0 {
@@ -128,62 +115,6 @@ pub(crate) fn build_chunk_query_sql(
         start = start,
         end = end,
     )
-}
-
-/// Return the table ident from a `SELECT * FROM <ident>` base query if it
-/// exactly matches that simple shape, otherwise None. Used by the chunked
-/// SQL builder to avoid wrapping the user's query in a subquery when we know
-/// it is just a single-table select — see [`build_chunk_query_sql`] and
-/// [`crate::pipeline::chunked::detect`] for the min/max/COUNT fast-paths.
-///
-/// Acceptance criteria are deliberately strict: any trailing clause (WHERE,
-/// JOIN, comma, alias) → None, so we never rewrite a query the user thought
-/// was filtered.
-pub(crate) fn strip_select_star_from(base_query: &str) -> Option<&str> {
-    let trimmed = base_query.trim();
-    // Case-insensitive prefix match on "SELECT * FROM "
-    let after = strip_prefix_ascii_ci(trimmed, "select")
-        .map(str::trim_start)
-        .and_then(|s| s.strip_prefix('*'))
-        .map(str::trim_start)
-        .and_then(|s| strip_prefix_ascii_ci(s, "from"))?;
-    let rest = after.trim_start();
-    // Ident: `<word>` or `<word>.<word>` with ASCII identifier characters.
-    // Anything more (WHERE, JOIN, alias, comma, semicolon, parenthesis) → None.
-    let end = rest
-        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
-        .unwrap_or(rest.len());
-    let ident = &rest[..end];
-    // Must look like `name` or `schema.name`, each segment a valid identifier.
-    let parts: Vec<&str> = ident.split('.').collect();
-    if !(1..=2).contains(&parts.len()) {
-        return None;
-    }
-    for p in &parts {
-        let mut chars = p.chars();
-        match chars.next() {
-            Some(c) if c.is_ascii_alphabetic() || c == '_' => {
-                if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                    return None;
-                }
-            }
-            _ => return None,
-        }
-    }
-    // No trailing payload allowed (WHERE/JOIN/etc.) — `table:` shortcut
-    // produces nothing after the ident, and that's the only form we promote.
-    if !rest[end..].trim().is_empty() {
-        return None;
-    }
-    Some(ident)
-}
-
-fn strip_prefix_ascii_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&s[prefix.len()..])
-    } else {
-        None
-    }
 }
 
 pub(crate) fn chunk_plan_fingerprint(
@@ -377,36 +308,8 @@ mod tests {
         assert!(q.contains("BETWEEN 1 AND 5000"), "got: {}", q);
     }
 
-    #[test]
-    fn test_parse_date_flexible_date_only() {
-        let d = parse_date_flexible("2023-06-15").unwrap();
-        assert_eq!(d.to_string(), "2023-06-15");
-    }
-
-    #[test]
-    fn test_parse_date_flexible_datetime() {
-        let d = parse_date_flexible("2023-06-15 14:32:00").unwrap();
-        assert_eq!(d.to_string(), "2023-06-15");
-    }
-
-    #[test]
-    fn test_parse_date_flexible_iso8601() {
-        let d = parse_date_flexible("2023-06-15T14:32:00").unwrap();
-        assert_eq!(d.to_string(), "2023-06-15");
-    }
-
-    #[test]
-    fn test_parse_date_flexible_iso8601_micros() {
-        let d = parse_date_flexible("2023-06-15T14:32:00.123456").unwrap();
-        assert_eq!(d.to_string(), "2023-06-15");
-    }
-
-    #[test]
-    fn test_parse_date_flexible_invalid() {
-        assert!(parse_date_flexible("not-a-date").is_none());
-        assert!(parse_date_flexible("").is_none());
-        assert!(parse_date_flexible("12345").is_none());
-    }
+    // `parse_date_flexible` now lives in `crate::sql` (shared across layers);
+    // its tests moved there too.
 
     #[test]
     fn test_build_chunk_query_date_mode() {

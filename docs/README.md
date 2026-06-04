@@ -53,6 +53,12 @@ Short terminal walkthroughs in [gifs/](gifs/):
 | Azure Blob Storage | [destinations/azure.md](destinations/azure.md) |
 | Stdout (pipe) | [destinations/stdout.md](destinations/stdout.md) |
 
+### Output layout
+
+| Feature | What | Guide |
+|---------|------|-------|
+| **`partition_by`** | Split rows into Hive-style `col=value/` sub-folders by a date column (`day`/`month`/`year`); NULLs → `__HIVE_DEFAULT_PARTITION__`; orthogonal to `mode` | [partitioning.md](partitioning.md) |
+
 ## Reference
 
 | Topic | Guide |

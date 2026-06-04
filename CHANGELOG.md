@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.9.0 (2026-06-04) — Value-Based Output Partitioning
+
+> **`partition_by`** splits one export's rows into one destination sub-folder
+> per value bucket of a date column — the Hive `col=value/` layout that
+> Snowflake external tables, BigQuery, Spark, DuckDB, and Athena discover
+> automatically. Verified end-to-end on live PostgreSQL and on object storage
+> (MinIO + GCS) with both `--reconcile` (per-partition source `COUNT(*)` ==
+> exported) and per-partition `--validate` (manifest + `_SUCCESS`, content-MD5
+> with no download — confirmed against live GCS).
+
+### Features
+
+- **`feat(partition)`** — new per-export `partition_by:` (+ `partition_granularity:`
+  `day` | `month` | `year`). Rivet reads the column's `[min, max]` span, expands
+  the export into one child per bucket (`WHERE col >= lo AND col < hi`,
+  half-open), and resolves a required `{partition}` destination token to
+  `col=value`. Each partition is an independent prefix with its own
+  `manifest.json` + `_SUCCESS`, so `--validate` and downstream consumers work
+  per-partition with no new machinery. Orthogonal to `mode`: `mode: chunked`
+  chunks *within* a partition. See [docs/partitioning.md](docs/partitioning.md).
+- **`feat(partition)`** — rows with a **NULL** partition value land in
+  `col=__HIVE_DEFAULT_PARTITION__/` (Hive default-partition convention) so no
+  row is silently dropped; the NULL bucket is queryable by Hive/Spark/DuckDB
+  partition discovery.
+
+### Notes
+
+- `partition_by` is rejected without a `{partition}` token in
+  `destination.path`/`prefix` (every partition would otherwise overwrite the
+  same prefix), and is not compatible with `mode: time_window`.
+- `--parallel-export-processes` is disabled while partitioning is active (child
+  processes re-load the config and can't see synthesised partitions); the run
+  executes in-process.
+- Not compatible with `chunk_by_key` (keyset needs the `table:` shortcut to
+  verify the index; partitioning rewrites the export into a `query:` subquery) —
+  rejected up front. `plan` / `check` do not expand partitions yet (they show the
+  parent as one un-partitioned job).
+- **Per-partition chunking trade-offs (source load, not correctness):** with
+  `mode: chunked`, chunk windows come from the partition's key `[min,max]`, not
+  its row count. A range key that is *dense/correlated* within the partition is
+  one clean pass; a *sparse* key amplifies queries/I/O; `chunk_dense` is
+  `O(chunks × rows)` (fine for small partitions, not for huge ones); `mode: full`
+  is a long PG transaction / MySQL client-side OOM at scale. Row counts stay
+  exact in every case. See [docs/partitioning.md](docs/partitioning.md).
+- Validating every partition of an export by its parent name in one command is
+  not yet wired — point `validate --prefix` at a concrete partition prefix.
+
+### Internal
+
+- **`refactor(test)`** — the three hand-written full-field `ExportConfig` test
+  fixtures are consolidated into one `config::sample_export()`; adding a config
+  field is now a single-site edit.
+- **`refactor(sql)`** — dialect-aware SQL string helpers shared across layers
+  (`parse_date_flexible`, `strip_select_star_from`, `aggregate_sql`) now live in
+  the `sql` leaf module instead of being duplicated between `pipeline::chunked`,
+  `preflight`, and `plan::partition`. Behaviour-preserving; the `table:` fast
+  path now also applies to partition min/max probes.
+
 ## 0.8.1 (2026-06-03) — Check↔Run Consistency + Trust-Gate Fixes
 
 > A correctness pass over the export pipeline: wherever `check` (or a contract,

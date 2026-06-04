@@ -29,9 +29,9 @@ checklist is what a maintainer fills out **before** pushing the tag.
 - [ ] `cargo test schema_drift` — checked-in `schemas/rivet.schema.json`
       matches the running binary.
 - [ ] `rivet schema config | diff - schemas/rivet.schema.json` — no drift.
-- [ ] All sample configs in `examples/` parse:
-      `for f in examples/*.yaml; do rivet doctor --config "$f" --no-network || echo "FAIL: $f"; done`
-      *(use `--config` parsing only; do not run live).*
+- [ ] All sample configs in `examples/` parse + validate (offline):
+      `cargo test --test examples_parse`
+      *(loads every `examples/*.yaml` through `Config::from_yaml`; no DB/network).*
 - [ ] `tests/config_parse_errors.rs` — unknown-field + did-you-mean
       regression suite green.
 

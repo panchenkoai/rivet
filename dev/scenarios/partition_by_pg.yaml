@@ -1,0 +1,29 @@
+# Native partition_by end-to-end (NOT the hand-generated workaround).
+# Rivet itself derives the buckets from min/max of the partition column and
+# expands each export into one child per bucket, resolving {partition} → col=value.
+source:
+  type: postgres
+  url: "postgresql://rivet:rivet@localhost:5432/rivet"
+
+exports:
+  # 1) Day granularity over a 5-day window. Expected per-day counts (ground
+  #    truth from PG): 82 / 83 / 83 / 83 / 83.
+  - name: ci_by_day
+    query: "SELECT id, title, category, created_at FROM content_items WHERE created_at >= '2023-01-01' AND created_at < '2023-01-06'"
+    partition_by: created_at
+    partition_granularity: day
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/output/partition_by/ci_by_day/{partition}
+
+  # 2) Month granularity over the whole table — exercises the NULL bucket
+  #    (content_items.published_at has 20,227 NULLs → col=__HIVE_DEFAULT_PARTITION__).
+  - name: ci_by_month
+    query: "SELECT id, title, published_at FROM content_items"
+    partition_by: published_at
+    partition_granularity: month
+    format: parquet
+    destination:
+      type: local
+      path: ./dev/output/partition_by/ci_by_month/{partition}

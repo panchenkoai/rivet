@@ -7,6 +7,7 @@
   <a href="https://github.com/panchenkoai/rivet/releases/latest"><img src="https://img.shields.io/github/v/release/panchenkoai/rivet?label=release" alt="release"></a>
   <a href="docs/reliability-matrix.md"><img src="https://img.shields.io/badge/coverage-reliability%20matrix-blue" alt="coverage"></a>
   <a href="https://github.com/panchenkoai/rivet/blob/main/LICENSE"><img src="https://img.shields.io/github/license/panchenkoai/rivet" alt="license"></a>
+  <a href="https://discord.gg/HT5DZNzNU"><img src="https://img.shields.io/badge/Discord-join%20chat-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
 </p>
 
 <p align="center"><strong>Make database extraction boring.</strong></p>

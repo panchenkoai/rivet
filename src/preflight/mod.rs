@@ -255,59 +255,25 @@ fn print_diagnostic(diag: &ExportDiagnostic) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        CompressionType, DestinationConfig, DestinationType, ExportConfig, ExportMode, FormatType,
-        IncrementalCursorMode, MetaColumns, TimeColumnType,
-    };
+    use crate::config::{DestinationConfig, DestinationType, ExportConfig, ExportMode, FormatType};
     use doctor::{
         categorize_dest_error, categorize_source_error, destination_error_hint, source_error_hint,
     };
 
     fn make_export(name: &str, mode: ExportMode, cursor: Option<&str>) -> ExportConfig {
+        // Baseline from the canonical test fixture; override only the fields
+        // these preflight tests vary (mode, cursor, CSV format, query, dest).
         ExportConfig {
-            name: name.to_string(),
-            target: None,
-            verify: crate::config::VerifyMode::Size,
-            query: Some("SELECT * FROM t".to_string()),
-            query_file: None,
-            table: None,
             mode,
             cursor_column: cursor.map(|s| s.to_string()),
-            cursor_fallback_column: None,
-            incremental_cursor_mode: IncrementalCursorMode::SingleColumn,
-            chunk_column: None,
-            chunk_size: 100_000,
-            chunk_size_memory_mb: None,
-            chunk_count: None,
-            parallel: 1,
-            time_column: None,
-            time_column_type: TimeColumnType::Timestamp,
-            days_window: None,
+            query: Some("SELECT * FROM t".to_string()),
             format: FormatType::Csv,
-            compression: CompressionType::default(),
-            compression_level: None,
-            compression_profile: None,
-            skip_empty: false,
             destination: DestinationConfig {
                 destination_type: DestinationType::Local,
                 path: Some("./out".to_string()),
                 ..Default::default()
             },
-            meta_columns: MetaColumns::default(),
-            quality: None,
-            max_file_size: None,
-            chunk_checkpoint: false,
-            chunk_max_attempts: None,
-            tuning: None,
-            chunk_dense: false,
-            chunk_by_days: None,
-            chunk_by_key: None,
-            source_group: None,
-            reconcile_required: false,
-            columns: Default::default(),
-            on_schema_drift: Default::default(),
-            shape_drift_warn_factor: None,
-            parquet: None,
+            ..crate::config::sample_export(name)
         }
     }
 
