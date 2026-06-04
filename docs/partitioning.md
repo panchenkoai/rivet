@@ -96,6 +96,11 @@ GROUP BY 1;
 
 ## Notes and limits
 
+- **Cloud prefixes: put a `/` after `{partition}`.** Object stores have no
+  directories — the part filename is appended to the resolved prefix verbatim.
+  `prefix: "events/{partition}/"` yields `events/created_at=2023-01-01/part.parquet`;
+  omitting the trailing slash concatenates into `…created_at=2023-01-01part.parquet`.
+  (Local `path:` joins as directories, so the slash is optional there.)
 - **Index the partition column.** Expansion runs three probes over the base
   query (`min`, `max`, NULL-count). Without an index on `partition_by` those are
   up to three full scans before the first row is exported.
