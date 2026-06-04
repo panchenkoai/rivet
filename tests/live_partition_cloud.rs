@@ -1,16 +1,16 @@
-//! Live: value-based partitioning of `content_items` to object storage
-//! (MinIO / fake-gcs), verified end-to-end **with `--reconcile`**.
+//! Live: value-based partitioning to object storage (MinIO / fake-gcs),
+//! verified end-to-end **with `--reconcile`**.
 //!
 //! `--reconcile` implies `--validate` (ADR-0013), so a green run proves, per
 //! partition: source `COUNT(*)` of that day's rows == exported rows, AND the
 //! manifest + `_SUCCESS` at the cloud prefix verify. We then list the bucket to
 //! confirm the Hive `created_at=YYYY-MM-DD/` layout actually landed.
 //!
-//! `content_items` is the pre-seeded bench fixture (`cargo run --bin seed`);
-//! this test does not seed or drop it. The 3-day window and the expected
-//! partition labels are derived from the table's actual earliest day, so the
-//! test adapts to whatever date distribution the seed produced instead of
-//! hard-coding calendar dates. Each test is `#[ignore]`.
+//! Self-contained: each test seeds its own small fixture table (a
+//! content-items-shaped `id / title / created_at`) and drops it on teardown —
+//! it does NOT depend on the heavy pre-seeded `content_items`, which the live
+//! CI job deliberately does not seed (`--skip content_export`). Each test is
+//! `#[ignore]`.
 
 mod common;
 
@@ -18,54 +18,47 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 
 use common::*;
+use postgres::NoTls;
 
-/// Derive a small, data-backed test window from `content_items`: the earliest
-/// day present, plus the next two. Returns the SQL `WHERE` predicate and the
-/// `created_at=YYYY-MM-DD` partition labels that actually have rows in it.
-///
-/// Panics with an actionable message when `content_items` is absent or empty
-/// (it is a `seed.rs` fixture, not seeded here).
-fn content_items_window() -> (String, Vec<String>) {
-    let mut c = pg_connect();
-    let min_day: String = c
-        .query_one(
-            "SELECT min(created_at)::date::text FROM content_items WHERE created_at IS NOT NULL",
-            &[],
-        )
-        .expect("content_items must exist — run `cargo run --bin seed`")
-        .get::<_, Option<String>>(0)
-        .expect("content_items is empty — run `cargo run --bin seed`");
+/// Deterministic 3-day fixture → exactly three day partitions.
+const PART_DAYS: [&str; 3] = [
+    "created_at=2023-01-01",
+    "created_at=2023-01-02",
+    "created_at=2023-01-03",
+];
 
-    let start = chrono::NaiveDate::parse_from_str(&min_day, "%Y-%m-%d").expect("parse min day");
-    let end = start
-        .checked_add_days(chrono::Days::new(3))
-        .expect("min day + 3");
-    let where_clause = format!("created_at >= '{start}' AND created_at < '{end}'");
+struct PgCleanup(String);
 
-    let days: Vec<String> = c
-        .query(
-            &format!(
-                "SELECT DISTINCT created_at::date::text AS d FROM content_items \
-                 WHERE {where_clause} ORDER BY d"
-            ),
-            &[],
-        )
-        .expect("query distinct partition days")
-        .iter()
-        .map(|r| format!("created_at={}", r.get::<_, String>(0)))
-        .collect();
-
-    assert!(
-        !days.is_empty(),
-        "content_items has no rows near its earliest day ({min_day}); run `cargo run --bin seed`"
-    );
-    (where_clause, days)
+impl Drop for PgCleanup {
+    fn drop(&mut self) {
+        if let Ok(mut c) = postgres::Client::connect(POSTGRES_URL, NoTls) {
+            let _ = c.execute(&format!("DROP TABLE IF EXISTS {}", self.0), &[]);
+        }
+    }
 }
 
-/// Run a partitioned `content_items` export with `--reconcile` through
-/// `destination_yaml`, filtered to `window`. Returns `(success, stderr)`.
+/// Seed a small `id / title / created_at` table spanning the three PART_DAYS
+/// (2 + 2 + 1 rows). Returns the table name and a guard that drops it.
+fn seed_partition_source() -> (String, PgCleanup) {
+    let table = unique_name("ci_part_src");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {table} (id BIGINT PRIMARY KEY, title TEXT, created_at TIMESTAMP);
+         INSERT INTO {table} (id, title, created_at) VALUES
+           (1, 'a', '2023-01-01 09:00:00'),
+           (2, 'b', '2023-01-01 18:00:00'),
+           (3, 'c', '2023-01-02 09:00:00'),
+           (4, 'd', '2023-01-02 18:00:00'),
+           (5, 'e', '2023-01-03 09:00:00');",
+    ))
+    .expect("seed partition source table");
+    (table.clone(), PgCleanup(table))
+}
+
+/// Run a partitioned export of `table` (by `created_at`, day) with `--reconcile`
+/// through `destination_yaml`. Returns `(success, stderr)`.
 fn run_partitioned_reconcile(
-    window: &str,
+    table: &str,
     destination_yaml: &str,
     env: &[(&str, &str)],
 ) -> (bool, String) {
@@ -78,7 +71,7 @@ source:
   url: "{POSTGRES_URL}"
 exports:
   - name: {export_name}
-    query: "SELECT id, title, created_at FROM content_items WHERE {window}"
+    query: "SELECT id, title, created_at FROM {table}"
     partition_by: created_at
     partition_granularity: day
     format: parquet
@@ -107,11 +100,11 @@ exports:
 }
 
 #[test]
-#[ignore = "live: requires docker compose postgres + minio (content_items pre-seeded)"]
-fn partition_content_items_to_s3_minio_with_reconcile() {
+#[ignore = "live: requires docker compose postgres + minio"]
+fn partition_to_s3_minio_with_reconcile() {
     require_alive(LiveService::Postgres);
     require_alive(LiveService::Minio);
-    let (window, days) = content_items_window();
+    let (table, _guard) = seed_partition_source();
 
     let bucket = "rivet-qa-parity";
     ensure_minio_bucket(bucket);
@@ -133,14 +126,12 @@ fn partition_content_items_to_s3_minio_with_reconcile() {
         ("AWS_EC2_METADATA_DISABLED", "true"),
     ];
 
-    let (ok, stderr) = run_partitioned_reconcile(&window, &dest, &env);
+    let (ok, stderr) = run_partitioned_reconcile(&table, &dest, &env);
     assert!(
         ok,
-        "partitioned content_items → S3 with --reconcile failed (reconcile/validate mismatch?):\n{stderr}"
+        "partitioned export → S3 with --reconcile failed (reconcile/validate mismatch?):\n{stderr}"
     );
 
-    // List the bucket and assert the Hive layout: one `created_at=DAY/` per day,
-    // each with a parquet.
     let script = format!(
         "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
          mc ls --recursive local/{bucket}/{base} 2>/dev/null"
@@ -150,25 +141,25 @@ fn partition_content_items_to_s3_minio_with_reconcile() {
         .output()
         .expect("mc ls");
     let listing = String::from_utf8_lossy(&ls.stdout);
-    for day in &days {
+    for day in PART_DAYS {
         assert!(
             listing.contains(day),
             "S3 bucket missing partition `{day}`;\nmc ls:\n{listing}"
         );
     }
     assert!(
-        listing.matches(".parquet").count() >= days.len(),
+        listing.matches(".parquet").count() >= PART_DAYS.len(),
         "S3 must hold >= {} parquet (one per day partition);\nmc ls:\n{listing}",
-        days.len()
+        PART_DAYS.len()
     );
 }
 
 #[test]
-#[ignore = "live: requires docker compose postgres + fake-gcs (content_items pre-seeded)"]
-fn partition_content_items_to_gcs_with_reconcile() {
+#[ignore = "live: requires docker compose postgres + fake-gcs"]
+fn partition_to_gcs_with_reconcile() {
     require_alive(LiveService::Postgres);
     require_alive(LiveService::FakeGcs);
-    let (window, days) = content_items_window();
+    let (table, _guard) = seed_partition_source();
 
     let bucket = "rivet-qa-parity-gcs";
     ensure_gcs_bucket(bucket);
@@ -183,13 +174,12 @@ fn partition_content_items_to_gcs_with_reconcile() {
       allow_anonymous: true"#
     );
 
-    let (ok, stderr) = run_partitioned_reconcile(&window, &dest, &[]);
+    let (ok, stderr) = run_partitioned_reconcile(&table, &dest, &[]);
     assert!(
         ok,
-        "partitioned content_items → GCS with --reconcile failed (reconcile/validate mismatch?):\n{stderr}"
+        "partitioned export → GCS with --reconcile failed (reconcile/validate mismatch?):\n{stderr}"
     );
 
-    // Enumerate objects via the fake-gcs list API and assert the Hive layout.
     let mut s = TcpStream::connect("127.0.0.1:4443").unwrap();
     let req = format!(
         "GET /storage/v1/b/{bucket}/o?prefix={base} HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n"
@@ -198,7 +188,7 @@ fn partition_content_items_to_gcs_with_reconcile() {
     let mut resp = String::new();
     let _ = s.read_to_string(&mut resp);
     // fake-gcs URL-encodes the `=` in object names (`created_at%3D2023-01-01`).
-    for day in &days {
+    for day in PART_DAYS {
         let encoded = day.replace('=', "%3D");
         assert!(
             resp.contains(&encoded),
@@ -206,8 +196,8 @@ fn partition_content_items_to_gcs_with_reconcile() {
         );
     }
     assert!(
-        resp.matches(".parquet").count() >= days.len(),
+        resp.matches(".parquet").count() >= PART_DAYS.len(),
         "GCS must hold >= {} parquet (one per day partition);\nlist response:\n{resp}",
-        days.len()
+        PART_DAYS.len()
     );
 }
