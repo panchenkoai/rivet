@@ -1,0 +1,54 @@
+# Rivet Example: PostgreSQL → Value-Partitioned Export → Google Cloud Storage
+#
+# Use case: lay each row under a Hive-style `created_at=YYYY-MM-DD/` sub-folder
+#           in GCS, so BigQuery / Snowflake / DuckDB can read it as a
+#           partitioned dataset and prune by date.
+#
+# Run:        export DATABASE_URL='postgresql://user:pass@host:5432/db'
+#             rivet run -c examples/pg_partitioned_gcs.yaml --reconcile
+#   --reconcile implies --validate (ADR-0013): every partition's source
+#   COUNT(*) is compared to exported rows AND its manifest + _SUCCESS are
+#   verified at the GCS prefix.
+#
+# Verify one partition on its own (validating all partitions by the parent
+# name in one command is not yet wired):
+#   rivet validate -c examples/pg_partitioned_gcs.yaml --export content_items \
+#     --prefix exports/content_items/created_at=2023-01-01/
+
+source:
+  type: postgres
+  url_env: DATABASE_URL
+
+exports:
+  - name: content_items
+    # The partition column must appear in the SELECT so the row predicate works.
+    # NOTE: it is also written into the Parquet *and* encoded in the path. DuckDB
+    # and Snowflake handle that fine; BigQuery's Hive auto-detect rejects a
+    # partition key that is also a data column — drop `created_at` from the
+    # SELECT if you point a BigQuery external table at this layout.
+    query: "SELECT id, title, created_at FROM content_items"
+
+    # --- Value-based partitioning -------------------------------------------
+    partition_by: created_at          # DATE / TIMESTAMP / TIMESTAMPTZ column
+    partition_granularity: day        # day (default) | month | year
+    # Orthogonal to `mode`: each partition runs the export's mode. `full` is
+    # simplest when a single day fits memory; switch to chunked for huge days:
+    #   mode: chunked
+    #   chunk_column: id              # dense/correlated key → clean range scans
+    #   chunk_size: 100000
+    mode: full
+
+    format: parquet
+    compression: zstd
+
+    destination:
+      type: gcs
+      bucket: my-analytics-bucket     # bucket must already exist
+      # The {partition} token expands to `created_at=2023-01-01`. The trailing
+      # slash is REQUIRED for object stores — without it the part filename is
+      # concatenated onto the segment instead of nested under it.
+      prefix: exports/content_items/{partition}/
+      # Credentials: uses Application Default Credentials (ADC) by default
+      # (`gcloud auth application-default login` or GOOGLE_APPLICATION_CREDENTIALS).
+      # For a service account key, uncomment:
+      # credentials_file: /path/to/service-account.json
