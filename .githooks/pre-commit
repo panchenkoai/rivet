@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Pre-commit gate — mirrors the CI fmt + clippy steps (.github/workflows/ci.yml)
-# byte-for-byte, so a commit can't introduce drift that CI would later reject.
+# Pre-commit gate — mirrors the CI fmt + clippy + audit steps
+# (.github/workflows/ci.yml) so a commit can't introduce drift CI would reject.
 #
 # Enable once per clone (these hooks are version-controlled under .githooks/,
 # not auto-installed):
@@ -15,6 +15,18 @@ cargo fmt --all -- --check
 
 echo "pre-commit: cargo clippy --all-targets -- -D warnings"
 cargo clippy --all-targets -- -D warnings
+
+# Dependency vulnerability gate — mirrors the CI `audit` job and honors the
+# accepted-advisory list in `.cargo/audit.toml`. Hard gate when `cargo-audit`
+# is installed; otherwise prints an install hint and continues (CI still
+# enforces it) so the hook stays usable for contributors without the tool.
+echo "pre-commit: cargo audit"
+if command -v cargo-audit >/dev/null 2>&1; then
+    cargo audit
+else
+    echo "pre-commit: cargo-audit not installed — skipping locally (CI still enforces it)."
+    echo "           install once with: cargo install cargo-audit --locked"
+fi
 
 # Best-effort knowledge-graph refresh — no-op when the tool isn't installed,
 # so this hook stays portable for contributors who don't use code-review-graph.

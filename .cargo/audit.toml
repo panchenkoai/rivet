@@ -46,4 +46,28 @@ ignore = [
     # `log::set_logger`. The unsafe path is unreachable.
     # Action: drop once upstream PR https://github.com/rust-random/rand/pull/1763
     # lands and crates we depend on pick up the fix.
+
+    # ─── tiberius (MSSQL source) → rustls 0.21 → rustls-webpki 0.101.7 ──
+    # Path: tiberius 0.12.3 → tokio-rustls 0.24 → rustls 0.21 → rustls-webpki
+    #       0.101.7 / rustls-pemfile 1.0.4.
+    # Status: tiberius 0.12 is the latest release and still pins rustls 0.21;
+    #       no release on a newer rustls exists. Its `native-tls` backend cannot
+    #       complete SQL Server's TDS-wrapped TLS login handshake (OpenSSL 3
+    #       "connection closed via error" — verified live against mssql 2022),
+    #       so `rustls` is the only working TLS for the `mssql` engine. The rest
+    #       of the tree already resolves the patched `rustls-webpki 0.103.13`;
+    #       only this old rustls pulls 0.101.7.
+    # Reachability: rivet connects only to an operator-specified SQL Server with
+    #       a pinned CA or explicit `accept_invalid_certs` (the latter is
+    #       `trust_cert` — no chain validation at all). The name-constraint
+    #       advisories trigger only when validating against a CA that asserts
+    #       name constraints (not a realistic DB-server cert) and require a MITM
+    #       presenting a crafted cert; the CRL panic needs revocation checking,
+    #       which tiberius never configures. Residual risk is narrow and
+    #       documented.
+    # Action: drop each entry when tiberius ships on a newer rustls.
+    "RUSTSEC-2026-0104", # rustls-webpki: reachable panic parsing a CRL
+    "RUSTSEC-2026-0098", # rustls-webpki: URI-name constraints incorrectly accepted
+    "RUSTSEC-2026-0099", # rustls-webpki: wildcard-name constraints accepted
+    "RUSTSEC-2025-0134", # rustls-pemfile: unmaintained
 ]

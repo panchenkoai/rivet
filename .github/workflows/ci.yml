@@ -360,10 +360,17 @@ jobs:
     name: Security audit
     runs-on: ubuntu-latest
     permissions:
-      checks: write
       contents: read
     steps:
       - uses: actions/checkout@v5
-      - uses: rustsec/audit-check@v2
+      # Run cargo-audit directly (prebuilt binary, no compile) so it honors the
+      # accepted-advisory list in `.cargo/audit.toml` — the single source of
+      # truth shared with the `.githooks/pre-commit` hook. The previous
+      # `rustsec/audit-check` action did not reliably read that file, so the
+      # MSSQL driver's unavoidable tiberius→rustls-0.21 advisories failed the
+      # gate; documenting + tracking them in one place keeps the gate green
+      # while still catching every *fixable* future advisory.
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ github.token }}
+          tool: cargo-audit
+      - run: cargo audit
