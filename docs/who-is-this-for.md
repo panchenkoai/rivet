@@ -13,8 +13,8 @@ right place.
 
 ## Yes, Rivet is probably a good fit if…
 
-- You need to **dump rows from PostgreSQL or MySQL into Parquet or
-  CSV files** — locally, on S3, GCS, or Azure Blob Storage.
+- You need to **dump rows from PostgreSQL, MySQL, or SQL Server into
+  Parquet or CSV files** — locally, on S3, GCS, or Azure Blob Storage.
 - The source database is **fragile, production-shared, or behind a
   pooler** (pgBouncer, ProxySQL, MaxScale) and a careless `SELECT *`
   is going to hurt someone.

@@ -19,10 +19,29 @@ builds and the same YAML configs drive every target.
 | PostgreSQL |       16 | Supported (primary target) |
 | MySQL      |      5.7 | Supported (EOL upstream Oct 2023) |
 | MySQL      |      8.0 | Supported (primary target) |
+| SQL Server |     2022 | Supported (primary target) |
 
 "Primary target" means the version that runs the e2e suite by default in the
-local `docker-compose.yaml` top-level `postgres` / `mysql` services. "Legacy"
-versions are opt-in under the `legacy` compose profile (see below).
+local `docker-compose.yaml` top-level `postgres` / `mysql` / `mssql` services.
+"Legacy" versions are opt-in under the `legacy` compose profile (see below).
+
+### SQL Server (MSSQL) — current scope
+
+SQL Server is a source engine (`source.type: mssql`, scheme `sqlserver://`,
+default port 1433), driven by the async `tiberius` client. Supported today:
+
+- **Modes**: `full` / snapshot, `incremental`, `chunked` (range + dense).
+  **Keyset (seek) pagination is not yet wired** — T-SQL spells `LIMIT` as
+  `OFFSET … FETCH`, which the shared page builder does not emit yet; a keyset
+  config bails loudly rather than send invalid SQL.
+- **Types** (live-validated through the DuckDB + ClickHouse Parquet oracles):
+  `int`/`bigint`/`smallint`/`tinyint`, `bit`, `decimal`/`numeric`,
+  `real`/`float`, `money`, `date`, `time`, `datetime2`, `nvarchar`/`varchar`/
+  `char`, `varbinary`, `uniqueidentifier` (→ native Parquet `LogicalType::Uuid`).
+  `datetimeoffset` is mapped but not yet roundtrip-verified.
+- **TLS**: required on the login handshake (SQL Server always encrypts it).
+  Set `tls.ca_file:` for a private CA, or `tls.accept_invalid_certs: true` for a
+  self-signed dev cert.
 
 ### Why these versions
 
