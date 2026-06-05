@@ -127,6 +127,12 @@ serde_yaml_ng = "0.10"
 criterion = { version = "0.8", features = ["html_reports"] }
 # OPT-3: property-based type round-trip (tests/type_roundtrip/property.rs).
 proptest = "1"
+# MSSQL type-roundtrip harness (tests/common/mssql.rs) needs the async driver
+# directly to seed fixtures — same crates the lib uses, exposed to the
+# integration-test crate.
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono", "rustls"] }
+tokio = { version = "1.50.0", features = ["rt-multi-thread", "net", "time"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 
 [[bench]]
 name = "hot_paths"

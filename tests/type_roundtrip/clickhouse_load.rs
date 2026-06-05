@@ -17,8 +17,9 @@
 use crate::common::*;
 
 use super::helpers::{
-    MysqlCleanup, PgCleanup, run_mysql_matrix_export, run_pg_matrix_export,
-    setup_mysql_matrix_table, setup_pg_matrix_table,
+    MssqlCleanup, MysqlCleanup, PgCleanup, run_mssql_matrix_export, run_mysql_matrix_export,
+    run_pg_matrix_export, setup_mssql_matrix_table, setup_mysql_matrix_table,
+    setup_pg_matrix_table,
 };
 
 /// `path` is the in-container glob (relative to `/work` thanks to the
@@ -267,4 +268,82 @@ fn clickhouse_validates_mysql_type_matrix_parquet() {
     ));
     assert!(bits["c_bit1"].as_bool().unwrap());
     assert_eq!(bits["bit8"].as_str().unwrap(), "255");
+}
+
+// ─── SQL Server matrix → Parquet → ClickHouse ──────────────────────────────
+
+#[test]
+#[ignore = "live: requires docker compose mssql + clickhouse"]
+fn clickhouse_validates_mssql_type_matrix_parquet() {
+    require_alive(LiveService::Mssql);
+    require_alive(LiveService::ClickHouse);
+
+    let table_name = unique_name("ch_ms");
+    setup_mssql_matrix_table(&table_name);
+    let _guard = MssqlCleanup(table_name.clone());
+
+    let (host_dir, container_dir) = clickhouse_shared_workdir(&unique_name("ch_ms_out"));
+    run_mssql_matrix_export(&table_name, "parquet", &host_dir);
+    let rel = container_dir.strip_prefix("/work/").unwrap();
+    let glob = format!("{rel}/*.parquet");
+
+    // 1) ClickHouse autoload types. tinyint widens to Int16, bit → Bool,
+    //    decimal scale survives, uniqueidentifier lands as FixedString(16)
+    //    (CH 24.x reads the arrow.uuid logical type as 16 raw bytes).
+    let described = clickhouse_run_sql_json(&format!("DESCRIBE TABLE file('{glob}', 'Parquet')"));
+    let actual = clickhouse_parse_describe(described);
+    let expected = [
+        ("id", "Nullable(Int64)"),
+        ("c_smallint", "Nullable(Int16)"),
+        ("c_int", "Nullable(Int32)"),
+        ("c_bigint", "Nullable(Int64)"),
+        ("c_tinyint", "Nullable(Int16)"),
+        ("c_bit", "Nullable(Bool)"),
+        ("amount", "Nullable(Decimal(18, 2))"),
+        ("fee", "Nullable(Decimal(20, 6))"),
+        ("price", "Nullable(Decimal(10, 2))"),
+        ("c_real", "Nullable(Float32)"),
+        ("c_float", "Nullable(Float64)"),
+        ("c_date", "Nullable(Date32)"),
+        ("created_at", "Nullable(DateTime64(6))"),
+        ("label", "Nullable(String)"),
+        ("c_varchar", "Nullable(String)"),
+        ("raw_bytes", "Nullable(String)"),
+        ("uid", "Nullable(FixedString(16))"),
+        ("c_nvarchar", "Nullable(String)"),
+    ];
+    for (col, want) in expected {
+        let got = actual
+            .get(col)
+            .unwrap_or_else(|| panic!("clickhouse did not see column `{col}`: {actual:?}"));
+        assert_eq!(
+            got, want,
+            "clickhouse autoload type for `{col}`: expected {want}, got {got}"
+        );
+    }
+
+    // 2) Aggregates: 3 rows, signed bigint sums to zero, decimal scale preserved.
+    let agg = ch_one(&format!(
+        "SELECT count(*) AS n, toString(sum(c_bigint)) AS sb, toString(sum(amount)) AS sa
+         FROM file('{glob}', 'Parquet')"
+    ));
+    assert_eq!(agg["n"].as_str().unwrap(), "3");
+    assert_eq!(agg["sb"].as_str().unwrap(), "0");
+    assert_eq!(
+        agg["sa"].as_str().unwrap(),
+        "1234.55",
+        "decimal scale must survive into ClickHouse"
+    );
+
+    // 3) Unicode text byte-exact; all-null column is null for every row.
+    let txt = ch_one(&format!(
+        "SELECT c_nvarchar, toString(isNull(note_all_null)) AS an
+         FROM file('{glob}', 'Parquet') WHERE id = 1"
+    ));
+    assert_eq!(txt["c_nvarchar"].as_str().unwrap(), "héllo wörld");
+    assert_eq!(
+        txt["an"].as_str().unwrap(),
+        "1",
+        "note_all_null must be NULL"
+    );
 }
