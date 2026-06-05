@@ -93,13 +93,28 @@ pub(super) fn mssql_type_to_rivet(col: &Column, overrides: &ColumnOverrides) -> 
 pub(super) fn mssql_columns_to_schema(
     columns: &[Column],
     overrides: &ColumnOverrides,
+    rows: &[Row],
 ) -> Result<(Schema, Vec<(String, ColumnType)>)> {
     let mut fields: Vec<Field> = Vec::with_capacity(columns.len());
     let mut decoders: Vec<(String, ColumnType)> = Vec::with_capacity(columns.len());
     let mut errors: Vec<String> = Vec::new();
 
-    for col in columns {
-        let rivet = mssql_type_to_rivet(col, overrides);
+    for (idx, col) in columns.iter().enumerate() {
+        let mut rivet = mssql_type_to_rivet(col, overrides);
+        // tiberius' `Column` drops a decimal's declared precision/scale (only the
+        // type tag survives), so an autodetected `Decimal` carries a placeholder
+        // scale. Recover the real scale from the data — every `Numeric` value in
+        // a column shares it — so a `decimal(12,2)` does not silently truncate to
+        // scale 0. A user `columns:` override wins and is left untouched.
+        if !overrides.contains_key(col.name())
+            && let RivetType::Decimal { precision, .. } = rivet
+            && let Some(s) = decimal_scale_from_rows(idx, rows)
+        {
+            rivet = RivetType::Decimal {
+                precision: precision.max(s),
+                scale: s as i8,
+            };
+        }
         let native = format!("{:?}", col.column_type()).to_lowercase();
         let source = SourceColumn::simple(col.name(), native, true);
         let mapping = TypeMapping::from_source(&source, rivet);
@@ -151,6 +166,16 @@ pub(super) fn mssql_type_mappings(
 /// Fetch the `ColumnData` of column `idx` from a row without consuming it.
 fn cell(row: &Row, idx: usize) -> Option<&ColumnData<'static>> {
     row.cells().nth(idx).map(|(_, d)| d)
+}
+
+/// The decimal scale of column `idx`, read from the first non-null `Numeric`
+/// value (all values in a column share it). `None` when the column is all-null
+/// or empty — the caller keeps its placeholder scale (no values to misalign).
+fn decimal_scale_from_rows(idx: usize, rows: &[Row]) -> Option<u8> {
+    rows.iter().find_map(|row| match cell(row, idx) {
+        Some(ColumnData::Numeric(Some(n))) => Some(n.scale()),
+        _ => None,
+    })
 }
 
 /// Build one Arrow array for column `idx`, dispatching on the Arrow target type

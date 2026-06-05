@@ -172,11 +172,14 @@ impl Source for MssqlSource {
                 .map_err(|e| anyhow::anyhow!("mssql: reading result metadata failed: {e}"))?
                 .map(<[_]>::to_vec)
                 .unwrap_or_default();
-            let (schema, _decoders) = arrow_convert::mssql_columns_to_schema(&columns, &overrides)?;
             let rows = stream
                 .into_first_result()
                 .await
                 .map_err(|e| anyhow::anyhow!("mssql: streaming rows failed: {e}"))?;
+            // Schema after rows: decimal scale is recovered from the data
+            // (tiberius hides a column's declared precision/scale).
+            let (schema, _decoders) =
+                arrow_convert::mssql_columns_to_schema(&columns, &overrides, &rows)?;
             Ok::<_, anyhow::Error>((Arc::new(schema), rows))
         })?;
 

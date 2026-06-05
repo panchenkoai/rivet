@@ -99,7 +99,7 @@ tokio = { version = "1.50.0", features = ["rt-multi-thread", "net", "time"] }
 # via a per-source `tokio` current-thread runtime + `block_on` (ADR-0011 keeps
 # `Source` sync). `native-tls` matches the OpenSSL stack the PG/MySQL drivers
 # already vendor; `rustls` default is disabled to avoid a second TLS tree.
-tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono", "native-tls"] }
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono", "rustls"] }
 # `compat` bridges a tokio `TcpStream` to the `futures-io` traits tiberius'
 # `Client::connect` expects.
 tokio-util = { version = "0.7", features = ["compat"] }
