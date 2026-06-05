@@ -30,10 +30,10 @@ local `docker-compose.yaml` top-level `postgres` / `mysql` / `mssql` services.
 SQL Server is a source engine (`source.type: mssql`, scheme `sqlserver://`,
 default port 1433), driven by the async `tiberius` client. Supported today:
 
-- **Modes**: `full` / snapshot, `incremental`, `chunked` (range + dense).
-  **Keyset (seek) pagination is not yet wired** — T-SQL spells `LIMIT` as
-  `OFFSET … FETCH`, which the shared page builder does not emit yet; a keyset
-  config bails loudly rather than send invalid SQL.
+- **Modes**: `full` / snapshot, `incremental`, `chunked` (range + dense), and
+  **keyset (seek)** via explicit `chunk_by_key` — the ideal shape for a
+  non-integer PK (UUID / string). The page builder emits the T-SQL
+  `OFFSET 0 ROWS FETCH NEXT n ROWS ONLY` clause (T-SQL has no `LIMIT`).
 - **Types** (live-validated through the DuckDB + ClickHouse Parquet oracles):
   `int`/`bigint`/`smallint`/`tinyint`, `bit`, `decimal`/`numeric`,
   `real`/`float`, `money`, `date`, `time`, `datetime2`, `nvarchar`/`varchar`/

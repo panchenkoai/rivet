@@ -10,11 +10,10 @@
 //! - cursor literal `N'…'` with `''` escaping (`query::cursor_rhs`)
 //! - introspection via `sys.*` catalog views
 //!
-//! Supported today: snapshot / incremental / chunked (range + dense) export,
-//! `check --type-report`, `doctor`, chunked-mode planning. **Keyset (seek)
-//! pagination is not yet wired** — the shared page builder emits `LIMIT`, which
-//! T-SQL spells `OFFSET … FETCH`; an MSSQL arm there is the next step. Until
-//! then a keyset request bails loudly rather than send invalid SQL.
+//! Supported today: snapshot / incremental / chunked (range + dense) and keyset
+//! (seek) export, `check --type-report`, `doctor`, chunked-mode planning. The
+//! keyset page builder emits a dialect-correct
+//! `OFFSET 0 ROWS FETCH NEXT n ROWS ONLY` clause (T-SQL has no `LIMIT`).
 
 mod arrow_convert;
 
@@ -149,13 +148,9 @@ impl MssqlSource {
 
 impl Source for MssqlSource {
     fn export(&mut self, request: &ExportRequest<'_>, sink: &mut dyn BatchSink) -> Result<()> {
-        if request.page_limit.is_some() {
-            anyhow::bail!(
-                "mssql: keyset (seek) pagination is not yet supported — the page builder emits \
-                 `LIMIT`, which T-SQL spells `OFFSET … FETCH`. Use `mode: chunked` with a range \
-                 `chunk_column`, or `mode: full`."
-            );
-        }
+        // Keyset (seek) pages now build a dialect-correct
+        // `OFFSET 0 ROWS FETCH NEXT n ROWS ONLY` clause (T-SQL has no `LIMIT`),
+        // so the page-limit path is supported like the other runners.
         let built = build_export_query(request, crate::config::SourceType::Mssql);
         let sql = built.sql.clone();
         let overrides = request.column_overrides.clone();
