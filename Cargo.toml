@@ -94,7 +94,15 @@ serde_yaml_ng = "0.10"
 schemars = { version = "1", features = ["preserve_order"] }
 tempfile = "3"
 tikv-jemallocator = { version = "0.7", optional = true }
-tokio = { version = "1.50.0", features = ["rt-multi-thread"] }
+tokio = { version = "1.50.0", features = ["rt-multi-thread", "net", "time"] }
+# MSSQL / SQL Server source driver (async). Bridged to the sync `Source` trait
+# via a per-source `tokio` current-thread runtime + `block_on` (ADR-0011 keeps
+# `Source` sync). `native-tls` matches the OpenSSL stack the PG/MySQL drivers
+# already vendor; `rustls` default is disabled to avoid a second TLS tree.
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono", "native-tls"] }
+# `compat` bridges a tokio `TcpStream` to the `futures-io` traits tiberius'
+# `Client::connect` expects.
+tokio-util = { version = "0.7", features = ["compat"] }
 reqsign = "0.16"
 # Single reqwest version (0.12) shared with the one reqsign 0.16 / opendal pull
 # in. Keeping one HTTP+TLS stack avoids duplicating rustls / hyper / h2 in the

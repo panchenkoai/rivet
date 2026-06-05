@@ -127,6 +127,12 @@ fn check_source_auth(config: &Config) -> Result<()> {
             conn.query_drop("SELECT 1")?;
             Ok(())
         }
+        SourceType::Mssql => {
+            // `connect_with_tls` runs a connect + `SELECT 1` round-trip itself,
+            // so a successful construction is a green health-check.
+            crate::source::mssql::MssqlSource::connect_with_tls(&url, tls)?;
+            Ok(())
+        }
     }
 }
 
@@ -235,6 +241,9 @@ pub(super) fn source_error_hint(
             SourceType::Mysql => {
                 "TLS handshake failed. Try `tls.mode: prefer` or set `tls.ca_file: /path/to/ca-bundle.pem` to trust the DB's certificate authority."
             }
+            SourceType::Mssql => {
+                "TLS handshake failed. SQL Server forces TLS on the login handshake; set `tls.ca_file: /path/to/ca-bundle.pem` to trust a private CA, or `tls.accept_invalid_certs: true` for a self-signed dev cert."
+            }
         });
     }
 
@@ -245,6 +254,9 @@ pub(super) fn source_error_hint(
             }
             SourceType::Mysql => {
                 "Verify the user/password and that the user has SELECT grants on the target tables. MySQL `GRANT SELECT ON db.* TO 'user'@'host'` plus `FLUSH PRIVILEGES`."
+            }
+            SourceType::Mssql => {
+                "Verify the SQL login/password and that the login maps to a database user with SELECT on the target tables (`GRANT SELECT ON dbo.tbl TO [user]`). Check you are pointed at the right database — contained-DB users and server logins are resolved differently."
             }
         }),
         "connectivity error" => Some(

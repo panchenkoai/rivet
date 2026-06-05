@@ -208,7 +208,28 @@ fn cursor_rhs(source_type: SourceType, value: &str) -> (String, Option<String>) 
     match source_type {
         SourceType::Mysql => ("?".to_string(), Some(value.to_string())),
         SourceType::Postgres => (escape_pg_literal(value), None),
+        // SQL Server: in-SQL `N'…'` unicode literal, server implicit-casts to the
+        // column type (same rationale as Postgres — the keyset/cursor column may
+        // be int, datetime2, uniqueidentifier, …). No backslash escaping in
+        // T-SQL; only `'` is doubled.
+        SourceType::Mssql => (escape_mssql_literal(value), None),
     }
+}
+
+/// Quote `s` as a T-SQL `N'…'` unicode string literal. SQL Server escapes only
+/// the single quote (by doubling); backslash is a literal character (unlike
+/// Postgres `E'…'`). The `N` prefix keeps non-ASCII cursor values intact.
+pub(crate) fn escape_mssql_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    out.push_str("N'");
+    for c in s.chars() {
+        if c == '\'' {
+            out.push('\'');
+        }
+        out.push(c);
+    }
+    out.push('\'');
+    out
 }
 
 /// Quote `s` as a Postgres `E'…'` string literal, escaping both `'` and `\`.

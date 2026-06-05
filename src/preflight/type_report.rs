@@ -91,6 +91,7 @@ pub fn collect_report(
             &url, tls,
         )?),
         SourceType::Mysql => Box::new(source::mysql::MysqlSource::connect_with_tls(&url, tls)?),
+        SourceType::Mssql => Box::new(source::mssql::MssqlSource::connect_with_tls(&url, tls)?),
     };
 
     let mappings = src.type_mappings(&query, column_overrides)?;

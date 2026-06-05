@@ -232,12 +232,14 @@ impl SourceConfig {
         let default_port = match self.source_type {
             SourceType::Postgres => 5432,
             SourceType::Mysql => 3306,
+            SourceType::Mssql => 1433,
         };
         let port = self.port.unwrap_or(default_port);
 
         let scheme = match self.source_type {
             SourceType::Postgres => "postgresql",
             SourceType::Mysql => "mysql",
+            SourceType::Mssql => "sqlserver",
         };
 
         if password.is_empty() {
@@ -359,6 +361,7 @@ impl SourceConfig {
 pub enum SourceType {
     Postgres,
     Mysql,
+    Mssql,
 }
 
 /// Locate `user[:password]@` userinfo inside a standard URL.

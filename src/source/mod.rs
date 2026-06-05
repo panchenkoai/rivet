@@ -1,3 +1,4 @@
+pub mod mssql;
 pub mod mysql;
 pub(crate) mod pg_numeric_wire;
 pub mod postgres;
@@ -226,6 +227,10 @@ pub fn create_source(config: &SourceConfig) -> Result<Box<dyn Source>> {
             config.tls.as_ref(),
         )?)),
         SourceType::Mysql => Ok(Box::new(mysql::MysqlSource::connect_with_tls(
+            &url,
+            config.tls.as_ref(),
+        )?)),
+        SourceType::Mssql => Ok(Box::new(mssql::MssqlSource::connect_with_tls(
             &url,
             config.tls.as_ref(),
         )?)),

@@ -262,6 +262,13 @@ fn resolve_chunked_strategy(
                 tbl,
             )
         }
+        crate::config::SourceType::Mssql => {
+            crate::source::mssql::introspect_mssql_table_for_chunking(
+                &url,
+                config.source.tls.as_ref(),
+                tbl,
+            )
+        }
     }
     .map_err(|e| {
         anyhow::anyhow!(

@@ -143,6 +143,7 @@ pub(super) fn finalize_manifest(
     let source_engine = match plan.source.source_type {
         crate::config::SourceType::Postgres => "postgres",
         crate::config::SourceType::Mysql => "mysql",
+        crate::config::SourceType::Mssql => "mssql",
     };
 
     // `export_name` is often `schema.table`; split for the manifest fields
