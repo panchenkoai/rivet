@@ -170,13 +170,23 @@ jobs:
         run: mkdir -p tests/.live-tmp
 
       - name: Start source + oracle containers
-        # postgres/mysql are the sources; duckdb + clickhouse are independent
-        # Parquet *readers* (ADR-0014 oracles) that read back what rivet wrote
-        # and assert field-by-field type fidelity. The duckdb image pip-installs
-        # duckdb/pytz/pyarrow on boot, so `--wait` blocks on its healthcheck
-        # (start_period 30s) before tests run. All four share the
-        # ./tests/.live-tmp:/work bind mount the readers glob over.
-        run: docker compose up -d --wait postgres mysql duckdb clickhouse
+        # postgres/mysql/mssql are the sources; duckdb + clickhouse are
+        # independent Parquet *readers* (ADR-0014 oracles) that read back what
+        # rivet wrote and assert field-by-field type fidelity. The duckdb image
+        # pip-installs duckdb/pytz/pyarrow on boot, so `--wait` blocks on its
+        # healthcheck (start_period 30s) before tests run. The reader containers
+        # share the ./tests/.live-tmp:/work bind mount they glob over.
+        run: docker compose up -d --wait postgres mysql duckdb clickhouse mssql
+
+      - name: Seed MSSQL database
+        # The SQL Server image has no /docker-entrypoint-initdb.d hook, so create
+        # the `rivet` database via dev/mssql/init.sql once the container is
+        # healthy (`--wait` blocked on its SELECT-1 healthcheck). The
+        # type-roundtrip validators create their per-test matrix tables inside it.
+        run: |
+          docker compose cp dev/mssql/init.sql mssql:/tmp/init.sql
+          docker compose exec -T mssql /opt/mssql-tools18/bin/sqlcmd \
+            -S localhost -U sa -P 'Rivet_Passw0rd!' -C -i /tmp/init.sql
 
       - name: Reopen shared mount after ClickHouse chowns it
         # ClickHouse chowns its user_files_path (/work = ./tests/.live-tmp) to
