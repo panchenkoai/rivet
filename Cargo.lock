@@ -3053,7 +3053,7 @@ dependencies = [
  "libc",
  "log",
  "mach2",
- "md-5 0.10.6",
+ "md-5 0.11.0",
  "mysql",
  "native-tls",
  "opendal",
