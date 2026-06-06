@@ -82,39 +82,46 @@ ClickHouse has no `mssql()` table function (both drop out); odbc2parquet needs
 the MS ODBC Driver 18, not installed on the bench host. Harness:
 [`bench_mssql.sh`](../harness/bench_mssql.sh) (`gtime -v` for wall/RSS),
 seed [`seed_bench_mssql.sql`](../../../dev/bench/seed_bench_mssql.sql), against
-live SQL Server 2022. rivet config: `mode: chunked`, **`chunk_size_memory_mb: 256`**
-(the same default-ish config the PG/MySQL benches use — see the caveat below).
+live SQL Server 2022. rivet config: `mode: chunked`, `chunk_size_memory_mb: 256`
+— but rivet now **streams** (one Arrow batch per `batch_size` rows), so RSS is
+bounded by `batch_size`, not the chunk size, on every table.
 
-## Per-table — wall (s) / peak RSS (MB)
+## Per-table — wall (s) / peak RSS (MB), streaming rivet
 
 | Table (rows) | rivet | sling | dlt |
 |---|---|---|---|
-| bench_narrow (500 k) | **0.67 / 209** | 4.04 / 95 | 6.90 / 142 |
-| bench_hc (200 k) | **0.75 / 130** | 2.37 / 94 | 5.00 / 157 |
-| bench_decimal (200 k) | **0.42 / 121** | 2.51 / 95 | 4.86 / 162 |
-| bench_sparse (10 k) | **0.22 / 21** | 1.04 / 84 | 1.80 / 139 |
-| users (500) | **0.21 / 15** | 0.93 / 79 | 1.68 / 131 |
-| orders (2.5 k) | **0.21 / 17** | 0.95 / 83 | 1.69 / 133 |
-| events (5 k) | **0.21 / 18** | 0.95 / 86 | 1.78 / 135 |
-| page_views (5 k) | **0.27 / 32** | 1.26 / 93 | 2.16 / 146 |
-| bench_wide (100 k, 10×200 B) | 7.21 / 340 | **3.60 / 96** | 7.22 / 264 |
-| content_items (60 k, heavy) | 10.81 / 475 | **6.20 / 104** | 10.35 / 445 |
+| bench_narrow (500 k) | **0.56 / 38** | 4.30 / 94 | 7.73 / 147 |
+| bench_hc (200 k) | **0.74 / 49** | 2.39 / 94 | 4.89 / 157 |
+| bench_decimal (200 k) | **0.42 / 41** | 2.50 / 95 | 4.78 / 163 |
+| bench_sparse (10 k) | **0.21 / 21** | 0.99 / 84 | 1.74 / 138 |
+| users (500) | **0.20 / 15** | 1.09 / 79 | 1.66 / 132 |
+| orders (2.5 k) | **0.20 / 17** | 0.93 / 83 | 1.69 / 133 |
+| events (5 k) | **0.21 / 18** | 0.95 / 86 | 1.69 / 134 |
+| page_views (5 k) | **0.20 / 32** | 1.02 / 93 | 1.78 / 147 |
+| bench_wide (100 k, 10×200 B) | 7.03 / **76** | **3.58** / 98 | 7.79 / 264 |
+| content_items (60 k, heavy) | 10.30 / 155 | **4.04 / 106** | 9.88 / 455 |
+
+(Previous, pre-streaming rivet RSS for reference: bench_narrow 209 → 38 MB,
+bench_wide 340 → 76 MB, content_items 475 → 155 MB.)
 
 ## Reading it
 
-- **Throughput / narrow-to-medium rows — rivet wins decisively.** Sub-second on
-  every table up to 500 k narrow rows, 3–30× faster than sling/dlt, and the lowest
-  RSS on those (it streams small Arrow batches out).
-- **Wide / heavy-text rows — rivet loses on memory and wall** (bench_wide,
-  content_items). This is the SQL Server engine's per-chunk buffering (no server
-  cursor) **amplified by the config**: `chunk_size_memory_mb` can't size by bytes
-  on MSSQL, so each chunk is ~500 k rows regardless of width → multi-GB buffers on
-  wide rows. sling/dlt stream natively and stay flat (~100 MB).
+- **Throughput / narrow-to-medium rows — rivet wins outright.** Sub-second on
+  every table up to 500 k narrow rows (3–30× faster than sling/dlt) **and the
+  lowest RSS** — streaming holds it at 15–49 MB, well under sling's ~90 MB.
+- **Memory — rivet is now lowest or competitive everywhere**, including the wide
+  tables (bench_wide 76 MB < sling 98 MB). The pre-streaming multi-GB wide-row
+  RSS is gone.
+- **Wide / heavy-text rows — rivet still trails on *wall*** (bench_wide 7.0 s vs
+  sling 3.6 s; content_items 10.3 s vs sling 4.0 s). The remaining gap is the
+  `tiberius` decode of wide rows, **not** memory. (Decode-path speedups are
+  roadmap; sling/dlt's native streaming readers are faster on these shapes.)
 
-## Memory is a config/engine artifact, not a floor — measured on 2 M content_items
+## Big-table memory — measured on 2 M content_items
 
-The matrix above ran rivet with `chunk_size_memory_mb: 256`, which on SQL Server
-buffers ~500 k-row chunks → multi-GB RSS on wide rows. That was the per-chunk
+Before streaming, the only way to bound RSS on a big heavy table was a tiny
+`chunk_size` → hundreds of tiny files, or `chunk_size_memory_mb` buffered
+~500 k-row chunks → multi-GB. That was the per-chunk
 **buffering** limitation. The engine now **streams** (emits one Arrow batch per
 `batch_size` rows), so RSS is bounded by `batch_size`, not `chunk_size`.
 
