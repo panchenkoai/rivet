@@ -3085,7 +3085,7 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
  "tokio-util",
- "uuid 0.8.2",
+ "uuid 1.23.1",
  "xxhash-rust",
  "zeroize",
 ]
