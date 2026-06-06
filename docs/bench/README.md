@@ -34,6 +34,7 @@ Full numbers in [`reports/`](reports/):
 
 - [`REPORT_pg.md`](reports/REPORT_pg.md) — Postgres, 6 tools × 22 tables (defaults)
 - [`REPORT_mysql.md`](reports/REPORT_mysql.md) — MySQL, 5 tools × 17 tables (defaults)
+- [`REPORT_mssql.md`](reports/REPORT_mssql.md) — SQL Server, **DBA-harm signals** (lock / transaction / log footprint; competitive perf matrix deferred)
 - [`REPORT_combined.md`](reports/REPORT_combined.md) — PG ↔ MySQL drift per tool
 - [`REPORT_steelman.md`](reports/REPORT_steelman.md) — same suite re-run with every other tool's chunking / memory knobs tuned, to answer "do they catch up if you put effort in?"
 
@@ -50,6 +51,9 @@ Full numbers in [`reports/`](reports/):
 
 Postgres uses [`dev/bench/seed_bench_pg.sql`](../../dev/bench/seed_bench_pg.sql);
 MySQL uses [`dev/bench/seed_bench_mysql.sql`](../../dev/bench/seed_bench_mysql.sql).
+SQL Server (DBA-harm probe only) uses
+[`dev/bench/seed_bench_mssql.sql`](../../dev/bench/seed_bench_mssql.sql) +
+[`harness/mssql_db_bench.sh`](harness/mssql_db_bench.sh).
 Both seed the same `content_items`, `page_views`, `audit_log`, `users`, etc.
 shapes used in the published runs. Apply them once after the containers come up.
 

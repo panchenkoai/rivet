@@ -19,6 +19,12 @@
   (precision 7 = 100 ns) incremental cursor lands one tick below the source max
   and re-exports the boundary row each run — use `datetime2(6)` or coarser.
   Reliability / type-mapping / tuning matrices gained SQL Server rows.
+- **`bench(mssql)`** — DBA-harm matrix for SQL Server
+  ([`REPORT_mssql.md`](docs/bench/reports/REPORT_mssql.md) +
+  `mssql_db_bench.sh`): measured against live SQL Server 2022, rivet's chunked
+  autocommit reads hold **no long transaction** (0 ms), pin **nothing** back
+  from log truncation, add **zero** write pressure (read-only), and take a
+  **3–4 lock** peak footprint. Competitive performance matrix deferred.
 
 ## 0.9.1 (2026-06-06) — SQL Server Source Engine
 
