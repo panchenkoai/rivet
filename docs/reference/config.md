@@ -18,12 +18,12 @@ Every field Rivet accepts in a config YAML, grouped by section.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `type` | `postgres` \| `mysql` | **yes** | — | Database type |
-| `url` | string | one of url/url_env/url_file or structured | — | Full connection URL |
+| `type` | `postgres` \| `mysql` \| `mssql` | **yes** | — | Database type. `mssql` = SQL Server (URL scheme `sqlserver://`). |
+| `url` | string | one of url/url_env/url_file or structured | — | Full connection URL (`postgresql://` / `mysql://` / `sqlserver://`) |
 | `url_env` | string | | — | Env var name containing the URL |
 | `url_file` | string | | — | Path to file containing the URL |
 | `host` | string | for structured | — | Database hostname |
-| `port` | integer | no | `5432` (PG) / `3306` (MySQL) | Database port |
+| `port` | integer | no | `5432` (PG) / `3306` (MySQL) / `1433` (MSSQL) | Database port |
 | `user` | string | for structured | — | Database user |
 | `password` | string | no | — | **Not recommended** — plaintext; see [Credentials & plan artifacts](#credentials--plan-artifacts) below |
 | `password_env` | string | no | — | Env var name containing the password (recommended) |
@@ -68,6 +68,21 @@ source:
   database: rivet
   tls: { mode: disable }       # explicit opt-out — silences the plaintext WARN
 ```
+
+Example (SQL Server — `sqlserver://` scheme, port 1433):
+
+```yaml
+source:
+  type: mssql
+  url_env: MSSQL_URL           # sqlserver://user:pass@host:1433/database
+  tls:
+    ca_file: /etc/ssl/certs/your-sql-server-ca.pem   # private CA, or:
+    # accept_invalid_certs: true                      # self-signed dev cert
+```
+
+SQL Server always encrypts the login handshake, so TLS is on regardless; the
+`tls:` block only controls how the server certificate is trusted. Supported
+export modes and types are listed in [compatibility.md](compatibility.md#sql-server-mssql--current-scope).
 
 When `tls:` is omitted entirely, Rivet connects without TLS and emits a WARN so you notice. See [reference/compatibility.md](compatibility.md) for which servers ship TLS-ready and Rivet's dev-environment defaults.
 

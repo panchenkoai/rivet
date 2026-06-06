@@ -1,0 +1,44 @@
+# Dependabot keeps dependencies current so security patches and bug fixes flow
+# in regularly instead of accumulating. Every PR it opens is gated by the full
+# CI suite (fmt, clippy, the test matrix, AND `cargo audit`), so an update only
+# merges if it is green — review the diff, then merge.
+#
+# Strategy (see docs/reference/testing.md):
+#   * patch + minor (within-semver, low-risk) are grouped into one weekly PR.
+#   * major (semver-breaking) bumps come as individual PRs so each API change is
+#     reviewed and tested on its own.
+#   * GitHub also opens out-of-band *security* PRs the moment an advisory with a
+#     fix lands — that is how the accepted advisories in `.cargo/audit.toml`
+#     (e.g. the `rand` entry, or tiberius's rustls bump) get retired.
+version: 2
+updates:
+  # ── Rust crates ──────────────────────────────────────────────────────────
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    # One combined PR for the low-risk churn; majors stay separate.
+    groups:
+      patch-and-minor:
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: "deps"
+    labels:
+      - dependencies
+
+  # ── GitHub Actions used by the workflows ─────────────────────────────────
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    labels:
+      - dependencies
+      - github-actions

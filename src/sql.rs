@@ -23,6 +23,8 @@ pub(crate) fn quote_ident(source_type: SourceType, name: &str) -> String {
     match source_type {
         SourceType::Postgres => format!("\"{}\"", name.replace('"', "\"\"")),
         SourceType::Mysql => format!("`{}`", name.replace('`', "``")),
+        // SQL Server bracket-quoting: `[col]`; internal `]` doubled (`[a]]b]`).
+        SourceType::Mssql => format!("[{}]", name.replace(']', "]]")),
     }
 }
 

@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.9.1 (2026-06-06) — SQL Server Source Engine
+
+> Rivet gains a third source engine: **SQL Server (MSSQL)**. Point it at a
+> `sqlserver://` URL and it extracts the same way it does for PostgreSQL/MySQL —
+> snapshot, incremental, chunked (range + dense), and **keyset (seek)** for
+> non-integer PKs — into Parquet/CSV on local/S3/GCS/Azure. Every type and mode
+> is live-verified against SQL Server 2022 and round-tripped through the same
+> DuckDB / ClickHouse / BigQuery oracles that gate PostgreSQL and MySQL, so a
+> `decimal(18,2)`, a `uniqueidentifier`, or a `datetime2` lands byte-exact
+> downstream. No change for existing PG/MySQL exports.
+
+### SQL Server source
+
+- **`feat(mssql)`** — new `source.type: mssql` engine on the async `tiberius`
+  driver, bridged to the sync `Source` trait via a per-source tokio runtime
+  (ADR-0011 keeps `Source` sync). Routed through every shared seam: identifier
+  quoting `[col]`, cursor literal `N'…'`, `sys.*` chunk-planning introspection,
+  preflight/doctor, and the `OPT-2` back-pressure governor (`Log Flush Waits`
+  perfmon counter — the SQL Server analog of MySQL `Innodb_log_waits`).
+- **`feat(mssql)`** — export modes: `full` / snapshot, `incremental`, `chunked`
+  (range + dense), and **keyset (seek)** via `chunk_by_key` for non-integer PKs
+  (UUID / string). The keyset page builder emits the T-SQL
+  `OFFSET 0 ROWS FETCH NEXT n ROWS ONLY` (T-SQL has no `LIMIT`).
+- **`feat(mssql)`** — type matrix → Arrow/Parquet, live-validated: int family,
+  `bit`, `decimal`/`numeric` (scale recovered from the data, since `tiberius`
+  drops declared precision), `real`/`float`, `money`, `date`, `time`,
+  `datetime2`, `nvarchar`/`varchar`/`char`, `varbinary`, and `uniqueidentifier`
+  → native Parquet `LogicalType::Uuid`. Unmapped types fail loud.
+- **`test(mssql)`** — `{duckdb,clickhouse}_validates_mssql_type_matrix_parquet`
+  added to the type-roundtrip harness, the same oracle pattern as PG/MySQL; CI
+  `test-type-validators` provisions and seeds the `mssql` service.
+
+### Security & maintenance
+
+- **`ci(audit)`** — `cargo audit` is now a gate in both the `.githooks/pre-commit`
+  hook and CI, reading one accepted-advisory list in `.cargo/audit.toml`. The
+  MSSQL driver's unavoidable `tiberius → rustls 0.21` advisories are documented
+  there with a reachability analysis (operator-specified server, pinned CA /
+  `trust_cert`, no CRL checking); the gate still fails on every *fixable* vuln.
+- **`ci(deps)`** — added Dependabot for weekly grouped Rust + GitHub-Actions
+  updates, so security patches flow in automatically and the accepted advisories
+  retire themselves the day upstream ships a fix.
+
+### Docs
+
+- README / getting-started / config / compatibility now list SQL Server as a
+  source, with a worked `sqlserver://` example, the supported mode/type scope,
+  and the TLS-on-handshake note.
+
 ## 0.9.0 (2026-06-04) — Value-Based Output Partitioning
 
 > **`partition_by`** splits one export's rows into one destination sub-folder

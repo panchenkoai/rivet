@@ -173,26 +173,35 @@ pub(crate) fn build_keyset_query(
     source_type: SourceType,
 ) -> BuiltQuery {
     let key = quote_ident(source_type, key_column);
+    let page = page_limit_clause(source_type, limit);
     match last {
         Some(val) => {
             let (rhs, cursor_param) = cursor_rhs(source_type, val);
             BuiltQuery {
                 sql: format!(
-                    "SELECT * FROM ({base}) AS _rivet WHERE {k} > {rhs} ORDER BY {k} LIMIT {n}",
+                    "SELECT * FROM ({base}) AS _rivet WHERE {k} > {rhs} ORDER BY {k} {page}",
                     base = base_query,
                     k = key,
-                    rhs = rhs,
-                    n = limit,
                 ),
                 cursor_param,
             }
         }
         None => BuiltQuery::without_param(format!(
-            "SELECT * FROM ({base}) AS _rivet ORDER BY {k} LIMIT {n}",
+            "SELECT * FROM ({base}) AS _rivet ORDER BY {k} {page}",
             base = base_query,
             k = key,
-            n = limit,
         )),
+    }
+}
+
+/// Dialect-appropriate "first N rows after the ORDER BY" clause for keyset
+/// pages. PostgreSQL / MySQL spell it `LIMIT n`; T-SQL (SQL Server) has no
+/// `LIMIT` — it uses `OFFSET 0 ROWS FETCH NEXT n ROWS ONLY` (which requires the
+/// `ORDER BY` the keyset query already carries).
+fn page_limit_clause(source_type: SourceType, limit: usize) -> String {
+    match source_type {
+        SourceType::Postgres | SourceType::Mysql => format!("LIMIT {limit}"),
+        SourceType::Mssql => format!("OFFSET 0 ROWS FETCH NEXT {limit} ROWS ONLY"),
     }
 }
 
@@ -208,7 +217,28 @@ fn cursor_rhs(source_type: SourceType, value: &str) -> (String, Option<String>) 
     match source_type {
         SourceType::Mysql => ("?".to_string(), Some(value.to_string())),
         SourceType::Postgres => (escape_pg_literal(value), None),
+        // SQL Server: in-SQL `N'…'` unicode literal, server implicit-casts to the
+        // column type (same rationale as Postgres — the keyset/cursor column may
+        // be int, datetime2, uniqueidentifier, …). No backslash escaping in
+        // T-SQL; only `'` is doubled.
+        SourceType::Mssql => (escape_mssql_literal(value), None),
     }
+}
+
+/// Quote `s` as a T-SQL `N'…'` unicode string literal. SQL Server escapes only
+/// the single quote (by doubling); backslash is a literal character (unlike
+/// Postgres `E'…'`). The `N` prefix keeps non-ASCII cursor values intact.
+pub(crate) fn escape_mssql_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    out.push_str("N'");
+    for c in s.chars() {
+        if c == '\'' {
+            out.push('\'');
+        }
+        out.push(c);
+    }
+    out.push('\'');
+    out
 }
 
 /// Quote `s` as a Postgres `E'…'` string literal, escaping both `'` and `\`.
@@ -437,6 +467,39 @@ mod tests {
         assert!(q.sql.contains("ORDER BY \"id\""), "{}", q.sql);
         assert!(q.sql.contains("LIMIT 1000"), "{}", q.sql);
         assert_eq!(q.cursor_param, None);
+    }
+
+    #[test]
+    fn keyset_mssql_uses_offset_fetch_with_bracket_quoting() {
+        // First page (no cursor): bracket-quoted key + T-SQL paging, no LIMIT.
+        let first = build_keyset_query("SELECT * FROM t", "id", None, 1000, SourceType::Mssql);
+        assert!(!first.sql.contains("WHERE"), "{}", first.sql);
+        assert!(first.sql.contains("ORDER BY [id]"), "{}", first.sql);
+        assert!(
+            first
+                .sql
+                .contains("OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY"),
+            "T-SQL has no LIMIT: {}",
+            first.sql
+        );
+        assert!(!first.sql.contains("LIMIT"), "{}", first.sql);
+
+        // Subsequent page: cursor as an N'…' literal (server implicit-casts),
+        // FETCH after the ORDER BY.
+        let next = build_keyset_query(
+            "SELECT * FROM t",
+            "id",
+            Some("00000000-0000-0000-0000-000000000001"),
+            500,
+            SourceType::Mssql,
+        );
+        assert!(next.sql.contains("WHERE [id] > N'"), "{}", next.sql);
+        assert!(
+            next.sql.contains("OFFSET 0 ROWS FETCH NEXT 500 ROWS ONLY"),
+            "{}",
+            next.sql
+        );
+        assert_eq!(next.cursor_param, None);
     }
 
     #[test]

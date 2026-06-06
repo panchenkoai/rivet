@@ -13,7 +13,10 @@ use mysql::prelude::Queryable;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use postgres::NoTls;
 
-use crate::common::{MYSQL_URL, POSTGRES_URL, run_rivet_export, unique_name, write_config};
+use crate::common::{
+    MSSQL_URL, MYSQL_URL, POSTGRES_URL, mssql_drop_table, mssql_exec, run_rivet_export,
+    unique_name, write_config,
+};
 
 /// RAII guard for the PostgreSQL matrix table + companion enum type. Drops
 /// both on test exit so a failing assertion never poisons the next run.
@@ -49,6 +52,15 @@ impl Drop for MysqlCleanup {
     }
 }
 
+/// RAII guard for the SQL Server matrix table.
+pub struct MssqlCleanup(pub String);
+
+impl Drop for MssqlCleanup {
+    fn drop(&mut self) {
+        mssql_drop_table(&self.0);
+    }
+}
+
 pub const PG_MATRIX_COLUMNS: &str = "\
     id, c_smallint, c_integer, c_bigint, amount, fee, price, c_real, c_double, \
     c_date, c_time, created_at, created_at_tz, label, c_varchar, c_bpchar, \
@@ -72,6 +84,11 @@ pub const MYSQL_MATRIX_COLUMNS: &str = "\
     c_bit1, c_bit8, note_nullable, note_all_null";
 
 pub const MATRIX_COLUMN_OVERRIDES_YAML: &str = "    columns:\n      amount: decimal(18,2)\n      fee: decimal(20,6)\n      price: decimal(10,2)\n";
+
+pub const MSSQL_MATRIX_COLUMNS: &str = "\
+    id, c_smallint, c_int, c_bigint, c_tinyint, c_bit, amount, fee, price, \
+    c_real, c_float, c_date, c_time, created_at, label, c_varchar, c_char, \
+    raw_bytes, uid, c_nvarchar, note_nullable, note_all_null";
 
 pub fn read_parquet_batches(path: &Path) -> (SchemaRef, Vec<RecordBatch>) {
     let bytes = std::fs::read(path).unwrap();
@@ -545,6 +562,57 @@ exports:
     assert!(
         out.status.success(),
         "mysql type-matrix {format}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Create + seed the SQL Server type-matrix table from the shared fixtures.
+pub fn setup_mssql_matrix_table(table_name: &str) {
+    mssql_drop_table(table_name);
+    mssql_exec(&apply_table_name(
+        &load_fixture("mssql_schema.sql"),
+        table_name,
+    ));
+    mssql_exec(&apply_table_name(
+        &load_fixture("mssql_seed.sql"),
+        table_name,
+    ));
+}
+
+/// Export the SQL Server type matrix to `out_dir`. Decimal precision is pinned
+/// via the shared `columns:` overrides (same as PG/MySQL) so `amount` / `fee` /
+/// `price` land at their declared precision rather than the driver's
+/// max-precision default.
+pub fn run_mssql_matrix_export(table_name: &str, format: &str, out_dir: &Path) {
+    let export_name = unique_name("type_rt_ms");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        r#"
+source:
+  type: mssql
+  url: "{MSSQL_URL}"
+  tls:
+    accept_invalid_certs: true
+exports:
+  - name: {export_name}
+    query: >-
+      SELECT {MSSQL_MATRIX_COLUMNS}
+      FROM {table_name} ORDER BY id
+    mode: full
+    format: {format}
+    compression: zstd
+{MATRIX_COLUMN_OVERRIDES_YAML}
+    destination:
+      type: local
+      path: {out_dir}
+"#,
+        out_dir = out_dir.display()
+    );
+    let cfg_path = write_config(&cfg_dir, &yaml);
+    let out = run_rivet_export(&cfg_path, &export_name);
+    assert!(
+        out.status.success(),
+        "mssql type-matrix {format}: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 }

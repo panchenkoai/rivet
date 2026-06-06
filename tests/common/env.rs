@@ -31,6 +31,11 @@ pub const PGBOUNCER_URL: &str = "postgresql://rivet:rivet@127.0.0.1:6432/rivet";
 pub const MYSQL_URL: &str = "mysql://rivet:rivet@127.0.0.1:3306/rivet";
 pub const MYSQL_TOXI_URL: &str = "mysql://rivet:rivet@127.0.0.1:13306/rivet";
 
+/// SQL Server (`service: mssql`, port :1433). The `sa` login + dev password
+/// match `docker-compose.yaml`; the `rivet` database is seeded by
+/// `dev/mssql/init.sql` (piped through sqlcmd by the live-test setup).
+pub const MSSQL_URL: &str = "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1433/rivet";
+
 /// ProxySQL in transaction-persistent mode, port :6033.
 /// Opt in: docker compose --profile pool up -d proxysql
 /// Backend forwards to the same `mysql` service used by `MYSQL_URL`.
@@ -187,6 +192,8 @@ pub enum LiveService {
     PostgresToxi,
     Mysql,
     MysqlToxi,
+    /// SQL Server source engine. TCP :1433.
+    Mssql,
     Minio,
     FakeGcs,
     Toxiproxy,
@@ -218,6 +225,7 @@ impl LiveService {
                 "service `toxiproxy` — proxied Postgres on :15432",
             ),
             LiveService::Mysql => ("127.0.0.1", 3306, "service `mysql` in docker-compose.yaml"),
+            LiveService::Mssql => ("127.0.0.1", 1433, "service `mssql` in docker-compose.yaml"),
             LiveService::MysqlToxi => (
                 "127.0.0.1",
                 13306,

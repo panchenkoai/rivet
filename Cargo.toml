@@ -1,11 +1,11 @@
 [package]
 name = "rivet-cli"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
 repository = "https://github.com/panchenkoai/rivet"
-description = "Rivet: PostgreSQL/MySQL → Parquet/CSV (local, S3, GCS). Crate name rivet-cli; binary rivet."
+description = "Rivet: PostgreSQL/MySQL/SQL Server → Parquet/CSV (local, S3, GCS, Azure). Crate name rivet-cli; binary rivet."
 readme = "README.md"
 default-run = "rivet"
 exclude = ["dev/", "USER_TEST_PLAN.md", "tests/", ".github/", "docs/gifs/"]
@@ -94,7 +94,15 @@ serde_yaml_ng = "0.10"
 schemars = { version = "1", features = ["preserve_order"] }
 tempfile = "3"
 tikv-jemallocator = { version = "0.7", optional = true }
-tokio = { version = "1.50.0", features = ["rt-multi-thread"] }
+tokio = { version = "1.50.0", features = ["rt-multi-thread", "net", "time"] }
+# MSSQL / SQL Server source driver (async). Bridged to the sync `Source` trait
+# via a per-source `tokio` current-thread runtime + `block_on` (ADR-0011 keeps
+# `Source` sync). `native-tls` matches the OpenSSL stack the PG/MySQL drivers
+# already vendor; `rustls` default is disabled to avoid a second TLS tree.
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono", "rustls"] }
+# `compat` bridges a tokio `TcpStream` to the `futures-io` traits tiberius'
+# `Client::connect` expects.
+tokio-util = { version = "0.7", features = ["compat"] }
 reqsign = "0.16"
 # Single reqwest version (0.12) shared with the one reqsign 0.16 / opendal pull
 # in. Keeping one HTTP+TLS stack avoids duplicating rustls / hyper / h2 in the
@@ -119,6 +127,12 @@ serde_yaml_ng = "0.10"
 criterion = { version = "0.8", features = ["html_reports"] }
 # OPT-3: property-based type round-trip (tests/type_roundtrip/property.rs).
 proptest = "1"
+# MSSQL type-roundtrip harness (tests/common/mssql.rs) needs the async driver
+# directly to seed fixtures — same crates the lib uses, exposed to the
+# integration-test crate.
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono", "rustls"] }
+tokio = { version = "1.50.0", features = ["rt-multi-thread", "net", "time"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 
 [[bench]]
 name = "hot_paths"
