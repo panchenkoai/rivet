@@ -82,7 +82,7 @@ postgres-types = {
 bigdecimal = "0.4"
 byteorder = "1"
 uuid = "0.8"
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
