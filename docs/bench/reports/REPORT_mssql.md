@@ -111,19 +111,25 @@ live SQL Server 2022. rivet config: `mode: chunked`, **`chunk_size_memory_mb: 25
   on MSSQL, so each chunk is ~500 k rows regardless of width → multi-GB buffers on
   wide rows. sling/dlt stream natively and stay flat (~100 MB).
 
-## The fix is one line — `chunk_size` (rows), measured on 2 M content_items
+## Memory is a config/engine artifact, not a floor — measured on 2 M content_items
 
-Re-running the heavy table at **2 000 000 rows**, changing only the chunking knob:
+The matrix above ran rivet with `chunk_size_memory_mb: 256`, which on SQL Server
+buffers ~500 k-row chunks → multi-GB RSS on wide rows. That was the per-chunk
+**buffering** limitation. The engine now **streams** (emits one Arrow batch per
+`batch_size` rows), so RSS is bounded by `batch_size`, not `chunk_size`.
+
+Re-running the heavy table at **2 000 000 rows**:
 
 | config | wall | peak RSS | files |
 |---|---:|---:|---:|
-| `chunk_size_memory_mb: 256` | 8m08s | **2 759 MB** | 4 |
-| `chunk_size: 5000` (explicit) | 8m15s | **101 MB** | 400 |
+| `chunk_size_memory_mb: 256` (pre-streaming) | 8m08s | 2 759 MB | 4 |
+| `chunk_size: 5000` (pre-streaming) | 8m15s | 101 MB | 400 |
+| **`mode: full` (streamed)** | 8m03s | **171 MB** | **1** |
 
-**~27× less memory, same wall, both write all 2 M rows.** With the explicit
-`chunk_size`, rivet's wide-table RSS drops to sling's level (content_items
-60 k: 475 → 93 MB; bench_wide 100 k: 340 → 66 MB). So the matrix's wide-row
-memory numbers above are a *config* artifact, not a floor — see
-[best-practices/mssql-gentle-extraction.md](../../best-practices/mssql-gentle-extraction.md).
-Engine fixes (row-byte introspection so `chunk_size_memory_mb` works; server-side
-streaming) are roadmap.
+**One file *and* ~170 MB** — before streaming, `mode: full` would have
+materialised ~10 GB and OOM'd. `chunk_size` now controls only the file layout;
+`batch_size` is the memory lever (see
+[best-practices/mssql-gentle-extraction.md](../../best-practices/mssql-gentle-extraction.md)).
+So the matrix's wide-row RSS numbers above are a pre-streaming artifact, not a
+floor. (Row-byte introspection so `chunk_size_memory_mb` sizes by bytes is still
+roadmap, but lower priority now that streaming bounds memory regardless.)

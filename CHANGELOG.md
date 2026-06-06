@@ -2,8 +2,16 @@
 
 ## Unreleased
 
-### SQL Server — pooler detection + parity test suites
+### SQL Server — streaming export + pooler detection + parity test suites
 
+- **`feat(mssql)`** — the export now **streams**: it consumes the `tiberius`
+  result set incrementally and emits one Arrow batch per `tuning.batch_size`
+  rows instead of materialising the whole chunk (`into_first_result`). Peak RSS
+  is bounded by `batch_size × row_bytes`, **independent of `chunk_size`** — the
+  SQL Server analogue of the PG cursor's `FETCH N`. So a large `chunk_size` (or
+  `mode: full`) gives few large files at low memory; `chunk_size` now controls
+  file count, `batch_size` controls memory. Measured on 2 M heavy rows:
+  `mode: full` went from a ~10 GB materialise (OOM) to **1 file at 171 MB**.
 - **`feat(mssql)`** — connection pooler / gateway detection (`MssqlProxyKind`):
   `@@SPID` drift across two queries → transaction-mode multiplexer (`Multiplexed`);
   `SERVERPROPERTY('EngineEdition')` 5/8 (or an Azure `@@VERSION` banner) →

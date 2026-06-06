@@ -28,14 +28,17 @@ exports:
                               # Raise only if the governor (above) has headroom.
 
     # ── gentle to the WORKER (rivet's RAM) ──────────────────────────────────
-    chunk_size: 50000         # ROW COUNT — the memory lever on SQL Server. The MSSQL engine
-                              # buffers a whole chunk in RAM (no server-side cursor yet), so
-                              # peak RSS ≈ chunk_size × avg_row_bytes × parallel. Pick it for
-                              # your row width (sizing table in the doc).
+    # The MSSQL engine STREAMS: it emits one Arrow batch per `batch_size` rows and
+    # never holds more, so peak RSS ≈ batch_size × avg_row_bytes — independent of
+    # chunk_size. That means the two knobs are separate:
+    #   • chunk_size below = the FILE-COUNT lever (one part file per chunk).
+    #   • tuning.batch_size = the MEMORY lever (lower it for wide rows).
+    chunk_size: 200000        # files = rows ÷ chunk_size. Bigger = fewer, larger files;
+                              # memory is unaffected. Use `mode: full` for a single file.
+    # tuning: { batch_size: 10000 }   # ← lower for wide/heavy rows to cap RSS
                               #
-                              # DO NOT use `chunk_size_memory_mb` on SQL Server: it can't derive
-                              # a size yet (introspection returns no avg_row_bytes) and degrades
-                              # to ONE whole-table chunk → rivet buffers the entire result → OOM.
+                              # Skip `chunk_size_memory_mb` on SQL Server (no avg_row_bytes from
+                              # introspection → it can't size by bytes); use chunk_size + batch_size.
 
     chunk_checkpoint: true    # resumable: each chunk commits independently, so a crash resumes
                               # from the last committed chunk instead of re-reading the table.

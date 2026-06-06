@@ -55,69 +55,70 @@ way round. `environment: local` (the default for dev) does **not** throttle.
 > If that matters more than read-consistency, enable RCSI on the database.
 > Lock-light read options inside rivet are roadmap.
 
-## Gentle to the worker — the one SQL Server footgun
+## Gentle to the worker — `batch_size` bounds RSS, not `chunk_size`
 
-Unlike PostgreSQL (server-side `DECLARE CURSOR` + `FETCH N`, a true stream),
-**the SQL Server engine currently buffers a whole chunk into RAM** before writing
-it out (no server cursor yet). So:
+The SQL Server engine **streams** the result set: it consumes rows from the
+server incrementally and emits an Arrow batch every `tuning.batch_size` rows,
+never holding more than one batch in memory (the SQL Server analogue of the
+PostgreSQL cursor's `FETCH N`). So:
 
-> **peak RSS ≈ `chunk_size` × avg_row_bytes × `parallel`**
+> **peak RSS ≈ `batch_size` × avg_row_bytes** — *independent of `chunk_size`*.
 
-That's fine — *as long as you bound `chunk_size`*. The trap is
-**`chunk_size_memory_mb`**: on SQL Server, chunk-planning introspection doesn't
-yet return an average row size, so the memory target can't be turned into a row
-count — it **falls back to a large fixed row count (~500 000 rows per chunk),
-ignoring the byte budget**. On wide rows each chunk then buffers multiple GB.
+That splits the two knobs cleanly:
+
+- **`batch_size`** is the **memory** lever.
+- **`chunk_size`** is now only the **file-count** lever (one part file per
+  chunk). A large `chunk_size` — or `mode: full` — gives **few large files** and
+  still runs at low RSS.
 
 Measured live against SQL Server 2022, exporting `content_items`
-(2 000 000 rows × ~5 KB heavy text), changing only the chunking knob:
+(2 000 000 rows × ~5 KB heavy text):
 
-| `content_items` 2 M | wall | peak RSS | files |
+| config | wall | peak RSS | files |
 |---|---:|---:|---:|
-| `chunk_size_memory_mb: 256` (→ ~500 k-row chunks) | 8m08s | **2 759 MB** | 4 |
-| `chunk_size: 5000` (explicit rows) | 8m15s | **101 MB** | 400 |
+| `mode: full` (streamed, one file) | 8m03s | **171 MB** | 1 |
+| `chunk_size: 5000` | 8m15s | 101 MB | 400 |
 
-**~27× less memory, same wall time, both write all 2 M rows.** On *this* host
-2.76 GB fit, but on a memory-capped worker (a 1–2 GB container) the
-`chunk_size_memory_mb` run OOMs while the explicit-`chunk_size` run sails at
-~100 MB. The wider the rows, the worse the gap.
+**One file *and* ~170 MB at 2 M heavy rows.** Before streaming, `mode: full`
+buffered the whole table (~10 GB → OOM) and the only way to bound memory was a
+tiny `chunk_size` → hundreds of tiny files. Now you pick `chunk_size` purely for
+the downstream file layout; memory stays put.
 
-### Sizing `chunk_size`
+### Sizing the two knobs
 
-Pick it from your row width and the RAM you'll give the worker:
+- **`batch_size`** (RAM): peak RSS ≈ `batch_size` × avg_row_bytes. Lower it for
+  wide rows.
 
-```
-chunk_size  ≈  worker_RAM_budget_MB × 1024 / avg_row_KB / parallel
-```
+  | Row shape | avg row | `batch_size` for ~100 MB/worker |
+  |---|---:|---:|
+  | narrow (ints/dates) | ~0.1 KB | leave the profile default |
+  | typical (mixed cols) | ~1 KB | ~50 000 |
+  | wide / heavy text | ~5 KB | ~10 000 |
 
-| Row shape | avg row | chunk_size for ~256 MB/worker |
-|---|---:|---:|
-| narrow (ints/dates) | ~0.1 KB | 500 000 (or just leave the 100 000 default) |
-| typical (mixed cols) | ~1 KB | 200 000 |
-| wide / heavy text | ~5 KB | 20 000–50 000 |
+- **`chunk_size`** (files): ≈ rows ÷ desired file count. Bigger = fewer, larger
+  files; memory is unaffected. `mode: full` = one file.
 
-When in doubt, smaller is safer: more, shorter chunks are gentler to **both** the
-source (shorter SELECTs) and the worker (less buffered). The cost is only a few
-extra round-trips.
+> Skip `chunk_size_memory_mb` on SQL Server: introspection returns no
+> `avg_row_bytes`, so it can't size by bytes (it falls back to ~500 k-row
+> chunks). With streaming that no longer blows up memory, but `chunk_size`
+> (files) + `batch_size` (RAM) are the honest levers.
 
 ## Verify it
 
 - **Worker:** run under `/usr/bin/time -v` (or `gtime -v`) and watch
-  *Maximum resident set size* — it should track `chunk_size × row_bytes`, not the
-  table size.
+  *Maximum resident set size* — it should track `batch_size × row_bytes`, flat
+  across `chunk_size` and table size.
 - **Source:** run [`mssql_db_bench.sh`](../bench/harness/mssql_db_bench.sh) — it
   reports longest open txn, lock count, and Log Flush Waits delta during a live
   export.
 
-## Roadmap (why the footgun exists)
+## Roadmap
 
-Two engine gaps make the explicit `chunk_size` necessary on SQL Server today;
-both are tracked:
-
-1. **No `avg_row_bytes` from MSSQL introspection** → `chunk_size_memory_mb` can't
-   size chunks. Fix: add a row-size probe to `introspect_mssql_table_for_chunking`.
-2. **Per-chunk buffering** (`into_first_result`) instead of a server-side stream.
-   Fix: batched / streaming fetch so a chunk doesn't fully materialise.
-
-Until both land, `chunk_size` (rows) is the supported way to keep rivet gentle to
-the worker on SQL Server — and it makes it gentler to the source too.
+- ✅ **Streaming export** — the engine now consumes the result set incrementally
+  and emits one `batch_size` batch at a time, so RSS is bounded by `batch_size`,
+  not `chunk_size`. (Was: `into_first_result` materialised the whole chunk.)
+- ◻ **`avg_row_bytes` from MSSQL introspection** so `chunk_size_memory_mb` can
+  size by bytes (add a row-size probe to `introspect_mssql_table_for_chunking`).
+  Lower priority now that streaming bounds memory regardless.
+- ◻ **Lock-light reads** (RCSI / snapshot opt-in) for sources under heavy
+  concurrent OLTP writes.
