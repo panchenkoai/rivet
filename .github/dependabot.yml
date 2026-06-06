@@ -4,12 +4,19 @@
 # merges if it is green — review the diff, then merge.
 #
 # Strategy (see docs/reference/testing.md):
-#   * patch + minor (within-semver, low-risk) are grouped into one weekly PR.
-#   * major (semver-breaking) bumps come as individual PRs so each API change is
-#     reviewed and tested on its own.
+#   * Routine crate churn is scoped to MAJOR (semver-breaking) bumps only and
+#     grouped into ONE weekly PR. Minor/patch are ignored on purpose — they are
+#     noise that rarely needs a human, and the ones that matter (security) arrive
+#     out-of-band as security PRs regardless of this filter.
+#   * A `cooldown` of 14 days holds every update back until two weeks after the
+#     upstream release, so a freshly shipped `.0` (or a regressing point release)
+#     never lands in the build before its first round of fixes.
 #   * GitHub also opens out-of-band *security* PRs the moment an advisory with a
 #     fix lands — that is how the accepted advisories in `.cargo/audit.toml`
-#     (e.g. the `rand` entry, or tiberius's rustls bump) get retired.
+#     (e.g. the `rand` entry, or tiberius's rustls bump) get retired. Those are
+#     NOT subject to the cooldown, so a real CVE fix is never delayed. The
+#     `cargo audit` gate (pre-commit + CI) is the hard backstop if a fixable
+#     advisory ever slips past the routine schedule.
 version: 2
 updates:
   # ── Rust crates ──────────────────────────────────────────────────────────
@@ -19,14 +26,25 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 10
-    # One combined PR for the low-risk churn; majors stay separate.
-    groups:
-      patch-and-minor:
+    # Hold every bump for two weeks after its release — let other people hit the
+    # fresh-release bugs first.
+    cooldown:
+      default-days: 14
+    # Skip minor/patch churn entirely; only deliberate major bumps get a PR.
+    ignore:
+      - dependency-name: "*"
         update-types:
-          - minor
-          - patch
+          - version-update:semver-minor
+          - version-update:semver-patch
+    # One combined PR for the (major-only) churn, so the whole upgrade is
+    # reviewed and CI'd together rather than as N racing branches.
+    groups:
+      cargo-major:
+        applies-to: version-updates
+        update-types:
+          - major
     commit-message:
-      prefix: "deps"
+      prefix: deps
     labels:
       - dependencies
 
@@ -37,8 +55,16 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 14
+    # Action pins are low-risk; group all of them into one weekly PR.
+    groups:
+      github-actions:
+        applies-to: version-updates
+        patterns:
+          - "*"
     commit-message:
-      prefix: "ci"
+      prefix: ci
     labels:
       - dependencies
       - github-actions
