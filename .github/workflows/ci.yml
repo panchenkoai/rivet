@@ -24,7 +24,7 @@ jobs:
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
@@ -44,7 +44,7 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
@@ -56,7 +56,7 @@ jobs:
     name: Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
@@ -67,7 +67,7 @@ jobs:
     name: Invariant tests (semantic gate)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
@@ -78,7 +78,7 @@ jobs:
     name: Recovery tests (semantic gate)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
@@ -89,7 +89,7 @@ jobs:
     name: Compatibility matrix tests (semantic gate)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
@@ -100,7 +100,7 @@ jobs:
     name: Type mapping contracts (semantic gate)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
@@ -111,7 +111,7 @@ jobs:
     name: Stability tests — Phase 1 (semantic gate)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
@@ -127,7 +127,7 @@ jobs:
     name: Type-golden tests (semantic gate)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
@@ -154,7 +154,7 @@ jobs:
     name: Type round-trip validators — DuckDB · ClickHouse · pyarrow (semantic gate)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
@@ -212,7 +212,7 @@ jobs:
     name: Release build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
@@ -223,7 +223,7 @@ jobs:
     name: E2E matrix
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
 
       # GitHub-hosted ubuntu-latest ships with ~14 GB free on `/`. This job
       # then asks for ~3 GB of toolchain + ~3-4 GB of `cargo build --release`
@@ -326,7 +326,7 @@ jobs:
     # Shell-based regression guards under dev/matrices/. Catches UX and
     # config-surface regressions that unit tests miss. See dev/matrices/README.md.
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
@@ -372,7 +372,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
       # Run cargo-audit directly (prebuilt binary, no compile) so it honors the
       # accepted-advisory list in `.cargo/audit.toml` — the single source of
       # truth shared with the `.githooks/pre-commit` hook. The previous
@@ -380,7 +380,7 @@ jobs:
       # MSSQL driver's unavoidable tiberius→rustls-0.21 advisories failed the
       # gate; documenting + tracking them in one place keeps the gate green
       # while still catching every *fixable* future advisory.
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.79.6
         with:
           tool: cargo-audit
       - run: cargo audit
