@@ -32,7 +32,7 @@ anyhow = "1"
 # integrity can be verified against the object's listing metadata with no
 # download (both already in the tree transitively).
 base64 = "0.22"
-md-5 = "0.10"
+md-5 = "0.11"
 # `canonical_extension_types` enables Arrow's canonical extension wrappers
 # (`arrow_schema::extension::{Uuid, Json}`) — see Cargo dep on `parquet`
 # below for the writer-side pairing.
