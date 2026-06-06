@@ -103,7 +103,7 @@ tiberius = { version = "0.12", default-features = false, features = ["tds73", "c
 # `compat` bridges a tokio `TcpStream` to the `futures-io` traits tiberius'
 # `Client::connect` expects.
 tokio-util = { version = "0.7", features = ["compat"] }
-reqsign = "0.16"
+reqsign = "0.20"
 # Single reqwest version (0.12) shared with the one reqsign 0.16 / opendal pull
 # in. Keeping one HTTP+TLS stack avoids duplicating rustls / hyper / h2 in the
 # release binary. `rustls-tls` is selected explicitly so it matches the TLS
