@@ -1,0 +1,44 @@
+# Gentle SQL Server extraction — easy on the source database *and* on the rivet
+# worker. Every line is explained in docs/best-practices/mssql-gentle-extraction.md.
+#
+# Copy this, point it at your server, set the table/query, and size `chunk_size`
+# to your row width (see the sizing table in the doc).
+
+source:
+  type: mssql
+  url_env: MSSQL_URL          # sqlserver://user:***@host:1433/db — credentials via env, not in the file
+  environment: production     # → Balanced profile: the OPT-2 back-pressure governor throttles
+                              #   concurrency when the source's `Log Flush Waits` rises (source-safety)
+  tls:
+    mode: verify-full         # encrypt + verify the server cert
+    # ca_file: /etc/ssl/certs/your-ca.pem
+    # For a dev/self-signed container instead: tls: { accept_invalid_certs: true }
+
+exports:
+  - name: big_table
+    table: big_table          # or:  query: "SELECT col_a, col_b FROM dbo.big_table WHERE ..."
+    mode: chunked
+
+    # ── gentle to the SOURCE ────────────────────────────────────────────────
+    chunk_column: id          # single-integer PK → range chunking: each chunk is a short,
+                              # bounded SELECT. Under READ COMMITTED the source releases its
+                              # shared locks as it scans, so no chunk holds the table.
+    # chunk_by_key: uid       # …or a UUID / string / composite PK → keyset (seek) paging.
+    parallel: 1               # sequential chunks = the fewest concurrent SELECTs on the source.
+                              # Raise only if the governor (above) has headroom.
+
+    # ── gentle to the WORKER (rivet's RAM) ──────────────────────────────────
+    chunk_size: 50000         # ROW COUNT — the memory lever on SQL Server. The MSSQL engine
+                              # buffers a whole chunk in RAM (no server-side cursor yet), so
+                              # peak RSS ≈ chunk_size × avg_row_bytes × parallel. Pick it for
+                              # your row width (sizing table in the doc).
+                              #
+                              # DO NOT use `chunk_size_memory_mb` on SQL Server: it can't derive
+                              # a size yet (introspection returns no avg_row_bytes) and degrades
+                              # to ONE whole-table chunk → rivet buffers the entire result → OOM.
+
+    chunk_checkpoint: true    # resumable: each chunk commits independently, so a crash resumes
+                              # from the last committed chunk instead of re-reading the table.
+    format: parquet
+    compression: zstd
+    destination: { type: local, path: ./out/big_table }

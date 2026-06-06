@@ -19,6 +19,12 @@
   (precision 7 = 100 ns) incremental cursor lands one tick below the source max
   and re-exports the boundary row each run — use `datetime2(6)` or coarser.
   Reliability / type-mapping / tuning matrices gained SQL Server rows.
+- **`docs(mssql)`** — [Gentle SQL Server extraction](docs/best-practices/mssql-gentle-extraction.md)
+  best-practice + copy-paste config (`rivet_mssql_gentle.yaml`): how to stay easy
+  on both the source DB and the rivet worker. Documents the one MSSQL footgun —
+  use an explicit `chunk_size` (rows), **not** `chunk_size_memory_mb` (which can't
+  size yet on MSSQL and degrades to a single whole-table chunk → OOM) — with a
+  row-width sizing table and the `environment: production` governor lever.
 - **`bench(mssql)`** — DBA-harm matrix for SQL Server
   ([`REPORT_mssql.md`](docs/bench/reports/REPORT_mssql.md) +
   `mssql_db_bench.sh`): measured against live SQL Server 2022, rivet's chunked

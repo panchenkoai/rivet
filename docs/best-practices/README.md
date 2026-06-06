@@ -11,6 +11,7 @@ matter and *when* to use them.
 | [Compression profiles](compression-profiles.md) | Profile-to-codec mapping, CPU/size trade-offs, when to use each |
 | [Quality checks](quality-checks.md) | Row count gates, null ratio, uniqueness tracking, `unique_max_entries` cap |
 | [Low-memory runners](low-memory-runners.md) | Settings for 512 MB–4 GB hosts; `auto_shrink` guarantees and caveats |
+| [Gentle SQL Server extraction](mssql-gentle-extraction.md) | Easy on the source DB *and* the worker; why `chunk_size` (not `chunk_size_memory_mb`) on MSSQL — config: [`rivet_mssql_gentle.yaml`](rivet_mssql_gentle.yaml) |
 | [Recovery and resume](recovery-and-resume.md) | `--resume` semantics, crash recovery, state inspection |
 | [Benchmark methodology](benchmark-methodology.md) | How to run E2E and Criterion benchmarks, interpret results, compare versions |
 
