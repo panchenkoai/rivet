@@ -23,8 +23,10 @@
   best-practice + copy-paste config (`rivet_mssql_gentle.yaml`): how to stay easy
   on both the source DB and the rivet worker. Documents the one MSSQL footgun —
   use an explicit `chunk_size` (rows), **not** `chunk_size_memory_mb` (which can't
-  size yet on MSSQL and degrades to a single whole-table chunk → OOM) — with a
-  row-width sizing table and the `environment: production` governor lever.
+  size by bytes yet on MSSQL and falls back to ~500k-row chunks, so wide rows
+  buffer multiple GB). Measured live on a 2 M-row heavy table: **2 759 MB →
+  101 MB peak RSS (~27×) at the same wall time** by switching to `chunk_size`.
+  Includes a row-width sizing table and the `environment: production` governor lever.
 - **`bench(mssql)`** — DBA-harm matrix for SQL Server
   ([`REPORT_mssql.md`](docs/bench/reports/REPORT_mssql.md) +
   `mssql_db_bench.sh`): measured against live SQL Server 2022, rivet's chunked

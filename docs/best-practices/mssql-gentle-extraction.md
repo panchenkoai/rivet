@@ -66,16 +66,21 @@ it out (no server cursor yet). So:
 That's fine — *as long as you bound `chunk_size`*. The trap is
 **`chunk_size_memory_mb`**: on SQL Server, chunk-planning introspection doesn't
 yet return an average row size, so the memory target can't be turned into a row
-count and **degrades to a single whole-table chunk**. rivet then buffers the
-*entire* result. On a wide/large table that means runaway RSS or an OOM:
+count — it **falls back to a large fixed row count (~500 000 rows per chunk),
+ignoring the byte budget**. On wide rows each chunk then buffers multiple GB.
 
-| `content_items` (heavy text) | wall | peak RSS |
-|---|---:|---:|
-| `chunk_size_memory_mb: 256` (degrades → 1 chunk) | 10.8 s | **475 MB** |
-| `chunk_size: 5000` (explicit rows) | 11.2 s | **93 MB** |
+Measured live against SQL Server 2022, exporting `content_items`
+(2 000 000 rows × ~5 KB heavy text), changing only the chunking knob:
 
-Same data, 5× less memory — only the chunking knob changed. With
-`chunk_size_memory_mb`, a 2 M-row heavy table tries to buffer ~10 GB and dies.
+| `content_items` 2 M | wall | peak RSS | files |
+|---|---:|---:|---:|
+| `chunk_size_memory_mb: 256` (→ ~500 k-row chunks) | 8m08s | **2 759 MB** | 4 |
+| `chunk_size: 5000` (explicit rows) | 8m15s | **101 MB** | 400 |
+
+**~27× less memory, same wall time, both write all 2 M rows.** On *this* host
+2.76 GB fit, but on a memory-capped worker (a 1–2 GB container) the
+`chunk_size_memory_mb` run OOMs while the explicit-`chunk_size` run sails at
+~100 MB. The wider the rows, the worse the gap.
 
 ### Sizing `chunk_size`
 
