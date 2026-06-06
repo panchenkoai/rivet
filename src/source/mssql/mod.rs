@@ -36,10 +36,6 @@ use crate::source::query::build_export_query;
 use crate::source::{BatchSink, ExportRequest, Source, TableIntrospection};
 use crate::types::{ColumnOverrides, TypeMapping};
 
-/// Rows per Arrow `RecordBatch` streamed to the sink. Chunked mode bounds the
-/// total row set per part; this only bounds the in-memory Arrow batch width.
-const BATCH_ROWS: usize = 8192;
-
 type MssqlClient = Client<Compat<TcpStream>>;
 
 /// SQL Server source. Owns the async driver + the runtime that drives it.
@@ -175,46 +171,63 @@ impl MssqlSource {
 
 impl Source for MssqlSource {
     fn export(&mut self, request: &ExportRequest<'_>, sink: &mut dyn BatchSink) -> Result<()> {
-        // Keyset (seek) pages now build a dialect-correct
-        // `OFFSET 0 ROWS FETCH NEXT n ROWS ONLY` clause (T-SQL has no `LIMIT`),
-        // so the page-limit path is supported like the other runners.
+        // Keyset (seek) pages build a dialect-correct
+        // `OFFSET 0 ROWS FETCH NEXT n ROWS ONLY` clause (T-SQL has no `LIMIT`).
         let built = build_export_query(request, crate::config::SourceType::Mssql);
         let sql = built.sql.clone();
         let overrides = request.column_overrides.clone();
+        // Stream the result in `batch_size`-row Arrow batches rather than
+        // materialising the whole chunk: peak RSS is bounded by one batch
+        // (~`batch_size` × row_bytes), *independent of `chunk_size`*. A large
+        // `chunk_size` (few output files) then runs at low memory — the SQL
+        // Server analogue of the PostgreSQL cursor's `FETCH N`.
+        let batch_rows = request.tuning.batch_size.max(1);
 
         let Self { rt, client, .. } = self;
-        let (schema, rows) = rt.block_on(async {
+        rt.block_on(async {
+            use futures_util::stream::TryStreamExt;
+            use tiberius::QueryItem;
+
             let mut stream = client
                 .query(sql.as_str(), &[])
                 .await
                 .map_err(|e| anyhow::anyhow!("mssql: query failed: {e}"))?;
-            let columns = stream
-                .columns()
+
+            let mut columns: Vec<tiberius::Column> = Vec::new();
+            let mut buf: Vec<tiberius::Row> = Vec::with_capacity(batch_rows);
+            let mut schema: Option<SchemaRef> = None;
+
+            while let Some(item) = stream
+                .try_next()
                 .await
-                .map_err(|e| anyhow::anyhow!("mssql: reading result metadata failed: {e}"))?
-                .map(<[_]>::to_vec)
-                .unwrap_or_default();
-            let rows = stream
-                .into_first_result()
-                .await
-                .map_err(|e| anyhow::anyhow!("mssql: streaming rows failed: {e}"))?;
-            // Schema after rows: decimal scale is recovered from the data
-            // (tiberius hides a column's declared precision/scale).
-            let (schema, _decoders) =
-                arrow_convert::mssql_columns_to_schema(&columns, &overrides, &rows)?;
-            Ok::<_, anyhow::Error>((Arc::new(schema), rows))
+                .map_err(|e| anyhow::anyhow!("mssql: streaming rows failed: {e}"))?
+            {
+                match item {
+                    // A single SELECT yields one metadata token (the column
+                    // shape) ahead of its rows.
+                    QueryItem::Metadata(meta) if columns.is_empty() => {
+                        columns = meta.columns().to_vec();
+                    }
+                    QueryItem::Metadata(_) => {}
+                    QueryItem::Row(row) => {
+                        buf.push(row);
+                        if buf.len() >= batch_rows {
+                            emit_mssql_batch(&columns, &overrides, &mut schema, &buf, sink)?;
+                            buf.clear();
+                        }
+                    }
+                }
+            }
+            // Final partial batch — or, for an empty result set, a single call
+            // that still emits the (empty) schema so the sink writes a
+            // correctly-typed empty output. Rows arrive in the query's
+            // `ORDER BY` order, so the last batch's last row carries the max
+            // cursor the sink extracts.
+            if !buf.is_empty() || schema.is_none() {
+                emit_mssql_batch(&columns, &overrides, &mut schema, &buf, sink)?;
+            }
+            Ok::<_, anyhow::Error>(())
         })?;
-
-        sink.on_schema(schema.clone() as SchemaRef)?;
-
-        // Rows arrive ordered (incremental/chunked queries carry `ORDER BY`), so
-        // splitting the Vec preserves order — the last batch's last row holds
-        // the max cursor the sink extracts.
-        for chunk in rows.chunks(BATCH_ROWS) {
-            let batch =
-                arrow_convert::mssql_rows_to_record_batch(&(schema.clone() as SchemaRef), chunk)?;
-            sink.on_batch(&batch)?;
-        }
         Ok(())
     }
 
@@ -278,6 +291,37 @@ impl Source for MssqlSource {
             row.get::<i64, _>(0).map(|v| v.max(0) as u64)
         })
     }
+}
+
+/// Emit one Arrow batch from `rows`, building (and emitting) the schema on the
+/// first call and reusing it thereafter. Decimal scales are recovered from the
+/// data — tiberius drops a column's declared precision/scale — so the first
+/// batch must carry each decimal column's first non-null value (true for every
+/// table in practice; a decimal column NULL for the whole first batch falls back
+/// to scale 0, same as the pre-streaming behaviour on an all-null column).
+fn emit_mssql_batch(
+    columns: &[tiberius::Column],
+    overrides: &ColumnOverrides,
+    schema: &mut Option<SchemaRef>,
+    rows: &[tiberius::Row],
+    sink: &mut dyn BatchSink,
+) -> Result<()> {
+    let schema_ref = match schema {
+        Some(s) => s.clone(),
+        None => {
+            let (built, _decoders) =
+                arrow_convert::mssql_columns_to_schema(columns, overrides, rows)?;
+            let s: SchemaRef = Arc::new(built);
+            sink.on_schema(s.clone())?;
+            *schema = Some(s.clone());
+            s
+        }
+    };
+    if !rows.is_empty() {
+        let batch = arrow_convert::mssql_rows_to_record_batch(&schema_ref, rows)?;
+        sink.on_batch(&batch)?;
+    }
+    Ok(())
 }
 
 /// Render a row's first column as a display string for `query_scalar`

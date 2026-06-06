@@ -103,6 +103,11 @@ tiberius = { version = "0.12", default-features = false, features = ["tds73", "c
 # `compat` bridges a tokio `TcpStream` to the `futures-io` traits tiberius'
 # `Client::connect` expects.
 tokio-util = { version = "0.7", features = ["compat"] }
+# `TryStreamExt` to consume tiberius' `QueryStream` row-by-row in the MSSQL
+# export, so a chunk streams in `batch_size`-row batches instead of
+# materialising whole — bounds RSS independent of `chunk_size`. Same 0.3.x
+# tiberius already pulls in.
+futures-util = "0.3"
 reqsign = "0.16"
 # Single reqwest version (0.12) shared with the one reqsign 0.16 / opendal pull
 # in. Keeping one HTTP+TLS stack avoids duplicating rustls / hyper / h2 in the

@@ -3058,6 +3058,7 @@ dependencies = [
  "criterion",
  "csv",
  "env_logger",
+ "futures-util",
  "indicatif",
  "libc",
  "log",
