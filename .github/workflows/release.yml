@@ -125,7 +125,7 @@ jobs:
           echo "ASSET=${dir}.tar.gz" >> "$GITHUB_ENV"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: rivet-${{ matrix.target }}
           path: ${{ env.ASSET }}
@@ -294,7 +294,7 @@ jobs:
           echo "${digest#sha256:}" > "/tmp/digests/${{ matrix.arch_tag }}"
 
       - name: Upload digest
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: docker-digest-${{ matrix.arch_tag }}
           path: /tmp/digests/${{ matrix.arch_tag }}
