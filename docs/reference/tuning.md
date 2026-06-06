@@ -166,6 +166,7 @@ exports:
 |--------|----------------|----------|
 | PostgreSQL | `pg_stat_bgwriter.checkpoints_req` | `SELECT checkpoints_req FROM pg_stat_bgwriter` (preceded by `pg_stat_clear_snapshot()`) |
 | MySQL | global `Innodb_log_waits` | `SHOW GLOBAL STATUS LIKE 'Innodb_log_waits'` |
+| SQL Server | `Log Flush Waits/sec` (cumulative `cntr_value`) | `SELECT cntr_value FROM sys.dm_os_performance_counters WHERE counter_name LIKE 'Log Flush Wait%' AND instance_name = <database>` |
 
 It is the **same proxy** the adaptive batch loop uses — enabling the governor adds no new query beyond what `adaptive: true` already runs.
 

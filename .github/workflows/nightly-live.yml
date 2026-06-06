@@ -69,7 +69,7 @@ jobs:
         # them the `--ignored` run fails 13 tests with `No such object:
         # rivet-duckdb` / `ClickHouse reachable on 127.0.0.1:8123` (pyarrow_*
         # cases also go through the shared rivet-duckdb exec helper).
-        run: docker compose --profile pool --profile loaders up -d postgres mysql minio fake-gcs toxiproxy pgbouncer proxysql duckdb clickhouse
+        run: docker compose --profile pool --profile loaders up -d postgres mysql mssql minio fake-gcs toxiproxy pgbouncer proxysql duckdb clickhouse
 
       - name: Wait for services
         run: |
@@ -89,6 +89,10 @@ jobs:
           echo "Waiting for duckdb loader..."
           # Long-running exec container; wait until its `import duckdb` healthcheck passes.
           for i in $(seq 1 30); do [ "$(docker inspect -f '{{.State.Health.Status}}' rivet-duckdb 2>/dev/null)" = "healthy" ] && break || sleep 2; done
+          echo "Waiting for SQL Server..."
+          # sqlcmd SELECT-1 healthcheck (start_period 30s); the live_mssql_* suites
+          # connect + seed against it.
+          for i in $(seq 1 40); do [ "$(docker inspect -f '{{.State.Health.Status}}' rivet-mssql 2>/dev/null)" = "healthy" ] && break || sleep 2; done
 
       - name: Build release (rivet + seed)
         # `--bin seed` builds the auxiliary src/bin/seed.rs target on top of
@@ -100,6 +104,15 @@ jobs:
         run: |
           PGPASSWORD=rivet psql -h localhost -U rivet -d rivet -f dev/e2e/seed_pg.sql
           mysql -h 127.0.0.1 -u rivet -privet rivet < dev/e2e/seed_mysql.sql
+
+      - name: Seed MSSQL database
+        # Create the `rivet` database (no init hook in the SQL Server image) so
+        # the live_mssql_* recovery/resume/reconcile suites can connect + seed
+        # their own per-test tables.
+        run: |
+          docker compose cp dev/mssql/init.sql mssql:/tmp/init.sql
+          docker compose exec -T mssql /opt/mssql-tools18/bin/sqlcmd \
+            -S localhost -U sa -P 'Rivet_Passw0rd!' -C -i /tmp/init.sql
 
       - name: Seed heavy fixture (content_items)
         # tests/live_content_load.rs asserts count >= 50_000 for the

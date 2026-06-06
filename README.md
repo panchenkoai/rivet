@@ -38,7 +38,7 @@ Rivet tries to make database extraction boring:
 
 1. **Plan before running** — `rivet plan` seals the extraction intent into a reviewable JSON artifact before any writes happen. Review it like a migration.
 2. **Protect the source** — server-side cursor + `FETCH N` on PostgreSQL (longest single query: **0.19s** on a 2M-row table); adaptive PK-range chunking on MySQL (**9s**, vs 137–208s for alternatives). Neither shape holds an open transaction for minutes.
-3. **Knows you're behind a pooler** — auto-detects pgBouncer / Odyssey on Postgres and ProxySQL / MaxScale on MySQL. Uses `SET LOCAL` inside RAII-guarded transactions so session state never leaks into the pool.
+3. **Knows you're behind a pooler** — auto-detects pgBouncer / Odyssey on Postgres, ProxySQL / MaxScale on MySQL, and statement-level multiplexers (`@@SPID` drift) or the Azure SQL gateway on SQL Server. On Postgres it uses `SET LOCAL` inside RAII-guarded transactions so session state never leaks into the pool.
 4. **Write in resumable units** — chunk checkpoints, not one giant transaction. The job can crash, the network can blip, the next `rivet run --resume` continues from the last committed chunk.
 5. **Record everything** — run journal, file manifest, schema-drift tracker, all in `.rivet_state.db`. Every run is reconstructible. `rivet state` shows exactly what committed and what didn't.
 6. **Validate outputs** — quality gates (row count, null ratio, uniqueness via xxHash3), `rivet validate`, `rivet reconcile`, `rivet repair`. Know before your downstream pipeline does.

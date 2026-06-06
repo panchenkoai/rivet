@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### SQL Server — pooler detection + parity test suites
+
+- **`feat(mssql)`** — connection pooler / gateway detection (`MssqlProxyKind`):
+  `@@SPID` drift across two queries → transaction-mode multiplexer (`Multiplexed`);
+  `SERVERPROPERTY('EngineEdition')` 5/8 (or an Azure `@@VERSION` banner) →
+  `AzureGateway`. One connect-time warning, mirroring PG (`pg_backend_pid` drift)
+  and MySQL (`CONNECTION_ID()` drift). Pure classifier exhaustively unit-tested;
+  live direct-connection guard in `live_pool_safety`.
+- **`test(mssql)`** — full live parity suites mirroring the PG/MySQL twins:
+  `live_mssql_resume`, `live_mssql_chunked_recovery`, `live_mssql_crash_recovery`,
+  `live_mssql_reconcile_repair`, `live_mssql_chunked`. Wired into the per-PR
+  `e2e` job and Nightly (mssql service + seed step added to both).
+- **`docs(mssql)`** — `datetime2` sub-microsecond truncation documented as a
+  tracked gap: rivet maps timestamps to microsecond, so a bare `datetime2`
+  (precision 7 = 100 ns) incremental cursor lands one tick below the source max
+  and re-exports the boundary row each run — use `datetime2(6)` or coarser.
+  Reliability / type-mapping / tuning matrices gained SQL Server rows.
+
 ## 0.9.1 (2026-06-06) — SQL Server Source Engine
 
 > Rivet gains a third source engine: **SQL Server (MSSQL)**. Point it at a

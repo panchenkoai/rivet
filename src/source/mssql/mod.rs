@@ -16,6 +16,9 @@
 //! `OFFSET 0 ROWS FETCH NEXT n ROWS ONLY` clause (T-SQL has no `LIMIT`).
 
 mod arrow_convert;
+mod proxy;
+
+pub use proxy::MssqlProxyKind;
 
 use std::sync::Arc;
 
@@ -24,6 +27,8 @@ use tiberius::{AuthMethod, Client, Config, EncryptionLevel};
 use tokio::net::TcpStream;
 use tokio::runtime::Runtime;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
+
+use proxy::{detect_mssql_proxy_kind, warn_proxy_kind};
 
 use crate::config::TlsConfig;
 use crate::error::Result;
@@ -38,11 +43,17 @@ const BATCH_ROWS: usize = 8192;
 type MssqlClient = Client<Compat<TcpStream>>;
 
 /// SQL Server source. Owns the async driver + the runtime that drives it.
-pub(crate) struct MssqlSource {
+///
+/// `pub` (not `pub(crate)`) so integration tests can reach `proxy_kind()` the
+/// same way they reach `MysqlSource::proxy_kind()`; the rest of the type
+/// carries the same "no external API contract" disclaimer as `MysqlSource`.
+pub struct MssqlSource {
     rt: Runtime,
     client: MssqlClient,
     /// Connection database — the instance pressure proxy keys on it.
     database: String,
+    /// Pooler/gateway classification, sampled once at connect time.
+    proxy_kind: MssqlProxyKind,
 }
 
 /// Parsed `sqlserver://user[:password]@host[:port]/db` connection parts.
@@ -138,11 +149,27 @@ impl MssqlSource {
             rt,
             client,
             database: parts.database,
+            proxy_kind: MssqlProxyKind::Direct,
         };
         // Health round-trip — surfaces auth/permission errors at connect time
         // (doctor relies on this).
         src.query_scalar("SELECT 1")?;
+        // Best-effort pooler/gateway detection (mirrors PG `pg_backend_pid`
+        // drift and MySQL `CONNECTION_ID()` drift): one warning at connect
+        // time, never breaks the export. Disjoint borrows of `rt` (&) and
+        // `client` (&mut).
+        let kind = detect_mssql_proxy_kind(&src.rt, &mut src.client);
+        warn_proxy_kind(kind);
+        src.proxy_kind = kind;
         Ok(src)
+    }
+
+    /// Expose the proxy classification for diagnostics (preflight, integration
+    /// tests). Not part of the `Source` trait — same internal-may-change
+    /// contract as the rest of `rivet::source::mssql::*`.
+    #[allow(dead_code)]
+    pub fn proxy_kind(&self) -> MssqlProxyKind {
+        self.proxy_kind
     }
 }
 
