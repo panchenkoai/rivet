@@ -63,7 +63,11 @@
   `mssql_db_bench.sh`): measured against live SQL Server 2022, rivet's chunked
   autocommit reads hold **no long transaction** (0 ms), pin **nothing** back
   from log truncation, add **zero** write pressure (read-only), and take a
-  **3–4 lock** peak footprint.
+  **3–4 lock** peak footprint. A **per-tool comparison** (`mssql_harm_compare.sh`,
+  2 M-row `content_items`) puts that next to the competitors: rivet's longest
+  single query is **6.6 s** vs **~9 min** for sling/dlt scanning the table in one
+  shot, and rivet holds **no** open transaction where **dlt holds one for ~8 min**
+  (version-store / log-truncation hazard).
 - **`bench(mssql)`** — competitive performance matrix
   ([`REPORT_mssql.md`](docs/bench/reports/REPORT_mssql.md)) vs sling / dlt on
   live SQL Server 2022: rivet wins throughput on narrow-to-medium tables

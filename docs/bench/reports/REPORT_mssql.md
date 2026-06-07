@@ -1,10 +1,12 @@
 # SQL Server benchmark — DBA-harm signals
 
-> **Scope.** This report covers the **DBA-harm** matrix for SQL Server (how
-> gently rivet treats the source). The **competitive performance** matrix
-> (rivet vs sling / dlt / duckdb / clickhouse / odbc2parquet, à la
-> [`REPORT_pg.md`](REPORT_pg.md) / [`REPORT_mysql.md`](REPORT_mysql.md)) is
-> deferred — it needs each external tool wired to extract from SQL Server fairly.
+> **Scope.** Two matrices for SQL Server, both measured against live SQL Server
+> 2022, **rivet vs sling vs dlt**: a **DBA-harm** matrix (how gently each tool
+> treats the source — longest query, longest open transaction, locks, log
+> pressure) and a **competitive performance** matrix (wall / RSS). The competitor
+> set is narrower than [`REPORT_pg.md`](REPORT_pg.md) / [`REPORT_mysql.md`](REPORT_mysql.md)
+> because DuckDB / ClickHouse have no SQL Server connector and odbc2parquet needs
+> the MS ODBC Driver 18.
 
 Measured against live **SQL Server 2022** (`docker-compose.yaml` `mssql`
 service) with the harness
@@ -51,6 +53,35 @@ rivet is a **gentle** SQL Server citizen on the dimensions that matter to a DBA:
   [reference/tuning.md](../../reference/tuning.md).)
 - **Small lock footprint.** Peak 3–4 locks: a chunk's range scan takes shared
   locks only for its own duration and releases them before the next chunk.
+
+## Per-tool DBA-harm comparison — `content_items` (2 M rows)
+
+The signals above are rivet's own footprint. Wrapping each extractor in the same
+DMV sampler (harness:
+[`mssql_harm_compare.sh`](../harness/mssql_harm_compare.sh)) shows how rivet's
+chunked reads compare to tools that scan the whole table in one shot — the SQL
+Server analogue of the PG "DB-side signals" table in
+[`REPORT_pg.md`](REPORT_pg.md):
+
+| Tool | Longest single request | Longest open txn | Peak locks | Sessions |
+|---|---:|---:|---:|---:|
+| **rivet** | **6.6 s** | **0 s** | 22 | 1 |
+| sling | 539 s | 0 s | 7 | 1 |
+| dlt | 490 s | **490 s** | 6 | 1 |
+
+- **Longest single request** — rivet's chunked `SELECT`s top out at **6.6 s** per
+  chunk; sling and dlt each run **one ~8–9 minute query** over the whole 2 M-row
+  table. The source's long-running-query monitors never see rivet for longer than
+  a chunk; they see the others for the entire export.
+- **Longest open transaction** — rivet (autocommit chunks) and sling (autocommit
+  streaming) hold **none**; **dlt holds a single transaction open for ~8 minutes**
+  (a server-side cursor inside a transaction). That is the classic DBA pager
+  event: an 8-minute transaction pins the version store and blocks log truncation
+  for its whole duration. **rivet is the only tool here with both a short query
+  and no long transaction.**
+- Lock counts are all small (6–22) and all three are read-only
+  (`Log Flush Waits` ≈ 0). rivet's chunked range scans hold a few more shared
+  locks at once but release them per chunk.
 
 ### Honest caveat — isolation level
 
