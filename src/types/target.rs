@@ -31,7 +31,7 @@
 use arrow::datatypes::DataType;
 use serde::Serialize;
 
-use super::{RivetType, TypeFidelity, TypeMapping};
+use super::{RivetType, TimeUnit, TypeFidelity, TypeMapping};
 
 /// A supported downstream warehouse target. Closed, in-tree, contract-tested
 /// set; chosen at runtime from `--target X`, one per run.
@@ -348,6 +348,25 @@ mod bigquery {
             RivetType::Timestamp {
                 timezone: Some(_), ..
             } => Resolved::ok("TIMESTAMP"),
+            // Nanosecond naive timestamp (the `timestamp_ns` override, e.g. SQL
+            // Server datetime2(7)) has no BigQuery native temporal type: the loader
+            // does not recognise the Parquet TIMESTAMP(NANOS) logical type and
+            // autoloads the raw INT64 nanoseconds-since-epoch (verified live
+            // 2026-06-07 — lossless as an integer). A native TIMESTAMP needs
+            // TIMESTAMP_MICROS(DIV(col,1000)), which drops the sub-µs digits
+            // (BigQuery TIMESTAMP is microsecond), so no lossless temporal cast
+            // exists — keep INT64, or use the default `timestamp` for BigQuery.
+            RivetType::Timestamp {
+                unit: TimeUnit::Nanosecond,
+                timezone: None,
+            } => Resolved::diverge(
+                "INT64",
+                "INT64",
+                "nanosecond timestamp has no BigQuery native type — autoloads as INT64 (raw \
+                 nanos, lossless); a native TIMESTAMP via TIMESTAMP_MICROS(DIV(col,1000)) drops \
+                 sub-µs precision. Prefer `timestamp` (microsecond) for BigQuery targets.",
+                None,
+            ),
             // naive timestamp → wall-clock → DATETIME, but BigQuery autoload
             // ignores Parquet isAdjustedToUTC=false and yields TIMESTAMP
             // (verified). `DATETIME(ts)` recovers the wall-clock after load.
@@ -470,6 +489,12 @@ mod duckdb {
             RivetType::Timestamp {
                 timezone: Some(_), ..
             } => Resolved::ok("TIMESTAMPTZ"),
+            // DuckDB has a native nanosecond timestamp; the `timestamp_ns` override
+            // round-trips losslessly (verified live 2026-06-07).
+            RivetType::Timestamp {
+                unit: TimeUnit::Nanosecond,
+                timezone: None,
+            } => Resolved::ok("TIMESTAMP_NS"),
             RivetType::Timestamp { timezone: None, .. } => Resolved::ok("TIMESTAMP"),
             RivetType::String | RivetType::Text | RivetType::Enum => Resolved::ok("VARCHAR"),
             RivetType::Binary => Resolved::ok("BLOB"),
@@ -545,6 +570,21 @@ mod snowflake {
                 "TIMESTAMP_NTZ",
                 "tz timestamp autoloads as TIMESTAMP_NTZ — ALTER SESSION SET TIMEZONE='UTC' before COPY so the instant matches",
                 None,
+            ),
+            // Nanosecond naive timestamp autoloads as NUMBER (ns since epoch),
+            // like the µs case but at scale 9. Snowflake TIMESTAMP_NTZ holds full
+            // 9-digit precision, so TO_TIMESTAMP_NTZ(col, 9) recovers it
+            // losslessly — verified live 2026-06-07 (NUMBER 1717761600123456700 →
+            // 2024-06-07 12:00:00.123456700, the 7th digit intact).
+            RivetType::Timestamp {
+                unit: TimeUnit::Nanosecond,
+                timezone: None,
+            } => Resolved::diverge(
+                "TIMESTAMP_NTZ",
+                "NUMBER(38,0)",
+                "nanosecond timestamp autoloads as NUMBER (ns since epoch); recover with \
+                 TO_TIMESTAMP_NTZ(col, 9) after load — Snowflake TIMESTAMP_NTZ holds full ns precision",
+                Some(r#"TO_TIMESTAMP_NTZ("{col}", 9)"#),
             ),
             // naive timestamp autoloads as NUMBER (µs since epoch).
             RivetType::Timestamp { timezone: None, .. } => Resolved::diverge(
@@ -622,6 +662,50 @@ mod tests {
     }
     fn sf(rt: &RivetType) -> TargetColumnSpec {
         ExportTarget::Snowflake.resolve_column(input(rt))
+    }
+
+    // ── nanosecond timestamp (`timestamp_ns` override) per-target autoload ────
+    // The default `timestamp` is microsecond; ns is opt-in (datetime2(7)). These
+    // pin the autoload truth verified live on 2026-06-07 so the preflight report
+    // doesn't claim the microsecond behaviour for a ns column.
+
+    #[test]
+    fn bq_nanosecond_timestamp_autoloads_as_int64() {
+        let ns = RivetType::Timestamp {
+            unit: super::super::TimeUnit::Nanosecond,
+            timezone: None,
+        };
+        let s = bq(&ns);
+        assert_eq!(s.target_type, "INT64");
+        assert_eq!(s.autoload_type, "INT64");
+        assert_eq!(s.status, TargetStatus::Warn);
+        // No lossless temporal recovery (ns→µs is lossy) — like the UINT64 case.
+        assert!(s.cast_sql.is_none(), "ns→BQ has no lossless temporal cast");
+    }
+
+    #[test]
+    fn duckdb_nanosecond_timestamp_is_native_timestamp_ns() {
+        let ns = RivetType::Timestamp {
+            unit: super::super::TimeUnit::Nanosecond,
+            timezone: None,
+        };
+        let s = duck(&ns);
+        assert_eq!(s.target_type, "TIMESTAMP_NS");
+        assert_eq!(s.status, TargetStatus::Ok);
+    }
+
+    #[test]
+    fn snowflake_nanosecond_timestamp_recovers_losslessly_at_scale_9() {
+        let ns = RivetType::Timestamp {
+            unit: super::super::TimeUnit::Nanosecond,
+            timezone: None,
+        };
+        let s = sf(&ns);
+        assert_eq!(s.target_type, "TIMESTAMP_NTZ");
+        assert_eq!(s.autoload_type, "NUMBER(38,0)");
+        // Lossless recovery (TIMESTAMP_NTZ holds 9 digits) → cast_sql is Some at
+        // scale 9 (not the µs scale 6); `{col}` is substituted with the column.
+        assert_eq!(s.cast_sql.as_deref(), Some(r#"TO_TIMESTAMP_NTZ("c", 9)"#));
     }
 
     // ── dispatch on RivetType, not Arrow — the headline fix ──────────────────

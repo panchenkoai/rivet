@@ -55,16 +55,32 @@ pub fn parse_type_str(s: &str) -> Result<RivetType> {
             unit: TimeUnit::Microsecond,
             timezone: None,
         }),
+        // Nanosecond opt-in: preserves a source's sub-microsecond fractional
+        // seconds (e.g. SQL Server `datetime2(7)`'s 100 ns tick) that the default
+        // microsecond mapping truncates. Arrow nanosecond timestamps are i64 ns,
+        // so the representable range is 1677-09-21 .. 2262-04-11 — values outside
+        // it export as NULL. Default to `timestamp` (microsecond, full range)
+        // unless you specifically need the extra precision and your data is in
+        // range. See docs/type-mapping.md.
+        "timestamp_ns" => Ok(RivetType::Timestamp {
+            unit: TimeUnit::Nanosecond,
+            timezone: None,
+        }),
         "timestamp_tz" | "timestamptz" | "timestamp with time zone" | "timestamp_utc" => {
             Ok(RivetType::Timestamp {
                 unit: TimeUnit::Microsecond,
                 timezone: Some("UTC".into()),
             })
         }
+        "timestamp_tz_ns" | "timestamptz_ns" => Ok(RivetType::Timestamp {
+            unit: TimeUnit::Nanosecond,
+            timezone: Some("UTC".into()),
+        }),
         _ => anyhow::bail!(
             "column override: unrecognised type '{}'. \
              Supported: bool, int2/int4/int8, float4/float8, decimal(p,s), \
-             date, timestamp, timestamp_tz, text, binary, json, uuid",
+             date, timestamp, timestamp_ns, timestamp_tz, timestamp_tz_ns, \
+             text, binary, json, uuid",
             s
         ),
     }
@@ -209,6 +225,33 @@ mod tests {
             parse_type_str("timestamptz").unwrap(),
             RivetType::Timestamp {
                 unit: TimeUnit::Microsecond,
+                timezone: Some("UTC".into())
+            }
+        );
+    }
+
+    #[test]
+    fn timestamp_nanosecond_opt_in_variants() {
+        // The ns opt-in for sub-microsecond sources (e.g. SQL Server
+        // datetime2(7)); default `timestamp` stays microsecond.
+        assert_eq!(
+            parse_type_str("timestamp_ns").unwrap(),
+            RivetType::Timestamp {
+                unit: TimeUnit::Nanosecond,
+                timezone: None
+            }
+        );
+        assert_eq!(
+            parse_type_str("timestamp_tz_ns").unwrap(),
+            RivetType::Timestamp {
+                unit: TimeUnit::Nanosecond,
+                timezone: Some("UTC".into())
+            }
+        );
+        assert_eq!(
+            parse_type_str("timestamptz_ns").unwrap(),
+            RivetType::Timestamp {
+                unit: TimeUnit::Nanosecond,
                 timezone: Some("UTC".into())
             }
         );

@@ -56,7 +56,14 @@ exports:
     columns:
       uid: uuid              # MySQL VARCHAR(36) → UUID semantic
       amount: decimal(18,2)  # also valid for MySQL DECIMAL without catalog
+      event_ts: timestamp_ns # keep SQL Server datetime2(7)'s 100 ns tick (see gap 4)
 ```
+
+Supported override types: `bool`, `int2/int4/int8`, `float4/float8`,
+`decimal(p,s)`, `date`, `timestamp`, `timestamp_ns`, `timestamp_tz`,
+`timestamp_tz_ns`, `text`, `binary`, `json`, `uuid`. The `_ns` timestamp
+variants preserve sub-microsecond precision (range 1677–2262; see gap 4) — the
+plain `timestamp` is microsecond with full date range.
 
 The override path is safe: a `uid: uuid` declaration tries to parse each
 cell — either 16 raw bytes (BINARY(16) layout) or a 36-char canonical text
@@ -249,7 +256,7 @@ defects in the PG / MySQL drivers; all have been fixed in v0.7.8:
 | `float` | `float64` | `Float64` | float text | | live matrix |
 | `date` | `date` | `Date32` | ISO date | | live matrix |
 | `time` | `time(µs)` | `Time64(µs)` | time text | µs precision | live matrix |
-| `datetime2` / `datetime` / `smalldatetime` | `timestamp(µs, none)` | `Timestamp(µs, None)` | datetime text | naive; **truncated to µs** — see known gap 4 | live matrix |
+| `datetime2` / `datetime` / `smalldatetime` | `timestamp(µs, none)` | `Timestamp(µs, None)` | datetime text | naive; µs default (full range), `datetime2(7)`'s 100 ns tick truncated — opt into `timestamp_ns` to keep it, see known gap 4 | live matrix |
 | `datetimeoffset` | `timestamp_tz(µs, UTC)` | `Timestamp(µs, UTC)` | datetime text | normalised to UTC | type_roundtrip |
 | `nvarchar` / `varchar` / `nchar` / `char` / `text` / `ntext` | `string` | `Utf8` | escaped UTF-8 | | live matrix |
 | `varbinary` / `binary` / `image` | `binary` | `Binary` | hex in CSV | | live matrix |
@@ -271,15 +278,39 @@ build unless a `columns:` override maps them.
    non-UUID fixed binary have no CSV cell — the export **fails loudly** naming
    the column (see [CSV serialization](#csv-serialization)) rather than silently
    writing empty values.
-4. **SQL Server `datetime2` sub-microsecond precision**: rivet maps every
-   timestamp to microsecond (`Timestamp(µs)`); Arrow nanosecond can't span the
-   full `datetime2` 0001–9999 range, so the 7th fractional digit of a bare
-   `datetime2` (default precision 7 = 100 ns) is **truncated to µs** on export.
-   This is lossless for `datetime2(6)` and below. Consequence for **incremental
-   mode**: a cursor on a `datetime2(7)` column lands one tick below the source
-   max, so the boundary row re-exports on every run. Use a `datetime2(6)`
-   (or coarser) cursor column, or an integer/identity cursor, for exact
-   incremental semantics.
+4. **SQL Server `datetime2` sub-microsecond precision** — *default is
+   microsecond; nanosecond is opt-in.* rivet maps `datetime2` to `Timestamp(µs)`
+   **by default**, because Arrow nanosecond timestamps are i64 ns and span only
+   **1677-09-21 .. 2262-04-11**, while `datetime2` spans 0001–9999 — a blanket ns
+   mapping would silently corrupt any value outside that window (a far worse bug
+   than the precision gap). So the 7th fractional digit of a `datetime2(7)`
+   (100 ns) is truncated to µs by default; lossless for `datetime2(6)` and below.
+
+   To **preserve the 100 ns tick** on a column whose data is inside the ns range,
+   opt in per column with a `timestamp_ns` override:
+
+   ```yaml
+   columns:
+     event_ts: timestamp_ns       # naive; use timestamp_tz_ns for datetimeoffset
+   ```
+
+   The Parquet file then carries `Timestamp(ns)` and the full precision survives
+   (verified live 2026-06-07: DuckDB reads it natively as `TIMESTAMP_NS`,
+   `…12:00:00.1234567` intact; the default µs path truncates to `.123456`).
+   **Caveats (all verified live 2026-06-07):**
+   - A value outside 1677–2262 exports as **NULL** (Arrow ns range).
+   - **DuckDB** — native `TIMESTAMP_NS`, fully lossless.
+   - **Snowflake** — autoloads as `NUMBER(38,0)` (raw nanos); `TO_TIMESTAMP_NTZ(col, 9)`
+     recovers a **lossless** `TIMESTAMP_NTZ` (it holds 9 digits — the 7th survives).
+   - **BigQuery** — autoloads as `INT64` (raw nanos, lossless as an integer); a
+     native `TIMESTAMP_MICROS(DIV(col,1000))` is **lossy** (BigQuery `TIMESTAMP`
+     is microsecond — the 7th digit drops). Keep the default `timestamp` for
+     BigQuery unless you carry the raw nanos.
+
+   **Incremental mode:** the default µs cursor on a `datetime2(7)` lands one tick
+   below the source max, re-exporting the boundary row every run — use
+   `timestamp_ns` (the cursor literal then carries all 9 digits), a `datetime2(6)`
+   (or coarser) cursor, or an integer/identity cursor.
 
 (MySQL `DECIMAL` now resolves its precision/scale from the wire column
 definition — no override needed; see the MySQL section.)
