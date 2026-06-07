@@ -63,7 +63,31 @@
   `mssql_db_bench.sh`): measured against live SQL Server 2022, rivet's chunked
   autocommit reads hold **no long transaction** (0 ms), pin **nothing** back
   from log truncation, add **zero** write pressure (read-only), and take a
-  **3–4 lock** peak footprint. Competitive performance matrix deferred.
+  **3–4 lock** peak footprint.
+- **`bench(mssql)`** — competitive performance matrix
+  ([`REPORT_mssql.md`](docs/bench/reports/REPORT_mssql.md)) vs sling / dlt on
+  live SQL Server 2022: rivet wins throughput on narrow-to-medium tables
+  (sub-second, 3–30× faster) and — with the streaming export — holds the lowest
+  or competitive peak RSS on every table, including the wide ones. The one
+  remaining gap is wall-time on heavy-text rows (the `tiberius` row decode), not
+  memory.
+- **`test(mssql)`** — `bigquery_validates_mssql_type_matrix_parquet`: the SQL
+  Server type matrix now also round-trips through live BigQuery (autoload types,
+  microsecond TIME/TIMESTAMP, `uniqueidentifier`→BYTES, decimal sums). **All
+  three type matrices (PG / MySQL / SQL Server) now pass through every oracle —
+  DuckDB, ClickHouse, and live BigQuery.**
+
+### Upgrade notes
+
+- **No config or API changes.** Existing PostgreSQL / MySQL / SQL Server exports
+  are unaffected; the `AdaptiveBatchController` refactor is internal and fully
+  re-validated on all three engines.
+- **SQL Server chunked exports open a fresh connection per chunk** (as the PG and
+  MySQL engines do) and run the one-time pooler / gateway detection on each. On a
+  many-chunk export that is real connection + auth churn — prefer a larger
+  `chunk_size` (fewer, larger files; the streaming export keeps memory bounded
+  regardless) over many small chunks. See
+  [gentle SQL Server extraction](docs/best-practices/mssql-gentle-extraction.md).
 
 ## 0.9.1 (2026-06-06) — SQL Server Source Engine
 
@@ -93,11 +117,6 @@
   drops declared precision), `real`/`float`, `money`, `date`, `time`,
   `datetime2`, `nvarchar`/`varchar`/`char`, `varbinary`, and `uniqueidentifier`
   → native Parquet `LogicalType::Uuid`. Unmapped types fail loud.
-- **`test(mssql)`** — `bigquery_validates_mssql_type_matrix_parquet`: the SQL
-  Server type matrix now also round-trips through live BigQuery (autoload types
-  + microsecond TIME/TIMESTAMP, `uniqueidentifier`→BYTES, decimal sums), joining
-  the PG/MySQL BigQuery validators. All three matrices now pass through every
-  oracle (DuckDB, ClickHouse, BigQuery).
 - **`test(mssql)`** — `{duckdb,clickhouse}_validates_mssql_type_matrix_parquet`
   added to the type-roundtrip harness, the same oracle pattern as PG/MySQL; CI
   `test-type-validators` provisions and seeds the `mssql` service.
