@@ -4,6 +4,12 @@
 
 ### SQL Server — streaming export + pooler detection + parity test suites
 
+- **`feat(mssql)`** — the export now honours the source-safety `SourceTuning`
+  knobs it previously ignored (it read only `batch_size`): **`lock_timeout`**
+  (server-side `SET LOCK_TIMEOUT` so a blocked read fails fast), **`statement_timeout`**
+  (client-side wall-clock budget — SQL Server has no statement-duration `SET`;
+  live-verified to abort + retry), and **`throttle_ms`** (sleep between batches).
+  Brings MSSQL to in-export tuning parity with the PG/MySQL engines.
 - **`feat(mssql)`** — the export now **streams**: it consumes the `tiberius`
   result set incrementally and emits one Arrow batch per `tuning.batch_size`
   rows instead of materialising the whole chunk (`into_first_result`). Peak RSS

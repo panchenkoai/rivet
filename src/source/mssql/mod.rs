@@ -182,12 +182,33 @@ impl Source for MssqlSource {
         // `chunk_size` (few output files) then runs at low memory — the SQL
         // Server analogue of the PostgreSQL cursor's `FETCH N`.
         let batch_rows = request.tuning.batch_size.max(1);
+        // Source-safety knobs (parity with the PG/MySQL export loops):
+        //  - lock_timeout → server-side `SET LOCK_TIMEOUT` so a blocked read
+        //    fails fast instead of waiting on a writer's lock indefinitely.
+        //  - statement_timeout → enforced client-side: SQL Server has no
+        //    statement-duration `SET` (unlike PG's `statement_timeout` / MySQL's
+        //    `max_execution_time`), so we stop pulling and error out once the
+        //    wall-clock budget is spent. The half-drained stream is dropped with
+        //    the (errored) source, so nothing leaks.
+        //  - throttle_ms → sleep between batches to cap read pressure.
+        let lock_timeout_ms = request.tuning.lock_timeout_s.saturating_mul(1000);
+        let throttle = request.tuning.throttle_ms;
+        let stmt_timeout = (request.tuning.statement_timeout_s > 0)
+            .then(|| std::time::Duration::from_secs(request.tuning.statement_timeout_s));
 
         let Self { rt, client, .. } = self;
         rt.block_on(async {
             use futures_util::stream::TryStreamExt;
             use tiberius::QueryItem;
 
+            if lock_timeout_ms > 0 {
+                client
+                    .execute(format!("SET LOCK_TIMEOUT {lock_timeout_ms}"), &[])
+                    .await
+                    .map_err(|e| anyhow::anyhow!("mssql: SET LOCK_TIMEOUT failed: {e}"))?;
+            }
+
+            let started = std::time::Instant::now();
             let mut stream = client
                 .query(sql.as_str(), &[])
                 .await
@@ -202,6 +223,14 @@ impl Source for MssqlSource {
                 .await
                 .map_err(|e| anyhow::anyhow!("mssql: streaming rows failed: {e}"))?
             {
+                if let Some(budget) = stmt_timeout
+                    && started.elapsed() > budget
+                {
+                    anyhow::bail!(
+                        "mssql: statement timeout after {}s (tuning.statement_timeout_s)",
+                        budget.as_secs()
+                    );
+                }
                 match item {
                     // A single SELECT yields one metadata token (the column
                     // shape) ahead of its rows.
@@ -214,6 +243,9 @@ impl Source for MssqlSource {
                         if buf.len() >= batch_rows {
                             emit_mssql_batch(&columns, &overrides, &mut schema, &buf, sink)?;
                             buf.clear();
+                            if throttle > 0 {
+                                std::thread::sleep(std::time::Duration::from_millis(throttle));
+                            }
                         }
                     }
                 }
