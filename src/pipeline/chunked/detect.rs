@@ -24,6 +24,55 @@ fn query_wrapped_row_count(src: &mut dyn Source, base_query: &str) -> Result<i64
     parse_scalar_i64(&raw)
 }
 
+/// Refuse to range/date-chunk on a column that has NULL values.
+///
+/// Range chunking filters with `WHERE col BETWEEN min AND max` and date chunking
+/// with `>= start AND < end`; both forms exclude NULL, so a row whose
+/// `chunk_column` is NULL falls into no chunk and would vanish from the export
+/// with no error. The keyset path already refuses a nullable key up front
+/// (`plan::build::resolve_chunked_strategy`, via `is_usable_keyset_key`); the
+/// range path historically did not. We detect the condition on the live data
+/// (one aggregate — a nullable column with zero actual NULLs is fine and must
+/// not be rejected) and bail with the same posture as keyset rather than drop
+/// rows silently. `chunk_dense` does NOT call this: its `ROW_NUMBER()` numbers
+/// every row, NULL-keyed included, so no row is lost.
+fn bail_if_null_keyed(
+    src: &mut dyn Source,
+    base_query: &str,
+    chunk_column: &str,
+    export_name: &str,
+    source_type: crate::config::SourceType,
+) -> Result<()> {
+    let col = crate::sql::quote_ident(source_type, chunk_column);
+    // `COUNT(*) - COUNT(col)` = number of NULL-keyed rows, dialect-agnostic and
+    // reusing the same fast-path-vs-wrap shape as the row-count query.
+    let sql = match strip_select_star_from(base_query) {
+        Some(table_ident) => format!("SELECT COUNT(*) - COUNT({col}) FROM {table_ident}"),
+        None => format!("SELECT COUNT(*) - COUNT({col}) FROM ({base_query}) AS _rivet_nullcnt"),
+    };
+    let null_keyed = src
+        .query_scalar(&sql)?
+        .as_deref()
+        .map(parse_scalar_i64)
+        .transpose()?
+        .unwrap_or(0);
+    if null_keyed > 0 {
+        anyhow::bail!(
+            "export '{}': {} row(s) have NULL in chunk_column '{}'. Range/date chunking filters \
+             with `BETWEEN min AND max` (or `>= .. < ..`), which excludes NULL — those rows would \
+             be silently dropped from the export. Fix one of: use a NOT NULL column for \
+             chunk_column; add `WHERE {} IS NOT NULL` to the query to drop them explicitly; set \
+             `chunk_dense: true` (ROW_NUMBER covers every row, NULL-keyed included); or use \
+             `mode: full`.",
+            export_name,
+            null_keyed,
+            chunk_column,
+            chunk_column
+        );
+    }
+    Ok(())
+}
+
 fn log_chunk_boundaries_list(export_name: &str, chunks: &[(i64, i64)]) {
     const HEAD: usize = 8;
     const TAIL: usize = 8;
@@ -120,6 +169,9 @@ pub(crate) fn detect_and_generate_chunks(
     source_type: crate::config::SourceType,
 ) -> Result<Vec<(i64, i64)>> {
     if let Some(days_per_chunk) = chunk_by_days {
+        // NULL-keyed rows are excluded by the date predicate `>= start AND < end`
+        // — refuse rather than drop them silently. (chunk_dense, below, is exempt.)
+        bail_if_null_keyed(src, base_query, chunk_column, export_name, source_type)?;
         let min_sql = crate::sql::aggregate_sql(source_type, "min", chunk_column, base_query);
         let max_sql = crate::sql::aggregate_sql(source_type, "max", chunk_column, base_query);
         let min_str = src.query_scalar(&min_sql)?.ok_or_else(|| {
@@ -190,6 +242,10 @@ pub(crate) fn detect_and_generate_chunks(
         );
         return Ok(chunks);
     }
+
+    // NULL-keyed rows are excluded by `WHERE col BETWEEN min AND max` — refuse
+    // rather than drop them silently. (chunk_dense, above, is exempt.)
+    bail_if_null_keyed(src, base_query, chunk_column, export_name, source_type)?;
 
     let min_sql = crate::sql::aggregate_sql(source_type, "min", chunk_column, base_query);
     let max_sql = crate::sql::aggregate_sql(source_type, "max", chunk_column, base_query);
@@ -273,6 +329,10 @@ mod tests {
     struct ScriptedSource {
         replies: VecDeque<Result<Option<String>>>,
         seen_sql: Vec<String>,
+        /// Value returned for the NULL-key guard query (`COUNT(*) - COUNT(col)`).
+        /// Defaults to 0 so existing min/max/count scripts stay focused and the
+        /// guard is a transparent no-op; the bail tests set it explicitly.
+        null_keys: i64,
     }
 
     impl ScriptedSource {
@@ -280,7 +340,13 @@ mod tests {
             Self {
                 replies: items.into_iter().collect(),
                 seen_sql: Vec::new(),
+                null_keys: 0,
             }
+        }
+
+        fn with_null_keys(mut self, n: i64) -> Self {
+            self.null_keys = n;
+            self
         }
     }
 
@@ -294,6 +360,12 @@ mod tests {
     impl crate::source::Source for ScriptedSource {
         fn query_scalar(&mut self, sql: &str) -> Result<Option<String>> {
             self.seen_sql.push(sql.to_string());
+            // The NULL-key guard issues `COUNT(*) - COUNT(col)`; answer it from
+            // `null_keys` (default 0) so it doesn't consume the min/max/count
+            // script and existing tests stay unchanged.
+            if sql.contains("- COUNT(") {
+                return Ok(Some(self.null_keys.to_string()));
+            }
             self.replies
                 .pop_front()
                 .expect("ScriptedSource: queue exhausted")
@@ -366,6 +438,35 @@ mod tests {
         let mut src = ScriptedSource::new([ok("5"), ok("20"), ok("15")]);
         let chunks = detect(&mut src, 100, false, None).unwrap();
         assert_eq!(chunks, vec![(5, 20)]);
+    }
+
+    // ── NULL-key guard (silent-drop prevention) ─────────────────────────────
+
+    #[test]
+    fn null_keyed_rows_in_integer_range_bail_not_silently_dropped() {
+        // 3 rows have NULL chunk_column → range chunking would exclude them via
+        // BETWEEN. Refuse with a clear, counted error instead of dropping them.
+        let mut src = ScriptedSource::new([ok("1"), ok("1000"), ok("500")]).with_null_keys(3);
+        let err = detect(&mut src, 100, false, None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("NULL in chunk_column"), "got: {msg}");
+        assert!(msg.contains("3 row(s)"), "should report the count: {msg}");
+    }
+
+    #[test]
+    fn null_keyed_rows_in_date_range_bail() {
+        let mut src = ScriptedSource::new([ok("2023-01-01"), ok("2023-01-31")]).with_null_keys(7);
+        let err = detect(&mut src, 10_000, false, Some(7)).unwrap_err();
+        assert!(format!("{err:#}").contains("NULL in chunk_column"));
+    }
+
+    #[test]
+    fn chunk_dense_is_exempt_from_null_guard() {
+        // ROW_NUMBER() numbers every row, NULL-keyed included, so dense must NOT
+        // run the guard even when NULLs exist — no bail, normal ordinal chunks.
+        let mut src = ScriptedSource::new([ok("250")]).with_null_keys(99);
+        let chunks = detect(&mut src, 100, true, None).unwrap();
+        assert_eq!(chunks, vec![(1, 100), (101, 200), (201, 250)]);
     }
 
     // ── chunk_dense path ────────────────────────────────────────────────────
