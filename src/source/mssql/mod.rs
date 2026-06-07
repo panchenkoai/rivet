@@ -32,7 +32,9 @@ use proxy::{detect_mssql_proxy_kind, warn_proxy_kind};
 
 use crate::config::TlsConfig;
 use crate::error::Result;
-use crate::source::batch_controller::{AdaptiveBatchController, PROBE_BATCH_SIZE};
+use crate::source::batch_controller::{
+    AdaptiveBatchController, DEFAULT_BATCH_TARGET_MB, PROBE_BATCH_SIZE,
+};
 use crate::source::query::build_export_query;
 use crate::source::{BatchSink, ExportRequest, Source, TableIntrospection};
 use crate::types::{ColumnOverrides, TypeMapping};
@@ -185,7 +187,6 @@ impl Source for MssqlSource {
         // is a no-op here: a single streaming connection can't sample DB pressure
         // mid-stream; the OPT-2 concurrency governor handles that at the chunk
         // layer instead.)
-        const MSSQL_BATCH_TARGET_MB_DEFAULT: usize = 64;
         let mut ctl =
             AdaptiveBatchController::new(request.tuning, request.tuning.batch_size.max(1));
         let mut cap_applied = false;
@@ -260,7 +261,7 @@ impl Source for MssqlSource {
                                 let target_mb = request
                                     .tuning
                                     .batch_size_memory_mb
-                                    .unwrap_or(MSSQL_BATCH_TARGET_MB_DEFAULT);
+                                    .unwrap_or(DEFAULT_BATCH_TARGET_MB);
                                 let safe = ((target_mb * 1024 * 1024) / arrow_per_row)
                                     .max(PROBE_BATCH_SIZE);
                                 if let Some(new) = ctl.apply_memory_cap(safe) {

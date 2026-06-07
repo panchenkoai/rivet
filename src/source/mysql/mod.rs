@@ -29,7 +29,9 @@ use mysql::{Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts};
 
 use crate::config::{SourceType, TlsConfig, TlsMode};
 use crate::error::Result;
-use crate::source::batch_controller::{AdaptiveBatchController, PROBE_BATCH_SIZE};
+use crate::source::batch_controller::{
+    AdaptiveBatchController, DEFAULT_BATCH_TARGET_MB, PROBE_BATCH_SIZE,
+};
 use crate::source::query::build_export_query;
 use crate::tuning::SourceTuning;
 use crate::types::ColumnOverrides;
@@ -73,9 +75,10 @@ fn mysql_sample_innodb_log_waits(pool: &Pool) -> Option<u64> {
 }
 
 impl MysqlSource {
-    /// Build a source from an existing pool. Useful in tests that need to
-    /// share the pool with post-export state inspection.
-    #[allow(dead_code)]
+    /// Build a source from an existing pool: the single place that detects the
+    /// proxy kind, warns once, and wraps the pool. The `connect*` entry points
+    /// all funnel through here (also handy in tests that share the pool for
+    /// post-export state inspection).
     pub fn from_pool(pool: Pool) -> Self {
         let proxy_kind = detect_mysql_proxy_kind(&pool);
         warn_proxy_kind(proxy_kind);
@@ -86,10 +89,7 @@ impl MysqlSource {
     pub fn connect(url: &str) -> Result<Self> {
         let opts =
             Opts::from(OptsBuilder::from_opts(Opts::from_url(url)?).pool_opts(lean_pool_opts()));
-        let pool = Pool::new(opts)?;
-        let proxy_kind = detect_mysql_proxy_kind(&pool);
-        warn_proxy_kind(proxy_kind);
-        Ok(Self { pool, proxy_kind })
+        Ok(Self::from_pool(Pool::new(opts)?))
     }
 
     /// Connect honoring the user's [`TlsConfig`].
@@ -103,10 +103,7 @@ impl MysqlSource {
                         .ssl_opts(Some(ssl))
                         .pool_opts(lean_pool_opts()),
                 );
-                let pool = Pool::new(opts)?;
-                let proxy_kind = detect_mysql_proxy_kind(&pool);
-                warn_proxy_kind(proxy_kind);
-                Ok(Self { pool, proxy_kind })
+                Ok(Self::from_pool(Pool::new(opts)?))
             }
             _ => Self::connect(url),
         }
@@ -418,8 +415,6 @@ fn mysql_run_export(
     // Caller's `batch_size_memory_mb` wins when set; the default is 64 MB —
     // chosen to keep peak RSS well under 200 MB on wide-row tables while
     // keeping batches large enough to be efficient for the parquet writer.
-    const MYSQL_BATCH_TARGET_MB_DEFAULT: usize = 64;
-
     let configured_batch_size = tuning.effective_batch_size(Some(&schema));
     // Shared batch-size state machine (probe → memory-cap → adaptive → throttle);
     // MySQL provides only the row source + the target-MB cap formula below.
@@ -454,7 +449,7 @@ fn mysql_run_export(
                 let arrow_per_row = (arrow_bytes / batch_rows).max(64);
                 let target_mb = tuning
                     .batch_size_memory_mb
-                    .unwrap_or(MYSQL_BATCH_TARGET_MB_DEFAULT);
+                    .unwrap_or(DEFAULT_BATCH_TARGET_MB);
                 let safe = ((target_mb * 1024 * 1024) / arrow_per_row).max(PROBE_BATCH_SIZE);
                 if let Some(new) = ctl.apply_memory_cap(safe) {
                     log::info!(

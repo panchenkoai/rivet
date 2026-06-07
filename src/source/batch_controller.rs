@@ -25,6 +25,11 @@ use crate::tuning::{ADAPTIVE_SAMPLE_INTERVAL, SourceTuning, next_adaptive_batch_
 /// memory cap exists, without a wide-row first batch blowing the budget.
 pub(crate) const PROBE_BATCH_SIZE: usize = 500;
 
+/// Default per-batch Arrow memory budget (MB) when the export sets no
+/// `batch_size_memory_mb`. Used by the row-accumulating engines (MySQL, MSSQL)
+/// to size the post-probe cap; PostgreSQL derives its own from `work_mem`.
+pub(crate) const DEFAULT_BATCH_TARGET_MB: usize = 64;
+
 /// Owns the batch-size state machine shared by all engine export loops.
 pub(crate) struct AdaptiveBatchController {
     effective: usize,
