@@ -31,9 +31,10 @@ use postgres::{Client, NoTls};
 
 use crate::config::{SourceType, TlsConfig};
 use crate::error::Result;
+use crate::source::batch_controller::AdaptiveBatchController;
 use crate::source::query::build_export_query;
 use crate::source::tls::build_native_tls;
-use crate::tuning::{ADAPTIVE_SAMPLE_INTERVAL, SourceTuning, next_adaptive_batch_size};
+use crate::tuning::SourceTuning;
 use crate::types::{ColumnOverrides, SourceColumn, TypeMapping};
 
 use arrow_convert::{pg_columns_to_schema, rivet_type_for_pg_column, rows_to_record_batch_typed};
@@ -403,31 +404,27 @@ fn pg_run_export(
         .client_mut()
         .batch_execute(&format!("DECLARE _rivet NO SCROLL CURSOR FOR {built_sql}"))?;
 
-    // First FETCH is intentionally small — it acts as a row-width probe.
-    // Without it we can't know `arrow_bytes/row` before the cursor runs, and a
-    // single FETCH of `tuning.batch_size` × wide rows already triggers spill.
-    // 500 wide rows × 4 KB ≈ 2 MB, well under the typical work_mem of 4 MB.
-    const PROBE_FETCH_SIZE: usize = 500;
+    // The first FETCH is intentionally a small `PROBE_BATCH_SIZE` row-width
+    // probe (the controller starts there): without it we can't know
+    // `arrow_bytes/row` before the cursor runs, and a single FETCH of
+    // `tuning.batch_size` × wide rows already triggers a `pgsql_tmp/` spill.
     let configured_batch_size = tuning.batch_size;
-    let mut fetch_size = configured_batch_size.min(PROBE_FETCH_SIZE);
-    let mut fetch_sql = format!("FETCH {} FROM _rivet", fetch_size);
-    let mut work_mem_cap_applied = false;
+    // Shared batch-size state machine; PG provides the FETCH N row source, the
+    // work_mem (or schema-derived) cap target, and the checkpoint pressure proxy.
+    let mut ctl = AdaptiveBatchController::new(tuning, configured_batch_size);
+    ctl.seed_pressure(if tuning.adaptive {
+        pg_sample_checkpoints_req(guard.client_mut()).map(|v| v as u64)
+    } else {
+        None
+    });
     let mut schema: Option<SchemaRef> = None;
     let mut columns_cache: Option<Vec<(String, Type)>> = None;
     let mut total_rows: usize = 0;
-    let mut base_fetch_size = fetch_size;
-    let mut adaptive_last_ckpt: Option<i64> = if tuning.adaptive {
-        pg_sample_checkpoints_req(guard.client_mut())
-    } else {
-        None
-    };
-    let mut batch_count: usize = 0;
+    let mut cap_applied = false;
 
     loop {
-        // `fetch_size` may be resized mid-iteration (probe → work_mem cap
-        // adjustment). The end-of-loop "exhausted" check must compare against
-        // the size we actually requested in this round, not the resized one.
-        let requested_this_iter = fetch_size;
+        let requested = ctl.target();
+        let fetch_sql = format!("FETCH {} FROM _rivet", requested);
         let rows = guard.client_mut().query(&fetch_sql, &[])?;
         if rows.is_empty() {
             break;
@@ -445,17 +442,15 @@ fn pg_run_export(
                 numeric_hints,
             )?);
             sink.on_schema(s.clone())?;
-            schema = Some(s.clone());
-            columns_cache = Some(stmt_cols);
-
-            // Defer the work_mem cap to after we measure the actual batch
-            // bytes below — schema-only estimates under-count wide TEXT.
-            let effective = tuning.effective_batch_size(Some(&s));
-            if effective != fetch_size && work_mem_bytes.is_none() {
-                fetch_size = effective.max(fetch_size);
-                fetch_sql = format!("FETCH {} FROM _rivet", fetch_size);
+            // When work_mem can't be read, fall back to the schema-derived
+            // effective batch size as the cap target (controller clamps it).
+            if work_mem_bytes.is_none() {
+                let effective = tuning.effective_batch_size(Some(&s));
+                ctl.apply_memory_cap(effective.max(requested));
+                cap_applied = true;
             }
-            base_fetch_size = fetch_size;
+            schema = Some(s);
+            columns_cache = Some(stmt_cols);
         }
 
         let row_count = rows.len();
@@ -468,13 +463,11 @@ fn pg_run_export(
         let batch = rows_to_record_batch_typed(s, cols, &rows)?;
         drop(rows);
 
-        // After the first (small probe) batch we know the actual row width.
-        // Compute the cursor-spill-safe FETCH size from observed Arrow bytes:
-        //   pg_row_bytes ≈ arrow_per_row × 1.2  (small fudge for tuple header)
-        //   safe = work_mem × 0.7 / pg_row_bytes
-        // Subsequent FETCHes use that, clamped never to exceed the user's
-        // configured `batch_size` (so an explicit knob still wins).
-        if !work_mem_cap_applied
+        // After the first (probe) batch we know the actual row width. Cap the
+        // FETCH N below `work_mem × 0.7` so the cursor never spills:
+        //   pg_row_bytes ≈ arrow_per_row × 1.2 ; safe = work_mem×0.7 / pg_row_bytes
+        // The controller clamps it to the configured `batch_size`.
+        if !cap_applied
             && let Some(wm) = work_mem_bytes
             && row_count > 0
         {
@@ -482,62 +475,46 @@ fn pg_run_export(
             let arrow_per_row = (arrow_bytes / row_count).max(1);
             let pg_per_row = ((arrow_per_row * 12) / 10).max(64);
             let safe = (((wm as f64) * 0.7) as usize / pg_per_row).max(100);
-            let mut target = safe.min(configured_batch_size);
+            let mut target = safe;
             if let Some(mem_mb) = tuning.batch_size_memory_mb {
                 let arrow_target = (mem_mb * 1024 * 1024) / arrow_per_row;
                 target = target.min(arrow_target.max(100));
             }
-            if target != fetch_size {
+            if let Some(new) = ctl.apply_memory_cap(target) {
                 log::info!(
-                    "PG work_mem={} B, observed row={} B (arrow), pg≈{} B → FETCH N {} → {} (configured={})",
+                    "PG work_mem={} B, observed row={} B (arrow), pg≈{} B → FETCH N → {} (configured={})",
                     wm,
                     arrow_per_row,
                     pg_per_row,
-                    fetch_size,
-                    target,
+                    new,
                     configured_batch_size,
                 );
-                fetch_size = target;
-                fetch_sql = format!("FETCH {} FROM _rivet", fetch_size);
-                base_fetch_size = fetch_size;
             }
-            work_mem_cap_applied = true;
+            cap_applied = true;
         }
 
         sink.on_batch(&batch)?;
 
-        batch_count += 1;
-        if tuning.adaptive
-            && batch_count.is_multiple_of(ADAPTIVE_SAMPLE_INTERVAL)
-            && let Some(cur) = pg_sample_checkpoints_req(guard.client_mut())
+        if let Some((new, under_pressure)) =
+            ctl.after_batch(|| pg_sample_checkpoints_req(guard.client_mut()).map(|v| v as u64))
         {
-            let under_pressure = adaptive_last_ckpt.is_some_and(|prev| cur > prev);
-            adaptive_last_ckpt = Some(cur);
-            let next = next_adaptive_batch_size(fetch_size, base_fetch_size, under_pressure);
-            if next != fetch_size {
-                fetch_size = next;
-                fetch_sql = format!("FETCH {} FROM _rivet", fetch_size);
-                log::info!(
-                    "adaptive batch size → {} ({})",
-                    fetch_size,
-                    if under_pressure {
-                        "pressure"
-                    } else {
-                        "recovery"
-                    }
-                );
-            }
+            log::info!(
+                "adaptive batch size → {} ({})",
+                new,
+                if under_pressure {
+                    "pressure"
+                } else {
+                    "recovery"
+                }
+            );
         }
 
         log::info!("fetched {} rows so far...", total_rows);
 
-        if row_count < requested_this_iter {
+        if row_count < requested {
             break;
         }
-
-        if tuning.throttle_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(tuning.throttle_ms));
-        }
+        ctl.throttle();
     }
 
     // Explicit CLOSE is technically redundant — COMMIT releases the cursor —

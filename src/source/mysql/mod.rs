@@ -29,8 +29,9 @@ use mysql::{Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts};
 
 use crate::config::{SourceType, TlsConfig, TlsMode};
 use crate::error::Result;
+use crate::source::batch_controller::{AdaptiveBatchController, PROBE_BATCH_SIZE};
 use crate::source::query::build_export_query;
-use crate::tuning::{ADAPTIVE_SAMPLE_INTERVAL, SourceTuning, next_adaptive_batch_size};
+use crate::tuning::SourceTuning;
 use crate::types::ColumnOverrides;
 
 use arrow_convert::{
@@ -417,22 +418,21 @@ fn mysql_run_export(
     // Caller's `batch_size_memory_mb` wins when set; the default is 64 MB —
     // chosen to keep peak RSS well under 200 MB on wide-row tables while
     // keeping batches large enough to be efficient for the parquet writer.
-    const PROBE_BATCH_SIZE: usize = 500;
     const MYSQL_BATCH_TARGET_MB_DEFAULT: usize = 64;
 
     let configured_batch_size = tuning.effective_batch_size(Some(&schema));
-    let mut effective_bs = configured_batch_size.min(PROBE_BATCH_SIZE);
-    let mut base_fetch_size = effective_bs;
-    let mut adaptive_last_waits: Option<u64> = if tuning.adaptive {
+    // Shared batch-size state machine (probe → memory-cap → adaptive → throttle);
+    // MySQL provides only the row source + the target-MB cap formula below.
+    let mut ctl = AdaptiveBatchController::new(tuning, configured_batch_size);
+    ctl.seed_pressure(if tuning.adaptive {
         sample_pool.as_ref().and_then(mysql_sample_innodb_log_waits)
     } else {
         None
-    };
-    let mut batch_count: usize = 0;
+    });
     let row_set = result
         .iter()
         .ok_or_else(|| anyhow::anyhow!("no result set"))?;
-    let mut row_buf: Vec<mysql::Row> = Vec::with_capacity(effective_bs);
+    let mut row_buf: Vec<mysql::Row> = Vec::with_capacity(ctl.target());
     let mut total_rows: usize = 0;
     let mut memory_cap_applied = false;
 
@@ -440,16 +440,15 @@ fn mysql_run_export(
         let row = row_result?;
         row_buf.push(row);
 
-        if row_buf.len() >= effective_bs {
+        if row_buf.len() >= ctl.target() {
             total_rows += row_buf.len();
-            batch_count += 1;
             let batch = rows_to_record_batch_typed(&schema, &arrow_types, &row_buf)?;
             let batch_rows = row_buf.len();
             row_buf.clear();
 
             // After the first (probe-sized) batch we know how many bytes per
             // row Arrow actually uses. Cap subsequent flushes to a memory
-            // target. Never exceed the user's configured `batch_size`.
+            // target. The controller clamps it to the configured `batch_size`.
             if !memory_cap_applied && batch_rows > 0 {
                 let arrow_bytes = crate::tuning::SourceTuning::batch_memory_bytes(&batch);
                 let arrow_per_row = (arrow_bytes / batch_rows).max(64);
@@ -457,52 +456,37 @@ fn mysql_run_export(
                     .batch_size_memory_mb
                     .unwrap_or(MYSQL_BATCH_TARGET_MB_DEFAULT);
                 let safe = ((target_mb * 1024 * 1024) / arrow_per_row).max(PROBE_BATCH_SIZE);
-                let target = safe.min(configured_batch_size);
-                if target != effective_bs {
+                if let Some(new) = ctl.apply_memory_cap(safe) {
                     log::info!(
-                        "MySQL row_buf cap: arrow≈{} B/row, target={} MB → batch_size {} → {} (configured={})",
+                        "MySQL row_buf cap: arrow≈{} B/row, target={} MB → batch_size → {} (configured={})",
                         arrow_per_row,
                         target_mb,
-                        effective_bs,
-                        target,
+                        new,
                         configured_batch_size
                     );
-                    effective_bs = target;
-                    base_fetch_size = effective_bs;
-                    row_buf.reserve(effective_bs.saturating_sub(row_buf.capacity()));
+                    row_buf.reserve(new.saturating_sub(row_buf.capacity()));
                 }
                 memory_cap_applied = true;
             }
 
             sink.on_batch(&batch)?;
 
-            if tuning.adaptive
-                && batch_count.is_multiple_of(ADAPTIVE_SAMPLE_INTERVAL)
-                && let Some(ref pool) = sample_pool
-                && let Some(cur) = mysql_sample_innodb_log_waits(pool)
+            if let Some((new, under_pressure)) =
+                ctl.after_batch(|| sample_pool.as_ref().and_then(mysql_sample_innodb_log_waits))
             {
-                let under_pressure = adaptive_last_waits.is_some_and(|prev| cur > prev);
-                adaptive_last_waits = Some(cur);
-                let next = next_adaptive_batch_size(effective_bs, base_fetch_size, under_pressure);
-                if next != effective_bs {
-                    effective_bs = next;
-                    log::info!(
-                        "adaptive batch size → {} ({})",
-                        effective_bs,
-                        if under_pressure {
-                            "pressure"
-                        } else {
-                            "recovery"
-                        }
-                    );
-                }
+                log::info!(
+                    "adaptive batch size → {} ({})",
+                    new,
+                    if under_pressure {
+                        "pressure"
+                    } else {
+                        "recovery"
+                    }
+                );
             }
 
             log::info!("fetched {} rows so far...", total_rows);
-
-            if tuning.throttle_ms > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(tuning.throttle_ms));
-            }
+            ctl.throttle();
         }
     }
 

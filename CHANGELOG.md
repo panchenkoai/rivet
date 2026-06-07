@@ -4,6 +4,12 @@
 
 ### SQL Server — streaming export + pooler detection + parity test suites
 
+- **`refactor(source)`** — the probe → memory-cap → adaptive-resize → throttle
+  batch-sizing policy, previously triplicated across the PG / MySQL / SQL Server
+  export loops, is now one unit-tested `AdaptiveBatchController`. Engines provide
+  only what differs (row source + memory-cap formula). SQL Server gains the same
+  first-batch memory-cap probe PG/MySQL have. No behaviour change — full live
+  validation across all three engines (parity, recovery, type matrices).
 - **`feat(mssql)`** — the export now honours the source-safety `SourceTuning`
   knobs it previously ignored (it read only `batch_size`): **`lock_timeout`**
   (server-side `SET LOCK_TIMEOUT` so a blocked read fails fast), **`statement_timeout`**

@@ -1,3 +1,4 @@
+pub(crate) mod batch_controller;
 pub mod mssql;
 pub mod mysql;
 pub(crate) mod pg_numeric_wire;
