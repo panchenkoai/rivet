@@ -613,11 +613,21 @@ roadmap-write time; file paths resolved, line refs current):**
 
 ### Phase B — pooler-safe session parity (P1)
 
-- [ ] **B1. MySQL session-reset RAII guard (analogue of `PgTxnGuard`).**
-      `SET SESSION max_execution_time` (`src/source/mysql/mod.rs:519`) is reset
-      at end-of-function (`:543`) but not on a `Drop` path, so it can stick to a
-      reused backend connection behind ProxySQL / MaxScale on an early return /
-      panic. Add a guard that resets session vars (`SET … = DEFAULT`) on `Drop`.
+- [x] **B1. MySQL session-reset RAII guard — DONE 2026-06-07.** Added
+      `MysqlSessionGuard` (analogue of `postgres::PgTxnGuard`): it applies the
+      two per-connection SETs (`time_zone = '+00:00'` always; `max_execution_time`
+      when a statement timeout is configured) and resets them on `Drop`, so a
+      pooled connection — returned to the mysql-crate pool or reused behind
+      ProxySQL / MaxScale — is always clean before the next checkout. Closes two
+      gaps the old end-of-function reset missed: (1) a **panic** mid-export
+      unwinding past the reset, and (2) an **early `?`** on the
+      `SET max_execution_time` itself (MariaDB spells it `max_statement_time`, so
+      that SET errors — and `time_zone`, already set, leaked). The guard is
+      constructed immediately after the `time_zone` SET so the reset is armed
+      before any later failure. Live-validated: the reset fires on teardown
+      (probe), is correctly gated (`max_exec` reset only when armed;
+      `statement_timeout_s: 0` skips it), and the `live_mysql_chunked` suite
+      (every run resets `time_zone`) stays green.
 - [x] **B2. MSSQL session/transaction hygiene — DONE 2026-06-07.** Verified the
       source never opens a transaction (no `BEGIN TRAN`/`COMMIT`/`ROLLBACK`
       anywhere — every read is an autocommit `SELECT`), so the `block_on` bridge

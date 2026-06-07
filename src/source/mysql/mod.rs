@@ -368,10 +368,63 @@ fn build_mysql_ssl_opts(cfg: &TlsConfig) -> SslOpts {
     ssl
 }
 
+/// RAII reset of the per-connection session state the export mutates
+/// (`time_zone`, optionally `max_execution_time`) — the MySQL analogue of
+/// `postgres::PgTxnGuard` (Epic 18 B1).
+///
+/// MySQL hands connections back to the `mysql` crate's pool on drop, and may sit
+/// behind ProxySQL / MaxScale that reuse a physical backend across logical
+/// connections. The previous end-of-`export()` reset covered success and the
+/// `Err` return (no `?`), but **not** a panic mid-export, nor an early `?` on
+/// the `SET max_execution_time` itself (MariaDB spells it `max_statement_time`,
+/// so that SET errors — and `time_zone`, already set, would leak). Arming the
+/// reset on `Drop` closes both: whatever exit path the export takes, the
+/// connection is clean before it returns to the pool.
+struct MysqlSessionGuard<'a> {
+    conn: &'a mut mysql::PooledConn,
+    reset_max_exec: bool,
+}
+
+impl<'a> MysqlSessionGuard<'a> {
+    /// Apply the session SETs and arm the reset. `time_zone` is always set (UTC
+    /// normalisation so Parquet writes `isAdjustedToUTC=true`); the guard is
+    /// constructed *immediately* after it, so if the later `max_execution_time`
+    /// SET fails (or anything panics), `Drop` still resets `time_zone`.
+    fn apply(conn: &'a mut mysql::PooledConn, max_exec_ms: Option<u64>) -> Result<Self> {
+        conn.query_drop("SET time_zone = '+00:00'")?;
+        let mut guard = Self {
+            conn,
+            reset_max_exec: false,
+        };
+        if let Some(ms) = max_exec_ms {
+            guard
+                .conn
+                .query_drop(format!("SET SESSION max_execution_time = {ms}"))?;
+            guard.reset_max_exec = true;
+        }
+        Ok(guard)
+    }
+
+    fn conn(&mut self) -> &mut mysql::PooledConn {
+        self.conn
+    }
+}
+
+impl Drop for MysqlSessionGuard<'_> {
+    fn drop(&mut self) {
+        // Best-effort; the connection is about to return to the pool either way.
+        let _ = self.conn.query_drop("SET time_zone = @@global.time_zone");
+        if self.reset_max_exec {
+            let _ = self.conn.query_drop("SET SESSION max_execution_time = 0");
+        }
+    }
+}
+
 /// Execute the MySQL query and stream results to sink.
 ///
-/// Separated from export() so session-state cleanup (time_zone, max_execution_time)
-/// can run unconditionally in the caller regardless of success or failure.
+/// Session-state cleanup (`time_zone`, `max_execution_time`) is handled by the
+/// caller's [`MysqlSessionGuard`], which resets it on `Drop` regardless of how
+/// this function exits (success, `Err`, or panic).
 ///
 /// `sample_pool`: when `tuning.adaptive` is true, a clone of the source pool used
 /// to obtain a second connection for `Innodb_log_waits` sampling without interfering
@@ -510,16 +563,15 @@ impl super::Source for MysqlSource {
 
         let mut conn = self.pool.get_conn()?;
 
-        // Roadmap §13: normalize TIMESTAMP columns to UTC so Parquet writes
-        // isAdjustedToUTC=true. SET per-connection (not global) to avoid side-effects.
-        conn.query_drop("SET time_zone = '+00:00'")?;
-
-        if request.tuning.statement_timeout_s > 0 {
-            conn.query_drop(format!(
-                "SET SESSION max_execution_time = {}",
-                request.tuning.statement_timeout_s * 1000
-            ))?;
-        }
+        // Per-connection session state, reset on `Drop` (Epic 18 B1) so a pooled
+        // connection — returned to the mysql-crate pool or reused behind
+        // ProxySQL/MaxScale — never carries our settings into the next checkout,
+        // even on a panic or an early return. `time_zone` normalises TIMESTAMP to
+        // UTC (Parquet `isAdjustedToUTC=true`); `max_execution_time` bounds the
+        // statement when a timeout is configured.
+        let max_exec_ms = (request.tuning.statement_timeout_s > 0)
+            .then(|| request.tuning.statement_timeout_s * 1000);
+        let mut guard = MysqlSessionGuard::apply(&mut conn, max_exec_ms)?;
 
         let sample_pool = if request.tuning.adaptive {
             Some(self.pool.clone())
@@ -527,7 +579,7 @@ impl super::Source for MysqlSource {
             None
         };
         let result = mysql_run_export(
-            &mut conn,
+            guard.conn(),
             sample_pool,
             &built.sql,
             built.cursor_param.as_deref(),
@@ -535,13 +587,9 @@ impl super::Source for MysqlSource {
             request.column_overrides,
             sink,
         );
-
-        // Always reset session state before connection returns to pool,
-        // regardless of whether the export succeeded or failed.
-        let _ = conn.query_drop("SET time_zone = @@global.time_zone");
-        if request.tuning.statement_timeout_s > 0 {
-            let _ = conn.query_drop("SET SESSION max_execution_time = 0");
-        }
+        // Reset now (success or `Err`); the `Drop` impl is the backstop for a
+        // panic or early return inside `mysql_run_export`.
+        drop(guard);
 
         // The empty-result fallback to `Schema::empty()` lives here for
         // parity with the PG implementation, even though `exec_iter` always
