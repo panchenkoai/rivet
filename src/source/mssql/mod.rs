@@ -53,6 +53,38 @@ pub struct MssqlSource {
     database: String,
     /// Pooler/gateway classification, sampled once at connect time.
     proxy_kind: MssqlProxyKind,
+    /// Whether the export issued `SET LOCK_TIMEOUT` on this connection, so the
+    /// `Drop` teardown knows to reset it (Epic 18 B2 — pooler-safe session).
+    lock_timeout_applied: bool,
+}
+
+impl Drop for MssqlSource {
+    /// Pooler-safe session teardown (Epic 18 B2). rivet never opens a
+    /// transaction on this connection — every read is an autocommit `SELECT`,
+    /// so there is no transaction to leave dangling across the `block_on`
+    /// bridge (ADR-0011). The only session state the export mutates is
+    /// `SET LOCK_TIMEOUT`; reset it to the SQL Server default (`-1`, wait
+    /// indefinitely) before the connection closes so a *multiplexed* pooler
+    /// that keeps the backend connection alive cannot hand our non-default
+    /// `LOCK_TIMEOUT` to the next session that reuses it.
+    ///
+    /// Best-effort and time-boxed: after a failed read the stream is
+    /// half-drained and the connection is dying anyway, so the reset (and the
+    /// physical connection) just goes away; the 2 s cap guarantees `Drop`
+    /// can never hang on a wedged connection.
+    fn drop(&mut self) {
+        if !self.lock_timeout_applied {
+            return;
+        }
+        let Self { rt, client, .. } = self;
+        let _ = rt.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client.execute("SET LOCK_TIMEOUT -1", &[]),
+            )
+            .await
+        });
+    }
 }
 
 /// Parsed `sqlserver://user[:password]@host[:port]/db` connection parts.
@@ -149,6 +181,7 @@ impl MssqlSource {
             client,
             database: parts.database,
             proxy_kind: MssqlProxyKind::Direct,
+            lock_timeout_applied: false,
         };
         // Health round-trip — surfaces auth/permission errors at connect time
         // (doctor relies on this).
@@ -202,6 +235,12 @@ impl Source for MssqlSource {
         let lock_timeout_ms = request.tuning.lock_timeout_s.saturating_mul(1000);
         let stmt_timeout = (request.tuning.statement_timeout_s > 0)
             .then(|| std::time::Duration::from_secs(request.tuning.statement_timeout_s));
+
+        // Record that we are about to mutate session state so `Drop` resets it
+        // (Epic 18 B2). Set before the disjoint-borrow destructure below.
+        if lock_timeout_ms > 0 {
+            self.lock_timeout_applied = true;
+        }
 
         let Self { rt, client, .. } = self;
         rt.block_on(async {

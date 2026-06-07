@@ -618,10 +618,19 @@ roadmap-write time; file paths resolved, line refs current):**
       at end-of-function (`:543`) but not on a `Drop` path, so it can stick to a
       reused backend connection behind ProxySQL / MaxScale on an early return /
       panic. Add a guard that resets session vars (`SET … = DEFAULT`) on `Drop`.
-- [ ] **B2. MSSQL session/transaction hygiene.** Confirm the `block_on`
-      bridge (ADR-0011) never leaves an open transaction; reset
-      `LOCK_TIMEOUT` (`src/source/mssql/mod.rs:213`) and any session SET on
-      teardown.
+- [x] **B2. MSSQL session/transaction hygiene — DONE 2026-06-07.** Verified the
+      source never opens a transaction (no `BEGIN TRAN`/`COMMIT`/`ROLLBACK`
+      anywhere — every read is an autocommit `SELECT`), so the `block_on` bridge
+      (ADR-0011) leaves nothing dangling. The only session-mutating SET is
+      `SET LOCK_TIMEOUT` (`src/source/mssql/mod.rs:213`); added `impl Drop for
+      MssqlSource` that resets it to the SQL Server default (`-1`) before the
+      connection closes, so a *multiplexed* pooler that keeps the backend alive
+      can't hand our non-default `LOCK_TIMEOUT` to the next session.
+      Best-effort + 2 s time-boxed so `Drop` can never hang; gated on a flag so
+      it fires only when the SET was issued (lock_timeout > 0; default profile is
+      30 s, `lock_timeout_s: 0` skips it). Live-validated: reset executes on
+      teardown (probe: `inner_ok=true`), is skipped when no SET ran, and the
+      whole `live_mssql_chunked` suite stays green.
 
 ### Phase C — pressure-proxy fidelity (P2)
 
