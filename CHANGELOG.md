@@ -1,6 +1,65 @@
 # Changelog
 
-## Unreleased
+## 0.9.3 (2026-06-07) — correctness & safety pass: data-loss guard, credential redaction, nanosecond timestamps
+
+A focused review pass (structural → domain-correctness → security) that found
+and closed four genuinely-broken things — two data-correctness, one security,
+one precision — and added an opt-in high-precision timestamp. No public-API
+breaks; the one runtime behaviour change (chunked NULL-key) converts a silent
+data loss into a clear error.
+
+### Fixed
+
+- **`fix(chunked)` — chunked export silently dropped rows with a NULL chunk
+  column.** Range chunking emits `WHERE col BETWEEN min AND max` and date
+  chunking `>= start AND < end`; both exclude NULL, so a row whose
+  `chunk_column` was NULL fell into no chunk and vanished from the export with
+  no signal (the keyset path already refused a nullable key; the range path did
+  not). Detection now runs one `COUNT(*) - COUNT(col)` and **bails** with
+  remediation (NOT NULL column / `WHERE col IS NOT NULL` / `chunk_dense` /
+  `mode: full`) rather than dropping rows. Detected on the live data, so a
+  nullable column with zero actual NULLs is unaffected.
+- **`fix(redact)` — credentials could leak to stderr via the log sink.** The
+  redaction module names "logs" in its scope, but enforcement was wired only at
+  the error/summary call sites; the `env_logger` sink was bare, so a
+  `log::warn!("…{e}", e)` whose error captured a `scheme://user:password@host`
+  connect string printed the password (and the default filter is `warn`, so
+  those lines show). The sink now routes every record through the redaction
+  chokepoint — no call site has to remember, present and future.
+
+### Added
+
+- **`feat(types)` — opt-in nanosecond timestamps (`timestamp_ns` /
+  `timestamp_tz_ns` column overrides).** Preserves a source's sub-microsecond
+  fractional seconds — notably SQL Server `datetime2(7)`'s 100 ns tick that the
+  default microsecond mapping truncates. The default stays microsecond on
+  purpose: Arrow nanosecond timestamps span only 1677–2262, so a blanket ns
+  mapping would corrupt out-of-range dates — the opt-in keeps the full-range
+  default and lets in-range columns carry the extra precision. Per-target
+  autoload verified live: DuckDB → native `TIMESTAMP_NS` (lossless); Snowflake →
+  `NUMBER`, `TO_TIMESTAMP_NTZ(col, 9)` recovers losslessly; BigQuery → `INT64`
+  raw nanos (a native `TIMESTAMP` cast is lossy µs). The incremental cursor
+  carries the full 9-digit value, fixing the `datetime2(7)` boundary re-export.
+
+### Changed
+
+- **`docs(incremental)` — documented the strict-`>` cursor tie hazard.**
+  Incremental resume uses `WHERE cursor > last_value`; rows that tie on the
+  high-watermark value and arrive after it is passed are skipped. This is
+  inherent high-watermark semantics (keyset is unaffected — its key is unique),
+  now stated where keyset's uniqueness contract already lives (semantics.md
+  "Known non-guarantees", config.md, the query builder).
+- **`refactor(config)`** — split the 379-line `Config::validate` into three
+  cohesive, independently-testable validators (exports-list / source-connection
+  / per-export). Behaviour-preserving; all 27 validation/secops tests green.
+- **`refactor(pipeline)`** — deleted `src/pipeline/child.rs`, a 461-line orphan
+  fork never wired into the module tree (so never compiled, its tests never
+  ran); its byte-identical `render_child_stderr` tests moved onto the live
+  `parallel_children.rs`. Gave the parallel chunk drivers' mutex
+  poison-recovery decision a single documented home (`chunked/poison.rs`).
+- **`test(csv)`** — pinned the float `NaN`/`±Infinity` CSV contract (emit the
+  literal, never an empty cell that would conflate with NULL) with a
+  characterization test + docs; verified correct-by-design.
 
 ### Dependency policy
 
