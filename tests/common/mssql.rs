@@ -11,6 +11,8 @@ use tiberius::{AuthMethod, Client, Config, EncryptionLevel};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
+use super::unique_name;
+
 async fn connect() -> Client<Compat<TcpStream>> {
     let mut config = Config::new();
     config.host("127.0.0.1");
@@ -57,6 +59,64 @@ pub fn mssql_drop_table(name: &str) {
     mssql_exec(&format!(
         "IF OBJECT_ID('{name}','U') IS NOT NULL DROP TABLE {name}"
     ));
+}
+
+/// A seeded SQL Server table that drops itself on `Drop` (RAII) — the SQL
+/// Server twin of [`super::mysql::MysqlTable`].
+pub struct MssqlTable {
+    name: String,
+}
+
+impl MssqlTable {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl Drop for MssqlTable {
+    fn drop(&mut self) {
+        mssql_drop_table(&self.name);
+    }
+}
+
+/// Seed a `(id BIGINT PK, name NVARCHAR(100), amount DECIMAL(12,2),
+/// created_at DATETIME2)` SQL Server table with `row_count` rows — the SQL
+/// Server twin of [`super::mysql::seed_mysql_numeric_table`]. Rows are
+/// `id`-ordered `0..row_count` with `amount = id * 1.5` and a descending
+/// `created_at`, matching the MySQL/PG seeders so the same export queries and
+/// row-count assertions hold across engines.
+pub fn seed_mssql_numeric_table(row_count: i64) -> MssqlTable {
+    let name = unique_name("rivet_qa_tbl");
+    mssql_drop_table(&name);
+    mssql_exec(&format!(
+        "CREATE TABLE {name} (
+            id BIGINT PRIMARY KEY,
+            name NVARCHAR(100) NOT NULL,
+            amount DECIMAL(12,2) NOT NULL,
+            created_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+        );"
+    ));
+    if row_count > 0 {
+        // T-SQL caps a multi-row VALUES clause at 1000 rows per INSERT — chunk.
+        let mut start = 0;
+        while start < row_count {
+            let end = (start + 1000).min(row_count);
+            let mut sql = format!("INSERT INTO {name} (id, name, amount, created_at) VALUES ");
+            for i in start..end {
+                if i > start {
+                    sql.push_str(", ");
+                }
+                sql.push_str(&format!(
+                    "({i}, 'row_{i}', {:.2}, DATEADD(SECOND, -{}, SYSUTCDATETIME()))",
+                    (i as f64) * 1.5,
+                    row_count - i
+                ));
+            }
+            mssql_exec(&sql);
+            start = end;
+        }
+    }
+    MssqlTable { name }
 }
 
 /// Split a script on lines that are exactly `GO` (the sqlcmd batch separator,

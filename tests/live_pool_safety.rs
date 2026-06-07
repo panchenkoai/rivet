@@ -45,6 +45,7 @@ use postgres::{Client as PgClient, NoTls};
 
 use common::*;
 use rivet::error::Result;
+use rivet::source::mssql::{MssqlProxyKind, MssqlSource};
 use rivet::source::mysql::{MysqlProxyKind, MysqlSource};
 use rivet::source::postgres::PostgresSource;
 use rivet::source::{BatchSink, ExportRequest, Source};
@@ -389,6 +390,33 @@ fn mysql_direct_connection_classified_as_direct() {
         source.proxy_kind(),
         MysqlProxyKind::Direct,
         "direct MySQL connection must be classified as Direct; got {:?}",
+        source.proxy_kind()
+    );
+    assert!(
+        !source.proxy_kind().is_proxy(),
+        "is_proxy() must be false for a direct connection"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql (direct backend, no proxy)"]
+fn mssql_direct_connection_classified_as_direct() {
+    // SQL Server analogue of `mysql_direct_connection_classified_as_direct`: a
+    // direct connection to the dev SQL Server container must NOT be
+    // misclassified. `@@SPID` is stable across queries on one connection, and
+    // the dev image reports an on-prem EngineEdition (Developer = 3), so the
+    // classifier returns `Direct`. No open-source SQL Server statement-level
+    // multiplexer exists to exercise the `Multiplexed` path live; that variant
+    // (and `AzureGateway`) is covered by the pure-classifier unit tests in
+    // `src/source/mssql/proxy.rs`.
+    require_alive(LiveService::Mssql);
+
+    let source =
+        MssqlSource::connect_with_tls(MSSQL_URL, None).expect("connect directly to SQL Server");
+    assert_eq!(
+        source.proxy_kind(),
+        MssqlProxyKind::Direct,
+        "direct SQL Server connection must be classified as Direct; got {:?}",
         source.proxy_kind()
     );
     assert!(

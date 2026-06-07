@@ -30,6 +30,9 @@ PR CI defines branch protection — the named gates (`fmt`, `clippy`, `test`, `t
 | MySQL — incremental (cursor) | ✅ | ✅ | partial | `live_resume` |
 | MySQL — chunked | ✅ | ✅ | partial | `live_chunked_recovery` |
 | MySQL — time_window | ✅ | ✅ | — | `time_window` |
+| SQL Server — full export | ✅ | ✅ | ✅ | `live_mssql_resume` (full), `live_mssql_crash_recovery` |
+| SQL Server — incremental (cursor) | ✅ | ✅ | ✅ | `live_mssql_resume`, `live_mssql_crash_recovery` |
+| SQL Server — chunked (range + keyset/seek) | ✅ | ✅ | ✅ | `live_mssql_chunked`, `live_mssql_chunked_recovery` |
 | Cross-DB parity (PG ↔ MySQL same query) | ✅ | ✅ | — | `live_cross_db_parity` |
 
 ---
@@ -43,11 +46,15 @@ PR CI defines branch protection — the named gates (`fmt`, `clippy`, `test`, `t
 | Chunk checkpoint resume (I5, I6) | ✅ gate | ✅ | — | `recovery` |
 | Crash and resume (live DB, Postgres) | ✅ | ✅ | ✅ | `live_crash_recovery` |
 | Crash and resume (live DB, MySQL) | ✅ | ✅ | — | `live_mysql_crash_recovery` (parallel matrix to the PG suite) |
+| Crash and resume (live DB, SQL Server) | ✅ | ✅ | — | `live_mssql_crash_recovery` (4 crash-point twins to the PG suite) |
 | Chunked checkpoint resume (live DB, MySQL) | ✅ | ✅ | — | `live_mysql_chunked_recovery` (C1–C4 twins) |
+| Chunked checkpoint resume (live DB, SQL Server) | ✅ | ✅ | — | `live_mssql_chunked_recovery` (C1–C4 twins, incl. parallel) |
 | Resume across modes (live DB, MySQL) | ✅ | ✅ | — | `live_mysql_resume` (full / incremental / chunked --resume validation) |
+| Resume across modes (live DB, SQL Server) | ✅ | ✅ | — | `live_mssql_resume` (full / incremental / chunked --resume validation) |
 | Schema drift (live DB, MySQL) | ✅ | ✅ | — | `live_mysql_schema_drift` (added / removed / stable matrix) |
 | Retry + Toxiproxy faults (live DB, MySQL) | ✅ | ✅ | — | `live_mysql_retry_and_faults` (baseline / latency / disabled / mid-stream / permanent) |
 | Reconcile + targeted repair (live DB, MySQL) | ✅ | ✅ | — | `live_mysql_reconcile_repair` (RR1–RR6 twins) |
+| Reconcile + targeted repair (live DB, SQL Server) | ✅ | ✅ | — | `live_mssql_reconcile_repair` (reconcile/repair twins) |
 | Retry classification under injected faults | ✅ | ✅ | — | `live_retry_and_faults`, `retry_integration` |
 | Toxiproxy-driven network chaos | ✅ | ✅ | — | `live_chaos` |
 | Schema drift between runs | ✅ | ✅ | — | `live_schema_drift`, `schema_evolution` |
@@ -81,6 +88,8 @@ Per-backend commit contracts: [ADR-0004](adr/0004-destination-write-contracts.md
 | pgBouncer (transaction mode, pool_size=1) | ✅ | ✅ | ✅ | `live_pool_safety` — F1–F6 / G1 DBA-audit fixes |
 | ProxySQL (MySQL transaction-persistent pool) | — | ✅ | ✅ | `live_pool_safety::mysql_proxysql_*` — detection + cleanup-through-proxy |
 | MySQL proxy / multiplexer classification (unit) | ✅ | ✅ | — | `source::mysql::tests::proxy_*` — pure classifier over the 4 signals |
+| SQL Server pooler / Azure-gateway classification (unit) | ✅ | ✅ | — | `source::mssql::proxy::tests::*` — pure classifier (@@SPID drift → Multiplexed, EngineEdition 5/8 → AzureGateway) |
+| SQL Server direct-connection classification (live) | ✅ | ✅ | — | `live_pool_safety::mssql_direct_connection_classified_as_direct` (false-positive guard) |
 | Parallel chunk checkpoint recovery (panic + resume) | ✅ | ✅ | — | `live_chunked_recovery::parallel_chunked_*` (C3 / C4) |
 | OLTP load on source during export | partial | ✅ | ✅ | `live_oltp_load` |
 | ~60k-row content extraction under update pressure | — | ✅ | ✅ | `live_content_load` (nightly only — minutes to seed) |
@@ -94,6 +103,7 @@ Per-backend commit contracts: [ADR-0004](adr/0004-destination-write-contracts.md
 | Area | PR CI | Nightly | Manual | Notes |
 |---|:---:|:---:|:---:|---|
 | Per-type golden round-trip (PG + MySQL) | ✅ gate | ✅ | — | `live_type_golden` — runs in dedicated `test-type-golden` job with live DBs |
+| Per-type round-trip via oracle (SQL Server) | ✅ gate | ✅ | — | `type_roundtrip::{duckdb,clickhouse}_validates_mssql_type_matrix_parquet` — `test-type-validators` job (DuckDB + ClickHouse readers) |
 | Parquet round-trip | ✅ | ✅ | — | `live_parquet_roundtrip`, `format_golden`, `format_fuzz` |
 | Format writer (CSV + Parquet, row-group golden) | ✅ gate | ✅ | — | `format_golden`, `test-stability` job |
 | Type policy + ExportTarget compat (BigQuery) | ✅ | ✅ | — | covered in `live_cli_flags --type-report` |
@@ -108,6 +118,7 @@ Per-backend commit contracts: [ADR-0004](adr/0004-destination-write-contracts.md
 | PostgreSQL | 12, 13, 14, 15 | — | ✅ | `dev/legacy/run_full_matrix.sh`, opt-in compose profile |
 | MySQL | 8.0 | ✅ | ✅ | Primary target |
 | MySQL | 5.7 | — | ✅ | `dev/legacy/run_full_matrix.sh` — known view-syntax gap in `init.sql`, see [reference/compatibility.md](reference/compatibility.md#mysql-57--window-functions) |
+| SQL Server | 2022 | ✅ | ✅ | Primary target; `test-type-validators` (type matrix) + `e2e` (live_mssql_* recovery/resume/reconcile) jobs |
 
 Each legacy target runs the full 83-assertion e2e suite when selected. Status table in [reference/compatibility.md](reference/compatibility.md).
 

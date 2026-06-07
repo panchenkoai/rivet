@@ -25,7 +25,8 @@
 use crate::common::*;
 
 use super::helpers::{
-    MYSQL_MATRIX_COLUMNS, MysqlCleanup, PgCleanup, run_pg_matrix_export, setup_mysql_matrix_table,
+    MYSQL_MATRIX_COLUMNS, MssqlCleanup, MysqlCleanup, PgCleanup, run_mssql_matrix_export,
+    run_pg_matrix_export, setup_mssql_matrix_table, setup_mysql_matrix_table,
     setup_pg_matrix_table,
 };
 
@@ -451,4 +452,110 @@ exports:
     ));
     assert_eq!(sums[0]["s_amount"], "99999999990024");
     assert_eq!(sums[0]["s_fee"], "10000003");
+}
+
+// ─── SQL Server matrix → Parquet → BigQuery ────────────────────────────────
+
+#[test]
+#[ignore = "live: requires BIGQUERY_TEST_PROJECT env + bq CLI"]
+fn bigquery_validates_mssql_type_matrix_parquet() {
+    require_alive(LiveService::Mssql);
+    let Some(cfg) = bq_config() else {
+        eprintln!("bigquery_load: skipping (BIGQUERY_TEST_PROJECT not set)");
+        return;
+    };
+
+    let ms_table = unique_name("bq_ms");
+    setup_mssql_matrix_table(&ms_table);
+    let _ms_guard = MssqlCleanup(ms_table.clone());
+
+    // `run_mssql_matrix_export` applies the canonical decimal overrides
+    // (amount/fee/price) and `tls.accept_invalid_certs` for the dev container.
+    let out_dir = tempfile::tempdir().unwrap();
+    run_mssql_matrix_export(&ms_table, "parquet", out_dir.path());
+    let parquet = files_with_extension(out_dir.path(), "parquet")
+        .into_iter()
+        .next()
+        .expect("one parquet part");
+
+    let bq_table = unique_name("bq_ms");
+    let _table_guard = BqTableGuard {
+        cfg: &cfg,
+        table: bq_table.clone(),
+    };
+    cfg.load_parquet(&bq_table, &parquet);
+
+    // 1) Autoload schema. int family widens to INTEGER, bit → BOOLEAN,
+    //    decimal/money → NUMERIC, real/float → FLOAT, datetime2 → TIMESTAMP,
+    //    uniqueidentifier (FixedSizeBinary(16) + LogicalType::Uuid) lands as
+    //    BYTES (same as PG `uuid`; Snowflake autoload makes the same choice).
+    let schema = cfg.schema(&bq_table);
+    let expected: &[(&str, &str)] = &[
+        ("id", "INTEGER"),
+        ("c_smallint", "INTEGER"),
+        ("c_int", "INTEGER"),
+        ("c_bigint", "INTEGER"),
+        ("c_tinyint", "INTEGER"),
+        ("c_bit", "BOOLEAN"),
+        ("amount", "NUMERIC"),
+        ("fee", "NUMERIC"),
+        ("price", "NUMERIC"),
+        ("c_real", "FLOAT"),
+        ("c_float", "FLOAT"),
+        ("c_date", "DATE"),
+        ("c_time", "TIME"),
+        ("created_at", "TIMESTAMP"),
+        ("label", "STRING"),
+        ("c_varchar", "STRING"),
+        ("c_char", "STRING"),
+        ("raw_bytes", "BYTES"),
+        ("uid", "BYTES"),
+        ("c_nvarchar", "STRING"),
+        ("note_nullable", "STRING"),
+        ("note_all_null", "STRING"),
+    ];
+    for (col, want) in expected {
+        let got = schema
+            .get(*col)
+            .unwrap_or_else(|| panic!("BigQuery did not see column `{col}`; saw: {schema:?}"));
+        assert_eq!(
+            got, want,
+            "BigQuery autoload type for `{col}`: expected {want}, got {got}",
+        );
+    }
+
+    // 2) Row 1 values: microsecond TIME / TIMESTAMP, varbinary + uniqueidentifier
+    //    as canonical-order bytes, and Unicode nvarchar byte-exact.
+    let r1 = cfg.query_rows(&format!(
+        "SELECT FORMAT_TIME('%H:%M:%E6S', c_time)                      AS t,
+                FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%E6S', created_at)    AS ts,
+                TO_HEX(raw_bytes)                                      AS raw_hex,
+                TO_HEX(uid)                                            AS uid_hex,
+                c_nvarchar                                            AS nv
+         FROM `{}.{}.{}` WHERE id = 1",
+        cfg.project, cfg.dataset, bq_table,
+    ));
+    let r = &r1[0];
+    assert_eq!(r["t"], "13:45:30.123456");
+    assert_eq!(r["ts"], "2026-01-15 13:45:30.123456");
+    assert_eq!(r["raw_hex"], "00112233445566ff");
+    assert_eq!(r["uid_hex"], "6f9619ff8b86d011b42d00c04fc964ff");
+    assert_eq!(r["nv"], "héllo wörld");
+
+    // 3) Aggregates: 3 rows, signed bigint sums to zero (+9e9, -9e9, 0),
+    //    decimal scale preserved (1234.56 - 0.01 + 0.00 = 1234.55), every
+    //    note_all_null is NULL.
+    let agg = cfg.query_rows(&format!(
+        "SELECT COUNT(*)                            AS n,
+                CAST(SUM(c_bigint) AS STRING)       AS s_bigint,
+                CAST(SUM(amount * 100) AS STRING)   AS s_amount,
+                COUNTIF(note_all_null IS NULL)      AS null_count
+         FROM `{}.{}.{}`",
+        cfg.project, cfg.dataset, bq_table,
+    ));
+    let a = &agg[0];
+    assert_eq!(a["n"], "3");
+    assert_eq!(a["s_bigint"], "0");
+    assert_eq!(a["s_amount"], "123455");
+    assert_eq!(a["null_count"], "3", "note_all_null IS NULL for every row");
 }

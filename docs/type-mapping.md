@@ -66,10 +66,10 @@ semantics on a MySQL column add the override explicitly.
 ```bash
 make test-types              # offline mapping contracts (PR-fast)
 make test-types-live         # full matrix; requires docker compose
-make test-types-validators   # PG/MySQL → Parquet → {DuckDB, ClickHouse} round-trip
+make test-types-validators   # PG/MySQL/SQL Server → Parquet → {DuckDB, ClickHouse} round-trip
 ```
 
-`test-types-validators` re-runs the same canonical PG / MySQL type matrix used
+`test-types-validators` re-runs the same canonical PG / MySQL / SQL Server type matrix used
 by `test-types-live`, but writes the Parquet into the shared bind-mount under
 `tests/.live-tmp/` and feeds it through **three independent readers**: DuckDB,
 ClickHouse (both from `docker-compose.yaml`), and pyarrow (installed alongside
@@ -226,6 +226,32 @@ defects in the PG / MySQL drivers; all have been fixed in v0.7.8:
 | `boolean` (native) | `bool` | `Boolean` | true/false | not only `TINYINT(1)` | type_roundtrip |
 | nullable / all-null | — | preserved | empty cells | edge columns | type_roundtrip |
 
+## SQL Server (MSSQL)
+
+| Source type | Rivet logical | Parquet (Arrow) | CSV | Notes | Tested |
+|-------------|---------------|-----------------|-----|-------|--------|
+| `tinyint` (0–255) | `int16` | `Int16` | integer text | widened (unsigned source) | live matrix |
+| `smallint` | `int16` | `Int16` | integer text | | live matrix |
+| `int` | `int32` | `Int32` | integer text | | live matrix |
+| `bigint` | `int64` | `Int64` | integer text | | live matrix |
+| `bit` | `bool` | `Boolean` | 0/1 | | live matrix |
+| `decimal(p,s)` / `numeric(p,s)` | `decimal(p,s)` | `DECIMAL(p,s)` | exact decimal text | scale recovered from the data (tiberius drops declared scale) | live matrix |
+| `money` | `decimal(19,4)` | `DECIMAL(19,4)` | exact decimal text | fixed scale | live matrix |
+| `smallmoney` | `decimal(10,4)` | `DECIMAL(10,4)` | exact decimal text | fixed scale | type_roundtrip |
+| `real` | `float32` | `Float32` | float text | | live matrix |
+| `float` | `float64` | `Float64` | float text | | live matrix |
+| `date` | `date` | `Date32` | ISO date | | live matrix |
+| `time` | `time(µs)` | `Time64(µs)` | time text | µs precision | live matrix |
+| `datetime2` / `datetime` / `smalldatetime` | `timestamp(µs, none)` | `Timestamp(µs, None)` | datetime text | naive; **truncated to µs** — see known gap 4 | live matrix |
+| `datetimeoffset` | `timestamp_tz(µs, UTC)` | `Timestamp(µs, UTC)` | datetime text | normalised to UTC | type_roundtrip |
+| `nvarchar` / `varchar` / `nchar` / `char` / `text` / `ntext` | `string` | `Utf8` | escaped UTF-8 | | live matrix |
+| `varbinary` / `binary` / `image` | `binary` | `Binary` | hex in CSV | | live matrix |
+| `uniqueidentifier` | `uuid` | `FixedSizeBinary(16)` + Parquet `LogicalType::Uuid` | canonical UUID text | native UUID downstream | live matrix |
+| nullable / all-null | — | preserved | empty cells | | live matrix |
+
+Unmapped SQL Server types resolve to `Unsupported` and fail loudly at schema
+build unless a `columns:` override maps them.
+
 ## Known gaps (tracked)
 
 1. **Nested arrays, ranges, inet, PostGIS, geometry**: not in the type matrix —
@@ -238,6 +264,15 @@ defects in the PG / MySQL drivers; all have been fixed in v0.7.8:
    non-UUID fixed binary have no CSV cell — the export **fails loudly** naming
    the column (see [CSV serialization](#csv-serialization)) rather than silently
    writing empty values.
+4. **SQL Server `datetime2` sub-microsecond precision**: rivet maps every
+   timestamp to microsecond (`Timestamp(µs)`); Arrow nanosecond can't span the
+   full `datetime2` 0001–9999 range, so the 7th fractional digit of a bare
+   `datetime2` (default precision 7 = 100 ns) is **truncated to µs** on export.
+   This is lossless for `datetime2(6)` and below. Consequence for **incremental
+   mode**: a cursor on a `datetime2(7)` column lands one tick below the source
+   max, so the boundary row re-exports on every run. Use a `datetime2(6)`
+   (or coarser) cursor column, or an integer/identity cursor, for exact
+   incremental semantics.
 
 (MySQL `DECIMAL` now resolves its precision/scale from the wire column
 definition — no override needed; see the MySQL section.)

@@ -16,6 +16,9 @@
 //! `OFFSET 0 ROWS FETCH NEXT n ROWS ONLY` clause (T-SQL has no `LIMIT`).
 
 mod arrow_convert;
+mod proxy;
+
+pub use proxy::MssqlProxyKind;
 
 use std::sync::Arc;
 
@@ -25,24 +28,31 @@ use tokio::net::TcpStream;
 use tokio::runtime::Runtime;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
+use proxy::{detect_mssql_proxy_kind, warn_proxy_kind};
+
 use crate::config::TlsConfig;
 use crate::error::Result;
+use crate::source::batch_controller::{
+    AdaptiveBatchController, DEFAULT_BATCH_TARGET_MB, PROBE_BATCH_SIZE,
+};
 use crate::source::query::build_export_query;
 use crate::source::{BatchSink, ExportRequest, Source, TableIntrospection};
 use crate::types::{ColumnOverrides, TypeMapping};
 
-/// Rows per Arrow `RecordBatch` streamed to the sink. Chunked mode bounds the
-/// total row set per part; this only bounds the in-memory Arrow batch width.
-const BATCH_ROWS: usize = 8192;
-
 type MssqlClient = Client<Compat<TcpStream>>;
 
 /// SQL Server source. Owns the async driver + the runtime that drives it.
-pub(crate) struct MssqlSource {
+///
+/// `pub` (not `pub(crate)`) so integration tests can reach `proxy_kind()` the
+/// same way they reach `MysqlSource::proxy_kind()`; the rest of the type
+/// carries the same "no external API contract" disclaimer as `MysqlSource`.
+pub struct MssqlSource {
     rt: Runtime,
     client: MssqlClient,
     /// Connection database — the instance pressure proxy keys on it.
     database: String,
+    /// Pooler/gateway classification, sampled once at connect time.
+    proxy_kind: MssqlProxyKind,
 }
 
 /// Parsed `sqlserver://user[:password]@host[:port]/db` connection parts.
@@ -138,56 +148,150 @@ impl MssqlSource {
             rt,
             client,
             database: parts.database,
+            proxy_kind: MssqlProxyKind::Direct,
         };
         // Health round-trip — surfaces auth/permission errors at connect time
         // (doctor relies on this).
         src.query_scalar("SELECT 1")?;
+        // Best-effort pooler/gateway detection (mirrors PG `pg_backend_pid`
+        // drift and MySQL `CONNECTION_ID()` drift): one warning at connect
+        // time, never breaks the export. Disjoint borrows of `rt` (&) and
+        // `client` (&mut).
+        let kind = detect_mssql_proxy_kind(&src.rt, &mut src.client);
+        warn_proxy_kind(kind);
+        src.proxy_kind = kind;
         Ok(src)
+    }
+
+    /// Expose the proxy classification for diagnostics (preflight, integration
+    /// tests). Not part of the `Source` trait — same internal-may-change
+    /// contract as the rest of `rivet::source::mssql::*`.
+    #[allow(dead_code)]
+    pub fn proxy_kind(&self) -> MssqlProxyKind {
+        self.proxy_kind
     }
 }
 
 impl Source for MssqlSource {
     fn export(&mut self, request: &ExportRequest<'_>, sink: &mut dyn BatchSink) -> Result<()> {
-        // Keyset (seek) pages now build a dialect-correct
-        // `OFFSET 0 ROWS FETCH NEXT n ROWS ONLY` clause (T-SQL has no `LIMIT`),
-        // so the page-limit path is supported like the other runners.
+        // Keyset (seek) pages build a dialect-correct
+        // `OFFSET 0 ROWS FETCH NEXT n ROWS ONLY` clause (T-SQL has no `LIMIT`).
         let built = build_export_query(request, crate::config::SourceType::Mssql);
         let sql = built.sql.clone();
         let overrides = request.column_overrides.clone();
+        // Stream the result one Arrow batch at a time (peak RSS ≈ one batch,
+        // independent of `chunk_size`) through the shared `AdaptiveBatchController`
+        // — it starts at a probe size and caps the batch to a memory target once
+        // the real row width is known (the cap is computed in the loop). The SQL
+        // Server analogue of the PostgreSQL cursor's `FETCH N`. (`adaptive` resize
+        // is a no-op here: a single streaming connection can't sample DB pressure
+        // mid-stream; the OPT-2 concurrency governor handles that at the chunk
+        // layer instead.)
+        let mut ctl =
+            AdaptiveBatchController::new(request.tuning, request.tuning.batch_size.max(1));
+        let mut cap_applied = false;
+        // Source-safety knobs (parity with the PG/MySQL export loops):
+        //  - lock_timeout → server-side `SET LOCK_TIMEOUT` so a blocked read
+        //    fails fast instead of waiting on a writer's lock indefinitely.
+        //  - statement_timeout → enforced client-side: SQL Server has no
+        //    statement-duration `SET` (unlike PG's `statement_timeout` / MySQL's
+        //    `max_execution_time`), so we stop pulling and error out once the
+        //    wall-clock budget is spent. The half-drained stream is dropped with
+        //    the (errored) source, so nothing leaks.
+        //  - throttle_ms → applied by the controller between batches.
+        let lock_timeout_ms = request.tuning.lock_timeout_s.saturating_mul(1000);
+        let stmt_timeout = (request.tuning.statement_timeout_s > 0)
+            .then(|| std::time::Duration::from_secs(request.tuning.statement_timeout_s));
 
         let Self { rt, client, .. } = self;
-        let (schema, rows) = rt.block_on(async {
+        rt.block_on(async {
+            use futures_util::stream::TryStreamExt;
+            use tiberius::QueryItem;
+
+            if lock_timeout_ms > 0 {
+                client
+                    .execute(format!("SET LOCK_TIMEOUT {lock_timeout_ms}"), &[])
+                    .await
+                    .map_err(|e| anyhow::anyhow!("mssql: SET LOCK_TIMEOUT failed: {e}"))?;
+            }
+
+            let started = std::time::Instant::now();
             let mut stream = client
                 .query(sql.as_str(), &[])
                 .await
                 .map_err(|e| anyhow::anyhow!("mssql: query failed: {e}"))?;
-            let columns = stream
-                .columns()
+
+            let mut columns: Vec<tiberius::Column> = Vec::new();
+            let mut buf: Vec<tiberius::Row> = Vec::with_capacity(ctl.target());
+            let mut schema: Option<SchemaRef> = None;
+
+            while let Some(item) = stream
+                .try_next()
                 .await
-                .map_err(|e| anyhow::anyhow!("mssql: reading result metadata failed: {e}"))?
-                .map(<[_]>::to_vec)
-                .unwrap_or_default();
-            let rows = stream
-                .into_first_result()
-                .await
-                .map_err(|e| anyhow::anyhow!("mssql: streaming rows failed: {e}"))?;
-            // Schema after rows: decimal scale is recovered from the data
-            // (tiberius hides a column's declared precision/scale).
-            let (schema, _decoders) =
-                arrow_convert::mssql_columns_to_schema(&columns, &overrides, &rows)?;
-            Ok::<_, anyhow::Error>((Arc::new(schema), rows))
+                .map_err(|e| anyhow::anyhow!("mssql: streaming rows failed: {e}"))?
+            {
+                if let Some(budget) = stmt_timeout
+                    && started.elapsed() > budget
+                {
+                    anyhow::bail!(
+                        "mssql: statement timeout after {}s (tuning.statement_timeout_s)",
+                        budget.as_secs()
+                    );
+                }
+                match item {
+                    // A single SELECT yields one metadata token (the column
+                    // shape) ahead of its rows.
+                    QueryItem::Metadata(meta) if columns.is_empty() => {
+                        columns = meta.columns().to_vec();
+                    }
+                    QueryItem::Metadata(_) => {}
+                    QueryItem::Row(row) => {
+                        buf.push(row);
+                        if buf.len() >= ctl.target() {
+                            let arrow_bytes =
+                                emit_mssql_batch(&columns, &overrides, &mut schema, &buf, sink)?;
+                            let n = buf.len();
+                            buf.clear();
+                            // First batch: cap to a memory target now that the
+                            // real Arrow width is known (same probe→cap the
+                            // PG/MySQL loops do, clamped to the configured
+                            // batch_size by the controller).
+                            if !cap_applied && n > 0 {
+                                let arrow_per_row = (arrow_bytes / n).max(64);
+                                let target_mb = request
+                                    .tuning
+                                    .batch_size_memory_mb
+                                    .unwrap_or(DEFAULT_BATCH_TARGET_MB);
+                                let safe = ((target_mb * 1024 * 1024) / arrow_per_row)
+                                    .max(PROBE_BATCH_SIZE);
+                                if let Some(new) = ctl.apply_memory_cap(safe) {
+                                    log::info!(
+                                        "MSSQL batch cap: arrow≈{} B/row, target={} MB → batch_size → {}",
+                                        arrow_per_row,
+                                        target_mb,
+                                        new
+                                    );
+                                    buf.reserve(new.saturating_sub(buf.capacity()));
+                                }
+                                cap_applied = true;
+                            }
+                            // adaptive no-op mid-stream (sample → None); throttle.
+                            ctl.after_batch(|| None);
+                            ctl.throttle();
+                        }
+                    }
+                }
+            }
+            // Final partial batch — or, for an empty result set, a single call
+            // that still emits the (empty) schema so the sink writes a
+            // correctly-typed empty output. Rows arrive in the query's
+            // `ORDER BY` order, so the last batch's last row carries the max
+            // cursor the sink extracts.
+            if !buf.is_empty() || schema.is_none() {
+                emit_mssql_batch(&columns, &overrides, &mut schema, &buf, sink)?;
+            }
+            Ok::<_, anyhow::Error>(())
         })?;
-
-        sink.on_schema(schema.clone() as SchemaRef)?;
-
-        // Rows arrive ordered (incremental/chunked queries carry `ORDER BY`), so
-        // splitting the Vec preserves order — the last batch's last row holds
-        // the max cursor the sink extracts.
-        for chunk in rows.chunks(BATCH_ROWS) {
-            let batch =
-                arrow_convert::mssql_rows_to_record_batch(&(schema.clone() as SchemaRef), chunk)?;
-            sink.on_batch(&batch)?;
-        }
         Ok(())
     }
 
@@ -251,6 +355,42 @@ impl Source for MssqlSource {
             row.get::<i64, _>(0).map(|v| v.max(0) as u64)
         })
     }
+}
+
+/// Emit one Arrow batch from `rows`, building (and emitting) the schema on the
+/// first call and reusing it thereafter. Decimal scales are recovered from the
+/// data — tiberius drops a column's declared precision/scale — so the first
+/// batch must carry each decimal column's first non-null value (true for every
+/// table in practice; a decimal column NULL for the whole first batch falls back
+/// to scale 0, same as the pre-streaming behaviour on an all-null column).
+///
+/// Returns the emitted batch's Arrow memory footprint (bytes), so the export
+/// loop can size the memory cap from the real row width; `0` for an empty batch.
+fn emit_mssql_batch(
+    columns: &[tiberius::Column],
+    overrides: &ColumnOverrides,
+    schema: &mut Option<SchemaRef>,
+    rows: &[tiberius::Row],
+    sink: &mut dyn BatchSink,
+) -> Result<usize> {
+    let schema_ref = match schema {
+        Some(s) => s.clone(),
+        None => {
+            let (built, _decoders) =
+                arrow_convert::mssql_columns_to_schema(columns, overrides, rows)?;
+            let s: SchemaRef = Arc::new(built);
+            sink.on_schema(s.clone())?;
+            *schema = Some(s.clone());
+            s
+        }
+    };
+    if !rows.is_empty() {
+        let batch = arrow_convert::mssql_rows_to_record_batch(&schema_ref, rows)?;
+        let bytes = crate::tuning::SourceTuning::batch_memory_bytes(&batch);
+        sink.on_batch(&batch)?;
+        return Ok(bytes);
+    }
+    Ok(0)
 }
 
 /// Render a row's first column as a display string for `query_scalar`

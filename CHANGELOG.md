@@ -11,6 +11,99 @@
   Security PRs still arrive out-of-band (no cooldown), and the `cargo audit`
   gate (pre-commit + CI) remains the hard backstop for any fixable advisory.
 
+## 0.9.2 (2026-06-07) — SQL Server engine maturity + shared batch controller
+
+> The SQL Server source grows up: the export **streams** (peak RSS bounded by
+> `batch_size`, not the chunk — `mode: full` on a 2 M-row heavy table went from a
+> ~10 GB OOM to 1 file at 171 MB), **detects connection poolers / the Azure SQL
+> gateway**, honours `lock_timeout` / `statement_timeout` / `throttle_ms`, and is
+> covered by full live parity suites (resume / chunked-recovery / crash-recovery
+> / reconcile-repair) plus a type matrix round-tripped through DuckDB, ClickHouse
+> **and** live BigQuery. Internally, the probe → memory-cap → adaptive → throttle
+> batch policy that was triplicated across the PG / MySQL / MSSQL export loops is
+> now one unit-tested `AdaptiveBatchController` — PG/MySQL fully revalidated, no
+> behaviour change.
+
+### SQL Server — streaming export + pooler detection + parity test suites
+
+- **`refactor(source)`** — the probe → memory-cap → adaptive-resize → throttle
+  batch-sizing policy, previously triplicated across the PG / MySQL / SQL Server
+  export loops, is now one unit-tested `AdaptiveBatchController`. Engines provide
+  only what differs (row source + memory-cap formula). SQL Server gains the same
+  first-batch memory-cap probe PG/MySQL have. No behaviour change — full live
+  validation across all three engines (parity, recovery, type matrices).
+- **`feat(mssql)`** — the export now honours the source-safety `SourceTuning`
+  knobs it previously ignored (it read only `batch_size`): **`lock_timeout`**
+  (server-side `SET LOCK_TIMEOUT` so a blocked read fails fast), **`statement_timeout`**
+  (client-side wall-clock budget — SQL Server has no statement-duration `SET`;
+  live-verified to abort + retry), and **`throttle_ms`** (sleep between batches).
+  Brings MSSQL to in-export tuning parity with the PG/MySQL engines.
+- **`feat(mssql)`** — the export now **streams**: it consumes the `tiberius`
+  result set incrementally and emits one Arrow batch per `tuning.batch_size`
+  rows instead of materialising the whole chunk (`into_first_result`). Peak RSS
+  is bounded by `batch_size × row_bytes`, **independent of `chunk_size`** — the
+  SQL Server analogue of the PG cursor's `FETCH N`. So a large `chunk_size` (or
+  `mode: full`) gives few large files at low memory; `chunk_size` now controls
+  file count, `batch_size` controls memory. Measured on 2 M heavy rows:
+  `mode: full` went from a ~10 GB materialise (OOM) to **1 file at 171 MB**.
+- **`feat(mssql)`** — connection pooler / gateway detection (`MssqlProxyKind`):
+  `@@SPID` drift across two queries → transaction-mode multiplexer (`Multiplexed`);
+  `SERVERPROPERTY('EngineEdition')` 5/8 (or an Azure `@@VERSION` banner) →
+  `AzureGateway`. One connect-time warning, mirroring PG (`pg_backend_pid` drift)
+  and MySQL (`CONNECTION_ID()` drift). Pure classifier exhaustively unit-tested;
+  live direct-connection guard in `live_pool_safety`.
+- **`test(mssql)`** — full live parity suites mirroring the PG/MySQL twins:
+  `live_mssql_resume`, `live_mssql_chunked_recovery`, `live_mssql_crash_recovery`,
+  `live_mssql_reconcile_repair`, `live_mssql_chunked`. Wired into the per-PR
+  `e2e` job and Nightly (mssql service + seed step added to both).
+- **`docs(mssql)`** — `datetime2` sub-microsecond truncation documented as a
+  tracked gap: rivet maps timestamps to microsecond, so a bare `datetime2`
+  (precision 7 = 100 ns) incremental cursor lands one tick below the source max
+  and re-exports the boundary row each run — use `datetime2(6)` or coarser.
+  Reliability / type-mapping / tuning matrices gained SQL Server rows.
+- **`docs(mssql)`** — [Gentle SQL Server extraction](docs/best-practices/mssql-gentle-extraction.md)
+  best-practice + copy-paste config (`rivet_mssql_gentle.yaml`): how to stay easy
+  on both the source DB and the rivet worker. Documents the one MSSQL footgun —
+  use an explicit `chunk_size` (rows), **not** `chunk_size_memory_mb` (which can't
+  size by bytes yet on MSSQL and falls back to ~500k-row chunks, so wide rows
+  buffer multiple GB). Measured live on a 2 M-row heavy table: **2 759 MB →
+  101 MB peak RSS (~27×) at the same wall time** by switching to `chunk_size`.
+  Includes a row-width sizing table and the `environment: production` governor lever.
+- **`bench(mssql)`** — DBA-harm matrix for SQL Server
+  ([`REPORT_mssql.md`](docs/bench/reports/REPORT_mssql.md) +
+  `mssql_db_bench.sh`): measured against live SQL Server 2022, rivet's chunked
+  autocommit reads hold **no long transaction** (0 ms), pin **nothing** back
+  from log truncation, add **zero** write pressure (read-only), and take a
+  **3–4 lock** peak footprint. A **per-tool comparison** (`mssql_harm_compare.sh`,
+  2 M-row `content_items`) puts that next to the competitors: rivet's longest
+  single query is **6.6 s** vs **~9 min** for sling/dlt scanning the table in one
+  shot, and rivet holds **no** open transaction where **dlt holds one for ~8 min**
+  (version-store / log-truncation hazard).
+- **`bench(mssql)`** — competitive performance matrix
+  ([`REPORT_mssql.md`](docs/bench/reports/REPORT_mssql.md)) vs sling / dlt on
+  live SQL Server 2022: rivet wins throughput on narrow-to-medium tables
+  (sub-second, 3–30× faster) and — with the streaming export — holds the lowest
+  or competitive peak RSS on every table, including the wide ones. The one
+  remaining gap is wall-time on heavy-text rows (the `tiberius` row decode), not
+  memory.
+- **`test(mssql)`** — `bigquery_validates_mssql_type_matrix_parquet`: the SQL
+  Server type matrix now also round-trips through live BigQuery (autoload types,
+  microsecond TIME/TIMESTAMP, `uniqueidentifier`→BYTES, decimal sums). **All
+  three type matrices (PG / MySQL / SQL Server) now pass through every oracle —
+  DuckDB, ClickHouse, and live BigQuery.**
+
+### Upgrade notes
+
+- **No config or API changes.** Existing PostgreSQL / MySQL / SQL Server exports
+  are unaffected; the `AdaptiveBatchController` refactor is internal and fully
+  re-validated on all three engines.
+- **SQL Server chunked exports open a fresh connection per chunk** (as the PG and
+  MySQL engines do) and run the one-time pooler / gateway detection on each. On a
+  many-chunk export that is real connection + auth churn — prefer a larger
+  `chunk_size` (fewer, larger files; the streaming export keeps memory bounded
+  regardless) over many small chunks. See
+  [gentle SQL Server extraction](docs/best-practices/mssql-gentle-extraction.md).
+
 ## 0.9.1 (2026-06-06) — SQL Server Source Engine
 
 > Rivet gains a third source engine: **SQL Server (MSSQL)**. Point it at a

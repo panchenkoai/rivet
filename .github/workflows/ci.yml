@@ -263,7 +263,7 @@ jobs:
         # profile and is required by the new MySQL `mysql_proxysql_*` tests in
         # tests/live_pool_safety.rs (added in 0.6.0); without it
         # `require_alive(LiveService::ProxySql)` panics before the test runs.
-        run: docker compose --profile pool up -d postgres mysql minio fake-gcs toxiproxy pgbouncer proxysql
+        run: docker compose --profile pool up -d postgres mysql mssql minio fake-gcs toxiproxy pgbouncer proxysql
 
       - name: Wait for services
         run: |
@@ -277,6 +277,10 @@ jobs:
           # 6033 is the client-facing MySQL protocol port; 6032 admin comes
           # up first but we wait for 6033 so backend wiring is in place.
           for i in $(seq 1 30); do (exec 3<>/dev/tcp/127.0.0.1/6033) 2>/dev/null && break || sleep 1; done
+          echo "Waiting for SQL Server..."
+          # mssql has a sqlcmd SELECT-1 healthcheck (start_period 30s); wait on it
+          # so the live_mssql_* suites can connect + seed.
+          for i in $(seq 1 40); do [ "$(docker inspect -f '{{.State.Health.Status}}' rivet-mssql 2>/dev/null)" = "healthy" ] && break || sleep 2; done
 
       - name: Build release
         run: cargo build --release
@@ -285,6 +289,15 @@ jobs:
         run: |
           PGPASSWORD=rivet psql -h localhost -U rivet -d rivet -f dev/e2e/seed_pg.sql
           mysql -h 127.0.0.1 -u rivet -privet rivet < dev/e2e/seed_mysql.sql
+
+      - name: Seed MSSQL database
+        # The SQL Server image has no init hook; create the `rivet` database via
+        # dev/mssql/init.sql (sqlcmd ships inside the container). The live_mssql_*
+        # suites create their own per-test tables but need the database to exist.
+        run: |
+          docker compose cp dev/mssql/init.sql mssql:/tmp/init.sql
+          docker compose exec -T mssql /opt/mssql-tools18/bin/sqlcmd \
+            -S localhost -U sa -P 'Rivet_Passw0rd!' -C -i /tmp/init.sql
 
       - name: Run E2E test suite
         env:

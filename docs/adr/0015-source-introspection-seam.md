@@ -23,12 +23,15 @@ The current arrangement (since OPT-4 shipped, commit `40433a0`):
   qualified_table) -> Result<TableIntrospection>`.
 - `src/source/mysql/mod.rs::introspect_mysql_table_for_chunking(url, tls,
   qualified_table) -> Result<TableIntrospection>`.
+- `src/source/mssql/mod.rs::introspect_mssql_table_for_chunking(url, tls,
+  qualified_table) -> Result<TableIntrospection>` (added with the SQL Server
+  engine; probes `sys.*` catalog views).
 - `src/plan/build.rs::resolve_chunked_strategy` dispatches by
   `match config.source.source_type` to the right free function.
 
-Two architecture-review walks have re-suggested unifying these into a
+Architecture-review walks have re-suggested unifying these into a
 `trait Introspector` with one impl per engine, citing "code drift" /
-"parallel modules with no shared abstraction" between the two
+"parallel modules with no shared abstraction" between the (now three)
 introspection functions. Each suggestion has reached the implementation
 stage, been examined against the actual code, and been rejected for the
 reasons in this ADR.
@@ -38,9 +41,10 @@ reasons in this ADR.
 ## Decision
 
 **The introspection seam lives at the data shape (`TableIntrospection`),
-not at a trait.** The two per-engine functions remain free functions,
+not at a trait.** The three per-engine functions remain free functions,
 dispatched by `match source_type` at the one call site in `plan/build.rs`.
-No `trait Introspector` is introduced.
+No `trait Introspector` is introduced. (The deletion-test rationale below
+scales unchanged to N engines: the functions share a data shape, not logic.)
 
 ---
 
