@@ -13,6 +13,13 @@ representations. It is aligned with the automated suite in
   (column override, catalog hint, or PostgreSQL wire metadata).
 - **Binary** (`BYTEA`, `BLOB`, `BINARY`/`VARBINARY` with charset 63) stays
   Arrow `Binary` in Parquet.
+- **Float `NaN` / `±Infinity`** are preserved. Parquet stores them natively
+  (IEEE-754); CSV emits the literal `NaN` / `inf` / `-inf` (and `-0` keeps its
+  sign) rather than an empty cell — an empty cell would silently conflate a real
+  special value with `NULL`. Note these are *float* values: `decimal` / `NUMERIC`
+  has no NaN representation and a NaN/Infinity payload there is rejected at
+  extract time, not coerced. Strict CSV loaders that expect `Infinity` over `inf`
+  should configure their float parser accordingly; Parquet needs no such care.
 - **JSON / JSONB** is valid JSON text in the file, paired with the Arrow
   `arrow.json` canonical extension type so parquet-rs emits native
   `LogicalType::Json` in the Parquet footer. The Rivet field metadata
