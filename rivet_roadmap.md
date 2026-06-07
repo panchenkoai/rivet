@@ -537,6 +537,87 @@ The current README is honest about the 9s MySQL number, but it creates an asymme
 
 ---
 
+## Epic 18 — Source parity (MySQL / MSSQL → PostgreSQL gold standard)
+
+**Goal:** PostgreSQL is the reference source. Close the per-engine gap on the
+two axes that make it the gold standard — (1) longest-single-query under a
+DBA `statement_timeout`, and (2) pooler-safe session state — without assuming
+the gap requires a server-side cursor.
+
+**Verified baseline (code, not README — re-verified against the tree at
+roadmap-write time; file paths resolved, line refs current):**
+
+| Mechanism | PG | MySQL | MSSQL |
+|---|---|---|---|
+| Server-side cursor (`DECLARE … FETCH N`, capped `work_mem×0.7`) | ✅ `src/source/postgres/mod.rs:405,427,467` | ❌ keyset emulation | ⚠️ `OFFSET 0 FETCH NEXT` (keyset) |
+| Governor pressure proxy | ✅ `temp_bytes` + `checkpoints_req` + `work_mem` | ⚠️ `Innodb_log_waits` (write-pressure) | ⚠️ `Log Flush Waits` (write-pressure) |
+| Keyset chunking (OPT-4) | ✅ any unique NOT NULL index `src/source/postgres/mod.rs:314-340` | ✅ unique NOT NULL index `src/source/mysql/mod.rs:303-335` | ❌ single-column PK only `src/source/mssql/mod.rs:475-476` |
+| Pooler-safe session | ✅ RAII `PgTxnGuard` + `SET LOCAL` `src/source/postgres/mod.rs:121-156` | ⚠️ session `SET max_execution_time` `src/source/mysql/mod.rs:519` (end-of-fn reset at `:543`, not `Drop`-safe) | ⚠️ none |
+
+> Note: governor parity already exists — all three engines implement
+> `sample_pressure`. The real remaining gaps are cursor/keyset page size,
+> session-state leakage behind a pooler, and MSSQL keyset key selection.
+
+---
+
+### Phase A — measure-first, highest leverage (P0)
+
+- [ ] **A1. Shrink MySQL/MSSQL keyset page to PG-equivalent statement time.**
+      The 9s MySQL longest-query is an oversized keyset page/chunk, not the
+      absence of a cursor. Tune the keyset page size (`src/source/mysql/mod.rs`
+      keyset driver + `src/source/query.rs::page_limit_clause` / `pipeline/chunked/`)
+      so one SQL statement runs ~0.2–0.5s, matching PG `FETCH N`. Re-run the
+      `content_items` bench. **This experiment gates Phase D** — if it closes
+      the gap, the MySQL cursor work is not needed.
+- [ ] **A2. MSSQL keyset on composite / unique-index keys (parity with PG).**
+      Port the key-selection logic from `src/source/postgres/mod.rs:314-340`
+      (which discovers every single-column unique NOT NULL index as a keyset
+      key) to `src/source/mssql/mod.rs:475-476` (which today treats only the
+      single-column PK as a keyset key); tables with composite PKs or surrogate
+      unique keys currently fall back to the less-safe chunked path.
+
+### Phase B — pooler-safe session parity (P1)
+
+- [ ] **B1. MySQL session-reset RAII guard (analogue of `PgTxnGuard`).**
+      `SET SESSION max_execution_time` (`src/source/mysql/mod.rs:519`) is reset
+      at end-of-function (`:543`) but not on a `Drop` path, so it can stick to a
+      reused backend connection behind ProxySQL / MaxScale on an early return /
+      panic. Add a guard that resets session vars (`SET … = DEFAULT`) on `Drop`.
+- [ ] **B2. MSSQL session/transaction hygiene.** Confirm the `block_on`
+      bridge (ADR-0011) never leaves an open transaction; reset
+      `LOCK_TIMEOUT` (`src/source/mssql/mod.rs:213`) and any session SET on
+      teardown.
+
+### Phase C — pressure-proxy fidelity (P2)
+
+- [ ] **C1. MySQL extraction-pressure proxy.** Replace/augment
+      `Innodb_log_waits` with `Created_tmp_disk_tables` or
+      `Innodb_buffer_pool_wait_free` — closer to "my extraction is spilling"
+      than global write-waits (PG's `temp_bytes` analogue).
+- [ ] **C2. MSSQL tempdb-pressure proxy.** Sample `sys.dm_db_task_space_usage`
+      / Page Life Expectancy instead of (or alongside) `Log Flush Waits`.
+
+### Phase D — MySQL server-side cursor (P3, gated on A1)
+
+- [ ] **D1.** Only if A1 leaves a material longest-query gap. `mysql` crate v28
+      does not expose `CURSOR_TYPE_READ_ONLY` (`COM_STMT_EXECUTE` flag `0x01`
+      + `COM_STMT_FETCH`). Upstream PR exposing `CursorType` on
+      `StatementParams`; vendor until merged. **Do not start without an
+      A1-measured justification** — high cost (upstream dependency), possibly
+      marginal delta over small index-backed keyset pages.
+
+---
+
+**Crosswalk update (§9.1):** Epic 17 (MySQL parity) and Epic 16
+(Auto-parallel) feed into this; the former Phase B "COM_STMT_FETCH" becomes
+Epic 18 Phase D, now explicitly gated on the Phase A measurement.
+
+**Exit criteria:** MySQL and MSSQL longest-single-query within ~2× of PG on
+the `content_items` bench at defaults; no session-state leak behind a pooler
+(B1/B2 tested); MSSQL keyset coverage matches PG's index eligibility rules.
+
+---
+
 # 5.1 Packaging, Trust, and External Adoption Track
 
 This track replaces the former standalone `rivet_packaging_trust_roadmap.md`.
@@ -680,6 +761,7 @@ Near-term resource-control priorities:
 
 ## Phase 3.5 — Source-engine parity
 17. Epic 17 — MySQL Source Parity (COM_STMT_FETCH)
+18. Epic 18 — Source parity (MySQL / MSSQL → PostgreSQL gold standard)
 
 ## Phase 4 — Expand carefully
 13. Epic 13 — SSH / Jump Host Access
@@ -743,7 +825,8 @@ This section merges the former `rivet_roadmap_v3.md` task tracker. **Strategic p
 | Epic 14 — Warehouse load | `src/types/`, M1–M6 | Type system + type report + BQ compat ✅; direct load path = future |
 | Epic 15 — CDC | **N** | WAL/binlog = future |
 | Epic 16 — Auto-parallel | *(none)* | Auto-parallelism = future |
-| Epic 17 — MySQL parity | *(none yet)* | Phase A: adaptive chunk timing; Phase B: COM_STMT_FETCH |
+| Epic 17 — MySQL parity | *(none yet)* | Phase A: adaptive chunk timing; Phase B (COM_STMT_FETCH) → re-homed as **Epic 18 Phase D**, now gated on the Epic 18 Phase A measurement |
+| Epic 18 — Source parity | `src/source/{postgres,mysql,mssql}/mod.rs` | Close MySQL/MSSQL longest-single-query + pooler-safe session gap vs the PG gold standard. A1 (keyset page size) gates D (MySQL server-side cursor); A2 = MSSQL keyset on unique indexes; B1/B2 = session-reset hygiene |
 
 **Auth and connectivity (lettered A)** underpin all runs and map across Epics 1–2 and §7 (niche).
 
