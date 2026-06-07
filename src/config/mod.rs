@@ -144,7 +144,23 @@ impl Config {
         Ok(())
     }
 
+    /// Reject a config before any plan/connect step. The body is split into
+    /// three cohesive validators so each can be read — and unit-tested — on its
+    /// own: the export-list shape, the source connection block, and the
+    /// per-export rules. The end-to-end surface (`Config::from_yaml`) is
+    /// covered by `config/tests/{validation,secops}.rs`; the split additionally
+    /// lets a rule be exercised directly via `validate_export`.
     fn validate(&self) -> crate::error::Result<()> {
+        self.validate_exports_list()?;
+        self.validate_source_connection()?;
+        for export in &self.exports {
+            self.validate_export(export)?;
+        }
+        Ok(())
+    }
+
+    /// Whole-config shape: at least one export, names unique.
+    fn validate_exports_list(&self) -> crate::error::Result<()> {
         // An empty `exports:` list is almost always a typo (wrong config file,
         // dropped anchor, merged doc with the anchor section missing). Running
         // with zero exports is a silent no-op that looks like success in CI;
@@ -157,49 +173,27 @@ impl Config {
         // `file_log`, and `chunk_run` are all keyed by `export_name`, so
         // two configs with the same name silently share cursor/file-log rows.
         // QA backlog Task 5.1.
-        {
-            let mut seen: std::collections::HashSet<&str> =
-                std::collections::HashSet::with_capacity(self.exports.len());
-            for e in &self.exports {
-                if !seen.insert(e.name.as_str()) {
-                    anyhow::bail!(
-                        "exports: duplicate export name '{}' (each export must have a unique name; state is keyed by name)",
-                        e.name
-                    );
-                }
+        let mut seen: std::collections::HashSet<&str> =
+            std::collections::HashSet::with_capacity(self.exports.len());
+        for e in &self.exports {
+            if !seen.insert(e.name.as_str()) {
+                anyhow::bail!(
+                    "exports: duplicate export name '{}' (each export must have a unique name; state is keyed by name)",
+                    e.name
+                );
             }
         }
+        Ok(())
+    }
 
+    /// Source connection block: exactly one connection method, well-formed,
+    /// and the source-level tuning that is shared by every export.
+    fn validate_source_connection(&self) -> crate::error::Result<()> {
         if let Some(t) = &self.source.tuning
             && t.batch_size.is_some()
             && t.batch_size_memory_mb.is_some()
         {
             anyhow::bail!("tuning: batch_size and batch_size_memory_mb are mutually exclusive");
-        }
-
-        for export in &self.exports {
-            let merged = crate::tuning::merge_tuning_config(
-                self.source.tuning.as_ref(),
-                export.tuning.as_ref(),
-            );
-            if let Some(t) = merged
-                && t.batch_size.is_some()
-                && t.batch_size_memory_mb.is_some()
-            {
-                anyhow::bail!(
-                    "export '{}': effective tuning has both batch_size and batch_size_memory_mb (mutually exclusive)",
-                    export.name
-                );
-            }
-            if let Some(et) = &export.tuning
-                && et.batch_size.is_some()
-                && et.batch_size_memory_mb.is_some()
-            {
-                anyhow::bail!(
-                    "export '{}': tuning.batch_size and tuning.batch_size_memory_mb are mutually exclusive",
-                    export.name
-                );
-            }
         }
 
         if !self.source.has_url_fields() && !self.source.has_structured_fields() {
@@ -257,263 +251,288 @@ impl Config {
                 );
             }
         }
+        Ok(())
+    }
 
-        for export in &self.exports {
-            let set_count = [
-                export.query.is_some(),
-                export.query_file.is_some(),
-                export.table.is_some(),
-            ]
-            .iter()
-            .filter(|b| **b)
-            .count();
-            if set_count == 0 {
+    /// Per-export rules: effective tuning, query source, `query_file` SecOps,
+    /// destination auth, compression, and the mode/chunk matrix. Takes `&self`
+    /// because effective tuning merges the source-level block.
+    fn validate_export(&self, export: &ExportConfig) -> crate::error::Result<()> {
+        let merged =
+            crate::tuning::merge_tuning_config(self.source.tuning.as_ref(), export.tuning.as_ref());
+        if let Some(t) = merged
+            && t.batch_size.is_some()
+            && t.batch_size_memory_mb.is_some()
+        {
+            anyhow::bail!(
+                "export '{}': effective tuning has both batch_size and batch_size_memory_mb (mutually exclusive)",
+                export.name
+            );
+        }
+        if let Some(et) = &export.tuning
+            && et.batch_size.is_some()
+            && et.batch_size_memory_mb.is_some()
+        {
+            anyhow::bail!(
+                "export '{}': tuning.batch_size and tuning.batch_size_memory_mb are mutually exclusive",
+                export.name
+            );
+        }
+
+        let set_count = [
+            export.query.is_some(),
+            export.query_file.is_some(),
+            export.table.is_some(),
+        ]
+        .iter()
+        .filter(|b| **b)
+        .count();
+        if set_count == 0 {
+            anyhow::bail!(
+                "export '{}': must specify exactly one of 'query', 'query_file', or 'table'",
+                export.name
+            );
+        }
+        if set_count > 1 {
+            anyhow::bail!(
+                "export '{}': specify exactly one of 'query', 'query_file', or 'table' (got {} set)",
+                export.name,
+                set_count
+            );
+        }
+        // SecOps: syntactic `query_file` checks must run at config-validate
+        // time so `rivet check` / `rivet doctor` catch them before any
+        // plan step. The same checks repeat (with a canonicalize-based
+        // symlink probe) in `ExportConfig::resolve_query` because the
+        // file may have been swapped between validation and read.
+        if let Some(file) = &export.query_file {
+            let p = std::path::Path::new(file);
+            if p.is_absolute() {
                 anyhow::bail!(
-                    "export '{}': must specify exactly one of 'query', 'query_file', or 'table'",
+                    "export '{}': query_file must be a relative path: '{}'",
+                    export.name,
+                    file
+                );
+            }
+            if p.components().any(|c| c == std::path::Component::ParentDir) {
+                anyhow::bail!(
+                    "export '{}': query_file path must not contain '..': '{}'",
+                    export.name,
+                    file
+                );
+            }
+        }
+        if export.destination.destination_type == DestinationType::S3 {
+            let ak = export.destination.access_key_env.is_some();
+            let sk = export.destination.secret_key_env.is_some();
+            if ak != sk {
+                anyhow::bail!(
+                    "export '{}': S3 requires both access_key_env and secret_key_env, or neither (use default AWS credential chain)",
                     export.name
                 );
             }
-            if set_count > 1 {
-                anyhow::bail!(
-                    "export '{}': specify exactly one of 'query', 'query_file', or 'table' (got {} set)",
-                    export.name,
-                    set_count
-                );
-            }
-            // SecOps: syntactic `query_file` checks must run at config-validate
-            // time so `rivet check` / `rivet doctor` catch them before any
-            // plan step. The same checks repeat (with a canonicalize-based
-            // symlink probe) in `ExportConfig::resolve_query` because the
-            // file may have been swapped between validation and read.
-            if let Some(file) = &export.query_file {
-                let p = std::path::Path::new(file);
-                if p.is_absolute() {
+        }
+
+        if export.destination.destination_type == DestinationType::Gcs
+            && export.destination.allow_anonymous
+            && export.destination.credentials_file.is_some()
+        {
+            anyhow::bail!(
+                "export '{}': GCS allow_anonymous cannot be used together with credentials_file",
+                export.name
+            );
+        }
+
+        if export.destination.destination_type == DestinationType::Azure {
+            let has_name = export.destination.account_name.is_some();
+            let has_key = export.destination.account_key_env.is_some();
+            let has_sas = export.destination.sas_token_env.is_some();
+            if export.destination.allow_anonymous {
+                if has_name || has_key || has_sas {
                     anyhow::bail!(
-                        "export '{}': query_file must be a relative path: '{}'",
-                        export.name,
-                        file
-                    );
-                }
-                if p.components().any(|c| c == std::path::Component::ParentDir) {
-                    anyhow::bail!(
-                        "export '{}': query_file path must not contain '..': '{}'",
-                        export.name,
-                        file
-                    );
-                }
-            }
-            if export.destination.destination_type == DestinationType::S3 {
-                let ak = export.destination.access_key_env.is_some();
-                let sk = export.destination.secret_key_env.is_some();
-                if ak != sk {
-                    anyhow::bail!(
-                        "export '{}': S3 requires both access_key_env and secret_key_env, or neither (use default AWS credential chain)",
+                        "export '{}': Azure allow_anonymous cannot be combined with account_name/account_key_env/sas_token_env",
                         export.name
                     );
                 }
-            }
-
-            if export.destination.destination_type == DestinationType::Gcs
-                && export.destination.allow_anonymous
-                && export.destination.credentials_file.is_some()
-            {
+            } else if has_key && has_sas {
                 anyhow::bail!(
-                    "export '{}': GCS allow_anonymous cannot be used together with credentials_file",
+                    "export '{}': Azure account_key_env and sas_token_env are mutually exclusive — pick one auth mode",
+                    export.name
+                );
+            } else if !has_name {
+                anyhow::bail!(
+                    "export '{}': Azure requires account_name (plus account_key_env or sas_token_env), or allow_anonymous: true for Azurite",
+                    export.name
+                );
+            } else if !has_key && !has_sas {
+                anyhow::bail!(
+                    "export '{}': Azure requires account_key_env or sas_token_env (or allow_anonymous: true for Azurite)",
                     export.name
                 );
             }
+        }
 
-            if export.destination.destination_type == DestinationType::Azure {
-                let has_name = export.destination.account_name.is_some();
-                let has_key = export.destination.account_key_env.is_some();
-                let has_sas = export.destination.sas_token_env.is_some();
-                if export.destination.allow_anonymous {
-                    if has_name || has_key || has_sas {
+        if let Some(cred_path) = &export.destination.credentials_file
+            && !std::path::Path::new(cred_path).exists()
+        {
+            anyhow::bail!(
+                "export '{}': credentials_file '{}' does not exist",
+                export.name,
+                cred_path
+            );
+        }
+
+        if let Some(ref size_str) = export.max_file_size {
+            parse_file_size(size_str).map_err(|_| {
+                anyhow::anyhow!(
+                    "export '{}': invalid max_file_size '{}'",
+                    export.name,
+                    size_str
+                )
+            })?;
+        }
+
+        if let Some(level) = export.compression_level {
+            match export.compression {
+                CompressionType::Zstd => {
+                    if !(1..=22).contains(&level) {
                         anyhow::bail!(
-                            "export '{}': Azure allow_anonymous cannot be combined with account_name/account_key_env/sas_token_env",
-                            export.name
+                            "export '{}': zstd compression_level must be 1..22, got {}",
+                            export.name,
+                            level
                         );
                     }
-                } else if has_key && has_sas {
+                }
+                CompressionType::Gzip => {
+                    if level > 10 {
+                        anyhow::bail!(
+                            "export '{}': gzip compression_level must be 0..10, got {}",
+                            export.name,
+                            level
+                        );
+                    }
+                }
+                _ => {
                     anyhow::bail!(
-                        "export '{}': Azure account_key_env and sas_token_env are mutually exclusive — pick one auth mode",
-                        export.name
-                    );
-                } else if !has_name {
-                    anyhow::bail!(
-                        "export '{}': Azure requires account_name (plus account_key_env or sas_token_env), or allow_anonymous: true for Azurite",
-                        export.name
-                    );
-                } else if !has_key && !has_sas {
-                    anyhow::bail!(
-                        "export '{}': Azure requires account_key_env or sas_token_env (or allow_anonymous: true for Azurite)",
+                        "export '{}': compression_level is only supported for zstd and gzip",
                         export.name
                     );
                 }
             }
+        }
 
-            if let Some(cred_path) = &export.destination.credentials_file
-                && !std::path::Path::new(cred_path).exists()
-            {
-                anyhow::bail!(
-                    "export '{}': credentials_file '{}' does not exist",
-                    export.name,
-                    cred_path
-                );
-            }
-
-            if let Some(ref size_str) = export.max_file_size {
-                parse_file_size(size_str).map_err(|_| {
-                    anyhow::anyhow!(
-                        "export '{}': invalid max_file_size '{}'",
-                        export.name,
-                        size_str
-                    )
-                })?;
-            }
-
-            if let Some(level) = export.compression_level {
-                match export.compression {
-                    CompressionType::Zstd => {
-                        if !(1..=22).contains(&level) {
+        match export.mode {
+            ExportMode::Incremental => {
+                if export.cursor_column.is_none() {
+                    anyhow::bail!(
+                        "export '{}': incremental mode requires cursor_column",
+                        export.name
+                    );
+                }
+                match export.incremental_cursor_mode {
+                    IncrementalCursorMode::Coalesce => {
+                        if export.cursor_fallback_column.is_none() {
                             anyhow::bail!(
-                                "export '{}': zstd compression_level must be 1..22, got {}",
-                                export.name,
-                                level
+                                "export '{}': incremental_cursor_mode: coalesce requires cursor_fallback_column",
+                                export.name
                             );
                         }
                     }
-                    CompressionType::Gzip => {
-                        if level > 10 {
+                    IncrementalCursorMode::SingleColumn => {
+                        if export.cursor_fallback_column.is_some() {
                             anyhow::bail!(
-                                "export '{}': gzip compression_level must be 0..10, got {}",
-                                export.name,
-                                level
+                                "export '{}': cursor_fallback_column is only valid with incremental_cursor_mode: coalesce",
+                                export.name
                             );
                         }
                     }
-                    _ => {
-                        anyhow::bail!(
-                            "export '{}': compression_level is only supported for zstd and gzip",
-                            export.name
-                        );
-                    }
                 }
             }
-
-            match export.mode {
-                ExportMode::Incremental => {
-                    if export.cursor_column.is_none() {
-                        anyhow::bail!(
-                            "export '{}': incremental mode requires cursor_column",
-                            export.name
-                        );
-                    }
-                    match export.incremental_cursor_mode {
-                        IncrementalCursorMode::Coalesce => {
-                            if export.cursor_fallback_column.is_none() {
-                                anyhow::bail!(
-                                    "export '{}': incremental_cursor_mode: coalesce requires cursor_fallback_column",
-                                    export.name
-                                );
-                            }
-                        }
-                        IncrementalCursorMode::SingleColumn => {
-                            if export.cursor_fallback_column.is_some() {
-                                anyhow::bail!(
-                                    "export '{}': cursor_fallback_column is only valid with incremental_cursor_mode: coalesce",
-                                    export.name
-                                );
-                            }
-                        }
-                    }
+            ExportMode::Chunked => {
+                // `chunk_column` is mandatory unless the user used the `table:`
+                // shortcut on a Postgres source — in that case it is auto-resolved
+                // from the table's single-integer PK at plan-build time (see
+                // `crate::plan::build::resolve_chunk_column`).
+                if export.chunk_column.is_none() && export.table.is_none() {
+                    anyhow::bail!(
+                        "export '{}': chunked mode requires chunk_column \
+                         (or use `table:` shortcut on a Postgres source to auto-resolve from PK)",
+                        export.name
+                    );
                 }
-                ExportMode::Chunked => {
-                    // `chunk_column` is mandatory unless the user used the `table:`
-                    // shortcut on a Postgres source — in that case it is auto-resolved
-                    // from the table's single-integer PK at plan-build time (see
-                    // `crate::plan::build::resolve_chunk_column`).
-                    if export.chunk_column.is_none() && export.table.is_none() {
-                        anyhow::bail!(
-                            "export '{}': chunked mode requires chunk_column \
-                             (or use `table:` shortcut on a Postgres source to auto-resolve from PK)",
-                            export.name
-                        );
-                    }
-                    // chunk_size == 0 would divide the range into zero-width
-                    // slices and (before the saturating fix in generate_chunks)
-                    // either infinite-loop or produce no progress. QA backlog
-                    // Task 5.1.
-                    if export.chunk_size == 0 {
-                        anyhow::bail!(
-                            "export '{}': chunked mode requires chunk_size >= 1 (got 0)",
-                            export.name
-                        );
-                    }
-                    // parallel == 0 means "spawn zero workers". Claiming tasks
-                    // with no workers stalls the pipeline. QA backlog Task 5.1.
-                    if export.parallel == 0 {
-                        anyhow::bail!(
-                            "export '{}': chunked mode requires parallel >= 1 (got 0)",
-                            export.name
-                        );
-                    }
-                    if let Some(0) = export.chunk_count {
-                        anyhow::bail!("export '{}': chunk_count must be >= 1", export.name);
-                    }
-                    if export.chunk_count.is_some() && export.chunk_dense {
-                        anyhow::bail!(
-                            "export '{}': chunk_count and chunk_dense are mutually exclusive",
-                            export.name
-                        );
-                    }
-                    if export.chunk_count.is_some() && export.chunk_by_days.is_some() {
-                        anyhow::bail!(
-                            "export '{}': chunk_count and chunk_by_days are mutually exclusive",
-                            export.name
-                        );
-                    }
+                // chunk_size == 0 would divide the range into zero-width
+                // slices and (before the saturating fix in generate_chunks)
+                // either infinite-loop or produce no progress. QA backlog
+                // Task 5.1.
+                if export.chunk_size == 0 {
+                    anyhow::bail!(
+                        "export '{}': chunked mode requires chunk_size >= 1 (got 0)",
+                        export.name
+                    );
                 }
-                ExportMode::TimeWindow => {
-                    if export.time_column.is_none() {
-                        anyhow::bail!(
-                            "export '{}': time_window mode requires time_column",
-                            export.name
-                        );
-                    }
-                    if export.days_window.is_none() {
-                        anyhow::bail!(
-                            "export '{}': time_window mode requires days_window",
-                            export.name
-                        );
-                    }
+                // parallel == 0 means "spawn zero workers". Claiming tasks
+                // with no workers stalls the pipeline. QA backlog Task 5.1.
+                if export.parallel == 0 {
+                    anyhow::bail!(
+                        "export '{}': chunked mode requires parallel >= 1 (got 0)",
+                        export.name
+                    );
                 }
-                ExportMode::Full => {}
+                if let Some(0) = export.chunk_count {
+                    anyhow::bail!("export '{}': chunk_count must be >= 1", export.name);
+                }
+                if export.chunk_count.is_some() && export.chunk_dense {
+                    anyhow::bail!(
+                        "export '{}': chunk_count and chunk_dense are mutually exclusive",
+                        export.name
+                    );
+                }
+                if export.chunk_count.is_some() && export.chunk_by_days.is_some() {
+                    anyhow::bail!(
+                        "export '{}': chunk_count and chunk_by_days are mutually exclusive",
+                        export.name
+                    );
+                }
             }
+            ExportMode::TimeWindow => {
+                if export.time_column.is_none() {
+                    anyhow::bail!(
+                        "export '{}': time_window mode requires time_column",
+                        export.name
+                    );
+                }
+                if export.days_window.is_none() {
+                    anyhow::bail!(
+                        "export '{}': time_window mode requires days_window",
+                        export.name
+                    );
+                }
+            }
+            ExportMode::Full => {}
+        }
 
-            if export.chunk_dense && export.mode != ExportMode::Chunked {
+        if export.chunk_dense && export.mode != ExportMode::Chunked {
+            anyhow::bail!(
+                "export '{}': chunk_dense is only valid with mode: chunked",
+                export.name
+            );
+        }
+
+        if let Some(days) = export.chunk_by_days {
+            if export.mode != ExportMode::Chunked {
                 anyhow::bail!(
-                    "export '{}': chunk_dense is only valid with mode: chunked",
+                    "export '{}': chunk_by_days requires mode: chunked",
                     export.name
                 );
             }
-
-            if let Some(days) = export.chunk_by_days {
-                if export.mode != ExportMode::Chunked {
-                    anyhow::bail!(
-                        "export '{}': chunk_by_days requires mode: chunked",
-                        export.name
-                    );
-                }
-                if export.chunk_dense {
-                    anyhow::bail!(
-                        "export '{}': chunk_by_days cannot be combined with chunk_dense",
-                        export.name
-                    );
-                }
-                if days == 0 {
-                    anyhow::bail!("export '{}': chunk_by_days must be at least 1", export.name);
-                }
+            if export.chunk_dense {
+                anyhow::bail!(
+                    "export '{}': chunk_by_days cannot be combined with chunk_dense",
+                    export.name
+                );
+            }
+            if days == 0 {
+                anyhow::bail!("export '{}': chunk_by_days must be at least 1", export.name);
             }
         }
         Ok(())
