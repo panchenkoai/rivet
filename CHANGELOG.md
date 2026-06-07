@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Dependency policy
+
+- **`ci(deps)`** — Dependabot retuned to cut churn: routine crate updates are
+  scoped to **major** bumps only, **grouped** into one weekly PR, and held by a
+  **14-day cooldown** so a freshly shipped `.0` never lands before its first
+  round of fixes. GitHub Actions bumps are likewise grouped + cooled down.
+  Security PRs still arrive out-of-band (no cooldown), and the `cargo audit`
+  gate (pre-commit + CI) remains the hard backstop for any fixable advisory.
+
 ## 0.9.2 (2026-06-07) — SQL Server engine maturity + shared batch controller
 
 > The SQL Server source grows up: the export **streams** (peak RSS bounded by
