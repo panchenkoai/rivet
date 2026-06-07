@@ -23,6 +23,7 @@ use super::super::{
     RunSummary, progress::ChunkProgress, retry::classify_error, sink::ExportSink,
     validate::validate_output,
 };
+use super::poison;
 use super::{
     ChunkSource, chunked_plan, config_hint, detect_and_generate_chunks,
     ensure_chunk_checkpoint_plan,
@@ -161,9 +162,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                     ) {
                         Ok(c) => c,
                         Err(e) => {
-                            errors
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
+                            poison::lock_recover(errors)
                                 .push(format!("claim error: {:#}", e));
                             break;
                         }
@@ -368,9 +367,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                     }
                                 }
                                 let name = rec.file_name.clone();
-                                file_records
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
+                                poison::lock_recover(file_records)
                                     .push((rec, chunk_index));
                                 Some(name)
                             } else {
@@ -405,9 +402,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                 chunk_index,
                                 &msg,
                             );
-                            errors
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
+                            poison::lock_recover(errors)
                                 .push(format!("chunk {}: {}", chunk_index, msg));
                         }
                     }
@@ -439,7 +434,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     // Before this migration nothing populated `summary.manifest_parts` for
     // parallel_checkpoint runs at all — the cloud manifest M1 contract was
     // silently empty for every `parallel>1 + chunk_checkpoint:true` run.
-    for (rec, chunk_index) in file_records.into_inner().unwrap_or_else(|e| e.into_inner()) {
+    for (rec, chunk_index) in poison::into_recover(file_records) {
         super::super::commit::record_part(
             plan,
             summary,
@@ -449,7 +444,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
         );
     }
 
-    let errs = errors.into_inner().unwrap_or_else(|e| e.into_inner());
+    let errs = poison::into_recover(errors);
     if !errs.is_empty() {
         anyhow::bail!(
             "export '{}': parallel checkpoint worker errors:\n{}",

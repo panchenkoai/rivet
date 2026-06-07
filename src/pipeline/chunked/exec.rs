@@ -12,6 +12,7 @@ use super::super::{
 };
 use super::detect::detect_and_generate_chunks;
 use super::math::build_chunk_query_sql;
+use super::poison;
 use crate::error::Result;
 use crate::journal::RunEvent;
 use crate::plan::{ChunkedPlan, ExtractionStrategy, ResolvedRunPlan};
@@ -334,10 +335,7 @@ pub(crate) fn run_chunked_parallel(
                             to,
                             reason
                         );
-                        governor_log
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push((from, to, reason.to_string()));
+                        poison::lock_recover(governor_log).push((from, to, reason.to_string()));
                     },
                 );
             });
@@ -432,10 +430,7 @@ pub(crate) fn run_chunked_parallel(
                             sink.total_rows as i64,
                             file_name,
                         )?;
-                        file_records
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push((rec, i as i64));
+                        poison::lock_recover(file_records).push((rec, i as i64));
                     }
 
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -454,10 +449,7 @@ pub(crate) fn run_chunked_parallel(
 
                 if let Err(e) = result {
                     log::error!("export '{}': chunk {} failed: {:#}", export_name, i, e);
-                    errors
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push(format!("chunk {}: {:#}", i, e));
+                    poison::lock_recover(errors).push(format!("chunk {}: {:#}", i, e));
                 }
 
                 // Mark this worker done (success OR failure) so the governor
@@ -471,7 +463,7 @@ pub(crate) fn run_chunked_parallel(
     pb.finish(summary.total_rows);
 
     // Drain governor decisions (recorded off-thread) into the run journal.
-    for (from, to, reason) in governor_log.into_inner().unwrap_or_else(|e| e.into_inner()) {
+    for (from, to, reason) in poison::into_recover(governor_log) {
         summary
             .journal
             .record(RunEvent::ParallelismAdjusted { from, to, reason });
@@ -489,7 +481,7 @@ pub(crate) fn run_chunked_parallel(
     // Drain each worker-written part through the shared commit path: I2/M1 +
     // bytes/files counters + ChunkCompleted journal + I7 file-log. All summary
     // and state mutation happens here on the parent thread, post-join.
-    for (rec, chunk_index) in file_records.into_inner().unwrap_or_else(|e| e.into_inner()) {
+    for (rec, chunk_index) in poison::into_recover(file_records) {
         super::super::commit::record_part(
             plan,
             summary,
@@ -499,7 +491,7 @@ pub(crate) fn run_chunked_parallel(
         );
     }
 
-    let errs = errors.into_inner().unwrap_or_else(|e| e.into_inner());
+    let errs = poison::into_recover(errors);
     if !errs.is_empty() {
         anyhow::bail!(
             "export '{}': {} chunks failed:\n{}",

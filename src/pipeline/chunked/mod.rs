@@ -23,6 +23,7 @@ mod detect;
 mod exec;
 pub(crate) mod math;
 mod parallel_checkpoint;
+mod poison;
 mod resume_m8;
 mod sequential_checkpoint;
 
