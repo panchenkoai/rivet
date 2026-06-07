@@ -469,11 +469,45 @@ pub(crate) fn introspect_mssql_table_for_chunking(
         schema.replace('\'', "''"),
         table.replace('\'', "''")
     );
+    // Keyset keys (OPT-4) — parity with `postgres/mod.rs:314-340`: every
+    // single-column, NOT NULL, UNIQUE index (the PK *plus* any unique
+    // constraint/index), PK-first and de-duplicated, not just the PK. SQL
+    // Server: `sys.indexes.is_unique = 1`, exactly one key column
+    // (`ic.key_ordinal > 0` + `HAVING COUNT(*) = 1`), and the column is NOT NULL
+    // — so `ORDER BY key LIMIT n` is an index range scan and `WHERE key > last`
+    // never skips dup keys. Aggregated with a `CHAR(31)` (unit-separator)
+    // delimiter because the introspection seam only exposes `query_scalar`; that
+    // byte cannot appear in a real identifier, so the split is unambiguous.
+    let keyset_sql = format!(
+        "SELECT STRING_AGG(col, CHAR(31)) WITHIN GROUP (ORDER BY is_pk DESC, col) FROM ( \
+           SELECT col, MAX(is_pk) AS is_pk FROM ( \
+             SELECT MIN(c.name) AS col, MAX(CONVERT(int, i.is_primary_key)) AS is_pk \
+             FROM sys.indexes i \
+             JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0 \
+             JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
+             JOIN sys.objects o ON o.object_id = i.object_id \
+             JOIN sys.schemas s ON s.schema_id = o.schema_id \
+             WHERE i.is_unique = 1 AND c.is_nullable = 0 AND s.name = N'{}' AND o.name = N'{}' \
+             GROUP BY i.object_id, i.index_id HAVING COUNT(*) = 1 \
+           ) per_index GROUP BY col \
+         ) deduped",
+        schema.replace('\'', "''"),
+        table.replace('\'', "''")
+    );
+    let keyset_keys: Vec<String> = src
+        .query_scalar(&keyset_sql)?
+        .map(|s| {
+            s.split('\u{1f}')
+                .filter(|c| !c.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Single-column integer PK → range chunking. Its own probe (the keyset list
+    // above doesn't carry the type, and range-chunk eligibility needs it).
     let mut single_int_pk = None;
-    let mut keyset_keys = Vec::new();
     if let Some(pk_col) = src.query_scalar(&pk_sql)? {
-        // A single-column PK is always a usable keyset key (unique, NOT NULL).
-        keyset_keys.push(pk_col.clone());
         // The scalar query returns only the column name; re-probe the type to
         // decide range-chunk eligibility.
         let type_sql = format!(
