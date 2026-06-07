@@ -58,6 +58,25 @@ impl BuiltQuery {
 ///   [`IncrementalCursorPlan::RIVET_COALESCE_CURSOR_COL`] column, filters and orders
 ///   by `COALESCE(primary, fallback)`. The outer `ORDER BY` ensures the final Arrow
 ///   batch carries the maximum coalesced value so cursor advance stays monotonic.
+///
+/// # Boundary semantics — strict `>` and the tie hazard
+///
+/// Both modes resume with **strict `>`** (`WHERE <cursor> > <last>`), where
+/// `<last>` is the maximum cursor value of the previous run. Unlike
+/// [`build_keyset_query`] — whose key the planner *enforces* to be unique and
+/// NOT NULL, making `>` provably lossless — the incremental cursor column has
+/// **no uniqueness guarantee**. If two rows share the high-watermark value and
+/// the second one becomes visible only *after* the run that advanced the
+/// watermark past it (a low-resolution cursor like a second-granularity
+/// `updated_at`, or rows committed at the same timestamp after the read
+/// snapshot), the next run's `> <last>` **silently skips** them — those rows
+/// are never exported.
+///
+/// `>` is the deliberate choice: `>=` would instead re-export the boundary row
+/// on *every* run (guaranteed duplicates). The safe configuration is a
+/// **strictly-monotonic, per-row-distinct** cursor (a sequence/identity id, or
+/// a timestamp with sub-value uniqueness). When the cursor can tie, prefer a
+/// chunked/full re-snapshot for the affected window. See `docs/semantics.md`.
 pub(crate) fn build_incremental_query(
     base_query: &str,
     incremental: Option<&IncrementalCursorPlan>,
