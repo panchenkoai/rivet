@@ -35,7 +35,25 @@ fn main() {
     // operator set RUST_LOG=warn.  Showing warns by default makes
     // these guardrails visible without changing anything for
     // operators that already override RUST_LOG.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    // Credential-redaction invariant (ADR-0014): the redact module names "logs"
+    // in its scope, but the `log::*` macros do not pass through the artifact-path
+    // redaction wired at the error/summary call sites — a `log::warn!("…{e}", e)`
+    // that captured a `scheme://user:password@host` connect error would print the
+    // password to stderr (and `main` defaults the filter to `warn`, so these
+    // lines are shown). Route every formatted line through `redacted_log_line` so
+    // the sink itself is the chokepoint: no call site has to remember.
+    use std::io::Write;
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .format(|buf, record| {
+            let line = redact::redacted_log_line(
+                &buf.timestamp().to_string(),
+                record.level().as_str(),
+                record.target(),
+                &record.args().to_string(),
+            );
+            writeln!(buf, "{line}")
+        })
+        .init();
     let cli = cli::Cli::parse();
     let json_errors = cli.json_errors;
     if let Err(e) = cli::dispatch(cli) {
