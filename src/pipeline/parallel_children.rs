@@ -345,3 +345,91 @@ fn render_child_stderr(
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_export(name: &str) -> crate::config::ExportConfig {
+        let yaml = format!(
+            "name: {name}\nquery: \"SELECT 1\"\nformat: parquet\ndestination:\n  type: local\n  path: /tmp\n"
+        );
+        serde_yaml_ng::from_str(&yaml).expect("parse test ExportConfig")
+    }
+
+    #[test]
+    fn empty_buffers_returns_empty_string() {
+        let exp = make_export("orders");
+        let exports = vec![&exp];
+        let out = render_child_stderr(&exports, &HashMap::new(), &HashMap::new());
+        assert!(out.is_empty(), "no stderr → empty output, got: {out:?}");
+    }
+
+    #[test]
+    fn single_export_with_stderr_lines_rendered() {
+        let exp = make_export("orders");
+        let exports = vec![&exp];
+        let mut buffers = HashMap::new();
+        buffers.insert(
+            "orders".to_string(),
+            vec!["INFO starting".to_string(), "WARN slow query".to_string()],
+        );
+        let out = render_child_stderr(&exports, &buffers, &HashMap::new());
+        assert!(out.contains("── orders ──"), "should have header: {out}");
+        assert!(out.contains("INFO starting"), "should have line 1: {out}");
+        assert!(out.contains("WARN slow query"), "should have line 2: {out}");
+        assert!(out.contains("| "), "lines prefixed with |: {out}");
+    }
+
+    #[test]
+    fn truncated_count_appended() {
+        let exp = make_export("payments");
+        let exports = vec![&exp];
+        let mut buffers = HashMap::new();
+        buffers.insert("payments".to_string(), vec!["some line".to_string()]);
+        let mut truncated = HashMap::new();
+        truncated.insert("payments".to_string(), 42usize);
+        let out = render_child_stderr(&exports, &buffers, &truncated);
+        assert!(
+            out.contains("42 more line(s) dropped"),
+            "truncation note: {out}"
+        );
+    }
+
+    #[test]
+    fn export_not_in_buffers_is_skipped() {
+        let exp = make_export("users");
+        let exports = vec![&exp];
+        // buffers has a *different* export
+        let mut buffers = HashMap::new();
+        buffers.insert("other".to_string(), vec!["line".to_string()]);
+        let out = render_child_stderr(&exports, &buffers, &HashMap::new());
+        // "users" has no entry → no output (other is not in exports list)
+        assert!(out.is_empty(), "unrelated export not rendered: {out:?}");
+    }
+
+    #[test]
+    fn multiple_exports_ordering_matches_exports_slice() {
+        let exp_a = make_export("alpha");
+        let exp_b = make_export("beta");
+        let exports = vec![&exp_a, &exp_b];
+        let mut buffers = HashMap::new();
+        buffers.insert("alpha".to_string(), vec!["line_a".to_string()]);
+        buffers.insert("beta".to_string(), vec!["line_b".to_string()]);
+        let out = render_child_stderr(&exports, &buffers, &HashMap::new());
+        let pos_a = out.find("alpha").expect("alpha in output");
+        let pos_b = out.find("beta").expect("beta in output");
+        assert!(pos_a < pos_b, "alpha rendered before beta");
+    }
+
+    #[test]
+    fn export_with_empty_lines_vec_not_rendered() {
+        let exp = make_export("events");
+        let exports = vec![&exp];
+        let mut buffers = HashMap::new();
+        // Export has an entry but it's empty.
+        buffers.insert("events".to_string(), vec![]);
+        let out = render_child_stderr(&exports, &buffers, &HashMap::new());
+        assert!(out.is_empty(), "empty lines vec → no output: {out:?}");
+    }
+}

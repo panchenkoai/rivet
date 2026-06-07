@@ -361,6 +361,27 @@ mod tests {
         assert!(result.starts_with("3.14"), "got: {result}");
     }
 
+    // Characterization: float NaN/±Infinity are IEEE-754 values a float column
+    // can legitimately hold (unlike `decimal`, whose Arrow `Decimal128` has no
+    // NaN bit pattern — see the NUMERIC NaN/infinity reject in
+    // `postgres::arrow_convert::build_array`). They are preserved natively in
+    // Parquet; in CSV we emit the Rust float literal (`NaN` / `inf` / `-inf`)
+    // rather than an empty cell, because writing empty would silently conflate
+    // a real NaN/Inf with NULL — corruption — whereas a recognizable literal
+    // round-trips into every major loader's float parser. This pins that
+    // contract so a future arrow/std change can't silently alter it. The CSV
+    // literal is documented in docs/type-mapping.md.
+    #[test]
+    fn float_special_values_emit_literals_not_empty() {
+        assert_eq!(cell(Float64Array::from(vec![f64::NAN]), 0), "NaN");
+        assert_eq!(cell(Float64Array::from(vec![f64::INFINITY]), 0), "inf");
+        assert_eq!(cell(Float64Array::from(vec![f64::NEG_INFINITY]), 0), "-inf");
+        assert_eq!(cell(Float32Array::from(vec![f32::NAN]), 0), "NaN");
+        assert_eq!(cell(Float32Array::from(vec![f32::INFINITY]), 0), "inf");
+        // -0.0 keeps its sign (a real IEEE-754 distinction), never becomes "0".
+        assert_eq!(cell(Float64Array::from(vec![-0.0f64]), 0), "-0");
+    }
+
     // ── string escaping ──────────────────────────────────────────────────────
 
     #[test]

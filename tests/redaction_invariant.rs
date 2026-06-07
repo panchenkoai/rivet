@@ -15,7 +15,7 @@
 //!   `redact_error` at a downstream site can never corrupt an
 //!   upstream-redacted message.
 
-use rivet::redact::{redact_error, redact_secrets, redact_url_passwords};
+use rivet::redact::{redact_error, redact_secrets, redact_url_passwords, redacted_log_line};
 
 /// Magic marker stand-in for a real password.  Any test that finds this
 /// string in a redacted artifact is a leak.
@@ -37,6 +37,30 @@ fn redact_error_strips_password_from_anyhow() {
     let out = redact_error(&e);
     assert!(!out.contains(SECRET_MARKER));
     assert!(out.contains("mysql://REDACTED@10.0.0.5"));
+}
+
+/// The log **sink** is the chokepoint: `main`'s `env_logger` formatter routes
+/// every record through `redacted_log_line`, so a `log::warn!("…{e}", e)` that
+/// captured a credential-bearing connect error (the `pipeline::job` reconcile
+/// path, the `preflight` probes) cannot print the password to stderr — even
+/// though those call sites pass the raw error, not `redact_error(&e)`. This is
+/// the gap the artifact-path tests above did not cover.
+#[test]
+fn log_sink_formatter_redacts_embedded_url_password() {
+    let msg = format!(
+        "reconcile: could not connect: postgresql://svc:{SECRET_MARKER}@10.0.0.9:5432/orders"
+    );
+    let line = redacted_log_line("2026-06-07T00:00:00Z", "WARN", "rivet::pipeline::job", &msg);
+    assert!(
+        !line.contains(SECRET_MARKER),
+        "log sink leaked credential: {line}"
+    );
+    assert!(line.contains("postgresql://REDACTED@10.0.0.9"), "{line}");
+    // Format is preserved so operator triage context survives redaction.
+    assert!(
+        line.contains("WARN") && line.contains("rivet::pipeline::job"),
+        "{line}"
+    );
 }
 
 #[test]

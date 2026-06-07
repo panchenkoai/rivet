@@ -8,7 +8,7 @@
 use arrow::array::Array;
 use arrow::array::{
     Date32Array, FixedSizeBinaryArray, Float64Array, Int16Array, Int32Array, Int64Array,
-    StringArray, TimestampMicrosecondArray,
+    StringArray, TimestampMicrosecondArray, TimestampNanosecondArray,
 };
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -76,10 +76,24 @@ pub(crate) fn extract_last_cursor_value(
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()?
                 .value(last_row);
-            let secs = micros / 1_000_000;
-            let nsecs = ((micros % 1_000_000) * 1_000) as u32;
+            let secs = micros.div_euclid(1_000_000);
+            let nsecs = (micros.rem_euclid(1_000_000) * 1_000) as u32;
             let dt = chrono::DateTime::from_timestamp(secs, nsecs)?;
             Some(dt.format("%Y-%m-%dT%H:%M:%S%.6f").to_string())
+        }
+        // Nanosecond timestamps (the `timestamp_ns` override). Format with 9
+        // fractional digits so the cursor literal carries the full precision the
+        // column holds — otherwise an incremental resume would compare a
+        // microsecond-truncated value and re-emit the boundary row.
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            let nanos = array
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()?
+                .value(last_row);
+            let secs = nanos.div_euclid(1_000_000_000);
+            let nsecs = nanos.rem_euclid(1_000_000_000) as u32;
+            let dt = chrono::DateTime::from_timestamp(secs, nsecs)?;
+            Some(dt.format("%Y-%m-%dT%H:%M:%S%.9f").to_string())
         }
         DataType::Date32 => {
             let days = array
@@ -237,6 +251,31 @@ mod tests {
         assert!(
             val.starts_with("2023-11-14T22:13:20"),
             "unexpected ts: {val}"
+        );
+    }
+
+    #[test]
+    fn cursor_timestamp_nanosecond_keeps_full_precision() {
+        // datetime2(7) → `timestamp_ns` override: the cursor literal must carry
+        // all 9 fractional digits, or an incremental resume would compare a
+        // truncated value and re-emit the boundary row.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        )]));
+        // 2023-11-14T22:13:20.123456700 — the trailing 100 ns tick is exactly
+        // what microsecond precision would drop.
+        let nanos = 1_700_000_000_123_456_700i64;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(TimestampNanosecondArray::from(vec![nanos]))],
+        )
+        .unwrap();
+        let val = extract_last_cursor_value(&batch, "ts", &schema).unwrap();
+        assert_eq!(
+            val, "2023-11-14T22:13:20.123456700",
+            "ns precision lost: {val}"
         );
     }
 

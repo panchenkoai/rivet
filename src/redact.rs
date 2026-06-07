@@ -149,6 +149,22 @@ pub fn redact_error(e: &anyhow::Error) -> String {
     redact_secrets(&format!("{e:#}"))
 }
 
+/// Render one log record into a redacted, operator-visible line.
+///
+/// The module scope names **logs** as a redaction target, but the `log::*`
+/// macros bypass the artifact-path redaction that is wired by hand at the
+/// error/summary call sites — a `log::warn!("…{e}", e)` whose `e` captured a
+/// `scheme://user:password@host` connect error would otherwise print the
+/// password to stderr. `main`'s `env_logger` formatter delegates here so the
+/// log **sink** itself is the chokepoint: every line, present and future,
+/// passes through [`redact_secrets`] with no reliance on each call site
+/// remembering to redact. Kept in this module (beside the other redactors) and
+/// log-crate-agnostic (`level` is a pre-rendered `&str`) so the wiring is
+/// unit-testable without capturing global stderr.
+pub fn redacted_log_line(timestamp: &str, level: &str, target: &str, message: &str) -> String {
+    redact_secrets(&format!("[{timestamp} {level} {target}] {message}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

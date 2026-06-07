@@ -16,7 +16,7 @@ use std::sync::Arc;
 use arrow::array::{
     ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder,
     FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder,
-    Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
+    Int64Builder, StringBuilder, TimestampMicrosecondBuilder, TimestampNanosecondBuilder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use chrono::{NaiveDate, NaiveDateTime, Timelike};
@@ -288,6 +288,31 @@ fn build_array(target: &DataType, idx: usize, rows: &[Row]) -> Result<ArrayRef> 
             for (r, row) in rows.iter().enumerate() {
                 match row.try_get::<NaiveDateTime, _>(idx) {
                     Ok(Some(dt)) => b.append_value(dt.and_utc().timestamp_micros()),
+                    Ok(None) => b.append_null(),
+                    Err(e) => anyhow::bail!("mssql datetime column {idx} row {r}: {e}"),
+                }
+            }
+            let arr = b.finish();
+            return Ok(match tz {
+                Some(tz) => Arc::new(arr.with_timezone(tz.clone())),
+                None => Arc::new(arr),
+            });
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
+            // Opt-in via a `timestamp_ns` / `timestamp_tz_ns` column override —
+            // preserves `datetime2(7)`'s 100 ns tick that the default microsecond
+            // mapping truncates. Arrow nanosecond timestamps are i64 ns, so the
+            // representable range is 1677-09-21 .. 2262-04-11; a value outside
+            // that cannot be encoded and is exported as NULL (the documented
+            // range caveat of the override — the default `timestamp` keeps full
+            // range at microsecond precision).
+            let mut b = TimestampNanosecondBuilder::with_capacity(rows.len());
+            for (r, row) in rows.iter().enumerate() {
+                match row.try_get::<NaiveDateTime, _>(idx) {
+                    Ok(Some(dt)) => match dt.and_utc().timestamp_nanos_opt() {
+                        Some(ns) => b.append_value(ns),
+                        None => b.append_null(),
+                    },
                     Ok(None) => b.append_null(),
                     Err(e) => anyhow::bail!("mssql datetime column {idx} row {r}: {e}"),
                 }
