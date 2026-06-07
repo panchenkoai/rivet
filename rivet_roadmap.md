@@ -580,16 +580,30 @@ roadmap-write time; file paths resolved, line refs current):**
       gated OUT** — small index-backed pages close the gap; the upstream-crate
       cursor cost is not justified.
 - [ ] **A1 (implementation) — decouple the per-statement page from the
-      chunk/file.** The asymmetry: PG bounds the `FETCH N` page by
-      `work_mem × 0.7` while the chunk/file stays large; MySQL/MSSQL tie
-      `page = chunk_size = file`, so one `WHERE id BETWEEN x AND y` statement
-      streams the whole chunk and stays "Sending data" for its full duration
-      (`src/source/mysql/mod.rs:391` `exec_iter`). Sub-page a range chunk via
-      keyset (`WHERE id > last AND id <= chunk_max ORDER BY id LIMIT page`,
-      `page` memory-derived) accumulating into the same part file — so the DBA
-      sees a series of ~0.5 s statements, not one 3–9 s statement. Touches the
-      chunk runner (pass key + bounds + page) and `mysql_run_export` /
-      `mssql::export` (loop instead of single `exec_iter`).
+      chunk/file, OPT-IN (measured tradeoff).** The asymmetry: PG bounds the
+      `FETCH N` page by `work_mem × 0.7` while the chunk/file stays large;
+      MySQL/MSSQL tie `page = chunk_size = file`, so one `WHERE id BETWEEN x AND y`
+      statement streams the whole chunk and stays "Sending data" for its full
+      duration (`src/source/mysql/mod.rs:391` `exec_iter`). Sub-page a range
+      chunk via keyset (`WHERE id > last ORDER BY id LIMIT page`) accumulating
+      into the same part file — the DBA sees ~0.5 s statements, not one 3–9 s.
+
+      **Measured tradeoff (2026-06-07, content_items, same 100k rows):**
+
+      | | total wall | statements | longest stmt |
+      |---|---|---|---|
+      | one 100k `BETWEEN` (today) | 3.40 s | 1 | 3.40 s |
+      | 10× 10k keyset pages | **4.25 s (+25%)** | 10 (×10 QPS) | **0.40 s (÷8.5)** |
+
+      So sub-paging is **not free**: it costs ~25% throughput + 10× query count
+      (each page re-seeks the index — PG's server-side cursor avoids this, which
+      is what Phase D would buy and why it's only *gated*, not deleted). It must
+      therefore be **opt-in / tunable**, not a forced default: a
+      `statement_page_rows` (or `statement_target_s`) knob, default OFF (= one
+      query per chunk, today's throughput). Throughput users pay nothing; users
+      who fear `statement_timeout` / long lock-holding opt in. Touches the chunk
+      runner (pass key + bounds + page) and `mysql_run_export` / `mssql::export`
+      (loop instead of single `exec_iter`).
 - [ ] **A2. MSSQL keyset on composite / unique-index keys (parity with PG).**
       Port the key-selection logic from `src/source/postgres/mod.rs:314-340`
       (which discovers every single-column unique NOT NULL index as a keyset
