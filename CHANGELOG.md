@@ -82,6 +82,11 @@
   drops declared precision), `real`/`float`, `money`, `date`, `time`,
   `datetime2`, `nvarchar`/`varchar`/`char`, `varbinary`, and `uniqueidentifier`
   → native Parquet `LogicalType::Uuid`. Unmapped types fail loud.
+- **`test(mssql)`** — `bigquery_validates_mssql_type_matrix_parquet`: the SQL
+  Server type matrix now also round-trips through live BigQuery (autoload types
+  + microsecond TIME/TIMESTAMP, `uniqueidentifier`→BYTES, decimal sums), joining
+  the PG/MySQL BigQuery validators. All three matrices now pass through every
+  oracle (DuckDB, ClickHouse, BigQuery).
 - **`test(mssql)`** — `{duckdb,clickhouse}_validates_mssql_type_matrix_parquet`
   added to the type-roundtrip harness, the same oracle pattern as PG/MySQL; CI
   `test-type-validators` provisions and seeds the `mssql` service.
