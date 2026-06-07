@@ -1,6 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.9.2 (2026-06-07) — SQL Server engine maturity + shared batch controller
+
+> The SQL Server source grows up: the export **streams** (peak RSS bounded by
+> `batch_size`, not the chunk — `mode: full` on a 2 M-row heavy table went from a
+> ~10 GB OOM to 1 file at 171 MB), **detects connection poolers / the Azure SQL
+> gateway**, honours `lock_timeout` / `statement_timeout` / `throttle_ms`, and is
+> covered by full live parity suites (resume / chunked-recovery / crash-recovery
+> / reconcile-repair) plus a type matrix round-tripped through DuckDB, ClickHouse
+> **and** live BigQuery. Internally, the probe → memory-cap → adaptive → throttle
+> batch policy that was triplicated across the PG / MySQL / MSSQL export loops is
+> now one unit-tested `AdaptiveBatchController` — PG/MySQL fully revalidated, no
+> behaviour change.
 
 ### SQL Server — streaming export + pooler detection + parity test suites
 
