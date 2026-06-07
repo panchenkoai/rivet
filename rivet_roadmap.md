@@ -562,13 +562,34 @@ roadmap-write time; file paths resolved, line refs current):**
 
 ### Phase A — measure-first, highest leverage (P0)
 
-- [ ] **A1. Shrink MySQL/MSSQL keyset page to PG-equivalent statement time.**
-      The 9s MySQL longest-query is an oversized keyset page/chunk, not the
-      absence of a cursor. Tune the keyset page size (`src/source/mysql/mod.rs`
-      keyset driver + `src/source/query.rs::page_limit_clause` / `pipeline/chunked/`)
-      so one SQL statement runs ~0.2–0.5s, matching PG `FETCH N`. Re-run the
-      `content_items` bench. **This experiment gates Phase D** — if it closes
-      the gap, the MySQL cursor work is not needed.
+- [x] **A1 (measurement) — DONE 2026-06-07. The gating experiment is
+      conclusive: the long MySQL query is the oversized page, not the missing
+      cursor.** On live MySQL `content_items` (524 288 wide rows, ~3.9 KB/row),
+      wall time of one chunk statement `SELECT * … WHERE id BETWEEN 1 AND N`:
+
+      | page (rows) | one statement (wall) |
+      |---|---|
+      | 1 000 | 0.44 s |
+      | 10 000 | **0.56 s** |
+      | 100 000 (`default_chunk_size`) | **3.15 s** (1.36 s server + ~1.8 s transfer) |
+
+      Per-statement time scales with `rows × row_width`, independent of table
+      size (each chunk statement touches only `chunk_size` rows). At the bench's
+      wider ~12 KB rows the 100 k page is the README's ~9 s; a ~10 k page lands
+      at PG `FETCH N` levels (~0.5 s). **→ Phase D (MySQL server-side cursor) is
+      gated OUT** — small index-backed pages close the gap; the upstream-crate
+      cursor cost is not justified.
+- [ ] **A1 (implementation) — decouple the per-statement page from the
+      chunk/file.** The asymmetry: PG bounds the `FETCH N` page by
+      `work_mem × 0.7` while the chunk/file stays large; MySQL/MSSQL tie
+      `page = chunk_size = file`, so one `WHERE id BETWEEN x AND y` statement
+      streams the whole chunk and stays "Sending data" for its full duration
+      (`src/source/mysql/mod.rs:391` `exec_iter`). Sub-page a range chunk via
+      keyset (`WHERE id > last AND id <= chunk_max ORDER BY id LIMIT page`,
+      `page` memory-derived) accumulating into the same part file — so the DBA
+      sees a series of ~0.5 s statements, not one 3–9 s statement. Touches the
+      chunk runner (pass key + bounds + page) and `mysql_run_export` /
+      `mssql::export` (loop instead of single `exec_iter`).
 - [ ] **A2. MSSQL keyset on composite / unique-index keys (parity with PG).**
       Port the key-selection logic from `src/source/postgres/mod.rs:314-340`
       (which discovers every single-column unique NOT NULL index as a keyset
