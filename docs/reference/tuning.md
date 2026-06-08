@@ -141,6 +141,49 @@ tuning:
 
 Rivet samples the first batch to estimate row size, then adjusts subsequent batches. Cannot be used together with `batch_size`.
 
+## Choosing `chunk_size` (and bounding statement duration)
+
+`chunk_size` is a different lever from `batch_size`. `batch_size` is internal —
+how many rows Rivet buffers in Arrow memory at a time (RSS only). `chunk_size`
+is the unit of **work and output**: in chunked mode it is the size of one
+`WHERE key BETWEEN …` (or keyset `… LIMIT n`) window, which is **one SQL
+statement** and **one output part file**.
+
+That makes `chunk_size` the knob for the **longest single query** the source
+sees — the thing a DBA's `statement_timeout`, long-running-query alert, or
+lock-duration monitor reacts to. On a wide table, one chunk statement transfers
+`chunk_size × row_width` bytes and stays active on the server for that whole
+duration. Measured on MySQL `content_items` (wide ~4 KB rows; one chunk
+statement, wall):
+
+| `chunk_size` | one chunk statement | output files (for 1 M rows) |
+|---|---|---|
+| 1,000 | ~0.4 s | 1,000 small files |
+| 10,000 | ~0.6 s | 100 files |
+| 100,000 (default) | ~3.4 s (≈9 s at ~12 KB rows) | 10 large files |
+
+**If a strict `statement_timeout` on the source trips your chunk queries, or you
+want to keep each read short and gentle on a busy OLTP source, lower
+`chunk_size`** (e.g. `chunk_size: 10000`):
+
+```yaml
+exports:
+  - name: orders
+    mode: chunked
+    chunk_column: id
+    chunk_size: 10000     # ~0.5 s per statement instead of ~3-9 s
+```
+
+The trade-off is more, smaller part files and a small (~25%) increase in total
+wall time (more index seeks / round-trips for the same rows). It is **not** a
+throughput win — it trades total speed and query count for shorter individual
+statements. Pick the point that fits your source's tolerance.
+
+> **PostgreSQL** is unaffected: it streams each chunk through a server-side
+> cursor (`DECLARE … FETCH N`, `N` capped by `work_mem`), so its per-statement
+> work is already bounded regardless of `chunk_size`. The lever above matters
+> for **MySQL / SQL Server**, which run one statement per chunk.
+
 ## Adaptive concurrency governor
 
 In **chunked mode with `parallel > 1`**, setting `adaptive: true` arms a governor that adjusts how many chunk workers (and therefore source connections) run concurrently, in response to source write-pressure. It backs parallelism down when the source is under load and recovers it when the load eases, staying within `[min_parallel, parallel]`.

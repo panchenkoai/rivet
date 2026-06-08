@@ -579,31 +579,31 @@ roadmap-write time; file paths resolved, line refs current):**
       at PG `FETCH N` levels (~0.5 s). **→ Phase D (MySQL server-side cursor) is
       gated OUT** — small index-backed pages close the gap; the upstream-crate
       cursor cost is not justified.
-- [ ] **A1 (implementation) — decouple the per-statement page from the
-      chunk/file, OPT-IN (measured tradeoff).** The asymmetry: PG bounds the
-      `FETCH N` page by `work_mem × 0.7` while the chunk/file stays large;
-      MySQL/MSSQL tie `page = chunk_size = file`, so one `WHERE id BETWEEN x AND y`
-      statement streams the whole chunk and stays "Sending data" for its full
-      duration (`src/source/mysql/mod.rs:391` `exec_iter`). Sub-page a range
-      chunk via keyset (`WHERE id > last ORDER BY id LIMIT page`) accumulating
-      into the same part file — the DBA sees ~0.5 s statements, not one 3–9 s.
-
-      **Measured tradeoff (2026-06-07, content_items, same 100k rows):**
+- [x] **A1 (implementation) — WON'T BUILD (2026-06-07). The existing
+      `chunk_size` knob already is the lever; sub-paging would only regress.**
+      The idea was to sub-page a range chunk via keyset
+      (`WHERE id > last ORDER BY id LIMIT page`) into the same part file so the
+      DBA sees ~0.5 s statements, not one 3–9 s. Measured, it is **not free**:
 
       | | total wall | statements | longest stmt |
       |---|---|---|---|
       | one 100k `BETWEEN` (today) | 3.40 s | 1 | 3.40 s |
-      | 10× 10k keyset pages | **4.25 s (+25%)** | 10 (×10 QPS) | **0.40 s (÷8.5)** |
+      | 10× 10k keyset pages | **4.25 s (+25%)** | 10 (**×10 QPS**) | **0.40 s (÷8.5)** |
 
-      So sub-paging is **not free**: it costs ~25% throughput + 10× query count
-      (each page re-seeks the index — PG's server-side cursor avoids this, which
-      is what Phase D would buy and why it's only *gated*, not deleted). It must
-      therefore be **opt-in / tunable**, not a forced default: a
-      `statement_page_rows` (or `statement_target_s`) knob, default OFF (= one
-      query per chunk, today's throughput). Throughput users pay nothing; users
-      who fear `statement_timeout` / long lock-holding opt in. Touches the chunk
-      runner (pass key + bounds + page) and `mysql_run_export` / `mssql::export`
-      (loop instead of single `exec_iter`).
+      So it trades ~25% throughput + 10× query count for shorter statements —
+      it *shifts* DBA-harm from duration to QPS rather than removing it (10× the
+      queries can load a busy source *more*). A free version needs a real
+      server-side cursor (no re-seek) = the gated-out Phase D.
+
+      **The decisive point: `chunk_size` already does this today.** A user whose
+      chunk query trips a `statement_timeout` sets `chunk_size: 10000` →
+      ~0.5 s statements, no new code. Sub-paging's *only* unique addition over
+      that is keeping large output files while shortening the query — a niche
+      "short query **and** large files" combination most users don't need.
+      Resolution: don't build the `statement_page_rows` knob; document
+      `chunk_size` as the statement-duration lever
+      ([`reference/tuning.md` → Choosing `chunk_size`](docs/reference/tuning.md)).
+      Revisit only if a real user hits the niche case.
 - [ ] **A2. MSSQL keyset on composite / unique-index keys (parity with PG).**
       Port the key-selection logic from `src/source/postgres/mod.rs:314-340`
       (which discovers every single-column unique NOT NULL index as a keyset
@@ -666,9 +666,18 @@ roadmap-write time; file paths resolved, line refs current):**
 (Auto-parallel) feed into this; the former Phase B "COM_STMT_FETCH" becomes
 Epic 18 Phase D, now explicitly gated on the Phase A measurement.
 
-**Exit criteria:** MySQL and MSSQL longest-single-query within ~2× of PG on
-the `content_items` bench at defaults; no session-state leak behind a pooler
-(B1/B2 tested); MSSQL keyset coverage matches PG's index eligibility rules.
+**Exit criteria (revised after the A1 measurement):**
+- **Longest-single-query** — *resolved by tuning, not by a new default.* At
+  defaults MySQL/MSSQL run one statement per chunk, so the gap vs PG's cursor is
+  inherent; closing it "at defaults" would need either the sub-paging regression
+  (A1-impl, won't-build) or the gated Phase D cursor. Instead `chunk_size` is
+  documented as the statement-duration lever (`reference/tuning.md`): a user
+  under a strict `statement_timeout` sets `chunk_size: 10000` for ~0.5 s
+  statements. ✅
+- **No session-state leak behind a pooler** — B1 (MySQL RAII guard) + B2 (MSSQL
+  `Drop` reset) shipped and live-validated. ✅
+- **MSSQL keyset coverage matches PG's index eligibility** — A2 shipped: every
+  single-column unique NOT NULL index, not just the PK. ✅
 
 ---
 
