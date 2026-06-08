@@ -665,14 +665,45 @@ roadmap-write time; file paths resolved, line refs current):**
       dropped the now-unused per-database `MssqlSource::database` field.
       Live-validated via an adaptive export.
 
-### Phase D — MySQL server-side cursor (P3, gated on A1)
+### Phase D — MySQL server-side cursor (P3) — WON'T BUILD, now with proof on both axes
 
-- [ ] **D1.** Only if A1 leaves a material longest-query gap. `mysql` crate v28
-      does not expose `CURSOR_TYPE_READ_ONLY` (`COM_STMT_EXECUTE` flag `0x01`
-      + `COM_STMT_FETCH`). Upstream PR exposing `CursorType` on
-      `StatementParams`; vendor until merged. **Do not start without an
-      A1-measured justification** — high cost (upstream dependency), possibly
-      marginal delta over small index-backed keyset pages.
+- [x] **D1. CLOSED 2026-06-08 — proven expensive AND measured ineffective.**
+      Two separate kills, each verified rather than asserted:
+
+      **Cost — proven by reading the client code.** `mysql_common 0.37.2`
+      hardcodes the cursor flag at the *type* level:
+      `flags: Const::new(CursorType::CURSOR_TYPE_NO_CURSOR)`
+      (`packets/mod.rs:2696`) — no runtime setter — and the `mysql 28.0` crate's
+      `write_command` / raw-packet APIs are private (no escape hatch). Neither
+      `mysql_async` (same `mysql_common`) nor `sqlx` exposes a read-only cursor
+      either. So a Rust cursor requires forking `mysql_common` + patching the
+      `mysql` crate's exec/FETCH state machine — a real, ongoing fork cost.
+
+      **Efficacy — MEASURED (an earlier *asserted* claim, now proven).** A
+      standalone `libmysqlclient` probe
+      ([`dev/spikes/mysql_cursor_efficacy.c`](dev/spikes/mysql_cursor_efficacy.c))
+      opened a real `CURSOR_TYPE_READ_ONLY` cursor on a chunk-shaped `BETWEEN`
+      query and timed the open:
+
+      | | result |
+      |---|---|
+      | cursor OPEN time (3 runs) | 0.78–1.82 s — **the longest single statement** |
+      | `Created_tmp_tables` delta at open | **3, every run** |
+      | fetches after open | cheap (~0.15 s / 10k) |
+
+      So MySQL's read-only cursor **materialises the whole result into temp
+      tables at open**, then fetches cheaply — the *opposite* of PG's streaming
+      `FETCH N` (which pulls incrementally from a live scan, no temp table). The
+      cursor therefore does **not** shorten the longest statement: it moves the
+      cost into a long materialising open **and** adds tempdb pressure the
+      keyset / `chunk_size` path never causes. Even after paying the fork, D
+      would be a **regression** vs the free `chunk_size` lever (~0.5 s pages, no
+      temp tables).
+
+      > Honesty note: the materialisation behaviour was first stated from
+      > recollection (not in the client code we read) and overstated as fact;
+      > it is now backed by the measurement above. Phase D stays closed on
+      > **proven** grounds, not a hunch.
 
 ---
 

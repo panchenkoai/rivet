@@ -183,6 +183,16 @@ statements. Pick the point that fits your source's tolerance.
 > cursor (`DECLARE … FETCH N`, `N` capped by `work_mem`), so its per-statement
 > work is already bounded regardless of `chunk_size`. The lever above matters
 > for **MySQL / SQL Server**, which run one statement per chunk.
+>
+> Why not give MySQL the same server-side cursor? Because its read-only cursor
+> works differently: it **materialises the whole result into temp tables when
+> the cursor opens**, then fetches cheaply — the open itself is the long
+> statement, and it adds tempdb pressure. Measured directly with a
+> `libmysqlclient` probe: cursor-open 0.8–1.8 s and 3 temp tables created, every
+> run (`dev/spikes/mysql_cursor_efficacy.c`). So a MySQL cursor would be *worse*
+> than just lowering `chunk_size` (short pages, no temp tables). Lowering
+> `chunk_size` is the right lever; there is no free server-cursor shortcut on
+> MySQL.
 
 ## Adaptive concurrency governor
 
