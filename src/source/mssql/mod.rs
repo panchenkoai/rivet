@@ -49,10 +49,40 @@ type MssqlClient = Client<Compat<TcpStream>>;
 pub struct MssqlSource {
     rt: Runtime,
     client: MssqlClient,
-    /// Connection database — the instance pressure proxy keys on it.
-    database: String,
     /// Pooler/gateway classification, sampled once at connect time.
     proxy_kind: MssqlProxyKind,
+    /// Whether the export issued `SET LOCK_TIMEOUT` on this connection, so the
+    /// `Drop` teardown knows to reset it (Epic 18 B2 — pooler-safe session).
+    lock_timeout_applied: bool,
+}
+
+impl Drop for MssqlSource {
+    /// Pooler-safe session teardown (Epic 18 B2). rivet never opens a
+    /// transaction on this connection — every read is an autocommit `SELECT`,
+    /// so there is no transaction to leave dangling across the `block_on`
+    /// bridge (ADR-0011). The only session state the export mutates is
+    /// `SET LOCK_TIMEOUT`; reset it to the SQL Server default (`-1`, wait
+    /// indefinitely) before the connection closes so a *multiplexed* pooler
+    /// that keeps the backend connection alive cannot hand our non-default
+    /// `LOCK_TIMEOUT` to the next session that reuses it.
+    ///
+    /// Best-effort and time-boxed: after a failed read the stream is
+    /// half-drained and the connection is dying anyway, so the reset (and the
+    /// physical connection) just goes away; the 2 s cap guarantees `Drop`
+    /// can never hang on a wedged connection.
+    fn drop(&mut self) {
+        if !self.lock_timeout_applied {
+            return;
+        }
+        let Self { rt, client, .. } = self;
+        let _ = rt.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client.execute("SET LOCK_TIMEOUT -1", &[]),
+            )
+            .await
+        });
+    }
 }
 
 /// Parsed `sqlserver://user[:password]@host[:port]/db` connection parts.
@@ -147,8 +177,8 @@ impl MssqlSource {
         let mut src = Self {
             rt,
             client,
-            database: parts.database,
             proxy_kind: MssqlProxyKind::Direct,
+            lock_timeout_applied: false,
         };
         // Health round-trip — surfaces auth/permission errors at connect time
         // (doctor relies on this).
@@ -202,6 +232,12 @@ impl Source for MssqlSource {
         let lock_timeout_ms = request.tuning.lock_timeout_s.saturating_mul(1000);
         let stmt_timeout = (request.tuning.statement_timeout_s > 0)
             .then(|| std::time::Duration::from_secs(request.tuning.statement_timeout_s));
+
+        // Record that we are about to mutate session state so `Drop` resets it
+        // (Epic 18 B2). Set before the disjoint-borrow destructure below.
+        if lock_timeout_ms > 0 {
+            self.lock_timeout_applied = true;
+        }
 
         let Self { rt, client, .. } = self;
         rt.block_on(async {
@@ -336,22 +372,20 @@ impl Source for MssqlSource {
     }
 
     fn sample_pressure(&mut self) -> Option<u64> {
-        let db = self.database.clone();
         let Self { rt, client, .. } = self;
-        // `Log Flush Waits` is the SQL Server analog of MySQL `Innodb_log_waits`:
-        // a writer stalled waiting on the log = source write pressure. The
-        // `cntr_value` of a `*/sec` perfmon counter is the raw cumulative count,
-        // so it is monotonic — exactly what the governor compares deltas of.
-        let sql = "SELECT cntr_value FROM sys.dm_os_performance_counters \
-                   WHERE counter_name LIKE 'Log Flush Wait%' AND instance_name = @P1";
+        // Extraction-pressure proxy (Epic 18 C2): cumulative `Workfiles Created`
+        // + `Worktables Created` (SQLServer:Access Methods). A workfile /
+        // worktable is created when a sort or hash spills to tempdb — the SQL
+        // Server analogue of PG `temp_bytes` / MySQL `Created_tmp_disk_tables`.
+        // The `cntr_value` of these `*/sec`-named perfmon counters is the raw
+        // cumulative count, so their sum is monotonic — exactly what the governor
+        // compares deltas of. Replaces `Log Flush Waits`, which is redo-**write**
+        // pressure and barely moves during a read-only export. Instance-level
+        // (no per-database `instance_name`), so no parameter is bound.
+        let sql = "SELECT SUM(cntr_value) FROM sys.dm_os_performance_counters \
+                   WHERE counter_name IN ('Workfiles Created/sec', 'Worktables Created/sec')";
         rt.block_on(async {
-            let row = client
-                .query(sql, &[&db])
-                .await
-                .ok()?
-                .into_row()
-                .await
-                .ok()??;
+            let row = client.query(sql, &[]).await.ok()?.into_row().await.ok()??;
             row.get::<i64, _>(0).map(|v| v.max(0) as u64)
         })
     }
@@ -469,11 +503,45 @@ pub(crate) fn introspect_mssql_table_for_chunking(
         schema.replace('\'', "''"),
         table.replace('\'', "''")
     );
+    // Keyset keys (OPT-4) — parity with `postgres/mod.rs:314-340`: every
+    // single-column, NOT NULL, UNIQUE index (the PK *plus* any unique
+    // constraint/index), PK-first and de-duplicated, not just the PK. SQL
+    // Server: `sys.indexes.is_unique = 1`, exactly one key column
+    // (`ic.key_ordinal > 0` + `HAVING COUNT(*) = 1`), and the column is NOT NULL
+    // — so `ORDER BY key LIMIT n` is an index range scan and `WHERE key > last`
+    // never skips dup keys. Aggregated with a `CHAR(31)` (unit-separator)
+    // delimiter because the introspection seam only exposes `query_scalar`; that
+    // byte cannot appear in a real identifier, so the split is unambiguous.
+    let keyset_sql = format!(
+        "SELECT STRING_AGG(col, CHAR(31)) WITHIN GROUP (ORDER BY is_pk DESC, col) FROM ( \
+           SELECT col, MAX(is_pk) AS is_pk FROM ( \
+             SELECT MIN(c.name) AS col, MAX(CONVERT(int, i.is_primary_key)) AS is_pk \
+             FROM sys.indexes i \
+             JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0 \
+             JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
+             JOIN sys.objects o ON o.object_id = i.object_id \
+             JOIN sys.schemas s ON s.schema_id = o.schema_id \
+             WHERE i.is_unique = 1 AND c.is_nullable = 0 AND s.name = N'{}' AND o.name = N'{}' \
+             GROUP BY i.object_id, i.index_id HAVING COUNT(*) = 1 \
+           ) per_index GROUP BY col \
+         ) deduped",
+        schema.replace('\'', "''"),
+        table.replace('\'', "''")
+    );
+    let keyset_keys: Vec<String> = src
+        .query_scalar(&keyset_sql)?
+        .map(|s| {
+            s.split('\u{1f}')
+                .filter(|c| !c.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Single-column integer PK → range chunking. Its own probe (the keyset list
+    // above doesn't carry the type, and range-chunk eligibility needs it).
     let mut single_int_pk = None;
-    let mut keyset_keys = Vec::new();
     if let Some(pk_col) = src.query_scalar(&pk_sql)? {
-        // A single-column PK is always a usable keyset key (unique, NOT NULL).
-        keyset_keys.push(pk_col.clone());
         // The scalar query returns only the column name; re-probe the type to
         // decide range-chunk eligibility.
         let type_sql = format!(

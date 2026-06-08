@@ -3,7 +3,7 @@
 //! Module layout (mirrors `postgres/`):
 //!
 //! - `mod.rs` (this file) — `MysqlSource` struct + connect/TLS path, the
-//!   `InnoDB_log_waits` sampler, the `lean_pool_opts` / `connect_pool` /
+//!   extraction-pressure sampler, the `lean_pool_opts` / `connect_pool` /
 //!   `build_mysql_ssl_opts` helpers, `introspect_mysql_table_for_chunking`
 //!   together with the InnoDB `AVG_ROW_LENGTH` correction, the cursor-bound
 //!   `exec_iter` export loop (`mysql_run_export`), and the `Source` trait impl.
@@ -64,14 +64,33 @@ fn lean_pool_opts() -> PoolOpts {
         .with_constraints(PoolConstraints::new(1, 100).expect("valid pool constraints"))
 }
 
-/// Sample the global `Innodb_log_waits` counter — increments when InnoDB has to
-/// wait for redo-log buffer space, indicating write pressure.
-fn mysql_sample_innodb_log_waits(pool: &Pool) -> Option<u64> {
+/// Sample an **extraction-pressure** proxy (Epic 18 C1) — the MySQL analogue of
+/// PG's `temp_bytes`. Sums two monotonic global counters:
+///
+/// - `Created_tmp_disk_tables` — a query spilled an internal temp table to disk
+///   (a `GROUP BY` / `DISTINCT` / `ORDER BY` that exceeded `tmp_table_size`).
+/// - `Innodb_buffer_pool_wait_free` — InnoDB had to wait for a free buffer-pool
+///   page, i.e. the read is evicting pages under memory pressure.
+///
+/// Either moving means "my extraction is stressing the source"; their sum is
+/// monotonic, so the governor's `cur > prev` comparison works unchanged. The
+/// sum is robust to MySQL 8.0's `TempTable` engine, where a spill may not bump
+/// `Created_tmp_disk_tables` — `Innodb_buffer_pool_wait_free` carries the signal
+/// then (and `Created_tmp_disk_tables` adds it on 5.7 / MariaDB). This replaces
+/// the old `Innodb_log_waits`, which is redo-**write** pressure and barely moves
+/// during a read-only export.
+fn mysql_sample_extraction_pressure(pool: &Pool) -> Option<u64> {
     let mut conn = pool.get_conn().ok()?;
-    conn.query_first::<(String, u64), _>("SHOW GLOBAL STATUS LIKE 'Innodb_log_waits'")
-        .ok()
-        .flatten()
-        .map(|(_, v)| v)
+    let rows: Vec<(String, u64)> = conn
+        .query(
+            "SHOW GLOBAL STATUS WHERE Variable_name IN \
+             ('Created_tmp_disk_tables', 'Innodb_buffer_pool_wait_free')",
+        )
+        .ok()?;
+    if rows.is_empty() {
+        return None;
+    }
+    Some(rows.iter().map(|(_, v)| *v).sum())
 }
 
 impl MysqlSource {
@@ -368,13 +387,66 @@ fn build_mysql_ssl_opts(cfg: &TlsConfig) -> SslOpts {
     ssl
 }
 
+/// RAII reset of the per-connection session state the export mutates
+/// (`time_zone`, optionally `max_execution_time`) — the MySQL analogue of
+/// `postgres::PgTxnGuard` (Epic 18 B1).
+///
+/// MySQL hands connections back to the `mysql` crate's pool on drop, and may sit
+/// behind ProxySQL / MaxScale that reuse a physical backend across logical
+/// connections. The previous end-of-`export()` reset covered success and the
+/// `Err` return (no `?`), but **not** a panic mid-export, nor an early `?` on
+/// the `SET max_execution_time` itself (MariaDB spells it `max_statement_time`,
+/// so that SET errors — and `time_zone`, already set, would leak). Arming the
+/// reset on `Drop` closes both: whatever exit path the export takes, the
+/// connection is clean before it returns to the pool.
+struct MysqlSessionGuard<'a> {
+    conn: &'a mut mysql::PooledConn,
+    reset_max_exec: bool,
+}
+
+impl<'a> MysqlSessionGuard<'a> {
+    /// Apply the session SETs and arm the reset. `time_zone` is always set (UTC
+    /// normalisation so Parquet writes `isAdjustedToUTC=true`); the guard is
+    /// constructed *immediately* after it, so if the later `max_execution_time`
+    /// SET fails (or anything panics), `Drop` still resets `time_zone`.
+    fn apply(conn: &'a mut mysql::PooledConn, max_exec_ms: Option<u64>) -> Result<Self> {
+        conn.query_drop("SET time_zone = '+00:00'")?;
+        let mut guard = Self {
+            conn,
+            reset_max_exec: false,
+        };
+        if let Some(ms) = max_exec_ms {
+            guard
+                .conn
+                .query_drop(format!("SET SESSION max_execution_time = {ms}"))?;
+            guard.reset_max_exec = true;
+        }
+        Ok(guard)
+    }
+
+    fn conn(&mut self) -> &mut mysql::PooledConn {
+        self.conn
+    }
+}
+
+impl Drop for MysqlSessionGuard<'_> {
+    fn drop(&mut self) {
+        // Best-effort; the connection is about to return to the pool either way.
+        let _ = self.conn.query_drop("SET time_zone = @@global.time_zone");
+        if self.reset_max_exec {
+            let _ = self.conn.query_drop("SET SESSION max_execution_time = 0");
+        }
+    }
+}
+
 /// Execute the MySQL query and stream results to sink.
 ///
-/// Separated from export() so session-state cleanup (time_zone, max_execution_time)
-/// can run unconditionally in the caller regardless of success or failure.
+/// Session-state cleanup (`time_zone`, `max_execution_time`) is handled by the
+/// caller's [`MysqlSessionGuard`], which resets it on `Drop` regardless of how
+/// this function exits (success, `Err`, or panic).
 ///
 /// `sample_pool`: when `tuning.adaptive` is true, a clone of the source pool used
-/// to obtain a second connection for `Innodb_log_waits` sampling without interfering
+/// to obtain a second connection for extraction-pressure sampling without interfering
 /// with the streaming result set on `conn`.
 fn mysql_run_export(
     conn: &mut mysql::PooledConn,
@@ -420,7 +492,9 @@ fn mysql_run_export(
     // MySQL provides only the row source + the target-MB cap formula below.
     let mut ctl = AdaptiveBatchController::new(tuning, configured_batch_size);
     ctl.seed_pressure(if tuning.adaptive {
-        sample_pool.as_ref().and_then(mysql_sample_innodb_log_waits)
+        sample_pool
+            .as_ref()
+            .and_then(mysql_sample_extraction_pressure)
     } else {
         None
     });
@@ -466,9 +540,11 @@ fn mysql_run_export(
 
             sink.on_batch(&batch)?;
 
-            if let Some((new, under_pressure)) =
-                ctl.after_batch(|| sample_pool.as_ref().and_then(mysql_sample_innodb_log_waits))
-            {
+            if let Some((new, under_pressure)) = ctl.after_batch(|| {
+                sample_pool
+                    .as_ref()
+                    .and_then(mysql_sample_extraction_pressure)
+            }) {
                 log::info!(
                     "adaptive batch size → {} ({})",
                     new,
@@ -510,16 +586,15 @@ impl super::Source for MysqlSource {
 
         let mut conn = self.pool.get_conn()?;
 
-        // Roadmap §13: normalize TIMESTAMP columns to UTC so Parquet writes
-        // isAdjustedToUTC=true. SET per-connection (not global) to avoid side-effects.
-        conn.query_drop("SET time_zone = '+00:00'")?;
-
-        if request.tuning.statement_timeout_s > 0 {
-            conn.query_drop(format!(
-                "SET SESSION max_execution_time = {}",
-                request.tuning.statement_timeout_s * 1000
-            ))?;
-        }
+        // Per-connection session state, reset on `Drop` (Epic 18 B1) so a pooled
+        // connection — returned to the mysql-crate pool or reused behind
+        // ProxySQL/MaxScale — never carries our settings into the next checkout,
+        // even on a panic or an early return. `time_zone` normalises TIMESTAMP to
+        // UTC (Parquet `isAdjustedToUTC=true`); `max_execution_time` bounds the
+        // statement when a timeout is configured.
+        let max_exec_ms = (request.tuning.statement_timeout_s > 0)
+            .then(|| request.tuning.statement_timeout_s * 1000);
+        let mut guard = MysqlSessionGuard::apply(&mut conn, max_exec_ms)?;
 
         let sample_pool = if request.tuning.adaptive {
             Some(self.pool.clone())
@@ -527,7 +602,7 @@ impl super::Source for MysqlSource {
             None
         };
         let result = mysql_run_export(
-            &mut conn,
+            guard.conn(),
             sample_pool,
             &built.sql,
             built.cursor_param.as_deref(),
@@ -535,13 +610,9 @@ impl super::Source for MysqlSource {
             request.column_overrides,
             sink,
         );
-
-        // Always reset session state before connection returns to pool,
-        // regardless of whether the export succeeded or failed.
-        let _ = conn.query_drop("SET time_zone = @@global.time_zone");
-        if request.tuning.statement_timeout_s > 0 {
-            let _ = conn.query_drop("SET SESSION max_execution_time = 0");
-        }
+        // Reset now (success or `Err`); the `Drop` impl is the backstop for a
+        // panic or early return inside `mysql_run_export`.
+        drop(guard);
 
         // The empty-result fallback to `Schema::empty()` lives here for
         // parity with the PG implementation, even though `exec_iter` always
@@ -604,11 +675,13 @@ impl super::Source for MysqlSource {
         Ok(mappings)
     }
 
-    /// Governor pressure proxy: global `Innodb_log_waits` — the same monotonic
-    /// counter the adaptive batch loop samples. Rising between samples means
-    /// InnoDB is stalling on redo-log buffer space under write pressure.
+    /// Governor pressure proxy (Epic 18 C1): the same monotonic
+    /// extraction-pressure sum the adaptive batch loop samples
+    /// (`Created_tmp_disk_tables` + `Innodb_buffer_pool_wait_free`). Rising
+    /// between samples means the extraction is spilling a temp table to disk or
+    /// stalling on buffer-pool memory — the MySQL analogue of PG `temp_bytes`.
     fn sample_pressure(&mut self) -> Option<u64> {
-        mysql_sample_innodb_log_waits(&self.pool)
+        mysql_sample_extraction_pressure(&self.pool)
     }
 }
 

@@ -537,6 +537,195 @@ The current README is honest about the 9s MySQL number, but it creates an asymme
 
 ---
 
+## Epic 18 — Source parity (MySQL / MSSQL → PostgreSQL gold standard)
+
+**Goal:** PostgreSQL is the reference source. Close the per-engine gap on the
+two axes that make it the gold standard — (1) longest-single-query under a
+DBA `statement_timeout`, and (2) pooler-safe session state — without assuming
+the gap requires a server-side cursor.
+
+**Verified baseline (code, not README — re-verified against the tree at
+roadmap-write time; file paths resolved, line refs current):**
+
+| Mechanism | PG | MySQL | MSSQL |
+|---|---|---|---|
+| Server-side cursor (`DECLARE … FETCH N`, capped `work_mem×0.7`) | ✅ `src/source/postgres/mod.rs:405,427,467` | ❌ keyset emulation | ⚠️ `OFFSET 0 FETCH NEXT` (keyset) |
+| Governor pressure proxy | ✅ `temp_bytes` + `checkpoints_req` + `work_mem` | ⚠️ `Innodb_log_waits` (write-pressure) | ⚠️ `Log Flush Waits` (write-pressure) |
+| Keyset chunking (OPT-4) | ✅ any unique NOT NULL index `src/source/postgres/mod.rs:314-340` | ✅ unique NOT NULL index `src/source/mysql/mod.rs:303-335` | ❌ single-column PK only `src/source/mssql/mod.rs:475-476` |
+| Pooler-safe session | ✅ RAII `PgTxnGuard` + `SET LOCAL` `src/source/postgres/mod.rs:121-156` | ⚠️ session `SET max_execution_time` `src/source/mysql/mod.rs:519` (end-of-fn reset at `:543`, not `Drop`-safe) | ⚠️ none |
+
+> Note: governor parity already exists — all three engines implement
+> `sample_pressure`. The real remaining gaps are cursor/keyset page size,
+> session-state leakage behind a pooler, and MSSQL keyset key selection.
+
+---
+
+### Phase A — measure-first, highest leverage (P0)
+
+- [x] **A1 (measurement) — DONE 2026-06-07. The gating experiment is
+      conclusive: the long MySQL query is the oversized page, not the missing
+      cursor.** On live MySQL `content_items` (524 288 wide rows, ~3.9 KB/row),
+      wall time of one chunk statement `SELECT * … WHERE id BETWEEN 1 AND N`:
+
+      | page (rows) | one statement (wall) |
+      |---|---|
+      | 1 000 | 0.44 s |
+      | 10 000 | **0.56 s** |
+      | 100 000 (`default_chunk_size`) | **3.15 s** (1.36 s server + ~1.8 s transfer) |
+
+      Per-statement time scales with `rows × row_width`, independent of table
+      size (each chunk statement touches only `chunk_size` rows). At the bench's
+      wider ~12 KB rows the 100 k page is the README's ~9 s; a ~10 k page lands
+      at PG `FETCH N` levels (~0.5 s). **→ Phase D (MySQL server-side cursor) is
+      gated OUT** — small index-backed pages close the gap; the upstream-crate
+      cursor cost is not justified.
+- [x] **A1 (implementation) — WON'T BUILD (2026-06-07). The existing
+      `chunk_size` knob already is the lever; sub-paging would only regress.**
+      The idea was to sub-page a range chunk via keyset
+      (`WHERE id > last ORDER BY id LIMIT page`) into the same part file so the
+      DBA sees ~0.5 s statements, not one 3–9 s. Measured, it is **not free**:
+
+      | | total wall | statements | longest stmt |
+      |---|---|---|---|
+      | one 100k `BETWEEN` (today) | 3.40 s | 1 | 3.40 s |
+      | 10× 10k keyset pages | **4.25 s (+25%)** | 10 (**×10 QPS**) | **0.40 s (÷8.5)** |
+
+      So it trades ~25% throughput + 10× query count for shorter statements —
+      it *shifts* DBA-harm from duration to QPS rather than removing it (10× the
+      queries can load a busy source *more*). A free version needs a real
+      server-side cursor (no re-seek) = the gated-out Phase D.
+
+      **The decisive point: `chunk_size` already does this today.** A user whose
+      chunk query trips a `statement_timeout` sets `chunk_size: 10000` →
+      ~0.5 s statements, no new code. Sub-paging's *only* unique addition over
+      that is keeping large output files while shortening the query — a niche
+      "short query **and** large files" combination most users don't need.
+      Resolution: don't build the `statement_page_rows` knob; document
+      `chunk_size` as the statement-duration lever
+      ([`reference/tuning.md` → Choosing `chunk_size`](docs/reference/tuning.md)).
+      Revisit only if a real user hits the niche case.
+- [ ] **A2. MSSQL keyset on composite / unique-index keys (parity with PG).**
+      Port the key-selection logic from `src/source/postgres/mod.rs:314-340`
+      (which discovers every single-column unique NOT NULL index as a keyset
+      key) to `src/source/mssql/mod.rs:475-476` (which today treats only the
+      single-column PK as a keyset key); tables with composite PKs or surrogate
+      unique keys currently fall back to the less-safe chunked path.
+
+### Phase B — pooler-safe session parity (P1)
+
+- [x] **B1. MySQL session-reset RAII guard — DONE 2026-06-07.** Added
+      `MysqlSessionGuard` (analogue of `postgres::PgTxnGuard`): it applies the
+      two per-connection SETs (`time_zone = '+00:00'` always; `max_execution_time`
+      when a statement timeout is configured) and resets them on `Drop`, so a
+      pooled connection — returned to the mysql-crate pool or reused behind
+      ProxySQL / MaxScale — is always clean before the next checkout. Closes two
+      gaps the old end-of-function reset missed: (1) a **panic** mid-export
+      unwinding past the reset, and (2) an **early `?`** on the
+      `SET max_execution_time` itself (MariaDB spells it `max_statement_time`, so
+      that SET errors — and `time_zone`, already set, leaked). The guard is
+      constructed immediately after the `time_zone` SET so the reset is armed
+      before any later failure. Live-validated: the reset fires on teardown
+      (probe), is correctly gated (`max_exec` reset only when armed;
+      `statement_timeout_s: 0` skips it), and the `live_mysql_chunked` suite
+      (every run resets `time_zone`) stays green.
+- [x] **B2. MSSQL session/transaction hygiene — DONE 2026-06-07.** Verified the
+      source never opens a transaction (no `BEGIN TRAN`/`COMMIT`/`ROLLBACK`
+      anywhere — every read is an autocommit `SELECT`), so the `block_on` bridge
+      (ADR-0011) leaves nothing dangling. The only session-mutating SET is
+      `SET LOCK_TIMEOUT` (`src/source/mssql/mod.rs:213`); added `impl Drop for
+      MssqlSource` that resets it to the SQL Server default (`-1`) before the
+      connection closes, so a *multiplexed* pooler that keeps the backend alive
+      can't hand our non-default `LOCK_TIMEOUT` to the next session.
+      Best-effort + 2 s time-boxed so `Drop` can never hang; gated on a flag so
+      it fires only when the SET was issued (lock_timeout > 0; default profile is
+      30 s, `lock_timeout_s: 0` skips it). Live-validated: reset executes on
+      teardown (probe: `inner_ok=true`), is skipped when no SET ran, and the
+      whole `live_mssql_chunked` suite stays green.
+
+### Phase C — pressure-proxy fidelity (P2)
+
+- [x] **C1. MySQL extraction-pressure proxy — DONE 2026-06-07.** Replaced the
+      old `Innodb_log_waits` (redo-**write** pressure, near-flat during a read)
+      with `mysql_sample_extraction_pressure` = the sum of
+      `Created_tmp_disk_tables` + `Innodb_buffer_pool_wait_free` — sort/temp-table
+      spill **and** buffer-pool memory pressure, the PG `temp_bytes` analogue.
+      Both are monotonic globals so their sum is too (governor `cur > prev`
+      unchanged). The sum is deliberately robust to MySQL 8.0's `TempTable`
+      engine, where a spill may not bump `Created_tmp_disk_tables`
+      (live-confirmed delta=0) — `Innodb_buffer_pool_wait_free` carries the signal
+      then. Live-validated end-to-end via an adaptive export.
+- [x] **C2. MSSQL tempdb-pressure proxy — DONE 2026-06-07.** The Epic's
+      suggested `sys.dm_db_task_space_usage` / Page Life Expectancy are **gauges**
+      (non-monotonic; PLE is also inverted), which don't fit the governor's
+      monotonic `cur > prev` contract — so instead sample cumulative
+      `Workfiles Created` + `Worktables Created` (`sys.dm_os_performance_counters`,
+      Access Methods): a workfile/worktable is created when a sort or hash spills
+      to **tempdb** — the SQL Server analogue of `temp_bytes` /
+      `Created_tmp_disk_tables`, and monotonic. Replaced `Log Flush Waits`;
+      dropped the now-unused per-database `MssqlSource::database` field.
+      Live-validated via an adaptive export.
+
+### Phase D — MySQL server-side cursor (P3) — WON'T BUILD, now with proof on both axes
+
+- [x] **D1. CLOSED 2026-06-08 — proven expensive AND measured ineffective.**
+      Two separate kills, each verified rather than asserted:
+
+      **Cost — proven by reading the client code.** `mysql_common 0.37.2`
+      hardcodes the cursor flag at the *type* level:
+      `flags: Const::new(CursorType::CURSOR_TYPE_NO_CURSOR)`
+      (`packets/mod.rs:2696`) — no runtime setter — and the `mysql 28.0` crate's
+      `write_command` / raw-packet APIs are private (no escape hatch). Neither
+      `mysql_async` (same `mysql_common`) nor `sqlx` exposes a read-only cursor
+      either. So a Rust cursor requires forking `mysql_common` + patching the
+      `mysql` crate's exec/FETCH state machine — a real, ongoing fork cost.
+
+      **Efficacy — MEASURED (an earlier *asserted* claim, now proven).** A
+      standalone `libmysqlclient` probe
+      ([`dev/spikes/mysql_cursor_efficacy.c`](dev/spikes/mysql_cursor_efficacy.c))
+      opened a real `CURSOR_TYPE_READ_ONLY` cursor on a chunk-shaped `BETWEEN`
+      query and timed the open:
+
+      | | result |
+      |---|---|
+      | cursor OPEN time (3 runs) | 0.78–1.82 s — **the longest single statement** |
+      | `Created_tmp_tables` delta at open | **3, every run** |
+      | fetches after open | cheap (~0.15 s / 10k) |
+
+      So MySQL's read-only cursor **materialises the whole result into temp
+      tables at open**, then fetches cheaply — the *opposite* of PG's streaming
+      `FETCH N` (which pulls incrementally from a live scan, no temp table). The
+      cursor therefore does **not** shorten the longest statement: it moves the
+      cost into a long materialising open **and** adds tempdb pressure the
+      keyset / `chunk_size` path never causes. Even after paying the fork, D
+      would be a **regression** vs the free `chunk_size` lever (~0.5 s pages, no
+      temp tables).
+
+      > Honesty note: the materialisation behaviour was first stated from
+      > recollection (not in the client code we read) and overstated as fact;
+      > it is now backed by the measurement above. Phase D stays closed on
+      > **proven** grounds, not a hunch.
+
+---
+
+**Crosswalk update (§9.1):** Epic 17 (MySQL parity) and Epic 16
+(Auto-parallel) feed into this; the former Phase B "COM_STMT_FETCH" becomes
+Epic 18 Phase D, now explicitly gated on the Phase A measurement.
+
+**Exit criteria (revised after the A1 measurement):**
+- **Longest-single-query** — *resolved by tuning, not by a new default.* At
+  defaults MySQL/MSSQL run one statement per chunk, so the gap vs PG's cursor is
+  inherent; closing it "at defaults" would need either the sub-paging regression
+  (A1-impl, won't-build) or the gated Phase D cursor. Instead `chunk_size` is
+  documented as the statement-duration lever (`reference/tuning.md`): a user
+  under a strict `statement_timeout` sets `chunk_size: 10000` for ~0.5 s
+  statements. ✅
+- **No session-state leak behind a pooler** — B1 (MySQL RAII guard) + B2 (MSSQL
+  `Drop` reset) shipped and live-validated. ✅
+- **MSSQL keyset coverage matches PG's index eligibility** — A2 shipped: every
+  single-column unique NOT NULL index, not just the PK. ✅
+
+---
+
 # 5.1 Packaging, Trust, and External Adoption Track
 
 This track replaces the former standalone `rivet_packaging_trust_roadmap.md`.
@@ -680,6 +869,7 @@ Near-term resource-control priorities:
 
 ## Phase 3.5 — Source-engine parity
 17. Epic 17 — MySQL Source Parity (COM_STMT_FETCH)
+18. Epic 18 — Source parity (MySQL / MSSQL → PostgreSQL gold standard)
 
 ## Phase 4 — Expand carefully
 13. Epic 13 — SSH / Jump Host Access
@@ -743,7 +933,8 @@ This section merges the former `rivet_roadmap_v3.md` task tracker. **Strategic p
 | Epic 14 — Warehouse load | `src/types/`, M1–M6 | Type system + type report + BQ compat ✅; direct load path = future |
 | Epic 15 — CDC | **N** | WAL/binlog = future |
 | Epic 16 — Auto-parallel | *(none)* | Auto-parallelism = future |
-| Epic 17 — MySQL parity | *(none yet)* | Phase A: adaptive chunk timing; Phase B: COM_STMT_FETCH |
+| Epic 17 — MySQL parity | *(none yet)* | Phase A: adaptive chunk timing; Phase B (COM_STMT_FETCH) → re-homed as **Epic 18 Phase D**, now gated on the Epic 18 Phase A measurement |
+| Epic 18 — Source parity | `src/source/{postgres,mysql,mssql}/mod.rs` | Close MySQL/MSSQL longest-single-query + pooler-safe session gap vs the PG gold standard. A1 (keyset page size) gates D (MySQL server-side cursor); A2 = MSSQL keyset on unique indexes; B1/B2 = session-reset hygiene |
 
 **Auth and connectivity (lettered A)** underpin all runs and map across Epics 1–2 and §7 (niche).
 
