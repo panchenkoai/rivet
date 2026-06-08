@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.9.4 (2026-06-08) — source-engine parity (Epic 18): MySQL/SQL Server → PostgreSQL gold standard
+
+Closes the per-engine gap between MySQL / SQL Server and the PostgreSQL
+reference on the axes a DBA actually feels — keyset coverage, pooler-safe
+session state, and the adaptive governor's pressure signal — driven measure-
+first, so the most expensive idea (a MySQL server-side cursor) was disproven
+with evidence before any code was forked. No public-API breaks.
+
+### Added
+
+- **`feat(mssql)` — keyset (seek) pagination on any single-column unique NOT
+  NULL index, not just the PK** (parity with PostgreSQL/MySQL, which already
+  did). Tables with a surrogate/business unique key (and a composite or non-int
+  PK) now take the safer keyset path instead of falling back to the less-safe
+  chunked path, and `chunk_by_key: <unique non-PK col>` is accepted.
+
+### Fixed
+
+- **`fix(mysql)` / `fix(mssql)` — pooler-safe session teardown.** Both drivers
+  now reset the per-connection session state they mutate (`time_zone` +
+  `max_execution_time` on MySQL; `LOCK_TIMEOUT` on SQL Server) on a `Drop` path,
+  so a connection returned to the pool — or reused behind ProxySQL / MaxScale /
+  an Azure SQL gateway — can't carry our settings into the next checkout, even
+  on a panic or early return. MySQL gains a `MysqlSessionGuard` (analogue of
+  `PgTxnGuard`); SQL Server gains a `Drop` reset (best-effort, time-boxed). This
+  also closes a MariaDB-specific leak (it spells the timeout `max_statement_time`,
+  so the old end-of-function reset's `?` could skip the `time_zone` reset).
+
+### Changed
+
+- **`feat(governor)` — MySQL/SQL Server adaptive governor now samples
+  extraction pressure, not write pressure.** The old `Innodb_log_waits` /
+  `Log Flush Waits` signals are redo/log **write** pressure that barely moves
+  during a read-only export. Replaced with the PostgreSQL `temp_bytes` analogue:
+  MySQL sums `Created_tmp_disk_tables` + `Innodb_buffer_pool_wait_free` (sort
+  spill + buffer-pool memory pressure); SQL Server sums cumulative
+  `Workfiles Created` + `Worktables Created` (sort/hash spill to tempdb). Both
+  monotonic, so the governor's `cur > prev` contract is unchanged.
+- **`docs(tuning)` — `chunk_size` documented as the statement-duration lever.**
+  Lowering `chunk_size` is the supported, measured way to keep each MySQL/SQL
+  Server read short under a strict `statement_timeout` (one statement per chunk),
+  with the trade-off (more files, ~25% throughput, not a speed win) stated
+  honestly. A MySQL server-side cursor was investigated and rejected with a
+  `libmysqlclient` measurement (`dev/spikes/mysql_cursor_efficacy.c`): its
+  read-only cursor materialises the result into temp tables at open, so it would
+  be a regression vs lowering `chunk_size`, not an improvement.
+
 ## 0.9.3 (2026-06-07) — correctness & safety pass: data-loss guard, credential redaction, nanosecond timestamps
 
 A focused review pass (structural → domain-correctness → security) that found
