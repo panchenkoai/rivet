@@ -644,12 +644,26 @@ roadmap-write time; file paths resolved, line refs current):**
 
 ### Phase C — pressure-proxy fidelity (P2)
 
-- [ ] **C1. MySQL extraction-pressure proxy.** Replace/augment
-      `Innodb_log_waits` with `Created_tmp_disk_tables` or
-      `Innodb_buffer_pool_wait_free` — closer to "my extraction is spilling"
-      than global write-waits (PG's `temp_bytes` analogue).
-- [ ] **C2. MSSQL tempdb-pressure proxy.** Sample `sys.dm_db_task_space_usage`
-      / Page Life Expectancy instead of (or alongside) `Log Flush Waits`.
+- [x] **C1. MySQL extraction-pressure proxy — DONE 2026-06-07.** Replaced the
+      old `Innodb_log_waits` (redo-**write** pressure, near-flat during a read)
+      with `mysql_sample_extraction_pressure` = the sum of
+      `Created_tmp_disk_tables` + `Innodb_buffer_pool_wait_free` — sort/temp-table
+      spill **and** buffer-pool memory pressure, the PG `temp_bytes` analogue.
+      Both are monotonic globals so their sum is too (governor `cur > prev`
+      unchanged). The sum is deliberately robust to MySQL 8.0's `TempTable`
+      engine, where a spill may not bump `Created_tmp_disk_tables`
+      (live-confirmed delta=0) — `Innodb_buffer_pool_wait_free` carries the signal
+      then. Live-validated end-to-end via an adaptive export.
+- [x] **C2. MSSQL tempdb-pressure proxy — DONE 2026-06-07.** The Epic's
+      suggested `sys.dm_db_task_space_usage` / Page Life Expectancy are **gauges**
+      (non-monotonic; PLE is also inverted), which don't fit the governor's
+      monotonic `cur > prev` contract — so instead sample cumulative
+      `Workfiles Created` + `Worktables Created` (`sys.dm_os_performance_counters`,
+      Access Methods): a workfile/worktable is created when a sort or hash spills
+      to **tempdb** — the SQL Server analogue of `temp_bytes` /
+      `Created_tmp_disk_tables`, and monotonic. Replaced `Log Flush Waits`;
+      dropped the now-unused per-database `MssqlSource::database` field.
+      Live-validated via an adaptive export.
 
 ### Phase D — MySQL server-side cursor (P3, gated on A1)
 

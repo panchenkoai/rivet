@@ -49,8 +49,6 @@ type MssqlClient = Client<Compat<TcpStream>>;
 pub struct MssqlSource {
     rt: Runtime,
     client: MssqlClient,
-    /// Connection database — the instance pressure proxy keys on it.
-    database: String,
     /// Pooler/gateway classification, sampled once at connect time.
     proxy_kind: MssqlProxyKind,
     /// Whether the export issued `SET LOCK_TIMEOUT` on this connection, so the
@@ -179,7 +177,6 @@ impl MssqlSource {
         let mut src = Self {
             rt,
             client,
-            database: parts.database,
             proxy_kind: MssqlProxyKind::Direct,
             lock_timeout_applied: false,
         };
@@ -375,22 +372,20 @@ impl Source for MssqlSource {
     }
 
     fn sample_pressure(&mut self) -> Option<u64> {
-        let db = self.database.clone();
         let Self { rt, client, .. } = self;
-        // `Log Flush Waits` is the SQL Server analog of MySQL `Innodb_log_waits`:
-        // a writer stalled waiting on the log = source write pressure. The
-        // `cntr_value` of a `*/sec` perfmon counter is the raw cumulative count,
-        // so it is monotonic — exactly what the governor compares deltas of.
-        let sql = "SELECT cntr_value FROM sys.dm_os_performance_counters \
-                   WHERE counter_name LIKE 'Log Flush Wait%' AND instance_name = @P1";
+        // Extraction-pressure proxy (Epic 18 C2): cumulative `Workfiles Created`
+        // + `Worktables Created` (SQLServer:Access Methods). A workfile /
+        // worktable is created when a sort or hash spills to tempdb — the SQL
+        // Server analogue of PG `temp_bytes` / MySQL `Created_tmp_disk_tables`.
+        // The `cntr_value` of these `*/sec`-named perfmon counters is the raw
+        // cumulative count, so their sum is monotonic — exactly what the governor
+        // compares deltas of. Replaces `Log Flush Waits`, which is redo-**write**
+        // pressure and barely moves during a read-only export. Instance-level
+        // (no per-database `instance_name`), so no parameter is bound.
+        let sql = "SELECT SUM(cntr_value) FROM sys.dm_os_performance_counters \
+                   WHERE counter_name IN ('Workfiles Created/sec', 'Worktables Created/sec')";
         rt.block_on(async {
-            let row = client
-                .query(sql, &[&db])
-                .await
-                .ok()?
-                .into_row()
-                .await
-                .ok()??;
+            let row = client.query(sql, &[]).await.ok()?.into_row().await.ok()??;
             row.get::<i64, _>(0).map(|v| v.max(0) as u64)
         })
     }
