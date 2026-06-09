@@ -320,9 +320,7 @@ fn export_block_lines(
                     ));
                 }
                 lines.push(format!("    parallel: {parallel}"));
-            } else if source_type == "mysql"
-                && info.avg_row_bytes().is_some_and(|b| b >= 1024)
-            {
+            } else if source_type == "mysql" && info.avg_row_bytes().is_some_and(|b| b >= 1024) {
                 // Wide MySQL: a single sequential scan beats parallel chunks
                 // (the range-chunk contention regresses throughput). Left at
                 // parallel: 1 on purpose — raise it only if you've measured a
