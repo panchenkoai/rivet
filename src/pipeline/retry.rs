@@ -365,7 +365,9 @@ mod tests {
     /// released — so it stays transient. Guards the split from the branch above.
     #[test]
     fn test_lock_wait_timeout_stays_transient() {
-        let c = classify_error(&anyhow::anyhow!("lock wait timeout exceeded; try restarting"));
+        let c = classify_error(&anyhow::anyhow!(
+            "lock wait timeout exceeded; try restarting"
+        ));
         assert!(c.is_transient(), "lock-wait timeout must remain retryable");
         assert!(!c.needs_reconnect());
     }
