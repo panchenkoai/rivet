@@ -22,10 +22,15 @@
 //! `work_mem × 0.7`) is unchanged. `DEPTH` is the memory↔overlap knob:
 //! lower it to spend less memory, raise it to absorb burstier fetch latency.
 //!
-//! Experimental: enabled via the `RIVET_PIPELINE_WRITES` env var. Set it to a
-//! positive integer to also pick the channel depth (e.g. `RIVET_PIPELINE_WRITES=2`);
-//! `1` / any non-numeric truthy value uses [`DEFAULT_CHANNEL_DEPTH`]. When
-//! unset or `0`, the synchronous path is used unchanged.
+//! **On by default** (depth [`DEFAULT_CHANNEL_DEPTH`]): the overlap is free —
+//! no RSS penalty measured at depth 2, FIFO order preserved, and the
+//! commit-critical finalize (`writer.finish()`) still runs on the caller's
+//! thread after the worker is joined, so crash/ordering semantics are
+//! unchanged. Override with `RIVET_PIPELINE_WRITES`: `0` disables it (the old
+//! synchronous path), a positive integer sets the channel depth (the
+//! memory↔overlap knob). Wired into the single/snapshot export path
+//! (`pipeline::single`); the chunked runners are not pipelined yet (each chunk
+//! already runs on its own worker — intra-chunk overlap there is a follow-up).
 
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::thread::JoinHandle;
@@ -60,19 +65,22 @@ impl PipelinedSink {
         Self::configured_depth().is_some()
     }
 
-    /// Parse the requested channel depth from `RIVET_PIPELINE_WRITES`.
-    /// `None` => disabled. A positive integer sets the depth; any other
-    /// truthy value uses [`DEFAULT_CHANNEL_DEPTH`].
+    /// Resolve the encode-worker channel depth. **On by default**
+    /// ([`DEFAULT_CHANNEL_DEPTH`]) — the overlap is free (no RSS penalty
+    /// measured at depth 2) and FIFO-ordered, so the source thread's DB
+    /// round-trip wait overlaps the writer thread's parquet/zstd CPU. Disable
+    /// with `RIVET_PIPELINE_WRITES=0`; tune the depth with a positive integer.
     fn configured_depth() -> Option<usize> {
         match std::env::var("RIVET_PIPELINE_WRITES") {
-            Ok(v) if v.is_empty() || v == "0" => None,
+            Ok(v) if v == "0" => None, // explicit opt-out
+            Ok(v) if v.is_empty() => Some(DEFAULT_CHANNEL_DEPTH),
             Ok(v) => Some(
                 v.parse::<usize>()
                     .ok()
                     .filter(|&n| n > 0)
                     .unwrap_or(DEFAULT_CHANNEL_DEPTH),
             ),
-            Err(_) => None,
+            Err(_) => Some(DEFAULT_CHANNEL_DEPTH), // unset → on by default
         }
     }
 

@@ -115,6 +115,18 @@ impl TableInfo {
         }
     }
 
+    /// Average bytes per row, when the catalog gave us `total_bytes`. The cost
+    /// signal behind parallelism: narrow rows (small value) are CPU-bound on
+    /// row *count* and parallelise on every engine; wide rows already saturate
+    /// a fast engine's sequential scan. `None` when the size is unknown —
+    /// callers then fall back to a row-count-only heuristic.
+    pub(crate) fn avg_row_bytes(&self) -> Option<i64> {
+        match self.total_bytes {
+            Some(b) if self.row_estimate > 0 => Some(b / self.row_estimate),
+            _ => None,
+        }
+    }
+
     /// Enumerate ranked cursor candidates with structured reasons.
     pub(crate) fn cursor_candidates(&self) -> Vec<CursorCandidate> {
         candidates::cursor_candidates(self)

@@ -155,12 +155,29 @@ pub fn classify_error(err: &anyhow::Error) -> RetryClass {
         return TRANSIENT_RECONNECT;
     }
 
-    // Timeout errors -- retry on same connection
+    // Statement-DURATION timeout: the query exceeded its own time budget
+    // (PG `statement_timeout`, MySQL `max_execution_time`, MSSQL's client-side
+    // cap). This is *deterministic* on an unchunked scan — the identical query
+    // re-times-out, so a retry just burns another full budget for nothing.
+    // Measured: MSSQL full-mode over 2 M wide rows retried 3×300 s = 20 min to
+    // fail with 0 rows (REPORT_full_vs_parallel.md). Treat as permanent; the
+    // error message carries the actionable fix (split with `mode: chunked`, or
+    // raise the budget). Distinct from a *lock-wait* timeout (the lock releases)
+    // and a network i/o timeout (a blip) — both stay transient just below.
+    if msg.contains("statement timeout after")      // rivet MSSQL message
+        || msg.contains("due to statement timeout")  // PG statement_timeout
+        || msg.contains("execution time exceeded")   // MySQL max_execution_time
+        || msg.contains("max_execution_time")
+    {
+        return PERMANENT;
+    }
+
+    // Lock-wait / network timeout errors -- genuinely transient (the condition
+    // clears: a held lock releases, a network blip passes). Retry on same conn.
     if msg.contains("timed out")
         || msg.contains("timeout")
         || msg.contains("canceling statement")
         || msg.contains("lock wait timeout")
-        || msg.contains("execution time exceeded")
     {
         return TRANSIENT_SAME_CONN;
     }
@@ -219,9 +236,14 @@ fn classify_pg_sqlstate(code: &postgres::error::SqlState) -> RetryClass {
         return transient(false, 1_000);
     }
 
-    // 57014 query_canceled (statement_timeout)
+    // 57014 query_canceled — in an export this means `statement_timeout` fired
+    // (rivet never user-cancels mid-export). The statement exceeded its
+    // duration budget; retrying the identical query re-fails identically, so
+    // propagate immediately rather than burn the budget again (3× by default).
+    // Lock timeouts are 55P03 and deadlocks 40P01 — handled separately, both
+    // stay transient. See the string-path duration-timeout branch above.
     if *code == SqlState::QUERY_CANCELED {
-        return TRANSIENT_SAME_CONN;
+        return PERMANENT;
     }
 
     // Class 53 — Insufficient Resources (disk full, out of memory)
@@ -316,6 +338,37 @@ mod tests {
 
         let c = classify_error(&anyhow::anyhow!("lock wait timeout exceeded"));
         assert!(c.is_transient());
+        assert!(!c.needs_reconnect());
+    }
+
+    /// A statement-DURATION timeout is deterministic on an unchunked scan:
+    /// retrying the identical query re-times-out, so it must NOT be transient
+    /// (measured: MSSQL full-mode retried 3×300 s = 20 min for 0 rows). The
+    /// fix is `mode: chunked` or a bigger budget, never another attempt.
+    #[test]
+    fn test_statement_duration_timeout_is_permanent() {
+        let cases = [
+            // rivet's MSSQL client-side cap message (the measured bug)
+            "mssql: statement timeout after 300s (tuning.statement_timeout_s) — use mode: chunked",
+            // PG statement_timeout cancel text (if it reaches the string path)
+            "canceling statement due to statement timeout",
+            // MySQL max_execution_time
+            "Query execution was interrupted, maximum statement execution time exceeded",
+        ];
+        for msg in cases {
+            let c = classify_error(&anyhow::anyhow!("{}", msg));
+            assert_eq!(c, PERMANENT, "duration timeout must be permanent: {msg}");
+        }
+    }
+
+    /// A *lock-wait* timeout, by contrast, clears on its own — the lock is
+    /// released — so it stays transient. Guards the split from the branch above.
+    #[test]
+    fn test_lock_wait_timeout_stays_transient() {
+        let c = classify_error(&anyhow::anyhow!(
+            "lock wait timeout exceeded; try restarting"
+        ));
+        assert!(c.is_transient(), "lock-wait timeout must remain retryable");
         assert!(!c.needs_reconnect());
     }
 

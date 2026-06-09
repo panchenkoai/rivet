@@ -249,6 +249,23 @@ The governor needs **no elevated privileges**. A plain read-only role can run ev
 
 **Visibility.** Each adjustment is recorded in the run journal as a `ParallelismAdjusted` event (`from`, `to`, `reason`) and logged at `info` (`governor parallelism 8 → 7 (source pressure rising: backed off)`).
 
+## Write pipelining
+
+For single/snapshot exports (`mode: full`), Rivet runs the **fetch+convert**
+stage and the **Parquet encode+compress** stage on two threads with a small
+bounded channel between them, so the database round-trip wait overlaps the
+compression CPU. It is **on by default**, FIFO-ordered (byte-identical output),
+and free — no measurable RSS penalty at the default depth, and the commit-
+critical finalize still runs on the main thread.
+
+- Disable it (old synchronous path): `RIVET_PIPELINE_WRITES=0`.
+- Tune the channel depth (memory ↔ overlap): `RIVET_PIPELINE_WRITES=<n>`.
+
+The gain scales with how much real work compression does: on diverse data the
+encoder is busy and the overlap is worth it; on trivially-compressible data
+(near-zero zstd work) there is little to overlap. Chunked exports already run
+each chunk on its own worker and are not intra-chunk pipelined.
+
 ## Memory optimization tips
 
 1. **Reduce `batch_size`** -- the single most effective knob

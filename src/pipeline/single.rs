@@ -220,11 +220,11 @@ pub(super) fn run_single_export(
     .with_incremental(plan.strategy.incremental_plan())
     .with_cursor(cursor);
 
-    // Pipelined path (experimental, `RIVET_PIPELINE_WRITES`): the source thread
-    // only fetches + converts; a worker thread owns the ExportSink and does the
-    // parquet encode/compress so DB I/O overlaps with compression CPU. The
-    // worker error (if any) is recovered by `finish()` and takes precedence
-    // over the source-side error.
+    // Pipelined path (on by default; disable with `RIVET_PIPELINE_WRITES=0`):
+    // the source thread only fetches + converts; a worker thread owns the
+    // ExportSink and does the parquet encode/compress so DB I/O overlaps with
+    // compression CPU. The worker error (if any) is recovered by `finish()` and
+    // takes precedence over the source-side error.
     let mut sink = if super::sink::PipelinedSink::enabled() {
         let mut psink = super::sink::PipelinedSink::spawn(plan)?;
         let export_result = src.export(&request, &mut psink);
