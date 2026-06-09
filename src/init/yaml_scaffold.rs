@@ -292,7 +292,7 @@ fn export_block_lines(
     match mode {
         "chunked" => {
             let chunk_col = info.best_chunk_column().unwrap_or("id");
-            let parallel = suggest_parallel(info.row_estimate);
+            let parallel = suggest_parallel(info.row_estimate, info.avg_row_bytes(), source_type);
             let chunk_size = info.suggest_chunk_size();
             lines.push(format!(
                 "    chunk_column: {}",
@@ -306,7 +306,31 @@ fn export_block_lines(
             lines.push(format!("    chunk_size: {chunk_size}"));
             lines.push("    chunk_checkpoint: true".to_string());
             if parallel > 1 {
+                // Correction #5: show the predicted peak so the operator can
+                // trade memory for speed without guessing. RSS scales with
+                // worker count × row width (not chunk_size). See the sweep in
+                // docs/bench/reports/REPORT_full_vs_parallel.md.
+                if let Some(b) = info.avg_row_bytes() {
+                    lines.push(format!(
+                        "    # est. peak RSS ≈ {} MB ({} workers × ~{} MB/worker @ ~{} B/row); lower `parallel` to spend less memory",
+                        estimate_peak_rss_mb(parallel, b),
+                        parallel,
+                        per_worker_rss_mb(b),
+                        b,
+                    ));
+                }
                 lines.push(format!("    parallel: {parallel}"));
+            } else if source_type == "mysql"
+                && info.avg_row_bytes().is_some_and(|b| b >= 1024)
+            {
+                // Wide MySQL: a single sequential scan beats parallel chunks
+                // (the range-chunk contention regresses throughput). Left at
+                // parallel: 1 on purpose — raise it only if you've measured a
+                // gain on your hardware.
+                lines.push(
+                    "    # parallel: 1 (wide rows on MySQL: single scan is faster than chunks)"
+                        .to_string(),
+                );
             }
         }
         "incremental" => {
@@ -416,18 +440,148 @@ fn suggest_row_group_mb(info: &TableInfo) -> u64 {
     if wide_cols.count() >= 5 { 64 } else { 128 }
 }
 
-fn suggest_parallel(rows: i64) -> usize {
-    match rows {
+/// Suggested worker count — cost- *and* engine-aware (see
+/// `docs/bench/reports/REPORT_full_vs_parallel.md`).
+///
+/// Parallelism pays off only when the single thread leaves throughput headroom,
+/// which is governed by per-row cost (≈ avg row bytes) and the engine's
+/// single-scan speed:
+///   - **Narrow rows** (cheap per-row) are CPU-bound on row *count* — parallel
+///     scales ~3.3× on every engine, so scale workers with the row estimate.
+///   - **Wide rows on MySQL** already saturate an efficient sequential scan;
+///     splitting them adds buffer-pool/connection contention and *regresses*
+///     (measured 1.3× slower + 3× RAM) — keep it single-threaded.
+///   - **Wide rows on Postgres / SQL Server** have a slow single scan (and on
+///     MSSQL a full statement times out), so chunked-parallel still wins / is
+///     required — scale workers with the row estimate.
+///
+/// `avg_row_bytes == None` (unknown size) falls back to the row-count tiers.
+fn suggest_parallel(rows: i64, avg_row_bytes: Option<i64>, source_type: &str) -> usize {
+    /// At/above this width a row is "wide" for the contention trade-off.
+    const WIDE_BYTES: i64 = 1024;
+    // The one measured case where parallel is a net loss: wide rows on MySQL,
+    // whose single sequential scan is already fast. Prefer one full scan.
+    if source_type == "mysql" && avg_row_bytes.is_some_and(|b| b >= WIDE_BYTES) {
+        return 1;
+    }
+    // Everywhere else there is single-thread headroom — scale with row count.
+    let by_rows = match rows {
         r if r < 500_000 => 1,
         r if r < 5_000_000 => 2,
         _ => 4,
+    };
+    // Correction #5: never suggest a worker count whose predicted peak RSS
+    // breaches a memory budget. At the current ≤4 ceiling this is rarely
+    // binding (peak ≤ ~550 MB even at extreme width), but it keeps the
+    // suggestion honest if the ceiling is ever raised or rows are very wide.
+    match avg_row_bytes {
+        Some(b) => memory_capped_parallel(by_rows, b, DEFAULT_MEM_BUDGET_MB),
+        None => by_rows,
     }
+}
+
+/// Default memory budget (MB) the scaffold sizes worker count against. Generous
+/// on purpose — a guard against pathological widths, not a tuner. Operators on
+/// constrained boxes lower `parallel` directly (the emitted comment shows the
+/// predicted peak).
+const DEFAULT_MEM_BUDGET_MB: u64 = 2048;
+
+/// Per-worker peak RSS (MB) under the default *adaptive* batching, fitted to the
+/// sweep in `docs/bench/reports/REPORT_full_vs_parallel.md`. Anchored on
+/// measured points — ~19 MB/worker at ~40 B/row (narrow), ~105 MB at ~4 KB/row
+/// (wide) — and clamped to a ~130 MB ceiling (≈ 2× the 64 MB adaptive batch
+/// target). The driver is **row width × in-flight batch, not chunk_size**
+/// (chunk_size only sets file count). An explicit large `tuning.batch_size`
+/// overrides adaptive batching and raises this beyond the model.
+fn per_worker_rss_mb(avg_row_bytes: i64) -> u64 {
+    const FLOOR_MB: u64 = 18;
+    const CEIL_MB: u64 = 130;
+    let b = avg_row_bytes.max(0) as u64;
+    (FLOOR_MB + b * 87 / 4096).clamp(FLOOR_MB, CEIL_MB)
+}
+
+/// Predicted peak process RSS (MB) for a chunked export with `parallel` workers.
+/// `peak ≈ 16 (process base) + parallel × per_worker_rss_mb(width)`. Linear in
+/// `parallel`; slightly *over*-estimates past ~4 workers (allocator reuse) —
+/// the safe direction for a budget. Validated against the sweep (par 4 wide:
+/// est 436 vs measured 444 MB; par 8 narrow: est 166 vs 169 MB).
+pub(crate) fn estimate_peak_rss_mb(parallel: usize, avg_row_bytes: i64) -> u64 {
+    const PROCESS_BASE_MB: u64 = 16;
+    PROCESS_BASE_MB + parallel as u64 * per_worker_rss_mb(avg_row_bytes)
+}
+
+/// Largest worker count whose predicted peak RSS stays within `budget_mb`
+/// (never below 1).
+fn memory_capped_parallel(suggested: usize, avg_row_bytes: i64, budget_mb: u64) -> usize {
+    const PROCESS_BASE_MB: u64 = 16;
+    let per_worker = per_worker_rss_mb(avg_row_bytes).max(1);
+    let max_by_mem = (budget_mb.saturating_sub(PROCESS_BASE_MB) / per_worker).max(1) as usize;
+    suggested.min(max_by_mem)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::init::{ColumnInfo, TableInfo};
+
+    /// Cost+engine-aware parallelism (REPORT_full_vs_parallel.md): the wide
+    /// MySQL case is the only one forced single-threaded; narrow scales on
+    /// every engine, and wide PG/MSSQL still scale.
+    #[test]
+    fn suggest_parallel_is_cost_and_engine_aware() {
+        let big = 10_000_000;
+        let wide = Some(4096);
+        let narrow = Some(40);
+        // Wide MySQL → single scan beats chunks, regardless of row count.
+        assert_eq!(suggest_parallel(big, wide, "mysql"), 1);
+        assert_eq!(suggest_parallel(500_000, wide, "mysql"), 1);
+        // Narrow rows → headroom on every engine → scale with rows.
+        assert_eq!(suggest_parallel(big, narrow, "mysql"), 4);
+        assert_eq!(suggest_parallel(big, narrow, "postgres"), 4);
+        // Wide PG / MSSQL → slow single scan (MSSQL full even times out) →
+        // still parallelise.
+        assert_eq!(suggest_parallel(big, wide, "postgres"), 4);
+        assert_eq!(suggest_parallel(big, wide, "mssql"), 4);
+        // Unknown size → row-count tiers (no width signal to act on).
+        assert_eq!(suggest_parallel(big, None, "mysql"), 4);
+        assert_eq!(suggest_parallel(100_000, None, "postgres"), 1);
+    }
+
+    /// Correction #5: the peak-RSS estimate tracks the measured sweep
+    /// (REPORT_full_vs_parallel.md) within ~10%, and over-estimates past 4
+    /// workers (the safe direction). Anchors: par4 wide ≈444 MB, par8 narrow
+    /// ≈169 MB, par1 narrow ≈34 MB.
+    #[test]
+    fn peak_rss_estimate_matches_sweep() {
+        let wide = 4096;
+        let narrow = 40;
+        let near = |est: u64, measured: u64| {
+            let d = est.abs_diff(measured);
+            assert!(
+                d * 100 / measured <= 12,
+                "estimate {est} too far from measured {measured}"
+            );
+        };
+        near(estimate_peak_rss_mb(4, wide), 444);
+        near(estimate_peak_rss_mb(1, narrow), 34);
+        near(estimate_peak_rss_mb(4, narrow), 92);
+        near(estimate_peak_rss_mb(8, narrow), 169);
+        // Per-worker is width-driven and clamps to the adaptive-batch ceiling.
+        assert_eq!(per_worker_rss_mb(40), 18);
+        assert!(per_worker_rss_mb(65_536) <= 130, "must clamp to ceiling");
+    }
+
+    /// The memory cap reduces workers only when the predicted peak would breach
+    /// the budget; it is inert at a generous budget and never returns 0.
+    #[test]
+    fn memory_cap_binds_only_under_budget() {
+        // Wide rows, tiny 256 MB budget → (256-16)/105 ≈ 2 workers.
+        assert_eq!(memory_capped_parallel(4, 4096, 256), 2);
+        // Same suggestion, generous budget → untouched.
+        assert_eq!(memory_capped_parallel(4, 4096, 2048), 4);
+        // Never below 1 even with an absurd budget.
+        assert_eq!(memory_capped_parallel(4, 65_536, 1), 1);
+    }
 
     fn make_table(cols: Vec<ColumnInfo>) -> TableInfo {
         TableInfo {

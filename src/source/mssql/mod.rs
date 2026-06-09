@@ -270,7 +270,10 @@ impl Source for MssqlSource {
                     && started.elapsed() > budget
                 {
                     anyhow::bail!(
-                        "mssql: statement timeout after {}s (tuning.statement_timeout_s)",
+                        "mssql: statement timeout after {}s (tuning.statement_timeout_s) — \
+                         this query cannot finish within the budget; split it with \
+                         `mode: chunked` (per-chunk statements stay under the limit) or \
+                         raise `tuning.statement_timeout_s`",
                         budget.as_secs()
                     );
                 }

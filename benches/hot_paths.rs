@@ -697,6 +697,54 @@ fn bench_uniqueness(c: &mut Criterion) {
     group.finish();
 }
 
+// ── MySQL Utf8 text-column append: std from_utf8_lossy vs simdutf8 fast path ──
+//
+// The MySQL row→Arrow decode appends text columns (TEXT/LONGTEXT/VARCHAR/JSON)
+// into a `StringBuilder`. The validation of the raw bytes as UTF-8 is on the
+// hot path once per value; on wide-text tables (multiple ~KB text columns ×
+// hundreds of thousands of rows) the scan is a real chunk of decode CPU.
+//
+// `before` = `String::from_utf8_lossy(b).as_ref()` (std, scalar validation) —
+// today's `arrow_convert.rs:492`. `after` = simdutf8 fast path (Ok → &str)
+// with a lossy fallback only for the rare invalid-UTF-8 value — what every
+// other text path in the same file (and all of the PG decoder) already does.
+// Byte-identical output; the only difference is the validator.
+fn bench_utf8_text_append(c: &mut Criterion) {
+    // Representative wide-text payload: ~4 KB valid UTF-8 per value (the
+    // longtext/body shape), 10 k rows.
+    const ROWS: usize = 10_000;
+    let payload: Vec<u8> = (0..4096).map(|i| b"abcdefghij"[i % 10]).collect();
+    let vals: Vec<Vec<u8>> = (0..ROWS).map(|_| payload.clone()).collect();
+
+    fn build_before(vals: &[Vec<u8>]) -> StringArray {
+        let mut b = StringBuilder::with_capacity(vals.len(), vals.len() * 32);
+        for v in vals {
+            b.append_value(String::from_utf8_lossy(v).as_ref());
+        }
+        b.finish()
+    }
+    fn build_after(vals: &[Vec<u8>]) -> StringArray {
+        let mut b = StringBuilder::with_capacity(vals.len(), vals.len() * 32);
+        for v in vals {
+            match simdutf8::basic::from_utf8(v) {
+                Ok(s) => b.append_value(s),
+                Err(_) => b.append_value(String::from_utf8_lossy(v).as_ref()),
+            }
+        }
+        b.finish()
+    }
+
+    let mut group = c.benchmark_group("mysql_utf8_text_append");
+    group.throughput(Throughput::Bytes((ROWS * payload.len()) as u64));
+    group.bench_function("before_std_lossy", |b| {
+        b.iter(|| std::hint::black_box(build_before(&vals)))
+    });
+    group.bench_function("after_simdutf8", |b| {
+        b.iter(|| std::hint::black_box(build_after(&vals)))
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_csv,
@@ -707,5 +755,6 @@ criterion_group!(
     bench_mysql_parse_time,
     bench_mysql_int_bytes,
     bench_uniqueness,
+    bench_utf8_text_append,
 );
 criterion_main!(benches);
