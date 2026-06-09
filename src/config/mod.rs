@@ -193,7 +193,11 @@ impl Config {
             && t.batch_size.is_some()
             && t.batch_size_memory_mb.is_some()
         {
-            anyhow::bail!("tuning: batch_size and batch_size_memory_mb are mutually exclusive");
+            anyhow::bail!(
+                "tuning: batch_size and batch_size_memory_mb are mutually exclusive. \
+                 Prefer batch_size_memory_mb (rivet sizes the batch to a memory budget, \
+                 adapting to row width); set batch_size only to pin an exact row count."
+            );
         }
 
         if !self.source.has_url_fields() && !self.source.has_structured_fields() {
@@ -289,7 +293,10 @@ impl Config {
         .count();
         if set_count == 0 {
             anyhow::bail!(
-                "export '{}': must specify exactly one of 'query', 'query_file', or 'table'",
+                "export '{}': specify exactly one of 'query', 'query_file', or 'table'. \
+                 Use table: <name> for a whole table (enables PK auto-chunking); \
+                 query: \"SELECT …\" for an inline one-liner; \
+                 query_file: <path> for SQL you keep in version control.",
                 export.name
             );
         }
@@ -455,8 +462,12 @@ impl Config {
                 // `crate::plan::build::resolve_chunk_column`).
                 if export.chunk_column.is_none() && export.table.is_none() {
                     anyhow::bail!(
-                        "export '{}': chunked mode requires chunk_column \
-                         (or use `table:` shortcut on a Postgres source to auto-resolve from PK)",
+                        "export '{}': chunked mode needs a chunking strategy. Pick one:\n  \
+                         chunk_column: <int col>    range chunks on an integer column (most common)\n  \
+                         chunk_by_key: <unique col>  keyset pagination when there's no integer PK\n  \
+                         chunk_count: <N>            split the range into N equal chunks\n  \
+                         chunk_by_days: <D>          time-bucketed chunks (needs a date/timestamp column)\n  \
+                         Or use the `table:` shortcut on a single table — rivet auto-resolves the column from the primary key.",
                         export.name
                     );
                 }
@@ -483,13 +494,17 @@ impl Config {
                 }
                 if export.chunk_count.is_some() && export.chunk_dense {
                     anyhow::bail!(
-                        "export '{}': chunk_count and chunk_dense are mutually exclusive",
+                        "export '{}': chunk_count and chunk_dense are mutually exclusive. \
+                         Use chunk_count for equal-sized chunks over a sparse key; \
+                         use chunk_dense only when the key has no gaps.",
                         export.name
                     );
                 }
                 if export.chunk_count.is_some() && export.chunk_by_days.is_some() {
                     anyhow::bail!(
-                        "export '{}': chunk_count and chunk_by_days are mutually exclusive",
+                        "export '{}': chunk_count and chunk_by_days are mutually exclusive. \
+                         Use chunk_count: N to split an integer range into N chunks; \
+                         use chunk_by_days: D to bucket a date/timestamp column by D-day windows.",
                         export.name
                     );
                 }

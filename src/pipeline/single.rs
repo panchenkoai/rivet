@@ -267,12 +267,23 @@ pub(super) fn run_single_export(
                 message: issue.message.clone(),
             });
         }
-        if quality_issues
+        let fails: Vec<&str> = quality_issues
             .iter()
-            .any(|i| i.severity == crate::quality::Severity::Fail)
-        {
+            .filter(|i| i.severity == crate::quality::Severity::Fail)
+            .map(|i| i.message.as_str())
+            .collect();
+        if !fails.is_empty() {
             summary.quality_passed = Some(false);
-            anyhow::bail!("export '{}': quality checks failed", plan.export_name);
+            // Surface *which* checks failed in the terminal error, not just
+            // "quality checks failed" — the messages are already computed (and
+            // warn-logged above), so put them where the user will actually see
+            // them.
+            anyhow::bail!(
+                "export '{}': {} quality check(s) failed:\n  - {}\n  Fix the source data, or adjust the thresholds under `quality:` in your config.",
+                plan.export_name,
+                fails.len(),
+                fails.join("\n  - "),
+            );
         }
     }
     if plan.quality.is_some() {

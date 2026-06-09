@@ -44,9 +44,18 @@ fn run_chunked_quality_gate(
             log::warn!("quality FAIL: {}", issue.message);
         }
         summary.quality_passed = Some(false);
+        // Surface *which* checks failed, not just "quality checks failed" —
+        // the messages are already computed. (Chunked mode only aggregates
+        // row_count; null/unique are per-chunk and warn-logged above.)
+        let detail = row_issues
+            .iter()
+            .map(|i| i.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n  - ");
         anyhow::bail!(
-            "export '{}': quality checks failed (chunked aggregate)",
-            plan.export_name
+            "export '{}': quality checks failed (chunked aggregate):\n  - {}\n  Fix the source data, or adjust the thresholds under `quality:` in your config.",
+            plan.export_name,
+            detail
         );
     }
 
