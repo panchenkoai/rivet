@@ -52,11 +52,12 @@ fn mysql_disconnect_errors_need_reconnect() {
 
 #[test]
 fn timeout_errors_retry_without_reconnect() {
+    // Lock-wait and generic/network timeouts genuinely clear on retry, so they
+    // stay transient (same connection). A statement-*duration* timeout does NOT
+    // — see `statement_duration_timeouts_are_permanent` below.
     let cases = [
         "statement timed out",
-        "canceling statement due to statement timeout",
         "lock wait timeout exceeded; try restarting transaction",
-        "query execution was interrupted, maximum execution time exceeded",
     ];
     for msg in cases {
         let c = classify(msg);
@@ -66,6 +67,26 @@ fn timeout_errors_retry_without_reconnect() {
             c.extra_delay_ms(),
             0,
             "'{}' should have no extra delay",
+            msg
+        );
+    }
+}
+
+#[test]
+fn statement_duration_timeouts_are_permanent() {
+    // A query that exceeds its own time budget re-fails identically on an
+    // unchunked scan; retrying burns another full budget for nothing (measured:
+    // MSSQL full-mode 3×300 s = 20 min). These must be permanent — the fix is
+    // `mode: chunked` or a bigger budget, not another attempt.
+    let cases = [
+        "mssql: statement timeout after 300s (tuning.statement_timeout_s)",
+        "canceling statement due to statement timeout",
+        "query execution was interrupted, maximum statement execution time exceeded",
+    ];
+    for msg in cases {
+        assert!(
+            !classify(msg).is_transient(),
+            "'{}' should be permanent (duration timeout)",
             msg
         );
     }
@@ -198,12 +219,13 @@ fn all_documented_patterns_covered() {
         "lost connection",
         "the server closed the connection",
         "can't connect to mysql server",
-        // Timeout
+        // Timeout (lock-wait / network — transient; statement-DURATION
+        // timeouts are permanent, asserted in
+        // `statement_duration_timeouts_are_permanent`)
         "timed out",
         "timeout",
         "canceling statement",
         "lock wait timeout",
-        "execution time exceeded",
         // Capacity
         "too many connections",
         "the database system is starting up",

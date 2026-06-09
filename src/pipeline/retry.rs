@@ -164,9 +164,9 @@ pub fn classify_error(err: &anyhow::Error) -> RetryClass {
     // error message carries the actionable fix (split with `mode: chunked`, or
     // raise the budget). Distinct from a *lock-wait* timeout (the lock releases)
     // and a network i/o timeout (a blip) — both stay transient just below.
-    if msg.contains("statement timeout after")                  // rivet MSSQL message
-        || msg.contains("due to statement timeout")             // PG statement_timeout
-        || msg.contains("maximum statement execution time exceeded") // MySQL max_execution_time
+    if msg.contains("statement timeout after")      // rivet MSSQL message
+        || msg.contains("due to statement timeout")  // PG statement_timeout
+        || msg.contains("execution time exceeded")   // MySQL max_execution_time
         || msg.contains("max_execution_time")
     {
         return PERMANENT;
