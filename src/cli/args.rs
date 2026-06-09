@@ -31,9 +31,9 @@ pub enum Commands {
         /// Validate output files after writing
         #[arg(long)]
         validate: bool,
-        /// Reconcile: run COUNT(*) on source query and compare with exported rows.
-        /// Implies `--validate` (ADR-0013): a reconcile run also performs the
-        /// end-of-run manifest verification.
+        /// Row-count audit: run COUNT(*) on the source and compare with the
+        /// exported row count; a mismatch fails the run. Implies `--validate`
+        /// (also verifies the output file manifest).
         #[arg(long)]
         reconcile: bool,
         /// Resume a chunked export with `chunk_checkpoint: true` (same query/chunk_column/chunk_size)
@@ -42,8 +42,8 @@ pub enum Commands {
         /// Override safety gates that would otherwise refuse the run.
         ///
         /// Today: with `--resume`, allows starting against a destination prefix
-        /// whose `_SUCCESS` marker is already present (ADR-0012 M8).  Without
-        /// `--force`, resume against a complete run refuses so an operator
+        /// whose `_SUCCESS` marker is already present.  Without `--force`,
+        /// resume against an already-complete run refuses, so an operator
         /// cannot accidentally re-export over a verified dataset.
         #[arg(long)]
         force: bool,
@@ -63,7 +63,8 @@ pub enum Commands {
         #[arg(short, long = "param", value_name = "KEY=VALUE")]
         params: Vec<String>,
     },
-    /// Preflight check: diagnose source health for each export
+    /// Step 2 — column-type & schema report for each export (needs a working
+    /// connection; run `doctor` first if it can't connect)
     Check {
         /// Path to YAML config file
         #[arg(short, long)]
@@ -87,7 +88,7 @@ pub enum Commands {
         #[arg(long, value_name = "TARGET")]
         target: Option<String>,
     },
-    /// Verify source and destination auth before running exports
+    /// Step 1 — verify source + destination auth/connectivity (run this first)
     Doctor {
         /// Path to YAML config file
         #[arg(short, long)]
@@ -209,11 +210,11 @@ pub enum Commands {
     },
     /// Re-run manifest-aware verification against an existing destination, no extraction.
     ///
-    /// Same M5/M6 checks `rivet run --validate` performs at end-of-run, exposed
-    /// as a standalone command for between-run polling and triage.  Reads
-    /// manifest.json + _SUCCESS at the destination, head-checks every committed
-    /// part for presence and recorded size_bytes.  Source is not queried (use
-    /// `rivet reconcile` for that).  See ADR-0013 §"Subcommand carveouts".
+    /// The same file-manifest checks `rivet run --validate` performs at
+    /// end-of-run, exposed as a standalone command for between-run polling and
+    /// triage.  Reads manifest.json + _SUCCESS at the destination, head-checks
+    /// every committed part for presence and recorded size_bytes.  Source is
+    /// not queried — use `rivet reconcile` for a source-vs-export row audit.
     ///
     /// By default `validate` resolves the destination prefix the same way
     /// `run` does — `{date}` becomes today's UTC date.  Use `--date`,
@@ -390,7 +391,7 @@ pub enum StateAction {
         #[arg(short, long)]
         export: String,
     },
-    /// Show committed / verified export boundaries (Epic G / ADR-0008)
+    /// Show committed / verified export boundaries (the last fully-exported cursor position)
     Progression {
         #[arg(short, long)]
         config: String,

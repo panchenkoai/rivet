@@ -259,6 +259,17 @@ pub fn init(
                     yaml_scaffold::INIT_DECIMAL_REVIEW_MARKER
                 );
             }
+            // Don't leave the user holding a cold artifact — show the path from
+            // "I have a config" to "I have parquet files". Only for the YAML
+            // scaffold (the discovery JSON isn't runnable).
+            if matches!(format, InitFormat::Yaml) {
+                eprintln!(
+                    "\nNext steps:\n  \
+                     1. rivet doctor -c {path}            # test source + destination auth\n  \
+                     2. rivet check  -c {path}            # column-type & schema report\n  \
+                     3. rivet run    -c {path} --validate # export, then verify row counts"
+                );
+            }
         }
         None => print!("{text}"),
     }
