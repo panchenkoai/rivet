@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.9.5 (2026-06-09) — hot-path perf + benchmark-driven strategy corrections
+
+Squeezes the row→Arrow→Parquet decode path and turns a three-engine A/B
+benchmark (full vs chunked-parallel, on the same 2 M-wide and 10 M-narrow
+tables, with perf **and** DBA-harm signals) into concrete, measured fixes. No
+public-API breaks.
+
+### Performance
+
+- **`perf(mysql)` — SIMD-validate text columns on decode.** The MySQL
+  row→Arrow text-column append used `String::from_utf8_lossy` (scalar
+  validation) while every other text path in the file — and the whole Postgres
+  decoder — already used the `simdutf8` helper. Switched the high-volume path
+  to a simdutf8 fast path with a lossy fallback: **2.33× faster UTF-8
+  validation** on wide text (criterion `mysql_utf8_text_append`), byte-identical
+  output. (Rides on this line's earlier `opt-level = 3` and on-by-default write
+  pipelining.)
+
+### Fixed
+
+- **`fix(retry)` — a statement-duration timeout is no longer retried.** PG
+  `statement_timeout` (57014), MySQL `max_execution_time`, and the MSSQL
+  client-side cap were classed transient, so an unchunked full-scan that
+  exceeds the budget re-failed identically up to 3× — measured at **20 m 22 s
+  for 0 rows** on a 2 M-row MSSQL full export. Now classified permanent (lock-
+  wait / network timeouts stay transient) and the MSSQL message says to use
+  `mode: chunked` or raise the budget. Same export now fails in **5 m 20 s
+  (one attempt)**. Regression tests added.
+
+### Changed
+
+- **`feat(init)` — strategy defaults are cost-, engine-, and memory-aware.**
+  The A/B benchmark showed "parallel = faster" is false in general: a win on
+  Postgres (2.1× + ~5× less VACUUM-horizon bloat), a regression on wide MySQL
+  (already a fast sequential scan), and mandatory on SQL Server (a full
+  statement times out). `suggest_parallel` now factors introspected
+  `avg_row_bytes` and the engine (wide MySQL stays single-threaded), and emits
+  the **predicted peak RSS** as a comment — a memory sweep established that peak
+  RSS scales with `batch_size` × row width × worker count, **not** `chunk_size`.
+
+### Docs
+
+- **`docs(bench)` — `REPORT_full_vs_parallel.md`**: the full three-engine A/B
+  (perf + DBA-harm: longest open txn, PG xmin-horizon age, peak connections),
+  the narrow-vs-wide reversal, the memory-footprint sweep, and the six
+  corrections it justifies.
+
 ## 0.9.4 (2026-06-08) — source-engine parity (Epic 18): MySQL/SQL Server → PostgreSQL gold standard
 
 Closes the per-engine gap between MySQL / SQL Server and the PostgreSQL
