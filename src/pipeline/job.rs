@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::config::{Config, ExportConfig};
-use crate::error::Result;
+use crate::error::{DataIntegrityError, Result};
 use crate::plan::{
     DiagnosticLevel, ExtractionStrategy, ResolvedRunPlan, build_plan, validate_plan,
 };
@@ -46,13 +46,16 @@ fn run_chunked_quality_gate(
         summary.quality_passed = Some(false);
         // Surface *which* checks failed via the shared failure contract — see
         // `crate::quality::failure_message`. (Chunked mode only aggregates
-        // row_count; null/unique are per-chunk and warn-logged above.)
+        // row_count; null/unique are per-chunk and warn-logged above.) Tagged as
+        // a data-integrity failure (exit 3) so a scheduler stops rather than
+        // retries; the message text is unchanged.
         let fails: Vec<&str> = row_issues.iter().map(|i| i.message.as_str()).collect();
-        anyhow::bail!(crate::quality::failure_message(
+        return Err(DataIntegrityError::new(crate::quality::failure_message(
             &plan.export_name,
             Some("chunked aggregate"),
-            &fails
-        ));
+            &fails,
+        ))
+        .into());
     }
 
     summary.quality_passed = Some(true);
@@ -751,6 +754,13 @@ mod tests {
             msg.contains("  - "),
             "error must surface the specific failing check(s), not just a generic message: {err}"
         );
+        // The chunked quality bail carries the DataIntegrityError marker → exit
+        // class 3 (STOP). The operator message is unchanged (asserted above).
+        assert!(
+            err.downcast_ref::<DataIntegrityError>().is_some(),
+            "chunked quality-gate failure must be a typed data-integrity error"
+        );
+        assert_eq!(crate::error::classify_exit(&err), 3);
         assert_eq!(summary.quality_passed, Some(false));
     }
 

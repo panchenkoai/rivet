@@ -26,7 +26,9 @@ mod reconcile_cmd;
 mod repair_cmd;
 pub(crate) mod report;
 mod resume_decisions;
-mod retry;
+// `pub(crate)` so `error::classify_exit` can reach `retry::classify_error`
+// (transient → exit-code 2) without routing through the test-only re-export.
+pub(crate) mod retry;
 // The `rivet run` orchestrator (~290 LOC) lives next door so this facade
 // stays a thin re-export layer.  Module name shadows `pub fn run` below;
 // the duplicate is resolved by Rust's namespace rules (modules live in

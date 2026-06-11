@@ -13,7 +13,7 @@ use super::retry::{RetryClass, classify_error};
 use super::sink::{CompletedPart, ExportSink};
 use super::validate::validate_output;
 use crate::config::SchemaDriftPolicy;
-use crate::error::Result;
+use crate::error::{DataIntegrityError, Result, SchemaDriftError};
 use crate::journal::RunEvent;
 use crate::plan::{ExtractionStrategy, ResolvedRunPlan};
 use crate::source::{self, Source};
@@ -130,14 +130,18 @@ fn decide_export_retry(
         return ExportRetry::BailOriginal;
     }
     if files_committed > 0 {
-        return ExportRetry::BailDuplicateGuard(anyhow::anyhow!(
-            "export '{}': transient error after {} file(s) written to destination \
-             — cannot safely retry (would duplicate rows). \
-             Run `rivet reconcile` to verify state. Original error: {:#}",
-            export_name,
-            files_committed,
-            err
-        ));
+        // Data-integrity stop (exit 3): rows already landed and a same-cursor
+        // retry would duplicate them. Typed marker so a scheduler does not treat
+        // the underlying *transient* cause as safe-to-retry. Message verbatim.
+        return ExportRetry::BailDuplicateGuard(
+            DataIntegrityError::new(format!(
+                "export '{}': transient error after {} file(s) written to destination \
+                 — cannot safely retry (would duplicate rows). \
+                 Run `rivet reconcile` to verify state. Original error: {:#}",
+                export_name, files_committed, err
+            ))
+            .into(),
+        );
     }
     ExportRetry::Retry
 }
@@ -276,12 +280,15 @@ pub(super) fn run_single_export(
             summary.quality_passed = Some(false);
             // Surface *which* checks failed (they're already computed +
             // warn-logged above) via the shared failure contract in
-            // `crate::quality` so single and chunked modes can't drift.
-            anyhow::bail!(crate::quality::failure_message(
+            // `crate::quality` so single and chunked modes can't drift. Tagged
+            // as a data-integrity failure (exit 3) so a scheduler stops rather
+            // than retries — the message text is unchanged.
+            return Err(DataIntegrityError::new(crate::quality::failure_message(
                 &plan.export_name,
                 None,
-                &fails
-            ));
+                &fails,
+            ))
+            .into());
         }
     }
     if plan.quality.is_some() {
@@ -445,7 +452,11 @@ pub(super) fn run_single_export(
                         for (col, old, new) in &change.type_changed {
                             log::error!("  type changed: {} ({} → {})", col, old, new);
                         }
-                        return Err(anyhow::anyhow!(
+                        // Schema-drift stop (exit 4): the source shape changed
+                        // and `on_schema_drift: fail` is set. Typed marker so a
+                        // scheduler routes to human review, not a blind retry.
+                        // Message verbatim.
+                        return Err(SchemaDriftError::new(format!(
                             "schema drift detected for export '{}': \
                              {} column(s) added, {} removed, {} retyped — \
                              set `on_schema_drift: warn` to accept, or fix the schema mismatch",
@@ -453,7 +464,8 @@ pub(super) fn run_single_export(
                             change.added.len(),
                             change.removed.len(),
                             change.type_changed.len()
-                        ));
+                        ))
+                        .into());
                     }
                 }
             }
@@ -701,6 +713,13 @@ mod tests {
             err.to_string().contains("quality"),
             "expected quality error: {err}"
         );
+        // The quality bail carries the DataIntegrityError marker → exit class 3
+        // (STOP), and the operator message is unchanged (asserted above).
+        assert!(
+            err.downcast_ref::<DataIntegrityError>().is_some(),
+            "quality-gate failure must be a typed data-integrity error"
+        );
+        assert_eq!(crate::error::classify_exit(&err), 3);
         assert_eq!(summary.quality_passed, Some(false));
     }
 
@@ -776,6 +795,25 @@ mod tests {
             }
             other => panic!("expected BailDuplicateGuard, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn duplicate_guard_is_typed_data_integrity_exit_3() {
+        // The duplicate-guard bail must carry the DataIntegrityError marker so
+        // `classify_exit` returns 3 (STOP, do not blindly retry) — even though
+        // the *underlying* cause was transient. A scheduler must not treat a
+        // possibly-duplicated dataset as safe-to-retry.
+        let err = transient_err();
+        let d = decide_export_retry(1, 3, 2, "orders", &err);
+        let synth = match d {
+            ExportRetry::BailDuplicateGuard(e) => e,
+            other => panic!("expected BailDuplicateGuard, got {other:?}"),
+        };
+        assert!(
+            synth.downcast_ref::<DataIntegrityError>().is_some(),
+            "duplicate-guard bail must carry the DataIntegrityError marker"
+        );
+        assert_eq!(crate::error::classify_exit(&synth), 3);
     }
 
     #[test]
