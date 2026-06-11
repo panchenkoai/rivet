@@ -71,10 +71,20 @@ fn transient(needs_reconnect: bool, extra_delay_ms: u64) -> RetryClass {
 
 /// Classifies transient errors into retry categories.
 ///
-/// Checks Postgres SQLSTATE codes and MySQL error codes first, then falls back
-/// to string matching for errors that don't carry structured codes (e.g. IO,
-/// cloud credential errors).
+/// Order: a typed [`crate::source::StatementDurationTimeout`] marker
+/// (rivet-raised, robust to wording), then structured Postgres SQLSTATE /
+/// MySQL error codes, then a string fallback for errors that carry no
+/// structured signal (IO, cloud credentials, driver-native timeout prose).
 pub fn classify_error(err: &anyhow::Error) -> RetryClass {
+    // --- Typed marker: rivet-raised statement-duration timeout (deterministic) ---
+    // Downcast the TYPE so permanence does not depend on the Display wording.
+    if err
+        .downcast_ref::<crate::source::StatementDurationTimeout>()
+        .is_some()
+    {
+        return PERMANENT;
+    }
+
     // --- Postgres: check SQLSTATE via the `postgres::Error` downcasted type ---
     if let Some(pg) = err.downcast_ref::<postgres::Error>() {
         if let Some(db) = pg.as_db_error() {
@@ -286,6 +296,12 @@ fn classify_mysql_error(err: &mysql::Error) -> Option<RetryClass> {
             1213 => Some(transient(false, 1_000)),
             // ER_LOCK_WAIT_TIMEOUT
             1205 => Some(TRANSIENT_SAME_CONN),
+            // ER_QUERY_TIMEOUT (3024): `max_execution_time` / `MAX_EXECUTION_TIME`
+            // fired — a deterministic statement-DURATION timeout. The identical
+            // query re-times-out, so retrying just burns the budget again.
+            // Classified by code here so permanence does not depend on the
+            // English server message reaching the string path below.
+            3024 => Some(PERMANENT),
             // ER_CON_COUNT_ERROR (too many connections) / ER_SERVER_SHUTDOWN
             1040 | 1053 => Some(transient(true, 15_000)),
             // ER_ACCESS_DENIED_ERROR, ER_DBACCESS_DENIED_ERROR
@@ -406,6 +422,76 @@ mod tests {
             classify_pg_sqlstate(&SqlState::T_R_DEADLOCK_DETECTED).is_transient(),
             "PG 40P01 deadlock must stay retryable"
         );
+    }
+
+    /// WIP-completion / roast finding: MySQL `max_execution_time` raises
+    /// ER_QUERY_TIMEOUT (3024) as a STRUCTURED error. Classifying it by numeric
+    /// code (not the English message) makes permanence robust to a reworded /
+    /// localized server string. Today 3024 is unhandled in classify_mysql_error
+    /// (returns None) and falls to the string path, where a message containing
+    /// "timed out" is wrongly classified TRANSIENT_SAME_CONN — exactly the
+    /// 3×budget-burn the duration-timeout rule exists to prevent.
+    #[test]
+    fn test_mysql_query_timeout_code_3024_is_permanent() {
+        let err = mysql::Error::MySqlError(mysql::error::MySqlError {
+            state: "HY000".to_string(),
+            // A reworded message that contains a transient needle ("timed out")
+            // but NOT the English duration needles — proves we classify on the
+            // CODE, not the prose.
+            message: "Query interrupted: timed out".to_string(),
+            code: 3024,
+        });
+        let c = classify_error(&anyhow::Error::new(err));
+        assert_eq!(
+            c, PERMANENT,
+            "MySQL ER_QUERY_TIMEOUT (3024) is a deterministic duration timeout — must be permanent regardless of message wording"
+        );
+    }
+
+    /// The typed [`StatementDurationTimeout`] marker classifies PERMANENT via
+    /// downcast — BEFORE the string path runs. Proven robust here: even when the
+    /// error is wrapped in anyhow context (as it is on the way up the export
+    /// stack), the type survives and wins over any wording. Guards the MSSQL
+    /// fix against a future message reword silently flipping it to transient.
+    #[test]
+    fn test_statement_duration_timeout_typed_marker_is_permanent() {
+        use crate::source::StatementDurationTimeout;
+        let typed: anyhow::Error = StatementDurationTimeout::mssql(300).into();
+        assert_eq!(
+            classify_error(&typed),
+            PERMANENT,
+            "typed duration-timeout marker must be permanent"
+        );
+        // Survives context wrapping (anyhow downcast walks the chain).
+        let wrapped = typed.context("export 'orders': chunk 4 failed");
+        assert_eq!(
+            classify_error(&wrapped),
+            PERMANENT,
+            "typed marker must survive anyhow context wrapping"
+        );
+        // The user-facing Display still carries the actionable remediation.
+        let msg = format!("{}", StatementDurationTimeout::mssql(300));
+        assert!(
+            msg.contains("mode: chunked") && msg.contains("statement_timeout_s"),
+            "Display must keep the actionable hint: {msg}"
+        );
+    }
+
+    /// Belt-and-suspenders: the string fallback still classifies a genuinely
+    /// driver-native duration-timeout message (one we do NOT raise ourselves)
+    /// as permanent, so engines without a typed marker stay covered.
+    #[test]
+    fn test_native_duration_timeout_string_still_permanent() {
+        for msg in [
+            "canceling statement due to statement timeout",
+            "Query execution was interrupted, maximum statement execution time exceeded",
+        ] {
+            assert_eq!(
+                classify_error(&anyhow::anyhow!("{}", msg)),
+                PERMANENT,
+                "native duration-timeout string must stay permanent: {msg}"
+            );
+        }
     }
 
     #[test]

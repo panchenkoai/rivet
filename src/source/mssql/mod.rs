@@ -567,13 +567,14 @@ impl Source for MssqlSource {
                 if let Some(budget) = stmt_timeout
                     && started.elapsed() > budget
                 {
-                    anyhow::bail!(
-                        "mssql: statement timeout after {}s (tuning.statement_timeout_s) — \
-                         this query cannot finish within the budget; split it with \
-                         `mode: chunked` (per-chunk statements stay under the limit) or \
-                         raise `tuning.statement_timeout_s`",
-                        budget.as_secs()
-                    );
+                    // Typed marker (not a bare string): the retry classifier
+                    // downcasts the TYPE → permanent, so a reworded message can
+                    // never silently make this deterministic timeout retryable.
+                    // Its Display carries the same actionable hint for the user.
+                    return Err(crate::source::StatementDurationTimeout::mssql(
+                        budget.as_secs(),
+                    )
+                    .into());
                 }
                 match item {
                     // A single SELECT yields one metadata token (the column
