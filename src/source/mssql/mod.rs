@@ -591,14 +591,10 @@ impl Source for MssqlSource {
             let mut columns: Vec<tiberius::Column> = Vec::new();
             let mut buf: Vec<tiberius::Row> = Vec::with_capacity(ctl.target());
             let mut schema: Option<SchemaRef> = None;
-            // Per-value ceiling, computed exactly as the sink does (MB→bytes; `0`
-            // or None disables). Enforced pre-allocation inside the batch builder
-            // so an oversized cell bails before Arrow reserves the buffer.
-            let max_value_bytes = request
-                .tuning
-                .max_value_mb
-                .filter(|&mb| mb > 0)
-                .map(|mb| mb * 1024 * 1024);
+            // Per-value ceiling (MB→bytes; `0`/None disables), enforced
+            // pre-allocation inside the batch builder so an oversized cell bails
+            // before Arrow reserves the buffer. Same source of truth as the sink.
+            let max_value_bytes = request.tuning.max_value_bytes();
 
             while let Some(item) = stream
                 .try_next()

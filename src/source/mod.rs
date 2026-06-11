@@ -281,6 +281,66 @@ pub fn create_source(config: &SourceConfig) -> Result<Box<dyn Source>> {
     }
 }
 
+/// Pre-allocation per-value size guard, shared by every engine's
+/// `arrow_convert`. The sink-side `check_value_ceiling`
+/// (`pipeline::sink::mod`) scans the *already-built* Arrow batch, so an
+/// oversized cell costs the driver-decode copy **and** the Arrow-build copy
+/// before that guard fires. This check runs at the decode/`Value` stage — after
+/// the unavoidable driver copy, but *before* the value is appended into the
+/// `StringBuilder` / `BinaryBuilder` — so the Arrow allocation never grows to
+/// hold it. Only variable-length values (Utf8 / Binary) can be individually
+/// huge; fixed-width arms (ints/floats/dates) never call this.
+///
+/// `max_value_bytes` is `tuning.max_value_bytes()` (MB → bytes with the
+/// `Some(0)`/`None` ⇒ disabled semantics). The message mirrors the sink guard's
+/// `RIVET_VALUE_TOO_LARGE` so both read identically; the sink guard stays as the
+/// backstop (it also covers meta / enriched columns and is the contract test).
+pub(crate) fn value_within_ceiling(
+    column: &str,
+    len: usize,
+    max_value_bytes: Option<usize>,
+) -> Result<()> {
+    if let Some(limit) = max_value_bytes
+        && len > limit
+    {
+        anyhow::bail!(
+            "RIVET_VALUE_TOO_LARGE: column '{}' has a single value of {:.1} MB, exceeding the \
+             per-value ceiling of {} MB. One oversized cell can OOM the process regardless of \
+             batch size. Raise `tuning.max_value_mb` (or set it to 0 to disable the guard) if \
+             this value is expected.",
+            column,
+            len as f64 / (1024.0 * 1024.0),
+            limit / (1024 * 1024),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod value_ceiling_tests {
+    use super::value_within_ceiling;
+
+    #[test]
+    fn sec_value_ceiling_pre_alloc_over_limit_errors() {
+        let err = value_within_ceiling("payload", 2 * 1024 * 1024, Some(1024 * 1024)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("RIVET_VALUE_TOO_LARGE"), "got: {msg}");
+        assert!(msg.contains("payload"), "names the column: {msg}");
+    }
+
+    #[test]
+    fn sec_value_ceiling_pre_alloc_at_or_under_limit_ok() {
+        assert!(value_within_ceiling("c", 1024 * 1024, Some(1024 * 1024)).is_ok());
+        assert!(value_within_ceiling("c", 0, Some(1024 * 1024)).is_ok());
+    }
+
+    #[test]
+    fn sec_value_ceiling_pre_alloc_disabled_never_errors() {
+        // `None` (set when tuning.max_value_mb is 0 or unset) disables the guard.
+        assert!(value_within_ceiling("c", usize::MAX, None).is_ok());
+    }
+}
+
 /// One-time nudge to enable TLS when the current config connects in plaintext.
 /// Emitted at `warn` level so operators see it even at the default log level.
 /// `create_source` is called multiple times per run (plan/preflight/exec/chunk

@@ -508,13 +508,10 @@ fn mysql_run_export(
     let mut row_buf: Vec<mysql::Row> = Vec::with_capacity(ctl.target());
     let mut total_rows: usize = 0;
     let mut memory_cap_applied = false;
-    // Per-value ceiling, computed exactly as the sink does (MB→bytes; `0` or
-    // None disables). Enforced pre-allocation inside the batch builder so an
-    // oversized cell bails before Arrow reserves the buffer.
-    let max_value_bytes = tuning
-        .max_value_mb
-        .filter(|&mb| mb > 0)
-        .map(|mb| mb * 1024 * 1024);
+    // Per-value ceiling (MB→bytes; `0`/None disables), enforced pre-allocation
+    // inside the batch builder so an oversized cell bails before Arrow reserves
+    // the buffer. Same source of truth as the sink's backstop guard.
+    let max_value_bytes = tuning.max_value_bytes();
 
     for row_result in row_set {
         let row = row_result?;

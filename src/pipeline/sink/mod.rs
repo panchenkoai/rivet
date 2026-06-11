@@ -128,11 +128,7 @@ impl ExportSink {
             column_max_bytes: std::collections::HashMap::new(),
             max_batch_memory_bytes: plan.tuning.max_batch_memory_mb.map(|mb| mb * 1024 * 1024),
             // `0` (or None) disables the per-value guard; otherwise convert MB→bytes.
-            max_value_bytes: plan
-                .tuning
-                .max_value_mb
-                .filter(|&mb| mb > 0)
-                .map(|mb| mb * 1024 * 1024),
+            max_value_bytes: plan.tuning.max_value_bytes(),
             batch_memory_policy: plan.tuning.on_batch_memory_exceeded,
             oversized_batch_count: 0,
             parquet_config: plan.parquet.clone(),

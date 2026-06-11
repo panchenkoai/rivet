@@ -127,6 +127,17 @@ pub fn merge_tuning_config(
 }
 
 impl SourceTuning {
+    /// The per-value byte ceiling: `max_value_mb` converted to bytes, with
+    /// `Some(0)` / `None` meaning "disabled". Single source of truth shared by
+    /// the sink's post-materialization guard (`sink::check_value_ceiling`) and
+    /// the per-engine pre-allocation guard (`source::value_within_ceiling`), so
+    /// the two definitions of "0 disables" can never drift apart.
+    pub(crate) fn max_value_bytes(&self) -> Option<usize> {
+        self.max_value_mb
+            .filter(|&mb| mb > 0)
+            .map(|mb| mb * 1024 * 1024)
+    }
+
     /// Build tuning with the legacy `Balanced` fallback. Public for downstream
     /// callers and tests; production resolution in [`crate::plan::build`] uses
     /// [`Self::from_config_with_default_profile`] so that `source.environment:`
