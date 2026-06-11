@@ -31,8 +31,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use chrono::Timelike as _;
 use postgres::Row;
-use postgres::types::{FromSql as PgFromSql, Json, Kind, Type};
-use serde_json::Value as JsonValue;
+use postgres::types::{FromSql as PgFromSql, Kind, Type};
 
 use crate::error::Result;
 use crate::source::pg_numeric_wire::{PgNumericWire, numeric_wire_normalized_plain};
@@ -73,6 +72,43 @@ impl<'a> PgFromSql<'a> for PgUuidBytes {
         }
         let text = simdutf8::basic::from_utf8(raw)?.trim();
         Ok(Self(*uuid::Uuid::parse_str(text)?.as_bytes()))
+    }
+}
+
+/// PostgreSQL `json` / `jsonb` cells borrowed as their raw source text.
+///
+/// The wire payload already IS the JSON text: `json_send` transmits the
+/// stored bytes verbatim and `jsonb_send` prefixes them with a one-byte
+/// format version (always `1`). The old `Json<serde_json::Value>` read
+/// re-serialized the document, rounding non-integer numbers through `f64`
+/// (>17 significant digits silently altered) and normalising the whitespace
+/// a PG `json` column stores verbatim. Validating UTF-8 and appending the
+/// payload directly keeps byte fidelity at zero parse cost.
+///
+/// Only the binary format is handled: every data-row fetch in this source
+/// goes through `client.query` (extended protocol, binary results), and the
+/// version-byte check mirrors the `postgres` crate's own `Json<T>` reader,
+/// so failure behavior is unchanged.
+struct PgJsonRawText<'a>(&'a str);
+
+impl<'a> PgFromSql<'a> for PgJsonRawText<'a> {
+    fn accepts(ty: &Type) -> bool {
+        ty == &Type::JSON || ty == &Type::JSONB
+    }
+
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let payload = if *ty == Type::JSONB {
+            match raw.split_first() {
+                Some((&1, rest)) => rest,
+                _ => return Err("unsupported JSONB wire format version (expected 1)".into()),
+            }
+        } else {
+            raw
+        };
+        Ok(Self(simdutf8::basic::from_utf8(payload)?))
     }
 }
 
@@ -544,12 +580,15 @@ fn build_pg_text_array(pg_type: &Type, col_idx: usize, rows: &[Row]) -> Result<A
                 b.append_option(val.as_deref());
             }
         }
-        // `postgres` rejects `String` for these OIDs — read via `Json`.
+        // `postgres` rejects `String` for these OIDs. Read the wire payload as
+        // raw source text (`PgJsonRawText`) instead of round-tripping through
+        // `serde_json::Value`, which mangled high-precision numbers (via f64)
+        // and normalised `json` whitespace.
         Type::JSON | Type::JSONB => {
             for row in rows {
-                match row.try_get::<_, Option<Json<JsonValue>>>(col_idx)? {
+                match row.try_get::<_, Option<PgJsonRawText<'_>>>(col_idx)? {
                     None => b.append_null(),
-                    Some(Json(v)) => b.append_value(&serde_json::to_string(&v)?),
+                    Some(PgJsonRawText(text)) => b.append_value(text),
                 }
             }
         }

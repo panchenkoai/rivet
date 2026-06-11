@@ -711,6 +711,15 @@ mod tests {
         assert_eq!(bit_bytes_to_u64(&[]), 0);
     }
 
+    #[test]
+    fn bit_bytes_ascii_digit_bytes_are_bits_not_text() {
+        // Regression (mysql-bit): BIT bytes that happen to be ASCII digits are
+        // still big-endian bits — never decimal text.
+        assert_eq!(bit_bytes_to_u64(&[0x39]), 57); // "9" as text, BIT(8) 57
+        assert_eq!(bit_bytes_to_u64(&[0x31, 0x32]), 0x3132); // b"12" → 12594
+        assert_eq!(bit_bytes_to_u64(&[0x31, 0xFF]), 12799); // digit head, non-digit tail
+    }
+
     // ── InnoDB AVG_ROW_LENGTH correction ────────────────────────────────
 
     #[test]

@@ -28,7 +28,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use mysql::Value;
-use mysql::consts::ColumnFlags;
+use mysql::consts::{ColumnFlags, ColumnType};
 
 use crate::error::Result;
 use crate::types::{
@@ -302,9 +302,18 @@ pub(super) fn rows_to_record_batch_typed(
     arrow_types: &[DataType],
     rows: &[mysql::Row],
 ) -> Result<RecordBatch> {
+    // BIT columns put raw big-endian bytes on the wire, indistinguishable from
+    // decimal text by inspecting the value alone (BIT(16) 0x3132 *is* the bytes
+    // of "12"). `mysql::Row` carries the wire column metadata, so consult it
+    // per column instead of guessing per value.
+    let wire_columns = rows.first().map(|r| r.columns_ref());
     let mut arrays: Vec<Arc<dyn Array>> = Vec::with_capacity(arrow_types.len());
     for (col_idx, arrow_type) in arrow_types.iter().enumerate() {
-        arrays.push(build_array(arrow_type, col_idx, rows)?);
+        let is_bit = wire_columns.is_some_and(|cols| {
+            cols.get(col_idx)
+                .is_some_and(|c| matches!(c.column_type(), ColumnType::MYSQL_TYPE_BIT))
+        });
+        arrays.push(build_array(arrow_type, col_idx, rows, is_bit)?);
     }
     Ok(RecordBatch::try_new(schema.clone(), arrays)?)
 }
@@ -331,6 +340,25 @@ where
 /// MySQL sends BIT(n) values as ceil(n/8) big-endian bytes in the binary protocol.
 pub(super) fn bit_bytes_to_u64(b: &[u8]) -> u64 {
     b.iter().fold(0u64, |acc, &byte| acc << 8 | u64::from(byte))
+}
+
+/// Decode an Int64 cell that arrived as `Value::Bytes`. BIT columns carry raw
+/// big-endian bits; everything else (an integer in the text protocol, or a
+/// TEXT column overridden to int64) carries UTF-8 decimal text. The two
+/// encodings collide whenever the bit bytes happen to be ASCII digits, so the
+/// column's BIT-ness — from the wire metadata, not the value's shape — picks
+/// the decoder. Non-numeric text yields `None` (null, matching the Int16/Int32
+/// arms); out-of-range values error loudly rather than wrap.
+fn int64_from_bytes(bv: &[u8], is_bit: bool) -> Result<Option<i64>> {
+    if is_bit {
+        // BIT(64) with bit 63 set exceeds i64 — error (the operator can map it
+        // to `decimal(20,0)`), never wrap into a negative.
+        return Ok(Some(narrow::<i64>(bit_bytes_to_u64(bv) as i128, "bit")?));
+    }
+    match atoi::atoi::<i128>(bv) {
+        Some(v) => Ok(Some(narrow::<i64>(v, "bigint")?)),
+        None => Ok(None),
+    }
 }
 
 /// Parse MySQL text-protocol TIME string ("HH:MM:SS", "-HHH:MM:SS", "HH:MM:SS.uuuuuu")
@@ -369,6 +397,7 @@ fn build_array(
     arrow_type: &DataType,
     col_idx: usize,
     rows: &[mysql::Row],
+    is_bit: bool,
 ) -> Result<Arc<dyn Array>> {
     match arrow_type {
         DataType::Boolean => {
@@ -443,13 +472,10 @@ fn build_array(
                     // builder — error loudly (the operator should map it to
                     // `decimal(20,0)`) rather than wrap into a negative.
                     Some(Value::UInt(v)) => b.append_value(narrow::<i64>(*v as i128, "bigint")?),
-                    Some(Value::Bytes(bv)) => {
-                        // BIT(n>1) columns arrive as raw big-endian bytes; TEXT columns as UTF-8.
-                        // Try decimal parse first; fall back to big-endian uint interpretation.
-                        let v =
-                            atoi::atoi::<i64>(bv).unwrap_or_else(|| bit_bytes_to_u64(bv) as i64);
-                        b.append_value(v);
-                    }
+                    Some(Value::Bytes(bv)) => match int64_from_bytes(bv, is_bit)? {
+                        Some(v) => b.append_value(v),
+                        None => b.append_null(),
+                    },
                     _ => b.append_null(),
                 }
             }
@@ -898,5 +924,259 @@ mod utf8_fast_path_tests {
                 "fast path diverged from lossy for {bv:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod int64_bytes_dispatch_tests {
+    use super::int64_from_bytes;
+
+    // Regression (mysql-bit): the Int64 arm used to atoi-first on raw bytes,
+    // misdecoding any BIT value whose first byte is an ASCII digit (atoi also
+    // ignores trailing non-digits). The column's BIT-ness — not the value's
+    // shape — picks the decoder.
+
+    #[test]
+    fn bit_bytes_decode_big_endian_even_when_ascii_digits() {
+        // BIT(8) 0x39 is also the text "9" — must decode as 57, not 9.
+        assert_eq!(int64_from_bytes(&[0x39], true).unwrap(), Some(57));
+        // BIT(16) 0x3132 is also the text "12" — the RED-test value, 12594.
+        assert_eq!(int64_from_bytes(&[0x31, 0x32], true).unwrap(), Some(0x3132));
+        // Digit first byte + non-digit tail: atoi would yield 1, truth is 12799.
+        assert_eq!(int64_from_bytes(&[0x31, 0xFF], true).unwrap(), Some(12799));
+        // Non-digit bytes were the only case the old fallback got right.
+        assert_eq!(int64_from_bytes(&[0xAB, 0xCD], true).unwrap(), Some(0xABCD));
+    }
+
+    #[test]
+    fn bit64_top_bit_set_errors_not_wraps() {
+        // BIT(64) all-ones exceeds i64::MAX; wrapping to -1 would corrupt.
+        assert!(int64_from_bytes(&[0xFF; 8], true).is_err());
+        // The lossless neighbor: exactly i64::MAX still rides.
+        assert_eq!(
+            int64_from_bytes(&[0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], true).unwrap(),
+            Some(i64::MAX)
+        );
+    }
+
+    #[test]
+    fn text_bytes_follow_the_int_arm_mismatch_policy() {
+        assert_eq!(int64_from_bytes(b"12", false).unwrap(), Some(12));
+        assert_eq!(int64_from_bytes(b"-42", false).unwrap(), Some(-42));
+        // Non-numeric text overridden to int64 → null (matching the Int16/Int32
+        // arms), never big-endian garbage from a bit fallback.
+        assert_eq!(int64_from_bytes(b"hello", false).unwrap(), None);
+        assert_eq!(int64_from_bytes(b"", false).unwrap(), None);
+        // Out-of-range numeric text errors (overflow) rather than nulling.
+        assert!(int64_from_bytes(b"9223372036854775808", false).is_err());
+        assert_eq!(
+            int64_from_bytes(b"9223372036854775807", false).unwrap(),
+            Some(i64::MAX)
+        );
+    }
+}
+
+// ROAST-RED mysql-bit-decode: the Int64 builder arm in `build_array` tries an
+// ASCII-decimal parse (`atoi`) on `Value::Bytes` BEFORE the big-endian BIT
+// decode (`bit_bytes_to_u64`), so any BIT(n>1) value whose first byte happens
+// to be an ASCII digit is silently misdecoded (atoi also ignores trailing
+// non-digits). BIT(16) value 0x3132 arrives as bytes b"12" and decodes as 12
+// instead of 12594.
+// Asserts CORRECT behavior; expected to FAIL until the fix lands.
+#[cfg(test)]
+mod roast_mysql_bit_decode_tests {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use arrow::array::{Array, Int64Array};
+    use arrow::datatypes::DataType;
+    use mysql::consts::ColumnType;
+    use mysql::prelude::Queryable;
+    use mysql::{Conn, OptsBuilder, Value};
+
+    use super::{mysql_schema_and_arrow_types, rows_to_record_batch_typed};
+    use crate::types::ColumnOverrides;
+
+    // ── minimal fake MySQL server ─────────────────────────────────────────────
+    //
+    // `mysql::Row` has no public constructor reachable from this crate's
+    // feature set (`new_row` lives in `mysql_common`, which is not a direct
+    // dependency, and the `binlog` escape hatch is feature-gated off), so the
+    // only way to obtain real driver rows deterministically is to speak just
+    // enough of the wire protocol: handshake → auth OK → one text-protocol
+    // resultset with a single BIT(16) column. This also carries the
+    // `mysql::Column` metadata (MYSQL_TYPE_BIT) the decoder needs to consult.
+
+    /// Frame a payload as a MySQL protocol packet: 3-byte LE length + seq id.
+    fn write_packet(stream: &mut TcpStream, seq: u8, payload: &[u8]) {
+        let len = payload.len();
+        let header = [len as u8, (len >> 8) as u8, (len >> 16) as u8, seq];
+        stream
+            .write_all(&header)
+            .expect("fake MySQL server: write packet header");
+        stream
+            .write_all(payload)
+            .expect("fake MySQL server: write packet payload");
+    }
+
+    /// Read one client packet (header + payload); contents are ignored.
+    fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
+        let mut header = [0u8; 4];
+        stream
+            .read_exact(&mut header)
+            .expect("fake MySQL server: read packet header");
+        let len = u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
+        let mut payload = vec![0u8; len];
+        stream
+            .read_exact(&mut payload)
+            .expect("fake MySQL server: read packet payload");
+        payload
+    }
+
+    /// Length-encoded string (all our strings are < 251 bytes).
+    fn lenc_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+        debug_assert!(bytes.len() < 251);
+        out.push(bytes.len() as u8);
+        out.extend_from_slice(bytes);
+    }
+
+    /// HandshakeV10 greeting advertising PROTOCOL_41 | SECURE_CONNECTION |
+    /// PLUGIN_AUTH with `mysql_native_password`.
+    fn handshake_greeting() -> Vec<u8> {
+        let mut p = Vec::new();
+        p.push(0x0a); // protocol version 10
+        p.extend_from_slice(b"8.0.99\0"); // server version
+        p.extend_from_slice(&1u32.to_le_bytes()); // connection id
+        p.extend_from_slice(b"abcdefgh"); // auth plugin data part 1 (8 bytes)
+        p.push(0x00); // filler
+        // capabilities lower half:
+        // CLIENT_LONG_PASSWORD (0x0001) | CLIENT_PROTOCOL_41 (0x0200)
+        // | CLIENT_SECURE_CONNECTION (0x8000)
+        p.extend_from_slice(&0x8201u16.to_le_bytes());
+        p.push(0x21); // default collation: utf8_general_ci
+        p.extend_from_slice(&0x0002u16.to_le_bytes()); // status: AUTOCOMMIT
+        // capabilities upper half: CLIENT_PLUGIN_AUTH (0x0008_0000 >> 16)
+        p.extend_from_slice(&0x0008u16.to_le_bytes());
+        p.push(21); // auth plugin data total length (20 + NUL terminator)
+        p.extend_from_slice(&[0u8; 10]); // reserved
+        p.extend_from_slice(b"ijklmnopqrst\0"); // auth plugin data part 2 (13 bytes)
+        p.extend_from_slice(b"mysql_native_password\0");
+        p
+    }
+
+    /// ColumnDefinition41 for a `BIT(16)` column named `b`.
+    fn bit16_column_definition() -> Vec<u8> {
+        let mut p = Vec::new();
+        lenc_bytes(&mut p, b"def"); // catalog (fixed value)
+        lenc_bytes(&mut p, b""); // schema
+        lenc_bytes(&mut p, b"t"); // table
+        lenc_bytes(&mut p, b"t"); // org_table
+        lenc_bytes(&mut p, b"b"); // name
+        lenc_bytes(&mut p, b"b"); // org_name
+        p.push(0x0c); // length of fixed-length fields
+        p.extend_from_slice(&63u16.to_le_bytes()); // character set: binary
+        p.extend_from_slice(&16u32.to_le_bytes()); // column_length: BIT(16)
+        p.push(0x10); // column type: MYSQL_TYPE_BIT
+        p.extend_from_slice(&0x0020u16.to_le_bytes()); // flags: UNSIGNED
+        p.push(0); // decimals
+        p.extend_from_slice(&[0, 0]); // filler
+        p
+    }
+
+    /// Serve exactly one connection: handshake, auth OK, then answer the first
+    /// COM_QUERY with one BIT(16) row whose raw wire bytes are [0x31, 0x32].
+    fn serve_one_bit16_query(listener: TcpListener) {
+        let (mut s, _) = listener.accept().expect("fake MySQL server: accept");
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+
+        // ── connection phase (seq 0..=2) ──
+        write_packet(&mut s, 0, &handshake_greeting());
+        let _handshake_response = read_packet(&mut s);
+        // OK: header 0x00, affected 0, last_insert_id 0, status AUTOCOMMIT, warnings 0.
+        write_packet(&mut s, 2, &[0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00]);
+
+        // ── command phase: one COM_QUERY (client seq resets to 0) ──
+        let _com_query = read_packet(&mut s);
+        write_packet(&mut s, 1, &[0x01]); // column count = 1
+        write_packet(&mut s, 2, &bit16_column_definition());
+        write_packet(&mut s, 3, &[0xfe, 0x00, 0x00, 0x02, 0x00]); // EOF after metadata
+        // Text-protocol row: one length-encoded cell, the raw BIT bytes 0x3132
+        // — which are also the ASCII string "12". This is the trap.
+        write_packet(&mut s, 4, &[0x02, 0x31, 0x32]);
+        write_packet(&mut s, 5, &[0xfe, 0x00, 0x00, 0x02, 0x00]); // EOF after rows
+        // Swallow the COM_QUIT the client sends on drop; errors are fine.
+        let mut buf = [0u8; 64];
+        let _ = s.read(&mut buf);
+    }
+
+    // ROAST-RED mysql-bit-decode: BIT(16) value 0x3132 must decode to 12594,
+    // not to atoi(b"12") = 12.
+    // Asserts CORRECT behavior; expected to FAIL until the fix lands.
+    #[test]
+    fn roast_mysql_bit16_decodes_as_big_endian_bits_not_ascii_digits() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake MySQL server");
+        let port = listener.local_addr().expect("local_addr").port();
+        let server = std::thread::spawn(move || serve_one_bit16_query(listener));
+
+        let opts = OptsBuilder::new()
+            .ip_or_hostname(Some("127.0.0.1"))
+            .tcp_port(port)
+            .user(Some("root"))
+            .pass(Some(""))
+            .prefer_socket(false)
+            .max_allowed_packet(Some(16 * 1024 * 1024))
+            .tcp_connect_timeout(Some(Duration::from_secs(10)))
+            .read_timeout(Some(Duration::from_secs(10)))
+            .write_timeout(Some(Duration::from_secs(10)));
+        let mut conn = Conn::new(opts).expect("connect to fake MySQL server");
+
+        let rows: Vec<mysql::Row> = {
+            let mut result = conn.query_iter("SELECT b FROM t").expect("COM_QUERY");
+            let row_set = result.iter().expect("one result set");
+            row_set.map(|r| r.expect("row decodes")).collect()
+        };
+        drop(conn);
+        server.join().expect("fake MySQL server thread");
+
+        // ── harness preconditions: the wire gave us exactly the production input ──
+        assert_eq!(rows.len(), 1, "fake server sent exactly one row");
+        let columns = rows[0].columns();
+        assert!(
+            matches!(columns[0].column_type(), ColumnType::MYSQL_TYPE_BIT),
+            "column metadata is MYSQL_TYPE_BIT — the BIT-ness the decoder must consult"
+        );
+        assert_eq!(
+            rows[0].as_ref(0),
+            Some(&Value::Bytes(vec![0x31, 0x32])),
+            "BIT(16) travels as raw big-endian bytes on the wire"
+        );
+
+        // ── production decode path: schema + arrow types from the same columns ──
+        let (schema, arrow_types) = mysql_schema_and_arrow_types(&columns, &ColumnOverrides::new())
+            .expect("schema for BIT(16) column");
+        assert_eq!(
+            arrow_types,
+            vec![DataType::Int64],
+            "BIT(n>1) maps to Int64 — the buggy builder arm"
+        );
+
+        let batch = rows_to_record_batch_typed(&Arc::new(schema), &arrow_types, &rows)
+            .expect("record batch from BIT(16) row");
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 column");
+        assert!(!arr.is_null(0), "BIT value must not be nulled");
+        assert_eq!(
+            arr.value(0),
+            0x3132,
+            "BIT(16) value 0x3132 must decode as big-endian bits (12594); the \
+             atoi-first Int64 path reads bytes [0x31, 0x32] as ASCII \"12\" and \
+             yields the wrong value 12"
+        );
     }
 }

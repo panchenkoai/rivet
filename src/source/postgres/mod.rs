@@ -345,10 +345,13 @@ pub(crate) fn introspect_pg_table_for_chunking(
 
 /// Open a bare `postgres::Client` honoring the configured TLS policy.
 ///
-/// Shared by preflight, doctor, and init so every code path that connects to
-/// Postgres applies the same transport-security rules. `tls = None` or
-/// `mode: disable` falls back to the insecure `NoTls` transport — a warning is
-/// logged from `create_source` so operators know TLS is off.
+/// Shared by preflight, doctor, and `rivet init` so every code path that
+/// connects to Postgres applies the same transport-security rules. Preflight
+/// and doctor pass the YAML `tls:` block; init runs before any YAML exists,
+/// so it derives a `TlsConfig` from the URL's `sslmode` parameter (see
+/// `crate::init::postgres::connect`). `tls = None` or `mode: disable` falls
+/// back to the insecure `NoTls` transport — a warning is logged from
+/// `create_source` so operators know TLS is off.
 pub(crate) fn connect_client(url: &str, tls: Option<&TlsConfig>) -> Result<Client> {
     match tls {
         Some(cfg) if cfg.mode.is_enforced() => {
