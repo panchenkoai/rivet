@@ -117,53 +117,31 @@ impl std::error::Error for SchemaDriftError {}
 /// ## Why a string bridge for the aggregated `run` path
 ///
 /// The single-export `apply` path returns the typed marker straight to `main`,
-/// so the downcasts in steps 1–2 fire directly. The multi-export `run` path,
-/// however, aggregates per-export failures into a `Vec<String>` and re-raises a
-/// fresh `anyhow!` — that flattening *erases the concrete error type*, so a
-/// downcast against the aggregated error can never see the marker. To keep
-/// `rivet run` exit-class-correct without changing the operator-facing message,
-/// steps 1–2 also recognise the **stable failure-contract substrings** that the
-/// data-integrity / schema-drift bail sites emit (the same text the markers
-/// wrap). This is a recognition of existing contract text, not a hidden
-/// sentinel: the human message is byte-for-byte unchanged.
-///
-/// The durable fix — having `run` carry the first typed failure instead of a
-/// `String` — is tracked as follow-up plumbing in `pipeline::run`.
+/// so the downcasts below fire directly. The multi-export `run` path used to
+/// flatten per-export failures into a `Vec<String>` and re-raise a fresh
+/// `anyhow!`, erasing the concrete type — which once forced a substring bridge
+/// here. `pipeline::run` now carries a **representative typed failure** instead
+/// (the most stop-worthy class among the failures), so the marker survives and
+/// the downcasts work for `rivet run` too. Classification is therefore purely
+/// type-driven: an un-typed data-integrity / drift failure classifies as
+/// `Generic` on purpose — a *visible* signal that a marker was dropped upstream,
+/// rather than being silently rescued by string matching.
 pub fn classify_exit(err: &anyhow::Error) -> i32 {
-    // (a) schema-drift — typed marker, then the contract substring for the
-    //     flattened `run` path. `on_schema_drift: fail` is the only emitter of
-    //     "schema drift detected for export".
-    if err.downcast_ref::<SchemaDriftError>().is_some()
-        || contains_ci(err, "schema drift detected for export")
-    {
+    // Each check downcasts through anyhow's context chain.
+    if err.downcast_ref::<SchemaDriftError>().is_some() {
         return ExitClass::SchemaDrift.code();
     }
-
-    // (b) data-integrity — typed markers + manifest self-consistency, then the
-    //     shared quality-gate failure contract (`crate::quality::failure_message`)
-    //     and the duplicate-guard message, for the flattened `run` path.
     if err.downcast_ref::<DataIntegrityError>().is_some()
         || err
             .downcast_ref::<crate::manifest::ManifestInconsistency>()
             .is_some()
-        || contains_ci(err, "quality check(s) failed")
-        || contains_ci(err, "cannot safely retry (would duplicate rows)")
     {
         return ExitClass::DataIntegrity.code();
     }
-
-    // (c) transient → retryable.
     if crate::pipeline::retry::classify_error(err).is_transient() {
         return ExitClass::Retryable.code();
     }
-
-    // (d) everything else.
     ExitClass::Generic.code()
-}
-
-/// Case-insensitive substring check over the full anyhow chain (`{:#}`).
-fn contains_ci(err: &anyhow::Error, needle: &str) -> bool {
-    format!("{err:#}").to_lowercase().contains(needle)
 }
 
 pub type Result<T> = anyhow::Result<T>;
@@ -225,37 +203,31 @@ mod tests {
     }
 
     #[test]
-    fn flattened_run_aggregate_strings_still_classify() {
-        // The multi-export `run` path flattens typed errors into a String and
-        // re-raises a fresh anyhow!. The contract-substring bridge keeps the
-        // exit class correct over that flattened text (Display is unchanged).
-        let quality = anyhow::anyhow!(
-            "export 'orders': 1 quality check(s) failed:\n  - row_count below minimum\n  \
-             Fix the source data, or adjust the thresholds under `quality:` in your config."
-        );
+    fn run_carries_typed_marker_through_multi_failure_context() {
+        // `pipeline::run`'s multi-failure path returns the representative typed
+        // failure wrapped in a context string listing the others. The marker
+        // must still downcast through that context so the exit class is right.
+        let dup: anyhow::Error =
+            DataIntegrityError::new("export 'orders': cannot safely retry (would duplicate rows)")
+                .into();
+        let aggregated = dup.context("2 export(s) failed; representative error follows (also: export 'events': connection reset)");
         assert_eq!(
-            classify_exit(&quality),
+            classify_exit(&aggregated),
             3,
-            "flattened quality-gate failure must still be data-integrity"
+            "the carried data-integrity marker must survive run's multi-failure context wrapping"
         );
+    }
 
-        let drift = anyhow::anyhow!(
-            "schema drift detected for export 'orders': 1 column(s) added, 0 removed, 0 retyped"
-        );
+    #[test]
+    fn untyped_flattened_string_is_generic_not_string_matched() {
+        // Deliberate behavior change: classification is type-driven only. A bare
+        // string that merely *reads* like a quality-gate failure (no marker) is
+        // Generic — a visible signal a marker was dropped, not a silent rescue.
+        let bare = anyhow::anyhow!("export 'orders': 1 quality check(s) failed: row_count low");
         assert_eq!(
-            classify_exit(&drift),
-            4,
-            "flattened schema-drift failure must still be schema-drift"
-        );
-
-        let dup = anyhow::anyhow!(
-            "export 'orders': transient error after 2 file(s) written to destination \
-             — cannot safely retry (would duplicate rows). Run `rivet reconcile`."
-        );
-        assert_eq!(
-            classify_exit(&dup),
-            3,
-            "flattened duplicate-guard bail must still be data-integrity"
+            classify_exit(&bare),
+            1,
+            "an un-typed string must NOT be string-matched into data-integrity"
         );
     }
 
