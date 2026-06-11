@@ -19,6 +19,26 @@ mod common;
 use common::*;
 
 use mysql::prelude::Queryable;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+/// Total physical rows across every `.parquet` part in `dir`, plus the per-file
+/// breakdown. Re-reads the destination files (not rivet's counters).
+fn parquet_data_rows(dir: &std::path::Path) -> (usize, Vec<(std::path::PathBuf, usize)>) {
+    let mut per_file = Vec::new();
+    let mut total = 0usize;
+    for path in files_with_extension(dir, "parquet") {
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let rows: usize = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+            .unwrap_or_else(|e| panic!("open {}: {e}", path.display()))
+            .build()
+            .unwrap()
+            .map(|b| b.unwrap().num_rows())
+            .sum();
+        total += rows;
+        per_file.push((path, rows));
+    }
+    (total, per_file)
+}
 
 /// Count data rows (lines minus the header) across every `.csv` part file in
 /// `dir`.  CSV is used instead of parquet so `bytes_written` grows
@@ -185,5 +205,89 @@ exports:
          files {per_file:?} — maybe_split rotated parts into sink.completed_parts, but the \
          keyset runner uploaded only sink.tmp (the last partial part) and the rotated parts \
          were deleted with the sink"
+    );
+}
+
+// ─── keyset (keyset.rs) — PARQUET rotation must reach the destination ─────────
+
+// The CSV keyset test above proves the rotated-part drain for CSV. Parquet
+// rotates differently: maybe_split compares FLUSHED bytes, and parquet only
+// flushes on row-group close, so without a small `parquet.row_group_rows` the
+// cap silently never fires (documented loud-WARN limitation, sink/mod.rs:529).
+// Set row_group_rows so a closed group exceeds the cap, and use DISTINCT
+// payloads (parquet dictionary-encodes identical values to ~nothing, which
+// would defeat rotation). Assert all rows reach the destination AND that >=2
+// parts were produced, so the test proves rotation actually happened rather
+// than passing trivially on one unrotated file. (audit gap: keyset+parquet
+// rotation was only ever re-read for CSV.)
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn roast_keyset_split_parts_parquet_all_rows_reach_destination() {
+    require_alive(LiveService::Mysql);
+
+    const N: usize = 1_000;
+    let table = unique_name("roast_keyset_pq");
+    let _guard = DropMysqlTable(table.clone());
+
+    let mut conn = mysql_connect();
+    conn.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    conn.query_drop(format!(
+        "CREATE TABLE {table} (uid VARCHAR(40) NOT NULL PRIMARY KEY, payload TEXT NOT NULL)"
+    ))
+    .unwrap();
+    conn.query_drop("SET SESSION cte_max_recursion_depth = 20000")
+        .unwrap();
+    // payload = MD5(n) repeated 32× ≈ 1 KB, DISTINCT per row (defeats parquet
+    // dictionary encoding so row groups actually grow past the cap).
+    conn.query_drop(format!(
+        "INSERT INTO {table} (uid, payload) \
+         WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < {N}) \
+         SELECT CONCAT('id-', LPAD(n, 6, '0')), REPEAT(MD5(n), 32) FROM seq"
+    ))
+    .unwrap();
+
+    let export = unique_name("roast_keyset_pq_exp");
+    let out = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        r#"
+source: {{type: mysql, url: "{MYSQL_URL}"}}
+exports:
+  - name: {export}
+    table: {table}
+    mode: chunked
+    chunk_size: 500
+    format: parquet
+    compression: none
+    max_file_size: 64KB
+    parquet:
+      row_group_strategy: fixed_rows
+      row_group_rows: 100
+    destination: {{type: local, path: {dir}}}
+    tuning: {{batch_size: 250}}
+"#,
+        dir = out.path().display()
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    let run = run_rivet_export(&cfg, &export);
+    assert!(
+        run.status.success(),
+        "keyset parquet export must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let (total, per_file) = parquet_data_rows(out.path());
+    assert_eq!(
+        total, N,
+        "DATA LOSS: only {total} of {N} seeded rows survive across the destination parquet \
+         parts {per_file:?}"
+    );
+    assert!(
+        per_file.len() >= 2,
+        "rotation must have produced >=2 parquet parts (proves max_file_size engaged with \
+         row_group_rows=100); got {}: {per_file:?}",
+        per_file.len()
     );
 }
