@@ -70,6 +70,19 @@ exports:
         2,
         "full mode must produce one file per run; got {files:?}"
     );
+    // Re-read the destination (not rivet's file count): two full runs of 10 rows
+    // each → 20 physical rows, distinct ids 0..10. Proves both re-exports
+    // materialised every row, not just that two files appeared.
+    assert_eq!(
+        total_parquet_rows(out.path()),
+        20,
+        "two full runs must each materialise all 10 rows"
+    );
+    assert_eq!(
+        dir_parquet_id_set(out.path()),
+        (0..10).collect::<std::collections::BTreeSet<i64>>(),
+        "full re-export must hold every source id (0..10)"
+    );
 }
 
 #[test]
@@ -128,6 +141,18 @@ exports:
     );
     let files_after_first = files_with_extension(out.path(), "parquet").len();
     assert_eq!(files_after_first, 1, "first run must produce one file");
+    // Re-read the destination: the "picks up every row" claim must be backed by
+    // the actual rows, not just one file appearing.
+    assert_eq!(
+        total_parquet_rows(out.path()),
+        15,
+        "first incremental run must export all 15 seeded rows"
+    );
+    assert_eq!(
+        dir_parquet_id_set(out.path()),
+        (1..=15).collect::<std::collections::BTreeSet<i64>>(),
+        "first incremental run must contain ids 1..=15"
+    );
 
     // Run #2 — cursor is now at the most recent updated_at; no new rows, no
     // new file (documented: zero rows → no file).
@@ -211,6 +236,19 @@ exports:
         files_2,
         files_1 + 1,
         "incremental must produce one additional file for new rows"
+    );
+    // Re-read the destination: after both runs the union must hold ids 1..=10
+    // exactly — proves the second run picked up the newly-inserted rows 6..10
+    // and the first run's rows are still present (no loss across runs).
+    assert_eq!(
+        dir_parquet_id_set(out.path()),
+        (1..=10).collect::<std::collections::BTreeSet<i64>>(),
+        "after the second run the destination must hold ids 1..=10 exactly"
+    );
+    assert_eq!(
+        total_parquet_rows(out.path()),
+        10,
+        "two incremental runs must export each of the 10 rows exactly once"
     );
 }
 
