@@ -100,11 +100,15 @@ fn enforce_reconcile_exit(summary: &ReconcileSummary) -> Result<()> {
         );
     }
     if summary.mismatches > 0 {
-        anyhow::bail!(
+        // A partition disagreeing with the source is a verified-wrong result, not
+        // a "could not verify" — it is the data-integrity class (exit 3) named in
+        // the `error::ExitClass` table. Typed marker so a scheduler branches on
+        // the code; `unknown` partitions (handled above) stay a warning, not 3.
+        return Err(crate::error::DataIntegrityError::new(format!(
             "reconcile: {} of {} partition(s) disagree with the source — see the report above",
-            summary.mismatches,
-            summary.total_partitions
-        );
+            summary.mismatches, summary.total_partitions
+        ))
+        .into());
     }
     Ok(())
 }
@@ -471,6 +475,13 @@ mod tests {
         assert!(
             err.to_string().contains("disagree with the source"),
             "got: {err}"
+        );
+        // And it carries the data-integrity class so a scheduler exits 3, not 1 —
+        // the `error::ExitClass` table lists "reconcile mismatch" as exit 3.
+        assert_eq!(
+            crate::error::classify_exit(&err),
+            3,
+            "a reconcile mismatch must classify as data-integrity (exit 3)"
         );
     }
 

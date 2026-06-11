@@ -212,10 +212,24 @@ pub fn run_validate_command(
         .iter()
         .filter(|r| verdict_fails_exit(&r.verification))
         .count();
-    if !hard_failures.is_empty() || failed_verdicts > 0 {
-        anyhow::bail!(
+    if failed_verdicts > 0 {
+        // A verified-and-wrong verdict (missing part, size mismatch, stale
+        // _SUCCESS, self-inconsistent manifest) is the data-integrity class
+        // (exit 3) — typed so a scheduler stops rather than blindly retries.
+        // `hard_failures` (couldn't open / read the destination) are operational
+        // "could not verify", not "verified wrong", so they fold into the count
+        // but the class is driven by the real verdict failure.
+        return Err(crate::error::DataIntegrityError::new(format!(
             "rivet validate: {} export(s) failed verification",
             hard_failures.len() + failed_verdicts
+        ))
+        .into());
+    }
+    if !hard_failures.is_empty() {
+        // Could-not-verify only (no verified-wrong verdict): operational, generic.
+        anyhow::bail!(
+            "rivet validate: {} export(s) failed verification",
+            hard_failures.len()
         );
     }
     Ok(())

@@ -14,7 +14,7 @@
 /// | `0`  | success | — (handled separately, not in this enum) |
 /// | `1`  | [`Generic`](ExitClass::Generic): config / usage / unclassified error | fix the config; do **not** retry blindly |
 /// | `2`  | [`Retryable`](ExitClass::Retryable): transient (connection reset, lock-wait timeout, capacity) | safe to retry the *same* command |
-/// | `3`  | [`DataIntegrity`](ExitClass::DataIntegrity): quality gate / reconcile mismatch / duplicate-guard / manifest inconsistency | **STOP** — data may be wrong, do **not** blindly retry |
+/// | `3`  | [`DataIntegrity`](ExitClass::DataIntegrity): quality gate / reconcile mismatch / `validate` verification failure / duplicate-guard / manifest inconsistency | **STOP** — data may be wrong, do **not** blindly retry |
 /// | `4`  | [`SchemaDrift`](ExitClass::SchemaDrift): `on_schema_drift: fail` tripped | the source shape changed — needs human review |
 ///
 /// ## Overlap with clap's usage exit (also `2`)
@@ -36,9 +36,9 @@ pub enum ExitClass {
     /// `2` — transient failure (connection reset, lock-wait timeout, capacity).
     /// Safe to retry the same command after a backoff.
     Retryable = 2,
-    /// `3` — data-integrity failure (quality gate, reconcile mismatch,
-    /// duplicate-guard, manifest inconsistency). The exported data may be wrong;
-    /// **stop** and investigate rather than retry.
+    /// `3` — data-integrity failure (quality gate, reconcile mismatch, `validate`
+    /// verification failure, duplicate-guard, manifest inconsistency). The
+    /// exported data may be wrong; **stop** and investigate rather than retry.
     DataIntegrity = 3,
     /// `4` — schema-drift failure (`on_schema_drift: fail` tripped). The source
     /// shape changed; a human must review before re-running.

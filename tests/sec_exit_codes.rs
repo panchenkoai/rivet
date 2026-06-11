@@ -11,11 +11,12 @@
 //!   * `4` schema-drift (`on_schema_drift: fail` tripped — needs review)
 //!
 //! The class boundaries themselves are pinned by fast unit tests in
-//! `src/error.rs` (transient→2, syntax→1, schema-drift→4, data-integrity→3,
-//! including the flattened-`run`-aggregate string bridge). This file proves the
-//! *end-to-end wiring*: a real `rivet run` against live Postgres returns the
-//! data-integrity code `3` when a quality gate fails — i.e. `main` actually
-//! routes the failure through `classify_exit` and exits with the class.
+//! `src/error.rs` (transient→2, syntax→1, schema-drift→4, data-integrity→3) and
+//! `src/pipeline/reconcile_cmd.rs` (a mismatch classifies to 3). This file proves
+//! the *end-to-end wiring*: a real `rivet run` / `rivet reconcile` against live
+//! Postgres returns the data-integrity code `3` — i.e. `main` actually routes the
+//! failure through `classify_exit` and exits with the class, via the typed marker
+//! (no string matching).
 //!
 //! Run with: `cargo test --test sec_exit_codes -- --include-ignored`
 
@@ -68,6 +69,69 @@ exports:
     assert!(
         stderr.contains("quality check(s) failed"),
         "operator-facing quality message must be preserved verbatim; stderr:\n{stderr}"
+    );
+}
+
+/// A `rivet reconcile` that finds a partition disagreeing with the source must
+/// exit with the **data-integrity** code `3` (the taxonomy's "reconcile
+/// mismatch" row), so a CI gate `rivet reconcile && <deploy>` stops on divergent
+/// data instead of sailing past. Regression guard for the honesty gap where the
+/// reconcile bail was an un-typed string → classified generic (exit 1).
+#[test]
+#[ignore = "live: postgres"]
+fn reconcile_mismatch_exits_data_integrity_3() {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(150); // ids 0..149 → chunks [0..49],[50..99],[100..149]
+    let out = tempfile::tempdir().unwrap();
+    let export_name = unique_name("xc_reconcile_3");
+
+    let yaml = format!(
+        r#"
+source: {{type: postgres, url: "{POSTGRES_URL}"}}
+exports:
+  - name: {export_name}
+    query: "SELECT id, name FROM {table_name}"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 50
+    chunk_checkpoint: true
+    format: parquet
+    destination: {{type: local, path: {dir}}}
+"#,
+        table_name = table.name(),
+        dir = out.path().display()
+    );
+    let (_cfgdir, cfgpath) = cfg(&yaml);
+
+    // Export records each chunk's row count in the manifest.
+    let run = run_rivet_export(&cfgpath, &export_name);
+    assert!(
+        run.status.success(),
+        "setup export must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    // Mutate the SOURCE so a fresh per-chunk recount disagrees with the manifest:
+    // drop one row inside chunk 0 (the recount falls 50→49 while the manifest
+    // still says 50).
+    {
+        let mut c = pg_connect();
+        c.execute(&format!("DELETE FROM {} WHERE id = 1", table.name()), &[])
+            .expect("delete one source row to force a reconcile mismatch");
+    }
+
+    let result = run_rivet(&[
+        "reconcile",
+        "--config",
+        cfgpath.to_str().unwrap(),
+        "--export",
+        &export_name,
+    ]);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(
+        result.status.code(),
+        Some(3),
+        "a reconcile mismatch must exit 3 (data-integrity), not 1; stderr:\n{stderr}"
     );
 }
 
