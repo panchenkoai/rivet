@@ -204,6 +204,16 @@ jobs:
         # `make test-types-bigquery` target instead).
         run: cargo test --release --test type_roundtrip -- --include-ignored --skip bigquery
 
+      - name: Differential correctness at scale (DuckDB vs source)
+        # tests/live_differential.rs — an INDEPENDENT reader (DuckDB) fingerprints
+        # the exported Parquet and must agree with the source field-for-field
+        # (count, integer sums, distinct id/text). Two cases: a clean chunked
+        # export, and a crash + resume (raw count proves the at-least-once
+        # surplus; `SELECT DISTINCT *` collapses to the exactly-once set == source).
+        # Lives here, not the e2e job: needs the `duckdb` reader + the
+        # ./tests/.live-tmp:/work shared mount this job already provisions.
+        run: cargo test --release --test live_differential -- --ignored
+
       - name: Stop services
         if: always()
         run: docker compose down
@@ -327,7 +337,13 @@ jobs:
         # mysql_edge_cases modules). They need the DuckDB/ClickHouse containers
         # this job does not start and run in the dedicated `test-type-validators`
         # job instead. Both substrings are unique to the `type_roundtrip` binary.
-        run: cargo test --release -- --ignored --skip content_export --skip validates --skip edge_cases
+        # `--skip via_duckdb` excludes tests/live_differential.rs: it hard-requires
+        # the `duckdb` reader container (require_alive(DuckDb)) + the
+        # ./tests/.live-tmp:/work shared mount, neither of which this job sets up.
+        # It runs in the `test-type-validators` job instead (which has both).
+        # live_crash_soak.rs stays here — it re-reads the destination in-process
+        # (arrow/parquet-rs), no duckdb needed.
+        run: cargo test --release -- --ignored --skip content_export --skip validates --skip edge_cases --skip via_duckdb
 
       - name: Stop services
         if: always()
