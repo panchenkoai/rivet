@@ -10,11 +10,9 @@
   <a href="https://discord.gg/HT5DZNzNU"><img src="https://img.shields.io/badge/Discord-join%20chat-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
 </p>
 
-<p align="center"><strong>The database-extraction script you'll eventually write — without the 2&nbsp;a.m. incident.</strong></p>
+<p align="center"><strong>Make database extraction boring.</strong></p>
 
-<p align="center">Pull a Postgres / MySQL table (SQL&nbsp;Server: beta) to Parquet/CSV on S3, GCS, Azure, or local — <strong>without holding your production database open</strong>. On a 2&nbsp;M-row table Rivet holds the source <strong>12.3&nbsp;s</strong> where dlt / DuckDB / sling hold it <strong>88–215&nbsp;s</strong> (7–17× longer, and dlt leaves 4,843 dead tuples behind). Chunked, crash-resumable extraction is <strong>built in — not a paid tier</strong>. One ~18&nbsp;MB Rust binary. Resumable, auditable, source-safe.</p>
-
-<p align="center"><sub>Numbers: <a href="docs/bench/reports/REPORT_pg.md">docs/bench/reports/REPORT_pg.md</a> (PG snapshot hold) · <a href="docs/bench/reports/REPORT_mysql.md">REPORT_mysql.md</a> (MySQL 9&nbsp;s vs 137–208&nbsp;s).</sub></p>
+<p align="center">One Rust binary, ~18 MB (speed-optimized). Extracts PostgreSQL, MySQL, and SQL Server to Parquet/CSV — locally, on S3, GCS, or Azure Blob — without holding long queries open on your production database. Resumable, auditable, source-safe.</p>
 
 > Not sure if Rivet fits your problem? [docs/who-is-this-for.md](docs/who-is-this-for.md) is a 60-second fit-check.
 
