@@ -142,8 +142,27 @@ section "4. Postgres — compression, skip_empty, meta, split"
 $RIVET run --config dev/e2e/pg_e2e.yaml --export pg_users_zstd --validate >/dev/null 2>&1 && pass "PG zstd" || fail "PG zstd"
 assert_file_exists "$OUT/pg_users_zstd_*.parquet" "PG zstd file"
 
-$RIVET run --config dev/e2e/pg_e2e.yaml --export pg_users_gzip_csv >/dev/null 2>&1 && pass "PG gzip CSV" || fail "PG gzip CSV"
-assert_file_exists "$OUT/pg_users_gzip_csv_*.csv*" "PG gzip CSV file"
+# csv + compression is a silent no-op the manifest would lie about, so the
+# config loader rejects it (src/config/mod.rs::check_csv_compression). Assert the
+# loud rejection on a standalone bad config — it can't live in pg_e2e.yaml or the
+# whole config would fail to parse and poison every other PG export.
+_err=$($RIVET check --config /dev/stdin 2>&1 <<'YAML' || true
+source:
+  type: postgres
+  url_env: RIVET_PG_URL
+exports:
+  - name: bad_gzip_csv
+    query: "SELECT 1"
+    mode: full
+    format: csv
+    compression: gzip
+    destination:
+      type: local
+      path: ./dev/e2e/output
+YAML
+)
+echo "$_err" | grep -qi "csv output does not support compression" \
+    && pass "PG csv+gzip rejected" || fail "PG csv+gzip rejected (got: $(echo "$_err" | tr '\n' ' ' | cut -c1-160))"
 
 $RIVET run --config dev/e2e/pg_e2e.yaml --export pg_empty_skip >/dev/null 2>&1 && pass "PG skip_empty" || fail "PG skip_empty"
 assert_no_file "$OUT/pg_empty_skip_*.csv*" "PG skip_empty no file"
