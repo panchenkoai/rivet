@@ -18,8 +18,13 @@ cd "$(dirname "$0")/../.."
 
 # Default URLs — overridable via env so the legacy compat matrix can re-point
 # the same suite at any version without editing YAMLs.
-export RIVET_PG_URL="${RIVET_PG_URL:-postgresql://rivet:rivet@localhost:5432/rivet}"
-export RIVET_MYSQL_URL="${RIVET_MYSQL_URL:-mysql://rivet:rivet@localhost:3306/rivet}"
+# Use 127.0.0.1, NOT `localhost`: docker publishes the port on IPv4 (0.0.0.0)
+# only, while `localhost` can resolve to IPv6 `::1` first. tokio-postgres then
+# fails to reach the IPv4-only bind within its timeout (psql/libpq falls back to
+# IPv4 and hides the issue, which is why the PG seed worked but `rivet doctor`
+# did not). 127.0.0.1 is unambiguous IPv4. (MySQL already used it below.)
+export RIVET_PG_URL="${RIVET_PG_URL:-postgresql://rivet:rivet@127.0.0.1:5432/rivet}"
+export RIVET_MYSQL_URL="${RIVET_MYSQL_URL:-mysql://rivet:rivet@127.0.0.1:3306/rivet}"
 
 RIVET="${RIVET:-cargo run --release --bin rivet --}"
 OUT="dev/e2e/output"
@@ -69,16 +74,30 @@ mkdir -p "$OUT"
 
 pg_ok=false; mysql_ok=false; minio_ok=false; gcs_ok=false
 
-# Works both in docker-compose dev and GitHub Actions service containers
-pg_isready -h localhost -U rivet >/dev/null 2>&1 && pg_ok=true || \
-    docker compose exec -T postgres pg_isready -U rivet >/dev/null 2>&1 && pg_ok=true
+# Probe the EXACT path rivet uses: a raw TCP connect to the host IPv4 bind
+# (127.0.0.1:5432) — the same address tokio-postgres dials via RIVET_PG_URL.
+# Do NOT use `pg_isready -h localhost` (libpq silently falls back to IPv4 and
+# masks an IPv6-only-localhost failure) and do NOT fall back to
+# `docker compose exec` (that probes INSIDE the container, a false positive when
+# the host port is unreachable — precisely the failure this guard must catch).
+# Mirrors the pgBouncer/ProxySQL /dev/tcp probes in .github/workflows/ci.yml.
+(exec 3<>/dev/tcp/127.0.0.1/5432) 2>/dev/null && pg_ok=true || pg_ok=false
 mysqladmin ping -h 127.0.0.1 -uroot -privet >/dev/null 2>&1 && mysql_ok=true || \
     docker compose exec -T mysql mysqladmin ping -h localhost -uroot -privet >/dev/null 2>&1 && mysql_ok=true
 curl -sf http://localhost:9000/minio/health/live >/dev/null 2>&1 && minio_ok=true
 curl -sf http://localhost:4443/storage/v1/b >/dev/null 2>&1 && gcs_ok=true
 
 echo "Postgres: $pg_ok | MySQL: $mysql_ok | MinIO: $minio_ok | fake-gcs: $gcs_ok"
-$pg_ok || { echo "FATAL: Postgres not available"; exit 1; }
+if ! $pg_ok; then
+    echo "FATAL: Postgres not reachable on the host at 127.0.0.1:5432 (the address rivet dials)."
+    echo "  RIVET_PG_URL=$RIVET_PG_URL"
+    echo "  --- host listening sockets (5432/3306) ---"
+    (ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null) | grep -E ':5432|:3306' \
+        || echo "    (no 5432/3306 host bind found — the container port is not published to the host)"
+    echo "  --- docker compose postgres status ---"
+    docker compose ps postgres 2>/dev/null || true
+    exit 1
+fi
 
 # ──────────────────────────────────────────────────────────────
 section "1. Doctor (connectivity check)"

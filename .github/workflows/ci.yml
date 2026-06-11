@@ -287,7 +287,7 @@ jobs:
 
       - name: Seed databases
         run: |
-          PGPASSWORD=rivet psql -h localhost -U rivet -d rivet -f dev/e2e/seed_pg.sql
+          PGPASSWORD=rivet psql -h 127.0.0.1 -U rivet -d rivet -f dev/e2e/seed_pg.sql
           mysql -h 127.0.0.1 -u rivet -privet rivet < dev/e2e/seed_mysql.sql
 
       - name: Seed MSSQL database
