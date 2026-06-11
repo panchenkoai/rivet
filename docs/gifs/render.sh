@@ -52,7 +52,7 @@ ensure_prereqs() {
 
     if [[ ! -x "$BIN" || ! -x "$SEED" ]]; then
         log "building release binaries..."
-        (cd "$REPO_ROOT" && cargo build --release --bin rivet --bin seed)
+        (cd "$REPO_ROOT" && cargo build --release --bin rivet --bin seed --features dev-seed)
     fi
 
     if ! psql_ -c 'SELECT 1' >/dev/null 2>&1; then

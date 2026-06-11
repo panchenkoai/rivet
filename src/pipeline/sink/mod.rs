@@ -261,6 +261,20 @@ impl ExportSink {
     /// before the batch is split/encoded so the giant cell never reaches the
     /// row-group writer or the auto-shrink splitter (which can't divide one
     /// oversized value). `O(rows × var-length-cols)` length reads — no copies.
+    ///
+    /// KNOWN LIMITATION (security audit V22, CWE-770, accepted): this guard runs
+    /// *post-materialization* — the cell has already been decoded by the driver
+    /// and built into the Arrow array before its length is checked here, so a
+    /// single adversarial cell of N bytes costs ~2N RAM (driver copy + Arrow
+    /// copy) before the guard fires. The guard still prevents *further*
+    /// amplification (encode / row-group / split) and aborts the run, and it is
+    /// ON by default (`max_value_mb = Some(256)` in every tuning profile), so
+    /// the realistic blast radius is one ≤256 MB-class over-allocation per
+    /// oversized cell, not an unbounded OOM. A true pre-materialization cap
+    /// would need a source-side length probe (`SUBSTRING(col,1,max+1)` — lossy,
+    /// changes data) or a per-field driver limit (Postgres exposes none;
+    /// MySQL's `max_allowed_packet` is connection- not field-scoped), so it is
+    /// deliberately not attempted here.
     fn check_value_ceiling(&self, batch: &RecordBatch) -> Result<()> {
         use arrow::array::{BinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
         use arrow::datatypes::DataType;

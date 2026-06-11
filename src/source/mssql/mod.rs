@@ -166,6 +166,24 @@ impl MssqlSource {
                 config.trust_cert()
             }
             Some(cfg) => {
+                // Strict cert validation is ON here (mode verify-ca/verify-full,
+                // no accept_invalid_certs). This is the ONLY MSSQL path that
+                // exercises rustls-webpki, which is pinned to a vulnerable 0.101
+                // via tiberius 0.12 (no newer tiberius exists; see
+                // .cargo/audit.toml). The CA name-constraint advisories bite
+                // only when validating against a name-constraint-asserting
+                // private CA — narrow, but the operator who turned on strict
+                // validation is exactly who should know. Warn once.
+                static WEBPKI_WARNED: std::sync::Once = std::sync::Once::new();
+                WEBPKI_WARNED.call_once(|| {
+                    log::warn!(
+                        "mssql: TLS certificate validation is enabled, but the SQL Server \
+                         engine pins an old rustls-webpki (via tiberius) with known CA \
+                         name-constraint advisories (RUSTSEC-2026-0098/0099). Validation \
+                         against a name-constraint-asserting private CA may accept a \
+                         mis-issued certificate. Track tiberius for a rustls upgrade."
+                    );
+                });
                 if let Some(ca) = cfg.ca_file.as_deref() {
                     config.trust_cert_ca(ca);
                 }
