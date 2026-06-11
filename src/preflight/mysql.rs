@@ -67,7 +67,28 @@ fn diagnose_mysql(
         ),
     };
 
-    let base_query = export.query.as_deref().unwrap_or("SELECT 1");
+    // Resolve the same base query the runner will issue. For the `table:`
+    // shortcut (no `query:`) this is the canonical `SELECT * FROM <table>`
+    // (`ExportConfig::resolve_query`, which also validates/quotes the ident) —
+    // NOT a `SELECT 1` placeholder, or every probe below (row estimate, scan
+    // type, cursor range) would describe a 1-row dummy relation instead of the
+    // real table. config_dir/params are unused on the `table:`/inline branches;
+    // preflight is non-fatal, so fall back to the inline/placeholder text and
+    // surface the cause at debug rather than abort the diagnostic.
+    let base_query: String = match export.resolve_query(std::path::Path::new(""), None) {
+        Ok(q) => q,
+        Err(e) => {
+            log::debug!(
+                "preflight: base-query resolution failed for export '{}': {e}",
+                export.name
+            );
+            export
+                .query
+                .clone()
+                .unwrap_or_else(|| "SELECT 1".to_string())
+        }
+    };
+    let base_query = base_query.as_str();
     let range_col = export
         .chunk_column
         .as_deref()
@@ -257,5 +278,38 @@ pub(crate) fn column_has_index_mysql(
             log::debug!("preflight: btree index probe failed for {qualified_table}.{column}: {e}");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // ── regression: `table:` shortcut must NOT preflight the "SELECT 1" stub ──
+    //
+    // Mirrors the Postgres-side guard for audit_preflight_table: a
+    // `table:`-shortcut export (no `query:`) on MySQL must EXPLAIN the real
+    // `SELECT * FROM <table>`, not the 1-row placeholder, so the row estimate
+    // and access type describe the actual relation.
+
+    #[test]
+    fn table_shortcut_resolves_to_real_table_not_select_one() {
+        let mut export = crate::config::sample_export("orders");
+        export.query = None;
+        export.table = Some("orders".into());
+        let base = export
+            .resolve_query(std::path::Path::new(""), None)
+            .expect("table shortcut resolves");
+        assert_eq!(base, "SELECT * FROM orders");
+        assert_ne!(base, "SELECT 1");
+    }
+
+    #[test]
+    fn inline_query_form_is_left_untouched() {
+        let mut export = crate::config::sample_export("custom");
+        export.table = None;
+        export.query = Some("SELECT id FROM orders WHERE id > 0".into());
+        let base = export
+            .resolve_query(std::path::Path::new(""), None)
+            .expect("inline query resolves");
+        assert_eq!(base, "SELECT id FROM orders WHERE id > 0");
     }
 }

@@ -77,6 +77,22 @@ pub(crate) fn get_export_diagnostic(
     }
 }
 
+/// Dedup identity for a destination, shared by `check`'s credential probe
+/// and `doctor`'s write probe. Must include every field that changes where
+/// a probe lands — notably `path`, so two local destinations with different
+/// paths are probed separately. Keeping one helper prevents the two call
+/// sites from drifting apart (doctor's inline copy once omitted `path` and
+/// silently skipped the second local destination).
+fn destination_identity(d: &crate::config::DestinationConfig) -> String {
+    format!(
+        "{:?}:{}:{}:{}",
+        d.destination_type,
+        d.bucket.as_deref().unwrap_or("-"),
+        d.endpoint.as_deref().unwrap_or("-"),
+        d.path.as_deref().unwrap_or("-"),
+    )
+}
+
 pub fn check(
     config_path: &str,
     export_name: Option<&str>,
@@ -123,13 +139,7 @@ pub fn check(
     // configs cheap.
     let mut seen_destinations: std::collections::HashSet<String> = std::collections::HashSet::new();
     for export in &exports {
-        let dest_key = format!(
-            "{:?}:{}:{}:{}",
-            export.destination.destination_type,
-            export.destination.bucket.as_deref().unwrap_or("-"),
-            export.destination.endpoint.as_deref().unwrap_or("-"),
-            export.destination.path.as_deref().unwrap_or("-"),
-        );
+        let dest_key = destination_identity(&export.destination);
         if !seen_destinations.insert(dest_key) {
             continue;
         }
@@ -420,6 +430,59 @@ mod tests {
     fn dest_err(msg: &str, dtype: DestinationType) -> &'static str {
         let cfg = dest_config(dtype);
         categorize_dest_error(&anyhow::anyhow!("{}", msg), &cfg)
+    }
+
+    fn local_dest(path: &str) -> DestinationConfig {
+        DestinationConfig {
+            destination_type: DestinationType::Local,
+            path: Some(path.to_string()),
+            ..Default::default()
+        }
+    }
+
+    // Regression (doctor-dedup): doctor's inline dedup key omitted `path`,
+    // so two local destinations with different paths collapsed to one entry
+    // and the second was never write-probed. The shared identity must keep
+    // them distinct.
+    #[test]
+    fn destination_identity_distinguishes_local_paths() {
+        assert_ne!(
+            destination_identity(&local_dest("/tmp/a")),
+            destination_identity(&local_dest("/tmp/b")),
+        );
+    }
+
+    #[test]
+    fn destination_identity_collapses_identical_local_destinations() {
+        assert_eq!(
+            destination_identity(&local_dest("/tmp/a")),
+            destination_identity(&local_dest("/tmp/a")),
+        );
+    }
+
+    #[test]
+    fn destination_identity_distinguishes_buckets() {
+        let a = DestinationConfig {
+            bucket: Some("bucket-a".to_string()),
+            ..dest_config(DestinationType::S3)
+        };
+        let b = DestinationConfig {
+            bucket: Some("bucket-b".to_string()),
+            ..dest_config(DestinationType::S3)
+        };
+        assert_ne!(destination_identity(&a), destination_identity(&b));
+    }
+
+    // Same bucket name on different endpoints (e.g. AWS vs MinIO) is two
+    // distinct destinations and must be probed separately.
+    #[test]
+    fn destination_identity_distinguishes_endpoints_for_same_bucket() {
+        let aws = dest_config(DestinationType::S3);
+        let minio = DestinationConfig {
+            endpoint: Some("http://localhost:9000".to_string()),
+            ..dest_config(DestinationType::S3)
+        };
+        assert_ne!(destination_identity(&aws), destination_identity(&minio));
     }
 
     #[test]
