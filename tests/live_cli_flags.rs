@@ -214,6 +214,12 @@ fn run_json_flag_prints_aggregate_summary_to_stdout() {
         json["per_export"].is_array(),
         "per_export must be present and an array"
     );
+    // Back the reported total_rows with an independent destination read.
+    assert_eq!(
+        total_parquet_rows(out.path()),
+        20,
+        "destination must physically hold the 20 reported rows"
+    );
 }
 
 #[test]
@@ -257,6 +263,12 @@ fn run_summary_output_writes_json_to_file() {
         json["success_count"].as_i64().unwrap_or(0),
         1,
         "summary must report 1 successful export"
+    );
+    // Back the "export succeeded" claim with an independent destination read.
+    assert_eq!(
+        total_parquet_rows(out.path()),
+        10,
+        "destination must physically hold all 10 rows"
     );
 }
 
@@ -318,6 +330,12 @@ exports:
     assert_eq!(
         rows, 31,
         "param substitution must export exactly 31 rows (ids 0..=30); got {rows}"
+    );
+    // Back the reported count with an independent destination read.
+    assert_eq!(
+        total_parquet_rows(out.path()),
+        31,
+        "destination must physically hold the 31 param-filtered rows"
     );
 }
 
@@ -382,6 +400,12 @@ exports:
         rows, 11,
         "two --param substitutions must export exactly 11 rows (ids 10..=20); got {rows}"
     );
+    // Back the reported count with an independent destination read.
+    assert_eq!(
+        total_parquet_rows(out.path()),
+        11,
+        "destination must physically hold the 11 param-filtered rows"
+    );
 }
 
 #[test]
@@ -429,6 +453,12 @@ fn run_reconcile_flag_exits_zero_when_counts_match() {
     assert!(
         stderr.contains("MATCH"),
         "run --reconcile stderr must contain 'MATCH' when counts agree; got:\n{stderr}"
+    );
+    // Back the 25-row claim independently of rivet's reconcile/aggregate.
+    assert_eq!(
+        total_parquet_rows(out.path()),
+        25,
+        "destination must physically hold all 25 rows"
     );
 }
 
@@ -604,6 +634,17 @@ exports:
         2,
         "both exports must succeed"
     );
+    // Back the success-count with independent destination reads of both outputs.
+    assert_eq!(
+        total_parquet_rows(out1.path()),
+        10,
+        "export 1 destination must hold 10 rows"
+    );
+    assert_eq!(
+        total_parquet_rows(out2.path()),
+        10,
+        "export 2 destination must hold 10 rows"
+    );
 }
 
 #[test]
@@ -674,6 +715,17 @@ exports:
         json["success_count"].as_i64().unwrap_or(0),
         2,
         "both exports must succeed"
+    );
+    // Back the success-count with independent destination reads of both outputs.
+    assert_eq!(
+        total_parquet_rows(out1.path()),
+        10,
+        "export 1 destination must hold 10 rows"
+    );
+    assert_eq!(
+        total_parquet_rows(out2.path()),
+        10,
+        "export 2 destination must hold 10 rows"
     );
 }
 
@@ -1349,6 +1401,13 @@ exports:
     assert_eq!(
         completed_chunks, 2,
         "100 rows / chunk_size 50 must produce exactly 2 completed chunk tasks; got {completed_chunks}"
+    );
+    // Back the chunked-completeness claim with an independent destination read:
+    // both chunks' rows must physically land, not just be marked 'completed'.
+    assert_eq!(
+        total_parquet_rows(out.path()),
+        100,
+        "both chunks' rows must reach the destination (100 total)"
     );
 }
 
