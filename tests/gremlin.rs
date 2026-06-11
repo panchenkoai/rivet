@@ -31,8 +31,26 @@
 mod common;
 
 use common::*;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Total physical rows across every Parquet part at `dir` — re-reads the files
+/// rather than trusting rivet's internal `total_rows` counter.
+fn total_parquet_rows(dir: &std::path::Path) -> i64 {
+    let mut total = 0i64;
+    for path in files_with_extension(dir, "parquet") {
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+            .unwrap_or_else(|e| panic!("open {}: {e}", path.display()))
+            .build()
+            .unwrap();
+        for batch in reader {
+            total += batch.unwrap().num_rows() as i64;
+        }
+    }
+    total
+}
 
 /// Write `yaml` to a fresh tempdir and return `(dir_guard, config_path)`.
 /// The `TempDir` must be kept alive for the duration of the test; dropping it
@@ -280,6 +298,16 @@ exports:
     assert!(
         !files_with_extension(out.path(), "parquet").is_empty(),
         "auto_shrink export must produce at least one output file"
+    );
+    // The test name promises row-count correctness — lock it by re-reading the
+    // destination, not just rivet's internal counter / the quality gate. If
+    // auto_shrink's recursive batch splitting dropped a partial split, the gate
+    // (which reads the same internal counter) would still pass while the
+    // destination silently lost rows.
+    assert_eq!(
+        total_parquet_rows(out.path()),
+        2000,
+        "auto_shrink must write all 2000 rows to the destination across its splits"
     );
 }
 

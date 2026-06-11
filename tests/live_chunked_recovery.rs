@@ -32,6 +32,7 @@
 mod common;
 
 use common::*;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -89,6 +90,39 @@ fn manifest_total_rows(cfg: &std::path::Path, export: &str) -> i64 {
             |r| r.get(0),
         )
         .unwrap_or(0)
+}
+
+/// Physical row total and distinct `id` count across every Parquet part at the
+/// destination — an EXTERNAL oracle that re-reads the files rather than trusting
+/// rivet's own `file_log`. `physical` pins the at-least-once duplication count
+/// against what the manifest claims (catching a nonce regression → same-second
+/// overwrite, or an additive-within-chunk commit, that the file_log assertions
+/// alone would wave through); `distinct` proves the de-duplicated logical total.
+fn parquet_physical_and_distinct_ids(dir: &std::path::Path) -> (i64, i64) {
+    use arrow::array::{Array, AsArray};
+    let mut physical = 0i64;
+    let mut ids = std::collections::BTreeSet::new();
+    for path in files_with_extension(dir, "parquet") {
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+            .unwrap_or_else(|e| panic!("open {}: {e}", path.display()))
+            .build()
+            .unwrap();
+        for batch in reader {
+            let batch = batch.unwrap();
+            physical += batch.num_rows() as i64;
+            let col = batch.column_by_name("id").expect("id column present");
+            let a = col
+                .as_primitive_opt::<arrow::datatypes::Int64Type>()
+                .expect("id column decodes as Int64");
+            for i in 0..a.len() {
+                if !a.is_null(i) {
+                    ids.insert(a.value(i));
+                }
+            }
+        }
+    }
+    (physical, ids.len() as i64)
 }
 
 /// `validated` flag from the latest `export_metrics` row (NULL → None).
@@ -320,6 +354,24 @@ exports:
     assert!(
         parquet_files.len() >= 3,
         "at least 3 parquet files must exist (one per chunk); found: {parquet_files:?}"
+    );
+
+    // Re-read the DESTINATION (not file_log): the 1.1s sleep gives chunk 0's two
+    // writes distinct filenames, so the physical row total must equal what the
+    // manifest claims (200, chunk 0 counted twice), and the DISTINCT id set must
+    // equal the de-duplicated source (150). Together this proves the orphan is
+    // the only surplus and a manifest-aware reader recovers exactly-once — the
+    // file_log↔Parquet coherence the file_log-only assertions above cannot see.
+    let mtr = manifest_total_rows(&cfg, &export);
+    let (physical, distinct) = parquet_physical_and_distinct_ids(out.path());
+    assert_eq!(
+        physical, mtr,
+        "destination physical rows ({physical}) must equal manifest_total_rows ({mtr}) — \
+         file_log claims rows that must physically exist at the destination"
+    );
+    assert_eq!(
+        distinct, 150,
+        "150 distinct source ids must survive de-duplication (got {distinct}) — a hole here is row LOSS"
     );
 }
 
@@ -646,6 +698,21 @@ exports:
         parquet_files.len() >= EXPECTED_CHUNKS as usize,
         "at least {EXPECTED_CHUNKS} parquet files must exist; found {}: {parquet_files:?}",
         parquet_files.len()
+    );
+
+    // Re-read the DESTINATION (not file_log): physical rows must equal what the
+    // manifest claims (ROW_COUNT + one re-run chunk), and DISTINCT ids must equal
+    // the de-duplicated source — proving the orphan is the only surplus and a
+    // manifest-aware reader recovers exactly-once (file_log↔Parquet coherence).
+    let mtr = manifest_total_rows(&cfg, &export);
+    let (physical, distinct) = parquet_physical_and_distinct_ids(out.path());
+    assert_eq!(
+        physical, mtr,
+        "destination physical rows ({physical}) must equal manifest_total_rows ({mtr})"
+    );
+    assert_eq!(
+        distinct, ROW_COUNT,
+        "{ROW_COUNT} distinct source ids must survive de-duplication (got {distinct}) — a hole is row LOSS"
     );
 }
 

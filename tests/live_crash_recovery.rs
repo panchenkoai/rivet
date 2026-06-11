@@ -22,6 +22,37 @@
 mod common;
 
 use common::*;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+/// Distinct `id` values and physical row count across every Parquet part at the
+/// destination — re-reads the files, NOT rivet's state DB. Lets a recovery test
+/// assert the no-row-loss superset invariant the state-DB assertions cannot see.
+fn parquet_ids_and_rows(dir: &std::path::Path) -> (std::collections::BTreeSet<i64>, i64) {
+    use arrow::array::{Array, AsArray};
+    let mut ids = std::collections::BTreeSet::new();
+    let mut rows = 0i64;
+    for path in files_with_extension(dir, "parquet") {
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+            .unwrap_or_else(|e| panic!("open {}: {e}", path.display()))
+            .build()
+            .unwrap();
+        for batch in reader {
+            let batch = batch.unwrap();
+            rows += batch.num_rows() as i64;
+            let col = batch.column_by_name("id").expect("id column present");
+            let a = col
+                .as_primitive_opt::<arrow::datatypes::Int64Type>()
+                .expect("id column decodes as Int64");
+            for i in 0..a.len() {
+                if !a.is_null(i) {
+                    ids.insert(a.value(i));
+                }
+            }
+        }
+    }
+    (ids, rows)
+}
 
 /// RAII guard — drops a Postgres table on scope exit.
 struct PgCleanup(String);
@@ -229,6 +260,24 @@ fn crash_after_file_write_leaves_file_but_no_manifest_or_cursor() {
         total >= 2,
         "orphaned pre-crash file + recovery file: expected >=2, got {total}"
     );
+
+    // Re-read the DESTINATION (not the state DB): the recovery re-export must be
+    // a COMPLETE superset of the source — every seeded id present at least once
+    // (no row LOST across the orphan+recovery split) — with the only surplus
+    // being the documented at-least-once orphan (physical >= source). The
+    // existing assertions check file COUNT + state DB + exit code, never the
+    // rows actually on disk; a regression that dropped rows on the recovery
+    // re-export would pass them all.
+    let (ids, physical) = parquet_ids_and_rows(out.path());
+    let expected: std::collections::BTreeSet<i64> = (1..=8).collect();
+    assert_eq!(
+        ids, expected,
+        "recovery must leave every source id (1..=8) at the destination — a missing id is row LOSS"
+    );
+    assert!(
+        physical >= 8,
+        "at-least-once: physical destination rows ({physical}) must be >= source (8)"
+    );
 }
 
 #[test]
@@ -270,6 +319,19 @@ fn crash_after_manifest_update_leaves_file_and_manifest_but_no_cursor() {
     assert!(rec.status.success());
     assert_eq!(manifest_count(&cfg, &export), 2);
     assert!(cursor_value(&cfg, &export).is_some());
+
+    // Destination re-read: the recovery re-export is a complete superset of the
+    // source (every seeded id 1..=7 present; physical >= source for at-least-once).
+    let (ids, physical) = parquet_ids_and_rows(out.path());
+    let expected: std::collections::BTreeSet<i64> = (1..=7).collect();
+    assert_eq!(
+        ids, expected,
+        "recovery must leave every source id (1..=7) at the destination — a missing id is row LOSS"
+    );
+    assert!(
+        physical >= 7,
+        "at-least-once: physical destination rows ({physical}) must be >= source (7)"
+    );
 }
 
 #[test]
