@@ -61,6 +61,23 @@ jobs:
         with:
           toolchain: "1.94"
       - uses: Swatinem/rust-cache@v2
+      # `cargo test --all-targets` links every integration-test binary in the
+      # DEBUG profile — each statically links the full dep tree (arrow / parquet
+      # / openssl / ring / tiberius) with full debug info, hundreds of MB apiece.
+      # As the suite grew (live_differential / live_crash_soak / live_chunked_dense
+      # / sec_exit_codes …) the link working-set crossed ubuntu-latest's ~14 GB
+      # free, and `lld` (mmap-backed output) faults on the full disk with
+      # `ld terminated with signal 7 [Bus error]` — surfacing as a non-obvious
+      # exit 101. Same free-disk fix the e2e job already uses (~30 GB, ~15 s).
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          large-packages: false
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          swap-storage: false
       - run: cargo test --all-targets
 
   test-invariants:
