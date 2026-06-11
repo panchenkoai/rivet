@@ -57,7 +57,10 @@ fn main() {
     let cli = cli::Cli::parse();
     let json_errors = cli.json_errors;
     if let Err(e) = cli::dispatch(cli) {
-        let msg = redact::redact_error(&e);
+        // redact strips credentials; sanitize_terminal strips ANSI/OSC control
+        // bytes a malicious source DB can embed in an error string (V9/CWE-150)
+        // so the top-level error line cannot rewrite/clear the operator terminal.
+        let msg = crate::pipeline::parent_ui::sanitize_terminal(&redact::redact_error(&e));
         if json_errors {
             eprintln!("{}", serde_json::json!({ "error": msg }));
         } else {

@@ -62,6 +62,43 @@ use std::time::{Duration, Instant};
 use super::ipc::ChildEvent;
 use super::{clamp_line, format_bytes, strip_chunked_recovery_hint};
 
+/// Neutralise terminal-control bytes in text that originates outside the
+/// renderer (DB error strings forwarded over IPC, captured child stderr)
+/// before it is written to the operator's terminal.
+///
+/// A malicious or compromised source DB can embed ANSI/OSC escape sequences
+/// in an error message (e.g. `ESC ] 0 ; … BEL` to rewrite the window title,
+/// `ESC [ 2 J` to clear the screen). Those reach us verbatim through the
+/// error-card / child-stderr render paths, so every such string is funnelled
+/// through here first (CWE-150). Each dangerous character is replaced with an
+/// ASCII-safe `\u{NN}` escape rather than dropped, so the operator still sees
+/// that bytes were present without the terminal interpreting them.
+///
+/// Stripped: the C0 controls `U+0000..=U+001F` (except TAB and LF, the only
+/// layout whitespace the renderer relies on — CR is removed because it would
+/// reposition the cursor), DEL `U+007F`, and the C1 controls
+/// `U+0080..=U+009F`. Operating on `char`s means multi-byte display glyphs
+/// (`✓`, `…`, `─`) are preserved intact — their UTF-8 continuation bytes are
+/// never examined in isolation.
+pub(crate) fn sanitize_terminal(text: &str) -> String {
+    let needs_escape = |c: char| {
+        let cp = c as u32;
+        (cp <= 0x1f && c != '\t' && c != '\n') || cp == 0x7f || (0x80..=0x9f).contains(&cp)
+    };
+    if !text.chars().any(needs_escape) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if needs_escape(c) {
+            out.push_str(&format!("\\u{{{:02x}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// One unit of work for the UI thread.  Children emit raw `ChildEvent`s; the
 /// reader thread for each child wraps them in [`UiMessage::Event`].  When a
 /// child's stdout closes (process exited) the reader sends [`UiMessage::ChildClosed`]
@@ -447,9 +484,13 @@ impl CardState {
     fn finalize_synthetic(&mut self, status: &str, error_message: Option<&str>) {
         self.finished = true;
         self.status = format!("synthetic-{}", status);
-        self.final_line = error_message
-            .unwrap_or("child exited without a final summary")
-            .to_string();
+        // `error_message` here can carry a forwarded child/`wait()` failure
+        // string, so it is sanitised on the same terminal-injection grounds
+        // as `render_final_line` (CWE-150).
+        self.final_line = match error_message {
+            Some(msg) => sanitize_terminal(msg),
+            None => "child exited without a final summary".to_string(),
+        };
     }
 
     /// Lines this card contributes to the current frame.  Compact mode
@@ -549,7 +590,10 @@ fn render_final_line(
         // long inline command would otherwise wrap and corrupt the
         // in-place card layout.
         let (cause, _) = strip_chunked_recovery_hint(err);
-        return cause.to_string();
+        // The error text is attacker-influenced (source-DB error strings),
+        // so neutralise any embedded terminal-control bytes before it is
+        // rendered to the operator's terminal (CWE-150).
+        return sanitize_terminal(cause);
     }
     let rss = if peak_rss_mb > 0 {
         format!("  RSS {} MB", fmt_thousands(peak_rss_mb))
@@ -809,5 +853,73 @@ mod tests {
         let pa = la.find(" rows").expect("body present in a");
         let pb = lb.find(" rows").expect("body present in b");
         assert_eq!(pa, pb, "alignment broken: a={la:?} b={lb:?}");
+    }
+
+    /// Dangerous terminal control characters that must not survive
+    /// sanitisation, mirroring `sanitize_terminal`'s contract: C0 except TAB/LF,
+    /// DEL, and the C1 block. This scans decoded `char`s (NOT raw bytes) — a
+    /// byte scan would false-flag the UTF-8 continuation bytes (0x80..=0xBF) of
+    /// legitimate multi-byte display glyphs the renderer uses (`──`, `✗`, `—`).
+    fn dangerous_control_bytes(s: &str) -> Vec<char> {
+        s.chars()
+            .filter(|&c| {
+                let cp = c as u32;
+                (cp <= 0x1f && c != '\t' && c != '\n') || cp == 0x7f || (0x80..=0x9f).contains(&cp)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sanitize_terminal_escapes_ansi_and_osc_payload() {
+        // OSC 0 window-title rewrite + CSI 2J screen clear + BEL.
+        let payload = "\u{1b}]0;pwned\u{07}\u{1b}[2Jboom";
+        let clean = sanitize_terminal(payload);
+        assert!(
+            dangerous_control_bytes(&clean).is_empty(),
+            "escape bytes survived: {clean:?}"
+        );
+        // The visible, printable remainder is preserved.
+        assert!(clean.contains("pwned"));
+        assert!(clean.contains("boom"));
+    }
+
+    #[test]
+    fn sanitize_terminal_preserves_printable_and_layout_whitespace() {
+        // ASCII text, TAB and LF must pass through untouched; multi-byte
+        // display glyphs the renderer uses must survive intact.
+        let s = "ok\tline1\nline2 ✓ … ──";
+        assert_eq!(sanitize_terminal(s), s);
+    }
+
+    #[test]
+    fn sanitize_terminal_strips_del_c1_and_cr() {
+        // DEL (0x7f), a C1 control (U+0085 NEL) and CR are all removed/escaped.
+        let s = "a\u{7f}b\u{85}c\rd";
+        let clean = sanitize_terminal(s);
+        assert!(dangerous_control_bytes(&clean).is_empty());
+        assert!(clean.contains('a') && clean.contains('d'));
+    }
+
+    #[test]
+    fn render_final_line_sanitises_db_error_escapes() {
+        // The whole V9 leak path through `render_final_line` must emit no raw
+        // terminal-control bytes from an attacker-influenced DB error string.
+        let err = "db error: invalid input: \u{1b}]0;pwned\u{07}\u{1b}[2Jboom";
+        let line = render_final_line(0, 0, 0, 0, 0, Some(err));
+        assert!(
+            dangerous_control_bytes(&line).is_empty(),
+            "render_final_line leaked control bytes: {line:?}"
+        );
+    }
+
+    #[test]
+    fn finalize_synthetic_sanitises_escapes() {
+        let mut card = fresh_card("orders", "chunked");
+        card.finalize_synthetic("failed", Some("crash \u{1b}[2J\u{07}"));
+        let line = card.compact_line(MIN_NAME_COL, MIN_MODE_COL);
+        assert!(
+            dangerous_control_bytes(&line).is_empty(),
+            "synthetic final line leaked control bytes: {line:?}"
+        );
     }
 }

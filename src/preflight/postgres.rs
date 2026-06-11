@@ -238,11 +238,15 @@ fn get_cursor_range_pg(
     base_query: &str,
     cursor_col: &str,
 ) -> (Option<String>, Option<String>) {
+    // Quote the config-author-controlled column so a hostile value collapses to
+    // a single (nonexistent) identifier instead of injecting SQL into the
+    // min()/max() aggregates (CWE-89) — same defense the MSSQL sibling applies.
+    let expr = crate::sql::quote_ident(SourceType::Postgres, cursor_col);
     let range_query = match crate::pipeline::chunked::strip_select_star_from(base_query) {
-        Some(tbl) => format!("SELECT min({cursor_col})::text, max({cursor_col})::text FROM {tbl}"),
-        None => format!(
-            "SELECT min({cursor_col})::text, max({cursor_col})::text FROM ({base_query}) AS _rivet"
-        ),
+        Some(tbl) => format!("SELECT min({expr})::text, max({expr})::text FROM {tbl}"),
+        None => {
+            format!("SELECT min({expr})::text, max({expr})::text FROM ({base_query}) AS _rivet")
+        }
     };
     match client.query(&range_query, &[]) {
         Ok(rows) if !rows.is_empty() => {

@@ -89,6 +89,7 @@ impl Config {
         }
         Self::check_misplaced_tuning_fields(yaml)?;
         Self::check_csv_compression(yaml)?;
+        Self::check_tls_mode_downgrade(yaml)?;
         let config: Config = serde_yaml_ng::from_str(yaml).map_err(|e| {
             // A well-formed flow map (`prefix: {partition}`) parses as a YAML
             // value but serde then rejects it with `invalid type: map, expected
@@ -202,6 +203,69 @@ impl Config {
                     profile,
                 );
             }
+        }
+        Ok(())
+    }
+
+    /// V13: reject a `source.tls` block that pairs an *explicitly chosen*
+    /// enforced `mode:` with a verification-disabling danger knob
+    /// (`accept_invalid_certs` / `accept_invalid_hostnames`). `mode: verify-full`
+    /// promises chain + hostname verification, but the knob silently downgrades
+    /// it to "trust anything" — a MITM exposure that contradicts the stated
+    /// intent (see `src/source/tls.rs::build_native_tls`, whose comment claims
+    /// this is warned about at config-time but is not).
+    ///
+    /// Like [`Self::check_csv_compression`], this is a raw-YAML scan rather than
+    /// a `validate` check on purpose: `TlsMode` is `#[serde(default)]` and the
+    /// default is `VerifyFull`, so a parsed config cannot distinguish "user
+    /// wrote `mode: verify-full`" (a contradiction to flag) from "user omitted
+    /// `mode:`" (the common dev-container case `tls: { accept_invalid_certs:
+    /// true }` against a loopback self-signed cert — which must keep working).
+    /// Only an *explicit* enforced `mode:` next to a danger knob is the footgun.
+    fn check_tls_mode_downgrade(yaml: &str) -> crate::error::Result<()> {
+        let root: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml)?;
+        let Some(tls) = root.get("source").and_then(|s| s.get("tls")) else {
+            return Ok(());
+        };
+
+        // Only an explicitly written `mode:` is a deliberate, contradicted
+        // choice; an omitted mode is the dev-container default path.
+        let Some(mode) = tls.get("mode").and_then(|m| m.as_str()) else {
+            return Ok(());
+        };
+        // `disable` carries no verification promise to contradict; the danger
+        // knobs are a no-op there. Flag only the enforced modes.
+        if mode == "disable" {
+            return Ok(());
+        }
+
+        let knob = if tls
+            .get("accept_invalid_certs")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            Some("accept_invalid_certs")
+        } else if tls
+            .get("accept_invalid_hostnames")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            Some("accept_invalid_hostnames")
+        } else {
+            None
+        };
+
+        if let Some(knob) = knob {
+            anyhow::bail!(
+                "source.tls: {} disables certificate verification, silently downgrading the \
+                 chosen `mode: {}` to trust-anything (MITM exposure — credentials and rows \
+                 readable/forgeable on the wire).\n  \
+                 Hint: drop the danger knob and trust a private CA with `tls.ca_file: <pem>`; \
+                 only use a danger knob for a loopback self-signed dev container, and then omit \
+                 the explicit `mode:` so the contradiction is gone.",
+                knob,
+                mode,
+            );
         }
         Ok(())
     }
@@ -387,6 +451,21 @@ impl Config {
     /// destination auth, compression, and the mode/chunk matrix. Takes `&self`
     /// because effective tuning merges the source-level block.
     fn validate_export(&self, export: &ExportConfig) -> crate::error::Result<()> {
+        // V5: `name` is keyed into output paths, file logs, and on-disk state,
+        // yet is otherwise free-form. A traversal (`../../etc/x`), absolute or
+        // slash-bearing (`/abs/x`, `sub/dir`), leading-dot, or NUL-bearing name
+        // escapes the intended output tree and corrupts name-keyed state.
+        // Mirror the `query_file` `..`/absolute guard: reject at config-load,
+        // accepting only a filename-safe charset.
+        if !is_filename_safe_name(&export.name) {
+            anyhow::bail!(
+                "export name '{}' is not filename-safe: it must not be absolute, contain \
+                 '/', '\\', '..', a NUL, or start with '.' (the name is used in output paths \
+                 and state keys). Use a plain identifier like `orders` or `daily_events`.",
+                export.name.escape_default(),
+            );
+        }
+
         let merged =
             crate::tuning::merge_tuning_config(self.source.tuning.as_ref(), export.tuning.as_ref());
         if let Some(t) = merged
@@ -454,6 +533,70 @@ impl Config {
                 );
             }
         }
+        // V2/V12: a custom cloud `endpoint` is handed straight to the opendal
+        // S3/GCS/Azure builder with no validation, so a committed config can
+        // silently redirect every upload to an attacker host (exfiltration) or
+        // send credentials + rows over cleartext `http://`. The legitimate use
+        // is a local emulator (Minio / Azurite / fake-gcs on `127.0.0.1`), so
+        // accept a loopback host (any scheme), and otherwise accept a remote
+        // endpoint only when the operator has explicitly opted into anonymous
+        // (emulator) mode. Reject every other custom endpoint at config-load.
+        if matches!(
+            export.destination.destination_type,
+            DestinationType::S3 | DestinationType::Gcs | DestinationType::Azure
+        ) && let Some(endpoint) = &export.destination.endpoint
+        {
+            // Loopback emulator (Minio/Azurite/fake-gcs) is the legitimate
+            // local-dev path — accept any scheme. A non-loopback (or
+            // unparseable) custom endpoint is only accepted when the operator
+            // has explicitly opted into anonymous (emulator) mode, where no
+            // credentials are sent. Everything else is rejected.
+            let loopback = endpoint_host(endpoint).is_some_and(|host| is_loopback_host(&host));
+            if !loopback && !export.destination.allow_anonymous {
+                anyhow::bail!(
+                    "export '{}': destination.endpoint '{}' points at a non-loopback host. \
+                     A custom endpoint redirects every upload there — committing one is a \
+                     data-exfiltration / cleartext-credential risk.\n  \
+                     Hint: drop `endpoint:` to use the provider default, point it at a \
+                     loopback emulator (e.g. http://127.0.0.1:9000 with allow_anonymous: true \
+                     for Minio/Azurite), or set `allow_anonymous: true` for an anonymous \
+                     emulator.",
+                    export.name,
+                    endpoint,
+                );
+            }
+        }
+
+        // V15: a `type: local` destination `path` (or `prefix`) is written
+        // verbatim to the filesystem. A `..` component lets a committed config
+        // climb out of the intended output tree (`../../../../tmp/x`) — mirror
+        // the `query_file` traversal guard and reject it at config-load.
+        //
+        // Absolute paths are deliberately *not* rejected: `path: /output` is a
+        // legitimate Docker volume-mount pattern (see `examples/rivet.yaml`) and
+        // an explicit operator choice, not a hidden escape. The `..` climb is
+        // the unambiguous traversal footgun.
+        if export.destination.destination_type == DestinationType::Local {
+            for (field, value) in [
+                ("path", export.destination.path.as_deref()),
+                ("prefix", export.destination.prefix.as_deref()),
+            ] {
+                let Some(value) = value else { continue };
+                if std::path::Path::new(value)
+                    .components()
+                    .any(|c| c == std::path::Component::ParentDir)
+                {
+                    anyhow::bail!(
+                        "export '{}': local destination {} must not contain a '..' component: \
+                         '{}' (a parent-dir climb writes outside the output tree).",
+                        export.name,
+                        field,
+                        value
+                    );
+                }
+            }
+        }
+
         if export.destination.destination_type == DestinationType::S3 {
             let ak = export.destination.access_key_env.is_some();
             let sk = export.destination.secret_key_env.is_some();
@@ -733,6 +876,66 @@ fn line_has_unquoted_brace_value(line: &str) -> bool {
     false
 }
 
+/// Extract the lower-cased host from a `scheme://host[:port][/path]` endpoint,
+/// or `None` when it does not look like a URL.
+///
+/// SecOps helper for the cloud-`endpoint` exfiltration guard (V2/V12): the host
+/// decides whether a custom endpoint is a local emulator (loopback) or a remote
+/// redirect target. We reject every non-loopback custom endpoint regardless of
+/// scheme (covering both the exfil and the cleartext-`http` gaps), so only the
+/// host is needed. We hand-parse rather than pull in a URL crate — the inputs
+/// are operator-typed endpoints, not arbitrary URIs. A bracketed IPv6 literal
+/// authority (`http://[::1]:9000`) keeps its address so it compares against the
+/// loopback list.
+fn endpoint_host(endpoint: &str) -> Option<String> {
+    let (scheme, rest) = endpoint.split_once("://")?;
+    if scheme.is_empty() {
+        return None;
+    }
+    // Authority ends at the first `/` (path), `?` (query), or `#` (fragment);
+    // any `user[:pass]@` userinfo head is dropped (host is after the last `@`).
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .rsplit('@')
+        .next()
+        .unwrap_or("");
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        // Bracketed IPv6 literal: take up to the closing `]`.
+        stripped.split(']').next().unwrap_or("")
+    } else {
+        // host[:port] — strip the port suffix.
+        authority.split(':').next().unwrap_or("")
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
+}
+
+/// True when `host` names the local machine — the legitimate cloud-emulator
+/// target (Minio / Azurite / fake-gcs on `127.0.0.1`). Anything else is a
+/// remote host and a potential exfiltration redirect.
+fn is_loopback_host(host: &str) -> bool {
+    // `127.0.0.0/8` is the IPv4 loopback block; `localhost` and `::1` complete
+    // the set. Anything else is a remote host (a possible exfil redirect).
+    matches!(host, "localhost" | "::1") || host.starts_with("127.")
+}
+
+/// True when `name` is filename-safe: rejects path-traversal (`..`), absolute
+/// or slash-bearing names (`/`, `\`), a leading `.` (hidden / current-dir), and
+/// embedded NULs. `ExportConfig.name` is keyed into output paths and on-disk
+/// state, so a `../../etc/x` or absolute name escapes the output tree (V5).
+fn is_filename_safe_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains("..")
+        && !name.contains('\0')
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -973,5 +1176,392 @@ mod audit_unquoted_template_brace {
         assert!(!line_has_unquoted_brace_value("    path: ./out"));
         assert!(!line_has_unquoted_brace_value("  # prefix: {partition}")); // comment
         assert!(!line_has_unquoted_brace_value("    prefix:")); // no value
+    }
+}
+
+#[cfg(test)]
+mod sec_config_validation_regression {
+    //! Regression edge-cases that pin the *compat boundaries* of the
+    //! config-validation security fixes — the cases that distinguish a real
+    //! attack from a legitimate loopback / dev-container / Docker pattern.
+    //! These complement the RED tests in `sec_config_validation`: the RED
+    //! tests assert the attack is rejected; these assert the fix stays narrow
+    //! enough not to break local-dev usage (see CRITICAL COMPAT).
+    use super::*;
+
+    /// A full, otherwise-valid config whose single export's `destination:`
+    /// block is whatever the caller passes verbatim.
+    fn yaml_with_destination(dest_block: &str) -> String {
+        format!(
+            "source:\n  type: postgres\n  url: \"postgresql://localhost/test\"\n\
+             exports:\n  - name: t\n    query: \"SELECT 1\"\n    format: parquet\n\
+             {dest_block}"
+        )
+    }
+
+    // ── endpoint_host / is_loopback_host helpers ─────────────────────────────
+
+    #[test]
+    fn endpoint_host_parses_forms() {
+        assert_eq!(
+            endpoint_host("https://attacker.example.com").as_deref(),
+            Some("attacker.example.com")
+        );
+        // Port and path are stripped from the host.
+        assert_eq!(
+            endpoint_host("http://127.0.0.1:10000/devstoreaccount1").as_deref(),
+            Some("127.0.0.1")
+        );
+        // userinfo head is dropped (host is after the last `@`).
+        assert_eq!(
+            endpoint_host("http://user:pass@127.0.0.1:9000").as_deref(),
+            Some("127.0.0.1")
+        );
+        // Bracketed IPv6 literal keeps its address.
+        assert_eq!(endpoint_host("http://[::1]:9000").as_deref(), Some("::1"));
+        // Not a URL → None (treated as a non-loopback custom endpoint upstream).
+        assert_eq!(endpoint_host("not-a-url"), None);
+        assert_eq!(endpoint_host("://nohost"), None);
+    }
+
+    #[test]
+    fn loopback_host_classification() {
+        for h in ["127.0.0.1", "127.0.0.53", "localhost", "::1"] {
+            assert!(is_loopback_host(h), "{h} must be loopback");
+        }
+        for h in ["attacker.example.com", "evil.com", "10.0.0.1", "::2"] {
+            assert!(!is_loopback_host(h), "{h} must be remote");
+        }
+    }
+
+    // ── V2/V12 endpoint: loopback accepted regardless of allow_anonymous ─────
+
+    #[test]
+    fn loopback_endpoint_without_allow_anonymous_still_accepted() {
+        // A loopback emulator endpoint with credentials (no allow_anonymous) is
+        // the Minio-with-keys local-dev pattern and must stay accepted — the
+        // exfil guard targets *remote* hosts, not localhost.
+        let cfg = yaml_with_destination(
+            "    destination:\n      type: s3\n      bucket: b\n      region: us-east-1\n\
+             \x20     endpoint: http://127.0.0.1:9000\n      access_key_env: AK\n      secret_key_env: SK\n",
+        );
+        Config::from_yaml(&cfg).expect("loopback endpoint with creds must stay accepted");
+    }
+
+    #[test]
+    fn remote_https_endpoint_with_allow_anonymous_is_the_only_remote_escape() {
+        // The documented escape hatch: an explicit anonymous (emulator) opt-in
+        // permits a non-loopback endpoint (no credentials are sent). Without
+        // allow_anonymous the same endpoint is rejected (covered by the RED
+        // test); with it, accepted.
+        let cfg = yaml_with_destination(
+            "    destination:\n      type: gcs\n      bucket: b\n\
+             \x20     endpoint: https://emulator.example.com\n      allow_anonymous: true\n",
+        );
+        Config::from_yaml(&cfg).expect("remote endpoint + allow_anonymous opt-in must be accepted");
+    }
+
+    // ── V15 local path: absolute allowed (Docker mount), `..` rejected ───────
+
+    #[test]
+    fn absolute_local_path_is_allowed() {
+        // `path: /output` is a legitimate Docker volume-mount pattern
+        // (examples/rivet.yaml) and must keep validating — only `..` climbs are
+        // the traversal footgun.
+        let cfg =
+            yaml_with_destination("    destination:\n      type: local\n      path: /output\n");
+        Config::from_yaml(&cfg).expect("absolute local path (Docker mount) must validate");
+    }
+
+    #[test]
+    fn dotdot_in_local_prefix_is_rejected() {
+        // `prefix` is guarded the same as `path`.
+        let cfg = yaml_with_destination(
+            "    destination:\n      type: local\n      path: ./out\n      prefix: a/../b\n",
+        );
+        let err = Config::from_yaml(&cfg).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("prefix") && msg.contains(".."),
+            "a '..' in the local prefix must be rejected naming prefix/..; got: {msg}"
+        );
+    }
+
+    // ── V13 TLS: explicit enforced mode + knob rejected; default-mode kept ───
+
+    #[test]
+    fn tls_danger_knob_without_explicit_mode_still_accepted() {
+        // The dev-container pattern `tls: { accept_invalid_certs: true }` against
+        // a loopback self-signed cert (e.g. the MSSQL docker container) omits
+        // `mode:` — there is no *explicit* mode to contradict, so it must keep
+        // validating. The RED test rejects only the explicit-mode contradiction.
+        let yaml = "source:\n  type: mssql\n  url: \"sqlserver://sa:pw@127.0.0.1:1433/db\"\n  \
+                    tls:\n    accept_invalid_certs: true\n\
+                    exports:\n  - name: t\n    query: \"SELECT 1\"\n    format: parquet\n    \
+                    destination:\n      type: local\n      path: ./out\n";
+        Config::from_yaml(yaml)
+            .expect("dev-container default-mode + accept_invalid_certs must stay accepted");
+    }
+
+    #[test]
+    fn tls_explicit_verify_ca_plus_invalid_hostnames_rejected() {
+        // The hostname knob is flagged too, against any explicit enforced mode.
+        let yaml = "source:\n  type: postgres\n  url: \"postgresql://localhost/test\"\n  \
+                    tls:\n    mode: verify-ca\n    accept_invalid_hostnames: true\n\
+                    exports:\n  - name: t\n    query: \"SELECT 1\"\n    format: parquet\n    \
+                    destination:\n      type: local\n      path: ./out\n";
+        let err = Config::from_yaml(yaml).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("accept_invalid_hostnames") && msg.contains("verify-ca"),
+            "explicit verify-ca + accept_invalid_hostnames must be rejected; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn tls_explicit_disable_with_knob_is_not_flagged() {
+        // `mode: disable` carries no verification promise to contradict, so the
+        // danger knob is a no-op there and must not be rejected.
+        let yaml = "source:\n  type: postgres\n  url: \"postgresql://localhost/test\"\n  \
+                    tls:\n    mode: disable\n    accept_invalid_certs: true\n\
+                    exports:\n  - name: t\n    query: \"SELECT 1\"\n    format: parquet\n    \
+                    destination:\n      type: local\n      path: ./out\n";
+        Config::from_yaml(yaml).expect("mode: disable + knob is a no-op and must validate");
+    }
+
+    // ── V5 name: filename-safe predicate boundaries ──────────────────────────
+
+    #[test]
+    fn filename_safe_name_boundaries() {
+        for ok in ["t", "orders", "daily_events", "v2-2024", "name.with.dots"] {
+            assert!(is_filename_safe_name(ok), "{ok:?} must be accepted");
+        }
+        for bad in [
+            "",
+            "..",
+            "../x",
+            "/abs",
+            "sub/dir",
+            "back\\slash",
+            ".hidden",
+            "with\u{0000}nul",
+        ] {
+            assert!(!is_filename_safe_name(bad), "{bad:?} must be rejected");
+        }
+    }
+}
+
+#[cfg(test)]
+mod sec_config_validation {
+    //! RED security tests for config-load validation gaps (cluster:
+    //! config-validation). Each asserts the SECURE behavior through the
+    //! stable `Config::from_yaml` seam: a malicious config that is accepted
+    //! today must be REJECTED (or, for warn-only knobs, surfaced as an
+    //! error/loud warning) at config-load. These are expected to FAIL until
+    //! the corresponding production fix lands.
+    //!
+    //! The pattern mirrors the existing `query_file` `..`/absolute-path guard
+    //! in `validate_export` (see `config/tests/validation.rs`): a syntactic
+    //! check that runs at config-validate time so `rivet check` / `rivet
+    //! doctor` catch the problem before any connect/plan/upload step.
+    use super::*;
+
+    /// A full, otherwise-valid config whose single export's `destination:`
+    /// block is whatever the caller passes verbatim. Only the destination
+    /// varies, so any rejection is attributable to the destination under test.
+    fn yaml_with_destination(dest_block: &str) -> String {
+        format!(
+            "source:\n  type: postgres\n  url: \"postgresql://localhost/test\"\n\
+             exports:\n  - name: t\n    query: \"SELECT 1\"\n    format: parquet\n\
+             {dest_block}"
+        )
+    }
+
+    // ── V2/V12: cloud-endpoint exfiltration + http cleartext ────────────────
+    //
+    // `destination.endpoint` is passed straight to the opendal S3/GCS/Azure
+    // builder with no validation (see `src/destination/{s3,gcs,azure}.rs`),
+    // so a committed config can silently redirect every export to an
+    // attacker-controlled host. Two distinct gaps:
+    //   V2  — a custom *non-loopback* endpoint (data exfiltration target).
+    //   V12 — an `http://` (plaintext) endpoint (credentials + data on the
+    //         wire in cleartext).
+    // The secure behavior is to reject (or require explicit opt-in) at
+    // config-load. Loopback/emulator endpoints (Minio/Azurite/fake-gcs on
+    // 127.0.0.1) MUST stay accepted — that path is exercised by the existing
+    // `gcs_allow_anonymous_parses` test and the guard test below.
+
+    #[test]
+    fn sec_s3_custom_endpoint_rejected() {
+        // SEC-RED V2: a non-loopback custom S3 endpoint is an exfiltration
+        // target — every part upload goes to attacker.example.com. Must be
+        // rejected (or require explicit opt-in) at config-load. Accepted today.
+        let cfg = yaml_with_destination(
+            "    destination:\n      type: s3\n      bucket: my-bucket\n      region: us-east-1\n\
+             \x20     endpoint: https://attacker.example.com\n",
+        );
+        let res = Config::from_yaml(&cfg);
+        assert!(
+            res.is_err(),
+            "a non-loopback custom S3 endpoint (https://attacker.example.com) must be \
+             rejected at config-load (data-exfiltration target); got Ok"
+        );
+        let msg = format!("{:#}", res.unwrap_err());
+        assert!(
+            msg.contains("endpoint"),
+            "rejection must name the offending 'endpoint' field; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn sec_http_endpoint_rejected() {
+        // SEC-RED V12: a plaintext http:// endpoint to a *remote* host sends
+        // credentials and exported rows over the wire in cleartext. Must be
+        // rejected (or require explicit opt-in) at config-load. Accepted today.
+        // Use a non-loopback host so this is distinct from the Minio/Azurite
+        // loopback emulator case (guarded below).
+        let cfg = yaml_with_destination(
+            "    destination:\n      type: s3\n      bucket: my-bucket\n      region: us-east-1\n\
+             \x20     endpoint: http://evil.com\n",
+        );
+        let res = Config::from_yaml(&cfg);
+        assert!(
+            res.is_err(),
+            "a plaintext http:// endpoint to a remote host (http://evil.com) must be \
+             rejected at config-load (cleartext credentials + data); got Ok"
+        );
+        let msg = format!("{:#}", res.unwrap_err());
+        assert!(
+            msg.contains("endpoint") || msg.to_lowercase().contains("http"),
+            "rejection must name the endpoint / cleartext problem; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn sec_loopback_endpoint_still_accepted_guard() {
+        // SEC-RED V2/V12 (guard): a loopback emulator endpoint
+        // (`http://127.0.0.1:9000` Minio, with allow_anonymous) is the
+        // legitimate local-dev path and MUST stay accepted after the fix.
+        // This pins that the endpoint rejection targets *remote* hosts, not
+        // localhost — otherwise the fix breaks every Minio/Azurite/fake-gcs
+        // integration test (see `gcs_allow_anonymous_parses`).
+        let cfg = yaml_with_destination(
+            "    destination:\n      type: s3\n      bucket: my-bucket\n      region: us-east-1\n\
+             \x20     endpoint: http://127.0.0.1:9000\n      allow_anonymous: true\n",
+        );
+        Config::from_yaml(&cfg)
+            .expect("a loopback emulator endpoint with allow_anonymous must stay accepted");
+    }
+
+    // ── V5: export `name` path traversal ────────────────────────────────────
+    //
+    // `ExportConfig.name` is a free-form `String` keyed into state tracking,
+    // file logs, and (via the destination layout) output paths — yet it is
+    // never validated. A name like `../../../etc/x`, an absolute `/abs/x`, a
+    // bare slash, or an embedded NUL can escape the intended output tree.
+    // Mirror the `query_file` `..`/absolute guard: reject at config-load.
+
+    #[test]
+    fn sec_export_name_traversal_rejected() {
+        // SEC-RED V5: a traversal / absolute / slash / NUL export name escapes
+        // the output tree (and corrupts name-keyed state). Must be rejected at
+        // config-load. Accepted today.
+        for bad in ["../../../etc/x", "/abs/x", "sub/dir", "with\u{0000}nul"] {
+            // `name:` is JSON-encoded so embedded slashes / NULs survive the
+            // YAML parse verbatim and reach validation.
+            let name_yaml = serde_json::to_string(bad).expect("encode name");
+            let cfg = format!(
+                "source:\n  type: postgres\n  url: \"postgresql://localhost/test\"\n\
+                 exports:\n  - name: {name_yaml}\n    query: \"SELECT 1\"\n    format: parquet\n\
+                 \x20   destination:\n      type: local\n      path: ./out\n"
+            );
+            let res = Config::from_yaml(&cfg);
+            assert!(
+                res.is_err(),
+                "export name {bad:?} (traversal/absolute/slash/NUL) must be rejected at \
+                 config-load; got Ok"
+            );
+            let msg = format!("{:#}", res.unwrap_err());
+            assert!(
+                msg.contains("name"),
+                "rejection of name {bad:?} must name the offending 'name' field; got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn sec_export_name_normal_still_accepted_guard() {
+        // SEC-RED V5 (guard): a plain, well-formed export name must keep
+        // loading after the fix. Pins that the traversal check is narrow.
+        let cfg = yaml_with_destination("    destination:\n      type: local\n      path: ./out\n");
+        Config::from_yaml(&cfg).expect("a normal export name ('t') must stay accepted");
+    }
+
+    // ── V15: local destination `path` traversal ─────────────────────────────
+    //
+    // `destination.path` for a `type: local` export is written verbatim to the
+    // filesystem. A relative `../../../../tmp/x` or absolute path lets a
+    // committed config write outside the intended output directory. Must be
+    // rejected (or at minimum loudly surfaced) at config-load. Accepted today.
+
+    #[test]
+    fn sec_local_dest_path_traversal_rejected() {
+        // SEC-RED V15: a traversal local-destination path writes outside the
+        // intended output tree. Must be rejected at config-load. Accepted today.
+        let cfg = yaml_with_destination(
+            "    destination:\n      type: local\n      path: ../../../../tmp/x\n",
+        );
+        let res = Config::from_yaml(&cfg);
+        assert!(
+            res.is_err(),
+            "a local destination path containing '..' (../../../../tmp/x) must be rejected \
+             at config-load (writes outside the output tree); got Ok"
+        );
+        let msg = format!("{:#}", res.unwrap_err());
+        assert!(
+            msg.contains("path") || msg.contains(".."),
+            "rejection must name the offending 'path' / traversal; got: {msg}"
+        );
+    }
+
+    // ── V13: dangerous TLS cert-knob combination ─────────────────────────────
+    //
+    // `tls: { mode: verify-full, accept_invalid_certs: true }` silently
+    // *downgrades* the strongest mode to "accept any cert" — `verify-full`
+    // promises chain + hostname verification, but the danger knob disables
+    // chain verification (see `src/source/tls.rs::build_native_tls`). The
+    // comment at `src/source/tls.rs:55-56` claims "Each one emits a warning at
+    // config-time (see `Config::validate`)" — but `Config::validate` emits no
+    // such warning today. The secure behavior is a LOUD error (or surfaced
+    // warning) at config-load. No `Err`/warning is produced today, so this is
+    // RED.
+
+    #[test]
+    fn sec_accept_invalid_certs_warns() {
+        // SEC-RED V13: verify-full + accept_invalid_certs: true is a silent
+        // security downgrade that contradicts the chosen mode. It must be
+        // loudly surfaced at config-load. The only stable secure seam is an
+        // `Err` from `Config::from_yaml` (validate returns Ok today, and there
+        // is no captured-warning seam exposed from here — see notes). Asserting
+        // `Err` is the strongest secure assertion and is RED against current
+        // code.
+        let cfg = yaml_with_destination("    destination:\n      type: local\n      path: ./out\n");
+        // Splice the TLS block into the source rather than the destination so
+        // the rest of the config stays valid.
+        let cfg = cfg.replace(
+            "  url: \"postgresql://localhost/test\"\n",
+            "  url: \"postgresql://localhost/test\"\n  tls:\n    mode: verify-full\n    accept_invalid_certs: true\n",
+        );
+        let res = Config::from_yaml(&cfg);
+        assert!(
+            res.is_err(),
+            "tls mode: verify-full with accept_invalid_certs: true is a silent security \
+             downgrade and must be loudly surfaced (error) at config-load; got Ok"
+        );
+        let msg = format!("{:#}", res.unwrap_err());
+        assert!(
+            msg.contains("accept_invalid_certs") || msg.to_lowercase().contains("verify"),
+            "the surfaced error must name the dangerous knob / mode contradiction; got: {msg}"
+        );
     }
 }

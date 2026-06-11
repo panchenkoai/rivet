@@ -41,6 +41,52 @@ use crate::manifest::{
 };
 use crate::pipeline::manifest_reconcile::{PartPresence, reconcile_manifest_against_listing};
 
+/// Upper bound on a destination control artifact (`manifest.json`) the read
+/// path will materialise into memory.  A `manifest.json` is metadata — a few
+/// KB to low single-digit MB even for very large datasets — so 64 MiB is far
+/// above any legitimate body while still bounding the blast radius.
+///
+/// Security (V21, CWE-400): the manifest readers `head()` an object then read
+/// its full body into a `Vec<u8>`.  An attacker who can write the destination
+/// prefix (a shared bucket prefix, a world-writable export dir) can plant a
+/// multi-GB `manifest.json`; an unbounded read would OOM the next `--resume`,
+/// `--validate`, or `rivet repair`.  [`read_capped`] consults the size the
+/// `head()` already reports and bails before the read when it exceeds this cap.
+pub(crate) const MANIFEST_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Read `key` into memory only if its `head()`-reported size is within
+/// `max_bytes`; otherwise bail without reading a single byte.
+///
+/// The single enforcement point for the V21 (CWE-400) manifest-read cap shared
+/// by the three control-artifact readers (`--resume` M8 preamble, `--validate`,
+/// `rivet repair`).  Each previously did `head()` then an uncapped `read()`,
+/// discarding the size `head()` already returned; routing through here closes
+/// that gap in one place.
+///
+/// Behaviour:
+/// - object absent (`head` → `None`): `Err` — callers invoke this only after
+///   establishing the object exists, so an absent object here is a hard error,
+///   not the benign "no manifest / legacy prefix" case (which the callers
+///   detect with their own `head()` first).
+/// - oversized (`size_bytes > max_bytes`): `Err` naming the cap, **before** any
+///   body is materialised.
+/// - otherwise: the full body via [`Destination::read`].
+pub(crate) fn read_capped(dest: &dyn Destination, key: &str, max_bytes: u64) -> Result<Vec<u8>> {
+    match dest.head(key)? {
+        None => anyhow::bail!("'{key}' not found at the destination"),
+        Some(meta) => {
+            if meta.size_bytes > max_bytes {
+                anyhow::bail!(
+                    "'{key}' is {} bytes, exceeding the {max_bytes}-byte control-artifact \
+                     read cap — refusing to load it into memory (possible tampering)",
+                    meta.size_bytes
+                );
+            }
+            dest.read(key)
+        }
+    }
+}
+
 /// Outcome of a single `--validate` pass over a destination prefix.
 ///
 /// Stable enough to be embedded in `summary.json` directly (see
@@ -354,7 +400,7 @@ pub fn verify_at_destination(
     // `manifest_dir`, a future destination breaks an internal invariant).
     let manifest_bytes = match dest.head(&manifest_key) {
         Ok(None) => return Ok(ManifestVerification::legacy()),
-        Ok(Some(_)) => match dest.read(&manifest_key) {
+        Ok(Some(_)) => match read_capped(dest, &manifest_key, MANIFEST_MAX_BYTES) {
             Ok(b) => b,
             Err(e) => {
                 let mut v = ManifestVerification::legacy();

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use crate::config::DestinationConfig;
 use crate::error::Result;
@@ -16,28 +16,88 @@ impl LocalDestination {
             .unwrap_or_else(|| ".".to_string());
         Ok(Self { base_path })
     }
+
+    /// Join an attacker-influenceable `key` under `base_path` without letting
+    /// it escape the destination root (CWE-22). Rejects — rather than clamps —
+    /// any key that is absolute, contains a `..` (parent-dir) component, or
+    /// embeds a NUL byte, so a hostile key fails loudly instead of silently
+    /// resolving to a host path outside the prefix. A component scan (vs.
+    /// canonicalize-then-contain) is used so containment holds even for keys
+    /// whose path does not yet exist on disk, which is the common write case.
+    fn safe_join(&self, key: &str) -> Result<PathBuf> {
+        if key.contains('\0') {
+            anyhow::bail!("destination key contains a NUL byte: {key:?}");
+        }
+        let rel = Path::new(key);
+        if rel.is_absolute() {
+            anyhow::bail!("destination key must be relative, got absolute path: {key:?}");
+        }
+        for component in rel.components() {
+            match component {
+                Component::Normal(_) | Component::CurDir => {}
+                // ParentDir escapes the root; Prefix/RootDir are absolute
+                // anchors (already rejected above on POSIX, caught here on
+                // Windows-shaped keys).
+                Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
+                    anyhow::bail!("destination key escapes the destination root: {key:?}");
+                }
+            }
+        }
+        Ok(Path::new(&self.base_path).join(rel))
+    }
+}
+
+/// Copy `src` into the deterministic staging path `tmp`, creating it with
+/// `O_EXCL` so a pre-planted file or symlink at the temp name causes `EEXIST`
+/// rather than a silent follow that writes through the link (CWE-367 / symlink
+/// race). A stale temp left by a crashed prior run is the only legitimate
+/// pre-existing case: it is removed (the unlink targets the link itself, never
+/// its target) and creation retried exactly once. If the retry still hits
+/// `EEXIST`, an adversary re-planted between unlink and create — fail loudly
+/// instead of following.
+fn stage_copy(src: &Path, tmp: &Path) -> Result<()> {
+    use std::io::ErrorKind;
+
+    fn create_excl(tmp: &Path) -> std::io::Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(tmp)
+    }
+
+    let mut out = match create_excl(tmp) {
+        Ok(f) => f,
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            std::fs::remove_file(tmp)?;
+            create_excl(tmp)?
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let mut input = std::fs::File::open(src)?;
+    std::io::copy(&mut input, &mut out)?;
+    Ok(())
 }
 
 impl super::Destination for LocalDestination {
     fn write(&self, local_path: &Path, remote_key: &str) -> Result<super::WriteOutcome> {
-        let target = Path::new(&self.base_path).join(remote_key);
+        let target = self.safe_join(remote_key)?;
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
         // Stage into a dot-prefixed sibling in the target directory (same
         // filesystem, so the rename is atomic POSIX): a crash mid-copy can
         // never leave a truncated file at the final key.  The temp name is
-        // deterministic so a stale temp from a crashed run is simply
-        // overwritten by the next attempt.
+        // deterministic; a stale temp from a crashed run is unlinked and
+        // recreated (never followed) by `stage_copy`.
         let file_name = target
             .file_name()
             .ok_or_else(|| anyhow::anyhow!("destination key has no file name: {remote_key}"))?
             .to_string_lossy()
             .into_owned();
         let tmp = target.with_file_name(format!(".{file_name}.tmp"));
-        if let Err(e) = std::fs::copy(local_path, &tmp) {
+        if let Err(e) = stage_copy(local_path, &tmp) {
             let _ = std::fs::remove_file(&tmp);
-            return Err(e.into());
+            return Err(e);
         }
         if let Err(e) = std::fs::rename(&tmp, &target) {
             let _ = std::fs::remove_file(&tmp);
@@ -65,7 +125,7 @@ impl super::Destination for LocalDestination {
     // POSIX walk.
 
     fn list_prefix(&self, prefix: &str) -> Result<Vec<super::ObjectMeta>> {
-        let root = Path::new(&self.base_path).join(prefix);
+        let root = self.safe_join(prefix)?;
         if !root.exists() {
             return Ok(Vec::new());
         }
@@ -116,12 +176,12 @@ impl super::Destination for LocalDestination {
     }
 
     fn read(&self, key: &str) -> Result<Vec<u8>> {
-        let path = Path::new(&self.base_path).join(key);
+        let path = self.safe_join(key)?;
         Ok(std::fs::read(path)?)
     }
 
     fn head(&self, key: &str) -> Result<Option<super::ObjectMeta>> {
-        let path = Path::new(&self.base_path).join(key);
+        let path = self.safe_join(key)?;
         match std::fs::metadata(&path) {
             Ok(m) if m.is_file() => Ok(Some(super::ObjectMeta {
                 key: key.to_string(),
@@ -140,8 +200,8 @@ impl super::Destination for LocalDestination {
         // POSIX `rename` is atomic on the same filesystem; fall back to
         // copy + delete when the rename crosses devices (rare on a
         // single destination prefix but cheap to handle).
-        let src = Path::new(&self.base_path).join(from);
-        let dst = Path::new(&self.base_path).join(to);
+        let src = self.safe_join(from)?;
+        let dst = self.safe_join(to)?;
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -567,5 +627,151 @@ mod tests {
         assert!(!dir.path().join("a").exists());
         let body = std::fs::read(dir.path().join("_quarantine/r/a")).unwrap();
         assert_eq!(body, b"new", "rename overwrites target");
+    }
+
+    // ── Path-traversal containment (security) ─────────────────────────────
+
+    /// SEC-RED V14: `remote_key` is joined onto `base_path` via `Path::join`
+    /// with no traversal containment, so a key containing `../` (or an
+    /// absolute path) escapes the destination directory and lets an
+    /// attacker-influenced key write/move/read arbitrary files on the host.
+    ///
+    /// SECURE behaviour: every escaping key must be REFUSED with an Err and
+    /// must NOT touch any path outside `base_path`. This is RED today — the
+    /// current code happily writes to the escaped path and returns Ok.
+    #[test]
+    fn sec_local_write_rejects_traversal_key() {
+        // Lay out a tempdir with a contained base directory so any escape
+        // lands inside the tempdir (provably outside `base`, yet cleaned up
+        // by the tempdir on drop):
+        //
+        //   <tempdir>/                <- escape targets land here
+        //   └── base/                 <- the destination root
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir_all(&base).unwrap();
+        let dest = dest_at(&base);
+
+        // ── 1. Relative `../` traversal via write ────────────────────────
+        // `base.join("../escape.parquet")` resolves to <tempdir>/escape.parquet,
+        // i.e. a sibling of `base` — outside the destination root.
+        let escaped_rel = dir.path().join("escape.parquet");
+        let src = source_file_with(b"pwned-relative");
+        let result = dest.write(src.path(), "../escape.parquet");
+        assert!(
+            result.is_err(),
+            "write must REFUSE a `../` traversal key (V14), got Ok"
+        );
+        assert!(
+            !escaped_rel.exists(),
+            "write must NOT create a file outside base_path: {}",
+            escaped_rel.display()
+        );
+
+        // ── 2. Absolute-path key via write ───────────────────────────────
+        // Rust's `Path::join` discards the base entirely when the argument is
+        // absolute, so an absolute key writes wherever it points. Aim it at a
+        // file inside the tempdir but outside `base`.
+        let escaped_abs = dir.path().join("abs-escape.parquet");
+        let abs_key = escaped_abs.to_string_lossy().into_owned();
+        let src_abs = source_file_with(b"pwned-absolute");
+        let result_abs = dest.write(src_abs.path(), &abs_key);
+        assert!(
+            result_abs.is_err(),
+            "write must REFUSE an absolute key that escapes base_path (V14), got Ok"
+        );
+        assert!(
+            !escaped_abs.exists(),
+            "write must NOT create a file at an absolute escaped path: {}",
+            escaped_abs.display()
+        );
+
+        // ── 3. `read` must not read outside base via traversal ───────────
+        // Plant a secret outside `base` and prove a `../` key cannot read it.
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, b"top-secret").unwrap();
+        let read_res = dest.read("../secret.txt");
+        assert!(
+            read_res.is_err(),
+            "read must REFUSE a `../` traversal key (V14); leaking host files"
+        );
+
+        // ── 4. `r#move` must not relocate a file outside base ────────────
+        // Seed a real source inside base, then try to move it out via `../`.
+        std::fs::write(base.join("inside.parquet"), b"payload").unwrap();
+        let move_escaped = dir.path().join("moved-out.parquet");
+        let move_res = dest.r#move("inside.parquet", "../moved-out.parquet");
+        assert!(
+            move_res.is_err(),
+            "r#move must REFUSE a `../` traversal destination key (V14), got Ok"
+        );
+        assert!(
+            !move_escaped.exists(),
+            "r#move must NOT relocate a file outside base_path: {}",
+            move_escaped.display()
+        );
+    }
+
+    /// V14: a `..` buried mid-path (not just a leading one) and a NUL byte are
+    /// equally refused — the containment is a component scan, not a prefix
+    /// check, so `a/../../escape` and embedded NUL cannot slip through.
+    #[test]
+    fn sec_local_rejects_buried_traversal_and_nul_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir_all(&base).unwrap();
+        let dest = dest_at(&base);
+        let src = source_file_with(b"x");
+
+        assert!(
+            dest.write(src.path(), "ok/../../escape.parquet").is_err(),
+            "a `..` component anywhere in the key must be refused"
+        );
+        assert!(
+            dest.write(src.path(), "bad\0name.parquet").is_err(),
+            "a NUL byte in the key must be refused"
+        );
+        // A legal name that merely *contains* `..` as text (not a component)
+        // must still be allowed — the scan keys on path components, not bytes.
+        dest.write(src.path(), "ver..1/data.parquet").unwrap();
+        assert!(base.join("ver..1/data.parquet").exists());
+    }
+
+    /// V16 (CWE-367): the deterministic staging temp is created with `O_EXCL`.
+    /// A symlink pre-planted at the temp name (a classic TOCTOU attack to
+    /// redirect the staged bytes at a victim file) must NOT be followed — the
+    /// link target is left untouched and the real key still receives the
+    /// payload.
+    #[cfg(unix)]
+    #[test]
+    fn sec_write_does_not_follow_symlink_at_staging_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dest_at(dir.path());
+
+        // Victim outside the staged write that the symlink points at.
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"original").unwrap();
+
+        // Plant a symlink at the deterministic temp name for key "data.csv".
+        let tmp = dir.path().join(".data.csv.tmp");
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+
+        let src = source_file_with(b"clean payload\n");
+        dest.write(src.path(), "data.csv").unwrap();
+
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"original",
+            "staged write must not follow the planted symlink into the victim"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("data.csv")).unwrap(),
+            b"clean payload\n",
+            "the real key still gets the payload via a fresh regular temp"
+        );
+        assert!(
+            !tmp.exists(),
+            "the staging temp is renamed away, leaving no symlink behind"
+        );
     }
 }

@@ -133,9 +133,13 @@ fn diagnose_mysql(
             (None, None)
         }
     } else if let Some(col) = range_col {
+        // Quote the config-author-controlled column so a hostile value collapses
+        // to a single (nonexistent) identifier instead of injecting SQL into the
+        // min()/max() aggregates (CWE-89) — same defense the MSSQL sibling applies.
+        let expr = crate::sql::quote_ident(SourceType::Mysql, col);
         let range_query = format!(
-            "SELECT CAST(min({col}) AS CHAR), CAST(max({col}) AS CHAR) FROM ({base}) AS _rivet",
-            col = col,
+            "SELECT CAST(min({expr}) AS CHAR), CAST(max({expr}) AS CHAR) FROM ({base}) AS _rivet",
+            expr = expr,
             base = base_query,
         );
         match conn.query_first::<(Option<String>, Option<String>), _>(&range_query) {

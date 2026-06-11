@@ -374,13 +374,15 @@ pub enum SourceType {
 fn find_userinfo(raw: &str) -> Option<(usize, usize)> {
     let scheme = raw.find("://")? + 3;
     let rest = &raw[scheme..];
-    let at = rest.find('@')?;
-    // `@` must appear before the path/query start so we don't match `?foo=a@b` etc.
-    if let Some(path) = rest.find('/')
-        && path < at
-    {
-        return None;
-    }
+    // The authority ends at the first path/query/fragment delimiter; an `@`
+    // after that belongs to the path or query (`?foo=a@b`), not the userinfo.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    // Terminate userinfo at the LAST `@` within the authority: a password may
+    // itself contain `@` (`user:p@ssw0rd@host`), and splitting at the FIRST
+    // `@` would leak the tail after it into the persisted plan artifact.
+    // `rfind` mirrors `redact_pg_url` in state/mod.rs, which strips passwords
+    // the same way for the same reason.
+    let at = rest[..authority_end].rfind('@')?;
     Some((scheme + at, scheme))
 }
 
@@ -564,5 +566,38 @@ mod tests {
     #[test]
     fn find_userinfo_no_at_sign_returns_none() {
         assert!(find_userinfo("postgresql://db.example.com:5432/app").is_none());
+    }
+
+    // ── SEC-RED: embedded `@` in password must not leak to plan artifact ──────
+
+    #[test]
+    fn sec_artifact_redaction_password_with_at() {
+        // SEC-RED V7: find_userinfo (used by redact_for_artifact when building
+        // the persisted plan JSON) splits userinfo at the FIRST `@` via
+        // `rest.find('@')`, leaking the password tail after an embedded `@`.
+        // For `postgresql://rivet:p@ssw0rd@host/db` the first `@` sits right
+        // after `p`, so `userinfo_end` lands before `ssw0rd@host/db` and the
+        // rewrite emits `postgresql://REDACTED@ssw0rd@host/db` — the password
+        // tail `ssw0rd` round-trips into the artifact. The terminator must be
+        // the LAST `@` before the path (rfind semantics, as already used by
+        // redact_pg_url in state/mod.rs:564).
+        let mut src = make_source(SourceType::Postgres);
+        src.url = Some("postgresql://rivet:p@ssw0rd@db.example.com:5432/orders".into());
+        let (redacted, flag) = src.redact_for_artifact();
+        assert!(flag, "URL with userinfo must be flagged as redacted");
+        let url = redacted.url.expect("url retained after redaction");
+        assert!(
+            !url.contains("ssw0rd"),
+            "password tail after embedded @ must not leak into artifact: {url}"
+        );
+        assert!(
+            !url.contains("p@ssw0rd"),
+            "full password must not leak into artifact: {url}"
+        );
+        assert!(url.contains("REDACTED"), "placeholder must appear: {url}");
+        assert!(
+            url.contains("@db.example.com:5432/orders"),
+            "host and path must be retained: {url}"
+        );
     }
 }

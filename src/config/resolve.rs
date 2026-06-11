@@ -10,6 +10,13 @@
 /// unset variables fail.
 ///
 /// Empty placeholders (`${}`) are left as-is for backwards compatibility.
+///
+/// **Value hardening (V6, CWE-89/94, narrowed):** a substituted value is spliced
+/// into the raw config/query text *before* YAML/SQL parse, so a NUL byte (never
+/// legitimate, enables C-string truncation) is rejected. Substitution is
+/// otherwise a documented verbatim splice — newlines/quotes/braces pass through
+/// (escaping is the caller's responsibility); the structural fix for raw-text
+/// param injection (substitute into parsed values) is tracked separately.
 pub fn resolve_vars(
     input: &str,
     params: Option<&std::collections::HashMap<String, String>>,
@@ -40,6 +47,24 @@ pub fn resolve_vars(
                 ),
             }
         };
+
+        // V6 (CWE-89/94, narrowed): the value is spliced into the RAW
+        // config/query text before YAML/SQL parse with no escaping. A NUL byte
+        // is never legitimate in a config/SQL value and enables C-string
+        // truncation tricks, so reject it. Newlines/quotes/braces are NOT
+        // rejected: substitution is a documented verbatim text splice (escaping
+        // is the caller's responsibility — see the `passes_through` test), and
+        // legitimate multi-line `-p` values rely on that. The structural fix for
+        // raw-text param injection is to substitute into parsed values, not raw
+        // text — tracked separately; this guard is the no-cost NUL backstop. The
+        // error names the placeholder but never echoes the value (it may itself
+        // be a secret).
+        if value.contains('\0') {
+            anyhow::bail!(
+                "value for '${{{var_name}}}' contains a NUL byte; refusing to substitute it \
+                 (check the parameter/environment source)"
+            );
+        }
 
         result = format!("{}{}{}", &result[..start], value, &result[end + 1..]);
         search_from = start + value.len();
@@ -171,6 +196,61 @@ mod tests {
         p.insert("B".into(), "world".into());
         let result = resolve_vars("${A} ${B}", Some(&p)).unwrap();
         assert_eq!(result, "hello world");
+    }
+
+    // ── resolve_vars — V6 param-value injection hardening (NUL-only) ─────────
+    //
+    // A param/env value is spliced into the RAW config/query text before
+    // YAML/SQL parse with no escaping. A NUL byte is never legitimate and
+    // enables C-string truncation, so it is rejected. Newlines/quotes/braces
+    // are NOT rejected — substitution is a documented verbatim splice (see
+    // `resolve_vars_value_with_quotes_newlines_braces_passes_through`) and
+    // legitimate multi-line `-p` values rely on it; the structural fix for
+    // raw-text param injection (substitute into parsed values) is tracked
+    // separately.
+
+    #[test]
+    fn sec_param_value_with_nul_rejected() {
+        let mut p = HashMap::new();
+        p.insert("x".into(), "1\0injected".into());
+        let err = resolve_vars("${x}", Some(&p)).expect_err("a NUL value must be rejected");
+        // Names the placeholder, never echoes the (possibly-secret) value.
+        assert!(err.to_string().contains("x"), "must name the param: {err}");
+        assert!(
+            !err.to_string().contains("injected"),
+            "must not echo the value: {err}"
+        );
+    }
+
+    // (No env-var NUL test: the OS forbids a NUL byte in an environment
+    // variable — `set_var` would reject it — so that channel cannot carry the
+    // payload. The HashMap `-p` param path above is the reachable vector.)
+
+    #[test]
+    fn sec_param_value_newline_passes_through_guard() {
+        // Documented verbatim contract: a multi-line value substitutes as-is.
+        // (Mirrors resolve_vars_value_with_quotes_newlines_braces_passes_through;
+        // the V6 guard rejects only NUL, not structural-looking characters.)
+        let mut p = HashMap::new();
+        p.insert("frag".into(), "a\nb".into());
+        let result = resolve_vars("X=${frag}", Some(&p)).unwrap();
+        assert_eq!(result, "X=a\nb");
+    }
+
+    #[test]
+    fn sec_normal_param_value_substitutes_fine_guard() {
+        let mut p = HashMap::new();
+        p.insert("id_min".into(), "100".into());
+        let result = resolve_vars("WHERE id >= ${id_min}", Some(&p)).unwrap();
+        assert_eq!(result, "WHERE id >= 100");
+    }
+
+    #[test]
+    fn sec_normal_param_value_with_spaces_and_quotes_substitutes_fine_guard() {
+        let mut p = HashMap::new();
+        p.insert("filter".into(), "name = 'o''brien'".into());
+        let result = resolve_vars("WHERE ${filter}", Some(&p)).unwrap();
+        assert_eq!(result, "WHERE name = 'o''brien'");
     }
 
     // ── resolve_vars — env var substitution ─────────────────────────────────

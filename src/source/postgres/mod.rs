@@ -88,6 +88,8 @@ impl PostgresSource {
     /// Connect honoring the user's [`TlsConfig`]. When `tls.mode` is
     /// [`TlsMode::Disable`] this falls back to [`Self::connect`].
     pub fn connect_with_tls(url: &str, tls: Option<&TlsConfig>) -> Result<Self> {
+        // Refuse remote plaintext (no `tls:` block) before any dial (CWE-319).
+        crate::source::require_tls_or_loopback(url, tls)?;
         match tls {
             Some(cfg) if cfg.mode.is_enforced() => {
                 let connector = build_native_tls(cfg)?;
@@ -353,6 +355,8 @@ pub(crate) fn introspect_pg_table_for_chunking(
 /// back to the insecure `NoTls` transport — a warning is logged from
 /// `create_source` so operators know TLS is off.
 pub(crate) fn connect_client(url: &str, tls: Option<&TlsConfig>) -> Result<Client> {
+    // Refuse remote plaintext (no `tls:` block) before any dial (CWE-319).
+    crate::source::require_tls_or_loopback(url, tls)?;
     match tls {
         Some(cfg) if cfg.mode.is_enforced() => {
             let connector = build_native_tls(cfg)?;

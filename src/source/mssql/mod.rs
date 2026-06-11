@@ -31,7 +31,7 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 use proxy::{detect_mssql_proxy_kind, warn_proxy_kind};
 
-use crate::config::TlsConfig;
+use crate::config::{TlsConfig, TlsMode};
 use crate::error::Result;
 use crate::source::batch_controller::{
     AdaptiveBatchController, DEFAULT_BATCH_TARGET_MB, PROBE_BATCH_SIZE,
@@ -138,6 +138,12 @@ impl MssqlSource {
     /// resolved `sqlserver://user:pass@host:port/db` form. A successful return
     /// has completed a TLS login handshake and a `SELECT 1` round-trip.
     pub fn connect_with_tls(url: &str, tls: Option<&TlsConfig>) -> Result<Self> {
+        // Refuse trust-any-cert to a remote host with no `tls:` block before any
+        // dial (CWE-295): SQL Server always encrypts the login handshake, but
+        // with `trust_cert` that handshake is unauthenticated, so a MITM is not
+        // detected. Loopback keeps trust-cert (dev); a remote host must opt in
+        // explicitly via `tls: { mode: ... }`.
+        crate::source::require_tls_or_loopback(url, tls)?;
         let parts = parse_mssql_url(url)?;
         let mut config = Config::new();
         config.host(&parts.host);
@@ -151,19 +157,28 @@ impl MssqlSource {
         // `trust_cert` (accept-invalid). Default keeps full verification.
         config.encryption(EncryptionLevel::Required);
         match tls {
-            Some(cfg) if cfg.accept_invalid_certs => config.trust_cert(),
+            // `mode: disable` is the operator's explicit opt-in to an
+            // unauthenticated (trust-any-cert) connection — the SQL Server
+            // analogue of PG/MySQL remote plaintext. It is the documented way
+            // to keep trust-cert against a remote host the gate above would
+            // otherwise have refused.
+            Some(cfg) if cfg.mode == TlsMode::Disable || cfg.accept_invalid_certs => {
+                config.trust_cert()
+            }
             Some(cfg) => {
                 if let Some(ca) = cfg.ca_file.as_deref() {
                     config.trust_cert_ca(ca);
                 }
             }
             None => {
-                // No `tls:` block at all ⇒ tiberius trusts the server certificate
-                // without verifying issuer or hostname: the handshake is encrypted
-                // but unauthenticated, so a MITM on the network path is not
-                // detected. Warn once, naming the config key that turns on strict
-                // validation; the effective default stays trust-cert so dev /
-                // self-signed setups keep working without opt-in.
+                // Reached only for a LOOPBACK host (the gate above refuses a
+                // remote host with no `tls:` block). On loopback, tiberius
+                // trusts the server certificate without verifying issuer or
+                // hostname: the handshake is encrypted but unauthenticated. That
+                // is safe here because the bytes never leave the box, and it
+                // keeps dev / self-signed docker setups working without opt-in.
+                // Warn once, naming the config key that turns on strict
+                // validation.
                 static WARNED: std::sync::Once = std::sync::Once::new();
                 WARNED.call_once(|| {
                     log::warn!(

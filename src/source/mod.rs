@@ -9,7 +9,7 @@ pub(crate) mod tls;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
-use crate::config::SourceConfig;
+use crate::config::{SourceConfig, TlsConfig};
 use crate::error::Result;
 use crate::plan::IncrementalCursorPlan;
 use crate::tuning::SourceTuning;
@@ -296,5 +296,150 @@ pub(crate) fn warn_if_tls_disabled(config: &SourceConfig) {
                  Add `source.tls.mode: verify-full` (with `ca_file:` if your CA is private) to enable transport security."
             );
         });
+    }
+}
+
+/// Whether the host in a `scheme://[user[:pass]@]host[:port][/db][?…]`
+/// connection URL is a loopback address (`127.0.0.0/8`, `::1`) or the literal
+/// `localhost`.
+///
+/// Used by [`require_tls_or_loopback`] to decide TLS posture from the host:
+/// loopback is the docker / local-dev case where the bytes never leave the box,
+/// so plaintext is fine; a remote host without TLS leaks credentials and rows.
+///
+/// Fails **closed**: any URL we cannot confidently parse a loopback host out of
+/// is treated as non-loopback, so a parse gap can only ever *tighten* the gate
+/// (refuse a connection), never silently allow plaintext to an unverified host.
+pub(crate) fn host_is_loopback(url: &str) -> bool {
+    // Strip the scheme (`postgresql://`, `mysql://`, `sqlserver://`, …).
+    let after_scheme = match url.split_once("://") {
+        Some((_, rest)) => rest,
+        None => url,
+    };
+    // Authority ends at the first `/`, `?` or `#`.
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    // Drop `user[:pass]@` — rsplit the last `@` so an `@` inside a password is
+    // tolerated (it belongs to the userinfo, not the host).
+    let host_port = match authority.rsplit_once('@') {
+        Some((_, hp)) => hp,
+        None => authority,
+    };
+    // Host vs port. IPv6 literals are bracketed (`[::1]:5432`); for those the
+    // host is the bracketed span, and any `:` inside is part of the address.
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((h, _)) => h,
+            None => return false, // unterminated bracket — fail closed
+        }
+    } else {
+        // Bare host or IPv4: the host ends at the (single) port `:`.
+        host_port.split(':').next().unwrap_or(host_port)
+    };
+
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // `IpAddr::is_loopback` covers the whole 127.0.0.0/8 block and `::1`.
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Gate plaintext / trust-any-cert connections by host (CWE-319 / CWE-295).
+///
+/// When no `tls:` block is configured (`tls == None`) **and** the resolved host
+/// is not loopback, refuse the connection *before any network I/O* with a
+/// TLS-required policy error. This stops the per-engine connect helpers from
+/// silently dialing a remote database in cleartext (Postgres/MySQL `NoTls`) or
+/// trusting any server certificate (MSSQL `trust_cert`).
+///
+/// Loopback hosts (docker / local dev) keep today's behaviour — plaintext is
+/// allowed there because the bytes never leave the box. An explicit
+/// `tls: { mode: disable }` is `Some(..)`, so it is the operator's opt-in to
+/// remote plaintext and is **not** refused here.
+pub(crate) fn require_tls_or_loopback(url: &str, tls: Option<&TlsConfig>) -> Result<()> {
+    if tls.is_none() && !host_is_loopback(url) {
+        // The message must name TLS *and* that it is a policy refusal for a
+        // remote host. Emit it at `error` level (→ stderr) as well as returning
+        // it: callers like `doctor` print the `Err` to stdout in their own
+        // `[FAIL]` style and only re-raise a generic summary, so the log line is
+        // what guarantees the TLS-required reason reaches stderr. Deliberately
+        // avoids socket-error vocabulary ("could not connect", "timeout", "os
+        // error") so it is never mistaken for a connect-time failure.
+        let msg = "source: TLS required — refusing to connect to a remote (non-loopback) \
+             host without TLS; credentials and every exported row would cross the network \
+             in cleartext. Add `source.tls: { mode: verify-full }` (with `ca_file:` for a \
+             private CA) to enable transport security, or explicitly opt into remote \
+             plaintext with `source.tls: { mode: disable }` if this network path is \
+             already trusted.";
+        log::error!("{msg}");
+        anyhow::bail!("{msg}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tls_gate_tests {
+    use super::{host_is_loopback, require_tls_or_loopback};
+    use crate::config::{TlsConfig, TlsMode};
+
+    #[test]
+    fn loopback_variants_are_loopback() {
+        assert!(host_is_loopback(
+            "postgresql://rivet:rivet@127.0.0.1:5432/rivet"
+        ));
+        assert!(host_is_loopback(
+            "postgresql://rivet:rivet@localhost:5432/rivet"
+        ));
+        assert!(host_is_loopback("mysql://root@127.0.0.1:3306/db"));
+        // Whole 127.0.0.0/8 block is loopback.
+        assert!(host_is_loopback("postgresql://u:p@127.255.0.9/db"));
+        // IPv6 loopback, bracketed with and without a port.
+        assert!(host_is_loopback("postgresql://u:p@[::1]:5432/db"));
+        assert!(host_is_loopback("sqlserver://sa:pw@[::1]/master"));
+        // Case-insensitive host, no port, no db.
+        assert!(host_is_loopback("mysql://root@LOCALHOST"));
+        // An `@` inside the password must not be mistaken for the host boundary.
+        assert!(host_is_loopback("postgresql://u:p@ss@127.0.0.1:5432/db"));
+    }
+
+    #[test]
+    fn remote_hosts_are_not_loopback() {
+        assert!(!host_is_loopback(
+            "postgresql://rivet:rivet@10.255.255.1:5432/rivet"
+        ));
+        assert!(!host_is_loopback(
+            "postgresql://u:p@db.example.com:5432/app"
+        ));
+        assert!(!host_is_loopback("mysql://root@192.168.1.10:3306/db"));
+        assert!(!host_is_loopback("sqlserver://sa:pw@10.0.0.5:1433/master"));
+        // Not loopback: an unbracketed IPv6-looking address won't parse here, so
+        // it fails closed (treated as remote).
+        assert!(!host_is_loopback("postgresql://u:p@::1:5432/db"));
+    }
+
+    #[test]
+    fn gate_refuses_remote_plaintext_only() {
+        let remote = "postgresql://rivet:rivet@10.255.255.1:5432/rivet";
+        let loopback = "postgresql://rivet:rivet@127.0.0.1:5432/rivet";
+        let disable = TlsConfig {
+            mode: TlsMode::Disable,
+            ..Default::default()
+        };
+        let verify = TlsConfig {
+            mode: TlsMode::VerifyFull,
+            ..Default::default()
+        };
+
+        // Remote + no tls block → refused.
+        assert!(require_tls_or_loopback(remote, None).is_err());
+        // Loopback + no tls block → allowed (docker / dev path).
+        assert!(require_tls_or_loopback(loopback, None).is_ok());
+        // Explicit `mode: disable` is the remote-plaintext opt-in → allowed.
+        assert!(require_tls_or_loopback(remote, Some(&disable)).is_ok());
+        // Enforced TLS to a remote host → allowed (the connect path uses TLS).
+        assert!(require_tls_or_loopback(remote, Some(&verify)).is_ok());
     }
 }

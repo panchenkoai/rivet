@@ -321,7 +321,11 @@ fn record_repair_parts_in_manifest(
     // and bucket-prefix destinations repair supports); parts are recorded with
     // prefix-relative paths, which is exactly what `record_part` stored.
     let raw = match dest.head(MANIFEST_FILENAME)? {
-        Some(_) => dest.read(MANIFEST_FILENAME)?,
+        Some(_) => crate::pipeline::validate_manifest::read_capped(
+            &*dest,
+            MANIFEST_FILENAME,
+            crate::pipeline::validate_manifest::MANIFEST_MAX_BYTES,
+        )?,
         None => anyhow::bail!(
             "no manifest.json at the destination prefix — cannot record repair parts \
              (was the original export finalized?)"

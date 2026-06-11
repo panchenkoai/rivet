@@ -358,7 +358,13 @@ impl RunSummary {
         };
 
         use std::io::Write;
-        let mut buf = block;
+        // V9 (CWE-150): the block embeds error_message, which can carry
+        // attacker-controlled ANSI/OSC escapes from a malicious source DB. The
+        // single-export path reaches the operator terminal here (the parallel
+        // renderer sanitises separately). Funnel the whole block through the
+        // shared sanitiser before write — it preserves the renderer's own
+        // multi-byte glyphs (✓/✗/──) and strips only C0/C1/DEL control bytes.
+        let mut buf = super::parent_ui::sanitize_terminal(&block);
         buf.push('\n');
         let stderr = std::io::stderr();
         let mut handle = stderr.lock();

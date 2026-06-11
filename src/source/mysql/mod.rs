@@ -113,6 +113,8 @@ impl MysqlSource {
 
     /// Connect honoring the user's [`TlsConfig`].
     pub fn connect_with_tls(url: &str, tls: Option<&TlsConfig>) -> Result<Self> {
+        // Refuse remote plaintext (no `tls:` block) before any dial (CWE-319).
+        crate::source::require_tls_or_loopback(url, tls)?;
         match tls {
             Some(cfg) if cfg.mode.is_enforced() => {
                 let base = Opts::from_url(url)?;
@@ -146,6 +148,8 @@ impl MysqlSource {
 /// Shared by preflight, doctor, init, and anywhere else we need a pool outside
 /// the `Source` trait. `tls = None` falls back to plaintext (legacy behavior).
 pub(crate) fn connect_pool(url: &str, tls: Option<&TlsConfig>) -> Result<Pool> {
+    // Refuse remote plaintext (no `tls:` block) before any dial (CWE-319).
+    crate::source::require_tls_or_loopback(url, tls)?;
     match tls {
         Some(cfg) if cfg.mode.is_enforced() => {
             let base = Opts::from_url(url)?;

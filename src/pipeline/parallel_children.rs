@@ -11,7 +11,7 @@ use crate::error::Result;
 use crate::state::StateStore;
 
 use super::ipc::{ChildEvent, ENV_IPC_EVENTS};
-use super::parent_ui::{ChildWaitStatus, UiMessage};
+use super::parent_ui::{ChildWaitStatus, UiMessage, sanitize_terminal};
 
 /// Re-invoke this binary once per export. Children do not inherit parallel flags, so there is no recursion.
 ///
@@ -187,6 +187,11 @@ pub(super) fn run_exports_as_child_processes(
                                     Ok(l) => l,
                                     Err(_) => break,
                                 };
+                                // Captured child stderr is later re-emitted to
+                                // the operator's terminal verbatim, so strip any
+                                // terminal-control bytes a malicious source DB
+                                // echoed into the child's error output (CWE-150).
+                                let line = sanitize_terminal(&line);
                                 let mut guard = match buf.lock() {
                                     Ok(g) => g,
                                     Err(p) => p.into_inner(),
@@ -431,5 +436,39 @@ mod tests {
         buffers.insert("events".to_string(), vec![]);
         let out = render_child_stderr(&exports, &buffers, &HashMap::new());
         assert!(out.is_empty(), "empty lines vec → no output: {out:?}");
+    }
+
+    /// SEC V9 (CWE-150): a child stderr line carrying ANSI/OSC escape bytes is
+    /// sanitised by the capture thread (`sanitize_terminal`) before it lands in
+    /// the buffer, so the rendered block re-emitted to the operator's terminal
+    /// holds no raw terminal-control bytes. This mirrors the reader-thread
+    /// transform without spawning a real child.
+    #[test]
+    fn captured_child_stderr_escapes_stripped_before_render() {
+        // Scan decoded chars, not raw bytes: a byte scan would false-flag the
+        // UTF-8 continuation bytes (0x80..=0xBF) of the renderer's box-drawing
+        // glyph `──` (U+2500). Mirrors sanitize_terminal's char-based contract.
+        let dangerous = |s: &str| -> Vec<char> {
+            s.chars()
+                .filter(|&c| {
+                    let cp = c as u32;
+                    (cp <= 0x1f && c != '\t' && c != '\n')
+                        || cp == 0x7f
+                        || (0x80..=0x9f).contains(&cp)
+                })
+                .collect()
+        };
+        let exp = make_export("orders");
+        let exports = vec![&exp];
+        let raw = "ERROR \u{1b}]0;pwned\u{07}\u{1b}[2Jboom";
+        let mut buffers = HashMap::new();
+        // Capture thread applies `sanitize_terminal` to each line before push.
+        buffers.insert("orders".to_string(), vec![sanitize_terminal(raw)]);
+        let out = render_child_stderr(&exports, &buffers, &HashMap::new());
+        assert!(
+            dangerous(&out).is_empty(),
+            "child stderr render leaked control bytes: {out:?}"
+        );
+        assert!(out.contains("pwned") && out.contains("boom"));
     }
 }

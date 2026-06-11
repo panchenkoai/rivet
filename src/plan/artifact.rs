@@ -46,16 +46,25 @@ pub struct PlanArtifact {
     pub strategy: String,
     /// Deterministic fingerprint of the chunked plan inputs (empty for non-chunked).
     pub plan_fingerprint: String,
-    /// Tamper-evidence seal over [`Self::resolved_plan`] (ADR-0005 PA10, finding
-    /// #16).  Computed at `rivet plan` time over the canonical JSON of the
-    /// *redacted* resolved plan and re-verified by `rivet apply` before any
-    /// query runs — editing `base_query` (or any other execution-affecting
-    /// field) after planning makes apply reject the artifact rather than export
-    /// the wrong thing under the planned export name.
+    /// Accidental-corruption checksum over [`Self::resolved_plan`] (ADR-0005
+    /// PA10, finding #16).  Computed at `rivet plan` time over the canonical
+    /// JSON of the *redacted* resolved plan and re-checked by `rivet apply`
+    /// before any query runs — a `base_query` (or any other execution-affecting
+    /// field) that changed since planning makes apply reject the artifact rather
+    /// than export the wrong thing under the planned export name.
     ///
-    /// Format mirrors the crate's other content seals: `"xxh3:<16 hex>"`.
+    /// **This is NOT tamper protection.** The checksum is an *unkeyed* `xxh3`
+    /// digest stored in the same JSON it covers, so anyone who edits the plan
+    /// can recompute a matching value — there is no secret/MAC. It catches
+    /// *accidental* edits (a hand-tweaked field, a botched merge, on-disk bit
+    /// rot), not a *malicious* writer. A real tamper seal would need a keyed MAC
+    /// plus a key store, which is out of scope; `apply` trusts the artifact the
+    /// same way it trusts an untrusted config handed to it. See
+    /// [`Self::verify_integrity`].
+    ///
+    /// Format mirrors the crate's other content checksums: `"xxh3:<16 hex>"`.
     /// `#[serde(default)]` keeps pre-PA10 artifacts (empty string) readable;
-    /// [`Self::verify_integrity`] treats an unsealed artifact as legacy and
+    /// [`Self::verify_integrity`] treats an unchecksummed artifact as legacy and
     /// warns rather than failing closed (back-compat, never a silent pass).
     #[serde(default)]
     pub integrity: String,
@@ -149,12 +158,14 @@ impl PlanArtifact {
             );
         }
 
-        // PA10 (#16): seal the *redacted* resolved plan so apply can detect a
-        // post-plan edit.  Computed here, after redaction, so the seal matches
-        // exactly what gets serialized to disk.  `config_path` (set by the
-        // caller after construction) is intentionally outside the seal — it is
-        // an apply-time state-location hint, not part of the execution
-        // contract, and the operator may legitimately relocate the plan file.
+        // PA10 (#16): checksum the *redacted* resolved plan so apply can detect
+        // an accidental post-plan edit (not a malicious one — the digest is
+        // unkeyed; see the `integrity` field doc).  Computed here, after
+        // redaction, so the checksum matches exactly what gets serialized to
+        // disk.  `config_path` (set by the caller after construction) is
+        // intentionally outside the checksum — it is an apply-time
+        // state-location hint, not part of the execution contract, and the
+        // operator may legitimately relocate the plan file.
         let integrity = resolved_plan_integrity(&resolved_plan);
 
         let created_at = Utc::now();
@@ -175,24 +186,33 @@ impl PlanArtifact {
         }
     }
 
-    /// Verify the resolved-plan integrity seal (ADR-0005 PA10, finding #16).
+    /// Re-check the resolved-plan corruption checksum (ADR-0005 PA10, finding
+    /// #16).
     ///
     /// Recomputes the canonical hash of [`Self::resolved_plan`] and compares it
-    /// to the [`Self::integrity`] seal recorded at plan time.  On mismatch,
+    /// to the [`Self::integrity`] checksum recorded at plan time.  On mismatch,
     /// returns an error so `rivet apply` exits non-zero rather than running a
-    /// tampered query under the planned export name.
+    /// changed query under the planned export name.
     ///
-    /// Back-compat: a pre-PA10 artifact has an empty seal (the `#[serde(default)]`
-    /// fallback).  Such an artifact cannot be integrity-checked, so we log a
-    /// WARN and accept it — failing closed would break apply on every plan file
-    /// generated before this field existed.  This is explicit, not a silent
-    /// pass: the operator is told the artifact predates tamper-evidence.
+    /// **Not a tamper guard.** Because the checksum is unkeyed and stored beside
+    /// the data it covers (see the [`Self::integrity`] field doc), this detects
+    /// an *accidental* change — a hand-edited field, a bad merge, on-disk
+    /// corruption — but not a *deliberate* attacker, who can recompute a
+    /// matching digest. There is no secret/MAC; a real tamper guard needs a key
+    /// store, which is out of scope. `apply` trusts the artifact the way it
+    /// trusts the config it was generated from.
+    ///
+    /// Back-compat: a pre-PA10 artifact has an empty checksum (the
+    /// `#[serde(default)]` fallback).  Such an artifact cannot be checked, so we
+    /// log a WARN and accept it — failing closed would break apply on every plan
+    /// file generated before this field existed.  This is explicit, not a silent
+    /// pass: the operator is told the artifact predates the corruption checksum.
     pub fn verify_integrity(&self) -> Result<()> {
         if self.integrity.is_empty() {
             log::warn!(
-                "plan '{}': artifact predates integrity sealing (no `integrity` field); \
-                 cannot verify it was not modified after planning. Re-run `rivet plan` to \
-                 produce a tamper-evident artifact.",
+                "plan '{}': artifact predates the corruption checksum (no `integrity` field); \
+                 cannot detect an accidental edit after planning. Re-run `rivet plan` to \
+                 produce a checksummed artifact.",
                 self.export_name,
             );
             return Ok(());
@@ -429,16 +449,22 @@ impl PlanArtifact {
     }
 }
 
-/// Compute the tamper-evidence seal over a resolved plan (ADR-0005 PA10, #16).
+/// Compute the accidental-corruption checksum over a resolved plan (ADR-0005
+/// PA10, #16).
 ///
-/// The seal is an `xxh3` digest (matching the crate's other content seals in
-/// `manifest.rs` / `commit.rs`, format `"xxh3:<16 hex>"`) over a **canonical**
-/// JSON encoding of the plan.  Canonicalisation matters because the plan embeds
-/// process-randomized maps — `column_overrides: HashMap<String, RivetType>` and
+/// This is an *unkeyed* `xxh3` digest (matching the crate's other content
+/// checksums in `manifest.rs` / `commit.rs`, format `"xxh3:<16 hex>"`) — it is
+/// deliberately NOT a security MAC. Stored beside the data it covers, it detects
+/// an accidental change to the plan, not a malicious one (an attacker recomputes
+/// it for free); see the [`PlanArtifact::integrity`] field doc for the threat
+/// model. The digest runs over a **canonical** JSON encoding of the plan.
+/// Canonicalisation matters because the plan embeds process-randomized maps —
+/// `column_overrides: HashMap<String, RivetType>` and
 /// `quality.null_ratio_max: HashMap<String, f64>` — whose iteration order is
 /// **not** stable across processes (std `HashMap` uses a per-process random
-/// seed).  The seal is written by one process (`rivet plan`) and re-verified by
-/// another (`rivet apply`), so the bytes hashed must not depend on map ordering.
+/// seed).  The checksum is written by one process (`rivet plan`) and re-checked
+/// by another (`rivet apply`), so the bytes hashed must not depend on map
+/// ordering.
 ///
 /// We **cannot** rely on `serde_json::Value` to sort keys for us: this crate
 /// pulls `serde_json/preserve_order` transitively (via `schemars`'s
@@ -451,7 +477,7 @@ impl PlanArtifact {
 /// mirroring the crate's own `schema_fingerprint` (which sorts columns by name).
 ///
 /// On the (practically impossible) event that the plan fails to serialize, the
-/// seal degrades to a sentinel that will never match a real seal — apply then
+/// checksum degrades to a sentinel that will never match a real one — apply then
 /// rejects the artifact rather than silently skipping the check.
 fn resolved_plan_integrity(plan: &ResolvedRunPlan) -> String {
     use xxhash_rust::xxh3::xxh3_64;
@@ -463,8 +489,8 @@ fn resolved_plan_integrity(plan: &ResolvedRunPlan) -> String {
         Ok(bytes) => format!("xxh3:{:016x}", xxh3_64(&bytes)),
         Err(e) => {
             log::error!(
-                "plan integrity seal: failed to canonicalize resolved_plan ({e}); \
-                 emitting a non-matching seal so apply rejects this artifact"
+                "plan integrity checksum: failed to canonicalize resolved_plan ({e}); \
+                 emitting a non-matching value so apply rejects this artifact"
             );
             "xxh3:unserializable".to_string()
         }
@@ -475,8 +501,8 @@ fn resolved_plan_integrity(plan: &ResolvedRunPlan) -> String {
 /// serialized byte stream is independent of map iteration order.  Required
 /// because `serde_json/preserve_order` is active crate-wide (see
 /// [`resolved_plan_integrity`]); without it a `serde_json::Value::Object` keeps
-/// the (process-randomized) `HashMap` insertion order and the seal would not be
-/// reproducible across the plan/apply process boundary.
+/// the (process-randomized) `HashMap` insertion order and the checksum would not
+/// be reproducible across the plan/apply process boundary.
 fn canonicalize_value(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
@@ -860,6 +886,25 @@ mod tests {
         artifact
             .verify_integrity()
             .expect("unsealed (legacy) artifact must be accepted, not failed closed");
+    }
+
+    #[test]
+    fn integrity_checksum_is_not_tamper_protection() {
+        // V17 (CWE-345 honesty): the checksum is an UNKEYED hash stored beside
+        // the data it covers, so a writer who edits the plan can recompute a
+        // matching value for free — this catches *accidental* edits only, never
+        // a *malicious* one. Document that contract here so nobody mistakes the
+        // field for a security MAC: edit the plan, recompute via the same
+        // function apply uses, and verify_integrity then passes.
+        let mut artifact = minimal_artifact();
+        artifact.resolved_plan.base_query = "SELECT * FROM users".into();
+        // A real tamper seal would still reject this; an unkeyed checksum cannot,
+        // because the "attacker" simply recomputes it from the edited plan.
+        artifact.integrity = resolved_plan_integrity(&artifact.resolved_plan);
+        artifact.verify_integrity().expect(
+            "an unkeyed checksum cannot detect a deliberate edit + recompute — \
+             this is accidental-corruption detection, not tamper protection",
+        );
     }
 
     #[test]

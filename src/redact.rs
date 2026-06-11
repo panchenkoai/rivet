@@ -110,29 +110,33 @@ fn try_redact_at(bytes: &[u8], i: usize) -> Option<(String, usize)> {
         return None;
     }
     let userinfo_start = j + 3;
-    // Walk userinfo until terminator.  We require a `:` (password
-    // segment) and an `@` before any path/query/whitespace.
+    // Walk the authority until the path/query/fragment/whitespace
+    // terminator, tracking the LAST `@` we cross. A password may itself
+    // contain `@` (`user:p@ssw0rd@host`), so splitting at the FIRST `@`
+    // would leak the tail after it; the userinfo terminator is the last
+    // `@` before the path — mirroring `redact_pg_url` in state/mod.rs,
+    // which uses `rfind('@')` for the same reason. `has_colon` must reflect
+    // a `:` *within the userinfo* (before that last `@`), not a host:port
+    // colon after it, so we recompute it from the chosen `@`.
     let mut k = userinfo_start;
-    let mut has_colon = false;
+    let mut last_at: Option<usize> = None;
     while k < bytes.len() {
         let b = bytes[k];
         if b == b'@' {
+            last_at = Some(k);
+        } else if matches!(b, b'/' | b'?' | b'#') || b.is_ascii_whitespace() {
             break;
-        }
-        if matches!(b, b'/' | b'?' | b'#') || b.is_ascii_whitespace() {
-            return None;
-        }
-        if b == b':' {
-            has_colon = true;
         }
         k += 1;
     }
-    if !has_colon || k >= bytes.len() || bytes[k] != b'@' {
+    let at = last_at?;
+    let has_colon = bytes[userinfo_start..at].contains(&b':');
+    if !has_colon {
         return None;
     }
     // Slice out `scheme://`, replace userinfo with `REDACTED`.
     let scheme_part = std::str::from_utf8(&bytes[i..userinfo_start]).ok()?;
-    Some((format!("{scheme_part}REDACTED"), k))
+    Some((format!("{scheme_part}REDACTED"), at))
 }
 
 /// Compose every redactor.  Use this at every boundary that turns a
@@ -274,5 +278,48 @@ mod tests {
         let out = redact_url_passwords(s3);
         assert!(out.contains("ошибка — postgresql://REDACTED@host/db"));
         assert!(!out.contains("u:p@"));
+    }
+
+    // ── SEC-RED: embedded `@` in password must not leak ───────────────────────
+
+    #[test]
+    fn sec_redact_url_password_with_at() {
+        // SEC-RED V8: redact_url_passwords splits userinfo at the FIRST `@`,
+        // leaking the password tail after an embedded `@`. The userinfo walk in
+        // `try_redact_at` breaks on the first `@` it sees, so the password
+        // `p@ssw0rd` is split: only `p` is treated as the password and the
+        // tail `ssw0rd` survives in the output. The userinfo terminator must be
+        // the LAST `@` before the path/query (rfind semantics, as already used
+        // by redact_pg_url in state/mod.rs).
+        let s = "connect failed to postgresql://rivet:p@ssw0rd@db.example.com:5432/orders";
+        let out = redact_url_passwords(s);
+        // No fragment of the password may survive. `ssw0rd` is the tail that
+        // leaks today.
+        assert!(
+            !out.contains("ssw0rd"),
+            "password tail after embedded @ must not leak: {out}"
+        );
+        assert!(
+            !out.contains("p@ssw0rd"),
+            "full password must not leak: {out}"
+        );
+        // Host and path must be retained, redacted to REDACTED@host.
+        assert!(
+            out.contains("postgresql://REDACTED@db.example.com:5432/orders"),
+            "expected REDACTED@host with embedded-@ password stripped, got: {out}"
+        );
+
+        // Guard: a normal password (no embedded @) still redacts correctly so
+        // this test pins the fix rather than just any change.
+        let normal = "connect failed to postgresql://rivet:s3cret@db.example.com:5432/orders";
+        let normal_out = redact_url_passwords(normal);
+        assert!(
+            !normal_out.contains("s3cret"),
+            "normal password must still be redacted: {normal_out}"
+        );
+        assert!(
+            normal_out.contains("postgresql://REDACTED@db.example.com:5432/orders"),
+            "normal password redaction unchanged: {normal_out}"
+        );
     }
 }
