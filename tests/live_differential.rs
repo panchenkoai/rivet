@@ -95,8 +95,8 @@ fn pg_fingerprint(table: &str) -> Fingerprint {
     }
 }
 
-fn duckdb_fingerprint(glob: &str) -> Fingerprint {
-    let json = duckdb_run_sql_json(&format!("{FINGERPRINT_SQL} FROM read_parquet('{glob}')"));
+fn duckdb_fp_from(from_sql: &str) -> Fingerprint {
+    let json = duckdb_run_sql_json(&format!("{FINGERPRINT_SQL} FROM {from_sql}"));
     let row = json["rows"][0]
         .as_array()
         .unwrap_or_else(|| panic!("duckdb fingerprint returned no row: {json}"));
@@ -116,6 +116,30 @@ fn duckdb_fingerprint(glob: &str) -> Fingerprint {
         distinct_id: cell(5),
         distinct_text: cell(6),
     }
+}
+
+/// Fingerprint the exported Parquet as-is (clean export).
+fn duckdb_fingerprint(glob: &str) -> Fingerprint {
+    duckdb_fp_from(&format!("read_parquet('{glob}')"))
+}
+
+/// Fingerprint the exported Parquet with at-least-once duplicate parts collapsed.
+/// After a crash + resume the destination holds the re-run chunk twice; rivet's
+/// duplicate parts are byte-identical re-exports, so `SELECT DISTINCT *` recovers
+/// the exactly-once set — which must equal the source.
+fn duckdb_fingerprint_dedup(glob: &str) -> Fingerprint {
+    duckdb_fp_from(&format!("(SELECT DISTINCT * FROM read_parquet('{glob}'))"))
+}
+
+/// Raw physical row count over the whole glob (counts at-least-once duplicates).
+fn duckdb_raw_rows(glob: &str) -> i64 {
+    let json = duckdb_run_sql_json(&format!(
+        "SELECT count(*)::BIGINT FROM read_parquet('{glob}')"
+    ));
+    json["rows"][0][0]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("duckdb raw count failed: {json}"))
 }
 
 #[test]
@@ -182,4 +206,105 @@ exports:
         src.distinct_text, N,
         "c_text is unique per row by construction"
     );
+}
+
+/// Differential correctness AFTER A CRASH, via the independent reader.
+///
+/// `live_crash_soak.rs` proves no row is lost after a crash, but it re-reads the
+/// destination with the in-process arrow/parquet-rs stack — the same library
+/// family rivet writes with (independent of rivet's *bookkeeping*, but not of
+/// the *codec*). This test closes that gap: it crashes a chunked export, resumes,
+/// then fingerprints the recovered Parquet with **DuckDB** (a fully independent
+/// reader) and compares to the source.
+///
+/// At-least-once means the crashed chunk is written twice, so the raw glob shows
+/// a surplus; `SELECT DISTINCT *` collapses the byte-identical duplicate parts to
+/// the exactly-once set, which must equal the source field-for-field.
+#[test]
+#[ignore = "live: requires docker compose postgres + rivet-duckdb"]
+fn pg_chunked_export_after_crash_matches_source_via_duckdb() {
+    require_alive(LiveService::Postgres);
+    require_alive(LiveService::DuckDb);
+
+    let table = unique_name("rivet_diff_crash");
+    let _guard = DropPg(table.clone());
+    seed_pg(&table);
+
+    let export = unique_name("diffc_exp");
+    let (host_dir, container_dir) = duckdb_shared_workdir(&unique_name("diffc_out"));
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        r#"source: {{type: postgres, url: "{POSTGRES_URL}"}}
+exports:
+  - name: {export}
+    query: "SELECT id, n, big, c_text FROM {table}"
+    mode: chunked
+    chunk_column: id
+    chunk_size: {CHUNK}
+    chunk_checkpoint: true
+    format: parquet
+    compression: zstd
+    destination: {{type: local, path: {dir}}}
+"#,
+        dir = host_dir.display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    // Crash mid-run, after chunk 1's file is written but before it commits →
+    // chunk 1 re-runs on resume (at-least-once duplicate part).
+    let crash = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+        ])
+        .env("RIVET_TEST_PANIC_AT", "after_chunk_file:1")
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        !crash.status.success(),
+        "crash run must exit non-zero; stderr:\n{}",
+        String::from_utf8_lossy(&crash.stderr)
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    let resume = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+            "--resume",
+        ])
+        .output()
+        .expect("spawn rivet resume");
+    assert!(
+        resume.status.success(),
+        "--resume must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+    make_shared_world_readable();
+
+    let glob = format!("{container_dir}/*.parquet");
+    let src = pg_fingerprint(&table);
+
+    // At-least-once: the raw destination physically holds MORE than N rows
+    // (chunk 1 written twice) — proves the duplicate part is really there.
+    assert!(
+        duckdb_raw_rows(&glob) > N,
+        "after a crash the destination must carry the at-least-once duplicate part (>{N} raw rows)"
+    );
+
+    // Exactly-once view (duplicates collapsed) must equal the source — read by
+    // DuckDB, a fully independent reader, AFTER the crash + resume.
+    let dst = duckdb_fingerprint_dedup(&glob);
+    assert_eq!(
+        src, dst,
+        "POST-CRASH DIFFERENTIAL MISMATCH: DuckDB's exactly-once view of the recovered Parquet \
+         disagrees with the source — recovery lost or corrupted a row. source={src:?} dest={dst:?}"
+    );
+    assert_eq!(src.rows, N, "source must cover all {N} rows");
 }
