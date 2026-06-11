@@ -206,10 +206,18 @@ exports:
 
 #[test]
 #[ignore = "live: requires docker compose postgres + mysql"]
-fn pg_and_mysql_chunked_exports_agree_on_row_count() {
+fn pg_and_mysql_chunked_exports_agree_on_row_count_and_id_set() {
     // Chunked execution exercises a different SQL shaping path
     // (`build_chunk_query_sql` with the dialect-appropriate identifier
-    // quoting).  Assert row count parity under that path too.
+    // quoting).  Assert row count parity under that path too — AND id-set
+    // equality: the range/BETWEEN chunk path splits the id space at chunk
+    // boundaries (here 6|7, 13|14, 20|21, 27|28 for contiguous ids 0..29 at
+    // chunk_size 7), so a boundary off-by-one that DROPS chunk[i].end while
+    // DUPLICATING chunk[i+1].start nets to the same physical count and slips
+    // past a count-only assertion. count==ROWS catches a net-duplication;
+    // the id-set == {0..ROWS} catches any dropped id; together they prove
+    // exactly-once. (keyset already has this lock via read_uid_set; the
+    // BETWEEN path did not — see the data-correctness audit.)
     require_alive(LiveService::Postgres);
     require_alive(LiveService::Mysql);
 
@@ -275,14 +283,35 @@ exports:
             .map(|p| read_total_rows(p))
             .sum()
     };
+    // Union of per-file id sets — re-reads the destination Parquet, not rivet's
+    // own counters. A dropped boundary row leaves a hole here even when the
+    // physical count is restored by a duplicate elsewhere.
+    let union_ids = |dir: &std::path::Path| -> std::collections::BTreeSet<i64> {
+        files_with_extension(dir, "parquet")
+            .iter()
+            .flat_map(|p| read_id_set(p))
+            .collect()
+    };
+    let expected: std::collections::BTreeSet<i64> = (0..ROWS).collect();
+
     assert_eq!(
         sum(pg_out.path()),
         ROWS as usize,
-        "pg chunked total row count mismatch"
+        "pg chunked total row count mismatch (net duplication or loss)"
+    );
+    assert_eq!(
+        union_ids(pg_out.path()),
+        expected,
+        "pg chunked id-set must equal source 0..{ROWS} — a missing id is a boundary DROP"
     );
     assert_eq!(
         sum(my_out.path()),
         ROWS as usize,
-        "mysql chunked total row count mismatch"
+        "mysql chunked total row count mismatch (net duplication or loss)"
+    );
+    assert_eq!(
+        union_ids(my_out.path()),
+        expected,
+        "mysql chunked id-set must equal source 0..{ROWS} — a missing id is a boundary DROP"
     );
 }
