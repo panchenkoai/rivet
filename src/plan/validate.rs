@@ -60,11 +60,16 @@ fn check_stdout_split(diags: &mut Vec<Diagnostic>, plan: &ResolvedRunPlan) {
     }
 }
 
-/// `stdout + chunked` — each chunk produces a separate binary stream; concatenating them
-/// to stdout produces unusable output for binary formats like Parquet.
+/// `stdout + chunked/keyset` — each chunk (or keyset page) produces a separate binary
+/// stream; concatenating them to stdout produces unusable output for binary formats
+/// like Parquet. Keyset matters here because the planner auto-selects it for tables
+/// without a single-integer PK — the operator never opted into multi-part output.
 fn check_stdout_chunked(diags: &mut Vec<Diagnostic>, plan: &ResolvedRunPlan) {
-    if is_stdout(plan) && matches!(&plan.strategy, ExtractionStrategy::Chunked(_)) {
-        diags.push(Diagnostic {
+    if !is_stdout(plan) {
+        return;
+    }
+    match &plan.strategy {
+        ExtractionStrategy::Chunked(_) => diags.push(Diagnostic {
             level: DiagnosticLevel::Rejected,
             rule: "stdout-no-chunked",
             message: format!(
@@ -72,7 +77,17 @@ fn check_stdout_chunked(diags: &mut Vec<Diagnostic>, plan: &ResolvedRunPlan) {
                  each chunk produces a separate binary stream; concatenated output is unusable",
                 plan.export_name
             ),
-        });
+        }),
+        ExtractionStrategy::Keyset(_) => diags.push(Diagnostic {
+            level: DiagnosticLevel::Rejected,
+            rule: "stdout-no-keyset",
+            message: format!(
+                "export '{}': keyset pagination cannot be used with stdout destination — \
+                 each page produces a separate binary stream; concatenated output is unusable",
+                plan.export_name
+            ),
+        }),
+        _ => {}
     }
 }
 
@@ -93,15 +108,21 @@ fn check_incremental_reconcile(diags: &mut Vec<Diagnostic>, plan: &ResolvedRunPl
     }
 }
 
-/// `quality + chunked` — quality checks run per-chunk file; row-count and uniqueness
-/// checks operate on each chunk independently, not on the full dataset.
+/// `quality + chunked/keyset` — quality checks run per part file; row-count and
+/// uniqueness checks operate on each chunk (or keyset page) independently, not on
+/// the full dataset.
 fn check_quality_chunked(diags: &mut Vec<Diagnostic>, plan: &ResolvedRunPlan) {
-    if plan.quality.is_some() && matches!(&plan.strategy, ExtractionStrategy::Chunked(_)) {
+    if plan.quality.is_some()
+        && matches!(
+            &plan.strategy,
+            ExtractionStrategy::Chunked(_) | ExtractionStrategy::Keyset(_)
+        )
+    {
         diags.push(Diagnostic {
             level: DiagnosticLevel::Warning,
             rule: "quality-chunked-partial",
             message: format!(
-                "export '{}': quality checks run per-chunk file; row_count and \
+                "export '{}': quality checks run per part file; row_count and \
                  unique_columns checks apply to each chunk independently, not the \
                  full dataset — results may be misleading",
                 plan.export_name
@@ -546,6 +567,12 @@ mod tests {
     //  M18 │ Incremental │ Local       │ resume                  │ Warning         [resume-no-checkpoint]
     //  M19 │ Chunked     │ Local       │ no-checkpoint + resume  │ Warning         (resume_with_chunked_no_checkpoint_warns)
     //  M20 │ Stdout      │ —           │ incremental + reconcile │ Warning+Degraded [incremental-reconcile-mismatch, stdout-manifest-phantom]
+    //  M21 │ Keyset      │ Local       │ —                       │ Clean
+    //  M22 │ Stdout      │ —           │ keyset                  │ Rejected+Degraded [stdout-no-keyset, stdout-manifest-phantom]
+    //  M23 │ Keyset      │ Local       │ quality                 │ Warning         (roast_quality_with_keyset_warns)
+    //  M24 │ Keyset      │ Local       │ resume                  │ Warning         [resume-no-checkpoint]
+    //  M25 │ Keyset      │ Local       │ reconcile               │ Clean           (full-table export; COUNT(*) matches)
+    //  M26 │ Stdout      │ —           │ keyset + max_file_size  │ Rejected×2+Degraded [stdout-no-split, stdout-no-keyset, stdout-manifest-phantom]
 
     // M5 — Incremental + Local + no flags → Clean
     #[test]
@@ -811,6 +838,174 @@ mod tests {
         assert!(
             diags.iter().all(|d| d.rule != "quality-unique-no-cap"),
             "absent quality config must not trigger no-cap warning; got: {:?}",
+            rules(&diags)
+        );
+    }
+
+    // ── Keyset blind spot (ROAST-RED) ──────────────────────────────────────────
+
+    fn keyset_plan_strategy() -> ExtractionStrategy {
+        ExtractionStrategy::Keyset(crate::plan::KeysetPlan {
+            key_column: "uuid_pk".into(),
+            chunk_size: 10_000,
+        })
+    }
+
+    // ROAST-RED plan-keyset-rules: compatibility rules match only Chunked(_); Keyset
+    // (one part PER PAGE — same multi-part binary shape, auto-selected by the planner
+    // for MySQL tables without an int PK) slips past stdout-no-chunked unflagged.
+    // Asserts CORRECT behavior; expected to FAIL until the fix lands.
+    #[test]
+    fn roast_stdout_with_keyset_is_rejected() {
+        let mut p = stdout_plan();
+        p.strategy = keyset_plan_strategy();
+        let diags = validate_plan(&p);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.level == DiagnosticLevel::Rejected && d.rule.starts_with("stdout-no-")),
+            "keyset emits one binary part per page — stdout must be Rejected like chunked \
+             (stdout-no-* rule family), got: {:?}",
+            rules(&diags)
+        );
+    }
+
+    // ROAST-RED plan-keyset-rules: quality checks run per-part for Keyset exactly as
+    // for Chunked, but check_quality_chunked matches only Chunked(_) — keyset + quality
+    // produces no quality-chunked-partial warning.
+    // Asserts CORRECT behavior; expected to FAIL until the fix lands.
+    #[test]
+    fn roast_quality_with_keyset_warns() {
+        let mut p = base_plan();
+        p.strategy = keyset_plan_strategy();
+        p.quality = Some(QualityConfig {
+            row_count_min: Some(1),
+            row_count_max: None,
+            null_ratio_max: Default::default(),
+            unique_columns: vec![],
+            unique_max_entries: None,
+        });
+        let diags = validate_plan(&p);
+        assert!(
+            diags.iter().any(|d| d.rule == "quality-chunked-partial"
+                && d.level == DiagnosticLevel::Warning),
+            "keyset quality checks run per-page part — expected quality-chunked-partial \
+             warning as for chunked, got: {:?}",
+            rules(&diags)
+        );
+    }
+
+    // M21 — Keyset + Local + no flags → Clean
+    #[test]
+    fn matrix_m21_keyset_local_no_flags_is_clean() {
+        let mut p = base_plan();
+        p.strategy = keyset_plan_strategy();
+        assert!(
+            validate_plan(&p).is_empty(),
+            "keyset + local must produce no diagnostics"
+        );
+    }
+
+    // M22 — Stdout + keyset → Rejected [stdout-no-keyset] and Degraded
+    //        [stdout-manifest-phantom] both fire; the chunked-specific rule must not
+    #[test]
+    fn matrix_m22_stdout_keyset_fires_rejected_and_degraded() {
+        let mut p = stdout_plan();
+        p.strategy = keyset_plan_strategy();
+        let diags = validate_plan(&p);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.rule == "stdout-no-keyset" && d.level == DiagnosticLevel::Rejected),
+            "must fire stdout-no-keyset Rejected, got: {:?}",
+            rules(&diags)
+        );
+        assert!(
+            diags.iter().any(
+                |d| d.rule == "stdout-manifest-phantom" && d.level == DiagnosticLevel::Degraded
+            ),
+            "must also fire stdout-manifest-phantom Degraded, got: {:?}",
+            rules(&diags)
+        );
+        assert!(
+            diags.iter().all(|d| d.rule != "stdout-no-chunked"),
+            "keyset must fire its own rule, not stdout-no-chunked; got: {:?}",
+            rules(&diags)
+        );
+    }
+
+    // M23 — Keyset + Local + quality → Warning [quality-chunked-partial]
+    //        (covered by roast_quality_with_keyset_warns above — cross-reference only)
+
+    // M24 — Keyset + Local + resume → Warning [resume-no-checkpoint]
+    //        keyset has no checkpoint support; --resume is silently ignored
+    #[test]
+    fn matrix_m24_keyset_with_resume_warns() {
+        let mut p = base_plan();
+        p.strategy = keyset_plan_strategy();
+        p.resume = true;
+        let diags = validate_plan(&p);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.rule == "resume-no-checkpoint" && d.level == DiagnosticLevel::Warning),
+            "keyset + resume must warn resume-no-checkpoint, got: {:?}",
+            rules(&diags)
+        );
+    }
+
+    // M25 — Keyset + Local + reconcile → Clean
+    //        keyset exports the full table, so reconcile's COUNT(*) is comparable —
+    //        unlike incremental/time_window it must NOT inherit a mismatch warning
+    #[test]
+    fn matrix_m25_keyset_with_reconcile_is_clean() {
+        let mut p = base_plan();
+        p.strategy = keyset_plan_strategy();
+        p.reconcile = true;
+        assert!(
+            validate_plan(&p).is_empty(),
+            "keyset + reconcile must produce no diagnostics"
+        );
+    }
+
+    // M26 — Stdout + keyset + max_file_size → two Rejected rules + one Degraded all
+    //        fire (keyset analogue of M13: the keyset rule composes independently
+    //        with stdout-no-split, neither masks the other)
+    #[test]
+    fn matrix_m26_stdout_keyset_max_file_size_fires_all_three_rules() {
+        let mut p = stdout_plan();
+        p.strategy = keyset_plan_strategy();
+        p.max_file_size_bytes = Some(100 * 1024 * 1024);
+        let diags = validate_plan(&p);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.rule == "stdout-no-split" && d.level == DiagnosticLevel::Rejected),
+            "must fire stdout-no-split, got: {:?}",
+            rules(&diags)
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.rule == "stdout-no-keyset" && d.level == DiagnosticLevel::Rejected),
+            "must fire stdout-no-keyset, got: {:?}",
+            rules(&diags)
+        );
+        assert!(
+            diags.iter().any(
+                |d| d.rule == "stdout-manifest-phantom" && d.level == DiagnosticLevel::Degraded
+            ),
+            "must fire stdout-manifest-phantom, got: {:?}",
+            rules(&diags)
+        );
+        let rejected: Vec<_> = diags
+            .iter()
+            .filter(|d| d.level == DiagnosticLevel::Rejected)
+            .collect();
+        assert_eq!(
+            rejected.len(),
+            2,
+            "exactly 2 Rejected diagnostics expected, got: {:?}",
             rules(&diags)
         );
     }

@@ -72,6 +72,12 @@ impl StateStore {
         Ok(())
     }
 
+    /// Return an export to a "never ran" state.
+    ///
+    /// Clears the incremental cursor (`export_state`) **and** the committed /
+    /// verified boundary (`export_progression`). Both must go: a surviving
+    /// progression row would make `rivet state progression` report a stale
+    /// committed boundary after `state show` is already empty.
     pub fn reset(&self, export_name: &str) -> Result<()> {
         let sql = "DELETE FROM export_state WHERE export_name = ?1";
         match &self.conn {
@@ -83,6 +89,7 @@ impl StateStore {
                 c.execute(&pg_sql(sql), &[&export_name])?;
             }
         }
+        self.delete_progression(export_name)?;
         Ok(())
     }
 
@@ -246,6 +253,32 @@ mod tests {
         assert!(
             after.last_run_at.is_none(),
             "reset must clear last_run_at as well"
+        );
+    }
+
+    /// #22 (0.9.x audit): `reset` left `export_progression` behind, so
+    /// `rivet state progression` reported a stale committed boundary after
+    /// `state show` was already empty. Reset must clear progression too.
+    #[test]
+    fn reset_clears_committed_progression() {
+        let s = store();
+        s.update("orders", "100").unwrap();
+        s.record_committed_incremental("orders", "100", "run-1")
+            .unwrap();
+        // Other exports' progression must survive — reset is per-export.
+        s.record_committed_incremental("users", "9", "run-u")
+            .unwrap();
+
+        s.reset("orders").unwrap();
+
+        let p = s.get_progression("orders").unwrap();
+        assert!(
+            p.committed.is_none() && p.verified.is_none(),
+            "reset must clear the export's committed/verified boundary"
+        );
+        assert!(
+            s.get_progression("users").unwrap().committed.is_some(),
+            "reset must not touch another export's progression"
         );
     }
 }

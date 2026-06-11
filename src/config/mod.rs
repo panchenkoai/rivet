@@ -76,9 +76,72 @@ impl Config {
 
     pub fn from_yaml(yaml: &str) -> crate::error::Result<Self> {
         Self::check_misplaced_tuning_fields(yaml)?;
+        Self::check_csv_compression(yaml)?;
         let config: Config = serde_yaml_ng::from_str(yaml).map_err(lints::enhance_parse_error)?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Reject `format: csv` paired with an explicitly-requested compression
+    /// codec (Finding #10). The CSV writer has no compression encoder, so the
+    /// codec is silently dropped on write while the run manifest still records
+    /// it — a degraded, dishonest no-op. We reject loudly at config-validate
+    /// time so `rivet check` / `rivet doctor` catch it before any run.
+    ///
+    /// This is a raw-YAML scan (like [`Self::check_misplaced_tuning_fields`])
+    /// rather than a `validate_export` check on purpose: `ExportConfig.
+    /// compression` is `#[serde(default)]` and `CompressionType::default()` is
+    /// `Zstd`, so a parsed export cannot distinguish "user asked for zstd" from
+    /// "user omitted the field". Only a user who *wrote* `compression:`/
+    /// `compression_profile:` is asking for something the CSV writer cannot
+    /// honour; the bare-`format: csv` default writes uncompressed and is fine.
+    fn check_csv_compression(yaml: &str) -> crate::error::Result<()> {
+        let root: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml)?;
+        let Some(exports) = root.get("exports").and_then(|e| e.as_sequence()) else {
+            return Ok(());
+        };
+        for export in exports {
+            if export.get("format").and_then(|f| f.as_str()) != Some("csv") {
+                continue;
+            }
+            let name = export
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("<unnamed>");
+
+            // Explicit `compression:` codec that the CSV writer cannot apply.
+            // An unrecognised label is left for serde to reject during the real
+            // parse; we only act on a codec we understand and that CSV cannot
+            // honour (everything but `none`).
+            if let Some(codec) = export.get("compression").and_then(|c| c.as_str())
+                && let Some(ct) = CompressionType::from_label(codec)
+                && !format::compression_supported(FormatType::Csv, ct)
+            {
+                anyhow::bail!(
+                    "export '{}': CSV output does not support compression: {}. \
+                     CSV has no compression encoder, so the codec would be silently dropped \
+                     while the manifest records it.\n  \
+                     Hint: use `format: parquet` for compression, or set `compression: none`.",
+                    name,
+                    codec,
+                );
+            }
+
+            // A `compression_profile:` other than `none` resolves to a real
+            // codec too (fast→snappy, balanced/compact→zstd) — same no-op.
+            if let Some(profile) = export.get("compression_profile").and_then(|c| c.as_str())
+                && profile != CompressionProfile::None.label()
+            {
+                anyhow::bail!(
+                    "export '{}': CSV output does not support compression_profile: {} \
+                     (it resolves to a compression codec the CSV writer cannot apply).\n  \
+                     Hint: use `format: parquet` for compression, or set `compression_profile: none`.",
+                    name,
+                    profile,
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Detect tuning-related fields placed directly under `source:` or an
@@ -556,3 +619,117 @@ impl Config {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod audit_csv_compression {
+    //! Finding #10: `format: csv` + a compression codec is a silent no-op
+    //! (the file stays uncompressed but the manifest records the codec). The
+    //! combo must be rejected at config-validate time. These tests encode the
+    //! new rule, so reverting the fix turns them red.
+    use super::*;
+
+    fn yaml(format: &str, compression_line: &str) -> String {
+        format!(
+            "source:\n  type: postgres\n  url: \"postgresql://localhost/test\"\n\
+             exports:\n  - name: t\n    query: \"SELECT 1\"\n    format: {format}\n\
+             {compression_line}    destination:\n      type: local\n      path: ./out\n"
+        )
+    }
+
+    #[test]
+    fn audit_csv_compression_is_rejected() {
+        // csv + gzip → rejected, with an actionable message.
+        let err = Config::from_yaml(&yaml("csv", "    compression: gzip\n")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("CSV output does not support compression") && msg.contains("gzip"),
+            "csv+gzip must be rejected with an actionable message; got: {msg}"
+        );
+        assert!(
+            msg.contains("parquet") && msg.contains("none"),
+            "message must point to the real options (parquet / none); got: {msg}"
+        );
+
+        // Guard the boundaries: parquet+gzip and csv+none still validate.
+        Config::from_yaml(&yaml("parquet", "    compression: gzip\n"))
+            .expect("parquet+gzip must validate");
+        Config::from_yaml(&yaml("csv", "    compression: none\n")).expect("csv+none must validate");
+    }
+
+    #[test]
+    fn audit_csv_every_real_codec_is_rejected() {
+        // Each non-None codec is a silent no-op for CSV — none may slip through.
+        for codec in ["zstd", "snappy", "gzip", "lz4"] {
+            let err = Config::from_yaml(&yaml("csv", &format!("    compression: {codec}\n")))
+                .unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("CSV output does not support compression") && msg.contains(codec),
+                "csv+{codec} must be rejected; got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_csv_compression_profile_is_rejected() {
+        // A `compression_profile:` other than `none` resolves to a real codec,
+        // so it is the same silent no-op for CSV.
+        for profile in ["fast", "balanced", "compact"] {
+            let err = Config::from_yaml(&yaml(
+                "csv",
+                &format!("    compression_profile: {profile}\n"),
+            ))
+            .unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("CSV output does not support compression_profile")
+                    && msg.contains(profile),
+                "csv+profile {profile} must be rejected; got: {msg}"
+            );
+        }
+        // profile: none is a no-op request and is fine.
+        Config::from_yaml(&yaml("csv", "    compression_profile: none\n"))
+            .expect("csv + compression_profile: none must validate");
+    }
+
+    #[test]
+    fn audit_csv_default_compression_still_validates() {
+        // Regression guard: a bare `format: csv` (no explicit codec) must keep
+        // validating. `CompressionType::default()` is `Zstd`, but the user did
+        // not *ask* for it — only an explicit codec is a no-op request. This
+        // pins that the fix scans for explicit intent, not the struct default
+        // (which would break ~60 existing csv configs).
+        Config::from_yaml(&yaml("csv", "")).expect("bare format: csv must validate");
+    }
+
+    #[test]
+    fn audit_compression_supported_predicate() {
+        // `compression_supported` is re-exported via `pub use format::*`.
+        // Parquet supports every codec; CSV supports only None.
+        for ct in [
+            CompressionType::Zstd,
+            CompressionType::Snappy,
+            CompressionType::Gzip,
+            CompressionType::Lz4,
+            CompressionType::None,
+        ] {
+            assert!(compression_supported(FormatType::Parquet, ct));
+        }
+        assert!(compression_supported(
+            FormatType::Csv,
+            CompressionType::None
+        ));
+        for ct in [
+            CompressionType::Zstd,
+            CompressionType::Snappy,
+            CompressionType::Gzip,
+            CompressionType::Lz4,
+        ] {
+            assert!(
+                !compression_supported(FormatType::Csv, ct),
+                "CSV must not claim to support {}",
+                ct.label()
+            );
+        }
+    }
+}

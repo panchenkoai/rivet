@@ -117,11 +117,20 @@ pub struct ExportConfig {
     pub time_column_type: TimeColumnType,
     pub days_window: Option<u32>,
 
-    /// Value-based output partitioning: split this export's rows into one
-    /// destination sub-prefix per distinct bucket of this column's value
-    /// (Hive-style `col=value/` layout). The bucket width is
-    /// `partition_granularity`. Requires a `{partition}` token in
-    /// `destination.path` / `destination.prefix`.
+    /// Date/time output partitioning: split this export's rows into one
+    /// destination sub-prefix per calendar bucket of this **DATE or TIMESTAMP**
+    /// column, bucketed by [`partition_granularity`](Self::partition_granularity)
+    /// (`day` / `month` / `year`), in a Hive-style `col=value/` layout
+    /// (`created_at=2023-01-01/`, `created_at=2023-01/`, `created_at=2023/`).
+    /// Requires a `{partition}` token in `destination.path` /
+    /// `destination.prefix`.
+    ///
+    /// This is **not** arbitrary value partitioning: the column's min/max is
+    /// read and parsed as a date to generate contiguous calendar buckets, so a
+    /// non-temporal column (e.g. `partition_by: status`) fails at run time with
+    /// "could not parse partition min '<value>' from column '<col>' as a date".
+    /// To split by a categorical column, write one export per value with a
+    /// `WHERE` filter instead.
     ///
     /// Orthogonal to `mode`: each partition runs the export's own mode, so
     /// `mode: chunked` chunks *within* a day. Rows whose partition column is
@@ -132,7 +141,7 @@ pub struct ExportConfig {
     /// exports:
     ///   - name: events
     ///     table: events
-    ///     partition_by: created_at
+    ///     partition_by: created_at        # must be a DATE or TIMESTAMP column
     ///     partition_granularity: day
     ///     destination:
     ///       type: s3
@@ -142,7 +151,11 @@ pub struct ExportConfig {
     #[serde(default)]
     pub partition_by: Option<String>,
 
-    /// Bucket width for [`partition_by`](Self::partition_by). Default `day`.
+    /// Calendar bucket width for [`partition_by`](Self::partition_by):
+    /// `day` (default), `month`, or `year`. Determines how the partition
+    /// column's date/timestamp range is split into contiguous Hive buckets
+    /// (`col=2023-01-01/` / `col=2023-01/` / `col=2023/`). Has no effect
+    /// unless `partition_by` is set.
     #[serde(default)]
     pub partition_granularity: PartitionGranularity,
     pub format: FormatType,
@@ -416,13 +429,19 @@ pub enum TimeColumnType {
     Unix,
 }
 
-/// Bucket width for value-based output partitioning ([`ExportConfig::partition_by`]).
+/// Calendar bucket width for date/timestamp output partitioning
+/// ([`ExportConfig::partition_by`]). The partition column must be a DATE or
+/// TIMESTAMP column; this picks how its range is split into contiguous Hive
+/// buckets. It is not a knob for partitioning by arbitrary column values.
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum PartitionGranularity {
+    /// One bucket per calendar day (`col=2023-01-01/`). Default.
     #[default]
     Day,
+    /// One bucket per calendar month (`col=2023-01/`).
     Month,
+    /// One bucket per calendar year (`col=2023/`).
     Year,
 }
 

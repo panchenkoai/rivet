@@ -9,7 +9,23 @@ use crate::error::Result;
 use crate::journal::RunEvent;
 use crate::state::StateStore;
 
+/// Validate the `--config` path BEFORE opening the state store.
+///
+/// Inspect commands (`state show/files/chunks/progression`, `metrics`,
+/// `journal`) use `config_path` only to *locate* the SQLite `.rivet_state.db`
+/// next to it; they never parse the YAML. So a missing or garbage path used to
+/// silently open an empty/foreign DB and exit 0 (and `StateStore::open` would
+/// materialize a fresh `.rivet_state.db` beside the phantom path). Loading the
+/// config first turns a bad path into a clear non-zero error — exactly as
+/// `run`/`check` already do — and avoids littering a state DB. The parsed
+/// config is returned so callers that also need the declared export names
+/// (e.g. `reset-chunks`) reuse the same load.
+fn require_config(config_path: &str) -> Result<Config> {
+    Config::load(config_path)
+}
+
 pub fn show_state(config_path: &str) -> Result<()> {
+    require_config(config_path)?;
     let state = StateStore::open(config_path)?;
     let states = state.list_all()?;
     if states.is_empty() {
@@ -57,6 +73,7 @@ pub fn show_state(config_path: &str) -> Result<()> {
 
 /// Epic G / ADR-0008 — explicit committed / verified boundaries per export.
 pub fn show_progression(config_path: &str, export_name: Option<&str>) -> Result<()> {
+    require_config(config_path)?;
     let state = StateStore::open(config_path)?;
     let entries = match export_name {
         Some(name) => vec![state.get_progression(name)?],
@@ -135,6 +152,7 @@ pub fn reset_state(config_path: &str, export_name: &str) -> Result<()> {
 }
 
 pub fn show_files(config_path: &str, export_name: Option<&str>, limit: usize) -> Result<()> {
+    require_config(config_path)?;
     let state = StateStore::open(config_path)?;
     let files = state.get_files(export_name, limit)?;
     if files.is_empty() {
@@ -160,6 +178,7 @@ pub fn show_files(config_path: &str, export_name: Option<&str>, limit: usize) ->
 }
 
 pub fn show_metrics(config_path: &str, export_name: Option<&str>, limit: usize) -> Result<()> {
+    require_config(config_path)?;
     let state = StateStore::open(config_path)?;
     let metrics = state.get_metrics(export_name, limit)?;
     if metrics.is_empty() {
@@ -212,8 +231,31 @@ pub fn show_metrics(config_path: &str, export_name: Option<&str>, limit: usize) 
 }
 
 pub fn reset_chunk_checkpoint(config_path: &str, export_name: &str) -> Result<()> {
+    // Parity with `reset_state`: validate the export name against the config
+    // BEFORE touching state, so a typo (`-e pa_audi` for `pa_audit`) errors with
+    // the declared names instead of silently "Removed 0 chunk run record(s)"
+    // (rc=0) — which looked like the resume was abandoned when it was not.
+    let config = require_config(config_path)?;
+    if !config.exports.iter().any(|e| e.name == export_name) {
+        let known: Vec<String> = config.exports.iter().map(|e| e.name.clone()).collect();
+        anyhow::bail!(
+            "export '{}' not found in config '{}'.\n  Known exports: {}\n  Hint: check the spelling, or run `rivet state chunks -c {} -e <name>` to inspect a checkpoint.",
+            export_name,
+            config_path,
+            if known.is_empty() {
+                "(none defined)".to_string()
+            } else {
+                known.join(", ")
+            },
+            config_path,
+        );
+    }
     let state = StateStore::open(config_path)?;
     let n = state.reset_chunk_checkpoint(export_name)?;
+    // Abandoning the resume also clears the committed/verified boundary, so
+    // `rivet state progression` does not report a stale chunk boundary after
+    // the chunk_run/chunk_task rows are gone (parity with `state reset`).
+    state.delete_progression(export_name)?;
     println!(
         "Removed {} chunk run record(s) for export '{}'.",
         n, export_name
@@ -278,6 +320,7 @@ pub fn reset_chunk_checkpoints_stuck(config_path: &str) -> Result<()> {
 }
 
 pub fn show_chunk_checkpoint(config_path: &str, export_name: &str) -> Result<()> {
+    require_config(config_path)?;
     let state = StateStore::open(config_path)?;
     println!(
         "database:   {}",
@@ -326,6 +369,7 @@ pub fn show_journal(
     limit: usize,
     run_id: Option<&str>,
 ) -> Result<()> {
+    require_config(config_path)?;
     let state = StateStore::open(config_path)?;
 
     let journals = if let Some(rid) = run_id {
@@ -407,6 +451,26 @@ pub fn show_journal(
                 total_rows,
                 format_bytes(total_bytes),
             );
+            // List each produced file by name — the aggregate count alone hides
+            // *which* objects landed, so an operator could not cross-check the
+            // journal against the destination / manifest. Each FileWritten event
+            // stores the exact basename `state files` shows.
+            for e in &files {
+                if let RunEvent::FileWritten {
+                    file_name,
+                    rows,
+                    bytes,
+                    ..
+                } = &e.event
+                {
+                    println!(
+                        "    - {}  ({} rows, {})",
+                        file_name,
+                        rows,
+                        format_bytes(*bytes),
+                    );
+                }
+            }
         }
 
         let retries = journal.retries();
@@ -462,8 +526,14 @@ mod tests {
 
     fn setup_dir() -> (tempfile::TempDir, String) {
         let dir = tempfile::TempDir::new().unwrap();
-        // config file itself does not need to exist; StateStore::open uses its parent dir
+        // Inspect/reset commands now validate the --config path up front
+        // (findings #9/#23): they `Config::load` before opening the state DB,
+        // so the file must exist and parse. Write a valid two-export config
+        // (orders + transactions — the names the show/reset tests use) so the
+        // tests exercise the post-validation display/reset path, not the
+        // config-not-found bail.
         let config_path = dir.path().join("rivet.yaml").to_str().unwrap().to_string();
+        write_two_export_config(&config_path);
         (dir, config_path)
     }
 
@@ -750,6 +820,64 @@ exports:
         let (dir, config_path) = setup_dir();
         let _ = open_state(&dir);
         assert!(reset_chunk_checkpoint(&config_path, "orders").is_ok());
+    }
+
+    // #21 (0.9.x audit): `state reset-chunks -e <typo>` used to "Removed 0 …"
+    // rc=0 with no export-name guardrail. Parity with `reset_state`: an unknown
+    // name must bail with a hint that names the export and lists the declared
+    // ones so the operator can spot the typo.
+    #[test]
+    fn reset_chunk_checkpoint_unknown_export_bails_with_hint() {
+        let (_dir, config_path) = setup_dir(); // declares orders + transactions
+        let err = reset_chunk_checkpoint(&config_path, "ghost").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("export 'ghost' not found"),
+            "must name the missing export: {msg}"
+        );
+        assert!(
+            msg.contains("orders") && msg.contains("transactions"),
+            "must list the declared exports so the user can spot the typo: {msg}"
+        );
+    }
+
+    // #9/#23 (0.9.x audit): inspect/reset commands used --config ONLY to locate
+    // the state DB next to it, never parsing it — so a nonexistent path opened a
+    // fresh empty DB and exited 0 with "No … recorded yet" (and littered a
+    // .rivet_state.db). They must bail naming the bad path instead.
+    #[test]
+    fn inspect_commands_bail_on_nonexistent_config() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir
+            .path()
+            .join("does_not_exist.yaml")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        for res in [
+            show_state(&missing),
+            show_files(&missing, None, 10),
+            show_metrics(&missing, None, 10),
+            show_progression(&missing, None),
+            show_journal(&missing, "orders", 5, None),
+            show_chunk_checkpoint(&missing, "orders"),
+            reset_state(&missing, "orders"),
+            reset_chunk_checkpoint(&missing, "orders"),
+        ] {
+            let err = res.expect_err("nonexistent config must error, not exit Ok");
+            assert!(
+                format!("{err:#}").contains("does_not_exist.yaml"),
+                "error must name the missing config path: {err:#}"
+            );
+        }
+
+        // And the read-only inspect must NOT materialize a state DB beside the
+        // phantom config (validation happens before StateStore::open).
+        assert!(
+            !dir.path().join(".rivet_state.db").exists(),
+            "a bad-config inspect must not leak a fresh .rivet_state.db"
+        );
     }
 
     #[test]

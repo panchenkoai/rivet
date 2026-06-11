@@ -231,8 +231,7 @@ impl StateStore {
                 Ok(res)
             }
             StateRef::Postgres(url) => {
-                let mut client = postgres::Client::connect(url, postgres::NoTls)
-                    .map_err(|e| anyhow::anyhow!("state(pg): connect for claim: {:#}", e))?;
+                let mut client = super::connect_pg(url)?;
                 let now = chrono::Utc::now().to_rfc3339();
                 // FOR UPDATE SKIP LOCKED ensures concurrent workers each get a distinct task.
                 let rows = client
@@ -321,8 +320,7 @@ impl StateStore {
                 conn.execute(sql, rusqlite::params![err, now, run_id, chunk_index])?;
             }
             StateRef::Postgres(url) => {
-                let mut client = postgres::Client::connect(url, postgres::NoTls)
-                    .map_err(|e| anyhow::anyhow!("state(pg): connect for fail: {:#}", e))?;
+                let mut client = super::connect_pg(url)?;
                 client.execute(&pg_sql(sql), &[&err, &now, &run_id, &chunk_index])?;
             }
         }
@@ -349,8 +347,7 @@ impl StateStore {
                 )?;
             }
             StateRef::Postgres(url) => {
-                let mut client = postgres::Client::connect(url, postgres::NoTls)
-                    .map_err(|e| anyhow::anyhow!("state(pg): connect for complete: {:#}", e))?;
+                let mut client = super::connect_pg(url)?;
                 client.execute(
                     &pg_sql(sql),
                     &[&rows_written, &file_name, &now, &run_id, &chunk_index],

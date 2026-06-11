@@ -17,6 +17,7 @@
 //! | PA6 | Fingerprint Stability          | logged at apply time (advisory)          |
 //! | PA7 | State Writes Unchanged         | ADR-0001 invariants apply unchanged      |
 //! | PA8 | Diagnostics Are Advisory       | verdict not enforced at apply time       |
+//! | PA10| Resolved-Plan Integrity        | [`PlanArtifact::verify_integrity`] (#16) |
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,19 @@ pub struct PlanArtifact {
     pub strategy: String,
     /// Deterministic fingerprint of the chunked plan inputs (empty for non-chunked).
     pub plan_fingerprint: String,
+    /// Tamper-evidence seal over [`Self::resolved_plan`] (ADR-0005 PA10, finding
+    /// #16).  Computed at `rivet plan` time over the canonical JSON of the
+    /// *redacted* resolved plan and re-verified by `rivet apply` before any
+    /// query runs — editing `base_query` (or any other execution-affecting
+    /// field) after planning makes apply reject the artifact rather than export
+    /// the wrong thing under the planned export name.
+    ///
+    /// Format mirrors the crate's other content seals: `"xxh3:<16 hex>"`.
+    /// `#[serde(default)]` keeps pre-PA10 artifacts (empty string) readable;
+    /// [`Self::verify_integrity`] treats an unsealed artifact as legacy and
+    /// warns rather than failing closed (back-compat, never a silent pass).
+    #[serde(default)]
+    pub integrity: String,
     /// The fully-resolved execution plan embedded verbatim.
     pub resolved_plan: ResolvedRunPlan,
     /// Data computed at plan time that can be replayed at apply time.
@@ -135,6 +149,14 @@ impl PlanArtifact {
             );
         }
 
+        // PA10 (#16): seal the *redacted* resolved plan so apply can detect a
+        // post-plan edit.  Computed here, after redaction, so the seal matches
+        // exactly what gets serialized to disk.  `config_path` (set by the
+        // caller after construction) is intentionally outside the seal — it is
+        // an apply-time state-location hint, not part of the execution
+        // contract, and the operator may legitimately relocate the plan file.
+        let integrity = resolved_plan_integrity(&resolved_plan);
+
         let created_at = Utc::now();
         Self {
             rivet_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -144,12 +166,49 @@ impl PlanArtifact {
             export_name,
             strategy,
             plan_fingerprint,
+            integrity,
             resolved_plan,
             computed,
             diagnostics,
             prioritization: None,
             config_path: None,
         }
+    }
+
+    /// Verify the resolved-plan integrity seal (ADR-0005 PA10, finding #16).
+    ///
+    /// Recomputes the canonical hash of [`Self::resolved_plan`] and compares it
+    /// to the [`Self::integrity`] seal recorded at plan time.  On mismatch,
+    /// returns an error so `rivet apply` exits non-zero rather than running a
+    /// tampered query under the planned export name.
+    ///
+    /// Back-compat: a pre-PA10 artifact has an empty seal (the `#[serde(default)]`
+    /// fallback).  Such an artifact cannot be integrity-checked, so we log a
+    /// WARN and accept it — failing closed would break apply on every plan file
+    /// generated before this field existed.  This is explicit, not a silent
+    /// pass: the operator is told the artifact predates tamper-evidence.
+    pub fn verify_integrity(&self) -> Result<()> {
+        if self.integrity.is_empty() {
+            log::warn!(
+                "plan '{}': artifact predates integrity sealing (no `integrity` field); \
+                 cannot verify it was not modified after planning. Re-run `rivet plan` to \
+                 produce a tamper-evident artifact.",
+                self.export_name,
+            );
+            return Ok(());
+        }
+        let actual = resolved_plan_integrity(&self.resolved_plan);
+        if actual != self.integrity {
+            anyhow::bail!(
+                "plan artifact integrity check failed: resolved_plan was modified after planning \
+                 (export '{}', sealed {}, recomputed {}). \
+                 Do not hand-edit plan files — re-run `rivet plan` to regenerate.",
+                self.export_name,
+                self.integrity,
+                actual,
+            );
+        }
+        Ok(())
     }
 
     /// Serialize to pretty-printed JSON.
@@ -367,6 +426,80 @@ impl PlanArtifact {
             }
         }
         println!();
+    }
+}
+
+/// Compute the tamper-evidence seal over a resolved plan (ADR-0005 PA10, #16).
+///
+/// The seal is an `xxh3` digest (matching the crate's other content seals in
+/// `manifest.rs` / `commit.rs`, format `"xxh3:<16 hex>"`) over a **canonical**
+/// JSON encoding of the plan.  Canonicalisation matters because the plan embeds
+/// process-randomized maps — `column_overrides: HashMap<String, RivetType>` and
+/// `quality.null_ratio_max: HashMap<String, f64>` — whose iteration order is
+/// **not** stable across processes (std `HashMap` uses a per-process random
+/// seed).  The seal is written by one process (`rivet plan`) and re-verified by
+/// another (`rivet apply`), so the bytes hashed must not depend on map ordering.
+///
+/// We **cannot** rely on `serde_json::Value` to sort keys for us: this crate
+/// pulls `serde_json/preserve_order` transitively (via `schemars`'s
+/// `preserve_order` feature → `serde_json/preserve_order`), so `Value::Object`
+/// is an *insertion-ordered* `IndexMap`, not a key-sorted `BTreeMap`.  Without
+/// an explicit sort, a plan with ≥2 column overrides would hash differently on
+/// the apply host and a legitimate, untouched artifact would be wrongly rejected.
+/// Instead we serialize to a `Value` and recursively sort every object's keys
+/// (`canonicalize_value`) before encoding — order-independent by construction,
+/// mirroring the crate's own `schema_fingerprint` (which sorts columns by name).
+///
+/// On the (practically impossible) event that the plan fails to serialize, the
+/// seal degrades to a sentinel that will never match a real seal — apply then
+/// rejects the artifact rather than silently skipping the check.
+fn resolved_plan_integrity(plan: &ResolvedRunPlan) -> String {
+    use xxhash_rust::xxh3::xxh3_64;
+    let encoded = serde_json::to_value(plan).and_then(|mut v| {
+        canonicalize_value(&mut v);
+        serde_json::to_vec(&v)
+    });
+    match encoded {
+        Ok(bytes) => format!("xxh3:{:016x}", xxh3_64(&bytes)),
+        Err(e) => {
+            log::error!(
+                "plan integrity seal: failed to canonicalize resolved_plan ({e}); \
+                 emitting a non-matching seal so apply rejects this artifact"
+            );
+            "xxh3:unserializable".to_string()
+        }
+    }
+}
+
+/// Recursively rewrite every JSON object in `value` into key-sorted order so the
+/// serialized byte stream is independent of map iteration order.  Required
+/// because `serde_json/preserve_order` is active crate-wide (see
+/// [`resolved_plan_integrity`]); without it a `serde_json::Value::Object` keeps
+/// the (process-randomized) `HashMap` insertion order and the seal would not be
+/// reproducible across the plan/apply process boundary.
+fn canonicalize_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            // Reinsert entries in sorted-key order. `serde_json::Map` is an
+            // `IndexMap` under `preserve_order`, so iteration order == insertion
+            // order; draining into a sorted `Vec` and reinserting fixes it.
+            let mut entries: Vec<(String, serde_json::Value)> =
+                map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            map.clear();
+            for (k, mut v) in entries {
+                canonicalize_value(&mut v);
+                map.insert(k, v);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            // Arrays are positional (e.g. chunk_ranges, warnings) — order is
+            // semantically meaningful, so only recurse, never reorder.
+            for item in items {
+                canonicalize_value(item);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -665,5 +798,135 @@ mod tests {
             "password must not remain in URL: {url}"
         );
         assert!(url.contains("REDACTED@db.example.com/prod"));
+    }
+
+    // ─── ADR-0005 PA10 — resolved-plan integrity seal (finding #16) ──────
+
+    #[test]
+    fn integrity_seal_accepts_untouched_artifact() {
+        // A plan straight out of `PlanArtifact::new` must verify cleanly — the
+        // seal is computed over exactly the bytes that get serialized.
+        let artifact = minimal_artifact();
+        assert!(
+            !artifact.integrity.is_empty(),
+            "new artifact must be sealed"
+        );
+        artifact
+            .verify_integrity()
+            .expect("untouched artifact must pass integrity check");
+
+        // Round-tripping through JSON (the real plan/apply boundary) must not
+        // disturb the seal.
+        let json = artifact.to_json_pretty().unwrap();
+        let restored = PlanArtifact::from_json(&json).unwrap();
+        restored
+            .verify_integrity()
+            .expect("round-tripped artifact must still verify");
+    }
+
+    #[test]
+    fn integrity_seal_rejects_tampered_base_query() {
+        // Mirror the live RED test (audit_apply_rejects_tampered_plan) at the
+        // unit level: edit base_query after planning → verify_integrity must
+        // fail with the documented message so apply exits non-zero.
+        let mut artifact = minimal_artifact();
+        artifact.resolved_plan.base_query = "SELECT * FROM users".into();
+        let err = artifact.verify_integrity().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("integrity check failed") && msg.contains("modified after planning"),
+            "tamper must be reported with the PA10 message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn integrity_seal_rejects_tamper_in_any_execution_field() {
+        // Not just base_query — any execution-affecting edit must be caught.
+        let mut artifact = minimal_artifact();
+        artifact.resolved_plan.destination.path = Some("/etc/evil".into());
+        assert!(
+            artifact.verify_integrity().is_err(),
+            "editing the destination path must be detected as tampering"
+        );
+    }
+
+    #[test]
+    fn integrity_seal_legacy_empty_is_accepted_with_warning() {
+        // Back-compat: a pre-PA10 artifact has an empty seal. It cannot be
+        // checked, but failing closed would break apply on every older plan
+        // file — so it is accepted (the WARN is emitted, see verify_integrity).
+        let mut artifact = minimal_artifact();
+        artifact.integrity = String::new();
+        artifact
+            .verify_integrity()
+            .expect("unsealed (legacy) artifact must be accepted, not failed closed");
+    }
+
+    #[test]
+    fn integrity_seal_distinguishes_a_real_override_change() {
+        // The seal must change when column_overrides genuinely change — a single
+        // entry is order-free, so this is robust regardless of HashMap seeding.
+        let mut plan_a = minimal_plan();
+        plan_a.column_overrides = [("alpha".to_string(), crate::types::RivetType::String)]
+            .into_iter()
+            .collect();
+        let mut plan_b = minimal_plan();
+        plan_b.column_overrides = [("alpha".to_string(), crate::types::RivetType::Int64)]
+            .into_iter()
+            .collect();
+        assert_ne!(
+            resolved_plan_integrity(&plan_a),
+            resolved_plan_integrity(&plan_b),
+            "a real override type change must change the seal"
+        );
+    }
+
+    #[test]
+    fn canonicalize_makes_seal_independent_of_object_key_order() {
+        // Regression for the canonicalization bug. The seal is written by `rivet
+        // plan` and re-verified by `rivet apply` in a *different* process; the
+        // plan embeds std `HashMap`s (`column_overrides`, `quality.null_ratio_max`)
+        // whose iteration order is randomized per process. With
+        // `serde_json/preserve_order` active crate-wide, `serde_json::to_value`
+        // keeps that randomized order, so without canonicalization the recomputed
+        // seal would not match across the process boundary.
+        //
+        // We exercise the mechanism deterministically (not at the mercy of the
+        // per-process HashMap seed): build two JSON objects with the SAME entries
+        // in DIFFERENT insertion order and assert the canonicalized bytes — and
+        // therefore the hash — are identical. This is precisely what differs
+        // between the plan and apply processes for a multi-key override map.
+        let mut a = serde_json::json!({});
+        let mut b = serde_json::json!({});
+        if let (serde_json::Value::Object(ma), serde_json::Value::Object(mb)) = (&mut a, &mut b) {
+            for k in ["zeta", "alpha", "mu"] {
+                ma.insert(k.to_string(), serde_json::json!(k));
+            }
+            for k in ["mu", "zeta", "alpha"] {
+                mb.insert(k.to_string(), serde_json::json!(k));
+            }
+        }
+        // After canonicalization the byte encodings must be identical
+        // regardless of insertion order — that equality is the contract.
+        canonicalize_value(&mut a);
+        canonicalize_value(&mut b);
+        assert_eq!(
+            serde_json::to_vec(&a).unwrap(),
+            serde_json::to_vec(&b).unwrap(),
+            "canonicalized bytes must not depend on object key insertion order"
+        );
+    }
+
+    #[test]
+    fn canonicalize_value_sorts_nested_keys_preserves_arrays() {
+        // Direct check of the canonicalizer: object keys sorted recursively,
+        // array element order untouched.
+        let mut v = serde_json::json!({
+            "b": 1,
+            "a": { "y": [3, 2, 1], "x": 0 },
+        });
+        canonicalize_value(&mut v);
+        let s = serde_json::to_string(&v).unwrap();
+        assert_eq!(s, r#"{"a":{"x":0,"y":[3,2,1]},"b":1}"#);
     }
 }

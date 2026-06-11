@@ -303,23 +303,41 @@ fn pg_checkpoint_pressure(url: &str) -> anyhow::Result<String> {
     Ok(format!("pg_stat_bgwriter\n\n{}", pg_rows_to_table(&rows)))
 }
 
+/// SQL for `pg_table_stats`. The schema value only selects the variant — the
+/// caller binds it as `$1`, so client-supplied input never lands in the SQL
+/// text (the tool's read-only promise depends on this).
+fn pg_table_stats_sql(schema: Option<&str>) -> &'static str {
+    match schema {
+        Some(_) => {
+            "SELECT schemaname, relname AS tablename, n_live_tup, n_dead_tup,
+                    (n_dead_tup * 100 / NULLIF(n_live_tup + n_dead_tup, 0)) AS dead_pct,
+                    COALESCE(to_char(last_vacuum, 'YYYY-MM-DD HH24:MI'), '-') AS last_vacuum,
+                    COALESCE(to_char(last_analyze, 'YYYY-MM-DD HH24:MI'), '-') AS last_analyze
+             FROM pg_stat_user_tables
+             WHERE schemaname = $1::text
+             ORDER BY n_live_tup DESC
+             LIMIT 20"
+        }
+        None => {
+            "SELECT schemaname, relname AS tablename, n_live_tup, n_dead_tup,
+                    (n_dead_tup * 100 / NULLIF(n_live_tup + n_dead_tup, 0)) AS dead_pct,
+                    COALESCE(to_char(last_vacuum, 'YYYY-MM-DD HH24:MI'), '-') AS last_vacuum,
+                    COALESCE(to_char(last_analyze, 'YYYY-MM-DD HH24:MI'), '-') AS last_analyze
+             FROM pg_stat_user_tables
+             WHERE schemaname NOT IN ('pg_catalog','information_schema','pg_toast')
+             ORDER BY n_live_tup DESC
+             LIMIT 20"
+        }
+    }
+}
+
 fn pg_table_stats(url: &str, schema: Option<&str>) -> anyhow::Result<String> {
     let mut client = pg_connect(url)?;
-    let schema_filter = match schema {
-        Some(s) => format!("AND schemaname = '{s}'"),
-        None => "AND schemaname NOT IN ('pg_catalog','information_schema','pg_toast')".into(),
+    let sql = pg_table_stats_sql(schema);
+    let rows = match schema {
+        Some(s) => client.query(sql, &[&s])?,
+        None => client.query(sql, &[])?,
     };
-    let sql = format!(
-        "SELECT schemaname, relname AS tablename, n_live_tup, n_dead_tup,
-                (n_dead_tup * 100 / NULLIF(n_live_tup + n_dead_tup, 0)) AS dead_pct,
-                COALESCE(to_char(last_vacuum, 'YYYY-MM-DD HH24:MI'), '-') AS last_vacuum,
-                COALESCE(to_char(last_analyze, 'YYYY-MM-DD HH24:MI'), '-') AS last_analyze
-         FROM pg_stat_user_tables
-         WHERE TRUE {schema_filter}
-         ORDER BY n_live_tup DESC
-         LIMIT 20"
-    );
-    let rows = client.query(&sql, &[])?;
     Ok(format!(
         "Table stats (top 20)\n\n{}",
         pg_rows_to_table(&rows)
@@ -469,24 +487,40 @@ fn mysql_key_metrics(url: &str) -> anyhow::Result<String> {
     ))
 }
 
+/// SQL for `mysql_table_stats`. The schema value only selects the variant —
+/// the caller binds it as `?`, so client-supplied input never lands in the
+/// SQL text (the tool's read-only promise depends on this).
+fn mysql_table_stats_sql(schema: Option<&str>) -> &'static str {
+    match schema {
+        Some(_) => {
+            "SELECT table_schema, table_name, table_rows, \
+                    data_length, index_length, engine \
+             FROM information_schema.TABLES \
+             WHERE table_type = 'BASE TABLE' AND table_schema = ? \
+             ORDER BY table_rows DESC \
+             LIMIT 20"
+        }
+        None => {
+            "SELECT table_schema, table_name, table_rows, \
+                    data_length, index_length, engine \
+             FROM information_schema.TABLES \
+             WHERE table_type = 'BASE TABLE' \
+               AND table_schema NOT IN ('information_schema','performance_schema','mysql','sys') \
+             ORDER BY table_rows DESC \
+             LIMIT 20"
+        }
+    }
+}
+
 fn mysql_table_stats(url: &str, schema: Option<&str>) -> anyhow::Result<String> {
     use mysql::prelude::*;
     let pool = mysql_pool(url)?;
     let mut conn = pool.get_conn()?;
-    let schema_filter = match schema {
-        Some(s) => format!("AND table_schema = '{s}'"),
-        None => "AND table_schema NOT IN ('information_schema','performance_schema','mysql','sys')"
-            .into(),
+    let sql = mysql_table_stats_sql(schema);
+    let mut result = match schema {
+        Some(s) => conn.exec_iter(sql, (s,))?,
+        None => conn.exec_iter(sql, ())?,
     };
-    let sql = format!(
-        "SELECT table_schema, table_name, table_rows, \
-                data_length, index_length, engine \
-         FROM information_schema.TABLES \
-         WHERE table_type = 'BASE TABLE' {schema_filter} \
-         ORDER BY table_rows DESC \
-         LIMIT 20"
-    );
-    let mut result = conn.exec_iter(&sql, ())?;
     let cols: Vec<String> = result
         .columns()
         .as_ref()
@@ -600,6 +634,56 @@ mod tests {
         let out = ascii_table(&headers, &[]);
         // No body line — header + separator only.
         assert_eq!(out, "col_a | col_b\n------+------");
+    }
+
+    // Hostile `schema` values an MCP client (an LLM) could supply. Both stay
+    // inside a single SELECT, so single-statement defaults do not block them —
+    // only bind parameters do.
+    const HOSTILE_PG: &str = "x' UNION SELECT usename, passwd, 0, 0, 0, '-', '-' FROM pg_shadow --";
+    const HOSTILE_MYSQL: &str =
+        "x' UNION SELECT user, authentication_string, 0, 0, 0, 'x' FROM mysql.user -- ";
+
+    #[test]
+    fn pg_table_stats_sql_binds_schema_instead_of_interpolating() {
+        let sql = pg_table_stats_sql(Some(HOSTILE_PG));
+        assert!(
+            sql.contains("schemaname = $1"),
+            "schema filter must use a bind placeholder, got: {sql}"
+        );
+        assert!(
+            !sql.contains(HOSTILE_PG) && !sql.contains("UNION"),
+            "client input must never land in the SQL text, got: {sql}"
+        );
+        // The SQL text is identical regardless of the schema value.
+        assert_eq!(sql, pg_table_stats_sql(Some("public")));
+    }
+
+    #[test]
+    fn pg_table_stats_sql_no_schema_is_static_with_no_placeholder() {
+        let sql = pg_table_stats_sql(None);
+        assert!(sql.contains("schemaname NOT IN"));
+        assert!(!sql.contains("$1"), "fallback takes no bind params: {sql}");
+    }
+
+    #[test]
+    fn mysql_table_stats_sql_binds_schema_instead_of_interpolating() {
+        let sql = mysql_table_stats_sql(Some(HOSTILE_MYSQL));
+        assert!(
+            sql.contains("table_schema = ?"),
+            "schema filter must use a bind placeholder, got: {sql}"
+        );
+        assert!(
+            !sql.contains(HOSTILE_MYSQL) && !sql.contains("UNION"),
+            "client input must never land in the SQL text, got: {sql}"
+        );
+        assert_eq!(sql, mysql_table_stats_sql(Some("appdb")));
+    }
+
+    #[test]
+    fn mysql_table_stats_sql_no_schema_is_static_with_no_placeholder() {
+        let sql = mysql_table_stats_sql(None);
+        assert!(sql.contains("table_schema NOT IN"));
+        assert!(!sql.contains('?'), "fallback takes no bind params: {sql}");
     }
 
     #[test]

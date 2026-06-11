@@ -22,6 +22,21 @@ impl FormatType {
     }
 }
 
+/// Whether `format` actually encodes `compression` on write.
+///
+/// Only Parquet has a compression encoder (see [`crate::format::parquet`]); the
+/// CSV writer ([`crate::format::csv`]) ignores the codec entirely. Accepting a
+/// non-`None` codec for CSV would be a silent no-op — the file stays
+/// uncompressed while the run manifest records the codec — so config validation
+/// rejects that combination up-front (Finding #10). `None` is always supported
+/// (it means "do not compress").
+pub fn compression_supported(format: FormatType, compression: CompressionType) -> bool {
+    match format {
+        FormatType::Parquet => true,
+        FormatType::Csv => matches!(compression, CompressionType::None),
+    }
+}
+
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CompressionType {
@@ -42,6 +57,23 @@ impl CompressionType {
             CompressionType::Gzip => "gzip",
             CompressionType::Lz4 => "lz4",
             CompressionType::None => "none",
+        }
+    }
+
+    /// Parse a [`label`](Self::label)-shaped string back to a codec.
+    ///
+    /// Used by config validation to evaluate an *explicitly-written* codec
+    /// against [`compression_supported`] without re-deriving the serde mapping.
+    /// Returns `None` for any unrecognised string (serde rejects those during
+    /// the real parse anyway).
+    pub fn from_label(s: &str) -> Option<Self> {
+        match s {
+            "zstd" => Some(CompressionType::Zstd),
+            "snappy" => Some(CompressionType::Snappy),
+            "gzip" => Some(CompressionType::Gzip),
+            "lz4" => Some(CompressionType::Lz4),
+            "none" => Some(CompressionType::None),
+            _ => None,
         }
     }
 }

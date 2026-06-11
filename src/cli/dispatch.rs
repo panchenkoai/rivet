@@ -191,9 +191,15 @@ fn dispatch_check(
 ) -> Result<()> {
     let p = parse_params(&params);
     let p = if p.is_empty() { None } else { Some(p) };
-    let tgt = target
-        .as_deref()
-        .and_then(crate::types::target::ExportTarget::parse);
+    // A declared `--target` that doesn't parse is a loud error — never silently
+    // dropped to `None` (which would give false target-compat assurance). This
+    // mirrors the config-level `target:` validation in `preflight/mod.rs`.
+    let tgt = match target.as_deref() {
+        Some(s) => Some(crate::types::target::ExportTarget::parse(s).ok_or_else(|| {
+            anyhow::anyhow!("unknown target '{s}' (expected: bigquery, duckdb, snowflake)")
+        })?),
+        None => None,
+    };
     preflight::check(
         &config,
         export.as_deref(),

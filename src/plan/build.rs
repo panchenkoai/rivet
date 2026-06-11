@@ -147,7 +147,10 @@ pub fn build_plan(
 ///    below the resolved `chunk_size`, downgrade `Chunked → Snapshot` since
 ///    a single chunk would offer no benefit and adds ~10 ms of plumbing
 ///    overhead per export. The downgrade is informational (log::info!) and
-///    safe (a `Snapshot` writes one file like `mode: full`).
+///    safe (a `Snapshot` writes one file like `mode: full`). Skipped when an
+///    explicit chunk-shape knob (`chunk_count`, `chunk_by_days`,
+///    `chunk_checkpoint`, `chunk_by_key`) is set — explicit user intent wins
+///    over the heuristic.
 ///
 /// Steps 1–3 each only fire on PG with `table:` shortcut; everything else
 /// falls back to the original "explicit column required" path.
@@ -313,7 +316,21 @@ fn resolve_chunked_strategy(
     // plumbing latency. Downgrade to Snapshot (bounded + simplest). Only fires
     // when reltuples is a meaningful positive number — un-analyzed tables
     // (reltuples=0) keep the chunked/keyset plan to preserve existing semantics.
-    if introspection.row_estimate > 0 && (introspection.row_estimate as usize) <= chunk_size {
+    //
+    // Explicit chunk knobs win over the heuristic: `chunk_count` recomputes
+    // chunk_size at detect time from min/max (so comparing the estimate
+    // against the static default chunk_size is meaningless), `chunk_by_days`
+    // asks for date-ranged chunks, `chunk_checkpoint` asks for resumability a
+    // Snapshot cannot provide, and `chunk_by_key` pins keyset pagination.
+    // None of these may be silently collapsed to one snapshot file.
+    let explicit_chunk_shape = export.chunk_count.is_some()
+        || export.chunk_by_days.is_some()
+        || export.chunk_checkpoint
+        || export.chunk_by_key.is_some();
+    if !explicit_chunk_shape
+        && introspection.row_estimate > 0
+        && (introspection.row_estimate as usize) <= chunk_size
+    {
         log::info!(
             "export '{}': {} has ~{} rows ≤ chunk_size {}; downgrading chunked → snapshot",
             export.name,
@@ -381,6 +398,14 @@ fn resolve_chunked_strategy(
                 // page it with keyset instead of refusing (OPT-4). PG keeps
                 // refusing — its `DECLARE CURSOR` snapshot is already bounded, so
                 // `mode: full` is the safe answer there.
+                //
+                // ADR-0020 (Layer 1, deferred) deliberately keeps this
+                // MySQL-only: flipping the guard is a behaviour-changing default
+                // for every existing PG/MSSQL UUID-PK config, and is to be
+                // promoted "after a real operator request, not on the strength
+                // of 'we technically can'." The escape hatch is explicit
+                // `chunk_by_key:` (which works since Layer 2). Do not flip
+                // without re-opening ADR-0020.
                 if config.source.source_type == crate::config::SourceType::Mysql
                     && let Some(key) = introspection.auto_keyset_key()
                 {
