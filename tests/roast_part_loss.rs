@@ -19,7 +19,6 @@ mod common;
 use common::*;
 
 use mysql::prelude::Queryable;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 /// Total physical rows across every `.parquet` part in `dir`, plus the per-file
 /// breakdown. Re-reads the destination files (not rivet's counters).
@@ -27,13 +26,7 @@ fn parquet_data_rows(dir: &std::path::Path) -> (usize, Vec<(std::path::PathBuf, 
     let mut per_file = Vec::new();
     let mut total = 0usize;
     for path in files_with_extension(dir, "parquet") {
-        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let rows: usize = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
-            .unwrap_or_else(|e| panic!("open {}: {e}", path.display()))
-            .build()
-            .unwrap()
-            .map(|b| b.unwrap().num_rows())
-            .sum();
+        let rows = parquet_rows(&path);
         total += rows;
         per_file.push((path, rows));
     }
@@ -121,19 +114,6 @@ exports:
 
 // ─── keyset (keyset.rs) — rotated parts must reach the destination ───────────
 
-/// Drop the MySQL test table on exit even if an assertion fails (the shared
-/// `MysqlTable` guard cannot be constructed outside `common::mysql`).
-struct DropMysqlTable(String);
-impl Drop for DropMysqlTable {
-    fn drop(&mut self) {
-        if let Ok(pool) = mysql::Pool::new(MYSQL_URL)
-            && let Ok(mut c) = pool.get_conn()
-        {
-            let _ = c.query_drop(format!("DROP TABLE IF EXISTS {}", self.0));
-        }
-    }
-}
-
 // ROAST-RED live-part-loss: keyset runner uploads only sink.tmp per page;
 // parts rotated into sink.completed_parts by maybe_split are deleted.
 // Asserts CORRECT behavior; expected to FAIL until the fix lands.
@@ -148,7 +128,7 @@ fn roast_keyset_split_parts_all_rows_reach_destination() {
     // batch, leaving each page's final temp file header-only.
     const N: usize = 1_000;
     let table = unique_name("roast_keyset_split");
-    let _guard = DropMysqlTable(table.clone());
+    let _guard = MysqlTable::adopt(table.clone());
 
     let mut conn = mysql_connect();
     conn.query_drop(format!("DROP TABLE IF EXISTS {table}"))
@@ -227,7 +207,7 @@ fn roast_keyset_split_parts_parquet_all_rows_reach_destination() {
 
     const N: usize = 1_000;
     let table = unique_name("roast_keyset_pq");
-    let _guard = DropMysqlTable(table.clone());
+    let _guard = MysqlTable::adopt(table.clone());
 
     let mut conn = mysql_connect();
     conn.query_drop(format!("DROP TABLE IF EXISTS {table}"))

@@ -22,36 +22,12 @@
 mod common;
 
 use common::*;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 /// Distinct `id` values and physical row count across every Parquet part at the
 /// destination — re-reads the files, NOT rivet's state DB. Lets a recovery test
 /// assert the no-row-loss superset invariant the state-DB assertions cannot see.
 fn parquet_ids_and_rows(dir: &std::path::Path) -> (std::collections::BTreeSet<i64>, i64) {
-    use arrow::array::{Array, AsArray};
-    let mut ids = std::collections::BTreeSet::new();
-    let mut rows = 0i64;
-    for path in files_with_extension(dir, "parquet") {
-        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
-            .unwrap_or_else(|e| panic!("open {}: {e}", path.display()))
-            .build()
-            .unwrap();
-        for batch in reader {
-            let batch = batch.unwrap();
-            rows += batch.num_rows() as i64;
-            let col = batch.column_by_name("id").expect("id column present");
-            let a = col
-                .as_primitive_opt::<arrow::datatypes::Int64Type>()
-                .expect("id column decodes as Int64");
-            for i in 0..a.len() {
-                if !a.is_null(i) {
-                    ids.insert(a.value(i));
-                }
-            }
-        }
-    }
-    (ids, rows)
+    (dir_parquet_id_set(dir), total_parquet_rows(dir) as i64)
 }
 
 /// RAII guard — drops a Postgres table on scope exit.

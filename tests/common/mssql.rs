@@ -71,6 +71,11 @@ impl MssqlTable {
     pub fn name(&self) -> &str {
         &self.name
     }
+
+    /// Wrap an already-created table (custom schema) in the RAII drop guard.
+    pub fn adopt(name: String) -> Self {
+        MssqlTable { name }
+    }
 }
 
 impl Drop for MssqlTable {

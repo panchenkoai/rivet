@@ -25,6 +25,13 @@ impl PgTable {
     pub fn name(&self) -> &str {
         &self.name
     }
+
+    /// Wrap an already-created table (custom schema, seeded by the test itself)
+    /// in the RAII drop guard, so tests that need a non-canonical shape don't
+    /// roll their own `DropPgTable`. The table is dropped on guard drop.
+    pub fn adopt(name: String) -> Self {
+        PgTable { name }
+    }
 }
 
 impl Drop for PgTable {

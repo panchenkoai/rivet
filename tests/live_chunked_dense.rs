@@ -39,8 +39,6 @@ mod common;
 use common::*;
 
 use mysql::prelude::Queryable;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use postgres::{Client as PgClient, NoTls};
 use std::collections::BTreeSet;
 
 const ROWS: i64 = 1_000;
@@ -59,38 +57,11 @@ const GRP_CASE: &str = "CASE WHEN n <= 200 THEN n WHEN n <= 800 THEN 5000 ELSE 5
 
 // ── source-agnostic destination oracle ───────────────────────────────────────
 
-/// Every `id` value across every Parquet part at the destination (with
-/// multiplicity, so duplicates are observable — NOT a set).
-fn read_all_ids(dir: &std::path::Path) -> Vec<i64> {
-    use arrow::array::{Array, AsArray};
-    let mut ids = Vec::new();
-    for path in files_with_extension(dir, "parquet") {
-        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
-            .unwrap_or_else(|e| panic!("open {}: {e}", path.display()))
-            .build()
-            .unwrap();
-        for batch in reader {
-            let batch = batch.unwrap();
-            let col = batch.column_by_name("id").expect("id column present");
-            let a = col
-                .as_primitive_opt::<arrow::datatypes::Int64Type>()
-                .expect("id column decodes as Int64");
-            for i in 0..a.len() {
-                if !a.is_null(i) {
-                    ids.push(a.value(i));
-                }
-            }
-        }
-    }
-    ids
-}
-
 /// Assert the destination holds every seeded id EXACTLY once — re-reading the
 /// Parquet, not rivet's counters. Distinguishes LOSS (missing id) from
 /// DUPLICATION (count > ROWS) so the failure message names the actual fault.
 fn assert_each_id_exactly_once(dir: &std::path::Path, ctx: &str) {
-    let ids = read_all_ids(dir);
+    let ids = dir_parquet_ids(dir);
     let set: BTreeSet<i64> = ids.iter().copied().collect();
     let expected: BTreeSet<i64> = (1..=ROWS).collect();
 
@@ -129,16 +100,7 @@ fn run_dense_assert(yaml: &str, export: &str, out: &std::path::Path, ctx: &str) 
 
 // ── Postgres ─────────────────────────────────────────────────────────────────
 
-struct DropPgTable(String);
-impl Drop for DropPgTable {
-    fn drop(&mut self) {
-        if let Ok(mut c) = PgClient::connect(POSTGRES_URL, NoTls) {
-            let _ = c.execute(&format!("DROP TABLE IF EXISTS {}", self.0), &[]);
-        }
-    }
-}
-
-fn seed_pg_tied() -> (String, DropPgTable) {
+fn seed_pg_tied() -> (String, PgTable) {
     let name = unique_name("rivet_dense_ties");
     let mut c = pg_connect();
     c.batch_execute(&format!(
@@ -150,7 +112,7 @@ fn seed_pg_tied() -> (String, DropPgTable) {
          SELECT n, {GRP_CASE} FROM generate_series(1, {ROWS}) AS n",
     ))
     .expect("seed pg dense-ties rows");
-    (name.clone(), DropPgTable(name))
+    (name.clone(), PgTable::adopt(name))
 }
 
 fn pg_yaml(name: &str, out: &std::path::Path, parallel: usize) -> String {
@@ -203,18 +165,7 @@ fn dense_ties_pg_parallel_no_loss_no_dup() {
 
 // ── MySQL ──────────────────────────────────────────────────────────────────
 
-struct DropMysqlTable(String);
-impl Drop for DropMysqlTable {
-    fn drop(&mut self) {
-        if let Ok(pool) = mysql::Pool::new(MYSQL_URL)
-            && let Ok(mut c) = pool.get_conn()
-        {
-            let _ = c.query_drop(format!("DROP TABLE IF EXISTS {}", self.0));
-        }
-    }
-}
-
-fn seed_mysql_tied() -> (String, DropMysqlTable) {
+fn seed_mysql_tied() -> (String, MysqlTable) {
     let name = unique_name("rivet_dense_ties");
     let mut c = mysql_connect();
     c.query_drop(format!("DROP TABLE IF EXISTS {name}"))
@@ -232,7 +183,7 @@ fn seed_mysql_tied() -> (String, DropMysqlTable) {
          SELECT n, {GRP_CASE} FROM seq",
     ))
     .expect("seed mysql dense-ties rows");
-    (name.clone(), DropMysqlTable(name))
+    (name.clone(), MysqlTable::adopt(name))
 }
 
 fn mysql_yaml(name: &str, out: &std::path::Path, parallel: usize) -> String {
@@ -285,14 +236,7 @@ fn dense_ties_mysql_parallel_no_loss_no_dup() {
 
 // ── SQL Server ───────────────────────────────────────────────────────────────
 
-struct DropMssqlTable(String);
-impl Drop for DropMssqlTable {
-    fn drop(&mut self) {
-        mssql_drop_table(&self.0);
-    }
-}
-
-fn seed_mssql_tied() -> (String, DropMssqlTable) {
+fn seed_mssql_tied() -> (String, MssqlTable) {
     let name = unique_name("rivet_dense_ties");
     mssql_drop_table(&name);
     mssql_exec(&format!(
@@ -302,7 +246,7 @@ fn seed_mssql_tied() -> (String, DropMssqlTable) {
         "WITH seq AS (SELECT CAST(1 AS BIGINT) AS n UNION ALL SELECT n+1 FROM seq WHERE n < {ROWS}) \
          INSERT INTO {name} (id, grp) SELECT n, {GRP_CASE} FROM seq OPTION (MAXRECURSION 0)",
     ));
-    (name.clone(), DropMssqlTable(name))
+    (name.clone(), MssqlTable::adopt(name))
 }
 
 fn mssql_yaml(name: &str, out: &std::path::Path, parallel: usize) -> String {

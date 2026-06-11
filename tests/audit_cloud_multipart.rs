@@ -29,23 +29,12 @@
 mod common;
 use common::*;
 
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
 const N: i64 = 1_000;
-
-struct DropPgTable(String);
-impl Drop for DropPgTable {
-    fn drop(&mut self) {
-        if let Ok(mut c) = postgres::Client::connect(POSTGRES_URL, postgres::NoTls) {
-            let _ = c.execute(&format!("DROP TABLE IF EXISTS {}", self.0), &[]);
-        }
-    }
-}
 
 /// Seed `(id BIGINT PK, payload TEXT)` with N rows of DISTINCT ~1 KB payloads
 /// (`md5(g)` repeated 32× ≈ 1 KB, unique per row) so parquet row groups grow
 /// past the cap instead of dictionary-compressing to nothing.
-fn seed_distinct_payload() -> (String, DropPgTable) {
+fn seed_distinct_payload() -> (String, PgTable) {
     let name = unique_name("rivet_cloud_mp");
     let mut c = pg_connect();
     c.batch_execute(&format!(
@@ -57,17 +46,7 @@ fn seed_distinct_payload() -> (String, DropPgTable) {
          SELECT g, repeat(md5(g::text), 32) FROM generate_series(1, {N}) g"
     ))
     .expect("seed cloud-mp rows");
-    (name.clone(), DropPgTable(name))
-}
-
-/// Parquet row count from an in-memory object body.
-fn parquet_rows_from_bytes(bytes: Vec<u8>) -> usize {
-    ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
-        .expect("parse downloaded parquet object")
-        .build()
-        .unwrap()
-        .map(|b| b.unwrap().num_rows())
-        .sum()
+    (name.clone(), PgTable::adopt(name))
 }
 
 /// The chunked-export config body that forces rotation: chunk_size 500 → 2

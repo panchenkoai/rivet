@@ -20,8 +20,6 @@
 mod common;
 use common::*;
 
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
 const N: i64 = 1_000;
 
 /// A fresh, valid Azure container name per run (lowercase alnum + hyphens, no
@@ -33,18 +31,9 @@ fn unique_container() -> String {
     unique_name("rivetazmp").replace('_', "-").to_lowercase()
 }
 
-struct DropPgTable(String);
-impl Drop for DropPgTable {
-    fn drop(&mut self) {
-        if let Ok(mut c) = postgres::Client::connect(POSTGRES_URL, postgres::NoTls) {
-            let _ = c.execute(&format!("DROP TABLE IF EXISTS {}", self.0), &[]);
-        }
-    }
-}
-
 /// Seed `(id BIGINT PK, payload TEXT)` with DISTINCT ~1 KB payloads so parquet
 /// row groups grow past the cap (identical values dictionary-encode to nothing).
-fn seed_distinct_payload() -> (String, DropPgTable) {
+fn seed_distinct_payload() -> (String, PgTable) {
     let name = unique_name("rivet_azure_mp");
     let mut c = pg_connect();
     c.batch_execute(&format!(
@@ -56,16 +45,7 @@ fn seed_distinct_payload() -> (String, DropPgTable) {
          SELECT g, repeat(md5(g::text), 32) FROM generate_series(1, {N}) g"
     ))
     .expect("seed azure-mp rows");
-    (name.clone(), DropPgTable(name))
-}
-
-fn parquet_rows_from_bytes(bytes: Vec<u8>) -> usize {
-    ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
-        .expect("parse downloaded parquet blob")
-        .build()
-        .unwrap()
-        .map(|b| b.unwrap().num_rows())
-        .sum()
+    (name.clone(), PgTable::adopt(name))
 }
 
 /// Extract blob names from an Azure "List Blobs" XML body: each blob is
