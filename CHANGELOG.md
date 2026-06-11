@@ -1,5 +1,99 @@
 # Changelog
 
+## 0.10.0 (2026-06-11) — machine-actionable exit codes + externally-proven correctness
+
+Adds a stable process-exit-code taxonomy (the headline, contract-affecting
+change), hardens a pre-allocation OOM vector, labels SQL Server **beta** with an
+honest CVE disclosure, and lands a trust program that proves data correctness
+with an **independent reader** (DuckDB) — including after a crash — rather than
+trusting rivet's own counters. A data-correctness audit (10 adversarially-verified
+candidates) found **zero live data-loss bugs**; the work below mostly *locks* that
+result against future regressions.
+
+### ⚠️ Behaviour change (why this is a MINOR bump)
+
+- **`feat(error)` — process exit codes now encode the failure class.** A failed
+  run used to exit `1` for everything. Now an unattended scheduler can branch on
+  the code without grepping stderr:
+  - `1` generic / config / usage
+  - `2` retryable — transient (connection reset, lock-wait/timeout, S3 5xx); safe
+    to re-run the same command
+  - `3` data-integrity — quality gate, **reconcile mismatch**, **`validate`
+    verification failure**, duplicate-guard, manifest inconsistency; **STOP**, do
+    not blindly retry
+  - `4` schema-drift — `on_schema_drift: fail` tripped; needs human review
+
+  `--json-errors` gains an `"exit_class"` field. Classification is **type-driven**
+  (typed markers downcast through the anyhow chain), not string-matched: a reworded
+  message can never silently flip the code. **A script that asserted "failure ==
+  exit 1" must be updated.** (Note: clap's own usage-error exit `2` overlaps
+  numerically with Retryable but is distinguishable — clap exits pre-dispatch with
+  no `Error:` line.)
+
+### Added
+
+- **`feat(correctness)` — `dev/correctness/verify_export.py`.** Prove an export is
+  faithful *on your own data*, independent of rivet's bookkeeping: it compares a
+  content fingerprint of the source query against the exported Parquet, both
+  computed by DuckDB (source via its Postgres/MySQL scanner). Exit `0`=PASS /
+  `1`=FAIL, so it drops into `rivet run && verify_export && deploy`. Single dep
+  (`pip install duckdb`). Recipe: `docs/recipes/verify-your-export.md`.
+- **`test` — Azure Blob (Azurite) live-test infrastructure** (`azurite` service in
+  `docker-compose.yaml`, `LiveService::Azurite`, container-provisioning helper).
+
+### Security / hardening
+
+- **`feat(source)` — per-value byte ceiling enforced *before* Arrow allocation.**
+  An oversized cell was previously only rejected after materialization (the Arrow
+  buffer was already reserved/filled); a single hostile/corrupt huge value could
+  OOM the builder first. Now `value_within_ceiling` bails with `RIVET_VALUE_TOO_LARGE`
+  (naming the column) before allocation, in every engine. Defense-in-depth with the
+  existing post-materialization sink guard.
+- **`docs` — SQL Server marked Beta + procurement advisory.** `tiberius` 0.12 pins
+  `rustls` 0.21 → `rustls-webpki` 0.101 (RUSTSEC-2026-0098/0099/0104). No newer
+  `tiberius` exists. The path is reachable **only** under `tls.mode: verify-ca|
+  verify-full` against a name-constraint-asserting private CA on MSSQL; strict
+  validation emits a one-time WARN; advisories are documented + suppressed in
+  `.cargo/audit.toml`. Security-sensitive deployments should pin to PG/MySQL.
+
+### Fixed
+
+- **`fix(error)` — reconcile mismatch + `validate` verification failure now
+  classify as data-integrity (exit 3).** They previously bailed with bare strings
+  and exited `1`, contradicting the documented exit-code table. ("Could not verify"
+  — reconcile `unknown` partitions, validate operational read errors — stays
+  generic, not 3.)
+
+### Trust program (correctness, externally verified)
+
+- **`test(differential)` — independent-reader correctness at scale.** DuckDB
+  fingerprints the exported Parquet and must agree with the source DB field-for-
+  field (count, sums, distinct), neither side reading rivet's counters. Covers the
+  multi-part chunked write path (20k rows → 5 files), **and a post-crash variant**:
+  crash → resume → DuckDB's exactly-once (deduped) view still equals the source.
+- **`test(crash-soak)` — no fault point loses a row.** Sweeps the crash matrix; after
+  `--resume`, the destination (re-read independently) holds every source id at least
+  once, at-least-once being the only allowed surplus.
+- **`test` — closed the systemic self-oracle blind spot (31 tests).** The
+  recovery/resume/chunked/cli/plan completeness suites trusted rivet's own
+  `file_log`/summary/file-count counters; **every completeness test now re-reads the
+  destination row content** — across PostgreSQL, MySQL, and SQL Server. A regression
+  that drops/duplicates rows while keeping rivet's counters self-consistent (the
+  shape of the original rotated-part loss) can no longer ship green.
+- **`docs` — documented the dense-chunking tied-column ordering hazard.** `chunk_dense`
+  on a non-unique, concurrently-written `chunk_column` could in principle map an
+  ordinal to a different physical row across independent per-chunk queries. Proven
+  not to occur on a static table on any tested engine; documented in
+  `semantics.md` + `modes/chunked.md` next to the analogous incremental-cursor-tie,
+  guarded by `tests/live_chunked_dense.rs`.
+
+### Internal
+
+- **`refactor` — de-duplicated the per-value ceiling** (one `SourceTuning::max_value_bytes()`
+  + one shared `source::value_within_ceiling`, was copy-pasted across the sink and
+  three engines) and the **test Parquet read-back boilerplate** (shared
+  `tests/common/parquet.rs` primitives + `XTable::adopt` guards).
+
 ## 0.9.5 (2026-06-09) — hot-path perf + benchmark-driven strategy corrections
 
 Squeezes the row→Arrow→Parquet decode path and turns a three-engine A/B
