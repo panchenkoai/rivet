@@ -290,7 +290,7 @@ jobs:
         # profile and is required by the new MySQL `mysql_proxysql_*` tests in
         # tests/live_pool_safety.rs (added in 0.6.0); without it
         # `require_alive(LiveService::ProxySql)` panics before the test runs.
-        run: docker compose --profile pool up -d postgres mysql mssql minio fake-gcs toxiproxy pgbouncer proxysql
+        run: docker compose --profile pool up -d postgres mysql mssql minio fake-gcs azurite toxiproxy pgbouncer proxysql
 
       - name: Wait for services
         run: |
@@ -304,6 +304,10 @@ jobs:
           # 6033 is the client-facing MySQL protocol port; 6032 admin comes
           # up first but we wait for 6033 so backend wiring is in place.
           for i in $(seq 1 30); do (exec 3<>/dev/tcp/127.0.0.1/6033) 2>/dev/null && break || sleep 1; done
+          echo "Waiting for Azurite..."
+          # Blob emulator on :10000 — the live_azure_multipart suite lists/reads
+          # blobs over HTTP and creates its container via the (preinstalled) az CLI.
+          for i in $(seq 1 30); do (exec 3<>/dev/tcp/127.0.0.1/10000) 2>/dev/null && break || sleep 1; done
           echo "Waiting for SQL Server..."
           # mssql has a sqlcmd SELECT-1 healthcheck (start_period 30s); wait on it
           # so the live_mssql_* suites can connect + seed.

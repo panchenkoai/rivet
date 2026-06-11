@@ -210,7 +210,8 @@ fn cloud_multipart_gcs_rotation_distinct_keys_and_all_rows() {
       type: gcs
       bucket: {bucket}
       prefix: {prefix}
-      endpoint: {FAKE_GCS_ENDPOINT}"#
+      endpoint: {FAKE_GCS_ENDPOINT}
+      allow_anonymous: true"#
     );
     let cfg_dir = tempfile::tempdir().unwrap();
     let cfg = write_config(&cfg_dir, &chunked_cloud_yaml(&table, &prefix, &dest));
