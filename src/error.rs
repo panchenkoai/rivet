@@ -104,6 +104,24 @@ impl std::fmt::Display for SchemaDriftError {
 
 impl std::error::Error for SchemaDriftError {}
 
+/// Typed marker carrying an **already-decided** process exit code.
+///
+/// A parallel-export child runs in its own process, classifies its own failure,
+/// and exits with that code; the typed marker itself cannot cross the process
+/// boundary — only the integer code does. The parent wraps the aggregate failure
+/// in this marker so [`classify_exit`] re-derives the SAME class instead of
+/// stringifying `"exited with status 3"` and collapsing it to a generic `1`.
+#[derive(Debug)]
+pub struct PreclassifiedExit(pub i32);
+
+impl std::fmt::Display for PreclassifiedExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "child exited with status {}", self.0)
+    }
+}
+
+impl std::error::Error for PreclassifiedExit {}
+
 /// Map an error to its process exit code per the [`ExitClass`] taxonomy.
 ///
 /// Precedence (first match wins):
@@ -128,6 +146,11 @@ impl std::error::Error for SchemaDriftError {}
 /// rather than being silently rescued by string matching.
 pub fn classify_exit(err: &anyhow::Error) -> i32 {
     // Each check downcasts through anyhow's context chain.
+    // A child process already classified itself and exited with that code; honor
+    // it verbatim (parallel-export path) so the parent surfaces the same class.
+    if let Some(p) = err.downcast_ref::<PreclassifiedExit>() {
+        return p.0;
+    }
     if err.downcast_ref::<SchemaDriftError>().is_some() {
         return ExitClass::SchemaDrift.code();
     }

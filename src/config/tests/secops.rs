@@ -230,3 +230,65 @@ exports:
         "expected field name: {msg}"
     );
 }
+
+// ─── V2/V12 — cloud-endpoint credential-exfil gate: loopback classification ───
+// A custom `destination.endpoint` is treated as a trusted local emulator (so
+// credentials may flow even without `allow_anonymous`) ONLY when its host is
+// genuine loopback. A lexical `starts_with("127.")` misclassifies
+// attacker-controlled DNS (`127.attacker.com`, `127.0.0.1.evil.com`) as
+// loopback, re-opening the very exfil hole the gate is meant to close — rivet
+// would sign and send real credentials to an attacker-resolved host.
+
+#[test]
+fn loopback_host_rejects_dns_lookalikes() {
+    // Genuine loopback — must be accepted.
+    assert!(is_loopback_host("127.0.0.1"), "127.0.0.1 is loopback");
+    assert!(
+        is_loopback_host("127.5.6.7"),
+        "all of 127.0.0.0/8 is loopback"
+    );
+    assert!(is_loopback_host("localhost"), "localhost is loopback");
+    assert!(is_loopback_host("::1"), "::1 is loopback");
+    // Attacker-controlled hostnames that merely look loopback — must be rejected
+    // (they DNS-resolve to whatever the attacker wants).
+    assert!(
+        !is_loopback_host("127.attacker.com"),
+        "a hostname starting with `127.` is NOT loopback — it resolves via DNS"
+    );
+    assert!(
+        !is_loopback_host("127.0.0.1.evil.com"),
+        "a `127.0.0.1`-prefixed hostname is NOT loopback"
+    );
+    assert!(
+        !is_loopback_host("localhost.attacker.com"),
+        "a `localhost.`-prefixed hostname is NOT loopback"
+    );
+    assert!(!is_loopback_host("storage.googleapis.com"));
+}
+
+#[test]
+fn custom_endpoint_127_dns_lookalike_is_rejected_without_anonymous() {
+    // The exfil gate must fire: `127.attacker.com` is a remote host, so a
+    // destination pointing at it without `allow_anonymous` must be REJECTED.
+    let err = Config::from_yaml(
+        r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    query: "SELECT 1"
+    format: parquet
+    destination:
+      type: gcs
+      bucket: b
+      endpoint: https://127.attacker.com
+"#,
+    )
+    .expect_err("a `127.attacker.com` endpoint must be rejected as non-loopback");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("non-loopback"),
+        "expected the non-loopback exfil rejection, got: {msg}"
+    );
+}

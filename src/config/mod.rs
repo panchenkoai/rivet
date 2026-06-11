@@ -918,9 +918,22 @@ fn endpoint_host(endpoint: &str) -> Option<String> {
 /// target (Minio / Azurite / fake-gcs on `127.0.0.1`). Anything else is a
 /// remote host and a potential exfiltration redirect.
 fn is_loopback_host(host: &str) -> bool {
-    // `127.0.0.0/8` is the IPv4 loopback block; `localhost` and `::1` complete
-    // the set. Anything else is a remote host (a possible exfil redirect).
-    matches!(host, "localhost" | "::1") || host.starts_with("127.")
+    // `localhost` is the only non-IP host that counts as loopback. Everything
+    // else must PARSE as an IP literal in the loopback range — a lexical
+    // `starts_with("127.")` would accept attacker-controlled DNS like
+    // `127.attacker.com` or `127.0.0.1.evil.com` (both resolve off-box), turning
+    // the credential-exfil gate into a bypass (V2/V12). Parse strictly: only a
+    // real `127.0.0.0/8` / `::1` address is loopback; a hostname is not.
+    if host == "localhost" {
+        return true;
+    }
+    // Tolerate a bracketed IPv6 literal (`[::1]`) in case a caller forwards one.
+    let h = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    h.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// True when `name` is filename-safe: rejects path-traversal (`..`), absolute

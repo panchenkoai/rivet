@@ -440,15 +440,7 @@ pub fn run(
         // the most "stop-worthy" class — data-integrity (possibly-wrong data)
         // outranks schema-drift, which outranks retryable, which outranks
         // generic — so a mixed batch exits on the scariest reason.
-        let rank = |e: &anyhow::Error| match crate::error::classify_exit(e) {
-            c if c == crate::error::ExitClass::DataIntegrity.code() => 3,
-            c if c == crate::error::ExitClass::SchemaDrift.code() => 2,
-            c if c == crate::error::ExitClass::Retryable.code() => 1,
-            _ => 0,
-        };
-        let primary_idx = (0..failures.len())
-            .max_by_key(|&i| rank(&failures[i]))
-            .unwrap();
+        let primary_idx = representative_failure_idx(&failures).unwrap();
         let primary = failures.remove(primary_idx);
         if failures.is_empty() {
             // Single failure — return it verbatim (its own message + marker).
@@ -468,4 +460,59 @@ pub fn run(
     }
 
     Ok(())
+}
+
+/// Index of the most "stop-worthy" failure in a batch: data-integrity (exit 3)
+/// outranks schema-drift (4), which outranks retryable (2), which outranks
+/// generic (1). The chosen error's typed marker then rides up so `classify_exit`
+/// exits the process on the scariest reason rather than whichever export happened
+/// to fail first. Returns `None` for an empty slice.
+fn representative_failure_idx(failures: &[anyhow::Error]) -> Option<usize> {
+    let rank = |e: &anyhow::Error| match crate::error::classify_exit(e) {
+        c if c == crate::error::ExitClass::DataIntegrity.code() => 3,
+        c if c == crate::error::ExitClass::SchemaDrift.code() => 2,
+        c if c == crate::error::ExitClass::Retryable.code() => 1,
+        _ => 0,
+    };
+    (0..failures.len()).max_by_key(|&i| rank(&failures[i]))
+}
+
+#[cfg(test)]
+mod representative_failure_tests {
+    use super::representative_failure_idx;
+    use crate::error::{DataIntegrityError, ExitClass, SchemaDriftError, classify_exit};
+
+    #[test]
+    fn empty_batch_has_no_representative() {
+        assert_eq!(representative_failure_idx(&[]), None);
+    }
+
+    #[test]
+    fn data_integrity_outranks_everything_regardless_of_position() {
+        // Data-integrity sits LAST so a naive "first failure" or a flipped
+        // min/max selector would pick the generic error instead.
+        let failures = vec![
+            anyhow::anyhow!("generic boom"),
+            SchemaDriftError::new("shape changed").into(),
+            anyhow::anyhow!("another generic"),
+            DataIntegrityError::new("reconcile mismatch").into(),
+        ];
+        let idx = representative_failure_idx(&failures).unwrap();
+        assert_eq!(
+            classify_exit(&failures[idx]),
+            ExitClass::DataIntegrity.code(),
+            "a mixed batch must surface the data-integrity (exit 3) failure"
+        );
+    }
+
+    #[test]
+    fn schema_drift_outranks_retryable_and_generic() {
+        // No data-integrity present → schema-drift (exit 4) is the scariest.
+        let failures = vec![
+            anyhow::anyhow!("generic"),
+            SchemaDriftError::new("drift").into(),
+        ];
+        let idx = representative_failure_idx(&failures).unwrap();
+        assert_eq!(classify_exit(&failures[idx]), ExitClass::SchemaDrift.code());
+    }
 }

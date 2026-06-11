@@ -218,6 +218,10 @@ pub(super) fn run_exports_as_child_processes(
 
     let mut failures = Vec::new();
     let mut wait_failures: HashMap<String, String> = HashMap::new();
+    // Numeric exit codes of failed children, so the parent can re-derive the
+    // SAME process exit class instead of collapsing a child's data-integrity (3)
+    // / schema-drift (4) / retryable (2) into a misleading generic 1.
+    let mut child_exit_codes: Vec<i32> = Vec::new();
 
     type WaitOutcome = (String, std::io::Result<std::process::ExitStatus>);
     let mut reaper_handles: Vec<std::thread::JoinHandle<WaitOutcome>> =
@@ -255,6 +259,9 @@ pub(super) fn run_exports_as_child_processes(
             }
         };
         if !status.success() {
+            if let Some(c) = status.code() {
+                child_exit_codes.push(c);
+            }
             let code = status
                 .code()
                 .map(|c| c.to_string())
@@ -306,12 +313,88 @@ pub(super) fn run_exports_as_child_processes(
         }
     }
 
-    let result = if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("{}", failures.join("; ")))
-    };
+    let result = aggregate_child_result(&failures, &child_exit_codes);
     (result, all_failures, stderr_dump)
+}
+
+/// Build the parent's final result from the children's outcomes. When any child
+/// exited with a CLASSIFIED non-generic code, the aggregate error carries a
+/// [`crate::error::PreclassifiedExit`] so `classify_exit` re-derives that SAME
+/// process exit class — otherwise a child's data-integrity (3) / schema-drift
+/// (4) / retryable (2) would be stringified and the parent would exit a
+/// misleading generic 1.
+fn aggregate_child_result(failures: &[String], child_exit_codes: &[i32]) -> anyhow::Result<()> {
+    if failures.is_empty() {
+        return Ok(());
+    }
+    let msg = failures.join("; ");
+    match worst_exit_code(child_exit_codes) {
+        Some(code) => Err(anyhow::Error::from(crate::error::PreclassifiedExit(code)).context(msg)),
+        None => Err(anyhow::anyhow!("{}", msg)),
+    }
+}
+
+/// The most "stop-worthy" exit code among failed children: data-integrity (3)
+/// outranks schema-drift (4), which outranks retryable (2), which outranks
+/// generic / anything else (1) — matching the representative-failure ranking the
+/// in-process multi-export path uses. `None` when no child reported a code.
+fn worst_exit_code(codes: &[i32]) -> Option<i32> {
+    let rank = |c: i32| match c {
+        3 => 3, // data-integrity — STOP, possibly-wrong data
+        4 => 2, // schema-drift — needs human review
+        2 => 1, // retryable — safe to retry
+        _ => 0, // generic / signal
+    };
+    codes.iter().copied().max_by_key(|&c| rank(c))
+}
+
+#[cfg(test)]
+mod exit_propagation_tests {
+    use super::{aggregate_child_result, worst_exit_code};
+    use crate::error::{ExitClass, classify_exit};
+
+    #[test]
+    fn worst_code_prefers_data_integrity_over_drift_and_generic() {
+        // Data-integrity (3) is the scariest even though 4 is numerically larger
+        // and 1 came first — a naive max(code) or first-wins would pick wrong.
+        assert_eq!(worst_exit_code(&[1, 4, 3, 2]), Some(3));
+        assert_eq!(worst_exit_code(&[1, 4, 2]), Some(4));
+        assert_eq!(worst_exit_code(&[1, 2]), Some(2));
+        assert_eq!(worst_exit_code(&[1, 1]), Some(1));
+        assert_eq!(worst_exit_code(&[]), None);
+    }
+
+    #[test]
+    fn child_data_integrity_exit_3_is_not_downgraded_to_1() {
+        // The regression: a child that exited 3 (data-integrity) must make the
+        // PARENT classify to 3, not collapse to a generic 1.
+        let failures = vec!["export 'a' exited with status 3".to_string()];
+        let err = aggregate_child_result(&failures, &[3]).unwrap_err();
+        assert_eq!(
+            classify_exit(&err),
+            ExitClass::DataIntegrity.code(),
+            "a child's data-integrity exit must survive to the parent's exit code"
+        );
+    }
+
+    #[test]
+    fn child_schema_drift_exit_4_survives() {
+        let failures = vec!["export 'a' exited with status 4".to_string()];
+        let err = aggregate_child_result(&failures, &[4]).unwrap_err();
+        assert_eq!(classify_exit(&err), ExitClass::SchemaDrift.code());
+    }
+
+    #[test]
+    fn generic_only_children_stay_generic_1() {
+        let failures = vec!["export 'a' exited with status 1".to_string()];
+        let err = aggregate_child_result(&failures, &[1]).unwrap_err();
+        assert_eq!(classify_exit(&err), ExitClass::Generic.code());
+    }
+
+    #[test]
+    fn no_failures_is_ok() {
+        assert!(aggregate_child_result(&[], &[]).is_ok());
+    }
 }
 
 fn render_child_stderr(
