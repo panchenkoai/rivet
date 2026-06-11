@@ -286,8 +286,14 @@ fn init_yaml(
     if let Some(t) = table {
         let (sch, table_name) = yaml_scaffold::parse_table(t);
         let info = match source_type(source_url)? {
-            "postgres" => postgres::introspect(source_url, &sch, table_name)?,
-            "mysql" => mysql::introspect(source_url, table_name)?,
+            "postgres" => {
+                let mut client = postgres::connect(source_url)?;
+                postgres::introspect(&mut client, &sch, table_name)?
+            }
+            "mysql" => {
+                let mut conn = mysql::connect(source_url)?;
+                mysql::introspect(&mut conn, table_name)?
+            }
             _ => unreachable!(),
         };
         let hint = yaml_scaffold::table_has_unbounded_decimal_columns(&info);
@@ -314,8 +320,14 @@ fn init_discovery_json(
     let (infos, scope) = if let Some(t) = table {
         let (sch, table_name) = yaml_scaffold::parse_table(t);
         let info = match source_type(source_url)? {
-            "postgres" => postgres::introspect(source_url, &sch, table_name)?,
-            "mysql" => mysql::introspect(source_url, table_name)?,
+            "postgres" => {
+                let mut client = postgres::connect(source_url)?;
+                postgres::introspect(&mut client, &sch, table_name)?
+            }
+            "mysql" => {
+                let mut conn = mysql::connect(source_url)?;
+                mysql::introspect(&mut conn, table_name)?
+            }
             _ => unreachable!(),
         };
         let scope = match source_type(source_url)? {
@@ -382,10 +394,13 @@ fn introspect_all(source_url: &str, schema: Option<&str>) -> Result<Vec<TableInf
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .unwrap_or("public");
-            let names = postgres::list_tables(source_url, sch)?;
+            // One connection for the whole scan — a fresh client per table
+            // would mean N+1 TCP+auth(+TLS) handshakes on large schemas.
+            let mut client = postgres::connect(source_url)?;
+            let names = postgres::list_tables(&mut client, sch)?;
             let mut out = Vec::with_capacity(names.len());
             for n in names {
-                match postgres::introspect(source_url, sch, &n) {
+                match postgres::introspect(&mut client, sch, &n) {
                     Ok(info) => out.push(info),
                     // Table may have been dropped between list_tables and introspect.
                     // Skip it rather than aborting the whole schema scan.
@@ -397,10 +412,13 @@ fn introspect_all(source_url: &str, schema: Option<&str>) -> Result<Vec<TableInf
         }
         "mysql" => {
             let db = mysql::resolve_database_for_listing(source_url, schema)?;
-            let names = mysql::list_tables(source_url, &db)?;
+            // One pooled connection for the whole scan — a fresh Pool per
+            // table would mean N+1 TCP+auth(+TLS) handshakes on large schemas.
+            let mut conn = mysql::connect(source_url)?;
+            let names = mysql::list_tables(&mut conn, &db)?;
             let mut out = Vec::with_capacity(names.len());
             for n in names {
-                out.push(mysql::introspect(source_url, &n)?);
+                out.push(mysql::introspect(&mut conn, &n)?);
             }
             Ok(out)
         }

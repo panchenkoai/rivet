@@ -1,10 +1,54 @@
+use postgres::Client;
+
+use crate::config::{TlsConfig, TlsMode};
 use crate::error::Result;
 
 use super::{ColumnInfo, TableInfo};
 
+/// Open the one client shared across the whole init run (`list_tables` plus
+/// every per-table `introspect` — no per-table reconnect).
+///
+/// `init` runs before any YAML `tls:` block exists (it *generates* the
+/// config), so the transport-security policy comes from the URL's `sslmode`
+/// parameter; the connection itself goes through the same
+/// [`crate::source::postgres::connect_client`] path as doctor/check/run.
+pub(super) fn connect(url: &str) -> Result<Client> {
+    let tls = tls_mode_from_url(url).map(|mode| TlsConfig {
+        mode,
+        ..TlsConfig::default()
+    });
+    crate::source::postgres::connect_client(url, tls.as_ref())
+}
+
+/// Map the URL's `sslmode` query parameter to the [`TlsMode`] the shared TLS
+/// connector understands.
+///
+/// `require` / `verify-ca` / `verify-full` map to the corresponding enforced
+/// mode. Everything else — parameter missing, `disable`, `prefer`, `allow`,
+/// or an unrecognized value — returns `None` (plaintext), keeping plain dev
+/// setups working. [`TlsMode`] has no `prefer` variant, so no try-TLS-then-
+/// fallback is attempted; values libpq would reject are left for the driver's
+/// own URL parsing to diagnose. Last occurrence wins, matching libpq.
+fn tls_mode_from_url(url: &str) -> Option<TlsMode> {
+    let (_, query) = url.split_once('?')?;
+    let mut mode = None;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key != "sslmode" {
+            continue;
+        }
+        mode = match value {
+            "require" => Some(TlsMode::Require),
+            "verify-ca" => Some(TlsMode::VerifyCa),
+            "verify-full" => Some(TlsMode::VerifyFull),
+            _ => None,
+        };
+    }
+    mode
+}
+
 /// Tables and views in a PostgreSQL schema (`information_schema`).
-pub(super) fn list_tables(url: &str, schema: &str) -> Result<Vec<String>> {
-    let mut client = postgres::Client::connect(url, postgres::NoTls)?;
+pub(super) fn list_tables(client: &mut Client, schema: &str) -> Result<Vec<String>> {
     let rows = client.query(
         "SELECT table_name FROM information_schema.tables
          WHERE table_schema = $1 AND table_type IN ('BASE TABLE', 'VIEW')
@@ -14,9 +58,7 @@ pub(super) fn list_tables(url: &str, schema: &str) -> Result<Vec<String>> {
     Ok(rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
 }
 
-pub(super) fn introspect(url: &str, schema: &str, table: &str) -> Result<TableInfo> {
-    let mut client = postgres::Client::connect(url, postgres::NoTls)?;
-
+pub(super) fn introspect(client: &mut Client, schema: &str, table: &str) -> Result<TableInfo> {
     // Row estimate from pg_class (fast, no COUNT(*))
     let row_estimate: i64 = client
         .query_opt(
@@ -102,4 +144,88 @@ pub(super) fn introspect(url: &str, schema: &str, table: &str) -> Result<TableIn
         total_bytes,
         columns,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tls_mode_from_url;
+    use crate::config::TlsMode;
+
+    #[test]
+    fn sslmode_enforced_values_map_to_tls_modes() {
+        assert_eq!(
+            tls_mode_from_url("postgresql://u:p@host:5432/db?sslmode=require"),
+            Some(TlsMode::Require)
+        );
+        assert_eq!(
+            tls_mode_from_url("postgresql://u:p@host/db?sslmode=verify-ca"),
+            Some(TlsMode::VerifyCa)
+        );
+        assert_eq!(
+            tls_mode_from_url("postgresql://u:p@host/db?sslmode=verify-full"),
+            Some(TlsMode::VerifyFull)
+        );
+    }
+
+    #[test]
+    fn sslmode_plaintext_values_stay_plaintext() {
+        // Missing, disable, and libpq's plaintext-leaning modes (prefer/allow)
+        // all keep the current NoTls behavior — TlsMode has no `prefer`.
+        assert_eq!(tls_mode_from_url("postgresql://u:p@host/db"), None);
+        assert_eq!(
+            tls_mode_from_url("postgresql://u:p@host/db?sslmode=disable"),
+            None
+        );
+        assert_eq!(
+            tls_mode_from_url("postgresql://u:p@host/db?sslmode=prefer"),
+            None
+        );
+        assert_eq!(
+            tls_mode_from_url("postgresql://u:p@host/db?sslmode=allow"),
+            None
+        );
+    }
+
+    #[test]
+    fn sslmode_unrecognized_values_stay_plaintext() {
+        // libpq values are lowercase and exact; the driver rejects anything
+        // else at connect time, so derivation must not guess.
+        assert_eq!(
+            tls_mode_from_url("postgresql://u:p@host/db?sslmode=REQUIRE"),
+            None
+        );
+        assert_eq!(
+            tls_mode_from_url("postgresql://u:p@host/db?sslmode=garbage"),
+            None
+        );
+        assert_eq!(tls_mode_from_url("postgresql://u:p@host/db?sslmode"), None);
+        assert_eq!(tls_mode_from_url("postgresql://u:p@host/db?sslmode="), None);
+    }
+
+    #[test]
+    fn sslmode_found_among_other_params_and_exact_key_only() {
+        assert_eq!(
+            tls_mode_from_url(
+                "postgresql://u:p@host/db?connect_timeout=10&sslmode=require&application_name=x"
+            ),
+            Some(TlsMode::Require)
+        );
+        // Key must match exactly — `xsslmode` is a different parameter.
+        assert_eq!(
+            tls_mode_from_url("postgresql://u:p@host/db?xsslmode=require"),
+            None
+        );
+    }
+
+    #[test]
+    fn sslmode_last_occurrence_wins() {
+        assert_eq!(
+            tls_mode_from_url("postgresql://u:p@host/db?sslmode=disable&sslmode=require"),
+            Some(TlsMode::Require)
+        );
+        assert_eq!(
+            tls_mode_from_url("postgresql://u:p@host/db?sslmode=require&sslmode=disable"),
+            None
+        );
+    }
 }

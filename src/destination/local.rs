@@ -24,7 +24,25 @@ impl super::Destination for LocalDestination {
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::copy(local_path, &target)?;
+        // Stage into a dot-prefixed sibling in the target directory (same
+        // filesystem, so the rename is atomic POSIX): a crash mid-copy can
+        // never leave a truncated file at the final key.  The temp name is
+        // deterministic so a stale temp from a crashed run is simply
+        // overwritten by the next attempt.
+        let file_name = target
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("destination key has no file name: {remote_key}"))?
+            .to_string_lossy()
+            .into_owned();
+        let tmp = target.with_file_name(format!(".{file_name}.tmp"));
+        if let Err(e) = std::fs::copy(local_path, &tmp) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        if let Err(e) = std::fs::rename(&tmp, &target) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         log::info!("wrote {}", target.display());
         Ok(super::WriteOutcome::opaque()) // local FS reports no content checksum
     }
@@ -33,8 +51,8 @@ impl super::Destination for LocalDestination {
         super::DestinationCapabilities {
             commit_protocol: super::WriteCommitProtocol::Atomic,
             idempotent_overwrite: true,
-            retry_safe: false, // fs::copy may leave a partial file at the destination on failure
-            partial_write_risk: true,
+            retry_safe: true, // temp-then-rename: a failure leaves nothing at the final key
+            partial_write_risk: false,
         }
     }
 
@@ -154,8 +172,8 @@ mod tests {
         }
     }
 
-    /// ADR-0004: local fs::copy is Atomic — `write()` returning Ok(()) means the full
-    /// file is present at the destination path.
+    /// ADR-0004: local temp-then-rename is Atomic — `write()` returning Ok(()) means
+    /// the full file is present at the destination path.
     #[test]
     fn local_commit_protocol_is_atomic() {
         let caps = dest().capabilities();
@@ -168,18 +186,18 @@ mod tests {
         assert!(dest().capabilities().idempotent_overwrite);
     }
 
-    /// `fs::copy` can leave a partial file if the process is killed mid-copy,
-    /// so the local destination is not retry-safe without manual cleanup.
+    /// Temp-then-rename means a killed write leaves nothing at the final key,
+    /// so the local destination is retry-safe with no partial-write risk.
     #[test]
-    fn local_not_retry_safe_has_partial_write_risk() {
+    fn local_retry_safe_no_partial_write_risk() {
         let caps = dest().capabilities();
         assert!(
-            !caps.retry_safe,
-            "fs::copy is not retry-safe (partial file risk)"
+            caps.retry_safe,
+            "temp-then-rename is retry-safe (no artifact at the final key on failure)"
         );
         assert!(
-            caps.partial_write_risk,
-            "partial file can be left on failure"
+            !caps.partial_write_risk,
+            "rename is atomic on the same filesystem; no partial file at the final key"
         );
     }
 
@@ -315,6 +333,82 @@ mod tests {
         assert!(
             dir.path().join(key).exists(),
             "unicode-and-space key must be preserved verbatim"
+        );
+    }
+
+    // ── Atomic write mechanics (temp-then-rename regression tests) ─────────
+
+    /// A successful write must leave exactly the final file — the staging
+    /// temp is renamed away, never left as a sibling.
+    #[test]
+    fn write_leaves_no_temp_file_behind_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dest_at(dir.path());
+        let src = source_file_with(b"full payload\n");
+
+        dest.write(src.path(), "nested/part-000001.parquet")
+            .unwrap();
+
+        let parent = dir.path().join("nested");
+        let entries: Vec<_> = std::fs::read_dir(&parent)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["part-000001.parquet".to_string()],
+            "only the final file may remain; no .tmp sibling"
+        );
+        assert_eq!(
+            std::fs::read(parent.join("part-000001.parquet")).unwrap(),
+            b"full payload\n"
+        );
+    }
+
+    /// A failed write must leave nothing at the final key — neither a
+    /// truncated final file nor a stranded temp sibling.
+    #[test]
+    fn failed_write_leaves_no_file_at_final_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dest_at(dir.path());
+
+        let missing = dir.path().join("vanished-source.csv");
+        let result = dest.write(&missing, "out/data.csv");
+        assert!(result.is_err());
+
+        let parent = dir.path().join("out");
+        assert!(
+            !parent.join("data.csv").exists(),
+            "no file at the final key"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&parent)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no temp artifact may survive a failed write: {leftovers:?}"
+        );
+    }
+
+    /// A stale temp left by a crashed previous run must not poison the next
+    /// attempt: the deterministic temp name is overwritten and renamed away.
+    #[test]
+    fn stale_temp_from_crashed_run_is_replaced_on_next_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dest_at(dir.path());
+        std::fs::write(dir.path().join(".data.csv.tmp"), b"truncated garb").unwrap();
+
+        let src = source_file_with(b"clean payload\n");
+        dest.write(src.path(), "data.csv").unwrap();
+
+        assert_eq!(
+            std::fs::read(dir.path().join("data.csv")).unwrap(),
+            b"clean payload\n"
+        );
+        assert!(
+            !dir.path().join(".data.csv.tmp").exists(),
+            "stale temp must be consumed by the rename, not accumulate"
         );
     }
 
