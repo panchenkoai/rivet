@@ -107,6 +107,26 @@ pub(crate) fn csv_serializable(dt: &DataType) -> bool {
     )
 }
 
+/// Lowercase hex-encode `bytes` into `writer`. Replaces a per-byte
+/// `write!("{:02x}")` (which drove `core::fmt` through the `dyn Write` vtable
+/// once per byte) with a table lookup batched through a stack buffer — zero
+/// allocation, byte-identical output. On a binary/blob column this is the
+/// difference between N format-machinery calls and a handful of `write_all`s.
+fn write_lower_hex(writer: &mut dyn Write, bytes: &[u8]) -> Result<()> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut chunk = [0u8; 1024];
+    for slab in bytes.chunks(chunk.len() / 2) {
+        let mut n = 0;
+        for &b in slab {
+            chunk[n] = HEX[(b >> 4) as usize];
+            chunk[n + 1] = HEX[(b & 0x0f) as usize];
+            n += 2;
+        }
+        writer.write_all(&chunk[..n])?;
+    }
+    Ok(())
+}
+
 fn write_csv_value(writer: &mut dyn Write, array: &dyn Array, idx: usize) -> Result<()> {
     if array.is_null(idx) {
         return Ok(());
@@ -173,7 +193,13 @@ fn write_csv_value(writer: &mut dyn Write, array: &dyn Array, idx: usize) -> Res
                 .downcast_ref::<StringArray>()
                 .expect("DataType/Array mismatch");
             let val = arr.value(idx);
-            if val.contains(',') || val.contains('"') || val.contains('\n') {
+            // RFC 4180: quote on delimiter, quote, LF — and CR, which readers
+            // in universal-newline mode treat as a record terminator. One pass
+            // instead of four `contains` scans per cell.
+            if val
+                .bytes()
+                .any(|b| matches!(b, b',' | b'"' | b'\n' | b'\r'))
+            {
                 writer.write_all(b"\"")?;
                 let mut rest = val;
                 while let Some(pos) = rest.find('"') {
@@ -192,10 +218,7 @@ fn write_csv_value(writer: &mut dyn Write, array: &dyn Array, idx: usize) -> Res
                 .as_any()
                 .downcast_ref::<BinaryArray>()
                 .expect("DataType/Array mismatch");
-            let val = arr.value(idx);
-            for byte in val {
-                write!(writer, "{:02x}", byte)?;
-            }
+            write_lower_hex(writer, arr.value(idx))?;
         }
         // FixedSizeBinary today only carries 16-byte UUIDs (see
         // `RivetType::Uuid` → `DataType::FixedSizeBinary(16)` in
@@ -258,7 +281,28 @@ fn write_csv_value(writer: &mut dyn Write, array: &dyn Array, idx: usize) -> Res
             let secs = micros / 1_000_000;
             let nsecs = ((micros % 1_000_000) * 1_000) as u32;
             if let Some(dt) = chrono::DateTime::from_timestamp(secs, nsecs) {
-                write!(writer, "{}", dt.format("%Y-%m-%dT%H:%M:%S%.6f"))?;
+                use chrono::{Datelike as _, Timelike as _};
+                let y = dt.year();
+                // Fast path: emit the `%Y-%m-%dT%H:%M:%S%.6f` form by hand to
+                // skip chrono's per-value strftime-string re-parse. `{:04}`
+                // matches `%Y`'s zero-pad-to-4 exactly for years 0..=9999;
+                // outside that range (pre-CE / 5-digit years from pathological
+                // micros) fall back to chrono so the output stays identical.
+                if (0..=9999).contains(&y) {
+                    write!(
+                        writer,
+                        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}",
+                        y,
+                        dt.month(),
+                        dt.day(),
+                        dt.hour(),
+                        dt.minute(),
+                        dt.second(),
+                        dt.nanosecond() / 1_000
+                    )?;
+                } else {
+                    write!(writer, "{}", dt.format("%Y-%m-%dT%H:%M:%S%.6f"))?;
+                }
             }
         }
         other => {
@@ -409,6 +453,20 @@ mod tests {
             "got: {result}"
         );
         assert!(result.contains("line1\nline2"), "got: {result}");
+    }
+
+    // ROAST-RED csv-cr-quote: the quote predicate checks ',', '"' and '\n' but
+    // not '\r', so a value containing a lone CR is emitted unquoted — RFC 4180
+    // requires quoting CR, and Excel/Python universal-newline readers split the
+    // row on the bare CR.
+    // Asserts CORRECT behavior; expected to FAIL until the fix lands.
+    #[test]
+    fn roast_string_with_carriage_return_is_quoted() {
+        let result = cell(StringArray::from(vec!["a\rb"]), 0);
+        assert_eq!(
+            result, "\"a\rb\"",
+            "lone CR must force quoting per RFC 4180, but got unquoted cell {result:?}"
+        );
     }
 
     // ── binary ───────────────────────────────────────────────────────────────
@@ -564,5 +622,55 @@ mod tests {
             .unwrap();
         w.write_batch(&batch)
             .expect("every serializable type must write without hitting the fallthrough");
+    }
+
+    // ── perf-wave byte-identity guards ───────────────────────────────────────
+    // The hex + timestamp fast paths must stay byte-for-byte identical to the
+    // `{:02x}`-per-byte / `dt.format(...)` forms they replaced.
+
+    #[test]
+    fn binary_hex_matches_per_byte_format_for_all_byte_values() {
+        // Every byte 0..=255 plus the empty slice — the table+chunk encoder
+        // must equal the old per-byte `{:02x}`.
+        let all: Vec<u8> = (0..=255u8).collect();
+        for case in [&all[..], &[][..], &[0x00, 0xff, 0x10, 0x0a]] {
+            let expected: String = case.iter().map(|b| format!("{b:02x}")).collect();
+            let got = cell(BinaryArray::from_vec(vec![case]), 0);
+            assert_eq!(got, expected, "hex mismatch for {case:?}");
+        }
+    }
+
+    #[test]
+    fn binary_hex_spans_chunk_boundary() {
+        // Larger than the 512-byte slab so the chunked write_all path is hit.
+        let big: Vec<u8> = (0..2000u32).map(|i| (i % 256) as u8).collect();
+        let expected: String = big.iter().map(|b| format!("{b:02x}")).collect();
+        let got = cell(BinaryArray::from_vec(vec![&big[..]]), 0);
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn timestamp_fast_path_matches_chrono_format() {
+        // Representative micros: epoch, sub-second, end-of-day, a far-future
+        // in-range year, and a value whose year leaves the 0..=9999 fast path
+        // (must hit the chrono fallback and still match).
+        let cases: [i64; 6] = [
+            0,
+            1_700_000_000_123_456,        // 2023-… with micros
+            1_000_000 * 86_399 + 999_999, // 1970-01-01T23:59:59.999999
+            -1, // (negative micros: from_timestamp rejects → empty, both paths)
+            253_402_300_799_000_000, // 9999-12-31T23:59:59 (still fast path)
+            300_000_000_000_000_000, // year > 9999 → chrono fallback
+        ];
+        for micros in cases {
+            let got = cell(TimestampMicrosecondArray::from(vec![micros]), 0);
+            let secs = micros / 1_000_000;
+            let nsecs = ((micros % 1_000_000) * 1_000) as u32;
+            let expected = match chrono::DateTime::from_timestamp(secs, nsecs) {
+                Some(dt) => format!("{}", dt.format("%Y-%m-%dT%H:%M:%S%.6f")),
+                None => String::new(),
+            };
+            assert_eq!(got, expected, "timestamp mismatch for micros={micros}");
+        }
     }
 }
