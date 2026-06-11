@@ -47,6 +47,15 @@ pub const MINIO_SECRET_KEY: &str = "minioadmin";
 
 pub const FAKE_GCS_ENDPOINT: &str = "http://127.0.0.1:4443";
 
+/// Azurite (Azure Blob emulator) well-known dev account, key, and blob
+/// endpoint. The key is the fixed Azurite default — not a secret.
+pub const AZURITE_ENDPOINT: &str = "http://127.0.0.1:10000/devstoreaccount1";
+pub const AZURITE_ACCOUNT: &str = "devstoreaccount1";
+pub const AZURITE_KEY: &str =
+    "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
+/// Connection string for the `az` CLI (container provisioning, read-back).
+pub const AZURITE_CONN_STRING: &str = "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;";
+
 pub const TOXIPROXY_API: &str = "http://127.0.0.1:8474";
 
 // ─── ClickHouse + DuckDB (Parquet validators — ADR-0014 §4) ────────────────
@@ -196,6 +205,8 @@ pub enum LiveService {
     Mssql,
     Minio,
     FakeGcs,
+    /// Azure Blob emulator (Azurite). Blob endpoint :10000.
+    Azurite,
     Toxiproxy,
     PgBouncer,
     ProxySql,
@@ -236,6 +247,11 @@ impl LiveService {
                 "127.0.0.1",
                 4443,
                 "service `fake-gcs` in docker-compose.yaml",
+            ),
+            LiveService::Azurite => (
+                "127.0.0.1",
+                10000,
+                "service `azurite` in docker-compose.yaml (blob :10000)",
             ),
             LiveService::Toxiproxy => (
                 "127.0.0.1",

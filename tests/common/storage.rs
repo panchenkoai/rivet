@@ -6,7 +6,9 @@
 use std::net::TcpStream;
 use std::process::Command;
 
-use super::env::{LiveService, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, require_alive};
+use super::env::{
+    AZURITE_CONN_STRING, LiveService, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, require_alive,
+};
 
 /// Idempotently create `bucket` in the local MinIO instance via `mc` inside
 /// the running container.  Does nothing if the bucket already exists.
@@ -57,5 +59,45 @@ pub fn ensure_gcs_bucket(bucket: &str) {
     assert!(
         status_ok,
         "fake-gcs bucket create returned unexpected response:\n{resp}"
+    );
+}
+
+/// Idempotently create `container` in the local Azurite emulator via the `az`
+/// CLI + the well-known dev connection string, with CONTAINER-level public
+/// read access. opendal's Azblob backend does not create the container, so
+/// tests must provision it first; the public-access level lets the test re-read
+/// the blobs over plain anonymous HTTP (rivet still WRITES with the account
+/// key — public access only affects anonymous reads). Requires the `az` CLI on
+/// PATH (Azure Storage emulator tests are dev-machine only).
+///
+/// `--public-access` is used (rather than `az storage blob` read-back) because
+/// some `az` builds ship a Python without the `expat` XML module and choke on
+/// the XML that blob list/download return; an anonymous reqwest GET sidesteps
+/// the CLI entirely for the read path.
+pub fn ensure_azure_container(container: &str) {
+    require_alive(LiveService::Azurite);
+    let out = Command::new("az")
+        .args([
+            "storage",
+            "container",
+            "create",
+            "--name",
+            container,
+            "--public-access",
+            "container",
+            "--connection-string",
+            AZURITE_CONN_STRING,
+        ])
+        .output()
+        .expect(
+            "failed to spawn `az` — Azure/Azurite live tests require the Azure CLI on PATH \
+             (brew install azure-cli)",
+        );
+    // `az container create` is idempotent: it returns {\"created\": true|false}
+    // and exits 0 whether the container was freshly made or already existed.
+    assert!(
+        out.status.success(),
+        "`az storage container create --name {container}` against Azurite failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
