@@ -40,6 +40,40 @@ use crate::types::{
     build_arrow_field,
 };
 
+// ─── Pre-allocation per-value ceiling (security audit V22, CWE-770) ───────────
+
+/// Pre-allocation per-value size guard. The sink-side `check_value_ceiling`
+/// (`pipeline::sink::mod`) scans the *already-built* Arrow batch, so an
+/// oversized cell costs the driver-decode copy **and** the Arrow-build copy
+/// before the guard fires. This check runs at the decode/`Value` stage —
+/// after the unavoidable driver copy, but *before* the value is appended into
+/// the `StringBuilder` / `BinaryBuilder` — so the Arrow allocation never grows
+/// to hold it. Only variable-length values (Utf8 / Binary) can be individually
+/// huge; fixed-width arms (ints/floats/dates) never call this.
+///
+/// `max_value_bytes` is `tuning.max_value_mb` already converted to bytes with
+/// the `Some(0)/None ⇒ disabled` semantics applied by the caller (mirrors the
+/// sink). The error string mirrors `check_value_ceiling`'s
+/// `RIVET_VALUE_TOO_LARGE` message so both guards read identically. The sink
+/// guard is kept as the backstop (it also covers meta/enriched columns and is
+/// the integration contract test).
+fn value_within_ceiling(column: &str, len: usize, max_value_bytes: Option<usize>) -> Result<()> {
+    if let Some(limit) = max_value_bytes
+        && len > limit
+    {
+        anyhow::bail!(
+            "RIVET_VALUE_TOO_LARGE: column '{}' has a single value of {:.1} MB, exceeding the \
+             per-value ceiling of {} MB. One oversized cell can OOM the process regardless of \
+             batch size. Raise `tuning.max_value_mb` (or set it to 0 to disable the guard) if \
+             this value is expected.",
+            column,
+            len as f64 / (1024.0 * 1024.0),
+            limit / (1024 * 1024),
+        );
+    }
+    Ok(())
+}
+
 // ─── Wire-type adapters ──────────────────────────────────────────────────────
 
 /// PostgreSQL `uuid` rows materialised as their canonical 16-byte form.
@@ -385,11 +419,12 @@ pub(super) fn rows_to_record_batch_typed(
     schema: &SchemaRef,
     columns: &[(String, Type)],
     rows: &[Row],
+    max_value_bytes: Option<usize>,
 ) -> Result<RecordBatch> {
     let mut arrays: Vec<Arc<dyn Array>> = Vec::with_capacity(columns.len());
     for (col_idx, (name, pg_type)) in columns.iter().enumerate() {
         let target_type = schema.field(col_idx).data_type();
-        let arr = build_array(pg_type, target_type, col_idx, rows)?;
+        let arr = build_array(pg_type, target_type, col_idx, rows, name, max_value_bytes)?;
         // Defensive invariant: `build_array` now dispatches on `target_type`, so
         // the produced array matches the schema field by construction. This
         // guard turns any future arm that builds the wrong width/unit into a
@@ -416,6 +451,8 @@ fn build_array(
     target_type: &DataType,
     col_idx: usize,
     rows: &[Row],
+    column: &str,
+    max_value_bytes: Option<usize>,
 ) -> Result<Arc<dyn Array>> {
     // Dispatch on the schema's resolved TARGET type — the single decision site.
     // `pg_type` only chooses *how* to read the wire value (which `FromSql`),
@@ -480,7 +517,13 @@ fn build_array(
             let mut b = BinaryBuilder::with_capacity(rows.len(), rows.len() * 64);
             for row in rows {
                 match row.get::<_, Option<Vec<u8>>>(col_idx) {
-                    Some(v) => b.append_value(&v),
+                    Some(v) => {
+                        // Pre-allocation ceiling: the driver copy (`Vec<u8>`) is
+                        // unavoidable, but bail before it is appended so the
+                        // Arrow buffer never grows to hold the oversized cell.
+                        value_within_ceiling(column, v.len(), max_value_bytes)?;
+                        b.append_value(&v);
+                    }
                     None => b.append_null(),
                 }
             }
@@ -557,7 +600,7 @@ fn build_array(
         // Utf8 target: several wire types render to text. The read is chosen by
         // `pg_type`, so this is where `col: string` overrides land (numeric/uuid
         // → text) alongside the natural text/json/enum/interval columns.
-        DataType::Utf8 => build_pg_text_array(pg_type, col_idx, rows),
+        DataType::Utf8 => build_pg_text_array(pg_type, col_idx, rows, column, max_value_bytes),
         DataType::List(_) => build_pg_list_array(target_type, col_idx, rows),
         other => anyhow::bail!(
             "no PostgreSQL value converter for target Arrow type {other:?} \
@@ -571,13 +614,25 @@ fn build_array(
 /// uuid column an operator retyped to `string` via a `columns:` override. Bails
 /// on a wire type with no text rendering (fail-loud, slice A) instead of the old
 /// silent `try_get::<String>` → null.
-fn build_pg_text_array(pg_type: &Type, col_idx: usize, rows: &[Row]) -> Result<Arc<dyn Array>> {
+fn build_pg_text_array(
+    pg_type: &Type,
+    col_idx: usize,
+    rows: &[Row],
+    column: &str,
+    max_value_bytes: Option<usize>,
+) -> Result<Arc<dyn Array>> {
     let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
     match *pg_type {
         Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => {
             for row in rows {
                 let val: Option<String> = row.get(col_idx);
-                b.append_option(val.as_deref());
+                match val {
+                    Some(s) => {
+                        value_within_ceiling(column, s.len(), max_value_bytes)?;
+                        b.append_value(s);
+                    }
+                    None => b.append_null(),
+                }
             }
         }
         // `postgres` rejects `String` for these OIDs. Read the wire payload as
@@ -588,7 +643,10 @@ fn build_pg_text_array(pg_type: &Type, col_idx: usize, rows: &[Row]) -> Result<A
             for row in rows {
                 match row.try_get::<_, Option<PgJsonRawText<'_>>>(col_idx)? {
                     None => b.append_null(),
-                    Some(PgJsonRawText(text)) => b.append_value(text),
+                    Some(PgJsonRawText(text)) => {
+                        value_within_ceiling(column, text.len(), max_value_bytes)?;
+                        b.append_value(text);
+                    }
                 }
             }
         }
@@ -819,4 +877,39 @@ fn pg_numeric_to_decimal256(
     Ok(Arc::new(
         b.finish().with_precision_and_scale(precision, scale)?,
     ))
+}
+
+// ─── Pre-allocation per-value ceiling tests (security audit V22, CWE-770) ──────
+#[cfg(test)]
+mod sec_value_ceiling_pre_alloc_tests {
+    use super::value_within_ceiling;
+
+    // The pre-allocation guard is the production gate that fires inside
+    // `build_array` *before* a variable-length value is appended into the
+    // StringBuilder/BinaryBuilder — eliminating the second (Arrow-build) copy
+    // of an oversized cell. `build_array` needs real `postgres::Row`s (a live
+    // driver), so the pure length-check is unit-tested here; the end-to-end
+    // proof is the sink contract test (`pipeline::sink::tests`), which is kept
+    // as the post-materialization backstop.
+
+    #[test]
+    fn sec_value_ceiling_pre_alloc_over_limit_errors() {
+        let err = value_within_ceiling("payload", 2 * 1024 * 1024, Some(1024 * 1024)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("RIVET_VALUE_TOO_LARGE"), "got: {msg}");
+        assert!(msg.contains("payload"), "names the column: {msg}");
+    }
+
+    #[test]
+    fn sec_value_ceiling_pre_alloc_at_or_under_limit_ok() {
+        // Exactly at the limit is allowed (the sink guard uses `> limit` too).
+        assert!(value_within_ceiling("c", 1024 * 1024, Some(1024 * 1024)).is_ok());
+        assert!(value_within_ceiling("c", 0, Some(1024 * 1024)).is_ok());
+    }
+
+    #[test]
+    fn sec_value_ceiling_pre_alloc_disabled_never_errors() {
+        // `None` (guard off / `max_value_mb = 0` → None) admits any size.
+        assert!(value_within_ceiling("c", usize::MAX, None).is_ok());
+    }
 }

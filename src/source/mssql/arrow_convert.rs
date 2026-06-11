@@ -33,6 +33,38 @@ use crate::types::{
 /// Days from the Arrow/Unix epoch (1970-01-01) used to anchor `Date32`.
 const UNIX_EPOCH_DAY: i32 = 0;
 
+/// Pre-allocation per-value size guard — twin of the PostgreSQL/MySQL helpers.
+/// The sink-side `check_value_ceiling` (`pipeline::sink::mod`) scans the
+/// *already-built* Arrow batch, so an oversized cell costs the driver-decode
+/// copy **and** the Arrow-build copy before the guard fires. This check runs at
+/// the `ColumnData` stage — after the unavoidable driver copy, but *before* the
+/// value is appended into the `StringBuilder` / `BinaryBuilder` — so the Arrow
+/// allocation never grows to hold it. Only variable-length values (Utf8 /
+/// Binary) can be individually huge; fixed-width arms (ints/floats/dates) never
+/// call this.
+///
+/// `max_value_bytes` is `tuning.max_value_mb` already converted to bytes with
+/// the `Some(0)/None ⇒ disabled` semantics applied by the caller (mirrors the
+/// sink). The error string mirrors `check_value_ceiling`'s `RIVET_VALUE_TOO_LARGE`
+/// message so both guards read identically. The sink guard is kept as the
+/// backstop (it also covers meta/enriched columns and is the contract test).
+fn value_within_ceiling(column: &str, len: usize, max_value_bytes: Option<usize>) -> Result<()> {
+    if let Some(limit) = max_value_bytes
+        && len > limit
+    {
+        anyhow::bail!(
+            "RIVET_VALUE_TOO_LARGE: column '{}' has a single value of {:.1} MB, exceeding the \
+             per-value ceiling of {} MB. One oversized cell can OOM the process regardless of \
+             batch size. Raise `tuning.max_value_mb` (or set it to 0 to disable the guard) if \
+             this value is expected.",
+            column,
+            len as f64 / (1024.0 * 1024.0),
+            limit / (1024 * 1024),
+        );
+    }
+    Ok(())
+}
+
 /// Map a SQL Server column type to its `RivetType`. An explicit
 /// `exports[].columns:` override wins (lets a `decimal` without resolvable
 /// precision still ride as a declared type, same as PG/MySQL).
@@ -205,7 +237,13 @@ fn decimal_scale_from_rows(idx: usize, rows: &[Row]) -> Option<u8> {
 
 /// Build one Arrow array for column `idx`, dispatching on the Arrow target type
 /// (so the array always matches the schema field by construction).
-fn build_array(target: &DataType, idx: usize, rows: &[Row]) -> Result<ArrayRef> {
+fn build_array(
+    target: &DataType,
+    idx: usize,
+    rows: &[Row],
+    column: &str,
+    max_value_bytes: Option<usize>,
+) -> Result<ArrayRef> {
     macro_rules! simple {
         ($builder:ty, $pat:pat => $val:expr) => {{
             let mut b = <$builder>::with_capacity(rows.len());
@@ -274,7 +312,13 @@ fn build_array(target: &DataType, idx: usize, rows: &[Row]) -> Result<ArrayRef> 
             let mut b = StringBuilder::new();
             for row in rows {
                 match cell(row, idx) {
-                    Some(ColumnData::String(Some(s))) => b.append_value(s.as_ref()),
+                    Some(ColumnData::String(Some(s))) => {
+                        // Pre-allocation ceiling: the driver copy is unavoidable,
+                        // but bail before the append so the Arrow buffer never
+                        // grows to hold the oversized cell.
+                        value_within_ceiling(column, s.len(), max_value_bytes)?;
+                        b.append_value(s.as_ref());
+                    }
                     _ => b.append_null(),
                 }
             }
@@ -284,7 +328,10 @@ fn build_array(target: &DataType, idx: usize, rows: &[Row]) -> Result<ArrayRef> 
             let mut b = BinaryBuilder::new();
             for row in rows {
                 match cell(row, idx) {
-                    Some(ColumnData::Binary(Some(bytes))) => b.append_value(bytes.as_ref()),
+                    Some(ColumnData::Binary(Some(bytes))) => {
+                        value_within_ceiling(column, bytes.len(), max_value_bytes)?;
+                        b.append_value(bytes.as_ref());
+                    }
                     _ => b.append_null(),
                 }
             }
@@ -428,11 +475,12 @@ fn rescale_i128(value: i128, from_scale: u8, to_scale: u8) -> Result<i128> {
 pub(super) fn mssql_rows_to_record_batch(
     schema: &SchemaRef,
     rows: &[Row],
+    max_value_bytes: Option<usize>,
 ) -> Result<arrow::record_batch::RecordBatch> {
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
     for (idx, field) in schema.fields().iter().enumerate() {
         arrays.push(
-            build_array(field.data_type(), idx, rows)
+            build_array(field.data_type(), idx, rows, field.name(), max_value_bytes)
                 .with_context(|| format!("mssql column '{}'", field.name()))?,
         );
     }
@@ -548,5 +596,39 @@ mod tests {
                 "lossy-rescale Err must mention {needle:?}, got: {msg}"
             );
         }
+    }
+}
+
+// ─── Pre-allocation per-value ceiling tests (security audit V22, CWE-770) ──────
+#[cfg(test)]
+mod sec_value_ceiling_pre_alloc_tests {
+    use super::value_within_ceiling;
+
+    // The pre-allocation guard is the production gate that fires inside
+    // `build_array` *before* a `ColumnData::String`/`Binary` value is appended
+    // into the StringBuilder/BinaryBuilder — eliminating the second
+    // (Arrow-build) copy of an oversized cell. `build_array` needs real
+    // `tiberius::Row`s (a live driver), so the pure length-check is unit-tested
+    // here; the end-to-end proof is the sink contract test
+    // (`pipeline::sink::tests`), kept as the post-materialization backstop.
+
+    #[test]
+    fn sec_value_ceiling_pre_alloc_over_limit_errors() {
+        let err =
+            value_within_ceiling("ntext_col", 2 * 1024 * 1024, Some(1024 * 1024)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("RIVET_VALUE_TOO_LARGE"), "got: {msg}");
+        assert!(msg.contains("ntext_col"), "names the column: {msg}");
+    }
+
+    #[test]
+    fn sec_value_ceiling_pre_alloc_at_or_under_limit_ok() {
+        assert!(value_within_ceiling("c", 1024 * 1024, Some(1024 * 1024)).is_ok());
+        assert!(value_within_ceiling("c", 0, Some(1024 * 1024)).is_ok());
+    }
+
+    #[test]
+    fn sec_value_ceiling_pre_alloc_disabled_never_errors() {
+        assert!(value_within_ceiling("c", usize::MAX, None).is_ok());
     }
 }

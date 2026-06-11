@@ -591,6 +591,14 @@ impl Source for MssqlSource {
             let mut columns: Vec<tiberius::Column> = Vec::new();
             let mut buf: Vec<tiberius::Row> = Vec::with_capacity(ctl.target());
             let mut schema: Option<SchemaRef> = None;
+            // Per-value ceiling, computed exactly as the sink does (MB→bytes; `0`
+            // or None disables). Enforced pre-allocation inside the batch builder
+            // so an oversized cell bails before Arrow reserves the buffer.
+            let max_value_bytes = request
+                .tuning
+                .max_value_mb
+                .filter(|&mb| mb > 0)
+                .map(|mb| mb * 1024 * 1024);
 
             while let Some(item) = stream
                 .try_next()
@@ -626,6 +634,7 @@ impl Source for MssqlSource {
                                 &mut schema,
                                 &buf,
                                 sink,
+                                max_value_bytes,
                             )?;
                             let n = buf.len();
                             buf.clear();
@@ -672,6 +681,7 @@ impl Source for MssqlSource {
                     &mut schema,
                     &buf,
                     sink,
+                    max_value_bytes,
                 )?;
             }
             Ok::<_, anyhow::Error>(())
@@ -755,6 +765,7 @@ fn emit_mssql_batch(
     schema: &mut Option<SchemaRef>,
     rows: &[tiberius::Row],
     sink: &mut dyn BatchSink,
+    max_value_bytes: Option<usize>,
 ) -> Result<usize> {
     let schema_ref = match schema {
         Some(s) => s.clone(),
@@ -768,7 +779,7 @@ fn emit_mssql_batch(
         }
     };
     if !rows.is_empty() {
-        let batch = arrow_convert::mssql_rows_to_record_batch(&schema_ref, rows)?;
+        let batch = arrow_convert::mssql_rows_to_record_batch(&schema_ref, rows, max_value_bytes)?;
         let bytes = crate::tuning::SourceTuning::batch_memory_bytes(&batch);
         sink.on_batch(&batch)?;
         return Ok(bytes);

@@ -36,6 +36,40 @@ use crate::types::{
     build_arrow_field,
 };
 
+// ─── Pre-allocation per-value ceiling (security audit V22, CWE-770) ───────────
+
+/// Pre-allocation per-value size guard — twin of the PostgreSQL/MSSQL helpers.
+/// The sink-side `check_value_ceiling` (`pipeline::sink::mod`) scans the
+/// *already-built* Arrow batch, so an oversized cell costs the driver-decode
+/// copy **and** the Arrow-build copy before the guard fires. This check runs at
+/// the `mysql::Value` stage — after the unavoidable driver copy
+/// (`Value::Bytes`), but *before* the value is appended into the
+/// `StringBuilder` / `BinaryBuilder` — so the Arrow allocation never grows to
+/// hold it. Only variable-length values (Utf8 / Binary) can be individually
+/// huge; fixed-width arms (ints/floats/dates) never call this.
+///
+/// `max_value_bytes` is `tuning.max_value_mb` already converted to bytes with
+/// the `Some(0)/None ⇒ disabled` semantics applied by the caller (mirrors the
+/// sink). The error string mirrors `check_value_ceiling`'s `RIVET_VALUE_TOO_LARGE`
+/// message so both guards read identically. The sink guard is kept as the
+/// backstop (it also covers meta/enriched columns and is the contract test).
+fn value_within_ceiling(column: &str, len: usize, max_value_bytes: Option<usize>) -> Result<()> {
+    if let Some(limit) = max_value_bytes
+        && len > limit
+    {
+        anyhow::bail!(
+            "RIVET_VALUE_TOO_LARGE: column '{}' has a single value of {:.1} MB, exceeding the \
+             per-value ceiling of {} MB. One oversized cell can OOM the process regardless of \
+             batch size. Raise `tuning.max_value_mb` (or set it to 0 to disable the guard) if \
+             this value is expected.",
+            column,
+            len as f64 / (1024.0 * 1024.0),
+            limit / (1024 * 1024),
+        );
+    }
+    Ok(())
+}
+
 // ─── Native type names + Rivet type mapping ──────────────────────────────────
 
 pub(super) fn mysql_native_type_name(col: &mysql::Column) -> String {
@@ -301,6 +335,7 @@ pub(super) fn rows_to_record_batch_typed(
     schema: &SchemaRef,
     arrow_types: &[DataType],
     rows: &[mysql::Row],
+    max_value_bytes: Option<usize>,
 ) -> Result<RecordBatch> {
     // BIT columns put raw big-endian bytes on the wire, indistinguishable from
     // decimal text by inspecting the value alone (BIT(16) 0x3132 *is* the bytes
@@ -313,7 +348,15 @@ pub(super) fn rows_to_record_batch_typed(
             cols.get(col_idx)
                 .is_some_and(|c| matches!(c.column_type(), ColumnType::MYSQL_TYPE_BIT))
         });
-        arrays.push(build_array(arrow_type, col_idx, rows, is_bit)?);
+        let column = schema.field(col_idx).name();
+        arrays.push(build_array(
+            arrow_type,
+            col_idx,
+            rows,
+            is_bit,
+            column,
+            max_value_bytes,
+        )?);
     }
     Ok(RecordBatch::try_new(schema.clone(), arrays)?)
 }
@@ -398,6 +441,8 @@ fn build_array(
     col_idx: usize,
     rows: &[mysql::Row],
     is_bit: bool,
+    column: &str,
+    max_value_bytes: Option<usize>,
 ) -> Result<Arc<dyn Array>> {
     match arrow_type {
         DataType::Boolean => {
@@ -521,10 +566,16 @@ fn build_array(
                     // invalid value. Byte-identical to `from_utf8_lossy` but
                     // ~2.3x faster on wide text (bench `mysql_utf8_text_append`).
                     // Matches every other text path in this file + the PG decoder.
-                    Some(Value::Bytes(bv)) => match bytes_to_str(bv) {
-                        Some(s) => b.append_value(s),
-                        None => b.append_value(String::from_utf8_lossy(bv).as_ref()),
-                    },
+                    Some(Value::Bytes(bv)) => {
+                        // Pre-allocation ceiling: the driver copy (`Value::Bytes`)
+                        // is unavoidable, but bail before the append so the Arrow
+                        // buffer never grows to hold the oversized cell.
+                        value_within_ceiling(column, bv.len(), max_value_bytes)?;
+                        match bytes_to_str(bv) {
+                            Some(s) => b.append_value(s),
+                            None => b.append_value(String::from_utf8_lossy(bv).as_ref()),
+                        }
+                    }
                     Some(Value::Int(v)) => b.append_value(v.to_string()),
                     Some(Value::UInt(v)) => b.append_value(v.to_string()),
                     Some(Value::Float(v)) => b.append_value(v.to_string()),
@@ -543,7 +594,10 @@ fn build_array(
             let mut b = BinaryBuilder::with_capacity(rows.len(), rows.len() * 64);
             for row in rows {
                 match row.as_ref(col_idx) {
-                    Some(Value::Bytes(bv)) => b.append_value(bv),
+                    Some(Value::Bytes(bv)) => {
+                        value_within_ceiling(column, bv.len(), max_value_bytes)?;
+                        b.append_value(bv);
+                    }
                     _ => b.append_null(),
                 }
             }
@@ -927,6 +981,39 @@ mod utf8_fast_path_tests {
     }
 }
 
+// ─── Pre-allocation per-value ceiling tests (security audit V22, CWE-770) ──────
+#[cfg(test)]
+mod sec_value_ceiling_pre_alloc_tests {
+    use super::value_within_ceiling;
+
+    // The pre-allocation guard is the production gate that fires inside
+    // `build_array` *before* a `Value::Bytes` is appended into the
+    // StringBuilder/BinaryBuilder — eliminating the second (Arrow-build) copy
+    // of an oversized cell. `build_array` needs real `mysql::Row`s (a live
+    // driver), so the pure length-check is unit-tested here; the end-to-end
+    // proof is the sink contract test (`pipeline::sink::tests`), kept as the
+    // post-materialization backstop.
+
+    #[test]
+    fn sec_value_ceiling_pre_alloc_over_limit_errors() {
+        let err = value_within_ceiling("blob_col", 2 * 1024 * 1024, Some(1024 * 1024)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("RIVET_VALUE_TOO_LARGE"), "got: {msg}");
+        assert!(msg.contains("blob_col"), "names the column: {msg}");
+    }
+
+    #[test]
+    fn sec_value_ceiling_pre_alloc_at_or_under_limit_ok() {
+        assert!(value_within_ceiling("c", 1024 * 1024, Some(1024 * 1024)).is_ok());
+        assert!(value_within_ceiling("c", 0, Some(1024 * 1024)).is_ok());
+    }
+
+    #[test]
+    fn sec_value_ceiling_pre_alloc_disabled_never_errors() {
+        assert!(value_within_ceiling("c", usize::MAX, None).is_ok());
+    }
+}
+
 #[cfg(test)]
 mod int64_bytes_dispatch_tests {
     use super::int64_from_bytes;
@@ -1163,7 +1250,7 @@ mod roast_mysql_bit_decode_tests {
             "BIT(n>1) maps to Int64 — the buggy builder arm"
         );
 
-        let batch = rows_to_record_batch_typed(&Arc::new(schema), &arrow_types, &rows)
+        let batch = rows_to_record_batch_typed(&Arc::new(schema), &arrow_types, &rows, None)
             .expect("record batch from BIT(16) row");
         let arr = batch
             .column(0)

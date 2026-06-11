@@ -428,6 +428,13 @@ fn pg_run_export(
     let mut columns_cache: Option<Vec<(String, Type)>> = None;
     let mut total_rows: usize = 0;
     let mut cap_applied = false;
+    // Per-value ceiling, computed exactly as the sink does (MB→bytes; `0` or
+    // None disables). Enforced pre-allocation inside the batch builder so an
+    // oversized cell bails before Arrow reserves the buffer.
+    let max_value_bytes = tuning
+        .max_value_mb
+        .filter(|&mb| mb > 0)
+        .map(|mb| mb * 1024 * 1024);
 
     loop {
         let requested = ctl.target();
@@ -467,7 +474,7 @@ fn pg_run_export(
         let cols = columns_cache
             .as_ref()
             .expect("columns set on first iteration");
-        let batch = rows_to_record_batch_typed(s, cols, &rows)?;
+        let batch = rows_to_record_batch_typed(s, cols, &rows, max_value_bytes)?;
         drop(rows);
 
         // After the first (probe) batch we know the actual row width. Cap the
