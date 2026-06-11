@@ -45,9 +45,12 @@
 > **LOW (2026-06-11): 18 из 30 закрыто** тем же fix+assert конвейером (doctor single-surface/perm-label/trim/stdout-line,
 > check target-msg+note+plan-validation+export-list, state column+hints+unknown-export, plan json-array+output,
 > validate untracked→warning, repair chunk-index, config warns+docs). **Дубли уже закрытых HIGH:** L3/L5/L11.
-> **Отложено:** L0 (init MSSQL-scaffold) и L1 (init include/exclude фильтр) — фичи; L20 (doctor fail-fast на
-> недоступном cloud) — нужен no-retry seam в `cloud.rs`; L26 (hint на не-закавыченный `{partition}`) — ошибка
-> serde_yaml upstream; L27 (cursor/window-строка в summary) — частично.
+> **Отложенные 5 — закрыты (2026-06-11):** L0 — `rivet init` И `rivet check` теперь поддерживают SQL Server
+> (новые `src/init/mssql.rs` + `src/preflight/mssql.rs` на `MssqlSource`; flow init→check→run работает end-to-end,
+> заодно закрыта роаст-находка про MSSQL-check); L1 — `init --include/--exclude` глоб-фильтр; L20 — doctor строит
+> probe с `max_times=0` (fail-fast вместо ~10s storm, экспорты сохраняют 5 ретраев); L26 — `Config::load` ловит
+> не-закавыченный `{partition}` flow-mapping и даёт hint на кавычки; L27 — 0-строчный incremental/time-window
+> summary показывает позицию курсора/окна. Все с RED→GREEN тестами; 1589 offline + live (mssql/pg/doctor) зелёные.
 
 ---
 
