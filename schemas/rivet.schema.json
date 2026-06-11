@@ -502,7 +502,7 @@
           "minimum": 0
         },
         "partition_by": {
-          "description": "Value-based output partitioning: split this export's rows into one\ndestination sub-prefix per distinct bucket of this column's value\n(Hive-style `col=value/` layout). The bucket width is\n`partition_granularity`. Requires a `{partition}` token in\n`destination.path` / `destination.prefix`.\n\nOrthogonal to `mode`: each partition runs the export's own mode, so\n`mode: chunked` chunks *within* a day. Rows whose partition column is\nNULL land in `col=__HIVE_DEFAULT_PARTITION__/` (Hive default partition)\nso no row is silently dropped. Not compatible with `mode: time_window`.\n\n```yaml\nexports:\n  - name: events\n    table: events\n    partition_by: created_at\n    partition_granularity: day\n    destination:\n      type: s3\n      bucket: my-bucket\n      prefix: \"events/{partition}/\"   # → events/created_at=2023-01-01/\n```",
+          "description": "Date/time output partitioning: split this export's rows into one\ndestination sub-prefix per calendar bucket of this **DATE or TIMESTAMP**\ncolumn, bucketed by [`partition_granularity`](Self::partition_granularity)\n(`day` / `month` / `year`), in a Hive-style `col=value/` layout\n(`created_at=2023-01-01/`, `created_at=2023-01/`, `created_at=2023/`).\nRequires a `{partition}` token in `destination.path` /\n`destination.prefix`.\n\nThis is **not** arbitrary value partitioning: the column's min/max is\nread and parsed as a date to generate contiguous calendar buckets, so a\nnon-temporal column (e.g. `partition_by: status`) fails at run time with\n\"could not parse partition min '<value>' from column '<col>' as a date\".\nTo split by a categorical column, write one export per value with a\n`WHERE` filter instead.\n\nOrthogonal to `mode`: each partition runs the export's own mode, so\n`mode: chunked` chunks *within* a day. Rows whose partition column is\nNULL land in `col=__HIVE_DEFAULT_PARTITION__/` (Hive default partition)\nso no row is silently dropped. Not compatible with `mode: time_window`.\n\n```yaml\nexports:\n  - name: events\n    table: events\n    partition_by: created_at        # must be a DATE or TIMESTAMP column\n    partition_granularity: day\n    destination:\n      type: s3\n      bucket: my-bucket\n      prefix: \"events/{partition}/\"   # → events/created_at=2023-01-01/\n```",
           "type": [
             "string",
             "null"
@@ -510,7 +510,7 @@
           "default": null
         },
         "partition_granularity": {
-          "description": "Bucket width for [`partition_by`](Self::partition_by). Default `day`.",
+          "description": "Calendar bucket width for [`partition_by`](Self::partition_by):\n`day` (default), `month`, or `year`. Determines how the partition\ncolumn's date/timestamp range is split into contiguous Hive buckets\n(`col=2023-01-01/` / `col=2023-01/` / `col=2023/`). Has no effect\nunless `partition_by` is set.",
           "$ref": "#/$defs/PartitionGranularity",
           "default": "day"
         },
@@ -693,12 +693,23 @@
       ]
     },
     "PartitionGranularity": {
-      "description": "Bucket width for value-based output partitioning ([`ExportConfig::partition_by`]).",
-      "type": "string",
-      "enum": [
-        "day",
-        "month",
-        "year"
+      "description": "Calendar bucket width for date/timestamp output partitioning\n([`ExportConfig::partition_by`]). The partition column must be a DATE or\nTIMESTAMP column; this picks how its range is split into contiguous Hive\nbuckets. It is not a knob for partitioning by arbitrary column values.",
+      "oneOf": [
+        {
+          "description": "One bucket per calendar day (`col=2023-01-01/`). Default.",
+          "type": "string",
+          "const": "day"
+        },
+        {
+          "description": "One bucket per calendar month (`col=2023-01/`).",
+          "type": "string",
+          "const": "month"
+        },
+        {
+          "description": "One bucket per calendar year (`col=2023/`).",
+          "type": "string",
+          "const": "year"
+        }
       ]
     },
     "FormatType": {
