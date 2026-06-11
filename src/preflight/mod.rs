@@ -1,6 +1,7 @@
 mod analysis;
 pub(crate) mod cursor_expr;
 mod doctor;
+mod mssql;
 mod mysql;
 mod postgres;
 pub mod type_report;
@@ -71,9 +72,7 @@ pub(crate) fn get_export_diagnostic(
     match config.source.source_type {
         SourceType::Postgres => postgres::diagnose_export_pg(&url, tls, export),
         SourceType::Mysql => mysql::diagnose_export_mysql(&url, tls, export),
-        SourceType::Mssql => {
-            anyhow::bail!("mssql preflight diagnostics not yet implemented (scaffold)")
-        }
+        SourceType::Mssql => mssql::diagnose_export_mssql(&url, tls, export),
     }
 }
 
@@ -138,7 +137,7 @@ pub fn check(
     match config.source.source_type {
         SourceType::Postgres => postgres::check_postgres(&url, tls, &exports, json_output)?,
         SourceType::Mysql => mysql::check_mysql(&url, tls, &exports, json_output)?,
-        SourceType::Mssql => anyhow::bail!("mssql check not yet implemented (scaffold)"),
+        SourceType::Mssql => mssql::check_mssql(&url, tls, &exports, json_output)?,
     }
 
     // Destination credential-resolution preflight.  Until 0.7.6 `check` only

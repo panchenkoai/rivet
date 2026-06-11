@@ -145,8 +145,13 @@ fn check_source_auth(config: &Config) -> Result<()> {
 }
 
 fn check_destination_auth(dest: &crate::config::DestinationConfig) -> Result<()> {
-    use crate::destination::create_destination;
-    let d = create_destination(dest)?;
+    use crate::destination::create_destination_for_probe;
+    // L20: a preflight connectivity probe must FAIL FAST against an
+    // unreachable cloud endpoint. The export-path `create_destination`
+    // inherits a 5-attempt escalating-backoff RetryLayer (~10s of WARN-noisy
+    // retries before the `[FAIL]`); the probe factory builds the destination
+    // with retries disabled so a closed port surfaces immediately.
+    let d = create_destination_for_probe(dest)?;
     let probe_key = crate::manifest::DOCTOR_PROBE_FILENAME;
     let tmp = std::env::temp_dir().join(probe_key);
     std::fs::write(&tmp, b"ok")?;

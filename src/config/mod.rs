@@ -75,11 +75,73 @@ impl Config {
     }
 
     pub fn from_yaml(yaml: &str) -> crate::error::Result<Self> {
+        // Intercept the unquoted-`{partition}` footgun before the raw-YAML
+        // pre-scans below (they `from_str::<Value>` too and would re-emit the
+        // same cryptic libyaml message). A document that does not even parse as
+        // a `Value` is malformed; if the failure looks like a flow-mapping
+        // scanner error *and* the source carries an unquoted brace value, point
+        // straight at the quoting fix. On a valid config this `Value` parse
+        // succeeds and the block is skipped, so the success path is unchanged.
+        if let Err(e) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(yaml)
+            && let Some(hint) = Self::unquoted_template_brace_hint(yaml, &e.to_string())
+        {
+            return Err(anyhow::anyhow!("{e}\n  {hint}"));
+        }
         Self::check_misplaced_tuning_fields(yaml)?;
         Self::check_csv_compression(yaml)?;
-        let config: Config = serde_yaml_ng::from_str(yaml).map_err(lints::enhance_parse_error)?;
+        let config: Config = serde_yaml_ng::from_str(yaml).map_err(|e| {
+            // A well-formed flow map (`prefix: {partition}`) parses as a YAML
+            // value but serde then rejects it with `invalid type: map, expected
+            // a string`. That is the same unquoted-brace footgun, surfacing one
+            // layer later than the scanner errors caught above — so try the same
+            // hint here before falling back to the generic field-typo enhancer.
+            if let Some(hint) = Self::unquoted_template_brace_hint(yaml, &e.to_string()) {
+                anyhow::anyhow!("{e}\n  {hint}")
+            } else {
+                lints::enhance_parse_error(e)
+            }
+        })?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Detect the unquoted-`{partition}` (or `{date}`, …) template footgun and
+    /// return an actionable quoting hint, or `None` when the error is unrelated.
+    ///
+    /// A YAML value that *starts* a flow mapping — `prefix: {partition}` — is
+    /// the common copy-paste mistake: `{partition}` is the required token for
+    /// `partition_by`, but unquoted it parses as a YAML map (or, with trailing
+    /// text, trips the libyaml scanner). serde then emits a cryptic
+    /// `did not find expected ',' or '}'` / `while parsing a flow mapping` /
+    /// `invalid type: map, expected a string` with no hint that a pair of
+    /// quotes is the fix.
+    ///
+    /// Two guards keep this from firing on unrelated parse errors: the error
+    /// message must carry one of the flow-mapping symptoms, AND the raw source
+    /// must actually contain an unquoted `{…}` value. Both must hold, so a
+    /// valid config (every brace value quoted) never sees the hint, and a
+    /// genuine map-typed field error elsewhere is left alone.
+    fn unquoted_template_brace_hint(yaml: &str, err_msg: &str) -> Option<String> {
+        const FLOW_SYMPTOMS: &[&str] = &[
+            "did not find expected ',' or '}'",
+            "while parsing a flow mapping",
+            // A bare `key: {token}` parses as a map, then serde rejects the
+            // map where it wanted a scalar — same root cause, later layer.
+            "invalid type: map, expected a string",
+            // `key: {token}/more` runs the flow map into block context.
+            "did not find expected key",
+        ];
+        if !FLOW_SYMPTOMS.iter().any(|s| err_msg.contains(s)) {
+            return None;
+        }
+        if !yaml.lines().any(line_has_unquoted_brace_value) {
+            return None;
+        }
+        Some(
+            "a YAML value containing { } (such as {partition} or {date}) must be quoted, \
+             e.g. prefix: \"exports/{partition}/\""
+                .to_string(),
+        )
     }
 
     /// Reject `format: csv` paired with an explicitly-requested compression
@@ -617,6 +679,60 @@ impl Config {
     }
 }
 
+/// True when a single YAML line carries a mapping value (text after `key:`)
+/// that contains a `{` outside of any quotes — the unquoted-template-brace
+/// shape (`prefix: {partition}`, `path: {date}/out`).
+///
+/// Quote-aware so a properly quoted value (`prefix: "exports/{partition}/"`)
+/// does *not* match, and `$`-prefixed braces (`${VAR}` env placeholders) are
+/// ignored — they are resolved before the parse and are not the footgun.
+fn line_has_unquoted_brace_value(line: &str) -> bool {
+    // Whole-line comments never carry a value — skip before splitting.
+    if line.trim_start().starts_with('#') {
+        return false;
+    }
+    // Split key from value at the first `": "` / `":\t"` / trailing `:`.
+    // A YAML plain-key separator is a colon followed by whitespace or EOL.
+    let bytes = line.as_bytes();
+    let mut sep = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b':' && (i + 1 == bytes.len() || bytes[i + 1].is_ascii_whitespace()) {
+            sep = Some(i + 1);
+            break;
+        }
+        i += 1;
+    }
+    let Some(value_start) = sep else {
+        return false;
+    };
+    let value = line[value_start..].trim_start();
+    // A trailing `#` after the value starts an inline comment; an empty or
+    // comment-only value carries no brace to flag.
+    if value.is_empty() || value.starts_with('#') {
+        return false;
+    }
+
+    let mut in_single = false;
+    let mut in_double = false;
+    let vbytes = value.as_bytes();
+    for (j, &c) in vbytes.iter().enumerate() {
+        match c {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'{' if !in_single && !in_double => {
+                // Ignore `${...}` env placeholders (resolved pre-parse).
+                if j > 0 && vbytes[j - 1] == b'$' {
+                    continue;
+                }
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -731,5 +847,131 @@ mod audit_csv_compression {
                 ct.label()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod audit_unquoted_template_brace {
+    //! yaml-hint: an unquoted `{partition}` (or `{date}`) in a path/prefix
+    //! value trips serde_yaml_ng's flow-mapping parser with a cryptic message
+    //! that gives no clue the brace needs quoting. Since `{partition}` is the
+    //! required token for `partition_by`, this is a common copy-paste footgun.
+    //! `Config::from_yaml` augments the parser error with a quoting hint; these
+    //! tests pin that behavior (and guard that valid configs are untouched).
+    use super::*;
+
+    /// A full, otherwise-valid config whose `prefix:` value is whatever the
+    /// caller passes verbatim (quoted or not). Only the `prefix:` line varies,
+    /// so any parse error is attributable to the brace under test.
+    fn yaml_with_prefix(prefix_value: &str) -> String {
+        format!(
+            "source:\n\
+             \x20 type: postgres\n\
+             \x20 url: \"postgresql://localhost/test\"\n\
+             exports:\n\
+             \x20 - name: t\n\
+             \x20   query: \"SELECT 1\"\n\
+             \x20   format: parquet\n\
+             \x20   partition_by: created_date\n\
+             \x20   destination:\n\
+             \x20     type: local\n\
+             \x20     path: ./out\n\
+             \x20     prefix: {prefix_value}\n"
+        )
+    }
+
+    const HINT_FRAGMENT: &str =
+        "a YAML value containing { } (such as {partition} or {date}) must be quoted";
+
+    #[test]
+    fn bare_partition_token_gets_quoting_hint() {
+        // `prefix: {partition}` parses as a YAML map, so serde rejects it with
+        // `invalid type: map, expected a string` — no clue it's a quoting bug.
+        let err = Config::from_yaml(&yaml_with_prefix("{partition}")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(HINT_FRAGMENT),
+            "bare {{partition}} must carry the quoting hint; got: {msg}"
+        );
+        // The original parser detail (type + location) is preserved.
+        assert!(
+            msg.contains("invalid type: map") || msg.contains("line"),
+            "the original parser error must be kept; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn trailing_text_after_brace_gets_quoting_hint() {
+        // `prefix: {date}/{partition}/` runs the flow map into block context:
+        // serde emits `did not find expected key ... while parsing a block
+        // mapping`. Same footgun, different libyaml symptom.
+        let err = Config::from_yaml(&yaml_with_prefix("{date}/{partition}/")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(HINT_FRAGMENT),
+            "{{date}}/{{partition}}/ must carry the quoting hint; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn unclosed_brace_gets_quoting_hint() {
+        // `prefix: {partition` (unclosed) is the canonical flow-mapping scanner
+        // error: `did not find expected ',' or '}' ... while parsing a flow
+        // mapping`. The hint must still fire.
+        let err = Config::from_yaml(&yaml_with_prefix("{partition")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(HINT_FRAGMENT),
+            "unclosed brace must carry the quoting hint; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn quoted_brace_value_loads_ok() {
+        // The fix itself, applied: a properly quoted brace value parses and
+        // validates. This is the guard that the hint never reaches a valid
+        // config and the success path is unchanged.
+        let cfg = Config::from_yaml(&yaml_with_prefix("\"exports/{partition}/\""))
+            .expect("quoted {partition} prefix must load");
+        assert_eq!(
+            cfg.exports[0].destination.prefix.as_deref(),
+            Some("exports/{partition}/")
+        );
+    }
+
+    #[test]
+    fn config_without_braces_is_untouched() {
+        // No brace anywhere: a plain valid config still loads, and an unrelated
+        // YAML error elsewhere must not pick up a spurious quoting hint.
+        Config::from_yaml(&yaml_with_prefix("exports/data/"))
+            .expect("a brace-free prefix must load");
+    }
+
+    // ── line_has_unquoted_brace_value() unit coverage ──────────────────────
+
+    #[test]
+    fn unquoted_brace_value_is_detected() {
+        assert!(line_has_unquoted_brace_value("    prefix: {partition}"));
+        assert!(line_has_unquoted_brace_value("      path: {date}/out"));
+        assert!(line_has_unquoted_brace_value("prefix: {partition")); // unclosed
+    }
+
+    #[test]
+    fn quoted_brace_value_is_not_flagged() {
+        // Quotes around the value hide the brace from the scanner — not a bug.
+        assert!(!line_has_unquoted_brace_value(
+            "    prefix: \"exports/{partition}/\""
+        ));
+        assert!(!line_has_unquoted_brace_value("    prefix: 'data/{date}/'"));
+    }
+
+    #[test]
+    fn env_placeholder_and_plain_values_are_not_flagged() {
+        // `${VAR}` placeholders are resolved before the parse and are not the
+        // footgun; plain brace-free values are obviously fine.
+        assert!(!line_has_unquoted_brace_value("    url: ${DATABASE_URL}"));
+        assert!(!line_has_unquoted_brace_value("    path: ./out"));
+        assert!(!line_has_unquoted_brace_value("  # prefix: {partition}")); // comment
+        assert!(!line_has_unquoted_brace_value("    prefix:")); // no value
     }
 }

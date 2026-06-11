@@ -108,7 +108,7 @@ pub enum Commands {
     /// Generate a config scaffold from a live database (connect + introspect)
     #[command(group = clap::ArgGroup::new("source_spec").required(true).multiple(false))]
     Init {
-        /// Database URL (postgresql:// or mysql://). Visible in shell history / `ps`;
+        /// Database URL (postgresql://, mysql://, or sqlserver://). Visible in shell history / `ps`;
         /// prefer `--source-env` or `--source-file` for anything other than local dev.
         #[arg(long, group = "source_spec")]
         source: Option<String>,
@@ -120,12 +120,18 @@ pub enum Commands {
         /// Credentials stay on disk instead of entering the process command line.
         #[arg(long, value_name = "PATH", group = "source_spec")]
         source_file: Option<String>,
-        /// Single table, optionally schema-qualified (e.g. public.orders). Omit to emit all tables/views in a Postgres schema or MySQL database.
+        /// Single table, optionally schema-qualified (e.g. public.orders, dbo.orders). Omit to emit all tables/views in a Postgres/SQL Server schema or MySQL database.
         #[arg(long)]
         table: Option<String>,
-        /// PostgreSQL: schema to export (default public). MySQL: database name if missing from the URL, or override URL database.
+        /// PostgreSQL: schema to export (default public). SQL Server: schema (default dbo). MySQL: database name if missing from the URL, or override URL database.
         #[arg(long)]
         schema: Option<String>,
+        /// Whole-schema only: keep only tables/views matching this glob (`*`/`?`). Repeatable; a table is kept if it matches any `--include`. No `--include` = keep all.
+        #[arg(long, value_name = "GLOB")]
+        include: Vec<String>,
+        /// Whole-schema only: drop tables/views matching this glob (`*`/`?`). Repeatable; `--exclude` wins over `--include`.
+        #[arg(long, value_name = "GLOB")]
+        exclude: Vec<String>,
         /// Write output to this file instead of stdout
         #[arg(short, long)]
         output: Option<String>,
@@ -621,6 +627,48 @@ mod tests {
             ],
             "well-formed --s3-bucket invocation",
         );
+    }
+
+    #[test]
+    fn init_clap_accepts_repeatable_include_and_exclude_globs() {
+        // Both flags are repeatable and parse alongside a source spec.
+        let cli = Cli::try_parse_from([
+            "rivet",
+            "init",
+            "--source",
+            "sqlserver://sa:p@host:1433/db",
+            "--include",
+            "orders",
+            "--include",
+            "users",
+            "--exclude",
+            "bench_*",
+        ])
+        .expect("repeatable --include/--exclude must parse");
+        match cli.command {
+            Commands::Init {
+                include, exclude, ..
+            } => {
+                assert_eq!(include, vec!["orders", "users"]);
+                assert_eq!(exclude, vec!["bench_*"]);
+            }
+            _ => panic!("expected Init command"),
+        }
+    }
+
+    #[test]
+    fn init_clap_include_exclude_default_empty() {
+        let cli = Cli::try_parse_from(["rivet", "init", "--source", "postgresql://localhost/db"])
+            .expect("init without globs must parse");
+        match cli.command {
+            Commands::Init {
+                include, exclude, ..
+            } => {
+                assert!(include.is_empty(), "include defaults to empty");
+                assert!(exclude.is_empty(), "exclude defaults to empty");
+            }
+            _ => panic!("expected Init command"),
+        }
     }
 
     #[test]

@@ -94,6 +94,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             source_file,
             table,
             schema,
+            include,
+            exclude,
             output,
             discover,
             gcs_bucket,
@@ -106,6 +108,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             source_file,
             table,
             schema,
+            include,
+            exclude,
             output,
             discover,
             gcs_bucket,
@@ -325,6 +329,8 @@ fn dispatch_init(
     source_file: Option<String>,
     table: Option<String>,
     schema: Option<String>,
+    include: Vec<String>,
+    exclude: Vec<String>,
     output: Option<String>,
     discover: bool,
     gcs_bucket: Option<String>,
@@ -344,6 +350,7 @@ fn dispatch_init(
         s3_bucket,
         s3_region,
     };
+    let filter = init::TableFilter { include, exclude };
     init::init(
         &source_url,
         table.as_deref(),
@@ -351,6 +358,7 @@ fn dispatch_init(
         output.as_deref(),
         fmt,
         yaml_dest,
+        &filter,
     )
 }
 

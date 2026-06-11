@@ -233,6 +233,39 @@ pub fn create_destination(config: &DestinationConfig) -> Result<Box<dyn Destinat
     }
 }
 
+/// Build a destination for a preflight connectivity probe (`rivet doctor`).
+///
+/// Identical to [`create_destination`] except cloud backends (S3/GCS/Azure)
+/// are constructed with the OpenDAL retry budget disabled (`max_times = 0`,
+/// single attempt). A probe against an unreachable endpoint must FAIL FAST
+/// — inheriting the export's 5-attempt escalating backoff would block doctor
+/// for ~10s and spew transient-retry WARN noise before the `[FAIL]` line.
+///
+/// Local and stdout backends have no retry layer, so they fall through to the
+/// same construction `create_destination` uses; the probe distinction is
+/// meaningful only for the OpenDAL-backed stores.
+pub fn create_destination_for_probe(config: &DestinationConfig) -> Result<Box<dyn Destination>> {
+    use crate::config::DestinationType;
+    // No retries on the probe path: a single attempt, then surface the error.
+    const PROBE_MAX_RETRIES: usize = 0;
+    match config.destination_type {
+        DestinationType::S3 => Ok(Box::new(s3::S3Destination::new_with_retries(
+            config,
+            PROBE_MAX_RETRIES,
+        )?)),
+        DestinationType::Gcs => Ok(Box::new(gcs::GcsDestination::new_with_retries(
+            config,
+            PROBE_MAX_RETRIES,
+        )?)),
+        DestinationType::Azure => Ok(Box::new(azure::AzureDestination::new_with_retries(
+            config,
+            PROBE_MAX_RETRIES,
+        )?)),
+        // No OpenDAL retry layer to disable — same path as a real export.
+        DestinationType::Local | DestinationType::Stdout => create_destination(config),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

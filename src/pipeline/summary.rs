@@ -454,6 +454,18 @@ impl RunSummary {
         // `skip_reason` (the value is a follow-up once it reaches here).
         if let Some(pos) = incremental_position_line(self.skip_reason.as_deref()) {
             rows.push(("cursor", pos));
+        } else if let Some(window) = time_window_skip_line(&self.mode, self.skip_reason.as_deref())
+        {
+            // A time_window run that returned 0 rows reports the generic
+            // `"source returned 0 rows"` skip (`cursor_column()` is `None` for
+            // this strategy), so the incremental branch above never fires. Add
+            // an explicit `window:` line so the operator can tell an *empty
+            // window* apart from a *wrong column / window* — otherwise the
+            // summary is indistinguishable from any other empty run. The window
+            // column / days / computed bound are not plumbed onto `RunSummary`,
+            // so this is the strategy-level signal reachable here (the concrete
+            // bound is a follow-up once the runner records it on the summary).
+            rows.push(("window", window));
         }
         if self.bytes_written > 0 {
             rows.push(("bytes", format_bytes(self.bytes_written)));
@@ -641,6 +653,30 @@ fn incremental_position_line(skip_reason: Option<&str>) -> Option<String> {
         .strip_prefix("no new rows since cursor '")?
         .strip_suffix('\'')?;
     Some(format!("'{col}' unchanged (no new rows this run)"))
+}
+
+/// Derive the summary block's `window:` line for a time_window run that
+/// returned nothing.
+///
+/// A `TimeWindow` strategy has no cursor column, so a 0-row run reports the
+/// generic `"source returned 0 rows"` skip — the `incremental_position_line`
+/// branch never fires and, without this line, an empty time window looks
+/// identical to any other empty export. Surfacing it lets the operator tell an
+/// *empty window* (data simply outside the rolling range) from a *misconfigured
+/// window* (wrong `time_column` / `days_window`).
+///
+/// Keyed on `mode == "timewindow"` (set from `ExtractionStrategy::mode_label`)
+/// plus a set skip reason, so it only fires on a skipped time_window run and
+/// never on incremental/snapshot/chunked/keyset. The window column, days, and
+/// computed lower bound are not carried on `RunSummary`, so this reports the
+/// strategy-level fact and where to look — the concrete bound is a follow-up
+/// once the runner records it onto the summary.
+fn time_window_skip_line(mode: &str, skip_reason: Option<&str>) -> Option<String> {
+    skip_reason?;
+    if mode != "timewindow" {
+        return None;
+    }
+    Some("rolling time window matched no rows — check `time_column`/`days_window`".to_string())
 }
 
 fn summarize_parallel_chunk_errors(raw: &str) -> Option<String> {
@@ -1166,5 +1202,57 @@ mod tests {
             None
         );
         assert_eq!(incremental_position_line(None), None);
+    }
+
+    #[test]
+    fn render_surfaces_window_position_on_zero_row_time_window() {
+        // L27 (time_window arm): a 0-row time_window run reports the generic
+        // `"source returned 0 rows"` skip (the strategy has no cursor column),
+        // so the `cursor:` branch never fires. Without a `window:` line the
+        // operator can't tell an empty window from a wrong column/window —
+        // assert the dedicated `window:` line appears for this mode.
+        let mut s = RunSummary::new(&plan_for("events"));
+        s.status = "skipped".into();
+        s.mode = "timewindow".into();
+        s.skip_reason = Some("source returned 0 rows".into());
+
+        let block = s.render();
+        let window_line = block
+            .lines()
+            .find(|l| l.trim_start().starts_with("window:"))
+            .unwrap_or_else(|| panic!("expected a window: line in block: {block}"));
+        assert!(
+            window_line.contains("matched no rows"),
+            "window line reports the empty window: {window_line:?}"
+        );
+        assert!(
+            window_line.contains("time_column") && window_line.contains("days_window"),
+            "window line points at the window config to check: {window_line:?}"
+        );
+        // The generic 0-row skip must not also produce a `cursor:` line.
+        assert!(
+            !block.lines().any(|l| l.trim_start().starts_with("cursor:")),
+            "no cursor line for a non-cursor strategy: {block}"
+        );
+    }
+
+    #[test]
+    fn time_window_skip_line_only_for_skipped_time_window() {
+        // Fires only when the run skipped AND the strategy is time_window.
+        assert_eq!(
+            time_window_skip_line("timewindow", Some("source returned 0 rows")),
+            Some("rolling time window matched no rows — check `time_column`/`days_window`".into())
+        );
+        // Wrong mode → no window line (incremental/snapshot handle their own).
+        assert_eq!(
+            time_window_skip_line("incremental", Some("source returned 0 rows")),
+            None
+        );
+        assert_eq!(
+            time_window_skip_line("full", Some("source returned 0 rows")),
+            None
+        );
+        // A time_window run that produced rows (no skip) gets no window line.
+        assert_eq!(time_window_skip_line("timewindow", None), None);
     }
 }
