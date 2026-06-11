@@ -96,6 +96,7 @@ pub fn run_plan_command(
     // export is dropped and each file remains directly consumable by `apply`.
     let multi_export = built.len() > 1;
 
+    let mut artifacts: Vec<PlanArtifact> = Vec::with_capacity(built.len());
     for (mut artifact, _inputs, standalone_rec) in built {
         let snap = if let Some(ref camp) = campaign_opt {
             let rec = camp
@@ -115,8 +116,10 @@ pub fn run_plan_command(
             }
         };
         artifact.prioritization = Some(snap);
-        emit_artifact(&artifact, &format, multi_export)?;
+        artifacts.push(artifact);
     }
+
+    emit_artifacts(&artifacts, &format, multi_export)?;
 
     Ok(())
 }
@@ -364,31 +367,45 @@ fn compute_plan_data(
     }
 }
 
-fn emit_artifact(
-    artifact: &PlanArtifact,
+fn emit_artifacts(
+    artifacts: &[PlanArtifact],
     format: &PlanOutputFormat,
     multi_export: bool,
 ) -> Result<()> {
     match format {
         PlanOutputFormat::Pretty => {
-            artifact.print_summary();
+            for artifact in artifacts {
+                artifact.print_summary();
+            }
         }
+        // Multi-export JSON to stdout: a single export prints its object
+        // unchanged, but printing N objects back-to-back is invalid JSON (audit
+        // #L10: `jq` fails with "Extra data"). Wrap them in a JSON array so the
+        // stream parses as one document.
         PlanOutputFormat::Json(None) => {
-            println!("{}", artifact.to_json_pretty()?);
+            if artifacts.len() > 1 {
+                // `&[PlanArtifact]` serializes as a JSON array — one parseable
+                // document rather than N concatenated objects.
+                println!("{}", serde_json::to_string_pretty(artifacts)?);
+            } else if let Some(artifact) = artifacts.first() {
+                println!("{}", artifact.to_json_pretty()?);
+            }
         }
         PlanOutputFormat::Json(Some(path)) => {
-            let json = artifact.to_json_pretty()?;
-            // For a single export keep the operator's exact path so `rivet apply
-            // <path>` works verbatim. For multiple exports a single path would
-            // overwrite (audit #4): give each export its own file.
-            let out_path = if multi_export {
-                per_export_output_path(path, &artifact.export_name)
-            } else {
-                path.clone()
-            };
-            std::fs::write(&out_path, &json)
-                .map_err(|e| anyhow::anyhow!("cannot write plan file '{}': {}", out_path, e))?;
-            println!("Plan written to: {}", out_path);
+            for artifact in artifacts {
+                let json = artifact.to_json_pretty()?;
+                // For a single export keep the operator's exact path so `rivet
+                // apply <path>` works verbatim. For multiple exports a single
+                // path would overwrite (audit #4): give each export its own file.
+                let out_path = if multi_export {
+                    per_export_output_path(path, &artifact.export_name)
+                } else {
+                    path.clone()
+                };
+                std::fs::write(&out_path, &json)
+                    .map_err(|e| anyhow::anyhow!("cannot write plan file '{}': {}", out_path, e))?;
+                println!("Plan written to: {}", out_path);
+            }
         }
     }
     Ok(())

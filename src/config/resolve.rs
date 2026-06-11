@@ -98,6 +98,10 @@ pub fn warn_unused_params(
 }
 
 /// Parse a human-readable file size like "512MB", "1GB", "100KB" into bytes.
+///
+/// Accepted units are `B`, `KB`, `MB`, `GB` (case-insensitive); a bare number
+/// is bytes. A fractional value is allowed (`1.5GB`). Units are IEC-style binary
+/// multiples: `KB` = 1024 bytes, `MB` = 1024 KB, `GB` = 1024 MB.
 pub fn parse_file_size(s: &str) -> crate::error::Result<u64> {
     let s = s.trim().to_uppercase();
     let (num, multiplier) = if let Some(n) = s.strip_suffix("GB") {
@@ -111,9 +115,14 @@ pub fn parse_file_size(s: &str) -> crate::error::Result<u64> {
     } else {
         (s.as_str(), 1u64)
     };
-    let value: f64 = num
-        .parse()
-        .map_err(|_| anyhow::anyhow!("invalid file size: '{}'", s))?;
+    let value: f64 = num.parse().map_err(|_| {
+        anyhow::anyhow!(
+            "invalid file size: '{}' — expected a number with an optional unit \
+             B/KB/MB/GB (e.g. '512MB', '1.5GB', or a bare byte count like '1048576'); \
+             a fractional value is allowed and units are binary (KB = 1024 bytes)",
+            s
+        )
+    })?;
     Ok((value * multiplier as f64) as u64)
 }
 
@@ -301,5 +310,16 @@ mod tests {
     #[test]
     fn parse_invalid_returns_error() {
         assert!(parse_file_size("notanumber").is_err());
+    }
+
+    #[test]
+    fn parse_invalid_error_names_accepted_units() {
+        // L25: the error must teach the accepted format, not just name the bad
+        // value — units B/KB/MB/GB, fractional allowed, and KB = 1024 (binary).
+        let err = parse_file_size("banana").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("B/KB/MB/GB"), "got: {msg}");
+        assert!(msg.contains("fractional"), "got: {msg}");
+        assert!(msg.contains("1024"), "got: {msg}");
     }
 }

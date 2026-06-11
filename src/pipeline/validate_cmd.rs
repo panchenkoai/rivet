@@ -319,9 +319,19 @@ fn render_pretty(results: &[ExportVerdict], hard_failures: &[String]) {
             }
         );
         for failure in &v.failures {
-            // `Failure: Display` is the single source of truth for these
-            // lines; same string the run report's "failure:" entry uses.
-            let _ = writeln!(h, "  failure:   {}", failure);
+            // `Failure: Display` is the single source of truth for the message;
+            // same string the run report uses.  L14: advisory (non-fatal)
+            // entries — `UntrackedObject` surplus — are labelled "warning:" not
+            // "failure:".  They never flip `passed` and never change the exit
+            // code (cleanup is `--resume`'s job, M9), so rendering them as
+            // "failure:" beside exit 0 was contradictory.  Fatal failures keep
+            // the "failure:" label.
+            let label = if failure.is_fatal() {
+                "failure:"
+            } else {
+                "warning:"
+            };
+            let _ = writeln!(h, "  {}   {}", label, failure);
         }
     }
 
@@ -340,6 +350,28 @@ fn render_json(
     hard_failures: &[String],
     out_path: Option<String>,
 ) -> Result<()> {
+    // L14: surface advisory (non-fatal) entries — `UntrackedObject` surplus —
+    // in a dedicated top-level `warnings` array so a consumer can tell at a
+    // glance that "failures means failures".  The per-export
+    // `verification.failures` array is the stable wire contract (consumers
+    // branch on `failures[].kind`), so advisory entries stay there too — this
+    // is an additive lens over the same data, not a relocation.
+    let warnings: Vec<serde_json::Value> = results
+        .iter()
+        .flat_map(|r| {
+            r.verification
+                .failures
+                .iter()
+                .filter(|f| !f.is_fatal())
+                .map(move |f| {
+                    serde_json::json!({
+                        "export_name": r.name,
+                        "warning": f,
+                    })
+                })
+        })
+        .collect();
+
     let payload = serde_json::json!({
         "exports": results
             .iter()
@@ -351,6 +383,7 @@ fn render_json(
                 })
             })
             .collect::<Vec<_>>(),
+        "warnings": warnings,
         "errors": hard_failures,
     });
     let serialized = serde_json::to_string_pretty(&payload)?;
@@ -623,7 +656,48 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
         let verification = &json["exports"][0]["verification"];
         assert_eq!(verification["passed"], true);
+        // The stable wire contract is preserved: untracked entries still ride
+        // `verification.failures` (consumers branch on `failures[].kind`).
         assert_eq!(verification["failures"][0]["kind"], "untracked_object");
+
+        // L14: …and the same advisory entry is also surfaced in the top-level
+        // `warnings` array so "failures means failures" — an exit-0 verdict no
+        // longer hides a surplus object under a "failure" label.
+        let warnings = json["warnings"].as_array().expect("warnings array present");
+        assert_eq!(warnings.len(), 1, "the untracked surplus is one warning");
+        assert_eq!(warnings[0]["export_name"], "orders");
+        assert_eq!(warnings[0]["warning"]["kind"], "untracked_object");
+        assert_eq!(warnings[0]["warning"]["key"], "rogue.parquet");
+    }
+
+    #[test]
+    fn json_warnings_array_is_empty_when_no_advisory_failures() {
+        // A clean dataset with no surplus → no warnings.  Guards against the
+        // `warnings` lens accidentally picking up fatal failures.
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("out");
+        stage_dataset(&prefix, &success_manifest(Vec::new()));
+        let cfg = write_cfg(dir.path(), &prefix);
+
+        let report = dir.path().join("report.json");
+        run_validate_command(
+            cfg.to_str().unwrap(),
+            Some("orders"),
+            ValidateOutputFormat::Json(Some(report.to_string_lossy().into_owned())),
+            ValidateTarget::default(),
+        )
+        .expect("a clean dataset must pass");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+        assert_eq!(
+            json["warnings"]
+                .as_array()
+                .expect("warnings array present")
+                .len(),
+            0,
+            "no surplus → no warnings"
+        );
     }
 
     #[test]

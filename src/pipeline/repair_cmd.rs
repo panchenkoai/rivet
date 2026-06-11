@@ -169,6 +169,15 @@ fn execute_repair(
     let mut src = source::create_source(&plan.source)?;
     let mut summary = RunSummary::new(plan);
 
+    // One destination handle for the whole repair: used to rename each
+    // repair-written part so its filename carries the ORIGINAL chunk index
+    // (audit L15). The single-chunk `Precomputed` source restarts enumeration
+    // at 0, so the writer always names the file `..._chunk0_...`; without this
+    // the file repairing chunk 2 would land as `chunk0`, no longer reflecting
+    // the logical chunk it repairs. Built once here (re-`create_destination`d
+    // again only in the manifest-rewrite step, which runs at most once).
+    let dest = crate::destination::create_destination(&plan.destination)?;
+
     // Repair-written parts to record in the destination manifest, in order.
     let mut new_parts: Vec<ManifestPart> = Vec::new();
 
@@ -202,8 +211,34 @@ fn execute_repair(
                 // path, rows, bytes, fingerprint, md5. One chunk yields one part
                 // unless max_file_size rotated it; either way these are exactly
                 // the new files the manifest must learn about.
-                let chunk_parts: Vec<ManifestPart> =
+                let mut chunk_parts: Vec<ManifestPart> =
                     summary.manifest_parts[parts_before..].to_vec();
+
+                // L15: the writer named each part `..._chunk0_...` (the
+                // single-chunk `Precomputed` source enumerates from 0), but this
+                // part repairs the logical chunk `a.chunk_index`. Rename the file
+                // and rewrite the recorded `path` so the name carries the real
+                // index — both `complete_chunk_task` (file_name) and the manifest
+                // append below then reference the corrected name. Best-effort
+                // (ADR-0012 M9 `move` semantics): the bytes are already durable,
+                // so a failed rename keeps the original name and warns rather than
+                // failing the repair. A no-op when the chunk index is already 0.
+                for p in &mut chunk_parts {
+                    if let Some(renamed) = relabel_repair_chunk_index(&p.path, a.chunk_index) {
+                        match dest.r#move(&p.path, &renamed) {
+                            Ok(()) => p.path = renamed,
+                            Err(e) => log::warn!(
+                                "repair: chunk {} re-exported but could not rename \
+                                 '{}' → '{}' to carry the original chunk index \
+                                 (the file is durable under its chunk0 name): {:#}",
+                                a.chunk_index,
+                                p.path,
+                                renamed,
+                                e
+                            ),
+                        }
+                    }
+                }
 
                 // (1) Close finding #7: point `chunk_task.rows_written` at the
                 //     freshly-exported count (and re-mark the task completed,
@@ -329,6 +364,34 @@ fn record_repair_parts_in_manifest(
     Ok(())
 }
 
+/// Rewrite a repair-written part filename so it carries the ORIGINAL chunk
+/// index (L15). The single-chunk `Precomputed` source the repair runner uses
+/// enumerates from 0, so the writer always emits `..._chunk0_<nonce>.<ext>`
+/// (or a rotated `..._chunk0_<nonce>_p<n>.<ext>`); this replaces that `_chunk0_`
+/// token with `_chunk{original_chunk_index}_` so the name reflects the logical
+/// chunk it repairs.
+///
+/// Returns `None` when there is nothing to do: the chunk index is already 0
+/// (the name is already correct), or the path carries no `_chunk0_` token
+/// (defensive — an unexpected name shape is left untouched rather than mangled).
+///
+/// Targets the **rightmost** `_chunk0_`: everything after the chunk token is a
+/// 16-hex nonce, an optional `_p<n>` rotation suffix, and the extension — none
+/// of which can contain `_chunk0_`, so the rightmost match is the chunk token.
+fn relabel_repair_chunk_index(path: &str, original_chunk_index: i64) -> Option<String> {
+    if original_chunk_index == 0 {
+        return None;
+    }
+    let token = "_chunk0_";
+    let at = path.rfind(token)?;
+    Some(format!(
+        "{}_chunk{}_{}",
+        &path[..at],
+        original_chunk_index,
+        &path[at + token.len()..],
+    ))
+}
+
 fn emit_plan(plan: &RepairPlan, format: &RepairOutputFormat) -> Result<()> {
     match format {
         RepairOutputFormat::Pretty => print_plan_pretty(plan),
@@ -435,5 +498,47 @@ mod tests {
         let plan = RepairPlan::from_reconcile(&r);
         assert_eq!(plan.actions.len(), 1);
         assert_eq!(plan.actions[0].chunk_index, 1);
+    }
+
+    // ── L15: repair-written filename carries the ORIGINAL chunk index ─────────
+
+    #[test]
+    fn relabel_repair_chunk_index_rewrites_chunk0_to_original() {
+        // The writer always emits `_chunk0_` for a single-chunk Precomputed
+        // source; repairing logical chunk 2 must rename it to `_chunk2_`.
+        let written = "orders_20260611_120000_chunk0_a1b2c3d4e5f6a7b8.parquet";
+        let renamed = relabel_repair_chunk_index(written, 2)
+            .expect("a non-zero chunk index must produce a renamed path");
+        assert_eq!(
+            renamed,
+            "orders_20260611_120000_chunk2_a1b2c3d4e5f6a7b8.parquet"
+        );
+        assert!(!renamed.contains("_chunk0_"), "no chunk0 token survives");
+    }
+
+    #[test]
+    fn relabel_repair_chunk_index_handles_rotated_part_suffix() {
+        // A max_file_size rotation suffixes `_p<n>` after the nonce; the chunk
+        // token still rewrites and the rotation suffix is preserved.
+        let written = "orders_20260611_120000_chunk0_a1b2c3d4e5f6a7b8_p1.parquet";
+        let renamed = relabel_repair_chunk_index(written, 3).unwrap();
+        assert_eq!(
+            renamed,
+            "orders_20260611_120000_chunk3_a1b2c3d4e5f6a7b8_p1.parquet"
+        );
+    }
+
+    #[test]
+    fn relabel_repair_chunk_index_is_noop_for_chunk_zero() {
+        // Chunk 0's name is already correct — nothing to rename, so no move.
+        let written = "orders_20260611_120000_chunk0_a1b2c3d4e5f6a7b8.parquet";
+        assert!(relabel_repair_chunk_index(written, 0).is_none());
+    }
+
+    #[test]
+    fn relabel_repair_chunk_index_leaves_unexpected_shapes_untouched() {
+        // A name without the chunk0 token (e.g. an unexpected writer shape) is
+        // left alone rather than mangled.
+        assert!(relabel_repair_chunk_index("orders_no_chunk_token.parquet", 5).is_none());
     }
 }

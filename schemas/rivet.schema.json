@@ -570,6 +570,7 @@
           "default": null
         },
         "max_file_size": {
+          "description": "Rotate to a new part when the current file reaches this size.\nAccepts `B`/`KB`/`MB`/`GB` (case-insensitive) or a bare byte count;\na fractional value is allowed (`1.5GB`). Units are binary (IEC-style):\n`KB` = 1024 bytes, `MB` = 1024 KB, `GB` = 1024 MB. Example: `256MB`.",
           "type": [
             "string",
             "null"

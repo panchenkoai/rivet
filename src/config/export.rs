@@ -178,6 +178,10 @@ pub struct ExportConfig {
     pub meta_columns: MetaColumns,
     #[serde(default)]
     pub quality: Option<QualityConfig>,
+    /// Rotate to a new part when the current file reaches this size.
+    /// Accepts `B`/`KB`/`MB`/`GB` (case-insensitive) or a bare byte count;
+    /// a fractional value is allowed (`1.5GB`). Units are binary (IEC-style):
+    /// `KB` = 1024 bytes, `MB` = 1024 KB, `GB` = 1024 MB. Example: `256MB`.
     pub max_file_size: Option<String>,
     #[serde(default)]
     pub chunk_checkpoint: bool,
@@ -245,8 +249,23 @@ pub struct ExportConfig {
 impl ExportConfig {
     /// Resolve the effective `(CompressionType, level)` for this export.
     /// `compression_profile` takes precedence over `compression` + `compression_level`.
+    ///
+    /// L24: when a profile is set *and* a conflicting explicit codec/level was
+    /// written, warn once that the profile wins rather than silently dropping the
+    /// explicit choice. An explicit codec is only detectable when it differs from
+    /// the `#[serde(default)]` (Zstd) — a literal `compression: zstd` alongside a
+    /// profile is indistinguishable from an omitted field and stays silent.
     pub fn effective_compression(&self) -> (CompressionType, Option<u32>) {
         if let Some(profile) = self.compression_profile {
+            let explicit_codec =
+                (self.compression != CompressionType::default()).then_some(self.compression);
+            if let Some(msg) = super::format::compression_profile_override_warning(
+                profile,
+                explicit_codec,
+                self.compression_level,
+            ) {
+                log::warn!("export '{}': {}", self.name, msg);
+            }
             profile.to_codec()
         } else {
             (self.compression, self.compression_level)

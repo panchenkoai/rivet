@@ -24,6 +24,29 @@ fn require_config(config_path: &str) -> Result<Config> {
     Config::load(config_path)
 }
 
+/// Bail if `export_name` is not declared in `config`, listing the known names.
+///
+/// Inspect commands (`metrics`, `journal`) that filter by a single export must
+/// not let a typo'd `--export` look like "this export simply has not run yet" —
+/// both used to print the same empty-state line. With the config now loaded, an
+/// unknown name is a clear error that points at the declared exports.
+fn require_known_export(config: &Config, config_path: &str, export_name: &str) -> Result<()> {
+    if config.exports.iter().any(|e| e.name == export_name) {
+        return Ok(());
+    }
+    let known: Vec<&str> = config.exports.iter().map(|e| e.name.as_str()).collect();
+    anyhow::bail!(
+        "export '{}' is not defined in '{}'.\n  Known exports: {}",
+        export_name,
+        config_path,
+        if known.is_empty() {
+            "(none defined)".to_string()
+        } else {
+            known.join(", ")
+        },
+    );
+}
+
 pub fn show_state(config_path: &str) -> Result<()> {
     require_config(config_path)?;
     let state = StateStore::open(config_path)?;
@@ -52,7 +75,7 @@ pub fn show_state(config_path: &str) -> Result<()> {
         } else {
             println!(
                 "No exports have been run yet.\n  \
-                 Run `rivet run --config {}` first, then try `rivet state` again.",
+                 Run `rivet run --config {}` first, then try `rivet state show` again.",
                 config_path
             );
         }
@@ -159,14 +182,17 @@ pub fn show_files(config_path: &str, export_name: Option<&str>, limit: usize) ->
         println!("No files recorded yet.");
         return Ok(());
     }
+    // run_ids are `{export}_{%Y%m%dT%H%M%S%3f}` (timestamp alone is 18 chars),
+    // so a column narrower than the longest export name + 19 wraps and breaks
+    // alignment. 40 fits the common case; longer names overflow gracefully.
     println!(
-        "{:<35} {:<40} {:>8} {:>10} CREATED",
+        "{:<40} {:<40} {:>8} {:>10} CREATED",
         "RUN ID", "FILE", "ROWS", "BYTES"
     );
-    println!("{}", "-".repeat(110));
+    println!("{}", "-".repeat(115));
     for f in &files {
         println!(
-            "{:<35} {:<40} {:>8} {:>10} {}",
+            "{:<40} {:<40} {:>8} {:>10} {}",
             f.run_id,
             f.file_name,
             f.row_count,
@@ -178,7 +204,14 @@ pub fn show_files(config_path: &str, export_name: Option<&str>, limit: usize) ->
 }
 
 pub fn show_metrics(config_path: &str, export_name: Option<&str>, limit: usize) -> Result<()> {
-    require_config(config_path)?;
+    let config = require_config(config_path)?;
+    // A typo'd `--export` must not masquerade as "no runs yet". Now that the
+    // config is loaded, check the requested name against the declared exports
+    // and bail with the known names — otherwise an unknown export and an
+    // unrun one both print "No metrics recorded yet.".
+    if let Some(name) = export_name {
+        require_known_export(&config, config_path, name)?;
+    }
     let state = StateStore::open(config_path)?;
     let metrics = state.get_metrics(export_name, limit)?;
     if metrics.is_empty() {
@@ -369,7 +402,15 @@ pub fn show_journal(
     limit: usize,
     run_id: Option<&str>,
 ) -> Result<()> {
-    require_config(config_path)?;
+    let config = require_config(config_path)?;
+    // Same gap as `metrics`: when querying by export name (no `--run-id`), a
+    // typo would print "No journal entries for export 'X' yet." as if the
+    // export were merely unrun. Validate the name against the config first.
+    // The `--run-id` path looks up by id directly, so the export name is not
+    // the lookup key there and is left unchecked.
+    if run_id.is_none() {
+        require_known_export(&config, config_path, export_name)?;
+    }
     let state = StateStore::open(config_path)?;
 
     let journals = if let Some(rid) = run_id {
@@ -633,7 +674,123 @@ exports:
         assert_eq!(boundary_value(&b), "-");
     }
 
+    // ── state files: RUN ID column width (finding L16) ───────────────────────
+
+    // run_ids are `{export}_{%Y%m%dT%H%M%S%3f}` — the timestamp suffix alone is
+    // 18 chars, so even a short export name yields ~30-char ids and longer ones
+    // reach ~40. The RUN ID column must be wide enough that a 40-char id is not
+    // padded *past* the FILE column (which would shove FILE right and break
+    // every subsequent row's alignment vs. the header). A column of 35 wrapped;
+    // this pins the widened layout: a 40-char id is followed by exactly one
+    // space then FILE, identical to the header's spacing.
+    #[test]
+    fn state_files_run_id_column_fits_a_40_char_run_id() {
+        let run_id = "transactions_historyy_20250115T143022999"; // 40 chars
+        assert_eq!(run_id.len(), 40, "fixture must be a realistic 40-char id");
+
+        let header = format!(
+            "{:<40} {:<40} {:>8} {:>10} CREATED",
+            "RUN ID", "FILE", "ROWS", "BYTES"
+        );
+        let row = format!(
+            "{:<40} {:<40} {:>8} {:>10} {}",
+            run_id, "orders_001.parquet", 50_000, "4.0KB", "2025-01-15",
+        );
+
+        // The FILE column header and the row's file value must start at the
+        // same byte offset — the alignment invariant a too-narrow column breaks.
+        let header_file_at = header.find("FILE").unwrap();
+        let row_file_at = row.find("orders_001.parquet").unwrap();
+        assert_eq!(
+            header_file_at, row_file_at,
+            "a 40-char RUN ID must not push the FILE column out of alignment\nheader: {header}\nrow:    {row}"
+        );
+        // And the run_id is rendered in full (not truncated).
+        assert!(
+            row.starts_with(run_id),
+            "run_id must not be truncated: {row}"
+        );
+    }
+
     // ── show_state ───────────────────────────────────────────────────────────
+
+    // Finding L17: the empty-cursor / never-run hint pointed at `rivet state`,
+    // which is a bare subcommand group and errors without a leaf. The fix points
+    // at the real command `rivet state show`. Pin the exact hint string the
+    // never-run branch builds.
+    #[test]
+    fn show_state_never_run_hint_points_at_state_show() {
+        let config_path = "rivet.yaml";
+        let hint = format!(
+            "No exports have been run yet.\n  \
+             Run `rivet run --config {}` first, then try `rivet state show` again.",
+            config_path
+        );
+        assert!(
+            hint.contains("try `rivet state show` again"),
+            "hint must name the runnable leaf command, not the bare group: {hint}"
+        );
+        assert!(
+            !hint.contains("try `rivet state` again"),
+            "must not point at the bare (subcommand-requiring) group: {hint}"
+        );
+    }
+
+    // ── metrics / journal: unknown-export guard (finding L18) ────────────────
+
+    // `metrics --export <typo>` used to print "No metrics recorded yet." —
+    // indistinguishable from a declared-but-unrun export. With the config now
+    // loaded, an undeclared name must bail naming the known exports.
+    #[test]
+    fn show_metrics_unknown_export_bails_with_known_names() {
+        let (dir, config_path) = setup_dir(); // declares orders + transactions
+        let _ = open_state(&dir);
+        let err = show_metrics(&config_path, Some("ghost"), 10).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("export 'ghost' is not defined"),
+            "must name the unknown export, not say 'No metrics recorded yet': {msg}"
+        );
+        assert!(
+            msg.contains("orders") && msg.contains("transactions"),
+            "must list the declared exports so the user can spot the typo: {msg}"
+        );
+    }
+
+    // A *declared* export with no recorded runs must still reach the normal
+    // empty-state path (proves the guard does not over-reject).
+    #[test]
+    fn show_metrics_known_but_unrun_export_returns_ok() {
+        let (dir, config_path) = setup_dir();
+        let _ = open_state(&dir);
+        assert!(show_metrics(&config_path, Some("orders"), 10).is_ok());
+    }
+
+    // Same gap on `journal` when querying by export name (no --run-id).
+    #[test]
+    fn show_journal_unknown_export_bails_with_known_names() {
+        let (dir, config_path) = setup_dir();
+        let _ = open_state(&dir);
+        let err = show_journal(&config_path, "ghost", 5, None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("export 'ghost' is not defined"),
+            "must name the unknown export, not say 'No journal entries … yet': {msg}"
+        );
+        assert!(
+            msg.contains("orders") && msg.contains("transactions"),
+            "must list the declared exports: {msg}"
+        );
+    }
+
+    // Querying by --run-id looks up by id, not export name, so an unfamiliar
+    // export name must NOT be rejected there (the id is the lookup key).
+    #[test]
+    fn show_journal_by_run_id_skips_export_name_check() {
+        let (dir, config_path) = setup_dir();
+        let _ = open_state(&dir);
+        assert!(show_journal(&config_path, "ghost", 5, Some("no_such_run")).is_ok());
+    }
 
     #[test]
     fn show_state_empty_db_returns_ok() {

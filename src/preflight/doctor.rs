@@ -11,8 +11,13 @@ pub fn doctor(config_path: &str) -> Result<()> {
             c
         }
         Err(e) => {
-            println!("[FAIL] Config error: {}", e);
-            return Err(e);
+            // L4: surface the config error exactly once. The detailed message
+            // is printed here in doctor's `[FAIL]` style; `main` then prints a
+            // distinct one-line pointer (not a duplicate of the same text) —
+            // mirroring the `bail!` pointer used for the failed-checks summary
+            // below. Exit code stays non-zero because we still return `Err`.
+            println!("[FAIL] Config error: {}", trim_probe_error(&e));
+            anyhow::bail!("doctor: config check failed (see [FAIL] above)")
         }
     };
 
@@ -23,7 +28,7 @@ pub fn doctor(config_path: &str) -> Result<()> {
         Err(e) => {
             all_ok = false;
             let category = categorize_source_error(&e);
-            println!("[FAIL] Source {}: {}", category, e);
+            println!("[FAIL] Source {}: {}", category, trim_probe_error(&e));
             if let Some(hint) = source_error_hint(category, &e, &config.source.source_type) {
                 println!("       Hint: {}", hint);
             }
@@ -56,7 +61,10 @@ pub fn doctor(config_path: &str) -> Result<()> {
                 export.destination.bucket.as_deref().unwrap_or("?")
             ),
             DestinationType::Stdout => {
-                log::info!("  Stdout: no auth check needed");
+                // L23: stdout streams to the terminal — there is nothing to
+                // auth-probe — but say so explicitly so the operator sees the
+                // destination was considered, not silently skipped.
+                println!("[OK]  Destination Stdout (streaming; no preflight needed)");
                 continue;
             }
         };
@@ -74,7 +82,12 @@ pub fn doctor(config_path: &str) -> Result<()> {
             Err(e) => {
                 all_ok = false;
                 let category = categorize_dest_error(&e, &expanded_dest);
-                println!("[FAIL] Destination {} -- {}: {}", label, category, e);
+                println!(
+                    "[FAIL] Destination {} -- {}: {}",
+                    label,
+                    category,
+                    trim_probe_error(&e)
+                );
                 if let Some(hint) = destination_error_hint(category, &expanded_dest) {
                     println!("       Hint: {}", hint);
                 }
@@ -208,6 +221,55 @@ fn remove_destination_probe(dest: &crate::config::DestinationConfig, probe_key: 
     }
 }
 
+/// L21: trim a raw probe error to its root cause for the `[FAIL]` line.
+///
+/// opendal/reqwest errors dump the entire HTTP response — `... response: Parts
+/// { status: 403, version: HTTP/1.1, headers: {"x-amz-request-id": ...,
+/// "content-type": ..., ...} } ...` — into their `Display`. That multi-line
+/// header blob buries the one line the operator needs (the category is already
+/// shown separately). We keep the meaningful prefix and cut at the first noisy
+/// marker, collapse any embedded newlines, and cap the length as a backstop.
+/// Categorisation still runs on the full `{:#}` chain elsewhere — this only
+/// shapes what is *printed*, never what is matched.
+fn trim_probe_error(err: &anyhow::Error) -> String {
+    // Single-line first: the `Parts { .. }` / `headers: { .. }` dumps span
+    // lines, and a `[FAIL]` entry should be one line.
+    let flat = err.to_string().replace(['\n', '\r'], " ");
+    // Cut at the first structural-dump marker (case-insensitive). These are the
+    // opendal/reqwest fragments that introduce the verbose HTTP response.
+    // `to_ascii_lowercase` keeps the byte layout identical to `flat` (markers
+    // are ASCII), so an index found in `lower` indexes `flat` correctly — a
+    // full Unicode `to_lowercase` could shift byte offsets and slice mid-char.
+    let lower = flat.to_ascii_lowercase();
+    let cut = [
+        ", context: {",
+        " context: {",
+        " parts {",
+        ", headers: {",
+        " headers: {",
+        ", response:",
+    ]
+    .iter()
+    .filter_map(|m| lower.find(m))
+    .min();
+    let mut out = match cut {
+        Some(i) => flat[..i].trim_end_matches([' ', ',']).to_string(),
+        None => flat.trim().to_string(),
+    };
+    // Backstop: never let a single line run unbounded.
+    const MAX: usize = 300;
+    if out.len() > MAX {
+        // Truncate on a char boundary.
+        let mut end = MAX;
+        while !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.truncate(end);
+        out.push('…');
+    }
+    out
+}
+
 pub(super) fn categorize_source_error(err: &anyhow::Error) -> &'static str {
     // `{:#}` (alternate) walks the anyhow cause chain, not just the top
     // Display. Postgres surfaces a wrong password as the bare top-level
@@ -255,6 +317,22 @@ pub(super) fn categorize_dest_error(
     // If that message ever changes, update both places together.
     if msg.contains("already expired") && msg.contains("sas") {
         return "sas expired";
+    }
+    // L6: a local filesystem permission denial (`Permission denied (os error
+    // 13)`) is NOT an auth failure — there are no credentials involved, just
+    // directory mode bits. Route Local/Stdout permission denials to their own
+    // "permission error" category (the same FS-permissions hint applies) so the
+    // label stops misattributing an `os error 13` to credentials. Cloud
+    // backends keep falling through to "auth error" below, where a denied write
+    // genuinely is a credential/IAM problem.
+    if matches!(
+        dest.destination_type,
+        DestinationType::Local | DestinationType::Stdout
+    ) && (msg.contains("permission denied")
+        || msg.contains("permissiondenied")
+        || msg.contains("os error 13"))
+    {
+        return "permission error";
     }
     if msg.contains("credential")
         || msg.contains("permission denied")
@@ -363,6 +441,9 @@ pub(super) fn destination_error_hint(
         "sas expired" => Some(
             "Azure SAS token is expired or near-expiry. Generate a new SAS via `az storage container generate-sas --permissions rwdlc --expiry <future-date>` and re-export AZURE_STORAGE_SAS_TOKEN.",
         ),
+        // L6: local FS permission denial — same actionable hint as the
+        // Local/Stdout auth branch below, just under the correct category.
+        "permission error" => Some("Verify filesystem permissions on the destination directory."),
         "auth error" => Some(match dest.destination_type {
             DestinationType::S3 => {
                 "Verify AWS credentials resolve (env / profile / instance role) and that the role has s3:PutObject + s3:GetObject + s3:ListBucket on the prefix. See docs/cloud-permissions.md."
@@ -759,5 +840,120 @@ exports:
         // No probe present; must not panic and must leave the dir untouched.
         remove_destination_probe(&dest, crate::manifest::DOCTOR_PROBE_FILENAME);
         assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+    }
+
+    // ── L6: local FS permission denial is "permission error", not "auth" ─────
+
+    // A local destination that fails with `Permission denied (os error 13)` is
+    // a directory-mode problem, not a credential/auth one. It must categorize
+    // as "permission error" (RED before the fix: the spaced "permission denied"
+    // needle routed it to "auth error"), and still carry the FS-permissions
+    // hint so the operator gets a next step.
+    #[test]
+    fn local_permission_denied_is_permission_error_not_auth() {
+        let dest = dest_of(DestinationType::Local);
+        let err = anyhow::anyhow!("Permission denied (os error 13)");
+        let cat = categorize_dest_error(&err, &dest);
+        assert_eq!(
+            cat, "permission error",
+            "a local FS `os error 13` is a directory-permission problem, not auth; got {cat:?}"
+        );
+        assert!(
+            destination_error_hint(cat, &dest).is_some(),
+            "permission error must still surface the filesystem-permissions hint"
+        );
+    }
+
+    // Guard: a CLOUD permission denial (S3/GCS/Azure) is a genuine
+    // credential/IAM failure and must stay "auth error" — the L6 nuance is
+    // scoped to Local/Stdout only.
+    #[test]
+    fn cloud_permission_denied_stays_auth_error() {
+        for t in [
+            DestinationType::S3,
+            DestinationType::Gcs,
+            DestinationType::Azure,
+        ] {
+            let dest = dest_of(t);
+            let err = anyhow::anyhow!("PermissionDenied at write");
+            assert_eq!(
+                categorize_dest_error(&err, &dest),
+                "auth error",
+                "cloud permission denial must remain auth for {t:?}"
+            );
+        }
+    }
+
+    // ── L21: trim_probe_error strips the verbose HTTP response dump ───────────
+
+    // An opendal/reqwest error whose Display embeds the full `Parts { ... headers:
+    // { ... } }` response must be trimmed to the actionable prefix: no headers,
+    // no `Parts {`, single line.
+    #[test]
+    fn trim_probe_error_strips_http_response_parts_and_headers() {
+        let raw = "PermissionDenied (persistent) at write, context: { uri: https://b.s3.amazonaws.com/probe, response: Parts { status: 403, version: HTTP/1.1, headers: {\"x-amz-request-id\": \"ABC123\", \"content-type\": \"application/xml\"} }, service: s3 } => InvalidAccessKeyId";
+        let err = anyhow::anyhow!(raw);
+        let out = trim_probe_error(&err);
+        assert!(
+            !out.contains("Parts {") && !out.to_lowercase().contains("headers: {"),
+            "trimmed error still leaks the HTTP response dump: {out:?}"
+        );
+        assert!(
+            !out.contains('\n'),
+            "trimmed error must be a single line: {out:?}"
+        );
+        assert!(
+            out.starts_with("PermissionDenied (persistent) at write"),
+            "trimmed error must keep the meaningful root-cause prefix: {out:?}"
+        );
+    }
+
+    // A clean, short error passes through essentially unchanged (no false cut).
+    #[test]
+    fn trim_probe_error_leaves_clean_message_intact() {
+        let err = anyhow::anyhow!("error connecting to server: Connection refused (os error 61)");
+        assert_eq!(
+            trim_probe_error(&err),
+            "error connecting to server: Connection refused (os error 61)"
+        );
+    }
+
+    // Backstop: a pathologically long single line is capped (char-boundary safe).
+    #[test]
+    fn trim_probe_error_caps_unbounded_line() {
+        let err = anyhow::anyhow!("x".repeat(5000));
+        let out = trim_probe_error(&err);
+        assert!(
+            out.chars().count() <= 301,
+            "line not capped: {} chars",
+            out.chars().count()
+        );
+        assert!(
+            out.ends_with('…'),
+            "capped line must signal truncation: {out:?}"
+        );
+    }
+
+    // ── L4: config-load failure is surfaced exactly once ─────────────────────
+
+    // doctor must not return the raw config-error message (which `main` would
+    // reprint as `Error: <msg>`, doubling it). It prints the `[FAIL]` line and
+    // returns a distinct one-line pointer instead. RED before the fix: the
+    // returned Err carried the same "missing field" text printed in `[FAIL]`.
+    #[test]
+    fn config_load_failure_returns_pointer_not_duplicate_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("rivet.yaml");
+        // Invalid YAML structure → Config::load fails with a parse/missing-field
+        // message; doctor must convert that to a pointer error.
+        std::fs::write(&cfg, "source: not-a-mapping\n").unwrap();
+        let err = doctor(cfg.to_str().unwrap())
+            .expect_err("doctor must return Err when the config fails to load");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("doctor: config check failed") && msg.contains("[FAIL]"),
+            "returned error must be the one-line pointer (so `main` does not double-print the \
+             config error); got {msg:?}"
+        );
     }
 }
