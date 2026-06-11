@@ -215,6 +215,18 @@ fn mysql_crash_after_source_read_leaves_state_completely_clean() {
         "recovery run must produce the single expected file"
     );
     assert!(cursor_value(&cfg, &export).is_some());
+    // Re-read the destination (not the state DB): the recovery file holds every
+    // source row exactly once.
+    assert_eq!(
+        total_parquet_rows(out.path()),
+        10,
+        "recovery file must hold all 10 rows"
+    );
+    assert_eq!(
+        dir_parquet_id_set(out.path()),
+        (1..=10).collect::<std::collections::BTreeSet<i64>>(),
+        "recovery must surface every source id (1..=10)"
+    );
 }
 
 #[test]
@@ -271,6 +283,18 @@ fn mysql_crash_after_file_write_leaves_file_but_no_manifest_or_cursor() {
         total >= 2,
         "orphaned pre-crash file + recovery file: expected >=2, got {total}"
     );
+    // Re-read the destination: recovery must be a COMPLETE superset of the
+    // source (every id present — no loss across orphan+recovery), with
+    // at-least-once duplication the only surplus.
+    assert_eq!(
+        dir_parquet_id_set(out.path()),
+        (1..=8).collect::<std::collections::BTreeSet<i64>>(),
+        "recovery must leave every source id (1..=8) — a missing id is row LOSS"
+    );
+    assert!(
+        total_parquet_rows(out.path()) as i64 >= 8,
+        "at-least-once: physical destination rows must be >= source (8)"
+    );
 }
 
 #[test]
@@ -312,6 +336,16 @@ fn mysql_crash_after_manifest_update_leaves_file_and_manifest_but_no_cursor() {
     assert!(rec.status.success());
     assert_eq!(manifest_count(&cfg, &export), 2);
     assert!(cursor_value(&cfg, &export).is_some());
+    // Destination re-read: complete superset of the source (no loss).
+    assert_eq!(
+        dir_parquet_id_set(out.path()),
+        (1..=7).collect::<std::collections::BTreeSet<i64>>(),
+        "recovery must leave every source id (1..=7) — a missing id is row LOSS"
+    );
+    assert!(
+        total_parquet_rows(out.path()) as i64 >= 7,
+        "at-least-once: physical destination rows must be >= source (7)"
+    );
 }
 
 #[test]
@@ -364,5 +398,17 @@ fn mysql_crash_after_cursor_commit_is_recoverable_with_full_state() {
         cursor_value(&cfg, &export),
         cursor_after_crash,
         "cursor value must stay at the post-crash position when no new data arrived"
+    );
+    // Destination re-read: the durably-committed file holds every source row
+    // exactly once (cursor committed before the crash → no re-export, no dup).
+    assert_eq!(
+        total_parquet_rows(out.path()),
+        6,
+        "committed file must hold all 6 rows once"
+    );
+    assert_eq!(
+        dir_parquet_id_set(out.path()),
+        (1..=6).collect::<std::collections::BTreeSet<i64>>(),
+        "committed file must hold every source id (1..=6)"
     );
 }
