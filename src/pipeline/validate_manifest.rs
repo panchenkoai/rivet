@@ -139,6 +139,14 @@ pub enum Failure {
     /// size-verified (no comparable content checksum from the store) — the
     /// declared integrity contract was not met.
     ContentVerificationUnmet { size_only: usize, total: usize },
+    /// A manifest was *required* at this prefix (the operator pinned a literal
+    /// `--prefix`, asserting a real dataset lives here) but none was found.
+    /// Without this, an absent manifest at an operator-pinned prefix maps to
+    /// the M6 legacy-run label and exits 0 — indistinguishable from a verified
+    /// run, so a CI gate `rivet validate && deploy` sails past a destination
+    /// that was never written.  Fatal: a required-but-missing manifest is a
+    /// refusal reason, not a "cannot certify" advisory.
+    ManifestRequiredButAbsent { prefix: String },
 }
 
 impl Failure {
@@ -220,6 +228,13 @@ impl std::fmt::Display for Failure {
                  size-verified (no store checksum); lower max_file_size so parts \
                  upload as a single PUT, or the backend exposes no checksum"
             ),
+            Failure::ManifestRequiredButAbsent { prefix } => write!(
+                f,
+                "no manifest at {prefix}: a manifest was required here (operator \
+                 pinned --prefix) but none was found — this prefix was never \
+                 written, or the data was relocated. Run the export first, or \
+                 drop --prefix to validate the config-resolved destination."
+            ),
         }
     }
 }
@@ -266,6 +281,28 @@ impl ManifestVerification {
                 });
                 self.recompute_passed();
             }
+        }
+    }
+
+    /// Apply the "a manifest must exist here" policy (finding #20).  When the
+    /// operator pinned a literal `--prefix`, an absent manifest is no longer the
+    /// benign M6 legacy-run case — it almost always means the prefix was never
+    /// written (a misconfigured CI gate). Convert that exact verdict — no
+    /// manifest, no other failure (i.e. the [`ManifestVerification::legacy`]
+    /// shape) — into a fatal [`Failure::ManifestRequiredButAbsent`] so the exit
+    /// gate refuses it loudly instead of silently passing.
+    ///
+    /// Deliberately a no-op for every other shape: a real manifest (passed or
+    /// failed), or an absent manifest that already carries a `ManifestReadError`
+    /// / head failure, is left untouched — those are already classified.  Only
+    /// the "legacy / cannot certify" case is escalated, and only when required.
+    pub fn require_manifest_present(&mut self, prefix: &str) {
+        if !self.manifest_found && !self.has_failures() {
+            self.legacy_run = false;
+            self.failures.push(Failure::ManifestRequiredButAbsent {
+                prefix: prefix.to_string(),
+            });
+            self.recompute_passed();
         }
     }
 
@@ -1002,6 +1039,106 @@ mod tests {
         );
     }
 
+    // ── manifest read-error semantics (explicit failure, not legacy) ─────
+
+    /// Wraps a real `LocalDestination` but fails reading `manifest.json`
+    /// (head still sees it) — EACCES or a transient store error on a
+    /// manifest that exists.
+    struct ManifestReadFails(LocalDestination);
+    impl crate::destination::Destination for ManifestReadFails {
+        fn write(&self, p: &Path, k: &str) -> Result<crate::destination::WriteOutcome> {
+            self.0.write(p, k)
+        }
+        fn capabilities(&self) -> crate::destination::DestinationCapabilities {
+            self.0.capabilities()
+        }
+        fn head(&self, k: &str) -> Result<Option<crate::destination::ObjectMeta>> {
+            self.0.head(k)
+        }
+        fn read(&self, k: &str) -> Result<Vec<u8>> {
+            if k.ends_with(MANIFEST_FILENAME) {
+                anyhow::bail!("permission denied (simulated)")
+            }
+            self.0.read(k)
+        }
+        fn list_prefix(&self, p: &str) -> Result<Vec<crate::destination::ObjectMeta>> {
+            self.0.list_prefix(p)
+        }
+    }
+
+    #[test]
+    fn unreadable_manifest_is_explicit_failure_not_legacy() {
+        // The exit gates (`rivet validate`, run finalize) key off this exact
+        // shape: `manifest_found: false` but `has_failures()` — distinct
+        // from M6 legacy (`legacy_run: true`, no failures, exit 0).
+        let dir = tempfile::tempdir().unwrap();
+        let m = build_manifest(
+            vec![part(1, 10, 4, "xxh3:1111111111111111")],
+            ManifestStatus::Success,
+        );
+        write_dataset(dir.path(), &m, &[("part-000001.parquet", b"AAAA")]);
+        let dest = ManifestReadFails(local_dest(dir.path()));
+
+        let v = verify_at_destination(&dest, "").unwrap();
+        assert!(!v.manifest_found);
+        assert!(!v.legacy_run, "a read error is not the M6 legacy label");
+        assert!(!v.passed);
+        assert!(v.has_failures(), "orchestrators need a reason to refuse");
+        assert!(
+            matches!(v.failures.as_slice(), [Failure::ManifestReadError { .. }]),
+            "expected exactly one ManifestReadError, got: {:?}",
+            v.failures
+        );
+    }
+
+    /// Same contract when `head` itself errors (cannot even stat the
+    /// manifest): symmetric `ManifestReadError`, never the legacy label.
+    struct ManifestHeadFails(LocalDestination);
+    impl crate::destination::Destination for ManifestHeadFails {
+        fn write(&self, p: &Path, k: &str) -> Result<crate::destination::WriteOutcome> {
+            self.0.write(p, k)
+        }
+        fn capabilities(&self) -> crate::destination::DestinationCapabilities {
+            self.0.capabilities()
+        }
+        fn head(&self, k: &str) -> Result<Option<crate::destination::ObjectMeta>> {
+            if k.ends_with(MANIFEST_FILENAME) {
+                anyhow::bail!("io timeout (simulated)")
+            }
+            self.0.head(k)
+        }
+        fn read(&self, k: &str) -> Result<Vec<u8>> {
+            self.0.read(k)
+        }
+        fn list_prefix(&self, p: &str) -> Result<Vec<crate::destination::ObjectMeta>> {
+            self.0.list_prefix(p)
+        }
+    }
+
+    #[test]
+    fn manifest_head_error_is_explicit_failure_not_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = build_manifest(
+            vec![part(1, 10, 4, "xxh3:1111111111111111")],
+            ManifestStatus::Success,
+        );
+        write_dataset(dir.path(), &m, &[("part-000001.parquet", b"AAAA")]);
+        let dest = ManifestHeadFails(local_dest(dir.path()));
+
+        let v = verify_at_destination(&dest, "").unwrap();
+        assert!(!v.manifest_found);
+        assert!(!v.legacy_run);
+        assert!(!v.passed);
+        assert!(
+            matches!(
+                v.failures.as_slice(),
+                [Failure::ManifestReadError { detail }] if detail.contains("manifest head failed")
+            ),
+            "expected one ManifestReadError naming the head step, got: {:?}",
+            v.failures
+        );
+    }
+
     #[test]
     fn passed_is_derived_advisory_failures_do_not_fail() {
         // An advisory failure (untracked surplus) keeps the verdict passing…
@@ -1072,6 +1209,71 @@ mod tests {
         assert!(
             all.passed && all.failures.is_empty(),
             "all md5 meets verify: content"
+        );
+    }
+
+    // ── require_manifest_present (finding #20: operator-pinned --prefix) ──────
+
+    #[test]
+    fn require_manifest_escalates_legacy_to_fatal_absent() {
+        // The exact shape `verify_at_destination` returns for an absent manifest
+        // (`legacy()`): no manifest, no other failure. With a pinned `--prefix`
+        // this is escalated to a fatal `ManifestRequiredButAbsent` so the exit
+        // gate refuses it instead of passing as a benign legacy run.
+        let mut v = ManifestVerification::legacy();
+        assert!(v.legacy_run && !v.has_failures());
+
+        v.require_manifest_present("exports/2026-06-09/orders/");
+
+        assert!(!v.legacy_run, "no longer the benign legacy-run label");
+        assert!(!v.passed, "an absent-but-required manifest cannot pass");
+        assert!(
+            matches!(
+                v.failures.as_slice(),
+                [Failure::ManifestRequiredButAbsent { prefix }]
+                    if prefix == "exports/2026-06-09/orders/"
+            ),
+            "expected one ManifestRequiredButAbsent naming the prefix, got: {:?}",
+            v.failures
+        );
+    }
+
+    #[test]
+    fn require_manifest_is_noop_on_a_real_passing_manifest() {
+        // A found, passing verdict is untouched — `--prefix` plus real data is
+        // the normal "validate this exact prefix" case and must still pass.
+        let mut v = ManifestVerification {
+            manifest_found: true,
+            manifest_self_consistent: true,
+            parts_verified: 1,
+            passed: true,
+            ..ManifestVerification::empty()
+        };
+        v.require_manifest_present("exports/orders/");
+        assert!(
+            v.passed && v.failures.is_empty(),
+            "real dataset still passes"
+        );
+    }
+
+    #[test]
+    fn require_manifest_does_not_double_flag_a_read_error() {
+        // An absent manifest that already carries a `ManifestReadError` (head /
+        // read failed) is already a fatal, classified failure — requiring a
+        // manifest here must not add a second, redundant failure.
+        let mut v = ManifestVerification::legacy();
+        v.legacy_run = false;
+        v.failures.push(Failure::ManifestReadError {
+            detail: "permission denied".into(),
+        });
+        v.recompute_passed();
+
+        v.require_manifest_present("exports/orders/");
+
+        assert!(
+            matches!(v.failures.as_slice(), [Failure::ManifestReadError { .. }]),
+            "must leave the existing read-error verdict alone, got: {:?}",
+            v.failures
         );
     }
 }

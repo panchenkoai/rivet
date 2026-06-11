@@ -44,19 +44,15 @@ fn run_chunked_quality_gate(
             log::warn!("quality FAIL: {}", issue.message);
         }
         summary.quality_passed = Some(false);
-        // Surface *which* checks failed, not just "quality checks failed" —
-        // the messages are already computed. (Chunked mode only aggregates
+        // Surface *which* checks failed via the shared failure contract — see
+        // `crate::quality::failure_message`. (Chunked mode only aggregates
         // row_count; null/unique are per-chunk and warn-logged above.)
-        let detail = row_issues
-            .iter()
-            .map(|i| i.message.as_str())
-            .collect::<Vec<_>>()
-            .join("\n  - ");
-        anyhow::bail!(
-            "export '{}': quality checks failed (chunked aggregate):\n  - {}\n  Fix the source data, or adjust the thresholds under `quality:` in your config.",
-            plan.export_name,
-            detail
-        );
+        let fails: Vec<&str> = row_issues.iter().map(|i| i.message.as_str()).collect();
+        anyhow::bail!(crate::quality::failure_message(
+            &plan.export_name,
+            Some("chunked aggregate"),
+            &fails
+        ));
     }
 
     summary.quality_passed = Some(true);
@@ -273,6 +269,18 @@ pub(super) fn run_export_job(
         return (Err(e), summary);
     }
 
+    // rerun-accumulation footgun (audit findings #5/#19/#30): a *fresh* run
+    // (no `--resume`) into a prefix that already carries a completed export
+    // does NOT overwrite — it appends a new timestamp-/nonce-named part set
+    // alongside the old one and rewrites manifest.json to describe only this
+    // run, so a glob reader over the prefix double-counts / sees orphaned
+    // parts.  Refusing or auto-deleting would destroy operator data, so this
+    // is a loud, non-fatal WARN instead (the `--resume` path above keeps its
+    // refuse-without-`--force` gate).  `--force` is the explicit opt-out.
+    if !opts.resume && !opts.force {
+        warn_if_prefix_has_completed_run(&plan);
+    }
+
     log::info!(
         "starting export '{}' (effective tuning: {})",
         plan.export_name,
@@ -384,6 +392,20 @@ pub(super) fn run_export_job(
         );
     }
 
+    summary.print();
+    // Order matters: write the manifest first, then run the manifest-aware
+    // `--validate` pass against the destination, then persist the metrics
+    // row, then write the run report.  The report sees the verification
+    // verdict only because we run it before `finalize_run_report`; the
+    // metrics row must also wait for `finalize_validate_manifest`, which can
+    // downgrade `summary.validated` — recording earlier left `rivet metrics`
+    // permanently saying validated=pass for a run whose report says it
+    // failed.  The notification fires last so it carries the most complete
+    // summary.
+    finalize_manifest(&plan, state, &summary, "export");
+    if plan.validate {
+        finalize_validate_manifest(&plan, &mut summary, "export");
+    }
     if let Err(e) = state.record_metric(
         &summary.export_name,
         &summary.run_id,
@@ -407,17 +429,6 @@ pub(super) fn run_export_job(
             e
         );
     }
-
-    summary.print();
-    // Order matters: write the manifest first, then run the manifest-aware
-    // `--validate` pass against the destination, then write the run report.
-    // The report sees the verification verdict only because we run it before
-    // `finalize_run_report`.  The notification fires last so it carries the
-    // most complete summary.
-    finalize_manifest(&plan, state, &summary, "export");
-    if plan.validate {
-        finalize_validate_manifest(&plan, &mut summary, "export");
-    }
     finalize_run_report(config_path, &summary, "export");
     crate::notify::maybe_send(config.notifications.as_ref(), &summary);
 
@@ -430,7 +441,7 @@ pub(super) fn run_export_job(
 // metric → call finalize hooks).  Imports below give us local names.
 use super::finalize::{
     check_success_gate_for_resume, finalize_manifest, finalize_run_report,
-    finalize_validate_manifest,
+    finalize_validate_manifest, warn_if_prefix_has_completed_run,
 };
 
 /// Execute a pre-resolved plan with a caller-supplied `ChunkSource`.
@@ -511,6 +522,14 @@ pub(crate) fn run_export_job_with_chunk_source(
         }
     }
 
+    summary.print();
+    finalize_manifest(plan, state, &summary, "apply");
+    if plan.validate {
+        finalize_validate_manifest(plan, &mut summary, "apply");
+    }
+    // After finalize_validate_manifest: it can downgrade summary.validated,
+    // and the metrics row must carry the final verdict (same ordering as
+    // run_export_job).
     if let Err(e) = state.record_metric(
         &summary.export_name,
         &summary.run_id,
@@ -533,12 +552,6 @@ pub(crate) fn run_export_job_with_chunk_source(
             summary.export_name,
             e
         );
-    }
-
-    summary.print();
-    finalize_manifest(plan, state, &summary, "apply");
-    if plan.validate {
-        finalize_validate_manifest(plan, &mut summary, "apply");
     }
     finalize_run_report(config_path, &summary, "apply");
 
@@ -729,9 +742,14 @@ mod tests {
         let mut summary = fresh_summary(&plan, 42);
         let err =
             run_chunked_quality_gate(Ok(()), &plan, &mut summary).expect_err("below min must fail");
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("quality checks failed"),
-            "error must mention quality: {err}"
+            msg.contains("quality check(s) failed") && msg.contains("chunked aggregate"),
+            "error must name the failed quality gate: {err}"
+        );
+        assert!(
+            msg.contains("  - "),
+            "error must surface the specific failing check(s), not just a generic message: {err}"
         );
         assert_eq!(summary.quality_passed, Some(false));
     }

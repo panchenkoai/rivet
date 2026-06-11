@@ -9,19 +9,39 @@
 //! 3. Without `--execute` (default): emit the plan and exit.
 //! 4. With `--execute`: re-run just those chunks via
 //!    [`chunked::run_chunked_sequential`] using a `Precomputed` chunk source.
-//!    Output files are written with the standard `<export>_<ts>_chunk<idx>.<ext>`
-//!    naming — they are new files alongside the originals; Rivet does not
-//!    delete or overwrite the old files.
+//!    Output files are written with collision-proof naming — they are new
+//!    files alongside the originals; Rivet does not delete or overwrite the
+//!    old files.
+//!
+//! ## Closing the trust loop
+//!
+//! A re-export that lands a fresh file but leaves the recorded state stale
+//! breaks the operator's trust loop: `reconcile` still recounts the source
+//! against the *old* `chunk_task.rows_written` and reports the same mismatch
+//! (the loop never converges), and `rivet validate` lists the prefix and flags
+//! the un-recorded repair file as an `untracked_object`. So after a successful
+//! per-chunk re-export this path:
+//!
+//! 1. updates that chunk's `chunk_task` row — `rows_written` is set to the
+//!    freshly-exported count and the task is re-marked `completed` — so the
+//!    next `reconcile` compares the live source count against the repaired
+//!    count and converges to a match; and
+//! 2. appends the repair-written part(s) to the destination `manifest.json`
+//!    (read → append → rewrite) so the new file is tracked and `validate` no
+//!    longer reports it as untracked. The originals are left in place and in
+//!    the manifest (repair is additive, ADR-0009 RR5 / ADR-0012).
 //!
 //! Progression semantics (ADR-0008): repair does **not** advance
 //! `last_committed_*` — the committed boundary already covers the chunk index.
-//! Operator runs `rivet reconcile` afterwards to advance `last_verified_*`.
+//! The reconcile the operator runs (or that the repaired state now passes)
+//! advances `last_verified_*`.
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use crate::config::Config;
 use crate::error::Result;
+use crate::manifest::{MANIFEST_FILENAME, ManifestPart, ManifestStatus, PartStatus, RunManifest};
 use crate::plan::{
     ExtractionStrategy, ReconcileReport, RepairAction, RepairOutcome, RepairPlan, RepairReport,
     ResolvedRunPlan, build_plan,
@@ -129,76 +149,115 @@ fn execute_repair(
     state: &StateStore,
     repair_plan: RepairPlan,
 ) -> Result<RepairReport> {
-    // Map start/end strings → i64. Skip ranges that don't parse (recorded as skipped outcomes).
-    let mut ranges: Vec<(i64, i64)> = Vec::with_capacity(repair_plan.actions.len());
-    let mut prebuilt_outcomes: Vec<(RepairAction, RepairOutcome)> = Vec::new();
-    for a in &repair_plan.actions {
-        match (a.start_key.parse::<i64>(), a.end_key.parse::<i64>()) {
-            (Ok(s), Ok(e)) => ranges.push((s, e)),
-            _ => prebuilt_outcomes.push((
-                a.clone(),
-                RepairOutcome::Skipped {
-                    reason: format!("unparseable chunk keys [{}..{}]", a.start_key, a.end_key),
-                },
-            )),
-        }
-    }
-
     let mut results: Vec<(RepairAction, RepairOutcome)> =
         Vec::with_capacity(repair_plan.actions.len());
-    results.extend(prebuilt_outcomes);
 
-    if !ranges.is_empty() {
-        let mut src = source::create_source(&plan.source)?;
-        let mut summary = RunSummary::new(plan);
-        let before = summary.total_rows;
+    // The chunk run whose `chunk_task` rows reconcile reads. Repair re-exports
+    // against the latest run for this export — the same run reconcile counted.
+    // Without it we can re-export the data but cannot point the recorded state
+    // at the fresh count, so `reconcile → repair → reconcile` could never
+    // converge (audit finding #7).
+    let run_id = state
+        .get_latest_chunk_run(&plan.export_name)?
+        .map(|(rid, _, _, _)| rid);
+
+    // One summary across the whole repair (matches the original single
+    // `RunSummary::new`): `record_part` appends every freshly-written part to
+    // `summary.manifest_parts`. We snapshot its length and `total_rows` around
+    // each single-chunk re-export to attribute the exact rows and the exact
+    // new file(s) to that chunk — no even-split lie.
+    let mut src = source::create_source(&plan.source)?;
+    let mut summary = RunSummary::new(plan);
+
+    // Repair-written parts to record in the destination manifest, in order.
+    let mut new_parts: Vec<ManifestPart> = Vec::new();
+
+    for a in &repair_plan.actions {
+        let (start, end) = match (a.start_key.parse::<i64>(), a.end_key.parse::<i64>()) {
+            (Ok(s), Ok(e)) => (s, e),
+            _ => {
+                results.push((
+                    a.clone(),
+                    RepairOutcome::Skipped {
+                        reason: format!("unparseable chunk keys [{}..{}]", a.start_key, a.end_key),
+                    },
+                ));
+                continue;
+            }
+        };
+
+        let rows_before = summary.total_rows;
+        let parts_before = summary.manifest_parts.len();
         let outcome = run_chunked_sequential(
             &mut *src,
             plan,
             &mut summary,
             Some(state),
-            ChunkSource::Precomputed(ranges.clone()),
+            ChunkSource::Precomputed(vec![(start, end)]),
         );
-        let delta = summary.total_rows - before;
         match outcome {
             Ok(()) => {
-                // Sequential runs chunks in order; we do not track per-chunk row
-                // counts separately here, so attribute the delta to the set.
-                // If the set is a single chunk, the attribution is exact.
-                let executed_actions: Vec<_> = repair_plan
-                    .actions
-                    .iter()
-                    .filter(|a| {
-                        a.start_key.parse::<i64>().is_ok() && a.end_key.parse::<i64>().is_ok()
-                    })
-                    .cloned()
-                    .collect();
-                if executed_actions.len() == 1 {
-                    results.push((
-                        executed_actions[0].clone(),
-                        RepairOutcome::Executed {
-                            rows_written: delta,
-                        },
-                    ));
-                } else {
-                    // Even split is a lie — mark each as executed, attribute total to the first.
-                    let mut first = true;
-                    for a in executed_actions {
-                        let rows = if first { delta } else { 0 };
-                        first = false;
-                        results.push((a, RepairOutcome::Executed { rows_written: rows }));
+                let rows = summary.total_rows - rows_before;
+                // Every part `record_part` appended for this single chunk — its
+                // path, rows, bytes, fingerprint, md5. One chunk yields one part
+                // unless max_file_size rotated it; either way these are exactly
+                // the new files the manifest must learn about.
+                let chunk_parts: Vec<ManifestPart> =
+                    summary.manifest_parts[parts_before..].to_vec();
+
+                // (1) Close finding #7: point `chunk_task.rows_written` at the
+                //     freshly-exported count (and re-mark the task completed,
+                //     clearing any stale error) so the next reconcile compares
+                //     the live source count against the repaired count. The
+                //     `file_name` records the newest part for this chunk; if the
+                //     chunk rotated into several parts the latest is recorded
+                //     (reconcile keys on rows_written, not file_name).
+                if let Some(rid) = &run_id {
+                    let file_name = chunk_parts.last().map(|p| p.path.as_str());
+                    if let Err(e) = state.complete_chunk_task(rid, a.chunk_index, rows, file_name) {
+                        // Non-fatal to the data (the file is durable) but fatal
+                        // to trust — surface it loudly rather than report a
+                        // false "executed" that leaves reconcile stuck.
+                        log::warn!(
+                            "repair: chunk {} re-exported but chunk_task update failed — \
+                             reconcile will still report the old mismatch: {:#}",
+                            a.chunk_index,
+                            e
+                        );
                     }
+                } else {
+                    log::warn!(
+                        "repair: chunk {} re-exported but no chunk run is recorded for export \
+                         '{}' — chunk_task could not be updated; reconcile will not converge",
+                        a.chunk_index,
+                        plan.export_name
+                    );
                 }
+
+                new_parts.extend(chunk_parts);
+                results.push((a.clone(), RepairOutcome::Executed { rows_written: rows }));
             }
             Err(e) => {
                 let msg = crate::redact::redact_error(&e);
-                for a in repair_plan.actions.iter().filter(|a| {
-                    a.start_key.parse::<i64>().is_ok() && a.end_key.parse::<i64>().is_ok()
-                }) {
-                    results.push((a.clone(), RepairOutcome::Failed { error: msg.clone() }));
-                }
+                results.push((a.clone(), RepairOutcome::Failed { error: msg }));
             }
         }
+    }
+
+    // (2) Close finding #8: record the repair-written parts in the destination
+    //     manifest so `rivet validate` no longer flags them as untracked. Best
+    //     effort and warn-on-fail (ADR-0001 I7 / ADR-0012): the parts are
+    //     already durable at the destination, so a manifest-rewrite failure
+    //     must not change the repair's exit code — but it is logged loudly so
+    //     the operator knows validate may still flag the files.
+    if !new_parts.is_empty()
+        && let Err(e) = record_repair_parts_in_manifest(plan, &new_parts)
+    {
+        log::warn!(
+            "repair: re-exported parts were written but the destination manifest could not be \
+             updated (the files are durable; `rivet validate` may flag them as untracked): {:#}",
+            e
+        );
     }
 
     Ok(RepairReport::new(
@@ -206,6 +265,68 @@ fn execute_repair(
         format!("repair-{}", chrono::Utc::now().format("%Y%m%dT%H%M%S")),
         results,
     ))
+}
+
+/// Read the destination `manifest.json`, append the repair-written parts as new
+/// committed entries (fresh unique `part_id`s, recomputed `row_count` /
+/// `part_count`), and rewrite it. The originals stay recorded — repair is
+/// additive — so this closes the "untracked repair file" gap (finding #8)
+/// without dropping the manifest's history of the prior parts.
+///
+/// Returns `Err` if no manifest exists at the prefix (a repair against a prefix
+/// that was never finalized has nothing to amend) or if the read/write fails;
+/// the caller logs and continues since the data itself is already durable.
+fn record_repair_parts_in_manifest(
+    plan: &ResolvedRunPlan,
+    new_parts: &[ManifestPart],
+) -> Result<()> {
+    let dest = crate::destination::create_destination(&plan.destination)?;
+
+    // Manifests live at the prefix root (manifest_dir == "" for the local/path
+    // and bucket-prefix destinations repair supports); parts are recorded with
+    // prefix-relative paths, which is exactly what `record_part` stored.
+    let raw = match dest.head(MANIFEST_FILENAME)? {
+        Some(_) => dest.read(MANIFEST_FILENAME)?,
+        None => anyhow::bail!(
+            "no manifest.json at the destination prefix — cannot record repair parts \
+             (was the original export finalized?)"
+        ),
+    };
+    let mut manifest: RunManifest = serde_json::from_slice(&raw)
+        .map_err(|e| anyhow::anyhow!("destination manifest.json is unparseable: {e}"))?;
+
+    // Unique, monotonic part_ids (ADR-0012 M4): max existing + 1, incrementing.
+    let mut next_id = manifest.parts.iter().map(|p| p.part_id).max().unwrap_or(0) + 1;
+    for p in new_parts {
+        manifest.parts.push(ManifestPart {
+            part_id: next_id,
+            path: p.path.clone(),
+            rows: p.rows,
+            size_bytes: p.size_bytes,
+            content_fingerprint: p.content_fingerprint.clone(),
+            content_md5: p.content_md5.clone(),
+            status: PartStatus::Committed,
+        });
+        next_id += 1;
+    }
+
+    // Keep the manifest self-consistent (validate's step 2 checks this): the
+    // declared aggregates must match the committed parts after the append.
+    manifest.row_count = manifest.committed_rows();
+    manifest.part_count = manifest.committed_part_count() as u32;
+    manifest.finished_at = chrono::Utc::now().to_rfc3339();
+
+    // Reuse the standard writer so atomicity / streaming-skip rules stay in one
+    // place. A repaired dataset is not a fresh clean run, so do NOT re-stamp
+    // _SUCCESS here — preserve whatever terminal status the manifest carried
+    // (the writer emits _SUCCESS only for `Success`, which the original clean
+    // run already established).
+    let bytes = serde_json::to_vec_pretty(&manifest)?;
+    let _ = ManifestStatus::Success; // (status unchanged; documented above)
+    let tmp = tempfile::NamedTempFile::new()?;
+    std::fs::write(tmp.path(), &bytes)?;
+    dest.write(tmp.path(), MANIFEST_FILENAME)?;
+    Ok(())
 }
 
 fn emit_plan(plan: &RepairPlan, format: &RepairOutputFormat) -> Result<()> {
