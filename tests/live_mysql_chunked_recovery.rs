@@ -187,6 +187,17 @@ exports:
         150,
         "total manifest rows must equal seeded row count (no duplicates)"
     );
+    // Destination re-read: chunk 0 not re-run → exactly 150 rows, 150 distinct ids.
+    assert_eq!(
+        total_parquet_rows(out.path()),
+        150,
+        "destination must hold exactly 150 rows (no re-run, no dup)"
+    );
+    assert_eq!(
+        dir_parquet_id_set(out.path()).len(),
+        150,
+        "150 distinct source ids must be present at the destination"
+    );
 }
 
 // ─── C2: sequential — crash after chunk 0 file (before commit) → re-runs ─────
@@ -287,6 +298,17 @@ exports:
     assert!(
         parquet_files.len() >= 3,
         "at least 3 parquet files must exist (one per chunk); found: {parquet_files:?}"
+    );
+    // Destination re-read: every source id present (no loss) despite the
+    // at-least-once chunk-0 re-run; physical rows >= source (the dup is surplus).
+    assert_eq!(
+        dir_parquet_id_set(out.path()).len(),
+        150,
+        "every seeded id must survive the at-least-once re-run (no loss)"
+    );
+    assert!(
+        total_parquet_rows(out.path()) as i64 >= 150,
+        "at-least-once: physical destination rows must be >= source (150)"
     );
 }
 
@@ -415,6 +437,18 @@ exports:
         "at least {EXPECTED_CHUNKS} parquet files must exist; found {}: {parquet_files:?}",
         parquet_files.len()
     );
+    // Destination re-read: no parallel double-write → exactly ROW_COUNT rows,
+    // ROW_COUNT distinct ids.
+    assert_eq!(
+        total_parquet_rows(out.path()) as i64,
+        ROW_COUNT,
+        "destination must hold exactly ROW_COUNT rows — no parallel double-write"
+    );
+    assert_eq!(
+        dir_parquet_id_set(out.path()).len() as i64,
+        ROW_COUNT,
+        "ROW_COUNT distinct source ids must be present"
+    );
 }
 
 // ─── C4: parallel — stuck-running recovery via at-least-once ─────────────────
@@ -537,5 +571,16 @@ exports:
         parquet_files.len() >= EXPECTED_CHUNKS as usize,
         "at least {EXPECTED_CHUNKS} parquet files must exist; found {}: {parquet_files:?}",
         parquet_files.len()
+    );
+    // Destination re-read: every source id survives the stuck-running reset +
+    // at-least-once re-run (no loss); physical rows >= source (the dup is surplus).
+    assert_eq!(
+        dir_parquet_id_set(out.path()).len() as i64,
+        ROW_COUNT,
+        "every seeded id must land after stuck-running reset + at-least-once re-run"
+    );
+    assert!(
+        total_parquet_rows(out.path()) as i64 >= ROW_COUNT,
+        "at-least-once: physical destination rows must be >= ROW_COUNT"
     );
 }
