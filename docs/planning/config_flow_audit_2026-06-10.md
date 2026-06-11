@@ -40,7 +40,14 @@
 >
 > **Осознанно НЕ закрыто** (продуктовые решения / вне scope): полная реализация value-партиционирования
 > (#28 — только docs), CSV-compression как фича (#10 — выбран reject), `--json` флаг metrics/journal
-> (#25 — рендереры готовы, остаётся проводка в cli.rs). 30 LOW-находок не трогались.
+> (#25 — рендереры готовы, остаётся проводка в cli.rs).
+>
+> **LOW (2026-06-11): 18 из 30 закрыто** тем же fix+assert конвейером (doctor single-surface/perm-label/trim/stdout-line,
+> check target-msg+note+plan-validation+export-list, state column+hints+unknown-export, plan json-array+output,
+> validate untracked→warning, repair chunk-index, config warns+docs). **Дубли уже закрытых HIGH:** L3/L5/L11.
+> **Отложено:** L0 (init MSSQL-scaffold) и L1 (init include/exclude фильтр) — фичи; L20 (doctor fail-fast на
+> недоступном cloud) — нужен no-retry seam в `cloud.rs`; L26 (hint на не-закавыченный `{partition}`) — ошибка
+> serde_yaml upstream; L27 (cursor/window-строка в summary) — частично.
 
 ---
 
