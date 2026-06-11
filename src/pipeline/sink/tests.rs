@@ -199,6 +199,7 @@ fn run_quality_checks_detects_duplicates() {
     set.insert(1u64);
     set.insert(2u64);
     sink.quality_unique_sets.insert("id".into(), set);
+    sink.quality_unique_non_null_counts.insert("id".into(), 5);
     let issues = sink.run_quality_checks();
     assert_eq!(issues.len(), 1);
     assert!(issues[0].message.contains("duplicate"));
@@ -392,6 +393,7 @@ fn minimal_sink() -> ExportSink {
         exported_at_us: 0,
         quality_null_counts: std::collections::HashMap::new(),
         quality_unique_sets: std::collections::HashMap::new(),
+        quality_unique_non_null_counts: std::collections::HashMap::new(),
         quality_unique_capped: std::collections::HashSet::new(),
         quality_columns: None,
         quality_null_indices: Vec::new(),
@@ -892,5 +894,292 @@ fn pipelined_sink_output_is_byte_identical_to_synchronous() {
     assert_eq!(
         sync_fp, p_fp,
         "pipelined output must be byte-identical to synchronous"
+    );
+}
+
+// ─── ROAST-RED: NULLs in unique-checked columns ──────────────────────────
+
+// ROAST-RED sink-null-uniq: track_quality hashes NULL rows of unique-checked
+// columns (each NULL formats to "" and all collapse into one xxh3 entry), so a
+// nullable unique column with k>=2 NULLs reports k-1 false duplicates and the
+// quality gate fails the export. SQL UNIQUE semantics: NULLs are not duplicates.
+// Asserts CORRECT behavior; expected to FAIL until the fix lands.
+#[test]
+fn roast_unique_check_treats_nulls_as_non_duplicates() {
+    use crate::source::BatchSink;
+    let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec![
+            Some("a"),
+            None,
+            None,
+            Some("b"),
+        ]))],
+    )
+    .unwrap();
+
+    let mut sink = minimal_sink_with_quality(vec![], vec!["name".into()]);
+    sink.on_schema(schema).unwrap();
+    sink.on_batch(&batch).unwrap(); // total_rows = 4, quality tracked inline
+
+    let issues = sink.run_quality_checks();
+    let dupe_issues: Vec<String> = issues
+        .iter()
+        .filter(|i| i.message.contains("duplicate"))
+        .map(|i| format!("[{:?}] {}", i.severity, i.message))
+        .collect();
+    assert!(
+        dupe_issues.is_empty(),
+        "column 'name' holds distinct non-NULL values ('a', 'b') plus 2 NULLs — \
+         per SQL UNIQUE semantics NULLs are not duplicates, so the quality gate \
+         must pass with zero duplicates; got false duplicate report(s): {:?}",
+        dupe_issues
+    );
+}
+
+// ─── regression edge cases: NULLs vs uniqueness (companions to the roast test) ──
+
+#[test]
+fn unique_check_all_null_column_reports_zero_issues() {
+    use crate::source::BatchSink;
+    let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec![None::<&str>, None, None]))],
+    )
+    .unwrap();
+
+    let mut sink = minimal_sink_with_quality(vec![], vec!["name".into()]);
+    sink.on_schema(schema).unwrap();
+    sink.on_batch(&batch).unwrap(); // total_rows = 3, all NULL
+
+    let issues = sink.run_quality_checks();
+    assert!(
+        issues.is_empty(),
+        "an all-NULL unique column has zero duplicates and must pass; got: {:?}",
+        issues
+            .iter()
+            .map(|i| i.message.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn unique_check_counts_only_real_duplicates_when_nulls_present() {
+    use crate::source::BatchSink;
+    let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+    // 7 rows: 'a' twice, 'b' twice, 'c' once, 2 NULLs → exactly 2 real duplicates.
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec![
+            Some("a"),
+            Some("a"),
+            None,
+            Some("b"),
+            None,
+            Some("b"),
+            Some("c"),
+        ]))],
+    )
+    .unwrap();
+
+    let mut sink = minimal_sink_with_quality(vec![], vec!["name".into()]);
+    sink.on_schema(schema).unwrap();
+    sink.on_batch(&batch).unwrap(); // total_rows = 7
+
+    let issues = sink.run_quality_checks();
+    assert_eq!(
+        issues.len(),
+        1,
+        "real duplicates must still be reported; got: {:?}",
+        issues
+            .iter()
+            .map(|i| i.message.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(issues[0].severity, crate::quality::Severity::Fail);
+    assert!(
+        issues[0].message.contains("2 duplicate"),
+        "NULLs must not inflate the count — exactly 2 duplicates; got: {}",
+        issues[0].message
+    );
+}
+
+#[test]
+fn unique_check_empty_string_distinct_from_null() {
+    use crate::source::BatchSink;
+    // ArrayFormatter renders both NULL and "" as "" — the NULL skip must keep a
+    // real empty string from colliding with a NULL.
+    let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec![Some(""), None, Some("x")]))],
+    )
+    .unwrap();
+
+    let mut sink = minimal_sink_with_quality(vec![], vec!["name".into()]);
+    sink.on_schema(schema).unwrap();
+    sink.on_batch(&batch).unwrap();
+
+    let issues = sink.run_quality_checks();
+    assert!(
+        issues.is_empty(),
+        "one empty string plus one NULL are distinct, not duplicates; got: {:?}",
+        issues
+            .iter()
+            .map(|i| i.message.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn unique_check_duplicate_empty_strings_counted_nulls_excluded() {
+    use crate::source::BatchSink;
+    // A genuinely repeated "" is a real duplicate; the NULL beside it (which
+    // formats identically to "") must not inflate the count: exactly 1 dupe.
+    let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec![
+            Some(""),
+            Some(""),
+            None,
+            Some("x"),
+        ]))],
+    )
+    .unwrap();
+
+    let mut sink = minimal_sink_with_quality(vec![], vec!["name".into()]);
+    sink.on_schema(schema).unwrap();
+    sink.on_batch(&batch).unwrap(); // total_rows = 4
+
+    let issues = sink.run_quality_checks();
+    assert_eq!(
+        issues.len(),
+        1,
+        "the repeated empty string is one real duplicate; got: {:?}",
+        issues
+            .iter()
+            .map(|i| i.message.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        issues[0].message.contains("1 duplicate"),
+        "exactly 1 duplicate (the second \"\"), NULL excluded; got: {}",
+        issues[0].message
+    );
+}
+
+#[test]
+fn unique_check_non_null_counter_accumulates_across_batches() {
+    use crate::source::BatchSink;
+    let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec![Some("a"), None]))],
+    )
+    .unwrap();
+
+    let mut sink = minimal_sink_with_quality(vec![], vec!["name".into()]);
+    sink.on_schema(schema).unwrap();
+    sink.on_batch(&batch).unwrap();
+    sink.on_batch(&batch).unwrap(); // total_rows = 4: 'a' twice + 2 NULLs
+
+    let issues = sink.run_quality_checks();
+    assert_eq!(
+        issues.len(),
+        1,
+        "the repeated 'a' across batches is one real duplicate; got: {:?}",
+        issues
+            .iter()
+            .map(|i| i.message.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        issues[0].message.contains("1 duplicate"),
+        "exactly 1 duplicate ('a'), NULLs excluded; got: {}",
+        issues[0].message
+    );
+}
+
+#[test]
+fn unique_cap_with_nulls_emits_warn_only_no_false_duplicate_fail() {
+    // Capped column: the check is abandoned (Warn) and the non-null counter
+    // must not resurrect it as a Fail-severity duplicate report.
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int64Array::from(vec![
+            Some(1),
+            None,
+            Some(2),
+            None,
+            Some(3),
+        ]))],
+    )
+    .unwrap();
+
+    let mut sink = sink_with_unique_cap(vec!["id".into()], 2);
+    sink.quality_unique_indices = vec![(0, "id".into())];
+    sink.track_quality(&batch);
+    sink.total_rows = 5;
+
+    assert!(
+        sink.quality_unique_capped.contains("id"),
+        "third distinct value past cap=2 must flag the column as capped"
+    );
+    let issues = sink.run_quality_checks();
+    assert_eq!(
+        issues.len(),
+        1,
+        "capped column must emit exactly the Warn issue; got: {:?}",
+        issues
+            .iter()
+            .map(|i| i.message.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(issues[0].severity, crate::quality::Severity::Warn);
+    assert!(
+        issues[0].message.contains("capped"),
+        "message must say 'capped'; got: {}",
+        issues[0].message
+    );
+}
+
+#[test]
+fn unique_cap_exact_boundary_trailing_nulls_do_not_trip_cap() {
+    // Exactly cap distinct values followed by NULLs: a NULL row reaching the
+    // cap comparison would falsely flag the column — the NULL skip must come first.
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int64Array::from(vec![
+            Some(1),
+            Some(2),
+            Some(3),
+            None,
+            None,
+        ]))],
+    )
+    .unwrap();
+
+    let mut sink = sink_with_unique_cap(vec!["id".into()], 3);
+    sink.quality_unique_indices = vec![(0, "id".into())];
+    sink.track_quality(&batch);
+    sink.total_rows = 5;
+
+    assert!(
+        !sink.quality_unique_capped.contains("id"),
+        "NULL rows after exactly cap distinct values must not trip the cap"
+    );
+    let issues = sink.run_quality_checks();
+    assert!(
+        issues.is_empty(),
+        "3 distinct + 2 NULLs at cap=3: no duplicates, no cap warning; got: {:?}",
+        issues
+            .iter()
+            .map(|i| i.message.as_str())
+            .collect::<Vec<_>>()
     );
 }

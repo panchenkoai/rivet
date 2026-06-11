@@ -18,7 +18,6 @@ use super::super::{
     progress::ChunkProgress,
     retry::{RetryClass, classify_error},
     sink::ExportSink,
-    validate::validate_output,
 };
 use super::{
     ChunkSource, chunked_plan, config_hint, detect_and_generate_chunks,
@@ -33,10 +32,11 @@ use crate::{destination, format, resource};
 
 use super::math::build_chunk_query_sql;
 
-/// Returns `(rows, Some(part))` for a non-empty chunk or `(0, None)` for an
-/// empty one.  Uses [`commit::write_part_file`] for the worker-safe I1 →
-/// dest.write → fingerprint half; the caller threads the resulting
-/// [`PartRecord`] through [`commit::record_part`].
+/// Returns `(rows, parts)` — one [`PartRecord`] per written part: empty for
+/// an empty chunk, several when `max_file_size` rotation split the chunk.
+/// Uses [`commit::write_sink_parts`] for the worker-safe I1 → dest.write →
+/// fingerprint half; the caller threads each record through
+/// [`commit::record_part`].
 #[allow(clippy::too_many_arguments)] // chunk + plan + summary threading is the actual arity here
 fn export_one_chunk_range(
     src: &mut dyn Source,
@@ -47,7 +47,7 @@ fn export_one_chunk_range(
     chunk_index: i64,
     plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
-) -> Result<(usize, Option<super::super::commit::PartRecord>)> {
+) -> Result<(usize, Vec<super::super::commit::PartRecord>)> {
     let chunk_query = build_chunk_query_sql(
         base_query,
         &cp.column,
@@ -79,27 +79,25 @@ fn export_one_chunk_range(
     }
 
     if sink.total_rows == 0 {
-        return Ok((0, None));
-    }
-
-    if plan.validate {
-        validate_output(sink.tmp.path(), plan.format, sink.total_rows)?;
-        summary.validated = Some(true);
+        return Ok((0, Vec::new()));
     }
 
     let fmt = format::create_format(plan.format, plan.compression, plan.compression_level, None);
-    let file_name =
-        super::chunk_part_filename(&plan.export_name, chunk_index, fmt.file_extension());
+    let base = super::chunk_part_filename(&plan.export_name, chunk_index, fmt.file_extension());
     let dest = destination::create_destination(&plan.destination)?;
-    // Worker-safe half of commit (I1 + dest.write + fingerprint).
-    let rec = super::super::commit::write_part_file(
+    // Worker-safe half of commit (I1 + dest.write + fingerprint), draining
+    // every part the sink produced (max_file_size rotation included).
+    let recs = super::super::commit::write_sink_parts(
         dest.as_ref(),
-        sink.tmp.path(),
-        sink.total_rows as i64,
-        file_name,
+        &mut sink,
+        plan.validate.then_some(plan.format),
+        |idx, count| super::super::commit::part_indexed_name(&base, idx, count),
     )?;
+    if plan.validate {
+        summary.validated = Some(true);
+    }
 
-    Ok((sink.total_rows, Some(rec)))
+    Ok((sink.total_rows, recs))
 }
 
 #[allow(clippy::too_many_arguments)] // mirrors export_one_chunk_range's arity for retry wrapping
@@ -111,7 +109,7 @@ fn run_chunk_with_source_retries(
     chunk_index: i64,
     plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
-) -> Result<(usize, Option<super::super::commit::PartRecord>)> {
+) -> Result<(usize, Vec<super::super::commit::PartRecord>)> {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..=plan.tuning.max_retries {
         if attempt > 0 {
@@ -255,7 +253,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
             plan,
             summary,
         ) {
-            Ok((rows, part)) => {
+            Ok((rows, parts)) => {
                 summary.total_rows += rows as i64;
                 pb.inc(summary.total_rows);
                 // Shared commit path for the non-empty branch (I2/M1 + counters
@@ -263,8 +261,15 @@ pub(crate) fn run_chunked_sequential_checkpoint(
                 // Empty chunks have no file to record but still need to journal
                 // completion + finalize the chunk_task so the run accounts for
                 // every claimed index.
-                let fname: Option<String> = match &part {
-                    Some(rec) => {
+                let fname: Option<String> = if parts.is_empty() {
+                    summary.journal.record(RunEvent::ChunkCompleted {
+                        chunk_index,
+                        rows: 0,
+                        file_name: None,
+                    });
+                    None
+                } else {
+                    for rec in &parts {
                         super::super::commit::record_part(
                             plan,
                             summary,
@@ -272,16 +277,12 @@ pub(crate) fn run_chunked_sequential_checkpoint(
                             rec,
                             super::super::commit::PartKind::Chunk { chunk_index },
                         );
-                        Some(rec.file_name.clone())
                     }
-                    None => {
-                        summary.journal.record(RunEvent::ChunkCompleted {
-                            chunk_index,
-                            rows: 0,
-                            file_name: None,
-                        });
-                        None
-                    }
+                    // chunk_task carries one file name; for a rotation-split
+                    // chunk store the first sibling. The manifest records all
+                    // siblings, so a missing one fails destination verification
+                    // loudly instead of being silently skipped on resume.
+                    Some(parts[0].file_name.clone())
                 };
                 crate::test_hook::maybe_panic_at_chunk("after_chunk_file", chunk_index);
                 state.complete_chunk_task(&run_id, chunk_index, rows as i64, fname.as_deref())?;

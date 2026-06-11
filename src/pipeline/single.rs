@@ -274,16 +274,14 @@ pub(super) fn run_single_export(
             .collect();
         if !fails.is_empty() {
             summary.quality_passed = Some(false);
-            // Surface *which* checks failed in the terminal error, not just
-            // "quality checks failed" — the messages are already computed (and
-            // warn-logged above), so put them where the user will actually see
-            // them.
-            anyhow::bail!(
-                "export '{}': {} quality check(s) failed:\n  - {}\n  Fix the source data, or adjust the thresholds under `quality:` in your config.",
-                plan.export_name,
-                fails.len(),
-                fails.join("\n  - "),
-            );
+            // Surface *which* checks failed (they're already computed +
+            // warn-logged above) via the shared failure contract in
+            // `crate::quality` so single and chunked modes can't drift.
+            anyhow::bail!(crate::quality::failure_message(
+                &plan.export_name,
+                None,
+                &fails
+            ));
         }
     }
     if plan.quality.is_some() {
