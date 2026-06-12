@@ -343,7 +343,7 @@ fn dispatch_init(
     } else {
         init::InitFormat::Yaml
     };
-    let source_url = resolve_init_source(source, source_env, source_file)?;
+    let (source_url, provenance) = resolve_init_source(source, source_env, source_file)?;
     let yaml_dest = init::InitYamlDestination {
         gcs_bucket,
         gcs_credentials_file,
@@ -353,6 +353,7 @@ fn dispatch_init(
     let filter = init::TableFilter { include, exclude };
     init::init(
         &source_url,
+        &provenance,
         table.as_deref(),
         schema.as_deref(),
         output.as_deref(),

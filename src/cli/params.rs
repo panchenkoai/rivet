@@ -33,18 +33,20 @@ pub(super) fn resolve_init_source(
     source: Option<String>,
     source_env: Option<String>,
     source_file: Option<String>,
-) -> Result<String> {
+) -> Result<(String, crate::init::SourceProvenance)> {
+    use crate::init::SourceProvenance;
     if let Some(url) = source {
-        return Ok(url);
+        return Ok((url, SourceProvenance::Inline));
     }
     if let Some(var) = source_env {
-        return std::env::var(&var)
-            .map_err(|_| anyhow::anyhow!("--source-env '{}' is not set in the environment", var));
+        let url = std::env::var(&var)
+            .map_err(|_| anyhow::anyhow!("--source-env '{}' is not set in the environment", var))?;
+        return Ok((url, SourceProvenance::Env(var)));
     }
     if let Some(path) = source_file {
         let raw = std::fs::read_to_string(&path)
             .map_err(|e| anyhow::anyhow!("cannot read --source-file '{}': {}", path, e))?;
-        return Ok(raw.trim().to_string());
+        return Ok((raw.trim().to_string(), SourceProvenance::File(path)));
     }
     // Unreachable: clap ArgGroup enforces `required = true`.
     anyhow::bail!("--source, --source-env, or --source-file is required")
