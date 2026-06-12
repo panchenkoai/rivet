@@ -9,13 +9,50 @@ use clap::{Parser, Subcommand};
 use clap_complete::Shell;
 
 #[derive(Parser)]
-#[command(name = "rivet", version, about = "Export data from databases to files")]
+#[command(
+    name = "rivet",
+    version,
+    about = "Export data from databases to files",
+    after_help = "Getting started (the happy path):\n  \
+        1. rivet init     scaffold a config from your database\n  \
+        2. rivet doctor   test source + destination auth\n  \
+        3. rivet check    column-type & schema report\n  \
+        4. rivet run      export your data\n\n\
+        Docs: https://github.com/panchenkoai/rivet/blob/main/docs/getting-started.md"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
     /// Output errors as {"error":"..."} JSON to stderr; useful for machine-readable orchestration
     #[arg(long, global = true)]
     pub json_errors: bool,
+}
+
+/// Parse argv into [`Cli`]. When a config-taking subcommand (the documented
+/// `doctor` Step 1, `check`, `run`, …) is invoked with NO `-c/--config`, append
+/// a `rivet init` recovery hint after clap's own usage error. Every other clap
+/// outcome — `--help` / `--version` (which exit 0) and all other parse errors —
+/// is left byte-for-byte unchanged. We deliberately do NOT default `-c` to
+/// `./rivet.yaml`: that would silently run against an unintended config from the
+/// wrong directory, breaking rivet's no-accidental-action contract.
+pub fn parse_cli() -> Cli {
+    use clap::Parser;
+    match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            let missing_config = e.kind() == clap::error::ErrorKind::MissingRequiredArgument
+                && e.to_string().contains("--config");
+            if missing_config {
+                let _ = e.print();
+                eprintln!(
+                    "\nHint: run `rivet init -o rivet.yaml` to scaffold a config, then pass it with `-c rivet.yaml`."
+                );
+                std::process::exit(2);
+            }
+            // Help/version (exit 0) and every other parse error: clap's default.
+            e.exit();
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -63,8 +100,8 @@ pub enum Commands {
         #[arg(short, long = "param", value_name = "KEY=VALUE")]
         params: Vec<String>,
     },
-    /// Step 2 — column-type & schema report for each export (needs a working
-    /// connection; run `doctor` first if it can't connect)
+    /// Column-type & schema report for each export (needs a working connection;
+    /// run `doctor` first if it can't connect)
     Check {
         /// Path to YAML config file
         #[arg(short, long)]
@@ -88,7 +125,7 @@ pub enum Commands {
         #[arg(long, value_name = "TARGET")]
         target: Option<String>,
     },
-    /// Step 1 — verify source + destination auth/connectivity (run this first)
+    /// Verify source + destination auth/connectivity (run this first)
     Doctor {
         /// Path to YAML config file
         #[arg(short, long)]
@@ -135,7 +172,7 @@ pub enum Commands {
         /// Write output to this file instead of stdout
         #[arg(short, long)]
         output: Option<String>,
-        /// Emit a machine-readable JSON discovery artifact (Epic B) instead of a YAML scaffold.
+        /// Emit a machine-readable JSON discovery artifact instead of a YAML scaffold.
         /// Includes row estimates, size bytes, ranked cursor candidates, chunk candidates, and advisory notes.
         /// Mutually exclusive with the YAML-only `--gcs-bucket` / `--s3-bucket` flags.
         #[arg(
@@ -189,7 +226,7 @@ pub enum Commands {
         #[arg(long)]
         force: bool,
     },
-    /// Targeted repair of chunks flagged by reconcile: emit a repair plan, or re-export only mismatched ranges (Epic H).
+    /// Targeted repair of chunks flagged by reconcile: emit a repair plan, or re-export only mismatched ranges.
     Repair {
         /// Path to YAML config file
         #[arg(short, long)]
@@ -261,7 +298,7 @@ pub enum Commands {
         #[arg(long, value_name = "PREFIX")]
         prefix: Option<String>,
     },
-    /// Partition/window reconciliation: re-count per-partition on source and report mismatches (Epic F).
+    /// Partition/window reconciliation: re-count per-partition on source and report mismatches.
     /// Requires a chunked export previously run with `chunk_checkpoint: true`.
     /// Exits non-zero when a mismatch is detected, so CI / orchestrators can gate on it
     /// (an `unknown` partition warns but does not fail).
