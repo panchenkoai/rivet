@@ -34,7 +34,33 @@ pub fn enhance_parse_error(err: serde_yaml_ng::Error) -> anyhow::Error {
         // and just append the suggestion as a new line.
         return anyhow::anyhow!("{raw}\n  Did you mean `{hint}`?");
     }
+    if let Some(hint) = missing_field_hint(&raw) {
+        // serde's bare `missing field \`x\`` says WHAT is missing but not how to
+        // fix it. Append a remediation line, preserving the verbatim leading text.
+        return anyhow::anyhow!("{raw}\n  Hint: {hint}");
+    }
     err.into()
+}
+
+/// A remediation line for serde's `missing field \`x\`` errors on the few
+/// top-level fields a newcomer is most likely to omit. `None` for any other
+/// field, so it never over-fires on a missing nested/optional field.
+fn missing_field_hint(msg: &str) -> Option<&'static str> {
+    let i = msg.find("missing field `")? + "missing field `".len();
+    let field = msg[i..].split('`').next()?;
+    match field {
+        "source" => Some(
+            "every config needs a `source:` block (type + url/url_env). Run `rivet init` to scaffold one.",
+        ),
+        "exports" => Some(
+            "every config needs an `exports:` list with at least one export. Run `rivet init` to scaffold one.",
+        ),
+        "name" => Some("each export needs a `name:` (used in output filenames and state keys)."),
+        "query" => {
+            Some("each export needs a `query:` — or the `table:` shortcut — to select rows.")
+        }
+        _ => None,
+    }
 }
 
 /// Parse `"unknown field `xxx`, expected one of `a`, `b`, ..."` and
@@ -96,13 +122,30 @@ fn parse_unknown_field_message(msg: &str) -> Option<(String, Vec<String>)> {
 fn closest_match(needle: &str, candidates: &[String]) -> Option<String> {
     let needle_lower = needle.to_ascii_lowercase();
 
-    // Substring relation wins outright.  Pick the longest candidate
-    // (more specific) when several qualify — `bucket_name` should
-    // suggest `bucket`, not `b`, even if both were in scope.
-    //
-    // Floor at 3 chars: single-letter candidates produce nonsense
-    // suggestions ("did you mean `a`?" for `totally_unrelated`) and
-    // no real Config field is that short anyway.
+    // Edit-distance FIRST: a near-exact typo must win over a substring match to
+    // a longer, unrelated field. `export` is one edit from `exports`, but it is
+    // ALSO a substring of `parallel_export_processes` — running substring first
+    // (longest wins) suggested the advanced flag instead of the obvious field.
+    let mut best: Option<(usize, &String)> = None;
+    for c in candidates {
+        let d = levenshtein(&needle_lower, &c.to_ascii_lowercase());
+        match best {
+            Some((bd, _)) if d >= bd => {}
+            _ => best = Some((d, c)),
+        }
+    }
+    if let Some((dist, hit)) = best {
+        let longer = needle.len().max(hit.len());
+        let threshold = (longer / 3).max(2);
+        if dist <= threshold {
+            return Some(hit.clone());
+        }
+    }
+
+    // Substring fallback: `bucket_name` → `bucket` is meaningful even though the
+    // edit distance (5) is too far. Pick the longest qualifying candidate.
+    // Floor at 3 chars: single-letter candidates produce nonsense suggestions
+    // and no real Config field is that short.
     const SUBSTR_MIN_LEN: usize = 3;
     let mut substring_hit: Option<&String> = None;
     for c in candidates {
@@ -117,26 +160,7 @@ fn closest_match(needle: &str, candidates: &[String]) -> Option<String> {
             };
         }
     }
-    if let Some(hit) = substring_hit {
-        return Some(hit.clone());
-    }
-
-    let mut best: Option<(usize, &String)> = None;
-    for c in candidates {
-        let d = levenshtein(&needle_lower, &c.to_ascii_lowercase());
-        match best {
-            Some((bd, _)) if d >= bd => {}
-            _ => best = Some((d, c)),
-        }
-    }
-    let (dist, hit) = best?;
-    let longer = needle.len().max(hit.len());
-    let threshold = (longer / 3).max(2);
-    if dist <= threshold {
-        Some(hit.clone())
-    } else {
-        None
-    }
+    substring_hit.cloned()
 }
 
 /// Classic Wagner–Fischer Levenshtein distance over ASCII / byte-
@@ -214,6 +238,33 @@ mod tests {
         let candidates = vec!["bucket".into()];
         assert_eq!(
             closest_match("BUCKET", &candidates).as_deref(),
+            Some("bucket"),
+        );
+    }
+
+    #[test]
+    fn closest_match_prefers_near_typo_over_longer_substring() {
+        // `export` is one edit from `exports`, but ALSO a substring of
+        // `parallel_export_processes`. The near typo must win — the old
+        // substring-first rule suggested the advanced flag.
+        let candidates = vec![
+            "source".into(),
+            "exports".into(),
+            "parallel_exports".into(),
+            "parallel_export_processes".into(),
+        ];
+        assert_eq!(
+            closest_match("export", &candidates).as_deref(),
+            Some("exports"),
+        );
+    }
+
+    #[test]
+    fn closest_match_substring_fallback_still_works() {
+        // No near typo, but `bucket_name` meaningfully contains `bucket`.
+        let candidates = vec!["bucket".into(), "prefix".into()];
+        assert_eq!(
+            closest_match("bucket_name", &candidates).as_deref(),
             Some("bucket"),
         );
     }

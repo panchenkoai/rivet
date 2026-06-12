@@ -414,3 +414,27 @@ exports:
 "#;
     Config::from_yaml(yaml).expect("relative path must pass validation");
 }
+
+#[test]
+fn tab_indentation_gets_a_spaces_hint() {
+    // A tab in indentation is the classic beginner YAML mistake.
+    let yaml = "source:\n  type: postgres\n\tbad: tab\nexports: []\n";
+    let err = Config::from_yaml(yaml).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("TAB") && msg.contains("spaces"),
+        "expected a tab→spaces hint, got: {msg}"
+    );
+}
+
+#[test]
+fn missing_source_field_gets_a_remediation_hint() {
+    let yaml = "exports:\n  - name: t\n    query: \"SELECT 1\"\n    format: csv\n    destination: {type: local, path: /tmp}\n";
+    let err = Config::from_yaml(yaml).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("missing field `source`"), "got: {msg}");
+    assert!(
+        msg.contains("rivet init"),
+        "expected a `rivet init` remediation hint, got: {msg}"
+    );
+}
