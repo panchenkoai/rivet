@@ -6,6 +6,22 @@ representations. It is aligned with the automated suite in
 [`tests/type_roundtrip/`](../tests/type_roundtrip/) and
 [`tests/live_type_golden.rs`](../tests/live_type_golden.rs).
 
+## The short version
+
+Wondering "will my decimals / UUIDs / JSON / timestamps silently break on the way
+out?" — the short answer is no:
+
+- **Decimals never become floats** — `DECIMAL`/`NUMERIC` export as exact Arrow
+  `Decimal128`/`Decimal256` when precision and scale are known.
+- **UUID and JSON keep native types** — Parquet gets native `LogicalType::Uuid` /
+  `LogicalType::Json`, not opaque strings.
+- **Timestamps preserve the instant** — the point in time round-trips (Parquet
+  keeps the zone; CSV deliberately emits the instant without an offset).
+- **Rivet fails loud, not silent** — a lossy or unmapped type is named by
+  `rivet check` and aborts the run, never quietly truncated.
+
+The per-engine tables below are the precise contract; this is just the gist.
+
 ## Guarantees (v0.7.8)
 
 - **DECIMAL / NUMERIC** are never silently converted to float. They export as

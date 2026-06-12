@@ -24,6 +24,7 @@
 brew install panchenkoai/rivet/rivet
 
 export DATABASE_URL="postgresql://user:pass@host/db"
+# `orders` is a placeholder — use one of YOUR tables, or omit --table to scan the whole schema
 rivet init --source-env DATABASE_URL --table orders -o rivet.yaml
 rivet run -c rivet.yaml
 ```

@@ -7,6 +7,7 @@ Rivet exports tables from PostgreSQL, MySQL, or SQL Server to Parquet (or CSV) f
 ```bash
 brew install panchenkoai/rivet/rivet
 export DATABASE_URL='postgresql://user:pass@localhost:5432/mydb'
+# `orders` is a placeholder — use one of YOUR tables, or omit --table to scan the whole schema
 rivet init --source-env DATABASE_URL --table orders -o rivet.yaml
 rivet run --config rivet.yaml --validate
 ```
@@ -42,6 +43,7 @@ export DATABASE_URL='postgresql://user:pass@localhost:5432/mydb'
 # export DATABASE_URL='mysql://user:pass@localhost:3306/mydb'
 
 rivet init --source-env DATABASE_URL --table orders -o rivet.yaml
+# `orders` is a placeholder — use one of YOUR tables, or omit --table to scan the whole schema
 ```
 
 `rivet init` connects once, reads the column list + a rough row estimate from the live database, and writes a YAML file with `url_env: DATABASE_URL` and a sensible default mode. For large tables it picks `mode: chunked`, auto-resolves the chunk key from the primary key, and **scales `parallel:` to the row estimate** (1 / 2 / 4) so a big export uses several connections out of the box — measured ~1.4× faster on a wide 2 M-row table and ~4× on a narrow one, with no flags to set. You can also point it at a whole schema (`--schema public`) or emit a richer JSON discovery artifact instead (`--discover -o discovery.json`).
