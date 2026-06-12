@@ -167,6 +167,11 @@ pub fn check(
         })?;
     }
 
+    // Whether the check ends clean (no strict failure, no target-fail column).
+    // Stays true for the default `rivet check` (no type report), so the "Next:
+    // rivet run" pointer still fires.
+    let mut clean = true;
+
     if show_type_report {
         let policy = if strict {
             TypePolicy::strict()
@@ -247,10 +252,26 @@ pub fn check(
         } else if !strict && target_fail_cols > 0 && !json_output {
             // The table showed "fail ✗" but rc is 0 — say so explicitly. Skipped
             // under --json so NDJSON output stays one object per line.
+            clean = false;
             println!();
             println!(
                 "{}",
                 target_fail_note(target_fail_cols, target_fail_label.unwrap_or("target"))
+            );
+        }
+    }
+
+    if !json_output {
+        // Verdict legend — decode the EFFICIENT/ACCEPTABLE/DEGRADED/UNSAFE words
+        // printed above and reassure that `check` is advisory: never blocks a run.
+        println!();
+        println!(
+            "Verdicts: EFFICIENT > ACCEPTABLE > DEGRADED > UNSAFE — advisory only; the run is never blocked."
+        );
+        if clean {
+            // Keep the ladder going to the final rung instead of ending cold.
+            println!(
+                "Looks good. Next: rivet run -c {config_path} --validate   # export, then verify row counts"
             );
         }
     }
@@ -278,9 +299,17 @@ fn print_diagnostic(diag: &ExportDiagnostic) {
     if let Some(col) = &diag.cursor_column {
         println!("  Cursor col:   {}", col);
     }
-    if let Some(scan) = &diag.scan_type {
-        let idx_label = if diag.uses_index { " (indexed)" } else { "" };
-        println!("  Scan type:    {}{}", scan, idx_label);
+    // Plain-language access path instead of a raw EXPLAIN node dump
+    // (`Result (cost=0.00..0.01 rows=1 width=36)`). Keyed off the authoritative
+    // `uses_index` bool, gated on `scan_type.is_some()` so engines without an
+    // EXPLAIN probe (MSSQL) stay silent.
+    if diag.scan_type.is_some() {
+        let access = if diag.uses_index {
+            "index scan (the cursor/chunk column is indexed)"
+        } else {
+            "full table scan (no index on the read path)"
+        };
+        println!("  Access:       {access}");
     }
     println!("  Verdict:      {}", diag.verdict);
     println!(

@@ -348,15 +348,24 @@ mod value_ceiling_tests {
 /// process rather than 3-4 times in stderr.
 pub(crate) fn warn_if_tls_disabled(config: &SourceConfig) {
     let enforced = config.tls.as_ref().is_some_and(|t| t.mode.is_enforced());
-    if !enforced {
-        static WARNED: std::sync::Once = std::sync::Once::new();
-        WARNED.call_once(|| {
-            log::warn!(
-                "source: TLS is not enforced — credentials and result rows cross the network in plaintext. \
-                 Add `source.tls.mode: verify-full` (with `ca_file:` if your CA is private) to enable transport security."
-            );
-        });
+    if enforced {
+        return;
     }
+    // Loopback (localhost / 127.0.0.0/8 / ::1) is the local-dev / docker case:
+    // the bytes never leave the box, so the plaintext warning is just noise on
+    // a newcomer's laptop. Resolve best-effort — if the URL can't be resolved we
+    // fall through and warn (fail-safe). The real CWE-319 signal still fires for
+    // any remote host.
+    if config.resolve_url().is_ok_and(|u| host_is_loopback(&u)) {
+        return;
+    }
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        log::warn!(
+            "source: TLS is not enforced — credentials and result rows cross the network in plaintext. \
+             Add `source.tls.mode: verify-full` (with `ca_file:` if your CA is private) to enable transport security."
+        );
+    });
 }
 
 /// Whether the host in a `scheme://[user[:pass]@]host[:port][/db][?…]`

@@ -98,6 +98,8 @@ pub fn doctor(config_path: &str) -> Result<()> {
     println!();
     if all_ok {
         println!("All checks passed.");
+        // Keep the ladder going to the next rung instead of ending cold.
+        println!("Next: rivet check -c {config_path}   # column-type & schema report");
         Ok(())
     } else {
         // F-NEW-A (0.7.5 audit): previously `doctor` printed
@@ -237,14 +239,14 @@ fn remove_destination_probe(dest: &crate::config::DestinationConfig, probe_key: 
 /// Categorisation still runs on the full `{:#}` chain elsewhere — this only
 /// shapes what is *printed*, never what is matched.
 fn trim_probe_error(err: &anyhow::Error) -> String {
-    // Single-line first: the `Parts { .. }` / `headers: { .. }` dumps span
-    // lines, and a `[FAIL]` entry should be one line.
-    let flat = err.to_string().replace(['\n', '\r'], " ");
-    // Cut at the first structural-dump marker (case-insensitive). These are the
-    // opendal/reqwest fragments that introduce the verbose HTTP response.
-    // `to_ascii_lowercase` keeps the byte layout identical to `flat` (markers
-    // are ASCII), so an index found in `lower` indexes `flat` correctly — a
-    // full Unicode `to_lowercase` could shift byte offsets and slice mid-char.
+    // Use the full `{:#}` cause chain, not the top-level Display: Postgres
+    // surfaces a wrong password as the bare wrapper `db error` and buries
+    // `password authentication failed for user …` in `.source()`. The alternate
+    // form joins the chain so the [FAIL] line shows the real reason.
+    let raw = format!("{err:#}");
+    // Detect an opendal/reqwest HTTP-response dump on a flattened copy (markers
+    // are ASCII, single-line fragments). `to_ascii_lowercase` keeps byte layout.
+    let flat = raw.replace(['\n', '\r'], " ");
     let lower = flat.to_ascii_lowercase();
     let cut = [
         ", context: {",
@@ -258,18 +260,20 @@ fn trim_probe_error(err: &anyhow::Error) -> String {
     .filter_map(|m| lower.find(m))
     .min();
     let mut out = match cut {
+        // A structural HTTP dump IS present: flatten to ONE line and cut at the
+        // marker so the header blob doesn't bury the root cause.
         Some(i) => flat[..i].trim_end_matches([' ', ',']).to_string(),
-        None => flat.trim().to_string(),
+        // No dump: a hand-authored message (a config-validation menu like the
+        // chunk_column/chunk_by_key options, or the auth detail). Preserve it
+        // VERBATIM, newlines included — flattening would mash a multi-line hint
+        // into a run-on line.
+        None => raw.trim().to_string(),
     };
-    // Backstop: never let a single line run unbounded.
-    const MAX: usize = 300;
-    if out.len() > MAX {
-        // Truncate on a char boundary.
-        let mut end = MAX;
-        while !out.is_char_boundary(end) {
-            end -= 1;
-        }
-        out.truncate(end);
+    // Backstop against a runaway message: generous enough to keep a multi-line
+    // config hint intact, small enough to bound a 5000-char library dump.
+    const MAX: usize = 1200;
+    if out.chars().count() > MAX {
+        out = out.chars().take(MAX).collect::<String>();
         out.push('…');
     }
     out
@@ -929,7 +933,7 @@ exports:
         let err = anyhow::anyhow!("x".repeat(5000));
         let out = trim_probe_error(&err);
         assert!(
-            out.chars().count() <= 301,
+            out.chars().count() <= 1201,
             "line not capped: {} chars",
             out.chars().count()
         );
@@ -937,6 +941,23 @@ exports:
             out.ends_with('…'),
             "capped line must signal truncation: {out:?}"
         );
+    }
+
+    #[test]
+    fn trim_probe_error_preserves_multiline_hint_verbatim() {
+        // A hand-authored config hint (no HTTP-dump marker) must keep its lines
+        // — flattening or a tight cap used to drop options from the menu.
+        let err = anyhow::anyhow!(
+            "chunked mode needs one of:\n  - chunk_column: <int col>\n  - chunk_by_key: <col>\n  - chunk_count: <n>"
+        );
+        let out = trim_probe_error(&err);
+        assert!(out.contains("chunk_column"), "got: {out:?}");
+        assert!(out.contains("chunk_by_key"), "got: {out:?}");
+        assert!(
+            out.contains("chunk_count"),
+            "all options preserved: {out:?}"
+        );
+        assert!(out.contains('\n'), "newlines preserved: {out:?}");
     }
 
     // ── L4: config-load failure is surfaced exactly once ─────────────────────
