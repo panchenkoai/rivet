@@ -55,11 +55,12 @@ fn init_mssql_single_table_emits_valid_config_that_passes_check() {
         export_count, 1,
         "single-table init must emit exactly 1 export; got {export_count}:\n{yaml}"
     );
-    // The `price DECIMAL(10,2)` column must ride through with declared
-    // precision/scale (catalog hint), so no unbounded-decimal REVIEW marker.
+    // The `amount DECIMAL(12,2)` column (see dev/mssql/init.sql `dbo.orders`)
+    // must ride through with its declared precision/scale (catalog hint), so no
+    // unbounded-decimal REVIEW marker.
     assert!(
-        yaml.contains("price: decimal(10,2)"),
-        "DECIMAL(10,2) must scaffold with its catalog precision/scale; got:\n{yaml}"
+        yaml.contains("amount: decimal(12,2)"),
+        "DECIMAL(12,2) must scaffold with its catalog precision/scale; got:\n{yaml}"
     );
 
     // ── swap url_env → literal url so `rivet check` can connect ─────────────
