@@ -18,6 +18,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # CI debug builds keep line-tables only (file:line in panics is enough for
+  # triage) — not full DWARF. This shrinks the debug `target/` and the link
+  # working set, speeding every `cargo test`/`cargo build` job and easing disk
+  # pressure (the lld-SIGBUS-on-ENOSPC failure mode). Only affects the `dev`
+  # profile; the `build-release` job's release artifact is unchanged.
+  CARGO_PROFILE_DEV_DEBUG: 1
 
 jobs:
   fmt:
@@ -161,7 +167,7 @@ jobs:
           for i in $(seq 1 30); do docker compose exec -T mysql mysqladmin ping -h localhost -uroot -privet 2>/dev/null && break || sleep 2; done
 
       - name: Run type-golden tests
-        run: cargo test --release --test live_type_golden -- --ignored
+        run: cargo test --test live_type_golden -- --ignored
 
       - name: Stop services
         if: always()
@@ -219,7 +225,7 @@ jobs:
         # drops the two cloud-warehouse tests — they need a real GCP project +
         # `bq` CLI that CI has no credentials for (covered by the manual
         # `make test-types-bigquery` target instead).
-        run: cargo test --release --test type_roundtrip -- --include-ignored --skip bigquery
+        run: cargo test --test type_roundtrip -- --include-ignored --skip bigquery
 
       - name: Differential correctness at scale (DuckDB vs source)
         # tests/live_differential.rs — an INDEPENDENT reader (DuckDB) fingerprints
@@ -229,7 +235,7 @@ jobs:
         # surplus; `SELECT DISTINCT *` collapses to the exactly-once set == source).
         # Lives here, not the e2e job: needs the `duckdb` reader + the
         # ./tests/.live-tmp:/work shared mount this job already provisions.
-        run: cargo test --release --test live_differential -- --ignored
+        run: cargo test --test live_differential -- --ignored
 
       - name: Stop services
         if: always()
@@ -313,8 +319,13 @@ jobs:
           # so the live_mssql_* suites can connect + seed.
           for i in $(seq 1 40); do [ "$(docker inspect -f '{{.State.Health.Status}}' rivet-mssql 2>/dev/null)" = "healthy" ] && break || sleep 2; done
 
-      - name: Build release
-        run: cargo build --release
+      - name: Build rivet (debug)
+        # Debug, not --release: the e2e suite exercises CORRECTNESS, not
+        # throughput, on small seeded fixtures, so the fat-LTO release build
+        # (codegen-units=1 → ~22 min link) buys nothing here. Debug builds in
+        # ~2-3 min. The shipping artifact is still validated by the dedicated
+        # `build-release` job, which keeps the full release profile.
+        run: cargo build
 
       - name: Seed databases
         run: |
@@ -334,7 +345,7 @@ jobs:
         env:
           MINIO_ACCESS_KEY: minioadmin
           MINIO_SECRET_KEY: minioadmin
-          RIVET: ./target/release/rivet
+          RIVET: ./target/debug/rivet
         run: bash dev/e2e/run_e2e.sh
 
       - name: Disk snapshot — post-build
@@ -364,7 +375,7 @@ jobs:
         # It runs in the `test-type-validators` job instead (which has both).
         # live_crash_soak.rs stays here — it re-reads the destination in-process
         # (arrow/parquet-rs), no duckdb needed.
-        run: cargo test --release -- --ignored --skip content_export --skip validates --skip edge_cases --skip via_duckdb
+        run: cargo test -- --ignored --skip content_export --skip validates --skip edge_cases --skip via_duckdb
 
       - name: Stop services
         if: always()
@@ -392,13 +403,20 @@ jobs:
           echo "Waiting for MySQL..."
           for i in $(seq 1 30); do docker compose exec -T mysql mysqladmin ping -h localhost -uroot -privet 2>/dev/null && break || sleep 2; done
 
-      - name: Build release rivet
-        run: cargo build --bin rivet --release
+      - name: Build rivet (debug)
+        # Debug, not --release: the matrices probe CLI / config / path SURFACE
+        # behavior, not throughput, so the fat-LTO release build buys nothing.
+        # `stage_rivet.sh` honours $RIVET_BIN, so point it at the debug binary.
+        run: cargo build --bin rivet
 
       - name: Create matrix navigation links
+        env:
+          RIVET_BIN: ${{ github.workspace }}/target/debug/rivet
         run: bash dev/matrices/setup_links.sh
 
       - name: Run PR matrix tier
+        env:
+          RIVET_BIN: ${{ github.workspace }}/target/debug/rivet
         run: bash dev/matrices/run.sh --tier=pr --skip-compose | tee dev/matrices/run.log
 
       - name: Upload artifacts on failure
