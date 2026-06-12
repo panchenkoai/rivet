@@ -745,6 +745,123 @@ fn bench_utf8_text_append(c: &mut Criterion) {
     group.finish();
 }
 
+// ── CSV binary hex: per-byte write!("{:02x}") vs table + chunked write_all ───
+// Mirrors the Binary arm of write_csv_value in src/format/csv.rs. The old form
+// drove core::fmt through the dyn-Write vtable once per byte; the new form is a
+// table lookup batched through a 1 KiB stack buffer. Byte-identical output.
+fn hex_before(writer: &mut dyn IoWrite, bytes: &[u8]) {
+    for byte in bytes {
+        write!(writer, "{:02x}", byte).unwrap();
+    }
+}
+
+fn hex_after(writer: &mut dyn IoWrite, bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut chunk = [0u8; 1024];
+    for slab in bytes.chunks(chunk.len() / 2) {
+        let mut n = 0;
+        for &b in slab {
+            chunk[n] = HEX[(b >> 4) as usize];
+            chunk[n + 1] = HEX[(b & 0x0f) as usize];
+            n += 2;
+        }
+        writer.write_all(&chunk[..n]).unwrap();
+    }
+}
+
+fn bench_csv_binary_hex(c: &mut Criterion) {
+    // 10 k rows × a 64-byte blob (e.g. a sha-256 pair / small bytea) — the
+    // per-byte cost compounds with column width.
+    const ROWS: usize = 10_000;
+    let blob: Vec<u8> = (0..64u32).map(|i| (i * 7 % 256) as u8).collect();
+    let mut group = c.benchmark_group("csv_binary_hex");
+    group.throughput(Throughput::Elements(ROWS as u64));
+    group.bench_function("before_per_byte_fmt", |b| {
+        b.iter(|| {
+            let mut buf = Vec::with_capacity(ROWS * blob.len() * 2);
+            for _ in 0..ROWS {
+                hex_before(&mut buf, &blob);
+            }
+            buf
+        })
+    });
+    group.bench_function("after_table_chunked", |b| {
+        b.iter(|| {
+            let mut buf = Vec::with_capacity(ROWS * blob.len() * 2);
+            for _ in 0..ROWS {
+                hex_after(&mut buf, &blob);
+            }
+            buf
+        })
+    });
+    group.finish();
+}
+
+// ── CSV timestamp: dt.format(strftime-str) vs manual integer write ───────────
+// Mirrors the Timestamp(µs) arm of write_csv_value. The old form re-parses the
+// "%Y-%m-%dT%H:%M:%S%.6f" strftime string into format items on every value; the
+// new form decomposes the DateTime and writes integers directly. Identical
+// output for years 0..=9999 (the realistic range).
+fn ts_before(writer: &mut dyn IoWrite, micros: i64) {
+    let secs = micros / 1_000_000;
+    let nsecs = ((micros % 1_000_000) * 1_000) as u32;
+    if let Some(dt) = chrono::DateTime::from_timestamp(secs, nsecs) {
+        write!(writer, "{}", dt.format("%Y-%m-%dT%H:%M:%S%.6f")).unwrap();
+    }
+}
+
+fn ts_after(writer: &mut dyn IoWrite, micros: i64) {
+    use chrono::{Datelike as _, Timelike as _};
+    let secs = micros / 1_000_000;
+    let nsecs = ((micros % 1_000_000) * 1_000) as u32;
+    if let Some(dt) = chrono::DateTime::from_timestamp(secs, nsecs) {
+        let y = dt.year();
+        if (0..=9999).contains(&y) {
+            write!(
+                writer,
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}",
+                y,
+                dt.month(),
+                dt.day(),
+                dt.hour(),
+                dt.minute(),
+                dt.second(),
+                dt.nanosecond() / 1_000
+            )
+            .unwrap();
+        } else {
+            write!(writer, "{}", dt.format("%Y-%m-%dT%H:%M:%S%.6f")).unwrap();
+        }
+    }
+}
+
+fn bench_csv_timestamp(c: &mut Criterion) {
+    const ROWS: usize = 10_000;
+    let base = 1_700_000_000_000_000i64;
+    let inputs: Vec<i64> = (0..ROWS as i64).map(|i| base + i * 1_234_567).collect();
+    let mut group = c.benchmark_group("csv_timestamp");
+    group.throughput(Throughput::Elements(ROWS as u64));
+    group.bench_function("before_strftime_reparse", |b| {
+        b.iter(|| {
+            let mut buf = Vec::with_capacity(ROWS * 27);
+            for &m in &inputs {
+                ts_before(&mut buf, m);
+            }
+            buf
+        })
+    });
+    group.bench_function("after_manual_int", |b| {
+        b.iter(|| {
+            let mut buf = Vec::with_capacity(ROWS * 27);
+            for &m in &inputs {
+                ts_after(&mut buf, m);
+            }
+            buf
+        })
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_csv,
@@ -756,5 +873,7 @@ criterion_group!(
     bench_mysql_int_bytes,
     bench_uniqueness,
     bench_utf8_text_append,
+    bench_csv_binary_hex,
+    bench_csv_timestamp,
 );
 criterion_main!(benches);

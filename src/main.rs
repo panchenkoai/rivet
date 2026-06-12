@@ -57,12 +57,22 @@ fn main() {
     let cli = cli::Cli::parse();
     let json_errors = cli.json_errors;
     if let Err(e) = cli::dispatch(cli) {
-        let msg = redact::redact_error(&e);
+        // redact strips credentials; sanitize_terminal strips ANSI/OSC control
+        // bytes a malicious source DB can embed in an error string (V9/CWE-150)
+        // so the top-level error line cannot rewrite/clear the operator terminal.
+        let msg = crate::pipeline::parent_ui::sanitize_terminal(&redact::redact_error(&e));
+        // Machine-actionable exit-code taxonomy (see `error::ExitClass`): a
+        // scheduler branches on the code (2=retryable, 3=data-integrity,
+        // 4=schema-drift, 1=generic) instead of grepping `msg`.
+        let exit_class = crate::error::classify_exit(&e);
         if json_errors {
-            eprintln!("{}", serde_json::json!({ "error": msg }));
+            eprintln!(
+                "{}",
+                serde_json::json!({ "error": msg, "exit_class": exit_class })
+            );
         } else {
             eprintln!("Error: {msg}");
         }
-        std::process::exit(1);
+        std::process::exit(exit_class);
     }
 }

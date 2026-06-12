@@ -31,8 +31,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use chrono::Timelike as _;
 use postgres::Row;
-use postgres::types::{FromSql as PgFromSql, Json, Kind, Type};
-use serde_json::Value as JsonValue;
+use postgres::types::{FromSql as PgFromSql, Kind, Type};
 
 use crate::error::Result;
 use crate::source::pg_numeric_wire::{PgNumericWire, numeric_wire_normalized_plain};
@@ -40,6 +39,10 @@ use crate::types::{
     ColumnOverrides, RivetType, SourceColumn, TimeUnit as RivetTimeUnit, TypeMapping,
     build_arrow_field,
 };
+
+// ─── Pre-allocation per-value ceiling (security audit V22, CWE-770) ───────────
+
+use crate::source::value_within_ceiling;
 
 // ─── Wire-type adapters ──────────────────────────────────────────────────────
 
@@ -73,6 +76,43 @@ impl<'a> PgFromSql<'a> for PgUuidBytes {
         }
         let text = simdutf8::basic::from_utf8(raw)?.trim();
         Ok(Self(*uuid::Uuid::parse_str(text)?.as_bytes()))
+    }
+}
+
+/// PostgreSQL `json` / `jsonb` cells borrowed as their raw source text.
+///
+/// The wire payload already IS the JSON text: `json_send` transmits the
+/// stored bytes verbatim and `jsonb_send` prefixes them with a one-byte
+/// format version (always `1`). The old `Json<serde_json::Value>` read
+/// re-serialized the document, rounding non-integer numbers through `f64`
+/// (>17 significant digits silently altered) and normalising the whitespace
+/// a PG `json` column stores verbatim. Validating UTF-8 and appending the
+/// payload directly keeps byte fidelity at zero parse cost.
+///
+/// Only the binary format is handled: every data-row fetch in this source
+/// goes through `client.query` (extended protocol, binary results), and the
+/// version-byte check mirrors the `postgres` crate's own `Json<T>` reader,
+/// so failure behavior is unchanged.
+struct PgJsonRawText<'a>(&'a str);
+
+impl<'a> PgFromSql<'a> for PgJsonRawText<'a> {
+    fn accepts(ty: &Type) -> bool {
+        ty == &Type::JSON || ty == &Type::JSONB
+    }
+
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let payload = if *ty == Type::JSONB {
+            match raw.split_first() {
+                Some((&1, rest)) => rest,
+                _ => return Err("unsupported JSONB wire format version (expected 1)".into()),
+            }
+        } else {
+            raw
+        };
+        Ok(Self(simdutf8::basic::from_utf8(payload)?))
     }
 }
 
@@ -349,11 +389,12 @@ pub(super) fn rows_to_record_batch_typed(
     schema: &SchemaRef,
     columns: &[(String, Type)],
     rows: &[Row],
+    max_value_bytes: Option<usize>,
 ) -> Result<RecordBatch> {
     let mut arrays: Vec<Arc<dyn Array>> = Vec::with_capacity(columns.len());
     for (col_idx, (name, pg_type)) in columns.iter().enumerate() {
         let target_type = schema.field(col_idx).data_type();
-        let arr = build_array(pg_type, target_type, col_idx, rows)?;
+        let arr = build_array(pg_type, target_type, col_idx, rows, name, max_value_bytes)?;
         // Defensive invariant: `build_array` now dispatches on `target_type`, so
         // the produced array matches the schema field by construction. This
         // guard turns any future arm that builds the wrong width/unit into a
@@ -380,6 +421,8 @@ fn build_array(
     target_type: &DataType,
     col_idx: usize,
     rows: &[Row],
+    column: &str,
+    max_value_bytes: Option<usize>,
 ) -> Result<Arc<dyn Array>> {
     // Dispatch on the schema's resolved TARGET type — the single decision site.
     // `pg_type` only chooses *how* to read the wire value (which `FromSql`),
@@ -444,7 +487,13 @@ fn build_array(
             let mut b = BinaryBuilder::with_capacity(rows.len(), rows.len() * 64);
             for row in rows {
                 match row.get::<_, Option<Vec<u8>>>(col_idx) {
-                    Some(v) => b.append_value(&v),
+                    Some(v) => {
+                        // Pre-allocation ceiling: the driver copy (`Vec<u8>`) is
+                        // unavoidable, but bail before it is appended so the
+                        // Arrow buffer never grows to hold the oversized cell.
+                        value_within_ceiling(column, v.len(), max_value_bytes)?;
+                        b.append_value(&v);
+                    }
                     None => b.append_null(),
                 }
             }
@@ -521,7 +570,7 @@ fn build_array(
         // Utf8 target: several wire types render to text. The read is chosen by
         // `pg_type`, so this is where `col: string` overrides land (numeric/uuid
         // → text) alongside the natural text/json/enum/interval columns.
-        DataType::Utf8 => build_pg_text_array(pg_type, col_idx, rows),
+        DataType::Utf8 => build_pg_text_array(pg_type, col_idx, rows, column, max_value_bytes),
         DataType::List(_) => build_pg_list_array(target_type, col_idx, rows),
         other => anyhow::bail!(
             "no PostgreSQL value converter for target Arrow type {other:?} \
@@ -535,21 +584,39 @@ fn build_array(
 /// uuid column an operator retyped to `string` via a `columns:` override. Bails
 /// on a wire type with no text rendering (fail-loud, slice A) instead of the old
 /// silent `try_get::<String>` → null.
-fn build_pg_text_array(pg_type: &Type, col_idx: usize, rows: &[Row]) -> Result<Arc<dyn Array>> {
+fn build_pg_text_array(
+    pg_type: &Type,
+    col_idx: usize,
+    rows: &[Row],
+    column: &str,
+    max_value_bytes: Option<usize>,
+) -> Result<Arc<dyn Array>> {
     let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
     match *pg_type {
         Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => {
             for row in rows {
                 let val: Option<String> = row.get(col_idx);
-                b.append_option(val.as_deref());
+                match val {
+                    Some(s) => {
+                        value_within_ceiling(column, s.len(), max_value_bytes)?;
+                        b.append_value(s);
+                    }
+                    None => b.append_null(),
+                }
             }
         }
-        // `postgres` rejects `String` for these OIDs — read via `Json`.
+        // `postgres` rejects `String` for these OIDs. Read the wire payload as
+        // raw source text (`PgJsonRawText`) instead of round-tripping through
+        // `serde_json::Value`, which mangled high-precision numbers (via f64)
+        // and normalised `json` whitespace.
         Type::JSON | Type::JSONB => {
             for row in rows {
-                match row.try_get::<_, Option<Json<JsonValue>>>(col_idx)? {
+                match row.try_get::<_, Option<PgJsonRawText<'_>>>(col_idx)? {
                     None => b.append_null(),
-                    Some(Json(v)) => b.append_value(&serde_json::to_string(&v)?),
+                    Some(PgJsonRawText(text)) => {
+                        value_within_ceiling(column, text.len(), max_value_bytes)?;
+                        b.append_value(text);
+                    }
                 }
             }
         }

@@ -214,6 +214,22 @@ services:
       - "-port"
       - "4443"
 
+  # Azure Blob Storage emulator. Uses the well-known dev account
+  # (devstoreaccount1) + key; the blob endpoint is
+  # http://127.0.0.1:10000/devstoreaccount1. `--skipApiVersionCheck` keeps it
+  # tolerant of the OpenDAL/azure REST version rivet sends.
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    command:
+      - "azurite-blob"
+      - "--blobHost"
+      - "0.0.0.0"
+      - "--blobPort"
+      - "10000"
+      - "--skipApiVersionCheck"
+    ports:
+      - "10000:10000"
+
   # --- Monitoring stack (Postgres metrics under load) ---
   postgres-exporter:
     image: prometheuscommunity/postgres-exporter:latest

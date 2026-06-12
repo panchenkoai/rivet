@@ -11,7 +11,7 @@ use crate::error::Result;
 use crate::state::StateStore;
 
 use super::ipc::{ChildEvent, ENV_IPC_EVENTS};
-use super::parent_ui::{ChildWaitStatus, UiMessage};
+use super::parent_ui::{ChildWaitStatus, UiMessage, sanitize_terminal};
 
 /// Re-invoke this binary once per export. Children do not inherit parallel flags, so there is no recursion.
 ///
@@ -187,6 +187,11 @@ pub(super) fn run_exports_as_child_processes(
                                     Ok(l) => l,
                                     Err(_) => break,
                                 };
+                                // Captured child stderr is later re-emitted to
+                                // the operator's terminal verbatim, so strip any
+                                // terminal-control bytes a malicious source DB
+                                // echoed into the child's error output (CWE-150).
+                                let line = sanitize_terminal(&line);
                                 let mut guard = match buf.lock() {
                                     Ok(g) => g,
                                     Err(p) => p.into_inner(),
@@ -213,6 +218,10 @@ pub(super) fn run_exports_as_child_processes(
 
     let mut failures = Vec::new();
     let mut wait_failures: HashMap<String, String> = HashMap::new();
+    // Numeric exit codes of failed children, so the parent can re-derive the
+    // SAME process exit class instead of collapsing a child's data-integrity (3)
+    // / schema-drift (4) / retryable (2) into a misleading generic 1.
+    let mut child_exit_codes: Vec<i32> = Vec::new();
 
     type WaitOutcome = (String, std::io::Result<std::process::ExitStatus>);
     let mut reaper_handles: Vec<std::thread::JoinHandle<WaitOutcome>> =
@@ -250,6 +259,9 @@ pub(super) fn run_exports_as_child_processes(
             }
         };
         if !status.success() {
+            if let Some(c) = status.code() {
+                child_exit_codes.push(c);
+            }
             let code = status
                 .code()
                 .map(|c| c.to_string())
@@ -301,12 +313,88 @@ pub(super) fn run_exports_as_child_processes(
         }
     }
 
-    let result = if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("{}", failures.join("; ")))
-    };
+    let result = aggregate_child_result(&failures, &child_exit_codes);
     (result, all_failures, stderr_dump)
+}
+
+/// Build the parent's final result from the children's outcomes. When any child
+/// exited with a CLASSIFIED non-generic code, the aggregate error carries a
+/// [`crate::error::PreclassifiedExit`] so `classify_exit` re-derives that SAME
+/// process exit class — otherwise a child's data-integrity (3) / schema-drift
+/// (4) / retryable (2) would be stringified and the parent would exit a
+/// misleading generic 1.
+fn aggregate_child_result(failures: &[String], child_exit_codes: &[i32]) -> anyhow::Result<()> {
+    if failures.is_empty() {
+        return Ok(());
+    }
+    let msg = failures.join("; ");
+    match worst_exit_code(child_exit_codes) {
+        Some(code) => Err(anyhow::Error::from(crate::error::PreclassifiedExit(code)).context(msg)),
+        None => Err(anyhow::anyhow!("{}", msg)),
+    }
+}
+
+/// The most "stop-worthy" exit code among failed children: data-integrity (3)
+/// outranks schema-drift (4), which outranks retryable (2), which outranks
+/// generic / anything else (1) — matching the representative-failure ranking the
+/// in-process multi-export path uses. `None` when no child reported a code.
+fn worst_exit_code(codes: &[i32]) -> Option<i32> {
+    let rank = |c: i32| match c {
+        3 => 3, // data-integrity — STOP, possibly-wrong data
+        4 => 2, // schema-drift — needs human review
+        2 => 1, // retryable — safe to retry
+        _ => 0, // generic / signal
+    };
+    codes.iter().copied().max_by_key(|&c| rank(c))
+}
+
+#[cfg(test)]
+mod exit_propagation_tests {
+    use super::{aggregate_child_result, worst_exit_code};
+    use crate::error::{ExitClass, classify_exit};
+
+    #[test]
+    fn worst_code_prefers_data_integrity_over_drift_and_generic() {
+        // Data-integrity (3) is the scariest even though 4 is numerically larger
+        // and 1 came first — a naive max(code) or first-wins would pick wrong.
+        assert_eq!(worst_exit_code(&[1, 4, 3, 2]), Some(3));
+        assert_eq!(worst_exit_code(&[1, 4, 2]), Some(4));
+        assert_eq!(worst_exit_code(&[1, 2]), Some(2));
+        assert_eq!(worst_exit_code(&[1, 1]), Some(1));
+        assert_eq!(worst_exit_code(&[]), None);
+    }
+
+    #[test]
+    fn child_data_integrity_exit_3_is_not_downgraded_to_1() {
+        // The regression: a child that exited 3 (data-integrity) must make the
+        // PARENT classify to 3, not collapse to a generic 1.
+        let failures = vec!["export 'a' exited with status 3".to_string()];
+        let err = aggregate_child_result(&failures, &[3]).unwrap_err();
+        assert_eq!(
+            classify_exit(&err),
+            ExitClass::DataIntegrity.code(),
+            "a child's data-integrity exit must survive to the parent's exit code"
+        );
+    }
+
+    #[test]
+    fn child_schema_drift_exit_4_survives() {
+        let failures = vec!["export 'a' exited with status 4".to_string()];
+        let err = aggregate_child_result(&failures, &[4]).unwrap_err();
+        assert_eq!(classify_exit(&err), ExitClass::SchemaDrift.code());
+    }
+
+    #[test]
+    fn generic_only_children_stay_generic_1() {
+        let failures = vec!["export 'a' exited with status 1".to_string()];
+        let err = aggregate_child_result(&failures, &[1]).unwrap_err();
+        assert_eq!(classify_exit(&err), ExitClass::Generic.code());
+    }
+
+    #[test]
+    fn no_failures_is_ok() {
+        assert!(aggregate_child_result(&[], &[]).is_ok());
+    }
 }
 
 fn render_child_stderr(
@@ -431,5 +519,39 @@ mod tests {
         buffers.insert("events".to_string(), vec![]);
         let out = render_child_stderr(&exports, &buffers, &HashMap::new());
         assert!(out.is_empty(), "empty lines vec → no output: {out:?}");
+    }
+
+    /// SEC V9 (CWE-150): a child stderr line carrying ANSI/OSC escape bytes is
+    /// sanitised by the capture thread (`sanitize_terminal`) before it lands in
+    /// the buffer, so the rendered block re-emitted to the operator's terminal
+    /// holds no raw terminal-control bytes. This mirrors the reader-thread
+    /// transform without spawning a real child.
+    #[test]
+    fn captured_child_stderr_escapes_stripped_before_render() {
+        // Scan decoded chars, not raw bytes: a byte scan would false-flag the
+        // UTF-8 continuation bytes (0x80..=0xBF) of the renderer's box-drawing
+        // glyph `──` (U+2500). Mirrors sanitize_terminal's char-based contract.
+        let dangerous = |s: &str| -> Vec<char> {
+            s.chars()
+                .filter(|&c| {
+                    let cp = c as u32;
+                    (cp <= 0x1f && c != '\t' && c != '\n')
+                        || cp == 0x7f
+                        || (0x80..=0x9f).contains(&cp)
+                })
+                .collect()
+        };
+        let exp = make_export("orders");
+        let exports = vec![&exp];
+        let raw = "ERROR \u{1b}]0;pwned\u{07}\u{1b}[2Jboom";
+        let mut buffers = HashMap::new();
+        // Capture thread applies `sanitize_terminal` to each line before push.
+        buffers.insert("orders".to_string(), vec![sanitize_terminal(raw)]);
+        let out = render_child_stderr(&exports, &buffers, &HashMap::new());
+        assert!(
+            dangerous(&out).is_empty(),
+            "child stderr render leaked control bytes: {out:?}"
+        );
+        assert!(out.contains("pwned") && out.contains("boom"));
     }
 }

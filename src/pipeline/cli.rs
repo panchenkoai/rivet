@@ -9,7 +9,46 @@ use crate::error::Result;
 use crate::journal::RunEvent;
 use crate::state::StateStore;
 
+/// Validate the `--config` path BEFORE opening the state store.
+///
+/// Inspect commands (`state show/files/chunks/progression`, `metrics`,
+/// `journal`) use `config_path` only to *locate* the SQLite `.rivet_state.db`
+/// next to it; they never parse the YAML. So a missing or garbage path used to
+/// silently open an empty/foreign DB and exit 0 (and `StateStore::open` would
+/// materialize a fresh `.rivet_state.db` beside the phantom path). Loading the
+/// config first turns a bad path into a clear non-zero error — exactly as
+/// `run`/`check` already do — and avoids littering a state DB. The parsed
+/// config is returned so callers that also need the declared export names
+/// (e.g. `reset-chunks`) reuse the same load.
+fn require_config(config_path: &str) -> Result<Config> {
+    Config::load(config_path)
+}
+
+/// Bail if `export_name` is not declared in `config`, listing the known names.
+///
+/// Inspect commands (`metrics`, `journal`) that filter by a single export must
+/// not let a typo'd `--export` look like "this export simply has not run yet" —
+/// both used to print the same empty-state line. With the config now loaded, an
+/// unknown name is a clear error that points at the declared exports.
+fn require_known_export(config: &Config, config_path: &str, export_name: &str) -> Result<()> {
+    if config.exports.iter().any(|e| e.name == export_name) {
+        return Ok(());
+    }
+    let known: Vec<&str> = config.exports.iter().map(|e| e.name.as_str()).collect();
+    anyhow::bail!(
+        "export '{}' is not defined in '{}'.\n  Known exports: {}",
+        export_name,
+        config_path,
+        if known.is_empty() {
+            "(none defined)".to_string()
+        } else {
+            known.join(", ")
+        },
+    );
+}
+
 pub fn show_state(config_path: &str) -> Result<()> {
+    require_config(config_path)?;
     let state = StateStore::open(config_path)?;
     let states = state.list_all()?;
     if states.is_empty() {
@@ -36,7 +75,7 @@ pub fn show_state(config_path: &str) -> Result<()> {
         } else {
             println!(
                 "No exports have been run yet.\n  \
-                 Run `rivet run --config {}` first, then try `rivet state` again.",
+                 Run `rivet run --config {}` first, then try `rivet state show` again.",
                 config_path
             );
         }
@@ -57,6 +96,7 @@ pub fn show_state(config_path: &str) -> Result<()> {
 
 /// Epic G / ADR-0008 — explicit committed / verified boundaries per export.
 pub fn show_progression(config_path: &str, export_name: Option<&str>) -> Result<()> {
+    require_config(config_path)?;
     let state = StateStore::open(config_path)?;
     let entries = match export_name {
         Some(name) => vec![state.get_progression(name)?],
@@ -135,20 +175,24 @@ pub fn reset_state(config_path: &str, export_name: &str) -> Result<()> {
 }
 
 pub fn show_files(config_path: &str, export_name: Option<&str>, limit: usize) -> Result<()> {
+    require_config(config_path)?;
     let state = StateStore::open(config_path)?;
     let files = state.get_files(export_name, limit)?;
     if files.is_empty() {
         println!("No files recorded yet.");
         return Ok(());
     }
+    // run_ids are `{export}_{%Y%m%dT%H%M%S%3f}` (timestamp alone is 18 chars),
+    // so a column narrower than the longest export name + 19 wraps and breaks
+    // alignment. 40 fits the common case; longer names overflow gracefully.
     println!(
-        "{:<35} {:<40} {:>8} {:>10} CREATED",
+        "{:<40} {:<40} {:>8} {:>10} CREATED",
         "RUN ID", "FILE", "ROWS", "BYTES"
     );
-    println!("{}", "-".repeat(110));
+    println!("{}", "-".repeat(115));
     for f in &files {
         println!(
-            "{:<35} {:<40} {:>8} {:>10} {}",
+            "{:<40} {:<40} {:>8} {:>10} {}",
             f.run_id,
             f.file_name,
             f.row_count,
@@ -160,6 +204,14 @@ pub fn show_files(config_path: &str, export_name: Option<&str>, limit: usize) ->
 }
 
 pub fn show_metrics(config_path: &str, export_name: Option<&str>, limit: usize) -> Result<()> {
+    let config = require_config(config_path)?;
+    // A typo'd `--export` must not masquerade as "no runs yet". Now that the
+    // config is loaded, check the requested name against the declared exports
+    // and bail with the known names — otherwise an unknown export and an
+    // unrun one both print "No metrics recorded yet.".
+    if let Some(name) = export_name {
+        require_known_export(&config, config_path, name)?;
+    }
     let state = StateStore::open(config_path)?;
     let metrics = state.get_metrics(export_name, limit)?;
     if metrics.is_empty() {
@@ -212,8 +264,31 @@ pub fn show_metrics(config_path: &str, export_name: Option<&str>, limit: usize) 
 }
 
 pub fn reset_chunk_checkpoint(config_path: &str, export_name: &str) -> Result<()> {
+    // Parity with `reset_state`: validate the export name against the config
+    // BEFORE touching state, so a typo (`-e pa_audi` for `pa_audit`) errors with
+    // the declared names instead of silently "Removed 0 chunk run record(s)"
+    // (rc=0) — which looked like the resume was abandoned when it was not.
+    let config = require_config(config_path)?;
+    if !config.exports.iter().any(|e| e.name == export_name) {
+        let known: Vec<String> = config.exports.iter().map(|e| e.name.clone()).collect();
+        anyhow::bail!(
+            "export '{}' not found in config '{}'.\n  Known exports: {}\n  Hint: check the spelling, or run `rivet state chunks -c {} -e <name>` to inspect a checkpoint.",
+            export_name,
+            config_path,
+            if known.is_empty() {
+                "(none defined)".to_string()
+            } else {
+                known.join(", ")
+            },
+            config_path,
+        );
+    }
     let state = StateStore::open(config_path)?;
     let n = state.reset_chunk_checkpoint(export_name)?;
+    // Abandoning the resume also clears the committed/verified boundary, so
+    // `rivet state progression` does not report a stale chunk boundary after
+    // the chunk_run/chunk_task rows are gone (parity with `state reset`).
+    state.delete_progression(export_name)?;
     println!(
         "Removed {} chunk run record(s) for export '{}'.",
         n, export_name
@@ -278,6 +353,7 @@ pub fn reset_chunk_checkpoints_stuck(config_path: &str) -> Result<()> {
 }
 
 pub fn show_chunk_checkpoint(config_path: &str, export_name: &str) -> Result<()> {
+    require_config(config_path)?;
     let state = StateStore::open(config_path)?;
     println!(
         "database:   {}",
@@ -326,6 +402,15 @@ pub fn show_journal(
     limit: usize,
     run_id: Option<&str>,
 ) -> Result<()> {
+    let config = require_config(config_path)?;
+    // Same gap as `metrics`: when querying by export name (no `--run-id`), a
+    // typo would print "No journal entries for export 'X' yet." as if the
+    // export were merely unrun. Validate the name against the config first.
+    // The `--run-id` path looks up by id directly, so the export name is not
+    // the lookup key there and is left unchecked.
+    if run_id.is_none() {
+        require_known_export(&config, config_path, export_name)?;
+    }
     let state = StateStore::open(config_path)?;
 
     let journals = if let Some(rid) = run_id {
@@ -407,6 +492,26 @@ pub fn show_journal(
                 total_rows,
                 format_bytes(total_bytes),
             );
+            // List each produced file by name — the aggregate count alone hides
+            // *which* objects landed, so an operator could not cross-check the
+            // journal against the destination / manifest. Each FileWritten event
+            // stores the exact basename `state files` shows.
+            for e in &files {
+                if let RunEvent::FileWritten {
+                    file_name,
+                    rows,
+                    bytes,
+                    ..
+                } = &e.event
+                {
+                    println!(
+                        "    - {}  ({} rows, {})",
+                        file_name,
+                        rows,
+                        format_bytes(*bytes),
+                    );
+                }
+            }
         }
 
         let retries = journal.retries();
@@ -462,8 +567,14 @@ mod tests {
 
     fn setup_dir() -> (tempfile::TempDir, String) {
         let dir = tempfile::TempDir::new().unwrap();
-        // config file itself does not need to exist; StateStore::open uses its parent dir
+        // Inspect/reset commands now validate the --config path up front
+        // (findings #9/#23): they `Config::load` before opening the state DB,
+        // so the file must exist and parse. Write a valid two-export config
+        // (orders + transactions — the names the show/reset tests use) so the
+        // tests exercise the post-validation display/reset path, not the
+        // config-not-found bail.
         let config_path = dir.path().join("rivet.yaml").to_str().unwrap().to_string();
+        write_two_export_config(&config_path);
         (dir, config_path)
     }
 
@@ -563,7 +674,123 @@ exports:
         assert_eq!(boundary_value(&b), "-");
     }
 
+    // ── state files: RUN ID column width (finding L16) ───────────────────────
+
+    // run_ids are `{export}_{%Y%m%dT%H%M%S%3f}` — the timestamp suffix alone is
+    // 18 chars, so even a short export name yields ~30-char ids and longer ones
+    // reach ~40. The RUN ID column must be wide enough that a 40-char id is not
+    // padded *past* the FILE column (which would shove FILE right and break
+    // every subsequent row's alignment vs. the header). A column of 35 wrapped;
+    // this pins the widened layout: a 40-char id is followed by exactly one
+    // space then FILE, identical to the header's spacing.
+    #[test]
+    fn state_files_run_id_column_fits_a_40_char_run_id() {
+        let run_id = "transactions_historyy_20250115T143022999"; // 40 chars
+        assert_eq!(run_id.len(), 40, "fixture must be a realistic 40-char id");
+
+        let header = format!(
+            "{:<40} {:<40} {:>8} {:>10} CREATED",
+            "RUN ID", "FILE", "ROWS", "BYTES"
+        );
+        let row = format!(
+            "{:<40} {:<40} {:>8} {:>10} {}",
+            run_id, "orders_001.parquet", 50_000, "4.0KB", "2025-01-15",
+        );
+
+        // The FILE column header and the row's file value must start at the
+        // same byte offset — the alignment invariant a too-narrow column breaks.
+        let header_file_at = header.find("FILE").unwrap();
+        let row_file_at = row.find("orders_001.parquet").unwrap();
+        assert_eq!(
+            header_file_at, row_file_at,
+            "a 40-char RUN ID must not push the FILE column out of alignment\nheader: {header}\nrow:    {row}"
+        );
+        // And the run_id is rendered in full (not truncated).
+        assert!(
+            row.starts_with(run_id),
+            "run_id must not be truncated: {row}"
+        );
+    }
+
     // ── show_state ───────────────────────────────────────────────────────────
+
+    // Finding L17: the empty-cursor / never-run hint pointed at `rivet state`,
+    // which is a bare subcommand group and errors without a leaf. The fix points
+    // at the real command `rivet state show`. Pin the exact hint string the
+    // never-run branch builds.
+    #[test]
+    fn show_state_never_run_hint_points_at_state_show() {
+        let config_path = "rivet.yaml";
+        let hint = format!(
+            "No exports have been run yet.\n  \
+             Run `rivet run --config {}` first, then try `rivet state show` again.",
+            config_path
+        );
+        assert!(
+            hint.contains("try `rivet state show` again"),
+            "hint must name the runnable leaf command, not the bare group: {hint}"
+        );
+        assert!(
+            !hint.contains("try `rivet state` again"),
+            "must not point at the bare (subcommand-requiring) group: {hint}"
+        );
+    }
+
+    // ── metrics / journal: unknown-export guard (finding L18) ────────────────
+
+    // `metrics --export <typo>` used to print "No metrics recorded yet." —
+    // indistinguishable from a declared-but-unrun export. With the config now
+    // loaded, an undeclared name must bail naming the known exports.
+    #[test]
+    fn show_metrics_unknown_export_bails_with_known_names() {
+        let (dir, config_path) = setup_dir(); // declares orders + transactions
+        let _ = open_state(&dir);
+        let err = show_metrics(&config_path, Some("ghost"), 10).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("export 'ghost' is not defined"),
+            "must name the unknown export, not say 'No metrics recorded yet': {msg}"
+        );
+        assert!(
+            msg.contains("orders") && msg.contains("transactions"),
+            "must list the declared exports so the user can spot the typo: {msg}"
+        );
+    }
+
+    // A *declared* export with no recorded runs must still reach the normal
+    // empty-state path (proves the guard does not over-reject).
+    #[test]
+    fn show_metrics_known_but_unrun_export_returns_ok() {
+        let (dir, config_path) = setup_dir();
+        let _ = open_state(&dir);
+        assert!(show_metrics(&config_path, Some("orders"), 10).is_ok());
+    }
+
+    // Same gap on `journal` when querying by export name (no --run-id).
+    #[test]
+    fn show_journal_unknown_export_bails_with_known_names() {
+        let (dir, config_path) = setup_dir();
+        let _ = open_state(&dir);
+        let err = show_journal(&config_path, "ghost", 5, None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("export 'ghost' is not defined"),
+            "must name the unknown export, not say 'No journal entries … yet': {msg}"
+        );
+        assert!(
+            msg.contains("orders") && msg.contains("transactions"),
+            "must list the declared exports: {msg}"
+        );
+    }
+
+    // Querying by --run-id looks up by id, not export name, so an unfamiliar
+    // export name must NOT be rejected there (the id is the lookup key).
+    #[test]
+    fn show_journal_by_run_id_skips_export_name_check() {
+        let (dir, config_path) = setup_dir();
+        let _ = open_state(&dir);
+        assert!(show_journal(&config_path, "ghost", 5, Some("no_such_run")).is_ok());
+    }
 
     #[test]
     fn show_state_empty_db_returns_ok() {
@@ -750,6 +977,64 @@ exports:
         let (dir, config_path) = setup_dir();
         let _ = open_state(&dir);
         assert!(reset_chunk_checkpoint(&config_path, "orders").is_ok());
+    }
+
+    // #21 (0.9.x audit): `state reset-chunks -e <typo>` used to "Removed 0 …"
+    // rc=0 with no export-name guardrail. Parity with `reset_state`: an unknown
+    // name must bail with a hint that names the export and lists the declared
+    // ones so the operator can spot the typo.
+    #[test]
+    fn reset_chunk_checkpoint_unknown_export_bails_with_hint() {
+        let (_dir, config_path) = setup_dir(); // declares orders + transactions
+        let err = reset_chunk_checkpoint(&config_path, "ghost").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("export 'ghost' not found"),
+            "must name the missing export: {msg}"
+        );
+        assert!(
+            msg.contains("orders") && msg.contains("transactions"),
+            "must list the declared exports so the user can spot the typo: {msg}"
+        );
+    }
+
+    // #9/#23 (0.9.x audit): inspect/reset commands used --config ONLY to locate
+    // the state DB next to it, never parsing it — so a nonexistent path opened a
+    // fresh empty DB and exited 0 with "No … recorded yet" (and littered a
+    // .rivet_state.db). They must bail naming the bad path instead.
+    #[test]
+    fn inspect_commands_bail_on_nonexistent_config() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir
+            .path()
+            .join("does_not_exist.yaml")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        for res in [
+            show_state(&missing),
+            show_files(&missing, None, 10),
+            show_metrics(&missing, None, 10),
+            show_progression(&missing, None),
+            show_journal(&missing, "orders", 5, None),
+            show_chunk_checkpoint(&missing, "orders"),
+            reset_state(&missing, "orders"),
+            reset_chunk_checkpoint(&missing, "orders"),
+        ] {
+            let err = res.expect_err("nonexistent config must error, not exit Ok");
+            assert!(
+                format!("{err:#}").contains("does_not_exist.yaml"),
+                "error must name the missing config path: {err:#}"
+            );
+        }
+
+        // And the read-only inspect must NOT materialize a state DB beside the
+        // phantom config (validation happens before StateStore::open).
+        assert!(
+            !dir.path().join(".rivet_state.db").exists(),
+            "a bad-config inspect must not leak a fresh .rivet_state.db"
+        );
     }
 
     #[test]

@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::journal::RunEvent;
+use crate::journal::{RunEvent, RunJournal};
 use crate::pipeline::summary::RunSummary;
 
 /// Compute the on-disk report directory for a run.
@@ -452,6 +452,26 @@ pub fn render_markdown(r: &RunReport) -> String {
     out
 }
 
+/// Render run journals as a pretty-printed JSON array for `rivet journal --json`.
+///
+/// `RunJournal` (and its embedded `JournalEntry` / `RunEvent`) already derive
+/// `Serialize`, so the wire form is the canonical journal — no lossy projection.
+/// Each element carries the full typed event stream (`FileWritten`, retries,
+/// schema changes, the terminal `RunCompleted`, …) that the human view
+/// summarises; a machine consumer gets every event with its `recorded_at`
+/// timestamp.  An empty slice renders as `[]` (a valid JSON array), never the
+/// human "No journal entries …" text, so consumers always parse cleanly.  The
+/// caller is responsible for the `--config` existence check (finding #9) before
+/// reaching here — this function is pure formatting.
+///
+/// `dead_code`-allowed until the `rivet journal --json` flag dispatch (a later
+/// wave, in the off-limits `cli.rs`/`args.rs`) calls it; exercised today by the
+/// module's unit tests.
+#[allow(dead_code)]
+pub(super) fn journals_to_json(journals: &[RunJournal]) -> Result<String> {
+    Ok(serde_json::to_string_pretty(journals)?)
+}
+
 fn verdict_badge(status: &str) -> &'static str {
     match status {
         "success" => "SUCCESS",
@@ -617,5 +637,54 @@ mod tests {
         let r = RunReport::from_summary(&s, "rivet.yaml");
         let md = render_markdown(&r);
         assert!(md.contains("INTERRUPTED"));
+    }
+
+    #[test]
+    fn journals_to_json_empty_is_valid_array() {
+        let json = journals_to_json(&[]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.is_array(), "empty journals must serialize as []");
+        assert_eq!(parsed.as_array().unwrap().len(), 0);
+        // Must NOT leak the human-view sentinel into the machine contract.
+        assert!(!json.contains("No journal entries"));
+    }
+
+    #[test]
+    fn journals_to_json_carries_events_and_file_names() {
+        let mut j = RunJournal::new("run-42", "orders");
+        j.record(RunEvent::FileWritten {
+            file_name: "part-000.parquet".into(),
+            rows: 100,
+            bytes: 4096,
+            part_index: 0,
+        });
+        j.record(RunEvent::RunCompleted {
+            status: "success".into(),
+            error_message: None,
+            duration_ms: 1234,
+        });
+
+        let json = journals_to_json(&[j]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+
+        let run = &arr[0];
+        assert_eq!(run["run_id"], "run-42");
+        assert_eq!(run["export_name"], "orders");
+
+        let entries = run["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        // Each entry carries a timestamp and a typed event (serde externally
+        // tagged enum → the variant name is the key).
+        assert!(entries[0]["recorded_at"].is_string());
+        let file_event = &entries[0]["event"]["FileWritten"];
+        assert_eq!(file_event["file_name"], "part-000.parquet");
+        assert_eq!(file_event["rows"], 100);
+        // The produced file name (finding #24's human-view gap) is present in
+        // the machine contract too, so `--json` consumers can cross-check it.
+        assert!(json.contains("part-000.parquet"));
+        // Terminal outcome is the second entry.
+        assert_eq!(entries[1]["event"]["RunCompleted"]["status"], "success");
     }
 }

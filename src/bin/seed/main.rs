@@ -3,13 +3,44 @@ mod copy_pg;
 mod fast;
 mod insert;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::Parser;
 
 use args::{Args, SeedProfile};
 
+/// Env var that must equal `1` to authorise the destructive seed run.
+const CONFIRM_ENV: &str = "RIVET_SEED_I_KNOW";
+
+/// Tables every seed profile unconditionally `TRUNCATE ... CASCADE`s before
+/// loading fixtures (see fast.rs / copy_pg.rs / insert.rs).
+const TRUNCATED_TABLES: &str =
+    "orders_coalesce, orders_sparse, content_items, page_views, events, orders, users";
+
+/// Returns `Ok(())` only when the operator has explicitly opted in to the
+/// destructive run via `RIVET_SEED_I_KNOW=1`. This is a safety gate, not a
+/// security boundary: the binary is dev-only (built behind the `dev-seed`
+/// feature) and connects to a local fixture DB, but its default run wipes
+/// real tables named `users` / `orders` with no prompt, so we refuse unless
+/// the caller confirms they know what will be truncated.
+fn confirm_destructive(confirmed: bool, target: &str, pg_url: &str, mysql_url: &str) -> Result<()> {
+    if confirmed {
+        return Ok(());
+    }
+    let urls = match target {
+        "postgres" => format!("\n  postgres: {pg_url}"),
+        "mysql" => format!("\n  mysql:    {mysql_url}"),
+        _ => format!("\n  postgres: {pg_url}\n  mysql:    {mysql_url}"),
+    };
+    bail!(
+        "refusing to seed: this will TRUNCATE ... CASCADE the following tables{urls}\n  tables:   {TRUNCATED_TABLES}\n\nThis is destructive and not reversible. Re-run with {CONFIRM_ENV}=1 to proceed."
+    );
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    let confirmed = std::env::var(CONFIRM_ENV).as_deref() == Ok("1");
+    confirm_destructive(confirmed, &args.target, &args.pg_url, &args.mysql_url)?;
 
     if args.only_sparse_chunk_demo {
         println!(
@@ -67,4 +98,39 @@ fn main() -> Result<()> {
 
     println!("\nDone!");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refuses_destructive_run_without_confirmation() {
+        let err = confirm_destructive(
+            false,
+            "both",
+            "postgresql://rivet:rivet@localhost:5432/rivet",
+            "mysql://rivet:rivet@localhost:3306/rivet",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("refusing to seed"), "got: {err}");
+        assert!(err.contains("TRUNCATE"), "got: {err}");
+        // Must name the tables it will wipe and how to opt in.
+        assert!(err.contains("users"), "got: {err}");
+        assert!(err.contains(CONFIRM_ENV), "got: {err}");
+    }
+
+    #[test]
+    fn allows_destructive_run_when_confirmed() {
+        assert!(
+            confirm_destructive(
+                true,
+                "both",
+                "postgresql://rivet:rivet@localhost:5432/rivet",
+                "mysql://rivet:rivet@localhost:3306/rivet",
+            )
+            .is_ok()
+        );
+    }
 }

@@ -97,8 +97,10 @@ jobs:
       - name: Build release (rivet + seed)
         # `--bin seed` builds the auxiliary src/bin/seed.rs target on top of
         # the default `rivet` binary so the heavy content_items fixture can
-        # be populated without `cargo run`'s rebuild overhead.
-        run: cargo build --release --bin rivet --bin seed
+        # be populated without `cargo run`'s rebuild overhead. The seed bin is
+        # gated behind the off-by-default `dev-seed` feature (so `cargo install`
+        # never ships the destructive TRUNCATE tool), hence `--features dev-seed`.
+        run: cargo build --release --bin rivet --bin seed --features dev-seed
 
       - name: Seed light fixtures (orders, etc.)
         run: |
@@ -121,8 +123,10 @@ jobs:
         # without inflating CI wall time with millions of rows.
         # The `pg_full_content_export_max_pressure` test requires 1M rows
         # and is intentionally not exercised here (still manual-only).
+        # RIVET_SEED_I_KNOW=1 confirms the destructive TRUNCATE...CASCADE the
+        # seed tool runs (the runtime safety gate; CI fixtures are throwaway).
         run: |
-          ./target/release/seed \
+          RIVET_SEED_I_KNOW=1 ./target/release/seed \
             --target postgres \
             --users 1000 \
             --orders-per-user 5 \

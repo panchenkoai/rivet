@@ -88,6 +88,8 @@ impl PostgresSource {
     /// Connect honoring the user's [`TlsConfig`]. When `tls.mode` is
     /// [`TlsMode::Disable`] this falls back to [`Self::connect`].
     pub fn connect_with_tls(url: &str, tls: Option<&TlsConfig>) -> Result<Self> {
+        // Refuse remote plaintext (no `tls:` block) before any dial (CWE-319).
+        crate::source::require_tls_or_loopback(url, tls)?;
         match tls {
             Some(cfg) if cfg.mode.is_enforced() => {
                 let connector = build_native_tls(cfg)?;
@@ -345,11 +347,16 @@ pub(crate) fn introspect_pg_table_for_chunking(
 
 /// Open a bare `postgres::Client` honoring the configured TLS policy.
 ///
-/// Shared by preflight, doctor, and init so every code path that connects to
-/// Postgres applies the same transport-security rules. `tls = None` or
-/// `mode: disable` falls back to the insecure `NoTls` transport — a warning is
-/// logged from `create_source` so operators know TLS is off.
+/// Shared by preflight, doctor, and `rivet init` so every code path that
+/// connects to Postgres applies the same transport-security rules. Preflight
+/// and doctor pass the YAML `tls:` block; init runs before any YAML exists,
+/// so it derives a `TlsConfig` from the URL's `sslmode` parameter (see
+/// `crate::init::postgres::connect`). `tls = None` or `mode: disable` falls
+/// back to the insecure `NoTls` transport — a warning is logged from
+/// `create_source` so operators know TLS is off.
 pub(crate) fn connect_client(url: &str, tls: Option<&TlsConfig>) -> Result<Client> {
+    // Refuse remote plaintext (no `tls:` block) before any dial (CWE-319).
+    crate::source::require_tls_or_loopback(url, tls)?;
     match tls {
         Some(cfg) if cfg.mode.is_enforced() => {
             let connector = build_native_tls(cfg)?;
@@ -421,6 +428,10 @@ fn pg_run_export(
     let mut columns_cache: Option<Vec<(String, Type)>> = None;
     let mut total_rows: usize = 0;
     let mut cap_applied = false;
+    // Per-value ceiling (MB→bytes; `0`/None disables), enforced pre-allocation
+    // inside the batch builder so an oversized cell bails before Arrow reserves
+    // the buffer. Same source of truth as the sink's backstop guard.
+    let max_value_bytes = tuning.max_value_bytes();
 
     loop {
         let requested = ctl.target();
@@ -460,7 +471,7 @@ fn pg_run_export(
         let cols = columns_cache
             .as_ref()
             .expect("columns set on first iteration");
-        let batch = rows_to_record_batch_typed(s, cols, &rows)?;
+        let batch = rows_to_record_batch_typed(s, cols, &rows, max_value_bytes)?;
         drop(rows);
 
         // After the first (probe) batch we know the actual row width. Cap the

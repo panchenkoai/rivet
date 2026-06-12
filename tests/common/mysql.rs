@@ -23,6 +23,12 @@ impl MysqlTable {
     pub fn name(&self) -> &str {
         &self.name
     }
+
+    /// Wrap an already-created table (custom schema) in the RAII drop guard, so
+    /// tests needing a non-canonical shape don't roll their own `DropMysqlTable`.
+    pub fn adopt(name: String) -> Self {
+        MysqlTable { name }
+    }
 }
 
 impl Drop for MysqlTable {

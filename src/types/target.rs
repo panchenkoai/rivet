@@ -58,6 +58,14 @@ impl ExportTarget {
         }
     }
 
+    /// Human-readable list of every spelling [`parse`](Self::parse) accepts,
+    /// for "unknown target" error messages. Single source so the message can't
+    /// drift from `parse` (it once said "bigquery, duckdb" and missed
+    /// snowflake). Aliases are shown in parens after each canonical name.
+    pub fn valid_target_names() -> &'static str {
+        "bigquery (bq), duckdb (duck), snowflake (sf)"
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::BigQuery => "bigquery",
@@ -1233,5 +1241,16 @@ mod tests {
             Some(ExportTarget::Snowflake)
         );
         assert_eq!(ExportTarget::parse("sf"), Some(ExportTarget::Snowflake));
+    }
+
+    #[test]
+    fn valid_target_names_lists_every_parseable_target() {
+        // The "unknown target" error message reads from this; it must name
+        // every target `parse` accepts, or the hint sends operators wrong.
+        // snowflake regression: the old message hard-coded "bigquery, duckdb".
+        let names = ExportTarget::valid_target_names();
+        assert!(names.contains("snowflake"), "got: {names}");
+        assert!(names.contains("bigquery"), "got: {names}");
+        assert!(names.contains("duckdb"), "got: {names}");
     }
 }

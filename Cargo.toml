@@ -1,6 +1,6 @@
 [package]
 name = "rivet-cli"
-version = "0.9.5"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
@@ -22,9 +22,15 @@ path = "src/main.rs"
 name = "rivet-mcp"
 path = "src/bin/rivet-mcp.rs"
 
+# Dev-only test-data generator. Gated behind the off-by-default `dev-seed`
+# feature so `cargo install rivet-cli` (default features) does NOT build or
+# install a generically-named `seed` binary on the user's PATH — its default
+# run issues `TRUNCATE ... CASCADE` against a local DB (CWE-1188). Dev/docker
+# workflows build it with `--features dev-seed`.
 [[bin]]
 name = "seed"
 path = "src/bin/seed/main.rs"
+required-features = ["dev-seed"]
 
 [dependencies]
 anyhow = "1"
@@ -150,6 +156,9 @@ harness = false
 [features]
 default = ["jemalloc"]
 jemalloc = ["tikv-jemallocator"]
+# Builds the dev-only `seed` test-data generator (see `[[bin]] seed`). Off by
+# default so it is never installed by `cargo install rivet-cli`.
+dev-seed = []
 
 [profile.release]
 strip = true

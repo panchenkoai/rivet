@@ -1,6 +1,7 @@
 mod analysis;
 pub(crate) mod cursor_expr;
 mod doctor;
+mod mssql;
 mod mysql;
 mod postgres;
 pub mod type_report;
@@ -20,7 +21,7 @@ use postgres::{extract_scan_type, parse_pg_row_estimate};
 use crate::config::{Config, ExportConfig, SourceType};
 use crate::error::Result;
 use crate::types::policy::TypePolicy;
-use crate::types::target::ExportTarget;
+use crate::types::target::{ExportTarget, TargetStatus};
 
 #[derive(Debug)]
 pub enum HealthVerdict {
@@ -71,10 +72,36 @@ pub(crate) fn get_export_diagnostic(
     match config.source.source_type {
         SourceType::Postgres => postgres::diagnose_export_pg(&url, tls, export),
         SourceType::Mysql => mysql::diagnose_export_mysql(&url, tls, export),
-        SourceType::Mssql => {
-            anyhow::bail!("mssql preflight diagnostics not yet implemented (scaffold)")
-        }
+        SourceType::Mssql => mssql::diagnose_export_mssql(&url, tls, export),
     }
+}
+
+/// Dedup identity for a destination, shared by `check`'s credential probe
+/// and `doctor`'s write probe. Must include every field that changes where
+/// a probe lands — notably `path`, so two local destinations with different
+/// paths are probed separately. Keeping one helper prevents the two call
+/// sites from drifting apart (doctor's inline copy once omitted `path` and
+/// silently skipped the second local destination).
+fn destination_identity(d: &crate::config::DestinationConfig) -> String {
+    format!(
+        "{:?}:{}:{}:{}",
+        d.destination_type,
+        d.bucket.as_deref().unwrap_or("-"),
+        d.endpoint.as_deref().unwrap_or("-"),
+        d.path.as_deref().unwrap_or("-"),
+    )
+}
+
+/// One-line note for the "fail ✗ but rc 0" case: a column rendered `fail ✗`
+/// for `--target` does NOT gate the exit code unless `--strict` is also passed
+/// (that is the gate by design). Without this note an operator or CI reading
+/// the glyph alone would wrongly assume a non-zero exit. Pure so the exact text
+/// is unit-tested.
+fn target_fail_note(n: usize, target_label: &str) -> String {
+    let col = if n == 1 { "column" } else { "columns" };
+    format!(
+        "Note: {n} {col} FAIL {target_label} compatibility; exit code is gated only with --strict (currently exit 0)"
+    )
 }
 
 pub fn check(
@@ -110,7 +137,7 @@ pub fn check(
     match config.source.source_type {
         SourceType::Postgres => postgres::check_postgres(&url, tls, &exports, json_output)?,
         SourceType::Mysql => mysql::check_mysql(&url, tls, &exports, json_output)?,
-        SourceType::Mssql => anyhow::bail!("mssql check not yet implemented (scaffold)"),
+        SourceType::Mssql => mssql::check_mssql(&url, tls, &exports, json_output)?,
     }
 
     // Destination credential-resolution preflight.  Until 0.7.6 `check` only
@@ -123,13 +150,7 @@ pub fn check(
     // configs cheap.
     let mut seen_destinations: std::collections::HashSet<String> = std::collections::HashSet::new();
     for export in &exports {
-        let dest_key = format!(
-            "{:?}:{}:{}:{}",
-            export.destination.destination_type,
-            export.destination.bucket.as_deref().unwrap_or("-"),
-            export.destination.endpoint.as_deref().unwrap_or("-"),
-            export.destination.path.as_deref().unwrap_or("-"),
-        );
+        let dest_key = destination_identity(&export.destination);
         if !seen_destinations.insert(dest_key) {
             continue;
         }
@@ -154,6 +175,13 @@ pub fn check(
         };
 
         let mut any_fatal = false;
+        // Count hard target-FAIL columns (and remember which target) so that —
+        // when --strict was NOT passed and the exit code is therefore 0 — we can
+        // print a note. The "fail ✗" glyph in the table implies a hard failure,
+        // but exit is gated only by --strict; without this note an operator or CI
+        // reading the glyph alone would be misled into thinking rc != 0.
+        let mut target_fail_cols = 0usize;
+        let mut target_fail_label: Option<&'static str> = None;
         for export in &exports {
             let column_overrides =
                 crate::plan::parse_column_overrides_pub(&export.columns, &export.name)?;
@@ -164,8 +192,9 @@ pub fn check(
                 && crate::types::target::ExportTarget::parse(t).is_none()
             {
                 anyhow::bail!(
-                    "export '{}': unknown target '{t}' (expected: bigquery, duckdb)",
-                    export.name
+                    "export '{}': unknown target '{t}' (expected: {})",
+                    export.name,
+                    crate::types::target::ExportTarget::valid_target_names()
                 );
             }
             let eff_target = target.or_else(|| {
@@ -190,8 +219,16 @@ pub fn check(
                     if report.has_fatal() {
                         any_fatal = true;
                     }
-                    if eff_target.is_some() && report.has_target_fail() {
+                    if let Some(t) = eff_target
+                        && report.has_target_fail()
+                    {
                         any_fatal = true;
+                        target_fail_cols += report
+                            .columns
+                            .iter()
+                            .filter(|c| c.target_status == Some(TargetStatus::Fail))
+                            .count();
+                        target_fail_label.get_or_insert(t.label());
                     }
                     if json_output {
                         type_report::print_json(&report)?;
@@ -207,6 +244,14 @@ pub fn check(
 
         if strict && any_fatal {
             anyhow::bail!("strict mode: unsafe type mappings found (see report above)");
+        } else if !strict && target_fail_cols > 0 && !json_output {
+            // The table showed "fail ✗" but rc is 0 — say so explicitly. Skipped
+            // under --json so NDJSON output stays one object per line.
+            println!();
+            println!(
+                "{}",
+                target_fail_note(target_fail_cols, target_fail_label.unwrap_or("target"))
+            );
         }
     }
 
@@ -279,6 +324,25 @@ mod tests {
             },
             ..crate::config::sample_export(name)
         }
+    }
+
+    // ── L8: 'fail ✗' note when --target FAILs but --strict was not passed ─────
+    // The glyph implies a hard failure; exit is gated only by --strict. The note
+    // tells an operator/CI the exit is 0 so the glyph doesn't mislead.
+    #[test]
+    fn target_fail_note_names_count_target_and_strict_gate() {
+        let note = target_fail_note(2, "bigquery");
+        assert!(note.contains("2 columns FAIL"), "got: {note}");
+        assert!(note.contains("bigquery"), "got: {note}");
+        assert!(note.contains("--strict"), "got: {note}");
+        assert!(note.contains("exit 0"), "got: {note}");
+    }
+
+    #[test]
+    fn target_fail_note_singular_for_one_column() {
+        let note = target_fail_note(1, "duckdb");
+        assert!(note.contains("1 column FAIL"), "got: {note}");
+        assert!(!note.contains("1 columns"), "should be singular: {note}");
     }
 
     #[test]
@@ -420,6 +484,59 @@ mod tests {
     fn dest_err(msg: &str, dtype: DestinationType) -> &'static str {
         let cfg = dest_config(dtype);
         categorize_dest_error(&anyhow::anyhow!("{}", msg), &cfg)
+    }
+
+    fn local_dest(path: &str) -> DestinationConfig {
+        DestinationConfig {
+            destination_type: DestinationType::Local,
+            path: Some(path.to_string()),
+            ..Default::default()
+        }
+    }
+
+    // Regression (doctor-dedup): doctor's inline dedup key omitted `path`,
+    // so two local destinations with different paths collapsed to one entry
+    // and the second was never write-probed. The shared identity must keep
+    // them distinct.
+    #[test]
+    fn destination_identity_distinguishes_local_paths() {
+        assert_ne!(
+            destination_identity(&local_dest("/tmp/a")),
+            destination_identity(&local_dest("/tmp/b")),
+        );
+    }
+
+    #[test]
+    fn destination_identity_collapses_identical_local_destinations() {
+        assert_eq!(
+            destination_identity(&local_dest("/tmp/a")),
+            destination_identity(&local_dest("/tmp/a")),
+        );
+    }
+
+    #[test]
+    fn destination_identity_distinguishes_buckets() {
+        let a = DestinationConfig {
+            bucket: Some("bucket-a".to_string()),
+            ..dest_config(DestinationType::S3)
+        };
+        let b = DestinationConfig {
+            bucket: Some("bucket-b".to_string()),
+            ..dest_config(DestinationType::S3)
+        };
+        assert_ne!(destination_identity(&a), destination_identity(&b));
+    }
+
+    // Same bucket name on different endpoints (e.g. AWS vs MinIO) is two
+    // distinct destinations and must be probed separately.
+    #[test]
+    fn destination_identity_distinguishes_endpoints_for_same_bucket() {
+        let aws = dest_config(DestinationType::S3);
+        let minio = DestinationConfig {
+            endpoint: Some("http://localhost:9000".to_string()),
+            ..dest_config(DestinationType::S3)
+        };
+        assert_ne!(destination_identity(&aws), destination_identity(&minio));
     }
 
     #[test]

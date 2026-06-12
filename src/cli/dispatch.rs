@@ -13,8 +13,39 @@ use super::args::{
 };
 use super::params::{parse_params, resolve_init_source};
 use super::validate::validate_cli;
+use crate::config::Config;
 use crate::error::Result;
 use crate::{init, pipeline, preflight};
+
+/// Validate a `--export <name>` selection against the loaded config and, on a
+/// miss, bail with the sorted list of declared export names — so a typo
+/// (`--export oders` for `orders`) names the choices instead of the bare
+/// "export 'oders' not found in config" the pipeline/preflight resolvers emit
+/// downstream. Mirrors the enumerated-names hint `rivet state reset` already
+/// gives (`pipeline/cli.rs`) and the "Did you mean" field-typo lint
+/// (`config/lints.rs`). A `None` selection (all exports) is always Ok.
+///
+/// This runs *before* the subcommand's own config load; the extra read of a
+/// small YAML is the same cost `reset_state`/`reset_chunk_checkpoint` already
+/// pay to validate an export name up front, and it keeps the good error in one
+/// place for every `--export`-taking subcommand.
+fn check_export_selection(config: &Config, export: Option<&str>) -> Result<()> {
+    let Some(name) = export else { return Ok(()) };
+    if config.exports.iter().any(|e| e.name == name) {
+        return Ok(());
+    }
+    let mut known: Vec<&str> = config.exports.iter().map(|e| e.name.as_str()).collect();
+    known.sort_unstable();
+    anyhow::bail!(
+        "export '{}' not found in config.\n  Known exports: {}\n  Hint: check the spelling against the names above.",
+        name,
+        if known.is_empty() {
+            "(none defined)".to_string()
+        } else {
+            known.join(", ")
+        },
+    );
+}
 
 /// Validate and execute the parsed CLI. Returns `Err` with a formatted message
 /// on validation failure or any subcommand error; `main.rs` decides whether to
@@ -63,6 +94,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             source_file,
             table,
             schema,
+            include,
+            exclude,
             output,
             discover,
             gcs_bucket,
@@ -75,6 +108,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             source_file,
             table,
             schema,
+            include,
+            exclude,
             output,
             discover,
             gcs_bucket,
@@ -164,6 +199,9 @@ fn dispatch_run(
 ) -> Result<()> {
     let p = parse_params(&params);
     let p = if p.is_empty() { None } else { Some(p) };
+    if let Some(name) = export.as_deref() {
+        check_export_selection(&Config::load_with_params(&config, p.as_ref())?, Some(name))?;
+    }
     let summary_output_path = summary_output.as_ref().map(std::path::PathBuf::from);
     pipeline::run(
         &config,
@@ -191,9 +229,18 @@ fn dispatch_check(
 ) -> Result<()> {
     let p = parse_params(&params);
     let p = if p.is_empty() { None } else { Some(p) };
-    let tgt = target
-        .as_deref()
-        .and_then(crate::types::target::ExportTarget::parse);
+    // A declared `--target` that doesn't parse is a loud error — never silently
+    // dropped to `None` (which would give false target-compat assurance). This
+    // mirrors the config-level `target:` validation in `preflight/mod.rs`.
+    let tgt = match target.as_deref() {
+        Some(s) => Some(crate::types::target::ExportTarget::parse(s).ok_or_else(|| {
+            anyhow::anyhow!("unknown target '{s}' (expected: bigquery, duckdb, snowflake)")
+        })?),
+        None => None,
+    };
+    if let Some(name) = export.as_deref() {
+        check_export_selection(&Config::load_with_params(&config, p.as_ref())?, Some(name))?;
+    }
     preflight::check(
         &config,
         export.as_deref(),
@@ -202,7 +249,77 @@ fn dispatch_check(
         strict,
         json,
         tgt,
-    )
+    )?;
+    // Surface plan-validation diagnostics so `check` agrees with `run`/`plan`:
+    // a stdout+chunked config is Rejected by all three, not silently passed by
+    // `check` alone. `preflight::check` probes source/destination/types; this
+    // adds the mode×destination compatibility gate (`validate_plan`). Skipped
+    // under `--json` so NDJSON type-report output stays one object per line.
+    check_plan_compatibility(&config, export.as_deref(), p.as_ref(), json)
+}
+
+/// Build the resolved plan for each selected export and surface
+/// [`validate_plan`](crate::plan::validate_plan) diagnostics the same way
+/// `rivet plan` does: print every `[rule] message`, and return an error on the
+/// first `Rejected` so `check` exits non-zero on an incompatible combination
+/// (e.g. `[stdout-no-chunked]`). Warnings/Degraded notes print but do not fail.
+fn check_plan_compatibility(
+    config_path: &str,
+    export_name: Option<&str>,
+    params: Option<&std::collections::HashMap<String, String>>,
+    json_output: bool,
+) -> Result<()> {
+    if json_output {
+        return Ok(());
+    }
+    let config = Config::load_with_params(config_path, params)?;
+    let config_dir = std::path::Path::new(config_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let selected: Vec<&crate::config::ExportConfig> = match export_name {
+        Some(name) => config.exports.iter().filter(|e| e.name == name).collect(),
+        None => config.exports.iter().collect(),
+    };
+    let mut rejected: Option<String> = None;
+    for export in selected {
+        // `--validate`/`--reconcile`/`--resume` are run-only flags; `check`
+        // builds the plan with them off, matching how `rivet plan` validates.
+        //
+        // A `build_plan` failure here is NOT promoted to a `check` error: the
+        // source/destination/type probes in `preflight::check` already ran and
+        // own those diagnostics, and `build_plan` can fail for unrelated reasons
+        // (e.g. a `table:`-shortcut chunk-shape probe). We only want the
+        // compatibility verdict — when the plan won't build, log and skip it so
+        // `check` never regresses to a hard error it did not produce before.
+        let plan =
+            match crate::plan::build_plan(&config, export, config_dir, false, false, false, params)
+            {
+                Ok(plan) => plan,
+                Err(e) => {
+                    log::warn!(
+                        "check '{}': plan-compatibility check skipped (plan did not build): {:#}",
+                        export.name,
+                        e
+                    );
+                    continue;
+                }
+            };
+        for d in crate::plan::validate_plan(&plan) {
+            let line = format!("[{}] {}", d.rule, d.message);
+            match d.level {
+                crate::plan::DiagnosticLevel::Rejected => {
+                    println!("Rejected: {line}");
+                    rejected.get_or_insert(line);
+                }
+                crate::plan::DiagnosticLevel::Warning => println!("Warning: {line}"),
+                crate::plan::DiagnosticLevel::Degraded => println!("Degraded: {line}"),
+            }
+        }
+    }
+    if let Some(line) = rejected {
+        anyhow::bail!("{line}");
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -212,6 +329,8 @@ fn dispatch_init(
     source_file: Option<String>,
     table: Option<String>,
     schema: Option<String>,
+    include: Vec<String>,
+    exclude: Vec<String>,
     output: Option<String>,
     discover: bool,
     gcs_bucket: Option<String>,
@@ -231,6 +350,7 @@ fn dispatch_init(
         s3_bucket,
         s3_region,
     };
+    let filter = init::TableFilter { include, exclude };
     init::init(
         &source_url,
         table.as_deref(),
@@ -238,6 +358,7 @@ fn dispatch_init(
         output.as_deref(),
         fmt,
         yaml_dest,
+        &filter,
     )
 }
 
@@ -250,6 +371,9 @@ fn dispatch_plan(
 ) -> Result<()> {
     let p = parse_params(&params);
     let p = if p.is_empty() { None } else { Some(p) };
+    if let Some(name) = export.as_deref() {
+        check_export_selection(&Config::load_with_params(&config, p.as_ref())?, Some(name))?;
+    }
     let fmt = match format {
         PlanFormat::Pretty => pipeline::PlanOutputFormat::Pretty,
         PlanFormat::Json => pipeline::PlanOutputFormat::Json(output),
@@ -266,6 +390,9 @@ fn dispatch_validate(
     run_id: Option<String>,
     prefix: Option<String>,
 ) -> Result<()> {
+    if let Some(name) = export.as_deref() {
+        check_export_selection(&Config::load(&config)?, Some(name))?;
+    }
     let fmt = match format {
         ValidateFormat::Pretty => pipeline::ValidateOutputFormat::Pretty,
         ValidateFormat::Json => pipeline::ValidateOutputFormat::Json(output),
@@ -297,6 +424,10 @@ fn dispatch_reconcile(
 ) -> Result<()> {
     let p = parse_params(&params);
     let p = if p.is_empty() { None } else { Some(p) };
+    check_export_selection(
+        &Config::load_with_params(&config, p.as_ref())?,
+        Some(&export),
+    )?;
     let fmt = match format {
         ReconcileFormat::Pretty => pipeline::ReconcileOutputFormat::Pretty,
         ReconcileFormat::Json => pipeline::ReconcileOutputFormat::Json(output),
@@ -315,6 +446,10 @@ fn dispatch_repair(
 ) -> Result<()> {
     let p = parse_params(&params);
     let p = if p.is_empty() { None } else { Some(p) };
+    check_export_selection(
+        &Config::load_with_params(&config, p.as_ref())?,
+        Some(&export),
+    )?;
     let source = match report {
         Some(path) => pipeline::RepairReportSource::File(path),
         None => pipeline::RepairReportSource::Auto,

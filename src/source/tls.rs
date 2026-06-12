@@ -50,10 +50,16 @@ pub(crate) fn build_native_tls(cfg: &TlsConfig) -> Result<native_tls::TlsConnect
         builder.add_root_certificate(cert);
     }
 
-    // Honor the explicit danger knobs on top of the mode-derived defaults so
-    // that, for example, `mode: verify-full` + `accept_invalid_hostnames: true`
-    // works for IP-addressed hosts behind a cert. Each one emits a warning at
-    // config-time (see `Config::validate`).
+    // Honor the explicit danger knobs on top of the mode-derived defaults.
+    // Config-load enforcement lives upstream: `Config::check_tls_mode_downgrade`
+    // (run from `Config::from_yaml`) REJECTS an *explicitly chosen* enforced
+    // `mode:` paired with a danger knob (e.g. `mode: verify-full` +
+    // `accept_invalid_certs: true`) with an Err, since the knob silently
+    // downgrades the stated mode to trust-anything. A danger knob therefore
+    // reaches here only in the permitted case: an enforced mode with no explicit
+    // `mode:` key (the dev-container default-mode path against a loopback
+    // self-signed cert), where the contradiction the config check guards against
+    // is absent.
     if cfg.accept_invalid_certs {
         builder.danger_accept_invalid_certs(true);
     }

@@ -192,14 +192,10 @@ pub trait Destination: Send + Sync {
 /// Log destination capabilities at DEBUG level and emit a WARN when the backend is not
 /// retry-safe but retries are configured.  Call once per export after `create_destination`.
 ///
-/// `dest_kind` lets the WARN distinguish "partial file overwritten on next
-/// retry" (local) from "partial output stream that can never be reverted"
-/// (stdout). For `local` the previous warning fired on every run with the
-/// default destination (the canonical dev/test target), training operators
-/// to ignore it; `idempotent_overwrite` already guarantees a clean
-/// rewrite on retry, so the partial-file window is benign — demote to
-/// DEBUG. `stdout` keeps the WARN because a duplicate / corrupt output
-/// stream cannot be undone.
+/// `dest_kind` names the backend in the WARN so the operator knows which
+/// destination needs cleanup.  Local writes are temp-then-rename and report
+/// `retry_safe: true`, so the WARN can fire only for genuinely unsafe
+/// backends (stdout's stream cannot be reverted).
 pub fn log_capabilities(
     export_name: &str,
     dest: &dyn Destination,
@@ -216,26 +212,13 @@ pub fn log_capabilities(
         caps.partial_write_risk,
     );
     if !caps.retry_safe && max_retries > 0 {
-        // Local destination: partial file is overwritten cleanly on the
-        // next attempt (`idempotent_overwrite == true`). The warn was a
-        // false alarm for the most common dev/test setup — log at DEBUG
-        // so it's still discoverable for forensics.
-        if matches!(dest_kind, crate::config::DestinationType::Local) {
-            log::debug!(
-                "export '{}': local destination is not formally retry-safe \
-                 (fs::copy can leave a partial file on crash), but \
-                 idempotent_overwrite=true means the next retry rewrites \
-                 the file cleanly — no operator action needed",
-                export_name,
-            );
-        } else {
-            log::warn!(
-                "export '{}': destination is not retry-safe (max_retries={}); \
-                 partial artifacts may exist at destination on failure — manual cleanup may be needed",
-                export_name,
-                max_retries,
-            );
-        }
+        log::warn!(
+            "export '{}': {} destination is not retry-safe (max_retries={}); \
+             partial artifacts may exist at destination on failure — manual cleanup may be needed",
+            export_name,
+            dest_kind.label(),
+            max_retries,
+        );
     }
 }
 
@@ -247,6 +230,39 @@ pub fn create_destination(config: &DestinationConfig) -> Result<Box<dyn Destinat
         DestinationType::Gcs => Ok(Box::new(gcs::GcsDestination::new(config)?)),
         DestinationType::Azure => Ok(Box::new(azure::AzureDestination::new(config)?)),
         DestinationType::Stdout => Ok(Box::new(stdout::StdoutDestination::new()?)),
+    }
+}
+
+/// Build a destination for a preflight connectivity probe (`rivet doctor`).
+///
+/// Identical to [`create_destination`] except cloud backends (S3/GCS/Azure)
+/// are constructed with the OpenDAL retry budget disabled (`max_times = 0`,
+/// single attempt). A probe against an unreachable endpoint must FAIL FAST
+/// — inheriting the export's 5-attempt escalating backoff would block doctor
+/// for ~10s and spew transient-retry WARN noise before the `[FAIL]` line.
+///
+/// Local and stdout backends have no retry layer, so they fall through to the
+/// same construction `create_destination` uses; the probe distinction is
+/// meaningful only for the OpenDAL-backed stores.
+pub fn create_destination_for_probe(config: &DestinationConfig) -> Result<Box<dyn Destination>> {
+    use crate::config::DestinationType;
+    // No retries on the probe path: a single attempt, then surface the error.
+    const PROBE_MAX_RETRIES: usize = 0;
+    match config.destination_type {
+        DestinationType::S3 => Ok(Box::new(s3::S3Destination::new_with_retries(
+            config,
+            PROBE_MAX_RETRIES,
+        )?)),
+        DestinationType::Gcs => Ok(Box::new(gcs::GcsDestination::new_with_retries(
+            config,
+            PROBE_MAX_RETRIES,
+        )?)),
+        DestinationType::Azure => Ok(Box::new(azure::AzureDestination::new_with_retries(
+            config,
+            PROBE_MAX_RETRIES,
+        )?)),
+        // No OpenDAL retry layer to disable — same path as a real export.
+        DestinationType::Local | DestinationType::Stdout => create_destination(config),
     }
 }
 

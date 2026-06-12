@@ -23,6 +23,13 @@ mod common;
 
 use common::*;
 
+/// Distinct `id` values and physical row count across every Parquet part at the
+/// destination — re-reads the files, NOT rivet's state DB. Lets a recovery test
+/// assert the no-row-loss superset invariant the state-DB assertions cannot see.
+fn parquet_ids_and_rows(dir: &std::path::Path) -> (std::collections::BTreeSet<i64>, i64) {
+    (dir_parquet_id_set(dir), total_parquet_rows(dir) as i64)
+}
+
 /// RAII guard — drops a Postgres table on scope exit.
 struct PgCleanup(String);
 impl Drop for PgCleanup {
@@ -229,6 +236,24 @@ fn crash_after_file_write_leaves_file_but_no_manifest_or_cursor() {
         total >= 2,
         "orphaned pre-crash file + recovery file: expected >=2, got {total}"
     );
+
+    // Re-read the DESTINATION (not the state DB): the recovery re-export must be
+    // a COMPLETE superset of the source — every seeded id present at least once
+    // (no row LOST across the orphan+recovery split) — with the only surplus
+    // being the documented at-least-once orphan (physical >= source). The
+    // existing assertions check file COUNT + state DB + exit code, never the
+    // rows actually on disk; a regression that dropped rows on the recovery
+    // re-export would pass them all.
+    let (ids, physical) = parquet_ids_and_rows(out.path());
+    let expected: std::collections::BTreeSet<i64> = (1..=8).collect();
+    assert_eq!(
+        ids, expected,
+        "recovery must leave every source id (1..=8) at the destination — a missing id is row LOSS"
+    );
+    assert!(
+        physical >= 8,
+        "at-least-once: physical destination rows ({physical}) must be >= source (8)"
+    );
 }
 
 #[test]
@@ -270,6 +295,19 @@ fn crash_after_manifest_update_leaves_file_and_manifest_but_no_cursor() {
     assert!(rec.status.success());
     assert_eq!(manifest_count(&cfg, &export), 2);
     assert!(cursor_value(&cfg, &export).is_some());
+
+    // Destination re-read: the recovery re-export is a complete superset of the
+    // source (every seeded id 1..=7 present; physical >= source for at-least-once).
+    let (ids, physical) = parquet_ids_and_rows(out.path());
+    let expected: std::collections::BTreeSet<i64> = (1..=7).collect();
+    assert_eq!(
+        ids, expected,
+        "recovery must leave every source id (1..=7) at the destination — a missing id is row LOSS"
+    );
+    assert!(
+        physical >= 7,
+        "at-least-once: physical destination rows ({physical}) must be >= source (7)"
+    );
 }
 
 #[test]

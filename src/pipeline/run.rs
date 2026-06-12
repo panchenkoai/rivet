@@ -248,7 +248,12 @@ pub fn run(
     let _reset_multi = ResetMultiExport(prev_multi, prev_concurrent);
 
     let mut summaries: Vec<RunSummary> = Vec::with_capacity(exports.len());
-    let mut failures: Vec<String> = Vec::new();
+    // Keep the typed `anyhow::Error`s (not flattened strings) so the final bail
+    // can carry a representative one — its DataIntegrityError / SchemaDriftError /
+    // transient marker downcasts through anyhow's context chain in
+    // `error::classify_exit`, giving the right process exit code without grepping
+    // the message.
+    let mut failures: Vec<anyhow::Error> = Vec::new();
 
     if run_parallel {
         log::info!(
@@ -318,7 +323,7 @@ pub fn run(
 
         for (res, summary) in collected.into_inner().unwrap() {
             if let Err(e) = res {
-                failures.push(format!("{e:#}"));
+                failures.push(e);
             }
             summaries.push(summary);
         }
@@ -340,7 +345,7 @@ pub fn run(
             let (res, summary) =
                 job::run_export_job(config_path, &config, export, &state, &config_dir, &opts);
             if let Err(e) = res {
-                failures.push(format!("{e:#}"));
+                failures.push(e);
             }
             summaries.push(summary);
         }
@@ -429,8 +434,85 @@ pub fn run(
     }
 
     if !failures.is_empty() {
-        anyhow::bail!("{}", failures.join("; "));
+        // Carry a representative typed failure as the returned error so
+        // `error::classify_exit` downcasts the marker (DataIntegrityError=3,
+        // SchemaDriftError=4, transient=2) through anyhow's context chain. Pick
+        // the most "stop-worthy" class — data-integrity (possibly-wrong data)
+        // outranks schema-drift, which outranks retryable, which outranks
+        // generic — so a mixed batch exits on the scariest reason.
+        let primary_idx = representative_failure_idx(&failures).unwrap();
+        let primary = failures.remove(primary_idx);
+        if failures.is_empty() {
+            // Single failure — return it verbatim (its own message + marker).
+            return Err(primary);
+        }
+        // Multiple failures: list the others as higher-level context; `primary`
+        // (with its typed marker) rides underneath so the downcast still finds it.
+        let others = failures
+            .iter()
+            .map(|e| format!("{e:#}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(primary.context(format!(
+            "{} export(s) failed; representative error follows (also: {others})",
+            failures.len() + 1
+        )));
     }
 
     Ok(())
+}
+
+/// Index of the most "stop-worthy" failure in a batch: data-integrity (exit 3)
+/// outranks schema-drift (4), which outranks retryable (2), which outranks
+/// generic (1). The chosen error's typed marker then rides up so `classify_exit`
+/// exits the process on the scariest reason rather than whichever export happened
+/// to fail first. Returns `None` for an empty slice.
+fn representative_failure_idx(failures: &[anyhow::Error]) -> Option<usize> {
+    let rank = |e: &anyhow::Error| match crate::error::classify_exit(e) {
+        c if c == crate::error::ExitClass::DataIntegrity.code() => 3,
+        c if c == crate::error::ExitClass::SchemaDrift.code() => 2,
+        c if c == crate::error::ExitClass::Retryable.code() => 1,
+        _ => 0,
+    };
+    (0..failures.len()).max_by_key(|&i| rank(&failures[i]))
+}
+
+#[cfg(test)]
+mod representative_failure_tests {
+    use super::representative_failure_idx;
+    use crate::error::{DataIntegrityError, ExitClass, SchemaDriftError, classify_exit};
+
+    #[test]
+    fn empty_batch_has_no_representative() {
+        assert_eq!(representative_failure_idx(&[]), None);
+    }
+
+    #[test]
+    fn data_integrity_outranks_everything_regardless_of_position() {
+        // Data-integrity sits LAST so a naive "first failure" or a flipped
+        // min/max selector would pick the generic error instead.
+        let failures = vec![
+            anyhow::anyhow!("generic boom"),
+            SchemaDriftError::new("shape changed").into(),
+            anyhow::anyhow!("another generic"),
+            DataIntegrityError::new("reconcile mismatch").into(),
+        ];
+        let idx = representative_failure_idx(&failures).unwrap();
+        assert_eq!(
+            classify_exit(&failures[idx]),
+            ExitClass::DataIntegrity.code(),
+            "a mixed batch must surface the data-integrity (exit 3) failure"
+        );
+    }
+
+    #[test]
+    fn schema_drift_outranks_retryable_and_generic() {
+        // No data-integrity present → schema-drift (exit 4) is the scariest.
+        let failures = vec![
+            anyhow::anyhow!("generic"),
+            SchemaDriftError::new("drift").into(),
+        ];
+        let idx = representative_failure_idx(&failures).unwrap();
+        assert_eq!(classify_exit(&failures[idx]), ExitClass::SchemaDrift.code());
+    }
 }

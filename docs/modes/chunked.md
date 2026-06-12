@@ -229,6 +229,18 @@ exports:
 
 `rivet check` will warn you about sparse ranges.
 
+> **Pick a `chunk_column` whose ordering is stable.** Dense mode pages by
+> `ROW_NUMBER() OVER (ORDER BY chunk_column)`, recomputed in an independent query
+> per chunk. If `chunk_column` has a large tied peer group (many equal values)
+> *and* the source is being written concurrently during the export, two chunks'
+> queries could order the tied band differently and a boundary row could land in
+> both or neither. Against a **static** table every engine we test (PG 16,
+> MySQL 8, SQL Server 2022) orders ties deterministically, so this does not occur
+> — but prefer a column with no large tied groups, or use **keyset** on a unique
+> key, when exporting a live-writing table. (The analog for incremental cursors
+> is in [semantics.md § Known non-guarantees](../semantics.md#known-non-guarantees).
+> Regression-guarded by `tests/live_chunked_dense.rs`.)
+
 ## Keyset (seek) pagination — the safe shape without an integer PK
 
 Range chunking needs a **single integer PK** to slice `MIN..MAX`. A MySQL table

@@ -88,6 +88,15 @@ pub fn run_plan_command(
         None
     };
 
+    // When `--output FILE` is given but the config yields more than one export,
+    // a single path cannot hold every artifact: `rivet apply` reads exactly one
+    // `PlanArtifact` per file (`PlanArtifact::from_file`), and a JSON array is
+    // not a valid artifact. Writing all of them to the same path silently kept
+    // only the last (audit #4). Instead, derive a distinct per-export path so no
+    // export is dropped and each file remains directly consumable by `apply`.
+    let multi_export = built.len() > 1;
+
+    let mut artifacts: Vec<PlanArtifact> = Vec::with_capacity(built.len());
     for (mut artifact, _inputs, standalone_rec) in built {
         let snap = if let Some(ref camp) = campaign_opt {
             let rec = camp
@@ -107,10 +116,56 @@ pub fn run_plan_command(
             }
         };
         artifact.prioritization = Some(snap);
-        emit_artifact(&artifact, &format)?;
+        artifacts.push(artifact);
     }
 
+    emit_artifacts(&artifacts, &format, multi_export)?;
+
     Ok(())
+}
+
+/// Derive a distinct per-export output path from the `--output` value when more
+/// than one export is being planned.
+///
+/// Inserts the export name into the file stem (`plan.json` → `plan.orders.json`)
+/// so every artifact lands on its own path and `rivet apply <file>` consumes a
+/// single artifact unchanged. The export name is sanitised to a safe filename
+/// fragment (any non-alphanumeric/`-`/`_` byte becomes `_`) so an export named
+/// with a slash or dot cannot escape the intended directory or mangle the
+/// extension. The original extension is preserved so per-export files keep the
+/// same suffix (`.json`) the operator asked for.
+fn per_export_output_path(base: &str, export_name: &str) -> String {
+    let sanitized: String = export_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    let path = Path::new(base);
+    let parent = path.parent();
+    let stem = path.file_stem().and_then(|s| s.to_str());
+    let ext = path.extension().and_then(|s| s.to_str());
+
+    let file_name = match (stem, ext) {
+        (Some(stem), Some(ext)) => format!("{stem}.{sanitized}.{ext}"),
+        (Some(stem), None) => format!("{stem}.{sanitized}"),
+        // No usable stem (e.g. path was empty or just an extension): fall back to
+        // appending the sanitized name so the artifact still lands on a distinct
+        // path rather than colliding.
+        (None, _) => format!("{base}.{sanitized}"),
+    };
+
+    match parent {
+        Some(dir) if !dir.as_os_str().is_empty() => {
+            dir.join(file_name).to_string_lossy().into_owned()
+        }
+        _ => file_name,
+    }
 }
 
 fn build_plan_artifact(
@@ -312,20 +367,113 @@ fn compute_plan_data(
     }
 }
 
-fn emit_artifact(artifact: &PlanArtifact, format: &PlanOutputFormat) -> Result<()> {
+fn emit_artifacts(
+    artifacts: &[PlanArtifact],
+    format: &PlanOutputFormat,
+    multi_export: bool,
+) -> Result<()> {
     match format {
         PlanOutputFormat::Pretty => {
-            artifact.print_summary();
+            for artifact in artifacts {
+                artifact.print_summary();
+            }
         }
+        // Multi-export JSON to stdout: a single export prints its object
+        // unchanged, but printing N objects back-to-back is invalid JSON (audit
+        // #L10: `jq` fails with "Extra data"). Wrap them in a JSON array so the
+        // stream parses as one document.
         PlanOutputFormat::Json(None) => {
-            println!("{}", artifact.to_json_pretty()?);
+            if artifacts.len() > 1 {
+                // `&[PlanArtifact]` serializes as a JSON array — one parseable
+                // document rather than N concatenated objects.
+                println!("{}", serde_json::to_string_pretty(artifacts)?);
+            } else if let Some(artifact) = artifacts.first() {
+                println!("{}", artifact.to_json_pretty()?);
+            }
         }
         PlanOutputFormat::Json(Some(path)) => {
-            let json = artifact.to_json_pretty()?;
-            std::fs::write(path, &json)
-                .map_err(|e| anyhow::anyhow!("cannot write plan file '{}': {}", path, e))?;
-            println!("Plan written to: {}", path);
+            for artifact in artifacts {
+                let json = artifact.to_json_pretty()?;
+                // For a single export keep the operator's exact path so `rivet
+                // apply <path>` works verbatim. For multiple exports a single
+                // path would overwrite (audit #4): give each export its own file.
+                let out_path = if multi_export {
+                    per_export_output_path(path, &artifact.export_name)
+                } else {
+                    path.clone()
+                };
+                std::fs::write(&out_path, &json)
+                    .map_err(|e| anyhow::anyhow!("cannot write plan file '{}': {}", out_path, e))?;
+                println!("Plan written to: {}", out_path);
+            }
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::per_export_output_path;
+    use std::path::Path;
+
+    /// Regression (audit #4): two distinct exports under one `--output FILE`
+    /// must derive two distinct paths, so neither is silently overwritten.
+    #[test]
+    fn per_export_paths_are_distinct() {
+        let a = per_export_output_path("/tmp/plan.json", "orders");
+        let b = per_export_output_path("/tmp/plan.json", "users");
+        assert_ne!(a, b, "distinct exports must not collide on one path");
+        assert_eq!(a, "/tmp/plan.orders.json");
+        assert_eq!(b, "/tmp/plan.users.json");
+    }
+
+    /// The original extension is preserved so `rivet apply` (and any `*.json`
+    /// glob) still find the per-export files.
+    #[test]
+    fn per_export_path_keeps_json_extension() {
+        let p = per_export_output_path("/tmp/plan.json", "orders");
+        assert_eq!(
+            Path::new(&p).extension().and_then(|e| e.to_str()),
+            Some("json"),
+            "per-export file must keep the .json extension"
+        );
+    }
+
+    /// An export name with no extension on the base still gets a distinct,
+    /// non-colliding suffix rather than overwriting the base path.
+    #[test]
+    fn per_export_path_without_extension_appends_name() {
+        let p = per_export_output_path("/tmp/plan", "orders");
+        assert_eq!(p, "/tmp/plan.orders");
+    }
+
+    /// A hostile export name (path separators, dots) must not escape the
+    /// directory or mangle the extension — every unsafe byte is replaced.
+    #[test]
+    fn per_export_path_sanitizes_unsafe_export_name() {
+        let p = per_export_output_path("/tmp/plan.json", "../../etc/passwd");
+        // No remaining path separators or `..` traversal in the derived name.
+        assert!(
+            !p.contains(".."),
+            "sanitized path must not contain a `..` traversal: {p}"
+        );
+        let file = Path::new(&p)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .expect("derived path has a file name");
+        assert!(
+            !file.contains('/') && !file.contains('\\'),
+            "sanitized file name must not contain a path separator: {file}"
+        );
+        assert_eq!(
+            Path::new(&p).parent().and_then(|d| d.to_str()),
+            Some("/tmp"),
+            "derived path must stay in the requested directory"
+        );
+        assert_eq!(
+            Path::new(&p).extension().and_then(|e| e.to_str()),
+            Some("json"),
+            "extension must survive sanitization"
+        );
+    }
 }

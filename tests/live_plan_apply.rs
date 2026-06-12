@@ -146,6 +146,12 @@ fn plan_and_apply_full_export_round_trip() {
         "at least 1 parquet file must exist after apply; out_dir: {:?}",
         out_dir.path()
     );
+    // Back the round-trip claim with an independent destination read.
+    assert_eq!(
+        total_parquet_rows(out_dir.path()),
+        30,
+        "full plan+apply must land all 30 rows"
+    );
 }
 
 // ─── PA-L2: chunked plan + apply — chunk_ranges pre-computed and replayed ─────
@@ -231,6 +237,18 @@ fn plan_and_apply_chunked_export_round_trip_uses_precomputed_ranges() {
         parquet.len(),
         3,
         "3 chunks must produce 3 parquet files; found: {parquet:?}"
+    );
+    // Back the chunked round-trip with an independent destination read: all 150
+    // rows across the 3 chunks, distinct ids 0..150 (no drop/dup at boundaries).
+    assert_eq!(
+        total_parquet_rows(out_dir.path()),
+        150,
+        "3 chunks must land all 150 rows"
+    );
+    assert_eq!(
+        dir_parquet_id_set(out_dir.path()),
+        (0..150).collect::<std::collections::BTreeSet<i64>>(),
+        "chunked round-trip must hold every source id 0..150"
     );
 }
 
@@ -470,6 +488,12 @@ fn apply_force_flag_bypasses_expired_plan() {
         "parquet file must exist after forced apply; out_dir: {:?}",
         out_dir.path()
     );
+    // "Data must actually be exported" — back it with a destination read.
+    assert_eq!(
+        total_parquet_rows(out_dir.path()),
+        10,
+        "forced apply must still land all 10 rows"
+    );
 }
 
 // ─── PA-L8: plan --param substitutes query parameter ─────────────────────────
@@ -574,6 +598,12 @@ exports:
     assert_eq!(
         rows_written, 20,
         "plan --param max_id=19 must export exactly 20 rows (ids 0..=19); got {rows_written}"
+    );
+    // Back the export_metrics count with an independent destination read.
+    assert_eq!(
+        total_parquet_rows(out_dir.path()),
+        20,
+        "param max_id=19 must physically land exactly 20 rows at the destination"
     );
 }
 

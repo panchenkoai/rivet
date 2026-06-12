@@ -341,6 +341,104 @@ pub(super) fn check_success_gate_for_resume(plan: &ResolvedRunPlan) -> Result<()
     }
 }
 
+/// Footgun guard for a *fresh* (non-`--resume`) run into a destination prefix
+/// that already carries a completed export.
+///
+/// The audit (findings #5/#19/#30) showed that re-running `rivet run` into the
+/// same stable local prefix without `--resume` writes a brand-new set of
+/// timestamp-/nonce-named part files *alongside* the old ones — nothing is
+/// overwritten, and `manifest.json` is rewritten to describe only the latest
+/// run.  A glob reader over the prefix (`read_parquet('<prefix>/*.parquet')`)
+/// then over-counts: a chunked re-run doubles the row total while the manifest
+/// silently claims the smaller count.
+///
+/// Unlike [`check_success_gate_for_resume`] this is **non-destructive and
+/// non-fatal**: we never auto-delete the operator's prior data, and we never
+/// change the run's exit code.  But the drift must not be *silent* (CLAUDE.md:
+/// degraded/lossy paths must be loud), so when the prefix already holds a
+/// completed run we emit a prominent `WARN` naming the prefix and the exact
+/// risk, and point at the safe recoveries (`--resume`, or clear the prefix).
+///
+/// Streaming destinations (stdout) have no prefix to accumulate into; skipped.
+/// I/O failures probing the marker are swallowed to a debug log — this is a
+/// safety hint emitted *before* extraction, not a correctness gate, so a
+/// transient stat failure must never block an otherwise-valid run (the resume
+/// gate, which *does* gate, surfaces such errors instead).
+pub(super) fn warn_if_prefix_has_completed_run(plan: &ResolvedRunPlan) {
+    use crate::destination::WriteCommitProtocol;
+    use crate::manifest::{MANIFEST_FILENAME, SUCCESS_FILENAME};
+
+    let dest = match crate::destination::create_destination(&plan.destination) {
+        Ok(d) => d,
+        Err(e) => {
+            log::debug!(
+                "rerun-guard: could not create destination for export '{}' (skipping pre-run check): {:#}",
+                plan.export_name,
+                e
+            );
+            return;
+        }
+    };
+    if dest.capabilities().commit_protocol == WriteCommitProtocol::Streaming {
+        return;
+    }
+
+    // `_SUCCESS` is the unambiguous "a prior run completed cleanly here" signal;
+    // `manifest.json` catches a prior run that committed parts even if `_SUCCESS`
+    // is absent.  Probe `_SUCCESS` first so the warning is precise about a
+    // *completed* run when it can be.
+    let marker = match dest.head(SUCCESS_FILENAME) {
+        Ok(Some(_)) => Some(SUCCESS_FILENAME),
+        Ok(None) => match dest.head(MANIFEST_FILENAME) {
+            Ok(Some(_)) => Some(MANIFEST_FILENAME),
+            Ok(None) => None,
+            Err(e) => {
+                log::debug!(
+                    "rerun-guard: stat {} failed for export '{}' (skipping pre-run check): {:#}",
+                    MANIFEST_FILENAME,
+                    plan.export_name,
+                    e
+                );
+                return;
+            }
+        },
+        Err(e) => {
+            log::debug!(
+                "rerun-guard: stat {} failed for export '{}' (skipping pre-run check): {:#}",
+                SUCCESS_FILENAME,
+                plan.export_name,
+                e
+            );
+            return;
+        }
+    };
+
+    if let Some(marker) = marker {
+        log::warn!(
+            "export '{}': {}",
+            plan.export_name,
+            rerun_warning_message(&destination_uri_for_manifest(&plan.destination), marker),
+        );
+    }
+}
+
+/// The operator-facing body of the rerun-accumulation warning.
+///
+/// Split out so a regression test can pin the exact wording — the live audit
+/// (`tests/audit_rerun.rs`) only accepts this guard as "loud enough" when the
+/// message carries phrases like `already has`, `prior completed run`,
+/// `_SUCCESS` / `would overwrite`, or `orphan`.  Weakening the text below those
+/// markers would silently fail the audit, so the test below guards it.
+fn rerun_warning_message(uri: &str, marker: &str) -> String {
+    format!(
+        "destination prefix '{uri}' already has a prior completed run ({marker} present) — \
+         re-running WITHOUT --resume appends fresh timestamp-named parts alongside the old ones \
+         (nothing is overwritten) and rewrites manifest.json to describe only this run, so a glob \
+         reader over the prefix will double-count / orphan the old parts. \
+         Use --resume to continue the prior run, or clear the prefix first."
+    )
+}
+
 /// Best-effort textual URI for the manifest's `destination.uri` field.
 ///
 /// The manifest is a record of where data was written, so the URI must
@@ -478,5 +576,53 @@ mod tests {
         let mut c = cfg_local(None, None);
         c.destination_type = DestinationType::Stdout;
         assert_eq!(destination_uri_for_manifest(&c), "stdout");
+    }
+
+    // ── rerun-accumulation guard wording (audit findings #5/#19/#30) ─────────
+    //
+    // `warn_if_prefix_has_completed_run` only counts as the "loud" fix shape in
+    // `tests/audit_rerun.rs` when its message matches that test's deliberately
+    // narrow `warned_about_existing_prefix` matcher.  Pin the wording here so a
+    // future copy-edit can't quietly drop below that bar and re-open the silent
+    // double-count footgun while the live audit isn't running.
+
+    /// Mirrors `tests/audit_rerun.rs::warned_about_existing_prefix`.
+    fn audit_matcher_accepts(s: &str) -> bool {
+        let s = s.to_lowercase();
+        s.contains("_success")
+            || s.contains("already has")
+            || s.contains("prior completed run")
+            || s.contains("would overwrite")
+            || s.contains("orphan")
+    }
+
+    #[test]
+    fn rerun_warning_message_matches_live_audit_matcher_for_success_marker() {
+        let msg = rerun_warning_message("file:///tmp/out", "_SUCCESS");
+        assert!(
+            audit_matcher_accepts(&msg),
+            "rerun warning must trip the live audit matcher; message was: {msg}"
+        );
+        // Names the prefix and the safe recovery so the operator can act.
+        assert!(
+            msg.contains("file:///tmp/out"),
+            "must name the prefix: {msg}"
+        );
+        assert!(
+            msg.contains("--resume"),
+            "must point at the safe recovery: {msg}"
+        );
+    }
+
+    #[test]
+    fn rerun_warning_message_matches_live_audit_matcher_for_manifest_marker() {
+        // When only `manifest.json` is present (committed parts, no `_SUCCESS`),
+        // the `_SUCCESS` substring is gone — the message must still trip the
+        // matcher via `already has` / `prior completed run` / `orphan`.
+        let msg = rerun_warning_message("file:///tmp/out", "manifest.json");
+        assert!(
+            audit_matcher_accepts(&msg),
+            "manifest-only rerun warning must still trip the live audit matcher; message was: {msg}"
+        );
     }
 }

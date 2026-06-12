@@ -20,6 +20,7 @@ mod proxy;
 
 pub use proxy::MssqlProxyKind;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
@@ -30,7 +31,7 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 use proxy::{detect_mssql_proxy_kind, warn_proxy_kind};
 
-use crate::config::TlsConfig;
+use crate::config::{TlsConfig, TlsMode};
 use crate::error::Result;
 use crate::source::batch_controller::{
     AdaptiveBatchController, DEFAULT_BATCH_TARGET_MB, PROBE_BATCH_SIZE,
@@ -137,6 +138,12 @@ impl MssqlSource {
     /// resolved `sqlserver://user:pass@host:port/db` form. A successful return
     /// has completed a TLS login handshake and a `SELECT 1` round-trip.
     pub fn connect_with_tls(url: &str, tls: Option<&TlsConfig>) -> Result<Self> {
+        // Refuse trust-any-cert to a remote host with no `tls:` block before any
+        // dial (CWE-295): SQL Server always encrypts the login handshake, but
+        // with `trust_cert` that handshake is unauthenticated, so a MITM is not
+        // detected. Loopback keeps trust-cert (dev); a remote host must opt in
+        // explicitly via `tls: { mode: ... }`.
+        crate::source::require_tls_or_loopback(url, tls)?;
         let parts = parse_mssql_url(url)?;
         let mut config = Config::new();
         config.host(&parts.host);
@@ -150,13 +157,58 @@ impl MssqlSource {
         // `trust_cert` (accept-invalid). Default keeps full verification.
         config.encryption(EncryptionLevel::Required);
         match tls {
-            Some(cfg) if cfg.accept_invalid_certs => config.trust_cert(),
+            // `mode: disable` is the operator's explicit opt-in to an
+            // unauthenticated (trust-any-cert) connection — the SQL Server
+            // analogue of PG/MySQL remote plaintext. It is the documented way
+            // to keep trust-cert against a remote host the gate above would
+            // otherwise have refused.
+            Some(cfg) if cfg.mode == TlsMode::Disable || cfg.accept_invalid_certs => {
+                config.trust_cert()
+            }
             Some(cfg) => {
+                // Strict cert validation is ON here (mode verify-ca/verify-full,
+                // no accept_invalid_certs). This is the ONLY MSSQL path that
+                // exercises rustls-webpki, which is pinned to a vulnerable 0.101
+                // via tiberius 0.12 (no newer tiberius exists; see
+                // .cargo/audit.toml). The CA name-constraint advisories bite
+                // only when validating against a name-constraint-asserting
+                // private CA — narrow, but the operator who turned on strict
+                // validation is exactly who should know. Warn once.
+                static WEBPKI_WARNED: std::sync::Once = std::sync::Once::new();
+                WEBPKI_WARNED.call_once(|| {
+                    log::warn!(
+                        "mssql: TLS certificate validation is enabled, but the SQL Server \
+                         engine pins an old rustls-webpki (via tiberius) with known CA \
+                         name-constraint advisories (RUSTSEC-2026-0098/0099). Validation \
+                         against a name-constraint-asserting private CA may accept a \
+                         mis-issued certificate. Track tiberius for a rustls upgrade."
+                    );
+                });
                 if let Some(ca) = cfg.ca_file.as_deref() {
                     config.trust_cert_ca(ca);
                 }
             }
-            None => config.trust_cert(),
+            None => {
+                // Reached only for a LOOPBACK host (the gate above refuses a
+                // remote host with no `tls:` block). On loopback, tiberius
+                // trusts the server certificate without verifying issuer or
+                // hostname: the handshake is encrypted but unauthenticated. That
+                // is safe here because the bytes never leave the box, and it
+                // keeps dev / self-signed docker setups working without opt-in.
+                // Warn once, naming the config key that turns on strict
+                // validation.
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    log::warn!(
+                        "mssql: connecting with TLS certificate validation disabled \
+                         (no `source.tls:` block) — the connection is encrypted but the \
+                         server certificate is not verified (MITM not detected). Add \
+                         `source.tls: {{ mode: verify-full, ca_file: <ca.pem> }}` to enable \
+                         strict validation (or `mode: verify-ca` to skip only hostname checks)."
+                    );
+                });
+                config.trust_cert();
+            }
         }
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -200,6 +252,277 @@ impl MssqlSource {
     pub fn proxy_kind(&self) -> MssqlProxyKind {
         self.proxy_kind
     }
+
+    /// Declared `(precision, scale)` per decimal/numeric column, read from
+    /// `sys.columns`, for a simple single-table `SELECT … FROM [schema.]table`.
+    /// `None` for any query the FROM parser does not handle (joins, comma lists,
+    /// subqueries) or when the lookup fails — the schema builder then falls back
+    /// to data-inference, today's behaviour. Never fails the export: a lookup
+    /// error is logged (mirrors `pg_numeric_catalog_hints_opt`) and downgraded
+    /// to `None`.
+    fn mssql_decimal_catalog_hints_opt(
+        &mut self,
+        query: &str,
+    ) -> Option<HashMap<String, (u8, i8)>> {
+        let (schema, table) = parse_mssql_simple_from_table(query)?;
+        match self.fetch_mssql_decimal_catalog_hints(&schema, &table) {
+            Ok(m) => m,
+            Err(e) => {
+                // The parser identified a single-table query but the catalog
+                // lookup itself failed (permissions, gateway). Surface it —
+                // otherwise a downstream decimal scale-0 freeze on an all-NULL
+                // first batch looks like a config problem when the real cause is
+                // a missing `sys.columns` read here.
+                log::warn!(
+                    "mssql decimal catalog lookup failed for {schema}.{table} — decimal scale \
+                     will fall back to first-batch inference (declare it with a `columns:` \
+                     override if an all-NULL first batch truncates it): {e}"
+                );
+                None
+            }
+        }
+    }
+
+    /// Probe `sys.columns` for each `decimal`/`numeric` column's declared
+    /// `(precision, scale)`. Joined through `sys.schemas`/`sys.objects` so the
+    /// `(schema, table)` pair resolves the exact base table the export reads.
+    fn fetch_mssql_decimal_catalog_hints(
+        &mut self,
+        schema: &str,
+        table: &str,
+    ) -> Result<Option<HashMap<String, (u8, i8)>>> {
+        // `decimal` and `numeric` are synonyms in SQL Server and share one
+        // `sys.types` entry per scale; filter on the base type name so only
+        // fixed-point columns (not money / int / float) carry a hint.
+        let sql = format!(
+            "SELECT c.name, c.precision, c.scale \
+             FROM sys.columns c \
+             JOIN sys.types t ON t.user_type_id = c.user_type_id \
+             JOIN sys.objects o ON o.object_id = c.object_id \
+             JOIN sys.schemas s ON s.schema_id = o.schema_id \
+             WHERE s.name = N'{}' AND o.name = N'{}' \
+             AND t.name IN ('decimal', 'numeric')",
+            schema.replace('\'', "''"),
+            table.replace('\'', "''")
+        );
+        let Self { rt, client, .. } = self;
+        let rows = rt.block_on(async {
+            client
+                .query(sql.as_str(), &[])
+                .await
+                .map_err(|e| anyhow::anyhow!("mssql: sys.columns probe failed: {e}"))?
+                .into_first_result()
+                .await
+                .map_err(|e| anyhow::anyhow!("mssql: reading sys.columns rows failed: {e}"))
+        })?;
+
+        let mut map = HashMap::new();
+        for row in &rows {
+            // sys.columns: name = sysname (nvarchar), precision/scale = tinyint.
+            // `try_get` (not `get`) so an unexpected cell type downgrades to a
+            // skipped hint rather than panicking the export.
+            let name: Option<&str> = row.try_get(0).ok().flatten();
+            let precision: Option<u8> = row.try_get(1).ok().flatten();
+            let scale: Option<u8> = row.try_get(2).ok().flatten();
+            if let (Some(name), Some(p), Some(s)) = (name, precision, scale)
+                && let Some(pair) = catalog_decimal_to_params(p, s)
+            {
+                map.insert(name.to_string(), pair);
+            }
+        }
+
+        if map.is_empty() {
+            Ok(None)
+        } else {
+            log::debug!(
+                "mssql decimal catalog: resolved {} DECIMAL/NUMERIC column(s) for {schema}.{table}",
+                map.len(),
+            );
+            Ok(Some(map))
+        }
+    }
+}
+
+/// Convert `sys.columns` `(precision, scale)` into Rivet `decimal(p, s)`
+/// parameters, rejecting anything outside the bounds the YAML overrides accept.
+/// SQL Server caps precision at 38 and scale ≤ precision, so a well-formed
+/// catalog row always passes; the guard defends against a degenerate row.
+fn catalog_decimal_to_params(precision: u8, scale: u8) -> Option<(u8, i8)> {
+    if precision == 0 || precision > 38 {
+        return None;
+    }
+    if scale > precision || scale > i8::MAX as u8 {
+        return None;
+    }
+    Some((precision, scale as i8))
+}
+
+/// Extract the `(schema, table)` of a simple single-table T-SQL
+/// `SELECT … FROM [schema.]table` (no joins, no comma list, no subquery in
+/// `FROM`). Returns `None` for anything more complex — the caller falls back to
+/// data-inference rather than guessing. Schema defaults to `dbo` when the table
+/// is unqualified. Handles `[bracketed]` and bare identifiers; pure `&str`
+/// work, so it is unit-testable without a live server.
+fn parse_mssql_simple_from_table(query: &str) -> Option<(String, String)> {
+    let from_idx = mssql_find_outer_from_keyword(query)?;
+    let tail = trim_sql_ws(query.get(from_idx + 4..)?);
+    let (first, after1) = parse_mssql_ident_piece(tail)?;
+    let after1 = trim_sql_ws(after1);
+    // `schema.table` (optionally `db.schema.table` → take the last two parts).
+    let (schema, table, after) = if after1.starts_with('.') {
+        let (second, after2) = parse_mssql_ident_piece(trim_sql_ws(after1.get(1..)?))?;
+        let after2 = trim_sql_ws(after2);
+        if after2.starts_with('.') {
+            // db.schema.table — `first` is the database, drop it.
+            let (third, after3) = parse_mssql_ident_piece(trim_sql_ws(after2.get(1..)?))?;
+            (second, third, trim_sql_ws(after3))
+        } else {
+            (first, second, after2)
+        }
+    } else {
+        ("dbo".to_string(), first, after1)
+    };
+    // Reject joins / comma-lists / a trailing dotted continuation we didn't
+    // consume; only a clause boundary (WHERE/ORDER/…/end) or an alias may follow.
+    let after = skip_mssql_optional_alias(after)?;
+    if mssql_joins_or_comma(after) {
+        return None;
+    }
+    Some((schema, table))
+}
+
+fn trim_sql_ws(s: &str) -> &str {
+    s.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r'))
+}
+
+fn is_sql_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Case-insensitive keyword match at byte `idx` with identifier-boundary checks
+/// on both sides (so `from_x` does not match `from`).
+fn sql_keyword_at(haystack: &[u8], idx: usize, kw_lower: &[u8]) -> bool {
+    let n = kw_lower.len();
+    if idx + n > haystack.len() || !haystack[idx..idx + n].eq_ignore_ascii_case(kw_lower) {
+        return false;
+    }
+    let before_ok = idx == 0 || !is_sql_ident_byte(haystack[idx - 1]);
+    let after_ok = idx + n >= haystack.len() || !is_sql_ident_byte(haystack[idx + n]);
+    before_ok && after_ok
+}
+
+/// Byte offset of the top-level `FROM`, skipping nested parentheses
+/// (subqueries) and `'…'` string literals (with `''` escapes).
+fn mssql_find_outer_from_keyword(sql: &str) -> Option<usize> {
+    let b = sql.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0usize;
+    let mut in_quote = false;
+    while i < b.len() {
+        if in_quote {
+            if b[i] == b'\'' {
+                if i + 1 < b.len() && b[i + 1] == b'\'' {
+                    i += 2;
+                } else {
+                    in_quote = false;
+                    i += 1;
+                }
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        match b[i] {
+            b'\'' => in_quote = true,
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 && sql_keyword_at(b, i, b"from") => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parse one T-SQL identifier piece: `[bracketed name]` (with `]]` escapes) or
+/// a bare `ident`. Returns the unquoted name and the remaining tail.
+fn parse_mssql_ident_piece(rest: &str) -> Option<(String, &str)> {
+    let rest = trim_sql_ws(rest);
+    if let Some(after_open) = rest.strip_prefix('[') {
+        let mut out = String::new();
+        let mut chars = after_open.chars();
+        while let Some(ch) = chars.next() {
+            if ch == ']' {
+                if chars.as_str().starts_with(']') {
+                    chars.next();
+                    out.push(']');
+                    continue;
+                }
+                return Some((out, chars.as_str()));
+            }
+            out.push(ch);
+        }
+        return None; // unterminated bracket
+    }
+    let bytes = rest.as_bytes();
+    if bytes.is_empty() || (!bytes[0].is_ascii_alphabetic() && bytes[0] != b'_') {
+        return None;
+    }
+    let mut i = 1usize;
+    while i < bytes.len() && is_sql_ident_byte(bytes[i]) {
+        i += 1;
+    }
+    Some((rest.get(0..i)?.to_string(), rest.get(i..)?))
+}
+
+/// `true` when a join / comma-list follows the relation — the parser rejects
+/// these (catalog hints only resolve for a single base table).
+fn mssql_joins_or_comma(rest: &str) -> bool {
+    let r = trim_sql_ws(rest);
+    if r.starts_with(',') || r.starts_with('.') {
+        return true;
+    }
+    let b = r.as_bytes();
+    ["inner", "left", "right", "full", "cross", "join"]
+        .iter()
+        .any(|kw| sql_keyword_at(b, 0, kw.as_bytes()))
+}
+
+/// Consume an optional table alias (`[AS] alias`) after the relation, stopping
+/// at a clause boundary. Returns the tail after the alias, or `None` if what
+/// follows is a join/comma (so the caller rejects the query).
+fn skip_mssql_optional_alias(rest: &str) -> Option<&str> {
+    let rest = trim_sql_ws(rest);
+    if rest.is_empty() || mssql_starts_clause_boundary(rest) || mssql_joins_or_comma(rest) {
+        return Some(rest);
+    }
+    let mut rest = rest;
+    if sql_keyword_at(rest.as_bytes(), 0, b"as") {
+        rest = trim_sql_ws(rest.get(2..)?);
+    }
+    let (_, tail) = parse_mssql_ident_piece(rest)?;
+    Some(trim_sql_ws(tail))
+}
+
+fn mssql_starts_clause_boundary(rest: &str) -> bool {
+    let r = trim_sql_ws(rest);
+    if r.is_empty() {
+        return true;
+    }
+    const KWS: &[&[u8]] = &[
+        b"where",
+        b"group",
+        b"having",
+        b"order",
+        b"union",
+        b"except",
+        b"intersect",
+        b"for",
+        b"option",
+        b"offset",
+    ];
+    let b = r.as_bytes();
+    KWS.iter().any(|kw| sql_keyword_at(b, 0, kw))
 }
 
 impl Source for MssqlSource {
@@ -233,6 +556,14 @@ impl Source for MssqlSource {
         let stmt_timeout = (request.tuning.statement_timeout_s > 0)
             .then(|| std::time::Duration::from_secs(request.tuning.statement_timeout_s));
 
+        // Resolve declared decimal precision/scale from `sys.columns` for the
+        // *unwrapped* base query (the chunk/keyset wrapper hides the source
+        // table from the FROM parser, so resolve from the base — same restriction
+        // as PG's catalog hints). `None` ⇒ not a simple single-table SELECT, so
+        // the schema builder falls back to data-inference, today's behaviour.
+        let hint_query = request.catalog_hint_query.unwrap_or(request.query);
+        let decimal_hints = self.mssql_decimal_catalog_hints_opt(hint_query);
+
         // Record that we are about to mutate session state so `Drop` resets it
         // (Epic 18 B2). Set before the disjoint-borrow destructure below.
         if lock_timeout_ms > 0 {
@@ -260,6 +591,10 @@ impl Source for MssqlSource {
             let mut columns: Vec<tiberius::Column> = Vec::new();
             let mut buf: Vec<tiberius::Row> = Vec::with_capacity(ctl.target());
             let mut schema: Option<SchemaRef> = None;
+            // Per-value ceiling (MB→bytes; `0`/None disables), enforced
+            // pre-allocation inside the batch builder so an oversized cell bails
+            // before Arrow reserves the buffer. Same source of truth as the sink.
+            let max_value_bytes = request.tuning.max_value_bytes();
 
             while let Some(item) = stream
                 .try_next()
@@ -269,13 +604,14 @@ impl Source for MssqlSource {
                 if let Some(budget) = stmt_timeout
                     && started.elapsed() > budget
                 {
-                    anyhow::bail!(
-                        "mssql: statement timeout after {}s (tuning.statement_timeout_s) — \
-                         this query cannot finish within the budget; split it with \
-                         `mode: chunked` (per-chunk statements stay under the limit) or \
-                         raise `tuning.statement_timeout_s`",
-                        budget.as_secs()
-                    );
+                    // Typed marker (not a bare string): the retry classifier
+                    // downcasts the TYPE → permanent, so a reworded message can
+                    // never silently make this deterministic timeout retryable.
+                    // Its Display carries the same actionable hint for the user.
+                    return Err(crate::source::StatementDurationTimeout::mssql(
+                        budget.as_secs(),
+                    )
+                    .into());
                 }
                 match item {
                     // A single SELECT yields one metadata token (the column
@@ -287,8 +623,15 @@ impl Source for MssqlSource {
                     QueryItem::Row(row) => {
                         buf.push(row);
                         if buf.len() >= ctl.target() {
-                            let arrow_bytes =
-                                emit_mssql_batch(&columns, &overrides, &mut schema, &buf, sink)?;
+                            let arrow_bytes = emit_mssql_batch(
+                                &columns,
+                                &overrides,
+                                decimal_hints.as_ref(),
+                                &mut schema,
+                                &buf,
+                                sink,
+                                max_value_bytes,
+                            )?;
                             let n = buf.len();
                             buf.clear();
                             // First batch: cap to a memory target now that the
@@ -327,7 +670,15 @@ impl Source for MssqlSource {
             // `ORDER BY` order, so the last batch's last row carries the max
             // cursor the sink extracts.
             if !buf.is_empty() || schema.is_none() {
-                emit_mssql_batch(&columns, &overrides, &mut schema, &buf, sink)?;
+                emit_mssql_batch(
+                    &columns,
+                    &overrides,
+                    decimal_hints.as_ref(),
+                    &mut schema,
+                    &buf,
+                    sink,
+                    max_value_bytes,
+                )?;
             }
             Ok::<_, anyhow::Error>(())
         })?;
@@ -395,26 +746,28 @@ impl Source for MssqlSource {
 }
 
 /// Emit one Arrow batch from `rows`, building (and emitting) the schema on the
-/// first call and reusing it thereafter. Decimal scales are recovered from the
-/// data — tiberius drops a column's declared precision/scale — so the first
-/// batch must carry each decimal column's first non-null value (true for every
-/// table in practice; a decimal column NULL for the whole first batch falls back
-/// to scale 0, same as the pre-streaming behaviour on an all-null column).
+/// first call and reusing it thereafter. tiberius drops a decimal column's
+/// declared precision/scale, so the scale is recovered from the `decimal_hints`
+/// catalog lookup (the upstream, lossless source that survives an all-NULL
+/// first batch); only an expression/computed column with no catalog entry falls
+/// back to inferring the scale from the first batch's data.
 ///
 /// Returns the emitted batch's Arrow memory footprint (bytes), so the export
 /// loop can size the memory cap from the real row width; `0` for an empty batch.
 fn emit_mssql_batch(
     columns: &[tiberius::Column],
     overrides: &ColumnOverrides,
+    decimal_hints: Option<&HashMap<String, (u8, i8)>>,
     schema: &mut Option<SchemaRef>,
     rows: &[tiberius::Row],
     sink: &mut dyn BatchSink,
+    max_value_bytes: Option<usize>,
 ) -> Result<usize> {
     let schema_ref = match schema {
         Some(s) => s.clone(),
         None => {
             let (built, _decoders) =
-                arrow_convert::mssql_columns_to_schema(columns, overrides, rows)?;
+                arrow_convert::mssql_columns_to_schema(columns, overrides, rows, decimal_hints)?;
             let s: SchemaRef = Arc::new(built);
             sink.on_schema(s.clone())?;
             *schema = Some(s.clone());
@@ -422,7 +775,7 @@ fn emit_mssql_batch(
         }
     };
     if !rows.is_empty() {
-        let batch = arrow_convert::mssql_rows_to_record_batch(&schema_ref, rows)?;
+        let batch = arrow_convert::mssql_rows_to_record_batch(&schema_ref, rows, max_value_bytes)?;
         let bytes = crate::tuning::SourceTuning::batch_memory_bytes(&batch);
         sink.on_batch(&batch)?;
         return Ok(bytes);
@@ -570,4 +923,97 @@ pub(crate) fn introspect_mssql_table_for_chunking(
         row_estimate,
         avg_row_bytes: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{catalog_decimal_to_params, parse_mssql_simple_from_table};
+
+    fn parse(q: &str) -> Option<(String, String)> {
+        parse_mssql_simple_from_table(q)
+    }
+
+    #[test]
+    fn parse_unqualified_table_defaults_to_dbo() {
+        assert_eq!(
+            parse("SELECT id, amount FROM transactions ORDER BY id"),
+            Some(("dbo".into(), "transactions".into()))
+        );
+    }
+
+    #[test]
+    fn parse_schema_qualified() {
+        assert_eq!(
+            parse("SELECT id FROM sales.orders WHERE id > 1"),
+            Some(("sales".into(), "orders".into()))
+        );
+    }
+
+    #[test]
+    fn parse_db_schema_table_takes_last_two() {
+        assert_eq!(
+            parse("SELECT * FROM mydb.sales.orders"),
+            Some(("sales".into(), "orders".into()))
+        );
+    }
+
+    #[test]
+    fn parse_bracketed_identifiers() {
+        assert_eq!(
+            parse("SELECT * FROM [my schema].[order items]"),
+            Some(("my schema".into(), "order items".into()))
+        );
+    }
+
+    #[test]
+    fn parse_table_with_alias() {
+        assert_eq!(
+            parse("SELECT t.id FROM transactions AS t WHERE t.x = 1"),
+            Some(("dbo".into(), "transactions".into()))
+        );
+        assert_eq!(
+            parse("SELECT t.id FROM transactions t ORDER BY t.id"),
+            Some(("dbo".into(), "transactions".into()))
+        );
+    }
+
+    #[test]
+    fn parse_rejects_join() {
+        assert_eq!(parse("SELECT * FROM a INNER JOIN b ON a.id = b.id"), None);
+        assert_eq!(parse("SELECT * FROM a JOIN b ON a.id = b.id"), None);
+    }
+
+    #[test]
+    fn parse_rejects_comma_list() {
+        assert_eq!(parse("SELECT * FROM a, b WHERE a.id = b.id"), None);
+    }
+
+    #[test]
+    fn parse_rejects_subquery_from() {
+        assert_eq!(parse("SELECT * FROM (SELECT * FROM t) AS s"), None);
+    }
+
+    #[test]
+    fn parse_ignores_from_inside_string_literal() {
+        // The first top-level FROM is the real one, not the literal's bytes.
+        assert_eq!(
+            parse("SELECT 'from x', amount FROM ledger WHERE note = 'paid from cash'"),
+            Some(("dbo".into(), "ledger".into()))
+        );
+    }
+
+    #[test]
+    fn catalog_bounds_accept_well_formed_and_reject_degenerate() {
+        // DECIMAL(10,2) — the bug's column — rides through losslessly.
+        assert_eq!(catalog_decimal_to_params(10, 2), Some((10, 2)));
+        // SQL Server max precision.
+        assert_eq!(catalog_decimal_to_params(38, 0), Some((38, 0)));
+        assert_eq!(catalog_decimal_to_params(38, 38), Some((38, 38)));
+        // Degenerate rows are rejected (defends against a corrupt catalog row),
+        // so the builder falls back to data-inference rather than emitting a
+        // nonsensical decimal type.
+        assert_eq!(catalog_decimal_to_params(0, 0), None);
+        assert_eq!(catalog_decimal_to_params(39, 0), None);
+        assert_eq!(catalog_decimal_to_params(10, 11), None);
+    }
 }

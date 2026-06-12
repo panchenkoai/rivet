@@ -358,7 +358,13 @@ impl RunSummary {
         };
 
         use std::io::Write;
-        let mut buf = block;
+        // V9 (CWE-150): the block embeds error_message, which can carry
+        // attacker-controlled ANSI/OSC escapes from a malicious source DB. The
+        // single-export path reaches the operator terminal here (the parallel
+        // renderer sanitises separately). Funnel the whole block through the
+        // shared sanitiser before write — it preserves the renderer's own
+        // multi-byte glyphs (✓/✗/──) and strips only C0/C1/DEL control bytes.
+        let mut buf = super::parent_ui::sanitize_terminal(&block);
         buf.push('\n');
         let stderr = std::io::stderr();
         let mut handle = stderr.lock();
@@ -446,6 +452,27 @@ impl RunSummary {
 
         rows.push(("rows", fmt_thousands(self.total_rows)));
         rows.push(("files", fmt_thousands(self.files_produced as i64)));
+        // On a 0-new incremental run, `0 rows  0 files` alone hides *why*
+        // nothing moved. Surface the cursor position as its own line so the
+        // operator sees the incremental boundary held — not just an empty run.
+        // The cursor *value* lives in the runner and isn't plumbed onto the
+        // summary yet, so this reports the column-level position derived from
+        // `skip_reason` (the value is a follow-up once it reaches here).
+        if let Some(pos) = incremental_position_line(self.skip_reason.as_deref()) {
+            rows.push(("cursor", pos));
+        } else if let Some(window) = time_window_skip_line(&self.mode, self.skip_reason.as_deref())
+        {
+            // A time_window run that returned 0 rows reports the generic
+            // `"source returned 0 rows"` skip (`cursor_column()` is `None` for
+            // this strategy), so the incremental branch above never fires. Add
+            // an explicit `window:` line so the operator can tell an *empty
+            // window* apart from a *wrong column / window* — otherwise the
+            // summary is indistinguishable from any other empty run. The window
+            // column / days / computed bound are not plumbed onto `RunSummary`,
+            // so this is the strategy-level signal reachable here (the concrete
+            // bound is a follow-up once the runner records it on the summary).
+            rows.push(("window", window));
+        }
         if self.bytes_written > 0 {
             rows.push(("bytes", format_bytes(self.bytes_written)));
         }
@@ -513,12 +540,12 @@ impl RunSummary {
             rows.push(("reconcile", value));
         }
         if let Some(err) = &self.error_message {
-            // Multi-line errors (e.g. `parallel checkpoint worker errors:\n
-            // chunk 4: …\nchunk 5: …`) wreak havoc on the indented block
-            // because `format_block` only knows how to indent the first
-            // line.  Collapse them to a compact single-line cause; the full
-            // multi-line text is already in the structured logs above.
-            rows.push(("error", compact_error(err)));
+            // Preserve the error's own line structure: the detailed block has
+            // room for it and `format_block` now indents continuation lines
+            // under the value column. Flattening to `"; "`-joined text (the
+            // compact one-liner's job) made multi-line errors — e.g. a quality
+            // failure's `failed:\n  - <check>\n  Fix …` — hard to read here.
+            rows.push(("error", err.trim_end().to_string()));
         }
 
         format_block(&self.export_name, &rows)
@@ -620,6 +647,44 @@ fn compact_error(raw: &str) -> String {
     clamp_chars(&collapsed, MAX_CHARS)
 }
 
+/// Derive the summary block's `cursor:` line from a `skip_reason`.
+///
+/// `skip_reason` for an incremental no-op is `"no new rows since cursor
+/// '<col>'"` (set by the runner); we lift the column out and report the
+/// position as held. Returns `None` for the non-cursor `"source returned 0
+/// rows"` skip and for `None` (a run that actually produced rows). The cursor
+/// *value* isn't carried on the summary yet, so this is column-level only.
+fn incremental_position_line(skip_reason: Option<&str>) -> Option<String> {
+    let col = skip_reason?
+        .strip_prefix("no new rows since cursor '")?
+        .strip_suffix('\'')?;
+    Some(format!("'{col}' unchanged (no new rows this run)"))
+}
+
+/// Derive the summary block's `window:` line for a time_window run that
+/// returned nothing.
+///
+/// A `TimeWindow` strategy has no cursor column, so a 0-row run reports the
+/// generic `"source returned 0 rows"` skip — the `incremental_position_line`
+/// branch never fires and, without this line, an empty time window looks
+/// identical to any other empty export. Surfacing it lets the operator tell an
+/// *empty window* (data simply outside the rolling range) from a *misconfigured
+/// window* (wrong `time_column` / `days_window`).
+///
+/// Keyed on `mode == "timewindow"` (set from `ExtractionStrategy::mode_label`)
+/// plus a set skip reason, so it only fires on a skipped time_window run and
+/// never on incremental/snapshot/chunked/keyset. The window column, days, and
+/// computed lower bound are not carried on `RunSummary`, so this reports the
+/// strategy-level fact and where to look — the concrete bound is a follow-up
+/// once the runner records it onto the summary.
+fn time_window_skip_line(mode: &str, skip_reason: Option<&str>) -> Option<String> {
+    skip_reason?;
+    if mode != "timewindow" {
+        return None;
+    }
+    Some("rolling time window matched no rows — check `time_column`/`days_window`".to_string())
+}
+
 fn summarize_parallel_chunk_errors(raw: &str) -> Option<String> {
     let header_pos = raw.find("parallel checkpoint worker errors:")?;
     let prefix = raw[..header_pos].trim_end_matches(": ").trim_end();
@@ -678,15 +743,26 @@ fn format_block(name: &str, rows: &[(&str, String)]) -> String {
         out.push('─');
     }
     out.push('\n');
+    // Continuation lines of a multi-line value (e.g. the multi-line `error`
+    // row) are indented to align under the value column, so block-shaped
+    // messages stay readable instead of being flattened onto one line.
+    let value_indent = " ".repeat(2 + (label_w + 1) + 2);
     for (label, value) in rows {
         // `label_w + 1` so the colon stays attached to the label and the
         // value column starts uniformly two spaces after it.
+        let mut lines = value.split('\n');
+        let first = lines.next().unwrap_or("");
         out.push_str(&format!(
             "  {:<width$}  {}\n",
             format!("{label}:"),
-            value,
+            first,
             width = label_w + 1
         ));
+        for cont in lines {
+            out.push_str(&value_indent);
+            out.push_str(cont);
+            out.push('\n');
+        }
     }
     out
 }
@@ -999,5 +1075,190 @@ mod tests {
             line
         );
         assert!(!line.contains('\n'), "single line: {:?}", line);
+    }
+
+    fn plan_for(export_name: &str) -> crate::plan::ResolvedRunPlan {
+        use crate::plan::{
+            CompressionType, DestinationConfig, DestinationType, ExtractionStrategy, FormatType,
+            MetaColumns, ResolvedRunPlan,
+        };
+        use crate::tuning::SourceTuning;
+        ResolvedRunPlan {
+            export_name: export_name.into(),
+            base_query: "SELECT 1".into(),
+            strategy: ExtractionStrategy::Snapshot,
+            format: FormatType::Parquet,
+            compression: CompressionType::default(),
+            compression_level: None,
+            max_file_size_bytes: None,
+            skip_empty: false,
+            meta_columns: MetaColumns::default(),
+            destination: DestinationConfig {
+                destination_type: DestinationType::Local,
+                path: Some("./out".into()),
+                ..Default::default()
+            },
+            quality: None,
+            tuning: SourceTuning::from_config(None),
+            tuning_profile_label: "balanced (default)".into(),
+            validate: false,
+            reconcile: false,
+            resume: false,
+            source: crate::config::SourceConfig {
+                source_type: crate::config::SourceType::Postgres,
+                url: Some("postgresql://localhost/test".into()),
+                url_env: None,
+                url_file: None,
+                host: None,
+                port: None,
+                user: None,
+                password: None,
+                password_env: None,
+                database: None,
+                environment: None,
+                tuning: None,
+                tls: None,
+            },
+            column_overrides: Default::default(),
+            verify: crate::config::VerifyMode::Size,
+            schema_drift_policy: Default::default(),
+            shape_drift_warn_factor: 2.0,
+            parquet: None,
+        }
+    }
+
+    #[test]
+    fn render_preserves_multiline_error_block() {
+        // L19: a multi-line error (a quality failure here) must stay multi-line
+        // in the detailed single-export block — not collapsed to `"; "`-joined
+        // text the way the compact one-liner does.
+        let mut s = RunSummary::new(&plan_for("orders"));
+        s.status = "failed".into();
+        s.error_message = Some(
+            "export 'orders': 1 quality check(s) failed:\n  \
+             - row_count 10 below minimum 999999\n  \
+             Fix the source data, or adjust the thresholds under `quality:` in your config."
+                .to_string(),
+        );
+
+        let block = s.render();
+        // The collapsed form joined lines with `"; "` — assert that flattening
+        // is gone and the original newline structure survives.
+        assert!(
+            !block.contains("failed:;"),
+            "error must not be '; '-flattened in the detailed block: {block}"
+        );
+        assert!(
+            block.contains("- row_count 10 below minimum 999999"),
+            "failing check line present: {block}"
+        );
+        // Each part of the multi-line error lands on its own line.
+        let err_lines: Vec<&str> = block
+            .lines()
+            .filter(|l| {
+                l.contains("quality check(s) failed")
+                    || l.contains("row_count 10 below minimum")
+                    || l.contains("Fix the source data")
+            })
+            .collect();
+        assert_eq!(
+            err_lines.len(),
+            3,
+            "all three error lines should render on separate lines: {block}"
+        );
+        // Continuation lines are indented under the value column, not at col 0.
+        for l in &err_lines {
+            assert!(l.starts_with(' '), "error line should be indented: {l:?}");
+        }
+    }
+
+    #[test]
+    fn render_surfaces_cursor_position_on_zero_new_incremental() {
+        // L27: a 0-new incremental run shows `0 rows  0 files`; without a
+        // cursor line the operator can't tell the boundary held. Assert the
+        // dedicated `cursor:` line appears, derived from `skip_reason`.
+        let mut s = RunSummary::new(&plan_for("orders"));
+        s.status = "skipped".into();
+        s.skip_reason = Some("no new rows since cursor 'updated_at'".into());
+
+        let block = s.render();
+        let cursor_line = block
+            .lines()
+            .find(|l| l.trim_start().starts_with("cursor:"))
+            .unwrap_or_else(|| panic!("expected a cursor: line in block: {block}"));
+        assert!(
+            cursor_line.contains("'updated_at'"),
+            "cursor line names the column: {cursor_line:?}"
+        );
+        assert!(
+            cursor_line.contains("unchanged"),
+            "cursor line reports the position held: {cursor_line:?}"
+        );
+    }
+
+    #[test]
+    fn incremental_position_line_only_for_cursor_skips() {
+        // The non-cursor 0-row skip and the no-skip case produce no cursor line.
+        assert_eq!(
+            incremental_position_line(Some("no new rows since cursor 'ts'")),
+            Some("'ts' unchanged (no new rows this run)".into())
+        );
+        assert_eq!(
+            incremental_position_line(Some("source returned 0 rows")),
+            None
+        );
+        assert_eq!(incremental_position_line(None), None);
+    }
+
+    #[test]
+    fn render_surfaces_window_position_on_zero_row_time_window() {
+        // L27 (time_window arm): a 0-row time_window run reports the generic
+        // `"source returned 0 rows"` skip (the strategy has no cursor column),
+        // so the `cursor:` branch never fires. Without a `window:` line the
+        // operator can't tell an empty window from a wrong column/window —
+        // assert the dedicated `window:` line appears for this mode.
+        let mut s = RunSummary::new(&plan_for("events"));
+        s.status = "skipped".into();
+        s.mode = "timewindow".into();
+        s.skip_reason = Some("source returned 0 rows".into());
+
+        let block = s.render();
+        let window_line = block
+            .lines()
+            .find(|l| l.trim_start().starts_with("window:"))
+            .unwrap_or_else(|| panic!("expected a window: line in block: {block}"));
+        assert!(
+            window_line.contains("matched no rows"),
+            "window line reports the empty window: {window_line:?}"
+        );
+        assert!(
+            window_line.contains("time_column") && window_line.contains("days_window"),
+            "window line points at the window config to check: {window_line:?}"
+        );
+        // The generic 0-row skip must not also produce a `cursor:` line.
+        assert!(
+            !block.lines().any(|l| l.trim_start().starts_with("cursor:")),
+            "no cursor line for a non-cursor strategy: {block}"
+        );
+    }
+
+    #[test]
+    fn time_window_skip_line_only_for_skipped_time_window() {
+        // Fires only when the run skipped AND the strategy is time_window.
+        assert_eq!(
+            time_window_skip_line("timewindow", Some("source returned 0 rows")),
+            Some("rolling time window matched no rows — check `time_column`/`days_window`".into())
+        );
+        // Wrong mode → no window line (incremental/snapshot handle their own).
+        assert_eq!(
+            time_window_skip_line("incremental", Some("source returned 0 rows")),
+            None
+        );
+        assert_eq!(
+            time_window_skip_line("full", Some("source returned 0 rows")),
+            None
+        );
+        // A time_window run that produced rows (no skip) gets no window line.
+        assert_eq!(time_window_skip_line("timewindow", None), None);
     }
 }

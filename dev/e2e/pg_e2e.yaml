@@ -80,20 +80,17 @@ exports:
       path: ./dev/e2e/output
 
   # --- Compression variants ---
+  # NOTE: `format: csv` + `compression:` is rejected at config-load (the CSV
+  # writer has no compression encoder, so the codec would be a silent no-op the
+  # manifest then lies about — see src/config/mod.rs::check_csv_compression).
+  # The rejection is asserted as a negative test in run_e2e.sh ("PG csv+gzip
+  # rejected"); it MUST NOT live as an export here, or the whole config fails to
+  # parse and every PG operation in the suite dies before touching the database.
   - name: pg_users_zstd
     query: "SELECT id, name, email FROM users"
     mode: full
     format: parquet
     compression: zstd
-    destination:
-      type: local
-      path: ./dev/e2e/output
-
-  - name: pg_users_gzip_csv
-    query: "SELECT id, name, email FROM users"
-    mode: full
-    format: csv
-    compression: gzip
     destination:
       type: local
       path: ./dev/e2e/output

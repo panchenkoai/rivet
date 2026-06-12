@@ -20,7 +20,7 @@
 //! keyset key), which the loop reads to advance to the next page.
 
 use super::manifest_writer;
-use super::{RunSummary, sink::ExportSink, validate::validate_output};
+use super::{RunSummary, sink::ExportSink};
 use crate::config::IncrementalCursorMode;
 use crate::error::Result;
 use crate::plan::{ExtractionStrategy, IncrementalCursorPlan, KeysetPlan, ResolvedRunPlan};
@@ -98,14 +98,9 @@ pub(crate) fn run_keyset(
         }
         summary.total_rows += rows as i64;
 
-        if plan.validate {
-            validate_output(sink.tmp.path(), plan.format, rows)?;
-            summary.validated = Some(true);
-        }
-
         let fmt =
             format::create_format(plan.format, plan.compression, plan.compression_level, None);
-        let file_name = format!(
+        let base = format!(
             "{}_{}_keyset{}.{}",
             plan.export_name,
             chrono::Utc::now().format("%Y%m%d_%H%M%S"),
@@ -114,17 +109,29 @@ pub(crate) fn run_keyset(
         );
         let dest = destination::create_destination(&plan.destination)?;
         // Shared commit path (I1→I2→I7 + counters + journal + fault hooks).
-        let rec =
-            super::commit::write_part_file(dest.as_ref(), sink.tmp.path(), rows as i64, file_name)?;
-        super::commit::record_part(
-            plan,
-            summary,
-            state,
-            &rec,
-            super::commit::PartKind::Page {
-                page_index: pages as i64,
-            },
-        );
+        // write_sink_parts drains every part the sink produced — the final
+        // temp file plus anything maybe_split rotated at max_file_size — so
+        // rotation cannot drop data.
+        let recs = super::commit::write_sink_parts(
+            dest.as_ref(),
+            &mut sink,
+            plan.validate.then_some(plan.format),
+            |idx, count| super::commit::part_indexed_name(&base, idx, count),
+        )?;
+        if plan.validate {
+            summary.validated = Some(true);
+        }
+        for rec in &recs {
+            super::commit::record_part(
+                plan,
+                summary,
+                state,
+                rec,
+                super::commit::PartKind::Page {
+                    page_index: pages as i64,
+                },
+            );
+        }
         log::info!(
             "export '{}': keyset page {} — {} rows",
             plan.export_name,

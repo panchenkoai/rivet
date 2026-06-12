@@ -17,12 +17,85 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 
 use crate::error::Result;
-use crate::state::{RunAggregate, RunAggregateEntry, StateStore};
+use crate::state::{ExportMetric, RunAggregate, RunAggregateEntry, StateStore};
 
 use super::summary::RunSummary;
 use super::{format_bytes, strip_chunked_recovery_hint};
+
+/// Machine-readable view of one `export_metrics` row for `rivet metrics --json`.
+///
+/// `ExportMetric` (the internal `state` row) derives only `Debug`, so this DTO
+/// is the stable on-the-wire contract — decoupled from the storage struct the
+/// same way [`super::report::RunReport`] is decoupled from `RunSummary`, so the
+/// JSON schema can evolve independently of column layout.  Field names mirror
+/// the `export_metrics` columns; `Option` fields are emitted as JSON `null`
+/// (kept, not skipped) so consumers see a fixed-shape object every row.
+///
+/// `dead_code`-allowed because the only production caller — the `rivet metrics
+/// --json` flag dispatch — is added in a later wave (the CLI arg lives in
+/// `cli.rs`/`args.rs`); this serialization layer lands first so wiring the flag
+/// is a one-liner.  Exercised today by the module's unit tests.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct MetricRowJson {
+    pub export_name: String,
+    pub run_id: Option<String>,
+    pub run_at: String,
+    pub duration_ms: i64,
+    pub total_rows: i64,
+    pub peak_rss_mb: Option<i64>,
+    pub status: String,
+    pub error_message: Option<String>,
+    pub tuning_profile: Option<String>,
+    pub format: Option<String>,
+    pub mode: Option<String>,
+    pub files_produced: i64,
+    pub bytes_written: i64,
+    pub retries: i64,
+    pub validated: Option<bool>,
+    pub schema_changed: Option<bool>,
+}
+
+impl From<&ExportMetric> for MetricRowJson {
+    fn from(m: &ExportMetric) -> Self {
+        Self {
+            export_name: m.export_name.clone(),
+            run_id: m.run_id.clone(),
+            run_at: m.run_at.clone(),
+            duration_ms: m.duration_ms,
+            total_rows: m.total_rows,
+            peak_rss_mb: m.peak_rss_mb,
+            status: m.status.clone(),
+            error_message: m.error_message.clone(),
+            tuning_profile: m.tuning_profile.clone(),
+            format: m.format.clone(),
+            mode: m.mode.clone(),
+            files_produced: m.files_produced,
+            bytes_written: m.bytes_written,
+            retries: m.retries,
+            validated: m.validated,
+            schema_changed: m.schema_changed,
+        }
+    }
+}
+
+/// Render metric rows as a pretty-printed JSON array for `rivet metrics --json`.
+///
+/// An empty slice renders as `[]` (not an error, not the human-table's
+/// "No metrics recorded yet." text) so machine consumers always parse a valid
+/// JSON array.  The caller is responsible for the `--config` existence check
+/// (finding #9) before reaching here — this function is pure formatting.
+///
+/// `dead_code`-allowed until the `rivet metrics --json` flag dispatch (a later
+/// wave, in the off-limits `cli.rs`/`args.rs`) calls it.
+#[allow(dead_code)]
+pub(super) fn metrics_to_json(metrics: &[ExportMetric]) -> Result<String> {
+    let rows: Vec<MetricRowJson> = metrics.iter().map(MetricRowJson::from).collect();
+    serde_json::to_string_pretty(&rows).map_err(|e| anyhow::anyhow!("serde_json: {:#}", e))
+}
 
 /// Convert a per-export summary into an aggregate row.
 pub(super) fn entry_from_summary(s: &RunSummary) -> RunAggregateEntry {
@@ -419,6 +492,86 @@ mod tests {
         let s = "αβγδ".repeat(100); // multibyte unicode, 400 chars
         let t = truncate(&s, 10);
         assert_eq!(t.chars().count(), 11); // 10 + ellipsis
+    }
+
+    fn metric(name: &str, status: &str) -> ExportMetric {
+        ExportMetric {
+            export_name: name.into(),
+            run_id: Some(format!("{name}_run")),
+            run_at: "2026-06-09T12:00:00+00:00".into(),
+            duration_ms: 1500,
+            total_rows: 42,
+            peak_rss_mb: Some(64),
+            status: status.into(),
+            error_message: if status == "failed" {
+                Some("boom".into())
+            } else {
+                None
+            },
+            tuning_profile: Some("balanced".into()),
+            format: Some("parquet".into()),
+            mode: Some("full".into()),
+            files_produced: 2,
+            bytes_written: 4096,
+            retries: 1,
+            validated: Some(true),
+            schema_changed: Some(false),
+        }
+    }
+
+    #[test]
+    fn metrics_to_json_empty_is_valid_array() {
+        let json = metrics_to_json(&[]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.is_array(), "empty metrics must serialize as []");
+        assert_eq!(parsed.as_array().unwrap().len(), 0);
+        // Must NOT leak the human-table sentinel into the machine contract.
+        assert!(!json.contains("No metrics recorded yet"));
+    }
+
+    #[test]
+    fn metrics_to_json_carries_all_fields() {
+        let json =
+            metrics_to_json(&[metric("orders", "success"), metric("users", "failed")]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let rows = parsed.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+
+        let first = &rows[0];
+        // Every column of `export_metrics` is present under its column name.
+        for key in [
+            "export_name",
+            "run_id",
+            "run_at",
+            "duration_ms",
+            "total_rows",
+            "peak_rss_mb",
+            "status",
+            "error_message",
+            "tuning_profile",
+            "format",
+            "mode",
+            "files_produced",
+            "bytes_written",
+            "retries",
+            "validated",
+            "schema_changed",
+        ] {
+            assert!(
+                first.get(key).is_some(),
+                "metrics JSON row must carry `{key}`; got {first}"
+            );
+        }
+        assert_eq!(first["export_name"], "orders");
+        assert_eq!(first["status"], "success");
+        assert_eq!(first["total_rows"], 42);
+        assert_eq!(first["files_produced"], 2);
+        assert_eq!(first["validated"], true);
+        // `None` fields are emitted as JSON null (fixed shape, not skipped).
+        assert!(first["error_message"].is_null());
+        // The failed row carries its error message.
+        assert_eq!(rows[1]["status"], "failed");
+        assert_eq!(rows[1]["error_message"], "boom");
     }
 
     #[test]

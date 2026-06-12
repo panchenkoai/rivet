@@ -19,10 +19,7 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use super::super::{
-    RunSummary, progress::ChunkProgress, retry::classify_error, sink::ExportSink,
-    validate::validate_output,
-};
+use super::super::{RunSummary, progress::ChunkProgress, retry::classify_error, sink::ExportSink};
 use super::poison;
 use super::{
     ChunkSource, chunked_plan, config_hint, detect_and_generate_chunks,
@@ -211,7 +208,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                         plan_w.source.source_type,
                     );
 
-                    let result = (|| -> Result<(usize, Option<super::super::commit::PartRecord>)> {
+                    let result = (|| -> Result<(usize, Vec<super::super::commit::PartRecord>)> {
                         let mut last_err: Option<anyhow::Error> = None;
                         for attempt in 0..=plan_w.tuning.max_retries {
                             if attempt > 0 {
@@ -250,7 +247,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
 
                             let export_attempt = (|| -> Result<(
                                 usize,
-                                Option<super::super::commit::PartRecord>,
+                                Vec<super::super::commit::PartRecord>,
                             )> {
                                 thread_src.export(
                                     &source::ExportRequest::wrapped(
@@ -273,14 +270,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                         .set(crate::state::schema_fingerprint(&columns));
                                 }
                                 if sink.total_rows == 0 {
-                                    return Ok((0, None));
-                                }
-                                if plan_w.validate {
-                                    validate_output(
-                                        sink.tmp.path(),
-                                        plan_w.format,
-                                        sink.total_rows,
-                                    )?;
+                                    return Ok((0, Vec::new()));
                                 }
                                 let fmt = format::create_format(
                                     plan_w.format,
@@ -288,22 +278,25 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                     plan_w.compression_level,
                                     None,
                                 );
-                                let file_name = super::chunk_part_filename(
+                                let base = super::chunk_part_filename(
                                     &plan_w.export_name,
                                     chunk_index,
                                     fmt.file_extension(),
                                 );
                                 // Worker-safe half of commit (I1 + dest.write
-                                // + fingerprint). The parent drains the
-                                // resulting PartRecord through
+                                // + fingerprint), draining every part the sink
+                                // produced (max_file_size rotation included).
+                                // The parent drains each PartRecord through
                                 // commit::record_part post-scope.
-                                let rec = super::super::commit::write_part_file(
+                                let recs = super::super::commit::write_sink_parts(
                                     &**shared_destination,
-                                    sink.tmp.path(),
-                                    sink.total_rows as i64,
-                                    file_name,
+                                    &mut sink,
+                                    plan_w.validate.then_some(plan_w.format),
+                                    |idx, count| {
+                                        super::super::commit::part_indexed_name(&base, idx, count)
+                                    },
                                 )?;
-                                Ok((sink.total_rows, Some(rec)))
+                                Ok((sink.total_rows, recs))
                             })();
 
                             match export_attempt {
@@ -324,25 +317,27 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                     })();
 
                     match result {
-                        Ok((rows, part)) => {
+                        Ok((rows, parts)) => {
                             agg_rows.fetch_add(rows as i64, Ordering::Relaxed);
                             // Non-empty chunk: write file_log NOW (per-chunk
                             // durable manifest — the recovery flows in
                             // live_chunked_recovery.rs C3 read it after a
                             // mid-run crash to reconstruct the manifest) AND
-                            // push the PartRecord for the parent drain. The
+                            // push each PartRecord for the parent drain. The
                             // drain calls commit::record_part(state=None) so
                             // file_log is not double-written; manifest_parts +
                             // counters + journal still get populated for the
                             // cloud manifest M1 contract.
-                            let fname_for_state: Option<String> = if let Some(rec) = part {
-                                if let Some(name) = Some(rec.file_name.as_str()) {
-                                    match StateStore::open(&config_path_w) {
-                                        Ok(store) => {
+                            let fname_for_state: Option<String> = if parts.is_empty() {
+                                None
+                            } else {
+                                match StateStore::open(&config_path_w) {
+                                    Ok(store) => {
+                                        for rec in &parts {
                                             if let Err(e) = store.record_file(
                                                 run_id_arc.as_str(),
                                                 &plan_w.export_name,
-                                                name,
+                                                &rec.file_name,
                                                 rec.rows,
                                                 rec.bytes as i64,
                                                 fmt_label_w,
@@ -351,27 +346,33 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                                 log::warn!(
                                                     "export '{}': file_log write failed for parallel checkpoint chunk '{}' (file was produced): {:#}",
                                                     plan_w.export_name,
-                                                    name,
+                                                    rec.file_name,
                                                     e
                                                 );
                                             }
                                         }
-                                        Err(e) => {
-                                            log::warn!(
-                                                "export '{}': could not open state DB for file_log write of '{}': {:#}",
-                                                plan_w.export_name,
-                                                name,
-                                                e
-                                            );
-                                        }
+                                    }
+                                    Err(e) => {
+                                        log::warn!(
+                                            "export '{}': could not open state DB for file_log write of chunk {}: {:#}",
+                                            plan_w.export_name,
+                                            chunk_index,
+                                            e
+                                        );
                                     }
                                 }
-                                let name = rec.file_name.clone();
-                                poison::lock_recover(file_records)
-                                    .push((rec, chunk_index));
-                                Some(name)
-                            } else {
-                                None
+                                // chunk_task carries one file name; for a
+                                // rotation-split chunk store the first sibling.
+                                // The manifest records all siblings, so a
+                                // missing one fails destination verification
+                                // loudly instead of being silently skipped on
+                                // resume.
+                                let first = parts[0].file_name.clone();
+                                let mut records = poison::lock_recover(file_records);
+                                for rec in parts {
+                                    records.push((rec, chunk_index));
+                                }
+                                Some(first)
                             };
                             // Mirror of the sequential checkpoint hooks (search for
                             // `maybe_panic_at_chunk` in sequential_checkpoint.rs): same

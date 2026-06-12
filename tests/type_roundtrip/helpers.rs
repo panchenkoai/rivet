@@ -503,6 +503,9 @@ pub fn run_pg_matrix_export(table_name: &str, format: &str, out_dir: &Path) {
     } else {
         PG_MATRIX_COLUMNS
     };
+    // CSV has no compression encoder — rivet (correctly) refuses `csv + zstd`
+    // rather than silently drop the codec, so the CSV variant must use `none`.
+    let compression = if format == "csv" { "none" } else { "zstd" };
     let yaml = format!(
         r#"
 source:
@@ -515,7 +518,7 @@ exports:
       FROM {table_name} ORDER BY id
     mode: full
     format: {format}
-    compression: zstd
+    compression: {compression}
 {MATRIX_COLUMN_OVERRIDES_YAML}
     destination:
       type: local

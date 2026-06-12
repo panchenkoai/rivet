@@ -1,5 +1,6 @@
 mod artifact;
 mod candidates;
+mod mssql;
 mod mysql;
 mod postgres;
 mod yaml_scaffold;
@@ -180,12 +181,86 @@ pub(super) fn source_type(source_url: &str) -> Result<&'static str> {
         Ok("postgres")
     } else if source_url.starts_with("mysql") {
         Ok("mysql")
+    } else if source_url.starts_with("sqlserver") || source_url.starts_with("mssql") {
+        Ok("mssql")
     } else {
         anyhow::bail!(
-            "Unsupported source URL scheme. Expected postgresql:// or mysql://, got: {}",
+            "Unsupported source URL scheme. Expected postgresql://, mysql://, or sqlserver://, got: {}",
             source_url
         )
     }
+}
+
+/// Default SQL Server schema when the user passes a bare table name.
+/// [`yaml_scaffold::parse_table`] defaults an unqualified table to `public`
+/// (the PostgreSQL default); SQL Server's is `dbo`, so the mssql arm rewrites a
+/// `public` placeholder to `dbo` while honouring any schema the user *did*
+/// qualify (`sales.orders`).
+fn mssql_table_schema(parsed_schema: &str) -> String {
+    if parsed_schema == "public" {
+        "dbo".to_string()
+    } else {
+        parsed_schema.to_string()
+    }
+}
+
+/// Whole-schema include/exclude filtering for `rivet init` (L1).
+///
+/// Both lists hold simple globs (`*` = any run, `?` = one char); a discovered
+/// table is kept when it matches at least one `include` (or `include` is empty)
+/// **and** matches no `exclude`. `--exclude` therefore wins over `--include`.
+/// No flags ⇒ both empty ⇒ every table kept (the prior behaviour). Applied only
+/// to the whole-schema path; `--table` names one relation explicitly.
+#[derive(Debug, Clone, Default)]
+pub struct TableFilter {
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+}
+
+impl TableFilter {
+    /// `true` when `name` survives the filter (kept in the scaffold).
+    pub(super) fn matches(&self, name: &str) -> bool {
+        if self.exclude.iter().any(|g| glob_match(g, name)) {
+            return false;
+        }
+        self.include.is_empty() || self.include.iter().any(|g| glob_match(g, name))
+    }
+}
+
+/// Minimal shell-style glob over the whole `name` (anchored at both ends):
+/// `*` matches any run (including empty), `?` matches exactly one char, every
+/// other char is literal. Backtracking on `*` is linear-enough for the short
+/// identifiers init deals with — no regex / glob crate dependency (L1 keeps the
+/// matcher in-tree on purpose). Comparison is byte-exact (case-sensitive),
+/// matching how SQL identifiers are returned by the catalog.
+fn glob_match(pattern: &str, name: &str) -> bool {
+    let pat: Vec<char> = pattern.chars().collect();
+    let txt: Vec<char> = name.chars().collect();
+    // Classic two-pointer wildcard match with a single backtrack anchor for `*`.
+    let (mut p, mut t) = (0usize, 0usize);
+    let (mut star, mut star_t) = (None, 0usize);
+    while t < txt.len() {
+        if p < pat.len() && (pat[p] == '?' || pat[p] == txt[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pat.len() && pat[p] == '*' {
+            star = Some(p);
+            star_t = t;
+            p += 1;
+        } else if let Some(sp) = star {
+            // Backtrack: let the last `*` swallow one more char.
+            p = sp + 1;
+            star_t += 1;
+            t = star_t;
+        } else {
+            return false;
+        }
+    }
+    // Consume trailing `*`s (they match the empty remainder).
+    while p < pat.len() && pat[p] == '*' {
+        p += 1;
+    }
+    p == pat.len()
 }
 
 /// Output format for `rivet init` (Epic B).
@@ -219,8 +294,9 @@ impl InitYamlDestination {
 /// Entry point for `rivet init`.
 ///
 /// With `--table`: introspect one table (optional `schema.table`) and emit one export.
-/// Without `--table`: introspect every table/view in a PostgreSQL schema (default `public`)
-/// or in a MySQL database (from `--schema` or from the URL path).
+/// Without `--table`: introspect every table/view in a PostgreSQL schema (default `public`),
+/// a MySQL database (from `--schema` or from the URL path), or a SQL Server schema
+/// (default `dbo`), optionally narrowed by the `--include` / `--exclude` globs in `filter`.
 pub fn init(
     source_url: &str,
     table: Option<&str>,
@@ -228,10 +304,11 @@ pub fn init(
     output: Option<&str>,
     format: InitFormat,
     yaml_destination: InitYamlDestination,
+    filter: &TableFilter,
 ) -> Result<()> {
     yaml_destination.validate()?;
     let (text, yaml_decimal_review) = match format {
-        InitFormat::Yaml => init_yaml(source_url, table, schema, &yaml_destination)?,
+        InitFormat::Yaml => init_yaml(source_url, table, schema, &yaml_destination, filter)?,
         InitFormat::DiscoveryJson => {
             // Defensive backstop for non-CLI callers; the `rivet init` CLI
             // already rejects `--discover` together with any cloud flag via
@@ -241,7 +318,10 @@ pub fn init(
                     "rivet: note: --gcs-bucket / --s3-bucket are ignored for --discover (JSON has no destination)"
                 );
             }
-            (init_discovery_json(source_url, table, schema)?, false)
+            (
+                init_discovery_json(source_url, table, schema, filter)?,
+                false,
+            )
         }
     };
 
@@ -259,6 +339,17 @@ pub fn init(
                     yaml_scaffold::INIT_DECIMAL_REVIEW_MARKER
                 );
             }
+            // Don't leave the user holding a cold artifact — show the path from
+            // "I have a config" to "I have parquet files". Only for the YAML
+            // scaffold (the discovery JSON isn't runnable).
+            if matches!(format, InitFormat::Yaml) {
+                eprintln!(
+                    "\nNext steps:\n  \
+                     1. rivet doctor -c {path}            # test source + destination auth\n  \
+                     2. rivet check  -c {path}            # column-type & schema report\n  \
+                     3. rivet run    -c {path} --validate # export, then verify row counts"
+                );
+            }
         }
         None => print!("{text}"),
     }
@@ -271,19 +362,30 @@ fn init_yaml(
     table: Option<&str>,
     schema: Option<&str>,
     dest: &InitYamlDestination,
+    filter: &TableFilter,
 ) -> Result<(String, bool)> {
     if let Some(t) = table {
         let (sch, table_name) = yaml_scaffold::parse_table(t);
         let info = match source_type(source_url)? {
-            "postgres" => postgres::introspect(source_url, &sch, table_name)?,
-            "mysql" => mysql::introspect(source_url, table_name)?,
+            "postgres" => {
+                let mut client = postgres::connect(source_url)?;
+                postgres::introspect(&mut client, &sch, table_name)?
+            }
+            "mysql" => {
+                let mut conn = mysql::connect(source_url)?;
+                mysql::introspect(&mut conn, table_name)?
+            }
+            "mssql" => {
+                let mut conn = mssql::connect(source_url)?;
+                mssql::introspect(&mut conn, &mssql_table_schema(&sch), table_name)?
+            }
             _ => unreachable!(),
         };
         let hint = yaml_scaffold::table_has_unbounded_decimal_columns(&info);
         let yaml = yaml_scaffold::generate_config(&info, source_url, dest)?;
         return Ok((yaml, hint));
     }
-    let infos = introspect_all(source_url, schema)?;
+    let infos = introspect_all(source_url, schema, filter)?;
     if infos.is_empty() {
         anyhow::bail!("No tables or views found (check --schema and privileges)");
     }
@@ -299,22 +401,34 @@ fn init_discovery_json(
     source_url: &str,
     table: Option<&str>,
     schema: Option<&str>,
+    filter: &TableFilter,
 ) -> Result<String> {
     let (infos, scope) = if let Some(t) = table {
         let (sch, table_name) = yaml_scaffold::parse_table(t);
         let info = match source_type(source_url)? {
-            "postgres" => postgres::introspect(source_url, &sch, table_name)?,
-            "mysql" => mysql::introspect(source_url, table_name)?,
+            "postgres" => {
+                let mut client = postgres::connect(source_url)?;
+                postgres::introspect(&mut client, &sch, table_name)?
+            }
+            "mysql" => {
+                let mut conn = mysql::connect(source_url)?;
+                mysql::introspect(&mut conn, table_name)?
+            }
+            "mssql" => {
+                let mut conn = mssql::connect(source_url)?;
+                mssql::introspect(&mut conn, &mssql_table_schema(&sch), table_name)?
+            }
             _ => unreachable!(),
         };
         let scope = match source_type(source_url)? {
             "postgres" => format!("table \"{}\".\"{}\"", info.schema, info.table),
             "mysql" => format!("table `{}`", info.table),
+            "mssql" => format!("table [{}].[{}]", info.schema, info.table),
             _ => unreachable!(),
         };
         (vec![info], scope)
     } else {
-        let infos = introspect_all(source_url, schema)?;
+        let infos = introspect_all(source_url, schema, filter)?;
         if infos.is_empty() {
             anyhow::bail!("No tables or views found (check --schema and privileges)");
         }
@@ -364,17 +478,24 @@ fn table_discovery(info: &TableInfo) -> TableDiscovery {
     }
 }
 
-fn introspect_all(source_url: &str, schema: Option<&str>) -> Result<Vec<TableInfo>> {
+fn introspect_all(
+    source_url: &str,
+    schema: Option<&str>,
+    filter: &TableFilter,
+) -> Result<Vec<TableInfo>> {
     match source_type(source_url)? {
         "postgres" => {
             let sch = schema
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .unwrap_or("public");
-            let names = postgres::list_tables(source_url, sch)?;
+            // One connection for the whole scan — a fresh client per table
+            // would mean N+1 TCP+auth(+TLS) handshakes on large schemas.
+            let mut client = postgres::connect(source_url)?;
+            let names = retain_filtered(postgres::list_tables(&mut client, sch)?, filter);
             let mut out = Vec::with_capacity(names.len());
             for n in names {
-                match postgres::introspect(source_url, sch, &n) {
+                match postgres::introspect(&mut client, sch, &n) {
                     Ok(info) => out.push(info),
                     // Table may have been dropped between list_tables and introspect.
                     // Skip it rather than aborting the whole schema scan.
@@ -386,15 +507,46 @@ fn introspect_all(source_url: &str, schema: Option<&str>) -> Result<Vec<TableInf
         }
         "mysql" => {
             let db = mysql::resolve_database_for_listing(source_url, schema)?;
-            let names = mysql::list_tables(source_url, &db)?;
+            // One pooled connection for the whole scan — a fresh Pool per
+            // table would mean N+1 TCP+auth(+TLS) handshakes on large schemas.
+            let mut conn = mysql::connect(source_url)?;
+            let names = retain_filtered(mysql::list_tables(&mut conn, &db)?, filter);
             let mut out = Vec::with_capacity(names.len());
             for n in names {
-                out.push(mysql::introspect(source_url, &n)?);
+                out.push(mysql::introspect(&mut conn, &n)?);
+            }
+            Ok(out)
+        }
+        "mssql" => {
+            let sch = schema
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("dbo");
+            // One connection for the whole scan — `MssqlSource` owns its runtime
+            // and block_on's each query, so reusing it avoids N+1 TLS logins.
+            let mut conn = mssql::connect(source_url)?;
+            let names = retain_filtered(mssql::list_tables(&mut conn, sch)?, filter);
+            let mut out = Vec::with_capacity(names.len());
+            for n in names {
+                match mssql::introspect(&mut conn, sch, &n) {
+                    Ok(info) => out.push(info),
+                    // Dropped between list and introspect — skip, don't abort.
+                    Err(e) if e.to_string().contains("not found or has no columns") => {}
+                    Err(e) => return Err(e),
+                }
             }
             Ok(out)
         }
         _ => unreachable!(),
     }
+}
+
+/// Keep only the discovered table names the `--include` / `--exclude` globs
+/// admit (L1). A no-op when both lists are empty (the default), so the
+/// whole-schema scan is unchanged unless the operator asked to narrow it.
+fn retain_filtered(mut names: Vec<String>, filter: &TableFilter) -> Vec<String> {
+    names.retain(|n| filter.matches(n));
+    names
 }
 
 fn schema_scope_label(source_url: &str, schema: Option<&str>, n: usize) -> Result<String> {
@@ -411,6 +563,13 @@ fn schema_scope_label(source_url: &str, schema: Option<&str>, n: usize) -> Resul
         "mysql" => {
             let db = mysql::resolve_database_for_listing(source_url, schema)?;
             format!("MySQL database \"{db}\" ({n} {obj})")
+        }
+        "mssql" => {
+            let sch = schema
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("dbo");
+            format!("SQL Server schema \"{sch}\" ({n} {obj})")
         }
         _ => unreachable!(),
     })
@@ -799,6 +958,95 @@ mod tests {
             exp["destination"]["prefix"].as_str(),
             Some("exports/orders/")
         );
+    }
+
+    #[test]
+    fn source_type_recognizes_sqlserver_and_mssql_schemes() {
+        assert_eq!(
+            source_type("sqlserver://sa:p@host:1433/db").unwrap(),
+            "mssql"
+        );
+        assert_eq!(source_type("mssql://sa:p@host:1433/db").unwrap(), "mssql");
+    }
+
+    #[test]
+    fn source_type_unsupported_scheme_names_sqlserver() {
+        let err = source_type("oracle://host/db").expect_err("oracle is unsupported");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("sqlserver://"),
+            "error must list sqlserver:// as accepted, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn mssql_table_schema_defaults_public_placeholder_to_dbo() {
+        // `parse_table("orders")` yields schema "public"; mssql rewrites to dbo.
+        assert_eq!(mssql_table_schema("public"), "dbo");
+        // An explicitly-qualified schema is honoured verbatim.
+        assert_eq!(mssql_table_schema("sales"), "sales");
+    }
+
+    #[test]
+    fn glob_match_literal_star_and_question() {
+        assert!(glob_match("orders", "orders"));
+        assert!(!glob_match("orders", "orders2"));
+        // `*` matches any run including empty.
+        assert!(glob_match("bench_*", "bench_users"));
+        assert!(glob_match("bench_*", "bench_"));
+        assert!(!glob_match("bench_*", "orders"));
+        assert!(glob_match("*_tmp", "orders_tmp"));
+        assert!(glob_match("a*c", "abc"));
+        assert!(glob_match("a*c", "ac"));
+        assert!(!glob_match("a*c", "ab"));
+        // `?` matches exactly one char.
+        assert!(glob_match("order?", "orders"));
+        assert!(!glob_match("order?", "order"));
+        // Bare `*` matches everything.
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("*", ""));
+        // Multiple stars.
+        assert!(glob_match("*bench*", "x_bench_y"));
+        assert!(!glob_match("*bench*", "orders"));
+    }
+
+    #[test]
+    fn table_filter_empty_keeps_everything() {
+        let f = TableFilter::default();
+        assert!(f.matches("orders"));
+        assert!(f.matches("bench_users"));
+    }
+
+    #[test]
+    fn table_filter_include_only_keeps_matches() {
+        let f = TableFilter {
+            include: vec!["orders".into()],
+            exclude: vec![],
+        };
+        assert!(f.matches("orders"));
+        assert!(!f.matches("users"));
+        assert!(!f.matches("bench_orders"));
+    }
+
+    #[test]
+    fn table_filter_exclude_drops_matches() {
+        let f = TableFilter {
+            include: vec![],
+            exclude: vec!["bench_*".into()],
+        };
+        assert!(f.matches("orders"));
+        assert!(!f.matches("bench_users"));
+    }
+
+    #[test]
+    fn table_filter_exclude_wins_over_include() {
+        // A name that matches both include and exclude is excluded.
+        let f = TableFilter {
+            include: vec!["*".into()],
+            exclude: vec!["bench_*".into()],
+        };
+        assert!(f.matches("orders"));
+        assert!(!f.matches("bench_users"));
     }
 
     #[test]

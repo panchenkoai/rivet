@@ -9,11 +9,54 @@ pub(crate) mod tls;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
-use crate::config::SourceConfig;
+use crate::config::{SourceConfig, TlsConfig};
 use crate::error::Result;
 use crate::plan::IncrementalCursorPlan;
 use crate::tuning::SourceTuning;
 use crate::types::{ColumnOverrides, CursorState, TypeMapping};
+
+/// A statement-DURATION timeout that **rivet itself** raised — distinct from a
+/// driver-native timeout that carries a structured code (PG 57014, MySQL 3024).
+///
+/// The MSSQL engine has no server-side statement-duration `SET`, so rivet
+/// enforces `tuning.statement_timeout_s` client-side and raises this when the
+/// budget is exceeded (see [`mssql`]). Before this type the retry classifier's
+/// permanence hinged on substring-matching rivet's OWN prose ("statement
+/// timeout after …"); a reworded message would silently flip the error back to
+/// *transient*, and the identical query would be retried until it burned the
+/// budget N times (measured: 3×300 s = 20 min for 0 rows). Carrying a typed
+/// marker means [`crate::pipeline::retry::classify_error`] downcasts the TYPE,
+/// so permanence survives any change to the human-facing wording. The string
+/// branches in the classifier remain a fallback for genuinely driver-native
+/// timeout messages we do not control.
+#[derive(Debug)]
+pub struct StatementDurationTimeout {
+    /// Full actionable message shown to the operator. The classifier keys off
+    /// the TYPE, not this text — it exists only for Display.
+    message: String,
+}
+
+impl StatementDurationTimeout {
+    /// MSSQL client-side statement-duration timeout (no server-side `SET`).
+    pub fn mssql(seconds: u64) -> Self {
+        Self {
+            message: format!(
+                "mssql: statement timeout after {seconds}s (tuning.statement_timeout_s) — \
+                 this query cannot finish within the budget; split it with `mode: chunked` \
+                 (per-chunk statements stay under the limit) or raise \
+                 `tuning.statement_timeout_s`"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for StatementDurationTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StatementDurationTimeout {}
 
 /// Summary of a source table relevant to chunked-mode planning. Source-neutral
 /// shape so plan-build can ask either Postgres or MySQL for the same answer.
@@ -238,6 +281,66 @@ pub fn create_source(config: &SourceConfig) -> Result<Box<dyn Source>> {
     }
 }
 
+/// Pre-allocation per-value size guard, shared by every engine's
+/// `arrow_convert`. The sink-side `check_value_ceiling`
+/// (`pipeline::sink::mod`) scans the *already-built* Arrow batch, so an
+/// oversized cell costs the driver-decode copy **and** the Arrow-build copy
+/// before that guard fires. This check runs at the decode/`Value` stage — after
+/// the unavoidable driver copy, but *before* the value is appended into the
+/// `StringBuilder` / `BinaryBuilder` — so the Arrow allocation never grows to
+/// hold it. Only variable-length values (Utf8 / Binary) can be individually
+/// huge; fixed-width arms (ints/floats/dates) never call this.
+///
+/// `max_value_bytes` is `tuning.max_value_bytes()` (MB → bytes with the
+/// `Some(0)`/`None` ⇒ disabled semantics). The message mirrors the sink guard's
+/// `RIVET_VALUE_TOO_LARGE` so both read identically; the sink guard stays as the
+/// backstop (it also covers meta / enriched columns and is the contract test).
+pub(crate) fn value_within_ceiling(
+    column: &str,
+    len: usize,
+    max_value_bytes: Option<usize>,
+) -> Result<()> {
+    if let Some(limit) = max_value_bytes
+        && len > limit
+    {
+        anyhow::bail!(
+            "RIVET_VALUE_TOO_LARGE: column '{}' has a single value of {:.1} MB, exceeding the \
+             per-value ceiling of {} MB. One oversized cell can OOM the process regardless of \
+             batch size. Raise `tuning.max_value_mb` (or set it to 0 to disable the guard) if \
+             this value is expected.",
+            column,
+            len as f64 / (1024.0 * 1024.0),
+            limit / (1024 * 1024),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod value_ceiling_tests {
+    use super::value_within_ceiling;
+
+    #[test]
+    fn sec_value_ceiling_pre_alloc_over_limit_errors() {
+        let err = value_within_ceiling("payload", 2 * 1024 * 1024, Some(1024 * 1024)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("RIVET_VALUE_TOO_LARGE"), "got: {msg}");
+        assert!(msg.contains("payload"), "names the column: {msg}");
+    }
+
+    #[test]
+    fn sec_value_ceiling_pre_alloc_at_or_under_limit_ok() {
+        assert!(value_within_ceiling("c", 1024 * 1024, Some(1024 * 1024)).is_ok());
+        assert!(value_within_ceiling("c", 0, Some(1024 * 1024)).is_ok());
+    }
+
+    #[test]
+    fn sec_value_ceiling_pre_alloc_disabled_never_errors() {
+        // `None` (set when tuning.max_value_mb is 0 or unset) disables the guard.
+        assert!(value_within_ceiling("c", usize::MAX, None).is_ok());
+    }
+}
+
 /// One-time nudge to enable TLS when the current config connects in plaintext.
 /// Emitted at `warn` level so operators see it even at the default log level.
 /// `create_source` is called multiple times per run (plan/preflight/exec/chunk
@@ -253,5 +356,150 @@ pub(crate) fn warn_if_tls_disabled(config: &SourceConfig) {
                  Add `source.tls.mode: verify-full` (with `ca_file:` if your CA is private) to enable transport security."
             );
         });
+    }
+}
+
+/// Whether the host in a `scheme://[user[:pass]@]host[:port][/db][?…]`
+/// connection URL is a loopback address (`127.0.0.0/8`, `::1`) or the literal
+/// `localhost`.
+///
+/// Used by [`require_tls_or_loopback`] to decide TLS posture from the host:
+/// loopback is the docker / local-dev case where the bytes never leave the box,
+/// so plaintext is fine; a remote host without TLS leaks credentials and rows.
+///
+/// Fails **closed**: any URL we cannot confidently parse a loopback host out of
+/// is treated as non-loopback, so a parse gap can only ever *tighten* the gate
+/// (refuse a connection), never silently allow plaintext to an unverified host.
+pub(crate) fn host_is_loopback(url: &str) -> bool {
+    // Strip the scheme (`postgresql://`, `mysql://`, `sqlserver://`, …).
+    let after_scheme = match url.split_once("://") {
+        Some((_, rest)) => rest,
+        None => url,
+    };
+    // Authority ends at the first `/`, `?` or `#`.
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    // Drop `user[:pass]@` — rsplit the last `@` so an `@` inside a password is
+    // tolerated (it belongs to the userinfo, not the host).
+    let host_port = match authority.rsplit_once('@') {
+        Some((_, hp)) => hp,
+        None => authority,
+    };
+    // Host vs port. IPv6 literals are bracketed (`[::1]:5432`); for those the
+    // host is the bracketed span, and any `:` inside is part of the address.
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((h, _)) => h,
+            None => return false, // unterminated bracket — fail closed
+        }
+    } else {
+        // Bare host or IPv4: the host ends at the (single) port `:`.
+        host_port.split(':').next().unwrap_or(host_port)
+    };
+
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // `IpAddr::is_loopback` covers the whole 127.0.0.0/8 block and `::1`.
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Gate plaintext / trust-any-cert connections by host (CWE-319 / CWE-295).
+///
+/// When no `tls:` block is configured (`tls == None`) **and** the resolved host
+/// is not loopback, refuse the connection *before any network I/O* with a
+/// TLS-required policy error. This stops the per-engine connect helpers from
+/// silently dialing a remote database in cleartext (Postgres/MySQL `NoTls`) or
+/// trusting any server certificate (MSSQL `trust_cert`).
+///
+/// Loopback hosts (docker / local dev) keep today's behaviour — plaintext is
+/// allowed there because the bytes never leave the box. An explicit
+/// `tls: { mode: disable }` is `Some(..)`, so it is the operator's opt-in to
+/// remote plaintext and is **not** refused here.
+pub(crate) fn require_tls_or_loopback(url: &str, tls: Option<&TlsConfig>) -> Result<()> {
+    if tls.is_none() && !host_is_loopback(url) {
+        // The message must name TLS *and* that it is a policy refusal for a
+        // remote host. Emit it at `error` level (→ stderr) as well as returning
+        // it: callers like `doctor` print the `Err` to stdout in their own
+        // `[FAIL]` style and only re-raise a generic summary, so the log line is
+        // what guarantees the TLS-required reason reaches stderr. Deliberately
+        // avoids socket-error vocabulary ("could not connect", "timeout", "os
+        // error") so it is never mistaken for a connect-time failure.
+        let msg = "source: TLS required — refusing to connect to a remote (non-loopback) \
+             host without TLS; credentials and every exported row would cross the network \
+             in cleartext. Add `source.tls: { mode: verify-full }` (with `ca_file:` for a \
+             private CA) to enable transport security, or explicitly opt into remote \
+             plaintext with `source.tls: { mode: disable }` if this network path is \
+             already trusted.";
+        log::error!("{msg}");
+        anyhow::bail!("{msg}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tls_gate_tests {
+    use super::{host_is_loopback, require_tls_or_loopback};
+    use crate::config::{TlsConfig, TlsMode};
+
+    #[test]
+    fn loopback_variants_are_loopback() {
+        assert!(host_is_loopback(
+            "postgresql://rivet:rivet@127.0.0.1:5432/rivet"
+        ));
+        assert!(host_is_loopback(
+            "postgresql://rivet:rivet@localhost:5432/rivet"
+        ));
+        assert!(host_is_loopback("mysql://root@127.0.0.1:3306/db"));
+        // Whole 127.0.0.0/8 block is loopback.
+        assert!(host_is_loopback("postgresql://u:p@127.255.0.9/db"));
+        // IPv6 loopback, bracketed with and without a port.
+        assert!(host_is_loopback("postgresql://u:p@[::1]:5432/db"));
+        assert!(host_is_loopback("sqlserver://sa:pw@[::1]/master"));
+        // Case-insensitive host, no port, no db.
+        assert!(host_is_loopback("mysql://root@LOCALHOST"));
+        // An `@` inside the password must not be mistaken for the host boundary.
+        assert!(host_is_loopback("postgresql://u:p@ss@127.0.0.1:5432/db"));
+    }
+
+    #[test]
+    fn remote_hosts_are_not_loopback() {
+        assert!(!host_is_loopback(
+            "postgresql://rivet:rivet@10.255.255.1:5432/rivet"
+        ));
+        assert!(!host_is_loopback(
+            "postgresql://u:p@db.example.com:5432/app"
+        ));
+        assert!(!host_is_loopback("mysql://root@192.168.1.10:3306/db"));
+        assert!(!host_is_loopback("sqlserver://sa:pw@10.0.0.5:1433/master"));
+        // Not loopback: an unbracketed IPv6-looking address won't parse here, so
+        // it fails closed (treated as remote).
+        assert!(!host_is_loopback("postgresql://u:p@::1:5432/db"));
+    }
+
+    #[test]
+    fn gate_refuses_remote_plaintext_only() {
+        let remote = "postgresql://rivet:rivet@10.255.255.1:5432/rivet";
+        let loopback = "postgresql://rivet:rivet@127.0.0.1:5432/rivet";
+        let disable = TlsConfig {
+            mode: TlsMode::Disable,
+            ..Default::default()
+        };
+        let verify = TlsConfig {
+            mode: TlsMode::VerifyFull,
+            ..Default::default()
+        };
+
+        // Remote + no tls block → refused.
+        assert!(require_tls_or_loopback(remote, None).is_err());
+        // Loopback + no tls block → allowed (docker / dev path).
+        assert!(require_tls_or_loopback(loopback, None).is_ok());
+        // Explicit `mode: disable` is the remote-plaintext opt-in → allowed.
+        assert!(require_tls_or_loopback(remote, Some(&disable)).is_ok());
+        // Enforced TLS to a remote host → allowed (the connect path uses TLS).
+        assert!(require_tls_or_loopback(remote, Some(&verify)).is_ok());
     }
 }

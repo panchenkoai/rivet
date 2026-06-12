@@ -24,6 +24,20 @@ pub fn run_apply_command(plan_file: &str, force: bool) -> Result<()> {
     // 1. Load artifact
     let artifact = PlanArtifact::from_file(plan_file)?;
 
+    // 1a. Tamper-evidence (ADR-0005 PA10, finding #16): reject a plan whose
+    //     `resolved_plan` was edited after planning before we run any query.
+    //     Unlike staleness/cursor-drift this is NOT bypassable by --force —
+    //     a hand-edited execution contract is never something the operator
+    //     can opt into; the only correct recovery is to re-run `rivet plan`.
+    artifact.verify_integrity()?;
+
+    // 1b. Un-appliable inline-url plan (finding #17): a plan generated from an
+    //     inline `url:` config has its credentials redacted to `REDACTED@…`
+    //     with no env/file reference to re-resolve them, so apply would die
+    //     deep in the driver with an opaque auth/"password missing" error.
+    //     Catch it here with the exact remedy.
+    reject_unrecoverable_inline_url(&artifact)?;
+
     // Track which preflight checks --force actually overrode for this run.
     // Threaded into RunSummary.apply_context so the run report carries an
     // auditable record of bypassed gates (finding F5 of the 0.7.5 audit).
@@ -171,6 +185,55 @@ pub fn run_apply_command(plan_file: &str, force: bool) -> Result<()> {
     )
 }
 
+/// Finding #17: reject — with an actionable remedy — a plan whose source
+/// credentials were stripped at plan time (inline `url:`) and cannot be
+/// re-resolved at apply time.
+///
+/// `PlanArtifact::new` redacts plaintext credentials (PA9): an inline
+/// `url: "postgresql://user:pass@host/db"` becomes `postgresql://REDACTED@host/db`.
+/// That is recoverable only if the source *also* carries a reference apply can
+/// resolve (`url_env` / `url_file` / `password_env`, or structured `host`+`user`).
+/// When none of those exist, connecting later fails deep in the driver with an
+/// opaque auth error; surface the fix instead.
+fn reject_unrecoverable_inline_url(artifact: &PlanArtifact) -> Result<()> {
+    let source = &artifact.resolved_plan.source;
+
+    let url_redacted = source
+        .url
+        .as_deref()
+        .is_some_and(|u| u.contains("REDACTED@"));
+    if !url_redacted {
+        return Ok(());
+    }
+
+    // A redacted URL is still appliable if apply has another way to obtain
+    // credentials: an env/file URL reference, an env password, or enough
+    // structured fields to rebuild the connection.
+    let has_recovery = source.url_env.is_some()
+        || source.url_file.is_some()
+        || source.password_env.is_some()
+        || (source.host.is_some() && source.user.is_some());
+    if has_recovery {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "plan '{}': source credentials were stripped from this artifact and cannot be \
+         recovered at apply time — the plan was created from an inline `url:` config, whose \
+         password is never persisted.\n  \
+         Fix: re-plan from a config that uses `url_env: <VAR>` (or `url_file:`) so `rivet apply` \
+         can resolve credentials, e.g.\n    \
+         source:\n      type: {}\n      url_env: DATABASE_URL\n  \
+         then `export DATABASE_URL=...` before running apply.",
+        artifact.export_name,
+        match artifact.resolved_plan.source.source_type {
+            crate::config::SourceType::Postgres => "postgres",
+            crate::config::SourceType::Mysql => "mysql",
+            crate::config::SourceType::Mssql => "mssql",
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,10 +269,16 @@ mod tests {
             validate: false,
             reconcile: false,
             resume: false,
-            // Deliberately unreachable — tests that fail early won't try to connect.
+            // Deliberately unreachable — tests that fail early won't try to
+            // connect. No userinfo in the URL: nothing to redact, so the
+            // finding-#17 gate (`reject_unrecoverable_inline_url`) does not fire
+            // and these fixtures still exercise the staleness / cursor / driver
+            // paths they were written for. A credentialed URL here would be
+            // rewritten to `REDACTED@…` by PA9 redaction and then rejected by
+            // #17 before reaching those gates.
             source: SourceConfig {
                 source_type: SourceType::Postgres,
-                url: Some("postgresql://nobody:wrong@127.0.0.2:9999/nonexistent".into()),
+                url: Some("postgresql://127.0.0.2:9999/nonexistent".into()),
                 url_env: None,
                 url_file: None,
                 host: None,
@@ -316,4 +385,49 @@ mod tests {
             "expected parse error: {msg}"
         );
     }
+
+    // ── artifact integrity / tamper-evidence (ADR-0005 PA10, finding #16) ─────
+
+    /// Offline mirror of the live RED test `audit_apply_rejects_tampered_plan`:
+    /// hand-edit `base_query` in the written plan file (orders → users), then
+    /// `apply` must REJECT it at the integrity gate — before any DB connection,
+    /// so this test needs no live source. Not bypassable by `--force`.
+    #[test]
+    fn apply_rejects_tampered_base_query() {
+        let artifact = fresh_artifact();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_artifact(&dir, &artifact);
+
+        // Tamper the serialized artifact the same way the live test does:
+        // rewrite the embedded base_query string in place, leaving the seal
+        // (and created_at) untouched so only the integrity check can catch it.
+        let json = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            json.contains("SELECT 1"),
+            "fixture must embed the planned base_query"
+        );
+        let tampered = json.replace("SELECT 1", "SELECT * FROM secrets");
+        std::fs::write(&path, &tampered).unwrap();
+
+        let err = run_apply_command(&path, false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("integrity check failed") && msg.contains("modified after planning"),
+            "tampered plan must be rejected at the integrity gate, got: {msg}"
+        );
+
+        // And --force must NOT override it — a hand-edited contract is not opt-in.
+        let err_forced = run_apply_command(&path, true).unwrap_err();
+        let msg_forced = format!("{err_forced:#}");
+        assert!(
+            msg_forced.contains("integrity check failed"),
+            "--force must not bypass the integrity gate, got: {msg_forced}"
+        );
+    }
+
+    // The "untouched artifact is accepted" half is covered deterministically and
+    // without any connection attempt by `artifact.rs::integrity_seal_accepts_
+    // untouched_artifact`, and indirectly here by `stale_error_without_force_is_
+    // rejected` / `cursor_drift_detected_no_prior_state`, which both pass the
+    // integrity gate to reach the staleness / cursor gates they assert on.
 }

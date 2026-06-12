@@ -3,29 +3,65 @@
 //! Post-write output validation.  Opens the written file and counts rows to
 //! verify the expected count.  Triggered only when `plan.validate = true`.
 
+use std::io::BufRead;
 use std::path::Path;
 
 use crate::error::Result;
 use crate::plan::FormatType;
 
+/// Counts RFC-4180 records by streaming the file: a `\n` terminates a record
+/// only outside double quotes, so quoted embedded newlines (which our own CSV
+/// writer emits) stay inside one record. Doubled quotes within a quoted field
+/// self-cancel, so toggling on every `"` tracks quoted state without parsing
+/// fields. CRLF terminators work because the `\n` is the trigger; a final
+/// record without a trailing newline is counted at EOF.
+fn count_csv_records(path: &Path) -> Result<usize> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut records = 0usize;
+    let mut in_quotes = false;
+    let mut pending = false;
+    loop {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            break;
+        }
+        let len = buf.len();
+        for &byte in buf {
+            match byte {
+                b'"' => {
+                    in_quotes = !in_quotes;
+                    pending = true;
+                }
+                b'\n' if !in_quotes => {
+                    records += 1;
+                    pending = false;
+                }
+                _ => pending = true,
+            }
+        }
+        reader.consume(len);
+    }
+    if pending {
+        records += 1;
+    }
+    Ok(records)
+}
+
 pub fn validate_output(path: &Path, format: FormatType, expected_rows: usize) -> Result<()> {
     let actual = match format {
         FormatType::Parquet => {
+            // The footer carries the authoritative row count — the ArrowWriter
+            // wrote it from the same batches we just encoded. Read it instead
+            // of decoding+decompressing every page a second time (the part was
+            // already streamed once for its checksum). `try_new` parses and
+            // validates the footer; a corrupt footer fails loudly here.
             let file = std::fs::File::open(path)?;
             let builder =
                 parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)?;
-            let reader = builder.build()?;
-            let mut count = 0usize;
-            for batch in reader {
-                count += batch?.num_rows();
-            }
-            count
+            builder.metadata().file_metadata().num_rows() as usize
         }
-        FormatType::Csv => {
-            let content = std::fs::read_to_string(path)?;
-            let lines = content.lines().count();
-            lines.saturating_sub(1)
-        }
+        FormatType::Csv => count_csv_records(path)?.saturating_sub(1),
     };
 
     if actual != expected_rows {
@@ -90,6 +126,58 @@ mod tests {
     fn csv_trailing_newline_does_not_count_as_row() {
         // "header\nrow1\n" → 2 lines → 2 - 1 = 1 data row
         let f = write_temp(b"id\n42\n", ".csv");
+        validate_output(f.path(), FormatType::Csv, 1).unwrap();
+    }
+
+    // ROAST-RED validate-csv-newline: validate_output counts physical lines,
+    // not RFC-4180 records, so a correct CSV part with a quoted embedded "\n"
+    // (exactly what src/format/csv.rs emits — see its test
+    // `string_with_newline_is_quoted`) fails validation and aborts the export.
+    // Asserts CORRECT behavior; expected to FAIL until the fix lands.
+    #[test]
+    fn roast_csv_quoted_embedded_newline_is_one_record() {
+        // Header + exactly 2 RFC-4180 data records; record 1's second field
+        // contains an embedded newline inside quotes (4 physical lines total).
+        let f = write_temp(b"id,note\n1,\"line1\nline2\"\n2,plain\n", ".csv");
+        let result = validate_output(f.path(), FormatType::Csv, 2);
+        assert!(
+            result.is_ok(),
+            "a quoted embedded newline is part of one RFC-4180 record, not a \
+             record boundary; line-count validation miscounts 2 records as 3 \
+             rows: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn csv_crlf_terminators_count_records() {
+        let f = write_temp(b"id,name\r\n1,alice\r\n2,bob\r\n", ".csv");
+        validate_output(f.path(), FormatType::Csv, 2).unwrap();
+    }
+
+    #[test]
+    fn csv_doubled_quotes_inside_quoted_field_with_newline() {
+        // Escaped quotes ("") must not flip the in-quote state, so the
+        // embedded newline after them is still inside the quoted field.
+        let f = write_temp(b"id,note\n1,\"say \"\"hi\"\"\nbye\"\n2,plain\n", ".csv");
+        validate_output(f.path(), FormatType::Csv, 2).unwrap();
+    }
+
+    #[test]
+    fn csv_no_trailing_newline_counts_final_record() {
+        let f = write_temp(b"id,name\n1,alice\n2,bob", ".csv");
+        validate_output(f.path(), FormatType::Csv, 2).unwrap();
+    }
+
+    #[test]
+    fn csv_quoted_field_at_eof_without_trailing_newline() {
+        let f = write_temp(b"id,note\n1,\"line1\nline2\"", ".csv");
+        validate_output(f.path(), FormatType::Csv, 1).unwrap();
+    }
+
+    #[test]
+    fn csv_quoted_embedded_crlf_is_one_record() {
+        let f = write_temp(b"id,note\r\n1,\"line1\r\nline2\"\r\n", ".csv");
         validate_output(f.path(), FormatType::Csv, 1).unwrap();
     }
 

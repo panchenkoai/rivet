@@ -112,8 +112,25 @@ pub(crate) struct CloudDestination<B: CloudBackend> {
     _backend: PhantomData<fn() -> B>,
 }
 
+/// Default retry budget for real exports: OpenDAL retries individual HTTP
+/// calls this many times before giving up to the chunk worker's outer loop.
+const DEFAULT_MAX_RETRIES: usize = 5;
+
 impl<B: CloudBackend> CloudDestination<B> {
     pub fn new(config: &DestinationConfig) -> Result<Self> {
+        Self::new_with_retries(config, DEFAULT_MAX_RETRIES)
+    }
+
+    /// Build the destination with an explicit OpenDAL retry budget.
+    ///
+    /// Real exports use [`new`] (`DEFAULT_MAX_RETRIES` = 5). A preflight
+    /// connectivity probe (`rivet doctor`) wants to FAIL FAST against an
+    /// unreachable endpoint rather than inherit the export's ~10s of
+    /// escalating-backoff retries, so it passes `max_times = 0`: with a zero
+    /// budget OpenDAL's `RetryLayer` makes a single attempt and surfaces the
+    /// transport error immediately. Default (export) behavior is unchanged —
+    /// `new` still threads 5 here.
+    pub fn new_with_retries(config: &DestinationConfig, max_times: usize) -> Result<Self> {
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -136,9 +153,11 @@ impl<B: CloudBackend> CloudDestination<B> {
         // SQL retries) — this just stops a single TCP blip from poisoning a
         // streaming upload that otherwise costs another full SQL fetch +
         // parquet encode. One policy, applied identically to every backend.
+        // `max_times == 0` disables retries entirely (single attempt) — the
+        // fail-fast path the doctor probe wants.
         let async_op = B::build_operator(config)?.layer(
             RetryLayer::new()
-                .with_max_times(5)
+                .with_max_times(max_times)
                 .with_min_delay(Duration::from_millis(200))
                 .with_max_delay(Duration::from_secs(10))
                 .with_jitter(),
@@ -293,7 +312,34 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AtomicI64, Ordering, take_from};
+    use super::{AtomicI64, CloudDestination, Ordering, take_from};
+    use crate::config::{DestinationConfig, DestinationType};
+    use crate::destination::gcs::GcsBackend;
+
+    // L20 (cloud-fastfail): the no-retry probe seam must construct. A GCS
+    // `allow_anonymous` config builds the OpenDAL operator without touching
+    // the wire (Azurite/emulator path), so this exercises `new_with_retries`
+    // end-to-end with `max_times = 0` — the value the doctor probe threads to
+    // disable the export's 5-attempt escalating backoff. If `with_max_times`
+    // ever rejected 0 (or the seam regressed), this construction would fail.
+    #[test]
+    fn new_with_retries_zero_builds_no_retry_probe_destination() {
+        let cfg = DestinationConfig {
+            destination_type: DestinationType::Gcs,
+            bucket: Some("rivet-fastfail-probe".into()),
+            // Emulator/anonymous: skips OAuth, builds operator offline.
+            allow_anonymous: true,
+            endpoint: Some("http://127.0.0.1:4443".into()),
+            ..Default::default()
+        };
+        // The construction itself is the assertion: a zero retry budget is a
+        // valid `RetryLayer` config and the probe seam reaches it. (The built
+        // `blocking::Operator` is opaque, so the retry count can't be read
+        // back here — the live timing test in tests/audit_doctor_fastfail.rs
+        // proves the *behavioral* fail-fast against a closed port.)
+        CloudDestination::<GcsBackend>::new_with_retries(&cfg, 0)
+            .expect("no-retry probe destination must build");
+    }
 
     #[test]
     fn oneshot_budget_reserves_until_exhausted_then_streams() {

@@ -56,6 +56,11 @@ pub(crate) struct ExportSink {
     pub(in crate::pipeline) quality_null_counts: std::collections::HashMap<String, usize>,
     pub(in crate::pipeline) quality_unique_sets:
         std::collections::HashMap<String, std::collections::HashSet<u64>>,
+    /// Per-column count of non-NULL values seen by uniqueness tracking. NULLs are
+    /// never duplicates (SQL UNIQUE semantics) and are skipped from hashing, so
+    /// duplicates must be computed against this count, not `total_rows`.
+    pub(in crate::pipeline) quality_unique_non_null_counts:
+        std::collections::HashMap<String, usize>,
     /// Columns whose unique-entry tracking was stopped because `unique_max_entries` was reached.
     pub(in crate::pipeline) quality_unique_capped: std::collections::HashSet<String>,
     pub(in crate::pipeline) quality_columns: Option<crate::config::QualityConfig>,
@@ -112,6 +117,7 @@ impl ExportSink {
             exported_at_us,
             quality_null_counts: std::collections::HashMap::new(),
             quality_unique_sets: std::collections::HashMap::new(),
+            quality_unique_non_null_counts: std::collections::HashMap::new(),
             quality_unique_capped: std::collections::HashSet::new(),
             quality_columns: plan.quality.clone(),
             quality_null_indices: Vec::new(),
@@ -122,11 +128,7 @@ impl ExportSink {
             column_max_bytes: std::collections::HashMap::new(),
             max_batch_memory_bytes: plan.tuning.max_batch_memory_mb.map(|mb| mb * 1024 * 1024),
             // `0` (or None) disables the per-value guard; otherwise convert MB→bytes.
-            max_value_bytes: plan
-                .tuning
-                .max_value_mb
-                .filter(|&mb| mb > 0)
-                .map(|mb| mb * 1024 * 1024),
+            max_value_bytes: plan.tuning.max_value_bytes(),
             batch_memory_policy: plan.tuning.on_batch_memory_exceeded,
             oversized_batch_count: 0,
             parquet_config: plan.parquet.clone(),
@@ -219,11 +221,20 @@ impl ExportSink {
                 continue;
             }
             let col = batch.column(*i);
+            let non_null_count = self
+                .quality_unique_non_null_counts
+                .entry(name.clone())
+                .or_default();
             let set = self.quality_unique_sets.entry(name.clone()).or_default();
             if let Ok(formatter) =
                 arrow::util::display::ArrayFormatter::try_new(col.as_ref(), &fmt_options)
             {
                 for row in 0..col.len() {
+                    // NULLs are never duplicates (SQL UNIQUE semantics): skip
+                    // before the cap check so trailing NULLs can't trip the cap.
+                    if col.is_null(row) {
+                        continue;
+                    }
                     if let Some(limit) = cap
                         && set.len() >= limit
                     {
@@ -233,6 +244,7 @@ impl ExportSink {
                     scratch.clear();
                     let _ = write!(scratch, "{}", formatter.value(row));
                     set.insert(xxh3_64(&scratch));
+                    *non_null_count += 1;
                 }
             }
         }
@@ -245,6 +257,20 @@ impl ExportSink {
     /// before the batch is split/encoded so the giant cell never reaches the
     /// row-group writer or the auto-shrink splitter (which can't divide one
     /// oversized value). `O(rows × var-length-cols)` length reads — no copies.
+    ///
+    /// KNOWN LIMITATION (security audit V22, CWE-770, accepted): this guard runs
+    /// *post-materialization* — the cell has already been decoded by the driver
+    /// and built into the Arrow array before its length is checked here, so a
+    /// single adversarial cell of N bytes costs ~2N RAM (driver copy + Arrow
+    /// copy) before the guard fires. The guard still prevents *further*
+    /// amplification (encode / row-group / split) and aborts the run, and it is
+    /// ON by default (`max_value_mb = Some(256)` in every tuning profile), so
+    /// the realistic blast radius is one ≤256 MB-class over-allocation per
+    /// oversized cell, not an unbounded OOM. A true pre-materialization cap
+    /// would need a source-side length probe (`SUBSTRING(col,1,max+1)` — lossy,
+    /// changes data) or a per-field driver limit (Postgres exposes none;
+    /// MySQL's `max_allowed_packet` is connection- not field-scoped), so it is
+    /// deliberately not attempted here.
     fn check_value_ceiling(&self, batch: &RecordBatch) -> Result<()> {
         use arrow::array::{BinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
         use arrow::datatypes::DataType;
@@ -363,7 +389,12 @@ impl ExportSink {
                         ),
                     });
                 } else if let Some(set) = self.quality_unique_sets.get(col) {
-                    let dupes = self.total_rows.saturating_sub(set.len());
+                    let non_null = self
+                        .quality_unique_non_null_counts
+                        .get(col)
+                        .copied()
+                        .unwrap_or(0);
+                    let dupes = non_null.saturating_sub(set.len());
                     if dupes > 0 {
                         issues.push(crate::quality::QualityIssue {
                             severity: crate::quality::Severity::Fail,
@@ -484,6 +515,29 @@ impl BatchSink for ExportSink {
                 );
             }
         }
+        // Warn loud (#6/#29, CLAUDE.md "never a silent no-op"): `max_file_size`
+        // is enforced by `maybe_split` comparing the writer's FLUSHED bytes
+        // against the cap. parquet-rs only flushes on row-group close, so with
+        // the library-default (~1M-row) row group an export below one group
+        // flushes ~nothing and the cap silently never fires. Tell the operator
+        // their declared cap won't engage unless they constrain the row group
+        // (or switch to CSV). Once per process so chunked runs don't spam.
+        if self.format_type == FormatType::Parquet
+            && self.max_file_size.is_some()
+            && self.parquet_row_group_rows.is_none()
+        {
+            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+            WARN_ONCE.call_once(|| {
+                log::warn!(
+                    "max_file_size is set but will NOT be enforced for this parquet export: \
+                     parquet only flushes bytes when a row group closes, and no \
+                     `parquet.row_group_rows` is configured (library default ~1M rows), so a \
+                     file below one row group never reaches the cap. Set a small \
+                     `parquet.row_group_rows` to make max_file_size effective, or use \
+                     `format: csv`."
+                );
+            });
+        }
         let fmt = format::create_format(
             self.format_type,
             self.compression,
@@ -495,6 +549,17 @@ impl BatchSink for ExportSink {
         self.writer = Some(fmt.create_writer(&enriched, Box::new(buf_writer))?);
         // Build quality field index cache from dest_schema (after stripping internal cols).
         if let Some(qc) = &self.quality_columns {
+            // Fail loud (#33, CLAUDE.md "never a silent no-op"): a quality rule
+            // naming a column the export does not produce would otherwise be
+            // dropped by the `contains`/`index_of` filters below and report
+            // `quality: pass` over a gate that never ran. Validate names against
+            // the real schema the moment it resolves, before any batch.
+            let available: Vec<String> = dest_schema
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            crate::quality::validate_quality_columns(qc, &available)?;
             self.quality_null_indices = dest_schema
                 .fields()
                 .iter()

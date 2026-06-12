@@ -22,6 +22,21 @@ impl FormatType {
     }
 }
 
+/// Whether `format` actually encodes `compression` on write.
+///
+/// Only Parquet has a compression encoder (see [`crate::format::parquet`]); the
+/// CSV writer ([`crate::format::csv`]) ignores the codec entirely. Accepting a
+/// non-`None` codec for CSV would be a silent no-op — the file stays
+/// uncompressed while the run manifest records the codec — so config validation
+/// rejects that combination up-front (Finding #10). `None` is always supported
+/// (it means "do not compress").
+pub fn compression_supported(format: FormatType, compression: CompressionType) -> bool {
+    match format {
+        FormatType::Parquet => true,
+        FormatType::Csv => matches!(compression, CompressionType::None),
+    }
+}
+
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CompressionType {
@@ -42,6 +57,23 @@ impl CompressionType {
             CompressionType::Gzip => "gzip",
             CompressionType::Lz4 => "lz4",
             CompressionType::None => "none",
+        }
+    }
+
+    /// Parse a [`label`](Self::label)-shaped string back to a codec.
+    ///
+    /// Used by config validation to evaluate an *explicitly-written* codec
+    /// against [`compression_supported`] without re-deriving the serde mapping.
+    /// Returns `None` for any unrecognised string (serde rejects those during
+    /// the real parse anyway).
+    pub fn from_label(s: &str) -> Option<Self> {
+        match s {
+            "zstd" => Some(CompressionType::Zstd),
+            "snappy" => Some(CompressionType::Snappy),
+            "gzip" => Some(CompressionType::Gzip),
+            "lz4" => Some(CompressionType::Lz4),
+            "none" => Some(CompressionType::None),
+            _ => None,
         }
     }
 }
@@ -165,6 +197,39 @@ impl CompressionProfile {
     }
 }
 
+/// L24: when a `compression_profile` is set *and* the user also wrote an
+/// explicit codec the profile silently discards, return a one-line warning
+/// naming both — otherwise `None`.
+///
+/// Pure (no logging) so it can be unit-tested; the caller emits the message.
+/// `explicit_compression` is `Some` only when the user actually wrote a
+/// `compression:` codec — a `#[serde(default)]` Zstd cannot be distinguished
+/// from an omitted field, so the caller passes `None` for the defaulted case.
+pub fn compression_profile_override_warning(
+    profile: CompressionProfile,
+    explicit_compression: Option<CompressionType>,
+    explicit_level: Option<u32>,
+) -> Option<String> {
+    let (codec, _) = profile.to_codec();
+    if let Some(c) = explicit_compression
+        && c != codec
+    {
+        return Some(format!(
+            "compression_profile '{}' overrides explicit compression '{}' (using '{}')",
+            profile.label(),
+            c.label(),
+            codec.label(),
+        ));
+    }
+    if explicit_level.is_some() {
+        return Some(format!(
+            "compression_profile '{}' overrides explicit compression_level (the profile sets its own level)",
+            profile.label(),
+        ));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +249,51 @@ mod tests {
         assert_eq!(CompressionType::Gzip.label(), "gzip");
         assert_eq!(CompressionType::Lz4.label(), "lz4");
         assert_eq!(CompressionType::None.label(), "none");
+    }
+
+    // ── L24: compression_profile override warning ───────────────────────────
+
+    #[test]
+    fn profile_override_warns_on_conflicting_explicit_codec() {
+        // `compression_profile: fast` (snappy) with explicit `compression: gzip`
+        // must warn, naming both codecs and the winner.
+        let msg = compression_profile_override_warning(
+            CompressionProfile::Fast,
+            Some(CompressionType::Gzip),
+            None,
+        )
+        .expect("conflicting explicit codec must warn");
+        assert!(msg.contains("fast"), "got: {msg}");
+        assert!(msg.contains("gzip"), "got: {msg}");
+        assert!(msg.contains("snappy"), "winner codec named, got: {msg}");
+    }
+
+    #[test]
+    fn profile_override_warns_on_explicit_level() {
+        let msg = compression_profile_override_warning(CompressionProfile::Balanced, None, Some(7))
+            .expect("explicit compression_level under a profile must warn");
+        assert!(msg.contains("compression_level"), "got: {msg}");
+    }
+
+    #[test]
+    fn profile_override_silent_when_codec_matches_profile() {
+        // Profile `fast` resolves to snappy; an explicit `snappy` is not a
+        // conflict, so no warning.
+        assert!(
+            compression_profile_override_warning(
+                CompressionProfile::Fast,
+                Some(CompressionType::Snappy),
+                None,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn profile_override_silent_when_nothing_explicit() {
+        assert!(
+            compression_profile_override_warning(CompressionProfile::Compact, None, None).is_none()
+        );
     }
 
     // ── ParquetConfig::effective_row_group_rows ─────────────────────────────

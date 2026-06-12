@@ -99,18 +99,22 @@ pub struct Reconciliation {
 ///   `SizeMismatch`.  Quarantined manifest entries are audit-only and skipped.
 /// - Untracked surplus is every listed key that is not a committed part, the
 ///   manifest, the `_SUCCESS` marker, the doctor probe, or under the
-///   `_quarantine/` prefix.
+///   manifest-rooted `_quarantine/` directory.
 pub fn reconcile_manifest_against_listing(
     manifest: &RunManifest,
     listing: &[ObjectMeta],
     manifest_dir: &str,
 ) -> Reconciliation {
-    // Index the listing by key, dropping the quarantine prefix outright — its
-    // contents are audit artifacts and must never match a part or be flagged
-    // as untracked.
+    // Index the listing by key, dropping the manifest-rooted `_quarantine/`
+    // directory outright — its contents are audit artifacts and must never
+    // match a part or be flagged as untracked.  Anchored to the directory
+    // (the dir's own key, or anything under `<dir>/`), never a substring
+    // match: a part legitimately named `*_quarantine*` is an ordinary key.
+    let quarantine_dir = join_key(manifest_dir, QUARANTINE_PREFIX);
+    let quarantine_subtree = format!("{quarantine_dir}/");
     let listed: BTreeMap<&str, &ObjectMeta> = listing
         .iter()
-        .filter(|m| !m.key.contains(QUARANTINE_PREFIX))
+        .filter(|m| m.key != quarantine_dir && !m.key.starts_with(&quarantine_subtree))
         .map(|m| (m.key.as_str(), m))
         .collect();
 
@@ -391,5 +395,112 @@ mod tests {
                 md5_verified: false
             }
         );
+    }
+
+    // ROAST-RED quarantine-anchor: the listing filter drops any key CONTAINING
+    // the "_quarantine" substring anywhere, instead of only keys under the
+    // manifest-rooted `_quarantine/` directory, so a committed part whose file
+    // name merely contains the substring is reported Missing (fatal in verify,
+    // duplicate re-export in resume).
+    // Asserts CORRECT behavior; expected to FAIL until the fix lands.
+    #[test]
+    fn roast_part_named_like_quarantine_is_matched_not_missing() {
+        // Contract (resume_decisions.rs): only entries whose key STARTS WITH
+        // QUARANTINE_PREFIX — i.e. the `_quarantine/` audit directory — are
+        // skipped.  An export literally named `orders_quarantine_audit`
+        // produces ordinary committed parts that must match the listing.
+        let mut p = part(0, 100);
+        p.path = "orders_quarantine_audit-000000.parquet".into();
+        let m = manifest(vec![p]);
+        let listing = vec![obj("orders_quarantine_audit-000000.parquet", 100)];
+        let rec = reconcile_manifest_against_listing(&m, &listing, "");
+        assert_eq!(
+            rec.per_part[0].presence,
+            PartPresence::Present {
+                md5_verified: false
+            },
+            "committed part `orders_quarantine_audit-000000.parquet` was \
+             classified {:?} instead of Present: the quarantine filter \
+             matched the `_quarantine` substring in the file name, not the \
+             `_quarantine/` directory",
+            rec.per_part[0].presence
+        );
+    }
+
+    #[test]
+    fn key_exactly_equal_to_quarantine_dir_is_filtered() {
+        // Some object stores list a zero-byte placeholder object for the
+        // directory itself (key `_quarantine`, no slash).  It is a Rivet
+        // audit artifact, not untracked surplus.
+        let m = manifest(vec![part(0, 100)]);
+        let listing = vec![obj("part-000000.parquet", 100), obj(QUARANTINE_PREFIX, 0)];
+        let rec = reconcile_manifest_against_listing(&m, &listing, "");
+        assert_eq!(
+            rec.per_part[0].presence,
+            PartPresence::Present {
+                md5_verified: false
+            }
+        );
+        assert!(rec.untracked.is_empty());
+    }
+
+    #[test]
+    fn nested_quarantine_files_are_filtered_at_any_depth() {
+        let m = manifest(vec![part(0, 100)]);
+        let listing = vec![
+            obj("part-000000.parquet", 100),
+            obj("_quarantine/r/deep/nested/part-000099.parquet", 7),
+            // Substring in the file name AND under the directory → the
+            // directory anchor, not the name, decides: filtered.
+            obj("_quarantine/r/_quarantine.parquet", 7),
+        ];
+        let rec = reconcile_manifest_against_listing(&m, &listing, "");
+        assert!(rec.untracked.is_empty());
+    }
+
+    #[test]
+    fn root_file_named_quarantine_dot_parquet_is_an_ordinary_key() {
+        // `_quarantine.parquet` is NOT under `_quarantine/` — it behaves like
+        // any other key: matched when a committed part claims it, reported
+        // untracked when nothing does (the old substring filter silently
+        // hid such surplus).
+        let mut p = part(0, 100);
+        p.path = "_quarantine.parquet".into();
+        let m = manifest(vec![p]);
+        let listing = vec![
+            obj("_quarantine.parquet", 100),
+            obj("stray_quarantine_export.parquet", 7),
+        ];
+        let rec = reconcile_manifest_against_listing(&m, &listing, "");
+        assert_eq!(
+            rec.per_part[0].presence,
+            PartPresence::Present {
+                md5_verified: false
+            }
+        );
+        assert_eq!(rec.untracked.len(), 1);
+        assert_eq!(rec.untracked[0].key, "stray_quarantine_export.parquet");
+    }
+
+    #[test]
+    fn quarantine_anchor_respects_manifest_dir_prefix() {
+        // Prefixed destination: the quarantine directory lives under the
+        // manifest dir (`sub/run/_quarantine/…`), and a part whose name
+        // contains the substring still matches its prefixed key.
+        let mut p = part(0, 100);
+        p.path = "orders_quarantine-000000.parquet".into();
+        let m = manifest(vec![p]);
+        let listing = vec![
+            obj("sub/run/orders_quarantine-000000.parquet", 100),
+            obj("sub/run/_quarantine/r/old.parquet", 9),
+        ];
+        let rec = reconcile_manifest_against_listing(&m, &listing, "sub/run");
+        assert_eq!(
+            rec.per_part[0].presence,
+            PartPresence::Present {
+                md5_verified: false
+            }
+        );
+        assert!(rec.untracked.is_empty());
     }
 }

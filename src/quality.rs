@@ -15,6 +15,7 @@ use arrow::record_batch::RecordBatch;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::config::QualityConfig;
+use crate::error::Result;
 
 /// Hash a single non-null array value using typed dispatch to avoid string formatting.
 /// Returns `None` for null values; caller skips those in uniqueness tracking.
@@ -163,6 +164,81 @@ pub enum Severity {
     Fail,
 }
 
+/// The single home for the operator-facing quality-gate *failure contract*: the
+/// "N check(s) failed" body, the per-issue bullet layout, and the remediation
+/// hint. Both the single-export gate (`pipeline::single`) and the chunked
+/// aggregate gate (`pipeline::job`) format failures through here so the message
+/// — which is a de-facto public contract — cannot drift between modes.
+///
+/// `context` tags the gate when it matters (e.g. `Some("chunked aggregate")`,
+/// where only row-count bounds are checked); `None` for the full per-export gate.
+pub fn failure_message(export_name: &str, context: Option<&str>, failing: &[&str]) -> String {
+    let ctx = context.map(|c| format!(" ({c})")).unwrap_or_default();
+    format!(
+        "export '{}': {} quality check(s) failed{}:\n  - {}\n  \
+         Fix the source data, or adjust the thresholds under `quality:` in your config.",
+        export_name,
+        failing.len(),
+        ctx,
+        failing.join("\n  - "),
+    )
+}
+
+/// Pre-flight gate (#33, column-applicability): every column named by a quality
+/// rule must be produced by the export, or the gate is a silent no-op — the
+/// uniqueness loop `index_of(col)` skips a missing column (0 duplicates, "pass")
+/// and the null-ratio loop's `unwrap_or(0)` treats a missing column as 0 nulls
+/// ("pass"). Per CLAUDE.md ("never a silent no-op"), a quality rule that can
+/// never evaluate is a configuration error, not a pass.
+///
+/// `available` is the set of column names the export actually produces (the
+/// output schema). Returns a loud error naming the offending column and the
+/// available columns. Call this once the schema is known — before the gate runs
+/// — so the run fails fast instead of reporting `quality: pass` over a rule that
+/// never fired.
+pub fn validate_quality_columns(config: &QualityConfig, available: &[String]) -> Result<()> {
+    let mut missing: Vec<&str> = Vec::new();
+    for col in &config.unique_columns {
+        if !available.iter().any(|c| c == col) {
+            missing.push(col.as_str());
+        }
+    }
+    for col in config.null_ratio_max.keys() {
+        if !available.iter().any(|c| c == col) && !missing.contains(&col.as_str()) {
+            missing.push(col.as_str());
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    missing.sort_unstable();
+    anyhow::bail!(
+        "quality check references column(s) not produced by the export: {}. \
+         Available columns: {}. \
+         Fix the column name(s) under `quality:` or add them to the query.",
+        missing.join(", "),
+        if available.is_empty() {
+            "<none>".to_string()
+        } else {
+            available.join(", ")
+        },
+    );
+}
+
+/// Union of column names across `batches` (the schema the export produced).
+/// Used to validate quality-rule column references against reality.
+fn available_columns(batches: &[RecordBatch]) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for batch in batches {
+        for field in batch.schema().fields() {
+            if !seen.iter().any(|c| c == field.name()) {
+                seen.push(field.name().clone());
+            }
+        }
+    }
+    seen
+}
+
 pub fn check_row_count(actual: usize, config: &QualityConfig) -> Vec<QualityIssue> {
     let mut issues = Vec::new();
     if let Some(min) = config.row_count_min
@@ -192,9 +268,33 @@ pub fn check_null_ratios(
         return Vec::new();
     }
 
+    // #33: a threshold naming a column the export does not produce can never
+    // evaluate — `unwrap_or(0)` would treat it as 0 nulls and silently "pass".
+    // Surface it as a Fail (naming the available columns) instead, regardless of
+    // row count, so the gate cannot vanish.
+    let available = available_columns(batches);
+    let mut issues = Vec::new();
+    for col_name in thresholds.keys() {
+        if !available.iter().any(|c| c == col_name) {
+            issues.push(QualityIssue {
+                severity: Severity::Fail,
+                message: format!(
+                    "column '{}': null-ratio check references a column not produced by the \
+                     export (available: {}); fix the column name or add it to the query",
+                    col_name,
+                    if available.is_empty() {
+                        "<none>".to_string()
+                    } else {
+                        available.join(", ")
+                    },
+                ),
+            });
+        }
+    }
+
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     if total_rows == 0 {
-        return Vec::new();
+        return issues;
     }
 
     let mut null_counts: HashMap<String, usize> = HashMap::new();
@@ -208,8 +308,12 @@ pub fn check_null_ratios(
         }
     }
 
-    let mut issues = Vec::new();
     for (col_name, max_ratio) in thresholds {
+        // Missing columns already produced a Fail above; skip the ratio math so
+        // they don't also yield a spurious "ratio 0.0000 exceeds" line.
+        if !available.iter().any(|c| c == col_name) {
+            continue;
+        }
         let nulls = null_counts.get(col_name.as_str()).copied().unwrap_or(0);
         let ratio = nulls as f64 / total_rows as f64;
         if ratio > *max_ratio {
@@ -234,14 +338,40 @@ pub fn check_uniqueness(
         return Vec::new();
     }
 
-    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    if total_rows == 0 {
-        return Vec::new();
+    // #33: a uniqueness column the export does not produce can never evaluate —
+    // `index_of(col)` returns `Err`, the inner loop is skipped, 0 duplicates are
+    // counted and the gate silently "passes". Surface it as a Fail (naming the
+    // available columns) instead, regardless of row count, so the gate cannot
+    // vanish (CLAUDE.md: never a silent no-op).
+    let available = available_columns(batches);
+    let mut issues = Vec::new();
+    for col_name in columns {
+        if !available.iter().any(|c| c == col_name) {
+            issues.push(QualityIssue {
+                severity: Severity::Fail,
+                message: format!(
+                    "column '{}': uniqueness check references a column not produced by the \
+                     export (available: {}); fix the column name or add it to the query",
+                    col_name,
+                    if available.is_empty() {
+                        "<none>".to_string()
+                    } else {
+                        available.join(", ")
+                    },
+                ),
+            });
+        }
     }
 
-    let mut issues = Vec::new();
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    if total_rows == 0 {
+        return issues;
+    }
 
     for col_name in columns {
+        if !available.iter().any(|c| c == col_name) {
+            continue; // already reported as a Fail above
+        }
         let mut seen: HashSet<u64> = HashSet::new();
         let mut duplicates = 0usize;
         let mut capped = false;
@@ -311,6 +441,26 @@ mod tests {
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+
+    /// The shared failure contract (used by both pipeline gates): names the
+    /// export, lists every failing check as a bullet, carries the remediation
+    /// hint, and tags the gate when given a context. Tested once here so the
+    /// two call sites don't each re-assert it via `contains()`.
+    #[test]
+    fn failure_message_lists_checks_and_hint() {
+        let m = failure_message("orders", None, &["row count 42 < min 100"]);
+        assert!(m.contains("export 'orders': 1 quality check(s) failed:"));
+        assert!(m.contains("\n  - row count 42 < min 100"));
+        assert!(m.contains("adjust the thresholds under `quality:`"));
+        assert!(
+            !m.contains("aggregate"),
+            "no context tag when context is None"
+        );
+
+        let c = failure_message("events", Some("chunked aggregate"), &["a", "b"]);
+        assert!(c.contains("2 quality check(s) failed (chunked aggregate):"));
+        assert!(c.contains("\n  - a\n  - b"));
+    }
     use std::sync::Arc;
 
     fn make_batch(ids: &[Option<i64>], names: &[Option<&str>]) -> RecordBatch {
@@ -567,5 +717,104 @@ mod tests {
         thresholds.insert("name".into(), 0.5);
         let issues = check_null_ratios(&[batch], &thresholds);
         assert!(issues.is_empty(), "0.5 == 0.5, not >, so should pass");
+    }
+
+    // ─── #33 regression: a quality rule on a ghost column must be LOUD ────────
+    // (CLAUDE.md "never a silent no-op"). The old code skipped a missing
+    // uniqueness column (index_of → Err → 0 dups → pass) and treated a missing
+    // null-ratio column as 0 nulls (unwrap_or(0) → pass); both vanished.
+
+    #[test]
+    fn uniqueness_missing_column_is_loud_fail() {
+        let batch = make_batch(
+            &[Some(1), Some(2), Some(3)],
+            &[Some("a"), Some("b"), Some("c")],
+        );
+        let issues = check_uniqueness(&[batch], &["ghost".into()], None);
+        assert_eq!(issues.len(), 1, "missing column must produce one Fail");
+        assert_eq!(issues[0].severity, Severity::Fail);
+        assert!(issues[0].message.contains("ghost"), "names the column");
+        assert!(
+            issues[0].message.contains("not produced"),
+            "explains why: {}",
+            issues[0].message
+        );
+        // Available columns are surfaced so the operator can spot the typo.
+        assert!(
+            issues[0].message.contains("id") && issues[0].message.contains("name"),
+            "lists available columns: {}",
+            issues[0].message
+        );
+    }
+
+    #[test]
+    fn uniqueness_missing_column_fails_even_on_empty_batches() {
+        // A ghost column is a config error regardless of row count — it must
+        // not slip through the `total_rows == 0` early return.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let empty = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(Vec::<Option<i64>>::new())),
+                Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
+            ],
+        )
+        .unwrap();
+        let issues = check_uniqueness(&[empty], &["ghost".into()], None);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].severity, Severity::Fail);
+        assert!(issues[0].message.contains("ghost"));
+    }
+
+    #[test]
+    fn null_ratio_missing_column_is_loud_fail() {
+        let batch = make_batch(&[Some(1), Some(2)], &[Some("a"), Some("b")]);
+        let mut thresholds = HashMap::new();
+        thresholds.insert("ghost".into(), 0.5);
+        let issues = check_null_ratios(&[batch], &thresholds);
+        assert_eq!(issues.len(), 1, "missing column must produce one Fail");
+        assert_eq!(issues[0].severity, Severity::Fail);
+        assert!(issues[0].message.contains("ghost"));
+        assert!(issues[0].message.contains("not produced"));
+    }
+
+    #[test]
+    fn validate_quality_columns_ok_when_all_present() {
+        let cfg = QualityConfig {
+            row_count_min: None,
+            row_count_max: None,
+            null_ratio_max: {
+                let mut m = HashMap::new();
+                m.insert("name".into(), 0.5);
+                m
+            },
+            unique_columns: vec!["id".into()],
+            unique_max_entries: None,
+        };
+        let available = vec!["id".to_string(), "name".to_string()];
+        assert!(validate_quality_columns(&cfg, &available).is_ok());
+    }
+
+    #[test]
+    fn validate_quality_columns_errors_naming_column_and_available() {
+        let cfg = QualityConfig {
+            row_count_min: None,
+            row_count_max: None,
+            null_ratio_max: HashMap::new(),
+            unique_columns: vec!["ghost".into()],
+            unique_max_entries: None,
+        };
+        let available = vec!["id".to_string(), "name".to_string()];
+        let err =
+            validate_quality_columns(&cfg, &available).expect_err("ghost column must be rejected");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("ghost"), "names the offending column: {msg}");
+        assert!(
+            msg.contains("id") && msg.contains("name"),
+            "lists available columns: {msg}"
+        );
     }
 }

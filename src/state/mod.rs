@@ -355,6 +355,57 @@ pub(super) fn pg_sql(sql: &str) -> String {
     out
 }
 
+/// Open a Postgres client for the state backend, honoring the URL's `sslmode`.
+///
+/// The state backend connects to its store using only a URL (`RIVET_STATE_URL`)
+/// — there is no YAML `tls:` block — so the transport-security policy is derived
+/// from the URL's `sslmode` query parameter, exactly as `rivet init` does for
+/// source connections. The connection itself goes through the shared
+/// [`crate::source::postgres::connect_client`] path so the state backend and
+/// source connections apply identical TLS rules.
+///
+/// - missing / `disable` / `prefer` / `allow` / unrecognized → `NoTls`
+///   (plaintext), keeping local and dev setups working unchanged.
+/// - `require` / `verify-ca` / `verify-full` → negotiate TLS.
+///
+/// Used by both [`StateStore::open_postgres`] and the parallel chunk-worker
+/// reconnection paths in `checkpoint.rs`, so every PG state connection is
+/// TLS-aware.
+pub(super) fn connect_pg(url: &str) -> Result<postgres::Client> {
+    let tls = state_tls_mode_from_url(url).map(|mode| crate::config::TlsConfig {
+        mode,
+        ..crate::config::TlsConfig::default()
+    });
+    crate::source::postgres::connect_client(url, tls.as_ref())
+        .map_err(|e| anyhow::anyhow!("state(pg): connect to '{}': {:#}", redact_pg_url(url), e))
+}
+
+/// Map the state URL's `sslmode` query parameter to a [`crate::config::TlsMode`].
+///
+/// Mirrors the source-side mapping in `crate::init::postgres`: `require` /
+/// `verify-ca` / `verify-full` enforce TLS; everything else — parameter missing,
+/// `disable`, `prefer`, `allow`, or an unrecognized value — returns `None`
+/// (plaintext `NoTls`). [`crate::config::TlsMode`] has no `prefer` variant, so no
+/// try-TLS-then-fallback is attempted. Last occurrence wins, matching libpq.
+fn state_tls_mode_from_url(url: &str) -> Option<crate::config::TlsMode> {
+    use crate::config::TlsMode;
+    let (_, query) = url.split_once('?')?;
+    let mut mode = None;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key != "sslmode" {
+            continue;
+        }
+        mode = match value {
+            "require" => Some(TlsMode::Require),
+            "verify-ca" => Some(TlsMode::VerifyCa),
+            "verify-full" => Some(TlsMode::VerifyFull),
+            _ => None,
+        };
+    }
+    mode
+}
+
 // ─── Backend connection ────────────────────────────────────────────────────────
 
 /// Internal storage for the active database connection.
@@ -608,15 +659,14 @@ impl StateStore {
     fn open_postgres(url: &str) -> Result<Self> {
         let is_local =
             url.contains("localhost") || url.contains("127.0.0.1") || url.contains("::1");
-        if !is_local {
+        if !is_local && state_tls_mode_from_url(url).is_none() {
             log::warn!(
                 "state(pg): connecting to a remote host without TLS; \
-                 set RIVET_STATE_URL to a sslmode=require URL for production use"
+                 add sslmode=require (or verify-ca / verify-full) to RIVET_STATE_URL \
+                 to negotiate TLS for production use"
             );
         }
-        let mut client = postgres::Client::connect(url, postgres::NoTls).map_err(|e| {
-            anyhow::anyhow!("state(pg): connect to '{}': {:#}", redact_pg_url(url), e)
-        })?;
+        let mut client = connect_pg(url)?;
         migrate_pg(&mut client)?;
         Ok(Self {
             conn: StateConn::Postgres(Box::new(std::cell::RefCell::new(client))),
@@ -829,5 +879,82 @@ mod tests {
         // URL without a password should come back as-is.
         let url = "postgresql://rivet@localhost/state";
         assert_eq!(redact_pg_url(url), url);
+    }
+
+    // ── state(pg) sslmode → TlsMode mapping ─────────────────────────────────
+    //
+    // Pins the decision behind the TLS bug fix: the state backend can no longer
+    // hard-code NoTls. We can't drive a live TLS handshake in a unit test, so we
+    // assert the *chosen transport policy* — TLS is enforced for require /
+    // verify-* and plaintext (NoTls) otherwise — which is what selects the
+    // connector inside `connect_pg` -> `connect_client`.
+    use crate::config::TlsMode;
+
+    #[test]
+    fn state_sslmode_enforced_values_negotiate_tls() {
+        for (url, want) in [
+            (
+                "postgresql://u:p@db.prod:5432/state?sslmode=require",
+                TlsMode::Require,
+            ),
+            (
+                "postgresql://u:p@db.prod/state?sslmode=verify-ca",
+                TlsMode::VerifyCa,
+            ),
+            (
+                "postgresql://u:p@db.prod/state?sslmode=verify-full",
+                TlsMode::VerifyFull,
+            ),
+        ] {
+            let mode = state_tls_mode_from_url(url);
+            assert_eq!(mode, Some(want), "url: {url}");
+            assert!(
+                mode.unwrap().is_enforced(),
+                "{want:?} must enforce TLS (not NoTls)"
+            );
+        }
+    }
+
+    #[test]
+    fn state_sslmode_plaintext_values_stay_notls() {
+        // Missing / disable / prefer / allow / unrecognized / uppercase all keep
+        // the original NoTls behavior, so dev + docker setups are unchanged.
+        for url in [
+            "postgresql://u:p@localhost/state",
+            "postgresql://u:p@localhost/state?sslmode=disable",
+            "postgresql://u:p@db/state?sslmode=prefer",
+            "postgresql://u:p@db/state?sslmode=allow",
+            "postgresql://u:p@db/state?sslmode=REQUIRE",
+            "postgresql://u:p@db/state?sslmode=garbage",
+            "postgresql://u:p@db/state?sslmode",
+            "postgresql://u:p@db/state?sslmode=",
+        ] {
+            assert_eq!(state_tls_mode_from_url(url), None, "url: {url}");
+        }
+    }
+
+    #[test]
+    fn state_sslmode_exact_key_and_last_occurrence_wins() {
+        // `xsslmode` is a different parameter; the exact `sslmode` key matters.
+        assert_eq!(
+            state_tls_mode_from_url("postgresql://u:p@db/state?xsslmode=require"),
+            None
+        );
+        // Found among other params.
+        assert_eq!(
+            state_tls_mode_from_url(
+                "postgresql://u:p@db/state?connect_timeout=10&sslmode=require&application_name=x"
+            ),
+            Some(TlsMode::Require)
+        );
+        // Last occurrence wins, matching libpq.
+        assert_eq!(
+            state_tls_mode_from_url("postgresql://u:p@db/state?sslmode=disable&sslmode=require"),
+            Some(TlsMode::Require)
+        );
+        assert_eq!(
+            state_tls_mode_from_url("postgresql://u:p@db/state?sslmode=require&sslmode=disable"),
+            None
+        );
     }
 }

@@ -19,13 +19,31 @@ builds and the same YAML configs drive every target.
 | PostgreSQL |       16 | Supported (primary target) |
 | MySQL      |      5.7 | Supported (EOL upstream Oct 2023) |
 | MySQL      |      8.0 | Supported (primary target) |
-| SQL Server |     2022 | Supported (primary target) |
+| SQL Server |     2022 | **Beta** (source engine; see scope + advisory below) |
 
 "Primary target" means the version that runs the e2e suite by default in the
 local `docker-compose.yaml` top-level `postgres` / `mysql` / `mssql` services.
 "Legacy" versions are opt-in under the `legacy` compose profile (see below).
 
 ### SQL Server (MSSQL) — current scope
+
+> **Status: Beta.** The engine is live-validated and feature-complete for the
+> shapes below, but it ships a **tracked transitive advisory** and is held to a
+> lower bar than the primary PG/MySQL targets until a `tiberius` upgrade lands.
+>
+> **Known advisory (procurement note):** `tiberius` 0.12 (latest published)
+> pins `rustls` 0.21 → `rustls-webpki` 0.101, which carries CA name-constraint
+> advisories (RUSTSEC-2026-0098/0099) and a CRL-parse panic (RUSTSEC-2026-0104).
+> A newer `tiberius` does not yet exist, so no dependency bump is possible. The
+> path is **reachable only** when validating a server certificate against a
+> name-constraint-asserting **private CA** with `tls.mode: verify-ca|verify-full`
+> on MSSQL (rivet never configures CRL revocation checking, so the panic is
+> unreachable). Loopback / `accept_invalid_certs` connections do not validate
+> and are unaffected. When strict validation IS enabled rivet emits a one-time
+> runtime warning. The advisories are documented + suppressed in
+> `.cargo/audit.toml` with this reachability rationale; they are dropped the
+> moment `tiberius` ships on a newer `rustls`. Security-sensitive deployments
+> that require a clean `cargo audit` should pin to PG/MySQL until then.
 
 SQL Server is a source engine (`source.type: mssql`, scheme `sqlserver://`,
 default port 1433), driven by the async `tiberius` client. Supported today:

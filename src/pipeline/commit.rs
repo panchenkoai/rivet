@@ -130,6 +130,70 @@ pub(crate) fn write_part_file(
     })
 }
 
+/// Seam 1a — finalize the sink's writer and write EVERY part it produced:
+/// the rotated `completed_parts` plus the final partial temp file. Before
+/// this seam, every chunked/keyset runner uploaded only `sink.tmp` — the
+/// parts `ExportSink::maybe_split` had rotated at `max_file_size` were
+/// silently deleted with the sink (total data loss at rotation boundaries;
+/// pinned by the `roast_part_loss` live tests). `single` had its own
+/// correct drain; this is that drain, hoisted to the seam so no runner can
+/// re-introduce the gap.
+///
+/// `name_for(part_idx, part_count)` returns the destination file name —
+/// pass [`part_indexed_name`] over the runner's legacy single-part name so
+/// unrotated chunks (`part_count == 1`) keep their existing naming and
+/// resumes of old runs stay compatible.
+///
+/// Validation (when `validate` is `Some`) runs per part against that
+/// part's own row count — the only count the part actually contains.
+pub(crate) fn write_sink_parts(
+    dest: &dyn Destination,
+    sink: &mut crate::pipeline::sink::ExportSink,
+    validate: Option<crate::config::FormatType>,
+    name_for: impl Fn(usize, usize) -> String,
+) -> Result<Vec<PartRecord>> {
+    if let Some(w) = sink.writer.take() {
+        w.finish()?;
+    }
+    if sink.part_rows > 0 {
+        sink.completed_parts
+            .push(crate::pipeline::sink::CompletedPart {
+                tmp: std::mem::replace(&mut sink.tmp, tempfile::NamedTempFile::new()?),
+                rows: sink.part_rows,
+            });
+        sink.part_rows = 0;
+    }
+    let count = sink.completed_parts.len();
+    let mut recs = Vec::with_capacity(count);
+    for (idx, part) in sink.completed_parts.drain(..).enumerate() {
+        if let Some(fmt) = validate {
+            crate::pipeline::validate::validate_output(part.tmp.path(), fmt, part.rows)?;
+        }
+        recs.push(write_part_file(
+            dest,
+            part.tmp.path(),
+            part.rows as i64,
+            name_for(idx, count),
+        )?);
+    }
+    Ok(recs)
+}
+
+/// Sibling naming for rotated parts: a single-part chunk keeps its legacy
+/// name; a rotated chunk suffixes every part with `_p{idx}` before the
+/// extension (`orders_ts_chunk3.parquet` → `orders_ts_chunk3_p0.parquet`,
+/// `_p1`, …) so siblings sort together and no name collides with the
+/// legacy form.
+pub(crate) fn part_indexed_name(base: &str, idx: usize, count: usize) -> String {
+    if count <= 1 {
+        return base.to_string();
+    }
+    match base.rsplit_once('.') {
+        Some((stem, ext)) => format!("{stem}_p{idx}.{ext}"),
+        None => format!("{base}_p{idx}"),
+    }
+}
+
 /// Seam 2 — the single home for the post-write ordering that used to drift
 /// across runners: the I2 fault window, the byte/file counters, the manifest
 /// part (I2/M1), the journal event, and the warn-on-fail file-log write (I7).
@@ -280,6 +344,28 @@ mod tests {
             fingerprint: "xxh3:1234567890abcdef".into(),
             md5: String::new(),
         }
+    }
+
+    // ── part_indexed_name: rotation sibling naming ───────────────────────────
+
+    #[test]
+    fn part_indexed_name_keeps_legacy_name_for_single_part_and_suffixes_siblings() {
+        // Single part — legacy name untouched (resume/manifest compat).
+        assert_eq!(
+            part_indexed_name("orders_ts_chunk3.parquet", 0, 1),
+            "orders_ts_chunk3.parquet"
+        );
+        // Rotated chunk — every sibling suffixed before the extension.
+        assert_eq!(
+            part_indexed_name("orders_ts_chunk3.parquet", 0, 3),
+            "orders_ts_chunk3_p0.parquet"
+        );
+        assert_eq!(
+            part_indexed_name("orders_ts_chunk3.parquet", 2, 3),
+            "orders_ts_chunk3_p2.parquet"
+        );
+        // No extension — suffix appended bare.
+        assert_eq!(part_indexed_name("orders_chunk3", 1, 2), "orders_chunk3_p1");
     }
 
     // ── write_part_file ──────────────────────────────────────────────────────

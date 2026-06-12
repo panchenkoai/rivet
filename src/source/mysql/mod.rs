@@ -113,6 +113,8 @@ impl MysqlSource {
 
     /// Connect honoring the user's [`TlsConfig`].
     pub fn connect_with_tls(url: &str, tls: Option<&TlsConfig>) -> Result<Self> {
+        // Refuse remote plaintext (no `tls:` block) before any dial (CWE-319).
+        crate::source::require_tls_or_loopback(url, tls)?;
         match tls {
             Some(cfg) if cfg.mode.is_enforced() => {
                 let base = Opts::from_url(url)?;
@@ -146,6 +148,8 @@ impl MysqlSource {
 /// Shared by preflight, doctor, init, and anywhere else we need a pool outside
 /// the `Source` trait. `tls = None` falls back to plaintext (legacy behavior).
 pub(crate) fn connect_pool(url: &str, tls: Option<&TlsConfig>) -> Result<Pool> {
+    // Refuse remote plaintext (no `tls:` block) before any dial (CWE-319).
+    crate::source::require_tls_or_loopback(url, tls)?;
     match tls {
         Some(cfg) if cfg.mode.is_enforced() => {
             let base = Opts::from_url(url)?;
@@ -504,6 +508,10 @@ fn mysql_run_export(
     let mut row_buf: Vec<mysql::Row> = Vec::with_capacity(ctl.target());
     let mut total_rows: usize = 0;
     let mut memory_cap_applied = false;
+    // Per-value ceiling (MB→bytes; `0`/None disables), enforced pre-allocation
+    // inside the batch builder so an oversized cell bails before Arrow reserves
+    // the buffer. Same source of truth as the sink's backstop guard.
+    let max_value_bytes = tuning.max_value_bytes();
 
     for row_result in row_set {
         let row = row_result?;
@@ -511,7 +519,8 @@ fn mysql_run_export(
 
         if row_buf.len() >= ctl.target() {
             total_rows += row_buf.len();
-            let batch = rows_to_record_batch_typed(&schema, &arrow_types, &row_buf)?;
+            let batch =
+                rows_to_record_batch_typed(&schema, &arrow_types, &row_buf, max_value_bytes)?;
             let batch_rows = row_buf.len();
             row_buf.clear();
 
@@ -563,7 +572,7 @@ fn mysql_run_export(
 
     if !row_buf.is_empty() {
         total_rows += row_buf.len();
-        let batch = rows_to_record_batch_typed(&schema, &arrow_types, &row_buf)?;
+        let batch = rows_to_record_batch_typed(&schema, &arrow_types, &row_buf, max_value_bytes)?;
         sink.on_batch(&batch)?;
     }
 
@@ -709,6 +718,15 @@ mod tests {
     #[test]
     fn bit_bytes_empty() {
         assert_eq!(bit_bytes_to_u64(&[]), 0);
+    }
+
+    #[test]
+    fn bit_bytes_ascii_digit_bytes_are_bits_not_text() {
+        // Regression (mysql-bit): BIT bytes that happen to be ASCII digits are
+        // still big-endian bits — never decimal text.
+        assert_eq!(bit_bytes_to_u64(&[0x39]), 57); // "9" as text, BIT(8) 57
+        assert_eq!(bit_bytes_to_u64(&[0x31, 0x32]), 0x3132); // b"12" → 12594
+        assert_eq!(bit_bytes_to_u64(&[0x31, 0xFF]), 12799); // digit head, non-digit tail
     }
 
     // ── InnoDB AVG_ROW_LENGTH correction ────────────────────────────────

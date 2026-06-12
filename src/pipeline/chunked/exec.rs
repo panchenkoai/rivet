@@ -7,9 +7,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use super::super::{
-    RunSummary, progress::ChunkProgress, sink::ExportSink, validate::validate_output,
-};
+use super::super::{RunSummary, progress::ChunkProgress, sink::ExportSink};
 use super::detect::detect_and_generate_chunks;
 use super::math::build_chunk_query_sql;
 use super::poison;
@@ -126,31 +124,35 @@ pub(crate) fn run_chunked_sequential(
         );
 
         if sink.total_rows > 0 {
-            if plan.validate {
-                validate_output(sink.tmp.path(), plan.format, sink.total_rows)?;
-                summary.validated = Some(true);
-            }
             let fmt =
                 format::create_format(plan.format, plan.compression, plan.compression_level, None);
-            let file_name = super::chunk_part_filename(&plan.export_name, i, fmt.file_extension());
+            let base = super::chunk_part_filename(&plan.export_name, i, fmt.file_extension());
             let dest = destination::create_destination(&plan.destination)?;
             // Shared commit path (I1→I2→I7 + counters + journal + fault hooks).
-            // record_part journals the ChunkCompleted event with file_name=Some.
-            let rec = super::super::commit::write_part_file(
+            // write_sink_parts drains every part the sink produced — the
+            // final temp file plus anything maybe_split rotated at
+            // max_file_size — so rotation cannot drop data.
+            let recs = super::super::commit::write_sink_parts(
                 dest.as_ref(),
-                sink.tmp.path(),
-                sink.total_rows as i64,
-                file_name,
+                &mut sink,
+                plan.validate.then_some(plan.format),
+                |idx, count| super::super::commit::part_indexed_name(&base, idx, count),
             )?;
-            super::super::commit::record_part(
-                plan,
-                summary,
-                state,
-                &rec,
-                super::super::commit::PartKind::Chunk {
-                    chunk_index: i as i64,
-                },
-            );
+            if plan.validate {
+                summary.validated = Some(true);
+            }
+            // record_part journals the ChunkCompleted event with file_name=Some.
+            for rec in &recs {
+                super::super::commit::record_part(
+                    plan,
+                    summary,
+                    state,
+                    rec,
+                    super::super::commit::PartKind::Chunk {
+                        chunk_index: i as i64,
+                    },
+                );
+            }
         } else {
             // Empty chunk: no file, but still journal completion so the run
             // record covers every chunk index. record_part only handles the
@@ -407,30 +409,27 @@ pub(crate) fn run_chunked_parallel(
                     agg_rows.fetch_add(sink.total_rows as i64, Ordering::Relaxed);
 
                     if sink.total_rows > 0 {
-                        if plan_for_worker.validate {
-                            validate_output(
-                                sink.tmp.path(),
-                                plan_for_worker.format,
-                                sink.total_rows,
-                            )?;
-                        }
                         let fmt = format::create_format(
                             plan_for_worker.format,
                             plan_for_worker.compression,
                             plan_for_worker.compression_level,
                             None,
                         );
-                        let file_name =
-                            super::chunk_part_filename(export_name, i, fmt.file_extension());
-                        // Worker-safe half of commit (I1 + dest.write + fingerprint).
-                        // Touches no shared run state; record_part runs in the drain.
-                        let rec = super::super::commit::write_part_file(
+                        let base = super::chunk_part_filename(export_name, i, fmt.file_extension());
+                        // Worker-safe half of commit (I1 + dest.write + fingerprint),
+                        // draining every part the sink produced (max_file_size
+                        // rotation included). Touches no shared run state;
+                        // record_part runs in the drain.
+                        let recs = super::super::commit::write_sink_parts(
                             &**shared_destination,
-                            sink.tmp.path(),
-                            sink.total_rows as i64,
-                            file_name,
+                            &mut sink,
+                            plan_for_worker.validate.then_some(plan_for_worker.format),
+                            |idx, count| super::super::commit::part_indexed_name(&base, idx, count),
                         )?;
-                        poison::lock_recover(file_records).push((rec, i as i64));
+                        let mut records = poison::lock_recover(file_records);
+                        for rec in recs {
+                            records.push((rec, i as i64));
+                        }
                     }
 
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;

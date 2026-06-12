@@ -44,6 +44,10 @@ use crate::error::Result;
 use crate::manifest::{MANIFEST_FILENAME, QUARANTINE_PREFIX, RunManifest};
 use crate::pipeline::RunSummary;
 use crate::pipeline::resume_decisions::{ResumeDecision, build_resume_plan};
+// V21 (CWE-400): cap the manifest body so a planted multi-GB manifest.json
+// cannot OOM the resume preamble.  The shared enforcement point lives with the
+// other two control-artifact readers in `validate_manifest`.
+use crate::pipeline::validate_manifest::{MANIFEST_MAX_BYTES, read_capped};
 use crate::plan::ResolvedRunPlan;
 use crate::state::StateStore;
 
@@ -134,7 +138,7 @@ pub(crate) fn apply_m8_resume_decisions(
 
     // ── 2. Read manifest body (absent → fresh / legacy prefix, no-op) ──
     let manifest_bytes = match dest.head(MANIFEST_FILENAME) {
-        Ok(Some(_)) => match dest.read(MANIFEST_FILENAME) {
+        Ok(Some(_)) => match read_capped(&*dest, MANIFEST_FILENAME, MANIFEST_MAX_BYTES) {
             Ok(b) => b,
             Err(e) => {
                 log::warn!(
@@ -464,6 +468,70 @@ mod tests {
         );
         assert_eq!(stats.quarantined_moved, 0);
         assert_eq!(stats.quarantine_move_failures, 1);
+    }
+
+    // ── SEC-RED V21: uncapped manifest read can OOM resume/validate ──────
+    //
+    // resume_m8.rs:136-137 does `head()` then `read()` for `manifest.json`,
+    // discarding the `size_bytes` the `head()` already returned, and reads
+    // the whole body into a `Vec<u8>` with no upper bound.  An attacker who
+    // can write the destination prefix (a shared bucket prefix, a
+    // world-writable export dir) can plant a multi-GB `manifest.json`; the
+    // next `rivet --resume` / `rivet validate` / `rivet repair` slurps it
+    // into memory and OOMs the process.  The same uncapped pattern appears
+    // in `repair_cmd.rs:323-324` and `validate_manifest.rs:355-357` — three
+    // readers, one missing bound.
+    //
+    // SECURE behaviour: the capped reader consults the size `head()` reports
+    // and BAILS (Err) once the object exceeds the manifest cap, instead of
+    // materialising an unbounded body.  Enforced once in
+    // `validate_manifest::read_capped` (cap `MANIFEST_MAX_BYTES`) and called by
+    // all three readers: resume_m8 here, `repair_cmd`, and `validate_manifest`.
+    #[test]
+    fn sec_manifest_read_rejects_oversized() {
+        // SEC-RED V21: a destination manifest larger than the cap must be
+        // refused by the read path, not loaded whole into memory.
+        use crate::config::{DestinationConfig, DestinationType};
+        use crate::destination::local::LocalDestination;
+
+        // A manifest cap well under the planted body.  64 MiB is the figure
+        // the audit cites; the planted object is comfortably above it.
+        const MANIFEST_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = LocalDestination::new(&DestinationConfig {
+            destination_type: DestinationType::Local,
+            path: Some(dir.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Plant a > cap `manifest.json` at the prefix root.  Use a sparse
+        // write (seek + single byte) so the test stays fast and doesn't
+        // itself allocate the multi-MB body it is guarding against.
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::File::create(dir.path().join(MANIFEST_FILENAME)).unwrap();
+            f.seek(SeekFrom::Start(MANIFEST_MAX_BYTES + 4096)).unwrap();
+            f.write_all(b"}").unwrap();
+            f.flush().unwrap();
+        }
+
+        // head() reports the oversized length — proving the size was knowable
+        // before the read (the discarded `size_bytes` at line 136).
+        let meta = dest.head(MANIFEST_FILENAME).unwrap().unwrap();
+        assert!(
+            meta.size_bytes > MANIFEST_MAX_BYTES,
+            "precondition: planted manifest must exceed the cap"
+        );
+
+        // SECURE: the capped reader must BAIL rather than read the whole body.
+        let result = read_capped(&dest, MANIFEST_FILENAME, MANIFEST_MAX_BYTES);
+        assert!(
+            result.is_err(),
+            "oversized manifest.json must be rejected by the capped read path, \
+             not materialised into memory (V21 DoS)"
+        );
     }
 
     /// Cross-check: the in-memory `by_file` index this module builds is

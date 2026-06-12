@@ -180,9 +180,16 @@ pub fn scale_int_to_i256(v: i128, scale: i8) -> Option<i256> {
 }
 
 /// `10^n` as `i256` (up to 10^76, the `Decimal256` scale ceiling); `None` if it
-/// would exceed `i256`.
+/// would exceed `i256`. Repeated `checked_mul` rather than the old
+/// `format!("1{0:0}")` + `i256::from_string` — no per-value string allocation
+/// or parse on the Decimal256 scale path; same overflow contract.
 fn pow10_i256(n: u32) -> Option<i256> {
-    i256::from_string(&format!("1{}", "0".repeat(n as usize)))
+    let ten = i256::from_i128(10);
+    let mut acc = i256::from_i128(1);
+    for _ in 0..n {
+        acc = acc.checked_mul(ten)?;
+    }
+    Some(acc)
 }
 
 #[cfg(test)]
@@ -341,5 +348,18 @@ mod tests {
         assert!(scale_int_to_i256(u64::MAX as i128, 30).is_some());
         assert_eq!(scale_int_to_i256(5, 2), Some(i256::from_i128(500)));
         assert_eq!(scale_int_to_i256(123, -1), None, "negative scale rejected");
+    }
+
+    #[test]
+    fn pow10_i256_matches_string_form_and_respects_ceiling() {
+        // The checked_mul loop must equal the old format!+from_string for every
+        // power, span the i128 boundary, reach the Decimal256 ceiling (10^76),
+        // and overflow to None beyond it.
+        for n in [0u32, 1, 5, 18, 38, 39, 76] {
+            let expected = i256::from_string(&format!("1{}", "0".repeat(n as usize)));
+            assert_eq!(pow10_i256(n), expected, "10^{n} mismatch");
+        }
+        assert!(pow10_i256(76).is_some(), "10^76 fits i256");
+        assert!(pow10_i256(77).is_none(), "10^77 overflows i256 → None");
     }
 }

@@ -94,7 +94,38 @@ pub fn collect_report(
         SourceType::Mssql => Box::new(source::mssql::MssqlSource::connect_with_tls(&url, tls)?),
     };
 
-    let mappings = src.type_mappings(&query, column_overrides)?;
+    let mut mappings = src.type_mappings(&query, column_overrides)?;
+
+    // #32 (column-applicability): a `columns:` override that *narrows* the
+    // source type — e.g. `price numeric(10,2)` → `decimal(20,0)` — drops the
+    // two fractional digits at `run`, but `derive_fidelity` only sees the
+    // resolved (overridden) `RivetType` and labels it `exact`. That makes
+    // `check --type-report` disagree with what `run` actually does (a
+    // check↔run gap). Re-probe the *autodetected* source types (no overrides)
+    // and downgrade any overridden column whose override narrows scale or
+    // integer-digit capacity to `Lossy`, with a warning that says why. We only
+    // downgrade when the source type is confidently known (autodetect resolved
+    // it) — never on a guess, so we don't fabricate a loss we can't prove.
+    if !column_overrides.is_empty() {
+        let source_mappings = src.type_mappings(&query, &ColumnOverrides::new())?;
+        let source_by_name: std::collections::HashMap<&str, &crate::types::RivetType> =
+            source_mappings
+                .iter()
+                .map(|m| (m.column_name.as_str(), &m.rivet_type))
+                .collect();
+        for m in &mut mappings {
+            if !column_overrides.contains_key(&m.column_name) {
+                continue;
+            }
+            if let Some(&src_type) = source_by_name.get(m.column_name.as_str())
+                && let Some(reason) = override_narrows(src_type, &m.rivet_type)
+            {
+                m.fidelity = TypeFidelity::Lossy;
+                m.warnings.push(reason);
+            }
+        }
+    }
+
     let mut violations = policy.validate(&mappings);
 
     // Format-awareness: type resolution above is for the Parquet representation,
@@ -317,6 +348,57 @@ fn fidelity_marker(f: TypeFidelity) -> &'static str {
     }
 }
 
+/// Detect whether a `columns:` override *narrows* the autodetected source type
+/// in a value-losing way. Returns `Some(reason)` to flag the column `Lossy`,
+/// `None` when the override preserves or widens the type (or when the comparison
+/// is not applicable).
+///
+/// Today this covers the decimal case the audit exercises (#32): a scale or
+/// integer-digit reduction on `numeric`/`decimal`. A scale reduction
+/// (`numeric(10,2)` → `decimal(20,0)`) silently truncates the fractional digits
+/// at `run`; an integer-digit reduction (`(20,0)` → `(10,0)`) overflows the
+/// declared precision. Either is genuinely lossy and must not be reported
+/// `exact`. Widening or an equal scale/precision is fine. Non-decimal overrides
+/// are left to `derive_fidelity` (not narrowing-classified here).
+fn override_narrows(
+    source: &crate::types::RivetType,
+    overridden: &crate::types::RivetType,
+) -> Option<String> {
+    use crate::types::RivetType::Decimal;
+    if let (
+        Decimal {
+            precision: sp,
+            scale: ss,
+        },
+        Decimal {
+            precision: op,
+            scale: os,
+        },
+    ) = (source, overridden)
+    {
+        // Fractional-digit loss: the override keeps fewer digits to the right
+        // of the point than the source declared.
+        if os < ss {
+            return Some(format!(
+                "override decimal({op},{os}) reduces scale from source numeric({sp},{ss}) — \
+                 {} fractional digit(s) are truncated at run; this is lossy, not exact",
+                (*ss as i16) - (*os as i16)
+            ));
+        }
+        // Integer-digit loss: the override leaves fewer digits to the left of
+        // the point than the source could hold, so large values overflow.
+        let src_int_digits = *sp as i16 - *ss as i16;
+        let ov_int_digits = *op as i16 - *os as i16;
+        if ov_int_digits < src_int_digits {
+            return Some(format!(
+                "override decimal({op},{os}) reduces integer-digit capacity from source \
+                 numeric({sp},{ss}) — large values overflow at run; this is lossy, not exact"
+            ));
+        }
+    }
+    None
+}
+
 fn rivet_type_label(t: &crate::types::RivetType) -> String {
     use crate::types::RivetType::*;
     match t {
@@ -350,6 +432,60 @@ fn rivet_type_label(t: &crate::types::RivetType) -> String {
 mod tests {
     use super::*;
     use crate::types::{RivetType, TypeFidelity};
+
+    // ── override_narrows (#32: lossy scale/precision narrowing) ──────────────
+
+    fn dec(precision: u8, scale: i8) -> RivetType {
+        RivetType::Decimal { precision, scale }
+    }
+
+    #[test]
+    fn narrows_flags_scale_reduction_as_lossy() {
+        // The audit case: numeric(10,2) overridden to decimal(20,0) drops the
+        // two fractional digits — must be flagged, never 'exact'.
+        let reason = override_narrows(&dec(10, 2), &dec(20, 0)).expect("scale drop is lossy");
+        assert!(
+            reason.contains("scale"),
+            "reason should name scale: {reason}"
+        );
+        assert!(
+            reason.contains("lossy"),
+            "reason should say lossy: {reason}"
+        );
+    }
+
+    #[test]
+    fn narrows_none_when_scale_preserved() {
+        // Same scale, wider precision: no fractional loss → not narrowing.
+        assert!(override_narrows(&dec(10, 2), &dec(20, 2)).is_none());
+        // Identical type: not narrowing.
+        assert!(override_narrows(&dec(10, 2), &dec(10, 2)).is_none());
+    }
+
+    #[test]
+    fn narrows_none_when_scale_widened() {
+        // More fractional digits than the source declared preserves every value.
+        assert!(override_narrows(&dec(10, 2), &dec(12, 4)).is_none());
+    }
+
+    #[test]
+    fn narrows_flags_integer_digit_reduction_as_lossy() {
+        // Same scale but fewer integer digits: (20,0) → (10,0) overflows large
+        // values, so it is lossy even though the scale is unchanged.
+        let reason =
+            override_narrows(&dec(20, 0), &dec(10, 0)).expect("integer-digit drop is lossy");
+        assert!(
+            reason.contains("integer-digit") && reason.contains("lossy"),
+            "reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn narrows_none_for_non_decimal_overrides() {
+        // Non-decimal overrides are classified by derive_fidelity, not here.
+        assert!(override_narrows(&RivetType::Int32, &RivetType::Int64).is_none());
+        assert!(override_narrows(&RivetType::Int64, &RivetType::String).is_none());
+    }
 
     // ── fidelity_marker ──────────────────────────────────────────────────────
 

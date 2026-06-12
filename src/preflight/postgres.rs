@@ -68,7 +68,29 @@ fn diagnose_pg(
         ),
     };
 
-    let base_query = export.query.as_deref().unwrap_or("SELECT 1");
+    // Resolve the same base query the runner will issue. For the `table:`
+    // shortcut (no `query:`) this is the canonical `SELECT * FROM <table>`
+    // (`ExportConfig::resolve_query`, which also validates/quotes the ident) —
+    // NOT a `SELECT 1` placeholder, or every probe below (row estimate, scan
+    // type, cursor range) would describe a 1-row dummy relation instead of the
+    // real table. config_dir/params are unused on the `table:`/inline branches;
+    // a query_file would already have been read at plan time, so fall back to
+    // the inline/placeholder text if resolution fails here (preflight is
+    // non-fatal — surface the cause at debug rather than abort the diagnostic).
+    let base_query: String = match export.resolve_query(std::path::Path::new(""), None) {
+        Ok(q) => q,
+        Err(e) => {
+            log::debug!(
+                "preflight: base-query resolution failed for export '{}': {e}",
+                export.name
+            );
+            export
+                .query
+                .clone()
+                .unwrap_or_else(|| "SELECT 1".to_string())
+        }
+    };
+    let base_query = base_query.as_str();
 
     let range_col = export
         .chunk_column
@@ -216,11 +238,15 @@ fn get_cursor_range_pg(
     base_query: &str,
     cursor_col: &str,
 ) -> (Option<String>, Option<String>) {
+    // Quote the config-author-controlled column so a hostile value collapses to
+    // a single (nonexistent) identifier instead of injecting SQL into the
+    // min()/max() aggregates (CWE-89) — same defense the MSSQL sibling applies.
+    let expr = crate::sql::quote_ident(SourceType::Postgres, cursor_col);
     let range_query = match crate::pipeline::chunked::strip_select_star_from(base_query) {
-        Some(tbl) => format!("SELECT min({cursor_col})::text, max({cursor_col})::text FROM {tbl}"),
-        None => format!(
-            "SELECT min({cursor_col})::text, max({cursor_col})::text FROM ({base_query}) AS _rivet"
-        ),
+        Some(tbl) => format!("SELECT min({expr})::text, max({expr})::text FROM {tbl}"),
+        None => {
+            format!("SELECT min({expr})::text, max({expr})::text FROM ({base_query}) AS _rivet")
+        }
     };
     match client.query(&range_query, &[]) {
         Ok(rows) if !rows.is_empty() => {
@@ -621,6 +647,63 @@ mod tests {
         // hasn't supplied a query yet. Must not crash, must return None.
         assert_eq!(table_from_simple_query("SELECT 1"), None);
         assert_eq!(table_from_simple_query(""), None);
+    }
+
+    // ── regression: `table:` shortcut must NOT preflight the "SELECT 1" stub ──
+    //
+    // Guards the root cause of audit_preflight_table (findings #3, #15): the
+    // base query `diagnose_pg` probes for a `table:`-shortcut export (no
+    // `query:`) is the canonical `SELECT * FROM <table>`, not the 1-row
+    // placeholder. If this contract regresses, every downstream probe (row
+    // estimate, scan type, cursor range) silently describes a dummy relation.
+
+    #[test]
+    fn table_shortcut_resolves_to_real_table_not_select_one() {
+        let mut export = crate::config::sample_export("orders");
+        export.query = None;
+        export.table = Some("orders".into());
+        // Same call diagnose_pg makes — config_dir/params are unused on this
+        // branch. The base query the probes see must be the real table.
+        let base = export
+            .resolve_query(std::path::Path::new(""), None)
+            .expect("table shortcut resolves");
+        assert_eq!(base, "SELECT * FROM orders");
+        assert_ne!(base, "SELECT 1");
+        // …and it must be recognised as a single-table read so the min/max
+        // range probe rewrites in place (recovering the dropped Cursor range).
+        assert_eq!(
+            crate::pipeline::chunked::strip_select_star_from(&base),
+            Some("orders")
+        );
+        assert_eq!(table_from_simple_query(&base), Some("orders"));
+    }
+
+    #[test]
+    fn schema_qualified_table_shortcut_resolves_to_real_table() {
+        let mut export = crate::config::sample_export("orders");
+        export.query = None;
+        export.table = Some("public.orders".into());
+        let base = export
+            .resolve_query(std::path::Path::new(""), None)
+            .expect("schema-qualified table shortcut resolves");
+        assert_eq!(base, "SELECT * FROM public.orders");
+        assert_eq!(
+            crate::pipeline::chunked::strip_select_star_from(&base),
+            Some("public.orders")
+        );
+    }
+
+    #[test]
+    fn inline_query_form_is_left_untouched() {
+        // The fix must not change behavior when `query:` is provided — the
+        // user's SQL flows through verbatim.
+        let mut export = crate::config::sample_export("custom");
+        export.table = None;
+        export.query = Some("SELECT id, total FROM orders WHERE total > 0".into());
+        let base = export
+            .resolve_query(std::path::Path::new(""), None)
+            .expect("inline query resolves");
+        assert_eq!(base, "SELECT id, total FROM orders WHERE total > 0");
     }
 
     #[test]

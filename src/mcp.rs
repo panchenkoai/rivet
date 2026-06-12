@@ -10,6 +10,8 @@
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
 
+use crate::config::{TlsConfig, TlsMode};
+
 // ─── Public entry point ────────────────────────────────────────────────────
 
 /// Run the MCP server loop on stdin/stdout until EOF.
@@ -37,10 +39,14 @@ pub fn run_stdio(pg_url: Option<&str>, mysql_url: Option<&str>) -> anyhow::Resul
         let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let envelope = match dispatch(method, &msg, pg_url, mysql_url) {
             Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+            // The MCP client is prompt-injectable (it is an LLM); route every
+            // error through the shared redaction chokepoint so a connect error
+            // carrying a `scheme://user:password@host` URL never reaches it in
+            // cleartext (CWE-209).
             Err(e) => json!({
                 "jsonrpc": "2.0",
                 "id": id,
-                "error": { "code": -32_000, "message": e.to_string() }
+                "error": { "code": -32_000, "message": crate::redact::redact_error(&e) }
             }),
         };
 
@@ -82,8 +88,9 @@ fn dispatch(
             // Per MCP spec, tool execution errors are text content, not JSON-RPC errors.
             Ok(match call_tool(name, args, pg_url, mysql_url) {
                 Ok(v) => v,
+                // Redact before the error reaches the (prompt-injectable) client.
                 Err(e) => json!({
-                    "content": [{ "type": "text", "text": format!("error: {e}") }],
+                    "content": [{ "type": "text", "text": format!("error: {}", crate::redact::redact_error(&e)) }],
                     "isError": true
                 }),
             })
@@ -210,15 +217,54 @@ fn require_mysql(url: Option<&str>) -> anyhow::Result<&str> {
 }
 
 fn text(result: anyhow::Result<String>) -> anyhow::Result<Value> {
-    let body = result.unwrap_or_else(|e| format!("error: {e}"));
+    // On the error branch the body is a stringified driver/connect error that
+    // may embed a `scheme://user:password@host` URL; redact before it reaches
+    // the prompt-injectable client (CWE-209). The Ok branch is tool output
+    // (already-formatted DB rows), which carries no credential material.
+    let body = result.unwrap_or_else(|e| format!("error: {}", crate::redact::redact_error(&e)));
     Ok(json!({ "content": [{ "type": "text", "text": body }] }))
 }
 
 // ─── Postgres tools ────────────────────────────────────────────────────────
 
+/// Derive a [`TlsConfig`] from a connection URL's `sslmode` query parameter so
+/// the MCP diagnostics tools honor transport security (CWE-319). The MCP server
+/// runs before/without any YAML `tls:` block (it takes raw URLs on the command
+/// line), so the URL's `sslmode` is the only policy signal — the same source
+/// `rivet init` and the state backend use.
+///
+/// `require` / `verify-ca` / `verify-full` map to the enforced mode; everything
+/// else (missing, `disable`, `prefer`, `allow`, unrecognized) returns `None`
+/// (plaintext), which keeps loopback/local-dev URLs working. Last occurrence
+/// wins, matching libpq. Returning `None` for a remote plaintext URL is what
+/// lets the shared connect seams refuse it via `require_tls_or_loopback`.
+fn tls_config_from_url(url: &str) -> Option<TlsConfig> {
+    let (_, query) = url.split_once('?')?;
+    let mut mode = None;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key != "sslmode" {
+            continue;
+        }
+        mode = match value {
+            "require" => Some(TlsMode::Require),
+            "verify-ca" => Some(TlsMode::VerifyCa),
+            "verify-full" => Some(TlsMode::VerifyFull),
+            _ => None,
+        };
+    }
+    mode.map(|mode| TlsConfig {
+        mode,
+        ..TlsConfig::default()
+    })
+}
+
 fn pg_connect(url: &str) -> anyhow::Result<postgres::Client> {
-    use postgres::NoTls;
-    Ok(postgres::Client::connect(url, NoTls)?)
+    // Route through the shared TLS-aware seam (same path as doctor/check/init)
+    // so `sslmode=require|verify-ca|verify-full` is honored and remote plaintext
+    // is refused before any dial.
+    let tls = tls_config_from_url(url);
+    crate::source::postgres::connect_client(url, tls.as_ref())
 }
 
 /// Convert a Postgres row cell to a displayable string.
@@ -303,23 +349,41 @@ fn pg_checkpoint_pressure(url: &str) -> anyhow::Result<String> {
     Ok(format!("pg_stat_bgwriter\n\n{}", pg_rows_to_table(&rows)))
 }
 
+/// SQL for `pg_table_stats`. The schema value only selects the variant — the
+/// caller binds it as `$1`, so client-supplied input never lands in the SQL
+/// text (the tool's read-only promise depends on this).
+fn pg_table_stats_sql(schema: Option<&str>) -> &'static str {
+    match schema {
+        Some(_) => {
+            "SELECT schemaname, relname AS tablename, n_live_tup, n_dead_tup,
+                    (n_dead_tup * 100 / NULLIF(n_live_tup + n_dead_tup, 0)) AS dead_pct,
+                    COALESCE(to_char(last_vacuum, 'YYYY-MM-DD HH24:MI'), '-') AS last_vacuum,
+                    COALESCE(to_char(last_analyze, 'YYYY-MM-DD HH24:MI'), '-') AS last_analyze
+             FROM pg_stat_user_tables
+             WHERE schemaname = $1::text
+             ORDER BY n_live_tup DESC
+             LIMIT 20"
+        }
+        None => {
+            "SELECT schemaname, relname AS tablename, n_live_tup, n_dead_tup,
+                    (n_dead_tup * 100 / NULLIF(n_live_tup + n_dead_tup, 0)) AS dead_pct,
+                    COALESCE(to_char(last_vacuum, 'YYYY-MM-DD HH24:MI'), '-') AS last_vacuum,
+                    COALESCE(to_char(last_analyze, 'YYYY-MM-DD HH24:MI'), '-') AS last_analyze
+             FROM pg_stat_user_tables
+             WHERE schemaname NOT IN ('pg_catalog','information_schema','pg_toast')
+             ORDER BY n_live_tup DESC
+             LIMIT 20"
+        }
+    }
+}
+
 fn pg_table_stats(url: &str, schema: Option<&str>) -> anyhow::Result<String> {
     let mut client = pg_connect(url)?;
-    let schema_filter = match schema {
-        Some(s) => format!("AND schemaname = '{s}'"),
-        None => "AND schemaname NOT IN ('pg_catalog','information_schema','pg_toast')".into(),
+    let sql = pg_table_stats_sql(schema);
+    let rows = match schema {
+        Some(s) => client.query(sql, &[&s])?,
+        None => client.query(sql, &[])?,
     };
-    let sql = format!(
-        "SELECT schemaname, relname AS tablename, n_live_tup, n_dead_tup,
-                (n_dead_tup * 100 / NULLIF(n_live_tup + n_dead_tup, 0)) AS dead_pct,
-                COALESCE(to_char(last_vacuum, 'YYYY-MM-DD HH24:MI'), '-') AS last_vacuum,
-                COALESCE(to_char(last_analyze, 'YYYY-MM-DD HH24:MI'), '-') AS last_analyze
-         FROM pg_stat_user_tables
-         WHERE TRUE {schema_filter}
-         ORDER BY n_live_tup DESC
-         LIMIT 20"
-    );
-    let rows = client.query(&sql, &[])?;
     Ok(format!(
         "Table stats (top 20)\n\n{}",
         pg_rows_to_table(&rows)
@@ -380,14 +444,12 @@ fn pg_top_queries_by_io(url: &str) -> anyhow::Result<String> {
 // ─── MySQL tools ───────────────────────────────────────────────────────────
 
 fn mysql_pool(url: &str) -> anyhow::Result<mysql::Pool> {
-    use mysql::{Opts, OptsBuilder, PoolConstraints, PoolOpts};
-    let opts = Opts::from(
-        OptsBuilder::from_opts(Opts::from_url(url)?).pool_opts(
-            PoolOpts::default()
-                .with_constraints(PoolConstraints::new(1, 1).expect("valid pool constraints")),
-        ),
-    );
-    Ok(mysql::Pool::new(opts)?)
+    // Route through the shared TLS-aware seam so `sslmode` from the URL enables
+    // `ssl_opts` (previously the MCP pool built Opts with no TLS — CWE-319) and
+    // remote plaintext is refused before any dial. The seam pins lean pool opts
+    // (no eager pre-connection) for these short-lived diagnostics calls.
+    let tls = tls_config_from_url(url);
+    crate::source::mysql::connect_pool(url, tls.as_ref())
 }
 
 fn mysql_rows_to_table(rows: &[Vec<String>], headers: &[String]) -> String {
@@ -469,24 +531,40 @@ fn mysql_key_metrics(url: &str) -> anyhow::Result<String> {
     ))
 }
 
+/// SQL for `mysql_table_stats`. The schema value only selects the variant —
+/// the caller binds it as `?`, so client-supplied input never lands in the
+/// SQL text (the tool's read-only promise depends on this).
+fn mysql_table_stats_sql(schema: Option<&str>) -> &'static str {
+    match schema {
+        Some(_) => {
+            "SELECT table_schema, table_name, table_rows, \
+                    data_length, index_length, engine \
+             FROM information_schema.TABLES \
+             WHERE table_type = 'BASE TABLE' AND table_schema = ? \
+             ORDER BY table_rows DESC \
+             LIMIT 20"
+        }
+        None => {
+            "SELECT table_schema, table_name, table_rows, \
+                    data_length, index_length, engine \
+             FROM information_schema.TABLES \
+             WHERE table_type = 'BASE TABLE' \
+               AND table_schema NOT IN ('information_schema','performance_schema','mysql','sys') \
+             ORDER BY table_rows DESC \
+             LIMIT 20"
+        }
+    }
+}
+
 fn mysql_table_stats(url: &str, schema: Option<&str>) -> anyhow::Result<String> {
     use mysql::prelude::*;
     let pool = mysql_pool(url)?;
     let mut conn = pool.get_conn()?;
-    let schema_filter = match schema {
-        Some(s) => format!("AND table_schema = '{s}'"),
-        None => "AND table_schema NOT IN ('information_schema','performance_schema','mysql','sys')"
-            .into(),
+    let sql = mysql_table_stats_sql(schema);
+    let mut result = match schema {
+        Some(s) => conn.exec_iter(sql, (s,))?,
+        None => conn.exec_iter(sql, ())?,
     };
-    let sql = format!(
-        "SELECT table_schema, table_name, table_rows, \
-                data_length, index_length, engine \
-         FROM information_schema.TABLES \
-         WHERE table_type = 'BASE TABLE' {schema_filter} \
-         ORDER BY table_rows DESC \
-         LIMIT 20"
-    );
-    let mut result = conn.exec_iter(&sql, ())?;
     let cols: Vec<String> = result
         .columns()
         .as_ref()
@@ -525,8 +603,7 @@ fn pgbouncer_query(sql: &str) -> anyhow::Result<String> {
              Example: postgresql://pgbouncer@127.0.0.1:6432/pgbouncer"
         )
     })?;
-    use postgres::NoTls;
-    let mut client = postgres::Client::connect(&admin_url, NoTls)?;
+    let mut client = pg_connect(&admin_url)?;
     let rows = client.query(sql, &[])?;
     Ok(pg_rows_to_table(&rows))
 }
@@ -600,6 +677,140 @@ mod tests {
         let out = ascii_table(&headers, &[]);
         // No body line — header + separator only.
         assert_eq!(out, "col_a | col_b\n------+------");
+    }
+
+    // Hostile `schema` values an MCP client (an LLM) could supply. Both stay
+    // inside a single SELECT, so single-statement defaults do not block them —
+    // only bind parameters do.
+    const HOSTILE_PG: &str = "x' UNION SELECT usename, passwd, 0, 0, 0, '-', '-' FROM pg_shadow --";
+    const HOSTILE_MYSQL: &str =
+        "x' UNION SELECT user, authentication_string, 0, 0, 0, 'x' FROM mysql.user -- ";
+
+    #[test]
+    fn pg_table_stats_sql_binds_schema_instead_of_interpolating() {
+        let sql = pg_table_stats_sql(Some(HOSTILE_PG));
+        assert!(
+            sql.contains("schemaname = $1"),
+            "schema filter must use a bind placeholder, got: {sql}"
+        );
+        assert!(
+            !sql.contains(HOSTILE_PG) && !sql.contains("UNION"),
+            "client input must never land in the SQL text, got: {sql}"
+        );
+        // The SQL text is identical regardless of the schema value.
+        assert_eq!(sql, pg_table_stats_sql(Some("public")));
+    }
+
+    #[test]
+    fn pg_table_stats_sql_no_schema_is_static_with_no_placeholder() {
+        let sql = pg_table_stats_sql(None);
+        assert!(sql.contains("schemaname NOT IN"));
+        assert!(!sql.contains("$1"), "fallback takes no bind params: {sql}");
+    }
+
+    #[test]
+    fn mysql_table_stats_sql_binds_schema_instead_of_interpolating() {
+        let sql = mysql_table_stats_sql(Some(HOSTILE_MYSQL));
+        assert!(
+            sql.contains("table_schema = ?"),
+            "schema filter must use a bind placeholder, got: {sql}"
+        );
+        assert!(
+            !sql.contains(HOSTILE_MYSQL) && !sql.contains("UNION"),
+            "client input must never land in the SQL text, got: {sql}"
+        );
+        assert_eq!(sql, mysql_table_stats_sql(Some("appdb")));
+    }
+
+    #[test]
+    fn mysql_table_stats_sql_no_schema_is_static_with_no_placeholder() {
+        let sql = mysql_table_stats_sql(None);
+        assert!(sql.contains("table_schema NOT IN"));
+        assert!(!sql.contains('?'), "fallback takes no bind params: {sql}");
+    }
+
+    // ── V10/V18: sslmode → TlsConfig derivation ──────────────────────────────
+
+    #[test]
+    fn tls_config_from_url_enforces_when_sslmode_requested() {
+        for (url, want) in [
+            (
+                "postgresql://u:p@db.prod:5432/d?sslmode=require",
+                TlsMode::Require,
+            ),
+            (
+                "postgresql://u:p@db.prod/d?sslmode=verify-ca",
+                TlsMode::VerifyCa,
+            ),
+            (
+                "mysql://u:p@db.prod:3306/d?sslmode=verify-full",
+                TlsMode::VerifyFull,
+            ),
+        ] {
+            let cfg = tls_config_from_url(url)
+                .unwrap_or_else(|| panic!("expected enforced TLS for {url}"));
+            assert_eq!(cfg.mode, want, "url {url}");
+            assert!(cfg.mode.is_enforced(), "url {url} must enforce TLS");
+        }
+    }
+
+    #[test]
+    fn tls_config_from_url_none_for_plaintext_or_missing() {
+        // Missing, disable, prefer/allow, unrecognized, or empty → None (plaintext),
+        // which on a remote host is what makes the shared seam refuse the dial.
+        for url in [
+            "postgresql://u:p@localhost/d",
+            "mysql://u:p@127.0.0.1:3306/d",
+            "postgresql://u:p@db/d?sslmode=disable",
+            "postgresql://u:p@db/d?sslmode=prefer",
+            "postgresql://u:p@db/d?sslmode=allow",
+            "postgresql://u:p@db/d?sslmode=REQUIRE",
+            "postgresql://u:p@db/d?sslmode=garbage",
+            "postgresql://u:p@db/d?sslmode",
+            "postgresql://u:p@db/d?sslmode=",
+        ] {
+            assert!(tls_config_from_url(url).is_none(), "url {url} must be None");
+        }
+    }
+
+    #[test]
+    fn tls_config_from_url_exact_key_and_last_occurrence_wins() {
+        // `xsslmode` is a different parameter; the exact `sslmode` key matters.
+        assert!(tls_config_from_url("postgresql://u:p@db/d?xsslmode=require").is_none());
+        // Last occurrence wins (matches libpq), even mid-query.
+        let cfg = tls_config_from_url(
+            "postgresql://u:p@db/d?connect_timeout=10&sslmode=require&application_name=x",
+        )
+        .expect("enforced");
+        assert_eq!(cfg.mode, TlsMode::Require);
+        assert!(
+            tls_config_from_url("postgresql://u:p@db/d?sslmode=require&sslmode=disable").is_none()
+        );
+    }
+
+    // ── V11: MCP error emission must pass through the redaction chokepoint ─────
+
+    #[test]
+    fn sec_mcp_error_is_redacted() {
+        // A connect error commonly stringifies the URL it failed to reach,
+        // including `user:password@host`. The MCP client is an LLM (prompt-
+        // injectable), so the tool-output `text()` path must redact before the
+        // password reaches it.
+        let err = anyhow::anyhow!(
+            "could not connect to postgresql://rivet:s3cret@db.prod:5432/orders: timeout"
+        );
+        let value = text(Err(err)).expect("text() always returns Ok envelope");
+        let body = value["content"][0]["text"]
+            .as_str()
+            .expect("text content present");
+        assert!(
+            !body.contains("s3cret"),
+            "password must be redacted in MCP error output: {body}"
+        );
+        assert!(
+            body.contains("postgresql://REDACTED@db.prod:5432/orders"),
+            "host/path retained, userinfo redacted: {body}"
+        );
     }
 
     #[test]
