@@ -79,16 +79,16 @@ Example summary card after a successful run:
 ── orders ──
   run_id:      orders_20260519T120000.123
   status:      success
-  tuning:      profile=balanced (default), batch_size=10000
-  rows:        5432
+  tuning:      profile=balanced (default), batch_size=10,000
+  rows:        5,432
   files:       1
   output:      file://./output
   bytes:       847 KB
   duration:    1.2s
-  peak RSS:    15MB (sampled during run)
+  peak RSS:    15 MB (sampled during run)
   validated:   pass
   schema:      unchanged
-  reconcile:   MATCH (5432/5432)
+  reconcile:   MATCH (5,432/5,432)
 ```
 
 ## 4 · Inspect & iterate
