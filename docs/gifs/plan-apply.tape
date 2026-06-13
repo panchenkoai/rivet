@@ -31,7 +31,7 @@ Type "# Step 1 — seal the intent into an auditable plan artifact"
 Enter
 Sleep 1500ms
 
-Type "rivet plan --config orders.yaml --format json --output plan.json"
+Type "rivet plan -c orders.yaml --format json --output plan.json"
 Enter
 Sleep 2500ms
 

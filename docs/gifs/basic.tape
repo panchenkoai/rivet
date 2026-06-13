@@ -41,19 +41,19 @@ Type "cat orders.yaml"
 Enter
 Sleep 2500ms
 
-Type "rivet doctor --config orders.yaml"
+Type "rivet doctor -c orders.yaml"
 Enter
 Sleep 2s
 
-Type "rivet check --config orders.yaml"
+Type "rivet check -c orders.yaml"
 Enter
 Sleep 2500ms
 
-Type "rivet run --config orders.yaml --validate --reconcile"
+Type "rivet run -c orders.yaml --validate --reconcile"
 Enter
 Sleep 12s
 
-Type "rivet state show --config orders.yaml"
+Type "rivet state show -c orders.yaml"
 Enter
 Sleep 2s
 

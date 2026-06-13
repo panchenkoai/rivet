@@ -28,22 +28,22 @@ Enter
 Sleep 300ms
 Show
 
-Type "rivet state show --config orders_incremental.yaml"
+Type "rivet state show -c orders_incremental.yaml"
 Enter
 Sleep 2500ms
 
-Type "rivet metrics --config orders_incremental.yaml --last 5"
+Type "rivet metrics -c orders_incremental.yaml --last 5"
 Enter
 Sleep 3s
 
-Type "rivet state files --config orders_incremental.yaml --last 5"
+Type "rivet state files -c orders_incremental.yaml --last 5"
 Enter
 Sleep 3s
 
-Type "rivet state progression --config orders_incremental.yaml"
+Type "rivet state progression -c orders_incremental.yaml"
 Enter
 Sleep 3s
 
-Type "rivet journal --config orders_incremental.yaml --export events --last 1"
+Type "rivet journal -c orders_incremental.yaml --export events --last 1"
 Enter
 Sleep 4s

@@ -31,7 +31,7 @@ Type "# 1. Chunked export with checkpoint — 4 chunks of 2,500 rows"
 Enter
 Sleep 1500ms
 
-Type "rivet run --config chunked.yaml --validate 2>&1 | tail -n 20"
+Type "rivet run -c chunked.yaml --validate 2>&1 | tail -n 20"
 Enter
 Sleep 4s
 
@@ -39,7 +39,7 @@ Type "# 2. Reconcile re-counts every partition on the source"
 Enter
 Sleep 1500ms
 
-Type "rivet reconcile --config chunked.yaml --export events"
+Type "rivet reconcile -c chunked.yaml --export events"
 Enter
 Sleep 3s
 
@@ -51,7 +51,7 @@ Type `psql "$DATABASE_URL" -c "DELETE FROM rivet_gif.events WHERE id BETWEEN 250
 Enter
 Sleep 1500ms
 
-Type "rivet reconcile --config chunked.yaml --export events"
+Type "rivet reconcile -c chunked.yaml --export events"
 Enter
 Sleep 3s
 
@@ -59,7 +59,7 @@ Type "# 4. Targeted repair — re-run only the flagged chunk"
 Enter
 Sleep 1500ms
 
-Type "rivet repair --config chunked.yaml --export events --execute"
+Type "rivet repair -c chunked.yaml --export events --execute"
 Enter
 Sleep 3s
 
@@ -67,7 +67,7 @@ Type "# 5. Committed boundary is untouched (ADR-0009 RR4)"
 Enter
 Sleep 1200ms
 
-Type "rivet state progression --config chunked.yaml"
+Type "rivet state progression -c chunked.yaml"
 Enter
 Sleep 3500ms
 

@@ -28,11 +28,11 @@ Type "# First run — no cursor yet, all 10,000 rows exported"
 Enter
 Sleep 1500ms
 
-Type "rivet run --config incremental.yaml --validate"
+Type "rivet run -c incremental.yaml --validate"
 Enter
 Sleep 3500ms
 
-Type "rivet state show --config incremental.yaml"
+Type "rivet state show -c incremental.yaml"
 Enter
 Sleep 2500ms
 
@@ -40,10 +40,10 @@ Type "# Second run — cursor is now 10000; nothing new. skip_empty suppresses t
 Enter
 Sleep 2s
 
-Type "rivet run --config incremental.yaml --validate"
+Type "rivet run -c incremental.yaml --validate"
 Enter
 Sleep 3s
 
-Type "rivet state show --config incremental.yaml"
+Type "rivet state show -c incremental.yaml"
 Enter
 Sleep 2500ms
