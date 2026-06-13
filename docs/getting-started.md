@@ -1,4 +1,4 @@
-_Last updated: 2026-05-19._
+_Last updated: 2026-06-13._
 
 # Getting Started
 
@@ -118,6 +118,26 @@ exports:
 ```
 
 Subsequent `rivet run` invocations will only fetch rows with `updated_at >` the stored cursor. For tables larger than ~5 M rows, switch to `mode: chunked` instead — see [modes/chunked.md](modes/chunked.md).
+
+---
+
+## When something is wrong
+
+Rivet tries to fail early and say exactly what to fix — most mistakes are caught at `check` / `doctor` time, before a single row is read.
+
+A query that references a table (or column) that doesn't exist is caught by `rivet check` — it exits non-zero with the offending name and SQLSTATE, instead of passing through to a half-finished run:
+
+![rivet check catches a query against a missing table](gifs/error-missing-table.gif)
+
+A typo in a config field is caught at parse time with a `Did you mean …?` suggestion that names the line:
+
+![rivet names a mistyped config field and suggests the correct one](gifs/error-config-typo.gif)
+
+An unreachable database — down, wrong host/port, or a tunnel that isn't up — is reported by `rivet doctor` with a reachability hint before you waste a run:
+
+![rivet doctor reports an unreachable source with a hint](gifs/error-connection.gif)
+
+More failure modes (retries, schema drift, crash/resume) and exactly what rivet does for each: [semantics.md](semantics.md).
 
 ---
 

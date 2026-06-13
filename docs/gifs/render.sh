@@ -596,6 +596,69 @@ fixture_chunked_teardown() {
     psql_ -c 'DROP SCHEMA IF EXISTS rivet_gif CASCADE;' >/dev/null
 }
 
+# ----- Error / recovery scenarios -------------------------------------------
+# Each writes a tiny rivet.yaml that triggers one of rivet's actionable failure
+# messages. No data seeding: the missing-table probe only needs Postgres to be
+# reachable (DATABASE_URL is exported by render.sh), the parse error needs no DB
+# at all, and the connection-refused tape overrides DATABASE_URL to a dead port.
+
+fixture_error_missing_table_setup() {
+    local work="/tmp/rivet-gif-error-missing-table"
+    mkdir -p "$work"
+    cat >"$work/rivet.yaml" <<'YAML'
+source:
+  type: postgres
+  url_env: DATABASE_URL
+exports:
+  - name: orders
+    query: "SELECT id, total FROM ordrs"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: ./output
+YAML
+}
+fixture_error_missing_table_teardown() { :; }
+
+fixture_error_config_typo_setup() {
+    local work="/tmp/rivet-gif-error-config-typo"
+    mkdir -p "$work"
+    cat >"$work/rivet.yaml" <<'YAML'
+source:
+  type: postgres
+  url_env: DATABASE_URL
+export:
+  - name: orders
+    query: "SELECT id FROM orders"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: ./output
+YAML
+}
+fixture_error_config_typo_teardown() { :; }
+
+fixture_error_connection_setup() {
+    local work="/tmp/rivet-gif-error-connection"
+    mkdir -p "$work"
+    cat >"$work/rivet.yaml" <<'YAML'
+source:
+  type: postgres
+  url_env: DATABASE_URL
+exports:
+  - name: orders
+    query: "SELECT id FROM orders"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: ./output
+YAML
+}
+fixture_error_connection_teardown() { :; }
+
 # ----- Scenario runner -------------------------------------------------------
 
 render_scenario() {
@@ -650,7 +713,7 @@ render_scenario() {
 
 ensure_prereqs
 
-SCENARIOS=("${@:-basic plan-apply reconcile-repair init-scaffold check-verdict inspect chunked-progress parallel-cards incremental-cursor coalesce-cursor discover-artifact plan-campaign}")
+SCENARIOS=("${@:-basic plan-apply reconcile-repair init-scaffold check-verdict inspect chunked-progress parallel-cards incremental-cursor coalesce-cursor discover-artifact plan-campaign error-missing-table error-config-typo error-connection}")
 for raw in "${SCENARIOS[@]}"; do
     for name in $raw; do
         case "$name" in
@@ -668,6 +731,9 @@ for raw in "${SCENARIOS[@]}"; do
             plan-campaign)         render_scenario plan-campaign         fixture_campaign_setup          fixture_campaign_teardown ;;
             pool-detect)           render_scenario pool-detect           fixture_pool_detect_setup       fixture_pool_detect_teardown ;;
             doctor-gcs)            render_scenario doctor-gcs            fixture_gcs_setup               fixture_gcs_teardown ;;
+            error-missing-table)   render_scenario error-missing-table   fixture_error_missing_table_setup   fixture_error_missing_table_teardown ;;
+            error-config-typo)     render_scenario error-config-typo     fixture_error_config_typo_setup     fixture_error_config_typo_teardown ;;
+            error-connection)      render_scenario error-connection      fixture_error_connection_setup      fixture_error_connection_teardown ;;
             *) echo "unknown scenario: $name" >&2; exit 1 ;;
         esac
     done
