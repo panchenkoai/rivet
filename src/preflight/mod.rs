@@ -4,6 +4,7 @@ mod doctor;
 mod mssql;
 mod mysql;
 mod postgres;
+mod schema_error;
 pub mod type_report;
 
 pub(crate) use analysis::chunk_sparsity_from_counts;

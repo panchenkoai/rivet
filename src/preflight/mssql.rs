@@ -28,6 +28,7 @@
 use super::ExportDiagnostic;
 use super::analysis::*;
 use super::cursor_expr::incremental_key_expr;
+use super::schema_error::PreflightSchemaError;
 use crate::config::{ExportConfig, ExportMode, SourceType, TlsConfig};
 use crate::error::Result;
 use crate::source::Source;
@@ -225,10 +226,28 @@ fn schema_fail_mssql(conn: &mut MssqlSource, base_query: &str) -> Option<anyhow:
     } else {
         return None; // operational → fail-soft
     };
-    let server = m.lines().next().unwrap_or(&m);
-    Some(anyhow::anyhow!(
-        "preflight: {detail}. Check the table/column names in the query, and that the login has SELECT on them. ({server})"
-    ))
+    // The `query_scalar` seam erases the *typed* tiberius error, but the SQL
+    // Server number survives in its Display string ("… (code: 208, …)"), so we
+    // parse it out for an "error 208" label matching PG's SQLSTATE / MySQL's
+    // code. A *typed* code would mean probing off the `query_scalar` seam — the
+    // ADR-0011 boundary noted in `schema_error.rs`.
+    let code_label = mssql_error_code(&m)
+        .map(|c| format!("error {c}"))
+        .unwrap_or_else(|| "SQL Server schema error".into());
+    Some(PreflightSchemaError::new(detail, code_label).into_error())
+}
+
+/// Pull the SQL Server error number from a tiberius error's Display string
+/// (`"… (code: 208, state: 1, class: 16)"`). `None` if tiberius ever changes the
+/// format — `schema_fail_mssql` then falls back to a generic label, never panics.
+fn mssql_error_code(msg: &str) -> Option<u16> {
+    msg.split("code: ")
+        .nth(1)?
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()
 }
 
 fn row_estimate_mssql(conn: &mut MssqlSource, qualified_table: &str) -> Option<i64> {
@@ -402,5 +421,18 @@ mod tests {
         );
         assert_eq!(base_table_of("SELECT * FROM orders, users"), None);
         assert_eq!(base_table_of("SELECT * FROM (SELECT 1 AS x) AS s"), None);
+    }
+
+    #[test]
+    fn mssql_error_code_parsed_from_tiberius_display() {
+        // The exact shape tiberius renders for a missing relation (verified live).
+        let m = "mssql: scalar query failed: Token error: 'Invalid object name \
+                 'ordrs'.' on server x executing  on line 1 (code: 208, state: 1, class: 16)";
+        assert_eq!(mssql_error_code(m), Some(208));
+        assert_eq!(
+            mssql_error_code("Invalid column name 'totl'. (code: 207)"),
+            Some(207)
+        );
+        assert_eq!(mssql_error_code("connection reset; no code here"), None);
     }
 }

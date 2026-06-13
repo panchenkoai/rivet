@@ -1,6 +1,7 @@
 use super::ExportDiagnostic;
 use super::analysis::*;
 use super::cursor_expr::incremental_key_expr;
+use super::schema_error::PreflightSchemaError;
 use crate::config::{ExportConfig, ExportMode, SourceType, TlsConfig};
 use crate::error::Result;
 
@@ -241,10 +242,7 @@ fn schema_fail_pg(e: &postgres::Error) -> Option<anyhow::Error> {
             .as_db_error()
             .map(|db| db.message())
             .unwrap_or("schema/query error");
-        anyhow::anyhow!(
-            "preflight: {detail} (SQLSTATE {}). Check the table/column names in the export's query, and that the user has SELECT on them.",
-            code.code()
-        )
+        PreflightSchemaError::new(detail, format!("SQLSTATE {}", code.code())).into_error()
     })
 }
 

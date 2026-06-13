@@ -1,6 +1,7 @@
 use super::ExportDiagnostic;
 use super::analysis::*;
 use super::cursor_expr::incremental_key_expr;
+use super::schema_error::PreflightSchemaError;
 use crate::config::{ExportConfig, ExportMode, SourceType, TlsConfig};
 use crate::error::Result;
 
@@ -60,11 +61,10 @@ fn mysql_schema_error(e: &mysql::Error) -> Option<anyhow::Error> {
     if let mysql::Error::MySqlError(me) = e
         && matches!(me.code, 1146 | 1054 | 1142 | 1064)
     {
-        return Some(anyhow::anyhow!(
-            "preflight: {} (MySQL error {}). Check the table/column names in the export's query, and that the user has SELECT on them.",
-            me.message,
-            me.code
-        ));
+        return Some(
+            PreflightSchemaError::new(me.message.as_str(), format!("MySQL error {}", me.code))
+                .into_error(),
+        );
     }
     None
 }
