@@ -297,8 +297,30 @@ impl InitYamlDestination {
 /// Without `--table`: introspect every table/view in a PostgreSQL schema (default `public`),
 /// a MySQL database (from `--schema` or from the URL path), or a SQL Server schema
 /// (default `dbo`), optionally narrowed by the `--include` / `--exclude` globs in `filter`.
+/// How the DB URL reached `rivet init` — determines which connection form the
+/// scaffold writes so the prescribed next steps (`doctor` / `check` / `run`)
+/// inherit a WORKING connection, instead of always emitting `url_env:
+/// DATABASE_URL` and failing on a variable the user never set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceProvenance {
+    /// `--source <url>`: typed inline. The scaffold keeps the secure
+    /// `url_env: DATABASE_URL` default (it never writes the literal URL into a
+    /// likely-committed file) and the next-steps block reminds the user to
+    /// export it.
+    Inline,
+    /// `--source-env <NAME>`: write `url_env: NAME` — the variable the user has
+    /// already exported, so the scaffold connects out of the box.
+    Env(String),
+    /// `--source-file <PATH>`: write `url_file: PATH`.
+    File(String),
+}
+
+// Thin CLI dispatch shim: each argument maps 1:1 to a `rivet init` flag, so
+// bundling them into a struct would only add indirection for the single caller.
+#[allow(clippy::too_many_arguments)]
 pub fn init(
     source_url: &str,
+    provenance: &SourceProvenance,
     table: Option<&str>,
     schema: Option<&str>,
     output: Option<&str>,
@@ -308,7 +330,14 @@ pub fn init(
 ) -> Result<()> {
     yaml_destination.validate()?;
     let (text, yaml_decimal_review) = match format {
-        InitFormat::Yaml => init_yaml(source_url, table, schema, &yaml_destination, filter)?,
+        InitFormat::Yaml => init_yaml(
+            source_url,
+            provenance,
+            table,
+            schema,
+            &yaml_destination,
+            filter,
+        )?,
         InitFormat::DiscoveryJson => {
             // Defensive backstop for non-CLI callers; the `rivet init` CLI
             // already rejects `--discover` together with any cloud flag via
@@ -343,22 +372,44 @@ pub fn init(
             // "I have a config" to "I have parquet files". Only for the YAML
             // scaffold (the discovery JSON isn't runnable).
             if matches!(format, InitFormat::Yaml) {
-                eprintln!(
-                    "\nNext steps:\n  \
-                     1. rivet doctor -c {path}            # test source + destination auth\n  \
-                     2. rivet check  -c {path}            # column-type & schema report\n  \
-                     3. rivet run    -c {path} --validate # export, then verify row counts"
-                );
+                eprint!("{}", next_steps_block(path, provenance));
             }
         }
-        None => print!("{text}"),
+        None => {
+            // stdout stays pure (pipeable); the guidance still reaches the user
+            // on stderr so `rivet init | tee rivet.yaml` isn't a dead end.
+            print!("{text}");
+            if matches!(format, InitFormat::Yaml) {
+                eprint!("{}", next_steps_block("rivet.yaml", provenance));
+            }
+        }
     }
 
     Ok(())
 }
 
+/// The friendly "do this next" ladder printed after a YAML scaffold. For an
+/// inline `--source` URL it leads with a step-0 export reminder, because the
+/// scaffold deliberately writes `url_env: DATABASE_URL` (it never persists the
+/// literal URL) and would otherwise fail on an unset variable.
+fn next_steps_block(path: &str, provenance: &SourceProvenance) -> String {
+    let mut s = String::from("\nNext steps:\n");
+    if matches!(provenance, SourceProvenance::Inline) {
+        s.push_str(
+            "  0. export DATABASE_URL='<your-url>'    # the scaffold reads this (URL kept out of the file)\n",
+        );
+    }
+    s.push_str(&format!(
+        "  1. rivet doctor -c {path}            # test source + destination auth\n  \
+         2. rivet check  -c {path}            # column-type & schema report\n  \
+         3. rivet run    -c {path} --validate # export, then verify row counts\n"
+    ));
+    s
+}
+
 fn init_yaml(
     source_url: &str,
+    provenance: &SourceProvenance,
     table: Option<&str>,
     schema: Option<&str>,
     dest: &InitYamlDestination,
@@ -382,7 +433,7 @@ fn init_yaml(
             _ => unreachable!(),
         };
         let hint = yaml_scaffold::table_has_unbounded_decimal_columns(&info);
-        let yaml = yaml_scaffold::generate_config(&info, source_url, dest)?;
+        let yaml = yaml_scaffold::generate_config(&info, source_url, provenance, dest)?;
         return Ok((yaml, hint));
     }
     let infos = introspect_all(source_url, schema, filter)?;
@@ -393,7 +444,7 @@ fn init_yaml(
     let hint = infos
         .iter()
         .any(yaml_scaffold::table_has_unbounded_decimal_columns);
-    let yaml = yaml_scaffold::generate_schema_config(&infos, source_url, &label, dest)?;
+    let yaml = yaml_scaffold::generate_schema_config(&infos, source_url, provenance, &label, dest)?;
     Ok((yaml, hint))
 }
 
@@ -661,6 +712,7 @@ mod tests {
         let yaml = yaml_scaffold::generate_config(
             &info,
             "postgresql://localhost/db",
+            &super::SourceProvenance::Inline,
             &InitYamlDestination::default(),
         )
         .unwrap();
@@ -680,6 +732,7 @@ mod tests {
         let yaml = yaml_scaffold::generate_config(
             &info,
             "mysql://localhost/db",
+            &super::SourceProvenance::Inline,
             &InitYamlDestination::default(),
         )
         .unwrap();
@@ -707,6 +760,7 @@ mod tests {
         let yaml = yaml_scaffold::generate_schema_config(
             &[a, b],
             "postgresql://localhost/db",
+            &super::SourceProvenance::Inline,
             r#"schema "public" (2)"#,
             &InitYamlDestination::default(),
         )
@@ -739,8 +793,13 @@ mod tests {
             s3_bucket: None,
             s3_region: None,
         };
-        let yaml =
-            yaml_scaffold::generate_config(&info, "postgresql://localhost/db", &dest).unwrap();
+        let yaml = yaml_scaffold::generate_config(
+            &info,
+            "postgresql://localhost/db",
+            &super::SourceProvenance::Inline,
+            &dest,
+        )
+        .unwrap();
         assert!(yaml.contains("type: gcs"), "got:\n{yaml}");
         assert!(yaml.contains("bucket: my-bucket"), "got:\n{yaml}");
         assert!(yaml.contains("prefix: exports/orders/"), "got:\n{yaml}");
@@ -759,8 +818,13 @@ mod tests {
             s3_bucket: None,
             s3_region: None,
         };
-        let yaml =
-            yaml_scaffold::generate_config(&info, "postgresql://localhost/db", &dest).unwrap();
+        let yaml = yaml_scaffold::generate_config(
+            &info,
+            "postgresql://localhost/db",
+            &super::SourceProvenance::Inline,
+            &dest,
+        )
+        .unwrap();
         assert!(
             yaml.contains("credentials_file: /path/sa.json"),
             "got:\n{yaml}"
@@ -779,8 +843,13 @@ mod tests {
             s3_bucket: Some("my-s3-bucket".to_string()),
             s3_region: Some("eu-central-1".to_string()),
         };
-        let yaml =
-            yaml_scaffold::generate_config(&info, "postgresql://localhost/db", &dest).unwrap();
+        let yaml = yaml_scaffold::generate_config(
+            &info,
+            "postgresql://localhost/db",
+            &super::SourceProvenance::Inline,
+            &dest,
+        )
+        .unwrap();
         assert!(yaml.contains("type: s3"), "got:\n{yaml}");
         assert!(yaml.contains("bucket: my-s3-bucket"), "got:\n{yaml}");
         assert!(yaml.contains("prefix: exports/orders/"), "got:\n{yaml}");
@@ -804,8 +873,13 @@ mod tests {
             s3_bucket: Some("b".to_string()),
             s3_region: None,
         };
-        let yaml =
-            yaml_scaffold::generate_config(&info, "postgresql://localhost/db", &dest).unwrap();
+        let yaml = yaml_scaffold::generate_config(
+            &info,
+            "postgresql://localhost/db",
+            &super::SourceProvenance::Inline,
+            &dest,
+        )
+        .unwrap();
         assert!(yaml.contains("type: s3"), "got:\n{yaml}");
         assert!(!yaml.contains("region:"), "got:\n{yaml}");
     }
@@ -895,8 +969,13 @@ mod tests {
             gcs_bucket: Some("true".to_string()),
             ..Default::default()
         };
-        let yaml =
-            yaml_scaffold::generate_config(&info, "postgresql://localhost/db", &dest).unwrap();
+        let yaml = yaml_scaffold::generate_config(
+            &info,
+            "postgresql://localhost/db",
+            &super::SourceProvenance::Inline,
+            &dest,
+        )
+        .unwrap();
         // Plain `bucket: true` would deserialize to the boolean `true`.
         assert!(
             yaml.contains("bucket: \"true\""),
@@ -920,8 +999,13 @@ mod tests {
             gcs_credentials_file: Some("/path with spaces/sa.json".into()),
             ..Default::default()
         };
-        let yaml =
-            yaml_scaffold::generate_config(&info, "postgresql://localhost/db", &dest).unwrap();
+        let yaml = yaml_scaffold::generate_config(
+            &info,
+            "postgresql://localhost/db",
+            &super::SourceProvenance::Inline,
+            &dest,
+        )
+        .unwrap();
         let parsed: serde_yaml_ng::Value =
             serde_yaml_ng::from_str(&yaml).expect("YAML must remain valid");
         assert_eq!(
@@ -941,8 +1025,13 @@ mod tests {
             s3_region: Some("eu-west-1".into()),
             ..Default::default()
         };
-        let yaml =
-            yaml_scaffold::generate_config(&info, "postgresql://localhost/db", &dest).unwrap();
+        let yaml = yaml_scaffold::generate_config(
+            &info,
+            "postgresql://localhost/db",
+            &super::SourceProvenance::Inline,
+            &dest,
+        )
+        .unwrap();
         let parsed: serde_yaml_ng::Value =
             serde_yaml_ng::from_str(&yaml).expect("scaffold must be valid YAML");
         let exp = &parsed["exports"][0];

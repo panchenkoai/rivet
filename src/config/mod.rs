@@ -82,10 +82,17 @@ impl Config {
         // scanner error *and* the source carries an unquoted brace value, point
         // straight at the quoting fix. On a valid config this `Value` parse
         // succeeds and the block is skipped, so the success path is unchanged.
-        if let Err(e) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(yaml)
-            && let Some(hint) = Self::unquoted_template_brace_hint(yaml, &e.to_string())
-        {
-            return Err(anyhow::anyhow!("{e}\n  {hint}"));
+        if let Err(e) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(yaml) {
+            let m = e.to_string();
+            if let Some(hint) = Self::unquoted_template_brace_hint(yaml, &m) {
+                return Err(anyhow::anyhow!("{e}\n  {hint}"));
+            }
+            // A TAB in indentation is the most common beginner YAML mistake; it
+            // trips libyaml before serde ever sees a field, so it must be caught
+            // here in the raw scan, not in `enhance_parse_error`.
+            if let Some(hint) = Self::tab_indent_hint(yaml, &m) {
+                return Err(anyhow::anyhow!("{e}\n  {hint}"));
+            }
         }
         Self::check_misplaced_tuning_fields(yaml)?;
         Self::check_csv_compression(yaml)?;
@@ -122,6 +129,29 @@ impl Config {
     /// must actually contain an unquoted `{…}` value. Both must hold, so a
     /// valid config (every brace value quoted) never sees the hint, and a
     /// genuine map-typed field error elsewhere is left alone.
+    /// A YAML document indented with a TAB trips libyaml with `found character
+    /// that cannot start any token`. Point straight at the fix (spaces, not
+    /// tabs) — but only when the cited line really begins with a tab, so an
+    /// unrelated scanner error is left with its original message.
+    fn tab_indent_hint(yaml: &str, err_msg: &str) -> Option<String> {
+        if !err_msg.contains("tab character") {
+            return None;
+        }
+        // serde_yaml_ng reports `found a tab character … at line N column C …`;
+        // the FIRST `line N` is where the offending tab is.
+        let line_no: usize = err_msg
+            .split_once("line ")
+            .and_then(|(_, rest)| rest.split([' ', ',']).next())
+            .and_then(|n| n.parse().ok())?;
+        let line = yaml.lines().nth(line_no.checked_sub(1)?)?;
+        let leading = &line[..line.len() - line.trim_start().len()];
+        leading.contains('\t').then(|| {
+            format!(
+                "line {line_no} is indented with a TAB — YAML requires spaces. Replace the tab(s) with spaces."
+            )
+        })
+    }
+
     fn unquoted_template_brace_hint(yaml: &str, err_msg: &str) -> Option<String> {
         const FLOW_SYMPTOMS: &[&str] = &[
             "did not find expected ',' or '}'",

@@ -1,4 +1,4 @@
-_Last updated: 2026-05-19._
+_Last updated: 2026-06-13._
 
 # Getting Started
 
@@ -7,8 +7,9 @@ Rivet exports tables from PostgreSQL, MySQL, or SQL Server to Parquet (or CSV) f
 ```bash
 brew install panchenkoai/rivet/rivet
 export DATABASE_URL='postgresql://user:pass@localhost:5432/mydb'
+# `orders` is a placeholder — use one of YOUR tables, or omit --table to scan the whole schema
 rivet init --source-env DATABASE_URL --table orders -o rivet.yaml
-rivet run --config rivet.yaml --validate
+rivet run -c rivet.yaml --validate
 ```
 
 That's the whole flow. The four steps below explain each command, expected output, and where to go from each. Read time: ~3 minutes.
@@ -42,6 +43,7 @@ export DATABASE_URL='postgresql://user:pass@localhost:5432/mydb'
 # export DATABASE_URL='mysql://user:pass@localhost:3306/mydb'
 
 rivet init --source-env DATABASE_URL --table orders -o rivet.yaml
+# `orders` is a placeholder — use one of YOUR tables, or omit --table to scan the whole schema
 ```
 
 `rivet init` connects once, reads the column list + a rough row estimate from the live database, and writes a YAML file with `url_env: DATABASE_URL` and a sensible default mode. For large tables it picks `mode: chunked`, auto-resolves the chunk key from the primary key, and **scales `parallel:` to the row estimate** (1 / 2 / 4) so a big export uses several connections out of the box — measured ~1.4× faster on a wide 2 M-row table and ~4× on a narrow one, with no flags to set. You can also point it at a whole schema (`--schema public`) or emit a richer JSON discovery artifact instead (`--discover -o discovery.json`).
@@ -53,9 +55,9 @@ Full flag reference: [reference/init.md](reference/init.md). For a manually-auth
 ## 3 · Preflight & run
 
 ```bash
-rivet doctor --config rivet.yaml   # verify source + destination auth
-rivet check  --config rivet.yaml   # dry-run analysis per export
-rivet run    --config rivet.yaml --validate --reconcile
+rivet doctor -c rivet.yaml   # verify source + destination auth
+rivet check  -c rivet.yaml   # dry-run analysis per export
+rivet run    -c rivet.yaml --validate --reconcile
 ```
 
 The full basic workflow (`init` → `doctor` → `check` → `run` → `state`) recorded as a single terminal cast:
@@ -77,24 +79,25 @@ Example summary card after a successful run:
 ── orders ──
   run_id:      orders_20260519T120000.123
   status:      success
-  tuning:      profile=balanced (default), batch_size=10000
-  rows:        5432
+  tuning:      profile=balanced (default), batch_size=10,000
+  rows:        5,432
   files:       1
+  output:      file://./output
   bytes:       847 KB
   duration:    1.2s
-  peak RSS:    15MB (sampled during run)
+  peak RSS:    15 MB (sampled during run)
   validated:   pass
   schema:      unchanged
-  reconcile:   MATCH (5432/5432)
+  reconcile:   MATCH (5,432/5,432)
 ```
 
 ## 4 · Inspect & iterate
 
 ```bash
-rivet state show   --config rivet.yaml             # cursors (incremental exports)
-rivet metrics      --config rivet.yaml --last 10   # per-run history
-rivet state files  --config rivet.yaml             # files actually written
-rivet journal      --config rivet.yaml --export orders   # per-run events / retries / quality issues
+rivet state show   -c rivet.yaml             # cursors (incremental exports)
+rivet metrics      -c rivet.yaml --last 10   # per-run history
+rivet state files  -c rivet.yaml             # files actually written
+rivet journal      -c rivet.yaml --export orders   # per-run events / retries / quality issues
 ```
 
 ![Post-run inspection: state show, metrics, state files, state progression](gifs/inspect.gif)
@@ -115,6 +118,26 @@ exports:
 ```
 
 Subsequent `rivet run` invocations will only fetch rows with `updated_at >` the stored cursor. For tables larger than ~5 M rows, switch to `mode: chunked` instead — see [modes/chunked.md](modes/chunked.md).
+
+---
+
+## When something is wrong
+
+Rivet tries to fail early and say exactly what to fix — most mistakes are caught at `check` / `doctor` time, before a single row is read.
+
+A query that references a table (or column) that doesn't exist is caught by `rivet check` — it exits non-zero with the offending name and SQLSTATE, instead of passing through to a half-finished run:
+
+![rivet check catches a query against a missing table](gifs/error-missing-table.gif)
+
+A typo in a config field is caught at parse time with a `Did you mean …?` suggestion that names the line:
+
+![rivet names a mistyped config field and suggests the correct one](gifs/error-config-typo.gif)
+
+An unreachable database — down, wrong host/port, or a tunnel that isn't up — is reported by `rivet doctor` with a reachability hint before you waste a run:
+
+![rivet doctor reports an unreachable source with a hint](gifs/error-connection.gif)
+
+More failure modes (retries, schema drift, crash/resume) and exactly what rivet does for each: [semantics.md](semantics.md).
 
 ---
 

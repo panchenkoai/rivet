@@ -27,6 +27,6 @@ Enter
 Sleep 300ms
 Show
 
-Type "rivet check --config orders.yaml"
+Type "rivet check -c orders.yaml"
 Enter
 Sleep 4s

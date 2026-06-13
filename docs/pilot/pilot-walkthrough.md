@@ -62,7 +62,7 @@ Everything below works with local-dev settings. For a real pilot against a manag
 
 ![rivet init scaffolding YAML from a live table](../gifs/init-scaffold.gif)
 
-Scaffold a YAML from the live schema and, in parallel, emit a **machine-readable discovery artifact** for review or automation (Epic B).
+Scaffold a YAML from the live schema and, in parallel, emit a **machine-readable discovery artifact** for review or automation.
 
 ```bash
 # YAML scaffold for a whole schema
@@ -84,7 +84,7 @@ jq '.tables[] | {table, suggested_mode, best_cursor: (.cursor_candidates[0].colu
 
 ## Step 2 — Write a chunked + checkpoint config
 
-For any non-trivial table, use chunked mode with `chunk_checkpoint: true`. Checkpointing is what unlocks reconcile (Epic F), repair (Epic H), and progression (Epic G).
+For any non-trivial table, use chunked mode with `chunk_checkpoint: true`. Checkpointing is what unlocks reconcile, repair, and progression.
 
 ```yaml
 source:
@@ -99,7 +99,7 @@ exports:
     mode: chunked
     chunk_column: id
     chunk_size: 100000
-    chunk_checkpoint: true          # required for reconcile/repair/progression (PG/RC/RR)
+    chunk_checkpoint: true          # required for reconcile/repair/progression
     parallel: 2
     format: parquet
     destination:
@@ -127,8 +127,8 @@ exports:
 Validate structural constraints:
 
 ```bash
-rivet check --config pilot.yaml
-rivet doctor --config pilot.yaml
+rivet check -c pilot.yaml
+rivet doctor -c pilot.yaml
 ```
 
 ---
@@ -199,7 +199,7 @@ At this point:
 
 ---
 
-## Step 6 — Reconcile (Epic F)
+## Step 6 — Reconcile
 
 ![Chunked + drift injection + reconcile + targeted repair + RR4 committed boundary untouched](../gifs/reconcile-repair.gif)
 
@@ -227,7 +227,7 @@ The reconcile SQL uses exactly the same `build_chunk_query_sql` shape the pipeli
 
 ---
 
-## Step 7 — Targeted repair (Epic H)
+## Step 7 — Targeted repair
 
 If the reconcile report is dirty, derive a repair plan from it:
 

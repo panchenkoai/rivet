@@ -19,5 +19,5 @@ mod dispatch;
 mod params;
 mod validate;
 
-pub use args::Cli;
+pub use args::parse_cli;
 pub use dispatch::dispatch;

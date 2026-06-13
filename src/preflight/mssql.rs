@@ -28,6 +28,7 @@
 use super::ExportDiagnostic;
 use super::analysis::*;
 use super::cursor_expr::incremental_key_expr;
+use super::schema_error::PreflightSchemaError;
 use crate::config::{ExportConfig, ExportMode, SourceType, TlsConfig};
 use crate::error::Result;
 use crate::source::Source;
@@ -102,6 +103,15 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
         }
     };
     let base_query = base_query.as_str();
+
+    // A missing table/column (or no SELECT grant) is permanent and
+    // author-fixable — fail preflight loudly instead of letting it surface only
+    // at run time. The catalog-based row-estimate below never touches the table,
+    // so this zero-row probe is the only check that validates the query's actual
+    // relations. Operational errors stay fail-soft (`None`).
+    if let Some(fail) = schema_fail_mssql(conn, base_query) {
+        return Err(fail);
+    }
 
     let range_col = export
         .chunk_column
@@ -199,6 +209,47 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
 /// clustered index (`index_id IN (0,1)`), no `COUNT(*)` scan. `None` when the
 /// stats row is absent (view, no stats) or the probe fails; preflight is
 /// non-fatal, so a failure is logged at debug, never aborted.
+/// Validate the query's relations with a zero-row wrap; map an author-fixable
+/// failure (Invalid object name = 208, Invalid column name = 207) to a loud
+/// preflight error. `None` (fail-soft) for success and operational errors.
+fn schema_fail_mssql(conn: &mut MssqlSource, base_query: &str) -> Option<anyhow::Error> {
+    // `TOP 0` over a derived table executes the relations without scanning rows.
+    let probe = format!("SELECT TOP 0 1 AS _ok FROM ({base_query}) AS _rivet_probe");
+    let Err(e) = conn.query_scalar(&probe) else {
+        return None;
+    };
+    let m = format!("{e:#}");
+    let detail = if m.contains("Invalid object name") {
+        "a table/view in the export's query does not exist"
+    } else if m.contains("Invalid column name") {
+        "a column in the export's query does not exist"
+    } else {
+        return None; // operational → fail-soft
+    };
+    // The `query_scalar` seam erases the *typed* tiberius error, but the SQL
+    // Server number survives in its Display string ("… (code: 208, …)"), so we
+    // parse it out for an "error 208" label matching PG's SQLSTATE / MySQL's
+    // code. A *typed* code would mean probing off the `query_scalar` seam — the
+    // ADR-0011 boundary noted in `schema_error.rs`.
+    let code_label = mssql_error_code(&m)
+        .map(|c| format!("error {c}"))
+        .unwrap_or_else(|| "SQL Server schema error".into());
+    Some(PreflightSchemaError::new(detail, code_label).into_error())
+}
+
+/// Pull the SQL Server error number from a tiberius error's Display string
+/// (`"… (code: 208, state: 1, class: 16)"`). `None` if tiberius ever changes the
+/// format — `schema_fail_mssql` then falls back to a generic label, never panics.
+fn mssql_error_code(msg: &str) -> Option<u16> {
+    msg.split("code: ")
+        .nth(1)?
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
 fn row_estimate_mssql(conn: &mut MssqlSource, qualified_table: &str) -> Option<i64> {
     let (schema, table) = split_qualified(qualified_table);
     let sql = format!(
@@ -370,5 +421,18 @@ mod tests {
         );
         assert_eq!(base_table_of("SELECT * FROM orders, users"), None);
         assert_eq!(base_table_of("SELECT * FROM (SELECT 1 AS x) AS s"), None);
+    }
+
+    #[test]
+    fn mssql_error_code_parsed_from_tiberius_display() {
+        // The exact shape tiberius renders for a missing relation (verified live).
+        let m = "mssql: scalar query failed: Token error: 'Invalid object name \
+                 'ordrs'.' on server x executing  on line 1 (code: 208, state: 1, class: 16)";
+        assert_eq!(mssql_error_code(m), Some(208));
+        assert_eq!(
+            mssql_error_code("Invalid column name 'totl'. (code: 207)"),
+            Some(207)
+        );
+        assert_eq!(mssql_error_code("connection reset; no code here"), None);
     }
 }

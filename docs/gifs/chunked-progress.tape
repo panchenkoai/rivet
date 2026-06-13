@@ -31,6 +31,6 @@ Type "# Chunked export (50k rows / 10 chunks) — per-chunk log lines + end-of-r
 Enter
 Sleep 1500ms
 
-Type `rivet run --config chunked-progress.yaml --validate 2>&1 | grep -E 'chunk [0-9]+/10|chunks completed|---|run_id|status|rows|files|bytes|duration|peak|validated'`
+Type `rivet run -c chunked-progress.yaml --validate 2>&1 | grep -E 'chunk [0-9]+/10|chunks completed|---|run_id|status|rows|files|bytes|duration|peak|validated'`
 Enter
 Sleep 9s

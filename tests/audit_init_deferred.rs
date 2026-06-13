@@ -64,10 +64,9 @@ fn init_mssql_single_table_emits_valid_config_that_passes_check() {
     );
 
     // ── swap url_env → literal url so `rivet check` can connect ─────────────
-    let yaml_with_url = yaml.replace(
-        "url_env: DATABASE_URL  # export DATABASE_URL='<your-url>'",
-        &format!("url: \"{MSSQL_URL}\""),
-    );
+    // Replace only the key=value; the trailing `# export ...` stays a valid
+    // YAML comment, so this is robust to the scaffold's comment wording.
+    let yaml_with_url = yaml.replace("url_env: DATABASE_URL", &format!("url: \"{MSSQL_URL}\""));
     let cfg_path = cfg_dir.path().join("rivet.yaml");
     std::fs::write(&cfg_path, &yaml_with_url).expect("write patched config");
 

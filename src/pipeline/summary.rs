@@ -93,6 +93,11 @@ pub struct RunSummary {
     pub format: String,
     pub mode: String,
     pub compression: String,
+    /// Where the files were written, as an operator would type it to find them
+    /// again (`./output`, `s3://bucket/prefix`, …). `None` for stdout or a
+    /// summary built outside the run path (tests). Surfaced on the success card
+    /// so a newcomer isn't left wondering where their data landed.
+    pub destination_uri: Option<String>,
     /// Postgres `pg_stat_database.temp_bytes` delta around the run. `None` for
     /// non-Postgres sources or when the snapshot probe failed (no admin perms
     /// not required — the view is readable by any role). When set and large,
@@ -182,6 +187,11 @@ impl RunSummary {
             format: plan.format.label().to_string(),
             mode: plan.strategy.mode_label().to_string(),
             compression: plan.compression.label().to_string(),
+            destination_uri: (!matches!(
+                plan.destination.destination_type,
+                crate::config::DestinationType::Stdout
+            ))
+            .then(|| crate::pipeline::finalize::destination_uri_for_manifest(&plan.destination)),
             pg_temp_bytes_delta: None,
             skip_reason: None,
             source_count: None,
@@ -241,6 +251,7 @@ impl RunSummary {
             format: "parquet".into(),
             mode: "snapshot".into(),
             compression: "zstd".into(),
+            destination_uri: None,
             pg_temp_bytes_delta: None,
             skip_reason: None,
             source_count: None,
@@ -452,6 +463,14 @@ impl RunSummary {
 
         rows.push(("rows", fmt_thousands(self.total_rows)));
         rows.push(("files", fmt_thousands(self.files_produced as i64)));
+        // Where the files landed — so a newcomer isn't left guessing after a
+        // successful export. Only when we actually wrote somewhere addressable
+        // (skips stdout and 0-file skips).
+        if self.files_produced > 0
+            && let Some(uri) = &self.destination_uri
+        {
+            rows.push(("output", uri.clone()));
+        }
         // On a 0-new incremental run, `0 rows  0 files` alone hides *why*
         // nothing moved. Surface the cursor position as its own line so the
         // operator sees the incremental boundary held — not just an empty run.

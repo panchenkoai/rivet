@@ -1,5 +1,75 @@
 # Changelog
 
+## 0.11.0 (2026-06-13) — new-user UX: friendly errors, guided onboarding, preflight that catches mistakes
+
+A new-user experience pass: the first ten minutes with rivet read as guidance,
+not archaeology. `rivet init` scaffolds a *working* config and names the next
+command; `rivet check` catches a mistyped table/column **before** any run instead
+of passing through to a half-finished export; errors name the failing thing and
+suggest the fix; the success card shows where the files landed. Every
+instructional GIF is re-recorded against the new behaviour, plus three new ones
+showing rivet catching mistakes. **MINOR** bump — the `rivet check` exit-code
+change below is behaviour-affecting.
+
+### ⚠️ Behaviour change (why this is a MINOR bump)
+
+- **`feat(ux/check)` — `rivet check` now FAILS (exit non-zero) on a query against
+  a table/column that doesn't exist**, instead of passing with exit `0` and only
+  failing at run time. A permanent, author-fixable schema error (PG SQLSTATE
+  class 42 / MySQL 1146·1054·1142·1064 / MSSQL 208·207) is caught at preflight;
+  operational/transient errors stay fail-soft. **CI that asserted `check` exits
+  `0` on such a config must be updated.**
+- **`feat(ux/run)` — a failed `rivet run` against a closed port fails fast** (one
+  connect attempt) instead of ~14 s of retry spam. Refused / no-route / DNS are
+  treated as dead endpoints; resets and timeouts still retry.
+- **`feat(ux/init)` — local exports scaffold a per-export subdir**
+  (`./output/<table>/`) so multi-table configs don't collide in one folder (and
+  the double-count `_SUCCESS` WARN is gone).
+
+### Added
+
+- **`feat(ux/run)` — the success card shows the destination** (`output: file://…`)
+  so you can see where the files landed without guessing.
+- **`docs` — three error/recovery GIFs + a "When something is wrong" section** in
+  getting-started: `check` catching a missing table, a config-field "did you
+  mean", and `doctor` reporting an unreachable source.
+
+### Changed
+
+- **`feat(ux/init)` — scaffolds a *working* connection per source provenance**
+  (`url_env` / `url_file` / inline) and ends with an on-voice next-steps ladder
+  (`doctor` → `check` → `run`). Credentials are never written into the file.
+- **`feat(ux/check)` — friendlier preflight**: a plain access-path line (no raw
+  EXPLAIN dump), a verdict legend, a next-step pointer, and no false `DEGRADED` on
+  small tables.
+- **`feat(ux/cli)` — friendlier `--help`** (a getting-started map; internal
+  Epic/Step labels dropped) and an `init` hint when `-c` is missing.
+- **`feat(ux/errors)` — config errors point at the fix**: corrected "did you mean"
+  ranking (Levenshtein-first, so `export` → `exports`), missing-field hints, and a
+  TAB-indentation hint.
+- **`feat(ux/run)` — a failed run carries doctor's connect-error category +
+  remediation hint** (auth / TLS / connectivity), bridged via `.context()` so the
+  typed cause and the retry-classifier substrings stay intact underneath.
+
+### Fixed
+
+- **`fix(ux/init)` — the scaffold's local-dest note fits 80 columns** (was
+  wrapping mid-word in narrow terminals / GIFs).
+- **`docs(getting-started)` — the example summary card matches real number
+  formatting** (`5,432`, `10,000`, `15 MB`).
+
+### Internal
+
+- **`refactor(preflight)` — the schema-error shape is named**
+  (`PreflightSchemaError`, the ADR-0015 data-shape-seam pattern): one message
+  template, three per-engine mappers, so the actionable sentence can no longer
+  drift across PG / MySQL / MSSQL. Live-verified on all three engines.
+- **`chore(deps)` — postgres-protocol 0.6.12 / tokio-postgres 0.7.18**
+  (RUSTSEC-2026-0178 / 0179 / 0180).
+- **`docs` — all instructional GIFs re-recorded** against the new behaviour
+  (`-c` short form, the `output:` row, the friendlier scaffold/check). `doctor-gcs`
+  and `pool-detect` are unchanged (need GCS ADC / the `pool` docker profile).
+
 ## 0.10.0 (2026-06-11) — machine-actionable exit codes + externally-proven correctness
 
 Adds a stable process-exit-code taxonomy (the headline, contract-affecting

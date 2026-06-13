@@ -67,6 +67,16 @@ pub(crate) fn run_with_reconnect(
         let mut src = match source::create_source(&plan.source) {
             Ok(s) => s,
             Err(e) => {
+                // A closed port / unroutable host / DNS failure will never come
+                // up on its own — retrying just spams ~14s of escalating backoff
+                // before the same error. Fail fast with a doctor pointer on the
+                // first attempt. (Connection RESET / EOF / cold-start "starting
+                // up" can recover, so those still flow into the retry below.)
+                if attempt == 0 && is_port_closed(&e) {
+                    return Err(e.context(format!(
+                        "cannot reach the source — run `rivet doctor -c {config_path}` to diagnose (is the host/port right and the server up?)"
+                    )));
+                }
                 if attempt < plan.tuning.max_retries && classify_error(&e).is_transient() {
                     log::warn!(
                         "export '{}': connection failed, will retry: {}",
@@ -76,7 +86,12 @@ pub(crate) fn run_with_reconnect(
                     last_err = Some(e);
                     continue;
                 }
-                return Err(e);
+                // Final, non-transient connect failure (e.g. auth): bridge the
+                // same category + remediation hint `rivet doctor` already gives,
+                // so a run-time failure isn't a dead end. `.context()` (not
+                // message replacement) keeps the typed cause + the substrings
+                // classify_exit / retry classification depend on.
+                return Err(attach_connect_hint(e, &plan.source));
             }
         };
 
@@ -519,6 +534,35 @@ pub(super) fn run_single_export(
     Ok(())
 }
 
+/// True for connect errors that will NEVER recover on their own — nothing is
+/// listening, the host is unroutable, or DNS can't resolve it. Deliberately
+/// EXCLUDES connection-reset / broken-pipe / EOF (a transient mid-handshake
+/// blip that does retry) and is never hit by cold-start "starting up", which is
+/// a post-connect SQLSTATE, not a connect failure.
+/// Bridge `rivet doctor`'s source-error categorizer + remediation hint to the
+/// run-time connect seam, so a failed `rivet run` (auth, TLS, …) carries the same
+/// guidance instead of a bare driver error. `.context()` (not message
+/// replacement) keeps the original error — and the substrings classify_exit /
+/// retry classification rely on — intact underneath.
+fn attach_connect_hint(e: anyhow::Error, source: &crate::config::SourceConfig) -> anyhow::Error {
+    let category = crate::preflight::categorize_source_error(&e);
+    match crate::preflight::source_error_hint(category, &e, &source.source_type) {
+        Some(hint) => e.context(format!("{category} — {hint}")),
+        None => e,
+    }
+}
+
+fn is_port_closed(e: &anyhow::Error) -> bool {
+    let m = format!("{e:#}").to_ascii_lowercase();
+    m.contains("connection refused")
+        || m.contains("no route to host")
+        || m.contains("network unreachable")
+        || m.contains("name or service not known") // Linux DNS failure
+        || m.contains("nodename nor servname") // macOS DNS failure
+        || m.contains("failed to lookup address") // hickory/reqwest DNS failure
+        || m.contains("could not translate host name") // libpq DNS failure
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -845,5 +889,28 @@ mod tests {
         // must bail immediately even on a transient error.
         let d = decide_export_retry(0, 0, 0, "orders", &transient_err());
         assert!(matches!(d, ExportRetry::BailOriginal), "got: {d:?}");
+    }
+
+    #[test]
+    fn is_port_closed_fast_bails_dead_endpoints_not_transient_blips() {
+        // Hard "nothing will ever answer here" signals → fast-bail.
+        assert!(is_port_closed(&anyhow::anyhow!(
+            "error connecting to server: Connection refused (os error 61)"
+        )));
+        assert!(is_port_closed(&anyhow::anyhow!(
+            "No route to host (os error 65)"
+        )));
+        assert!(is_port_closed(&anyhow::anyhow!(
+            "dns error: failed to lookup address information: Name or service not known"
+        )));
+        // Transient / recoverable signals → must NOT fast-bail (they retry).
+        assert!(!is_port_closed(&anyhow::anyhow!(
+            "connection reset by peer (os error 54)"
+        )));
+        assert!(!is_port_closed(&anyhow::anyhow!("broken pipe")));
+        // Cold-start: a post-connect SQLSTATE, must keep retrying.
+        assert!(!is_port_closed(&anyhow::anyhow!(
+            "db error: FATAL: the database system is starting up"
+        )));
     }
 }

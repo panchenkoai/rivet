@@ -45,11 +45,11 @@ Type "# First run — all 200 rows exported, including NULL-updated_at ones"
 Enter
 Sleep 1500ms
 
-Type "rivet run --config orders.yaml --validate"
+Type "rivet run -c orders.yaml --validate"
 Enter
 Sleep 3500ms
 
-Type "rivet state show --config orders.yaml"
+Type "rivet state show -c orders.yaml"
 Enter
 Sleep 2500ms
 
@@ -65,10 +65,10 @@ Type "# Second run — COALESCE picks them up via created_at. A plain cursor_col
 Enter
 Sleep 2s
 
-Type "rivet run --config orders.yaml --validate"
+Type "rivet run -c orders.yaml --validate"
 Enter
 Sleep 3500ms
 
-Type "rivet state show --config orders.yaml"
+Type "rivet state show -c orders.yaml"
 Enter
 Sleep 2500ms

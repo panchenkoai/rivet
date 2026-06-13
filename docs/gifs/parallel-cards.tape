@@ -32,6 +32,6 @@ Type "# 4 chunked exports, one rivet child process each, one card per export"
 Enter
 Sleep 1200ms
 
-Type "rivet run --config parallel-cards.yaml --parallel-export-processes"
+Type "rivet run -c parallel-cards.yaml --parallel-export-processes"
 Enter
 Sleep 30s

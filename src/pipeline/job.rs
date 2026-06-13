@@ -197,6 +197,8 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
         format: String::new(),
         mode: String::new(),
         compression: String::new(),
+        // Pre-plan failure: we don't know (and never wrote to) a destination.
+        destination_uri: None,
         source_count: None,
         pg_temp_bytes_delta: None,
         skip_reason: None,

@@ -114,11 +114,9 @@ fn init_pg_single_table_emits_valid_config_that_passes_check() {
 
     // ── Step 2: replace url_env with url so rivet check can connect ────────
     // The emitted YAML uses `url_env: DATABASE_URL` by default. Swap in the
-    // literal URL so the check can run without the env var.
-    let yaml_with_url = yaml.replace(
-        "url_env: DATABASE_URL  # export DATABASE_URL='<your-url>'",
-        &format!("url: \"{POSTGRES_URL}\""),
-    );
+    // literal URL so the check can run without the env var. Replace only the
+    // key=value; the trailing `# export ...` stays a valid YAML comment.
+    let yaml_with_url = yaml.replace("url_env: DATABASE_URL", &format!("url: \"{POSTGRES_URL}\""));
 
     let cfg_path = cfg_dir.path().join("rivet.yaml");
     std::fs::write(&cfg_path, &yaml_with_url).expect("write patched config");

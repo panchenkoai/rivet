@@ -24,6 +24,7 @@
 brew install panchenkoai/rivet/rivet
 
 export DATABASE_URL="postgresql://user:pass@host/db"
+# `orders` is a placeholder — use one of YOUR tables, or omit --table to scan the whole schema
 rivet init --source-env DATABASE_URL --table orders -o rivet.yaml
 rivet run -c rivet.yaml
 ```
@@ -245,7 +246,7 @@ docker run --rm \
   -v $(pwd)/examples/rivet.yaml:/config/rivet.yaml \
   -v $(pwd)/output:/output \
   ghcr.io/panchenkoai/rivet:latest \
-  run --config /config/rivet.yaml
+  run -c /config/rivet.yaml
 ```
 
 > From a container, `localhost` is not your machine. Use `host.docker.internal` (Docker Desktop) or `--add-host=host.docker.internal:host-gateway` on Linux. See [Getting Started](docs/getting-started.md) for details.

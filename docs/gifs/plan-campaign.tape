@@ -29,6 +29,6 @@ Type "# Three exports, two share `source_group: replica_main` and are both heavy
 Enter
 Sleep 1500ms
 
-Type "rivet plan --config campaign.yaml"
+Type "rivet plan -c campaign.yaml"
 Enter
 Sleep 12s

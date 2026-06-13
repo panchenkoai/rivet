@@ -25,8 +25,6 @@ mod test_hook;
 mod tuning;
 mod types;
 
-use clap::Parser;
-
 fn main() {
     // F-NEW-F (0.7.5 audit): default log level was `error`, so every
     // `log::warn!(...)` in the codebase (unused --param, --force as
@@ -54,7 +52,7 @@ fn main() {
             writeln!(buf, "{line}")
         })
         .init();
-    let cli = cli::Cli::parse();
+    let cli = cli::parse_cli();
     let json_errors = cli.json_errors;
     if let Err(e) = cli::dispatch(cli) {
         // redact strips credentials; sanitize_terminal strips ANSI/OSC control

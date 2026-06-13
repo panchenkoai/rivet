@@ -443,7 +443,7 @@ fn rerun_warning_message(uri: &str, marker: &str) -> String {
 ///
 /// The manifest is a record of where data was written, so the URI must
 /// reflect what an operator would type to find the prefix again.
-fn destination_uri_for_manifest(cfg: &DestinationConfig) -> String {
+pub(crate) fn destination_uri_for_manifest(cfg: &DestinationConfig) -> String {
     use crate::config::DestinationType;
     match cfg.destination_type {
         DestinationType::Local => cfg

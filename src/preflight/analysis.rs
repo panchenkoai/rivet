@@ -269,6 +269,12 @@ pub(super) fn collect_warnings(
     warnings
 }
 
+/// Tables at or below this row count are a one-shot full copy, not a workload
+/// worth a "DEGRADED" warning. Mirrors `init::TableInfo::suggest_mode`, which
+/// recommends plain `mode: full` (no index/cursor) up to the same threshold —
+/// so the scaffold init writes must not then be scolded by `check`.
+pub(crate) const SMALL_TABLE_ROW_THRESHOLD: i64 = 100_000;
+
 pub(crate) fn compute_verdict(
     row_estimate: Option<i64>,
     uses_index: bool,
@@ -286,6 +292,13 @@ pub(crate) fn compute_verdict(
         // chunked export falls through to `_ => Degraded`, which the
         // operator reads as "your config is wrong" — but it's fine.
         (true, false, _) => HealthVerdict::Acceptable,
+        // A KNOWN-small table (real estimate below the threshold) full-scanning
+        // is exactly what `rivet init` recommends — not a problem. Keyed on a
+        // real estimate (`Some`), so an UNKNOWN size still falls through to
+        // Degraded and gets the index/incremental nudge.
+        (false, _, r) if row_estimate.is_some() && r < SMALL_TABLE_ROW_THRESHOLD => {
+            HealthVerdict::Acceptable
+        }
         (false, _, r) if r <= 1_000_000 => HealthVerdict::Degraded,
         (false, true, r) if r <= 50_000_000 => HealthVerdict::Degraded,
         (false, _, _) => HealthVerdict::Unsafe,
