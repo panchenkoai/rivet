@@ -99,6 +99,9 @@ pub(super) fn run_exports_as_child_processes(
     let mut children: Vec<(String, std::process::Child)> = Vec::with_capacity(exports.len());
     let mut reader_handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(exports.len());
     let mut spawn_failures: HashMap<String, String> = HashMap::new();
+    // Reap children on a targeted SIGTERM/SIGINT to the parent so they don't
+    // orphan and keep holding source connections (OPT-6).
+    child_reaper::install_once();
     for export in exports {
         let mut cmd = Command::new(&exe);
         cmd.arg("run")
@@ -130,6 +133,7 @@ pub(super) fn run_exports_as_child_processes(
         log::debug!("spawning child for export '{}': {:?}", export.name, cmd);
         match cmd.spawn() {
             Ok(mut child) => {
+                child_reaper::register(child.id());
                 if let Some(stdout) = child.stdout.take() {
                     let tx = tx.clone();
                     let export_name = export.name.clone();
@@ -227,10 +231,14 @@ pub(super) fn run_exports_as_child_processes(
     let mut reaper_handles: Vec<std::thread::JoinHandle<WaitOutcome>> =
         Vec::with_capacity(children.len());
     for (name, mut child) in children {
+        let pid = child.id();
         let handle = std::thread::Builder::new()
             .name(format!("rivet-reap-{}", name))
             .spawn(move || {
                 let status = child.wait();
+                // Reaped — clear before the PID can be reused, so a later signal
+                // never targets an unrelated process.
+                child_reaper::deregister(pid);
                 (name, status)
             });
         match handle {
@@ -346,6 +354,96 @@ fn worst_exit_code(codes: &[i32]) -> Option<i32> {
         _ => 0, // generic / signal
     };
     codes.iter().copied().max_by_key(|&c| rank(c))
+}
+
+/// Best-effort reaping of subprocess-export children when the parent receives a
+/// targeted SIGTERM/SIGINT.
+///
+/// Children are spawned in the parent's process group, so a *terminal* Ctrl-C
+/// (SIGINT to the foreground group) already reaches them. But a **targeted**
+/// `kill <parent_pid>` — systemd stop, a k8s pod termination, a scheduler — hits
+/// only the parent; without this the children orphan and keep holding source
+/// connections, the exact fragility rivet exists to protect (OPT-6).
+///
+/// Signal-safe by construction: the handler does only async-signal-safe work —
+/// atomic loads from a fixed-size registry, `kill(2)`, then restore-default +
+/// `raise(2)`. No allocation, no locks in the handler.
+#[cfg(unix)]
+mod child_reaper {
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
+    /// Far above any real export fan-out; the registry is fixed so the handler
+    /// touches no allocator. An overflow child is simply untracked (never UB).
+    const CAP: usize = 512;
+    static SLOTS: [AtomicI32; CAP] = [const { AtomicI32::new(0) }; CAP];
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+
+    /// Record a live child PID so the handler can signal it.
+    pub(super) fn register(pid: u32) {
+        let pid = pid as i32;
+        for slot in &SLOTS {
+            if slot
+                .compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+        log::debug!("child_reaper: registry full ({CAP}); pid {pid} not tracked");
+    }
+
+    /// Clear a PID once the parent has `wait`ed it — so a future PID reuse can
+    /// never be signalled by a late crash.
+    pub(super) fn deregister(pid: u32) {
+        let pid = pid as i32;
+        for slot in &SLOTS {
+            let _ = slot.compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Acquire);
+        }
+    }
+
+    extern "C" fn handle(sig: libc::c_int) {
+        for slot in &SLOTS {
+            let pid = slot.load(Ordering::Acquire);
+            if pid != 0 {
+                // SAFETY: `kill` is async-signal-safe. A reaped PID is cleared
+                // before reuse (see `deregister`); a zombie kill is a harmless
+                // no-op.
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+            }
+        }
+        // Restore the default disposition and re-raise so the parent still dies
+        // *with* the signal (correct exit status for the scheduler that sent it).
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+    }
+
+    /// Install the SIGTERM/SIGINT handler exactly once for the parent process.
+    pub(super) fn install_once() {
+        if INSTALLED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // SAFETY: `handle` is async-signal-safe (see its body). No SA_RESTART, so
+        // a blocking `wait` in a reaper thread is interrupted by the signal.
+        unsafe {
+            let mut act: libc::sigaction = std::mem::zeroed();
+            // Cast through the fn-pointer type (not the fn item) to satisfy
+            // `clippy::fn_to_numeric_cast` under `-D warnings`.
+            act.sa_sigaction = handle as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            libc::sigemptyset(&mut act.sa_mask);
+            act.sa_flags = 0;
+            libc::sigaction(libc::SIGTERM, &act, std::ptr::null_mut());
+            libc::sigaction(libc::SIGINT, &act, std::ptr::null_mut());
+        }
+    }
+}
+
+#[cfg(not(unix))]
+mod child_reaper {
+    pub(super) fn register(_pid: u32) {}
+    pub(super) fn deregister(_pid: u32) {}
+    pub(super) fn install_once() {}
 }
 
 #[cfg(test)]

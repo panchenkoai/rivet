@@ -102,7 +102,7 @@ as the **weaker** engine:
 | Panic at a write-cycle boundary (`RIVET_TEST_PANIC_AT`) | ✅ `live_crash_recovery.rs` (all 4 boundaries) + per-chunk `maybe_panic_at_chunk` | ⚠️ **partial** — `parallel_processes_hard_crash_writes_no_partial_file` drives `after_source_read` through it (asserts no partial at the destination); the other 3 boundaries are not yet driven through `parallel_export_processes` |
 | One child fails (sibling isolation) | n/a | ✅ `parallel_processes_one_child_failure_isolated_from_siblings` — healthy sibling completes, failed child leaves no partial |
 | External **SIGKILL** mid-write (no Drop) | ❌ none | ❌ none |
-| External **SIGTERM / SIGINT** to the orchestrator | ❌ none | ❌ no handler — children may orphan, holding source connections |
+| External **SIGTERM / SIGINT** to the orchestrator | n/a (no child processes) | ✅ `child_reaper` reaps tracked children, then re-raises (`parallel_processes_sigterm_reaps_children_no_orphans`) |
 | A child killed by signal (parent accounting) | n/a | ⚠️ ranking unit-tested only (`parallel_children.rs::exit_propagation_tests`); no end-to-end real-kill test |
 
 ### Panic ≠ signal (why the table above is not redundant)
@@ -121,17 +121,19 @@ destination's commit protocol (`src/destination/mod.rs`):
   known non-atomic window, flagged via destination capabilities, untested under
   signal.
 
-### Open OPT-6 work
+### OPT-6 work
 
-1. **SIGTERM/SIGINT handler in the subprocess orchestrator** — a targeted
-   SIGTERM to the parent currently orphans children that keep holding source
-   connections (the exact fragility rivet exists to protect). Propagate
-   termination to the child process group.
-2. **A real-signal crash test for both engines** — SIGKILL mid-write asserting:
-   local → abandoned temp, no corrupt committed file, clean `--resume`;
-   subprocess → the killed child is recorded as a failure (not silent success)
-   and no child is orphaned.
-3. **Extend subprocess panic coverage to the remaining boundaries** (lower
+1. ✅ **Done — SIGTERM/SIGINT reaper** (`parallel_children::child_reaper`): a
+   signal-safe PID registry + a `sigaction` handler that `kill`s the tracked
+   children and re-raises the default disposition, so a targeted SIGTERM/SIGINT
+   to the parent no longer orphans them. Proven RED→GREEN by
+   `parallel_processes_sigterm_reaps_children_no_orphans` (orphans survive the
+   8 s window without it; reaped in <1 s with it).
+2. ⏳ **SIGKILL-mid-write proof (both engines)** — the no-corrupt-output property
+   under a *non-unwinding* kill is still unproven. The new `RIVET_TEST_BLOCK_AT`
+   hook opens a deterministic mid-write window; a test should SIGKILL there and
+   assert local → abandoned temp + no corrupt committed file + clean `--resume`.
+3. ⏳ **Extend subprocess panic coverage to the remaining boundaries** (lower
    priority) — `after_source_read` is already driven through
    `parallel_export_processes`; add `after_file_write` / `after_manifest_update`
    / `after_cursor_commit` for full symmetry. The no-partial property is already

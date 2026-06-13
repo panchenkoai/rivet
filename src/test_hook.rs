@@ -75,3 +75,23 @@ pub(crate) fn maybe_panic_at_chunk(point: &str, chunk_index: i64) {
         );
     }
 }
+
+/// Block (sleep) at `point` for `RIVET_TEST_BLOCK_MS` ms (default 10000) when
+/// `RIVET_TEST_BLOCK_AT` matches — a *deterministic* "process is alive mid-export"
+/// window, distinct from the panic hook. Used to send a real signal to the parent
+/// and assert subprocess children are reaped, not orphaned (OPT-6 crash matrix).
+/// No-op (one memoised env read) when unset.
+#[inline]
+pub(crate) fn maybe_block_at(point: &str) {
+    static BLOCK_POINT: OnceLock<Option<String>> = OnceLock::new();
+    let configured = BLOCK_POINT
+        .get_or_init(|| std::env::var("RIVET_TEST_BLOCK_AT").ok())
+        .as_deref();
+    if configured == Some(point) {
+        let ms: u64 = std::env::var("RIVET_TEST_BLOCK_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10_000);
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+}
