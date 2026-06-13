@@ -106,7 +106,7 @@ fn diagnose_pg(
         base_query.to_string()
     };
 
-    let row_estimate = estimate_rows_pg(client, &effective_query);
+    let row_estimate = estimate_rows_pg(client, &effective_query)?;
 
     let (range_min, range_max) = if export.mode == ExportMode::Incremental {
         if let Some(expr) = incremental_key_expr(export, SourceType::Postgres) {
@@ -203,21 +203,49 @@ fn diagnose_pg(
     })
 }
 
-fn estimate_rows_pg(client: &mut postgres::Client, query: &str) -> Option<i64> {
+fn estimate_rows_pg(client: &mut postgres::Client, query: &str) -> Result<Option<i64>> {
     let explain = format!("EXPLAIN {}", query);
     let rows = match client.query(&explain, &[]) {
         Ok(r) => r,
         Err(e) => {
-            // Preflight is non-fatal, but a silent .ok()? would hide a real
-            // issue (lock_timeout, missing privilege, syntax in user query) —
-            // surface at debug so `RUST_LOG=debug rivet check` reveals it.
+            // A SQLSTATE *class 42* failure (undefined table/column, no
+            // privilege, syntax) is permanent and author-fixable — let it fail
+            // preflight loudly instead of sailing through to run time.
+            if let Some(fail) = schema_fail_pg(&e) {
+                return Err(fail);
+            }
+            // Everything else (08 connection, 53 resources, 55 lock, 57 cancel,
+            // …) is operational and stays FAIL-SOFT: preflight is non-fatal, so
+            // surface at debug (visible under `RUST_LOG=debug`) and continue.
             log::debug!("preflight: EXPLAIN for row-estimate failed: {e}");
-            return None;
+            return Ok(None);
         }
     };
     let lines: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
     let plan_text = lines.join("\n");
-    parse_pg_row_estimate(&plan_text)
+    Ok(parse_pg_row_estimate(&plan_text))
+}
+
+/// Map a Postgres SQLSTATE *class 42* (syntax/access-rule violation) connect-time
+/// EXPLAIN failure to a loud, author-facing preflight error. Returns `None` for
+/// every other class so operational/transient failures stay fail-soft.
+fn schema_fail_pg(e: &postgres::Error) -> Option<anyhow::Error> {
+    let code = e.code()?;
+    // Class 42 = undefined_table (42P01), undefined_column (42703),
+    // insufficient_privilege (42501), syntax_error (42601), … — all permanent
+    // and fixable in the config/grants, not by retrying.
+    code.code().starts_with("42").then(|| {
+        // `e` (Display) is the bare "db error"; the real reason ("relation … does
+        // not exist") lives on the DbError. Surface it + the SQLSTATE.
+        let detail = e
+            .as_db_error()
+            .map(|db| db.message())
+            .unwrap_or("schema/query error");
+        anyhow::anyhow!(
+            "preflight: {detail} (SQLSTATE {}). Check the table/column names in the export's query, and that the user has SELECT on them.",
+            code.code()
+        )
+    })
 }
 
 pub(crate) fn parse_pg_row_estimate(plan: &str) -> Option<i64> {

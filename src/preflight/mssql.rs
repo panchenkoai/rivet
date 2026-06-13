@@ -103,6 +103,15 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
     };
     let base_query = base_query.as_str();
 
+    // A missing table/column (or no SELECT grant) is permanent and
+    // author-fixable — fail preflight loudly instead of letting it surface only
+    // at run time. The catalog-based row-estimate below never touches the table,
+    // so this zero-row probe is the only check that validates the query's actual
+    // relations. Operational errors stay fail-soft (`None`).
+    if let Some(fail) = schema_fail_mssql(conn, base_query) {
+        return Err(fail);
+    }
+
     let range_col = export
         .chunk_column
         .as_deref()
@@ -199,6 +208,29 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
 /// clustered index (`index_id IN (0,1)`), no `COUNT(*)` scan. `None` when the
 /// stats row is absent (view, no stats) or the probe fails; preflight is
 /// non-fatal, so a failure is logged at debug, never aborted.
+/// Validate the query's relations with a zero-row wrap; map an author-fixable
+/// failure (Invalid object name = 208, Invalid column name = 207) to a loud
+/// preflight error. `None` (fail-soft) for success and operational errors.
+fn schema_fail_mssql(conn: &mut MssqlSource, base_query: &str) -> Option<anyhow::Error> {
+    // `TOP 0` over a derived table executes the relations without scanning rows.
+    let probe = format!("SELECT TOP 0 1 AS _ok FROM ({base_query}) AS _rivet_probe");
+    let Err(e) = conn.query_scalar(&probe) else {
+        return None;
+    };
+    let m = format!("{e:#}");
+    let detail = if m.contains("Invalid object name") {
+        "a table/view in the export's query does not exist"
+    } else if m.contains("Invalid column name") {
+        "a column in the export's query does not exist"
+    } else {
+        return None; // operational → fail-soft
+    };
+    let server = m.lines().next().unwrap_or(&m);
+    Some(anyhow::anyhow!(
+        "preflight: {detail}. Check the table/column names in the query, and that the login has SELECT on them. ({server})"
+    ))
+}
+
 fn row_estimate_mssql(conn: &mut MssqlSource, qualified_table: &str) -> Option<i64> {
     let (schema, table) = split_qualified(qualified_table);
     let sql = format!(

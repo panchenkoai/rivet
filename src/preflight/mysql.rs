@@ -42,6 +42,33 @@ fn fetch_max_connections_mysql(conn: &mut mysql::PooledConn) -> Option<u32> {
     val.try_into().ok()
 }
 
+/// `EXPLAIN` the export's query purely to validate the schema; map an
+/// author-fixable failure to a loud preflight error. `None` (fail-soft) for
+/// success and for operational/transient errors.
+fn schema_fail_mysql(conn: &mut mysql::PooledConn, query: &str) -> Option<anyhow::Error> {
+    use mysql::prelude::Queryable;
+    match conn.query_drop(format!("EXPLAIN {query}")) {
+        Ok(()) => None,
+        Err(e) => mysql_schema_error(&e),
+    }
+}
+
+/// MySQL author-fixable schema errors: ER_NO_SUCH_TABLE (1146),
+/// ER_BAD_FIELD_ERROR (1054), ER_TABLEACCESS_DENIED_ERROR (1142), parse error
+/// (1064). Every other code/variant is operational → `None` (fail-soft).
+fn mysql_schema_error(e: &mysql::Error) -> Option<anyhow::Error> {
+    if let mysql::Error::MySqlError(me) = e
+        && matches!(me.code, 1146 | 1054 | 1142 | 1064)
+    {
+        return Some(anyhow::anyhow!(
+            "preflight: {} (MySQL error {}). Check the table/column names in the export's query, and that the user has SELECT on them.",
+            me.message,
+            me.code
+        ));
+    }
+    None
+}
+
 fn diagnose_mysql(
     conn: &mut mysql::PooledConn,
     export: &ExportConfig,
@@ -101,6 +128,14 @@ fn diagnose_mysql(
     } else {
         base_query.to_string()
     };
+
+    // A schema-class error (missing table/column, no SELECT grant, syntax) is
+    // permanent and author-fixable — fail preflight loudly instead of letting it
+    // sail through to run time. Operational errors stay fail-soft in the probes
+    // below (which `unwrap_or_default` / log at debug and continue).
+    if let Some(fail) = schema_fail_mysql(conn, &effective_query) {
+        return Err(fail);
+    }
 
     let row_estimate = {
         let explain_query = format!("EXPLAIN {}", effective_query);
