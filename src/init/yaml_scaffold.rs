@@ -115,14 +115,21 @@ fn source_url_line(provenance: &super::SourceProvenance) -> String {
     }
 }
 
-/// `exports/<table>/` in the bucket, or `exports/<schema>__<table>/` for non-`public` PostgreSQL.
-fn table_export_prefix(info: &TableInfo, source_type: &str) -> String {
-    let segment = if source_type == "postgres" && info.schema != "public" {
+/// The per-export path segment: the table name, or `<schema>__<table>` for a
+/// non-`public` PostgreSQL table. Shared by every destination so each export
+/// lands under its own subdirectory/prefix (no manifest.json / _SUCCESS
+/// collisions, and a re-run doesn't read a sibling export's parts).
+fn export_segment(info: &TableInfo, source_type: &str) -> String {
+    if source_type == "postgres" && info.schema != "public" {
         format!("{}__{}", info.schema, info.table)
     } else {
         info.table.clone()
-    };
-    format!("exports/{segment}/")
+    }
+}
+
+/// `exports/<table>/` in the bucket, or `exports/<schema>__<table>/` for non-`public` PostgreSQL.
+fn table_export_prefix(info: &TableInfo, source_type: &str) -> String {
+    format!("exports/{}/", export_segment(info, source_type))
 }
 
 /// Emit a YAML scalar that is unambiguous for any plain-text value the user
@@ -457,11 +464,19 @@ fn destination_scaffold(
         }
         v
     } else {
+        // Per-export subdirectory (symmetric with the bucket prefixes above) so
+        // a schema-wide init's exports don't all share ./output — that collides
+        // their manifest.json / _SUCCESS and makes a second run read a sibling's
+        // parts (the scary double-count WARN).
+        let path =
+            yaml_quote_if_needed(&format!("./output/{}/", export_segment(info, source_type)));
         vec![
             "    destination:".to_string(),
             "      type: local".to_string(),
-            // Note the rivet-metadata sidecars so `ls ./output` later isn't a surprise.
-            "      path: ./output  # also writes manifest.json + _SUCCESS here (rivet metadata — keep them; don't load into your warehouse)".to_string(),
+            // Note the rivet-metadata sidecars so `ls` here later isn't a surprise.
+            format!(
+                "      path: {path}  # also writes manifest.json + _SUCCESS here (rivet metadata — keep them; don't load into your warehouse)"
+            ),
         ]
     }
 }
