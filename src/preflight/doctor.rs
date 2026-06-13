@@ -279,7 +279,7 @@ fn trim_probe_error(err: &anyhow::Error) -> String {
     out
 }
 
-pub(super) fn categorize_source_error(err: &anyhow::Error) -> &'static str {
+pub(crate) fn categorize_source_error(err: &anyhow::Error) -> &'static str {
     // `{:#}` (alternate) walks the anyhow cause chain, not just the top
     // Display. Postgres surfaces a wrong password as the bare top-level
     // `"db error"` and buries `"password authentication failed for user …"`
@@ -389,7 +389,7 @@ pub(super) fn categorize_dest_error(
 /// *next action*, not re-explain the failure.
 ///
 /// Categories come from [`categorize_source_error`].
-pub(super) fn source_error_hint(
+pub(crate) fn source_error_hint(
     category: &'static str,
     err: &anyhow::Error,
     source_type: &crate::config::SourceType,

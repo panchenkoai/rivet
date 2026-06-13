@@ -86,7 +86,12 @@ pub(crate) fn run_with_reconnect(
                     last_err = Some(e);
                     continue;
                 }
-                return Err(e);
+                // Final, non-transient connect failure (e.g. auth): bridge the
+                // same category + remediation hint `rivet doctor` already gives,
+                // so a run-time failure isn't a dead end. `.context()` (not
+                // message replacement) keeps the typed cause + the substrings
+                // classify_exit / retry classification depend on.
+                return Err(attach_connect_hint(e, &plan.source));
             }
         };
 
@@ -534,6 +539,19 @@ pub(super) fn run_single_export(
 /// EXCLUDES connection-reset / broken-pipe / EOF (a transient mid-handshake
 /// blip that does retry) and is never hit by cold-start "starting up", which is
 /// a post-connect SQLSTATE, not a connect failure.
+/// Bridge `rivet doctor`'s source-error categorizer + remediation hint to the
+/// run-time connect seam, so a failed `rivet run` (auth, TLS, …) carries the same
+/// guidance instead of a bare driver error. `.context()` (not message
+/// replacement) keeps the original error — and the substrings classify_exit /
+/// retry classification rely on — intact underneath.
+fn attach_connect_hint(e: anyhow::Error, source: &crate::config::SourceConfig) -> anyhow::Error {
+    let category = crate::preflight::categorize_source_error(&e);
+    match crate::preflight::source_error_hint(category, &e, &source.source_type) {
+        Some(hint) => e.context(format!("{category} — {hint}")),
+        None => e,
+    }
+}
+
 fn is_port_closed(e: &anyhow::Error) -> bool {
     let m = format!("{e:#}").to_ascii_lowercase();
     m.contains("connection refused")
