@@ -332,7 +332,10 @@ fn export_block_lines(
             // it now lands at ~10. Operators who want different geometry
             // override this line directly.
             lines.push(format!("    chunk_size: {chunk_size}"));
-            lines.push("    chunk_checkpoint: true".to_string());
+            lines.push(
+                "    chunk_checkpoint: true  # record per-chunk progress so `rivet run --resume` can finish a crashed run"
+                    .to_string(),
+            );
             if parallel.workers > 1 {
                 // Correction #5: show the predicted peak so the operator can
                 // trade memory for speed without guessing. RSS scales with
@@ -382,9 +385,18 @@ fn export_block_lines(
         ));
     }
 
-    lines.push("    meta_columns:".to_string());
-    lines.push("      exported_at: true".to_string());
-    lines.push("      row_hash: true".to_string());
+    // meta_columns inject two extra columns into every output file; name them
+    // here so the operator isn't surprised by `_rivet_*` columns downstream.
+    lines.push(
+        "    meta_columns:  # adds 2 columns to the output (drop this block to omit them)"
+            .to_string(),
+    );
+    lines.push(
+        "      exported_at: true  # _rivet_exported_at: when the row was exported".to_string(),
+    );
+    lines.push(
+        "      row_hash: true  # _rivet_row_hash: per-row hash for change detection".to_string(),
+    );
     lines.extend(destination_scaffold(info, source_type, dest));
 
     // Emit `columns:` overrides for NUMERIC/DECIMAL columns so the export
@@ -448,7 +460,8 @@ fn destination_scaffold(
         vec![
             "    destination:".to_string(),
             "      type: local".to_string(),
-            "      path: ./output".to_string(),
+            // Note the rivet-metadata sidecars so `ls ./output` later isn't a surprise.
+            "      path: ./output  # also writes manifest.json + _SUCCESS here (rivet metadata — keep them; don't load into your warehouse)".to_string(),
         ]
     }
 }
