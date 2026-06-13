@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.11.0 (unreleased) — new-user UX: friendly errors, guided onboarding, preflight that catches mistakes
+## 0.11.0 (2026-06-13) — new-user UX: friendly errors, guided onboarding, preflight that catches mistakes
 
 A new-user experience pass: the first ten minutes with rivet read as guidance,
 not archaeology. `rivet init` scaffolds a *working* config and names the next
