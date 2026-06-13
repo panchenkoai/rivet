@@ -473,10 +473,11 @@ fn destination_scaffold(
         vec![
             "    destination:".to_string(),
             "      type: local".to_string(),
-            // Note the rivet-metadata sidecars so `ls` here later isn't a surprise.
-            format!(
-                "      path: {path}  # also writes manifest.json + _SUCCESS here (rivet metadata — keep them; don't load into your warehouse)"
-            ),
+            // Name the rivet-metadata sidecars so `ls` here later isn't a
+            // surprise. A standalone line (not an inline comment) so it fits
+            // 80 cols regardless of how long the table/segment name is.
+            "      # rivet also writes manifest.json + _SUCCESS here (its metadata)".to_string(),
+            format!("      path: {path}"),
         ]
     }
 }
