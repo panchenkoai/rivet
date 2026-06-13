@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — new-user UX: friendly errors, guided onboarding, preflight that catches mistakes
+## 0.11.0 (unreleased) — new-user UX: friendly errors, guided onboarding, preflight that catches mistakes
 
 A new-user experience pass: the first ten minutes with rivet read as guidance,
 not archaeology. `rivet init` scaffolds a *working* config and names the next
@@ -8,8 +8,8 @@ command; `rivet check` catches a mistyped table/column **before** any run instea
 of passing through to a half-finished export; errors name the failing thing and
 suggest the fix; the success card shows where the files landed. Every
 instructional GIF is re-recorded against the new behaviour, plus three new ones
-showing rivet catching mistakes. Proposed **MINOR** bump (0.11.0) — the
-`rivet check` exit-code change below is behaviour-affecting.
+showing rivet catching mistakes. **MINOR** bump — the `rivet check` exit-code
+change below is behaviour-affecting.
 
 ### ⚠️ Behaviour change (why this is a MINOR bump)
 
