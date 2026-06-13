@@ -20,7 +20,7 @@ For the full internal acceptance test plan with detailed suites and smoke-test s
 
 ## Basic export
 
-- [ ] `rivet run --config rivet.yaml --validate` completes with `status: success`
+- [ ] `rivet run -c rivet.yaml --validate` completes with `status: success`
 - [ ] Row count in summary matches expected
 - [ ] Output files exist at the configured destination
 
@@ -45,7 +45,7 @@ For the full internal acceptance test plan with detailed suites and smoke-test s
 
 ## Plan/Apply (if using auditable execution)
 
-- [ ] `rivet plan --config rivet.yaml -o plan.json` succeeds
+- [ ] `rivet plan -c rivet.yaml -o plan.json` succeeds
 - [ ] `rivet apply plan.json` runs and matches the plan artifact
 - [ ] Re-running `rivet apply` with an unchanged plan succeeds; altered config is rejected
 

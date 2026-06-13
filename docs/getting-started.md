@@ -9,7 +9,7 @@ brew install panchenkoai/rivet/rivet
 export DATABASE_URL='postgresql://user:pass@localhost:5432/mydb'
 # `orders` is a placeholder — use one of YOUR tables, or omit --table to scan the whole schema
 rivet init --source-env DATABASE_URL --table orders -o rivet.yaml
-rivet run --config rivet.yaml --validate
+rivet run -c rivet.yaml --validate
 ```
 
 That's the whole flow. The four steps below explain each command, expected output, and where to go from each. Read time: ~3 minutes.
@@ -55,9 +55,9 @@ Full flag reference: [reference/init.md](reference/init.md). For a manually-auth
 ## 3 · Preflight & run
 
 ```bash
-rivet doctor --config rivet.yaml   # verify source + destination auth
-rivet check  --config rivet.yaml   # dry-run analysis per export
-rivet run    --config rivet.yaml --validate --reconcile
+rivet doctor -c rivet.yaml   # verify source + destination auth
+rivet check  -c rivet.yaml   # dry-run analysis per export
+rivet run    -c rivet.yaml --validate --reconcile
 ```
 
 The full basic workflow (`init` → `doctor` → `check` → `run` → `state`) recorded as a single terminal cast:
@@ -82,6 +82,7 @@ Example summary card after a successful run:
   tuning:      profile=balanced (default), batch_size=10000
   rows:        5432
   files:       1
+  output:      file://./output
   bytes:       847 KB
   duration:    1.2s
   peak RSS:    15MB (sampled during run)
@@ -93,10 +94,10 @@ Example summary card after a successful run:
 ## 4 · Inspect & iterate
 
 ```bash
-rivet state show   --config rivet.yaml             # cursors (incremental exports)
-rivet metrics      --config rivet.yaml --last 10   # per-run history
-rivet state files  --config rivet.yaml             # files actually written
-rivet journal      --config rivet.yaml --export orders   # per-run events / retries / quality issues
+rivet state show   -c rivet.yaml             # cursors (incremental exports)
+rivet metrics      -c rivet.yaml --last 10   # per-run history
+rivet state files  -c rivet.yaml             # files actually written
+rivet journal      -c rivet.yaml --export orders   # per-run events / retries / quality issues
 ```
 
 ![Post-run inspection: state show, metrics, state files, state progression](gifs/inspect.gif)

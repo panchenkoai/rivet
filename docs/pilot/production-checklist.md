@@ -77,7 +77,7 @@ For CI/CD pipelines, GitOps workflows, or any run that requires a pre-execution 
 
 1. **Generate a plan artifact** — preflight analysis + chunk boundaries pre-computed, no data exported:
    ```bash
-   rivet plan --config rivet.yaml --format json --output plan.json
+   rivet plan -c rivet.yaml --format json --output plan.json
    ```
 2. **Review the plan** — inspect `verdict`, `warnings`, chunk count, row estimate. Commit `plan.json` to a PR or store as a CI artifact.
 3. **Apply the sealed artifact** — executes exactly the pre-computed plan:
