@@ -99,7 +99,7 @@ as the **weaker** engine:
 
 | Trigger | In-process | Subprocess |
 |---|---|---|
-| Panic at a write-cycle boundary (`RIVET_TEST_PANIC_AT`) | ✅ `live_crash_recovery.rs` (all 4 boundaries) + per-chunk `maybe_panic_at_chunk` | ⚠️ **partial** — `parallel_processes_hard_crash_writes_no_partial_file` drives `after_source_read` through it (asserts no partial at the destination); the other 3 boundaries are not yet driven through `parallel_export_processes` |
+| Panic at a write-cycle boundary (`RIVET_TEST_PANIC_AT`) | ✅ `live_crash_recovery.rs` (all 4 boundaries) + per-chunk `maybe_panic_at_chunk` | ✅ `after_source_read` (no partial — `parallel_processes_hard_crash_writes_no_partial_file`); `after_file_write` / `after_manifest_update` / `after_cursor_commit` recover with no row loss (`parallel_processes_recovers_from_child_crash_at_each_boundary`) |
 | One child fails (sibling isolation) | n/a | ✅ `parallel_processes_one_child_failure_isolated_from_siblings` — healthy sibling completes, failed child leaves no partial |
 | External **SIGKILL** mid-write (no Drop) | ✅ `sigkill_in_commit_window_leaves_no_committed_file` — staged temp, no committed file, clean recovery | ✅ same write cycle (each child is a single export through `local::write`) |
 | External **SIGTERM / SIGINT** to the orchestrator | n/a (no child processes) | ✅ `child_reaper` reaps tracked children, then re-raises (`parallel_processes_sigterm_reaps_children_no_orphans`) |
@@ -136,8 +136,18 @@ destination's commit protocol (`src/destination/mod.rs`):
    exactly one file — temp+rename, not `Drop`, carries guarantee #3 under a
    non-unwinding signal. (Object-store `FinalizeOnClose` remains unproven — needs
    a live cloud target.)
-3. ⏳ **Extend subprocess panic coverage to the remaining boundaries** (lower
-   priority) — `after_source_read` is already driven through
-   `parallel_export_processes`; add `after_file_write` / `after_manifest_update`
-   / `after_cursor_commit` for full symmetry. The no-partial property is already
-   proven; these only add per-child manifest/cursor coverage.
+3. ✅ **Done — subprocess panic coverage across the full write cycle**
+   (`parallel_processes_recovers_from_child_crash_at_each_boundary`): a child
+   panic at `after_file_write` / `after_manifest_update` / `after_cursor_commit`
+   through `parallel_export_processes` → the parent reports the crash and a clean
+   subprocess rerun recovers the full source id set with no loss. Symmetric with
+   the in-process matrix.
+
+### Residual (out of the OPT-6 slices)
+
+- **Object-store SIGKILL / `FinalizeOnClose`** — the non-atomic finalize window is
+  unproven; needs a live cloud target.
+- **A child killed by an external signal** (vs the parent) — parent accounting is
+  unit-tested for ranking (`exit_propagation_tests`); no end-to-end real-kill of a
+  single child. Low risk (a signal-killed child is a non-zero wait status the
+  parent already aggregates).
