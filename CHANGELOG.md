@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.11.1 (2026-06-14) — crash-matrix symmetry: no orphaned subprocess children
+
+A reliability fix for the subprocess-export engine (`--parallel-export-processes`)
+plus the crash-test coverage that locks it in. **PATCH** — a bug fix + tests + docs,
+no contract change.
+
+### Fixed
+
+- **`fix(pipeline)` — a targeted SIGTERM/SIGINT to a `--parallel-export-processes`
+  run now reaps its export children** instead of orphaning them. A `kill <pid>`
+  from a scheduler / k8s / systemd hit only the parent; the children kept running
+  and holding source connections — the exact fragility rivet protects against.
+  (Terminal Ctrl-C, which signals the whole process group, already reached them;
+  this closes the *targeted*-signal case.) Implemented as a signal-safe child
+  reaper (`parallel_children::child_reaper`).
+
+### Internal / tests
+
+- **Crash-matrix symmetry (OPT-6)** across both execution engines (ADR-0010):
+  - SIGKILL mid-commit proven to leave no corrupt committed file — temp+rename,
+    not `Drop`, carries the no-corrupt-output guarantee under a non-unwinding signal.
+  - Subprocess panic recovery across all four write-cycle boundaries (no row loss).
+  - `dev/CRASH_MATRIX.md` rewritten with the verified two-engine coverage matrix
+    and the panic-vs-signal rationale; residuals (object-store `FinalizeOnClose`,
+    single-child external-signal accounting) documented as known non-guarantees.
+  - Reusable test-only `RIVET_TEST_BLOCK_AT` / `_MS` fault hook for deterministic
+    mid-export crash windows (no-op when unset).
+
 ## 0.11.0 (2026-06-13) — new-user UX: friendly errors, guided onboarding, preflight that catches mistakes
 
 A new-user experience pass: the first ten minutes with rivet read as guidance,
