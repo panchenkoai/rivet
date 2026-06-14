@@ -362,3 +362,73 @@ fn crash_after_cursor_commit_is_recoverable_with_full_state() {
         "cursor value must stay at the post-crash position when no new data arrived"
     );
 }
+
+// ─── OPT-6 slice 3: the same write-cycle boundaries through the SUBPROCESS engine ─
+//
+// `after_source_read` is covered by `parallel_processes_hard_crash_writes_no_partial_file`
+// (no partial at the destination). The remaining boundaries are boundary-agnostic
+// for the parent — it only sees "child exited non-zero" — so one parametrised test
+// proves the parent aggregates a child crash AND a clean subprocess rerun recovers
+// the full source id set with no loss, symmetric with the in-process matrix above.
+// (The child runs the in-process write path, already covered per-boundary above;
+// this adds the parent-aggregation + recovery dimension for `parallel_export_processes`.)
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn parallel_processes_recovers_from_child_crash_at_each_boundary() {
+    require_alive(LiveService::Postgres);
+    for crash_at in [
+        "after_file_write",
+        "after_manifest_update",
+        "after_cursor_commit",
+    ] {
+        let (table, _guard) = seed_cursor_table(40);
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let export = unique_name("qa11_sub");
+        let cfg = write_cfg(out.path(), &table, &export, &cfg_dir);
+
+        // Crash the child mid-write-cycle through the subprocess engine — the env
+        // is inherited by the spawned child, which runs the in-process write path.
+        let crashed = std::process::Command::new(RIVET_BIN)
+            .args([
+                "run",
+                "--config",
+                cfg.to_str().unwrap(),
+                "--parallel-export-processes",
+            ])
+            .env("RIVET_TEST_PANIC_AT", crash_at)
+            .output()
+            .expect("spawn rivet --parallel-export-processes");
+        assert!(
+            !crashed.status.success(),
+            "{crash_at}: the parent must report the child crash (non-zero); stderr:\n{}",
+            String::from_utf8_lossy(&crashed.stderr)
+        );
+
+        // Recover via a clean subprocess rerun.
+        let rec = std::process::Command::new(RIVET_BIN)
+            .args([
+                "run",
+                "--config",
+                cfg.to_str().unwrap(),
+                "--parallel-export-processes",
+            ])
+            .output()
+            .expect("spawn rivet recovery");
+        assert!(
+            rec.status.success(),
+            "{crash_at}: subprocess rerun must recover; stderr:\n{}",
+            String::from_utf8_lossy(&rec.stderr)
+        );
+
+        // No row loss: the destination holds the full source id set (duplicates
+        // from an at-least-once rerun are allowed; a *lost* id is not).
+        let (ids, _rows) = parquet_ids_and_rows(out.path());
+        assert_eq!(
+            ids.len(),
+            40,
+            "{crash_at}: recovery must export all 40 source ids; got {}",
+            ids.len()
+        );
+    }
+}

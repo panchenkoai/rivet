@@ -83,3 +83,71 @@ cargo test --test live_crash_recovery -- --ignored
 
 See also: [docs/reference/testing.md](../docs/reference/testing.md) for the
 full offline + live test matrix.
+
+## Engine symmetry (OPT-6)
+
+Rivet has two execution engines (ADR-0010); a crash scenario is only as covered
+as the **weaker** engine:
+
+- **In-process** — `src/pipeline/chunked/exec.rs` (+ `parallel_checkpoint.rs` /
+  `sequential_checkpoint.rs`). Worker threads sharing one write cycle.
+- **Subprocess fan-out** — `src/pipeline/parallel_children.rs`
+  (`parallel_export_processes`). One child `rivet` per export; the parent
+  spawns, waits, and aggregates child exit codes.
+
+### Crash-trigger × engine coverage (verified 2026-06-13)
+
+| Trigger | In-process | Subprocess |
+|---|---|---|
+| Panic at a write-cycle boundary (`RIVET_TEST_PANIC_AT`) | ✅ `live_crash_recovery.rs` (all 4 boundaries) + per-chunk `maybe_panic_at_chunk` | ✅ `after_source_read` (no partial — `parallel_processes_hard_crash_writes_no_partial_file`); `after_file_write` / `after_manifest_update` / `after_cursor_commit` recover with no row loss (`parallel_processes_recovers_from_child_crash_at_each_boundary`) |
+| One child fails (sibling isolation) | n/a | ✅ `parallel_processes_one_child_failure_isolated_from_siblings` — healthy sibling completes, failed child leaves no partial |
+| External **SIGKILL** mid-write (no Drop) | ✅ `sigkill_in_commit_window_leaves_no_committed_file` — staged temp, no committed file, clean recovery | ✅ same write cycle (each child is a single export through `local::write`) |
+| External **SIGTERM / SIGINT** to the orchestrator | n/a (no child processes) | ✅ `child_reaper` reaps tracked children, then re-raises (`parallel_processes_sigterm_reaps_children_no_orphans`) |
+| A child killed by signal (parent accounting) | n/a | ⚠️ ranking unit-tested only (`parallel_children.rs::exit_propagation_tests`); no end-to-end real-kill test |
+
+### Panic ≠ signal (why the table above is not redundant)
+
+The automated matrix injects **panics**, which *unwind* and run destructors — so
+`ParquetWriter`'s `ArrowWriter::close()` (the footer) and the temp→rename can
+still complete. A real **SIGKILL** runs **no** destructors, so under signals the
+"no corrupt output" property does **not** rest on `Drop` — it rests on the
+destination's commit protocol (`src/destination/mod.rs`):
+
+- **Local** (`WriteCommitProtocol::Atomic`) — temp-then-rename. A SIGKILL leaves
+  an **abandoned temp** (footerless or whole), never a corrupt *committed* file,
+  so guarantee #3 holds **by design** — but this is unproven under a real signal.
+- **Object stores** (`FinalizeOnClose`, `partial_write_risk`) — finalize is
+  **non-atomic** (opendal `rename` = copy+delete). A crash mid-finalize is a
+  known non-atomic window, flagged via destination capabilities, untested under
+  signal.
+
+### OPT-6 work
+
+1. ✅ **Done — SIGTERM/SIGINT reaper** (`parallel_children::child_reaper`): a
+   signal-safe PID registry + a `sigaction` handler that `kill`s the tracked
+   children and re-raises the default disposition, so a targeted SIGTERM/SIGINT
+   to the parent no longer orphans them. Proven RED→GREEN by
+   `parallel_processes_sigterm_reaps_children_no_orphans` (orphans survive the
+   8 s window without it; reaped in <1 s with it).
+2. ✅ **Done — SIGKILL-mid-write proof** (`sigkill_in_commit_window_leaves_no_committed_file`):
+   `RIVET_TEST_BLOCK_AT=before_commit_rename` parks the export with the staged
+   `.tmp` written but the atomic rename not yet run; a real SIGKILL there leaves
+   NO committed `.parquet` (only the abandoned temp) and a clean re-run recovers
+   exactly one file — temp+rename, not `Drop`, carries guarantee #3 under a
+   non-unwinding signal. (Object-store `FinalizeOnClose` remains unproven — needs
+   a live cloud target.)
+3. ✅ **Done — subprocess panic coverage across the full write cycle**
+   (`parallel_processes_recovers_from_child_crash_at_each_boundary`): a child
+   panic at `after_file_write` / `after_manifest_update` / `after_cursor_commit`
+   through `parallel_export_processes` → the parent reports the crash and a clean
+   subprocess rerun recovers the full source id set with no loss. Symmetric with
+   the in-process matrix.
+
+### Residual (out of the OPT-6 slices)
+
+- **Object-store SIGKILL / `FinalizeOnClose`** — the non-atomic finalize window is
+  unproven; needs a live cloud target.
+- **A child killed by an external signal** (vs the parent) — parent accounting is
+  unit-tested for ranking (`exit_propagation_tests`); no end-to-end real-kill of a
+  single child. Low risk (a signal-killed child is a non-zero wait status the
+  parent already aggregates).

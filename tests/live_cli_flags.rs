@@ -2233,6 +2233,241 @@ exports:
 }
 
 #[test]
+#[ignore = "live: requires docker compose postgres (unix only)"]
+#[cfg(unix)]
+fn parallel_processes_sigterm_reaps_children_no_orphans() {
+    // OPT-6: a TARGETED SIGTERM to the parent (the case k8s / systemd / a
+    // scheduler `kill <pid>` produces — terminal Ctrl-C, which hits the whole
+    // group, does not) must reap the export children. Without the reaper they
+    // orphan and keep holding source connections.
+    require_alive(LiveService::Postgres);
+    let t1 = seed_pg_numeric_table(5);
+    let t2 = seed_pg_numeric_table(5);
+    let out1 = tempfile::tempdir().unwrap();
+    let out2 = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        r#"
+source:
+  type: postgres
+  url: "{POSTGRES_URL}"
+exports:
+  - name: {n1}
+    query: "SELECT id, name FROM {n1}"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: {o1}
+  - name: {n2}
+    query: "SELECT id, name FROM {n2}"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: {o2}
+"#,
+        n1 = t1.name(),
+        o1 = out1.path().display(),
+        n2 = t2.name(),
+        o2 = out2.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    let children_of = |ppid: u32| -> Vec<u32> {
+        std::process::Command::new("pgrep")
+            .args(["-P", &ppid.to_string()])
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .filter_map(|l| l.trim().parse::<u32>().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let alive = |pid: u32| -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+
+    // Each child blocks 60s after reading the source — far longer than the 8s
+    // observation window below, so a child that is still alive at the deadline
+    // was *orphaned*, not merely self-terminated when its block expired. (An
+    // earlier 10s block let children die naturally inside the window, masking
+    // the bug — the reaper run finished in ~2s, the unreaped run in ~12s, but
+    // both "passed".) The env is inherited by every spawned child.
+    let mut parent = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--parallel-export-processes",
+        ])
+        .env("RIVET_TEST_BLOCK_AT", "after_source_read")
+        .env("RIVET_TEST_BLOCK_MS", "60000")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn parent rivet run --parallel-export-processes");
+    let ppid = parent.id();
+
+    let mut kids: Vec<u32> = Vec::new();
+    let appear_by = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < appear_by {
+        kids = children_of(ppid);
+        if kids.len() >= 2 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+    assert!(
+        kids.len() >= 2,
+        "expected 2 subprocess children alive before signalling; found {kids:?}"
+    );
+
+    // Targeted SIGTERM to the parent PID only.
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", &ppid.to_string()])
+        .status();
+
+    let gone_by = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    while std::time::Instant::now() < gone_by && kids.iter().any(|&p| alive(p)) {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let _ = parent.wait();
+    let survivors: Vec<u32> = kids.into_iter().filter(|&p| alive(p)).collect();
+    // Never leave orphans behind, pass or fail (they hold a 60s block otherwise).
+    for &p in &survivors {
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &p.to_string()])
+            .status();
+    }
+    assert!(
+        survivors.is_empty(),
+        "OPT-6: child export processes orphaned after a targeted SIGTERM to the \
+         parent (still alive: {survivors:?}) — they must be reaped, not left \
+         holding source connections"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres (unix only)"]
+#[cfg(unix)]
+fn sigkill_in_commit_window_leaves_no_committed_file() {
+    // OPT-6 / guarantee #3 under a REAL signal (panic != signal). A SIGKILL in
+    // the local commit window — staged `.tmp` written, atomic rename not yet
+    // run — must leave NO file at the final key (only the abandoned temp); a
+    // clean re-run then recovers. Proves temp+rename, not `Drop`, carries the
+    // no-corrupt-output property when destructors never run.
+    require_alive(LiveService::Postgres);
+    let t = seed_pg_numeric_table(20);
+    let out = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        r#"
+source:
+  type: postgres
+  url: "{POSTGRES_URL}"
+exports:
+  - name: {n}
+    query: "SELECT id, name FROM {n}"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: {o}
+"#,
+        n = t.name(),
+        o = out.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    let alive = |pid: u32| -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    let has_tmp = || {
+        std::fs::read_dir(out.path())
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            })
+            .unwrap_or(false)
+    };
+
+    let mut child = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            t.name(),
+        ])
+        .env("RIVET_TEST_BLOCK_AT", "before_commit_rename")
+        .env("RIVET_TEST_BLOCK_MS", "60000")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn rivet run");
+    let pid = child.id();
+
+    // Wait until the staged `.tmp` exists (process parked in the commit window).
+    let staged_by = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::time::Instant::now() < staged_by && !has_tmp() {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+    assert!(
+        has_tmp(),
+        "expected a staged `.tmp` in the commit window before SIGKILL; dir empty"
+    );
+
+    // Hard kill — no unwinding, no Drop.
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status();
+    let dead_by = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < dead_by && alive(pid) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = child.wait();
+
+    // The committed key must NOT exist — only the abandoned temp may linger.
+    assert!(
+        files_with_extension(out.path(), "parquet").is_empty(),
+        "SIGKILL in the commit window left a committed .parquet (temp+rename violated)"
+    );
+
+    // Recovery: a clean re-run (no block) produces exactly one real file.
+    let rec = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            t.name(),
+        ])
+        .output()
+        .expect("spawn recovery run");
+    assert!(
+        rec.status.success(),
+        "recovery run must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&rec.stderr)
+    );
+    assert_eq!(
+        files_with_extension(out.path(), "parquet").len(),
+        1,
+        "recovery must produce exactly one committed .parquet"
+    );
+}
+
+#[test]
 #[ignore = "live: requires docker compose postgres"]
 fn check_strict_flags_csv_unserializable_column_consistently_with_run() {
     // Format-awareness regression: `check` resolves types for the Parquet

@@ -259,6 +259,8 @@ pub(super) fn run_single_export(
     // Test fault-point #1: after the source stream was fully read but
     // before the writer is finalised.  Exercised by QA backlog Task 1.1.
     crate::test_hook::maybe_panic_at("after_source_read");
+    // Deterministic "alive mid-export" window for the OPT-6 signal-reaping test.
+    crate::test_hook::maybe_block_at("after_source_read");
 
     if let Some(w) = sink.writer.take() {
         w.finish()?;
