@@ -4,9 +4,10 @@
 
 Sizes the extraction batch to a memory target instead of a static row count, so
 narrow tables stop paying a per-batch handoff tax. **MINOR** — the default
-`balanced` batching behaviour changes (peak RSS on wide tables is unchanged;
-narrow tables get much larger batches). Source-friendlier too: the source query
-is held open ~9× less time (verified — identical server-side scan, same SQL).
+`balanced` batching behaviour changes: narrow tables get much larger batches
+(higher but bounded peak RSS — see Memory below), wide tables change little.
+Source-friendlier too: the source query is held open ~9× less time (verified —
+identical server-side scan, same SQL).
 
 ### ⚠️ Behaviour change (why this is a MINOR bump)
 
@@ -15,9 +16,9 @@ is held open ~9× less time (verified — identical server-side scan, same SQL).
   ~128 MB.** On narrow tables the static 10k pinned the engine to tiny Arrow
   batches (one parquet row-group per 10k rows), so the per-flush handoff
   dominated wall-clock. The memory target sizes the batch to the row width:
-  large for narrow tables (clamped to a 500k-row hard-max), and *small* for
-  wide ones (≈64 MB ÷ row width) — so peak RSS on wide tables is unchanged.
-  The static `batch_size` remains as the no-schema fallback and advisory base.
+  large for narrow tables (clamped to a 150k-row hard-max that bounds peak RSS),
+  and *small* for wide ones (≈64 MB ÷ row width). The static `batch_size`
+  remains as the no-schema fallback and advisory base.
 
 ### Performance
 
@@ -32,6 +33,25 @@ is held open ~9× less time (verified — identical server-side scan, same SQL).
     it 6.9× (62.4s → 9.0s).
   - **PostgreSQL neutral** (≈ 1.0×) — its server-side cursor + `work_mem`-bounded
     `FETCH N` was already efficient; no regression.
+
+### Memory (peak RSS)
+
+The bigger batch *is* the speedup, so narrow-table peak RSS rises — bounded by
+the 150k-row cap on the raw-row accumulator (for narrow rows that raw `Vec<Row>`
+dominates the ~64 MB Arrow batch). Measured, OLD (static 10k) → NEW,
+`bench_narrow` 10.24M (the `150k` cap was chosen against the `500k` figures in
+parentheses):
+
+| engine | OLD | NEW | note |
+|---|---:|---:|---|
+| PostgreSQL | 29 MB | 30 MB | flat — `work_mem`-bounded `FETCH N` never grew |
+| MySQL | 34 MB | 68 MB | ~2× (was 149 MB at a 500k cap) |
+| SQL Server | 32 MB | 113 MB | ~3.5× (was 352 MB at 500k) — heavier `tiberius::Row` |
+
+Speedup is unchanged at the lower cap (walls within noise). Wide tables rise
+less (PG `content_items` 51→57 MB; MySQL 128→170 MB), and all stay well under
+the multi-GB a single-`SELECT *` client buffer incurs. Memory-constrained host?
+`profile: safe`, a lower `batch_size_memory_mb`, or `memory_threshold_mb` cap it.
 
 ### Internal
 

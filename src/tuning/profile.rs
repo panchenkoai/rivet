@@ -221,10 +221,11 @@ impl SourceTuning {
             TuningProfile::Balanced => Self {
                 // Memory-driven batch by default: a 64 MB-per-flush target sizes the
                 // batch to the row width — large for narrow tables (clamped to the
-                // 500k hard-max in `compute_batch_size_from_memory`; a small static
-                // default made the per-batch handoff dominate — 10.24M narrow rows ran
-                // 57s vs ~4s at 256k+), and small for wide ones (≈64 MB ÷ row). The
-                // static `batch_size` below is the no-schema fallback + advisory base.
+                // 150k hard-max in `compute_batch_size_from_memory`, which bounds the
+                // raw-row accumulator's peak RSS; a small static default made the
+                // per-batch handoff dominate — 10.24M narrow rows ran 57s vs ~7s
+                // memory-driven), and small for wide ones (≈64 MB ÷ row). The static
+                // `batch_size` below is the no-schema fallback + advisory base.
                 batch_size: 10_000,
                 batch_size_memory_mb: Some(64),
                 throttle_ms: 50,
@@ -527,9 +528,9 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
         ]));
         let bs = t.effective_batch_size(Some(&schema));
-        assert!((1_000..=500_000).contains(&bs), "got {bs}");
-        // 256MB / 266B ≈ 1_009_022, clamped to 500_000
-        assert_eq!(bs, 500_000);
+        assert!((1_000..=150_000).contains(&bs), "got {bs}");
+        // 256MB / 266B ≈ 1_009_022, clamped to 150_000
+        assert_eq!(bs, 150_000);
     }
 
     #[test]
