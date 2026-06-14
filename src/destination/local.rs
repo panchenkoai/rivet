@@ -99,6 +99,11 @@ impl super::Destination for LocalDestination {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
+        // OPT-6: a deterministic window where the staged `.tmp` is fully written
+        // but the atomic rename has not run. A SIGKILL here must leave NO file at
+        // the final key — proving temp+rename (not `Drop`) carries guarantee #3
+        // under a real, non-unwinding signal.
+        crate::test_hook::maybe_block_at("before_commit_rename");
         if let Err(e) = std::fs::rename(&tmp, &target) {
             let _ = std::fs::remove_file(&tmp);
             return Err(e.into());

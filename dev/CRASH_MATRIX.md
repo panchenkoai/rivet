@@ -101,7 +101,7 @@ as the **weaker** engine:
 |---|---|---|
 | Panic at a write-cycle boundary (`RIVET_TEST_PANIC_AT`) | ✅ `live_crash_recovery.rs` (all 4 boundaries) + per-chunk `maybe_panic_at_chunk` | ⚠️ **partial** — `parallel_processes_hard_crash_writes_no_partial_file` drives `after_source_read` through it (asserts no partial at the destination); the other 3 boundaries are not yet driven through `parallel_export_processes` |
 | One child fails (sibling isolation) | n/a | ✅ `parallel_processes_one_child_failure_isolated_from_siblings` — healthy sibling completes, failed child leaves no partial |
-| External **SIGKILL** mid-write (no Drop) | ❌ none | ❌ none |
+| External **SIGKILL** mid-write (no Drop) | ✅ `sigkill_in_commit_window_leaves_no_committed_file` — staged temp, no committed file, clean recovery | ✅ same write cycle (each child is a single export through `local::write`) |
 | External **SIGTERM / SIGINT** to the orchestrator | n/a (no child processes) | ✅ `child_reaper` reaps tracked children, then re-raises (`parallel_processes_sigterm_reaps_children_no_orphans`) |
 | A child killed by signal (parent accounting) | n/a | ⚠️ ranking unit-tested only (`parallel_children.rs::exit_propagation_tests`); no end-to-end real-kill test |
 
@@ -129,10 +129,13 @@ destination's commit protocol (`src/destination/mod.rs`):
    to the parent no longer orphans them. Proven RED→GREEN by
    `parallel_processes_sigterm_reaps_children_no_orphans` (orphans survive the
    8 s window without it; reaped in <1 s with it).
-2. ⏳ **SIGKILL-mid-write proof (both engines)** — the no-corrupt-output property
-   under a *non-unwinding* kill is still unproven. The new `RIVET_TEST_BLOCK_AT`
-   hook opens a deterministic mid-write window; a test should SIGKILL there and
-   assert local → abandoned temp + no corrupt committed file + clean `--resume`.
+2. ✅ **Done — SIGKILL-mid-write proof** (`sigkill_in_commit_window_leaves_no_committed_file`):
+   `RIVET_TEST_BLOCK_AT=before_commit_rename` parks the export with the staged
+   `.tmp` written but the atomic rename not yet run; a real SIGKILL there leaves
+   NO committed `.parquet` (only the abandoned temp) and a clean re-run recovers
+   exactly one file — temp+rename, not `Drop`, carries guarantee #3 under a
+   non-unwinding signal. (Object-store `FinalizeOnClose` remains unproven — needs
+   a live cloud target.)
 3. ⏳ **Extend subprocess panic coverage to the remaining boundaries** (lower
    priority) — `after_source_read` is already driven through
    `parallel_export_processes`; add `after_file_write` / `after_manifest_update`
