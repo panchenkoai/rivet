@@ -1,11 +1,12 @@
 # Changelog
 
-## [Unreleased] — memory-driven default batch sizing (narrow-table throughput)
+## 0.12.0 (2026-06-14) — memory-driven default batch sizing: MySQL ~9×, SQL Server ~7× faster on narrow tables
 
 Sizes the extraction batch to a memory target instead of a static row count, so
-narrow tables stop paying a per-batch handoff tax. **MINOR** at release — the
-default `balanced` batching behaviour changes (peak RSS on wide tables is
-unchanged; narrow tables get much larger batches).
+narrow tables stop paying a per-batch handoff tax. **MINOR** — the default
+`balanced` batching behaviour changes (peak RSS on wide tables is unchanged;
+narrow tables get much larger batches). Source-friendlier too: the source query
+is held open ~9× less time (verified — identical server-side scan, same SQL).
 
 ### ⚠️ Behaviour change (why this will be a MINOR bump)
 
