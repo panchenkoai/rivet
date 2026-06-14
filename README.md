@@ -91,6 +91,8 @@ The MySQL gap vs PostgreSQL is architectural: PostgreSQL exposes `DECLARE … CU
 
 How Rivet wins these axes is not magic — it's the deliberately boring extraction shape: PK-auto-resolved chunks, a server-side cursor with a `work_mem`-aware `FETCH N` cap on PG, and an Arrow-memory-budgeted row buffer on MySQL. The «one big `SELECT *` into a giant client-side buffer» shape that most alternatives use produces both the multi-minute single-query holds and the multi-GB RSS.
 
+**As of 0.12.0, fast as well as gentle.** Source-safety never meant slow. Rivet now sizes each batch to a ~64 MB memory target instead of a fixed 10,000 rows — which on narrow tables (many rows, few/small columns) sped up extraction **~9× on MySQL and ~7× on SQL Server** (rivet 0.11 → 0.12, same 10.24M-row fixture, row-exact). And it's source-neutral *by construction*: batch size governs only how fast Rivet drains its **client-side** buffer, never the SQL it issues — so the source query is held open *less* time, not more (verified: identical server-side rows scanned, zero extra temp-table spills). Reproduce with [`dev/bench/batch_throughput_ab.sh`](dev/bench/batch_throughput_ab.sh).
+
 The numbers above use each tool **at its defaults**. We also published a [**steelman**](docs/bench/reports/REPORT_steelman.md) re-run that gives each competitor its best plausible configuration. Short version: on narrow tables the gap closes; on the wide `content_items` fixture Rivet's edge survives largely intact.
 
 Methodology, exact configs, raw `gtime -v` output, and DB-side counter deltas: [docs/bench/](docs/bench/) — one-command repro.
@@ -275,7 +277,7 @@ These are production-safety primitives, not performance knobs.
 | `tuning.max_batch_memory_mb` | Hard cap on a single Arrow batch. When exceeded, the `on_batch_memory_exceeded` policy fires. |
 | `tuning.on_batch_memory_exceeded` | `warn` (log + continue) · `fail` (abort) · `auto_shrink` (split batch recursively, then continue) |
 | `tuning.memory_threshold_mb` | Process-level RSS guard — pauses fetching when RSS exceeds the threshold |
-| `tuning.batch_size_memory_mb` | Adaptive batch sizing: Rivet samples the first batch to estimate row width, then adjusts subsequent batch sizes automatically |
+| `tuning.batch_size_memory_mb` | Memory-driven batch sizing: Rivet samples the first batch to estimate row width, then sizes each batch to that memory target — large on narrow tables, small on wide ones. **On by default** (64 MB on `balanced`, 128 MB on `fast`); set it explicitly to override. |
 
 ### Output controls
 

@@ -8,7 +8,7 @@ narrow tables stop paying a per-batch handoff tax. **MINOR** — the default
 narrow tables get much larger batches). Source-friendlier too: the source query
 is held open ~9× less time (verified — identical server-side scan, same SQL).
 
-### ⚠️ Behaviour change (why this will be a MINOR bump)
+### ⚠️ Behaviour change (why this is a MINOR bump)
 
 - **`perf(source)` — the default (`balanced`) batch size is now memory-driven
   (~64 MB per Arrow flush) rather than a static 10,000 rows; `fast` targets
