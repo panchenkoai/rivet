@@ -1264,7 +1264,7 @@ and the two-engine separation with explicit revisit triggers (ADR-0010).
 | OPT-3 | Type fidelity | P1 | ⏳ Open (validated) | Round-trip proof is enumerated-fixture; no proptest type test exists — confirmed |
 | OPT-4 | MySQL parity | P1 | ✅ Done | MySQL keyset (seek) pagination shipped (40433a0) — single-column unique key, sequential, EXPLAIN-verified index range scan. Follow-ups: composite keys, parallel keyset, resume |
 | OPT-5 | Dedup ergonomics | P2 | ⏳ Open (**corrected**) | Deterministic per-part `content_fingerprint` **already exists** (`manifest.rs:160`); gap = guarantee/expose + parquet byte-determinism |
-| OPT-6 | Engine debt | P2 | ⏳ Open (validated) | Subprocess fan-out engine has **zero** crash tests; no signal handling — confirmed gap |
+| OPT-6 | Engine debt | P2 | ✅ Done | Crash-matrix symmetry pass on `feat/opt6-crash-matrix`: SIGTERM/SIGINT child reaper (`parallel_children::child_reaper`), SIGKILL-mid-write proof (temp+rename), subprocess panic recovery across all 4 write-cycle boundaries. See `dev/CRASH_MATRIX.md`. Residuals: object-store `FinalizeOnClose`, single-child external-signal accounting |
 | OPT-7 | Doc/roadmap drift | P1 | ✅ Done | Checksums documented as shipped (SECURITY.md + README + §5.1/§9.7); 3 §9.6.1 items struck. *Verified 3 other claimed-shipped §9.6.1 items (local-retry WARN, init mode-comment, init chunk_size scaling) are NOT shipped — left open.* |
 
 ---
@@ -1451,6 +1451,24 @@ engine — the classic "killed mid-run leaves a corrupt parquet" regression site
 **Definition of done.** The crash matrix asserts no corrupt/footerless output
 file under SIGTERM/SIGKILL for *both* engines, and the gap (if any) is documented
 as a known non-guarantee.
+
+**Status (2026-06-14): Done** — `feat/opt6-crash-matrix`.
+
+- Audit corrected: the subprocess engine had *partial* panic coverage, not zero
+  (the "zero crash tests" claim above was inaccurate). `dev/CRASH_MATRIX.md` now
+  carries the verified two-engine coverage matrix + the panic-vs-signal rationale.
+- **SIGTERM/SIGINT reaper** (`parallel_children::child_reaper`): a targeted kill
+  of the parent no longer orphans children holding source connections. RED→GREEN:
+  `parallel_processes_sigterm_reaps_children_no_orphans`.
+- **SIGKILL-mid-commit proof**: `sigkill_in_commit_window_leaves_no_committed_file`
+  shows temp+rename (not `Drop`) carries the no-corrupt-output guarantee under a
+  non-unwinding signal.
+- **Subprocess panic recovery** across all 4 write-cycle boundaries:
+  `parallel_processes_recovers_from_child_crash_at_each_boundary`.
+
+Residual non-guarantees (documented in the crash matrix, not in this slice):
+object-store `FinalizeOnClose` under SIGKILL (needs a live cloud target); a
+single *child* killed by an external signal (parent ranking is unit-tested).
 
 ---
 
