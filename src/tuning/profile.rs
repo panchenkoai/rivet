@@ -202,8 +202,9 @@ impl SourceTuning {
     fn from_profile(profile: TuningProfile) -> Self {
         match profile {
             TuningProfile::Fast => Self {
+                // Memory-driven, more aggressive than Balanced (see its note).
                 batch_size: 50_000,
-                batch_size_memory_mb: None,
+                batch_size_memory_mb: Some(128),
                 throttle_ms: 0,
                 statement_timeout_s: 0,
                 max_retries: 1,
@@ -218,8 +219,14 @@ impl SourceTuning {
                 configured_profile: TuningProfile::Fast,
             },
             TuningProfile::Balanced => Self {
+                // Memory-driven batch by default: a 64 MB-per-flush target sizes the
+                // batch to the row width — large for narrow tables (clamped to the
+                // 500k hard-max in `compute_batch_size_from_memory`; a small static
+                // default made the per-batch handoff dominate — 10.24M narrow rows ran
+                // 57s vs ~4s at 256k+), and small for wide ones (≈64 MB ÷ row). The
+                // static `batch_size` below is the no-schema fallback + advisory base.
                 batch_size: 10_000,
-                batch_size_memory_mb: None,
+                batch_size_memory_mb: Some(64),
                 throttle_ms: 50,
                 statement_timeout_s: 300,
                 max_retries: 3,
@@ -531,7 +538,9 @@ mod tests {
         let r = t.resource_summary();
         assert_eq!(r.profile, "balanced");
         assert_eq!(r.batch_size, 10_000);
-        assert!(r.batch_size_memory_mb.is_none());
+        // Balanced now drives batch sizing from a 64 MB-per-flush target by
+        // default (the static batch_size above is the no-schema fallback).
+        assert_eq!(r.batch_size_memory_mb, Some(64));
         assert_eq!(r.memory_threshold_mb, 4_096);
         assert_eq!(r.throttle_ms, 50);
         // narrow: 10_000 × 200 B = ~1.9 MB

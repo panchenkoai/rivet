@@ -1,5 +1,45 @@
 # Changelog
 
+## [Unreleased] — memory-driven default batch sizing (narrow-table throughput)
+
+Sizes the extraction batch to a memory target instead of a static row count, so
+narrow tables stop paying a per-batch handoff tax. **MINOR** at release — the
+default `balanced` batching behaviour changes (peak RSS on wide tables is
+unchanged; narrow tables get much larger batches).
+
+### ⚠️ Behaviour change (why this will be a MINOR bump)
+
+- **`perf(source)` — the default (`balanced`) batch size is now memory-driven
+  (~64 MB per Arrow flush) rather than a static 10,000 rows; `fast` targets
+  ~128 MB.** On narrow tables the static 10k pinned the engine to tiny Arrow
+  batches (one parquet row-group per 10k rows), so the per-flush handoff
+  dominated wall-clock. The memory target sizes the batch to the row width:
+  large for narrow tables (clamped to a 500k-row hard-max), and *small* for
+  wide ones (≈64 MB ÷ row width) — so peak RSS on wide tables is unchanged.
+  The static `batch_size` remains as the no-schema fallback and advisory base.
+
+### Performance
+
+- **Narrow-table throughput** (`bench_narrow`, 10.24M rows, chunked, default
+  tuning, rivet-vs-rivet, row-exact verified by an independent parquet re-count):
+  - **MySQL ≈ 7.9× faster** — its keyset row-accumulator was pinned at 10k.
+  - **SQL Server ≈ 6.9× faster** — the MSSQL stream loop now seeds its batch
+    controller from `effective_batch_size` once the column shape is known (the
+    first `tiberius` metadata token, which precedes all rows), so the
+    memory-driven ceiling reaches it too. Proven in isolation: the batch-size
+    default *alone* moved MSSQL 1.00× (the loop was unwired); the wiring moved
+    it 6.9× (62.4s → 9.0s).
+  - **PostgreSQL neutral** (≈ 1.0×) — its server-side cursor + `work_mem`-bounded
+    `FETCH N` was already efficient; no regression.
+
+### Internal
+
+- `AdaptiveBatchController::raise_configured_ceiling` — lets an engine that
+  discovers its row width mid-stream (SQL Server) raise the batch ceiling once
+  the schema is known, so the post-probe memory cap can grow the batch past the
+  static `batch_size`. Raises only, one-shot before the cap; PG/MySQL seed the
+  ceiling up-front and don't use it.
+
 ## 0.11.1 (2026-06-14) — crash-matrix symmetry: no orphaned subprocess children
 
 A reliability fix for the subprocess-export engine (`--parallel-export-processes`)
