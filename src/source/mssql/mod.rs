@@ -618,6 +618,27 @@ impl Source for MssqlSource {
                     // shape) ahead of its rows.
                     QueryItem::Metadata(meta) if columns.is_empty() => {
                         columns = meta.columns().to_vec();
+                        // First moment the column shape is known. SQL Server
+                        // can't seed the controller from `effective_batch_size`
+                        // up-front (the schema isn't known until now), so raise
+                        // the ceiling here — otherwise it stays pinned at the
+                        // static `batch_size` and the post-probe memory cap
+                        // (shrink-only) can never grow a narrow table's batch
+                        // past it, the way the PG/MySQL loops do. A provisional
+                        // schema (no rows) is enough for the row-byte estimate;
+                        // the real, decimal-scale-correct schema is still built
+                        // per batch in `emit_mssql_batch`.
+                        if let Ok((provisional, _)) = arrow_convert::mssql_columns_to_schema(
+                            &columns,
+                            &overrides,
+                            &[],
+                            decimal_hints.as_ref(),
+                        ) {
+                            let eff = request
+                                .tuning
+                                .effective_batch_size(Some(&Arc::new(provisional)));
+                            ctl.raise_configured_ceiling(eff);
+                        }
                     }
                     QueryItem::Metadata(_) => {}
                     QueryItem::Row(row) => {

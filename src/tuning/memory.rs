@@ -37,10 +37,17 @@ pub fn estimate_row_bytes(schema: &SchemaRef) -> usize {
 }
 
 /// Compute batch_size from a memory target in MB and estimated row size.
+///
+/// The 150k upper clamp bounds the *raw-row accumulator* an engine holds
+/// alongside the Arrow batch (mysql/tiberius `Vec<Row>`): for narrow rows that
+/// raw buffer is several× the compact Arrow form, so it — not the MB target —
+/// drives peak RSS. 150k still gives ~15× fewer pipeline flushes than the old
+/// static 10k (most of the throughput win) at a fraction of the peak RSS that
+/// a 500k cap incurred on narrow tables.
 pub fn compute_batch_size_from_memory(memory_mb: usize, schema: &SchemaRef) -> usize {
     let row_bytes = estimate_row_bytes(schema);
     let target = memory_mb * 1024 * 1024 / row_bytes;
-    target.clamp(1_000, 500_000)
+    target.clamp(1_000, 150_000)
 }
 
 #[cfg(test)]
@@ -62,13 +69,13 @@ mod tests {
 
     #[test]
     fn compute_batch_size_clamped() {
-        // 1 tiny column -> huge batch, clamped to 500_000
+        // 1 tiny column -> huge batch, clamped to 150_000
         let schema = Arc::new(Schema::new(vec![Field::new(
             "flag",
             DataType::Boolean,
             false,
         )]));
-        assert_eq!(compute_batch_size_from_memory(256, &schema), 500_000);
+        assert_eq!(compute_batch_size_from_memory(256, &schema), 150_000);
 
         // 100 large string columns -> small batch, clamped to 1_000
         let fields: Vec<Field> = (0..100)

@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.12.0 (2026-06-14) — memory-driven default batch sizing: MySQL ~7.5×, SQL Server ~6× faster on narrow tables
+
+Sizes the extraction batch to a memory target instead of a static row count, so
+narrow tables stop paying a per-batch handoff tax. **MINOR** — the default
+`balanced` batching behaviour changes: narrow tables get much larger batches
+(higher but bounded peak RSS — see Memory below), wide tables change little.
+Source-friendlier too: the source query is held open ~7× less time (verified —
+identical server-side scan, same SQL).
+
+### ⚠️ Behaviour change (why this is a MINOR bump)
+
+- **`perf(source)` — the default (`balanced`) batch size is now memory-driven
+  (~32 MB per Arrow flush) rather than a static 10,000 rows; `fast` targets
+  ~64 MB.** On narrow tables the static 10k pinned the engine to tiny Arrow
+  batches (one parquet row-group per 10k rows), so the per-flush handoff
+  dominated wall-clock. The memory target sizes the batch to the row width:
+  large for narrow tables (clamped to a 150k-row hard-max that bounds peak RSS),
+  and *small* for wide ones (≈32 MB ÷ row width ≈ the old static size — a larger
+  target overshot medium-wide tables for no flush-count gain). The static
+  `batch_size` remains as the no-schema fallback and advisory base.
+
+### Performance
+
+- **Narrow-table throughput** (`bench_narrow`, 10.24M rows, chunked, default
+  tuning, rivet-vs-rivet, row-exact verified by an independent parquet re-count):
+  - **MySQL ≈ 7.5× faster** (58.7s → 7.7s) — its keyset row-accumulator was
+    pinned at 10k.
+  - **SQL Server ≈ 6× faster** (62s → 10.5s) — the MSSQL stream loop now seeds
+    its batch controller from `effective_batch_size` once the column shape is
+    known (the first `tiberius` metadata token, which precedes all rows), so the
+    memory-driven ceiling reaches it too. Proven in isolation: the batch-size
+    default *alone* moved MSSQL 1.00× (the loop was unwired); the wiring is the
+    cause.
+  - **PostgreSQL neutral** (≈ 1.0×) — its server-side cursor + `work_mem`-bounded
+    `FETCH N` was already efficient; no regression.
+  - **Wide tables: no regression.** The ~32 MB target keeps wide batches near
+    the old static size (MySQL `content_items` 2M: 80.6s → 71.0s, RSS 126 → 101
+    MB — slightly *better* on both). A larger 64 MB target had grown them to
+    ~21k rows and cost ~10% — which is why the target is 32, not 64.
+
+### Memory (peak RSS)
+
+The bigger batch *is* the speedup, so narrow-table peak RSS rises — bounded by
+the 150k-row cap on the raw-row accumulator (for narrow rows that raw `Vec<Row>`,
+not the ~32 MB Arrow batch, dominates RSS, so the row cap is the lever). Measured,
+OLD (static 10k) → NEW, `bench_narrow` 10.24M:
+
+| engine | OLD | NEW | note |
+|---|---:|---:|---|
+| PostgreSQL | 29 MB | 30 MB | flat — `work_mem`-bounded `FETCH N` never grew |
+| MySQL | 34 MB | 67 MB | ~2× — bounded by the 150k row cap |
+| SQL Server | 32 MB | 89 MB | ~2.8× — heavier `tiberius::Row` accumulator |
+
+The 150k cap is a deliberate speed/RAM point: a 500k cap was ~20% faster on
+narrow but pushed SQL Server to 352 MB; 150k keeps most of the win at a third of
+the RAM. Wide tables stay flat-to-lower (PG `content_items` 51→57 MB; MySQL
+128→101 MB). All well under the multi-GB a single-`SELECT *` client buffer
+incurs. Memory-constrained host? `profile: safe`, a lower `batch_size_memory_mb`,
+or `memory_threshold_mb` cap it further.
+
+### Internal
+
+- `AdaptiveBatchController::raise_configured_ceiling` — lets an engine that
+  discovers its row width mid-stream (SQL Server) raise the batch ceiling once
+  the schema is known, so the post-probe memory cap can grow the batch past the
+  static `batch_size`. Raises only, one-shot before the cap; PG/MySQL seed the
+  ceiling up-front and don't use it.
+
 ## 0.11.1 (2026-06-14) — crash-matrix symmetry: no orphaned subprocess children
 
 A reliability fix for the subprocess-export engine (`--parallel-export-processes`)

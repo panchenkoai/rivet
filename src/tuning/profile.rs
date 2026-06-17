@@ -202,8 +202,10 @@ impl SourceTuning {
     fn from_profile(profile: TuningProfile) -> Self {
         match profile {
             TuningProfile::Fast => Self {
+                // Memory-driven, 2× Balanced's target (see its note). Narrow tables
+                // still clamp to 150k; the larger target only sizes up wide ones.
                 batch_size: 50_000,
-                batch_size_memory_mb: None,
+                batch_size_memory_mb: Some(64),
                 throttle_ms: 0,
                 statement_timeout_s: 0,
                 max_retries: 1,
@@ -218,8 +220,17 @@ impl SourceTuning {
                 configured_profile: TuningProfile::Fast,
             },
             TuningProfile::Balanced => Self {
+                // Memory-driven batch by default: a 32 MB-per-flush target sizes the
+                // batch to the row width — large for narrow tables (where the 150k
+                // hard-max in `compute_batch_size_from_memory`, not this target, binds
+                // and bounds the raw-row accumulator's RSS), small for wide ones. 32
+                // not 64 MB: a 64 MB target grew medium-wide tables (~2.6 KB/row) to
+                // ~21k rows — ~6% slower for zero flush-count gain — while 32 MB lands
+                // them near the old static 10k; narrow tables are unaffected (clamp
+                // binds either way). The static `batch_size` below is the no-schema
+                // fallback + advisory base.
                 batch_size: 10_000,
-                batch_size_memory_mb: None,
+                batch_size_memory_mb: Some(32),
                 throttle_ms: 50,
                 statement_timeout_s: 300,
                 max_retries: 3,
@@ -520,9 +531,9 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
         ]));
         let bs = t.effective_batch_size(Some(&schema));
-        assert!((1_000..=500_000).contains(&bs), "got {bs}");
-        // 256MB / 266B ≈ 1_009_022, clamped to 500_000
-        assert_eq!(bs, 500_000);
+        assert!((1_000..=150_000).contains(&bs), "got {bs}");
+        // 256MB / 266B ≈ 1_009_022, clamped to 150_000
+        assert_eq!(bs, 150_000);
     }
 
     #[test]
@@ -531,7 +542,11 @@ mod tests {
         let r = t.resource_summary();
         assert_eq!(r.profile, "balanced");
         assert_eq!(r.batch_size, 10_000);
-        assert!(r.batch_size_memory_mb.is_none());
+        // Balanced drives batch sizing from a 32 MB-per-flush target by default
+        // (the static batch_size above is the no-schema fallback). 32 not 64 MB:
+        // 64 overshot medium-wide tables; 32 keeps the narrow win (clamp-bound)
+        // while landing wide tables near the old static size — see profile note.
+        assert_eq!(r.batch_size_memory_mb, Some(32));
         assert_eq!(r.memory_threshold_mb, 4_096);
         assert_eq!(r.throttle_ms, 50);
         // narrow: 10_000 × 200 B = ~1.9 MB

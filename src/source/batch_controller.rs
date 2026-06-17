@@ -60,6 +60,24 @@ impl AdaptiveBatchController {
         }
     }
 
+    /// Adopt the true configured ceiling once an engine that discovers its row
+    /// width *mid-stream* can finally compute its memory-driven batch size.
+    /// SQL Server learns the column shape from the first `tiberius` metadata
+    /// token — *after* the controller is already built — so it can't seed
+    /// `configured` from `effective_batch_size` up-front the way PG and MySQL
+    /// do. Calling this when the metadata arrives raises the ceiling so the
+    /// post-probe memory cap can grow the batch past the static `batch_size`.
+    ///
+    /// Only ever *raises* the ceiling (a wide table whose memory-driven size is
+    /// below the static `batch_size` is left to shrink via the cap as before),
+    /// and only before the one-shot memory cap has fired — afterwards the cap
+    /// already used the ceiling and re-targeting would be a silent no-op anyway.
+    pub(crate) fn raise_configured_ceiling(&mut self, new_configured: usize) {
+        if !self.cap_applied {
+            self.configured = self.configured.max(new_configured.max(1));
+        }
+    }
+
     /// Seed the adaptive baseline with a pre-loop pressure sample so the first
     /// adaptive decision compares against a real prior reading (matches the
     /// pre-extraction PG/MySQL behaviour). No-op when not adaptive.
@@ -164,6 +182,38 @@ mod tests {
         // Engine budget would allow 1M rows; configured caps it.
         assert_eq!(c.apply_memory_cap(1_000_000), Some(5_000));
         assert_eq!(c.target(), 5_000);
+    }
+
+    #[test]
+    fn raise_ceiling_lets_cap_grow_past_static_batch_size() {
+        // SQL Server case: built with the static batch_size (10k) before the
+        // schema is known; the metadata token then raises the ceiling so the
+        // post-probe memory cap can size a narrow table's batch well past 10k.
+        let mut c = AdaptiveBatchController::new(&tuning(false, 0), 10_000);
+        c.raise_configured_ceiling(500_000);
+        assert_eq!(c.apply_memory_cap(480_000), Some(480_000));
+        assert_eq!(c.target(), 480_000);
+    }
+
+    #[test]
+    fn raise_ceiling_only_raises_never_lowers() {
+        // A wide table whose memory-driven size is below the static batch_size
+        // must NOT lower the ceiling — the cap still shrinks it as before.
+        let mut c = AdaptiveBatchController::new(&tuning(false, 0), 10_000);
+        c.raise_configured_ceiling(5_000);
+        assert_eq!(c.apply_memory_cap(1_000_000), Some(10_000));
+        assert_eq!(c.target(), 10_000);
+    }
+
+    #[test]
+    fn raise_ceiling_after_cap_is_a_no_op() {
+        // Once the one-shot cap has fired the ceiling is spent; a late raise
+        // can't retroactively grow the (already one-shot) cap.
+        let mut c = AdaptiveBatchController::new(&tuning(false, 0), 10_000);
+        c.apply_memory_cap(8_000);
+        c.raise_configured_ceiling(500_000);
+        assert_eq!(c.apply_memory_cap(400_000), None);
+        assert_eq!(c.target(), 8_000);
     }
 
     #[test]
