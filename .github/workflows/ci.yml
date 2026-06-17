@@ -448,7 +448,7 @@ jobs:
       # MSSQL driver's unavoidable tiberius→rustls-0.21 advisories failed the
       # gate; documenting + tracking them in one place keeps the gate green
       # while still catching every *fixable* future advisory.
-      - uses: taiki-e/install-action@v2.79.7
+      - uses: taiki-e/install-action@v2.81.1
         with:
           tool: cargo-audit
       - run: cargo audit
