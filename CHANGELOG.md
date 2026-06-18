@@ -1,5 +1,23 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **`perf(chunked)` — chunked range planning no longer runs a full `COUNT(*)` on
+  the source before the first chunk.** That count fed *only* the sparsity
+  diagnostic log — the chunk boundaries come from `min`/`max`, never the count —
+  yet on a 484M-row table it meant **~12 minutes of silence** before any chunk,
+  and a full scan on a large production table is exactly the source-harm rivet
+  exists to avoid (in the hot path, contradicting the source-safety promise). The
+  diagnostic now reads a **scan-free row estimate** for the `table:` shortcut on
+  engines with a trustworthy cheap count — PostgreSQL `reltuples` and SQL Server
+  `dm_db_partition_stats`. MySQL has none (its `TABLE_ROWS` / `EXPLAIN` figure is
+  a ±30-50% random-dive estimate), so the density line is skipped there, as it is
+  for any curated query — boundaries are still logged, just without a scan.
+  `chunk_dense` is unchanged (its `COUNT(*)` sizes the ordinal chunks). No output
+  or boundary change — only the pre-chunk source footprint.
+
 ## 0.12.0 (2026-06-14) — memory-driven default batch sizing: MySQL ~7.5×, SQL Server ~6× faster on narrow tables
 
 Sizes the extraction batch to a memory target instead of a static row count, so
