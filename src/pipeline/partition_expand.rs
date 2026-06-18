@@ -112,7 +112,7 @@ fn fetch_value_span(
         return Ok(None);
     };
     let parse = |raw: &str, which: &str| {
-        crate::sql::parse_date_flexible(raw).ok_or_else(|| {
+        crate::scalar::parse_date_flexible(raw).ok_or_else(|| {
             anyhow::anyhow!(
                 "export '{}': could not parse partition {} '{}' from column '{}' as a date",
                 export.name,

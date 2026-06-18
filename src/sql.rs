@@ -1,8 +1,14 @@
-//! SQL identifier quoting helpers.
+//! Dialect SQL string building — the outbound half of source interaction.
+//!
+//! Builds and recognises the small SQL strings rivet sends to a source:
+//! identifier quoting ([`quote_ident`]), the `SELECT * FROM <ident>` table-form
+//! recogniser ([`strip_select_star_from`]), aggregate probes ([`aggregate_sql`]),
+//! and scan-free row estimates ([`row_estimate_sql`]). Parsing the scalars read
+//! back lives in the inbound mirror, [`crate::scalar`].
 //!
 //! Column and table names that come from user configuration must never be
 //! interpolated raw into query strings — doing so opens a SQL injection vector
-//! even when `start`/`end` bounds are typed integers.  Use `quote_ident` for
+//! even when `start`/`end` bounds are typed integers.  Use [`quote_ident`] for
 //! every identifier that is not a literal written by the developer.
 
 use crate::config::SourceType;
@@ -26,45 +32,6 @@ pub(crate) fn quote_ident(source_type: SourceType, name: &str) -> String {
         // SQL Server bracket-quoting: `[col]`; internal `]` doubled (`[a]]b]`).
         SourceType::Mssql => format!("[{}]", name.replace(']', "]]")),
     }
-}
-
-/// Parse a `NaiveDate` out of a DB scalar (typically `min`/`max` of a
-/// date/timestamp column returned by `query_scalar`).
-///
-/// Single source of truth for both the chunked date-range path
-/// (`pipeline::chunked`) and value-based partitioning (`plan::partition`), which
-/// live in different layers and so must share this through the `sql` leaf rather
-/// than duplicate it.
-///
-/// Accepts, in order: `DATE` (`2023-01-01`), `DATETIME`
-/// (`2023-01-01 14:32:00`), ISO-8601 with `T` and optional fractional seconds,
-/// and finally a lenient leading-`YYYY-MM-DD` fallback that covers the
-/// PostgreSQL `timestamptz` text form (`2023-01-01 14:32:00.123456+00`).
-/// Returns `None` for an empty / unparseable value.
-pub(crate) fn parse_date_flexible(s: &str) -> Option<chrono::NaiveDate> {
-    use chrono::NaiveDate;
-    let s = s.trim();
-    NaiveDate::parse_from_str(s, "%Y-%m-%d")
-        .ok()
-        .or_else(|| {
-            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
-                .ok()
-                .map(|dt| dt.date())
-        })
-        .or_else(|| {
-            // ISO 8601 with T, optional fractional seconds / offset.
-            let base = s.split('.').next().unwrap_or(s);
-            let base = base.split('+').next().unwrap_or(base);
-            chrono::NaiveDateTime::parse_from_str(base, "%Y-%m-%dT%H:%M:%S")
-                .ok()
-                .map(|dt| dt.date())
-        })
-        .or_else(|| {
-            // Lenient fallback: any value whose first 10 chars are `YYYY-MM-DD`
-            // (space-separated fractional/offset timestamptz, etc.).
-            s.get(..10)
-                .and_then(|head| NaiveDate::parse_from_str(head, "%Y-%m-%d").ok())
-        })
 }
 
 /// If `base_query` is exactly `SELECT * FROM <ident>` (the `table:` YAML
@@ -208,39 +175,6 @@ mod tests {
     #[test]
     fn mysql_escapes_internal_backticks() {
         assert_eq!(quote_ident(SourceType::Mysql, "col`name"), "`col``name`");
-    }
-
-    fn d(s: &str) -> chrono::NaiveDate {
-        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
-    }
-
-    #[test]
-    fn parse_date_flexible_handles_db_scalar_forms() {
-        assert_eq!(parse_date_flexible("2023-06-15"), Some(d("2023-06-15")));
-        assert_eq!(
-            parse_date_flexible("2023-06-15 14:32:00"),
-            Some(d("2023-06-15"))
-        );
-        assert_eq!(
-            parse_date_flexible("2023-06-15T14:32:00"),
-            Some(d("2023-06-15"))
-        );
-        assert_eq!(
-            parse_date_flexible("2023-06-15T14:32:00.123456"),
-            Some(d("2023-06-15"))
-        );
-        // PostgreSQL timestamptz text form — covered by the lenient fallback.
-        assert_eq!(
-            parse_date_flexible("2024-12-30 00:00:00.123456+00"),
-            Some(d("2024-12-30"))
-        );
-    }
-
-    #[test]
-    fn parse_date_flexible_rejects_non_dates() {
-        assert!(parse_date_flexible("").is_none());
-        assert!(parse_date_flexible("not-a-date").is_none());
-        assert!(parse_date_flexible("12345").is_none());
     }
 
     #[test]

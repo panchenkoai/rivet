@@ -3,8 +3,9 @@
 //! Queries min/max (and optionally COUNT) from the source to compute chunk ranges,
 //! logs sparsity diagnostics, and returns the final `Vec<(i64, i64)>` chunk list.
 
-use super::math::{generate_chunks, parse_date_flexible, parse_scalar_i64, strip_select_star_from};
+use super::math::{generate_chunks, strip_select_star_from};
 use crate::error::Result;
+use crate::scalar::{parse_date_flexible, parse_scalar_i64};
 use crate::source::Source;
 
 /// `SELECT COUNT(*) FROM (<base>) AS _rivet_rowcnt`, with a fast path when
