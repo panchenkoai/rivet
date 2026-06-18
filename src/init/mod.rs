@@ -84,11 +84,24 @@ impl TableInfo {
     /// stays short because it lives in the YAML directly above `mode:`.
     pub(crate) fn mode_rationale(&self, mode: &str) -> String {
         match mode {
-            "chunked" => format!(
-                "auto: ~{} rows ≥ 100K threshold and chunk column '{}' is available",
-                fmt_row_estimate(self.row_estimate),
-                self.best_chunk_column().unwrap_or("id"),
-            ),
+            "chunked" => {
+                let base = format!(
+                    "auto: ~{} rows ≥ 100K threshold and chunk column '{}' is available",
+                    fmt_row_estimate(self.row_estimate),
+                    self.best_chunk_column().unwrap_or("id"),
+                );
+                // A chunked re-run re-reads the whole table. If a cursor column
+                // exists, point operators at incremental for scheduled re-runs —
+                // the pilot showed a 655k-row table re-dumped 4× in 2 days under
+                // chunked, re-reading ~570k unchanged rows each time.
+                match self.best_cursor_column() {
+                    Some(cursor) => format!(
+                        "{base}. NOTE: chunked re-reads the whole table each run — for scheduled \
+                         re-runs, `mode: incremental` on '{cursor}' pulls only changed rows"
+                    ),
+                    None => base,
+                }
+            }
             "incremental" => format!(
                 "auto: ~{} rows ≥ 100K threshold; chunk column missing, falling back to incremental on '{}'",
                 fmt_row_estimate(self.row_estimate),
@@ -662,6 +675,42 @@ mod tests {
         );
         assert_eq!(info.suggest_mode(), "chunked");
         assert_eq!(info.best_chunk_column(), Some("id"));
+    }
+
+    #[test]
+    fn chunked_rationale_hints_incremental_when_cursor_column_exists() {
+        // warranty-shaped: large table with BOTH an int PK and a cursor column.
+        // suggest_mode picks chunked, but the rationale must point at incremental
+        // for scheduled re-runs — chunked re-reads the whole table every run.
+        let info = make_table(
+            655_000,
+            vec![
+                col("warranty_id", "bigint", true),
+                col("update_date", "timestamp", false),
+            ],
+        );
+        assert_eq!(info.suggest_mode(), "chunked");
+        let r = info.mode_rationale("chunked");
+        assert!(
+            r.contains("mode: incremental"),
+            "expected an incremental hint: {r}"
+        );
+        assert!(
+            r.contains("update_date"),
+            "should name the cursor column: {r}"
+        );
+    }
+
+    #[test]
+    fn chunked_rationale_no_incremental_hint_without_cursor_column() {
+        // No timestamp/cursor column → no incremental hint (would be misleading).
+        let info = make_table(5_000_000, vec![col("id", "bigint", true)]);
+        assert_eq!(info.suggest_mode(), "chunked");
+        let r = info.mode_rationale("chunked");
+        assert!(
+            !r.contains("mode: incremental"),
+            "no cursor column → no hint: {r}"
+        );
     }
 
     #[test]

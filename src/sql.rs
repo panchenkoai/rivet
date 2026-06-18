@@ -140,6 +140,44 @@ pub(crate) fn aggregate_sql(
     }
 }
 
+/// Scan-free row **estimate** for the chunk-sparsity diagnostic — reads catalog /
+/// optimizer statistics, never a `COUNT(*)`. A full count on a large production
+/// table is exactly the source-harm rivet exists to avoid (we measured ~12 min of
+/// silent `COUNT(*)` before the first chunk on a 484M-row table), and the sparsity
+/// heuristic only needs an order-of-magnitude figure.
+///
+/// `None` means "no trustworthy scan-free count for this dialect" — the caller
+/// then logs boundaries without a density line rather than fall back to a scan.
+/// Defined only for the `table:` shortcut: `table_ident` is the clean, validated
+/// `[schema.]table` identifier from [`strip_select_star_from`] (ASCII
+/// alphanumeric/underscore, ≤1 dot), so it is safe to interpolate. The caller also
+/// treats a NULL / error / non-positive query result as "unknown" and skips.
+pub(crate) fn row_estimate_sql(source_type: SourceType, table_ident: &str) -> Option<String> {
+    match source_type {
+        // `reltuples` is the planner's live estimate (kept fresh by ANALYZE /
+        // autovacuum, usually within a few %); `-1` (never analysed) and any
+        // negative are clamped to 0 so the caller's `> 0` guard skips it.
+        SourceType::Postgres => Some(format!(
+            "SELECT GREATEST(reltuples, 0)::bigint FROM pg_class WHERE oid = '{table_ident}'::regclass"
+        )),
+        // MySQL has NO reliable scan-free row count. `information_schema.TABLE_ROWS`
+        // — and the optimizer's `EXPLAIN` estimate, which shares the same InnoDB
+        // random-index-dive statistics — routinely err by 30-50%+ and read 0 on a
+        // freshly-loaded table. Rather than drive a precise-looking density % off
+        // an untrustworthy figure, skip the sparsity diagnostic on MySQL entirely;
+        // the chunk boundaries come from min/max regardless. (An exact count would
+        // need a full `COUNT(*)` scan — the very source-harm this function avoids.)
+        SourceType::Mysql => None,
+        // `sys.dm_db_partition_stats` is a maintained running row count (effectively
+        // exact), not a sampled estimate — the same fast probe the SQL Server
+        // preflight uses, over the heap/clustered index (index_id 0/1).
+        SourceType::Mssql => Some(format!(
+            "SELECT SUM(p.row_count) FROM sys.dm_db_partition_stats p \
+             WHERE p.object_id = OBJECT_ID('{table_ident}') AND p.index_id IN (0,1)"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +293,25 @@ mod tests {
             aggregate_sql(SourceType::Mysql, "min", "d", "SELECT d FROM t WHERE 1")
                 .contains("min(`d`)")
         );
+    }
+
+    #[test]
+    fn row_estimate_sql_is_scan_free_or_skipped_per_dialect() {
+        // Postgres: planner stats (reltuples), never COUNT(*).
+        let pg = row_estimate_sql(SourceType::Postgres, "warranty").expect("PG has an estimate");
+        assert!(pg.contains("reltuples") && pg.contains("pg_class"), "{pg}");
+        assert!(!pg.contains("COUNT"), "estimate must not scan: {pg}");
+        // SQL Server: partition stats (maintained count), never COUNT(*).
+        let ms =
+            row_estimate_sql(SourceType::Mssql, "dbo.warranty").expect("MSSQL has an estimate");
+        assert!(
+            ms.contains("dm_db_partition_stats") && ms.contains("OBJECT_ID('dbo.warranty')"),
+            "{ms}"
+        );
+        assert!(!ms.contains("COUNT"), "estimate must not scan: {ms}");
+        // MySQL: no trustworthy scan-free count (TABLE_ROWS/EXPLAIN ±30-50%) →
+        // skipped (None), never a misleading density figure.
+        assert!(row_estimate_sql(SourceType::Mysql, "warranty").is_none());
+        assert!(row_estimate_sql(SourceType::Mysql, "shop.warranty").is_none());
     }
 }
