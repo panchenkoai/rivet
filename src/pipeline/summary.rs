@@ -148,6 +148,10 @@ pub struct RunSummary {
     pub journal: RunJournal,
 }
 
+/// One `(label, value)` line in the rendered summary block. The label is a
+/// fixed string literal; the value is computed per run.
+type Row = (&'static str, String);
+
 impl RunSummary {
     pub(super) fn new(plan: &ResolvedRunPlan) -> Self {
         let run_id = format!(
@@ -431,22 +435,50 @@ impl RunSummary {
         )
     }
 
-    /// Build the block as a string.  Public to the module so tests can assert
+    /// Build the block as a string.  Module-private so tests can assert
     /// formatting without capturing stderr.
+    ///
+    /// Adaptive layout: assemble the `(label, value)` rows that apply to this
+    /// run from a flat manifest of per-row providers, then [`format_block`]
+    /// pads labels to the longest so columns line up *within* the block (the
+    /// header is fixed-width so consecutive blocks stay uniform regardless of
+    /// which optional fields are present). Each provider owns one row's gate +
+    /// formatting and is unit-testable in isolation; this method owns only
+    /// their order — completing the pattern begun by [`incremental_position_line`]
+    /// / [`time_window_skip_line`].
     fn render(&self) -> String {
-        // Adaptive layout: collect (label, value) pairs that actually apply to
-        // this run, then pad labels to the longest one so columns line up
-        // *within* the block.  Header is a fixed width so consecutive blocks
-        // look uniform regardless of which optional fields are present.
-        let mut rows: Vec<(&'static str, String)> = Vec::with_capacity(16);
+        let mut rows: Vec<Row> = Vec::with_capacity(16);
         rows.push(("run_id", self.run_id.clone()));
-        let status_value = match (&self.status, &self.skip_reason) {
+        rows.push(self.status_row());
+        rows.push(self.tuning_row());
+        rows.push(("rows", fmt_thousands(self.total_rows)));
+        rows.push(("files", fmt_thousands(self.files_produced as i64)));
+        rows.extend(self.output_row());
+        rows.extend(self.position_row());
+        rows.extend(self.bytes_row());
+        rows.push(("duration", fmt_duration_ms(self.duration_ms)));
+        rows.extend(self.peak_rss_row());
+        rows.extend(self.pg_temp_spill_row());
+        rows.extend(self.compression_row());
+        rows.extend(self.retries_row());
+        rows.extend(self.outcome_rows());
+        rows.extend(self.error_row());
+        format_block(&self.export_name, &rows)
+    }
+
+    /// `status`, annotated with the skip reason when the run was skipped.
+    fn status_row(&self) -> Row {
+        let value = match (&self.status, &self.skip_reason) {
             (s, Some(reason)) if s == "skipped" => format!("{s} ({reason})"),
             (s, _) => s.clone(),
         };
-        rows.push(("status", status_value));
+        ("status", value)
+    }
 
-        let tuning_value = match self.batch_size_memory_mb {
+    /// `tuning` — profile + configured batch_size, noting the memory-derived
+    /// FETCH override when `batch_size_memory_mb` is set.
+    fn tuning_row(&self) -> Row {
+        let value = match self.batch_size_memory_mb {
             Some(mem) => format!(
                 "profile={}, batch_size={} (batch_size_memory_mb={}MiB → effective FETCH in logs)",
                 self.tuning_profile,
@@ -459,76 +491,103 @@ impl RunSummary {
                 fmt_thousands(self.batch_size as i64)
             ),
         };
-        rows.push(("tuning", tuning_value));
+        ("tuning", value)
+    }
 
-        rows.push(("rows", fmt_thousands(self.total_rows)));
-        rows.push(("files", fmt_thousands(self.files_produced as i64)));
-        // Where the files landed — so a newcomer isn't left guessing after a
-        // successful export. Only when we actually wrote somewhere addressable
-        // (skips stdout and 0-file skips).
-        if self.files_produced > 0
-            && let Some(uri) = &self.destination_uri
-        {
-            rows.push(("output", uri.clone()));
+    /// `output` — where the files landed, so a newcomer isn't left guessing
+    /// after a successful export. Only when we actually wrote somewhere
+    /// addressable (skips stdout and 0-file skips).
+    fn output_row(&self) -> Option<Row> {
+        if self.files_produced > 0 {
+            self.destination_uri.clone().map(|uri| ("output", uri))
+        } else {
+            None
         }
-        // On a 0-new incremental run, `0 rows  0 files` alone hides *why*
-        // nothing moved. Surface the cursor position as its own line so the
-        // operator sees the incremental boundary held — not just an empty run.
-        // The cursor *value* lives in the runner and isn't plumbed onto the
-        // summary yet, so this reports the column-level position derived from
-        // `skip_reason` (the value is a follow-up once it reaches here).
+    }
+
+    /// `cursor` (incremental) xor `window` (time_window): the position line for
+    /// a 0-row run. On a bare `0 rows  0 files` run this tells the operator the
+    /// incremental boundary held / the rolling window was simply empty, rather
+    /// than leaving an empty run indistinguishable from a misconfigured one.
+    /// `None` for a run that produced rows or whose skip carries no position.
+    /// (Detail lives in the two helpers it wraps.)
+    fn position_row(&self) -> Option<Row> {
         if let Some(pos) = incremental_position_line(self.skip_reason.as_deref()) {
-            rows.push(("cursor", pos));
-        } else if let Some(window) = time_window_skip_line(&self.mode, self.skip_reason.as_deref())
-        {
-            // A time_window run that returned 0 rows reports the generic
-            // `"source returned 0 rows"` skip (`cursor_column()` is `None` for
-            // this strategy), so the incremental branch above never fires. Add
-            // an explicit `window:` line so the operator can tell an *empty
-            // window* apart from a *wrong column / window* — otherwise the
-            // summary is indistinguishable from any other empty run. The window
-            // column / days / computed bound are not plumbed onto `RunSummary`,
-            // so this is the strategy-level signal reachable here (the concrete
-            // bound is a follow-up once the runner records it on the summary).
-            rows.push(("window", window));
+            Some(("cursor", pos))
+        } else {
+            time_window_skip_line(&self.mode, self.skip_reason.as_deref()).map(|w| ("window", w))
         }
-        if self.bytes_written > 0 {
-            rows.push(("bytes", format_bytes(self.bytes_written)));
-        }
-        rows.push(("duration", fmt_duration_ms(self.duration_ms)));
+    }
 
+    /// `bytes` — only when something was written.
+    fn bytes_row(&self) -> Option<Row> {
+        if self.bytes_written > 0 {
+            Some(("bytes", format_bytes(self.bytes_written)))
+        } else {
+            None
+        }
+    }
+
+    /// `peak RSS` — only when sampled during the run.
+    fn peak_rss_row(&self) -> Option<Row> {
         if self.peak_rss_mb > 0 {
-            rows.push((
+            Some((
                 "peak RSS",
                 format!(
                     "{} MB (sampled during run)",
                     fmt_thousands(self.peak_rss_mb)
                 ),
-            ));
+            ))
+        } else {
+            None
         }
-        if let Some(temp) = self.pg_temp_bytes_delta {
-            // Skip when the cluster reported no delta — only chatter when there
-            // was actual spill. > 100 MB is annotated with a tuning hint;
-            // smaller numbers are reported as plain info.
-            if temp > 0 {
-                let temp_mb = temp as f64 / (1024.0 * 1024.0);
-                let label = if temp > 100 * 1024 * 1024 {
-                    format!(
-                        "{:.1} MB ⚠ shrink tuning.batch_size or set batch_size_memory_mb",
-                        temp_mb
-                    )
-                } else {
-                    format!("{:.1} MB", temp_mb)
-                };
-                rows.push(("pg temp spill", label));
-            }
+    }
+
+    /// `pg temp spill` — PostgreSQL temp-file spill around the run. Chatters
+    /// only on actual spill (`> 0`); annotates a tuning hint above 100 MB.
+    /// `None` for non-Postgres sources, a failed probe, or no spill.
+    fn pg_temp_spill_row(&self) -> Option<Row> {
+        let temp = self.pg_temp_bytes_delta?;
+        if temp <= 0 {
+            return None;
         }
+        let temp_mb = temp as f64 / (1024.0 * 1024.0);
+        let label = if temp > 100 * 1024 * 1024 {
+            format!(
+                "{:.1} MB ⚠ shrink tuning.batch_size or set batch_size_memory_mb",
+                temp_mb
+            )
+        } else {
+            format!("{:.1} MB", temp_mb)
+        };
+        Some(("pg temp spill", label))
+    }
+
+    /// `compression` — only when it differs from the parquet default (zstd).
+    fn compression_row(&self) -> Option<Row> {
         if self.format == "parquet" && self.compression != "zstd" {
-            rows.push(("compression", self.compression.clone()));
+            Some(("compression", self.compression.clone()))
+        } else {
+            None
         }
+    }
+
+    /// `retries` — only when the run had to retry.
+    fn retries_row(&self) -> Option<Row> {
         if self.retries > 0 {
-            rows.push(("retries", self.retries.to_string()));
+            Some(("retries", self.retries.to_string()))
+        } else {
+            None
         }
+    }
+
+    /// Post-extraction check outcomes: `--validate`, schema-drift, the quality
+    /// gate, `--reconcile`, plus the advisory verify nudge. Grouped so the
+    /// nudge's "ran neither verification pass" gate sits next to the very
+    /// fields it inspects — when it was added (#4) it landed as a 10-line block
+    /// appended to a flat ladder; here that dependency is local.
+    fn outcome_rows(&self) -> Vec<Row> {
+        let mut rows: Vec<Row> = Vec::new();
         if let Some(v) = self.validated {
             rows.push(("validated", if v { "pass".into() } else { "FAIL".into() }));
         }
@@ -559,9 +618,9 @@ impl RunSummary {
             rows.push(("reconcile", value));
         }
         // Nudge: a successful run that wrote files but ran neither verification
-        // pass leaves completeness unconfirmed. Surface it (advisory only) so
-        // skipping verification is a deliberate choice, not an oversight — a
-        // pilot loaded hundreds of millions of rows across 5 runs with 0 verified.
+        // pass leaves completeness unconfirmed. Advisory only — so skipping
+        // verification is a deliberate choice, not an oversight (a pilot loaded
+        // hundreds of millions of rows across 5 runs with 0 verified).
         if self.status == "success"
             && self.files_produced > 0
             && self.validated.is_none()
@@ -573,16 +632,18 @@ impl RunSummary {
                     .into(),
             ));
         }
-        if let Some(err) = &self.error_message {
-            // Preserve the error's own line structure: the detailed block has
-            // room for it and `format_block` now indents continuation lines
-            // under the value column. Flattening to `"; "`-joined text (the
-            // compact one-liner's job) made multi-line errors — e.g. a quality
-            // failure's `failed:\n  - <check>\n  Fix …` — hard to read here.
-            rows.push(("error", err.trim_end().to_string()));
-        }
+        rows
+    }
 
-        format_block(&self.export_name, &rows)
+    /// `error` — the failure message, with its own multi-line structure
+    /// preserved (the detailed block indents continuation lines under the
+    /// value column; flattening to `"; "`-joined text is the compact
+    /// one-liner's job, not this one's — a quality failure's multi-line
+    /// `failed:\n  - <check>\n  Fix …` stays readable here).
+    fn error_row(&self) -> Option<Row> {
+        self.error_message
+            .as_ref()
+            .map(|err| ("error", err.trim_end().to_string()))
     }
 
     /// Sanity-check the post-run summary ↔ manifest_parts coherence. Used as
@@ -1232,6 +1293,70 @@ mod tests {
                 .lines()
                 .any(|l| l.trim_start().starts_with("verify:")),
             "a verified run must not nudge: {block2}"
+        );
+    }
+
+    #[test]
+    fn pg_temp_spill_row_only_for_real_spill_and_annotates_large() {
+        // Direct provider test — previously this threshold logic was only
+        // reachable by rendering a whole block (and no test set the field).
+        let mut s = RunSummary::stub_for_testing("r", "orders");
+        assert_eq!(s.pg_temp_spill_row(), None, "no delta → no row");
+        s.pg_temp_bytes_delta = Some(0);
+        assert_eq!(s.pg_temp_spill_row(), None, "zero spill → no row");
+        s.pg_temp_bytes_delta = Some(-5);
+        assert_eq!(s.pg_temp_spill_row(), None, "negative delta → no row");
+
+        s.pg_temp_bytes_delta = Some(50 * 1024 * 1024);
+        let (label, value) = s.pg_temp_spill_row().expect("50MB spill → row");
+        assert_eq!(label, "pg temp spill");
+        assert!(
+            value.contains("50.0 MB") && !value.contains('⚠'),
+            "small spill is plain info: {value:?}"
+        );
+
+        s.pg_temp_bytes_delta = Some(200 * 1024 * 1024);
+        let (_, value) = s.pg_temp_spill_row().expect("200MB spill → row");
+        assert!(
+            value.contains('⚠') && value.contains("batch_size"),
+            "spill over 100 MB carries the tuning hint: {value:?}"
+        );
+    }
+
+    #[test]
+    fn outcome_rows_format_reconcile_and_suppress_nudge_when_checked() {
+        let mut s = RunSummary::stub_for_testing("r", "orders");
+        s.reconciled = Some(true);
+        s.source_count = Some(1_000);
+        s.total_rows = 1_000;
+        assert!(
+            s.outcome_rows()
+                .iter()
+                .any(|(l, v)| *l == "reconcile" && v == "MATCH (1,000/1,000)"),
+            "match wording: {:?}",
+            s.outcome_rows()
+        );
+
+        s.reconciled = Some(false);
+        s.source_count = Some(1_200);
+        let rows = s.outcome_rows();
+        let recon = rows
+            .iter()
+            .find(|(l, _)| *l == "reconcile")
+            .expect("reconcile row");
+        assert!(
+            recon.1.contains("MISMATCH") && recon.1.contains("1,000") && recon.1.contains("1,200"),
+            "mismatch names both sides: {:?}",
+            recon
+        );
+
+        // A set reconcile result suppresses the verify nudge even on a
+        // files-produced success (the nudge's gate lives beside this field).
+        s.status = "success".into();
+        s.files_produced = 2;
+        assert!(
+            !s.outcome_rows().iter().any(|(l, _)| *l == "verify"),
+            "a reconciled run must not also nudge"
         );
     }
 
