@@ -558,6 +558,21 @@ impl RunSummary {
             };
             rows.push(("reconcile", value));
         }
+        // Nudge: a successful run that wrote files but ran neither verification
+        // pass leaves completeness unconfirmed. Surface it (advisory only) so
+        // skipping verification is a deliberate choice, not an oversight — a
+        // pilot loaded hundreds of millions of rows across 5 runs with 0 verified.
+        if self.status == "success"
+            && self.files_produced > 0
+            && self.validated.is_none()
+            && self.reconciled.is_none()
+        {
+            rows.push((
+                "verify",
+                "not run — add `--reconcile` (count vs source) or `rivet validate` (re-read outputs)"
+                    .into(),
+            ));
+        }
         if let Some(err) = &self.error_message {
             // Preserve the error's own line structure: the detailed block has
             // room for it and `format_block` now indents continuation lines
@@ -1189,6 +1204,35 @@ mod tests {
         for l in &err_lines {
             assert!(l.starts_with(' '), "error line should be indented: {l:?}");
         }
+    }
+
+    #[test]
+    fn render_nudges_verification_when_unverified_success() {
+        // #4: a successful run that wrote files but ran no verification pass
+        // should surface an advisory `verify:` line — so skipping it is a choice.
+        let mut s = RunSummary::new(&plan_for("orders"));
+        s.status = "success".into();
+        s.files_produced = 3;
+        s.total_rows = 1_000;
+        // validated / reconciled left None (no --validate / --reconcile).
+        let block = s.render();
+        assert!(
+            block.lines().any(|l| l.trim_start().starts_with("verify:")),
+            "expected a verify nudge on an unverified success: {block}"
+        );
+
+        // A run that verified must NOT nudge.
+        let mut s2 = RunSummary::new(&plan_for("orders"));
+        s2.status = "success".into();
+        s2.files_produced = 3;
+        s2.validated = Some(true);
+        let block2 = s2.render();
+        assert!(
+            !block2
+                .lines()
+                .any(|l| l.trim_start().starts_with("verify:")),
+            "a verified run must not nudge: {block2}"
+        );
     }
 
     #[test]

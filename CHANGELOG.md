@@ -18,6 +18,21 @@
   `chunk_dense` is unchanged (its `COUNT(*)` sizes the ordinal chunks). No output
   or boundary change — only the pre-chunk source footprint.
 
+### Changed
+
+- **`feat(init)` — `rivet init` now hints at incremental when it auto-picks
+  `chunked` for a re-runnable table.** When a large table gets `mode: chunked`
+  but *also* has a cursor column (`updated_at`/`created_at`), the generated YAML
+  comment points at `mode: incremental` for scheduled re-runs — chunked re-reads
+  the whole table every run (a pilot re-dumped a 655k-row table 4× in two days,
+  re-reading ~570k unchanged rows each time). Advisory comment only; the selected
+  mode is unchanged.
+- **`feat(ux)` — the run summary nudges verification.** A successful run that
+  wrote files but ran neither `--validate` nor `--reconcile` now shows an
+  advisory `verify: not run — …` line, so skipping completeness checks is a
+  deliberate choice rather than an oversight (a pilot loaded hundreds of millions
+  of rows across five runs with zero verified). Advisory only.
+
 ## 0.12.0 (2026-06-14) — memory-driven default batch sizing: MySQL ~7.5×, SQL Server ~6× faster on narrow tables
 
 Sizes the extraction batch to a memory target instead of a static row count, so
