@@ -136,6 +136,10 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
         None => None,
     };
 
+    // Average bytes/row from the same `dm_db_partition_stats` DMV — feeds the
+    // oversized-chunk warning. `None` when the base relation is unknown.
+    let avg_row_bytes = base_table.and_then(|table| avg_row_bytes_mssql(conn, table));
+
     // Cursor / chunk range. Incremental mode orders on the (possibly COALESCE'd)
     // key expression; chunked/cursor modes take MIN/MAX of the range column.
     let (range_min, range_max) = if export.mode == ExportMode::Incremental {
@@ -179,6 +183,7 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
     let warnings = collect_warnings(
         export,
         row_estimate,
+        avg_row_bytes,
         range_min.as_deref(),
         range_max.as_deref(),
         None,
@@ -191,6 +196,7 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
         mode: mode_str,
         cursor_column: export.cursor_column.clone(),
         row_estimate,
+        avg_row_bytes,
         cursor_min: range_min,
         cursor_max: range_max,
         scan_type,
@@ -264,6 +270,32 @@ fn row_estimate_mssql(conn: &mut MssqlSource, qualified_table: &str) -> Option<i
         Ok(opt) => opt.and_then(|s| s.parse::<i64>().ok()).map(|n| n.max(0)),
         Err(e) => {
             log::debug!("preflight: row-estimate probe failed for {qualified_table}: {e}");
+            None
+        }
+    }
+}
+
+/// Average bytes/row from `dm_db_partition_stats` for `[schema.]table`:
+/// `SUM(used_page_count) * 8192 / SUM(row_count)` over the heap / clustered
+/// index (`index_id IN (0,1)`) — a maintained stat, no scan (8 KB is SQL
+/// Server's fixed page size). `None` when the table is empty, the stats row is
+/// absent, or the probe fails (preflight is non-fatal).
+fn avg_row_bytes_mssql(conn: &mut MssqlSource, qualified_table: &str) -> Option<i64> {
+    let (schema, table) = split_qualified(qualified_table);
+    let sql = format!(
+        "SELECT CASE WHEN SUM(p.row_count) > 0 \
+                THEN SUM(p.used_page_count) * 8192 / SUM(p.row_count) ELSE NULL END \
+         FROM sys.dm_db_partition_stats p \
+         JOIN sys.objects o ON o.object_id = p.object_id \
+         JOIN sys.schemas s ON s.schema_id = o.schema_id \
+         WHERE s.name = N'{}' AND o.name = N'{}' AND p.index_id IN (0,1)",
+        schema.replace('\'', "''"),
+        table.replace('\'', "''"),
+    );
+    match conn.query_scalar(&sql) {
+        Ok(opt) => opt.and_then(|s| s.parse::<i64>().ok()).filter(|n| *n > 0),
+        Err(e) => {
+            log::debug!("preflight: row-width probe failed for {qualified_table}: {e}");
             None
         }
     }

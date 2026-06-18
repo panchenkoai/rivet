@@ -232,9 +232,15 @@ fn diagnose_mysql(
     let verdict = compute_verdict(row_estimate, uses_index, export.cursor_column.is_some());
     let recommended_profile = recommend_profile(row_estimate, uses_index, export);
     let recommended_parallel = recommend_parallelism(export, row_estimate, uses_index);
+    // MySQL has no trustworthy scan-free row-width estimate (information_schema
+    // AVG_ROW_LENGTH shares the same InnoDB random-dive statistics as TABLE_ROWS,
+    // which #1 already declined to trust), so the oversized-chunk check is skipped
+    // here by passing `None` — same stance as the row-estimate density diagnostic.
+    let avg_row_bytes: Option<i64> = None;
     let warnings = collect_warnings(
         export,
         row_estimate,
+        avg_row_bytes,
         range_min.as_deref(),
         range_max.as_deref(),
         db_max_connections,
@@ -247,6 +253,7 @@ fn diagnose_mysql(
         mode: mode_str,
         cursor_column: export.cursor_column.clone(),
         row_estimate,
+        avg_row_bytes,
         cursor_min: range_min,
         cursor_max: range_max,
         scan_type,
