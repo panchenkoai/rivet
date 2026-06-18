@@ -725,6 +725,8 @@ mod tests {
             size_bytes: 4,
             content_fingerprint: "xxh3:1111111111111111".into(),
             content_md5: String::new(),
+            chunk_start: None,
+            chunk_end: None,
             status: PartStatus::Committed,
         }]);
         stage_dataset(&prefix, &m); // the part itself is never written

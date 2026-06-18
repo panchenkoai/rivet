@@ -67,9 +67,12 @@ pub(crate) struct PartRecord {
 ///
 /// - `File { part_index }` — written by the single-file (snapshot / incremental)
 ///   runner: emits `RunEvent::FileWritten`.
-/// - `Chunk { chunk_index }` — the chunked runners (sequential / parallel /
-///   sequential_checkpoint / parallel_checkpoint): emits
-///   `RunEvent::ChunkCompleted` with the real chunk window's index.
+/// - `Chunk { chunk_index, start_key, end_key }` — the chunked runners
+///   (sequential / parallel / sequential_checkpoint / parallel_checkpoint):
+///   emits `RunEvent::ChunkCompleted` with the real chunk window's index, and
+///   stamps the `[start_key, end_key]` window onto the manifest part as the
+///   dedup token's range (ADR-0012). The keys are the raw `i64` bounds the
+///   chunk query used (integer range / dense ordinals / days-since-epoch).
 /// - `Page { page_index }` — keyset (seek-paginated) runner: emits
 ///   `RunEvent::ChunkCompleted` *for backward journal compatibility* but
 ///   conceptually a keyset page is **not** a chunk (no `[start, end]`
@@ -79,9 +82,17 @@ pub(crate) struct PartRecord {
 ///   `RunEvent::KeysetPageWritten` later without touching the runners —
 ///   only the match arm in [`record_part`] would change.
 pub(crate) enum PartKind {
-    File { part_index: usize },
-    Chunk { chunk_index: i64 },
-    Page { page_index: i64 },
+    File {
+        part_index: usize,
+    },
+    Chunk {
+        chunk_index: i64,
+        start_key: i64,
+        end_key: i64,
+    },
+    Page {
+        page_index: i64,
+    },
 }
 
 /// Seam 1 — ADR-0001 I1 + the destination-write boundary. Writes the
@@ -211,6 +222,15 @@ pub(crate) fn record_part(
     summary.files_produced += 1;
     summary.files_committed += 1;
 
+    // Only a chunk part carries a key-range window; snapshot/keyset parts don't
+    // (ADR-0012 dedup token). Read it off `kind` before the match consumes it.
+    let (chunk_start, chunk_end) = match &kind {
+        PartKind::Chunk {
+            start_key, end_key, ..
+        } => (Some(*start_key), Some(*end_key)),
+        _ => (None, None),
+    };
+
     // ADR-0012 M1: record the committed part for the finalizer's RunManifest.
     manifest_writer::record_committed_part_with_fingerprint(
         summary,
@@ -219,6 +239,8 @@ pub(crate) fn record_part(
         part.bytes,
         part.fingerprint.clone(),
         part.md5.clone(),
+        chunk_start,
+        chunk_end,
     );
 
     match kind {
@@ -228,7 +250,7 @@ pub(crate) fn record_part(
             bytes: part.bytes,
             part_index,
         }),
-        PartKind::Chunk { chunk_index } => summary.journal.record(RunEvent::ChunkCompleted {
+        PartKind::Chunk { chunk_index, .. } => summary.journal.record(RunEvent::ChunkCompleted {
             chunk_index,
             rows: part.rows,
             file_name: Some(part.file_name.clone()),
@@ -512,7 +534,11 @@ mod tests {
             &mut summary,
             None,
             &part,
-            PartKind::Chunk { chunk_index: 7 },
+            PartKind::Chunk {
+                chunk_index: 7,
+                start_key: 700,
+                end_key: 799,
+            },
         );
 
         let events = summary.journal.chunk_events();
@@ -535,6 +561,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn record_part_chunk_kind_stamps_range_on_manifest_part() {
+        // #6 dedup token: a Chunk part carries its [start_key, end_key] window
+        // (alongside content_fingerprint) onto the manifest; a File part has None.
+        let plan = test_plan();
+        let mut summary = test_summary(&plan);
+
+        record_part(
+            &plan,
+            &mut summary,
+            None,
+            &test_part("orders_chunk3.parquet"),
+            PartKind::Chunk {
+                chunk_index: 3,
+                start_key: 1000,
+                end_key: 1999,
+            },
+        );
+        record_part(
+            &plan,
+            &mut summary,
+            None,
+            &test_part("orders_snap.parquet"),
+            PartKind::File { part_index: 0 },
+        );
+
+        assert_eq!(summary.manifest_parts[0].chunk_start, Some(1000));
+        assert_eq!(summary.manifest_parts[0].chunk_end, Some(1999));
+        assert_eq!(
+            summary.manifest_parts[1].chunk_start, None,
+            "a non-chunk (snapshot) part has no chunk range"
+        );
+        assert_eq!(summary.manifest_parts[1].chunk_end, None);
+    }
+
     // ── I7: state.record_file is optional and warn-on-fail ───────────────────
 
     #[test]
@@ -549,7 +610,11 @@ mod tests {
             &mut summary,
             Some(&state),
             &part,
-            PartKind::Chunk { chunk_index: 0 },
+            PartKind::Chunk {
+                chunk_index: 0,
+                start_key: 0,
+                end_key: 99,
+            },
         );
 
         let files = state.get_files(Some(&plan.export_name), 16).unwrap();
@@ -572,7 +637,11 @@ mod tests {
             &mut summary,
             None,
             &part,
-            PartKind::Chunk { chunk_index: 0 },
+            PartKind::Chunk {
+                chunk_index: 0,
+                start_key: 0,
+                end_key: 99,
+            },
         );
 
         assert_eq!(summary.files_committed, 1);
@@ -623,6 +692,8 @@ mod tests {
                 p,
                 PartKind::Chunk {
                     chunk_index: i as i64,
+                    start_key: (i as i64) * 100,
+                    end_key: (i as i64) * 100 + 99,
                 },
             );
         }
@@ -668,7 +739,11 @@ mod tests {
             &mut summary,
             None,
             &part,
-            PartKind::Chunk { chunk_index: 0 },
+            PartKind::Chunk {
+                chunk_index: 0,
+                start_key: 0,
+                end_key: 99,
+            },
         );
         summary.status = "success".into();
 

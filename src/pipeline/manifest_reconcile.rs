@@ -208,6 +208,8 @@ mod tests {
             size_bytes: size,
             content_fingerprint: "xxh3:0".into(),
             content_md5: md5.into(),
+            chunk_start: None,
+            chunk_end: None,
             status: PartStatus::Committed,
         }
     }

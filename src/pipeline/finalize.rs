@@ -180,6 +180,8 @@ pub(super) fn finalize_manifest(
             part.size_bytes,
             part.content_fingerprint.clone(),
             part.content_md5.clone(),
+            part.chunk_start,
+            part.chunk_end,
         );
     }
     let manifest = builder.finalize(status);

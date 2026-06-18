@@ -181,6 +181,8 @@ Field additions are backwards-compatible (consumers ignore unknowns). Field remo
       "rows": 50000,
       "size_bytes": 123456789,
       "content_fingerprint": "xxh3:8a44e2c1...",
+      "chunk_start": 1,
+      "chunk_end": 50000,
       "status": "committed"
     }
   ]
@@ -194,6 +196,8 @@ Field additions are backwards-compatible (consumers ignore unknowns). Field remo
 `schema_fingerprint` is xxh3_64 over a canonical serialization of `[{name, type}]` from the existing `state::SchemaColumn` array. The fingerprint format prefix (`xxh3:`) is reserved so future fingerprint algorithms can coexist.
 
 `status` per part: `committed` (in this manifest) or `quarantined` (the part listed in a prior superseded manifest that resume found corrupted; retained for audit).
+
+`chunk_start` / `chunk_end` (optional) record the `[start_key, end_key]` chunk window a part covers — the raw i64 bounds the chunk query used (integer key range, dense `ROW_NUMBER` ordinals, or days-since-epoch for `chunk_by_days`). Present only for parts produced by a chunked runner; **absent** for snapshot / incremental / keyset parts (no chunk window) and for pre-0.13 manifests. Together with `content_fingerprint` they form a **dedup token**: because parts are append-only (a resumed or re-run export appends, never overwrites — M4 / ADR-0009 RR5), a consumer can group parts by `[chunk_start, chunk_end]` and tell a re-export (same range, new fingerprint → newest wins) from a true duplicate (same range, same fingerprint → load once). Additive and backwards-compatible: `#[serde(default)]` parses pre-0.13 manifests, `skip_serializing_if` keeps non-chunk parts byte-identical to before, and no `manifest_version` bump is required (field additions are back-compat per the schema note above — the same way `content_md5` was added).
 
 ---
 

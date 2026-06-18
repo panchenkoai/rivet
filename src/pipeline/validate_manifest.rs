@@ -654,6 +654,8 @@ mod tests {
             size_bytes: size,
             content_fingerprint: fp.into(),
             content_md5: String::new(),
+            chunk_start: None,
+            chunk_end: None,
             status: PartStatus::Committed,
         }
     }

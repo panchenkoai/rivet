@@ -140,6 +140,8 @@ pub(crate) fn run_chunked_sequential(
                     rec,
                     super::super::commit::PartKind::Chunk {
                         chunk_index: i as i64,
+                        start_key: *start,
+                        end_key: *end,
                     },
                 );
             }
@@ -202,11 +204,12 @@ pub(crate) fn run_chunked_parallel(
     let agg_rows = std::sync::atomic::AtomicI64::new(0);
     let errors = std::sync::Mutex::new(Vec::<String>::new());
     // PartRecords pushed by workers, drained into record_part post-scope so the
-    // I2/M1 → I7 → counters ordering lives once in commit::record_part. Tuple
-    // second is the chunk_index used by the ChunkCompleted journal event. The
-    // bytes_written / files_produced / files_committed counters are no longer
-    // accumulated worker-side — record_part bumps them in the drain.
-    let file_records: std::sync::Mutex<Vec<(super::super::commit::PartRecord, i64)>> =
+    // I2/M1 → I7 → counters ordering lives once in commit::record_part. Tuple is
+    // (rec, chunk_index, start_key, end_key): the index drives the ChunkCompleted
+    // journal event, the key-range stamps the manifest part's dedup token
+    // (ADR-0012). The bytes_written / files_produced / files_committed counters
+    // are no longer accumulated worker-side — record_part bumps them in the drain.
+    let file_records: std::sync::Mutex<Vec<(super::super::commit::PartRecord, i64, i64, i64)>> =
         std::sync::Mutex::new(Vec::new());
     // Schema fingerprint captured by whichever worker resolves the dest
     // schema first.  ADR-0012 M3 — stays None for empty runs (no chunk
@@ -410,7 +413,7 @@ pub(crate) fn run_chunked_parallel(
                         )?;
                         let mut records = poison::lock_recover(file_records);
                         for rec in recs {
-                            records.push((rec, i as i64));
+                            records.push((rec, i as i64, start, end));
                         }
                     }
 
@@ -462,13 +465,17 @@ pub(crate) fn run_chunked_parallel(
     // Drain each worker-written part through the shared commit path: I2/M1 +
     // bytes/files counters + ChunkCompleted journal + I7 file-log. All summary
     // and state mutation happens here on the parent thread, post-join.
-    for (rec, chunk_index) in poison::into_recover(file_records) {
+    for (rec, chunk_index, start_key, end_key) in poison::into_recover(file_records) {
         super::super::commit::record_part(
             plan,
             summary,
             Some(state),
             &rec,
-            super::super::commit::PartKind::Chunk { chunk_index },
+            super::super::commit::PartKind::Chunk {
+                chunk_index,
+                start_key,
+                end_key,
+            },
         );
     }
 

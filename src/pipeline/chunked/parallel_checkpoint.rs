@@ -97,8 +97,10 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     // per chunk just to call `record_file` and *no one* populated
     // `summary.manifest_parts` — so the cloud manifest (ADR-0012 M1) was
     // silently empty for every `parallel>1 + chunk_checkpoint:true` run.
-    // Tuple second is the chunk_index used by the ChunkCompleted journal.
-    let file_records: std::sync::Mutex<Vec<(super::super::commit::PartRecord, i64)>> =
+    // Tuple is (rec, chunk_index, start_key, end_key): the index drives the
+    // ChunkCompleted journal, the key-range stamps the manifest part's dedup
+    // token (ADR-0012).
+    let file_records: std::sync::Mutex<Vec<(super::super::commit::PartRecord, i64, i64, i64)>> =
         std::sync::Mutex::new(Vec::new());
     // ADR-0012 M3: schema fingerprint captured once across workers.  None
     // until any worker exports a non-empty chunk and resolves the dest schema.
@@ -361,7 +363,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                 let first = parts[0].file_name.clone();
                                 let mut records = poison::lock_recover(file_records);
                                 for rec in parts {
-                                    records.push((rec, chunk_index));
+                                    records.push((rec, chunk_index, start, end));
                                 }
                                 Some(first)
                             };
@@ -426,13 +428,17 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     // Before this migration nothing populated `summary.manifest_parts` for
     // parallel_checkpoint runs at all — the cloud manifest M1 contract was
     // silently empty for every `parallel>1 + chunk_checkpoint:true` run.
-    for (rec, chunk_index) in poison::into_recover(file_records) {
+    for (rec, chunk_index, start_key, end_key) in poison::into_recover(file_records) {
         super::super::commit::record_part(
             plan,
             summary,
             None,
             &rec,
-            super::super::commit::PartKind::Chunk { chunk_index },
+            super::super::commit::PartKind::Chunk {
+                chunk_index,
+                start_key,
+                end_key,
+            },
         );
     }
 
