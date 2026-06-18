@@ -21,10 +21,7 @@ use std::time::Duration;
 
 use super::super::{RunSummary, progress::ChunkProgress, retry::classify_error, sink::ExportSink};
 use super::poison;
-use super::{
-    ChunkSource, chunked_plan, config_hint, detect_and_generate_chunks,
-    ensure_chunk_checkpoint_plan,
-};
+use super::{ChunkSource, chunked_plan, config_hint, ensure_chunk_checkpoint_plan};
 use crate::error::Result;
 use crate::plan::ResolvedRunPlan;
 use crate::source;
@@ -46,22 +43,12 @@ pub(crate) fn run_chunked_parallel_checkpoint(
         vec![]
     } else {
         match chunk_source {
+            // Detect: one short-lived connection computes ranges + runs the
+            // pre-chunk drift check (ADR-0021) before the workers spawn.
             ChunkSource::Detect => {
                 let mut src = source::create_source(&plan.source)?;
-                let ranges = detect_and_generate_chunks(
-                    &mut *src,
-                    &plan.base_query,
-                    &cp.column,
-                    cp.chunk_size,
-                    cp.chunk_count,
-                    &plan.export_name,
-                    cp.dense,
-                    cp.by_days,
-                    plan.source.source_type,
-                )?;
-                // ADR-0021: schema-drift check pre-chunk — `fail` aborts before
-                // any worker writes a chunk.
-                super::precheck_schema_drift(&mut *src, state, plan, summary)?;
+                let ranges = super::prepare_chunk_plan(&mut *src, plan, Some(state), summary)?;
+                drop(src);
                 ranges
             }
             ChunkSource::Precomputed(ranges) => ranges,

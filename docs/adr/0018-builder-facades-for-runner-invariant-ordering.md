@@ -98,6 +98,21 @@ does not generalize across modes. Metric writes
 Coordinator layer (ADR-0003 L4), not on the runner-level Persistence
 layer (L3) the facade addresses.
 
+> **Update (2026-06-18, ADR-0021):** the schema-drift carve-out above
+> was wrong. Adding `on_schema_drift` to the chunked modes (ADR-0021)
+> showed the Continue/Warn/Fail policy *does* generalize — what differs
+> between modes is only the **column source**: single mode resolves
+> columns post-write from the sink's data-derived Arrow schema; chunked
+> resolves them pre-chunk from a scan-free `type_mappings` probe so
+> `fail` aborts before any chunk writes. That difference is exactly one
+> adapter each over a shared core, so schema-drift became the **third
+> runner-write facade**, `pipeline::schema_drift`
+> (`check_from_sink_schema` / `check_from_type_mappings` over a private
+> `check_and_persist`), alongside `commit::record_part` and `RunStore`.
+> The deletion test confirms its depth: inlining it back would
+> re-duplicate the detect → policy → store state machine across single
+> mode plus the four chunked Detect arms.
+
 ## Why "builder" instead of one method with `Option` args
 
 Three shapes were considered:
@@ -150,11 +165,12 @@ implementation logic, not from substitutability.
 
 **Negative**
 
-- The split between `commit_part` (per-part) and `RunStore`
-  (post-finalize) is two facades, not one. Schema-drift stays
-  outside, metrics stay above. A new contributor must learn three
-  layers (per-part / post-finalize / coordinator-finalize) instead of
-  one.
+- The runner-write surface is now **three facades**, not one:
+  `commit::record_part` (per-part), `RunStore` (post-finalize), and
+  `schema_drift` (pre-chunk / post-write — added by ADR-0021). Metrics
+  stay above on the Coordinator layer. A new contributor must learn
+  where each ordered-write group lives instead of finding them all in
+  one place.
 - Builder-with-fluent-chain may feel unidiomatic in Rust where most
   ordered writes are direct function calls. ADR-0017 explains the
   per-runner asymmetry that motivated the chain.
@@ -168,7 +184,12 @@ implementation logic, not from substitutability.
 - If a fourth ordered-write group emerges at the runner level (e.g.,
   per-run lineage tracking, audit log of source queries) that does not
   fit cursor/progression or per-part: extend `RunStore` with a third
-  `with_*` method rather than building a third facade.
+  `with_*` method rather than building a third facade. (Schema-drift,
+  added later as its own facade per ADR-0021, is *not* a counter-example
+  to this rule: it is a detect → policy → store **decision** keyed on
+  column-source, run pre-chunk or post-write — not a post-finalize
+  ordered write that fits `RunStore`'s cursor/progression shape. A true
+  post-finalize fourth write should still extend `RunStore`.)
 - If a runner needs to **dispatch** between different per-part commit
   strategies at runtime (today every runner uses the same
   `write_part_file` → `record_part`): re-evaluate the

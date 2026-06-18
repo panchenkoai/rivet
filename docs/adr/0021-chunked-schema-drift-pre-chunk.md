@@ -42,9 +42,17 @@ resolved via `Source::type_mappings` (a metadata-only query; no data scan).
 baselines are comparable.
 
 `fail` then aborts before the first chunk writes — matching single's intent;
-`warn` / `continue` store-or-update the baseline. The logic is a single shared
-helper, `pipeline::schema_drift::check_and_persist`, used by both single
-(post-write, sink schema) and chunked (pre-chunk, `type_mappings` schema).
+`warn` / `continue` store-or-update the baseline. The logic lives in
+`pipeline::schema_drift` as one deep core (`check_and_persist`: detect → policy
+→ store) behind two thin **column-source adapters** — `check_from_sink_schema`
+(single, post-write, sink schema) and `check_from_type_mappings` (chunked,
+pre-chunk, `type_mappings` schema). The four chunked Detect arms reach the
+chunked adapter through one shared preamble, `prepare_chunk_plan` (compute chunk
+ranges → run the pre-chunk drift check), rather than re-implementing
+detect-then-check per runner. This makes `schema_drift` the **third runner-write
+facade** alongside `commit::record_part` and `RunStore`, superseding ADR-0018's
+note that drift "does not generalize across modes" (see that ADR's 2026-06-18
+update).
 
 ## Consequences
 

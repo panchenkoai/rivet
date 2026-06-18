@@ -1,19 +1,78 @@
-//! Shared schema-drift detection + baseline persistence (ADR-0021).
+//! Schema-drift detection + baseline persistence — the runner-write facade for
+//! `on_schema_drift` (ADR-0021), the third alongside `commit::record_part` and
+//! `run_store::RunStore` (ADR-0018; that ADR's claim that drift "does not
+//! generalize across modes" is what this module disproves).
 //!
-//! Single mode calls this **post-write** from the sink's resolved schema;
-//! chunked mode calls it **pre-chunk** from a `type_mappings`-resolved schema so
-//! that `on_schema_drift: fail` aborts before any chunk is written. Keeping the
-//! policy in one place guarantees both paths behave identically.
+//! One deep core ([`check_and_persist`]: detect → policy → store) behind two
+//! column-source **adapters**:
+//!   - [`check_from_sink_schema`] — single mode, post-write, from the sink's
+//!     data-derived Arrow schema.
+//!   - [`check_from_type_mappings`] — chunked mode, pre-chunk, from a scan-free
+//!     `type_mappings` probe, so `on_schema_drift: fail` aborts before any chunk
+//!     is written.
+//!
+//! Both produce the *same* canonical `SchemaColumn` shape (via
+//! `arrow_schema_to_columns`), so a baseline is comparable across modes.
 
 use crate::config::SchemaDriftPolicy;
 use crate::error::{Result, SchemaDriftError};
 use crate::journal::RunEvent;
+use crate::plan::ResolvedRunPlan;
 use crate::state::{SchemaColumn, StateStore};
 
 use super::summary::RunSummary;
 
-/// Detect drift of `columns` against the stored baseline for `export_name` and
-/// act per `policy`.
+/// Adapter — single mode: columns from the sink's resolved (data-derived) schema.
+pub(super) fn check_from_sink_schema(
+    state: &StateStore,
+    export_name: &str,
+    sink_schema: &arrow::datatypes::Schema,
+    policy: SchemaDriftPolicy,
+    summary: &mut RunSummary,
+) -> Result<()> {
+    let columns = crate::state::arrow_schema_to_columns(sink_schema);
+    check_and_persist(state, export_name, &columns, policy, summary)
+}
+
+/// Adapter — chunked mode: columns from a scan-free `type_mappings` probe, run
+/// **pre-chunk** so `on_schema_drift: fail` aborts before any chunk is written
+/// (ADR-0021). Schema-resolution failures are non-fatal (logged) — drift is
+/// advisory infra and must not fail an otherwise-healthy run.
+pub(super) fn check_from_type_mappings(
+    src: &mut dyn crate::source::Source,
+    state: &StateStore,
+    plan: &ResolvedRunPlan,
+    summary: &mut RunSummary,
+) -> Result<()> {
+    let mappings = match src.type_mappings(&plan.base_query, &plan.column_overrides) {
+        Ok(m) => m,
+        Err(e) => {
+            log::warn!(
+                "export '{}': could not resolve schema for drift check (skipping): {e:#}",
+                plan.export_name
+            );
+            return Ok(());
+        }
+    };
+    let fields: Vec<arrow::datatypes::Field> = mappings
+        .iter()
+        .filter_map(crate::types::build_arrow_field)
+        .collect();
+    if fields.is_empty() {
+        return Ok(());
+    }
+    let columns = crate::state::arrow_schema_to_columns(&arrow::datatypes::Schema::new(fields));
+    check_and_persist(
+        state,
+        &plan.export_name,
+        &columns,
+        plan.schema_drift_policy,
+        summary,
+    )
+}
+
+/// Deep core (private): detect drift of `columns` against the stored baseline for
+/// `export_name` and act per `policy`.
 ///
 /// - First run (no baseline): `detect_schema_change` establishes it and returns
 ///   "no change" — `schema_changed = Some(false)`.
@@ -23,7 +82,7 @@ use super::summary::RunSummary;
 ///   treats this as an abort (in chunked mode this happens **before** any chunk
 ///   writes; see ADR-0021).
 /// - Tracking error: logged at warn, non-fatal (drift is advisory infra).
-pub(super) fn check_and_persist(
+fn check_and_persist(
     state: &StateStore,
     export_name: &str,
     columns: &[SchemaColumn],

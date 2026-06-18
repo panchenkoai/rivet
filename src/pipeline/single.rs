@@ -414,14 +414,13 @@ pub(super) fn run_single_export(
     }
 
     if let (Some(schema), Some(st)) = (&sink.dest_schema, state) {
-        // Single mode detects drift from the sink's resolved (data-derived)
-        // schema, post-write. Chunked mode runs the same check pre-chunk from a
-        // type_mappings schema (ADR-0021) — shared helper, identical policy.
-        let columns = crate::state::arrow_schema_to_columns(schema);
-        super::schema_drift::check_and_persist(
+        // Single mode: drift from the sink's resolved (data-derived) schema,
+        // post-write. Chunked runs the same facade pre-chunk via
+        // `check_from_type_mappings` (ADR-0021).
+        super::schema_drift::check_from_sink_schema(
             st,
             &plan.export_name,
-            &columns,
+            schema,
             plan.schema_drift_policy,
             summary,
         )?;

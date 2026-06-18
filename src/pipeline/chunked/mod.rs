@@ -98,48 +98,38 @@ use crate::error::Result;
 use crate::plan::{ChunkedPlan, ExtractionStrategy, ResolvedRunPlan};
 use crate::state::StateStore;
 
-/// Pre-chunk schema-drift check (ADR-0021).
+/// The shared `Detect`-path preamble for all four chunked runners: compute the
+/// chunk ranges, then run the pre-chunk schema-drift check (ADR-0021) once,
+/// before any chunk executes — so `on_schema_drift: fail` aborts before a single
+/// chunk is written. The runners' durability-divergent *execution*
+/// (ADR-0010/0017) stays per-runner; only this identical preamble is shared, the
+/// way `commit::record_part` shares the per-part tail (ADR-0018).
 ///
-/// Resolves the export's column schema from a metadata-only `type_mappings`
-/// query (no data scan), then runs the shared drift detect-and-persist policy
-/// **before any chunk executes** — so `on_schema_drift: fail` aborts before a
-/// single chunk is written, matching single mode's intent. Only the `Detect`
-/// chunk source calls this; `Precomputed`/resume sources skip it (drift was
-/// evaluated on the original planning run). Schema-resolution failures are
-/// non-fatal (logged): drift tracking is advisory and must not fail an
-/// otherwise-healthy run.
-pub(super) fn precheck_schema_drift(
+/// `Precomputed`/resume chunk sources never call this — drift was evaluated on
+/// the original planning run that produced the ranges. Drift runs only when the
+/// runner is stateful (`state.is_some()`).
+pub(super) fn prepare_chunk_plan(
     src: &mut dyn crate::source::Source,
-    state: &StateStore,
     plan: &ResolvedRunPlan,
+    state: Option<&StateStore>,
     summary: &mut RunSummary,
-) -> Result<()> {
-    let mappings = match src.type_mappings(&plan.base_query, &plan.column_overrides) {
-        Ok(m) => m,
-        Err(e) => {
-            log::warn!(
-                "export '{}': could not resolve schema for drift check (skipping): {e:#}",
-                plan.export_name
-            );
-            return Ok(());
-        }
-    };
-    let fields: Vec<arrow::datatypes::Field> = mappings
-        .iter()
-        .filter_map(crate::types::build_arrow_field)
-        .collect();
-    if fields.is_empty() {
-        return Ok(());
-    }
-    let schema = arrow::datatypes::Schema::new(fields);
-    let columns = crate::state::arrow_schema_to_columns(&schema);
-    super::schema_drift::check_and_persist(
-        state,
+) -> Result<Vec<(i64, i64)>> {
+    let cp = chunked_plan(plan);
+    let ranges = detect_and_generate_chunks(
+        src,
+        &plan.base_query,
+        &cp.column,
+        cp.chunk_size,
+        cp.chunk_count,
         &plan.export_name,
-        &columns,
-        plan.schema_drift_policy,
-        summary,
-    )
+        cp.dense,
+        cp.by_days,
+        plan.source.source_type,
+    )?;
+    if let Some(st) = state {
+        super::schema_drift::check_from_type_mappings(src, st, plan, summary)?;
+    }
+    Ok(ranges)
 }
 
 /// Extract the `ChunkedPlan` from a `ResolvedRunPlan`. Panics if the strategy
