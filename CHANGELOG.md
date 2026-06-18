@@ -1,6 +1,14 @@
 # Changelog
 
-## [Unreleased]
+## 0.13.0 (2026-06-18) — chunked-mode parity & source-safety: scan-free planning, schema-drift, heavy-chunk guard, dedup tokens
+
+A pilot run surfaced four chunked-mode gaps; this release closes them. Chunked
+exports — the default for large tables — now get scan-free range planning (no
+pre-chunk `COUNT(*)`), column-level schema-drift detection at parity with single
+mode, a `rivet check` warning when a chunk would hold one statement open too
+long, and a manifest dedup token so re-exported parts can be deduplicated
+downstream. **MINOR** — chunked `on_schema_drift: fail` now aborts runs that
+previously sailed through (it never recorded a baseline before).
 
 ### Added
 
@@ -16,6 +24,23 @@
   parallel, checkpoint / non-checkpoint) share one helper with single mode.
   Cross-mode caveat (a single→chunked baseline can log a one-time, self-healing
   drift) is documented in ADR-0021.
+- **`feat(check)` — `rivet check` warns when `chunk_size` would make one chunk
+  query scan too much.** The source-harm lever the 0.12 A/B measured is how long
+  a single chunk statement holds its snapshot / locks (SQL Server's longest
+  request fell 1839 ms → 276 ms once chunks shrank). `check` now projects
+  bytes-per-chunk (`rows_per_chunk × avg_row_bytes`) and, above ~256 MB, advises
+  a smaller `chunk_size`. Row width comes free from stats already read — PG
+  EXPLAIN `width`, SQL Server `dm_db_partition_stats` — so no extra round-trip;
+  MySQL is skipped (no trustworthy scan-free estimate). Advisory only; never
+  blocks a run.
+- **`feat(manifest)` — each manifest part carries its chunk key-range as a dedup
+  token (ADR-0012).** A part's `content_fingerprint` already identified its
+  bytes; parts now also record the `[chunk_start, chunk_end]` window they cover.
+  Because parts are append-only (a resume / re-run appends, never overwrites), a
+  consumer can group by range and tell a re-export (same range, new fingerprint →
+  newest wins) from a true duplicate (same range, same fingerprint → load once).
+  Additive and backwards-compatible — absent for snapshot / keyset parts and
+  pre-0.13 manifests, no `manifest_version` bump.
 
 ### Fixed
 
@@ -47,6 +72,18 @@
   advisory `verify: not run — …` line, so skipping completeness checks is a
   deliberate choice rather than an oversight (a pilot loaded hundreds of millions
   of rows across five runs with zero verified). Advisory only.
+
+### Internal
+
+- **`refactor` — architecture deepening over the modules the pilot fixes
+  touched (no behaviour change).** Schema-drift became the third runner-write
+  facade (`pipeline::schema_drift`: two column-source adapters over one
+  detect→policy→store core), and the four chunked Detect arms now share one
+  `prepare_chunk_plan` preamble instead of each hand-wiring detect + drift-check
+  (ADR-0018 / ADR-0021 updated). The two DB-scalar parsers were unified into a
+  `crate::scalar` leaf (the inbound mirror of `crate::sql`), and
+  `RunSummary::render` became an ordered manifest of per-row providers — both
+  gaining direct unit tests they previously lacked.
 
 ## 0.12.0 (2026-06-14) — memory-driven default batch sizing: MySQL ~7.5×, SQL Server ~6× faster on narrow tables
 
