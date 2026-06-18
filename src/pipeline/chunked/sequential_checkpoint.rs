@@ -183,17 +183,23 @@ pub(crate) fn run_chunked_sequential_checkpoint(
         vec![]
     } else {
         match chunk_source {
-            ChunkSource::Detect => detect_and_generate_chunks(
-                src,
-                &plan.base_query,
-                &cp.column,
-                cp.chunk_size,
-                cp.chunk_count,
-                &plan.export_name,
-                cp.dense,
-                cp.by_days,
-                plan.source.source_type,
-            )?,
+            ChunkSource::Detect => {
+                let ranges = detect_and_generate_chunks(
+                    src,
+                    &plan.base_query,
+                    &cp.column,
+                    cp.chunk_size,
+                    cp.chunk_count,
+                    &plan.export_name,
+                    cp.dense,
+                    cp.by_days,
+                    plan.source.source_type,
+                )?;
+                // ADR-0021: schema-drift check pre-chunk — `fail` aborts before
+                // any chunk writes.
+                super::precheck_schema_drift(src, state, plan, summary)?;
+                ranges
+            }
             ChunkSource::Precomputed(ranges) => ranges,
         }
     };

@@ -48,7 +48,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
         match chunk_source {
             ChunkSource::Detect => {
                 let mut src = source::create_source(&plan.source)?;
-                detect_and_generate_chunks(
+                let ranges = detect_and_generate_chunks(
                     &mut *src,
                     &plan.base_query,
                     &cp.column,
@@ -58,7 +58,11 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                     cp.dense,
                     cp.by_days,
                     plan.source.source_type,
-                )?
+                )?;
+                // ADR-0021: schema-drift check pre-chunk — `fail` aborts before
+                // any worker writes a chunk.
+                super::precheck_schema_drift(&mut *src, state, plan, summary)?;
+                ranges
             }
             ChunkSource::Precomputed(ranges) => ranges,
         }

@@ -1,6 +1,21 @@
 # Changelog
 
-## 0.12.0 (2026-06-14) — memory-driven default batch sizing: MySQL ~7.5×, SQL Server ~6× faster on narrow tables
+## [Unreleased]
+
+### Added
+
+- **`feat(chunked)` — chunked exports now get column-level schema-drift
+  detection, at parity with single mode (ADR-0021).** Previously
+  `detect_schema_change` / `store_schema` ran only in single mode, so chunked
+  exports (the default for large tables) never recorded a schema snapshot —
+  `rivet state` showed nothing and drift went unnoticed across re-runs. Drift is
+  now checked **pre-chunk**, from a scan-free `type_mappings` schema, so
+  `on_schema_drift: fail` aborts **before any chunk is written** (single detects
+  post-write; chunks have already written by then, so a post-hoc check could not
+  prevent the bad output). All four chunked execution modes (sequential /
+  parallel, checkpoint / non-checkpoint) share one helper with single mode.
+  Cross-mode caveat (a single→chunked baseline can log a one-time, self-healing
+  drift) is documented in ADR-0021.
 
 Sizes the extraction batch to a memory target instead of a static row count, so
 narrow tables stop paying a per-batch handoff tax. **MINOR** — the default

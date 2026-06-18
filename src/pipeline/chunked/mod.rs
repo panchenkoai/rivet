@@ -98,6 +98,50 @@ use crate::error::Result;
 use crate::plan::{ChunkedPlan, ExtractionStrategy, ResolvedRunPlan};
 use crate::state::StateStore;
 
+/// Pre-chunk schema-drift check (ADR-0021).
+///
+/// Resolves the export's column schema from a metadata-only `type_mappings`
+/// query (no data scan), then runs the shared drift detect-and-persist policy
+/// **before any chunk executes** — so `on_schema_drift: fail` aborts before a
+/// single chunk is written, matching single mode's intent. Only the `Detect`
+/// chunk source calls this; `Precomputed`/resume sources skip it (drift was
+/// evaluated on the original planning run). Schema-resolution failures are
+/// non-fatal (logged): drift tracking is advisory and must not fail an
+/// otherwise-healthy run.
+pub(super) fn precheck_schema_drift(
+    src: &mut dyn crate::source::Source,
+    state: &StateStore,
+    plan: &ResolvedRunPlan,
+    summary: &mut RunSummary,
+) -> Result<()> {
+    let mappings = match src.type_mappings(&plan.base_query, &plan.column_overrides) {
+        Ok(m) => m,
+        Err(e) => {
+            log::warn!(
+                "export '{}': could not resolve schema for drift check (skipping): {e:#}",
+                plan.export_name
+            );
+            return Ok(());
+        }
+    };
+    let fields: Vec<arrow::datatypes::Field> = mappings
+        .iter()
+        .filter_map(crate::types::build_arrow_field)
+        .collect();
+    if fields.is_empty() {
+        return Ok(());
+    }
+    let schema = arrow::datatypes::Schema::new(fields);
+    let columns = crate::state::arrow_schema_to_columns(&schema);
+    super::schema_drift::check_and_persist(
+        state,
+        &plan.export_name,
+        &columns,
+        plan.schema_drift_policy,
+        summary,
+    )
+}
+
 /// Extract the `ChunkedPlan` from a `ResolvedRunPlan`. Panics if the strategy
 /// is not `Chunked` — all callers in this module only run for chunked plans.
 pub(super) fn chunked_plan(plan: &ResolvedRunPlan) -> &ChunkedPlan {

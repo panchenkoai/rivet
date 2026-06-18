@@ -89,3 +89,60 @@ pub(super) fn check_and_persist(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn col(name: &str, ty: &str) -> SchemaColumn {
+        SchemaColumn {
+            name: name.into(),
+            data_type: ty.into(),
+        }
+    }
+    fn summary() -> RunSummary {
+        RunSummary::stub_for_testing("run-1", "orders")
+    }
+
+    #[test]
+    fn first_run_establishes_baseline_no_drift() {
+        let st = StateStore::open_in_memory().unwrap();
+        let mut s = summary();
+        let cols = vec![col("id", "Int64"), col("name", "Utf8")];
+        // No baseline yet → detect_schema_change establishes it, reports no change.
+        check_and_persist(&st, "orders", &cols, SchemaDriftPolicy::Fail, &mut s).unwrap();
+        assert_eq!(s.schema_changed, Some(false));
+    }
+
+    #[test]
+    fn drift_under_fail_returns_err_and_flags_change() {
+        let st = StateStore::open_in_memory().unwrap();
+        let v1 = vec![col("id", "Int64")];
+        check_and_persist(&st, "orders", &v1, SchemaDriftPolicy::Fail, &mut summary()).unwrap();
+        // A new column appears on the next run.
+        let v2 = vec![col("id", "Int64"), col("email", "Utf8")];
+        let mut s2 = summary();
+        let err = check_and_persist(&st, "orders", &v2, SchemaDriftPolicy::Fail, &mut s2)
+            .expect_err("fail policy must abort on drift");
+        assert!(
+            format!("{err:#}").contains("schema drift detected"),
+            "{err:#}"
+        );
+        assert_eq!(s2.schema_changed, Some(true));
+    }
+
+    #[test]
+    fn drift_under_warn_stores_new_baseline_and_continues() {
+        let st = StateStore::open_in_memory().unwrap();
+        let v1 = vec![col("id", "Int64")];
+        check_and_persist(&st, "orders", &v1, SchemaDriftPolicy::Warn, &mut summary()).unwrap();
+        let v2 = vec![col("id", "Int64"), col("email", "Utf8")];
+        let mut s2 = summary();
+        check_and_persist(&st, "orders", &v2, SchemaDriftPolicy::Warn, &mut s2).unwrap();
+        assert_eq!(s2.schema_changed, Some(true));
+        // Warn updates the baseline → re-running v2 is now drift-free.
+        let mut s3 = summary();
+        check_and_persist(&st, "orders", &v2, SchemaDriftPolicy::Warn, &mut s3).unwrap();
+        assert_eq!(s3.schema_changed, Some(false));
+    }
+}

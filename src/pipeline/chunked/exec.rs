@@ -38,17 +38,25 @@ pub(crate) fn run_chunked_sequential(
     let cp = chunked_plan(plan);
 
     let chunks = match chunk_source {
-        super::ChunkSource::Detect => detect_and_generate_chunks(
-            src,
-            &plan.base_query,
-            &cp.column,
-            cp.chunk_size,
-            cp.chunk_count,
-            &plan.export_name,
-            cp.dense,
-            cp.by_days,
-            plan.source.source_type,
-        )?,
+        super::ChunkSource::Detect => {
+            let ranges = detect_and_generate_chunks(
+                src,
+                &plan.base_query,
+                &cp.column,
+                cp.chunk_size,
+                cp.chunk_count,
+                &plan.export_name,
+                cp.dense,
+                cp.by_days,
+                plan.source.source_type,
+            )?;
+            // ADR-0021: schema-drift check pre-chunk (only when stateful) — `fail`
+            // aborts before any chunk writes.
+            if let Some(st) = state {
+                super::precheck_schema_drift(src, st, plan, summary)?;
+            }
+            ranges
+        }
         super::ChunkSource::Precomputed(ranges) => ranges,
     };
 
@@ -192,6 +200,9 @@ pub(crate) fn run_chunked_parallel(
                 cp.by_days,
                 plan.source.source_type,
             )?;
+            // ADR-0021: schema-drift check pre-chunk, reusing the detect
+            // connection — `fail` aborts before any worker writes a chunk.
+            super::precheck_schema_drift(&mut *src, state, plan, summary)?;
             drop(src);
             ranges
         }
