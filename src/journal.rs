@@ -305,6 +305,34 @@ impl RunJournal {
 }
 
 #[cfg(test)]
+impl RunJournal {
+    /// Test-only: append a paired `ChunkStarted` + `ChunkCompleted` for
+    /// `chunk_index` whose wall-clock span is exactly `dur_ms`, stamped with
+    /// explicit timestamps (`record()` stamps `Utc::now`, which a test can't
+    /// control). Lets a caller make `longest_chunk_ms()` deterministic without
+    /// reaching into the private-by-convention `entries` Vec.
+    pub(crate) fn push_test_chunk_span(&mut self, chunk_index: i64, dur_ms: i64) {
+        let base = Utc::now();
+        self.entries.push(JournalEntry {
+            recorded_at: base,
+            event: RunEvent::ChunkStarted {
+                chunk_index,
+                start_key: "0".into(),
+                end_key: "1".into(),
+            },
+        });
+        self.entries.push(JournalEntry {
+            recorded_at: base + chrono::Duration::milliseconds(dur_ms),
+            event: RunEvent::ChunkCompleted {
+                chunk_index,
+                rows: 1,
+                file_name: None,
+            },
+        });
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

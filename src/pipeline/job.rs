@@ -889,4 +889,205 @@ mod tests {
             .expect("non-chunked strategy must skip the gate");
         assert!(summary.quality_passed.is_none());
     }
+
+    // ── build_metric_row ────────────────────────────────────────────────────
+    //
+    // The builder is what actually decides *what* lands in every `export_metrics`
+    // row, so a single field wired to the wrong summary/plan member silently
+    // persists a wrong metric for the entire pilot. The metrics-store test
+    // (`record_metric_full_persists_v9_columns_in_order`) only guards the
+    // MetricRow→SQL column mapping; this pins the summary/plan→MetricRow mapping
+    // upstream of it. Every look-alike pair (files_committed vs files_produced,
+    // source_count vs total_rows, chunk_size vs parallel) gets a *distinct* value
+    // so a field swap surfaces as a wrong-value read, not a passing tie.
+
+    #[test]
+    fn build_metric_row_maps_every_summary_and_plan_field() {
+        let mut summary = RunSummary::stub_for_testing("run-bmr", "orders");
+        summary.duration_ms = 1234;
+        summary.total_rows = 50_000;
+        summary.peak_rss_mb = 142;
+        summary.status = "success".into();
+        summary.error_message = Some("boom".into());
+        summary.format = "parquet".into();
+        summary.mode = "chunked".into();
+        summary.files_produced = 7;
+        summary.bytes_written = 4096;
+        summary.retries = 2;
+        summary.validated = Some(true);
+        summary.schema_changed = Some(false);
+        // v9 signals — each distinct from its look-alike sibling.
+        summary.files_committed = 6; // ≠ files_produced (7)
+        summary.reconciled = Some(true);
+        summary.source_count = Some(49_999); // ≠ total_rows (50_000)
+        summary.quality_passed = Some(true);
+        summary.pg_temp_bytes_delta = Some(1_048_576);
+        summary.batch_size = 32_000;
+        summary.batch_size_memory_mb = Some(256);
+        summary.skip_reason = Some("manual".into());
+        summary.schema_fingerprint = Some("fp-abc".into());
+
+        // v10: longest_chunk_ms is delegated to the journal. Inject one paired
+        // 640ms chunk span (via the journal's own test helper, not a reach into
+        // `entries`) so the field is a known Some — proving the builder reads
+        // the journal rather than hardcoding None.
+        summary.journal.push_test_chunk_span(0, 640);
+
+        // Chunked plan with distinct chunk_size/parallel so a swap can't pass.
+        let mut plan = chunked_plan_with_quality(None);
+        plan.strategy = ExtractionStrategy::Chunked(ChunkedPlan {
+            column: "id".into(),
+            chunk_size: 100_000,
+            chunk_count: None,
+            parallel: 4,
+            dense: false,
+            by_days: None,
+            checkpoint: false,
+            max_attempts: 3,
+        });
+
+        // Destructure WITHOUT `..` so a new `MetricRow` field is a COMPILE error
+        // here until it's bound and asserted — "every field" becomes a
+        // compiler-enforced invariant, not a hopeful test name. (The earlier
+        // `row.field` form silently ignored any field added to the struct.)
+        let crate::state::MetricRow {
+            export_name,
+            run_id,
+            duration_ms,
+            total_rows,
+            peak_rss_mb,
+            status,
+            error_message,
+            tuning_profile,
+            format,
+            mode,
+            files_produced,
+            bytes_written,
+            retries,
+            validated,
+            schema_changed,
+            files_committed,
+            reconciled,
+            source_count,
+            quality_passed,
+            pg_temp_bytes_delta,
+            batch_size,
+            batch_size_memory_mb,
+            skip_reason,
+            schema_fingerprint,
+            chunk_size,
+            parallel,
+            source_type,
+            destination_type,
+            rivet_version,
+            longest_chunk_ms,
+        } = build_metric_row(&summary, &plan, "safe");
+
+        // ── core (v1) ──
+        assert_eq!(export_name, "orders");
+        assert_eq!(run_id, "run-bmr");
+        assert_eq!(duration_ms, 1234);
+        assert_eq!(total_rows, 50_000);
+        assert_eq!(peak_rss_mb, Some(142));
+        assert_eq!(status, "success");
+        assert_eq!(error_message.as_deref(), Some("boom"));
+        assert_eq!(tuning_profile.as_deref(), Some("safe")); // builder arg
+        assert_eq!(format.as_deref(), Some("parquet"));
+        assert_eq!(mode.as_deref(), Some("chunked"));
+        assert_eq!(files_produced, 7);
+        assert_eq!(bytes_written, 4096);
+        assert_eq!(retries, 2);
+        assert_eq!(validated, Some(true));
+        assert_eq!(schema_changed, Some(false));
+        // ── v9 ──
+        assert_eq!(files_committed, 6);
+        assert_eq!(reconciled, Some(true));
+        assert_eq!(source_count, Some(49_999));
+        assert_eq!(quality_passed, Some(true));
+        assert_eq!(pg_temp_bytes_delta, Some(1_048_576));
+        assert_eq!(batch_size, 32_000);
+        assert_eq!(batch_size_memory_mb, Some(256));
+        assert_eq!(skip_reason.as_deref(), Some("manual"));
+        assert_eq!(schema_fingerprint.as_deref(), Some("fp-abc"));
+        // ── plan-derived ──
+        assert_eq!(chunk_size, Some(100_000));
+        assert_eq!(parallel, Some(4));
+        assert_eq!(source_type.as_deref(), Some("postgres"));
+        assert_eq!(destination_type.as_deref(), Some("local"));
+        assert_eq!(rivet_version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        // ── v10: delegated to the journal (pinned to the injected span) ──
+        assert_eq!(longest_chunk_ms, Some(640));
+        assert_eq!(longest_chunk_ms, summary.journal.longest_chunk_ms());
+    }
+
+    #[test]
+    fn build_metric_row_non_chunked_has_no_chunk_dims() {
+        // The chunk-config dimensions only exist for the Chunked strategy; every
+        // other strategy must leave chunk_size/parallel NULL (the `_ => (None,
+        // None)` arm) rather than persist a stale or zero value.
+        let mut plan = chunked_plan_with_quality(None);
+        plan.strategy = ExtractionStrategy::Snapshot;
+        let summary = RunSummary::stub_for_testing("run-snap", "orders");
+
+        let row = build_metric_row(&summary, &plan, "balanced");
+
+        assert!(row.chunk_size.is_none(), "snapshot has no chunk_size");
+        assert!(row.parallel.is_none(), "snapshot has no parallel");
+        // The non-chunk dimensions are still populated.
+        assert_eq!(row.source_type.as_deref(), Some("postgres"));
+        assert_eq!(row.destination_type.as_deref(), Some("local"));
+    }
+
+    // ── harm_deltas ─────────────────────────────────────────────────────────
+    //
+    // The per-counter delta feeding `export_harm`. Three semantics to pin:
+    // matched counters subtract, a counter reset floors at 0 (never a negative
+    // "harm"), and the result is the *name intersection* of the two snapshots
+    // (a counter present in only one snapshot is dropped, not treated as 0).
+
+    #[test]
+    fn harm_deltas_subtracts_matched_counters() {
+        let before = vec![
+            ("pg_tup_returned".to_string(), 100),
+            ("pg_blks_read".to_string(), 5),
+        ];
+        let after = vec![
+            ("pg_tup_returned".to_string(), 150),
+            ("pg_blks_read".to_string(), 9),
+        ];
+        let mut got = harm_deltas(&before, &after);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("pg_blks_read".to_string(), 4),
+                ("pg_tup_returned".to_string(), 50)
+            ]
+        );
+    }
+
+    #[test]
+    fn harm_deltas_floors_counter_reset_at_zero() {
+        // A mid-run server restart resets the cumulative counter; after < before
+        // must not surface as negative harm.
+        let before = vec![("pg_tup_returned".to_string(), 1_000)];
+        let after = vec![("pg_tup_returned".to_string(), 40)];
+        assert_eq!(
+            harm_deltas(&before, &after),
+            vec![("pg_tup_returned".to_string(), 0)]
+        );
+    }
+
+    #[test]
+    fn harm_deltas_intersects_counter_names() {
+        // Only counters present in BOTH snapshots are emitted: a metric in only
+        // `before` (probe stopped exposing it) or only `after` (newly appeared)
+        // has no honest delta and is dropped.
+        let before = vec![("shared".to_string(), 10), ("only_before".to_string(), 1)];
+        let after = vec![("shared".to_string(), 25), ("only_after".to_string(), 7)];
+        assert_eq!(
+            harm_deltas(&before, &after),
+            vec![("shared".to_string(), 15)]
+        );
+    }
 }
