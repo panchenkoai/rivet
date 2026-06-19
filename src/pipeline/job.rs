@@ -13,6 +13,56 @@ use super::single::run_with_reconnect;
 use super::summary::RunSummary;
 use crate::journal::RunEvent;
 
+/// Assemble the full `export_metrics` row (v9) from the finished run summary +
+/// plan. One builder so the run and apply paths persist an identical shape
+/// rather than each inlining the metric fields. The richer signals
+/// (`pg_temp_bytes_delta`, `reconciled`/`source_count`, effective `batch_size`,
+/// config dims, `rivet_version`) are what `record_metric`'s old 15-arg shim
+/// dropped on the floor — they exist on the summary/plan here, so persist them.
+fn build_metric_row(
+    summary: &RunSummary,
+    plan: &ResolvedRunPlan,
+    tuning_class: &str,
+) -> crate::state::MetricRow {
+    let (chunk_size, parallel) = match &plan.strategy {
+        crate::plan::ExtractionStrategy::Chunked(cp) => {
+            (Some(cp.chunk_size as i64), Some(cp.parallel as i64))
+        }
+        _ => (None, None),
+    };
+    crate::state::MetricRow {
+        export_name: summary.export_name.clone(),
+        run_id: summary.run_id.clone(),
+        duration_ms: summary.duration_ms,
+        total_rows: summary.total_rows,
+        peak_rss_mb: Some(summary.peak_rss_mb),
+        status: summary.status.clone(),
+        error_message: summary.error_message.clone(),
+        tuning_profile: Some(tuning_class.to_string()),
+        format: Some(summary.format.clone()),
+        mode: Some(summary.mode.clone()),
+        files_produced: summary.files_produced as i64,
+        bytes_written: summary.bytes_written as i64,
+        retries: summary.retries as i64,
+        validated: summary.validated,
+        schema_changed: summary.schema_changed,
+        files_committed: summary.files_committed as i64,
+        reconciled: summary.reconciled,
+        source_count: summary.source_count,
+        quality_passed: summary.quality_passed,
+        pg_temp_bytes_delta: summary.pg_temp_bytes_delta,
+        batch_size: summary.batch_size as i64,
+        batch_size_memory_mb: summary.batch_size_memory_mb.map(|m| m as i64),
+        skip_reason: summary.skip_reason.clone(),
+        schema_fingerprint: summary.schema_fingerprint.clone(),
+        chunk_size,
+        parallel,
+        source_type: Some(format!("{:?}", plan.source.source_type).to_lowercase()),
+        destination_type: Some(plan.destination.destination_type.label().to_string()),
+        rivet_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+    }
+}
+
 fn run_chunked_quality_gate(
     result: Result<()>,
     plan: &ResolvedRunPlan,
@@ -411,23 +461,7 @@ pub(super) fn run_export_job(
     if plan.validate {
         finalize_validate_manifest(&plan, &mut summary, "export");
     }
-    if let Err(e) = state.record_metric(
-        &summary.export_name,
-        &summary.run_id,
-        summary.duration_ms,
-        summary.total_rows,
-        Some(summary.peak_rss_mb),
-        &summary.status,
-        summary.error_message.as_deref(),
-        Some(&tuning_class),
-        Some(&summary.format),
-        Some(&summary.mode),
-        summary.files_produced as i64,
-        summary.bytes_written as i64,
-        summary.retries as i64,
-        summary.validated,
-        summary.schema_changed,
-    ) {
+    if let Err(e) = state.record_metric_full(&build_metric_row(&summary, &plan, &tuning_class)) {
         log::warn!(
             "export '{}': metrics write failed (run outcome not stored): {:#}",
             summary.export_name,
@@ -535,23 +569,7 @@ pub(crate) fn run_export_job_with_chunk_source(
     // After finalize_validate_manifest: it can downgrade summary.validated,
     // and the metrics row must carry the final verdict (same ordering as
     // run_export_job).
-    if let Err(e) = state.record_metric(
-        &summary.export_name,
-        &summary.run_id,
-        summary.duration_ms,
-        summary.total_rows,
-        Some(summary.peak_rss_mb),
-        &summary.status,
-        summary.error_message.as_deref(),
-        Some(&tuning_class),
-        Some(&summary.format),
-        Some(&summary.mode),
-        summary.files_produced as i64,
-        summary.bytes_written as i64,
-        summary.retries as i64,
-        summary.validated,
-        summary.schema_changed,
-    ) {
+    if let Err(e) = state.record_metric_full(&build_metric_row(&summary, plan, &tuning_class)) {
         log::warn!(
             "apply '{}': metrics write failed: {:#}",
             summary.export_name,
