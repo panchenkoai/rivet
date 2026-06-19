@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.13.0 (2026-06-18) — chunked-mode parity & source-safety: scan-free planning, schema-drift, heavy-chunk guard
+## 0.13.0 (2026-06-19) — chunked-mode parity, source-safety & source-harm observability
 
 A pilot run surfaced three chunked-mode gaps; this release closes them. Chunked
 exports — the default for large tables — now get scan-free range planning (no
@@ -8,6 +8,13 @@ pre-chunk `COUNT(*)`), column-level schema-drift detection at parity with single
 mode, and a `rivet check` warning when a chunk would hold one statement open too
 long. **MINOR** — chunked `on_schema_drift: fail` now aborts runs that
 previously sailed through (it never recorded a baseline before).
+
+It also lands the first slice of **source-harm observability**: the same pilot
+had no way to quantify what an export actually *cost* its source. Every run now
+persists an extended `export_metrics` row plus a per-counter `export_harm` delta
+to `.rivet_state.db` — SQL-queryable for analysis, not (yet) surfaced in
+`rivet metrics` — and `rivet doctor` flags when a SQL Server login can't read the
+harm counters.
 
 ### Added
 
@@ -32,6 +39,31 @@ previously sailed through (it never recorded a baseline before).
   EXPLAIN `width`, SQL Server `dm_db_partition_stats` — so no extra round-trip;
   MySQL is skipped (no trustworthy scan-free estimate). Advisory only; never
   blocks a run.
+- **`feat(metrics)` — every run persists an extended `export_metrics` row for
+  post-hoc analysis.** Alongside the original 16 columns, the table now records
+  15 more per-run signals: completeness (`files_committed`, `reconciled`,
+  `source_count`, `quality_passed`), source cost (`pg_temp_bytes_delta`, and
+  `longest_chunk_ms` — how long the single longest chunk held its snapshot /
+  locks, the #5 source-harm lever the 0.12 A/B measured), effective tuning
+  (`batch_size`, `batch_size_memory_mb`, `chunk_size`, `parallel`,
+  `skip_reason`), and run identity (`schema_fingerprint`, `source_type`,
+  `destination_type`, `rivet_version`). Written on the `run` and `apply` paths
+  and queryable via SQL; `rivet metrics` still prints the core row — these
+  columns are for analysis, not the summary card.
+- **`feat(metrics)` — per-run source-harm deltas in a new `export_harm` table.**
+  Each run brackets the source with an engine-specific counter snapshot and
+  stores the delta per counter: PostgreSQL `pg_stat_database` (`pg_tup_returned`
+  read-amplification, `pg_blks_read`/`hit`, `pg_temp_files`, `pg_deadlocks`),
+  MySQL `SHOW GLOBAL STATUS` (`Innodb_rows_read`, row-lock waits, tmp-disk
+  tables, …), SQL Server `sys.dm_os_wait_stats` (`LCK%` wait count + wait-ms).
+  Best-effort observability — a failed or unavailable probe is logged and
+  ignored, never affecting the run verdict. Captured on the `run` path; `apply`
+  persists the metric row but skips the harm + `temp_bytes` probes.
+- **`feat(doctor)` — `rivet doctor` advises when a SQL Server login lacks
+  `VIEW SERVER STATE`.** The harm probe reads `sys.dm_os_wait_stats`, which needs
+  that permission; doctor now prints a `[note]` (never a `[FAIL]`) with the exact
+  `GRANT VIEW SERVER STATE` to run if the operator wants lock-wait metrics —
+  data extraction is unaffected either way.
 
 ### Fixed
 
@@ -75,6 +107,18 @@ previously sailed through (it never recorded a baseline before).
   `crate::scalar` leaf (the inbound mirror of `crate::sql`), and
   `RunSummary::render` became an ordered manifest of per-row providers — both
   gaining direct unit tests they previously lacked.
+- **`refactor(preflight, chunked)` — further deepening over the metrics-touched
+  modules (no behaviour change).** `collect_warnings` became a declarative
+  manifest (C1), the four chunked Detect arms dedup their plan-build and own the
+  detect connection (C3/C4), and the mode-string + base-query were hoisted out of
+  the per-engine `diagnose_*` paths (C2). A speculative chunk-range dedup token
+  was reverted before shipping — no consumer (#6).
+- **`test` — metrics-persistence coverage.** New unit tests pin the
+  summary→`MetricRow` builder and the harm-delta math (floor + name
+  intersection); live tests prove the extended columns and per-engine
+  `export_harm` rows actually land in a freshly-migrated state DB on
+  PostgreSQL / MySQL / SQL Server, plus the `apply`-path metric row and the
+  doctor `VIEW SERVER STATE` note (restricted login + sysadmin control).
 
 ## 0.12.0 (2026-06-14) — memory-driven default batch sizing: MySQL ~7.5×, SQL Server ~6× faster on narrow tables
 
