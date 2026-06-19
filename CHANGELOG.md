@@ -1,13 +1,12 @@
 # Changelog
 
-## 0.13.0 (2026-06-18) — chunked-mode parity & source-safety: scan-free planning, schema-drift, heavy-chunk guard, dedup tokens
+## 0.13.0 (2026-06-18) — chunked-mode parity & source-safety: scan-free planning, schema-drift, heavy-chunk guard
 
-A pilot run surfaced four chunked-mode gaps; this release closes them. Chunked
+A pilot run surfaced three chunked-mode gaps; this release closes them. Chunked
 exports — the default for large tables — now get scan-free range planning (no
 pre-chunk `COUNT(*)`), column-level schema-drift detection at parity with single
-mode, a `rivet check` warning when a chunk would hold one statement open too
-long, and a manifest dedup token so re-exported parts can be deduplicated
-downstream. **MINOR** — chunked `on_schema_drift: fail` now aborts runs that
+mode, and a `rivet check` warning when a chunk would hold one statement open too
+long. **MINOR** — chunked `on_schema_drift: fail` now aborts runs that
 previously sailed through (it never recorded a baseline before).
 
 ### Added
@@ -33,14 +32,6 @@ previously sailed through (it never recorded a baseline before).
   EXPLAIN `width`, SQL Server `dm_db_partition_stats` — so no extra round-trip;
   MySQL is skipped (no trustworthy scan-free estimate). Advisory only; never
   blocks a run.
-- **`feat(manifest)` — each manifest part carries its chunk key-range as a dedup
-  token (ADR-0012).** A part's `content_fingerprint` already identified its
-  bytes; parts now also record the `[chunk_start, chunk_end]` window they cover.
-  Because parts are append-only (a resume / re-run appends, never overwrites), a
-  consumer can group by range and tell a re-export (same range, new fingerprint →
-  newest wins) from a true duplicate (same range, same fingerprint → load once).
-  Additive and backwards-compatible — absent for snapshot / keyset parts and
-  pre-0.13 manifests, no `manifest_version` bump.
 
 ### Fixed
 

@@ -263,11 +263,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
                             summary,
                             Some(state),
                             rec,
-                            super::super::commit::PartKind::Chunk {
-                                chunk_index,
-                                start_key: start,
-                                end_key: end,
-                            },
+                            super::super::commit::PartKind::Chunk { chunk_index },
                         );
                     }
                     // chunk_task carries one file name; for a rotation-split

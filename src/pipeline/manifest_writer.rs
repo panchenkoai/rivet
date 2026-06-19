@@ -100,7 +100,6 @@ impl ManifestBuilder {
     /// `part_id` is the 1-based ordinal of the part within this run.
     /// `relative_path` is the destination-prefix-relative path (the same
     /// `remote_key` passed to `dest.write`).
-    #[allow(clippy::too_many_arguments)] // a manifest part is a wide value; the args mirror its fields
     pub fn record_part(
         &mut self,
         part_id: u32,
@@ -109,8 +108,6 @@ impl ManifestBuilder {
         size_bytes: u64,
         content_fingerprint: String,
         content_md5: String,
-        chunk_start: Option<i64>,
-        chunk_end: Option<i64>,
     ) {
         self.parts.push(ManifestPart {
             part_id,
@@ -119,8 +116,6 @@ impl ManifestBuilder {
             size_bytes,
             content_fingerprint,
             content_md5,
-            chunk_start,
-            chunk_end,
             status: PartStatus::Committed,
         });
     }
@@ -224,7 +219,6 @@ pub fn record_run_schema_fingerprint(
 /// Used by parallel-chunked aggregation, where workers compute fingerprints
 /// inside their thread (the local tmp file is dropped at thread exit) and
 /// the parent iterates over the shared `file_records` collection.
-#[allow(clippy::too_many_arguments)] // a manifest part is a wide value; the args mirror its fields
 pub fn record_committed_part_with_fingerprint(
     summary: &mut RunSummary,
     relative_path: String,
@@ -232,8 +226,6 @@ pub fn record_committed_part_with_fingerprint(
     size_bytes: u64,
     content_fingerprint: String,
     content_md5: String,
-    chunk_start: Option<i64>,
-    chunk_end: Option<i64>,
 ) {
     // ADR-0012 M4: part_id must be unique within the manifest.  Before the
     // M8 resume-hydration work, `summary.manifest_parts.len() + 1` was a
@@ -257,8 +249,6 @@ pub fn record_committed_part_with_fingerprint(
         size_bytes,
         content_fingerprint,
         content_md5,
-        chunk_start,
-        chunk_end,
         status: PartStatus::Committed,
     });
 }
@@ -381,8 +371,6 @@ mod tests {
             4096,
             "xxh3:aaaaaaaaaaaaaaaa".into(),
             String::new(),
-            None,
-            None,
         );
         b.record_part(
             2,
@@ -391,8 +379,6 @@ mod tests {
             2048,
             "xxh3:bbbbbbbbbbbbbbbb".into(),
             String::new(),
-            None,
-            None,
         );
 
         let m = b.finalize(ManifestStatus::Success);
@@ -536,8 +522,6 @@ mod tests {
             4096,
             "xxh3:1111111111111111".into(),
             String::new(),
-            None,
-            None,
         );
         b.record_part(
             2,
@@ -546,8 +530,6 @@ mod tests {
             8192,
             "xxh3:2222222222222222".into(),
             String::new(),
-            None,
-            None,
         );
         b.finalize(status)
     }

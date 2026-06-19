@@ -185,8 +185,6 @@ mod tests {
             size_bytes: size,
             content_fingerprint: format!("xxh3:{:016x}", part_id as u64),
             content_md5: String::new(),
-            chunk_start: None,
-            chunk_end: None,
             status: PartStatus::Committed,
         }
     }

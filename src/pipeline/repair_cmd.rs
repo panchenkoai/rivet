@@ -344,11 +344,6 @@ fn record_repair_parts_in_manifest(
             size_bytes: p.size_bytes,
             content_fingerprint: p.content_fingerprint.clone(),
             content_md5: p.content_md5.clone(),
-            // The repair re-export runs through run_chunked_sequential, so these
-            // parts already carry the chunk window (= the repair action's
-            // start/end key); preserve the dedup-token range (ADR-0012).
-            chunk_start: p.chunk_start,
-            chunk_end: p.chunk_end,
             status: PartStatus::Committed,
         });
         next_id += 1;

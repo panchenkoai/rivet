@@ -180,20 +180,6 @@ pub struct ManifestPart {
     /// size-only.  `#[serde(default)]` keeps pre-0.7.x manifests parseable.
     #[serde(default)]
     pub content_md5: String,
-    /// Chunk key-range this part covers — the `[chunk_start, chunk_end]` window
-    /// of the chunk query that produced it, as the raw `i64` bounds the runner
-    /// used (integer key range, dense `ROW_NUMBER` ordinals, or days-since-epoch
-    /// for `chunk_by_days`).  `None` for snapshot / incremental / keyset parts,
-    /// which have no chunk window.  Together with `content_fingerprint` this is
-    /// the **dedup token** (ADR-0012): a consumer can group parts by range and
-    /// tell a re-export (same range, new content) from a true duplicate (same
-    /// range, same fingerprint).  `#[serde(default)]` keeps pre-0.13 manifests
-    /// parseable; `skip_serializing_if` keeps snapshot / keyset manifests
-    /// byte-identical to before (no `null` noise where there is no range).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chunk_start: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chunk_end: Option<i64>,
     pub status: PartStatus,
 }
 
@@ -309,8 +295,6 @@ mod tests {
             size_bytes: size,
             content_fingerprint: format!("xxh3:{:016x}", id as u64),
             content_md5: String::new(),
-            chunk_start: None,
-            chunk_end: None,
             status: PartStatus::Committed,
         }
     }
