@@ -1,5 +1,125 @@
 # Changelog
 
+## 0.13.0 (2026-06-19) — chunked-mode parity, source-safety & source-harm observability
+
+A pilot run surfaced three chunked-mode gaps; this release closes them. Chunked
+exports — the default for large tables — now get scan-free range planning (no
+pre-chunk `COUNT(*)`), column-level schema-drift detection at parity with single
+mode, and a `rivet check` warning when a chunk would hold one statement open too
+long. **MINOR** — chunked `on_schema_drift: fail` now aborts runs that
+previously sailed through (it never recorded a baseline before).
+
+It also lands the first slice of **source-harm observability**: the same pilot
+had no way to quantify what an export actually *cost* its source. Every run now
+persists an extended `export_metrics` row plus a per-counter `export_harm` delta
+to `.rivet_state.db` — SQL-queryable for analysis, not (yet) surfaced in
+`rivet metrics` — and `rivet doctor` flags when a SQL Server login can't read the
+harm counters.
+
+### Added
+
+- **`feat(chunked)` — chunked exports now get column-level schema-drift
+  detection, at parity with single mode (ADR-0021).** Previously
+  `detect_schema_change` / `store_schema` ran only in single mode, so chunked
+  exports (the default for large tables) never recorded a schema snapshot —
+  `rivet state` showed nothing and drift went unnoticed across re-runs. Drift is
+  now checked **pre-chunk**, from a scan-free `type_mappings` schema, so
+  `on_schema_drift: fail` aborts **before any chunk is written** (single detects
+  post-write; chunks have already written by then, so a post-hoc check could not
+  prevent the bad output). All four chunked execution modes (sequential /
+  parallel, checkpoint / non-checkpoint) share one helper with single mode.
+  Cross-mode caveat (a single→chunked baseline can log a one-time, self-healing
+  drift) is documented in ADR-0021.
+- **`feat(check)` — `rivet check` warns when `chunk_size` would make one chunk
+  query scan too much.** The source-harm lever the 0.12 A/B measured is how long
+  a single chunk statement holds its snapshot / locks (SQL Server's longest
+  request fell 1839 ms → 276 ms once chunks shrank). `check` now projects
+  bytes-per-chunk (`rows_per_chunk × avg_row_bytes`) and, above ~256 MB, advises
+  a smaller `chunk_size`. Row width comes free from stats already read — PG
+  EXPLAIN `width`, SQL Server `dm_db_partition_stats` — so no extra round-trip;
+  MySQL is skipped (no trustworthy scan-free estimate). Advisory only; never
+  blocks a run.
+- **`feat(metrics)` — every run persists an extended `export_metrics` row for
+  post-hoc analysis.** Alongside the original 16 columns, the table now records
+  15 more per-run signals: completeness (`files_committed`, `reconciled`,
+  `source_count`, `quality_passed`), source cost (`pg_temp_bytes_delta`, and
+  `longest_chunk_ms` — how long the single longest chunk held its snapshot /
+  locks, the #5 source-harm lever the 0.12 A/B measured), effective tuning
+  (`batch_size`, `batch_size_memory_mb`, `chunk_size`, `parallel`,
+  `skip_reason`), and run identity (`schema_fingerprint`, `source_type`,
+  `destination_type`, `rivet_version`). Written on the `run` and `apply` paths
+  and queryable via SQL; `rivet metrics` still prints the core row — these
+  columns are for analysis, not the summary card.
+- **`feat(metrics)` — per-run source-harm deltas in a new `export_harm` table.**
+  Each run brackets the source with an engine-specific counter snapshot and
+  stores the delta per counter: PostgreSQL `pg_stat_database` (`pg_tup_returned`
+  read-amplification, `pg_blks_read`/`hit`, `pg_temp_files`, `pg_deadlocks`),
+  MySQL `SHOW GLOBAL STATUS` (`Innodb_rows_read`, row-lock waits, tmp-disk
+  tables, …), SQL Server `sys.dm_os_wait_stats` (`LCK%` wait count + wait-ms).
+  Best-effort observability — a failed or unavailable probe is logged and
+  ignored, never affecting the run verdict. Captured on the `run` path; `apply`
+  persists the metric row but skips the harm + `temp_bytes` probes.
+- **`feat(doctor)` — `rivet doctor` advises when a SQL Server login lacks
+  `VIEW SERVER STATE`.** The harm probe reads `sys.dm_os_wait_stats`, which needs
+  that permission; doctor now prints a `[note]` (never a `[FAIL]`) with the exact
+  `GRANT VIEW SERVER STATE` to run if the operator wants lock-wait metrics —
+  data extraction is unaffected either way.
+
+### Fixed
+
+- **`perf(chunked)` — chunked range planning no longer runs a full `COUNT(*)` on
+  the source before the first chunk.** That count fed *only* the sparsity
+  diagnostic log — the chunk boundaries come from `min`/`max`, never the count —
+  yet on a 484M-row table it meant **~12 minutes of silence** before any chunk,
+  and a full scan on a large production table is exactly the source-harm rivet
+  exists to avoid (in the hot path, contradicting the source-safety promise). The
+  diagnostic now reads a **scan-free row estimate** for the `table:` shortcut on
+  engines with a trustworthy cheap count — PostgreSQL `reltuples` and SQL Server
+  `dm_db_partition_stats`. MySQL has none (its `TABLE_ROWS` / `EXPLAIN` figure is
+  a ±30-50% random-dive estimate), so the density line is skipped there, as it is
+  for any curated query — boundaries are still logged, just without a scan.
+  `chunk_dense` is unchanged (its `COUNT(*)` sizes the ordinal chunks). No output
+  or boundary change — only the pre-chunk source footprint.
+
+### Changed
+
+- **`feat(init)` — `rivet init` now hints at incremental when it auto-picks
+  `chunked` for a re-runnable table.** When a large table gets `mode: chunked`
+  but *also* has a cursor column (`updated_at`/`created_at`), the generated YAML
+  comment points at `mode: incremental` for scheduled re-runs — chunked re-reads
+  the whole table every run (a pilot re-dumped a 655k-row table 4× in two days,
+  re-reading ~570k unchanged rows each time). Advisory comment only; the selected
+  mode is unchanged.
+- **`feat(ux)` — the run summary nudges verification.** A successful run that
+  wrote files but ran neither `--validate` nor `--reconcile` now shows an
+  advisory `verify: not run — …` line, so skipping completeness checks is a
+  deliberate choice rather than an oversight (a pilot loaded hundreds of millions
+  of rows across five runs with zero verified). Advisory only.
+
+### Internal
+
+- **`refactor` — architecture deepening over the modules the pilot fixes
+  touched (no behaviour change).** Schema-drift became the third runner-write
+  facade (`pipeline::schema_drift`: two column-source adapters over one
+  detect→policy→store core), and the four chunked Detect arms now share one
+  `prepare_chunk_plan` preamble instead of each hand-wiring detect + drift-check
+  (ADR-0018 / ADR-0021 updated). The two DB-scalar parsers were unified into a
+  `crate::scalar` leaf (the inbound mirror of `crate::sql`), and
+  `RunSummary::render` became an ordered manifest of per-row providers — both
+  gaining direct unit tests they previously lacked.
+- **`refactor(preflight, chunked)` — further deepening over the metrics-touched
+  modules (no behaviour change).** `collect_warnings` became a declarative
+  manifest (C1), the four chunked Detect arms dedup their plan-build and own the
+  detect connection (C3/C4), and the mode-string + base-query were hoisted out of
+  the per-engine `diagnose_*` paths (C2). A speculative chunk-range dedup token
+  was reverted before shipping — no consumer (#6).
+- **`test` — metrics-persistence coverage.** New unit tests pin the
+  summary→`MetricRow` builder and the harm-delta math (floor + name
+  intersection); live tests prove the extended columns and per-engine
+  `export_harm` rows actually land in a freshly-migrated state DB on
+  PostgreSQL / MySQL / SQL Server, plus the `apply`-path metric row and the
+  doctor `VIEW SERVER STATE` note (restricted login + sysadmin control).
+
 ## 0.12.0 (2026-06-14) — memory-driven default batch sizing: MySQL ~7.5×, SQL Server ~6× faster on narrow tables
 
 Sizes the extraction batch to a memory target instead of a static row count, so

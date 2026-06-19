@@ -12,8 +12,7 @@ use super::chunked::{run_chunked_sequential, run_chunked_sequential_checkpoint};
 use super::retry::{RetryClass, classify_error};
 use super::sink::{CompletedPart, ExportSink};
 use super::validate::validate_output;
-use crate::config::SchemaDriftPolicy;
-use crate::error::{DataIntegrityError, Result, SchemaDriftError};
+use crate::error::{DataIntegrityError, Result};
 use crate::journal::RunEvent;
 use crate::plan::{ExtractionStrategy, ResolvedRunPlan};
 use crate::source::{self, Source};
@@ -415,82 +414,16 @@ pub(super) fn run_single_export(
     }
 
     if let (Some(schema), Some(st)) = (&sink.dest_schema, state) {
-        let columns = crate::state::arrow_schema_to_columns(schema);
-
-        match st.detect_schema_change(&plan.export_name, &columns) {
-            Ok(Some(change)) => {
-                summary.schema_changed = Some(true);
-                summary.journal.record(RunEvent::SchemaChanged {
-                    added: change.added.clone(),
-                    removed: change.removed.clone(),
-                    type_changed: change.type_changed.clone(),
-                });
-
-                match plan.schema_drift_policy {
-                    SchemaDriftPolicy::Continue => {
-                        if let Err(e) = st.store_schema(&plan.export_name, &columns) {
-                            log::warn!(
-                                "export '{}': schema store update failed: {:#}",
-                                plan.export_name,
-                                e
-                            );
-                        }
-                    }
-                    SchemaDriftPolicy::Warn => {
-                        log::warn!("export '{}': schema changed!", plan.export_name);
-                        if !change.added.is_empty() {
-                            log::warn!("  added: {}", change.added.join(", "));
-                        }
-                        if !change.removed.is_empty() {
-                            log::warn!("  removed: {}", change.removed.join(", "));
-                        }
-                        for (col, old, new) in &change.type_changed {
-                            log::warn!("  type changed: {} ({} → {})", col, old, new);
-                        }
-                        if let Err(e) = st.store_schema(&plan.export_name, &columns) {
-                            log::warn!(
-                                "export '{}': schema store update failed: {:#}",
-                                plan.export_name,
-                                e
-                            );
-                        }
-                    }
-                    SchemaDriftPolicy::Fail => {
-                        log::error!(
-                            "export '{}': schema drift detected — aborting (on_schema_drift: fail)",
-                            plan.export_name
-                        );
-                        if !change.added.is_empty() {
-                            log::error!("  added: {}", change.added.join(", "));
-                        }
-                        if !change.removed.is_empty() {
-                            log::error!("  removed: {}", change.removed.join(", "));
-                        }
-                        for (col, old, new) in &change.type_changed {
-                            log::error!("  type changed: {} ({} → {})", col, old, new);
-                        }
-                        // Schema-drift stop (exit 4): the source shape changed
-                        // and `on_schema_drift: fail` is set. Typed marker so a
-                        // scheduler routes to human review, not a blind retry.
-                        // Message verbatim.
-                        return Err(SchemaDriftError::new(format!(
-                            "schema drift detected for export '{}': \
-                             {} column(s) added, {} removed, {} retyped — \
-                             set `on_schema_drift: warn` to accept, or fix the schema mismatch",
-                            plan.export_name,
-                            change.added.len(),
-                            change.removed.len(),
-                            change.type_changed.len()
-                        ))
-                        .into());
-                    }
-                }
-            }
-            Ok(None) => {
-                summary.schema_changed = Some(false);
-            }
-            Err(e) => log::warn!("schema tracking error: {:#}", e),
-        }
+        // Single mode: drift from the sink's resolved (data-derived) schema,
+        // post-write. Chunked runs the same facade pre-chunk via
+        // `check_from_type_mappings` (ADR-0021).
+        super::schema_drift::check_from_sink_schema(
+            st,
+            &plan.export_name,
+            schema,
+            plan.schema_drift_policy,
+            summary,
+        )?;
     }
 
     // Epic 8: data shape drift — warn when string/binary columns grow beyond threshold.

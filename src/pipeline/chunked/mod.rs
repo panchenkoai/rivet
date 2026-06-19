@@ -98,6 +98,56 @@ use crate::error::Result;
 use crate::plan::{ChunkedPlan, ExtractionStrategy, ResolvedRunPlan};
 use crate::state::StateStore;
 
+/// The shared `Detect`-path preamble for all four chunked runners: compute the
+/// chunk ranges, then run the pre-chunk schema-drift check (ADR-0021) once,
+/// before any chunk executes — so `on_schema_drift: fail` aborts before a single
+/// chunk is written. The runners' durability-divergent *execution*
+/// (ADR-0010/0017) stays per-runner; only this identical preamble is shared, the
+/// way `commit::record_part` shares the per-part tail (ADR-0018).
+///
+/// `Precomputed`/resume chunk sources never call this — drift was evaluated on
+/// the original planning run that produced the ranges. Drift runs only when the
+/// runner is stateful (`state.is_some()`).
+pub(super) fn prepare_chunk_plan(
+    src: &mut dyn crate::source::Source,
+    plan: &ResolvedRunPlan,
+    state: Option<&StateStore>,
+    summary: &mut RunSummary,
+) -> Result<Vec<(i64, i64)>> {
+    let cp = chunked_plan(plan);
+    let ranges = detect_and_generate_chunks(
+        src,
+        &plan.base_query,
+        &cp.column,
+        cp.chunk_size,
+        cp.chunk_count,
+        &plan.export_name,
+        cp.dense,
+        cp.by_days,
+        plan.source.source_type,
+    )?;
+    if let Some(st) = state {
+        super::schema_drift::check_from_type_mappings(src, st, plan, summary)?;
+    }
+    Ok(ranges)
+}
+
+/// Like [`prepare_chunk_plan`], but for the parallel runners that don't already
+/// hold a `Source`: open a short-lived connection, compute the plan, and drop
+/// the connection here — **before** the workers open theirs. The detect
+/// connection must not outlive this call; folding the create → plan → drop dance
+/// into one helper keeps that `drop` structural rather than a hand-placed
+/// statement the two parallel Detect arms must each remember.
+pub(super) fn prepare_chunk_plan_fresh(
+    plan: &ResolvedRunPlan,
+    state: &StateStore,
+    summary: &mut RunSummary,
+) -> Result<Vec<(i64, i64)>> {
+    let mut src = crate::source::create_source(&plan.source)?;
+    prepare_chunk_plan(&mut *src, plan, Some(state), summary)
+    // `src` drops here, closing the detect connection before workers open theirs.
+}
+
 /// Extract the `ChunkedPlan` from a `ResolvedRunPlan`. Panics if the strategy
 /// is not `Chunked` — all callers in this module only run for chunked plans.
 pub(super) fn chunked_plan(plan: &ResolvedRunPlan) -> &ChunkedPlan {

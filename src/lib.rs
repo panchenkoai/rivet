@@ -70,4 +70,5 @@ pub(crate) mod test_hook;
 // Same "no external API contract" disclaimer as the other lib modules.
 pub mod preflight;
 pub(crate) mod quality;
+pub(crate) mod scalar;
 pub(crate) mod sql;

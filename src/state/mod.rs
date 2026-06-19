@@ -21,6 +21,7 @@ pub use checkpoint::ChunkTaskInfo;
 pub use file_log::FileRecord;
 #[allow(unused_imports)]
 pub use metrics::ExportMetric;
+pub use metrics::MetricRow;
 #[allow(unused_imports)]
 pub use progression::{Boundary, ExportProgression};
 #[allow(unused_imports)]
@@ -187,6 +188,51 @@ const MIGRATIONS: &[(i64, &str)] = &[
         DROP INDEX IF EXISTS idx_file_manifest_export;
         CREATE INDEX IF NOT EXISTS idx_file_log_export ON file_log(export_name, id DESC);",
     ),
+    // v9: extended per-run metrics for post-pilot analysis — source harm
+    // (pg_temp_bytes_delta), completeness (reconciled, source_count,
+    // quality_passed), memory (batch_size[_memory_mb]), and config dimensions
+    // (chunk_size, parallel, source/destination type, rivet_version). All
+    // additive + nullable: old rows read NULL, no backfill, reads stay forward-
+    // compatible.
+    (
+        9,
+        "ALTER TABLE export_metrics ADD COLUMN files_committed INTEGER;
+        ALTER TABLE export_metrics ADD COLUMN reconciled INTEGER;
+        ALTER TABLE export_metrics ADD COLUMN source_count INTEGER;
+        ALTER TABLE export_metrics ADD COLUMN quality_passed INTEGER;
+        ALTER TABLE export_metrics ADD COLUMN pg_temp_bytes_delta INTEGER;
+        ALTER TABLE export_metrics ADD COLUMN batch_size INTEGER;
+        ALTER TABLE export_metrics ADD COLUMN batch_size_memory_mb INTEGER;
+        ALTER TABLE export_metrics ADD COLUMN skip_reason TEXT;
+        ALTER TABLE export_metrics ADD COLUMN schema_fingerprint TEXT;
+        ALTER TABLE export_metrics ADD COLUMN chunk_size INTEGER;
+        ALTER TABLE export_metrics ADD COLUMN parallel INTEGER;
+        ALTER TABLE export_metrics ADD COLUMN source_type TEXT;
+        ALTER TABLE export_metrics ADD COLUMN destination_type TEXT;
+        ALTER TABLE export_metrics ADD COLUMN rivet_version TEXT;",
+    ),
+    // v10: longest single-chunk wall time (ms) — the #5 source-harm lever,
+    // aggregated at finalize from the run journal's per-chunk timings.
+    (
+        10,
+        "ALTER TABLE export_metrics ADD COLUMN longest_chunk_ms INTEGER;",
+    ),
+    // v11: per-run source-harm deltas (locks, rows read, buffer misses, temp
+    // files) — one row per counter, keyed on run_id. Engine-neutral key/value so
+    // each engine's counter set lands without schema churn. Written from
+    // pipeline::job::harm_snapshot via source::{postgres,mysql,mssql}.
+    (
+        11,
+        "CREATE TABLE IF NOT EXISTS export_harm (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            export_name TEXT NOT NULL,
+            metric TEXT NOT NULL,
+            delta INTEGER NOT NULL,
+            recorded_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_export_harm_run ON export_harm(run_id);",
+    ),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -333,6 +379,43 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
         "ALTER TABLE file_manifest RENAME TO file_log;
         DROP INDEX IF EXISTS idx_file_manifest_export;
         CREATE INDEX IF NOT EXISTS idx_file_log_export ON file_log(export_name, id DESC);",
+    ),
+    // v9: extended per-run metrics (see the SQLite array for rationale).
+    // Additive + nullable; BOOLEAN for the bool flags, BIGINT for counts.
+    (
+        9,
+        "ALTER TABLE export_metrics ADD COLUMN files_committed BIGINT;
+        ALTER TABLE export_metrics ADD COLUMN reconciled BOOLEAN;
+        ALTER TABLE export_metrics ADD COLUMN source_count BIGINT;
+        ALTER TABLE export_metrics ADD COLUMN quality_passed BOOLEAN;
+        ALTER TABLE export_metrics ADD COLUMN pg_temp_bytes_delta BIGINT;
+        ALTER TABLE export_metrics ADD COLUMN batch_size BIGINT;
+        ALTER TABLE export_metrics ADD COLUMN batch_size_memory_mb BIGINT;
+        ALTER TABLE export_metrics ADD COLUMN skip_reason TEXT;
+        ALTER TABLE export_metrics ADD COLUMN schema_fingerprint TEXT;
+        ALTER TABLE export_metrics ADD COLUMN chunk_size BIGINT;
+        ALTER TABLE export_metrics ADD COLUMN parallel BIGINT;
+        ALTER TABLE export_metrics ADD COLUMN source_type TEXT;
+        ALTER TABLE export_metrics ADD COLUMN destination_type TEXT;
+        ALTER TABLE export_metrics ADD COLUMN rivet_version TEXT;",
+    ),
+    // v10: longest single-chunk wall time (ms). See the SQLite array.
+    (
+        10,
+        "ALTER TABLE export_metrics ADD COLUMN longest_chunk_ms BIGINT;",
+    ),
+    // v11: per-run source-harm deltas (see the SQLite array for rationale).
+    (
+        11,
+        "CREATE TABLE IF NOT EXISTS export_harm (
+            id BIGSERIAL PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            export_name TEXT NOT NULL,
+            metric TEXT NOT NULL,
+            delta BIGINT NOT NULL,
+            recorded_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_export_harm_run ON export_harm(run_id);",
     ),
 ];
 

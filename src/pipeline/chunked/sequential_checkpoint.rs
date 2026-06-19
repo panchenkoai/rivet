@@ -19,10 +19,7 @@ use super::super::{
     retry::{RetryClass, classify_error},
     sink::ExportSink,
 };
-use super::{
-    ChunkSource, chunked_plan, config_hint, detect_and_generate_chunks,
-    ensure_chunk_checkpoint_plan,
-};
+use super::{ChunkSource, chunked_plan, config_hint, ensure_chunk_checkpoint_plan};
 use crate::error::Result;
 use crate::journal::RunEvent;
 use crate::plan::{ChunkedPlan, ResolvedRunPlan};
@@ -183,17 +180,8 @@ pub(crate) fn run_chunked_sequential_checkpoint(
         vec![]
     } else {
         match chunk_source {
-            ChunkSource::Detect => detect_and_generate_chunks(
-                src,
-                &plan.base_query,
-                &cp.column,
-                cp.chunk_size,
-                cp.chunk_count,
-                &plan.export_name,
-                cp.dense,
-                cp.by_days,
-                plan.source.source_type,
-            )?,
+            // Detect: compute ranges + run the pre-chunk drift check (ADR-0021).
+            ChunkSource::Detect => super::prepare_chunk_plan(src, plan, Some(state), summary)?,
             ChunkSource::Precomputed(ranges) => ranges,
         }
     };

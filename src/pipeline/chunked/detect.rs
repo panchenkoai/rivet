@@ -3,8 +3,9 @@
 //! Queries min/max (and optionally COUNT) from the source to compute chunk ranges,
 //! logs sparsity diagnostics, and returns the final `Vec<(i64, i64)>` chunk list.
 
-use super::math::{generate_chunks, parse_date_flexible, parse_scalar_i64, strip_select_star_from};
+use super::math::{generate_chunks, strip_select_star_from};
 use crate::error::Result;
+use crate::scalar::{parse_date_flexible, parse_scalar_i64};
 use crate::source::Source;
 
 /// `SELECT COUNT(*) FROM (<base>) AS _rivet_rowcnt`, with a fast path when
@@ -102,6 +103,10 @@ fn log_chunk_boundaries_list(export_name: &str, chunks: &[(i64, i64)]) {
     }
 }
 
+/// Sparsity diagnostic computed from a scan-free row **estimate** (catalog stats,
+/// never `COUNT(*)`). The caller only invokes this with a positive estimate; a
+/// missing / zero / unparseable estimate logs boundaries-only instead, so there
+/// is no `row == 0` branch here.
 fn log_chunk_sparsity_at_run(
     export_name: &str,
     chunk_column: &str,
@@ -109,29 +114,16 @@ fn log_chunk_sparsity_at_run(
     min_val: i64,
     max_val: i64,
     chunks: &[(i64, i64)],
-    row_count: i64,
+    row_estimate: i64,
 ) {
-    if row_count == 0 {
-        log::info!(
-            "export '{}': COUNT(*) = 0 — no rows in export query; {} BETWEEN window(s) from `{}` min..max (runs will skip empty chunks)",
-            export_name,
-            chunks.len(),
-            chunk_column
-        );
-        if !chunks.is_empty() && chunks.len() <= 24 {
-            log_chunk_boundaries_list(export_name, chunks);
-        }
-        return;
-    }
-
     let info =
-        crate::preflight::chunk_sparsity_from_counts(row_count, min_val, max_val, chunk_size);
+        crate::preflight::chunk_sparsity_from_counts(row_estimate, min_val, max_val, chunk_size);
     if info.is_sparse {
         let fill_pct = info.density * 100.0;
         let empty_hint = (1.0 - info.density).clamp(0.0, 1.0) * 100.0;
         log::info!(
             "export '{}': sparse `{}` range — ~{:.2}% of the min..max ID band contains rows (~{:.1}% of logical windows likely empty). \
-             rows={}, span≈{}, chunk_size={}, ~{} logical windows, {} BETWEEN chunks. Computed boundaries:",
+             rows≈{} (est), span≈{}, chunk_size={}, ~{} logical windows, {} BETWEEN chunks. Computed boundaries:",
             export_name,
             chunk_column,
             fill_pct,
@@ -145,7 +137,7 @@ fn log_chunk_sparsity_at_run(
         log_chunk_boundaries_list(export_name, chunks);
     } else {
         log::info!(
-            "export '{}': `{}` range looks dense enough for BETWEEN chunking (rows={}, span≈{}, density≈{:.6}, {} chunks); continuing",
+            "export '{}': `{}` range looks dense enough for BETWEEN chunking (rows≈{} est, span≈{}, density≈{:.6}, {} chunks); continuing",
             export_name,
             chunk_column,
             info.row_count,
@@ -281,32 +273,44 @@ pub(crate) fn detect_and_generate_chunks(
 
     let chunks = generate_chunks(min_val, max_val, effective_chunk_size as i64);
 
-    match query_wrapped_row_count(src, base_query) {
-        Ok(row_count) => {
-            log_chunk_sparsity_at_run(
+    // Sparsity diagnostic from a SCAN-FREE row estimate (catalog stats), never a
+    // full COUNT(*): a full count on a large production table is exactly the
+    // source-harm rivet exists to avoid (it once cost ~12 min of silence before
+    // the first chunk on a 484M-row table), and this heuristic only needs an
+    // order-of-magnitude figure. Available for the `table:` shortcut on engines
+    // with a trustworthy cheap count (PG/MSSQL); MySQL has none (TABLE_ROWS is a
+    // ±30-50% random-dive estimate → `row_estimate_sql` returns None) and a
+    // curated query has no catalog row — both log boundaries without density
+    // rather than scan. The boundaries come from min/max above; the estimate
+    // never feeds them.
+    let row_estimate = strip_select_star_from(base_query)
+        .and_then(|table_ident| crate::sql::row_estimate_sql(source_type, table_ident))
+        .and_then(|sql| {
+            src.query_scalar(&sql)
+                .ok()
+                .flatten()
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .filter(|&n| n > 0)
+        });
+    match row_estimate {
+        Some(est) => log_chunk_sparsity_at_run(
+            export_name,
+            chunk_column,
+            chunk_size,
+            min_val,
+            max_val,
+            &chunks,
+            est,
+        ),
+        None => {
+            log::info!(
+                "export '{}': {} BETWEEN window(s) from `{}` min..max (no scan-free row estimate available — sparsity check skipped, no COUNT(*))",
                 export_name,
+                chunks.len(),
                 chunk_column,
-                chunk_size,
-                min_val,
-                max_val,
-                &chunks,
-                row_count,
-            );
-        }
-        Err(e) => {
-            log::warn!(
-                "export '{}': could not run COUNT(*) for sparsity diagnostics: {:#}; proceeding with {} windows from min/max only",
-                export_name,
-                e,
-                chunks.len()
             );
             if chunks.len() <= 24 {
                 log_chunk_boundaries_list(export_name, &chunks);
-            } else {
-                log::info!(
-                    "export '{}': use `RUST_LOG=info rivet run` after fixing COUNT if you need the full boundary list",
-                    export_name
-                );
             }
         }
     }
@@ -394,7 +398,7 @@ mod tests {
     ) -> Result<Vec<(i64, i64)>> {
         detect_and_generate_chunks(
             src,
-            "SELECT id FROM orders",
+            "SELECT * FROM orders",
             "id",
             chunk_size,
             None,
@@ -409,7 +413,7 @@ mod tests {
 
     #[test]
     fn integer_range_basic_chunks_computed_correctly() {
-        // min=1, max=1000, COUNT=500 → 10 chunks of size 100
+        // min=1, max=1000, est=500 (sparsity diagnostic only) → 10 chunks of size 100
         let mut src = ScriptedSource::new([ok("1"), ok("1000"), ok("500")]);
         let chunks = detect(&mut src, 100, false, None).unwrap();
         assert_eq!(chunks.len(), 10);
@@ -427,7 +431,7 @@ mod tests {
 
     #[test]
     fn integer_range_count_failure_still_returns_chunks() {
-        // COUNT returns unparseable string → logged as warning; chunks from min/max returned
+        // estimate returns unparseable → density skipped; chunks still come from min/max
         let mut src = ScriptedSource::new([ok("1"), ok("100"), ok("not-a-number")]);
         let chunks = detect(&mut src, 50, false, None).unwrap();
         assert_eq!(chunks, vec![(1, 50), (51, 100)]);
@@ -555,7 +559,7 @@ mod tests {
     ) -> Result<Vec<(i64, i64)>> {
         detect_and_generate_chunks(
             src,
-            "SELECT id FROM orders",
+            "SELECT * FROM orders",
             "id",
             100_000, // chunk_size ignored when chunk_count is Some
             Some(chunk_count),
@@ -568,7 +572,7 @@ mod tests {
 
     #[test]
     fn chunk_count_divides_range_into_exact_n_chunks() {
-        // min=1, max=1000, COUNT=500 → requested 10 chunks of size 100 each
+        // min=1, max=1000, est=500 (diagnostic only) → requested 10 chunks of size 100 each
         let mut src = ScriptedSource::new([ok("1"), ok("1000"), ok("500")]);
         let chunks = detect_with_count(&mut src, 10).unwrap();
         assert_eq!(chunks.len(), 10, "expected 10 chunks: {chunks:?}");
@@ -620,9 +624,10 @@ mod tests {
     }
 
     #[test]
-    fn fast_path_select_star_emits_min_max_count_without_subquery_wrap() {
+    fn fast_path_select_star_emits_min_max_estimate_without_subquery_wrap() {
         // base = simple SELECT * FROM public.users → no `FROM (...) AS _rivet`
-        // anywhere. PG can satisfy these as index-only scans, no temp_files.
+        // anywhere. PG can satisfy min/max as index-only scans, no temp_files,
+        // and the row-count is a scan-free `reltuples` estimate, not COUNT(*).
         let mut src = ScriptedSource::new([ok("1"), ok("1000"), ok("500")]);
         let _ = detect_with_base(&mut src, "SELECT * FROM public.users", false, None).unwrap();
         for sql in &src.seen_sql {
@@ -631,19 +636,86 @@ mod tests {
                 "fast path must not wrap; got: {sql}"
             );
         }
-        // min/max are explicit, COUNT is plain.
         assert!(src.seen_sql.iter().any(|s| s.starts_with("SELECT min(")));
         assert!(src.seen_sql.iter().any(|s| s.starts_with("SELECT max(")));
+        // Row count for sparsity is a catalog ESTIMATE, never a full COUNT(*) scan.
         assert!(
             src.seen_sql
                 .iter()
-                .any(|s| s.starts_with("SELECT COUNT(*) FROM public.users"))
+                .any(|s| s.contains("reltuples") && s.contains("pg_class")),
+            "range path must use a scan-free estimate; saw: {:?}",
+            src.seen_sql
+        );
+        assert!(
+            !src.seen_sql
+                .iter()
+                .any(|s| s.contains("SELECT COUNT(*) FROM")),
+            "range path must NOT issue a full COUNT(*) scan; saw: {:?}",
+            src.seen_sql
         );
     }
 
     #[test]
-    fn fallback_keeps_subquery_wrap_for_curated_query() {
-        // Anything that isn't `SELECT * FROM <ident>` → original wrap.
+    fn range_path_uses_scanfree_estimate_never_full_count() {
+        // Regression guard for the source-harm bug: a `table:` range chunk must
+        // size sparsity from a catalog estimate, never a full COUNT(*) scan (which
+        // cost ~12 min of silence before the first chunk on a 484M-row table).
+        let mut src = ScriptedSource::new([ok("1"), ok("1000000"), ok("950000")]);
+        let _ = detect_with_base(&mut src, "SELECT * FROM warranty", false, None).unwrap();
+        assert!(
+            src.seen_sql.iter().any(|s| s.contains("reltuples")
+                || s.contains("dm_db_partition_stats")
+                || s.contains("TABLE_ROWS")),
+            "expected a scan-free row estimate; saw: {:?}",
+            src.seen_sql
+        );
+        assert!(
+            !src.seen_sql
+                .iter()
+                .any(|s| s.contains("SELECT COUNT(*) FROM")),
+            "range path must never full-scan COUNT(*); saw: {:?}",
+            src.seen_sql
+        );
+    }
+
+    #[test]
+    fn mysql_range_path_skips_estimate_no_count_scan() {
+        // MySQL's only scan-free row count (TABLE_ROWS) is too unreliable for a
+        // density readout, so the range path issues NO row-count query at all —
+        // boundaries from min/max only, no scan.
+        let mut src = ScriptedSource::new([ok("1"), ok("1000000")]); // min, max only
+        let chunks = detect_and_generate_chunks(
+            &mut src,
+            "SELECT * FROM warranty",
+            "id",
+            100_000,
+            None,
+            "warranty",
+            false,
+            None,
+            SourceType::Mysql,
+        )
+        .unwrap();
+        assert!(!chunks.is_empty());
+        assert!(
+            !src.seen_sql
+                .iter()
+                .any(|s| s.contains("TABLE_ROWS") || s.contains("SELECT COUNT(*) FROM")),
+            "MySQL range path must issue no row-count/estimate query: {:?}",
+            src.seen_sql
+        );
+        assert!(
+            src.seen_sql.iter().any(|s| s.starts_with("SELECT min(")),
+            "min/max still issued: {:?}",
+            src.seen_sql
+        );
+    }
+
+    #[test]
+    fn fallback_curated_query_wraps_minmax_and_skips_count_scan() {
+        // A curated query (not `SELECT * FROM <ident>`) can't read catalog stats,
+        // so the sparsity diagnostic is skipped entirely — min/max still wrap, but
+        // NO row-count query (COUNT(*) or estimate) is issued: no scan.
         let mut src = ScriptedSource::new([ok("1"), ok("1000"), ok("500")]);
         let _ = detect_with_base(
             &mut src,
@@ -652,8 +724,18 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(src.seen_sql.iter().any(|s| s.contains("AS _rivet_rowcnt")));
-        assert!(src.seen_sql.iter().any(|s| s.contains("AS _rivet")));
+        assert!(
+            src.seen_sql.iter().any(|s| s.contains("AS _rivet")),
+            "min/max should still wrap for a curated query: {:?}",
+            src.seen_sql
+        );
+        assert!(
+            !src.seen_sql.iter().any(|s| s.contains("_rivet_rowcnt")
+                || s.contains("reltuples")
+                || s.contains("SELECT COUNT(*) FROM")),
+            "curated query must issue no row-count scan: {:?}",
+            src.seen_sql
+        );
     }
 
     #[test]

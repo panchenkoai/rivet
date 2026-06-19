@@ -93,6 +93,37 @@ fn mysql_sample_extraction_pressure(pool: &Pool) -> Option<u64> {
     Some(rows.iter().map(|(_, v)| *v).sum())
 }
 
+/// Snapshot the broader source-harm counters from `SHOW GLOBAL STATUS` — a
+/// superset of the governor's [`mysql_sample_extraction_pressure`]. Returns
+/// `(metric, cumulative_value)` pairs the pipeline deltas around the export and
+/// stores in `export_harm`. `SHOW GLOBAL STATUS` needs **no special privilege**.
+/// These are global counters, so concurrent load inflates the delta (accurate on
+/// a quiet pilot box). `Innodb_rows_read` is the read-amplification signal the
+/// 0.12 harm A/B keyed on. `None` on connect/query failure — never blocks the
+/// export.
+pub(crate) fn sample_harm_counters(
+    url: &str,
+    tls: Option<&TlsConfig>,
+) -> Option<Vec<(String, i64)>> {
+    let pool = connect_pool(url, tls).ok()?;
+    let mut conn = pool.get_conn().ok()?;
+    let rows: Vec<(String, i64)> = conn
+        .query(
+            "SHOW GLOBAL STATUS WHERE Variable_name IN \
+             ('Innodb_rows_read', 'Innodb_buffer_pool_reads', 'Created_tmp_disk_tables', \
+              'Handler_read_rnd_next', 'Innodb_row_lock_waits', 'Innodb_row_lock_time')",
+        )
+        .ok()?;
+    if rows.is_empty() {
+        return None;
+    }
+    Some(
+        rows.into_iter()
+            .map(|(k, v)| (format!("mysql_{}", k.to_lowercase()), v))
+            .collect(),
+    )
+}
+
 impl MysqlSource {
     /// Build a source from an existing pool: the single place that detects the
     /// proxy kind, warns once, and wraps the pool. The `connect*` entry points

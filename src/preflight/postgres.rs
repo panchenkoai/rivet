@@ -51,46 +51,9 @@ fn diagnose_pg(
     export: &ExportConfig,
     db_max_connections: Option<u32>,
 ) -> Result<ExportDiagnostic> {
-    let mode_str = match export.mode {
-        ExportMode::Full => "full".to_string(),
-        ExportMode::Incremental => format!(
-            "incremental (cursor: {})",
-            export.cursor_column.as_deref().unwrap_or("?")
-        ),
-        ExportMode::Chunked => format!(
-            "chunked (column: {}, size: {})",
-            export.chunk_column.as_deref().unwrap_or("?"),
-            export.chunk_size
-        ),
-        ExportMode::TimeWindow => format!(
-            "time_window (column: {}, days: {})",
-            export.time_column.as_deref().unwrap_or("?"),
-            export.days_window.unwrap_or(0)
-        ),
-    };
+    let mode_str = diagnose_mode_str(export);
 
-    // Resolve the same base query the runner will issue. For the `table:`
-    // shortcut (no `query:`) this is the canonical `SELECT * FROM <table>`
-    // (`ExportConfig::resolve_query`, which also validates/quotes the ident) —
-    // NOT a `SELECT 1` placeholder, or every probe below (row estimate, scan
-    // type, cursor range) would describe a 1-row dummy relation instead of the
-    // real table. config_dir/params are unused on the `table:`/inline branches;
-    // a query_file would already have been read at plan time, so fall back to
-    // the inline/placeholder text if resolution fails here (preflight is
-    // non-fatal — surface the cause at debug rather than abort the diagnostic).
-    let base_query: String = match export.resolve_query(std::path::Path::new(""), None) {
-        Ok(q) => q,
-        Err(e) => {
-            log::debug!(
-                "preflight: base-query resolution failed for export '{}': {e}",
-                export.name
-            );
-            export
-                .query
-                .clone()
-                .unwrap_or_else(|| "SELECT 1".to_string())
-        }
-    };
+    let base_query = resolve_preflight_base_query(export);
     let base_query = base_query.as_str();
 
     let range_col = export
@@ -107,7 +70,7 @@ fn diagnose_pg(
         base_query.to_string()
     };
 
-    let row_estimate = estimate_rows_pg(client, &effective_query)?;
+    let (row_estimate, avg_row_bytes) = estimate_rows_pg(client, &effective_query)?;
 
     let (range_min, range_max) = if export.mode == ExportMode::Incremental {
         if let Some(expr) = incremental_key_expr(export, SourceType::Postgres) {
@@ -180,6 +143,7 @@ fn diagnose_pg(
     let warnings = collect_warnings(
         export,
         row_estimate,
+        avg_row_bytes,
         range_min.as_deref(),
         range_max.as_deref(),
         db_max_connections,
@@ -192,6 +156,7 @@ fn diagnose_pg(
         mode: mode_str,
         cursor_column: export.cursor_column.clone(),
         row_estimate,
+        avg_row_bytes,
         cursor_min: range_min,
         cursor_max: range_max,
         scan_type,
@@ -204,7 +169,13 @@ fn diagnose_pg(
     })
 }
 
-fn estimate_rows_pg(client: &mut postgres::Client, query: &str) -> Result<Option<i64>> {
+/// Returns `(row_estimate, avg_row_bytes)` parsed from one EXPLAIN — the top
+/// node's `rows=` and `width=`, which describe the same projected output. One
+/// plan, both numbers, so no second round-trip for the row-width estimate.
+fn estimate_rows_pg(
+    client: &mut postgres::Client,
+    query: &str,
+) -> Result<(Option<i64>, Option<i64>)> {
     let explain = format!("EXPLAIN {}", query);
     let rows = match client.query(&explain, &[]) {
         Ok(r) => r,
@@ -219,12 +190,15 @@ fn estimate_rows_pg(client: &mut postgres::Client, query: &str) -> Result<Option
             // …) is operational and stays FAIL-SOFT: preflight is non-fatal, so
             // surface at debug (visible under `RUST_LOG=debug`) and continue.
             log::debug!("preflight: EXPLAIN for row-estimate failed: {e}");
-            return Ok(None);
+            return Ok((None, None));
         }
     };
     let lines: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
     let plan_text = lines.join("\n");
-    Ok(parse_pg_row_estimate(&plan_text))
+    Ok((
+        parse_pg_row_estimate(&plan_text),
+        parse_pg_row_width(&plan_text),
+    ))
 }
 
 /// Map a Postgres SQLSTATE *class 42* (syntax/access-rule violation) connect-time
@@ -250,6 +224,23 @@ pub(crate) fn parse_pg_row_estimate(plan: &str) -> Option<i64> {
     for line in plan.lines() {
         if let Some(idx) = line.find("rows=") {
             let after = &line[idx + 5..];
+            let num_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(n) = num_str.parse::<i64>() {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+/// Parse the estimated row `width=` (bytes) from an EXPLAIN plan — the first
+/// (top-node) occurrence, so it pairs with the first `rows=` that
+/// [`parse_pg_row_estimate`] reads. Both describe the same projected output
+/// row, so `rows × width` estimates the bytes a chunk query transfers.
+pub(crate) fn parse_pg_row_width(plan: &str) -> Option<i64> {
+    for line in plan.lines() {
+        if let Some(idx) = line.find("width=") {
+            let after = &line[idx + 6..];
             let num_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
             if let Ok(n) = num_str.parse::<i64>() {
                 return Some(n);
@@ -497,6 +488,28 @@ mod tests {
     #[test]
     fn parse_pg_row_estimate_empty_plan_returns_none() {
         assert!(parse_pg_row_estimate("").is_none());
+    }
+
+    // ── parse_pg_row_width ───────────────────────────────────────────────────
+
+    #[test]
+    fn parse_pg_row_width_typical_seq_scan() {
+        let plan = "Seq Scan on orders  (cost=0.00..1250.00 rows=5000 width=120)";
+        assert_eq!(parse_pg_row_width(plan), Some(120));
+    }
+
+    #[test]
+    fn parse_pg_row_width_top_node_wins() {
+        // Top node's width pairs with the top node's rows (parse_pg_row_estimate
+        // takes the first rows=, this takes the first width= — same node).
+        let plan = "Sort  (cost=0.00..50.00 rows=1000 width=64)\n  ->  Seq Scan on t  (cost=0.00..100.00 rows=1000 width=200)";
+        assert_eq!(parse_pg_row_width(plan), Some(64));
+    }
+
+    #[test]
+    fn parse_pg_row_width_absent_returns_none() {
+        assert!(parse_pg_row_width("Result  (cost=0.00..0.01 rows=1)").is_none());
+        assert!(parse_pg_row_width("").is_none());
     }
 
     // ── extract_scan_type ────────────────────────────────────────────────────

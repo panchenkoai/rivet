@@ -1,8 +1,14 @@
-//! SQL identifier quoting helpers.
+//! Dialect SQL string building — the outbound half of source interaction.
+//!
+//! Builds and recognises the small SQL strings rivet sends to a source:
+//! identifier quoting ([`quote_ident`]), the `SELECT * FROM <ident>` table-form
+//! recogniser ([`strip_select_star_from`]), aggregate probes ([`aggregate_sql`]),
+//! and scan-free row estimates ([`row_estimate_sql`]). Parsing the scalars read
+//! back lives in the inbound mirror, [`crate::scalar`].
 //!
 //! Column and table names that come from user configuration must never be
 //! interpolated raw into query strings — doing so opens a SQL injection vector
-//! even when `start`/`end` bounds are typed integers.  Use `quote_ident` for
+//! even when `start`/`end` bounds are typed integers.  Use [`quote_ident`] for
 //! every identifier that is not a literal written by the developer.
 
 use crate::config::SourceType;
@@ -26,45 +32,6 @@ pub(crate) fn quote_ident(source_type: SourceType, name: &str) -> String {
         // SQL Server bracket-quoting: `[col]`; internal `]` doubled (`[a]]b]`).
         SourceType::Mssql => format!("[{}]", name.replace(']', "]]")),
     }
-}
-
-/// Parse a `NaiveDate` out of a DB scalar (typically `min`/`max` of a
-/// date/timestamp column returned by `query_scalar`).
-///
-/// Single source of truth for both the chunked date-range path
-/// (`pipeline::chunked`) and value-based partitioning (`plan::partition`), which
-/// live in different layers and so must share this through the `sql` leaf rather
-/// than duplicate it.
-///
-/// Accepts, in order: `DATE` (`2023-01-01`), `DATETIME`
-/// (`2023-01-01 14:32:00`), ISO-8601 with `T` and optional fractional seconds,
-/// and finally a lenient leading-`YYYY-MM-DD` fallback that covers the
-/// PostgreSQL `timestamptz` text form (`2023-01-01 14:32:00.123456+00`).
-/// Returns `None` for an empty / unparseable value.
-pub(crate) fn parse_date_flexible(s: &str) -> Option<chrono::NaiveDate> {
-    use chrono::NaiveDate;
-    let s = s.trim();
-    NaiveDate::parse_from_str(s, "%Y-%m-%d")
-        .ok()
-        .or_else(|| {
-            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
-                .ok()
-                .map(|dt| dt.date())
-        })
-        .or_else(|| {
-            // ISO 8601 with T, optional fractional seconds / offset.
-            let base = s.split('.').next().unwrap_or(s);
-            let base = base.split('+').next().unwrap_or(base);
-            chrono::NaiveDateTime::parse_from_str(base, "%Y-%m-%dT%H:%M:%S")
-                .ok()
-                .map(|dt| dt.date())
-        })
-        .or_else(|| {
-            // Lenient fallback: any value whose first 10 chars are `YYYY-MM-DD`
-            // (space-separated fractional/offset timestamptz, etc.).
-            s.get(..10)
-                .and_then(|head| NaiveDate::parse_from_str(head, "%Y-%m-%d").ok())
-        })
 }
 
 /// If `base_query` is exactly `SELECT * FROM <ident>` (the `table:` YAML
@@ -140,6 +107,44 @@ pub(crate) fn aggregate_sql(
     }
 }
 
+/// Scan-free row **estimate** for the chunk-sparsity diagnostic — reads catalog /
+/// optimizer statistics, never a `COUNT(*)`. A full count on a large production
+/// table is exactly the source-harm rivet exists to avoid (we measured ~12 min of
+/// silent `COUNT(*)` before the first chunk on a 484M-row table), and the sparsity
+/// heuristic only needs an order-of-magnitude figure.
+///
+/// `None` means "no trustworthy scan-free count for this dialect" — the caller
+/// then logs boundaries without a density line rather than fall back to a scan.
+/// Defined only for the `table:` shortcut: `table_ident` is the clean, validated
+/// `[schema.]table` identifier from [`strip_select_star_from`] (ASCII
+/// alphanumeric/underscore, ≤1 dot), so it is safe to interpolate. The caller also
+/// treats a NULL / error / non-positive query result as "unknown" and skips.
+pub(crate) fn row_estimate_sql(source_type: SourceType, table_ident: &str) -> Option<String> {
+    match source_type {
+        // `reltuples` is the planner's live estimate (kept fresh by ANALYZE /
+        // autovacuum, usually within a few %); `-1` (never analysed) and any
+        // negative are clamped to 0 so the caller's `> 0` guard skips it.
+        SourceType::Postgres => Some(format!(
+            "SELECT GREATEST(reltuples, 0)::bigint FROM pg_class WHERE oid = '{table_ident}'::regclass"
+        )),
+        // MySQL has NO reliable scan-free row count. `information_schema.TABLE_ROWS`
+        // — and the optimizer's `EXPLAIN` estimate, which shares the same InnoDB
+        // random-index-dive statistics — routinely err by 30-50%+ and read 0 on a
+        // freshly-loaded table. Rather than drive a precise-looking density % off
+        // an untrustworthy figure, skip the sparsity diagnostic on MySQL entirely;
+        // the chunk boundaries come from min/max regardless. (An exact count would
+        // need a full `COUNT(*)` scan — the very source-harm this function avoids.)
+        SourceType::Mysql => None,
+        // `sys.dm_db_partition_stats` is a maintained running row count (effectively
+        // exact), not a sampled estimate — the same fast probe the SQL Server
+        // preflight uses, over the heap/clustered index (index_id 0/1).
+        SourceType::Mssql => Some(format!(
+            "SELECT SUM(p.row_count) FROM sys.dm_db_partition_stats p \
+             WHERE p.object_id = OBJECT_ID('{table_ident}') AND p.index_id IN (0,1)"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,39 +175,6 @@ mod tests {
     #[test]
     fn mysql_escapes_internal_backticks() {
         assert_eq!(quote_ident(SourceType::Mysql, "col`name"), "`col``name`");
-    }
-
-    fn d(s: &str) -> chrono::NaiveDate {
-        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
-    }
-
-    #[test]
-    fn parse_date_flexible_handles_db_scalar_forms() {
-        assert_eq!(parse_date_flexible("2023-06-15"), Some(d("2023-06-15")));
-        assert_eq!(
-            parse_date_flexible("2023-06-15 14:32:00"),
-            Some(d("2023-06-15"))
-        );
-        assert_eq!(
-            parse_date_flexible("2023-06-15T14:32:00"),
-            Some(d("2023-06-15"))
-        );
-        assert_eq!(
-            parse_date_flexible("2023-06-15T14:32:00.123456"),
-            Some(d("2023-06-15"))
-        );
-        // PostgreSQL timestamptz text form — covered by the lenient fallback.
-        assert_eq!(
-            parse_date_flexible("2024-12-30 00:00:00.123456+00"),
-            Some(d("2024-12-30"))
-        );
-    }
-
-    #[test]
-    fn parse_date_flexible_rejects_non_dates() {
-        assert!(parse_date_flexible("").is_none());
-        assert!(parse_date_flexible("not-a-date").is_none());
-        assert!(parse_date_flexible("12345").is_none());
     }
 
     #[test]
@@ -255,5 +227,25 @@ mod tests {
             aggregate_sql(SourceType::Mysql, "min", "d", "SELECT d FROM t WHERE 1")
                 .contains("min(`d`)")
         );
+    }
+
+    #[test]
+    fn row_estimate_sql_is_scan_free_or_skipped_per_dialect() {
+        // Postgres: planner stats (reltuples), never COUNT(*).
+        let pg = row_estimate_sql(SourceType::Postgres, "warranty").expect("PG has an estimate");
+        assert!(pg.contains("reltuples") && pg.contains("pg_class"), "{pg}");
+        assert!(!pg.contains("COUNT"), "estimate must not scan: {pg}");
+        // SQL Server: partition stats (maintained count), never COUNT(*).
+        let ms =
+            row_estimate_sql(SourceType::Mssql, "dbo.warranty").expect("MSSQL has an estimate");
+        assert!(
+            ms.contains("dm_db_partition_stats") && ms.contains("OBJECT_ID('dbo.warranty')"),
+            "{ms}"
+        );
+        assert!(!ms.contains("COUNT"), "estimate must not scan: {ms}");
+        // MySQL: no trustworthy scan-free count (TABLE_ROWS/EXPLAIN ±30-50%) →
+        // skipped (None), never a misleading density figure.
+        assert!(row_estimate_sql(SourceType::Mysql, "warranty").is_none());
+        assert!(row_estimate_sql(SourceType::Mysql, "shop.warranty").is_none());
     }
 }

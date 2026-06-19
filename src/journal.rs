@@ -228,6 +228,40 @@ impl RunJournal {
             .collect()
     }
 
+    /// The longest single-chunk wall time in milliseconds, if derivable.
+    ///
+    /// Pairs each `ChunkStarted` with its `ChunkCompleted` by `chunk_index`
+    /// (robust to the interleaving the parallel runners produce) and returns the
+    /// largest gap. This is the #5 source-harm lever — how long one chunk query,
+    /// and the snapshot / locks it holds, stayed open — made measurable.
+    ///
+    /// `None` when no pair is found: a non-chunked run, or a parallel runner that
+    /// records `ChunkCompleted` in a single post-scope batch (so no real
+    /// per-chunk start time exists). The sequential and checkpoint paths
+    /// timestamp each event as it happens, so they yield true per-chunk timings.
+    pub fn longest_chunk_ms(&self) -> Option<i64> {
+        let mut started: std::collections::HashMap<i64, DateTime<Utc>> =
+            std::collections::HashMap::new();
+        let mut max_ms: Option<i64> = None;
+        for e in &self.entries {
+            match &e.event {
+                RunEvent::ChunkStarted { chunk_index, .. } => {
+                    started.insert(*chunk_index, e.recorded_at);
+                }
+                RunEvent::ChunkCompleted { chunk_index, .. } => {
+                    if let Some(start) = started.get(chunk_index) {
+                        let ms = (e.recorded_at - *start).num_milliseconds();
+                        if ms >= 0 {
+                            max_ms = Some(max_ms.map_or(ms, |m| m.max(ms)));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        max_ms
+    }
+
     // ── What degraded? ────────────────────────────────────────
 
     /// All `QualityIssue` entries (both FAIL and WARN severity).
@@ -267,6 +301,34 @@ impl RunJournal {
             .iter()
             .rev()
             .find(|e| matches!(e.event, RunEvent::RunCompleted { .. }))
+    }
+}
+
+#[cfg(test)]
+impl RunJournal {
+    /// Test-only: append a paired `ChunkStarted` + `ChunkCompleted` for
+    /// `chunk_index` whose wall-clock span is exactly `dur_ms`, stamped with
+    /// explicit timestamps (`record()` stamps `Utc::now`, which a test can't
+    /// control). Lets a caller make `longest_chunk_ms()` deterministic without
+    /// reaching into the private-by-convention `entries` Vec.
+    pub(crate) fn push_test_chunk_span(&mut self, chunk_index: i64, dur_ms: i64) {
+        let base = Utc::now();
+        self.entries.push(JournalEntry {
+            recorded_at: base,
+            event: RunEvent::ChunkStarted {
+                chunk_index,
+                start_key: "0".into(),
+                end_key: "1".into(),
+            },
+        });
+        self.entries.push(JournalEntry {
+            recorded_at: base + chrono::Duration::milliseconds(dur_ms),
+            event: RunEvent::ChunkCompleted {
+                chunk_index,
+                rows: 1,
+                file_name: None,
+            },
+        });
     }
 }
 
@@ -428,6 +490,56 @@ mod tests {
             message: "y".into(),
         });
         assert_eq!(j.chunk_events().len(), 3);
+    }
+
+    // ── longest_chunk_ms ──────────────────────────────────────────────────────
+
+    #[test]
+    fn longest_chunk_ms_pairs_started_and_completed_by_index() {
+        use chrono::Duration;
+        // Construct entries with explicit timestamps (record() stamps Utc::now,
+        // which we can't control). chunk 0 = 200ms, chunk 1 = 800ms; starts and
+        // completes interleave the way the parallel runner would order them.
+        let base = Utc::now();
+        let mut j = journal();
+        let push = |j: &mut RunJournal, off_ms: i64, event: RunEvent| {
+            j.entries.push(JournalEntry {
+                recorded_at: base + Duration::milliseconds(off_ms),
+                event,
+            });
+        };
+        let started = |i: i64| RunEvent::ChunkStarted {
+            chunk_index: i,
+            start_key: "0".into(),
+            end_key: "1".into(),
+        };
+        let done = |i: i64| RunEvent::ChunkCompleted {
+            chunk_index: i,
+            rows: 1,
+            file_name: None,
+        };
+        push(&mut j, 0, started(0));
+        push(&mut j, 50, started(1));
+        push(&mut j, 200, done(0)); // chunk 0: 200ms
+        push(&mut j, 850, done(1)); // chunk 1: 850 - 50 = 800ms (the max)
+        assert_eq!(j.longest_chunk_ms(), Some(800));
+    }
+
+    #[test]
+    fn longest_chunk_ms_none_without_paired_start() {
+        // The parallel post-scope batch shape: ChunkCompleted with no matching
+        // ChunkStarted → no real per-chunk timing → None (honest, not a bogus 0).
+        let mut j = journal();
+        j.record(RunEvent::ChunkCompleted {
+            chunk_index: 0,
+            rows: 1,
+            file_name: None,
+        });
+        assert!(j.longest_chunk_ms().is_none());
+        assert!(
+            journal().longest_chunk_ms().is_none(),
+            "empty journal → None"
+        );
     }
 
     // ── quality_issues ───────────────────────────────────────────────────────

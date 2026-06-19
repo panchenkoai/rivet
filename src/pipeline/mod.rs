@@ -36,6 +36,7 @@ pub(crate) mod retry;
 // every call site (`pipeline::run(...)` is the function).
 mod run;
 mod run_store;
+mod schema_drift;
 mod single;
 mod sink;
 mod summary;

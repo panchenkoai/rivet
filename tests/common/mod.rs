@@ -59,6 +59,7 @@ mod mysql;
 mod parquet;
 mod pg;
 mod runner;
+mod state;
 mod storage;
 mod toxi;
 
@@ -70,6 +71,7 @@ pub use mysql::*;
 pub use parquet::*;
 pub use pg::*;
 pub use runner::*;
+pub use state::*;
 pub use storage::*;
 pub use toxi::*;
 

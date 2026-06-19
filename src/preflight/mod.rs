@@ -52,6 +52,11 @@ pub(crate) struct ExportDiagnostic {
     pub mode: String,
     pub cursor_column: Option<String>,
     pub row_estimate: Option<i64>,
+    /// Average bytes per row from catalog/plan stats (PG EXPLAIN `width`,
+    /// MSSQL `dm_db_partition_stats` pages/row). `None` when unavailable
+    /// (e.g. MySQL, with no trustworthy scan-free estimate). Feeds the
+    /// oversized-chunk warning and is shown as the `Row width` line.
+    pub avg_row_bytes: Option<i64>,
     pub cursor_min: Option<String>,
     pub cursor_max: Option<String>,
     pub scan_type: Option<String>,
@@ -296,6 +301,9 @@ fn print_diagnostic(diag: &ExportDiagnostic) {
         } else {
             println!("  Row estimate: ~{}", est);
         }
+    }
+    if let Some(w) = diag.avg_row_bytes {
+        println!("  Row width:    ~{} bytes", w);
     }
     if let (Some(min_v), Some(max_v)) = (&diag.cursor_min, &diag.cursor_max) {
         println!("  Cursor range: {} .. {}", min_v, max_v);

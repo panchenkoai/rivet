@@ -18,6 +18,7 @@ mod preflight;
 mod quality;
 mod redact;
 mod resource;
+mod scalar;
 mod source;
 mod sql;
 mod state;

@@ -63,45 +63,9 @@ pub(super) fn diagnose_export_mssql(
 }
 
 fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<ExportDiagnostic> {
-    let mode_str = match export.mode {
-        ExportMode::Full => "full".to_string(),
-        ExportMode::Incremental => format!(
-            "incremental (cursor: {})",
-            export.cursor_column.as_deref().unwrap_or("?")
-        ),
-        ExportMode::Chunked => format!(
-            "chunked (column: {}, size: {})",
-            export.chunk_column.as_deref().unwrap_or("?"),
-            export.chunk_size
-        ),
-        ExportMode::TimeWindow => format!(
-            "time_window (column: {}, days: {})",
-            export.time_column.as_deref().unwrap_or("?"),
-            export.days_window.unwrap_or(0)
-        ),
-    };
+    let mode_str = diagnose_mode_str(export);
 
-    // Resolve the same base query the runner will issue. For the `table:`
-    // shortcut (no `query:`) this is the canonical `SELECT * FROM <table>`
-    // (`ExportConfig::resolve_query`, which also validates/quotes the ident) —
-    // NOT a `SELECT 1` placeholder, or every probe below (row estimate, cursor
-    // range) would describe a 1-row dummy relation instead of the real table.
-    // config_dir/params are unused on the `table:`/inline branches; preflight is
-    // non-fatal, so fall back to the inline/placeholder text and surface the
-    // cause at debug rather than abort the diagnostic.
-    let base_query: String = match export.resolve_query(std::path::Path::new(""), None) {
-        Ok(q) => q,
-        Err(e) => {
-            log::debug!(
-                "preflight: base-query resolution failed for export '{}': {e}",
-                export.name
-            );
-            export
-                .query
-                .clone()
-                .unwrap_or_else(|| "SELECT 1".to_string())
-        }
-    };
+    let base_query = resolve_preflight_base_query(export);
     let base_query = base_query.as_str();
 
     // A missing table/column (or no SELECT grant) is permanent and
@@ -135,6 +99,10 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
         Some(table) => row_estimate_mssql(conn, table),
         None => None,
     };
+
+    // Average bytes/row from the same `dm_db_partition_stats` DMV — feeds the
+    // oversized-chunk warning. `None` when the base relation is unknown.
+    let avg_row_bytes = base_table.and_then(|table| avg_row_bytes_mssql(conn, table));
 
     // Cursor / chunk range. Incremental mode orders on the (possibly COALESCE'd)
     // key expression; chunked/cursor modes take MIN/MAX of the range column.
@@ -179,6 +147,7 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
     let warnings = collect_warnings(
         export,
         row_estimate,
+        avg_row_bytes,
         range_min.as_deref(),
         range_max.as_deref(),
         None,
@@ -191,6 +160,7 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
         mode: mode_str,
         cursor_column: export.cursor_column.clone(),
         row_estimate,
+        avg_row_bytes,
         cursor_min: range_min,
         cursor_max: range_max,
         scan_type,
@@ -264,6 +234,32 @@ fn row_estimate_mssql(conn: &mut MssqlSource, qualified_table: &str) -> Option<i
         Ok(opt) => opt.and_then(|s| s.parse::<i64>().ok()).map(|n| n.max(0)),
         Err(e) => {
             log::debug!("preflight: row-estimate probe failed for {qualified_table}: {e}");
+            None
+        }
+    }
+}
+
+/// Average bytes/row from `dm_db_partition_stats` for `[schema.]table`:
+/// `SUM(used_page_count) * 8192 / SUM(row_count)` over the heap / clustered
+/// index (`index_id IN (0,1)`) — a maintained stat, no scan (8 KB is SQL
+/// Server's fixed page size). `None` when the table is empty, the stats row is
+/// absent, or the probe fails (preflight is non-fatal).
+fn avg_row_bytes_mssql(conn: &mut MssqlSource, qualified_table: &str) -> Option<i64> {
+    let (schema, table) = split_qualified(qualified_table);
+    let sql = format!(
+        "SELECT CASE WHEN SUM(p.row_count) > 0 \
+                THEN SUM(p.used_page_count) * 8192 / SUM(p.row_count) ELSE NULL END \
+         FROM sys.dm_db_partition_stats p \
+         JOIN sys.objects o ON o.object_id = p.object_id \
+         JOIN sys.schemas s ON s.schema_id = o.schema_id \
+         WHERE s.name = N'{}' AND o.name = N'{}' AND p.index_id IN (0,1)",
+        schema.replace('\'', "''"),
+        table.replace('\'', "''"),
+    );
+    match conn.query_scalar(&sql) {
+        Ok(opt) => opt.and_then(|s| s.parse::<i64>().ok()).filter(|n| *n > 0),
+        Err(e) => {
+            log::debug!("preflight: row-width probe failed for {qualified_table}: {e}");
             None
         }
     }

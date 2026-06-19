@@ -1,14 +1,12 @@
 //! Pure chunk math — no I/O, no database access.
 //!
-//! Date parsing, range generation, SQL query building, plan fingerprinting.
-//! All functions in this module are deterministic and side-effect-free.
+//! Range generation, chunk-query SQL building, plan fingerprinting. All
+//! functions in this module are deterministic and side-effect-free. Parsing the
+//! DB scalars the planner turns into bounds (`min`/`max` strings) lives in the
+//! shared `crate::scalar` leaf, not here.
 
-// Date parsing of DB scalars is shared with `plan::partition` (a different
-// layer), so it lives in the `sql` leaf module. Re-exported here so the existing
-// `super::math::parse_date_flexible` call sites in `chunked` stay unchanged.
-pub(crate) use crate::sql::parse_date_flexible;
-// `strip_select_star_from` also moved to the `sql` leaf (shared with preflight
-// and plan::partition); re-exported so `chunked`'s call sites and the
+// `strip_select_star_from` lives in the `sql` leaf (shared with preflight and
+// plan::partition); re-exported here so `chunked`'s call sites and the
 // `chunked::strip_select_star_from` re-export are unchanged.
 pub(crate) use crate::sql::strip_select_star_from;
 
@@ -142,14 +140,6 @@ pub(crate) fn chunk_plan_fingerprint(
         }
     }
     format!("{:016x}", xxh3_64(buf.as_bytes()))
-}
-
-/// Parse a raw scalar string from the database as i64, accepting float representations.
-pub(super) fn parse_scalar_i64(raw: &str) -> crate::error::Result<i64> {
-    let t = raw.trim();
-    t.parse::<i64>()
-        .or_else(|_| t.parse::<f64>().map(|x| x as i64))
-        .map_err(|_| anyhow::anyhow!("invalid numeric scalar: {:?}", t))
 }
 
 #[cfg(test)]
@@ -308,8 +298,8 @@ mod tests {
         assert!(q.contains("BETWEEN 1 AND 5000"), "got: {}", q);
     }
 
-    // `parse_date_flexible` now lives in `crate::sql` (shared across layers);
-    // its tests moved there too.
+    // `parse_date_flexible` and `parse_scalar_i64` now live in the shared
+    // `crate::scalar` leaf; their tests moved there too.
 
     #[test]
     fn test_build_chunk_query_date_mode() {

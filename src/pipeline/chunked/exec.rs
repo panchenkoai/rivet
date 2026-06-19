@@ -8,25 +8,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use super::super::{RunSummary, progress::ChunkProgress, sink::ExportSink};
-use super::detect::detect_and_generate_chunks;
 use super::math::build_chunk_query_sql;
 use super::poison;
 use crate::error::Result;
 use crate::journal::RunEvent;
-use crate::plan::{ChunkedPlan, ExtractionStrategy, ResolvedRunPlan};
+use crate::plan::ResolvedRunPlan;
 use crate::source::{self, Source};
 use crate::state::StateStore;
 use crate::tuning::Governor;
 use crate::{destination, format, resource};
-
-/// Extract the `ChunkedPlan` from a `ResolvedRunPlan`. Panics if the strategy
-/// is not `Chunked` — all callers in this module only run for chunked plans.
-fn chunked_plan(plan: &ResolvedRunPlan) -> &ChunkedPlan {
-    match &plan.strategy {
-        ExtractionStrategy::Chunked(cp) => cp,
-        _ => unreachable!("chunked runner called with non-chunked plan"),
-    }
-}
 
 pub(crate) fn run_chunked_sequential(
     src: &mut dyn Source,
@@ -35,20 +25,11 @@ pub(crate) fn run_chunked_sequential(
     state: Option<&StateStore>,
     chunk_source: super::ChunkSource,
 ) -> Result<()> {
-    let cp = chunked_plan(plan);
+    let cp = super::chunked_plan(plan);
 
     let chunks = match chunk_source {
-        super::ChunkSource::Detect => detect_and_generate_chunks(
-            src,
-            &plan.base_query,
-            &cp.column,
-            cp.chunk_size,
-            cp.chunk_count,
-            &plan.export_name,
-            cp.dense,
-            cp.by_days,
-            plan.source.source_type,
-        )?,
+        // Detect: compute ranges + run the pre-chunk drift check once (ADR-0021).
+        super::ChunkSource::Detect => super::prepare_chunk_plan(src, plan, state, summary)?,
         super::ChunkSource::Precomputed(ranges) => ranges,
     };
 
@@ -176,25 +157,12 @@ pub(crate) fn run_chunked_parallel(
     summary: &mut RunSummary,
     chunk_source: super::ChunkSource,
 ) -> Result<()> {
-    let cp = chunked_plan(plan);
+    let cp = super::chunked_plan(plan);
 
     let chunks = match chunk_source {
-        super::ChunkSource::Detect => {
-            let mut src = source::create_source(&plan.source)?;
-            let ranges = detect_and_generate_chunks(
-                &mut *src,
-                &plan.base_query,
-                &cp.column,
-                cp.chunk_size,
-                cp.chunk_count,
-                &plan.export_name,
-                cp.dense,
-                cp.by_days,
-                plan.source.source_type,
-            )?;
-            drop(src);
-            ranges
-        }
+        // Detect: a short-lived connection computes ranges + runs the pre-chunk
+        // drift check (ADR-0021), then closes before the workers open theirs.
+        super::ChunkSource::Detect => super::prepare_chunk_plan_fresh(plan, state, summary)?,
         super::ChunkSource::Precomputed(ranges) => ranges,
     };
 
