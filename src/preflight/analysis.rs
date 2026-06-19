@@ -43,6 +43,56 @@ pub(crate) fn derive_strategy(export: &ExportConfig) -> String {
     }
 }
 
+/// The operator-facing mode line shown in the `rivet check` diagnostic —
+/// `"chunked (column: id, size: 100000)"`, `"incremental (cursor: updated_at)"`,
+/// etc. Shared verbatim by all three engine `diagnose_*` paths, which differ
+/// only in their probes, not in this label.
+pub(crate) fn diagnose_mode_str(export: &ExportConfig) -> String {
+    match export.mode {
+        ExportMode::Full => "full".to_string(),
+        ExportMode::Incremental => format!(
+            "incremental (cursor: {})",
+            export.cursor_column.as_deref().unwrap_or("?")
+        ),
+        ExportMode::Chunked => format!(
+            "chunked (column: {}, size: {})",
+            export.chunk_column.as_deref().unwrap_or("?"),
+            export.chunk_size
+        ),
+        ExportMode::TimeWindow => format!(
+            "time_window (column: {}, days: {})",
+            export.time_column.as_deref().unwrap_or("?"),
+            export.days_window.unwrap_or(0)
+        ),
+    }
+}
+
+/// Resolve the base query the runner will issue, for the preflight probes.
+///
+/// For the `table:` shortcut (no `query:`) this is the canonical
+/// `SELECT * FROM <table>` (`ExportConfig::resolve_query`, which validates and
+/// quotes the ident) — NOT a `SELECT 1` placeholder, or every probe (row
+/// estimate, scan type, cursor range) would describe a 1-row dummy relation
+/// instead of the real table. `config_dir`/`params` are unused on the
+/// `table:`/inline branches; preflight is non-fatal, so a resolution failure
+/// falls back to the inline/placeholder text and surfaces the cause at debug
+/// rather than aborting the diagnostic. Shared verbatim by all three engines.
+pub(crate) fn resolve_preflight_base_query(export: &ExportConfig) -> String {
+    match export.resolve_query(std::path::Path::new(""), None) {
+        Ok(q) => q,
+        Err(e) => {
+            log::debug!(
+                "preflight: base-query resolution failed for export '{}': {e}",
+                export.name
+            );
+            export
+                .query
+                .clone()
+                .unwrap_or_else(|| "SELECT 1".to_string())
+        }
+    }
+}
+
 /// B2: Recommend tuning profile based on row estimate and index usage.
 pub(crate) fn recommend_profile(
     row_estimate: Option<i64>,
@@ -521,6 +571,38 @@ mod tests {
     fn derive_strategy_date_chunked() {
         let e = cfg("mode: chunked\nchunk_column: created_at\nchunk_by_days: 7\n");
         assert_eq!(derive_strategy(&e), "date-chunked(created_at, 7d)");
+    }
+
+    // ── diagnose_mode_str / resolve_preflight_base_query (hoisted from the
+    //    three engine diagnose_* paths; pin the shared shape once) ────────────
+
+    #[test]
+    fn diagnose_mode_str_renders_each_mode() {
+        assert_eq!(diagnose_mode_str(&cfg("mode: full\n")), "full");
+        assert_eq!(
+            diagnose_mode_str(&cfg("mode: incremental\ncursor_column: updated_at\n")),
+            "incremental (cursor: updated_at)"
+        );
+        assert_eq!(
+            diagnose_mode_str(&cfg(
+                "mode: chunked\nchunk_column: id\nchunk_size: 100000\n"
+            )),
+            "chunked (column: id, size: 100000)"
+        );
+    }
+
+    #[test]
+    fn resolve_preflight_base_query_table_shortcut_and_inline() {
+        // `table:` shortcut → canonical SELECT * FROM <table>, never a SELECT 1 stub.
+        assert_eq!(
+            resolve_preflight_base_query(&cfg("mode: full\ntable: orders\n")),
+            "SELECT * FROM orders"
+        );
+        // Inline `query:` passes through verbatim.
+        assert_eq!(
+            resolve_preflight_base_query(&cfg("mode: full\nquery: \"SELECT id FROM t WHERE x\"\n")),
+            "SELECT id FROM t WHERE x"
+        );
     }
 
     // ── recommend_profile ───────────────────────────────────────────────────

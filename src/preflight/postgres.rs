@@ -51,46 +51,9 @@ fn diagnose_pg(
     export: &ExportConfig,
     db_max_connections: Option<u32>,
 ) -> Result<ExportDiagnostic> {
-    let mode_str = match export.mode {
-        ExportMode::Full => "full".to_string(),
-        ExportMode::Incremental => format!(
-            "incremental (cursor: {})",
-            export.cursor_column.as_deref().unwrap_or("?")
-        ),
-        ExportMode::Chunked => format!(
-            "chunked (column: {}, size: {})",
-            export.chunk_column.as_deref().unwrap_or("?"),
-            export.chunk_size
-        ),
-        ExportMode::TimeWindow => format!(
-            "time_window (column: {}, days: {})",
-            export.time_column.as_deref().unwrap_or("?"),
-            export.days_window.unwrap_or(0)
-        ),
-    };
+    let mode_str = diagnose_mode_str(export);
 
-    // Resolve the same base query the runner will issue. For the `table:`
-    // shortcut (no `query:`) this is the canonical `SELECT * FROM <table>`
-    // (`ExportConfig::resolve_query`, which also validates/quotes the ident) —
-    // NOT a `SELECT 1` placeholder, or every probe below (row estimate, scan
-    // type, cursor range) would describe a 1-row dummy relation instead of the
-    // real table. config_dir/params are unused on the `table:`/inline branches;
-    // a query_file would already have been read at plan time, so fall back to
-    // the inline/placeholder text if resolution fails here (preflight is
-    // non-fatal — surface the cause at debug rather than abort the diagnostic).
-    let base_query: String = match export.resolve_query(std::path::Path::new(""), None) {
-        Ok(q) => q,
-        Err(e) => {
-            log::debug!(
-                "preflight: base-query resolution failed for export '{}': {e}",
-                export.name
-            );
-            export
-                .query
-                .clone()
-                .unwrap_or_else(|| "SELECT 1".to_string())
-        }
-    };
+    let base_query = resolve_preflight_base_query(export);
     let base_query = base_query.as_str();
 
     let range_col = export
