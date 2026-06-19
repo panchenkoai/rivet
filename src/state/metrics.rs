@@ -216,6 +216,64 @@ impl StateStore {
         Ok(())
     }
 
+    /// Record per-run source-harm deltas (Tier 2): one row per counter into
+    /// `export_harm`, keyed on `run_id`. Best-effort observability — the caller
+    /// logs and ignores any error; a missing harm row never affects the run
+    /// verdict. No-op for an empty delta set (e.g. a non-Postgres source whose
+    /// probe was skipped, or a counter set that didn't move).
+    pub fn record_harm(
+        &self,
+        run_id: &str,
+        export_name: &str,
+        deltas: &[(String, i64)],
+    ) -> Result<()> {
+        if deltas.is_empty() {
+            return Ok(());
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let sql = "INSERT INTO export_harm (run_id, export_name, metric, delta, recorded_at) \
+                   VALUES (?1, ?2, ?3, ?4, ?5)";
+        match &self.conn {
+            StateConn::Sqlite(c) => {
+                for (metric, delta) in deltas {
+                    c.execute(
+                        sql,
+                        rusqlite::params![run_id, export_name, metric, delta, now],
+                    )?;
+                }
+            }
+            StateConn::Postgres(client) => {
+                let mut c = client.borrow_mut();
+                for (metric, delta) in deltas {
+                    c.execute(&pg_sql(sql), &[&run_id, &export_name, metric, delta, &now])?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Test-only read of the `export_harm` rows for a run, `(metric, delta)`
+    /// sorted by metric — lets tests trace the harm signal through the table.
+    #[cfg(test)]
+    pub(crate) fn harm_rows_for_test(&self, run_id: &str) -> Vec<(String, i64)> {
+        match &self.conn {
+            StateConn::Sqlite(c) => {
+                let mut stmt = c
+                    .prepare(
+                        "SELECT metric, delta FROM export_harm WHERE run_id = ?1 ORDER BY metric",
+                    )
+                    .expect("prepare export_harm read");
+                let rows = stmt
+                    .query_map([run_id], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                    })
+                    .expect("query export_harm");
+                rows.filter_map(|r| r.ok()).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// Test-only raw scalar read of a v9 metric column the typed `get_metrics`
     /// path intentionally doesn't surface — lets tests pin that the wide INSERT
     /// mapped each field to the right column (catches a positional param swap).
@@ -438,6 +496,35 @@ mod tests {
         assert_eq!(s.metric_scalar_i64("r1", "chunk_size"), Some(100_000));
         assert_eq!(s.metric_scalar_i64("r1", "parallel"), Some(4));
         assert_eq!(s.metric_scalar_i64("r1", "longest_chunk_ms"), Some(1_839));
+    }
+
+    #[test]
+    fn record_harm_round_trips_per_counter_rows() {
+        // Traces the Tier 2 signal through SQLite: v11 migration creates
+        // export_harm, record_harm writes one row per counter, the read returns
+        // them. (The live source-probe that produces these deltas needs a real
+        // DB; this validates the storage path it lands in.)
+        let s = store();
+        let deltas = vec![
+            ("pg_tup_returned".to_string(), 1_000_000),
+            ("pg_blks_read".to_string(), 2_048),
+            ("pg_temp_files".to_string(), 3),
+        ];
+        s.record_harm("run-h", "content_items", &deltas).unwrap();
+
+        // One row per counter, keyed on run_id (read sorted by metric).
+        assert_eq!(
+            s.harm_rows_for_test("run-h"),
+            vec![
+                ("pg_blks_read".to_string(), 2_048),
+                ("pg_temp_files".to_string(), 3),
+                ("pg_tup_returned".to_string(), 1_000_000),
+            ]
+        );
+
+        // Empty delta set (probe skipped / counters unmoved) → no rows, no error.
+        s.record_harm("run-empty", "x", &[]).unwrap();
+        assert!(s.harm_rows_for_test("run-empty").is_empty());
     }
 
     #[test]

@@ -217,6 +217,22 @@ const MIGRATIONS: &[(i64, &str)] = &[
         10,
         "ALTER TABLE export_metrics ADD COLUMN longest_chunk_ms INTEGER;",
     ),
+    // v11: per-run source-harm deltas (locks, rows read, buffer misses, temp
+    // files) — one row per counter, keyed on run_id. Engine-neutral key/value so
+    // each engine's counter set lands without schema churn. Written from
+    // pipeline::job::harm_snapshot via source::{postgres,mysql,mssql}.
+    (
+        11,
+        "CREATE TABLE IF NOT EXISTS export_harm (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            export_name TEXT NOT NULL,
+            metric TEXT NOT NULL,
+            delta INTEGER NOT NULL,
+            recorded_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_export_harm_run ON export_harm(run_id);",
+    ),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -387,6 +403,19 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
     (
         10,
         "ALTER TABLE export_metrics ADD COLUMN longest_chunk_ms BIGINT;",
+    ),
+    // v11: per-run source-harm deltas (see the SQLite array for rationale).
+    (
+        11,
+        "CREATE TABLE IF NOT EXISTS export_harm (
+            id BIGSERIAL PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            export_name TEXT NOT NULL,
+            metric TEXT NOT NULL,
+            delta BIGINT NOT NULL,
+            recorded_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_export_harm_run ON export_harm(run_id);",
     ),
 ];
 

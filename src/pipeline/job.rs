@@ -127,6 +127,40 @@ fn pg_temp_bytes_snapshot(plan: &ResolvedRunPlan) -> Option<i64> {
     crate::source::postgres::sample_temp_bytes(&url, plan.source.tls.as_ref())
 }
 
+/// Snapshot the broader source-harm counters for the run's source engine, as
+/// `(metric, cumulative_value)` pairs, dispatched by source type to the
+/// per-engine probe. `None` for any connect/query failure or a source whose
+/// probe is unavailable (e.g. MSSQL without `VIEW SERVER STATE`) — harm metrics
+/// are observability, never a gate, so a missing snapshot just yields no
+/// `export_harm` rows.
+fn harm_snapshot(plan: &ResolvedRunPlan) -> Option<Vec<(String, i64)>> {
+    let url = plan.source.resolve_url().ok()?;
+    let tls = plan.source.tls.as_ref();
+    match plan.source.source_type {
+        crate::config::SourceType::Postgres => {
+            crate::source::postgres::sample_harm_counters(&url, tls)
+        }
+        crate::config::SourceType::Mysql => crate::source::mysql::sample_harm_counters(&url, tls),
+        crate::config::SourceType::Mssql => crate::source::mssql::sample_harm_counters(&url, tls),
+    }
+}
+
+/// Per-metric delta (`after - before`, floored at 0) for counters present in
+/// both snapshots, matched by name. Floored because these are monotonic
+/// cumulative counters within a run; a negative would only arise from a counter
+/// reset (server restart mid-run) and is not meaningful harm.
+fn harm_deltas(before: &[(String, i64)], after: &[(String, i64)]) -> Vec<(String, i64)> {
+    let bmap: std::collections::HashMap<&str, i64> =
+        before.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    after
+        .iter()
+        .filter_map(|(k, after_v)| {
+            bmap.get(k.as_str())
+                .map(|b| (k.clone(), (after_v - b).max(0)))
+        })
+        .collect()
+}
+
 /// Run `SELECT COUNT(*) FROM ({query})` against the source and compare with exported rows.
 /// Skips reconciliation for incremental exports that used a cursor (moving target).
 fn reconcile_source_count(plan: &ResolvedRunPlan, summary: &mut RunSummary) {
@@ -352,6 +386,10 @@ pub(super) fn run_export_job(
     // Cluster-level counter, so this is a noisy upper bound on a shared host
     // but accurate on the single-tenant test DBs pilots typically use.
     let pg_temp_bytes_before = pg_temp_bytes_snapshot(&plan);
+    // Tier 2: broader source-harm counters (locks, rows read, buffer misses,
+    // temp files) bracketed around the same run window; the per-counter delta is
+    // stored in export_harm. Best-effort — see `harm_snapshot`.
+    let harm_before = harm_snapshot(&plan);
 
     // Record plan diagnostics that were already logged above.
     for d in &diags {
@@ -402,6 +440,21 @@ pub(super) fn run_export_job(
                  below PG's `work_mem`.",
                 plan.export_name,
                 delta as f64 / (1024.0 * 1024.0),
+            );
+        }
+    }
+
+    // Tier 2: record the per-counter source-harm delta. A failed or absent probe
+    // (e.g. missing VIEW SERVER STATE on MSSQL) leaves no rows — never fatal.
+    if let Some(before) = &harm_before
+        && let Some(after) = harm_snapshot(&plan)
+    {
+        let deltas = harm_deltas(before, &after);
+        if let Err(e) = state.record_harm(&summary.run_id, &summary.export_name, &deltas) {
+            log::debug!(
+                "export '{}': harm metrics write failed (informational): {:#}",
+                summary.export_name,
+                e
             );
         }
     }

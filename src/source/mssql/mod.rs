@@ -766,6 +766,39 @@ impl Source for MssqlSource {
     }
 }
 
+impl MssqlSource {
+    /// Snapshot lock-wait counters from `sys.dm_os_wait_stats` (LCK_* waits) —
+    /// the SQL Server contention signal the 0.12 harm A/B tracked. This is a
+    /// server-scoped DMV: it needs `VIEW SERVER STATE`; a missing grant (or any
+    /// query error) yields `None`, so the metric is simply skipped, never failing
+    /// the export. Cumulative since server start; the pipeline deltas it around
+    /// the run.
+    pub(crate) fn harm_counters(&mut self) -> Option<Vec<(String, i64)>> {
+        let Self { rt, client, .. } = self;
+        let sql = "SELECT SUM(waiting_tasks_count), SUM(wait_time_ms) \
+                   FROM sys.dm_os_wait_stats WHERE wait_type LIKE 'LCK%'";
+        rt.block_on(async {
+            let row = client.query(sql, &[]).await.ok()?.into_row().await.ok()??;
+            let waits = row.get::<i64, _>(0).unwrap_or(0);
+            let wait_ms = row.get::<i64, _>(1).unwrap_or(0);
+            Some(vec![
+                ("mssql_lock_waits".to_string(), waits),
+                ("mssql_lock_wait_ms".to_string(), wait_ms),
+            ])
+        })
+    }
+}
+
+/// Connect and snapshot MSSQL harm counters; see [`MssqlSource::harm_counters`].
+/// `None` on connect failure or a missing `VIEW SERVER STATE` grant.
+pub(crate) fn sample_harm_counters(
+    url: &str,
+    tls: Option<&TlsConfig>,
+) -> Option<Vec<(String, i64)>> {
+    let mut src = MssqlSource::connect_with_tls(url, tls).ok()?;
+    src.harm_counters()
+}
+
 /// Emit one Arrow batch from `rows`, building (and emitting) the schema on the
 /// first call and reusing it thereafter. tiberius drops a decimal column's
 /// declared precision/scale, so the scale is recovered from the `decimal_hints`
