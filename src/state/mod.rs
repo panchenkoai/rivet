@@ -211,6 +211,12 @@ const MIGRATIONS: &[(i64, &str)] = &[
         ALTER TABLE export_metrics ADD COLUMN destination_type TEXT;
         ALTER TABLE export_metrics ADD COLUMN rivet_version TEXT;",
     ),
+    // v10: longest single-chunk wall time (ms) — the #5 source-harm lever,
+    // aggregated at finalize from the run journal's per-chunk timings.
+    (
+        10,
+        "ALTER TABLE export_metrics ADD COLUMN longest_chunk_ms INTEGER;",
+    ),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -376,6 +382,11 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
         ALTER TABLE export_metrics ADD COLUMN source_type TEXT;
         ALTER TABLE export_metrics ADD COLUMN destination_type TEXT;
         ALTER TABLE export_metrics ADD COLUMN rivet_version TEXT;",
+    ),
+    // v10: longest single-chunk wall time (ms). See the SQLite array.
+    (
+        10,
+        "ALTER TABLE export_metrics ADD COLUMN longest_chunk_ms BIGINT;",
     ),
 ];
 

@@ -60,6 +60,7 @@ fn build_metric_row(
         source_type: Some(format!("{:?}", plan.source.source_type).to_lowercase()),
         destination_type: Some(plan.destination.destination_type.label().to_string()),
         rivet_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        longest_chunk_ms: summary.journal.longest_chunk_ms(),
     }
 }
 

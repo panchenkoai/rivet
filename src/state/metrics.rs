@@ -63,6 +63,8 @@ pub struct MetricRow {
     pub source_type: Option<String>,
     pub destination_type: Option<String>,
     pub rivet_version: Option<String>,
+    // ── v10: timing ──
+    pub longest_chunk_ms: Option<i64>,
 }
 
 /// Metrics store — reads and writes `export_metrics`.
@@ -128,9 +130,10 @@ impl StateStore {
              files_produced, bytes_written, retries, validated, schema_changed,
              files_committed, reconciled, source_count, quality_passed, pg_temp_bytes_delta,
              batch_size, batch_size_memory_mb, skip_reason, schema_fingerprint,
-             chunk_size, parallel, source_type, destination_type, rivet_version)
+             chunk_size, parallel, source_type, destination_type, rivet_version,
+             longest_chunk_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-             ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)";
+             ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)";
         match &self.conn {
             StateConn::Sqlite(c) => {
                 c.execute(
@@ -165,7 +168,8 @@ impl StateStore {
                         m.parallel,
                         m.source_type,
                         m.destination_type,
-                        m.rivet_version
+                        m.rivet_version,
+                        m.longest_chunk_ms
                     ],
                 )?;
             }
@@ -204,6 +208,7 @@ impl StateStore {
                         &m.source_type,
                         &m.destination_type,
                         &m.rivet_version,
+                        &m.longest_chunk_ms,
                     ],
                 )?;
             }
@@ -409,6 +414,7 @@ mod tests {
             batch_size: 32_000,
             chunk_size: Some(100_000),
             parallel: Some(4),
+            longest_chunk_ms: Some(1_839),
             ..Default::default()
         })
         .unwrap();
@@ -431,6 +437,7 @@ mod tests {
         assert_eq!(s.metric_scalar_i64("r1", "batch_size"), Some(32_000));
         assert_eq!(s.metric_scalar_i64("r1", "chunk_size"), Some(100_000));
         assert_eq!(s.metric_scalar_i64("r1", "parallel"), Some(4));
+        assert_eq!(s.metric_scalar_i64("r1", "longest_chunk_ms"), Some(1_839));
     }
 
     #[test]
