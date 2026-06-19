@@ -43,14 +43,9 @@ pub(crate) fn run_chunked_parallel_checkpoint(
         vec![]
     } else {
         match chunk_source {
-            // Detect: one short-lived connection computes ranges + runs the
-            // pre-chunk drift check (ADR-0021) before the workers spawn.
-            ChunkSource::Detect => {
-                let mut src = source::create_source(&plan.source)?;
-                let ranges = super::prepare_chunk_plan(&mut *src, plan, Some(state), summary)?;
-                drop(src);
-                ranges
-            }
+            // Detect: a short-lived connection computes ranges + runs the
+            // pre-chunk drift check (ADR-0021), then closes before workers spawn.
+            ChunkSource::Detect => super::prepare_chunk_plan_fresh(plan, state, summary)?,
             ChunkSource::Precomputed(ranges) => ranges,
         }
     };

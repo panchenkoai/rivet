@@ -132,6 +132,22 @@ pub(super) fn prepare_chunk_plan(
     Ok(ranges)
 }
 
+/// Like [`prepare_chunk_plan`], but for the parallel runners that don't already
+/// hold a `Source`: open a short-lived connection, compute the plan, and drop
+/// the connection here — **before** the workers open theirs. The detect
+/// connection must not outlive this call; folding the create → plan → drop dance
+/// into one helper keeps that `drop` structural rather than a hand-placed
+/// statement the two parallel Detect arms must each remember.
+pub(super) fn prepare_chunk_plan_fresh(
+    plan: &ResolvedRunPlan,
+    state: &StateStore,
+    summary: &mut RunSummary,
+) -> Result<Vec<(i64, i64)>> {
+    let mut src = crate::source::create_source(&plan.source)?;
+    prepare_chunk_plan(&mut *src, plan, Some(state), summary)
+    // `src` drops here, closing the detect connection before workers open theirs.
+}
+
 /// Extract the `ChunkedPlan` from a `ResolvedRunPlan`. Panics if the strategy
 /// is not `Chunked` — all callers in this module only run for chunked plans.
 pub(super) fn chunked_plan(plan: &ResolvedRunPlan) -> &ChunkedPlan {
