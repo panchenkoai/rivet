@@ -24,7 +24,10 @@ pub fn doctor(config_path: &str) -> Result<()> {
     let mut all_ok = true;
 
     match check_source_auth(&config) {
-        Ok(()) => println!("[OK]  Source auth ({:?})", config.source.source_type),
+        Ok(()) => {
+            println!("[OK]  Source auth ({:?})", config.source.source_type);
+            note_mssql_harm_permission(&config);
+        }
         Err(e) => {
             all_ok = false;
             let category = categorize_source_error(&e);
@@ -143,6 +146,33 @@ fn check_source_auth(config: &Config) -> Result<()> {
             crate::source::mssql::MssqlSource::connect_with_tls(&url, tls)?;
             Ok(())
         }
+    }
+}
+
+/// Advisory (never a `[FAIL]`): a SQL Server login that can extract data fine
+/// but lacks `VIEW SERVER STATE` will have its source-harm metrics (lock waits,
+/// via `sys.dm_os_wait_stats`) silently skipped. Surface that at health-check
+/// time so the operator can grant it if they want the metrics — but it must
+/// never gate extraction, so this only prints a `[note]` and leaves `all_ok`
+/// untouched.
+///
+/// No-op for non-MSSQL sources, and when the permission is present or
+/// undeterminable (a probe failure stays silent rather than guess).
+fn note_mssql_harm_permission(config: &Config) {
+    if config.source.source_type != SourceType::Mssql {
+        return;
+    }
+    let Ok(url) = config.source.resolve_url() else {
+        return;
+    };
+    if let Some(false) =
+        crate::source::mssql::sample_view_server_state(&url, config.source.tls.as_ref())
+    {
+        println!(
+            "[note] Source-harm metrics need VIEW SERVER STATE — this SQL Server login lacks it, \
+             so lock-wait metrics will be skipped. Data extraction is unaffected. \
+             Grant with: GRANT VIEW SERVER STATE TO [your_login];"
+        );
     }
 }
 

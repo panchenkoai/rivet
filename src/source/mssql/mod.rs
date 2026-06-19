@@ -787,6 +787,27 @@ impl MssqlSource {
             ])
         })
     }
+
+    /// Does the current login hold `VIEW SERVER STATE` — the permission
+    /// [`harm_counters`] needs? `Some(true/false)` via `HAS_PERMS_BY_NAME`
+    /// (callable by any login for its own permissions, so this probe itself
+    /// never needs a grant); `None` only if even that round-trip fails.
+    pub(crate) fn has_view_server_state(&mut self) -> Option<bool> {
+        let Self { rt, client, .. } = self;
+        rt.block_on(async {
+            let row = client
+                .query(
+                    "SELECT HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW SERVER STATE')",
+                    &[],
+                )
+                .await
+                .ok()?
+                .into_row()
+                .await
+                .ok()??;
+            row.get::<i32, _>(0).map(|v| v == 1)
+        })
+    }
 }
 
 /// Connect and snapshot MSSQL harm counters; see [`MssqlSource::harm_counters`].
@@ -797,6 +818,15 @@ pub(crate) fn sample_harm_counters(
 ) -> Option<Vec<(String, i64)>> {
     let mut src = MssqlSource::connect_with_tls(url, tls).ok()?;
     src.harm_counters()
+}
+
+/// Connect and check whether the login has `VIEW SERVER STATE` — used by
+/// `rivet doctor` to *advise* (never block) that source-harm metrics will be
+/// skipped without it. `None` on connect failure, in which case doctor stays
+/// silent rather than guess.
+pub(crate) fn sample_view_server_state(url: &str, tls: Option<&TlsConfig>) -> Option<bool> {
+    let mut src = MssqlSource::connect_with_tls(url, tls).ok()?;
+    src.has_view_server_state()
 }
 
 /// Emit one Arrow batch from `rows`, building (and emitting) the schema on the
