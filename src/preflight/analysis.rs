@@ -322,25 +322,21 @@ pub(super) fn collect_warnings(
     chunk_max: Option<&str>,
     db_max_connections: Option<u32>,
 ) -> Vec<String> {
-    let mut warnings = Vec::new();
-    if let Some(w) = check_connection_limit(export.parallel, db_max_connections) {
-        warnings.push(w);
-    }
-    if let Some(w) = check_sparse_range(export, row_estimate, chunk_min, chunk_max) {
-        warnings.push(w);
-    }
-    if let Some(w) =
-        check_oversized_chunk(export, row_estimate, avg_row_bytes, chunk_min, chunk_max)
-    {
-        warnings.push(w);
-    }
-    if let Some(w) = check_dense_surrogate_cost(export) {
-        warnings.push(w);
-    }
-    if let Some(w) = check_parallel_memory_risk(export, row_estimate) {
-        warnings.push(w);
-    }
-    warnings
+    // A flat manifest of the preflight checks, in display order: each returns
+    // `Some(warning)` when it applies, `None` otherwise. Adding the next check is
+    // a one-line array insert, not a new if-let rung — the same provider shape
+    // `RunSummary::render` uses for its rows. The checks keep their own
+    // (individually unit-tested) signatures; only the assembly is centralised here.
+    [
+        check_connection_limit(export.parallel, db_max_connections),
+        check_sparse_range(export, row_estimate, chunk_min, chunk_max),
+        check_oversized_chunk(export, row_estimate, avg_row_bytes, chunk_min, chunk_max),
+        check_dense_surrogate_cost(export),
+        check_parallel_memory_risk(export, row_estimate),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// Tables at or below this row count are a one-shot full copy, not a workload
@@ -766,6 +762,39 @@ mod tests {
         assert!(
             w.contains("Parallel=4") || w.contains("arallel"),
             "got: {w}"
+        );
+    }
+
+    // ── collect_warnings (the manifest) ─────────────────────────────────────
+
+    #[test]
+    fn collect_warnings_assembles_applicable_checks_in_registry_order() {
+        // The manifest rewrite must keep display order AND aggregate every
+        // applicable check. This config trips three at once: connection-limit
+        // (parallel >= max_connections), sparse-range (density < 0.1), and
+        // parallel-memory (> 5M rows). oversized-chunk and dense-surrogate stay
+        // None, so the survivors must be the other three, in array order.
+        let e = cfg("mode: chunked\nchunk_column: id\nchunk_size: 100000\nparallel: 20\n");
+        let warnings = collect_warnings(
+            &e,
+            Some(10_000_000), // row_estimate
+            None,             // avg_row_bytes → oversized-chunk check is skipped
+            Some("1"),
+            Some("1000000000"), // wide span → sparse range
+            Some(20),           // db max_connections → connection-limit trips
+        );
+        assert_eq!(warnings.len(), 3, "three checks apply: {warnings:?}");
+        assert!(
+            warnings[0].contains("max_connections"),
+            "connection-limit is first in the registry: {warnings:?}"
+        );
+        assert!(
+            warnings[1].contains("Sparse"),
+            "sparse-range is second: {warnings:?}"
+        );
+        assert!(
+            warnings[2].contains("memory"),
+            "parallel-memory is last: {warnings:?}"
         );
     }
 
