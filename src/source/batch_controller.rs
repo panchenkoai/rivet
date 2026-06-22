@@ -136,12 +136,49 @@ impl AdaptiveBatchController {
         }
     }
 
-    /// Sleep `throttle_ms` between batches if configured.
-    pub(crate) fn throttle(&self) {
-        if self.throttle_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(self.throttle_ms));
+    /// Pace the source after emitting a batch of `rows_in_batch` rows.
+    ///
+    /// Sleeps proportionally to the rows actually pulled — a full
+    /// `configured`-size batch pauses the whole `throttle_ms`; a smaller FETCH
+    /// (e.g. a wide table whose batch `work_mem` capped well below `batch_size`)
+    /// pauses proportionally less. Total throttle over a run is therefore
+    /// `throttle_ms × total_rows / configured`, **independent of how many
+    /// batches the row source was split into**.
+    ///
+    /// The old per-batch fixed sleep made the throttle cost scale with the batch
+    /// *count*, which `work_mem` blows up on wide tables: `content_items`
+    /// (~420-row FETCHes) spent ~75% of wall-clock in `thread::sleep` for ~0
+    /// extra source-gentleness (same `pg_tup_returned`/`pg_blks_read`; the long
+    /// snapshot hold was strictly worse). See
+    /// `docs/bench/reports/REPORT_throttle_vs_harm.md`.
+    ///
+    /// A full-size batch (narrow tables, where the FETCH returns `configured`
+    /// rows) still pauses exactly `throttle_ms` — that path is unchanged.
+    pub(crate) fn throttle(&self, rows_in_batch: usize) {
+        let us = throttle_sleep_us(self.throttle_ms, rows_in_batch, self.configured);
+        if us > 0 {
+            std::thread::sleep(std::time::Duration::from_micros(us));
         }
     }
+}
+
+/// Row-proportional throttle, in **microseconds**: `throttle_ms` scaled by the
+/// fraction of a full `configured`-size batch this `rows` batch represents. Pure
+/// (no sleep) so the pacing arithmetic is unit-tested without timing.
+///
+/// Microseconds, not milliseconds, so a small work_mem-capped batch still pauses
+/// a real (sub-ms) amount instead of truncating to `0` — a 420/10000 fraction of
+/// 50 ms is 2100 µs, not `floor(2.1 ms) = 2 ms`, and a 100-row batch is 500 µs,
+/// not `0`. The OS may round a sub-ms sleep up to its timer granularity, which
+/// only ever errs toward *more* throttle (conservative). `rows ≤ configured`
+/// always holds (the memory cap clamps the batch), so the result never exceeds
+/// `throttle_ms`.
+fn throttle_sleep_us(throttle_ms: u64, rows: usize, configured: usize) -> u64 {
+    if throttle_ms == 0 || rows == 0 {
+        return 0;
+    }
+    let configured = configured.max(1) as u128;
+    ((throttle_ms as u128 * 1_000 * rows as u128) / configured) as u64
 }
 
 #[cfg(test)]
@@ -232,6 +269,51 @@ mod tests {
             "expected a shrink under pressure, got {r:?}"
         );
         assert!(c.target() < 10_000);
+    }
+
+    #[test]
+    fn throttle_full_batch_pauses_the_whole_budget() {
+        // Narrow-table path (FETCH returns the configured size) is unchanged:
+        // a full configured-size batch still pauses exactly `throttle_ms` (µs).
+        assert_eq!(throttle_sleep_us(50, 10_000, 10_000), 50_000);
+        assert_eq!(throttle_sleep_us(500, 10_000, 10_000), 500_000);
+    }
+
+    #[test]
+    fn throttle_scales_with_rows_pulled() {
+        // Half a configured batch → half the pause; a work_mem-capped tiny FETCH
+        // → a tiny pause (the wide-table fix: 420/10000 of 50 ms = 2100 µs, not
+        // 50 ms — and not truncated to 0 the way integer-ms would do for <200 rows).
+        assert_eq!(throttle_sleep_us(50, 5_000, 10_000), 25_000);
+        assert_eq!(throttle_sleep_us(50, 420, 10_000), 2_100);
+        assert_eq!(throttle_sleep_us(50, 100, 10_000), 500); // ms math → 0; µs preserves it
+    }
+
+    #[test]
+    fn throttle_total_is_independent_of_batch_count() {
+        // THE fix: splitting the same total rows into more (smaller) batches must
+        // not change the total throttle. 1 batch of 10k vs 10 batches of 1k vs
+        // ~24 batches of 420 → same cumulative budget (exact in µs).
+        let one = throttle_sleep_us(50, 10_000, 10_000);
+        let ten: u64 = (0..10).map(|_| throttle_sleep_us(50, 1_000, 10_000)).sum();
+        assert_eq!(one, ten, "10×1k must equal 1×10k");
+        let mut total = 0u64;
+        let mut left = 10_000usize;
+        while left > 0 {
+            let n = left.min(420);
+            total += throttle_sleep_us(50, n, 10_000);
+            left -= n;
+        }
+        assert_eq!(
+            total, 50_000,
+            "10k rows in 420-row FETCHes = same 50 ms budget"
+        );
+    }
+
+    #[test]
+    fn throttle_zero_or_empty_never_sleeps() {
+        assert_eq!(throttle_sleep_us(0, 10_000, 10_000), 0); // fast profile
+        assert_eq!(throttle_sleep_us(50, 0, 10_000), 0); // empty batch
     }
 
     #[test]

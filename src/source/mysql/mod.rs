@@ -597,7 +597,7 @@ fn mysql_run_export(
             }
 
             log::info!("fetched {} rows so far...", total_rows);
-            ctl.throttle();
+            ctl.throttle(batch.num_rows());
         }
     }
 

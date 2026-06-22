@@ -680,7 +680,7 @@ impl Source for MssqlSource {
                             }
                             // adaptive no-op mid-stream (sample → None); throttle.
                             ctl.after_batch(|| None);
-                            ctl.throttle();
+                            ctl.throttle(n);
                         }
                     }
                 }
