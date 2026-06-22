@@ -571,7 +571,7 @@ fn pg_run_export(
         if row_count < requested {
             break;
         }
-        ctl.throttle();
+        ctl.throttle(row_count);
     }
 
     // Explicit CLOSE is technically redundant — COMMIT releases the cursor —

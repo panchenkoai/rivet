@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.13.1 (2026-06-23) — pace-aware throttle (wide-table extraction no longer sleeps away wall-clock)
+
+A profiling pass found the default `balanced` profile spending most of a wide-table
+extraction's wall-clock asleep in the inter-batch throttle for ~0 source benefit.
+This patch makes the throttle pace by rows pulled instead of per batch — output is
+byte-identical and the source harm is unchanged, the run just stops idling. Also
+picks up a transitive-dependency security advisory.
+
+### Fixed
+
+- **`perf(throttle)` — the inter-batch throttle now paces by rows pulled, not a
+  fixed sleep per batch (ADR-0022).** `throttle()` was
+  `thread::sleep(throttle_ms)` after every batch, so its cost scaled with the
+  batch *count* — which `work_mem` blows up on wide tables (PostgreSQL caps
+  `FETCH N` to avoid a spill). On `content_items` (1.93 M wide rows, ~420-row
+  FETCHes) the `balanced` 50 ms/batch became **~228 s of sleep — 74 % of
+  wall-clock — for ~0 measured source-gentleness** (same `pg_tup_returned` /
+  `pg_blks_read`, and a 6× longer MVCC snapshot hold, by rivet's own
+  `export_harm`). The sleep is now `throttle_ms × rows_in_batch / configured`
+  (in µs), so total pacing is `throttle_ms × total_rows / configured` —
+  independent of how `work_mem` split the FETCHes. A **full** configured-size
+  batch (narrow tables) still pauses exactly `throttle_ms`, so a narrow-table
+  run's pacing is unchanged. Validated live: `content_items` full export on the
+  default `balanced` profile **269.9 s → 55.2 s**, **byte-identical output**
+  (same content hash), `export_harm` unchanged. PostgreSQL is where the pathology
+  lived (work_mem-capped FETCHes); MySQL is a modest ~11 % win, SQL Server
+  unaffected (target-MB batches were already ~full size). See
+  `docs/bench/reports/REPORT_throttle_vs_harm.md`.
+
+### Security
+
+- **`deps` — bump `quinn-proto` 0.11.14 → 0.11.15 for RUSTSEC-2026-0185**
+  (remote memory exhaustion from unbounded out-of-order stream reassembly; high).
+  Transitive dependency; no API or behaviour change.
+
+### Internal
+
+- **`refactor(pg)` — the Arrow text-decode reads each cell as a borrowed `&str`,
+  not an owned `String`.** Drops a per-value allocation + copy on the row→Arrow
+  path (the JSON arm already read zero-copy); output is byte-identical. Profiling
+  found this is *not* the wide-table bottleneck (that was the throttle above), so
+  this is a cleanup, not a speed-up — kept for the symmetry and reduced allocator
+  churn. Adds a `profiling` cargo profile (release codegen + debug symbols).
+
 ## 0.13.0 (2026-06-19) — chunked-mode parity, source-safety & source-harm observability
 
 A pilot run surfaced three chunked-mode gaps; this release closes them. Chunked

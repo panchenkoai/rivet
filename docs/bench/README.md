@@ -37,6 +37,7 @@ Full numbers in [`reports/`](reports/):
 - [`REPORT_mssql.md`](reports/REPORT_mssql.md) — SQL Server, **DBA-harm signals** (lock / transaction / log footprint; competitive perf matrix deferred)
 - [`REPORT_combined.md`](reports/REPORT_combined.md) — PG ↔ MySQL drift per tool
 - [`REPORT_steelman.md`](reports/REPORT_steelman.md) — same suite re-run with every other tool's chunking / memory knobs tuned, to answer "do they catch up if you put effort in?"
+- [`REPORT_throttle_vs_harm.md`](reports/REPORT_throttle_vs_harm.md) — does the `balanced` 50 ms/batch throttle earn its 6.4× wall-clock? (measured by `export_harm`: ~0% harm removed, snapshot held 6× longer)
 
 ## Reproducing
 
