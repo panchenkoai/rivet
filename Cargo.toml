@@ -1,6 +1,6 @@
 [package]
 name = "rivet-cli"
-version = "0.13.0"
+version = "0.13.1"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
@@ -182,4 +182,11 @@ inherits = "release"
 opt-level = "z"
 panic = "abort"
 debug = false
+
+# Profiling: release codegen + debug symbols (no strip) so `sample` / dtrace can
+# symbolicate the row->Arrow decode hot path. Not for distribution.
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = true
 overflow-checks = false
