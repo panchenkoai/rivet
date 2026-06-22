@@ -595,7 +595,13 @@ fn build_pg_text_array(
     match *pg_type {
         Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => {
             for row in rows {
-                let val: Option<String> = row.get(col_idx);
+                // Borrow the cell as `&str` (a view into the Row's wire buffer)
+                // rather than `String`: the old owned read allocated + copied
+                // every text value, then `append_value` copied it again into the
+                // builder. `&str` drops the per-value alloc + the first copy —
+                // the same zero-copy read the JSON arm below already uses. The
+                // bytes appended are byte-identical (String = &str + to_owned).
+                let val: Option<&str> = row.get(col_idx);
                 match val {
                     Some(s) => {
                         value_within_ceiling(column, s.len(), max_value_bytes)?;
