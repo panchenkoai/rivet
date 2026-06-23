@@ -35,6 +35,7 @@ dev — the URL is otherwise visible in `ps` / shell history.
 | `--max-events N` | stop after N changes (otherwise stream until interrupted; the per-event checkpoint makes an interrupted run resumable). |
 | `--slot NAME` | PostgreSQL logical slot (default `rivet_slot`; created if absent). |
 | `--capture-instance NAME` | SQL Server CDC capture instance (e.g. `dbo_orders`) — required for `sqlserver://`. |
+| `--until-current` | Catch up to the source's current log end, then **exit** instead of streaming. For MySQL this sets `BINLOG_DUMP_NON_BLOCK`; PostgreSQL / SQL Server already drain-and-exit. With `--max-events N`, the run stops at the smaller of "N events" or "end of log" — so it never blocks waiting for the N-th event. Ideal for a scheduler. |
 
 The engine is chosen from the URL scheme (`mysql://` / `postgresql://` /
 `sqlserver://`) by `create_change_stream`, the CDC sibling of the batch
@@ -45,6 +46,45 @@ ADR-0004) and a `manifest.json` + `_SUCCESS` is written at clean end — so a
 (real `Timestamp` / `Date32` / `Decimal128`, not strings) flow through `RivetValue`
 structural typing — for all three engines (MySQL binlog values, PostgreSQL
 test_decoding parse, SQL Server change-table `ColumnData`).
+
+## From config (`rivet run`)
+
+CDC also runs as an export in a config, so a scheduled `rivet run` captures
+changes alongside batch exports and records the run the same way:
+
+```yaml
+source:
+  type: mysql
+  url_env: DATABASE_URL          # credentials out of the file
+  tls: { mode: verify-full }     # required for a remote host (see below)
+exports:
+  - name: orders_cdc
+    table: orders
+    mode: cdc
+    format: parquet
+    cdc:
+      checkpoint: /var/lib/rivet/orders.ckpt
+      until_current: true        # drain to now and exit — for a scheduler
+      # per-engine, all optional:
+      server_id: 4271            # MySQL replica id
+      slot: rivet_orders         # PostgreSQL logical slot
+      capture_instance: dbo_orders  # SQL Server (required for sqlserver://)
+    destination: { type: gcs, bucket: my-bucket, prefix: cdc/orders }
+```
+
+```bash
+rivet run --config cdc.yaml      # captures, writes typed Parquet, records the run
+rivet metrics                    # the CDC run appears with mode=cdc, like a batch
+```
+
+A `mode: cdc` export reuses the export's `table`, `destination`, and `format`; the
+`cdc:` block carries only the CDC-specific knobs. Each run produces the standard
+per-export summary block and an `export_metrics` row (rows / files / bytes /
+duration / status), so CDC shows up in `rivet metrics` and the run aggregate
+exactly like a batch export. **TLS:** unlike the CLI (which is loopback-only),
+the config path passes `source.tls` to the change stream — so a remote source over
+TLS requires the `tls:` block, and a remote host without it is refused before any
+connection (the same gate the batch path uses).
 
 ## The three models
 
@@ -233,13 +273,20 @@ overhead.
 
 ## Limitations (current)
 
-- **Typed file output** is complete for MySQL; PostgreSQL and SQL Server currently
-  carry op + table + position (typed before/after is their completion step).
-- **Coarse types:** ints/floats/bool/string land typed; temporal / decimal /
-  binary columns are written as strings for now (full per-type fidelity is in
-  progress).
-- **Checkpoint granularity** is per output file (after it is durably written); a
-  commit-boundary checkpoint (never split a transaction across files) is a planned
-  refinement.
-- **Cloud destinations + manifest** (GCS/S3 + content-MD5 verification, as the
-  batch path has) are the next layer; today `--output` writes local files.
+Typed output (real `Timestamp`/`Date32`/`Decimal128`), commit-boundary
+checkpointing, cloud destinations + `manifest.json`/`_SUCCESS`, and the
+config-driven `rivet run` path with a recorded run are all in place for all three
+engines. What remains:
+
+- **Continuous capture for PostgreSQL / SQL Server** is poll-once-and-exit (they
+  drain their backlog and stop); a long-running daemon reconstructs the stream each
+  cycle. The supported continuous model today is a scheduler running
+  `--until-current` (or `rivet run` with `cdc.until_current`) on an interval, each
+  run resuming from the checkpoint. MySQL streams continuously without `--until-current`.
+- **Schema drift:** the sink schema is frozen at the first flush — a column added
+  mid-run is not picked up until the next run re-resolves the table.
+- **No lag metric:** the run records rows / files / bytes / duration / status, but
+  not replication lag ("how far behind the source is") — the next observability step.
+- **Pre-image completeness** depends on the source config: full UPDATE/DELETE
+  before-images need `binlog_row_image=FULL` (MySQL) / `REPLICA IDENTITY FULL`
+  (PostgreSQL); otherwise only key columns are carried.
