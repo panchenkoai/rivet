@@ -228,6 +228,53 @@ fn cdc_captures_json_as_valid_json() {
     assert_eq!(parsed["b"][1], 3);
 }
 
+#[test]
+#[ignore = "live: requires docker compose mysql (binlog ROW + REPLICATION grant)"]
+fn cdc_crash_after_flush_before_ack_re_reads_on_resume() {
+    // The at-least-once guarantee under a crash: the durable sequence is
+    // flush → checkpoint → ack. A crash AFTER the part is durable but BEFORE the
+    // checkpoint advances must NOT lose the change — the resume re-reads it. (If the
+    // checkpoint were saved before the flush, this run would lose the two changes.)
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_cdc_crash");
+    let _drop = Table(tbl.clone());
+    let mut c = conn();
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let ckpt = d.path().join("cdc.ckpt");
+    write_checkpoint(&mut c, &ckpt);
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1,10),(2,20)"))
+        .unwrap();
+
+    // Run 1 crashes right after the part is flushed, before the checkpoint+ack.
+    let crash_out = d.path().join("crash");
+    std::fs::create_dir_all(&crash_out).unwrap();
+    let crashed = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cdc_config(&d, &tbl, &ckpt, &crash_out).to_str().unwrap(),
+        ])
+        .env("RIVET_TEST_PANIC_AT", "cdc_after_flush_before_ack")
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        !crashed.status.success(),
+        "the injected crash must fail run 1"
+    );
+
+    // Run 2 (no crash): the checkpoint never advanced, so it resumes from the same
+    // position and re-reads both changes — nothing was lost to the crash.
+    let out2 = d.path().join("out2");
+    std::fs::create_dir_all(&out2).unwrap();
+    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out2));
+    assert_eq!(
+        manifest_rows(&out2),
+        2,
+        "resume after a crash before the checkpoint re-reads both changes (no loss)"
+    );
+}
+
 // ─── PostgreSQL: the slot-advance side of at-least-once ──────────────────────
 
 /// Drops the test's logical replication slot on teardown — a slot pins WAL until

@@ -103,6 +103,9 @@ impl PartCommitter<'_> {
         stream: &mut dyn ChangeStream,
     ) -> Result<PartRecord> {
         let part = flush(buf, schema, columns, self.format, self.seq, self.dest)?;
+        // Fault point: the part is durable but the checkpoint/ack have NOT run. A
+        // crash here must re-read on resume (at-least-once) — never lose the change.
+        crate::test_hook::maybe_panic_at("cdc_after_flush_before_ack");
         if let Some(last) = buf.last()
             && last.committed
         {
