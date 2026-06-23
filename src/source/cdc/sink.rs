@@ -54,6 +54,9 @@ pub(crate) struct SinkConfig<'a> {
     pub checkpoint: Option<PathBuf>,
     pub max_events: Option<usize>,
     pub rollover: usize,
+    /// Roll a part once the buffered changes reach this many bytes (estimated),
+    /// whichever comes first with `rollover`. `None` ⇒ row-count only.
+    pub rollover_memory_bytes: Option<usize>,
     /// RFC3339 start time (passed in — `Utc::now()` is the caller's to stamp).
     pub started_at: String,
     /// RFC3339 stamp used as both `finished_at` and the run id seed.
@@ -75,6 +78,7 @@ pub(crate) fn run_to_files(
     let mut schema: Option<SchemaRef> = None;
 
     let mut buf: Vec<ChangeEvent> = Vec::new();
+    let mut buf_bytes = 0usize;
     let mut parts: Vec<PartRecord> = Vec::new();
     let mut seq = 0usize;
     let mut emitted = 0usize;
@@ -85,11 +89,13 @@ pub(crate) fn run_to_files(
             continue;
         }
         let committed = ev.committed;
+        buf_bytes += ev.estimated_bytes();
         buf.push(ev);
         emitted += 1;
-        // Roll a part only at a transaction boundary — never split a transaction
-        // across parts, and only checkpoint a commit position.
-        if committed && buf.len() >= cfg.rollover {
+        // Roll a part only at a transaction boundary (never split a transaction),
+        // once it hits the row-count OR the memory budget — whichever first.
+        let hit_budget = cfg.rollover_memory_bytes.is_some_and(|b| buf_bytes >= b);
+        if committed && (buf.len() >= cfg.rollover || hit_budget) {
             let sch = ensure_schema(&mut schema, &mut columns, &buf);
             parts.push(flush(&buf, &sch, &columns, cfg.format, seq, cfg.dest)?);
             let last_pos = &buf.last().unwrap().position;
@@ -101,6 +107,7 @@ pub(crate) fn run_to_files(
             stream.ack(last_pos)?;
             seq += 1;
             buf.clear();
+            buf_bytes = 0;
         }
         if cfg.max_events.is_some_and(|m| emitted >= m) {
             break;

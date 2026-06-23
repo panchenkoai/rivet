@@ -298,6 +298,7 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
         checkpoint: ckpt,
         max_events: a.max_events,
         rollover: a.rollover,
+        rollover_memory_bytes: None,
         started_at: now.clone(),
         run_id: now,
     };

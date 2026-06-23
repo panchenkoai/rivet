@@ -89,6 +89,19 @@ pub(crate) struct ChangeEvent {
     pub(crate) committed: bool,
 }
 
+impl ChangeEvent {
+    /// Rough in-memory footprint of this buffered change — drives the sink's
+    /// memory-budget rollover (`rollover_memory_mb`). The before/after value
+    /// images dominate; schema/table names + a small fixed overhead are added.
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        let img = |v: &Option<Vec<RivetValue>>| {
+            v.as_ref()
+                .map_or(0, |vs| vs.iter().map(RivetValue::estimated_bytes).sum())
+        };
+        self.schema.len() + self.table.len() + img(&self.before) + img(&self.after) + 32
+    }
+}
+
 /// The seam every engine reader satisfies: a blocking pull of canonical changes.
 ///
 /// `None` ⇒ no more changes available now. MySQL blocks until one arrives, so it

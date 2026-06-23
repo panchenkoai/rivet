@@ -108,6 +108,7 @@ fn run_cdc_inner(
         checkpoint,
         max_events: cdc.max_events,
         rollover: cdc.rollover.unwrap_or(10_000),
+        rollover_memory_bytes: cdc.rollover_memory_mb.map(|mb| mb * 1024 * 1024),
         started_at: now,
         run_id: run_id.to_string(),
     };

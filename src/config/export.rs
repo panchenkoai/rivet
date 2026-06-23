@@ -465,8 +465,14 @@ pub struct CdcExportConfig {
     pub until_current: bool,
     /// Stop after N change events (default: until end of stream / interrupted).
     pub max_events: Option<usize>,
-    /// Rows per output part file (default 10000).
+    /// Rows per output part file (default 10000). A part also rolls at a
+    /// transaction boundary, so it never splits a transaction.
     pub rollover: Option<usize>,
+    /// Roll a part once its buffered changes reach this many MB, whichever comes
+    /// first with `rollover`. Caps the in-memory buffer and the part file size by
+    /// bytes instead of a fixed row count — predictable for tables with wide
+    /// (large JSON / blob) rows, mirroring the batch path's `batch_size_memory_mb`.
+    pub rollover_memory_mb: Option<usize>,
     /// MySQL replica server-id for the binlog connection (default 4271; must be
     /// distinct from the source's and any other replica).
     pub server_id: Option<u32>,

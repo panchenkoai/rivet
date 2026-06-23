@@ -75,6 +75,20 @@ impl RivetValue {
         }
     }
 
+    /// Rough in-memory footprint of this cell — drives the sink's memory-budget
+    /// rollover. Heap length for `Bytes`; the scalar width otherwise.
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        match self {
+            RivetValue::Null | RivetValue::Bool(_) => 1,
+            RivetValue::Int(_)
+            | RivetValue::UInt(_)
+            | RivetValue::Float(_)
+            | RivetValue::TimeMicros(_) => 8,
+            RivetValue::DateTime(_) => 12,
+            RivetValue::Bytes(b) => b.len(),
+        }
+    }
+
     /// Render for NDJSON output. Lossy-by-design (JSON has no decimal/timestamp
     /// type) — the typed Arrow path is the lossless one.
     pub(crate) fn to_json(&self) -> Json {
