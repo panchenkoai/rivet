@@ -4,8 +4,13 @@
 //! `Event` stream into a [`ChangeEvent`] iterator that fits rivet's blocking
 //! source loop (no async runtime, unlike `mysql_async`).
 //!
-//! This is the *reader seam* only — not yet wired to a `mode: cdc` / CLI. Source
-//! prerequisites: `log_bin = ON`, `binlog_format = ROW` (ideally
+//! Each event carries a [`BinlogPos`] — the `(file, pos)` *after* it — so a
+//! consumer can persist a resume point (see [`super::cdc`] checkpoint). Cell
+//! values are decoded to `serde_json::Value`; the residual fidelity gaps
+//! (text-vs-binary ambiguity without column metadata, UINT64 precision in JSON)
+//! are documented inline and mirror rivet's existing value-mapping hazards.
+//!
+//! Source prerequisites: `log_bin = ON`, `binlog_format = ROW` (ideally
 //! `binlog_row_image = FULL` for complete UPDATE pre-images), a `REPLICATION
 //! SLAVE` grant, and a `server_id` distinct from the source's.
 #![allow(dead_code)] // reader seam; the CLI / mode wiring lands in a later increment.
@@ -13,8 +18,10 @@
 use std::collections::{HashMap, VecDeque};
 
 use mysql::binlog::events::{EventData, RowsEventData, TableMapEvent};
+use mysql::binlog::value::BinlogValue;
 use mysql::prelude::Queryable;
-use mysql::{BinlogRequest, BinlogStream, Conn, Opts};
+use mysql::{BinlogRequest, BinlogStream, Conn, Opts, Value};
+use serde_json::Value as Json;
 
 use crate::error::Result;
 
@@ -26,22 +33,27 @@ pub(crate) enum ChangeOp {
     Delete,
 }
 
-/// One row-level change decoded from the binlog.
-///
-/// Cell values are rendered to owned `String`s for now — `BinlogValue` borrows
-/// from the event buffer (can't outlive it), and the *typed* mapping
-/// (`BinlogValue` → rivet's value system, honouring the UINT64 / DECIMAL /
-/// naive-vs-instant-timestamp / JSON hazards) is the deferred "CDC semantics"
-/// work, not the reader seam.
+/// The binlog coordinate *after* an event — the resume point a checkpoint
+/// persists. `file` follows `ROTATE` events; `pos` is the event header's
+/// end-of-event log position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BinlogPos {
+    pub file: String,
+    pub pos: u64,
+}
+
+/// One row-level change decoded from the binlog, with typed cell values.
 #[derive(Debug, Clone)]
 pub(crate) struct ChangeEvent {
     pub op: ChangeOp,
     pub schema: String,
     pub table: String,
     /// Pre-image — present for `Update` and `Delete`.
-    pub before: Option<Vec<String>>,
+    pub before: Option<Vec<Json>>,
     /// Post-image — present for `Insert` and `Update`.
-    pub after: Option<Vec<String>>,
+    pub after: Option<Vec<Json>>,
+    /// Binlog position after this event (the checkpoint resume point).
+    pub pos: BinlogPos,
 }
 
 /// A blocking iterator of [`ChangeEvent`]s over a MySQL binlog stream.
@@ -49,26 +61,29 @@ pub(crate) struct ChangeEvent {
 /// A single binlog ROWS event carries many rows, so decoded changes are buffered
 /// in `pending` and drained one at a time. A `TableMapEvent` (which always
 /// precedes its ROWS event and carries the table identity + column metadata) is
-/// cached by `table_id` and applied to the following rows.
+/// cached by `table_id` and applied to the following rows. `file` tracks the
+/// current binlog file across `ROTATE` events.
 pub(crate) struct MysqlChangeStream {
     stream: BinlogStream,
     tables: HashMap<u64, TableMapEvent<'static>>,
     pending: VecDeque<ChangeEvent>,
+    file: String,
 }
 
 impl MysqlChangeStream {
     /// Open a stream from an explicit `(binlog_file, pos)` coordinate — the
     /// resume path a real CDC run takes from its persisted checkpoint.
-    pub(crate) fn open(url: &str, server_id: u32, file: Vec<u8>, pos: u64) -> Result<Self> {
+    pub(crate) fn open(url: &str, server_id: u32, file: String, pos: u64) -> Result<Self> {
         let conn = Conn::new(Opts::from_url(url)?)?;
         let req = BinlogRequest::new(server_id)
-            .with_filename(file)
+            .with_filename(file.clone().into_bytes())
             .with_pos(pos);
         let stream = conn.get_binlog_stream(req)?;
         Ok(Self {
             stream,
             tables: HashMap::new(),
             pending: VecDeque::new(),
+            file,
         })
     }
 
@@ -79,20 +94,24 @@ impl MysqlChangeStream {
         let row: mysql::Row = c
             .query_first("SHOW MASTER STATUS")?
             .ok_or_else(|| anyhow::anyhow!("mysql: binlog disabled (SHOW MASTER STATUS empty)"))?;
-        let file: Vec<u8> = row.get(0).expect("binlog file column");
+        let file: String = row.get(0).expect("binlog file column");
         let pos: u64 = row.get(1).expect("binlog pos column");
         Self::open(url, server_id, file, pos)
     }
 
     /// Pull one binlog event and expand it into `pending`. `Ok(false)` ⇒ stream
-    /// ended; `Ok(true)` ⇒ consumed an event (which may or may not have produced
-    /// change rows — e.g. a TABLE_MAP or a non-row event).
+    /// ended; `Ok(true)` ⇒ consumed an event.
     fn fill(&mut self) -> Result<bool> {
         let ev = match self.stream.next() {
             Some(ev) => ev?,
             None => return Ok(false),
         };
+        let log_pos = ev.header().log_pos() as u64;
         match ev.read_data()? {
+            // ROTATE → the next binlog file; subsequent positions are in it.
+            Some(EventData::RotateEvent(re)) => {
+                self.file = re.name().to_string();
+            }
             Some(EventData::TableMapEvent(tme)) => {
                 self.tables.insert(tme.table_id(), tme.into_owned());
             }
@@ -110,6 +129,10 @@ impl MysqlChangeStream {
                 };
                 let schema = tme.database_name().to_string();
                 let table = tme.table_name().to_string();
+                let pos = BinlogPos {
+                    file: self.file.clone(),
+                    pos: log_pos,
+                };
                 for row in re.rows(&tme) {
                     let (before, after) = row?;
                     self.pending.push_back(ChangeEvent {
@@ -117,8 +140,9 @@ impl MysqlChangeStream {
                         schema: schema.clone(),
                         table: table.clone(),
                         before: before
-                            .map(|r| r.unwrap().iter().map(|v| format!("{v:?}")).collect()),
-                        after: after.map(|r| r.unwrap().iter().map(|v| format!("{v:?}")).collect()),
+                            .map(|r| r.unwrap().iter().map(binlog_value_to_json).collect()),
+                        after: after.map(|r| r.unwrap().iter().map(binlog_value_to_json).collect()),
+                        pos: pos.clone(),
                     });
                 }
             }
@@ -145,6 +169,34 @@ impl Iterator for MysqlChangeStream {
     }
 }
 
+/// Decode a binlog cell to JSON. Plain `Value`s map by type; JSONB partial-update
+/// diffs (rare) are rendered textually for now.
+fn binlog_value_to_json(bv: &BinlogValue) -> Json {
+    match bv {
+        BinlogValue::Value(v) => value_to_json(v),
+        other => Json::String(format!("{other:?}")),
+    }
+}
+
+/// Map a MySQL [`Value`] to JSON. Documented fidelity gaps: `Bytes` is rendered
+/// utf8-lossy (text-vs-binary is ambiguous in the binlog without column
+/// metadata), and a `UInt` above 2^53 loses precision in a JSON number — both are
+/// the same value-mapping hazards rivet already tracks; typed-from-schema mapping
+/// is future CDC-semantics work.
+fn value_to_json(v: &Value) -> Json {
+    match v {
+        Value::NULL => Json::Null,
+        Value::Int(i) => (*i).into(),
+        Value::UInt(u) => (*u).into(),
+        Value::Float(f) => Json::from(*f as f64),
+        Value::Double(d) => Json::from(*d),
+        Value::Bytes(b) => Json::String(String::from_utf8_lossy(b).into_owned()),
+        Value::Date(..) | Value::Time(..) => {
+            Json::String(v.as_sql(false).trim_matches('\'').to_string())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,7 +205,7 @@ mod tests {
 
     #[test]
     #[ignore = "live: requires docker compose mysql (binlog_format=ROW)"]
-    fn streams_insert_update_delete() {
+    fn streams_typed_insert_update_delete() {
         let mut c = Conn::new(Opts::from_url(URL).unwrap()).unwrap();
         c.query_drop("DROP TABLE IF EXISTS cdc_unit").unwrap();
         c.query_drop("CREATE TABLE cdc_unit (id INT PRIMARY KEY, v INT)")
@@ -166,20 +218,33 @@ mod tests {
             .unwrap();
         c.query_drop("DELETE FROM cdc_unit WHERE id = 1").unwrap();
 
-        let mut ops = Vec::new();
+        let mut events = Vec::new();
         for ev in stream.by_ref() {
             let ev = ev.unwrap();
             if ev.table == "cdc_unit" {
-                ops.push(ev.op);
+                events.push(ev);
             }
-            if ops.len() >= 3 {
+            if events.len() >= 3 {
                 break;
             }
         }
+
+        let ops: Vec<ChangeOp> = events.iter().map(|e| e.op).collect();
         assert_eq!(
             ops,
-            vec![ChangeOp::Insert, ChangeOp::Update, ChangeOp::Delete],
-            "binlog must yield INSERT, UPDATE, DELETE in commit order"
+            vec![ChangeOp::Insert, ChangeOp::Update, ChangeOp::Delete]
         );
+
+        // Typed values: the INSERT after-image is [1, 10] as JSON numbers.
+        assert_eq!(
+            events[0].after.as_deref(),
+            Some([Json::from(1), Json::from(10)].as_slice())
+        );
+        // The UPDATE carries both before (v=10) and after (v=20).
+        assert_eq!(events[1].before.as_ref().unwrap()[1], Json::from(10));
+        assert_eq!(events[1].after.as_ref().unwrap()[1], Json::from(20));
+
+        // Every event carries a binlog position for checkpointing.
+        assert!(!events[2].pos.file.is_empty() && events[2].pos.pos > 0);
     }
 }
