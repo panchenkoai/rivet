@@ -249,22 +249,18 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
         // refuses a remote host (config-driven `rivet run` supplies source.tls).
         tls: None,
     };
-    let mut stream = crate::source::cdc::create_change_stream(&cdc_cfg)?;
-
     let Some(dir) = a.output else {
+        // NDJSON to stdout: no durable sink, so the slot is deliberately not
+        // advanced (correct at-least-once — the consumer owns durability). Resume
+        // for MySQL is the checkpoint file; PostgreSQL re-reads from the slot.
+        let mut stream = crate::source::cdc::create_change_stream(&cdc_cfg)?;
         return crate::source::cdc::run(stream.as_mut(), ckpt, a.table, a.max_events);
     };
 
-    // --output: typed file sink. All three engines carry typed before/after.
-    let engine = if url.starts_with("mysql://") {
-        "mysql"
-    } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-        "postgres"
-    } else if url.starts_with("sqlserver://") || url.starts_with("mssql://") {
-        "mssql"
-    } else {
-        anyhow::bail!("rivet cdc --output: unsupported source url scheme");
-    };
+    // --output: the typed file sink, via the same `run_capture` assembler the
+    // `mode: cdc` run uses. The CLI is the ad-hoc path — `manifest.json` + `_SUCCESS`
+    // at the destination are its run record; `rivet run` is the path that also
+    // writes the state-DB metric + journal.
     let tbl = match a.table.as_slice() {
         [t] => t.clone(),
         _ => anyhow::bail!(
@@ -276,33 +272,25 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
         "csv" => crate::config::FormatType::Csv,
         other => anyhow::bail!("--format must be 'parquet' or 'csv', got {other:?}"),
     };
-    let columns = crate::source::cdc::resolve_cdc_columns(&url, &tbl, None)?;
-
-    // Local destination today; gs:// / s3:// is the same DestinationConfig path
-    // (the commit seam is backend-agnostic).
-    let dest_cfg = crate::config::DestinationConfig {
+    let dest = crate::destination::create_destination(&crate::config::DestinationConfig {
         destination_type: crate::config::DestinationType::Local,
         path: Some(dir.clone()),
         ..Default::default()
-    };
-    let dest = crate::destination::create_destination(&dest_cfg)?;
+    })?;
     let now = chrono::Utc::now().to_rfc3339();
-    let sink_cfg = crate::source::cdc::sink::SinkConfig {
-        columns: &columns,
+    crate::source::cdc::run_capture(crate::source::cdc::CdcCapture {
+        cdc_cfg,
+        table: tbl,
         dest: dest.as_ref(),
         dest_uri: dir,
-        engine,
-        table: &tbl,
         format: fmt,
-        tables: a.table,
-        checkpoint: ckpt,
         max_events: a.max_events,
         rollover: a.rollover,
         rollover_memory_bytes: None,
-        started_at: now.clone(),
-        run_id: now,
-    };
-    crate::source::cdc::sink::run_to_files(stream.as_mut(), sink_cfg).map(|_| ())
+        run_id: now.clone(),
+        started_at: now,
+    })
+    .map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]

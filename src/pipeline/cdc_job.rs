@@ -13,8 +13,7 @@ use super::finalize::finalize_run_report;
 use super::summary::RunSummary;
 use crate::config::{Config, ExportConfig};
 use crate::error::Result;
-use crate::source::cdc::sink::{SinkConfig, run_to_files};
-use crate::source::cdc::{CdcConfig, create_change_stream, engine_label, resolve_cdc_columns};
+use crate::source::cdc::{CdcCapture, CdcConfig, engine_label, run_capture};
 use crate::state::StateStore;
 
 /// Run one `mode: cdc` export end to end, then record + report it like a batch
@@ -96,55 +95,43 @@ pub(super) fn run_cdc_export(
     (result.map(|_| ()), summary)
 }
 
-/// The actual stream → typed files → manifest work. Returns the `RunManifest` so
-/// the caller can record per-part journal events + the run metric.
+/// Build the capture from the config + export and drive it through the shared
+/// [`crate::source::cdc::run_capture`] (the same assembler the `rivet cdc` CLI
+/// uses). Returns the `RunManifest` so the caller records the metric + journal.
 fn run_cdc_inner(
     config: &Config,
     export: &ExportConfig,
     run_id: &str,
 ) -> Result<crate::manifest::RunManifest> {
     let url = config.source.resolve_url()?;
-    let tls = config.source.tls.clone();
     let cdc = export.cdc.clone().unwrap_or_default();
     let table = export
         .table
         .clone()
         .ok_or_else(|| anyhow::anyhow!("export '{}': cdc mode requires `table:`", export.name))?;
-    let checkpoint = cdc.checkpoint.as_ref().map(PathBuf::from);
-
-    let cdc_cfg = CdcConfig {
-        url: url.clone(),
-        server_id: cdc.server_id.unwrap_or(4271),
-        slot: cdc.slot.clone().unwrap_or_else(|| "rivet_slot".to_string()),
-        capture_instance: cdc.capture_instance.clone(),
-        checkpoint: checkpoint.clone(),
-        until_current: cdc.until_current,
-        tls: tls.clone(),
-    };
-    let mut stream = create_change_stream(&cdc_cfg)?;
-
-    let columns = resolve_cdc_columns(&url, &table, tls.as_ref())?;
     let dest = crate::destination::create_destination(&export.destination)?;
-    let dest_uri = export.destination.path.clone().unwrap_or_default();
-    let engine = engine_label(&url)?;
     let now = chrono::Utc::now().to_rfc3339();
 
-    let sink_cfg = SinkConfig {
-        columns: &columns,
+    run_capture(CdcCapture {
+        cdc_cfg: CdcConfig {
+            url,
+            server_id: cdc.server_id.unwrap_or(4271),
+            slot: cdc.slot.clone().unwrap_or_else(|| "rivet_slot".to_string()),
+            capture_instance: cdc.capture_instance.clone(),
+            checkpoint: cdc.checkpoint.as_ref().map(PathBuf::from),
+            until_current: cdc.until_current,
+            tls: config.source.tls.clone(),
+        },
+        table,
         dest: dest.as_ref(),
-        dest_uri,
-        engine,
-        table: &table,
+        dest_uri: export.destination.path.clone().unwrap_or_default(),
         format: export.format,
-        tables: vec![table.clone()],
-        checkpoint,
         max_events: cdc.max_events,
         rollover: cdc.rollover.unwrap_or(10_000),
         rollover_memory_bytes: cdc.rollover_memory_mb.map(|mb| mb * 1024 * 1024),
-        started_at: now,
         run_id: run_id.to_string(),
-    };
-    run_to_files(stream.as_mut(), sink_cfg)
+        started_at: now,
+    })
 }
 
 /// Build the per-run summary (mirrors `synthetic_failed_summary`'s shape, for a

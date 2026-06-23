@@ -296,3 +296,49 @@ pub(crate) fn resolve_cdc_columns(
         &crate::types::ColumnOverrides::new(),
     )
 }
+
+/// Everything needed to capture a change stream to typed files, assembled once —
+/// the source/output differ between the `rivet cdc` CLI and a `mode: cdc` run, but
+/// the capture itself (open the stream, resolve the schema, drive the file sink)
+/// is identical. Both entry points fill this in and call [`run_capture`].
+pub(crate) struct CdcCapture<'a> {
+    pub cdc_cfg: CdcConfig,
+    pub table: String,
+    pub dest: &'a dyn crate::destination::Destination,
+    pub dest_uri: String,
+    pub format: crate::config::FormatType,
+    pub max_events: Option<usize>,
+    pub rollover: usize,
+    pub rollover_memory_bytes: Option<usize>,
+    /// RFC3339 stamps the caller owns (`Utc::now()` is theirs to call).
+    pub run_id: String,
+    pub started_at: String,
+}
+
+/// Open the change stream (with the engine's permission/TLS gate), resolve the
+/// table's typed schema, and drive the commit-seam file sink — the single place
+/// the typed CDC capture is assembled. Returns the run's `RunManifest`.
+pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<crate::manifest::RunManifest> {
+    let url = cap.cdc_cfg.url.clone();
+    let tls = cap.cdc_cfg.tls.clone();
+    let checkpoint = cap.cdc_cfg.checkpoint.clone();
+    let mut stream = create_change_stream(&cap.cdc_cfg)?;
+    let columns = resolve_cdc_columns(&url, &cap.table, tls.as_ref())?;
+    let engine = engine_label(&url)?;
+    let sink_cfg = sink::SinkConfig {
+        columns: &columns,
+        dest: cap.dest,
+        dest_uri: cap.dest_uri,
+        engine,
+        table: &cap.table,
+        format: cap.format,
+        tables: vec![cap.table.clone()],
+        checkpoint,
+        max_events: cap.max_events,
+        rollover: cap.rollover,
+        rollover_memory_bytes: cap.rollover_memory_bytes,
+        started_at: cap.started_at,
+        run_id: cap.run_id,
+    };
+    sink::run_to_files(stream.as_mut(), sink_cfg)
+}
