@@ -40,6 +40,7 @@ pub(crate) fn derive_strategy(export: &ExportConfig) -> String {
             let days = export.days_window.unwrap_or(0);
             format!("time-window({}, {}d)", col, days)
         }
+        ExportMode::Cdc => "cdc".to_string(),
     }
 }
 
@@ -64,6 +65,7 @@ pub(crate) fn diagnose_mode_str(export: &ExportConfig) -> String {
             export.time_column.as_deref().unwrap_or("?"),
             export.days_window.unwrap_or(0)
         ),
+        ExportMode::Cdc => "cdc (change data capture)".to_string(),
     }
 }
 
@@ -523,6 +525,9 @@ pub(crate) fn build_suggestion(
                     let col = export.cursor_column.as_deref().unwrap_or("cursor_column");
                     parts.push(format!("Create an index on '{}'.", col));
                 }
+                // CDC reads the transaction log, not the table — the
+                // full-scan-safety advice below does not apply.
+                ExportMode::Cdc => {}
             }
             parts.push("Use 'safe' tuning profile. Extract during off-peak hours.".to_string());
             Some(parts.join(" "))

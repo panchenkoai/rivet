@@ -408,6 +408,18 @@
         "mode": {
           "$ref": "#/$defs/ExportMode"
         },
+        "cdc": {
+          "description": "Change-data-capture settings, required when `mode: cdc`. Reuses the\nexport's `table`, `destination`, and `format`; carries only the\nCDC-specific knobs (resume checkpoint, per-engine stream params).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CdcExportConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "cursor_column": {
           "type": [
             "string",
@@ -663,13 +675,81 @@
       ]
     },
     "ExportMode": {
-      "type": "string",
-      "enum": [
-        "full",
-        "incremental",
-        "chunked",
-        "time_window"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "full",
+            "incremental",
+            "chunked",
+            "time_window"
+          ]
+        },
+        {
+          "description": "Log-based change data capture (see [`CdcExportConfig`]): stream\nINSERT/UPDATE/DELETE from the source's transaction log instead of querying\nthe table. Reuses the export's `table` / `destination` / `format`.",
+          "type": "string",
+          "const": "cdc"
+        }
       ]
+    },
+    "CdcExportConfig": {
+      "description": "Per-export CDC settings, required when `mode: cdc`. The output `table`,\n`destination`, and `format` come from the export itself; this carries only the\nCDC-specific knobs (resume + per-engine stream params).",
+      "type": "object",
+      "properties": {
+        "checkpoint": {
+          "description": "Persist/resume the source log position to this file. Omit to tail from the\ncurrent position without checkpointing.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "until_current": {
+          "description": "Catch up to the source's current end and exit (a bounded run), instead of\nstreaming indefinitely — ideal for a scheduler. For MySQL this is a\nnon-blocking binlog dump; PostgreSQL / SQL Server already drain-and-exit.",
+          "type": "boolean",
+          "default": false
+        },
+        "max_events": {
+          "description": "Stop after N change events (default: until end of stream / interrupted).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "rollover": {
+          "description": "Rows per output part file (default 10000).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "server_id": {
+          "description": "MySQL replica server-id for the binlog connection (default 4271; must be\ndistinct from the source's and any other replica).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "slot": {
+          "description": "PostgreSQL logical replication slot name (default `rivet_slot`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "capture_instance": {
+          "description": "SQL Server CDC capture instance, e.g. `dbo_orders` — required for\n`sqlserver://` sources.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
     },
     "IncrementalCursorMode": {
       "description": "How the primary (and optional fallback) column(s) participate in incremental extraction.",

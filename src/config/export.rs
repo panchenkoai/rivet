@@ -71,6 +71,11 @@ pub struct ExportConfig {
     pub table: Option<String>,
     #[serde(default = "default_mode")]
     pub mode: ExportMode,
+    /// Change-data-capture settings, required when `mode: cdc`. Reuses the
+    /// export's `table`, `destination`, and `format`; carries only the
+    /// CDC-specific knobs (resume checkpoint, per-engine stream params).
+    #[serde(default)]
+    pub cdc: Option<CdcExportConfig>,
     pub cursor_column: Option<String>,
     /// Secondary column for [`IncrementalCursorMode::Coalesce`] only (see ADR-0007).
     #[serde(default)]
@@ -439,6 +444,37 @@ pub enum ExportMode {
     Incremental,
     Chunked,
     TimeWindow,
+    /// Log-based change data capture (see [`CdcExportConfig`]): stream
+    /// INSERT/UPDATE/DELETE from the source's transaction log instead of querying
+    /// the table. Reuses the export's `table` / `destination` / `format`.
+    Cdc,
+}
+
+/// Per-export CDC settings, required when `mode: cdc`. The output `table`,
+/// `destination`, and `format` come from the export itself; this carries only the
+/// CDC-specific knobs (resume + per-engine stream params).
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Default)]
+pub struct CdcExportConfig {
+    /// Persist/resume the source log position to this file. Omit to tail from the
+    /// current position without checkpointing.
+    pub checkpoint: Option<String>,
+    /// Catch up to the source's current end and exit (a bounded run), instead of
+    /// streaming indefinitely — ideal for a scheduler. For MySQL this is a
+    /// non-blocking binlog dump; PostgreSQL / SQL Server already drain-and-exit.
+    #[serde(default)]
+    pub until_current: bool,
+    /// Stop after N change events (default: until end of stream / interrupted).
+    pub max_events: Option<usize>,
+    /// Rows per output part file (default 10000).
+    pub rollover: Option<usize>,
+    /// MySQL replica server-id for the binlog connection (default 4271; must be
+    /// distinct from the source's and any other replica).
+    pub server_id: Option<u32>,
+    /// PostgreSQL logical replication slot name (default `rivet_slot`).
+    pub slot: Option<String>,
+    /// SQL Server CDC capture instance, e.g. `dbo_orders` — required for
+    /// `sqlserver://` sources.
+    pub capture_instance: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq)]
@@ -480,6 +516,7 @@ pub(crate) fn sample_export(name: &str) -> ExportConfig {
         query_file: None,
         table: None,
         mode: ExportMode::Full,
+        cdc: None,
         cursor_column: None,
         cursor_fallback_column: None,
         incremental_cursor_mode: Default::default(),

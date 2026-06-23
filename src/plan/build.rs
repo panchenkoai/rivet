@@ -95,6 +95,11 @@ pub fn build_plan(
                 days_window,
             }
         }
+        ExportMode::Cdc => anyhow::bail!(
+            "export '{}': cdc mode is run by the CDC runner, not batch plan \
+             resolution (internal routing error — dispatch should branch on mode first)",
+            export.name
+        ),
     };
 
     let (compression, compression_level) = export.effective_compression();
