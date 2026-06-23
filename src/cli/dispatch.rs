@@ -96,16 +96,21 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             checkpoint,
             table,
             max_events,
-        } => {
-            let (url, _prov) = resolve_init_source(source, source_env, source_file)?;
-            let ckpt = checkpoint.map(std::path::PathBuf::from);
-            let mut stream = crate::source::mysql::cdc::MysqlChangeStream::open_or_resume(
-                &url,
-                server_id,
-                ckpt.as_deref(),
-            )?;
-            crate::source::cdc::run(&mut stream, ckpt, table, max_events)
-        }
+            output,
+            format,
+            rollover,
+        } => dispatch_cdc(
+            source,
+            source_env,
+            source_file,
+            server_id,
+            checkpoint,
+            table,
+            max_events,
+            output,
+            format,
+            rollover,
+        ),
         Commands::Init {
             source,
             source_env,
@@ -199,6 +204,76 @@ fn dispatch_schema(what: SchemaKind) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// `rivet cdc` (MySQL): open the binlog change stream and either emit NDJSON
+/// (default) or, with `--output`, write typed Parquet/CSV files. The `--output`
+/// path resolves the single table's column schema from the source via
+/// `type_mappings` and hands it to the file sink.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_cdc(
+    source: Option<String>,
+    source_env: Option<String>,
+    source_file: Option<String>,
+    server_id: u32,
+    checkpoint: Option<String>,
+    table: Vec<String>,
+    max_events: Option<usize>,
+    output: Option<String>,
+    format: String,
+    rollover: usize,
+) -> Result<()> {
+    use crate::source::Source;
+
+    let (url, _prov) = resolve_init_source(source, source_env, source_file)?;
+    let ckpt = checkpoint.map(std::path::PathBuf::from);
+    let mut stream = crate::source::mysql::cdc::MysqlChangeStream::open_or_resume(
+        &url,
+        server_id,
+        ckpt.as_deref(),
+    )?;
+
+    let Some(dir) = output else {
+        return crate::source::cdc::run(&mut stream, ckpt, table, max_events);
+    };
+
+    // --output: typed file sink. One table so its schema is unambiguous.
+    let tbl = match table.as_slice() {
+        [t] => t.clone(),
+        _ => anyhow::bail!(
+            "rivet cdc --output requires exactly one --table (its schema is resolved from the source)"
+        ),
+    };
+    let fmt = match format.as_str() {
+        "parquet" => crate::config::FormatType::Parquet,
+        "csv" => crate::config::FormatType::Csv,
+        other => anyhow::bail!("--format must be 'parquet' or 'csv', got {other:?}"),
+    };
+    let mut src = crate::source::mysql::MysqlSource::connect_with_tls(&url, None)?;
+    let mappings = src.type_mappings(
+        &format!("SELECT * FROM {tbl}"),
+        &crate::types::ColumnOverrides::new(),
+    )?;
+    let columns: Vec<(String, arrow::datatypes::DataType)> = mappings
+        .into_iter()
+        .map(|m| {
+            (
+                m.column_name,
+                m.arrow_type.unwrap_or(arrow::datatypes::DataType::Utf8),
+            )
+        })
+        .collect();
+
+    crate::source::cdc::sink::run_to_files(
+        &mut stream,
+        &columns,
+        std::path::Path::new(&dir),
+        fmt,
+        table,
+        ckpt,
+        max_events,
+        rollover,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

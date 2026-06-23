@@ -163,6 +163,17 @@ pub enum Commands {
         /// Stop after N change events (default: stream until interrupted).
         #[arg(long, value_name = "N")]
         max_events: Option<usize>,
+        /// Write typed Parquet/CSV files to this directory (the upsert/after-image
+        /// shape) instead of NDJSON to stdout. Requires exactly one `--table` —
+        /// its schema is resolved from the source.
+        #[arg(long, value_name = "DIR")]
+        output: Option<String>,
+        /// Output file format when `--output` is set: `parquet` (default) or `csv`.
+        #[arg(long, value_name = "FORMAT", default_value = "parquet")]
+        format: String,
+        /// Rows per output file (rollover) when `--output` is set.
+        #[arg(long, value_name = "N", default_value_t = 10_000)]
+        rollover: usize,
     },
     /// Manage export state
     State {

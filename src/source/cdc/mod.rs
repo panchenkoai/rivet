@@ -12,6 +12,8 @@
 //! own. Same pattern as `source::mysql::cdc`.
 #![allow(dead_code)]
 
+pub(crate) mod sink;
+
 use std::path::{Path, PathBuf};
 
 use serde_json::Value as Json;
