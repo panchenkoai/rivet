@@ -157,7 +157,7 @@ pub struct JournalEntry {
 ///
 /// Accumulated during execution via `record()`.  Query methods let callers
 /// answer the four DoD questions without iterating `entries` directly.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RunJournal {
     pub run_id: String,
     pub export_name: String,

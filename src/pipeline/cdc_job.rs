@@ -14,7 +14,7 @@ use super::summary::RunSummary;
 use crate::config::{Config, ExportConfig};
 use crate::error::Result;
 use crate::source::cdc::sink::{SinkConfig, run_to_files};
-use crate::source::cdc::{CdcConfig, create_change_stream, resolve_cdc_columns};
+use crate::source::cdc::{CdcConfig, create_change_stream, engine_label, resolve_cdc_columns};
 use crate::state::StateStore;
 
 /// Run one `mode: cdc` export end to end, then record + report it like a batch
@@ -121,21 +121,6 @@ fn run_cdc_inner(
     ))
 }
 
-/// The source engine label for the metric row's `source_type`.
-fn engine_label(url: &str) -> Result<&'static str> {
-    if url.starts_with("mysql://") {
-        Ok("mysql")
-    } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-        Ok("postgres")
-    } else if url.starts_with("sqlserver://") || url.starts_with("mssql://") {
-        Ok("mssql")
-    } else {
-        anyhow::bail!(
-            "cdc: unsupported source url scheme (expected mysql:// / postgresql:// / sqlserver://)"
-        )
-    }
-}
-
 /// Build the per-run summary (mirrors `synthetic_failed_summary`'s shape, for a
 /// CDC run). CDC has no plan/tuning/cursor, so those fields default.
 #[allow(clippy::too_many_arguments)]
@@ -149,7 +134,8 @@ fn cdc_summary(
     duration_ms: i64,
     error_message: Option<String>,
 ) -> RunSummary {
-    let journal = crate::journal::RunJournal::new(run_id, &export.name);
+    // Only the fields a CDC run has; the batch-specific rest (cursor, quality,
+    // chunk, reconcile, …) stay at RunSummary::default() (None / 0 / empty).
     RunSummary {
         run_id: run_id.to_string(),
         export_name: export.name.clone(),
@@ -159,28 +145,13 @@ fn cdc_summary(
         bytes_written: bytes,
         files_committed: files,
         duration_ms,
-        peak_rss_mb: 0,
-        retries: 0,
-        validated: None,
-        schema_changed: None,
-        quality_passed: None,
         error_message,
         tuning_profile: "cdc".into(),
-        batch_size: 0,
-        batch_size_memory_mb: None,
         format: export.format.label().to_string(),
         mode: "cdc".into(),
-        compression: String::new(),
         destination_uri: export.destination.path.clone(),
-        source_count: None,
-        pg_temp_bytes_delta: None,
-        skip_reason: None,
-        reconciled: None,
-        manifest_parts: Vec::new(),
-        schema_fingerprint: None,
-        manifest_verification: None,
-        apply_context: None,
-        journal,
+        journal: crate::journal::RunJournal::new(run_id, &export.name),
+        ..Default::default()
     }
 }
 

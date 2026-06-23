@@ -192,6 +192,23 @@ pub(crate) struct CdcConfig {
     pub tls: Option<crate::config::TlsConfig>,
 }
 
+/// The engine label for a CDC source URL's scheme — the one place scheme→engine
+/// lives, shared by the metric/run record and any caller needing the name (the
+/// stream/source constructors still branch because they build different types).
+pub(crate) fn engine_label(url: &str) -> Result<&'static str> {
+    if url.starts_with("mysql://") {
+        Ok("mysql")
+    } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        Ok("postgres")
+    } else if url.starts_with("sqlserver://") || url.starts_with("mssql://") {
+        Ok("mssql")
+    } else {
+        anyhow::bail!(
+            "rivet cdc: unsupported source url — expected mysql:// / postgresql:// / sqlserver://"
+        )
+    }
+}
+
 /// Construct the right [`ChangeStream`] adapter for the source URL's scheme —
 /// dispatching by engine exactly as [`crate::source::create_source`] does for the
 /// batch path.
