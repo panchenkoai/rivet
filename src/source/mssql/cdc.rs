@@ -139,8 +139,12 @@ impl MssqlChangeStream {
              ORDER BY __$start_lsn, __$seqval",
             ci = capture_instance
         );
-        let rows =
-            rt.block_on(async { client.simple_query(sql).await?.into_first_result().await })?;
+        // The most common SQL Server gotcha — "Invalid object name
+        // cdc.fn_cdc_get_all_changes_…" — surfaces here, at the first poll, not at
+        // connect. Append the setup hint so the missing CDC enable is obvious.
+        let rows = rt
+            .block_on(async { client.simple_query(sql).await?.into_first_result().await })
+            .map_err(|e| anyhow::Error::new(e).context(crate::source::cdc::MSSQL_CDC_HINT))?;
         for r in &rows {
             let mut op_code = 0i32;
             let mut lsn = String::new();

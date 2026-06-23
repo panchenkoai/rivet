@@ -69,6 +69,8 @@ rivet run -c cdc.yaml
 
 First run starts from the current log position (or the checkpoint, on a resume); make a change to `orders`, run step 3 again, and it lands as a row (`__op` = insert/update/delete). Output: typed Parquet in `./output/` (or your bucket) + manifest + `_SUCCESS`, and the run appears in `rivet metrics`. Schedule step 3 (cron / Airflow) for continuous capture — each run resumes from the checkpoint. Full reference + grants: [docs/reference/cdc.md](docs/reference/cdc.md).
 
+> **Missing a grant?** If step 1 isn't done, `rivet run` fails with the exact requirement and a pointer to the grants section — e.g. `MySQL CDC needs … a REPLICATION SLAVE + REPLICATION CLIENT grant …` — not a raw driver error.
+
 The generated `cdc.yaml` (pass `--gcs-bucket` / `--s3-bucket` to `init` for a cloud destination instead of local):
 
 ```yaml

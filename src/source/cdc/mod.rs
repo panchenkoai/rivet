@@ -209,10 +209,18 @@ pub(crate) fn engine_label(url: &str) -> Result<&'static str> {
     }
 }
 
+/// Setup/permission hints appended to a CDC start-up error — so a missing grant
+/// surfaces the fix, not just a raw driver error. Phrased "if this is a
+/// permissions/setup error" because the same call can fail for other reasons.
+pub(crate) const MYSQL_CDC_HINT: &str = "if this is a permissions/setup error: MySQL CDC needs binlog_format=ROW plus a REPLICATION SLAVE + REPLICATION CLIENT grant (and SELECT on the table) — see the 'MySQL — the binlog grants' section of docs/reference/cdc.md";
+pub(crate) const PG_CDC_HINT: &str = "if this is a permissions/setup error: PostgreSQL CDC needs wal_level=logical and a role with the REPLICATION attribute — see the 'PostgreSQL — the logical slot' section of docs/reference/cdc.md";
+pub(crate) const MSSQL_CDC_HINT: &str = "if this is a permissions/setup error: SQL Server CDC must be enabled on the table (sys.sp_cdc_enable_table) with SQL Server Agent running, and the reader needs SELECT on the cdc schema — see the 'SQL Server — CDC change tables' section of docs/reference/cdc.md";
+
 /// Construct the right [`ChangeStream`] adapter for the source URL's scheme —
 /// dispatching by engine exactly as [`crate::source::create_source`] does for the
 /// batch path.
 pub(crate) fn create_change_stream(cfg: &CdcConfig) -> Result<Box<dyn ChangeStream>> {
+    use anyhow::Context;
     let url = cfg.url.as_str();
     let tls = cfg.tls.as_ref();
     if url.starts_with("mysql://") {
@@ -223,18 +231,21 @@ pub(crate) fn create_change_stream(cfg: &CdcConfig) -> Result<Box<dyn ChangeStre
                 cfg.checkpoint.as_deref(),
                 cfg.until_current,
                 tls,
-            )?,
+            )
+            .context(MYSQL_CDC_HINT)?,
         ))
     } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
         Ok(Box::new(
-            crate::source::postgres::cdc::PgChangeStream::open(url, &cfg.slot, tls)?,
+            crate::source::postgres::cdc::PgChangeStream::open(url, &cfg.slot, tls)
+                .context(PG_CDC_HINT)?,
         ))
     } else if url.starts_with("sqlserver://") || url.starts_with("mssql://") {
         let ci = cfg.capture_instance.as_deref().ok_or_else(|| {
             anyhow::anyhow!("sqlserver cdc requires --capture-instance (e.g. dbo_orders)")
         })?;
         Ok(Box::new(
-            crate::source::mssql::cdc::MssqlChangeStream::from_url(url, ci, tls)?,
+            crate::source::mssql::cdc::MssqlChangeStream::from_url(url, ci, tls)
+                .context(MSSQL_CDC_HINT)?,
         ))
     } else {
         anyhow::bail!(
