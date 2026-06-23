@@ -231,8 +231,6 @@ struct CdcArgs {
 /// `--output`, write typed Parquet/CSV files through the commit seam. `--output`
 /// resolves the table's column schema from the source via `type_mappings`.
 fn dispatch_cdc(a: CdcArgs) -> Result<()> {
-    use crate::source::Source;
-
     let (url, _prov) = resolve_init_source(a.source, a.source_env, a.source_file)?;
     let ckpt = a.checkpoint.map(std::path::PathBuf::from);
     let cdc_cfg = crate::source::cdc::CdcConfig {
@@ -248,13 +246,17 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
         return crate::source::cdc::run(stream.as_mut(), ckpt, a.table, a.max_events);
     };
 
-    // --output: typed file sink. MySQL-only schema resolution today (PG / SQL
-    // Server typed file output is in progress; NDJSON works for all engines).
-    if !url.starts_with("mysql://") {
+    // --output: typed file sink. MySQL + PostgreSQL carry typed before/after; SQL
+    // Server still streams NDJSON (its value extraction is in progress).
+    let engine = if url.starts_with("mysql://") {
+        "mysql"
+    } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        "postgres"
+    } else {
         anyhow::bail!(
-            "rivet cdc --output currently supports mysql:// only — omit --output to stream NDJSON for PostgreSQL / SQL Server"
+            "rivet cdc --output supports mysql:// and postgresql:// (SQL Server typed file output is in progress) — omit --output to stream NDJSON"
         );
-    }
+    };
     let tbl = match a.table.as_slice() {
         [t] => t.clone(),
         _ => anyhow::bail!(
@@ -266,20 +268,7 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
         "csv" => crate::config::FormatType::Csv,
         other => anyhow::bail!("--format must be 'parquet' or 'csv', got {other:?}"),
     };
-    let mut src = crate::source::mysql::MysqlSource::connect_with_tls(&url, None)?;
-    let mappings = src.type_mappings(
-        &format!("SELECT * FROM {tbl}"),
-        &crate::types::ColumnOverrides::new(),
-    )?;
-    let columns: Vec<(String, arrow::datatypes::DataType)> = mappings
-        .into_iter()
-        .map(|m| {
-            (
-                m.column_name,
-                m.arrow_type.unwrap_or(arrow::datatypes::DataType::Utf8),
-            )
-        })
-        .collect();
+    let columns = resolve_cdc_columns(&url, &tbl)?;
 
     // Local destination today; gs:// / s3:// is the same DestinationConfig path
     // (the commit seam is backend-agnostic).
@@ -294,7 +283,7 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
         columns: &columns,
         dest: dest.as_ref(),
         dest_uri: dir,
-        engine: "mysql",
+        engine,
         table: &tbl,
         format: fmt,
         tables: a.table,
@@ -305,6 +294,37 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
         run_id: now,
     };
     crate::source::cdc::sink::run_to_files(stream.as_mut(), sink_cfg)
+}
+
+/// Resolve a CDC table's column schema (name + Arrow type) from the source — the
+/// same `RivetType` → Arrow pipeline the batch path uses — to type the file sink.
+fn resolve_cdc_columns(
+    url: &str,
+    table: &str,
+) -> Result<Vec<(String, arrow::datatypes::DataType)>> {
+    use crate::source::Source;
+    let mut src: Box<dyn Source> = if url.starts_with("mysql://") {
+        Box::new(crate::source::mysql::MysqlSource::connect_with_tls(
+            url, None,
+        )?)
+    } else {
+        Box::new(crate::source::postgres::PostgresSource::connect_with_tls(
+            url, None,
+        )?)
+    };
+    let mappings = src.type_mappings(
+        &format!("SELECT * FROM {table}"),
+        &crate::types::ColumnOverrides::new(),
+    )?;
+    Ok(mappings
+        .into_iter()
+        .map(|m| {
+            (
+                m.column_name,
+                m.arrow_type.unwrap_or(arrow::datatypes::DataType::Utf8),
+            )
+        })
+        .collect())
 }
 
 #[allow(clippy::too_many_arguments)]

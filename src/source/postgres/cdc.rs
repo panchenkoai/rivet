@@ -26,6 +26,7 @@ use postgres::{Client, NoTls};
 use serde_json::json;
 
 use crate::error::Result;
+use crate::source::cdc::value::RivetValue;
 use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, Position};
 
 /// Polls a logical slot and yields canonical changes.
@@ -111,16 +112,134 @@ fn parse_test_decoding(lsn: &str, data: &str) -> Option<ChangeEvent> {
     } else {
         return None;
     };
+    // After `<OP>: ` comes the `col[type]:value …` list (all columns for
+    // INSERT/UPDATE; the key for DELETE).
+    let cols = tail
+        .split_once(": ")
+        .map(|(_, c)| parse_columns(c))
+        .unwrap_or_default();
+    let (before, after) = match op {
+        ChangeOp::Delete => (Some(cols), None),
+        _ => (None, Some(cols)),
+    };
     Some(ChangeEvent {
         op,
         schema,
         table,
-        before: None,
-        after: None,
+        before,
+        after,
         position: Position(json!({ "lsn": lsn })),
         // The slot only ever yields already-committed changes.
         committed: true,
     })
+}
+
+/// Parse a `test_decoding` column list (`name[type]:value name[type]:value …`)
+/// into typed [`RivetValue`]s, in column order. Values are quoted with `''`
+/// escaping or unquoted (numbers / `t`/`f` / `null`).
+fn parse_columns(s: &str) -> Vec<RivetValue> {
+    let mut out = Vec::new();
+    let mut rest = s.trim_start();
+    while !rest.is_empty() {
+        let Some(lb) = rest.find('[') else { break };
+        let Some(rel) = rest[lb..].find("]:") else {
+            break;
+        };
+        let typ = &rest[lb + 1..lb + rel];
+        let after_colon = &rest[lb + rel + 2..];
+        let (val, quoted, consumed) = parse_value(after_colon);
+        out.push(map_pg_value(typ, &val, quoted));
+        rest = after_colon[consumed..].trim_start();
+    }
+    out
+}
+
+/// Parse one value at the start of `s`. Returns `(value, quoted, bytes_consumed)`.
+fn parse_value(s: &str) -> (String, bool, usize) {
+    let b = s.as_bytes();
+    if b.first() != Some(&b'\'') {
+        let end = s.find(' ').unwrap_or(s.len());
+        return (s[..end].to_string(), false, end);
+    }
+    // quoted: copy chars, collapsing `''` → `'`, until the lone closing quote.
+    let mut v = String::new();
+    let mut i = 1;
+    while i < b.len() {
+        if b[i] == b'\'' {
+            if b.get(i + 1) == Some(&b'\'') {
+                v.push('\'');
+                i += 2;
+            } else {
+                return (v, true, i + 1);
+            }
+        } else {
+            let n = utf8_len(b[i]);
+            v.push_str(&s[i..i + n]);
+            i += n;
+        }
+    }
+    (v, true, i)
+}
+
+fn utf8_len(lead: u8) -> usize {
+    match lead {
+        b if b < 0x80 => 1,
+        b if b >> 5 == 0b110 => 2,
+        b if b >> 4 == 0b1110 => 3,
+        _ => 4,
+    }
+}
+
+/// Map a `test_decoding` `(type, value)` to a typed [`RivetValue`]. The column
+/// type is explicit in the stream, so timestamp-vs-timestamptz is never guessed
+/// (no naive-vs-instant hazard). Decimals carry exact text → `Decimal128`.
+fn map_pg_value(typ: &str, val: &str, quoted: bool) -> RivetValue {
+    if !quoted && val == "null" {
+        return RivetValue::Null;
+    }
+    let t = typ;
+    if t == "integer" || t == "bigint" || t == "smallint" || t == "oid" {
+        return val.parse::<i64>().map_or(RivetValue::Null, RivetValue::Int);
+    }
+    if t.starts_with("numeric") || t.starts_with("decimal") {
+        return RivetValue::Bytes(val.as_bytes().to_vec());
+    }
+    if t == "boolean" {
+        return RivetValue::Bool(val == "t" || val == "true");
+    }
+    if t == "double precision" || t == "real" {
+        return val
+            .parse::<f64>()
+            .map_or(RivetValue::Null, RivetValue::Float);
+    }
+    if t.starts_with("timestamp") {
+        return parse_pg_timestamp(val);
+    }
+    if t == "date" {
+        return chrono::NaiveDate::parse_from_str(val, "%Y-%m-%d")
+            .ok()
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .map_or(RivetValue::Null, RivetValue::DateTime);
+    }
+    // text / varchar / char / uuid / json / … → string bytes.
+    RivetValue::Bytes(val.as_bytes().to_vec())
+}
+
+/// Parse a PostgreSQL timestamp rendering (`YYYY-MM-DD HH:MM:SS[.ffffff][+TZ]`).
+/// For `timestamptz` the offset is stripped to the instant's UTC wall-clock.
+fn parse_pg_timestamp(val: &str) -> RivetValue {
+    let naive = val
+        .split('+')
+        .next()
+        .unwrap_or(val)
+        .trim_end()
+        .trim_end_matches('Z');
+    for fmt in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M:%S"] {
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(naive, fmt) {
+            return RivetValue::DateTime(dt);
+        }
+    }
+    RivetValue::Null
 }
 
 #[cfg(test)]
@@ -129,6 +248,23 @@ mod tests {
 
     const CONN: &str = "host=127.0.0.1 user=rivet password=rivet dbname=rivet";
     const SLOT: &str = "rivet_cdc_test";
+
+    #[test]
+    fn parses_typed_columns_from_test_decoding() {
+        let line = "table public.t: INSERT: id[integer]:1 name[text]:'alice o''brien' \
+                    amount[numeric]:150.05 ts[timestamp without time zone]:'2026-06-23 11:58:01' \
+                    flag[boolean]:t maybe[integer]:null";
+        let ev = parse_test_decoding("0/ABC", line).unwrap();
+        assert_eq!(ev.op, ChangeOp::Insert);
+        assert_eq!(ev.table, "t");
+        let after = ev.after.unwrap();
+        assert_eq!(after[0], RivetValue::Int(1));
+        assert_eq!(after[1], RivetValue::Bytes(b"alice o'brien".to_vec())); // '' → '
+        assert_eq!(after[2], RivetValue::Bytes(b"150.05".to_vec())); // decimal text
+        assert!(matches!(after[3], RivetValue::DateTime(_)));
+        assert_eq!(after[4], RivetValue::Bool(true));
+        assert_eq!(after[5], RivetValue::Null);
+    }
 
     #[test]
     #[ignore = "live: requires docker compose postgres (wal_level=logical)"]
