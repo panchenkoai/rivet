@@ -193,6 +193,8 @@ fn record_metric(state: &StateStore, config: &Config, export: &ExportConfig, sum
         .ok()
         .and_then(|u| engine_label(&u).ok())
         .map(|s| s.to_string());
+    // Only the fields a CDC run actually has; the batch-specific rest (chunk_size,
+    // cursor, quality, …) stay at their MetricRow::default() (None / 0).
     let row = crate::state::MetricRow {
         export_name: summary.export_name.clone(),
         run_id: summary.run_id.clone(),
@@ -206,24 +208,12 @@ fn record_metric(state: &StateStore, config: &Config, export: &ExportConfig, sum
         mode: Some("cdc".to_string()),
         files_produced: summary.files_produced as i64,
         bytes_written: summary.bytes_written as i64,
-        retries: 0,
-        validated: None,
-        schema_changed: None,
         files_committed: summary.files_committed as i64,
-        reconciled: None,
-        source_count: None,
-        quality_passed: None,
-        pg_temp_bytes_delta: None,
-        batch_size: 0,
-        batch_size_memory_mb: None,
-        skip_reason: None,
-        schema_fingerprint: None,
-        chunk_size: None,
-        parallel: None,
         source_type,
         destination_type: Some(export.destination.destination_type.label().to_string()),
         rivet_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         longest_chunk_ms: summary.journal.longest_chunk_ms(),
+        ..Default::default()
     };
     if let Err(e) = state.record_metric_full(&row) {
         log::warn!(
