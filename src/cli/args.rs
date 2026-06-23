@@ -237,6 +237,13 @@ pub enum Commands {
             conflicts_with_all = ["gcs_bucket", "gcs_credentials_file", "s3_bucket", "s3_region"]
         )]
         discover: bool,
+        /// Override the suggested extraction mode for every scaffolded export.
+        /// `cdc` scaffolds a change-data-capture export (mode: cdc + a cdc: block
+        /// with engine-specific stream params) instead of a batch query. Other
+        /// values (full / incremental / chunked / time_window) just override the
+        /// auto-suggested mode.
+        #[arg(long, value_name = "MODE")]
+        mode: Option<String>,
         /// Scaffold `destination: type: gcs` with this bucket (each export gets `prefix: exports/<table>/`).
         /// Incompatible with `--s3-bucket` and `--discover`.
         #[arg(long = "gcs-bucket", value_name = "NAME", conflicts_with = "s3_bucket")]

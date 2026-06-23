@@ -127,6 +127,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             exclude,
             output,
             discover,
+            mode,
             gcs_bucket,
             gcs_credentials_file,
             s3_bucket,
@@ -141,6 +142,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             exclude,
             output,
             discover,
+            mode,
             gcs_bucket,
             gcs_credentials_file,
             s3_bucket,
@@ -452,11 +454,22 @@ fn dispatch_init(
     exclude: Vec<String>,
     output: Option<String>,
     discover: bool,
+    mode: Option<String>,
     gcs_bucket: Option<String>,
     gcs_credentials_file: Option<String>,
     s3_bucket: Option<String>,
     s3_region: Option<String>,
 ) -> Result<()> {
+    if let Some(m) = mode.as_deref()
+        && !matches!(
+            m,
+            "full" | "incremental" | "chunked" | "time_window" | "cdc"
+        )
+    {
+        anyhow::bail!(
+            "--mode must be one of: full, incremental, chunked, time_window, cdc (got {m:?})"
+        );
+    }
     let fmt = if discover {
         init::InitFormat::DiscoveryJson
     } else {
@@ -479,6 +492,7 @@ fn dispatch_init(
         fmt,
         yaml_dest,
         &filter,
+        mode.as_deref(),
     )
 }
 

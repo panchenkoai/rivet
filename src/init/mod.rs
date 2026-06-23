@@ -340,6 +340,7 @@ pub fn init(
     format: InitFormat,
     yaml_destination: InitYamlDestination,
     filter: &TableFilter,
+    mode_override: Option<&str>,
 ) -> Result<()> {
     yaml_destination.validate()?;
     let (text, yaml_decimal_review) = match format {
@@ -350,6 +351,7 @@ pub fn init(
             schema,
             &yaml_destination,
             filter,
+            mode_override,
         )?,
         InitFormat::DiscoveryJson => {
             // Defensive backstop for non-CLI callers; the `rivet init` CLI
@@ -427,6 +429,7 @@ fn init_yaml(
     schema: Option<&str>,
     dest: &InitYamlDestination,
     filter: &TableFilter,
+    mode_override: Option<&str>,
 ) -> Result<(String, bool)> {
     if let Some(t) = table {
         let (sch, table_name) = yaml_scaffold::parse_table(t);
@@ -446,7 +449,8 @@ fn init_yaml(
             _ => unreachable!(),
         };
         let hint = yaml_scaffold::table_has_unbounded_decimal_columns(&info);
-        let yaml = yaml_scaffold::generate_config(&info, source_url, provenance, dest)?;
+        let yaml =
+            yaml_scaffold::generate_config(&info, source_url, provenance, dest, mode_override)?;
         return Ok((yaml, hint));
     }
     let infos = introspect_all(source_url, schema, filter)?;
@@ -457,7 +461,14 @@ fn init_yaml(
     let hint = infos
         .iter()
         .any(yaml_scaffold::table_has_unbounded_decimal_columns);
-    let yaml = yaml_scaffold::generate_schema_config(&infos, source_url, provenance, &label, dest)?;
+    let yaml = yaml_scaffold::generate_schema_config(
+        &infos,
+        source_url,
+        provenance,
+        &label,
+        dest,
+        mode_override,
+    )?;
     Ok((yaml, hint))
 }
 
@@ -763,6 +774,7 @@ mod tests {
             "postgresql://localhost/db",
             &super::SourceProvenance::Inline,
             &InitYamlDestination::default(),
+            None,
         )
         .unwrap();
         assert!(yaml.contains("mode: chunked"), "got:\n{yaml}");
@@ -783,6 +795,7 @@ mod tests {
             "mysql://localhost/db",
             &super::SourceProvenance::Inline,
             &InitYamlDestination::default(),
+            None,
         )
         .unwrap();
         assert!(yaml.contains("mode: incremental"), "got:\n{yaml}");
@@ -812,6 +825,7 @@ mod tests {
             &super::SourceProvenance::Inline,
             r#"schema "public" (2)"#,
             &InitYamlDestination::default(),
+            None,
         )
         .unwrap();
         assert!(yaml.contains("  - name: users"), "got:\n{yaml}");
@@ -847,6 +861,7 @@ mod tests {
             "postgresql://localhost/db",
             &super::SourceProvenance::Inline,
             &dest,
+            None,
         )
         .unwrap();
         assert!(yaml.contains("type: gcs"), "got:\n{yaml}");
@@ -872,6 +887,7 @@ mod tests {
             "postgresql://localhost/db",
             &super::SourceProvenance::Inline,
             &dest,
+            None,
         )
         .unwrap();
         assert!(
@@ -897,6 +913,7 @@ mod tests {
             "postgresql://localhost/db",
             &super::SourceProvenance::Inline,
             &dest,
+            None,
         )
         .unwrap();
         assert!(yaml.contains("type: s3"), "got:\n{yaml}");
@@ -927,6 +944,7 @@ mod tests {
             "postgresql://localhost/db",
             &super::SourceProvenance::Inline,
             &dest,
+            None,
         )
         .unwrap();
         assert!(yaml.contains("type: s3"), "got:\n{yaml}");
@@ -1023,6 +1041,7 @@ mod tests {
             "postgresql://localhost/db",
             &super::SourceProvenance::Inline,
             &dest,
+            None,
         )
         .unwrap();
         // Plain `bucket: true` would deserialize to the boolean `true`.
@@ -1053,6 +1072,7 @@ mod tests {
             "postgresql://localhost/db",
             &super::SourceProvenance::Inline,
             &dest,
+            None,
         )
         .unwrap();
         let parsed: serde_yaml_ng::Value =
@@ -1079,6 +1099,7 @@ mod tests {
             "postgresql://localhost/db",
             &super::SourceProvenance::Inline,
             &dest,
+            None,
         )
         .unwrap();
         let parsed: serde_yaml_ng::Value =
