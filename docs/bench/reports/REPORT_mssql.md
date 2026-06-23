@@ -171,3 +171,47 @@ materialised ~10 GB and OOM'd. `chunk_size` now controls only the file layout;
 So the matrix's wide-row RSS numbers above are a pre-streaming artifact, not a
 floor. (Row-byte introspection so `chunk_size_memory_mb` sizes by bytes is still
 roadmap, but lower priority now that streaming bounds memory regardless.)
+
+## Wide-row *wall* re-measured fairly (2026-06-23) — the gap was the seed and the mode, not the connector
+
+The "rivet still trails on wall on heavy text" caveat above (and the `8m03s` full
+number) was measured on a **mis-prepared** `content_items` and before the
+pace-aware-throttle fix (0.13.1). Re-measuring fairly collapses the gap.
+
+Three things were wrong, none of them rivet's extraction code:
+
+1. **The seed used `NVARCHAR(MAX)` for pure-ASCII content** (`lorem ipsum`). The
+   PG/MySQL twins store the same text as UTF-8 (`text` / `longtext`); NVARCHAR
+   stores it as **UTF-16 — double the bytes for zero benefit on ASCII** — and
+   forces the `tiberius` driver to transcode UTF-16→UTF-8 on every value. The
+   table was **30.6 GB** vs PG's 1.4 GB (TOAST-compressed UTF-8) for identical
+   logical content. Fixed in `dev/bench/seed_bench_mssql.sql` (→ VARCHAR, 15.3 GB).
+2. **The per-batch throttle** spent ~75 % of a wide-table run asleep (fixed in
+   0.13.1, ADR-0022).
+3. **`mode: full` is the wrong mode for a 2 M-row table** — the recommended path
+   is `chunked` + `parallel`, which `rivet init` auto-selects.
+
+Re-measured on the **VARCHAR** `content_items` (2 M rows, 15.3 GB), rivet 0.13.1:
+
+| mode | wall | vs PG (chunked ‖8 = 37.6 s) |
+|---|---:|---|
+| `mode: full` (1 connection) | 161 s | ~3× — single-connection `tiberius` decode |
+| `chunked` ‖4 | 52.8 s | ~1.4× |
+| **`chunked` ‖8** | **39.8 s** | **≈ parity** |
+
+A `sample` profile of single-connection `mode: full` puts **~91 % of wall-clock in
+`tiberius::tds::codec::column_data::string`/`plp::decode`** — the TDS string
+decode, *not* rivet's row→Arrow path (`build_array` barely registers) and *not*
+the network (`recvfrom` is noise). Per connection `tiberius` is ~3× slower than
+`tokio_postgres` is for PG. But that decode is **CPU-bound, and CPU-bound work
+parallelises**: across 8 chunk connections rivet recovers the gap entirely
+(`chunked ‖8` ≈ PG). Bumping the TDS `packet_size` 4096→32767 was tested and made
+**no** difference — the cost is the byte-level UTF-16/PLP decode, not packet
+framing.
+
+**Conclusion:** on a fairly-typed table and the recommended `chunked` path,
+rivet's SQL Server throughput is **competitive with PostgreSQL** (≈ 40 s for 2 M
+heavy-text rows). The single-connection deficit is real and lives in `tiberius`
+(an ODBC path or upstream-`tiberius` decode work would close it), but it is not on
+the path a large-table extraction takes, so decode-path speedups are **not** a
+throughput blocker — parallelism already covers it.
