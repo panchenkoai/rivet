@@ -25,6 +25,7 @@ use mysql::{BinlogRequest, BinlogStream, Conn, Opts};
 use serde_json::{Value as Json, json};
 
 use crate::error::Result;
+use crate::source::cdc::value::RivetValue;
 use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, Position};
 
 /// A blocking iterator of canonical [`ChangeEvent`]s over a MySQL binlog stream.
@@ -158,10 +159,18 @@ impl MysqlChangeStream {
     }
 }
 
-/// Render a binlog row's cells to JSON. (Candidate 2 routes this through the
-/// `RivetType` pipeline for typed Arrow output.)
-fn render_row(r: mysql::binlog::row::BinlogRow) -> Vec<Json> {
-    r.unwrap().iter().map(binlog_value_to_json).collect()
+/// Decode a binlog row's cells to typed [`RivetValue`]s (structural — no string
+/// reparse of temporals).
+fn render_row(r: mysql::binlog::row::BinlogRow) -> Vec<RivetValue> {
+    r.unwrap().iter().map(binlog_value_to_rivet).collect()
+}
+
+fn binlog_value_to_rivet(bv: &BinlogValue) -> RivetValue {
+    match bv {
+        BinlogValue::Value(v) => RivetValue::from_mysql(v),
+        // JSONB partial-update diffs (rare) — carry the debug bytes as text.
+        other => RivetValue::Bytes(format!("{other:?}").into_bytes()),
+    }
 }
 
 impl Iterator for MysqlChangeStream {
@@ -184,35 +193,6 @@ impl Iterator for MysqlChangeStream {
 impl ChangeStream for MysqlChangeStream {
     fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
         self.next()
-    }
-}
-
-/// Decode a binlog cell to JSON. Plain `Value`s map by type; JSONB partial-update
-/// diffs (rare) are rendered textually for now.
-fn binlog_value_to_json(bv: &BinlogValue) -> Json {
-    match bv {
-        BinlogValue::Value(v) => value_to_json(v),
-        other => Json::String(format!("{other:?}")),
-    }
-}
-
-/// Map a MySQL [`mysql::Value`] to JSON. Documented fidelity gaps: `Bytes` is
-/// rendered utf8-lossy (text-vs-binary is ambiguous in the binlog without column
-/// metadata), and a `UInt` above 2^53 loses precision in a JSON number — the same
-/// value-mapping hazards rivet already tracks. Candidate 2 replaces this with the
-/// `RivetType` pipeline.
-fn value_to_json(v: &mysql::Value) -> Json {
-    use mysql::Value;
-    match v {
-        Value::NULL => Json::Null,
-        Value::Int(i) => (*i).into(),
-        Value::UInt(u) => (*u).into(),
-        Value::Float(f) => Json::from(*f as f64),
-        Value::Double(d) => Json::from(*d),
-        Value::Bytes(b) => Json::String(String::from_utf8_lossy(b).into_owned()),
-        Value::Date(..) | Value::Time(..) => {
-            Json::String(v.as_sql(false).trim_matches('\'').to_string())
-        }
     }
 }
 
@@ -255,10 +235,10 @@ mod tests {
         // Typed values: the INSERT after-image is [1, 10] as JSON numbers.
         assert_eq!(
             events[0].after.as_deref(),
-            Some([Json::from(1), Json::from(10)].as_slice())
+            Some([RivetValue::Int(1), RivetValue::Int(10)].as_slice())
         );
-        assert_eq!(events[1].before.as_ref().unwrap()[1], Json::from(10));
-        assert_eq!(events[1].after.as_ref().unwrap()[1], Json::from(20));
+        assert_eq!(events[1].before.as_ref().unwrap()[1], RivetValue::Int(10));
+        assert_eq!(events[1].after.as_ref().unwrap()[1], RivetValue::Int(20));
         // Every event carries a canonical position for checkpointing.
         assert!(
             events[2]
@@ -290,7 +270,7 @@ mod tests {
             .map(|e| e.unwrap())
             .find(|e| e.table == "cdc_resume")
             .unwrap();
-        assert_eq!(a.after.as_ref().unwrap()[0], Json::from(1));
+        assert_eq!(a.after.as_ref().unwrap()[0], RivetValue::Int(1));
 
         let dir = tempfile::tempdir().unwrap();
         let ckpt = dir.path().join("mysql.ckpt.json");
@@ -312,7 +292,7 @@ mod tests {
         assert_eq!(b.op, ChangeOp::Insert);
         assert_eq!(
             b.after.as_ref().unwrap()[0],
-            Json::from(2),
+            RivetValue::Int(2),
             "resumed stream must start after the checkpoint, not re-read A"
         );
     }

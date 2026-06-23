@@ -13,12 +13,14 @@
 #![allow(dead_code)]
 
 pub(crate) mod sink;
+pub(crate) mod value;
 
 use std::path::{Path, PathBuf};
 
 use serde_json::Value as Json;
 
 use crate::error::Result;
+use value::RivetValue;
 
 /// Canonical DML kind. Engine framing — PostgreSQL `BEGIN`/`COMMIT` markers, the
 /// SQL Server update before/after split — is normalised away by each adapter; a
@@ -73,9 +75,9 @@ pub(crate) struct ChangeEvent {
     pub(crate) schema: String,
     pub(crate) table: String,
     /// Pre-image — present for `Update`/`Delete` when the engine carries it.
-    pub(crate) before: Option<Vec<Json>>,
+    pub(crate) before: Option<Vec<RivetValue>>,
     /// Post-image — present for `Insert`/`Update` when the engine carries it.
-    pub(crate) after: Option<Vec<Json>>,
+    pub(crate) after: Option<Vec<RivetValue>>,
     /// Resume position after this change.
     pub(crate) position: Position,
     /// `true` if this is the last change in its source transaction — the only
@@ -115,12 +117,16 @@ pub(crate) fn run(
         if !tables.is_empty() && !tables.iter().any(|t| t == &ev.table) {
             continue;
         }
+        let to_json = |img: &Option<Vec<RivetValue>>| {
+            img.as_ref()
+                .map(|vs| vs.iter().map(RivetValue::to_json).collect::<Vec<_>>())
+        };
         let line = serde_json::json!({
             "op": ev.op.as_str(),
             "schema": ev.schema,
             "table": ev.table,
-            "before": ev.before,
-            "after": ev.after,
+            "before": to_json(&ev.before),
+            "after": to_json(&ev.after),
             "pos": ev.position.0,
         });
         println!("{line}");

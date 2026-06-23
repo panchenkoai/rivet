@@ -6,86 +6,30 @@
 //! (upsert shape). A `DELETE` carries its key columns from the before-image.
 //! Downstream MERGEs by PK + `__op` — the latest full image per key wins.
 //!
-//! This reuses the interchange layer (`create_format` / `FormatWriter`); wiring
-//! to the full `ExportSink` (cloud destination + manifest + content-MD5) is the
-//! next layer. Per-type fidelity is coarsened (see [`coarse_type`]) — full
-//! temporal/decimal typing is the completion step.
+//! Column typing flows through [`super::value`] (`RivetValue` → Arrow), so
+//! temporals/decimals land as real `Timestamp`/`Date32`/`Decimal128` columns, not
+//! strings. This reuses the interchange layer (`create_format` / `FormatWriter`);
+//! wiring to the full `ExportSink` commit seam (cloud destination + manifest +
+//! content-MD5) is the next layer.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::array::{ArrayRef, StringArray};
+use arrow::datatypes::DataType;
+use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use serde_json::Value as Json;
 
 use crate::config::{CompressionType, FormatType};
 use crate::error::Result;
+use crate::source::cdc::value::{self, RivetValue};
 use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream};
 
-/// Coarsen a resolved Arrow type to one this sink builds from JSON values: ints →
-/// `Int64`, floats → `Float64`, bool → `Boolean`, strings → `Utf8`, everything
-/// else (temporal, decimal, binary, nested) → `Utf8` (stringified). Keeps the
-/// schema and the built arrays consistent; full per-type fidelity is the
-/// completion step.
-fn coarse_type(dt: &DataType) -> DataType {
-    match dt {
-        DataType::Int8
-        | DataType::Int16
-        | DataType::Int32
-        | DataType::Int64
-        | DataType::UInt8
-        | DataType::UInt16
-        | DataType::UInt32
-        | DataType::UInt64 => DataType::Int64,
-        DataType::Float16 | DataType::Float32 | DataType::Float64 => DataType::Float64,
-        DataType::Boolean => DataType::Boolean,
-        _ => DataType::Utf8,
-    }
-}
-
-/// Build one Arrow column from JSON cells (one per row; `None` ⇒ null). `dt` is
-/// the already-coarsened type.
-fn build_column(dt: &DataType, cells: &[Option<&Json>]) -> ArrayRef {
-    match dt {
-        DataType::Int64 => Arc::new(
-            cells
-                .iter()
-                .map(|c| c.and_then(Json::as_i64))
-                .collect::<Int64Array>(),
-        ),
-        DataType::Float64 => Arc::new(
-            cells
-                .iter()
-                .map(|c| c.and_then(Json::as_f64))
-                .collect::<Float64Array>(),
-        ),
-        DataType::Boolean => Arc::new(
-            cells
-                .iter()
-                .map(|c| c.and_then(Json::as_bool))
-                .collect::<BooleanArray>(),
-        ),
-        _ => Arc::new(
-            cells
-                .iter()
-                .map(|c| c.map(json_to_string))
-                .collect::<StringArray>(),
-        ),
-    }
-}
-
-fn json_to_string(v: &Json) -> String {
-    match v {
-        Json::String(s) => s.clone(),
-        other => other.to_string(),
-    }
-}
-
 /// Stream canonical changes to typed Parquet/CSV files under `out_dir`, rolling a
-/// new file every `rollover` rows. Persists the checkpoint after each file is
-/// durably written. Stops at end of stream, `max_events`, or interruption.
+/// new file at the first transaction boundary past `rollover` rows. Persists the
+/// checkpoint (a commit position) after each file is durably written. Stops at end
+/// of stream, `max_events`, or interruption.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_to_files(
     stream: &mut dyn ChangeStream,
@@ -98,14 +42,14 @@ pub(crate) fn run_to_files(
     rollover: usize,
 ) -> Result<()> {
     std::fs::create_dir_all(out_dir)?;
-    // __op, __pos, then the coarsened source columns (all nullable — a DELETE row
+    // __op, __pos, then the typed source columns (all nullable — a DELETE row
     // carries only its key).
     let mut fields = vec![
         Field::new("__op", DataType::Utf8, false),
         Field::new("__pos", DataType::Utf8, false),
     ];
     for (name, dt) in columns {
-        fields.push(Field::new(name, coarse_type(dt), true));
+        fields.push(Field::new(name, value::sink_type(dt), true));
     }
     let schema: SchemaRef = Arc::new(Schema::new(fields));
 
@@ -169,8 +113,7 @@ fn flush(
     );
     let mut arrays: Vec<ArrayRef> = vec![ops, poss];
     for (i, (_, dt)) in columns.iter().enumerate() {
-        let coarse = coarse_type(dt);
-        let cells: Vec<Option<&Json>> = events
+        let cells: Vec<Option<&RivetValue>> = events
             .iter()
             .map(|e| {
                 // after-image for insert/update; before-image (the key) for delete
@@ -181,7 +124,7 @@ fn flush(
                 image.and_then(|vals| vals.get(i))
             })
             .collect();
-        arrays.push(build_column(&coarse, &cells));
+        arrays.push(value::build_column(&value::sink_type(dt), &cells)?);
     }
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
 
