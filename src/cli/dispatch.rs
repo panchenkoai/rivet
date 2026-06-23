@@ -88,6 +88,24 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             target,
         } => dispatch_check(config, export, params, type_report, strict, json, target),
         Commands::Doctor { config } => preflight::doctor(&config),
+        Commands::Cdc {
+            source,
+            source_env,
+            source_file,
+            server_id,
+            checkpoint,
+            table,
+            max_events,
+        } => {
+            let (url, _prov) = resolve_init_source(source, source_env, source_file)?;
+            crate::source::mysql::cdc::run(
+                &url,
+                server_id,
+                checkpoint.map(std::path::PathBuf::from),
+                table,
+                max_events,
+            )
+        }
         Commands::Init {
             source,
             source_env,

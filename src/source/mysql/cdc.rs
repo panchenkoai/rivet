@@ -13,10 +13,18 @@
 //! Source prerequisites: `log_bin = ON`, `binlog_format = ROW` (ideally
 //! `binlog_row_image = FULL` for complete UPDATE pre-images), a `REPLICATION
 //! SLAVE` grant, and a `server_id` distinct from the source's.
-#![allow(dead_code)] // reader seam; the CLI / mode wiring lands in a later increment.
+//!
+//! Wired to `rivet cdc` via [`run`], which streams changes as NDJSON and
+//! persists a resume checkpoint.
+//!
+//! `#![allow(dead_code)]`: the consumer is `cli::dispatch` (the `rivet cdc`
+//! command), which lives only in the **binary** crate (`main.rs`). The library
+//! crate (`lib.rs`) also compiles `source` — for the integration tests — but has
+//! no CDC consumer of its own, so these items read as dead in the lib build.
+#![allow(dead_code)]
 
 use std::collections::{HashMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use mysql::binlog::events::{EventData, RowsEventData, TableMapEvent};
 use mysql::binlog::value::BinlogValue;
@@ -32,6 +40,16 @@ pub(crate) enum ChangeOp {
     Insert,
     Update,
     Delete,
+}
+
+impl ChangeOp {
+    fn as_str(self) -> &'static str {
+        match self {
+            ChangeOp::Insert => "insert",
+            ChangeOp::Update => "update",
+            ChangeOp::Delete => "delete",
+        }
+    }
 }
 
 /// The binlog coordinate *after* an event — the resume point a checkpoint
@@ -225,6 +243,48 @@ fn value_to_json(v: &Value) -> Json {
             Json::String(v.as_sql(false).trim_matches('\'').to_string())
         }
     }
+}
+
+/// `rivet cdc` entry point (MySQL). Streams binlog changes, emitting one NDJSON
+/// object per row change to stdout, and — if `checkpoint` is set — persists the
+/// resume position after each. Blocks until the stream ends, `max_events` is
+/// reached, or the process is interrupted (the per-event checkpoint makes an
+/// interrupted run resumable).
+pub(crate) fn run(
+    url: &str,
+    server_id: u32,
+    checkpoint: Option<PathBuf>,
+    tables: Vec<String>,
+    max_events: Option<usize>,
+) -> Result<()> {
+    let mut stream = match &checkpoint {
+        Some(p) => MysqlChangeStream::open_or_resume(url, server_id, p)?,
+        None => MysqlChangeStream::open_from_current(url, server_id)?,
+    };
+    let mut emitted = 0usize;
+    for ev in &mut stream {
+        let ev = ev?;
+        if !tables.is_empty() && !tables.iter().any(|t| t == &ev.table) {
+            continue;
+        }
+        let line = serde_json::json!({
+            "op": ev.op.as_str(),
+            "schema": ev.schema,
+            "table": ev.table,
+            "before": ev.before,
+            "after": ev.after,
+            "pos": { "file": ev.pos.file, "pos": ev.pos.pos },
+        });
+        println!("{line}");
+        if let Some(p) = &checkpoint {
+            ev.pos.save(p)?;
+        }
+        emitted += 1;
+        if max_events.is_some_and(|m| emitted >= m) {
+            break;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

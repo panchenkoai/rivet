@@ -131,6 +131,39 @@ pub enum Commands {
         #[arg(short, long)]
         config: String,
     },
+    /// Stream change data capture (CDC) from a source's transaction log.
+    ///
+    /// Experimental — MySQL binlog only. Emits one JSON object per row change to
+    /// stdout (NDJSON) and, with `--checkpoint`, persists a resume position.
+    /// Requires the source at `binlog_format = ROW` with a `REPLICATION SLAVE`
+    /// grant.
+    #[command(group = clap::ArgGroup::new("cdc_source").required(true).multiple(false))]
+    Cdc {
+        /// Database URL (mysql:// only for now). Visible in `ps`; prefer
+        /// `--source-env`/`--source-file` outside local dev.
+        #[arg(long, group = "cdc_source")]
+        source: Option<String>,
+        /// Name of an environment variable holding the database URL.
+        #[arg(long, value_name = "ENV_VAR", group = "cdc_source")]
+        source_env: Option<String>,
+        /// Path to a file containing just the database URL (one line).
+        #[arg(long, value_name = "PATH", group = "cdc_source")]
+        source_file: Option<String>,
+        /// Replica server-id for the binlog connection (must be distinct from the
+        /// source's and any other replica).
+        #[arg(long, default_value_t = 4271)]
+        server_id: u32,
+        /// Persist/resume the binlog position to this file. Omit to tail from the
+        /// current position without checkpointing.
+        #[arg(long, value_name = "PATH")]
+        checkpoint: Option<String>,
+        /// Only emit changes for this table (repeatable; default: all tables).
+        #[arg(long, value_name = "TABLE")]
+        table: Vec<String>,
+        /// Stop after N change events (default: stream until interrupted).
+        #[arg(long, value_name = "N")]
+        max_events: Option<usize>,
+    },
     /// Manage export state
     State {
         #[command(subcommand)]
