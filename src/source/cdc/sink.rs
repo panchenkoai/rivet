@@ -60,7 +60,10 @@ pub(crate) struct SinkConfig<'a> {
 /// commit seam, then writing a manifest + `_SUCCESS` at clean end. Rolls a part at
 /// the first transaction boundary past `rollover` rows; checkpoints a commit
 /// position after each part is durably committed.
-pub(crate) fn run_to_files(stream: &mut dyn ChangeStream, cfg: SinkConfig<'_>) -> Result<()> {
+pub(crate) fn run_to_files(
+    stream: &mut dyn ChangeStream,
+    cfg: SinkConfig<'_>,
+) -> Result<RunManifest> {
     // The schema is built lazily at the first flush so decimal column scales can
     // be refined from the data (SQL Server's metadata-only resolve gives a
     // placeholder scale of 0 — the same gap the batch path fills from rows).
@@ -106,8 +109,9 @@ pub(crate) fn run_to_files(stream: &mut dyn ChangeStream, cfg: SinkConfig<'_>) -
     }
 
     // Clean end → write the run manifest + _SUCCESS (bounded-run concept).
-    write_manifest(cfg.dest, &build_manifest(&cfg, &parts))?;
-    Ok(())
+    let manifest = build_manifest(&cfg, &parts);
+    write_manifest(cfg.dest, &manifest)?;
+    Ok(manifest)
 }
 
 /// Build the sink schema once, on the first flush — refining decimal scales from

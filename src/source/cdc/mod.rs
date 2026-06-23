@@ -200,3 +200,53 @@ pub(crate) fn create_change_stream(cfg: &CdcConfig) -> Result<Box<dyn ChangeStre
         )
     }
 }
+
+/// Resolve a CDC table's column schema (name + Arrow type) from the source — the
+/// same `RivetType` → Arrow pipeline the batch path uses — to type the file sink.
+/// `tls` is threaded through the same gate as the streaming connection.
+pub(crate) fn resolve_cdc_columns(
+    url: &str,
+    table: &str,
+    tls: Option<&crate::config::TlsConfig>,
+) -> Result<Vec<(String, arrow::datatypes::DataType)>> {
+    use crate::source::Source;
+    // The table name is interpolated into `SELECT * FROM {table}` for the schema
+    // probe, so validate it to a plain `[schema.]table` identifier — no quote,
+    // paren, semicolon, or space can break out (mirrors the capture-instance check).
+    if table.is_empty()
+        || !table
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+    {
+        anyhow::bail!(
+            "rivet cdc table must be a plain [schema.]table identifier (got {table:?}); \
+             refusing to interpolate it into SQL"
+        );
+    }
+    let mut src: Box<dyn Source> = if url.starts_with("mysql://") {
+        Box::new(crate::source::mysql::MysqlSource::connect_with_tls(
+            url, tls,
+        )?)
+    } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        Box::new(crate::source::postgres::PostgresSource::connect_with_tls(
+            url, tls,
+        )?)
+    } else {
+        Box::new(crate::source::mssql::MssqlSource::connect_with_tls(
+            url, tls,
+        )?)
+    };
+    let mappings = src.type_mappings(
+        &format!("SELECT * FROM {table}"),
+        &crate::types::ColumnOverrides::new(),
+    )?;
+    Ok(mappings
+        .into_iter()
+        .map(|m| {
+            (
+                m.column_name,
+                m.arrow_type.unwrap_or(arrow::datatypes::DataType::Utf8),
+            )
+        })
+        .collect())
+}

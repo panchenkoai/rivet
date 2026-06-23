@@ -304,6 +304,12 @@ pub(super) fn run_export_job(
     config_dir: &Path,
     opts: &RunOptions<'_>,
 ) -> (Result<()>, RunSummary) {
+    // CDC exports read the transaction log, not a query — they bypass the batch
+    // plan/strategy machinery entirely and run through the dedicated CDC runner,
+    // which produces the same (Result, RunSummary) contract + metric row.
+    if export.mode == crate::config::ExportMode::Cdc {
+        return super::cdc_job::run_cdc_export(config_path, config, export, state);
+    }
     let plan = match build_plan(
         config,
         export,

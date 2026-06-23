@@ -274,7 +274,7 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
         "csv" => crate::config::FormatType::Csv,
         other => anyhow::bail!("--format must be 'parquet' or 'csv', got {other:?}"),
     };
-    let columns = resolve_cdc_columns(&url, &tbl)?;
+    let columns = crate::source::cdc::resolve_cdc_columns(&url, &tbl, None)?;
 
     // Local destination today; gs:// / s3:// is the same DestinationConfig path
     // (the commit seam is backend-agnostic).
@@ -299,55 +299,7 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
         started_at: now.clone(),
         run_id: now,
     };
-    crate::source::cdc::sink::run_to_files(stream.as_mut(), sink_cfg)
-}
-
-/// Resolve a CDC table's column schema (name + Arrow type) from the source — the
-/// same `RivetType` → Arrow pipeline the batch path uses — to type the file sink.
-fn resolve_cdc_columns(
-    url: &str,
-    table: &str,
-) -> Result<Vec<(String, arrow::datatypes::DataType)>> {
-    use crate::source::Source;
-    // The table name is interpolated into `SELECT * FROM {table}` for the schema
-    // probe, so validate it to a plain `[schema.]table` identifier — no quote,
-    // paren, semicolon, or space can break out (mirrors the capture-instance check).
-    if table.is_empty()
-        || !table
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
-    {
-        anyhow::bail!(
-            "rivet cdc --table must be a plain [schema.]table identifier (got {table:?}); \
-             refusing to interpolate it into SQL"
-        );
-    }
-    let mut src: Box<dyn Source> = if url.starts_with("mysql://") {
-        Box::new(crate::source::mysql::MysqlSource::connect_with_tls(
-            url, None,
-        )?)
-    } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-        Box::new(crate::source::postgres::PostgresSource::connect_with_tls(
-            url, None,
-        )?)
-    } else {
-        Box::new(crate::source::mssql::MssqlSource::connect_with_tls(
-            url, None,
-        )?)
-    };
-    let mappings = src.type_mappings(
-        &format!("SELECT * FROM {table}"),
-        &crate::types::ColumnOverrides::new(),
-    )?;
-    Ok(mappings
-        .into_iter()
-        .map(|m| {
-            (
-                m.column_name,
-                m.arrow_type.unwrap_or(arrow::datatypes::DataType::Utf8),
-            )
-        })
-        .collect())
+    crate::source::cdc::sink::run_to_files(stream.as_mut(), sink_cfg).map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]

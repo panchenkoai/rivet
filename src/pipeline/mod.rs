@@ -8,6 +8,7 @@
 
 mod aggregate;
 mod apply_cmd;
+mod cdc_job;
 pub(crate) mod chunked;
 mod cli;
 pub(crate) mod commit;
