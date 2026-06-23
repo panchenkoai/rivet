@@ -352,6 +352,59 @@ fn pg_cdc_resume_captures_only_new_changes() {
 }
 
 #[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_crash_after_flush_before_ack_does_not_advance_the_slot() {
+    // PostgreSQL is the consume-on-read engine — the one where reordering flush/ack
+    // would actually lose data. A crash after the part is durable but before the slot
+    // advances must leave the slot un-advanced, so the resume re-reads (at-least-once).
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_cdc_pgcrash");
+    let slot = unique_name("rivet_crash_slot");
+    let mut c = postgres::Client::connect(POSTGRES_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+    c.execute(&format!("INSERT INTO {tbl} VALUES (1,10),(2,20)"), &[])
+        .unwrap();
+
+    // Run 1 crashes after the part is flushed, before the slot advances.
+    let crash_out = d.path().join("crash");
+    std::fs::create_dir_all(&crash_out).unwrap();
+    let crashed = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            pg_cdc_config(&d, &tbl, &slot, &crash_out).to_str().unwrap(),
+        ])
+        .env("RIVET_TEST_PANIC_AT", "cdc_after_flush_before_ack")
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        !crashed.status.success(),
+        "the injected crash must fail run 1"
+    );
+
+    // Run 2: the slot never advanced, so the peek still sees both changes.
+    let out2 = d.path().join("out2");
+    std::fs::create_dir_all(&out2).unwrap();
+    run_cdc(&pg_cdc_config(&d, &tbl, &slot, &out2));
+    assert_eq!(
+        manifest_rows(&out2),
+        2,
+        "the slot stayed put across the crash → resume re-reads both (no loss)"
+    );
+}
+
+#[test]
 #[ignore = "live: requires docker compose mysql (binlog ROW + REPLICATION grant)"]
 fn cdc_resume_captures_only_new_changes() {
     let d = tempfile::tempdir().unwrap();
