@@ -415,4 +415,54 @@ mod tests {
         assert_eq!(render_type(Some(&DataType::Date64)), DataType::Utf8);
         assert_eq!(render_type(None), DataType::Utf8);
     }
+
+    /// The invariant that keeps schema and data in lockstep: every type
+    /// `is_buildable` accepts, `build_column` must produce an array of *exactly*
+    /// that type. Adding a type to one but not the other (a field with no matching
+    /// array builder) would otherwise panic in `RecordBatch::try_new` at runtime,
+    /// on the data — this fails in CI instead.
+    #[test]
+    fn is_buildable_iff_build_column_produces_that_type() {
+        use arrow::array::Array;
+        let buildable = [
+            DataType::Boolean,
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+            DataType::Float32,
+            DataType::Float64,
+            DataType::Date32,
+            DataType::Time64(TimeUnit::Microsecond),
+            DataType::Decimal128(10, 2),
+            DataType::Utf8,
+            DataType::LargeUtf8,
+            DataType::Binary,
+            DataType::LargeBinary,
+            DataType::FixedSizeBinary(16),
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+        ];
+        for dt in &buildable {
+            assert!(is_buildable(dt), "is_buildable must accept {dt:?}");
+            let arr = build_column(dt, &[None]).unwrap();
+            assert_eq!(
+                arr.data_type(),
+                dt,
+                "build_column({dt:?}) produced a mismatched type"
+            );
+        }
+        // A type the sink can't build is rejected and coarsened to Utf8 — never a
+        // field type with no matching builder.
+        for dt in [
+            DataType::Date64,
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+        ] {
+            assert!(!is_buildable(&dt), "is_buildable must reject {dt:?}");
+            assert_eq!(render_type(Some(&dt)), DataType::Utf8);
+        }
+    }
 }
