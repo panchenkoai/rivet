@@ -144,3 +144,48 @@ pub(crate) fn run(
     }
     Ok(())
 }
+
+/// Connection + resume parameters for `rivet cdc`, across engines — the CDC
+/// sibling of [`crate::source::create_source`]'s `SourceConfig`.
+pub(crate) struct CdcConfig {
+    pub url: String,
+    /// MySQL replica id.
+    pub server_id: u32,
+    /// PostgreSQL logical slot name.
+    pub slot: String,
+    /// SQL Server capture instance (required for `sqlserver://`).
+    pub capture_instance: Option<String>,
+    /// MySQL checkpoint file (PG resumes via the slot; SQL Server via its LSN).
+    pub checkpoint: Option<PathBuf>,
+}
+
+/// Construct the right [`ChangeStream`] adapter for the source URL's scheme —
+/// dispatching by engine exactly as [`crate::source::create_source`] does for the
+/// batch path.
+pub(crate) fn create_change_stream(cfg: &CdcConfig) -> Result<Box<dyn ChangeStream>> {
+    let url = cfg.url.as_str();
+    if url.starts_with("mysql://") {
+        Ok(Box::new(
+            crate::source::mysql::cdc::MysqlChangeStream::open_or_resume(
+                url,
+                cfg.server_id,
+                cfg.checkpoint.as_deref(),
+            )?,
+        ))
+    } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        Ok(Box::new(
+            crate::source::postgres::cdc::PgChangeStream::open(url, &cfg.slot)?,
+        ))
+    } else if url.starts_with("sqlserver://") || url.starts_with("mssql://") {
+        let ci = cfg.capture_instance.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("sqlserver cdc requires --capture-instance (e.g. dbo_orders)")
+        })?;
+        Ok(Box::new(
+            crate::source::mssql::cdc::MssqlChangeStream::from_url(url, ci)?,
+        ))
+    } else {
+        anyhow::bail!(
+            "rivet cdc: unsupported source url — expected mysql:// / postgresql:// / sqlserver://"
+        )
+    }
+}

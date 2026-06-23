@@ -20,7 +20,7 @@
 //!   unit-tested in isolation.
 
 mod arrow_convert;
-mod cdc;
+pub(crate) mod cdc;
 mod from_parse;
 
 use std::collections::HashMap;

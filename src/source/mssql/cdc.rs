@@ -91,6 +91,20 @@ impl MssqlChangeStream {
         })
     }
 
+    /// Open from a `sqlserver://user:pass@host:port/db` URL + a capture instance
+    /// (the factory path).
+    pub(crate) fn from_url(url: &str, capture_instance: &str) -> Result<Self> {
+        let p = crate::source::mssql::parse_mssql_url(url)?;
+        Self::open(&MssqlCdcConfig {
+            host: p.host,
+            port: p.port,
+            database: p.database,
+            user: p.user,
+            password: p.password,
+            capture_instance: capture_instance.to_string(),
+        })
+    }
+
     /// Poll the change table once over `[min_lsn, max_lsn]` into `pending`.
     fn fill(&mut self) -> Result<()> {
         let Self {

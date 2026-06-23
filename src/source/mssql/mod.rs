@@ -16,7 +16,7 @@
 //! `OFFSET 0 ROWS FETCH NEXT n ROWS ONLY` clause (T-SQL has no `LIMIT`).
 
 mod arrow_convert;
-mod cdc;
+pub(crate) mod cdc;
 mod proxy;
 
 pub use proxy::MssqlProxyKind;
@@ -88,15 +88,15 @@ impl Drop for MssqlSource {
 }
 
 /// Parsed `sqlserver://user[:password]@host[:port]/db` connection parts.
-struct MssqlUrl {
-    host: String,
-    port: u16,
-    user: String,
-    password: String,
-    database: String,
+pub(crate) struct MssqlUrl {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub password: String,
+    pub database: String,
 }
 
-fn parse_mssql_url(url: &str) -> Result<MssqlUrl> {
+pub(crate) fn parse_mssql_url(url: &str) -> Result<MssqlUrl> {
     let rest = url
         .strip_prefix("sqlserver://")
         .or_else(|| url.strip_prefix("mssql://"))

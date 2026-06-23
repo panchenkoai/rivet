@@ -174,6 +174,13 @@ pub enum Commands {
         /// Rows per output file (rollover) when `--output` is set.
         #[arg(long, value_name = "N", default_value_t = 10_000)]
         rollover: usize,
+        /// PostgreSQL logical slot name (CDC; created if absent).
+        #[arg(long, value_name = "NAME", default_value = "rivet_slot")]
+        slot: String,
+        /// SQL Server CDC capture instance, e.g. `dbo_orders` — required for
+        /// `sqlserver://` sources.
+        #[arg(long, value_name = "INSTANCE")]
+        capture_instance: Option<String>,
     },
     /// Manage export state
     State {

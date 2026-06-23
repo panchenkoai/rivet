@@ -99,7 +99,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             output,
             format,
             rollover,
-        } => dispatch_cdc(
+            slot,
+            capture_instance,
+        } => dispatch_cdc(CdcArgs {
             source,
             source_env,
             source_file,
@@ -110,7 +112,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             output,
             format,
             rollover,
-        ),
+            slot,
+            capture_instance,
+        }),
         Commands::Init {
             source,
             source_env,
@@ -206,12 +210,8 @@ fn dispatch_schema(what: SchemaKind) -> Result<()> {
     }
 }
 
-/// `rivet cdc` (MySQL): open the binlog change stream and either emit NDJSON
-/// (default) or, with `--output`, write typed Parquet/CSV files. The `--output`
-/// path resolves the single table's column schema from the source via
-/// `type_mappings` and hands it to the file sink.
-#[allow(clippy::too_many_arguments)]
-fn dispatch_cdc(
+/// Parsed `rivet cdc` arguments (clap field types).
+struct CdcArgs {
     source: Option<String>,
     source_env: Option<String>,
     source_file: Option<String>,
@@ -222,29 +222,46 @@ fn dispatch_cdc(
     output: Option<String>,
     format: String,
     rollover: usize,
-) -> Result<()> {
+    slot: String,
+    capture_instance: Option<String>,
+}
+
+/// `rivet cdc`: build the engine's change stream via `create_change_stream`
+/// (dispatch by URL scheme), then either emit NDJSON (default) or, with
+/// `--output`, write typed Parquet/CSV files through the commit seam. `--output`
+/// resolves the table's column schema from the source via `type_mappings`.
+fn dispatch_cdc(a: CdcArgs) -> Result<()> {
     use crate::source::Source;
 
-    let (url, _prov) = resolve_init_source(source, source_env, source_file)?;
-    let ckpt = checkpoint.map(std::path::PathBuf::from);
-    let mut stream = crate::source::mysql::cdc::MysqlChangeStream::open_or_resume(
-        &url,
-        server_id,
-        ckpt.as_deref(),
-    )?;
+    let (url, _prov) = resolve_init_source(a.source, a.source_env, a.source_file)?;
+    let ckpt = a.checkpoint.map(std::path::PathBuf::from);
+    let cdc_cfg = crate::source::cdc::CdcConfig {
+        url: url.clone(),
+        server_id: a.server_id,
+        slot: a.slot,
+        capture_instance: a.capture_instance,
+        checkpoint: ckpt.clone(),
+    };
+    let mut stream = crate::source::cdc::create_change_stream(&cdc_cfg)?;
 
-    let Some(dir) = output else {
-        return crate::source::cdc::run(&mut stream, ckpt, table, max_events);
+    let Some(dir) = a.output else {
+        return crate::source::cdc::run(stream.as_mut(), ckpt, a.table, a.max_events);
     };
 
-    // --output: typed file sink. One table so its schema is unambiguous.
-    let tbl = match table.as_slice() {
+    // --output: typed file sink. MySQL-only schema resolution today (PG / SQL
+    // Server typed file output is in progress; NDJSON works for all engines).
+    if !url.starts_with("mysql://") {
+        anyhow::bail!(
+            "rivet cdc --output currently supports mysql:// only — omit --output to stream NDJSON for PostgreSQL / SQL Server"
+        );
+    }
+    let tbl = match a.table.as_slice() {
         [t] => t.clone(),
         _ => anyhow::bail!(
             "rivet cdc --output requires exactly one --table (its schema is resolved from the source)"
         ),
     };
-    let fmt = match format.as_str() {
+    let fmt = match a.format.as_str() {
         "parquet" => crate::config::FormatType::Parquet,
         "csv" => crate::config::FormatType::Csv,
         other => anyhow::bail!("--format must be 'parquet' or 'csv', got {other:?}"),
@@ -280,14 +297,14 @@ fn dispatch_cdc(
         engine: "mysql",
         table: &tbl,
         format: fmt,
-        tables: table,
+        tables: a.table,
         checkpoint: ckpt,
-        max_events,
-        rollover,
+        max_events: a.max_events,
+        rollover: a.rollover,
         started_at: now.clone(),
         run_id: now,
     };
-    crate::source::cdc::sink::run_to_files(&mut stream, sink_cfg)
+    crate::source::cdc::sink::run_to_files(stream.as_mut(), sink_cfg)
 }
 
 #[allow(clippy::too_many_arguments)]
