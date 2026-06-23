@@ -342,3 +342,23 @@ pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<crate::manifest::RunMan
     };
     sink::run_to_files(stream.as_mut(), sink_cfg)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_cdc_columns_rejects_a_non_identifier_table() {
+        // The table is interpolated into `SELECT * FROM {table}` for the schema
+        // probe — a name carrying a quote / paren / semicolon / space must be
+        // refused *before* any connection, so this needs no live database.
+        for bad in ["orders; DROP TABLE x", "orders WHERE 1=1", "a b", "o'r", ""] {
+            let err = resolve_cdc_columns("mysql://u:p@127.0.0.1:3306/db", bad, None)
+                .expect_err(&format!("{bad:?} must be rejected"));
+            assert!(
+                err.to_string().contains("plain [schema.]table identifier"),
+                "{bad:?} → {err}"
+            );
+        }
+    }
+}

@@ -493,4 +493,120 @@ mod tests {
         assert_eq!(cols[0].arrow_type, Some(DataType::Decimal128(38, 2))); // filled from "150.05"
         assert_eq!(cols[1].arrow_type, Some(DataType::Decimal128(10, 2))); // left untouched
     }
+
+    fn local_dest(dir: &tempfile::TempDir) -> Box<dyn crate::destination::Destination> {
+        crate::destination::create_destination(&crate::config::DestinationConfig {
+            destination_type: crate::config::DestinationType::Local,
+            path: Some(dir.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn cfg<'a>(
+        dest: &'a dyn crate::destination::Destination,
+        cols: &'a [TypeMapping],
+        format: FormatType,
+        rollover: usize,
+    ) -> SinkConfig<'a> {
+        SinkConfig {
+            columns: cols,
+            dest,
+            dest_uri: String::new(),
+            engine: "test",
+            table: "t",
+            format,
+            tables: Vec::new(),
+            checkpoint: None,
+            max_events: None,
+            rollover,
+            rollover_memory_bytes: None,
+            started_at: "2026-06-23T00:00:00Z".into(),
+            run_id: "r".into(),
+        }
+    }
+
+    #[test]
+    fn a_transaction_is_never_split_across_parts() {
+        // Four uncommitted changes + one committed = a 5-row transaction. rollover=2
+        // would split it, but the commit-boundary gate holds the part open until the
+        // commit — so the whole transaction lands in ONE part, acked once.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(&dir);
+        let cols = int_col();
+        let mut events: VecDeque<ChangeEvent> = (1..=4)
+            .map(|id| ChangeEvent {
+                committed: false,
+                ..insert(id)
+            })
+            .collect();
+        events.push_back(insert(5)); // the COMMIT
+        let mut stream = FakeStream {
+            events,
+            acked: Vec::new(),
+        };
+        let manifest = run_to_files(
+            &mut stream,
+            cfg(dest.as_ref(), &cols, FormatType::Parquet, 2),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest.part_count, 1,
+            "the 5-row transaction must not split at rollover=2"
+        );
+        assert_eq!(manifest.row_count, 5);
+        assert_eq!(
+            stream.acked.len(),
+            1,
+            "one ack, at the single commit boundary"
+        );
+    }
+
+    #[test]
+    fn delete_carries_the_before_image_not_an_empty_after() {
+        // A DELETE has no after-image; the sink must write the BEFORE-image (the key
+        // being removed), marked __op=delete — never an all-null row.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(&dir);
+        let cols = int_col();
+        let del = ChangeEvent {
+            op: ChangeOp::Delete,
+            before: Some(vec![RivetValue::Int(7)]),
+            after: None,
+            ..insert(0)
+        };
+        let mut stream = FakeStream {
+            events: VecDeque::from(vec![del]),
+            acked: Vec::new(),
+        };
+        run_to_files(&mut stream, cfg(dest.as_ref(), &cols, FormatType::Csv, 10)).unwrap();
+        let csv = std::fs::read_to_string(dir.path().join("cdc-000000.csv")).unwrap();
+        assert!(csv.contains("delete"), "row marked __op=delete:\n{csv}");
+        assert!(
+            csv.lines().any(|l| l.contains("delete") && l.contains('7')),
+            "the delete row carries the before-image key 7, not an empty after:\n{csv}"
+        );
+    }
+
+    #[test]
+    fn csv_output_has_a_header_and_one_row_per_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(&dir);
+        let cols = int_col();
+        let mut stream = FakeStream {
+            events: VecDeque::from(vec![insert(10), insert(20)]),
+            acked: Vec::new(),
+        };
+        let manifest =
+            run_to_files(&mut stream, cfg(dest.as_ref(), &cols, FormatType::Csv, 10)).unwrap();
+        assert_eq!(manifest.row_count, 2);
+        let csv = std::fs::read_to_string(dir.path().join("cdc-000000.csv")).unwrap();
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines.len(), 3, "header + 2 data rows:\n{csv}");
+        assert!(
+            lines[0].contains("__op") && lines[0].contains('v'),
+            "header carries the meta + source columns: {}",
+            lines[0]
+        );
+    }
 }
