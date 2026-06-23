@@ -404,6 +404,85 @@ fn pg_cdc_crash_after_flush_before_ack_does_not_advance_the_slot() {
     );
 }
 
+fn pg_full_config(d: &tempfile::TempDir, tbl: &str, out: &std::path::Path) -> std::path::PathBuf {
+    let yaml = format!(
+        r#"source: {{type: postgres, url: "{POSTGRES_URL}"}}
+exports:
+  - name: {tbl}_batch
+    query: "SELECT * FROM {tbl}"
+    mode: full
+    format: parquet
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        out = out.display(),
+    );
+    write_config(d, &yaml)
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_column_types_match_batch_except_tz_aware_timestamps() {
+    use arrow::datatypes::DataType;
+    use postgres::NoTls;
+    // Type parity with the batch export for every column whose Arrow type the sink can
+    // build — int, numeric, jsonb, text, NAIVE timestamp, uuid all match. The one
+    // documented divergence is `timestamptz`: the CDC value model is naive, so a
+    // tz-aware column rides as text (Utf8) rather than a lossy naive cast that would
+    // drop the zone (CLAUDE.md naive-instant rule); the batch path keeps it tz-typed.
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_cdc_pgtypes");
+    let slot = unique_name("rivet_types_slot");
+    let mut c = postgres::Client::connect(POSTGRES_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id int, amount numeric(10,2), \
+         meta jsonb, label text, ts timestamp, tstz timestamptz, u uuid)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+    c.execute(
+        &format!(
+            "INSERT INTO {tbl} VALUES (1, 12.34, '{{\"k\":1}}', 'hi', \
+             '2026-06-23 10:00:00', '2026-06-23 10:00:00+00', gen_random_uuid())"
+        ),
+        &[],
+    )
+    .unwrap();
+
+    let cdc_out = d.path().join("cdc");
+    let batch_out = d.path().join("batch");
+    std::fs::create_dir_all(&cdc_out).unwrap();
+    std::fs::create_dir_all(&batch_out).unwrap();
+    run_cdc(&pg_cdc_config(&d, &tbl, &slot, &cdc_out));
+    run_cdc(&pg_full_config(&d, &tbl, &batch_out));
+
+    let cdc: std::collections::HashMap<_, _> = parquet_fields(&cdc_out).into_iter().collect();
+    let batch: std::collections::HashMap<_, _> = parquet_fields(&batch_out).into_iter().collect();
+    for col in ["id", "amount", "meta", "label", "ts", "u"] {
+        assert_eq!(
+            cdc.get(col),
+            batch.get(col),
+            "column {col}: CDC type must match the batch export"
+        );
+    }
+    // The documented divergence — intentional, not a regression.
+    assert_eq!(
+        cdc.get("tstz"),
+        Some(&DataType::Utf8),
+        "timestamptz rides as text in CDC (safe: naive value model can't carry the zone)"
+    );
+    assert!(
+        matches!(batch.get("tstz"), Some(DataType::Timestamp(_, Some(_)))),
+        "...while the batch export keeps it tz-typed: {:?}",
+        batch.get("tstz")
+    );
+}
+
 #[test]
 #[ignore = "live: requires docker compose mysql (binlog ROW + REPLICATION grant)"]
 fn cdc_resume_captures_only_new_changes() {
