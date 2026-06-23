@@ -348,10 +348,19 @@ fn build_array(
         DataType::Timestamp(TimeUnit::Microsecond, tz) => {
             let mut b = TimestampMicrosecondBuilder::with_capacity(rows.len());
             for (r, row) in rows.iter().enumerate() {
-                match row.try_get::<NaiveDateTime, _>(idx) {
-                    Ok(Some(dt)) => b.append_value(dt.and_utc().timestamp_micros()),
-                    Ok(None) => b.append_null(),
-                    Err(e) => anyhow::bail!("mssql datetime column {idx} row {r}: {e}"),
+                // datetime/datetime2 are naive; datetimeoffset is tz-aware and is NOT
+                // a NaiveDateTime (reading it as one errors and fails the whole
+                // export). Fall back to its UTC instant via FixedOffset.
+                let micros = match row.try_get::<NaiveDateTime, _>(idx) {
+                    Ok(v) => v.map(|dt| dt.and_utc().timestamp_micros()),
+                    Err(_) => match row.try_get::<chrono::DateTime<chrono::FixedOffset>, _>(idx) {
+                        Ok(v) => v.map(|dt| dt.timestamp_micros()),
+                        Err(e) => anyhow::bail!("mssql timestamp column {idx} row {r}: {e}"),
+                    },
+                };
+                match micros {
+                    Some(m) => b.append_value(m),
+                    None => b.append_null(),
                 }
             }
             let arr = b.finish();

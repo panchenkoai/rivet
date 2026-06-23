@@ -156,3 +156,72 @@ exports:
          500-row probe batch and rescale_i128 silently truncated the cents"
     );
 }
+
+// A `datetimeoffset` column made the whole batch export ERROR — arrow_convert read
+// it as a NaiveDateTime, which is the wrong type ("cannot interpret DateTimeOffset
+// ... as NaiveDateTime"). Asserts CORRECT behavior: the export succeeds and the
+// column keeps its UTC instant, tz-typed. RED before the FixedOffset fallback.
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn mssql_batch_datetimeoffset_exports_the_utc_instant() {
+    require_alive(LiveService::Mssql);
+    let table_name = unique_name("dto_batch");
+    mssql_drop_table(&table_name);
+    mssql_exec(&format!(
+        "CREATE TABLE {table_name} (id INT PRIMARY KEY, dto DATETIMEOFFSET);"
+    ));
+    let _guard = MssqlCleanup(table_name.clone());
+    // 10:00 at +05:30 is 04:30:00 UTC — the instant that must survive.
+    mssql_exec(&format!(
+        "INSERT INTO {table_name} VALUES (1, '2026-06-23 10:00:00 +05:30');"
+    ));
+
+    let export_name = unique_name("dto_batch_run");
+    let out_dir = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        r#"
+source:
+  type: mssql
+  url: "{MSSQL_URL}"
+  tls:
+    accept_invalid_certs: true
+exports:
+  - name: {export_name}
+    query: "SELECT id, dto FROM {table_name}"
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: {out_dir}
+"#,
+        out_dir = out_dir.path().display()
+    );
+    let cfg_path = write_config(&cfg_dir, &yaml);
+    let out = run_rivet_export(&cfg_path, &export_name);
+    assert!(
+        out.status.success(),
+        "datetimeoffset export must not fail:\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let files = files_with_extension(out_dir.path(), "parquet");
+    let (schema, batches) = read_parquet_batches(&files[0]);
+    let dt = schema.field_with_name("dto").unwrap().data_type();
+    assert!(
+        matches!(dt, DataType::Timestamp(_, Some(_))),
+        "datetimeoffset stays tz-typed, got {dt:?}"
+    );
+    let arr = batches[0]
+        .column_by_name("dto")
+        .unwrap()
+        .as_primitive::<arrow::array::types::TimestampMicrosecondType>();
+    let instant = arr
+        .value_as_datetime(0)
+        .expect("a non-null instant")
+        .to_string();
+    assert!(
+        instant.starts_with("2026-06-23 04:30:00"),
+        "the UTC instant must be 04:30 (10:00 +05:30), got {instant}"
+    );
+}
