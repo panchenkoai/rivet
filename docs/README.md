@@ -42,6 +42,7 @@ Short terminal walkthroughs in [gifs/](gifs/):
 | **incremental** | Only export rows newer than the last cursor | [modes/incremental.md](modes/incremental.md) · [composite cursor](modes/incremental-coalesce.md) |
 | **chunked** | Split large tables into parallel ranges by ID, **or by date** (`chunk_by_days: 365` → one chunk per ~year, `>= AND <` semantics); checkpoint + `--resume` for crashed runs | [modes/chunked.md](modes/chunked.md) |
 | **time_window** | Export a rolling N-day window | [modes/time-window.md](modes/time-window.md) |
+| **cdc** | Stream INSERT/UPDATE/DELETE from the transaction log (MySQL binlog / PostgreSQL logical slot / SQL Server change tables) as typed Parquet/CSV — source-safe, at-least-once | [reference/cdc.md](reference/cdc.md) |
 
 ## Destinations
 

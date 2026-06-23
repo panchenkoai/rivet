@@ -101,43 +101,47 @@ pub(crate) fn check_positions(dest: &dyn Destination, prefix: &str) -> Result<Po
     let manifest_key = join_key(prefix, MANIFEST_FILENAME);
     let manifest: RunManifest = serde_json::from_slice(&dest.read(&manifest_key)?)?;
 
-    let mut prev: Option<PosKey> = None;
-    let mut first: Option<String> = None;
-    let mut last: Option<String> = None;
-    let mut rows = 0usize;
-    let mut violations = Vec::new();
-
+    // IO half: read every part's __pos in part→row order.
+    let mut items: Vec<(u32, String)> = Vec::new();
     for part in &manifest.parts {
         let body = dest.read(&join_key(prefix, &part.path))?;
-        for raw in read_pos_column(body)? {
-            let Some(key) = parse_pos(&raw) else {
-                violations.push(format!("part {}: unparseable __pos {raw:?}", part.part_id));
-                continue;
-            };
-            if first.is_none() {
-                first = Some(raw.clone());
-            }
-            if let Some(prev) = &prev
-                && key < *prev
-            {
-                violations.push(format!(
-                    "part {}: __pos went backwards at {raw:?} (out of log order)",
-                    part.part_id
-                ));
-            }
-            prev = Some(key);
-            last = Some(raw);
-            rows += 1;
-        }
+        items.extend(
+            read_pos_column(body)?
+                .into_iter()
+                .map(|p| (part.part_id, p)),
+        );
     }
 
+    let (first, last, violations) = check_order(&items);
     Ok(PositionCheck {
         parts: manifest.parts.len(),
-        rows,
+        rows: items.len(),
         first,
         last,
         violations,
     })
+}
+
+/// Pure half: the monotonicity invariant over `(part_id, __pos)` in part→row
+/// order, lifted out of the IO so it is testable without a destination.
+fn check_order(items: &[(u32, String)]) -> (Option<String>, Option<String>, Vec<String>) {
+    let mut prev: Option<PosKey> = None;
+    let (mut first, mut last, mut violations) = (None, None, Vec::new());
+    for (part_id, raw) in items {
+        let Some(key) = parse_pos(raw) else {
+            violations.push(format!("part {part_id}: unparseable __pos {raw:?}"));
+            continue;
+        };
+        first.get_or_insert_with(|| raw.clone());
+        if prev.as_ref().is_some_and(|p| key < *p) {
+            violations.push(format!(
+                "part {part_id}: __pos went backwards at {raw:?} (out of log order)"
+            ));
+        }
+        prev = Some(key);
+        last = Some(raw.clone());
+    }
+    (first, last, violations)
 }
 
 #[cfg(test)]
@@ -169,5 +173,27 @@ mod tests {
     fn malformed_pos_is_none() {
         assert!(parse_pos("not json").is_none());
         assert!(parse_pos(r#"{"nope":1}"#).is_none());
+    }
+
+    #[test]
+    fn check_order_flags_a_backwards_jump() {
+        let items = vec![
+            (1, r#"{"lsn":"3C/10"}"#.into()),
+            (2, r#"{"lsn":"3C/05"}"#.into()), // earlier LSN in a later part
+        ];
+        let (.., violations) = check_order(&items);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("backwards"));
+    }
+
+    #[test]
+    fn check_order_clean_when_monotonic() {
+        let items = vec![
+            (1, r#"{"file":"b.000001","pos":100}"#.into()),
+            (2, r#"{"file":"b.000002","pos":4}"#.into()), // file rotation still forward
+        ];
+        let (first, last, violations) = check_order(&items);
+        assert!(violations.is_empty());
+        assert!(first.unwrap().contains("100") && last.unwrap().contains("000002"));
     }
 }

@@ -12,7 +12,7 @@
 
 <p align="center"><strong>Make database extraction boring.</strong></p>
 
-<p align="center">One Rust binary, ~18 MB (speed-optimized). Extracts PostgreSQL, MySQL, and SQL Server to Parquet/CSV — locally, on S3, GCS, or Azure Blob — without holding long queries open on your production database. Resumable, auditable, source-safe.</p>
+<p align="center">One Rust binary, ~18 MB (speed-optimized). Extracts PostgreSQL, MySQL, and SQL Server to Parquet/CSV — batch snapshots <em>or</em> log-based change data capture — locally, on S3, GCS, or Azure Blob — without holding long queries open on your production database. Resumable, auditable, source-safe.</p>
 
 > Not sure if Rivet fits your problem? [docs/who-is-this-for.md](docs/who-is-this-for.md) is a 60-second fit-check.
 
@@ -46,6 +46,29 @@ Rivet tries to make database extraction boring:
 7. **Notice when the source changes** — column adds/removes/retypes trigger `on_schema_drift: warn|continue|fail` on the next run. Shape drift in TEXT/JSON columns is tracked via byte-width sampling.
 
 The execution contract behind each of these — what is guaranteed, what is at-least-once, what isn't covered — is in [docs/semantics.md](docs/semantics.md).
+
+## Change data capture
+
+Beyond batch snapshots, Rivet reads the source's **transaction log** — MySQL binlog, a PostgreSQL logical slot, SQL Server change tables — and writes every INSERT / UPDATE / DELETE as typed Parquet/CSV through the same commit seam (destination + content-MD5 + manifest + `_SUCCESS`) the batch path uses. A CDC export lands in your bucket and shows up in `rivet metrics` exactly like a batch one.
+
+```bash
+rivet init --source "$DATABASE_URL" --table orders --mode cdc -o cdc.yaml
+rivet run --config cdc.yaml        # captures changes → typed Parquet + manifest
+```
+
+```yaml
+exports:
+  - name: orders_cdc
+    table: orders
+    mode: cdc
+    cdc: { checkpoint: ./orders.ckpt, until_current: true }   # drain-to-now, for a scheduler
+    destination: { type: gcs, bucket: my-bucket, prefix: cdc/orders }
+```
+
+- **Source-safe, like the batch path** — reads the log, never a long `SELECT`: no locks, no snapshot. Catches changes that don't touch an `updated_at` (which a watermark sync silently misses).
+- **At-least-once** on all three engines — commit-boundary checkpoint; PostgreSQL advances its slot only after a durable write.
+- **Typed output matches the batch export** — real `Timestamp` / `Decimal` / `json` / `uuid`, not strings (same `build_arrow_field` pipeline).
+- The upsert output shape (`[__op, __pos]` + after-image), the grants each engine needs, the per-engine retention/ack model, and current limitations are in **[docs/reference/cdc.md](docs/reference/cdc.md)**.
 
 ## Trust contracts
 

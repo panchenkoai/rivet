@@ -393,4 +393,26 @@ mod tests {
             RivetValue::Null
         );
     }
+
+    #[test]
+    fn build_column_narrows_int_to_declared_width() {
+        use arrow::array::{Array, Int32Array};
+        let (v7, vmax) = (RivetValue::Int(7), RivetValue::Int(i64::MAX));
+        let cells = [Some(&v7), None, Some(&vmax)];
+        let arr = build_column(&DataType::Int32, &cells).unwrap();
+        let a = arr.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(a.value(0), 7);
+        assert!(a.is_null(1)); // null stays null
+        assert!(a.is_null(2)); // overflow → null, never a silent wrap
+    }
+
+    #[test]
+    fn render_type_keeps_buildable_else_utf8() {
+        // real width kept (matches the batch export); json/uuid ride as their
+        // physical Utf8/FixedSizeBinary; a type the sink can't build → Utf8.
+        assert_eq!(render_type(Some(&DataType::Int32)), DataType::Int32);
+        assert_eq!(render_type(Some(&DataType::Utf8)), DataType::Utf8);
+        assert_eq!(render_type(Some(&DataType::Date64)), DataType::Utf8);
+        assert_eq!(render_type(None), DataType::Utf8);
+    }
 }

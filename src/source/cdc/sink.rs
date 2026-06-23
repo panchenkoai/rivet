@@ -457,4 +457,40 @@ mod tests {
             "_SUCCESS marks the clean end"
         );
     }
+
+    fn decimal_col(name: &str, precision: u8, scale: i8) -> TypeMapping {
+        TypeMapping {
+            column_name: name.into(),
+            source_native_type: "decimal".into(),
+            // refine_decimal_scales only reads arrow_type — the logical type is irrelevant here.
+            rivet_type: crate::types::RivetType::Int64,
+            arrow_type: Some(DataType::Decimal128(precision, scale)),
+            fidelity: crate::types::TypeFidelity::Exact,
+            nullable: true,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn refine_decimal_scales_fills_placeholder_keeps_real_scale() {
+        let event = ChangeEvent {
+            op: ChangeOp::Insert,
+            schema: "s".into(),
+            table: "t".into(),
+            before: None,
+            after: Some(vec![
+                RivetValue::Bytes(b"150.05".to_vec()),
+                RivetValue::Bytes(b"7.5".to_vec()),
+            ]),
+            position: Position(serde_json::json!({})),
+            committed: true,
+        };
+        let mut cols = vec![
+            decimal_col("placeholder", 38, 0), // SQL Server: scale unknown at resolve
+            decimal_col("real", 10, 2),        // MySQL/PG: scale already declared
+        ];
+        refine_decimal_scales(&mut cols, std::slice::from_ref(&event));
+        assert_eq!(cols[0].arrow_type, Some(DataType::Decimal128(38, 2))); // filled from "150.05"
+        assert_eq!(cols[1].arrow_type, Some(DataType::Decimal128(10, 2))); // left untouched
+    }
 }
