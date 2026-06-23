@@ -157,6 +157,10 @@ pub(crate) struct CdcConfig {
     pub capture_instance: Option<String>,
     /// MySQL checkpoint file (PG resumes via the slot; SQL Server via its LSN).
     pub checkpoint: Option<PathBuf>,
+    /// Catch up to the source's current end and exit, instead of streaming
+    /// indefinitely. For MySQL this sets `BINLOG_DUMP_NON_BLOCK`; PostgreSQL /
+    /// SQL Server already drain their backlog and exit, so it is a no-op there.
+    pub until_current: bool,
 }
 
 /// Construct the right [`ChangeStream`] adapter for the source URL's scheme —
@@ -170,6 +174,7 @@ pub(crate) fn create_change_stream(cfg: &CdcConfig) -> Result<Box<dyn ChangeStre
                 url,
                 cfg.server_id,
                 cfg.checkpoint.as_deref(),
+                cfg.until_current,
             )?,
         ))
     } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {

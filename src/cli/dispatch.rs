@@ -101,6 +101,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             rollover,
             slot,
             capture_instance,
+            until_current,
         } => dispatch_cdc(CdcArgs {
             source,
             source_env,
@@ -114,6 +115,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             rollover,
             slot,
             capture_instance,
+            until_current,
         }),
         Commands::Init {
             source,
@@ -224,6 +226,7 @@ struct CdcArgs {
     rollover: usize,
     slot: String,
     capture_instance: Option<String>,
+    until_current: bool,
 }
 
 /// `rivet cdc`: build the engine's change stream via `create_change_stream`
@@ -239,6 +242,7 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
         slot: a.slot,
         capture_instance: a.capture_instance,
         checkpoint: ckpt.clone(),
+        until_current: a.until_current,
     };
     let mut stream = crate::source::cdc::create_change_stream(&cdc_cfg)?;
 

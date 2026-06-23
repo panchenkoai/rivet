@@ -21,7 +21,7 @@ use std::path::Path;
 use mysql::binlog::events::{EventData, RowsEventData, TableMapEvent};
 use mysql::binlog::value::BinlogValue;
 use mysql::prelude::Queryable;
-use mysql::{BinlogRequest, BinlogStream, Conn, Opts};
+use mysql::{BinlogDumpFlags, BinlogRequest, BinlogStream, Conn, Opts};
 use serde_json::{Value as Json, json};
 
 use crate::error::Result;
@@ -48,11 +48,25 @@ pub(crate) struct MysqlChangeStream {
 
 impl MysqlChangeStream {
     /// Open a stream from an explicit `(binlog_file, pos)` coordinate.
-    pub(crate) fn open(url: &str, server_id: u32, file: String, pos: u64) -> Result<Self> {
+    ///
+    /// `non_block` ⇒ set `BINLOG_DUMP_NON_BLOCK`: the server streams all binlog up
+    /// to the current end and then sends EOF instead of blocking for more. That
+    /// turns MySQL into the same drain-and-exit poll model as PostgreSQL / SQL
+    /// Server — a bounded "catch up to now and stop" run, ideal for a scheduler.
+    pub(crate) fn open(
+        url: &str,
+        server_id: u32,
+        file: String,
+        pos: u64,
+        non_block: bool,
+    ) -> Result<Self> {
         let conn = Conn::new(Opts::from_url(url)?)?;
-        let req = BinlogRequest::new(server_id)
+        let mut req = BinlogRequest::new(server_id)
             .with_filename(file.clone().into_bytes())
             .with_pos(pos);
+        if non_block {
+            req = req.with_flags(BinlogDumpFlags::BINLOG_DUMP_NON_BLOCK);
+        }
         let stream = conn.get_binlog_stream(req)?;
         Ok(Self {
             stream,
@@ -64,20 +78,26 @@ impl MysqlChangeStream {
     }
 
     /// Open a stream from the source's *current* position (`SHOW MASTER STATUS`).
-    pub(crate) fn open_from_current(url: &str, server_id: u32) -> Result<Self> {
+    pub(crate) fn open_from_current(url: &str, server_id: u32, non_block: bool) -> Result<Self> {
         let mut c = Conn::new(Opts::from_url(url)?)?;
         let row: mysql::Row = c
             .query_first("SHOW MASTER STATUS")?
             .ok_or_else(|| anyhow::anyhow!("mysql: binlog disabled (SHOW MASTER STATUS empty)"))?;
         let file: String = row.get(0).expect("binlog file column");
         let pos: u64 = row.get(1).expect("binlog pos column");
-        Self::open(url, server_id, file, pos)
+        Self::open(url, server_id, file, pos, non_block)
     }
 
     /// Resume from a persisted [`Position`] checkpoint, or start from the current
     /// position on the first run (no checkpoint yet). The MySQL position shape is
-    /// `{"file": String, "pos": u64}`.
-    pub(crate) fn open_or_resume(url: &str, server_id: u32, ckpt: Option<&Path>) -> Result<Self> {
+    /// `{"file": String, "pos": u64}`. `non_block` ⇒ drain to the current end and
+    /// exit (see [`Self::open`]).
+    pub(crate) fn open_or_resume(
+        url: &str,
+        server_id: u32,
+        ckpt: Option<&Path>,
+        non_block: bool,
+    ) -> Result<Self> {
         if let Some(path) = ckpt
             && let Some(pos) = Position::load(path)?
         {
@@ -92,9 +112,9 @@ impl MysqlChangeStream {
                 .get("pos")
                 .and_then(Json::as_u64)
                 .ok_or_else(|| anyhow::anyhow!("mysql cdc checkpoint missing 'pos'"))?;
-            return Self::open(url, server_id, file, p);
+            return Self::open(url, server_id, file, p, non_block);
         }
-        Self::open_from_current(url, server_id)
+        Self::open_from_current(url, server_id, non_block)
     }
 
     /// Pull one binlog event and expand it into `pending`. `Ok(false)` ⇒ stream
@@ -210,7 +230,7 @@ mod tests {
         c.query_drop("CREATE TABLE cdc_unit (id INT PRIMARY KEY, v INT)")
             .unwrap();
 
-        let mut stream = MysqlChangeStream::open_from_current(URL, 4243).unwrap();
+        let mut stream = MysqlChangeStream::open_from_current(URL, 4243, false).unwrap();
         c.query_drop("INSERT INTO cdc_unit VALUES (1, 10)").unwrap();
         c.query_drop("UPDATE cdc_unit SET v = 20 WHERE id = 1")
             .unwrap();
@@ -262,7 +282,7 @@ mod tests {
             .unwrap();
 
         // Read change A and checkpoint at its position.
-        let mut s = MysqlChangeStream::open_from_current(URL, 4244).unwrap();
+        let mut s = MysqlChangeStream::open_from_current(URL, 4244, false).unwrap();
         c.query_drop("INSERT INTO cdc_resume VALUES (1, 100)")
             .unwrap();
         let a = s
@@ -283,7 +303,7 @@ mod tests {
             .unwrap();
 
         // Resuming from the checkpoint must yield B (id=2), never re-read A.
-        let mut s2 = MysqlChangeStream::open_or_resume(URL, 4244, Some(&ckpt)).unwrap();
+        let mut s2 = MysqlChangeStream::open_or_resume(URL, 4244, Some(&ckpt), false).unwrap();
         let b = s2
             .by_ref()
             .map(|e| e.unwrap())

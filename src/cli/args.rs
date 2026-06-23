@@ -181,6 +181,12 @@ pub enum Commands {
         /// `sqlserver://` sources.
         #[arg(long, value_name = "INSTANCE")]
         capture_instance: Option<String>,
+        /// Catch up to the source's current end and exit, instead of streaming
+        /// indefinitely — the bounded "read to now and stop" model, ideal for a
+        /// scheduler. For MySQL this is a non-blocking binlog dump; PostgreSQL /
+        /// SQL Server already drain their backlog and exit.
+        #[arg(long)]
+        until_current: bool,
     },
     /// Manage export state
     State {
