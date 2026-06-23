@@ -39,23 +39,23 @@ FROM GENERATE_SERIES(CONVERT(BIGINT, 1), CONVERT(BIGINT, 500000));
 GO
 
 -- ── bench_wide ───────────────────────────────────────────────────────────────
--- 100 000 rows × 10 NVARCHAR(200) columns — memory-pressure profile (the shape
+-- 100 000 rows × 10 VARCHAR(200) columns — memory-pressure profile (the shape
 -- where a streaming extractor's RSS pulls away from a buffer-the-result one).
 IF OBJECT_ID('bench_wide', 'U') IS NOT NULL DROP TABLE bench_wide;
 GO
 
 CREATE TABLE bench_wide (
     id         BIGINT        PRIMARY KEY,
-    col_a      NVARCHAR(200) NOT NULL,
-    col_b      NVARCHAR(200) NOT NULL,
-    col_c      NVARCHAR(200) NOT NULL,
-    col_d      NVARCHAR(200) NOT NULL,
-    col_e      NVARCHAR(200) NOT NULL,
-    col_f      NVARCHAR(200) NOT NULL,
-    col_g      NVARCHAR(200) NOT NULL,
-    col_h      NVARCHAR(200) NOT NULL,
-    col_i      NVARCHAR(200) NOT NULL,
-    col_j      NVARCHAR(200) NOT NULL,
+    col_a      VARCHAR(200) NOT NULL,
+    col_b      VARCHAR(200) NOT NULL,
+    col_c      VARCHAR(200) NOT NULL,
+    col_d      VARCHAR(200) NOT NULL,
+    col_e      VARCHAR(200) NOT NULL,
+    col_f      VARCHAR(200) NOT NULL,
+    col_g      VARCHAR(200) NOT NULL,
+    col_h      VARCHAR(200) NOT NULL,
+    col_i      VARCHAR(200) NOT NULL,
+    col_j      VARCHAR(200) NOT NULL,
     updated_at DATETIME2(6)  NOT NULL
 );
 GO
@@ -85,7 +85,7 @@ GO
 CREATE TABLE bench_hc (
     id         BIGINT           PRIMARY KEY,
     uuid_col   UNIQUEIDENTIFIER NOT NULL,
-    email      NVARCHAR(200)    NOT NULL,
+    email      VARCHAR(200)    NOT NULL,
     session_id CHAR(32)         NOT NULL,
     updated_at DATETIME2(6)     NOT NULL
 );
@@ -130,9 +130,9 @@ IF OBJECT_ID('bench_sparse', 'U') IS NOT NULL DROP TABLE bench_sparse;
 GO
 CREATE TABLE bench_sparse (
     id         BIGINT       PRIMARY KEY,
-    val_a      NVARCHAR(16) NULL,
-    val_b      NVARCHAR(16) NULL,
-    val_c      NVARCHAR(16) NULL,
+    val_a      VARCHAR(16) NULL,
+    val_b      VARCHAR(16) NULL,
+    val_c      VARCHAR(16) NULL,
     val_d      FLOAT        NULL,
     val_e      FLOAT        NULL,
     updated_at DATETIME2(6) NOT NULL
@@ -141,9 +141,9 @@ GO
 INSERT INTO bench_sparse (id, val_a, val_b, val_c, val_d, val_e, updated_at)
 SELECT
     value,
-    CASE WHEN value % 10 = 0 THEN N'x' ELSE NULL END,
-    CASE WHEN value %  5 = 0 THEN N'y' ELSE NULL END,
-    CASE WHEN value %  3 = 0 THEN N'z' ELSE NULL END,
+    CASE WHEN value % 10 = 0 THEN 'x' ELSE NULL END,
+    CASE WHEN value %  5 = 0 THEN 'y' ELSE NULL END,
+    CASE WHEN value %  3 = 0 THEN 'z' ELSE NULL END,
     CASE WHEN value %  4 = 0 THEN value * 1.1 ELSE NULL END,
     CASE WHEN value %  7 = 0 THEN value * 2.2 ELSE NULL END,
     DATEADD(SECOND, -(10000 - value), SYSUTCDATETIME())
@@ -164,19 +164,19 @@ GO
 
 CREATE TABLE users (
     id         INT IDENTITY(1,1) PRIMARY KEY,
-    name       NVARCHAR(100)  NOT NULL,
-    email      NVARCHAR(200)  NOT NULL,
+    name       VARCHAR(100)  NOT NULL,
+    email      VARCHAR(200)  NOT NULL,
     age        INT            NULL,
     balance    DECIMAL(12,2)  NULL,
     is_active  BIT            NOT NULL DEFAULT 1,
-    bio        NVARCHAR(MAX)  NULL,
+    bio        VARCHAR(MAX)  NULL,
     created_at DATETIME2(6)   NOT NULL DEFAULT SYSUTCDATETIME(),
     updated_at DATETIME2(6)   NOT NULL DEFAULT SYSUTCDATETIME()
 );
 GO
 INSERT INTO users (name, email, age, balance, is_active, created_at, updated_at)
 SELECT
-    CONCAT(N'User ', value),
+    CONCAT('User ', value),
     CONCAT('user', value, '@example.com'),
     18 + (value % 60),
     ROUND(100 + (value % 9000) + 0.99, 2),
@@ -189,11 +189,11 @@ GO
 CREATE TABLE orders (
     id         INT IDENTITY(1,1) PRIMARY KEY,
     user_id    INT            NOT NULL,
-    product    NVARCHAR(200)  NOT NULL,
+    product    VARCHAR(200)  NOT NULL,
     quantity   INT            NOT NULL,
     price      DECIMAL(10,2)  NOT NULL,
-    status     NVARCHAR(20)   NOT NULL DEFAULT 'pending',
-    notes      NVARCHAR(MAX)  NULL,
+    status     VARCHAR(20)   NOT NULL DEFAULT 'pending',
+    notes      VARCHAR(MAX)  NULL,
     ordered_at DATETIME2(6)   NOT NULL DEFAULT SYSUTCDATETIME(),
     updated_at DATETIME2(6)   NOT NULL DEFAULT SYSUTCDATETIME()
 );
@@ -201,11 +201,11 @@ GO
 INSERT INTO orders (user_id, product, quantity, price, status, ordered_at, updated_at)
 SELECT
     ((value - 1) % 500) + 1,
-    CONCAT(N'Product ', value % 100),
+    CONCAT('Product ', value % 100),
     1 + (value % 10),
     ROUND(10 + (value % 500) + 0.99, 2),
-    CASE value % 4 WHEN 0 THEN N'pending' WHEN 1 THEN N'shipped'
-                   WHEN 2 THEN N'delivered' ELSE N'cancelled' END,
+    CASE value % 4 WHEN 0 THEN 'pending' WHEN 1 THEN 'shipped'
+                   WHEN 2 THEN 'delivered' ELSE 'cancelled' END,
     DATEADD(MINUTE, -(2500 - value), SYSUTCDATETIME()),
     DATEADD(MINUTE, -(2500 - value), SYSUTCDATETIME())
 FROM GENERATE_SERIES(1, 2500);
@@ -214,41 +214,51 @@ GO
 CREATE TABLE events (
     id         BIGINT IDENTITY(1,1) PRIMARY KEY,
     user_id    INT           NOT NULL,
-    event_type NVARCHAR(50)  NOT NULL,
-    payload    NVARCHAR(MAX) NULL,   -- SQL Server has no native JSON type
-    ip_address NVARCHAR(45)  NULL,
+    event_type VARCHAR(50)  NOT NULL,
+    payload    VARCHAR(MAX) NULL,   -- SQL Server has no native JSON type
+    ip_address VARCHAR(45)  NULL,
     created_at DATETIME2(6)  NOT NULL DEFAULT SYSUTCDATETIME()
 );
 GO
 INSERT INTO events (user_id, event_type, payload, ip_address, created_at)
 SELECT
     ((value - 1) % 500) + 1,
-    CASE value % 5 WHEN 0 THEN N'click' WHEN 1 THEN N'view'
-                   WHEN 2 THEN N'purchase' WHEN 3 THEN N'login' ELSE N'logout' END,
-    CONCAT(N'{"seq":', value, N',"v":', value % 1000, N'}'),
+    CASE value % 5 WHEN 0 THEN 'click' WHEN 1 THEN 'view'
+                   WHEN 2 THEN 'purchase' WHEN 3 THEN 'login' ELSE 'logout' END,
+    CONCAT('{"seq":', value, ',"v":', value % 1000, '}'),
     CONCAT('10.', value % 256, '.', (value / 256) % 256, '.1'),
     DATEADD(SECOND, -(5000 - value), SYSUTCDATETIME())
 FROM GENERATE_SERIES(1, 5000);
 GO
 
 -- ── content_items — heavy-text worst case (memory showcase) ──────────────────
--- 60 227 rows × ~5 KB each (body + raw_html each ~2.4 KB of lorem) — the table
+-- 60 227 rows × ~2.4 KB each (body + raw_html each ~2.4 KB of lorem) — the table
 -- the PG headline (REPORT_pg.md) stresses. Mirrors dev/postgres/init.sql +
 -- src/bin/seed/fast.rs (`repeat('lorem ipsum ', 200)`).
+--
+-- VARCHAR, not NVARCHAR: the seed content is pure ASCII (lorem ipsum), and the
+-- PG/MySQL twins store it as UTF-8 (`text` / `longtext`). NVARCHAR would store
+-- it as UTF-16 — *double* the bytes for zero benefit on ASCII — and force the
+-- tiberius driver to transcode UTF-16→UTF-8 on every value, which measured ~2×
+-- slower extraction (313 s → 149 s single-thread on 2 M rows) for no fidelity
+-- gain. That was a benchmark artifact making MSSQL look worse than it is, not a
+-- real MSSQL/tiberius limit. Use NVARCHAR only when the data is genuinely
+-- non-ASCII; for an apples-to-apples cross-engine bench on ASCII text, VARCHAR
+-- is the right parallel to PG `text`.
 IF OBJECT_ID('content_items', 'U') IS NOT NULL DROP TABLE content_items;
 GO
 CREATE TABLE content_items (
     id            BIGINT IDENTITY(1,1) PRIMARY KEY,
-    title         NVARCHAR(MAX)  NOT NULL,
-    body          NVARCHAR(MAX)  NOT NULL,
-    raw_html      NVARCHAR(MAX)  NOT NULL,
-    metadata      NVARCHAR(MAX)  NULL,
-    tags          NVARCHAR(MAX)  NULL,
-    author_name   NVARCHAR(100)  NOT NULL,
-    author_email  NVARCHAR(200)  NOT NULL,
-    source_url    NVARCHAR(MAX)  NULL,
-    category      NVARCHAR(50)   NULL,
-    status        NVARCHAR(20)   NOT NULL DEFAULT 'draft',
+    title         VARCHAR(MAX)   NOT NULL,
+    body          VARCHAR(MAX)   NOT NULL,
+    raw_html      VARCHAR(MAX)   NOT NULL,
+    metadata      VARCHAR(MAX)   NULL,
+    tags          VARCHAR(MAX)   NULL,
+    author_name   VARCHAR(100)   NOT NULL,
+    author_email  VARCHAR(200)   NOT NULL,
+    source_url    VARCHAR(MAX)   NULL,
+    category      VARCHAR(50)    NULL,
+    status        VARCHAR(20)    NOT NULL DEFAULT 'draft',
     priority      INT            NOT NULL DEFAULT 0,
     view_count    INT            NOT NULL DEFAULT 0,
     comment_count INT            NOT NULL DEFAULT 0,
@@ -257,23 +267,23 @@ CREATE TABLE content_items (
     published_at  DATETIME2(6)   NULL,
     updated_at    DATETIME2(6)   NOT NULL DEFAULT SYSUTCDATETIME(),
     created_at    DATETIME2(6)   NOT NULL DEFAULT SYSUTCDATETIME(),
-    extra_data    NVARCHAR(MAX)  NULL
+    extra_data    VARCHAR(MAX)   NULL
 );
 GO
 INSERT INTO content_items (title, body, raw_html, metadata, tags, author_name,
     author_email, source_url, category, status, priority, view_count,
     comment_count, word_count, language, published_at)
 SELECT
-    CONCAT(N'Article ', value),
-    REPLICATE(CAST(N'lorem ipsum ' AS NVARCHAR(MAX)), 200),
-    CONCAT(N'<p>', REPLICATE(CAST(N'lorem ipsum ' AS NVARCHAR(MAX)), 200), N'</p>'),
-    CONCAT(N'{"id":', value, N',"k":"v"}'),
-    N'tag1,tag2,tag3',
-    CONCAT(N'Author ', value % 100),
+    CONCAT('Article ', value),
+    REPLICATE(CAST('lorem ipsum ' AS VARCHAR(MAX)), 200),
+    CONCAT('<p>', REPLICATE(CAST('lorem ipsum ' AS VARCHAR(MAX)), 200), '</p>'),
+    CONCAT('{"id":', value, ',"k":"v"}'),
+    'tag1,tag2,tag3',
+    CONCAT('Author ', value % 100),
     CONCAT('author', value % 100, '@example.com'),
     CONCAT('https://example.com/', value),
-    CASE value % 4 WHEN 0 THEN N'tech' WHEN 1 THEN N'news' WHEN 2 THEN N'sports' ELSE N'misc' END,
-    CASE value % 3 WHEN 0 THEN N'published' WHEN 1 THEN N'draft' ELSE N'archived' END,
+    CASE value % 4 WHEN 0 THEN 'tech' WHEN 1 THEN 'news' WHEN 2 THEN 'sports' ELSE 'misc' END,
+    CASE value % 3 WHEN 0 THEN 'published' WHEN 1 THEN 'draft' ELSE 'archived' END,
     value % 10, value % 10000, value % 500, 2400, 'en',
     DATEADD(SECOND, -value, SYSUTCDATETIME())
 FROM GENERATE_SERIES(CONVERT(BIGINT, 1), CONVERT(BIGINT, 60227));
@@ -284,18 +294,18 @@ IF OBJECT_ID('page_views', 'U') IS NOT NULL DROP TABLE page_views;
 GO
 CREATE TABLE page_views (
     id              BIGINT IDENTITY(1,1) PRIMARY KEY,
-    session_id      NVARCHAR(36)  NOT NULL,
+    session_id      VARCHAR(36)  NOT NULL,
     user_id         INT           NULL,
-    url             NVARCHAR(MAX) NOT NULL,
-    referrer        NVARCHAR(MAX) NULL,
-    user_agent      NVARCHAR(MAX) NULL,
-    ip_address      NVARCHAR(45)  NULL,
+    url             VARCHAR(MAX) NOT NULL,
+    referrer        VARCHAR(MAX) NULL,
+    user_agent      VARCHAR(MAX) NULL,
+    ip_address      VARCHAR(45)  NULL,
     country_code    CHAR(2)       NULL,
-    region          NVARCHAR(100) NULL,
-    city            NVARCHAR(100) NULL,
-    device_type     NVARCHAR(20)  NULL,
-    browser         NVARCHAR(50)  NULL,
-    os              NVARCHAR(50)  NULL,
+    region          VARCHAR(100) NULL,
+    city            VARCHAR(100) NULL,
+    device_type     VARCHAR(20)  NULL,
+    browser         VARCHAR(50)  NULL,
+    os              VARCHAR(50)  NULL,
     screen_width    INT           NULL,
     screen_height   INT           NULL,
     viewport_width  INT           NULL,
@@ -306,12 +316,12 @@ CREATE TABLE page_views (
     scroll_depth_pct SMALLINT     NULL,
     click_count     SMALLINT      NULL,
     is_bounce       BIT           NOT NULL DEFAULT 0,
-    utm_source      NVARCHAR(100) NULL,
-    utm_medium      NVARCHAR(100) NULL,
-    utm_campaign    NVARCHAR(200) NULL,
-    utm_term        NVARCHAR(200) NULL,
-    utm_content     NVARCHAR(200) NULL,
-    custom_props    NVARCHAR(MAX) NULL,
+    utm_source      VARCHAR(100) NULL,
+    utm_medium      VARCHAR(100) NULL,
+    utm_campaign    VARCHAR(200) NULL,
+    utm_term        VARCHAR(200) NULL,
+    utm_content     VARCHAR(200) NULL,
+    custom_props    VARCHAR(MAX) NULL,
     created_at      DATETIME2(6)  NOT NULL DEFAULT SYSUTCDATETIME()
 );
 GO
@@ -325,17 +335,17 @@ SELECT
     ((value - 1) % 500) + 1,
     CONCAT('https://example.com/page/', value % 1000),
     CONCAT('https://ref.example.com/', value % 50),
-    N'Mozilla/5.0 (compatible; bench)',
+    'Mozilla/5.0 (compatible; bench)',
     CONCAT('10.', value % 256, '.', (value / 256) % 256, '.1'),
     CASE value % 3 WHEN 0 THEN 'US' WHEN 1 THEN 'DE' ELSE 'UA' END,
-    CONCAT(N'Region ', value % 20), CONCAT(N'City ', value % 50),
-    CASE value % 3 WHEN 0 THEN N'desktop' WHEN 1 THEN N'mobile' ELSE N'tablet' END,
-    N'Chrome', N'Linux',
+    CONCAT('Region ', value % 20), CONCAT('City ', value % 50),
+    CASE value % 3 WHEN 0 THEN 'desktop' WHEN 1 THEN 'mobile' ELSE 'tablet' END,
+    'Chrome', 'Linux',
     1920, 1080, 1280, 720, value % 3000, value % 1500, value % 60000,
     value % 100, value % 20,
     CAST(CASE WHEN value % 5 = 0 THEN 1 ELSE 0 END AS BIT),
-    N'google', N'cpc', CONCAT(N'campaign_', value % 10),
-    N'term', N'content', CONCAT(N'{"v":', value % 100, N'}'),
+    'google', 'cpc', CONCAT('campaign_', value % 10),
+    'term', 'content', CONCAT('{"v":', value % 100, '}'),
     DATEADD(SECOND, -value, SYSUTCDATETIME())
 FROM GENERATE_SERIES(1, 5000);
 GO
