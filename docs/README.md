@@ -66,6 +66,7 @@ Short terminal walkthroughs in [gifs/](gifs/):
 | Complete YAML config reference | [reference/config.md](reference/config.md) |
 | CLI commands and flags | [reference/cli.md](reference/cli.md) |
 | Tuning profiles and parameters | [reference/tuning.md](reference/tuning.md) |
+| `rivet cdc` — log-based change data capture: per-engine grants/prereqs, output shape, why it's gentle on the source | [reference/cdc.md](reference/cdc.md) |
 | `rivet init` — scaffold YAML from the database | [reference/init.md](reference/init.md) |
 | `rivet init --discover` — machine-readable JSON discovery artifact (ranked cursor / chunk candidates, row estimates, on-disk sizes) for automation and code review | [reference/init.md#discovery-artifact---discover](reference/init.md#discovery-artifact---discover) · [gifs/discover-artifact.gif](gifs/discover-artifact.gif) |
 | `rivet check --type-report --target bigquery` — per-column type fidelity report + warehouse compatibility (NUMERIC / BIGNUMERIC / TIMESTAMP overflow warnings); `--strict` exits non-zero on lossy mappings | [reference/cli.md#rivet-check](reference/cli.md#rivet-check) |
