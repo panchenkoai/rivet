@@ -201,13 +201,26 @@ impl MysqlChangeStream {
 /// driver's SSL options (`super::build_mysql_ssl_opts`).
 fn connect_conn(url: &str, tls: Option<&TlsConfig>) -> Result<Conn> {
     require_tls_or_loopback(url, tls)?;
-    match tls {
-        Some(cfg) if cfg.mode.is_enforced() => Ok(Conn::new(
+    let mut conn = match tls {
+        Some(cfg) if cfg.mode.is_enforced() => Conn::new(
             OptsBuilder::from_opts(Opts::from_url(url)?)
                 .ssl_opts(Some(super::build_mysql_ssl_opts(cfg))),
-        )?),
-        _ => Ok(Conn::new(Opts::from_url(url)?)?),
+        )?,
+        _ => Conn::new(Opts::from_url(url)?)?,
+    };
+    // CDC streams the binlog (COM_BINLOG_DUMP) — a replication protocol that
+    // ProxySQL / MaxScale / transaction-mode multiplexers do not carry. Detect the
+    // proxy here and fail with the fix, not a cryptic dump-protocol error or a hang.
+    let kind = super::proxy::detect_proxy_on_conn(&mut conn);
+    if kind.is_proxy() {
+        anyhow::bail!(
+            "CDC cannot stream the binlog through {} — it does not proxy the MySQL \
+             replication protocol (COM_BINLOG_DUMP). Point the source at the MySQL host \
+             directly (the replication endpoint), not the proxy.",
+            kind.log_label()
+        );
     }
+    Ok(conn)
 }
 
 /// Memory backstop: a single transaction is buffered until its `XID`, so an

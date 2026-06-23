@@ -143,6 +143,11 @@ Notes:
   data exposure with `--table` (rivet filters client-side) and the `SELECT` grant.
 - **A stale `server_id` collision silently kills the stream.** Give rivet a
   `--server-id` no other replica uses.
+- **Connect CDC *directly* to MySQL — not through ProxySQL / MaxScale.** The binlog
+  stream is `COM_BINLOG_DUMP`, a replication protocol query proxies don't carry; the
+  batch path can go through a pooler, CDC cannot. Rivet probes the connection and
+  fails fast with this exact reason if it sees a proxy, so point the source at the
+  MySQL host (the replication endpoint), not the proxy port.
 - `binlog_row_image = FULL` is MySQL's default; the risk is a source that has set
   it to `MINIMAL` to shrink the binlog — that path needs the column-mask MERGE,
   not the simple overwrite (see [Output shape](#output-shape)).

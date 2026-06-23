@@ -12,7 +12,7 @@
 
 <p align="center"><strong>Make database extraction boring.</strong></p>
 
-<p align="center">One Rust binary, ~18 MB (speed-optimized). Extracts PostgreSQL, MySQL, and SQL Server to Parquet/CSV — batch snapshots <em>or</em> log-based change data capture — locally, on S3, GCS, or Azure Blob — without holding long queries open on your production database. Resumable, auditable, source-safe.</p>
+<p align="center">One Rust binary, ~18 MB. Extracts PostgreSQL, MySQL, and SQL Server to Parquet/CSV — locally or to S3 / GCS / Azure — without holding long queries open on your production database. <strong>Batch snapshots or log-based change data capture.</strong> Resumable, auditable, source-safe.</p>
 
 > Not sure if Rivet fits your problem? [docs/who-is-this-for.md](docs/who-is-this-for.md) is a 60-second fit-check.
 

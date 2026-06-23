@@ -155,6 +155,13 @@ pub(super) fn detect_mysql_proxy_kind(pool: &Pool) -> MysqlProxyKind {
         Ok(c) => c,
         Err(_) => return MysqlProxyKind::Direct,
     };
+    detect_proxy_on_conn(&mut conn)
+}
+
+/// The probe + classify on an already-open connection — shared by the batch pool
+/// path and the CDC path (which holds a bare `Conn`, not a `Pool`). A proxy that
+/// shows up here cannot carry the binlog/replication protocol CDC needs.
+pub(super) fn detect_proxy_on_conn<C: Queryable>(conn: &mut C) -> MysqlProxyKind {
     // `PROXYSQL INTERNAL SESSION` is intercepted by ProxySQL on its client
     // port (6033) and returns a single-column JSON row describing the
     // proxy session; vanilla MySQL and MariaDB return SQL syntax error
