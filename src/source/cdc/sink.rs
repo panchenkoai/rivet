@@ -17,7 +17,7 @@
 //! stream still uploads each part, it just has no terminal `_SUCCESS` until it
 //! stops.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, StringArray};
@@ -63,10 +63,63 @@ pub(crate) struct SinkConfig<'a> {
     pub run_id: String,
 }
 
+/// When to roll a part: at a transaction boundary, once the buffer reaches the row
+/// count OR the memory budget. Pure — unit-tested without a stream or destination.
+struct RolloverPolicy {
+    rollover_rows: usize,
+    rollover_bytes: Option<usize>,
+}
+
+impl RolloverPolicy {
+    /// Never split a transaction across parts, so a part can only roll on a
+    /// committed event; then roll on whichever of count / byte-budget hits first.
+    fn should_roll(&self, buf_rows: usize, buf_bytes: usize, committed: bool) -> bool {
+        committed
+            && (buf_rows >= self.rollover_rows
+                || self.rollover_bytes.is_some_and(|b| buf_bytes >= b))
+    }
+}
+
+/// Owns the **durable sequence** for one part — the invariant that makes the run
+/// at-least-once: encode + upload the part, THEN persist the resume checkpoint,
+/// THEN ack the source, in that exact order. A crash between any two steps re-reads
+/// on resume; reordering would risk dropping a change a consume-on-read source
+/// (PostgreSQL) had already advanced past. Checkpoint + ack happen only at a real
+/// commit boundary — the final part can end mid-transaction (resumed from the last
+/// committed position).
+struct PartCommitter<'a> {
+    dest: &'a dyn Destination,
+    format: FormatType,
+    checkpoint: Option<&'a Path>,
+    seq: usize,
+}
+
+impl PartCommitter<'_> {
+    fn commit(
+        &mut self,
+        buf: &[ChangeEvent],
+        schema: &SchemaRef,
+        columns: &[TypeMapping],
+        stream: &mut dyn ChangeStream,
+    ) -> Result<PartRecord> {
+        let part = flush(buf, schema, columns, self.format, self.seq, self.dest)?;
+        if let Some(last) = buf.last()
+            && last.committed
+        {
+            if let Some(p) = self.checkpoint {
+                last.position.save(p)?;
+            }
+            stream.ack(&last.position)?;
+        }
+        self.seq += 1;
+        Ok(part)
+    }
+}
+
 /// Stream canonical changes to typed Parquet/CSV parts, uploading each through the
-/// commit seam, then writing a manifest + `_SUCCESS` at clean end. Rolls a part at
-/// the first transaction boundary past `rollover` rows; checkpoints a commit
-/// position after each part is durably committed.
+/// commit seam, then writing a manifest + `_SUCCESS` at clean end. The loop only
+/// pulls + buffers + asks the [`RolloverPolicy`]; the durable flush→checkpoint→ack
+/// sequence lives in [`PartCommitter`].
 pub(crate) fn run_to_files(
     stream: &mut dyn ChangeStream,
     cfg: SinkConfig<'_>,
@@ -80,8 +133,18 @@ pub(crate) fn run_to_files(
     let mut buf: Vec<ChangeEvent> = Vec::new();
     let mut buf_bytes = 0usize;
     let mut parts: Vec<PartRecord> = Vec::new();
-    let mut seq = 0usize;
     let mut emitted = 0usize;
+
+    let policy = RolloverPolicy {
+        rollover_rows: cfg.rollover,
+        rollover_bytes: cfg.rollover_memory_bytes,
+    };
+    let mut committer = PartCommitter {
+        dest: cfg.dest,
+        format: cfg.format,
+        checkpoint: cfg.checkpoint.as_deref(),
+        seq: 0,
+    };
 
     while let Some(ev) = stream.next_change() {
         let ev = ev?;
@@ -92,20 +155,9 @@ pub(crate) fn run_to_files(
         buf_bytes += ev.estimated_bytes();
         buf.push(ev);
         emitted += 1;
-        // Roll a part only at a transaction boundary (never split a transaction),
-        // once it hits the row-count OR the memory budget — whichever first.
-        let hit_budget = cfg.rollover_memory_bytes.is_some_and(|b| buf_bytes >= b);
-        if committed && (buf.len() >= cfg.rollover || hit_budget) {
+        if policy.should_roll(buf.len(), buf_bytes, committed) {
             let sch = ensure_schema(&mut schema, &mut columns, &buf);
-            parts.push(flush(&buf, &sch, &columns, cfg.format, seq, cfg.dest)?);
-            let last_pos = &buf.last().unwrap().position;
-            if let Some(p) = &cfg.checkpoint {
-                last_pos.save(p)?;
-            }
-            // The part is durable + checkpointed — only now let a consume-on-read
-            // source (PostgreSQL) advance past it. A crash before here re-reads it.
-            stream.ack(last_pos)?;
-            seq += 1;
+            parts.push(committer.commit(&buf, &sch, &columns, stream)?);
             buf.clear();
             buf_bytes = 0;
         }
@@ -115,17 +167,7 @@ pub(crate) fn run_to_files(
     }
     if !buf.is_empty() {
         let sch = ensure_schema(&mut schema, &mut columns, &buf);
-        parts.push(flush(&buf, &sch, &columns, cfg.format, seq, cfg.dest)?);
-        // Only advance/checkpoint at a real commit boundary — a stream that ended
-        // mid-transaction is re-read from the last committed position on resume.
-        if let Some(last) = buf.last()
-            && last.committed
-        {
-            if let Some(p) = &cfg.checkpoint {
-                last.position.save(p)?;
-            }
-            stream.ack(&last.position)?;
-        }
+        parts.push(committer.commit(&buf, &sch, &columns, stream)?);
     }
 
     // Clean end → write the run manifest + _SUCCESS (bounded-run concept).
@@ -291,5 +333,128 @@ fn build_manifest(cfg: &SinkConfig<'_>, parts: &[PartRecord]) -> RunManifest {
                 status: PartStatus::Committed,
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use super::*;
+    use crate::source::cdc::value::RivetValue;
+    use crate::source::cdc::{ChangeEvent, ChangeOp, Position};
+
+    #[test]
+    fn rollover_policy_count_budget_and_commit_gate() {
+        let by_count = RolloverPolicy {
+            rollover_rows: 3,
+            rollover_bytes: None,
+        };
+        assert!(!by_count.should_roll(2, 0, true), "under the row count");
+        assert!(by_count.should_roll(3, 0, true), "hits the row count");
+        assert!(
+            !by_count.should_roll(9, 0, false),
+            "never roll mid-transaction (uncommitted)"
+        );
+
+        let by_budget = RolloverPolicy {
+            rollover_rows: 1_000_000,
+            rollover_bytes: Some(100),
+        };
+        assert!(!by_budget.should_roll(2, 50, true), "under the byte budget");
+        assert!(
+            by_budget.should_roll(2, 100, true),
+            "byte budget rolls before the (huge) row count"
+        );
+    }
+
+    /// A fake stream that yields a fixed list of changes and records every `ack`,
+    /// so the test can assert the durable sequence ran once per committed part.
+    struct FakeStream {
+        events: VecDeque<ChangeEvent>,
+        acked: Vec<Position>,
+    }
+
+    impl ChangeStream for FakeStream {
+        fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
+            self.events.pop_front().map(Ok)
+        }
+        fn ack(&mut self, position: &Position) -> Result<()> {
+            self.acked.push(position.clone());
+            Ok(())
+        }
+    }
+
+    fn insert(id: i64) -> ChangeEvent {
+        ChangeEvent {
+            op: ChangeOp::Insert,
+            schema: "s".into(),
+            table: "t".into(),
+            before: None,
+            after: Some(vec![RivetValue::Int(id)]),
+            position: Position(serde_json::json!({ "lsn": format!("{id:08X}") })),
+            committed: true,
+        }
+    }
+
+    fn int_col() -> Vec<TypeMapping> {
+        vec![TypeMapping {
+            column_name: "v".into(),
+            source_native_type: "bigint".into(),
+            rivet_type: crate::types::RivetType::Int64,
+            arrow_type: Some(DataType::Int64),
+            fidelity: crate::types::TypeFidelity::Exact,
+            nullable: true,
+            warnings: vec![],
+        }]
+    }
+
+    // Exercises the whole sink — encode + commit-seam upload + manifest + the
+    // flush→checkpoint→ack sequence — against a real LocalDestination (temp dir)
+    // and a fake stream, with no live database.
+    #[test]
+    fn run_to_files_rolls_parts_and_acks_each_committed_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = crate::destination::create_destination(&crate::config::DestinationConfig {
+            destination_type: crate::config::DestinationType::Local,
+            path: Some(dir.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+        let cols = int_col();
+        let mut stream = FakeStream {
+            events: VecDeque::from(vec![insert(1), insert(2), insert(3)]),
+            acked: Vec::new(),
+        };
+        let now = "2026-06-23T00:00:00Z".to_string();
+        let cfg = SinkConfig {
+            columns: &cols,
+            dest: dest.as_ref(),
+            dest_uri: dir.path().to_string_lossy().into_owned(),
+            engine: "test",
+            table: "t",
+            format: FormatType::Parquet,
+            tables: Vec::new(),
+            checkpoint: None,
+            max_events: None,
+            rollover: 2, // 3 events, roll at 2 ⇒ part0=[1,2], part1=[3]
+            rollover_memory_bytes: None,
+            started_at: now.clone(),
+            run_id: now,
+        };
+
+        let manifest = run_to_files(&mut stream, cfg).unwrap();
+
+        assert_eq!(manifest.part_count, 2, "rollover=2 over 3 events ⇒ 2 parts");
+        assert_eq!(manifest.row_count, 3);
+        assert_eq!(
+            stream.acked.len(),
+            2,
+            "the durable sequence acked once per committed part"
+        );
+        assert!(
+            dir.path().join("_SUCCESS").exists(),
+            "_SUCCESS marks the clean end"
+        );
     }
 }
