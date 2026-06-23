@@ -93,15 +93,20 @@ fn manifest_rows(out: &std::path::Path) -> i64 {
     m["row_count"].as_i64().expect("row_count")
 }
 
-/// `(column, Arrow type)` for the single `.parquet` part in `dir` — the surface
-/// the type-fidelity assertion compares against a batch export.
-fn parquet_fields(dir: &std::path::Path) -> Vec<(String, arrow::datatypes::DataType)> {
-    let part = std::fs::read_dir(dir)
+/// The single `.parquet` part written under `dir` (CDC + batch each write one for
+/// these small fixtures).
+fn find_parquet_part(dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::read_dir(dir)
         .unwrap()
         .filter_map(|e| e.ok().map(|e| e.path()))
         .find(|p| p.extension().is_some_and(|x| x == "parquet"))
-        .expect("a .parquet part");
-    let f = std::fs::File::open(part).unwrap();
+        .expect("a .parquet part")
+}
+
+/// `(column, Arrow type)` for the part — the surface the type-fidelity assertion
+/// compares against a batch export.
+fn parquet_fields(dir: &std::path::Path) -> Vec<(String, arrow::datatypes::DataType)> {
+    let f = std::fs::File::open(find_parquet_part(dir)).unwrap();
     let b = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f).unwrap();
     b.schema()
         .fields()
@@ -110,16 +115,11 @@ fn parquet_fields(dir: &std::path::Path) -> Vec<(String, arrow::datatypes::DataT
         .collect()
 }
 
-/// The single string value under `col` in the one `.parquet` part — for asserting
-/// captured content (e.g. a JSON column round-trips as valid JSON text).
+/// The single string value under `col` in the part — for asserting captured
+/// content (e.g. a JSON column round-trips as valid JSON text).
 fn parquet_one_string(dir: &std::path::Path, col: &str) -> String {
     use arrow::array::{Array, StringArray};
-    let part = std::fs::read_dir(dir)
-        .unwrap()
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .find(|p| p.extension().is_some_and(|x| x == "parquet"))
-        .expect("a .parquet part");
-    let f = std::fs::File::open(part).unwrap();
+    let f = std::fs::File::open(find_parquet_part(dir)).unwrap();
     let mut r = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
         .unwrap()
         .build()

@@ -415,35 +415,18 @@ mod tests {
     #[test]
     fn run_to_files_rolls_parts_and_acks_each_committed_part() {
         let dir = tempfile::tempdir().unwrap();
-        let dest = crate::destination::create_destination(&crate::config::DestinationConfig {
-            destination_type: crate::config::DestinationType::Local,
-            path: Some(dir.path().to_string_lossy().into_owned()),
-            ..Default::default()
-        })
-        .unwrap();
+        let dest = local_dest(&dir);
         let cols = int_col();
         let mut stream = FakeStream {
             events: VecDeque::from(vec![insert(1), insert(2), insert(3)]),
             acked: Vec::new(),
         };
-        let now = "2026-06-23T00:00:00Z".to_string();
-        let cfg = SinkConfig {
-            columns: &cols,
-            dest: dest.as_ref(),
-            dest_uri: dir.path().to_string_lossy().into_owned(),
-            engine: "test",
-            table: "t",
-            format: FormatType::Parquet,
-            tables: Vec::new(),
-            checkpoint: None,
-            max_events: None,
-            rollover: 2, // 3 events, roll at 2 ⇒ part0=[1,2], part1=[3]
-            rollover_memory_bytes: None,
-            started_at: now.clone(),
-            run_id: now,
-        };
-
-        let manifest = run_to_files(&mut stream, cfg).unwrap();
+        // 3 events, roll at 2 ⇒ part0=[1,2], part1=[3]
+        let manifest = run_to_files(
+            &mut stream,
+            cfg(dest.as_ref(), &cols, FormatType::Parquet, 2),
+        )
+        .unwrap();
 
         assert_eq!(manifest.part_count, 2, "rollover=2 over 3 events ⇒ 2 parts");
         assert_eq!(manifest.row_count, 3);
