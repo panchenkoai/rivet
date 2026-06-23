@@ -250,6 +250,22 @@ With a full row image, *which* columns changed is irrelevant — the latest imag
 per key (highest `__pos`) already contains every prior change, so dedup-by-key +
 overwrite is correct. This is why `binlog_row_image = FULL` matters.
 
+### Downstream loading
+
+CDC output is the **same typed Parquet** the batch export writes (same
+`build_arrow_field` pipeline), so the warehouse-loading recipes apply unchanged —
+the engine-specific `MERGE` and the JSON-as-`BYTES` / naive-timestamp autoload
+recovery are in
+[recipes/idempotent-warehouse-load.md](../recipes/idempotent-warehouse-load.md)
+(BigQuery) and [recipes/snowflake-load.md](../recipes/snowflake-load.md), keyed on
+the PK + `__op` above.
+
+Verified cross-engine on a CDC part: **DuckDB** reads `json` natively, **ClickHouse**
+as `String` (`JSONExtract*` parses it), **BigQuery** as `BYTES` (`PARSE_JSON` after
+`SAFE_CONVERT_BYTES_TO_STRING`); integers keep their width (`INT32`/`INT64`) and
+timestamps their microseconds. The JSON text round-trips losslessly in all three — the
+type that auto-detects differs, the data does not.
+
 Without `--output`, rivet emits the same information as NDJSON (one JSON object
 per change) to stdout.
 
