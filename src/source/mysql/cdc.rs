@@ -224,6 +224,13 @@ fn render_row(r: mysql::binlog::row::BinlogRow) -> Vec<RivetValue> {
 fn binlog_value_to_rivet(bv: &BinlogValue) -> RivetValue {
     match bv {
         BinlogValue::Value(v) => RivetValue::from_mysql(v),
+        // A JSON column arrives as MySQL's internal JSONB binary — convert it to
+        // canonical JSON text so it lands as a real `json` column downstream, not
+        // a debug-formatted byte blob.
+        BinlogValue::Jsonb(j) => match serde_json::Value::try_from(j.clone()) {
+            Ok(json) => RivetValue::Bytes(json.to_string().into_bytes()),
+            Err(_) => RivetValue::Null,
+        },
         // JSONB partial-update diffs (rare) — carry the debug bytes as text.
         other => RivetValue::Bytes(format!("{other:?}").into_bytes()),
     }

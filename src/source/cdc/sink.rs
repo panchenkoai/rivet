@@ -37,10 +37,14 @@ use crate::pipeline::commit::{PartRecord, write_part_file};
 use crate::pipeline::manifest_writer::write_manifest;
 use crate::source::cdc::value::{self, RivetValue};
 use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream};
+use crate::types::{TypeMapping, build_arrow_field};
 
 /// Everything the sink needs that isn't the stream itself.
 pub(crate) struct SinkConfig<'a> {
-    pub columns: &'a [(String, DataType)],
+    /// Resolved source column type mappings — carry the Arrow type *and* its
+    /// logical-type metadata (`json`/`uuid`/…), so the sink writes the same typed
+    /// columns the batch export does (via [`build_arrow_field`]).
+    pub columns: &'a [TypeMapping],
     pub dest: &'a dyn Destination,
     pub dest_uri: String,
     pub engine: &'a str,
@@ -118,7 +122,7 @@ pub(crate) fn run_to_files(
 /// the first batch's values first (`__op`, `__pos`, then the typed columns).
 fn ensure_schema(
     schema: &mut Option<SchemaRef>,
-    columns: &mut [(String, DataType)],
+    columns: &mut [TypeMapping],
     events: &[ChangeEvent],
 ) -> SchemaRef {
     if schema.is_none() {
@@ -127,8 +131,18 @@ fn ensure_schema(
             Field::new("__op", DataType::Utf8, false),
             Field::new("__pos", DataType::Utf8, false),
         ];
-        for (name, dt) in columns.iter() {
-            fields.push(Field::new(name, value::sink_type(dt), true));
+        for m in columns.iter() {
+            // Reuse the batch path's field builder so json/uuid/enum carry their
+            // logical-type metadata + Parquet extension and ints keep their width.
+            // For a type the sink can't build exactly (or `Unsupported`), fall back
+            // to a plain `Utf8` field — matching the `Utf8` array `build_column`
+            // will produce — so the schema and the data never disagree.
+            let field = match &m.arrow_type {
+                Some(dt) if value::is_buildable(dt) => build_arrow_field(m)
+                    .unwrap_or_else(|| Field::new(&m.column_name, DataType::Utf8, m.nullable)),
+                _ => Field::new(&m.column_name, DataType::Utf8, m.nullable),
+            };
+            fields.push(field);
         }
         *schema = Some(Arc::new(Schema::new(fields)));
     }
@@ -139,9 +153,9 @@ fn ensure_schema(
 /// `0` placeholder (SQL Server). A column with a real declared scale
 /// (MySQL/PostgreSQL metadata) is left untouched — only the placeholder is
 /// refined, from the max fractional-digit count seen in the batch.
-fn refine_decimal_scales(columns: &mut [(String, DataType)], events: &[ChangeEvent]) {
-    for (i, (_, dt)) in columns.iter_mut().enumerate() {
-        let DataType::Decimal128(p, 0) = dt else {
+fn refine_decimal_scales(columns: &mut [TypeMapping], events: &[ChangeEvent]) {
+    for (i, m) in columns.iter_mut().enumerate() {
+        let Some(DataType::Decimal128(p, 0)) = m.arrow_type else {
             continue;
         };
         let scale = events
@@ -161,7 +175,7 @@ fn refine_decimal_scales(columns: &mut [(String, DataType)], events: &[ChangeEve
             })
             .max();
         if let Some(s) = scale.filter(|s| *s > 0) {
-            *dt = DataType::Decimal128(*p, s as i8);
+            m.arrow_type = Some(DataType::Decimal128(p, s as i8));
         }
     }
 }
@@ -171,7 +185,7 @@ fn refine_decimal_scales(columns: &mut [(String, DataType)], events: &[ChangeEve
 fn flush(
     events: &[ChangeEvent],
     schema: &SchemaRef,
-    columns: &[(String, DataType)],
+    columns: &[TypeMapping],
     format: FormatType,
     seq: usize,
     dest: &dyn Destination,
@@ -189,7 +203,7 @@ fn flush(
             .collect::<StringArray>(),
     );
     let mut arrays: Vec<ArrayRef> = vec![ops, poss];
-    for (i, (_, dt)) in columns.iter().enumerate() {
+    for (i, m) in columns.iter().enumerate() {
         let cells: Vec<Option<&RivetValue>> = events
             .iter()
             .map(|e| {
@@ -201,7 +215,11 @@ fn flush(
                 image.and_then(|vals| vals.get(i))
             })
             .collect();
-        arrays.push(value::build_column(&value::sink_type(dt), &cells)?);
+        // The render type matches exactly the field `ensure_schema` declared.
+        arrays.push(value::build_column(
+            &value::render_type(m.arrow_type.as_ref()),
+            &cells,
+        )?);
     }
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
 

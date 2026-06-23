@@ -14,9 +14,11 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float64Builder,
-    Int64Builder, StringBuilder, Time64MicrosecondBuilder, TimestampMicrosecondBuilder,
-    UInt64Builder,
+    ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder,
+    FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int8Builder, Int16Builder,
+    Int32Builder, Int64Builder, LargeBinaryBuilder, LargeStringBuilder, StringBuilder,
+    Time64MicrosecondBuilder, TimestampMicrosecondBuilder, UInt8Builder, UInt16Builder,
+    UInt32Builder, UInt64Builder,
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use chrono::{NaiveDate, NaiveDateTime};
@@ -89,49 +91,74 @@ impl RivetValue {
     }
 }
 
-/// The Arrow type this sink can build for a resolved column type — passthrough for
-/// the types `build_column` handles, `Utf8` for the rest (stringified). Keeps the
-/// schema and the built arrays consistent.
-pub(crate) fn sink_type(dt: &DataType) -> DataType {
-    match dt {
+/// True when [`build_column`] can produce an array of *exactly* this Arrow type
+/// from a `RivetValue`. Drives whether the sink keeps the source's resolved type
+/// — carrying its logical-type metadata + extension through `build_arrow_field`,
+/// so `json` / `uuid` / real int widths land identically to the batch export —
+/// or coarsens the column to `Utf8`.
+pub(crate) fn is_buildable(dt: &DataType) -> bool {
+    matches!(
+        dt,
         DataType::Boolean
-        | DataType::Int8
-        | DataType::Int16
-        | DataType::Int32
-        | DataType::Int64
-        | DataType::UInt8
-        | DataType::UInt16
-        | DataType::UInt32
-        | DataType::UInt64
-        | DataType::Float16
-        | DataType::Float32
-        | DataType::Float64
-        | DataType::Date32
-        | DataType::Binary
-        | DataType::LargeBinary => normalize(dt),
-        DataType::Timestamp(_, _) => DataType::Timestamp(TimeUnit::Microsecond, None),
-        DataType::Time64(_) | DataType::Time32(_) => DataType::Time64(TimeUnit::Microsecond),
-        DataType::Decimal128(p, s) => DataType::Decimal128(*p, *s),
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Date32
+            | DataType::Time64(TimeUnit::Microsecond)
+            | DataType::Decimal128(_, _)
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::FixedSizeBinary(_)
+            | DataType::Timestamp(TimeUnit::Microsecond, None)
+    )
+}
+
+/// The storage type the sink actually writes for a resolved column: the source's
+/// own Arrow type when [`build_column`] can produce it exactly, else `Utf8`
+/// (stringified). Keeps the schema field and the built array in lockstep.
+pub(crate) fn render_type(arrow_type: Option<&DataType>) -> DataType {
+    match arrow_type {
+        Some(dt) if is_buildable(dt) => dt.clone(),
         _ => DataType::Utf8,
     }
 }
 
-fn normalize(dt: &DataType) -> DataType {
-    match dt {
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => DataType::Int64,
-        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
-            DataType::UInt64
-        }
-        DataType::Float16 | DataType::Float32 | DataType::Float64 => DataType::Float64,
-        DataType::Binary | DataType::LargeBinary => DataType::Binary,
-        other => other.clone(),
-    }
-}
-
 /// Build one Arrow column from typed cells (one per row; `None` ⇒ null). `dt` is
-/// the already-[`sink_type`]-normalized target type.
+/// the [`render_type`] — i.e. exactly the array type the schema field declares.
 pub(crate) fn build_column(dt: &DataType, cells: &[Option<&RivetValue>]) -> Result<ArrayRef> {
     use RivetValue as V;
+
+    // Integers: the binlog/driver value is always the widest signed/unsigned, so
+    // narrow to the column's declared width — `try_from` nulls on the (impossible
+    // for a correctly-typed column) overflow rather than silently wrapping.
+    macro_rules! int_col {
+        ($builder:ty, $ty:ty) => {{
+            let mut b = <$builder>::with_capacity(cells.len());
+            for c in cells {
+                let v = match c {
+                    Some(V::Int(i)) => <$ty>::try_from(*i).ok(),
+                    Some(V::UInt(u)) => <$ty>::try_from(*u).ok(),
+                    Some(V::Bool(x)) => Some(*x as $ty),
+                    _ => None,
+                };
+                match v {
+                    Some(v) => b.append_value(v),
+                    None => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }};
+    }
+
     Ok(match dt {
         DataType::Boolean => {
             let mut b = BooleanBuilder::with_capacity(cells.len());
@@ -145,23 +172,21 @@ pub(crate) fn build_column(dt: &DataType, cells: &[Option<&RivetValue>]) -> Resu
             }
             Arc::new(b.finish())
         }
-        DataType::Int64 => {
-            let mut b = Int64Builder::with_capacity(cells.len());
+        DataType::Int8 => int_col!(Int8Builder, i8),
+        DataType::Int16 => int_col!(Int16Builder, i16),
+        DataType::Int32 => int_col!(Int32Builder, i32),
+        DataType::Int64 => int_col!(Int64Builder, i64),
+        DataType::UInt8 => int_col!(UInt8Builder, u8),
+        DataType::UInt16 => int_col!(UInt16Builder, u16),
+        DataType::UInt32 => int_col!(UInt32Builder, u32),
+        DataType::UInt64 => int_col!(UInt64Builder, u64),
+        DataType::Float32 => {
+            let mut b = Float32Builder::with_capacity(cells.len());
             for c in cells {
                 match c {
-                    Some(V::Int(i)) => b.append_value(*i),
-                    Some(V::UInt(u)) if *u <= i64::MAX as u64 => b.append_value(*u as i64),
-                    _ => b.append_null(),
-                }
-            }
-            Arc::new(b.finish())
-        }
-        DataType::UInt64 => {
-            let mut b = UInt64Builder::with_capacity(cells.len());
-            for c in cells {
-                match c {
-                    Some(V::UInt(u)) => b.append_value(*u),
-                    Some(V::Int(i)) if *i >= 0 => b.append_value(*i as u64),
+                    Some(V::Float(f)) => b.append_value(*f as f32),
+                    Some(V::Int(i)) => b.append_value(*i as f32),
+                    Some(V::UInt(u)) => b.append_value(*u as f32),
                     _ => b.append_null(),
                 }
             }
@@ -189,7 +214,7 @@ pub(crate) fn build_column(dt: &DataType, cells: &[Option<&RivetValue>]) -> Resu
             }
             Arc::new(b.finish())
         }
-        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+        DataType::Timestamp(TimeUnit::Microsecond, None) => {
             let mut b = TimestampMicrosecondBuilder::with_capacity(cells.len());
             for c in cells {
                 match c {
@@ -230,7 +255,43 @@ pub(crate) fn build_column(dt: &DataType, cells: &[Option<&RivetValue>]) -> Resu
             }
             Arc::new(b.finish())
         }
-        // Utf8 fallback: render anything to a string.
+        DataType::LargeBinary => {
+            let mut b = LargeBinaryBuilder::with_capacity(cells.len(), 0);
+            for c in cells {
+                match c {
+                    Some(V::Bytes(by)) => b.append_value(by),
+                    _ => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        DataType::FixedSizeBinary(n) => {
+            let mut b = FixedSizeBinaryBuilder::with_capacity(cells.len(), *n);
+            for c in cells {
+                match c {
+                    // Only a value of exactly the declared width is valid (e.g. a
+                    // 16-byte UUID); anything else degrades to null rather than
+                    // failing the whole batch.
+                    Some(V::Bytes(by)) if by.len() == *n as usize => {
+                        b.append_value(by).map_err(|e| anyhow::anyhow!(e))?
+                    }
+                    _ => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        DataType::LargeUtf8 => {
+            let mut b = LargeStringBuilder::with_capacity(cells.len(), 0);
+            for c in cells {
+                match c {
+                    Some(v) => b.append_value(render_str(v)),
+                    None => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        // Utf8 + the catch-all: render anything to a string. `json` / `enum` ride
+        // here (physically `Utf8`); their logical-type marker lives on the field.
         _ => {
             let mut b = StringBuilder::with_capacity(cells.len(), 0);
             for c in cells {

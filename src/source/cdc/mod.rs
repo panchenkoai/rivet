@@ -201,14 +201,16 @@ pub(crate) fn create_change_stream(cfg: &CdcConfig) -> Result<Box<dyn ChangeStre
     }
 }
 
-/// Resolve a CDC table's column schema (name + Arrow type) from the source — the
-/// same `RivetType` → Arrow pipeline the batch path uses — to type the file sink.
-/// `tls` is threaded through the same gate as the streaming connection.
+/// Resolve a CDC table's column type mappings from the source — the **same**
+/// `RivetType` → Arrow pipeline the batch export uses — so the typed file sink
+/// writes identical columns (logical types `json`/`uuid`/…, real int widths, …)
+/// via [`crate::types::build_arrow_field`]. `tls` is threaded through the same
+/// gate as the streaming connection.
 pub(crate) fn resolve_cdc_columns(
     url: &str,
     table: &str,
     tls: Option<&crate::config::TlsConfig>,
-) -> Result<Vec<(String, arrow::datatypes::DataType)>> {
+) -> Result<Vec<crate::types::TypeMapping>> {
     use crate::source::Source;
     // The table name is interpolated into `SELECT * FROM {table}` for the schema
     // probe, so validate it to a plain `[schema.]table` identifier — no quote,
@@ -236,17 +238,8 @@ pub(crate) fn resolve_cdc_columns(
             url, tls,
         )?)
     };
-    let mappings = src.type_mappings(
+    src.type_mappings(
         &format!("SELECT * FROM {table}"),
         &crate::types::ColumnOverrides::new(),
-    )?;
-    Ok(mappings
-        .into_iter()
-        .map(|m| {
-            (
-                m.column_name,
-                m.arrow_type.unwrap_or(arrow::datatypes::DataType::Utf8),
-            )
-        })
-        .collect())
+    )
 }
