@@ -243,6 +243,9 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
         capture_instance: a.capture_instance,
         checkpoint: ckpt.clone(),
         until_current: a.until_current,
+        // The CLI carries no TlsConfig; `None` ⇒ the require_tls_or_loopback gate
+        // refuses a remote host (config-driven `rivet run` supplies source.tls).
+        tls: None,
     };
     let mut stream = crate::source::cdc::create_change_stream(&cdc_cfg)?;
 
@@ -306,6 +309,19 @@ fn resolve_cdc_columns(
     table: &str,
 ) -> Result<Vec<(String, arrow::datatypes::DataType)>> {
     use crate::source::Source;
+    // The table name is interpolated into `SELECT * FROM {table}` for the schema
+    // probe, so validate it to a plain `[schema.]table` identifier — no quote,
+    // paren, semicolon, or space can break out (mirrors the capture-instance check).
+    if table.is_empty()
+        || !table
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+    {
+        anyhow::bail!(
+            "rivet cdc --table must be a plain [schema.]table identifier (got {table:?}); \
+             refusing to interpolate it into SQL"
+        );
+    }
     let mut src: Box<dyn Source> = if url.starts_with("mysql://") {
         Box::new(crate::source::mysql::MysqlSource::connect_with_tls(
             url, None,

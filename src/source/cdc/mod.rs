@@ -161,6 +161,10 @@ pub(crate) struct CdcConfig {
     /// indefinitely. For MySQL this sets `BINLOG_DUMP_NON_BLOCK`; PostgreSQL /
     /// SQL Server already drain their backlog and exit, so it is a no-op there.
     pub until_current: bool,
+    /// Transport security, applied by every adapter through the same
+    /// `require_tls_or_loopback` gate the batch path uses (refuse remote
+    /// plaintext / unauthenticated TLS). `None` ⇒ loopback-only (the CLI default).
+    pub tls: Option<crate::config::TlsConfig>,
 }
 
 /// Construct the right [`ChangeStream`] adapter for the source URL's scheme —
@@ -168,6 +172,7 @@ pub(crate) struct CdcConfig {
 /// batch path.
 pub(crate) fn create_change_stream(cfg: &CdcConfig) -> Result<Box<dyn ChangeStream>> {
     let url = cfg.url.as_str();
+    let tls = cfg.tls.as_ref();
     if url.starts_with("mysql://") {
         Ok(Box::new(
             crate::source::mysql::cdc::MysqlChangeStream::open_or_resume(
@@ -175,18 +180,19 @@ pub(crate) fn create_change_stream(cfg: &CdcConfig) -> Result<Box<dyn ChangeStre
                 cfg.server_id,
                 cfg.checkpoint.as_deref(),
                 cfg.until_current,
+                tls,
             )?,
         ))
     } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
         Ok(Box::new(
-            crate::source::postgres::cdc::PgChangeStream::open(url, &cfg.slot)?,
+            crate::source::postgres::cdc::PgChangeStream::open(url, &cfg.slot, tls)?,
         ))
     } else if url.starts_with("sqlserver://") || url.starts_with("mssql://") {
         let ci = cfg.capture_instance.as_deref().ok_or_else(|| {
             anyhow::anyhow!("sqlserver cdc requires --capture-instance (e.g. dbo_orders)")
         })?;
         Ok(Box::new(
-            crate::source::mssql::cdc::MssqlChangeStream::from_url(url, ci)?,
+            crate::source::mssql::cdc::MssqlChangeStream::from_url(url, ci, tls)?,
         ))
     } else {
         anyhow::bail!(

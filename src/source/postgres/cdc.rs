@@ -25,9 +25,11 @@ use std::collections::VecDeque;
 use postgres::{Client, NoTls};
 use serde_json::json;
 
+use crate::config::TlsConfig;
 use crate::error::Result;
 use crate::source::cdc::value::RivetValue;
 use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, Position};
+use crate::source::require_tls_or_loopback;
 
 /// Polls a logical slot and yields canonical changes.
 pub(crate) struct PgChangeStream {
@@ -40,8 +42,20 @@ pub(crate) struct PgChangeStream {
 impl PgChangeStream {
     /// Connect and ensure a `test_decoding` logical slot named `slot` exists
     /// (idempotent — reuses an existing slot, which is how a real run resumes).
-    pub(crate) fn open(conn_str: &str, slot: &str) -> Result<Self> {
-        let mut client = Client::connect(conn_str, NoTls)?;
+    pub(crate) fn open(conn_str: &str, slot: &str, tls: Option<&TlsConfig>) -> Result<Self> {
+        // Same gate the batch path uses: refuse remote plaintext (CWE-319), and
+        // use a verifying TLS connector when a TlsConfig is enforced.
+        require_tls_or_loopback(conn_str, tls)?;
+        let mut client = match tls {
+            Some(cfg) if cfg.mode.is_enforced() => {
+                let connector = crate::source::tls::build_native_tls(cfg)?;
+                Client::connect(
+                    conn_str,
+                    postgres_native_tls::MakeTlsConnector::new(connector),
+                )?
+            }
+            _ => Client::connect(conn_str, NoTls)?,
+        };
         let exists: bool = client
             .query_one(
                 "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
@@ -246,7 +260,9 @@ fn parse_pg_timestamp(val: &str) -> RivetValue {
 mod tests {
     use super::*;
 
-    const CONN: &str = "host=127.0.0.1 user=rivet password=rivet dbname=rivet";
+    // URL form (not key=value) so the require_tls_or_loopback gate recognises
+    // 127.0.0.1 as loopback.
+    const CONN: &str = "postgresql://rivet:rivet@127.0.0.1:5432/rivet";
     const SLOT: &str = "rivet_cdc_test";
 
     #[test]
@@ -279,7 +295,7 @@ mod tests {
             .unwrap();
 
         // Slot must exist BEFORE the changes for them to be captured.
-        let mut s = PgChangeStream::open(CONN, SLOT).unwrap();
+        let mut s = PgChangeStream::open(CONN, SLOT, None).unwrap();
         admin
             .batch_execute(
                 "DROP TABLE IF EXISTS cdc_unit; CREATE TABLE cdc_unit (id INT PRIMARY KEY, v INT)",

@@ -21,12 +21,14 @@ use std::path::Path;
 use mysql::binlog::events::{EventData, RowsEventData, TableMapEvent};
 use mysql::binlog::value::BinlogValue;
 use mysql::prelude::Queryable;
-use mysql::{BinlogDumpFlags, BinlogRequest, BinlogStream, Conn, Opts};
+use mysql::{BinlogDumpFlags, BinlogRequest, BinlogStream, Conn, Opts, OptsBuilder};
 use serde_json::{Value as Json, json};
 
+use crate::config::TlsConfig;
 use crate::error::Result;
 use crate::source::cdc::value::RivetValue;
 use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, Position};
+use crate::source::require_tls_or_loopback;
 
 /// A blocking iterator of canonical [`ChangeEvent`]s over a MySQL binlog stream.
 ///
@@ -59,8 +61,9 @@ impl MysqlChangeStream {
         file: String,
         pos: u64,
         non_block: bool,
+        tls: Option<&TlsConfig>,
     ) -> Result<Self> {
-        let conn = Conn::new(Opts::from_url(url)?)?;
+        let conn = connect_conn(url, tls)?;
         let mut req = BinlogRequest::new(server_id)
             .with_filename(file.clone().into_bytes())
             .with_pos(pos);
@@ -78,25 +81,32 @@ impl MysqlChangeStream {
     }
 
     /// Open a stream from the source's *current* position (`SHOW MASTER STATUS`).
-    pub(crate) fn open_from_current(url: &str, server_id: u32, non_block: bool) -> Result<Self> {
-        let mut c = Conn::new(Opts::from_url(url)?)?;
+    pub(crate) fn open_from_current(
+        url: &str,
+        server_id: u32,
+        non_block: bool,
+        tls: Option<&TlsConfig>,
+    ) -> Result<Self> {
+        let mut c = connect_conn(url, tls)?;
         let row: mysql::Row = c
             .query_first("SHOW MASTER STATUS")?
             .ok_or_else(|| anyhow::anyhow!("mysql: binlog disabled (SHOW MASTER STATUS empty)"))?;
         let file: String = row.get(0).expect("binlog file column");
         let pos: u64 = row.get(1).expect("binlog pos column");
-        Self::open(url, server_id, file, pos, non_block)
+        Self::open(url, server_id, file, pos, non_block, tls)
     }
 
     /// Resume from a persisted [`Position`] checkpoint, or start from the current
     /// position on the first run (no checkpoint yet). The MySQL position shape is
     /// `{"file": String, "pos": u64}`. `non_block` ⇒ drain to the current end and
     /// exit (see [`Self::open`]).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_or_resume(
         url: &str,
         server_id: u32,
         ckpt: Option<&Path>,
         non_block: bool,
+        tls: Option<&TlsConfig>,
     ) -> Result<Self> {
         if let Some(path) = ckpt
             && let Some(pos) = Position::load(path)?
@@ -112,9 +122,9 @@ impl MysqlChangeStream {
                 .get("pos")
                 .and_then(Json::as_u64)
                 .ok_or_else(|| anyhow::anyhow!("mysql cdc checkpoint missing 'pos'"))?;
-            return Self::open(url, server_id, file, p, non_block);
+            return Self::open(url, server_id, file, p, non_block, tls);
         }
-        Self::open_from_current(url, server_id, non_block)
+        Self::open_from_current(url, server_id, non_block, tls)
     }
 
     /// Pull one binlog event and expand it into `pending`. `Ok(false)` ⇒ stream
@@ -159,6 +169,13 @@ impl MysqlChangeStream {
                         committed: false,
                     });
                 }
+                if self.tx.len() > MAX_TX_ROWS {
+                    anyhow::bail!(
+                        "mysql cdc: a single transaction buffered more than {MAX_TX_ROWS} rows \
+                         before its commit — refusing to buffer unbounded (raise the cap only if \
+                         a transaction this large is genuinely expected)"
+                    );
+                }
             }
             // XID = transaction commit. Stamp the commit position on every change
             // in the transaction and mark the last one committed, then release the
@@ -178,6 +195,25 @@ impl MysqlChangeStream {
         Ok(true)
     }
 }
+
+/// Connect a MySQL `Conn`, applying the same TLS gate the batch path uses —
+/// refuse remote plaintext (CWE-319), and map an enforced `TlsConfig` to the
+/// driver's SSL options (`super::build_mysql_ssl_opts`).
+fn connect_conn(url: &str, tls: Option<&TlsConfig>) -> Result<Conn> {
+    require_tls_or_loopback(url, tls)?;
+    match tls {
+        Some(cfg) if cfg.mode.is_enforced() => Ok(Conn::new(
+            OptsBuilder::from_opts(Opts::from_url(url)?)
+                .ssl_opts(Some(super::build_mysql_ssl_opts(cfg))),
+        )?),
+        _ => Ok(Conn::new(Opts::from_url(url)?)?),
+    }
+}
+
+/// Memory backstop: a single transaction is buffered until its `XID`, so an
+/// oversized (or crafted) transaction would grow `tx` unbounded. Cap it and bail
+/// loudly rather than OOM. A real OLTP transaction is far below this.
+const MAX_TX_ROWS: usize = 5_000_000;
 
 /// Decode a binlog row's cells to typed [`RivetValue`]s (structural — no string
 /// reparse of temporals).
@@ -230,7 +266,7 @@ mod tests {
         c.query_drop("CREATE TABLE cdc_unit (id INT PRIMARY KEY, v INT)")
             .unwrap();
 
-        let mut stream = MysqlChangeStream::open_from_current(URL, 4243, false).unwrap();
+        let mut stream = MysqlChangeStream::open_from_current(URL, 4243, false, None).unwrap();
         c.query_drop("INSERT INTO cdc_unit VALUES (1, 10)").unwrap();
         c.query_drop("UPDATE cdc_unit SET v = 20 WHERE id = 1")
             .unwrap();
@@ -282,7 +318,7 @@ mod tests {
             .unwrap();
 
         // Read change A and checkpoint at its position.
-        let mut s = MysqlChangeStream::open_from_current(URL, 4244, false).unwrap();
+        let mut s = MysqlChangeStream::open_from_current(URL, 4244, false, None).unwrap();
         c.query_drop("INSERT INTO cdc_resume VALUES (1, 100)")
             .unwrap();
         let a = s
@@ -303,7 +339,8 @@ mod tests {
             .unwrap();
 
         // Resuming from the checkpoint must yield B (id=2), never re-read A.
-        let mut s2 = MysqlChangeStream::open_or_resume(URL, 4244, Some(&ckpt), false).unwrap();
+        let mut s2 =
+            MysqlChangeStream::open_or_resume(URL, 4244, Some(&ckpt), false, None).unwrap();
         let b = s2
             .by_ref()
             .map(|e| e.unwrap())

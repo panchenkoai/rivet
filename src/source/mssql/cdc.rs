@@ -29,9 +29,11 @@ use tiberius::{AuthMethod, Client, ColumnData, Config, EncryptionLevel, Row};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
+use crate::config::{TlsConfig, TlsMode};
 use crate::error::Result;
 use crate::source::cdc::value::RivetValue;
 use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, Position};
+use crate::source::require_tls_or_loopback;
 
 /// Connection parameters for a SQL Server CDC poll stream.
 pub(crate) struct MssqlCdcConfig {
@@ -60,7 +62,7 @@ pub(crate) struct MssqlChangeStream {
 impl MssqlChangeStream {
     /// Connect and bind to a capture instance. Holds the runtime + connection for
     /// the life of the stream (folds the per-poll runtime/connect smell away).
-    pub(crate) fn open(cfg: &MssqlCdcConfig) -> Result<Self> {
+    pub(crate) fn open(cfg: &MssqlCdcConfig, tls: Option<&TlsConfig>) -> Result<Self> {
         if !cfg
             .capture_instance
             .bytes()
@@ -82,7 +84,7 @@ impl MssqlChangeStream {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        let client = rt.block_on(connect(cfg))?;
+        let client = rt.block_on(connect(cfg, tls))?;
         Ok(Self {
             rt,
             client,
@@ -96,16 +98,26 @@ impl MssqlChangeStream {
 
     /// Open from a `sqlserver://user:pass@host:port/db` URL + a capture instance
     /// (the factory path).
-    pub(crate) fn from_url(url: &str, capture_instance: &str) -> Result<Self> {
+    pub(crate) fn from_url(
+        url: &str,
+        capture_instance: &str,
+        tls: Option<&TlsConfig>,
+    ) -> Result<Self> {
+        // Refuse remote plaintext / unauthenticated TLS before any dial (the gate
+        // the batch MssqlSource uses).
+        require_tls_or_loopback(url, tls)?;
         let p = crate::source::mssql::parse_mssql_url(url)?;
-        Self::open(&MssqlCdcConfig {
-            host: p.host,
-            port: p.port,
-            database: p.database,
-            user: p.user,
-            password: p.password,
-            capture_instance: capture_instance.to_string(),
-        })
+        Self::open(
+            &MssqlCdcConfig {
+                host: p.host,
+                port: p.port,
+                database: p.database,
+                user: p.user,
+                password: p.password,
+                capture_instance: capture_instance.to_string(),
+            },
+            tls,
+        )
     }
 
     /// Poll the change table once over `[min_lsn, max_lsn]` into `pending`.
@@ -263,14 +275,29 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-async fn connect(cfg: &MssqlCdcConfig) -> Result<Client<Compat<TcpStream>>> {
+async fn connect(
+    cfg: &MssqlCdcConfig,
+    tls: Option<&TlsConfig>,
+) -> Result<Client<Compat<TcpStream>>> {
     let mut config = Config::new();
     config.host(&cfg.host);
     config.port(cfg.port);
     config.database(&cfg.database);
     config.authentication(AuthMethod::sql_server(&cfg.user, &cfg.password));
     config.encryption(EncryptionLevel::Required);
-    config.trust_cert();
+    // Gate trust_cert exactly as the batch MssqlSource does: verify the chain by
+    // default (no trust_cert); trust the named CA when given; accept-any only for
+    // an explicit disable / accept-invalid, or for loopback (None — the
+    // require_tls_or_loopback gate already ensured a remote host carries a tls block).
+    match tls {
+        Some(c) if c.mode == TlsMode::Disable || c.accept_invalid_certs => config.trust_cert(),
+        Some(c) => {
+            if let Some(ca) = &c.ca_file {
+                config.trust_cert_ca(ca);
+            }
+        }
+        None => config.trust_cert(),
+    }
     let tcp = TcpStream::connect(config.get_addr()).await?;
     tcp.set_nodelay(true)?;
     Ok(Client::connect(config, tcp.compat_write()).await?)
@@ -306,7 +333,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let mut c = connect(&cfg("dbo_cdc_unit")).await.unwrap();
+            let mut c = connect(&cfg("dbo_cdc_unit"), None).await.unwrap();
             for batch in sql.split(";\n") {
                 if !batch.trim().is_empty() {
                     c.simple_query(batch)
@@ -339,7 +366,7 @@ mod tests {
         // let the capture Agent job scan the log (~5 s cycle)
         std::thread::sleep(std::time::Duration::from_secs(8));
 
-        let mut s = MssqlChangeStream::open(&cfg("dbo_cdc_unit")).unwrap();
+        let mut s = MssqlChangeStream::open(&cfg("dbo_cdc_unit"), None).unwrap();
         let mut ops = Vec::new();
         while let Some(ev) = s.next_change() {
             ops.push(ev.unwrap().op);
