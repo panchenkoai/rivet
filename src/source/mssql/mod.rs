@@ -16,6 +16,7 @@
 //! `OFFSET 0 ROWS FETCH NEXT n ROWS ONLY` clause (T-SQL has no `LIMIT`).
 
 mod arrow_convert;
+mod cdc;
 mod proxy;
 
 pub use proxy::MssqlProxyKind;
