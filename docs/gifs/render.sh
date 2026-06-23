@@ -45,6 +45,16 @@ psql_() {
 
 log() { printf '\033[1;34m[gifs]\033[0m %s\n' "$*" >&2; }
 
+# MySQL helpers for the CDC scenarios (binlog needs the Docker stack's mysql).
+mysql_() {
+    docker compose -f "$REPO_ROOT/docker-compose.yaml" exec -T mysql \
+        mysql -urivet -privet rivet "$@"
+}
+mysql_root_() {
+    docker compose -f "$REPO_ROOT/docker-compose.yaml" exec -T mysql \
+        mysql -uroot -privet rivet "$@"
+}
+
 ensure_prereqs() {
     command -v vhs >/dev/null || { echo "vhs not found — brew install vhs" >&2; exit 1; }
     command -v ttyd >/dev/null || { echo "ttyd not found — brew install ttyd" >&2; exit 1; }
@@ -661,6 +671,55 @@ fixture_error_connection_teardown() { :; }
 
 # ----- Scenario runner -------------------------------------------------------
 
+# ----- CDC scenarios --------------------------------------------------------
+
+# Checkpoint at the current binlog position + a deterministic backlog after it,
+# so `rivet cdc --until-current` drains exactly these changes and exits.
+fixture_cdc_setup() {
+    mysql_ -N -B -e 'SHOW MASTER STATUS' \
+        | awk 'NR==1{printf "{\"file\":\"%s\",\"pos\":%s}", $1, $2}' > "$work/cdc.ckpt"
+    mysql_ -e "
+        UPDATE content_items SET view_count = view_count + 1 WHERE id = 1;
+        UPDATE content_items SET status = 'published'        WHERE id = 2;
+        UPDATE content_items SET view_count = view_count + 1 WHERE id = 3;"
+}
+fixture_cdc_teardown() { :; }
+
+# A SELECT-only user with no REPLICATION grant (root manages users).
+fixture_error_cdc_access_setup() {
+    mysql_root_ -e "
+        CREATE USER IF NOT EXISTS 'rivet_noperm'@'%' IDENTIFIED BY 'x';
+        GRANT SELECT ON rivet.* TO 'rivet_noperm'@'%';
+        FLUSH PRIVILEGES;"
+}
+fixture_error_cdc_access_teardown() {
+    mysql_root_ -e "DROP USER IF EXISTS 'rivet_noperm'@'%';" || true
+}
+
+# A full snapshot + a CDC stream of the same table, run in parallel. The snapshot
+# is a LIMIT query so it finishes inside the GIF window regardless of table size.
+fixture_cdc_parallel_setup() {
+    fixture_cdc_setup
+    cat >"$work/parallel.yaml" <<'YAML'
+source:
+  type: mysql
+  url: "mysql://rivet:rivet@127.0.0.1:3306/rivet"
+exports:
+  - name: content_items_snapshot
+    query: "SELECT id, title, status, view_count FROM content_items LIMIT 50000"
+    mode: full
+    format: parquet
+    destination: {type: local, path: ./output}
+  - name: content_items_cdc
+    table: content_items
+    mode: cdc
+    format: parquet
+    cdc: {checkpoint: ./cdc.ckpt, until_current: true}
+    destination: {type: local, path: ./output}
+YAML
+}
+fixture_cdc_parallel_teardown() { :; }
+
 render_scenario() {
     local name="$1"
     local setup="$2"
@@ -713,7 +772,7 @@ render_scenario() {
 
 ensure_prereqs
 
-SCENARIOS=("${@:-basic plan-apply reconcile-repair init-scaffold check-verdict inspect chunked-progress parallel-cards incremental-cursor coalesce-cursor discover-artifact plan-campaign error-missing-table error-config-typo error-connection}")
+SCENARIOS=("${@:-basic plan-apply reconcile-repair init-scaffold check-verdict inspect chunked-progress parallel-cards incremental-cursor coalesce-cursor discover-artifact plan-campaign error-missing-table error-config-typo error-connection cdc error-cdc-access cdc-parallel}")
 for raw in "${SCENARIOS[@]}"; do
     for name in $raw; do
         case "$name" in
@@ -734,6 +793,9 @@ for raw in "${SCENARIOS[@]}"; do
             error-missing-table)   render_scenario error-missing-table   fixture_error_missing_table_setup   fixture_error_missing_table_teardown ;;
             error-config-typo)     render_scenario error-config-typo     fixture_error_config_typo_setup     fixture_error_config_typo_teardown ;;
             error-connection)      render_scenario error-connection      fixture_error_connection_setup      fixture_error_connection_teardown ;;
+            cdc)                   render_scenario cdc                   fixture_cdc_setup               fixture_cdc_teardown ;;
+            error-cdc-access)      render_scenario error-cdc-access      fixture_error_cdc_access_setup      fixture_error_cdc_access_teardown ;;
+            cdc-parallel)          render_scenario cdc-parallel          fixture_cdc_parallel_setup      fixture_cdc_parallel_teardown ;;
             *) echo "unknown scenario: $name" >&2; exit 1 ;;
         esac
     done

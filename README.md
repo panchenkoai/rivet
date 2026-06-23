@@ -51,6 +51,8 @@ The execution contract behind each of these — what is guaranteed, what is at-l
 
 Beyond batch snapshots, Rivet reads the source's **transaction log** — MySQL binlog, a PostgreSQL logical slot, SQL Server change tables — and writes every INSERT / UPDATE / DELETE as typed Parquet/CSV through the same commit seam (destination + content-MD5 + manifest + `_SUCCESS`) the batch path uses. A CDC export lands in your bucket and shows up in `rivet metrics` exactly like a batch one.
 
+![rivet CDC — scaffold a cdc config, capture binlog changes to typed Parquet, read them back as typed rows](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/cdc.gif)
+
 ### CDC quickstart
 
 ```bash
@@ -224,7 +226,7 @@ rivet run -c rivet.yaml
 
 ## More walkthroughs
 
-[plan / apply](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/plan-apply.gif) · [plan campaign — multi-export waves](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/plan-campaign.gif) · [reconcile + repair](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/reconcile-repair.gif) · [parallel cards UI](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/parallel-cards.gif) · [composite cursor (COALESCE fallback)](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/coalesce-cursor.gif) · [pool detection](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/pool-detect.gif) · [discovery artifact (`rivet init --discover`)](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/discover-artifact.gif) · [post-run inspect](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/inspect.gif). Source scripts in [docs/gifs/](https://github.com/panchenkoai/rivet/tree/main/docs/gifs).
+[plan / apply](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/plan-apply.gif) · [plan campaign — multi-export waves](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/plan-campaign.gif) · [reconcile + repair](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/reconcile-repair.gif) · [parallel cards UI](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/parallel-cards.gif) · [composite cursor (COALESCE fallback)](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/coalesce-cursor.gif) · [pool detection](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/pool-detect.gif) · [discovery artifact (`rivet init --discover`)](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/discover-artifact.gif) · [post-run inspect](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/inspect.gif) · [CDC — batch + cdc on the same table, parallel](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/cdc-parallel.gif) · [CDC access error (missing grant)](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/error-cdc-access.gif). Source scripts in [docs/gifs/](https://github.com/panchenkoai/rivet/tree/main/docs/gifs).
 
 ---
 

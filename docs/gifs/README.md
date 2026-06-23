@@ -41,6 +41,14 @@ Operational warnings:
 |-----|----------|--------|
 | [pool-detect.gif](pool-detect.gif) | Connect-time pooler / proxy detection: direct PG (silent) → pgBouncer (transaction-mode warning) → direct MySQL (silent) → ProxySQL (`MysqlProxyKind::ProxySql` warning). Requires the `pool` docker-compose profile (`docker compose --profile pool up -d pgbouncer proxysql`); ≈18 s. | [pool-detect.tape](pool-detect.tape) |
 
+Change data capture:
+
+| GIF | Scenario | Source |
+|-----|----------|--------|
+| [cdc.gif](cdc.gif) | Scaffold `mode: cdc`, capture MySQL binlog changes since a checkpoint into typed Parquet, read them back as typed rows (`__op` + columns) (≈15 s) | [cdc.tape](cdc.tape) |
+| [cdc-parallel.gif](cdc-parallel.gif) | `rivet run --parallel-exports` with a full snapshot + a CDC stream of the **same table**, side by side — two cards, one aggregate summary (≈12 s) | [cdc-parallel.tape](cdc-parallel.tape) |
+| [error-cdc-access.gif](error-cdc-access.gif) | A MySQL user missing the `REPLICATION` grant gets the exact requirement + a pointer to the grants doc, not a raw driver error (≈6 s) | [error-cdc-access.tape](error-cdc-access.tape) |
+
 They are linked from the user-facing guides (see "Where they appear" below)
 and are intentionally terminal-only: no narration, no cursor movement, no UI
 chrome. They show exactly what `rivet` prints.
