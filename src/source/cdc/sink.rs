@@ -595,4 +595,54 @@ mod tests {
             lines[0]
         );
     }
+
+    #[test]
+    fn empty_stream_writes_a_zero_row_manifest_and_success() {
+        // A bounded run that drains no changes (`--until-current` with nothing new)
+        // must still close cleanly: a 0-part manifest + `_SUCCESS`, not an error or a
+        // missing marker that would look like a crash to the next run.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(&dir);
+        let cols = int_col();
+        let mut stream = FakeStream {
+            events: VecDeque::new(),
+            acked: Vec::new(),
+        };
+        let manifest = run_to_files(
+            &mut stream,
+            cfg(dest.as_ref(), &cols, FormatType::Parquet, 10),
+        )
+        .unwrap();
+        assert_eq!(manifest.row_count, 0);
+        assert_eq!(manifest.part_count, 0);
+        assert!(
+            dir.path().join("_SUCCESS").exists(),
+            "a clean no-change run still marks _SUCCESS"
+        );
+    }
+
+    #[test]
+    fn table_filter_drops_changes_for_other_tables() {
+        // The capture filters by table name client-side (one binlog/slot carries every
+        // table). A change for an unrequested table must never land in the output —
+        // a leak would mix unrelated tables into one export.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(&dir);
+        let cols = int_col();
+        let ev = |id: i64, table: &str| ChangeEvent {
+            table: table.into(),
+            ..insert(id)
+        };
+        let mut stream = FakeStream {
+            events: VecDeque::from(vec![ev(1, "t"), ev(2, "other"), ev(3, "t")]),
+            acked: Vec::new(),
+        };
+        let mut c = cfg(dest.as_ref(), &cols, FormatType::Parquet, 10);
+        c.tables = vec!["t".into()];
+        let manifest = run_to_files(&mut stream, c).unwrap();
+        assert_eq!(
+            manifest.row_count, 2,
+            "only the two 't' changes are kept; 'other' is filtered out"
+        );
+    }
 }
