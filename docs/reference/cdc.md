@@ -33,6 +33,18 @@ dev — the URL is otherwise visible in `ps` / shell history.
 | `--table NAME` | only emit this table (repeatable for NDJSON; **exactly one** required for `--output`, whose schema is resolved from the source). |
 | `--output DIR` | write typed Parquet/CSV files instead of NDJSON. |
 | `--max-events N` | stop after N changes (otherwise stream until interrupted; the per-event checkpoint makes an interrupted run resumable). |
+| `--slot NAME` | PostgreSQL logical slot (default `rivet_slot`; created if absent). |
+| `--capture-instance NAME` | SQL Server CDC capture instance (e.g. `dbo_orders`) — required for `sqlserver://`. |
+
+The engine is chosen from the URL scheme (`mysql://` / `postgresql://` /
+`sqlserver://`) by `create_change_stream`, the CDC sibling of the batch
+`create_source`. With `--output`, each part is uploaded through the same commit
+path the batch export uses (destination + content-MD5 + transit-integrity check,
+ADR-0004) and a `manifest.json` + `_SUCCESS` is written at clean end — so a
+`--output gs://…` / `s3://…` works via the same `DestinationConfig`. Typed columns
+(real `Timestamp` / `Date32` / `Decimal128`, not strings) flow through `RivetValue`
+structural typing. Typed `--output` is MySQL-only today; PostgreSQL / SQL Server
+stream NDJSON (their typed file output is in progress).
 
 ## The three models
 
