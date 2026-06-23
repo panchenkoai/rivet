@@ -59,7 +59,7 @@ log = "0.4"
 # work the same way they do on Postgres. Without this feature, the mysql
 # crate panics at connect time with "Client had asked for TLS connection
 # but TLS support is disabled" — operator-facing panic, no recoverable error.
-mysql = { version = "28", default-features = false, features = ["minimal", "native-tls"] }
+mysql = { version = "28", default-features = false, features = ["minimal", "native-tls", "binlog"] }
 opendal = { version = "0.55", features = ["blocking", "services-fs", "services-s3", "services-gcs", "services-azblob"] }
 # `arrow_canonical_extension_types` enables parquet-rs to emit native Parquet
 # `LogicalType::Uuid` / `LogicalType::Json` whenever an Arrow field carries the
