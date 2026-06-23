@@ -243,8 +243,21 @@ pub(crate) fn create_change_stream(cfg: &CdcConfig) -> Result<Box<dyn ChangeStre
         let ci = cfg.capture_instance.as_deref().ok_or_else(|| {
             anyhow::anyhow!("sqlserver cdc requires --capture-instance (e.g. dbo_orders)")
         })?;
+        // Resume from the checkpoint's LSN if one was persisted (SQL Server has no
+        // server-side cursor — the from-LSN is what makes it at-least-once instead
+        // of re-reading the whole change table each run).
+        let from_lsn = cfg
+            .checkpoint
+            .as_deref()
+            .and_then(|p| Position::load(p).ok().flatten())
+            .and_then(|pos| {
+                pos.0
+                    .get("lsn")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            });
         Ok(Box::new(
-            crate::source::mssql::cdc::MssqlChangeStream::from_url(url, ci, tls)
+            crate::source::mssql::cdc::MssqlChangeStream::from_url(url, ci, from_lsn, tls)
                 .context(MSSQL_CDC_HINT)?,
         ))
     } else {

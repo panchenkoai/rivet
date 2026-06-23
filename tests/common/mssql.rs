@@ -54,6 +54,27 @@ pub fn mssql_exec(sql: &str) {
     });
 }
 
+/// Run a scalar query and return the first column of the first row as `i64`
+/// (e.g. polling a CDC change table's row count while the capture job catches up).
+pub fn mssql_query_i64(sql: &str) -> i64 {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("mssql: tokio runtime");
+    rt.block_on(async {
+        let mut client = connect().await;
+        let row = client
+            .simple_query(sql)
+            .await
+            .expect("mssql: query")
+            .into_row()
+            .await
+            .expect("mssql: row")
+            .expect("mssql: at least one row");
+        i64::from(row.get::<i32, _>(0).unwrap_or(0))
+    })
+}
+
 /// Idempotent table drop for RAII cleanup guards.
 pub fn mssql_drop_table(name: &str) {
     mssql_exec(&format!(

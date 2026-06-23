@@ -46,6 +46,11 @@ pub(crate) struct MssqlCdcConfig {
     /// because it is interpolated into the change-function name (which can't be a
     /// bind parameter).
     pub capture_instance: String,
+    /// Resume LSN — the hex of the last durably-written `__$start_lsn`. The poll
+    /// reads changes *after* it (`fn_cdc_increment_lsn`); `None` ⇒ from the change
+    /// table's min LSN (first run). This is what makes SQL Server CDC at-least-once
+    /// rather than re-reading the whole retained change table every run.
+    pub from_lsn: Option<String>,
 }
 
 /// Polls a CDC change table and yields canonical changes.
@@ -55,6 +60,7 @@ pub(crate) struct MssqlChangeStream {
     capture_instance: String,
     schema: String,
     table: String,
+    from_lsn: Option<String>,
     pending: VecDeque<ChangeEvent>,
     drained: bool,
 }
@@ -72,6 +78,13 @@ impl MssqlChangeStream {
                 "invalid CDC capture instance name: {:?}",
                 cfg.capture_instance
             );
+        }
+        // The resume LSN is inlined into `0x{hex}` (binary(10) can't be bound), so
+        // validate it to even-length hex — no SQL can break out.
+        if let Some(lsn) = &cfg.from_lsn
+            && (lsn.is_empty() || lsn.len() % 2 != 0 || !lsn.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            anyhow::bail!("mssql cdc: malformed resume LSN {lsn:?}");
         }
         // Heuristic schema/table from `<schema>_<table>` — robust resolution via
         // cdc.change_tables metadata is the SQL Server completion step.
@@ -91,6 +104,7 @@ impl MssqlChangeStream {
             capture_instance: cfg.capture_instance.clone(),
             schema,
             table,
+            from_lsn: cfg.from_lsn.clone(),
             pending: VecDeque::new(),
             drained: false,
         })
@@ -101,6 +115,7 @@ impl MssqlChangeStream {
     pub(crate) fn from_url(
         url: &str,
         capture_instance: &str,
+        from_lsn: Option<String>,
         tls: Option<&TlsConfig>,
     ) -> Result<Self> {
         // Refuse remote plaintext / unauthenticated TLS before any dial (the gate
@@ -115,6 +130,7 @@ impl MssqlChangeStream {
                 user: p.user,
                 password: p.password,
                 capture_instance: capture_instance.to_string(),
+                from_lsn,
             },
             tls,
         )
@@ -128,16 +144,31 @@ impl MssqlChangeStream {
             capture_instance,
             schema,
             table,
+            from_lsn,
             pending,
             ..
         } = self;
-        // SELECT * → the cdc metadata columns (__$start_lsn, __$operation, …)
-        // followed by the captured source columns, in source order.
+        // Resume window: read changes *after* the last durably-written LSN
+        // (`fn_cdc_increment_lsn`); on the first run (no checkpoint) start at the
+        // change table's min LSN. The guard skips the query when there is nothing
+        // new (`@from > @to`) or nothing captured yet (NULL LSNs) — calling
+        // `fn_cdc_get_all_changes` with those raises an error rather than 0 rows.
+        // `@from` is clamped to the min LSN so a checkpoint older than retention
+        // falls back to the earliest available change instead of erroring.
+        let from_expr = match from_lsn {
+            Some(hex) => format!("sys.fn_cdc_increment_lsn(0x{hex})"),
+            None => format!("sys.fn_cdc_get_min_lsn('{ci}')", ci = capture_instance),
+        };
         let sql = format!(
-            "SELECT * FROM cdc.fn_cdc_get_all_changes_{ci}( \
-                  sys.fn_cdc_get_min_lsn('{ci}'), sys.fn_cdc_get_max_lsn(), N'all') \
-             ORDER BY __$start_lsn, __$seqval",
-            ci = capture_instance
+            "DECLARE @from binary(10) = {from_expr}; \
+             DECLARE @min binary(10) = sys.fn_cdc_get_min_lsn('{ci}'); \
+             DECLARE @to binary(10) = sys.fn_cdc_get_max_lsn(); \
+             IF @from IS NULL OR @from < @min SET @from = @min; \
+             IF @from IS NOT NULL AND @to IS NOT NULL AND @from <= @to \
+                SELECT * FROM cdc.fn_cdc_get_all_changes_{ci}(@from, @to, N'all') \
+                ORDER BY __$start_lsn, __$seqval;",
+            ci = capture_instance,
+            from_expr = from_expr,
         );
         // The most common SQL Server gotcha — "Invalid object name
         // cdc.fn_cdc_get_all_changes_…" — surfaces here, at the first poll, not at
@@ -327,6 +358,7 @@ mod tests {
             user: "sa".into(),
             password: "Rivet_Passw0rd!".into(),
             capture_instance: capture_instance.into(),
+            from_lsn: None,
         }
     }
 
