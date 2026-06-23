@@ -36,17 +36,20 @@ pub(super) fn run_cdc_export(
     let result = run_cdc_inner(config, export, &run_id);
     let duration_ms = started.elapsed().as_millis() as i64;
 
-    let summary = match &result {
-        Ok((rows, files, bytes)) => cdc_summary(
-            &run_id,
-            export,
-            "success",
-            *rows,
-            *files,
-            *bytes,
-            duration_ms,
-            None,
-        ),
+    let mut summary = match &result {
+        Ok(manifest) => {
+            let bytes: u64 = manifest.parts.iter().map(|p| p.size_bytes).sum();
+            cdc_summary(
+                &run_id,
+                export,
+                "success",
+                manifest.row_count,
+                manifest.part_count as usize,
+                bytes,
+                duration_ms,
+                None,
+            )
+        }
         Err(e) => cdc_summary(
             &run_id,
             export,
@@ -59,18 +62,47 @@ pub(super) fn run_cdc_export(
         ),
     };
 
+    // Record the run in the journal (so `rivet journal` shows a CDC run like a
+    // batch one): one FileWritten per committed part, then the RunCompleted outcome.
+    if let Ok(manifest) = &result {
+        for (i, part) in manifest.parts.iter().enumerate() {
+            summary
+                .journal
+                .record(crate::journal::RunEvent::FileWritten {
+                    file_name: part.path.clone(),
+                    rows: part.rows,
+                    bytes: part.size_bytes,
+                    part_index: i,
+                });
+        }
+    }
+    summary
+        .journal
+        .record(crate::journal::RunEvent::RunCompleted {
+            status: summary.status.clone(),
+            error_message: summary.error_message.clone(),
+            duration_ms,
+        });
+    if let Err(e) = state.store_journal(&summary.journal) {
+        log::warn!(
+            "cdc: journal persist failed for export '{}': {:#}",
+            export.name,
+            e
+        );
+    }
+
     record_metric(state, config, export, &summary);
     finalize_run_report(config_path, &summary, "cdc");
     (result.map(|_| ()), summary)
 }
 
-/// The actual stream → typed files → manifest work. Returns
-/// `(rows, files, bytes)` for the run record.
+/// The actual stream → typed files → manifest work. Returns the `RunManifest` so
+/// the caller can record per-part journal events + the run metric.
 fn run_cdc_inner(
     config: &Config,
     export: &ExportConfig,
     run_id: &str,
-) -> Result<(i64, usize, u64)> {
+) -> Result<crate::manifest::RunManifest> {
     let url = config.source.resolve_url()?;
     let tls = config.source.tls.clone();
     let cdc = export.cdc.clone().unwrap_or_default();
@@ -112,13 +144,7 @@ fn run_cdc_inner(
         started_at: now,
         run_id: run_id.to_string(),
     };
-    let manifest = run_to_files(stream.as_mut(), sink_cfg)?;
-    let bytes: u64 = manifest.parts.iter().map(|p| p.size_bytes).sum();
-    Ok((
-        manifest.row_count as i64,
-        manifest.part_count as usize,
-        bytes,
-    ))
+    run_to_files(stream.as_mut(), sink_cfg)
 }
 
 /// Build the per-run summary (mirrors `synthetic_failed_summary`'s shape, for a
