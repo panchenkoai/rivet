@@ -259,10 +259,18 @@ fn cell_to_rivet(row: &Row, idx: usize, data: &ColumnData<'_>) -> RivetValue {
         ColumnData::Numeric(Some(n)) => {
             RivetValue::Bytes(numeric_to_decimal_string(n.value(), n.scale()).into_bytes())
         }
-        ColumnData::DateTime(_)
-        | ColumnData::DateTime2(_)
-        | ColumnData::SmallDateTime(_)
-        | ColumnData::DateTimeOffset(_) => row
+        // datetimeoffset is tz-aware — `try_get::<NaiveDateTime>` is the *wrong* type
+        // and returns None (silent data loss). Read the UTC instant and carry it as
+        // unambiguous RFC3339 text (the resolved column coarsens tz-aware to Utf8, so
+        // text is the lossless representation — never a naive cast that drops the zone).
+        ColumnData::DateTimeOffset(_) => row
+            .try_get::<chrono::DateTime<chrono::FixedOffset>, _>(idx)
+            .ok()
+            .flatten()
+            .map_or(RivetValue::Null, |dt| {
+                RivetValue::Bytes(dt.to_rfc3339().into_bytes())
+            }),
+        ColumnData::DateTime(_) | ColumnData::DateTime2(_) | ColumnData::SmallDateTime(_) => row
             .try_get::<NaiveDateTime, _>(idx)
             .ok()
             .flatten()
