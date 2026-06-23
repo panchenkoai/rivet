@@ -61,16 +61,11 @@ pub(crate) struct SinkConfig<'a> {
 /// the first transaction boundary past `rollover` rows; checkpoints a commit
 /// position after each part is durably committed.
 pub(crate) fn run_to_files(stream: &mut dyn ChangeStream, cfg: SinkConfig<'_>) -> Result<()> {
-    // __op, __pos, then the typed source columns (all nullable — a DELETE row
-    // carries only its key).
-    let mut fields = vec![
-        Field::new("__op", DataType::Utf8, false),
-        Field::new("__pos", DataType::Utf8, false),
-    ];
-    for (name, dt) in cfg.columns {
-        fields.push(Field::new(name, value::sink_type(dt), true));
-    }
-    let schema: SchemaRef = Arc::new(Schema::new(fields));
+    // The schema is built lazily at the first flush so decimal column scales can
+    // be refined from the data (SQL Server's metadata-only resolve gives a
+    // placeholder scale of 0 — the same gap the batch path fills from rows).
+    let mut columns = cfg.columns.to_vec();
+    let mut schema: Option<SchemaRef> = None;
 
     let mut buf: Vec<ChangeEvent> = Vec::new();
     let mut parts: Vec<PartRecord> = Vec::new();
@@ -88,14 +83,8 @@ pub(crate) fn run_to_files(stream: &mut dyn ChangeStream, cfg: SinkConfig<'_>) -
         // Roll a part only at a transaction boundary — never split a transaction
         // across parts, and only checkpoint a commit position.
         if committed && buf.len() >= cfg.rollover {
-            parts.push(flush(
-                &buf,
-                &schema,
-                cfg.columns,
-                cfg.format,
-                seq,
-                cfg.dest,
-            )?);
+            let sch = ensure_schema(&mut schema, &mut columns, &buf);
+            parts.push(flush(&buf, &sch, &columns, cfg.format, seq, cfg.dest)?);
             if let Some(p) = &cfg.checkpoint {
                 buf.last().unwrap().position.save(p)?;
             }
@@ -107,14 +96,8 @@ pub(crate) fn run_to_files(stream: &mut dyn ChangeStream, cfg: SinkConfig<'_>) -
         }
     }
     if !buf.is_empty() {
-        parts.push(flush(
-            &buf,
-            &schema,
-            cfg.columns,
-            cfg.format,
-            seq,
-            cfg.dest,
-        )?);
+        let sch = ensure_schema(&mut schema, &mut columns, &buf);
+        parts.push(flush(&buf, &sch, &columns, cfg.format, seq, cfg.dest)?);
         if let (Some(p), Some(last)) = (&cfg.checkpoint, buf.last())
             && last.committed
         {
@@ -125,6 +108,58 @@ pub(crate) fn run_to_files(stream: &mut dyn ChangeStream, cfg: SinkConfig<'_>) -
     // Clean end → write the run manifest + _SUCCESS (bounded-run concept).
     write_manifest(cfg.dest, &build_manifest(&cfg, &parts))?;
     Ok(())
+}
+
+/// Build the sink schema once, on the first flush — refining decimal scales from
+/// the first batch's values first (`__op`, `__pos`, then the typed columns).
+fn ensure_schema(
+    schema: &mut Option<SchemaRef>,
+    columns: &mut [(String, DataType)],
+    events: &[ChangeEvent],
+) -> SchemaRef {
+    if schema.is_none() {
+        refine_decimal_scales(columns, events);
+        let mut fields = vec![
+            Field::new("__op", DataType::Utf8, false),
+            Field::new("__pos", DataType::Utf8, false),
+        ];
+        for (name, dt) in columns.iter() {
+            fields.push(Field::new(name, value::sink_type(dt), true));
+        }
+        *schema = Some(Arc::new(Schema::new(fields)));
+    }
+    schema.clone().unwrap()
+}
+
+/// Fill a `Decimal128` column's scale from the data when the resolved scale is the
+/// `0` placeholder (SQL Server). A column with a real declared scale
+/// (MySQL/PostgreSQL metadata) is left untouched — only the placeholder is
+/// refined, from the max fractional-digit count seen in the batch.
+fn refine_decimal_scales(columns: &mut [(String, DataType)], events: &[ChangeEvent]) {
+    for (i, (_, dt)) in columns.iter_mut().enumerate() {
+        let DataType::Decimal128(p, 0) = dt else {
+            continue;
+        };
+        let scale = events
+            .iter()
+            .filter_map(|e| {
+                let img = match e.op {
+                    ChangeOp::Delete => e.before.as_ref(),
+                    _ => e.after.as_ref(),
+                };
+                img.and_then(|v| v.get(i))
+            })
+            .filter_map(|rv| match rv {
+                RivetValue::Bytes(b) => std::str::from_utf8(b)
+                    .ok()
+                    .and_then(|s| s.split_once('.').map(|(_, f)| f.len())),
+                _ => None,
+            })
+            .max();
+        if let Some(s) = scale.filter(|s| *s > 0) {
+            *dt = DataType::Decimal128(*p, s as i8);
+        }
+    }
 }
 
 /// Build one `RecordBatch` from `events`, write it to a temp part, and upload it

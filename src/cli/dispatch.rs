@@ -246,16 +246,15 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
         return crate::source::cdc::run(stream.as_mut(), ckpt, a.table, a.max_events);
     };
 
-    // --output: typed file sink. MySQL + PostgreSQL carry typed before/after; SQL
-    // Server still streams NDJSON (its value extraction is in progress).
+    // --output: typed file sink. All three engines carry typed before/after.
     let engine = if url.starts_with("mysql://") {
         "mysql"
     } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
         "postgres"
+    } else if url.starts_with("sqlserver://") || url.starts_with("mssql://") {
+        "mssql"
     } else {
-        anyhow::bail!(
-            "rivet cdc --output supports mysql:// and postgresql:// (SQL Server typed file output is in progress) — omit --output to stream NDJSON"
-        );
+        anyhow::bail!("rivet cdc --output: unsupported source url scheme");
     };
     let tbl = match a.table.as_slice() {
         [t] => t.clone(),
@@ -307,8 +306,12 @@ fn resolve_cdc_columns(
         Box::new(crate::source::mysql::MysqlSource::connect_with_tls(
             url, None,
         )?)
-    } else {
+    } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
         Box::new(crate::source::postgres::PostgresSource::connect_with_tls(
+            url, None,
+        )?)
+    } else {
+        Box::new(crate::source::mssql::MssqlSource::connect_with_tls(
             url, None,
         )?)
     };

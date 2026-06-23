@@ -8,9 +8,10 @@
 //! continuous daemon wraps [`crate::source::cdc::run`] in an outer poll loop. The
 //! runtime + connection are held by the stream (paid once, not per poll).
 //!
-//! Pre-images / typed values are deferred — this adapter carries op + schema +
-//! table + position; the per-column extraction (via `cdc.captured_columns`) is
-//! the SQL Server completion step.
+//! Captured source columns are read generically from each change row
+//! (`Row::cells()`) into typed `RivetValue`s — ints/bool/float/string/binary,
+//! numeric → exact decimal text, temporal via tiberius+chrono structural
+//! `try_get` (no manual DateTime2-increment math). Mirrors `mssql::arrow_convert`.
 //!
 //! Prereqs (heaviest of the three): CDC enabled, **SQL Server Agent running**,
 //! supported edition (not Express). A stalled Agent freezes the change tables AND
@@ -22,12 +23,14 @@
 
 use std::collections::VecDeque;
 
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use serde_json::json;
-use tiberius::{AuthMethod, Client, Config, EncryptionLevel};
+use tiberius::{AuthMethod, Client, ColumnData, Config, EncryptionLevel, Row};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 use crate::error::Result;
+use crate::source::cdc::value::RivetValue;
 use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, Position};
 
 /// Connection parameters for a SQL Server CDC poll stream.
@@ -116,25 +119,48 @@ impl MssqlChangeStream {
             pending,
             ..
         } = self;
+        // SELECT * → the cdc metadata columns (__$start_lsn, __$operation, …)
+        // followed by the captured source columns, in source order.
         let sql = format!(
-            "SELECT CONVERT(VARCHAR(20), __$start_lsn, 2) AS lsn, __$operation AS op \
-             FROM cdc.fn_cdc_get_all_changes_{ci}( \
+            "SELECT * FROM cdc.fn_cdc_get_all_changes_{ci}( \
                   sys.fn_cdc_get_min_lsn('{ci}'), sys.fn_cdc_get_max_lsn(), N'all') \
              ORDER BY __$start_lsn, __$seqval",
             ci = capture_instance
         );
         let rows =
             rt.block_on(async { client.simple_query(sql).await?.into_first_result().await })?;
-        for r in rows {
-            let op_code: i32 = r.get("op").unwrap_or_default();
+        for r in &rows {
+            let mut op_code = 0i32;
+            let mut lsn = String::new();
+            let mut values: Vec<RivetValue> = Vec::new();
+            for (idx, (col, data)) in r.cells().enumerate() {
+                match col.name() {
+                    "__$operation" => {
+                        if let ColumnData::I32(Some(v)) = data {
+                            op_code = *v;
+                        }
+                    }
+                    "__$start_lsn" => {
+                        if let ColumnData::Binary(Some(b)) = data {
+                            lsn = hex(b);
+                        }
+                    }
+                    n if n.starts_with("__$") => {} // skip other metadata
+                    _ => values.push(cell_to_rivet(r, idx, data)),
+                }
+            }
             let Some(op) = map_op(op_code) else { continue };
-            let lsn: &str = r.get("lsn").unwrap_or("");
+            // after-image for insert/update; the key (before-image) for delete
+            let (before, after) = match op {
+                ChangeOp::Delete => (Some(values), None),
+                _ => (None, Some(values)),
+            };
             pending.push_back(ChangeEvent {
                 op,
                 schema: schema.clone(),
                 table: table.clone(),
-                before: None,
-                after: None,
+                before,
+                after,
                 position: Position(json!({ "lsn": lsn })),
                 // The change table only ever holds already-committed changes.
                 committed: true,
@@ -167,6 +193,76 @@ fn map_op(code: i32) -> Option<ChangeOp> {
     }
 }
 
+/// Map a captured source cell to a typed [`RivetValue`]. Temporals use
+/// tiberius+chrono's structural `try_get` (no manual DateTime2-increment math);
+/// numeric carries its exact unscaled value → decimal text → `Decimal128` at the
+/// sink. Mirrors `mssql::arrow_convert`'s per-`ColumnData` handling.
+fn cell_to_rivet(row: &Row, idx: usize, data: &ColumnData<'_>) -> RivetValue {
+    match data {
+        ColumnData::Bit(Some(b)) => RivetValue::Bool(*b),
+        ColumnData::U8(Some(v)) => RivetValue::Int(*v as i64),
+        ColumnData::I16(Some(v)) => RivetValue::Int(*v as i64),
+        ColumnData::I32(Some(v)) => RivetValue::Int(*v as i64),
+        ColumnData::I64(Some(v)) => RivetValue::Int(*v),
+        ColumnData::F32(Some(v)) => RivetValue::Float(*v as f64),
+        ColumnData::F64(Some(v)) => RivetValue::Float(*v),
+        ColumnData::String(Some(s)) => RivetValue::Bytes(s.as_bytes().to_vec()),
+        ColumnData::Guid(Some(g)) => RivetValue::Bytes(g.to_string().into_bytes()),
+        ColumnData::Binary(Some(b)) => RivetValue::Bytes(b.to_vec()),
+        ColumnData::Numeric(Some(n)) => {
+            RivetValue::Bytes(numeric_to_decimal_string(n.value(), n.scale()).into_bytes())
+        }
+        ColumnData::DateTime(_)
+        | ColumnData::DateTime2(_)
+        | ColumnData::SmallDateTime(_)
+        | ColumnData::DateTimeOffset(_) => row
+            .try_get::<NaiveDateTime, _>(idx)
+            .ok()
+            .flatten()
+            .map_or(RivetValue::Null, RivetValue::DateTime),
+        ColumnData::Date(_) => row
+            .try_get::<NaiveDate, _>(idx)
+            .ok()
+            .flatten()
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .map_or(RivetValue::Null, RivetValue::DateTime),
+        ColumnData::Time(_) => {
+            row.try_get::<NaiveTime, _>(idx)
+                .ok()
+                .flatten()
+                .map_or(RivetValue::Null, |t| {
+                    RivetValue::TimeMicros(
+                        t.num_seconds_from_midnight() as i64 * 1_000_000
+                            + t.nanosecond() as i64 / 1000,
+                    )
+                })
+        }
+        // every None (NULL) variant + anything unhandled
+        _ => RivetValue::Null,
+    }
+}
+
+/// Render a tiberius `Numeric` (unscaled `value` + `scale`) to exact decimal text.
+fn numeric_to_decimal_string(value: i128, scale: u8) -> String {
+    let scale = scale as usize;
+    if scale == 0 {
+        return value.to_string();
+    }
+    let neg = value < 0;
+    let digits = value.unsigned_abs().to_string();
+    let digits = if digits.len() <= scale {
+        format!("{}{}", "0".repeat(scale + 1 - digits.len()), digits)
+    } else {
+        digits
+    };
+    let (int_part, frac) = digits.split_at(digits.len() - scale);
+    format!("{}{}.{}", if neg { "-" } else { "" }, int_part, frac)
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
 async fn connect(cfg: &MssqlCdcConfig) -> Result<Client<Compat<TcpStream>>> {
     let mut config = Config::new();
     config.host(&cfg.host);
@@ -183,6 +279,14 @@ async fn connect(cfg: &MssqlCdcConfig) -> Result<Client<Compat<TcpStream>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numeric_renders_exact_decimal() {
+        assert_eq!(numeric_to_decimal_string(15005, 2), "150.05");
+        assert_eq!(numeric_to_decimal_string(-7500, 3), "-7.500");
+        assert_eq!(numeric_to_decimal_string(42, 0), "42");
+        assert_eq!(numeric_to_decimal_string(5, 2), "0.05");
+    }
 
     fn cfg(capture_instance: &str) -> MssqlCdcConfig {
         MssqlCdcConfig {
