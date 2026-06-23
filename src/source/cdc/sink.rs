@@ -92,9 +92,13 @@ pub(crate) fn run_to_files(
         if committed && buf.len() >= cfg.rollover {
             let sch = ensure_schema(&mut schema, &mut columns, &buf);
             parts.push(flush(&buf, &sch, &columns, cfg.format, seq, cfg.dest)?);
+            let last_pos = &buf.last().unwrap().position;
             if let Some(p) = &cfg.checkpoint {
-                buf.last().unwrap().position.save(p)?;
+                last_pos.save(p)?;
             }
+            // The part is durable + checkpointed — only now let a consume-on-read
+            // source (PostgreSQL) advance past it. A crash before here re-reads it.
+            stream.ack(last_pos)?;
             seq += 1;
             buf.clear();
         }
@@ -105,10 +109,15 @@ pub(crate) fn run_to_files(
     if !buf.is_empty() {
         let sch = ensure_schema(&mut schema, &mut columns, &buf);
         parts.push(flush(&buf, &sch, &columns, cfg.format, seq, cfg.dest)?);
-        if let (Some(p), Some(last)) = (&cfg.checkpoint, buf.last())
+        // Only advance/checkpoint at a real commit boundary — a stream that ended
+        // mid-transaction is re-read from the last committed position on resume.
+        if let Some(last) = buf.last()
             && last.committed
         {
-            last.position.save(p)?;
+            if let Some(p) = &cfg.checkpoint {
+                last.position.save(p)?;
+            }
+            stream.ack(&last.position)?;
         }
     }
 

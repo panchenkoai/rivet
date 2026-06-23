@@ -76,19 +76,34 @@ impl PgChangeStream {
         })
     }
 
-    /// Poll the slot once (consuming it) into `pending`.
-    /// `pg_logical_slot_get_changes` **advances** the slot — changes are gone
-    /// after this returns, so the driver persists the position before re-polling.
+    /// Poll the slot once into `pending` **without consuming it**
+    /// (`pg_logical_slot_peek_changes`). The slot is only advanced later, in
+    /// [`ChangeStream::ack`], once the changes are durably written — so a crash
+    /// before durability re-reads them (at-least-once) instead of losing them.
     fn fill(&mut self) -> Result<()> {
         let rows = self.client.query(
-            "SELECT lsn::text, data FROM pg_logical_slot_get_changes($1, NULL, NULL)",
+            "SELECT lsn::text, data FROM pg_logical_slot_peek_changes($1, NULL, NULL)",
             &[&self.slot],
         )?;
+        // Frame transactions (BEGIN … changes … COMMIT) and stamp every change with
+        // its transaction's COMMIT LSN — that is the only valid slot-advance
+        // boundary (advancing to a change's own mid-transaction LSN re-reads the
+        // whole transaction) and the commit-boundary resume position. Logical
+        // decoding only ever emits complete, committed transactions.
+        let mut tx: Vec<ChangeEvent> = Vec::new();
         for r in rows {
             let lsn: String = r.get(0);
             let data: String = r.get(1);
-            if let Some(ev) = parse_test_decoding(&lsn, &data) {
-                self.pending.push_back(ev);
+            if data.starts_with("COMMIT") {
+                let commit = Position(json!({ "lsn": lsn }));
+                for mut ev in tx.drain(..) {
+                    ev.position = commit.clone();
+                    self.pending.push_back(ev);
+                }
+            } else if data.starts_with("BEGIN") {
+                tx.clear();
+            } else if let Some(ev) = parse_test_decoding(&lsn, &data) {
+                tx.push(ev);
             }
         }
         Ok(())
@@ -104,6 +119,29 @@ impl ChangeStream for PgChangeStream {
             }
         }
         self.pending.pop_front().map(Ok)
+    }
+
+    /// Advance the slot's `confirmed_flush_lsn` to the last durably-written change
+    /// — only now is it safe to let PostgreSQL free that WAL and skip those changes
+    /// on the next peek. Called by the sink after a part commits.
+    fn ack(&mut self, position: &Position) -> Result<()> {
+        let lsn = position
+            .0
+            .get("lsn")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("pg cdc ack: position missing 'lsn'"))?;
+        // The postgres crate can't bind `&str` → `pg_lsn`, so the LSN is inlined.
+        // It comes from the slot's own output; still validate it to the pg_lsn
+        // charset (`[0-9A-Fa-f]+/[0-9A-Fa-f]+`) before interpolating — never trust
+        // a value into SQL unchecked.
+        if lsn.is_empty() || !lsn.bytes().all(|b| b.is_ascii_hexdigit() || b == b'/') {
+            anyhow::bail!("pg cdc ack: refusing to advance to a malformed LSN {lsn:?}");
+        }
+        self.client.execute(
+            &format!("SELECT pg_replication_slot_advance($1, '{lsn}'::pg_lsn)"),
+            &[&self.slot],
+        )?;
+        Ok(())
     }
 }
 

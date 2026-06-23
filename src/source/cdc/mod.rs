@@ -13,6 +13,7 @@
 #![allow(dead_code)]
 
 pub(crate) mod sink;
+pub(crate) mod validate;
 pub(crate) mod value;
 
 use std::path::{Path, PathBuf};
@@ -96,6 +97,17 @@ pub(crate) struct ChangeEvent {
 /// wraps the driver in an outer poll loop).
 pub(crate) trait ChangeStream {
     fn next_change(&mut self) -> Option<Result<ChangeEvent>>;
+
+    /// Acknowledge that every change up to and including `position` is **durably
+    /// persisted** at the destination. Engines that consume-on-read (PostgreSQL:
+    /// reading a logical slot advances it) defer the actual consume to here — so a
+    /// crash between reading and a durable write re-reads the un-acked changes
+    /// (at-least-once). MySQL (binlog) and SQL Server (change tables) retain on the
+    /// server independently of reads, so this is a no-op for them — the resume
+    /// checkpoint alone makes them at-least-once.
+    fn ack(&mut self, _position: &Position) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// `rivet cdc` driver. Streams canonical changes from any engine adapter,
