@@ -16,6 +16,7 @@
 #![allow(dead_code)] // reader seam; the CLI / mode wiring lands in a later increment.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::Path;
 
 use mysql::binlog::events::{EventData, RowsEventData, TableMapEvent};
 use mysql::binlog::value::BinlogValue;
@@ -36,10 +37,30 @@ pub(crate) enum ChangeOp {
 /// The binlog coordinate *after* an event — the resume point a checkpoint
 /// persists. `file` follows `ROTATE` events; `pos` is the event header's
 /// end-of-event log position.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct BinlogPos {
     pub file: String,
     pub pos: u64,
+}
+
+impl BinlogPos {
+    /// Load a persisted checkpoint from `path`, or `None` on first run (absent).
+    pub(crate) fn load(path: &Path) -> Result<Option<Self>> {
+        match std::fs::read_to_string(path) {
+            Ok(s) => Ok(Some(serde_json::from_str(&s)?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Persist atomically (temp file + rename) so a crash never leaves a torn
+    /// checkpoint that would resume from a corrupt position.
+    pub(crate) fn save(&self, path: &Path) -> Result<()> {
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, serde_json::to_vec(self)?)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
 }
 
 /// One row-level change decoded from the binlog, with typed cell values.
@@ -97,6 +118,15 @@ impl MysqlChangeStream {
         let file: String = row.get(0).expect("binlog file column");
         let pos: u64 = row.get(1).expect("binlog pos column");
         Self::open(url, server_id, file, pos)
+    }
+
+    /// Resume from a persisted checkpoint at `ckpt`, or start from the current
+    /// position on the first run (no checkpoint yet).
+    pub(crate) fn open_or_resume(url: &str, server_id: u32, ckpt: &Path) -> Result<Self> {
+        match BinlogPos::load(ckpt)? {
+            Some(p) => Self::open(url, server_id, p.file, p.pos),
+            None => Self::open_from_current(url, server_id),
+        }
     }
 
     /// Pull one binlog event and expand it into `pending`. `Ok(false)` ⇒ stream
@@ -246,5 +276,51 @@ mod tests {
 
         // Every event carries a binlog position for checkpointing.
         assert!(!events[2].pos.file.is_empty() && events[2].pos.pos > 0);
+    }
+
+    #[test]
+    #[ignore = "live: requires docker compose mysql (binlog_format=ROW)"]
+    fn resumes_from_checkpoint() {
+        // Distinct table + server_id so this runs safely in parallel with the
+        // other live test (cargo runs tests concurrently).
+        let mut c = Conn::new(Opts::from_url(URL).unwrap()).unwrap();
+        c.query_drop("DROP TABLE IF EXISTS cdc_resume").unwrap();
+        c.query_drop("CREATE TABLE cdc_resume (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+
+        // Read change A and checkpoint at its position.
+        let mut s = MysqlChangeStream::open_from_current(URL, 4244).unwrap();
+        c.query_drop("INSERT INTO cdc_resume VALUES (1, 100)")
+            .unwrap();
+        let a = s
+            .by_ref()
+            .map(|e| e.unwrap())
+            .find(|e| e.table == "cdc_resume")
+            .unwrap();
+        assert_eq!(a.after.as_ref().unwrap()[0], Json::from(1));
+
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = dir.path().join("mysql.ckpt.json");
+        a.pos.save(&ckpt).unwrap();
+        assert_eq!(BinlogPos::load(&ckpt).unwrap().as_ref(), Some(&a.pos));
+        drop(s);
+
+        // A change made AFTER the checkpoint.
+        c.query_drop("INSERT INTO cdc_resume VALUES (2, 200)")
+            .unwrap();
+
+        // Resuming from the checkpoint must yield B (id=2), never re-read A (id=1).
+        let mut s2 = MysqlChangeStream::open_or_resume(URL, 4244, &ckpt).unwrap();
+        let b = s2
+            .by_ref()
+            .map(|e| e.unwrap())
+            .find(|e| e.table == "cdc_resume")
+            .unwrap();
+        assert_eq!(b.op, ChangeOp::Insert);
+        assert_eq!(
+            b.after.as_ref().unwrap()[0],
+            Json::from(2),
+            "resumed stream must start after the checkpoint, not re-read A"
+        );
     }
 }
