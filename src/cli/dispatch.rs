@@ -264,16 +264,30 @@ fn dispatch_cdc(
         })
         .collect();
 
-    crate::source::cdc::sink::run_to_files(
-        &mut stream,
-        &columns,
-        std::path::Path::new(&dir),
-        fmt,
-        table,
-        ckpt,
+    // Local destination today; gs:// / s3:// is the same DestinationConfig path
+    // (the commit seam is backend-agnostic).
+    let dest_cfg = crate::config::DestinationConfig {
+        destination_type: crate::config::DestinationType::Local,
+        path: Some(dir.clone()),
+        ..Default::default()
+    };
+    let dest = crate::destination::create_destination(&dest_cfg)?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let sink_cfg = crate::source::cdc::sink::SinkConfig {
+        columns: &columns,
+        dest: dest.as_ref(),
+        dest_uri: dir,
+        engine: "mysql",
+        table: &tbl,
+        format: fmt,
+        tables: table,
+        checkpoint: ckpt,
         max_events,
         rollover,
-    )
+        started_at: now.clone(),
+        run_id: now,
+    };
+    crate::source::cdc::sink::run_to_files(&mut stream, sink_cfg)
 }
 
 #[allow(clippy::too_many_arguments)]

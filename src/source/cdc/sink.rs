@@ -1,5 +1,6 @@
-//! CDC file sink — canonical change stream → typed Arrow `RecordBatch` → the
-//! existing [`crate::format`] writer (Parquet/CSV), rolled over into files.
+//! CDC file sink — canonical change stream → typed Arrow `RecordBatch` → a temp
+//! part → the existing **commit seam** (`write_part_file` → `Destination`), then a
+//! `RunManifest` + `_SUCCESS` at clean end.
 //!
 //! Output shape (the downstream contract chosen in the architecture review):
 //! `[__op, __pos]` + the source columns, **typed**, as the **after-image**
@@ -7,98 +8,135 @@
 //! Downstream MERGEs by PK + `__op` — the latest full image per key wins.
 //!
 //! Column typing flows through [`super::value`] (`RivetValue` → Arrow), so
-//! temporals/decimals land as real `Timestamp`/`Date32`/`Decimal128` columns, not
-//! strings. This reuses the interchange layer (`create_format` / `FormatWriter`);
-//! wiring to the full `ExportSink` commit seam (cloud destination + manifest +
-//! content-MD5) is the next layer.
+//! temporals/decimals land as real `Timestamp`/`Date32`/`Decimal128` columns.
+//! Each part is uploaded through [`crate::pipeline::commit::write_part_file`] —
+//! the same destination + content-MD5 + transit-integrity path the batch export
+//! uses (ADR-0004) — so a `--output gs://…` / `s3://…` works, with no-download
+//! MD5 verification. The run-level manifest + `_SUCCESS` is a bounded-run concept:
+//! it is written when the stream ends cleanly (e.g. `--max-events`); an unbounded
+//! stream still uploads each part, it just has no terminal `_SUCCESS` until it
+//! stops.
 
-use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::DataType;
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use tempfile::NamedTempFile;
 
 use crate::config::{CompressionType, FormatType};
+use crate::destination::Destination;
 use crate::error::Result;
+use crate::manifest::{
+    MANIFEST_VERSION, ManifestDestination, ManifestPart, ManifestSource, ManifestStatus,
+    PartStatus, RunManifest,
+};
+use crate::pipeline::commit::{PartRecord, write_part_file};
+use crate::pipeline::manifest_writer::write_manifest;
 use crate::source::cdc::value::{self, RivetValue};
 use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream};
 
-/// Stream canonical changes to typed Parquet/CSV files under `out_dir`, rolling a
-/// new file at the first transaction boundary past `rollover` rows. Persists the
-/// checkpoint (a commit position) after each file is durably written. Stops at end
-/// of stream, `max_events`, or interruption.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run_to_files(
-    stream: &mut dyn ChangeStream,
-    columns: &[(String, DataType)],
-    out_dir: &Path,
-    format: FormatType,
-    tables: Vec<String>,
-    checkpoint: Option<PathBuf>,
-    max_events: Option<usize>,
-    rollover: usize,
-) -> Result<()> {
-    std::fs::create_dir_all(out_dir)?;
+/// Everything the sink needs that isn't the stream itself.
+pub(crate) struct SinkConfig<'a> {
+    pub columns: &'a [(String, DataType)],
+    pub dest: &'a dyn Destination,
+    pub dest_uri: String,
+    pub engine: &'a str,
+    pub table: &'a str,
+    pub format: FormatType,
+    pub tables: Vec<String>,
+    pub checkpoint: Option<PathBuf>,
+    pub max_events: Option<usize>,
+    pub rollover: usize,
+    /// RFC3339 start time (passed in — `Utc::now()` is the caller's to stamp).
+    pub started_at: String,
+    /// RFC3339 stamp used as both `finished_at` and the run id seed.
+    pub run_id: String,
+}
+
+/// Stream canonical changes to typed Parquet/CSV parts, uploading each through the
+/// commit seam, then writing a manifest + `_SUCCESS` at clean end. Rolls a part at
+/// the first transaction boundary past `rollover` rows; checkpoints a commit
+/// position after each part is durably committed.
+pub(crate) fn run_to_files(stream: &mut dyn ChangeStream, cfg: SinkConfig<'_>) -> Result<()> {
     // __op, __pos, then the typed source columns (all nullable — a DELETE row
     // carries only its key).
     let mut fields = vec![
         Field::new("__op", DataType::Utf8, false),
         Field::new("__pos", DataType::Utf8, false),
     ];
-    for (name, dt) in columns {
+    for (name, dt) in cfg.columns {
         fields.push(Field::new(name, value::sink_type(dt), true));
     }
     let schema: SchemaRef = Arc::new(Schema::new(fields));
 
     let mut buf: Vec<ChangeEvent> = Vec::new();
+    let mut parts: Vec<PartRecord> = Vec::new();
     let mut seq = 0usize;
     let mut emitted = 0usize;
 
     while let Some(ev) = stream.next_change() {
         let ev = ev?;
-        if !tables.is_empty() && !tables.iter().any(|t| t == &ev.table) {
+        if !cfg.tables.is_empty() && !cfg.tables.iter().any(|t| t == &ev.table) {
             continue;
         }
         let committed = ev.committed;
         buf.push(ev);
         emitted += 1;
-        // Roll a file only at a transaction boundary — never split a transaction
-        // across files, and only checkpoint a commit position.
-        if committed && buf.len() >= rollover {
-            flush(&buf, &schema, columns, out_dir, format, seq)?;
-            if let Some(p) = &checkpoint {
+        // Roll a part only at a transaction boundary — never split a transaction
+        // across parts, and only checkpoint a commit position.
+        if committed && buf.len() >= cfg.rollover {
+            parts.push(flush(
+                &buf,
+                &schema,
+                cfg.columns,
+                cfg.format,
+                seq,
+                cfg.dest,
+            )?);
+            if let Some(p) = &cfg.checkpoint {
                 buf.last().unwrap().position.save(p)?;
             }
             seq += 1;
             buf.clear();
         }
-        if max_events.is_some_and(|m| emitted >= m) {
+        if cfg.max_events.is_some_and(|m| emitted >= m) {
             break;
         }
     }
     if !buf.is_empty() {
-        flush(&buf, &schema, columns, out_dir, format, seq)?;
-        if let (Some(p), Some(last)) = (&checkpoint, buf.last())
+        parts.push(flush(
+            &buf,
+            &schema,
+            cfg.columns,
+            cfg.format,
+            seq,
+            cfg.dest,
+        )?);
+        if let (Some(p), Some(last)) = (&cfg.checkpoint, buf.last())
             && last.committed
         {
             last.position.save(p)?;
         }
     }
+
+    // Clean end → write the run manifest + _SUCCESS (bounded-run concept).
+    write_manifest(cfg.dest, &build_manifest(&cfg, &parts))?;
     Ok(())
 }
 
-/// Build one `RecordBatch` from `events` and write it as a single file.
+/// Build one `RecordBatch` from `events`, write it to a temp part, and upload it
+/// through the commit seam (destination write + content-MD5 + transit check).
 fn flush(
     events: &[ChangeEvent],
     schema: &SchemaRef,
     columns: &[(String, DataType)],
-    out_dir: &Path,
     format: FormatType,
     seq: usize,
-) -> Result<()> {
+    dest: &dyn Destination,
+) -> Result<PartRecord> {
     let ops: ArrayRef = Arc::new(
         events
             .iter()
@@ -128,16 +166,57 @@ fn flush(
     }
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
 
-    let path = out_dir.join(format!("cdc-{seq:06}.{}", format.label()));
-    let file = File::create(&path)?;
+    let tmp = NamedTempFile::new()?;
     let compression = match format {
         FormatType::Csv => CompressionType::None,
         FormatType::Parquet => CompressionType::Zstd,
     };
     let fmt = crate::format::create_format(format, compression, None, None);
-    let writer: Box<dyn std::io::Write + Send> = Box::new(file);
+    let writer: Box<dyn std::io::Write + Send> = Box::new(tmp.reopen()?);
     let mut w = fmt.create_writer(schema, writer)?;
     w.write_batch(&batch)?;
     w.finish()?;
-    Ok(())
+
+    let file_name = format!("cdc-{seq:06}.{}", format.label());
+    write_part_file(dest, tmp.path(), events.len() as i64, file_name)
+}
+
+/// Assemble a `RunManifest` from the committed parts (hand-built — no plan
+/// coupling; `record_part` is the plan-bound path the batch export uses).
+fn build_manifest(cfg: &SinkConfig<'_>, parts: &[PartRecord]) -> RunManifest {
+    RunManifest {
+        manifest_version: MANIFEST_VERSION,
+        run_id: cfg.run_id.clone(),
+        export_name: cfg.table.to_string(),
+        started_at: cfg.started_at.clone(),
+        finished_at: cfg.run_id.clone(),
+        status: ManifestStatus::Success,
+        source: ManifestSource {
+            engine: cfg.engine.to_string(),
+            schema: None,
+            table: Some(cfg.table.to_string()),
+        },
+        destination: ManifestDestination {
+            kind: "cdc".to_string(),
+            uri: cfg.dest_uri.clone(),
+        },
+        format: cfg.format.label().to_string(),
+        compression: "zstd".to_string(),
+        schema_fingerprint: String::new(),
+        row_count: parts.iter().map(|p| p.rows).sum(),
+        part_count: parts.len() as u32,
+        parts: parts
+            .iter()
+            .enumerate()
+            .map(|(i, p)| ManifestPart {
+                part_id: (i + 1) as u32,
+                path: p.file_name.clone(),
+                rows: p.rows,
+                size_bytes: p.bytes,
+                content_fingerprint: p.fingerprint.clone(),
+                content_md5: p.md5.clone(),
+                status: PartStatus::Committed,
+            })
+            .collect(),
+    }
 }
