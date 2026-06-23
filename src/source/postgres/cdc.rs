@@ -118,6 +118,8 @@ fn parse_test_decoding(lsn: &str, data: &str) -> Option<ChangeEvent> {
         before: None,
         after: None,
         position: Position(json!({ "lsn": lsn })),
+        // The slot only ever yields already-committed changes.
+        committed: true,
     })
 }
 

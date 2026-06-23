@@ -122,6 +122,8 @@ impl MssqlChangeStream {
                 before: None,
                 after: None,
                 position: Position(json!({ "lsn": lsn })),
+                // The change table only ever holds already-committed changes.
+                committed: true,
             });
         }
         Ok(())

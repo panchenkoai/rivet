@@ -39,6 +39,9 @@ pub(crate) struct MysqlChangeStream {
     stream: BinlogStream,
     tables: HashMap<u64, TableMapEvent<'static>>,
     pending: VecDeque<ChangeEvent>,
+    /// The current transaction's rows, held until the `XID` (commit) event so the
+    /// whole transaction is released atomically with the commit position.
+    tx: Vec<ChangeEvent>,
     file: String,
 }
 
@@ -54,6 +57,7 @@ impl MysqlChangeStream {
             stream,
             tables: HashMap::new(),
             pending: VecDeque::new(),
+            tx: Vec::new(),
             file,
         })
     }
@@ -120,17 +124,32 @@ impl MysqlChangeStream {
                 };
                 let schema = tme.database_name().to_string();
                 let table = tme.table_name().to_string();
+                // Provisional position; rewritten to the commit position at XID.
                 let position = Position(json!({ "file": self.file, "pos": log_pos }));
                 for row in re.rows(&tme) {
                     let (before, after) = row?;
-                    self.pending.push_back(ChangeEvent {
+                    self.tx.push(ChangeEvent {
                         op,
                         schema: schema.clone(),
                         table: table.clone(),
                         before: before.map(render_row),
                         after: after.map(render_row),
                         position: position.clone(),
+                        committed: false,
                     });
+                }
+            }
+            // XID = transaction commit. Stamp the commit position on every change
+            // in the transaction and mark the last one committed, then release the
+            // whole transaction atomically.
+            Some(EventData::XidEvent(_)) => {
+                let commit = Position(json!({ "file": self.file, "pos": log_pos }));
+                let tx: Vec<ChangeEvent> = self.tx.drain(..).collect();
+                let n = tx.len();
+                for (i, mut ev) in tx.into_iter().enumerate() {
+                    ev.position = commit.clone();
+                    ev.committed = i + 1 == n;
+                    self.pending.push_back(ev);
                 }
             }
             _ => {}

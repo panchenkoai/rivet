@@ -78,6 +78,12 @@ pub(crate) struct ChangeEvent {
     pub(crate) after: Option<Vec<Json>>,
     /// Resume position after this change.
     pub(crate) position: Position,
+    /// `true` if this is the last change in its source transaction — the only
+    /// point it is safe to advance the checkpoint (transaction-atomic resume) and
+    /// to roll an output file (never split a transaction across files). MySQL sets
+    /// it at the XID/commit marker; the poll-based PG / SQL Server adapters only
+    /// ever read already-committed data, so every change is a commit boundary.
+    pub(crate) committed: bool,
 }
 
 /// The seam every engine reader satisfies: a blocking pull of canonical changes.
@@ -118,7 +124,11 @@ pub(crate) fn run(
             "pos": ev.position.0,
         });
         println!("{line}");
-        if let Some(p) = &checkpoint {
+        // Checkpoint only at a transaction boundary — resuming mid-transaction
+        // would replay a partial transaction downstream.
+        if ev.committed
+            && let Some(p) = &checkpoint
+        {
             ev.position.save(p)?;
         }
         emitted += 1;

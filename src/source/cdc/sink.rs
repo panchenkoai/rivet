@@ -118,9 +118,12 @@ pub(crate) fn run_to_files(
         if !tables.is_empty() && !tables.iter().any(|t| t == &ev.table) {
             continue;
         }
+        let committed = ev.committed;
         buf.push(ev);
         emitted += 1;
-        if buf.len() >= rollover {
+        // Roll a file only at a transaction boundary — never split a transaction
+        // across files, and only checkpoint a commit position.
+        if committed && buf.len() >= rollover {
             flush(&buf, &schema, columns, out_dir, format, seq)?;
             if let Some(p) = &checkpoint {
                 buf.last().unwrap().position.save(p)?;
@@ -134,8 +137,10 @@ pub(crate) fn run_to_files(
     }
     if !buf.is_empty() {
         flush(&buf, &schema, columns, out_dir, format, seq)?;
-        if let Some(p) = &checkpoint {
-            buf.last().unwrap().position.save(p)?;
+        if let (Some(p), Some(last)) = (&checkpoint, buf.last())
+            && last.committed
+        {
+            last.position.save(p)?;
         }
     }
     Ok(())
