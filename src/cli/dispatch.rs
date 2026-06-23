@@ -98,13 +98,13 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             max_events,
         } => {
             let (url, _prov) = resolve_init_source(source, source_env, source_file)?;
-            crate::source::mysql::cdc::run(
+            let ckpt = checkpoint.map(std::path::PathBuf::from);
+            let mut stream = crate::source::mysql::cdc::MysqlChangeStream::open_or_resume(
                 &url,
                 server_id,
-                checkpoint.map(std::path::PathBuf::from),
-                table,
-                max_events,
-            )
+                ckpt.as_deref(),
+            )?;
+            crate::source::cdc::run(&mut stream, ckpt, table, max_events)
         }
         Commands::Init {
             source,
