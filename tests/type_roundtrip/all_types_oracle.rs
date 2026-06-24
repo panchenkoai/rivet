@@ -17,10 +17,11 @@
 use rivet::types::target::{ExportTarget, TargetInput, TargetStatus};
 use rivet::types::{RivetType, SourceColumn, TimeUnit, TypeMapping};
 
-const TARGETS: [ExportTarget; 3] = [
+const TARGETS: [ExportTarget; 4] = [
     ExportTarget::DuckDb,
     ExportTarget::BigQuery,
     ExportTarget::Snowflake,
+    ExportTarget::ClickHouse,
 ];
 
 /// The curated all-types row — every [`RivetType`] variant, including the
@@ -220,4 +221,39 @@ fn duckdb_honors_every_native_type_so_never_needs_a_cast() {
             spec.cast_sql
         );
     }
+}
+
+/// ClickHouse's headline advantage over BigQuery/Snowflake: `UInt64` and naive
+/// timestamps autoload *natively* — no overflow-to-NUMBER, no NTZ-via-cast. This
+/// is the "all types land natively in ClickHouse/DuckDb" claim, pinned.
+#[test]
+fn clickhouse_holds_uint64_and_naive_timestamp_natively() {
+    let u = resolve(
+        ExportTarget::ClickHouse,
+        "big_u",
+        "bigint unsigned",
+        RivetType::UInt64,
+    );
+    assert_eq!(
+        u.autoload_type, u.target_type,
+        "ClickHouse/UInt64 must autoload natively ({} -> {})",
+        u.autoload_type, u.target_type
+    );
+    assert!(u.cast_sql.is_none() && u.status != TargetStatus::Fail);
+
+    let ts = resolve(
+        ExportTarget::ClickHouse,
+        "ts",
+        "timestamp",
+        RivetType::Timestamp {
+            unit: TimeUnit::Microsecond,
+            timezone: None,
+        },
+    );
+    assert_eq!(
+        ts.autoload_type, ts.target_type,
+        "ClickHouse/naive-timestamp must autoload natively ({} -> {})",
+        ts.autoload_type, ts.target_type
+    );
+    assert!(ts.cast_sql.is_none());
 }
