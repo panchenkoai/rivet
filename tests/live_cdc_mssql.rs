@@ -314,3 +314,97 @@ fn mssql_cdc_uniqueidentifier_value_is_preserved() {
         "uniqueidentifier must be captured (16 canonical bytes), not dropped to NULL"
     );
 }
+
+fn mssql_full_config(
+    d: &tempfile::TempDir,
+    table: &str,
+    out: &std::path::Path,
+) -> std::path::PathBuf {
+    let yaml = format!(
+        r#"source: {{type: mssql, url: "{MSSQL_URL}", tls: {{accept_invalid_certs: true}}}}
+exports:
+  - name: {table}_batch
+    query: "SELECT * FROM dbo.{table}"
+    mode: full
+    format: parquet
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        out = out.display(),
+    );
+    write_config(d, &yaml)
+}
+
+/// The single `.parquet` part under `dir`, read as one RecordBatch.
+fn read_one_batch(dir: &std::path::Path) -> arrow::record_batch::RecordBatch {
+    let part = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "parquet"))
+        .expect("a .parquet part");
+    let f = std::fs::File::open(part).unwrap();
+    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
+        .unwrap()
+        .build()
+        .unwrap()
+        .next()
+        .expect("a row")
+        .unwrap()
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_full_type_matrix_matches_batch() {
+    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    // The parity contract, enforced: a comprehensive type table exported both ways —
+    // batch (`mode: full`) and CDC — must produce the IDENTICAL Arrow column (type AND
+    // value, via ArrayData equality) for every source column. Two value-decode paths
+    // exist for performance (CDC's typed RivetValue sink vs batch's zero-alloc
+    // arrow_convert); this test is what guarantees they can't drift — any divergence
+    // (a tz type, a uuid byte order, a decimal scale, a dropped value) fails here.
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("rivet_cdc_matrix");
+    let ci = format!("dbo_{table}");
+    mssql_drop_table(&format!("dbo.{table}"));
+    mssql_exec(&format!(
+        "CREATE TABLE dbo.{table} (id INT PRIMARY KEY, big BIGINT, amount DECIMAL(18,4), \
+         flag BIT, label VARCHAR(50), nlabel NVARCHAR(50), dt2 DATETIME2, dto DATETIMEOFFSET, \
+         d DATE, t TIME, u UNIQUEIDENTIFIER, vb VARBINARY(16))"
+    ));
+    enable_cdc(&table, &ci);
+    let _guard = CdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+    let ckpt = d.path().join("cdc.ckpt");
+    mssql_exec(&format!(
+        "INSERT INTO dbo.{table} VALUES (1, 9000000000000, 12345.6789, 1, 'hello', \
+         N'cafe-unicode', '2026-06-23 10:00:00.1234567', '2026-06-23 10:00:00 +05:30', \
+         '2026-06-23', '13:45:30.123456', '12345678-1234-1234-1234-123456789012', 0xDEADBEEF)"
+    ));
+    wait_for_capture(&ci, 1);
+
+    let cdc_out = d.path().join("cdc");
+    let batch_out = d.path().join("batch");
+    std::fs::create_dir_all(&cdc_out).unwrap();
+    std::fs::create_dir_all(&batch_out).unwrap();
+    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &cdc_out));
+    run_cdc(&mssql_full_config(&d, &table, &batch_out));
+
+    let batch = read_one_batch(&batch_out);
+    let cdc = read_one_batch(&cdc_out);
+    // Every source column the batch export has must be byte-for-byte identical in CDC.
+    for (i, field) in batch.schema().fields().iter().enumerate() {
+        let name = field.name();
+        let cidx = cdc
+            .schema()
+            .index_of(name)
+            .unwrap_or_else(|_| panic!("cdc output is missing source column {name}"));
+        assert_eq!(
+            batch.column(i).to_data(),
+            cdc.column(cidx).to_data(),
+            "column {name}: CDC differs from the batch export (type or value drift)"
+        );
+    }
+    // CDC adds its change-metadata columns the batch export doesn't have.
+    assert!(cdc.schema().index_of("__op").is_ok() && cdc.schema().index_of("__pos").is_ok());
+}
