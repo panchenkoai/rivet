@@ -23,6 +23,7 @@
 
 mod common;
 use common::*;
+use proptest::prelude::*;
 
 /// Row count. Large enough that the export produces several chunk files and the
 /// aggregates are non-trivial, small enough to stay a fast CI gate. The harness
@@ -62,19 +63,25 @@ const FINGERPRINT_SQL: &str = "SELECT count(*)::BIGINT, \
      count(DISTINCT id)::BIGINT, count(DISTINCT c_text)::BIGINT";
 
 fn seed_pg(table: &str) {
+    seed_pg_n(table, N);
+}
+
+/// Seed `rows` differential rows (the parameterised core of [`seed_pg`], used by
+/// the generative boundary harnesses). Distinct, varied values per row: id is the
+/// dense key; n is bounded so its sum stays in i64; big spreads across the i64
+/// range; c_text is unique per row (id + md5) so distinct(c_text) == rows catches
+/// any text dup/corruption.
+fn seed_pg_n(table: &str, rows: i64) {
     let mut c = pg_connect();
     c.batch_execute(&format!(
         "CREATE TABLE {table} (id BIGINT PRIMARY KEY, n INT NOT NULL, big BIGINT NOT NULL, c_text TEXT NOT NULL)"
     ))
     .expect("create differential table");
-    // Distinct, varied values per row: id is the dense key; n is bounded so its
-    // sum stays in i64; big spreads across the i64 range; c_text is unique per
-    // row (id + md5) so distinct(c_text) == N catches any text dup/corruption.
     c.batch_execute(&format!(
         "INSERT INTO {table} (id, n, big, c_text) \
          SELECT g, ((g * 7) % 100000) - 50000, g::bigint * 1000003, \
                 'row-' || g || '-' || md5(g::text) \
-         FROM generate_series(0, {N} - 1) g"
+         FROM generate_series(0, {rows} - 1) g"
     ))
     .expect("seed differential rows");
 }
@@ -307,4 +314,133 @@ exports:
          disagrees with the source — recovery lost or corrupted a row. source={src:?} dest={dst:?}"
     );
     assert_eq!(src.rows, N, "source must cover all {N} rows");
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 16, ..ProptestConfig::default() })]
+
+    /// Generative completeness across chunk boundaries: for random (rows, chunk_size)
+    /// the chunked export, read back by DuckDB, must match the source field-for-field.
+    /// Exercises the off-by-one cases a fixed (N, CHUNK) misses — rows < chunk, rows
+    /// == k·chunk (exact boundary), rows == k·chunk + 1, single-row exports, …
+    #[test]
+    #[ignore = "live+loaders: postgres + rivet-duckdb (nightly); reads via_duckdb"]
+    fn batch_chunked_export_complete_across_boundaries_via_duckdb(
+        rows in 1i64..400,
+        chunk in 5i64..150,
+    ) {
+        require_alive(LiveService::Postgres);
+        require_alive(LiveService::DuckDb);
+        let table = unique_name("rivet_bp");
+        let _g = DropPg(table.clone());
+        seed_pg_n(&table, rows);
+
+        let export = unique_name("bp_exp");
+        let (host, container) = duckdb_shared_workdir(&unique_name("bp_out"));
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            r#"source: {{type: postgres, url: "{POSTGRES_URL}"}}
+exports:
+  - name: {export}
+    query: "SELECT id, n, big, c_text FROM {table}"
+    mode: chunked
+    chunk_column: id
+    chunk_size: {chunk}
+    format: parquet
+    destination: {{type: local, path: {dir}}}
+"#,
+            dir = host.display(),
+        );
+        let cfg = write_config(&cfg_dir, &yaml);
+        let run = run_rivet_export(&cfg, &export);
+        prop_assert!(
+            run.status.success(),
+            "rows={} chunk={}: export failed:\n{}",
+            rows, chunk, String::from_utf8_lossy(&run.stderr)
+        );
+        make_shared_world_readable();
+
+        let src = pg_fingerprint(&table);
+        let dst = duckdb_fingerprint(&format!("{container}/*.parquet"));
+        prop_assert_eq!(
+            &src, &dst,
+            "rows={} chunk={}: DuckDB's view disagrees with the source — a boundary lost or duped a row",
+            rows, chunk
+        );
+        prop_assert_eq!(src.rows, rows, "rows={}: the fingerprint must cover every row", rows);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 10, ..ProptestConfig::default() })]
+
+    /// Generative at-least-once: crash a chunked export at a random chunk, resume, and
+    /// the deduplicated DuckDB view must still equal the source — across random (rows,
+    /// chunk count, crash point). `chunk` is derived from `n_chunks` so the export has
+    /// ~`n_chunks` parts and the crash (`crash_at ∈ {1,2}`, with `n_chunks ≥ 3`) always
+    /// lands inside the run.
+    #[test]
+    #[ignore = "live+loaders: postgres + rivet-duckdb (nightly); reads via_duckdb"]
+    fn batch_chunked_crash_resume_complete_via_duckdb(
+        rows in 80i64..320,
+        n_chunks in 3i64..7,
+        crash_at in 1usize..3,
+    ) {
+        require_alive(LiveService::Postgres);
+        require_alive(LiveService::DuckDb);
+        let chunk = (rows / n_chunks).max(2);
+        let table = unique_name("rivet_bpc");
+        let _g = DropPg(table.clone());
+        seed_pg_n(&table, rows);
+
+        let export = unique_name("bpc_exp");
+        let (host, container) = duckdb_shared_workdir(&unique_name("bpc_out"));
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            r#"source: {{type: postgres, url: "{POSTGRES_URL}"}}
+exports:
+  - name: {export}
+    query: "SELECT id, n, big, c_text FROM {table}"
+    mode: chunked
+    chunk_column: id
+    chunk_size: {chunk}
+    chunk_checkpoint: true
+    format: parquet
+    destination: {{type: local, path: {dir}}}
+"#,
+            dir = host.display(),
+        );
+        let cfg = write_config(&cfg_dir, &yaml);
+
+        let crash = std::process::Command::new(RIVET_BIN)
+            .args(["run", "--config", cfg.to_str().unwrap(), "--export", &export])
+            .env("RIVET_TEST_PANIC_AT", format!("after_chunk_file:{crash_at}"))
+            .output()
+            .expect("spawn rivet");
+        prop_assert!(
+            !crash.status.success(),
+            "rows={} chunk={} crash_at={}: the injected crash must fail the run",
+            rows, chunk, crash_at
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        let resume = std::process::Command::new(RIVET_BIN)
+            .args(["run", "--config", cfg.to_str().unwrap(), "--export", &export, "--resume"])
+            .output()
+            .expect("spawn rivet resume");
+        prop_assert!(
+            resume.status.success(),
+            "rows={} chunk={} crash_at={}: resume failed:\n{}",
+            rows, chunk, crash_at, String::from_utf8_lossy(&resume.stderr)
+        );
+        make_shared_world_readable();
+
+        let src = pg_fingerprint(&table);
+        let dst = duckdb_fingerprint_dedup(&format!("{container}/*.parquet"));
+        prop_assert_eq!(
+            &src, &dst,
+            "rows={} chunk={} crash_at={}: post-crash exactly-once view disagrees with the source",
+            rows, chunk, crash_at
+        );
+    }
 }
