@@ -265,3 +265,54 @@ fn mssql_cdc_datetimeoffset_value_is_preserved() {
         "datetimeoffset must be captured losslessly with its zone, not dropped — got {dto:?}"
     );
 }
+
+/// Whether the first row's `col` is non-null in the one `.parquet` part.
+fn parquet_col0_present(dir: &std::path::Path, col: &str) -> bool {
+    use arrow::array::Array;
+    let part = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "parquet"))
+        .expect("a .parquet part");
+    let f = std::fs::File::open(part).unwrap();
+    let mut r = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
+        .unwrap()
+        .build()
+        .unwrap();
+    let batch = r.next().expect("a row").unwrap();
+    let idx = batch.schema().index_of(col).expect("column present");
+    !batch.column(idx).is_null(0)
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_uniqueidentifier_value_is_preserved() {
+    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    // uniqueidentifier resolves to a UUID column (FixedSizeBinary(16)). The adapter
+    // used to map the Guid to its 36-char string, which does not fit the fixed-size
+    // builder and silently became NULL — data loss.
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("rivet_cdc_uuid");
+    let ci = format!("dbo_{table}");
+    mssql_drop_table(&format!("dbo.{table}"));
+    mssql_exec(&format!(
+        "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, u UNIQUEIDENTIFIER)"
+    ));
+    enable_cdc(&table, &ci);
+    let _guard = CdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+    let ckpt = d.path().join("cdc.ckpt");
+    mssql_exec(&format!(
+        "INSERT INTO dbo.{table} VALUES (1, '12345678-1234-1234-1234-123456789012')"
+    ));
+    wait_for_capture(&ci, 1);
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out));
+    assert!(
+        parquet_col0_present(&out, "u"),
+        "uniqueidentifier must be captured (16 canonical bytes), not dropped to NULL"
+    );
+}

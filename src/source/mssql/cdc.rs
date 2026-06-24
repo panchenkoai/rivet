@@ -254,7 +254,10 @@ fn cell_to_rivet(row: &Row, idx: usize, data: &ColumnData<'_>) -> RivetValue {
         ColumnData::F32(Some(v)) => RivetValue::Float(*v as f64),
         ColumnData::F64(Some(v)) => RivetValue::Float(*v),
         ColumnData::String(Some(s)) => RivetValue::Bytes(s.as_bytes().to_vec()),
-        ColumnData::Guid(Some(g)) => RivetValue::Bytes(g.to_string().into_bytes()),
+        // uniqueidentifier resolves to a UUID column (FixedSizeBinary(16)), so carry
+        // the 16 canonical bytes — NOT the 36-char string, which won't fit the
+        // fixed-size builder and silently becomes NULL. Mirrors mssql::arrow_convert.
+        ColumnData::Guid(Some(g)) => RivetValue::Bytes(g.as_bytes().to_vec()),
         ColumnData::Binary(Some(b)) => RivetValue::Bytes(b.to_vec()),
         ColumnData::Numeric(Some(n)) => {
             RivetValue::Bytes(numeric_to_decimal_string(n.value(), n.scale()).into_bytes())
