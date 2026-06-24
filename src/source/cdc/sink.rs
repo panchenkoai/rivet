@@ -645,4 +645,58 @@ mod tests {
             "only the two 't' changes are kept; 'other' is filtered out"
         );
     }
+
+    /// A destination whose every write fails — to drive the *failure* branch of the
+    /// durable sequence, which the other sink tests (all happy-path) never reach.
+    struct FailingDestination;
+    impl crate::destination::Destination for FailingDestination {
+        fn write(&self, _local: &Path, _key: &str) -> Result<crate::destination::WriteOutcome> {
+            Err(anyhow::anyhow!("injected destination write failure"))
+        }
+        fn capabilities(&self) -> crate::destination::DestinationCapabilities {
+            crate::destination::DestinationCapabilities {
+                commit_protocol: crate::destination::WriteCommitProtocol::Atomic,
+                idempotent_overwrite: true,
+                retry_safe: true,
+                partial_write_risk: false,
+            }
+        }
+    }
+
+    #[test]
+    fn flush_failure_never_checkpoints_or_acks() {
+        // The at-least-once invariant at the FAILURE boundary: the durable sequence is
+        // flush → checkpoint → ack, and if the part write fails the checkpoint must NOT
+        // be persisted and the source must NOT be acked — else a crash would drop a
+        // change a consume-on-read source (PostgreSQL) had already advanced past. The
+        // `?` on `flush` enforces this by construction; this test locks it against a
+        // refactor that reorders the steps or swallows the flush error. (The crash
+        // *between* flush and ack is covered by the live `cdc_after_flush_before_ack`
+        // hook; this covers flush *itself* failing — a path no live test exercises.)
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = dir.path().join("cdc.ckpt");
+        let cols = int_col();
+        let mut stream = FakeStream {
+            events: VecDeque::from(vec![insert(1)]), // committed ⇒ would ack if flush succeeded
+            acked: Vec::new(),
+        };
+        let dest = FailingDestination;
+        let mut c = cfg(&dest, &cols, FormatType::Parquet, 10);
+        c.checkpoint = Some(ckpt.clone());
+
+        let res = run_to_files(&mut stream, c);
+
+        assert!(
+            res.is_err(),
+            "a destination write failure must fail the run"
+        );
+        assert!(
+            stream.acked.is_empty(),
+            "the source must NOT be acked when the part never became durable"
+        );
+        assert!(
+            !ckpt.exists(),
+            "the checkpoint must NOT be persisted when the part never became durable"
+        );
+    }
 }
