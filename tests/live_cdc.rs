@@ -230,6 +230,49 @@ fn cdc_captures_json_as_valid_json() {
 }
 
 #[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_picks_up_a_column_added_between_runs() {
+    // Schema-drift harness: the sink resolves the table schema at the START of each
+    // run, so a column added *between* runs is captured on the next run. (Within a
+    // single run the schema is frozen at the first flush — that's the documented
+    // limitation; run-to-run re-resolution is how drift is actually handled.)
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_cdc_drift");
+    let _drop = Table(tbl.clone());
+    let mut c = conn();
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let ckpt = d.path().join("cdc.ckpt");
+    write_checkpoint(&mut c, &ckpt);
+
+    // Run 1: capture a row under the original (id, v) schema.
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1, 10)"))
+        .unwrap();
+    let out1 = d.path().join("out1");
+    std::fs::create_dir_all(&out1).unwrap();
+    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out1));
+    let f1: std::collections::HashMap<_, _> = parquet_fields(&out1).into_iter().collect();
+    assert!(!f1.contains_key("w"), "run 1 predates the added column");
+
+    // Add a column, then a row that uses it.
+    c.query_drop(format!("ALTER TABLE {tbl} ADD COLUMN w VARCHAR(20)"))
+        .unwrap();
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (2, 20, 'hello')"))
+        .unwrap();
+
+    // Run 2 (resume): re-resolves the schema → the new column is captured.
+    let out2 = d.path().join("out2");
+    std::fs::create_dir_all(&out2).unwrap();
+    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out2));
+    let f2: std::collections::HashMap<_, _> = parquet_fields(&out2).into_iter().collect();
+    assert!(
+        f2.contains_key("w"),
+        "run 2 must re-resolve and pick up the column added between runs"
+    );
+    assert_eq!(parquet_one_string(&out2, "w"), "hello");
+}
+
+#[test]
 #[ignore = "live: requires docker compose mysql (binlog ROW + REPLICATION grant)"]
 fn cdc_crash_after_flush_before_ack_re_reads_on_resume() {
     // The at-least-once guarantee under a crash: the durable sequence is
