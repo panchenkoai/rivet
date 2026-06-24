@@ -88,6 +88,35 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             target,
         } => dispatch_check(config, export, params, type_report, strict, json, target),
         Commands::Doctor { config } => preflight::doctor(&config),
+        Commands::Cdc {
+            source,
+            source_env,
+            source_file,
+            server_id,
+            checkpoint,
+            table,
+            max_events,
+            output,
+            format,
+            rollover,
+            slot,
+            capture_instance,
+            until_current,
+        } => dispatch_cdc(CdcArgs {
+            source,
+            source_env,
+            source_file,
+            server_id,
+            checkpoint,
+            table,
+            max_events,
+            output,
+            format,
+            rollover,
+            slot,
+            capture_instance,
+            until_current,
+        }),
         Commands::Init {
             source,
             source_env,
@@ -98,6 +127,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             exclude,
             output,
             discover,
+            mode,
             gcs_bucket,
             gcs_credentials_file,
             s3_bucket,
@@ -112,6 +142,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             exclude,
             output,
             discover,
+            mode,
             gcs_bucket,
             gcs_credentials_file,
             s3_bucket,
@@ -181,6 +212,85 @@ fn dispatch_schema(what: SchemaKind) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Parsed `rivet cdc` arguments (clap field types).
+struct CdcArgs {
+    source: Option<String>,
+    source_env: Option<String>,
+    source_file: Option<String>,
+    server_id: u32,
+    checkpoint: Option<String>,
+    table: Vec<String>,
+    max_events: Option<usize>,
+    output: Option<String>,
+    format: String,
+    rollover: usize,
+    slot: String,
+    capture_instance: Option<String>,
+    until_current: bool,
+}
+
+/// `rivet cdc`: build the engine's change stream via `create_change_stream`
+/// (dispatch by URL scheme), then either emit NDJSON (default) or, with
+/// `--output`, write typed Parquet/CSV files through the commit seam. `--output`
+/// resolves the table's column schema from the source via `type_mappings`.
+fn dispatch_cdc(a: CdcArgs) -> Result<()> {
+    let (url, _prov) = resolve_init_source(a.source, a.source_env, a.source_file)?;
+    let ckpt = a.checkpoint.map(std::path::PathBuf::from);
+    let cdc_cfg = crate::source::cdc::CdcConfig {
+        url: url.clone(),
+        server_id: a.server_id,
+        slot: a.slot,
+        capture_instance: a.capture_instance,
+        checkpoint: ckpt.clone(),
+        until_current: a.until_current,
+        // The CLI carries no TlsConfig; `None` ⇒ the require_tls_or_loopback gate
+        // refuses a remote host (config-driven `rivet run` supplies source.tls).
+        tls: None,
+    };
+    let Some(dir) = a.output else {
+        // NDJSON to stdout: no durable sink, so the slot is deliberately not
+        // advanced (correct at-least-once — the consumer owns durability). Resume
+        // for MySQL is the checkpoint file; PostgreSQL re-reads from the slot.
+        let mut stream = crate::source::cdc::create_change_stream(&cdc_cfg)?;
+        return crate::source::cdc::run(stream.as_mut(), ckpt, a.table, a.max_events);
+    };
+
+    // --output: the typed file sink, via the same `run_capture` assembler the
+    // `mode: cdc` run uses. The CLI is the ad-hoc path — `manifest.json` + `_SUCCESS`
+    // at the destination are its run record; `rivet run` is the path that also
+    // writes the state-DB metric + journal.
+    let tbl = match a.table.as_slice() {
+        [t] => t.clone(),
+        _ => anyhow::bail!(
+            "rivet cdc --output requires exactly one --table (its schema is resolved from the source)"
+        ),
+    };
+    let fmt = match a.format.as_str() {
+        "parquet" => crate::config::FormatType::Parquet,
+        "csv" => crate::config::FormatType::Csv,
+        other => anyhow::bail!("--format must be 'parquet' or 'csv', got {other:?}"),
+    };
+    let dest = crate::destination::create_destination(&crate::config::DestinationConfig {
+        destination_type: crate::config::DestinationType::Local,
+        path: Some(dir.clone()),
+        ..Default::default()
+    })?;
+    let now = chrono::Utc::now().to_rfc3339();
+    crate::source::cdc::run_capture(crate::source::cdc::CdcCapture {
+        cdc_cfg,
+        table: tbl,
+        dest: dest.as_ref(),
+        dest_uri: dir,
+        format: fmt,
+        max_events: a.max_events,
+        rollover: a.rollover,
+        rollover_memory_bytes: None,
+        run_id: now.clone(),
+        started_at: now,
+    })
+    .map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -333,11 +443,22 @@ fn dispatch_init(
     exclude: Vec<String>,
     output: Option<String>,
     discover: bool,
+    mode: Option<String>,
     gcs_bucket: Option<String>,
     gcs_credentials_file: Option<String>,
     s3_bucket: Option<String>,
     s3_region: Option<String>,
 ) -> Result<()> {
+    if let Some(m) = mode.as_deref()
+        && !matches!(
+            m,
+            "full" | "incremental" | "chunked" | "time_window" | "cdc"
+        )
+    {
+        anyhow::bail!(
+            "--mode must be one of: full, incremental, chunked, time_window, cdc (got {m:?})"
+        );
+    }
     let fmt = if discover {
         init::InitFormat::DiscoveryJson
     } else {
@@ -360,6 +481,7 @@ fn dispatch_init(
         fmt,
         yaml_dest,
         &filter,
+        mode.as_deref(),
     )
 }
 

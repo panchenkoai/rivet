@@ -117,31 +117,17 @@ pub(super) fn mssql_columns_to_schema(
     let mut errors: Vec<String> = Vec::new();
 
     for (idx, col) in columns.iter().enumerate() {
-        let mut rivet = mssql_type_to_rivet(col, overrides);
-        // tiberius' `Column` drops a decimal's declared precision/scale (only the
-        // type tag survives), so an autodetected `Decimal` carries a placeholder
-        // scale. Recover it — a user `columns:` override always wins and is left
-        // untouched. Order of precedence for an autodetected `Decimal`:
-        //   1. a `sys.columns` catalog hint (declared precision+scale) — the
-        //      upstream, lossless source that survives an all-NULL first batch;
-        //   2. otherwise the scale inferred from the first non-null value in the
-        //      data (`decimal_scale_from_rows`), for expression/computed columns
-        //      with no catalog entry.
-        if !overrides.contains_key(col.name())
-            && let RivetType::Decimal { precision, .. } = rivet
-        {
-            if let Some(&(p, s)) = decimal_hints.and_then(|h| h.get(col.name())) {
-                rivet = RivetType::Decimal {
-                    precision: p,
-                    scale: s,
-                };
-            } else if let Some(s) = decimal_scale_from_rows(idx, rows) {
-                rivet = RivetType::Decimal {
-                    precision: precision.max(s),
-                    scale: s as i8,
-                };
-            }
-        }
+        // tiberius' `Column` drops a decimal's declared precision/scale, so recover
+        // it — via the shared `resolve_decimal`, the same logic the scan-free
+        // `mssql_type_mappings` probe uses, so a full export and a CDC/`check` probe
+        // land the identical decimal type.
+        let rivet = resolve_decimal(
+            mssql_type_to_rivet(col, overrides),
+            col.name(),
+            overrides,
+            decimal_hints,
+            decimal_scale_from_rows(idx, rows),
+        );
         let native = format!("{:?}", col.column_type()).to_lowercase();
         let source = SourceColumn::simple(col.name(), native, true);
         let mapping = TypeMapping::from_source(&source, rivet);
@@ -178,16 +164,64 @@ pub(super) fn mssql_columns_to_schema(
 pub(super) fn mssql_type_mappings(
     columns: &[Column],
     overrides: &ColumnOverrides,
+    decimal_hints: Option<&HashMap<String, (u8, i8)>>,
 ) -> Vec<TypeMapping> {
     columns
         .iter()
         .map(|col| {
-            let rivet = mssql_type_to_rivet(col, overrides);
+            // Same decimal recovery the full-export schema builder uses — without
+            // rows there is no data-inference fallback, but the sys.columns catalog
+            // hint is exactly what gives the declared precision/scale, so a scan-free
+            // probe (CDC resolve, `rivet check`) lands the identical type a batch
+            // export does.
+            let rivet = resolve_decimal(
+                mssql_type_to_rivet(col, overrides),
+                col.name(),
+                overrides,
+                decimal_hints,
+                None,
+            );
             let native = format!("{:?}", col.column_type()).to_lowercase();
             let source = SourceColumn::simple(col.name(), native, true);
             TypeMapping::from_source(&source, rivet)
         })
         .collect()
+}
+
+/// Recover an autodetected decimal's declared precision/scale. A user `columns:`
+/// override always wins; then the `sys.columns` catalog hint (the upstream,
+/// lossless declared `(precision, scale)`); then, when rows are available, the
+/// scale inferred from the first non-null value. The single source of truth shared
+/// by the full-export schema builder ([`mssql_columns_to_schema`]) and the
+/// scan-free [`mssql_type_mappings`] probe, so CDC and a batch export resolve a
+/// decimal identically by construction (no drift).
+fn resolve_decimal(
+    rivet: RivetType,
+    col_name: &str,
+    overrides: &ColumnOverrides,
+    decimal_hints: Option<&HashMap<String, (u8, i8)>>,
+    data_scale: Option<u8>,
+) -> RivetType {
+    if overrides.contains_key(col_name) {
+        return rivet;
+    }
+    let precision = match &rivet {
+        RivetType::Decimal { precision, .. } => *precision,
+        _ => return rivet,
+    };
+    if let Some(&(p, s)) = decimal_hints.and_then(|h| h.get(col_name)) {
+        RivetType::Decimal {
+            precision: p,
+            scale: s,
+        }
+    } else if let Some(s) = data_scale {
+        RivetType::Decimal {
+            precision: precision.max(s),
+            scale: s as i8,
+        }
+    } else {
+        rivet
+    }
 }
 
 /// Fetch the `ColumnData` of column `idx` from a row without consuming it.
@@ -348,10 +382,19 @@ fn build_array(
         DataType::Timestamp(TimeUnit::Microsecond, tz) => {
             let mut b = TimestampMicrosecondBuilder::with_capacity(rows.len());
             for (r, row) in rows.iter().enumerate() {
-                match row.try_get::<NaiveDateTime, _>(idx) {
-                    Ok(Some(dt)) => b.append_value(dt.and_utc().timestamp_micros()),
-                    Ok(None) => b.append_null(),
-                    Err(e) => anyhow::bail!("mssql datetime column {idx} row {r}: {e}"),
+                // datetime/datetime2 are naive; datetimeoffset is tz-aware and is NOT
+                // a NaiveDateTime (reading it as one errors and fails the whole
+                // export). Fall back to its UTC instant via FixedOffset.
+                let micros = match row.try_get::<NaiveDateTime, _>(idx) {
+                    Ok(v) => v.map(|dt| dt.and_utc().timestamp_micros()),
+                    Err(_) => match row.try_get::<chrono::DateTime<chrono::FixedOffset>, _>(idx) {
+                        Ok(v) => v.map(|dt| dt.timestamp_micros()),
+                        Err(e) => anyhow::bail!("mssql timestamp column {idx} row {r}: {e}"),
+                    },
+                };
+                match micros {
+                    Some(m) => b.append_value(m),
+                    None => b.append_null(),
                 }
             }
             let arr = b.finish();

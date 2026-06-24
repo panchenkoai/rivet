@@ -131,6 +131,63 @@ pub enum Commands {
         #[arg(short, long)]
         config: String,
     },
+    /// Stream change data capture (CDC) from a source's transaction log.
+    ///
+    /// Experimental — MySQL binlog only. Emits one JSON object per row change to
+    /// stdout (NDJSON) and, with `--checkpoint`, persists a resume position.
+    /// Requires the source at `binlog_format = ROW` with a `REPLICATION SLAVE`
+    /// grant.
+    #[command(group = clap::ArgGroup::new("cdc_source").required(true).multiple(false))]
+    Cdc {
+        /// Database URL (mysql:// only for now). Visible in `ps`; prefer
+        /// `--source-env`/`--source-file` outside local dev.
+        #[arg(long, group = "cdc_source")]
+        source: Option<String>,
+        /// Name of an environment variable holding the database URL.
+        #[arg(long, value_name = "ENV_VAR", group = "cdc_source")]
+        source_env: Option<String>,
+        /// Path to a file containing just the database URL (one line).
+        #[arg(long, value_name = "PATH", group = "cdc_source")]
+        source_file: Option<String>,
+        /// Replica server-id for the binlog connection (must be distinct from the
+        /// source's and any other replica).
+        #[arg(long, default_value_t = 4271)]
+        server_id: u32,
+        /// Persist/resume the binlog position to this file. Omit to tail from the
+        /// current position without checkpointing.
+        #[arg(long, value_name = "PATH")]
+        checkpoint: Option<String>,
+        /// Only emit changes for this table (repeatable; default: all tables).
+        #[arg(long, value_name = "TABLE")]
+        table: Vec<String>,
+        /// Stop after N change events (default: stream until interrupted).
+        #[arg(long, value_name = "N")]
+        max_events: Option<usize>,
+        /// Write typed Parquet/CSV files to this directory (the upsert/after-image
+        /// shape) instead of NDJSON to stdout. Requires exactly one `--table` —
+        /// its schema is resolved from the source.
+        #[arg(long, value_name = "DIR")]
+        output: Option<String>,
+        /// Output file format when `--output` is set: `parquet` (default) or `csv`.
+        #[arg(long, value_name = "FORMAT", default_value = "parquet")]
+        format: String,
+        /// Rows per output file (rollover) when `--output` is set.
+        #[arg(long, value_name = "N", default_value_t = 10_000)]
+        rollover: usize,
+        /// PostgreSQL logical slot name (CDC; created if absent).
+        #[arg(long, value_name = "NAME", default_value = "rivet_slot")]
+        slot: String,
+        /// SQL Server CDC capture instance, e.g. `dbo_orders` — required for
+        /// `sqlserver://` sources.
+        #[arg(long, value_name = "INSTANCE")]
+        capture_instance: Option<String>,
+        /// Catch up to the source's current end and exit, instead of streaming
+        /// indefinitely — the bounded "read to now and stop" model, ideal for a
+        /// scheduler. For MySQL this is a non-blocking binlog dump; PostgreSQL /
+        /// SQL Server already drain their backlog and exit.
+        #[arg(long)]
+        until_current: bool,
+    },
     /// Manage export state
     State {
         #[command(subcommand)]
@@ -180,6 +237,13 @@ pub enum Commands {
             conflicts_with_all = ["gcs_bucket", "gcs_credentials_file", "s3_bucket", "s3_region"]
         )]
         discover: bool,
+        /// Override the suggested extraction mode for every scaffolded export.
+        /// `cdc` scaffolds a change-data-capture export (mode: cdc + a cdc: block
+        /// with engine-specific stream params) instead of a batch query. Other
+        /// values (full / incremental / chunked / time_window) just override the
+        /// auto-suggested mode.
+        #[arg(long, value_name = "MODE")]
+        mode: Option<String>,
         /// Scaffold `destination: type: gcs` with this bucket (each export gets `prefix: exports/<table>/`).
         /// Incompatible with `--s3-bucket` and `--discover`.
         #[arg(long = "gcs-bucket", value_name = "NAME", conflicts_with = "s3_bucket")]

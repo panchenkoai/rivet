@@ -160,6 +160,75 @@ services:
       timeout: 5s
       retries: 20
 
+  # ---- CDC-configured source engines (cdc profile) --------------------------
+  # Dedicated instances carrying the server-side config change data capture
+  # needs — logical WAL (PostgreSQL), a REPLICATION grant (MySQL), the SQL
+  # Server Agent (the capture job) — kept SEPARATE from the shared source
+  # services so those CDC settings never touch the batch tests. Ports are the
+  # shared port + 1: PostgreSQL 5434, MySQL 3307, SQL Server 1434. Brought up
+  # with `docker compose --profile cdc up -d postgres-cdc mysql-cdc mssql-cdc`.
+  postgres-cdc:
+    image: postgres:16
+    profiles: ["cdc"]
+    command: ["-c", "wal_level=logical"]
+    environment:
+      POSTGRES_USER: rivet
+      POSTGRES_PASSWORD: rivet
+      POSTGRES_DB: rivet
+    ports:
+      - "5434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rivet"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mysql-cdc:
+    image: mysql:8.0
+    profiles: ["cdc"]
+    # binlog is ON by default in MySQL 8 (ROW format); set a server id and grant
+    # the REPLICATION privileges the binlog dump (`COM_BINLOG_DUMP`) needs.
+    command:
+      - "--default-authentication-plugin=mysql_native_password"
+      - "--server-id=1"
+      - "--log-bin=binlog"
+      - "--binlog-format=ROW"
+    environment:
+      MYSQL_ROOT_PASSWORD: rivet
+      MYSQL_USER: rivet
+      MYSQL_PASSWORD: rivet
+      MYSQL_DATABASE: rivet
+    ports:
+      - "3307:3306"
+    volumes:
+      - ./dev/cdc/mysql-grant.sql:/docker-entrypoint-initdb.d/grant.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-privet"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mssql-cdc:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    profiles: ["cdc"]
+    # The Agent runs the CDC capture job that populates the change tables.
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Rivet_Passw0rd!"
+      MSSQL_PID: Developer
+      MSSQL_AGENT_ENABLED: "true"
+    ports:
+      - "1434:1433"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1' || exit 1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
   # ---- Legacy MySQL ---------------------------------------------------------
   # MySQL 5.7 is EOL (Oct 2023) but still widely deployed. Use mysql_native_password
   # as the default auth plugin so older clients (and the `mysql` Rust crate's

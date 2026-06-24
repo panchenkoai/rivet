@@ -457,21 +457,28 @@ Useful, but this opens a new product layer and should follow extraction trust.
 ---
 
 ## Epic 15 — WAL/Binlog CDC to Files
-**Priority:** P3  
+**Priority:** P3
 **Pain coverage:** Pain B, Pain G
+**Status:** ✅ **Shipped in 0.14.0**
 
 ### Goal
 Extend Rivet from snapshot extraction into logical change extraction after the trust layer is mature.
 
 ### Deliverables
-- logical change extraction
-- insert/update/delete event model
-- durable LSN/binlog position state
-- changelog file format
-- snapshot + changelog workflow
+- ✅ logical change extraction — all three engines (MySQL binlog, PostgreSQL logical slot, SQL Server change tables)
+- ✅ insert/update/delete event model (`__op`) with a `__pos` continuity marker
+- ✅ durable LSN/binlog position state — checkpoint file (MySQL/SQL Server) + slot advance (PostgreSQL); at-least-once, crash-tested per engine
+- ✅ changelog file format — typed Parquet/CSV through the same commit seam as a batch export (full type parity, byte-for-byte, validated via DuckDB/ClickHouse/BigQuery)
+- ✅ snapshot + changelog workflow — `mode: full` + `mode: cdc` of the same table run in parallel via `rivet run`
 
 ### Why this matters
 A natural evolution, but only after auditability, recovery, and data quality are solid.
+
+### Scope note
+This ships **CDC to files** — a bounded, resumable capture that lands typed files in the same
+bucket through the same commit seam (destination + content-MD5 + manifest + `_SUCCESS`) the
+batch path uses. It is **not** a streaming CDC *platform* (Kafka, real-time connectors, a SaaS
+marketplace) — that boundary, stated throughout this roadmap, still holds.
 
 ---
 
@@ -874,7 +881,7 @@ Near-term resource-control priorities:
 ## Phase 4 — Expand carefully
 13. Epic 13 — SSH / Jump Host Access
 14. Epic 14 — Narrow Warehouse Load Layer
-15. Epic 15 — WAL/Binlog CDC to Files
+15. Epic 15 — WAL/Binlog CDC to Files — ✅ **shipped in 0.14.0**
 16. Epic 16 — Automatic Parallelism
 
 ---

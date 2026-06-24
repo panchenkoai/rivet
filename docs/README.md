@@ -42,6 +42,7 @@ Short terminal walkthroughs in [gifs/](gifs/):
 | **incremental** | Only export rows newer than the last cursor | [modes/incremental.md](modes/incremental.md) · [composite cursor](modes/incremental-coalesce.md) |
 | **chunked** | Split large tables into parallel ranges by ID, **or by date** (`chunk_by_days: 365` → one chunk per ~year, `>= AND <` semantics); checkpoint + `--resume` for crashed runs | [modes/chunked.md](modes/chunked.md) |
 | **time_window** | Export a rolling N-day window | [modes/time-window.md](modes/time-window.md) |
+| **cdc** | Stream INSERT/UPDATE/DELETE from the transaction log (MySQL binlog / PostgreSQL logical slot / SQL Server change tables) as typed Parquet/CSV — source-safe, at-least-once | [reference/cdc.md](reference/cdc.md) |
 
 ## Destinations
 
@@ -66,6 +67,7 @@ Short terminal walkthroughs in [gifs/](gifs/):
 | Complete YAML config reference | [reference/config.md](reference/config.md) |
 | CLI commands and flags | [reference/cli.md](reference/cli.md) |
 | Tuning profiles and parameters | [reference/tuning.md](reference/tuning.md) |
+| `rivet cdc` — log-based change data capture: per-engine grants/prereqs, output shape, why it's gentle on the source | [reference/cdc.md](reference/cdc.md) |
 | `rivet init` — scaffold YAML from the database | [reference/init.md](reference/init.md) |
 | `rivet init --discover` — machine-readable JSON discovery artifact (ranked cursor / chunk candidates, row estimates, on-disk sizes) for automation and code review | [reference/init.md#discovery-artifact---discover](reference/init.md#discovery-artifact---discover) · [gifs/discover-artifact.gif](gifs/discover-artifact.gif) |
 | `rivet check --type-report --target bigquery` — per-column type fidelity report + warehouse compatibility (NUMERIC / BIGNUMERIC / TIMESTAMP overflow warnings); `--strict` exits non-zero on lossy mappings | [reference/cli.md#rivet-check](reference/cli.md#rivet-check) |

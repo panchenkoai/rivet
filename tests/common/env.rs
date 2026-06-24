@@ -36,6 +36,14 @@ pub const MYSQL_TOXI_URL: &str = "mysql://rivet:rivet@127.0.0.1:13306/rivet";
 /// `dev/mssql/init.sql` (piped through sqlcmd by the live-test setup).
 pub const MSSQL_URL: &str = "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1433/rivet";
 
+/// CDC-configured engines (`cdc` profile) — separate instances with logical WAL
+/// (PostgreSQL), a REPLICATION grant (MySQL) and the SQL Server Agent, so the CDC
+/// server-side config never touches the shared source services. Ports are the
+/// shared port + 1. Brought up with `docker compose --profile cdc up -d`.
+pub const POSTGRES_CDC_URL: &str = "postgresql://rivet:rivet@127.0.0.1:5434/rivet";
+pub const MYSQL_CDC_URL: &str = "mysql://rivet:rivet@127.0.0.1:3307/rivet";
+pub const MSSQL_CDC_URL: &str = "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1434/rivet";
+
 /// ProxySQL in transaction-persistent mode, port :6033.
 /// Opt in: docker compose --profile pool up -d proxysql
 /// Backend forwards to the same `mysql` service used by `MYSQL_URL`.

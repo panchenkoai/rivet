@@ -822,11 +822,33 @@ impl Config {
                 }
             }
             ExportMode::Full => {}
+            ExportMode::Cdc => {
+                if export.table.is_none() {
+                    anyhow::bail!(
+                        "export '{}': cdc mode requires `table:` (the source table to capture)",
+                        export.name
+                    );
+                }
+                if export.query.is_some() || export.query_file.is_some() {
+                    anyhow::bail!(
+                        "export '{}': cdc mode reads the transaction log, not a query — \
+                         remove query/query_file and use `table:`",
+                        export.name
+                    );
+                }
+            }
         }
 
         if export.chunk_dense && export.mode != ExportMode::Chunked {
             anyhow::bail!(
                 "export '{}': chunk_dense is only valid with mode: chunked",
+                export.name
+            );
+        }
+
+        if export.cdc.is_some() && export.mode != ExportMode::Cdc {
+            anyhow::bail!(
+                "export '{}': a `cdc:` block is only valid with `mode: cdc`",
                 export.name
             );
         }

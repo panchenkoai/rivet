@@ -8,15 +8,16 @@
 
 mod aggregate;
 mod apply_cmd;
+mod cdc_job;
 pub(crate) mod chunked;
 mod cli;
-mod commit;
+pub(crate) mod commit;
 mod finalize;
 pub(crate) mod ipc;
 mod job;
 mod keyset;
 mod manifest_reconcile;
-mod manifest_writer;
+pub(crate) mod manifest_writer;
 mod parallel_children;
 pub(crate) mod parent_ui;
 mod partition_expand;

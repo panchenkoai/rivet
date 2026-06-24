@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.14.0 (2026-06-24) — change data capture to files (Epic 15)
+
+Rivet learns to read the source's transaction log. Beyond batch snapshots, it now captures
+every INSERT / UPDATE / DELETE — MySQL binlog, a PostgreSQL logical slot, SQL Server change
+tables — and writes them as typed Parquet/CSV through the **same commit seam** (destination +
+content-MD5 + manifest + `_SUCCESS`) the batch path uses. A CDC export lands in your bucket and
+shows up in `rivet metrics` / `rivet journal` exactly like a batch one. This is CDC **to files**
+— bounded, resumable, source-safe — not a streaming platform.
+
+### Added
+
+- **`feat(cdc)` — log-based change data capture across all three engines.** A new `mode: cdc`
+  (in `rivet run` config) and a `rivet cdc` CLI command capture row changes from the MySQL
+  binlog, a PostgreSQL `test_decoding` logical slot, or SQL Server change tables, emitting
+  `[__op, __pos]` + the source columns — typed, as the after-image (the key columns for a
+  DELETE). `rivet init --mode cdc` scaffolds the config (incl. `--gcs-bucket` / `--s3-bucket`).
+- **At-least-once, resumable, crash-tested.** Durable position state per engine — a checkpoint
+  file (MySQL / SQL Server) or slot advance (PostgreSQL) — written only after the part is
+  durable (flush → checkpoint → ack). A crash before the checkpoint re-reads on resume and never
+  loses a change; validated live per engine via a `RIVET_TEST_PANIC_AT` fault point.
+- **Full type parity with the batch export.** The CDC sink reuses `build_arrow_field`, so a
+  captured column lands as the identical Arrow type a batch export produces — int widths,
+  decimal precision/scale, JSON, UUID, naive **and tz-aware** timestamps — validated
+  byte-for-byte against DuckDB, ClickHouse, and BigQuery and locked by a regression test
+  (`mssql_cdc_full_type_matrix_matches_batch`).
+- **Same observability + commit seam as batch.** Each part uploads via the existing destination
+  + content-MD5 + manifest + `_SUCCESS` path (so `--output gs://…` / `s3://…` works); a CDC run
+  records an `export_metrics` row + a `run_journal` entry, so `rivet metrics` and `rivet journal`
+  show it like a batch run. `mode: full` + `mode: cdc` of the same table run in parallel under
+  one `rivet run`.
+- **Operational guardrails.** Per-engine permission/setup hints on a failed CDC start; fail-fast
+  through a MySQL query proxy (ProxySQL / MaxScale can't carry the replication stream); a TLS
+  gate on every adapter; `--table` identifier validation; memory-budget part rollover
+  (`rollover_memory_mb`); `--until-current` (drain to the current end and exit).
+
+### Fixed
+
+- **`fix(mssql)` — SQL Server CDC now resumes by LSN (was re-reading the whole change table).**
+  The adapter read `fn_cdc_get_all_changes(min_lsn, max_lsn)` on every poll — re-reading the
+  entire retained change table each run (at-least-*everything*) because `open()` never consumed
+  the checkpoint LSN. It now resumes from `fn_cdc_increment_lsn(checkpoint)`, guarded so
+  nothing-new / nothing-captured skips the call instead of erroring.
+- **`fix(mssql)` — `datetimeoffset` was silently dropped in CDC and failed the export in batch.**
+  Both paths read it via `try_get::<NaiveDateTime>` — the wrong type for a tz-aware column. CDC
+  silently nulled the value; **a batch export errored out entirely on any `datetimeoffset`
+  column** (the table was unexportable). Both now read it as the UTC instant and land it as a
+  tz-aware Timestamp.
+- **`fix(cdc)` — SQL Server `uniqueidentifier` was dropped to NULL in CDC.** It was mapped to its
+  36-char string, which doesn't fit the UUID `FixedSizeBinary(16)` column and silently became
+  NULL; it now carries the 16 canonical bytes, matching the batch export.
+- **`fix(mssql)` — decimal precision now matches batch in CDC and `rivet check`.** The scan-free
+  type probe skipped the `sys.columns` catalog hint the full export applies, so a SQL Server
+  decimal resolved as the placeholder `DECIMAL(38,…)` instead of the declared `DECIMAL(18,4)`. A
+  single shared `resolve_decimal` now serves both paths.
+
 ## 0.13.1 (2026-06-23) — pace-aware throttle (wide-table extraction no longer sleeps away wall-clock)
 
 A profiling pass found the default `balanced` profile spending most of a wide-table

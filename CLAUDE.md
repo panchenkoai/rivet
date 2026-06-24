@@ -86,3 +86,22 @@ post-load cast only where it is lossless, otherwise `None` + an
 upstream (load-schema) note, and never a silent no-op. When self-review
 catches a bug of this shape, add the edge-case test alongside the fix,
 not just the fix.
+
+## CDC resume is per-engine — verify it empirically, twice
+
+A CDC adapter that **captures** correctly can still fail to **resume**:
+capture-works ≠ resume-works, and a single-run test sees only capture.
+The SQL Server adapter (`src/source/mssql/cdc.rs`) shipped reading
+`fn_cdc_get_all_changes(get_min_lsn(), get_max_lsn())` on **every** poll
+— it re-read the entire retained change table each run (at-least-
+*everything*, not at-least-once) because `open()` never consumed the
+checkpoint LSN. The gap was invisible until run twice: capture 2 →
+re-run with no new changes → it returned the same 2 instead of 0.
+
+Process rule: **for every CDC engine, prove resume with a two-run live
+test** — run, change, resume — asserting the second run captures *only*
+the new changes (and, with the `cdc_after_flush_before_ack` fault hook,
+that a crash before the checkpoint re-reads rather than loses). Each
+engine resumes by a different mechanism (MySQL binlog checkpoint file,
+PostgreSQL slot advance, SQL Server from-LSN), so one engine passing
+proves nothing about another. Never infer resume from capture.

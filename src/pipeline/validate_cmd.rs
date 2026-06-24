@@ -174,6 +174,33 @@ pub fn run_validate_command(
                     resolved_prefix,
                     verification: v,
                 });
+                // CDC-specific: re-read the parts and confirm `__pos` stayed in
+                // source-log order (no reorder / no part-boundary overlap). The
+                // manifest check above already covered per-part MD5 / size / _SUCCESS.
+                if export.mode == crate::config::ExportMode::Cdc
+                    && export.format == crate::config::FormatType::Parquet
+                {
+                    match crate::source::cdc::validate::check_positions(&*dest, "") {
+                        Ok(pc) if pc.is_ok() => log::info!(
+                            "export '{}': cdc __pos continuity OK — {} changes across {} parts, range {:?}..{:?}",
+                            export.name,
+                            pc.rows,
+                            pc.parts,
+                            pc.first,
+                            pc.last
+                        ),
+                        Ok(pc) => {
+                            for v in &pc.violations {
+                                hard_failures
+                                    .push(format!("export '{}': cdc __pos: {}", export.name, v));
+                            }
+                        }
+                        Err(e) => hard_failures.push(format!(
+                            "export '{}': cdc __pos check failed: {:#}",
+                            export.name, e
+                        )),
+                    }
+                }
             }
             Err(e) => {
                 hard_failures.push(format!(

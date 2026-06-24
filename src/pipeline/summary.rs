@@ -66,7 +66,7 @@ pub struct ApplyContext {
 /// The embedded `journal` is the structured event log for this run.  Use
 /// `summary.journal.record(event)` at any call site that already holds
 /// `&mut RunSummary`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RunSummary {
     pub run_id: String,
     pub export_name: String,

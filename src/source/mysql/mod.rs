@@ -19,6 +19,7 @@
 //!   is exhaustively unit-tested in isolation (no live MySQL needed).
 
 mod arrow_convert;
+pub(crate) mod cdc;
 mod proxy;
 
 use std::sync::Arc;

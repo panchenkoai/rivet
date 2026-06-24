@@ -12,7 +12,7 @@
 
 <p align="center"><strong>Make database extraction boring.</strong></p>
 
-<p align="center">One Rust binary, ~18 MB (speed-optimized). Extracts PostgreSQL, MySQL, and SQL Server to Parquet/CSV — locally, on S3, GCS, or Azure Blob — without holding long queries open on your production database. Resumable, auditable, source-safe.</p>
+<p align="center">One Rust binary, ~18 MB. Extracts PostgreSQL, MySQL, and SQL Server to Parquet/CSV — locally or to S3 / GCS / Azure — without holding long queries open on your production database. <strong>Batch snapshots or log-based change data capture.</strong> Resumable, auditable, source-safe.</p>
 
 > Not sure if Rivet fits your problem? [docs/who-is-this-for.md](docs/who-is-this-for.md) is a 60-second fit-check.
 
@@ -46,6 +46,52 @@ Rivet tries to make database extraction boring:
 7. **Notice when the source changes** — column adds/removes/retypes trigger `on_schema_drift: warn|continue|fail` on the next run. Shape drift in TEXT/JSON columns is tracked via byte-width sampling.
 
 The execution contract behind each of these — what is guaranteed, what is at-least-once, what isn't covered — is in [docs/semantics.md](docs/semantics.md).
+
+## Change data capture
+
+Beyond batch snapshots, Rivet reads the source's **transaction log** — MySQL binlog, a PostgreSQL logical slot, SQL Server change tables — and writes every INSERT / UPDATE / DELETE as typed Parquet/CSV through the same commit seam (destination + content-MD5 + manifest + `_SUCCESS`) the batch path uses. A CDC export lands in your bucket and shows up in `rivet metrics` exactly like a batch one.
+
+![rivet CDC — scaffold a cdc config, capture binlog changes to typed Parquet, read them back as typed rows](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/cdc.gif)
+
+### CDC quickstart
+
+```bash
+# 1. One-time source prep (per engine — full list: docs/reference/cdc.md):
+#    MySQL: binlog_format=ROW + a REPLICATION SLAVE grant
+#    PostgreSQL: wal_level=logical + a role with REPLICATION
+#    SQL Server: enable CDC on the table + SQL Server Agent running
+export DATABASE_URL="mysql://user:pass@host/db"
+
+# 2. Scaffold a cdc config (engine-specific stream params pre-filled)
+rivet init --source-env DATABASE_URL --table orders --mode cdc -o cdc.yaml
+
+# 3. Capture: drain every change since the checkpoint to typed Parquet, then exit
+rivet run -c cdc.yaml
+```
+
+First run starts from the current log position (or the checkpoint, on a resume); make a change to `orders`, run step 3 again, and it lands as a row (`__op` = insert/update/delete). Output: typed Parquet in `./output/` (or your bucket) + manifest + `_SUCCESS`, and the run appears in `rivet metrics`. Schedule step 3 (cron / Airflow) for continuous capture — each run resumes from the checkpoint. Full reference + grants: [docs/reference/cdc.md](docs/reference/cdc.md).
+
+> **Missing a grant?** If step 1 isn't done, `rivet run` fails with the exact requirement and a pointer to the grants section — e.g. `MySQL CDC needs … a REPLICATION SLAVE + REPLICATION CLIENT grant …` — not a raw driver error.
+
+The generated `cdc.yaml` (pass `--gcs-bucket` / `--s3-bucket` to `init` for a cloud destination instead of local):
+
+```yaml
+exports:
+  - name: orders
+    table: orders
+    mode: cdc
+    format: parquet
+    cdc:
+      checkpoint: ./cdc/orders.ckpt
+      until_current: true        # drain to the current log end and exit (for a scheduler)
+      server_id: 4271            # MySQL replica id (slot / capture_instance for PG / SQL Server)
+    destination: { type: local, path: ./output/orders/ }
+```
+
+- **Source-safe, like the batch path** — reads the log, never a long `SELECT`: no locks, no snapshot. Catches changes that don't touch an `updated_at` (which a watermark sync silently misses).
+- **At-least-once** on all three engines — commit-boundary checkpoint; PostgreSQL advances its slot only after a durable write.
+- **Typed output matches the batch export** — real `Timestamp` / `Decimal` / `json` / `uuid`, not strings (same `build_arrow_field` pipeline).
+- The upsert output shape (`[__op, __pos]` + after-image), the grants each engine needs, the per-engine retention/ack model, and current limitations are in **[docs/reference/cdc.md](docs/reference/cdc.md)**.
 
 ## Trust contracts
 
@@ -180,7 +226,7 @@ rivet run -c rivet.yaml
 
 ## More walkthroughs
 
-[plan / apply](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/plan-apply.gif) · [plan campaign — multi-export waves](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/plan-campaign.gif) · [reconcile + repair](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/reconcile-repair.gif) · [parallel cards UI](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/parallel-cards.gif) · [composite cursor (COALESCE fallback)](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/coalesce-cursor.gif) · [pool detection](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/pool-detect.gif) · [discovery artifact (`rivet init --discover`)](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/discover-artifact.gif) · [post-run inspect](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/inspect.gif). Source scripts in [docs/gifs/](https://github.com/panchenkoai/rivet/tree/main/docs/gifs).
+[plan / apply](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/plan-apply.gif) · [plan campaign — multi-export waves](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/plan-campaign.gif) · [reconcile + repair](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/reconcile-repair.gif) · [parallel cards UI](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/parallel-cards.gif) · [composite cursor (COALESCE fallback)](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/coalesce-cursor.gif) · [pool detection](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/pool-detect.gif) · [discovery artifact (`rivet init --discover`)](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/discover-artifact.gif) · [post-run inspect](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/inspect.gif) · [CDC — batch + cdc on the same table, parallel](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/cdc-parallel.gif) · [CDC access error (missing grant)](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/error-cdc-access.gif). Source scripts in [docs/gifs/](https://github.com/panchenkoai/rivet/tree/main/docs/gifs).
 
 ---
 
