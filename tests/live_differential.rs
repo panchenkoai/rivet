@@ -444,3 +444,104 @@ exports:
         );
     }
 }
+
+/// Multi-export isolation: one export failing at *runtime* must not poison the
+/// others. The failing export is listed FIRST, so a fail-fast loop would abort
+/// before the good export ever runs — this proves the run is continue-on-error
+/// (run.rs collects each export's result and carries on). The contract:
+///   - the good export completes fully — status:success, a `_SUCCESS` marker, all rows;
+///   - the failed export RECORDS its failure — a status:failed manifest with no parts
+///     and crucially NO `_SUCCESS` marker, so it's never mistaken for a clean export;
+///   - the run still reports overall failure (non-zero exit).
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn multi_export_one_runtime_failure_does_not_poison_the_others() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("rivet_me");
+    let _g = DropPg(table.clone());
+    seed_pg_n(&table, 200);
+
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let ok_out = cfg_dir.path().join("ok");
+    let bad_out = cfg_dir.path().join("bad");
+    std::fs::create_dir_all(&ok_out).unwrap();
+    std::fs::create_dir_all(&bad_out).unwrap();
+    // bad_exp FIRST: a valid config whose query fails at runtime (missing table).
+    let yaml = format!(
+        r#"source: {{type: postgres, url: "{POSTGRES_URL}"}}
+exports:
+  - name: bad_exp
+    query: "SELECT * FROM rivet_nonexistent_table_xyz"
+    mode: full
+    format: parquet
+    destination: {{type: local, path: {bad}}}
+  - name: ok_exp
+    query: "SELECT id, n, big, c_text FROM {table}"
+    mode: full
+    format: parquet
+    destination: {{type: local, path: {ok}}}
+"#,
+        bad = bad_out.display(),
+        ok = ok_out.display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let run = std::process::Command::new(RIVET_BIN)
+        .args(["run", "--config", cfg.to_str().unwrap()])
+        .output()
+        .expect("spawn rivet");
+
+    // The run reports overall failure (bad_exp failed)…
+    assert!(
+        !run.status.success(),
+        "the run must exit non-zero because bad_exp failed; stderr:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    // …but ok_exp — listed AFTER the failure — still completed: a fail-fast loop
+    // would have aborted before it ran.
+    let manifest = ok_out.join("manifest.json");
+    assert!(
+        manifest.exists(),
+        "ok_exp must complete despite the earlier bad_exp failing (continue-on-error isolation); stderr:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let m: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    assert_eq!(
+        m["row_count"].as_i64().unwrap(),
+        200,
+        "ok_exp must export every row — its output must be whole, not truncated by the sibling failure"
+    );
+    assert_eq!(
+        m["status"].as_str(),
+        Some("success"),
+        "ok_exp manifest must record status:success"
+    );
+    assert!(
+        ok_out.join("_SUCCESS").exists(),
+        "ok_exp must write its _SUCCESS marker (the clean-completion signal)"
+    );
+
+    // bad_exp RECORDS its failure (not silently absent) but is unmistakably not a
+    // clean export: status:failed, zero rows, and NO _SUCCESS marker.
+    let bad_manifest = bad_out.join("manifest.json");
+    assert!(
+        bad_manifest.exists(),
+        "bad_exp must record its failure with a manifest, not vanish silently"
+    );
+    let bm: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&bad_manifest).unwrap()).unwrap();
+    assert_eq!(
+        bm["status"].as_str(),
+        Some("failed"),
+        "bad_exp manifest must record status:failed"
+    );
+    assert_eq!(
+        bm["row_count"].as_i64(),
+        Some(0),
+        "a failed export writes no rows"
+    );
+    assert!(
+        !bad_out.join("_SUCCESS").exists(),
+        "bad_exp must NOT write a _SUCCESS marker — that's how downstream tells it apart from a clean export"
+    );
+}
