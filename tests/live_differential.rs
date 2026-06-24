@@ -130,6 +130,14 @@ fn duckdb_fingerprint(glob: &str) -> Fingerprint {
     duckdb_fp_from(&format!("read_parquet('{glob}')"))
 }
 
+/// Fingerprint exported CSV via DuckDB's `read_csv_auto` — a fully independent CSV
+/// parser. If rivet mis-escapes a field (comma/quote/newline), DuckDB's parse of
+/// the round-tripped value diverges from the source on the text-length or
+/// distinct-text fields.
+fn duckdb_csv_fingerprint(glob: &str) -> Fingerprint {
+    duckdb_fp_from(&format!("read_csv_auto('{glob}', header=true)"))
+}
+
 /// Fingerprint the exported Parquet with at-least-once duplicate parts collapsed.
 /// After a crash + resume the destination holds the re-run chunk twice; rivet's
 /// duplicate parts are byte-identical re-exports, so `SELECT DISTINCT *` recovers
@@ -441,6 +449,62 @@ exports:
             &src, &dst,
             "rows={} chunk={} crash_at={}: post-crash exactly-once view disagrees with the source",
             rows, chunk, crash_at
+        );
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 12, ..ProptestConfig::default() })]
+
+    /// CSV write-path completeness + escaping: a full CSV export, read back by
+    /// DuckDB's independent CSV parser, must match the source. One row carries a
+    /// comma and a double-quote, so a mis-escape (RFC-4180: quote the field, double
+    /// the quote) diverges the text-length / distinct-text fingerprint fields.
+    #[test]
+    #[ignore = "live+loaders: postgres + rivet-duckdb (nightly); reads via_duckdb"]
+    fn batch_csv_export_complete_and_escaped_via_duckdb(rows in 1i64..300) {
+        require_alive(LiveService::Postgres);
+        require_alive(LiveService::DuckDb);
+        let table = unique_name("rivet_csv");
+        let _g = DropPg(table.clone());
+        seed_pg_n(&table, rows);
+        // A row that stresses CSV escaping: c_text contains a comma and a quote.
+        pg_connect()
+            .execute(
+                &format!(r#"INSERT INTO {table} VALUES ({rows}, 0, 0, 'a,b"c')"#),
+                &[],
+            )
+            .expect("seed escaping row");
+
+        let export = unique_name("csv_exp");
+        let (host, container) = duckdb_shared_workdir(&unique_name("csv_out"));
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            r#"source: {{type: postgres, url: "{POSTGRES_URL}"}}
+exports:
+  - name: {export}
+    query: "SELECT id, n, big, c_text FROM {table}"
+    mode: full
+    format: csv
+    destination: {{type: local, path: {dir}}}
+"#,
+            dir = host.display(),
+        );
+        let cfg = write_config(&cfg_dir, &yaml);
+        let run = run_rivet_export(&cfg, &export);
+        prop_assert!(
+            run.status.success(),
+            "rows={}: csv export failed:\n{}",
+            rows, String::from_utf8_lossy(&run.stderr)
+        );
+        make_shared_world_readable();
+
+        let src = pg_fingerprint(&table);
+        let dst = duckdb_csv_fingerprint(&format!("{container}/*.csv"));
+        prop_assert_eq!(
+            &src, &dst,
+            "rows={}: DuckDB's CSV view disagrees with the source — a row was lost, duped, or mis-escaped",
+            rows
         );
     }
 }
