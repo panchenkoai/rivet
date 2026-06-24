@@ -413,7 +413,175 @@ pub(super) fn rows_to_record_batch_typed(
         arrays.push(arr);
     }
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
+    // Form A value-checksum (opt-in, RIVET_VALUE_CHECKSUM=1): an independent
+    // source-side pass over the raw pg values (A) vs the Arrow-side pass over the
+    // built batch (B). A mismatch means the value converter changed a value
+    // between read and Arrow build — fail loud rather than write the bad batch.
+    if crate::source::value_checksum::enabled() {
+        let a = pg_rows_checksums(schema, columns, rows);
+        let b = crate::source::value_checksum::arrow_batch_checksums(&batch);
+        crate::source::value_checksum::verify(&a, &b, schema)?;
+    }
     Ok(batch)
+}
+
+/// Side A of the Form A value-checksum: the per-column additive checksum computed
+/// **independently** from the raw pg `Row` values, mirroring `build_array`'s
+/// intended per-type transform so it equals side B on a correct build. Dispatches
+/// on the resolved target Arrow type (same decision site as `build_array`) so it
+/// covers exactly the types side B covers and skips exactly the ones it skips —
+/// any drift here is a false mismatch. Nulls contribute 0 (side B skips them too).
+fn pg_rows_checksums(schema: &SchemaRef, columns: &[(String, Type)], rows: &[Row]) -> Vec<i128> {
+    (0..columns.len())
+        .map(|col_idx| {
+            let target = schema.field(col_idx).data_type();
+            let pg_type = &columns[col_idx].1;
+            let mut s: i128 = 0;
+            macro_rules! add {
+                ($e:expr) => {
+                    s = s.wrapping_add($e as i128);
+                };
+            }
+            match target {
+                DataType::Int16 => {
+                    for row in rows {
+                        if let Some(v) = row.get::<_, Option<i16>>(col_idx) {
+                            add!(v);
+                        }
+                    }
+                }
+                DataType::Int32 => {
+                    for row in rows {
+                        if let Some(v) = row.get::<_, Option<i32>>(col_idx) {
+                            add!(v);
+                        }
+                    }
+                }
+                DataType::Int64 => {
+                    if *pg_type == Type::OID {
+                        for row in rows {
+                            if let Some(v) = row.get::<_, Option<u32>>(col_idx) {
+                                add!(v);
+                            }
+                        }
+                    } else {
+                        for row in rows {
+                            if let Some(v) = row.get::<_, Option<i64>>(col_idx) {
+                                add!(v);
+                            }
+                        }
+                    }
+                }
+                DataType::Float32 => {
+                    for row in rows {
+                        if let Some(v) = row.get::<_, Option<f32>>(col_idx) {
+                            add!(v.to_bits());
+                        }
+                    }
+                }
+                DataType::Float64 => {
+                    for row in rows {
+                        if let Some(v) = row.get::<_, Option<f64>>(col_idx) {
+                            add!(v.to_bits());
+                        }
+                    }
+                }
+                DataType::Boolean => {
+                    for row in rows {
+                        if let Some(true) = row.get::<_, Option<bool>>(col_idx) {
+                            add!(1);
+                        }
+                    }
+                }
+                DataType::Date32 => {
+                    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch valid");
+                    for row in rows {
+                        if let Some(d) = row.get::<_, Option<chrono::NaiveDate>>(col_idx) {
+                            add!((d - epoch).num_days());
+                        }
+                    }
+                }
+                DataType::Timestamp(_, _) => {
+                    if *pg_type == Type::TIMESTAMPTZ {
+                        for row in rows {
+                            if let Some(ts) =
+                                row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(col_idx)
+                            {
+                                add!(ts.timestamp_micros());
+                            }
+                        }
+                    } else {
+                        for row in rows {
+                            if let Some(ts) = row.get::<_, Option<chrono::NaiveDateTime>>(col_idx) {
+                                add!(ts.and_utc().timestamp_micros());
+                            }
+                        }
+                    }
+                }
+                DataType::Binary => {
+                    for row in rows {
+                        if let Some(v) = row.get::<_, Option<Vec<u8>>>(col_idx) {
+                            add!(v.len());
+                        }
+                    }
+                }
+                DataType::Utf8 => match *pg_type {
+                    Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => {
+                        for row in rows {
+                            let v: Option<&str> = row.get(col_idx);
+                            if let Some(t) = v {
+                                add!(t.len());
+                            }
+                        }
+                    }
+                    Type::JSON | Type::JSONB => {
+                        for row in rows {
+                            if let Ok(Some(PgJsonRawText(text))) =
+                                row.try_get::<_, Option<PgJsonRawText<'_>>>(col_idx)
+                            {
+                                add!(text.len());
+                            }
+                        }
+                    }
+                    Type::NUMERIC => {
+                        for row in rows {
+                            if let Ok(Some(t)) = pg_numeric_optional_utf8_string(row, col_idx) {
+                                add!(t.len());
+                            }
+                        }
+                    }
+                    Type::UUID => {
+                        for row in rows {
+                            if let Ok(Some(PgUuidBytes(bytes))) =
+                                row.try_get::<_, Option<PgUuidBytes>>(col_idx)
+                            {
+                                add!(uuid::Uuid::from_bytes(bytes).to_string().len());
+                            }
+                        }
+                    }
+                    Type::INTERVAL => {
+                        for row in rows {
+                            if let Some(iv) =
+                                row.try_get::<_, Option<PgInterval>>(col_idx).ok().flatten()
+                            {
+                                add!(
+                                    pg_interval_to_iso8601(iv.months, iv.days, iv.microseconds)
+                                        .len()
+                                );
+                            }
+                        }
+                    }
+                    // Any other text wire type: side B counts a byte length we did
+                    // not reproduce here, so skip rather than risk a false mismatch.
+                    _ => {}
+                },
+                // Decimal128 / FixedSizeBinary (UUID) / List / Time64 / etc. —
+                // skipped on both sides for this first cut.
+                _ => {}
+            }
+            s
+        })
+        .collect()
 }
 
 fn build_array(
