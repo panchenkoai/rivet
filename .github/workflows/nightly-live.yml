@@ -69,7 +69,7 @@ jobs:
         # them the `--ignored` run fails 13 tests with `No such object:
         # rivet-duckdb` / `ClickHouse reachable on 127.0.0.1:8123` (pyarrow_*
         # cases also go through the shared rivet-duckdb exec helper).
-        run: docker compose --profile pool --profile loaders --profile cdc --profile replica up -d postgres mysql mssql minio fake-gcs toxiproxy pgbouncer proxysql duckdb clickhouse postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica
+        run: docker compose --profile pool --profile loaders --profile cdc --profile replica up -d postgres mysql mssql minio fake-gcs azurite toxiproxy pgbouncer proxysql duckdb clickhouse postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica
 
       - name: Wait for services
         run: |
@@ -83,6 +83,10 @@ jobs:
           # 6033 is the client-facing MySQL protocol port; 6032 admin comes
           # up first but we wait for 6033 so backend wiring is in place.
           for i in $(seq 1 30); do (exec 3<>/dev/tcp/127.0.0.1/6033) 2>/dev/null && break || sleep 1; done
+          echo "Waiting for Azurite..."
+          # Blob emulator on :10000 — cloud_multipart_azure_* needs it. It was missing
+          # from `up` here (ci.yml has it) and panicked the whole nightly suite nightly.
+          for i in $(seq 1 30); do (exec 3<>/dev/tcp/127.0.0.1/10000) 2>/dev/null && break || sleep 1; done
           echo "Waiting for ClickHouse..."
           # HTTP :8123/ping — the type_roundtrip clickhouse_load tests connect here.
           for i in $(seq 1 30); do curl -sf localhost:8123/ping >/dev/null 2>&1 && break || sleep 2; done
