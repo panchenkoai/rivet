@@ -736,3 +736,111 @@ exports:
         );
     }
 }
+
+// ---- Engine variant: a SQL Server source -----------------------------------
+
+/// SQL Server twin of [`seed_pg_n`]. T-SQL caps a multi-row VALUES at 1000, so
+/// chunk the INSERTs.
+fn seed_mssql_n(table: &str, rows: i64) {
+    mssql_drop_table(table);
+    mssql_exec(&format!(
+        "CREATE TABLE {table} (id BIGINT PRIMARY KEY, n INT NOT NULL, big BIGINT NOT NULL, c_text NVARCHAR(100) NOT NULL)"
+    ));
+    let mut start = 0;
+    while start < rows {
+        let end = (start + 1000).min(rows);
+        let mut sql = format!("INSERT INTO {table} (id, n, big, c_text) VALUES ");
+        for i in start..end {
+            if i > start {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!(
+                "({i}, {}, {}, 'row-{i}')",
+                ((i * 7) % 100000) - 50000,
+                i * 1000003
+            ));
+        }
+        mssql_exec(&sql);
+        start = end;
+    }
+}
+
+/// SQL Server twin of [`pg_fingerprint`]. Every field is `CAST(... AS BIGINT)` so it
+/// reads back as i64 and `sum` can't overflow its source column type.
+fn mssql_fingerprint(table: &str) -> Fingerprint {
+    let v = mssql_query_bigints(
+        &format!(
+            "SELECT CAST(count(*) AS BIGINT), sum(CAST(id AS BIGINT)), sum(CAST(n AS BIGINT)), \
+             sum(CAST(big AS BIGINT)), sum(CAST(LEN(c_text) AS BIGINT)), \
+             CAST(count(DISTINCT id) AS BIGINT), CAST(count(DISTINCT c_text) AS BIGINT) FROM {table}"
+        ),
+        7,
+    );
+    Fingerprint {
+        rows: v[0],
+        sum_id: v[1],
+        sum_n: v[2],
+        sum_big: v[3],
+        sum_text_len: v[4],
+        distinct_id: v[5],
+        distinct_text: v[6],
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 8, ..ProptestConfig::default() })]
+
+    /// Engine variant: a SQL Server source. The same boundary-completeness proof as
+    /// the PostgreSQL and MySQL paths — chunked export, DuckDB fingerprint vs the SQL
+    /// Server source across random (rows, chunk_size). Fewer cases: the per-call
+    /// tiberius runtime makes each fingerprint heavier.
+    #[test]
+    #[ignore = "live+loaders: mssql + rivet-duckdb (nightly); reads via_duckdb"]
+    fn mssql_chunked_export_complete_across_boundaries_via_duckdb(
+        rows in 1i64..400,
+        chunk in 5i64..150,
+    ) {
+        require_alive(LiveService::Mssql);
+        require_alive(LiveService::DuckDb);
+        let table = unique_name("rivet_msbp");
+        seed_mssql_n(&table, rows);
+        let _g = MssqlTable::adopt(table.clone());
+
+        let export = unique_name("msbp_exp");
+        let (host, container) = duckdb_shared_workdir(&unique_name("msbp_out"));
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            r#"source:
+  type: mssql
+  url: "{MSSQL_URL}"
+  tls:
+    accept_invalid_certs: true
+exports:
+  - name: {export}
+    query: "SELECT id, n, big, c_text FROM {table}"
+    mode: chunked
+    chunk_column: id
+    chunk_size: {chunk}
+    format: parquet
+    destination: {{type: local, path: {dir}}}
+"#,
+            dir = host.display(),
+        );
+        let cfg = write_config(&cfg_dir, &yaml);
+        let run = run_rivet_export(&cfg, &export);
+        prop_assert!(
+            run.status.success(),
+            "rows={} chunk={}: mssql export failed:\n{}",
+            rows, chunk, String::from_utf8_lossy(&run.stderr)
+        );
+        make_shared_world_readable();
+
+        let src = mssql_fingerprint(&table);
+        let dst = duckdb_fingerprint(&format!("{container}/*.parquet"));
+        prop_assert_eq!(
+            &src, &dst,
+            "rows={} chunk={}: DuckDB's view disagrees with the SQL Server source — a boundary lost or duped a row",
+            rows, chunk
+        );
+    }
+}

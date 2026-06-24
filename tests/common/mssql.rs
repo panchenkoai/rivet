@@ -96,6 +96,31 @@ pub fn mssql_cdc_query_i64(sql: &str) -> i64 {
     query_i64_at(1434, sql)
 }
 
+/// Run a query whose `cols` columns are all `BIGINT` and return the first row as
+/// `i64`s — for multi-aggregate fingerprints (each aggregate `CAST(... AS BIGINT)`
+/// in SQL, since [`mssql_query_i64`] only reads a single `INT` column). Shared
+/// `mssql` (`:1433`).
+pub fn mssql_query_bigints(sql: &str, cols: usize) -> Vec<i64> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("mssql: tokio runtime");
+    rt.block_on(async {
+        let mut client = connect_at(1433).await;
+        let row = client
+            .simple_query(sql)
+            .await
+            .expect("mssql: query")
+            .into_row()
+            .await
+            .expect("mssql: row")
+            .expect("mssql: at least one row");
+        (0..cols)
+            .map(|i| row.get::<i64, _>(i).unwrap_or(0))
+            .collect()
+    })
+}
+
 /// Idempotent table drop for RAII cleanup guards (shared `mssql`).
 pub fn mssql_drop_table(name: &str) {
     mssql_exec(&format!(
