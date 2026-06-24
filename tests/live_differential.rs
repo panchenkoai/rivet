@@ -23,6 +23,7 @@
 
 mod common;
 use common::*;
+use mysql::prelude::Queryable;
 use proptest::prelude::*;
 
 /// Row count. Large enough that the export produces several chunk files and the
@@ -608,4 +609,130 @@ exports:
         !bad_out.join("_SUCCESS").exists(),
         "bad_exp must NOT write a _SUCCESS marker — that's how downstream tells it apart from a clean export"
     );
+}
+
+// ---- Engine variant: the same differential, but a MySQL source -------------
+// The batch write path is shared, so this exercises the MySQL source adapter's
+// chunked read against the same independent-reader fingerprint.
+
+struct DropMysql(String);
+impl Drop for DropMysql {
+    fn drop(&mut self) {
+        if let Ok(p) = mysql::Pool::new(MYSQL_URL)
+            && let Ok(mut c) = p.get_conn()
+        {
+            let _ = c.query_drop(format!("DROP TABLE IF EXISTS {}", self.0));
+        }
+    }
+}
+
+/// MySQL twin of [`seed_pg_n`] — same (id, n, big, c_text) shape, distinct values,
+/// c_text unique per row. Batched INSERTs (MySQL has no `generate_series`).
+fn seed_mysql_n(table: &str, rows: i64) {
+    let mut c = mysql::Pool::new(MYSQL_URL)
+        .expect("mysql pool")
+        .get_conn()
+        .expect("mysql conn");
+    c.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {table} (id BIGINT PRIMARY KEY, n INT NOT NULL, big BIGINT NOT NULL, c_text TEXT NOT NULL)"
+    ))
+    .unwrap();
+    let mut g = 0i64;
+    while g < rows {
+        let end = (g + 1000).min(rows);
+        let vals: Vec<String> = (g..end)
+            .map(|i| {
+                format!(
+                    "({i}, {}, {}, 'row-{i}')",
+                    ((i * 7) % 100000) - 50000,
+                    i * 1000003
+                )
+            })
+            .collect();
+        c.query_drop(format!("INSERT INTO {table} VALUES {}", vals.join(", ")))
+            .unwrap();
+        g = end;
+    }
+}
+
+/// MySQL twin of [`pg_fingerprint`]. `CAST(... AS SIGNED)` keeps every field an
+/// unambiguous i64 (MySQL `sum()` over BIGINT otherwise widens to DECIMAL).
+fn mysql_fingerprint(table: &str) -> Fingerprint {
+    let mut c = mysql::Pool::new(MYSQL_URL)
+        .expect("mysql pool")
+        .get_conn()
+        .expect("mysql conn");
+    let row: mysql::Row = c
+        .query_first(format!(
+            "SELECT CAST(count(*) AS SIGNED), CAST(sum(id) AS SIGNED), CAST(sum(n) AS SIGNED), \
+             CAST(sum(big) AS SIGNED), CAST(sum(length(c_text)) AS SIGNED), \
+             CAST(count(DISTINCT id) AS SIGNED), CAST(count(DISTINCT c_text) AS SIGNED) FROM {table}"
+        ))
+        .expect("mysql fingerprint query")
+        .expect("one row");
+    Fingerprint {
+        rows: row.get(0).unwrap(),
+        sum_id: row.get(1).unwrap(),
+        sum_n: row.get(2).unwrap(),
+        sum_big: row.get(3).unwrap(),
+        sum_text_len: row.get(4).unwrap(),
+        distinct_id: row.get(5).unwrap(),
+        distinct_text: row.get(6).unwrap(),
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 12, ..ProptestConfig::default() })]
+
+    /// Engine variant of the boundary-completeness harness: a MySQL source, chunked
+    /// export, fingerprinted by DuckDB against the MySQL source across random
+    /// (rows, chunk_size). Proves the MySQL adapter's chunked read loses nothing at
+    /// the boundaries the same way the PostgreSQL path is proven.
+    #[test]
+    #[ignore = "live+loaders: mysql + rivet-duckdb (nightly); reads via_duckdb"]
+    fn mysql_chunked_export_complete_across_boundaries_via_duckdb(
+        rows in 1i64..400,
+        chunk in 5i64..150,
+    ) {
+        require_alive(LiveService::Mysql);
+        require_alive(LiveService::DuckDb);
+        let table = unique_name("rivet_mybp");
+        let _g = DropMysql(table.clone());
+        seed_mysql_n(&table, rows);
+
+        let export = unique_name("mybp_exp");
+        let (host, container) = duckdb_shared_workdir(&unique_name("mybp_out"));
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            r#"source: {{type: mysql, url: "{MYSQL_URL}"}}
+exports:
+  - name: {export}
+    query: "SELECT id, n, big, c_text FROM {table}"
+    mode: chunked
+    chunk_column: id
+    chunk_size: {chunk}
+    format: parquet
+    destination: {{type: local, path: {dir}}}
+"#,
+            dir = host.display(),
+        );
+        let cfg = write_config(&cfg_dir, &yaml);
+        let run = run_rivet_export(&cfg, &export);
+        prop_assert!(
+            run.status.success(),
+            "rows={} chunk={}: mysql export failed:\n{}",
+            rows, chunk, String::from_utf8_lossy(&run.stderr)
+        );
+        make_shared_world_readable();
+
+        let src = mysql_fingerprint(&table);
+        let dst = duckdb_fingerprint(&format!("{container}/*.parquet"));
+        prop_assert_eq!(
+            &src, &dst,
+            "rows={} chunk={}: DuckDB's view disagrees with the MySQL source — a boundary lost or duped a row",
+            rows, chunk
+        );
+    }
 }
