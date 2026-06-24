@@ -229,6 +229,63 @@ services:
       timeout: 5s
       retries: 20
 
+  # ---- MySQL primary → replica (replica profile) ----------------------------
+  # Proves CDC can read a *replica's* binlog (the "no master access" case): the
+  # replica re-logs replicated changes into its own binlog via log_replica_updates,
+  # and rivet reads that. The test wires up replication at runtime (CHANGE
+  # REPLICATION SOURCE / START REPLICA). GTID so SOURCE_AUTO_POSITION=1 needs no
+  # manual coordinates. Ports: primary 3308, replica 3309.
+  mysql-primary:
+    image: mysql:8.0
+    profiles: ["replica"]
+    command:
+      - "--default-authentication-plugin=mysql_native_password"
+      - "--server-id=10"
+      - "--log-bin=binlog"
+      - "--binlog-format=ROW"
+      - "--gtid-mode=ON"
+      - "--enforce-gtid-consistency=ON"
+    environment:
+      MYSQL_ROOT_PASSWORD: rivet
+      MYSQL_USER: rivet
+      MYSQL_PASSWORD: rivet
+      MYSQL_DATABASE: rivet
+    ports:
+      - "3308:3306"
+    volumes:
+      - ./dev/cdc/replica-primary-init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-privet"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mysql-replica:
+    image: mysql:8.0
+    profiles: ["replica"]
+    command:
+      - "--default-authentication-plugin=mysql_native_password"
+      - "--server-id=11"
+      - "--log-bin=binlog"
+      - "--binlog-format=ROW"
+      - "--log-replica-updates=ON" # re-log replicated changes into the replica's own binlog
+      - "--gtid-mode=ON"
+      - "--enforce-gtid-consistency=ON"
+    environment:
+      MYSQL_ROOT_PASSWORD: rivet
+      MYSQL_USER: rivet
+      MYSQL_PASSWORD: rivet
+      MYSQL_DATABASE: rivet
+    ports:
+      - "3309:3306"
+    volumes:
+      - ./dev/cdc/replica-grant.sql:/docker-entrypoint-initdb.d/grant.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-privet"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   # ---- Legacy MySQL ---------------------------------------------------------
   # MySQL 5.7 is EOL (Oct 2023) but still widely deployed. Use mysql_native_password
   # as the default auth plugin so older clients (and the `mysql` Rust crate's
