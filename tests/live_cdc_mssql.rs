@@ -1,8 +1,9 @@
 //! Live SQL Server CDC regression — at-least-once resume.
 //!
-//! Gated `#[ignore]`: needs the docker `mssql` service with SQL Server Agent
-//! running (the capture job copies committed changes into `cdc.<instance>_CT`
-//! asynchronously) and CDC enabled. Run with:
+//! Gated `#[ignore]`: needs the dedicated `mssql-cdc` engine (the `cdc` profile,
+//! :1434) with SQL Server Agent running — the capture job copies committed changes
+//! into `cdc.<instance>_CT` asynchronously. Run with:
+//!     docker compose --profile cdc up -d mssql-cdc
 //!     cargo test --test live_cdc_mssql -- --ignored
 
 mod common;
@@ -18,11 +19,11 @@ static CDC_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Enable CDC on the database (idempotent) + the table, creating capture instance
 /// `ci`. The capture job (SQL Server Agent) then populates `cdc.<ci>_CT`.
 fn enable_cdc(table: &str, ci: &str) {
-    mssql_exec(
+    mssql_cdc_exec(
         "IF NOT EXISTS(SELECT 1 FROM sys.databases WHERE name='rivet' AND is_cdc_enabled=1) \
          EXEC sys.sp_cdc_enable_db;",
     );
-    mssql_exec(&format!(
+    mssql_cdc_exec(&format!(
         "EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'{table}', \
          @role_name=NULL, @capture_instance=N'{ci}';"
     ));
@@ -38,13 +39,13 @@ impl Drop for CdcTable {
     fn drop(&mut self) {
         let (table, ci) = (self.table.clone(), self.ci.clone());
         let _ = std::panic::catch_unwind(move || {
-            mssql_exec(&format!(
+            mssql_cdc_exec(&format!(
                 "IF EXISTS(SELECT 1 FROM cdc.change_tables ct JOIN sys.tables t \
                    ON ct.source_object_id=t.object_id WHERE t.name='{table}') \
                  EXEC sys.sp_cdc_disable_table @source_schema=N'dbo', @source_name=N'{table}', \
                  @capture_instance=N'{ci}';"
             ));
-            mssql_drop_table(&format!("dbo.{table}"));
+            mssql_cdc_drop_table(&format!("dbo.{table}"));
         });
     }
 }
@@ -53,7 +54,7 @@ impl Drop for CdcTable {
 /// table — the job runs asynchronously, so the test must wait for it.
 fn wait_for_capture(ci: &str, want: i64) {
     for _ in 0..60 {
-        if mssql_query_i64(&format!("SELECT COUNT(*) FROM cdc.{ci}_CT")) >= want {
+        if mssql_cdc_query_i64(&format!("SELECT COUNT(*) FROM cdc.{ci}_CT")) >= want {
             return;
         }
         std::thread::sleep(Duration::from_millis(500));
@@ -69,7 +70,7 @@ fn mssql_cdc_config(
     out: &std::path::Path,
 ) -> std::path::PathBuf {
     let yaml = format!(
-        r#"source: {{type: mssql, url: "{MSSQL_URL}"}}
+        r#"source: {{type: mssql, url: "{MSSQL_CDC_URL}"}}
 exports:
   - name: {table}
     table: {table}
@@ -109,8 +110,8 @@ fn mssql_cdc_resume_captures_only_new_changes() {
     let d = tempfile::tempdir().unwrap();
     let table = unique_name("rivet_cdc_ms");
     let ci = format!("dbo_{table}");
-    mssql_drop_table(&format!("dbo.{table}"));
-    mssql_exec(&format!(
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
         "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT)"
     ));
     enable_cdc(&table, &ci);
@@ -120,7 +121,7 @@ fn mssql_cdc_resume_captures_only_new_changes() {
     };
 
     let ckpt = d.path().join("cdc.ckpt");
-    mssql_exec(&format!("INSERT INTO dbo.{table} VALUES (1,10),(2,20)"));
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (1,10),(2,20)"));
     wait_for_capture(&ci, 2);
     let out1 = d.path().join("out1");
     std::fs::create_dir_all(&out1).unwrap();
@@ -129,7 +130,7 @@ fn mssql_cdc_resume_captures_only_new_changes() {
 
     // Resume: the checkpoint advanced past the first two, so run 2 must capture ONLY
     // the two new changes — not re-read all four from the change table's min LSN.
-    mssql_exec(&format!("INSERT INTO dbo.{table} VALUES (3,30),(4,40)"));
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (3,30),(4,40)"));
     wait_for_capture(&ci, 4);
     let out2 = d.path().join("out2");
     std::fs::create_dir_all(&out2).unwrap();
@@ -152,8 +153,8 @@ fn mssql_cdc_crash_before_checkpoint_re_reads_on_resume() {
     let d = tempfile::tempdir().unwrap();
     let table = unique_name("rivet_cdc_mscrash");
     let ci = format!("dbo_{table}");
-    mssql_drop_table(&format!("dbo.{table}"));
-    mssql_exec(&format!(
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
         "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT)"
     ));
     enable_cdc(&table, &ci);
@@ -164,7 +165,7 @@ fn mssql_cdc_crash_before_checkpoint_re_reads_on_resume() {
     let ckpt = d.path().join("cdc.ckpt");
 
     // Establish the checkpoint at the first two changes.
-    mssql_exec(&format!("INSERT INTO dbo.{table} VALUES (1,10),(2,20)"));
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (1,10),(2,20)"));
     wait_for_capture(&ci, 2);
     let out1 = d.path().join("out1");
     std::fs::create_dir_all(&out1).unwrap();
@@ -172,7 +173,7 @@ fn mssql_cdc_crash_before_checkpoint_re_reads_on_resume() {
     assert_eq!(manifest_rows(&out1), 2);
 
     // Two more changes; run crashes after the part is durable, before the checkpoint.
-    mssql_exec(&format!("INSERT INTO dbo.{table} VALUES (3,30),(4,40)"));
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (3,30),(4,40)"));
     wait_for_capture(&ci, 4);
     let crash_out = d.path().join("crash");
     std::fs::create_dir_all(&crash_out).unwrap();
@@ -214,8 +215,8 @@ fn mssql_cdc_datetimeoffset_value_is_preserved() {
     let d = tempfile::tempdir().unwrap();
     let table = unique_name("rivet_cdc_dto");
     let ci = format!("dbo_{table}");
-    mssql_drop_table(&format!("dbo.{table}"));
-    mssql_exec(&format!(
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
         "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, dto DATETIMEOFFSET)"
     ));
     enable_cdc(&table, &ci);
@@ -225,7 +226,7 @@ fn mssql_cdc_datetimeoffset_value_is_preserved() {
     };
     let ckpt = d.path().join("cdc.ckpt");
     // 10:00 at +05:30 is 04:30:00 UTC — the instant that must survive.
-    mssql_exec(&format!(
+    mssql_cdc_exec(&format!(
         "INSERT INTO dbo.{table} VALUES (1, '2026-06-23 10:00:00 +05:30')"
     ));
     wait_for_capture(&ci, 1);
@@ -292,8 +293,8 @@ fn mssql_cdc_uniqueidentifier_value_is_preserved() {
     let d = tempfile::tempdir().unwrap();
     let table = unique_name("rivet_cdc_uuid");
     let ci = format!("dbo_{table}");
-    mssql_drop_table(&format!("dbo.{table}"));
-    mssql_exec(&format!(
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
         "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, u UNIQUEIDENTIFIER)"
     ));
     enable_cdc(&table, &ci);
@@ -302,7 +303,7 @@ fn mssql_cdc_uniqueidentifier_value_is_preserved() {
         ci: ci.clone(),
     };
     let ckpt = d.path().join("cdc.ckpt");
-    mssql_exec(&format!(
+    mssql_cdc_exec(&format!(
         "INSERT INTO dbo.{table} VALUES (1, '12345678-1234-1234-1234-123456789012')"
     ));
     wait_for_capture(&ci, 1);
@@ -321,7 +322,7 @@ fn mssql_full_config(
     out: &std::path::Path,
 ) -> std::path::PathBuf {
     let yaml = format!(
-        r#"source: {{type: mssql, url: "{MSSQL_URL}", tls: {{accept_invalid_certs: true}}}}
+        r#"source: {{type: mssql, url: "{MSSQL_CDC_URL}", tls: {{accept_invalid_certs: true}}}}
 exports:
   - name: {table}_batch
     query: "SELECT * FROM dbo.{table}"
@@ -364,8 +365,8 @@ fn mssql_cdc_full_type_matrix_matches_batch() {
     let d = tempfile::tempdir().unwrap();
     let table = unique_name("rivet_cdc_matrix");
     let ci = format!("dbo_{table}");
-    mssql_drop_table(&format!("dbo.{table}"));
-    mssql_exec(&format!(
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
         "CREATE TABLE dbo.{table} (id INT PRIMARY KEY, big BIGINT, amount DECIMAL(18,4), \
          flag BIT, label VARCHAR(50), nlabel NVARCHAR(50), dt2 DATETIME2, dto DATETIMEOFFSET, \
          d DATE, t TIME, u UNIQUEIDENTIFIER, vb VARBINARY(16))"
@@ -376,7 +377,7 @@ fn mssql_cdc_full_type_matrix_matches_batch() {
         ci: ci.clone(),
     };
     let ckpt = d.path().join("cdc.ckpt");
-    mssql_exec(&format!(
+    mssql_cdc_exec(&format!(
         "INSERT INTO dbo.{table} VALUES (1, 9000000000000, 12345.6789, 1, 'hello', \
          N'cafe-unicode', '2026-06-23 10:00:00.1234567', '2026-06-23 10:00:00 +05:30', \
          '2026-06-23', '13:45:30.123456', '12345678-1234-1234-1234-123456789012', 0xDEADBEEF)"

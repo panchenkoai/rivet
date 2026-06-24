@@ -362,7 +362,8 @@ mod tests {
     fn cfg(capture_instance: &str) -> MssqlCdcConfig {
         MssqlCdcConfig {
             host: "127.0.0.1".into(),
-            port: 1433,
+            // The `mssql-cdc` instance (cdc profile, :1434) — SQL Server Agent on.
+            port: 1434,
             database: "rivet".into(),
             user: "sa".into(),
             password: "Rivet_Passw0rd!".into(),

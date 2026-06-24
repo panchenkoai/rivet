@@ -13,32 +13,32 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 use super::unique_name;
 
-async fn connect() -> Client<Compat<TcpStream>> {
+/// Connect to a SQL Server instance on `port` — `:1433` is the shared `mssql`
+/// service, `:1434` is the CDC-configured `mssql-cdc` (cdc profile).
+async fn connect_at(port: u16) -> Client<Compat<TcpStream>> {
     let mut config = Config::new();
     config.host("127.0.0.1");
-    config.port(1433);
+    config.port(port);
     config.database("rivet");
     config.authentication(AuthMethod::sql_server("sa", "Rivet_Passw0rd!"));
     config.encryption(EncryptionLevel::Required);
     config.trust_cert();
     let tcp = TcpStream::connect(config.get_addr())
         .await
-        .expect("mssql: tcp connect (is the `mssql` service up?)");
+        .expect("mssql: tcp connect (is the service up?)");
     tcp.set_nodelay(true).ok();
     Client::connect(config, tcp.compat_write())
         .await
         .expect("mssql: login")
 }
 
-/// Run T-SQL against the `rivet` database. `GO`-delimited batches run in order;
-/// statements within a batch run together. Panics on error (test setup).
-pub fn mssql_exec(sql: &str) {
+fn exec_at(port: u16, sql: &str) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("mssql: tokio runtime");
     rt.block_on(async {
-        let mut client = connect().await;
+        let mut client = connect_at(port).await;
         for batch in split_go(sql) {
             if batch.trim().is_empty() {
                 continue;
@@ -54,15 +54,13 @@ pub fn mssql_exec(sql: &str) {
     });
 }
 
-/// Run a scalar query and return the first column of the first row as `i64`
-/// (e.g. polling a CDC change table's row count while the capture job catches up).
-pub fn mssql_query_i64(sql: &str) -> i64 {
+fn query_i64_at(port: u16, sql: &str) -> i64 {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("mssql: tokio runtime");
     rt.block_on(async {
-        let mut client = connect().await;
+        let mut client = connect_at(port).await;
         let row = client
             .simple_query(sql)
             .await
@@ -75,9 +73,39 @@ pub fn mssql_query_i64(sql: &str) -> i64 {
     })
 }
 
-/// Idempotent table drop for RAII cleanup guards.
+/// Run T-SQL against the shared `mssql` (`:1433`). `GO`-delimited batches run in
+/// order; statements within a batch run together. Panics on error (test setup).
+pub fn mssql_exec(sql: &str) {
+    exec_at(1433, sql)
+}
+
+/// As [`mssql_exec`], but against the CDC `mssql-cdc` instance (`:1434`).
+pub fn mssql_cdc_exec(sql: &str) {
+    exec_at(1434, sql)
+}
+
+/// Scalar query → first column of the first row as `i64`, against the shared
+/// `mssql` (`:1433`).
+pub fn mssql_query_i64(sql: &str) -> i64 {
+    query_i64_at(1433, sql)
+}
+
+/// As [`mssql_query_i64`], but against `mssql-cdc` (`:1434`) — e.g. polling a CDC
+/// change table's row count while the capture job catches up.
+pub fn mssql_cdc_query_i64(sql: &str) -> i64 {
+    query_i64_at(1434, sql)
+}
+
+/// Idempotent table drop for RAII cleanup guards (shared `mssql`).
 pub fn mssql_drop_table(name: &str) {
     mssql_exec(&format!(
+        "IF OBJECT_ID('{name}','U') IS NOT NULL DROP TABLE {name}"
+    ));
+}
+
+/// Idempotent table drop against `mssql-cdc` (`:1434`).
+pub fn mssql_cdc_drop_table(name: &str) {
+    mssql_cdc_exec(&format!(
         "IF OBJECT_ID('{name}','U') IS NOT NULL DROP TABLE {name}"
     ));
 }

@@ -276,7 +276,8 @@ impl ChangeStream for MysqlChangeStream {
 mod tests {
     use super::*;
 
-    const URL: &str = "mysql://rivet:rivet@127.0.0.1:3306/rivet";
+    // The `mysql-cdc` instance (cdc profile, :3307) — binlog + a REPLICATION grant.
+    const URL: &str = "mysql://rivet:rivet@127.0.0.1:3307/rivet";
 
     #[test]
     #[ignore = "live: requires docker compose mysql (binlog_format=ROW)"]

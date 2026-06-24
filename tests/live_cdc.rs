@@ -2,9 +2,10 @@
 //! at-least-once resume (no gap, no dup) and the run being recorded in the state
 //! DB (metric + journal) like a batch export.
 //!
-//! Gated `#[ignore]` like the other `live_*` tests — needs the docker compose
-//! `mysql` (binlog ROW + a REPLICATION grant for the `rivet` user, which the dev
-//! stack already has). Run with:
+//! Gated `#[ignore]` like the other `live_*` tests — needs the dedicated CDC
+//! engines (the `cdc` profile: MySQL :3307 with a REPLICATION grant, PostgreSQL
+//! :5434 with `wal_level=logical`). Run with:
+//!     docker compose --profile cdc up -d postgres-cdc mysql-cdc
 //!     cargo test --test live_cdc -- --ignored
 
 mod common;
@@ -16,7 +17,7 @@ use mysql::prelude::Queryable;
 struct Table(String);
 impl Drop for Table {
     fn drop(&mut self) {
-        if let Ok(pool) = mysql::Pool::new(MYSQL_URL)
+        if let Ok(pool) = mysql::Pool::new(MYSQL_CDC_URL)
             && let Ok(mut c) = pool.get_conn()
         {
             let _ = c.query_drop(format!("DROP TABLE IF EXISTS {}", self.0));
@@ -25,7 +26,7 @@ impl Drop for Table {
 }
 
 fn conn() -> mysql::PooledConn {
-    mysql::Pool::new(MYSQL_URL)
+    mysql::Pool::new(MYSQL_CDC_URL)
         .expect("mysql pool")
         .get_conn()
         .expect("mysql conn")
@@ -59,7 +60,7 @@ fn cdc_config(
     out: &std::path::Path,
 ) -> std::path::PathBuf {
     let yaml = format!(
-        r#"source: {{type: mysql, url: "{MYSQL_URL}"}}
+        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
 exports:
   - name: {tbl}
     table: {tbl}
@@ -136,7 +137,7 @@ fn parquet_one_string(dir: &std::path::Path, col: &str) -> String {
 
 fn full_config(d: &tempfile::TempDir, tbl: &str, out: &std::path::Path) -> std::path::PathBuf {
     let yaml = format!(
-        r#"source: {{type: mysql, url: "{MYSQL_URL}"}}
+        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
 exports:
   - name: {tbl}_batch
     query: "SELECT * FROM {tbl}"
@@ -282,7 +283,7 @@ fn cdc_crash_after_flush_before_ack_re_reads_on_resume() {
 struct Slot(String);
 impl Drop for Slot {
     fn drop(&mut self) {
-        if let Ok(mut c) = postgres::Client::connect(POSTGRES_URL, postgres::NoTls) {
+        if let Ok(mut c) = postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls) {
             let _ = c.execute("SELECT pg_drop_replication_slot($1)", &[&self.0]);
         }
     }
@@ -295,7 +296,7 @@ fn pg_cdc_config(
     out: &std::path::Path,
 ) -> std::path::PathBuf {
     let yaml = format!(
-        r#"source: {{type: postgres, url: "{POSTGRES_URL}"}}
+        r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
 exports:
   - name: {tbl}
     table: {tbl}
@@ -316,7 +317,7 @@ fn pg_cdc_resume_captures_only_new_changes() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("rivet_cdc_pg");
     let slot = unique_name("rivet_regr_slot");
-    let mut c = postgres::Client::connect(POSTGRES_URL, NoTls).expect("connect postgres");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
     ))
@@ -361,7 +362,7 @@ fn pg_cdc_crash_after_flush_before_ack_does_not_advance_the_slot() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("rivet_cdc_pgcrash");
     let slot = unique_name("rivet_crash_slot");
-    let mut c = postgres::Client::connect(POSTGRES_URL, NoTls).expect("connect postgres");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
     ))
@@ -406,7 +407,7 @@ fn pg_cdc_crash_after_flush_before_ack_does_not_advance_the_slot() {
 
 fn pg_full_config(d: &tempfile::TempDir, tbl: &str, out: &std::path::Path) -> std::path::PathBuf {
     let yaml = format!(
-        r#"source: {{type: postgres, url: "{POSTGRES_URL}"}}
+        r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
 exports:
   - name: {tbl}_batch
     query: "SELECT * FROM {tbl}"
@@ -430,7 +431,7 @@ fn pg_cdc_column_types_match_batch_export() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("rivet_cdc_pgtypes");
     let slot = unique_name("rivet_types_slot");
-    let mut c = postgres::Client::connect(POSTGRES_URL, NoTls).expect("connect postgres");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id int, amount numeric(10,2), \
          meta jsonb, label text, ts timestamp, tstz timestamptz, u uuid)"

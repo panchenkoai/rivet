@@ -300,7 +300,8 @@ mod tests {
 
     // URL form (not key=value) so the require_tls_or_loopback gate recognises
     // 127.0.0.1 as loopback.
-    const CONN: &str = "postgresql://rivet:rivet@127.0.0.1:5432/rivet";
+    // The `postgres-cdc` instance (cdc profile, :5434) — wal_level=logical.
+    const CONN: &str = "postgresql://rivet:rivet@127.0.0.1:5434/rivet";
     const SLOT: &str = "rivet_cdc_test";
 
     #[test]
