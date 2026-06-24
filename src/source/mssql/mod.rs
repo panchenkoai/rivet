@@ -726,6 +726,10 @@ impl Source for MssqlSource {
         query: &str,
         column_overrides: &ColumnOverrides,
     ) -> Result<Vec<TypeMapping>> {
+        // Recover declared decimal precision/scale from `sys.columns` — the same
+        // catalog hint the full-export path applies — so a scan-free probe (CDC
+        // resolve, `rivet check`) resolves decimals identically to a batch export.
+        let decimal_hints = self.mssql_decimal_catalog_hints_opt(query);
         // Zero-row wrapper so the server returns column metadata without a scan.
         let wrapped = format!("SELECT * FROM ({query}) AS _rivet_q WHERE 1 = 0");
         let overrides = column_overrides.clone();
@@ -743,7 +747,11 @@ impl Source for MssqlSource {
                 .unwrap_or_default();
             // Drain so the connection is reusable.
             let _ = stream.into_first_result().await;
-            Ok(arrow_convert::mssql_type_mappings(&columns, &overrides))
+            Ok(arrow_convert::mssql_type_mappings(
+                &columns,
+                &overrides,
+                decimal_hints.as_ref(),
+            ))
         })
     }
 
