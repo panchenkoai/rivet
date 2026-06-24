@@ -409,3 +409,52 @@ fn mssql_cdc_full_type_matrix_matches_batch() {
     // CDC adds its change-metadata columns the batch export doesn't have.
     assert!(cdc.schema().index_of("__op").is_ok() && cdc.schema().index_of("__pos").is_ok());
 }
+
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_resume_past_retention_errors_not_a_silent_gap() {
+    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    // If the resume LSN has fallen below the change table's min (the cleanup job
+    // removed it), resuming from min would silently SKIP the cleaned-up changes. The
+    // adapter must fail loudly (prompting a re-snapshot), never hide the gap.
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("rivet_cdc_stale");
+    let ci = format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT)"
+    ));
+    enable_cdc(&table, &ci);
+    let _guard = CdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (1,10)"));
+    wait_for_capture(&ci, 1);
+
+    // A checkpoint whose LSN is far below the change table's min — what a checkpoint
+    // older than retention looks like after the cleanup job runs.
+    let ckpt = d.path().join("cdc.ckpt");
+    std::fs::write(&ckpt, r#"{"lsn":"00000000000000000001"}"#).unwrap();
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let res = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            mssql_cdc_config(&d, &table, &ci, &ckpt, &out)
+                .to_str()
+                .unwrap(),
+        ])
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        !res.status.success(),
+        "a resume past retention must fail, not silently skip the gap"
+    );
+    let stderr = String::from_utf8_lossy(&res.stderr);
+    assert!(
+        stderr.contains("older than") && stderr.contains("re-snapshot"),
+        "the error must name the retention gap + the re-snapshot remedy, got:\n{stderr}"
+    );
+}

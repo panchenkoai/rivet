@@ -153,8 +153,12 @@ impl MssqlChangeStream {
         // change table's min LSN. The guard skips the query when there is nothing
         // new (`@from > @to`) or nothing captured yet (NULL LSNs) — calling
         // `fn_cdc_get_all_changes` with those raises an error rather than 0 rows.
-        // `@from` is clamped to the min LSN so a checkpoint older than retention
-        // falls back to the earliest available change instead of erroring.
+        //
+        // If the resume LSN has fallen BELOW the min LSN, the cleanup job removed
+        // the changes between them — resuming from min would silently skip them. So
+        // we THROW instead, forcing a re-snapshot, rather than hide a gap. (First run
+        // sets `@from = @min`, so `@from < @min` is false there — only a stale resume
+        // checkpoint trips it.)
         let from_expr = match from_lsn {
             Some(hex) => format!("sys.fn_cdc_increment_lsn(0x{hex})"),
             None => format!("sys.fn_cdc_get_min_lsn('{ci}')", ci = capture_instance),
@@ -163,7 +167,10 @@ impl MssqlChangeStream {
             "DECLARE @from binary(10) = {from_expr}; \
              DECLARE @min binary(10) = sys.fn_cdc_get_min_lsn('{ci}'); \
              DECLARE @to binary(10) = sys.fn_cdc_get_max_lsn(); \
-             IF @from IS NULL OR @from < @min SET @from = @min; \
+             IF @from IS NOT NULL AND @min IS NOT NULL AND @from < @min \
+                THROW 51000, 'rivet cdc: the resume position is older than the SQL Server \
+CDC change-table retention (the cleanup job removed it). Resuming would silently skip changes \
+— re-snapshot the table (mode: full) and restart CDC from a fresh checkpoint.', 1; \
              IF @from IS NOT NULL AND @to IS NOT NULL AND @from <= @to \
                 SELECT * FROM cdc.fn_cdc_get_all_changes_{ci}(@from, @to, N'all') \
                 ORDER BY __$start_lsn, __$seqval;",
