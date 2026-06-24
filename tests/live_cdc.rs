@@ -230,6 +230,99 @@ fn cdc_captures_json_as_valid_json() {
 }
 
 #[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_picks_up_a_column_added_between_runs() {
+    // Schema-drift harness: the sink resolves the table schema at the START of each
+    // run, so a column added *between* runs is captured on the next run. (Within a
+    // single run the schema is frozen at the first flush — that's the documented
+    // limitation; run-to-run re-resolution is how drift is actually handled.)
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_cdc_drift");
+    let _drop = Table(tbl.clone());
+    let mut c = conn();
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let ckpt = d.path().join("cdc.ckpt");
+    write_checkpoint(&mut c, &ckpt);
+
+    // Run 1: capture a row under the original (id, v) schema.
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1, 10)"))
+        .unwrap();
+    let out1 = d.path().join("out1");
+    std::fs::create_dir_all(&out1).unwrap();
+    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out1));
+    let f1: std::collections::HashMap<_, _> = parquet_fields(&out1).into_iter().collect();
+    assert!(!f1.contains_key("w"), "run 1 predates the added column");
+
+    // Add a column, then a row that uses it.
+    c.query_drop(format!("ALTER TABLE {tbl} ADD COLUMN w VARCHAR(20)"))
+        .unwrap();
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (2, 20, 'hello')"))
+        .unwrap();
+
+    // Run 2 (resume): re-resolves the schema → the new column is captured.
+    let out2 = d.path().join("out2");
+    std::fs::create_dir_all(&out2).unwrap();
+    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out2));
+    let f2: std::collections::HashMap<_, _> = parquet_fields(&out2).into_iter().collect();
+    assert!(
+        f2.contains_key("w"),
+        "run 2 must re-resolve and pick up the column added between runs"
+    );
+    assert_eq!(parquet_one_string(&out2, "w"), "hello");
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_throughput_drains_a_large_backlog() {
+    // Lag/throughput harness (#6): rivet exposes no replication-lag metric (a
+    // documented limitation), so this measures the next best proxy — how fast a
+    // backlog drains — and logs rows/s. It's also the only CDC test at non-trivial
+    // scale (the others use tiny fixtures), so it doubles as a correctness-at-scale
+    // check: every one of N changes must be captured.
+    const N: i64 = 5_000;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_cdc_bench");
+    let _drop = Table(tbl.clone());
+    let mut c = conn();
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let ckpt = d.path().join("cdc.ckpt");
+    write_checkpoint(&mut c, &ckpt);
+
+    // Seed N changes (1000-row INSERT batches).
+    let mut id = 0;
+    while id < N {
+        let end = (id + 1000).min(N);
+        let vals: Vec<String> = (id..end).map(|i| format!("({i},{i})")).collect();
+        c.query_drop(format!("INSERT INTO {tbl} VALUES {}", vals.join(",")))
+            .unwrap();
+        id = end;
+    }
+
+    // Drain the backlog, timed.
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let t = std::time::Instant::now();
+    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out));
+    let secs = t.elapsed().as_secs_f64();
+
+    // Correctness at scale: nothing dropped under volume.
+    assert_eq!(manifest_rows(&out), N, "all {N} changes must be captured");
+
+    // Throughput: logged for trend-watching, plus a generous wall-clock ceiling so
+    // a catastrophic perf regression fails the test without machine-variance flake.
+    eprintln!(
+        "CDC throughput: {N} changes drained in {secs:.2}s = {:.0} rows/s",
+        N as f64 / secs
+    );
+    assert!(
+        secs < 60.0,
+        "draining {N} changes took {secs:.1}s (>60s — perf regression?)"
+    );
+}
+
+#[test]
 #[ignore = "live: requires docker compose mysql (binlog ROW + REPLICATION grant)"]
 fn cdc_crash_after_flush_before_ack_re_reads_on_resume() {
     // The at-least-once guarantee under a crash: the durable sequence is

@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.14.1 (2026-06-24) — SQL Server CDC retention fix + recovery docs
+
+A patch on 0.14.0: one real data-loss fix on the SQL Server CDC resume path, plus the
+operator-facing "what happens when X fails" documentation the CDC reference was missing.
+
+### Fixed
+
+- **`fix(cdc)` — SQL Server CDC resume past retention no longer silently skips changes.** When the
+  saved LSN had fallen below the change table's min LSN (the cleanup job removed the changes after
+  it), the poll silently clamped to min and resumed — skipping the cleaned-up changes with **no
+  error**. It now `THROW`s (*"the resume position is older than the change-table retention …
+  re-snapshot"*), so the gap is recovered by a fresh snapshot rather than hidden. First run
+  (`from = min`) is unaffected; only a stale resume checkpoint trips it. Regression test added (a
+  below-min checkpoint must error, not skip).
+
+### Docs
+
+- **CDC failure modes & recovery** (`docs/reference/cdc.md`): the shared flush → checkpoint → ack
+  model (at-least-once; dedupe by primary key + `__op`; a partial run leaves no `_SUCCESS`), then
+  per engine — PostgreSQL slot/disk (an abandoned slot pins WAL; `max_slot_wal_keep_size` bounds
+  it), MySQL purged binlog (ERROR 1236 → re-snapshot), SQL Server retention + a stopped Agent.
+- **Reading from a replica** (no primary access), per engine: MySQL (`log_replica_updates`),
+  PostgreSQL 16+ (logical decoding on a standby), SQL Server Always On readable secondary.
+
+### Internal
+
+- CDC test harnesses (property: replaying the captured changes reconstructs the source, and the
+  same under a mid-flight crash; schema-drift; read-from-a-replica; oracle round-trip via DuckDB +
+  ClickHouse; throughput/scale) and generative batch differential harnesses (boundary completeness,
+  crash-resume, multi-export isolation, CSV escaping, MySQL + SQL Server engine variants); plus a
+  unit test for the durable-sequence failure branch (flush error ⇒ no checkpoint/ack).
+- Bench: a declarative row-size RSS sweep and a PostgreSQL cross-tool **DB-harm matrix** (snapshot
+  hold-time + peak backends across rivet, ingestr, sling, duckdb, odbc2parquet).
+- CI: nightly now starts Azurite — it was missing, so the azure-multipart test failed the whole
+  suite every night.
+
 ## 0.14.0 (2026-06-24) — change data capture to files (Epic 15)
 
 Rivet learns to read the source's transaction log. Beyond batch snapshots, it now captures

@@ -69,7 +69,7 @@ jobs:
         # them the `--ignored` run fails 13 tests with `No such object:
         # rivet-duckdb` / `ClickHouse reachable on 127.0.0.1:8123` (pyarrow_*
         # cases also go through the shared rivet-duckdb exec helper).
-        run: docker compose --profile pool --profile loaders --profile cdc up -d postgres mysql mssql minio fake-gcs azurite toxiproxy pgbouncer proxysql duckdb clickhouse postgres-cdc mysql-cdc mssql-cdc
+        run: docker compose --profile pool --profile loaders --profile cdc --profile replica up -d postgres mysql mssql minio fake-gcs azurite toxiproxy pgbouncer proxysql duckdb clickhouse postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica
 
       - name: Wait for services
         run: |

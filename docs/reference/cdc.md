@@ -226,6 +226,32 @@ Notes:
 
 ---
 
+## Reading from a replica (no primary access)
+
+A common real-world constraint: you're handed a database but **only a read
+replica**, never the master. Rivet reads the **log of whatever host you point
+`source.url` at** — it never needs the primary *specifically*. Whether a replica
+can serve that log is an engine + replica-config question, not a rivet limitation:
+
+| engine | from a replica? | what the replica needs |
+| --- | --- | --- |
+| **MySQL** | ✅ yes | `log_bin = ON` **and `log_replica_updates = ON`** (`log_slave_updates` pre-8.0) so the replica re-logs replicated changes into its *own* binlog — this is **off by default**: a replica applies changes but does not re-log them without it. Plus the `REPLICATION SLAVE` / `REPLICATION CLIENT` grant and a `server_id` distinct from both the primary and the replica. |
+| **PostgreSQL** | ⚠️ PG **16+** only | Logical decoding on a standby is a PostgreSQL 16 feature. On < 16 a logical slot can only be created on the primary — rivet's slot creation fails (PostgreSQL refuses logical decoding *"while in recovery"*). On 16+, set `hot_standby_feedback = on` on the standby (or a physical `primary_slot_name`) so the primary doesn't recycle WAL the standby's slot still needs. |
+| **SQL Server** | ✅ yes (readable secondary) | CDC is enabled on the **primary**; the `cdc.*` change tables are ordinary tables in the database, so they **replicate to an Always On readable secondary**. Point rivet at the secondary — the reads are plain `SELECT`s on the replicated change tables. The capture job still runs on the primary; LSNs are consistent across the availability group. |
+
+**MySQL caveat — the checkpoint is replica-local.** Rivet resumes by binlog
+`{file, pos}` (not GTID), and a replica's binlog coordinates are its *own*, not the
+primary's. A checkpoint taken against one replica does **not** transfer to another
+host: if you fail over (to a different replica, or to the primary), re-snapshot
+(`mode: full`) and restart CDC from a fresh checkpoint there.
+
+So the answer to "can I read the log from a slave?" is **yes for MySQL (with
+`log_replica_updates`) and SQL Server (readable secondary), and PostgreSQL 16+** —
+point `source.url` at the replica; everything else (grants, `mode: cdc`, output) is
+identical to running against a primary.
+
+---
+
 ## Output shape
 
 `--output` writes one row per change in the **typed after-image (upsert)** shape:
@@ -291,6 +317,69 @@ lags (PG slots pin WAL; MySQL keeps binlog until read). SQL Server is the
 exception: its Agent **writes** changes into change tables (extra write volume +
 storage), so CDC there trades read-contention for an ongoing write/storage
 overhead.
+
+## Failure modes & recovery
+
+Every CDC run is **bounded and resumable**, and the durable sequence is
+flush → checkpoint → ack: the resume position only advances **after** the part is
+durably written. So on *any* failure — a dropped connection, a query error, a full
+source disk — the run **fails loudly** (non-zero exit, with the per-engine setup
+hint), the checkpoint/slot is **not advanced**, and the **next run re-reads** from
+the last good position. Rivet never silently loses a change; the trade-off is
+at-least-once, so a failed run's already-uploaded parts can reappear — **dedupe
+downstream by primary key + `__op`** (the output is the upsert / after-image shape).
+
+A failed run leaves its durable parts in the destination but **no `manifest.json` /
+`_SUCCESS`** — that pair marks a *clean* end, so a missing `_SUCCESS` is how you (and
+`rivet validate`) tell a partial run from a complete one.
+
+### PostgreSQL — the slot fills / the source disk fills
+
+A logical slot pins WAL until rivet advances it (`confirmed_flush_lsn`). The
+behaviour depends on whether rivet is **running**:
+
+- **Running + advancing** — each successful run reads the changes, writes them
+  durably, then advances the slot, so PostgreSQL **releases the WAL** up to that
+  point. The slot only ever holds the WAL *since the last advance* — it does not
+  grow unbounded while rivet keeps the slot moving.
+- **Stopped (abandoned slot)** — rivet does nothing (it isn't running); the slot
+  keeps pinning WAL and the **source disk fills**. This is the number-one
+  PostgreSQL CDC foot-gun, and it is *operator* responsibility:
+  `SELECT pg_drop_replication_slot('rivet_slot');` when you stop capturing for good.
+- **Source disk already full** — run rivet (it *reads* WAL to advance the slot,
+  which **releases** WAL and relieves the pressure) or drop the slot. If PostgreSQL
+  is too degraded to answer, rivet's query fails → the run fails → re-read next run.
+
+**Bound the blast radius:** set `max_slot_wal_keep_size` (PG 13+). PostgreSQL then
+**invalidates the slot** rather than fill the disk; rivet's next run fails with a
+slot-invalidated error and you re-snapshot. **Monitor** `pg_replication_slots`
+(`active`, and `restart_lsn` vs the current LSN = how much WAL the slot is holding).
+
+### MySQL — the binlog was purged
+
+If rivet is offline long enough that the saved binlog position is **purged**
+(`binlog_expire_logs_seconds` / `PURGE BINARY LOGS`), the resume read fails with
+MySQL **ERROR 1236** (the requested binlog file is gone). The position is
+unrecoverable — **re-snapshot** (`mode: full`) and restart CDC from a fresh
+checkpoint. Size binlog retention comfortably above your CDC cadence.
+
+### SQL Server — the checkpoint fell below retention
+
+If the saved LSN falls **below** `sys.fn_cdc_get_min_lsn()` (the cleanup job — ~3
+days by default — removed the changes after it), rivet **fails loudly** — *"the
+resume position is older than the change-table retention … re-snapshot"* — rather
+than resume from the new min and **silently skip the gap**. Re-snapshot and restart
+from a fresh checkpoint. Also watch for a **non-advancing `sys.fn_cdc_get_max_lsn()`**:
+that means the **Agent capture job stopped**, so the change tables are frozen — read
+"no rows" as "the job is down", not "no changes".
+
+### Recovery, in one line
+
+Re-run to resume from the last checkpoint (the common case). If the run reports the
+position is unrecoverable (PostgreSQL slot invalidated, MySQL binlog purged, SQL
+Server retention exceeded), **re-snapshot the table with `mode: full` and restart
+CDC from a new checkpoint** — the only safe recovery once the source log no longer
+covers the gap.
 
 ## Limitations (current)
 
