@@ -421,14 +421,12 @@ exports:
 
 #[test]
 #[ignore = "live: requires docker compose postgres (wal_level=logical)"]
-fn pg_cdc_column_types_match_batch_except_tz_aware_timestamps() {
-    use arrow::datatypes::DataType;
+fn pg_cdc_column_types_match_batch_export() {
     use postgres::NoTls;
-    // Type parity with the batch export for every column whose Arrow type the sink can
-    // build — int, numeric, jsonb, text, NAIVE timestamp, uuid all match. The one
-    // documented divergence is `timestamptz`: the CDC value model is naive, so a
-    // tz-aware column rides as text (Utf8) rather than a lossy naive cast that would
-    // drop the zone (CLAUDE.md naive-instant rule); the batch path keeps it tz-typed.
+    // FULL type parity with the batch export — every column, including the tz-aware
+    // `timestamptz`, lands with the identical Arrow type a `mode: full` export
+    // produces. (timestamptz is carried as the UTC instant + zone label, exactly like
+    // batch — see docs/reference/cdc-type-parity.md.)
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("rivet_cdc_pgtypes");
     let slot = unique_name("rivet_types_slot");
@@ -463,24 +461,13 @@ fn pg_cdc_column_types_match_batch_except_tz_aware_timestamps() {
 
     let cdc: std::collections::HashMap<_, _> = parquet_fields(&cdc_out).into_iter().collect();
     let batch: std::collections::HashMap<_, _> = parquet_fields(&batch_out).into_iter().collect();
-    for col in ["id", "amount", "meta", "label", "ts", "u"] {
+    for col in ["id", "amount", "meta", "label", "ts", "tstz", "u"] {
         assert_eq!(
             cdc.get(col),
             batch.get(col),
-            "column {col}: CDC type must match the batch export"
+            "column {col}: CDC type must match the batch export (full parity)"
         );
     }
-    // The documented divergence — intentional, not a regression.
-    assert_eq!(
-        cdc.get("tstz"),
-        Some(&DataType::Utf8),
-        "timestamptz rides as text in CDC (safe: naive value model can't carry the zone)"
-    );
-    assert!(
-        matches!(batch.get("tstz"), Some(DataType::Timestamp(_, Some(_)))),
-        "...while the batch export keeps it tz-typed: {:?}",
-        batch.get("tstz")
-    );
 }
 
 #[test]

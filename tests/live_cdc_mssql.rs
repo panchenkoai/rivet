@@ -204,37 +204,13 @@ fn mssql_cdc_crash_before_checkpoint_re_reads_on_resume() {
     );
 }
 
-/// The single string value under `col` in the one `.parquet` part.
-fn parquet_one_string(dir: &std::path::Path, col: &str) -> String {
-    use arrow::array::{Array, StringArray};
-    let part = std::fs::read_dir(dir)
-        .unwrap()
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .find(|p| p.extension().is_some_and(|x| x == "parquet"))
-        .expect("a .parquet part");
-    let f = std::fs::File::open(part).unwrap();
-    let mut r = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
-        .unwrap()
-        .build()
-        .unwrap();
-    let batch = r.next().expect("a row").unwrap();
-    let idx = batch.schema().index_of(col).expect("column present");
-    batch
-        .column(idx)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .expect("string column")
-        .value(0)
-        .to_string()
-}
-
 #[test]
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
 fn mssql_cdc_datetimeoffset_value_is_preserved() {
     let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    // datetimeoffset is tz-aware: it must be captured (as the UTC instant in text),
-    // never silently dropped. The adapter used to try_get it as NaiveDateTime — the
-    // wrong type — which returned None → an empty/null value (data loss).
+    // datetimeoffset is tz-aware: it must land as a tz-aware Timestamp carrying the
+    // UTC instant — identical to the batch export (parity) — never silently dropped.
+    // The adapter used to try_get it as NaiveDateTime (wrong type) → None → NULL.
     let d = tempfile::tempdir().unwrap();
     let table = unique_name("rivet_cdc_dto");
     let ci = format!("dbo_{table}");
@@ -257,13 +233,35 @@ fn mssql_cdc_datetimeoffset_value_is_preserved() {
     std::fs::create_dir_all(&out).unwrap();
     run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out));
 
-    // Lossless: the local time + its offset both survive (RFC3339), so the UTC
-    // instant (04:30) is recoverable and the zone is never silently dropped.
-    let dto = parquet_one_string(&out, "dto");
+    // tz-aware Timestamp carrying the UTC instant (10:00 +05:30 → 04:30:00 UTC).
+    let dto = parquet_one_timestamp(&out, "dto");
     assert!(
-        dto.contains("10:00:00+05:30"),
-        "datetimeoffset must be captured losslessly with its zone, not dropped — got {dto:?}"
+        dto.starts_with("2026-06-23 04:30:00"),
+        "datetimeoffset must be captured as the 04:30 UTC instant — got {dto:?}"
     );
+}
+
+/// The first row's `col` (a Timestamp(µs)) as its UTC `NaiveDateTime` string.
+fn parquet_one_timestamp(dir: &std::path::Path, col: &str) -> String {
+    use arrow::array::{AsArray, types::TimestampMicrosecondType};
+    let part = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "parquet"))
+        .expect("a .parquet part");
+    let f = std::fs::File::open(part).unwrap();
+    let mut r = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
+        .unwrap()
+        .build()
+        .unwrap();
+    let batch = r.next().expect("a row").unwrap();
+    let idx = batch.schema().index_of(col).expect("column present");
+    batch
+        .column(idx)
+        .as_primitive::<TimestampMicrosecondType>()
+        .value_as_datetime(0)
+        .expect("a non-null instant")
+        .to_string()
 }
 
 /// Whether the first row's `col` is non-null in the one `.parquet` part.

@@ -263,16 +263,14 @@ fn cell_to_rivet(row: &Row, idx: usize, data: &ColumnData<'_>) -> RivetValue {
             RivetValue::Bytes(numeric_to_decimal_string(n.value(), n.scale()).into_bytes())
         }
         // datetimeoffset is tz-aware — `try_get::<NaiveDateTime>` is the *wrong* type
-        // and returns None (silent data loss). Read the UTC instant and carry it as
-        // unambiguous RFC3339 text (the resolved column coarsens tz-aware to Utf8, so
-        // text is the lossless representation — never a naive cast that drops the zone).
+        // and returns None (silent data loss). Read it as FixedOffset and carry its UTC
+        // instant; the resolved column is a tz-aware Timestamp, so the sink writes it
+        // identically to the batch export (parity) with the zone preserved.
         ColumnData::DateTimeOffset(_) => row
             .try_get::<chrono::DateTime<chrono::FixedOffset>, _>(idx)
             .ok()
             .flatten()
-            .map_or(RivetValue::Null, |dt| {
-                RivetValue::Bytes(dt.to_rfc3339().into_bytes())
-            }),
+            .map_or(RivetValue::Null, |dt| RivetValue::DateTime(dt.naive_utc())),
         ColumnData::DateTime(_) | ColumnData::DateTime2(_) | ColumnData::SmallDateTime(_) => row
             .try_get::<NaiveDateTime, _>(idx)
             .ok()

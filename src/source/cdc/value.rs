@@ -132,7 +132,10 @@ pub(crate) fn is_buildable(dt: &DataType) -> bool {
             | DataType::Binary
             | DataType::LargeBinary
             | DataType::FixedSizeBinary(_)
-            | DataType::Timestamp(TimeUnit::Microsecond, None)
+            // Both naive (datetime/datetime2/PG timestamp) and tz-aware
+            // (datetimeoffset/PG timestamptz) — the latter as the UTC instant + the
+            // column's zone label, matching the batch export (full type parity).
+            | DataType::Timestamp(TimeUnit::Microsecond, _)
     )
 }
 
@@ -228,7 +231,10 @@ pub(crate) fn build_column(dt: &DataType, cells: &[Option<&RivetValue>]) -> Resu
             }
             Arc::new(b.finish())
         }
-        DataType::Timestamp(TimeUnit::Microsecond, None) => {
+        DataType::Timestamp(TimeUnit::Microsecond, tz) => {
+            // The `DateTime` is the UTC instant; a tz-aware column carries it with its
+            // zone label so it lands identically to the batch export (parity), never a
+            // naive cast that drops the zone.
             let mut b = TimestampMicrosecondBuilder::with_capacity(cells.len());
             for c in cells {
                 match c {
@@ -236,7 +242,11 @@ pub(crate) fn build_column(dt: &DataType, cells: &[Option<&RivetValue>]) -> Resu
                     _ => b.append_null(),
                 }
             }
-            Arc::new(b.finish())
+            let arr = b.finish();
+            match tz {
+                Some(tz) => Arc::new(arr.with_timezone(tz.clone())),
+                None => Arc::new(arr),
+            }
         }
         DataType::Time64(TimeUnit::Microsecond) => {
             let mut b = Time64MicrosecondBuilder::with_capacity(cells.len());
@@ -445,6 +455,7 @@ mod tests {
             DataType::LargeBinary,
             DataType::FixedSizeBinary(16),
             DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
         ];
         for dt in &buildable {
             assert!(is_buildable(dt), "is_buildable must accept {dt:?}");
