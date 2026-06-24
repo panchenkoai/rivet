@@ -1,11 +1,11 @@
-//! Property-based CDC harness — the fundamental CDC correctness invariant:
-//! **replaying the captured changes reconstructs the source's final state.**
+//! Property-based CDC harness — the fundamental CDC correctness invariants,
+//! generatively, over random op sequences:
 //!
-//! proptest generates a random sequence of upserts/deletes on a small key space
-//! (so updates and deletes overlap), applies it to MySQL, captures it via CDC, then
-//! replays the `__op` rows (insert/update → upsert, delete → remove) into a model
-//! and asserts the model equals the source table. Over many generated sequences
-//! this catches whole classes of capture/ordering bugs a single example can't.
+//! 1. `cdc_replay_reconstructs_source` — replaying the captured changes (MERGE by
+//!    PK + `__op`) reconstructs the source table's final state.
+//! 2. `cdc_replay_reconstructs_after_a_crash` — the same, but the first capture is
+//!    crashed mid-flight (before the checkpoint advances); the resume re-reads and
+//!    still reconstructs. The at-least-once guarantee, generatively.
 //!
 //! Gated `#[ignore]`: needs the `cdc` profile's `mysql-cdc` (:3307). Run with:
 //!     docker compose --profile cdc up -d mysql-cdc
@@ -35,23 +35,21 @@ fn op_strategy() -> impl Strategy<Value = Op> {
     ]
 }
 
-/// A `server_id` outside `live_cdc.rs`'s `server_id_for` range (10_000..60_000) so
-/// this harness's binlog connection never collides with the other CDC tests.
-const SERVER_ID: u32 = 9_999;
-
 fn cdc_config(
     d: &tempfile::TempDir,
+    table: &str,
+    server_id: u32,
     ckpt: &std::path::Path,
     out: &std::path::Path,
 ) -> std::path::PathBuf {
     let yaml = format!(
         r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
 exports:
-  - name: cdc_prop
-    table: cdc_prop
+  - name: {table}
+    table: {table}
     mode: cdc
     format: parquet
-    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {SERVER_ID} }}
+    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {server_id} }}
     destination: {{ type: local, path: "{out}" }}
 "#,
         ckpt = ckpt.display(),
@@ -60,7 +58,51 @@ exports:
     write_config(d, &yaml)
 }
 
-/// Read the captured changes as `(__op, id, v)`, in file order (= `__pos` order).
+/// Clear `table`, checkpoint at the current binlog position, then apply `ops` and
+/// return the temp dir, the checkpoint path, and the source's expected final state.
+fn setup_and_apply(
+    table: &str,
+    ops: &[Op],
+) -> (tempfile::TempDir, std::path::PathBuf, HashMap<u32, i32>) {
+    let mut c = mysql::Pool::new(MYSQL_CDC_URL)
+        .expect("mysql-cdc pool")
+        .get_conn()
+        .expect("conn");
+    c.query_drop(format!(
+        "CREATE TABLE IF NOT EXISTS {table} (id INT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    c.query_drop(format!("DELETE FROM {table}")).unwrap();
+
+    // Checkpoint AFTER clearing, so the capture sees only this case's ops.
+    let d = tempfile::tempdir().unwrap();
+    let ckpt = d.path().join("ckpt");
+    let row: mysql::Row = c.query_first("SHOW MASTER STATUS").unwrap().unwrap();
+    let (file, pos): (String, u64) = (row.get(0).unwrap(), row.get(1).unwrap());
+    std::fs::write(&ckpt, format!(r#"{{"file":"{file}","pos":{pos}}}"#)).unwrap();
+
+    let mut expected: HashMap<u32, i32> = HashMap::new();
+    for op in ops {
+        match *op {
+            Op::Upsert(id, v) => {
+                c.exec_drop(
+                    format!("INSERT INTO {table} (id, v) VALUES (?, ?) ON DUPLICATE KEY UPDATE v = VALUES(v)"),
+                    (id, v),
+                )
+                .unwrap();
+                expected.insert(id, v);
+            }
+            Op::Delete(id) => {
+                c.exec_drop(format!("DELETE FROM {table} WHERE id = ?"), (id,))
+                    .unwrap();
+                expected.remove(&id);
+            }
+        }
+    }
+    (d, ckpt, expected)
+}
+
+/// Read the captured changes as `(__op, id, v)` in file order (= `__pos` order).
 fn read_cdc_rows(dir: &std::path::Path) -> Vec<(String, i32, Option<i32>)> {
     use arrow::array::{Array, Int32Array, StringArray};
     let Some(part) = std::fs::read_dir(dir)
@@ -93,70 +135,77 @@ fn read_cdc_rows(dir: &std::path::Path) -> Vec<(String, i32, Option<i32>)> {
     out
 }
 
+/// Replay captured `(__op, id, v)` rows the way a downstream MERGE would.
+fn replay(rows: Vec<(String, i32, Option<i32>)>) -> HashMap<u32, i32> {
+    let mut m = HashMap::new();
+    for (op, id, v) in rows {
+        match op.as_str() {
+            "insert" | "update" => {
+                m.insert(id as u32, v.expect("insert/update carries v"));
+            }
+            "delete" => {
+                m.remove(&(id as u32));
+            }
+            other => panic!("unexpected __op {other:?}"),
+        }
+    }
+    m
+}
+
+fn run_cdc(cfg: &std::path::Path, crash: bool) -> std::process::Output {
+    let mut cmd = std::process::Command::new(RIVET_BIN);
+    cmd.args(["run", "--config", cfg.to_str().unwrap()]);
+    if crash {
+        cmd.env("RIVET_TEST_PANIC_AT", "cdc_after_flush_before_ack");
+    }
+    cmd.output().expect("spawn rivet")
+}
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: 24, ..ProptestConfig::default() })]
 
     #[test]
     #[ignore = "live: requires docker compose --profile cdc mysql-cdc (:3307)"]
     fn cdc_replay_reconstructs_source(ops in prop::collection::vec(op_strategy(), 1..40)) {
-        let pool = mysql::Pool::new(MYSQL_CDC_URL).expect("mysql-cdc pool");
-        let mut c = pool.get_conn().expect("conn");
-        c.query_drop("CREATE TABLE IF NOT EXISTS cdc_prop (id INT PRIMARY KEY, v INT)").unwrap();
-        c.query_drop("DELETE FROM cdc_prop").unwrap();
-
-        // Checkpoint at the current position (AFTER clearing) so the capture sees
-        // only this case's ops, not the clear.
-        let d = tempfile::tempdir().unwrap();
-        let ckpt = d.path().join("ckpt");
-        let row: mysql::Row = c.query_first("SHOW MASTER STATUS").unwrap().unwrap();
-        let (file, pos): (String, u64) = (row.get(0).unwrap(), row.get(1).unwrap());
-        std::fs::write(&ckpt, format!(r#"{{"file":"{file}","pos":{pos}}}"#)).unwrap();
-
-        // Apply the ops, building the expected final state in lockstep.
-        let mut expected: HashMap<u32, i32> = HashMap::new();
-        for op in &ops {
-            match *op {
-                Op::Upsert(id, v) => {
-                    c.exec_drop(
-                        "INSERT INTO cdc_prop (id, v) VALUES (?, ?) ON DUPLICATE KEY UPDATE v = VALUES(v)",
-                        (id, v),
-                    ).unwrap();
-                    expected.insert(id, v);
-                }
-                Op::Delete(id) => {
-                    c.exec_drop("DELETE FROM cdc_prop WHERE id = ?", (id,)).unwrap();
-                    expected.remove(&id);
-                }
-            }
-        }
-
-        // Capture.
+        let (d, ckpt, expected) = setup_and_apply("cdc_prop", &ops);
         let out = d.path().join("out");
         std::fs::create_dir_all(&out).unwrap();
-        let res = std::process::Command::new(RIVET_BIN)
-            .args(["run", "--config", cdc_config(&d, &ckpt, &out).to_str().unwrap()])
-            .output()
-            .expect("spawn rivet");
-        prop_assert!(
-            res.status.success(),
-            "cdc run failed:\n{}",
-            String::from_utf8_lossy(&res.stderr)
-        );
-
-        // Replay the captured changes the way a downstream MERGE would.
-        let mut replayed: HashMap<u32, i32> = HashMap::new();
-        for (op, id, v) in read_cdc_rows(&out) {
-            match op.as_str() {
-                "insert" | "update" => { replayed.insert(id as u32, v.expect("insert/update carries v")); }
-                "delete" => { replayed.remove(&(id as u32)); }
-                other => prop_assert!(false, "unexpected __op {other:?}"),
-            }
-        }
-
+        let res = run_cdc(&cdc_config(&d, "cdc_prop", 9_999, &ckpt, &out), false);
+        prop_assert!(res.status.success(), "cdc run failed:\n{}", String::from_utf8_lossy(&res.stderr));
         prop_assert_eq!(
-            &replayed, &expected,
-            "replaying the captured changes must reconstruct the source's final state; ops = {:?}",
-            ops
+            &replay(read_cdc_rows(&out)), &expected,
+            "replaying the captured changes must reconstruct the source's final state; ops = {:?}", ops
+        );
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 16, ..ProptestConfig::default() })]
+
+    #[test]
+    #[ignore = "live: requires docker compose --profile cdc mysql-cdc (:3307)"]
+    fn cdc_replay_reconstructs_after_a_crash(rest in prop::collection::vec(op_strategy(), 0..30)) {
+        // Prepend a guaranteed change so the crash point (after the part is durable,
+        // before the checkpoint) is actually reached.
+        let mut ops = vec![Op::Upsert(1, 0)];
+        ops.extend(rest);
+        let (d, ckpt, expected) = setup_and_apply("cdc_prop_crash", &ops);
+
+        // Run 1 crashes after the part is durable but before the checkpoint advances.
+        let crash_out = d.path().join("crash");
+        std::fs::create_dir_all(&crash_out).unwrap();
+        let crashed = run_cdc(&cdc_config(&d, "cdc_prop_crash", 9_998, &ckpt, &crash_out), true);
+        prop_assert!(!crashed.status.success(), "the injected crash must fail run 1");
+
+        // Run 2 (clean): the checkpoint never advanced, so it re-reads everything —
+        // at-least-once, nothing lost — and the replay reconstructs the source.
+        let out = d.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let res = run_cdc(&cdc_config(&d, "cdc_prop_crash", 9_998, &ckpt, &out), false);
+        prop_assert!(res.status.success(), "resume run failed:\n{}", String::from_utf8_lossy(&res.stderr));
+        prop_assert_eq!(
+            &replay(read_cdc_rows(&out)), &expected,
+            "a crash before the checkpoint must lose nothing — the resume reconstructs the source; ops = {:?}", ops
         );
     }
 }
