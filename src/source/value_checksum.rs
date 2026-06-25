@@ -1,28 +1,31 @@
-//! Opt-in value checksum (`RIVET_VALUE_CHECKSUM=1`) — a cheap, order-independent
-//! additive checksum per column, cross-checked source-vs-Arrow in process.
+//! Always-on value checksum — a cheap, order-independent per-column `xxh3`,
+//! cross-checked at two stages.
 //!
-//! **Form A.** An independent source-side pass (per engine — e.g. Postgres'
-//! `pg_rows_checksums`) computes a per-column checksum from the raw driver values;
-//! [`arrow_batch_checksums`] ("side B") computes the same over the *built* Arrow
-//! [`RecordBatch`]; [`verify`] compares them on the spot. A mismatch means the
-//! value converter (`build_array`) changed a value between read and Arrow build —
-//! caught in process, no re-read. Opt-in + benchmark-gated.
+//! **Form A (in-process).** An independent source-side pass (per engine — e.g.
+//! Postgres' `pg_rows_checksums`) computes a per-column checksum from the raw
+//! driver values; [`arrow_batch_checksums`] ("side B") computes the same over the
+//! *built* Arrow [`RecordBatch`]; [`verify`] compares them on the spot. A mismatch
+//! means the value converter (`build_array`) changed a value between read and Arrow
+//! build — caught in process, no re-read. Always-on (~+7% CPU, ~0% wall on the
+//! I/O-bound export path).
+//!
+//! **Form B (validate-time).** The sink records the per-column checksum in the
+//! manifest (name-keyed [`crate::manifest::ColumnChecksum`]); `rivet validate`
+//! re-reads the Parquet and recompares ([`validate_manifest_checksums`]), catching
+//! an `Arrow→Parquet` encode / post-write fault Form A cannot see.
 //!
 //! The per-column value is `xxh3` of each cell's value **bytes**, XOR-combined
-//! (order-independent, so chunk/parallel order doesn't matter). Hashing the bytes
-//! — not summing values or lengths — makes it sensitive to content corruption
-//! that preserves length or sum (a byte flip, two compensating changes), which the
-//! earlier value-sum silently missed. It complements the content-MD5 (file-byte
-//! integrity) and the differential fingerprint (test-time); it does not replace
-//! them. (A follow-on keys each cell's hash to the row PK — `xxh3(pk ‖ value)` —
-//! to also catch row/value swaps, which an order-independent combine still misses.)
+//! (order-independent, so chunk/parallel order doesn't matter) — keyed to the row
+//! cursor/key column when present (`xxh3(key ‖ value)`, swap-resistant). Hashing
+//! the bytes — not summing values or lengths — makes it sensitive to content
+//! corruption that preserves length or sum (a byte flip, two compensating changes)
+//! the earlier value-sum silently missed. It complements the content-MD5 (file-byte
+//! integrity) and the differential fingerprint (test-time).
 //!
 //! Coverage (both sides MUST agree, or the check false-mismatches): int / uint /
 //! float / bool / date / timestamp(µs) / utf8 / binary / decimal128. Time64,
 //! FixedSizeBinary (UUID), List, and nanosecond timestamps contribute 0 on BOTH
 //! sides for now (not yet matched between the two passes).
-
-use std::sync::OnceLock;
 
 use arrow::array::types::{
     Date32Type, Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
@@ -33,15 +36,6 @@ use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
 use crate::error::Result;
-
-/// `true` when `RIVET_VALUE_CHECKSUM` is set to `1`/`true` (read once).
-pub fn enabled() -> bool {
-    static CELL: OnceLock<bool> = OnceLock::new();
-    *CELL.get_or_init(|| {
-        std::env::var("RIVET_VALUE_CHECKSUM")
-            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-    })
-}
 
 /// Side B — order-independent per-column checksum over a built batch: `xxh3` of
 /// each cell's **value bytes**, XOR-combined. int/uint/float/decimal128/date/

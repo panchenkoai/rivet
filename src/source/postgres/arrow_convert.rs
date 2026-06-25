@@ -413,15 +413,13 @@ pub(super) fn rows_to_record_batch_typed(
         arrays.push(arr);
     }
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-    // Form A value-checksum (opt-in, RIVET_VALUE_CHECKSUM=1): an independent
-    // source-side pass over the raw pg values (A) vs the Arrow-side pass over the
-    // built batch (B). A mismatch means the value converter changed a value
-    // between read and Arrow build — fail loud rather than write the bad batch.
-    if crate::source::value_checksum::enabled() {
-        let a = pg_rows_checksums(schema, columns, rows);
-        let b = crate::source::value_checksum::arrow_batch_checksums(&batch);
-        crate::source::value_checksum::verify(&a, &b, schema)?;
-    }
+    // Form A value-checksum (always-on): an independent source-side pass over the
+    // raw pg values (A) vs the Arrow-side pass over the built batch (B). A mismatch
+    // means the value converter changed a value between read and Arrow build — fail
+    // loud rather than write the bad batch.
+    let a = pg_rows_checksums(schema, columns, rows);
+    let b = crate::source::value_checksum::arrow_batch_checksums(&batch);
+    crate::source::value_checksum::verify(&a, &b, schema)?;
     Ok(batch)
 }
 

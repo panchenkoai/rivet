@@ -329,11 +329,11 @@ pub(super) fn rows_to_record_batch_typed(
         )?);
     }
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-    if crate::source::value_checksum::enabled() {
-        let a = mysql_rows_checksums(arrow_types, rows);
-        let b = crate::source::value_checksum::arrow_batch_checksums(&batch);
-        crate::source::value_checksum::verify(&a, &b, schema)?;
-    }
+    // Form A value-checksum (always-on): source-side pass (A) vs the built batch
+    // (B) — fail loud if the value converter diverged between read and Arrow build.
+    let a = mysql_rows_checksums(arrow_types, rows);
+    let b = crate::source::value_checksum::arrow_batch_checksums(&batch);
+    crate::source::value_checksum::verify(&a, &b, schema)?;
     Ok(batch)
 }
 

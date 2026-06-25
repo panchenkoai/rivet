@@ -498,11 +498,11 @@ pub(super) fn mssql_rows_to_record_batch(
         );
     }
     let batch = arrow::record_batch::RecordBatch::try_new(schema.clone(), arrays)?;
-    if crate::source::value_checksum::enabled() {
-        let a = mssql_rows_checksums(schema, rows);
-        let b = crate::source::value_checksum::arrow_batch_checksums(&batch);
-        crate::source::value_checksum::verify(&a, &b, schema)?;
-    }
+    // Form A value-checksum (always-on): source-side pass (A) vs the built batch
+    // (B) — fail loud if the value converter diverged between read and Arrow build.
+    let a = mssql_rows_checksums(schema, rows);
+    let b = crate::source::value_checksum::arrow_batch_checksums(&batch);
+    crate::source::value_checksum::verify(&a, &b, schema)?;
     Ok(batch)
 }
 
