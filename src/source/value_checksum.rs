@@ -118,6 +118,68 @@ pub fn verify(source: &[i128], arrow: &[i128], schema: &SchemaRef) -> Result<()>
     Ok(())
 }
 
+/// Form B: re-read the exported Parquet parts and recompute the per-column
+/// checksum ("side C"), comparing it to the value recorded in the manifest's
+/// `column_checksums`. Catches an `Arrow→Parquet` encode fault or post-write
+/// corruption that the in-process Form A check (source↔Arrow) cannot see. The
+/// recorded sums are i128 decimal strings (JSON-stable in the manifest).
+///
+/// The manifest field + this re-read entry are in place and unit-tested (it
+/// catches a corrupted re-read); the call site in the validate command is the
+/// remaining Form B recording/validate wiring.
+#[allow(dead_code)]
+pub fn validate_recorded_checksums(
+    recorded: &[String],
+    part_paths: &[std::path::PathBuf],
+) -> Result<()> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let mut actual: Vec<i128> = Vec::new();
+    let mut schema: Option<SchemaRef> = None;
+    for path in part_paths {
+        let file = std::fs::File::open(path)
+            .map_err(|e| anyhow::anyhow!("value checksum: open {}: {e}", path.display()))?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+        for batch in reader {
+            let batch = batch?;
+            if actual.is_empty() {
+                schema = Some(batch.schema());
+                actual = vec![0i128; batch.num_columns()];
+            }
+            for (i, c) in arrow_batch_checksums(&batch).into_iter().enumerate() {
+                if i < actual.len() {
+                    actual[i] = actual[i].wrapping_add(c);
+                }
+            }
+        }
+    }
+
+    if recorded.len() != actual.len() {
+        anyhow::bail!(
+            "value checksum: manifest recorded {} columns, re-read found {}",
+            recorded.len(),
+            actual.len()
+        );
+    }
+    for (i, (rec, act)) in recorded.iter().zip(actual.iter()).enumerate() {
+        let rec_i: i128 = rec.parse().map_err(|_| {
+            anyhow::anyhow!("value checksum: manifest column {i} sum '{rec}' is not an integer")
+        })?;
+        if rec_i != *act {
+            let col = schema
+                .as_ref()
+                .and_then(|s| s.fields().get(i))
+                .map(|f| f.name().clone())
+                .unwrap_or_else(|| format!("#{i}"));
+            anyhow::bail!(
+                "value checksum mismatch in column '{col}': manifest={rec_i} re-read={act} \
+                 — the Parquet differs from what was checksummed at write (encode fault or corruption)"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -219,6 +281,58 @@ mod tests {
         assert!(
             verify(&cg, &cb, &s).is_err(),
             "verify must fire on the decimal divergence"
+        );
+    }
+
+    fn write_parquet(batch: &RecordBatch, path: &std::path::Path) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut w = parquet::arrow::ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+        w.write(batch).unwrap();
+        w.close().unwrap();
+    }
+
+    fn batch3(b_mid: i64) -> RecordBatch {
+        RecordBatch::try_new(
+            schema3(),
+            vec![
+                Arc::new(Int64Array::from(vec![10, 20, 30])),
+                Arc::new(Int64Array::from(vec![1, b_mid, 3])),
+                Arc::new(Int64Array::from(vec![100, 200, 300])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn recorded_of(batch: &RecordBatch) -> Vec<String> {
+        arrow_batch_checksums(batch)
+            .iter()
+            .map(|v| v.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn form_b_validate_passes_on_matching_parts() {
+        let batch = batch3(2);
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("part.parquet");
+        write_parquet(&batch, &p);
+        validate_recorded_checksums(&recorded_of(&batch), &[p])
+            .expect("matching parts must validate");
+    }
+
+    #[test]
+    fn form_b_validate_fires_on_corrupted_part() {
+        // The manifest recorded the checksum of the correct batch (col `b` mid = 2)...
+        let recorded = recorded_of(&batch3(2));
+        // ...but the Parquet on disk holds a corrupted `b` (2 -> 999).
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("part.parquet");
+        write_parquet(&batch3(999), &p);
+        let err = validate_recorded_checksums(&recorded, &[p])
+            .expect_err("a corrupted re-read must fire");
+        assert!(
+            err.to_string().contains("column 'b'"),
+            "must name the diverged column: {err}"
         );
     }
 }

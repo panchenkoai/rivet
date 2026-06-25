@@ -53,6 +53,10 @@ pub struct ManifestBuilder {
     compression: String,
     schema_fingerprint: String,
     parts: Vec<ManifestPart>,
+    /// Per-column value checksums (Form B), i128 sums as decimal strings, set by
+    /// [`set_column_checksums`](Self::set_column_checksums) when the run had
+    /// `RIVET_VALUE_CHECKSUM` on. `None` → omitted from the manifest.
+    column_checksums: Option<Vec<String>>,
 }
 
 impl ManifestBuilder {
@@ -91,7 +95,16 @@ impl ManifestBuilder {
             compression: plan.compression.clone(),
             schema_fingerprint,
             parts: Vec::new(),
+            column_checksums: None,
         }
+    }
+
+    /// Record the run-level per-column value checksums (Form B). The sums are
+    /// i128 decimal strings; surfaced into the manifest by [`finalize`](Self::finalize).
+    /// Caller wiring (sink accumulator → summary → here) is the remaining Form B step.
+    #[allow(dead_code)]
+    pub fn set_column_checksums(&mut self, checksums: Vec<String>) {
+        self.column_checksums = Some(checksums);
     }
 
     /// Record a committed part.  Must be called only after `dest.write()`
@@ -152,6 +165,7 @@ impl ManifestBuilder {
             row_count,
             part_count,
             parts: self.parts,
+            column_checksums: self.column_checksums,
         }
     }
 }

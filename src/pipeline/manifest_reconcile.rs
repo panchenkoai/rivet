@@ -235,6 +235,7 @@ mod tests {
             row_count: parts.iter().map(|p| p.rows).sum(),
             part_count: parts.len() as u32,
             parts,
+            column_checksums: None,
         }
     }
 

@@ -129,6 +129,15 @@ pub struct RunManifest {
     pub row_count: i64,
     pub part_count: u32,
     pub parts: Vec<ManifestPart>,
+    /// Per-column additive value checksum over the whole export (Form B), the
+    /// i128 sums as decimal strings (JSON-stable). Present only when
+    /// `RIVET_VALUE_CHECKSUM` was on during the run. `rivet validate` re-reads the
+    /// parts and recomputes this to catch an `Arrow→Parquet` encode fault or
+    /// post-write corruption — the step the in-process Form A check cannot see.
+    /// Optional for back-compat: older manifests omit it (no `MANIFEST_VERSION`
+    /// bump), newer readers tolerate its absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column_checksums: Option<Vec<String>>,
 }
 
 /// Terminal status of the run *as recorded by the writer*.
@@ -331,6 +340,7 @@ mod tests {
             row_count,
             part_count,
             parts,
+            column_checksums: None,
         }
     }
 

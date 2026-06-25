@@ -163,6 +163,7 @@ fn build_manifest(run_id: &str, status: ManifestStatus, parts: Vec<ManifestPart>
         row_count,
         part_count,
         parts,
+        column_checksums: None,
     }
 }
 

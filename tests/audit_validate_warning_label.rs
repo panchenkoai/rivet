@@ -56,6 +56,7 @@ fn one_part_manifest() -> RunManifest {
             content_md5: String::new(),
             status: PartStatus::Committed,
         }],
+        column_checksums: None,
     }
 }
 
