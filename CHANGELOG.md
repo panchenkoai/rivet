@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.15.0 (2026-06-25) — always-on value-integrity checksum
+
+Every export now cross-checks its data end-to-end, on by default. An always-on per-column `xxh3`
+value checksum catches silent value corruption the manifest's row-count + content hash could not: a
+`build_array` converter fault (caught in process) and an `Arrow→Parquet` encode / post-write fault
+(caught on `rivet validate`). The cost is hidden by the I/O-bound export path (+2.8% wall on a 1.93 M-row
+table).
+
+### Added
+
+- **Form A — in-process value cross-check (always-on).** An independent source-side pass over the raw
+  driver values is compared against the built Arrow batch on every export; a mismatch fails the run loud,
+  naming the column, instead of writing the corrupted batch. Catches the per-engine value converter
+  (`build_array`).
+- **Form B — manifest-recorded checksum + `rivet validate` re-read (always-on).** The per-column `xxh3`
+  is recorded in the manifest (`column_checksums`, name-keyed) and `rivet validate` re-reads the exported
+  Parquet to re-verify it — catching an encoder fault or post-write / bit-rot corruption Form A cannot
+  see. Live round-trip proven: export → validate passes → flip one byte → validate fails naming the column.
+- **Swap-resistant when keyed.** When the export has a cursor / key column, each cell hashes as
+  `xxh3(key ‖ value)` (`checksum_key_column` in the manifest), so a value swapped between two rows — which
+  an order-independent combine would otherwise miss — is caught.
+- **Visible coverage, never a silent "verified".** Types not yet covered (UUID / `FixedSizeBinary`, List,
+  `Decimal256`, nanosecond timestamps) are logged once per export ("value checksum covers N/M columns;
+  NOT checked: …") instead of contributing a silent zero that reads as verified.
+
+### Notes
+
+- **Manifest stays back-compatible — `MANIFEST_VERSION` unchanged at 1.** `column_checksums` +
+  `checksum_key_column` are additive Optional fields; older manifests omit them and newer readers tolerate
+  their absence, so `rivet validate` keeps working across versions.
+- **Honest scope.** The guarantee is *decoded-value → file* for covered types, probabilistic (xxh3-64),
+  with the DB-wire decode trusted (the same `FromSql` feeds both sides) — **not** byte-for-byte
+  source→file. CSV exports get Form A only (the Parquet re-read is Parquet-only).
+- **Cost vs 0.14.1** (content_items, 1.93 M × 20 cols): +2.8% wall / +11.3% CPU / ~0 RSS. The dominant
+  cost is the independent re-decode + passes, not the hashing — the I/O-bound export hides most of it on
+  wall time.
+
+### Internal
+
+- Permanent matrix-guard regression oracle: the source-side and Arrow-side checksums must agree
+  byte-for-byte across the full PostgreSQL / MySQL / SQL Server type matrices (the test that would have
+  caught the PG-enum side-A gap before ship). Validated live end-to-end through DuckDB, ClickHouse,
+  pyarrow, BigQuery, and Snowflake.
+- Docs: `README` + `docs/semantics.md` now distinguish **CDC-to-files** (`mode: cdc`, shipped 0.14.0)
+  from continuous / live-streaming replication (the actual non-goal); roadmap accuracy revision.
+
 ## 0.14.1 (2026-06-24) — SQL Server CDC retention fix + recovery docs
 
 A patch on 0.14.0: one real data-loss fix on the SQL Server CDC resume path, plus the
