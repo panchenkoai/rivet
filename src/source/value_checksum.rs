@@ -30,7 +30,7 @@ use arrow::array::types::{
 };
 use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
-use xxhash_rust::xxh3::xxh3_64;
+use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
 use crate::error::Result;
 
@@ -107,6 +107,99 @@ fn column_checksum(arr: &dyn Array) -> u64 {
         _ => {}
     }
     acc
+}
+
+/// Keyed side B — the **swap-resistant** variant. Each cell's contribution is
+/// `xxh3(key_value_bytes ‖ cell_value_bytes)` instead of `xxh3(cell_value_bytes)`,
+/// so the per-column XOR stays order-independent (chunk/parallel safe) yet a value
+/// **swap between two rows** — which preserves the column's multiset and is
+/// therefore invisible to the un-keyed XOR — now changes each row's prepended key
+/// and diverges. `key_col` is the keyset / incremental cursor column resolved to a
+/// schema index. The source pass prepends the SAME key-column bytes (read from the
+/// batch it just built), so a correct build keeps A==B and a swap breaks it on both.
+///
+/// Not yet called from the export hooks — that is the live-pk wiring step (switch
+/// `arrow_batch_checksums(&batch)` → `arrow_batch_checksums_keyed(&batch, k)` once
+/// the cursor key is threaded through `rows_to_record_batch_typed`, and have each
+/// engine's source pass prepend the same key column). Exercised now by
+/// `keyed_checksum_catches_a_value_swap_that_unkeyed_misses`.
+#[allow(dead_code)]
+pub fn arrow_batch_checksums_keyed(batch: &RecordBatch, key_col: usize) -> Vec<u64> {
+    let key = batch.column(key_col).as_ref();
+    batch
+        .columns()
+        .iter()
+        .map(|c| column_checksum_keyed(c.as_ref(), key))
+        .collect()
+}
+
+/// Whether a type contributes to the checksum — must mirror the `match` arms in
+/// `column_checksum` / `feed_cell` exactly, so an uncovered column reads 0 on BOTH
+/// the keyed and un-keyed paths (and so A==B for it).
+#[allow(dead_code)]
+fn covered(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(..)
+            | DataType::Date32
+            | DataType::Boolean
+            | DataType::Utf8
+            | DataType::Binary
+            | DataType::Timestamp(TimeUnit::Microsecond, _)
+    )
+}
+
+#[allow(dead_code)]
+fn column_checksum_keyed(arr: &dyn Array, key: &dyn Array) -> u64 {
+    if !covered(arr.data_type()) {
+        return 0;
+    }
+    let mut acc: u64 = 0;
+    for r in 0..arr.len() {
+        if arr.is_null(r) {
+            continue;
+        }
+        let mut h = Xxh3::new();
+        feed_cell(&mut h, key, r);
+        feed_cell(&mut h, arr, r);
+        acc ^= h.digest();
+    }
+    acc
+}
+
+/// Feed cell `r` of `arr` into `h` as its value bytes — byte-identical to the
+/// one-shot `xxh3_64(value_bytes)` the un-keyed path uses (streaming and one-shot
+/// XXH3 agree on the same input), so feeding nothing else reproduces the un-keyed
+/// hash and feeding the key first produces the keyed one. Uncovered types feed
+/// nothing — their column is short-circuited to 0 by `covered`.
+#[allow(dead_code)]
+fn feed_cell(h: &mut Xxh3, arr: &dyn Array, r: usize) {
+    macro_rules! fp {
+        ($t:ty) => {
+            h.update(&arr.as_primitive::<$t>().value(r).to_le_bytes())
+        };
+    }
+    match arr.data_type() {
+        DataType::Int16 => fp!(Int16Type),
+        DataType::Int32 => fp!(Int32Type),
+        DataType::Int64 => fp!(Int64Type),
+        DataType::UInt64 => fp!(UInt64Type),
+        DataType::Float32 => fp!(Float32Type),
+        DataType::Float64 => fp!(Float64Type),
+        DataType::Decimal128(..) => fp!(Decimal128Type),
+        DataType::Date32 => fp!(Date32Type),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => fp!(TimestampMicrosecondType),
+        DataType::Boolean => h.update(&[arr.as_boolean().value(r) as u8]),
+        DataType::Utf8 => h.update(arr.as_string::<i32>().value(r).as_bytes()),
+        DataType::Binary => h.update(arr.as_binary::<i32>().value(r)),
+        _ => {}
+    }
 }
 
 /// Compare the source-side ("A") and Arrow-side ("B") checksums column-by-column.
@@ -256,6 +349,63 @@ mod tests {
         assert!(
             verify(&cg, &cb, &s).is_err(),
             "verify must fire when a column diverges"
+        );
+    }
+
+    #[test]
+    fn keyed_checksum_catches_a_value_swap_that_unkeyed_misses() {
+        // The order-independent XOR's known blind spot: swap two rows' values in a
+        // column and the column's multiset is unchanged, so the un-keyed checksum is
+        // identical — a corruption it cannot see. Keying each cell to its row's PK
+        // (`xxh3(id ‖ value)`) makes the same swap diverge. This test is the proof
+        // the keyed variant earns its cost.
+        use arrow::array::StringArray;
+        let s: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("val", DataType::Utf8, false),
+        ]));
+        // id=1 -> "alpha", id=2 -> "beta".
+        let id = Int64Array::from(vec![1_i64, 2]);
+        let original = RecordBatch::try_new(
+            s.clone(),
+            vec![
+                Arc::new(id.clone()),
+                Arc::new(StringArray::from(vec!["alpha", "beta"])),
+            ],
+        )
+        .unwrap();
+        // Same ids, values swapped: id=1 -> "beta", id=2 -> "alpha".
+        let swapped = RecordBatch::try_new(
+            s.clone(),
+            vec![
+                Arc::new(id),
+                Arc::new(StringArray::from(vec!["beta", "alpha"])),
+            ],
+        )
+        .unwrap();
+
+        // Un-keyed: the `val` column's multiset {"alpha","beta"} is unchanged, so the
+        // XOR-combined checksum is blind to the swap.
+        let uk = arrow_batch_checksums(&original);
+        let uk_swapped = arrow_batch_checksums(&swapped);
+        assert_eq!(
+            uk[1], uk_swapped[1],
+            "un-keyed XOR cannot distinguish a same-multiset row swap"
+        );
+
+        // Keyed on `id` (col 0): each value is hashed with its row's id, so the swap
+        // diverges — exactly the corruption the un-keyed variant missed.
+        let k = arrow_batch_checksums_keyed(&original, 0);
+        let k_swapped = arrow_batch_checksums_keyed(&swapped, 0);
+        assert_ne!(
+            k[1], k_swapped[1],
+            "keying to the PK must catch a value swap the un-keyed check missed"
+        );
+        // The key column itself is identical in both, so its own checksum must not move
+        // (and feeding id‖id is deterministic).
+        assert_eq!(
+            k[0], k_swapped[0],
+            "the id column is identical in both batches"
         );
     }
 
