@@ -27,13 +27,15 @@
 //! FixedSizeBinary (UUID), List, and nanosecond timestamps contribute 0 on BOTH
 //! sides for now (not yet matched between the two passes).
 
+use std::borrow::Cow;
+
 use arrow::array::types::{
     Date32Type, Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
     TimestampMicrosecondType, UInt64Type,
 };
 use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
-use xxhash_rust::xxh3::Xxh3;
+use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
 use crate::error::Result;
 
@@ -108,12 +110,24 @@ fn column_xxh3(arr: &dyn Array, key: Option<&dyn Array>) -> u64 {
         if arr.is_null(r) {
             continue;
         }
-        let mut h = Xxh3::new();
-        if let Some(k) = key {
-            feed_cell(&mut h, k, r);
+        match key {
+            // Un-keyed: one-shot `xxh3_64` — ~2.5× faster than constructing a
+            // streaming `Xxh3` per cell (which inits the full ~576-byte state).
+            None => acc ^= with_cell_bytes(arr, r, xxh3_64),
+            // Keyed: stream `key ‖ value` so the swap-resistant hash needs no
+            // concat alloc; same hash value as one-shot over the concatenation.
+            Some(k) => {
+                let d = with_cell_bytes(k, r, |kb| {
+                    with_cell_bytes(arr, r, |vb| {
+                        let mut h = Xxh3::new();
+                        h.update(kb);
+                        h.update(vb);
+                        h.digest()
+                    })
+                });
+                acc ^= d;
+            }
         }
-        feed_cell(&mut h, arr, r);
-        acc ^= h.digest();
     }
     acc
 }
@@ -150,17 +164,17 @@ pub fn arrow_batch_checksums_keyed(batch: &RecordBatch, key_col: usize) -> Vec<u
         .collect()
 }
 
-/// Feed cell `r` of `arr` into `h` as its canonical value bytes — the single
-/// per-type byte extraction shared by the keyed and un-keyed paths (via
-/// [`column_xxh3`]). Streaming and one-shot XXH3 agree on the same input, so feeding
-/// only the value reproduces the un-keyed hash and feeding the key first produces
-/// the keyed one. The `_ => {}` arm is exactly the [`CheckRule::Skipped`] set —
-/// those columns are short-circuited to 0 by `column_xxh3` before this is reached,
-/// and a unit test pins the two in sync.
-fn feed_cell(h: &mut Xxh3, arr: &dyn Array, r: usize) {
+/// Hand cell `r` of `arr` to `f` as its canonical value bytes — the single per-type
+/// byte extraction behind [`column_xxh3`]. The un-keyed path one-shots
+/// `xxh3_64(bytes)` (fast); the keyed path feeds two calls (`key ‖ value`) into a
+/// streaming `Xxh3`. The `_` arm is unreachable for a (covered) cell —
+/// [`column_xxh3`] short-circuits `Skipped` first — but a Skipped KEY column (e.g. a
+/// UUID cursor) lands there and feeds an empty key; a unit test pins the covered set
+/// to [`check_rule`].
+fn with_cell_bytes<R>(arr: &dyn Array, r: usize, f: impl FnOnce(&[u8]) -> R) -> R {
     macro_rules! fp {
         ($t:ty) => {
-            h.update(&arr.as_primitive::<$t>().value(r).to_le_bytes())
+            f(&arr.as_primitive::<$t>().value(r).to_le_bytes())
         };
     }
     match arr.data_type() {
@@ -173,21 +187,21 @@ fn feed_cell(h: &mut Xxh3, arr: &dyn Array, r: usize) {
         DataType::Decimal128(..) => fp!(Decimal128Type),
         DataType::Date32 => fp!(Date32Type),
         DataType::Timestamp(TimeUnit::Microsecond, _) => fp!(TimestampMicrosecondType),
-        DataType::Boolean => h.update(&[arr.as_boolean().value(r) as u8]),
-        DataType::Utf8 => h.update(arr.as_string::<i32>().value(r).as_bytes()),
-        DataType::Binary => h.update(arr.as_binary::<i32>().value(r)),
-        _ => {}
+        DataType::Boolean => f(&[arr.as_boolean().value(r) as u8]),
+        DataType::Utf8 => f(arr.as_string::<i32>().value(r).as_bytes()),
+        DataType::Binary => f(arr.as_binary::<i32>().value(r)),
+        _ => f(&[]),
     }
 }
 
 /// A per-engine, INDEPENDENT source of typed cell values — a second decode of the
 /// same rows, the side-A twin of side B's Arrow read. Each accessor returns the
 /// cell's canonical value (the generic [`source_checksums`] byte-encodes it
-/// identically to [`feed_cell`]) or `None` for a NULL / absent cell; the
-/// variable-length `feed_*` accessors feed the hasher directly (a borrowed slice or
-/// a computed string) and return whether they fed. A new covered type is a new
-/// required method here — a compile requirement on all three engines, which is the
-/// point of routing every engine through ONE dispatch instead of three.
+/// identically to [`with_cell_bytes`]) or `None` for a NULL / absent cell; the
+/// variable-length `utf8`/`binary` return the bytes as a `Cow` — borrowed for plain
+/// text / driver bytes, owned for a computed string (uuid, interval, enum label,
+/// numeric-as-text). A new covered type is a new required method here — a compile
+/// requirement on all three engines, the point of one dispatch instead of three.
 pub trait CellSource {
     fn num_rows(&self) -> usize;
     fn int16(&self, col: usize, row: usize) -> Option<i16>;
@@ -200,8 +214,8 @@ pub trait CellSource {
     fn date32(&self, col: usize, row: usize) -> Option<i32>;
     fn ts_micros(&self, col: usize, row: usize) -> Option<i64>;
     fn boolean(&self, col: usize, row: usize) -> Option<bool>;
-    fn feed_utf8(&self, col: usize, row: usize, h: &mut Xxh3) -> bool;
-    fn feed_binary(&self, col: usize, row: usize, h: &mut Xxh3) -> bool;
+    fn utf8(&self, col: usize, row: usize) -> Option<Cow<'_, [u8]>>;
+    fn binary(&self, col: usize, row: usize) -> Option<Cow<'_, [u8]>>;
 }
 
 /// Side A — the per-column checksum computed **independently** from a [`CellSource`]
@@ -221,21 +235,16 @@ pub fn source_checksums<S: CellSource>(schema: &SchemaRef, src: &S) -> Vec<u64> 
             }
             let mut acc: u64 = 0;
             for row in 0..src.num_rows() {
-                let mut h = Xxh3::new();
-                // `le!` feeds a Copy value's little-endian bytes when present —
-                // matching `feed_cell`'s `to_le_bytes` arms exactly.
+                // One-shot `xxh3_64` per non-null cell — un-keyed (Form A is
+                // un-keyed), byte-encoded identically to `with_cell_bytes`.
                 macro_rules! le {
                     ($opt:expr) => {
-                        match $opt {
-                            Some(v) => {
-                                h.update(&v.to_le_bytes());
-                                true
-                            }
-                            None => false,
+                        if let Some(v) = $opt {
+                            acc ^= xxh3_64(&v.to_le_bytes());
                         }
                     };
                 }
-                let fed = match dt {
+                match dt {
                     DataType::Int16 => le!(src.int16(col, row)),
                     DataType::Int32 => le!(src.int32(col, row)),
                     DataType::Int64 => le!(src.int64(col, row)),
@@ -245,19 +254,22 @@ pub fn source_checksums<S: CellSource>(schema: &SchemaRef, src: &S) -> Vec<u64> 
                     DataType::Decimal128(_, scale) => le!(src.decimal128(col, row, *scale)),
                     DataType::Date32 => le!(src.date32(col, row)),
                     DataType::Timestamp(TimeUnit::Microsecond, _) => le!(src.ts_micros(col, row)),
-                    DataType::Boolean => match src.boolean(col, row) {
-                        Some(b) => {
-                            h.update(&[b as u8]);
-                            true
+                    DataType::Boolean => {
+                        if let Some(b) = src.boolean(col, row) {
+                            acc ^= xxh3_64(&[b as u8]);
                         }
-                        None => false,
-                    },
-                    DataType::Utf8 => src.feed_utf8(col, row, &mut h),
-                    DataType::Binary => src.feed_binary(col, row, &mut h),
-                    _ => false,
-                };
-                if fed {
-                    acc ^= h.digest();
+                    }
+                    DataType::Utf8 => {
+                        if let Some(b) = src.utf8(col, row) {
+                            acc ^= xxh3_64(b.as_ref());
+                        }
+                    }
+                    DataType::Binary => {
+                        if let Some(b) = src.binary(col, row) {
+                            acc ^= xxh3_64(b.as_ref());
+                        }
+                    }
+                    _ => {}
                 }
             }
             acc

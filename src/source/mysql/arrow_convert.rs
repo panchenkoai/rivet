@@ -17,6 +17,7 @@
 //! in `mod.rs`), and `bit_bytes_to_u64` (referenced by unit tests in
 //! `mod.rs::tests`). Everything else is private to this file.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -457,47 +458,26 @@ impl crate::source::value_checksum::CellSource for MysqlCellSource<'_> {
         }?;
         Some(dt.and_utc().timestamp_micros())
     }
-    fn feed_binary(&self, col: usize, row: usize, h: &mut xxhash_rust::xxh3::Xxh3) -> bool {
+    fn binary(&self, col: usize, row: usize) -> Option<Cow<'_, [u8]>> {
         match self.rows[row].as_ref(col) {
-            Some(Value::Bytes(bv)) => {
-                h.update(bv);
-                true
-            }
-            _ => false,
+            Some(Value::Bytes(bv)) => Some(Cow::Borrowed(bv.as_slice())),
+            _ => None,
         }
     }
-    fn feed_utf8(&self, col: usize, row: usize, h: &mut xxhash_rust::xxh3::Xxh3) -> bool {
+    fn utf8(&self, col: usize, row: usize) -> Option<Cow<'_, [u8]>> {
         match self.rows[row].as_ref(col) {
-            Some(Value::Bytes(bv)) => {
-                match bytes_to_str(bv) {
-                    Some(s) => h.update(s.as_bytes()),
-                    None => h.update(String::from_utf8_lossy(bv).as_bytes()),
-                }
-                true
-            }
-            Some(Value::Int(v)) => {
-                h.update(v.to_string().as_bytes());
-                true
-            }
-            Some(Value::UInt(v)) => {
-                h.update(v.to_string().as_bytes());
-                true
-            }
-            Some(Value::Float(v)) => {
-                h.update(v.to_string().as_bytes());
-                true
-            }
-            Some(Value::Double(v)) => {
-                h.update(v.to_string().as_bytes());
-                true
-            }
-            Some(Value::Date(y, m, d, hh, mi, sx, us)) => {
-                h.update(
-                    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mi:02}:{sx:02}.{us:06}").as_bytes(),
-                );
-                true
-            }
-            _ => false,
+            Some(Value::Bytes(bv)) => Some(match bytes_to_str(bv) {
+                Some(s) => Cow::Borrowed(s.as_bytes()),
+                None => Cow::Owned(String::from_utf8_lossy(bv).into_owned().into_bytes()),
+            }),
+            Some(Value::Int(v)) => Some(Cow::Owned(v.to_string().into_bytes())),
+            Some(Value::UInt(v)) => Some(Cow::Owned(v.to_string().into_bytes())),
+            Some(Value::Float(v)) => Some(Cow::Owned(v.to_string().into_bytes())),
+            Some(Value::Double(v)) => Some(Cow::Owned(v.to_string().into_bytes())),
+            Some(Value::Date(y, m, d, hh, mi, sx, us)) => Some(Cow::Owned(
+                format!("{y:04}-{m:02}-{d:02} {hh:02}:{mi:02}:{sx:02}.{us:06}").into_bytes(),
+            )),
+            _ => None,
         }
     }
 }

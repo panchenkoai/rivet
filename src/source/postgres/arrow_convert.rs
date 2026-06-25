@@ -18,6 +18,7 @@
 //! [`rows_to_record_batch_typed`] is called by `pg_run_export`. Everything
 //! else is private to this file.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -492,67 +493,46 @@ impl crate::source::value_checksum::CellSource for PgCellSource<'_> {
     fn boolean(&self, col: usize, row: usize) -> Option<bool> {
         self.rows[row].get::<_, Option<bool>>(col)
     }
-    fn feed_binary(&self, col: usize, row: usize, h: &mut xxhash_rust::xxh3::Xxh3) -> bool {
-        match self.rows[row].get::<_, Option<Vec<u8>>>(col) {
-            Some(v) => {
-                h.update(&v);
-                true
-            }
-            None => false,
-        }
+    fn binary(&self, col: usize, row: usize) -> Option<Cow<'_, [u8]>> {
+        self.rows[row]
+            .get::<_, Option<Vec<u8>>>(col)
+            .map(Cow::Owned)
     }
-    fn feed_utf8(&self, col: usize, row: usize, h: &mut xxhash_rust::xxh3::Xxh3) -> bool {
+    fn utf8(&self, col: usize, row: usize) -> Option<Cow<'_, [u8]>> {
         let r = &self.rows[row];
         match self.columns[col].1 {
-            Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => {
-                match r.get::<_, Option<&str>>(col) {
-                    Some(t) => {
-                        h.update(t.as_bytes());
-                        true
-                    }
-                    None => false,
-                }
-            }
+            Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => r
+                .get::<_, Option<&str>>(col)
+                .map(|t| Cow::Borrowed(t.as_bytes())),
             Type::JSON | Type::JSONB => match r.try_get::<_, Option<PgJsonRawText<'_>>>(col) {
-                Ok(Some(PgJsonRawText(t))) => {
-                    h.update(t.as_bytes());
-                    true
-                }
-                _ => false,
+                Ok(Some(PgJsonRawText(t))) => Some(Cow::Borrowed(t.as_bytes())),
+                _ => None,
             },
             Type::NUMERIC => match pg_numeric_optional_utf8_string(r, col) {
-                Ok(Some(t)) => {
-                    h.update(t.as_bytes());
-                    true
-                }
-                _ => false,
+                Ok(Some(t)) => Some(Cow::Owned(t.into_bytes())),
+                _ => None,
             },
             Type::UUID => match r.try_get::<_, Option<PgUuidBytes>>(col) {
-                Ok(Some(PgUuidBytes(b))) => {
-                    h.update(uuid::Uuid::from_bytes(b).to_string().as_bytes());
-                    true
-                }
-                _ => false,
+                Ok(Some(PgUuidBytes(b))) => Some(Cow::Owned(
+                    uuid::Uuid::from_bytes(b).to_string().into_bytes(),
+                )),
+                _ => None,
             },
-            Type::INTERVAL => match r.try_get::<_, Option<PgInterval>>(col).ok().flatten() {
-                Some(iv) => {
-                    h.update(
-                        pg_interval_to_iso8601(iv.months, iv.days, iv.microseconds).as_bytes(),
-                    );
-                    true
-                }
-                None => false,
-            },
-            ref t if matches!(t.kind(), Kind::Enum(_)) => {
-                match r.try_get::<_, Option<AnyAsString>>(col).ok().flatten() {
-                    Some(s) => {
-                        h.update(s.0.as_bytes());
-                        true
-                    }
-                    None => false,
-                }
-            }
-            _ => false,
+            Type::INTERVAL => r
+                .try_get::<_, Option<PgInterval>>(col)
+                .ok()
+                .flatten()
+                .map(|iv| {
+                    Cow::Owned(
+                        pg_interval_to_iso8601(iv.months, iv.days, iv.microseconds).into_bytes(),
+                    )
+                }),
+            ref t if matches!(t.kind(), Kind::Enum(_)) => r
+                .try_get::<_, Option<AnyAsString>>(col)
+                .ok()
+                .flatten()
+                .map(|s| Cow::Owned(s.0.into_bytes())),
+            _ => None,
         }
     }
 }

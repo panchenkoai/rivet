@@ -11,6 +11,7 @@
 //! values use tiberius' `chrono` `FromSql` impls via `try_get`, which already
 //! normalise the raw TDS day/second counts.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -589,22 +590,16 @@ impl crate::source::value_checksum::CellSource for MssqlCellSource<'_> {
             },
         }
     }
-    fn feed_binary(&self, col: usize, row: usize, h: &mut xxhash_rust::xxh3::Xxh3) -> bool {
+    fn binary(&self, col: usize, row: usize) -> Option<Cow<'_, [u8]>> {
         match cell(&self.rows[row], col) {
-            Some(ColumnData::Binary(Some(v))) => {
-                h.update(v);
-                true
-            }
-            _ => false,
+            Some(ColumnData::Binary(Some(v))) => Some(Cow::Borrowed(v.as_ref())),
+            _ => None,
         }
     }
-    fn feed_utf8(&self, col: usize, row: usize, h: &mut xxhash_rust::xxh3::Xxh3) -> bool {
+    fn utf8(&self, col: usize, row: usize) -> Option<Cow<'_, [u8]>> {
         match cell(&self.rows[row], col) {
-            Some(ColumnData::String(Some(v))) => {
-                h.update(v.as_bytes());
-                true
-            }
-            _ => false,
+            Some(ColumnData::String(Some(v))) => Some(Cow::Borrowed(v.as_bytes())),
+            _ => None,
         }
     }
 }
