@@ -431,15 +431,25 @@ pub(super) fn rows_to_record_batch_typed(
 /// on the resolved target Arrow type (same decision site as `build_array`) so it
 /// covers exactly the types side B covers and skips exactly the ones it skips —
 /// any drift here is a false mismatch. Nulls contribute 0 (side B skips them too).
-fn pg_rows_checksums(schema: &SchemaRef, columns: &[(String, Type)], rows: &[Row]) -> Vec<i128> {
+fn pg_rows_checksums(schema: &SchemaRef, columns: &[(String, Type)], rows: &[Row]) -> Vec<u64> {
     (0..columns.len())
         .map(|col_idx| {
             let target = schema.field(col_idx).data_type();
             let pg_type = &columns[col_idx].1;
-            let mut s: i128 = 0;
+            let mut acc: u64 = 0;
+            // Hash the value's little-endian bytes — the SAME bytes side B
+            // (`arrow_batch_checksums`) hashes for this target Arrow type — XORed
+            // into the column accumulator (order-independent). `addb!` hashes a raw
+            // byte slice (strings / binary). The widths must match side B (Date32 →
+            // i32, an OID widened to i64, etc.) or the matrix guard false-mismatches.
             macro_rules! add {
                 ($e:expr) => {
-                    s = s.wrapping_add($e as i128);
+                    acc ^= xxhash_rust::xxh3::xxh3_64(&($e).to_le_bytes());
+                };
+            }
+            macro_rules! addb {
+                ($b:expr) => {
+                    acc ^= xxhash_rust::xxh3::xxh3_64($b);
                 };
             }
             match target {
@@ -461,7 +471,7 @@ fn pg_rows_checksums(schema: &SchemaRef, columns: &[(String, Type)], rows: &[Row
                     if *pg_type == Type::OID {
                         for row in rows {
                             if let Some(v) = row.get::<_, Option<u32>>(col_idx) {
-                                add!(v);
+                                add!(v as i64);
                             }
                         }
                     } else {
@@ -488,8 +498,8 @@ fn pg_rows_checksums(schema: &SchemaRef, columns: &[(String, Type)], rows: &[Row
                 }
                 DataType::Boolean => {
                     for row in rows {
-                        if let Some(true) = row.get::<_, Option<bool>>(col_idx) {
-                            add!(1);
+                        if let Some(b) = row.get::<_, Option<bool>>(col_idx) {
+                            addb!(&[b as u8]);
                         }
                     }
                 }
@@ -497,7 +507,7 @@ fn pg_rows_checksums(schema: &SchemaRef, columns: &[(String, Type)], rows: &[Row
                     let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch valid");
                     for row in rows {
                         if let Some(d) = row.get::<_, Option<chrono::NaiveDate>>(col_idx) {
-                            add!((d - epoch).num_days());
+                            add!((d - epoch).num_days() as i32);
                         }
                     }
                 }
@@ -521,7 +531,7 @@ fn pg_rows_checksums(schema: &SchemaRef, columns: &[(String, Type)], rows: &[Row
                 DataType::Binary => {
                     for row in rows {
                         if let Some(v) = row.get::<_, Option<Vec<u8>>>(col_idx) {
-                            add!(v.len());
+                            addb!(&v);
                         }
                     }
                 }
@@ -530,7 +540,7 @@ fn pg_rows_checksums(schema: &SchemaRef, columns: &[(String, Type)], rows: &[Row
                         for row in rows {
                             let v: Option<&str> = row.get(col_idx);
                             if let Some(t) = v {
-                                add!(t.len());
+                                addb!(t.as_bytes());
                             }
                         }
                     }
@@ -539,14 +549,14 @@ fn pg_rows_checksums(schema: &SchemaRef, columns: &[(String, Type)], rows: &[Row
                             if let Ok(Some(PgJsonRawText(text))) =
                                 row.try_get::<_, Option<PgJsonRawText<'_>>>(col_idx)
                             {
-                                add!(text.len());
+                                addb!(text.as_bytes());
                             }
                         }
                     }
                     Type::NUMERIC => {
                         for row in rows {
                             if let Ok(Some(t)) = pg_numeric_optional_utf8_string(row, col_idx) {
-                                add!(t.len());
+                                addb!(t.as_bytes());
                             }
                         }
                     }
@@ -555,7 +565,7 @@ fn pg_rows_checksums(schema: &SchemaRef, columns: &[(String, Type)], rows: &[Row
                             if let Ok(Some(PgUuidBytes(bytes))) =
                                 row.try_get::<_, Option<PgUuidBytes>>(col_idx)
                             {
-                                add!(uuid::Uuid::from_bytes(bytes).to_string().len());
+                                addb!(uuid::Uuid::from_bytes(bytes).to_string().as_bytes());
                             }
                         }
                     }
@@ -564,9 +574,9 @@ fn pg_rows_checksums(schema: &SchemaRef, columns: &[(String, Type)], rows: &[Row
                             if let Some(iv) =
                                 row.try_get::<_, Option<PgInterval>>(col_idx).ok().flatten()
                             {
-                                add!(
+                                addb!(
                                     pg_interval_to_iso8601(iv.months, iv.days, iv.microseconds)
-                                        .len()
+                                        .as_bytes()
                                 );
                             }
                         }
@@ -581,7 +591,7 @@ fn pg_rows_checksums(schema: &SchemaRef, columns: &[(String, Type)], rows: &[Row
                                 .ok()
                                 .flatten()
                             {
-                                add!(s.0.len());
+                                addb!(s.0.as_bytes());
                             }
                         }
                     }
@@ -613,7 +623,7 @@ fn pg_rows_checksums(schema: &SchemaRef, columns: &[(String, Type)], rows: &[Row
                 // sides for now.
                 _ => {}
             }
-            s
+            acc
         })
         .collect()
 }

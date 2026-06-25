@@ -8,9 +8,14 @@
 //! value converter (`build_array`) changed a value between read and Arrow build —
 //! caught in process, no re-read. Opt-in + benchmark-gated.
 //!
-//! A SUM collides and overflows at scale (`wrapping_add` keeps it panic-free), so
-//! it is a cheap cross-check — it complements the content-MD5 (byte integrity)
-//! and the differential fingerprint (test-time), it does not replace them.
+//! The per-column value is `xxh3` of each cell's value **bytes**, XOR-combined
+//! (order-independent, so chunk/parallel order doesn't matter). Hashing the bytes
+//! — not summing values or lengths — makes it sensitive to content corruption
+//! that preserves length or sum (a byte flip, two compensating changes), which the
+//! earlier value-sum silently missed. It complements the content-MD5 (file-byte
+//! integrity) and the differential fingerprint (test-time); it does not replace
+//! them. (A follow-on keys each cell's hash to the row PK — `xxh3(pk ‖ value)` —
+//! to also catch row/value swaps, which an order-independent combine still misses.)
 //!
 //! Coverage (both sides MUST agree, or the check false-mismatches): int / uint /
 //! float / bool / date / timestamp(µs) / utf8 / binary / decimal128. Time64,
@@ -25,6 +30,7 @@ use arrow::array::types::{
 };
 use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+use xxhash_rust::xxh3::xxh3_64;
 
 use crate::error::Result;
 
@@ -37,46 +43,47 @@ pub fn enabled() -> bool {
     })
 }
 
-/// Side B — order-independent additive checksum per column over a built batch.
-/// int/uint → value; float → IEEE bits; bool → 0/1; date → days; timestamp(µs) →
-/// epoch µs; utf8/binary → byte length. Uncovered types contribute 0 (see the
-/// module-level coverage note — the source-side pass must skip exactly the same).
-pub fn arrow_batch_checksums(batch: &RecordBatch) -> Vec<i128> {
+/// Side B — order-independent per-column checksum over a built batch: `xxh3` of
+/// each cell's **value bytes**, XOR-combined. int/uint/float/decimal128/date/
+/// timestamp(µs) → little-endian value bytes; bool → a 0/1 byte; utf8/binary → the
+/// raw bytes. Uncovered types (Time64, FixedSizeBinary/UUID, List, ns-timestamps)
+/// contribute 0 on BOTH sides. Hashing every cell (vs the old value-sum) makes the
+/// check sensitive to **content** corruption that preserves length or sum — a byte
+/// flip, or two compensating changes — which a sum/length silently misses.
+pub fn arrow_batch_checksums(batch: &RecordBatch) -> Vec<u64> {
     batch.columns().iter().map(|c| column_checksum(c)).collect()
 }
 
-fn column_checksum(arr: &dyn Array) -> i128 {
-    let mut s: i128 = 0;
-    macro_rules! sum_prim {
-        ($t:ty, $f:expr) => {{
+fn column_checksum(arr: &dyn Array) -> u64 {
+    let mut acc: u64 = 0;
+    macro_rules! hash_prim {
+        ($t:ty) => {{
             let a = arr.as_primitive::<$t>();
             for i in 0..a.len() {
                 if !a.is_null(i) {
-                    s = s.wrapping_add($f(a.value(i)));
+                    acc ^= xxh3_64(&a.value(i).to_le_bytes());
                 }
             }
         }};
     }
     match arr.data_type() {
-        DataType::Int16 => sum_prim!(Int16Type, |v| v as i128),
-        DataType::Int32 => sum_prim!(Int32Type, |v| v as i128),
-        DataType::Int64 => sum_prim!(Int64Type, |v| v as i128),
-        DataType::UInt64 => sum_prim!(UInt64Type, |v| v as i128),
-        DataType::Float32 => sum_prim!(Float32Type, |v: f32| v.to_bits() as i128),
-        DataType::Float64 => sum_prim!(Float64Type, |v: f64| v.to_bits() as i128),
-        // The scaled i128 the array already holds; the source pass rescales the pg
-        // numeric the same way (truncate toward zero) so a build-time scaling bug
-        // shows as a mismatch.
-        DataType::Decimal128(..) => sum_prim!(Decimal128Type, |v| v),
-        DataType::Date32 => sum_prim!(Date32Type, |v| v as i128),
-        DataType::Timestamp(TimeUnit::Microsecond, _) => {
-            sum_prim!(TimestampMicrosecondType, |v| v as i128)
-        }
+        DataType::Int16 => hash_prim!(Int16Type),
+        DataType::Int32 => hash_prim!(Int32Type),
+        DataType::Int64 => hash_prim!(Int64Type),
+        DataType::UInt64 => hash_prim!(UInt64Type),
+        DataType::Float32 => hash_prim!(Float32Type),
+        DataType::Float64 => hash_prim!(Float64Type),
+        // The scaled i128 the array holds; the source pass rescales the pg numeric
+        // to the same i128 (truncate toward zero) so the bytes — and the hash —
+        // match on a correct build and diverge on a scaling bug.
+        DataType::Decimal128(..) => hash_prim!(Decimal128Type),
+        DataType::Date32 => hash_prim!(Date32Type),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => hash_prim!(TimestampMicrosecondType),
         DataType::Boolean => {
             let a = arr.as_boolean();
             for i in 0..a.len() {
-                if !a.is_null(i) && a.value(i) {
-                    s = s.wrapping_add(1);
+                if !a.is_null(i) {
+                    acc ^= xxh3_64(&[a.value(i) as u8]);
                 }
             }
         }
@@ -84,7 +91,7 @@ fn column_checksum(arr: &dyn Array) -> i128 {
             let a = arr.as_string::<i32>();
             for i in 0..a.len() {
                 if !a.is_null(i) {
-                    s = s.wrapping_add(a.value(i).len() as i128);
+                    acc ^= xxh3_64(a.value(i).as_bytes());
                 }
             }
         }
@@ -92,20 +99,20 @@ fn column_checksum(arr: &dyn Array) -> i128 {
             let a = arr.as_binary::<i32>();
             for i in 0..a.len() {
                 if !a.is_null(i) {
-                    s = s.wrapping_add(a.value(i).len() as i128);
+                    acc ^= xxh3_64(a.value(i));
                 }
             }
         }
         // Not yet covered (must match the source-side skip) — contribute 0.
         _ => {}
     }
-    s
+    acc
 }
 
 /// Compare the source-side ("A") and Arrow-side ("B") checksums column-by-column.
 /// A mismatch means the value converter produced a value the source did not — fail
 /// loud, naming the column, rather than write the corrupted batch.
-pub fn verify(source: &[i128], arrow: &[i128], schema: &SchemaRef) -> Result<()> {
+pub fn verify(source: &[u64], arrow: &[u64], schema: &SchemaRef) -> Result<()> {
     for (i, (a, b)) in source.iter().zip(arrow.iter()).enumerate() {
         if a != b {
             let col = schema.field(i).name();
@@ -122,7 +129,8 @@ pub fn verify(source: &[i128], arrow: &[i128], schema: &SchemaRef) -> Result<()>
 /// checksum ("side C"), comparing it to the value recorded in the manifest's
 /// `column_checksums`. Catches an `Arrow→Parquet` encode fault or post-write
 /// corruption that the in-process Form A check (source↔Arrow) cannot see. The
-/// recorded sums are i128 decimal strings (JSON-stable in the manifest).
+/// recorded values are the per-column u64 xxh3 hashes as decimal strings
+/// (JSON-stable in the manifest).
 ///
 /// The manifest field + this re-read entry are in place and unit-tested (it
 /// catches a corrupted re-read); the call site in the validate command is the
@@ -134,7 +142,7 @@ pub fn validate_recorded_checksums(
 ) -> Result<()> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-    let mut actual: Vec<i128> = Vec::new();
+    let mut actual: Vec<u64> = Vec::new();
     let mut schema: Option<SchemaRef> = None;
     for path in part_paths {
         let file = std::fs::File::open(path)
@@ -144,11 +152,11 @@ pub fn validate_recorded_checksums(
             let batch = batch?;
             if actual.is_empty() {
                 schema = Some(batch.schema());
-                actual = vec![0i128; batch.num_columns()];
+                actual = vec![0u64; batch.num_columns()];
             }
             for (i, c) in arrow_batch_checksums(&batch).into_iter().enumerate() {
                 if i < actual.len() {
-                    actual[i] = actual[i].wrapping_add(c);
+                    actual[i] ^= c;
                 }
             }
         }
@@ -162,8 +170,8 @@ pub fn validate_recorded_checksums(
         );
     }
     for (i, (rec, act)) in recorded.iter().zip(actual.iter()).enumerate() {
-        let rec_i: i128 = rec.parse().map_err(|_| {
-            anyhow::anyhow!("value checksum: manifest column {i} sum '{rec}' is not an integer")
+        let rec_i: u64 = rec.parse().map_err(|_| {
+            anyhow::anyhow!("value checksum: manifest column {i} hash '{rec}' is not a u64")
         })?;
         if rec_i != *act {
             let col = schema

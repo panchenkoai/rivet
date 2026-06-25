@@ -346,7 +346,7 @@ pub(super) fn rows_to_record_batch_typed(
 /// everything else contributes 0 on both sides. Decimal128 uses an independent
 /// `BigDecimal` decode (build_array goes through `decimal_str_to_scaled_i128` /
 /// `scale_int_to_i128`) rounding toward zero to match.
-fn mysql_rows_checksums(arrow_types: &[DataType], rows: &[mysql::Row]) -> Vec<i128> {
+fn mysql_rows_checksums(arrow_types: &[DataType], rows: &[mysql::Row]) -> Vec<u64> {
     use bigdecimal::{BigDecimal, RoundingMode, num_traits::ToPrimitive};
     let wire_columns = rows.first().map(|r| r.columns_ref());
     (0..arrow_types.len())
@@ -355,10 +355,19 @@ fn mysql_rows_checksums(arrow_types: &[DataType], rows: &[mysql::Row]) -> Vec<i1
                 cols.get(col_idx)
                     .is_some_and(|c| matches!(c.column_type(), ColumnType::MYSQL_TYPE_BIT))
             });
-            let mut s: i128 = 0;
+            let mut acc: u64 = 0;
+            // Hash the value's little-endian bytes (`add!`) or a raw byte slice
+            // (`addb!`), XORed into the column accumulator — the SAME bytes side B
+            // hashes for this target Arrow type. Widths must match (Int16 → i16,
+            // Date32 → i32) or the matrix guard false-mismatches.
             macro_rules! add {
                 ($e:expr) => {
-                    s = s.wrapping_add($e as i128)
+                    acc ^= xxhash_rust::xxh3::xxh3_64(&($e).to_le_bytes())
+                };
+            }
+            macro_rules! addb {
+                ($b:expr) => {
+                    acc ^= xxhash_rust::xxh3::xxh3_64($b)
                 };
             }
             let bd_scaled = |bd: BigDecimal, scale: i8| -> Option<i128> {
@@ -370,22 +379,39 @@ fn mysql_rows_checksums(arrow_types: &[DataType], rows: &[mysql::Row]) -> Vec<i1
             match &arrow_types[col_idx] {
                 DataType::Boolean => {
                     for row in rows {
+                        let b = match row.as_ref(col_idx) {
+                            Some(Value::Int(v)) => Some(*v != 0),
+                            Some(Value::UInt(v)) => Some(*v != 0),
+                            Some(Value::Bytes(bv)) => Some(bit_bytes_to_u64(bv) != 0),
+                            _ => None,
+                        };
+                        if let Some(b) = b {
+                            addb!(&[b as u8]);
+                        }
+                    }
+                }
+                DataType::Int16 => {
+                    for row in rows {
                         match row.as_ref(col_idx) {
-                            Some(Value::Int(v)) if *v != 0 => add!(1),
-                            Some(Value::UInt(v)) if *v != 0 => add!(1),
-                            Some(Value::Bytes(bv)) if bit_bytes_to_u64(bv) != 0 => add!(1),
+                            Some(Value::Int(v)) => add!(*v as i16),
+                            Some(Value::UInt(v)) => add!(*v as i16),
+                            Some(Value::Bytes(bv)) => {
+                                if let Some(v) = atoi::atoi::<i128>(bv) {
+                                    add!(v as i16);
+                                }
+                            }
                             _ => {}
                         }
                     }
                 }
-                DataType::Int16 | DataType::Int32 => {
+                DataType::Int32 => {
                     for row in rows {
                         match row.as_ref(col_idx) {
-                            Some(Value::Int(v)) => add!(*v),
-                            Some(Value::UInt(v)) => add!(*v),
+                            Some(Value::Int(v)) => add!(*v as i32),
+                            Some(Value::UInt(v)) => add!(*v as i32),
                             Some(Value::Bytes(bv)) => {
                                 if let Some(v) = atoi::atoi::<i128>(bv) {
-                                    add!(v);
+                                    add!(v as i32);
                                 }
                             }
                             _ => {}
@@ -449,19 +475,17 @@ fn mysql_rows_checksums(arrow_types: &[DataType], rows: &[mysql::Row]) -> Vec<i1
                 DataType::Utf8 => {
                     for row in rows {
                         match row.as_ref(col_idx) {
-                            Some(Value::Bytes(bv)) => {
-                                let len = bytes_to_str(bv)
-                                    .map(|s| s.len())
-                                    .unwrap_or_else(|| String::from_utf8_lossy(bv).len());
-                                add!(len);
-                            }
-                            Some(Value::Int(v)) => add!(v.to_string().len()),
-                            Some(Value::UInt(v)) => add!(v.to_string().len()),
-                            Some(Value::Float(v)) => add!(v.to_string().len()),
-                            Some(Value::Double(v)) => add!(v.to_string().len()),
-                            Some(Value::Date(y, m, d, h, mi, sx, us)) => add!(
+                            Some(Value::Bytes(bv)) => match bytes_to_str(bv) {
+                                Some(s) => addb!(s.as_bytes()),
+                                None => addb!(String::from_utf8_lossy(bv).as_bytes()),
+                            },
+                            Some(Value::Int(v)) => addb!(v.to_string().as_bytes()),
+                            Some(Value::UInt(v)) => addb!(v.to_string().as_bytes()),
+                            Some(Value::Float(v)) => addb!(v.to_string().as_bytes()),
+                            Some(Value::Double(v)) => addb!(v.to_string().as_bytes()),
+                            Some(Value::Date(y, m, d, h, mi, sx, us)) => addb!(
                                 format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{sx:02}.{us:06}")
-                                    .len()
+                                    .as_bytes()
                             ),
                             _ => {}
                         }
@@ -470,7 +494,7 @@ fn mysql_rows_checksums(arrow_types: &[DataType], rows: &[mysql::Row]) -> Vec<i1
                 DataType::Binary => {
                     for row in rows {
                         if let Some(Value::Bytes(bv)) = row.as_ref(col_idx) {
-                            add!(bv.len());
+                            addb!(bv);
                         }
                     }
                 }
@@ -491,7 +515,7 @@ fn mysql_rows_checksums(arrow_types: &[DataType], rows: &[mysql::Row]) -> Vec<i1
                         };
                         if let Some(date) = d {
                             let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                            add!((date - epoch).num_days());
+                            add!((date - epoch).num_days() as i32);
                         }
                     }
                 }
@@ -533,7 +557,7 @@ fn mysql_rows_checksums(arrow_types: &[DataType], rows: &[mysql::Row]) -> Vec<i1
                 // both sides (see value_checksum coverage note).
                 _ => {}
             }
-            s
+            acc
         })
         .collect()
 }

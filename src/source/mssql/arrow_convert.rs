@@ -513,26 +513,32 @@ pub(super) fn mssql_rows_to_record_batch(
 /// decimal128); the rest contributes 0 on both sides. Decimal128 uses an
 /// independent `BigDecimal` rescale (build_array goes through `rescale_i128`)
 /// rounding toward zero to match.
-fn mssql_rows_checksums(schema: &SchemaRef, rows: &[Row]) -> Vec<i128> {
+fn mssql_rows_checksums(schema: &SchemaRef, rows: &[Row]) -> Vec<u64> {
     use bigdecimal::{BigDecimal, RoundingMode, num_bigint::BigInt, num_traits::ToPrimitive};
     schema
         .fields()
         .iter()
         .enumerate()
         .map(|(idx, field)| {
-            let mut s: i128 = 0;
+            let mut acc: u64 = 0;
+            // Hash the value's little-endian bytes (`add!`) or a raw byte slice
+            // (`addb!`), XORed into the column accumulator — the SAME bytes side B
+            // hashes for this target Arrow type (widths must match: Int16 → i16).
             macro_rules! add {
                 ($e:expr) => {
-                    s = s.wrapping_add($e as i128)
+                    acc ^= xxhash_rust::xxh3::xxh3_64(&($e).to_le_bytes())
+                };
+            }
+            macro_rules! addb {
+                ($b:expr) => {
+                    acc ^= xxhash_rust::xxh3::xxh3_64($b)
                 };
             }
             match field.data_type() {
                 DataType::Boolean => {
                     for row in rows {
-                        if let Some(ColumnData::Bit(Some(v))) = cell(row, idx)
-                            && *v
-                        {
-                            add!(1);
+                        if let Some(ColumnData::Bit(Some(v))) = cell(row, idx) {
+                            addb!(&[*v as u8]);
                         }
                     }
                 }
@@ -540,7 +546,7 @@ fn mssql_rows_checksums(schema: &SchemaRef, rows: &[Row]) -> Vec<i128> {
                     for row in rows {
                         match cell(row, idx) {
                             Some(ColumnData::I16(Some(v))) => add!(*v),
-                            Some(ColumnData::U8(Some(v))) => add!(*v),
+                            Some(ColumnData::U8(Some(v))) => add!(*v as i16),
                             _ => {}
                         }
                     }
@@ -576,14 +582,14 @@ fn mssql_rows_checksums(schema: &SchemaRef, rows: &[Row]) -> Vec<i128> {
                 DataType::Utf8 => {
                     for row in rows {
                         if let Some(ColumnData::String(Some(v))) = cell(row, idx) {
-                            add!(v.len());
+                            addb!(v.as_bytes());
                         }
                     }
                 }
                 DataType::Binary => {
                     for row in rows {
                         if let Some(ColumnData::Binary(Some(v))) = cell(row, idx) {
-                            add!(v.len());
+                            addb!(v);
                         }
                     }
                 }
@@ -627,7 +633,7 @@ fn mssql_rows_checksums(schema: &SchemaRef, rows: &[Row]) -> Vec<i128> {
                 // on both sides (see value_checksum coverage note).
                 _ => {}
             }
-            s
+            acc
         })
         .collect()
 }
