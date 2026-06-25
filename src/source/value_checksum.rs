@@ -180,6 +180,91 @@ fn feed_cell(h: &mut Xxh3, arr: &dyn Array, r: usize) {
     }
 }
 
+/// A per-engine, INDEPENDENT source of typed cell values — a second decode of the
+/// same rows, the side-A twin of side B's Arrow read. Each accessor returns the
+/// cell's canonical value (the generic [`source_checksums`] byte-encodes it
+/// identically to [`feed_cell`]) or `None` for a NULL / absent cell; the
+/// variable-length `feed_*` accessors feed the hasher directly (a borrowed slice or
+/// a computed string) and return whether they fed. A new covered type is a new
+/// required method here — a compile requirement on all three engines, which is the
+/// point of routing every engine through ONE dispatch instead of three.
+pub trait CellSource {
+    fn num_rows(&self) -> usize;
+    fn int16(&self, col: usize, row: usize) -> Option<i16>;
+    fn int32(&self, col: usize, row: usize) -> Option<i32>;
+    fn int64(&self, col: usize, row: usize) -> Option<i64>;
+    fn uint64(&self, col: usize, row: usize) -> Option<u64>;
+    fn float32(&self, col: usize, row: usize) -> Option<f32>;
+    fn float64(&self, col: usize, row: usize) -> Option<f64>;
+    fn decimal128(&self, col: usize, row: usize, scale: i8) -> Option<i128>;
+    fn date32(&self, col: usize, row: usize) -> Option<i32>;
+    fn ts_micros(&self, col: usize, row: usize) -> Option<i64>;
+    fn boolean(&self, col: usize, row: usize) -> Option<bool>;
+    fn feed_utf8(&self, col: usize, row: usize, h: &mut Xxh3) -> bool;
+    fn feed_binary(&self, col: usize, row: usize, h: &mut Xxh3) -> bool;
+}
+
+/// Side A — the per-column checksum computed **independently** from a [`CellSource`]
+/// (the raw driver values), the single dispatch behind every engine's source pass.
+/// Dispatches on the target Arrow type, byte-encodes each non-null cell **identically
+/// to [`feed_cell`]** (so a correct build keeps A==B and the matrix guard fires on
+/// any drift), XOR-combined. Un-keyed: the in-process Form A check is un-keyed today.
+pub fn source_checksums<S: CellSource>(schema: &SchemaRef, src: &S) -> Vec<u64> {
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(col, field)| {
+            let dt = field.data_type();
+            if matches!(check_rule(dt), CheckRule::Skipped(_)) {
+                return 0;
+            }
+            let mut acc: u64 = 0;
+            for row in 0..src.num_rows() {
+                let mut h = Xxh3::new();
+                // `le!` feeds a Copy value's little-endian bytes when present —
+                // matching `feed_cell`'s `to_le_bytes` arms exactly.
+                macro_rules! le {
+                    ($opt:expr) => {
+                        match $opt {
+                            Some(v) => {
+                                h.update(&v.to_le_bytes());
+                                true
+                            }
+                            None => false,
+                        }
+                    };
+                }
+                let fed = match dt {
+                    DataType::Int16 => le!(src.int16(col, row)),
+                    DataType::Int32 => le!(src.int32(col, row)),
+                    DataType::Int64 => le!(src.int64(col, row)),
+                    DataType::UInt64 => le!(src.uint64(col, row)),
+                    DataType::Float32 => le!(src.float32(col, row)),
+                    DataType::Float64 => le!(src.float64(col, row)),
+                    DataType::Decimal128(_, scale) => le!(src.decimal128(col, row, *scale)),
+                    DataType::Date32 => le!(src.date32(col, row)),
+                    DataType::Timestamp(TimeUnit::Microsecond, _) => le!(src.ts_micros(col, row)),
+                    DataType::Boolean => match src.boolean(col, row) {
+                        Some(b) => {
+                            h.update(&[b as u8]);
+                            true
+                        }
+                        None => false,
+                    },
+                    DataType::Utf8 => src.feed_utf8(col, row, &mut h),
+                    DataType::Binary => src.feed_binary(col, row, &mut h),
+                    _ => false,
+                };
+                if fed {
+                    acc ^= h.digest();
+                }
+            }
+            acc
+        })
+        .collect()
+}
+
 /// Compare the source-side ("A") and Arrow-side ("B") checksums column-by-column.
 /// A mismatch means the value converter produced a value the source did not — fail
 /// loud, naming the column, rather than write the corrupted batch.

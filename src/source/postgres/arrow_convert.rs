@@ -417,213 +417,144 @@ pub(super) fn rows_to_record_batch_typed(
     // raw pg values (A) vs the Arrow-side pass over the built batch (B). A mismatch
     // means the value converter changed a value between read and Arrow build — fail
     // loud rather than write the bad batch.
-    let a = pg_rows_checksums(schema, columns, rows);
+    let a =
+        crate::source::value_checksum::source_checksums(schema, &PgCellSource { columns, rows });
     let b = crate::source::value_checksum::arrow_batch_checksums(&batch);
     crate::source::value_checksum::verify(&a, &b, schema)?;
     Ok(batch)
 }
 
-/// Side A of the Form A value-checksum: the per-column additive checksum computed
-/// **independently** from the raw pg `Row` values, mirroring `build_array`'s
-/// intended per-type transform so it equals side B on a correct build. Dispatches
-/// on the resolved target Arrow type (same decision site as `build_array`) so it
-/// covers exactly the types side B covers and skips exactly the ones it skips —
-/// any drift here is a false mismatch. Nulls contribute 0 (side B skips them too).
-fn pg_rows_checksums(schema: &SchemaRef, columns: &[(String, Type)], rows: &[Row]) -> Vec<u64> {
-    (0..columns.len())
-        .map(|col_idx| {
-            let target = schema.field(col_idx).data_type();
-            let pg_type = &columns[col_idx].1;
-            let mut acc: u64 = 0;
-            // Hash the value's little-endian bytes — the SAME bytes side B
-            // (`arrow_batch_checksums`) hashes for this target Arrow type — XORed
-            // into the column accumulator (order-independent). `addb!` hashes a raw
-            // byte slice (strings / binary). The widths must match side B (Date32 →
-            // i32, an OID widened to i64, etc.) or the matrix guard false-mismatches.
-            macro_rules! add {
-                ($e:expr) => {
-                    acc ^= xxhash_rust::xxh3::xxh3_64(&($e).to_le_bytes());
-                };
+/// Side A of the Form A value-checksum for Postgres — an INDEPENDENT decode of the
+/// raw `Row` values (mirroring `build_array`'s per-type transform) so it equals side
+/// B on a correct build. Drives the shared
+/// [`crate::source::value_checksum::source_checksums`] dispatch; each accessor holds
+/// the pg-specific extraction (OID widen, TIMESTAMPTZ, the text/json/numeric/uuid/
+/// interval/enum split, numeric wire → scaled i128). Bytes must match `feed_cell`
+/// or the matrix guard false-mismatches.
+struct PgCellSource<'a> {
+    columns: &'a [(String, Type)],
+    rows: &'a [Row],
+}
+
+impl crate::source::value_checksum::CellSource for PgCellSource<'_> {
+    fn num_rows(&self) -> usize {
+        self.rows.len()
+    }
+    fn int16(&self, col: usize, row: usize) -> Option<i16> {
+        self.rows[row].get::<_, Option<i16>>(col)
+    }
+    fn int32(&self, col: usize, row: usize) -> Option<i32> {
+        self.rows[row].get::<_, Option<i32>>(col)
+    }
+    fn int64(&self, col: usize, row: usize) -> Option<i64> {
+        if self.columns[col].1 == Type::OID {
+            self.rows[row].get::<_, Option<u32>>(col).map(|v| v as i64)
+        } else {
+            self.rows[row].get::<_, Option<i64>>(col)
+        }
+    }
+    fn uint64(&self, _col: usize, _row: usize) -> Option<u64> {
+        // Postgres never maps to UInt64 (OID widens to i64), so source_checksums
+        // never calls this — a UInt64 column is not produced by this engine.
+        None
+    }
+    fn float32(&self, col: usize, row: usize) -> Option<f32> {
+        self.rows[row].get::<_, Option<f32>>(col)
+    }
+    fn float64(&self, col: usize, row: usize) -> Option<f64> {
+        self.rows[row].get::<_, Option<f64>>(col)
+    }
+    fn decimal128(&self, col: usize, row: usize, scale: i8) -> Option<i128> {
+        let wire = self.rows[row]
+            .try_get::<_, Option<PgNumericWire<'_>>>(col)
+            .ok()
+            .flatten()?;
+        let bd = crate::source::pg_numeric_wire::wire_to_big_decimal(wire.0)?;
+        let scaled = bd.with_scale_round(scale as i64, bigdecimal::RoundingMode::Down);
+        bigdecimal::num_traits::ToPrimitive::to_i128(&scaled.into_bigint_and_exponent().0)
+    }
+    fn date32(&self, col: usize, row: usize) -> Option<i32> {
+        let d = self.rows[row].get::<_, Option<chrono::NaiveDate>>(col)?;
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch valid");
+        Some((d - epoch).num_days() as i32)
+    }
+    fn ts_micros(&self, col: usize, row: usize) -> Option<i64> {
+        if self.columns[col].1 == Type::TIMESTAMPTZ {
+            self.rows[row]
+                .get::<_, Option<chrono::DateTime<chrono::Utc>>>(col)
+                .map(|ts| ts.timestamp_micros())
+        } else {
+            self.rows[row]
+                .get::<_, Option<chrono::NaiveDateTime>>(col)
+                .map(|ts| ts.and_utc().timestamp_micros())
+        }
+    }
+    fn boolean(&self, col: usize, row: usize) -> Option<bool> {
+        self.rows[row].get::<_, Option<bool>>(col)
+    }
+    fn feed_binary(&self, col: usize, row: usize, h: &mut xxhash_rust::xxh3::Xxh3) -> bool {
+        match self.rows[row].get::<_, Option<Vec<u8>>>(col) {
+            Some(v) => {
+                h.update(&v);
+                true
             }
-            macro_rules! addb {
-                ($b:expr) => {
-                    acc ^= xxhash_rust::xxh3::xxh3_64($b);
-                };
+            None => false,
+        }
+    }
+    fn feed_utf8(&self, col: usize, row: usize, h: &mut xxhash_rust::xxh3::Xxh3) -> bool {
+        let r = &self.rows[row];
+        match self.columns[col].1 {
+            Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => {
+                match r.get::<_, Option<&str>>(col) {
+                    Some(t) => {
+                        h.update(t.as_bytes());
+                        true
+                    }
+                    None => false,
+                }
             }
-            match target {
-                DataType::Int16 => {
-                    for row in rows {
-                        if let Some(v) = row.get::<_, Option<i16>>(col_idx) {
-                            add!(v);
-                        }
-                    }
+            Type::JSON | Type::JSONB => match r.try_get::<_, Option<PgJsonRawText<'_>>>(col) {
+                Ok(Some(PgJsonRawText(t))) => {
+                    h.update(t.as_bytes());
+                    true
                 }
-                DataType::Int32 => {
-                    for row in rows {
-                        if let Some(v) = row.get::<_, Option<i32>>(col_idx) {
-                            add!(v);
-                        }
-                    }
+                _ => false,
+            },
+            Type::NUMERIC => match pg_numeric_optional_utf8_string(r, col) {
+                Ok(Some(t)) => {
+                    h.update(t.as_bytes());
+                    true
                 }
-                DataType::Int64 => {
-                    if *pg_type == Type::OID {
-                        for row in rows {
-                            if let Some(v) = row.get::<_, Option<u32>>(col_idx) {
-                                add!(v as i64);
-                            }
-                        }
-                    } else {
-                        for row in rows {
-                            if let Some(v) = row.get::<_, Option<i64>>(col_idx) {
-                                add!(v);
-                            }
-                        }
-                    }
+                _ => false,
+            },
+            Type::UUID => match r.try_get::<_, Option<PgUuidBytes>>(col) {
+                Ok(Some(PgUuidBytes(b))) => {
+                    h.update(uuid::Uuid::from_bytes(b).to_string().as_bytes());
+                    true
                 }
-                DataType::Float32 => {
-                    for row in rows {
-                        if let Some(v) = row.get::<_, Option<f32>>(col_idx) {
-                            add!(v.to_bits());
-                        }
-                    }
+                _ => false,
+            },
+            Type::INTERVAL => match r.try_get::<_, Option<PgInterval>>(col).ok().flatten() {
+                Some(iv) => {
+                    h.update(
+                        pg_interval_to_iso8601(iv.months, iv.days, iv.microseconds).as_bytes(),
+                    );
+                    true
                 }
-                DataType::Float64 => {
-                    for row in rows {
-                        if let Some(v) = row.get::<_, Option<f64>>(col_idx) {
-                            add!(v.to_bits());
-                        }
+                None => false,
+            },
+            ref t if matches!(t.kind(), Kind::Enum(_)) => {
+                match r.try_get::<_, Option<AnyAsString>>(col).ok().flatten() {
+                    Some(s) => {
+                        h.update(s.0.as_bytes());
+                        true
                     }
+                    None => false,
                 }
-                DataType::Boolean => {
-                    for row in rows {
-                        if let Some(b) = row.get::<_, Option<bool>>(col_idx) {
-                            addb!(&[b as u8]);
-                        }
-                    }
-                }
-                DataType::Date32 => {
-                    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch valid");
-                    for row in rows {
-                        if let Some(d) = row.get::<_, Option<chrono::NaiveDate>>(col_idx) {
-                            add!((d - epoch).num_days() as i32);
-                        }
-                    }
-                }
-                DataType::Timestamp(_, _) => {
-                    if *pg_type == Type::TIMESTAMPTZ {
-                        for row in rows {
-                            if let Some(ts) =
-                                row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(col_idx)
-                            {
-                                add!(ts.timestamp_micros());
-                            }
-                        }
-                    } else {
-                        for row in rows {
-                            if let Some(ts) = row.get::<_, Option<chrono::NaiveDateTime>>(col_idx) {
-                                add!(ts.and_utc().timestamp_micros());
-                            }
-                        }
-                    }
-                }
-                DataType::Binary => {
-                    for row in rows {
-                        if let Some(v) = row.get::<_, Option<Vec<u8>>>(col_idx) {
-                            addb!(&v);
-                        }
-                    }
-                }
-                DataType::Utf8 => match *pg_type {
-                    Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => {
-                        for row in rows {
-                            let v: Option<&str> = row.get(col_idx);
-                            if let Some(t) = v {
-                                addb!(t.as_bytes());
-                            }
-                        }
-                    }
-                    Type::JSON | Type::JSONB => {
-                        for row in rows {
-                            if let Ok(Some(PgJsonRawText(text))) =
-                                row.try_get::<_, Option<PgJsonRawText<'_>>>(col_idx)
-                            {
-                                addb!(text.as_bytes());
-                            }
-                        }
-                    }
-                    Type::NUMERIC => {
-                        for row in rows {
-                            if let Ok(Some(t)) = pg_numeric_optional_utf8_string(row, col_idx) {
-                                addb!(t.as_bytes());
-                            }
-                        }
-                    }
-                    Type::UUID => {
-                        for row in rows {
-                            if let Ok(Some(PgUuidBytes(bytes))) =
-                                row.try_get::<_, Option<PgUuidBytes>>(col_idx)
-                            {
-                                addb!(uuid::Uuid::from_bytes(bytes).to_string().as_bytes());
-                            }
-                        }
-                    }
-                    Type::INTERVAL => {
-                        for row in rows {
-                            if let Some(iv) =
-                                row.try_get::<_, Option<PgInterval>>(col_idx).ok().flatten()
-                            {
-                                addb!(
-                                    pg_interval_to_iso8601(iv.months, iv.days, iv.microseconds)
-                                        .as_bytes()
-                                );
-                            }
-                        }
-                    }
-                    // Enum labels arrive as binary; read as UTF-8 (mirrors
-                    // build_pg_text_array) — otherwise side B's byte length for the
-                    // enum column goes uncounted on side A and false-mismatches.
-                    _ if matches!(pg_type.kind(), Kind::Enum(_)) => {
-                        for row in rows {
-                            if let Some(s) = row
-                                .try_get::<_, Option<AnyAsString>>(col_idx)
-                                .ok()
-                                .flatten()
-                            {
-                                addb!(s.0.as_bytes());
-                            }
-                        }
-                    }
-                    // build_pg_text_array bails on any other text wire type, so a
-                    // real batch never reaches this arm.
-                    _ => {}
-                },
-                // Decimal128: decode the pg numeric wire to BigDecimal and rescale
-                // (truncate toward zero, matching `decimal_str_to_scaled_i128`) — an
-                // INDEPENDENT path from build_array's text→scaled-i128, so a scaling
-                // or build bug surfaces as a mismatch rather than passing silently.
-                DataType::Decimal128(_p, scale) => {
-                    for row in rows {
-                        if let Ok(Some(wire)) = row.try_get::<_, Option<PgNumericWire<'_>>>(col_idx)
-                            && let Some(bd) =
-                                crate::source::pg_numeric_wire::wire_to_big_decimal(wire.0)
-                        {
-                            let scaled =
-                                bd.with_scale_round(*scale as i64, bigdecimal::RoundingMode::Down);
-                            let (mantissa, _exp) = scaled.into_bigint_and_exponent();
-                            if let Some(v) = bigdecimal::num_traits::ToPrimitive::to_i128(&mantissa)
-                            {
-                                add!(v);
-                            }
-                        }
-                    }
-                }
-                // FixedSizeBinary (UUID) / List / Time64 / etc. — skipped on both
-                // sides for now.
-                _ => {}
             }
-            acc
-        })
-        .collect()
+            _ => false,
+        }
+    }
 }
 
 fn build_array(

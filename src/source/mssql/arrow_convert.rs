@@ -500,142 +500,113 @@ pub(super) fn mssql_rows_to_record_batch(
     let batch = arrow::record_batch::RecordBatch::try_new(schema.clone(), arrays)?;
     // Form A value-checksum (always-on): source-side pass (A) vs the built batch
     // (B) — fail loud if the value converter diverged between read and Arrow build.
-    let a = mssql_rows_checksums(schema, rows);
+    let a = crate::source::value_checksum::source_checksums(schema, &MssqlCellSource { rows });
     let b = crate::source::value_checksum::arrow_batch_checksums(&batch);
     crate::source::value_checksum::verify(&a, &b, schema)?;
     Ok(batch)
 }
 
-/// Source-side value checksum for SQL Server (Form A, side A). Mirrors
-/// `build_array`'s per-type `ColumnData` decode, independently of the Arrow
-/// build, covering exactly what `value_checksum::arrow_batch_checksums` (side B)
-/// covers (int / float / bool / date / timestamp(µs) / utf8 / binary /
-/// decimal128); the rest contributes 0 on both sides. Decimal128 uses an
-/// independent `BigDecimal` rescale (build_array goes through `rescale_i128`)
-/// rounding toward zero to match.
-fn mssql_rows_checksums(schema: &SchemaRef, rows: &[Row]) -> Vec<u64> {
-    use bigdecimal::{BigDecimal, RoundingMode, num_bigint::BigInt, num_traits::ToPrimitive};
-    schema
-        .fields()
-        .iter()
-        .enumerate()
-        .map(|(idx, field)| {
-            let mut acc: u64 = 0;
-            // Hash the value's little-endian bytes (`add!`) or a raw byte slice
-            // (`addb!`), XORed into the column accumulator — the SAME bytes side B
-            // hashes for this target Arrow type (widths must match: Int16 → i16).
-            macro_rules! add {
-                ($e:expr) => {
-                    acc ^= xxhash_rust::xxh3::xxh3_64(&($e).to_le_bytes())
-                };
+/// Side A of the Form A value-checksum for SQL Server — an INDEPENDENT decode of the
+/// raw `ColumnData` (mirroring `build_array`) so it equals side B on a correct build.
+/// Drives the shared [`crate::source::value_checksum::source_checksums`] dispatch;
+/// each accessor holds the tiberius extraction (`cell`, the I16/U8 widen, datetime /
+/// datetimeoffset via `try_get`, numeric via `BigDecimal`). Bytes must match
+/// `feed_cell` or the matrix guard false-mismatches.
+struct MssqlCellSource<'a> {
+    rows: &'a [Row],
+}
+
+impl crate::source::value_checksum::CellSource for MssqlCellSource<'_> {
+    fn num_rows(&self) -> usize {
+        self.rows.len()
+    }
+    fn boolean(&self, col: usize, row: usize) -> Option<bool> {
+        match cell(&self.rows[row], col) {
+            Some(ColumnData::Bit(Some(v))) => Some(*v),
+            _ => None,
+        }
+    }
+    fn int16(&self, col: usize, row: usize) -> Option<i16> {
+        match cell(&self.rows[row], col) {
+            Some(ColumnData::I16(Some(v))) => Some(*v),
+            Some(ColumnData::U8(Some(v))) => Some(*v as i16),
+            _ => None,
+        }
+    }
+    fn int32(&self, col: usize, row: usize) -> Option<i32> {
+        match cell(&self.rows[row], col) {
+            Some(ColumnData::I32(Some(v))) => Some(*v),
+            _ => None,
+        }
+    }
+    fn int64(&self, col: usize, row: usize) -> Option<i64> {
+        match cell(&self.rows[row], col) {
+            Some(ColumnData::I64(Some(v))) => Some(*v),
+            _ => None,
+        }
+    }
+    fn uint64(&self, _col: usize, _row: usize) -> Option<u64> {
+        None // SQL Server never maps to UInt64.
+    }
+    fn float32(&self, col: usize, row: usize) -> Option<f32> {
+        match cell(&self.rows[row], col) {
+            Some(ColumnData::F32(Some(v))) => Some(*v),
+            _ => None,
+        }
+    }
+    fn float64(&self, col: usize, row: usize) -> Option<f64> {
+        match cell(&self.rows[row], col) {
+            Some(ColumnData::F64(Some(v))) => Some(*v),
+            _ => None,
+        }
+    }
+    fn decimal128(&self, col: usize, row: usize, scale: i8) -> Option<i128> {
+        use bigdecimal::{BigDecimal, RoundingMode, num_bigint::BigInt, num_traits::ToPrimitive};
+        let target_scale = scale.max(0) as i64;
+        match cell(&self.rows[row], col) {
+            Some(ColumnData::Numeric(Some(n))) => {
+                BigDecimal::new(BigInt::from(n.value()), n.scale() as i64)
+                    .with_scale_round(target_scale, RoundingMode::Down)
+                    .into_bigint_and_exponent()
+                    .0
+                    .to_i128()
             }
-            macro_rules! addb {
-                ($b:expr) => {
-                    acc ^= xxhash_rust::xxh3::xxh3_64($b)
-                };
+            _ => None,
+        }
+    }
+    fn date32(&self, col: usize, row: usize) -> Option<i32> {
+        let d = self.rows[row].try_get::<NaiveDate, _>(col).ok().flatten()?;
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        Some((d - epoch).num_days() as i32 + UNIX_EPOCH_DAY)
+    }
+    fn ts_micros(&self, col: usize, row: usize) -> Option<i64> {
+        match self.rows[row].try_get::<NaiveDateTime, _>(col) {
+            Ok(v) => v.map(|dt| dt.and_utc().timestamp_micros()),
+            Err(_) => match self.rows[row].try_get::<chrono::DateTime<chrono::FixedOffset>, _>(col)
+            {
+                Ok(v) => v.map(|dt| dt.timestamp_micros()),
+                Err(_) => None,
+            },
+        }
+    }
+    fn feed_binary(&self, col: usize, row: usize, h: &mut xxhash_rust::xxh3::Xxh3) -> bool {
+        match cell(&self.rows[row], col) {
+            Some(ColumnData::Binary(Some(v))) => {
+                h.update(v);
+                true
             }
-            match field.data_type() {
-                DataType::Boolean => {
-                    for row in rows {
-                        if let Some(ColumnData::Bit(Some(v))) = cell(row, idx) {
-                            addb!(&[*v as u8]);
-                        }
-                    }
-                }
-                DataType::Int16 => {
-                    for row in rows {
-                        match cell(row, idx) {
-                            Some(ColumnData::I16(Some(v))) => add!(*v),
-                            Some(ColumnData::U8(Some(v))) => add!(*v as i16),
-                            _ => {}
-                        }
-                    }
-                }
-                DataType::Int32 => {
-                    for row in rows {
-                        if let Some(ColumnData::I32(Some(v))) = cell(row, idx) {
-                            add!(*v);
-                        }
-                    }
-                }
-                DataType::Int64 => {
-                    for row in rows {
-                        if let Some(ColumnData::I64(Some(v))) = cell(row, idx) {
-                            add!(*v);
-                        }
-                    }
-                }
-                DataType::Float32 => {
-                    for row in rows {
-                        if let Some(ColumnData::F32(Some(v))) = cell(row, idx) {
-                            add!(v.to_bits());
-                        }
-                    }
-                }
-                DataType::Float64 => {
-                    for row in rows {
-                        if let Some(ColumnData::F64(Some(v))) = cell(row, idx) {
-                            add!(v.to_bits());
-                        }
-                    }
-                }
-                DataType::Utf8 => {
-                    for row in rows {
-                        if let Some(ColumnData::String(Some(v))) = cell(row, idx) {
-                            addb!(v.as_bytes());
-                        }
-                    }
-                }
-                DataType::Binary => {
-                    for row in rows {
-                        if let Some(ColumnData::Binary(Some(v))) = cell(row, idx) {
-                            addb!(v);
-                        }
-                    }
-                }
-                DataType::Date32 => {
-                    for row in rows {
-                        if let Ok(Some(d)) = row.try_get::<NaiveDate, _>(idx) {
-                            let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                            add!((d - epoch).num_days() as i32 + UNIX_EPOCH_DAY);
-                        }
-                    }
-                }
-                DataType::Timestamp(TimeUnit::Microsecond, _) => {
-                    for row in rows {
-                        let micros = match row.try_get::<NaiveDateTime, _>(idx) {
-                            Ok(v) => v.map(|dt| dt.and_utc().timestamp_micros()),
-                            Err(_) => {
-                                match row.try_get::<chrono::DateTime<chrono::FixedOffset>, _>(idx) {
-                                    Ok(v) => v.map(|dt| dt.timestamp_micros()),
-                                    Err(_) => None,
-                                }
-                            }
-                        };
-                        if let Some(m) = micros {
-                            add!(m);
-                        }
-                    }
-                }
-                DataType::Decimal128(_p, sc) => {
-                    let target_scale = (*sc).max(0) as i64;
-                    for row in rows {
-                        if let Some(ColumnData::Numeric(Some(n))) = cell(row, idx) {
-                            let bd = BigDecimal::new(BigInt::from(n.value()), n.scale() as i64)
-                                .with_scale_round(target_scale, RoundingMode::Down);
-                            if let Some(v) = bd.into_bigint_and_exponent().0.to_i128() {
-                                add!(v);
-                            }
-                        }
-                    }
-                }
-                // Guid (UUID) / Time64 / nanosecond timestamps / Decimal256 — skipped
-                // on both sides (see value_checksum coverage note).
-                _ => {}
+            _ => false,
+        }
+    }
+    fn feed_utf8(&self, col: usize, row: usize, h: &mut xxhash_rust::xxh3::Xxh3) -> bool {
+        match cell(&self.rows[row], col) {
+            Some(ColumnData::String(Some(v))) => {
+                h.update(v.as_bytes());
+                true
             }
-            acc
-        })
-        .collect()
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]
