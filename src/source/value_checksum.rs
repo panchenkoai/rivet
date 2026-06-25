@@ -13,14 +13,14 @@
 //! and the differential fingerprint (test-time), it does not replace them.
 //!
 //! Coverage (both sides MUST agree, or the check false-mismatches): int / uint /
-//! float / bool / date / timestamp(µs) / utf8 / binary. Decimal128, Time64,
+//! float / bool / date / timestamp(µs) / utf8 / binary / decimal128. Time64,
 //! FixedSizeBinary (UUID), List, and nanosecond timestamps contribute 0 on BOTH
-//! sides for this first cut (not yet matched between the two passes).
+//! sides for now (not yet matched between the two passes).
 
 use std::sync::OnceLock;
 
 use arrow::array::types::{
-    Date32Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
+    Date32Type, Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
     TimestampMicrosecondType, UInt64Type,
 };
 use arrow::array::{Array, AsArray, RecordBatch};
@@ -64,6 +64,10 @@ fn column_checksum(arr: &dyn Array) -> i128 {
         DataType::UInt64 => sum_prim!(UInt64Type, |v| v as i128),
         DataType::Float32 => sum_prim!(Float32Type, |v: f32| v.to_bits() as i128),
         DataType::Float64 => sum_prim!(Float64Type, |v: f64| v.to_bits() as i128),
+        // The scaled i128 the array already holds; the source pass rescales the pg
+        // numeric the same way (truncate toward zero) so a build-time scaling bug
+        // shows as a mismatch.
+        DataType::Decimal128(..) => sum_prim!(Decimal128Type, |v| v),
         DataType::Date32 => sum_prim!(Date32Type, |v| v as i128),
         DataType::Timestamp(TimeUnit::Microsecond, _) => {
             sum_prim!(TimestampMicrosecondType, |v| v as i128)
@@ -182,6 +186,39 @@ mod tests {
         assert!(
             verify(&cg, &cb, &s).is_err(),
             "verify must fire when a column diverges"
+        );
+    }
+
+    #[test]
+    fn decimal128_checksum_distinguishes_a_scaling_bug() {
+        // The decimal arm must be sensitive too: a build-time scaling bug (12.34
+        // scaled to 1234, but built as 123) must move the column checksum and fire
+        // verify — not pass silently.
+        use arrow::array::Decimal128Array;
+        let s: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(18, 2),
+            true,
+        )]));
+        let mk = |mid: i128| {
+            RecordBatch::try_new(
+                s.clone(),
+                vec![Arc::new(
+                    Decimal128Array::from(vec![1234_i128, mid, -99])
+                        .with_precision_and_scale(18, 2)
+                        .unwrap(),
+                )],
+            )
+            .unwrap()
+        };
+        let good = mk(5000); // 50.00
+        let bad = mk(500); //  5.00 — a 10x scaling slip
+        let cg = arrow_batch_checksums(&good);
+        let cb = arrow_batch_checksums(&bad);
+        assert_ne!(cg[0], cb[0], "a decimal scaling bug must move the checksum");
+        assert!(
+            verify(&cg, &cb, &s).is_err(),
+            "verify must fire on the decimal divergence"
         );
     }
 }

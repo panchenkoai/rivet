@@ -575,8 +575,28 @@ fn pg_rows_checksums(schema: &SchemaRef, columns: &[(String, Type)], rows: &[Row
                     // not reproduce here, so skip rather than risk a false mismatch.
                     _ => {}
                 },
-                // Decimal128 / FixedSizeBinary (UUID) / List / Time64 / etc. —
-                // skipped on both sides for this first cut.
+                // Decimal128: decode the pg numeric wire to BigDecimal and rescale
+                // (truncate toward zero, matching `decimal_str_to_scaled_i128`) — an
+                // INDEPENDENT path from build_array's text→scaled-i128, so a scaling
+                // or build bug surfaces as a mismatch rather than passing silently.
+                DataType::Decimal128(_p, scale) => {
+                    for row in rows {
+                        if let Ok(Some(wire)) = row.try_get::<_, Option<PgNumericWire<'_>>>(col_idx)
+                            && let Some(bd) =
+                                crate::source::pg_numeric_wire::wire_to_big_decimal(wire.0)
+                        {
+                            let scaled =
+                                bd.with_scale_round(*scale as i64, bigdecimal::RoundingMode::Down);
+                            let (mantissa, _exp) = scaled.into_bigint_and_exponent();
+                            if let Some(v) = bigdecimal::num_traits::ToPrimitive::to_i128(&mantissa)
+                            {
+                                add!(v);
+                            }
+                        }
+                    }
+                }
+                // FixedSizeBinary (UUID) / List / Time64 / etc. — skipped on both
+                // sides for now.
                 _ => {}
             }
             s
