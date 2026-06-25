@@ -571,8 +571,22 @@ fn pg_rows_checksums(schema: &SchemaRef, columns: &[(String, Type)], rows: &[Row
                             }
                         }
                     }
-                    // Any other text wire type: side B counts a byte length we did
-                    // not reproduce here, so skip rather than risk a false mismatch.
+                    // Enum labels arrive as binary; read as UTF-8 (mirrors
+                    // build_pg_text_array) — otherwise side B's byte length for the
+                    // enum column goes uncounted on side A and false-mismatches.
+                    _ if matches!(pg_type.kind(), Kind::Enum(_)) => {
+                        for row in rows {
+                            if let Some(s) = row
+                                .try_get::<_, Option<AnyAsString>>(col_idx)
+                                .ok()
+                                .flatten()
+                            {
+                                add!(s.0.len());
+                            }
+                        }
+                    }
+                    // build_pg_text_array bails on any other text wire type, so a
+                    // real batch never reaches this arm.
                     _ => {}
                 },
                 // Decimal128: decode the pg numeric wire to BigDecimal and rescale

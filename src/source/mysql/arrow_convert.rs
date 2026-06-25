@@ -328,7 +328,214 @@ pub(super) fn rows_to_record_batch_typed(
             max_value_bytes,
         )?);
     }
-    Ok(RecordBatch::try_new(schema.clone(), arrays)?)
+    let batch = RecordBatch::try_new(schema.clone(), arrays)?;
+    if crate::source::value_checksum::enabled() {
+        let a = mysql_rows_checksums(arrow_types, rows);
+        let b = crate::source::value_checksum::arrow_batch_checksums(&batch);
+        crate::source::value_checksum::verify(&a, &b, schema)?;
+    }
+    Ok(batch)
+}
+
+/// Source-side value checksum for MySQL (Form A, side A). Mirrors `build_array`'s
+/// per-type decode from `mysql::Value`, independently of the Arrow build, so a
+/// divergence means the value converter changed a value between read and Arrow
+/// build. Dispatches on the resolved target Arrow type and covers exactly the
+/// types [`crate::source::value_checksum::arrow_batch_checksums`] (side B) covers
+/// (int / uint / float / bool / date / timestamp(µs) / utf8 / binary / decimal128);
+/// everything else contributes 0 on both sides. Decimal128 uses an independent
+/// `BigDecimal` decode (build_array goes through `decimal_str_to_scaled_i128` /
+/// `scale_int_to_i128`) rounding toward zero to match.
+fn mysql_rows_checksums(arrow_types: &[DataType], rows: &[mysql::Row]) -> Vec<i128> {
+    use bigdecimal::{BigDecimal, RoundingMode, num_traits::ToPrimitive};
+    let wire_columns = rows.first().map(|r| r.columns_ref());
+    (0..arrow_types.len())
+        .map(|col_idx| {
+            let is_bit = wire_columns.is_some_and(|cols| {
+                cols.get(col_idx)
+                    .is_some_and(|c| matches!(c.column_type(), ColumnType::MYSQL_TYPE_BIT))
+            });
+            let mut s: i128 = 0;
+            macro_rules! add {
+                ($e:expr) => {
+                    s = s.wrapping_add($e as i128)
+                };
+            }
+            let bd_scaled = |bd: BigDecimal, scale: i8| -> Option<i128> {
+                bd.with_scale_round(scale as i64, RoundingMode::Down)
+                    .into_bigint_and_exponent()
+                    .0
+                    .to_i128()
+            };
+            match &arrow_types[col_idx] {
+                DataType::Boolean => {
+                    for row in rows {
+                        match row.as_ref(col_idx) {
+                            Some(Value::Int(v)) if *v != 0 => add!(1),
+                            Some(Value::UInt(v)) if *v != 0 => add!(1),
+                            Some(Value::Bytes(bv)) if bit_bytes_to_u64(bv) != 0 => add!(1),
+                            _ => {}
+                        }
+                    }
+                }
+                DataType::Int16 | DataType::Int32 => {
+                    for row in rows {
+                        match row.as_ref(col_idx) {
+                            Some(Value::Int(v)) => add!(*v),
+                            Some(Value::UInt(v)) => add!(*v),
+                            Some(Value::Bytes(bv)) => {
+                                if let Some(v) = atoi::atoi::<i128>(bv) {
+                                    add!(v);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                DataType::UInt64 => {
+                    for row in rows {
+                        match row.as_ref(col_idx) {
+                            Some(Value::UInt(v)) => add!(*v),
+                            Some(Value::Int(v)) if *v >= 0 => add!(*v as u64),
+                            Some(Value::Bytes(bv)) => {
+                                if let Some(v) = atoi::atoi::<u64>(bv) {
+                                    add!(v);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                DataType::Int64 => {
+                    for row in rows {
+                        match row.as_ref(col_idx) {
+                            Some(Value::Int(v)) => add!(*v),
+                            Some(Value::UInt(v)) => add!(*v),
+                            Some(Value::Bytes(bv)) => {
+                                if let Some(v) = int64_from_bytes(bv, is_bit).ok().flatten() {
+                                    add!(v);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                DataType::Float32 => {
+                    for row in rows {
+                        let f: Option<f32> = match row.as_ref(col_idx) {
+                            Some(Value::Float(v)) => Some(*v),
+                            Some(Value::Double(v)) => Some(*v as f32),
+                            Some(Value::Bytes(bv)) => bytes_to_str(bv).and_then(|s| s.parse().ok()),
+                            _ => None,
+                        };
+                        if let Some(f) = f {
+                            add!(f.to_bits());
+                        }
+                    }
+                }
+                DataType::Float64 => {
+                    for row in rows {
+                        let f: Option<f64> = match row.as_ref(col_idx) {
+                            Some(Value::Float(v)) => Some(*v as f64),
+                            Some(Value::Double(v)) => Some(*v),
+                            Some(Value::Bytes(bv)) => bytes_to_str(bv).and_then(|s| s.parse().ok()),
+                            _ => None,
+                        };
+                        if let Some(f) = f {
+                            add!(f.to_bits());
+                        }
+                    }
+                }
+                DataType::Utf8 => {
+                    for row in rows {
+                        match row.as_ref(col_idx) {
+                            Some(Value::Bytes(bv)) => {
+                                let len = bytes_to_str(bv)
+                                    .map(|s| s.len())
+                                    .unwrap_or_else(|| String::from_utf8_lossy(bv).len());
+                                add!(len);
+                            }
+                            Some(Value::Int(v)) => add!(v.to_string().len()),
+                            Some(Value::UInt(v)) => add!(v.to_string().len()),
+                            Some(Value::Float(v)) => add!(v.to_string().len()),
+                            Some(Value::Double(v)) => add!(v.to_string().len()),
+                            Some(Value::Date(y, m, d, h, mi, sx, us)) => add!(
+                                format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{sx:02}.{us:06}")
+                                    .len()
+                            ),
+                            _ => {}
+                        }
+                    }
+                }
+                DataType::Binary => {
+                    for row in rows {
+                        if let Some(Value::Bytes(bv)) = row.as_ref(col_idx) {
+                            add!(bv.len());
+                        }
+                    }
+                }
+                DataType::Date32 => {
+                    for row in rows {
+                        let d = match row.as_ref(col_idx) {
+                            Some(Value::Date(y, m, d, _, _, _, _)) => {
+                                chrono::NaiveDate::from_ymd_opt(*y as i32, *m as u32, *d as u32)
+                            }
+                            Some(Value::Bytes(bv)) => bytes_to_str(bv).and_then(|s| {
+                                chrono::NaiveDate::parse_from_str(
+                                    s.split(' ').next().unwrap_or(s),
+                                    "%Y-%m-%d",
+                                )
+                                .ok()
+                            }),
+                            _ => None,
+                        };
+                        if let Some(date) = d {
+                            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                            add!((date - epoch).num_days());
+                        }
+                    }
+                }
+                DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                    for row in rows {
+                        let dt = match row.as_ref(col_idx) {
+                            Some(Value::Date(y, mo, d, h, mi, sx, us)) => {
+                                chrono::NaiveDate::from_ymd_opt(*y as i32, *mo as u32, *d as u32)
+                                    .and_then(|d| {
+                                        d.and_hms_micro_opt(*h as u32, *mi as u32, *sx as u32, *us)
+                                    })
+                            }
+                            Some(Value::Bytes(bv)) => bytes_to_str(bv).and_then(|s| {
+                                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok()
+                            }),
+                            _ => None,
+                        };
+                        if let Some(dt) = dt {
+                            add!(dt.and_utc().timestamp_micros());
+                        }
+                    }
+                }
+                DataType::Decimal128(_p, scale) => {
+                    for row in rows {
+                        let scaled = match row.as_ref(col_idx) {
+                            Some(Value::Bytes(bv)) => bytes_to_str(bv)
+                                .and_then(|s| s.parse::<BigDecimal>().ok())
+                                .and_then(|bd| bd_scaled(bd, *scale)),
+                            Some(Value::Int(v)) => bd_scaled(BigDecimal::from(*v), *scale),
+                            Some(Value::UInt(v)) => bd_scaled(BigDecimal::from(*v), *scale),
+                            _ => None,
+                        };
+                        if let Some(v) = scaled {
+                            add!(v);
+                        }
+                    }
+                }
+                // FixedSizeBinary(UUID) / Time64 / Decimal256 / etc. — skipped on
+                // both sides (see value_checksum coverage note).
+                _ => {}
+            }
+            s
+        })
+        .collect()
 }
 
 fn bytes_to_str(b: &[u8]) -> Option<&str> {
