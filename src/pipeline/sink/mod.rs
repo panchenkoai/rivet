@@ -623,6 +623,22 @@ impl BatchSink for ExportSink {
             .cursor_column
             .as_ref()
             .and_then(|c| dest_schema.index_of(c).ok());
+        // Coverage is visible, not silent: warn once per export about any column the
+        // value checksum does NOT cover (UUID / List / Decimal256 / ns-timestamp),
+        // so its 0 contribution can't read as "verified".
+        let skips = crate::source::value_checksum::coverage_skips(&dest_schema);
+        if !skips.is_empty() {
+            log::warn!(
+                "value checksum covers {}/{} columns; NOT checked: {}",
+                dest_schema.fields().len() - skips.len(),
+                dest_schema.fields().len(),
+                skips
+                    .iter()
+                    .map(|(n, r)| format!("{n} ({r})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         self.schema = Some(schema);
         self.dest_schema = Some(dest_schema);
         self.enriched_schema = Some(enriched);

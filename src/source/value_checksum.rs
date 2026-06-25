@@ -33,7 +33,7 @@ use arrow::array::types::{
 };
 use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
-use xxhash_rust::xxh3::{Xxh3, xxh3_64};
+use xxhash_rust::xxh3::Xxh3;
 
 use crate::error::Result;
 
@@ -49,109 +49,58 @@ pub fn arrow_batch_checksums(batch: &RecordBatch) -> Vec<u64> {
 }
 
 fn column_checksum(arr: &dyn Array) -> u64 {
-    let mut acc: u64 = 0;
-    macro_rules! hash_prim {
-        ($t:ty) => {{
-            let a = arr.as_primitive::<$t>();
-            for i in 0..a.len() {
-                if !a.is_null(i) {
-                    acc ^= xxh3_64(&a.value(i).to_le_bytes());
-                }
-            }
-        }};
-    }
-    match arr.data_type() {
-        DataType::Int16 => hash_prim!(Int16Type),
-        DataType::Int32 => hash_prim!(Int32Type),
-        DataType::Int64 => hash_prim!(Int64Type),
-        DataType::UInt64 => hash_prim!(UInt64Type),
-        DataType::Float32 => hash_prim!(Float32Type),
-        DataType::Float64 => hash_prim!(Float64Type),
-        // The scaled i128 the array holds; the source pass rescales the pg numeric
-        // to the same i128 (truncate toward zero) so the bytes — and the hash —
-        // match on a correct build and diverge on a scaling bug.
-        DataType::Decimal128(..) => hash_prim!(Decimal128Type),
-        DataType::Date32 => hash_prim!(Date32Type),
-        DataType::Timestamp(TimeUnit::Microsecond, _) => hash_prim!(TimestampMicrosecondType),
-        DataType::Boolean => {
-            let a = arr.as_boolean();
-            for i in 0..a.len() {
-                if !a.is_null(i) {
-                    acc ^= xxh3_64(&[a.value(i) as u8]);
-                }
-            }
-        }
-        DataType::Utf8 => {
-            let a = arr.as_string::<i32>();
-            for i in 0..a.len() {
-                if !a.is_null(i) {
-                    acc ^= xxh3_64(a.value(i).as_bytes());
-                }
-            }
-        }
-        DataType::Binary => {
-            let a = arr.as_binary::<i32>();
-            for i in 0..a.len() {
-                if !a.is_null(i) {
-                    acc ^= xxh3_64(a.value(i));
-                }
-            }
-        }
-        // Not yet covered (must match the source-side skip) — contribute 0.
-        _ => {}
-    }
-    acc
+    column_xxh3(arr, None)
 }
 
-/// Keyed side B — the **swap-resistant** variant. Each cell's contribution is
-/// `xxh3(key_value_bytes ‖ cell_value_bytes)` instead of `xxh3(cell_value_bytes)`,
-/// so the per-column XOR stays order-independent (chunk/parallel safe) yet a value
-/// **swap between two rows** — which preserves the column's multiset and is
-/// therefore invisible to the un-keyed XOR — now changes each row's prepended key
-/// and diverges. `key_col` is the keyset / incremental cursor column resolved to a
-/// schema index. The source pass prepends the SAME key-column bytes (read from the
-/// batch it just built), so a correct build keeps A==B and a swap breaks it on both.
-///
-/// Not yet called from the export hooks — that is the live-pk wiring step (switch
-/// `arrow_batch_checksums(&batch)` → `arrow_batch_checksums_keyed(&batch, k)` once
-/// the cursor key is threaded through `rows_to_record_batch_typed`, and have each
-/// engine's source pass prepend the same key column). Exercised now by
-/// `keyed_checksum_catches_a_value_swap_that_unkeyed_misses`.
-#[allow(dead_code)]
-pub fn arrow_batch_checksums_keyed(batch: &RecordBatch, key_col: usize) -> Vec<u64> {
-    let key = batch.column(key_col).as_ref();
-    batch
-        .columns()
-        .iter()
-        .map(|c| column_checksum_keyed(c.as_ref(), key))
-        .collect()
+/// What the value checksum does with a column of a given Arrow type — the single
+/// declared source of truth for coverage, consulted by both the keyed and un-keyed
+/// paths and by [`coverage_skips`]. Adding a covered type is one edit here plus the
+/// matching extraction arm in [`feed_cell`] (a unit test pins the two together); an
+/// uncovered type is a DECLARED skip whose reason is surfaced (logged once per
+/// export) — never a silent zero that reads as "verified".
+enum CheckRule {
+    /// Covered — [`feed_cell`] knows how to hash this type's value bytes.
+    Covered,
+    /// Not yet matched between the source pass and the Arrow pass; contributes 0 on
+    /// BOTH sides (so A==B holds for it). Reason surfaced via [`coverage_skips`].
+    Skipped(&'static str),
 }
 
-/// Whether a type contributes to the checksum — must mirror the `match` arms in
-/// `column_checksum` / `feed_cell` exactly, so an uncovered column reads 0 on BOTH
-/// the keyed and un-keyed paths (and so A==B for it).
-#[allow(dead_code)]
-fn covered(dt: &DataType) -> bool {
-    matches!(
-        dt,
+fn check_rule(dt: &DataType) -> CheckRule {
+    match dt {
         DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt64
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Decimal128(..)
-            | DataType::Date32
-            | DataType::Boolean
-            | DataType::Utf8
-            | DataType::Binary
-            | DataType::Timestamp(TimeUnit::Microsecond, _)
-    )
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt64
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Decimal128(..)
+        | DataType::Date32
+        | DataType::Timestamp(TimeUnit::Microsecond, _)
+        | DataType::Boolean
+        | DataType::Utf8
+        | DataType::Binary => CheckRule::Covered,
+        DataType::Time64(..) => CheckRule::Skipped("Time64 not yet matched source↔Arrow"),
+        DataType::FixedSizeBinary(_) => {
+            CheckRule::Skipped("UUID / FixedSizeBinary not yet matched")
+        }
+        DataType::List(_) | DataType::LargeList(_) => CheckRule::Skipped("List not yet matched"),
+        DataType::Decimal256(..) => CheckRule::Skipped("Decimal256 not yet matched"),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            CheckRule::Skipped("nanosecond timestamp not yet matched")
+        }
+        _ => CheckRule::Skipped("type not covered by the value checksum"),
+    }
 }
 
-#[allow(dead_code)]
-fn column_checksum_keyed(arr: &dyn Array, key: &dyn Array) -> u64 {
-    if !covered(arr.data_type()) {
+/// The single per-column hasher behind both [`arrow_batch_checksums`] (un-keyed,
+/// `key = None`) and [`arrow_batch_checksums_keyed`] (swap-resistant, `key = Some`).
+/// Each non-null cell hashes `xxh3(key_bytes ‖ value_bytes)` — or just the value
+/// bytes when un-keyed — via [`feed_cell`], XOR-combined (order-independent, so
+/// chunk/parallel order is irrelevant). A [`CheckRule::Skipped`] column
+/// short-circuits to 0 on both paths.
+fn column_xxh3(arr: &dyn Array, key: Option<&dyn Array>) -> u64 {
+    if matches!(check_rule(arr.data_type()), CheckRule::Skipped(_)) {
         return 0;
     }
     let mut acc: u64 = 0;
@@ -160,19 +109,54 @@ fn column_checksum_keyed(arr: &dyn Array, key: &dyn Array) -> u64 {
             continue;
         }
         let mut h = Xxh3::new();
-        feed_cell(&mut h, key, r);
+        if let Some(k) = key {
+            feed_cell(&mut h, k, r);
+        }
         feed_cell(&mut h, arr, r);
         acc ^= h.digest();
     }
     acc
 }
 
-/// Feed cell `r` of `arr` into `h` as its value bytes — byte-identical to the
-/// one-shot `xxh3_64(value_bytes)` the un-keyed path uses (streaming and one-shot
-/// XXH3 agree on the same input), so feeding nothing else reproduces the un-keyed
-/// hash and feeding the key first produces the keyed one. Uncovered types feed
-/// nothing — their column is short-circuited to 0 by `covered`.
-#[allow(dead_code)]
+/// The columns the value checksum does NOT cover, each with the reason — so a
+/// `UUID` / `List` / `Decimal256` / ns-timestamp column yields a visible "not
+/// checked" line (logged once per export by the sink) instead of a silent zero that
+/// reads as "verified". Empty ⇒ full coverage.
+pub fn coverage_skips(schema: &SchemaRef) -> Vec<(String, &'static str)> {
+    schema
+        .fields()
+        .iter()
+        .filter_map(|f| match check_rule(f.data_type()) {
+            CheckRule::Skipped(reason) => Some((f.name().clone(), reason)),
+            CheckRule::Covered => None,
+        })
+        .collect()
+}
+
+/// Keyed side B — the **swap-resistant** variant. Each cell's contribution is
+/// `xxh3(key_value_bytes ‖ cell_value_bytes)` instead of `xxh3(cell_value_bytes)`,
+/// so the per-column XOR stays order-independent (chunk/parallel safe) yet a value
+/// **swap between two rows** — invisible to the un-keyed XOR because it preserves
+/// the column's multiset — now changes each row's prepended key and diverges.
+/// `key_col` is the keyset / incremental cursor column resolved to a schema index.
+/// Used by the sink's Form B recording; the source pass prepends the SAME key-column
+/// bytes, so a correct build keeps A==B and a swap breaks it on both.
+pub fn arrow_batch_checksums_keyed(batch: &RecordBatch, key_col: usize) -> Vec<u64> {
+    let key = batch.column(key_col).as_ref();
+    batch
+        .columns()
+        .iter()
+        .map(|c| column_xxh3(c.as_ref(), Some(key)))
+        .collect()
+}
+
+/// Feed cell `r` of `arr` into `h` as its canonical value bytes — the single
+/// per-type byte extraction shared by the keyed and un-keyed paths (via
+/// [`column_xxh3`]). Streaming and one-shot XXH3 agree on the same input, so feeding
+/// only the value reproduces the un-keyed hash and feeding the key first produces
+/// the keyed one. The `_ => {}` arm is exactly the [`CheckRule::Skipped`] set —
+/// those columns are short-circuited to 0 by `column_xxh3` before this is reached,
+/// and a unit test pins the two in sync.
 fn feed_cell(h: &mut Xxh3, arr: &dyn Array, r: usize) {
     macro_rules! fp {
         ($t:ty) => {
@@ -327,6 +311,41 @@ mod tests {
             Field::new("b", DataType::Int64, true),
             Field::new("c", DataType::Int64, true),
         ]))
+    }
+
+    #[test]
+    fn coverage_skips_names_uncovered_columns_and_they_contribute_zero() {
+        use arrow::array::Time64MicrosecondArray;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("t", DataType::Time64(TimeUnit::Microsecond), true),
+        ]));
+        // The skip is declared + named, not silent.
+        let skips = coverage_skips(&schema);
+        assert_eq!(
+            skips.len(),
+            1,
+            "exactly the Time64 column is uncovered: {skips:?}"
+        );
+        assert_eq!(skips[0].0, "t");
+        assert!(
+            skips[0].1.contains("Time64"),
+            "reason names the type: {}",
+            skips[0].1
+        );
+        // ...and it short-circuits to 0 (feed_cell's skip set == check_rule's
+        // Skipped), so an uncovered column can never false-mismatch (0 on both sides).
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Time64MicrosecondArray::from(vec![10, 20])),
+            ],
+        )
+        .unwrap();
+        let sums = arrow_batch_checksums(&batch);
+        assert_ne!(sums[0], 0, "covered Int64 contributes");
+        assert_eq!(sums[1], 0, "uncovered Time64 contributes 0");
     }
 
     #[test]
