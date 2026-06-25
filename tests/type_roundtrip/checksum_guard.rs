@@ -1,7 +1,7 @@
 //! Permanent regression guard for the value checksum (Form A).
 //!
-//! Each engine's FULL type matrix — exported through rivet with
-//! `RIVET_VALUE_CHECKSUM=1` — must produce zero checksum mismatch. The matrix
+//! Each engine's FULL type matrix — exported through rivet (the checksum is
+//! always-on) — must produce zero checksum mismatch. The matrix
 //! carries the engine-specific types content_items lacks (unsigned widths, BIT,
 //! ENUM/SET/YEAR, datetime2/datetimeoffset, uuid, json, decimals), so a side-A
 //! dispatch arm that drifts from `build_array` (a missing sub-case, e.g. the PG
@@ -14,16 +14,14 @@ use super::helpers::{
     setup_pg_matrix_table,
 };
 use crate::common::{
-    MSSQL_URL, MYSQL_URL, POSTGRES_URL, run_rivet_export_with_env, unique_name, write_config,
+    MSSQL_URL, MYSQL_URL, POSTGRES_URL, run_rivet_export, unique_name, write_config,
 };
-
-const CHECKSUM_ON: &[(&str, &str)] = &[("RIVET_VALUE_CHECKSUM", "1")];
 
 fn assert_mismatch_free(out: std::process::Output, engine: &str) {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
-        "{engine} type-matrix export with RIVET_VALUE_CHECKSUM=1 failed \
+        "{engine} type-matrix export failed \
          (a 'checksum mismatch' here = side A drifted from build_array):\n{err}"
     );
     assert!(
@@ -63,10 +61,7 @@ exports:
         path = out.path().display()
     );
     let cfg = write_config(&cfg_dir, &yaml);
-    assert_mismatch_free(
-        run_rivet_export_with_env(&cfg, "ck_guard", CHECKSUM_ON),
-        "postgres",
-    );
+    assert_mismatch_free(run_rivet_export(&cfg, "ck_guard"), "postgres");
 }
 
 #[test]
@@ -97,10 +92,7 @@ exports:
         path = out.path().display()
     );
     let cfg = write_config(&cfg_dir, &yaml);
-    assert_mismatch_free(
-        run_rivet_export_with_env(&cfg, "ck_guard", CHECKSUM_ON),
-        "mysql",
-    );
+    assert_mismatch_free(run_rivet_export(&cfg, "ck_guard"), "mysql");
 }
 
 #[test]
@@ -133,8 +125,5 @@ exports:
         path = out.path().display()
     );
     let cfg = write_config(&cfg_dir, &yaml);
-    assert_mismatch_free(
-        run_rivet_export_with_env(&cfg, "ck_guard", CHECKSUM_ON),
-        "mssql",
-    );
+    assert_mismatch_free(run_rivet_export(&cfg, "ck_guard"), "mssql");
 }
