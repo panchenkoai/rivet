@@ -236,6 +236,7 @@ mod tests {
             part_count: parts.len() as u32,
             parts,
             column_checksums: None,
+            checksum_key_column: None,
         }
     }
 

@@ -219,66 +219,103 @@ pub fn verify(source: &[u64], arrow: &[u64], schema: &SchemaRef) -> Result<()> {
 }
 
 /// Form B: re-read the exported Parquet parts and recompute the per-column
-/// checksum ("side C"), comparing it to the value recorded in the manifest's
-/// `column_checksums`. Catches an `Arrow→Parquet` encode fault or post-write
-/// corruption that the in-process Form A check (source↔Arrow) cannot see. The
-/// recorded values are the per-column u64 xxh3 hashes as decimal strings
-/// (JSON-stable in the manifest).
-///
-/// The manifest field + this re-read entry are in place and unit-tested (it
-/// catches a corrupted re-read); the call site in the validate command is the
-/// remaining Form B recording/validate wiring.
-#[allow(dead_code)]
+/// checksum ("side C") BY NAME — keyed to the same cursor column as the export
+/// when `key_col_name` is set — comparing each to the value recorded in the
+/// manifest's `column_checksums`. Catches an `Arrow→Parquet` encode fault or
+/// post-write corruption that the in-process Form A check (source↔Arrow) cannot
+/// see. The recorded values are the per-column u64 xxh3 hashes as decimal strings
+/// (JSON-stable in the manifest). Wired via [`validate_manifest_checksums`] (the
+/// destination entry point) into `rivet validate`.
 pub fn validate_recorded_checksums(
-    recorded: &[String],
+    recorded: &[crate::manifest::ColumnChecksum],
     part_paths: &[std::path::PathBuf],
+    key_col_name: Option<&str>,
 ) -> Result<()> {
+    use std::collections::BTreeMap;
+
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-    let mut actual: Vec<u64> = Vec::new();
-    let mut schema: Option<SchemaRef> = None;
+    // Re-read every part, accumulate side C per column BY NAME — keyed to the same
+    // cursor column as the export when `key_col_name` is set, so the keyed hashes
+    // match. Name-keyed so a column reorder can't silently misalign the compare.
+    let mut actual: BTreeMap<String, u64> = BTreeMap::new();
     for path in part_paths {
         let file = std::fs::File::open(path)
             .map_err(|e| anyhow::anyhow!("value checksum: open {}: {e}", path.display()))?;
         let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
         for batch in reader {
             let batch = batch?;
-            if actual.is_empty() {
-                schema = Some(batch.schema());
-                actual = vec![0u64; batch.num_columns()];
-            }
-            for (i, c) in arrow_batch_checksums(&batch).into_iter().enumerate() {
-                if i < actual.len() {
-                    actual[i] ^= c;
-                }
+            let key_col = key_col_name.and_then(|n| batch.schema().index_of(n).ok());
+            let sums = match key_col {
+                Some(k) => arrow_batch_checksums_keyed(&batch, k),
+                None => arrow_batch_checksums(&batch),
+            };
+            for (i, f) in batch.schema().fields().iter().enumerate() {
+                *actual.entry(f.name().clone()).or_insert(0) ^= sums[i];
             }
         }
     }
 
-    if recorded.len() != actual.len() {
-        anyhow::bail!(
-            "value checksum: manifest recorded {} columns, re-read found {}",
-            recorded.len(),
-            actual.len()
-        );
-    }
-    for (i, (rec, act)) in recorded.iter().zip(actual.iter()).enumerate() {
-        let rec_i: u64 = rec.parse().map_err(|_| {
-            anyhow::anyhow!("value checksum: manifest column {i} hash '{rec}' is not a u64")
+    // Compare each recorded (data) column to the re-read value by name. Re-read
+    // columns absent from `recorded` (enrichment / meta columns) are not compared.
+    for rec in recorded {
+        let want: u64 = rec.checksum.parse().map_err(|_| {
+            anyhow::anyhow!(
+                "value checksum: manifest column '{}' hash '{}' is not a u64",
+                rec.name,
+                rec.checksum
+            )
         })?;
-        if rec_i != *act {
-            let col = schema
-                .as_ref()
-                .and_then(|s| s.fields().get(i))
-                .map(|f| f.name().clone())
-                .unwrap_or_else(|| format!("#{i}"));
-            anyhow::bail!(
-                "value checksum mismatch in column '{col}': manifest={rec_i} re-read={act} \
-                 — the Parquet differs from what was checksummed at write (encode fault or corruption)"
-            );
+        match actual.get(&rec.name) {
+            Some(&got) if got == want => {}
+            Some(&got) => anyhow::bail!(
+                "value checksum mismatch in column '{}': manifest={want} re-read={got} \
+                 — the Parquet differs from what was checksummed at write (Arrow→Parquet \
+                 encode fault or post-write corruption)",
+                rec.name
+            ),
+            None => anyhow::bail!(
+                "value checksum: manifest column '{}' was not found when re-reading the exported parts",
+                rec.name
+            ),
         }
     }
     Ok(())
+}
+
+/// Form B at the destination: read the manifest + every part via `dest`,
+/// materialise each part to a temp file (a part may be remote), and verify the
+/// re-read per-column checksums against the manifest's `column_checksums`. A
+/// no-op (`Ok`) when the manifest records none (older run / non-Parquet). Mirrors
+/// [`crate::source::cdc::validate::check_positions`]; called by `rivet validate`
+/// for Parquet runs.
+pub fn validate_manifest_checksums(
+    dest: &dyn crate::destination::Destination,
+    prefix: &str,
+) -> Result<()> {
+    use std::io::Write;
+
+    use crate::manifest::{MANIFEST_FILENAME, RunManifest, join_key};
+
+    let manifest_key = join_key(prefix, MANIFEST_FILENAME);
+    let manifest: RunManifest = serde_json::from_slice(&dest.read(&manifest_key)?)?;
+    let Some(recorded) = manifest.column_checksums.as_deref() else {
+        return Ok(());
+    };
+
+    // Materialise each part to a temp file so the Parquet reader can seek (the
+    // dest may be a cloud backend); keep the temp files alive for the re-read.
+    let mut tmps: Vec<tempfile::NamedTempFile> = Vec::with_capacity(manifest.parts.len());
+    for part in &manifest.parts {
+        let body = dest.read(&join_key(prefix, &part.path))?;
+        let mut tmp = tempfile::NamedTempFile::new()?;
+        tmp.write_all(&body)?;
+        tmp.flush()?;
+        tmps.push(tmp);
+    }
+    let paths: Vec<std::path::PathBuf> = tmps.iter().map(|t| t.path().to_path_buf()).collect();
+
+    validate_recorded_checksums(recorded, &paths, manifest.checksum_key_column.as_deref())
 }
 
 #[cfg(test)]
@@ -461,10 +498,14 @@ mod tests {
         .unwrap()
     }
 
-    fn recorded_of(batch: &RecordBatch) -> Vec<String> {
+    fn recorded_of(batch: &RecordBatch) -> Vec<crate::manifest::ColumnChecksum> {
         arrow_batch_checksums(batch)
             .iter()
-            .map(|v| v.to_string())
+            .zip(batch.schema().fields())
+            .map(|(v, f)| crate::manifest::ColumnChecksum {
+                name: f.name().clone(),
+                checksum: v.to_string(),
+            })
             .collect()
     }
 
@@ -474,7 +515,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("part.parquet");
         write_parquet(&batch, &p);
-        validate_recorded_checksums(&recorded_of(&batch), &[p])
+        validate_recorded_checksums(&recorded_of(&batch), &[p], None)
             .expect("matching parts must validate");
     }
 
@@ -486,7 +527,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("part.parquet");
         write_parquet(&batch3(999), &p);
-        let err = validate_recorded_checksums(&recorded, &[p])
+        let err = validate_recorded_checksums(&recorded, &[p], None)
             .expect_err("a corrupted re-read must fire");
         assert!(
             err.to_string().contains("column 'b'"),

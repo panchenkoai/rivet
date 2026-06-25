@@ -691,6 +691,7 @@ mod tests {
             part_count,
             parts,
             column_checksums: None,
+            checksum_key_column: None,
         }
     }
 

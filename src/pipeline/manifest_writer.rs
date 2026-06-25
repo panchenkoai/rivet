@@ -28,8 +28,8 @@ use crate::destination::{Destination, WriteCommitProtocol};
 use crate::error::Result;
 use crate::journal::PlanSnapshot;
 use crate::manifest::{
-    MANIFEST_FILENAME, ManifestDestination, ManifestPart, ManifestSource, ManifestStatus,
-    PartStatus, RunManifest, SUCCESS_FILENAME, success_marker_body,
+    ColumnChecksum, MANIFEST_FILENAME, ManifestDestination, ManifestPart, ManifestSource,
+    ManifestStatus, PartStatus, RunManifest, SUCCESS_FILENAME, success_marker_body,
 };
 use crate::pipeline::summary::RunSummary;
 
@@ -53,10 +53,13 @@ pub struct ManifestBuilder {
     compression: String,
     schema_fingerprint: String,
     parts: Vec<ManifestPart>,
-    /// Per-column value checksums (Form B), i128 sums as decimal strings, set by
-    /// [`set_column_checksums`](Self::set_column_checksums) when the run had
-    /// `RIVET_VALUE_CHECKSUM` on. `None` → omitted from the manifest.
-    column_checksums: Option<Vec<String>>,
+    /// Per-column value checksums (Form B), name-keyed, set by
+    /// [`set_column_checksums`](Self::set_column_checksums) from the sink
+    /// accumulator. `None` → omitted from the manifest.
+    column_checksums: Option<Vec<ColumnChecksum>>,
+    /// The column the Form B checksum is keyed to (cursor/key column); `None` =
+    /// un-keyed. Recorded so `validate` re-keys identically.
+    checksum_key_column: Option<String>,
 }
 
 impl ManifestBuilder {
@@ -96,15 +99,20 @@ impl ManifestBuilder {
             schema_fingerprint,
             parts: Vec::new(),
             column_checksums: None,
+            checksum_key_column: None,
         }
     }
 
-    /// Record the run-level per-column value checksums (Form B). The sums are
-    /// i128 decimal strings; surfaced into the manifest by [`finalize`](Self::finalize).
-    /// Caller wiring (sink accumulator → summary → here) is the remaining Form B step.
-    #[allow(dead_code)]
-    pub fn set_column_checksums(&mut self, checksums: Vec<String>) {
+    /// Record the run-level per-column value checksums (Form B), name-keyed,
+    /// surfaced into the manifest by [`finalize`](Self::finalize). `key_column` is
+    /// the column the hashes are keyed to (`xxh3(key ‖ value)`), `None` if un-keyed.
+    pub fn set_column_checksums(
+        &mut self,
+        checksums: Vec<ColumnChecksum>,
+        key_column: Option<String>,
+    ) {
         self.column_checksums = Some(checksums);
+        self.checksum_key_column = key_column;
     }
 
     /// Record a committed part.  Must be called only after `dest.write()`
@@ -166,6 +174,7 @@ impl ManifestBuilder {
             part_count,
             parts: self.parts,
             column_checksums: self.column_checksums,
+            checksum_key_column: self.checksum_key_column,
         }
     }
 }

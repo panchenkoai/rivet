@@ -338,6 +338,7 @@ fn build_manifest(cfg: &SinkConfig<'_>, parts: &[PartRecord]) -> RunManifest {
             .collect(),
         // Form B value-checksum recording is batch-path only for now.
         column_checksums: None,
+        checksum_key_column: None,
     }
 }
 

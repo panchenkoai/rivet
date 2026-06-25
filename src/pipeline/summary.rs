@@ -83,6 +83,11 @@ pub struct RunSummary {
     pub validated: Option<bool>,
     pub schema_changed: Option<bool>,
     pub quality_passed: Option<bool>,
+    /// Form B per-column value checksums (name-keyed), harvested from the sink;
+    /// recorded in the manifest so `validate` re-reads + verifies. Empty = none.
+    pub column_checksums: Vec<crate::manifest::ColumnChecksum>,
+    /// The column the Form B checksum is keyed to (cursor/key column); `None` = un-keyed.
+    pub checksum_key_column: Option<String>,
     pub error_message: Option<String>,
     /// `profile` from YAML, or `balanced (default)` if omitted.
     pub tuning_profile: String,
@@ -204,6 +209,8 @@ impl RunSummary {
             schema_fingerprint: None,
             manifest_verification: None,
             apply_context: None,
+            column_checksums: Vec::new(),
+            checksum_key_column: None,
             journal,
         }
     }
@@ -264,6 +271,8 @@ impl RunSummary {
             schema_fingerprint: None,
             manifest_verification: None,
             apply_context: None,
+            column_checksums: Vec::new(),
+            checksum_key_column: None,
             journal,
         }
     }

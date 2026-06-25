@@ -201,6 +201,16 @@ pub fn run_validate_command(
                         )),
                     }
                 }
+                // Form B: re-read the parts and verify the per-column value
+                // checksums recorded in the manifest (catches an Arrow→Parquet
+                // encode / post-write fault the in-process Form A cannot see).
+                if export.format == crate::config::FormatType::Parquet
+                    && let Err(e) =
+                        crate::source::value_checksum::validate_manifest_checksums(&*dest, "")
+                {
+                    hard_failures
+                        .push(format!("export '{}': value checksum: {:#}", export.name, e));
+                }
             }
             Err(e) => {
                 hard_failures.push(format!(
@@ -601,6 +611,7 @@ mod tests {
             part_count,
             parts,
             column_checksums: None,
+            checksum_key_column: None,
         }
     }
 
