@@ -192,7 +192,7 @@ Export modes: `full`, `incremental` (cursor-based), `chunked`, `time_window`.
 Formats: Parquet (zstd / snappy / gzip / lz4 / none) and CSV.
 
 **Not for you if you need:**
-- **CDC / streaming** — Rivet reads a snapshot per run; no replication slot or event log. Use [Debezium](https://debezium.io/) or [Estuary](https://estuary.dev/).
+- **Always-on streaming / continuous replication** — Rivet *does* capture CDC to files (`mode: cdc` — WAL/binlog inserts/updates/deletes into typed Parquet/CSV, one batch of changes per run), but it is not a continuously-running replication sink. For always-on near-real-time streaming into a live target use [Debezium](https://debezium.io/) or [Estuary](https://estuary.dev/).
 - **Connectors to SaaS sources** — no Salesforce, Stripe, HubSpot, etc. Use [Airbyte](https://airbyte.com/) or [Fivetran](https://www.fivetran.com/).
 - **An integrated extract-and-load product** — Rivet stops at "file in a bucket." Use [dlt](https://dlthub.com/) or [Sling](https://slingdata.io/) if you want the warehouse load included.
 - **Loading or transformation** — bring dbt, Spark, or your own loader.

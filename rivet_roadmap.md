@@ -762,10 +762,10 @@ recovery semantics, quality gates, resource controls, and reliability coverage.
 | Security policy | ✅ Done | `SECURITY.md` documents access, artifacts, credentials, TLS, supply chain, reporting |
 | Sensitive artifact hygiene | ✅ Done | README/security docs warn about `.rivet_state.db`, plans, journals, configs, outputs |
 | README top positioning | ✅ Done | README leads with source-safe extraction, scope, non-goals, core promise |
-| Fit / non-fit boundaries | ✅ Done | README and semantics explicitly exclude SaaS marketplace, k8s platform, loading. ⚠️ STALE — CDC shipped (0.14.0) but `README.md:195` + `docs/semantics.md:187` still list it as a non-goal (route users to Debezium/Estuary) and need updating |
+| Fit / non-fit boundaries | ✅ Done | README + semantics exclude SaaS marketplace, k8s platform, loading, and **continuous/live-streaming replication** — and now correctly distinguish that from **CDC-to-files** (`mode: cdc`, shipped 0.14.0): `README.md:195` + `docs/semantics.md:187` reworded to "CDC captured to files, not a continuously-running replication sink" |
 | Execution semantics contract | ✅ Done | `docs/semantics.md` covers retry, crash, resume, repair, reconcile, non-guarantees |
 | Reliability matrix | ✅ Done | `docs/reliability-matrix.md` separates PR CI, nightly, and manual coverage |
-| Compatibility matrix | ✅ Done | `docs/reference/compatibility.md` covers PG 12-16 and MySQL 5.7/8.0 |
+| Compatibility matrix | ✅ Done | `docs/reference/compatibility.md` covers PG 12-16, MySQL 5.7/8.0, and SQL Server 2022 (Beta) |
 | Pilot kit | ✅ Done | `docs/pilot/README.md`, quickstarts, demo, walkthrough, production checklist |
 | Benchmark methodology | ✅ Done | `docs/bench/` and best-practices methodology docs capture DB-side signals |
 
@@ -1200,7 +1200,7 @@ with verify-layer work as bandwidth allows.
 
 - ⏳ **`rivet init` does not explain *why* it picked a mode.** Generated YAML says `mode: chunked` but not "(auto-selected because rows estimate ≥ 500 K)". One-line inline comment in the rendered config would close the loop.
 - ⏳ **`rivet journal --export X` does not show retry events.** Doc promises "per-run events / retries / quality issues"; today it only shows status + duration. Plumb per-chunk retry attempts into the structured journal so post-mortem doesn't require digging in stderr WARNs.
-- ⏳ **100 files per 10 M-row chunked export.** Default `chunk_size: 100_000` × big table = many small files. `rivet init` could scale `chunk_size` logarithmically with the row estimate (e.g. ≥ 10 M → 1 M chunk_size) so default file counts stay reasonable.
+- ✅ **100 files per 10 M-row chunked export — FIXED.** `rivet init` now scales `chunk_size` by the row estimate (`TableInfo::suggest_chunk_size` → `src/init/yaml_scaffold.rs:340`); a 10 M-row export that used to render 100 files now lands at ~10. Operators override the rendered line for different geometry.
 - ✅ **`status: skipped` now names the cursor** (v0.7.8) — shows `(no new rows since cursor '<col>')` ([src/pipeline/single.rs](src/pipeline/single.rs)) so the operator doesn't have to guess.
 - ✅ **Doc note added: re-running `chunked` re-extracts everything** — [`docs/modes/chunked.md`](docs/modes/chunked.md) § "Clean re-runs are NOT idempotent" spells out that `--resume` only skips completed chunks after a crash.
 - ⏳ **Doc note: `time_window` re-runs duplicate output.** Rolling window mode does not persist "we did this window already", so frequent re-runs produce duplicate files. Worth a paragraph in `modes/time-window.md`.
@@ -1273,7 +1273,7 @@ and the two-engine separation with explicit revisit triggers (ADR-0010).
 | OPT-4 | MySQL parity | P1 | ✅ Done | MySQL keyset (seek) pagination shipped (40433a0) — single-column unique key, sequential, index range scan (documented in code comments; no EXPLAIN assertion in the suite). Follow-ups: composite keys, parallel keyset, resume |
 | OPT-5 | Dedup ergonomics | P2 | ✅ Partial | Deterministic per-part `content_fingerprint` exposed in every manifest (`manifest.rs:198`) + documented as the dedup key; remaining gap = a dedicated SIGKILL-between-write-and-commit dedup-collision test |
 | OPT-6 | Engine debt | P2 | ✅ Done | Crash-matrix symmetry pass on `feat/opt6-crash-matrix`: SIGTERM/SIGINT child reaper (`parallel_children::child_reaper`), SIGKILL-mid-write proof (temp+rename), subprocess panic recovery across all 4 write-cycle boundaries. See `dev/CRASH_MATRIX.md`. Residuals: object-store `FinalizeOnClose`, single-child external-signal accounting |
-| OPT-7 | Doc/roadmap drift | P1 | ✅ Done | Checksums documented as shipped (SECURITY.md + README + §5.1/§9.7); 3 §9.6.1 items struck. *Verified 3 other claimed-shipped §9.6.1 items (local-retry WARN, init mode-comment, init chunk_size scaling) are NOT shipped — left open.* |
+| OPT-7 | Doc/roadmap drift | P1 | ✅ Done | Checksums documented as shipped (SECURITY.md + README + §5.1/§9.7); 3 §9.6.1 items struck. *Of those 3: `init chunk_size scaling` IS in fact shipped (`yaml_scaffold.rs:340`, `suggest_chunk_size`) — only `local-retry WARN` suppression for local destinations and the `init` mode-selection comment remain genuinely open.* |
 
 ---
 
