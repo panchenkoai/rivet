@@ -53,6 +53,28 @@ pub fn run_rivet_export(config_path: &std::path::Path, export_name: &str) -> Out
     ])
 }
 
+/// Like [`run_rivet_export`] but with extra environment variables set on the
+/// rivet subprocess — used by the value-checksum guard to flip
+/// `RIVET_VALUE_CHECKSUM` on for a single export.
+pub fn run_rivet_export_with_env(
+    config_path: &std::path::Path,
+    export_name: &str,
+    env: &[(&str, &str)],
+) -> Output {
+    let mut cmd = Command::new(RIVET_BIN);
+    cmd.args([
+        "run",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--export",
+        export_name,
+    ]);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("spawn rivet binary")
+}
+
 /// Collect every file with the given extension under `dir` (non-recursive).
 /// Useful for locating the timestamped output rivet just wrote.
 pub fn files_with_extension(dir: &std::path::Path, ext: &str) -> Vec<std::path::PathBuf> {
