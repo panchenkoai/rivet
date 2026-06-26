@@ -3,8 +3,8 @@
 # Why nextest: it runs every `#[test]` in its OWN PROCESS, whereas cargo's
 # built-in harness runs the tests of one binary as threads in one process. That
 # per-test process isolation is what lets us consolidate many test files into a
-# single binary (one link instead of N — see `tests/offline_suite.rs` and the
-# test-link consolidation) WITHOUT a crash / SIGKILL / global-state test
+# single binary (one link instead of N — see `tests/offline_suite.rs` / `tests/live_suite.rs`
+# and the test-link consolidation) WITHOUT a crash / SIGKILL / global-state test
 # poisoning its siblings. It restores the isolation the old
 # one-binary-per-file layout provided, at one link instead of N.
 
