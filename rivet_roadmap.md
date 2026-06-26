@@ -1274,6 +1274,7 @@ and the two-engine separation with explicit revisit triggers (ADR-0010).
 | OPT-5 | Dedup ergonomics | P2 | ✅ Partial | Deterministic per-part `content_fingerprint` exposed in every manifest (`manifest.rs:198`) + documented as the dedup key; remaining gap = a dedicated SIGKILL-between-write-and-commit dedup-collision test |
 | OPT-6 | Engine debt | P2 | ✅ Done | Crash-matrix symmetry pass on `feat/opt6-crash-matrix`: SIGTERM/SIGINT child reaper (`parallel_children::child_reaper`), SIGKILL-mid-write proof (temp+rename), subprocess panic recovery across all 4 write-cycle boundaries. See `dev/CRASH_MATRIX.md`. Residuals: object-store `FinalizeOnClose`, single-child external-signal accounting |
 | OPT-7 | Doc/roadmap drift | P1 | ✅ Done | Checksums documented as shipped (SECURITY.md + README + §5.1/§9.7); 3 §9.6.1 items struck. *Of those 3: ALL in fact shipped — `init chunk_size scaling` (`yaml_scaffold.rs:340`), the `init` mode-selection comment (`yaml_scaffold.rs:333` + `mode_rationale`), and the `local-retry WARN` (suppressed for local/cloud by `local.rs:119` `retry_safe: true`; fires only for stdout, correctly). OPT-7's "not shipped" claim was stale on all three.* |
+| OPT-8 | Test build/infra | P2 | ✅ Done | 109 integration-test binaries → 13 (`tests/{offline,live}_suite.rs` `#[path]`-consolidation) + cargo-nextest per-test isolation + split pre-push hook → test-LINK build 229s→29s (8×). `tests/suite_completeness.rs` guard closes the silent-skip footgun; nextest requirement documented; cargo-chef Dockerfile caches the dep layer. Rejected after measurement: sccache (incremental → 0% Rust hits), lld (macOS ld-prime already fast), dep-dedup (transitive majors), feature-trim (all live) |
 
 ---
 
@@ -1504,6 +1505,53 @@ re-planning work that is already done.
 **Definition of done.** §5.1, §9.6.1, and §9.7 reflect the actual shipped state of
 v0.7.8; README/SECURITY document checksum verification against the published
 `SHA256SUMS.txt`.
+
+---
+
+## OPT-8 — Test build/infra consolidation (link-count + isolation)
+
+**Priority: P2** — pure developer-velocity / CI-cost debt; no product-surface change.
+
+**Problem.** cargo builds one test binary per `tests/*.rs` file, and each links the whole crate. The repo
+had ~109 such files, so `cargo test --tests` / the pre-push hook / CI linked rivet 109 times — the link
+phase, not compilation, dominated the offline test build (~229s warm). The only thing that link cost
+bought was per-test isolation *as a side effect* (one binary = one process) — an implicit property
+nothing named or could reason about.
+
+**Change (shipped on `feat/verify-and-ux`).**
+- **Consolidation 109 → 13 binaries.** Self-contained offline tests moved under `tests/offline/`, the live
+  (`#[ignore]`, docker) suites under `tests/live/`; two entry files (`tests/offline_suite.rs`,
+  `tests/live_suite.rs`) `#[path]`-include them so each set LINKS ONCE. A few targets named individually
+  by CI (`type_roundtrip`, `live_differential`, `live_type_golden`) stay separate.
+- **cargo-nextest** (`.config/nextest.toml`) for process-per-test isolation, so a crash / SIGKILL /
+  global-state test can't poison its siblings inside a consolidated binary — restoring *explicitly* the
+  isolation the old layout gave implicitly.
+- **Split pre-push hook**: unit tests threaded (`cargo test --lib --bins`), only the integration suites
+  under nextest (`-E 'kind(test)'`) — avoids ~1700 process spawns for the pure unit tests.
+- **Both footguns the consolidation introduced, closed:** silent-skip (a file added to the subdir but not
+  registered in the entry runs as nothing) → `tests/suite_completeness.rs` guard (auto-discovered; proven
+  RED→GREEN); runner-dependent isolation (`cargo test` ≠ nextest) → documented in both entry headers, the
+  hook fallback, and a README "Running tests" section.
+- **cargo-chef Dockerfile**: the dependency build is its own layer keyed on `recipe.json`, so a
+  source-only change recompiles just rivet, not the ~500 dep crates.
+
+**Measured (honest).** Test-LINK build (warm lib): **229s → 29s, 8×, −200s** — link count was the whole
+cost. Hook run phase **~67s → ~32s** (units threaded vs process-per-test). This is a *test-build* win, NOT
+a cold-build one: a from-scratch dep compile is ~60s (arrow/parquet/tokio), not the once-assumed "30
+minutes" — that figure never matched a real build.
+
+**Rejected after measurement (not assumed):**
+- **sccache** — committed then reverted: with dev `incremental=true` it scores **0% Rust cache hits**
+  (sccache skips incremental Rust); `CARGO_INCREMENTAL=0` gives only 60s→35s (1.7×) on an already-60s
+  build while hurting the warm edit-loop. A CI-only `incremental=0` setup remains optional.
+- **lld linker** — macOS already ships the fast `ld-prime` (Xcode 17, ld v1230); lld doesn't beat it here.
+- **dependency dedup** — the 57 duplicate-version crates are transitive major splits (`base64 0.21 ←
+  tiberius`, `rand 0.8 ← sqlx`); not unifiable.
+- **feature trim** — the parquet codecs (zstd/lz4/gzip) and the arrow canonical extension types
+  (`src/types/mapping.rs:24`) are all live.
+
+**Definition of done.** Offline suite + hook green under nextest at 13 binaries; the `suite_completeness`
+guard enforces registration; the nextest requirement is documented where a contributor meets it. ✅
 
 ---
 
