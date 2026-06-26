@@ -189,7 +189,7 @@ pub fn run_validate_command(
                 // manifest check above already covered per-part MD5 / size / _SUCCESS.
                 // Full-depth only — like Form B below it downloads every part, so a
                 // light/sample run skips it (keeps the depth contract consistent).
-                if target.depth == ValidateDepth::Full
+                if target.depth.runs_part_download()
                     && export.mode == crate::config::ExportMode::Cdc
                     && export.format == crate::config::FormatType::Parquet
                 {
@@ -224,7 +224,7 @@ pub fn run_validate_command(
                 // Graded depth: Form B is the **only** part-download step, so it
                 // runs at `--depth full` alone.  `light` and `sample` deliberately
                 // skip it — `sample` is "all structural checks, no part bodies".
-                if target.depth == ValidateDepth::Full
+                if target.depth.runs_part_download()
                     && manifest_verified
                     && export.format == crate::config::FormatType::Parquet
                     && let Err(e) =

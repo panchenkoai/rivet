@@ -95,6 +95,16 @@ impl ValidateDepth {
         !matches!(self, ValidateDepth::Light)
     }
 
+    /// True iff this level downloads part *bodies* — the CDC `__pos` continuity
+    /// check and the Form-B value-checksum re-read, both `Full`-only (the
+    /// `part_reconcile` level above only reads listing metadata). The single
+    /// predicate the section-3/5 part-download gating keys off, parallel to
+    /// [`Self::runs_part_reconcile`] — so adding a depth level edits the enum,
+    /// not the call sites in `validate_cmd`.
+    pub(crate) fn runs_part_download(self) -> bool {
+        matches!(self, ValidateDepth::Full)
+    }
+
     /// Stable operator-/wire-facing label for the depth a verdict was produced
     /// at, surfaced in `summary.json` (`depth_level`) and `rivet validate`
     /// output.

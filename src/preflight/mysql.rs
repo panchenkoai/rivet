@@ -17,12 +17,9 @@ pub(super) fn check_mysql(
     let mut conn = pool.get_conn()?;
     let db_max_connections = fetch_max_connections_mysql(&mut conn);
 
-    let mut diags = Vec::with_capacity(exports.len());
-    for export in exports {
-        diags.push(diagnose_mysql(&mut conn, export, db_max_connections)?);
-    }
-
-    Ok(diags)
+    super::collect_diagnostics(exports, |export| {
+        diagnose_mysql(&mut conn, export, db_max_connections)
+    })
 }
 
 /// Diagnose a single export without printing — used by `rivet plan`.

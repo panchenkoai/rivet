@@ -16,12 +16,9 @@ pub(super) fn check_postgres(
     let mut client = crate::source::postgres::connect_client(url, tls)?;
     let db_max_connections = fetch_max_connections_pg(&mut client);
 
-    let mut diags = Vec::with_capacity(exports.len());
-    for export in exports {
-        diags.push(diagnose_pg(&mut client, export, db_max_connections)?);
-    }
-
-    Ok(diags)
+    super::collect_diagnostics(exports, |export| {
+        diagnose_pg(&mut client, export, db_max_connections)
+    })
 }
 
 /// Diagnose a single export without printing — used by `rivet plan`.

@@ -199,6 +199,21 @@ fn target_fail_note(n: usize, target_label: &str) -> String {
     )
 }
 
+/// Build one [`ExportDiagnostic`] per export via `diagnose`, collecting them (or
+/// short-circuiting on the first error). Single-sources the connect → loop →
+/// return contract every engine's `check_*` shares — only the per-export
+/// `diagnose` call differs — so the deferred print-vs-collect decision lives in
+/// one place rather than triplicated across postgres / mysql / mssql.
+pub(super) fn collect_diagnostics<F>(
+    exports: &[&ExportConfig],
+    mut diagnose: F,
+) -> Result<Vec<ExportDiagnostic>>
+where
+    F: FnMut(&ExportConfig) -> Result<ExportDiagnostic>,
+{
+    exports.iter().map(|&e| diagnose(e)).collect()
+}
+
 pub fn check(
     config_path: &str,
     export_name: Option<&str>,

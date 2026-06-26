@@ -44,12 +44,7 @@ pub(super) fn check_mssql(
 ) -> Result<Vec<ExportDiagnostic>> {
     let mut conn = MssqlSource::connect_with_tls(url, tls)?;
 
-    let mut diags = Vec::with_capacity(exports.len());
-    for export in exports {
-        diags.push(diagnose_mssql(&mut conn, export)?);
-    }
-
-    Ok(diags)
+    super::collect_diagnostics(exports, |export| diagnose_mssql(&mut conn, export))
 }
 
 /// Diagnose a single export without printing — used by `rivet plan`.
