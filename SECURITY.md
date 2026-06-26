@@ -163,21 +163,31 @@ The pilot guide covers this end-to-end: [docs/pilot/production-checklist.md](doc
 | RustSec advisory audit | **Active** | `audit` job in [.github/workflows/ci.yml](.github/workflows/ci.yml) runs `rustsec/audit-check` on every PR |
 | Dependency review | **Active** | Cargo.lock is committed; bumps land in dedicated PRs |
 | Release checksums (`SHA256SUMS`) | **Active** | Every release publishes `SHA256SUMS.txt` as an asset ([`.github/workflows/release.yml`](.github/workflows/release.yml)); verification below |
-| Signed releases (cosign / GPG / attestation) | Roadmap | Phase 6.2 |
+| Signed releases (cosign keyless) | **Active** | Every release signs `SHA256SUMS.txt` via Sigstore/cosign keyless (GitHub OIDC — no key to manage), published as `SHA256SUMS.txt.cosign.bundle`; verification below |
 | SBOM | Roadmap | Phase 6.3 |
 
-**Verify a downloaded release** against the published checksums:
+**Verify a downloaded release.** Confirm provenance first (the checksums were
+produced by *this repo's* release workflow), then integrity:
 
 ```bash
-# Download the release tarball(s) and SHA256SUMS.txt from the GitHub release, then:
+# 1. Provenance — verify the keyless signature on SHA256SUMS.txt.
+#    Needs cosign: https://docs.sigstore.dev/cosign/installation
+cosign verify-blob \
+  --bundle SHA256SUMS.txt.cosign.bundle \
+  --certificate-identity-regexp '^https://github\.com/.+/rivet/\.github/workflows/release\.yml@' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS.txt
+
+# 2. Integrity — verify the tarball(s) match the now-trusted checksums.
 sha256sum -c SHA256SUMS.txt        # Linux
 shasum -a 256 -c SHA256SUMS.txt    # macOS
 ```
 
-Signatures/attestations are not yet published — until then, checksums confirm
-integrity (the file matches what CI built) but not provenance. For the strongest
-guarantee you can still rebuild from source at the tagged commit
-(`cargo build --release` after `git checkout <tag>`).
+Step 1 proves the checksums were signed by GitHub's OIDC identity for this repo's
+`release.yml` (recorded in Sigstore's public transparency log — no key to fetch or
+trust on first use); step 2 ties your downloaded bytes to those signed checksums.
+You can still rebuild from source at the tagged commit (`cargo build --release`
+after `git checkout <tag>`) as an independent cross-check.
 
 ---
 
