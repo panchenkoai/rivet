@@ -8,6 +8,9 @@ mod schema_error;
 pub mod type_report;
 
 pub(crate) use analysis::chunk_sparsity_from_counts;
+// Re-exported so the plan layer's strategy explainer can ground its "≥ threshold"
+// narrative on the same constant `check`/`init` use, not a hard-coded copy.
+pub(crate) use analysis::SMALL_TABLE_ROW_THRESHOLD;
 #[cfg(test)]
 use analysis::{
     build_suggestion, check_connection_limit, check_dense_surrogate_cost,
@@ -22,12 +25,19 @@ pub(crate) use doctor::{categorize_source_error, source_error_hint};
 #[cfg(test)]
 use postgres::{extract_scan_type, parse_pg_row_estimate};
 
+use serde::Serialize;
+
 use crate::config::{Config, ExportConfig, SourceType};
 use crate::error::Result;
 use crate::types::policy::TypePolicy;
 use crate::types::target::{ExportTarget, TargetStatus};
 
-#[derive(Debug)]
+/// Serializes lowercase ("efficient"/"acceptable"/"degraded"/"unsafe") so
+/// `rivet check --json` consumers (CI gates, orchestrators) match on a stable,
+/// case-insensitive token rather than the SHOUTING `Display` form used in the
+/// human-readable table.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum HealthVerdict {
     Efficient,
     Acceptable,
@@ -66,6 +76,82 @@ pub(crate) struct ExportDiagnostic {
     pub recommended_parallel: (u32, &'static str),
     pub warnings: Vec<String>,
     pub suggestion: Option<String>,
+}
+
+// Hand-rolled `Serialize` (rather than `#[derive]`) so the JSON shape stays
+// fully under our control without touching the three engine construction sites:
+//   - `recommended_parallel` (a raw `(u32, &str)`) becomes a self-describing
+//     `{ "level": N, "reason": "…" }` object instead of a positional 2-array;
+//   - a derived `capabilities` object ({uses_index, has_cursor, can_parallel})
+//     is computed from the sibling fields at serialization time — no stored
+//     field, no extra probe;
+//   - `None` optionals are skipped to keep the object lean for CI consumers.
+// `HealthVerdict` rides its own `#[derive(Serialize)]` (lowercase tokens).
+impl Serialize for ExportDiagnostic {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        #[derive(Serialize)]
+        struct RecommendedParallel {
+            level: u32,
+            reason: &'static str,
+        }
+        #[derive(Serialize)]
+        struct Capabilities {
+            uses_index: bool,
+            has_cursor: bool,
+            can_parallel: bool,
+        }
+
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("export_name", &self.export_name)?;
+        map.serialize_entry("strategy", &self.strategy)?;
+        map.serialize_entry("mode", &self.mode)?;
+        if let Some(v) = &self.cursor_column {
+            map.serialize_entry("cursor_column", v)?;
+        }
+        if let Some(v) = &self.row_estimate {
+            map.serialize_entry("row_estimate", v)?;
+        }
+        if let Some(v) = &self.avg_row_bytes {
+            map.serialize_entry("avg_row_bytes", v)?;
+        }
+        if let Some(v) = &self.cursor_min {
+            map.serialize_entry("cursor_min", v)?;
+        }
+        if let Some(v) = &self.cursor_max {
+            map.serialize_entry("cursor_max", v)?;
+        }
+        if let Some(v) = &self.scan_type {
+            map.serialize_entry("scan_type", v)?;
+        }
+        map.serialize_entry("uses_index", &self.uses_index)?;
+        map.serialize_entry("verdict", &self.verdict)?;
+        map.serialize_entry("recommended_profile", &self.recommended_profile)?;
+        map.serialize_entry(
+            "recommended_parallel",
+            &RecommendedParallel {
+                level: self.recommended_parallel.0,
+                reason: self.recommended_parallel.1,
+            },
+        )?;
+        map.serialize_entry("warnings", &self.warnings)?;
+        if let Some(v) = &self.suggestion {
+            map.serialize_entry("suggestion", v)?;
+        }
+        map.serialize_entry(
+            "capabilities",
+            &Capabilities {
+                uses_index: self.uses_index,
+                has_cursor: self.cursor_column.is_some(),
+                can_parallel: self.recommended_parallel.0 > 1,
+            },
+        )?;
+        map.end()
+    }
 }
 
 /// Return the diagnostic for a single export without printing anything.
@@ -113,6 +199,21 @@ fn target_fail_note(n: usize, target_label: &str) -> String {
     )
 }
 
+/// Build one [`ExportDiagnostic`] per export via `diagnose`, collecting them (or
+/// short-circuiting on the first error). Single-sources the connect → loop →
+/// return contract every engine's `check_*` shares — only the per-export
+/// `diagnose` call differs — so the deferred print-vs-collect decision lives in
+/// one place rather than triplicated across postgres / mysql / mssql.
+pub(super) fn collect_diagnostics<F>(
+    exports: &[&ExportConfig],
+    mut diagnose: F,
+) -> Result<Vec<ExportDiagnostic>>
+where
+    F: FnMut(&ExportConfig) -> Result<ExportDiagnostic>,
+{
+    exports.iter().map(|&e| diagnose(e)).collect()
+}
+
 pub fn check(
     config_path: &str,
     export_name: Option<&str>,
@@ -143,11 +244,44 @@ pub fn check(
     // the helper keeps emission to one line per process even when both
     // `check` and `run` flow through it.
     crate::source::warn_if_tls_disabled(&config.source);
-    match config.source.source_type {
-        SourceType::Postgres => postgres::check_postgres(&url, tls, &exports, json_output)?,
-        SourceType::Mysql => mysql::check_mysql(&url, tls, &exports, json_output)?,
-        SourceType::Mssql => mssql::check_mssql(&url, tls, &exports, json_output)?,
+    // Each engine connects once and returns one diagnostic per export without
+    // printing. Rendering is decided here: TEXT (the per-export table) for the
+    // default human path, or — under `--json` — the diagnostic is merged into
+    // each export's type-report JSON object below (see the `if show_type_report`
+    // block). `get_export_diagnostic` already proved the diag is computable
+    // without printing; this is the multi-export variant of that path.
+    let diagnostics: Vec<ExportDiagnostic> = match config.source.source_type {
+        SourceType::Postgres => postgres::check_postgres(&url, tls, &exports)?,
+        SourceType::Mysql => mysql::check_mysql(&url, tls, &exports)?,
+        SourceType::Mssql => mssql::check_mssql(&url, tls, &exports)?,
+    };
+    if !json_output {
+        for diag in &diagnostics {
+            print_diagnostic(diag);
+        }
+    } else if !show_type_report {
+        // `--json` WITHOUT a type report (the CLI forces `show_type_report` on
+        // under `--json`, so this only fires if `check` is called directly with
+        // `json_output=true, show_type_report=false`): there is no per-export
+        // type-report object to nest the diagnostic into, so emit the diagnostic
+        // alone — still NDJSON, one object per export per line. Keeps the
+        // verdict from being silently dropped regardless of caller.
+        for diag in &diagnostics {
+            println!("{}", serde_json::to_string(diag)?);
+        }
     }
+    // Under `--json` WITH a type report, the diagnostics are emitted nested
+    // inside each export's type-report object (the `show_type_report` block)
+    // rather than as a standalone array — see the design note there. Built only
+    // on the `--json` path (empty otherwise) since the TEXT path printed above.
+    let diag_by_export: std::collections::HashMap<&str, &ExportDiagnostic> = if json_output {
+        diagnostics
+            .iter()
+            .map(|d| (d.export_name.as_str(), d))
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
 
     // Destination credential-resolution preflight.  Until 0.7.6 `check` only
     // probed the source: a config with `AWS_ACCESS_KEY_ID` unset would pass
@@ -245,13 +379,38 @@ pub fn check(
                         target_fail_label.get_or_insert(t.label());
                     }
                     if json_output {
-                        type_report::print_json(&report)?;
+                        // `--json` + `--type-report` interaction (DESIGN):
+                        // emit BOTH, nested. Each export gets ONE JSON object
+                        // (NDJSON, one per line, unchanged) keeping the
+                        // top-level type-report keys (`export`/`columns`/
+                        // `violations`) so existing consumers and the
+                        // `check_json_flag_outputs_type_report_as_json` test
+                        // stay green — and we attach the per-export DIAGNOSTIC
+                        // verdict under a new `"diagnostic"` key. This is the
+                        // least-surprising shape because `check --json` already
+                        // emitted one type-report object per export; we simply
+                        // enrich each with its verdict rather than printing a
+                        // second, separate JSON value (which would break a
+                        // single-`from_str` parse of stdout).
+                        print_report_json_with_diagnostic(
+                            &report,
+                            diag_by_export.get(export.name.as_str()).copied(),
+                        )?;
                     } else {
                         type_report::print_table(&report, eff_target);
                     }
                 }
                 Err(e) => {
                     log::warn!("type report for '{}' failed: {:#}", export.name, e);
+                    // The type report could not be collected, but the diagnostic
+                    // was. Under --json the verdict must still reach the
+                    // consumer, so emit a diagnostic-only object (no `columns`/
+                    // `violations`) rather than silently dropping this export.
+                    if json_output
+                        && let Some(diag) = diag_by_export.get(export.name.as_str()).copied()
+                    {
+                        println!("{}", serde_json::to_string(diag)?);
+                    }
                 }
             }
         }
@@ -285,6 +444,27 @@ pub fn check(
         }
     }
 
+    Ok(())
+}
+
+/// Emit one export's `--json` line: the type report (`export`/`columns`/
+/// `violations`/…) with the per-export DIAGNOSTIC verdict attached under a new
+/// `"diagnostic"` key. NDJSON — exactly one JSON object, terminated by a
+/// newline, so a multi-export config prints one parseable object per line
+/// (preserving the prior `check --json` type-report wire shape, now enriched).
+///
+/// `diag` is `None` only if the diagnostic could not be paired by export name
+/// (it always can in practice); in that case the type report is emitted as
+/// before, so the worst case is a missing `diagnostic` key, never a panic.
+fn print_report_json_with_diagnostic(
+    report: &type_report::ExportTypeReport,
+    diag: Option<&ExportDiagnostic>,
+) -> Result<()> {
+    let mut value = serde_json::to_value(report)?;
+    if let (Some(obj), Some(diag)) = (value.as_object_mut(), diag) {
+        obj.insert("diagnostic".to_string(), serde_json::to_value(diag)?);
+    }
+    println!("{}", serde_json::to_string(&value)?);
     Ok(())
 }
 
@@ -349,6 +529,7 @@ mod tests {
     use doctor::{
         categorize_dest_error, categorize_source_error, destination_error_hint, source_error_hint,
     };
+    use serde_json::Value;
 
     fn make_export(name: &str, mode: ExportMode, cursor: Option<&str>) -> ExportConfig {
         // Baseline from the canonical test fixture; override only the fields
@@ -365,6 +546,182 @@ mod tests {
             },
             ..crate::config::sample_export(name)
         }
+    }
+
+    /// A representative incremental diagnostic for the `--json` serialization
+    /// tests: a cursor column (so `has_cursor` is true), an index (so
+    /// `uses_index` is true), a >1 parallel recommendation (so `can_parallel`
+    /// is true), and a couple of warnings.
+    fn sample_diagnostic(name: &str) -> ExportDiagnostic {
+        ExportDiagnostic {
+            export_name: name.to_string(),
+            strategy: "incremental(updated_at)".to_string(),
+            mode: "incremental".to_string(),
+            cursor_column: Some("updated_at".to_string()),
+            row_estimate: Some(1_234_567),
+            avg_row_bytes: Some(96),
+            cursor_min: Some("2020-01-01".to_string()),
+            cursor_max: Some("2024-01-01".to_string()),
+            scan_type: Some("Index Scan".to_string()),
+            uses_index: true,
+            verdict: HealthVerdict::Degraded,
+            recommended_profile: "safe",
+            recommended_parallel: (4, "large indexed dataset"),
+            warnings: vec!["Sparse key range".to_string(), "memory risk".to_string()],
+            suggestion: Some("create an index".to_string()),
+        }
+    }
+
+    // ── `rivet check --json`: the per-export DIAGNOSTIC verdict as JSON ───────
+
+    #[test]
+    fn diagnostic_json_has_lowercase_verdict_and_core_fields() {
+        let diag = sample_diagnostic("orders");
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&diag).unwrap()).unwrap();
+
+        // Verdict serializes to a stable lowercase token (not the SHOUTING
+        // Display form), so CI can match on it case-sensitively.
+        assert_eq!(v["verdict"], "degraded", "got: {v}");
+        assert_eq!(v["strategy"], "incremental(updated_at)", "got: {v}");
+        assert_eq!(v["mode"], "incremental", "got: {v}");
+        assert_eq!(v["recommended_profile"], "safe", "got: {v}");
+        assert!(v["warnings"].is_array(), "warnings must be an array: {v}");
+        assert_eq!(v["warnings"].as_array().unwrap().len(), 2, "got: {v}");
+        assert_eq!(v["export_name"], "orders", "got: {v}");
+    }
+
+    #[test]
+    fn diagnostic_json_verdict_tokens_are_all_lowercase() {
+        for (verdict, token) in [
+            (HealthVerdict::Efficient, "efficient"),
+            (HealthVerdict::Acceptable, "acceptable"),
+            (HealthVerdict::Degraded, "degraded"),
+            (HealthVerdict::Unsafe, "unsafe"),
+        ] {
+            let mut diag = sample_diagnostic("t");
+            diag.verdict = verdict;
+            let v: serde_json::Value =
+                serde_json::from_str(&serde_json::to_string(&diag).unwrap()).unwrap();
+            assert_eq!(v["verdict"], token, "verdict must lowercase to {token}");
+        }
+    }
+
+    #[test]
+    fn diagnostic_json_recommended_parallel_is_named_object_not_tuple() {
+        // The raw `(u32, &str)` must NOT leak as a positional 2-array; consumers
+        // read `recommended_parallel.level` / `.reason`.
+        let diag = sample_diagnostic("t");
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&diag).unwrap()).unwrap();
+        assert!(
+            v["recommended_parallel"].is_object(),
+            "recommended_parallel must be an object, got: {}",
+            v["recommended_parallel"]
+        );
+        assert_eq!(v["recommended_parallel"]["level"], 4, "got: {v}");
+        assert_eq!(
+            v["recommended_parallel"]["reason"], "large indexed dataset",
+            "got: {v}"
+        );
+    }
+
+    #[test]
+    fn diagnostic_json_capabilities_are_derived_from_fields() {
+        let diag = sample_diagnostic("t");
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&diag).unwrap()).unwrap();
+        let caps = &v["capabilities"];
+        assert_eq!(caps["uses_index"], true, "got: {caps}");
+        assert_eq!(caps["has_cursor"], true, "got: {caps}");
+        assert_eq!(caps["can_parallel"], true, "got: {caps}");
+    }
+
+    #[test]
+    fn diagnostic_json_capabilities_flip_with_fields() {
+        // A non-cursor, no-index, single-worker diagnostic flips all three.
+        let mut diag = sample_diagnostic("t");
+        diag.cursor_column = None;
+        diag.uses_index = false;
+        diag.recommended_parallel = (1, "small dataset");
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&diag).unwrap()).unwrap();
+        let caps = &v["capabilities"];
+        assert_eq!(caps["uses_index"], false, "got: {caps}");
+        assert_eq!(caps["has_cursor"], false, "got: {caps}");
+        assert_eq!(caps["can_parallel"], false, "got: {caps}");
+    }
+
+    #[test]
+    fn diagnostic_json_skips_none_optionals() {
+        // `None` optionals are omitted (not `null`) to keep the object lean.
+        let mut diag = sample_diagnostic("t");
+        diag.suggestion = None;
+        diag.scan_type = None;
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&diag).unwrap()).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(!obj.contains_key("suggestion"), "None must be omitted: {v}");
+        assert!(!obj.contains_key("scan_type"), "None must be omitted: {v}");
+    }
+
+    /// Build the same `Value` `print_report_json_with_diagnostic` prints, so the
+    /// merged shape is asserted without capturing stdout.
+    fn merged_check_json(report: &type_report::ExportTypeReport, diag: &ExportDiagnostic) -> Value {
+        let mut value = serde_json::to_value(report).unwrap();
+        value.as_object_mut().unwrap().insert(
+            "diagnostic".to_string(),
+            serde_json::to_value(diag).unwrap(),
+        );
+        value
+    }
+
+    fn empty_report(export: &str) -> type_report::ExportTypeReport {
+        type_report::ExportTypeReport {
+            export: export.to_string(),
+            columns: Vec::new(),
+            violations: Vec::new(),
+            target_failures: false,
+            recovery_sql: None,
+        }
+    }
+
+    #[test]
+    fn check_json_merges_diagnostic_into_type_report_object() {
+        // The `--json` + `--type-report` interaction: ONE object per export
+        // keeping the type-report keys (`export`/`columns`/`violations`) — so
+        // the existing `check_json_flag_outputs_type_report_as_json` contract
+        // holds — PLUS a nested `diagnostic` carrying the verdict.
+        let report = empty_report("orders");
+        let diag = sample_diagnostic("orders");
+        let v = merged_check_json(&report, &diag);
+
+        // Pre-existing type-report keys still at the root.
+        assert_eq!(v["export"], "orders", "got: {v}");
+        assert!(v["columns"].is_array(), "columns at root: {v}");
+        assert!(v["violations"].is_array(), "violations at root: {v}");
+
+        // The diagnostic is nested and carries the verdict + advice.
+        let d = &v["diagnostic"];
+        assert_eq!(d["verdict"], "degraded", "got: {d}");
+        assert_eq!(d["strategy"], "incremental(updated_at)", "got: {d}");
+        assert_eq!(d["mode"], "incremental", "got: {d}");
+        assert_eq!(d["recommended_profile"], "safe", "got: {d}");
+        assert!(d["warnings"].is_array(), "warnings array: {d}");
+        assert_eq!(d["capabilities"]["has_cursor"], true, "got: {d}");
+    }
+
+    #[test]
+    fn check_json_object_is_a_single_parseable_line() {
+        // NDJSON: serializing yields exactly one JSON value with no trailing
+        // data, so `serde_json::from_str(line.trim())` (as the live test does)
+        // parses it whole.
+        let report = empty_report("orders");
+        let diag = sample_diagnostic("orders");
+        let line = serde_json::to_string(&merged_check_json(&report, &diag)).unwrap();
+        assert!(!line.contains('\n'), "one object per line: {line}");
+        let parsed: Value = serde_json::from_str(line.trim()).expect("must parse whole");
+        assert_eq!(parsed["export"], "orders");
     }
 
     // ── L8: 'fail ✗' note when --target FAILs but --strict was not passed ─────
@@ -388,25 +745,25 @@ mod tests {
 
     #[test]
     fn verdict_small_indexed_with_cursor_is_efficient() {
-        let v = compute_verdict(Some(500_000), true, true);
+        let v = compute_verdict(Some(500_000), true, true, None, 1);
         assert!(matches!(v, HealthVerdict::Efficient), "got: {v}");
     }
 
     #[test]
     fn verdict_large_indexed_with_cursor_is_acceptable() {
-        let v = compute_verdict(Some(20_000_000), true, true);
+        let v = compute_verdict(Some(20_000_000), true, true, None, 1);
         assert!(matches!(v, HealthVerdict::Acceptable), "got: {v}");
     }
 
     #[test]
     fn verdict_no_index_no_cursor_is_degraded() {
-        let v = compute_verdict(Some(500_000), false, false);
+        let v = compute_verdict(Some(500_000), false, false, None, 1);
         assert!(matches!(v, HealthVerdict::Degraded), "got: {v}");
     }
 
     #[test]
     fn verdict_huge_no_index_is_unsafe() {
-        let v = compute_verdict(Some(100_000_000), false, false);
+        let v = compute_verdict(Some(100_000_000), false, false, None, 1);
         assert!(matches!(v, HealthVerdict::Unsafe), "got: {v}");
     }
 

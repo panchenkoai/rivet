@@ -774,8 +774,8 @@ recovery semantics, quality gates, resource controls, and reliability coverage.
 | Work | Priority | Status | Definition of done |
 |---|---|---|---|
 | Release checksums (`SHA256SUMS`) | P1 | ✅ Done | `release.yml` publishes `SHA256SUMS.txt` per release; verification documented in README + SECURITY.md |
-| Signed releases / attestations | P2 | ⏳ Open | Release artifacts can be cryptographically verified |
-| SBOM | P2 | ⏳ Open | Release includes SBOM artifact and security docs mention it |
+| Signed releases / attestations | P2 | ✅ Done | `SHA256SUMS.txt` signed with cosign keyless (Sigstore + GitHub OIDC) → `SHA256SUMS.txt.cosign.bundle`; `cosign verify-blob` documented in SECURITY.md |
+| SBOM | P2 | ✅ Done | Release publishes an SPDX SBOM (`rivet-<tag>.spdx.json`, syft) of the source + Cargo graph; its hash rides in the signed `SHA256SUMS.txt`; SECURITY.md SBOM row → Active |
 | 24h+ soak tests | P2 | ⏳ Open | Long-horizon extraction run documented in reliability matrix |
 | Real-cloud destination release smoke | P2 | ✅ Done | `docs/cloud-smoke-tests.md` (dated S3/GCS/Azure record) + `docs/release-checklist.md` §3 (per-tag smoke gate before publish) |
 | k8s/Helm deployment guidance | P3 | ✅ doc-guidance done | `docs/who-is-this-for.md` (Job/CronJob supported; operator/Helm chart an explicit non-fit). An actual Helm chart / operator remains a deliberate non-goal / future |
@@ -1171,8 +1171,8 @@ Prioritize by stabilization before distribution polish:
 3. ✅ **F5 + I5** — reconcile/validate tradeoffs (cli.md); capacity/memory planning (tuning.md).
 4. ✅ **I2** — `cargo bench` + `dev/scripts/bench.sh` save/compare harness; column_scan + shape_tracking groups.
 5. ✅ **Epic 4 (§5)** — external/durable state backend: `RIVET_STATE_URL` PostgreSQL backend shipped.
-6. ⏳ **Verify / Validation Layer (v0.7.9, next focus)** — *"are produced files + manifest + state + summary internally consistent, AND is the data itself intact?"*. **Value-integrity depth IMPLEMENTED** (`feat/all-types-oracle`, 15 commits, pending merge): an always-on per-column `xxh3` value checksum — **Form A** cross-checks source↔Arrow in-process (catches the `build_array` converter mid-run) and **Form B** records per-column checksums in the manifest so `rivet validate` re-reads the Parquet and compares (catches an Arrow→Parquet encode / post-write fault). This **answers the design-open question toward extending `rivet validate`** (ADR-0013 "no new flags", NOT a new `rivet verify` command) and delivers the deepest "full file scan" level. Scope is honest: *decoded-value → file*, covered types only (uncovered logged, never a silent zero), probabilistic (xxh3-64), the DB-wire decode trusted; live round-trip proven (export → validate pass → flip a byte → validate fails). Cost vs v0.14.1: +2.8% wall / +11.3% CPU. **Remaining (⏳):** the lighter artifact-consistency levels (missing/partial/orphan files, size mismatch, manifest↔state divergence, schema-hash) — most already in Epic 2's `--validate` — plus stable `RIVET_VERIFY_*` codes, JSON output, and the graded light/sample/full depth-level UX.
-7. ⏳ **Operator UX & Diagnostics (v0.8.0)** — structured diagnostics with stable codes (`RIVET_CONFIG_*`, `RIVET_SOURCE_*`, `RIVET_VERIFY_*`, …), severity (low / medium / high / blocking), actionable hints; `--json` everywhere; strategy explanation in `rivet plan` (why this chunk size, why this mode, what risk remains); `doctor` capability + blocker report.
+6. ✅ **Verify / Validation Layer (shipped 0.15.0 + graded depth/codes)** — *"are produced files + manifest + state + summary internally consistent, AND is the data itself intact?"*. **Value-integrity depth SHIPPED** (v0.15.0): an always-on per-column `xxh3` value checksum — **Form A** cross-checks source↔Arrow in-process (catches the `build_array` converter mid-run) and **Form B** records per-column checksums in the manifest so `rivet validate` re-reads the Parquet and compares (catches an Arrow→Parquet encode / post-write fault). This **answers the design-open question toward extending `rivet validate`** (ADR-0013 "no new flags", NOT a new `rivet verify` command) and delivers the deepest "full file scan" level. Scope is honest: *decoded-value → file*, covered types only (uncovered logged, never a silent zero), probabilistic (xxh3-64), the DB-wire decode trusted; live round-trip proven (export → validate pass → flip a byte → validate fails). Cost vs v0.14.1: +2.8% wall / +11.3% CPU. **Now SHIPPED too** (`feat/verify-and-ux`): the graded `rivet validate --depth light|sample|full` UX, stable `RIVET_VERIFY_*` codes (one per failure variant — in JSON `code` + the pretty `[CODE]` prefix), and JSON output, over the artifact-consistency checks that already lived in Epic 2's `--validate` (missing/partial/orphan, size mismatch, `_SUCCESS` fingerprint). The Verify Layer is feature-complete; only a manifest↔state cross-divergence check remains a future nicety.
+7. 🟡 **Operator UX & Diagnostics (v0.8.0) — in progress** — structured diagnostics with stable codes, severity, `--json` everywhere, strategy explanation, a `doctor` report. **Shipped so far** (`feat/verify-and-ux`): `rivet check --json` now emits the per-export verdict / strategy / warnings / recommended profile+parallel / capabilities (not just the type report); `rivet plan` now **explains the strategy** (`plan::explain` — why this mode, chunk geometry, and parallelism, the RSS-budget fit, plus the resumability + memory risk); `RIVET_VERIFY_*` codes shipped (validate). **Remaining (⏳):** stable `RIVET_CONFIG_*` / `RIVET_SOURCE_*` codes, per-warning severity (low/medium/high/blocking), `doctor --json` + a capability/blocker summary, and `--json` on the last text-only commands.
 
 ### 9.6.1 UX hardening backlog (v0.7.8 walk-through findings)
 
@@ -1191,21 +1191,21 @@ with verify-layer work as bandwidth allows.
 
 **P2 — friction, not bugs** (tackle before v0.7.9 release if time permits):
 
-- ⏳ **`check` verdict pessimism vs actual run.** UNSAFE / DEGRADED predicts high RSS on parallel reads against no-index tables, but the actual run frequently sits well under the predicted budget (e.g. 10 M-row chunked-parallel orders ran in 12 s at 117 MB RSS while check said UNSAFE). Either make the predictor use estimated row width + chunk batch size for a tighter bound, or downgrade UNSAFE to DEGRADED when the verdict can't show a concrete budget breach.
-- ⏳ **`destination is not retry-safe` WARN spams local-destination runs.** `type: local` is the canonical dev/test destination but each run prints a retry-safety WARN. Either suppress for `local` (partial artifact = one failed-rewrite file, not silent data loss) or have `rivet init` add the right opt-in so the warn does not fire on defaults.
+- ✅ **`check` verdict pessimism vs actual run — FIXED.** `compute_verdict` now feeds the catalog `avg_row_bytes` + `parallel` into the bench-validated peak-RSS model (`tuning::memory::estimate_peak_rss_mb`, single-sourced with the scaffold) and downgrades UNSAFE→DEGRADED for an unindexed large scan whose predicted peak fits the 2 GB budget; it stays UNSAFE only when the width is unknown (e.g. MySQL) or the prediction breaches the budget. The 117 MB / 10 M-row case is now DEGRADED, not UNSAFE.
+- ✅ **`destination is not retry-safe` WARN does NOT fire for local — DONE.** `src/destination/local.rs:119` reports `retry_safe: true` (temp-then-rename leaves nothing at the final key on failure), so the gate `!retry_safe && max_retries > 0` (`destination/mod.rs:214`) is false for `local` *and* `cloud`. The WARN fires only for `stdout` (`retry_safe: false`), whose stream genuinely can't be reverted — which is correct, not spam.
 - ✅ **TLS warning now surfaces in `doctor`/`check`** (v0.7.8) — preflight calls `warn_if_tls_disabled` ([src/preflight/doctor.rs](src/preflight/doctor.rs), [src/preflight/mod.rs](src/preflight/mod.rs)), so the missing-`tls:` warning fires before a real extract, not only in `run`.
 - ✅ **`rivet init --schema X` test-table filtering — DONE.** Repeatable `--include` / `--exclude '<glob>'` flags (`*`/`?` globs; `--exclude` wins over `--include`) — `TableFilter` + an in-tree `glob_match` (`src/init/mod.rs`), wired in `src/cli/dispatch.rs:474`, 4 passing unit tests (`table_filter_*`). Whole-schema init now drops `bench_*` / `tmp_*` / `*_temp` on demand.
 
 **P3 — polish & doc clarity** (good v0.8.0 fodder):
 
-- ⏳ **`rivet init` does not explain *why* it picked a mode.** Generated YAML says `mode: chunked` but not "(auto-selected because rows estimate ≥ 500 K)". One-line inline comment in the rendered config would close the loop.
+- ✅ **`rivet init` explains *why* it picked a mode — DONE.** `src/init/yaml_scaffold.rs:333` renders `# {mode_rationale}` above `mode:`; `TableInfo::mode_rationale` (`init/mod.rs:85`) emits e.g. "auto: ~Nk rows ≥ 100K threshold and chunk column 'id' available. NOTE: chunked re-reads the whole table — for scheduled re-runs use `mode: incremental` on '<cursor>'".
 - ✅ **`rivet journal` shows retry events — DONE.** `RunEvent::RetryAttempted` is journaled and the command prints `retries: N` (`src/pipeline/cli.rs:517`); `RunJournal::retries()` exposes the entries for post-mortem.
 - ✅ **100 files per 10 M-row chunked export — FIXED.** `rivet init` now scales `chunk_size` by the row estimate (`TableInfo::suggest_chunk_size` → `src/init/yaml_scaffold.rs:340`); a 10 M-row export that used to render 100 files now lands at ~10. Operators override the rendered line for different geometry.
 - ✅ **`status: skipped` now names the cursor** (v0.7.8) — shows `(no new rows since cursor '<col>')` ([src/pipeline/single.rs](src/pipeline/single.rs)) so the operator doesn't have to guess.
 - ✅ **Doc note added: re-running `chunked` re-extracts everything** — [`docs/modes/chunked.md`](docs/modes/chunked.md) § "Clean re-runs are NOT idempotent" spells out that `--resume` only skips completed chunks after a crash.
 - ✅ **Doc note added: `time_window` re-runs duplicate output.** `docs/modes/time-window.md` documents that rolling-window mode does not persist "this window already done", so frequent re-runs duplicate files.
 - ⏳ **Retry / I3 (Write Before Cursor) at-least-once dupe scenario** not yet covered by tests. The contract documents the duplicate possibility (`ADR-0001 I3`), and toxiproxy-based retry testing showed counters work; a dedicated SIGKILL-between-write-and-commit recovery test would pin the actual dupe behavior end-to-end.
-- ⏳ **Stale roadmap items inherited from earlier sessions:** "2–3 pilot tables repeated on a schedule" in §9.7 (organizational), SBOM / signed release attestations (also §9.7 unchecked). *(Release checksums shipped in v0.7.8 — now checked.)*
+- ⏳ **Stale roadmap items inherited from earlier sessions:** "2–3 pilot tables repeated on a schedule" in §9.7 (organizational; optional automation K2) is now the only unchecked §9.7 item. *(Release checksums shipped v0.7.8; SBOM + signed-release attestations shipped v0.15.0 — both now checked in §9.7.)*
 
 ---
 
@@ -1234,8 +1234,8 @@ with verify-layer work as bandwidth allows.
 - [x] Reliability and compatibility matrices published
 - [x] Pilot and production-readiness docs published
 - [x] Release checksums *(v0.7.8 — `SHA256SUMS.txt` published per release; verify with `sha256sum -c`)*
-- [ ] Signed releases / attestations
-- [ ] SBOM
+- [x] Signed releases / attestations
+- [x] SBOM
 
 ---
 
@@ -1273,7 +1273,8 @@ and the two-engine separation with explicit revisit triggers (ADR-0010).
 | OPT-4 | MySQL parity | P1 | ✅ Done | MySQL keyset (seek) pagination shipped (40433a0) — single-column unique key, sequential, index range scan (documented in code comments; no EXPLAIN assertion in the suite). Follow-ups: composite keys, parallel keyset, resume |
 | OPT-5 | Dedup ergonomics | P2 | ✅ Partial | Deterministic per-part `content_fingerprint` exposed in every manifest (`manifest.rs:198`) + documented as the dedup key; remaining gap = a dedicated SIGKILL-between-write-and-commit dedup-collision test |
 | OPT-6 | Engine debt | P2 | ✅ Done | Crash-matrix symmetry pass on `feat/opt6-crash-matrix`: SIGTERM/SIGINT child reaper (`parallel_children::child_reaper`), SIGKILL-mid-write proof (temp+rename), subprocess panic recovery across all 4 write-cycle boundaries. See `dev/CRASH_MATRIX.md`. Residuals: object-store `FinalizeOnClose`, single-child external-signal accounting |
-| OPT-7 | Doc/roadmap drift | P1 | ✅ Done | Checksums documented as shipped (SECURITY.md + README + §5.1/§9.7); 3 §9.6.1 items struck. *Of those 3: `init chunk_size scaling` IS in fact shipped (`yaml_scaffold.rs:340`, `suggest_chunk_size`) — only `local-retry WARN` suppression for local destinations and the `init` mode-selection comment remain genuinely open.* |
+| OPT-7 | Doc/roadmap drift | P1 | ✅ Done | Checksums documented as shipped (SECURITY.md + README + §5.1/§9.7); 3 §9.6.1 items struck. *Of those 3: ALL in fact shipped — `init chunk_size scaling` (`yaml_scaffold.rs:340`), the `init` mode-selection comment (`yaml_scaffold.rs:333` + `mode_rationale`), and the `local-retry WARN` (suppressed for local/cloud by `local.rs:119` `retry_safe: true`; fires only for stdout, correctly). OPT-7's "not shipped" claim was stale on all three.* |
+| OPT-8 | Test build/infra | P2 | ✅ Done | 109 integration-test binaries → 13 (`tests/{offline,live}_suite.rs` `#[path]`-consolidation) + cargo-nextest per-test isolation + split pre-push hook → test-LINK build 229s→29s (8×). `tests/suite_completeness.rs` guard closes the silent-skip footgun; nextest requirement documented; cargo-chef Dockerfile caches the dep layer. Rejected after measurement: sccache (incremental → 0% Rust hits), lld (macOS ld-prime already fast), dep-dedup (transitive majors), feature-trim (all live) |
 
 ---
 
@@ -1504,6 +1505,53 @@ re-planning work that is already done.
 **Definition of done.** §5.1, §9.6.1, and §9.7 reflect the actual shipped state of
 v0.7.8; README/SECURITY document checksum verification against the published
 `SHA256SUMS.txt`.
+
+---
+
+## OPT-8 — Test build/infra consolidation (link-count + isolation)
+
+**Priority: P2** — pure developer-velocity / CI-cost debt; no product-surface change.
+
+**Problem.** cargo builds one test binary per `tests/*.rs` file, and each links the whole crate. The repo
+had ~109 such files, so `cargo test --tests` / the pre-push hook / CI linked rivet 109 times — the link
+phase, not compilation, dominated the offline test build (~229s warm). The only thing that link cost
+bought was per-test isolation *as a side effect* (one binary = one process) — an implicit property
+nothing named or could reason about.
+
+**Change (shipped on `feat/verify-and-ux`).**
+- **Consolidation 109 → 13 binaries.** Self-contained offline tests moved under `tests/offline/`, the live
+  (`#[ignore]`, docker) suites under `tests/live/`; two entry files (`tests/offline_suite.rs`,
+  `tests/live_suite.rs`) `#[path]`-include them so each set LINKS ONCE. A few targets named individually
+  by CI (`type_roundtrip`, `live_differential`, `live_type_golden`) stay separate.
+- **cargo-nextest** (`.config/nextest.toml`) for process-per-test isolation, so a crash / SIGKILL /
+  global-state test can't poison its siblings inside a consolidated binary — restoring *explicitly* the
+  isolation the old layout gave implicitly.
+- **Split pre-push hook**: unit tests threaded (`cargo test --lib --bins`), only the integration suites
+  under nextest (`-E 'kind(test)'`) — avoids ~1700 process spawns for the pure unit tests.
+- **Both footguns the consolidation introduced, closed:** silent-skip (a file added to the subdir but not
+  registered in the entry runs as nothing) → `tests/suite_completeness.rs` guard (auto-discovered; proven
+  RED→GREEN); runner-dependent isolation (`cargo test` ≠ nextest) → documented in both entry headers, the
+  hook fallback, and a README "Running tests" section.
+- **cargo-chef Dockerfile**: the dependency build is its own layer keyed on `recipe.json`, so a
+  source-only change recompiles just rivet, not the ~500 dep crates.
+
+**Measured (honest).** Test-LINK build (warm lib): **229s → 29s, 8×, −200s** — link count was the whole
+cost. Hook run phase **~67s → ~32s** (units threaded vs process-per-test). This is a *test-build* win, NOT
+a cold-build one: a from-scratch dep compile is ~60s (arrow/parquet/tokio), not the once-assumed "30
+minutes" — that figure never matched a real build.
+
+**Rejected after measurement (not assumed):**
+- **sccache** — committed then reverted: with dev `incremental=true` it scores **0% Rust cache hits**
+  (sccache skips incremental Rust); `CARGO_INCREMENTAL=0` gives only 60s→35s (1.7×) on an already-60s
+  build while hurting the warm edit-loop. A CI-only `incremental=0` setup remains optional.
+- **lld linker** — macOS already ships the fast `ld-prime` (Xcode 17, ld v1230); lld doesn't beat it here.
+- **dependency dedup** — the 57 duplicate-version crates are transitive major splits (`base64 0.21 ←
+  tiberius`, `rand 0.8 ← sqlx`); not unifiable.
+- **feature trim** — the parquet codecs (zstd/lz4/gzip) and the arrow canonical extension types
+  (`src/types/mapping.rs:24`) are all live.
+
+**Definition of done.** Offline suite + hook green under nextest at 13 binaries; the `suite_completeness`
+guard enforces registration; the nextest requirement is documented where a contributor meets it. ✅
 
 ---
 

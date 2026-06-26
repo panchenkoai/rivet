@@ -34,22 +34,17 @@ use crate::error::Result;
 use crate::source::Source;
 use crate::source::mssql::MssqlSource;
 
+/// Connect once and build one [`ExportDiagnostic`] per export. Rendering
+/// (TEXT table vs `--json`) is the caller's job in [`super::check`], so this
+/// returns the diagnostics rather than printing inline.
 pub(super) fn check_mssql(
     url: &str,
     tls: Option<&TlsConfig>,
     exports: &[&ExportConfig],
-    silent: bool,
-) -> Result<()> {
+) -> Result<Vec<ExportDiagnostic>> {
     let mut conn = MssqlSource::connect_with_tls(url, tls)?;
 
-    for export in exports {
-        let diag = diagnose_mssql(&mut conn, export)?;
-        if !silent {
-            super::print_diagnostic(&diag);
-        }
-    }
-
-    Ok(())
+    super::collect_diagnostics(exports, |export| diagnose_mssql(&mut conn, export))
 }
 
 /// Diagnose a single export without printing — used by `rivet plan`.
@@ -136,7 +131,13 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
     };
 
     let strategy = derive_strategy(export);
-    let verdict = compute_verdict(row_estimate, uses_index, export.cursor_column.is_some());
+    let verdict = compute_verdict(
+        row_estimate,
+        uses_index,
+        export.cursor_column.is_some(),
+        avg_row_bytes,
+        export.parallel,
+    );
     let recommended_profile = recommend_profile(row_estimate, uses_index, export);
     let recommended_parallel = recommend_parallelism(export, row_estimate, uses_index);
     // SQL Server has no portable per-user `max_connections` server variable

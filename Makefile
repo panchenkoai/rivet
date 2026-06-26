@@ -1,7 +1,7 @@
 # Rivet developer shortcuts.
 # Requires Rust 1.94+ (see rust-toolchain.toml if present).
 
-.PHONY: test-types test-types-live test-types-property test-types-validators test-types-bigquery test-types-snowflake
+.PHONY: test-types test-types-live test-types-property test-types-validators test-types-bigquery test-types-snowflake sweep-test-db test-live
 
 # PR-fast: offline type-mapping contracts (no docker).
 test-types:
@@ -49,3 +49,17 @@ test-types-bigquery:
 # Example: `SNOWFLAKE_TEST_CONNECTION=rivet make test-types-snowflake`.
 test-types-snowflake:
 	cargo test --test type_roundtrip snowflake_validates -- --include-ignored --test-threads=1
+
+# Drop test-fixture tables left behind by INTERRUPTED live runs (a killed test
+# process skips the RAII Drop guard, so the slow cloud suites can leak
+# `<prefix>_<pid>_<counter>` tables into the shared `rivet` fixture DB). Safe
+# anytime — only touches those fixtures, never the init.sql / seed.rs tables.
+# Best-effort per engine: a down service is skipped. See dev/sweep-test-cruft.sh.
+sweep-test-db:
+	bash dev/sweep-test-cruft.sh
+
+# Full live suite under nextest (per-test isolation), sweeping stale fixtures
+# FIRST so an interrupted prior run never pollutes the shared `rivet` DB.
+# Requires `docker compose up -d` (postgres + mysql + the validator containers).
+test-live: sweep-test-db
+	cargo nextest run --run-ignored all

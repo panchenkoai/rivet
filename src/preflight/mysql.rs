@@ -5,24 +5,21 @@ use super::schema_error::PreflightSchemaError;
 use crate::config::{ExportConfig, ExportMode, SourceType, TlsConfig};
 use crate::error::Result;
 
+/// Connect once and build one [`ExportDiagnostic`] per export. Rendering
+/// (TEXT table vs `--json`) is the caller's job in [`super::check`], so this
+/// returns the diagnostics rather than printing inline.
 pub(super) fn check_mysql(
     url: &str,
     tls: Option<&TlsConfig>,
     exports: &[&ExportConfig],
-    silent: bool,
-) -> Result<()> {
+) -> Result<Vec<ExportDiagnostic>> {
     let pool = crate::source::mysql::connect_pool(url, tls)?;
     let mut conn = pool.get_conn()?;
     let db_max_connections = fetch_max_connections_mysql(&mut conn);
 
-    for export in exports {
-        let diag = diagnose_mysql(&mut conn, export, db_max_connections)?;
-        if !silent {
-            super::print_diagnostic(&diag);
-        }
-    }
-
-    Ok(())
+    super::collect_diagnostics(exports, |export| {
+        diagnose_mysql(&mut conn, export, db_max_connections)
+    })
 }
 
 /// Diagnose a single export without printing — used by `rivet plan`.
@@ -193,7 +190,13 @@ fn diagnose_mysql(
     };
 
     let strategy = derive_strategy(export);
-    let verdict = compute_verdict(row_estimate, uses_index, export.cursor_column.is_some());
+    let verdict = compute_verdict(
+        row_estimate,
+        uses_index,
+        export.cursor_column.is_some(),
+        None, // MySQL exposes no reliable avg_row_bytes pre-run → can't predict RSS
+        export.parallel,
+    );
     let recommended_profile = recommend_profile(row_estimate, uses_index, export);
     let recommended_parallel = recommend_parallelism(export, row_estimate, uses_index);
     // MySQL has no trustworthy scan-free row-width estimate (information_schema

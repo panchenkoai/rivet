@@ -5,23 +5,20 @@ use super::schema_error::PreflightSchemaError;
 use crate::config::{ExportConfig, ExportMode, SourceType, TlsConfig};
 use crate::error::Result;
 
+/// Connect once and build one [`ExportDiagnostic`] per export. Rendering
+/// (TEXT table vs `--json`) is the caller's job in [`super::check`], so this
+/// returns the diagnostics rather than printing inline.
 pub(super) fn check_postgres(
     url: &str,
     tls: Option<&TlsConfig>,
     exports: &[&ExportConfig],
-    silent: bool,
-) -> Result<()> {
+) -> Result<Vec<ExportDiagnostic>> {
     let mut client = crate::source::postgres::connect_client(url, tls)?;
     let db_max_connections = fetch_max_connections_pg(&mut client);
 
-    for export in exports {
-        let diag = diagnose_pg(&mut client, export, db_max_connections)?;
-        if !silent {
-            super::print_diagnostic(&diag);
-        }
-    }
-
-    Ok(())
+    super::collect_diagnostics(exports, |export| {
+        diagnose_pg(&mut client, export, db_max_connections)
+    })
 }
 
 /// Diagnose a single export without printing — used by `rivet plan`.
@@ -137,7 +134,13 @@ fn diagnose_pg(
     };
 
     let strategy = derive_strategy(export);
-    let verdict = compute_verdict(row_estimate, uses_index, export.cursor_column.is_some());
+    let verdict = compute_verdict(
+        row_estimate,
+        uses_index,
+        export.cursor_column.is_some(),
+        avg_row_bytes,
+        export.parallel,
+    );
     let recommended_profile = recommend_profile(row_estimate, uses_index, export);
     let recommended_parallel = recommend_parallelism(export, row_estimate, uses_index);
     let warnings = collect_warnings(

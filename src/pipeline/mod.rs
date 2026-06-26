@@ -60,6 +60,11 @@ pub use plan_cmd::{PlanOutputFormat, run_plan_command};
 pub use reconcile_cmd::{ReconcileOutputFormat, run_reconcile_command};
 pub use repair_cmd::{RepairOutputFormat, RepairReportSource, run_repair_command};
 pub use validate_cmd::{ValidateOutputFormat, ValidateTarget, run_validate_command};
+// The graded verify depth is part of the CLI contract (`--depth`) and is the
+// same enum that gates the checks in `verify_at_destination`.  Defined in the
+// pipeline layer; re-exported here so `cli::args` can parse it on the flag
+// without the CLI→pipeline layering inversion of defining it in `cli`.
+pub use validate_manifest::ValidateDepth;
 
 // `RunSummary` is consumed by `notify::*` (via the Coordinator path) plus
 // integration-test fixtures.  It is the canonical observability struct so

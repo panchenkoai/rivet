@@ -310,6 +310,30 @@ cargo build --release
 # binary is at target/release/rivet
 ```
 
+### Running tests
+
+Tests run under [cargo-nextest](https://nexte.st) — it executes each test in its own process:
+
+```bash
+cargo install cargo-nextest --locked    # one-time
+cargo nextest run                        # offline suite (live tests are #[ignore], skipped)
+
+# Live engine tests need the docker services first:
+docker compose up -d                     # services match docker-compose.yaml
+make test-live                           # sweep stale fixtures, then run offline + live
+```
+
+A killed live run (slow-timeout / Ctrl-C) skips the per-test table cleanup, so `make test-live` first
+runs `make sweep-test-db` to drop any `<prefix>_<pid>_<counter>` fixtures a prior interrupted run left in
+the shared `rivet` database. `make sweep-test-db` is safe to run by hand anytime — it only matches those
+ephemeral fixtures, never the `init.sql` / `seed.rs` seeded tables.
+
+The offline integration tests are consolidated into single binaries (`tests/offline_suite.rs`,
+`tests/live_suite.rs`) to keep link time down. **Run them with nextest, not plain `cargo test`** — the
+consolidated binaries run their tests as threads in one process, so without nextest's per-test process
+isolation a crashing or global-state test can take its siblings down with it. The pre-push hook
+(`git config core.hooksPath .githooks`) and CI both use nextest.
+
 ---
 
 ## Resource-aware extraction

@@ -16,8 +16,8 @@ use std::path::Path;
 use crate::config::Config;
 use crate::error::Result;
 use crate::plan::{
-    ComputedPlanData, ExportRecommendation, ExtractionStrategy, PlanArtifact, PlanDiagnostics,
-    PlanPrioritizationSnapshot, PrioritizationInputs, build_plan,
+    CampaignRecommendation, ComputedPlanData, ExportRecommendation, ExtractionStrategy,
+    PlanArtifact, PlanDiagnostics, PlanPrioritizationSnapshot, PrioritizationInputs, build_plan,
     campaign::recommend_campaign,
     inputs::{PrioritizationHints, build_prioritization_inputs},
     recommend::recommend_export,
@@ -119,7 +119,7 @@ pub fn run_plan_command(
         artifacts.push(artifact);
     }
 
-    emit_artifacts(&artifacts, &format, multi_export)?;
+    emit_artifacts(&artifacts, &format, multi_export, config_path)?;
 
     Ok(())
 }
@@ -214,10 +214,16 @@ fn build_plan_artifact(
                     ));
                 }
             }
+            // Explain *why* this strategy was chosen (mode + chunk geometry +
+            // parallelism) and its risk profile. Built from the same
+            // `ExportDiagnostic` + config the numbers above came from, so the
+            // narrative can never contradict them.
+            let strategy_rationale = crate::plan::explain_strategy(&diag, export);
             let plan_diagnostics = PlanDiagnostics {
                 verdict: diag.verdict.to_string(),
                 warnings,
                 recommended_profile: diag.recommended_profile.to_string(),
+                strategy_rationale,
             };
             let computed = compute_plan_data(&plan, diag.row_estimate, state)?;
             let hints = PrioritizationHints {
@@ -239,6 +245,11 @@ fn build_plan_artifact(
                 verdict: "unknown (preflight failed)".into(),
                 warnings,
                 recommended_profile: "balanced".into(),
+                // No diagnostic to explain from — be honest rather than fabricate
+                // a rationale from config alone (no row estimate / index facts).
+                strategy_rationale: "Strategy rationale unavailable — preflight diagnostics could \
+                     not be collected for this export."
+                    .into(),
             };
             (computed, plan_diagnostics, PrioritizationHints::default())
         }
@@ -371,11 +382,15 @@ fn emit_artifacts(
     artifacts: &[PlanArtifact],
     format: &PlanOutputFormat,
     multi_export: bool,
+    config_path: &str,
 ) -> Result<()> {
     match format {
         PlanOutputFormat::Pretty => {
             for artifact in artifacts {
                 artifact.print_summary();
+            }
+            if multi_export {
+                print_wave_execution_hint(artifacts, config_path);
             }
         }
         // Multi-export JSON to stdout: a single export prints its object
@@ -411,10 +426,129 @@ fn emit_artifacts(
     Ok(())
 }
 
+/// Print copy-pasteable `rivet run` commands grouped by advisory wave, so an
+/// operator can execute the plan in priority order. rivet itself runs config
+/// order (or all-at-once with `--parallel-exports`) and never consumes the
+/// waves, so this block is the bridge between the advice and the run. `rivet
+/// run` takes a single `--export`, so it is one command per export.
+fn print_wave_execution_hint(artifacts: &[PlanArtifact], config_path: &str) {
+    if let Some(campaign) = artifacts
+        .first()
+        .and_then(|a| a.prioritization.as_ref())
+        .and_then(|p| p.campaign.as_ref())
+        && let Some(hint) = build_wave_hint(campaign, config_path)
+    {
+        print!("{hint}");
+    }
+}
+
+/// Build the wave-ordered `rivet run` command list as a string (pure, so it is
+/// unit-tested). Returns `None` when there are no waves to suggest.
+fn build_wave_hint(campaign: &CampaignRecommendation, config_path: &str) -> Option<String> {
+    if campaign.waves.is_empty() {
+        return None;
+    }
+
+    let isolated: std::collections::HashSet<&str> = campaign
+        .ordered_exports
+        .iter()
+        .filter(|e| e.isolate_on_source)
+        .map(|e| e.export_name.as_str())
+        .collect();
+
+    let mut waves: Vec<_> = campaign.waves.iter().collect();
+    waves.sort_by_key(|w| w.wave);
+
+    let mut out = String::from(
+        "\n  Suggested execution (advisory — rivet runs config order, not waves):\n    \
+         run lowest wave first; `rivet run` takes one --export, so one command per export.\n",
+    );
+    for w in waves {
+        for export in &w.exports {
+            let note = if isolated.contains(export.as_str()) {
+                "   # isolate_on_source — run alone (no --parallel-exports)"
+            } else {
+                ""
+            };
+            out.push_str(&format!(
+                "    wave {}:  rivet run -c {} --export {}{}\n",
+                w.wave, config_path, export, note
+            ));
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::per_export_output_path;
     use std::path::Path;
+
+    use super::build_wave_hint;
+    use crate::plan::{
+        CampaignRecommendation, CostClass, ExportRecommendation, PriorityClass, RecommendedWave,
+        RiskClass,
+    };
+
+    fn rec(name: &str, isolate: bool) -> ExportRecommendation {
+        ExportRecommendation {
+            export_name: name.into(),
+            source_group: None,
+            priority_score: 0,
+            priority_class: PriorityClass::Low,
+            cost_class: CostClass::Low,
+            risk_class: RiskClass::Low,
+            recommended_wave: 0,
+            isolate_on_source: isolate,
+            reasons: vec![],
+        }
+    }
+
+    /// The hint renders waves lowest-first, one valid `rivet run --export` per
+    /// export, and tags only the `isolate_on_source` ones.
+    #[test]
+    fn wave_hint_groups_commands_by_wave_with_isolate_note() {
+        let campaign = CampaignRecommendation {
+            ordered_exports: vec![rec("heavy", true), rec("small", false)],
+            // deliberately out of wave order to prove the sort
+            waves: vec![
+                RecommendedWave {
+                    wave: 3,
+                    exports: vec!["heavy".into()],
+                },
+                RecommendedWave {
+                    wave: 1,
+                    exports: vec!["small".into(), "tiny".into()],
+                },
+            ],
+            source_group_warnings: vec![],
+        };
+
+        let hint = build_wave_hint(&campaign, "rivet.yaml").expect("waves present → Some");
+
+        let w1 = hint
+            .find("wave 1:  rivet run -c rivet.yaml --export small")
+            .unwrap();
+        let w1b = hint
+            .find("wave 1:  rivet run -c rivet.yaml --export tiny")
+            .unwrap();
+        let w3 = hint
+            .find("wave 3:  rivet run -c rivet.yaml --export heavy")
+            .unwrap();
+        assert!(w1 < w3 && w1b < w3, "waves must render lowest-first");
+        assert!(hint.contains("--export heavy   # isolate_on_source"));
+        assert!(!hint.contains("--export small   # isolate_on_source"));
+    }
+
+    #[test]
+    fn wave_hint_none_when_no_waves() {
+        let campaign = CampaignRecommendation {
+            ordered_exports: vec![],
+            waves: vec![],
+            source_group_warnings: vec![],
+        };
+        assert!(build_wave_hint(&campaign, "rivet.yaml").is_none());
+    }
 
     /// Regression (audit #4): two distinct exports under one `--output FILE`
     /// must derive two distinct paths, so neither is silently overwritten.

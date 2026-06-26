@@ -9,7 +9,8 @@
 use clap::CommandFactory;
 
 use super::args::{
-    Cli, Commands, PlanFormat, ReconcileFormat, SchemaKind, StateAction, ValidateFormat,
+    Cli, Commands, PlanFormat, ReconcileFormat, SchemaKind, StateAction, ValidateDepth,
+    ValidateFormat,
 };
 use super::params::{parse_params, resolve_init_source};
 use super::validate::validate_cli;
@@ -160,11 +161,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             config,
             export,
             format,
+            depth,
             output,
             date,
             run_id,
             prefix,
-        } => dispatch_validate(config, export, format, output, date, run_id, prefix),
+        } => dispatch_validate(config, export, format, depth, output, date, run_id, prefix),
         Commands::Reconcile {
             config,
             export,
@@ -504,10 +506,12 @@ fn dispatch_plan(
     pipeline::run_plan_command(&config, export.as_deref(), p.as_ref(), fmt)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_validate(
     config: String,
     export: Option<String>,
     format: ValidateFormat,
+    depth: ValidateDepth,
     output: Option<String>,
     date: Option<String>,
     run_id: Option<String>,
@@ -530,10 +534,14 @@ fn dispatch_validate(
         ),
         None => None,
     };
+    // `--depth` is already the pipeline `ValidateDepth` (re-exported through
+    // `args`), so it threads straight onto the target with no CLI→pipeline
+    // mapping.
     let target = pipeline::ValidateTarget {
         date: parsed_date,
         run_id,
         prefix_override: prefix,
+        depth,
     };
     pipeline::run_validate_command(&config, export.as_deref(), fmt, target)
 }

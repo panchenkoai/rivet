@@ -134,6 +134,9 @@ jobs:
     name: Create GitHub Release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub release and upload assets
+      id-token: write # OIDC token for cosign keyless signing (no keys to manage)
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
     steps:
@@ -147,10 +150,39 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      # SBOM (SPDX) of the source tree incl. the Cargo dependency graph. Built
+      # before the checksums on purpose: SHA256SUMS.txt then lists it too, so the
+      # one cosign signature below transitively vouches for the SBOM as well.
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: artifacts/rivet-${{ env.RELEASE_TAG }}.spdx.json
+          upload-artifact: false
+
       - name: Generate checksums
         run: |
           cd artifacts
-          sha256sum *.tar.gz > SHA256SUMS.txt
+          sha256sum *.tar.gz *.spdx.json > SHA256SUMS.txt
+
+      # Keyless signing (Sigstore / cosign via GitHub OIDC — no private key to
+      # manage or rotate). We sign SHA256SUMS.txt; because it lists the SHA-256
+      # of every tarball, one signature transitively covers the whole release.
+      # Verify (see SECURITY.md):
+      #   cosign verify-blob --bundle SHA256SUMS.txt.cosign.bundle \
+      #     --certificate-identity-regexp '^https://github\.com/.+/rivet/' \
+      #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      #     SHA256SUMS.txt
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign checksums (keyless)
+        working-directory: artifacts
+        run: |
+          cosign sign-blob --yes \
+            --bundle SHA256SUMS.txt.cosign.bundle \
+            SHA256SUMS.txt
 
       # Pull the release notes for this tag straight out of CHANGELOG.md so
       # the published release body matches what's in the repo. The awk
@@ -181,6 +213,8 @@ jobs:
           files: |
             artifacts/*.tar.gz
             artifacts/SHA256SUMS.txt
+            artifacts/SHA256SUMS.txt.cosign.bundle
+            artifacts/*.spdx.json
 
       # Homebrew tap: https://github.com/<owner>/homebrew-rivet (create empty repo once).
       # Add repo secret HOMEBREW_TAP_GITHUB_TOKEN (fine-grained or classic PAT) with Contents: Read and write

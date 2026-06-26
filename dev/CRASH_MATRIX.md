@@ -78,7 +78,9 @@ asserts recovery produces the full export.  Run with:
 
 ```bash
 docker compose up -d postgres
-cargo test --test live_crash_recovery -- --ignored
+# live_crash_recovery is now part of the consolidated live_suite binary; the
+# test-name filter selects just its cases.
+cargo test --test live_suite crash_recovery -- --ignored
 ```
 
 See also: [docs/reference/testing.md](../docs/reference/testing.md) for the

@@ -16,7 +16,24 @@
 # gate — run them explicitly with `cargo test -- --ignored`.
 set -euo pipefail
 
-echo "pre-push: cargo test --tests (offline; benches excluded)"
-cargo test --tests --quiet
+# Prefer cargo-nextest: it runs each test in its own process, so the consolidated
+# test binaries (one link instead of N — tests/offline_suite.rs et al.) stay
+# isolated. Falls back to the built-in harness when nextest isn't installed.
+if command -v cargo-nextest >/dev/null 2>&1; then
+  # Split for speed: the lib/bin UNIT tests are pure + fast — run them threaded
+  # via the built-in harness. Only the INTEGRATION suites (offline_suite /
+  # live_suite et al.) need nextest's per-test process isolation, so run just
+  # those (`kind(test)`) under nextest. Avoids ~1700 process spawns for the lib.
+  echo "pre-push: cargo test --lib --bins (unit, threaded) + nextest integration (isolated)"
+  cargo test --lib --bins --quiet
+  cargo nextest run -E 'kind(test)'
+else
+  # No nextest: fall back to the built-in harness. NOTE this runs each consolidated suite
+  # (offline_suite / live_suite) as threads in ONE process — a crash / SIGKILL / global-state
+  # test can poison its siblings (per-test isolation is gone). Install cargo-nextest to restore
+  # it; CI runs under nextest regardless.
+  echo "pre-push: cargo test --tests (NO per-test isolation — install cargo-nextest)"
+  cargo test --tests --quiet
+fi
 
 echo "pre-push: ok"

@@ -315,6 +315,7 @@ mod tests {
                 verdict: "Efficient".into(),
                 warnings: vec![],
                 recommended_profile: "balanced".into(),
+                strategy_rationale: String::new(),
             },
         )
     }

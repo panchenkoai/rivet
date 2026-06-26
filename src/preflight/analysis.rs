@@ -401,6 +401,8 @@ pub(crate) fn compute_verdict(
     row_estimate: Option<i64>,
     uses_index: bool,
     has_cursor: bool,
+    avg_row_bytes: Option<i64>,
+    parallel: usize,
 ) -> HealthVerdict {
     let rows = row_estimate.unwrap_or(0);
 
@@ -423,7 +425,25 @@ pub(crate) fn compute_verdict(
         }
         (false, _, r) if r <= 1_000_000 => HealthVerdict::Degraded,
         (false, true, r) if r <= 50_000_000 => HealthVerdict::Degraded,
-        (false, _, _) => HealthVerdict::Unsafe,
+        // No index + large. The old rule cried UNSAFE on row count alone — but
+        // rivet streams bounded batches (peak RSS ≈ row-width × in-flight batch
+        // × workers, NOT the whole table), so an unindexed scan of a narrow or
+        // modestly-parallel table peaks at ~100 MB, not OOM. When we can predict
+        // the peak (have a row-width estimate) and it fits the default memory
+        // budget, downgrade to DEGRADED — the unindexed scan is still a DB-load
+        // concern worth flagging, just not "don't run this". Keep UNSAFE when
+        // the width is unknown (can't predict — e.g. MySQL) or the predicted
+        // peak breaches the budget. The RSS model is single-sourced from the
+        // `tuning::memory` (shared with the scaffold) so the two never drift.
+        (false, _, _) => match avg_row_bytes {
+            Some(b)
+                if crate::tuning::memory::estimate_peak_rss_mb(parallel.max(1), b)
+                    <= crate::tuning::memory::DEFAULT_MEM_BUDGET_MB =>
+            {
+                HealthVerdict::Degraded
+            }
+            _ => HealthVerdict::Unsafe,
+        },
     }
 }
 
@@ -890,7 +910,7 @@ mod tests {
     #[test]
     fn compute_verdict_indexed_cursor_small_is_efficient() {
         assert!(matches!(
-            compute_verdict(Some(1_000_000), true, true),
+            compute_verdict(Some(1_000_000), true, true, None, 1),
             HealthVerdict::Efficient
         ));
     }
@@ -898,7 +918,7 @@ mod tests {
     #[test]
     fn compute_verdict_indexed_no_cursor_small_is_acceptable() {
         assert!(matches!(
-            compute_verdict(Some(1_000_000), true, false),
+            compute_verdict(Some(1_000_000), true, false, None, 1),
             HealthVerdict::Acceptable
         ));
     }
@@ -906,16 +926,39 @@ mod tests {
     #[test]
     fn compute_verdict_no_index_small_is_degraded() {
         assert!(matches!(
-            compute_verdict(Some(500_000), false, true),
+            compute_verdict(Some(500_000), false, true, None, 1),
             HealthVerdict::Degraded
         ));
     }
 
     #[test]
-    fn compute_verdict_no_index_very_large_is_unsafe() {
-        // > 1_000_000 rows, no index, no cursor → Unsafe
+    fn compute_verdict_no_index_very_large_no_width_is_unsafe() {
+        // > 1_000_000 rows, no index, no cursor, no row-width estimate → can't
+        // prove memory stays in budget, so stay Unsafe.
         assert!(matches!(
-            compute_verdict(Some(5_000_000), false, false),
+            compute_verdict(Some(5_000_000), false, false, None, 1),
+            HealthVerdict::Unsafe
+        ));
+    }
+
+    #[test]
+    fn compute_verdict_no_index_large_narrow_within_budget_is_degraded() {
+        // 10M rows, no index, no cursor — but a narrow row (~100 B) at modest
+        // parallelism peaks at ~96 MB, well under the 2 GB budget. The old
+        // row-count-only rule cried UNSAFE; the memory-aware rule downgrades to
+        // DEGRADED (the unindexed scan is still worth flagging, not blocking).
+        assert!(matches!(
+            compute_verdict(Some(10_000_000), false, false, Some(100), 4),
+            HealthVerdict::Degraded
+        ));
+    }
+
+    #[test]
+    fn compute_verdict_no_index_wide_high_parallel_over_budget_is_unsafe() {
+        // Wide rows (~20 KB) × 24 workers → predicted peak ~3 GB, over the 2 GB
+        // budget → genuinely Unsafe even with a width estimate.
+        assert!(matches!(
+            compute_verdict(Some(10_000_000), false, false, Some(20_000), 24),
             HealthVerdict::Unsafe
         ));
     }

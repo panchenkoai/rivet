@@ -54,6 +54,69 @@ use crate::pipeline::manifest_reconcile::{PartPresence, reconcile_manifest_again
 /// `head()` already reports and bails before the read when it exceeds this cap.
 pub(crate) const MANIFEST_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
+/// How deep a `rivet validate` pass goes — a graded verify layer over the
+/// same checks, letting an operator trade thoroughness for latency / cost.
+///
+/// The variants are a strict superset chain: `Light ⊂ Sample ⊂ Full`.  Each
+/// level runs every check the level below it does, plus more.  Defined here
+/// (the pipeline layer) and re-exported for the CLI grammar so the **same**
+/// enum gates the checks in [`verify_at_destination`] and parses on the
+/// `--depth` flag — no CLI→pipeline back-dependency.
+///
+/// - **Light**: manifest read + self-consistency + `_SUCCESS` only.  Skips the
+///   `list_prefix` reconcile (no per-part presence/size/checksum) and the
+///   untracked-surplus scan, leaving `parts_verified = 0`.  One `head` + one
+///   `read` of `manifest.json` and `_SUCCESS` — a fast "is this prefix a
+///   complete, marked run?" poll with no prefix listing.
+/// - **Sample**: everything Light does **plus** the part reconcile and
+///   untracked surplus (one `list_prefix`).  This is the pre-graded behaviour
+///   minus the Form B value re-read — full structural verification with no
+///   part downloads.
+/// - **Full** (default): everything Sample does **plus** the Form B value-
+///   checksum re-read (re-reads parts, re-derives per-column checksums).  The
+///   most thorough and the only level that downloads part bodies.  Equivalent
+///   to the pre-graded behaviour, so existing callers are unchanged.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ValidateDepth {
+    /// Manifest read + self-consistency + `_SUCCESS` only (no prefix listing).
+    Light,
+    /// Light + part reconcile + untracked surplus (one `list_prefix`).
+    Sample,
+    /// Sample + the Form B value-checksum re-read (downloads parts).
+    #[default]
+    Full,
+}
+
+impl ValidateDepth {
+    /// True iff this level runs the `list_prefix` reconcile (part presence,
+    /// size, checksum) and the untracked-surplus scan — i.e. anything above
+    /// `Light`.  The single predicate the section-3/5 depth gating keys off.
+    fn runs_part_reconcile(self) -> bool {
+        !matches!(self, ValidateDepth::Light)
+    }
+
+    /// True iff this level downloads part *bodies* — the CDC `__pos` continuity
+    /// check and the Form-B value-checksum re-read, both `Full`-only (the
+    /// `part_reconcile` level above only reads listing metadata). The single
+    /// predicate the section-3/5 part-download gating keys off, parallel to
+    /// [`Self::runs_part_reconcile`] — so adding a depth level edits the enum,
+    /// not the call sites in `validate_cmd`.
+    pub(crate) fn runs_part_download(self) -> bool {
+        matches!(self, ValidateDepth::Full)
+    }
+
+    /// Stable operator-/wire-facing label for the depth a verdict was produced
+    /// at, surfaced in `summary.json` (`depth_level`) and `rivet validate`
+    /// output.
+    pub fn label(self) -> &'static str {
+        match self {
+            ValidateDepth::Light => "light",
+            ValidateDepth::Sample => "sample",
+            ValidateDepth::Full => "full",
+        }
+    }
+}
+
 /// Read `key` into memory only if its `head()`-reported size is within
 /// `max_bytes`; otherwise bail without reading a single byte.
 ///
@@ -130,6 +193,21 @@ pub struct ManifestVerification {
     /// (non-fatal) failures like [`Failure::UntrackedObject`].  Stable variant
     /// set; new variants land under a new manifest version per ADR-0012.
     pub failures: Vec<Failure>,
+    /// The graded depth this verdict was produced at: `"light"`, `"sample"`,
+    /// or `"full"` (see [`ValidateDepth`]).  Lets a consumer of `summary.json`
+    /// tell **how much** was actually checked — a `passed: true` at `"light"`
+    /// asserts far less than at `"full"` (no part presence was verified).
+    /// `#[serde(default)]` (→ `"full"`) for back-compat: pre-graded verdicts
+    /// always ran the full pass.
+    #[serde(default = "default_depth_level")]
+    pub depth_level: String,
+}
+
+/// `serde(default)` for [`ManifestVerification::depth_level`]: a verdict that
+/// predates the graded layer always ran the full pass, so an absent field
+/// deserializes to `"full"`.
+fn default_depth_level() -> String {
+    ValidateDepth::Full.label().to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,6 +283,31 @@ impl Failure {
     /// closed (safe) rather than silently passing.
     pub fn is_fatal(&self) -> bool {
         !matches!(self, Failure::UntrackedObject { .. })
+    }
+
+    /// Stable `RIVET_VERIFY_*` error code for this failure variant.
+    ///
+    /// One code per variant, intended for orchestrators / CI to branch on
+    /// without parsing the human `Display` string or the per-variant JSON
+    /// fields.  The code is part of the wire contract: it is emitted next to
+    /// `kind` in the JSON report and prefixed in brackets on each pretty line.
+    /// Codes are append-only — never renamed once shipped (a renamed code is a
+    /// silent break for any consumer keying off it).
+    pub fn error_code(&self) -> &'static str {
+        match self {
+            Failure::PartMissing { .. } => "RIVET_VERIFY_PART_MISSING",
+            Failure::PartSizeMismatch { .. } => "RIVET_VERIFY_PART_SIZE_MISMATCH",
+            Failure::PartChecksumMismatch { .. } => "RIVET_VERIFY_PART_CHECKSUM_MISMATCH",
+            Failure::SuccessMarkerMalformed { .. } => "RIVET_VERIFY_SUCCESS_MALFORMED",
+            Failure::SuccessMarkerStale { .. } => "RIVET_VERIFY_SUCCESS_STALE",
+            Failure::ManifestSelfInconsistent { .. } => "RIVET_VERIFY_MANIFEST_INCONSISTENT",
+            Failure::ManifestReadError { .. } => "RIVET_VERIFY_MANIFEST_READ_ERROR",
+            Failure::SuccessMarkerReadError { .. } => "RIVET_VERIFY_SUCCESS_READ_ERROR",
+            Failure::ListPrefixError { .. } => "RIVET_VERIFY_LIST_ERROR",
+            Failure::UntrackedObject { .. } => "RIVET_VERIFY_UNTRACKED_OBJECT",
+            Failure::ContentVerificationUnmet { .. } => "RIVET_VERIFY_CONTENT_UNMET",
+            Failure::ManifestRequiredButAbsent { .. } => "RIVET_VERIFY_MANIFEST_REQUIRED",
+        }
     }
 }
 
@@ -301,6 +404,9 @@ impl ManifestVerification {
             manifest_self_consistent: false,
             passed: false,
             failures: Vec::new(),
+            // Base level; `verify_at_destination` overwrites this with the
+            // depth it was actually called at before returning any verdict.
+            depth_level: default_depth_level(),
         }
     }
 
@@ -383,12 +489,33 @@ impl ManifestVerification {
 /// This function does not panic on any expected I/O outcome — every read
 /// failure becomes a `Failure::*ReadError` so the caller can render a
 /// useful message instead of bailing.
+///
+/// `depth` selects the graded verify layer (see [`ValidateDepth`]):
+/// - [`ValidateDepth::Light`] skips section 3 (the `list_prefix` part
+///   reconcile) and section 5 (untracked surplus), leaving `parts_verified`
+///   at 0 — a fast manifest + `_SUCCESS` poll with no prefix listing.
+/// - [`ValidateDepth::Sample`] and [`ValidateDepth::Full`] run all five
+///   sections here.  The Form B value re-read is **not** in this function;
+///   it is the caller's concern (`run_validate_command`), gated on `Full`.
+///
+/// Regardless of depth, `depth_level` on the returned verdict records the
+/// level this pass ran at.
 pub fn verify_at_destination(
     dest: &dyn Destination,
     manifest_dir: &str,
+    depth: ValidateDepth,
 ) -> Result<ManifestVerification> {
     let manifest_key = join_key(manifest_dir, MANIFEST_FILENAME);
     let success_key = join_key(manifest_dir, SUCCESS_FILENAME);
+
+    // Stamp the depth this pass ran at onto every verdict before it leaves the
+    // function — including the early-return error/legacy shapes — so a consumer
+    // always sees *how much* was checked.  Each `return Ok(v)` below routes
+    // through `with_depth` (or sets `out.depth_level` for the main path).
+    let with_depth = |mut v: ManifestVerification| -> ManifestVerification {
+        v.depth_level = depth.label().to_string();
+        v
+    };
 
     // ── 1. Manifest read ───────────────────────────────────────────────
     //
@@ -399,7 +526,7 @@ pub fn verify_at_destination(
     // path is reserved for *programmer* errors (caller passes a malformed
     // `manifest_dir`, a future destination breaks an internal invariant).
     let manifest_bytes = match dest.head(&manifest_key) {
-        Ok(None) => return Ok(ManifestVerification::legacy()),
+        Ok(None) => return Ok(with_depth(ManifestVerification::legacy())),
         Ok(Some(_)) => match read_capped(dest, &manifest_key, MANIFEST_MAX_BYTES) {
             Ok(b) => b,
             Err(e) => {
@@ -409,7 +536,7 @@ pub fn verify_at_destination(
                     detail: format!("{e:#}"),
                 });
                 v.passed = false;
-                return Ok(v);
+                return Ok(with_depth(v));
             }
         },
         Err(e) => {
@@ -423,7 +550,7 @@ pub fn verify_at_destination(
                 detail: format!("manifest head failed: {e:#}"),
             });
             v.passed = false;
-            return Ok(v);
+            return Ok(with_depth(v));
         }
     };
 
@@ -434,22 +561,25 @@ pub fn verify_at_destination(
             // semantically equivalent for the operator (the manifest can't
             // be trusted) but kept distinct in `failures` so the kind is
             // explicit on the wire.
-            return Ok(ManifestVerification {
+            return Ok(with_depth(ManifestVerification {
                 manifest_found: true,
                 failures: vec![Failure::ManifestSelfInconsistent {
                     detail: format!("manifest.json parse failed: {e}"),
                 }],
                 ..ManifestVerification::empty()
-            });
+            }));
         }
     };
 
     // Optimistic base: a found, self-consistent manifest that passes until a
     // check below flips it.  Overrides only what differs from `empty()`.
+    // Stamp the depth here so the two early `return Ok(out)` paths in section
+    // 4 (success-marker head error, non-utf8 body) carry the right level too.
     let mut out = ManifestVerification {
         manifest_found: true,
         manifest_self_consistent: true,
         passed: true,
+        depth_level: depth.label().to_string(),
         ..ManifestVerification::empty()
     };
 
@@ -479,18 +609,29 @@ pub fn verify_at_destination(
     // old behaviour where per-part HEAD still "verified" parts a failed
     // listing couldn't enumerate.  Every Rivet destination backend offers
     // strong read-after-write list consistency, so the happy path is one call.
-    let reconciliation = match dest.list_prefix(manifest_dir) {
-        Ok(listing) => Some(reconcile_manifest_against_listing(
-            &manifest,
-            &listing,
-            manifest_dir,
-        )),
-        Err(e) => {
-            out.failures.push(Failure::ListPrefixError {
-                detail: format!("{e:#}"),
-            });
-            None
+    //
+    // Graded depth: `Light` skips this `list_prefix` entirely — no part
+    // reconcile, no `ListPrefixError`, `parts_verified` stays 0, and section 5
+    // (untracked) is a no-op since `reconciliation` is `None`.  `Sample` and
+    // `Full` run it.  A `Light` pass therefore certifies only that the
+    // manifest reads, is self-consistent, and `_SUCCESS` matches — never that
+    // the parts are physically present.
+    let reconciliation = if depth.runs_part_reconcile() {
+        match dest.list_prefix(manifest_dir) {
+            Ok(listing) => Some(reconcile_manifest_against_listing(
+                &manifest,
+                &listing,
+                manifest_dir,
+            )),
+            Err(e) => {
+                out.failures.push(Failure::ListPrefixError {
+                    detail: format!("{e:#}"),
+                });
+                None
+            }
         }
+    } else {
+        None
     };
     if let Some(rec) = &reconciliation {
         for check in &rec.per_part {
@@ -729,7 +870,7 @@ mod tests {
         );
         let dest = local_dest(dir.path());
 
-        let v = verify_at_destination(&dest, "").unwrap();
+        let v = verify_at_destination(&dest, "", ValidateDepth::Full).unwrap();
         assert!(v.manifest_found);
         assert!(!v.legacy_run);
         assert_eq!(v.parts_verified, 2);
@@ -747,7 +888,7 @@ mod tests {
         // Empty prefix — no manifest, no parts.
         let dir = tempfile::tempdir().unwrap();
         let dest = local_dest(dir.path());
-        let v = verify_at_destination(&dest, "").unwrap();
+        let v = verify_at_destination(&dest, "", ValidateDepth::Full).unwrap();
         assert!(!v.manifest_found);
         assert!(v.legacy_run);
         assert_eq!(v.parts_verified, 0);
@@ -774,7 +915,7 @@ mod tests {
         );
         let dest = local_dest(dir.path());
 
-        let v = verify_at_destination(&dest, "").unwrap();
+        let v = verify_at_destination(&dest, "", ValidateDepth::Full).unwrap();
         assert_eq!(v.parts_verified, 1);
         assert_eq!(v.parts_failed, 1);
         assert!(!v.passed);
@@ -796,7 +937,7 @@ mod tests {
         write_dataset(dir.path(), &m, &[("part-000001.parquet", b"OOPSIE")]);
         let dest = local_dest(dir.path());
 
-        let v = verify_at_destination(&dest, "").unwrap();
+        let v = verify_at_destination(&dest, "", ValidateDepth::Full).unwrap();
         assert!(!v.passed);
         let mismatch = v
             .failures
@@ -834,7 +975,7 @@ mod tests {
         .unwrap();
         let dest = local_dest(dir.path());
 
-        let v = verify_at_destination(&dest, "").unwrap();
+        let v = verify_at_destination(&dest, "", ValidateDepth::Full).unwrap();
         assert!(!v.success_marker_consistent);
         assert!(!v.passed);
         assert!(
@@ -855,7 +996,7 @@ mod tests {
         std::fs::write(dir.path().join(SUCCESS_FILENAME), b"not even xxh3 shaped").unwrap();
         let dest = local_dest(dir.path());
 
-        let v = verify_at_destination(&dest, "").unwrap();
+        let v = verify_at_destination(&dest, "", ValidateDepth::Full).unwrap();
         assert!(!v.passed);
         assert!(
             v.failures
@@ -880,7 +1021,7 @@ mod tests {
         assert!(!dir.path().join(SUCCESS_FILENAME).exists());
         let dest = local_dest(dir.path());
 
-        let v = verify_at_destination(&dest, "").unwrap();
+        let v = verify_at_destination(&dest, "", ValidateDepth::Full).unwrap();
         assert!(v.manifest_found);
         assert!(
             !v.success_marker_consistent,
@@ -912,7 +1053,7 @@ mod tests {
         .unwrap();
         let dest = local_dest(dir.path());
 
-        let v = verify_at_destination(&dest, "").unwrap();
+        let v = verify_at_destination(&dest, "", ValidateDepth::Full).unwrap();
         assert!(v.manifest_found);
         assert!(!v.manifest_self_consistent);
         assert!(!v.passed);
@@ -939,7 +1080,7 @@ mod tests {
         std::fs::write(dir.path().join("rogue.parquet"), b"XX").unwrap();
         let dest = local_dest(dir.path());
 
-        let v = verify_at_destination(&dest, "").unwrap();
+        let v = verify_at_destination(&dest, "", ValidateDepth::Full).unwrap();
         assert!(
             v.failures.iter().any(
                 |f| matches!(f, Failure::UntrackedObject { key, .. } if key == "rogue.parquet")
@@ -969,7 +1110,7 @@ mod tests {
         .unwrap();
         let dest = local_dest(dir.path());
 
-        let v = verify_at_destination(&dest, "").unwrap();
+        let v = verify_at_destination(&dest, "", ValidateDepth::Full).unwrap();
         assert!(v.passed);
         assert!(
             !v.failures
@@ -999,7 +1140,7 @@ mod tests {
         .unwrap();
         let dest = local_dest(dir.path());
 
-        let v = verify_at_destination(&dest, "").unwrap();
+        let v = verify_at_destination(&dest, "", ValidateDepth::Full).unwrap();
         assert!(
             !v.has_failures(),
             "doctor probe must not surface as a failure: {:?}",
@@ -1028,12 +1169,12 @@ mod tests {
         .unwrap();
         let dest = local_dest(outer.path());
 
-        let v = verify_at_destination(&dest, "sub/run").unwrap();
+        let v = verify_at_destination(&dest, "sub/run", ValidateDepth::Full).unwrap();
         assert!(v.passed);
         assert_eq!(v.parts_verified, 1);
 
         // Trailing slash is normalised — same outcome.
-        let v2 = verify_at_destination(&dest, "sub/run/").unwrap();
+        let v2 = verify_at_destination(&dest, "sub/run/", ValidateDepth::Full).unwrap();
         assert!(v2.passed);
     }
 
@@ -1068,7 +1209,7 @@ mod tests {
         write_dataset(dir.path(), &m, &[("part-000000.parquet", b"abc")]);
         let dest = ListFails(local_dest(dir.path()));
 
-        let v = verify_at_destination(&dest, "").unwrap();
+        let v = verify_at_destination(&dest, "", ValidateDepth::Full).unwrap();
         // The manifest itself reads + parses fine (HEAD/read still work)…
         assert!(v.manifest_found);
         assert!(v.manifest_self_consistent);
@@ -1127,7 +1268,7 @@ mod tests {
         write_dataset(dir.path(), &m, &[("part-000001.parquet", b"AAAA")]);
         let dest = ManifestReadFails(local_dest(dir.path()));
 
-        let v = verify_at_destination(&dest, "").unwrap();
+        let v = verify_at_destination(&dest, "", ValidateDepth::Full).unwrap();
         assert!(!v.manifest_found);
         assert!(!v.legacy_run, "a read error is not the M6 legacy label");
         assert!(!v.passed);
@@ -1173,7 +1314,7 @@ mod tests {
         write_dataset(dir.path(), &m, &[("part-000001.parquet", b"AAAA")]);
         let dest = ManifestHeadFails(local_dest(dir.path()));
 
-        let v = verify_at_destination(&dest, "").unwrap();
+        let v = verify_at_destination(&dest, "", ValidateDepth::Full).unwrap();
         assert!(!v.manifest_found);
         assert!(!v.legacy_run);
         assert!(!v.passed);
@@ -1323,5 +1464,220 @@ mod tests {
             "must leave the existing read-error verdict alone, got: {:?}",
             v.failures
         );
+    }
+
+    // ── graded verify layer (--depth) ───────────────────────────────────
+
+    #[test]
+    fn light_depth_skips_part_reconcile_even_when_a_part_is_missing() {
+        // A manifest declaring a part that is NOT on disk. At `Full`/`Sample`
+        // this is a fatal `PartMissing`; at `Light` the `list_prefix` reconcile
+        // is skipped entirely, so `parts_verified == 0`, no `ListPrefixError`,
+        // and — with `_SUCCESS` consistent and the manifest self-consistent —
+        // the verdict still passes. Light certifies the manifest + marker, not
+        // the parts.
+        let dir = tempfile::tempdir().unwrap();
+        let m = build_manifest(
+            vec![
+                part(1, 10, 4, "xxh3:1111111111111111"),
+                part(2, 20, 5, "xxh3:2222222222222222"),
+            ],
+            ManifestStatus::Success,
+        );
+        // Deliberately write NEITHER part — only manifest.json + _SUCCESS.
+        write_dataset(dir.path(), &m, &[]);
+        let dest = local_dest(dir.path());
+
+        let v = verify_at_destination(&dest, "", ValidateDepth::Light).unwrap();
+        assert_eq!(v.depth_level, "light");
+        assert_eq!(
+            v.parts_verified, 0,
+            "light skips the listing — no part is ever verified"
+        );
+        assert_eq!(
+            v.parts_failed, 0,
+            "no part reconcile means no part failures"
+        );
+        assert!(
+            !v.failures.iter().any(|f| matches!(
+                f,
+                Failure::PartMissing { .. } | Failure::ListPrefixError { .. }
+            )),
+            "light must not surface part or list failures, got: {:?}",
+            v.failures
+        );
+        assert!(
+            v.success_marker_consistent,
+            "_SUCCESS is still checked at light depth"
+        );
+        assert!(v.manifest_self_consistent);
+        assert!(
+            v.passed,
+            "manifest + _SUCCESS are consistent, so a light pass certifies it"
+        );
+    }
+
+    #[test]
+    fn light_depth_never_lists_so_a_list_failure_cannot_trip() {
+        // Even with a destination whose `list_prefix` always errors, a light
+        // pass succeeds: it never calls `list_prefix`, so no `ListPrefixError`.
+        // This is the direct contrast to `list_failure_cannot_certify_parts…`
+        // (which runs at Full and *does* fail on the list error).
+        let dir = tempfile::tempdir().unwrap();
+        let m = build_manifest(vec![part(0, 3, 3, "xxh3:0")], ManifestStatus::Success);
+        write_dataset(dir.path(), &m, &[("part-000000.parquet", b"abc")]);
+        let dest = ListFails(local_dest(dir.path()));
+
+        let v = verify_at_destination(&dest, "", ValidateDepth::Light).unwrap();
+        assert_eq!(v.depth_level, "light");
+        assert!(
+            !v.failures
+                .iter()
+                .any(|f| matches!(f, Failure::ListPrefixError { .. })),
+            "light never lists, so a failing list_prefix cannot surface, got: {:?}",
+            v.failures
+        );
+        assert_eq!(v.parts_verified, 0);
+        assert!(v.passed, "manifest + _SUCCESS consistent → light passes");
+    }
+
+    #[test]
+    fn sample_depth_runs_part_reconcile_like_full() {
+        // `Sample` runs every section `verify_at_destination` owns (1-5) — the
+        // Form B value re-read it skips lives in the *caller*, not here. So a
+        // missing part is a fatal `PartMissing` at Sample, identical to Full.
+        let dir = tempfile::tempdir().unwrap();
+        let m = build_manifest(
+            vec![
+                part(1, 10, 4, "xxh3:1111111111111111"),
+                part(2, 20, 5, "xxh3:2222222222222222"),
+            ],
+            ManifestStatus::Success,
+        );
+        write_dataset(dir.path(), &m, &[("part-000001.parquet", b"AAAA")]); // part 2 missing
+        let dest = local_dest(dir.path());
+
+        let v = verify_at_destination(&dest, "", ValidateDepth::Sample).unwrap();
+        assert_eq!(v.depth_level, "sample");
+        assert_eq!(v.parts_verified, 1);
+        assert_eq!(v.parts_failed, 1);
+        assert!(!v.passed);
+        assert!(
+            v.failures
+                .iter()
+                .any(|f| matches!(f, Failure::PartMissing { part_id: 2, .. })),
+            "sample reconciles parts just like full, got: {:?}",
+            v.failures
+        );
+    }
+
+    #[test]
+    fn depth_level_is_stamped_on_every_verdict_shape() {
+        // The depth label rides the verdict even on the early-return shapes
+        // (legacy / no manifest), so a consumer always sees how deep the pass
+        // went.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(dir.path()); // empty prefix → legacy
+        for depth in [
+            ValidateDepth::Light,
+            ValidateDepth::Sample,
+            ValidateDepth::Full,
+        ] {
+            let v = verify_at_destination(&dest, "", depth).unwrap();
+            assert!(v.legacy_run, "empty prefix is the legacy shape");
+            assert_eq!(
+                v.depth_level,
+                depth.label(),
+                "legacy verdict must still carry its depth label"
+            );
+        }
+    }
+
+    #[test]
+    fn error_code_is_stable_and_distinct_per_variant() {
+        // Each variant maps to its documented `RIVET_VERIFY_*` code. A
+        // regression guard: renaming a code is a silent break for any CI gate
+        // keying off it.
+        let cases: &[(Failure, &str)] = &[
+            (
+                Failure::PartMissing {
+                    part_id: 1,
+                    path: "p".into(),
+                },
+                "RIVET_VERIFY_PART_MISSING",
+            ),
+            (
+                Failure::PartSizeMismatch {
+                    part_id: 1,
+                    path: "p".into(),
+                    expected: 1,
+                    actual: 2,
+                },
+                "RIVET_VERIFY_PART_SIZE_MISMATCH",
+            ),
+            (
+                Failure::PartChecksumMismatch {
+                    part_id: 1,
+                    path: "p".into(),
+                    expected: "a".into(),
+                    actual: "b".into(),
+                },
+                "RIVET_VERIFY_PART_CHECKSUM_MISMATCH",
+            ),
+            (
+                Failure::SuccessMarkerMalformed {
+                    body_preview: "x".into(),
+                },
+                "RIVET_VERIFY_SUCCESS_MALFORMED",
+            ),
+            (
+                Failure::SuccessMarkerStale {
+                    marker_fingerprint: "a".into(),
+                    manifest_fingerprint: "b".into(),
+                },
+                "RIVET_VERIFY_SUCCESS_STALE",
+            ),
+            (
+                Failure::ManifestSelfInconsistent { detail: "d".into() },
+                "RIVET_VERIFY_MANIFEST_INCONSISTENT",
+            ),
+            (
+                Failure::ManifestReadError { detail: "d".into() },
+                "RIVET_VERIFY_MANIFEST_READ_ERROR",
+            ),
+            (
+                Failure::SuccessMarkerReadError { detail: "d".into() },
+                "RIVET_VERIFY_SUCCESS_READ_ERROR",
+            ),
+            (
+                Failure::ListPrefixError { detail: "d".into() },
+                "RIVET_VERIFY_LIST_ERROR",
+            ),
+            (
+                Failure::UntrackedObject {
+                    key: "k".into(),
+                    size_bytes: 1,
+                },
+                "RIVET_VERIFY_UNTRACKED_OBJECT",
+            ),
+            (
+                Failure::ContentVerificationUnmet {
+                    size_only: 1,
+                    total: 2,
+                },
+                "RIVET_VERIFY_CONTENT_UNMET",
+            ),
+            (
+                Failure::ManifestRequiredButAbsent { prefix: "p".into() },
+                "RIVET_VERIFY_MANIFEST_REQUIRED",
+            ),
+        ];
+        for (failure, code) in cases {
+            assert_eq!(&failure.error_code(), code, "code for {failure:?}");
+            assert!(
+                failure.error_code().starts_with("RIVET_VERIFY_"),
+                "every code shares the RIVET_VERIFY_ prefix"
+            );
+        }
     }
 }

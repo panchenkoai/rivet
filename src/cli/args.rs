@@ -8,6 +8,14 @@
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
 
+// The graded verify depth (`--depth`) is the *same* enum that gates the checks
+// in the pipeline's `verify_at_destination`, re-exported through `pipeline` so
+// the flag parses straight into it.  Defining it in `cli` instead would invert
+// the layering (the pipeline would depend on the CLI), so this one shared type
+// is the deliberate exception to the "no crate:: types" guideline above — it
+// keeps a single source of truth for the three depth levels.
+pub use crate::pipeline::ValidateDepth;
+
 #[derive(Parser)]
 #[command(
     name = "rivet",
@@ -336,6 +344,15 @@ pub enum Commands {
         /// Output format: "pretty" (human summary) or "json" (machine-readable)
         #[arg(long, default_value = "pretty")]
         format: ValidateFormat,
+        /// How deep to verify: "light" (manifest + _SUCCESS only, no prefix
+        /// listing), "sample" (light + part reconcile + untracked surplus), or
+        /// "full" (sample + the value-checksum re-read of every part).
+        ///
+        /// `full` is the default and matches the pre-graded behaviour. Use
+        /// `light` for a fast "is this a complete, marked run?" poll, or
+        /// `sample` for full structural verification without downloading parts.
+        #[arg(long, default_value = "full")]
+        depth: ValidateDepth,
         /// Write JSON report to this file (only with `--format json`)
         #[arg(short, long)]
         output: Option<String>,
@@ -791,5 +808,51 @@ mod tests {
         let cli =
             Cli::try_parse_from(["rivet", "run", "--config", "c.yaml"]).expect("should parse");
         assert!(!cli.json_errors);
+    }
+
+    // ── validate --depth grammar ─────────────────────────────────────────
+
+    /// Pull the parsed `--depth` out of a `rivet validate …` invocation.
+    fn validate_depth(extra: &[&str]) -> ValidateDepth {
+        let mut argv = vec!["rivet", "validate", "--config", "c.yaml"];
+        argv.extend(extra);
+        let cli = match Cli::try_parse_from(argv) {
+            Ok(cli) => cli,
+            Err(e) => panic!("validate should parse, got: {e}"),
+        };
+        match cli.command {
+            Commands::Validate { depth, .. } => depth,
+            _ => panic!("expected the Validate subcommand"),
+        }
+    }
+
+    #[test]
+    fn validate_depth_defaults_to_full() {
+        // No `--depth` → Full, i.e. the pre-graded behaviour, so existing
+        // invocations are unchanged.
+        assert_eq!(validate_depth(&[]), ValidateDepth::Full);
+    }
+
+    #[test]
+    fn validate_depth_parses_each_level() {
+        assert_eq!(validate_depth(&["--depth", "light"]), ValidateDepth::Light);
+        assert_eq!(
+            validate_depth(&["--depth", "sample"]),
+            ValidateDepth::Sample
+        );
+        assert_eq!(validate_depth(&["--depth", "full"]), ValidateDepth::Full);
+    }
+
+    #[test]
+    fn validate_depth_rejects_unknown_level() {
+        let kind =
+            Cli::try_parse_from(["rivet", "validate", "--config", "c.yaml", "--depth", "deep"])
+                .err()
+                .map(|e| e.kind());
+        assert_eq!(
+            kind,
+            Some(clap::error::ErrorKind::InvalidValue),
+            "an unknown depth must be rejected by clap"
+        );
     }
 }

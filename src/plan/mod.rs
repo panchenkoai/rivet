@@ -1,5 +1,6 @@
 pub mod artifact;
 pub mod campaign;
+pub mod explain;
 pub mod history;
 pub mod inputs;
 pub mod partition;
@@ -15,6 +16,8 @@ pub use history::{HistorySnapshot, LastStatus};
 pub use artifact::{
     ComputedPlanData, PlanArtifact, PlanDiagnostics, PlanPrioritizationSnapshot, StalenessCheck,
 };
+#[allow(unused_imports)]
+pub use explain::explain_strategy;
 #[allow(unused_imports)]
 pub use prioritization::{
     CampaignRecommendation, CostClass, CursorQuality, ExportRecommendation, PrioritizationInputs,
