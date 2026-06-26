@@ -320,8 +320,13 @@ cargo nextest run                        # offline suite (live tests are #[ignor
 
 # Live engine tests need the docker services first:
 docker compose up -d                     # services match docker-compose.yaml
-cargo nextest run --run-ignored all      # offline + live
+make test-live                           # sweep stale fixtures, then run offline + live
 ```
+
+A killed live run (slow-timeout / Ctrl-C) skips the per-test table cleanup, so `make test-live` first
+runs `make sweep-test-db` to drop any `<prefix>_<pid>_<counter>` fixtures a prior interrupted run left in
+the shared `rivet` database. `make sweep-test-db` is safe to run by hand anytime — it only matches those
+ephemeral fixtures, never the `init.sql` / `seed.rs` seeded tables.
 
 The offline integration tests are consolidated into single binaries (`tests/offline_suite.rs`,
 `tests/live_suite.rs`) to keep link time down. **Run them with nextest, not plain `cargo test`** — the
