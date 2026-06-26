@@ -5,23 +5,23 @@ use super::schema_error::PreflightSchemaError;
 use crate::config::{ExportConfig, ExportMode, SourceType, TlsConfig};
 use crate::error::Result;
 
+/// Connect once and build one [`ExportDiagnostic`] per export. Rendering
+/// (TEXT table vs `--json`) is the caller's job in [`super::check`], so this
+/// returns the diagnostics rather than printing inline.
 pub(super) fn check_postgres(
     url: &str,
     tls: Option<&TlsConfig>,
     exports: &[&ExportConfig],
-    silent: bool,
-) -> Result<()> {
+) -> Result<Vec<ExportDiagnostic>> {
     let mut client = crate::source::postgres::connect_client(url, tls)?;
     let db_max_connections = fetch_max_connections_pg(&mut client);
 
+    let mut diags = Vec::with_capacity(exports.len());
     for export in exports {
-        let diag = diagnose_pg(&mut client, export, db_max_connections)?;
-        if !silent {
-            super::print_diagnostic(&diag);
-        }
+        diags.push(diagnose_pg(&mut client, export, db_max_connections)?);
     }
 
-    Ok(())
+    Ok(diags)
 }
 
 /// Diagnose a single export without printing — used by `rivet plan`.

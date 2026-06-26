@@ -34,22 +34,22 @@ use crate::error::Result;
 use crate::source::Source;
 use crate::source::mssql::MssqlSource;
 
+/// Connect once and build one [`ExportDiagnostic`] per export. Rendering
+/// (TEXT table vs `--json`) is the caller's job in [`super::check`], so this
+/// returns the diagnostics rather than printing inline.
 pub(super) fn check_mssql(
     url: &str,
     tls: Option<&TlsConfig>,
     exports: &[&ExportConfig],
-    silent: bool,
-) -> Result<()> {
+) -> Result<Vec<ExportDiagnostic>> {
     let mut conn = MssqlSource::connect_with_tls(url, tls)?;
 
+    let mut diags = Vec::with_capacity(exports.len());
     for export in exports {
-        let diag = diagnose_mssql(&mut conn, export)?;
-        if !silent {
-            super::print_diagnostic(&diag);
-        }
+        diags.push(diagnose_mssql(&mut conn, export)?);
     }
 
-    Ok(())
+    Ok(diags)
 }
 
 /// Diagnose a single export without printing — used by `rivet plan`.

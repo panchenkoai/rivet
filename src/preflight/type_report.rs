@@ -329,13 +329,6 @@ pub fn print_table(report: &ExportTypeReport, target: Option<ExportTarget>) {
     }
 }
 
-/// Emit newline-delimited JSON (one object per export).
-pub fn print_json(report: &ExportTypeReport) -> Result<()> {
-    let s = serde_json::to_string(report)?;
-    println!("{}", s);
-    Ok(())
-}
-
 fn col_width(rows: &[TypeReportRow], f: impl Fn(&TypeReportRow) -> usize) -> usize {
     rows.iter().map(f).max().unwrap_or(8).max(8)
 }

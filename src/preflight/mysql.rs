@@ -5,24 +5,24 @@ use super::schema_error::PreflightSchemaError;
 use crate::config::{ExportConfig, ExportMode, SourceType, TlsConfig};
 use crate::error::Result;
 
+/// Connect once and build one [`ExportDiagnostic`] per export. Rendering
+/// (TEXT table vs `--json`) is the caller's job in [`super::check`], so this
+/// returns the diagnostics rather than printing inline.
 pub(super) fn check_mysql(
     url: &str,
     tls: Option<&TlsConfig>,
     exports: &[&ExportConfig],
-    silent: bool,
-) -> Result<()> {
+) -> Result<Vec<ExportDiagnostic>> {
     let pool = crate::source::mysql::connect_pool(url, tls)?;
     let mut conn = pool.get_conn()?;
     let db_max_connections = fetch_max_connections_mysql(&mut conn);
 
+    let mut diags = Vec::with_capacity(exports.len());
     for export in exports {
-        let diag = diagnose_mysql(&mut conn, export, db_max_connections)?;
-        if !silent {
-            super::print_diagnostic(&diag);
-        }
+        diags.push(diagnose_mysql(&mut conn, export, db_max_connections)?);
     }
 
-    Ok(())
+    Ok(diags)
 }
 
 /// Diagnose a single export without printing — used by `rivet plan`.
