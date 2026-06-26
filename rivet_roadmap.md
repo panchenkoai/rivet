@@ -774,8 +774,8 @@ recovery semantics, quality gates, resource controls, and reliability coverage.
 | Work | Priority | Status | Definition of done |
 |---|---|---|---|
 | Release checksums (`SHA256SUMS`) | P1 | ✅ Done | `release.yml` publishes `SHA256SUMS.txt` per release; verification documented in README + SECURITY.md |
-| Signed releases / attestations | P2 | ⏳ Open | Release artifacts can be cryptographically verified |
-| SBOM | P2 | ⏳ Open | Release includes SBOM artifact and security docs mention it |
+| Signed releases / attestations | P2 | ✅ Done | `SHA256SUMS.txt` signed with cosign keyless (Sigstore + GitHub OIDC) → `SHA256SUMS.txt.cosign.bundle`; `cosign verify-blob` documented in SECURITY.md |
+| SBOM | P2 | ✅ Done | Release publishes an SPDX SBOM (`rivet-<tag>.spdx.json`, syft) of the source + Cargo graph; its hash rides in the signed `SHA256SUMS.txt`; SECURITY.md SBOM row → Active |
 | 24h+ soak tests | P2 | ⏳ Open | Long-horizon extraction run documented in reliability matrix |
 | Real-cloud destination release smoke | P2 | ✅ Done | `docs/cloud-smoke-tests.md` (dated S3/GCS/Azure record) + `docs/release-checklist.md` §3 (per-tag smoke gate before publish) |
 | k8s/Helm deployment guidance | P3 | ✅ doc-guidance done | `docs/who-is-this-for.md` (Job/CronJob supported; operator/Helm chart an explicit non-fit). An actual Helm chart / operator remains a deliberate non-goal / future |
@@ -1171,7 +1171,7 @@ Prioritize by stabilization before distribution polish:
 3. ✅ **F5 + I5** — reconcile/validate tradeoffs (cli.md); capacity/memory planning (tuning.md).
 4. ✅ **I2** — `cargo bench` + `dev/scripts/bench.sh` save/compare harness; column_scan + shape_tracking groups.
 5. ✅ **Epic 4 (§5)** — external/durable state backend: `RIVET_STATE_URL` PostgreSQL backend shipped.
-6. ⏳ **Verify / Validation Layer (v0.7.9, next focus)** — *"are produced files + manifest + state + summary internally consistent, AND is the data itself intact?"*. **Value-integrity depth IMPLEMENTED** (`feat/all-types-oracle`, 15 commits, pending merge): an always-on per-column `xxh3` value checksum — **Form A** cross-checks source↔Arrow in-process (catches the `build_array` converter mid-run) and **Form B** records per-column checksums in the manifest so `rivet validate` re-reads the Parquet and compares (catches an Arrow→Parquet encode / post-write fault). This **answers the design-open question toward extending `rivet validate`** (ADR-0013 "no new flags", NOT a new `rivet verify` command) and delivers the deepest "full file scan" level. Scope is honest: *decoded-value → file*, covered types only (uncovered logged, never a silent zero), probabilistic (xxh3-64), the DB-wire decode trusted; live round-trip proven (export → validate pass → flip a byte → validate fails). Cost vs v0.14.1: +2.8% wall / +11.3% CPU. **Remaining (⏳):** the lighter artifact-consistency levels (missing/partial/orphan files, size mismatch, manifest↔state divergence, schema-hash) — most already in Epic 2's `--validate` — plus stable `RIVET_VERIFY_*` codes, JSON output, and the graded light/sample/full depth-level UX.
+6. ✅ **Verify / Validation Layer (shipped 0.15.0 + graded depth/codes)** — *"are produced files + manifest + state + summary internally consistent, AND is the data itself intact?"*. **Value-integrity depth SHIPPED** (v0.15.0): an always-on per-column `xxh3` value checksum — **Form A** cross-checks source↔Arrow in-process (catches the `build_array` converter mid-run) and **Form B** records per-column checksums in the manifest so `rivet validate` re-reads the Parquet and compares (catches an Arrow→Parquet encode / post-write fault). This **answers the design-open question toward extending `rivet validate`** (ADR-0013 "no new flags", NOT a new `rivet verify` command) and delivers the deepest "full file scan" level. Scope is honest: *decoded-value → file*, covered types only (uncovered logged, never a silent zero), probabilistic (xxh3-64), the DB-wire decode trusted; live round-trip proven (export → validate pass → flip a byte → validate fails). Cost vs v0.14.1: +2.8% wall / +11.3% CPU. **Now SHIPPED too** (`feat/verify-and-ux`): the graded `rivet validate --depth light|sample|full` UX, stable `RIVET_VERIFY_*` codes (one per failure variant — in JSON `code` + the pretty `[CODE]` prefix), and JSON output, over the artifact-consistency checks that already lived in Epic 2's `--validate` (missing/partial/orphan, size mismatch, `_SUCCESS` fingerprint). The Verify Layer is feature-complete; only a manifest↔state cross-divergence check remains a future nicety.
 7. ⏳ **Operator UX & Diagnostics (v0.8.0)** — structured diagnostics with stable codes (`RIVET_CONFIG_*`, `RIVET_SOURCE_*`, `RIVET_VERIFY_*`, …), severity (low / medium / high / blocking), actionable hints; `--json` everywhere; strategy explanation in `rivet plan` (why this chunk size, why this mode, what risk remains); `doctor` capability + blocker report.
 
 ### 9.6.1 UX hardening backlog (v0.7.8 walk-through findings)
@@ -1191,7 +1191,7 @@ with verify-layer work as bandwidth allows.
 
 **P2 — friction, not bugs** (tackle before v0.7.9 release if time permits):
 
-- ⏳ **`check` verdict pessimism vs actual run.** UNSAFE / DEGRADED predicts high RSS on parallel reads against no-index tables, but the actual run frequently sits well under the predicted budget (e.g. 10 M-row chunked-parallel orders ran in 12 s at 117 MB RSS while check said UNSAFE). Either make the predictor use estimated row width + chunk batch size for a tighter bound, or downgrade UNSAFE to DEGRADED when the verdict can't show a concrete budget breach.
+- ✅ **`check` verdict pessimism vs actual run — FIXED.** `compute_verdict` now feeds the catalog `avg_row_bytes` + `parallel` into the bench-validated peak-RSS model (`tuning::memory::estimate_peak_rss_mb`, single-sourced with the scaffold) and downgrades UNSAFE→DEGRADED for an unindexed large scan whose predicted peak fits the 2 GB budget; it stays UNSAFE only when the width is unknown (e.g. MySQL) or the prediction breaches the budget. The 117 MB / 10 M-row case is now DEGRADED, not UNSAFE.
 - ✅ **`destination is not retry-safe` WARN does NOT fire for local — DONE.** `src/destination/local.rs:119` reports `retry_safe: true` (temp-then-rename leaves nothing at the final key on failure), so the gate `!retry_safe && max_retries > 0` (`destination/mod.rs:214`) is false for `local` *and* `cloud`. The WARN fires only for `stdout` (`retry_safe: false`), whose stream genuinely can't be reverted — which is correct, not spam.
 - ✅ **TLS warning now surfaces in `doctor`/`check`** (v0.7.8) — preflight calls `warn_if_tls_disabled` ([src/preflight/doctor.rs](src/preflight/doctor.rs), [src/preflight/mod.rs](src/preflight/mod.rs)), so the missing-`tls:` warning fires before a real extract, not only in `run`.
 - ✅ **`rivet init --schema X` test-table filtering — DONE.** Repeatable `--include` / `--exclude '<glob>'` flags (`*`/`?` globs; `--exclude` wins over `--include`) — `TableFilter` + an in-tree `glob_match` (`src/init/mod.rs`), wired in `src/cli/dispatch.rs:474`, 4 passing unit tests (`table_filter_*`). Whole-schema init now drops `bench_*` / `tmp_*` / `*_temp` on demand.
@@ -1234,8 +1234,8 @@ with verify-layer work as bandwidth allows.
 - [x] Reliability and compatibility matrices published
 - [x] Pilot and production-readiness docs published
 - [x] Release checksums *(v0.7.8 — `SHA256SUMS.txt` published per release; verify with `sha256sum -c`)*
-- [ ] Signed releases / attestations
-- [ ] SBOM
+- [x] Signed releases / attestations
+- [x] SBOM
 
 ---
 
