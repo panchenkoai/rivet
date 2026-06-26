@@ -5,6 +5,12 @@
 //! cargo does NOT build each as its own target. This one entry `#[path]`-includes them, so the
 //! whole set LINKS ONCE instead of N times (PoC measured 21 files: 42s -> 8s, 5x). The default
 //! harness still collects every `#[test]` from each module.
+//!
+//! Run these under cargo-nextest (process-per-test) — as the pre-push hook and CI do. Under the
+//! plain libtest harness (`cargo test --test offline_suite`) every `#[test]` here runs as a THREAD
+//! in one process, so an abort / SIGKILL / `std::process::exit` / corrupted process-global state in
+//! one test takes its siblings down with it. That isolation was free in the old one-binary-per-file
+//! layout; consolidation made it conditional on the runner. See `.config/nextest.toml`.
 
 #[path = "offline/audit_validate_warning_label.rs"]
 mod audit_validate_warning_label;

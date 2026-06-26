@@ -9,10 +9,12 @@
 //! The 49 suites now live under `tests/live/` — a subdir, so cargo does NOT build
 //! each as its own target. This one entry declares `mod common;` ONCE and
 //! `#[path]`-includes every suite as a nested module, so the whole set LINKS ONCE.
-//! Per-test isolation is preserved because the repo runs these under cargo-nextest
-//! (process-per-test); the default libtest harness still collects every `#[test]`,
-//! and every `--ignored` / `--skip <name>` filter CI uses works unchanged (those
-//! filter by test-name, not by `--test` target).
+//! Run these under cargo-nextest (process-per-test): that isolation is what makes the
+//! consolidation safe. Run them WITHOUT nextest (plain `cargo test`) and it is GONE — every
+//! `#[test]` runs as a thread in one process, so an abort / SIGKILL / `std::process::exit` /
+//! global-state corruption in one test takes its siblings with it. The default libtest harness
+//! still collects every `#[test]`, and every `--ignored` / `--skip <name>` filter CI uses works
+//! unchanged (those filter by test-name, not by `--test` target).
 //!
 //! NOT consolidated (still their own targets, named individually by CI via `--test`):
 //! `live_differential` and `live_type_golden`.

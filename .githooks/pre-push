@@ -28,7 +28,11 @@ if command -v cargo-nextest >/dev/null 2>&1; then
   cargo test --lib --bins --quiet
   cargo nextest run -E 'kind(test)'
 else
-  echo "pre-push: cargo test --tests (offline; install cargo-nextest for faster isolated runs)"
+  # No nextest: fall back to the built-in harness. NOTE this runs each consolidated suite
+  # (offline_suite / live_suite) as threads in ONE process — a crash / SIGKILL / global-state
+  # test can poison its siblings (per-test isolation is gone). Install cargo-nextest to restore
+  # it; CI runs under nextest regardless.
+  echo "pre-push: cargo test --tests (NO per-test isolation — install cargo-nextest)"
   cargo test --tests --quiet
 fi
 
