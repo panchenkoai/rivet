@@ -44,9 +44,7 @@
 //!   MySQL payload `id) AS CHAR), CAST(min(id`   → prints `Cursor range: … .. …`
 //! Both should print NO cursor-range line once the column is quoted.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 
 /// Seeded benchmark table the live stack ships with: `orders`, 2500 rows,
 /// PK `id`. Same table `audit_preflight_table.rs` keys on.

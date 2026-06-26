@@ -60,9 +60,7 @@
 //! they cannot be made reliably-RED until the production seam above exists; the
 //! fix wave converts them into true assertions on the shared TLS-aware builder.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};

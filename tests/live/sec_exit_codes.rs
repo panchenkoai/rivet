@@ -20,8 +20,7 @@
 //!
 //! Run with: `cargo test --test sec_exit_codes -- --include-ignored`
 
-mod common;
-use common::*;
+use crate::common::*;
 
 fn cfg(yaml: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     let d = tempfile::tempdir().unwrap();

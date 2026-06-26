@@ -40,8 +40,7 @@
 //! gate lands, so it is the regression fence that stops the V3/V4 fix from
 //! breaking the loopback (docker) workflow.
 
-mod common;
-use common::*;
+use crate::common::*;
 
 /// Minimal Postgres export config with NO `tls:` block, pointed at `url`.
 /// Inline `url:` (not `url_env:`) so the host the policy gate inspects is

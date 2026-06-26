@@ -10,9 +10,7 @@
 //! `RIVET_BIN` built for this test, swap `url_env:` for a literal `url:` so
 //! `rivet check` can connect without an env var.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 
 // ─── L0: SQL Server single-table init → runnable scaffold (passes check) ───────
 

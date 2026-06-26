@@ -21,9 +21,7 @@
 //! because of the ESCAPE, not because of missing stats), run the real
 //! `rivet plan` binary, and assert the resolved strategy in the plan artifact.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 
 /// Chunked-mode config using the `table:` shortcut with NO `chunk_column:` so
 /// plan-build takes the introspection path where the small-table escape lives.

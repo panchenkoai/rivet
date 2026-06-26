@@ -13,9 +13,7 @@
 //! |---|---|---|
 //! | L15 | drift chunk 1, `repair --execute` | repaired file is named `chunk1`, not a 2nd `chunk0` |
 
-mod common;
-
-use common::*;
+use crate::common::*;
 
 /// Seed a 100-row table with chunk_size 50 (→ chunk 0 and chunk 1), run the
 /// chunked export, and return the table guard, output dir, and config path.

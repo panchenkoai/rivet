@@ -26,8 +26,7 @@
 //! Run: `docker compose up -d postgres minio fake-gcs && \
 //!       cargo test --test audit_cloud_multipart -- --ignored`
 
-mod common;
-use common::*;
+use crate::common::*;
 
 const N: i64 = 1_000;
 

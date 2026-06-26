@@ -15,9 +15,7 @@
 //!   line; it never prints the produced file names that are stored in each
 //!   `FileWritten` journal event.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 
 /// Minimal single-export full-mode parquet config for `table` writing to
 /// `out_dir`.  Mirrors the `simple_config` helper used by `live_cli_flags.rs`.

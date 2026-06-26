@@ -12,10 +12,8 @@
 //! order already survives. These tests assert the CORRECT behavior (byte /
 //! digit fidelity) and are expected to FAIL until the fix lands.
 
-mod common;
-
+use crate::common::*;
 use arrow::array::{Array, StringArray};
-use common::*;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use postgres::NoTls;
 

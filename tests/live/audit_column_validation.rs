@@ -25,8 +25,7 @@
 //!
 //! Run with: `cargo test --test audit_column_validation -- --ignored`
 
-mod common;
-use common::*;
+use crate::common::*;
 
 /// Write `yaml` into a fresh tempdir and return both so the dir stays alive.
 fn cfg(yaml: &str) -> (tempfile::TempDir, std::path::PathBuf) {

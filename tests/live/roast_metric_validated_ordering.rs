@@ -33,9 +33,7 @@
 //!
 //! The metrics row and the run's own final report now disagree, permanently.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 
 /// Latest `export_metrics` row for the export: `(run_id, validated)`.
 /// Mirrors `latest_metric_validated` in tests/live_chunked_recovery.rs, but

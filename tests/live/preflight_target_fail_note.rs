@@ -6,9 +6,7 @@
 //! test drives the real binary to prove the note is produced AND the exit is
 //! still 0 (the gating default is unchanged).
 
-mod common;
-
-use common::*;
+use crate::common::*;
 
 /// RAII table guard local to this test (the shared `PgTable` has a private
 /// field and no public constructor for arbitrary DDL, so we keep a small

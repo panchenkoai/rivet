@@ -32,9 +32,7 @@
 //! Both tests assert the SECURE behavior and are expected to FAIL against the
 //! current (vulnerable) code, which emits the raw escape bytes unmodified.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 
 /// C0/C1 control bytes that must never reach an operator's terminal raw.
 /// We allow only TAB (0x09), LF (0x0a) and CR (0x0d) as legitimate layout

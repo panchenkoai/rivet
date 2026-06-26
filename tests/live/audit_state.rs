@@ -16,8 +16,7 @@
 //!
 //! Run with: `cargo test --test audit_state -- --ignored`
 
-mod common;
-use common::*;
+use crate::common::*;
 
 use std::process::{Command, Output};
 

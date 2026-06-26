@@ -22,9 +22,7 @@
 //! repair file) and are expected to FAIL until the repair path updates state
 //! and the manifest.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 
 // ─── setup helper ─────────────────────────────────────────────────────────────
 

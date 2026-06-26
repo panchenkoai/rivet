@@ -19,6 +19,40 @@
 
 mod common;
 
+#[path = "live/audit_cli_dispatch.rs"]
+mod audit_cli_dispatch;
+#[path = "live/audit_cloud_multipart.rs"]
+mod audit_cloud_multipart;
+#[path = "live/audit_column_validation.rs"]
+mod audit_column_validation;
+#[path = "live/audit_doctor_fastfail.rs"]
+mod audit_doctor_fastfail;
+#[path = "live/audit_doctor_probe.rs"]
+mod audit_doctor_probe;
+#[path = "live/audit_init_deferred.rs"]
+mod audit_init_deferred;
+#[path = "live/audit_maxfile.rs"]
+mod audit_maxfile;
+#[path = "live/audit_observability.rs"]
+mod audit_observability;
+#[path = "live/audit_plan_apply.rs"]
+mod audit_plan_apply;
+#[path = "live/audit_preflight_table.rs"]
+mod audit_preflight_table;
+#[path = "live/audit_repair.rs"]
+mod audit_repair;
+#[path = "live/audit_repair_chunk_index.rs"]
+mod audit_repair_chunk_index;
+#[path = "live/audit_rerun.rs"]
+mod audit_rerun;
+#[path = "live/audit_state.rs"]
+mod audit_state;
+#[path = "live/audit_target_typo.rs"]
+mod audit_target_typo;
+#[path = "live/batch_memory_policy.rs"]
+mod batch_memory_policy;
+#[path = "live/gremlin.rs"]
+mod gremlin;
 #[path = "live/live_azure_multipart.rs"]
 mod live_azure_multipart;
 #[path = "live/live_catalog_hints.rs"]
@@ -117,3 +151,31 @@ mod live_retry_and_faults;
 mod live_schema_drift;
 #[path = "live/live_temp_spill.rs"]
 mod live_temp_spill;
+#[path = "live/preflight_missing_table.rs"]
+mod preflight_missing_table;
+#[path = "live/preflight_target_fail_note.rs"]
+mod preflight_target_fail_note;
+#[path = "live/quality_live.rs"]
+mod quality_live;
+#[path = "live/roast_metric_validated_ordering.rs"]
+mod roast_metric_validated_ordering;
+#[path = "live/roast_mssql_decimal_scale.rs"]
+mod roast_mssql_decimal_scale;
+#[path = "live/roast_part_loss.rs"]
+mod roast_part_loss;
+#[path = "live/roast_pg_json_fidelity.rs"]
+mod roast_pg_json_fidelity;
+#[path = "live/roast_small_table_escape.rs"]
+mod roast_small_table_escape;
+#[path = "live/roast_validate_exit.rs"]
+mod roast_validate_exit;
+#[path = "live/sec_exit_codes.rs"]
+mod sec_exit_codes;
+#[path = "live/sec_mcp_tls.rs"]
+mod sec_mcp_tls;
+#[path = "live/sec_preflight_sqli.rs"]
+mod sec_preflight_sqli;
+#[path = "live/sec_terminal_inject.rs"]
+mod sec_terminal_inject;
+#[path = "live/sec_tls_defaults.rs"]
+mod sec_tls_defaults;

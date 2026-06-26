@@ -12,12 +12,10 @@
 //! This test seeds 600 leading-NULL rows (> the 500-row probe) followed by one
 //! `123.45` and asserts the exported Parquet still carries exactly 123.45.
 
-mod common;
-
+use crate::common::*;
 use arrow::array::types::Decimal128Type;
 use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::datatypes::{DataType, SchemaRef};
-use common::*;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 fn read_parquet_batches(path: &std::path::Path) -> (SchemaRef, Vec<RecordBatch>) {

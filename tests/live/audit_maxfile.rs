@@ -33,9 +33,7 @@
 //!
 //! Run: `docker compose up -d postgres && cargo test --test audit_maxfile -- --ignored`
 
-mod common;
-
-use common::*;
+use crate::common::*;
 
 /// Self-seed a wide content table (`id, title, body, raw_html, metadata jsonb`)
 /// with `rows` high-entropy, NON-repetitive rows — distinct md5 hashes

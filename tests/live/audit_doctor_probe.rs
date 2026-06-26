@@ -15,9 +15,7 @@
 //! real `rivet` binary against a live, reachable Postgres source so that
 //! `doctor` proceeds to the destination write-probe and exits 0.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 
 // AUDIT-RED doctor-probe-cleanup: `rivet doctor` write-probes the destination with a
 // `.rivet_doctor_probe` object but only deletes the local temp, leaving the probe at

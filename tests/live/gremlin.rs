@@ -28,9 +28,7 @@
 //! cargo test --test gremlin -- --include-ignored
 //! ```
 
-mod common;
-
-use common::*;
+use crate::common::*;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 

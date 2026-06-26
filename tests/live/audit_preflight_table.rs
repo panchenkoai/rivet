@@ -17,9 +17,7 @@
 //! These tests assert the CORRECT behavior (form A must match form B / the
 //! real 2500 rows) and therefore FAIL against current code.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 

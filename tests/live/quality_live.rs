@@ -15,8 +15,7 @@
 //!   appears in stderr (tested with RUST_LOG=warn).
 //! - `null_ratio_max` gate: export fails when null ratio exceeds threshold.
 
-mod common;
-use common::*;
+use crate::common::*;
 
 fn cfg(yaml: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     let d = tempfile::tempdir().unwrap();

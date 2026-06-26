@@ -7,8 +7,7 @@
 //! Run: `docker compose up -d postgres mysql mssql && \
 //!       cargo test --test preflight_missing_table -- --ignored`
 
-mod common;
-use common::*;
+use crate::common::*;
 
 fn check_rejects_missing_table(source_yaml: &str, what: &str) {
     let cfg_dir = tempfile::tempdir().unwrap();

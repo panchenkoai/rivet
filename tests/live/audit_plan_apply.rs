@@ -19,9 +19,7 @@
 //! common::*;`, `#[ignore = "live: postgres"]`, drive the real binary via
 //! `std::process::Command::new(RIVET_BIN)`, assert on exit code + output files.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 

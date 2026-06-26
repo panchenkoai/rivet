@@ -11,11 +11,9 @@
 //! manifest is made unreadable (`chmod 000`), then `rivet validate` runs.
 //! Correct behavior: exit code != 0.  Current behavior: exit code 0.
 
-mod common;
-
 use std::os::unix::fs::PermissionsExt;
 
-use common::*;
+use crate::common::*;
 
 /// Restore the original permission bits on drop so cleanup (tempdir removal,
 /// post-mortem inspection) works even when an assertion panics mid-test.

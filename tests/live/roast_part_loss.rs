@@ -15,8 +15,7 @@
 //!
 //! Run: `docker compose up -d postgres mysql && cargo test --test roast_part_loss -- --ignored`
 
-mod common;
-use common::*;
+use crate::common::*;
 
 use mysql::prelude::Queryable;
 

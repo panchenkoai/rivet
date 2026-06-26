@@ -11,9 +11,7 @@
 //! assert the CORRECT (loud) behavior and are expected to FAIL until the CLI
 //! flag stops swallowing unknown targets.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 
 /// Minimal single-export Postgres config (orders-style: int + text columns).
 fn simple_config(table: &str, out_dir: &std::path::Path) -> String {

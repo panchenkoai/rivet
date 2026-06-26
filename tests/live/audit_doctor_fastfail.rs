@@ -18,9 +18,7 @@
 //! check fails fast, offline, via `resolve_url`) and the destination is a
 //! closed loopback port (no MinIO / fake-gcs needed).
 
-mod common;
-
-use common::*;
+use crate::common::*;
 
 use std::time::{Duration, Instant};
 

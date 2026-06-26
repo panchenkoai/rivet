@@ -15,8 +15,7 @@
 //!   new rows after the full table has been exported once.
 //! - Batch below cap: export succeeds silently with no oversized-batch warning.
 
-mod common;
-use common::*;
+use crate::common::*;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 

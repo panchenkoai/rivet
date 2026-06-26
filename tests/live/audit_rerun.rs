@@ -16,9 +16,7 @@
 //! matches the manifest — so the assertions accept either and only fail on the
 //! silent-doubling that the live audit observed.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 
 use std::path::Path;
 

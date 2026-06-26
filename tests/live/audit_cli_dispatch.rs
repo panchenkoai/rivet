@@ -13,9 +13,7 @@
 //!
 //! These assert the CORRECT (fixed) behavior.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 
 /// Single-export Postgres config whose destination is **stdout** and whose mode
 /// is **chunked** — the [stdout-no-chunked] combination that `run`/`plan` reject
