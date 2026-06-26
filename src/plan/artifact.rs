@@ -120,6 +120,17 @@ pub struct PlanDiagnostics {
     pub warnings: Vec<String>,
     /// Recommended tuning profile: "fast", "balanced", or "safe".
     pub recommended_profile: String,
+    /// Narrative explaining *why* this export's strategy (mode + chunk geometry +
+    /// parallelism) was chosen, plus its risk profile (resumable? memory bound?).
+    /// Built from the preflight `ExportDiagnostic` + config by
+    /// [`crate::plan::explain::explain_strategy`].  `#[serde(default)]` keeps
+    /// pre-existing artifacts (which lack the field) readable: they deserialize
+    /// to an empty string and `print_summary` simply omits the block.  This field
+    /// is **not** covered by the resolved-plan integrity seal (that hashes only
+    /// `resolved_plan`), so adding it never disturbs an existing artifact's
+    /// checksum.
+    #[serde(default)]
+    pub strategy_rationale: String,
 }
 
 /// Result of a staleness check against the current wall clock.
@@ -333,6 +344,13 @@ impl PlanArtifact {
         // diagnostics
         println!("  Verdict  : {}", self.diagnostics.verdict);
         println!("  Profile  : {}", self.diagnostics.recommended_profile);
+        if !self.diagnostics.strategy_rationale.is_empty() {
+            println!("  Strategy :");
+            // The rationale is one paragraph (sentences joined by spaces). Wrap it
+            // to a readable width and indent under the "Why:" label so the block
+            // reads as the *reason* for the numbers printed above.
+            println!("    Why: {}", self.diagnostics.strategy_rationale);
+        }
         if !self.diagnostics.warnings.is_empty() {
             println!("  Warnings :");
             for w in &self.diagnostics.warnings {
@@ -638,6 +656,7 @@ mod tests {
                 verdict: "Efficient".into(),
                 warnings: vec![],
                 recommended_profile: "balanced".into(),
+                strategy_rationale: String::new(),
             },
         )
     }
@@ -651,6 +670,56 @@ mod tests {
         assert_eq!(restored.plan_id, artifact.plan_id);
         assert_eq!(restored.computed.row_estimate, Some(42));
         assert_eq!(restored.diagnostics.verdict, "Efficient");
+    }
+
+    #[test]
+    fn strategy_rationale_serializes_and_round_trips() {
+        // The strategy narrative must reach the JSON artifact verbatim so a
+        // machine consumer can read *why* the plan chose its strategy, and it
+        // must survive the plan→apply round trip unchanged.
+        let mut artifact = minimal_artifact();
+        let why = "Mode full: ~42 rows, below the threshold. Risk — resumable: no.";
+        artifact.diagnostics.strategy_rationale = why.to_string();
+
+        let json = artifact.to_json_pretty().unwrap();
+        assert!(
+            json.contains("strategy_rationale"),
+            "the rationale field must appear in the JSON: {json}"
+        );
+        assert!(
+            json.contains("Mode full"),
+            "the rationale text must appear in the JSON: {json}"
+        );
+
+        let restored = PlanArtifact::from_json(&json).unwrap();
+        assert_eq!(
+            restored.diagnostics.strategy_rationale, why,
+            "rationale must survive the round trip unchanged"
+        );
+    }
+
+    #[test]
+    fn legacy_artifact_without_rationale_deserializes_to_empty() {
+        // A pre-existing artifact JSON (no `strategy_rationale` key) must still
+        // load — `#[serde(default)]` fills an empty string rather than failing.
+        let mut artifact = minimal_artifact();
+        artifact.diagnostics.strategy_rationale = "should be dropped".into();
+        let mut value: serde_json::Value =
+            serde_json::from_str(&artifact.to_json_pretty().unwrap()).unwrap();
+        // Simulate an older artifact by removing the field entirely.
+        value["diagnostics"]
+            .as_object_mut()
+            .unwrap()
+            .remove("strategy_rationale");
+        let legacy_json = serde_json::to_string(&value).unwrap();
+        assert!(!legacy_json.contains("strategy_rationale"));
+
+        let restored = PlanArtifact::from_json(&legacy_json)
+            .expect("legacy artifact without the rationale field must deserialize");
+        assert_eq!(
+            restored.diagnostics.strategy_rationale, "",
+            "missing rationale must default to empty, not fail"
+        );
     }
 
     #[test]
@@ -681,6 +750,7 @@ mod tests {
                 verdict: "Acceptable".into(),
                 warnings: vec!["sparse range".into()],
                 recommended_profile: "balanced".into(),
+                strategy_rationale: String::new(),
             },
         );
         let json = artifact.to_json_compact().unwrap();
@@ -784,6 +854,7 @@ mod tests {
                 verdict: "Efficient".into(),
                 warnings: vec![],
                 recommended_profile: "balanced".into(),
+                strategy_rationale: String::new(),
             },
         );
         assert_eq!(
@@ -816,6 +887,7 @@ mod tests {
                 verdict: "Efficient".into(),
                 warnings: vec![],
                 recommended_profile: "balanced".into(),
+                strategy_rationale: String::new(),
             },
         );
         let url = artifact.resolved_plan.source.url.as_deref().unwrap();

@@ -191,6 +191,7 @@ mod tests {
             verdict: "ok".into(),
             warnings: vec![],
             recommended_profile: "balanced".into(),
+            strategy_rationale: String::new(),
         }
     }
 
@@ -387,6 +388,7 @@ mod tests {
             verdict: "warning".into(),
             warnings: vec!["sparse range detected — consider smaller chunks".into()],
             recommended_profile: "safe".into(),
+            strategy_rationale: String::new(),
         };
         let inputs = build_prioritization_inputs(
             &export,
@@ -407,6 +409,7 @@ mod tests {
             verdict: "warning".into(),
             warnings: vec!["index missing on cursor column".into()],
             recommended_profile: "balanced".into(),
+            strategy_rationale: String::new(),
         };
         let inputs = build_prioritization_inputs(
             &export,

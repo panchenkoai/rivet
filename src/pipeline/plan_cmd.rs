@@ -214,10 +214,16 @@ fn build_plan_artifact(
                     ));
                 }
             }
+            // Explain *why* this strategy was chosen (mode + chunk geometry +
+            // parallelism) and its risk profile. Built from the same
+            // `ExportDiagnostic` + config the numbers above came from, so the
+            // narrative can never contradict them.
+            let strategy_rationale = crate::plan::explain_strategy(&diag, export);
             let plan_diagnostics = PlanDiagnostics {
                 verdict: diag.verdict.to_string(),
                 warnings,
                 recommended_profile: diag.recommended_profile.to_string(),
+                strategy_rationale,
             };
             let computed = compute_plan_data(&plan, diag.row_estimate, state)?;
             let hints = PrioritizationHints {
@@ -239,6 +245,11 @@ fn build_plan_artifact(
                 verdict: "unknown (preflight failed)".into(),
                 warnings,
                 recommended_profile: "balanced".into(),
+                // No diagnostic to explain from — be honest rather than fabricate
+                // a rationale from config alone (no row estimate / index facts).
+                strategy_rationale: "Strategy rationale unavailable — preflight diagnostics could \
+                     not be collected for this export."
+                    .into(),
             };
             (computed, plan_diagnostics, PrioritizationHints::default())
         }

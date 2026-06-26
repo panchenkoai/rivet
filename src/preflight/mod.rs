@@ -8,6 +8,9 @@ mod schema_error;
 pub mod type_report;
 
 pub(crate) use analysis::chunk_sparsity_from_counts;
+// Re-exported so the plan layer's strategy explainer can ground its "≥ threshold"
+// narrative on the same constant `check`/`init` use, not a hard-coded copy.
+pub(crate) use analysis::SMALL_TABLE_ROW_THRESHOLD;
 #[cfg(test)]
 use analysis::{
     build_suggestion, check_connection_limit, check_dense_surrogate_cost,
