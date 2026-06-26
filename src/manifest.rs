@@ -108,6 +108,17 @@ pub fn parse_success_marker(body: &str) -> Option<&str> {
     Some(trimmed)
 }
 
+/// One per-column Form B checksum, keyed by column **name** (not position) so a
+/// column reorder between export and validate can never silently misalign the
+/// comparison (the positional `Vec<String>` it replaced could). `checksum` is the
+/// per-column xxh3, XOR-combined over the whole export, as a decimal string
+/// (JSON-stable).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ColumnChecksum {
+    pub name: String,
+    pub checksum: String,
+}
+
 /// Public, stable JSON shape for the run manifest.
 ///
 /// One manifest is written per `run_id` per export.  See ADR-0012 M4
@@ -129,6 +140,19 @@ pub struct RunManifest {
     pub row_count: i64,
     pub part_count: u32,
     pub parts: Vec<ManifestPart>,
+    /// Per-column value checksum over the whole export (Form B), keyed by column
+    /// name — the per-column xxh3 XOR-combined over the run. `rivet validate`
+    /// re-reads the parts and recomputes this to catch an `Arrow→Parquet` encode
+    /// fault or post-write corruption — the step the in-process Form A check
+    /// cannot see. Optional for back-compat: older manifests omit it (no
+    /// `MANIFEST_VERSION` bump), newer readers tolerate its absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column_checksums: Option<Vec<ColumnChecksum>>,
+    /// The column the Form B checksum is keyed to (`xxh3(key ‖ value)`, the
+    /// export's cursor/key column) so `validate` re-keys identically. `None` ⇒
+    /// un-keyed (a full export with no cursor). See [`ColumnChecksum`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum_key_column: Option<String>,
 }
 
 /// Terminal status of the run *as recorded by the writer*.
@@ -331,6 +355,8 @@ mod tests {
             row_count,
             part_count,
             parts,
+            column_checksums: None,
+            checksum_key_column: None,
         }
     }
 

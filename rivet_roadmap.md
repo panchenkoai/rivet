@@ -558,7 +558,7 @@ roadmap-write time; file paths resolved, line refs current):**
 |---|---|---|---|
 | Server-side cursor (`DECLARE … FETCH N`, capped `work_mem×0.7`) | ✅ `src/source/postgres/mod.rs:405,427,467` | ❌ keyset emulation | ⚠️ `OFFSET 0 FETCH NEXT` (keyset) |
 | Governor pressure proxy | ✅ `temp_bytes` + `checkpoints_req` + `work_mem` | ⚠️ `Innodb_log_waits` (write-pressure) | ⚠️ `Log Flush Waits` (write-pressure) |
-| Keyset chunking (OPT-4) | ✅ any unique NOT NULL index `src/source/postgres/mod.rs:314-340` | ✅ unique NOT NULL index `src/source/mysql/mod.rs:303-335` | ❌ single-column PK only `src/source/mssql/mod.rs:475-476` |
+| Keyset chunking (OPT-4) | ✅ any unique NOT NULL index `src/source/postgres/mod.rs:314-340` | ✅ unique NOT NULL index `src/source/mysql/mod.rs:303-335` | ✅ every single-column NOT NULL UNIQUE index (PK + unique constraints), PK-first `src/source/mssql/mod.rs:955-981` |
 | Pooler-safe session | ✅ RAII `PgTxnGuard` + `SET LOCAL` `src/source/postgres/mod.rs:121-156` | ⚠️ session `SET max_execution_time` `src/source/mysql/mod.rs:519` (end-of-fn reset at `:543`, not `Drop`-safe) | ⚠️ none |
 
 > Note: governor parity already exists — all three engines implement
@@ -611,12 +611,13 @@ roadmap-write time; file paths resolved, line refs current):**
       `chunk_size` as the statement-duration lever
       ([`reference/tuning.md` → Choosing `chunk_size`](docs/reference/tuning.md)).
       Revisit only if a real user hits the niche case.
-- [ ] **A2. MSSQL keyset on composite / unique-index keys (parity with PG).**
-      Port the key-selection logic from `src/source/postgres/mod.rs:314-340`
-      (which discovers every single-column unique NOT NULL index as a keyset
-      key) to `src/source/mssql/mod.rs:475-476` (which today treats only the
-      single-column PK as a keyset key); tables with composite PKs or surrogate
-      unique keys currently fall back to the less-safe chunked path.
+- [x] **A2. MSSQL keyset on single-column unique-index keys (parity with PG) — DONE.**
+      The key-selection logic from `src/source/postgres/mod.rs:314-340` (every
+      single-column unique NOT NULL index) is now ported to
+      `src/source/mssql/mod.rs:955-981`: it discovers every single-column NOT NULL
+      UNIQUE index (PK + unique constraints), PK-first and de-duplicated, so
+      surrogate-unique-key tables use the safe keyset path. (Composite-PK keyset
+      remains a follow-up.)
 
 ### Phase B — pooler-safe session parity (P1)
 
@@ -761,10 +762,10 @@ recovery semantics, quality gates, resource controls, and reliability coverage.
 | Security policy | ✅ Done | `SECURITY.md` documents access, artifacts, credentials, TLS, supply chain, reporting |
 | Sensitive artifact hygiene | ✅ Done | README/security docs warn about `.rivet_state.db`, plans, journals, configs, outputs |
 | README top positioning | ✅ Done | README leads with source-safe extraction, scope, non-goals, core promise |
-| Fit / non-fit boundaries | ✅ Done | README and semantics explicitly exclude CDC, SaaS marketplace, k8s platform, loading |
+| Fit / non-fit boundaries | ✅ Done | README + semantics exclude SaaS marketplace, k8s platform, loading, and **continuous/live-streaming replication** — and now correctly distinguish that from **CDC-to-files** (`mode: cdc`, shipped 0.14.0): `README.md:195` + `docs/semantics.md:187` reworded to "CDC captured to files, not a continuously-running replication sink" |
 | Execution semantics contract | ✅ Done | `docs/semantics.md` covers retry, crash, resume, repair, reconcile, non-guarantees |
 | Reliability matrix | ✅ Done | `docs/reliability-matrix.md` separates PR CI, nightly, and manual coverage |
-| Compatibility matrix | ✅ Done | `docs/reference/compatibility.md` covers PG 12-16 and MySQL 5.7/8.0 |
+| Compatibility matrix | ✅ Done | `docs/reference/compatibility.md` covers PG 12-16, MySQL 5.7/8.0, and SQL Server 2022 (Beta) |
 | Pilot kit | ✅ Done | `docs/pilot/README.md`, quickstarts, demo, walkthrough, production checklist |
 | Benchmark methodology | ✅ Done | `docs/bench/` and best-practices methodology docs capture DB-side signals |
 
@@ -776,8 +777,8 @@ recovery semantics, quality gates, resource controls, and reliability coverage.
 | Signed releases / attestations | P2 | ⏳ Open | Release artifacts can be cryptographically verified |
 | SBOM | P2 | ⏳ Open | Release includes SBOM artifact and security docs mention it |
 | 24h+ soak tests | P2 | ⏳ Open | Long-horizon extraction run documented in reliability matrix |
-| Real-cloud destination release smoke | P2 | ⏳ Open | Manual release checklist records real S3/GCS smoke before publish |
-| k8s/Helm deployment guidance | P3 | ⏳ Open | Docs explain supported pattern and non-goals without implying an operator |
+| Real-cloud destination release smoke | P2 | ✅ Done | `docs/cloud-smoke-tests.md` (dated S3/GCS/Azure record) + `docs/release-checklist.md` §3 (per-tag smoke gate before publish) |
+| k8s/Helm deployment guidance | P3 | ✅ doc-guidance done | `docs/who-is-this-for.md` (Job/CronJob supported; operator/Helm chart an explicit non-fit). An actual Helm chart / operator remains a deliberate non-goal / future |
 
 ## Demo/adoption priorities
 
@@ -809,7 +810,7 @@ across multiple roadmap files.
 |---|---|---|
 | pgBouncer / pooler safety | ✅ Done | Postgres transaction-pooler detection, `SET LOCAL` scoped inside guarded transactions, pgBouncer live tests, pool-safety coverage |
 | MySQL pooler / multiplexer detection | ✅ Done | `MysqlProxyKind` (Direct, ProxySql, MaxScale, Multiplexed); 4-signal classifier (`PROXYSQL INTERNAL SESSION`, `@@version_comment`, `@@proxy_version`, `CONNECTION_ID()` drift) with 13 unit tests + ProxySQL live tests (`docker compose --profile pool up -d proxysql`) |
-| MySQL live-test symmetry with PG | ✅ Done | 5 paired suites (`live_mysql_crash_recovery`, `live_mysql_chunked_recovery`, `live_mysql_resume`, `live_mysql_schema_drift`, `live_mysql_retry_and_faults`, `live_mysql_reconcile_repair`) — 29 MySQL tests mirror the PG matrix 1:1 for crash points / chunked recovery / resume / schema drift / retry+toxiproxy / reconcile+repair |
+| MySQL live-test symmetry with PG | ✅ Done | 6 paired suites (`live_mysql_crash_recovery`, `live_mysql_chunked_recovery`, `live_mysql_resume`, `live_mysql_schema_drift`, `live_mysql_retry_and_faults`, `live_mysql_reconcile_repair`) — ~31 MySQL tests mirror the PG matrix 1:1 for crash points / chunked recovery / resume / schema drift / retry+toxiproxy / reconcile+repair |
 | Session-state cleanup | ✅ Done | Postgres RAII transaction guard; MySQL session variables reset on all paths; seed FK checks cleaned up |
 | OLTP load tests | ✅ Done / ongoing | `live_oltp_load` plus `live_content_load` exercise concurrent writes, checkpoint pressure, MVCC snapshot behavior |
 | Adaptive runtime feedback | ✅ Partial | `tuning.adaptive` reacts to Postgres `checkpoints_req` and MySQL `Innodb_log_waits`; still no `pg_stat_io` / tablespace-level controller |
@@ -938,7 +939,7 @@ This section merges the former `rivet_roadmap_v3.md` task tracker. **Strategic p
 | Epic 12 — Deployment | docs, `docker-compose`, state backend | pilot/production checklist + durable state ✅; k8s/Helm = future |
 | Epic 13 — SSH | **O** | External tunnel docs first; native SSH = future |
 | Epic 14 — Warehouse load | `src/types/`, M1–M6 | Type system + type report + BQ compat ✅; direct load path = future |
-| Epic 15 — CDC | **N** | WAL/binlog = future |
+| Epic 15 — CDC | **N** | WAL/binlog CDC to files **shipped 0.14.0** ✅ (3 engines: `src/source/{postgres,mysql,mssql}/cdc.rs`) |
 | Epic 16 — Auto-parallel | *(none)* | Auto-parallelism = future |
 | Epic 17 — MySQL parity | *(none yet)* | Phase A: adaptive chunk timing; Phase B (COM_STMT_FETCH) → re-homed as **Epic 18 Phase D**, now gated on the Epic 18 Phase A measurement |
 | Epic 18 — Source parity | `src/source/{postgres,mysql,mssql}/mod.rs` | Close MySQL/MSSQL longest-single-query + pooler-safe session gap vs the PG gold standard. A1 (keyset page size) gates D (MySQL server-side cursor); A2 = MSSQL keyset on unique indexes; B1/B2 = session-reset hygiene |
@@ -979,7 +980,7 @@ Rivet core is **feature-complete for stable extraction with type safety, resourc
 
 ### Observability
 
-- `RunJournal` domain model: 13 `RunEvent` variants (plan snapshot, files, retries, chunks, quality issues, schema changes, outcome)
+- `RunJournal` domain model: 14 `RunEvent` variants (plan snapshot, files, retries, chunks, quality issues, schema changes, outcome)
 - **Persistent** — serialized to `run_journal` SQLite table (migration v7) at end of every run; `store_journal` / `load_journal` / `recent_journals` APIs
 - **`rivet journal --config <file> --export <name>`** — inspect last N runs: per-run header (status, duration, run_id), files/rows/bytes summary, retries, quality issues, schema changes, error first line
 - `--run-id <id>` flag to inspect a specific run
@@ -1058,7 +1059,7 @@ Rivet core is **feature-complete for stable extraction with type safety, resourc
 | Versioned SQLite migrations | `schema_version` |
 | `aws_profile` for S3 | Sets `AWS_PROFILE` for OpenDAL chain |
 | Chunked quality gate | Row-count bounds after all chunks; warn on null/unique in chunked mode |
-| QA live-test harness | `tests/common/mod.rs` + **~55** ignored live tests across **11** `tests/live_*.rs` binaries mapped in [docs/reference/testing.md](docs/reference/testing.md); full offline suite (**~1345** tests) runs on every PR via `cargo test`. Includes **golden type round-trip** ([`live_type_golden.rs`](tests/live_type_golden.rs)). |
+| QA live-test harness | `tests/common/mod.rs` + **285** ignored live tests across **51** `tests/live_*.rs` binaries mapped in [docs/reference/testing.md](docs/reference/testing.md); full offline suite (**~1833** `#[test]` in `src/`, ≈2200 with integration tests) runs on every PR via `cargo test`. Includes **golden type round-trip** ([`live_type_golden.rs`](tests/live_type_golden.rs)). |
 
 ---
 
@@ -1082,7 +1083,7 @@ Rivet core is **feature-complete for stable extraction with type safety, resourc
 | G2 | ✅ | P2 | Toxiproxy wired into `docker-compose.yaml`, registered via `tests/common/mod.rs::ensure_toxi_proxy`, exercised by `tests/live_retry_and_faults.rs` + `tests/live_chaos.rs`; cross-process flock guard prevents suite races |
 | G3 | ✅ Partial | P1 | `seed` inserts; limited mutations |
 | G4 | ✅ Partial | P1 | `dev/` configs; edge fixtures TBD |
-| G5 | ✅ | P0 | E2E matrix in CI — `ci.yml::e2e` runs both `dev/e2e/run_e2e.sh` **and** `cargo test --release -- --ignored` (**~55** ignored live tests across **11** `tests/live_*.rs` binaries, including **Trust golden** parity on Postgres + MySQL in `live_type_golden.rs`). See [docs/reference/testing.md](docs/reference/testing.md). |
+| G5 | ✅ | P0 | E2E matrix in CI — `ci.yml::e2e` runs both `dev/e2e/run_e2e.sh` **and** `cargo test --release -- --ignored` (**285** ignored live tests across **51** `tests/live_*.rs` binaries, including **Trust golden** parity on Postgres + MySQL in `live_type_golden.rs`). See [docs/reference/testing.md](docs/reference/testing.md). |
 
 ### Epic H — Crash and recovery
 
@@ -1143,7 +1144,7 @@ Rivet core is **feature-complete for stable extraction with type safety, resourc
 
 | Task | Priority |
 |------|----------|
-| O1–O10 | P3 — CDC, Iceberg/Delta, multi-source, encryption, Prometheus, plugins, UI, sources, Flight, serverless |
+| O1–O10 | P3 — Iceberg/Delta, multi-source, encryption, Prometheus, plugins, UI, sources, Flight, serverless (CDC shipped 0.14.0 — no longer "future") |
 
 ---
 
@@ -1170,7 +1171,7 @@ Prioritize by stabilization before distribution polish:
 3. ✅ **F5 + I5** — reconcile/validate tradeoffs (cli.md); capacity/memory planning (tuning.md).
 4. ✅ **I2** — `cargo bench` + `dev/scripts/bench.sh` save/compare harness; column_scan + shape_tracking groups.
 5. ✅ **Epic 4 (§5)** — external/durable state backend: `RIVET_STATE_URL` PostgreSQL backend shipped.
-6. ⏳ **Verify / Validation Layer (v0.7.9, next focus)** — new top-level `rivet verify` command answering *"are produced files + manifest + state + summary internally consistent?"*. Three depth levels (light file/size/schema-hash check → sample row read → full file scan), stable error codes `RIVET_VERIFY_*`, read-only (mutating fixes stay in `repair`). Catches missing/partial files, size mismatch, orphan output, manifest/state divergence, schema-hash mismatch. JSON output for automation. Builds on the Type Roundtrip Proof: type contract is now provable, next we need *artifact* consistency to be provable too. **Design open:** extend existing `--validate` (per ADR-0013 "no new flags") vs new top-level `rivet verify` command — pick before implementation.
+6. ⏳ **Verify / Validation Layer (v0.7.9, next focus)** — *"are produced files + manifest + state + summary internally consistent, AND is the data itself intact?"*. **Value-integrity depth IMPLEMENTED** (`feat/all-types-oracle`, 15 commits, pending merge): an always-on per-column `xxh3` value checksum — **Form A** cross-checks source↔Arrow in-process (catches the `build_array` converter mid-run) and **Form B** records per-column checksums in the manifest so `rivet validate` re-reads the Parquet and compares (catches an Arrow→Parquet encode / post-write fault). This **answers the design-open question toward extending `rivet validate`** (ADR-0013 "no new flags", NOT a new `rivet verify` command) and delivers the deepest "full file scan" level. Scope is honest: *decoded-value → file*, covered types only (uncovered logged, never a silent zero), probabilistic (xxh3-64), the DB-wire decode trusted; live round-trip proven (export → validate pass → flip a byte → validate fails). Cost vs v0.14.1: +2.8% wall / +11.3% CPU. **Remaining (⏳):** the lighter artifact-consistency levels (missing/partial/orphan files, size mismatch, manifest↔state divergence, schema-hash) — most already in Epic 2's `--validate` — plus stable `RIVET_VERIFY_*` codes, JSON output, and the graded light/sample/full depth-level UX.
 7. ⏳ **Operator UX & Diagnostics (v0.8.0)** — structured diagnostics with stable codes (`RIVET_CONFIG_*`, `RIVET_SOURCE_*`, `RIVET_VERIFY_*`, …), severity (low / medium / high / blocking), actionable hints; `--json` everywhere; strategy explanation in `rivet plan` (why this chunk size, why this mode, what risk remains); `doctor` capability + blocker report.
 
 ### 9.6.1 UX hardening backlog (v0.7.8 walk-through findings)
@@ -1193,16 +1194,16 @@ with verify-layer work as bandwidth allows.
 - ⏳ **`check` verdict pessimism vs actual run.** UNSAFE / DEGRADED predicts high RSS on parallel reads against no-index tables, but the actual run frequently sits well under the predicted budget (e.g. 10 M-row chunked-parallel orders ran in 12 s at 117 MB RSS while check said UNSAFE). Either make the predictor use estimated row width + chunk batch size for a tighter bound, or downgrade UNSAFE to DEGRADED when the verdict can't show a concrete budget breach.
 - ⏳ **`destination is not retry-safe` WARN spams local-destination runs.** `type: local` is the canonical dev/test destination but each run prints a retry-safety WARN. Either suppress for `local` (partial artifact = one failed-rewrite file, not silent data loss) or have `rivet init` add the right opt-in so the warn does not fire on defaults.
 - ✅ **TLS warning now surfaces in `doctor`/`check`** (v0.7.8) — preflight calls `warn_if_tls_disabled` ([src/preflight/doctor.rs](src/preflight/doctor.rs), [src/preflight/mod.rs](src/preflight/mod.rs)), so the missing-`tls:` warning fires before a real extract, not only in `run`.
-- ⏳ **`rivet init --schema X` includes ad-hoc / test tables.** Schema-wide init dumps every relation in the schema (140 entries in our dev DB, most of them leftover test artifacts). Add an `--exclude '<glob>'` flag or a heuristic that skips tables whose names match common temp/test patterns (`tmp_*`, `*_temp`, tables with PID-shaped suffixes).
+- ✅ **`rivet init --schema X` test-table filtering — DONE.** Repeatable `--include` / `--exclude '<glob>'` flags (`*`/`?` globs; `--exclude` wins over `--include`) — `TableFilter` + an in-tree `glob_match` (`src/init/mod.rs`), wired in `src/cli/dispatch.rs:474`, 4 passing unit tests (`table_filter_*`). Whole-schema init now drops `bench_*` / `tmp_*` / `*_temp` on demand.
 
 **P3 — polish & doc clarity** (good v0.8.0 fodder):
 
 - ⏳ **`rivet init` does not explain *why* it picked a mode.** Generated YAML says `mode: chunked` but not "(auto-selected because rows estimate ≥ 500 K)". One-line inline comment in the rendered config would close the loop.
-- ⏳ **`rivet journal --export X` does not show retry events.** Doc promises "per-run events / retries / quality issues"; today it only shows status + duration. Plumb per-chunk retry attempts into the structured journal so post-mortem doesn't require digging in stderr WARNs.
-- ⏳ **100 files per 10 M-row chunked export.** Default `chunk_size: 100_000` × big table = many small files. `rivet init` could scale `chunk_size` logarithmically with the row estimate (e.g. ≥ 10 M → 1 M chunk_size) so default file counts stay reasonable.
+- ✅ **`rivet journal` shows retry events — DONE.** `RunEvent::RetryAttempted` is journaled and the command prints `retries: N` (`src/pipeline/cli.rs:517`); `RunJournal::retries()` exposes the entries for post-mortem.
+- ✅ **100 files per 10 M-row chunked export — FIXED.** `rivet init` now scales `chunk_size` by the row estimate (`TableInfo::suggest_chunk_size` → `src/init/yaml_scaffold.rs:340`); a 10 M-row export that used to render 100 files now lands at ~10. Operators override the rendered line for different geometry.
 - ✅ **`status: skipped` now names the cursor** (v0.7.8) — shows `(no new rows since cursor '<col>')` ([src/pipeline/single.rs](src/pipeline/single.rs)) so the operator doesn't have to guess.
 - ✅ **Doc note added: re-running `chunked` re-extracts everything** — [`docs/modes/chunked.md`](docs/modes/chunked.md) § "Clean re-runs are NOT idempotent" spells out that `--resume` only skips completed chunks after a crash.
-- ⏳ **Doc note: `time_window` re-runs duplicate output.** Rolling window mode does not persist "we did this window already", so frequent re-runs produce duplicate files. Worth a paragraph in `modes/time-window.md`.
+- ✅ **Doc note added: `time_window` re-runs duplicate output.** `docs/modes/time-window.md` documents that rolling-window mode does not persist "this window already done", so frequent re-runs duplicate files.
 - ⏳ **Retry / I3 (Write Before Cursor) at-least-once dupe scenario** not yet covered by tests. The contract documents the duplicate possibility (`ADR-0001 I3`), and toxiproxy-based retry testing showed counters work; a dedicated SIGKILL-between-write-and-commit recovery test would pin the actual dupe behavior end-to-end.
 - ⏳ **Stale roadmap items inherited from earlier sessions:** "2–3 pilot tables repeated on a schedule" in §9.7 (organizational), SBOM / signed release attestations (also §9.7 unchecked). *(Release checksums shipped in v0.7.8 — now checked.)*
 
@@ -1221,7 +1222,7 @@ with verify-layer work as bandwidth allows.
 - [x] Plan/Apply workflow — sealed execution artifacts, ADR-0005
 - [x] Parallel exports — `--parallel-exports` + `--parallel-export-processes` with live cards UI
 - [x] Type safety layer — `--type-report`, TypePolicy, BigQuery compat, complex types (M1–M6)
-- [x] **Type roundtrip proof (v0.7.8)** — PG/MySQL × Parquet/CSV validated through DuckDB + ClickHouse + pyarrow + BigQuery; native Parquet `LogicalType::Uuid` / `LogicalType::Json`; `make test-types-validators`; per-tool fidelity benchmark in [`docs/bench/reports/`](docs/bench/reports/)
+- [x] **Type roundtrip proof (v0.7.8, since expanded)** — **PG / MySQL / MSSQL** × Parquet/CSV validated through DuckDB + ClickHouse + pyarrow + BigQuery **+ Snowflake** (all live-verified together); native Parquet `LogicalType::Uuid` / `LogicalType::Json`; `make test-types-validators`; per-tool fidelity benchmark in [`docs/bench/reports/`](docs/bench/reports/). Now **guarded by the always-on value checksum** — A==B byte-identical across every matrix type on all 3 engines (the permanent matrix-guard regression oracle that would have caught the PG-enum side-A gap before ship)
 - [x] Schema drift policy hooks — `on_schema_drift: warn|continue|fail` (Epic 7)
 - [x] Data shape drift detection — string/text width tracking (Epic 8)
 - [ ] 2–3 pilot tables repeated on a schedule *(organizational; optional automation K2)*
@@ -1268,11 +1269,11 @@ and the two-engine separation with explicit revisit triggers (ADR-0010).
 |---|---|---|---|---|
 | OPT-1 | Memory safety | P2 | ✅ Done (core) | Per-value ceiling `RIVET_VALUE_TOO_LARGE` shipped (189d915, default 256 MB). Follow-ups: probe-batch warmup shrink, check-predictor feedback |
 | OPT-2 | Adaptive concurrency | P1 | ✅ Done | Adaptive parallelism governor shipped (141bf33) — resizes worker count in `[min, parallel]` under source pressure (in-process engine). Follow-ups: subprocess engine (after OPT-6), richer `rivet-mcp` signals |
-| OPT-3 | Type fidelity | P1 | ⏳ Open (validated) | Round-trip proof is enumerated-fixture; no proptest type test exists — confirmed |
-| OPT-4 | MySQL parity | P1 | ✅ Done | MySQL keyset (seek) pagination shipped (40433a0) — single-column unique key, sequential, EXPLAIN-verified index range scan. Follow-ups: composite keys, parallel keyset, resume |
-| OPT-5 | Dedup ergonomics | P2 | ⏳ Open (**corrected**) | Deterministic per-part `content_fingerprint` **already exists** (`manifest.rs:160`); gap = guarantee/expose + parquet byte-determinism |
+| OPT-3 | Type fidelity | P1 | ✅ Done | proptest type round-trip shipped (`tests/type_roundtrip/property.rs`, `make test-types-property`); covers random *values* over a fixed MySQL schema — random *schemas* + Postgres remain documented follow-ups |
+| OPT-4 | MySQL parity | P1 | ✅ Done | MySQL keyset (seek) pagination shipped (40433a0) — single-column unique key, sequential, index range scan (documented in code comments; no EXPLAIN assertion in the suite). Follow-ups: composite keys, parallel keyset, resume |
+| OPT-5 | Dedup ergonomics | P2 | ✅ Partial | Deterministic per-part `content_fingerprint` exposed in every manifest (`manifest.rs:198`) + documented as the dedup key; remaining gap = a dedicated SIGKILL-between-write-and-commit dedup-collision test |
 | OPT-6 | Engine debt | P2 | ✅ Done | Crash-matrix symmetry pass on `feat/opt6-crash-matrix`: SIGTERM/SIGINT child reaper (`parallel_children::child_reaper`), SIGKILL-mid-write proof (temp+rename), subprocess panic recovery across all 4 write-cycle boundaries. See `dev/CRASH_MATRIX.md`. Residuals: object-store `FinalizeOnClose`, single-child external-signal accounting |
-| OPT-7 | Doc/roadmap drift | P1 | ✅ Done | Checksums documented as shipped (SECURITY.md + README + §5.1/§9.7); 3 §9.6.1 items struck. *Verified 3 other claimed-shipped §9.6.1 items (local-retry WARN, init mode-comment, init chunk_size scaling) are NOT shipped — left open.* |
+| OPT-7 | Doc/roadmap drift | P1 | ✅ Done | Checksums documented as shipped (SECURITY.md + README + §5.1/§9.7); 3 §9.6.1 items struck. *Of those 3: `init chunk_size scaling` IS in fact shipped (`yaml_scaffold.rs:340`, `suggest_chunk_size`) — only `local-retry WARN` suppression for local destinations and the `init` mode-selection comment remain genuinely open.* |
 
 ---
 

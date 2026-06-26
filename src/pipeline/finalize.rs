@@ -182,6 +182,12 @@ pub(super) fn finalize_manifest(
             part.content_md5.clone(),
         );
     }
+    if !summary.column_checksums.is_empty() {
+        builder.set_column_checksums(
+            summary.column_checksums.clone(),
+            summary.checksum_key_column.clone(),
+        );
+    }
     let manifest = builder.finalize(status);
 
     let dest = match crate::destination::create_destination(&plan.destination) {

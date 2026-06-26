@@ -46,6 +46,12 @@ pub enum ExportTarget {
     /// Cloud warehouse. Like BigQuery, its Parquet autoload degrades JSON,
     /// UUID, naive timestamps and TIME — see [`snowflake`]. Verified live.
     Snowflake,
+    /// Columnar warehouse with the most faithful Parquet autoload of the
+    /// warehouse targets: native `UInt64`, `Decimal`, `DateTime64` (naive *and*
+    /// tz), and `Array`, so most types autoload exactly. Diverges only on `UUID`
+    /// (lands as `FixedString(16)`), `JSON` (lands as `String`) and `TIME` (no
+    /// native type) — see [`clickhouse`]. Verified live against `clickhouse_load`.
+    ClickHouse,
 }
 
 impl ExportTarget {
@@ -54,6 +60,7 @@ impl ExportTarget {
             "bigquery" | "bq" => Some(Self::BigQuery),
             "duckdb" | "duck" => Some(Self::DuckDb),
             "snowflake" | "sf" => Some(Self::Snowflake),
+            "clickhouse" | "ch" => Some(Self::ClickHouse),
             _ => None,
         }
     }
@@ -63,7 +70,7 @@ impl ExportTarget {
     /// drift from `parse` (it once said "bigquery, duckdb" and missed
     /// snowflake). Aliases are shown in parens after each canonical name.
     pub fn valid_target_names() -> &'static str {
-        "bigquery (bq), duckdb (duck), snowflake (sf)"
+        "bigquery (bq), duckdb (duck), snowflake (sf), clickhouse (ch)"
     }
 
     pub fn label(self) -> &'static str {
@@ -71,6 +78,7 @@ impl ExportTarget {
             Self::BigQuery => "bigquery",
             Self::DuckDb => "duckdb",
             Self::Snowflake => "snowflake",
+            Self::ClickHouse => "clickhouse",
         }
     }
 
@@ -80,6 +88,7 @@ impl ExportTarget {
             ExportTarget::BigQuery => bigquery::resolve(&input),
             ExportTarget::DuckDb => duckdb::resolve(&input),
             ExportTarget::Snowflake => snowflake::resolve(&input),
+            ExportTarget::ClickHouse => clickhouse::resolve(&input),
         };
         // Fidelity floor (ADR-0014 T6): the target status must not be rosier
         // than the source fidelity warrants — a lossy/unsupported source column
@@ -112,6 +121,7 @@ impl ExportTarget {
         match self {
             ExportTarget::BigQuery => Some(bigquery_recovery_sql(specs, table)),
             ExportTarget::Snowflake => Some(snowflake_recovery_sql(specs, table)),
+            ExportTarget::ClickHouse => Some(clickhouse_recovery_sql(specs, table)),
             ExportTarget::DuckDb => None,
         }
     }
@@ -642,6 +652,122 @@ mod snowflake {
                         "list autoloads as VARIANT (the JSON array); recover native ARRAY with ::ARRAY after load",
                         Some(r#""{col}"::ARRAY"#),
                     )
+                }
+            }
+            RivetType::Unsupported { .. } => Resolved::fail(unsupported_reason(t)),
+        }
+    }
+}
+
+// ── ClickHouse ───────────────────────────────────────────────────────────────
+
+fn clickhouse_recovery_sql(specs: &[TargetColumnSpec], table: &str) -> String {
+    let cols = recovery_projection(specs, |name| format!("  {name}"));
+    format!(
+        "-- 1) load the Parquet into a staging table, e.g.\n\
+         --    CREATE TABLE {table}__staging ENGINE = MergeTree ORDER BY tuple() AS\n\
+         --      SELECT * FROM file('<parquet>', 'Parquet');\n\
+         -- 2) recover native types:\n\
+         CREATE TABLE {table} ENGINE = MergeTree ORDER BY tuple() AS\n\
+         SELECT\n{cols}\n\
+         FROM {table}__staging;"
+    )
+}
+
+mod clickhouse {
+    use super::*;
+
+    pub(super) fn resolve(input: &TargetInput<'_>) -> TargetColumnSpec {
+        native(input.rivet_type).into_spec(input)
+    }
+
+    /// ClickHouse Parquet autoload (`file(..., 'Parquet')`) — pinned against the
+    /// live `clickhouse_load` matrix. The most faithful warehouse target: native
+    /// `UInt64`, `Decimal`, `DateTime64` (naive *and* tz) and `Array`, so most
+    /// types autoload exactly. Divergences: `UUID` -> `FixedString(16)`, `JSON`
+    /// -> `String`, and `TIME` (no native type -> `Int64`, µs of day).
+    fn native(t: &RivetType) -> Resolved {
+        match t {
+            RivetType::Bool => Resolved::ok("Bool"),
+            RivetType::Int16 => Resolved::ok("Int16"),
+            RivetType::Int32 => Resolved::ok("Int32"),
+            RivetType::Int64 => Resolved::ok("Int64"),
+            // Native unsigned 64-bit — ClickHouse holds the full UInt64 range, so
+            // the overflow that forces BigQuery/Snowflake to a load-schema note
+            // never happens here. The headline difference from the cloud warehouses.
+            RivetType::UInt64 => Resolved::ok("UInt64"),
+            RivetType::Float32 => Resolved::ok("Float32"),
+            RivetType::Float64 => Resolved::ok("Float64"),
+            RivetType::Decimal { precision, scale } => {
+                if *scale < 0 {
+                    Resolved::warn(
+                        "Decimal",
+                        format!(
+                            "ClickHouse Decimal has no negative scale; decimal({precision},{scale}) needs a declared schema"
+                        ),
+                    )
+                } else {
+                    Resolved::ok(format!("Decimal({precision}, {scale})"))
+                }
+            }
+            RivetType::Date => Resolved::ok("Date32"),
+            // No time-of-day type; Time64 autoloads as Int64 (µs of day). There is
+            // no native type to recover to — fix at source if a real time matters.
+            RivetType::Time { .. } => Resolved::warn(
+                "Int64",
+                "ClickHouse has no TIME type; time-of-day autoloads as Int64 (µs of day)",
+            ),
+            // DateTime64 holds both naive and tz timestamps natively (verified:
+            // naive -> DateTime64(6), tz -> DateTime64(6, 'UTC')).
+            RivetType::Timestamp { unit, timezone } => {
+                let p = match unit {
+                    TimeUnit::Second => 0,
+                    TimeUnit::Millisecond => 3,
+                    TimeUnit::Microsecond => 6,
+                    TimeUnit::Nanosecond => 9,
+                };
+                match timezone {
+                    Some(tz) => Resolved::ok(format!("DateTime64({p}, '{tz}')")),
+                    None => Resolved::ok(format!("DateTime64({p})")),
+                }
+            }
+            RivetType::String | RivetType::Text | RivetType::Enum => Resolved::ok("String"),
+            // ClickHouse String holds arbitrary bytes, so bytea/blob round-trips
+            // losslessly — no BINARY_AS_TEXT caveat like Snowflake.
+            RivetType::Binary => Resolved::ok("String"),
+            // ClickHouse's native JSON type is a declared column (still settling
+            // across versions); Parquet JSON autoloads as String holding the valid
+            // JSON text. Recover by declaring a JSON column at load — there is no
+            // safe SELECT-time cast, so the recovery is upstream (a note).
+            RivetType::Json => Resolved::diverge(
+                "JSON",
+                "String",
+                "JSON autoloads as String (valid JSON text); declare a JSON column at load for the native type",
+                None,
+            ),
+            // The 16-byte UUID field autoloads as FixedString(16) (verified live).
+            // The bytes are the canonical UUID; recover the native UUID with the
+            // hex -> dashed-text -> toUUID round-trip clickhouse_load pins.
+            RivetType::Uuid => Resolved::diverge(
+                "UUID",
+                "FixedString(16)",
+                "UUID autoloads as FixedString(16); recover the native UUID with toUUID after load",
+                Some(
+                    "toUUID(concat(substring(lower(hex({col})),1,8),'-',substring(lower(hex({col})),9,4),'-',substring(lower(hex({col})),13,4),'-',substring(lower(hex({col})),17,4),'-',substring(lower(hex({col})),21,12)))",
+                ),
+            ),
+            RivetType::Interval => Resolved::ok("String"),
+            // A Parquet list autoloads as a native Array (verified: tags ->
+            // Array(Nullable(String)), nums -> Array(Nullable(Int32))).
+            RivetType::List { inner } => {
+                let inner_r = native(inner);
+                if inner_r.status == TargetStatus::Fail {
+                    Resolved::fail(format!(
+                        "Array of unsupported element: {}",
+                        inner_r.target_type
+                    ))
+                } else {
+                    Resolved::ok(format!("Array(Nullable({}))", inner_r.target_type))
                 }
             }
             RivetType::Unsupported { .. } => Resolved::fail(unsupported_reason(t)),
@@ -1244,6 +1370,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_accepts_clickhouse() {
+        assert_eq!(
+            ExportTarget::parse("clickhouse"),
+            Some(ExportTarget::ClickHouse)
+        );
+        assert_eq!(ExportTarget::parse("ch"), Some(ExportTarget::ClickHouse));
+    }
+
+    #[test]
     fn valid_target_names_lists_every_parseable_target() {
         // The "unknown target" error message reads from this; it must name
         // every target `parse` accepts, or the hint sends operators wrong.
@@ -1252,5 +1387,6 @@ mod tests {
         assert!(names.contains("snowflake"), "got: {names}");
         assert!(names.contains("bigquery"), "got: {names}");
         assert!(names.contains("duckdb"), "got: {names}");
+        assert!(names.contains("clickhouse"), "got: {names}");
     }
 }

@@ -54,6 +54,8 @@ fn empty_success_manifest(run_id: &str, export_name: &str) -> RunManifest {
         row_count: 0,
         part_count: 0,
         parts: Vec::<ManifestPart>::new(),
+        column_checksums: None,
+        checksum_key_column: None,
     }
 }
 

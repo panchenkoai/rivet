@@ -6,6 +6,7 @@ pub(crate) mod pg_numeric_wire;
 pub mod postgres;
 pub(crate) mod query;
 pub(crate) mod tls;
+pub(crate) mod value_checksum;
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;

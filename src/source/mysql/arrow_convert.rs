@@ -17,6 +17,7 @@
 //! in `mod.rs`), and `bit_bytes_to_u64` (referenced by unit tests in
 //! `mod.rs::tests`). Everything else is private to this file.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -328,7 +329,157 @@ pub(super) fn rows_to_record_batch_typed(
             max_value_bytes,
         )?);
     }
-    Ok(RecordBatch::try_new(schema.clone(), arrays)?)
+    let batch = RecordBatch::try_new(schema.clone(), arrays)?;
+    // Form A value-checksum (always-on): source-side pass (A) vs the built batch
+    // (B) — fail loud if the value converter diverged between read and Arrow build.
+    let a = crate::source::value_checksum::source_checksums(schema, &MysqlCellSource { rows });
+    let b = crate::source::value_checksum::arrow_batch_checksums(&batch);
+    crate::source::value_checksum::verify(&a, &b, schema)?;
+    Ok(batch)
+}
+
+/// Side A of the Form A value-checksum for MySQL — an INDEPENDENT decode of the raw
+/// `mysql::Value`s (mirroring `build_array`) so it equals side B on a correct build.
+/// Drives the shared [`crate::source::value_checksum::source_checksums`] dispatch;
+/// each accessor holds MySQL's per-type extraction (the Int/UInt/Bytes/Float/Double/
+/// Date variants, unsigned widths, BIT via `is_bit`, decimal via `BigDecimal`). Bytes
+/// must match `feed_cell` or the matrix guard false-mismatches.
+struct MysqlCellSource<'a> {
+    rows: &'a [mysql::Row],
+}
+
+impl MysqlCellSource<'_> {
+    /// MySQL surfaces a `BIT` column's bytes big-endian; `int64_from_bytes` needs to
+    /// know so it widens them correctly. Read from the first row's column metadata.
+    fn is_bit(&self, col: usize) -> bool {
+        self.rows.first().is_some_and(|r| {
+            r.columns_ref()
+                .get(col)
+                .is_some_and(|c| matches!(c.column_type(), ColumnType::MYSQL_TYPE_BIT))
+        })
+    }
+}
+
+impl crate::source::value_checksum::CellSource for MysqlCellSource<'_> {
+    fn num_rows(&self) -> usize {
+        self.rows.len()
+    }
+    fn boolean(&self, col: usize, row: usize) -> Option<bool> {
+        match self.rows[row].as_ref(col) {
+            Some(Value::Int(v)) => Some(*v != 0),
+            Some(Value::UInt(v)) => Some(*v != 0),
+            Some(Value::Bytes(bv)) => Some(bit_bytes_to_u64(bv) != 0),
+            _ => None,
+        }
+    }
+    fn int16(&self, col: usize, row: usize) -> Option<i16> {
+        match self.rows[row].as_ref(col) {
+            Some(Value::Int(v)) => Some(*v as i16),
+            Some(Value::UInt(v)) => Some(*v as i16),
+            Some(Value::Bytes(bv)) => atoi::atoi::<i128>(bv).map(|v| v as i16),
+            _ => None,
+        }
+    }
+    fn int32(&self, col: usize, row: usize) -> Option<i32> {
+        match self.rows[row].as_ref(col) {
+            Some(Value::Int(v)) => Some(*v as i32),
+            Some(Value::UInt(v)) => Some(*v as i32),
+            Some(Value::Bytes(bv)) => atoi::atoi::<i128>(bv).map(|v| v as i32),
+            _ => None,
+        }
+    }
+    fn int64(&self, col: usize, row: usize) -> Option<i64> {
+        match self.rows[row].as_ref(col) {
+            Some(Value::Int(v)) => Some(*v),
+            Some(Value::UInt(v)) => Some(*v as i64),
+            Some(Value::Bytes(bv)) => int64_from_bytes(bv, self.is_bit(col)).ok().flatten(),
+            _ => None,
+        }
+    }
+    fn uint64(&self, col: usize, row: usize) -> Option<u64> {
+        match self.rows[row].as_ref(col) {
+            Some(Value::UInt(v)) => Some(*v),
+            Some(Value::Int(v)) if *v >= 0 => Some(*v as u64),
+            Some(Value::Bytes(bv)) => atoi::atoi::<u64>(bv),
+            _ => None,
+        }
+    }
+    fn float32(&self, col: usize, row: usize) -> Option<f32> {
+        match self.rows[row].as_ref(col) {
+            Some(Value::Float(v)) => Some(*v),
+            Some(Value::Double(v)) => Some(*v as f32),
+            Some(Value::Bytes(bv)) => bytes_to_str(bv).and_then(|s| s.parse().ok()),
+            _ => None,
+        }
+    }
+    fn float64(&self, col: usize, row: usize) -> Option<f64> {
+        match self.rows[row].as_ref(col) {
+            Some(Value::Float(v)) => Some(*v as f64),
+            Some(Value::Double(v)) => Some(*v),
+            Some(Value::Bytes(bv)) => bytes_to_str(bv).and_then(|s| s.parse().ok()),
+            _ => None,
+        }
+    }
+    fn decimal128(&self, col: usize, row: usize, scale: i8) -> Option<i128> {
+        use bigdecimal::{BigDecimal, RoundingMode, num_traits::ToPrimitive};
+        let bd: BigDecimal = match self.rows[row].as_ref(col) {
+            Some(Value::Bytes(bv)) => bytes_to_str(bv)?.parse().ok()?,
+            Some(Value::Int(v)) => BigDecimal::from(*v),
+            Some(Value::UInt(v)) => BigDecimal::from(*v),
+            _ => return None,
+        };
+        bd.with_scale_round(scale as i64, RoundingMode::Down)
+            .into_bigint_and_exponent()
+            .0
+            .to_i128()
+    }
+    fn date32(&self, col: usize, row: usize) -> Option<i32> {
+        let d = match self.rows[row].as_ref(col) {
+            Some(Value::Date(y, m, d, _, _, _, _)) => {
+                chrono::NaiveDate::from_ymd_opt(*y as i32, *m as u32, *d as u32)
+            }
+            Some(Value::Bytes(bv)) => bytes_to_str(bv).and_then(|s| {
+                chrono::NaiveDate::parse_from_str(s.split(' ').next().unwrap_or(s), "%Y-%m-%d").ok()
+            }),
+            _ => None,
+        }?;
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        Some((d - epoch).num_days() as i32)
+    }
+    fn ts_micros(&self, col: usize, row: usize) -> Option<i64> {
+        let dt = match self.rows[row].as_ref(col) {
+            Some(Value::Date(y, mo, d, h, mi, sx, us)) => {
+                chrono::NaiveDate::from_ymd_opt(*y as i32, *mo as u32, *d as u32)
+                    .and_then(|d| d.and_hms_micro_opt(*h as u32, *mi as u32, *sx as u32, *us))
+            }
+            Some(Value::Bytes(bv)) => bytes_to_str(bv)
+                .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok()),
+            _ => None,
+        }?;
+        Some(dt.and_utc().timestamp_micros())
+    }
+    fn binary(&self, col: usize, row: usize) -> Option<Cow<'_, [u8]>> {
+        match self.rows[row].as_ref(col) {
+            Some(Value::Bytes(bv)) => Some(Cow::Borrowed(bv.as_slice())),
+            _ => None,
+        }
+    }
+    fn utf8(&self, col: usize, row: usize) -> Option<Cow<'_, [u8]>> {
+        match self.rows[row].as_ref(col) {
+            Some(Value::Bytes(bv)) => Some(match bytes_to_str(bv) {
+                Some(s) => Cow::Borrowed(s.as_bytes()),
+                None => Cow::Owned(String::from_utf8_lossy(bv).into_owned().into_bytes()),
+            }),
+            Some(Value::Int(v)) => Some(Cow::Owned(v.to_string().into_bytes())),
+            Some(Value::UInt(v)) => Some(Cow::Owned(v.to_string().into_bytes())),
+            Some(Value::Float(v)) => Some(Cow::Owned(v.to_string().into_bytes())),
+            Some(Value::Double(v)) => Some(Cow::Owned(v.to_string().into_bytes())),
+            Some(Value::Date(y, m, d, hh, mi, sx, us)) => Some(Cow::Owned(
+                format!("{y:04}-{m:02}-{d:02} {hh:02}:{mi:02}:{sx:02}.{us:06}").into_bytes(),
+            )),
+            _ => None,
+        }
+    }
 }
 
 fn bytes_to_str(b: &[u8]) -> Option<&str> {

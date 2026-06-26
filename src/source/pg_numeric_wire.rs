@@ -53,7 +53,7 @@ pub fn numeric_wire_normalized_plain(wire: &[u8]) -> Option<String> {
     Some(bd.normalized().to_plain_string().trim().to_string())
 }
 
-fn wire_to_big_decimal(wire: &[u8]) -> Option<BigDecimal> {
+pub(crate) fn wire_to_big_decimal(wire: &[u8]) -> Option<BigDecimal> {
     let mut cur = Cursor::new(wire);
     let ndigits = cur.read_u16::<BigEndian>().ok()? as usize;
     let weight = cur.read_i16::<BigEndian>().ok()?;

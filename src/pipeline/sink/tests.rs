@@ -408,6 +408,8 @@ fn minimal_sink() -> ExportSink {
         oversized_batch_count: 0,
         parquet_config: None,
         parquet_row_group_rows: None,
+        column_checksums: std::collections::BTreeMap::new(),
+        checksum_key_col: None,
     }
 }
 

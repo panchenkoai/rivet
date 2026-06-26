@@ -292,6 +292,8 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
         schema_fingerprint: None,
         manifest_verification: None,
         apply_context: None,
+        column_checksums: Vec::new(),
+        checksum_key_column: None,
         journal,
     }
 }

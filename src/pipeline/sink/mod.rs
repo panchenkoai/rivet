@@ -87,6 +87,17 @@ pub(crate) struct ExportSink {
     pub(in crate::pipeline) parquet_config: Option<crate::config::ParquetConfig>,
     /// Resolved rows-per-row-group, computed from schema in `on_schema`. `None` = library default.
     pub(in crate::pipeline) parquet_row_group_rows: Option<usize>,
+    /// Form B value-checksum accumulator: per-column xxh3 (keyed to the cursor
+    /// column when present — `xxh3(key ‖ value)`), XOR-combined over the export,
+    /// keyed by column NAME. Surfaced into the manifest by `finalize`; `rivet
+    /// validate` re-reads to catch an Arrow→Parquet encode / post-write fault the
+    /// in-process Form A check cannot see. Always tracked (cheap, one pass over
+    /// the batch the sink already holds).
+    pub(in crate::pipeline) column_checksums: std::collections::BTreeMap<String, u64>,
+    /// Index of the cursor/key column in the dest batch (the pk for the keyed
+    /// checksum), resolved in `on_schema`. `None` = un-keyed (full export, or a
+    /// stripped/synthetic cursor not present in the dest batch).
+    pub(in crate::pipeline) checksum_key_col: Option<usize>,
 }
 
 impl ExportSink {
@@ -133,6 +144,8 @@ impl ExportSink {
             oversized_batch_count: 0,
             parquet_config: plan.parquet.clone(),
             parquet_row_group_rows: None,
+            column_checksums: std::collections::BTreeMap::new(),
+            checksum_key_col: None,
         })
     }
 
@@ -316,6 +329,30 @@ impl ExportSink {
     }
 
     /// Update the running per-column max byte length for string/binary columns.
+    /// Form B: fold each column's xxh3 (keyed to the cursor column when present —
+    /// `xxh3(key ‖ value)`) into the per-column accumulator, XOR-combined and
+    /// keyed by column NAME. Over the dest batch (data columns), so enrichment /
+    /// meta columns are naturally excluded; `validate` re-reads and recomputes
+    /// this by name to catch an Arrow→Parquet encode / post-write fault.
+    pub fn track_checksum(&mut self, batch: &RecordBatch) {
+        use crate::source::value_checksum::{arrow_batch_checksums, arrow_batch_checksums_keyed};
+        // Form B re-read verification only works for Parquet (a CSV→Arrow re-read
+        // is not byte-faithful), so only Parquet exports record the checksum.
+        if self.format_type != FormatType::Parquet {
+            return;
+        }
+        let sums = match self.checksum_key_col {
+            Some(k) => arrow_batch_checksums_keyed(batch, k),
+            None => arrow_batch_checksums(batch),
+        };
+        for (i, field) in batch.schema().fields().iter().enumerate() {
+            *self
+                .column_checksums
+                .entry(field.name().clone())
+                .or_insert(0) ^= sums[i];
+        }
+    }
+
     pub fn track_shape(&mut self, batch: &RecordBatch) {
         use arrow::array::{BinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
         use arrow::datatypes::DataType;
@@ -416,6 +453,7 @@ impl ExportSink {
         self.part_rows += dest_batch.num_rows();
         self.track_quality(dest_batch);
         self.track_shape(dest_batch);
+        self.track_checksum(dest_batch);
 
         let output = if let Some(es) = &self.enriched_schema {
             enrich::enrich_batch(dest_batch, &self.meta, es, self.exported_at_us)?
@@ -578,6 +616,29 @@ impl BatchSink for ExportSink {
         // `schema` keeps internal columns so cursor extraction (e.g. synthetic
         // `_rivet_coalesced_cursor`) can index by name. `dest_schema` is what
         // downstream consumers see — used for schema-change detection.
+        // Form B: resolve the cursor/key column index in the dest batch (the pk
+        // for the keyed checksum). `None` when there's no cursor, or it's a
+        // stripped/synthetic column not present in the dest batch (→ un-keyed).
+        self.checksum_key_col = self
+            .cursor_column
+            .as_ref()
+            .and_then(|c| dest_schema.index_of(c).ok());
+        // Coverage is visible, not silent: warn once per export about any column the
+        // value checksum does NOT cover (UUID / List / Decimal256 / ns-timestamp),
+        // so its 0 contribution can't read as "verified".
+        let skips = crate::source::value_checksum::coverage_skips(&dest_schema);
+        if !skips.is_empty() {
+            log::warn!(
+                "value checksum covers {}/{} columns; NOT checked: {}",
+                dest_schema.fields().len() - skips.len(),
+                dest_schema.fields().len(),
+                skips
+                    .iter()
+                    .map(|(n, r)| format!("{n} ({r})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         self.schema = Some(schema);
         self.dest_schema = Some(dest_schema);
         self.enriched_schema = Some(enriched);

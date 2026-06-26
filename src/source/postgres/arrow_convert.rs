@@ -18,6 +18,7 @@
 //! [`rows_to_record_batch_typed`] is called by `pg_run_export`. Everything
 //! else is private to this file.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -413,7 +414,127 @@ pub(super) fn rows_to_record_batch_typed(
         arrays.push(arr);
     }
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
+    // Form A value-checksum (always-on): an independent source-side pass over the
+    // raw pg values (A) vs the Arrow-side pass over the built batch (B). A mismatch
+    // means the value converter changed a value between read and Arrow build — fail
+    // loud rather than write the bad batch.
+    let a =
+        crate::source::value_checksum::source_checksums(schema, &PgCellSource { columns, rows });
+    let b = crate::source::value_checksum::arrow_batch_checksums(&batch);
+    crate::source::value_checksum::verify(&a, &b, schema)?;
     Ok(batch)
+}
+
+/// Side A of the Form A value-checksum for Postgres — an INDEPENDENT decode of the
+/// raw `Row` values (mirroring `build_array`'s per-type transform) so it equals side
+/// B on a correct build. Drives the shared
+/// [`crate::source::value_checksum::source_checksums`] dispatch; each accessor holds
+/// the pg-specific extraction (OID widen, TIMESTAMPTZ, the text/json/numeric/uuid/
+/// interval/enum split, numeric wire → scaled i128). Bytes must match `feed_cell`
+/// or the matrix guard false-mismatches.
+struct PgCellSource<'a> {
+    columns: &'a [(String, Type)],
+    rows: &'a [Row],
+}
+
+impl crate::source::value_checksum::CellSource for PgCellSource<'_> {
+    fn num_rows(&self) -> usize {
+        self.rows.len()
+    }
+    fn int16(&self, col: usize, row: usize) -> Option<i16> {
+        self.rows[row].get::<_, Option<i16>>(col)
+    }
+    fn int32(&self, col: usize, row: usize) -> Option<i32> {
+        self.rows[row].get::<_, Option<i32>>(col)
+    }
+    fn int64(&self, col: usize, row: usize) -> Option<i64> {
+        if self.columns[col].1 == Type::OID {
+            self.rows[row].get::<_, Option<u32>>(col).map(|v| v as i64)
+        } else {
+            self.rows[row].get::<_, Option<i64>>(col)
+        }
+    }
+    fn uint64(&self, _col: usize, _row: usize) -> Option<u64> {
+        // Postgres never maps to UInt64 (OID widens to i64), so source_checksums
+        // never calls this — a UInt64 column is not produced by this engine.
+        None
+    }
+    fn float32(&self, col: usize, row: usize) -> Option<f32> {
+        self.rows[row].get::<_, Option<f32>>(col)
+    }
+    fn float64(&self, col: usize, row: usize) -> Option<f64> {
+        self.rows[row].get::<_, Option<f64>>(col)
+    }
+    fn decimal128(&self, col: usize, row: usize, scale: i8) -> Option<i128> {
+        let wire = self.rows[row]
+            .try_get::<_, Option<PgNumericWire<'_>>>(col)
+            .ok()
+            .flatten()?;
+        let bd = crate::source::pg_numeric_wire::wire_to_big_decimal(wire.0)?;
+        let scaled = bd.with_scale_round(scale as i64, bigdecimal::RoundingMode::Down);
+        bigdecimal::num_traits::ToPrimitive::to_i128(&scaled.into_bigint_and_exponent().0)
+    }
+    fn date32(&self, col: usize, row: usize) -> Option<i32> {
+        let d = self.rows[row].get::<_, Option<chrono::NaiveDate>>(col)?;
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch valid");
+        Some((d - epoch).num_days() as i32)
+    }
+    fn ts_micros(&self, col: usize, row: usize) -> Option<i64> {
+        if self.columns[col].1 == Type::TIMESTAMPTZ {
+            self.rows[row]
+                .get::<_, Option<chrono::DateTime<chrono::Utc>>>(col)
+                .map(|ts| ts.timestamp_micros())
+        } else {
+            self.rows[row]
+                .get::<_, Option<chrono::NaiveDateTime>>(col)
+                .map(|ts| ts.and_utc().timestamp_micros())
+        }
+    }
+    fn boolean(&self, col: usize, row: usize) -> Option<bool> {
+        self.rows[row].get::<_, Option<bool>>(col)
+    }
+    fn binary(&self, col: usize, row: usize) -> Option<Cow<'_, [u8]>> {
+        self.rows[row]
+            .get::<_, Option<Vec<u8>>>(col)
+            .map(Cow::Owned)
+    }
+    fn utf8(&self, col: usize, row: usize) -> Option<Cow<'_, [u8]>> {
+        let r = &self.rows[row];
+        match self.columns[col].1 {
+            Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => r
+                .get::<_, Option<&str>>(col)
+                .map(|t| Cow::Borrowed(t.as_bytes())),
+            Type::JSON | Type::JSONB => match r.try_get::<_, Option<PgJsonRawText<'_>>>(col) {
+                Ok(Some(PgJsonRawText(t))) => Some(Cow::Borrowed(t.as_bytes())),
+                _ => None,
+            },
+            Type::NUMERIC => match pg_numeric_optional_utf8_string(r, col) {
+                Ok(Some(t)) => Some(Cow::Owned(t.into_bytes())),
+                _ => None,
+            },
+            Type::UUID => match r.try_get::<_, Option<PgUuidBytes>>(col) {
+                Ok(Some(PgUuidBytes(b))) => Some(Cow::Owned(
+                    uuid::Uuid::from_bytes(b).to_string().into_bytes(),
+                )),
+                _ => None,
+            },
+            Type::INTERVAL => r
+                .try_get::<_, Option<PgInterval>>(col)
+                .ok()
+                .flatten()
+                .map(|iv| {
+                    Cow::Owned(
+                        pg_interval_to_iso8601(iv.months, iv.days, iv.microseconds).into_bytes(),
+                    )
+                }),
+            ref t if matches!(t.kind(), Kind::Enum(_)) => r
+                .try_get::<_, Option<AnyAsString>>(col)
+                .ok()
+                .flatten()
+                .map(|s| Cow::Owned(s.0.into_bytes())),
+            _ => None,
+        }
+    }
 }
 
 fn build_array(

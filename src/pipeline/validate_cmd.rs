@@ -169,6 +169,10 @@ pub fn run_validate_command(
                 if target.prefix_override.is_some() {
                     v.require_manifest_present(&resolved_prefix);
                 }
+                // Capture the verdict before `v` is moved into the result: the
+                // deeper Form B checksum re-read below must run *only* on a
+                // manifest that was found and passed the standard checks.
+                let manifest_verified = v.manifest_found && v.passed;
                 all_results.push(ExportVerdict {
                     name: export.name.clone(),
                     resolved_prefix,
@@ -200,6 +204,20 @@ pub fn run_validate_command(
                             export.name, e
                         )),
                     }
+                }
+                // Form B: re-read the parts and verify the per-column value
+                // checksums recorded in the manifest (catches an Arrow→Parquet
+                // encode / post-write fault the in-process Form A cannot see).
+                // Gated on a found+passed manifest: an absent (legacy pass) or
+                // unreadable manifest is already accounted for above, so re-reading
+                // it here would either break the legacy pass or double-count.
+                if manifest_verified
+                    && export.format == crate::config::FormatType::Parquet
+                    && let Err(e) =
+                        crate::source::value_checksum::validate_manifest_checksums(&*dest, "")
+                {
+                    hard_failures
+                        .push(format!("export '{}': value checksum: {:#}", export.name, e));
                 }
             }
             Err(e) => {
@@ -600,6 +618,8 @@ mod tests {
             row_count,
             part_count,
             parts,
+            column_checksums: None,
+            checksum_key_column: None,
         }
     }
 

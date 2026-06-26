@@ -10,8 +10,12 @@
 
 mod common;
 
+#[path = "type_roundtrip/all_types_oracle.rs"]
+mod all_types_oracle;
 #[path = "type_roundtrip/bigquery_load.rs"]
 mod bigquery_load;
+#[path = "type_roundtrip/checksum_guard.rs"]
+mod checksum_guard;
 #[path = "type_roundtrip/clickhouse_load.rs"]
 mod clickhouse_load;
 #[path = "type_roundtrip/compression_matrix.rs"]
