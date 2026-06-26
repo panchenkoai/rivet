@@ -388,25 +388,25 @@ mod tests {
 
     #[test]
     fn verdict_small_indexed_with_cursor_is_efficient() {
-        let v = compute_verdict(Some(500_000), true, true);
+        let v = compute_verdict(Some(500_000), true, true, None, 1);
         assert!(matches!(v, HealthVerdict::Efficient), "got: {v}");
     }
 
     #[test]
     fn verdict_large_indexed_with_cursor_is_acceptable() {
-        let v = compute_verdict(Some(20_000_000), true, true);
+        let v = compute_verdict(Some(20_000_000), true, true, None, 1);
         assert!(matches!(v, HealthVerdict::Acceptable), "got: {v}");
     }
 
     #[test]
     fn verdict_no_index_no_cursor_is_degraded() {
-        let v = compute_verdict(Some(500_000), false, false);
+        let v = compute_verdict(Some(500_000), false, false, None, 1);
         assert!(matches!(v, HealthVerdict::Degraded), "got: {v}");
     }
 
     #[test]
     fn verdict_huge_no_index_is_unsafe() {
-        let v = compute_verdict(Some(100_000_000), false, false);
+        let v = compute_verdict(Some(100_000_000), false, false, None, 1);
         assert!(matches!(v, HealthVerdict::Unsafe), "got: {v}");
     }
 

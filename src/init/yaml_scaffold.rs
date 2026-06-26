@@ -1,6 +1,7 @@
 //! YAML scaffold generation for `rivet init`.
 
 use crate::error::Result;
+use crate::tuning::memory::{DEFAULT_MEM_BUDGET_MB, estimate_peak_rss_mb, per_worker_rss_mb};
 
 use super::{InitYamlDestination, TableInfo};
 
@@ -624,43 +625,6 @@ struct ParallelChoice {
     /// Held at 1 because wide MySQL rows make a single scan beat chunked.
     wide_mysql_single: bool,
 }
-
-/// Per-worker peak RSS (MB) under the default *adaptive* batching, fitted to the
-/// sweep in `docs/bench/reports/REPORT_full_vs_parallel.md`. Anchored on
-/// measured points — ~19 MB/worker at ~40 B/row (narrow), ~105 MB at ~4 KB/row
-/// (wide) — and clamped to a ceiling of ≈ 2× the adaptive batch target. The
-/// driver is **row width × in-flight batch, not chunk_size** (chunk_size only
-/// sets file count). An explicit large `tuning.batch_size` overrides adaptive
-/// batching and raises this beyond the model.
-///
-/// This is the *scaffold-time* estimate (catalog `avg_row_bytes`, pre-schema).
-/// Its runtime sibling — which sizes the actual batch from the resolved Arrow
-/// schema — is [`crate::tuning::memory`]; the ceiling is single-sourced from
-/// [`DEFAULT_BATCH_TARGET_MB`] so the two cannot silently drift on the batch
-/// target. The slope/floor remain empirical (the bench sweep, not derivable
-/// from the schema-bytes model).
-fn per_worker_rss_mb(avg_row_bytes: i64) -> u64 {
-    const FLOOR_MB: u64 = 18;
-    // ~2× the adaptive batch target (Arrow builders + parquet row-group + zstd
-    // hold roughly twice the raw in-flight batch). Linked to the source of
-    // truth so it tracks the batch target instead of drifting.
-    const CEIL_MB: u64 = 2 * crate::source::batch_controller::DEFAULT_BATCH_TARGET_MB as u64;
-    let b = avg_row_bytes.max(0) as u64;
-    (FLOOR_MB + b * 87 / 4096).clamp(FLOOR_MB, CEIL_MB)
-}
-
-/// Predicted peak process RSS (MB) for a chunked export with `parallel` workers.
-/// `peak ≈ 16 (process base) + parallel × per_worker_rss_mb(width)`. Linear in
-/// `parallel`; slightly *over*-estimates past ~4 workers (allocator reuse) —
-/// the safe direction for a budget. Validated against the sweep (par 4 wide:
-/// est 436 vs measured 444 MB; par 8 narrow: est 166 vs 169 MB).
-fn estimate_peak_rss_mb(parallel: usize, avg_row_bytes: i64) -> u64 {
-    const PROCESS_BASE_MB: u64 = 16;
-    PROCESS_BASE_MB + parallel as u64 * per_worker_rss_mb(avg_row_bytes)
-}
-
-/// Default RSS budget the scaffold sizes `parallel:` against (Correction #5).
-const DEFAULT_MEM_BUDGET_MB: u64 = 2048;
 
 /// Largest worker count whose predicted peak RSS stays within `budget_mb`
 /// (never below 1).

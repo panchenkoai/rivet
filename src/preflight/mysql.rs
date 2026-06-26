@@ -193,7 +193,13 @@ fn diagnose_mysql(
     };
 
     let strategy = derive_strategy(export);
-    let verdict = compute_verdict(row_estimate, uses_index, export.cursor_column.is_some());
+    let verdict = compute_verdict(
+        row_estimate,
+        uses_index,
+        export.cursor_column.is_some(),
+        None, // MySQL exposes no reliable avg_row_bytes pre-run → can't predict RSS
+        export.parallel,
+    );
     let recommended_profile = recommend_profile(row_estimate, uses_index, export);
     let recommended_parallel = recommend_parallelism(export, row_estimate, uses_index);
     // MySQL has no trustworthy scan-free row-width estimate (information_schema

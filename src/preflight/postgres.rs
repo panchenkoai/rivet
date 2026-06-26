@@ -137,7 +137,13 @@ fn diagnose_pg(
     };
 
     let strategy = derive_strategy(export);
-    let verdict = compute_verdict(row_estimate, uses_index, export.cursor_column.is_some());
+    let verdict = compute_verdict(
+        row_estimate,
+        uses_index,
+        export.cursor_column.is_some(),
+        avg_row_bytes,
+        export.parallel,
+    );
     let recommended_profile = recommend_profile(row_estimate, uses_index, export);
     let recommended_parallel = recommend_parallelism(export, row_estimate, uses_index);
     let warnings = collect_warnings(

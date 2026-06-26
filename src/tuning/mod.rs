@@ -13,7 +13,7 @@
 //! keep working.
 
 mod adaptive;
-mod memory;
+pub(crate) mod memory;
 mod profile;
 
 pub use adaptive::{ADAPTIVE_SAMPLE_INTERVAL, Governor, next_adaptive_batch_size};
