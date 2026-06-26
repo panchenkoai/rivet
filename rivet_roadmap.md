@@ -1205,7 +1205,7 @@ with verify-layer work as bandwidth allows.
 - ✅ **Doc note added: re-running `chunked` re-extracts everything** — [`docs/modes/chunked.md`](docs/modes/chunked.md) § "Clean re-runs are NOT idempotent" spells out that `--resume` only skips completed chunks after a crash.
 - ✅ **Doc note added: `time_window` re-runs duplicate output.** `docs/modes/time-window.md` documents that rolling-window mode does not persist "this window already done", so frequent re-runs duplicate files.
 - ⏳ **Retry / I3 (Write Before Cursor) at-least-once dupe scenario** not yet covered by tests. The contract documents the duplicate possibility (`ADR-0001 I3`), and toxiproxy-based retry testing showed counters work; a dedicated SIGKILL-between-write-and-commit recovery test would pin the actual dupe behavior end-to-end.
-- ⏳ **Stale roadmap items inherited from earlier sessions:** "2–3 pilot tables repeated on a schedule" in §9.7 (organizational), SBOM / signed release attestations (also §9.7 unchecked). *(Release checksums shipped in v0.7.8 — now checked.)*
+- ⏳ **Stale roadmap items inherited from earlier sessions:** "2–3 pilot tables repeated on a schedule" in §9.7 (organizational; optional automation K2) is now the only unchecked §9.7 item. *(Release checksums shipped v0.7.8; SBOM + signed-release attestations shipped v0.15.0 — both now checked in §9.7.)*
 
 ---
 
