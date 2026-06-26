@@ -20,8 +20,13 @@ set -euo pipefail
 # test binaries (one link instead of N — tests/offline_suite.rs et al.) stay
 # isolated. Falls back to the built-in harness when nextest isn't installed.
 if command -v cargo-nextest >/dev/null 2>&1; then
-  echo "pre-push: cargo nextest run (offline; per-test process isolation)"
-  cargo nextest run
+  # Split for speed: the lib/bin UNIT tests are pure + fast — run them threaded
+  # via the built-in harness. Only the INTEGRATION suites (offline_suite /
+  # live_suite et al.) need nextest's per-test process isolation, so run just
+  # those (`kind(test)`) under nextest. Avoids ~1700 process spawns for the lib.
+  echo "pre-push: cargo test --lib --bins (unit, threaded) + nextest integration (isolated)"
+  cargo test --lib --bins --quiet
+  cargo nextest run -E 'kind(test)'
 else
   echo "pre-push: cargo test --tests (offline; install cargo-nextest for faster isolated runs)"
   cargo test --tests --quiet
