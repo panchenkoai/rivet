@@ -16,7 +16,15 @@
 # gate — run them explicitly with `cargo test -- --ignored`.
 set -euo pipefail
 
-echo "pre-push: cargo test --tests (offline; benches excluded)"
-cargo test --tests --quiet
+# Prefer cargo-nextest: it runs each test in its own process, so the consolidated
+# test binaries (one link instead of N — tests/offline_suite.rs et al.) stay
+# isolated. Falls back to the built-in harness when nextest isn't installed.
+if command -v cargo-nextest >/dev/null 2>&1; then
+  echo "pre-push: cargo nextest run (offline; per-test process isolation)"
+  cargo nextest run
+else
+  echo "pre-push: cargo test --tests (offline; install cargo-nextest for faster isolated runs)"
+  cargo test --tests --quiet
+fi
 
 echo "pre-push: ok"

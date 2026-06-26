@@ -1,0 +1,21 @@
+# cargo-nextest configuration.
+#
+# Why nextest: it runs every `#[test]` in its OWN PROCESS, whereas cargo's
+# built-in harness runs the tests of one binary as threads in one process. That
+# per-test process isolation is what lets us consolidate many test files into a
+# single binary (one link instead of N — see `tests/offline_suite.rs` and the
+# test-link consolidation) WITHOUT a crash / SIGKILL / global-state test
+# poisoning its siblings. It restores the isolation the old
+# one-binary-per-file layout provided, at one link instead of N.
+
+[profile.default]
+# Don't let a hung test block the whole run forever; terminate after two
+# slow-timeout periods and report it as a failure.
+slow-timeout = { period = "120s", terminate-after = 2 }
+retries = 0
+
+[profile.ci]
+# CI tolerates a single flaky retry and reports every failure (no early bail),
+# so one flake doesn't mask the rest of the matrix.
+retries = 1
+fail-fast = false
