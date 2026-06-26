@@ -247,7 +247,7 @@ pub(super) fn finalize_validate_manifest(
     kind: &str,
 ) {
     use crate::destination::WriteCommitProtocol;
-    use crate::pipeline::validate_manifest::verify_at_destination;
+    use crate::pipeline::validate_manifest::{ValidateDepth, verify_at_destination};
 
     let dest = match crate::destination::create_destination(&plan.destination) {
         Ok(d) => d,
@@ -270,7 +270,10 @@ pub(super) fn finalize_validate_manifest(
         return;
     }
 
-    match verify_at_destination(&*dest, "") {
+    // Run finalize always does the full manifest pass (the graded `--depth`
+    // levels are a `rivet validate` operator affordance, not a run-time knob);
+    // this preserves the pre-graded end-of-run behaviour exactly.
+    match verify_at_destination(&*dest, "", ValidateDepth::Full) {
         Ok(mut v) => {
             // Apply the export's `verify` policy: `content` turns size-only
             // parts into a fatal failure (review D).

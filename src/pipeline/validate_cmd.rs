@@ -36,7 +36,7 @@ use crate::config::Config;
 use crate::destination::placeholder::PlaceholderContext;
 use crate::error::Result;
 use crate::pipeline::ManifestVerification;
-use crate::pipeline::validate_manifest::verify_at_destination;
+use crate::pipeline::validate_manifest::{ValidateDepth, verify_at_destination};
 
 /// Output format mirroring the `rivet reconcile` / `rivet repair` pattern.
 pub enum ValidateOutputFormat {
@@ -60,6 +60,12 @@ pub struct ValidateTarget {
     /// `--prefix STRING` — bypass placeholder resolution entirely and
     /// verify exactly this prefix.  Replaces both `prefix` and `path`.
     pub prefix_override: Option<String>,
+    /// `--depth light|sample|full` — the graded verify layer (see
+    /// [`ValidateDepth`]).  Defaults (`ValidateDepth::default()` →
+    /// [`ValidateDepth::Full`]) to the pre-graded behaviour: all five
+    /// sections **plus** the Form B value re-read, so existing callers
+    /// constructing `ValidateTarget::default()` are unchanged.
+    pub depth: ValidateDepth,
 }
 
 impl ValidateTarget {
@@ -152,7 +158,7 @@ pub fn run_validate_command(
             );
             continue;
         }
-        match verify_at_destination(&*dest, "") {
+        match verify_at_destination(&*dest, "", target.depth) {
             Ok(mut v) => {
                 // Apply this export's `verify` policy: `content` fails the
                 // verdict when any part is only size-verified (review D).
@@ -211,7 +217,12 @@ pub fn run_validate_command(
                 // Gated on a found+passed manifest: an absent (legacy pass) or
                 // unreadable manifest is already accounted for above, so re-reading
                 // it here would either break the legacy pass or double-count.
-                if manifest_verified
+                //
+                // Graded depth: Form B is the **only** part-download step, so it
+                // runs at `--depth full` alone.  `light` and `sample` deliberately
+                // skip it — `sample` is "all structural checks, no part bodies".
+                if target.depth == ValidateDepth::Full
+                    && manifest_verified
                     && export.format == crate::config::FormatType::Parquet
                     && let Err(e) =
                         crate::source::value_checksum::validate_manifest_checksums(&*dest, "")
@@ -321,6 +332,10 @@ fn render_pretty(results: &[ExportVerdict], hard_failures: &[String]) {
         let _ = writeln!(h, "── {} ──", r.name);
         let _ = writeln!(h, "  prefix:    {}", r.resolved_prefix);
         let v = &r.verification;
+        // Graded verify layer: surface how deep this pass went so a reader
+        // knows whether a PASSED verdict reconciled parts (sample/full) or
+        // only the manifest + _SUCCESS (light).
+        let _ = writeln!(h, "  depth:     {}", v.depth_level);
         if v.legacy_run {
             let _ = writeln!(
                 h,
@@ -333,9 +348,10 @@ fn render_pretty(results: &[ExportVerdict], hard_failures: &[String]) {
             // A read-error verdict lands here (manifest present but
             // unreadable, or head failed): its `failures` are the
             // operator's only signal, so print them before bailing out
-            // of this export's section.
+            // of this export's section.  Each line carries its stable
+            // `RIVET_VERIFY_*` code in brackets so CI can grep it.
             for failure in &v.failures {
-                let _ = writeln!(h, "  failure:   {}", failure);
+                let _ = writeln!(h, "  failure:   [{}] {}", failure.error_code(), failure);
             }
             continue;
         }
@@ -390,7 +406,10 @@ fn render_pretty(results: &[ExportVerdict], hard_failures: &[String]) {
             } else {
                 "warning:"
             };
-            let _ = writeln!(h, "  {}   {}", label, failure);
+            // Stable `RIVET_VERIFY_*` code in brackets ahead of the human
+            // message so an orchestrator can branch on the code without
+            // parsing the prose.
+            let _ = writeln!(h, "  {}   [{}] {}", label, failure.error_code(), failure);
         }
     }
 
@@ -404,6 +423,37 @@ fn render_pretty(results: &[ExportVerdict], hard_failures: &[String]) {
     let _ = h.flush();
 }
 
+/// Serialize one [`ManifestVerificationFailure`] to JSON with its stable
+/// `RIVET_VERIFY_*` code injected next to `kind`.
+///
+/// The derive emits `{ "kind": "...", <variant fields> }`; this adds `"code"`
+/// so a consumer can branch on the code without re-deriving it from `kind`.
+/// Returns the enriched object (or the unmodified serde value if, impossibly,
+/// the failure didn't serialize as a JSON object).
+fn failure_json(f: &crate::pipeline::ManifestVerificationFailure) -> serde_json::Value {
+    let mut value = serde_json::json!(f);
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "code".to_string(),
+            serde_json::Value::String(f.error_code().to_string()),
+        );
+    }
+    value
+}
+
+/// Serialize a [`ManifestVerification`] to JSON, replacing the derive's plain
+/// `failures` array with one whose entries each carry their `RIVET_VERIFY_*`
+/// `code`.  All other fields (`depth_level`, `passed`, counts, …) ride the
+/// derive unchanged, so the stable wire contract is preserved and only widened.
+fn verification_json(v: &ManifestVerification) -> serde_json::Value {
+    let mut value = serde_json::json!(v);
+    if let Some(obj) = value.as_object_mut() {
+        let failures: Vec<serde_json::Value> = v.failures.iter().map(failure_json).collect();
+        obj.insert("failures".to_string(), serde_json::Value::Array(failures));
+    }
+    value
+}
+
 fn render_json(
     results: &[ExportVerdict],
     hard_failures: &[String],
@@ -414,7 +464,8 @@ fn render_json(
     // glance that "failures means failures".  The per-export
     // `verification.failures` array is the stable wire contract (consumers
     // branch on `failures[].kind`), so advisory entries stay there too — this
-    // is an additive lens over the same data, not a relocation.
+    // is an additive lens over the same data, not a relocation.  Each entry
+    // also carries its stable `RIVET_VERIFY_*` `code` next to `kind`.
     let warnings: Vec<serde_json::Value> = results
         .iter()
         .flat_map(|r| {
@@ -425,7 +476,7 @@ fn render_json(
                 .map(move |f| {
                     serde_json::json!({
                         "export_name": r.name,
-                        "warning": f,
+                        "warning": failure_json(f),
                     })
                 })
         })
@@ -438,7 +489,7 @@ fn render_json(
                 serde_json::json!({
                     "export_name": r.name,
                     "resolved_prefix": r.resolved_prefix,
-                    "verification": r.verification,
+                    "verification": verification_json(&r.verification),
                 })
             })
             .collect::<Vec<_>>(),
@@ -493,6 +544,7 @@ mod tests {
             date: Some(NaiveDate::from_ymd_opt(2026, 5, 21).unwrap()),
             run_id: Some("r-abc123".into()),
             prefix_override: None,
+            ..Default::default()
         };
         let ctx = target.placeholder_context("orders");
         assert_eq!(ctx.date, NaiveDate::from_ymd_opt(2026, 5, 21).unwrap());
@@ -874,5 +926,168 @@ mod tests {
             ValidateTarget::default(), // no --prefix
         )
         .expect("an absent manifest with no pinned --prefix is a legacy pass (exit 0)");
+    }
+
+    // ── graded verify layer (--depth) end-to-end ─────────────────────────
+
+    /// Stage a dataset that passes sections 1-5 (manifest reads + is
+    /// self-consistent, the single part is present at the recorded size,
+    /// `_SUCCESS` matches) **but** records a non-empty `column_checksums`, so
+    /// the Form B re-read is *reachable*. The part body is deliberately NOT
+    /// valid Parquet, so if Form B runs it errors on the Parquet open — making
+    /// "did Form B run?" observable as a pass/fail of the command.
+    fn stage_dataset_form_b_would_fail(prefix: &Path) {
+        std::fs::create_dir_all(prefix).unwrap();
+        // 4-byte non-Parquet body; the manifest records size 4 so the part
+        // reconcile (size-only, empty content_md5) passes.
+        let part_body: &[u8] = b"AAAA";
+        std::fs::write(prefix.join("part-000001.parquet"), part_body).unwrap();
+
+        let mut m = success_manifest(vec![ManifestPart {
+            part_id: 1,
+            path: "part-000001.parquet".into(),
+            rows: 1,
+            size_bytes: part_body.len() as u64,
+            content_fingerprint: "xxh3:1111111111111111".into(),
+            content_md5: String::new(),
+            status: PartStatus::Committed,
+        }]);
+        // Non-empty → Form B does NOT early-return; it proceeds to read the
+        // (garbage) part as Parquet and fail.
+        m.column_checksums = Some(vec![crate::manifest::ColumnChecksum {
+            name: "id".into(),
+            checksum: "0".into(),
+        }]);
+        stage_dataset(prefix, &m);
+    }
+
+    #[test]
+    fn sample_depth_does_not_run_form_b() {
+        // At `--depth sample` the structural checks (parts present, _SUCCESS,
+        // self-consistency) all pass and the Form B value re-read is skipped —
+        // so the command succeeds even though the part body is not real Parquet.
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("out");
+        stage_dataset_form_b_would_fail(&prefix);
+        let cfg = write_cfg(dir.path(), &prefix);
+
+        let report = dir.path().join("report.json");
+        run_validate_command(
+            cfg.to_str().unwrap(),
+            Some("orders"),
+            ValidateOutputFormat::Json(Some(report.to_string_lossy().into_owned())),
+            ValidateTarget {
+                depth: ValidateDepth::Sample,
+                ..Default::default()
+            },
+        )
+        .expect("sample depth skips Form B, so a non-Parquet part still passes");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+        let verification = &json["exports"][0]["verification"];
+        assert_eq!(verification["passed"], true);
+        assert_eq!(verification["parts_verified"], 1, "sample reconciles parts");
+        assert_eq!(verification["depth_level"], "sample");
+    }
+
+    #[test]
+    fn full_depth_runs_form_b() {
+        // The contrast: identical dataset, `--depth full`. Sections 1-5 still
+        // pass (so `manifest_verified` is true and Form B is gated open), Form B
+        // re-reads the part, fails to parse it as Parquet, and the command exits
+        // non-zero. Proves Form B runs at full depth and only at full depth.
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("out");
+        stage_dataset_form_b_would_fail(&prefix);
+        let cfg = write_cfg(dir.path(), &prefix);
+
+        let err = run_validate_command(
+            cfg.to_str().unwrap(),
+            Some("orders"),
+            ValidateOutputFormat::Json(None),
+            ValidateTarget {
+                depth: ValidateDepth::Full,
+                ..Default::default()
+            },
+        )
+        .expect_err("full depth runs Form B, which fails on a non-Parquet part");
+        assert!(
+            format!("{err:#}").contains("1 export(s) failed verification"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn json_report_carries_failure_code_and_depth_level() {
+        // render_json injects the stable `RIVET_VERIFY_*` code next to each
+        // failure's `kind`, and the verdict carries the `depth_level` it ran at.
+        // A missing committed part gives us a fatal failure to inspect.
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("out");
+        let m = success_manifest(vec![ManifestPart {
+            part_id: 1,
+            path: "part-000001.parquet".into(),
+            rows: 10,
+            size_bytes: 4,
+            content_fingerprint: "xxh3:1111111111111111".into(),
+            content_md5: String::new(),
+            status: PartStatus::Committed,
+        }]);
+        stage_dataset(&prefix, &m); // the part itself is never written → PartMissing
+        let cfg = write_cfg(dir.path(), &prefix);
+
+        let report = dir.path().join("report.json");
+        let _ = run_validate_command(
+            cfg.to_str().unwrap(),
+            Some("orders"),
+            ValidateOutputFormat::Json(Some(report.to_string_lossy().into_owned())),
+            ValidateTarget {
+                depth: ValidateDepth::Sample,
+                ..Default::default()
+            },
+        )
+        .expect_err("a missing part fails the command");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+        let verification = &json["exports"][0]["verification"];
+        // depth_level surfaces the level the pass ran at.
+        assert_eq!(verification["depth_level"], "sample");
+        // The PartMissing failure carries BOTH its stable kind and its code.
+        let failure = &verification["failures"][0];
+        assert_eq!(failure["kind"], "part_missing");
+        assert_eq!(failure["code"], "RIVET_VERIFY_PART_MISSING");
+        // The per-variant fields ride alongside (the derive output is widened,
+        // not replaced).
+        assert_eq!(failure["part_id"], 1);
+    }
+
+    #[test]
+    fn json_warning_entry_also_carries_its_code() {
+        // The advisory `warnings` lens carries the code too — an untracked
+        // surplus surfaces `RIVET_VERIFY_UNTRACKED_OBJECT` without flipping exit.
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("out");
+        stage_dataset(&prefix, &success_manifest(Vec::new()));
+        std::fs::write(prefix.join("rogue.parquet"), b"XX").unwrap();
+        let cfg = write_cfg(dir.path(), &prefix);
+
+        let report = dir.path().join("report.json");
+        run_validate_command(
+            cfg.to_str().unwrap(),
+            Some("orders"),
+            ValidateOutputFormat::Json(Some(report.to_string_lossy().into_owned())),
+            ValidateTarget::default(),
+        )
+        .expect("advisory untracked surplus must not flip the exit code");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+        let warning = &json["warnings"][0]["warning"];
+        assert_eq!(warning["kind"], "untracked_object");
+        assert_eq!(warning["code"], "RIVET_VERIFY_UNTRACKED_OBJECT");
+        // And the default depth (full) is recorded on the verdict.
+        assert_eq!(json["exports"][0]["verification"]["depth_level"], "full");
     }
 }

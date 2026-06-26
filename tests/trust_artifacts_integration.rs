@@ -28,8 +28,8 @@ use rivet::manifest::{
 };
 use rivet::pipeline::{
     ManifestBuilder, ManifestVerification, ManifestVerificationFailure, RunReport, RunSummary,
-    WriteOutcome, build_resume_plan, report_dir, verify_at_destination, write_manifest,
-    write_run_report,
+    ValidateDepth, WriteOutcome, build_resume_plan, report_dir, verify_at_destination,
+    write_manifest, write_run_report,
 };
 use rivet::pipeline::{QuarantineReason, ResumeDecision, UntrackedDecision};
 use rivet::state::{SchemaColumn, schema_fingerprint};
@@ -1717,7 +1717,8 @@ fn verify_at_destination_certifies_a_clean_writer_output() {
     let parts = parts_with_payloads(payloads);
     let dest = lay_out_clean_dataset(dir.path(), &parts, payloads);
 
-    let v: ManifestVerification = verify_at_destination(dest.as_writer(), "").unwrap();
+    let v: ManifestVerification =
+        verify_at_destination(dest.as_writer(), "", ValidateDepth::Full).unwrap();
     assert!(v.manifest_found);
     assert!(!v.legacy_run);
     assert!(v.manifest_self_consistent);
@@ -1739,7 +1740,7 @@ fn verify_at_destination_legacy_run_when_manifest_absent() {
     std::fs::write(dir.path().join("part-000001.parquet"), b"data").unwrap();
     let dest_proxy = local_dest(dir.path());
 
-    let v = verify_at_destination(dest_proxy.as_writer(), "").unwrap();
+    let v = verify_at_destination(dest_proxy.as_writer(), "", ValidateDepth::Full).unwrap();
     assert!(!v.manifest_found);
     assert!(v.legacy_run);
     assert!(v.failures.is_empty(), "legacy is a label, not a failure");
@@ -1760,7 +1761,7 @@ fn verify_at_destination_flags_missing_part_with_part_id() {
     let dest = lay_out_clean_dataset(dir.path(), &parts, payloads);
     std::fs::remove_file(dir.path().join(&parts[1].path)).unwrap();
 
-    let v = verify_at_destination(dest.as_writer(), "").unwrap();
+    let v = verify_at_destination(dest.as_writer(), "", ValidateDepth::Full).unwrap();
     assert!(!v.passed);
     assert_eq!(v.parts_verified, 1);
     assert_eq!(v.parts_failed, 1);
@@ -1783,7 +1784,7 @@ fn verify_at_destination_flags_size_drift_with_expected_and_actual() {
     // recorded `size_bytes`.
     std::fs::write(dir.path().join(&parts[0].path), b"shorter").unwrap();
 
-    let v = verify_at_destination(dest.as_writer(), "").unwrap();
+    let v = verify_at_destination(dest.as_writer(), "", ValidateDepth::Full).unwrap();
     assert!(!v.passed);
     let mismatch = v.failures.iter().find_map(|f| match f {
         ManifestVerificationFailure::PartSizeMismatch {
@@ -1817,7 +1818,7 @@ fn verify_at_destination_flags_stale_success_marker_after_manifest_rewrite() {
     std::fs::write(dir.path().join(MANIFEST_FILENAME), &body).unwrap();
     // Note: _SUCCESS file is NOT updated — it still carries the prior fp.
 
-    let v = verify_at_destination(dest.as_writer(), "").unwrap();
+    let v = verify_at_destination(dest.as_writer(), "", ValidateDepth::Full).unwrap();
     assert!(!v.passed);
     assert!(
         v.failures
@@ -1845,7 +1846,7 @@ fn verify_at_destination_tolerates_absent_success_marker_for_failed_run() {
         "writer must skip _SUCCESS for Failed status"
     );
 
-    let v = verify_at_destination(dest_proxy.as_writer(), "").unwrap();
+    let v = verify_at_destination(dest_proxy.as_writer(), "", ValidateDepth::Full).unwrap();
     assert!(v.manifest_found);
     assert!(
         !v.success_marker_consistent,
@@ -1866,7 +1867,7 @@ fn verify_at_destination_flags_untracked_object_but_keeps_passed_true() {
     let dest = lay_out_clean_dataset(dir.path(), &parts, payloads);
     std::fs::write(dir.path().join("rogue-leftover.parquet"), b"X").unwrap();
 
-    let v = verify_at_destination(dest.as_writer(), "").unwrap();
+    let v = verify_at_destination(dest.as_writer(), "", ValidateDepth::Full).unwrap();
     assert!(
         v.passed,
         "tracked parts and marker pass — surplus is informational"
@@ -1888,7 +1889,7 @@ fn verify_at_destination_serialises_failures_with_kind_tag_for_consumers() {
     let dest = lay_out_clean_dataset(dir.path(), &parts, payloads);
     std::fs::remove_file(dir.path().join(&parts[0].path)).unwrap();
 
-    let v = verify_at_destination(dest.as_writer(), "").unwrap();
+    let v = verify_at_destination(dest.as_writer(), "", ValidateDepth::Full).unwrap();
     let json = serde_json::to_value(&v).unwrap();
     let failures = json["failures"].as_array().expect("failures is an array");
     assert!(!failures.is_empty(), "must surface at least one failure");
@@ -1923,6 +1924,7 @@ fn validation_outcome_in_summary_json_carries_manifest_subobject_when_set() {
         manifest_self_consistent: true,
         passed: true,
         failures: Vec::new(),
+        depth_level: ValidateDepth::Full.label().to_string(),
     });
 
     let out = write_run_report(cfg.to_str().unwrap(), &s).unwrap();
