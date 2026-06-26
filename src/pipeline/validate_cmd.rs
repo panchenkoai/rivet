@@ -187,7 +187,10 @@ pub fn run_validate_command(
                 // CDC-specific: re-read the parts and confirm `__pos` stayed in
                 // source-log order (no reorder / no part-boundary overlap). The
                 // manifest check above already covered per-part MD5 / size / _SUCCESS.
-                if export.mode == crate::config::ExportMode::Cdc
+                // Full-depth only — like Form B below it downloads every part, so a
+                // light/sample run skips it (keeps the depth contract consistent).
+                if target.depth == ValidateDepth::Full
+                    && export.mode == crate::config::ExportMode::Cdc
                     && export.format == crate::config::FormatType::Parquet
                 {
                     match crate::source::cdc::validate::check_positions(&*dest, "") {
