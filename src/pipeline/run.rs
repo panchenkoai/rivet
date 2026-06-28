@@ -492,8 +492,17 @@ pub(crate) fn run_waves(config_path: &str, force: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Compact per-export rendering when more than one export runs.
-    let prev_multi = MULTI_EXPORT_MODE.swap(total > 1, AtomicOrdering::Relaxed);
+    // `parallel_export_processes: true` opts into within-wave parallelism: each
+    // wave's exports run as concurrent child processes (per-child governor keeps
+    // each one source-safe), the call blocks until all exit = the wave barrier.
+    // Default stays sequential.
+    let parallel = config.parallel_export_processes;
+
+    // Compact per-export rendering for the SEQUENTIAL path only. The parallel
+    // (subprocess) path renders the parent card stack itself and each child sees
+    // `exports.len() == 1`, so the flag must stay clear there — matching `run`'s
+    // parallel-processes branch.
+    let prev_multi = MULTI_EXPORT_MODE.swap(total > 1 && !parallel, AtomicOrdering::Relaxed);
     struct ResetMulti(bool);
     impl Drop for ResetMulti {
         fn drop(&mut self) {
@@ -506,6 +515,12 @@ pub(crate) fn run_waves(config_path: &str, force: bool) -> Result<()> {
     let started_at = chrono::Utc::now();
     let mut summaries: Vec<RunSummary> = Vec::with_capacity(total);
     let mut failures: Vec<anyhow::Error> = Vec::new();
+    // Parallel-path accumulators: per-child metrics live in the state DB, so the
+    // parent reconstructs one aggregate from them after every wave has joined.
+    let mut all_exports: Vec<&ExportConfig> = Vec::with_capacity(total);
+    let mut child_failures: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut combined_stderr = String::new();
 
     for (wave, exports) in &by_wave {
         let label = if *wave == u32::MAX {
@@ -513,41 +528,79 @@ pub(crate) fn run_waves(config_path: &str, force: bool) -> Result<()> {
         } else {
             wave.to_string()
         };
-        log::info!(
-            "apply: wave {} — {} export(s), sequential",
-            label,
-            exports.len()
-        );
-        // The wave barrier is implicit while sequential: this loop body fully
-        // drains the wave before the next iteration. It becomes load-bearing
-        // once within-wave parallelism lands.
-        for export in exports {
-            let (res, summary) =
-                job::run_export_job(config_path, &config, export, &state, &config_dir, &opts);
-            if let Err(e) = res {
+        // The wave barrier is the loop itself: each strategy below fully drains
+        // the wave (the sequential loop, or the blocking child-process join)
+        // before the next iteration starts the next wave.
+        if parallel {
+            log::info!(
+                "apply: wave {} — {} export(s), parallel (subprocess)",
+                label,
+                exports.len()
+            );
+            let slice: Vec<&ExportConfig> = exports.to_vec();
+            let (result, cf, stderr_dump) = parallel_children::run_exports_as_child_processes(
+                config_path,
+                &slice,
+                false,
+                false,
+                false,
+                force,
+                None,
+            );
+            child_failures.extend(cf);
+            combined_stderr.push_str(&stderr_dump);
+            all_exports.extend(slice);
+            if let Err(e) = result {
                 failures.push(e);
             }
-            summaries.push(summary);
+        } else {
+            log::info!(
+                "apply: wave {} — {} export(s), sequential",
+                label,
+                exports.len()
+            );
+            for export in exports {
+                let (res, summary) =
+                    job::run_export_job(config_path, &config, export, &state, &config_dir, &opts);
+                if let Err(e) = res {
+                    failures.push(e);
+                }
+                summaries.push(summary);
+            }
         }
     }
 
     let finished_at = chrono::Utc::now();
     if total > 1 {
-        let entries: Vec<_> = summaries
-            .iter()
-            .map(aggregate::entry_from_summary)
-            .collect();
+        let entries = if parallel {
+            aggregate::collect_child_entries(&state, &all_exports, started_at, &child_failures)
+        } else {
+            summaries
+                .iter()
+                .map(aggregate::entry_from_summary)
+                .collect()
+        };
         let agg = aggregate::build(
             entries,
             started_at,
             finished_at,
             Some(config_path),
-            "wave-sequential",
+            if parallel {
+                "wave-parallel-processes"
+            } else {
+                "wave-sequential"
+            },
         );
         aggregate::print(&agg);
-        if let Ok(state) = StateStore::open(config_path) {
-            aggregate::persist(&state, &agg, None);
-        }
+        aggregate::persist(&state, &agg, None);
+    }
+    // Captured child stderr prints AFTER the aggregate (parallel path only) so
+    // the run summary stays under the card stack, logs below — matching `run`.
+    if !combined_stderr.is_empty() {
+        use std::io::Write;
+        let mut h = std::io::stderr().lock();
+        let _ = h.write_all(combined_stderr.as_bytes());
+        let _ = h.flush();
     }
 
     if !failures.is_empty() {
