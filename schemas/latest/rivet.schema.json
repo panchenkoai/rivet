@@ -495,6 +495,22 @@
           "minimum": 0,
           "default": 1
         },
+        "wave": {
+          "description": "Advisory execution wave (1 = highest priority, run first). Written by\n`rivet plan` from the source-aware prioritization score (see ADR-0006)\nand consumed by `rivet apply`, which runs exports wave-by-wave in\nascending order. `None` = unscheduled (apply treats it as the last wave).\nOperators may hand-edit it; a later `rivet plan` refreshes it in place.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "parallel_safe": {
+          "description": "Whether this export is cheap enough to run concurrently with its\nwave-mates under `rivet apply --parallel-export-processes`. Written by\n`rivet plan` (true when the source-aware cost class is `Low`, i.e.\n< ~100K rows); a heavier table already chunk-parallelizes internally, so\ntwo of them at once would overload the source. `None`/`false` → the\nexport runs alone within its wave. Operators may hand-edit it; a later\n`rivet plan` refreshes it in place.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "time_column": {
           "type": [
             "string",
