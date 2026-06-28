@@ -333,15 +333,34 @@ impl PlanArtifact {
         } else {
             self.export_name.clone()
         };
-        format!(
-            "  {:<5} {:<width$}  {:<11}  {:<12}  {}",
-            wave,
-            name,
-            self.strategy.to_string(),
-            rows,
-            self.diagnostics.verdict,
-            width = name_width
+        Self::compact_row(
+            &wave,
+            &name,
+            &self.strategy.to_string(),
+            &rows,
+            &self.diagnostics.verdict,
+            name_width,
         )
+    }
+
+    /// Header row for the compact multi-export plan table, matching
+    /// [`PlanArtifact::summary_line`]'s columns — both go through
+    /// [`PlanArtifact::compact_row`], so the geometry lives in one place and
+    /// widening a column can't silently misalign the table.
+    pub fn summary_header(name_width: usize) -> String {
+        Self::compact_row("Wave", "Export", "Strategy", "Rows", "Verdict", name_width)
+    }
+
+    /// The shared column geometry of the compact plan table (header + rows).
+    fn compact_row(
+        wave: &str,
+        export: &str,
+        strategy: &str,
+        rows: &str,
+        verdict: &str,
+        name_width: usize,
+    ) -> String {
+        format!("  {wave:<5} {export:<name_width$}  {strategy:<11}  {rows:<12}  {verdict}")
     }
 
     /// Pretty-print a human-readable plan summary to stdout.

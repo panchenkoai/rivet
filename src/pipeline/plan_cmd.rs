@@ -129,7 +129,11 @@ pub fn run_plan_command(
     for a in &artifacts {
         if let Some(p) = a.prioritization.as_ref() {
             let rec = &p.export_recommendation;
-            let parallel_safe = rec.cost_class == crate::plan::CostClass::Low;
+            // ...and not flagged `isolate_on_source` by the campaign (a shared,
+            // contended source group) — the campaign owns the "run alone" call,
+            // so a cheap export there still runs on its own.
+            let parallel_safe =
+                rec.cost_class == crate::plan::CostClass::Low && !rec.isolate_on_source;
             fields.insert(
                 a.export_name.clone(),
                 vec![
@@ -498,14 +502,7 @@ fn print_compact_summary(artifacts: &[PlanArtifact], config_path: &str) {
         config_path
     );
     println!();
-    println!(
-        "  {:<5} {:<width$}  {:<11}  {:<12}  Verdict",
-        "Wave",
-        "Export",
-        "Strategy",
-        "Rows",
-        width = name_w
-    );
+    println!("{}", PlanArtifact::summary_header(name_w));
     for a in &order {
         println!("{}", a.summary_line(name_w));
     }
@@ -513,13 +510,6 @@ fn print_compact_summary(artifacts: &[PlanArtifact], config_path: &str) {
     println!("  Full detail for one export:  rivet plan -c <config> --export <name>");
 }
 
-/// Write `wave: N` into each export of the YAML config **in place**, preserving
-/// comments / structure / field order — a surgical text edit, not a serde
-/// round-trip (which would drop the operator's comments and `init` rationale).
-/// The fresh `wave:` is inserted right after each export's `- name:`; an
-/// existing `wave:` for that export is replaced. Only the standard block-style
-/// `- name: …` layout (what `rivet init` emits) is handled; an export whose
-/// name is not found in the file is left untouched.
 /// Per-export YAML fields that `plan` records in place (`wave`, `parallel_safe`),
 /// keyed by export name → ordered `(field, value)` pairs.
 type ExportFields = HashMap<String, Vec<(&'static str, String)>>;
