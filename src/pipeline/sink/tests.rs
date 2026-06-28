@@ -410,6 +410,7 @@ fn minimal_sink() -> ExportSink {
         parquet_row_group_rows: None,
         column_checksums: std::collections::BTreeMap::new(),
         checksum_key_col: None,
+        row_progress: None,
     }
 }
 

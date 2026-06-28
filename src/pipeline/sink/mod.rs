@@ -98,6 +98,20 @@ pub(crate) struct ExportSink {
     /// checksum), resolved in `on_schema`. `None` = un-keyed (full export, or a
     /// stripped/synthetic cursor not present in the dest batch).
     pub(in crate::pipeline) checksum_key_col: Option<usize>,
+    /// Per-batch row-progress feed (chunked exports). `None` for paths that
+    /// don't drive a progress bar.
+    pub(in crate::pipeline) row_progress: Option<RowProgress>,
+}
+
+/// Per-batch progress feed for chunked exports: ticks the export's shared
+/// progress bar with the running row count *during* a chunk's read, so a wide
+/// first chunk (e.g. 250k rows / 90 MB) doesn't sit at "0 rows" for seconds and
+/// read as idle. `streamed` is shared across the export's chunk workers (each
+/// batch adds to it); `last_tick` throttles the bar/IPC refresh to ~8/s.
+pub(in crate::pipeline) struct RowProgress {
+    pub(in crate::pipeline) handle: crate::pipeline::progress::ChunkProgressHandle,
+    pub(in crate::pipeline) streamed: Arc<std::sync::atomic::AtomicI64>,
+    pub(in crate::pipeline) last_tick: std::time::Instant,
 }
 
 impl ExportSink {
@@ -146,7 +160,23 @@ impl ExportSink {
             parquet_row_group_rows: None,
             column_checksums: std::collections::BTreeMap::new(),
             checksum_key_col: None,
+            row_progress: None,
         })
+    }
+
+    /// Attach a per-batch row-progress feed (see [`RowProgress`]). Returns self
+    /// so a chunk worker can `ExportSink::new(plan)?.with_row_progress(...)`.
+    pub(in crate::pipeline) fn with_row_progress(
+        mut self,
+        handle: crate::pipeline::progress::ChunkProgressHandle,
+        streamed: Arc<std::sync::atomic::AtomicI64>,
+    ) -> Self {
+        self.row_progress = Some(RowProgress {
+            handle,
+            streamed,
+            last_tick: std::time::Instant::now(),
+        });
+        self
     }
 
     fn schema_without_internal(schema: &Schema, name: &str) -> Result<SchemaRef> {
@@ -450,6 +480,19 @@ impl ExportSink {
     /// Core batch processing: track quality/shape, enrich, write. Called after memory check.
     fn on_batch_inner(&mut self, dest_batch: &RecordBatch) -> Result<()> {
         self.total_rows += dest_batch.num_rows();
+        // Feed the running row count to the progress bar *during* the read, not
+        // only when the chunk completes (throttled to ~8/s).
+        if let Some(rp) = self.row_progress.as_mut() {
+            let n = dest_batch.num_rows() as i64;
+            let total = rp
+                .streamed
+                .fetch_add(n, std::sync::atomic::Ordering::Relaxed)
+                + n;
+            if rp.last_tick.elapsed() >= std::time::Duration::from_millis(120) {
+                rp.handle.set_rows(total);
+                rp.last_tick = std::time::Instant::now();
+            }
+        }
         self.part_rows += dest_batch.num_rows();
         self.track_quality(dest_batch);
         self.track_shape(dest_batch);

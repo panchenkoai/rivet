@@ -79,6 +79,9 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     let state_ref = state.state_ref().clone();
     let run_id_arc = std::sync::Arc::new(run_id.clone());
     let agg_rows = std::sync::atomic::AtomicI64::new(0);
+    // Rows streamed across ALL tasks (completed + in-flight) — drives the
+    // per-batch progress feed so the bar ticks during a chunk's read.
+    let streamed_rows = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
     // Per-attempt retry counter bumped from inside each worker's retry
     // loop and folded into `summary.retries` after the scope joins, so the
     // console summary card / `rivet metrics` / `export_metrics.retries`
@@ -135,6 +138,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
             let fmt_label_w = fmt_label;
             let comp_label_w = comp_label;
             let pb_w = pb_cp_handle.clone();
+            let streamed_rows = std::sync::Arc::clone(&streamed_rows);
 
             s.spawn(move || {
                 let shared_destination = shared_destination;
@@ -229,7 +233,11 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                 }
                             };
 
-                            let mut sink = ExportSink::new(&plan_w)?;
+                            let mut sink = ExportSink::new(&plan_w)?
+                                .with_row_progress(
+                                    pb_w.clone(),
+                                    std::sync::Arc::clone(&streamed_rows),
+                                );
 
                             let export_attempt = (|| -> Result<(
                                 usize,
@@ -379,7 +387,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                 "after_chunk_complete",
                                 chunk_index,
                             );
-                            pb_w.inc(agg_rows.load(Ordering::Relaxed));
+                            pb_w.inc(streamed_rows.load(Ordering::Relaxed));
                         }
                         Err(e) => {
                             let msg = crate::redact::redact_error(&e);
