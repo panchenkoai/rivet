@@ -78,6 +78,37 @@ fn print_json_summary(agg: &crate::state::RunAggregate) {
     }
 }
 
+/// Emit captured child stderr from a parallel run. It's verbose — every child's
+/// full run card — so write it to a timestamped log beside the config and print
+/// a one-line pointer, instead of flooding the console with all N exports'
+/// stderr. Falls back to the inline console dump if the file can't be written.
+fn emit_child_stderr(dump: &str, dir: &Path) {
+    if dump.is_empty() {
+        return;
+    }
+    let name = format!(
+        "rivet-child-stderr-{}.log",
+        chrono::Utc::now().format("%Y%m%dT%H%M%S")
+    );
+    let path = dir.join(name);
+    match std::fs::write(&path, dump) {
+        Ok(()) => println!(
+            "\n  child stderr (full per-export logs) → {}",
+            path.display()
+        ),
+        Err(e) => {
+            log::warn!(
+                "could not write child stderr to {} ({e}); printing inline",
+                path.display()
+            );
+            use std::io::Write;
+            let mut h = std::io::stderr().lock();
+            let _ = h.write_all(dump.as_bytes());
+            let _ = h.flush();
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // CLI fan-in; surface stays stable per ADR-0013
 pub fn run(
     config_path: &str,
@@ -214,15 +245,10 @@ pub fn run(
                 e
             ),
         }
-        // Captured child stderr is printed AFTER the aggregate so the run
-        // summary stays immediately under the card stack — verbose log
-        // output sits below for triage when needed.
-        if !stderr_dump.is_empty() {
-            use std::io::Write;
-            let mut h = std::io::stderr().lock();
-            let _ = h.write_all(stderr_dump.as_bytes());
-            let _ = h.flush();
-        }
+        // Captured child stderr (verbose per-export cards) goes to a file
+        // artifact beside the config, with a one-line console pointer — the run
+        // summary stays clean instead of flooding with every child's stderr.
+        emit_child_stderr(&stderr_dump, &config_dir);
         return result;
     }
 
@@ -640,14 +666,9 @@ pub(crate) fn run_waves(
         aggregate::print(&agg);
         aggregate::persist(&state, &agg, None);
     }
-    // Captured child stderr prints AFTER the aggregate (parallel path only) so
-    // the run summary stays under the card stack, logs below — matching `run`.
-    if !combined_stderr.is_empty() {
-        use std::io::Write;
-        let mut h = std::io::stderr().lock();
-        let _ = h.write_all(combined_stderr.as_bytes());
-        let _ = h.flush();
-    }
+    // Captured child stderr (verbose per-export cards, parallel path only) goes
+    // to a file artifact beside the config, with a one-line console pointer.
+    emit_child_stderr(&combined_stderr, &config_dir);
 
     if !failures.is_empty() {
         let primary_idx = representative_failure_idx(&failures).unwrap();
