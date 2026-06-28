@@ -156,7 +156,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             output,
             format,
         } => dispatch_plan(config, export, params, output, format),
-        Commands::Apply { plan_file, force } => pipeline::run_apply_command(&plan_file, force),
+        Commands::Apply {
+            plan_file,
+            parallel_export_processes,
+            resume,
+            force,
+        } => pipeline::run_apply_command(&plan_file, force, parallel_export_processes, resume),
         Commands::Validate {
             config,
             export,

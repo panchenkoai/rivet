@@ -155,18 +155,18 @@ const MIN_MODE_COL: usize = 7;
 ///   no-ops or, worse, line-wrap around long error messages and corrupt the
 ///   anchor — so we instead print each card exactly once when it
 ///   transitions to its terminal state.
-pub(crate) fn run_ui(rx: Receiver<UiMessage>) {
+pub(crate) fn run_ui(rx: Receiver<UiMessage>, name_floor: usize) {
     let width = pick_width();
     if console::Term::stderr().features().is_attended() {
-        run_ui_interactive(rx, width);
+        run_ui_interactive(rx, width, name_floor);
     } else {
-        run_ui_linear(rx, width);
+        run_ui_linear(rx, width, name_floor);
     }
 }
 
 /// In-place card-stack renderer for tty stderr.
-fn run_ui_interactive(rx: Receiver<UiMessage>, width: usize) {
-    let mut renderer = Renderer::new(width);
+fn run_ui_interactive(rx: Receiver<UiMessage>, width: usize, name_floor: usize) {
+    let mut renderer = Renderer::new(width, name_floor);
 
     loop {
         match rx.recv_timeout(IDLE_REDRAW_INTERVAL) {
@@ -197,8 +197,8 @@ fn run_ui_interactive(rx: Receiver<UiMessage>, width: usize) {
 /// Linear renderer for non-tty stderr.  Each card is printed once when it
 /// reaches its terminal state — there is no in-place redraw, so output is
 /// safe to `tee` / capture without phantom duplicates.
-fn run_ui_linear(rx: Receiver<UiMessage>, width: usize) {
-    let mut renderer = Renderer::new(width);
+fn run_ui_linear(rx: Receiver<UiMessage>, width: usize, name_floor: usize) {
+    let mut renderer = Renderer::new(width, name_floor);
     let mut printed: HashSet<String> = HashSet::new();
 
     while let Ok(msg) = rx.recv() {
@@ -227,7 +227,7 @@ fn run_ui_linear(rx: Receiver<UiMessage>, width: usize) {
 /// Append every card that has reached its terminal state but hasn't been
 /// printed yet to stderr, preserving the `Started`-event observation order.
 fn flush_finished_cards(renderer: &Renderer, printed: &mut HashSet<String>, width: usize) {
-    let (name_col, mode_col) = column_widths(&renderer.cards);
+    let (name_col, mode_col) = column_widths(&renderer.cards, renderer.name_floor);
     let mut out = String::new();
     for name in &renderer.order {
         if printed.contains(name) {
@@ -256,8 +256,8 @@ fn flush_finished_cards(renderer: &Renderer, printed: &mut HashSet<String>, widt
 /// Pick stable column widths for the name and mode columns by combining the
 /// observed maxima with `MIN_NAME_COL` / `MIN_MODE_COL` floors so the layout
 /// stays aligned even when only short names / modes have been observed yet.
-fn column_widths(cards: &HashMap<String, CardState>) -> (usize, usize) {
-    let mut name = 0usize;
+fn column_widths(cards: &HashMap<String, CardState>, name_floor: usize) -> (usize, usize) {
+    let mut name = name_floor;
     let mut mode = 0usize;
     for c in cards.values() {
         name = name.max(c.export_name.chars().count());
@@ -278,15 +278,19 @@ struct Renderer {
     /// repaint in place rather than appending a fresh card stack each time.
     last_drawn_lines: usize,
     width: usize,
+    /// Lower bound on the name column, seeded from the known export names so the
+    /// table is aligned from the first redraw (not widening as long names arrive).
+    name_floor: usize,
 }
 
 impl Renderer {
-    fn new(width: usize) -> Self {
+    fn new(width: usize, name_floor: usize) -> Self {
         Self {
             cards: HashMap::new(),
             order: Vec::new(),
             last_drawn_lines: 0,
             width,
+            name_floor,
         }
     }
 
@@ -399,7 +403,7 @@ impl Renderer {
             out.push('\r');
         }
 
-        let (name_col, mode_col) = column_widths(&self.cards);
+        let (name_col, mode_col) = column_widths(&self.cards, self.name_floor);
         let mut new_lines = 0usize;
         for name in &self.order {
             if let Some(card) = self.cards.get(name) {
@@ -596,12 +600,14 @@ fn render_final_line(
         return sanitize_terminal(cause);
     }
     let rss = if peak_rss_mb > 0 {
-        format!("  RSS {} MB", fmt_thousands(peak_rss_mb))
+        format!("  RSS {:>3} MB", fmt_thousands(peak_rss_mb))
     } else {
         String::new()
     };
+    // Fixed-width columns so values line up into a table regardless of magnitude:
+    // rows/files/bytes/duration are right-aligned (numbers read down a column).
     format!(
-        "{} rows  {} files  {}  {}{}",
+        "{:>11} rows  {:>3} files  {:>9}  {:>8}{}",
         fmt_thousands(total_rows),
         fmt_thousands(files_produced as i64),
         format_bytes(bytes_written),
@@ -695,7 +701,8 @@ mod tests {
         assert!(s.contains("123,456 rows"));
         assert!(s.contains("5 files"));
         assert!(s.contains("9.4s"));
-        assert!(s.contains("RSS 30 MB"));
+        // Columns are right-padded for table alignment, so check parts.
+        assert!(s.contains("RSS") && s.contains("30 MB"));
     }
 
     #[test]
@@ -802,7 +809,7 @@ mod tests {
         assert!(line.contains("100 rows"));
         assert!(line.contains("1 files"));
         assert!(line.contains("1.2s"));
-        assert!(line.contains("RSS 30 MB"));
+        assert!(line.contains("RSS") && line.contains("30 MB"));
     }
 
     #[test]

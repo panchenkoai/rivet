@@ -52,7 +52,83 @@ pub(crate) fn strip_select_star_from(base_query: &str) -> Option<&str> {
         .and_then(|s| s.strip_prefix('*'))
         .map(str::trim_start)
         .and_then(|s| strip_prefix_ascii_ci(s, "from"))?;
-    let rest = after.trim_start();
+    parse_bare_table_ident(after.trim_start())
+}
+
+/// Like [`strip_select_star_from`] but accepts an explicit **plain column-list**
+/// projection (`SELECT id, title, … FROM <ident>`) — the shape `rivet init`
+/// scaffolds — not just `*`.
+///
+/// For a chunk-boundary probe (`min`/`max`/null-count/row-count of the chunk
+/// column) the projection is irrelevant: with **no `WHERE`** the row set is the
+/// whole table, so the column's extremes — and the row count — are identical
+/// whether read through the wide projection or straight off the table. Reading
+/// off the table lets the planner use the index instead of materialising every
+/// wide row into a temp-file spill (the wrap measured ~3.2 GB of temp_files on
+/// an 8.6 GB table).
+///
+/// Acceptance stays strict so a filtered / derived / joined / de-duplicated
+/// query is never rewritten to the bare table: the projection must be bare
+/// column references only — any `(` (function / subquery), quote, `DISTINCT`,
+/// or other token → `None`; any trailing clause after the table → `None`. On
+/// `None` the caller wraps exactly as before.
+pub(crate) fn strip_simple_projection_from(base_query: &str) -> Option<&str> {
+    let trimmed = base_query.trim();
+    let after_select = strip_prefix_ascii_ci(trimmed, "select").map(str::trim_start)?;
+    // Split on the first whitespace-bounded `from`. The projection is validated
+    // below to hold no `(`/quote, so that first `from` is necessarily the
+    // table's FROM (a subquery's `from` would sit behind a `(`; a column named
+    // `from` would need quoting) — never one inside a literal or derived table.
+    let from_at = find_from_keyword(after_select)?;
+    let projection = after_select[..from_at].trim();
+    if !is_plain_column_list(projection) {
+        return None;
+    }
+    parse_bare_table_ident(after_select[from_at + "from".len()..].trim_start())
+}
+
+/// Byte offset of the first whitespace/boundary-delimited `from` keyword
+/// (ASCII case-insensitive), or `None`. Only meaningful once the preceding text
+/// is known paren/quote-free (see [`strip_simple_projection_from`]).
+fn find_from_keyword(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i + 4 <= bytes.len() {
+        if s[i..i + 4].eq_ignore_ascii_case("from")
+            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+            && (i + 4 == bytes.len() || bytes[i + 4].is_ascii_whitespace())
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// A non-empty list of bare column references: only ASCII alphanumerics, `_`,
+/// `.`, `,`, `*`, and whitespace — and not a leading `DISTINCT` (which would
+/// change the row count / set, breaking the dense-chunk count and the
+/// whole-table equivalence the fast path relies on). Functions (`(`), quoted
+/// idents / string literals, and any other punctuation → `false`.
+fn is_plain_column_list(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    if let Some(rest) = strip_prefix_ascii_ci(s, "distinct")
+        && rest.starts_with(|c: char| c.is_whitespace())
+    {
+        return false;
+    }
+    s.chars().all(|c| {
+        c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ',' | '*' | ' ' | '\t' | '\n' | '\r')
+    })
+}
+
+/// Validate `after_from` is a bare `[schema.]table` identifier with no trailing
+/// clause (WHERE/JOIN/comma/alias/semicolon), returning it. Shared by the `*`
+/// and column-list table-form recognisers so the strictness lives in one place.
+fn parse_bare_table_ident(after_from: &str) -> Option<&str> {
+    let rest = after_from.trim_start();
     let end = rest
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
         .unwrap_or(rest.len());
@@ -101,9 +177,33 @@ pub(crate) fn aggregate_sql(
     base_query: &str,
 ) -> String {
     let q = quote_ident(source_type, col);
-    match strip_select_star_from(base_query) {
+    match strip_simple_projection_from(base_query) {
         Some(table_ident) => format!("SELECT {agg}({q}) FROM {table_ident}"),
         None => format!("SELECT {agg}({q}) FROM ({base_query}) AS _rivet"),
+    }
+}
+
+/// Presence probe for NULL chunk keys: one row iff `<col>` has any NULL. Replaces
+/// the old `COUNT(*) - COUNT(col)` full count in `bail_if_null_keyed` — the DB
+/// stops at the first NULL, and for a NOT NULL column the planner returns nothing
+/// without scanning, so the cold full-index scan that count forced (the seconds
+/// of upfront idle on a large chunked export) is gone. A nullable column with
+/// zero NULLs still yields no row, preserving the "detect on live data" intent.
+///
+/// Same bare-table-vs-wrap shape as [`aggregate_sql`]; `col` is dialect-quoted
+/// here. MSSQL uses `TOP 1` — the keyset `OFFSET/FETCH` limit form needs an
+/// `ORDER BY` this presence probe has no use for.
+pub(crate) fn null_key_probe_sql(source_type: SourceType, col: &str, base_query: &str) -> String {
+    let from = match strip_simple_projection_from(base_query) {
+        Some(table_ident) => table_ident.to_string(),
+        None => format!("({base_query}) AS _rivet_nullprobe"),
+    };
+    let q = quote_ident(source_type, col);
+    match source_type {
+        SourceType::Mssql => format!("SELECT TOP 1 1 FROM {from} WHERE {q} IS NULL"),
+        SourceType::Postgres | SourceType::Mysql => {
+            format!("SELECT 1 FROM {from} WHERE {q} IS NULL LIMIT 1")
+        }
     }
 }
 
@@ -199,6 +299,54 @@ mod tests {
     }
 
     #[test]
+    fn strip_simple_projection_accepts_plain_column_lists() {
+        // The shape `rivet init` scaffolds: an explicit column list off a bare
+        // table — the chunk-column probes can read straight off the table.
+        assert_eq!(
+            strip_simple_projection_from("SELECT id, title, body FROM content_items"),
+            Some("content_items")
+        );
+        // Star still works (a superset of strip_select_star_from).
+        assert_eq!(
+            strip_simple_projection_from("SELECT * FROM events"),
+            Some("events")
+        );
+        // Schema-qualified table, dotted columns, mixed case / extra whitespace.
+        assert_eq!(
+            strip_simple_projection_from("select a.x, a.y  from  public.users"),
+            Some("public.users")
+        );
+        // Folded multi-line (YAML `>` block) collapses to one line of columns.
+        assert_eq!(
+            strip_simple_projection_from("SELECT id, a, b, c, d FROM content_items\n"),
+            Some("content_items")
+        );
+    }
+
+    #[test]
+    fn strip_simple_projection_rejects_anything_that_changes_the_row_set() {
+        // WHERE / JOIN / GROUP / trailing clause / `;` — the bare table no
+        // longer matches the query's rows, so the caller must wrap (None).
+        assert!(strip_simple_projection_from("SELECT id FROM t WHERE id > 1").is_none());
+        assert!(
+            strip_simple_projection_from("SELECT a.id FROM t a JOIN u ON a.id = u.id").is_none()
+        );
+        assert!(strip_simple_projection_from("SELECT id FROM t GROUP BY id").is_none());
+        assert!(strip_simple_projection_from("SELECT id FROM t;").is_none());
+        // DISTINCT changes the row count/set (would break the dense-chunk COUNT).
+        assert!(strip_simple_projection_from("SELECT DISTINCT id FROM t").is_none());
+        // A function / expression in the projection — can't reason syntactically.
+        assert!(strip_simple_projection_from("SELECT count(*) FROM t").is_none());
+        assert!(strip_simple_projection_from("SELECT lower(name) FROM t").is_none());
+        // A subquery / derived table: the first `from` is the inner one.
+        assert!(strip_simple_projection_from("SELECT id FROM (SELECT id FROM y) z").is_none());
+        // A string literal in the projection could hide a `from`.
+        assert!(strip_simple_projection_from("SELECT 'from x' FROM t").is_none());
+        // Three-part identifier is not `[schema.]table`.
+        assert!(strip_simple_projection_from("SELECT id FROM a.b.c").is_none());
+    }
+
+    #[test]
     fn aggregate_sql_fast_path_on_table_shortcut() {
         assert_eq!(
             aggregate_sql(
@@ -227,6 +375,32 @@ mod tests {
             aggregate_sql(SourceType::Mysql, "min", "d", "SELECT d FROM t WHERE 1")
                 .contains("min(`d`)")
         );
+    }
+
+    #[test]
+    fn null_key_probe_sql_is_a_presence_probe_not_a_count() {
+        // Bare table / simple projection → probe the table directly (PG `LIMIT 1`).
+        assert_eq!(
+            null_key_probe_sql(SourceType::Postgres, "id", "SELECT id, title FROM orders"),
+            "SELECT 1 FROM orders WHERE \"id\" IS NULL LIMIT 1"
+        );
+        // MSSQL has no LIMIT in this position → TOP 1.
+        assert_eq!(
+            null_key_probe_sql(SourceType::Mssql, "id", "SELECT * FROM orders"),
+            "SELECT TOP 1 1 FROM orders WHERE [id] IS NULL"
+        );
+        // A filtered query can't be reasoned about → wrap, exactly as before.
+        assert_eq!(
+            null_key_probe_sql(
+                SourceType::Postgres,
+                "id",
+                "SELECT id FROM orders WHERE x > 1"
+            ),
+            "SELECT 1 FROM (SELECT id FROM orders WHERE x > 1) AS _rivet_nullprobe \
+             WHERE \"id\" IS NULL LIMIT 1"
+        );
+        // Never a COUNT — that full scan was the whole problem.
+        assert!(!null_key_probe_sql(SourceType::Mysql, "k", "SELECT * FROM t").contains("COUNT"));
     }
 
     #[test]

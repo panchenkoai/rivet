@@ -42,6 +42,8 @@ pub(crate) fn run_chunked_sequential(
     );
 
     let pb = ChunkProgress::new(&plan.export_name, chunks.len());
+    // Per-batch progress feed (single-threaded here, but the sink API is shared).
+    let streamed_rows = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
 
     for (i, (start, end)) in chunks.iter().enumerate() {
         if !resource::check_memory(plan.tuning.memory_threshold_mb) {
@@ -73,7 +75,8 @@ pub(crate) fn run_chunked_sequential(
             end_key: end.to_string(),
         });
 
-        let mut sink = ExportSink::new(plan)?;
+        let mut sink = ExportSink::new(plan)?
+            .with_row_progress(pb.handle(), std::sync::Arc::clone(&streamed_rows));
         src.export(
             // `chunk_query` wraps the base in a subquery → resolve NUMERIC
             // catalog hints from the unwrapped base (`wrapped`).
@@ -186,6 +189,9 @@ pub(crate) fn run_chunked_parallel(
     // that never arrives).
     let finished = AtomicUsize::new(0);
     let agg_rows = std::sync::atomic::AtomicI64::new(0);
+    // Rows streamed across ALL chunks (completed + in-flight) — drives the
+    // per-batch progress feed so the bar ticks during a chunk's read.
+    let streamed_rows = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
     let errors = std::sync::Mutex::new(Vec::<String>::new());
     // PartRecords pushed by workers, drained into record_part post-scope so the
     // I2/M1 → I7 → counters ordering lives once in commit::record_part. Tuple
@@ -336,6 +342,7 @@ pub(crate) fn run_chunked_parallel(
             let shared_fingerprint = &shared_fingerprint;
             let semaphore = &semaphore;
             let pb_thread = pb_handle.clone();
+            let streamed_rows = std::sync::Arc::clone(&streamed_rows);
             let start = *start;
             let end = *end;
             let shared_destination = std::sync::Arc::clone(&shared_destination);
@@ -353,7 +360,10 @@ pub(crate) fn run_chunked_parallel(
                     );
 
                     let mut thread_src = source::create_source(&plan_for_worker.source)?;
-                    let mut sink = ExportSink::new(&plan_for_worker)?;
+                    let mut sink = ExportSink::new(&plan_for_worker)?.with_row_progress(
+                        pb_thread.clone(),
+                        std::sync::Arc::clone(&streamed_rows),
+                    );
                     thread_src.export(
                         &source::ExportRequest::wrapped(
                             &chunk_query,
@@ -401,7 +411,10 @@ pub(crate) fn run_chunked_parallel(
                     }
 
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                    pb_thread.inc(agg_rows.load(Ordering::Relaxed));
+                    // Advance the chunk count; show the streamed-rows total (≥
+                    // agg_rows, monotonic) so the bar never jumps backward from
+                    // the in-flight per-batch updates.
+                    pb_thread.inc(streamed_rows.load(Ordering::Relaxed));
                     log::info!(
                         "export '{}': chunk {}/{} done ({} rows)",
                         export_name,

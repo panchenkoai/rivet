@@ -228,18 +228,19 @@ The JSON artifact (`--format json`) contains:
 
 ## `rivet apply`
 
-Execute a previously-generated plan artifact.
+Execute a sealed plan artifact, **or** run a config's exports wave-by-wave. The mode is chosen by the path's extension:
 
-`rivet apply` deserializes the artifact, validates staleness and cursor integrity, then executes the export using the pre-computed chunk boundaries from the artifact — no `SELECT min/max` queries are run against the source.
+- **`.json`** → a sealed [`PlanArtifact`](#rivet-plan): deserialize, validate staleness + cursor integrity, then execute the single export using the artifact's pre-computed chunk boundaries — no `SELECT min/max` queries against the source.
+- **`.yaml` / `.yml`** → a config: run every export **wave by wave** in ascending `wave:` order (the wave each export was assigned by `rivet plan`). See [Wave-ordered execution](#wave-ordered-execution-yaml-config) below.
 
 ```bash
-rivet apply <PLAN_FILE> [OPTIONS]
+rivet apply <PLAN_FILE | CONFIG> [OPTIONS]
 ```
 
 | Argument/Flag | Type | Description |
 |---|---|---|
-| `PLAN_FILE` | string | Path to plan JSON file **(required)** |
-| `--force` | bool | Skip staleness check (allow plans older than 24 h) |
+| `PLAN_FILE` / `CONFIG` | string | Path to a plan JSON artifact, or a YAML config for wave-ordered execution **(required)** |
+| `--force` | bool | Skip staleness check (allow plans older than 24 h) — JSON-artifact mode only |
 
 ### Staleness rules
 
@@ -273,6 +274,24 @@ rivet apply plan.json --force
 ### State location
 
 `rivet apply` opens `.rivet_state.db` from the directory containing the plan file. Place the plan file alongside the config file, or in the same directory, to ensure the correct state database is used.
+
+### Wave-ordered execution (YAML config)
+
+`rivet apply <config>.yaml` runs every export in the config **wave by wave**, lowest `wave:` first, with a barrier between waves — every export in wave 1 finishes before wave 2 starts. Exports with no `wave:` run last. `rivet plan` writes the `wave:` and `parallel_safe:` fields onto each export (you can hand-edit them; apply respects your order).
+
+**Within-wave parallelism.** With `parallel_export_processes: true` in the config (or `rivet apply --parallel-export-processes`), the **cheap** exports within a wave — those `rivet plan` marked `parallel_safe: true` (cost class `Low`, < ~100K rows) — run concurrently as separate processes. A heavier export already chunk-parallelizes its own ranges internally, so it runs **alone** in its wave; two large tables at once would multiply load on the source. Each child still self-throttles via the adaptive governor. Without the flag, every export runs sequentially. `parallel_safe` also respects the campaign's `isolate_on_source` — a cheap export on a contended shared source still runs alone.
+
+```bash
+# plan assigns waves → you review/edit → apply executes them, lowest wave first
+rivet plan  -c rivet.yaml
+rivet apply rivet.yaml
+```
+
+A failing export does not stop its wave-mates: failures are collected and the run exits non-zero with the most stop-worthy error (data-integrity > schema-drift > retryable).
+
+**Resuming after a partial failure.** Re-run with `rivet apply <config>.yaml --resume`: exports a prior run already completed (their destination carries a `_SUCCESS` marker) are **skipped**, and an incomplete chunked export continues from its checkpoint — so recovering a run that failed mid-way does not redo the tables that already succeeded. Without `--resume`, a re-run re-exports everything.
+
+`partition_by` exports are not expanded in this path yet — use `rivet run` for those.
 
 ---
 

@@ -16,8 +16,8 @@ use std::path::Path;
 use crate::config::Config;
 use crate::error::Result;
 use crate::plan::{
-    CampaignRecommendation, ComputedPlanData, ExportRecommendation, ExtractionStrategy,
-    PlanArtifact, PlanDiagnostics, PlanPrioritizationSnapshot, PrioritizationInputs, build_plan,
+    ComputedPlanData, ExportRecommendation, ExtractionStrategy, PlanArtifact, PlanDiagnostics,
+    PlanPrioritizationSnapshot, PrioritizationInputs, build_plan,
     campaign::recommend_campaign,
     inputs::{PrioritizationHints, build_prioritization_inputs},
     recommend::recommend_export,
@@ -117,6 +117,39 @@ pub fn run_plan_command(
         };
         artifact.prioritization = Some(snap);
         artifacts.push(artifact);
+    }
+
+    // Record the advisory wave + parallel-safety on each export in the config
+    // (in place), so the operator sees / edits them and `rivet apply` can run
+    // exports wave-by-wave, parallelizing only the cheap (low-cost) ones.
+    // `parallel_safe = cost_class Low` (< 100K rows): a heavy table already
+    // chunk-parallelizes internally, so two of them at once would overload the
+    // source — only the small / cheap exports share a concurrent wave batch.
+    let mut fields: ExportFields = HashMap::new();
+    for a in &artifacts {
+        if let Some(p) = a.prioritization.as_ref() {
+            let rec = &p.export_recommendation;
+            // ...and not flagged `isolate_on_source` by the campaign (a shared,
+            // contended source group) — the campaign owns the "run alone" call,
+            // so a cheap export there still runs on its own.
+            let parallel_safe =
+                rec.cost_class == crate::plan::CostClass::Low && !rec.isolate_on_source;
+            fields.insert(
+                a.export_name.clone(),
+                vec![
+                    ("wave", rec.recommended_wave.to_string()),
+                    ("parallel_safe", parallel_safe.to_string()),
+                ],
+            );
+        }
+    }
+    if !fields.is_empty() {
+        write_plan_fields_to_config(config_path, &fields)?;
+        log::info!(
+            "plan: recorded wave + parallel-safety for {} export(s) in {}",
+            fields.len(),
+            config_path
+        );
     }
 
     emit_artifacts(&artifacts, &format, multi_export, config_path)?;
@@ -386,11 +419,16 @@ fn emit_artifacts(
 ) -> Result<()> {
     match format {
         PlanOutputFormat::Pretty => {
-            for artifact in artifacts {
-                artifact.print_summary();
-            }
             if multi_export {
-                print_wave_execution_hint(artifacts, config_path);
+                // A schema scan can yield dozens of exports; the full per-export
+                // block would be hundreds of lines. Show a compact, one-line-per-
+                // export table sorted by wave, then the wave-execution hint. Use
+                // `--export <name>` for a single export's full detail.
+                print_compact_summary(artifacts, config_path);
+            } else {
+                for artifact in artifacts {
+                    artifact.print_summary();
+                }
             }
         }
         // Multi-export JSON to stdout: a single export prints its object
@@ -426,57 +464,139 @@ fn emit_artifacts(
     Ok(())
 }
 
-/// Print copy-pasteable `rivet run` commands grouped by advisory wave, so an
-/// operator can execute the plan in priority order. rivet itself runs config
-/// order (or all-at-once with `--parallel-exports`) and never consumes the
-/// waves, so this block is the bridge between the advice and the run. `rivet
-/// run` takes a single `--export`, so it is one command per export.
-fn print_wave_execution_hint(artifacts: &[PlanArtifact], config_path: &str) {
-    if let Some(campaign) = artifacts
-        .first()
-        .and_then(|a| a.prioritization.as_ref())
-        .and_then(|p| p.campaign.as_ref())
-        && let Some(hint) = build_wave_hint(campaign, config_path)
-    {
-        print!("{hint}");
+/// Compact one-line-per-export table for a multi-export plan, sorted by wave
+/// (then by descending score, then name). The full per-export block
+/// (`print_summary`) would be hundreds of lines for a schema scan, so it is
+/// reserved for a single-export plan (`--export <name>`).
+fn print_compact_summary(artifacts: &[PlanArtifact], config_path: &str) {
+    let key = |a: &PlanArtifact| {
+        a.prioritization
+            .as_ref()
+            .map(|p| {
+                (
+                    p.export_recommendation.recommended_wave,
+                    p.export_recommendation.priority_score,
+                )
+            })
+            .unwrap_or((u32::MAX, 0))
+    };
+    let mut order: Vec<&PlanArtifact> = artifacts.iter().collect();
+    order.sort_by(|a, b| {
+        let (wa, sa) = key(a);
+        let (wb, sb) = key(b);
+        wa.cmp(&wb)
+            .then(sb.cmp(&sa))
+            .then(a.export_name.cmp(&b.export_name))
+    });
+    let name_w = order
+        .iter()
+        .map(|a| a.export_name.chars().count())
+        .max()
+        .unwrap_or(6)
+        .clamp(6, 32);
+
+    println!();
+    println!(
+        "  Plan: {} exports — `rivet apply {}` runs them by wave (lowest first)",
+        artifacts.len(),
+        config_path
+    );
+    println!();
+    println!("{}", PlanArtifact::summary_header(name_w));
+    for a in &order {
+        println!("{}", a.summary_line(name_w));
     }
+    println!();
+    println!("  Full detail for one export:  rivet plan -c <config> --export <name>");
 }
 
-/// Build the wave-ordered `rivet run` command list as a string (pure, so it is
-/// unit-tested). Returns `None` when there are no waves to suggest.
-fn build_wave_hint(campaign: &CampaignRecommendation, config_path: &str) -> Option<String> {
-    if campaign.waves.is_empty() {
-        return None;
+/// Per-export YAML fields that `plan` records in place (`wave`, `parallel_safe`),
+/// keyed by export name → ordered `(field, value)` pairs.
+type ExportFields = HashMap<String, Vec<(&'static str, String)>>;
+
+fn write_plan_fields_to_config(config_path: &str, fields: &ExportFields) -> Result<()> {
+    if fields.is_empty() {
+        return Ok(());
     }
+    let original = std::fs::read_to_string(config_path).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot read config '{}' to record plan fields: {}",
+            config_path,
+            e
+        )
+    })?;
+    let updated = apply_field_annotations(&original, fields);
+    if updated != original {
+        std::fs::write(config_path, updated).map_err(|e| {
+            anyhow::anyhow!(
+                "cannot write plan fields to config '{}': {}",
+                config_path,
+                e
+            )
+        })?;
+    }
+    Ok(())
+}
 
-    let isolated: std::collections::HashSet<&str> = campaign
-        .ordered_exports
-        .iter()
-        .filter(|e| e.isolate_on_source)
-        .map(|e| e.export_name.as_str())
-        .collect();
+/// Pure core of [`write_plan_fields_to_config`] (text in → text out, unit-tested).
+/// For each named export, inserts its `<field>: <value>` lines right after
+/// `- name:` and drops any stale line for those same fields.
+fn apply_field_annotations(yaml: &str, fields: &ExportFields) -> String {
+    let mut out = String::with_capacity(yaml.len() + 64);
+    // (export name, indent of the `-`, indent of the export's fields) while
+    // inside an export block; `None` between / outside exports.
+    let mut current: Option<(String, usize, usize)> = None;
 
-    let mut waves: Vec<_> = campaign.waves.iter().collect();
-    waves.sort_by_key(|w| w.wave);
+    for line in yaml.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
 
-    let mut out = String::from(
-        "\n  Suggested execution (advisory — rivet runs config order, not waves):\n    \
-         run lowest wave first; `rivet run` takes one --export, so one command per export.\n",
-    );
-    for w in waves {
-        for export in &w.exports {
-            let note = if isolated.contains(export.as_str()) {
-                "   # isolate_on_source — run alone (no --parallel-exports)"
-            } else {
-                ""
-            };
-            out.push_str(&format!(
-                "    wave {}:  rivet run -c {} --export {}{}\n",
-                w.wave, config_path, export, note
-            ));
+        if let Some((dash_indent, name)) = parse_export_name(content) {
+            out.push_str(line);
+            let field_indent = dash_indent + 2;
+            if let Some(items) = fields.get(&name) {
+                for (key, value) in items {
+                    out.push_str(&" ".repeat(field_indent));
+                    out.push_str(&format!("{key}: {value}\n"));
+                }
+            }
+            current = Some((name, dash_indent, field_indent));
+            continue;
         }
+
+        if let Some((name, dash_indent, field_indent)) = current.as_ref() {
+            let trimmed = content.trim_start();
+            let indent = content.len() - trimmed.len();
+            let blank_or_comment = trimmed.is_empty() || trimmed.starts_with('#');
+            if !blank_or_comment && indent <= *dash_indent {
+                current = None; // dedented out of the export block
+            } else if indent == *field_indent
+                && let Some(items) = fields.get(name)
+                && items
+                    .iter()
+                    .any(|(key, _)| trimmed.starts_with(&format!("{key}:")))
+            {
+                continue; // drop the stale field line — the fresh one is already in
+            }
+        }
+        out.push_str(line);
     }
-    Some(out)
+    out
+}
+
+/// Parse a `<indent>- name: <name>` export list item → `(indent_of_dash, name)`.
+/// Handles quoted names; `None` for any other line.
+fn parse_export_name(line: &str) -> Option<(usize, String)> {
+    let trimmed = line.trim_start();
+    let dash_indent = line.len() - trimmed.len();
+    let rest = trimmed.strip_prefix("- ")?;
+    let value = rest.trim_start().strip_prefix("name:")?;
+    // Drop an inline ` # …` comment (a YAML comment is a space then a hash).
+    let value = value.split(" #").next().unwrap_or(value);
+    let name = value
+        .trim()
+        .trim_matches(|c: char| c == '"' || c == '\'')
+        .to_string();
+    (!name.is_empty()).then_some((dash_indent, name))
 }
 
 #[cfg(test)]
@@ -484,70 +604,43 @@ mod tests {
     use super::per_export_output_path;
     use std::path::Path;
 
-    use super::build_wave_hint;
-    use crate::plan::{
-        CampaignRecommendation, CostClass, ExportRecommendation, PriorityClass, RecommendedWave,
-        RiskClass,
-    };
+    use super::{ExportFields, apply_field_annotations};
 
-    fn rec(name: &str, isolate: bool) -> ExportRecommendation {
-        ExportRecommendation {
-            export_name: name.into(),
-            source_group: None,
-            priority_score: 0,
-            priority_class: PriorityClass::Low,
-            cost_class: CostClass::Low,
-            risk_class: RiskClass::Low,
-            recommended_wave: 0,
-            isolate_on_source: isolate,
-            reasons: vec![],
-        }
+    fn wave_fields(pairs: &[(&str, u32)]) -> ExportFields {
+        pairs
+            .iter()
+            .map(|(n, w)| (n.to_string(), vec![("wave", w.to_string())]))
+            .collect()
     }
 
-    /// The hint renders waves lowest-first, one valid `rivet run --export` per
-    /// export, and tags only the `isolate_on_source` ones.
+    /// Inserts `wave:` right after each `- name:`, replaces a stale one, and
+    /// leaves comments / other fields / unlisted exports untouched.
     #[test]
-    fn wave_hint_groups_commands_by_wave_with_isolate_note() {
-        let campaign = CampaignRecommendation {
-            ordered_exports: vec![rec("heavy", true), rec("small", false)],
-            // deliberately out of wave order to prove the sort
-            waves: vec![
-                RecommendedWave {
-                    wave: 3,
-                    exports: vec!["heavy".into()],
-                },
-                RecommendedWave {
-                    wave: 1,
-                    exports: vec!["small".into(), "tiny".into()],
-                },
-            ],
-            source_group_warnings: vec![],
-        };
-
-        let hint = build_wave_hint(&campaign, "rivet.yaml").expect("waves present → Some");
-
-        let w1 = hint
-            .find("wave 1:  rivet run -c rivet.yaml --export small")
-            .unwrap();
-        let w1b = hint
-            .find("wave 1:  rivet run -c rivet.yaml --export tiny")
-            .unwrap();
-        let w3 = hint
-            .find("wave 3:  rivet run -c rivet.yaml --export heavy")
-            .unwrap();
-        assert!(w1 < w3 && w1b < w3, "waves must render lowest-first");
-        assert!(hint.contains("--export heavy   # isolate_on_source"));
-        assert!(!hint.contains("--export small   # isolate_on_source"));
+    fn wave_annotations_insert_replace_and_preserve() {
+        let yaml = "exports:\n  - name: orders   # the orders table\n    mode: incremental\n    wave: 9\n    cursor_column: updated_at\n  - name: events\n    mode: full\ndestination:\n  type: local\n";
+        let out = apply_field_annotations(yaml, &wave_fields(&[("orders", 2), ("events", 1)]));
+        // orders: stale wave 9 replaced with 2, placed after name (comment kept)
+        assert!(
+            out.contains("- name: orders   # the orders table\n    wave: 2\n"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("wave: 9"),
+            "stale wave must be dropped:\n{out}"
+        );
+        // events: fresh wave 1 inserted right after name
+        assert!(out.contains("- name: events\n    wave: 1\n"), "{out}");
+        // untouched: the cursor field and the trailing top-level key
+        assert!(out.contains("cursor_column: updated_at"));
+        assert!(out.contains("destination:\n  type: local"));
     }
 
+    /// An export whose name isn't in the map is left byte-identical.
     #[test]
-    fn wave_hint_none_when_no_waves() {
-        let campaign = CampaignRecommendation {
-            ordered_exports: vec![],
-            waves: vec![],
-            source_group_warnings: vec![],
-        };
-        assert!(build_wave_hint(&campaign, "rivet.yaml").is_none());
+    fn wave_annotations_leave_unlisted_export_untouched() {
+        let yaml = "exports:\n  - name: orders\n    mode: full\n";
+        let out = apply_field_annotations(yaml, &wave_fields(&[("other", 1)]));
+        assert_eq!(out, yaml);
     }
 
     /// Regression (audit #4): two distinct exports under one `--output FILE`

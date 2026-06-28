@@ -290,10 +290,25 @@ pub enum Commands {
         #[arg(long, default_value = "pretty")]
         format: PlanFormat,
     },
-    /// Execute a previously-generated plan artifact
+    /// Execute a sealed plan artifact, or run a config's exports wave-by-wave
     Apply {
-        /// Path to plan JSON file produced by `rivet plan`
+        /// A plan JSON artifact from `rivet plan` (sealed single-export replay),
+        /// OR a YAML config (`.yaml`/`.yml`) to run its exports wave-by-wave in
+        /// ascending `wave:` order — the wave each export was assigned by
+        /// `rivet plan`.
         plan_file: String,
+        /// Run the cheap (low-cost) exports within each wave concurrently, as
+        /// separate processes (same as `parallel_export_processes: true` in the
+        /// config). Config-wave mode only; heavier exports — which already
+        /// chunk-parallelize internally — still run one at a time.
+        #[arg(long)]
+        parallel_export_processes: bool,
+        /// Config-wave mode: skip exports a prior run already completed
+        /// (`_SUCCESS` present) and resume incomplete chunked exports from their
+        /// checkpoints, so a re-run after a partial failure does not redo
+        /// finished tables. Independent tables are never re-exported.
+        #[arg(long)]
+        resume: bool,
         /// Skip staleness check (allow plans older than 24 h)
         #[arg(long)]
         force: bool,

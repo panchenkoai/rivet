@@ -121,6 +121,42 @@ Subsequent `rivet run` invocations will only fetch rows with `updated_at >` the 
 
 ---
 
+## 5 · Many tables: plan once, apply by waves
+
+When a config has several exports, `rivet plan` assigns each one a **wave** — a priority band derived from its size, chunking strategy, and risk ([ADR-0006](adr/0006-source-aware-prioritization.md)) — and writes it back into the config as a `wave:` field you can see and hand-edit:
+
+```bash
+rivet plan -c rivet.yaml        # writes `wave: N` onto every export, in place
+```
+
+```yaml
+exports:
+  - name: users
+    wave: 1        # small / cheap → runs first
+    # …
+  - name: events
+    wave: 3        # large → runs later
+    # …
+```
+
+`rivet apply` then runs the whole config **wave by wave**, lowest first, with a barrier between waves — every export in wave 1 finishes before wave 2 starts. Exports with no `wave:` run last:
+
+```bash
+rivet apply rivet.yaml          # a .yaml path → wave-ordered execution
+```
+
+(A `.json` path still means the sealed single-artifact replay — see [reference/cli.md § rivet apply](reference/cli.md#rivet-apply).) The plan *suggests* the waves; you stay in control — hand-edit `wave:` and `apply` respects your order.
+
+### Parallel within a wave — only where it's safe
+
+Add `parallel_export_processes: true` (or pass `rivet apply --parallel-export-processes`) and, within each wave, the **cheap** exports — the ones `rivet plan` marked `parallel_safe: true` (cost class `Low`, under ~100K rows) — run concurrently as separate processes. A heavier export already chunk-parallelizes its own ranges *internally*, so it runs **alone** in its wave: two big tables at once would multiply the load on the source. Every child still self-throttles on source pressure + memory (the adaptive governor), so a whole wave at once stays bounded.
+
+```yaml
+parallel_export_processes: true   # top-level: parallelize the cheap (parallel_safe) exports within each wave
+```
+
+---
+
 ## When something is wrong
 
 Rivet tries to fail early and say exactly what to fix — most mistakes are caught at `check` / `doctor` time, before a single row is read.

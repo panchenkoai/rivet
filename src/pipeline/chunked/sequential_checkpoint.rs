@@ -44,6 +44,10 @@ fn export_one_chunk_range(
     chunk_index: i64,
     plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
+    row_progress: Option<(
+        &crate::pipeline::progress::ChunkProgressHandle,
+        &std::sync::Arc<std::sync::atomic::AtomicI64>,
+    )>,
 ) -> Result<(usize, Vec<super::super::commit::PartRecord>)> {
     let chunk_query = build_chunk_query_sql(
         base_query,
@@ -56,6 +60,9 @@ fn export_one_chunk_range(
     );
 
     let mut sink = ExportSink::new(plan)?;
+    if let Some((h, sr)) = row_progress {
+        sink = sink.with_row_progress(h.clone(), std::sync::Arc::clone(sr));
+    }
     src.export(
         &source::ExportRequest::wrapped(
             &chunk_query,
@@ -106,6 +113,10 @@ fn run_chunk_with_source_retries(
     chunk_index: i64,
     plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
+    row_progress: Option<(
+        &crate::pipeline::progress::ChunkProgressHandle,
+        &std::sync::Arc<std::sync::atomic::AtomicI64>,
+    )>,
 ) -> Result<(usize, Vec<super::super::commit::PartRecord>)> {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..=plan.tuning.max_retries {
@@ -152,6 +163,7 @@ fn run_chunk_with_source_retries(
             chunk_index,
             plan,
             summary,
+            row_progress,
         ) {
             Ok(v) => return Ok(v),
             Err(e) => {
@@ -196,6 +208,9 @@ pub(crate) fn run_chunked_sequential_checkpoint(
 
     let total_tasks = state.count_chunk_tasks_total(&run_id).unwrap_or(1);
     let pb = ChunkProgress::new(&plan.export_name, total_tasks);
+    let pb_handle = pb.handle();
+    // Per-batch progress feed: bar ticks during a chunk's read, not only at end.
+    let streamed_rows = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
 
     if !plan.resume && !resource::check_memory(plan.tuning.memory_threshold_mb) {
         log::warn!("memory threshold exceeded before chunk export; pausing 5s");
@@ -240,6 +255,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
             chunk_index,
             plan,
             summary,
+            Some((&pb_handle, &streamed_rows)),
         ) {
             Ok((rows, parts)) => {
                 summary.total_rows += rows as i64;

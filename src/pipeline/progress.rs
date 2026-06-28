@@ -152,6 +152,18 @@ impl ChunkProgressHandle {
     /// hidden mode) and emits a `Progress` event when a unified UI is
     /// active (parallel-export-processes child or `--parallel-exports`).
     pub(crate) fn inc(&self, total_rows_so_far: i64) {
+        // Advance the chunk count, then refresh rows/rate at the new position.
+        self.bar.inc(1);
+        self.inner.chunks_done.fetch_add(1, Ordering::Relaxed);
+        self.set_rows(total_rows_so_far);
+    }
+
+    /// Update the running row count / rate WITHOUT advancing the chunk count.
+    /// Called per source batch so the bar ticks *during* a chunk's read — a wide
+    /// first chunk (e.g. 250k rows / 90 MB) would otherwise sit frozen at
+    /// "0 rows" for seconds, reading as idle. Emits a `Progress` event at the
+    /// current `chunks_done` so a unified UI updates too.
+    pub(crate) fn set_rows(&self, total_rows_so_far: i64) {
         let elapsed = self.inner.started_at.elapsed().as_secs_f64();
         let msg = if elapsed >= 0.5 && total_rows_so_far > 0 {
             let rps = total_rows_so_far as f64 / elapsed;
@@ -160,12 +172,10 @@ impl ChunkProgressHandle {
             fmt_rows(total_rows_so_far)
         };
         self.bar.set_message(msg);
-        self.bar.inc(1);
-        let chunks_done = self.inner.chunks_done.fetch_add(1, Ordering::Relaxed) + 1;
         if self.inner.capturing {
             ipc::emit_event(&ChildEvent::Progress {
                 export_name: self.inner.export_name.clone(),
-                chunks_done,
+                chunks_done: self.inner.chunks_done.load(Ordering::Relaxed),
                 rows: total_rows_so_far,
             });
         }
@@ -211,6 +221,20 @@ mod tests {
         h.inc(100);
         h.inc(250);
         assert_eq!(pb.inner.chunks_done.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn set_rows_updates_rows_without_advancing_the_chunk_counter() {
+        // Per-batch row updates must NOT bump the chunk count — only `inc`
+        // (per-chunk completion) does. Otherwise a wide chunk's many batches
+        // would each look like a finished chunk.
+        let pb = ChunkProgress::new("orders", 10);
+        let h = pb.handle();
+        h.set_rows(500);
+        h.set_rows(1_200);
+        assert_eq!(pb.inner.chunks_done.load(Ordering::Relaxed), 0);
+        h.inc(1_500); // a real chunk completion still advances it
+        assert_eq!(pb.inner.chunks_done.load(Ordering::Relaxed), 1);
     }
 
     #[test]

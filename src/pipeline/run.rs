@@ -17,7 +17,7 @@ use crate::error::Result;
 use crate::state::StateStore;
 
 use super::summary::RunSummary;
-use super::{aggregate, ipc, job, parallel_children, parent_ui, partition_expand};
+use super::{aggregate, finalize, ipc, job, parallel_children, parent_ui, partition_expand};
 
 /// Per-run configuration flags passed from the CLI to the pipeline.
 ///
@@ -75,6 +75,39 @@ fn print_json_summary(agg: &crate::state::RunAggregate) {
             "rivet: error: failed to serialize run summary as JSON: {:#}",
             e
         ),
+    }
+}
+
+/// Emit captured child stderr from a parallel run. It's verbose — every child's
+/// full run card — so write it to a timestamped log beside the config and print
+/// a one-line pointer, instead of flooding the console with all N exports'
+/// stderr. Falls back to the inline console dump if the file can't be written.
+fn emit_child_stderr(dump: &str, dir: &Path) {
+    if dump.is_empty() {
+        return;
+    }
+    let name = format!(
+        "rivet-child-stderr-{}.log",
+        chrono::Utc::now().format("%Y%m%dT%H%M%S")
+    );
+    let path = dir.join(name);
+    match std::fs::write(&path, dump) {
+        // stderr, not stdout — stdout may carry the machine-readable `--json`
+        // run summary, which this pointer would otherwise corrupt.
+        Ok(()) => eprintln!(
+            "\n  child stderr (full per-export logs) → {}",
+            path.display()
+        ),
+        Err(e) => {
+            log::warn!(
+                "could not write child stderr to {} ({e}); printing inline",
+                path.display()
+            );
+            use std::io::Write;
+            let mut h = std::io::stderr().lock();
+            let _ = h.write_all(dump.as_bytes());
+            let _ = h.flush();
+        }
     }
 }
 
@@ -147,6 +180,13 @@ pub fn run(
         params,
     };
 
+    // Seeds the card-table name column so it aligns from the first redraw
+    // (the renderer can't see a long name until its export emits `Started`).
+    let name_floor = exports
+        .iter()
+        .map(|e| e.name.chars().count())
+        .max()
+        .unwrap_or(0);
     let process_mode_requested = parallel_export_processes_cli || config.parallel_export_processes;
     // Process-mode children re-exec `rivet run --export <name>` and re-load the
     // config from disk, so they cannot see the synthesised partition child
@@ -187,6 +227,7 @@ pub fn run(
                 resume,
                 force,
                 params,
+                name_floor,
             );
         let finished_at = chrono::Utc::now();
         // Best-effort aggregate: open the state DB read-only-ish and reconstruct
@@ -214,15 +255,10 @@ pub fn run(
                 e
             ),
         }
-        // Captured child stderr is printed AFTER the aggregate so the run
-        // summary stays immediately under the card stack — verbose log
-        // output sits below for triage when needed.
-        if !stderr_dump.is_empty() {
-            use std::io::Write;
-            let mut h = std::io::stderr().lock();
-            let _ = h.write_all(stderr_dump.as_bytes());
-            let _ = h.flush();
-        }
+        // Captured child stderr (verbose per-export cards) goes to a file
+        // artifact beside the config, with a one-line console pointer — the run
+        // summary stays clean instead of flooding with every child's stderr.
+        emit_child_stderr(&stderr_dump, &config_dir);
         return result;
     }
 
@@ -279,7 +315,7 @@ pub fn run(
         ipc::install_in_process_tx(tx);
         let ui_thread = std::thread::Builder::new()
             .name("rivet-ui".to_string())
-            .spawn(move || parent_ui::run_ui(rx))
+            .spawn(move || parent_ui::run_ui(rx, name_floor))
             .ok();
 
         let collected: std::sync::Mutex<Vec<(Result<()>, RunSummary)>> =
@@ -338,7 +374,7 @@ pub fn run(
         ipc::install_in_process_tx(tx);
         let ui_thread = std::thread::Builder::new()
             .name("rivet-ui".to_string())
-            .spawn(move || parent_ui::run_ui(rx))
+            .spawn(move || parent_ui::run_ui(rx, name_floor))
             .ok();
 
         for export in &exports {
@@ -460,6 +496,287 @@ pub fn run(
     }
 
     Ok(())
+}
+
+/// `rivet apply -c config.yaml` (plan→apply cycle): run every export of the
+/// config **wave by wave** in ascending `wave:` order — exports with no `wave:`
+/// run last — reusing the same per-export job + run aggregate as [`run`]. This
+/// first cut runs each wave's exports SEQUENTIALLY (deterministic); safety-aware
+/// within-wave parallelism is a follow-up, and `partition_by` exports are not
+/// expanded here yet (use `rivet run` for those).
+pub(crate) fn run_waves(
+    config_path: &str,
+    force: bool,
+    parallel_cli: bool,
+    resume: bool,
+) -> Result<()> {
+    let config = Config::load_with_params(config_path, None)?;
+    let config_dir = Path::new(config_path)
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let opts = RunOptions {
+        validate: false,
+        reconcile: false,
+        resume,
+        force,
+        params: None,
+    };
+
+    // Group exports by wave (ascending; an export with no `wave:` runs last).
+    // The ordering is the contract apply depends on, so it lives in a pure
+    // tested helper rather than hiding inline here.
+    let by_wave = group_exports_by_wave(&config.exports);
+    let total: usize = by_wave.iter().map(|(_, v)| v.len()).sum();
+    if total == 0 {
+        log::warn!("apply: config '{config_path}' defines no exports");
+        return Ok(());
+    }
+
+    // `--parallel` (or `parallel_export_processes: true` in the config) opts into
+    // within-wave parallelism: each wave's exports run as concurrent child
+    // processes (per-child governor keeps each one source-safe), the call blocks
+    // until all exit = the wave barrier. Default stays sequential.
+    let parallel = parallel_cli || config.parallel_export_processes;
+
+    // Compact per-export rendering for the SEQUENTIAL path only. The parallel
+    // (subprocess) path renders the parent card stack itself and each child sees
+    // `exports.len() == 1`, so the flag must stay clear there — matching `run`'s
+    // parallel-processes branch.
+    let prev_multi = MULTI_EXPORT_MODE.swap(total > 1 && !parallel, AtomicOrdering::Relaxed);
+    struct ResetMulti(bool);
+    impl Drop for ResetMulti {
+        fn drop(&mut self) {
+            MULTI_EXPORT_MODE.store(self.0, AtomicOrdering::Relaxed);
+        }
+    }
+    let _reset = ResetMulti(prev_multi);
+
+    let state = StateStore::open(config_path)?;
+    let started_at = chrono::Utc::now();
+    let mut summaries: Vec<RunSummary> = Vec::with_capacity(total);
+    let mut failures: Vec<anyhow::Error> = Vec::new();
+    // Parallel-path accumulators: per-child metrics live in the state DB, so the
+    // parent reconstructs one aggregate from them after every wave has joined.
+    let mut all_exports: Vec<&ExportConfig> = Vec::with_capacity(total);
+    let mut child_failures: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut combined_stderr = String::new();
+
+    for (wave, exports) in &by_wave {
+        let label = if *wave == u32::MAX {
+            "unscheduled".to_string()
+        } else {
+            wave.to_string()
+        };
+        // Skip-completed under --resume: an export whose destination already has
+        // `_SUCCESS` is done — re-running must not redo it (and would hit the
+        // resume gate). The rest run with `resume`, so an incomplete chunked
+        // export continues from its checkpoint. Reuses `finalize`'s prior-run
+        // probe rather than re-implementing the marker check.
+        let pending: Vec<&ExportConfig> = exports
+            .iter()
+            .copied()
+            .filter(|e| {
+                let done = resume && finalize::destination_has_success(&e.destination);
+                if done {
+                    log::info!(
+                        "apply: skipping '{}' — destination already complete (_SUCCESS)",
+                        e.name
+                    );
+                }
+                !done
+            })
+            .collect();
+        if pending.is_empty() {
+            continue;
+        }
+        if total > 1 {
+            println!("\n  ── wave {label} · {} export(s) ──", pending.len());
+        }
+        // The wave barrier is the loop itself: each strategy below fully drains
+        // the wave (the sequential loop, or the blocking child-process join)
+        // before the next iteration starts the next wave.
+        if parallel {
+            // Cost safety-gate: within the wave, the cheap (`parallel_safe`)
+            // exports run together in ONE concurrent batch; every heavier export
+            // runs ALONE in its own single-child batch, since a big table already
+            // chunk-parallelizes internally and two at once would overload the
+            // source. The per-child governor still bounds each one; this gate also
+            // bounds the concurrent connection count.
+            let (safe, lone): (Vec<&ExportConfig>, Vec<&ExportConfig>) =
+                pending.iter().copied().partition(|e| is_parallel_safe(e));
+            log::info!(
+                "apply: wave {} — {} parallel-safe export(s) in parallel, {} run alone",
+                label,
+                safe.len(),
+                lone.len()
+            );
+            // One single-child batch per lone export (run sequentially), then
+            // one concurrent batch for all parallel-safe exports.
+            let mut batches: Vec<Vec<&ExportConfig>> = lone.iter().map(|e| vec![*e]).collect();
+            if !safe.is_empty() {
+                batches.push(safe);
+            }
+            // Wave-wide name floor so cards align across the safe/lone batches
+            // (the cost gate splits a wave into one safe batch + N lone batches,
+            // each its own renderer — without a shared floor they'd each pad to
+            // their own widest name and the table would step).
+            let wave_name_floor = pending
+                .iter()
+                .map(|e| e.name.chars().count())
+                .max()
+                .unwrap_or(0);
+            for batch in &batches {
+                let (result, cf, stderr_dump) = parallel_children::run_exports_as_child_processes(
+                    config_path,
+                    batch,
+                    false,
+                    false,
+                    resume,
+                    force,
+                    None,
+                    wave_name_floor,
+                );
+                child_failures.extend(cf);
+                combined_stderr.push_str(&stderr_dump);
+                if let Err(e) = result {
+                    failures.push(e);
+                }
+            }
+            all_exports.extend_from_slice(&pending);
+        } else {
+            log::info!(
+                "apply: wave {} — {} export(s), sequential",
+                label,
+                pending.len()
+            );
+            for export in &pending {
+                let (res, summary) =
+                    job::run_export_job(config_path, &config, export, &state, &config_dir, &opts);
+                if let Err(e) = res {
+                    failures.push(e);
+                }
+                summaries.push(summary);
+            }
+        }
+    }
+
+    let finished_at = chrono::Utc::now();
+    if total > 1 {
+        let entries = if parallel {
+            aggregate::collect_child_entries(&state, &all_exports, started_at, &child_failures)
+        } else {
+            summaries
+                .iter()
+                .map(aggregate::entry_from_summary)
+                .collect()
+        };
+        let agg = aggregate::build(
+            entries,
+            started_at,
+            finished_at,
+            Some(config_path),
+            if parallel {
+                "wave-parallel-processes"
+            } else {
+                "wave-sequential"
+            },
+        );
+        aggregate::print(&agg);
+        aggregate::persist(&state, &agg, None);
+    }
+    // Captured child stderr (verbose per-export cards, parallel path only) goes
+    // to a file artifact beside the config, with a one-line console pointer.
+    emit_child_stderr(&combined_stderr, &config_dir);
+
+    if !failures.is_empty() {
+        let primary_idx = representative_failure_idx(&failures).unwrap();
+        let primary = failures.remove(primary_idx);
+        if failures.is_empty() {
+            return Err(primary);
+        }
+        let others = failures
+            .iter()
+            .map(|e| format!("{e:#}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(primary.context(format!(
+            "{} export(s) failed across waves; representative error follows (also: {others})",
+            failures.len() + 1
+        )));
+    }
+    Ok(())
+}
+
+/// Group exports by `wave:` in ascending order; an export with no `wave:` runs
+/// last (sorted as `u32::MAX`). Pure + unit-tested — the ordering is the
+/// contract `apply` depends on, so it does not hide inside [`run_waves`].
+fn group_exports_by_wave(exports: &[ExportConfig]) -> Vec<(u32, Vec<&ExportConfig>)> {
+    let mut by_wave: std::collections::BTreeMap<u32, Vec<&ExportConfig>> =
+        std::collections::BTreeMap::new();
+    for e in exports {
+        by_wave
+            .entry(e.wave.unwrap_or(u32::MAX))
+            .or_default()
+            .push(e);
+    }
+    by_wave.into_iter().collect()
+}
+
+/// Whether an export may run concurrently with its wave-mates: the
+/// `parallel_safe` flag that `rivet plan` records from the source-aware cost
+/// class (true only for cheap, `Low`-cost tables — see
+/// [`ExportConfig::parallel_safe`]). A heavy table already chunk-parallelizes
+/// internally, so it runs ALONE within its wave; only the cheap exports share a
+/// concurrent batch. `None` (un-planned / hand-written) is treated as not-safe.
+fn is_parallel_safe(export: &ExportConfig) -> bool {
+    export.parallel_safe.unwrap_or(false)
+}
+
+#[cfg(test)]
+mod wave_grouping_tests {
+    use super::{group_exports_by_wave, is_parallel_safe};
+
+    #[test]
+    fn groups_ascending_with_unscheduled_last() {
+        let mut a = crate::config::sample_export("a");
+        a.wave = Some(3);
+        let mut b = crate::config::sample_export("b");
+        b.wave = None; // unscheduled → must sort last
+        let mut c = crate::config::sample_export("c");
+        c.wave = Some(1);
+        let mut d = crate::config::sample_export("d");
+        d.wave = Some(1); // shares wave 1 with c, preserves input order
+
+        let exports = vec![a, b, c, d];
+        let grouped = group_exports_by_wave(&exports);
+
+        let waves: Vec<u32> = grouped.iter().map(|(w, _)| *w).collect();
+        assert_eq!(waves, vec![1, 3, u32::MAX], "ascending, unscheduled last");
+        let wave1: Vec<&str> = grouped[0].1.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(wave1, vec!["c", "d"], "same-wave keeps input order");
+        assert_eq!(grouped[2].1.len(), 1);
+        assert_eq!(
+            grouped[2].1[0].name, "b",
+            "the no-wave export lands in the last group"
+        );
+    }
+
+    #[test]
+    fn parallel_safe_reads_the_plan_flag() {
+        // default sample_export leaves `parallel_safe` None → not safe
+        let unset = crate::config::sample_export("unset");
+        assert!(!is_parallel_safe(&unset), "None is treated as not-safe");
+
+        let mut safe = crate::config::sample_export("safe");
+        safe.parallel_safe = Some(true);
+        assert!(is_parallel_safe(&safe), "parallel_safe: true → concurrent");
+
+        let mut not_safe = crate::config::sample_export("heavy");
+        not_safe.parallel_safe = Some(false);
+        assert!(!is_parallel_safe(&not_safe), "parallel_safe: false → alone");
+    }
 }
 
 /// Index of the most "stop-worthy" failure in a batch: data-integrity (exit 3)

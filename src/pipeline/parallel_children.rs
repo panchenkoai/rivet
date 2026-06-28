@@ -38,6 +38,9 @@ pub(super) fn run_exports_as_child_processes(
     resume: bool,
     force: bool,
     params: Option<&std::collections::HashMap<String, String>>,
+    // Wave-wide max export-name width so the card table aligns across the
+    // cost-gate's separate safe/lone batches, not just within one batch.
+    name_floor: usize,
 ) -> (Result<()>, HashMap<String, String>, String) {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -76,9 +79,11 @@ pub(super) fn run_exports_as_child_processes(
 
     let (tx, rx) = mpsc::channel::<UiMessage>();
 
+    // `name_floor` (wave-wide max, from the caller) seeds the card table's name
+    // column so it aligns from the first redraw and across batches.
     let ui_handle = std::thread::Builder::new()
         .name("rivet-ipc-ui".into())
-        .spawn(move || super::parent_ui::run_ui(rx))
+        .spawn(move || super::parent_ui::run_ui(rx, name_floor))
         .ok();
 
     const CHILD_STDERR_LINE_CAP: usize = 5_000;
