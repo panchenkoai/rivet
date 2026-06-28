@@ -21,6 +21,13 @@ use super::summary::ApplyContext;
 
 /// Entry point for `rivet apply <plan-file> [--force]`.
 pub fn run_apply_command(plan_file: &str, force: bool) -> Result<()> {
+    // A YAML config selects the wave-ordered multi-export path (plan→apply
+    // cycle): run every export wave-by-wave in ascending `wave:` order. A JSON
+    // plan artifact falls through to the sealed single-export replay below.
+    if plan_file.ends_with(".yaml") || plan_file.ends_with(".yml") {
+        return super::run::run_waves(plan_file, force);
+    }
+
     // 1. Load artifact
     let artifact = PlanArtifact::from_file(plan_file)?;
 

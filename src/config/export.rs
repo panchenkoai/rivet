@@ -123,11 +123,6 @@ pub struct ExportConfig {
     /// and consumed by `rivet apply`, which runs exports wave-by-wave in
     /// ascending order. `None` = unscheduled (apply treats it as the last wave).
     /// Operators may hand-edit it; a later `rivet plan` refreshes it in place.
-    ///
-    /// `allow(dead_code)`: `plan` writes it through the YAML text and it is
-    /// deserialized here, but no Rust code *reads* the field until `rivet apply`
-    /// consumes it (plan→apply cycle step 2). Drop the allow when that lands.
-    #[allow(dead_code)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wave: Option<u32>,
     pub time_column: Option<String>,

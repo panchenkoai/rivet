@@ -462,6 +462,158 @@ pub fn run(
     Ok(())
 }
 
+/// `rivet apply -c config.yaml` (plan→apply cycle): run every export of the
+/// config **wave by wave** in ascending `wave:` order — exports with no `wave:`
+/// run last — reusing the same per-export job + run aggregate as [`run`]. This
+/// first cut runs each wave's exports SEQUENTIALLY (deterministic); safety-aware
+/// within-wave parallelism is a follow-up, and `partition_by` exports are not
+/// expanded here yet (use `rivet run` for those).
+pub(crate) fn run_waves(config_path: &str, force: bool) -> Result<()> {
+    let config = Config::load_with_params(config_path, None)?;
+    let config_dir = Path::new(config_path)
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let opts = RunOptions {
+        validate: false,
+        reconcile: false,
+        resume: false,
+        force,
+        params: None,
+    };
+
+    // Group exports by wave (ascending; an export with no `wave:` runs last).
+    // The ordering is the contract apply depends on, so it lives in a pure
+    // tested helper rather than hiding inline here.
+    let by_wave = group_exports_by_wave(&config.exports);
+    let total: usize = by_wave.iter().map(|(_, v)| v.len()).sum();
+    if total == 0 {
+        log::warn!("apply: config '{config_path}' defines no exports");
+        return Ok(());
+    }
+
+    // Compact per-export rendering when more than one export runs.
+    let prev_multi = MULTI_EXPORT_MODE.swap(total > 1, AtomicOrdering::Relaxed);
+    struct ResetMulti(bool);
+    impl Drop for ResetMulti {
+        fn drop(&mut self) {
+            MULTI_EXPORT_MODE.store(self.0, AtomicOrdering::Relaxed);
+        }
+    }
+    let _reset = ResetMulti(prev_multi);
+
+    let state = StateStore::open(config_path)?;
+    let started_at = chrono::Utc::now();
+    let mut summaries: Vec<RunSummary> = Vec::with_capacity(total);
+    let mut failures: Vec<anyhow::Error> = Vec::new();
+
+    for (wave, exports) in &by_wave {
+        let label = if *wave == u32::MAX {
+            "unscheduled".to_string()
+        } else {
+            wave.to_string()
+        };
+        log::info!(
+            "apply: wave {} — {} export(s), sequential",
+            label,
+            exports.len()
+        );
+        // The wave barrier is implicit while sequential: this loop body fully
+        // drains the wave before the next iteration. It becomes load-bearing
+        // once within-wave parallelism lands.
+        for export in exports {
+            let (res, summary) =
+                job::run_export_job(config_path, &config, export, &state, &config_dir, &opts);
+            if let Err(e) = res {
+                failures.push(e);
+            }
+            summaries.push(summary);
+        }
+    }
+
+    let finished_at = chrono::Utc::now();
+    if total > 1 {
+        let entries: Vec<_> = summaries
+            .iter()
+            .map(aggregate::entry_from_summary)
+            .collect();
+        let agg = aggregate::build(
+            entries,
+            started_at,
+            finished_at,
+            Some(config_path),
+            "wave-sequential",
+        );
+        aggregate::print(&agg);
+        if let Ok(state) = StateStore::open(config_path) {
+            aggregate::persist(&state, &agg, None);
+        }
+    }
+
+    if !failures.is_empty() {
+        let primary_idx = representative_failure_idx(&failures).unwrap();
+        let primary = failures.remove(primary_idx);
+        if failures.is_empty() {
+            return Err(primary);
+        }
+        let others = failures
+            .iter()
+            .map(|e| format!("{e:#}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(primary.context(format!(
+            "{} export(s) failed across waves; representative error follows (also: {others})",
+            failures.len() + 1
+        )));
+    }
+    Ok(())
+}
+
+/// Group exports by `wave:` in ascending order; an export with no `wave:` runs
+/// last (sorted as `u32::MAX`). Pure + unit-tested — the ordering is the
+/// contract `apply` depends on, so it does not hide inside [`run_waves`].
+fn group_exports_by_wave(exports: &[ExportConfig]) -> Vec<(u32, Vec<&ExportConfig>)> {
+    let mut by_wave: std::collections::BTreeMap<u32, Vec<&ExportConfig>> =
+        std::collections::BTreeMap::new();
+    for e in exports {
+        by_wave
+            .entry(e.wave.unwrap_or(u32::MAX))
+            .or_default()
+            .push(e);
+    }
+    by_wave.into_iter().collect()
+}
+
+#[cfg(test)]
+mod wave_grouping_tests {
+    use super::group_exports_by_wave;
+
+    #[test]
+    fn groups_ascending_with_unscheduled_last() {
+        let mut a = crate::config::sample_export("a");
+        a.wave = Some(3);
+        let mut b = crate::config::sample_export("b");
+        b.wave = None; // unscheduled → must sort last
+        let mut c = crate::config::sample_export("c");
+        c.wave = Some(1);
+        let mut d = crate::config::sample_export("d");
+        d.wave = Some(1); // shares wave 1 with c, preserves input order
+
+        let exports = vec![a, b, c, d];
+        let grouped = group_exports_by_wave(&exports);
+
+        let waves: Vec<u32> = grouped.iter().map(|(w, _)| *w).collect();
+        assert_eq!(waves, vec![1, 3, u32::MAX], "ascending, unscheduled last");
+        let wave1: Vec<&str> = grouped[0].1.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(wave1, vec!["c", "d"], "same-wave keeps input order");
+        assert_eq!(grouped[2].1.len(), 1);
+        assert_eq!(
+            grouped[2].1[0].name, "b",
+            "the no-wave export lands in the last group"
+        );
+    }
+}
+
 /// Index of the most "stop-worthy" failure in a batch: data-integrity (exit 3)
 /// outranks schema-drift (4), which outranks retryable (2), which outranks
 /// generic (1). The chosen error's typed marker then rides up so `classify_exit`
