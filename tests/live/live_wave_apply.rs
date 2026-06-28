@@ -150,7 +150,12 @@ exports:
     );
 
     // Phase 3 (contrast) — a plain re-run re-exports, appending a second Parquet.
-    // Proves the Phase-2 skip is real, not apply simply never writing.
+    // Proves the Phase-2 skip is real, not apply simply never writing. The part
+    // filename is second-granularity (`<export>_<YYYYMMDD_HHMMSS>.parquet`), so
+    // wait past the current second to guarantee a distinct name rather than an
+    // overwrite of Phase 1's file (the failure when all three phases land in one
+    // second).
+    std::thread::sleep(std::time::Duration::from_millis(1100));
     let rerun = run(&[]);
     assert!(
         rerun.status.success(),

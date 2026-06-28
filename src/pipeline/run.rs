@@ -92,7 +92,9 @@ fn emit_child_stderr(dump: &str, dir: &Path) {
     );
     let path = dir.join(name);
     match std::fs::write(&path, dump) {
-        Ok(()) => println!(
+        // stderr, not stdout — stdout may carry the machine-readable `--json`
+        // run summary, which this pointer would otherwise corrupt.
+        Ok(()) => eprintln!(
             "\n  child stderr (full per-export logs) → {}",
             path.display()
         ),
