@@ -297,11 +297,12 @@ pub enum Commands {
         /// ascending `wave:` order — the wave each export was assigned by
         /// `rivet plan`.
         plan_file: String,
-        /// Run keyset-chunkable exports within each wave concurrently, as separate
-        /// processes (same as `parallel_export_processes: true` in the config).
-        /// Config-wave mode only; full / non-keyset exports still run one at a time.
+        /// Run the cheap (low-cost) exports within each wave concurrently, as
+        /// separate processes (same as `parallel_export_processes: true` in the
+        /// config). Config-wave mode only; heavier exports — which already
+        /// chunk-parallelize internally — still run one at a time.
         #[arg(long)]
-        parallel: bool,
+        parallel_export_processes: bool,
         /// Skip staleness check (allow plans older than 24 h)
         #[arg(long)]
         force: bool,

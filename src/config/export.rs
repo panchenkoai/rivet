@@ -125,6 +125,16 @@ pub struct ExportConfig {
     /// Operators may hand-edit it; a later `rivet plan` refreshes it in place.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wave: Option<u32>,
+
+    /// Whether this export is cheap enough to run concurrently with its
+    /// wave-mates under `rivet apply --parallel-export-processes`. Written by
+    /// `rivet plan` (true when the source-aware cost class is `Low`, i.e.
+    /// < ~100K rows); a heavier table already chunk-parallelizes internally, so
+    /// two of them at once would overload the source. `None`/`false` → the
+    /// export runs alone within its wave. Operators may hand-edit it; a later
+    /// `rivet plan` refreshes it in place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_safe: Option<bool>,
     pub time_column: Option<String>,
     #[serde(default = "default_time_column_type")]
     pub time_column_type: TimeColumnType,
@@ -543,6 +553,7 @@ pub(crate) fn sample_export(name: &str) -> ExportConfig {
         chunk_by_key: None,
         parallel: 1,
         wave: None,
+        parallel_safe: None,
         time_column: None,
         time_column_type: TimeColumnType::Timestamp,
         days_window: None,

@@ -158,9 +158,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         } => dispatch_plan(config, export, params, output, format),
         Commands::Apply {
             plan_file,
-            parallel,
+            parallel_export_processes,
             force,
-        } => pipeline::run_apply_command(&plan_file, force, parallel),
+        } => pipeline::run_apply_command(&plan_file, force, parallel_export_processes),
         Commands::Validate {
             config,
             export,

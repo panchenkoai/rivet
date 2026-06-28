@@ -119,24 +119,31 @@ pub fn run_plan_command(
         artifacts.push(artifact);
     }
 
-    // Record the advisory wave on each export in the config (in place), so the
-    // operator sees / edits it and `rivet apply` can run exports wave-by-wave.
-    let waves: HashMap<String, u32> = artifacts
-        .iter()
-        .filter_map(|a| {
-            a.prioritization.as_ref().map(|p| {
-                (
-                    a.export_name.clone(),
-                    p.export_recommendation.recommended_wave,
-                )
-            })
-        })
-        .collect();
-    if !waves.is_empty() {
-        write_waves_to_config(config_path, &waves)?;
+    // Record the advisory wave + parallel-safety on each export in the config
+    // (in place), so the operator sees / edits them and `rivet apply` can run
+    // exports wave-by-wave, parallelizing only the cheap (low-cost) ones.
+    // `parallel_safe = cost_class Low` (< 100K rows): a heavy table already
+    // chunk-parallelizes internally, so two of them at once would overload the
+    // source — only the small / cheap exports share a concurrent wave batch.
+    let mut fields: ExportFields = HashMap::new();
+    for a in &artifacts {
+        if let Some(p) = a.prioritization.as_ref() {
+            let rec = &p.export_recommendation;
+            let parallel_safe = rec.cost_class == crate::plan::CostClass::Low;
+            fields.insert(
+                a.export_name.clone(),
+                vec![
+                    ("wave", rec.recommended_wave.to_string()),
+                    ("parallel_safe", parallel_safe.to_string()),
+                ],
+            );
+        }
+    }
+    if !fields.is_empty() {
+        write_plan_fields_to_config(config_path, &fields)?;
         log::info!(
-            "plan: recorded wave assignments for {} export(s) in {}",
-            waves.len(),
+            "plan: recorded wave + parallel-safety for {} export(s) in {}",
+            fields.len(),
             config_path
         );
     }
@@ -513,29 +520,39 @@ fn print_compact_summary(artifacts: &[PlanArtifact], config_path: &str) {
 /// existing `wave:` for that export is replaced. Only the standard block-style
 /// `- name: …` layout (what `rivet init` emits) is handled; an export whose
 /// name is not found in the file is left untouched.
-fn write_waves_to_config(config_path: &str, waves: &HashMap<String, u32>) -> Result<()> {
-    if waves.is_empty() {
+/// Per-export YAML fields that `plan` records in place (`wave`, `parallel_safe`),
+/// keyed by export name → ordered `(field, value)` pairs.
+type ExportFields = HashMap<String, Vec<(&'static str, String)>>;
+
+fn write_plan_fields_to_config(config_path: &str, fields: &ExportFields) -> Result<()> {
+    if fields.is_empty() {
         return Ok(());
     }
     let original = std::fs::read_to_string(config_path).map_err(|e| {
         anyhow::anyhow!(
-            "cannot read config '{}' to record waves: {}",
+            "cannot read config '{}' to record plan fields: {}",
             config_path,
             e
         )
     })?;
-    let updated = apply_wave_annotations(&original, waves);
+    let updated = apply_field_annotations(&original, fields);
     if updated != original {
         std::fs::write(config_path, updated).map_err(|e| {
-            anyhow::anyhow!("cannot write waves to config '{}': {}", config_path, e)
+            anyhow::anyhow!(
+                "cannot write plan fields to config '{}': {}",
+                config_path,
+                e
+            )
         })?;
     }
     Ok(())
 }
 
-/// Pure core of [`write_waves_to_config`] (text in → text out, unit-tested).
-fn apply_wave_annotations(yaml: &str, waves: &HashMap<String, u32>) -> String {
-    let mut out = String::with_capacity(yaml.len() + 32);
+/// Pure core of [`write_plan_fields_to_config`] (text in → text out, unit-tested).
+/// For each named export, inserts its `<field>: <value>` lines right after
+/// `- name:` and drops any stale line for those same fields.
+fn apply_field_annotations(yaml: &str, fields: &ExportFields) -> String {
+    let mut out = String::with_capacity(yaml.len() + 64);
     // (export name, indent of the `-`, indent of the export's fields) while
     // inside an export block; `None` between / outside exports.
     let mut current: Option<(String, usize, usize)> = None;
@@ -546,9 +563,11 @@ fn apply_wave_annotations(yaml: &str, waves: &HashMap<String, u32>) -> String {
         if let Some((dash_indent, name)) = parse_export_name(content) {
             out.push_str(line);
             let field_indent = dash_indent + 2;
-            if let Some(&wave) = waves.get(&name) {
-                out.push_str(&" ".repeat(field_indent));
-                out.push_str(&format!("wave: {wave}\n"));
+            if let Some(items) = fields.get(&name) {
+                for (key, value) in items {
+                    out.push_str(&" ".repeat(field_indent));
+                    out.push_str(&format!("{key}: {value}\n"));
+                }
             }
             current = Some((name, dash_indent, field_indent));
             continue;
@@ -561,10 +580,12 @@ fn apply_wave_annotations(yaml: &str, waves: &HashMap<String, u32>) -> String {
             if !blank_or_comment && indent <= *dash_indent {
                 current = None; // dedented out of the export block
             } else if indent == *field_indent
-                && trimmed.starts_with("wave:")
-                && waves.contains_key(name)
+                && let Some(items) = fields.get(name)
+                && items
+                    .iter()
+                    .any(|(key, _)| trimmed.starts_with(&format!("{key}:")))
             {
-                continue; // drop the stale wave line — the fresh one is already in
+                continue; // drop the stale field line — the fresh one is already in
             }
         }
         out.push_str(line);
@@ -593,11 +614,13 @@ mod tests {
     use super::per_export_output_path;
     use std::path::Path;
 
-    use super::apply_wave_annotations;
-    use std::collections::HashMap;
+    use super::{ExportFields, apply_field_annotations};
 
-    fn wave_map(pairs: &[(&str, u32)]) -> HashMap<String, u32> {
-        pairs.iter().map(|(n, w)| (n.to_string(), *w)).collect()
+    fn wave_fields(pairs: &[(&str, u32)]) -> ExportFields {
+        pairs
+            .iter()
+            .map(|(n, w)| (n.to_string(), vec![("wave", w.to_string())]))
+            .collect()
     }
 
     /// Inserts `wave:` right after each `- name:`, replaces a stale one, and
@@ -605,7 +628,7 @@ mod tests {
     #[test]
     fn wave_annotations_insert_replace_and_preserve() {
         let yaml = "exports:\n  - name: orders   # the orders table\n    mode: incremental\n    wave: 9\n    cursor_column: updated_at\n  - name: events\n    mode: full\ndestination:\n  type: local\n";
-        let out = apply_wave_annotations(yaml, &wave_map(&[("orders", 2), ("events", 1)]));
+        let out = apply_field_annotations(yaml, &wave_fields(&[("orders", 2), ("events", 1)]));
         // orders: stale wave 9 replaced with 2, placed after name (comment kept)
         assert!(
             out.contains("- name: orders   # the orders table\n    wave: 2\n"),
@@ -626,7 +649,7 @@ mod tests {
     #[test]
     fn wave_annotations_leave_unlisted_export_untouched() {
         let yaml = "exports:\n  - name: orders\n    mode: full\n";
-        let out = apply_wave_annotations(yaml, &wave_map(&[("other", 1)]));
+        let out = apply_field_annotations(yaml, &wave_fields(&[("other", 1)]));
         assert_eq!(out, yaml);
     }
 

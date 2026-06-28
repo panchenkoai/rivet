@@ -535,25 +535,25 @@ pub(crate) fn run_waves(config_path: &str, force: bool, parallel_cli: bool) -> R
         // the wave (the sequential loop, or the blocking child-process join)
         // before the next iteration starts the next wave.
         if parallel {
-            // Keyset safety-gate: within the wave, exports that paginate by a
-            // keyset chunk column run together in ONE concurrent batch; every
-            // other export (full scan / incremental / time-window / CDC) runs
-            // ALONE in its own single-child batch so it never stacks source
-            // pressure against a wave-mate. The per-child governor still bounds
-            // each one; this gate also bounds the concurrent connection count.
-            let (keyset, lone): (Vec<&ExportConfig>, Vec<&ExportConfig>) =
+            // Cost safety-gate: within the wave, the cheap (`parallel_safe`)
+            // exports run together in ONE concurrent batch; every heavier export
+            // runs ALONE in its own single-child batch, since a big table already
+            // chunk-parallelizes internally and two at once would overload the
+            // source. The per-child governor still bounds each one; this gate also
+            // bounds the concurrent connection count.
+            let (safe, lone): (Vec<&ExportConfig>, Vec<&ExportConfig>) =
                 exports.iter().copied().partition(|e| is_parallel_safe(e));
             log::info!(
-                "apply: wave {} — {} keyset export(s) in parallel, {} run alone",
+                "apply: wave {} — {} parallel-safe export(s) in parallel, {} run alone",
                 label,
-                keyset.len(),
+                safe.len(),
                 lone.len()
             );
             // One single-child batch per lone export (run sequentially), then
-            // one concurrent batch for all keyset exports.
+            // one concurrent batch for all parallel-safe exports.
             let mut batches: Vec<Vec<&ExportConfig>> = lone.iter().map(|e| vec![*e]).collect();
-            if !keyset.is_empty() {
-                batches.push(keyset);
+            if !safe.is_empty() {
+                batches.push(safe);
             }
             for batch in &batches {
                 let (result, cf, stderr_dump) = parallel_children::run_exports_as_child_processes(
@@ -656,13 +656,14 @@ fn group_exports_by_wave(exports: &[ExportConfig]) -> Vec<(u32, Vec<&ExportConfi
     by_wave.into_iter().collect()
 }
 
-/// Config-derivable predicate: an export is safe to run concurrently with its
-/// wave-mates when it paginates the source by a keyset chunk column (bounded,
-/// index-backed scans). Full / incremental / time-window / CDC exports scan or
-/// stream the table, so they run ALONE within the wave to avoid stacking source
-/// pressure. Conservative on purpose — widen only with evidence.
+/// Whether an export may run concurrently with its wave-mates: the
+/// `parallel_safe` flag that `rivet plan` records from the source-aware cost
+/// class (true only for cheap, `Low`-cost tables — see
+/// [`ExportConfig::parallel_safe`]). A heavy table already chunk-parallelizes
+/// internally, so it runs ALONE within its wave; only the cheap exports share a
+/// concurrent batch. `None` (un-planned / hand-written) is treated as not-safe.
 fn is_parallel_safe(export: &ExportConfig) -> bool {
-    export.mode == crate::config::ExportMode::Chunked && export.chunk_column.is_some()
+    export.parallel_safe.unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -695,27 +696,18 @@ mod wave_grouping_tests {
     }
 
     #[test]
-    fn parallel_safe_only_for_keyset_chunked() {
-        // default sample_export is mode=Full, chunk_column=None
-        let full = crate::config::sample_export("full");
-        assert!(!is_parallel_safe(&full), "full scan is not parallel-safe");
+    fn parallel_safe_reads_the_plan_flag() {
+        // default sample_export leaves `parallel_safe` None → not safe
+        let unset = crate::config::sample_export("unset");
+        assert!(!is_parallel_safe(&unset), "None is treated as not-safe");
 
-        let mut chunked = crate::config::sample_export("chunked");
-        chunked.mode = crate::config::ExportMode::Chunked;
-        chunked.chunk_column = Some("id".into());
-        assert!(
-            is_parallel_safe(&chunked),
-            "keyset chunked is parallel-safe"
-        );
+        let mut safe = crate::config::sample_export("safe");
+        safe.parallel_safe = Some(true);
+        assert!(is_parallel_safe(&safe), "parallel_safe: true → concurrent");
 
-        // chunked but no chunk_column → not keyset → not safe
-        let mut chunked_no_col = crate::config::sample_export("nocol");
-        chunked_no_col.mode = crate::config::ExportMode::Chunked;
-        chunked_no_col.chunk_column = None;
-        assert!(
-            !is_parallel_safe(&chunked_no_col),
-            "chunked without a chunk column is not keyset"
-        );
+        let mut not_safe = crate::config::sample_export("heavy");
+        not_safe.parallel_safe = Some(false);
+        assert!(!is_parallel_safe(&not_safe), "parallel_safe: false → alone");
     }
 }
 
