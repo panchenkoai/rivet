@@ -312,6 +312,38 @@ impl PlanArtifact {
         }
     }
 
+    /// One compact row for the multi-export plan table — `wave  export  strategy
+    /// rows  verdict`, the export name padded to `name_width` (ellipsised if
+    /// longer). Used instead of [`print_summary`] when planning many exports,
+    /// where the full per-export block would run to hundreds of lines.
+    pub fn summary_line(&self, name_width: usize) -> String {
+        let wave = self
+            .prioritization
+            .as_ref()
+            .map(|p| p.export_recommendation.recommended_wave.to_string())
+            .unwrap_or_else(|| "—".to_string());
+        let rows = self
+            .computed
+            .row_estimate
+            .map(|e| format!("~{}", format_rows(e)))
+            .unwrap_or_else(|| "—".to_string());
+        let name = if self.export_name.chars().count() > name_width {
+            let head: String = self.export_name.chars().take(name_width - 1).collect();
+            format!("{head}…")
+        } else {
+            self.export_name.clone()
+        };
+        format!(
+            "  {:<5} {:<width$}  {:<11}  {:<12}  {}",
+            wave,
+            name,
+            self.strategy.to_string(),
+            rows,
+            self.diagnostics.verdict,
+            width = name_width
+        )
+    }
+
     /// Pretty-print a human-readable plan summary to stdout.
     pub fn print_summary(&self) {
         println!();
