@@ -149,6 +149,8 @@ A single-export plan prints a `Priority` block; a multi-export plan adds a `Camp
 rivet plan -c pilot.yaml --format json -o plan.json
 ```
 
+For a multi-export config, `plan` also writes the assigned `wave:` and `parallel_safe:` fields back into the config **in place** (preserving your comments and field order) — visible, hand-editable, and consumed by `rivet apply <config>` in Step 4. The plan *suggests* the schedule; you stay in control.
+
 **What the plan guarantees (PA1–PA8):**
 - PA1 — the artifact is the sole input to `apply`.
 - PA3 — apply bails on plans older than 24h (override with `--force`).
@@ -157,15 +159,24 @@ rivet plan -c pilot.yaml --format json -o plan.json
 
 ---
 
-## Step 4 — Run (or apply the sealed plan)
+## Step 4 — Run, or apply by wave
 
-Either run live:
+Three ways to execute, by how much orchestration you want.
+
+**Run live** — straightforward, config order, no waves:
 
 ```bash
 rivet run -c pilot.yaml --validate
 ```
 
-…or apply the plan for an auditable split between "what will happen" and "do it":
+**Apply the whole config wave-by-wave** — `rivet plan` (Step 3) wrote a `wave:` onto each export; apply runs them lowest-wave first, with a barrier between waves. Tables are independent, so a failed export does **not** block its wave-mates: apply collects the failure, runs the rest, and exits non-zero. Add `--parallel-export-processes` to run the cheap (`parallel_safe`) exports within a wave concurrently — the heavy ones still run alone (they chunk-parallelize internally):
+
+```bash
+rivet apply pilot.yaml                          # wave-ordered, sequential
+rivet apply pilot.yaml --parallel-export-processes   # + within-wave parallelism for cheap exports
+```
+
+**Apply a sealed single-export artifact** — the auditable split between "what will happen" and "do it":
 
 ```bash
 rivet apply plan.json
