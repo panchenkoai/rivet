@@ -225,6 +225,7 @@ pub fn run(
                 resume,
                 force,
                 params,
+                name_floor,
             );
         let finished_at = chrono::Utc::now();
         // Best-effort aggregate: open the state DB read-only-ish and reconstruct
@@ -615,6 +616,15 @@ pub(crate) fn run_waves(
             if !safe.is_empty() {
                 batches.push(safe);
             }
+            // Wave-wide name floor so cards align across the safe/lone batches
+            // (the cost gate splits a wave into one safe batch + N lone batches,
+            // each its own renderer — without a shared floor they'd each pad to
+            // their own widest name and the table would step).
+            let wave_name_floor = pending
+                .iter()
+                .map(|e| e.name.chars().count())
+                .max()
+                .unwrap_or(0);
             for batch in &batches {
                 let (result, cf, stderr_dump) = parallel_children::run_exports_as_child_processes(
                     config_path,
@@ -624,6 +634,7 @@ pub(crate) fn run_waves(
                     resume,
                     force,
                     None,
+                    wave_name_floor,
                 );
                 child_failures.extend(cf);
                 combined_stderr.push_str(&stderr_dump);
