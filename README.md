@@ -215,7 +215,7 @@ Branch commands: `rivet apply` (replay a saved plan, **or** run a config's expor
 
 For a first run, `rivet init + rivet run` is enough. The full workflow is for production pipelines where "it ran" is not sufficient — you need a verifiable record of what was written.
 
-**Many tables, one command.** For a config with several exports, `rivet plan` assigns each a `wave:` (a priority band by size / strategy / risk) and writes it back into the config; `rivet apply rivet.yaml` then runs them wave by wave, lowest first, with a barrier between waves. With `parallel_export_processes: true`, keyset-chunkable exports within a wave run as concurrent processes while full-scan ones run alone — see [docs/getting-started.md § 5](docs/getting-started.md#5--many-tables-plan-once-apply-by-waves).
+**Many tables, one command.** For a config with several exports, `rivet plan` assigns each a `wave:` (a priority band by size / strategy / risk) and writes it back into the config; `rivet apply rivet.yaml` then runs them wave by wave, lowest first, with a barrier between waves. With `parallel_export_processes: true` (or `rivet apply --parallel-export-processes`), the cheap (low-cost) exports within a wave run as concurrent processes while heavier ones — which already chunk-parallelize internally — run alone; see [docs/getting-started.md § 5](docs/getting-started.md#5--many-tables-plan-once-apply-by-waves).
 
 ## Stateless deployment
 

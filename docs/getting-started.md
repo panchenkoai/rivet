@@ -149,10 +149,10 @@ rivet apply rivet.yaml          # a .yaml path → wave-ordered execution
 
 ### Parallel within a wave — only where it's safe
 
-Add `parallel_export_processes: true` and, within each wave, **keyset-chunkable** exports (`mode: chunked` with a `chunk_column` — bounded, index-backed scans) run concurrently as separate processes. Full / incremental / time-window / CDC exports scan or stream the table, so each runs **alone** to avoid stacking pressure on the source. Every child still self-throttles on source pressure + memory (the adaptive governor), so a whole wave at once stays bounded.
+Add `parallel_export_processes: true` (or pass `rivet apply --parallel-export-processes`) and, within each wave, the **cheap** exports — the ones `rivet plan` marked `parallel_safe: true` (cost class `Low`, under ~100K rows) — run concurrently as separate processes. A heavier export already chunk-parallelizes its own ranges *internally*, so it runs **alone** in its wave: two big tables at once would multiply the load on the source. Every child still self-throttles on source pressure + memory (the adaptive governor), so a whole wave at once stays bounded.
 
 ```yaml
-parallel_export_processes: true   # top-level: parallelize keyset exports within each wave
+parallel_export_processes: true   # top-level: parallelize the cheap (parallel_safe) exports within each wave
 ```
 
 ---

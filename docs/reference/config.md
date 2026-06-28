@@ -123,6 +123,8 @@ Each entry in the `exports` list defines one export job.
 | `verify` | `size` \| `content` | no | `size` | Integrity depth required of `--validate`. `content` checks every part's MD5 against the store's listing (no download) and **fails** validation for any part only size-verified — e.g. a part too large to upload as a single PUT (lower `max_file_size` so it fits) or a backend that exposes no checksum (local FS, streamed multipart). See [Verification depth](#verification-depth) below. |
 | `skip_empty` | boolean | no | `false` | Skip file creation if 0 rows |
 | `max_file_size` | string | no | — | Split output: `"256MB"`, `"1GB"`, etc. |
+| `wave` | integer | no | — | Advisory execution wave (1 = highest priority, runs first). Written by `rivet plan` from the source-aware prioritization score ([ADR-0006](../adr/0006-source-aware-prioritization.md)); consumed by `rivet apply <config>`, which runs exports wave-by-wave in ascending order (no `wave:` runs last). Hand-editable; a later `rivet plan` refreshes it. |
+| `parallel_safe` | boolean | no | — | Whether this export is cheap enough (cost class `Low`, < ~100K rows, and not `isolate_on_source`) to run concurrently with its wave-mates under `rivet apply --parallel-export-processes`. Written by `rivet plan`; a heavier export runs alone in its wave (it already chunk-parallelizes internally). Hand-editable. |
 | `meta_columns` | object | no | — | Extra columns added to output |
 | `quality` | object | no | — | Data quality checks |
 | `tuning` | object | no | — | Per-export tuning overrides |
