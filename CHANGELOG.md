@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.16.0 (2026-06-28) — the plan→apply cycle: wave-ordered, cost-gated, resumable execution
+
+`rivet plan` becomes executable. It already scored and waved your exports; now `rivet apply <config>`
+runs them — wave by wave, lowest priority first, with a barrier between waves and cost-gated within-wave
+parallelism. This closes the OSS engine's loop: `init` → `plan` (annotates the config in place) →
+[review/edit] → `apply`. This release also ships the operator-UX and verify-depth work that was merged in
+#53 but never released (v0.15.0 cherry-picked only the always-on checksum from it).
+
+### Added — the plan → apply cycle
+
+- **`rivet apply <config>.yaml` runs exports wave-by-wave.** `rivet plan` writes a `wave:` and
+  `parallel_safe:` onto each export (in place, comments and field order preserved); `apply` runs them in
+  ascending `wave:` order with a barrier between waves. Tables are independent, so a failed export does
+  **not** block its wave-mates — `apply` collects failures, runs the rest, and exits non-zero
+  (continue/isolate). A `.json` path still means the sealed single-artifact replay.
+- **Cost-gated within-wave parallelism** (`--parallel-export-processes`, or `parallel_export_processes:
+  true`). The cheap exports — `parallel_safe: true` (cost class `Low`, and not flagged
+  `isolate_on_source`) — run concurrently as separate processes; a heavier export runs alone in its wave
+  (it already chunk-parallelizes internally), so two big tables never multiply load on the source.
+- **`rivet apply <config> --resume`** skips exports a prior run already completed (`_SUCCESS` present)
+  and resumes incomplete chunked exports from their checkpoints, so recovering a partially-failed run
+  does not redo the tables that already succeeded.
+- **`rivet plan` writes the advisory schedule into the config** and prints a compact one-line-per-export
+  table (Wave | Export | Strategy | Rows | Verdict). `rivet init`'s next-steps surface the plan→apply path.
+
+### Added — operator UX & verify (#53)
+
+- **Graded `rivet validate --depth light|sample|full`** with stable `RIVET_VERIFY_*` error codes — one
+  per failure variant (JSON `code` + the pretty `[CODE]` prefix).
+- **Memory-aware `rivet check` verdict** — an unindexed large scan is DEGRADED (not UNSAFE) when the
+  estimated peak RSS fits the budget; **`check --json`** emits the per-export verdict / strategy /
+  warnings / recommended profile + parallel, not just the type report.
+- **`rivet plan` explains the strategy** — why this mode, chunk geometry, parallelism, RSS-budget fit,
+  resumability and memory risk.
+- **Signed releases** — keyless cosign (Sigstore).
+
+### Changed — multi-export console UX
+
+- **Strict aligned card table.** Per-export cards render as a table: the name plus every metric column
+  (rows / files / size / duration / RSS) is fixed-width and aligned, and the name column is seeded
+  wave-wide so it stays aligned across the cost gate's separate safe/lone batches.
+- **Chunk progress ticks per source batch, not only per chunk** — a wide first chunk (e.g. 250k rows /
+  90 MB) no longer reads as idle while it streams; the bar shows rows/rate climbing throughout the read.
+- **Captured child stderr goes to a file artifact** (`rivet-child-stderr-<ts>.log`) with a one-line
+  console pointer, instead of flooding the run summary with every child's per-export log.
+
+### Fixed
+
+- **Chunked boundary probes no longer force a full scan.** The NULL-key guard is a presence probe
+  (`SELECT 1 … WHERE col IS NULL LIMIT 1`, `TOP 1` on SQL Server) instead of `COUNT(*) - COUNT(col)` —
+  the planner returns nothing without scanning for a `NOT NULL` column, and stops at the first NULL
+  otherwise. A plain `SELECT <cols> FROM <table>` projection now probes the bare table (index-only)
+  instead of wrapping the wide query in a subquery.
+
+### Internal
+
+- Test-infra consolidation (#53). plan→apply pre-PR review fixes (orphaned doc-comment, table-geometry
+  split across two files, `parallel_safe` now respecting the campaign's `isolate_on_source`). Live tests:
+  a failed wave isolates its successors; `--resume` skips completed exports. A "measure cold, don't
+  theorize" performance-diagnosis rule added to `CLAUDE.md`.
+
 ## 0.15.0 (2026-06-25) — always-on value-integrity checksum
 
 Every export now cross-checks its data end-to-end, on by default. An always-on per-column `xxh3`
