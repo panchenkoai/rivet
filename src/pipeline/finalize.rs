@@ -61,7 +61,10 @@ pub(super) fn finalize_run_report(config_path: &str, summary: &RunSummary, kind:
 
     let stderr = std::io::stderr();
     let mut h = stderr.lock();
-    if written {
+    // Per-export `report:` lines double the output of a multi-export run (one
+    // per export); the run aggregate at the end already points at `.rivet/runs/`.
+    // Keep the line only for a single export, where it is the one place to look.
+    if written && !crate::pipeline::multi_export_mode() {
         let _ = writeln!(h, "report:    {}", dir.join("summary.md").display());
     }
     if summary.status == "failed" && summary.files_committed > 0 {

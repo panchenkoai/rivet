@@ -468,7 +468,7 @@ pub fn run(
 /// first cut runs each wave's exports SEQUENTIALLY (deterministic); safety-aware
 /// within-wave parallelism is a follow-up, and `partition_by` exports are not
 /// expanded here yet (use `rivet run` for those).
-pub(crate) fn run_waves(config_path: &str, force: bool) -> Result<()> {
+pub(crate) fn run_waves(config_path: &str, force: bool, parallel_cli: bool) -> Result<()> {
     let config = Config::load_with_params(config_path, None)?;
     let config_dir = Path::new(config_path)
         .parent()
@@ -492,11 +492,11 @@ pub(crate) fn run_waves(config_path: &str, force: bool) -> Result<()> {
         return Ok(());
     }
 
-    // `parallel_export_processes: true` opts into within-wave parallelism: each
-    // wave's exports run as concurrent child processes (per-child governor keeps
-    // each one source-safe), the call blocks until all exit = the wave barrier.
-    // Default stays sequential.
-    let parallel = config.parallel_export_processes;
+    // `--parallel` (or `parallel_export_processes: true` in the config) opts into
+    // within-wave parallelism: each wave's exports run as concurrent child
+    // processes (per-child governor keeps each one source-safe), the call blocks
+    // until all exit = the wave barrier. Default stays sequential.
+    let parallel = parallel_cli || config.parallel_export_processes;
 
     // Compact per-export rendering for the SEQUENTIAL path only. The parallel
     // (subprocess) path renders the parent card stack itself and each child sees
@@ -528,6 +528,9 @@ pub(crate) fn run_waves(config_path: &str, force: bool) -> Result<()> {
         } else {
             wave.to_string()
         };
+        if total > 1 {
+            println!("\n  ── wave {label} · {} export(s) ──", exports.len());
+        }
         // The wave barrier is the loop itself: each strategy below fully drains
         // the wave (the sequential loop, or the blocking child-process join)
         // before the next iteration starts the next wave.

@@ -295,10 +295,13 @@ pub enum Commands {
         /// A plan JSON artifact from `rivet plan` (sealed single-export replay),
         /// OR a YAML config (`.yaml`/`.yml`) to run its exports wave-by-wave in
         /// ascending `wave:` order — the wave each export was assigned by
-        /// `rivet plan`. With `parallel_export_processes: true` in the config,
-        /// keyset-chunkable exports within a wave run concurrently; the rest run
-        /// one at a time.
+        /// `rivet plan`.
         plan_file: String,
+        /// Run keyset-chunkable exports within each wave concurrently, as separate
+        /// processes (same as `parallel_export_processes: true` in the config).
+        /// Config-wave mode only; full / non-keyset exports still run one at a time.
+        #[arg(long)]
+        parallel: bool,
         /// Skip staleness check (allow plans older than 24 h)
         #[arg(long)]
         force: bool,
