@@ -76,9 +76,17 @@ pub(super) fn run_exports_as_child_processes(
 
     let (tx, rx) = mpsc::channel::<UiMessage>();
 
+    // Seed the card table's name column from the known export names so it is
+    // aligned from the first redraw (the renderer can't see a long name until
+    // its child emits `Started`).
+    let name_floor = exports
+        .iter()
+        .map(|e| e.name.chars().count())
+        .max()
+        .unwrap_or(0);
     let ui_handle = std::thread::Builder::new()
         .name("rivet-ipc-ui".into())
-        .spawn(move || super::parent_ui::run_ui(rx))
+        .spawn(move || super::parent_ui::run_ui(rx, name_floor))
         .ok();
 
     const CHILD_STDERR_LINE_CAP: usize = 5_000;

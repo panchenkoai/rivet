@@ -178,6 +178,13 @@ pub fn run(
         params,
     };
 
+    // Seeds the card-table name column so it aligns from the first redraw
+    // (the renderer can't see a long name until its export emits `Started`).
+    let name_floor = exports
+        .iter()
+        .map(|e| e.name.chars().count())
+        .max()
+        .unwrap_or(0);
     let process_mode_requested = parallel_export_processes_cli || config.parallel_export_processes;
     // Process-mode children re-exec `rivet run --export <name>` and re-load the
     // config from disk, so they cannot see the synthesised partition child
@@ -305,7 +312,7 @@ pub fn run(
         ipc::install_in_process_tx(tx);
         let ui_thread = std::thread::Builder::new()
             .name("rivet-ui".to_string())
-            .spawn(move || parent_ui::run_ui(rx))
+            .spawn(move || parent_ui::run_ui(rx, name_floor))
             .ok();
 
         let collected: std::sync::Mutex<Vec<(Result<()>, RunSummary)>> =
@@ -364,7 +371,7 @@ pub fn run(
         ipc::install_in_process_tx(tx);
         let ui_thread = std::thread::Builder::new()
             .name("rivet-ui".to_string())
-            .spawn(move || parent_ui::run_ui(rx))
+            .spawn(move || parent_ui::run_ui(rx, name_floor))
             .ok();
 
         for export in &exports {
