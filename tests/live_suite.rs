@@ -153,6 +153,8 @@ mod live_retry_and_faults;
 mod live_schema_drift;
 #[path = "live/live_temp_spill.rs"]
 mod live_temp_spill;
+#[path = "live/live_wave_apply.rs"]
+mod live_wave_apply;
 #[path = "live/preflight_missing_table.rs"]
 mod preflight_missing_table;
 #[path = "live/preflight_target_fail_note.rs"]
