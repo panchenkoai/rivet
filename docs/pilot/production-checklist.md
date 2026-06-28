@@ -90,6 +90,8 @@ Key guarantees:
 - Plans older than 1 hour emit a warning; older than 24 hours require `--force`
 - For incremental exports, `apply` rejects the artifact if the cursor has advanced since plan time (another run completed in between)
 
+**Many tables in one run.** For a config with several exports, `rivet plan -c rivet.yaml` also writes a `wave:` and `parallel_safe:` onto each export, and `rivet apply rivet.yaml` runs them **wave by wave** (lowest first), with a barrier between waves. Tables are independent, so a failed export does not block its wave-mates — apply collects failures, runs the rest, and exits non-zero. Add `--parallel-export-processes` to run the cheap (`parallel_safe`) exports within a wave concurrently. See [getting-started § 5](../getting-started.md#5--many-tables-plan-once-apply-by-waves).
+
 > **Security note:** `plan.json` embeds the resolved source connection config. Plaintext `password:` values and `scheme://user:pass@` userinfo are stripped by ADR-0005 PA9; references (`password_env:` / `url_env:` / `url_file:`) are preserved so the apply environment can re-resolve them. Plans still contain query SQL, schema and cursor state — treat them as sensitive.
 
 See [CLI reference](../reference/cli.md) and [ADR-0005](../adr/0005-plan-apply-contracts.md) for the full contract specification.
