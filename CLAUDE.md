@@ -105,3 +105,26 @@ that a crash before the checkpoint re-reads rather than loses). Each
 engine resumes by a different mechanism (MySQL binlog checkpoint file,
 PostgreSQL slot advance, SQL Server from-LSN), so one engine passing
 proves nothing about another. Never infer resume from capture.
+
+## Performance diagnosis: measure cold, don't theorize
+
+A "why is this slow?" answer reasoned from the code is a hypothesis, not a
+finding — and on the *same* symptom this repo's plausible hypothesis was wrong
+three times running. A reported "~12s of idle before the first chunk" on a
+chunked `content_items` export was blamed, in order, on a window function
+(wrong — `ROW_NUMBER` only runs for `chunk_dense`), on the `SELECT … FROM
+(<wide query>)` boundary-probe wrap (wrong — PostgreSQL pushes the `min`/`max`
+into the index: 0.1 ms), and on the `COUNT(*) - COUNT(col)` null-key check
+(wrong — index-only, 90 ms warm). The real cause, found only by running the
+binary **cold** with elapsed-time-prefixed `RUST_LOG` output, was the first
+chunk reading 92 MB of wide rows with **no progress feedback** — not a query at
+all. Each wrong guess shipped a real fix (they were genuine improvements) that
+did nothing for the actual symptom.
+
+Process rule: **for any latency claim, reproduce it and read the timeline before
+proposing a fix.** Restart the source (`docker restart rivet-postgres-1`) for a
+cold cache; run the real binary with per-line elapsed timestamps and let the
+trace name the slow step; `EXPLAIN (ANALYZE, BUFFERS)` the exact SQL rivet emits
+rather than guessing the plan. A fix shipped against an unmeasured hypothesis is
+a guess wearing a diff — each of the three wrong guesses above cost a build +
+install + dogfood round-trip that a 20-second cold trace would have skipped.
