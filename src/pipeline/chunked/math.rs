@@ -8,7 +8,7 @@
 // `strip_select_star_from` lives in the `sql` leaf (shared with preflight and
 // plan::partition); re-exported here so `chunked`'s call sites and the
 // `chunked::strip_select_star_from` re-export are unchanged.
-pub(crate) use crate::sql::strip_select_star_from;
+pub(crate) use crate::sql::{strip_select_star_from, strip_simple_projection_from};
 
 pub fn generate_chunks(min: i64, max: i64, chunk_size: i64) -> Vec<(i64, i64)> {
     if max < min || chunk_size <= 0 {

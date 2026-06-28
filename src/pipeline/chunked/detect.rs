@@ -3,7 +3,7 @@
 //! Queries min/max (and optionally COUNT) from the source to compute chunk ranges,
 //! logs sparsity diagnostics, and returns the final `Vec<(i64, i64)>` chunk list.
 
-use super::math::{generate_chunks, strip_select_star_from};
+use super::math::{generate_chunks, strip_simple_projection_from};
 use crate::error::Result;
 use crate::scalar::{parse_date_flexible, parse_scalar_i64};
 use crate::source::Source;
@@ -15,7 +15,7 @@ use crate::source::Source;
 /// avoids the wrap entirely so `COUNT(*)` becomes a plain heap-scan / index-only
 /// scan with no spill.
 fn query_wrapped_row_count(src: &mut dyn Source, base_query: &str) -> Result<i64> {
-    let sql = match strip_select_star_from(base_query) {
+    let sql = match strip_simple_projection_from(base_query) {
         Some(table_ident) => format!("SELECT COUNT(*) FROM {table_ident}"),
         None => format!("SELECT COUNT(*) FROM ({base_query}) AS _rivet_rowcnt"),
     };
@@ -44,29 +44,21 @@ fn bail_if_null_keyed(
     export_name: &str,
     source_type: crate::config::SourceType,
 ) -> Result<()> {
-    let col = crate::sql::quote_ident(source_type, chunk_column);
-    // `COUNT(*) - COUNT(col)` = number of NULL-keyed rows, dialect-agnostic and
-    // reusing the same fast-path-vs-wrap shape as the row-count query.
-    let sql = match strip_select_star_from(base_query) {
-        Some(table_ident) => format!("SELECT COUNT(*) - COUNT({col}) FROM {table_ident}"),
-        None => format!("SELECT COUNT(*) - COUNT({col}) FROM ({base_query}) AS _rivet_nullcnt"),
-    };
-    let null_keyed = src
-        .query_scalar(&sql)?
-        .as_deref()
-        .map(parse_scalar_i64)
-        .transpose()?
-        .unwrap_or(0);
-    if null_keyed > 0 {
+    // Presence probe (not a count): is there ANY NULL-keyed row? For a NOT NULL
+    // column the planner returns nothing without a scan; for a nullable one it
+    // stops at the first NULL — so this never forces the cold full-index scan a
+    // `COUNT(*) - COUNT(col)` did. A nullable column with zero NULLs still passes
+    // (no row → no bail), preserving the "detect on live data" intent.
+    let sql = crate::sql::null_key_probe_sql(source_type, chunk_column, base_query);
+    if src.query_scalar(&sql)?.is_some() {
         anyhow::bail!(
-            "export '{}': {} row(s) have NULL in chunk_column '{}'. Range/date chunking filters \
+            "export '{}': found NULL in chunk_column '{}'. Range/date chunking filters \
              with `BETWEEN min AND max` (or `>= .. < ..`), which excludes NULL — those rows would \
              be silently dropped from the export. Fix one of: use a NOT NULL column for \
              chunk_column; add `WHERE {} IS NOT NULL` to the query to drop them explicitly; set \
              `chunk_dense: true` (ROW_NUMBER covers every row, NULL-keyed included); or use \
              `mode: full`.",
             export_name,
-            null_keyed,
             chunk_column,
             chunk_column
         );
@@ -283,7 +275,7 @@ pub(crate) fn detect_and_generate_chunks(
     // curated query has no catalog row — both log boundaries without density
     // rather than scan. The boundaries come from min/max above; the estimate
     // never feeds them.
-    let row_estimate = strip_select_star_from(base_query)
+    let row_estimate = strip_simple_projection_from(base_query)
         .and_then(|table_ident| crate::sql::row_estimate_sql(source_type, table_ident))
         .and_then(|sql| {
             src.query_scalar(&sql)
@@ -333,9 +325,10 @@ mod tests {
     struct ScriptedSource {
         replies: VecDeque<Result<Option<String>>>,
         seen_sql: Vec<String>,
-        /// Value returned for the NULL-key guard query (`COUNT(*) - COUNT(col)`).
-        /// Defaults to 0 so existing min/max/count scripts stay focused and the
-        /// guard is a transparent no-op; the bail tests set it explicitly.
+        /// Drives the NULL-key guard's presence probe (`… WHERE col IS NULL`):
+        /// `> 0` ⇒ a NULL exists (one row). Defaults to 0 so existing
+        /// min/max/count scripts stay focused and the guard is a transparent
+        /// no-op; the bail tests set it explicitly.
         null_keys: i64,
     }
 
@@ -364,11 +357,12 @@ mod tests {
     impl crate::source::Source for ScriptedSource {
         fn query_scalar(&mut self, sql: &str) -> Result<Option<String>> {
             self.seen_sql.push(sql.to_string());
-            // The NULL-key guard issues `COUNT(*) - COUNT(col)`; answer it from
-            // `null_keys` (default 0) so it doesn't consume the min/max/count
-            // script and existing tests stay unchanged.
-            if sql.contains("- COUNT(") {
-                return Ok(Some(self.null_keys.to_string()));
+            // The NULL-key guard now issues a presence probe `… WHERE col IS NULL
+            // LIMIT 1` (was COUNT(*) - COUNT(col)); answer it from `null_keys`
+            // (> 0 ⇒ a NULL exists → one row) so it doesn't consume the
+            // min/max/count script and existing tests stay focused.
+            if sql.contains("IS NULL") {
+                return Ok((self.null_keys > 0).then(|| "1".to_string()));
             }
             self.replies
                 .pop_front()
@@ -448,13 +442,12 @@ mod tests {
 
     #[test]
     fn null_keyed_rows_in_integer_range_bail_not_silently_dropped() {
-        // 3 rows have NULL chunk_column → range chunking would exclude them via
-        // BETWEEN. Refuse with a clear, counted error instead of dropping them.
+        // Rows have NULL chunk_column → range chunking would exclude them via
+        // BETWEEN. Refuse with a clear error instead of dropping them.
         let mut src = ScriptedSource::new([ok("1"), ok("1000"), ok("500")]).with_null_keys(3);
         let err = detect(&mut src, 100, false, None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("NULL in chunk_column"), "got: {msg}");
-        assert!(msg.contains("3 row(s)"), "should report the count: {msg}");
     }
 
     #[test]
