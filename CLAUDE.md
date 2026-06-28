@@ -128,3 +128,28 @@ trace name the slow step; `EXPLAIN (ANALYZE, BUFFERS)` the exact SQL rivet emits
 rather than guessing the plan. A fix shipped against an unmeasured hypothesis is
 a guess wearing a diff — each of the three wrong guesses above cost a build +
 install + dogfood round-trip that a 20-second cold trace would have skipped.
+
+## Verify the real release build path, not just `cargo build`
+
+A green `cargo build` does not mean the release will build. The release path runs
+**different, stricter tooling** than local dev, and the gap only surfaces at the
+tag — *after* crates.io, the binaries, and the GitHub release have already
+published, when the failure is no longer re-runnable from the immutable tag.
+
+0.16.0 shipped this way: `cargo build` plus the whole offline + live suite were
+green, all four binaries and the crate published — but **both Docker images
+failed**. The release Dockerfile's `cargo chef prepare` (dependency-cache layer)
+parses `Cargo.toml` with `cargo-manifest`, a **spec-strict** TOML parser that
+rejects multi-line inline tables (`postgres = {` … newline … `}`). `cargo`'s own
+parser tolerates them, so the two offending tables sailed through every local
+check for months and broke only the one build path no local command exercises.
+The fix was one line each; the cost was a whole 0.16.1 patch release.
+
+Process rule: **before tagging a release, run the release build path itself, not
+a proxy for it** — build the Docker image locally (or at least run `cargo chef
+prepare`), plus whatever `cargo publish --dry-run` / cross-compile / packaging
+step the workflow runs. When a release-only tool (cargo-chef, cargo-manifest, a
+stricter MSRV image, a `--locked` resolve) can reject what `cargo build` accepts,
+add a **local regression guard** that mimics its check (here: the
+`cargo_manifest_chef` offline test asserts no multi-line inline tables) so the
+mismatch fails loud and local instead of half-way through publishing.

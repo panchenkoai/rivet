@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.16.1 (2026-06-29) — release Docker images build again
+
+0.16.0 published to crates.io, shipped its binaries, and cut a GitHub release — but both Docker images
+(`linux/amd64`, `linux/arm64`) failed to build. `cargo chef prepare` (the dependency-caching step) uses a
+spec-strict TOML parser that rejects **multi-line inline tables**, which `cargo build` tolerates. Two
+`dep = {` … `}` entries (`postgres`, `postgres-types`) tripped it with `invalid inline table`, so the
+publish landed half-complete and could not be re-run from the tag.
+
+### Fixed
+
+- Collapsed the `postgres` and `postgres-types` dependency tables onto one line each (no version/feature
+  change — `Cargo.lock` untouched). The release Docker build passes again.
+
+### Internal
+
+- Regression guard: an offline test (`cargo_manifest_chef`) asserts `Cargo.toml` carries no multi-line
+  inline tables, so the parser mismatch fails loud and local instead of at release time.
+
 ## 0.16.0 (2026-06-28) — the plan→apply cycle: wave-ordered, cost-gated, resumable execution
 
 `rivet plan` becomes executable. It already scored and waved your exports; now `rivet apply <config>`
