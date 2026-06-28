@@ -39,7 +39,7 @@ pub(super) fn generate_config(
     let mut lines = config_header_lines(st, &header, unbounded, provenance);
     lines.push("exports:".to_string());
     lines.extend(export_block_lines(info, st, dest, mode_override));
-    Ok(lines.join("\n") + "\n")
+    Ok(wrap_comments(&(lines.join("\n") + "\n")))
 }
 
 pub(super) fn generate_schema_config(
@@ -64,7 +64,90 @@ pub(super) fn generate_schema_config(
     for info in infos {
         lines.extend(export_block_lines(info, st, dest, mode_override));
     }
-    Ok(lines.join("\n") + "\n")
+    Ok(wrap_comments(&(lines.join("\n") + "\n")))
+}
+
+/// Maximum column width for scaffolded comment lines.
+const COMMENT_WRAP_WIDTH: usize = 100;
+
+/// Word-wrap every comment in the scaffolded YAML so no line exceeds
+/// [`COMMENT_WRAP_WIDTH`]. A standalone comment (`<indent># text`) wraps onto
+/// continuation comment lines at the same indent; an inline comment
+/// (`key: value  # text`) keeps as much as fits after the value and wraps the
+/// rest onto standalone comment lines at the line's indent. Lines with no
+/// comment — or whose `#` sits inside a quoted scalar (a generated SQL `query:`
+/// or any quoted value) — are left byte-for-byte untouched, so values are never
+/// split.
+fn wrap_comments(yaml: &str) -> String {
+    let mut out = String::with_capacity(yaml.len());
+    for line in yaml.split_inclusive('\n') {
+        let nl = line.ends_with('\n');
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        if content.chars().count() <= COMMENT_WRAP_WIDTH {
+            out.push_str(line);
+            continue;
+        }
+        match comment_split(content) {
+            Some((prefix, comment)) => {
+                let indent: String = content.chars().take_while(|c| *c == ' ').collect();
+                out.push_str(&wrap_comment(prefix, &indent, comment));
+                if nl {
+                    out.push('\n');
+                }
+            }
+            None => out.push_str(line),
+        }
+    }
+    out
+}
+
+/// Split a line at the start of a YAML comment that is NOT inside a quoted
+/// scalar → `(prefix, comment_text)`, where `prefix` is everything up to (not
+/// including) the `#` and `comment_text` is the comment with its `#` and one
+/// leading space stripped. `None` if the line carries no such comment.
+fn comment_split(line: &str) -> Option<(&str, &str)> {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix('#') {
+        let prefix = &line[..line.len() - trimmed.len()];
+        return Some((prefix, rest.trim_start()));
+    }
+    let (mut in_s, mut in_d) = (false, false);
+    let bytes = line.as_bytes();
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_d => in_s = !in_s,
+            b'"' if !in_s => in_d = !in_d,
+            b'#' if !in_s && !in_d && i > 0 && bytes[i - 1] == b' ' => {
+                return Some((&line[..i], line[i + 1..].trim_start()));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Greedily word-wrap `comment` so the first line is `prefix# …` and each
+/// continuation line is `indent# …`, none exceeding [`COMMENT_WRAP_WIDTH`]
+/// (except a single word longer than the budget, which takes its own line).
+fn wrap_comment(prefix: &str, indent: &str, comment: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = format!("{prefix}# ");
+    let mut has_word = false;
+    for word in comment.split_whitespace() {
+        let extra = usize::from(has_word) + word.chars().count();
+        if has_word && cur.chars().count() + extra > COMMENT_WRAP_WIDTH {
+            lines.push(cur);
+            cur = format!("{indent}# {word}");
+        } else {
+            if has_word {
+                cur.push(' ');
+            }
+            cur.push_str(word);
+        }
+        has_word = true;
+    }
+    lines.push(cur);
+    lines.join("\n")
 }
 
 fn config_header_lines(
@@ -638,6 +721,58 @@ fn memory_capped_parallel(suggested: usize, avg_row_bytes: i64, budget_mb: u64) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrap_long_standalone_comment_by_words() {
+        let yaml = "exports:\n    # auto: this is a very long generated comment that goes well beyond one hundred columns so it has to wrap onto several lines\n    mode: full\n";
+        let out = wrap_comments(yaml);
+        for l in out.lines() {
+            assert!(l.chars().count() <= COMMENT_WRAP_WIDTH, "over width: {l:?}");
+        }
+        assert!(
+            out.starts_with("exports:\n    # auto: "),
+            "first comment line kept"
+        );
+        assert!(
+            out.contains("\n    # "),
+            "continuation comment at the same indent"
+        );
+        assert!(out.contains("    mode: full\n"), "value line untouched");
+    }
+
+    #[test]
+    fn wrap_leaves_quoted_value_with_hash_untouched() {
+        let long = "x".repeat(140);
+        let yaml = format!("    query: \"SELECT '{long}' -- not # a real comment\"\n");
+        assert_eq!(
+            wrap_comments(&yaml),
+            yaml,
+            "a quoted scalar containing # must stay byte-identical"
+        );
+    }
+
+    #[test]
+    fn wrap_long_inline_comment_continues_below() {
+        let yaml = "    chunk_checkpoint: true  # record per-chunk progress so the resume command can finish a crashed run without redoing work\n";
+        let out = wrap_comments(yaml);
+        for l in out.lines() {
+            assert!(l.chars().count() <= COMMENT_WRAP_WIDTH, "over width: {l:?}");
+        }
+        assert!(
+            out.starts_with("    chunk_checkpoint: true  # "),
+            "value + first comment chunk stay inline"
+        );
+        assert!(
+            out.contains("\n    # "),
+            "continuation comment at line indent"
+        );
+    }
+
+    #[test]
+    fn wrap_leaves_short_comment_untouched() {
+        let yaml = "    mode: full  # full table scan\n";
+        assert_eq!(wrap_comments(yaml), yaml);
+    }
     use crate::init::{ColumnInfo, TableInfo};
 
     /// Cost+engine-aware parallelism (REPORT_full_vs_parallel.md): the wide
