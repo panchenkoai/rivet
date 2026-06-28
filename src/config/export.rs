@@ -117,6 +117,19 @@ pub struct ExportConfig {
     pub chunk_by_key: Option<String>,
     #[serde(default = "default_parallel")]
     pub parallel: usize,
+
+    /// Advisory execution wave (1 = highest priority, run first). Written by
+    /// `rivet plan` from the source-aware prioritization score (see ADR-0006)
+    /// and consumed by `rivet apply`, which runs exports wave-by-wave in
+    /// ascending order. `None` = unscheduled (apply treats it as the last wave).
+    /// Operators may hand-edit it; a later `rivet plan` refreshes it in place.
+    ///
+    /// `allow(dead_code)`: `plan` writes it through the YAML text and it is
+    /// deserialized here, but no Rust code *reads* the field until `rivet apply`
+    /// consumes it (plan→apply cycle step 2). Drop the allow when that lands.
+    #[allow(dead_code)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wave: Option<u32>,
     pub time_column: Option<String>,
     #[serde(default = "default_time_column_type")]
     pub time_column_type: TimeColumnType,
@@ -534,6 +547,7 @@ pub(crate) fn sample_export(name: &str) -> ExportConfig {
         chunk_by_days: None,
         chunk_by_key: None,
         parallel: 1,
+        wave: None,
         time_column: None,
         time_column_type: TimeColumnType::Timestamp,
         days_window: None,

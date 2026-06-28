@@ -119,6 +119,28 @@ pub fn run_plan_command(
         artifacts.push(artifact);
     }
 
+    // Record the advisory wave on each export in the config (in place), so the
+    // operator sees / edits it and `rivet apply` can run exports wave-by-wave.
+    let waves: HashMap<String, u32> = artifacts
+        .iter()
+        .filter_map(|a| {
+            a.prioritization.as_ref().map(|p| {
+                (
+                    a.export_name.clone(),
+                    p.export_recommendation.recommended_wave,
+                )
+            })
+        })
+        .collect();
+    if !waves.is_empty() {
+        write_waves_to_config(config_path, &waves)?;
+        log::info!(
+            "plan: recorded wave assignments for {} export(s) in {}",
+            waves.len(),
+            config_path
+        );
+    }
+
     emit_artifacts(&artifacts, &format, multi_export, config_path)?;
 
     Ok(())
@@ -479,10 +501,129 @@ fn build_wave_hint(campaign: &CampaignRecommendation, config_path: &str) -> Opti
     Some(out)
 }
 
+/// Write `wave: N` into each export of the YAML config **in place**, preserving
+/// comments / structure / field order — a surgical text edit, not a serde
+/// round-trip (which would drop the operator's comments and `init` rationale).
+/// The fresh `wave:` is inserted right after each export's `- name:`; an
+/// existing `wave:` for that export is replaced. Only the standard block-style
+/// `- name: …` layout (what `rivet init` emits) is handled; an export whose
+/// name is not found in the file is left untouched.
+fn write_waves_to_config(config_path: &str, waves: &HashMap<String, u32>) -> Result<()> {
+    if waves.is_empty() {
+        return Ok(());
+    }
+    let original = std::fs::read_to_string(config_path).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot read config '{}' to record waves: {}",
+            config_path,
+            e
+        )
+    })?;
+    let updated = apply_wave_annotations(&original, waves);
+    if updated != original {
+        std::fs::write(config_path, updated).map_err(|e| {
+            anyhow::anyhow!("cannot write waves to config '{}': {}", config_path, e)
+        })?;
+    }
+    Ok(())
+}
+
+/// Pure core of [`write_waves_to_config`] (text in → text out, unit-tested).
+fn apply_wave_annotations(yaml: &str, waves: &HashMap<String, u32>) -> String {
+    let mut out = String::with_capacity(yaml.len() + 32);
+    // (export name, indent of the `-`, indent of the export's fields) while
+    // inside an export block; `None` between / outside exports.
+    let mut current: Option<(String, usize, usize)> = None;
+
+    for line in yaml.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+
+        if let Some((dash_indent, name)) = parse_export_name(content) {
+            out.push_str(line);
+            let field_indent = dash_indent + 2;
+            if let Some(&wave) = waves.get(&name) {
+                out.push_str(&" ".repeat(field_indent));
+                out.push_str(&format!("wave: {wave}\n"));
+            }
+            current = Some((name, dash_indent, field_indent));
+            continue;
+        }
+
+        if let Some((name, dash_indent, field_indent)) = current.as_ref() {
+            let trimmed = content.trim_start();
+            let indent = content.len() - trimmed.len();
+            let blank_or_comment = trimmed.is_empty() || trimmed.starts_with('#');
+            if !blank_or_comment && indent <= *dash_indent {
+                current = None; // dedented out of the export block
+            } else if indent == *field_indent
+                && trimmed.starts_with("wave:")
+                && waves.contains_key(name)
+            {
+                continue; // drop the stale wave line — the fresh one is already in
+            }
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+/// Parse a `<indent>- name: <name>` export list item → `(indent_of_dash, name)`.
+/// Handles quoted names; `None` for any other line.
+fn parse_export_name(line: &str) -> Option<(usize, String)> {
+    let trimmed = line.trim_start();
+    let dash_indent = line.len() - trimmed.len();
+    let rest = trimmed.strip_prefix("- ")?;
+    let value = rest.trim_start().strip_prefix("name:")?;
+    // Drop an inline ` # …` comment (a YAML comment is a space then a hash).
+    let value = value.split(" #").next().unwrap_or(value);
+    let name = value
+        .trim()
+        .trim_matches(|c: char| c == '"' || c == '\'')
+        .to_string();
+    (!name.is_empty()).then_some((dash_indent, name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::per_export_output_path;
     use std::path::Path;
+
+    use super::apply_wave_annotations;
+    use std::collections::HashMap;
+
+    fn wave_map(pairs: &[(&str, u32)]) -> HashMap<String, u32> {
+        pairs.iter().map(|(n, w)| (n.to_string(), *w)).collect()
+    }
+
+    /// Inserts `wave:` right after each `- name:`, replaces a stale one, and
+    /// leaves comments / other fields / unlisted exports untouched.
+    #[test]
+    fn wave_annotations_insert_replace_and_preserve() {
+        let yaml = "exports:\n  - name: orders   # the orders table\n    mode: incremental\n    wave: 9\n    cursor_column: updated_at\n  - name: events\n    mode: full\ndestination:\n  type: local\n";
+        let out = apply_wave_annotations(yaml, &wave_map(&[("orders", 2), ("events", 1)]));
+        // orders: stale wave 9 replaced with 2, placed after name (comment kept)
+        assert!(
+            out.contains("- name: orders   # the orders table\n    wave: 2\n"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("wave: 9"),
+            "stale wave must be dropped:\n{out}"
+        );
+        // events: fresh wave 1 inserted right after name
+        assert!(out.contains("- name: events\n    wave: 1\n"), "{out}");
+        // untouched: the cursor field and the trailing top-level key
+        assert!(out.contains("cursor_column: updated_at"));
+        assert!(out.contains("destination:\n  type: local"));
+    }
+
+    /// An export whose name isn't in the map is left byte-identical.
+    #[test]
+    fn wave_annotations_leave_unlisted_export_untouched() {
+        let yaml = "exports:\n  - name: orders\n    mode: full\n";
+        let out = apply_wave_annotations(yaml, &wave_map(&[("other", 1)]));
+        assert_eq!(out, yaml);
+    }
 
     use super::build_wave_hint;
     use crate::plan::{
