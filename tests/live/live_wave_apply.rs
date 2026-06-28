@@ -83,3 +83,83 @@ exports:
          (continue/isolate — independent tables).",
     );
 }
+
+/// `apply --resume` skips an export whose destination already completed
+/// (`_SUCCESS`), so a re-run after a partial failure does not redo finished
+/// tables. A plain re-run (no `--resume`) DOES re-export — the contrast proves
+/// the skip is real, not apply silently never writing.
+#[test]
+#[ignore = "live: postgres"]
+fn resume_skips_completed_exports() {
+    require_alive(LiveService::Postgres);
+
+    let out = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let exp = unique_name("orders_done");
+
+    let yaml = format!(
+        r#"
+source:
+  type: postgres
+  url_env: DATABASE_URL
+
+exports:
+  - name: {exp}
+    query: "SELECT id FROM orders"
+    mode: full
+    format: parquet
+    wave: 1
+    destination: {{ type: local, path: {root} }}
+"#,
+        root = out.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    let run = |args: &[&str]| {
+        std::process::Command::new(RIVET_BIN)
+            .arg("apply")
+            .arg(cfg.to_str().unwrap())
+            .args(args)
+            .env("DATABASE_URL", POSTGRES_URL)
+            .output()
+            .expect("spawn rivet apply")
+    };
+    let parquet_count = || files_with_extension(out.path(), "parquet").len();
+
+    // Phase 1 — fresh run writes one Parquet + a `_SUCCESS` marker.
+    let first = run(&[]);
+    assert!(
+        first.status.success(),
+        "fresh apply must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&first.stderr),
+    );
+    let after_first = parquet_count();
+    assert_eq!(after_first, 1, "fresh apply must write exactly one Parquet");
+
+    // Phase 2 — `--resume` sees `_SUCCESS` and SKIPS: no new Parquet, exit 0.
+    let resumed = run(&["--resume"]);
+    assert!(
+        resumed.status.success(),
+        "apply --resume must succeed (everything already complete); stderr:\n{}",
+        String::from_utf8_lossy(&resumed.stderr),
+    );
+    assert_eq!(
+        parquet_count(),
+        after_first,
+        "apply --resume must skip the completed export — no new Parquet written",
+    );
+
+    // Phase 3 (contrast) — a plain re-run re-exports, appending a second Parquet.
+    // Proves the Phase-2 skip is real, not apply simply never writing.
+    let rerun = run(&[]);
+    assert!(
+        rerun.status.success(),
+        "plain re-run must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&rerun.stderr),
+    );
+    assert!(
+        parquet_count() > after_first,
+        "a plain re-run (no --resume) must re-export, adding a Parquet — \
+         confirming --resume's skip was the actual difference",
+    );
+}

@@ -303,6 +303,12 @@ pub enum Commands {
         /// chunk-parallelize internally — still run one at a time.
         #[arg(long)]
         parallel_export_processes: bool,
+        /// Config-wave mode: skip exports a prior run already completed
+        /// (`_SUCCESS` present) and resume incomplete chunked exports from their
+        /// checkpoints, so a re-run after a partial failure does not redo
+        /// finished tables. Independent tables are never re-exported.
+        #[arg(long)]
+        resume: bool,
         /// Skip staleness check (allow plans older than 24 h)
         #[arg(long)]
         force: bool,

@@ -287,7 +287,11 @@ rivet plan  -c rivet.yaml
 rivet apply rivet.yaml
 ```
 
-A failing export does not stop its wave-mates: failures are collected and the run exits non-zero with the most stop-worthy error (data-integrity > schema-drift > retryable). `partition_by` exports are not expanded in this path yet — use `rivet run` for those.
+A failing export does not stop its wave-mates: failures are collected and the run exits non-zero with the most stop-worthy error (data-integrity > schema-drift > retryable).
+
+**Resuming after a partial failure.** Re-run with `rivet apply <config>.yaml --resume`: exports a prior run already completed (their destination carries a `_SUCCESS` marker) are **skipped**, and an incomplete chunked export continues from its checkpoint — so recovering a run that failed mid-way does not redo the tables that already succeeded. Without `--resume`, a re-run re-exports everything.
+
+`partition_by` exports are not expanded in this path yet — use `rivet run` for those.
 
 ---
 

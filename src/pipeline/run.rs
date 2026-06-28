@@ -17,7 +17,7 @@ use crate::error::Result;
 use crate::state::StateStore;
 
 use super::summary::RunSummary;
-use super::{aggregate, ipc, job, parallel_children, parent_ui, partition_expand};
+use super::{aggregate, finalize, ipc, job, parallel_children, parent_ui, partition_expand};
 
 /// Per-run configuration flags passed from the CLI to the pipeline.
 ///
@@ -468,7 +468,12 @@ pub fn run(
 /// first cut runs each wave's exports SEQUENTIALLY (deterministic); safety-aware
 /// within-wave parallelism is a follow-up, and `partition_by` exports are not
 /// expanded here yet (use `rivet run` for those).
-pub(crate) fn run_waves(config_path: &str, force: bool, parallel_cli: bool) -> Result<()> {
+pub(crate) fn run_waves(
+    config_path: &str,
+    force: bool,
+    parallel_cli: bool,
+    resume: bool,
+) -> Result<()> {
     let config = Config::load_with_params(config_path, None)?;
     let config_dir = Path::new(config_path)
         .parent()
@@ -477,7 +482,7 @@ pub(crate) fn run_waves(config_path: &str, force: bool, parallel_cli: bool) -> R
     let opts = RunOptions {
         validate: false,
         reconcile: false,
-        resume: false,
+        resume,
         force,
         params: None,
     };
@@ -528,8 +533,30 @@ pub(crate) fn run_waves(config_path: &str, force: bool, parallel_cli: bool) -> R
         } else {
             wave.to_string()
         };
+        // Skip-completed under --resume: an export whose destination already has
+        // `_SUCCESS` is done — re-running must not redo it (and would hit the
+        // resume gate). The rest run with `resume`, so an incomplete chunked
+        // export continues from its checkpoint. Reuses `finalize`'s prior-run
+        // probe rather than re-implementing the marker check.
+        let pending: Vec<&ExportConfig> = exports
+            .iter()
+            .copied()
+            .filter(|e| {
+                let done = resume && finalize::destination_has_success(&e.destination);
+                if done {
+                    log::info!(
+                        "apply: skipping '{}' — destination already complete (_SUCCESS)",
+                        e.name
+                    );
+                }
+                !done
+            })
+            .collect();
+        if pending.is_empty() {
+            continue;
+        }
         if total > 1 {
-            println!("\n  ── wave {label} · {} export(s) ──", exports.len());
+            println!("\n  ── wave {label} · {} export(s) ──", pending.len());
         }
         // The wave barrier is the loop itself: each strategy below fully drains
         // the wave (the sequential loop, or the blocking child-process join)
@@ -542,7 +569,7 @@ pub(crate) fn run_waves(config_path: &str, force: bool, parallel_cli: bool) -> R
             // source. The per-child governor still bounds each one; this gate also
             // bounds the concurrent connection count.
             let (safe, lone): (Vec<&ExportConfig>, Vec<&ExportConfig>) =
-                exports.iter().copied().partition(|e| is_parallel_safe(e));
+                pending.iter().copied().partition(|e| is_parallel_safe(e));
             log::info!(
                 "apply: wave {} — {} parallel-safe export(s) in parallel, {} run alone",
                 label,
@@ -561,7 +588,7 @@ pub(crate) fn run_waves(config_path: &str, force: bool, parallel_cli: bool) -> R
                     batch,
                     false,
                     false,
-                    false,
+                    resume,
                     force,
                     None,
                 );
@@ -571,14 +598,14 @@ pub(crate) fn run_waves(config_path: &str, force: bool, parallel_cli: bool) -> R
                     failures.push(e);
                 }
             }
-            all_exports.extend_from_slice(exports);
+            all_exports.extend_from_slice(&pending);
         } else {
             log::info!(
                 "apply: wave {} — {} export(s), sequential",
                 label,
-                exports.len()
+                pending.len()
             );
-            for export in exports {
+            for export in &pending {
                 let (res, summary) =
                     job::run_export_job(config_path, &config, export, &state, &config_dir, &opts);
                 if let Err(e) = res {

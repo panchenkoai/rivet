@@ -434,6 +434,23 @@ pub(super) fn warn_if_prefix_has_completed_run(plan: &ResolvedRunPlan) {
     }
 }
 
+/// Whether this destination already holds a completed export (`_SUCCESS`).
+/// `rivet apply --resume` uses it to skip exports a prior run finished, so a
+/// re-run after a partial failure does not redo work already done. Reuses the
+/// same probe as [`warn_if_prefix_has_completed_run`]; a streaming destination
+/// (stdout) or a probe error counts as "not complete" (re-run it).
+pub(crate) fn destination_has_success(dest: &crate::config::DestinationConfig) -> bool {
+    use crate::destination::WriteCommitProtocol;
+    use crate::manifest::SUCCESS_FILENAME;
+    let Ok(d) = crate::destination::create_destination(dest) else {
+        return false;
+    };
+    if d.capabilities().commit_protocol == WriteCommitProtocol::Streaming {
+        return false;
+    }
+    matches!(d.head(SUCCESS_FILENAME), Ok(Some(_)))
+}
+
 /// The operator-facing body of the rerun-accumulation warning.
 ///
 /// Split out so a regression test can pin the exact wording — the live audit
