@@ -419,6 +419,11 @@ fn next_steps_block(path: &str, provenance: &SourceProvenance) -> String {
          2. rivet check  -c {path}            # column-type & schema report\n  \
          3. rivet run    -c {path} --validate # export, then verify row counts\n"
     ));
+    s.push_str(&format!(
+        "\nOr seal a reviewable plan, then apply it (runs many tables by priority wave):\n  \
+         rivet plan  -c {path}     # assigns waves + writes a reviewable plan\n  \
+         rivet apply {path}        # runs wave-by-wave (parallel where safe)\n"
+    ));
     s
 }
 
