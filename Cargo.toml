@@ -1,6 +1,6 @@
 [package]
 name = "rivet-cli"
-version = "0.16.0"
+version = "0.16.1"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
@@ -69,10 +69,7 @@ opendal = { version = "0.55", features = ["blocking", "services-fs", "services-s
 # stays one cast away. See `src/types/mapping.rs` for the emission site.
 parquet = { version = "58", features = ["arrow", "zstd", "lz4", "flate2", "arrow_canonical_extension_types"] }
 clap_complete = "4"
-postgres = {
-    version = "0.19",
-    features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-0_8"],
-}
+postgres = { version = "0.19", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-0_8"] }
 postgres-native-tls = "0.5"
 # `vendored` statically links OpenSSL on Linux so `cargo install rivet-cli` works
 # on bare systems and our cross-compiled aarch64-unknown-linux-gnu release
@@ -81,10 +78,7 @@ postgres-native-tls = "0.5"
 # is ever compiled or linked there.
 native-tls = { version = "0.2", features = ["vendored"] }
 rand = "0.10"
-postgres-types = {
-    version = "0.2",
-    features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-0_8"],
-}
+postgres-types = { version = "0.2", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-0_8"] }
 bigdecimal = "0.4"
 byteorder = "1"
 uuid = "0.8"
