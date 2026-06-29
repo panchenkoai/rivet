@@ -122,6 +122,65 @@ impl std::fmt::Display for PreclassifiedExit {
 
 impl std::error::Error for PreclassifiedExit {}
 
+/// Typed marker carrying a **stable error code** (`RIVET_CONFIG_*` /
+/// `RIVET_SOURCE_*`) alongside its [`ExitClass`], for config / source failures
+/// that an operator's tooling greps by code rather than by wording.
+///
+/// Same contract as [`DataIntegrityError`]: the code + class ride on the type via
+/// downcast (so a reworded message never moves the code), and `Display`
+/// reproduces the wrapped message verbatim — the console line is unchanged except
+/// for the `[CODE]` prefix `main` adds. [`classify_exit`] reads `class`;
+/// [`error_code`] reads `code` for the JSON `code` field + the text prefix.
+#[derive(Debug)]
+pub struct CodedError {
+    code: &'static str,
+    class: ExitClass,
+    message: String,
+}
+
+impl CodedError {
+    /// Wrap a human-facing message with a stable `RIVET_*` code + exit class.
+    pub fn new(code: &'static str, class: ExitClass, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            class,
+            message: message.into(),
+        }
+    }
+
+    /// The stable `RIVET_*` code.
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+}
+
+impl std::fmt::Display for CodedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CodedError {}
+
+/// The stable `RIVET_*` error code for a failure, if one was tagged via
+/// [`CodedError`] anywhere in the anyhow context chain. `main` surfaces it as the
+/// JSON `code` field and a `[CODE]` prefix on the text error line.
+pub fn error_code(err: &anyhow::Error) -> Option<&'static str> {
+    if let Some(c) = err.downcast_ref::<CodedError>() {
+        return Some(c.code());
+    }
+    // The existing source-side statement-timeout marker also gets a stable code,
+    // so the long-query failure an operator's `statement_timeout` tooling watches
+    // for is greppable without re-tagging its construction site.
+    if err
+        .downcast_ref::<crate::source::StatementDurationTimeout>()
+        .is_some()
+    {
+        return Some(codes::SOURCE_STATEMENT_TIMEOUT);
+    }
+    None
+}
+
 /// Map an error to its process exit code per the [`ExitClass`] taxonomy.
 ///
 /// Precedence (first match wins):
@@ -151,6 +210,11 @@ pub fn classify_exit(err: &anyhow::Error) -> i32 {
     if let Some(p) = err.downcast_ref::<PreclassifiedExit>() {
         return p.0;
     }
+    // A config/source failure tagged with a stable code also carries its class,
+    // so a coded error never collapses to a generic `1`.
+    if let Some(c) = err.downcast_ref::<CodedError>() {
+        return c.class.code();
+    }
     if err.downcast_ref::<SchemaDriftError>().is_some() {
         return ExitClass::SchemaDrift.code();
     }
@@ -165,6 +229,51 @@ pub fn classify_exit(err: &anyhow::Error) -> i32 {
         return ExitClass::Retryable.code();
     }
     ExitClass::Generic.code()
+}
+
+/// Stable, greppable error codes carried by [`CodedError`]. A scheduler / CI step
+/// matches on these (the JSON `code` field or the `[CODE]` text prefix) instead
+/// of the human wording, which is free to change. Every code shares the
+/// `RIVET_CONFIG_` or `RIVET_SOURCE_` prefix; the `codes_*` guard tests assert
+/// distinctness + the prefix, mirroring the verify-layer `RIVET_VERIFY_*` guard.
+pub mod codes {
+    // Config validation — always exit class Generic (`1`): fix the file, no retry.
+    pub const CONFIG_NO_EXPORTS: &str = "RIVET_CONFIG_NO_EXPORTS";
+    pub const CONFIG_CHUNK_COUNT_INVALID: &str = "RIVET_CONFIG_CHUNK_COUNT_INVALID";
+    pub const CONFIG_CHUNK_BY_DAYS_INVALID: &str = "RIVET_CONFIG_CHUNK_BY_DAYS_INVALID";
+    pub const CONFIG_DUPLICATE_EXPORT: &str = "RIVET_CONFIG_DUPLICATE_EXPORT";
+
+    // Source — a statement that ran past the configured duration cap. Carried by
+    // the existing `source::StatementDurationTimeout` marker (recognised in
+    // [`super::error_code`]), so the long-query failure an operator's
+    // `statement_timeout` tooling watches for has a stable code without
+    // re-tagging its construction site. (Connect / auth codes are a deliberate
+    // follow-up: tagging them at `create_source` must preserve the retry path's
+    // transient classification — wrapping the driver error there can blind
+    // `classify_error` and regress retries, so it needs its own careful change.)
+    pub const SOURCE_STATEMENT_TIMEOUT: &str = "RIVET_SOURCE_STATEMENT_TIMEOUT";
+
+    /// Every code, for the stability/uniqueness guard test.
+    #[cfg(test)]
+    pub(crate) const ALL: &[&str] = &[
+        CONFIG_NO_EXPORTS,
+        CONFIG_CHUNK_COUNT_INVALID,
+        CONFIG_CHUNK_BY_DAYS_INVALID,
+        CONFIG_DUPLICATE_EXPORT,
+        SOURCE_STATEMENT_TIMEOUT,
+    ];
+}
+
+/// `return Err`-style bail with a stable `RIVET_CONFIG_*` code (exit class
+/// Generic). Drop-in for `anyhow::bail!` at a config-validation site — the
+/// message text is unchanged; only a typed code rides alongside it.
+#[macro_export]
+macro_rules! config_bail {
+    ($code:expr, $($arg:tt)*) => {
+        return ::core::result::Result::Err(::anyhow::Error::new(
+            $crate::error::CodedError::new(
+                $code, $crate::error::ExitClass::Generic, format!($($arg)*))))
+    };
 }
 
 pub type Result<T> = anyhow::Result<T>;
@@ -261,5 +370,33 @@ mod tests {
         let msg = "export 'orders': 1 quality check(s) failed";
         assert_eq!(format!("{}", DataIntegrityError::new(msg)), msg);
         assert_eq!(format!("{}", SchemaDriftError::new(msg)), msg);
+    }
+
+    #[test]
+    fn coded_error_codes_are_distinct_and_prefixed() {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        for &c in codes::ALL {
+            assert!(seen.insert(c), "duplicate code: {c}");
+            assert!(
+                c.starts_with("RIVET_CONFIG_") || c.starts_with("RIVET_SOURCE_"),
+                "code {c} must share the RIVET_CONFIG_ / RIVET_SOURCE_ prefix",
+            );
+        }
+    }
+
+    #[test]
+    fn coded_error_surfaces_code_and_class_through_anyhow_context() {
+        // The code + class ride on the type through `.context()`; `Display` is the
+        // verbatim message (operator output unchanged but for the `[CODE]` prefix).
+        let e = anyhow::Error::new(CodedError::new(
+            codes::CONFIG_NO_EXPORTS,
+            ExitClass::Generic,
+            "exports: at least one export must be defined",
+        ))
+        .context("while loading config");
+        assert_eq!(error_code(&e), Some(codes::CONFIG_NO_EXPORTS));
+        assert_eq!(classify_exit(&e), ExitClass::Generic.code());
+        assert!(format!("{e:#}").contains("at least one export must be defined"));
     }
 }

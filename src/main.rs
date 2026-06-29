@@ -64,11 +64,17 @@ fn main() {
         // scheduler branches on the code (2=retryable, 3=data-integrity,
         // 4=schema-drift, 1=generic) instead of grepping `msg`.
         let exit_class = crate::error::classify_exit(&e);
+        // A config/source failure tagged with a stable `RIVET_*` code surfaces it
+        // for greppable tooling: a `code` field in JSON, a `[CODE]` text prefix.
+        let code = crate::error::error_code(&e);
         if json_errors {
-            eprintln!(
-                "{}",
-                serde_json::json!({ "error": msg, "exit_class": exit_class })
-            );
+            let mut obj = serde_json::json!({ "error": msg, "exit_class": exit_class });
+            if let Some(c) = code {
+                obj["code"] = serde_json::Value::String(c.to_string());
+            }
+            eprintln!("{obj}");
+        } else if let Some(c) = code {
+            eprintln!("Error: [{c}] {msg}");
         } else {
             eprintln!("Error: {msg}");
         }
