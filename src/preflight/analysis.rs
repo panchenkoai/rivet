@@ -366,22 +366,17 @@ pub(crate) fn recommend_parallelism(
 }
 
 /// Collect all warnings (B3-B6) for an export.
-/// Severity of a preflight `check` warning, low → blocking. A scheduler / CI can
-/// gate on `blocking`/`high` and treat `low`/`medium` as advisory. Serializes
-/// lowercase so `check --json`'s `warnings[].severity` is a stable token.
+/// Severity of a preflight `check` warning, low → high. A scheduler / CI can gate
+/// on `high` and treat `low`/`medium` as advisory. Serializes lowercase so
+/// `check --json`'s `warnings[].severity` is a stable token. (A genuine "do not
+/// run" is the `UNSAFE` health verdict, not a warning — so there is no `blocking`
+/// warning level; add one only when a blocking *warning* actually exists.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Severity {
     Low,
     Medium,
     High,
-    /// Reserved top level for the stable 4-token contract. No current preflight
-    /// *warning* is constructed at this level — a genuine "do not run" is the
-    /// `UNSAFE` health verdict, not a warning — but the token exists so a future
-    /// blocking warning (or an external consumer's gate) has it without a
-    /// breaking enum change.
-    #[allow(dead_code)]
-    Blocking,
 }
 
 impl Severity {
@@ -391,7 +386,6 @@ impl Severity {
             Severity::Low => "LOW",
             Severity::Medium => "MEDIUM",
             Severity::High => "HIGH",
-            Severity::Blocking => "BLOCKING",
         }
     }
 }

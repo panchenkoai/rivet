@@ -123,27 +123,31 @@ impl std::fmt::Display for PreclassifiedExit {
 impl std::error::Error for PreclassifiedExit {}
 
 /// Typed marker carrying a **stable error code** (`RIVET_CONFIG_*` /
-/// `RIVET_SOURCE_*`) alongside its [`ExitClass`], for config / source failures
-/// that an operator's tooling greps by code rather than by wording.
+/// `RIVET_SOURCE_*`), for config / source failures that an operator's tooling
+/// greps by code rather than by wording.
 ///
-/// Same contract as [`DataIntegrityError`]: the code + class ride on the type via
+/// Same contract as [`DataIntegrityError`]: the code rides on the type via
 /// downcast (so a reworded message never moves the code), and `Display`
 /// reproduces the wrapped message verbatim — the console line is unchanged except
-/// for the `[CODE]` prefix `main` adds. [`classify_exit`] reads `class`;
-/// [`error_code`] reads `code` for the JSON `code` field + the text prefix.
+/// for the `[CODE]` prefix `main` adds. [`error_code`] reads `code` for the JSON
+/// `code` field + the text prefix.
+///
+/// A `CodedError` is always exit class `Generic` (config / usage — fix it, don't
+/// retry), which is already [`classify_exit`]'s default, so it carries no class
+/// and needs no downcast arm there. The first coded error that needs a
+/// non-`Generic` class (e.g. a retryable source failure) is where a class field
+/// would be reintroduced — until then it is dead weight.
 #[derive(Debug)]
 pub struct CodedError {
     code: &'static str,
-    class: ExitClass,
     message: String,
 }
 
 impl CodedError {
-    /// Wrap a human-facing message with a stable `RIVET_*` code + exit class.
-    pub fn new(code: &'static str, class: ExitClass, message: impl Into<String>) -> Self {
+    /// Wrap a human-facing message with a stable `RIVET_*` code.
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
-            class,
             message: message.into(),
         }
     }
@@ -210,11 +214,8 @@ pub fn classify_exit(err: &anyhow::Error) -> i32 {
     if let Some(p) = err.downcast_ref::<PreclassifiedExit>() {
         return p.0;
     }
-    // A config/source failure tagged with a stable code also carries its class,
-    // so a coded error never collapses to a generic `1`.
-    if let Some(c) = err.downcast_ref::<CodedError>() {
-        return c.class.code();
-    }
+    // A `CodedError` (config validation) is always exit class `Generic`, which is
+    // this function's default below — so it needs no arm of its own here.
     if err.downcast_ref::<SchemaDriftError>().is_some() {
         return ExitClass::SchemaDrift.code();
     }
@@ -271,8 +272,7 @@ pub mod codes {
 macro_rules! config_bail {
     ($code:expr, $($arg:tt)*) => {
         return ::core::result::Result::Err(::anyhow::Error::new(
-            $crate::error::CodedError::new(
-                $code, $crate::error::ExitClass::Generic, format!($($arg)*))))
+            $crate::error::CodedError::new($code, format!($($arg)*))))
     };
 }
 
@@ -386,12 +386,13 @@ mod tests {
     }
 
     #[test]
-    fn coded_error_surfaces_code_and_class_through_anyhow_context() {
-        // The code + class ride on the type through `.context()`; `Display` is the
+    fn coded_error_surfaces_code_through_anyhow_context() {
+        // The code rides on the type through `.context()`; `Display` is the
         // verbatim message (operator output unchanged but for the `[CODE]` prefix).
+        // `classify_exit` returns `Generic` via its default (no `CodedError` arm),
+        // proving the dropped `class` field changed nothing.
         let e = anyhow::Error::new(CodedError::new(
             codes::CONFIG_NO_EXPORTS,
-            ExitClass::Generic,
             "exports: at least one export must be defined",
         ))
         .context("while loading config");
