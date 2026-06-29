@@ -36,4 +36,20 @@ else
   cargo test --tests --quiet
 fi
 
+# The test run above ran a non-`--locked` cargo build, which silently reconciles
+# the working-tree Cargo.lock against Cargo.toml. If that left the lock DIRTY,
+# the COMMITTED lock was stale — and the pushed commit would fail the release's
+# `cargo publish --locked` (exit 101, *after* the tag is cut). 0.16.1 stalled
+# exactly this way: a version bump regenerated the lock but never committed it.
+# Checking *after* the build is the trick — it forces the reconcile that exposes
+# a committed-stale lock as a dirty working tree (a pre-build `--locked` check
+# sees the already-reconciled tree and is fooled).
+if ! git diff --quiet -- Cargo.lock; then
+  echo "pre-push: ERROR — Cargo.lock is out of sync with Cargo.toml." >&2
+  echo "  The test run just reconciled it, so the committed lock is stale and the" >&2
+  echo "  release's 'cargo publish --locked' would abort. Commit the synced lock:" >&2
+  echo "    git add Cargo.lock && git commit --amend --no-edit   (or a fresh commit)" >&2
+  exit 1
+fi
+
 echo "pre-push: ok"
