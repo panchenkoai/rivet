@@ -33,42 +33,65 @@ fn print_doctor_json(config_path: &str, all_ok: bool, checks: &[DoctorCheck]) {
     );
 }
 
+/// Record a check and, in text mode, render its `[OK]/[FAIL]` line **from the
+/// same struct**. One call per check — there is no second hand-written line to
+/// drift out of sync with the `--json` report (the dual-emit this replaced had
+/// a `println!` and a `push` maintained in parallel at every site). A `FAIL`
+/// always carries `detail` at its call sites; `unwrap_or("")` is a belt-and-
+/// braces fallback, not an expected path.
+fn emit_check(checks: &mut Vec<DoctorCheck>, json: bool, check: DoctorCheck) {
+    if !json {
+        if check.ok {
+            println!("[OK]  {}", check.name);
+        } else {
+            println!(
+                "[FAIL] {}: {}",
+                check.name,
+                check.detail.as_deref().unwrap_or("")
+            );
+            if let Some(h) = &check.hint {
+                println!("       Hint: {}", h);
+            }
+        }
+    }
+    checks.push(check);
+}
+
 pub fn doctor(config_path: &str, json: bool) -> Result<()> {
     if !json {
         println!("rivet doctor: verifying auth for config '{}'", config_path);
         println!();
     }
-    // Collected for `--json`; the text path still prints inline (gated `!json`)
-    // so its output is byte-for-byte what it was before.
     let mut checks: Vec<DoctorCheck> = Vec::new();
 
     let config = match Config::load(config_path) {
         Ok(c) => {
-            checks.push(DoctorCheck {
-                name: "Config parsed successfully".into(),
-                ok: true,
-                detail: None,
-                hint: None,
-            });
-            if !json {
-                println!("[OK]  Config parsed successfully");
-            }
+            emit_check(
+                &mut checks,
+                json,
+                DoctorCheck {
+                    name: "Config parsed successfully".into(),
+                    ok: true,
+                    detail: None,
+                    hint: None,
+                },
+            );
             c
         }
         Err(e) => {
-            // L4: surface the config error exactly once. Exit code stays non-zero
-            // because we still return `Err`.
-            let detail = trim_probe_error(&e);
-            if json {
-                checks.push(DoctorCheck {
-                    name: "Config".into(),
+            // L4: surface the config error exactly once; exit stays non-zero.
+            emit_check(
+                &mut checks,
+                json,
+                DoctorCheck {
+                    name: "Config error".into(),
                     ok: false,
-                    detail: Some(detail),
+                    detail: Some(trim_probe_error(&e)),
                     hint: None,
-                });
+                },
+            );
+            if json {
                 print_doctor_json(config_path, false, &checks);
-            } else {
-                println!("[FAIL] Config error: {}", detail);
             }
             anyhow::bail!("doctor: config check failed (see output above)")
         }
@@ -78,35 +101,37 @@ pub fn doctor(config_path: &str, json: bool) -> Result<()> {
 
     match check_source_auth(&config) {
         Ok(()) => {
-            checks.push(DoctorCheck {
-                name: format!("Source auth ({:?})", config.source.source_type),
-                ok: true,
-                detail: None,
-                hint: None,
-            });
+            emit_check(
+                &mut checks,
+                json,
+                DoctorCheck {
+                    name: format!("Source auth ({:?})", config.source.source_type),
+                    ok: true,
+                    detail: None,
+                    hint: None,
+                },
+            );
+            // Text-only advisory (live probe, no JSON counterpart) — stays inline
+            // after the source line, so its position is unchanged.
             if !json {
-                println!("[OK]  Source auth ({:?})", config.source.source_type);
                 note_mssql_harm_permission(&config);
             }
         }
         Err(e) => {
             all_ok = false;
             let category = categorize_source_error(&e);
-            let detail = trim_probe_error(&e);
             let hint =
                 source_error_hint(category, &e, &config.source.source_type).map(|h| h.to_string());
-            checks.push(DoctorCheck {
-                name: format!("Source {}", category),
-                ok: false,
-                detail: Some(detail.clone()),
-                hint: hint.clone(),
-            });
-            if !json {
-                println!("[FAIL] Source {}: {}", category, detail);
-                if let Some(h) = &hint {
-                    println!("       Hint: {}", h);
-                }
-            }
+            emit_check(
+                &mut checks,
+                json,
+                DoctorCheck {
+                    name: format!("Source {}", category),
+                    ok: false,
+                    detail: Some(trim_probe_error(&e)),
+                    hint,
+                },
+            );
         }
     }
 
@@ -138,15 +163,16 @@ pub fn doctor(config_path: &str, json: bool) -> Result<()> {
             DestinationType::Stdout => {
                 // L23: stdout streams to the terminal — nothing to auth-probe —
                 // but say so explicitly so the operator sees it was considered.
-                checks.push(DoctorCheck {
-                    name: "Destination Stdout (streaming; no preflight needed)".into(),
-                    ok: true,
-                    detail: None,
-                    hint: None,
-                });
-                if !json {
-                    println!("[OK]  Destination Stdout (streaming; no preflight needed)");
-                }
+                emit_check(
+                    &mut checks,
+                    json,
+                    DoctorCheck {
+                        name: "Destination Stdout (streaming; no preflight needed)".into(),
+                        ok: true,
+                        detail: None,
+                        hint: None,
+                    },
+                );
                 continue;
             }
         };
@@ -159,33 +185,31 @@ pub fn doctor(config_path: &str, json: bool) -> Result<()> {
         );
         match check_destination_auth(&expanded_dest) {
             Ok(()) => {
-                checks.push(DoctorCheck {
-                    name: format!("Destination {}", label),
-                    ok: true,
-                    detail: None,
-                    hint: None,
-                });
-                if !json {
-                    println!("[OK]  Destination {}", label);
-                }
+                emit_check(
+                    &mut checks,
+                    json,
+                    DoctorCheck {
+                        name: format!("Destination {}", label),
+                        ok: true,
+                        detail: None,
+                        hint: None,
+                    },
+                );
             }
             Err(e) => {
                 all_ok = false;
                 let category = categorize_dest_error(&e, &expanded_dest);
-                let detail = trim_probe_error(&e);
                 let hint = destination_error_hint(category, &expanded_dest).map(|h| h.to_string());
-                checks.push(DoctorCheck {
-                    name: format!("Destination {} -- {}", label, category),
-                    ok: false,
-                    detail: Some(detail.clone()),
-                    hint: hint.clone(),
-                });
-                if !json {
-                    println!("[FAIL] Destination {} -- {}: {}", label, category, detail);
-                    if let Some(h) = &hint {
-                        println!("       Hint: {}", h);
-                    }
-                }
+                emit_check(
+                    &mut checks,
+                    json,
+                    DoctorCheck {
+                        name: format!("Destination {} -- {}", label, category),
+                        ok: false,
+                        detail: Some(trim_probe_error(&e)),
+                        hint,
+                    },
+                );
             }
         }
     }
