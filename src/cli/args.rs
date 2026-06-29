@@ -499,6 +499,10 @@ pub enum StateAction {
         /// Number of recent files to show
         #[arg(short, long, default_value = "50")]
         last: usize,
+        /// Emit the file list as a JSON array to stdout (CI completeness checks)
+        /// instead of the text table. Empty → `[]`.
+        #[arg(long)]
+        json: bool,
     },
     /// Clear persisted chunk checkpoint rows (`chunk_run` / `chunk_task`).
     ResetChunks {

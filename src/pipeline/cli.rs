@@ -174,10 +174,21 @@ pub fn reset_state(config_path: &str, export_name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn show_files(config_path: &str, export_name: Option<&str>, limit: usize) -> Result<()> {
+pub fn show_files(
+    config_path: &str,
+    export_name: Option<&str>,
+    limit: usize,
+    json: bool,
+) -> Result<()> {
     require_config(config_path)?;
     let state = StateStore::open(config_path)?;
     let files = state.get_files(export_name, limit)?;
+    if json {
+        // FileRecord is a stable inspect row — serialize it directly. Empty → `[]`
+        // (valid JSON) so a CI completeness check never special-cases.
+        println!("{}", serde_json::to_string_pretty(&files)?);
+        return Ok(());
+    }
     if files.is_empty() {
         println!("No files recorded yet.");
         return Ok(());
@@ -830,7 +841,7 @@ exports:
     fn show_files_empty_returns_ok() {
         let (dir, config_path) = setup_dir();
         let _ = open_state(&dir);
-        assert!(show_files(&config_path, None, 10).is_ok());
+        assert!(show_files(&config_path, None, 10, false).is_ok());
     }
 
     #[test]
@@ -849,7 +860,7 @@ exports:
             )
             .unwrap();
         drop(state);
-        assert!(show_files(&config_path, Some("orders"), 10).is_ok());
+        assert!(show_files(&config_path, Some("orders"), 10, false).is_ok());
     }
 
     // ── show_metrics ─────────────────────────────────────────────────────────
@@ -1030,7 +1041,7 @@ exports:
 
         for res in [
             show_state(&missing),
-            show_files(&missing, None, 10),
+            show_files(&missing, None, 10, false),
             show_metrics(&missing, None, 10, false),
             show_progression(&missing, None),
             show_journal(&missing, "orders", 5, None),

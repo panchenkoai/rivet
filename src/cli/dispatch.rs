@@ -606,7 +606,8 @@ fn dispatch_state(action: StateAction) -> Result<()> {
             config,
             export,
             last,
-        } => pipeline::show_files(&config, export.as_deref(), last),
+            json,
+        } => pipeline::show_files(&config, export.as_deref(), last, json),
         StateAction::ResetChunks {
             config,
             export,
