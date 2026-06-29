@@ -541,6 +541,10 @@ pub enum StateAction {
         config: String,
         #[arg(short, long)]
         export: String,
+        /// Emit the checkpoint (run header + per-chunk tasks) as a JSON object to
+        /// stdout instead of the text table. No checkpoint → `null`.
+        #[arg(long)]
+        json: bool,
     },
     /// Show committed / verified export boundaries (the last fully-exported cursor position)
     Progression {

@@ -622,7 +622,11 @@ fn dispatch_state(action: StateAction) -> Result<()> {
                 Ok(())
             }
         }
-        StateAction::Chunks { config, export } => pipeline::show_chunk_checkpoint(&config, &export),
+        StateAction::Chunks {
+            config,
+            export,
+            json,
+        } => pipeline::show_chunk_checkpoint(&config, &export, json),
         StateAction::Progression { config, export } => {
             pipeline::show_progression(&config, export.as_deref())
         }

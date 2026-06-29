@@ -385,9 +385,44 @@ pub fn reset_chunk_checkpoints_stuck(config_path: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn show_chunk_checkpoint(config_path: &str, export_name: &str) -> Result<()> {
+pub fn show_chunk_checkpoint(config_path: &str, export_name: &str, json: bool) -> Result<()> {
     require_config(config_path)?;
     let state = StateStore::open(config_path)?;
+    if json {
+        // Composite (run header + per-chunk tasks) built inline so no state-layer
+        // type needs `Serialize`. No checkpoint → `null` (valid JSON).
+        let report = match state.get_latest_chunk_run(export_name)? {
+            None => serde_json::Value::Null,
+            Some((run_id, plan_hash, status, updated_at)) => {
+                let tasks: Vec<serde_json::Value> = state
+                    .list_chunk_tasks_for_run(&run_id)?
+                    .iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "chunk_index": t.chunk_index,
+                            "status": t.status,
+                            "start_key": t.start_key,
+                            "end_key": t.end_key,
+                            "attempts": t.attempts,
+                            "rows_written": t.rows_written,
+                            "file_name": t.file_name,
+                            "last_error": t.last_error,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "export": export_name,
+                    "run_id": run_id,
+                    "plan_hash": plan_hash,
+                    "status": status,
+                    "updated_at": updated_at,
+                    "tasks": tasks,
+                })
+            }
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
     println!(
         "database:   {}",
         StateStore::state_db_path(config_path).display()
@@ -1051,7 +1086,7 @@ exports:
             show_metrics(&missing, None, 10, false),
             show_progression(&missing, None),
             show_journal(&missing, "orders", 5, None),
-            show_chunk_checkpoint(&missing, "orders"),
+            show_chunk_checkpoint(&missing, "orders", false),
             reset_state(&missing, "orders"),
             reset_chunk_checkpoint(&missing, "orders"),
         ] {
@@ -1147,6 +1182,6 @@ exports:
     fn show_chunk_checkpoint_no_data_returns_ok() {
         let (dir, config_path) = setup_dir();
         let _ = open_state(&dir);
-        assert!(show_chunk_checkpoint(&config_path, "orders").is_ok());
+        assert!(show_chunk_checkpoint(&config_path, "orders", false).is_ok());
     }
 }
