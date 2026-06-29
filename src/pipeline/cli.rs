@@ -47,10 +47,16 @@ fn require_known_export(config: &Config, config_path: &str, export_name: &str) -
     );
 }
 
-pub fn show_state(config_path: &str) -> Result<()> {
+pub fn show_state(config_path: &str, json: bool) -> Result<()> {
     require_config(config_path)?;
     let state = StateStore::open(config_path)?;
     let states = state.list_all()?;
+    if json {
+        // Incremental-cursor rows; serialize directly. Empty → `[]` (the text
+        // path's "no cursor / never ran" guidance is operator help, not data).
+        println!("{}", serde_json::to_string_pretty(&states)?);
+        return Ok(());
+    }
     if states.is_empty() {
         // `state.list_all()` returns only incremental-cursor rows. Chunked
         // and full runs land in different tables (`export_metrics`,
@@ -823,7 +829,7 @@ exports:
     fn show_state_empty_db_returns_ok() {
         let (dir, config_path) = setup_dir();
         let _ = open_state(&dir); // create the DB file
-        assert!(show_state(&config_path).is_ok());
+        assert!(show_state(&config_path, false).is_ok());
     }
 
     #[test]
@@ -832,7 +838,7 @@ exports:
         let state = open_state(&dir);
         state.update("orders", "2025-01-15").unwrap();
         drop(state);
-        assert!(show_state(&config_path).is_ok());
+        assert!(show_state(&config_path, false).is_ok());
     }
 
     // ── show_files ───────────────────────────────────────────────────────────
@@ -1040,7 +1046,7 @@ exports:
             .to_string();
 
         for res in [
-            show_state(&missing),
+            show_state(&missing, false),
             show_files(&missing, None, 10, false),
             show_metrics(&missing, None, 10, false),
             show_progression(&missing, None),

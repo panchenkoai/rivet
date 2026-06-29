@@ -600,7 +600,7 @@ fn dispatch_repair(
 
 fn dispatch_state(action: StateAction) -> Result<()> {
     match action {
-        StateAction::Show { config } => pipeline::show_state(&config),
+        StateAction::Show { config, json } => pipeline::show_state(&config, json),
         StateAction::Reset { config, export } => pipeline::reset_state(&config, &export),
         StateAction::Files {
             config,

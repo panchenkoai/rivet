@@ -480,6 +480,10 @@ pub enum StateAction {
     Show {
         #[arg(short, long)]
         config: String,
+        /// Emit the incremental-cursor state as a JSON array to stdout instead
+        /// of the text table. Empty → `[]`.
+        #[arg(long)]
+        json: bool,
     },
     /// Reset state for an export
     Reset {
