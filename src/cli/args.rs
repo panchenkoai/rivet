@@ -426,6 +426,10 @@ pub enum Commands {
         /// Number of recent runs to show
         #[arg(short, long, default_value = "20")]
         last: usize,
+        /// Emit the metrics as a JSON array to stdout (for CI / dashboards)
+        /// instead of the text table. Empty history prints `[]`.
+        #[arg(long)]
+        json: bool,
     },
     /// Emit machine-readable schemas for Rivet's data contracts.
     ///

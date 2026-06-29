@@ -203,7 +203,12 @@ pub fn show_files(config_path: &str, export_name: Option<&str>, limit: usize) ->
     Ok(())
 }
 
-pub fn show_metrics(config_path: &str, export_name: Option<&str>, limit: usize) -> Result<()> {
+pub fn show_metrics(
+    config_path: &str,
+    export_name: Option<&str>,
+    limit: usize,
+    json: bool,
+) -> Result<()> {
     let config = require_config(config_path)?;
     // A typo'd `--export` must not masquerade as "no runs yet". Now that the
     // config is loaded, check the requested name against the declared exports
@@ -214,6 +219,17 @@ pub fn show_metrics(config_path: &str, export_name: Option<&str>, limit: usize) 
     }
     let state = StateStore::open(config_path)?;
     let metrics = state.get_metrics(export_name, limit)?;
+    if json {
+        // Reuse the run aggregate's serializable DTO so `metrics --json` and the
+        // run summary's `--json` agree field-for-field. Empty → `[]` (valid JSON),
+        // not the text "no metrics" line, so a CI consumer never special-cases.
+        let rows: Vec<super::aggregate::MetricRowJson> = metrics
+            .iter()
+            .map(super::aggregate::MetricRowJson::from)
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
     if metrics.is_empty() {
         println!("No metrics recorded yet.");
         return Ok(());
@@ -745,7 +761,7 @@ exports:
     fn show_metrics_unknown_export_bails_with_known_names() {
         let (dir, config_path) = setup_dir(); // declares orders + transactions
         let _ = open_state(&dir);
-        let err = show_metrics(&config_path, Some("ghost"), 10).unwrap_err();
+        let err = show_metrics(&config_path, Some("ghost"), 10, false).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("export 'ghost' is not defined"),
@@ -763,7 +779,7 @@ exports:
     fn show_metrics_known_but_unrun_export_returns_ok() {
         let (dir, config_path) = setup_dir();
         let _ = open_state(&dir);
-        assert!(show_metrics(&config_path, Some("orders"), 10).is_ok());
+        assert!(show_metrics(&config_path, Some("orders"), 10, false).is_ok());
     }
 
     // Same gap on `journal` when querying by export name (no --run-id).
@@ -842,7 +858,7 @@ exports:
     fn show_metrics_empty_returns_ok() {
         let (dir, config_path) = setup_dir();
         let _ = open_state(&dir);
-        assert!(show_metrics(&config_path, None, 10).is_ok());
+        assert!(show_metrics(&config_path, None, 10, false).is_ok());
     }
 
     #[test]
@@ -892,7 +908,7 @@ exports:
             )
             .unwrap();
         drop(state);
-        assert!(show_metrics(&config_path, Some("orders"), 10).is_ok());
+        assert!(show_metrics(&config_path, Some("orders"), 10, false).is_ok());
     }
 
     // ── show_journal ─────────────────────────────────────────────────────────
@@ -1015,7 +1031,7 @@ exports:
         for res in [
             show_state(&missing),
             show_files(&missing, None, 10),
-            show_metrics(&missing, None, 10),
+            show_metrics(&missing, None, 10, false),
             show_progression(&missing, None),
             show_journal(&missing, "orders", 5, None),
             show_chunk_checkpoint(&missing, "orders"),

@@ -196,7 +196,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             config,
             export,
             last,
-        } => pipeline::show_metrics(&config, export.as_deref(), last),
+            json,
+        } => pipeline::show_metrics(&config, export.as_deref(), last, json),
         Commands::Journal {
             config,
             export,
