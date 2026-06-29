@@ -67,6 +67,14 @@ jobs:
         with:
           toolchain: "1.94"
       - uses: Swatinem/rust-cache@v2
+      # The release publishes with `cargo publish --locked`; mirror that here on
+      # the clean checkout — BEFORE any `cargo test`/`build` silently reconciles
+      # the working-tree lock — so a Cargo.toml version bump that forgot to commit
+      # the regenerated Cargo.lock fails the PR, not the tag. (0.16.1's crates.io
+      # publish stalled exactly this way: lock still pinned 0.16.0.) `cargo
+      # metadata` resolves without compiling, so this is a couple of seconds.
+      - name: Cargo.lock is in sync with Cargo.toml (release uses --locked)
+        run: cargo metadata --locked --format-version 1 > /dev/null
       # `cargo test --all-targets` links every integration-test binary in the
       # DEBUG profile — each statically links the full dep tree (arrow / parquet
       # / openssl / ring / tiberius) with full debug info, hundreds of MB apiece.

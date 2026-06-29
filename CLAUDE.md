@@ -153,3 +153,23 @@ stricter MSRV image, a `--locked` resolve) can reject what `cargo build` accepts
 add a **local regression guard** that mimics its check (here: the
 `cargo_manifest_chef` offline test asserts no multi-line inline tables) so the
 mismatch fails loud and local instead of half-way through publishing.
+
+The very next release (0.16.1) proved how easy it is to get the *guard itself*
+wrong. The release runs `cargo publish --locked`; a version bump that did not
+commit the regenerated `Cargo.lock` (lock still pinned 0.16.0 against a 0.16.1
+manifest) made `--locked` abort with exit 101 — again *after* the tag was cut.
+The obvious guard, an offline test that reads `Cargo.lock` at runtime and
+compares its `rivet-cli` version to `Cargo.toml`, **does not work**: `cargo test`
+silently reconciles the working-tree lock *before* the test body runs, so the
+test always reads the fixed version and passes even on a stale committed lock.
+(Proven by running the RED case — the desynced lock still passed.) The staleness
+lives only in git, and `cargo` erases it on the way to running your check.
+
+Process rule: **a guard for a `--locked` mismatch must itself run `--locked` on a
+clean tree, not read files at runtime.** The working guard is a CI step —
+`cargo metadata --locked` on the freshly-checked-out commit, *before* any
+`cargo build`/`test` reconciles the lock — which fails fast on a stale committed
+lock without compiling. More generally: when a check's subject is mutated by the
+act of checking it (cargo reconciling the lock, a formatter rewriting the file),
+the runtime read is a no-op; assert against the committed state or the
+strict-mode tool, never the post-reconcile working tree.
