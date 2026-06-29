@@ -138,6 +138,10 @@ pub enum Commands {
         /// Path to YAML config file
         #[arg(short, long)]
         config: String,
+        /// Emit the probe results as a JSON object (`{config_path, all_ok,
+        /// checks: [{name, ok, detail?, hint?}]}`) instead of the text report.
+        #[arg(long)]
+        json: bool,
     },
     /// Stream change data capture (CDC) from a source's transaction log.
     ///

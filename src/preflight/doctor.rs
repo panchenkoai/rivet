@@ -1,23 +1,76 @@
 use crate::config::{Config, DestinationType, SourceType};
 use crate::error::Result;
 
-pub fn doctor(config_path: &str) -> Result<()> {
-    println!("rivet doctor: verifying auth for config '{}'", config_path);
-    println!();
+/// One `rivet doctor` probe result. `doctor --json` emits these as an array; the
+/// text path prints the same data as `[OK]/[FAIL] <name>` lines (byte-identical
+/// to before — the `println!`s are unchanged, just gated on `!json`).
+#[derive(Debug, Clone, serde::Serialize)]
+struct DoctorCheck {
+    name: String,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DoctorReport {
+    config_path: String,
+    all_ok: bool,
+    checks: Vec<DoctorCheck>,
+}
+
+fn print_doctor_json(config_path: &str, all_ok: bool, checks: &[DoctorCheck]) {
+    let report = DoctorReport {
+        config_path: config_path.to_string(),
+        all_ok,
+        checks: checks.to_vec(),
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into())
+    );
+}
+
+pub fn doctor(config_path: &str, json: bool) -> Result<()> {
+    if !json {
+        println!("rivet doctor: verifying auth for config '{}'", config_path);
+        println!();
+    }
+    // Collected for `--json`; the text path still prints inline (gated `!json`)
+    // so its output is byte-for-byte what it was before.
+    let mut checks: Vec<DoctorCheck> = Vec::new();
 
     let config = match Config::load(config_path) {
         Ok(c) => {
-            println!("[OK]  Config parsed successfully");
+            checks.push(DoctorCheck {
+                name: "Config parsed successfully".into(),
+                ok: true,
+                detail: None,
+                hint: None,
+            });
+            if !json {
+                println!("[OK]  Config parsed successfully");
+            }
             c
         }
         Err(e) => {
-            // L4: surface the config error exactly once. The detailed message
-            // is printed here in doctor's `[FAIL]` style; `main` then prints a
-            // distinct one-line pointer (not a duplicate of the same text) —
-            // mirroring the `bail!` pointer used for the failed-checks summary
-            // below. Exit code stays non-zero because we still return `Err`.
-            println!("[FAIL] Config error: {}", trim_probe_error(&e));
-            anyhow::bail!("doctor: config check failed (see [FAIL] above)")
+            // L4: surface the config error exactly once. Exit code stays non-zero
+            // because we still return `Err`.
+            let detail = trim_probe_error(&e);
+            if json {
+                checks.push(DoctorCheck {
+                    name: "Config".into(),
+                    ok: false,
+                    detail: Some(detail),
+                    hint: None,
+                });
+                print_doctor_json(config_path, false, &checks);
+            } else {
+                println!("[FAIL] Config error: {}", detail);
+            }
+            anyhow::bail!("doctor: config check failed (see output above)")
         }
     };
 
@@ -25,15 +78,34 @@ pub fn doctor(config_path: &str) -> Result<()> {
 
     match check_source_auth(&config) {
         Ok(()) => {
-            println!("[OK]  Source auth ({:?})", config.source.source_type);
-            note_mssql_harm_permission(&config);
+            checks.push(DoctorCheck {
+                name: format!("Source auth ({:?})", config.source.source_type),
+                ok: true,
+                detail: None,
+                hint: None,
+            });
+            if !json {
+                println!("[OK]  Source auth ({:?})", config.source.source_type);
+                note_mssql_harm_permission(&config);
+            }
         }
         Err(e) => {
             all_ok = false;
             let category = categorize_source_error(&e);
-            println!("[FAIL] Source {}: {}", category, trim_probe_error(&e));
-            if let Some(hint) = source_error_hint(category, &e, &config.source.source_type) {
-                println!("       Hint: {}", hint);
+            let detail = trim_probe_error(&e);
+            let hint =
+                source_error_hint(category, &e, &config.source.source_type).map(|h| h.to_string());
+            checks.push(DoctorCheck {
+                name: format!("Source {}", category),
+                ok: false,
+                detail: Some(detail.clone()),
+                hint: hint.clone(),
+            });
+            if !json {
+                println!("[FAIL] Source {}: {}", category, detail);
+                if let Some(h) = &hint {
+                    println!("       Hint: {}", h);
+                }
             }
         }
     }
@@ -64,54 +136,76 @@ pub fn doctor(config_path: &str) -> Result<()> {
                 export.destination.bucket.as_deref().unwrap_or("?")
             ),
             DestinationType::Stdout => {
-                // L23: stdout streams to the terminal — there is nothing to
-                // auth-probe — but say so explicitly so the operator sees the
-                // destination was considered, not silently skipped.
-                println!("[OK]  Destination Stdout (streaming; no preflight needed)");
+                // L23: stdout streams to the terminal — nothing to auth-probe —
+                // but say so explicitly so the operator sees it was considered.
+                checks.push(DoctorCheck {
+                    name: "Destination Stdout (streaming; no preflight needed)".into(),
+                    ok: true,
+                    detail: None,
+                    hint: None,
+                });
+                if !json {
+                    println!("[OK]  Destination Stdout (streaming; no preflight needed)");
+                }
                 continue;
             }
         };
 
-        // Apply `{date}`/`{export}`/`{table}` substitution so the probe
-        // write lands at the same prefix `run` would use — otherwise we
-        // leave a literal `runs/{date}/{export}/.rivet_doctor_probe` object
-        // at the destination (visible on 2026-05-21 against real Azure).
+        // Apply `{date}`/`{export}`/`{table}` substitution so the probe write
+        // lands at the same prefix `run` would use.
         let expanded_dest = crate::plan::build::expand_destination_templates(
             export.destination.clone(),
             &export.name,
         );
         match check_destination_auth(&expanded_dest) {
-            Ok(()) => println!("[OK]  Destination {}", label),
+            Ok(()) => {
+                checks.push(DoctorCheck {
+                    name: format!("Destination {}", label),
+                    ok: true,
+                    detail: None,
+                    hint: None,
+                });
+                if !json {
+                    println!("[OK]  Destination {}", label);
+                }
+            }
             Err(e) => {
                 all_ok = false;
                 let category = categorize_dest_error(&e, &expanded_dest);
-                println!(
-                    "[FAIL] Destination {} -- {}: {}",
-                    label,
-                    category,
-                    trim_probe_error(&e)
-                );
-                if let Some(hint) = destination_error_hint(category, &expanded_dest) {
-                    println!("       Hint: {}", hint);
+                let detail = trim_probe_error(&e);
+                let hint = destination_error_hint(category, &expanded_dest).map(|h| h.to_string());
+                checks.push(DoctorCheck {
+                    name: format!("Destination {} -- {}", label, category),
+                    ok: false,
+                    detail: Some(detail.clone()),
+                    hint: hint.clone(),
+                });
+                if !json {
+                    println!("[FAIL] Destination {} -- {}: {}", label, category, detail);
+                    if let Some(h) = &hint {
+                        println!("       Hint: {}", h);
+                    }
                 }
             }
         }
     }
 
-    println!();
+    if json {
+        print_doctor_json(config_path, all_ok, &checks);
+    } else {
+        println!();
+        if all_ok {
+            println!("All checks passed.");
+            println!("Next: rivet check -c {config_path}   # column-type & schema report");
+        } else {
+            // F-NEW-A (0.7.5 audit): the exit code now matches the fail-line so
+            // CI / cron can tell a healthy environment from a broken one.
+            println!("Some checks failed. Fix the issues above before running exports.");
+        }
+    }
     if all_ok {
-        println!("All checks passed.");
-        // Keep the ladder going to the next rung instead of ending cold.
-        println!("Next: rivet check -c {config_path}   # column-type & schema report");
         Ok(())
     } else {
-        // F-NEW-A (0.7.5 audit): previously `doctor` printed
-        // "Some checks failed" and returned `Ok(())`, so the exit
-        // code was 0 even when source auth or destination probe
-        // failed.  CI / cron orchestration that only inspects rc
-        // could not tell a healthy environment from a broken one.
-        // The fail-line is still printed; the exit code now matches.
-        println!("Some checks failed. Fix the issues above before running exports.");
         anyhow::bail!("doctor: one or more preflight checks failed (see output above)")
     }
 }
@@ -590,7 +684,7 @@ exports:
 
         // Returns Err (source auth fails on the unset env var); the
         // destination probes are the observable under test.
-        let _ = doctor(config_path.to_str().unwrap());
+        let _ = doctor(config_path.to_str().unwrap(), false);
 
         let probe = crate::manifest::DOCTOR_PROBE_FILENAME;
 
@@ -1003,11 +1097,11 @@ exports:
         // Invalid YAML structure → Config::load fails with a parse/missing-field
         // message; doctor must convert that to a pointer error.
         std::fs::write(&cfg, "source: not-a-mapping\n").unwrap();
-        let err = doctor(cfg.to_str().unwrap())
+        let err = doctor(cfg.to_str().unwrap(), false)
             .expect_err("doctor must return Err when the config fails to load");
         let msg = err.to_string();
         assert!(
-            msg.contains("doctor: config check failed") && msg.contains("[FAIL]"),
+            msg.contains("doctor: config check failed") && msg.contains("see output above"),
             "returned error must be the one-line pointer (so `main` does not double-print the \
              config error); got {msg:?}"
         );

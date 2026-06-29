@@ -88,7 +88,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             json,
             target,
         } => dispatch_check(config, export, params, type_report, strict, json, target),
-        Commands::Doctor { config } => preflight::doctor(&config),
+        Commands::Doctor { config, json } => preflight::doctor(&config, json),
         Commands::Cdc {
             source,
             source_env,
