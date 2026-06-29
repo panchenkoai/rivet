@@ -1538,6 +1538,14 @@ re-planning work that is already done.
 v0.7.8; README/SECURITY document checksum verification against the published
 `SHA256SUMS.txt`.
 
+**Status (2026-06-29): Done** — applied and verified. §5.1 marks Release checksums
+`✅ Done` (line ~808); the three §9.6.1 items are struck `✅` (retry-safe local WARN
+via `local.rs:119 retry_safe: true`, TLS warning from `doctor`/`check`, `init` mode
+rationale); §9.7 checks checksums + SBOM; OPT-7 is `✅ Done` in the §5 table.
+`SECURITY.md:165-169` + `README.md:281-285` document `SHA256SUMS.txt` (+ cosign)
+verification — the stale "until checksums are published" wording is gone. The
+*Findings* above are the historical before-state, now resolved.
+
 ---
 
 ## OPT-8 — Test build/infra consolidation (link-count + isolation)
