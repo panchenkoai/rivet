@@ -485,6 +485,10 @@ marketplace) — that boundary, stated throughout this roadmap, still holds.
 ## Epic 16 — Automatic Parallelism
 **Priority:** P3  
 **Pain coverage:** Pain A, Pain D
+**Status:** ⚠️ Partial — `recommend_parallelism` (`src/preflight/analysis.rs:332`)
+ships an advisory recommendation in `check`/`plan` for all three engines; the
+"later auto-selected parallelism bounded by safety rules" deliverable (auto-apply
+at `run`) is the remaining open piece (verified in-tree 2026-06-29).
 
 ### Goal
 Move from warning-based guidance to controlled automatic parallelism selection.
@@ -499,6 +503,25 @@ Parallelism is valuable, but automation should come after better planner guidanc
 ## Epic 17 — MySQL Source Parity (COM_STMT_FETCH)
 **Priority:** P1
 **Pain coverage:** Pain A, Pain B
+**Status:** ✅ RESOLVED — superseded by **Epic 18** (which re-derived and shipped
+this work). The premise below (~9s longest statement; a server-side cursor as the
+fix) was re-measured and is obsolete:
+- **Re-measured 2026-06-29** (live MySQL `content_items`, current main, build A):
+  at the planner's default `chunk_size` (100k) the longest chunk is **~2.0s**, not
+  9s — the memory-adaptive batching + sane default already closed it. The ~9s only
+  appears at a *manually set* large `chunk_size` (600k rows → 5.9s; ~500k → ~9s),
+  i.e. a misconfiguration. Per-statement time scales linearly (~20µs/row).
+- **Phase A (adaptive time-feedback) — WON'T BUILD:** `chunk_size` is already the
+  lever; sub-paging measured as a +25% wall / 10×-QPS regression (Epic 18 A1-impl).
+- **Phase B (COM_STMT_FETCH cursor) — WON'T BUILD:** proven expensive (the crate
+  hardcodes `CURSOR_TYPE_NO_CURSOR`, `mysql_common 0.37.2 packets/mod.rs:2696`;
+  raw `write_command` private) *and* ineffective (MySQL materialises the result to
+  temp tables at cursor open, so it does not shorten the longest statement — Epic
+  18 Phase D, `dev/spikes/mysql_cursor_efficacy.c`).
+
+The shipped parity work lives in Epic 18 (session guards, pressure proxies, MSSQL
+keyset, `chunk_size` documented as the statement-duration lever). The original
+Epic 17 plan is kept below for history.
 
 ### Goal
 
@@ -545,6 +568,15 @@ The current README is honest about the 9s MySQL number, but it creates an asymme
 ---
 
 ## Epic 18 — Source parity (MySQL / MSSQL → PostgreSQL gold standard)
+
+**Status:** ✅ DONE — all phases shipped & live-validated (2026-06-07/08);
+re-verified in-tree 2026-06-29: `MysqlSessionGuard` (`src/source/mysql/mod.rs:438`,
+`Drop` at `:468`), MSSQL `impl Drop` LOCK_TIMEOUT reset (`src/source/mssql/mod.rs:61`),
+C1 pressure proxy `Created_tmp_disk_tables` + `Innodb_buffer_pool_wait_free`
+(`mysql/mod.rs:71`), C2 Workfiles/Worktables (`mssql/mod.rs:760`), A2 MSSQL keyset,
+and the efficacy spike `dev/spikes/mysql_cursor_efficacy.c`. The MySQL cursor
+(Phase D) is closed with proof on both cost and efficacy. This epic subsumes
+Epic 17.
 
 **Goal:** PostgreSQL is the reference source. Close the per-engine gap on the
 two axes that make it the gold standard — (1) longest-single-query under a
