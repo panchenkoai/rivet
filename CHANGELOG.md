@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.16.3 (2026-06-30) — dependency bump: arrow / parquet 58 → 59
+
+A pure dependency bump (no config-grammar change — the schema bump is the version title only).
+
+### Changed
+
+- Bumped `arrow`, `arrow-schema`, and `parquet` 58 → 59. parquet 59 reshaped `LogicalType`'s parametrized
+  variants (struct-variants with inline fields → tuple-variants wrapping nested structs); the only code
+  affected was one type-round-trip test asserting Parquet logical types, migrated to parquet 59's public
+  `LogicalType::{integer,decimal,time,timestamp}` constructors. **No behavioral change** — the live
+  `parquet_schema_pins_{postgres,mysql}_matrix_logical_types` tests confirm arrow 59 emits byte-identical
+  Parquet logical types. The bump also drops three transitive deps (`integer-encoding`, `ordered-float`,
+  `thrift`), 497 → 494 crates.
+
 ## 0.16.2 (2026-06-30) — operator diagnostics: stable codes, `--json` everywhere, warning severity, `doctor --json`
 
 Backward-compatible operator-UX additions (roadmap §9.6 item 7). The config grammar is unchanged — the
