@@ -56,6 +56,21 @@ def _included(name: str) -> bool:
     return name in _ONLY if _ONLY else name not in _EXCLUDE
 
 
+# Hard recovery from the Airflow UI — no shell needed. The idempotent run handles
+# a *resumable* crash automatically; this is for the other case: a checkpoint that
+# CAN'T be resumed (chunk params changed, or you want a clean re-extract). Set the
+# `rivet_reset` Airflow Variable (Admin → Variables) to a comma-list of tables;
+# their chunk checkpoint is wiped before the next run. Clear the Variable after.
+try:
+    from airflow.models import Variable
+
+    _RESET = {
+        t.strip() for t in Variable.get("rivet_reset", default_var="").split(",") if t.strip()
+    }
+except Exception:  # noqa: BLE001 — a missing Variable / no DB at parse must not break the DAG
+    _RESET = set()
+
+
 def build_wave_dag(
     dag_id: str, config_path: str, plan_path: str, *, tags: list[str], state_url: str
 ) -> DAG:
@@ -144,12 +159,22 @@ def build_wave_dag(
             # rivet reports the in-progress checkpoint, `--resume` from the last good
             # chunk (no reconcile — it would count only the resumed remainder). Any
             # other failure propagates.
-            return (
+            run = (
                 f"out=$({base}{reconcile} 2>&1); rc=$?; echo \"$out\"; "
                 f'if [ $rc -ne 0 ]; then '
                 f"if echo \"$out\" | grep -q 'chunk checkpoint .* in progress'; "
                 f"then {base} --resume; else exit $rc; fi; fi"
             )
+            if name in _RESET:
+                # Operator asked (via the `rivet_reset` Variable) to wipe this
+                # table's checkpoint first — for an unresumable one. Belt: even
+                # if reset finds nothing, the run still proceeds.
+                reset = (
+                    f"RIVET_STATE_URL='{state_url}' {RIVET_BIN} state reset-chunks "
+                    f"--config {config_path} --export {name!r} || true"
+                )
+                return f"{reset}; {run}"
+            return run
         return base + reconcile
 
     def plan_cmd() -> str:
