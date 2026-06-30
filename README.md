@@ -182,7 +182,7 @@ Add to your MCP client config:
 |-----------------|----------------|
 | Queries PostgreSQL 12–16 and MySQL 5.7 / 8.0 | The database and credentials |
 | Streams rows → Arrow → Parquet or CSV | A destination (local path, S3 bucket, GCS bucket, Azure container) |
-| Retries failed batches with exponential backoff | Orchestration (cron, Airflow, dbt, etc.) |
+| Retries failed batches with exponential backoff | Orchestration (cron, [Airflow](docs/recipes/airflow/), dbt, etc.) |
 | Validates row counts, null ratios, and uniqueness | Your warehouse or downstream pipeline |
 | Checkpoints progress — resume after crashes | Schema management on the warehouse side |
 | Protects the source DB — longest single query ~0.2s on PG / ~9s on MySQL on 2M-row tables | — |

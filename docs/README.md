@@ -129,6 +129,7 @@ Action-first cookbooks for the most common production scenarios.
 |--------|----------------|
 | [recipes/recover-interrupted-run.md](recipes/recover-interrupted-run.md) | Resume after kill / crash, drive `validate` / `reconcile` / `repair`, unstick a stalled state DB |
 | [recipes/idempotent-warehouse-load.md](recipes/idempotent-warehouse-load.md) | Build an idempotent BigQuery / Snowflake loader on top of `manifest.json` + `_SUCCESS` |
+| [recipes/airflow/](recipes/airflow/) | Run Rivet on Airflow — a wave-aware DAG generated from `rivet plan` (heavy tables isolated, light ones parallelised, a barrier between waves), with per-table retries and a row-count reconcile gate |
 
 ## Architecture Decision Records
 
