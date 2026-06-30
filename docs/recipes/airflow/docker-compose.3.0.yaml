@@ -69,6 +69,8 @@ x-airflow-common:
     RIVET_PG_URL: postgresql://rivet:rivet@host.docker.internal:5432/rivet
     RIVET_MY_URL: mysql://rivet:rivet@host.docker.internal:3306/rivet
     RIVET_MS_URL: sqlserver://sa:Rivet_Passw0rd!@host.docker.internal:1433/rivet
+    AWS_ACCESS_KEY_ID: minioadmin       # MinIO (S3-compatible) for the *_s3 DAGs
+    AWS_SECRET_ACCESS_KEY: minioadmin
     RIVET_STATE_URL: postgresql://rivet:rivet@rivet-state-db:5432/rivet_state?sslmode=require
     AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
     # yamllint disable rule:line-length

@@ -117,6 +117,36 @@ Set an env var on the workers (or in the compose `environment:`):
 
 ---
 
+## Many sources → one bucket
+
+For a shared S3 / GCS data lake, point each source's config at the **same bucket
+with a per-source prefix** so same-named tables across engines never collide:
+
+```yaml
+# postgres.s3.yaml
+destination:
+  type: s3
+  bucket: my-data-lake                 # ← one bucket for every source
+  prefix: rivet/postgres/{export}/     # ← namespaced by source; {export} = table
+# mysql.s3.yaml  → prefix: rivet/mysql/{export}/
+# mssql.s3.yaml  → prefix: rivet/mssql/{export}/
+```
+
+A `bench_hc` then lands at `s3://my-data-lake/rivet/postgres/bench_hc/`, the MySQL
+one at `…/rivet/mysql/bench_hc/` — separate objects. The namespace is **required**,
+not cosmetic: different databases are different data, and the *same* logical table
+yields different Arrow types per engine (`uuid_col` is `FixedSizeBinary(16)` on
+PG/MSSQL but `Utf8` on MySQL; MySQL drops the timestamp's UTC tz) — merging them
+under one prefix would write a dataset with incompatible schemas.
+
+The checked-in `*.s3.yaml` / `postgres.gcs.yaml` configs build the cloud DAGs
+(`rivet_waves_<source>_s3`, `rivet_waves_postgres_gcs`); the demo writes to the
+project's MinIO / fake-gcs emulators (worker env supplies `AWS_ACCESS_KEY_ID` /
+`AWS_SECRET_ACCESS_KEY`). A real bucket drops the `endpoint` + `allow_anonymous`
+and uses normal cloud credentials.
+
+---
+
 ## Recovery — all from Airflow, no shell
 
 A chunked export checkpoints per chunk, so a kill mid-chunk is recoverable. The

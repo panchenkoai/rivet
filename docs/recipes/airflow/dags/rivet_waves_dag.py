@@ -253,3 +253,33 @@ for _id, _cfg, _plan, _tag, _state in (
         tags=["rivet", "extract", _tag],
         state_url=f"postgresql://rivet:rivet@{_STATE_HOST}/{_state}?sslmode=require",
     )
+
+# ── The same three sources, writing to ONE shared S3 bucket ─────────────────────
+# Each `*.s3.yaml` config points at the same bucket with a per-source prefix
+# (`rivet/<source>/{export}/`), so same-named tables across engines never collide:
+# a `bench_hc` from Postgres lands at `rivet/postgres/bench_hc/`, the MySQL one at
+# `rivet/mysql/bench_hc/`. (Different databases are different data; the same
+# logical table also yields different Arrow types per engine — see the README.)
+for _id, _cfg, _plan, _state in (
+    ("rivet_waves_postgres_s3", "postgres.s3.yaml", "postgres.s3.plan.json", "rivet_state_postgres_s3"),
+    ("rivet_waves_mysql_s3", "mysql.s3.yaml", "mysql.s3.plan.json", "rivet_state_mysql_s3"),
+    ("rivet_waves_mssql_s3", "mssql.s3.yaml", "mssql.s3.plan.json", "rivet_state_mssql_s3"),
+):
+    globals()[_id] = build_wave_dag(
+        _id,
+        str(_HERE / _cfg),
+        str(_HERE / _plan),
+        tags=["rivet", "extract", "s3"],
+        state_url=f"postgresql://rivet:rivet@{_STATE_HOST}/{_state}?sslmode=require",
+    )
+
+# ── One GCS DAG, to show the same recipe writes to Google Cloud Storage ─────────
+# Identical shape, just a `type: gcs` destination (`postgres.gcs.yaml`). The demo
+# writes to the project's fake-gcs emulator; a real bucket needs no `endpoint`.
+globals()["rivet_waves_postgres_gcs"] = build_wave_dag(
+    "rivet_waves_postgres_gcs",
+    str(_HERE / "postgres.gcs.yaml"),
+    str(_HERE / "postgres.gcs.plan.json"),
+    tags=["rivet", "extract", "gcs"],
+    state_url=f"postgresql://rivet:rivet@{_STATE_HOST}/rivet_state_postgres_gcs?sslmode=require",
+)
