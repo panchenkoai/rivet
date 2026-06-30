@@ -128,13 +128,26 @@ def build_wave_dag(
         )
 
     def run_cmd(name: str) -> str:
-        # A reconcile gate (source COUNT(*) vs exported rows) only makes sense for a
-        # full-table export; an incremental one writes only rows past the cursor, so
-        # a full-table count always mismatches after the first run (rivet warns).
-        cmd = f"RIVET_STATE_URL='{state_url}' {RIVET_BIN} run --config {config_path} --export {name!r}"
-        if not str(strategy.get(name, "")).startswith("incremental"):
-            cmd += " --reconcile"
-        return cmd
+        strat = str(strategy.get(name, ""))
+        base = f"RIVET_STATE_URL='{state_url}' {RIVET_BIN} run --config {config_path} --export {name!r}"
+        # A reconcile gate (source COUNT(*) vs exported rows) is meaningful only on a
+        # full fresh extract. An incremental export writes only rows past the cursor;
+        # a resumed chunked export writes only the chunks left after a crash — both
+        # would false-mismatch a full-table COUNT(*), so reconcile only the rest.
+        reconcile = "" if strat.startswith("incremental") else " --reconcile"
+        if strat.startswith("chunked"):
+            # A chunked export checkpoints per chunk. If a previous attempt was
+            # killed mid-chunk (worker crash, retry, timeout), the checkpoint is left
+            # "in progress" and a fresh start refuses with "still in progress" — that
+            # protection is exactly why the checkpoint exists. So on an Airflow RETRY
+            # (try_number > 1) we `--resume` it (continue from the last good chunk,
+            # and skip reconcile — it would count only the resumed remainder). The
+            # first attempt runs clean + reconciled.
+            return (
+                f'if [ "{{{{ ti.try_number }}}}" -gt "1" ]; '
+                f"then {base} --resume; else {base}{reconcile}; fi"
+            )
+        return base + reconcile
 
     def plan_cmd() -> str:
         # First task: refresh the plan from the current config against the real DB —
