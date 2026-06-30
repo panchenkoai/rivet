@@ -30,7 +30,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/bench_decimal/
+      path: ./output/mssql/bench_decimal/
     columns:
       price: decimal(18,4)
       qty: decimal(10,2)
@@ -58,7 +58,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/bench_hc/
+      path: ./output/mssql/bench_hc/
   - name: bench_narrow
     wave: 4
     parallel_safe: false
@@ -82,7 +82,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/bench_narrow/
+      path: ./output/mssql/bench_narrow/
   - name: bench_sparse
     wave: 2
     parallel_safe: true
@@ -98,7 +98,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/bench_sparse/
+      path: ./output/mssql/bench_sparse/
   - name: bench_wide
     wave: 3
     parallel_safe: false
@@ -114,7 +114,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/bench_wide/
+      path: ./output/mssql/bench_wide/
   - name: content_items
     wave: 3
     parallel_safe: false
@@ -138,7 +138,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/content_items/
+      path: ./output/mssql/content_items/
   - name: events
     wave: 2
     parallel_safe: true
@@ -154,7 +154,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/events/
+      path: ./output/mssql/events/
   - name: orders
     wave: 2
     parallel_safe: true
@@ -170,7 +170,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/orders/
+      path: ./output/mssql/orders/
     columns:
       amount: decimal(12,2)
   - name: page_views
@@ -188,7 +188,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/page_views/
+      path: ./output/mssql/page_views/
   - name: systranschemas
     wave: 2
     parallel_safe: true
@@ -204,7 +204,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/systranschemas/
+      path: ./output/mssql/systranschemas/
   - name: type_matrix
     wave: 2
     parallel_safe: true
@@ -220,7 +220,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/type_matrix/
+      path: ./output/mssql/type_matrix/
     columns:
       c_decimal: decimal(12,2)
   - name: users
@@ -238,6 +238,6 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/users/
+      path: ./output/mssql/users/
     columns:
       balance: decimal(12,2)

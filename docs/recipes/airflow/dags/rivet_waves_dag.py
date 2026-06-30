@@ -56,11 +56,17 @@ def _included(name: str) -> bool:
     return name in _ONLY if _ONLY else name not in _EXCLUDE
 
 
-def build_wave_dag(dag_id: str, config_path: str, plan_path: str, *, tags: list[str]) -> DAG:
+def build_wave_dag(
+    dag_id: str, config_path: str, plan_path: str, *, tags: list[str], state_url: str
+) -> DAG:
     """Build one wave-ordered DAG for the source described by `config_path`.
 
     The wave layout comes from `plan_path` (a `rivet plan --format json` artifact)
     read at parse time; the DAG's own `plan` task keeps that file fresh.
+
+    `state_url` is this source's own state database — each source gets its own so
+    that same-named tables across engines (a `bench_hc` in Postgres and in MySQL)
+    don't collide on cursor / shape / file-log state.
     """
     plan_file = Path(plan_path)
     # ── Parse the plan at DAG-parse time (no DB hit) ──────────────────────────
@@ -125,7 +131,7 @@ def build_wave_dag(dag_id: str, config_path: str, plan_path: str, *, tags: list[
         # A reconcile gate (source COUNT(*) vs exported rows) only makes sense for a
         # full-table export; an incremental one writes only rows past the cursor, so
         # a full-table count always mismatches after the first run (rivet warns).
-        cmd = f"{RIVET_BIN} run --config {config_path} --export {name!r}"
+        cmd = f"RIVET_STATE_URL='{state_url}' {RIVET_BIN} run --config {config_path} --export {name!r}"
         if not str(strategy.get(name, "")).startswith("incremental"):
             cmd += " --reconcile"
         return cmd
@@ -190,13 +196,19 @@ def build_wave_dag(dag_id: str, config_path: str, plan_path: str, *, tags: list[
 
 
 # ── One DAG per source database ────────────────────────────────────────────────
-# Each reads its own config + plan; the worker env supplies the matching URL
-# (RIVET_PG_URL / RIVET_MY_URL / RIVET_MS_URL — set in the compose file).
-for _id, _cfg, _plan, _tag in (
-    ("rivet_waves_postgres", "postgres.yaml", "postgres.plan.json", "postgres"),
-    ("rivet_waves_mysql", "mysql.yaml", "mysql.plan.json", "mysql"),
-    ("rivet_waves_mssql", "mssql.yaml", "mssql.plan.json", "sqlserver"),
+# Each reads its own config + plan; the worker env supplies the matching source
+# URL (RIVET_PG_URL / RIVET_MY_URL / RIVET_MS_URL). Each also gets its OWN state
+# database so same-named tables across engines don't collide on cursor / shape.
+_STATE_HOST = "rivet-state-db:5432"
+for _id, _cfg, _plan, _tag, _state in (
+    ("rivet_waves_postgres", "postgres.yaml", "postgres.plan.json", "postgres", "rivet_state_postgres"),
+    ("rivet_waves_mysql", "mysql.yaml", "mysql.plan.json", "mysql", "rivet_state_mysql"),
+    ("rivet_waves_mssql", "mssql.yaml", "mssql.plan.json", "sqlserver", "rivet_state_mssql"),
 ):
     globals()[_id] = build_wave_dag(
-        _id, str(_HERE / _cfg), str(_HERE / _plan), tags=["rivet", "extract", _tag]
+        _id,
+        str(_HERE / _cfg),
+        str(_HERE / _plan),
+        tags=["rivet", "extract", _tag],
+        state_url=f"postgresql://rivet:rivet@{_STATE_HOST}/{_state}?sslmode=require",
     )

@@ -32,7 +32,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/bench_decimal/
+      path: ./output/mysql/bench_decimal/
     columns:
       price: decimal(18,4)
       qty: decimal(10,2)
@@ -62,7 +62,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/bench_hc/
+      path: ./output/mysql/bench_hc/
   - name: bench_narrow
     wave: 4
     parallel_safe: false
@@ -90,7 +90,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/bench_narrow/
+      path: ./output/mysql/bench_narrow/
   - name: bench_sparse
     wave: 2
     parallel_safe: true
@@ -106,7 +106,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/bench_sparse/
+      path: ./output/mysql/bench_sparse/
   - name: bench_wide
     wave: 2
     parallel_safe: true
@@ -122,7 +122,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/bench_wide/
+      path: ./output/mysql/bench_wide/
   - name: content_items
     wave: 3
     parallel_safe: false
@@ -148,7 +148,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/content_items/
+      path: ./output/mysql/content_items/
   - name: events
     wave: 2
     parallel_safe: true
@@ -164,7 +164,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/events/
+      path: ./output/mysql/events/
   - name: orders
     wave: 2
     parallel_safe: true
@@ -180,7 +180,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/orders/
+      path: ./output/mysql/orders/
     columns:
       price: decimal(10,2)
   - name: orders_coalesce
@@ -198,7 +198,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/orders_coalesce/
+      path: ./output/mysql/orders_coalesce/
     columns:
       price: decimal(10,2)
   - name: orders_sparse
@@ -216,7 +216,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/orders_sparse/
+      path: ./output/mysql/orders_sparse/
   - name: page_views
     wave: 2
     parallel_safe: true
@@ -232,7 +232,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/page_views/
+      path: ./output/mysql/page_views/
   - name: users
     wave: 2
     parallel_safe: true
@@ -248,6 +248,6 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/users/
+      path: ./output/mysql/users/
     columns:
       balance: decimal(12,2)

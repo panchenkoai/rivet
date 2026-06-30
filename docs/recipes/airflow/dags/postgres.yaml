@@ -32,7 +32,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/bench_decimal/
+      path: ./output/postgres/bench_decimal/
     columns:
       price: decimal(18,4)
       qty: decimal(10,2)
@@ -62,7 +62,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/bench_hc/
+      path: ./output/postgres/bench_hc/
   - name: bench_json
     wave: 2
     parallel_safe: true
@@ -76,7 +76,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/bench_json/
+      path: ./output/postgres/bench_json/
   - name: bench_narrow
     wave: 4
     parallel_safe: false
@@ -104,7 +104,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/bench_narrow/
+      path: ./output/postgres/bench_narrow/
   - name: bench_sparse
     wave: 2
     parallel_safe: true
@@ -118,7 +118,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/bench_sparse/
+      path: ./output/postgres/bench_sparse/
   - name: bench_wide
     wave: 3
     parallel_safe: false
@@ -132,7 +132,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/bench_wide/
+      path: ./output/postgres/bench_wide/
   - name: cdc_ack_test
     wave: 2
     parallel_safe: true
@@ -146,7 +146,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/cdc_ack_test/
+      path: ./output/postgres/cdc_ack_test/
   - name: cdc_demo
     wave: 2
     parallel_safe: true
@@ -160,7 +160,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/cdc_demo/
+      path: ./output/postgres/cdc_demo/
   - name: content_items
     wave: 4
     parallel_safe: false
@@ -188,7 +188,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/content_items/
+      path: ./output/postgres/content_items/
   - name: content_items_sample
     wave: 2
     parallel_safe: true
@@ -202,7 +202,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/content_items_sample/
+      path: ./output/postgres/content_items_sample/
   - name: events
     wave: 2
     parallel_safe: true
@@ -216,7 +216,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/events/
+      path: ./output/postgres/events/
   - name: meta_demo
     wave: 2
     parallel_safe: true
@@ -230,7 +230,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/meta_demo/
+      path: ./output/postgres/meta_demo/
     columns:
       amount: decimal(12,2)
   - name: orders
@@ -257,7 +257,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/orders/
+      path: ./output/postgres/orders/
     columns:
       price: decimal(10,2)
   - name: orders_coalesce
@@ -273,7 +273,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/orders_coalesce/
+      path: ./output/postgres/orders_coalesce/
     columns:
       price: decimal(10,2)
   - name: orders_sparse
@@ -289,7 +289,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/orders_sparse/
+      path: ./output/postgres/orders_sparse/
   - name: page_views
     wave: 2
     parallel_safe: true
@@ -303,7 +303,7 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/page_views/
+      path: ./output/postgres/page_views/
   - name: users
     wave: 2
     parallel_safe: true
@@ -317,6 +317,6 @@ exports:
     destination:
       type: local
       # rivet also writes manifest.json + _SUCCESS here (its metadata)
-      path: ./output/users/
+      path: ./output/postgres/users/
     columns:
       balance: decimal(12,2)
