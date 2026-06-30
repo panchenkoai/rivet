@@ -1,136 +1,128 @@
 # Run Rivet on Apache Airflow
 
-Rivet extracts your tables; Airflow schedules and watches them. This recipe wires
-the two together so Airflow's graph **is** Rivet's extraction plan — heavy tables
-isolated, light ones parallelised, a barrier between waves — with per-table
-retries, logs, and alerting for free.
+Rivet extracts your tables; Airflow schedules and watches them. This recipe makes
+Airflow's graph **be** Rivet's extraction plan — small tables parallelised, heavy
+tables run one at a time, a barrier between waves — with per-table retries, logs,
+and alerting for free, and a real `rivet` binary doing the work.
 
-There are two levels. Start at level 1; graduate to level 2 when you want
-per-table visibility in the Airflow UI.
+```
+docs/recipes/airflow/
+├── Dockerfile                 # apache/airflow + the rivet release binary baked in
+├── docker-compose.2.10.yaml   # official Airflow 2.10 stack, adapted
+├── docker-compose.3.0.yaml    # official Airflow 3.0 stack, adapted
+└── dags/
+    ├── rivet_waves_dag.py      # the DAG — builds the wave graph from plan.json
+    ├── rivet.yaml              # the config you edit  ← this is yours
+    └── plan.json               # rivet plan output the DAG reads (auto-refreshed)
+```
 
 ---
 
-## Level 1 — one task (5 minutes)
+## Try it locally
 
-`rivet apply` already runs a config's exports **wave by wave**, lowest first, with
-a barrier between waves. So the simplest possible DAG is a single command:
+These are the **official** Apache Airflow docker-compose stacks (Postgres metadata
++ Redis + CeleryExecutor — not SQLite/Sequential), adapted three ways: example
+DAGs are off, the worker image has `rivet` baked in, and a dedicated
+TLS-enabled Postgres holds Rivet's durable run state.
 
-```python
-from datetime import datetime
-from airflow import DAG
-from airflow.operators.bash import BashOperator
+```bash
+cd docs/recipes/airflow
 
-with DAG(
-    dag_id="rivet_apply",
-    schedule="0 2 * * *",
-    start_date=datetime(2026, 1, 1),
-    catchup=False,
-    tags=["rivet"],
-) as dag:
-    BashOperator(
-        task_id="rivet_apply",
-        bash_command="rivet apply /opt/rivet/rivet.yaml --resume",
-    )
+docker compose -f docker-compose.2.10.yaml up --build      # Airflow 2.10.5
+#   …or
+docker compose -f docker-compose.3.0.yaml up --build       # Airflow 3.0.3
 ```
 
-`--resume` makes a re-run after a partial failure skip already-finished tables and
-continue incomplete chunked ones from their checkpoints — so an Airflow retry is
-safe and doesn't redo finished work. One task, Rivet does the wave ordering
-internally. You lose per-table visibility in the UI; that's what level 2 adds.
+First boot builds the image and migrates the metadata DB (~2-3 min). Then open
+<http://localhost:8080> (login **`airflow`** / **`airflow`**), un-pause and trigger
+the **`rivet_waves`** DAG, and open **Graph**:
+
+```
+plan ──> wave_2 ──────────> wave_3 ───────────────> wave_4
+         [11 small tables    [bench_decimal →        [bench_narrow →
+          in parallel]        bench_hc →              content_items]
+                              orders → bench_wide]    (one at a time)
+```
+
+The demo runs against the project's Postgres fixture on the host
+(`host.docker.internal:5432`), so `docker compose up` in the rivet repo first.
+`docker compose -f … down -v` tears everything down (`-v` drops the state too).
+
+The same DAG runs on both majors — it imports `BashOperator` from the bundled
+`standard` provider on Airflow 3.x and from core on 2.x.
 
 ---
 
-## Level 2 — wave-aware DAG (per-table tasks)
+## What the graph does
 
-[`rivet_waves_dag.py`](rivet_waves_dag.py) reads Rivet's plan and builds one
-TaskGroup per wave, one task per table, with a barrier between waves:
+**`plan` → waves.** `rivet plan` scores every export (size, cursor quality, chunk
+geometry, risk) and groups them into waves. The DAG runs the waves lowest-first
+with a **barrier** between them — wave N+1 starts only after every task in wave N
+succeeds.
+
+**Cheap parallel, heavy serial — within a wave.** This is the part that matters:
+only the cheap exports (planner `cost_class: low`) run in parallel. The heavier
+ones run **one at a time** (a sequential chain). The whole reason the planner
+defers big tables into a late wave is to *not* pile several large scans onto the
+source at once — so running them in parallel would defeat the point. (Same split
+as the in-engine `rivet apply --parallel-export-processes`.)
+
+**Each task is a real `rivet run`.** A wave task is `rivet run --config rivet.yaml
+--export <table>` — a single table, with `--reconcile` (source `COUNT(*)` vs
+exported rows) on full/chunked exports. The task log is the actual rivet output:
 
 ```
-wave_1  ──>  wave_2  ──>  wave_3  ──────────>  wave_4
-[orders]     [bench_json]  [bench_wide,         [bench_narrow,
-                            bench_decimal]        content_items]   ← very_high cost, isolated
+✓ orders         incremental  250,000 rows  1 files  3.4 MB  2.7s  RSS 64 MB
 ```
 
-Each box is `rivet run --config rivet.yaml --export <table> --reconcile` — a single
-table with a row-count audit (source `COUNT(*)` vs exported rows) that fails the
-task on drift. Tables **within** a wave run in parallel; wave N+1 starts only after
-every task in wave N succeeds.
-
-This graph is generated, not hand-written — it comes straight from the planner.
-
-### Setup
-
-1. **Generate the plan artifact** (the DAG reads this at parse time, so the
-   scheduler never touches your database just to build the graph):
-
-   ```bash
-   rivet plan --config rivet.yaml --format json > docs/recipes/airflow/plan.json
-   ```
-
-   Commit `plan.json`. Regenerate + re-commit it whenever your table set or sizes
-   change materially — the DAG re-shapes itself on the next parse. (A sample is
-   checked in here so the DAG parses out of the box.)
-
-2. **Drop the files** into your Airflow `dags/` folder (or point `DAG_FOLDER` at
-   this directory): `rivet_waves_dag.py` + `plan.json`.
-
-3. **Give the workers Rivet + credentials.** The binary must be on `PATH` (or use
-   the Docker variant below). Source/destination secrets come from the task env —
-   never hard-code them in the DAG. For example, export a Postgres URL from an
-   Airflow Connection:
-
-   ```python
-   # in the DAG, or via the worker environment
-   env={"RIVET_PG_URL": "{{ conn.rivet_pg.get_uri() }}"}
-   ```
-
-   and reference it in your `rivet.yaml` as `source: { type: postgres, url_env: RIVET_PG_URL }`.
-
-### Knobs (env or Airflow Variables)
-
-| Variable        | Default               | Meaning                          |
-|-----------------|-----------------------|----------------------------------|
-| `RIVET_BIN`     | `rivet`               | Path to the binary on the worker |
-| `RIVET_CONFIG`  | `/opt/rivet/rivet.yaml` | Config the tasks run against     |
+A failing reconcile (or any error) exits non-zero with a stable `[RIVET_*]` code,
+so the task fails loudly and the wave barrier stops everything downstream — before
+a half-extracted table reaches a warehouse load.
 
 ---
 
-## Running Rivet in a container (DockerOperator)
+## Config → plan → graph (no manual steps)
 
-If your workers don't have the binary, run the published image instead. Swap the
-`BashOperator` for:
+The graph is generated from Rivet's planner, and the `plan` task keeps it fresh:
 
-```python
-from airflow.providers.docker.operators.docker import DockerOperator
+1. **`dags/rivet.yaml`** is the config you edit. `rivet init --source <url>`
+   scaffolds one from your live schema (use `--exclude '<glob>'` to drop test /
+   junk tables); the checked-in sample is the PG fixture trimmed to a clean set.
+2. The DAG's first task, **`plan`**, runs `rivet plan --format json` and
+   **atomically** rewrites `dags/plan.json` (temp file, swapped in only if rivet
+   succeeded *and* the output is valid JSON — a failed plan can't truncate the
+   graph source and break the DAG).
+3. The DAG reads `plan.json` at **parse time** to lay out the waves. So editing
+   the config and re-running the DAG re-shapes the graph on the next parse — no
+   hand-run CLI, no committing `plan.json` by yourself. The checked-in sample
+   makes the DAG work on the very first boot.
 
-DockerOperator(
-    task_id=name,
-    image="ghcr.io/panchenkoai/rivet:latest",
-    command=f"run --config /work/rivet.yaml --export {name} --reconcile",
-    mounts=[...],          # mount your config + a writable output/state dir
-    environment={"RIVET_PG_URL": "{{ conn.rivet_pg.get_uri() }}"},
-    auto_remove=True,
-)
-```
+### Skip tables — you don't have to extract everything
 
-Mount the config and the state/output directories so checkpoints survive across
-retries (Rivet keeps resumable state in `.rivet_state.db` next to the config).
+Set an env var on the workers (or in the compose `environment:`):
+
+| Variable        | Effect                                                            |
+|-----------------|------------------------------------------------------------------|
+| `RIVET_EXCLUDE` | Comma-separated tables to drop. A wave left empty disappears.     |
+| `RIVET_ONLY`    | Comma-separated allow-list — run only these.                     |
 
 ---
 
-## What a task logs
+## Architecture
 
-Each `rivet run` task ends with a single, parseable summary line — the shape your
-Airflow logs and alerts key off:
-
-```
-✓ orders         incremental  250,000 rows  1 files  3.4 MB  5.8s  RSS 59 MB
-```
-
-rows written · file parts · bytes · wall time · peak memory. A failing reconcile
-(or any error) exits non-zero with a stable `[RIVET_*]` code on the line, so the
-task fails loudly and the wave barrier stops everything downstream — exactly what
-you want before a half-extracted table reaches a warehouse load.
+- **`rivet` binary** — baked into the worker image from the published release
+  ([`Dockerfile`](Dockerfile), arch-aware: pulls the `x86_64` or `aarch64` linux
+  build). To pin a version, set `RIVET_VERSION` in the compose `build.args`.
+- **Durable state** — `rivet-state-db`, a dedicated TLS Postgres service.
+  `RIVET_STATE_URL` points the workers at it with `sslmode=require`. SQLite state
+  in a bind-mount corrupts under parallel writers; Rivet refuses to send state
+  credentials in cleartext to a non-loopback host (CWE-319), so the service speaks
+  TLS (a self-signed cert generated at startup — fine for an in-cluster service).
+- **Source credentials** — `RIVET_PG_URL` in the compose env for the demo. In
+  production, put the URL in an Airflow Connection / Variable and export it into
+  the task env, matching `source: { url_env: RIVET_PG_URL }` in the config —
+  never inline it in the DAG. The demo opts into plaintext to the fixture with
+  `source.tls: { mode: disable }`; a real remote DB uses `mode: verify-full`.
 
 ---
 
@@ -139,6 +131,7 @@ you want before a half-extracted table reaches a warehouse load.
 Rivet's planner is deliberately **advisory** ([ADR-0006](../../adr/0006-source-aware-prioritization.md)):
 it scores and groups, it does not schedule. That's what lets a real scheduler own
 execution — retries, backfills, SLAs, alerting — while Rivet owns *source safety*
-(which tables to defer, which to isolate, how hard to push the database). This
-recipe is the seam between the two: the planner's `waves` become Airflow's graph,
-and nothing about your database or its credentials leaves your environment.
+(which tables to defer, which to run serially, how hard to push the database).
+This recipe is the seam between the two: the planner's `waves` and cost classes
+become Airflow's graph, and nothing about your database or its credentials leaves
+your environment.
