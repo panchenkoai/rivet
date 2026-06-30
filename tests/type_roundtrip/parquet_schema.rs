@@ -106,42 +106,20 @@ fn parquet_schema_pins_postgres_matrix_logical_types() {
         &cols,
         "c_smallint",
         INT32,
-        Some(Integer {
-            bit_width: 16,
-            is_signed: true,
-        }),
+        Some(LogicalType::integer(16, true)),
     );
     assert_col(&cols, "c_integer", INT32, None);
     assert_col(&cols, "c_bigint", INT64, None);
 
     // Decimals: small precision fits INT64; precision > 18 escalates to FLBA.
-    assert_col(
-        &cols,
-        "amount",
-        INT64,
-        Some(Decimal {
-            scale: 2,
-            precision: 18,
-        }),
-    );
+    assert_col(&cols, "amount", INT64, Some(LogicalType::decimal(2, 18)));
     assert_col(
         &cols,
         "fee",
         FIXED_LEN_BYTE_ARRAY,
-        Some(Decimal {
-            scale: 6,
-            precision: 20,
-        }),
+        Some(LogicalType::decimal(6, 20)),
     );
-    assert_col(
-        &cols,
-        "price",
-        INT64,
-        Some(Decimal {
-            scale: 2,
-            precision: 10,
-        }),
-    );
+    assert_col(&cols, "price", INT64, Some(LogicalType::decimal(2, 10)));
 
     // Floats
     assert_col(&cols, "c_real", FLOAT, None);
@@ -153,28 +131,25 @@ fn parquet_schema_pins_postgres_matrix_logical_types() {
         &cols,
         "c_time",
         INT64,
-        Some(Time {
-            is_adjusted_to_u_t_c: false,
-            unit: parquet::basic::TimeUnit::MICROS,
-        }),
+        Some(LogicalType::time(false, parquet::basic::TimeUnit::MICROS)),
     );
     assert_col(
         &cols,
         "created_at",
         INT64,
-        Some(Timestamp {
-            is_adjusted_to_u_t_c: false,
-            unit: parquet::basic::TimeUnit::MICROS,
-        }),
+        Some(LogicalType::timestamp(
+            false,
+            parquet::basic::TimeUnit::MICROS,
+        )),
     );
     assert_col(
         &cols,
         "created_at_tz",
         INT64,
-        Some(Timestamp {
-            is_adjusted_to_u_t_c: true,
-            unit: parquet::basic::TimeUnit::MICROS,
-        }),
+        Some(LogicalType::timestamp(
+            true,
+            parquet::basic::TimeUnit::MICROS,
+        )),
     );
 
     // Strings / text
@@ -235,10 +210,7 @@ fn parquet_schema_pins_mysql_matrix_logical_types() {
         &cols,
         "c_tinyint",
         INT32,
-        Some(Integer {
-            bit_width: 16,
-            is_signed: true,
-        }),
+        Some(LogicalType::integer(16, true)),
     );
     assert_col(&cols, "c_bigint", INT64, None);
 
@@ -248,10 +220,7 @@ fn parquet_schema_pins_mysql_matrix_logical_types() {
         &cols,
         "c_tinyint_u",
         INT32,
-        Some(Integer {
-            bit_width: 16,
-            is_signed: true,
-        }),
+        Some(LogicalType::integer(16, true)),
     );
     assert_col(&cols, "c_smallint_u", INT32, None);
     assert_col(&cols, "c_int_u", INT64, None);
@@ -259,59 +228,37 @@ fn parquet_schema_pins_mysql_matrix_logical_types() {
         &cols,
         "c_bigint_u",
         INT64,
-        Some(Integer {
-            bit_width: 64,
-            is_signed: false,
-        }),
+        Some(LogicalType::integer(64, false)),
     );
 
     // Decimals identical to PG matrix.
-    assert_col(
-        &cols,
-        "amount",
-        INT64,
-        Some(Decimal {
-            scale: 2,
-            precision: 18,
-        }),
-    );
+    assert_col(&cols, "amount", INT64, Some(LogicalType::decimal(2, 18)));
     assert_col(
         &cols,
         "fee",
         FIXED_LEN_BYTE_ARRAY,
-        Some(Decimal {
-            scale: 6,
-            precision: 20,
-        }),
+        Some(LogicalType::decimal(6, 20)),
     );
-    assert_col(
-        &cols,
-        "price",
-        INT64,
-        Some(Decimal {
-            scale: 2,
-            precision: 10,
-        }),
-    );
+    assert_col(&cols, "price", INT64, Some(LogicalType::decimal(2, 10)));
 
     // Temporal — both naive (DATETIME) and tz (TIMESTAMP) map.
     assert_col(
         &cols,
         "created_at_dt",
         INT64,
-        Some(Timestamp {
-            is_adjusted_to_u_t_c: false,
-            unit: parquet::basic::TimeUnit::MICROS,
-        }),
+        Some(LogicalType::timestamp(
+            false,
+            parquet::basic::TimeUnit::MICROS,
+        )),
     );
     assert_col(
         &cols,
         "created_at_ts",
         INT64,
-        Some(Timestamp {
-            is_adjusted_to_u_t_c: true,
-            unit: parquet::basic::TimeUnit::MICROS,
-        }),
+        Some(LogicalType::timestamp(
+            true,
+            parquet::basic::TimeUnit::MICROS,
+        )),
     );
 
     // Binary family — all three MySQL binary widths land as BYTE_ARRAY.
@@ -328,10 +275,7 @@ fn parquet_schema_pins_mysql_matrix_logical_types() {
         &cols,
         "year_col",
         INT32,
-        Some(Integer {
-            bit_width: 16,
-            is_signed: true,
-        }),
+        Some(LogicalType::integer(16, true)),
     );
 
     // `extras` is MySQL `JSON` — now emits native `LogicalType::Json`.

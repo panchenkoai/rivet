@@ -1,6 +1,6 @@
 [package]
 name = "rivet-cli"
-version = "0.16.2"
+version = "0.16.3"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
@@ -42,11 +42,11 @@ md-5 = "0.11"
 # `canonical_extension_types` enables Arrow's canonical extension wrappers
 # (`arrow_schema::extension::{Uuid, Json}`) — see Cargo dep on `parquet`
 # below for the writer-side pairing.
-arrow = { version = "58", features = ["canonical_extension_types"] }
+arrow = { version = "59", features = ["canonical_extension_types"] }
 # Direct dep on `arrow-schema` so we can use the `extension` module — the
 # `arrow` facade re-exports `DataType` / `Field` but not the `extension`
 # submodule. Version is pinned to match `arrow`'s transitive choice.
-arrow-schema = { version = "58", features = ["canonical_extension_types"] }
+arrow-schema = { version = "59", features = ["canonical_extension_types"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 csv = "1"
@@ -67,7 +67,7 @@ opendal = { version = "0.55", features = ["blocking", "services-fs", "services-s
 # this flag, those columns would fall back to `String` and our downstream
 # autoload story (DuckDB → native UUID, ClickHouse → Nullable(UUID), …)
 # stays one cast away. See `src/types/mapping.rs` for the emission site.
-parquet = { version = "58", features = ["arrow", "zstd", "lz4", "flate2", "arrow_canonical_extension_types"] }
+parquet = { version = "59", features = ["arrow", "zstd", "lz4", "flate2", "arrow_canonical_extension_types"] }
 clap_complete = "4"
 postgres = { version = "0.19", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-0_8"] }
 postgres-native-tls = "0.5"
