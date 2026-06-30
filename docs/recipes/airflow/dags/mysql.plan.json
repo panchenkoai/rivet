@@ -1,0 +1,4565 @@
+[
+  {
+    "rivet_version": "0.16.3",
+    "plan_id": "8f6026d27281e696cc8d3ce3adf8413a",
+    "created_at": "2026-06-30T21:23:36.704364044Z",
+    "expires_at": "2026-07-01T21:23:36.704364044Z",
+    "export_name": "bench_decimal",
+    "strategy": "chunked",
+    "plan_fingerprint": "791506e1a64ffcbb",
+    "integrity": "xxh3:f3d98ae67cc90dc7",
+    "resolved_plan": {
+      "export_name": "bench_decimal",
+      "base_query": "SELECT id, price, qty, discount, total, updated_at FROM bench_decimal\n",
+      "strategy": {
+        "Chunked": {
+          "column": "id",
+          "chunk_size": 100000,
+          "chunk_count": null,
+          "parallel": 1,
+          "dense": false,
+          "by_days": null,
+          "checkpoint": true,
+          "max_attempts": 4
+        }
+      },
+      "format": "parquet",
+      "compression": "zstd",
+      "compression_level": null,
+      "max_file_size_bytes": null,
+      "skip_empty": false,
+      "meta_columns": {
+        "exported_at": true,
+        "row_hash": true
+      },
+      "destination": {
+        "type": "local",
+        "bucket": null,
+        "prefix": null,
+        "path": "./output/bench_decimal/",
+        "region": null,
+        "endpoint": null,
+        "credentials_file": null,
+        "access_key_env": null,
+        "secret_key_env": null,
+        "session_token_env": null,
+        "aws_profile": null,
+        "account_name": null,
+        "account_key_env": null,
+        "sas_token_env": null,
+        "allow_anonymous": false
+      },
+      "quality": null,
+      "tuning": {
+        "batch_size": 10000,
+        "batch_size_memory_mb": 32,
+        "throttle_ms": 50,
+        "statement_timeout_s": 300,
+        "max_retries": 3,
+        "retry_backoff_ms": 2000,
+        "lock_timeout_s": 30,
+        "memory_threshold_mb": 4096,
+        "max_batch_memory_mb": null,
+        "on_batch_memory_exceeded": "warn",
+        "adaptive": false,
+        "min_parallel": null,
+        "max_value_mb": 256,
+        "configured_profile": "balanced"
+      },
+      "tuning_profile_label": "balanced (default)",
+      "validate": false,
+      "reconcile": false,
+      "resume": false,
+      "verify": "size",
+      "source": {
+        "type": "mysql",
+        "url": null,
+        "url_env": "RIVET_MY_URL",
+        "url_file": null,
+        "host": null,
+        "port": null,
+        "user": null,
+        "password": null,
+        "password_env": null,
+        "database": null,
+        "environment": null,
+        "tuning": null,
+        "tls": {
+          "mode": "disable",
+          "ca_file": null,
+          "accept_invalid_certs": false,
+          "accept_invalid_hostnames": false
+        }
+      },
+      "column_overrides": {
+        "qty": {
+          "kind": "decimal",
+          "precision": 10,
+          "scale": 2
+        },
+        "discount": {
+          "kind": "decimal",
+          "precision": 5,
+          "scale": 4
+        },
+        "total": {
+          "kind": "decimal",
+          "precision": 20,
+          "scale": 4
+        },
+        "price": {
+          "kind": "decimal",
+          "precision": 18,
+          "scale": 4
+        }
+      },
+      "schema_drift_policy": "warn",
+      "shape_drift_warn_factor": 2.0,
+      "parquet": {
+        "row_group_strategy": "auto",
+        "row_group_rows": null,
+        "target_row_group_mb": 128,
+        "max_row_group_mb": null
+      }
+    },
+    "computed": {
+      "chunk_ranges": [
+        [
+          1,
+          100000
+        ],
+        [
+          100001,
+          200000
+        ]
+      ],
+      "chunk_count": 2,
+      "cursor_snapshot": null,
+      "row_estimate": 200000
+    },
+    "diagnostics": {
+      "verdict": "ACCEPTABLE",
+      "warnings": [
+        "verdict ACCEPTABLE but preflight collected no specific warnings — review `rivet check` output for context"
+      ],
+      "recommended_profile": "fast",
+      "strategy_rationale": "Mode chunked (column: id, size: 100000): ~183K. Parallelism: single worker — moderate dataset — 2 workers sufficient; parallel=1 (row width unavailable, so peak RSS cannot be bounded here). Risk — resumable: no — a failed run restarts from the beginning; memory: peak unavailable (no row-width estimate)."
+    },
+    "prioritization": {
+      "export_recommendation": {
+        "export_name": "bench_decimal",
+        "priority_score": 40,
+        "priority_class": "medium",
+        "cost_class": "medium",
+        "risk_class": "low",
+        "recommended_wave": 3,
+        "isolate_on_source": false,
+        "reasons": [
+          {
+            "kind": "large_table",
+            "message": "Medium/large estimated row count (~200000)."
+          },
+          {
+            "kind": "chunking_heavy",
+            "message": "Chunked extraction (2 chunk windows) — higher source load and runtime."
+          }
+        ]
+      },
+      "campaign": {
+        "ordered_exports": [
+          {
+            "export_name": "bench_sparse",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~9625) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_wide",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~82980) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "events",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~5000) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~2500) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders_coalesce",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~1) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders_sparse",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~1) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "page_views",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~64421) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "users",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~500) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_decimal",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~200000)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (2 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_hc",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~200000)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (2 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "content_items",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~4247620)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (17 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_narrow",
+            "priority_score": 25,
+            "priority_class": "low",
+            "cost_class": "very_high",
+            "risk_class": "low",
+            "recommended_wave": 4,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "huge_table",
+                "message": "Very large estimated row count (~10493868) — defer and isolate if possible."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (42 chunk windows) — higher source load and runtime."
+              }
+            ]
+          }
+        ],
+        "waves": [
+          {
+            "wave": 2,
+            "exports": [
+              "bench_sparse",
+              "bench_wide",
+              "events",
+              "orders",
+              "orders_coalesce",
+              "orders_sparse",
+              "page_views",
+              "users"
+            ]
+          },
+          {
+            "wave": 3,
+            "exports": [
+              "bench_decimal",
+              "bench_hc",
+              "content_items"
+            ]
+          },
+          {
+            "wave": 4,
+            "exports": [
+              "bench_narrow"
+            ]
+          }
+        ],
+        "source_group_warnings": []
+      }
+    },
+    "config_path": "/opt/airflow/dags/mysql.yaml"
+  },
+  {
+    "rivet_version": "0.16.3",
+    "plan_id": "8f2f5383ab5be92ba268147cfc21ab2d",
+    "created_at": "2026-06-30T21:23:36.792513169Z",
+    "expires_at": "2026-07-01T21:23:36.792513169Z",
+    "export_name": "bench_hc",
+    "strategy": "chunked",
+    "plan_fingerprint": "0b2156390ec50941",
+    "integrity": "xxh3:86e221d99dda1bcc",
+    "resolved_plan": {
+      "export_name": "bench_hc",
+      "base_query": "SELECT id, uuid_col, email, session_id, updated_at FROM bench_hc\n",
+      "strategy": {
+        "Chunked": {
+          "column": "id",
+          "chunk_size": 100000,
+          "chunk_count": null,
+          "parallel": 1,
+          "dense": false,
+          "by_days": null,
+          "checkpoint": true,
+          "max_attempts": 4
+        }
+      },
+      "format": "parquet",
+      "compression": "zstd",
+      "compression_level": null,
+      "max_file_size_bytes": null,
+      "skip_empty": false,
+      "meta_columns": {
+        "exported_at": true,
+        "row_hash": true
+      },
+      "destination": {
+        "type": "local",
+        "bucket": null,
+        "prefix": null,
+        "path": "./output/bench_hc/",
+        "region": null,
+        "endpoint": null,
+        "credentials_file": null,
+        "access_key_env": null,
+        "secret_key_env": null,
+        "session_token_env": null,
+        "aws_profile": null,
+        "account_name": null,
+        "account_key_env": null,
+        "sas_token_env": null,
+        "allow_anonymous": false
+      },
+      "quality": null,
+      "tuning": {
+        "batch_size": 10000,
+        "batch_size_memory_mb": 32,
+        "throttle_ms": 50,
+        "statement_timeout_s": 300,
+        "max_retries": 3,
+        "retry_backoff_ms": 2000,
+        "lock_timeout_s": 30,
+        "memory_threshold_mb": 4096,
+        "max_batch_memory_mb": null,
+        "on_batch_memory_exceeded": "warn",
+        "adaptive": false,
+        "min_parallel": null,
+        "max_value_mb": 256,
+        "configured_profile": "balanced"
+      },
+      "tuning_profile_label": "balanced (default)",
+      "validate": false,
+      "reconcile": false,
+      "resume": false,
+      "verify": "size",
+      "source": {
+        "type": "mysql",
+        "url": null,
+        "url_env": "RIVET_MY_URL",
+        "url_file": null,
+        "host": null,
+        "port": null,
+        "user": null,
+        "password": null,
+        "password_env": null,
+        "database": null,
+        "environment": null,
+        "tuning": null,
+        "tls": {
+          "mode": "disable",
+          "ca_file": null,
+          "accept_invalid_certs": false,
+          "accept_invalid_hostnames": false
+        }
+      },
+      "column_overrides": {},
+      "schema_drift_policy": "warn",
+      "shape_drift_warn_factor": 2.0,
+      "parquet": {
+        "row_group_strategy": "auto",
+        "row_group_rows": null,
+        "target_row_group_mb": 128,
+        "max_row_group_mb": null
+      }
+    },
+    "computed": {
+      "chunk_ranges": [
+        [
+          1,
+          100000
+        ],
+        [
+          100001,
+          200000
+        ]
+      ],
+      "chunk_count": 2,
+      "cursor_snapshot": null,
+      "row_estimate": 200000
+    },
+    "diagnostics": {
+      "verdict": "ACCEPTABLE",
+      "warnings": [
+        "verdict ACCEPTABLE but preflight collected no specific warnings — review `rivet check` output for context"
+      ],
+      "recommended_profile": "fast",
+      "strategy_rationale": "Mode chunked (column: id, size: 100000): ~190K. Parallelism: single worker — moderate dataset — 2 workers sufficient; parallel=1 (row width unavailable, so peak RSS cannot be bounded here). Risk — resumable: no — a failed run restarts from the beginning; memory: peak unavailable (no row-width estimate)."
+    },
+    "prioritization": {
+      "export_recommendation": {
+        "export_name": "bench_hc",
+        "priority_score": 40,
+        "priority_class": "medium",
+        "cost_class": "medium",
+        "risk_class": "low",
+        "recommended_wave": 3,
+        "isolate_on_source": false,
+        "reasons": [
+          {
+            "kind": "large_table",
+            "message": "Medium/large estimated row count (~200000)."
+          },
+          {
+            "kind": "chunking_heavy",
+            "message": "Chunked extraction (2 chunk windows) — higher source load and runtime."
+          }
+        ]
+      },
+      "campaign": {
+        "ordered_exports": [
+          {
+            "export_name": "bench_sparse",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~9625) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_wide",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~82980) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "events",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~5000) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~2500) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders_coalesce",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~1) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders_sparse",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~1) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "page_views",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~64421) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "users",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~500) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_decimal",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~200000)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (2 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_hc",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~200000)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (2 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "content_items",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~4247620)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (17 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_narrow",
+            "priority_score": 25,
+            "priority_class": "low",
+            "cost_class": "very_high",
+            "risk_class": "low",
+            "recommended_wave": 4,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "huge_table",
+                "message": "Very large estimated row count (~10493868) — defer and isolate if possible."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (42 chunk windows) — higher source load and runtime."
+              }
+            ]
+          }
+        ],
+        "waves": [
+          {
+            "wave": 2,
+            "exports": [
+              "bench_sparse",
+              "bench_wide",
+              "events",
+              "orders",
+              "orders_coalesce",
+              "orders_sparse",
+              "page_views",
+              "users"
+            ]
+          },
+          {
+            "wave": 3,
+            "exports": [
+              "bench_decimal",
+              "bench_hc",
+              "content_items"
+            ]
+          },
+          {
+            "wave": 4,
+            "exports": [
+              "bench_narrow"
+            ]
+          }
+        ],
+        "source_group_warnings": []
+      }
+    },
+    "config_path": "/opt/airflow/dags/mysql.yaml"
+  },
+  {
+    "rivet_version": "0.16.3",
+    "plan_id": "9bd895088d6cc2aa5431b98fc8e96c0c",
+    "created_at": "2026-06-30T21:23:36.861278461Z",
+    "expires_at": "2026-07-01T21:23:36.861278461Z",
+    "export_name": "bench_narrow",
+    "strategy": "chunked",
+    "plan_fingerprint": "adbff2ba94b795c9",
+    "integrity": "xxh3:36d590cb437d4f45",
+    "resolved_plan": {
+      "export_name": "bench_narrow",
+      "base_query": "SELECT id, user_id, amount, status, created_at FROM bench_narrow\n",
+      "strategy": {
+        "Chunked": {
+          "column": "id",
+          "chunk_size": 250000,
+          "chunk_count": null,
+          "parallel": 4,
+          "dense": false,
+          "by_days": null,
+          "checkpoint": true,
+          "max_attempts": 4
+        }
+      },
+      "format": "parquet",
+      "compression": "zstd",
+      "compression_level": null,
+      "max_file_size_bytes": null,
+      "skip_empty": false,
+      "meta_columns": {
+        "exported_at": true,
+        "row_hash": true
+      },
+      "destination": {
+        "type": "local",
+        "bucket": null,
+        "prefix": null,
+        "path": "./output/bench_narrow/",
+        "region": null,
+        "endpoint": null,
+        "credentials_file": null,
+        "access_key_env": null,
+        "secret_key_env": null,
+        "session_token_env": null,
+        "aws_profile": null,
+        "account_name": null,
+        "account_key_env": null,
+        "sas_token_env": null,
+        "allow_anonymous": false
+      },
+      "quality": null,
+      "tuning": {
+        "batch_size": 10000,
+        "batch_size_memory_mb": 32,
+        "throttle_ms": 50,
+        "statement_timeout_s": 300,
+        "max_retries": 3,
+        "retry_backoff_ms": 2000,
+        "lock_timeout_s": 30,
+        "memory_threshold_mb": 4096,
+        "max_batch_memory_mb": null,
+        "on_batch_memory_exceeded": "warn",
+        "adaptive": false,
+        "min_parallel": null,
+        "max_value_mb": 256,
+        "configured_profile": "balanced"
+      },
+      "tuning_profile_label": "balanced (default)",
+      "validate": false,
+      "reconcile": false,
+      "resume": false,
+      "verify": "size",
+      "source": {
+        "type": "mysql",
+        "url": null,
+        "url_env": "RIVET_MY_URL",
+        "url_file": null,
+        "host": null,
+        "port": null,
+        "user": null,
+        "password": null,
+        "password_env": null,
+        "database": null,
+        "environment": null,
+        "tuning": null,
+        "tls": {
+          "mode": "disable",
+          "ca_file": null,
+          "accept_invalid_certs": false,
+          "accept_invalid_hostnames": false
+        }
+      },
+      "column_overrides": {},
+      "schema_drift_policy": "warn",
+      "shape_drift_warn_factor": 2.0,
+      "parquet": {
+        "row_group_strategy": "auto",
+        "row_group_rows": null,
+        "target_row_group_mb": 128,
+        "max_row_group_mb": null
+      }
+    },
+    "computed": {
+      "chunk_ranges": [
+        [
+          1,
+          250000
+        ],
+        [
+          250001,
+          500000
+        ],
+        [
+          500001,
+          750000
+        ],
+        [
+          750001,
+          1000000
+        ],
+        [
+          1000001,
+          1250000
+        ],
+        [
+          1250001,
+          1500000
+        ],
+        [
+          1500001,
+          1750000
+        ],
+        [
+          1750001,
+          2000000
+        ],
+        [
+          2000001,
+          2250000
+        ],
+        [
+          2250001,
+          2500000
+        ],
+        [
+          2500001,
+          2750000
+        ],
+        [
+          2750001,
+          3000000
+        ],
+        [
+          3000001,
+          3250000
+        ],
+        [
+          3250001,
+          3500000
+        ],
+        [
+          3500001,
+          3750000
+        ],
+        [
+          3750001,
+          4000000
+        ],
+        [
+          4000001,
+          4250000
+        ],
+        [
+          4250001,
+          4500000
+        ],
+        [
+          4500001,
+          4750000
+        ],
+        [
+          4750001,
+          5000000
+        ],
+        [
+          5000001,
+          5250000
+        ],
+        [
+          5250001,
+          5500000
+        ],
+        [
+          5500001,
+          5750000
+        ],
+        [
+          5750001,
+          6000000
+        ],
+        [
+          6000001,
+          6250000
+        ],
+        [
+          6250001,
+          6500000
+        ],
+        [
+          6500001,
+          6750000
+        ],
+        [
+          6750001,
+          7000000
+        ],
+        [
+          7000001,
+          7250000
+        ],
+        [
+          7250001,
+          7500000
+        ],
+        [
+          7500001,
+          7750000
+        ],
+        [
+          7750001,
+          8000000
+        ],
+        [
+          8000001,
+          8250000
+        ],
+        [
+          8250001,
+          8500000
+        ],
+        [
+          8500001,
+          8750000
+        ],
+        [
+          8750001,
+          9000000
+        ],
+        [
+          9000001,
+          9250000
+        ],
+        [
+          9250001,
+          9500000
+        ],
+        [
+          9500001,
+          9750000
+        ],
+        [
+          9750001,
+          10000000
+        ],
+        [
+          10000001,
+          10250000
+        ],
+        [
+          10250001,
+          10493868
+        ]
+      ],
+      "chunk_count": 42,
+      "cursor_snapshot": null,
+      "row_estimate": 10493868
+    },
+    "diagnostics": {
+      "verdict": "ACCEPTABLE",
+      "warnings": [
+        "Parallel=4 on ~9M rows: each worker buffers batch_size rows in memory. With wide rows this can cause high RSS. Monitor with memory_threshold_mb or reduce parallel/batch_size."
+      ],
+      "recommended_profile": "balanced",
+      "strategy_rationale": "Mode chunked (column: id, size: 250000): ~9.8M. Parallelism: single worker — very large dataset — cap at 4 to control memory; increase with memory_threshold_mb monitoring; parallel=1 (row width unavailable, so peak RSS cannot be bounded here). Risk — resumable: no — a failed run restarts from the beginning; memory: peak unavailable (no row-width estimate)."
+    },
+    "prioritization": {
+      "export_recommendation": {
+        "export_name": "bench_narrow",
+        "priority_score": 25,
+        "priority_class": "low",
+        "cost_class": "very_high",
+        "risk_class": "low",
+        "recommended_wave": 4,
+        "isolate_on_source": false,
+        "reasons": [
+          {
+            "kind": "huge_table",
+            "message": "Very large estimated row count (~10493868) — defer and isolate if possible."
+          },
+          {
+            "kind": "chunking_heavy",
+            "message": "Chunked extraction (42 chunk windows) — higher source load and runtime."
+          }
+        ]
+      },
+      "campaign": {
+        "ordered_exports": [
+          {
+            "export_name": "bench_sparse",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~9625) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_wide",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~82980) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "events",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~5000) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~2500) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders_coalesce",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~1) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders_sparse",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~1) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "page_views",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~64421) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "users",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~500) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_decimal",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~200000)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (2 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_hc",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~200000)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (2 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "content_items",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~4247620)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (17 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_narrow",
+            "priority_score": 25,
+            "priority_class": "low",
+            "cost_class": "very_high",
+            "risk_class": "low",
+            "recommended_wave": 4,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "huge_table",
+                "message": "Very large estimated row count (~10493868) — defer and isolate if possible."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (42 chunk windows) — higher source load and runtime."
+              }
+            ]
+          }
+        ],
+        "waves": [
+          {
+            "wave": 2,
+            "exports": [
+              "bench_sparse",
+              "bench_wide",
+              "events",
+              "orders",
+              "orders_coalesce",
+              "orders_sparse",
+              "page_views",
+              "users"
+            ]
+          },
+          {
+            "wave": 3,
+            "exports": [
+              "bench_decimal",
+              "bench_hc",
+              "content_items"
+            ]
+          },
+          {
+            "wave": 4,
+            "exports": [
+              "bench_narrow"
+            ]
+          }
+        ],
+        "source_group_warnings": []
+      }
+    },
+    "config_path": "/opt/airflow/dags/mysql.yaml"
+  },
+  {
+    "rivet_version": "0.16.3",
+    "plan_id": "b88b9401c05812ed6b4309c5720dbe84",
+    "created_at": "2026-06-30T21:23:36.871998836Z",
+    "expires_at": "2026-07-01T21:23:36.871998836Z",
+    "export_name": "bench_sparse",
+    "strategy": "full",
+    "plan_fingerprint": "",
+    "integrity": "xxh3:a136c024b65f57c9",
+    "resolved_plan": {
+      "export_name": "bench_sparse",
+      "base_query": "SELECT id, val_a, val_b, val_c, val_d, val_e, updated_at FROM bench_sparse\n",
+      "strategy": "Snapshot",
+      "format": "parquet",
+      "compression": "zstd",
+      "compression_level": null,
+      "max_file_size_bytes": null,
+      "skip_empty": false,
+      "meta_columns": {
+        "exported_at": true,
+        "row_hash": true
+      },
+      "destination": {
+        "type": "local",
+        "bucket": null,
+        "prefix": null,
+        "path": "./output/bench_sparse/",
+        "region": null,
+        "endpoint": null,
+        "credentials_file": null,
+        "access_key_env": null,
+        "secret_key_env": null,
+        "session_token_env": null,
+        "aws_profile": null,
+        "account_name": null,
+        "account_key_env": null,
+        "sas_token_env": null,
+        "allow_anonymous": false
+      },
+      "quality": null,
+      "tuning": {
+        "batch_size": 10000,
+        "batch_size_memory_mb": 32,
+        "throttle_ms": 50,
+        "statement_timeout_s": 300,
+        "max_retries": 3,
+        "retry_backoff_ms": 2000,
+        "lock_timeout_s": 30,
+        "memory_threshold_mb": 4096,
+        "max_batch_memory_mb": null,
+        "on_batch_memory_exceeded": "warn",
+        "adaptive": false,
+        "min_parallel": null,
+        "max_value_mb": 256,
+        "configured_profile": "balanced"
+      },
+      "tuning_profile_label": "balanced (default)",
+      "validate": false,
+      "reconcile": false,
+      "resume": false,
+      "verify": "size",
+      "source": {
+        "type": "mysql",
+        "url": null,
+        "url_env": "RIVET_MY_URL",
+        "url_file": null,
+        "host": null,
+        "port": null,
+        "user": null,
+        "password": null,
+        "password_env": null,
+        "database": null,
+        "environment": null,
+        "tuning": null,
+        "tls": {
+          "mode": "disable",
+          "ca_file": null,
+          "accept_invalid_certs": false,
+          "accept_invalid_hostnames": false
+        }
+      },
+      "column_overrides": {},
+      "schema_drift_policy": "warn",
+      "shape_drift_warn_factor": 2.0,
+      "parquet": null
+    },
+    "computed": {
+      "chunk_ranges": [],
+      "chunk_count": 0,
+      "cursor_snapshot": null,
+      "row_estimate": 9625
+    },
+    "diagnostics": {
+      "verdict": "ACCEPTABLE",
+      "warnings": [
+        "verdict ACCEPTABLE but preflight collected no specific warnings — review `rivet check` output for context"
+      ],
+      "recommended_profile": "balanced",
+      "strategy_rationale": "Mode full: ~9625 rows, below the ~100K chunked threshold, so a single-pass copy is cheapest. Parallelism: single worker — only chunked mode benefits from parallelism; parallel=1 (row width unavailable, so peak RSS cannot be bounded here). Risk — resumable: no — a failed run restarts from the beginning; memory: peak unavailable (no row-width estimate)."
+    },
+    "prioritization": {
+      "export_recommendation": {
+        "export_name": "bench_sparse",
+        "priority_score": 67,
+        "priority_class": "medium",
+        "cost_class": "low",
+        "risk_class": "low",
+        "recommended_wave": 2,
+        "isolate_on_source": false,
+        "reasons": [
+          {
+            "kind": "small_table",
+            "message": "Smaller estimated row count (~9625) — lower extraction cost."
+          }
+        ]
+      },
+      "campaign": {
+        "ordered_exports": [
+          {
+            "export_name": "bench_sparse",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~9625) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_wide",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~82980) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "events",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~5000) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~2500) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders_coalesce",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~1) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders_sparse",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~1) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "page_views",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~64421) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "users",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~500) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_decimal",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~200000)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (2 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_hc",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~200000)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (2 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "content_items",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~4247620)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (17 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_narrow",
+            "priority_score": 25,
+            "priority_class": "low",
+            "cost_class": "very_high",
+            "risk_class": "low",
+            "recommended_wave": 4,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "huge_table",
+                "message": "Very large estimated row count (~10493868) — defer and isolate if possible."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (42 chunk windows) — higher source load and runtime."
+              }
+            ]
+          }
+        ],
+        "waves": [
+          {
+            "wave": 2,
+            "exports": [
+              "bench_sparse",
+              "bench_wide",
+              "events",
+              "orders",
+              "orders_coalesce",
+              "orders_sparse",
+              "page_views",
+              "users"
+            ]
+          },
+          {
+            "wave": 3,
+            "exports": [
+              "bench_decimal",
+              "bench_hc",
+              "content_items"
+            ]
+          },
+          {
+            "wave": 4,
+            "exports": [
+              "bench_narrow"
+            ]
+          }
+        ],
+        "source_group_warnings": []
+      }
+    },
+    "config_path": "/opt/airflow/dags/mysql.yaml"
+  },
+  {
+    "rivet_version": "0.16.3",
+    "plan_id": "ce63bfa7596ed2c1d3dbaa3ba8abcd31",
+    "created_at": "2026-06-30T21:23:36.882294544Z",
+    "expires_at": "2026-07-01T21:23:36.882294544Z",
+    "export_name": "bench_wide",
+    "strategy": "full",
+    "plan_fingerprint": "",
+    "integrity": "xxh3:c76ae878eac4769e",
+    "resolved_plan": {
+      "export_name": "bench_wide",
+      "base_query": "SELECT id, col_a, col_b, col_c, col_d, col_e, col_f, col_g, col_h, col_i, col_j, updated_at FROM bench_wide\n",
+      "strategy": "Snapshot",
+      "format": "parquet",
+      "compression": "zstd",
+      "compression_level": null,
+      "max_file_size_bytes": null,
+      "skip_empty": false,
+      "meta_columns": {
+        "exported_at": true,
+        "row_hash": true
+      },
+      "destination": {
+        "type": "local",
+        "bucket": null,
+        "prefix": null,
+        "path": "./output/bench_wide/",
+        "region": null,
+        "endpoint": null,
+        "credentials_file": null,
+        "access_key_env": null,
+        "secret_key_env": null,
+        "session_token_env": null,
+        "aws_profile": null,
+        "account_name": null,
+        "account_key_env": null,
+        "sas_token_env": null,
+        "allow_anonymous": false
+      },
+      "quality": null,
+      "tuning": {
+        "batch_size": 10000,
+        "batch_size_memory_mb": 32,
+        "throttle_ms": 50,
+        "statement_timeout_s": 300,
+        "max_retries": 3,
+        "retry_backoff_ms": 2000,
+        "lock_timeout_s": 30,
+        "memory_threshold_mb": 4096,
+        "max_batch_memory_mb": null,
+        "on_batch_memory_exceeded": "warn",
+        "adaptive": false,
+        "min_parallel": null,
+        "max_value_mb": 256,
+        "configured_profile": "balanced"
+      },
+      "tuning_profile_label": "balanced (default)",
+      "validate": false,
+      "reconcile": false,
+      "resume": false,
+      "verify": "size",
+      "source": {
+        "type": "mysql",
+        "url": null,
+        "url_env": "RIVET_MY_URL",
+        "url_file": null,
+        "host": null,
+        "port": null,
+        "user": null,
+        "password": null,
+        "password_env": null,
+        "database": null,
+        "environment": null,
+        "tuning": null,
+        "tls": {
+          "mode": "disable",
+          "ca_file": null,
+          "accept_invalid_certs": false,
+          "accept_invalid_hostnames": false
+        }
+      },
+      "column_overrides": {},
+      "schema_drift_policy": "warn",
+      "shape_drift_warn_factor": 2.0,
+      "parquet": null
+    },
+    "computed": {
+      "chunk_ranges": [],
+      "chunk_count": 0,
+      "cursor_snapshot": null,
+      "row_estimate": 82980
+    },
+    "diagnostics": {
+      "verdict": "ACCEPTABLE",
+      "warnings": [
+        "verdict ACCEPTABLE but preflight collected no specific warnings — review `rivet check` output for context"
+      ],
+      "recommended_profile": "balanced",
+      "strategy_rationale": "Mode full: ~83K rows, below the ~100K chunked threshold, so a single-pass copy is cheapest. Parallelism: single worker — only chunked mode benefits from parallelism; parallel=1 (row width unavailable, so peak RSS cannot be bounded here). Risk — resumable: no — a failed run restarts from the beginning; memory: peak unavailable (no row-width estimate)."
+    },
+    "prioritization": {
+      "export_recommendation": {
+        "export_name": "bench_wide",
+        "priority_score": 67,
+        "priority_class": "medium",
+        "cost_class": "low",
+        "risk_class": "low",
+        "recommended_wave": 2,
+        "isolate_on_source": false,
+        "reasons": [
+          {
+            "kind": "small_table",
+            "message": "Smaller estimated row count (~82980) — lower extraction cost."
+          }
+        ]
+      },
+      "campaign": {
+        "ordered_exports": [
+          {
+            "export_name": "bench_sparse",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~9625) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_wide",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~82980) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "events",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~5000) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~2500) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders_coalesce",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~1) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders_sparse",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~1) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "page_views",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~64421) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "users",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~500) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_decimal",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~200000)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (2 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_hc",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~200000)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (2 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "content_items",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~4247620)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (17 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_narrow",
+            "priority_score": 25,
+            "priority_class": "low",
+            "cost_class": "very_high",
+            "risk_class": "low",
+            "recommended_wave": 4,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "huge_table",
+                "message": "Very large estimated row count (~10493868) — defer and isolate if possible."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (42 chunk windows) — higher source load and runtime."
+              }
+            ]
+          }
+        ],
+        "waves": [
+          {
+            "wave": 2,
+            "exports": [
+              "bench_sparse",
+              "bench_wide",
+              "events",
+              "orders",
+              "orders_coalesce",
+              "orders_sparse",
+              "page_views",
+              "users"
+            ]
+          },
+          {
+            "wave": 3,
+            "exports": [
+              "bench_decimal",
+              "bench_hc",
+              "content_items"
+            ]
+          },
+          {
+            "wave": 4,
+            "exports": [
+              "bench_narrow"
+            ]
+          }
+        ],
+        "source_group_warnings": []
+      }
+    },
+    "config_path": "/opt/airflow/dags/mysql.yaml"
+  },
+  {
+    "rivet_version": "0.16.3",
+    "plan_id": "7df3ab81c9ea393eb1a53ed0f478dc14",
+    "created_at": "2026-06-30T21:23:36.924472336Z",
+    "expires_at": "2026-07-01T21:23:36.924472336Z",
+    "export_name": "content_items",
+    "strategy": "chunked",
+    "plan_fingerprint": "435131e972cf9c3b",
+    "integrity": "xxh3:1f1f3aad81de3641",
+    "resolved_plan": {
+      "export_name": "content_items",
+      "base_query": "SELECT id, title, body, raw_html, metadata, tags, author_name, author_email, source_url, category, status, priority, view_count, comment_count, word_count, language, published_at, updated_at, created_at, extra_data FROM content_items\n",
+      "strategy": {
+        "Chunked": {
+          "column": "id",
+          "chunk_size": 250000,
+          "chunk_count": null,
+          "parallel": 1,
+          "dense": false,
+          "by_days": null,
+          "checkpoint": true,
+          "max_attempts": 4
+        }
+      },
+      "format": "parquet",
+      "compression": "zstd",
+      "compression_level": null,
+      "max_file_size_bytes": null,
+      "skip_empty": false,
+      "meta_columns": {
+        "exported_at": true,
+        "row_hash": true
+      },
+      "destination": {
+        "type": "local",
+        "bucket": null,
+        "prefix": null,
+        "path": "./output/content_items/",
+        "region": null,
+        "endpoint": null,
+        "credentials_file": null,
+        "access_key_env": null,
+        "secret_key_env": null,
+        "session_token_env": null,
+        "aws_profile": null,
+        "account_name": null,
+        "account_key_env": null,
+        "sas_token_env": null,
+        "allow_anonymous": false
+      },
+      "quality": null,
+      "tuning": {
+        "batch_size": 10000,
+        "batch_size_memory_mb": 32,
+        "throttle_ms": 50,
+        "statement_timeout_s": 300,
+        "max_retries": 3,
+        "retry_backoff_ms": 2000,
+        "lock_timeout_s": 30,
+        "memory_threshold_mb": 4096,
+        "max_batch_memory_mb": null,
+        "on_batch_memory_exceeded": "warn",
+        "adaptive": false,
+        "min_parallel": null,
+        "max_value_mb": 256,
+        "configured_profile": "balanced"
+      },
+      "tuning_profile_label": "balanced (default)",
+      "validate": false,
+      "reconcile": false,
+      "resume": false,
+      "verify": "size",
+      "source": {
+        "type": "mysql",
+        "url": null,
+        "url_env": "RIVET_MY_URL",
+        "url_file": null,
+        "host": null,
+        "port": null,
+        "user": null,
+        "password": null,
+        "password_env": null,
+        "database": null,
+        "environment": null,
+        "tuning": null,
+        "tls": {
+          "mode": "disable",
+          "ca_file": null,
+          "accept_invalid_certs": false,
+          "accept_invalid_hostnames": false
+        }
+      },
+      "column_overrides": {},
+      "schema_drift_policy": "warn",
+      "shape_drift_warn_factor": 2.0,
+      "parquet": {
+        "row_group_strategy": "auto",
+        "row_group_rows": null,
+        "target_row_group_mb": 64,
+        "max_row_group_mb": null
+      }
+    },
+    "computed": {
+      "chunk_ranges": [
+        [
+          1,
+          250000
+        ],
+        [
+          250001,
+          500000
+        ],
+        [
+          500001,
+          750000
+        ],
+        [
+          750001,
+          1000000
+        ],
+        [
+          1000001,
+          1250000
+        ],
+        [
+          1250001,
+          1500000
+        ],
+        [
+          1500001,
+          1750000
+        ],
+        [
+          1750001,
+          2000000
+        ],
+        [
+          2000001,
+          2250000
+        ],
+        [
+          2250001,
+          2500000
+        ],
+        [
+          2500001,
+          2750000
+        ],
+        [
+          2750001,
+          3000000
+        ],
+        [
+          3000001,
+          3250000
+        ],
+        [
+          3250001,
+          3500000
+        ],
+        [
+          3500001,
+          3750000
+        ],
+        [
+          3750001,
+          4000000
+        ],
+        [
+          4000001,
+          4247620
+        ]
+      ],
+      "chunk_count": 17,
+      "cursor_snapshot": null,
+      "row_estimate": 4247620
+    },
+    "diagnostics": {
+      "verdict": "ACCEPTABLE",
+      "warnings": [
+        "verdict ACCEPTABLE but preflight collected no specific warnings — review `rivet check` output for context"
+      ],
+      "recommended_profile": "balanced",
+      "strategy_rationale": "Mode chunked (column: id, size: 250000): ~1.3M. Parallelism: single worker — large dataset with index support; parallel=1 (row width unavailable, so peak RSS cannot be bounded here). Risk — resumable: no — a failed run restarts from the beginning; memory: peak unavailable (no row-width estimate)."
+    },
+    "prioritization": {
+      "export_recommendation": {
+        "export_name": "content_items",
+        "priority_score": 40,
+        "priority_class": "medium",
+        "cost_class": "medium",
+        "risk_class": "low",
+        "recommended_wave": 3,
+        "isolate_on_source": false,
+        "reasons": [
+          {
+            "kind": "large_table",
+            "message": "Medium/large estimated row count (~4247620)."
+          },
+          {
+            "kind": "chunking_heavy",
+            "message": "Chunked extraction (17 chunk windows) — higher source load and runtime."
+          }
+        ]
+      },
+      "campaign": {
+        "ordered_exports": [
+          {
+            "export_name": "bench_sparse",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~9625) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_wide",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~82980) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "events",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~5000) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~2500) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders_coalesce",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~1) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders_sparse",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~1) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "page_views",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~64421) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "users",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~500) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_decimal",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~200000)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (2 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_hc",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~200000)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (2 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "content_items",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~4247620)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (17 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_narrow",
+            "priority_score": 25,
+            "priority_class": "low",
+            "cost_class": "very_high",
+            "risk_class": "low",
+            "recommended_wave": 4,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "huge_table",
+                "message": "Very large estimated row count (~10493868) — defer and isolate if possible."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (42 chunk windows) — higher source load and runtime."
+              }
+            ]
+          }
+        ],
+        "waves": [
+          {
+            "wave": 2,
+            "exports": [
+              "bench_sparse",
+              "bench_wide",
+              "events",
+              "orders",
+              "orders_coalesce",
+              "orders_sparse",
+              "page_views",
+              "users"
+            ]
+          },
+          {
+            "wave": 3,
+            "exports": [
+              "bench_decimal",
+              "bench_hc",
+              "content_items"
+            ]
+          },
+          {
+            "wave": 4,
+            "exports": [
+              "bench_narrow"
+            ]
+          }
+        ],
+        "source_group_warnings": []
+      }
+    },
+    "config_path": "/opt/airflow/dags/mysql.yaml"
+  },
+  {
+    "rivet_version": "0.16.3",
+    "plan_id": "a5b3ef9c4f4f43ead752c9bc35171534",
+    "created_at": "2026-06-30T21:23:36.938854586Z",
+    "expires_at": "2026-07-01T21:23:36.938854586Z",
+    "export_name": "events",
+    "strategy": "full",
+    "plan_fingerprint": "",
+    "integrity": "xxh3:e444fa57c3ffba29",
+    "resolved_plan": {
+      "export_name": "events",
+      "base_query": "SELECT id, user_id, event_type, payload, ip_address, created_at FROM events\n",
+      "strategy": "Snapshot",
+      "format": "parquet",
+      "compression": "zstd",
+      "compression_level": null,
+      "max_file_size_bytes": null,
+      "skip_empty": false,
+      "meta_columns": {
+        "exported_at": true,
+        "row_hash": true
+      },
+      "destination": {
+        "type": "local",
+        "bucket": null,
+        "prefix": null,
+        "path": "./output/events/",
+        "region": null,
+        "endpoint": null,
+        "credentials_file": null,
+        "access_key_env": null,
+        "secret_key_env": null,
+        "session_token_env": null,
+        "aws_profile": null,
+        "account_name": null,
+        "account_key_env": null,
+        "sas_token_env": null,
+        "allow_anonymous": false
+      },
+      "quality": null,
+      "tuning": {
+        "batch_size": 10000,
+        "batch_size_memory_mb": 32,
+        "throttle_ms": 50,
+        "statement_timeout_s": 300,
+        "max_retries": 3,
+        "retry_backoff_ms": 2000,
+        "lock_timeout_s": 30,
+        "memory_threshold_mb": 4096,
+        "max_batch_memory_mb": null,
+        "on_batch_memory_exceeded": "warn",
+        "adaptive": false,
+        "min_parallel": null,
+        "max_value_mb": 256,
+        "configured_profile": "balanced"
+      },
+      "tuning_profile_label": "balanced (default)",
+      "validate": false,
+      "reconcile": false,
+      "resume": false,
+      "verify": "size",
+      "source": {
+        "type": "mysql",
+        "url": null,
+        "url_env": "RIVET_MY_URL",
+        "url_file": null,
+        "host": null,
+        "port": null,
+        "user": null,
+        "password": null,
+        "password_env": null,
+        "database": null,
+        "environment": null,
+        "tuning": null,
+        "tls": {
+          "mode": "disable",
+          "ca_file": null,
+          "accept_invalid_certs": false,
+          "accept_invalid_hostnames": false
+        }
+      },
+      "column_overrides": {},
+      "schema_drift_policy": "warn",
+      "shape_drift_warn_factor": 2.0,
+      "parquet": null
+    },
+    "computed": {
+      "chunk_ranges": [],
+      "chunk_count": 0,
+      "cursor_snapshot": null,
+      "row_estimate": 5000
+    },
+    "diagnostics": {
+      "verdict": "ACCEPTABLE",
+      "warnings": [
+        "verdict ACCEPTABLE but preflight collected no specific warnings — review `rivet check` output for context"
+      ],
+      "recommended_profile": "balanced",
+      "strategy_rationale": "Mode full: ~5000 rows, below the ~100K chunked threshold, so a single-pass copy is cheapest. Parallelism: single worker — only chunked mode benefits from parallelism; parallel=1 (row width unavailable, so peak RSS cannot be bounded here). Risk — resumable: no — a failed run restarts from the beginning; memory: peak unavailable (no row-width estimate)."
+    },
+    "prioritization": {
+      "export_recommendation": {
+        "export_name": "events",
+        "priority_score": 67,
+        "priority_class": "medium",
+        "cost_class": "low",
+        "risk_class": "low",
+        "recommended_wave": 2,
+        "isolate_on_source": false,
+        "reasons": [
+          {
+            "kind": "small_table",
+            "message": "Smaller estimated row count (~5000) — lower extraction cost."
+          }
+        ]
+      },
+      "campaign": {
+        "ordered_exports": [
+          {
+            "export_name": "bench_sparse",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~9625) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_wide",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~82980) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "events",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~5000) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~2500) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders_coalesce",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~1) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders_sparse",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~1) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "page_views",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~64421) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "users",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~500) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_decimal",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~200000)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (2 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_hc",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~200000)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (2 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "content_items",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~4247620)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (17 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_narrow",
+            "priority_score": 25,
+            "priority_class": "low",
+            "cost_class": "very_high",
+            "risk_class": "low",
+            "recommended_wave": 4,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "huge_table",
+                "message": "Very large estimated row count (~10493868) — defer and isolate if possible."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (42 chunk windows) — higher source load and runtime."
+              }
+            ]
+          }
+        ],
+        "waves": [
+          {
+            "wave": 2,
+            "exports": [
+              "bench_sparse",
+              "bench_wide",
+              "events",
+              "orders",
+              "orders_coalesce",
+              "orders_sparse",
+              "page_views",
+              "users"
+            ]
+          },
+          {
+            "wave": 3,
+            "exports": [
+              "bench_decimal",
+              "bench_hc",
+              "content_items"
+            ]
+          },
+          {
+            "wave": 4,
+            "exports": [
+              "bench_narrow"
+            ]
+          }
+        ],
+        "source_group_warnings": []
+      }
+    },
+    "config_path": "/opt/airflow/dags/mysql.yaml"
+  },
+  {
+    "rivet_version": "0.16.3",
+    "plan_id": "725676847c927b31b87b5222748eedf4",
+    "created_at": "2026-06-30T21:23:36.952100627Z",
+    "expires_at": "2026-07-01T21:23:36.952100627Z",
+    "export_name": "orders",
+    "strategy": "full",
+    "plan_fingerprint": "",
+    "integrity": "xxh3:43e624333f1beec7",
+    "resolved_plan": {
+      "export_name": "orders",
+      "base_query": "SELECT id, user_id, product, quantity, price, status, notes, ordered_at, updated_at FROM orders\n",
+      "strategy": "Snapshot",
+      "format": "parquet",
+      "compression": "zstd",
+      "compression_level": null,
+      "max_file_size_bytes": null,
+      "skip_empty": false,
+      "meta_columns": {
+        "exported_at": true,
+        "row_hash": true
+      },
+      "destination": {
+        "type": "local",
+        "bucket": null,
+        "prefix": null,
+        "path": "./output/orders/",
+        "region": null,
+        "endpoint": null,
+        "credentials_file": null,
+        "access_key_env": null,
+        "secret_key_env": null,
+        "session_token_env": null,
+        "aws_profile": null,
+        "account_name": null,
+        "account_key_env": null,
+        "sas_token_env": null,
+        "allow_anonymous": false
+      },
+      "quality": null,
+      "tuning": {
+        "batch_size": 10000,
+        "batch_size_memory_mb": 32,
+        "throttle_ms": 50,
+        "statement_timeout_s": 300,
+        "max_retries": 3,
+        "retry_backoff_ms": 2000,
+        "lock_timeout_s": 30,
+        "memory_threshold_mb": 4096,
+        "max_batch_memory_mb": null,
+        "on_batch_memory_exceeded": "warn",
+        "adaptive": false,
+        "min_parallel": null,
+        "max_value_mb": 256,
+        "configured_profile": "balanced"
+      },
+      "tuning_profile_label": "balanced (default)",
+      "validate": false,
+      "reconcile": false,
+      "resume": false,
+      "verify": "size",
+      "source": {
+        "type": "mysql",
+        "url": null,
+        "url_env": "RIVET_MY_URL",
+        "url_file": null,
+        "host": null,
+        "port": null,
+        "user": null,
+        "password": null,
+        "password_env": null,
+        "database": null,
+        "environment": null,
+        "tuning": null,
+        "tls": {
+          "mode": "disable",
+          "ca_file": null,
+          "accept_invalid_certs": false,
+          "accept_invalid_hostnames": false
+        }
+      },
+      "column_overrides": {
+        "price": {
+          "kind": "decimal",
+          "precision": 10,
+          "scale": 2
+        }
+      },
+      "schema_drift_policy": "warn",
+      "shape_drift_warn_factor": 2.0,
+      "parquet": null
+    },
+    "computed": {
+      "chunk_ranges": [],
+      "chunk_count": 0,
+      "cursor_snapshot": null,
+      "row_estimate": 2500
+    },
+    "diagnostics": {
+      "verdict": "ACCEPTABLE",
+      "warnings": [
+        "verdict ACCEPTABLE but preflight collected no specific warnings — review `rivet check` output for context"
+      ],
+      "recommended_profile": "balanced",
+      "strategy_rationale": "Mode full: ~2500 rows, below the ~100K chunked threshold, so a single-pass copy is cheapest. Parallelism: single worker — only chunked mode benefits from parallelism; parallel=1 (row width unavailable, so peak RSS cannot be bounded here). Risk — resumable: no — a failed run restarts from the beginning; memory: peak unavailable (no row-width estimate)."
+    },
+    "prioritization": {
+      "export_recommendation": {
+        "export_name": "orders",
+        "priority_score": 67,
+        "priority_class": "medium",
+        "cost_class": "low",
+        "risk_class": "low",
+        "recommended_wave": 2,
+        "isolate_on_source": false,
+        "reasons": [
+          {
+            "kind": "small_table",
+            "message": "Smaller estimated row count (~2500) — lower extraction cost."
+          }
+        ]
+      },
+      "campaign": {
+        "ordered_exports": [
+          {
+            "export_name": "bench_sparse",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~9625) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_wide",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~82980) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "events",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~5000) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~2500) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders_coalesce",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~1) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders_sparse",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~1) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "page_views",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~64421) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "users",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~500) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_decimal",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~200000)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (2 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_hc",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~200000)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (2 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "content_items",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~4247620)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (17 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_narrow",
+            "priority_score": 25,
+            "priority_class": "low",
+            "cost_class": "very_high",
+            "risk_class": "low",
+            "recommended_wave": 4,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "huge_table",
+                "message": "Very large estimated row count (~10493868) — defer and isolate if possible."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (42 chunk windows) — higher source load and runtime."
+              }
+            ]
+          }
+        ],
+        "waves": [
+          {
+            "wave": 2,
+            "exports": [
+              "bench_sparse",
+              "bench_wide",
+              "events",
+              "orders",
+              "orders_coalesce",
+              "orders_sparse",
+              "page_views",
+              "users"
+            ]
+          },
+          {
+            "wave": 3,
+            "exports": [
+              "bench_decimal",
+              "bench_hc",
+              "content_items"
+            ]
+          },
+          {
+            "wave": 4,
+            "exports": [
+              "bench_narrow"
+            ]
+          }
+        ],
+        "source_group_warnings": []
+      }
+    },
+    "config_path": "/opt/airflow/dags/mysql.yaml"
+  },
+  {
+    "rivet_version": "0.16.3",
+    "plan_id": "aa56ab6846af71e1d92c8e60fc992282",
+    "created_at": "2026-06-30T21:23:36.960124961Z",
+    "expires_at": "2026-07-01T21:23:36.960124961Z",
+    "export_name": "orders_coalesce",
+    "strategy": "full",
+    "plan_fingerprint": "",
+    "integrity": "xxh3:26bb7f8b28dd6863",
+    "resolved_plan": {
+      "export_name": "orders_coalesce",
+      "base_query": "SELECT id, product, quantity, price, updated_at, created_at FROM orders_coalesce\n",
+      "strategy": "Snapshot",
+      "format": "parquet",
+      "compression": "zstd",
+      "compression_level": null,
+      "max_file_size_bytes": null,
+      "skip_empty": false,
+      "meta_columns": {
+        "exported_at": true,
+        "row_hash": true
+      },
+      "destination": {
+        "type": "local",
+        "bucket": null,
+        "prefix": null,
+        "path": "./output/orders_coalesce/",
+        "region": null,
+        "endpoint": null,
+        "credentials_file": null,
+        "access_key_env": null,
+        "secret_key_env": null,
+        "session_token_env": null,
+        "aws_profile": null,
+        "account_name": null,
+        "account_key_env": null,
+        "sas_token_env": null,
+        "allow_anonymous": false
+      },
+      "quality": null,
+      "tuning": {
+        "batch_size": 10000,
+        "batch_size_memory_mb": 32,
+        "throttle_ms": 50,
+        "statement_timeout_s": 300,
+        "max_retries": 3,
+        "retry_backoff_ms": 2000,
+        "lock_timeout_s": 30,
+        "memory_threshold_mb": 4096,
+        "max_batch_memory_mb": null,
+        "on_batch_memory_exceeded": "warn",
+        "adaptive": false,
+        "min_parallel": null,
+        "max_value_mb": 256,
+        "configured_profile": "balanced"
+      },
+      "tuning_profile_label": "balanced (default)",
+      "validate": false,
+      "reconcile": false,
+      "resume": false,
+      "verify": "size",
+      "source": {
+        "type": "mysql",
+        "url": null,
+        "url_env": "RIVET_MY_URL",
+        "url_file": null,
+        "host": null,
+        "port": null,
+        "user": null,
+        "password": null,
+        "password_env": null,
+        "database": null,
+        "environment": null,
+        "tuning": null,
+        "tls": {
+          "mode": "disable",
+          "ca_file": null,
+          "accept_invalid_certs": false,
+          "accept_invalid_hostnames": false
+        }
+      },
+      "column_overrides": {
+        "price": {
+          "kind": "decimal",
+          "precision": 10,
+          "scale": 2
+        }
+      },
+      "schema_drift_policy": "warn",
+      "shape_drift_warn_factor": 2.0,
+      "parquet": null
+    },
+    "computed": {
+      "chunk_ranges": [],
+      "chunk_count": 0,
+      "cursor_snapshot": null,
+      "row_estimate": 1
+    },
+    "diagnostics": {
+      "verdict": "ACCEPTABLE",
+      "warnings": [
+        "verdict ACCEPTABLE but preflight collected no specific warnings — review `rivet check` output for context"
+      ],
+      "recommended_profile": "balanced",
+      "strategy_rationale": "Mode full: ~1 rows, below the ~100K chunked threshold, so a single-pass copy is cheapest. Parallelism: single worker — only chunked mode benefits from parallelism; parallel=1 (row width unavailable, so peak RSS cannot be bounded here). Risk — resumable: no — a failed run restarts from the beginning; memory: peak unavailable (no row-width estimate)."
+    },
+    "prioritization": {
+      "export_recommendation": {
+        "export_name": "orders_coalesce",
+        "priority_score": 67,
+        "priority_class": "medium",
+        "cost_class": "low",
+        "risk_class": "low",
+        "recommended_wave": 2,
+        "isolate_on_source": false,
+        "reasons": [
+          {
+            "kind": "small_table",
+            "message": "Smaller estimated row count (~1) — lower extraction cost."
+          }
+        ]
+      },
+      "campaign": {
+        "ordered_exports": [
+          {
+            "export_name": "bench_sparse",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~9625) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_wide",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~82980) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "events",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~5000) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~2500) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders_coalesce",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~1) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders_sparse",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~1) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "page_views",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~64421) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "users",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~500) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_decimal",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~200000)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (2 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_hc",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~200000)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (2 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "content_items",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~4247620)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (17 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_narrow",
+            "priority_score": 25,
+            "priority_class": "low",
+            "cost_class": "very_high",
+            "risk_class": "low",
+            "recommended_wave": 4,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "huge_table",
+                "message": "Very large estimated row count (~10493868) — defer and isolate if possible."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (42 chunk windows) — higher source load and runtime."
+              }
+            ]
+          }
+        ],
+        "waves": [
+          {
+            "wave": 2,
+            "exports": [
+              "bench_sparse",
+              "bench_wide",
+              "events",
+              "orders",
+              "orders_coalesce",
+              "orders_sparse",
+              "page_views",
+              "users"
+            ]
+          },
+          {
+            "wave": 3,
+            "exports": [
+              "bench_decimal",
+              "bench_hc",
+              "content_items"
+            ]
+          },
+          {
+            "wave": 4,
+            "exports": [
+              "bench_narrow"
+            ]
+          }
+        ],
+        "source_group_warnings": []
+      }
+    },
+    "config_path": "/opt/airflow/dags/mysql.yaml"
+  },
+  {
+    "rivet_version": "0.16.3",
+    "plan_id": "27b2e49b8c790f0361b6cf061b2fac76",
+    "created_at": "2026-06-30T21:23:36.971056127Z",
+    "expires_at": "2026-07-01T21:23:36.971056127Z",
+    "export_name": "orders_sparse",
+    "strategy": "full",
+    "plan_fingerprint": "",
+    "integrity": "xxh3:55230ef22c9ce78b",
+    "resolved_plan": {
+      "export_name": "orders_sparse",
+      "base_query": "SELECT id, payload FROM orders_sparse\n",
+      "strategy": "Snapshot",
+      "format": "parquet",
+      "compression": "zstd",
+      "compression_level": null,
+      "max_file_size_bytes": null,
+      "skip_empty": false,
+      "meta_columns": {
+        "exported_at": true,
+        "row_hash": true
+      },
+      "destination": {
+        "type": "local",
+        "bucket": null,
+        "prefix": null,
+        "path": "./output/orders_sparse/",
+        "region": null,
+        "endpoint": null,
+        "credentials_file": null,
+        "access_key_env": null,
+        "secret_key_env": null,
+        "session_token_env": null,
+        "aws_profile": null,
+        "account_name": null,
+        "account_key_env": null,
+        "sas_token_env": null,
+        "allow_anonymous": false
+      },
+      "quality": null,
+      "tuning": {
+        "batch_size": 10000,
+        "batch_size_memory_mb": 32,
+        "throttle_ms": 50,
+        "statement_timeout_s": 300,
+        "max_retries": 3,
+        "retry_backoff_ms": 2000,
+        "lock_timeout_s": 30,
+        "memory_threshold_mb": 4096,
+        "max_batch_memory_mb": null,
+        "on_batch_memory_exceeded": "warn",
+        "adaptive": false,
+        "min_parallel": null,
+        "max_value_mb": 256,
+        "configured_profile": "balanced"
+      },
+      "tuning_profile_label": "balanced (default)",
+      "validate": false,
+      "reconcile": false,
+      "resume": false,
+      "verify": "size",
+      "source": {
+        "type": "mysql",
+        "url": null,
+        "url_env": "RIVET_MY_URL",
+        "url_file": null,
+        "host": null,
+        "port": null,
+        "user": null,
+        "password": null,
+        "password_env": null,
+        "database": null,
+        "environment": null,
+        "tuning": null,
+        "tls": {
+          "mode": "disable",
+          "ca_file": null,
+          "accept_invalid_certs": false,
+          "accept_invalid_hostnames": false
+        }
+      },
+      "column_overrides": {},
+      "schema_drift_policy": "warn",
+      "shape_drift_warn_factor": 2.0,
+      "parquet": null
+    },
+    "computed": {
+      "chunk_ranges": [],
+      "chunk_count": 0,
+      "cursor_snapshot": null,
+      "row_estimate": 1
+    },
+    "diagnostics": {
+      "verdict": "ACCEPTABLE",
+      "warnings": [
+        "verdict ACCEPTABLE but preflight collected no specific warnings — review `rivet check` output for context"
+      ],
+      "recommended_profile": "balanced",
+      "strategy_rationale": "Mode full: ~1 rows, below the ~100K chunked threshold, so a single-pass copy is cheapest. Parallelism: single worker — only chunked mode benefits from parallelism; parallel=1 (row width unavailable, so peak RSS cannot be bounded here). Risk — resumable: no — a failed run restarts from the beginning; memory: peak unavailable (no row-width estimate)."
+    },
+    "prioritization": {
+      "export_recommendation": {
+        "export_name": "orders_sparse",
+        "priority_score": 67,
+        "priority_class": "medium",
+        "cost_class": "low",
+        "risk_class": "low",
+        "recommended_wave": 2,
+        "isolate_on_source": false,
+        "reasons": [
+          {
+            "kind": "small_table",
+            "message": "Smaller estimated row count (~1) — lower extraction cost."
+          }
+        ]
+      },
+      "campaign": {
+        "ordered_exports": [
+          {
+            "export_name": "bench_sparse",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~9625) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_wide",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~82980) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "events",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~5000) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~2500) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders_coalesce",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~1) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders_sparse",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~1) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "page_views",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~64421) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "users",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~500) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_decimal",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~200000)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (2 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_hc",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~200000)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (2 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "content_items",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~4247620)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (17 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_narrow",
+            "priority_score": 25,
+            "priority_class": "low",
+            "cost_class": "very_high",
+            "risk_class": "low",
+            "recommended_wave": 4,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "huge_table",
+                "message": "Very large estimated row count (~10493868) — defer and isolate if possible."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (42 chunk windows) — higher source load and runtime."
+              }
+            ]
+          }
+        ],
+        "waves": [
+          {
+            "wave": 2,
+            "exports": [
+              "bench_sparse",
+              "bench_wide",
+              "events",
+              "orders",
+              "orders_coalesce",
+              "orders_sparse",
+              "page_views",
+              "users"
+            ]
+          },
+          {
+            "wave": 3,
+            "exports": [
+              "bench_decimal",
+              "bench_hc",
+              "content_items"
+            ]
+          },
+          {
+            "wave": 4,
+            "exports": [
+              "bench_narrow"
+            ]
+          }
+        ],
+        "source_group_warnings": []
+      }
+    },
+    "config_path": "/opt/airflow/dags/mysql.yaml"
+  },
+  {
+    "rivet_version": "0.16.3",
+    "plan_id": "922ca1396a4e00125a2f4795760c894b",
+    "created_at": "2026-06-30T21:23:36.981233211Z",
+    "expires_at": "2026-07-01T21:23:36.981233211Z",
+    "export_name": "page_views",
+    "strategy": "full",
+    "plan_fingerprint": "",
+    "integrity": "xxh3:5c15b3fc0ebd7ddc",
+    "resolved_plan": {
+      "export_name": "page_views",
+      "base_query": "SELECT id, session_id, user_id, url, referrer, user_agent, ip_address, country_code, region, city, device_type, browser, os, screen_width, screen_height, viewport_width, viewport_height, page_load_ms, dom_ready_ms, time_on_page_ms, scroll_depth_pct, click_count, is_bounce, utm_source, utm_medium, utm_campaign, utm_term, utm_content, custom_props, created_at FROM page_views\n",
+      "strategy": "Snapshot",
+      "format": "parquet",
+      "compression": "zstd",
+      "compression_level": null,
+      "max_file_size_bytes": null,
+      "skip_empty": false,
+      "meta_columns": {
+        "exported_at": true,
+        "row_hash": true
+      },
+      "destination": {
+        "type": "local",
+        "bucket": null,
+        "prefix": null,
+        "path": "./output/page_views/",
+        "region": null,
+        "endpoint": null,
+        "credentials_file": null,
+        "access_key_env": null,
+        "secret_key_env": null,
+        "session_token_env": null,
+        "aws_profile": null,
+        "account_name": null,
+        "account_key_env": null,
+        "sas_token_env": null,
+        "allow_anonymous": false
+      },
+      "quality": null,
+      "tuning": {
+        "batch_size": 10000,
+        "batch_size_memory_mb": 32,
+        "throttle_ms": 50,
+        "statement_timeout_s": 300,
+        "max_retries": 3,
+        "retry_backoff_ms": 2000,
+        "lock_timeout_s": 30,
+        "memory_threshold_mb": 4096,
+        "max_batch_memory_mb": null,
+        "on_batch_memory_exceeded": "warn",
+        "adaptive": false,
+        "min_parallel": null,
+        "max_value_mb": 256,
+        "configured_profile": "balanced"
+      },
+      "tuning_profile_label": "balanced (default)",
+      "validate": false,
+      "reconcile": false,
+      "resume": false,
+      "verify": "size",
+      "source": {
+        "type": "mysql",
+        "url": null,
+        "url_env": "RIVET_MY_URL",
+        "url_file": null,
+        "host": null,
+        "port": null,
+        "user": null,
+        "password": null,
+        "password_env": null,
+        "database": null,
+        "environment": null,
+        "tuning": null,
+        "tls": {
+          "mode": "disable",
+          "ca_file": null,
+          "accept_invalid_certs": false,
+          "accept_invalid_hostnames": false
+        }
+      },
+      "column_overrides": {},
+      "schema_drift_policy": "warn",
+      "shape_drift_warn_factor": 2.0,
+      "parquet": null
+    },
+    "computed": {
+      "chunk_ranges": [],
+      "chunk_count": 0,
+      "cursor_snapshot": null,
+      "row_estimate": 64421
+    },
+    "diagnostics": {
+      "verdict": "ACCEPTABLE",
+      "warnings": [
+        "verdict ACCEPTABLE but preflight collected no specific warnings — review `rivet check` output for context"
+      ],
+      "recommended_profile": "balanced",
+      "strategy_rationale": "Mode full: ~64K rows, below the ~100K chunked threshold, so a single-pass copy is cheapest. Parallelism: single worker — only chunked mode benefits from parallelism; parallel=1 (row width unavailable, so peak RSS cannot be bounded here). Risk — resumable: no — a failed run restarts from the beginning; memory: peak unavailable (no row-width estimate)."
+    },
+    "prioritization": {
+      "export_recommendation": {
+        "export_name": "page_views",
+        "priority_score": 67,
+        "priority_class": "medium",
+        "cost_class": "low",
+        "risk_class": "low",
+        "recommended_wave": 2,
+        "isolate_on_source": false,
+        "reasons": [
+          {
+            "kind": "small_table",
+            "message": "Smaller estimated row count (~64421) — lower extraction cost."
+          }
+        ]
+      },
+      "campaign": {
+        "ordered_exports": [
+          {
+            "export_name": "bench_sparse",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~9625) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_wide",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~82980) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "events",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~5000) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~2500) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders_coalesce",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~1) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders_sparse",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~1) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "page_views",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~64421) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "users",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~500) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_decimal",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~200000)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (2 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_hc",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~200000)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (2 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "content_items",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~4247620)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (17 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_narrow",
+            "priority_score": 25,
+            "priority_class": "low",
+            "cost_class": "very_high",
+            "risk_class": "low",
+            "recommended_wave": 4,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "huge_table",
+                "message": "Very large estimated row count (~10493868) — defer and isolate if possible."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (42 chunk windows) — higher source load and runtime."
+              }
+            ]
+          }
+        ],
+        "waves": [
+          {
+            "wave": 2,
+            "exports": [
+              "bench_sparse",
+              "bench_wide",
+              "events",
+              "orders",
+              "orders_coalesce",
+              "orders_sparse",
+              "page_views",
+              "users"
+            ]
+          },
+          {
+            "wave": 3,
+            "exports": [
+              "bench_decimal",
+              "bench_hc",
+              "content_items"
+            ]
+          },
+          {
+            "wave": 4,
+            "exports": [
+              "bench_narrow"
+            ]
+          }
+        ],
+        "source_group_warnings": []
+      }
+    },
+    "config_path": "/opt/airflow/dags/mysql.yaml"
+  },
+  {
+    "rivet_version": "0.16.3",
+    "plan_id": "845200d364155f63c21966ec00c5ea68",
+    "created_at": "2026-06-30T21:23:36.990435877Z",
+    "expires_at": "2026-07-01T21:23:36.990435877Z",
+    "export_name": "users",
+    "strategy": "full",
+    "plan_fingerprint": "",
+    "integrity": "xxh3:aa5dd7fe085a8dc0",
+    "resolved_plan": {
+      "export_name": "users",
+      "base_query": "SELECT id, name, email, age, balance, is_active, bio, created_at, updated_at FROM users\n",
+      "strategy": "Snapshot",
+      "format": "parquet",
+      "compression": "zstd",
+      "compression_level": null,
+      "max_file_size_bytes": null,
+      "skip_empty": false,
+      "meta_columns": {
+        "exported_at": true,
+        "row_hash": true
+      },
+      "destination": {
+        "type": "local",
+        "bucket": null,
+        "prefix": null,
+        "path": "./output/users/",
+        "region": null,
+        "endpoint": null,
+        "credentials_file": null,
+        "access_key_env": null,
+        "secret_key_env": null,
+        "session_token_env": null,
+        "aws_profile": null,
+        "account_name": null,
+        "account_key_env": null,
+        "sas_token_env": null,
+        "allow_anonymous": false
+      },
+      "quality": null,
+      "tuning": {
+        "batch_size": 10000,
+        "batch_size_memory_mb": 32,
+        "throttle_ms": 50,
+        "statement_timeout_s": 300,
+        "max_retries": 3,
+        "retry_backoff_ms": 2000,
+        "lock_timeout_s": 30,
+        "memory_threshold_mb": 4096,
+        "max_batch_memory_mb": null,
+        "on_batch_memory_exceeded": "warn",
+        "adaptive": false,
+        "min_parallel": null,
+        "max_value_mb": 256,
+        "configured_profile": "balanced"
+      },
+      "tuning_profile_label": "balanced (default)",
+      "validate": false,
+      "reconcile": false,
+      "resume": false,
+      "verify": "size",
+      "source": {
+        "type": "mysql",
+        "url": null,
+        "url_env": "RIVET_MY_URL",
+        "url_file": null,
+        "host": null,
+        "port": null,
+        "user": null,
+        "password": null,
+        "password_env": null,
+        "database": null,
+        "environment": null,
+        "tuning": null,
+        "tls": {
+          "mode": "disable",
+          "ca_file": null,
+          "accept_invalid_certs": false,
+          "accept_invalid_hostnames": false
+        }
+      },
+      "column_overrides": {
+        "balance": {
+          "kind": "decimal",
+          "precision": 12,
+          "scale": 2
+        }
+      },
+      "schema_drift_policy": "warn",
+      "shape_drift_warn_factor": 2.0,
+      "parquet": null
+    },
+    "computed": {
+      "chunk_ranges": [],
+      "chunk_count": 0,
+      "cursor_snapshot": null,
+      "row_estimate": 500
+    },
+    "diagnostics": {
+      "verdict": "ACCEPTABLE",
+      "warnings": [
+        "verdict ACCEPTABLE but preflight collected no specific warnings — review `rivet check` output for context"
+      ],
+      "recommended_profile": "balanced",
+      "strategy_rationale": "Mode full: ~500 rows, below the ~100K chunked threshold, so a single-pass copy is cheapest. Parallelism: single worker — only chunked mode benefits from parallelism; parallel=1 (row width unavailable, so peak RSS cannot be bounded here). Risk — resumable: no — a failed run restarts from the beginning; memory: peak unavailable (no row-width estimate)."
+    },
+    "prioritization": {
+      "export_recommendation": {
+        "export_name": "users",
+        "priority_score": 67,
+        "priority_class": "medium",
+        "cost_class": "low",
+        "risk_class": "low",
+        "recommended_wave": 2,
+        "isolate_on_source": false,
+        "reasons": [
+          {
+            "kind": "small_table",
+            "message": "Smaller estimated row count (~500) — lower extraction cost."
+          }
+        ]
+      },
+      "campaign": {
+        "ordered_exports": [
+          {
+            "export_name": "bench_sparse",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~9625) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_wide",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~82980) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "events",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~5000) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~2500) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders_coalesce",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~1) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "orders_sparse",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~1) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "page_views",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~64421) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "users",
+            "priority_score": 67,
+            "priority_class": "medium",
+            "cost_class": "low",
+            "risk_class": "low",
+            "recommended_wave": 2,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "small_table",
+                "message": "Smaller estimated row count (~500) — lower extraction cost."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_decimal",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~200000)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (2 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_hc",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~200000)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (2 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "content_items",
+            "priority_score": 40,
+            "priority_class": "medium",
+            "cost_class": "medium",
+            "risk_class": "low",
+            "recommended_wave": 3,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "large_table",
+                "message": "Medium/large estimated row count (~4247620)."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (17 chunk windows) — higher source load and runtime."
+              }
+            ]
+          },
+          {
+            "export_name": "bench_narrow",
+            "priority_score": 25,
+            "priority_class": "low",
+            "cost_class": "very_high",
+            "risk_class": "low",
+            "recommended_wave": 4,
+            "isolate_on_source": false,
+            "reasons": [
+              {
+                "kind": "huge_table",
+                "message": "Very large estimated row count (~10493868) — defer and isolate if possible."
+              },
+              {
+                "kind": "chunking_heavy",
+                "message": "Chunked extraction (42 chunk windows) — higher source load and runtime."
+              }
+            ]
+          }
+        ],
+        "waves": [
+          {
+            "wave": 2,
+            "exports": [
+              "bench_sparse",
+              "bench_wide",
+              "events",
+              "orders",
+              "orders_coalesce",
+              "orders_sparse",
+              "page_views",
+              "users"
+            ]
+          },
+          {
+            "wave": 3,
+            "exports": [
+              "bench_decimal",
+              "bench_hc",
+              "content_items"
+            ]
+          },
+          {
+            "wave": 4,
+            "exports": [
+              "bench_narrow"
+            ]
+          }
+        ],
+        "source_group_warnings": []
+      }
+    },
+    "config_path": "/opt/airflow/dags/mysql.yaml"
+  }
+]

@@ -1,9 +1,9 @@
 [
   {
     "rivet_version": "0.16.3",
-    "plan_id": "82965fd662afdd14f190800cc42980cb",
-    "created_at": "2026-06-30T21:03:31.197333791Z",
-    "expires_at": "2026-07-01T21:03:31.197333791Z",
+    "plan_id": "20c12d660d36d36ea2b2465ba5020c73",
+    "created_at": "2026-06-30T21:23:30.580565222Z",
+    "expires_at": "2026-07-01T21:23:30.580565222Z",
     "export_name": "bench_decimal",
     "strategy": "chunked",
     "plan_fingerprint": "791506e1a64ffcbb",
@@ -92,24 +92,24 @@
         }
       },
       "column_overrides": {
-        "qty": {
-          "kind": "decimal",
-          "precision": 10,
-          "scale": 2
-        },
         "total": {
           "kind": "decimal",
           "precision": 20,
           "scale": 4
         },
-        "price": {
+        "qty": {
           "kind": "decimal",
-          "precision": 18,
-          "scale": 4
+          "precision": 10,
+          "scale": 2
         },
         "discount": {
           "kind": "decimal",
           "precision": 5,
+          "scale": 4
+        },
+        "price": {
+          "kind": "decimal",
+          "precision": 18,
           "scale": 4
         }
       },
@@ -480,13 +480,13 @@
         "source_group_warnings": []
       }
     },
-    "config_path": "/opt/airflow/dags/rivet.yaml"
+    "config_path": "/opt/airflow/dags/postgres.yaml"
   },
   {
     "rivet_version": "0.16.3",
-    "plan_id": "522adb0c923e39b8d7bb99f38f4ded8f",
-    "created_at": "2026-06-30T21:03:31.253490208Z",
-    "expires_at": "2026-07-01T21:03:31.253490208Z",
+    "plan_id": "4835ce82f587ff92929e3e4d61abcadb",
+    "created_at": "2026-06-30T21:23:30.634887430Z",
+    "expires_at": "2026-07-01T21:23:30.634887430Z",
     "export_name": "bench_hc",
     "strategy": "chunked",
     "plan_fingerprint": "0b2156390ec50941",
@@ -942,13 +942,13 @@
         "source_group_warnings": []
       }
     },
-    "config_path": "/opt/airflow/dags/rivet.yaml"
+    "config_path": "/opt/airflow/dags/postgres.yaml"
   },
   {
     "rivet_version": "0.16.3",
-    "plan_id": "12549156e663677e3e2fbe11f5e6efc1",
-    "created_at": "2026-06-30T21:03:31.282606500Z",
-    "expires_at": "2026-07-01T21:03:31.282606500Z",
+    "plan_id": "8189e96078f544ca544e106adb8694b9",
+    "created_at": "2026-06-30T21:23:30.645354722Z",
+    "expires_at": "2026-07-01T21:23:30.645354722Z",
     "export_name": "bench_json",
     "strategy": "full",
     "plan_fingerprint": "",
@@ -1375,13 +1375,13 @@
         "source_group_warnings": []
       }
     },
-    "config_path": "/opt/airflow/dags/rivet.yaml"
+    "config_path": "/opt/airflow/dags/postgres.yaml"
   },
   {
     "rivet_version": "0.16.3",
-    "plan_id": "9a605fa0715ff7a409051097a176c1f0",
-    "created_at": "2026-06-30T21:03:31.336903416Z",
-    "expires_at": "2026-07-01T21:03:31.336903416Z",
+    "plan_id": "197c53978e020c5e6ad95fa7b6a81794",
+    "created_at": "2026-06-30T21:23:30.683387222Z",
+    "expires_at": "2026-07-01T21:23:30.683387222Z",
     "export_name": "bench_narrow",
     "strategy": "chunked",
     "plan_fingerprint": "1884b763a41ddfb6",
@@ -1873,13 +1873,13 @@
         "source_group_warnings": []
       }
     },
-    "config_path": "/opt/airflow/dags/rivet.yaml"
+    "config_path": "/opt/airflow/dags/postgres.yaml"
   },
   {
     "rivet_version": "0.16.3",
-    "plan_id": "2e7aab96a6171cc4172728bdb7968ca3",
-    "created_at": "2026-06-30T21:03:31.346335875Z",
-    "expires_at": "2026-07-01T21:03:31.346335875Z",
+    "plan_id": "380b0d00d6ad76ba4e81633e73787a32",
+    "created_at": "2026-06-30T21:23:30.693288430Z",
+    "expires_at": "2026-07-01T21:23:30.693288430Z",
     "export_name": "bench_sparse",
     "strategy": "full",
     "plan_fingerprint": "",
@@ -2306,13 +2306,13 @@
         "source_group_warnings": []
       }
     },
-    "config_path": "/opt/airflow/dags/rivet.yaml"
+    "config_path": "/opt/airflow/dags/postgres.yaml"
   },
   {
     "rivet_version": "0.16.3",
-    "plan_id": "e0aaa3868ef58b98b7ca1d624a879080",
-    "created_at": "2026-06-30T21:03:31.361456416Z",
-    "expires_at": "2026-07-01T21:03:31.361456416Z",
+    "plan_id": "2c81934cad18c327a7377762fdf4f7cd",
+    "created_at": "2026-06-30T21:23:30.704924264Z",
+    "expires_at": "2026-07-01T21:23:30.704924264Z",
     "export_name": "bench_wide",
     "strategy": "full",
     "plan_fingerprint": "",
@@ -2739,13 +2739,13 @@
         "source_group_warnings": []
       }
     },
-    "config_path": "/opt/airflow/dags/rivet.yaml"
+    "config_path": "/opt/airflow/dags/postgres.yaml"
   },
   {
     "rivet_version": "0.16.3",
-    "plan_id": "a3f3977a4e42ff57786caf550042f9cd",
-    "created_at": "2026-06-30T21:03:31.442244Z",
-    "expires_at": "2026-07-01T21:03:31.442244Z",
+    "plan_id": "fbb076a3bff8a9d385018b3b15d34c1f",
+    "created_at": "2026-06-30T21:23:30.716135055Z",
+    "expires_at": "2026-07-01T21:23:30.716135055Z",
     "export_name": "cdc_ack_test",
     "strategy": "full",
     "plan_fingerprint": "",
@@ -3172,13 +3172,13 @@
         "source_group_warnings": []
       }
     },
-    "config_path": "/opt/airflow/dags/rivet.yaml"
+    "config_path": "/opt/airflow/dags/postgres.yaml"
   },
   {
     "rivet_version": "0.16.3",
-    "plan_id": "29da7f02514a7e1af3289b8fc6b589fe",
-    "created_at": "2026-06-30T21:03:31.467443958Z",
-    "expires_at": "2026-07-01T21:03:31.467443958Z",
+    "plan_id": "28f3745b8aa7451f2157444f8ab24461",
+    "created_at": "2026-06-30T21:23:30.725445597Z",
+    "expires_at": "2026-07-01T21:23:30.725445597Z",
     "export_name": "cdc_demo",
     "strategy": "full",
     "plan_fingerprint": "",
@@ -3605,13 +3605,13 @@
         "source_group_warnings": []
       }
     },
-    "config_path": "/opt/airflow/dags/rivet.yaml"
+    "config_path": "/opt/airflow/dags/postgres.yaml"
   },
   {
     "rivet_version": "0.16.3",
-    "plan_id": "c7ddca75d27e9c2f4b3aa840d59bfe73",
-    "created_at": "2026-06-30T21:03:31.512703500Z",
-    "expires_at": "2026-07-01T21:03:31.512703500Z",
+    "plan_id": "5486baab0e69318fd59d6fc72808c682",
+    "created_at": "2026-06-30T21:23:30.754120472Z",
+    "expires_at": "2026-07-01T21:23:30.754120472Z",
     "export_name": "content_items",
     "strategy": "chunked",
     "plan_fingerprint": "435131e972cf9c3b",
@@ -4223,13 +4223,13 @@
         "source_group_warnings": []
       }
     },
-    "config_path": "/opt/airflow/dags/rivet.yaml"
+    "config_path": "/opt/airflow/dags/postgres.yaml"
   },
   {
     "rivet_version": "0.16.3",
-    "plan_id": "6c6a2d9340e6144a3244cf4d29a8ceae",
-    "created_at": "2026-06-30T21:03:31.537756958Z",
-    "expires_at": "2026-07-01T21:03:31.537756958Z",
+    "plan_id": "8653fc93dec5b5a75abb7803fd48f36b",
+    "created_at": "2026-06-30T21:23:30.764721014Z",
+    "expires_at": "2026-07-01T21:23:30.764721014Z",
     "export_name": "content_items_sample",
     "strategy": "full",
     "plan_fingerprint": "",
@@ -4656,13 +4656,13 @@
         "source_group_warnings": []
       }
     },
-    "config_path": "/opt/airflow/dags/rivet.yaml"
+    "config_path": "/opt/airflow/dags/postgres.yaml"
   },
   {
     "rivet_version": "0.16.3",
-    "plan_id": "9be3add32b1f36b4a742121d7ccadfd1",
-    "created_at": "2026-06-30T21:03:31.559519Z",
-    "expires_at": "2026-07-01T21:03:31.559519Z",
+    "plan_id": "0bfbc8092b744f8955a5a9399fe1fc6e",
+    "created_at": "2026-06-30T21:23:30.774566014Z",
+    "expires_at": "2026-07-01T21:23:30.774566014Z",
     "export_name": "events",
     "strategy": "full",
     "plan_fingerprint": "",
@@ -5089,13 +5089,13 @@
         "source_group_warnings": []
       }
     },
-    "config_path": "/opt/airflow/dags/rivet.yaml"
+    "config_path": "/opt/airflow/dags/postgres.yaml"
   },
   {
     "rivet_version": "0.16.3",
-    "plan_id": "df8528df7ff0445fe149be59bf3a425d",
-    "created_at": "2026-06-30T21:03:31.573538250Z",
-    "expires_at": "2026-07-01T21:03:31.573538250Z",
+    "plan_id": "fdb1201782b77117840f724783996fc6",
+    "created_at": "2026-06-30T21:23:30.784147805Z",
+    "expires_at": "2026-07-01T21:23:30.784147805Z",
     "export_name": "meta_demo",
     "strategy": "full",
     "plan_fingerprint": "",
@@ -5528,13 +5528,13 @@
         "source_group_warnings": []
       }
     },
-    "config_path": "/opt/airflow/dags/rivet.yaml"
+    "config_path": "/opt/airflow/dags/postgres.yaml"
   },
   {
     "rivet_version": "0.16.3",
-    "plan_id": "511ead4c4db39bf88c63a4c0ef2687ac",
-    "created_at": "2026-06-30T21:03:31.610726333Z",
-    "expires_at": "2026-07-01T21:03:31.610726333Z",
+    "plan_id": "34a36c2d185c38d2b993b7ff59cf49c4",
+    "created_at": "2026-06-30T21:23:30.814275222Z",
+    "expires_at": "2026-07-01T21:23:30.814275222Z",
     "export_name": "orders",
     "strategy": "chunked",
     "plan_fingerprint": "a96b1270fd65c459",
@@ -6000,13 +6000,13 @@
         "source_group_warnings": []
       }
     },
-    "config_path": "/opt/airflow/dags/rivet.yaml"
+    "config_path": "/opt/airflow/dags/postgres.yaml"
   },
   {
     "rivet_version": "0.16.3",
-    "plan_id": "5caa62701ae96390bc8869b134d10fff",
-    "created_at": "2026-06-30T21:03:31.647104958Z",
-    "expires_at": "2026-07-01T21:03:31.647104958Z",
+    "plan_id": "02e3b1339b64d51e249554b380db9d35",
+    "created_at": "2026-06-30T21:23:30.824381805Z",
+    "expires_at": "2026-07-01T21:23:30.824381805Z",
     "export_name": "orders_coalesce",
     "strategy": "full",
     "plan_fingerprint": "",
@@ -6439,13 +6439,13 @@
         "source_group_warnings": []
       }
     },
-    "config_path": "/opt/airflow/dags/rivet.yaml"
+    "config_path": "/opt/airflow/dags/postgres.yaml"
   },
   {
     "rivet_version": "0.16.3",
-    "plan_id": "6813026102f0f490348bf203b8ebacd9",
-    "created_at": "2026-06-30T21:03:31.660227750Z",
-    "expires_at": "2026-07-01T21:03:31.660227750Z",
+    "plan_id": "046591153b6cec42495d738b9c63a109",
+    "created_at": "2026-06-30T21:23:30.834848097Z",
+    "expires_at": "2026-07-01T21:23:30.834848097Z",
     "export_name": "orders_sparse",
     "strategy": "full",
     "plan_fingerprint": "",
@@ -6872,13 +6872,13 @@
         "source_group_warnings": []
       }
     },
-    "config_path": "/opt/airflow/dags/rivet.yaml"
+    "config_path": "/opt/airflow/dags/postgres.yaml"
   },
   {
     "rivet_version": "0.16.3",
-    "plan_id": "73820f82041885da692390b4f466fc18",
-    "created_at": "2026-06-30T21:03:31.676263458Z",
-    "expires_at": "2026-07-01T21:03:31.676263458Z",
+    "plan_id": "796e75407b6ab89442e191358751aed6",
+    "created_at": "2026-06-30T21:23:30.844524055Z",
+    "expires_at": "2026-07-01T21:23:30.844524055Z",
     "export_name": "page_views",
     "strategy": "full",
     "plan_fingerprint": "",
@@ -7305,13 +7305,13 @@
         "source_group_warnings": []
       }
     },
-    "config_path": "/opt/airflow/dags/rivet.yaml"
+    "config_path": "/opt/airflow/dags/postgres.yaml"
   },
   {
     "rivet_version": "0.16.3",
-    "plan_id": "fd6686b8171cc0b640bfbeec6a4a8c90",
-    "created_at": "2026-06-30T21:03:31.690034250Z",
-    "expires_at": "2026-07-01T21:03:31.690034250Z",
+    "plan_id": "9d18584f95949d6387025dc867af1ec9",
+    "created_at": "2026-06-30T21:23:30.856195389Z",
+    "expires_at": "2026-07-01T21:23:30.856195389Z",
     "export_name": "users",
     "strategy": "full",
     "plan_fingerprint": "",
@@ -7744,6 +7744,6 @@
         "source_group_warnings": []
       }
     },
-    "config_path": "/opt/airflow/dags/rivet.yaml"
+    "config_path": "/opt/airflow/dags/postgres.yaml"
   }
 ]
