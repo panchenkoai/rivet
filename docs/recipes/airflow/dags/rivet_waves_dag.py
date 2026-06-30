@@ -137,15 +137,18 @@ def build_wave_dag(
         reconcile = "" if strat.startswith("incremental") else " --reconcile"
         if strat.startswith("chunked"):
             # A chunked export checkpoints per chunk. If a previous attempt was
-            # killed mid-chunk (worker crash, retry, timeout), the checkpoint is left
-            # "in progress" and a fresh start refuses with "still in progress" — that
-            # protection is exactly why the checkpoint exists. So on an Airflow RETRY
-            # (try_number > 1) we `--resume` it (continue from the last good chunk,
-            # and skip reconcile — it would count only the resumed remainder). The
-            # first attempt runs clean + reconciled.
+            # killed mid-chunk (worker crash, retry, timeout), rivet refuses a fresh
+            # start with "chunk checkpoint still in progress" — that protection is
+            # why the checkpoint exists. Recover by STATE, not by try_number (which
+            # is wrong after a resume already finished): try a clean run; ONLY if
+            # rivet reports the in-progress checkpoint, `--resume` from the last good
+            # chunk (no reconcile — it would count only the resumed remainder). Any
+            # other failure propagates.
             return (
-                f'if [ "{{{{ ti.try_number }}}}" -gt "1" ]; '
-                f"then {base} --resume; else {base}{reconcile}; fi"
+                f"out=$({base}{reconcile} 2>&1); rc=$?; echo \"$out\"; "
+                f'if [ $rc -ne 0 ]; then '
+                f"if echo \"$out\" | grep -q 'chunk checkpoint .* in progress'; "
+                f"then {base} --resume; else exit $rc; fi; fi"
             )
         return base + reconcile
 
