@@ -138,6 +138,10 @@ pub enum Commands {
         /// Path to YAML config file
         #[arg(short, long)]
         config: String,
+        /// Emit the probe results as a JSON object (`{config_path, all_ok,
+        /// checks: [{name, ok, detail?, hint?}]}`) instead of the text report.
+        #[arg(long)]
+        json: bool,
     },
     /// Stream change data capture (CDC) from a source's transaction log.
     ///
@@ -426,6 +430,10 @@ pub enum Commands {
         /// Number of recent runs to show
         #[arg(short, long, default_value = "20")]
         last: usize,
+        /// Emit the metrics as a JSON array to stdout (for CI / dashboards)
+        /// instead of the text table. Empty history prints `[]`.
+        #[arg(long)]
+        json: bool,
     },
     /// Emit machine-readable schemas for Rivet's data contracts.
     ///
@@ -476,6 +484,10 @@ pub enum StateAction {
     Show {
         #[arg(short, long)]
         config: String,
+        /// Emit the incremental-cursor state as a JSON array to stdout instead
+        /// of the text table. Empty → `[]`.
+        #[arg(long)]
+        json: bool,
     },
     /// Reset state for an export
     Reset {
@@ -495,6 +507,10 @@ pub enum StateAction {
         /// Number of recent files to show
         #[arg(short, long, default_value = "50")]
         last: usize,
+        /// Emit the file list as a JSON array to stdout (CI completeness checks)
+        /// instead of the text table. Empty → `[]`.
+        #[arg(long)]
+        json: bool,
     },
     /// Clear persisted chunk checkpoint rows (`chunk_run` / `chunk_task`).
     ResetChunks {
@@ -529,6 +545,10 @@ pub enum StateAction {
         config: String,
         #[arg(short, long)]
         export: String,
+        /// Emit the checkpoint (run header + per-chunk tasks) as a JSON object to
+        /// stdout instead of the text table. No checkpoint → `null`.
+        #[arg(long)]
+        json: bool,
     },
     /// Show committed / verified export boundaries (the last fully-exported cursor position)
     Progression {

@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.16.2 (2026-06-30) — operator diagnostics: stable codes, `--json` everywhere, warning severity, `doctor --json`
+
+Backward-compatible operator-UX additions (roadmap §9.6 item 7). The config grammar is unchanged — the
+schema bump is the version title only.
+
+### Added
+
+- **Stable error codes.** Config and source failures now carry a stable `RIVET_CONFIG_*` / `RIVET_SOURCE_*`
+  code on the typed error, surfaced as a JSON `code` field and a `[CODE]` prefix on the text error line, so
+  a scheduler / CI step matches on the code, not the wording. Codes: `RIVET_CONFIG_NO_EXPORTS`,
+  `RIVET_CONFIG_CHUNK_COUNT_INVALID`, `RIVET_CONFIG_CHUNK_BY_DAYS_INVALID`, `RIVET_CONFIG_DUPLICATE_EXPORT`,
+  `RIVET_SOURCE_STATEMENT_TIMEOUT`.
+- **`--json` on the remaining inspect commands** — `metrics`, `state show`, `state files`, `state chunks`
+  (the rest already had `--format json`). `state chunks --json` is a run-header + per-chunk `tasks[]` composite.
+- **Per-warning severity.** `rivet check`'s preflight warnings carry a `low` / `medium` / `high` severity:
+  `check --json` emits `warnings: [{ severity, message }]` and the text path prefixes `[SEVERITY]`, so CI can
+  gate on `high` and treat the rest as advisory.
+- **`doctor --json`** — `rivet doctor --json` emits `{ config_path, all_ok, checks: [{ name, ok, detail?,
+  hint? }] }` for CI / cron that wants a structured health verdict instead of grepping `[OK]`/`[FAIL]` lines.
+
+### Internal
+
+- `doctor` text + JSON now render from a single `DoctorCheck` collection (was a dual-emit `println!` + push
+  maintained in parallel, which could drift); the text output is byte-for-byte unchanged.
+- Dropped two pieces of dead weight a self-review found: a never-constructed `Severity::Blocking` token and
+  the always-`Generic` `class` field on the coded-error marker (whose `classify_exit` arm was a no-op).
+- Roadmap doc hygiene — struck several already-shipped items the backlog still listed as open (release
+  checksums, the I3 at-least-once dupe test, the §9.6.1 UX items), each verified against the code first.
+- Bumped `anyhow` 1.0.102 → 1.0.103, clearing RUSTSEC-2026-0190 (a `downcast_mut` unsoundness Rivet does
+  not reach — it uses only `downcast_ref`); the upstream fix is preferred over an audit-ignore entry.
+
 ## 0.16.1 (2026-06-29) — release Docker images build again
 
 0.16.0 published to crates.io, shipped its binaries, and cut a GitHub release — but both Docker images

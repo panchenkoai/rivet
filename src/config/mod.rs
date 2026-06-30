@@ -71,7 +71,11 @@ impl Config {
         // F12 (0.7.5 audit): YAML parse errors did not name the config
         // file.  When loading from disk we know the path — thread it
         // into the parse error.
-        Self::from_yaml(&resolved).map_err(|e| anyhow::anyhow!("config file '{}': {:#}", path, e))
+        // `.context` (not `anyhow!("…{:#}", e)`, which stringifies into a fresh
+        // error) so a typed `CodedError` raised by validation survives the chain —
+        // `error::error_code` downcasts it for the `[CODE]` prefix. `{e:#}` in
+        // `main` still renders the full "config file '…': <message>" chain.
+        Self::from_yaml(&resolved).map_err(|e| e.context(format!("config file '{}'", path)))
     }
 
     pub fn from_yaml(yaml: &str) -> crate::error::Result<Self> {
@@ -385,7 +389,10 @@ impl Config {
         // with zero exports is a silent no-op that looks like success in CI;
         // reject fast instead. See QA backlog Task 5.1.
         if self.exports.is_empty() {
-            anyhow::bail!("exports: at least one export must be defined (got empty list)");
+            crate::config_bail!(
+                crate::error::codes::CONFIG_NO_EXPORTS,
+                "exports: at least one export must be defined (got empty list)"
+            );
         }
 
         // Duplicate export names break state tracking: `export_state`,
@@ -396,7 +403,8 @@ impl Config {
             std::collections::HashSet::with_capacity(self.exports.len());
         for e in &self.exports {
             if !seen.insert(e.name.as_str()) {
-                anyhow::bail!(
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_DUPLICATE_EXPORT,
                     "exports: duplicate export name '{}' (each export must have a unique name; state is keyed by name)",
                     e.name
                 );
@@ -788,7 +796,11 @@ impl Config {
                     );
                 }
                 if let Some(0) = export.chunk_count {
-                    anyhow::bail!("export '{}': chunk_count must be >= 1", export.name);
+                    crate::config_bail!(
+                        crate::error::codes::CONFIG_CHUNK_COUNT_INVALID,
+                        "export '{}': chunk_count must be >= 1",
+                        export.name
+                    );
                 }
                 if export.chunk_count.is_some() && export.chunk_dense {
                     anyhow::bail!(
@@ -867,7 +879,11 @@ impl Config {
                 );
             }
             if days == 0 {
-                anyhow::bail!("export '{}': chunk_by_days must be at least 1", export.name);
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_CHUNK_BY_DAYS_INVALID,
+                    "export '{}': chunk_by_days must be at least 1",
+                    export.name
+                );
             }
         }
         Ok(())

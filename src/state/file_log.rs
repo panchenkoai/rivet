@@ -3,7 +3,7 @@ use crate::error::Result;
 use super::{StateConn, StateStore, pg_sql};
 
 /// One row from `file_log` (formerly `file_manifest`; renamed in schema v8).
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 #[allow(dead_code)]
 pub struct FileRecord {
     pub run_id: String,

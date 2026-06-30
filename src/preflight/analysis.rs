@@ -366,6 +366,44 @@ pub(crate) fn recommend_parallelism(
 }
 
 /// Collect all warnings (B3-B6) for an export.
+/// Severity of a preflight `check` warning, low → high. A scheduler / CI can gate
+/// on `high` and treat `low`/`medium` as advisory. Serializes lowercase so
+/// `check --json`'s `warnings[].severity` is a stable token. (A genuine "do not
+/// run" is the `UNSAFE` health verdict, not a warning — so there is no `blocking`
+/// warning level; add one only when a blocking *warning* actually exists.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Severity {
+    Low,
+    Medium,
+    High,
+}
+
+impl Severity {
+    /// Upper-case label for the text render (`[HIGH]`).
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Severity::Low => "LOW",
+            Severity::Medium => "MEDIUM",
+            Severity::High => "HIGH",
+        }
+    }
+}
+
+/// A preflight `check` warning with its severity. `check --json` emits
+/// `{ "severity": "…", "message": "…" }`; the text path prefixes `[SEVERITY]`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct Warning {
+    pub severity: Severity,
+    pub message: String,
+}
+
+impl Warning {
+    pub(crate) fn new(severity: Severity, message: String) -> Self {
+        Self { severity, message }
+    }
+}
+
 pub(super) fn collect_warnings(
     export: &ExportConfig,
     row_estimate: Option<i64>,
@@ -373,18 +411,21 @@ pub(super) fn collect_warnings(
     chunk_min: Option<&str>,
     chunk_max: Option<&str>,
     db_max_connections: Option<u32>,
-) -> Vec<String> {
+) -> Vec<Warning> {
     // A flat manifest of the preflight checks, in display order: each returns
-    // `Some(warning)` when it applies, `None` otherwise. Adding the next check is
-    // a one-line array insert, not a new if-let rung — the same provider shape
-    // `RunSummary::render` uses for its rows. The checks keep their own
-    // (individually unit-tested) signatures; only the assembly is centralised here.
+    // `Some(message)` when it applies, `None` otherwise, and the assembly tags it
+    // with that check's severity. Adding the next check is a one-line array insert;
+    // the checks keep their own (individually unit-tested) `Option<String>`
+    // signatures — only the severity classification is centralised here.
     [
-        check_connection_limit(export.parallel, db_max_connections),
-        check_sparse_range(export, row_estimate, chunk_min, chunk_max),
-        check_oversized_chunk(export, row_estimate, avg_row_bytes, chunk_min, chunk_max),
-        check_dense_surrogate_cost(export),
-        check_parallel_memory_risk(export, row_estimate),
+        check_connection_limit(export.parallel, db_max_connections)
+            .map(|m| Warning::new(Severity::High, m)),
+        check_sparse_range(export, row_estimate, chunk_min, chunk_max)
+            .map(|m| Warning::new(Severity::Medium, m)),
+        check_oversized_chunk(export, row_estimate, avg_row_bytes, chunk_min, chunk_max)
+            .map(|m| Warning::new(Severity::Medium, m)),
+        check_dense_surrogate_cost(export).map(|m| Warning::new(Severity::Low, m)),
+        check_parallel_memory_risk(export, row_estimate).map(|m| Warning::new(Severity::High, m)),
     ]
     .into_iter()
     .flatten()
@@ -892,16 +933,17 @@ mod tests {
         );
         assert_eq!(warnings.len(), 3, "three checks apply: {warnings:?}");
         assert!(
-            warnings[0].contains("max_connections"),
-            "connection-limit is first in the registry: {warnings:?}"
+            warnings[0].message.contains("max_connections")
+                && warnings[0].severity == Severity::High,
+            "connection-limit is first, High: {warnings:?}"
         );
         assert!(
-            warnings[1].contains("Sparse"),
-            "sparse-range is second: {warnings:?}"
+            warnings[1].message.contains("Sparse") && warnings[1].severity == Severity::Medium,
+            "sparse-range is second, Medium: {warnings:?}"
         );
         assert!(
-            warnings[2].contains("memory"),
-            "parallel-memory is last: {warnings:?}"
+            warnings[2].message.contains("memory") && warnings[2].severity == Severity::High,
+            "parallel-memory is last, High: {warnings:?}"
         );
     }
 

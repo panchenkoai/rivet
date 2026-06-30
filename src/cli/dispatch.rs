@@ -88,7 +88,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             json,
             target,
         } => dispatch_check(config, export, params, type_report, strict, json, target),
-        Commands::Doctor { config } => preflight::doctor(&config),
+        Commands::Doctor { config, json } => preflight::doctor(&config, json),
         Commands::Cdc {
             source,
             source_env,
@@ -196,7 +196,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             config,
             export,
             last,
-        } => pipeline::show_metrics(&config, export.as_deref(), last),
+            json,
+        } => pipeline::show_metrics(&config, export.as_deref(), last, json),
         Commands::Journal {
             config,
             export,
@@ -599,13 +600,14 @@ fn dispatch_repair(
 
 fn dispatch_state(action: StateAction) -> Result<()> {
     match action {
-        StateAction::Show { config } => pipeline::show_state(&config),
+        StateAction::Show { config, json } => pipeline::show_state(&config, json),
         StateAction::Reset { config, export } => pipeline::reset_state(&config, &export),
         StateAction::Files {
             config,
             export,
             last,
-        } => pipeline::show_files(&config, export.as_deref(), last),
+            json,
+        } => pipeline::show_files(&config, export.as_deref(), last, json),
         StateAction::ResetChunks {
             config,
             export,
@@ -620,7 +622,11 @@ fn dispatch_state(action: StateAction) -> Result<()> {
                 Ok(())
             }
         }
-        StateAction::Chunks { config, export } => pipeline::show_chunk_checkpoint(&config, &export),
+        StateAction::Chunks {
+            config,
+            export,
+            json,
+        } => pipeline::show_chunk_checkpoint(&config, &export, json),
         StateAction::Progression { config, export } => {
             pipeline::show_progression(&config, export.as_deref())
         }

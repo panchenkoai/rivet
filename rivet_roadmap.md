@@ -485,6 +485,10 @@ marketplace) — that boundary, stated throughout this roadmap, still holds.
 ## Epic 16 — Automatic Parallelism
 **Priority:** P3  
 **Pain coverage:** Pain A, Pain D
+**Status:** ⚠️ Partial — `recommend_parallelism` (`src/preflight/analysis.rs:332`)
+ships an advisory recommendation in `check`/`plan` for all three engines; the
+"later auto-selected parallelism bounded by safety rules" deliverable (auto-apply
+at `run`) is the remaining open piece (verified in-tree 2026-06-29).
 
 ### Goal
 Move from warning-based guidance to controlled automatic parallelism selection.
@@ -499,6 +503,25 @@ Parallelism is valuable, but automation should come after better planner guidanc
 ## Epic 17 — MySQL Source Parity (COM_STMT_FETCH)
 **Priority:** P1
 **Pain coverage:** Pain A, Pain B
+**Status:** ✅ RESOLVED — superseded by **Epic 18** (which re-derived and shipped
+this work). The premise below (~9s longest statement; a server-side cursor as the
+fix) was re-measured and is obsolete:
+- **Re-measured 2026-06-29** (live MySQL `content_items`, current main, build A):
+  at the planner's default `chunk_size` (100k) the longest chunk is **~2.0s**, not
+  9s — the memory-adaptive batching + sane default already closed it. The ~9s only
+  appears at a *manually set* large `chunk_size` (600k rows → 5.9s; ~500k → ~9s),
+  i.e. a misconfiguration. Per-statement time scales linearly (~20µs/row).
+- **Phase A (adaptive time-feedback) — WON'T BUILD:** `chunk_size` is already the
+  lever; sub-paging measured as a +25% wall / 10×-QPS regression (Epic 18 A1-impl).
+- **Phase B (COM_STMT_FETCH cursor) — WON'T BUILD:** proven expensive (the crate
+  hardcodes `CURSOR_TYPE_NO_CURSOR`, `mysql_common 0.37.2 packets/mod.rs:2696`;
+  raw `write_command` private) *and* ineffective (MySQL materialises the result to
+  temp tables at cursor open, so it does not shorten the longest statement — Epic
+  18 Phase D, `dev/spikes/mysql_cursor_efficacy.c`).
+
+The shipped parity work lives in Epic 18 (session guards, pressure proxies, MSSQL
+keyset, `chunk_size` documented as the statement-duration lever). The original
+Epic 17 plan is kept below for history.
 
 ### Goal
 
@@ -545,6 +568,15 @@ The current README is honest about the 9s MySQL number, but it creates an asymme
 ---
 
 ## Epic 18 — Source parity (MySQL / MSSQL → PostgreSQL gold standard)
+
+**Status:** ✅ DONE — all phases shipped & live-validated (2026-06-07/08);
+re-verified in-tree 2026-06-29: `MysqlSessionGuard` (`src/source/mysql/mod.rs:438`,
+`Drop` at `:468`), MSSQL `impl Drop` LOCK_TIMEOUT reset (`src/source/mssql/mod.rs:61`),
+C1 pressure proxy `Created_tmp_disk_tables` + `Innodb_buffer_pool_wait_free`
+(`mysql/mod.rs:71`), C2 Workfiles/Worktables (`mssql/mod.rs:760`), A2 MSSQL keyset,
+and the efficacy spike `dev/spikes/mysql_cursor_efficacy.c`. The MySQL cursor
+(Phase D) is closed with proof on both cost and efficacy. This epic subsumes
+Epic 17.
 
 **Goal:** PostgreSQL is the reference source. Close the per-engine gap on the
 two axes that make it the gold standard — (1) longest-single-query under a
@@ -1172,7 +1204,7 @@ Prioritize by stabilization before distribution polish:
 4. ✅ **I2** — `cargo bench` + `dev/scripts/bench.sh` save/compare harness; column_scan + shape_tracking groups.
 5. ✅ **Epic 4 (§5)** — external/durable state backend: `RIVET_STATE_URL` PostgreSQL backend shipped.
 6. ✅ **Verify / Validation Layer (shipped 0.15.0 + graded depth/codes)** — *"are produced files + manifest + state + summary internally consistent, AND is the data itself intact?"*. **Value-integrity depth SHIPPED** (v0.15.0): an always-on per-column `xxh3` value checksum — **Form A** cross-checks source↔Arrow in-process (catches the `build_array` converter mid-run) and **Form B** records per-column checksums in the manifest so `rivet validate` re-reads the Parquet and compares (catches an Arrow→Parquet encode / post-write fault). This **answers the design-open question toward extending `rivet validate`** (ADR-0013 "no new flags", NOT a new `rivet verify` command) and delivers the deepest "full file scan" level. Scope is honest: *decoded-value → file*, covered types only (uncovered logged, never a silent zero), probabilistic (xxh3-64), the DB-wire decode trusted; live round-trip proven (export → validate pass → flip a byte → validate fails). Cost vs v0.14.1: +2.8% wall / +11.3% CPU. **Now SHIPPED too** (`feat/verify-and-ux`): the graded `rivet validate --depth light|sample|full` UX, stable `RIVET_VERIFY_*` codes (one per failure variant — in JSON `code` + the pretty `[CODE]` prefix), and JSON output, over the artifact-consistency checks that already lived in Epic 2's `--validate` (missing/partial/orphan, size mismatch, `_SUCCESS` fingerprint). The Verify Layer is feature-complete; only a manifest↔state cross-divergence check remains a future nicety.
-7. 🟡 **Operator UX & Diagnostics (v0.8.0) — in progress** — structured diagnostics with stable codes, severity, `--json` everywhere, strategy explanation, a `doctor` report. **Shipped so far** (`feat/verify-and-ux`): `rivet check --json` now emits the per-export verdict / strategy / warnings / recommended profile+parallel / capabilities (not just the type report); `rivet plan` now **explains the strategy** (`plan::explain` — why this mode, chunk geometry, and parallelism, the RSS-budget fit, plus the resumability + memory risk); `RIVET_VERIFY_*` codes shipped (validate). **Remaining (⏳):** stable `RIVET_CONFIG_*` / `RIVET_SOURCE_*` codes, per-warning severity (low/medium/high/blocking), `doctor --json` + a capability/blocker summary, and `--json` on the last text-only commands.
+7. ✅ **Operator UX & Diagnostics (v0.8.0) — DONE** — structured diagnostics with stable codes, severity, `--json` everywhere, strategy explanation, a `doctor` report. **Shipped so far** (`feat/verify-and-ux`): `rivet check --json` now emits the per-export verdict / strategy / warnings / recommended profile+parallel / capabilities (not just the type report); `rivet plan` now **explains the strategy** (`plan::explain` — why this mode, chunk geometry, and parallelism, the RSS-budget fit, plus the resumability + memory risk); `RIVET_VERIFY_*` codes shipped (validate). **Done since** (`feat/operator-config-source-codes`, 2026-06-29): stable `RIVET_CONFIG_*` / `RIVET_SOURCE_*` codes via a `CodedError` typed marker (surfaced as a JSON `code` field + a `[CODE]` text prefix on the top-level error; `RIVET_SOURCE_STATEMENT_TIMEOUT` also recognised on the existing timeout marker); `--json` added to `metrics`, `state files`, `state show`, and `state chunks` (the last via an inline `serde_json::json!` composite — run header + per-chunk `tasks[]`, e2e-proven on a crash-hook checkpoint). **The `--json`-everywhere line item is DONE:** re-checking the tree, `reconcile` / `repair` / `validate` already shipped `--format json` / `--output`, so only those four inspect commands were actually missing it — now all have it. **Per-warning severity DONE** — re-scoping found a chokepoint (`analysis::collect_warnings` assembles the 5 operator-facing `check` warnings, NOT the 6 unrelated `Vec<String>` streams I first counted): a `Severity` (low/medium/high/blocking) + `Warning { severity, message }` are tagged at that one site, so `check --json` emits `warnings: [{severity, message}]` and the text path prefixes `[SEVERITY]` (the 5 check fns + their unit tests stay untouched). **`doctor --json` DONE** — `doctor()` is ~115 lines (not the 1015 the file is), refactored to collect each probe into a `DoctorCheck` Vec; `--json` serializes `{config_path, all_ok, checks[]}`, the text path is byte-for-byte unchanged (the `println!`s gated on `!json`). **Item 7 is complete.**
 
 ### 9.6.1 UX hardening backlog (v0.7.8 walk-through findings)
 
@@ -1204,7 +1236,7 @@ with verify-layer work as bandwidth allows.
 - ✅ **`status: skipped` now names the cursor** (v0.7.8) — shows `(no new rows since cursor '<col>')` ([src/pipeline/single.rs](src/pipeline/single.rs)) so the operator doesn't have to guess.
 - ✅ **Doc note added: re-running `chunked` re-extracts everything** — [`docs/modes/chunked.md`](docs/modes/chunked.md) § "Clean re-runs are NOT idempotent" spells out that `--resume` only skips completed chunks after a crash.
 - ✅ **Doc note added: `time_window` re-runs duplicate output.** `docs/modes/time-window.md` documents that rolling-window mode does not persist "this window already done", so frequent re-runs duplicate files.
-- ⏳ **Retry / I3 (Write Before Cursor) at-least-once dupe scenario** not yet covered by tests. The contract documents the duplicate possibility (`ADR-0001 I3`), and toxiproxy-based retry testing showed counters work; a dedicated SIGKILL-between-write-and-commit recovery test would pin the actual dupe behavior end-to-end.
+- ✅ **Retry / I3 (Write Before Cursor) at-least-once dupe scenario — COVERED** (2026-06-29 re-check, verified live). `crash_after_file_write_leaves_file_but_no_manifest_or_cursor` (`tests/live/live_crash_recovery.rs`, with per-engine `mysql_…`/`mssql_…` siblings) injects `RIVET_TEST_PANIC_AT=after_file_write` (file durable on disk, manifest = 0, cursor = None), re-runs without the injection, and asserts the dupe end-to-end: **≥ 2 files** (orphaned pre-crash file + recovery file), **every source id present** (re-reads the Parquet, not the state DB — a missing id would be row LOSS), and **physical rows ≥ source** (the at-least-once surplus). Passed live on PostgreSQL + MySQL at re-check (MSSQL sibling present but env-blocked — `mssql` service not up on :1433). The original "SIGKILL-between-write-and-commit" wording is satisfied by the panic injection: for I3 the panic-vs-SIGKILL distinction is immaterial — neither writes the cursor, and the file is already durable (temp→rename) *before* that boundary, so the post-crash state and the dupe outcome are identical. The SIGKILL *commit-window* atomicity (no committed file mid-rename) is separately proven by OPT-6's `sigkill_in_commit_window_leaves_no_committed_file`. The "not yet covered" note was stale.
 - ⏳ **Stale roadmap items inherited from earlier sessions:** "2–3 pilot tables repeated on a schedule" in §9.7 (organizational; optional automation K2) is now the only unchecked §9.7 item. *(Release checksums shipped v0.7.8; SBOM + signed-release attestations shipped v0.15.0 — both now checked in §9.7.)*
 
 ---
@@ -1505,6 +1537,14 @@ re-planning work that is already done.
 **Definition of done.** §5.1, §9.6.1, and §9.7 reflect the actual shipped state of
 v0.7.8; README/SECURITY document checksum verification against the published
 `SHA256SUMS.txt`.
+
+**Status (2026-06-29): Done** — applied and verified. §5.1 marks Release checksums
+`✅ Done` (line ~808); the three §9.6.1 items are struck `✅` (retry-safe local WARN
+via `local.rs:119 retry_safe: true`, TLS warning from `doctor`/`check`, `init` mode
+rationale); §9.7 checks checksums + SBOM; OPT-7 is `✅ Done` in the §5 table.
+`SECURITY.md:165-169` + `README.md:281-285` document `SHA256SUMS.txt` (+ cosign)
+verification — the stale "until checksums are published" wording is gone. The
+*Findings* above are the historical before-state, now resolved.
 
 ---
 

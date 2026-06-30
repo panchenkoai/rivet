@@ -47,10 +47,16 @@ fn require_known_export(config: &Config, config_path: &str, export_name: &str) -
     );
 }
 
-pub fn show_state(config_path: &str) -> Result<()> {
+pub fn show_state(config_path: &str, json: bool) -> Result<()> {
     require_config(config_path)?;
     let state = StateStore::open(config_path)?;
     let states = state.list_all()?;
+    if json {
+        // Incremental-cursor rows; serialize directly. Empty → `[]` (the text
+        // path's "no cursor / never ran" guidance is operator help, not data).
+        println!("{}", serde_json::to_string_pretty(&states)?);
+        return Ok(());
+    }
     if states.is_empty() {
         // `state.list_all()` returns only incremental-cursor rows. Chunked
         // and full runs land in different tables (`export_metrics`,
@@ -174,10 +180,21 @@ pub fn reset_state(config_path: &str, export_name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn show_files(config_path: &str, export_name: Option<&str>, limit: usize) -> Result<()> {
+pub fn show_files(
+    config_path: &str,
+    export_name: Option<&str>,
+    limit: usize,
+    json: bool,
+) -> Result<()> {
     require_config(config_path)?;
     let state = StateStore::open(config_path)?;
     let files = state.get_files(export_name, limit)?;
+    if json {
+        // FileRecord is a stable inspect row — serialize it directly. Empty → `[]`
+        // (valid JSON) so a CI completeness check never special-cases.
+        println!("{}", serde_json::to_string_pretty(&files)?);
+        return Ok(());
+    }
     if files.is_empty() {
         println!("No files recorded yet.");
         return Ok(());
@@ -203,7 +220,12 @@ pub fn show_files(config_path: &str, export_name: Option<&str>, limit: usize) ->
     Ok(())
 }
 
-pub fn show_metrics(config_path: &str, export_name: Option<&str>, limit: usize) -> Result<()> {
+pub fn show_metrics(
+    config_path: &str,
+    export_name: Option<&str>,
+    limit: usize,
+    json: bool,
+) -> Result<()> {
     let config = require_config(config_path)?;
     // A typo'd `--export` must not masquerade as "no runs yet". Now that the
     // config is loaded, check the requested name against the declared exports
@@ -214,6 +236,17 @@ pub fn show_metrics(config_path: &str, export_name: Option<&str>, limit: usize) 
     }
     let state = StateStore::open(config_path)?;
     let metrics = state.get_metrics(export_name, limit)?;
+    if json {
+        // Reuse the run aggregate's serializable DTO so `metrics --json` and the
+        // run summary's `--json` agree field-for-field. Empty → `[]` (valid JSON),
+        // not the text "no metrics" line, so a CI consumer never special-cases.
+        let rows: Vec<super::aggregate::MetricRowJson> = metrics
+            .iter()
+            .map(super::aggregate::MetricRowJson::from)
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
     if metrics.is_empty() {
         println!("No metrics recorded yet.");
         return Ok(());
@@ -352,9 +385,44 @@ pub fn reset_chunk_checkpoints_stuck(config_path: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn show_chunk_checkpoint(config_path: &str, export_name: &str) -> Result<()> {
+pub fn show_chunk_checkpoint(config_path: &str, export_name: &str, json: bool) -> Result<()> {
     require_config(config_path)?;
     let state = StateStore::open(config_path)?;
+    if json {
+        // Composite (run header + per-chunk tasks) built inline so no state-layer
+        // type needs `Serialize`. No checkpoint → `null` (valid JSON).
+        let report = match state.get_latest_chunk_run(export_name)? {
+            None => serde_json::Value::Null,
+            Some((run_id, plan_hash, status, updated_at)) => {
+                let tasks: Vec<serde_json::Value> = state
+                    .list_chunk_tasks_for_run(&run_id)?
+                    .iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "chunk_index": t.chunk_index,
+                            "status": t.status,
+                            "start_key": t.start_key,
+                            "end_key": t.end_key,
+                            "attempts": t.attempts,
+                            "rows_written": t.rows_written,
+                            "file_name": t.file_name,
+                            "last_error": t.last_error,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "export": export_name,
+                    "run_id": run_id,
+                    "plan_hash": plan_hash,
+                    "status": status,
+                    "updated_at": updated_at,
+                    "tasks": tasks,
+                })
+            }
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
     println!(
         "database:   {}",
         StateStore::state_db_path(config_path).display()
@@ -745,7 +813,7 @@ exports:
     fn show_metrics_unknown_export_bails_with_known_names() {
         let (dir, config_path) = setup_dir(); // declares orders + transactions
         let _ = open_state(&dir);
-        let err = show_metrics(&config_path, Some("ghost"), 10).unwrap_err();
+        let err = show_metrics(&config_path, Some("ghost"), 10, false).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("export 'ghost' is not defined"),
@@ -763,7 +831,7 @@ exports:
     fn show_metrics_known_but_unrun_export_returns_ok() {
         let (dir, config_path) = setup_dir();
         let _ = open_state(&dir);
-        assert!(show_metrics(&config_path, Some("orders"), 10).is_ok());
+        assert!(show_metrics(&config_path, Some("orders"), 10, false).is_ok());
     }
 
     // Same gap on `journal` when querying by export name (no --run-id).
@@ -796,7 +864,7 @@ exports:
     fn show_state_empty_db_returns_ok() {
         let (dir, config_path) = setup_dir();
         let _ = open_state(&dir); // create the DB file
-        assert!(show_state(&config_path).is_ok());
+        assert!(show_state(&config_path, false).is_ok());
     }
 
     #[test]
@@ -805,7 +873,7 @@ exports:
         let state = open_state(&dir);
         state.update("orders", "2025-01-15").unwrap();
         drop(state);
-        assert!(show_state(&config_path).is_ok());
+        assert!(show_state(&config_path, false).is_ok());
     }
 
     // ── show_files ───────────────────────────────────────────────────────────
@@ -814,7 +882,7 @@ exports:
     fn show_files_empty_returns_ok() {
         let (dir, config_path) = setup_dir();
         let _ = open_state(&dir);
-        assert!(show_files(&config_path, None, 10).is_ok());
+        assert!(show_files(&config_path, None, 10, false).is_ok());
     }
 
     #[test]
@@ -833,7 +901,7 @@ exports:
             )
             .unwrap();
         drop(state);
-        assert!(show_files(&config_path, Some("orders"), 10).is_ok());
+        assert!(show_files(&config_path, Some("orders"), 10, false).is_ok());
     }
 
     // ── show_metrics ─────────────────────────────────────────────────────────
@@ -842,7 +910,7 @@ exports:
     fn show_metrics_empty_returns_ok() {
         let (dir, config_path) = setup_dir();
         let _ = open_state(&dir);
-        assert!(show_metrics(&config_path, None, 10).is_ok());
+        assert!(show_metrics(&config_path, None, 10, false).is_ok());
     }
 
     #[test]
@@ -892,7 +960,7 @@ exports:
             )
             .unwrap();
         drop(state);
-        assert!(show_metrics(&config_path, Some("orders"), 10).is_ok());
+        assert!(show_metrics(&config_path, Some("orders"), 10, false).is_ok());
     }
 
     // ── show_journal ─────────────────────────────────────────────────────────
@@ -1013,12 +1081,12 @@ exports:
             .to_string();
 
         for res in [
-            show_state(&missing),
-            show_files(&missing, None, 10),
-            show_metrics(&missing, None, 10),
+            show_state(&missing, false),
+            show_files(&missing, None, 10, false),
+            show_metrics(&missing, None, 10, false),
             show_progression(&missing, None),
             show_journal(&missing, "orders", 5, None),
-            show_chunk_checkpoint(&missing, "orders"),
+            show_chunk_checkpoint(&missing, "orders", false),
             reset_state(&missing, "orders"),
             reset_chunk_checkpoint(&missing, "orders"),
         ] {
@@ -1114,6 +1182,6 @@ exports:
     fn show_chunk_checkpoint_no_data_returns_ok() {
         let (dir, config_path) = setup_dir();
         let _ = open_state(&dir);
-        assert!(show_chunk_checkpoint(&config_path, "orders").is_ok());
+        assert!(show_chunk_checkpoint(&config_path, "orders", false).is_ok());
     }
 }

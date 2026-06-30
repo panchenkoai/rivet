@@ -74,7 +74,7 @@ pub(crate) struct ExportDiagnostic {
     pub verdict: HealthVerdict,
     pub recommended_profile: &'static str,
     pub recommended_parallel: (u32, &'static str),
-    pub warnings: Vec<String>,
+    pub warnings: Vec<analysis::Warning>,
     pub suggestion: Option<String>,
 }
 
@@ -515,7 +515,7 @@ fn print_diagnostic(diag: &ExportDiagnostic) {
         println!("  Parallelism:  {} ({})", par_level, par_reason);
     }
     for w in &diag.warnings {
-        println!("  Warning:      {}", w);
+        println!("  Warning:      [{}] {}", w.severity.label(), w.message);
     }
     if let Some(suggestion) = &diag.suggestion {
         println!("  Suggestion:   {}", suggestion);
@@ -567,7 +567,10 @@ mod tests {
             verdict: HealthVerdict::Degraded,
             recommended_profile: "safe",
             recommended_parallel: (4, "large indexed dataset"),
-            warnings: vec!["Sparse key range".to_string(), "memory risk".to_string()],
+            warnings: vec![
+                analysis::Warning::new(analysis::Severity::Medium, "Sparse key range".to_string()),
+                analysis::Warning::new(analysis::Severity::High, "memory risk".to_string()),
+            ],
             suggestion: Some("create an index".to_string()),
         }
     }
@@ -588,6 +591,10 @@ mod tests {
         assert_eq!(v["recommended_profile"], "safe", "got: {v}");
         assert!(v["warnings"].is_array(), "warnings must be an array: {v}");
         assert_eq!(v["warnings"].as_array().unwrap().len(), 2, "got: {v}");
+        // Each warning is a `{ severity, message }` object (per-warning severity).
+        assert_eq!(v["warnings"][0]["severity"], "medium", "got: {v}");
+        assert_eq!(v["warnings"][0]["message"], "Sparse key range", "got: {v}");
+        assert_eq!(v["warnings"][1]["severity"], "high", "got: {v}");
         assert_eq!(v["export_name"], "orders", "got: {v}");
     }
 

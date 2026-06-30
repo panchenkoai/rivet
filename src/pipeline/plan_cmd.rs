@@ -228,7 +228,10 @@ fn build_plan_artifact(
     let (computed, plan_diagnostics, hints) = match preflight::get_export_diagnostic(config, export)
     {
         Ok(diag) => {
-            let mut warnings = diag.warnings.clone();
+            // The plan artifact's warnings stay flat strings (severity tags are a
+            // `rivet check` surface); take each warning's message text.
+            let mut warnings: Vec<String> =
+                diag.warnings.iter().map(|w| w.message.clone()).collect();
             warnings.extend(validate_warnings);
             // F3 (0.7.5 audit): the JSON artifact's `diagnostics`
             // exposed a non-Efficient verdict with `warnings: []`, so a

@@ -1,5 +1,5 @@
 /// Cursor state for incremental exports.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct CursorState {
     pub export_name: String,
     pub last_cursor_value: Option<String>,
