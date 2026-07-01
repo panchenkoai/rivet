@@ -1,0 +1,14 @@
+# Airflow runtime (official compose mounts these)
+logs/
+config/
+plugins/
+.env
+
+# rivet runtime artifacts (state, run summaries, parquet output)
+dags/.rivet/
+dags/.rivet_state.db
+dags/out/
+
+# python
+__pycache__/
+*.pyc
