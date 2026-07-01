@@ -10,7 +10,6 @@ DAG per source database** (PostgreSQL, MySQL, SQL Server) from a single factory.
 docs/recipes/airflow/
 ├── Dockerfile                 # apache/airflow + the rivet release binary baked in
 ├── docker-compose.2.10.yaml   # official Airflow 2.10 stack, adapted
-├── docker-compose.3.0.yaml    # official Airflow 3.0 stack, adapted
 └── dags/
     ├── rivet_waves_dag.py      # factory → rivet_waves_{postgres,mysql,mssql}
     ├── postgres.yaml / mysql.yaml / mssql.yaml      # the configs you edit  ← yours
@@ -21,17 +20,14 @@ docs/recipes/airflow/
 
 ## Try it locally
 
-These are the **official** Apache Airflow docker-compose stacks (Postgres metadata
-+ Redis + CeleryExecutor — not SQLite/Sequential), adapted three ways: example
-DAGs are off, the worker image has `rivet` baked in, and a dedicated
-TLS-enabled Postgres holds Rivet's durable run state.
+This is the **official** Apache Airflow docker-compose stack (Postgres metadata +
+Redis + CeleryExecutor — not SQLite/Sequential), adapted three ways: example DAGs
+are off, the worker image has `rivet` baked in, and a dedicated TLS-enabled
+Postgres holds Rivet's durable run state.
 
 ```bash
 cd docs/recipes/airflow
-
 docker compose -f docker-compose.2.10.yaml up --build      # Airflow 2.10.5
-#   …or
-docker compose -f docker-compose.3.0.yaml up --build       # Airflow 3.0.3
 ```
 
 First boot builds the image and migrates the metadata DB (~2-3 min). Then open
@@ -50,8 +46,9 @@ The demo runs against the project's fixtures on the host (Postgres :5432, MySQL
 :3306, SQL Server :1433), so `docker compose up` in the rivet repo first.
 `docker compose -f … down -v` tears everything down (`-v` drops the state too).
 
-Each DAG runs on both Airflow majors — it imports `BashOperator` from the bundled
-`standard` provider on 3.x and from core on 2.x.
+(The DAG keeps a `try/except` around the `BashOperator` import so it still parses
+on Airflow 3.x — where it moved to the `standard` provider — if you point it at a
+3.x stack yourself.)
 
 ---
 
