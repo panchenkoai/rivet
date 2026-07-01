@@ -1,9 +1,9 @@
 [
   {
     "rivet_version": "0.16.3",
-    "plan_id": "efbbb3cc0e188962d7bc85f82b8bf8ed",
-    "created_at": "2026-06-30T21:31:04.353343584Z",
-    "expires_at": "2026-07-01T21:31:04.353343584Z",
+    "plan_id": "59e753d85dc9261d2a29928cb1016de9",
+    "created_at": "2026-07-01T03:49:56.856056342Z",
+    "expires_at": "2026-07-02T03:49:56.856056342Z",
     "export_name": "bench_decimal",
     "strategy": "chunked",
     "plan_fingerprint": "791506e1a64ffcbb",
@@ -92,16 +92,6 @@
         }
       },
       "column_overrides": {
-        "price": {
-          "kind": "decimal",
-          "precision": 18,
-          "scale": 4
-        },
-        "discount": {
-          "kind": "decimal",
-          "precision": 5,
-          "scale": 4
-        },
         "qty": {
           "kind": "decimal",
           "precision": 10,
@@ -110,6 +100,16 @@
         "total": {
           "kind": "decimal",
           "precision": 20,
+          "scale": 4
+        },
+        "price": {
+          "kind": "decimal",
+          "precision": 18,
+          "scale": 4
+        },
+        "discount": {
+          "kind": "decimal",
+          "precision": 5,
           "scale": 4
         }
       },
@@ -400,9 +400,9 @@
   },
   {
     "rivet_version": "0.16.3",
-    "plan_id": "ff048c59d7f7d390ca482435a57f71ef",
-    "created_at": "2026-06-30T21:31:04.419853793Z",
-    "expires_at": "2026-07-01T21:31:04.419853793Z",
+    "plan_id": "663655c12f73ddb156c58c81bebdda8b",
+    "created_at": "2026-07-01T03:49:56.879236092Z",
+    "expires_at": "2026-07-02T03:49:56.879236092Z",
     "export_name": "bench_hc",
     "strategy": "chunked",
     "plan_fingerprint": "0b2156390ec50941",
@@ -778,9 +778,9 @@
   },
   {
     "rivet_version": "0.16.3",
-    "plan_id": "01fe212f0001bb9ed5de5764a635b4a3",
-    "created_at": "2026-06-30T21:31:04.461208709Z",
-    "expires_at": "2026-07-01T21:31:04.461208709Z",
+    "plan_id": "727713b0c621e55f218b5c837f142d20",
+    "created_at": "2026-07-01T03:49:56.922236217Z",
+    "expires_at": "2026-07-02T03:49:56.922236217Z",
     "export_name": "bench_narrow",
     "strategy": "chunked",
     "plan_fingerprint": "adbff2ba94b795c9",
@@ -1316,9 +1316,9 @@
   },
   {
     "rivet_version": "0.16.3",
-    "plan_id": "b3b77bb306d7ca742bb896447af830bc",
-    "created_at": "2026-06-30T21:31:04.483632209Z",
-    "expires_at": "2026-07-01T21:31:04.483632209Z",
+    "plan_id": "d2d8e16db9ee1d040b9a273fcc4a6ab3",
+    "created_at": "2026-07-01T03:49:56.929447926Z",
+    "expires_at": "2026-07-02T03:49:56.929447926Z",
     "export_name": "bench_sparse",
     "strategy": "full",
     "plan_fingerprint": "",
@@ -1665,9 +1665,9 @@
   },
   {
     "rivet_version": "0.16.3",
-    "plan_id": "47a7d8f58106c4978daecc4fa8645506",
-    "created_at": "2026-06-30T21:31:04.500369918Z",
-    "expires_at": "2026-07-01T21:31:04.500369918Z",
+    "plan_id": "07516aabe808371af00a2acce7dbdbe9",
+    "created_at": "2026-07-01T03:49:56.944422134Z",
+    "expires_at": "2026-07-02T03:49:56.944422134Z",
     "export_name": "bench_wide",
     "strategy": "full",
     "plan_fingerprint": "",
@@ -2014,9 +2014,9 @@
   },
   {
     "rivet_version": "0.16.3",
-    "plan_id": "f5816b8daf815016f4eb9de23da5ed67",
-    "created_at": "2026-06-30T21:31:04.537523751Z",
-    "expires_at": "2026-07-01T21:31:04.537523751Z",
+    "plan_id": "f25ec7a1bc6734eb9fb2a14b4e893aca",
+    "created_at": "2026-07-01T03:49:56.965302842Z",
+    "expires_at": "2026-07-02T03:49:56.965302842Z",
     "export_name": "content_items",
     "strategy": "chunked",
     "plan_fingerprint": "435131e972cf9c3b",
@@ -2452,9 +2452,9 @@
   },
   {
     "rivet_version": "0.16.3",
-    "plan_id": "747b9e9609d9ae3683b5efb3e02625bb",
-    "created_at": "2026-06-30T21:31:04.545569334Z",
-    "expires_at": "2026-07-01T21:31:04.545569334Z",
+    "plan_id": "dab907a1698a1f9ef9a5c94840eb9db8",
+    "created_at": "2026-07-01T03:49:56.970984176Z",
+    "expires_at": "2026-07-02T03:49:56.970984176Z",
     "export_name": "events",
     "strategy": "full",
     "plan_fingerprint": "",
@@ -2801,9 +2801,9 @@
   },
   {
     "rivet_version": "0.16.3",
-    "plan_id": "bc92868485aa515539f94b12f39e8a76",
-    "created_at": "2026-06-30T21:31:04.565809376Z",
-    "expires_at": "2026-07-01T21:31:04.565809376Z",
+    "plan_id": "55a24dab40623c639b392fb3baf8f6f0",
+    "created_at": "2026-07-01T03:49:56.978740217Z",
+    "expires_at": "2026-07-02T03:49:56.978740217Z",
     "export_name": "orders",
     "strategy": "full",
     "plan_fingerprint": "",
@@ -3156,9 +3156,9 @@
   },
   {
     "rivet_version": "0.16.3",
-    "plan_id": "e71aae75023359e67353a8e7403c6e04",
-    "created_at": "2026-06-30T21:31:04.576932709Z",
-    "expires_at": "2026-07-01T21:31:04.576932709Z",
+    "plan_id": "d9236494e153ea828aaf35a9c6f67356",
+    "created_at": "2026-07-01T03:49:56.984954509Z",
+    "expires_at": "2026-07-02T03:49:56.984954509Z",
     "export_name": "orders_coalesce",
     "strategy": "full",
     "plan_fingerprint": "",
@@ -3511,9 +3511,9 @@
   },
   {
     "rivet_version": "0.16.3",
-    "plan_id": "b5a8cddbdb34b7bda4469a8ec4b166fe",
-    "created_at": "2026-06-30T21:31:04.584702501Z",
-    "expires_at": "2026-07-01T21:31:04.584702501Z",
+    "plan_id": "4a76bef7468d07d1c273e80a7a94548b",
+    "created_at": "2026-07-01T03:49:56.991526593Z",
+    "expires_at": "2026-07-02T03:49:56.991526593Z",
     "export_name": "orders_sparse",
     "strategy": "full",
     "plan_fingerprint": "",
@@ -3860,9 +3860,9 @@
   },
   {
     "rivet_version": "0.16.3",
-    "plan_id": "1d8e34d02d6e1ae539727a11a1baeebe",
-    "created_at": "2026-06-30T21:31:04.595281001Z",
-    "expires_at": "2026-07-01T21:31:04.595281001Z",
+    "plan_id": "410b664db4a9d4a883dbaf216be5413f",
+    "created_at": "2026-07-01T03:49:57.004330676Z",
+    "expires_at": "2026-07-02T03:49:57.004330676Z",
     "export_name": "page_views",
     "strategy": "full",
     "plan_fingerprint": "",
@@ -4209,9 +4209,9 @@
   },
   {
     "rivet_version": "0.16.3",
-    "plan_id": "c4cd761e2efc84e26189ce3d745d628e",
-    "created_at": "2026-06-30T21:31:04.624523334Z",
-    "expires_at": "2026-07-01T21:31:04.624523334Z",
+    "plan_id": "e93c55ba1c21fd143eb7b78f7d20ac30",
+    "created_at": "2026-07-01T03:49:57.012593551Z",
+    "expires_at": "2026-07-02T03:49:57.012593551Z",
     "export_name": "users",
     "strategy": "full",
     "plan_fingerprint": "",

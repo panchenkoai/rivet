@@ -65,11 +65,11 @@ x-airflow-common:
     AIRFLOW__CORE__FERNET_KEY: ''
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
-    RIVET_PG_URL: postgresql://rivet:rivet@host.docker.internal:5432/rivet
-    RIVET_MY_URL: mysql://rivet:rivet@host.docker.internal:3306/rivet
-    RIVET_MS_URL: sqlserver://sa:Rivet_Passw0rd!@host.docker.internal:1433/rivet
     AWS_ACCESS_KEY_ID: minioadmin       # MinIO (S3-compatible) for the *_s3 DAGs
     AWS_SECRET_ACCESS_KEY: minioadmin
+    AIRFLOW_CONN_RIVET_POSTGRES: postgresql://rivet:rivet@host.docker.internal:5432/rivet
+    AIRFLOW_CONN_RIVET_MYSQL: mysql://rivet:rivet@host.docker.internal:3306/rivet
+    AIRFLOW_CONN_RIVET_MSSQL: mssql://sa:Rivet_Passw0rd!@host.docker.internal:1433/rivet
     RIVET_STATE_URL: postgresql://rivet:rivet@rivet-state-db:5432/rivet_state?sslmode=require
     AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
     # yamllint disable rule:line-length
@@ -91,6 +91,8 @@ x-airflow-common:
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
     &airflow-common-depends-on
+    rivet-state-schema-init:
+      condition: service_completed_successfully
     rivet-state-db:
       condition: service_healthy
     redis:
@@ -138,6 +140,21 @@ services:
     volumes:
       - ./init/create-buckets.sh:/init/create-buckets.sh:ro
     entrypoint: ["/bin/sh", "/init/create-buckets.sh"]
+    restart: "no"
+
+  rivet-state-schema-init:
+    image: rivet-airflow:2.10.5
+    build:
+      context: .
+      args:
+        AIRFLOW_VERSION: 2.10.5
+    depends_on:
+      rivet-state-db:
+        condition: service_healthy
+    volumes:
+      - ./dags:/opt/airflow/dags:ro
+      - ./init/init-state-schema.sh:/init/init-state-schema.sh:ro
+    entrypoint: ["/bin/bash", "/init/init-state-schema.sh"]
     restart: "no"
 
   postgres:

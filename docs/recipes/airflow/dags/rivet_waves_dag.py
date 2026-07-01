@@ -72,7 +72,15 @@ except Exception:  # noqa: BLE001 — a missing Variable / no DB at parse must n
 
 
 def build_wave_dag(
-    dag_id: str, config_path: str, plan_path: str, *, tags: list[str], state_url: str
+    dag_id: str,
+    config_path: str,
+    plan_path: str,
+    *,
+    tags: list[str],
+    state_url: str,
+    conn_id: str,
+    scheme: str,
+    url_env: str,
 ) -> DAG:
     """Build one wave-ordered DAG for the source described by `config_path`.
 
@@ -82,8 +90,27 @@ def build_wave_dag(
     `state_url` is this source's own state database — each source gets its own so
     that same-named tables across engines (a `bench_hc` in Postgres and in MySQL)
     don't collide on cursor / shape / file-log state.
+
+    The source connection comes from an **Airflow Connection** (`conn_id`), set in
+    the UI (Admin → Connections) — nothing about the database is hard-coded here.
+    The URL is assembled from the connection's FIELDS in rivet's scheme (`scheme`,
+    e.g. `sqlserver`) rather than `get_uri()`, whose scheme differs per engine
+    (Airflow emits `mssql://`, rivet wants `sqlserver://`). It's exported as
+    `url_env` (matching `source: { url_env: … }` in the config) at run time.
     """
     plan_file = Path(plan_path)
+    # Assemble the source URL from the Airflow Connection's fields, in rivet's
+    # scheme, as a Jinja expression the BashOperator renders at run time. Password
+    # is URL-encoded so special characters don't break the URL.
+    _c = f"conn.{conn_id}"
+    src_url = (
+        f"{scheme}://{{{{ {_c}.login }}}}:"
+        f"{{{{ {_c}.password }}}}@"
+        f"{{{{ {_c}.host }}}}:{{{{ {_c}.port }}}}/{{{{ {_c}.schema }}}}"
+    )
+    # `export` so every rivet invocation in the command (a plan + its summary, or a
+    # run + its resume retry) sees the URL.
+    url_prefix = f'export {url_env}="{src_url}"; '
     # ── Parse the plan at DAG-parse time (no DB hit) ──────────────────────────
     try:
         plan = json.loads(plan_file.read_text())
@@ -173,9 +200,9 @@ def build_wave_dag(
                     f"RIVET_STATE_URL='{state_url}' {RIVET_BIN} state reset-chunks "
                     f"--config {config_path} --export {name!r} || true"
                 )
-                return f"{reset}; {run}"
-            return run
-        return base + reconcile
+                return url_prefix + f"{reset}; {run}"
+            return url_prefix + run
+        return url_prefix + base + reconcile
 
     def plan_cmd() -> str:
         # First task: refresh the plan from the current config against the real DB —
@@ -183,7 +210,7 @@ def build_wave_dag(
         # file, swapped in only if it succeeded AND the output is valid JSON, so a
         # failed plan can't truncate the graph source and break the DAG.
         tmp = f"{plan_file}.tmp"
-        return (
+        return url_prefix + (
             f"{RIVET_BIN} plan --config {config_path} --format json > {tmp} "
             f"&& test -s {tmp} "
             f"""&& python3 -c "import json; json.load(open('{tmp}'))" """
@@ -236,50 +263,43 @@ def build_wave_dag(
     return dag
 
 
-# ── One DAG per source database ────────────────────────────────────────────────
-# Each reads its own config + plan; the worker env supplies the matching source
-# URL (RIVET_PG_URL / RIVET_MY_URL / RIVET_MS_URL). Each also gets its OWN state
-# database so same-named tables across engines don't collide on cursor / shape.
+# ── The source connections (create these in Airflow: Admin → Connections) ───────
+# Each source's URL is built from its Airflow Connection's fields, in rivet's URL
+# scheme, and exported as the env var the config's `url_env` reads. Nothing about
+# the databases is hard-coded here.
+#   source     → (Airflow conn_id, rivet URL scheme, config url_env)
 _STATE_HOST = "rivet-state-db:5432"
-for _id, _cfg, _plan, _tag, _state in (
-    ("rivet_waves_postgres", "postgres.yaml", "postgres.plan.json", "postgres", "rivet_state_postgres"),
-    ("rivet_waves_mysql", "mysql.yaml", "mysql.plan.json", "mysql", "rivet_state_mysql"),
-    ("rivet_waves_mssql", "mssql.yaml", "mssql.plan.json", "sqlserver", "rivet_state_mssql"),
-):
-    globals()[_id] = build_wave_dag(
-        _id,
-        str(_HERE / _cfg),
-        str(_HERE / _plan),
-        tags=["rivet", "extract", _tag],
-        state_url=f"postgresql://rivet:rivet@{_STATE_HOST}/{_state}?sslmode=require",
+_SRC = {
+    "postgres": ("rivet_postgres", "postgresql", "RIVET_PG_URL"),
+    "mysql": ("rivet_mysql", "mysql", "RIVET_MY_URL"),
+    "mssql": ("rivet_mssql", "sqlserver", "RIVET_MS_URL"),
+}
+
+
+def _register(dag_id: str, cfg: str, plan: str, source: str, tag: str, state: str) -> None:
+    conn_id, scheme, url_env = _SRC[source]
+    globals()[dag_id] = build_wave_dag(
+        dag_id,
+        str(_HERE / cfg),
+        str(_HERE / plan),
+        tags=["rivet", "extract", tag],
+        state_url=f"postgresql://rivet:rivet@{_STATE_HOST}/{state}?sslmode=require",
+        conn_id=conn_id,
+        scheme=scheme,
+        url_env=url_env,
     )
 
-# ── The same three sources, writing to ONE shared S3 bucket ─────────────────────
-# Each `*.s3.yaml` config points at the same bucket with a per-source prefix
-# (`rivet/<source>/{export}/`), so same-named tables across engines never collide:
-# a `bench_hc` from Postgres lands at `rivet/postgres/bench_hc/`, the MySQL one at
-# `rivet/mysql/bench_hc/`. (Different databases are different data; the same
-# logical table also yields different Arrow types per engine — see the README.)
-for _id, _cfg, _plan, _state in (
-    ("rivet_waves_postgres_s3", "postgres.s3.yaml", "postgres.s3.plan.json", "rivet_state_postgres_s3"),
-    ("rivet_waves_mysql_s3", "mysql.s3.yaml", "mysql.s3.plan.json", "rivet_state_mysql_s3"),
-    ("rivet_waves_mssql_s3", "mssql.s3.yaml", "mssql.s3.plan.json", "rivet_state_mssql_s3"),
-):
-    globals()[_id] = build_wave_dag(
-        _id,
-        str(_HERE / _cfg),
-        str(_HERE / _plan),
-        tags=["rivet", "extract", "s3"],
-        state_url=f"postgresql://rivet:rivet@{_STATE_HOST}/{_state}?sslmode=require",
-    )
 
-# ── One GCS DAG, to show the same recipe writes to Google Cloud Storage ─────────
-# Identical shape, just a `type: gcs` destination (`postgres.gcs.yaml`). The demo
-# writes to the project's fake-gcs emulator; a real bucket needs no `endpoint`.
-globals()["rivet_waves_postgres_gcs"] = build_wave_dag(
-    "rivet_waves_postgres_gcs",
-    str(_HERE / "postgres.gcs.yaml"),
-    str(_HERE / "postgres.gcs.plan.json"),
-    tags=["rivet", "extract", "gcs"],
-    state_url=f"postgresql://rivet:rivet@{_STATE_HOST}/rivet_state_postgres_gcs?sslmode=require",
-)
+# One DAG per source → local Parquet. Each gets its own state database.
+_register("rivet_waves_postgres", "postgres.yaml", "postgres.plan.json", "postgres", "postgres", "rivet_state_postgres")
+_register("rivet_waves_mysql", "mysql.yaml", "mysql.plan.json", "mysql", "mysql", "rivet_state_mysql")
+_register("rivet_waves_mssql", "mssql.yaml", "mssql.plan.json", "mssql", "sqlserver", "rivet_state_mssql")
+
+# The same three sources → ONE shared S3 bucket, each under a per-source prefix
+# (`rivet/<source>/{export}/`), so same-named tables across engines never collide.
+_register("rivet_waves_postgres_s3", "postgres.s3.yaml", "postgres.s3.plan.json", "postgres", "s3", "rivet_state_postgres_s3")
+_register("rivet_waves_mysql_s3", "mysql.s3.yaml", "mysql.s3.plan.json", "mysql", "s3", "rivet_state_mysql_s3")
+_register("rivet_waves_mssql_s3", "mssql.s3.yaml", "mssql.s3.plan.json", "mssql", "s3", "rivet_state_mssql_s3")
+
+# One GCS DAG, to show the same recipe writes to Google Cloud Storage.
+_register("rivet_waves_postgres_gcs", "postgres.gcs.yaml", "postgres.gcs.plan.json", "postgres", "gcs", "rivet_state_postgres_gcs")

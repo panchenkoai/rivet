@@ -175,12 +175,20 @@ remainder) — the same reasoning as skipping reconcile on incremental exports.
   SQLite state in a bind-mount corrupts under parallel writers; Rivet refuses to
   send state credentials in cleartext to a non-loopback host (CWE-319), so the
   service speaks TLS (a self-signed cert generated at startup — fine in-cluster).
-- **Source credentials** — `RIVET_PG_URL` / `RIVET_MY_URL` / `RIVET_MS_URL` in the
-  compose env for the demo. In production, put each URL in an Airflow Connection /
-  Variable and export it into the task env, matching `source: { url_env: … }` in
-  the config — never inline it in the DAG. The demo opts into plaintext to the
-  fixtures with `source.tls: { mode: disable }`; a real remote DB uses
-  `mode: verify-full`.
+- **Source credentials — Airflow Connections.** Each source is an Airflow
+  Connection (`rivet_postgres` / `rivet_mysql` / `rivet_mssql`), editable in the UI
+  (Admin → Connections); the demo seeds them via `AIRFLOW_CONN_*` in the compose so
+  it works out of the box. The DAG builds the URL from the connection's **fields**
+  in rivet's scheme — not `get_uri()`, whose scheme differs per engine (Airflow
+  emits `mssql://`, rivet wants `sqlserver://`) — and exports it as the env var the
+  config's `url_env` reads. Nothing about a database is hard-coded in the DAG. The
+  demo opts into plaintext to the fixtures with `source.tls: { mode: disable }`; a
+  real remote DB uses `mode: verify-full`.
+- **State schema is created up front.** `initdb` creates the state *databases*, but
+  rivet's *tables* are created on first connect — under parallelism that races
+  ("create version table: db error"). A one-shot `rivet-state-schema-init` service
+  runs `rivet state show` against every state DB at boot, so the schema exists
+  before any wave task runs. The Airflow services wait for it.
 
 ---
 
