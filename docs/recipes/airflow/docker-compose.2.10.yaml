@@ -109,6 +109,8 @@ services:
       POSTGRES_USER: rivet
       POSTGRES_PASSWORD: rivet
       POSTGRES_DB: rivet_state
+    volumes:
+      - ./init/10-state-dbs.sql:/docker-entrypoint-initdb.d/10-state-dbs.sql:ro
     command: ["bash","-c","install -d -o postgres -g postgres -m 700 /ssl && openssl req -new -x509 -days 365 -nodes -subj /CN=rivet-state-db -out /ssl/server.crt -keyout /ssl/server.key && chown postgres:postgres /ssl/server.crt /ssl/server.key && chmod 600 /ssl/server.key && exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/ssl/server.crt -c ssl_key_file=/ssl/server.key"]
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "rivet"]
@@ -116,6 +118,27 @@ services:
       retries: 5
       start_period: 5s
     restart: always
+
+  minio:
+    image: minio/minio:latest
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    restart: always
+
+  fake-gcs:
+    image: fsouza/fake-gcs-server:latest
+    command: -scheme http -host 0.0.0.0 -port 4443 -public-host fake-gcs:4443
+    restart: always
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on: [minio, fake-gcs]
+    volumes:
+      - ./init/create-buckets.sh:/init/create-buckets.sh:ro
+    entrypoint: ["/bin/sh", "/init/create-buckets.sh"]
+    restart: "no"
 
   postgres:
     image: postgres:13

@@ -34,7 +34,7 @@ exports:
       type: gcs
       bucket: rivet-lake-gcs
       prefix: rivet/postgres/{export}/
-      endpoint: http://host.docker.internal:4443
+      endpoint: http://fake-gcs:4443
       allow_anonymous: true
     columns:
       price: decimal(18,4)
@@ -66,7 +66,7 @@ exports:
       type: gcs
       bucket: rivet-lake-gcs
       prefix: rivet/postgres/{export}/
-      endpoint: http://host.docker.internal:4443
+      endpoint: http://fake-gcs:4443
       allow_anonymous: true
   - name: bench_json
     wave: 2
@@ -82,7 +82,7 @@ exports:
       type: gcs
       bucket: rivet-lake-gcs
       prefix: rivet/postgres/{export}/
-      endpoint: http://host.docker.internal:4443
+      endpoint: http://fake-gcs:4443
       allow_anonymous: true
   - name: bench_narrow
     wave: 4
@@ -112,7 +112,7 @@ exports:
       type: gcs
       bucket: rivet-lake-gcs
       prefix: rivet/postgres/{export}/
-      endpoint: http://host.docker.internal:4443
+      endpoint: http://fake-gcs:4443
       allow_anonymous: true
   - name: bench_sparse
     wave: 2
@@ -128,7 +128,7 @@ exports:
       type: gcs
       bucket: rivet-lake-gcs
       prefix: rivet/postgres/{export}/
-      endpoint: http://host.docker.internal:4443
+      endpoint: http://fake-gcs:4443
       allow_anonymous: true
   - name: bench_wide
     wave: 3
@@ -144,7 +144,7 @@ exports:
       type: gcs
       bucket: rivet-lake-gcs
       prefix: rivet/postgres/{export}/
-      endpoint: http://host.docker.internal:4443
+      endpoint: http://fake-gcs:4443
       allow_anonymous: true
   - name: cdc_ack_test
     wave: 2
@@ -160,7 +160,7 @@ exports:
       type: gcs
       bucket: rivet-lake-gcs
       prefix: rivet/postgres/{export}/
-      endpoint: http://host.docker.internal:4443
+      endpoint: http://fake-gcs:4443
       allow_anonymous: true
   - name: cdc_demo
     wave: 2
@@ -176,7 +176,7 @@ exports:
       type: gcs
       bucket: rivet-lake-gcs
       prefix: rivet/postgres/{export}/
-      endpoint: http://host.docker.internal:4443
+      endpoint: http://fake-gcs:4443
       allow_anonymous: true
   - name: content_items
     wave: 4
@@ -206,7 +206,7 @@ exports:
       type: gcs
       bucket: rivet-lake-gcs
       prefix: rivet/postgres/{export}/
-      endpoint: http://host.docker.internal:4443
+      endpoint: http://fake-gcs:4443
       allow_anonymous: true
   - name: content_items_sample
     wave: 2
@@ -222,7 +222,7 @@ exports:
       type: gcs
       bucket: rivet-lake-gcs
       prefix: rivet/postgres/{export}/
-      endpoint: http://host.docker.internal:4443
+      endpoint: http://fake-gcs:4443
       allow_anonymous: true
   - name: events
     wave: 2
@@ -238,7 +238,7 @@ exports:
       type: gcs
       bucket: rivet-lake-gcs
       prefix: rivet/postgres/{export}/
-      endpoint: http://host.docker.internal:4443
+      endpoint: http://fake-gcs:4443
       allow_anonymous: true
   - name: meta_demo
     wave: 2
@@ -254,7 +254,7 @@ exports:
       type: gcs
       bucket: rivet-lake-gcs
       prefix: rivet/postgres/{export}/
-      endpoint: http://host.docker.internal:4443
+      endpoint: http://fake-gcs:4443
       allow_anonymous: true
     columns:
       amount: decimal(12,2)
@@ -283,7 +283,7 @@ exports:
       type: gcs
       bucket: rivet-lake-gcs
       prefix: rivet/postgres/{export}/
-      endpoint: http://host.docker.internal:4443
+      endpoint: http://fake-gcs:4443
       allow_anonymous: true
     columns:
       price: decimal(10,2)
@@ -301,7 +301,7 @@ exports:
       type: gcs
       bucket: rivet-lake-gcs
       prefix: rivet/postgres/{export}/
-      endpoint: http://host.docker.internal:4443
+      endpoint: http://fake-gcs:4443
       allow_anonymous: true
     columns:
       price: decimal(10,2)
@@ -319,7 +319,7 @@ exports:
       type: gcs
       bucket: rivet-lake-gcs
       prefix: rivet/postgres/{export}/
-      endpoint: http://host.docker.internal:4443
+      endpoint: http://fake-gcs:4443
       allow_anonymous: true
   - name: page_views
     wave: 2
@@ -335,7 +335,7 @@ exports:
       type: gcs
       bucket: rivet-lake-gcs
       prefix: rivet/postgres/{export}/
-      endpoint: http://host.docker.internal:4443
+      endpoint: http://fake-gcs:4443
       allow_anonymous: true
   - name: users
     wave: 2
@@ -351,7 +351,7 @@ exports:
       type: gcs
       bucket: rivet-lake-gcs
       prefix: rivet/postgres/{export}/
-      endpoint: http://host.docker.internal:4443
+      endpoint: http://fake-gcs:4443
       allow_anonymous: true
     columns:
       balance: decimal(12,2)

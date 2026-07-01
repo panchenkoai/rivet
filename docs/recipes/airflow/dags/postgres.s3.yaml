@@ -35,7 +35,7 @@ exports:
       bucket: rivet-lake
       prefix: rivet/postgres/{export}/
       region: us-east-1
-      endpoint: http://host.docker.internal:9000
+      endpoint: http://minio:9000
       allow_anonymous: true
       access_key_env: AWS_ACCESS_KEY_ID
       secret_key_env: AWS_SECRET_ACCESS_KEY
@@ -70,7 +70,7 @@ exports:
       bucket: rivet-lake
       prefix: rivet/postgres/{export}/
       region: us-east-1
-      endpoint: http://host.docker.internal:9000
+      endpoint: http://minio:9000
       allow_anonymous: true
       access_key_env: AWS_ACCESS_KEY_ID
       secret_key_env: AWS_SECRET_ACCESS_KEY
@@ -89,7 +89,7 @@ exports:
       bucket: rivet-lake
       prefix: rivet/postgres/{export}/
       region: us-east-1
-      endpoint: http://host.docker.internal:9000
+      endpoint: http://minio:9000
       allow_anonymous: true
       access_key_env: AWS_ACCESS_KEY_ID
       secret_key_env: AWS_SECRET_ACCESS_KEY
@@ -122,7 +122,7 @@ exports:
       bucket: rivet-lake
       prefix: rivet/postgres/{export}/
       region: us-east-1
-      endpoint: http://host.docker.internal:9000
+      endpoint: http://minio:9000
       allow_anonymous: true
       access_key_env: AWS_ACCESS_KEY_ID
       secret_key_env: AWS_SECRET_ACCESS_KEY
@@ -141,7 +141,7 @@ exports:
       bucket: rivet-lake
       prefix: rivet/postgres/{export}/
       region: us-east-1
-      endpoint: http://host.docker.internal:9000
+      endpoint: http://minio:9000
       allow_anonymous: true
       access_key_env: AWS_ACCESS_KEY_ID
       secret_key_env: AWS_SECRET_ACCESS_KEY
@@ -160,7 +160,7 @@ exports:
       bucket: rivet-lake
       prefix: rivet/postgres/{export}/
       region: us-east-1
-      endpoint: http://host.docker.internal:9000
+      endpoint: http://minio:9000
       allow_anonymous: true
       access_key_env: AWS_ACCESS_KEY_ID
       secret_key_env: AWS_SECRET_ACCESS_KEY
@@ -179,7 +179,7 @@ exports:
       bucket: rivet-lake
       prefix: rivet/postgres/{export}/
       region: us-east-1
-      endpoint: http://host.docker.internal:9000
+      endpoint: http://minio:9000
       allow_anonymous: true
       access_key_env: AWS_ACCESS_KEY_ID
       secret_key_env: AWS_SECRET_ACCESS_KEY
@@ -198,7 +198,7 @@ exports:
       bucket: rivet-lake
       prefix: rivet/postgres/{export}/
       region: us-east-1
-      endpoint: http://host.docker.internal:9000
+      endpoint: http://minio:9000
       allow_anonymous: true
       access_key_env: AWS_ACCESS_KEY_ID
       secret_key_env: AWS_SECRET_ACCESS_KEY
@@ -231,7 +231,7 @@ exports:
       bucket: rivet-lake
       prefix: rivet/postgres/{export}/
       region: us-east-1
-      endpoint: http://host.docker.internal:9000
+      endpoint: http://minio:9000
       allow_anonymous: true
       access_key_env: AWS_ACCESS_KEY_ID
       secret_key_env: AWS_SECRET_ACCESS_KEY
@@ -250,7 +250,7 @@ exports:
       bucket: rivet-lake
       prefix: rivet/postgres/{export}/
       region: us-east-1
-      endpoint: http://host.docker.internal:9000
+      endpoint: http://minio:9000
       allow_anonymous: true
       access_key_env: AWS_ACCESS_KEY_ID
       secret_key_env: AWS_SECRET_ACCESS_KEY
@@ -269,7 +269,7 @@ exports:
       bucket: rivet-lake
       prefix: rivet/postgres/{export}/
       region: us-east-1
-      endpoint: http://host.docker.internal:9000
+      endpoint: http://minio:9000
       allow_anonymous: true
       access_key_env: AWS_ACCESS_KEY_ID
       secret_key_env: AWS_SECRET_ACCESS_KEY
@@ -288,7 +288,7 @@ exports:
       bucket: rivet-lake
       prefix: rivet/postgres/{export}/
       region: us-east-1
-      endpoint: http://host.docker.internal:9000
+      endpoint: http://minio:9000
       allow_anonymous: true
       access_key_env: AWS_ACCESS_KEY_ID
       secret_key_env: AWS_SECRET_ACCESS_KEY
@@ -320,7 +320,7 @@ exports:
       bucket: rivet-lake
       prefix: rivet/postgres/{export}/
       region: us-east-1
-      endpoint: http://host.docker.internal:9000
+      endpoint: http://minio:9000
       allow_anonymous: true
       access_key_env: AWS_ACCESS_KEY_ID
       secret_key_env: AWS_SECRET_ACCESS_KEY
@@ -341,7 +341,7 @@ exports:
       bucket: rivet-lake
       prefix: rivet/postgres/{export}/
       region: us-east-1
-      endpoint: http://host.docker.internal:9000
+      endpoint: http://minio:9000
       allow_anonymous: true
       access_key_env: AWS_ACCESS_KEY_ID
       secret_key_env: AWS_SECRET_ACCESS_KEY
@@ -362,7 +362,7 @@ exports:
       bucket: rivet-lake
       prefix: rivet/postgres/{export}/
       region: us-east-1
-      endpoint: http://host.docker.internal:9000
+      endpoint: http://minio:9000
       allow_anonymous: true
       access_key_env: AWS_ACCESS_KEY_ID
       secret_key_env: AWS_SECRET_ACCESS_KEY
@@ -381,7 +381,7 @@ exports:
       bucket: rivet-lake
       prefix: rivet/postgres/{export}/
       region: us-east-1
-      endpoint: http://host.docker.internal:9000
+      endpoint: http://minio:9000
       allow_anonymous: true
       access_key_env: AWS_ACCESS_KEY_ID
       secret_key_env: AWS_SECRET_ACCESS_KEY
@@ -400,7 +400,7 @@ exports:
       bucket: rivet-lake
       prefix: rivet/postgres/{export}/
       region: us-east-1
-      endpoint: http://host.docker.internal:9000
+      endpoint: http://minio:9000
       allow_anonymous: true
       access_key_env: AWS_ACCESS_KEY_ID
       secret_key_env: AWS_SECRET_ACCESS_KEY
