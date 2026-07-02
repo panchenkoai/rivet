@@ -573,6 +573,89 @@ fn cdc_full_type_matrix_matches_batch() {
     assert_cdc_matches_batch(&cdc_out, &batch_out);
 }
 
+// Same column NAME, different TYPES across tables of one multi-table stream:
+// resolution is per-table by construction (each TableOutput resolves its own
+// schema and cell fixes), so `a.v INT` and `b.v DECIMAL(10,2)` and
+// `c.v ENUM(…)` must land as three different, correctly-typed columns — no
+// cross-table bleed. Pinned because schema-wide CDC makes name collisions the
+// NORM, not the exception.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_multi_table_same_column_name_different_types_resolve_per_table() {
+    use arrow::datatypes::DataType;
+    let d = tempfile::tempdir().unwrap();
+    let ta = unique_name("cdc_nm_int");
+    let tb = unique_name("cdc_nm_dec");
+    let tc = unique_name("cdc_nm_enum");
+    let mut c = conn();
+    for (t, ty) in [
+        (&ta, "INT"),
+        (&tb, "DECIMAL(10,2)"),
+        (&tc, "ENUM('on','off')"),
+    ] {
+        c.query_drop(format!("DROP TABLE IF EXISTS {t}")).unwrap();
+        c.query_drop(format!("CREATE TABLE {t} (id INT PRIMARY KEY, v {ty})"))
+            .unwrap();
+    }
+    let (_g1, _g2, _g3) = (Table(ta.clone()), Table(tb.clone()), Table(tc.clone()));
+
+    let out = d.path().join("out");
+    let ckpt = d.path().join("cdc.ckpt");
+    std::fs::create_dir_all(&out).unwrap();
+    let yaml = format!(
+        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
+exports:
+  - name: app_cdc
+    tables: [{ta}, {tb}, {tc}]
+    mode: cdc
+    format: parquet
+    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        ckpt = ckpt.display(),
+        out = out.display(),
+        sid = server_id_for(&ta),
+    );
+    let cfg = write_config(&d, &yaml);
+
+    run_cdc(&cfg); // pin
+    c.query_drop(format!("INSERT INTO {ta} VALUES (1, -42)"))
+        .unwrap();
+    c.query_drop(format!("INSERT INTO {tb} VALUES (1, 13.37)"))
+        .unwrap();
+    c.query_drop(format!("INSERT INTO {tc} VALUES (1, 'off')"))
+        .unwrap();
+    run_cdc(&cfg);
+
+    let ty_of = |t: &str| {
+        parquet_fields(&out.join(t))
+            .into_iter()
+            .find(|(n, _)| n == "v")
+            .map(|(_, ty)| ty)
+            .unwrap()
+    };
+    assert_eq!(ty_of(&ta), DataType::Int32, "a.v stays INT");
+    assert_eq!(ty_of(&tb), DataType::Decimal128(10, 2), "b.v stays DECIMAL");
+    assert_eq!(ty_of(&tc), DataType::Utf8, "c.v stays ENUM→Utf8");
+    // Values: the enum INDEX must have become its label in c, while a kept -42.
+    assert_eq!(parquet_one_string(&out.join(&tc), "v"), "off");
+    use arrow::array::{Decimal128Array, Int32Array};
+    let a = read_one_batch(&out.join(&ta));
+    let av = a
+        .column(a.schema().index_of("v").unwrap())
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(av.value(0), -42);
+    let b = read_one_batch(&out.join(&tb));
+    let bv = b
+        .column(b.schema().index_of("v").unwrap())
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
+    assert_eq!(bv.value(0), 1337, "13.37 at scale 2");
+}
+
 // `cdc.initial: snapshot` — the safe switch ordering enforced by construction:
 // anchor → snapshot → drain in ONE run. The invariant this pins: rows that
 // exist BEFORE the first run land in `snapshot/`, changes AFTER land in the
