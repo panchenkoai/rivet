@@ -40,6 +40,20 @@
 
 ### Fixed
 
+- **PostgreSQL CDC: `uuid` and `bytea` values decode to raw bytes.** `test_decoding` renders a uuid as
+  its 36-char hyphenated text and bytea as `\x…` hex; the parse forwarded both as text bytes, and the
+  sink's `FixedSizeBinary(16)` builder — which accepts only exactly-16-byte values — silently degraded
+  **100% of the uuid column to NULL** while every count/sum check still passed (caught by eye on a live
+  GCS export). The parse now decodes both renderings to the same raw bytes the batch path produces.
+  Regression: `uuid_and_bytea_decode_to_raw_bytes_not_their_text_rendering`.
+- **SQL Server CDC: schema/table resolved from `cdc.change_tables` metadata, not the capture-instance
+  name.** The `<schema>_<table>` split-once heuristic mis-tagged every event when an instance was named
+  after an underscored table (`product_catalog` → schema `product`, table `catalog`), so table routing
+  silently dropped all of its changes while the run reported success — caught live with 6 of 8 tables
+  capturing zero events. Because checkpoints never advanced for the dropped tables, a single run with
+  the fix recovered the full backlog from the change tables — no re-snapshot needed. The name heuristic
+  remains only as a fallback when the metadata row is unreadable.
+  Regression (live): `mssql_cdc_capture_instance_name_must_not_decide_the_table`.
 - **MySQL CDC: an idle first run now pins the resume position.** The checkpoint file was written only
   at a part commit, and a MySQL run without a checkpoint anchors to the *current* master position
   (`SHOW MASTER STATUS`). So a bounded first run that drained zero changes left no checkpoint, the next

@@ -143,6 +143,34 @@ sub-second precision: in live verification two scheduler cycles landed
 125 ms apart — a `%Y%m%d_%H%M%S` stamp would have collided; derive the
 name from the millisecond `run_id`, filename-sanitized.
 
+## Silent-loss classes from the live GCS run: cells, and names
+
+Two same-day bugs, one lesson each — both survived every count/sum check
+and 26 green live CDC tests, and were caught only by a human eye on a
+real bucket:
+
+1. **A "degrade to null" cell path is a silent-loss path.** The
+   `FixedSizeBinary(16)` builder nulled anything not exactly 16 bytes;
+   PostgreSQL's `test_decoding` renders uuids as 36-char text → **100%
+   of the column became NULL** while `transactions`-style sum checks
+   passed. Rule: every lenient per-cell fallback needs a decode attempt
+   per engine's actual wire/text rendering *and* a test per engine; and
+   completeness verification must include a **per-column null-profile +
+   distinct-count vs the source**, not counts/sums of hand-picked
+   columns. (Extends the test-self-oracle rule: re-reading the
+   destination is not enough — read *every column* of it.)
+
+2. **Names are labels; catalogs are truth.** SQL Server's schema/table
+   came from splitting the capture-instance NAME on `_`
+   (`product_catalog` → table `catalog`), so routing dropped 100% of
+   events for 6 of 8 tables while runs reported success. Rule: when a
+   catalog view exists (`cdc.change_tables`), resolve identity from it;
+   a naming heuristic is at most a fallback. Corollary that saved us:
+   because flush→checkpoint→ack never ran for the dropped tables, the
+   events were still in the change tables and one fixed run recovered
+   everything — at-least-once turns a routing bug into a delay, not a
+   loss. Preserve that property in every sink change.
+
 ## Performance diagnosis: measure cold, don't theorize
 
 A "why is this slow?" answer reasoned from the code is a hypothesis, not a

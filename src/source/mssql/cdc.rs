@@ -86,18 +86,41 @@ impl MssqlChangeStream {
         {
             anyhow::bail!("mssql cdc: malformed resume LSN {lsn:?}");
         }
-        // Heuristic schema/table from `<schema>_<table>` — robust resolution via
-        // cdc.change_tables metadata is the SQL Server completion step.
-        let (schema, table) = cfg
-            .capture_instance
-            .split_once('_')
-            .map(|(s, t)| (s.to_string(), t.to_string()))
-            .unwrap_or_else(|| (String::new(), cfg.capture_instance.clone()));
-
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        let client = rt.block_on(connect(cfg, tls))?;
+        let mut client = rt.block_on(connect(cfg, tls))?;
+
+        // Resolve the REAL schema/table from cdc.change_tables metadata. The
+        // previous `<schema>_<table>` name heuristic silently mis-tagged every
+        // event when the capture instance was named after an underscored table
+        // (`product_catalog` → schema "product", table "catalog"), so the
+        // sink's table routing dropped 100% of its changes while the run still
+        // reported success. The name is a label; the metadata is the truth.
+        // Fall back to the heuristic only if the metadata row is unreadable.
+        let meta: Option<(String, String)> = rt.block_on(async {
+            let row = client
+                .query(
+                    "SELECT OBJECT_SCHEMA_NAME(source_object_id), \
+                            OBJECT_NAME(source_object_id) \
+                     FROM cdc.change_tables WHERE capture_instance = @P1",
+                    &[&cfg.capture_instance.as_str()],
+                )
+                .await
+                .ok()?
+                .into_row()
+                .await
+                .ok()??;
+            let s: Option<&str> = row.get(0);
+            let t: Option<&str> = row.get(1);
+            Some((s?.to_string(), t?.to_string()))
+        });
+        let (schema, table) = meta.unwrap_or_else(|| {
+            cfg.capture_instance
+                .split_once('_')
+                .map(|(s, t)| (s.to_string(), t.to_string()))
+                .unwrap_or_else(|| (String::new(), cfg.capture_instance.clone()))
+        });
         Ok(Self {
             rt,
             client,

@@ -328,6 +328,49 @@ With a full row image, *which* columns changed is irrelevant — the latest imag
 per key (highest `__pos`) already contains every prior change, so dedup-by-key +
 overwrite is correct. This is why `binlog_row_image = FULL` matters.
 
+### Deduplicating by position, per engine
+
+`__pos` granularity differs by engine, and the dedup recipe follows from it:
+
+| engine | `__pos` | unique per event? |
+| --- | --- | --- |
+| MySQL | `{file, pos}` — the transaction's **commit** position | per *statement* under autocommit; all events of one multi-statement transaction share it |
+| PostgreSQL | `{lsn}` — the transaction's **COMMIT LSN** | all events of one transaction share it |
+| SQL Server | `{lsn}` — `__$start_lsn` | per transaction (rows within share it) |
+
+Two distinct problems:
+
+1. **At-least-once re-delivery** (a crashed run's part re-read on resume): the
+   re-delivered event is **byte-identical** — same `__op`, `__pos`, and image —
+   so `SELECT DISTINCT` over the staged rows (or dedup on `(pk, __pos, __op)`)
+   removes it exactly.
+2. **Latest-image-per-key** (the MERGE): order by `__pos`, and break the
+   within-transaction tie with **file order** — rivet writes events to parts in
+   stream order, so `(file name, row number in file)` completes the total order:
+
+```sql
+-- DuckDB replay: newest surviving image per key.
+WITH ev AS (
+  SELECT *,
+         upper(lpad(split_part(__pos->>'lsn', '/', 1), 8, '0')) ||
+         upper(lpad(split_part(__pos->>'lsn', '/', 2), 8, '0')) AS lsn_key   -- PostgreSQL X/Y → sortable
+  FROM read_parquet('…/sessions/cdc-*.parquet', filename = true, file_row_number = true)
+), latest AS (
+  SELECT * FROM (
+    SELECT *, row_number() OVER (
+      PARTITION BY id
+      ORDER BY lsn_key DESC, filename DESC, file_row_number DESC) AS rn
+    FROM ev)
+  WHERE rn = 1
+)
+SELECT * FROM latest WHERE __op <> 'delete';
+```
+
+(MySQL: order by `(file, pos)` from `__pos` instead of `lsn_key`; SQL Server:
+the fixed-width hex `lsn` string is already lexically ordered.) In a warehouse
+MERGE, apply the same window to the staged batch first, then merge the winners
+by PK + `__op`.
+
 ### Downstream loading
 
 CDC output is the **same typed Parquet** the batch export writes (same

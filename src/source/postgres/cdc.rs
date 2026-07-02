@@ -273,8 +273,37 @@ fn map_pg_value(typ: &str, val: &str, quoted: bool) -> RivetValue {
             .and_then(|d| d.and_hms_opt(0, 0, 0))
             .map_or(RivetValue::Null, RivetValue::DateTime);
     }
-    // text / varchar / char / uuid / json / … → string bytes.
+    if t == "uuid" {
+        // test_decoding renders the uuid as 36-char hyphenated text; the sink's
+        // FixedSizeBinary(16) column (same as the batch export) needs the raw
+        // 16 bytes — the text rendering would silently degrade to NULL there.
+        return decode_hex(&val.replace('-', ""))
+            .filter(|b| b.len() == 16)
+            .map_or(RivetValue::Null, RivetValue::Bytes);
+    }
+    if t == "bytea" {
+        // Rendered as `\x…` hex; a Binary column must carry the raw bytes, not
+        // the hex string.
+        if let Some(hex) = val.strip_prefix("\\x")
+            && let Some(b) = decode_hex(hex)
+        {
+            return RivetValue::Bytes(b);
+        }
+        return RivetValue::Bytes(val.as_bytes().to_vec());
+    }
+    // text / varchar / char / json / … → string bytes.
     RivetValue::Bytes(val.as_bytes().to_vec())
+}
+
+/// Decode an even-length hex string to bytes; `None` on any non-hex input.
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
 }
 
 /// Parse a PostgreSQL timestamp rendering (`YYYY-MM-DD HH:MM:SS[.ffffff][+TZ]`).
@@ -303,6 +332,40 @@ mod tests {
     // The `postgres-cdc` instance (cdc profile, :5434) — wal_level=logical.
     const CONN: &str = "postgresql://rivet:rivet@127.0.0.1:5434/rivet";
     const SLOT: &str = "rivet_cdc_test";
+
+    // RED test for the finding (caught live on a GCS export, by eye): a uuid
+    // column rode through as its 36-char TEXT rendering, but the sink's
+    // FixedSizeBinary(16) builder accepts only exactly-16-byte values and
+    // silently degrades everything else to NULL — so 100% of the column was
+    // lost while every count/sum check still passed. The parse must produce
+    // the same raw 16 bytes the batch path produces. Same class: bytea rides
+    // as its `\x…` hex TEXT — a Binary column would store the hex string.
+    #[test]
+    fn uuid_and_bytea_decode_to_raw_bytes_not_their_text_rendering() {
+        let line = "table public.t: INSERT: \
+                    u[uuid]:'0b0e0af9-27ec-4c33-b428-a01b27fdd576' \
+                    b[bytea]:'\\x48656c6c6f'";
+        let ev = parse_test_decoding("0/ABC", line).unwrap();
+        let after = ev.after.unwrap();
+        let RivetValue::Bytes(u) = &after[0] else {
+            panic!("uuid must be Bytes, got {:?}", after[0]);
+        };
+        assert_eq!(
+            u.len(),
+            16,
+            "uuid must be the raw 16 bytes, not 36-char text"
+        );
+        assert_eq!(
+            u[..4],
+            [0x0b, 0x0e, 0x0a, 0xf9],
+            "uuid bytes must match the hyphenated hex"
+        );
+        assert_eq!(
+            after[1],
+            RivetValue::Bytes(b"Hello".to_vec()),
+            "bytea must decode the \\x hex rendering to raw bytes"
+        );
+    }
 
     #[test]
     fn parses_typed_columns_from_test_decoding() {

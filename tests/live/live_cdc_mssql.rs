@@ -185,6 +185,46 @@ fn mssql_cdc_idle_first_run_then_change_is_captured_not_skipped() {
     );
 }
 
+// RED test for the finding (caught live: 6 of 8 tables captured ZERO events):
+// the stream derived schema/table from the capture-instance NAME by splitting
+// on the first underscore, so an instance named after an underscored table
+// (`product_catalog` → schema "product", table "catalog") tagged every event
+// with the wrong table and the sink's routing silently dropped them all — the
+// run still reported success. Resolution must come from cdc.change_tables
+// metadata, not the name.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_capture_instance_name_must_not_decide_the_table() {
+    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempfile::tempdir().unwrap();
+    // The table name contains underscores AND the capture instance is named
+    // exactly after it — the shape the split-once heuristic gets wrong.
+    let table = unique_name("rivet_cdc_und");
+    let ci = table.clone();
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT)"
+    ));
+    enable_cdc(&table, &ci);
+    let _guard = CdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+
+    let ckpt = d.path().join("cdc.ckpt");
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (1,10),(2,20)"));
+    wait_for_capture(&ci, 2);
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out));
+    assert_eq!(
+        manifest_rows(&out),
+        2,
+        "events must be routed by the REAL table name (from cdc.change_tables), \
+         not by parsing the capture-instance name"
+    );
+}
+
 #[test]
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
 fn mssql_cdc_crash_before_checkpoint_re_reads_on_resume() {
