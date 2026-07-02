@@ -70,4 +70,22 @@ ignore = [
     "RUSTSEC-2026-0098", # rustls-webpki: URI-name constraints incorrectly accepted
     "RUSTSEC-2026-0099", # rustls-webpki: wildcard-name constraints accepted
     "RUSTSEC-2025-0134", # rustls-pemfile: unmaintained
+
+    # ─── quick-xml DoS advisories (2026-06-29) ──
+    # Path: reqsign 0.16 → quick-xml 0.37 and opendal 0.55 → quick-xml 0.38;
+    #       both parse XML responses from the operator-configured cloud
+    #       endpoint (S3 auth/list bodies etc.).
+    # Status: fix requires quick-xml >= 0.41; reqsign pins ^0.37 and opendal
+    #       ^0.38 — verified 2026-07-02 (`cargo update --precise 0.41.0` fails
+    #       version selection; `cargo update -p reqsign -p opendal` moves
+    #       nothing). No upstream release path yet.
+    # Reachability: both are DoS-class (unbounded namespace-declaration
+    #       allocation; quadratic duplicate-attribute check), triggered by a
+    #       malicious XML response. Rivet is a batch CLI talking to endpoints
+    #       the operator configured; the blast radius of a hostile endpoint is
+    #       one failed/OOM-killed run, re-run under at-least-once semantics —
+    #       no RCE, no data corruption. Residual risk documented.
+    # Action: drop both the day reqsign/opendal release on quick-xml >= 0.41.
+    "RUSTSEC-2026-0194", # quick-xml: quadratic duplicate-attribute check
+    "RUSTSEC-2026-0195", # quick-xml: unbounded namespace-declaration allocation
 ]
