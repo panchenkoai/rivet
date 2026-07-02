@@ -66,8 +66,39 @@ exports:
         "cdc capture failed:\n{}",
         String::from_utf8_lossy(&res.stderr)
     );
+    // Diagnose the parallel-suite flake: a successful run with ZERO captured
+    // events writes no part and the oracle read fails later with a confusing
+    // "no files" — surface the run summary instead.
+    let stdout = String::from_utf8_lossy(&res.stdout);
+    assert!(
+        !stdout.contains("rows:         0"),
+        "cdc capture succeeded but captured 0 events — run summary:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&res.stderr)
+    );
 
     // ---- DuckDB oracle: read_parquet over the absolute /work path ----
+    // Bind-mount visibility on macOS Docker lags under parallel FS load: the
+    // part exists on the host but the container's view can trail by seconds.
+    // Wait for the glob to resolve INSIDE the container before querying —
+    // solo runs never need this; a full parallel suite does.
+    for i in 0..30 {
+        let seen = std::process::Command::new("docker")
+            .args([
+                "exec",
+                "rivet-duckdb",
+                "sh",
+                "-lc",
+                &format!("ls {container}/*.parquet >/dev/null 2>&1"),
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if seen {
+            break;
+        }
+        assert!(i < 29, "part never became visible inside rivet-duckdb");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
     let dj = duckdb_run_sql_json(&format!(
         "SELECT amount, n, meta FROM read_parquet('{container}/*.parquet') WHERE id = 1"
     ));

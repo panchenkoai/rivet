@@ -170,7 +170,7 @@ services:
   postgres-cdc:
     image: postgres:16
     profiles: ["cdc"]
-    command: ["-c", "wal_level=logical"]
+    command: ["-c", "wal_level=logical", "-c", "max_replication_slots=32"]
     environment:
       POSTGRES_USER: rivet
       POSTGRES_PASSWORD: rivet
