@@ -185,6 +185,78 @@ fn mssql_cdc_idle_first_run_then_change_is_captured_not_skipped() {
     );
 }
 
+// UPDATE and DELETE through the typed surface (the matrix pins INSERTs only):
+// an UPDATE's after-image must equal a batch export of the post-update state,
+// column type for column type; a DELETE's image must carry the typed PK.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_update_and_delete_carry_full_types() {
+    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("rivet_cdc_updel");
+    let ci = format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, amount DECIMAL(18,4), \
+         dt2 DATETIME2, u UNIQUEIDENTIFIER, vb VARBINARY(8), m MONEY, note NVARCHAR(50))"
+    ));
+    enable_cdc(&table, &ci);
+    let _guard = CdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+    let ckpt = d.path().join("cdc.ckpt");
+    mssql_cdc_exec(&format!(
+        "INSERT INTO dbo.{table} VALUES (1, 1.5, '2024-01-01', \
+         '12345678-1234-1234-1234-123456789012', 0xAA, 1.00, N'v1')"
+    ));
+    wait_for_capture(&ci, 1);
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out));
+
+    mssql_cdc_exec(&format!(
+        "UPDATE dbo.{table} SET amount=99999999999999.9999, \
+         dt2='2035-08-07T09:08:07.987654', u='FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF', \
+         vb=0xDEADBEEF, m=123.4567, note=N'üñíçødé v2' WHERE id=1"
+    ));
+    wait_for_capture(&ci, 3); // insert(1) + update before(2) + after(4) rows
+    let upd_out = d.path().join("upd");
+    let batch_out = d.path().join("batch");
+    std::fs::create_dir_all(&upd_out).unwrap();
+    std::fs::create_dir_all(&batch_out).unwrap();
+    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &upd_out));
+    run_cdc(&mssql_full_config(&d, &table, &batch_out));
+    let upd = read_one_batch(&upd_out);
+    assert_eq!(upd.num_rows(), 1, "exactly the update after-image");
+    let batch = read_one_batch(&batch_out);
+    for field in batch.schema().fields() {
+        let bi = batch.schema().index_of(field.name()).unwrap();
+        let ui = upd.schema().index_of(field.name()).unwrap();
+        assert_eq!(
+            batch.column(bi).to_data(),
+            upd.column(ui).to_data(),
+            "update after-image column {}: differs from post-update batch",
+            field.name()
+        );
+    }
+
+    mssql_cdc_exec(&format!("DELETE FROM dbo.{table} WHERE id=1"));
+    wait_for_capture(&ci, 4);
+    let del_out = d.path().join("del");
+    std::fs::create_dir_all(&del_out).unwrap();
+    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &del_out));
+    let del = read_one_batch(&del_out);
+    assert_eq!(del.num_rows(), 1);
+    use arrow::array::Int32Array;
+    let id = del
+        .column(del.schema().index_of("id").unwrap())
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("typed PK in the delete image");
+    assert_eq!(id.value(0), 1);
+}
+
 // `cdc.initial: snapshot` — anchor(max LSN) → snapshot → drain, enforced by
 // construction. Pre-rows must be captured by the Agent BEFORE run 1, so the
 // anchor covers them; a lagging capture job just widens the overlap (deduped

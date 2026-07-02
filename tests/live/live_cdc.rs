@@ -573,6 +573,301 @@ fn cdc_full_type_matrix_matches_batch() {
     assert_cdc_matches_batch(&cdc_out, &batch_out);
 }
 
+// UPDATE and DELETE through the typed surface — the matrix tests pin INSERT
+// after-images only; this pins that an UPDATE's after-image carries every
+// column type identically to a batch export of the post-update state, and a
+// DELETE's key-image carries the typed PK. "Same builder by construction" is
+// not a test; this is.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_update_and_delete_carry_full_types() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_updel_my");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {tbl} (id INT PRIMARY KEY, amount DECIMAL(18,4), dt DATETIME(6), \
+         tm TIME(6), en ENUM('a','b','c'), st SET('x','y','z'), vb VARBINARY(8), \
+         big BIGINT UNSIGNED, note TEXT)"
+    ))
+    .unwrap();
+    let _guard = Table(tbl.clone());
+
+    let out = d.path().join("out");
+    let batch_out = d.path().join("batch");
+    let ckpt = d.path().join("cdc.ckpt");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::create_dir_all(&batch_out).unwrap();
+    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out)); // pin
+    c.query_drop(format!(
+        "INSERT INTO {tbl} VALUES (1, 1.5000, '2024-01-01 00:00:00', '01:02:03', \
+         'a', 'x', 0xAA, 1, 'v1')"
+    ))
+    .unwrap();
+    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out));
+
+    // UPDATE every column; the after-image must equal a batch export of the
+    // post-update state, type for type, value for value.
+    c.query_drop(format!(
+        "UPDATE {tbl} SET amount=999999999999.9999, dt='2035-08-07 09:08:07.987654', \
+         tm='23:59:59.999999', en='c', st='x,y,z', vb=0xDEADBEEF, \
+         big=18446744073709551615, note='üñíçødé v2' WHERE id=1"
+    ))
+    .unwrap();
+    let upd_out = d.path().join("upd");
+    std::fs::create_dir_all(&upd_out).unwrap();
+    run_cdc(&cdc_config(&d, &tbl, &ckpt, &upd_out));
+    run_cdc(&full_config(&d, &tbl, &batch_out));
+    let upd = read_one_batch(&upd_out);
+    assert_eq!(upd.num_rows(), 1, "exactly the update event");
+    assert_eq!(parquet_one_string(&upd_out, "__op"), "update");
+    let batch = read_one_batch(&batch_out);
+    for field in batch.schema().fields() {
+        let bi = batch.schema().index_of(field.name()).unwrap();
+        let ci = upd.schema().index_of(field.name()).unwrap();
+        assert_eq!(
+            batch.column(bi).to_data(),
+            upd.column(ci).to_data(),
+            "update after-image column {}: differs from post-update batch",
+            field.name()
+        );
+    }
+
+    // DELETE: the key-image event carries the typed PK.
+    c.query_drop(format!("DELETE FROM {tbl} WHERE id=1"))
+        .unwrap();
+    let del_out = d.path().join("del");
+    std::fs::create_dir_all(&del_out).unwrap();
+    run_cdc(&cdc_config(&d, &tbl, &ckpt, &del_out));
+    let del = read_one_batch(&del_out);
+    assert_eq!(del.num_rows(), 1);
+    assert_eq!(parquet_one_string(&del_out, "__op"), "delete");
+    use arrow::array::Int32Array;
+    let id = del
+        .column(del.schema().index_of("id").unwrap())
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("typed PK in the delete image");
+    assert_eq!(id.value(0), 1);
+}
+
+// PostgreSQL flavour — arrays, interval, uuid and numeric included in the
+// updated surface (test_decoding emits the full after-image row).
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_update_and_delete_carry_full_types() {
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_updel_pg");
+    let slot = unique_name("rivet_updel_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (
+           id BIGINT PRIMARY KEY, amount NUMERIC(18,2), ts TIMESTAMPTZ, u UUID,
+           tags TEXT[], nums INTEGER[], iv INTERVAL, note TEXT)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+    c.batch_execute(&format!(
+        "INSERT INTO {tbl} VALUES (1, 1.50, '2024-01-01T00:00:00Z',
+           'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380011', ARRAY['a'], ARRAY[1],
+           INTERVAL '1 day', 'v1')"
+    ))
+    .unwrap();
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    run_cdc(&pg_cdc_config(&d, &tbl, &slot, &out));
+
+    c.batch_execute(&format!(
+        "UPDATE {tbl} SET amount=999999999999.99, ts='2035-08-07T09:08:07.987654Z',
+           u='ffffffff-ffff-ffff-ffff-ffffffffffff',
+           tags=ARRAY['with,comma', NULL], nums=ARRAY[7, NULL, 9],
+           iv=INTERVAL '1 year 2 mons 3 days', note='üñíçødé v2' WHERE id=1"
+    ))
+    .unwrap();
+    let upd_out = d.path().join("upd");
+    let batch_out = d.path().join("batch");
+    std::fs::create_dir_all(&upd_out).unwrap();
+    std::fs::create_dir_all(&batch_out).unwrap();
+    run_cdc(&pg_cdc_config(&d, &tbl, &slot, &upd_out));
+    let batch_yaml = format!(
+        r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
+exports:
+  - name: {tbl}_batch
+    table: {tbl}
+    mode: full
+    format: parquet
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        out = batch_out.display(),
+    );
+    run_cdc(&write_config(&d, &batch_yaml));
+    let upd = read_one_batch(&upd_out);
+    assert_eq!(upd.num_rows(), 1, "exactly the update event");
+    assert_eq!(parquet_one_string(&upd_out, "__op"), "update");
+    let batch = read_one_batch(&batch_out);
+    for field in batch.schema().fields() {
+        let bi = batch.schema().index_of(field.name()).unwrap();
+        let ci = upd.schema().index_of(field.name()).unwrap();
+        assert_eq!(
+            batch.column(bi).to_data(),
+            upd.column(ci).to_data(),
+            "update after-image column {}: differs from post-update batch",
+            field.name()
+        );
+    }
+
+    c.execute(&format!("DELETE FROM {tbl} WHERE id=1"), &[])
+        .unwrap();
+    let del_out = d.path().join("del");
+    std::fs::create_dir_all(&del_out).unwrap();
+    run_cdc(&pg_cdc_config(&d, &tbl, &slot, &del_out));
+    let del = read_one_batch(&del_out);
+    assert_eq!(del.num_rows(), 1);
+    assert_eq!(parquet_one_string(&del_out, "__op"), "delete");
+    use arrow::array::Int64Array;
+    let id = del
+        .column(del.schema().index_of("id").unwrap())
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("typed PK in the delete image");
+    assert_eq!(id.value(0), 1);
+}
+
+// Hostile values, PostgreSQL: ±Infinity/NaN FLOAT8 are representable and must
+// ride CDC ArrayData-equal to batch; 'NaN'::NUMERIC is NOT representable in a
+// Parquet decimal — the batch export fails LOUDLY on it
+// ("unsupported NaN/infinity payload"), and CDC must fail the same way, never
+// silently NULL the cell.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_hostile_floats_match_batch_and_nan_numeric_fails_loudly() {
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_hostile_pg");
+    let slot = unique_name("rivet_hostile_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (
+           id INT PRIMARY KEY, f8 FLOAT8, f4 REAL, n NUMERIC(18,2))"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+
+    // Leg 1: hostile FLOATS (representable) — full parity required.
+    c.batch_execute(&format!(
+        "INSERT INTO {tbl} VALUES
+           (1, 'Infinity', '-Infinity', 1.50),
+           (2, '-Infinity', 'NaN', NULL),
+           (3, 'NaN', 'Infinity', 0.01),
+           (4, NULL, NULL, NULL)"
+    ))
+    .unwrap();
+    let cdc_out = d.path().join("cdc");
+    let batch_out = d.path().join("batch");
+    std::fs::create_dir_all(&cdc_out).unwrap();
+    std::fs::create_dir_all(&batch_out).unwrap();
+    run_cdc(&pg_cdc_config(&d, &tbl, &slot, &cdc_out));
+    let batch_yaml = format!(
+        r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
+exports:
+  - name: {tbl}_batch
+    table: {tbl}
+    mode: full
+    format: parquet
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        out = batch_out.display(),
+    );
+    run_cdc(&write_config(&d, &batch_yaml));
+    assert_cdc_matches_batch(&cdc_out, &batch_out);
+
+    // Leg 2: 'NaN'::NUMERIC — the CDC run must FAIL, naming the payload.
+    c.execute(
+        &format!("INSERT INTO {tbl} VALUES (5, 1.0, 1.0, 'NaN')"),
+        &[],
+    )
+    .unwrap();
+    let out = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            pg_cdc_config(&d, &tbl, &slot, &cdc_out).to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        !out.status.success(),
+        "CDC must fail loudly on NaN::numeric, like batch — not NULL it silently"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unsupported decimal payload"),
+        "the failure must name the payload: {stderr}"
+    );
+}
+
+// Hostile values, MySQL: a zero-date ('0000-00-00 00:00:00', insertable with
+// sql_mode='') degrades to NULL on BOTH paths (no epoch equivalent exists —
+// pinned as parity, not silence), and a NUL byte embedded in a VARCHAR
+// survives both paths byte-for-byte.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_hostile_zero_date_and_nul_string_match_batch() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_hostile_my");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {tbl} (id INT PRIMARY KEY, dt DATETIME, s VARCHAR(20))"
+    ))
+    .unwrap();
+    let _guard = Table(tbl.clone());
+
+    let out = d.path().join("out");
+    let batch_out = d.path().join("batch");
+    let ckpt = d.path().join("cdc.ckpt");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::create_dir_all(&batch_out).unwrap();
+    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out)); // pin
+    c.query_drop("SET SESSION sql_mode=''").unwrap();
+    c.query_drop(format!(
+        "INSERT INTO {tbl} VALUES (1, '0000-00-00 00:00:00', CONCAT('a', CHAR(0), 'b')), \
+         (2, '2024-03-15 12:00:00', 'plain')"
+    ))
+    .unwrap();
+    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out));
+    run_cdc(&full_config(&d, &tbl, &batch_out));
+    assert_cdc_matches_batch(&out, &batch_out);
+
+    // And pin the zero-date outcome explicitly: NULL, not epoch garbage.
+    use arrow::array::{Array, TimestampMicrosecondArray};
+    let b = read_one_batch(&out);
+    let dt_idx = b.schema().index_of("dt").unwrap();
+    let dt = b
+        .column(dt_idx)
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .unwrap();
+    assert!(dt.is_null(0), "zero-date degrades to NULL (documented)");
+    assert!(!dt.is_null(1), "a real datetime stays");
+    // The NUL byte survives inside the string.
+    let s = parquet_one_string(&out, "s");
+    assert_eq!(s.as_bytes(), b"a\0b", "embedded NUL survives byte-for-byte");
+}
+
 // Table-qualified `columns:` overrides on a multi-table stream: the bare key
 // applies everywhere, `"table.column"` targets ONE table and wins over the
 // bare key there — the out-of-the-box answer to same-named columns needing

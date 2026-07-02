@@ -4,6 +4,22 @@
 
 ### Added
 
+- **The two-ended value check now runs on CDC — and covers four more types everywhere.** The always-on
+  value checksum (independent source-side fold vs a fold of the built Arrow column) existed only on the
+  batch path; the CDC sink now performs the same comparison per column BEFORE writing each part, naming
+  the column on mismatch. Coverage narrowed its declared skips on both paths: `Time64`, `FixedSizeBinary`
+  (UUID/`BINARY(n)`), `Decimal256`, and one-dimensional `List`s now participate (canonical per-cell list
+  encoding shared by both sides; a new accessor per engine, enforced at compile time). An offline matrix
+  guard pins the CDC fold to the builder across every covered type with hostile cells (overflow
+  narrowing, wrong-width binary, arrays with inner NULLs, NaN, u64::MAX, 50-digit decimals).
+- **CDC fails loudly on `'NaN'::numeric` — exactly like batch.** A non-null decimal cell that cannot be
+  represented in a Parquet decimal (PG NaN/±Infinity NUMERIC) previously became a silent NULL on the CDC
+  path while the batch export failed loudly; both now fail identically, naming the payload. Hostile-value
+  live tests pin the rest of the surface: ±Infinity/NaN floats ride ArrayData-equal to batch, MySQL
+  zero-dates degrade to NULL on both paths (documented parity), and NUL bytes embedded in strings survive
+  byte-for-byte. UPDATE after-images and DELETE key-images are now pinned against post-update batch
+  exports through the typed surface on all three engines
+  (`*_cdc_update_and_delete_carry_full_types`).
 - **`cdc.initial: snapshot` — anchor-then-snapshot-then-stream in one run.** The safe
   incremental→CDC switch used to be operator choreography (create the anchor first, then a final batch
   catch-up, then CDC — get the order wrong and there's a silent gap, demonstrated live). It is now a

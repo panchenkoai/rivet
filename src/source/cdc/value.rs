@@ -298,9 +298,21 @@ pub(crate) fn build_column(dt: &DataType, cells: &[Option<&RivetValue>]) -> Resu
             let mut b = Decimal128Builder::with_capacity(cells.len())
                 .with_data_type(DataType::Decimal128(*p, *s));
             for c in cells {
-                match c.and_then(|v| decimal_to_i128(v, *s)) {
-                    Some(i) => b.append_value(i),
+                match c {
                     None => b.append_null(),
+                    Some(v) => match decimal_to_i128(v, *s) {
+                        Some(i) => b.append_value(i),
+                        // A non-null cell that doesn't parse (PG 'NaN'::numeric,
+                        // ±Infinity, a non-finite money float) is unrepresentable
+                        // in a Parquet decimal — fail LOUD, exactly like the
+                        // batch export does, never a silent NULL.
+                        None => anyhow::bail!(
+                            "cdc: unsupported decimal payload {:?} (NaN/Infinity \
+                             is not representable in a decimal column; batch \
+                             fails identically)",
+                            render_str(v)
+                        ),
+                    },
                 }
             }
             Arc::new(b.finish())
@@ -310,9 +322,17 @@ pub(crate) fn build_column(dt: &DataType, cells: &[Option<&RivetValue>]) -> Resu
             let mut b = arrow::array::Decimal256Builder::with_capacity(cells.len())
                 .with_data_type(DataType::Decimal256(*p, *s));
             for c in cells {
-                match c.and_then(|v| decimal_to_i256(v, *s)) {
-                    Some(i) => b.append_value(i),
+                match c {
                     None => b.append_null(),
+                    Some(v) => match decimal_to_i256(v, *s) {
+                        Some(i) => b.append_value(i),
+                        None => anyhow::bail!(
+                            "cdc: unsupported decimal payload {:?} (NaN/Infinity \
+                             is not representable in a decimal column; batch \
+                             fails identically)",
+                            render_str(v)
+                        ),
+                    },
                 }
             }
             Arc::new(b.finish())
