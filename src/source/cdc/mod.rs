@@ -235,9 +235,22 @@ pub(crate) fn create_change_stream(cfg: &CdcConfig) -> Result<Box<dyn ChangeStre
             .context(MYSQL_CDC_HINT)?,
         ))
     } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        // A persisted checkpoint proves a prior run happened — if the slot is
+        // then MISSING, it was dropped/invalidated and silently recreating it
+        // at the current position would skip everything since (a silent gap).
+        let resume_expected = cfg
+            .checkpoint
+            .as_deref()
+            .and_then(|p| Position::load(p).ok().flatten())
+            .is_some();
         Ok(Box::new(
-            crate::source::postgres::cdc::PgChangeStream::open(url, &cfg.slot, tls)
-                .context(PG_CDC_HINT)?,
+            crate::source::postgres::cdc::PgChangeStream::open(
+                url,
+                &cfg.slot,
+                resume_expected,
+                tls,
+            )
+            .context(PG_CDC_HINT)?,
         ))
     } else if url.starts_with("sqlserver://") || url.starts_with("mssql://") {
         let ci = cfg.capture_instance.as_deref().ok_or_else(|| {

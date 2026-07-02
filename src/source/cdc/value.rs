@@ -392,6 +392,10 @@ pub(crate) enum MysqlCellFix {
     /// type's `enum('a','b',…)` declaration); index 0 is MySQL's invalid-value
     /// sentinel → empty string, matching the server's own rendering.
     EnumLabels(Vec<String>),
+    /// SET arrives as its BITMASK (little-endian raw bytes, one bit per member)
+    /// — render the set members comma-joined in declaration order, exactly as
+    /// the server's own text form ("x,z").
+    SetLabels(Vec<String>),
     /// BINARY(n): the driver right-trims trailing NULs — pad back to width n
     /// (the batch export carries the full padded value).
     BinaryPad(usize),
@@ -419,6 +423,9 @@ pub(crate) fn mysql_cell_fix(engine: &str, native: &str) -> Option<MysqlCellFix>
     }
     if n.starts_with("enum(") {
         return Some(MysqlCellFix::EnumLabels(parse_enum_labels(native)));
+    }
+    if n.starts_with("set(") {
+        return Some(MysqlCellFix::SetLabels(parse_enum_labels(native)));
     }
     if let Some(width) = n
         .strip_prefix("binary(")
@@ -498,6 +505,16 @@ impl MysqlCellFix {
                 .map_or(V::Null, V::Int),
             (MysqlCellFix::EnumLabels(labels), V::Int(i)) => enum_label(labels, *i),
             (MysqlCellFix::EnumLabels(labels), V::UInt(u)) => enum_label(labels, *u as i64),
+            (MysqlCellFix::SetLabels(labels), V::Bytes(b)) if b.len() <= 8 => {
+                // Little-endian storage: byte 0 carries members 1..=8.
+                let mask = b
+                    .iter()
+                    .enumerate()
+                    .fold(0u64, |acc, (i, x)| acc | ((*x as u64) << (8 * i)));
+                set_labels(labels, mask)
+            }
+            (MysqlCellFix::SetLabels(labels), V::Int(i)) => set_labels(labels, *i as u64),
+            (MysqlCellFix::SetLabels(labels), V::UInt(u)) => set_labels(labels, *u),
             (MysqlCellFix::BinaryPad(w), V::Bytes(b)) if b.len() < *w => {
                 let mut p = b.clone();
                 p.resize(*w, 0);
@@ -506,6 +523,17 @@ impl MysqlCellFix {
             (_, other) => other.clone(),
         }
     }
+}
+
+fn set_labels(labels: &[String], mask: u64) -> RivetValue {
+    let joined = labels
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| mask & (1 << i) != 0)
+        .map(|(_, l)| l.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    RivetValue::Bytes(joined.into_bytes())
 }
 
 fn enum_label(labels: &[String], idx: i64) -> RivetValue {
@@ -592,6 +620,12 @@ mod tests {
             fix("binary(4)").apply(&V::Bytes(Vec::new())),
             V::Bytes(vec![0, 0, 0, 0])
         );
+
+        // SET: bitmask (LE bytes) → comma-joined labels in declaration order,
+        // the server's own rendering ('x,z' for bits 0+2 = 0x05).
+        let st = fix("set('x','y','z')");
+        assert_eq!(st.apply(&V::Bytes(vec![0x05])), V::Bytes(b"x,z".to_vec()));
+        assert_eq!(st.apply(&V::UInt(0)), V::Bytes(Vec::new()));
 
         // NULL always stays NULL; other engines get no fix at all.
         assert_eq!(fix("year").apply(&V::Null), V::Null);

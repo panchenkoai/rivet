@@ -448,6 +448,13 @@ behaviour depends on whether rivet is **running**:
   which **releases** WAL and relieves the pressure) or drop the slot. If PostgreSQL
   is too degraded to answer, rivet's query fails → the run fails → re-read next run.
 
+**A vanished slot is a loud error, not a silent restart.** When a resume
+checkpoint exists but the slot is gone (dropped by an operator, or invalidated
+and removed), rivet refuses to re-create it — a fresh slot would anchor at the
+*current* position and silently skip everything since the drop. The run fails
+with the re-snapshot hint; delete the checkpoint file only when you explicitly
+accept a fresh anchor.
+
 **Bound the blast radius:** set `max_slot_wal_keep_size` (PG 13+). PostgreSQL then
 **invalidates the slot** rather than fill the disk; rivet's next run fails with a
 slot-invalidated error and you re-snapshot. **Monitor** `pg_replication_slots`

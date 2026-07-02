@@ -449,10 +449,16 @@ fn mssql_cdc_full_type_matrix_matches_batch() {
     let table = unique_name("rivet_cdc_matrix");
     let ci = format!("dbo_{table}");
     mssql_cdc_drop_table(&format!("dbo.{table}"));
+    // MONEY/SMALLMONEY are deliberately absent: the BATCH export currently
+    // nulls their values (typed decimal(19,4), value lost) — including them
+    // here would "pass" on NULL == NULL and mask the loss. Tracked as a batch
+    // finding; add them the day the batch decode carries the value.
     mssql_cdc_exec(&format!(
         "CREATE TABLE dbo.{table} (id INT PRIMARY KEY, big BIGINT, amount DECIMAL(18,4), \
          flag BIT, label VARCHAR(50), nlabel NVARCHAR(50), dt2 DATETIME2, dto DATETIMEOFFSET, \
-         d DATE, t TIME, u UNIQUEIDENTIFIER, vb VARBINARY(16))"
+         d DATE, t TIME, u UNIQUEIDENTIFIER, vb VARBINARY(16), \
+         ch CHAR(8), nch NCHAR(8), dt1 DATETIME, sdt SMALLDATETIME, \
+         fb BINARY(8), num NUMERIC(10,3))"
     ));
     enable_cdc(&table, &ci);
     let _guard = CdcTable {
@@ -463,9 +469,11 @@ fn mssql_cdc_full_type_matrix_matches_batch() {
     mssql_cdc_exec(&format!(
         "INSERT INTO dbo.{table} VALUES (1, 9000000000000, 12345.6789, 1, 'hello', \
          N'cafe-unicode', '2026-06-23 10:00:00.1234567', '2026-06-23 10:00:00 +05:30', \
-         '2026-06-23', '13:45:30.123456', '12345678-1234-1234-1234-123456789012', 0xDEADBEEF)"
+         '2026-06-23', '13:45:30.123456', '12345678-1234-1234-1234-123456789012', 0xDEADBEEF, \
+         'pad', N'ñpad', '2026-01-15T13:45:30.127', '2026-01-15T13:45:00', 0xAB, 12.345)"
     ));
-    wait_for_capture(&ci, 1);
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{table} (id) VALUES (2)"));
+    wait_for_capture(&ci, 2);
 
     let cdc_out = d.path().join("cdc");
     let batch_out = d.path().join("batch");

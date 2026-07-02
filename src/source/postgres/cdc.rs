@@ -42,7 +42,17 @@ pub(crate) struct PgChangeStream {
 impl PgChangeStream {
     /// Connect and ensure a `test_decoding` logical slot named `slot` exists
     /// (idempotent — reuses an existing slot, which is how a real run resumes).
-    pub(crate) fn open(conn_str: &str, slot: &str, tls: Option<&TlsConfig>) -> Result<Self> {
+    ///
+    /// `resume_expected` = a prior run's checkpoint exists. In that case a
+    /// MISSING slot is a loud error, never a silent re-create: the slot was
+    /// dropped or invalidated, and a fresh slot would anchor at the *current*
+    /// position — silently skipping every change since the drop.
+    pub(crate) fn open(
+        conn_str: &str,
+        slot: &str,
+        resume_expected: bool,
+        tls: Option<&TlsConfig>,
+    ) -> Result<Self> {
         // Same gate the batch path uses: refuse remote plaintext (CWE-319), and
         // use a verifying TLS connector when a TlsConfig is enforced.
         require_tls_or_loopback(conn_str, tls)?;
@@ -63,6 +73,14 @@ impl PgChangeStream {
             )?
             .get(0);
         if !exists {
+            if resume_expected {
+                anyhow::bail!(
+                    "pg cdc: slot '{slot}' is missing but a resume checkpoint exists — the slot \
+                     was dropped or invalidated, and the changes since then are no longer in the \
+                     log. Re-snapshot the table (mode: full) and restart CDC from a fresh \
+                     checkpoint (delete the checkpoint file to accept a new slot)."
+                );
+            }
             client.execute(
                 "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
                 &[&slot],
@@ -516,7 +534,7 @@ mod tests {
             .unwrap();
 
         // Slot must exist BEFORE the changes for them to be captured.
-        let mut s = PgChangeStream::open(CONN, SLOT, None).unwrap();
+        let mut s = PgChangeStream::open(CONN, SLOT, false, None).unwrap();
         admin
             .batch_execute(
                 "DROP TABLE IF EXISTS cdc_unit; CREATE TABLE cdc_unit (id INT PRIMARY KEY, v INT)",

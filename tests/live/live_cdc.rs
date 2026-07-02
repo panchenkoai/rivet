@@ -539,7 +539,11 @@ fn cdc_full_type_matrix_matches_batch() {
            raw_bytes BINARY(4), extras JSON, flag BOOLEAN, bit1_col BIT(1),
            bit8_col BIT(8), tiny_col TINYINT, date_col DATE, time_col TIME(6),
            year_col YEAR, enum_col ENUM('a','b','c'), varbinary_col VARBINARY(4),
-           blob_col BLOB) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+           blob_col BLOB,
+           small_col SMALLINT, med_col MEDIUMINT, int_col INT,
+           intu_col INT UNSIGNED, bigu_col BIGINT UNSIGNED,
+           f_col FLOAT, d_col DOUBLE, ch_col CHAR(8), txt_col TEXT,
+           set_col SET('x','y','z')) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
     ))
     .unwrap();
     let _guard = Table(tbl.clone());
@@ -551,9 +555,12 @@ fn cdc_full_type_matrix_matches_batch() {
            (1, 'üñíçødé', 999999999999.99, '2035-08-07 09:08:07.987654',
             '2035-08-07 09:08:07.987654', UNHEX('00000000'),
             JSON_OBJECT('tier','gold','n',1), TRUE, b'1', b'10101010', 127,
-            '2024-03-15', '14:30:00.123456', 2024, 'b', 0xDEADBEEF, 0x0102),
+            '2024-03-15', '14:30:00.123456', 2024, 'b', 0xDEADBEEF, 0x0102,
+            -32768, 8388607, -2147483648, 4294967295, 18446744073709551615,
+            1.5, -2.25, 'pad', 'long text', 'x,z'),
            (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-            NULL, NULL, NULL, NULL, NULL, NULL)"
+            NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+            NULL, NULL, NULL, NULL, NULL)"
     ))
     .unwrap();
 
@@ -590,7 +597,8 @@ fn pg_cdc_full_type_matrix_matches_batch() {
            created_at TIMESTAMP, created_at_tz TIMESTAMPTZ, raw_bytes BYTEA,
            uid UUID, attrs JSONB, flag BOOLEAN, int2_col SMALLINT,
            float8_col DOUBLE PRECISION, date_col DATE, time_col TIME,
-           interval_col INTERVAL, enum_col rivet_status)"
+           interval_col INTERVAL, enum_col rivet_status,
+           doc_col JSON, ch_col CHAR(8), vc_col VARCHAR(50), float4_col REAL)"
     ))
     .unwrap();
     let _tbl = PgTable::adopt(tbl.clone());
@@ -608,7 +616,8 @@ fn pg_cdc_full_type_matrix_matches_batch() {
             '2019-02-03 08:07:06.554433+05', '\\x00ff01'::bytea,
             'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380011', '{{\"n\":1}}'::jsonb, TRUE,
             32767, 2.5, '2024-03-15', '14:30:00.123456',
-            INTERVAL '1 year 2 mons 3 days', 'active');
+            INTERVAL '1 year 2 mons 3 days', 'active',
+            '{{\"k\": [1, 2]}}'::json, 'pad', 'plain varchar', 3.14);
          INSERT INTO {tbl} (id) VALUES (2);"
     ))
     .unwrap();
@@ -746,6 +755,203 @@ exports:
     run_cdc(&cfg);
     assert_eq!(manifest_rows(&out.join(&ta)), 0, "resume: no re-read");
     assert_eq!(manifest_rows(&out.join(&tb)), 0, "resume: no re-read");
+}
+
+// The cloud sub-prefix regression, end to end against a real GCS API
+// (fake-gcs): a multi-table CDC export must land each table under
+// `<prefix>/<table>/…` with '/'-separated object keys. The mangled flat keys
+// this pins against (`<prefix>/<table>cdc-….parquet`) shipped to a real bucket
+// first — the multi-table live tests only used local destinations.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc + fake-gcs"]
+fn cdc_multi_table_to_gcs_lands_per_table_prefixes() {
+    let d = tempfile::tempdir().unwrap();
+    let ta = unique_name("cdc_gcs_a");
+    let tb = unique_name("cdc_gcs_b");
+    let mut c = conn();
+    for t in [&ta, &tb] {
+        c.query_drop(format!("DROP TABLE IF EXISTS {t}")).unwrap();
+        c.query_drop(format!("CREATE TABLE {t} (id INT PRIMARY KEY, v INT)"))
+            .unwrap();
+    }
+    let (_g1, _g2) = (Table(ta.clone()), Table(tb.clone()));
+
+    let bucket = "rivet-qa-cdc-gcs";
+    ensure_gcs_bucket(bucket);
+    let prefix = unique_name("cdcgcs");
+    let ckpt = d.path().join("cdc.ckpt");
+    let yaml = format!(
+        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
+exports:
+  - name: app_cdc
+    tables: [{ta}, {tb}]
+    mode: cdc
+    format: parquet
+    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
+    destination:
+      type: gcs
+      bucket: {bucket}
+      prefix: {prefix}
+      endpoint: {FAKE_GCS_ENDPOINT}
+      allow_anonymous: true
+"#,
+        ckpt = ckpt.display(),
+        sid = server_id_for(&ta),
+    );
+    let cfg = write_config(&d, &yaml);
+
+    run_cdc(&cfg); // pin
+    c.query_drop(format!("INSERT INTO {ta} VALUES (1,10),(2,20)"))
+        .unwrap();
+    c.query_drop(format!("INSERT INTO {tb} VALUES (7,70)"))
+        .unwrap();
+    run_cdc(&cfg); // capture → upload
+
+    // List the object keys under the prefix via the GCS JSON API.
+    let body = reqwest::blocking::get(format!(
+        "{FAKE_GCS_ENDPOINT}/storage/v1/b/{bucket}/o?prefix={prefix}"
+    ))
+    .expect("gcs list request")
+    .text()
+    .expect("gcs list body");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("gcs list json");
+    let keys: Vec<&str> = json["items"]
+        .as_array()
+        .map(|items| items.iter().filter_map(|o| o["name"].as_str()).collect())
+        .unwrap_or_default();
+
+    for t in [&ta, &tb] {
+        assert!(
+            keys.iter()
+                .any(|k| *k == format!("{prefix}/{t}/manifest.json")),
+            "per-table manifest key missing for {t}; keys: {keys:?}"
+        );
+        assert!(
+            keys.iter().any(|k| *k == format!("{prefix}/{t}/_SUCCESS")),
+            "per-table _SUCCESS key missing for {t}; keys: {keys:?}"
+        );
+        assert!(
+            keys.iter()
+                .any(|k| k.starts_with(&format!("{prefix}/{t}/cdc-")) && k.ends_with(".parquet")),
+            "per-table part key missing for {t}; keys: {keys:?}"
+        );
+        assert!(
+            !keys.iter().any(|k| k.contains(&format!("{t}cdc-"))
+                || k.contains(&format!("{t}manifest"))
+                || k.contains(&format!("{t}_SUCCESS"))),
+            "mangled flat key (missing '/') detected for {t}; keys: {keys:?}"
+        );
+    }
+}
+
+// Retention, MySQL flavour: a checkpoint whose binlog file the server no longer
+// has (purged — or, as forged here, simply nonexistent) must fail the run
+// LOUDLY, never fall back to "start from current" and silently skip the gap.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_resume_from_missing_binlog_fails_loudly_not_silently() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_1236");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let _guard = Table(tbl.clone());
+
+    // A checkpoint pointing at a binlog file the server does not have — the
+    // exact shape a purged-past-retention resume presents.
+    let ckpt = d.path().join("cdc.ckpt");
+    std::fs::write(&ckpt, r#"{"file":"binlog.999999","pos":4}"#).unwrap();
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1, 10)"))
+        .unwrap();
+
+    let out_dir = d.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let cfg = cdc_config(&d, &tbl, &ckpt, &out_dir);
+    let out = std::process::Command::new(RIVET_BIN)
+        .args(["run", "--config", cfg.to_str().unwrap()])
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        !out.status.success(),
+        "resuming from a purged/missing binlog must FAIL, not silently re-anchor"
+    );
+    assert!(
+        !out_dir.join("_SUCCESS").exists(),
+        "no _SUCCESS may be written for the failed run"
+    );
+}
+
+// Retention, PostgreSQL flavour (RED for the finding): a prior run's checkpoint
+// exists but the slot is GONE (dropped by an operator / invalidated and removed)
+// — recreating it at the current position would silently skip every change
+// since the drop. The run must fail loudly and demand a re-snapshot.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_vanished_slot_with_checkpoint_fails_loudly_not_recreates() {
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_cdc_gone");
+    let slot = unique_name("rivet_gone_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+
+    // Run 1 (with a checkpoint configured): creates the slot, captures one
+    // change, persists the checkpoint.
+    let out1 = d.path().join("out1");
+    std::fs::create_dir_all(&out1).unwrap();
+    let ckpt = d.path().join("cdc.ckpt");
+    let yaml = |out: &std::path::Path| {
+        format!(
+            r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
+exports:
+  - name: {tbl}
+    table: {tbl}
+    mode: cdc
+    format: parquet
+    cdc: {{ slot: {slot}, until_current: true, checkpoint: "{ckpt}" }}
+    destination: {{ type: local, path: "{out}" }}
+"#,
+            ckpt = ckpt.display(),
+            out = out.display(),
+        )
+    };
+    run_cdc(&write_config(&d, &yaml(&out1)));
+    c.execute(&format!("INSERT INTO {tbl} VALUES (1,10)"), &[])
+        .unwrap();
+    let out2 = d.path().join("out2");
+    std::fs::create_dir_all(&out2).unwrap();
+    run_cdc(&write_config(&d, &yaml(&out2)));
+    assert_eq!(manifest_rows(&out2), 1, "run 2 captured the change");
+    assert!(ckpt.exists(), "checkpoint persisted");
+
+    // The slot vanishes behind rivet's back; a change lands after.
+    c.execute("SELECT pg_drop_replication_slot($1)", &[&slot])
+        .unwrap();
+    c.execute(&format!("INSERT INTO {tbl} VALUES (2,20)"), &[])
+        .unwrap();
+
+    // Run 3 must FAIL loudly — recreating the slot would silently skip id=2.
+    let out3 = d.path().join("out3");
+    std::fs::create_dir_all(&out3).unwrap();
+    let cfg3 = write_config(&d, &yaml(&out3));
+    let out = std::process::Command::new(RIVET_BIN)
+        .args(["run", "--config", cfg3.to_str().unwrap()])
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        !out.status.success(),
+        "a vanished slot with an existing checkpoint must fail the run, not silently re-create"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("re-snapshot") || stderr.contains("missing"),
+        "the failure must carry the re-snapshot hint, got:\n{stderr}"
+    );
 }
 
 // `rivet doctor` CDC health: the slot / abandoned-slot probes automate the

@@ -40,6 +40,29 @@
 
 ### Fixed
 
+- **MySQL CDC: `SET` columns decode their binlog bitmask to the member labels.** The binlog delivers a
+  SET as raw little-endian bitmask bytes; the sink rendered them as lossy text. The bitmask now maps to
+  the comma-joined members in declaration order (`'x,z'`), exactly the server's own rendering — labels
+  come from the same `information_schema.COLUMN_TYPE` enrichment ENUM uses.
+- **PostgreSQL CDC: a vanished slot with an existing checkpoint fails loudly.** `open()` used to
+  re-create a missing slot unconditionally — correct on the first run, but on a *resume* (checkpoint
+  present) a fresh slot anchors at the current position and silently skips everything since the drop.
+  Now: loud error + re-snapshot hint; deleting the checkpoint file is the explicit opt-in to a fresh
+  anchor. Companion MySQL pin: resuming from a missing/purged binlog file fails the run (no `_SUCCESS`),
+  never falls back to "start from current".
+  Regressions (live): `pg_cdc_vanished_slot_with_checkpoint_fails_loudly_not_recreates`,
+  `cdc_resume_from_missing_binlog_fails_loudly_not_silently`.
+- **CDC type matrices extended to the full contracted surface** — MySQL adds
+  smallint/mediumint/int/int-unsigned/**bigint-unsigned (max value, → `Decimal(20,0)`)**/float/double/
+  char/text/**SET**; PostgreSQL adds json (non-jsonb)/bpchar/varchar/real; SQL Server adds
+  char/nchar/**datetime v1 (3.33 ms units)**/smalldatetime/**binary(n)**/numeric — all byte-identical to
+  batch. `MONEY`/`SMALLMONEY` are deliberately excluded: the **batch** export currently nulls their
+  values (typed `decimal(19,4)`, value lost) — including them would "pass" on NULL == NULL and mask the
+  loss; tracked as an open batch finding.
+- **Multi-table CDC to cloud destinations pinned end-to-end** against a real GCS API (fake-gcs):
+  per-table `<prefix>/<table>/` keys for parts + `manifest.json` + `_SUCCESS`, and an explicit assert
+  that the mangled flat-key shape can never return
+  (`cdc_multi_table_to_gcs_lands_per_table_prefixes`).
 - **CDC all-types parity audit: eight per-column silent losses fixed, and the audit pinned as live
   tests.** One wide table per engine (the union of the official type matrices) exported both ways —
   batch and CDC — must produce byte-identical Arrow columns (`ArrayData` equality); SQL Server already
