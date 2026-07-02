@@ -487,6 +487,73 @@ fn pg_cdc_resume_captures_only_new_changes() {
     );
 }
 
+// `rivet doctor` CDC health: the slot / abandoned-slot probes automate the
+// monitoring docs/reference/cdc.md asks operators to do by hand. The foreign
+// inactive slot here re-enacts a real incident: an abandoned ingestr slot was
+// found pinning WAL on this project's own dev instance.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn doctor_reports_cdc_slot_health_and_flags_foreign_inactive_slots() {
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_cdc_doc");
+    let own_slot = unique_name("rivet_doc_slot");
+    let foreign_slot = unique_name("abandoned_tool_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+    // A foreign, inactive slot — some other tool created it and walked away.
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&foreign_slot],
+    )
+    .unwrap();
+    let _foreign = Slot(foreign_slot.clone());
+
+    let out_dir = d.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let cfg = pg_cdc_config(&d, &tbl, &own_slot, &out_dir);
+    let out = std::process::Command::new(RIVET_BIN)
+        .args(["doctor", "--config", cfg.to_str().unwrap(), "--json"])
+        .output()
+        .expect("spawn rivet doctor");
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("doctor --json output");
+    let checks = report["checks"].as_array().expect("checks array");
+
+    // The export's own slot: absent → healthy "created on the first run".
+    let own = checks
+        .iter()
+        .find(|c| c["name"].as_str().unwrap_or("").contains(&own_slot))
+        .expect("own-slot check present");
+    assert_eq!(own["ok"], true, "absent slot is healthy: {own}");
+
+    // The abandoned foreign slot is surfaced by name (small → note, not FAIL).
+    let foreign = checks
+        .iter()
+        .find(|c| {
+            c["name"]
+                .as_str()
+                .unwrap_or("")
+                .contains("other inactive slots")
+        })
+        .expect("foreign-slots check present");
+    assert!(
+        foreign["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains(&foreign_slot),
+        "the abandoned slot must be named: {foreign}"
+    );
+    assert_eq!(
+        report["all_ok"], true,
+        "small foreign slot must not fail doctor"
+    );
+}
+
 // Idle-first-run anchor model (per-engine, see CLAUDE.md): PostgreSQL pins the
 // resume position server-side the moment the slot is created — so a first run
 // that drains ZERO changes still anchors, and a change landing between two idle

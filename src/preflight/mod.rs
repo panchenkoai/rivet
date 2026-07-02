@@ -1,4 +1,5 @@
 mod analysis;
+mod cdc_health;
 pub(crate) mod cursor_expr;
 mod doctor;
 mod mssql;

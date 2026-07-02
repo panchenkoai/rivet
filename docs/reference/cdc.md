@@ -392,6 +392,15 @@ behaviour depends on whether rivet is **running**:
 slot-invalidated error and you re-snapshot. **Monitor** `pg_replication_slots`
 (`active`, and `restart_lsn` vs the current LSN = how much WAL the slot is holding).
 
+> **`rivet doctor` automates this monitoring.** For a config with `mode: cdc`
+> exports, doctor probes the engine: PostgreSQL — the export's slot (retained
+> WAL, fails above 1 GiB) **and any other inactive slot pinning WAL** (the
+> abandoned-slot foot-gun); MySQL — `log_bin`/`binlog_format=ROW`/
+> `binlog_row_image=FULL`, and whether the checkpoint's binlog file is still
+> retained (a purged file is reported *before* the run fails with ERROR 1236);
+> SQL Server — CDC enabled, the capture instance exists, the checkpoint is
+> within retention, and the Agent service is running.
+
 ### MySQL — the binlog was purged
 
 If rivet is offline long enough that the saved binlog position is **purged**

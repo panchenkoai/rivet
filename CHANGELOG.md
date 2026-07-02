@@ -4,6 +4,18 @@
 
 ### Added
 
+- **`rivet doctor` CDC health probes.** For configs with `mode: cdc` exports, doctor now automates the
+  monitoring the CDC reference asks operators to do by hand: PostgreSQL — the export's slot (exists /
+  active / retained WAL, failing above 1 GiB) plus **other inactive slots pinning WAL** (the
+  abandoned-slot foot-gun, reported by name); MySQL — binlog server config (`log_bin`,
+  `binlog_format=ROW`, `binlog_row_image=FULL`), checkpoint-vs-retention (`SHOW BINARY LOGS` — a purged
+  binlog file is reported *before* the next run fails with ERROR 1236) and backlog size, failing a
+  config-driven cdc export with **no** checkpoint (changes between runs would be skipped); SQL Server —
+  CDC enabled on the database, capture instance exists, checkpoint within `fn_cdc_get_min_lsn`
+  retention, Agent service running (permission-gated: without `VIEW SERVER STATE` it reports "could not
+  verify" rather than guessing). Doctor's text mode now prints an OK check's detail inline
+  (`[OK] name — detail`); pre-existing OK checks carried no detail, so their lines are unchanged.
+
 - **CDC resource-conflict validation** (`RIVET_CONFIG_CDC_RESOURCE_CONFLICT`). Two `mode: cdc` exports
   resolving to the same PostgreSQL slot, MySQL `server_id`, or checkpoint path are now rejected at config
   load — **including the defaults colliding** (`rivet_slot` / `4271`), which is what a naive multi-table
