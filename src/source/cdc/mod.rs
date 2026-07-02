@@ -310,15 +310,22 @@ pub(crate) fn resolve_cdc_columns(
     )
 }
 
-/// Everything needed to capture a change stream to typed files, assembled once —
-/// the source/output differ between the `rivet cdc` CLI and a `mode: cdc` run, but
-/// the capture itself (open the stream, resolve the schema, drive the file sink)
-/// is identical. Both entry points fill this in and call [`run_capture`].
-pub(crate) struct CdcCapture<'a> {
-    pub cdc_cfg: CdcConfig,
+/// One table's destination wiring for a capture — see [`CdcCapture::outputs`].
+pub(crate) struct CaptureOutput<'a> {
     pub table: String,
     pub dest: &'a dyn crate::destination::Destination,
     pub dest_uri: String,
+}
+
+/// Everything needed to capture a change stream to typed files, assembled once —
+/// the source/output differ between the `rivet cdc` CLI and a `mode: cdc` run, but
+/// the capture itself (open the stream, resolve the schemas, drive the file sink)
+/// is identical. Both entry points fill this in and call [`run_capture`].
+/// `outputs` carries one entry per captured table: several tables ride ONE stream
+/// (one slot / one binlog connection) and one checkpoint.
+pub(crate) struct CdcCapture<'a> {
+    pub cdc_cfg: CdcConfig,
+    pub outputs: Vec<CaptureOutput<'a>>,
     pub format: crate::config::FormatType,
     pub max_events: Option<usize>,
     pub rollover: usize,
@@ -328,24 +335,30 @@ pub(crate) struct CdcCapture<'a> {
     pub started_at: String,
 }
 
-/// Open the change stream (with the engine's permission/TLS gate), resolve the
+/// Open the change stream (with the engine's permission/TLS gate), resolve each
 /// table's typed schema, and drive the commit-seam file sink — the single place
-/// the typed CDC capture is assembled. Returns the run's `RunManifest`.
-pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<crate::manifest::RunManifest> {
+/// the typed CDC capture is assembled. Returns one `RunManifest` per output, in
+/// `outputs` order.
+pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<Vec<crate::manifest::RunManifest>> {
     let url = cap.cdc_cfg.url.clone();
     let tls = cap.cdc_cfg.tls.clone();
     let checkpoint = cap.cdc_cfg.checkpoint.clone();
     let mut stream = create_change_stream(&cap.cdc_cfg)?;
-    let columns = resolve_cdc_columns(&url, &cap.table, tls.as_ref())?;
     let engine = engine_label(&url)?;
+    let mut outputs = Vec::with_capacity(cap.outputs.len());
+    for o in cap.outputs {
+        let columns = resolve_cdc_columns(&url, &o.table, tls.as_ref())?;
+        outputs.push(sink::TableOutput {
+            table: o.table,
+            columns,
+            dest: o.dest,
+            dest_uri: o.dest_uri,
+        });
+    }
     let sink_cfg = sink::SinkConfig {
-        columns: &columns,
-        dest: cap.dest,
-        dest_uri: cap.dest_uri,
+        outputs,
         engine,
-        table: &cap.table,
         format: cap.format,
-        tables: vec![cap.table.clone()],
         checkpoint,
         max_events: cap.max_events,
         rollover: cap.rollover,

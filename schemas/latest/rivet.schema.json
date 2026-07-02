@@ -405,6 +405,17 @@
           ],
           "default": null
         },
+        "tables": {
+          "description": "CDC only: capture **several** tables through ONE change stream (one\nPostgreSQL slot / one MySQL binlog connection) instead of one export —\nand one slot — per table. Each table's parts land under\n`<destination>/<table>/` with their own `manifest.json` + `_SUCCESS`;\nthe checkpoint (stream position) is shared. Mutually exclusive with\n`table:`. Not yet supported for SQL Server (capture instances are\nper-table).",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "default": null
+        },
         "mode": {
           "$ref": "#/$defs/ExportMode"
         },

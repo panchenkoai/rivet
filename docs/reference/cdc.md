@@ -102,12 +102,30 @@ exports:
     ...
 ```
 
-Note the cost model: N tables = N slots (PostgreSQL decodes the WAL once **per
-slot**) / N binlog connections (MySQL). For a handful of tables that is fine;
-for hundreds, wait for slot multiplexing (one stream fanning out to per-table
-outputs) rather than creating hundreds of slots. SQL Server is the exception —
-`capture_instance` sharing is safe (the change-table poll is read-only; resume
-state lives in the per-export checkpoint). Each run produces the standard
+**Or multiplex: several tables through ONE stream (`tables:`).** N single-table
+exports cost N slots — and PostgreSQL decodes the WAL once **per slot** (MySQL:
+N binlog connections). One export with `tables:` rides a single slot/connection
+and a single checkpoint, and routes each table's changes to its own sub-prefix
+(`<destination>/<table>/`, each with its own parts + `manifest.json` +
+`_SUCCESS` — exactly like N exports, minus the N−1 slots):
+
+```yaml
+exports:
+  - name: app_cdc
+    tables: [orders, users, payments]
+    mode: cdc
+    format: parquet
+    cdc: { slot: rivet_app, checkpoint: /var/lib/rivet/app.ckpt, until_current: true }
+    destination: { type: local, path: /data/cdc }   # → /data/cdc/orders/, /data/cdc/users/, …
+```
+
+The resume position is a property of the *stream*, so the at-least-once
+sequence generalises: every table's buffered part is flushed **before** the one
+checkpoint/ack advances — a crash mid-roll re-reads for all tables rather than
+losing any one of them. `tables:` is PostgreSQL/MySQL only for now — SQL Server
+capture instances are per-table (use one export per table there; sharing a
+`capture_instance` between exports is safe, since the change-table poll is
+read-only and resume state lives in the per-export checkpoint). Each run produces the standard
 per-export summary block and an `export_metrics` row (rows / files / bytes /
 duration / status), so CDC shows up in `rivet metrics` and the run aggregate
 exactly like a batch export. **TLS:** unlike the CLI (which is loopback-only),

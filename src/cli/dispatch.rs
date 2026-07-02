@@ -288,9 +288,11 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     crate::source::cdc::run_capture(crate::source::cdc::CdcCapture {
         cdc_cfg,
-        table: tbl,
-        dest: dest.as_ref(),
-        dest_uri: dir,
+        outputs: vec![crate::source::cdc::CaptureOutput {
+            table: tbl,
+            dest: dest.as_ref(),
+            dest_uri: dir,
+        }],
         format: fmt,
         max_events: a.max_events,
         rollover: a.rollover,

@@ -69,6 +69,15 @@ pub struct ExportConfig {
     /// Mutually exclusive with `query` and `query_file`.
     #[serde(default)]
     pub table: Option<String>,
+    /// CDC only: capture **several** tables through ONE change stream (one
+    /// PostgreSQL slot / one MySQL binlog connection) instead of one export —
+    /// and one slot — per table. Each table's parts land under
+    /// `<destination>/<table>/` with their own `manifest.json` + `_SUCCESS`;
+    /// the checkpoint (stream position) is shared. Mutually exclusive with
+    /// `table:`. Not yet supported for SQL Server (capture instances are
+    /// per-table).
+    #[serde(default)]
+    pub tables: Option<Vec<String>>,
     #[serde(default = "default_mode")]
     pub mode: ExportMode,
     /// Change-data-capture settings, required when `mode: cdc`. Reuses the
@@ -547,6 +556,7 @@ pub(crate) fn sample_export(name: &str) -> ExportConfig {
         query: Some("SELECT 1".into()),
         query_file: None,
         table: None,
+        tables: None,
         mode: ExportMode::Full,
         cdc: None,
         cursor_column: None,

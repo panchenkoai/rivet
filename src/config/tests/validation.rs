@@ -547,3 +547,99 @@ fn mysql_cdc_exports_with_distinct_server_ids_validate_fine() {
     );
     Config::from_yaml(&yaml).expect("distinct server_ids must validate");
 }
+
+// ── CDC multi-table `tables:` shape ───────────────────────────────────────────
+
+#[test]
+fn cdc_table_and_tables_are_mutually_exclusive() {
+    let yaml = r#"
+source: { type: postgres, url: "postgresql://localhost/test" }
+exports:
+  - name: app_cdc
+    table: orders
+    tables: [orders, users]
+    mode: cdc
+    format: parquet
+    cdc: { slot: s1 }
+    destination: { type: local, path: ./out }
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(msg.contains("mutually exclusive"), "{msg}");
+}
+
+#[test]
+fn cdc_tables_must_be_nonempty_and_unique() {
+    let empty = r#"
+source: { type: postgres, url: "postgresql://localhost/test" }
+exports:
+  - name: app_cdc
+    tables: []
+    mode: cdc
+    format: parquet
+    destination: { type: local, path: ./out }
+"#;
+    let msg = format!("{:#}", Config::from_yaml(empty).unwrap_err());
+    assert!(msg.contains("at least one table"), "{msg}");
+
+    let dup = r#"
+source: { type: postgres, url: "postgresql://localhost/test" }
+exports:
+  - name: app_cdc
+    tables: [orders, orders]
+    mode: cdc
+    format: parquet
+    destination: { type: local, path: ./out }
+"#;
+    let msg = format!("{:#}", Config::from_yaml(dup).unwrap_err());
+    assert!(msg.contains("duplicate table"), "{msg}");
+}
+
+#[test]
+fn cdc_tables_on_mssql_is_rejected_for_now() {
+    let yaml = r#"
+source: { type: mssql, url: "sqlserver://sa:x@localhost:1434/rivet" }
+exports:
+  - name: app_cdc
+    tables: [orders, users]
+    mode: cdc
+    format: parquet
+    destination: { type: local, path: ./out }
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(msg.contains("not yet supported for SQL Server"), "{msg}");
+}
+
+#[test]
+fn cdc_tables_multi_table_stream_validates_on_postgres_and_mysql() {
+    for source in ["postgres", "mysql"] {
+        let yaml = format!(
+            r#"
+source: {{ type: {source}, url: "{source}://localhost/test" }}
+exports:
+  - name: app_cdc
+    tables: [orders, users]
+    mode: cdc
+    format: parquet
+    cdc: {{ slot: s1, server_id: 5000, checkpoint: /tmp/app.ckpt }}
+    destination: {{ type: local, path: ./out }}
+"#
+        );
+        Config::from_yaml(&yaml)
+            .unwrap_or_else(|e| panic!("{source} multi-table cdc must validate: {e:#}"));
+    }
+}
+
+#[test]
+fn tables_outside_cdc_mode_is_rejected() {
+    let yaml = r#"
+source: { type: postgres, url: "postgresql://localhost/test" }
+exports:
+  - name: orders
+    tables: [orders, users]
+    mode: full
+    format: parquet
+    destination: { type: local, path: ./out }
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(msg.contains("only valid with `mode: cdc`"), "{msg}");
+}

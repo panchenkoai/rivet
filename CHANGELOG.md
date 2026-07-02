@@ -4,6 +4,17 @@
 
 ### Added
 
+- **CDC slot multiplexing: `tables:` — several tables through ONE stream.** A `mode: cdc` export can now
+  list `tables: [orders, users, …]` and capture them all through a single PostgreSQL slot / MySQL binlog
+  connection with a single checkpoint, instead of one export (and one slot — PostgreSQL decodes the WAL
+  once *per slot*) per table. Each table's changes land under `<destination>/<table>/` with their own
+  parts + `manifest.json` + `_SUCCESS`. The at-least-once sequence generalises: every table's buffered
+  part is flushed **before** the one checkpoint/ack advances (the position is a property of the stream),
+  so a crash mid-roll re-reads for all tables rather than losing any one of them; a part only ever rolls
+  at a commit boundary, and a trailing half-transaction is flushed but never acked past. Mutually
+  exclusive with `table:`; PostgreSQL/MySQL only (SQL Server capture instances are per-table). Verified
+  live on both engines: one slot/connection serving two tables, per-table routing, and a clean resume.
+
 - **`rivet doctor` CDC health probes.** For configs with `mode: cdc` exports, doctor now automates the
   monitoring the CDC reference asks operators to do by hand: PostgreSQL — the export's slot (exists /
   active / retained WAL, failing above 1 GiB) plus **other inactive slots pinning WAL** (the

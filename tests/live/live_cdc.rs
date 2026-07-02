@@ -487,6 +487,121 @@ fn pg_cdc_resume_captures_only_new_changes() {
     );
 }
 
+// Slot multiplexing: several tables through ONE PostgreSQL slot (`tables:`),
+// each landing under its own sub-prefix with its own manifest — and the shared
+// position still resumes correctly (second run captures nothing twice).
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_multi_table_stream_uses_one_slot_and_resumes() {
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let t1 = unique_name("rivet_cdc_ma");
+    let t2 = unique_name("rivet_cdc_mb");
+    let slot = unique_name("rivet_multi_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    for t in [&t1, &t2] {
+        c.batch_execute(&format!(
+            "DROP TABLE IF EXISTS {t}; CREATE TABLE {t} (id INT PRIMARY KEY, v INT)"
+        ))
+        .unwrap();
+    }
+    let (_g1, _g2) = (PgTable::adopt(t1.clone()), PgTable::adopt(t2.clone()));
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let yaml = format!(
+        r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
+exports:
+  - name: app_cdc
+    tables: [{t1}, {t2}]
+    mode: cdc
+    format: parquet
+    cdc: {{ slot: {slot}, until_current: true }}
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        out = out.display(),
+    );
+    let cfg = write_config(&d, &yaml);
+
+    // Run 1 creates the ONE slot and drains nothing.
+    run_cdc(&cfg);
+    let _slot = Slot(slot.clone());
+    let n: i64 = c
+        .query_one(
+            "SELECT count(*)::bigint FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(n, 1, "two tables ride ONE slot");
+
+    // Changes in both tables → one run captures both, routed per table.
+    c.execute(&format!("INSERT INTO {t1} VALUES (1,10),(2,20)"), &[])
+        .unwrap();
+    c.execute(&format!("INSERT INTO {t2} VALUES (7,70)"), &[])
+        .unwrap();
+    run_cdc(&cfg);
+    assert_eq!(manifest_rows(&out.join(&t1)), 2, "table 1 sub-prefix");
+    assert_eq!(manifest_rows(&out.join(&t2)), 1, "table 2 sub-prefix");
+
+    // Resume: the shared position advanced once for both tables.
+    run_cdc(&cfg);
+    assert_eq!(manifest_rows(&out.join(&t1)), 0, "no re-read for table 1");
+    assert_eq!(manifest_rows(&out.join(&t2)), 0, "no re-read for table 2");
+}
+
+// MySQL flavour of the multi-table stream: one binlog connection + one
+// checkpoint for both tables, idle-first-run pin included.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_multi_table_stream_one_binlog_connection_and_resumes() {
+    let d = tempfile::tempdir().unwrap();
+    let ta = unique_name("cdc_multi_a");
+    let tb = unique_name("cdc_multi_b");
+    let mut c = conn();
+    for t in [&ta, &tb] {
+        c.query_drop(format!("DROP TABLE IF EXISTS {t}")).unwrap();
+        c.query_drop(format!("CREATE TABLE {t} (id INT PRIMARY KEY, v INT)"))
+            .unwrap();
+    }
+    let (_g1, _g2) = (Table(ta.clone()), Table(tb.clone()));
+
+    let out = d.path().join("out");
+    let ckpt = d.path().join("cdc.ckpt");
+    std::fs::create_dir_all(&out).unwrap();
+    let yaml = format!(
+        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
+exports:
+  - name: app_cdc
+    tables: [{ta}, {tb}]
+    mode: cdc
+    format: parquet
+    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        ckpt = ckpt.display(),
+        out = out.display(),
+        sid = server_id_for(&ta),
+    );
+    let cfg = write_config(&d, &yaml);
+
+    // Run 1: pins the checkpoint (idle-first-run) with zero captures.
+    run_cdc(&cfg);
+    assert!(ckpt.exists(), "idle first run pins the shared checkpoint");
+
+    c.query_drop(format!("INSERT INTO {ta} VALUES (1,10),(2,20)"))
+        .unwrap();
+    c.query_drop(format!("INSERT INTO {tb} VALUES (7,70)"))
+        .unwrap();
+    run_cdc(&cfg);
+    assert_eq!(manifest_rows(&out.join(&ta)), 2);
+    assert_eq!(manifest_rows(&out.join(&tb)), 1);
+
+    run_cdc(&cfg);
+    assert_eq!(manifest_rows(&out.join(&ta)), 0, "resume: no re-read");
+    assert_eq!(manifest_rows(&out.join(&tb)), 0, "resume: no re-read");
+}
+
 // `rivet doctor` CDC health: the slot / abandoned-slot probes automate the
 // monitoring docs/reference/cdc.md asks operators to do by hand. The foreign
 // inactive slot here re-enacts a real incident: an abandoned ingestr slot was

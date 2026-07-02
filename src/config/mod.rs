@@ -594,10 +594,23 @@ impl Config {
             );
         }
 
+        // Before the generic exactly-one counting: the `table:`/`tables:` pair
+        // gets its specific message (the generic one doesn't mention `tables`).
+        if export.table.is_some() && export.tables.is_some() {
+            anyhow::bail!(
+                "export '{}': `table:` and `tables:` are mutually exclusive — use \
+                 `tables: [a, b]` for a multi-table stream",
+                export.name
+            );
+        }
+
         let set_count = [
             export.query.is_some(),
             export.query_file.is_some(),
             export.table.is_some(),
+            // A multi-table CDC stream (`tables:`) is that export's source
+            // specification — the CDC arm below owns its shape rules.
+            export.tables.is_some(),
         ]
         .iter()
         .filter(|b| **b)
@@ -904,11 +917,44 @@ impl Config {
             }
             ExportMode::Full => {}
             ExportMode::Cdc => {
-                if export.table.is_none() {
-                    anyhow::bail!(
-                        "export '{}': cdc mode requires `table:` (the source table to capture)",
+                match (&export.table, &export.tables) {
+                    (None, None) => anyhow::bail!(
+                        "export '{}': cdc mode requires `table:` (or `tables:` for a \
+                         multi-table stream)",
                         export.name
-                    );
+                    ),
+                    (Some(_), Some(_)) => anyhow::bail!(
+                        "export '{}': `table:` and `tables:` are mutually exclusive — \
+                         use `tables: [a, b]` for a multi-table stream",
+                        export.name
+                    ),
+                    (None, Some(ts)) => {
+                        if ts.is_empty() {
+                            anyhow::bail!(
+                                "export '{}': `tables:` must list at least one table",
+                                export.name
+                            );
+                        }
+                        let mut seen = std::collections::HashSet::new();
+                        for t in ts {
+                            if !seen.insert(t.as_str()) {
+                                anyhow::bail!(
+                                    "export '{}': duplicate table '{}' in `tables:`",
+                                    export.name,
+                                    t
+                                );
+                            }
+                        }
+                        if self.source.source_type == SourceType::Mssql {
+                            anyhow::bail!(
+                                "export '{}': `tables:` is not yet supported for SQL Server — \
+                                 its capture instances are per-table; use one cdc export per \
+                                 table (capture_instance each)",
+                                export.name
+                            );
+                        }
+                    }
+                    (Some(_), None) => {}
                 }
                 if export.query.is_some() || export.query_file.is_some() {
                     anyhow::bail!(
@@ -918,6 +964,14 @@ impl Config {
                     );
                 }
             }
+        }
+
+        if export.tables.is_some() && export.mode != ExportMode::Cdc {
+            anyhow::bail!(
+                "export '{}': `tables:` is only valid with `mode: cdc` (batch exports \
+                 are one query/table per export)",
+                export.name
+            );
         }
 
         if export.chunk_dense && export.mode != ExportMode::Chunked {

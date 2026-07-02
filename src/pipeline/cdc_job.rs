@@ -36,14 +36,20 @@ pub(super) fn run_cdc_export(
     let duration_ms = started.elapsed().as_millis() as i64;
 
     let mut summary = match &result {
-        Ok(manifest) => {
-            let bytes: u64 = manifest.parts.iter().map(|p| p.size_bytes).sum();
+        // One manifest per captured table (a multi-table `tables:` stream
+        // produces several); the export-level summary carries the totals.
+        Ok(manifests) => {
+            let bytes: u64 = manifests
+                .iter()
+                .flat_map(|m| &m.parts)
+                .map(|p| p.size_bytes)
+                .sum();
             cdc_summary(
                 &run_id,
                 export,
                 "success",
-                manifest.row_count,
-                manifest.part_count as usize,
+                manifests.iter().map(|m| m.row_count).sum(),
+                manifests.iter().map(|m| m.part_count as usize).sum(),
                 bytes,
                 duration_ms,
                 None,
@@ -63,8 +69,8 @@ pub(super) fn run_cdc_export(
 
     // Record the run in the journal (so `rivet journal` shows a CDC run like a
     // batch one): one FileWritten per committed part, then the RunCompleted outcome.
-    if let Ok(manifest) = &result {
-        for (i, part) in manifest.parts.iter().enumerate() {
+    if let Ok(manifests) = &result {
+        for (i, part) in manifests.iter().flat_map(|m| &m.parts).enumerate() {
             summary
                 .journal
                 .record(crate::journal::RunEvent::FileWritten {
@@ -95,21 +101,79 @@ pub(super) fn run_cdc_export(
     (result.map(|_| ()), summary)
 }
 
+/// A multi-table stream lands each table under its own sub-prefix of the
+/// export's destination (`<base>/<table>/`), so every table's prefix is
+/// self-describing (its own parts + `manifest.json` + `_SUCCESS`), exactly like
+/// N single-table exports — minus the N−1 extra slots/connections.
+fn dest_for_table(
+    base: &crate::config::DestinationConfig,
+    table: &str,
+) -> crate::config::DestinationConfig {
+    let mut d = base.clone();
+    match d.destination_type {
+        crate::config::DestinationType::Local => {
+            let p = d.path.take().unwrap_or_else(|| ".".into());
+            d.path = Some(format!("{}/{}", p.trim_end_matches('/'), table));
+        }
+        crate::config::DestinationType::Stdout => {}
+        // Cloud destinations: extend the key prefix.
+        _ => {
+            let pfx = d.prefix.take().unwrap_or_default();
+            d.prefix = Some(if pfx.is_empty() {
+                table.to_string()
+            } else {
+                format!("{}/{}", pfx.trim_end_matches('/'), table)
+            });
+        }
+    }
+    d
+}
+
 /// Build the capture from the config + export and drive it through the shared
 /// [`crate::source::cdc::run_capture`] (the same assembler the `rivet cdc` CLI
-/// uses). Returns the `RunManifest` so the caller records the metric + journal.
+/// uses). Returns the manifests (one per captured table) so the caller records
+/// the metric + journal.
 fn run_cdc_inner(
     config: &Config,
     export: &ExportConfig,
     run_id: &str,
-) -> Result<crate::manifest::RunManifest> {
+) -> Result<Vec<crate::manifest::RunManifest>> {
     let url = config.source.resolve_url()?;
     let cdc = export.cdc.clone().unwrap_or_default();
-    let table = export
-        .table
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("export '{}': cdc mode requires `table:`", export.name))?;
-    let dest = crate::destination::create_destination(&export.destination)?;
+    // `tables:` (multi-table, one stream) or the single `table:` — validation
+    // guarantees exactly one of them is set.
+    let (tables, multi) = match (&export.tables, &export.table) {
+        (Some(ts), _) => (ts.clone(), true),
+        (None, Some(t)) => (vec![t.clone()], false),
+        (None, None) => {
+            anyhow::bail!("export '{}': cdc mode requires `table:`", export.name)
+        }
+    };
+    // Per-table destinations must outlive the borrowed CaptureOutputs.
+    let mut wired: Vec<(String, Box<dyn crate::destination::Destination>, String)> =
+        Vec::with_capacity(tables.len());
+    for t in &tables {
+        let dcfg = if multi {
+            dest_for_table(&export.destination, t)
+        } else {
+            export.destination.clone()
+        };
+        let dest = crate::destination::create_destination(&dcfg)?;
+        let uri = dcfg
+            .path
+            .clone()
+            .or_else(|| dcfg.prefix.clone())
+            .unwrap_or_default();
+        wired.push((t.clone(), dest, uri));
+    }
+    let outputs = wired
+        .iter()
+        .map(|(t, d, u)| crate::source::cdc::CaptureOutput {
+            table: t.clone(),
+            dest: d.as_ref(),
+            dest_uri: u.clone(),
+        })
+        .collect();
     let now = chrono::Utc::now().to_rfc3339();
 
     run_capture(CdcCapture {
@@ -127,9 +191,7 @@ fn run_cdc_inner(
             until_current: cdc.until_current,
             tls: config.source.tls.clone(),
         },
-        table,
-        dest: dest.as_ref(),
-        dest_uri: export.destination.path.clone().unwrap_or_default(),
+        outputs,
         format: export.format,
         max_events: cdc.max_events,
         rollover: cdc.rollover.unwrap_or(10_000),
