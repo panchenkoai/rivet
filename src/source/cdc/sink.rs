@@ -103,7 +103,7 @@ impl TableSink<'_> {
     /// Encode + upload this table's buffered changes as one part (no-op when
     /// the buffer is empty). Does NOT touch the checkpoint or the stream — the
     /// ack decision is global (see [`roll_all`]).
-    fn flush_buffered(&mut self, format: FormatType, run_token: &str) -> Result<()> {
+    fn flush_buffered(&mut self, engine: &str, format: FormatType, run_token: &str) -> Result<()> {
         if self.buf.is_empty() {
             return Ok(());
         }
@@ -116,6 +116,7 @@ impl TableSink<'_> {
             &self.buf,
             &sch,
             &self.out.columns,
+            engine,
             format,
             run_token,
             self.seq,
@@ -144,6 +145,7 @@ impl TableSink<'_> {
 fn roll_all(
     sinks: &mut [TableSink<'_>],
     stream: &mut dyn ChangeStream,
+    engine: &str,
     format: FormatType,
     run_token: &str,
     checkpoint: Option<&Path>,
@@ -151,7 +153,7 @@ fn roll_all(
     unacked_commit: &mut bool,
 ) -> Result<()> {
     for s in sinks.iter_mut() {
-        s.flush_buffered(format, run_token)?;
+        s.flush_buffered(engine, format, run_token)?;
     }
     // Fault point: the parts are durable but the checkpoint/ack have NOT run. A
     // crash here must re-read on resume (at-least-once) — never lose the change.
@@ -218,6 +220,7 @@ pub(crate) fn run_to_files(
             roll_all(
                 &mut sinks,
                 stream,
+                cfg.engine,
                 cfg.format,
                 &run_token,
                 checkpoint,
@@ -235,6 +238,7 @@ pub(crate) fn run_to_files(
         roll_all(
             &mut sinks,
             stream,
+            cfg.engine,
             cfg.format,
             &run_token,
             checkpoint,
@@ -342,10 +346,12 @@ fn run_token(run_id: &str) -> String {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn flush(
     events: &[ChangeEvent],
     schema: &SchemaRef,
     columns: &[TypeMapping],
+    engine: &str,
     format: FormatType,
     run_token: &str,
     seq: usize,
@@ -365,22 +371,37 @@ fn flush(
     );
     let mut arrays: Vec<ArrayRef> = vec![ops, poss];
     for (i, m) in columns.iter().enumerate() {
-        let cells: Vec<Option<&RivetValue>> = events
-            .iter()
-            .map(|e| {
-                // after-image for insert/update; before-image (the key) for delete
-                let image = match e.op {
-                    ChangeOp::Delete => e.before.as_ref(),
-                    _ => e.after.as_ref(),
-                };
-                image.and_then(|vals| vals.get(i))
-            })
-            .collect();
-        // The render type matches exactly the field `ensure_schema` declared.
-        arrays.push(value::build_column(
-            &value::render_type(m.arrow_type.as_ref()),
-            &cells,
-        )?);
+        // Engine/native-type cell normalisation (e.g. MySQL binlog quirks: BIT
+        // bytes, ENUM indexes, epoch-text TIMESTAMPs, NUL-trimmed BINARY) —
+        // computed once per column, applied per cell.
+        let fix = value::mysql_cell_fix(engine, &m.source_native_type);
+        // after-image for insert/update; before-image (the key) for delete
+        fn image_of(e: &ChangeEvent) -> Option<&Vec<RivetValue>> {
+            match e.op {
+                ChangeOp::Delete => e.before.as_ref(),
+                _ => e.after.as_ref(),
+            }
+        }
+        let render = value::render_type(m.arrow_type.as_ref());
+        let arr = if let Some(fix) = &fix {
+            let owned: Vec<Option<RivetValue>> = events
+                .iter()
+                .map(|e| {
+                    image_of(e)
+                        .and_then(|vals| vals.get(i))
+                        .map(|v| fix.apply(v))
+                })
+                .collect();
+            let cells: Vec<Option<&RivetValue>> = owned.iter().map(|o| o.as_ref()).collect();
+            value::build_column(&render, &cells)?
+        } else {
+            let cells: Vec<Option<&RivetValue>> = events
+                .iter()
+                .map(|e| image_of(e).and_then(|vals| vals.get(i)))
+                .collect();
+            value::build_column(&render, &cells)?
+        };
+        arrays.push(arr);
     }
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
 

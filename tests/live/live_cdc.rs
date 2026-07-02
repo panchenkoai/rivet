@@ -487,6 +487,152 @@ fn pg_cdc_resume_captures_only_new_changes() {
     );
 }
 
+/// Read the (single) parquet part under `dir` into one RecordBatch.
+fn read_one_batch(dir: &std::path::Path) -> arrow::record_batch::RecordBatch {
+    let f = std::fs::File::open(find_parquet_part(dir)).unwrap();
+    let mut r = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
+        .unwrap()
+        .with_batch_size(usize::MAX)
+        .build()
+        .unwrap();
+    r.next().expect("at least one row").unwrap()
+}
+
+/// Assert every source column of the batch export is byte-for-byte identical
+/// (type AND value, via ArrayData equality) in the CDC output — the parity
+/// oracle that caught the uuid/time/interval/NULL-text losses on PostgreSQL
+/// and the timestamp/bit/year/enum/binary losses on MySQL.
+fn assert_cdc_matches_batch(cdc_out: &std::path::Path, batch_out: &std::path::Path) {
+    let batch = read_one_batch(batch_out);
+    let cdc = read_one_batch(cdc_out);
+    for (i, field) in batch.schema().fields().iter().enumerate() {
+        let name = field.name();
+        let cidx = cdc
+            .schema()
+            .index_of(name)
+            .unwrap_or_else(|_| panic!("cdc output is missing source column {name}"));
+        assert_eq!(
+            batch.column(i).to_data(),
+            cdc.column(cidx).to_data(),
+            "column {name}: CDC differs from the batch export (type or value drift)"
+        );
+    }
+    assert!(cdc.schema().index_of("__op").is_ok() && cdc.schema().index_of("__pos").is_ok());
+}
+
+// The all-types parity contract for MySQL: a table covering every Rivet-mapped
+// MySQL type (the union of both official type matrices), exported both ways —
+// batch and CDC — must produce identical Arrow columns. This is the e2e pin for
+// the binlog cell fixes: TIMESTAMP arrives as epoch text, BIT as raw bytes,
+// YEAR as text, ENUM as a 1-based index, BINARY(n) NUL-trimmed, JSONB spacing.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_full_type_matrix_matches_batch() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_matrix_my");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {tbl} (
+           id BIGINT PRIMARY KEY, label VARCHAR(200), amount DECIMAL(18,2),
+           created_at_dt DATETIME(6), created_at_ts TIMESTAMP(6) NULL,
+           raw_bytes BINARY(4), extras JSON, flag BOOLEAN, bit1_col BIT(1),
+           bit8_col BIT(8), tiny_col TINYINT, date_col DATE, time_col TIME(6),
+           year_col YEAR, enum_col ENUM('a','b','c'), varbinary_col VARBINARY(4),
+           blob_col BLOB) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    ))
+    .unwrap();
+    let _guard = Table(tbl.clone());
+
+    let ckpt = d.path().join("cdc.ckpt");
+    write_checkpoint(&mut c, &ckpt);
+    c.query_drop(format!(
+        "INSERT INTO {tbl} VALUES
+           (1, 'üñíçødé', 999999999999.99, '2035-08-07 09:08:07.987654',
+            '2035-08-07 09:08:07.987654', UNHEX('00000000'),
+            JSON_OBJECT('tier','gold','n',1), TRUE, b'1', b'10101010', 127,
+            '2024-03-15', '14:30:00.123456', 2024, 'b', 0xDEADBEEF, 0x0102),
+           (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+            NULL, NULL, NULL, NULL, NULL, NULL)"
+    ))
+    .unwrap();
+
+    let cdc_out = d.path().join("cdc");
+    let batch_out = d.path().join("batch");
+    std::fs::create_dir_all(&cdc_out).unwrap();
+    std::fs::create_dir_all(&batch_out).unwrap();
+    run_cdc(&cdc_config(&d, &tbl, &ckpt, &cdc_out));
+    run_cdc(&full_config(&d, &tbl, &batch_out));
+    assert_cdc_matches_batch(&cdc_out, &batch_out);
+}
+
+// The all-types parity contract for PostgreSQL — pins the test_decoding parse
+// fixes: uuid/bytea text→raw bytes, TIME→Time64, INTERVAL→the batch's ISO 8601
+// canon, and NULLs of text-shaped columns staying NULL (not ""). Arrays are the
+// known exception (CDC carries the PG literal as text until List support), so
+// this matrix deliberately covers everything BUT arrays.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_full_type_matrix_matches_batch() {
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_matrix_pg");
+    let slot = unique_name("rivet_matrix_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(
+        "DO $$ BEGIN CREATE TYPE rivet_status AS ENUM ('active','inactive','pending'); \
+         EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
+    )
+    .unwrap();
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (
+           id BIGINT PRIMARY KEY, label TEXT, amount NUMERIC(18,2),
+           created_at TIMESTAMP, created_at_tz TIMESTAMPTZ, raw_bytes BYTEA,
+           uid UUID, attrs JSONB, flag BOOLEAN, int2_col SMALLINT,
+           float8_col DOUBLE PRECISION, date_col DATE, time_col TIME,
+           interval_col INTERVAL, enum_col rivet_status)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+
+    // Slot first, then the changes (they must land inside the slot's window).
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+    c.batch_execute(&format!(
+        "INSERT INTO {tbl} VALUES
+           (1, 'üñíçødé ''q''', 999999999999.99, '2035-08-07 09:08:07.987654',
+            '2019-02-03 08:07:06.554433+05', '\\x00ff01'::bytea,
+            'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380011', '{{\"n\":1}}'::jsonb, TRUE,
+            32767, 2.5, '2024-03-15', '14:30:00.123456',
+            INTERVAL '1 year 2 mons 3 days', 'active');
+         INSERT INTO {tbl} (id) VALUES (2);"
+    ))
+    .unwrap();
+
+    let cdc_out = d.path().join("cdc");
+    let batch_out = d.path().join("batch");
+    std::fs::create_dir_all(&cdc_out).unwrap();
+    std::fs::create_dir_all(&batch_out).unwrap();
+    run_cdc(&pg_cdc_config(&d, &tbl, &slot, &cdc_out));
+    let batch_yaml = format!(
+        r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
+exports:
+  - name: {tbl}_batch
+    table: {tbl}
+    mode: full
+    format: parquet
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        out = batch_out.display(),
+    );
+    run_cdc(&write_config(&d, &batch_yaml));
+    assert_cdc_matches_batch(&cdc_out, &batch_out);
+}
+
 // Slot multiplexing: several tables through ONE PostgreSQL slot (`tables:`),
 // each landing under its own sub-prefix with its own manifest — and the shared
 // position still resumes correctly (second run captures nothing twice).

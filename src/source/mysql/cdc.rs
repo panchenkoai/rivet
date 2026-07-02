@@ -254,15 +254,58 @@ fn binlog_value_to_rivet(bv: &BinlogValue) -> RivetValue {
     match bv {
         BinlogValue::Value(v) => RivetValue::from_mysql(v),
         // A JSON column arrives as MySQL's internal JSONB binary — convert it to
-        // canonical JSON text so it lands as a real `json` column downstream, not
-        // a debug-formatted byte blob.
+        // JSON text in the SAME rendering the server itself produces (", " and
+        // ": " separators), so CDC and batch outputs of one value are
+        // byte-identical; compact serde output would differ only in whitespace.
         BinlogValue::Jsonb(j) => match serde_json::Value::try_from(j.clone()) {
-            Ok(json) => RivetValue::Bytes(json.to_string().into_bytes()),
+            Ok(json) => RivetValue::Bytes(mysql_style_json(&json).into_bytes()),
             Err(_) => RivetValue::Null,
         },
         // JSONB partial-update diffs (rare) — carry the debug bytes as text.
         other => RivetValue::Bytes(format!("{other:?}").into_bytes()),
     }
+}
+
+/// Serialise with MySQL's own JSON text spacing: `", "` between elements and
+/// `": "` after keys (`{"n": 1, "tier": "gold"}`), which is what the batch
+/// export reads from the server as text.
+fn mysql_style_json(v: &serde_json::Value) -> String {
+    struct MySqlFmt;
+    impl serde_json::ser::Formatter for MySqlFmt {
+        fn begin_array_value<W: ?Sized + std::io::Write>(
+            &mut self,
+            w: &mut W,
+            first: bool,
+        ) -> std::io::Result<()> {
+            if !first {
+                w.write_all(b", ")?;
+            }
+            Ok(())
+        }
+        fn begin_object_key<W: ?Sized + std::io::Write>(
+            &mut self,
+            w: &mut W,
+            first: bool,
+        ) -> std::io::Result<()> {
+            if !first {
+                w.write_all(b", ")?;
+            }
+            Ok(())
+        }
+        fn begin_object_value<W: ?Sized + std::io::Write>(
+            &mut self,
+            w: &mut W,
+        ) -> std::io::Result<()> {
+            w.write_all(b": ")
+        }
+    }
+    let mut out = Vec::new();
+    let mut ser = serde_json::Serializer::with_formatter(&mut out, MySqlFmt);
+    use serde::Serialize as _;
+    if v.serialize(&mut ser).is_err() {
+        return v.to_string();
+    }
+    String::from_utf8(out).unwrap_or_else(|_| v.to_string())
 }
 
 impl Iterator for MysqlChangeStream {

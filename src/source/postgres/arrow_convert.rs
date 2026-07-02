@@ -325,7 +325,7 @@ impl<'a> postgres_types::FromSql<'a> for PgInterval {
 ///   months → years + months  (e.g. 14 → "P1Y2M")
 ///   days   → days            (e.g. 3  → "3D")
 ///   µs     → T…H…M…S        (e.g. 90_061_000_000 → "T25H1M1S")
-fn pg_interval_to_iso8601(months: i32, days: i32, microseconds: i64) -> String {
+pub(crate) fn pg_interval_to_iso8601(months: i32, days: i32, microseconds: i64) -> String {
     use std::fmt::Write as _;
     let years = months / 12;
     let m = months % 12;

@@ -507,3 +507,9 @@ engines. What remains:
 - **Pre-image completeness** depends on the source config: full UPDATE/DELETE
   before-images need `binlog_row_image=FULL` (MySQL) / `REPLICA IDENTITY FULL`
   (PostgreSQL); otherwise only key columns are carried.
+- **PostgreSQL arrays** (`text[]`, `integer[]`, …) ride through CDC as the
+  PostgreSQL literal text (`{alpha,beta}`, a `Utf8` column) — the batch export
+  produces real `List` columns. No value is lost, but the column type differs
+  until the sink grows `List` support. Every other Rivet-mapped type is
+  **byte-identical to the batch export**, enforced per engine by the live
+  `*_full_type_matrix_matches_batch` tests.

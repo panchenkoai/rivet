@@ -304,10 +304,34 @@ pub(crate) fn resolve_cdc_columns(
             url, tls,
         )?)
     };
-    src.type_mappings(
+    let mut mappings = src.type_mappings(
         &format!("SELECT * FROM {table}"),
         &crate::types::ColumnOverrides::new(),
-    )
+    )?;
+    // MySQL: the wire metadata the probe sees has no widths or labels for
+    // BIT/BINARY/ENUM/SET ("bit", "binary", "enum"), but the binlog cell fixes
+    // (`value::mysql_cell_fix`) need them — BINARY's pad width and ENUM's label
+    // list in particular. Enrich `source_native_type` with the full
+    // `information_schema.COLUMN_TYPE` ("bit(8)", "binary(4)",
+    // "enum('a','b','c')"); CDC-only, so the batch path's contract-pinned
+    // native names stay untouched.
+    if url.starts_with("mysql://") {
+        use mysql::prelude::Queryable;
+        let pool = crate::source::mysql::connect_pool(url, tls)?;
+        let mut conn = pool.get_conn()?;
+        let bare = table.rsplit('.').next().unwrap_or(table);
+        let full: Vec<(String, String)> = conn.exec(
+            "SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
+            (bare,),
+        )?;
+        for m in &mut mappings {
+            if let Some((_, ct)) = full.iter().find(|(n, _)| *n == m.column_name) {
+                m.source_native_type = ct.clone();
+            }
+        }
+    }
+    Ok(mappings)
 }
 
 /// One table's destination wiring for a capture — see [`CdcCapture::outputs`].

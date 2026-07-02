@@ -267,6 +267,26 @@ fn map_pg_value(typ: &str, val: &str, quoted: bool) -> RivetValue {
     if t.starts_with("timestamp") {
         return parse_pg_timestamp(val);
     }
+    if t == "time" || t == "time without time zone" {
+        // "HH:MM:SS[.ffffff]" → microseconds since midnight (the Time64 column
+        // the batch export uses; the text rendering would silently null there).
+        return parse_pg_time_micros(val).map_or(RivetValue::Null, RivetValue::TimeMicros);
+    }
+    if t == "interval" {
+        // Canonicalise the text rendering ("1 year 2 mons 3 days") to the SAME
+        // ISO 8601 string the batch export emits ("P1Y2M3D") — one canon, so
+        // CDC and batch outputs of the same value are byte-identical.
+        return parse_pg_interval(val)
+            .map(|(months, days, us)| {
+                RivetValue::Bytes(
+                    crate::source::postgres::arrow_convert::pg_interval_to_iso8601(
+                        months, days, us,
+                    )
+                    .into_bytes(),
+                )
+            })
+            .unwrap_or_else(|| RivetValue::Bytes(val.as_bytes().to_vec()));
+    }
     if t == "date" {
         return chrono::NaiveDate::parse_from_str(val, "%Y-%m-%d")
             .ok()
@@ -293,6 +313,78 @@ fn map_pg_value(typ: &str, val: &str, quoted: bool) -> RivetValue {
     }
     // text / varchar / char / json / … → string bytes.
     RivetValue::Bytes(val.as_bytes().to_vec())
+}
+
+/// Parse "HH:MM:SS[.ffffff]" into microseconds since midnight.
+fn parse_pg_time_micros(val: &str) -> Option<i64> {
+    let (hms, frac) = match val.split_once('.') {
+        Some((h, f)) => (h, f),
+        None => (val, ""),
+    };
+    let mut parts = hms.split(':');
+    let h: i64 = parts.next()?.parse().ok()?;
+    let m: i64 = parts.next()?.parse().ok()?;
+    let s: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !(0..24).contains(&h) {
+        return None;
+    }
+    let us: i64 = if frac.is_empty() {
+        0
+    } else {
+        // Right-pad to 6 digits: ".5" ⇒ 500000 µs.
+        format!("{frac:0<6}").get(..6)?.parse().ok()?
+    };
+    Some(((h * 3600 + m * 60 + s) * 1_000_000) + us)
+}
+
+/// Parse PostgreSQL's `postgres`-style interval text rendering —
+/// `[N year(s)] [N mon(s)] [N day(s)] [±HH:MM:SS[.ffffff]]`, each part
+/// optional — into `(months, days, microseconds)`.
+fn parse_pg_interval(val: &str) -> Option<(i32, i32, i64)> {
+    let (mut months, mut days, mut micros) = (0i32, 0i32, 0i64);
+    let mut tokens = val.split_whitespace().peekable();
+    while let Some(tok) = tokens.next() {
+        if tok.contains(':') {
+            // The time tail: ±HH:MM:SS[.ffffff].
+            let (sign, rest) = match tok.strip_prefix('-') {
+                Some(r) => (-1i64, r),
+                None => (1i64, tok),
+            };
+            let t = parse_pg_time_micros_unbounded(rest)?;
+            micros = sign * t;
+            continue;
+        }
+        let n: i32 = tok.parse().ok()?;
+        match tokens.next()? {
+            u if u.starts_with("year") => months += n * 12,
+            u if u.starts_with("mon") => months += n,
+            u if u.starts_with("day") => days += n,
+            _ => return None,
+        }
+    }
+    Some((months, days, micros))
+}
+
+/// As [`parse_pg_time_micros`] but without the 24h bound — an interval's time
+/// component may exceed a day (e.g. "25:00:00").
+fn parse_pg_time_micros_unbounded(val: &str) -> Option<i64> {
+    let (hms, frac) = match val.split_once('.') {
+        Some((h, f)) => (h, f),
+        None => (val, ""),
+    };
+    let mut parts = hms.split(':');
+    let h: i64 = parts.next()?.parse().ok()?;
+    let m: i64 = parts.next()?.parse().ok()?;
+    let s: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let us: i64 = if frac.is_empty() {
+        0
+    } else {
+        format!("{frac:0<6}").get(..6)?.parse().ok()?
+    };
+    Some(((h * 3600 + m * 60 + s) * 1_000_000) + us)
 }
 
 /// Decode an even-length hex string to bytes; `None` on any non-hex input.
@@ -332,6 +424,33 @@ mod tests {
     // The `postgres-cdc` instance (cdc profile, :5434) — wal_level=logical.
     const CONN: &str = "postgresql://rivet:rivet@127.0.0.1:5434/rivet";
     const SLOT: &str = "rivet_cdc_test";
+
+    // RED tests for the all-types matrix audit findings: TIME arrived as text
+    // (the "timestamp" prefix check does not match "time without time zone"),
+    // so the strict Time64 builder silently nulled every value; INTERVAL rode
+    // as PostgreSQL's text rendering ("1 year 2 mons 3 days") while the batch
+    // export canonicalises to ISO 8601 ("P1Y2M3D") — same value, two spellings,
+    // breaking CDC↔batch parity.
+    #[test]
+    fn time_parses_to_micros_and_interval_canonicalises_to_iso8601() {
+        let line = "table public.t: INSERT: \
+                    t1[time without time zone]:'14:30:00.123456' \
+                    iv1[interval]:'1 year 2 mons 3 days' \
+                    iv2[interval]:'-1 years' \
+                    iv3[interval]:'00:00:00' \
+                    iv4[interval]:'3 days 04:05:06.789'";
+        let ev = parse_test_decoding("0/ABC", line).unwrap();
+        let after = ev.after.unwrap();
+        assert_eq!(
+            after[0],
+            RivetValue::TimeMicros((14 * 3600 + 30 * 60) * 1_000_000 + 123456),
+            "TIME must parse to microseconds-since-midnight"
+        );
+        assert_eq!(after[1], RivetValue::Bytes(b"P1Y2M3D".to_vec()));
+        assert_eq!(after[2], RivetValue::Bytes(b"P-1Y".to_vec()));
+        assert_eq!(after[3], RivetValue::Bytes(b"PT0S".to_vec()));
+        assert_eq!(after[4], RivetValue::Bytes(b"P3DT4H5M6.789000S".to_vec()));
+    }
 
     // RED test for the finding (caught live on a GCS export, by eye): a uuid
     // column rode through as its 36-char TEXT rendering, but the sink's

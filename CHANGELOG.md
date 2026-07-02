@@ -40,6 +40,27 @@
 
 ### Fixed
 
+- **CDC all-types parity audit: eight per-column silent losses fixed, and the audit pinned as live
+  tests.** One wide table per engine (the union of the official type matrices) exported both ways —
+  batch and CDC — must produce byte-identical Arrow columns (`ArrayData` equality); SQL Server already
+  had this test, PostgreSQL and MySQL now do too (`pg_cdc_full_type_matrix_matches_batch`,
+  `cdc_full_type_matrix_matches_batch`). What the audit caught and this release fixes:
+  - *All engines*: a NULL cell of a text-shaped column (`text`/`enum`/`json`/`interval`) was rendered as
+    an **empty string** instead of NULL by the `Utf8` builders (`""` is not even valid JSON for a json
+    column).
+  - *PostgreSQL*: `TIME` arrived as text and was silently nulled by the strict `Time64` builder (the
+    `timestamp` prefix check does not match `time without time zone`); `INTERVAL` rode as PostgreSQL's
+    text rendering while batch canonicalises to ISO 8601 — both now parse, interval through the same
+    `pg_interval_to_iso8601` serialiser the batch export uses. Known remaining gap: arrays
+    (`text[]`/`integer[]`) ride as the PG literal text (`Utf8`), not `List` — values present, type not
+    yet parity.
+  - *MySQL (binlog wire shapes, probed live)*: `TIMESTAMP` arrives as epoch-seconds TEXT (silently
+    nulled — `DATETIME` worked, which is why no demo caught it); `BIT(1)`/`BIT(n)` arrive as raw bytes
+    (nulled); `YEAR` as text (nulled); `ENUM` as its 1-based INDEX (written as `"2"` instead of `"b"` —
+    corruption, not even a null); `BINARY(n)` NUL-trimmed by the driver (padded back); JSON re-serialised
+    with MySQL's own `", "`/`": "` spacing so CDC and batch render one value identically. BIT/BINARY/ENUM
+    need widths/labels the wire metadata lacks, so the CDC resolve enriches `source_native_type` from
+    `information_schema.COLUMN_TYPE` (CDC-only; batch naming and its contracts untouched).
 - **PostgreSQL CDC: `uuid` and `bytea` values decode to raw bytes.** `test_decoding` renders a uuid as
   its 36-char hyphenated text and bytea as `\x…` hex; the parse forwarded both as text bytes, and the
   sink's `FixedSizeBinary(16)` builder — which accepts only exactly-16-byte values — silently degraded

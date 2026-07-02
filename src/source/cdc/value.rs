@@ -154,6 +154,20 @@ pub(crate) fn render_type(arrow_type: Option<&DataType>) -> DataType {
 pub(crate) fn build_column(dt: &DataType, cells: &[Option<&RivetValue>]) -> Result<ArrayRef> {
     use RivetValue as V;
 
+    // Normalise the explicit NULL variant to a missing cell up front, for every
+    // builder arm at once. Without this the text arms (`Utf8`/`LargeUtf8`),
+    // which accept ANY value via `render_str`, rendered `RivetValue::Null` as
+    // an EMPTY STRING — every text/enum/json/interval NULL silently became ""
+    // (and "" is not even valid JSON for a json column).
+    let normalized: Vec<Option<&RivetValue>> = cells
+        .iter()
+        .map(|c| match c {
+            Some(V::Null) => None,
+            other => *other,
+        })
+        .collect();
+    let cells: &[Option<&RivetValue>] = &normalized;
+
     // Integers: the binlog/driver value is always the widest signed/unsigned, so
     // narrow to the column's declared width — `try_from` nulls on the (impossible
     // for a correctly-typed column) overflow rather than silently wrapping.
@@ -358,6 +372,152 @@ fn decimal_to_i128(v: &RivetValue, scale: i8) -> Option<i128> {
     Some(if neg { -mag } else { mag })
 }
 
+/// MySQL binlog cell quirks, keyed by the column's NATIVE type (the binlog
+/// row image is type-blind at decode time): each variant is what the wire
+/// value actually is, and `apply` converts it to what the typed column needs.
+/// Found by the all-types matrix audit — every one of these was a silent
+/// per-column loss (NULLed by a strict builder) or corruption (enum index as
+/// text) that count/sum verification could not see.
+#[derive(Debug)]
+pub(crate) enum MysqlCellFix {
+    /// TIMESTAMP arrives as `"epoch[.micros]"` TEXT — parse to the UTC instant.
+    TimestampEpoch,
+    /// BIT(1) arrives as one raw byte — any set bit ⇒ true.
+    BitBool,
+    /// BIT(n>1) arrives as big-endian raw bytes — widen to u64.
+    BitUint,
+    /// YEAR arrives as its text rendering ("2024").
+    YearText,
+    /// ENUM arrives as its 1-based INDEX — map to the label (from the native
+    /// type's `enum('a','b',…)` declaration); index 0 is MySQL's invalid-value
+    /// sentinel → empty string, matching the server's own rendering.
+    EnumLabels(Vec<String>),
+    /// BINARY(n): the driver right-trims trailing NULs — pad back to width n
+    /// (the batch export carries the full padded value).
+    BinaryPad(usize),
+}
+
+/// The fix (if any) for a column, from the engine label + native type.
+pub(crate) fn mysql_cell_fix(engine: &str, native: &str) -> Option<MysqlCellFix> {
+    if engine != "mysql" {
+        return None;
+    }
+    let n = native.to_ascii_lowercase();
+    if n.starts_with("timestamp") {
+        return Some(MysqlCellFix::TimestampEpoch);
+    }
+    if n == "bit(1)" {
+        return Some(MysqlCellFix::BitBool);
+    }
+    // "bit" (no width) is what the wire metadata reports before the
+    // information_schema enrichment — the value conversion needs no width.
+    if n.starts_with("bit(") || n == "bit" {
+        return Some(MysqlCellFix::BitUint);
+    }
+    if n == "year" || n.starts_with("year(") {
+        return Some(MysqlCellFix::YearText);
+    }
+    if n.starts_with("enum(") {
+        return Some(MysqlCellFix::EnumLabels(parse_enum_labels(native)));
+    }
+    if let Some(width) = n
+        .strip_prefix("binary(")
+        .and_then(|r| r.strip_suffix(')'))
+        .and_then(|w| w.parse::<usize>().ok())
+    {
+        return Some(MysqlCellFix::BinaryPad(width));
+    }
+    None
+}
+
+/// Labels from `enum('a','b','it''s')`, in declaration (index) order.
+fn parse_enum_labels(native: &str) -> Vec<String> {
+    let Some(start) = native.find('(') else {
+        return Vec::new();
+    };
+    let inner = &native[start + 1..native.len().saturating_sub(1)];
+    let mut labels = Vec::new();
+    let b = inner.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'\'' {
+            i += 1;
+            continue;
+        }
+        let mut label = String::new();
+        i += 1;
+        while i < b.len() {
+            if b[i] == b'\'' {
+                if b.get(i + 1) == Some(&b'\'') {
+                    label.push('\'');
+                    i += 2;
+                } else {
+                    i += 1;
+                    break;
+                }
+            } else {
+                label.push(b[i] as char);
+                i += 1;
+            }
+        }
+        labels.push(label);
+    }
+    labels
+}
+
+impl MysqlCellFix {
+    pub(crate) fn apply(&self, v: &RivetValue) -> RivetValue {
+        use RivetValue as V;
+        match (self, v) {
+            (_, V::Null) => V::Null,
+            (MysqlCellFix::TimestampEpoch, V::Bytes(b)) => std::str::from_utf8(b)
+                .ok()
+                .and_then(|s| {
+                    let (sec, frac) = match s.split_once('.') {
+                        Some((s, f)) => (s, f),
+                        None => (s, ""),
+                    };
+                    let secs: i64 = sec.parse().ok()?;
+                    let micros: u32 = if frac.is_empty() {
+                        0
+                    } else {
+                        format!("{frac:0<6}").get(..6)?.parse().ok()?
+                    };
+                    chrono::DateTime::from_timestamp(secs, micros * 1_000).map(|dt| dt.naive_utc())
+                })
+                .map_or(V::Null, V::DateTime),
+            (MysqlCellFix::BitBool, V::Bytes(b)) => V::Bool(b.iter().any(|x| *x != 0)),
+            (MysqlCellFix::BitBool, V::Int(i)) => V::Bool(*i != 0),
+            (MysqlCellFix::BitBool, V::UInt(u)) => V::Bool(*u != 0),
+            (MysqlCellFix::BitUint, V::Bytes(b)) if b.len() <= 8 => {
+                V::UInt(b.iter().fold(0u64, |acc, x| (acc << 8) | *x as u64))
+            }
+            (MysqlCellFix::YearText, V::Bytes(b)) => std::str::from_utf8(b)
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .map_or(V::Null, V::Int),
+            (MysqlCellFix::EnumLabels(labels), V::Int(i)) => enum_label(labels, *i),
+            (MysqlCellFix::EnumLabels(labels), V::UInt(u)) => enum_label(labels, *u as i64),
+            (MysqlCellFix::BinaryPad(w), V::Bytes(b)) if b.len() < *w => {
+                let mut p = b.clone();
+                p.resize(*w, 0);
+                V::Bytes(p)
+            }
+            (_, other) => other.clone(),
+        }
+    }
+}
+
+fn enum_label(labels: &[String], idx: i64) -> RivetValue {
+    if idx <= 0 {
+        return RivetValue::Bytes(Vec::new()); // MySQL's invalid-value sentinel ''
+    }
+    labels
+        .get(idx as usize - 1)
+        .map(|l| RivetValue::Bytes(l.clone().into_bytes()))
+        .unwrap_or(RivetValue::Null)
+}
+
 fn render_str(v: &RivetValue) -> String {
     match v {
         RivetValue::Null => String::new(),
@@ -374,6 +534,71 @@ fn render_str(v: &RivetValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // RED test for the finding (all-types matrix audit): a NULL cell of a
+    // text-shaped column arrived as `Some(RivetValue::Null)` and the Utf8
+    // builder rendered it via `render_str` — an EMPTY STRING, not a null.
+    // Every text/enum/json/interval NULL silently became "" (and "" is not
+    // even valid JSON for a json column). A NULL must build as a null in
+    // every arm, for every engine.
+    #[test]
+    fn explicit_null_value_builds_as_null_not_empty_string() {
+        use arrow::array::Array;
+        let cells: Vec<Option<&RivetValue>> = vec![Some(&RivetValue::Null), None];
+        for dt in [DataType::Utf8, DataType::LargeUtf8] {
+            let arr = build_column(&dt, &cells).unwrap();
+            assert!(
+                arr.is_null(0),
+                "{dt:?}: Some(Null) must append a NULL, not an empty string"
+            );
+            assert!(arr.is_null(1));
+        }
+    }
+
+    // All-types matrix audit findings: what the MySQL binlog ACTUALLY delivers
+    // per native type (probed live via the NDJSON path), and the conversion
+    // each typed column needs. Every case below was a silent per-column loss
+    // (strict builder → NULL) or a corruption (enum index rendered as text).
+    #[test]
+    fn mysql_cell_fixes_convert_the_wire_shapes_the_binlog_delivers() {
+        use RivetValue as V;
+        let fix = |native: &str| mysql_cell_fix("mysql", native).expect(native);
+
+        // TIMESTAMP(6): "epoch.micros" text → the UTC instant.
+        let ts = fix("timestamp(6)").apply(&V::Bytes(b"1893553445.678901".to_vec()));
+        assert_eq!(
+            ts,
+            V::DateTime(
+                chrono::DateTime::from_timestamp(1_893_553_445, 678_901_000)
+                    .unwrap()
+                    .naive_utc()
+            )
+        );
+
+        // BIT(1): one raw byte → Bool; BIT(8): big-endian bytes → UInt.
+        assert_eq!(fix("bit(1)").apply(&V::Bytes(vec![1])), V::Bool(true));
+        assert_eq!(fix("bit(8)").apply(&V::Bytes(vec![0xAA])), V::UInt(170));
+
+        // YEAR: text rendering → Int.
+        assert_eq!(fix("year").apply(&V::Bytes(b"2030".to_vec())), V::Int(2030));
+
+        // ENUM: 1-based index → label; 0 → '' (MySQL's invalid sentinel).
+        let e = fix("enum('a','b','c')");
+        assert_eq!(e.apply(&V::Int(2)), V::Bytes(b"b".to_vec()));
+        assert_eq!(e.apply(&V::Int(0)), V::Bytes(Vec::new()));
+
+        // BINARY(4): trailing NULs trimmed by the driver → pad back to width.
+        assert_eq!(
+            fix("binary(4)").apply(&V::Bytes(Vec::new())),
+            V::Bytes(vec![0, 0, 0, 0])
+        );
+
+        // NULL always stays NULL; other engines get no fix at all.
+        assert_eq!(fix("year").apply(&V::Null), V::Null);
+        assert!(mysql_cell_fix("postgres", "bit(1)").is_none());
+        // varbinary is NOT padded (only fixed-width binary is).
+        assert!(mysql_cell_fix("mysql", "varbinary(4)").is_none());
+    }
 
     #[test]
     fn decimal_parse_is_lossless() {
