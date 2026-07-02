@@ -292,6 +292,8 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
             table: tbl,
             dest: dest.as_ref(),
             dest_uri: dir,
+            // The ad-hoc CLI has no `columns:` surface; config-driven runs do.
+            overrides: crate::types::ColumnOverrides::new(),
         }],
         format: fmt,
         max_events: a.max_events,

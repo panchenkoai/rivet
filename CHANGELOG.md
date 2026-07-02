@@ -40,6 +40,15 @@
 
 ### Fixed
 
+- **MySQL CDC: negative `MEDIUMINT` values no longer flip sign.** The binlog's 3-byte value arrives
+  without 24-bit sign extension (0x800000 decoded as +8388608 instead of −8388608) — caught by the
+  cross-oracle sweep, invisible until a negative mediumint entered the matrix. Sign-extended now;
+  `mediumint unsigned` untouched.
+- **CDC honours `columns:` type overrides.** `resolve_cdc_columns` passed an empty override map, so the
+  config's per-column declarations were silently ignored on the CDC path — e.g. the documented
+  `bigint unsigned → "decimal(20,0)"` override for BigQuery-bound exports (BQ has no unsigned 64) only
+  worked for batch. CDC now applies the same override surface; a multi-table export applies the map to
+  every table. Regression (live): `cdc_column_overrides_apply_like_batch`.
 - **MySQL CDC: `SET` columns decode their binlog bitmask to the member labels.** The binlog delivers a
   SET as raw little-endian bitmask bytes; the sink rendered them as lossy text. The bitmask now maps to
   the comma-joined members in declaration order (`'x,z'`), exactly the server's own rendering — labels

@@ -556,7 +556,7 @@ fn cdc_full_type_matrix_matches_batch() {
             '2035-08-07 09:08:07.987654', UNHEX('00000000'),
             JSON_OBJECT('tier','gold','n',1), TRUE, b'1', b'10101010', 127,
             '2024-03-15', '14:30:00.123456', 2024, 'b', 0xDEADBEEF, 0x0102,
-            -32768, 8388607, -2147483648, 4294967295, 18446744073709551615,
+            -32768, -8388608, -2147483648, 4294967295, 18446744073709551615,
             1.5, -2.25, 'pad', 'long text', 'x,z'),
            (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
             NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
@@ -570,6 +570,73 @@ fn cdc_full_type_matrix_matches_batch() {
     std::fs::create_dir_all(&batch_out).unwrap();
     run_cdc(&cdc_config(&d, &tbl, &ckpt, &cdc_out));
     run_cdc(&full_config(&d, &tbl, &batch_out));
+    assert_cdc_matches_batch(&cdc_out, &batch_out);
+}
+
+// `columns:` type overrides must apply to CDC exactly like batch — pinned for
+// the finding that resolve_cdc_columns passed an EMPTY override map, silently
+// ignoring the config's declarations. The canonical use: `bigint unsigned` →
+// `decimal(20,0)` so a BigQuery-bound export loads (BQ has no unsigned 64).
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_column_overrides_apply_like_batch() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_ovr");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {tbl} (id INT PRIMARY KEY, bigu BIGINT UNSIGNED)"
+    ))
+    .unwrap();
+    let _guard = Table(tbl.clone());
+
+    let ckpt = d.path().join("cdc.ckpt");
+    write_checkpoint(&mut c, &ckpt);
+    c.query_drop(format!(
+        "INSERT INTO {tbl} VALUES (1, 18446744073709551615)"
+    ))
+    .unwrap();
+
+    let cdc_out = d.path().join("cdc");
+    let batch_out = d.path().join("batch");
+    std::fs::create_dir_all(&cdc_out).unwrap();
+    std::fs::create_dir_all(&batch_out).unwrap();
+    let cdc_yaml = format!(
+        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
+exports:
+  - name: {tbl}
+    table: {tbl}
+    mode: cdc
+    format: parquet
+    columns: {{ bigu: "decimal(20,0)" }}
+    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
+    destination: {{ type: local, path: "{cdc_out}" }}
+"#,
+        ckpt = ckpt.display(),
+        cdc_out = cdc_out.display(),
+        sid = server_id_for(&tbl),
+    );
+    let batch_yaml = format!(
+        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
+exports:
+  - name: {tbl}_batch
+    table: {tbl}
+    mode: full
+    format: parquet
+    columns: {{ bigu: "decimal(20,0)" }}
+    destination: {{ type: local, path: "{batch_out}" }}
+"#,
+        batch_out = batch_out.display(),
+    );
+    run_cdc(&write_config(&d, &cdc_yaml));
+    run_cdc(&write_config(&d, &batch_yaml));
+
+    let fields: std::collections::HashMap<_, _> = parquet_fields(&cdc_out).into_iter().collect();
+    assert_eq!(
+        fields.get("bigu"),
+        Some(&arrow::datatypes::DataType::Decimal128(20, 0)),
+        "the override must reach the CDC schema"
+    );
     assert_cdc_matches_batch(&cdc_out, &batch_out);
 }
 

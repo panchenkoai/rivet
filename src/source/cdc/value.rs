@@ -388,6 +388,9 @@ pub(crate) enum MysqlCellFix {
     BitUint,
     /// YEAR arrives as its text rendering ("2024").
     YearText,
+    /// Signed MEDIUMINT arrives WITHOUT 24-bit sign extension (the binlog
+    /// stores 3 bytes; 0x800000 decodes as +8388608 instead of −8388608).
+    MediumIntSign,
     /// ENUM arrives as its 1-based INDEX — map to the label (from the native
     /// type's `enum('a','b',…)` declaration); index 0 is MySQL's invalid-value
     /// sentinel → empty string, matching the server's own rendering.
@@ -420,6 +423,10 @@ pub(crate) fn mysql_cell_fix(engine: &str, native: &str) -> Option<MysqlCellFix>
     }
     if n == "year" || n.starts_with("year(") {
         return Some(MysqlCellFix::YearText);
+    }
+    // Signed only — `mediumint unsigned` needs no sign extension.
+    if (n == "mediumint" || n.starts_with("mediumint(")) && !n.contains("unsigned") {
+        return Some(MysqlCellFix::MediumIntSign);
     }
     if n.starts_with("enum(") {
         return Some(MysqlCellFix::EnumLabels(parse_enum_labels(native)));
@@ -503,6 +510,11 @@ impl MysqlCellFix {
                 .ok()
                 .and_then(|s| s.parse::<i64>().ok())
                 .map_or(V::Null, V::Int),
+            (MysqlCellFix::MediumIntSign, V::Int(i)) if *i >= (1 << 23) => V::Int(*i - (1 << 24)),
+            (MysqlCellFix::MediumIntSign, V::UInt(u)) => {
+                let i = *u as i64;
+                V::Int(if i >= (1 << 23) { i - (1 << 24) } else { i })
+            }
             (MysqlCellFix::EnumLabels(labels), V::Int(i)) => enum_label(labels, *i),
             (MysqlCellFix::EnumLabels(labels), V::UInt(u)) => enum_label(labels, *u as i64),
             (MysqlCellFix::SetLabels(labels), V::Bytes(b)) if b.len() <= 8 => {
@@ -620,6 +632,13 @@ mod tests {
             fix("binary(4)").apply(&V::Bytes(Vec::new())),
             V::Bytes(vec![0, 0, 0, 0])
         );
+
+        // MEDIUMINT: 24-bit sign extension (0x800000 → −8388608); positives and
+        // the unsigned variant untouched.
+        let mi = fix("mediumint");
+        assert_eq!(mi.apply(&V::Int(8_388_608)), V::Int(-8_388_608));
+        assert_eq!(mi.apply(&V::Int(8_388_607)), V::Int(8_388_607));
+        assert!(mysql_cell_fix("mysql", "mediumint unsigned").is_none());
 
         // SET: bitmask (LE bytes) → comma-joined labels in declaration order,
         // the server's own rendering ('x,z' for bits 0+2 = 0x05).

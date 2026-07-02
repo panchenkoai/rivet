@@ -284,11 +284,14 @@ pub(crate) fn create_change_stream(cfg: &CdcConfig) -> Result<Box<dyn ChangeStre
 /// `RivetType` → Arrow pipeline the batch export uses — so the typed file sink
 /// writes identical columns (logical types `json`/`uuid`/…, real int widths, …)
 /// via [`crate::types::build_arrow_field`]. `tls` is threaded through the same
-/// gate as the streaming connection.
+/// gate as the streaming connection. `overrides` are the export's `columns:`
+/// declarations — the SAME override surface the batch export honours (e.g.
+/// `bigu: decimal(20,0)` for a BigQuery-bound unsigned bigint).
 pub(crate) fn resolve_cdc_columns(
     url: &str,
     table: &str,
     tls: Option<&crate::config::TlsConfig>,
+    overrides: &crate::types::ColumnOverrides,
 ) -> Result<Vec<crate::types::TypeMapping>> {
     use crate::source::Source;
     // The table name is interpolated into `SELECT * FROM {table}` for the schema
@@ -317,10 +320,7 @@ pub(crate) fn resolve_cdc_columns(
             url, tls,
         )?)
     };
-    let mut mappings = src.type_mappings(
-        &format!("SELECT * FROM {table}"),
-        &crate::types::ColumnOverrides::new(),
-    )?;
+    let mut mappings = src.type_mappings(&format!("SELECT * FROM {table}"), overrides)?;
     // MySQL: the wire metadata the probe sees has no widths or labels for
     // BIT/BINARY/ENUM/SET ("bit", "binary", "enum"), but the binlog cell fixes
     // (`value::mysql_cell_fix`) need them — BINARY's pad width and ENUM's label
@@ -352,6 +352,10 @@ pub(crate) struct CaptureOutput<'a> {
     pub table: String,
     pub dest: &'a dyn crate::destination::Destination,
     pub dest_uri: String,
+    /// The export's `columns:` type overrides — honoured exactly like the
+    /// batch path. A multi-table export applies the same map to every table
+    /// (override keys are column names).
+    pub overrides: crate::types::ColumnOverrides,
 }
 
 /// Everything needed to capture a change stream to typed files, assembled once —
@@ -384,7 +388,7 @@ pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<Vec<crate::manifest::Ru
     let engine = engine_label(&url)?;
     let mut outputs = Vec::with_capacity(cap.outputs.len());
     for o in cap.outputs {
-        let columns = resolve_cdc_columns(&url, &o.table, tls.as_ref())?;
+        let columns = resolve_cdc_columns(&url, &o.table, tls.as_ref(), &o.overrides)?;
         outputs.push(sink::TableOutput {
             table: o.table,
             columns,
@@ -416,8 +420,13 @@ mod tests {
         // probe — a name carrying a quote / paren / semicolon / space must be
         // refused *before* any connection, so this needs no live database.
         for bad in ["orders; DROP TABLE x", "orders WHERE 1=1", "a b", "o'r", ""] {
-            let err = resolve_cdc_columns("mysql://u:p@127.0.0.1:3306/db", bad, None)
-                .expect_err(&format!("{bad:?} must be rejected"));
+            let err = resolve_cdc_columns(
+                "mysql://u:p@127.0.0.1:3306/db",
+                bad,
+                None,
+                &crate::types::ColumnOverrides::new(),
+            )
+            .expect_err(&format!("{bad:?} must be rejected"));
             assert!(
                 err.to_string().contains("plain [schema.]table identifier"),
                 "{bad:?} → {err}"

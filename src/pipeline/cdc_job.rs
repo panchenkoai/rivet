@@ -171,12 +171,16 @@ fn run_cdc_inner(
             .unwrap_or_default();
         wired.push((t.clone(), dest, uri));
     }
+    // `columns:` type overrides — honoured exactly like the batch path (a
+    // multi-table export applies the same map to every table).
+    let overrides = crate::plan::build::parse_column_overrides_pub(&export.columns, &export.name)?;
     let outputs = wired
         .iter()
         .map(|(t, d, u)| crate::source::cdc::CaptureOutput {
             table: t.clone(),
             dest: d.as_ref(),
             dest_uri: u.clone(),
+            overrides: overrides.clone(),
         })
         .collect();
     let now = chrono::Utc::now().to_rfc3339();
