@@ -14,6 +14,12 @@
   crash mid-snapshot re-snapshots on retry with the anchor intact; later runs skip straight to the
   drain. MySQL / SQL Server require `cdc.checkpoint:` with it (validated at load). Live (all three
   engines): `*_initial_snapshot_covers_preexisting_rows_then_streams`.
+- **CDC↔batch type parity is now TOTAL — arrays and Decimal256 close the last two gaps.** PostgreSQL
+  arrays ride through CDC as real `List` columns (element field name/nullability matched for ArrayData
+  equality; inner NULLs, quoted/escaped elements, and empty arrays preserved — the `test_decoding`
+  literal is parsed, never passed through as text), and `NUMERIC`/`DECIMAL` above precision 38 build as
+  `Decimal256` with the same digit-exact parse as `Decimal128`. The PostgreSQL matrix test drops its
+  "everything but arrays" exception and now covers the full surface, `NUMERIC(60,10)` included.
 - **Table-qualified `columns:` override keys.** On a multi-table (schema-wide) export a bare key
   (`amount:`) applies to every captured table that has the column; a qualified key
   (`"orders.amount":`) targets one table and wins over the bare key there — same-named columns with

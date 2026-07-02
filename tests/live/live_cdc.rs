@@ -907,9 +907,9 @@ exports:
 
 // The all-types parity contract for PostgreSQL — pins the test_decoding parse
 // fixes: uuid/bytea text→raw bytes, TIME→Time64, INTERVAL→the batch's ISO 8601
-// canon, and NULLs of text-shaped columns staying NULL (not ""). Arrays are the
-// known exception (CDC carries the PG literal as text until List support), so
-// this matrix deliberately covers everything BUT arrays.
+// canon, NULLs of text-shaped columns staying NULL (not ""), ARRAYS as real
+// List columns (elements incl. inner NULLs, commas, quotes — not the PG
+// literal text), and NUMERIC(p>38) as Decimal256. Full surface, no exceptions.
 #[test]
 #[ignore = "live: requires docker compose postgres (wal_level=logical)"]
 fn pg_cdc_full_type_matrix_matches_batch() {
@@ -930,7 +930,9 @@ fn pg_cdc_full_type_matrix_matches_batch() {
            uid UUID, attrs JSONB, flag BOOLEAN, int2_col SMALLINT,
            float8_col DOUBLE PRECISION, date_col DATE, time_col TIME,
            interval_col INTERVAL, enum_col rivet_status,
-           doc_col JSON, ch_col CHAR(8), vc_col VARCHAR(50), float4_col REAL)"
+           doc_col JSON, ch_col CHAR(8), vc_col VARCHAR(50), float4_col REAL,
+           tags TEXT[], nums INTEGER[], floats DOUBLE PRECISION[],
+           big_num NUMERIC(60,10))"
     ))
     .unwrap();
     let _tbl = PgTable::adopt(tbl.clone());
@@ -949,8 +951,13 @@ fn pg_cdc_full_type_matrix_matches_batch() {
             'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380011', '{{\"n\":1}}'::jsonb, TRUE,
             32767, 2.5, '2024-03-15', '14:30:00.123456',
             INTERVAL '1 year 2 mons 3 days', 'active',
-            '{{\"k\": [1, 2]}}'::json, 'pad', 'plain varchar', 3.14);
-         INSERT INTO {tbl} (id) VALUES (2);"
+            '{{\"k\": [1, 2]}}'::json, 'pad', 'plain varchar', 3.14,
+            ARRAY['with,comma', 'he said \"hi\"', NULL], ARRAY[1, NULL, 3],
+            ARRAY[2.5, -0.5], 123456789012345678901234567890.0123456789);
+         INSERT INTO {tbl} VALUES (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+            NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+            NULL, NULL, NULL, NULL);
+         INSERT INTO {tbl} (id, tags, nums) VALUES (3, ARRAY[]::text[], '{{}}');"
     ))
     .unwrap();
 

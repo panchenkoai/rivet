@@ -267,6 +267,15 @@ fn map_pg_value(typ: &str, val: &str, quoted: bool) -> RivetValue {
     if !quoted && val == "null" {
         return RivetValue::Null;
     }
+    // One-dimensional arrays: `text[]` / `integer[]` / … render as the PG
+    // array literal (`{a,"with,comma",NULL}`); parse to element values so the
+    // sink builds a real List column (batch parity), never the literal text.
+    if let Some(inner) = typ.strip_suffix("[]") {
+        return parse_pg_array_literal(inner, val).map_or_else(
+            || RivetValue::Bytes(val.as_bytes().to_vec()),
+            RivetValue::Array,
+        );
+    }
     let t = typ;
     if t == "integer" || t == "bigint" || t == "smallint" || t == "oid" {
         return val.parse::<i64>().map_or(RivetValue::Null, RivetValue::Int);
@@ -331,6 +340,57 @@ fn map_pg_value(typ: &str, val: &str, quoted: bool) -> RivetValue {
     }
     // text / varchar / char / json / … → string bytes.
     RivetValue::Bytes(val.as_bytes().to_vec())
+}
+
+/// Parse a PG array literal (`{alpha,"with,comma","he said \"hi\"",NULL}`)
+/// into element values, mapped through [`map_pg_value`] with the element type.
+/// Quoted elements un-escape `\"` and `\\`; the bare token `NULL` is an inner
+/// NULL. `None` for anything that isn't a `{…}` literal (fail open to text).
+fn parse_pg_array_literal(inner_type: &str, val: &str) -> Option<Vec<RivetValue>> {
+    let body = val.strip_prefix('{')?.strip_suffix('}')?;
+    if body.is_empty() {
+        return Some(Vec::new());
+    }
+    let b = body.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i <= b.len() {
+        if b.get(i) == Some(&b'"') {
+            // Quoted element: copy until the closing quote, un-escaping.
+            let mut elem = String::new();
+            i += 1;
+            while i < b.len() && b[i] != b'"' {
+                if b[i] == b'\\' && i + 1 < b.len() {
+                    elem.push(b[i + 1] as char);
+                    i += 2;
+                } else {
+                    let n = utf8_len(b[i]);
+                    elem.push_str(&body[i..i + n]);
+                    i += n;
+                }
+            }
+            i += 1; // closing quote
+            out.push(map_pg_value(inner_type, &elem, true));
+            if b.get(i) == Some(&b',') {
+                i += 1;
+            } else {
+                break;
+            }
+        } else {
+            let end = body[i..].find(',').map(|p| i + p).unwrap_or(body.len());
+            let tok = &body[i..end];
+            out.push(if tok == "NULL" {
+                RivetValue::Null
+            } else {
+                map_pg_value(inner_type, tok, false)
+            });
+            if end == body.len() {
+                break;
+            }
+            i = end + 1;
+        }
+    }
+    Some(out)
 }
 
 /// Parse "HH:MM:SS[.ffffff]" into microseconds since midnight.
@@ -502,6 +562,37 @@ mod tests {
             RivetValue::Bytes(b"Hello".to_vec()),
             "bytea must decode the \\x hex rendering to raw bytes"
         );
+    }
+
+    // Arrays parse to element values (a real List column downstream), never
+    // the literal text — including the hostile shapes: commas inside quoted
+    // elements, escaped quotes, inner NULLs, and the empty array.
+    #[test]
+    fn array_literals_parse_to_typed_elements() {
+        let line = "table public.t: INSERT: \
+                    tags[text[]]:'{alpha,\"with,comma\",\"he said \\\"hi\\\"\",NULL}' \
+                    nums[integer[]]:'{1,NULL,3}' \
+                    empty[text[]]:'{}'";
+        let ev = parse_test_decoding("0/ABC", line).unwrap();
+        let after = ev.after.unwrap();
+        assert_eq!(
+            after[0],
+            RivetValue::Array(vec![
+                RivetValue::Bytes(b"alpha".to_vec()),
+                RivetValue::Bytes(b"with,comma".to_vec()),
+                RivetValue::Bytes(b"he said \"hi\"".to_vec()),
+                RivetValue::Null,
+            ])
+        );
+        assert_eq!(
+            after[1],
+            RivetValue::Array(vec![
+                RivetValue::Int(1),
+                RivetValue::Null,
+                RivetValue::Int(3),
+            ])
+        );
+        assert_eq!(after[2], RivetValue::Array(Vec::new()));
     }
 
     #[test]

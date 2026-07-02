@@ -47,6 +47,10 @@ pub(crate) enum RivetValue {
     /// Raw source bytes — `Utf8` text, `Binary`, or a `Decimal` string, decided by
     /// the target Arrow type at build time.
     Bytes(Vec<u8>),
+    /// A one-dimensional array (PG `text[]`/`integer[]`/…) — elements are
+    /// scalar `RivetValue`s (inner NULLs as [`RivetValue::Null`]). Built into a
+    /// real Arrow `List` column, matching the batch export.
+    Array(Vec<RivetValue>),
 }
 
 impl RivetValue {
@@ -86,6 +90,7 @@ impl RivetValue {
             | RivetValue::TimeMicros(_) => 8,
             RivetValue::DateTime(_) => 12,
             RivetValue::Bytes(b) => b.len(),
+            RivetValue::Array(v) => v.iter().map(RivetValue::estimated_bytes).sum::<usize>() + 16,
         }
     }
 
@@ -101,6 +106,7 @@ impl RivetValue {
             RivetValue::DateTime(dt) => Json::String(dt.to_string()),
             RivetValue::TimeMicros(us) => Json::from(*us),
             RivetValue::Bytes(b) => Json::String(String::from_utf8_lossy(b).into_owned()),
+            RivetValue::Array(v) => Json::Array(v.iter().map(RivetValue::to_json).collect()),
         }
     }
 }
@@ -111,6 +117,20 @@ impl RivetValue {
 /// so `json` / `uuid` / real int widths land identically to the batch export —
 /// or coarsens the column to `Utf8`.
 pub(crate) fn is_buildable(dt: &DataType) -> bool {
+    if let DataType::List(inner) = dt {
+        // One-dimensional arrays with the element types the batch list builder
+        // produces — full type parity for PG arrays.
+        return matches!(
+            inner.data_type(),
+            DataType::Boolean
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::Utf8
+        );
+    }
     matches!(
         dt,
         DataType::Boolean
@@ -127,6 +147,8 @@ pub(crate) fn is_buildable(dt: &DataType) -> bool {
             | DataType::Date32
             | DataType::Time64(TimeUnit::Microsecond)
             | DataType::Decimal128(_, _)
+            // NUMERIC precision > 38 (PG numeric / MySQL decimal up to 65).
+            | DataType::Decimal256(_, _)
             | DataType::Utf8
             | DataType::LargeUtf8
             | DataType::Binary
@@ -283,6 +305,21 @@ pub(crate) fn build_column(dt: &DataType, cells: &[Option<&RivetValue>]) -> Resu
             }
             Arc::new(b.finish())
         }
+        // NUMERIC precision > 38 — same digit-exact parse, into i256.
+        DataType::Decimal256(p, s) => {
+            let mut b = arrow::array::Decimal256Builder::with_capacity(cells.len())
+                .with_data_type(DataType::Decimal256(*p, *s));
+            for c in cells {
+                match c.and_then(|v| decimal_to_i256(v, *s)) {
+                    Some(i) => b.append_value(i),
+                    None => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        // One-dimensional arrays → a real List column, ELEMENT FIELD INCLUDED
+        // (name/nullability must match the batch schema for ArrayData parity).
+        DataType::List(field) => build_list_column(field, cells)?,
         DataType::Binary => {
             let mut b = BinaryBuilder::with_capacity(cells.len(), 0);
             for c in cells {
@@ -341,6 +378,143 @@ pub(crate) fn build_column(dt: &DataType, cells: &[Option<&RivetValue>]) -> Resu
             Arc::new(b.finish())
         }
     })
+}
+
+/// Build a `List<element>` column from [`RivetValue::Array`] cells. The child
+/// builder is chosen by the element type; the LIST FIELD itself is preserved
+/// (`with_field`) so the element name/nullability — and therefore the
+/// `ArrayData` — matches the batch export exactly. A NULL cell is a null list;
+/// an empty array is an empty (non-null) list; inner NULL elements survive.
+fn build_list_column(
+    field: &arrow::datatypes::FieldRef,
+    cells: &[Option<&RivetValue>],
+) -> Result<ArrayRef> {
+    use RivetValue as V;
+    use arrow::array::ListBuilder;
+
+    macro_rules! list_col {
+        ($child:expr, $append:expr) => {{
+            let mut lb = ListBuilder::new($child).with_field(field.clone());
+            for c in cells {
+                match c {
+                    Some(V::Array(elems)) => {
+                        for e in elems {
+                            #[allow(clippy::redundant_closure_call)]
+                            $append(lb.values(), e);
+                        }
+                        lb.append(true);
+                    }
+                    _ => lb.append(false),
+                }
+            }
+            Ok(Arc::new(lb.finish()) as ArrayRef)
+        }};
+    }
+
+    match field.data_type() {
+        DataType::Boolean => list_col!(
+            BooleanBuilder::new(),
+            |b: &mut BooleanBuilder, e: &RivetValue| {
+                match e {
+                    V::Bool(v) => b.append_value(*v),
+                    _ => b.append_null(),
+                }
+            }
+        ),
+        DataType::Int16 => list_col!(
+            Int16Builder::new(),
+            |b: &mut Int16Builder, e: &RivetValue| {
+                match e {
+                    V::Int(i) => match i16::try_from(*i) {
+                        Ok(v) => b.append_value(v),
+                        Err(_) => b.append_null(),
+                    },
+                    _ => b.append_null(),
+                }
+            }
+        ),
+        DataType::Int32 => list_col!(
+            Int32Builder::new(),
+            |b: &mut Int32Builder, e: &RivetValue| {
+                match e {
+                    V::Int(i) => match i32::try_from(*i) {
+                        Ok(v) => b.append_value(v),
+                        Err(_) => b.append_null(),
+                    },
+                    _ => b.append_null(),
+                }
+            }
+        ),
+        DataType::Int64 => list_col!(
+            Int64Builder::new(),
+            |b: &mut Int64Builder, e: &RivetValue| {
+                match e {
+                    V::Int(i) => b.append_value(*i),
+                    _ => b.append_null(),
+                }
+            }
+        ),
+        DataType::Float32 => list_col!(
+            Float32Builder::new(),
+            |b: &mut Float32Builder, e: &RivetValue| {
+                match e {
+                    V::Float(f) => b.append_value(*f as f32),
+                    _ => b.append_null(),
+                }
+            }
+        ),
+        DataType::Float64 => list_col!(
+            Float64Builder::new(),
+            |b: &mut Float64Builder, e: &RivetValue| {
+                match e {
+                    V::Float(f) => b.append_value(*f),
+                    V::Int(i) => b.append_value(*i as f64),
+                    _ => b.append_null(),
+                }
+            }
+        ),
+        DataType::Utf8 => list_col!(
+            StringBuilder::new(),
+            |b: &mut StringBuilder, e: &RivetValue| {
+                match e {
+                    V::Null => b.append_null(),
+                    other => b.append_value(render_str(other)),
+                }
+            }
+        ),
+        other => anyhow::bail!("unsupported list element type {other:?}"),
+    }
+}
+
+/// As [`decimal_to_i128`] but into `i256` for `Decimal256` columns.
+fn decimal_to_i256(v: &RivetValue, scale: i8) -> Option<arrow::datatypes::i256> {
+    let s = match v {
+        RivetValue::Bytes(b) => std::str::from_utf8(b).ok()?.trim().to_string(),
+        RivetValue::Int(i) => i.to_string(),
+        RivetValue::UInt(u) => u.to_string(),
+        RivetValue::Float(f) if f.is_finite() => {
+            format!("{f:.prec$}", prec = scale.max(0) as usize)
+        }
+        _ => return None,
+    };
+    let (neg, s) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.as_str()),
+    };
+    let (int_part, frac_part) = match s.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (s, ""),
+    };
+    let scale = scale.max(0) as usize;
+    let mut digits = String::with_capacity(int_part.len() + scale);
+    digits.push_str(int_part);
+    let frac: String = frac_part.chars().take(scale).collect();
+    digits.push_str(&frac);
+    for _ in frac.len()..scale {
+        digits.push('0');
+    }
+    let mag = arrow::datatypes::i256::from_string(&digits)?;
+    Some(if neg { -mag } else { mag })
 }
 
 /// Parse a decimal carried as source bytes (e.g. `"150.00"`) into the scaled
@@ -574,6 +748,10 @@ fn render_str(v: &RivetValue) -> String {
         RivetValue::DateTime(dt) => dt.to_string(),
         RivetValue::TimeMicros(us) => us.to_string(),
         RivetValue::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+        RivetValue::Array(v) => {
+            let inner: Vec<String> = v.iter().map(render_str).collect();
+            format!("[{}]", inner.join(","))
+        }
     }
 }
 
