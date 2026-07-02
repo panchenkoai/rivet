@@ -140,6 +140,51 @@ fn mssql_cdc_resume_captures_only_new_changes() {
     );
 }
 
+// Idle-first-run anchor model (per-engine, see CLAUDE.md): SQL Server has no
+// client-side anchor to pin — a run without a checkpoint floors at
+// `fn_cdc_get_min_lsn` (over-reads, never skips). This test pins that property:
+// if a no-checkpoint run ever starts at the *max* LSN instead, a change landing
+// between two idle scheduler cycles would be silently skipped — the exact hole
+// MySQL shipped with (`first_run_with_zero_changes_pins_the_checkpoint_at_open`).
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_idle_first_run_then_change_is_captured_not_skipped() {
+    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("rivet_cdc_msidle");
+    let ci = format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT)"
+    ));
+    enable_cdc(&table, &ci);
+    let _guard = CdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+
+    // Run 1: nothing captured yet — the change table is empty.
+    let ckpt = d.path().join("cdc.ckpt");
+    let out1 = d.path().join("out1");
+    std::fs::create_dir_all(&out1).unwrap();
+    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out1));
+    assert_eq!(manifest_rows(&out1), 0, "idle run 1 captures nothing");
+
+    // A change lands BETWEEN the idle run and the next scheduler cycle.
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (1,10)"));
+    wait_for_capture(&ci, 1);
+
+    // Run 2 must capture it — never skip past it to the current max LSN.
+    let out2 = d.path().join("out2");
+    std::fs::create_dir_all(&out2).unwrap();
+    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out2));
+    assert_eq!(
+        manifest_rows(&out2),
+        1,
+        "the change between an idle run and the next run must be captured, not skipped"
+    );
+}
+
 #[test]
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
 fn mssql_cdc_crash_before_checkpoint_re_reads_on_resume() {

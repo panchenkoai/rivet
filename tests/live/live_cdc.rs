@@ -320,6 +320,50 @@ fn cdc_throughput_drains_a_large_backlog() {
     );
 }
 
+// Idle-first-run anchor model (per-engine, see CLAUDE.md): MySQL's ONLY resume
+// anchor is the client checkpoint file, and the sink writes it at part commits —
+// so the first checkpointed open must persist its coordinates immediately, or an
+// idle bounded run (zero changes drained) leaves no anchor and the next run
+// re-anchors to a newer "current" position, silently skipping every change in
+// between. This is the binary-level (`rivet run`) mirror of the stream-level
+// regression `first_run_with_zero_changes_pins_the_checkpoint_at_open`.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_idle_first_run_then_change_is_captured_not_skipped() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_idle_bin");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let _guard = Table(tbl.clone());
+
+    // Run 1: checkpoint path configured, no file yet, nothing to capture.
+    let ckpt = d.path().join("cdc.ckpt");
+    let out1 = d.path().join("out1");
+    std::fs::create_dir_all(&out1).unwrap();
+    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out1));
+    assert_eq!(manifest_rows(&out1), 0, "idle run 1 captures nothing");
+    assert!(
+        ckpt.exists(),
+        "an idle first run must still pin the open position to the checkpoint"
+    );
+
+    // A change lands BETWEEN the idle run and the next scheduler cycle.
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1, 100)"))
+        .unwrap();
+
+    // Run 2 resumes from the pinned position and must capture it.
+    let out2 = d.path().join("out2");
+    std::fs::create_dir_all(&out2).unwrap();
+    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out2));
+    assert_eq!(
+        manifest_rows(&out2),
+        1,
+        "the change between an idle run and the next run must be captured, not skipped"
+    );
+}
+
 #[test]
 #[ignore = "live: requires docker compose mysql (binlog ROW + REPLICATION grant)"]
 fn cdc_crash_after_flush_before_ack_re_reads_on_resume() {
@@ -440,6 +484,48 @@ fn pg_cdc_resume_captures_only_new_changes() {
         manifest_rows(&out2),
         2,
         "resume drains only the 2 new changes (slot advanced, no re-read)"
+    );
+}
+
+// Idle-first-run anchor model (per-engine, see CLAUDE.md): PostgreSQL pins the
+// resume position server-side the moment the slot is created — so a first run
+// that drains ZERO changes still anchors, and a change landing between two idle
+// scheduler cycles is captured by the next one. This pins that property (the
+// exact hole MySQL shipped with, where the client checkpoint was the only anchor
+// and an idle run never wrote it).
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_idle_first_run_then_change_is_captured_not_skipped() {
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_cdc_pgidle");
+    let slot = unique_name("rivet_idle_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+
+    // Run 1: the slot does not exist yet — rivet creates it and drains nothing.
+    let out1 = d.path().join("out1");
+    std::fs::create_dir_all(&out1).unwrap();
+    run_cdc(&pg_cdc_config(&d, &tbl, &slot, &out1));
+    let _slot = Slot(slot.clone());
+    assert_eq!(manifest_rows(&out1), 0, "idle run 1 drains nothing");
+
+    // A change lands BETWEEN the idle run and the next scheduler cycle.
+    c.execute(&format!("INSERT INTO {tbl} VALUES (1,10)"), &[])
+        .unwrap();
+
+    // Run 2 must capture it — the slot created in run 1 pinned the position.
+    let out2 = d.path().join("out2");
+    std::fs::create_dir_all(&out2).unwrap();
+    run_cdc(&pg_cdc_config(&d, &tbl, &slot, &out2));
+    assert_eq!(
+        manifest_rows(&out2),
+        1,
+        "the change between an idle run and the next run must be captured, not skipped"
     );
 }
 

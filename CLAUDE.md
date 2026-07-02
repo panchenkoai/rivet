@@ -106,6 +106,43 @@ engine resumes by a different mechanism (MySQL binlog checkpoint file,
 PostgreSQL slot advance, SQL Server from-LSN), so one engine passing
 proves nothing about another. Never infer resume from capture.
 
+The two-run test has a blind spot the **idle-first-run** variant covers:
+run 1 captures *zero* changes → change → run 2 must capture it. MySQL
+shipped losing that change — the checkpoint was written only at a part
+commit, so an idle bounded run left no anchor and the next run re-anchored
+to a newer "current" position (`SHOW MASTER STATUS`), silently skipping
+everything in between. "Enable CDC during a quiet period" is exactly the
+ops sequence that hits it. The anchor rule per engine: PostgreSQL pins
+server-side at slot creation; SQL Server floors at `fn_cdc_get_min_lsn`
+(over-reads, never skips); MySQL has NO server-side anchor — the first
+checkpointed open must persist its coordinates immediately
+(`first_run_with_zero_changes_pins_the_checkpoint_at_open`). A new engine
+must state which of the three anchor models it has and test the idle
+variant accordingly.
+
+## Sink part names must be run-unique — prove it with a two-run test
+
+A sink that names its output files with only a per-run sequence
+(`cdc-000000`, `part-0`, …) silently overwrites the previous run's files
+when consecutive runs share a destination prefix — which is exactly the
+documented scheduler model (`until_current: true` on an interval). The
+CDC sink shipped this way: run N+1's first part clobbered run N's
+`cdc-000000.parquet` *after* the slot had been acked past those changes,
+so the data was gone from both the source log and the destination — the
+stream-level at-least-once guarantee (peek → flush → ack, fault-hook
+tested) was fully correct and the data was still lost, one layer up. The
+batch path was already immune (run-timestamp part names + a finalize WARN
+on prior `_SUCCESS`); the CDC sink reimplemented naming and silently
+dropped both defenses.
+
+Process rule: **every new sink/writer gets a two-consecutive-runs-into-
+the-same-prefix test** asserting the union of both runs' rows is readable
+afterwards (`roast_second_run_into_same_prefix_must_not_clobber_prior_parts`
+in `src/source/cdc/sink.rs` is the template). Run-uniqueness needs
+sub-second precision: in live verification two scheduler cycles landed
+125 ms apart — a `%Y%m%d_%H%M%S` stamp would have collided; derive the
+name from the millisecond `run_id`, filename-sanitized.
+
 ## Performance diagnosis: measure cold, don't theorize
 
 A "why is this slow?" answer reasoned from the code is a hypothesis, not a

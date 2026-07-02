@@ -468,6 +468,14 @@ pub enum ExportMode {
     Cdc,
 }
 
+/// Default PostgreSQL logical slot when `cdc.slot` is omitted — shared by the
+/// runner ([`crate::pipeline`]'s cdc job) and config validation, so the
+/// same-slot conflict check sees the value that will actually be used.
+pub const DEFAULT_PG_SLOT: &str = "rivet_slot";
+/// Default MySQL replica `server_id` when `cdc.server_id` is omitted (see
+/// [`DEFAULT_PG_SLOT`] for why this is a shared const).
+pub const DEFAULT_MYSQL_SERVER_ID: u32 = 4271;
+
 /// Per-export CDC settings, required when `mode: cdc`. The output `table`,
 /// `destination`, and `format` come from the export itself; this carries only the
 /// CDC-specific knobs (resume + per-engine stream params).

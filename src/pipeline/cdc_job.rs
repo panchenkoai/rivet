@@ -115,8 +115,13 @@ fn run_cdc_inner(
     run_capture(CdcCapture {
         cdc_cfg: CdcConfig {
             url,
-            server_id: cdc.server_id.unwrap_or(4271),
-            slot: cdc.slot.clone().unwrap_or_else(|| "rivet_slot".to_string()),
+            server_id: cdc
+                .server_id
+                .unwrap_or(crate::config::DEFAULT_MYSQL_SERVER_ID),
+            slot: cdc
+                .slot
+                .clone()
+                .unwrap_or_else(|| crate::config::DEFAULT_PG_SLOT.to_string()),
             capture_instance: cdc.capture_instance.clone(),
             checkpoint: cdc.checkpoint.as_ref().map(PathBuf::from),
             until_current: cdc.until_current,

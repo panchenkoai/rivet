@@ -80,6 +80,17 @@ impl MysqlChangeStream {
         })
     }
 
+    /// The source's current `(binlog_file, position)` coordinate (`SHOW MASTER STATUS`).
+    fn current_coordinates(url: &str, tls: Option<&TlsConfig>) -> Result<(String, u64)> {
+        let mut c = connect_conn(url, tls)?;
+        let row: mysql::Row = c
+            .query_first("SHOW MASTER STATUS")?
+            .ok_or_else(|| anyhow::anyhow!("mysql: binlog disabled (SHOW MASTER STATUS empty)"))?;
+        let file: String = row.get(0).expect("binlog file column");
+        let pos: u64 = row.get(1).expect("binlog pos column");
+        Ok((file, pos))
+    }
+
     /// Open a stream from the source's *current* position (`SHOW MASTER STATUS`).
     pub(crate) fn open_from_current(
         url: &str,
@@ -87,12 +98,7 @@ impl MysqlChangeStream {
         non_block: bool,
         tls: Option<&TlsConfig>,
     ) -> Result<Self> {
-        let mut c = connect_conn(url, tls)?;
-        let row: mysql::Row = c
-            .query_first("SHOW MASTER STATUS")?
-            .ok_or_else(|| anyhow::anyhow!("mysql: binlog disabled (SHOW MASTER STATUS empty)"))?;
-        let file: String = row.get(0).expect("binlog file column");
-        let pos: u64 = row.get(1).expect("binlog pos column");
+        let (file, pos) = Self::current_coordinates(url, tls)?;
         Self::open(url, server_id, file, pos, non_block, tls)
     }
 
@@ -124,7 +130,17 @@ impl MysqlChangeStream {
                 .ok_or_else(|| anyhow::anyhow!("mysql cdc checkpoint missing 'pos'"))?;
             return Self::open(url, server_id, file, p, non_block, tls);
         }
-        Self::open_from_current(url, server_id, non_block, tls)
+        // First run (no checkpoint yet): anchor at the current position and persist
+        // it IMMEDIATELY. PostgreSQL pins its anchor server-side at open (slot
+        // creation); MySQL's only anchor is this file, and the sink writes it only
+        // at a part commit — so an idle bounded run (zero changes drained) would
+        // otherwise leave no checkpoint, the next run would re-anchor to a newer
+        // "current" position, and every change in between would be silently skipped.
+        let (file, pos) = Self::current_coordinates(url, tls)?;
+        if let Some(path) = ckpt {
+            Position(serde_json::json!({ "file": file, "pos": pos })).save(path)?;
+        }
+        Self::open(url, server_id, file, pos, non_block, tls)
     }
 
     /// Pull one binlog event and expand it into `pending`. `Ok(false)` ⇒ stream
@@ -325,6 +341,56 @@ mod tests {
                 .and_then(Json::as_u64)
                 .unwrap()
                 > 0
+        );
+    }
+
+    // RED test for the idle-first-run hole: PostgreSQL pins its resume anchor
+    // server-side at open (slot creation); MySQL has no server-side anchor — the
+    // checkpoint file is the ONLY resume position, and it was written only at a
+    // part commit. So a bounded first run that drains ZERO changes left no
+    // checkpoint, the next run re-anchored to a newer "current" position, and
+    // every change in between was silently skipped. Enable-CDC-during-a-quiet-
+    // period is exactly the realistic ops sequence that hits this.
+    #[test]
+    #[ignore = "live: requires docker compose mysql (binlog_format=ROW)"]
+    fn first_run_with_zero_changes_pins_the_checkpoint_at_open() {
+        let mut c = Conn::new(Opts::from_url(URL).unwrap()).unwrap();
+        c.query_drop("DROP TABLE IF EXISTS cdc_idle_first").unwrap();
+        c.query_drop("CREATE TABLE cdc_idle_first (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = dir.path().join("mysql.ckpt.json");
+
+        // Run 1: checkpoint path configured, no file yet, nothing to drain
+        // (non_block ⇒ bounded drain-and-exit, the scheduler model).
+        let mut s = MysqlChangeStream::open_or_resume(URL, 4245, Some(&ckpt), true, None).unwrap();
+        assert!(
+            s.by_ref()
+                .map(|e| e.unwrap())
+                .all(|e| e.table != "cdc_idle_first"),
+            "run 1 must drain zero changes for this table"
+        );
+        drop(s);
+        assert!(
+            Position::load(&ckpt).unwrap().is_some(),
+            "a first run with no prior checkpoint must pin the open position, \
+             even when it captures nothing"
+        );
+
+        // A change made BETWEEN the idle run 1 and run 2.
+        c.query_drop("INSERT INTO cdc_idle_first VALUES (1, 100)")
+            .unwrap();
+
+        // Run 2 must resume from the pinned position and capture it.
+        let mut s2 = MysqlChangeStream::open_or_resume(URL, 4245, Some(&ckpt), true, None).unwrap();
+        let got = s2
+            .by_ref()
+            .map(|e| e.unwrap())
+            .find(|e| e.table == "cdc_idle_first");
+        assert!(
+            got.is_some(),
+            "the change between an idle run and the next run must be captured, not skipped"
         );
     }
 

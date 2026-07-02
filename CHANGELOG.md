@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **CDC resource-conflict validation** (`RIVET_CONFIG_CDC_RESOURCE_CONFLICT`). Two `mode: cdc` exports
+  resolving to the same PostgreSQL slot, MySQL `server_id`, or checkpoint path are now rejected at config
+  load — **including the defaults colliding** (`rivet_slot` / `4271`), which is what a naive multi-table
+  CDC config hits: a shared slot is acked past changes the other export never read (mutual silent data
+  loss), a shared `server_id` gets the older replica connection killed by the server, and a shared
+  checkpoint file gets its resume position overwritten. SQL Server `capture_instance` sharing stays
+  allowed (read-only poll; resume state is the per-export checkpoint).
+
+### Fixed
+
+- **MySQL CDC: an idle first run now pins the resume position.** The checkpoint file was written only
+  at a part commit, and a MySQL run without a checkpoint anchors to the *current* master position
+  (`SHOW MASTER STATUS`). So a bounded first run that drained zero changes left no checkpoint, the next
+  run re-anchored to a newer "now", and every change in between was **silently skipped** — the realistic
+  "enable CDC during a quiet period" sequence lost data. `open_or_resume` now persists the open
+  coordinates immediately when no checkpoint exists (the client-side analogue of PostgreSQL's
+  server-side slot pinning at creation; SQL Server was never exposed — no checkpoint there floors at
+  `fn_cdc_get_min_lsn`, over-reading instead of skipping). Regression (live, two-run):
+  `first_run_with_zero_changes_pins_the_checkpoint_at_open`.
+
+- **CDC parts no longer overwrite across runs.** CDC part files were named `cdc-{seq:06}` with the
+  sequence restarting at 0 every run, so the documented scheduler model (`until_current: true` re-run
+  into the same destination prefix) silently overwrote the previous cycle's parts — *after* the source
+  had been acked past those changes, making them unrecoverable (not in the slot, not in the destination).
+  Part names now carry the run id (`cdc-<run_id>-000000.parquet`, filename-sanitized), mirroring the
+  batch path's run-stamped naming, so consecutive runs append alongside each other; the run id's
+  millisecond precision keeps back-to-back scheduler cycles collision-free (two live cycles landed
+  125 ms apart). `manifest.json`/`_SUCCESS` still describe the latest run only — same as a batch re-run.
+  Regression: `roast_second_run_into_same_prefix_must_not_clobber_prior_parts`.
+
 ## 0.16.3 (2026-06-30) — dependency bump: arrow / parquet 58 → 59
 
 A pure dependency bump (no config-grammar change — the schema bump is the version title only).

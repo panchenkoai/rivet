@@ -29,7 +29,7 @@ dev — the URL is otherwise visible in `ps` / shell history.
 | flag | meaning |
 | ------ | --------- |
 | `--server-id` | replica id for the binlog connection (MySQL). **Must be unique** — distinct from the source and every real replica. Default `4271`. |
-| `--checkpoint PATH` | persist/resume the log position. Omit to tail from the current position without checkpointing. |
+| `--checkpoint PATH` | persist/resume the log position. Omit to tail from the current position without checkpointing. On the **first** checkpointed MySQL run the open position is persisted immediately (the client-side analogue of PostgreSQL's slot pinning at creation), so an idle first run still anchors the resume position — without it, changes landing between two idle scheduler cycles would be skipped. |
 | `--table NAME` | only emit this table (repeatable for NDJSON; **exactly one** required for `--output`, whose schema is resolved from the source). |
 | `--output DIR` | write typed Parquet/CSV files instead of NDJSON. |
 | `--max-events N` | stop after N changes (otherwise stream until interrupted; the per-event checkpoint makes an interrupted run resumable). |
@@ -78,7 +78,36 @@ rivet metrics                    # the CDC run appears with mode=cdc, like a bat
 ```
 
 A `mode: cdc` export reuses the export's `table`, `destination`, and `format`; the
-`cdc:` block carries only the CDC-specific knobs. Each run produces the standard
+`cdc:` block carries only the CDC-specific knobs.
+
+**Multiple CDC exports: each owns its stream resources.** A PostgreSQL slot has
+ONE consumer (a shared slot is advanced past changes the other export never
+read), a MySQL `server_id` has ONE connection (the server kills the older one),
+and a checkpoint file has ONE writer. Config validation rejects two `mode: cdc`
+exports that resolve to the same slot / `server_id` / checkpoint — **including
+the defaults** (`rivet_slot`, `4271`): a multi-table CDC config must set them
+explicitly per export:
+
+```yaml
+exports:
+  - name: orders_cdc
+    table: orders
+    mode: cdc
+    cdc: { slot: rivet_orders, checkpoint: /var/lib/rivet/orders.ckpt }
+    ...
+  - name: users_cdc
+    table: users
+    mode: cdc
+    cdc: { slot: rivet_users, checkpoint: /var/lib/rivet/users.ckpt }
+    ...
+```
+
+Note the cost model: N tables = N slots (PostgreSQL decodes the WAL once **per
+slot**) / N binlog connections (MySQL). For a handful of tables that is fine;
+for hundreds, wait for slot multiplexing (one stream fanning out to per-table
+outputs) rather than creating hundreds of slots. SQL Server is the exception —
+`capture_instance` sharing is safe (the change-table poll is read-only; resume
+state lives in the per-export checkpoint). Each run produces the standard
 per-export summary block and an `export_metrics` row (rows / files / bytes /
 duration / status), so CDC shows up in `rivet metrics` and the run aggregate
 exactly like a batch export. **TLS:** unlike the CLI (which is loopback-only),
@@ -296,6 +325,14 @@ as `String` (`JSONExtract*` parses it), **BigQuery** as `BYTES` (`PARSE_JSON` af
 `SAFE_CONVERT_BYTES_TO_STRING`); integers keep their width (`INT32`/`INT64`) and
 timestamps their microseconds. The JSON text round-trips losslessly in all three — the
 type that auto-detects differs, the data does not.
+
+**Part naming.** Parts are run-stamped — `cdc-<run_id>-000000.parquet` — so a
+scheduler re-running into the same prefix **appends** each cycle's parts alongside
+the previous cycle's (nothing is overwritten). `manifest.json` / `_SUCCESS`
+describe the **latest** run only; a glob reader over the prefix sees the union of
+all cycles, which is the intended at-least-once stream — dedupe by PK + `__op` +
+`__pos` downstream, and archive parts you have already loaded if you want the
+prefix to stay small.
 
 Without `--output`, rivet emits the same information as NDJSON (one JSON object
 per change) to stdout.

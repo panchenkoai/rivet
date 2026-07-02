@@ -243,6 +243,10 @@ pub mod codes {
     pub const CONFIG_CHUNK_COUNT_INVALID: &str = "RIVET_CONFIG_CHUNK_COUNT_INVALID";
     pub const CONFIG_CHUNK_BY_DAYS_INVALID: &str = "RIVET_CONFIG_CHUNK_BY_DAYS_INVALID";
     pub const CONFIG_DUPLICATE_EXPORT: &str = "RIVET_CONFIG_DUPLICATE_EXPORT";
+    /// Two `mode: cdc` exports resolved to the same per-engine stream resource
+    /// (PostgreSQL slot / MySQL server_id / checkpoint path) — including the
+    /// defaults colliding, which is what a naive multi-table CDC config hits.
+    pub const CONFIG_CDC_RESOURCE_CONFLICT: &str = "RIVET_CONFIG_CDC_RESOURCE_CONFLICT";
 
     // Source — a statement that ran past the configured duration cap. Carried by
     // the existing `source::StatementDurationTimeout` marker (recognised in
@@ -261,6 +265,7 @@ pub mod codes {
         CONFIG_CHUNK_COUNT_INVALID,
         CONFIG_CHUNK_BY_DAYS_INVALID,
         CONFIG_DUPLICATE_EXPORT,
+        CONFIG_CDC_RESOURCE_CONFLICT,
         SOURCE_STATEMENT_TIMEOUT,
     ];
 }

@@ -379,6 +379,75 @@ impl Config {
         for export in &self.exports {
             self.validate_export(export)?;
         }
+        self.validate_cdc_resource_conflicts()?;
+        Ok(())
+    }
+
+    /// CDC stream resources are per-export and their **defaults collide**: two
+    /// PostgreSQL cdc exports without an explicit `slot:` both resolve to
+    /// `rivet_slot` — each export's ack advances `confirmed_flush_lsn` past
+    /// changes the *other* never read (mutual, silent data loss). Two MySQL
+    /// exports both default to `server_id: 4271` — the server kills the older
+    /// replica connection. A shared `checkpoint:` path makes exports overwrite
+    /// each other's resume position on any engine. All three are config bugs a
+    /// naive multi-table CDC config hits by default, so reject them at load, on
+    /// the RESOLVED values (defaults included). SQL Server `capture_instance`
+    /// sharing is deliberately allowed: the change-table poll is read-only and
+    /// resume state lives in the per-export checkpoint.
+    fn validate_cdc_resource_conflicts(&self) -> crate::error::Result<()> {
+        use std::collections::HashMap;
+
+        let mut slots: HashMap<String, &str> = HashMap::new();
+        let mut server_ids: HashMap<u32, &str> = HashMap::new();
+        let mut checkpoints: HashMap<&str, &str> = HashMap::new();
+
+        for e in self.exports.iter().filter(|e| e.mode == ExportMode::Cdc) {
+            let cdc = e.cdc.as_ref();
+            match self.source.source_type {
+                SourceType::Postgres => {
+                    let slot = cdc
+                        .and_then(|c| c.slot.clone())
+                        .unwrap_or_else(|| DEFAULT_PG_SLOT.to_string());
+                    if let Some(prev) = slots.insert(slot.clone(), &e.name) {
+                        crate::config_bail!(
+                            crate::error::codes::CONFIG_CDC_RESOURCE_CONFLICT,
+                            "exports '{prev}' and '{}': same PostgreSQL slot '{slot}' — a slot \
+                             has ONE consumer; each export's ack would advance it past changes \
+                             the other never read (silent data loss). Set a distinct `cdc.slot:` \
+                             per export (the default is '{DEFAULT_PG_SLOT}').",
+                            e.name
+                        );
+                    }
+                }
+                SourceType::Mysql => {
+                    let sid = cdc
+                        .and_then(|c| c.server_id)
+                        .unwrap_or(DEFAULT_MYSQL_SERVER_ID);
+                    if let Some(prev) = server_ids.insert(sid, &e.name) {
+                        crate::config_bail!(
+                            crate::error::codes::CONFIG_CDC_RESOURCE_CONFLICT,
+                            "exports '{prev}' and '{}': same MySQL server_id {sid} — the server \
+                             kills the older replica connection when a new one registers with \
+                             the same id. Set a distinct `cdc.server_id:` per export (the \
+                             default is {DEFAULT_MYSQL_SERVER_ID}).",
+                            e.name
+                        );
+                    }
+                }
+                SourceType::Mssql => {}
+            }
+            if let Some(ckpt) = cdc.and_then(|c| c.checkpoint.as_deref())
+                && let Some(prev) = checkpoints.insert(ckpt, &e.name)
+            {
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_CDC_RESOURCE_CONFLICT,
+                    "exports '{prev}' and '{}': same checkpoint path '{ckpt}' — each export \
+                     must own its resume position or they overwrite each other's. Set a \
+                     distinct `cdc.checkpoint:` per export.",
+                    e.name
+                );
+            }
+        }
         Ok(())
     }
 

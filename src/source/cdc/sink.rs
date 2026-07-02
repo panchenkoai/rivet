@@ -91,6 +91,11 @@ struct PartCommitter<'a> {
     dest: &'a dyn Destination,
     format: FormatType,
     checkpoint: Option<&'a Path>,
+    /// Filename-safe run stamp — makes part names unique **across runs**, so the
+    /// scheduler model (every cycle re-runs into the same prefix) appends parts
+    /// alongside the prior cycle's instead of silently overwriting already-acked
+    /// changes the source can no longer replay.
+    run_token: String,
     seq: usize,
 }
 
@@ -102,7 +107,15 @@ impl PartCommitter<'_> {
         columns: &[TypeMapping],
         stream: &mut dyn ChangeStream,
     ) -> Result<PartRecord> {
-        let part = flush(buf, schema, columns, self.format, self.seq, self.dest)?;
+        let part = flush(
+            buf,
+            schema,
+            columns,
+            self.format,
+            &self.run_token,
+            self.seq,
+            self.dest,
+        )?;
         // Fault point: the part is durable but the checkpoint/ack have NOT run. A
         // crash here must re-read on resume (at-least-once) — never lose the change.
         crate::test_hook::maybe_panic_at("cdc_after_flush_before_ack");
@@ -146,6 +159,7 @@ pub(crate) fn run_to_files(
         dest: cfg.dest,
         format: cfg.format,
         checkpoint: cfg.checkpoint.as_deref(),
+        run_token: run_token(&cfg.run_id),
         seq: 0,
     };
 
@@ -243,11 +257,30 @@ fn refine_decimal_scales(columns: &mut [TypeMapping], events: &[ChangeEvent]) {
 
 /// Build one `RecordBatch` from `events`, write it to a temp part, and upload it
 /// through the commit seam (destination write + content-MD5 + transit check).
+/// Filename-safe token from the run id. Part names must be unique per run — a
+/// later run into the same prefix has to append alongside prior parts, never
+/// overwrite them (mirrors the batch path's timestamp-named parts). The CLI path
+/// passes an RFC3339 run id (`:`/`+` — `:` is not even legal on Windows), so map
+/// anything outside `[A-Za-z0-9._-]` to `-`.
+fn run_token(run_id: &str) -> String {
+    run_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
 fn flush(
     events: &[ChangeEvent],
     schema: &SchemaRef,
     columns: &[TypeMapping],
     format: FormatType,
+    run_token: &str,
     seq: usize,
     dest: &dyn Destination,
 ) -> Result<PartRecord> {
@@ -295,7 +328,7 @@ fn flush(
     w.write_batch(&batch)?;
     w.finish()?;
 
-    let file_name = format!("cdc-{seq:06}.{}", format.label());
+    let file_name = format!("cdc-{run_token}-{seq:06}.{}", format.label());
     write_part_file(dest, tmp.path(), events.len() as i64, file_name)
 }
 
@@ -447,6 +480,66 @@ mod tests {
         );
     }
 
+    // RED test for the finding: the documented continuous model (a scheduler re-running
+    // `rivet run` with `until_current: true`) points every cycle at the SAME
+    // destination prefix. Each cycle's parts must survive the next cycle — the
+    // batch path guarantees this with run-stamped part names. A fixed per-run
+    // name (`cdc-000000`) silently overwrites the prior run's part AFTER the
+    // source has already been acked past those changes: unrecoverable loss
+    // (not in the slot, not in the destination).
+    #[test]
+    fn roast_second_run_into_same_prefix_must_not_clobber_prior_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(&dir);
+        let cols = int_col();
+
+        // Cycle 1 captures changes 1,2 — one part.
+        let mut run1 = FakeStream {
+            events: VecDeque::from(vec![insert(1), insert(2)]),
+            acked: Vec::new(),
+        };
+        run_to_files(
+            &mut run1,
+            SinkConfig {
+                run_id: "t_cdc_20260702T100000000".into(),
+                ..cfg(dest.as_ref(), &cols, FormatType::Csv, 10)
+            },
+        )
+        .unwrap();
+
+        // Cycle 2 (a later scheduler tick, distinct run id) captures change 3.
+        let mut run2 = FakeStream {
+            events: VecDeque::from(vec![insert(3)]),
+            acked: Vec::new(),
+        };
+        run_to_files(
+            &mut run2,
+            SinkConfig {
+                run_id: "t_cdc_20260702T100500000".into(),
+                ..cfg(dest.as_ref(), &cols, FormatType::Csv, 10)
+            },
+        )
+        .unwrap();
+
+        // The union of both cycles must be readable from the prefix: 3 data rows.
+        let mut data_rows = 0usize;
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "csv") {
+                data_rows += std::fs::read_to_string(&path)
+                    .unwrap()
+                    .lines()
+                    .count()
+                    .saturating_sub(1); // header
+            }
+        }
+        assert_eq!(
+            data_rows, 3,
+            "run 2 must append its parts alongside run 1's in the same prefix — \
+             a fixed part name silently overwrites already-acked changes"
+        );
+    }
+
     fn decimal_col(name: &str, precision: u8, scale: i8) -> TypeMapping {
         TypeMapping {
             column_name: name.into(),
@@ -569,7 +662,7 @@ mod tests {
             acked: Vec::new(),
         };
         run_to_files(&mut stream, cfg(dest.as_ref(), &cols, FormatType::Csv, 10)).unwrap();
-        let csv = std::fs::read_to_string(dir.path().join("cdc-000000.csv")).unwrap();
+        let csv = std::fs::read_to_string(dir.path().join("cdc-r-000000.csv")).unwrap();
         assert!(csv.contains("delete"), "row marked __op=delete:\n{csv}");
         assert!(
             csv.lines().any(|l| l.contains("delete") && l.contains('7')),
@@ -589,7 +682,7 @@ mod tests {
         let manifest =
             run_to_files(&mut stream, cfg(dest.as_ref(), &cols, FormatType::Csv, 10)).unwrap();
         assert_eq!(manifest.row_count, 2);
-        let csv = std::fs::read_to_string(dir.path().join("cdc-000000.csv")).unwrap();
+        let csv = std::fs::read_to_string(dir.path().join("cdc-r-000000.csv")).unwrap();
         let lines: Vec<&str> = csv.lines().collect();
         assert_eq!(lines.len(), 3, "header + 2 data rows:\n{csv}");
         assert!(

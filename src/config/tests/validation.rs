@@ -438,3 +438,112 @@ fn missing_source_field_gets_a_remediation_hint() {
         "expected a `rivet init` remediation hint, got: {msg}"
     );
 }
+
+// ── CDC resource conflicts (slot / server_id / checkpoint) ────────────────────
+//
+// RED tests for the sharpest multi-table CDC edge: the per-engine stream
+// resources are per-export, and their DEFAULTS collide. Two PostgreSQL cdc
+// exports without an explicit `slot:` both resolve to `rivet_slot` — each ack
+// advances `confirmed_flush_lsn` past changes the other never read (mutual,
+// silent data loss). Two MySQL exports both default to `server_id: 4271` — the
+// server kills the older replica connection. A shared `checkpoint:` path makes
+// the exports overwrite each other's resume position on any engine.
+
+fn cdc_pair_yaml(source: &str, cdc_a: &str, cdc_b: &str) -> String {
+    format!(
+        r#"
+source:
+  type: {source}
+  url: "{source}://localhost/test"
+exports:
+  - name: orders_cdc
+    table: orders
+    mode: cdc
+    format: parquet
+    {cdc_a}
+    destination:
+      type: local
+      path: ./out/orders
+  - name: users_cdc
+    table: users
+    mode: cdc
+    format: parquet
+    {cdc_b}
+    destination:
+      type: local
+      path: ./out/users
+"#
+    )
+}
+
+#[test]
+fn two_pg_cdc_exports_defaulting_to_the_same_slot_are_rejected() {
+    let yaml = cdc_pair_yaml("postgres", "", "");
+    let err = Config::from_yaml(&yaml).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("rivet_slot") && msg.contains("slot"),
+        "expected a same-slot conflict naming the defaulted 'rivet_slot': {msg}"
+    );
+}
+
+#[test]
+fn two_cdc_exports_with_the_same_explicit_slot_are_rejected() {
+    let yaml = cdc_pair_yaml(
+        "postgres",
+        "cdc: { slot: shared_slot }",
+        "cdc: { slot: shared_slot }",
+    );
+    let err = Config::from_yaml(&yaml).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("shared_slot"),
+        "expected a same-slot conflict naming 'shared_slot': {msg}"
+    );
+}
+
+#[test]
+fn two_mysql_cdc_exports_defaulting_to_the_same_server_id_are_rejected() {
+    let yaml = cdc_pair_yaml("mysql", "", "");
+    let err = Config::from_yaml(&yaml).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("4271") && msg.contains("server_id"),
+        "expected a same-server_id conflict naming the defaulted 4271: {msg}"
+    );
+}
+
+#[test]
+fn two_cdc_exports_sharing_a_checkpoint_path_are_rejected() {
+    let yaml = cdc_pair_yaml(
+        "postgres",
+        "cdc: { slot: slot_a, checkpoint: /var/lib/rivet/same.ckpt }",
+        "cdc: { slot: slot_b, checkpoint: /var/lib/rivet/same.ckpt }",
+    );
+    let err = Config::from_yaml(&yaml).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("same.ckpt") && msg.contains("checkpoint"),
+        "expected a shared-checkpoint conflict naming the path: {msg}"
+    );
+}
+
+#[test]
+fn cdc_exports_with_distinct_resources_validate_fine() {
+    let yaml = cdc_pair_yaml(
+        "postgres",
+        "cdc: { slot: slot_orders, checkpoint: /var/lib/rivet/orders.ckpt }",
+        "cdc: { slot: slot_users, checkpoint: /var/lib/rivet/users.ckpt }",
+    );
+    Config::from_yaml(&yaml).expect("distinct slots + checkpoints must validate");
+}
+
+#[test]
+fn mysql_cdc_exports_with_distinct_server_ids_validate_fine() {
+    let yaml = cdc_pair_yaml(
+        "mysql",
+        "cdc: { server_id: 4271 }",
+        "cdc: { server_id: 4272 }",
+    );
+    Config::from_yaml(&yaml).expect("distinct server_ids must validate");
+}
