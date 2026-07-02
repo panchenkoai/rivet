@@ -873,6 +873,7 @@ impl MssqlSource {
 
             Ok(MssqlCdcProbe {
                 cdc_enabled: max.is_some(),
+                max_lsn_hex: max.clone(),
                 instance_min_lsn: min,
                 agent_running: agent,
             })
@@ -883,6 +884,9 @@ impl MssqlSource {
 /// Result of [`MssqlSource::cdc_health`].
 pub(crate) struct MssqlCdcProbe {
     pub cdc_enabled: bool,
+    /// The database's current max LSN (`0x…` hex) — the `initial: snapshot`
+    /// anchor position. `None` ⇔ CDC not enabled.
+    pub max_lsn_hex: Option<String>,
     /// Hex LSN (`0x…`) of the capture instance's retained minimum; `None` ⇒
     /// the instance does not exist (or none was configured).
     pub instance_min_lsn: Option<String>,

@@ -377,6 +377,38 @@ async fn connect(
     Ok(Client::connect(config, tcp.compat_write()).await?)
 }
 
+/// Persist the database's CURRENT max LSN to `ckpt` — the anchor for
+/// `cdc.initial: snapshot`, taken BEFORE the snapshot read so the change
+/// stream overlaps the snapshot instead of gapping it. Fails loudly when CDC
+/// is not enabled on the database (no max LSN exists to anchor at).
+pub(crate) fn pin_checkpoint_at_max_lsn(
+    url: &str,
+    ckpt: &std::path::Path,
+    tls: Option<&TlsConfig>,
+) -> Result<()> {
+    let mut src = crate::source::mssql::MssqlSource::connect_with_tls(url, tls)?;
+    let probe = src.cdc_health(None)?;
+    let Some(max) = probe_max_lsn(&probe) else {
+        anyhow::bail!(
+            "mssql cdc initial snapshot: sys.fn_cdc_get_max_lsn() is NULL — enable CDC first \
+             (EXEC sys.sp_cdc_enable_db) so the anchor exists before the snapshot"
+        );
+    };
+    Position(serde_json::json!({ "lsn": max })).save(ckpt)
+}
+
+/// The probe's max LSN as the bare hex the checkpoint stores (strip `0x`).
+fn probe_max_lsn(probe: &crate::source::mssql::MssqlCdcProbe) -> Option<String> {
+    if !probe.cdc_enabled {
+        return None;
+    }
+    probe.max_lsn_hex.as_deref().map(|s| {
+        s.trim_start_matches("0x")
+            .trim_start_matches("0X")
+            .to_string()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

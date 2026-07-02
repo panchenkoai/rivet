@@ -185,6 +185,130 @@ fn mssql_cdc_idle_first_run_then_change_is_captured_not_skipped() {
     );
 }
 
+// `cdc.initial: snapshot` — anchor(max LSN) → snapshot → drain, enforced by
+// construction. Pre-rows must be captured by the Agent BEFORE run 1, so the
+// anchor covers them; a lagging capture job just widens the overlap (deduped
+// by PK downstream), never a gap.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_initial_snapshot_covers_preexisting_rows_then_streams() {
+    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("rivet_cdc_init");
+    let ci = format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT)"
+    ));
+    enable_cdc(&table, &ci);
+    let _guard = CdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (1,10),(2,20)"));
+    wait_for_capture(&ci, 2);
+
+    let out = d.path().join("out");
+    let ckpt = d.path().join("cdc.ckpt");
+    std::fs::create_dir_all(&out).unwrap();
+    let yaml = format!(
+        r#"source: {{type: mssql, url: "{MSSQL_CDC_URL}"}}
+exports:
+  - name: {table}
+    table: {table}
+    mode: cdc
+    format: parquet
+    cdc: {{ initial: snapshot, capture_instance: {ci}, checkpoint: "{ckpt}", until_current: true }}
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        ckpt = ckpt.display(),
+        out = out.display(),
+    );
+    let cfg = write_config(&d, &yaml);
+
+    run_cdc(&cfg);
+    assert_eq!(manifest_rows(&out.join("snapshot")), 2);
+    assert_eq!(
+        manifest_rows(&out),
+        0,
+        "anchor at max LSN ⇒ nothing to drain"
+    );
+
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (3,30)"));
+    wait_for_capture(&ci, 3);
+    run_cdc(&cfg);
+    assert_eq!(manifest_rows(&out), 1, "the post-snapshot change streams");
+}
+
+// RED test for the finding: MONEY/SMALLMONEY were typed correctly
+// (decimal(19,4)/(10,4)) but every VALUE was NULL — tiberius delivers money as
+// ColumnData::F64 and both decimal decoders (batch arrow_convert and the CDC
+// cell path) accepted only Numeric. The values must survive BOTH paths and
+// stay ArrayData-equal. (Money is server-side fixed-point 1/10000; the f64
+// hop is exact up to ~9×10^11 currency units — fidelity: compatible.)
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_money_values_survive_batch_and_cdc() {
+    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("rivet_cdc_money");
+    let ci = format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, m MONEY, sm SMALLMONEY)"
+    ));
+    enable_cdc(&table, &ci);
+    let _guard = CdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+    let ckpt = d.path().join("cdc.ckpt");
+    mssql_cdc_exec(&format!(
+        "INSERT INTO dbo.{table} VALUES (1, 123.4567, 12.34), (2, NULL, NULL)"
+    ));
+    wait_for_capture(&ci, 2);
+
+    let cdc_out = d.path().join("cdc");
+    let batch_out = d.path().join("batch");
+    std::fs::create_dir_all(&cdc_out).unwrap();
+    std::fs::create_dir_all(&batch_out).unwrap();
+    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &cdc_out));
+    run_cdc(&mssql_full_config(&d, &table, &batch_out));
+
+    // Value-level check against the SOURCE literal (NULL == NULL between the
+    // two exports would mask the loss — that is exactly how it hid).
+    use arrow::array::{Array, Decimal128Array};
+    let batch = read_one_batch(&batch_out);
+    let m_idx = batch.schema().index_of("m").unwrap();
+    let m = batch
+        .column(m_idx)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .expect("money must be Decimal128");
+    assert!(!m.is_null(0), "money value must survive the batch export");
+    assert_eq!(m.value(0), 1_234_567, "123.4567 at scale 4");
+    let sm_idx = batch.schema().index_of("sm").unwrap();
+    let sm = batch
+        .column(sm_idx)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .expect("smallmoney must be Decimal128");
+    assert_eq!(sm.value(0), 123_400, "12.34 at scale 4");
+    assert!(m.is_null(1) && sm.is_null(1), "real NULLs stay NULL");
+
+    // And the CDC leg must be ArrayData-equal to batch, column by column.
+    let cdc = read_one_batch(&cdc_out);
+    for (i, field) in batch.schema().fields().iter().enumerate() {
+        let cidx = cdc.schema().index_of(field.name()).unwrap();
+        assert_eq!(
+            batch.column(i).to_data(),
+            cdc.column(cidx).to_data(),
+            "column {}: CDC differs from batch",
+            field.name()
+        );
+    }
+}
+
 // RED test for the finding (caught live: 6 of 8 tables captured ZERO events):
 // the stream derived schema/table from the capture-instance NAME by splitting
 // on the first underscore, so an instance named after an underscored table
@@ -449,16 +573,12 @@ fn mssql_cdc_full_type_matrix_matches_batch() {
     let table = unique_name("rivet_cdc_matrix");
     let ci = format!("dbo_{table}");
     mssql_cdc_drop_table(&format!("dbo.{table}"));
-    // MONEY/SMALLMONEY are deliberately absent: the BATCH export currently
-    // nulls their values (typed decimal(19,4), value lost) — including them
-    // here would "pass" on NULL == NULL and mask the loss. Tracked as a batch
-    // finding; add them the day the batch decode carries the value.
     mssql_cdc_exec(&format!(
         "CREATE TABLE dbo.{table} (id INT PRIMARY KEY, big BIGINT, amount DECIMAL(18,4), \
          flag BIT, label VARCHAR(50), nlabel NVARCHAR(50), dt2 DATETIME2, dto DATETIMEOFFSET, \
          d DATE, t TIME, u UNIQUEIDENTIFIER, vb VARBINARY(16), \
          ch CHAR(8), nch NCHAR(8), dt1 DATETIME, sdt SMALLDATETIME, \
-         fb BINARY(8), num NUMERIC(10,3))"
+         fb BINARY(8), num NUMERIC(10,3), m MONEY, sm SMALLMONEY)"
     ));
     enable_cdc(&table, &ci);
     let _guard = CdcTable {
@@ -470,7 +590,8 @@ fn mssql_cdc_full_type_matrix_matches_batch() {
         "INSERT INTO dbo.{table} VALUES (1, 9000000000000, 12345.6789, 1, 'hello', \
          N'cafe-unicode', '2026-06-23 10:00:00.1234567', '2026-06-23 10:00:00 +05:30', \
          '2026-06-23', '13:45:30.123456', '12345678-1234-1234-1234-123456789012', 0xDEADBEEF, \
-         'pad', N'ñpad', '2026-01-15T13:45:30.127', '2026-01-15T13:45:00', 0xAB, 12.345)"
+         'pad', N'ñpad', '2026-01-15T13:45:30.127', '2026-01-15T13:45:00', 0xAB, 12.345, \
+         123.4567, -0.01)"
     ));
     mssql_cdc_exec(&format!("INSERT INTO dbo.{table} (id) VALUES (2)"));
     wait_for_capture(&ci, 2);

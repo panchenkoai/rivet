@@ -350,6 +350,12 @@ fn decimal_to_i128(v: &RivetValue, scale: i8) -> Option<i128> {
         RivetValue::Bytes(b) => std::str::from_utf8(b).ok()?.trim().to_string(),
         RivetValue::Int(i) => i.to_string(),
         RivetValue::UInt(u) => u.to_string(),
+        // Fixed-point values some drivers deliver as floats (SQL Server MONEY
+        // via tiberius): render at the column scale, then the exact digit
+        // parse below — mirrors the batch path's f64_to_scaled_i128.
+        RivetValue::Float(f) if f.is_finite() => {
+            format!("{f:.prec$}", prec = scale.max(0) as usize)
+        }
         _ => return None,
     };
     let (neg, s) = match s.strip_prefix('-') {

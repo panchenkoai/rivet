@@ -4,6 +4,16 @@
 
 ### Added
 
+- **`cdc.initial: snapshot` — anchor-then-snapshot-then-stream in one run.** The safe
+  incremental→CDC switch used to be operator choreography (create the anchor first, then a final batch
+  catch-up, then CDC — get the order wrong and there's a silent gap, demonstrated live). It is now a
+  config key: the first run creates the anchor (PostgreSQL slot / MySQL pinned binlog checkpoint /
+  SQL Server max-LSN checkpoint), snapshots each table into `<destination>[/<table>]/snapshot/` via the
+  regular batch path (own manifest + `_SUCCESS`, metric and journal rows included), then drains.
+  Anchor-before-snapshot makes mid-snapshot changes an *overlap* (PK + `__op` dedupe), never a gap; a
+  crash mid-snapshot re-snapshots on retry with the anchor intact; later runs skip straight to the
+  drain. MySQL / SQL Server require `cdc.checkpoint:` with it (validated at load). Live (all three
+  engines): `*_initial_snapshot_covers_preexisting_rows_then_streams`.
 - **CDC slot multiplexing: `tables:` — several tables through ONE stream.** A `mode: cdc` export can now
   list `tables: [orders, users, …]` and capture them all through a single PostgreSQL slot / MySQL binlog
   connection with a single checkpoint, instead of one export (and one slot — PostgreSQL decodes the WAL
@@ -40,6 +50,14 @@
 
 ### Fixed
 
+- **SQL Server: `MONEY`/`SMALLMONEY` values survive export (batch AND CDC).** The type mapping knew
+  money (`decimal(19,4)`/`(10,4)`) but every decimal decoder accepted only `ColumnData::Numeric`, and
+  tiberius delivers money as `F64` — so the columns were typed correctly with every value silently
+  NULLed. Both decimal paths now render the F64 at the declared scale and parse the digits exactly
+  (non-finite fails loudly); the always-on value checksum's source fold learned the same conversion —
+  it caught the first fix attempt as a mismatch, exactly as designed. Fidelity note: the f64 hop is
+  exact up to ~9×10¹¹ currency units (money's server range exceeds f64 integer precision above that).
+  Money is back in the CDC type matrix. Regression (live): `mssql_money_values_survive_batch_and_cdc`.
 - **MySQL CDC: negative `MEDIUMINT` values no longer flip sign.** The binlog's 3-byte value arrives
   without 24-bit sign extension (0x800000 decoded as +8388608 instead of −8388608) — caught by the
   cross-oracle sweep, invisible until a negative mediumint entered the matrix. Sign-extended now;

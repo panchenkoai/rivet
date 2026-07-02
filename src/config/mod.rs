@@ -988,6 +988,22 @@ impl Config {
             );
         }
 
+        // `initial: snapshot` needs a durable anchor BEFORE the snapshot reads.
+        // PostgreSQL pins server-side (the slot); MySQL / SQL Server have no
+        // server-side anchor, so the checkpoint file is mandatory there.
+        if let Some(cdc) = &export.cdc
+            && cdc.initial == Some(CdcInitialMode::Snapshot)
+            && self.source.source_type != SourceType::Postgres
+            && cdc.checkpoint.is_none()
+        {
+            anyhow::bail!(
+                "export '{}': `cdc.initial: snapshot` on {:?} requires `cdc.checkpoint:` — \
+                 the checkpoint file is the anchor that makes snapshot-then-stream gap-free",
+                export.name,
+                self.source.source_type
+            );
+        }
+
         if let Some(days) = export.chunk_by_days {
             if export.mode != ExportMode::Chunked {
                 anyhow::bail!(

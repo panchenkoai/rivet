@@ -485,11 +485,30 @@ pub const DEFAULT_PG_SLOT: &str = "rivet_slot";
 /// [`DEFAULT_PG_SLOT`] for why this is a shared const).
 pub const DEFAULT_MYSQL_SERVER_ID: u32 = 4271;
 
+/// What the FIRST CDC run does before draining changes.
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CdcInitialMode {
+    /// Anchor-then-snapshot: create the resume anchor (PostgreSQL slot /
+    /// MySQL binlog checkpoint / SQL Server LSN checkpoint) FIRST, then run a
+    /// full batch snapshot of each table into `<destination>[/<table>]/snapshot/`,
+    /// then drain CDC. Because the anchor predates the snapshot read, anything
+    /// changed during the snapshot also appears in the change stream — an
+    /// overlap (dedupe by PK + `__op`), never a gap. The safe switch ordering,
+    /// enforced by construction instead of operator discipline.
+    Snapshot,
+}
+
 /// Per-export CDC settings, required when `mode: cdc`. The output `table`,
 /// `destination`, and `format` come from the export itself; this carries only the
 /// CDC-specific knobs (resume + per-engine stream params).
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Default)]
 pub struct CdcExportConfig {
+    /// First-run behaviour: `snapshot` = anchor → full snapshot → drain (see
+    /// [`CdcInitialMode`]). Omitted ⇒ capture changes only (the default; the
+    /// operator owns the initial load).
+    #[serde(default)]
+    pub initial: Option<CdcInitialMode>,
     /// Persist/resume the source log position to this file. Omit to tail from the
     /// current position without checkpointing.
     pub checkpoint: Option<String>,

@@ -723,6 +723,18 @@
       "description": "Per-export CDC settings, required when `mode: cdc`. The output `table`,\n`destination`, and `format` come from the export itself; this carries only the\nCDC-specific knobs (resume + per-engine stream params).",
       "type": "object",
       "properties": {
+        "initial": {
+          "description": "First-run behaviour: `snapshot` = anchor → full snapshot → drain (see\n[`CdcInitialMode`]). Omitted ⇒ capture changes only (the default; the\noperator owns the initial load).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CdcInitialMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "checkpoint": {
           "description": "Persist/resume the source log position to this file. Omit to tail from the\ncurrent position without checkpointing.",
           "type": [
@@ -786,6 +798,16 @@
           ]
         }
       }
+    },
+    "CdcInitialMode": {
+      "description": "What the FIRST CDC run does before draining changes.",
+      "oneOf": [
+        {
+          "description": "Anchor-then-snapshot: create the resume anchor (PostgreSQL slot /\nMySQL binlog checkpoint / SQL Server LSN checkpoint) FIRST, then run a\nfull batch snapshot of each table into `<destination>[/<table>]/snapshot/`,\nthen drain CDC. Because the anchor predates the snapshot read, anything\nchanged during the snapshot also appears in the change stream — an\noverlap (dedupe by PK + `__op`), never a gap. The safe switch ordering,\nenforced by construction instead of operator discipline.",
+          "type": "string",
+          "const": "snapshot"
+        }
+      ]
     },
     "IncrementalCursorMode": {
       "description": "How the primary (and optional fallback) column(s) participate in incremental extraction.",

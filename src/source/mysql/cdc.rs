@@ -91,6 +91,19 @@ impl MysqlChangeStream {
         Ok((file, pos))
     }
 
+    /// Persist the source's CURRENT position to `ckpt` — the anchor for
+    /// `cdc.initial: snapshot` (taken BEFORE the snapshot read, so everything
+    /// changed during the snapshot also appears in the stream). Idempotent-by-
+    /// caller: only invoked when no checkpoint exists yet.
+    pub(crate) fn pin_checkpoint_at_current(
+        url: &str,
+        ckpt: &Path,
+        tls: Option<&TlsConfig>,
+    ) -> Result<()> {
+        let (file, pos) = Self::current_coordinates(url, tls)?;
+        Position(serde_json::json!({ "file": file, "pos": pos })).save(ckpt)
+    }
+
     /// Open a stream from the source's *current* position (`SHOW MASTER STATUS`).
     pub(crate) fn open_from_current(
         url: &str,

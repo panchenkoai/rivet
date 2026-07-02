@@ -361,6 +361,16 @@ fn build_array(
                         rescale_i128(n.value(), n.scale(), scale)
                             .with_context(|| format!("mssql decimal column {idx} row {r}"))?,
                     ),
+                    // MONEY / SMALLMONEY: tiberius delivers the fixed-point
+                    // 1/10000 value as F64, so the value was silently NULLed
+                    // here. Render at the column's declared scale and parse the
+                    // digits exactly — a non-finite value fails LOUDLY. (The
+                    // f64 hop itself is exact up to ~9×10^11 currency units;
+                    // fidelity: compatible.)
+                    Some(ColumnData::F64(Some(v))) => b.append_value(
+                        f64_to_scaled_i128(*v, scale)
+                            .with_context(|| format!("mssql money column {idx} row {r}"))?,
+                    ),
                     _ => b.append_null(),
                 }
             }
@@ -447,6 +457,26 @@ fn build_array(
         other => anyhow::bail!("mssql: no array builder for Arrow type {other:?} (column {idx})"),
     };
     Ok(arr)
+}
+
+/// An f64-delivered fixed-point value (MONEY/SMALLMONEY) as the unscaled i128
+/// of a `Decimal128(_, scale)` column. Renders at the declared scale and parses
+/// the digits exactly — no float `powi` rounding artefacts; non-finite input is
+/// a loud error, never a silent NULL.
+fn f64_to_scaled_i128(v: f64, scale: u8) -> Result<i128> {
+    if !v.is_finite() {
+        anyhow::bail!("non-finite money value {v:?}");
+    }
+    let txt = format!("{v:.prec$}", prec = scale as usize);
+    let (neg, rest) = match txt.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, txt.as_str()),
+    };
+    let digits: String = rest.chars().filter(|c| *c != '.').collect();
+    let mag: i128 = digits
+        .parse()
+        .with_context(|| format!("money render {txt:?} did not parse"))?;
+    Ok(if neg { -mag } else { mag })
 }
 
 /// Rescale an unscaled decimal from `from_scale` to `to_scale` (Arrow's fixed
@@ -572,6 +602,9 @@ impl crate::source::value_checksum::CellSource for MssqlCellSource<'_> {
                     .0
                     .to_i128()
             }
+            // MONEY / SMALLMONEY arrive as F64 — fold the SAME scaled value the
+            // Arrow build writes, or the checksum flags a false mismatch.
+            Some(ColumnData::F64(Some(v))) => f64_to_scaled_i128(*v, scale.max(0) as u8).ok(),
             _ => None,
         }
     }

@@ -80,6 +80,29 @@ rivet metrics                    # the CDC run appears with mode=cdc, like a bat
 A `mode: cdc` export reuses the export's `table`, `destination`, and `format`; the
 `cdc:` block carries only the CDC-specific knobs.
 
+**`initial: snapshot` — the safe switch, enforced by construction.** On the
+first run (no anchor yet) rivet performs, in order: ① create the resume anchor
+(PostgreSQL slot / MySQL binlog checkpoint / SQL Server max-LSN checkpoint),
+② run a full batch snapshot of each table into
+`<destination>[/<table>]/snapshot/` (its own parts + `manifest.json` +
+`_SUCCESS`), ③ drain the change stream. Because the anchor predates the
+snapshot read, a change landing mid-snapshot appears in **both** the snapshot
+and the stream — an overlap the PK + `__op` dedupe absorbs, never a gap.
+Subsequent runs see the `snapshot/_SUCCESS` marker and go straight to draining;
+a run that crashes mid-snapshot re-snapshots on retry (the anchor stays put, so
+nothing is lost). Load order downstream: the snapshot prefix as the base table,
+then MERGE the CDC parts. MySQL / SQL Server require `cdc.checkpoint:` with
+`initial: snapshot` (it is the anchor); PostgreSQL anchors in the slot.
+
+```yaml
+  - name: orders_cdc
+    table: orders
+    mode: cdc
+    format: parquet
+    cdc: { initial: snapshot, checkpoint: /var/lib/rivet/orders.ckpt, until_current: true }
+    destination: { type: gcs, bucket: my-bucket, prefix: cdc/orders }
+```
+
 **Multiple CDC exports: each owns its stream resources.** A PostgreSQL slot has
 ONE consumer (a shared slot is advanced past changes the other export never
 read), a MySQL `server_id` has ONE connection (the server kills the older one),

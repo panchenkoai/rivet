@@ -101,6 +101,84 @@ pub(super) fn run_cdc_export(
     (result.map(|_| ()), summary)
 }
 
+/// `cdc.initial: snapshot` — the anchor-then-snapshot half, run by the
+/// orchestrator BEFORE the CDC drain. Returns the synthesized `mode: full`
+/// exports still pending (their `snapshot/_SUCCESS` marker absent), after
+/// ensuring the anchor exists. Anchor-BEFORE-snapshot is the whole point: a
+/// change landing mid-snapshot is then also in the stream — an overlap the
+/// PK+`__op` dedupe absorbs, never a gap.
+pub(super) fn initial_snapshot_pending(
+    config: &Config,
+    export: &ExportConfig,
+) -> Result<Vec<ExportConfig>> {
+    let cdc = export.cdc.clone().unwrap_or_default();
+    if cdc.initial != Some(crate::config::CdcInitialMode::Snapshot) {
+        return Ok(Vec::new());
+    }
+    let url = config.source.resolve_url()?;
+    let tls = config.source.tls.as_ref();
+
+    // 1) The anchor, engine by engine (idempotent: only created when absent).
+    if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        // Slot creation IS the anchor; open() creates it when missing.
+        let slot = cdc
+            .slot
+            .clone()
+            .unwrap_or_else(|| crate::config::DEFAULT_PG_SLOT.to_string());
+        drop(crate::source::postgres::cdc::PgChangeStream::open(
+            &url, &slot, false, tls,
+        )?);
+    } else {
+        // MySQL / SQL Server: the checkpoint file (validation guarantees it is
+        // configured for `initial: snapshot`).
+        let ckpt = PathBuf::from(cdc.checkpoint.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "export '{}': initial snapshot requires cdc.checkpoint",
+                export.name
+            )
+        })?);
+        let anchored = crate::source::cdc::Position::load(&ckpt)?.is_some();
+        if !anchored {
+            if url.starts_with("mysql://") {
+                crate::source::mysql::cdc::MysqlChangeStream::pin_checkpoint_at_current(
+                    &url, &ckpt, tls,
+                )?;
+            } else {
+                crate::source::mssql::cdc::pin_checkpoint_at_max_lsn(&url, &ckpt, tls)?;
+            }
+        }
+    }
+
+    // 2) Which tables still need their snapshot (no `snapshot/_SUCCESS` yet).
+    let (tables, multi) = match (&export.tables, &export.table) {
+        (Some(ts), _) => (ts.clone(), true),
+        (None, Some(t)) => (vec![t.clone()], false),
+        (None, None) => anyhow::bail!("export '{}': cdc mode requires `table:`", export.name),
+    };
+    let mut pending = Vec::new();
+    for t in &tables {
+        let table_dcfg = if multi {
+            dest_for_table(&export.destination, t)
+        } else {
+            export.destination.clone()
+        };
+        let snap_dcfg = dest_for_table(&table_dcfg, "snapshot");
+        let dest = crate::destination::create_destination(&snap_dcfg)?;
+        if dest.head("_SUCCESS")?.is_some() {
+            continue; // this table's snapshot already completed
+        }
+        let mut synth = export.clone();
+        synth.name = format!("{}__snapshot_{t}", export.name);
+        synth.mode = crate::config::ExportMode::Full;
+        synth.table = Some(t.clone());
+        synth.tables = None;
+        synth.cdc = None;
+        synth.destination = snap_dcfg;
+        pending.push(synth);
+    }
+    Ok(pending)
+}
+
 /// A multi-table stream lands each table under its own sub-prefix of the
 /// export's destination (`<base>/<table>/`), so every table's prefix is
 /// self-describing (its own parts + `manifest.json` + `_SUCCESS`), exactly like

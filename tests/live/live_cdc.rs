@@ -573,6 +573,117 @@ fn cdc_full_type_matrix_matches_batch() {
     assert_cdc_matches_batch(&cdc_out, &batch_out);
 }
 
+// `cdc.initial: snapshot` — the safe switch ordering enforced by construction:
+// anchor → snapshot → drain in ONE run. The invariant this pins: rows that
+// exist BEFORE the first run land in `snapshot/`, changes AFTER land in the
+// change stream, and a second run does NOT re-snapshot. No row is in neither.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_initial_snapshot_covers_preexisting_rows_then_streams() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_init_my");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let _guard = Table(tbl.clone());
+    // Pre-existing rows — the base CDC alone would never deliver.
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1,10),(2,20)"))
+        .unwrap();
+
+    let out = d.path().join("out");
+    let ckpt = d.path().join("cdc.ckpt");
+    std::fs::create_dir_all(&out).unwrap();
+    let yaml = format!(
+        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
+exports:
+  - name: {tbl}
+    table: {tbl}
+    mode: cdc
+    format: parquet
+    cdc: {{ initial: snapshot, checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        ckpt = ckpt.display(),
+        out = out.display(),
+        sid = server_id_for(&tbl),
+    );
+    let cfg = write_config(&d, &yaml);
+
+    // Run 1: anchor → snapshot(2 rows) → drain(0).
+    run_cdc(&cfg);
+    let snap = out.join("snapshot");
+    assert_eq!(
+        manifest_rows(&snap),
+        2,
+        "pre-existing rows land in snapshot/"
+    );
+    assert_eq!(manifest_rows(&out), 0, "nothing to drain yet");
+    let snap_parts = || {
+        std::fs::read_dir(&snap)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|x| x == "parquet")
+            })
+            .count()
+    };
+    assert_eq!(snap_parts(), 1);
+
+    // A change AFTER the snapshot → the stream, not a re-snapshot.
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (3,30)"))
+        .unwrap();
+    run_cdc(&cfg);
+    assert_eq!(manifest_rows(&out), 1, "the post-snapshot change streams");
+    assert_eq!(snap_parts(), 1, "run 2 must NOT re-snapshot");
+}
+
+// PostgreSQL flavour: the slot IS the anchor (no checkpoint required).
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_initial_snapshot_covers_preexisting_rows_then_streams() {
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_init_pg");
+    let slot = unique_name("rivet_init_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT); \
+         INSERT INTO {tbl} VALUES (1,10),(2,20)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let yaml = format!(
+        r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
+exports:
+  - name: {tbl}
+    table: {tbl}
+    mode: cdc
+    format: parquet
+    cdc: {{ initial: snapshot, slot: {slot}, until_current: true }}
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        out = out.display(),
+    );
+    let cfg = write_config(&d, &yaml);
+
+    run_cdc(&cfg);
+    let _slot = Slot(slot.clone());
+    assert_eq!(manifest_rows(&out.join("snapshot")), 2);
+    assert_eq!(manifest_rows(&out), 0);
+
+    c.execute(&format!("INSERT INTO {tbl} VALUES (3,30)"), &[])
+        .unwrap();
+    run_cdc(&cfg);
+    assert_eq!(manifest_rows(&out), 1, "the post-snapshot change streams");
+}
+
 // `columns:` type overrides must apply to CDC exactly like batch — pinned for
 // the finding that resolve_cdc_columns passed an EMPTY override map, silently
 // ignoring the config's declarations. The canonical use: `bigint unsigned` →
