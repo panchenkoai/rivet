@@ -573,6 +573,77 @@ fn cdc_full_type_matrix_matches_batch() {
     assert_cdc_matches_batch(&cdc_out, &batch_out);
 }
 
+// Table-qualified `columns:` overrides on a multi-table stream: the bare key
+// applies everywhere, `"table.column"` targets ONE table and wins over the
+// bare key there — the out-of-the-box answer to same-named columns needing
+// different overrides in schema-wide CDC.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_qualified_overrides_target_one_table_bare_applies_to_the_rest() {
+    use arrow::datatypes::DataType;
+    let d = tempfile::tempdir().unwrap();
+    let ta = unique_name("cdc_qo_a");
+    let tb = unique_name("cdc_qo_b");
+    let mut c = conn();
+    for t in [&ta, &tb] {
+        c.query_drop(format!("DROP TABLE IF EXISTS {t}")).unwrap();
+        c.query_drop(format!("CREATE TABLE {t} (id INT PRIMARY KEY, v INT)"))
+            .unwrap();
+    }
+    let (_g1, _g2) = (Table(ta.clone()), Table(tb.clone()));
+
+    let out = d.path().join("out");
+    let ckpt = d.path().join("cdc.ckpt");
+    std::fs::create_dir_all(&out).unwrap();
+    // Bare `v: text` hits every table; the qualified key retargets ONLY tb.
+    let yaml = format!(
+        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
+exports:
+  - name: app_cdc
+    tables: [{ta}, {tb}]
+    mode: cdc
+    format: parquet
+    columns: {{ v: text, "{tb}.v": "decimal(20,4)" }}
+    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        ckpt = ckpt.display(),
+        out = out.display(),
+        sid = server_id_for(&ta),
+    );
+    let cfg = write_config(&d, &yaml);
+
+    run_cdc(&cfg); // pin
+    c.query_drop(format!("INSERT INTO {ta} VALUES (1, -42)"))
+        .unwrap();
+    c.query_drop(format!("INSERT INTO {tb} VALUES (1, 7)"))
+        .unwrap();
+    run_cdc(&cfg);
+
+    let ty_of = |t: &str| {
+        parquet_fields(&out.join(t))
+            .into_iter()
+            .find(|(n, _)| n == "v")
+            .map(|(_, ty)| ty)
+            .unwrap()
+    };
+    assert_eq!(ty_of(&ta), DataType::Utf8, "bare `v: text` applies to a");
+    assert_eq!(
+        ty_of(&tb),
+        DataType::Decimal128(20, 4),
+        "qualified key wins over the bare one for b"
+    );
+    assert_eq!(parquet_one_string(&out.join(&ta), "v"), "-42");
+    use arrow::array::Decimal128Array;
+    let b = read_one_batch(&out.join(&tb));
+    let bv = b
+        .column(b.schema().index_of("v").unwrap())
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
+    assert_eq!(bv.value(0), 70_000, "7 at scale 4");
+}
+
 // Same column NAME, different TYPES across tables of one multi-table stream:
 // resolution is per-table by construction (each TableOutput resolves its own
 // schema and cell fixes), so `a.v INT` and `b.v DECIMAL(10,2)` and

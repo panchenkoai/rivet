@@ -14,6 +14,15 @@
   crash mid-snapshot re-snapshots on retry with the anchor intact; later runs skip straight to the
   drain. MySQL / SQL Server require `cdc.checkpoint:` with it (validated at load). Live (all three
   engines): `*_initial_snapshot_covers_preexisting_rows_then_streams`.
+- **Table-qualified `columns:` override keys.** On a multi-table (schema-wide) export a bare key
+  (`amount:`) applies to every captured table that has the column; a qualified key
+  (`"orders.amount":`) targets one table and wins over the bare key there — same-named columns with
+  different types across tables can now be overridden independently, out of the box. A qualified key
+  naming a table the export does not capture — or used on a query-shaped export — is a config error at
+  load. Batch `table:` exports narrow qualified keys the same way (one shared resolver,
+  `types::overrides_for_table`). Live: `cdc_qualified_overrides_target_one_table_bare_applies_to_the_rest`;
+  per-table type resolution under name collisions is separately pinned by
+  `cdc_multi_table_same_column_name_different_types_resolve_per_table`.
 - **CDC slot multiplexing: `tables:` — several tables through ONE stream.** A `mode: cdc` export can now
   list `tables: [orders, users, …]` and capture them all through a single PostgreSQL slot / MySQL binlog
   connection with a single checkpoint, instead of one export (and one slot — PostgreSQL decodes the WAL

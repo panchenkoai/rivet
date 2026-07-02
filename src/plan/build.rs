@@ -128,7 +128,18 @@ pub fn build_plan(
         resume,
         verify: export.verify,
         source: config.source.clone(),
-        column_overrides: parse_column_overrides(&export.columns, &export.name)?,
+        // Batch exports have at most one table; narrow qualified override keys
+        // ("table.column") to it — bare keys pass through unchanged. Query
+        // exports carry no table (validation already rejects qualified keys).
+        column_overrides: {
+            let all = parse_column_overrides(&export.columns, &export.name)?;
+            match export.table.as_deref() {
+                Some(t) => {
+                    crate::types::overrides_for_table(&all, t.rsplit('.').next().unwrap_or(t))
+                }
+                None => all,
+            }
+        },
         schema_drift_policy: export.on_schema_drift,
         shape_drift_warn_factor: export.shape_drift_warn_factor.unwrap_or(2.0),
         parquet: export.parquet.clone(),

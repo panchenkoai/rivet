@@ -988,6 +988,40 @@ impl Config {
             );
         }
 
+        // Table-qualified `columns:` override keys ("table.column"): the named
+        // table must be one this export captures — a typo must fail at load,
+        // never silently miss its target. Bare keys stay export-wide.
+        {
+            for key in export.columns.keys() {
+                let Some((tbl, _col)) = key.split_once('.') else {
+                    continue;
+                };
+                if export.query.is_some() || export.query_file.is_some() {
+                    anyhow::bail!(
+                        "export '{}': qualified column override '{key}' needs a table-shaped \
+                         export (`table:`/`tables:`), not a query",
+                        export.name
+                    );
+                }
+                let bare = |t: &str| t.rsplit('.').next().unwrap_or(t).to_string();
+                let captures = export
+                    .table
+                    .as_deref()
+                    .map(bare)
+                    .into_iter()
+                    .chain(export.tables.iter().flatten().map(|t| bare(t)))
+                    .any(|t| t == tbl);
+                if !captures {
+                    anyhow::bail!(
+                        "export '{}': column override '{key}' names table '{tbl}', which this \
+                         export does not capture — fix the table name or use a bare column key \
+                         to apply it to every captured table",
+                        export.name
+                    );
+                }
+            }
+        }
+
         // `initial: snapshot` needs a durable anchor BEFORE the snapshot reads.
         // PostgreSQL pins server-side (the slot); MySQL / SQL Server have no
         // server-side anchor, so the checkpoint file is mandatory there.

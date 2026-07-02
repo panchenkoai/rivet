@@ -643,3 +643,64 @@ exports:
     let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
     assert!(msg.contains("only valid with `mode: cdc`"), "{msg}");
 }
+
+// ── Table-qualified `columns:` override keys ─────────────────────────────────
+// Bare keys apply to every table of a multi-table export (the blast radius the
+// schema-wide user worries about); `"table.column"` targets one table and wins
+// over the bare key. A qualified key naming a table the export does NOT
+// capture is a config error — a typo must fail at load, never silently miss.
+
+#[test]
+fn qualified_override_for_unknown_table_is_rejected() {
+    let yaml = r#"
+source: { type: mysql, url: "mysql://localhost/test" }
+exports:
+  - name: app_cdc
+    tables: [orders, users]
+    mode: cdc
+    format: parquet
+    columns: { "ghost.v": "decimal(20,0)" }
+    cdc: { checkpoint: /tmp/a.ckpt, server_id: 5001 }
+    destination: { type: local, path: ./out }
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(
+        msg.contains("ghost") && msg.contains("does not capture"),
+        "a qualified override must name a captured table: {msg}"
+    );
+}
+
+#[test]
+fn qualified_override_on_query_export_is_rejected() {
+    let yaml = r#"
+source: { type: postgres, url: "postgresql://localhost/test" }
+exports:
+  - name: orders
+    query: "SELECT 1 AS v"
+    mode: full
+    format: parquet
+    columns: { "orders.v": "int8" }
+    destination: { type: local, path: ./out }
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(
+        msg.contains("query"),
+        "qualified overrides need a table-shaped export: {msg}"
+    );
+}
+
+#[test]
+fn qualified_override_matching_the_export_table_validates() {
+    let yaml = r#"
+source: { type: mysql, url: "mysql://localhost/test" }
+exports:
+  - name: app_cdc
+    tables: [orders, users]
+    mode: cdc
+    format: parquet
+    columns: { "orders.v": "decimal(20,0)", v: text }
+    cdc: { checkpoint: /tmp/a.ckpt, server_id: 5001 }
+    destination: { type: local, path: ./out }
+"#;
+    Config::from_yaml(yaml).expect("qualified + bare keys must validate");
+}

@@ -145,7 +145,21 @@ exports:
 The resume position is a property of the *stream*, so the at-least-once
 sequence generalises: every table's buffered part is flushed **before** the one
 checkpoint/ack advances — a crash mid-roll re-reads for all tables rather than
-losing any one of them. `tables:` is PostgreSQL/MySQL only for now — SQL Server
+losing any one of them.
+
+**`columns:` overrides on a multi-table export** support two key shapes: a bare
+column name applies to **every** captured table that has it, and a qualified
+`"table.column"` key targets one table and **wins** over the bare key there —
+so same-named columns needing different treatments never collide:
+
+```yaml
+    columns:
+      amount: "decimal(20,4)"          # every table's `amount`
+      "legacy_orders.amount": text     # …except this one
+```
+
+A qualified key naming a table the export does not capture is a **config
+error** (a typo must fail at load, never silently miss its target). `tables:` is PostgreSQL/MySQL only for now — SQL Server
 capture instances are per-table (use one export per table there; sharing a
 `capture_instance` between exports is safe, since the change-table poll is
 read-only and resume state lives in the per-export checkpoint). Each run produces the standard

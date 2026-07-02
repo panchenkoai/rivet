@@ -249,16 +249,22 @@ fn run_cdc_inner(
             .unwrap_or_default();
         wired.push((t.clone(), dest, uri));
     }
-    // `columns:` type overrides — honoured exactly like the batch path (a
-    // multi-table export applies the same map to every table).
-    let overrides = crate::plan::build::parse_column_overrides_pub(&export.columns, &export.name)?;
+    // `columns:` type overrides, narrowed per table: bare keys apply to every
+    // captured table; qualified keys ("table.column") only to theirs, winning
+    // over bare — so one table's override can never bleed into a same-named
+    // column elsewhere.
+    let all_overrides =
+        crate::plan::build::parse_column_overrides_pub(&export.columns, &export.name)?;
     let outputs = wired
         .iter()
         .map(|(t, d, u)| crate::source::cdc::CaptureOutput {
             table: t.clone(),
             dest: d.as_ref(),
             dest_uri: u.clone(),
-            overrides: overrides.clone(),
+            overrides: crate::types::overrides_for_table(
+                &all_overrides,
+                t.rsplit('.').next().unwrap_or(t),
+            ),
         })
         .collect();
     let now = chrono::Utc::now().to_rfc3339();

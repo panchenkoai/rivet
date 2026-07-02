@@ -352,9 +352,9 @@ pub(crate) struct CaptureOutput<'a> {
     pub table: String,
     pub dest: &'a dyn crate::destination::Destination,
     pub dest_uri: String,
-    /// The export's `columns:` type overrides — honoured exactly like the
-    /// batch path. A multi-table export applies the same map to every table
-    /// (override keys are column names).
+    /// The export's `columns:` type overrides for THIS table — already
+    /// narrowed by `types::overrides_for_table` (bare keys apply everywhere;
+    /// `"table.column"` keys target one table and win over bare).
     pub overrides: crate::types::ColumnOverrides,
 }
 
