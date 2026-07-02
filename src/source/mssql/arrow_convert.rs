@@ -635,6 +635,34 @@ impl crate::source::value_checksum::CellSource for MssqlCellSource<'_> {
             _ => None,
         }
     }
+    fn time64_micros(&self, col: usize, row: usize) -> Option<i64> {
+        self.rows[row]
+            .try_get::<chrono::NaiveTime, _>(col)
+            .ok()
+            .flatten()
+            .map(|t| {
+                t.num_seconds_from_midnight() as i64 * 1_000_000 + t.nanosecond() as i64 / 1000
+            })
+    }
+    fn fixed_binary(&self, col: usize, row: usize) -> Option<Cow<'_, [u8]>> {
+        match cell(&self.rows[row], col) {
+            Some(ColumnData::Guid(Some(g))) => Some(Cow::Owned(g.as_bytes().to_vec())),
+            _ => None,
+        }
+    }
+    fn decimal256(&self, _col: usize, _row: usize, _scale: i8) -> Option<arrow::datatypes::i256> {
+        // SQL Server DECIMAL caps at precision 38 — Decimal256 never resolves.
+        None
+    }
+    fn list(
+        &self,
+        _col: usize,
+        _row: usize,
+        _elem: &DataType,
+    ) -> Option<Vec<crate::source::value_checksum::ListElem>> {
+        // SQL Server has no array types.
+        None
+    }
 }
 
 #[cfg(test)]

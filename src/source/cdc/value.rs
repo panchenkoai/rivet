@@ -380,6 +380,144 @@ pub(crate) fn build_column(dt: &DataType, cells: &[Option<&RivetValue>]) -> Resu
     })
 }
 
+/// The CDC side-A fold: an INDEPENDENT per-column checksum computed from the
+/// typed cells (`RivetValue`s) — the source-side twin of
+/// [`crate::source::value_checksum::arrow_batch_checksums`] over the built
+/// array. Extraction mirrors [`build_column`] arm-for-arm (same narrowing,
+/// same decimal parse, same render), byte-encoded identically to the batch
+/// checksum canon, XOR-combined. A type the shared rule skips contributes 0 —
+/// the skip set cannot drift from the batch pass's. A mismatch against the
+/// built array means the builder changed a value between decode and Arrow.
+pub(crate) fn cells_checksum(dt: &DataType, cells: &[Option<&RivetValue>]) -> u64 {
+    use RivetValue as V;
+    use xxhash_rust::xxh3::xxh3_64;
+
+    use crate::source::value_checksum::{ListElem, encode_list_cell, is_covered};
+
+    if !is_covered(dt) {
+        return 0;
+    }
+    let mut acc: u64 = 0;
+    for c in cells {
+        let c = match c {
+            Some(V::Null) | None => continue,
+            Some(v) => *v,
+        };
+        macro_rules! le {
+            ($opt:expr) => {
+                if let Some(v) = $opt {
+                    acc ^= xxh3_64(&v.to_le_bytes());
+                }
+            };
+        }
+        match dt {
+            DataType::Boolean => {
+                let b = match c {
+                    V::Bool(x) => Some(*x),
+                    V::Int(i) => Some(*i != 0),
+                    V::UInt(u) => Some(*u != 0),
+                    _ => None,
+                };
+                if let Some(b) = b {
+                    acc ^= xxh3_64(&[b as u8]);
+                }
+            }
+            DataType::Int16 => le!(int_of::<i16>(c)),
+            DataType::Int32 => le!(int_of::<i32>(c)),
+            DataType::Int64 => le!(int_of::<i64>(c)),
+            DataType::UInt64 => le!(int_of::<u64>(c)),
+            // NOT float_of(c) as f32: i64→f64→f32 double-rounds differently
+            // than the builder's direct i64→f32 for large ints.
+            DataType::Float32 => le!(match c {
+                V::Float(f) => Some(*f as f32),
+                V::Int(i) => Some(*i as f32),
+                V::UInt(u) => Some(*u as f32),
+                _ => None,
+            }),
+            DataType::Float64 => le!(float_of(c)),
+            DataType::Date32 => le!(match c {
+                V::DateTime(dt) => Some(epoch_days(dt.date())),
+                _ => None,
+            }),
+            DataType::Timestamp(TimeUnit::Microsecond, _) => le!(match c {
+                V::DateTime(dt) => Some(dt.and_utc().timestamp_micros()),
+                _ => None,
+            }),
+            DataType::Time64(TimeUnit::Microsecond) => le!(match c {
+                V::TimeMicros(us) => Some(*us),
+                _ => None,
+            }),
+            DataType::Decimal128(_, s) => le!(decimal_to_i128(c, *s)),
+            DataType::Decimal256(_, s) => {
+                if let Some(v) = decimal_to_i256(c, *s) {
+                    acc ^= xxh3_64(&v.to_le_bytes());
+                }
+            }
+            DataType::Utf8 => acc ^= xxh3_64(render_str(c).as_bytes()),
+            DataType::Binary => {
+                if let V::Bytes(by) = c {
+                    acc ^= xxh3_64(by);
+                }
+            }
+            DataType::FixedSizeBinary(n) => {
+                if let V::Bytes(by) = c
+                    && by.len() == *n as usize
+                {
+                    acc ^= xxh3_64(by);
+                }
+            }
+            DataType::List(f) => {
+                if let V::Array(elems) = c {
+                    let encoded: Vec<ListElem> = elems
+                        .iter()
+                        .map(|e| match (f.data_type(), e) {
+                            (_, V::Null) => ListElem::Null,
+                            (DataType::Boolean, V::Bool(b)) => ListElem::Bool(*b),
+                            (DataType::Int16, V::Int(i)) => {
+                                i16::try_from(*i).map_or(ListElem::Null, ListElem::I16)
+                            }
+                            (DataType::Int32, V::Int(i)) => {
+                                i32::try_from(*i).map_or(ListElem::Null, ListElem::I32)
+                            }
+                            (DataType::Int64, V::Int(i)) => ListElem::I64(*i),
+                            (DataType::Float32, V::Float(x)) => ListElem::F32(*x as f32),
+                            (DataType::Float64, V::Float(x)) => ListElem::F64(*x),
+                            (DataType::Float64, V::Int(i)) => ListElem::F64(*i as f64),
+                            (DataType::Utf8, other) => {
+                                ListElem::Str(render_str(other).into_bytes())
+                            }
+                            _ => ListElem::Null,
+                        })
+                        .collect();
+                    acc ^= xxh3_64(&encode_list_cell(&encoded));
+                }
+            }
+            _ => {}
+        }
+    }
+    acc
+}
+
+/// The integer a [`build_column`] int arm would append for this cell — shared
+/// by the fold so narrowing (try_from ⇒ null on overflow) cannot drift.
+fn int_of<T: TryFrom<i64> + TryFrom<u64> + From<bool>>(v: &RivetValue) -> Option<T> {
+    match v {
+        RivetValue::Int(i) => T::try_from(*i).ok(),
+        RivetValue::UInt(u) => T::try_from(*u).ok(),
+        RivetValue::Bool(b) => Some(T::from(*b)),
+        _ => None,
+    }
+}
+
+fn float_of(v: &RivetValue) -> Option<f64> {
+    match v {
+        RivetValue::Float(f) => Some(*f),
+        RivetValue::Int(i) => Some(*i as f64),
+        RivetValue::UInt(u) => Some(*u as f64),
+        _ => None,
+    }
+}
+
 /// Build a `List<element>` column from [`RivetValue::Array`] cells. The child
 /// builder is chosen by the element type; the LIST FIELD itself is preserved
 /// (`with_field`) so the element name/nullability — and therefore the
@@ -758,6 +896,156 @@ fn render_str(v: &RivetValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The two-ended contract: the independent cell fold must equal the fold of
+    // the BUILT array for EVERY covered type — including the hostile cells
+    // (nulls, narrowing, arrays with inner nulls, wide decimals). If an arm of
+    // cells_checksum ever drifts from build_column, this matrix catches it
+    // offline before any live flush does.
+    #[test]
+    fn cells_checksum_matches_built_array_for_every_covered_type() {
+        use arrow::datatypes::Field;
+
+        use crate::source::value_checksum::array_checksum;
+        use RivetValue as V;
+        let list_utf8 = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        let list_i32 = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
+        let cases: Vec<(DataType, Vec<Option<RivetValue>>)> = vec![
+            (
+                DataType::Boolean,
+                vec![Some(V::Bool(true)), Some(V::Int(0)), None, Some(V::Null)],
+            ),
+            (
+                DataType::Int16,
+                // 40000 overflows i16 → builder nulls; the fold must too.
+                vec![
+                    Some(V::Int(-5)),
+                    Some(V::Int(40_000)),
+                    Some(V::UInt(7)),
+                    None,
+                ],
+            ),
+            (DataType::Int32, vec![Some(V::Int(-8_388_608)), None]),
+            (
+                DataType::Int64,
+                vec![Some(V::Int(i64::MIN)), Some(V::UInt(u64::MAX)), None],
+            ),
+            (
+                DataType::UInt64,
+                vec![Some(V::UInt(u64::MAX)), Some(V::Int(-1)), None],
+            ),
+            (
+                DataType::Float32,
+                vec![Some(V::Float(1.5)), Some(V::Int(i64::MAX)), None],
+            ),
+            (
+                DataType::Float64,
+                vec![Some(V::Float(f64::NAN)), Some(V::UInt(3)), None],
+            ),
+            (
+                DataType::Date32,
+                vec![
+                    Some(V::DateTime(
+                        chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
+                            .unwrap()
+                            .and_hms_opt(0, 0, 0)
+                            .unwrap(),
+                    )),
+                    None,
+                ],
+            ),
+            (
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                vec![
+                    Some(V::DateTime(
+                        chrono::NaiveDate::from_ymd_opt(2035, 8, 7)
+                            .unwrap()
+                            .and_hms_micro_opt(9, 8, 7, 987_654)
+                            .unwrap(),
+                    )),
+                    None,
+                ],
+            ),
+            (
+                DataType::Time64(TimeUnit::Microsecond),
+                vec![Some(V::TimeMicros(86_399_999_999)), None],
+            ),
+            (
+                DataType::Decimal128(18, 2),
+                vec![
+                    Some(V::Bytes(b"999999999999.99".to_vec())),
+                    Some(V::Int(-42)),
+                    None,
+                ],
+            ),
+            (
+                DataType::Decimal256(50, 10),
+                vec![
+                    Some(V::Bytes(
+                        b"1234567890123456789012345678901234567890.0123456789".to_vec(),
+                    )),
+                    None,
+                ],
+            ),
+            (
+                DataType::Utf8,
+                vec![Some(V::Bytes("üñíçødé".as_bytes().to_vec())), None],
+            ),
+            (
+                DataType::Binary,
+                vec![Some(V::Bytes(vec![0x00, 0xff, 0x01])), None],
+            ),
+            (
+                DataType::FixedSizeBinary(16),
+                // wrong width → builder nulls; the fold must too.
+                vec![
+                    Some(V::Bytes(vec![7u8; 16])),
+                    Some(V::Bytes(vec![1, 2])),
+                    None,
+                ],
+            ),
+            (
+                list_utf8,
+                vec![
+                    Some(V::Array(vec![
+                        V::Bytes(b"with,comma".to_vec()),
+                        V::Null,
+                        V::Bytes(b"".to_vec()),
+                    ])),
+                    Some(V::Array(vec![])),
+                    None,
+                ],
+            ),
+            (
+                list_i32,
+                vec![Some(V::Array(vec![V::Int(1), V::Null, V::Int(-3)])), None],
+            ),
+        ];
+        for (dt, owned) in cases {
+            let cells: Vec<Option<&RivetValue>> = owned.iter().map(|c| c.as_ref()).collect();
+            let arr = build_column(&dt, &cells).unwrap();
+            assert_eq!(
+                cells_checksum(&dt, &cells),
+                array_checksum(arr.as_ref()),
+                "fold ≠ built array for {dt:?}"
+            );
+        }
+    }
+
+    // Sensitivity: a corrupted cell must MOVE the fold, so the sink's compare
+    // fires — not a constant that trivially agrees.
+    #[test]
+    fn cells_checksum_detects_a_changed_cell() {
+        use RivetValue as V;
+        let a = [Some(V::Int(1)), Some(V::Int(2))];
+        let b = [Some(V::Int(1)), Some(V::Int(3))];
+        let ra: Vec<Option<&RivetValue>> = a.iter().map(|c| c.as_ref()).collect();
+        let rb: Vec<Option<&RivetValue>> = b.iter().map(|c| c.as_ref()).collect();
+        assert_ne!(
+            cells_checksum(&DataType::Int64, &ra),
+            cells_checksum(&DataType::Int64, &rb)
+        );
+    }
 
     // RED test for the finding (all-types matrix audit): a NULL cell of a
     // text-shaped column arrived as `Some(RivetValue::Null)` and the Utf8

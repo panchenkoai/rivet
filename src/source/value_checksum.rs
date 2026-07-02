@@ -23,15 +23,16 @@
 //! integrity) and the differential fingerprint (test-time).
 //!
 //! Coverage (both sides MUST agree, or the check false-mismatches): int / uint /
-//! float / bool / date / timestamp(µs) / utf8 / binary / decimal128. Time64,
-//! FixedSizeBinary (UUID), List, and nanosecond timestamps contribute 0 on BOTH
-//! sides for now (not yet matched between the two passes).
+//! float / bool / date / timestamp(µs) / time64(µs) / utf8 / binary / fixed-size
+//! binary (UUID, BINARY(n)) / decimal128 / decimal256 / one-dimensional lists
+//! over {bool, i16..i64, f32, f64, utf8}. Nanosecond timestamps and exotic list
+//! elements contribute 0 on BOTH sides (declared skips, surfaced per export).
 
 use std::borrow::Cow;
 
 use arrow::array::types::{
-    Date32Type, Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
-    TimestampMicrosecondType, UInt64Type,
+    Date32Type, Decimal128Type, Decimal256Type, Float32Type, Float64Type, Int16Type, Int32Type,
+    Int64Type, Time64MicrosecondType, TimestampMicrosecondType, UInt64Type,
 };
 use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
@@ -51,6 +52,12 @@ pub fn arrow_batch_checksums(batch: &RecordBatch) -> Vec<u64> {
 }
 
 fn column_checksum(arr: &dyn Array) -> u64 {
+    column_xxh3(arr, None)
+}
+
+/// Side B for ONE column — the CDC sink verifies per column as it builds (the
+/// batch path verifies whole batches via [`arrow_batch_checksums`]).
+pub fn array_checksum(arr: &dyn Array) -> u64 {
     column_xxh3(arr, None)
 }
 
@@ -77,22 +84,106 @@ fn check_rule(dt: &DataType) -> CheckRule {
         | DataType::Float32
         | DataType::Float64
         | DataType::Decimal128(..)
+        | DataType::Decimal256(..)
         | DataType::Date32
         | DataType::Timestamp(TimeUnit::Microsecond, _)
+        | DataType::Time64(TimeUnit::Microsecond)
+        | DataType::FixedSizeBinary(_)
         | DataType::Boolean
         | DataType::Utf8
         | DataType::Binary => CheckRule::Covered,
-        DataType::Time64(..) => CheckRule::Skipped("Time64 not yet matched source↔Arrow"),
-        DataType::FixedSizeBinary(_) => {
-            CheckRule::Skipped("UUID / FixedSizeBinary not yet matched")
+        // One-dimensional lists over the element set the exporters produce.
+        DataType::List(f) if list_elem_covered(f.data_type()) => CheckRule::Covered,
+        DataType::List(_) | DataType::LargeList(_) => {
+            CheckRule::Skipped("List element type not matched")
         }
-        DataType::List(_) | DataType::LargeList(_) => CheckRule::Skipped("List not yet matched"),
-        DataType::Decimal256(..) => CheckRule::Skipped("Decimal256 not yet matched"),
         DataType::Timestamp(TimeUnit::Nanosecond, _) => {
             CheckRule::Skipped("nanosecond timestamp not yet matched")
         }
         _ => CheckRule::Skipped("type not covered by the value checksum"),
     }
+}
+
+fn list_elem_covered(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Boolean
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+    )
+}
+
+/// One element of a list cell, as its source pass hands it over — the shared
+/// vocabulary both sides encode through [`encode_list_cell`], so the two passes
+/// cannot drift on list byte layout.
+pub enum ListElem {
+    Null,
+    Bool(bool),
+    I16(i16),
+    I32(i32),
+    I64(i64),
+    F32(f32),
+    F64(f64),
+    Str(Vec<u8>),
+}
+
+/// Canonical byte encoding of ONE list cell: per element a tag byte, then a
+/// little-endian u32 length, then the value bytes (empty for `Null`). Order
+/// matters INSIDE a cell (`[a,b] ≠ [b,a]`), unlike the per-column XOR across
+/// cells. Both [`with_cell_bytes`] (Arrow side) and every engine's source pass
+/// encode through this one function.
+pub fn encode_list_cell(elems: &[ListElem]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(elems.len() * 8);
+    let mut put = |tag: u8, bytes: &[u8]| {
+        out.push(tag);
+        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(bytes);
+    };
+    for e in elems {
+        match e {
+            ListElem::Null => put(0, &[]),
+            ListElem::Bool(v) => put(1, &[*v as u8]),
+            ListElem::I16(v) => put(2, &v.to_le_bytes()),
+            ListElem::I32(v) => put(3, &v.to_le_bytes()),
+            ListElem::I64(v) => put(4, &v.to_le_bytes()),
+            ListElem::F32(v) => put(5, &v.to_le_bytes()),
+            ListElem::F64(v) => put(6, &v.to_le_bytes()),
+            ListElem::Str(b) => put(7, b),
+        }
+    }
+    out
+}
+
+/// Cell `r` of a `List` array as [`ListElem`]s — the Arrow-side twin of the
+/// engines' list accessors, feeding the same [`encode_list_cell`] canon.
+fn list_cell_elems(arr: &dyn Array, r: usize) -> Vec<ListElem> {
+    use arrow::array::ListArray;
+    let list = arr.as_any().downcast_ref::<ListArray>().expect("List");
+    let v = list.value(r);
+    let inner = v.as_ref();
+    (0..inner.len())
+        .map(|i| {
+            if inner.is_null(i) {
+                return ListElem::Null;
+            }
+            match inner.data_type() {
+                DataType::Boolean => ListElem::Bool(inner.as_boolean().value(i)),
+                DataType::Int16 => ListElem::I16(inner.as_primitive::<Int16Type>().value(i)),
+                DataType::Int32 => ListElem::I32(inner.as_primitive::<Int32Type>().value(i)),
+                DataType::Int64 => ListElem::I64(inner.as_primitive::<Int64Type>().value(i)),
+                DataType::Float32 => ListElem::F32(inner.as_primitive::<Float32Type>().value(i)),
+                DataType::Float64 => ListElem::F64(inner.as_primitive::<Float64Type>().value(i)),
+                DataType::Utf8 => {
+                    ListElem::Str(inner.as_string::<i32>().value(i).as_bytes().to_vec())
+                }
+                _ => ListElem::Null, // unreachable: gated by list_elem_covered
+            }
+        })
+        .collect()
 }
 
 /// The single per-column hasher behind both [`arrow_batch_checksums`] (un-keyed,
@@ -130,6 +221,13 @@ fn column_xxh3(arr: &dyn Array, key: Option<&dyn Array>) -> u64 {
         }
     }
     acc
+}
+
+/// Whether this Arrow type participates in the value checksum (both sides hash
+/// it) — the CDC sink's independent fold consults this so its skip set can
+/// never drift from the batch pass's.
+pub fn is_covered(dt: &DataType) -> bool {
+    matches!(check_rule(dt), CheckRule::Covered)
 }
 
 /// The columns the value checksum does NOT cover, each with the reason — so a
@@ -185,11 +283,15 @@ fn with_cell_bytes<R>(arr: &dyn Array, r: usize, f: impl FnOnce(&[u8]) -> R) -> 
         DataType::Float32 => fp!(Float32Type),
         DataType::Float64 => fp!(Float64Type),
         DataType::Decimal128(..) => fp!(Decimal128Type),
+        DataType::Decimal256(..) => f(&arr.as_primitive::<Decimal256Type>().value(r).to_le_bytes()),
         DataType::Date32 => fp!(Date32Type),
         DataType::Timestamp(TimeUnit::Microsecond, _) => fp!(TimestampMicrosecondType),
+        DataType::Time64(TimeUnit::Microsecond) => fp!(Time64MicrosecondType),
+        DataType::FixedSizeBinary(_) => f(arr.as_fixed_size_binary().value(r)),
         DataType::Boolean => f(&[arr.as_boolean().value(r) as u8]),
         DataType::Utf8 => f(arr.as_string::<i32>().value(r).as_bytes()),
         DataType::Binary => f(arr.as_binary::<i32>().value(r)),
+        DataType::List(_) => f(&encode_list_cell(&list_cell_elems(arr, r))),
         _ => f(&[]),
     }
 }
@@ -216,6 +318,16 @@ pub trait CellSource {
     fn boolean(&self, col: usize, row: usize) -> Option<bool>;
     fn utf8(&self, col: usize, row: usize) -> Option<Cow<'_, [u8]>>;
     fn binary(&self, col: usize, row: usize) -> Option<Cow<'_, [u8]>>;
+    /// Microseconds since midnight (`TIME` → `Time64(µs)`).
+    fn time64_micros(&self, col: usize, row: usize) -> Option<i64>;
+    /// The exact bytes of a `FixedSizeBinary` cell (UUID's 16, `BINARY(n)`'s n).
+    fn fixed_binary(&self, col: usize, row: usize) -> Option<Cow<'_, [u8]>>;
+    /// Unscaled `i256` of a `Decimal256(_, scale)` cell (precision > 38).
+    fn decimal256(&self, col: usize, row: usize, scale: i8) -> Option<arrow::datatypes::i256>;
+    /// A list cell's elements — encoded via [`encode_list_cell`] by the
+    /// dispatcher, so engines only extract, never encode. Engines whose type
+    /// system has no arrays return `None` unconditionally.
+    fn list(&self, col: usize, row: usize, elem: &DataType) -> Option<Vec<ListElem>>;
 }
 
 /// Side A — the per-column checksum computed **independently** from a [`CellSource`]
@@ -267,6 +379,24 @@ pub fn source_checksums<S: CellSource>(schema: &SchemaRef, src: &S) -> Vec<u64> 
                     DataType::Binary => {
                         if let Some(b) = src.binary(col, row) {
                             acc ^= xxh3_64(b.as_ref());
+                        }
+                    }
+                    DataType::Time64(TimeUnit::Microsecond) => {
+                        le!(src.time64_micros(col, row))
+                    }
+                    DataType::FixedSizeBinary(_) => {
+                        if let Some(b) = src.fixed_binary(col, row) {
+                            acc ^= xxh3_64(b.as_ref());
+                        }
+                    }
+                    DataType::Decimal256(_, scale) => {
+                        if let Some(v) = src.decimal256(col, row, *scale) {
+                            acc ^= xxh3_64(&v.to_le_bytes());
+                        }
+                    }
+                    DataType::List(f) => {
+                        if let Some(elems) = src.list(col, row, f.data_type()) {
+                            acc ^= xxh3_64(&encode_list_cell(&elems));
                         }
                     }
                     _ => {}
@@ -412,21 +542,21 @@ mod tests {
 
     #[test]
     fn coverage_skips_names_uncovered_columns_and_they_contribute_zero() {
-        use arrow::array::Time64MicrosecondArray;
+        use arrow::array::TimestampNanosecondArray;
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
-            Field::new("t", DataType::Time64(TimeUnit::Microsecond), true),
+            Field::new("t", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
         ]));
         // The skip is declared + named, not silent.
         let skips = coverage_skips(&schema);
         assert_eq!(
             skips.len(),
             1,
-            "exactly the Time64 column is uncovered: {skips:?}"
+            "exactly the ns-timestamp column is uncovered: {skips:?}"
         );
         assert_eq!(skips[0].0, "t");
         assert!(
-            skips[0].1.contains("Time64"),
+            skips[0].1.contains("nanosecond"),
             "reason names the type: {}",
             skips[0].1
         );
@@ -436,13 +566,72 @@ mod tests {
             schema,
             vec![
                 Arc::new(Int64Array::from(vec![1, 2])),
-                Arc::new(Time64MicrosecondArray::from(vec![10, 20])),
+                Arc::new(TimestampNanosecondArray::from(vec![10, 20])),
             ],
         )
         .unwrap();
         let sums = arrow_batch_checksums(&batch);
         assert_ne!(sums[0], 0, "covered Int64 contributes");
-        assert_eq!(sums[1], 0, "uncovered Time64 contributes 0");
+        assert_eq!(sums[1], 0, "uncovered ns-timestamp contributes 0");
+    }
+
+    #[test]
+    fn newly_covered_types_contribute_and_detect_corruption() {
+        use arrow::array::{Decimal256Array, FixedSizeBinaryArray, Time64MicrosecondArray};
+        use arrow::datatypes::i256;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("t", DataType::Time64(TimeUnit::Microsecond), true),
+            Field::new("u", DataType::FixedSizeBinary(16), true),
+            Field::new("d", DataType::Decimal256(50, 10), true),
+            Field::new(
+                "l",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+        ]));
+        assert!(
+            coverage_skips(&schema).is_empty(),
+            "all four newly-covered types must be Covered"
+        );
+        let mk = |tval: i64, uuid_last: u8, dval: i128, s: &str| {
+            use arrow::array::StringBuilder;
+            let mut lb = arrow::array::ListBuilder::new(StringBuilder::new())
+                .with_field(Arc::new(Field::new("item", DataType::Utf8, true)));
+            lb.values().append_value(s);
+            lb.values().append_null();
+            lb.append(true);
+            let mut ub = [7u8; 16];
+            ub[15] = uuid_last;
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Time64MicrosecondArray::from(vec![tval])),
+                    Arc::new(
+                        FixedSizeBinaryArray::try_from_iter(vec![ub.to_vec()].into_iter()).unwrap(),
+                    ),
+                    Arc::new(
+                        Decimal256Array::from(vec![i256::from_i128(dval)])
+                            .with_precision_and_scale(50, 10)
+                            .unwrap(),
+                    ),
+                    Arc::new(lb.finish()) as Arc<dyn Array>,
+                ],
+            )
+            .unwrap()
+        };
+        let good = arrow_batch_checksums(&mk(1000, 1, 42, "alpha"));
+        for (i, bad) in [
+            arrow_batch_checksums(&mk(1001, 1, 42, "alpha")),
+            arrow_batch_checksums(&mk(1000, 2, 42, "alpha")),
+            arrow_batch_checksums(&mk(1000, 1, 43, "alpha")),
+            arrow_batch_checksums(&mk(1000, 1, 42, "alphb")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_ne!(good[i], bad[i], "column {i}: corruption must move the sum");
+            assert_ne!(good[i], 0, "column {i}: covered type must contribute");
+        }
     }
 
     #[test]

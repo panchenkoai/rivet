@@ -480,6 +480,50 @@ impl crate::source::value_checksum::CellSource for MysqlCellSource<'_> {
             _ => None,
         }
     }
+    fn time64_micros(&self, col: usize, row: usize) -> Option<i64> {
+        match self.rows[row].as_ref(col) {
+            Some(Value::Time(neg, days, h, m, s, us)) => {
+                let total =
+                    (*days as i64 * 86_400 + *h as i64 * 3_600 + *m as i64 * 60 + *s as i64)
+                        * 1_000_000
+                        + *us as i64;
+                Some(if *neg { -total } else { total })
+            }
+            Some(Value::Bytes(bv)) => bytes_to_str(bv).and_then(parse_time_str_to_micros),
+            _ => None,
+        }
+    }
+    fn fixed_binary(&self, col: usize, row: usize) -> Option<Cow<'_, [u8]>> {
+        // Mirrors the FixedSizeBinary(16) build arm: 16 raw bytes verbatim, or
+        // a 36-char text UUID parsed to its bytes.
+        match self.rows[row].as_ref(col) {
+            Some(Value::Bytes(bv)) if bv.len() == 16 => Some(Cow::Borrowed(bv.as_slice())),
+            Some(Value::Bytes(bv)) => bytes_to_str(bv)
+                .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
+                .map(|u| Cow::Owned(u.as_bytes().to_vec())),
+            _ => None,
+        }
+    }
+    fn decimal256(&self, col: usize, row: usize, scale: i8) -> Option<arrow::datatypes::i256> {
+        use crate::types::decimal::decimal_str_to_scaled_i256;
+        match self.rows[row].as_ref(col) {
+            Some(Value::Bytes(bv)) => {
+                bytes_to_str(bv).and_then(|s| decimal_str_to_scaled_i256(s.trim(), scale))
+            }
+            Some(Value::Int(v)) => decimal_str_to_scaled_i256(&v.to_string(), scale),
+            Some(Value::UInt(v)) => decimal_str_to_scaled_i256(&v.to_string(), scale),
+            _ => None,
+        }
+    }
+    fn list(
+        &self,
+        _col: usize,
+        _row: usize,
+        _elem: &arrow::datatypes::DataType,
+    ) -> Option<Vec<crate::source::value_checksum::ListElem>> {
+        // MySQL has no array types; a List column never resolves here.
+        None
+    }
 }
 
 fn bytes_to_str(b: &[u8]) -> Option<&str> {

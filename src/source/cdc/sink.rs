@@ -383,24 +383,38 @@ fn flush(
             }
         }
         let render = value::render_type(m.arrow_type.as_ref());
-        let arr = if let Some(fix) = &fix {
-            let owned: Vec<Option<RivetValue>> = events
+        let owned: Option<Vec<Option<RivetValue>>> = fix.as_ref().map(|fix| {
+            events
                 .iter()
                 .map(|e| {
                     image_of(e)
                         .and_then(|vals| vals.get(i))
                         .map(|v| fix.apply(v))
                 })
-                .collect();
-            let cells: Vec<Option<&RivetValue>> = owned.iter().map(|o| o.as_ref()).collect();
-            value::build_column(&render, &cells)?
-        } else {
-            let cells: Vec<Option<&RivetValue>> = events
+                .collect()
+        });
+        let cells: Vec<Option<&RivetValue>> = match &owned {
+            Some(o) => o.iter().map(|c| c.as_ref()).collect(),
+            None => events
                 .iter()
                 .map(|e| image_of(e).and_then(|vals| vals.get(i)))
-                .collect();
-            value::build_column(&render, &cells)?
+                .collect(),
         };
+        let arr = value::build_column(&render, &cells)?;
+        // Two-ended value check, same contract as the batch export's Form A:
+        // an independent fold of the typed cells vs a fold of the BUILT array.
+        // A mismatch means the builder changed a value between decode and
+        // Arrow — fail loud BEFORE the part is written, naming the column.
+        let source_sum = value::cells_checksum(&render, &cells);
+        let arrow_sum = crate::source::value_checksum::array_checksum(arr.as_ref());
+        if source_sum != arrow_sum {
+            anyhow::bail!(
+                "cdc value checksum mismatch in column '{}': source={source_sum} \
+                 arrow={arrow_sum} — the value converter changed a value between \
+                 decode and Arrow build",
+                m.column_name
+            );
+        }
         arrays.push(arr);
     }
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
