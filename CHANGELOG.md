@@ -14,6 +14,9 @@
   at a commit boundary, and a trailing half-transaction is flushed but never acked past. Mutually
   exclusive with `table:`; PostgreSQL/MySQL only (SQL Server capture instances are per-table). Verified
   live on both engines: one slot/connection serving two tables, per-table routing, and a clean resume.
+  Cloud destinations get the table sub-prefix with its own trailing slash — cloud prefixes are literal
+  key prefixes (`prefix + key`, no separator), so without it every object landed as a mangled flat key;
+  caught live on a real GCS bucket and pinned by a unit test on `dest_for_table`.
 
 - **`rivet doctor` CDC health probes.** For configs with `mode: cdc` exports, doctor now automates the
   monitoring the CDC reference asks operators to do by hand: PostgreSQL — the export's slot (exists /
