@@ -75,3 +75,17 @@ pub fn seed_mysql_numeric_table(row_count: i64) -> MysqlTable {
     }
     MysqlTable { name }
 }
+
+/// RAII drop-guard for a table on the mysql-cdc instance. (Was five identical
+/// local structs across the live CDC files.)
+pub struct CdcTable(pub String);
+impl Drop for CdcTable {
+    fn drop(&mut self) {
+        use mysql::prelude::Queryable as _;
+        if let Ok(pool) = mysql::Pool::new(super::env::MYSQL_CDC_URL)
+            && let Ok(mut c) = pool.get_conn()
+        {
+            let _ = c.query_drop(format!("DROP TABLE IF EXISTS {}", self.0));
+        }
+    }
+}

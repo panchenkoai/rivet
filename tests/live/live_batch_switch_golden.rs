@@ -16,6 +16,7 @@ use std::collections::HashSet;
 use arrow::array::{Array, Decimal128Array, Int64Array};
 use mysql::prelude::Queryable;
 
+use crate::common::CdcTable as Table;
 use crate::common::*;
 
 fn conn() -> mysql::PooledConn {
@@ -23,17 +24,6 @@ fn conn() -> mysql::PooledConn {
         .expect("mysql pool")
         .get_conn()
         .expect("mysql conn")
-}
-
-struct Table(String);
-impl Drop for Table {
-    fn drop(&mut self) {
-        if let Ok(pool) = mysql::Pool::new(MYSQL_CDC_URL)
-            && let Ok(mut c) = pool.get_conn()
-        {
-            let _ = c.query_drop(format!("DROP TABLE IF EXISTS {}", self.0));
-        }
-    }
 }
 
 /// (row_count, Σ unscaled cents of `amount`, distinct ids) over every part in `dir`.

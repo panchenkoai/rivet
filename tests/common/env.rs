@@ -302,3 +302,13 @@ impl LiveService {
         }
     }
 }
+
+/// Deterministic, collision-free binlog server id for a test, derived from
+/// its unique table name. (Was copy-pasted into four live files before the
+/// rig standardization pass.)
+pub fn server_id_for(tbl: &str) -> u32 {
+    let h = tbl.bytes().fold(2_166_136_261u32, |a, b| {
+        (a ^ b as u32).wrapping_mul(16_777_619)
+    });
+    10_000 + (h % 50_000)
+}

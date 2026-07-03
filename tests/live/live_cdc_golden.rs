@@ -19,6 +19,7 @@ use arrow::array::{Array, Decimal128Array, Float64Array, Int64Array, StringArray
 use arrow::record_batch::RecordBatch;
 use mysql::prelude::Queryable;
 
+use crate::common::CdcTable as Table;
 use crate::common::*;
 
 fn conn() -> mysql::PooledConn {
@@ -26,24 +27,6 @@ fn conn() -> mysql::PooledConn {
         .expect("mysql pool")
         .get_conn()
         .expect("mysql conn")
-}
-
-struct Table(String);
-impl Drop for Table {
-    fn drop(&mut self) {
-        if let Ok(pool) = mysql::Pool::new(MYSQL_CDC_URL)
-            && let Ok(mut c) = pool.get_conn()
-        {
-            let _ = c.query_drop(format!("DROP TABLE IF EXISTS {}", self.0));
-        }
-    }
-}
-
-fn server_id_for(tbl: &str) -> u32 {
-    let h = tbl.bytes().fold(2_166_136_261u32, |a, b| {
-        (a ^ b as u32).wrapping_mul(16_777_619)
-    });
-    10_000 + (h % 50_000)
 }
 
 /// Every row of every part under `dir`, concatenated.
