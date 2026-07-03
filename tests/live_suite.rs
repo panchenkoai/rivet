@@ -63,6 +63,8 @@ mod live_azure_multipart;
 mod live_catalog_hints;
 #[path = "live/live_cdc.rs"]
 mod live_cdc;
+#[path = "live/live_cdc_golden.rs"]
+mod live_cdc_golden;
 #[path = "live/live_cdc_mssql.rs"]
 mod live_cdc_mssql;
 #[path = "live/live_cdc_oracle.rs"]

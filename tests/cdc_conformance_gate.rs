@@ -143,6 +143,19 @@ const CASES: &[(&str, Expect, Expect, Expect)] = &[
         NA("same shared Position::save path; pinned once on MySQL"),
     ),
     (
+        "golden_calculated_metrics",
+        Test("fn cdc_golden_fixture_tables_calculated_metrics"),
+        NA(
+            "the arithmetic anchor is pinned once, on the client engine; \
+            cross-engine value fidelity is carried by the matrices + the \
+            cross-oracle sweeps",
+        ),
+        NA(
+            "same — one arithmetic anchor suffices; MSSQL values ride the \
+            matrix + oracle contracts",
+        ),
+    ),
+    (
         "gremlin_capture_job_stall",
         NA("MySQL has no external capture job — the binlog IS the capture"),
         NA("PG has no external capture job — the slot decodes on read"),
@@ -155,6 +168,7 @@ fn every_cdc_engine_covers_every_conformance_case() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut mysql_pg = fs::read_to_string(root.join("tests/live/live_cdc.rs")).unwrap();
     mysql_pg.push_str(&fs::read_to_string(root.join("tests/live/gremlin_cdc.rs")).unwrap());
+    mysql_pg.push_str(&fs::read_to_string(root.join("tests/live/live_cdc_golden.rs")).unwrap());
     let mssql = fs::read_to_string(root.join("tests/live/live_cdc_mssql.rs")).unwrap();
 
     let mut missing = Vec::new();

@@ -12,6 +12,15 @@
   encoding shared by both sides; a new accessor per engine, enforced at compile time). An offline matrix
   guard pins the CDC fold to the builder across every covered type with hostile cells (overflow
   narrowing, wrong-width binary, arrays with inner NULLs, NaN, u64::MAX, 50-digit decimals).
+- **CDC golden suite: hand-calculated metrics over the batch fixture schemas.** The matrices prove
+  CDC == batch; the goldens anchor CDC to ARITHMETIC — a deterministic insert/update/delete workload
+  over golden copies of eight real batch-fixture schemas (decimal money, char(36) uuids,
+  AUTO_INCREMENT keys, a varchar PRIMARY KEY, doubles, nullable text, fixed hex, the nullable-cursor
+  shape), captured through ONE multiplexed stream, asserted against formula-derived literals: op
+  counts per table, series sums of decimal cents over insert- and update-images, exact dyadic double
+  sums, planned NULL profiles, distinct-set identities, deleted-id sets, manifest row counts. If batch
+  and CDC ever drift TOGETHER, the matrices stay green — this suite does not. A row in the conformance
+  matrix.
 - **Gremlin suite for CDC: real faults, not panics.** Five fault classes the `RIVET_TEST_PANIC_AT`
   matrix structurally cannot exercise (a panic unwinds and runs `Drop`; these do not): SIGKILL
   mid-drain, the binlog TCP stream cut after N bytes (toxiproxy `limit_data` — deterministic), a hard
