@@ -1351,6 +1351,62 @@ exports:
     assert_eq!(snap_parts(), 1, "run 2 must NOT re-snapshot");
 }
 
+// Roast finding #25: the snapshot synth export INHERITED skip_empty — an
+// EMPTY table with skip_empty=true wrote no snapshot/_SUCCESS, so the marker
+// check re-snapshotted on every run, forever. The handoff must converge: an
+// empty snapshot still completes (0-row manifest + _SUCCESS), and run 2 goes
+// straight to draining.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_initial_snapshot_of_an_empty_table_converges_despite_skip_empty() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_init_empty");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let _guard = Table(tbl.clone());
+
+    let out = d.path().join("out");
+    let ckpt = d.path().join("cdc.ckpt");
+    std::fs::create_dir_all(&out).unwrap();
+    let yaml = format!(
+        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
+exports:
+  - name: {tbl}
+    table: {tbl}
+    mode: cdc
+    format: parquet
+    skip_empty: true
+    cdc: {{ initial: snapshot, checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        ckpt = ckpt.display(),
+        out = out.display(),
+        sid = server_id_for(&tbl),
+    );
+    let cfg = write_config(&d, &yaml);
+
+    run_cdc(&cfg);
+    let marker = out.join("snapshot").join("_SUCCESS");
+    assert!(
+        marker.exists(),
+        "an EMPTY snapshot must still write _SUCCESS or the handoff never converges"
+    );
+    let stamp = std::fs::metadata(&marker).unwrap().modified().unwrap();
+
+    // Run 2 must NOT re-snapshot (marker untouched) and must drain the change.
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1, 10)"))
+        .unwrap();
+    run_cdc(&cfg);
+    assert_eq!(
+        std::fs::metadata(&marker).unwrap().modified().unwrap(),
+        stamp,
+        "run 2 must not re-snapshot"
+    );
+    assert_eq!(manifest_rows(&out), 1, "the change streams normally");
+}
+
 // PostgreSQL flavour: the slot IS the anchor (no checkpoint required).
 #[test]
 #[ignore = "live: requires docker compose postgres (wal_level=logical)"]

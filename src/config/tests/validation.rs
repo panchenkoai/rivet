@@ -704,3 +704,21 @@ exports:
 "#;
     Config::from_yaml(yaml).expect("qualified + bare keys must validate");
 }
+
+// `initial: snapshot` reserves the `snapshot/` sub-prefix — a captured table
+// literally named "snapshot" would collide with it (roast finding).
+#[test]
+fn initial_snapshot_rejects_a_table_named_snapshot() {
+    let yaml = r#"
+source: { type: mysql, url: "mysql://localhost/test" }
+exports:
+  - name: app_cdc
+    tables: [orders, snapshot]
+    mode: cdc
+    format: parquet
+    cdc: { initial: snapshot, checkpoint: /tmp/a.ckpt, server_id: 5001 }
+    destination: { type: local, path: ./out }
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(msg.contains("snapshot"), "must name the collision: {msg}");
+}

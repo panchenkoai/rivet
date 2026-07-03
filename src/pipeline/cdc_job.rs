@@ -178,6 +178,11 @@ pub(super) fn initial_snapshot_pending(
         synth.tables = None;
         synth.cdc = None;
         synth.destination = snap_dcfg;
+        // NEVER inherit skip_empty: an EMPTY table with skip_empty=true would
+        // write no snapshot/_SUCCESS, so the marker check re-snapshots on
+        // every run forever. An empty snapshot must still complete (manifest +
+        // _SUCCESS with 0 rows) for the handoff to converge.
+        synth.skip_empty = false;
         pending.push(synth);
     }
     Ok(pending)

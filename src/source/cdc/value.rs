@@ -655,24 +655,7 @@ fn decimal_to_i256(v: &RivetValue, scale: i8) -> Option<arrow::datatypes::i256> 
         }
         _ => return None,
     };
-    let (neg, s) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, s.as_str()),
-    };
-    let (int_part, frac_part) = match s.split_once('.') {
-        Some((i, f)) => (i, f),
-        None => (s, ""),
-    };
-    let scale = scale.max(0) as usize;
-    let mut digits = String::with_capacity(int_part.len() + scale);
-    digits.push_str(int_part);
-    let frac: String = frac_part.chars().take(scale).collect();
-    digits.push_str(&frac);
-    for _ in frac.len()..scale {
-        digits.push('0');
-    }
-    let mag = arrow::datatypes::i256::from_string(&digits)?;
-    Some(if neg { -mag } else { mag })
+    crate::types::decimal::decimal_str_to_scaled_i256(&s, scale)
 }
 
 /// Parse a decimal carried as source bytes (e.g. `"150.00"`) into the scaled
@@ -683,31 +666,17 @@ fn decimal_to_i128(v: &RivetValue, scale: i8) -> Option<i128> {
         RivetValue::Int(i) => i.to_string(),
         RivetValue::UInt(u) => u.to_string(),
         // Fixed-point values some drivers deliver as floats (SQL Server MONEY
-        // via tiberius): render at the column scale, then the exact digit
-        // parse below — mirrors the batch path's f64_to_scaled_i128.
+        // via tiberius): render at the column scale first, then the shared
+        // digit-exact parse below.
         RivetValue::Float(f) if f.is_finite() => {
             format!("{f:.prec$}", prec = scale.max(0) as usize)
         }
         _ => return None,
     };
-    let (neg, s) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, s.as_str()),
-    };
-    let (int_part, frac_part) = match s.split_once('.') {
-        Some((i, f)) => (i, f),
-        None => (s, ""),
-    };
-    let scale = scale.max(0) as usize;
-    let mut digits = String::with_capacity(int_part.len() + scale);
-    digits.push_str(int_part);
-    let frac: String = frac_part.chars().take(scale).collect();
-    digits.push_str(&frac);
-    for _ in frac.len()..scale {
-        digits.push('0');
-    }
-    let mag: i128 = digits.parse().ok()?;
-    Some(if neg { -mag } else { mag })
+    // ONE decimal-string canon for the whole codebase (types::decimal) — the
+    // hand-rolled twin this replaced would drift (it rejected '+5.00' and an
+    // empty integer part the shared parser accepts).
+    crate::types::decimal::decimal_str_to_scaled_i128(&s, scale)
 }
 
 /// MySQL binlog cell quirks, keyed by the column's NATIVE type (the binlog

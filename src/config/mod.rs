@@ -1022,6 +1022,23 @@ impl Config {
             }
         }
 
+        // `initial: snapshot` writes each table's snapshot under the reserved
+        // sub-prefix `snapshot/` — a table actually NAMED "snapshot" would share
+        // a prefix with another table's marker. Refuse the collision at load.
+        if let Some(cdc) = &export.cdc
+            && cdc.initial == Some(CdcInitialMode::Snapshot)
+        {
+            let clashes = |t: &str| t.rsplit('.').next().unwrap_or(t) == "snapshot";
+            if export.table.as_deref().is_some_and(clashes)
+                || export.tables.iter().flatten().any(|t| clashes(t))
+            {
+                anyhow::bail!(
+                    "export '{}': a table named 'snapshot' collides with the reserved                      `snapshot/` sub-prefix that `cdc.initial: snapshot` writes — rename                      the table or use a separate export without `initial:`",
+                    export.name
+                );
+            }
+        }
+
         // `initial: snapshot` needs a durable anchor BEFORE the snapshot reads.
         // PostgreSQL pins server-side (the slot); MySQL / SQL Server have no
         // server-side anchor, so the checkpoint file is mandatory there.
