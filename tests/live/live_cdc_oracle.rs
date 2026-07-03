@@ -334,8 +334,13 @@ exports:
                 // (output_format_decimal_trailing_zeros: local image renders
                 // "…0000", newer CI image renders bare) — pin it, per the
                 // session-state-dependent-rendering rule.
+                // toString() on the SQL side: newer ClickHouse emits
+                // decimals as JSON NUMBERS (older quoted them as strings), and
+                // the number path re-renders through f64, eating the '.0000'
+                // scale digits. A SQL-side string is version-stable and keeps
+                // the full scale.
                 let cj = clickhouse_run_sql_json(&format!(
-                    "SELECT {ch} AS v FROM file('{rel}/*.parquet', Parquet) \
+                    "SELECT toString({ch}) AS v FROM file('{rel}/*.parquet', Parquet) \
                      SETTINGS output_format_decimal_trailing_zeros = 1"
                 ));
                 let got = cj[0]["v"]
