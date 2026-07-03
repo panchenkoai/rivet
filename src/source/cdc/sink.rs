@@ -134,6 +134,18 @@ impl TableSink<'_> {
     }
 }
 
+/// Does a config `table:` entry match an event's identity? Config may be bare
+/// (`orders` — matches the bare table name in any schema) or schema-qualified
+/// (`public.orders` — matches schema AND table). Adapters always emit schema
+/// and table separately; comparing the config string verbatim against the
+/// bare event table silently routed ZERO events for qualified configs.
+pub(super) fn table_matches(cfg: &str, schema: &str, table: &str) -> bool {
+    match cfg.split_once('.') {
+        Some((cs, ct)) => cs == schema && ct == table,
+        None => cfg == table,
+    }
+}
+
 /// The **durable sequence** for one roll — the invariant that makes the run
 /// at-least-once: encode + upload EVERY table's buffered part, THEN persist the
 /// resume checkpoint, THEN ack the source, in that exact order. A crash between
@@ -209,14 +221,23 @@ pub(crate) fn run_to_files(
 
     while let Some(ev) = stream.next_change() {
         let ev = ev?;
-        let Some(sink) = sinks.iter_mut().find(|s| s.out.table == ev.table) else {
-            continue; // not a captured table
-        };
+        // The commit boundary is a property of the STREAM, not of any routed
+        // table — record it BEFORE the routing filter. MySQL marks only the
+        // LAST event of a transaction committed; if that event lands on an
+        // uncaptured table (audit-log-written-last is a common ORM shape),
+        // filtering first would drop the boundary, stall the checkpoint
+        // forever, and duplicate the captured rows on every scheduler cycle.
         let committed = ev.committed;
         if committed {
             last_commit = Some(ev.position.clone());
             unacked_commit = true;
         }
+        let Some(sink) = sinks
+            .iter_mut()
+            .find(|s| table_matches(&s.out.table, &ev.schema, &ev.table))
+        else {
+            continue; // not a captured table
+        };
         total_bytes += ev.estimated_bytes();
         sink.buf.push(ev);
         total_rows += 1;
@@ -536,6 +557,62 @@ mod tests {
             self.acked.push(position.clone());
             Ok(())
         }
+    }
+
+    // Ultrareview bug_002: MySQL marks only the LAST event of a transaction
+    // committed. If that event lands on an UNCAPTURED table, filtering before
+    // the commit bookkeeping dropped the boundary — checkpoint never advanced,
+    // the captured rows re-read (and re-written) on every scheduler cycle.
+    // The boundary is a STREAM property: it must be recorded before routing.
+    #[test]
+    fn commit_boundary_on_an_uncaptured_table_still_advances_the_checkpoint() {
+        let d = tempfile::tempdir().unwrap();
+        let dest = local_dest(&d);
+        let cols = int_col();
+        let ckpt = d.path().join("ckpt");
+        let mut captured = insert(1);
+        captured.committed = false; // mid-transaction
+        let mut foreign = insert(2);
+        foreign.table = "audit_log".into(); // NOT captured
+        foreign.committed = true; // the transaction's commit boundary
+        let mut stream = FakeStream {
+            events: vec![captured, foreign].into(),
+            acked: Vec::new(),
+        };
+        let cfg = SinkConfig {
+            checkpoint: Some(ckpt.clone()),
+            ..cfg(dest.as_ref(), &cols, FormatType::Parquet, 10)
+        };
+        run_to_files(&mut stream, cfg).unwrap();
+        assert!(
+            Position::load(&ckpt).unwrap().is_some(),
+            "the stream's commit boundary must advance the checkpoint even when \
+             its event routes to an uncaptured table"
+        );
+        assert_eq!(stream.acked.len(), 1, "and the source must be acked");
+    }
+
+    // Ultrareview bug_004: a schema-qualified config (`table: public.orders`)
+    // compared verbatim against the adapter's BARE event table matched zero
+    // events — the whole stream silently dropped into a 0-row success.
+    #[test]
+    fn table_matches_handles_bare_and_qualified_configs() {
+        assert!(
+            table_matches("orders", "public", "orders"),
+            "bare matches any schema"
+        );
+        assert!(
+            table_matches("public.orders", "public", "orders"),
+            "qualified matches"
+        );
+        assert!(
+            !table_matches("audit.orders", "public", "orders"),
+            "wrong schema differs"
+        );
+        assert!(
+            !table_matches("orders", "public", "users"),
+            "different table differs"
+        );
     }
 
     fn insert(id: i64) -> ChangeEvent {

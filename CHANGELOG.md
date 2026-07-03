@@ -12,6 +12,20 @@
   encoding shared by both sides; a new accessor per engine, enforced at compile time). An offline matrix
   guard pins the CDC fold to the builder across every covered type with hostile cells (overflow
   narrowing, wrong-width binary, arrays with inner NULLs, NaN, u64::MAX, 50-digit decimals).
+- **CDC: a transaction's commit boundary counts even when its last event lands on an uncaptured
+  table.** MySQL marks only the LAST event of a transaction committed; the routing filter ran first, so
+  a transaction ending on an unlisted table (audit-log-written-last — the common ORM shape) never
+  advanced the checkpoint: the captured rows were re-read and re-written on every scheduler cycle until
+  binlog retention killed the export. The boundary is recorded before routing now, on both the file sink
+  and the NDJSON path. (Ultrareview finding; live + unit pinned.)
+- **CDC: schema-qualified `table:`/`tables:` entries route correctly.** `table: public.orders` — the
+  shape the batch docs promote — compared verbatim against the adapter's bare table name, matched zero
+  events, and produced a 0-row success. Qualified entries now match schema AND table; bare entries match
+  the bare name. (Ultrareview finding.)
+- **`initial: snapshot`: a missing checkpoint with prior-run evidence fails loudly on MySQL/SQL Server
+  too.** The finding-#28 fix covered only PostgreSQL; a deleted checkpoint file after a completed
+  snapshot silently re-pinned MySQL at `SHOW MASTER STATUS` and SQL Server at max-LSN — the latter
+  actively destroying its natural min-LSN over-read floor. (Ultrareview finding.)
 - **`initial: snapshot` no longer bypasses the vanished-slot protection.** The anchor step ran with
   `resume_expected=false` on EVERY run, so a dropped/invalidated PostgreSQL slot was silently recreated
   at the current position before the loud-failure path could fire — every change since the drop was

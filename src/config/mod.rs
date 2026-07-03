@@ -617,7 +617,7 @@ impl Config {
         .count();
         if set_count == 0 {
             anyhow::bail!(
-                "export '{}': specify exactly one of 'query', 'query_file', or 'table'. \
+                "export '{}': specify exactly one of 'query', 'query_file', 'table', or 'tables'. \
                  Use table: <name> for a whole table (enables PK auto-chunking); \
                  query: \"SELECT …\" for an inline one-liner; \
                  query_file: <path> for SQL you keep in version control.",
@@ -626,7 +626,7 @@ impl Config {
         }
         if set_count > 1 {
             anyhow::bail!(
-                "export '{}': specify exactly one of 'query', 'query_file', or 'table' (got {} set)",
+                "export '{}': specify exactly one of 'query', 'query_file', 'table', or 'tables' (got {} set)",
                 export.name,
                 set_count
             );
@@ -1033,7 +1033,9 @@ impl Config {
                 || export.tables.iter().flatten().any(|t| clashes(t))
             {
                 anyhow::bail!(
-                    "export '{}': a table named 'snapshot' collides with the reserved                      `snapshot/` sub-prefix that `cdc.initial: snapshot` writes — rename                      the table or use a separate export without `initial:`",
+                    "export '{}': a table named 'snapshot' collides with the reserved \
+                     `snapshot/` sub-prefix that `cdc.initial: snapshot` writes — rename \
+                     the table or use a separate export without `initial:`",
                     export.name
                 );
             }

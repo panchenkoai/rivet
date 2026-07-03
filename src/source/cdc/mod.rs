@@ -139,7 +139,20 @@ pub(crate) fn run(
     let mut emitted = 0usize;
     while let Some(ev) = stream.next_change() {
         let ev = ev?;
-        if !tables.is_empty() && !tables.iter().any(|t| t == &ev.table) {
+        // Checkpoint at every commit boundary BEFORE the table filter — the
+        // resume position is a stream property; a transaction whose last
+        // event lands on an unlisted table must still advance it (mirrors
+        // the file sink).
+        if ev.committed
+            && let Some(p) = &checkpoint
+        {
+            ev.position.save(p)?;
+        }
+        if !tables.is_empty()
+            && !tables
+                .iter()
+                .any(|t| sink::table_matches(t, &ev.schema, &ev.table))
+        {
             continue;
         }
         let to_json = |img: &Option<Vec<RivetValue>>| {
@@ -155,13 +168,6 @@ pub(crate) fn run(
             "pos": ev.position.0,
         });
         println!("{line}");
-        // Checkpoint only at a transaction boundary — resuming mid-transaction
-        // would replay a partial transaction downstream.
-        if ev.committed
-            && let Some(p) = &checkpoint
-        {
-            ev.position.save(p)?;
-        }
         emitted += 1;
         if max_events.is_some_and(|m| emitted >= m) {
             break;
@@ -264,6 +270,19 @@ impl CdcEngine {
                 })?;
                 if Position::load(ckpt)?.is_some() {
                     return Ok(()); // anchored already — never move it
+                }
+                if resume_expected {
+                    // Prior-run evidence (a completed snapshot marker) with a
+                    // MISSING checkpoint: pinning "current" would silently skip
+                    // everything since the loss — and on MSSQL would actively
+                    // destroy the min-LSN over-read floor. Fail loudly.
+                    anyhow::bail!(
+                        "{} cdc: checkpoint '{}' is missing but prior-run evidence exists — \
+                         re-snapshot (delete the snapshot/_SUCCESS markers) to accept a new \
+                         anchor, or restore the checkpoint file",
+                        self.label(),
+                        ckpt.display()
+                    );
                 }
                 match self {
                     Self::Mysql => {
@@ -515,6 +534,33 @@ pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<Vec<crate::manifest::Ru
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Ultrareview bug_001: the loud-fail-on-missing-anchor promise held only
+    // for PostgreSQL. On MySQL/MSSQL a deleted checkpoint with prior-run
+    // evidence behind it silently re-pinned at "current" (and on MSSQL that
+    // pin actively destroys the min-LSN over-read floor). The bail must fire
+    // BEFORE any connection — so this needs no live database.
+    #[test]
+    fn ensure_anchor_missing_checkpoint_with_evidence_fails_loudly() {
+        let d = tempfile::tempdir().unwrap();
+        let missing = d.path().join("nonexistent.ckpt");
+        for engine in [CdcEngine::Mysql, CdcEngine::Mssql] {
+            let err = engine
+                .ensure_anchor(
+                    "mysql://u:p@127.0.0.1:1/db",
+                    "unused",
+                    Some(&missing),
+                    None,
+                    true, // resume evidence exists
+                )
+                .expect_err("missing checkpoint + evidence must bail, not re-pin");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("prior-run evidence"),
+                "{engine:?}: must explain the evidence: {msg}"
+            );
+        }
+    }
 
     #[test]
     fn resolve_cdc_columns_rejects_a_non_identifier_table() {
