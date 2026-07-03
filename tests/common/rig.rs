@@ -21,6 +21,7 @@ pub struct Rig {
     format: &'static str,
     cdc_lines: Vec<String>,
     extra_lines: Vec<String>,
+    dest_override: Option<PathBuf>,
     dir: tempfile::TempDir,
 }
 
@@ -35,6 +36,7 @@ impl Rig {
             format: "parquet",
             cdc_lines: Vec::new(),
             extra_lines: Vec::new(),
+            dest_override: None,
             dir: tempfile::tempdir().expect("rig tempdir"),
         }
     }
@@ -83,7 +85,26 @@ impl Rig {
     }
 
     pub fn out_dir(&self) -> PathBuf {
-        self.dir.path().join("out")
+        self.dest_override
+            .clone()
+            .unwrap_or_else(|| self.dir.path().join("out"))
+    }
+
+    /// Point the destination somewhere outside the rig's tempdir (e.g. a
+    /// mounted tiny filesystem for ENOSPC scenarios).
+    pub fn dest_path(mut self, path: PathBuf) -> Self {
+        self.dest_override = Some(path);
+        self
+    }
+
+    /// Run with an extra environment variable (fault injection); returns the
+    /// raw output — the caller asserts success or failure.
+    pub fn run_with_env(&self, key: &str, val: &str) -> std::process::Output {
+        std::process::Command::new(RIVET_BIN)
+            .args(["run", "--config", self.config_path().to_str().unwrap()])
+            .env(key, val)
+            .output()
+            .expect("spawn rivet")
     }
 
     pub fn checkpoint(&self) -> PathBuf {

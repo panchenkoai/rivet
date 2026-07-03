@@ -54,7 +54,6 @@ struct OpCounts {
 #[test]
 #[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
 fn cdc_concurrent_writers_capture_converges_to_source_state() {
-    let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("cdc_mbt");
     let mut c = mysql::Pool::new(MYSQL_CDC_URL)
         .expect("pool")
@@ -67,31 +66,9 @@ fn cdc_concurrent_writers_capture_converges_to_source_state() {
     .unwrap();
     let _guard = Table(tbl.clone());
 
-    let out = d.path().join("out");
-    let ckpt = d.path().join("cdc.ckpt");
-    std::fs::create_dir_all(&out).unwrap();
-    let yaml = format!(
-        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: cdc
-    format: parquet
-    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid}, rollover: 128 }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        ckpt = ckpt.display(),
-        out = out.display(),
-        sid = server_id_for(&tbl),
-    );
-    let cfg = write_config(&d, &yaml);
-    let run = || {
-        let st = std::process::Command::new(RIVET_BIN)
-            .args(["run", "--config", cfg.to_str().unwrap()])
-            .status()
-            .unwrap();
-        assert!(st.success());
-    };
+    let rig = Rig::mysql_cdc(&tbl).cdc("rollover: 128");
+    let out = rig.out_dir();
+    let run = || rig.run_ok();
     run(); // pin
 
     // ── 4 concurrent writers, shared key range 1..=60, 250 ops each. ──────
@@ -261,7 +238,6 @@ fn cdc_fault_point_sweep_every_phase_boundary_recovers() {
         "cdc_before_manifest",
     ];
     for point in POINTS {
-        let d = tempfile::tempdir().unwrap();
         let tbl = unique_name("cdc_sweep");
         let mut c = mysql::Pool::new(MYSQL_CDC_URL)
             .expect("pool")
@@ -272,40 +248,16 @@ fn cdc_fault_point_sweep_every_phase_boundary_recovers() {
             .unwrap();
         let _guard = Table(tbl.clone());
 
-        let out = d.path().join("out");
-        let ckpt = d.path().join("cdc.ckpt");
-        std::fs::create_dir_all(&out).unwrap();
-        let yaml = format!(
-            r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: cdc
-    format: parquet
-    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid}, rollover: 10 }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-            ckpt = ckpt.display(),
-            out = out.display(),
-            sid = server_id_for(&tbl),
-        );
-        let cfg = write_config(&d, &yaml);
+        let rig = Rig::mysql_cdc(&tbl).cdc("rollover: 10");
+        let out = rig.out_dir();
         // Pin cleanly, then a 30-row backlog (3 parts at rollover 10).
-        let st = std::process::Command::new(RIVET_BIN)
-            .args(["run", "--config", cfg.to_str().unwrap()])
-            .status()
-            .unwrap();
-        assert!(st.success());
+        rig.run_ok();
         let vals: Vec<String> = (1..=30).map(|i| format!("({i}, {i})")).collect();
         c.query_drop(format!("INSERT INTO {tbl} VALUES {}", vals.join(",")))
             .unwrap();
 
         // Faulted run: must crash (loudly), never report success.
-        let res = std::process::Command::new(RIVET_BIN)
-            .args(["run", "--config", cfg.to_str().unwrap()])
-            .env("RIVET_TEST_PANIC_AT", point)
-            .output()
-            .unwrap();
+        let res = rig.run_with_env("RIVET_TEST_PANIC_AT", point);
         assert!(
             !res.status.success(),
             "{point}: the faulted run must fail loudly"
@@ -314,11 +266,7 @@ exports:
         // Clean retries close the gap.
         let mut ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
         for _ in 0..3 {
-            let st = std::process::Command::new(RIVET_BIN)
-                .args(["run", "--config", cfg.to_str().unwrap()])
-                .status()
-                .unwrap();
-            assert!(st.success(), "{point}: recovery run must succeed");
+            rig.run_ok();
             ids = distinct_int_ids(&out);
             if ids.len() >= 30 {
                 break;
@@ -1056,7 +1004,6 @@ exports:
 #[ignore = "live: requires docker compose postgres (wal_level=logical)"]
 fn pg_cdc_delete_with_non_first_pk_lands_in_the_pk_column() {
     use postgres::NoTls;
-    let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("cdc_pk_mid");
     let slot = unique_name("rivet_pkmid_slot");
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
@@ -1079,9 +1026,9 @@ fn pg_cdc_delete_with_non_first_pk_lands_in_the_pk_column() {
     ))
     .unwrap();
 
-    let out = d.path().join("out");
-    std::fs::create_dir_all(&out).unwrap();
-    run_ok(&pg_mbt_cfg(&d, &tbl, &slot, &out));
+    let rig = pg_mbt_cfg(&tbl, &slot);
+    let out = rig.out_dir();
+    rig.run_ok();
 
     use arrow::array::{Int32Array, StringArray};
     let mut checked_delete = false;
@@ -1124,25 +1071,8 @@ fn pg_cdc_delete_with_non_first_pk_lands_in_the_pk_column() {
     assert!(checked_delete, "a delete event must be captured");
 }
 
-fn pg_mbt_cfg(
-    d: &tempfile::TempDir,
-    tbl: &str,
-    slot: &str,
-    out: &std::path::Path,
-) -> std::path::PathBuf {
-    let yaml = format!(
-        r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: cdc
-    format: parquet
-    cdc: {{ slot: {slot}, until_current: true }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        out = out.display(),
-    );
-    write_config(d, &yaml)
+fn pg_mbt_cfg(tbl: &str, slot: &str) -> Rig {
+    Rig::pg_cdc(tbl, slot)
 }
 
 // Finding #42 (live): updating the PRIMARY KEY is a legal operation —
@@ -1152,7 +1082,6 @@ exports:
 #[ignore = "live: requires docker compose postgres (wal_level=logical)"]
 fn pg_cdc_pk_changing_update_captures_and_does_not_brick() {
     use postgres::NoTls;
-    let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("cdc_pkupd");
     let slot = unique_name("rivet_pkupd_slot");
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
@@ -1172,9 +1101,9 @@ fn pg_cdc_pk_changing_update_captures_and_does_not_brick() {
     ))
     .unwrap();
 
-    let out = d.path().join("out");
-    std::fs::create_dir_all(&out).unwrap();
-    run_ok(&pg_mbt_cfg(&d, &tbl, &slot, &out));
+    let rig = pg_mbt_cfg(&tbl, &slot);
+    let out = rig.out_dir();
+    rig.run_ok();
 
     use arrow::array::{Int32Array, StringArray};
     let mut update_after: Option<(i32, String)> = None;
