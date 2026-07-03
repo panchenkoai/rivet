@@ -185,6 +185,58 @@ fn mssql_cdc_idle_first_run_then_change_is_captured_not_skipped() {
     );
 }
 
+// Conformance: stream-property commit boundary + qualified `table:` routing,
+// SQL Server flavour. MSSQL stamps committed=true per change-table row, so
+// the MySQL stall cannot occur structurally; `dbo.<t>` must route.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_mixed_transaction_and_qualified_table_conformance() {
+    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempfile::tempdir().unwrap();
+    let orders = unique_name("rivet_cdc_mixq");
+    let audit = unique_name("rivet_cdc_mixa");
+    let (ci_o, ci_a) = (format!("dbo_{orders}"), format!("dbo_{audit}"));
+    for (t, _ci) in [(&orders, &ci_o), (&audit, &ci_a)] {
+        mssql_cdc_drop_table(&format!("dbo.{t}"));
+        mssql_cdc_exec(&format!("CREATE TABLE dbo.{t}(id INT PRIMARY KEY, v INT)"));
+    }
+    enable_cdc(&orders, &ci_o);
+    enable_cdc(&audit, &ci_a);
+    let _g1 = CdcTable {
+        table: orders.clone(),
+        ci: ci_o.clone(),
+    };
+    let _g2 = CdcTable {
+        table: audit.clone(),
+        ci: ci_a.clone(),
+    };
+
+    // ONE transaction touching both tables, audit last.
+    mssql_cdc_exec(&format!(
+        "BEGIN TRANSACTION; INSERT INTO dbo.{orders} VALUES (1,10); \
+         INSERT INTO dbo.{audit} VALUES (1,99); COMMIT;"
+    ));
+    wait_for_capture(&ci_o, 1);
+
+    // Qualified `table: dbo.<orders>` must route the captured row.
+    let ckpt = d.path().join("cdc.ckpt");
+    let out1 = d.path().join("out1");
+    let out2 = d.path().join("out2");
+    std::fs::create_dir_all(&out1).unwrap();
+    std::fs::create_dir_all(&out2).unwrap();
+    let qualified = format!("dbo.{orders}");
+    run_cdc(&mssql_cdc_config(&d, &qualified, &ci_o, &ckpt, &out1));
+    assert_eq!(manifest_rows(&out1), 1, "qualified table: must capture");
+
+    // And the checkpoint advanced past the mixed transaction.
+    run_cdc(&mssql_cdc_config(&d, &qualified, &ci_o, &ckpt, &out2));
+    assert_eq!(
+        manifest_rows(&out2),
+        0,
+        "no re-read of the mixed transaction"
+    );
+}
+
 // UPDATE and DELETE through the typed surface (the matrix pins INSERTs only):
 // an UPDATE's after-image must equal a batch export of the post-update state,
 // column type for column type; a DELETE's image must carry the typed PK.

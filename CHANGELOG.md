@@ -12,6 +12,16 @@
   encoding shared by both sides; a new accessor per engine, enforced at compile time). An offline matrix
   guard pins the CDC fold to the builder across every covered type with hostile cells (overflow
   narrowing, wrong-width binary, arrays with inner NULLs, NaN, u64::MAX, 50-digit decimals).
+- **Test harness: three standing hard gates distilled from the campaign.** (1) A CDC engine
+  conformance gate (offline, plain `cargo test`) requiring every engine to carry every conformance
+  case — resume, idle-first-run, crash-before-ack, type matrix, update/delete, initial snapshot,
+  vanished anchor, mixed-transaction boundary, qualified routing, non-UTC — or an explicit justified
+  N/A; the four cases it immediately flagged as missing (mixed-tx on PG/MSSQL, qualified names on
+  MySQL/MSSQL) are filled with live tests. (2) An outcome gate: every live CDC test that runs a capture
+  must read back what it produced — bare exit-0 successes (how the 0-row bugs hid) no longer pass.
+  (3) CI: nightly `cargo-mutants` over the CDC modules (surviving mutant = named test blind spot) and a
+  per-PR schema-diff gate requiring every new config key to be named by a test (the worst campaign bugs
+  lived at knob intersections).
 - **CDC: a transaction's commit boundary counts even when its last event lands on an uncaptured
   table.** MySQL marks only the LAST event of a transaction committed; the routing filter ran first, so
   a transaction ending on an unlisted table (audit-log-written-last — the common ORM shape) never

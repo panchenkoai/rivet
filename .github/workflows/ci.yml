@@ -26,6 +26,34 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 1
 
 jobs:
+  # Composition gate: a NEW config key is a new feature surface — the 2026-07
+  # campaign's worst bugs (initial×vanished-slot, initial×skip_empty) lived at
+  # the INTERSECTION of two individually-correct knobs. A PR that adds a key
+  # to the JSON schema must also add/extend a test that names that key.
+  config-key-composition:
+    name: New config keys carry tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: New schema keys must appear in tests
+        run: |
+          git fetch origin ${{ github.base_ref }} --depth=1
+          NEW_KEYS=$(diff \
+            <(git show origin/${{ github.base_ref }}:schemas/rivet.schema.json | jq -r '[paths | .[] | select(type=="string")] | unique | .[]' 2>/dev/null || true) \
+            <(jq -r '[paths | .[] | select(type=="string")] | unique | .[]' schemas/rivet.schema.json) \
+            | grep '^>' | awk '{print $2}' \
+            | grep -vE '^(properties|items|anyOf|allOf|oneOf|type|description|required|enum|format|default|minimum|maximum|pattern|additionalProperties|definitions|\$)' || true)
+          FAIL=0
+          for key in $NEW_KEYS; do
+            if ! git grep -q -- "$key" -- tests/ src/config/tests/; then
+              echo "::error::new config key '$key' has no test naming it — add a test covering the key AND its interaction with at least one crash/empty/second-run case"
+              FAIL=1
+            fi
+          done
+          [ "$FAIL" = "0" ]
+
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest

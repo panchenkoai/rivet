@@ -188,3 +188,33 @@ jobs:
       - name: Stop services
         if: always()
         run: docker compose down -v
+
+  # Mutation testing over the CDC surface — the meta-gate: a surviving mutant
+  # names a test blind spot. Scoped to the modules where the 2026-07 campaign
+  # found 33 defects (whole-crate mutants would take hours). Offline tests
+  # only — live tests are #[ignore]d, so mutants runs the cheap suite.
+  mutants-cdc:
+    name: cargo-mutants (CDC modules)
+    timeout-minutes: 50
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+      - name: Mutants over CDC + checksum + decimal canon
+        run: |
+          cargo mutants --no-shuffle -vV \
+            -f src/source/cdc/value.rs \
+            -f src/source/cdc/sink.rs \
+            -f src/source/postgres/cdc.rs \
+            -f src/source/value_checksum.rs \
+            -f src/types/decimal.rs \
+            -- --tests
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-out
+          path: mutants.out

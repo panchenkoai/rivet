@@ -1463,6 +1463,81 @@ fn cdc_mixed_transaction_ending_on_uncaptured_table_advances_checkpoint() {
     );
 }
 
+// Conformance: the stream-property commit boundary, PostgreSQL flavour.
+// PG stamps committed=true on every event (commit-LSN framing), so the MySQL
+// stall cannot occur structurally — this pins that property per engine.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_mixed_transaction_ending_on_uncaptured_table_advances_checkpoint() {
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let orders = unique_name("cdc_mixp_o");
+    let audit = unique_name("cdc_mixp_a");
+    let slot = unique_name("rivet_mixp_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {orders}; DROP TABLE IF EXISTS {audit}; \
+         CREATE TABLE {orders} (id INT PRIMARY KEY, v INT); \
+         CREATE TABLE {audit} (id INT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    let (_t1, _t2) = (
+        PgTable::adopt(orders.clone()),
+        PgTable::adopt(audit.clone()),
+    );
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+    c.batch_execute(&format!(
+        "BEGIN; INSERT INTO {orders} VALUES (1,10); INSERT INTO {audit} VALUES (1,99); COMMIT;"
+    ))
+    .unwrap();
+
+    let out1 = d.path().join("out1");
+    let out2 = d.path().join("out2");
+    std::fs::create_dir_all(&out1).unwrap();
+    std::fs::create_dir_all(&out2).unwrap();
+    run_cdc(&pg_cdc_config(&d, &orders, &slot, &out1));
+    assert_eq!(manifest_rows(&out1), 1, "the captured row lands");
+    run_cdc(&pg_cdc_config(&d, &orders, &slot, &out2));
+    assert_eq!(
+        manifest_rows(&out2),
+        0,
+        "slot advanced past the mixed transaction"
+    );
+}
+
+// Conformance: schema-qualified `table:` routing, MySQL flavour (the schema
+// part is the database name on MySQL).
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_schema_qualified_table_config_captures_events() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_qual_my");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let _guard = Table(tbl.clone());
+
+    let out = d.path().join("out");
+    let ckpt = d.path().join("cdc.ckpt");
+    std::fs::create_dir_all(&out).unwrap();
+    let qualified = format!("rivet.{tbl}");
+    run_cdc(&cdc_config(&d, &qualified, &ckpt, &out)); // pin
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1, 10)"))
+        .unwrap();
+    run_cdc(&cdc_config(&d, &qualified, &ckpt, &out));
+    assert_eq!(
+        manifest_rows(&out),
+        1,
+        "a db-qualified table: must capture, not 0-row-success"
+    );
+}
+
 // Ultrareview bug_004 (live): a schema-qualified `table:` (`public.<t>`) —
 // the shape rivet's own batch docs promote — must route events, not silently
 // produce a 0-row success.

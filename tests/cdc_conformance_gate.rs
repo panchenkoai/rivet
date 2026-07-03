@@ -1,0 +1,191 @@
+//! CDC engine conformance gate — the hard, offline-enforced checklist.
+//!
+//! Every CDC engine must carry a live test for every conformance case (or an
+//! explicit N/A with a reason below). The 2026-07 reliability campaign found
+//! that per-engine coverage drifts silently: MySQL had the mixed-transaction
+//! test, PostgreSQL had the qualified-name test — and each engine's missing
+//! case was exactly where a real bug lived (ultrareview bug_002/bug_004).
+//! This test scans the live-test SOURCES for a per-(engine × case) function
+//! name and fails compilation-adjacent (plain `cargo test`) when a new engine
+//! or a new case lands without its row. Adding a case: add it to CASES with
+//! the three expectations; adding an engine: every case must decide.
+
+use std::fs;
+
+#[derive(Clone, Copy)]
+enum Expect {
+    /// A test fn whose name contains this substring must exist in the file.
+    Test(&'static str),
+    /// Deliberately not applicable — the reason is printed on failure so the
+    /// exemption stays justified, never silent.
+    NA(&'static str),
+}
+use Expect::{NA, Test};
+
+/// (case, mysql, postgres, mssql). Test names live in tests/live/live_cdc.rs
+/// (mysql + pg) and tests/live/live_cdc_mssql.rs.
+const CASES: &[(&str, Expect, Expect, Expect)] = &[
+    (
+        "resume_two_run",
+        Test("fn cdc_resume_captures_only_new_changes"),
+        Test("fn pg_cdc_resume_captures_only_new_changes"),
+        Test("fn mssql_cdc_resume_captures_only_new_changes"),
+    ),
+    (
+        "idle_first_run",
+        Test("fn cdc_idle_first_run_then_change_is_captured"),
+        Test("fn pg_cdc_idle_first_run_then_change_is_captured"),
+        Test("fn mssql_cdc_idle_first_run_then_change_is_captured"),
+    ),
+    (
+        "crash_before_ack",
+        Test("fn cdc_crash_after_flush_before_ack"),
+        Test("fn pg_cdc_crash_after_flush_before_ack"),
+        Test("fn mssql_cdc_crash_before_checkpoint"),
+    ),
+    (
+        "full_type_matrix",
+        Test("fn cdc_full_type_matrix_matches_batch"),
+        Test("fn pg_cdc_full_type_matrix_matches_batch"),
+        Test("fn mssql_cdc_full_type_matrix_matches_batch"),
+    ),
+    (
+        "update_delete_typed",
+        Test("fn cdc_update_and_delete_carry_full_types"),
+        Test("fn pg_cdc_update_and_delete_carry_full_types"),
+        Test("fn mssql_cdc_update_and_delete_carry_full_types"),
+    ),
+    (
+        "initial_snapshot",
+        Test("fn cdc_initial_snapshot_covers_preexisting_rows"),
+        Test("fn pg_cdc_initial_snapshot_covers_preexisting_rows"),
+        Test("fn mssql_cdc_initial_snapshot_covers_preexisting_rows"),
+    ),
+    (
+        "vanished_anchor_loud",
+        Test("fn cdc_resume_from_missing_binlog_fails_loudly"),
+        Test("fn pg_cdc_vanished_slot_with_checkpoint_fails_loudly"),
+        Test("fn mssql_cdc_resume_past_retention_errors"),
+    ),
+    (
+        "mixed_transaction_boundary",
+        Test("fn cdc_mixed_transaction_ending_on_uncaptured_table"),
+        Test("fn pg_cdc_mixed_transaction_ending_on_uncaptured_table"),
+        Test("fn mssql_cdc_mixed_transaction_and_qualified_table"),
+    ),
+    (
+        "schema_qualified_table",
+        Test("fn cdc_schema_qualified_table_config_captures_events"),
+        Test("fn pg_cdc_schema_qualified_table_config_captures_events"),
+        Test("fn mssql_cdc_mixed_transaction_and_qualified_table"),
+    ),
+    (
+        "non_utc_session",
+        Test("fn cdc_non_utc_server_timezone_matches_batch"),
+        Test("fn pg_cdc_non_utc_database_timezone_matches_batch"),
+        NA(
+            "datetime is naive and datetimeoffset carries its offset explicitly — \
+            no MSSQL rendering is shaped by session/server timezone",
+        ),
+    ),
+    (
+        "empty_table_initial_converges",
+        Test("fn cdc_initial_snapshot_of_an_empty_table_converges"),
+        NA(
+            "marker + forced skip_empty=false live in engine-agnostic cdc_job \
+            code, pinned once on MySQL",
+        ),
+        NA("same engine-agnostic path, pinned once on MySQL"),
+    ),
+    (
+        "multi_table_one_stream",
+        Test("fn cdc_multi_table_stream_one_binlog_connection"),
+        Test("fn pg_cdc_multi_table_stream_uses_one_slot"),
+        NA(
+            "config validation rejects `tables:` for MSSQL (one capture \
+            instance per stream)",
+        ),
+    ),
+];
+
+#[test]
+fn every_cdc_engine_covers_every_conformance_case() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mysql_pg = fs::read_to_string(root.join("tests/live/live_cdc.rs")).unwrap();
+    let mssql = fs::read_to_string(root.join("tests/live/live_cdc_mssql.rs")).unwrap();
+
+    let mut missing = Vec::new();
+    for (case, my, pg, ms) in CASES {
+        for (engine, expect, hay) in [
+            ("mysql", my, &mysql_pg),
+            ("postgres", pg, &mysql_pg),
+            ("mssql", ms, &mssql),
+        ] {
+            match expect {
+                Test(needle) => {
+                    if !hay.contains(needle) {
+                        missing.push(format!("{engine} × {case}: no test matching `{needle}`"));
+                    }
+                }
+                NA(reason) => {
+                    // Exemptions are visible in the source above; nothing to
+                    // scan, but keep the reason referenced so it can't be an
+                    // empty excuse.
+                    assert!(!reason.is_empty());
+                }
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "CDC conformance gate: every engine needs every case (or an explicit \
+         NA with a reason in tests/cdc_conformance_gate.rs):\n  {}",
+        missing.join("\n  ")
+    );
+}
+
+/// Blind-spot №3 from the campaign: "0 rows = valid success". Three real bugs
+/// (qualified routing, instance-name heuristic, the stalled commit boundary)
+/// manifested as 0-row successes that a bare `run_cdc(&cfg)` + no assertion
+/// would wave through. Every live CDC test that runs a capture must assert an
+/// outcome: manifest rows, a batch comparison, or an explicit failure check.
+#[test]
+fn every_live_cdc_test_asserts_an_outcome() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut naked = Vec::new();
+    for file in ["tests/live/live_cdc.rs", "tests/live/live_cdc_mssql.rs"] {
+        let src = fs::read_to_string(root.join(file)).unwrap();
+        // Split on test attributes; each chunk is one test body (plus tail).
+        for chunk in src.split("#[test]").skip(1) {
+            let name = chunk
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("fn "))
+                .unwrap_or("?")
+                .split('(')
+                .next()
+                .unwrap_or("?")
+                .to_string();
+            let runs_capture = chunk.contains("run_cdc(");
+            // Outcome = the test READS BACK what the capture produced (files,
+            // destination listing, or the state DB) — not merely that the
+            // process exited 0.
+            let asserts_outcome = chunk.contains("manifest_rows")
+                || chunk.contains("assert_cdc_matches_batch")
+                || chunk.contains("read_one_batch")
+                || chunk.contains("parquet_")
+                || chunk.contains("read_csv(")
+                || chunk.contains("gcs list")
+                || chunk.contains("query_row")
+                || chunk.contains("status.success()");
+            if runs_capture && !asserts_outcome {
+                naked.push(format!("{file}::{name}"));
+            }
+        }
+    }
+    assert!(
+        naked.is_empty(),
+        "live CDC tests running a capture without asserting an outcome \
+         (0-row success would pass silently):\n  {}",
+        naked.join("\n  ")
+    );
+}
