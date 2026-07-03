@@ -58,7 +58,7 @@ pub(crate) struct TableOutput<'a> {
 /// property of the stream, not of a table.
 pub(crate) struct SinkConfig<'a> {
     pub outputs: Vec<TableOutput<'a>>,
-    pub engine: &'a str,
+    pub engine: super::CdcEngine,
     pub format: FormatType,
     pub checkpoint: Option<PathBuf>,
     pub max_events: Option<usize>,
@@ -103,7 +103,12 @@ impl TableSink<'_> {
     /// Encode + upload this table's buffered changes as one part (no-op when
     /// the buffer is empty). Does NOT touch the checkpoint or the stream — the
     /// ack decision is global (see [`roll_all`]).
-    fn flush_buffered(&mut self, engine: &str, format: FormatType, run_token: &str) -> Result<()> {
+    fn flush_buffered(
+        &mut self,
+        engine: super::CdcEngine,
+        format: FormatType,
+        run_token: &str,
+    ) -> Result<()> {
         if self.buf.is_empty() {
             return Ok(());
         }
@@ -145,7 +150,7 @@ impl TableSink<'_> {
 fn roll_all(
     sinks: &mut [TableSink<'_>],
     stream: &mut dyn ChangeStream,
-    engine: &str,
+    engine: super::CdcEngine,
     format: FormatType,
     run_token: &str,
     checkpoint: Option<&Path>,
@@ -351,7 +356,7 @@ fn flush(
     events: &[ChangeEvent],
     schema: &SchemaRef,
     columns: &[TypeMapping],
-    engine: &str,
+    engine: super::CdcEngine,
     format: FormatType,
     run_token: &str,
     seq: usize,
@@ -437,7 +442,7 @@ fn flush(
 /// Assemble one table's `RunManifest` from its committed parts (hand-built — no
 /// plan coupling; `record_part` is the plan-bound path the batch export uses).
 fn build_manifest(
-    engine: &str,
+    engine: super::CdcEngine,
     out: &TableOutput<'_>,
     format: FormatType,
     run_id: &str,
@@ -452,7 +457,7 @@ fn build_manifest(
         finished_at: run_id.to_string(),
         status: ManifestStatus::Success,
         source: ManifestSource {
-            engine: engine.to_string(),
+            engine: engine.label().to_string(),
             schema: None,
             table: Some(out.table.clone()),
         },
@@ -708,7 +713,7 @@ mod tests {
                 dest,
                 dest_uri: String::new(),
             }],
-            engine: "test",
+            engine: crate::source::cdc::CdcEngine::Mysql,
             format,
             checkpoint: None,
             max_events: None,
@@ -885,7 +890,7 @@ mod tests {
                     dest_uri: "b".into(),
                 },
             ],
-            engine: "test",
+            engine: crate::source::cdc::CdcEngine::Mysql,
             format,
             checkpoint: None,
             max_events: None,

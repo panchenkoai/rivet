@@ -13,7 +13,7 @@ use super::finalize::finalize_run_report;
 use super::summary::RunSummary;
 use crate::config::{Config, ExportConfig};
 use crate::error::Result;
-use crate::source::cdc::{CdcCapture, CdcConfig, engine_label, run_capture};
+use crate::source::cdc::{CdcCapture, CdcConfig, CdcEngine, run_capture};
 use crate::state::StateStore;
 
 /// Run one `mode: cdc` export end to end, then record + report it like a batch
@@ -119,32 +119,36 @@ pub(super) fn initial_snapshot_pending(
     let tls = config.source.tls.as_ref();
 
     // 1) The anchor, engine by engine (idempotent: only created when absent).
-    if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-        // Slot creation IS the anchor; open() creates it when missing.
-        let slot = cdc
-            .slot
-            .clone()
-            .unwrap_or_else(|| crate::config::DEFAULT_PG_SLOT.to_string());
-        drop(crate::source::postgres::cdc::PgChangeStream::open(
-            &url, &slot, false, tls,
-        )?);
-    } else {
-        // MySQL / SQL Server: the checkpoint file (validation guarantees it is
-        // configured for `initial: snapshot`).
-        let ckpt = PathBuf::from(cdc.checkpoint.as_deref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "export '{}': initial snapshot requires cdc.checkpoint",
-                export.name
-            )
-        })?);
-        let anchored = crate::source::cdc::Position::load(&ckpt)?.is_some();
-        if !anchored {
-            if url.starts_with("mysql://") {
-                crate::source::mysql::cdc::MysqlChangeStream::pin_checkpoint_at_current(
-                    &url, &ckpt, tls,
-                )?;
-            } else {
-                crate::source::mssql::cdc::pin_checkpoint_at_max_lsn(&url, &ckpt, tls)?;
+    match CdcEngine::from_url(&url)? {
+        CdcEngine::Postgres => {
+            // Slot creation IS the anchor; open() creates it when missing.
+            let slot = cdc
+                .slot
+                .clone()
+                .unwrap_or_else(|| crate::config::DEFAULT_PG_SLOT.to_string());
+            drop(crate::source::postgres::cdc::PgChangeStream::open(
+                &url, &slot, false, tls,
+            )?);
+        }
+        engine @ (CdcEngine::Mysql | CdcEngine::Mssql) => {
+            // The checkpoint file is the anchor (validation guarantees it is
+            // configured for `initial: snapshot`).
+            let ckpt = PathBuf::from(cdc.checkpoint.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "export '{}': initial snapshot requires cdc.checkpoint",
+                    export.name
+                )
+            })?);
+            let anchored = crate::source::cdc::Position::load(&ckpt)?.is_some();
+            if !anchored {
+                match engine {
+                    CdcEngine::Mysql => {
+                        crate::source::mysql::cdc::MysqlChangeStream::pin_checkpoint_at_current(
+                            &url, &ckpt, tls,
+                        )?
+                    }
+                    _ => crate::source::mssql::cdc::pin_checkpoint_at_max_lsn(&url, &ckpt, tls)?,
+                }
             }
         }
     }
@@ -335,7 +339,7 @@ fn record_metric(state: &StateStore, config: &Config, export: &ExportConfig, sum
         .source
         .resolve_url()
         .ok()
-        .and_then(|u| engine_label(&u).ok())
+        .and_then(|u| CdcEngine::from_url(&u).ok().map(CdcEngine::label))
         .map(|s| s.to_string());
     // Only the fields a CDC run actually has; the batch-specific rest (chunk_size,
     // cursor, quality, …) stay at their MetricRow::default() (None / 0).

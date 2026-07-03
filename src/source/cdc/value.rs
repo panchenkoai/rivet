@@ -742,9 +742,12 @@ pub(crate) enum MysqlCellFix {
     BinaryPad(usize),
 }
 
-/// The fix (if any) for a column, from the engine label + native type.
-pub(crate) fn mysql_cell_fix(engine: &str, native: &str) -> Option<MysqlCellFix> {
-    if engine != "mysql" {
+/// The fix (if any) for a column, from the engine + native type.
+pub(crate) fn mysql_cell_fix(
+    engine: crate::source::cdc::CdcEngine,
+    native: &str,
+) -> Option<MysqlCellFix> {
+    if engine != crate::source::cdc::CdcEngine::Mysql {
         return None;
     }
     let n = native.to_ascii_lowercase();
@@ -1094,7 +1097,9 @@ mod tests {
     #[test]
     fn mysql_cell_fixes_convert_the_wire_shapes_the_binlog_delivers() {
         use RivetValue as V;
-        let fix = |native: &str| mysql_cell_fix("mysql", native).expect(native);
+        let fix = |native: &str| {
+            mysql_cell_fix(crate::source::cdc::CdcEngine::Mysql, native).expect(native)
+        };
 
         // TIMESTAMP(6): "epoch.micros" text → the UTC instant.
         let ts = fix("timestamp(6)").apply(&V::Bytes(b"1893553445.678901".to_vec()));
@@ -1130,7 +1135,9 @@ mod tests {
         let mi = fix("mediumint");
         assert_eq!(mi.apply(&V::Int(8_388_608)), V::Int(-8_388_608));
         assert_eq!(mi.apply(&V::Int(8_388_607)), V::Int(8_388_607));
-        assert!(mysql_cell_fix("mysql", "mediumint unsigned").is_none());
+        assert!(
+            mysql_cell_fix(crate::source::cdc::CdcEngine::Mysql, "mediumint unsigned").is_none()
+        );
 
         // SET: bitmask (LE bytes) → comma-joined labels in declaration order,
         // the server's own rendering ('x,z' for bits 0+2 = 0x05).
@@ -1140,9 +1147,9 @@ mod tests {
 
         // NULL always stays NULL; other engines get no fix at all.
         assert_eq!(fix("year").apply(&V::Null), V::Null);
-        assert!(mysql_cell_fix("postgres", "bit(1)").is_none());
+        assert!(mysql_cell_fix(crate::source::cdc::CdcEngine::Postgres, "bit(1)").is_none());
         // varbinary is NOT padded (only fixed-width binary is).
-        assert!(mysql_cell_fix("mysql", "varbinary(4)").is_none());
+        assert!(mysql_cell_fix(crate::source::cdc::CdcEngine::Mysql, "varbinary(4)").is_none());
     }
 
     #[test]
