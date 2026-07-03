@@ -623,3 +623,186 @@ fn read_all_parts(out: &std::path::Path) -> Vec<arrow::record_batch::RecordBatch
     }
     out_b
 }
+
+// Finding #38 — Form B was a silent no-op for CDC: the manifest recorded
+// `column_checksums: None`, so `rivet validate` skipped the value leg on CDC
+// prefixes while looking green. The sink already computed the arrow-side sum
+// per column per part (Form A); it now XOR-accumulates them into the
+// manifest, and validate's re-read must agree — or name the column.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_manifest_records_form_b_checksums_and_validate_verifies_them() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_formb");
+    let mut c = mysql::Pool::new(MYSQL_CDC_URL).unwrap().get_conn().unwrap();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {tbl} (id INT PRIMARY KEY, v VARCHAR(20))"
+    ))
+    .unwrap();
+    let _guard = Table(tbl.clone());
+    let (cfg, out) = ddl_cfg(&d, &tbl);
+    run_ok(&cfg); // pin
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1,'aaa'),(2,'bbb')"))
+        .unwrap();
+    run_ok(&cfg);
+
+    let manifest_path = out.join("manifest.json");
+    let m: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    let sums = m["column_checksums"]
+        .as_array()
+        .expect("CDC manifest must record column_checksums (finding #38)");
+    assert!(
+        sums.iter().any(|c| c["name"] == "v"),
+        "data columns are recorded: {sums:?}"
+    );
+
+    // Clean validate passes…
+    let ok = std::process::Command::new(RIVET_BIN)
+        .args(["validate", "--config", cfg.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        ok.status.success(),
+        "clean validate must pass:\n{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+
+    // …and a tampered recorded sum must fail, naming the column.
+    let mut m2 = m.clone();
+    for csum in m2["column_checksums"].as_array_mut().unwrap() {
+        if csum["name"] == "v" {
+            csum["checksum"] = serde_json::Value::String("1".into());
+        }
+    }
+    std::fs::write(&manifest_path, serde_json::to_string_pretty(&m2).unwrap()).unwrap();
+    let bad = std::process::Command::new(RIVET_BIN)
+        .args(["validate", "--config", cfg.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        !bad.status.success(),
+        "a checksum mismatch must fail validate"
+    );
+    let err = format!(
+        "{}{}",
+        String::from_utf8_lossy(&bad.stdout),
+        String::from_utf8_lossy(&bad.stderr)
+    );
+    // Column naming is pinned at the unit level
+    // (verify_fails_on_mismatch_naming_the_column); here the contract is:
+    // the run fails AND the failure is checksum-shaped.
+    assert!(
+        err.to_lowercase().contains("checksum") || err.contains("INCONSISTENT"),
+        "the failure must be checksum-shaped: {err}"
+    );
+}
+
+// Composition-of-everything: multi-table × `initial: snapshot` × qualified
+// `columns:` override × a CLOUD destination (fake-gcs) — every headline
+// feature of the branch enabled at once. The initial-snapshot markers on GCS
+// were the one leg never live-tested (head("_SUCCESS") over the emulator).
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc + fake-gcs"]
+fn cdc_all_features_combined_on_gcs() {
+    let d = tempfile::tempdir().unwrap();
+    let ta = unique_name("cdc_all_a");
+    let tb = unique_name("cdc_all_b");
+    let mut c = mysql::Pool::new(MYSQL_CDC_URL).unwrap().get_conn().unwrap();
+    for t in [&ta, &tb] {
+        c.query_drop(format!("DROP TABLE IF EXISTS {t}")).unwrap();
+        c.query_drop(format!(
+            "CREATE TABLE {t} (id INT PRIMARY KEY, v BIGINT UNSIGNED)"
+        ))
+        .unwrap();
+    }
+    let (_g1, _g2) = (Table(ta.clone()), Table(tb.clone()));
+    // Pre-existing rows — the snapshot's job.
+    c.query_drop(format!("INSERT INTO {ta} VALUES (1, 10)"))
+        .unwrap();
+    c.query_drop(format!("INSERT INTO {tb} VALUES (1, 18446744073709551615)"))
+        .unwrap();
+
+    let bucket = "rivet-qa-cdc-gcs";
+    ensure_gcs_bucket(bucket);
+    let prefix = unique_name("allfeat");
+    let ckpt = d.path().join("cdc.ckpt");
+    let yaml = format!(
+        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
+exports:
+  - name: all_features
+    tables: [{ta}, {tb}]
+    mode: cdc
+    format: parquet
+    columns: {{ "{tb}.v": "decimal(20,0)" }}
+    cdc: {{ initial: snapshot, checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
+    destination:
+      type: gcs
+      bucket: {bucket}
+      prefix: {prefix}
+      endpoint: {FAKE_GCS_ENDPOINT}
+      allow_anonymous: true
+"#,
+        ckpt = ckpt.display(),
+        sid = server_id_for(&ta),
+    );
+    let cfg = write_config(&d, &yaml);
+    let run = || {
+        let st = std::process::Command::new(RIVET_BIN)
+            .args(["run", "--config", cfg.to_str().unwrap()])
+            .status()
+            .unwrap();
+        assert!(st.success());
+    };
+    run(); // anchor → per-table snapshots on GCS → drain(0)
+
+    let list = || -> Vec<String> {
+        let body = reqwest::blocking::get(format!(
+            "{FAKE_GCS_ENDPOINT}/storage/v1/b/{bucket}/o?prefix={prefix}"
+        ))
+        .unwrap()
+        .text()
+        .unwrap();
+        let j: serde_json::Value = serde_json::from_str(&body).unwrap();
+        j["items"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|i| i["name"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let keys = list();
+    for t in [&ta, &tb] {
+        assert!(
+            keys.iter()
+                .any(|k| k.contains(&format!("{t}/snapshot/")) && k.ends_with("_SUCCESS")),
+            "table {t}: snapshot marker must land on GCS: {keys:?}"
+        );
+    }
+
+    // Stream a change; run 2 must NOT re-snapshot (marker count stable).
+    let markers_before = keys.iter().filter(|k| k.ends_with("_SUCCESS")).count();
+    c.query_drop(format!("INSERT INTO {tb} VALUES (2, 7)"))
+        .unwrap();
+    run();
+    let keys2 = list();
+    assert!(
+        keys2.iter().any(|k| k.contains(&format!("{tb}/cdc-"))),
+        "the change streams into tb's own prefix: {keys2:?}"
+    );
+    let markers_after = keys2
+        .iter()
+        .filter(|k| k.ends_with("_SUCCESS") && k.contains("/snapshot/"))
+        .count();
+    assert_eq!(
+        markers_after,
+        keys.iter()
+            .filter(|k| k.ends_with("_SUCCESS") && k.contains("/snapshot/"))
+            .count(),
+        "run 2 must not re-snapshot (markers stable)"
+    );
+    let _ = markers_before;
+}

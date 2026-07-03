@@ -12,6 +12,12 @@
   encoding shared by both sides; a new accessor per engine, enforced at compile time). An offline matrix
   guard pins the CDC fold to the builder across every covered type with hostile cells (overflow
   narrowing, wrong-width binary, arrays with inner NULLs, NaN, u64::MAX, 50-digit decimals).
+- **`rivet validate` Form B now covers CDC prefixes.** The CDC manifest recorded
+  `column_checksums: None`, so validate's value-checksum re-read silently skipped CDC outputs while
+  reporting PASSED (finding #38). The sink already computed the arrow-side sum per column per part
+  (Form A); it now XOR-accumulates them across parts into the manifest — the same combining rule the
+  re-read applies — and a tampered part or recorded sum fails validation. Live-pinned, including the
+  tamper case.
 - **MySQL 8.4 support: binlog coordinates via `SHOW BINARY LOG STATUS` with a legacy fallback.**
   8.4 removed `SHOW MASTER STATUS` (the version scout's first empirical catch — every anchor/pin path
   died on the first run); rivet now tries the 8.2+ form first and falls back for older servers. The

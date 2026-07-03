@@ -97,6 +97,11 @@ struct TableSink<'a> {
     buf: Vec<ChangeEvent>,
     parts: Vec<PartRecord>,
     seq: usize,
+    /// Finding #38: per-column value checksums, XOR-accumulated across parts
+    /// (the same combining rule `validate_recorded_checksums` applies on
+    /// re-read) — recorded into the manifest so `rivet validate` Form B
+    /// covers CDC prefixes instead of silently skipping the value leg.
+    column_sums: std::collections::BTreeMap<String, u64>,
 }
 
 impl TableSink<'_> {
@@ -117,7 +122,7 @@ impl TableSink<'_> {
         // resolve gives a placeholder scale of 0 — the same gap the batch path
         // fills from rows).
         let sch = ensure_schema(&mut self.schema, &mut self.out.columns, &self.buf);
-        let part = flush(
+        let (part, sums) = flush(
             &self.buf,
             &sch,
             &self.out.columns,
@@ -127,6 +132,9 @@ impl TableSink<'_> {
             self.seq,
             self.out.dest,
         )?;
+        for (name, sum) in sums {
+            *self.column_sums.entry(name).or_insert(0) ^= sum;
+        }
         self.parts.push(part);
         self.seq += 1;
         self.buf.clear();
@@ -212,6 +220,7 @@ pub(crate) fn run_to_files(
             buf: Vec::new(),
             parts: Vec::new(),
             seq: 0,
+            column_sums: std::collections::BTreeMap::new(),
         })
         .collect();
 
@@ -290,6 +299,7 @@ pub(crate) fn run_to_files(
     for s in &sinks {
         let manifest = build_manifest(
             cfg.engine,
+            &s.column_sums,
             &s.out,
             cfg.format,
             &cfg.run_id,
@@ -394,7 +404,7 @@ fn flush(
     run_token: &str,
     seq: usize,
     dest: &dyn Destination,
-) -> Result<PartRecord> {
+) -> Result<(PartRecord, Vec<(String, u64)>)> {
     let ops: ArrayRef = Arc::new(
         events
             .iter()
@@ -451,6 +461,7 @@ fn flush(
     }
 
     let mut arrays: Vec<ArrayRef> = vec![ops, poss];
+    let mut col_sums: Vec<(String, u64)> = Vec::with_capacity(columns.len());
     for (i, m) in columns.iter().enumerate() {
         // Engine/native-type cell normalisation (e.g. MySQL binlog quirks: BIT
         // bytes, ENUM indexes, epoch-text TIMESTAMPs, NUL-trimmed BINARY) —
@@ -488,6 +499,7 @@ fn flush(
         // Arrow — fail loud BEFORE the part is written, naming the column.
         let source_sum = value::cells_checksum(&render, &cells);
         let arrow_sum = crate::source::value_checksum::array_checksum(arr.as_ref());
+        col_sums.push((m.column_name.clone(), arrow_sum));
         if source_sum != arrow_sum {
             anyhow::bail!(
                 "cdc value checksum mismatch in column '{}': source={source_sum} \
@@ -512,13 +524,15 @@ fn flush(
     w.finish()?;
 
     let file_name = format!("cdc-{run_token}-{seq:06}.{}", format.label());
-    write_part_file(dest, tmp.path(), events.len() as i64, file_name)
+    let part = write_part_file(dest, tmp.path(), events.len() as i64, file_name)?;
+    Ok((part, col_sums))
 }
 
 /// Assemble one table's `RunManifest` from its committed parts (hand-built — no
 /// plan coupling; `record_part` is the plan-bound path the batch export uses).
 fn build_manifest(
     engine: super::CdcEngine,
+    column_sums: &std::collections::BTreeMap<String, u64>,
     out: &TableOutput<'_>,
     format: FormatType,
     run_id: &str,
@@ -559,8 +573,15 @@ fn build_manifest(
                 status: PartStatus::Committed,
             })
             .collect(),
-        // Form B value-checksum recording is batch-path only for now.
-        column_checksums: None,
+        column_checksums: Some(
+            column_sums
+                .iter()
+                .map(|(name, sum)| crate::manifest::ColumnChecksum {
+                    name: name.clone(),
+                    checksum: sum.to_string(),
+                })
+                .collect(),
+        ),
         checksum_key_column: None,
     }
 }
