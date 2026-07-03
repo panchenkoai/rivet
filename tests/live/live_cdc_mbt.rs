@@ -25,6 +25,7 @@ use arrow::array::{Array, Int64Array, StringArray};
 use mysql::prelude::Queryable;
 
 use crate::common::CdcTable as Table;
+use crate::common::read_all_parts;
 use crate::common::*;
 
 /// Tiny deterministic PRNG (xorshift) — no rand dependency, fixed seeds.
@@ -583,27 +584,6 @@ fn run_ok(cfg: &std::path::Path) {
         .status()
         .unwrap();
     assert!(st.success());
-}
-
-fn read_all_parts(out: &std::path::Path) -> Vec<arrow::record_batch::RecordBatch> {
-    let mut parts: Vec<_> = std::fs::read_dir(out)
-        .unwrap()
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "parquet"))
-        .collect();
-    parts.sort();
-    let mut out_b = Vec::new();
-    for p in parts {
-        let f = std::fs::File::open(&p).unwrap();
-        let r = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
-            .unwrap()
-            .build()
-            .unwrap();
-        for b in r {
-            out_b.push(b.unwrap());
-        }
-    }
-    out_b
 }
 
 // Finding #38 — Form B was a silent no-op for CDC: the manifest recorded

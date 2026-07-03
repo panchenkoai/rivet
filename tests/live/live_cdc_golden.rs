@@ -235,7 +235,6 @@ const T0: &str = "2026-01-15 12:00:00";
 #[test]
 #[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
 fn cdc_golden_fixture_tables_calculated_metrics() {
-    let d = tempfile::tempdir().unwrap();
     let uniq = unique_name("g");
     let mut c = conn();
 
@@ -265,36 +264,10 @@ fn cdc_golden_fixture_tables_calculated_metrics() {
         names.insert(f, g);
     }
 
-    let out = d.path().join("out");
-    let ckpt = d.path().join("cdc.ckpt");
-    std::fs::create_dir_all(&out).unwrap();
-    let tables_list = fixtures
-        .iter()
-        .map(|f| names[f].clone())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let yaml = format!(
-        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: golden_cdc
-    tables: [{tables_list}]
-    mode: cdc
-    format: parquet
-    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        ckpt = ckpt.display(),
-        out = out.display(),
-        sid = server_id_for(&uniq),
-    );
-    let cfg = write_config(&d, &yaml);
-    let run = || {
-        let st = std::process::Command::new(RIVET_BIN)
-            .args(["run", "--config", cfg.to_str().unwrap()])
-            .status()
-            .unwrap();
-        assert!(st.success(), "golden cdc run failed");
-    };
+    let table_refs: Vec<&str> = fixtures.iter().map(|f| names[f].as_str()).collect();
+    let rig = Rig::mysql_cdc(&names[fixtures[0]]).tables(&table_refs);
+    let out = rig.out_dir();
+    let run = || rig.run_ok();
     run(); // pin the checkpoint
 
     // ── The golden workload: every number below is derivable by hand. ──────
@@ -649,7 +622,6 @@ exports:
 #[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
 fn cdc_event_order_within_and_across_transactions_is_commit_order() {
     use arrow::array::Int32Array;
-    let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("cdc_order");
     let mut c = conn();
     c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
@@ -657,31 +629,9 @@ fn cdc_event_order_within_and_across_transactions_is_commit_order() {
         .unwrap();
     let _guard = Table(tbl.clone());
 
-    let out = d.path().join("out");
-    let ckpt = d.path().join("cdc.ckpt");
-    std::fs::create_dir_all(&out).unwrap();
-    let yaml = format!(
-        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: cdc
-    format: parquet
-    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        ckpt = ckpt.display(),
-        out = out.display(),
-        sid = server_id_for(&tbl),
-    );
-    let cfg = write_config(&d, &yaml);
-    let run = || {
-        let st = std::process::Command::new(RIVET_BIN)
-            .args(["run", "--config", cfg.to_str().unwrap()])
-            .status()
-            .unwrap();
-        assert!(st.success());
-    };
+    let rig = Rig::mysql_cdc(&tbl);
+    let out = rig.out_dir();
+    let run = || rig.run_ok();
     run(); // pin
 
     c.query_drop(format!("INSERT INTO {tbl} VALUES (1, 0)"))
