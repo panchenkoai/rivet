@@ -313,6 +313,12 @@ pub(super) fn rows_to_record_batch_typed(
     // of "12"). `mysql::Row` carries the wire column metadata, so consult it
     // per column instead of guessing per value.
     let wire_columns = rows.first().map(|r| r.columns_ref());
+    if let Some(cols) = wire_columns {
+        let expected: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        let names: Vec<String> = cols.iter().map(|c| c.name_str().into_owned()).collect();
+        let wire: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        crate::source::verify_wire_columns(&expected, &wire)?;
+    }
     let mut arrays: Vec<Arc<dyn Array>> = Vec::with_capacity(arrow_types.len());
     for (col_idx, arrow_type) in arrow_types.iter().enumerate() {
         let is_bit = wire_columns.is_some_and(|cols| {

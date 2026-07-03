@@ -392,6 +392,11 @@ pub(super) fn rows_to_record_batch_typed(
     rows: &[Row],
     max_value_bytes: Option<usize>,
 ) -> Result<RecordBatch> {
+    if let Some(first) = rows.first() {
+        let expected: Vec<&str> = columns.iter().map(|(n, _)| n.as_str()).collect();
+        let wire: Vec<&str> = first.columns().iter().map(|c| c.name()).collect();
+        crate::source::verify_wire_columns(&expected, &wire)?;
+    }
     let mut arrays: Vec<Arc<dyn Array>> = Vec::with_capacity(columns.len());
     for (col_idx, (name, pg_type)) in columns.iter().enumerate() {
         let target_type = schema.field(col_idx).data_type();

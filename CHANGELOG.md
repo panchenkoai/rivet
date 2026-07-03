@@ -12,6 +12,20 @@
   encoding shared by both sides; a new accessor per engine, enforced at compile time). An offline matrix
   guard pins the CDC fold to the builder across every covered type with hostile cells (overflow
   narrowing, wrong-width binary, arrays with inner NULLs, NaN, u64::MAX, 50-digit decimals).
+- **Batch exports now verify wire column NAMES against the resolved mapping on every decoded batch.**
+  The probe ("ALTER between chunks") showed both sequential paths are server-serialized — PostgreSQL
+  holds ACCESS SHARE across the export transaction (a mid-export `DROP COLUMN` measurably waited 3.7 s
+  for the export to finish), and MySQL/InnoDB reads through a snapshot with instant-DDL row versioning
+  (500k rows exported cleanly across a completed mid-export ALTER) — but `SELECT *` is positional at
+  the protocol level, and the residual windows (parallel-worker idle gaps, chunk retries on fresh
+  connections, same-arity rename/reorder that no arity check can see) had no guard. All three engines'
+  batch decoders now compare the wire's column names (case-insensitive) against the resolve-time
+  mapping before decoding and fail loudly with the re-run recovery path.
+- **MySQL CDC maps images by name under `binlog_row_metadata=FULL`** (8.0.1+): the TABLE_MAP optional
+  metadata carries every column name; with FULL on, a mid-window `DROP COLUMN` goes from loud failure
+  to correct capture. Missing-name + matching-arity falls back positionally (a mid-window RENAME must
+  not degrade values to NULL — the rename pin caught exactly that in the first cut). MINIMAL keeps the
+  loud arity guard. The compose test stack sets FULL; recommended in production.
 - **Positional column mapping eliminated wherever the engine names its columns.** Ultrareview round 2
   found the class live (finding #41): a PostgreSQL DELETE under default REPLICA IDENTITY carries ONLY
   the key columns — with names in the wire text that the parser discarded — so a non-first/compound PK's

@@ -514,6 +514,11 @@ pub(super) fn mssql_rows_to_record_batch(
     rows: &[Row],
     max_value_bytes: Option<usize>,
 ) -> Result<arrow::record_batch::RecordBatch> {
+    if let Some(first) = rows.first() {
+        let expected: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        let wire: Vec<&str> = first.columns().iter().map(|c| c.name()).collect();
+        crate::source::verify_wire_columns(&expected, &wire)?;
+    }
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
     for (idx, field) in schema.fields().iter().enumerate() {
         arrays.push(

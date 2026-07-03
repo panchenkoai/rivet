@@ -514,3 +514,52 @@ mod tls_gate_tests {
         assert!(require_tls_or_loopback(remote, Some(&verify)).is_ok());
     }
 }
+
+/// Batch positional-mapping guard: every engine's batch decoder indexes wire
+/// rows by the RESOLVE-time column order (`SELECT *` is positional at the
+/// protocol level), so a DDL slipping between chunk reads (parallel-worker
+/// idle gaps, a chunk retry on a fresh connection) would misalign values
+/// silently. The wire carries column NAMES on all three engines — verify them
+/// against the resolved mapping before decoding each batch and fail loudly
+/// instead. (The sequential paths are already server-serialized: PG holds
+/// ACCESS SHARE across the export transaction, MySQL/InnoDB reads through a
+/// snapshot with instant-DDL row versioning — both measured live; this guard
+/// closes the residual windows.)
+pub(crate) fn verify_wire_columns(expected: &[&str], wire: &[&str]) -> anyhow::Result<()> {
+    if expected.len() != wire.len()
+        || expected
+            .iter()
+            .zip(wire)
+            .any(|(e, w)| !e.eq_ignore_ascii_case(w))
+    {
+        anyhow::bail!(
+            "the source returned columns [{}] but this export resolved [{}] — the table's \
+             schema changed while the export was running (a DDL mid-export). Re-run the \
+             export: a fresh run resolves the new schema.",
+            wire.join(", "),
+            expected.join(", "),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod wire_guard_tests {
+    use super::verify_wire_columns;
+
+    #[test]
+    fn verify_wire_columns_catches_every_drift_shape() {
+        let ok = verify_wire_columns(&["id", "a", "b"], &["id", "a", "b"]);
+        assert!(ok.is_ok());
+        // case-insensitive (MySQL lowercases, MSSQL preserves)
+        assert!(verify_wire_columns(&["id", "A"], &["ID", "a"]).is_ok());
+        // dropped column
+        assert!(verify_wire_columns(&["id", "a", "b"], &["id", "b"]).is_err());
+        // added column
+        assert!(verify_wire_columns(&["id", "b"], &["id", "b", "c"]).is_err());
+        // same-arity rename/reorder — the shape positional decoding CANNOT see
+        assert!(verify_wire_columns(&["id", "a", "b"], &["id", "b", "a"]).is_err());
+        let err = verify_wire_columns(&["id", "a"], &["id"]).unwrap_err();
+        assert!(err.to_string().contains("schema changed"));
+    }
+}
