@@ -380,13 +380,32 @@ mod fuzz {
             junk in ".{0,60}",
             int_part in 0u64..1_000_000_000_000,
             frac in 0u32..10_000,
+            // The fraction's WIDTH varies independently of the scale — the
+            // first fuzz shape always rendered exactly scale digits, so the
+            // zero-PADDING arm (frac shorter than scale) was never entered
+            // and its `-`→`+` mutant survived.
+            frac_width in 0usize..=6,
             neg in proptest::prelude::any::<bool>(),
         ) {
             let _ = decimal_str_to_scaled_i128(&junk, 4);
             let _ = decimal_str_to_scaled_i256(&junk, 4);
-            let s = format!("{}{}.{:04}", if neg { "-" } else { "" }, int_part, frac);
+            let frac_str = format!("{frac:04}");
+            let frac_used: String = frac_str.chars().cycle().take(frac_width).collect();
+            let s = format!(
+                "{}{}{}{}",
+                if neg { "-" } else { "" },
+                int_part,
+                if frac_width > 0 { "." } else { "" },
+                frac_used
+            );
+            // Expected: pad-or-truncate frac_used to exactly 4 digits.
+            let aligned: String = frac_used
+                .chars()
+                .chain(std::iter::repeat('0'))
+                .take(4)
+                .collect();
             let expect = {
-                let mag = int_part as i128 * 10_000 + frac as i128;
+                let mag = int_part as i128 * 10_000 + aligned.parse::<i128>().unwrap();
                 if neg { -mag } else { mag }
             };
             proptest::prop_assert_eq!(decimal_str_to_scaled_i128(&s, 4), Some(expect));
@@ -394,6 +413,17 @@ mod fuzz {
                 decimal_str_to_scaled_i256(&s, 4),
                 Some(arrow::datatypes::i256::from_i128(expect))
             );
+        }
+
+        // scale_int_to_i256 is LIVE in the mysql batch Decimal256 path for
+        // integer wire cells — pin exact scaling + the negative-scale refusal
+        // (its guard's mutants survived: nothing exercised the function).
+        #[test]
+        fn scale_int_to_i256_scales_exactly(v in -1_000_000i128..1_000_000, scale in 0i8..10) {
+            let got = scale_int_to_i256(v, scale).expect("in range");
+            let expect = arrow::datatypes::i256::from_i128(v * 10i128.pow(scale as u32));
+            proptest::prop_assert_eq!(got, expect);
+            proptest::prop_assert_eq!(scale_int_to_i256(v, -1), None);
         }
     }
 }
