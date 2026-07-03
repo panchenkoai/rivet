@@ -40,11 +40,14 @@ jobs:
       - name: New schema keys must appear in tests
         run: |
           git fetch origin ${{ github.base_ref }} --depth=1
+          # Only PROPERTY names (keys directly under a "properties" object) —
+          # definition/type names (e.g. CdcInitialMode) are not user-facing
+          # config keys and false-positived on the gate's own first run.
+          KEYS='[paths | select(length>=2 and .[-2]=="properties") | .[-1] | select(type=="string")] | unique | .[]'
           NEW_KEYS=$(diff \
-            <(git show origin/${{ github.base_ref }}:schemas/rivet.schema.json | jq -r '[paths | .[] | select(type=="string")] | unique | .[]' 2>/dev/null || true) \
-            <(jq -r '[paths | .[] | select(type=="string")] | unique | .[]' schemas/rivet.schema.json) \
-            | grep '^>' | awk '{print $2}' \
-            | grep -vE '^(properties|items|anyOf|allOf|oneOf|type|description|required|enum|format|default|minimum|maximum|pattern|additionalProperties|definitions|\$)' || true)
+            <(git show origin/${{ github.base_ref }}:schemas/rivet.schema.json | jq -r "$KEYS" 2>/dev/null || true) \
+            <(jq -r "$KEYS" schemas/rivet.schema.json) \
+            | grep '^>' | awk '{print $2}' || true)
           FAIL=0
           for key in $NEW_KEYS; do
             if ! git grep -q -- "$key" -- tests/ src/config/tests/; then
