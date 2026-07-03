@@ -1,5 +1,322 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **The two-ended value check now runs on CDC — and covers four more types everywhere.** The always-on
+  value checksum (independent source-side fold vs a fold of the built Arrow column) existed only on the
+  batch path; the CDC sink now performs the same comparison per column BEFORE writing each part, naming
+  the column on mismatch. Coverage narrowed its declared skips on both paths: `Time64`, `FixedSizeBinary`
+  (UUID/`BINARY(n)`), `Decimal256`, and one-dimensional `List`s now participate (canonical per-cell list
+  encoding shared by both sides; a new accessor per engine, enforced at compile time). An offline matrix
+  guard pins the CDC fold to the builder across every covered type with hostile cells (overflow
+  narrowing, wrong-width binary, arrays with inner NULLs, NaN, u64::MAX, 50-digit decimals).
+- **Batch exports now verify wire column NAMES against the resolved mapping on every decoded batch.**
+  The probe ("ALTER between chunks") showed both sequential paths are server-serialized — PostgreSQL
+  holds ACCESS SHARE across the export transaction (a mid-export `DROP COLUMN` measurably waited 3.7 s
+  for the export to finish), and MySQL/InnoDB reads through a snapshot with instant-DDL row versioning
+  (500k rows exported cleanly across a completed mid-export ALTER) — but `SELECT *` is positional at
+  the protocol level, and the residual windows (parallel-worker idle gaps, chunk retries on fresh
+  connections, same-arity rename/reorder that no arity check can see) had no guard. All three engines'
+  batch decoders now compare the wire's column names (case-insensitive) against the resolve-time
+  mapping before decoding and fail loudly with the re-run recovery path.
+- **MySQL CDC maps images by name under `binlog_row_metadata=FULL`** (8.0.1+): the TABLE_MAP optional
+  metadata carries every column name; with FULL on, a mid-window `DROP COLUMN` goes from loud failure
+  to correct capture. Missing-name + matching-arity falls back positionally (a mid-window RENAME must
+  not degrade values to NULL — the rename pin caught exactly that in the first cut). MINIMAL keeps the
+  loud arity guard. The compose test stack sets FULL; recommended in production.
+- **Positional column mapping eliminated wherever the engine names its columns.** Ultrareview round 2
+  found the class live (finding #41): a PostgreSQL DELETE under default REPLICA IDENTITY carries ONLY
+  the key columns — with names in the wire text that the parser discarded — so a non-first/compound PK's
+  value landed positionally in column 0 (rendered into a TEXT column!) and the PK became NULL: the
+  downstream MERGE matched nothing and the delete silently vanished (every campaign fixture had `id`
+  first — the shape-of-the-fixture blind spot). And #42: a PK-CHANGING update renders
+  `old-key: … new-tuple: …`; gluing the sections tripped the arity guard and permanently bricked the
+  stream on a legal operation behind a misleading "DDL" diagnosis. Both fixed at the root: PostgreSQL
+  events now carry their column NAMES for every op (old-key split into `before`), SQL Server images
+  carry the change-table column names, and the sink maps named images BY NAME — the positional
+  corruption class (#37/#41/#42) is unrepresentable on PG/MSSQL. MySQL binlog is nameless by protocol;
+  its arity guard stays load-bearing (schema history remains the roadmap answer there). Live pins:
+  non-first-PK delete, PK-changing update.
+- **Round-2 review nits fixed**: MySQL 8.4 + binlog-off now reports "binlog disabled" instead of a
+  masked syntax error; the outcome gate scans all eight CDC test files and recognizes direct
+  `Command::new(RIVET_BIN)` captures plus the newer read-back helpers; the soak script is
+  GNU/Linux-portable (`time -v`), fails LOUD when duckdb is missing instead of silently skipping the
+  gap check, and the CI lane installs duckdb by a verified method; a `.gitignore` append without a
+  trailing newline had glued `.claude/` + `mutants.out/` into one pattern, un-ignoring `.claude/` —
+  repaired and untracked; a contradictory golden comment corrected; the six surviving decimal mutants
+  are documented as boundary-equivalent (mathematically unkillable).
+- **Negative-scenario sweep: five hostile families closed, two more findings.** Binary-level fuzz over
+  the MySQL cell-fix layer found the enum-label parser PANICKING on malformed native strings and — worse
+  — silently MOJIBAKE-ing every non-ASCII label (`ENUM('привет')` byte-cast char-by-char; findings
+  #39/#39b): rewritten total and char-wise, pinned end-to-end (unicode + quoted labels through
+  enrichment→parse→fix→parquet). Corrupt checkpoint files (garbage/truncated/wrong-engine/empty) verified
+  LOUD on all shapes and pinned — no silent re-anchor. A revoked REPLICATION grant mid-life fails loudly,
+  freezes the checkpoint, and resumes lossless after the re-grant. Destination ENOSPC (incompressible
+  2.4 MB into a 2 MB volume) fails loudly naming the full disk, checkpoint frozen, full backlog captured
+  after healing (env-gated test: `RIVET_TINYFS_DIR`). Config parsing is proptest-total over arbitrary
+  YAML. Plus cargo-mutants' first harvest: the CSV decimal renderer and the negative-scale parse arms
+  had zero test sensitivity — killed with targeted units (sign preservation, padding width, exact
+  negative-scale rendering).
+- **`rivet validate` Form B now covers CDC prefixes.** The CDC manifest recorded
+  `column_checksums: None`, so validate's value-checksum re-read silently skipped CDC outputs while
+  reporting PASSED (finding #38). The sink already computed the arrow-side sum per column per part
+  (Form A); it now XOR-accumulates them across parts into the manifest — the same combining rule the
+  re-read applies — and a tampered part or recorded sum fails validation. Live-pinned, including the
+  tamper case.
+- **MySQL 8.4 support: binlog coordinates via `SHOW BINARY LOG STATUS` with a legacy fallback.**
+  8.4 removed `SHOW MASTER STATUS` (the version scout's first empirical catch — every anchor/pin path
+  died on the first run); rivet now tries the 8.2+ form first and falls back for older servers. The
+  full pilot flow (`initial: snapshot` → stream → idle) verified live against 8.4.10 AND 5.7.44.
+- **DDL inside a capture window fails loudly instead of silently misaligning values.** Binlog row
+  events are positional and nameless; after a mid-window `DROP COLUMN a`, the pre-DDL event's `a`
+  value landed in column `b` — silently, status success (observed live). The sink now refuses any
+  event whose arity differs from the resolved schema, with the recovery path in the error
+  (re-snapshot / reset the checkpoint past the DDL); no misaligned part reaches the destination.
+  DDL between runs and mid-window RENAME are pinned as safe.
+- **Documented: CDC memory is O(largest transaction).** Measured ~1.4 KB RSS per buffered row
+  (100k-row single transaction ≈ 170 MB, 300k ≈ 440 MB, linear) — bulk backfills belong in batched
+  transactions or the batch path; transaction spilling is roadmap.
+- **Staff-review test program: seven verification classes added in one pass.** (1) Concurrent-writer
+  model-based test — 4 threads × 250 randomized ops over shared keys; conservation (events == the
+  writers' affected-row counts) and convergence (the documented merge reproduces the source's exact
+  final state) under real interleaving. (2) Fault-point sweep — behavior-neutral hooks at every CDC
+  phase boundary + one parametrized test walking all of them (loud failure, gap-free recovery).
+  (3) Engine-version matrix — compose tags parametrized (`MYSQL_CDC_TAG`/`POSTGRES_CDC_TAG`) + a
+  nightly scout lane (MySQL 8.4/5.7, PG 13/17; findings, not blockers). (4) Artifact-compatibility
+  gate — v0.16 checkpoints/manifest/parquet committed as fixtures, parsed by every future binary.
+  (5) CDC soak (`scripts/soak_cdc.sh` + weekly CI): scheduler-style churn loop with gap and RSS-trend
+  assertions (54-cycle smoke: 10,800/10,800 ids, RSS flat). (6) Generative parser fuzzing (proptest,
+  stable toolchain): wire-facing parsers total on arbitrary input, exact on well-formed; **it caught a
+  real panic within its first run** — the shared decimal canon byte-sliced inside a multibyte UTF-8
+  char (`&frac[..4]` on emoji), so corrupt decimal wire text would crash the export; now rejects
+  gracefully. (7) Observability contracts — `rivet doctor --json` must SEE the gremlins' fault states
+  (purged-binlog checkpoint flagged; healthy baseline green).
+- **CDC golden suite: hand-calculated metrics over the batch fixture schemas.** The matrices prove
+  CDC == batch; the goldens anchor CDC to ARITHMETIC — a deterministic insert/update/delete workload
+  over golden copies of eight real batch-fixture schemas (decimal money, char(36) uuids,
+  AUTO_INCREMENT keys, a varchar PRIMARY KEY, doubles, nullable text, fixed hex, the nullable-cursor
+  shape), captured through ONE multiplexed stream, asserted against formula-derived literals: op
+  counts per table, series sums of decimal cents over insert- and update-images, exact dyadic double
+  sums, planned NULL profiles, distinct-set identities, deleted-id sets, manifest row counts. If batch
+  and CDC ever drift TOGETHER, the matrices stay green — this suite does not. A row in the conformance
+  matrix.
+- **Gremlin suite for CDC: real faults, not panics.** Five fault classes the `RIVET_TEST_PANIC_AT`
+  matrix structurally cannot exercise (a panic unwinds and runs `Drop`; these do not): SIGKILL
+  mid-drain, the binlog TCP stream cut after N bytes (toxiproxy `limit_data` — deterministic), a hard
+  destination outage mid-drain (proxy disabled once the first part is up; a per-connection byte limit
+  is defeated by the destination retry layer — observed live), a checkpoint write failure (EACCES)
+  after a durable flush, and a SQL Server capture-job stall (`sp_update_job` disable + verified stop —
+  `sysjobactivity` keeps never-closed rows from PAST agent sessions, so the check is scoped to the
+  newest `syssessions` entry; the re-enable guard is armed BEFORE the first manipulation, or a panic
+  leaves the SHARED job disabled and cascades into every other test). Each asserts the at-least-once
+  contract from the outside: loud failure, then a healed retry whose union of parts holds every row —
+  overlap allowed, gap never. All five are rows in the conformance matrix.
+- **Test harness: three standing hard gates distilled from the campaign.** (1) A CDC engine
+  conformance gate (offline, plain `cargo test`) requiring every engine to carry every conformance
+  case — resume, idle-first-run, crash-before-ack, type matrix, update/delete, initial snapshot,
+  vanished anchor, mixed-transaction boundary, qualified routing, non-UTC — or an explicit justified
+  N/A; the four cases it immediately flagged as missing (mixed-tx on PG/MSSQL, qualified names on
+  MySQL/MSSQL) are filled with live tests. (2) An outcome gate: every live CDC test that runs a capture
+  must read back what it produced — bare exit-0 successes (how the 0-row bugs hid) no longer pass.
+  (3) CI: nightly `cargo-mutants` over the CDC modules (surviving mutant = named test blind spot) and a
+  per-PR schema-diff gate requiring every new config key to be named by a test (the worst campaign bugs
+  lived at knob intersections).
+- **CDC: a transaction's commit boundary counts even when its last event lands on an uncaptured
+  table.** MySQL marks only the LAST event of a transaction committed; the routing filter ran first, so
+  a transaction ending on an unlisted table (audit-log-written-last — the common ORM shape) never
+  advanced the checkpoint: the captured rows were re-read and re-written on every scheduler cycle until
+  binlog retention killed the export. The boundary is recorded before routing now, on both the file sink
+  and the NDJSON path. (Ultrareview finding; live + unit pinned.)
+- **CDC: schema-qualified `table:`/`tables:` entries route correctly.** `table: public.orders` — the
+  shape the batch docs promote — compared verbatim against the adapter's bare table name, matched zero
+  events, and produced a 0-row success. Qualified entries now match schema AND table; bare entries match
+  the bare name. (Ultrareview finding.)
+- **`initial: snapshot`: a missing checkpoint with prior-run evidence fails loudly on MySQL/SQL Server
+  too.** The finding-#28 fix covered only PostgreSQL; a deleted checkpoint file after a completed
+  snapshot silently re-pinned MySQL at `SHOW MASTER STATUS` and SQL Server at max-LSN — the latter
+  actively destroying its natural min-LSN over-read floor. (Ultrareview finding.)
+- **`initial: snapshot` no longer bypasses the vanished-slot protection.** The anchor step ran with
+  `resume_expected=false` on EVERY run, so a dropped/invalidated PostgreSQL slot was silently recreated
+  at the current position before the loud-failure path could fire — every change since the drop was
+  lost while the run reported success (a composition bug between two individually-correct features).
+  Resume evidence (a checkpoint position OR any completed `snapshot/_SUCCESS` marker) now makes a
+  missing server-side anchor a loud error with the re-snapshot hint. Live:
+  `pg_initial_snapshot_vanished_slot_fails_loudly_not_recreates`.
+- **PostgreSQL CDC: `timestamptz` no longer corrupts at a non-UTC session/database timezone.**
+  `test_decoding` renders the instant in the POLLING SESSION's zone; the parser stripped the trailing
+  offset and treated the wall-clock as UTC — a +9h value shift at an `Asia/Tokyo` default, and at any
+  western (negative-offset) zone the parse failed outright, silently nulling every `timestamptz`. The
+  offset is parsed as data now (`+09`, `-05`, `+05:30`) and converted to the UTC instant. Invisible in
+  every prior test because a UTC server always renders `+00`. Live pins on both engines: a `+09:00`
+  MySQL global (TIMESTAMP → UTC instant, DATETIME → wall-clock) and an `Asia/Tokyo` PostgreSQL database
+  default (`*_non_utc_*_matches_batch*`); CSV output parity is pinned separately
+  (`cdc_csv_rendering_matches_batch_csv`).
+- **CDC fails loudly on `'NaN'::numeric` — exactly like batch.** A non-null decimal cell that cannot be
+  represented in a Parquet decimal (PG NaN/±Infinity NUMERIC) previously became a silent NULL on the CDC
+  path while the batch export failed loudly; both now fail identically, naming the payload. Hostile-value
+  live tests pin the rest of the surface: ±Infinity/NaN floats ride ArrayData-equal to batch, MySQL
+  zero-dates degrade to NULL on both paths (documented parity), and NUL bytes embedded in strings survive
+  byte-for-byte. UPDATE after-images and DELETE key-images are now pinned against post-update batch
+  exports through the typed surface on all three engines
+  (`*_cdc_update_and_delete_carry_full_types`).
+- **`cdc.initial: snapshot` — anchor-then-snapshot-then-stream in one run.** The safe
+  incremental→CDC switch used to be operator choreography (create the anchor first, then a final batch
+  catch-up, then CDC — get the order wrong and there's a silent gap, demonstrated live). It is now a
+  config key: the first run creates the anchor (PostgreSQL slot / MySQL pinned binlog checkpoint /
+  SQL Server max-LSN checkpoint), snapshots each table into `<destination>[/<table>]/snapshot/` via the
+  regular batch path (own manifest + `_SUCCESS`, metric and journal rows included), then drains.
+  Anchor-before-snapshot makes mid-snapshot changes an *overlap* (PK + `__op` dedupe), never a gap; a
+  crash mid-snapshot re-snapshots on retry with the anchor intact; later runs skip straight to the
+  drain. MySQL / SQL Server require `cdc.checkpoint:` with it (validated at load). Live (all three
+  engines): `*_initial_snapshot_covers_preexisting_rows_then_streams`.
+- **CDC↔batch type parity is now TOTAL — arrays and Decimal256 close the last two gaps.** PostgreSQL
+  arrays ride through CDC as real `List` columns (element field name/nullability matched for ArrayData
+  equality; inner NULLs, quoted/escaped elements, and empty arrays preserved — the `test_decoding`
+  literal is parsed, never passed through as text), and `NUMERIC`/`DECIMAL` above precision 38 build as
+  `Decimal256` with the same digit-exact parse as `Decimal128`. The PostgreSQL matrix test drops its
+  "everything but arrays" exception and now covers the full surface, `NUMERIC(60,10)` included.
+- **Table-qualified `columns:` override keys.** On a multi-table (schema-wide) export a bare key
+  (`amount:`) applies to every captured table that has the column; a qualified key
+  (`"orders.amount":`) targets one table and wins over the bare key there — same-named columns with
+  different types across tables can now be overridden independently, out of the box. A qualified key
+  naming a table the export does not capture — or used on a query-shaped export — is a config error at
+  load. Batch `table:` exports narrow qualified keys the same way (one shared resolver,
+  `types::overrides_for_table`). Live: `cdc_qualified_overrides_target_one_table_bare_applies_to_the_rest`;
+  per-table type resolution under name collisions is separately pinned by
+  `cdc_multi_table_same_column_name_different_types_resolve_per_table`.
+- **CDC slot multiplexing: `tables:` — several tables through ONE stream.** A `mode: cdc` export can now
+  list `tables: [orders, users, …]` and capture them all through a single PostgreSQL slot / MySQL binlog
+  connection with a single checkpoint, instead of one export (and one slot — PostgreSQL decodes the WAL
+  once *per slot*) per table. Each table's changes land under `<destination>/<table>/` with their own
+  parts + `manifest.json` + `_SUCCESS`. The at-least-once sequence generalises: every table's buffered
+  part is flushed **before** the one checkpoint/ack advances (the position is a property of the stream),
+  so a crash mid-roll re-reads for all tables rather than losing any one of them; a part only ever rolls
+  at a commit boundary, and a trailing half-transaction is flushed but never acked past. Mutually
+  exclusive with `table:`; PostgreSQL/MySQL only (SQL Server capture instances are per-table). Verified
+  live on both engines: one slot/connection serving two tables, per-table routing, and a clean resume.
+  Cloud destinations get the table sub-prefix with its own trailing slash — cloud prefixes are literal
+  key prefixes (`prefix + key`, no separator), so without it every object landed as a mangled flat key;
+  caught live on a real GCS bucket and pinned by a unit test on `dest_for_table`.
+
+- **`rivet doctor` CDC health probes.** For configs with `mode: cdc` exports, doctor now automates the
+  monitoring the CDC reference asks operators to do by hand: PostgreSQL — the export's slot (exists /
+  active / retained WAL, failing above 1 GiB) plus **other inactive slots pinning WAL** (the
+  abandoned-slot foot-gun, reported by name); MySQL — binlog server config (`log_bin`,
+  `binlog_format=ROW`, `binlog_row_image=FULL`), checkpoint-vs-retention (`SHOW BINARY LOGS` — a purged
+  binlog file is reported *before* the next run fails with ERROR 1236) and backlog size, failing a
+  config-driven cdc export with **no** checkpoint (changes between runs would be skipped); SQL Server —
+  CDC enabled on the database, capture instance exists, checkpoint within `fn_cdc_get_min_lsn`
+  retention, Agent service running (permission-gated: without `VIEW SERVER STATE` it reports "could not
+  verify" rather than guessing). Doctor's text mode now prints an OK check's detail inline
+  (`[OK] name — detail`); pre-existing OK checks carried no detail, so their lines are unchanged.
+
+- **CDC resource-conflict validation** (`RIVET_CONFIG_CDC_RESOURCE_CONFLICT`). Two `mode: cdc` exports
+  resolving to the same PostgreSQL slot, MySQL `server_id`, or checkpoint path are now rejected at config
+  load — **including the defaults colliding** (`rivet_slot` / `4271`), which is what a naive multi-table
+  CDC config hits: a shared slot is acked past changes the other export never read (mutual silent data
+  loss), a shared `server_id` gets the older replica connection killed by the server, and a shared
+  checkpoint file gets its resume position overwritten. SQL Server `capture_instance` sharing stays
+  allowed (read-only poll; resume state is the per-export checkpoint).
+
+### Fixed
+
+- **SQL Server: `MONEY`/`SMALLMONEY` values survive export (batch AND CDC).** The type mapping knew
+  money (`decimal(19,4)`/`(10,4)`) but every decimal decoder accepted only `ColumnData::Numeric`, and
+  tiberius delivers money as `F64` — so the columns were typed correctly with every value silently
+  NULLed. Both decimal paths now render the F64 at the declared scale and parse the digits exactly
+  (non-finite fails loudly); the always-on value checksum's source fold learned the same conversion —
+  it caught the first fix attempt as a mismatch, exactly as designed. Fidelity note: the f64 hop is
+  exact up to ~9×10¹¹ currency units (money's server range exceeds f64 integer precision above that).
+  Money is back in the CDC type matrix. Regression (live): `mssql_money_values_survive_batch_and_cdc`.
+- **MySQL CDC: negative `MEDIUMINT` values no longer flip sign.** The binlog's 3-byte value arrives
+  without 24-bit sign extension (0x800000 decoded as +8388608 instead of −8388608) — caught by the
+  cross-oracle sweep, invisible until a negative mediumint entered the matrix. Sign-extended now;
+  `mediumint unsigned` untouched.
+- **CDC honours `columns:` type overrides.** `resolve_cdc_columns` passed an empty override map, so the
+  config's per-column declarations were silently ignored on the CDC path — e.g. the documented
+  `bigint unsigned → "decimal(20,0)"` override for BigQuery-bound exports (BQ has no unsigned 64) only
+  worked for batch. CDC now applies the same override surface; a multi-table export applies the map to
+  every table. Regression (live): `cdc_column_overrides_apply_like_batch`.
+- **MySQL CDC: `SET` columns decode their binlog bitmask to the member labels.** The binlog delivers a
+  SET as raw little-endian bitmask bytes; the sink rendered them as lossy text. The bitmask now maps to
+  the comma-joined members in declaration order (`'x,z'`), exactly the server's own rendering — labels
+  come from the same `information_schema.COLUMN_TYPE` enrichment ENUM uses.
+- **PostgreSQL CDC: a vanished slot with an existing checkpoint fails loudly.** `open()` used to
+  re-create a missing slot unconditionally — correct on the first run, but on a *resume* (checkpoint
+  present) a fresh slot anchors at the current position and silently skips everything since the drop.
+  Now: loud error + re-snapshot hint; deleting the checkpoint file is the explicit opt-in to a fresh
+  anchor. Companion MySQL pin: resuming from a missing/purged binlog file fails the run (no `_SUCCESS`),
+  never falls back to "start from current".
+  Regressions (live): `pg_cdc_vanished_slot_with_checkpoint_fails_loudly_not_recreates`,
+  `cdc_resume_from_missing_binlog_fails_loudly_not_silently`.
+- **CDC type matrices extended to the full contracted surface** — MySQL adds
+  smallint/mediumint/int/int-unsigned/**bigint-unsigned (max value, → `Decimal(20,0)`)**/float/double/
+  char/text/**SET**; PostgreSQL adds json (non-jsonb)/bpchar/varchar/real; SQL Server adds
+  char/nchar/**datetime v1 (3.33 ms units)**/smalldatetime/**binary(n)**/numeric — all byte-identical to
+  batch. `MONEY`/`SMALLMONEY` are deliberately excluded: the **batch** export currently nulls their
+  values (typed `decimal(19,4)`, value lost) — including them would "pass" on NULL == NULL and mask the
+  loss; tracked as an open batch finding.
+- **Multi-table CDC to cloud destinations pinned end-to-end** against a real GCS API (fake-gcs):
+  per-table `<prefix>/<table>/` keys for parts + `manifest.json` + `_SUCCESS`, and an explicit assert
+  that the mangled flat-key shape can never return
+  (`cdc_multi_table_to_gcs_lands_per_table_prefixes`).
+- **CDC all-types parity audit: eight per-column silent losses fixed, and the audit pinned as live
+  tests.** One wide table per engine (the union of the official type matrices) exported both ways —
+  batch and CDC — must produce byte-identical Arrow columns (`ArrayData` equality); SQL Server already
+  had this test, PostgreSQL and MySQL now do too (`pg_cdc_full_type_matrix_matches_batch`,
+  `cdc_full_type_matrix_matches_batch`). What the audit caught and this release fixes:
+  - *All engines*: a NULL cell of a text-shaped column (`text`/`enum`/`json`/`interval`) was rendered as
+    an **empty string** instead of NULL by the `Utf8` builders (`""` is not even valid JSON for a json
+    column).
+  - *PostgreSQL*: `TIME` arrived as text and was silently nulled by the strict `Time64` builder (the
+    `timestamp` prefix check does not match `time without time zone`); `INTERVAL` rode as PostgreSQL's
+    text rendering while batch canonicalises to ISO 8601 — both now parse, interval through the same
+    `pg_interval_to_iso8601` serialiser the batch export uses. Known remaining gap: arrays
+    (`text[]`/`integer[]`) ride as the PG literal text (`Utf8`), not `List` — values present, type not
+    yet parity.
+  - *MySQL (binlog wire shapes, probed live)*: `TIMESTAMP` arrives as epoch-seconds TEXT (silently
+    nulled — `DATETIME` worked, which is why no demo caught it); `BIT(1)`/`BIT(n)` arrive as raw bytes
+    (nulled); `YEAR` as text (nulled); `ENUM` as its 1-based INDEX (written as `"2"` instead of `"b"` —
+    corruption, not even a null); `BINARY(n)` NUL-trimmed by the driver (padded back); JSON re-serialised
+    with MySQL's own `", "`/`": "` spacing so CDC and batch render one value identically. BIT/BINARY/ENUM
+    need widths/labels the wire metadata lacks, so the CDC resolve enriches `source_native_type` from
+    `information_schema.COLUMN_TYPE` (CDC-only; batch naming and its contracts untouched).
+- **PostgreSQL CDC: `uuid` and `bytea` values decode to raw bytes.** `test_decoding` renders a uuid as
+  its 36-char hyphenated text and bytea as `\x…` hex; the parse forwarded both as text bytes, and the
+  sink's `FixedSizeBinary(16)` builder — which accepts only exactly-16-byte values — silently degraded
+  **100% of the uuid column to NULL** while every count/sum check still passed (caught by eye on a live
+  GCS export). The parse now decodes both renderings to the same raw bytes the batch path produces.
+  Regression: `uuid_and_bytea_decode_to_raw_bytes_not_their_text_rendering`.
+- **SQL Server CDC: schema/table resolved from `cdc.change_tables` metadata, not the capture-instance
+  name.** The `<schema>_<table>` split-once heuristic mis-tagged every event when an instance was named
+  after an underscored table (`product_catalog` → schema `product`, table `catalog`), so table routing
+  silently dropped all of its changes while the run reported success — caught live with 6 of 8 tables
+  capturing zero events. Because checkpoints never advanced for the dropped tables, a single run with
+  the fix recovered the full backlog from the change tables — no re-snapshot needed. The name heuristic
+  remains only as a fallback when the metadata row is unreadable.
+  Regression (live): `mssql_cdc_capture_instance_name_must_not_decide_the_table`.
+- **MySQL CDC: an idle first run now pins the resume position.** The checkpoint file was written only
+  at a part commit, and a MySQL run without a checkpoint anchors to the *current* master position
+  (`SHOW MASTER STATUS`). So a bounded first run that drained zero changes left no checkpoint, the next
+  run re-anchored to a newer "now", and every change in between was **silently skipped** — the realistic
+  "enable CDC during a quiet period" sequence lost data. `open_or_resume` now persists the open
+  coordinates immediately when no checkpoint exists (the client-side analogue of PostgreSQL's
+  server-side slot pinning at creation; SQL Server was never exposed — no checkpoint there floors at
+  `fn_cdc_get_min_lsn`, over-reading instead of skipping). Regression (live, two-run):
+  `first_run_with_zero_changes_pins_the_checkpoint_at_open`.
+
+- **CDC parts no longer overwrite across runs.** CDC part files were named `cdc-{seq:06}` with the
+  sequence restarting at 0 every run, so the documented scheduler model (`until_current: true` re-run
+  into the same destination prefix) silently overwrote the previous cycle's parts — *after* the source
+  had been acked past those changes, making them unrecoverable (not in the slot, not in the destination).
+  Part names now carry the run id (`cdc-<run_id>-000000.parquet`, filename-sanitized), mirroring the
+  batch path's run-stamped naming, so consecutive runs append alongside each other; the run id's
+  millisecond precision keeps back-to-back scheduler cycles collision-free (two live cycles landed
+  125 ms apart). `manifest.json`/`_SUCCESS` still describe the latest run only — same as a batch re-run.
+  Regression: `roast_second_run_into_same_prefix_must_not_clobber_prior_parts`.
+
 ## 0.16.3 (2026-06-30) — dependency bump: arrow / parquet 58 → 59
 
 A pure dependency bump (no config-grammar change — the schema bump is the version title only).

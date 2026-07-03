@@ -80,6 +80,41 @@ impl MysqlChangeStream {
         })
     }
 
+    /// The source's current `(binlog_file, position)` coordinate.
+    /// MySQL 8.4 REMOVED `SHOW MASTER STATUS` (finding #36, caught by the
+    /// version scout); its replacement `SHOW BINARY LOG STATUS` does not exist
+    /// before 8.2 — try the new form first, fall back to the old.
+    fn current_coordinates(url: &str, tls: Option<&TlsConfig>) -> Result<(String, u64)> {
+        let mut c = connect_conn(url, tls)?;
+        let row: mysql::Row = match c.query_first("SHOW BINARY LOG STATUS") {
+            Ok(Some(row)) => row,
+            // The 8.2+ statement EXISTS and returned nothing ⇒ binlog is
+            // definitively disabled — falling back would surface 8.4's
+            // "SHOW MASTER STATUS" syntax error instead of the real cause.
+            Ok(None) => anyhow::bail!("mysql: binlog disabled (binlog status empty)"),
+            // Err ⇒ pre-8.2 server without the new statement — legacy form.
+            Err(_) => c.query_first("SHOW MASTER STATUS")?.ok_or_else(|| {
+                anyhow::anyhow!("mysql: binlog disabled (SHOW MASTER STATUS empty)")
+            })?,
+        };
+        let file: String = row.get(0).expect("binlog file column");
+        let pos: u64 = row.get(1).expect("binlog pos column");
+        Ok((file, pos))
+    }
+
+    /// Persist the source's CURRENT position to `ckpt` — the anchor for
+    /// `cdc.initial: snapshot` (taken BEFORE the snapshot read, so everything
+    /// changed during the snapshot also appears in the stream). Idempotent-by-
+    /// caller: only invoked when no checkpoint exists yet.
+    pub(crate) fn pin_checkpoint_at_current(
+        url: &str,
+        ckpt: &Path,
+        tls: Option<&TlsConfig>,
+    ) -> Result<()> {
+        let (file, pos) = Self::current_coordinates(url, tls)?;
+        Position(serde_json::json!({ "file": file, "pos": pos })).save(ckpt)
+    }
+
     /// Open a stream from the source's *current* position (`SHOW MASTER STATUS`).
     pub(crate) fn open_from_current(
         url: &str,
@@ -87,12 +122,7 @@ impl MysqlChangeStream {
         non_block: bool,
         tls: Option<&TlsConfig>,
     ) -> Result<Self> {
-        let mut c = connect_conn(url, tls)?;
-        let row: mysql::Row = c
-            .query_first("SHOW MASTER STATUS")?
-            .ok_or_else(|| anyhow::anyhow!("mysql: binlog disabled (SHOW MASTER STATUS empty)"))?;
-        let file: String = row.get(0).expect("binlog file column");
-        let pos: u64 = row.get(1).expect("binlog pos column");
+        let (file, pos) = Self::current_coordinates(url, tls)?;
         Self::open(url, server_id, file, pos, non_block, tls)
     }
 
@@ -124,7 +154,17 @@ impl MysqlChangeStream {
                 .ok_or_else(|| anyhow::anyhow!("mysql cdc checkpoint missing 'pos'"))?;
             return Self::open(url, server_id, file, p, non_block, tls);
         }
-        Self::open_from_current(url, server_id, non_block, tls)
+        // First run (no checkpoint yet): anchor at the current position and persist
+        // it IMMEDIATELY. PostgreSQL pins its anchor server-side at open (slot
+        // creation); MySQL's only anchor is this file, and the sink writes it only
+        // at a part commit — so an idle bounded run (zero changes drained) would
+        // otherwise leave no checkpoint, the next run would re-anchor to a newer
+        // "current" position, and every change in between would be silently skipped.
+        let (file, pos) = Self::current_coordinates(url, tls)?;
+        if let Some(path) = ckpt {
+            Position(serde_json::json!({ "file": file, "pos": pos })).save(path)?;
+        }
+        Self::open(url, server_id, file, pos, non_block, tls)
     }
 
     /// Pull one binlog event and expand it into `pending`. `Ok(false)` ⇒ stream
@@ -155,6 +195,25 @@ impl MysqlChangeStream {
                 };
                 let schema = tme.database_name().to_string();
                 let table = tme.table_name().to_string();
+                // `binlog_row_metadata=FULL` (8.0.1+) puts every column NAME
+                // into the TABLE_MAP's optional metadata — with names present
+                // the sink maps images BY NAME and the positional-corruption
+                // class (findings #37/#41) closes on MySQL too. Under the
+                // MINIMAL default this yields None and the arity guard stays
+                // load-bearing; `rivet doctor` recommends FULL.
+                let image_names: Option<std::sync::Arc<[String]>> =
+                    tme.iter_optional_meta().find_map(|f| match f {
+                        Ok(mysql::binlog::events::OptionalMetadataField::ColumnName(names)) => {
+                            Some(
+                                names
+                                    .iter_names()
+                                    .filter_map(|n| n.ok())
+                                    .map(|n| String::from_utf8_lossy(n.name_raw()).into_owned())
+                                    .collect(),
+                            )
+                        }
+                        _ => None,
+                    });
                 // Provisional position; rewritten to the commit position at XID.
                 let position = Position(json!({ "file": self.file, "pos": log_pos }));
                 for row in re.rows(&tme) {
@@ -167,6 +226,7 @@ impl MysqlChangeStream {
                         after: after.map(render_row),
                         position: position.clone(),
                         committed: false,
+                        image_names: image_names.clone(),
                     });
                 }
                 if self.tx.len() > MAX_TX_ROWS {
@@ -238,15 +298,58 @@ fn binlog_value_to_rivet(bv: &BinlogValue) -> RivetValue {
     match bv {
         BinlogValue::Value(v) => RivetValue::from_mysql(v),
         // A JSON column arrives as MySQL's internal JSONB binary — convert it to
-        // canonical JSON text so it lands as a real `json` column downstream, not
-        // a debug-formatted byte blob.
+        // JSON text in the SAME rendering the server itself produces (", " and
+        // ": " separators), so CDC and batch outputs of one value are
+        // byte-identical; compact serde output would differ only in whitespace.
         BinlogValue::Jsonb(j) => match serde_json::Value::try_from(j.clone()) {
-            Ok(json) => RivetValue::Bytes(json.to_string().into_bytes()),
+            Ok(json) => RivetValue::Bytes(mysql_style_json(&json).into_bytes()),
             Err(_) => RivetValue::Null,
         },
         // JSONB partial-update diffs (rare) — carry the debug bytes as text.
         other => RivetValue::Bytes(format!("{other:?}").into_bytes()),
     }
+}
+
+/// Serialise with MySQL's own JSON text spacing: `", "` between elements and
+/// `": "` after keys (`{"n": 1, "tier": "gold"}`), which is what the batch
+/// export reads from the server as text.
+fn mysql_style_json(v: &serde_json::Value) -> String {
+    struct MySqlFmt;
+    impl serde_json::ser::Formatter for MySqlFmt {
+        fn begin_array_value<W: ?Sized + std::io::Write>(
+            &mut self,
+            w: &mut W,
+            first: bool,
+        ) -> std::io::Result<()> {
+            if !first {
+                w.write_all(b", ")?;
+            }
+            Ok(())
+        }
+        fn begin_object_key<W: ?Sized + std::io::Write>(
+            &mut self,
+            w: &mut W,
+            first: bool,
+        ) -> std::io::Result<()> {
+            if !first {
+                w.write_all(b", ")?;
+            }
+            Ok(())
+        }
+        fn begin_object_value<W: ?Sized + std::io::Write>(
+            &mut self,
+            w: &mut W,
+        ) -> std::io::Result<()> {
+            w.write_all(b": ")
+        }
+    }
+    let mut out = Vec::new();
+    let mut ser = serde_json::Serializer::with_formatter(&mut out, MySqlFmt);
+    use serde::Serialize as _;
+    if v.serialize(&mut ser).is_err() {
+        return v.to_string();
+    }
+    String::from_utf8(out).unwrap_or_else(|_| v.to_string())
 }
 
 impl Iterator for MysqlChangeStream {
@@ -325,6 +428,56 @@ mod tests {
                 .and_then(Json::as_u64)
                 .unwrap()
                 > 0
+        );
+    }
+
+    // RED test for the idle-first-run hole: PostgreSQL pins its resume anchor
+    // server-side at open (slot creation); MySQL has no server-side anchor — the
+    // checkpoint file is the ONLY resume position, and it was written only at a
+    // part commit. So a bounded first run that drains ZERO changes left no
+    // checkpoint, the next run re-anchored to a newer "current" position, and
+    // every change in between was silently skipped. Enable-CDC-during-a-quiet-
+    // period is exactly the realistic ops sequence that hits this.
+    #[test]
+    #[ignore = "live: requires docker compose mysql (binlog_format=ROW)"]
+    fn first_run_with_zero_changes_pins_the_checkpoint_at_open() {
+        let mut c = Conn::new(Opts::from_url(URL).unwrap()).unwrap();
+        c.query_drop("DROP TABLE IF EXISTS cdc_idle_first").unwrap();
+        c.query_drop("CREATE TABLE cdc_idle_first (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = dir.path().join("mysql.ckpt.json");
+
+        // Run 1: checkpoint path configured, no file yet, nothing to drain
+        // (non_block ⇒ bounded drain-and-exit, the scheduler model).
+        let mut s = MysqlChangeStream::open_or_resume(URL, 4245, Some(&ckpt), true, None).unwrap();
+        assert!(
+            s.by_ref()
+                .map(|e| e.unwrap())
+                .all(|e| e.table != "cdc_idle_first"),
+            "run 1 must drain zero changes for this table"
+        );
+        drop(s);
+        assert!(
+            Position::load(&ckpt).unwrap().is_some(),
+            "a first run with no prior checkpoint must pin the open position, \
+             even when it captures nothing"
+        );
+
+        // A change made BETWEEN the idle run 1 and run 2.
+        c.query_drop("INSERT INTO cdc_idle_first VALUES (1, 100)")
+            .unwrap();
+
+        // Run 2 must resume from the pinned position and capture it.
+        let mut s2 = MysqlChangeStream::open_or_resume(URL, 4245, Some(&ckpt), true, None).unwrap();
+        let got = s2
+            .by_ref()
+            .map(|e| e.unwrap())
+            .find(|e| e.table == "cdc_idle_first");
+        assert!(
+            got.is_some(),
+            "the change between an idle run and the next run must be captured, not skipped"
         );
     }
 

@@ -36,21 +36,30 @@ use crate::manifest::{
 use crate::pipeline::commit::{PartRecord, write_part_file};
 use crate::pipeline::manifest_writer::write_manifest;
 use crate::source::cdc::value::{self, RivetValue};
-use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream};
+use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, Position};
 use crate::types::{TypeMapping, build_arrow_field};
 
-/// Everything the sink needs that isn't the stream itself.
-pub(crate) struct SinkConfig<'a> {
+/// One table's wiring in a (possibly multi-table) CDC run: where its parts go
+/// and its resolved column types. Events are **routed** by table name — an
+/// event for a table with no output is skipped (the filter).
+pub(crate) struct TableOutput<'a> {
+    pub table: String,
     /// Resolved source column type mappings — carry the Arrow type *and* its
     /// logical-type metadata (`json`/`uuid`/…), so the sink writes the same typed
     /// columns the batch export does (via [`build_arrow_field`]).
-    pub columns: &'a [TypeMapping],
+    pub columns: Vec<TypeMapping>,
     pub dest: &'a dyn Destination,
     pub dest_uri: String,
-    pub engine: &'a str,
-    pub table: &'a str,
+}
+
+/// Everything the sink needs that isn't the stream itself. `outputs` carries one
+/// entry per captured table — several tables share ONE stream (one slot / one
+/// binlog connection) and ONE checkpoint, because the resume position is a
+/// property of the stream, not of a table.
+pub(crate) struct SinkConfig<'a> {
+    pub outputs: Vec<TableOutput<'a>>,
+    pub engine: super::CdcEngine,
     pub format: FormatType,
-    pub tables: Vec<String>,
     pub checkpoint: Option<PathBuf>,
     pub max_events: Option<usize>,
     pub rollover: usize,
@@ -80,103 +89,227 @@ impl RolloverPolicy {
     }
 }
 
-/// Owns the **durable sequence** for one part — the invariant that makes the run
-/// at-least-once: encode + upload the part, THEN persist the resume checkpoint,
-/// THEN ack the source, in that exact order. A crash between any two steps re-reads
-/// on resume; reordering would risk dropping a change a consume-on-read source
-/// (PostgreSQL) had already advanced past. Checkpoint + ack happen only at a real
-/// commit boundary — the final part can end mid-transaction (resumed from the last
-/// committed position).
-struct PartCommitter<'a> {
-    dest: &'a dyn Destination,
-    format: FormatType,
-    checkpoint: Option<&'a Path>,
+/// Per-table sink state: the lazily-built schema, the buffered (not yet
+/// flushed) changes, and the committed parts.
+struct TableSink<'a> {
+    out: TableOutput<'a>,
+    schema: Option<SchemaRef>,
+    buf: Vec<ChangeEvent>,
+    parts: Vec<PartRecord>,
     seq: usize,
+    /// Finding #38: per-column value checksums, XOR-accumulated across parts
+    /// (the same combining rule `validate_recorded_checksums` applies on
+    /// re-read) — recorded into the manifest so `rivet validate` Form B
+    /// covers CDC prefixes instead of silently skipping the value leg.
+    column_sums: std::collections::BTreeMap<String, u64>,
 }
 
-impl PartCommitter<'_> {
-    fn commit(
+impl TableSink<'_> {
+    /// Encode + upload this table's buffered changes as one part (no-op when
+    /// the buffer is empty). Does NOT touch the checkpoint or the stream — the
+    /// ack decision is global (see [`roll_all`]).
+    fn flush_buffered(
         &mut self,
-        buf: &[ChangeEvent],
-        schema: &SchemaRef,
-        columns: &[TypeMapping],
-        stream: &mut dyn ChangeStream,
-    ) -> Result<PartRecord> {
-        let part = flush(buf, schema, columns, self.format, self.seq, self.dest)?;
-        // Fault point: the part is durable but the checkpoint/ack have NOT run. A
-        // crash here must re-read on resume (at-least-once) — never lose the change.
-        crate::test_hook::maybe_panic_at("cdc_after_flush_before_ack");
-        if let Some(last) = buf.last()
-            && last.committed
-        {
-            if let Some(p) = self.checkpoint {
-                last.position.save(p)?;
-            }
-            stream.ack(&last.position)?;
+        engine: super::CdcEngine,
+        format: FormatType,
+        run_token: &str,
+    ) -> Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
         }
+        // The schema is built lazily at the first flush so decimal column
+        // scales can be refined from the data (SQL Server's metadata-only
+        // resolve gives a placeholder scale of 0 — the same gap the batch path
+        // fills from rows).
+        let sch = ensure_schema(&mut self.schema, &mut self.out.columns, &self.buf);
+        let (part, sums) = flush(
+            &self.buf,
+            &sch,
+            &self.out.columns,
+            engine,
+            format,
+            run_token,
+            self.seq,
+            self.out.dest,
+        )?;
+        for (name, sum) in sums {
+            *self.column_sums.entry(name).or_insert(0) ^= sum;
+        }
+        self.parts.push(part);
         self.seq += 1;
-        Ok(part)
+        self.buf.clear();
+        Ok(())
     }
 }
 
-/// Stream canonical changes to typed Parquet/CSV parts, uploading each through the
-/// commit seam, then writing a manifest + `_SUCCESS` at clean end. The loop only
-/// pulls + buffers + asks the [`RolloverPolicy`]; the durable flush→checkpoint→ack
-/// sequence lives in [`PartCommitter`].
+/// Does a config `table:` entry match an event's identity? Config may be bare
+/// (`orders` — matches the bare table name in any schema) or schema-qualified
+/// (`public.orders` — matches schema AND table). Adapters always emit schema
+/// and table separately; comparing the config string verbatim against the
+/// bare event table silently routed ZERO events for qualified configs.
+pub(super) fn table_matches(cfg: &str, schema: &str, table: &str) -> bool {
+    match cfg.split_once('.') {
+        Some((cs, ct)) => cs == schema && ct == table,
+        None => cfg == table,
+    }
+}
+
+/// The **durable sequence** for one roll — the invariant that makes the run
+/// at-least-once: encode + upload EVERY table's buffered part, THEN persist the
+/// resume checkpoint, THEN ack the source, in that exact order. A crash between
+/// any two steps re-reads on resume; reordering would risk dropping a change a
+/// consume-on-read source (PostgreSQL) had already advanced past.
+///
+/// The flush-ALL-tables-first step is what makes the multi-table stream safe:
+/// the position is a property of the stream, so acking after flushing only one
+/// table would advance past another table's still-buffered changes. Checkpoint
+/// and ack happen only at a real commit boundary (`last_commit`); a trailing
+/// mid-transaction tail is flushed but never acked past — it is re-read (and
+/// deduped downstream) rather than lost.
+#[allow(clippy::too_many_arguments)]
+fn roll_all(
+    sinks: &mut [TableSink<'_>],
+    stream: &mut dyn ChangeStream,
+    engine: super::CdcEngine,
+    format: FormatType,
+    run_token: &str,
+    checkpoint: Option<&Path>,
+    last_commit: &Option<Position>,
+    unacked_commit: &mut bool,
+) -> Result<()> {
+    for s in sinks.iter_mut() {
+        s.flush_buffered(engine, format, run_token)?;
+    }
+    // Fault point: the parts are durable but the checkpoint/ack have NOT run. A
+    // crash here must re-read on resume (at-least-once) — never lose the change.
+    crate::test_hook::maybe_panic_at("cdc_after_flush_before_ack");
+    if *unacked_commit && let Some(p) = last_commit {
+        if let Some(ck) = checkpoint {
+            p.save(ck)?;
+        }
+        // Fault point: checkpoint persisted, source NOT acked — a crash here
+        // must re-read (PG would re-peek; the file checkpoint already moved,
+        // so MySQL resumes from it — both are at-least-once).
+        crate::test_hook::maybe_panic_at("cdc_after_checkpoint_before_ack");
+        stream.ack(p)?;
+        // Fault point: fully durable + acked — a crash here loses nothing and
+        // must not duplicate on resume (the checkpoint already advanced).
+        crate::test_hook::maybe_panic_at("cdc_after_ack");
+        *unacked_commit = false;
+    }
+    Ok(())
+}
+
+/// Stream canonical changes to typed Parquet/CSV parts — routed to each table's
+/// own output — uploading each part through the commit seam, then writing a
+/// per-table manifest + `_SUCCESS` at clean end. The loop only pulls + routes +
+/// asks the [`RolloverPolicy`] (on totals across tables); the durable
+/// flush→checkpoint→ack sequence lives in [`roll_all`]. Returns one manifest
+/// per output, in `outputs` order.
 pub(crate) fn run_to_files(
     stream: &mut dyn ChangeStream,
     cfg: SinkConfig<'_>,
-) -> Result<RunManifest> {
-    // The schema is built lazily at the first flush so decimal column scales can
-    // be refined from the data (SQL Server's metadata-only resolve gives a
-    // placeholder scale of 0 — the same gap the batch path fills from rows).
-    let mut columns = cfg.columns.to_vec();
-    let mut schema: Option<SchemaRef> = None;
-
-    let mut buf: Vec<ChangeEvent> = Vec::new();
-    let mut buf_bytes = 0usize;
-    let mut parts: Vec<PartRecord> = Vec::new();
-    let mut emitted = 0usize;
+) -> Result<Vec<RunManifest>> {
+    let run_token = run_token(&cfg.run_id);
+    let mut sinks: Vec<TableSink<'_>> = cfg
+        .outputs
+        .into_iter()
+        .map(|out| TableSink {
+            out,
+            schema: None,
+            buf: Vec::new(),
+            parts: Vec::new(),
+            seq: 0,
+            column_sums: std::collections::BTreeMap::new(),
+        })
+        .collect();
 
     let policy = RolloverPolicy {
         rollover_rows: cfg.rollover,
         rollover_bytes: cfg.rollover_memory_bytes,
     };
-    let mut committer = PartCommitter {
-        dest: cfg.dest,
-        format: cfg.format,
-        checkpoint: cfg.checkpoint.as_deref(),
-        seq: 0,
-    };
+    let checkpoint = cfg.checkpoint.as_deref();
+    let (mut total_rows, mut total_bytes, mut emitted) = (0usize, 0usize, 0usize);
+    // The last commit-boundary position seen, and whether a commit has arrived
+    // since the last ack — the only position it is ever valid to advance to.
+    let mut last_commit: Option<Position> = None;
+    let mut unacked_commit = false;
 
     while let Some(ev) = stream.next_change() {
         let ev = ev?;
-        if !cfg.tables.is_empty() && !cfg.tables.iter().any(|t| t == &ev.table) {
-            continue;
-        }
+        // The commit boundary is a property of the STREAM, not of any routed
+        // table — record it BEFORE the routing filter. MySQL marks only the
+        // LAST event of a transaction committed; if that event lands on an
+        // uncaptured table (audit-log-written-last is a common ORM shape),
+        // filtering first would drop the boundary, stall the checkpoint
+        // forever, and duplicate the captured rows on every scheduler cycle.
         let committed = ev.committed;
-        buf_bytes += ev.estimated_bytes();
-        buf.push(ev);
+        if committed {
+            last_commit = Some(ev.position.clone());
+            unacked_commit = true;
+        }
+        let Some(sink) = sinks
+            .iter_mut()
+            .find(|s| table_matches(&s.out.table, &ev.schema, &ev.table))
+        else {
+            continue; // not a captured table
+        };
+        total_bytes += ev.estimated_bytes();
+        sink.buf.push(ev);
+        total_rows += 1;
         emitted += 1;
-        if policy.should_roll(buf.len(), buf_bytes, committed) {
-            let sch = ensure_schema(&mut schema, &mut columns, &buf);
-            parts.push(committer.commit(&buf, &sch, &columns, stream)?);
-            buf.clear();
-            buf_bytes = 0;
+        if policy.should_roll(total_rows, total_bytes, committed) {
+            roll_all(
+                &mut sinks,
+                stream,
+                cfg.engine,
+                cfg.format,
+                &run_token,
+                checkpoint,
+                &last_commit,
+                &mut unacked_commit,
+            )?;
+            total_rows = 0;
+            total_bytes = 0;
         }
         if cfg.max_events.is_some_and(|m| emitted >= m) {
             break;
         }
     }
-    if !buf.is_empty() {
-        let sch = ensure_schema(&mut schema, &mut columns, &buf);
-        parts.push(committer.commit(&buf, &sch, &columns, stream)?);
+    if sinks.iter().any(|s| !s.buf.is_empty()) {
+        roll_all(
+            &mut sinks,
+            stream,
+            cfg.engine,
+            cfg.format,
+            &run_token,
+            checkpoint,
+            &last_commit,
+            &mut unacked_commit,
+        )?;
     }
 
-    // Clean end → write the run manifest + _SUCCESS (bounded-run concept).
-    let manifest = build_manifest(&cfg, &parts);
-    write_manifest(cfg.dest, &manifest)?;
-    Ok(manifest)
+    // Fault point: all parts durable + acked, no manifest yet — a crash here
+    // leaves a resumable prefix (parts without _SUCCESS), and the retry must
+    // complete it without re-capturing acked data.
+    crate::test_hook::maybe_panic_at("cdc_before_manifest");
+
+    // Clean end → write each table's run manifest + _SUCCESS (bounded-run concept).
+    let mut manifests = Vec::with_capacity(sinks.len());
+    for s in &sinks {
+        let manifest = build_manifest(
+            cfg.engine,
+            &s.column_sums,
+            &s.out,
+            cfg.format,
+            &cfg.run_id,
+            &cfg.started_at,
+            &s.parts,
+        );
+        write_manifest(s.out.dest, &manifest)?;
+        manifests.push(manifest);
+    }
+    Ok(manifests)
 }
 
 /// Build the sink schema once, on the first flush — refining decimal scales from
@@ -243,14 +376,35 @@ fn refine_decimal_scales(columns: &mut [TypeMapping], events: &[ChangeEvent]) {
 
 /// Build one `RecordBatch` from `events`, write it to a temp part, and upload it
 /// through the commit seam (destination write + content-MD5 + transit check).
+/// Filename-safe token from the run id. Part names must be unique per run — a
+/// later run into the same prefix has to append alongside prior parts, never
+/// overwrite them (mirrors the batch path's timestamp-named parts). The CLI path
+/// passes an RFC3339 run id (`:`/`+` — `:` is not even legal on Windows), so map
+/// anything outside `[A-Za-z0-9._-]` to `-`.
+fn run_token(run_id: &str) -> String {
+    run_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn flush(
     events: &[ChangeEvent],
     schema: &SchemaRef,
     columns: &[TypeMapping],
+    engine: super::CdcEngine,
     format: FormatType,
+    run_token: &str,
     seq: usize,
     dest: &dyn Destination,
-) -> Result<PartRecord> {
+) -> Result<(PartRecord, Vec<(String, u64)>)> {
     let ops: ArrayRef = Arc::new(
         events
             .iter()
@@ -263,24 +417,134 @@ fn flush(
             .map(|e| Some(e.position.0.to_string()))
             .collect::<StringArray>(),
     );
+    // Finding #37: a mid-window DDL desynchronizes the event images from the
+    // resolved schema — positional mapping then puts a dropped column's value
+    // into its NEIGHBOR (observed live: after DROP COLUMN a, row1's 'AAA'
+    // landed in column b, silently, status success). Binlog row events carry
+    // no column names, so v1 is the honest loud check: any image whose arity
+    // differs from the resolved schema aborts the flush with the recovery
+    // path spelled out. (Same-arity DDL — rename — is positionally safe;
+    // type changes are a schema-history feature, see the docs limitation.)
+    for ev in events {
+        // A DELETE's before-image may legitimately carry only the key
+        // columns (PostgreSQL test_decoding emits just the key; MySQL FULL
+        // row-image carries everything) — a SHORTER delete image maps by
+        // prefix; an image WIDER than the schema, or a non-delete image of
+        // ANY other arity, proves a stale pre-DDL layout.
+        let is_delete = ev.op == ChangeOp::Delete;
+        if ev.image_names.is_some() {
+            continue; // named image — mapped by name, arity-proof for any op
+        }
+        let img = if is_delete {
+            ev.before.as_ref()
+        } else {
+            ev.after.as_ref()
+        };
+        let bad = |n: usize| {
+            if is_delete {
+                n > columns.len()
+            } else {
+                n != columns.len()
+            }
+        };
+        if let Some(vals) = img
+            && bad(vals.len())
+        {
+            anyhow::bail!(
+                "cdc: an event for table '{}' carries {} column(s) but the resolved \
+                 schema has {} — a DDL landed inside this capture window, and mapping \
+                 by position would put values into the WRONG columns. Recover by \
+                 re-snapshotting the table (delete its snapshot/_SUCCESS marker under \
+                 `initial: snapshot`) or by resetting the checkpoint past the DDL. \
+                 To make mid-stream DDL safe going forward, set \
+                 binlog_row_metadata=FULL on the MySQL server (8.0.1+) — rivet then \
+                 maps binlog images by column NAME and this error class disappears.",
+                ev.table,
+                vals.len(),
+                columns.len()
+            );
+        }
+    }
+
     let mut arrays: Vec<ArrayRef> = vec![ops, poss];
+    let mut col_sums: Vec<(String, u64)> = Vec::with_capacity(columns.len());
     for (i, m) in columns.iter().enumerate() {
-        let cells: Vec<Option<&RivetValue>> = events
-            .iter()
-            .map(|e| {
-                // after-image for insert/update; before-image (the key) for delete
-                let image = match e.op {
-                    ChangeOp::Delete => e.before.as_ref(),
-                    _ => e.after.as_ref(),
-                };
-                image.and_then(|vals| vals.get(i))
-            })
-            .collect();
-        // The render type matches exactly the field `ensure_schema` declared.
-        arrays.push(value::build_column(
-            &value::render_type(m.arrow_type.as_ref()),
-            &cells,
-        )?);
+        // Engine/native-type cell normalisation (e.g. MySQL binlog quirks: BIT
+        // bytes, ENUM indexes, epoch-text TIMESTAMPs, NUL-trimmed BINARY) —
+        // computed once per column, applied per cell.
+        let fix = value::mysql_cell_fix(engine, &m.source_native_type);
+        // after-image for insert/update; before-image (the key) for delete.
+        // Finding #41: a NAMED key-only image (PG DELETE) maps by COLUMN NAME
+        // into the resolved schema — positional mapping put a non-first PK's
+        // value into column 0 and NULLed the PK, silently losing the delete
+        // downstream. Unnamed images stay positional (full rows).
+        fn image_cell<'e>(
+            e: &'e ChangeEvent,
+            i: usize,
+            col: &str,
+            ncols: usize,
+            memo: Option<(&std::sync::Arc<[String]>, Option<usize>)>,
+        ) -> Option<&'e RivetValue> {
+            let vals = match e.op {
+                ChangeOp::Delete => e.before.as_ref()?,
+                _ => e.after.as_ref()?,
+            };
+            match &e.image_names {
+                Some(names) => match memo
+                    .filter(|(m, _)| std::sync::Arc::ptr_eq(m, names))
+                    .map(|(_, j)| j)
+                    .unwrap_or_else(|| names.iter().position(|n| n == col))
+                {
+                    Some(j) => vals.get(j),
+                    // Name absent: a mid-window RENAME leaves the value under
+                    // its OLD name — when the arity still matches, position is
+                    // trustworthy and the value must not silently degrade to
+                    // NULL. Arity mismatch (mid-window ADD/DROP) ⇒ the column
+                    // genuinely has no value in this image ⇒ NULL.
+                    None if vals.len() == ncols => vals.get(i),
+                    None => None,
+                },
+                None => vals.get(i),
+            }
+        }
+        // O(1) name lookup for the common case: all events in a flush share
+        // one names-Arc (same TABLE_MAP / same wire session), so resolve this
+        // column's image index once and reuse it by pointer identity.
+        let memo_arc = events.iter().find_map(|e| e.image_names.as_ref());
+        let memo = memo_arc.map(|names| (names, names.iter().position(|n| n == &m.column_name)));
+        let render = value::render_type(m.arrow_type.as_ref());
+        let owned: Option<Vec<Option<RivetValue>>> = fix.as_ref().map(|fix| {
+            events
+                .iter()
+                .map(|e| {
+                    image_cell(e, i, &m.column_name, columns.len(), memo).map(|v| fix.apply(v))
+                })
+                .collect()
+        });
+        let cells: Vec<Option<&RivetValue>> = match &owned {
+            Some(o) => o.iter().map(|c| c.as_ref()).collect(),
+            None => events
+                .iter()
+                .map(|e| image_cell(e, i, &m.column_name, columns.len(), memo))
+                .collect(),
+        };
+        let arr = value::build_column(&render, &cells)?;
+        // Two-ended value check, same contract as the batch export's Form A:
+        // an independent fold of the typed cells vs a fold of the BUILT array.
+        // A mismatch means the builder changed a value between decode and
+        // Arrow — fail loud BEFORE the part is written, naming the column.
+        let source_sum = value::cells_checksum(&render, &cells);
+        let arrow_sum = crate::source::value_checksum::array_checksum(arr.as_ref());
+        col_sums.push((m.column_name.clone(), arrow_sum));
+        if source_sum != arrow_sum {
+            anyhow::bail!(
+                "cdc value checksum mismatch in column '{}': source={source_sum} \
+                 arrow={arrow_sum} — the value converter changed a value between \
+                 decode and Arrow build",
+                m.column_name
+            );
+        }
+        arrays.push(arr);
     }
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
 
@@ -295,30 +559,39 @@ fn flush(
     w.write_batch(&batch)?;
     w.finish()?;
 
-    let file_name = format!("cdc-{seq:06}.{}", format.label());
-    write_part_file(dest, tmp.path(), events.len() as i64, file_name)
+    let file_name = format!("cdc-{run_token}-{seq:06}.{}", format.label());
+    let part = write_part_file(dest, tmp.path(), events.len() as i64, file_name)?;
+    Ok((part, col_sums))
 }
 
-/// Assemble a `RunManifest` from the committed parts (hand-built — no plan
-/// coupling; `record_part` is the plan-bound path the batch export uses).
-fn build_manifest(cfg: &SinkConfig<'_>, parts: &[PartRecord]) -> RunManifest {
+/// Assemble one table's `RunManifest` from its committed parts (hand-built — no
+/// plan coupling; `record_part` is the plan-bound path the batch export uses).
+fn build_manifest(
+    engine: super::CdcEngine,
+    column_sums: &std::collections::BTreeMap<String, u64>,
+    out: &TableOutput<'_>,
+    format: FormatType,
+    run_id: &str,
+    started_at: &str,
+    parts: &[PartRecord],
+) -> RunManifest {
     RunManifest {
         manifest_version: MANIFEST_VERSION,
-        run_id: cfg.run_id.clone(),
-        export_name: cfg.table.to_string(),
-        started_at: cfg.started_at.clone(),
-        finished_at: cfg.run_id.clone(),
+        run_id: run_id.to_string(),
+        export_name: out.table.clone(),
+        started_at: started_at.to_string(),
+        finished_at: run_id.to_string(),
         status: ManifestStatus::Success,
         source: ManifestSource {
-            engine: cfg.engine.to_string(),
+            engine: engine.label().to_string(),
             schema: None,
-            table: Some(cfg.table.to_string()),
+            table: Some(out.table.clone()),
         },
         destination: ManifestDestination {
             kind: "cdc".to_string(),
-            uri: cfg.dest_uri.clone(),
+            uri: out.dest_uri.clone(),
         },
-        format: cfg.format.label().to_string(),
+        format: format.label().to_string(),
         compression: "zstd".to_string(),
         schema_fingerprint: String::new(),
         row_count: parts.iter().map(|p| p.rows).sum(),
@@ -336,8 +609,15 @@ fn build_manifest(cfg: &SinkConfig<'_>, parts: &[PartRecord]) -> RunManifest {
                 status: PartStatus::Committed,
             })
             .collect(),
-        // Form B value-checksum recording is batch-path only for now.
-        column_checksums: None,
+        column_checksums: Some(
+            column_sums
+                .iter()
+                .map(|(name, sum)| crate::manifest::ColumnChecksum {
+                    name: name.clone(),
+                    checksum: sum.to_string(),
+                })
+                .collect(),
+        ),
         checksum_key_column: None,
     }
 }
@@ -391,6 +671,85 @@ mod tests {
         }
     }
 
+    // Ultrareview bug_002: MySQL marks only the LAST event of a transaction
+    // committed. If that event lands on an UNCAPTURED table, filtering before
+    // the commit bookkeeping dropped the boundary — checkpoint never advanced,
+    // the captured rows re-read (and re-written) on every scheduler cycle.
+    // The boundary is a STREAM property: it must be recorded before routing.
+    #[test]
+    fn commit_boundary_on_an_uncaptured_table_still_advances_the_checkpoint() {
+        let d = tempfile::tempdir().unwrap();
+        let dest = local_dest(&d);
+        let cols = int_col();
+        let ckpt = d.path().join("ckpt");
+        let mut captured = insert(1);
+        captured.committed = false; // mid-transaction
+        let mut foreign = insert(2);
+        foreign.table = "audit_log".into(); // NOT captured
+        foreign.committed = true; // the transaction's commit boundary
+        let mut stream = FakeStream {
+            events: vec![captured, foreign].into(),
+            acked: Vec::new(),
+        };
+        let cfg = SinkConfig {
+            checkpoint: Some(ckpt.clone()),
+            ..cfg(dest.as_ref(), &cols, FormatType::Parquet, 10)
+        };
+        run_to_files(&mut stream, cfg).unwrap();
+        assert!(
+            Position::load(&ckpt).unwrap().is_some(),
+            "the stream's commit boundary must advance the checkpoint even when \
+             its event routes to an uncaptured table"
+        );
+        assert_eq!(stream.acked.len(), 1, "and the source must be acked");
+    }
+
+    // Ultrareview bug_004: a schema-qualified config (`table: public.orders`)
+    // compared verbatim against the adapter's BARE event table matched zero
+    // events — the whole stream silently dropped into a 0-row success.
+    #[test]
+    fn table_matches_handles_bare_and_qualified_configs() {
+        assert!(
+            table_matches("orders", "public", "orders"),
+            "bare matches any schema"
+        );
+        assert!(
+            table_matches("public.orders", "public", "orders"),
+            "qualified matches"
+        );
+        assert!(
+            !table_matches("audit.orders", "public", "orders"),
+            "wrong schema differs"
+        );
+        assert!(
+            !table_matches("orders", "public", "users"),
+            "different table differs"
+        );
+    }
+
+    // The nameless (binlog_row_metadata=MINIMAL) guard path: an image whose
+    // arity differs from the resolved schema must abort the flush loudly —
+    // name-mapped engines skip this, MySQL-without-FULL depends on it.
+    #[test]
+    fn nameless_arity_drift_fails_the_flush_loudly() {
+        let d = tempfile::tempdir().unwrap();
+        let dest = local_dest(&d);
+        let cols = int_col();
+        let mut ev = insert(1);
+        ev.after = Some(vec![RivetValue::Int(1), RivetValue::Int(2)]); // 2 vs 1 col
+        ev.image_names = None;
+        let mut stream = FakeStream {
+            events: vec![ev].into(),
+            acked: Vec::new(),
+        };
+        let cfg = cfg(dest.as_ref(), &cols, FormatType::Parquet, 10);
+        let err = run_to_files(&mut stream, cfg).expect_err("arity drift must fail");
+        assert!(
+            err.to_string().contains("WRONG columns"),
+            "must explain the misalignment: {err}"
+        );
+    }
+
     fn insert(id: i64) -> ChangeEvent {
         ChangeEvent {
             op: ChangeOp::Insert,
@@ -400,6 +759,7 @@ mod tests {
             after: Some(vec![RivetValue::Int(id)]),
             position: Position(serde_json::json!({ "lsn": format!("{id:08X}") })),
             committed: true,
+            image_names: None,
         }
     }
 
@@ -428,11 +788,12 @@ mod tests {
             acked: Vec::new(),
         };
         // 3 events, roll at 2 ⇒ part0=[1,2], part1=[3]
-        let manifest = run_to_files(
+        let manifests = run_to_files(
             &mut stream,
             cfg(dest.as_ref(), &cols, FormatType::Parquet, 2),
         )
         .unwrap();
+        let manifest = &manifests[0];
 
         assert_eq!(manifest.part_count, 2, "rollover=2 over 3 events ⇒ 2 parts");
         assert_eq!(manifest.row_count, 3);
@@ -444,6 +805,66 @@ mod tests {
         assert!(
             dir.path().join("_SUCCESS").exists(),
             "_SUCCESS marks the clean end"
+        );
+    }
+
+    // RED test for the finding: the documented continuous model (a scheduler re-running
+    // `rivet run` with `until_current: true`) points every cycle at the SAME
+    // destination prefix. Each cycle's parts must survive the next cycle — the
+    // batch path guarantees this with run-stamped part names. A fixed per-run
+    // name (`cdc-000000`) silently overwrites the prior run's part AFTER the
+    // source has already been acked past those changes: unrecoverable loss
+    // (not in the slot, not in the destination).
+    #[test]
+    fn roast_second_run_into_same_prefix_must_not_clobber_prior_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(&dir);
+        let cols = int_col();
+
+        // Cycle 1 captures changes 1,2 — one part.
+        let mut run1 = FakeStream {
+            events: VecDeque::from(vec![insert(1), insert(2)]),
+            acked: Vec::new(),
+        };
+        run_to_files(
+            &mut run1,
+            SinkConfig {
+                run_id: "t_cdc_20260702T100000000".into(),
+                ..cfg(dest.as_ref(), &cols, FormatType::Csv, 10)
+            },
+        )
+        .unwrap();
+
+        // Cycle 2 (a later scheduler tick, distinct run id) captures change 3.
+        let mut run2 = FakeStream {
+            events: VecDeque::from(vec![insert(3)]),
+            acked: Vec::new(),
+        };
+        run_to_files(
+            &mut run2,
+            SinkConfig {
+                run_id: "t_cdc_20260702T100500000".into(),
+                ..cfg(dest.as_ref(), &cols, FormatType::Csv, 10)
+            },
+        )
+        .unwrap();
+
+        // The union of both cycles must be readable from the prefix: 3 data rows.
+        let mut data_rows = 0usize;
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "csv") {
+                data_rows += std::fs::read_to_string(&path)
+                    .unwrap()
+                    .lines()
+                    .count()
+                    .saturating_sub(1); // header
+            }
+        }
+        assert_eq!(
+            data_rows, 3,
+            "run 2 must append its parts alongside run 1's in the same prefix — \
+             a fixed part name silently overwrites already-acked changes"
         );
     }
 
@@ -473,6 +894,7 @@ mod tests {
             ]),
             position: Position(serde_json::json!({})),
             committed: true,
+            image_names: None,
         };
         let mut cols = vec![
             decimal_col("placeholder", 38, 0), // SQL Server: scale unknown at resolve
@@ -499,13 +921,14 @@ mod tests {
         rollover: usize,
     ) -> SinkConfig<'a> {
         SinkConfig {
-            columns: cols,
-            dest,
-            dest_uri: String::new(),
-            engine: "test",
-            table: "t",
+            outputs: vec![TableOutput {
+                table: "t".into(),
+                columns: cols.to_vec(),
+                dest,
+                dest_uri: String::new(),
+            }],
+            engine: crate::source::cdc::CdcEngine::Mysql,
             format,
-            tables: Vec::new(),
             checkpoint: None,
             max_events: None,
             rollover,
@@ -534,11 +957,11 @@ mod tests {
             events,
             acked: Vec::new(),
         };
-        let manifest = run_to_files(
+        let manifest = &run_to_files(
             &mut stream,
             cfg(dest.as_ref(), &cols, FormatType::Parquet, 2),
         )
-        .unwrap();
+        .unwrap()[0];
         assert_eq!(
             manifest.part_count, 1,
             "the 5-row transaction must not split at rollover=2"
@@ -569,7 +992,7 @@ mod tests {
             acked: Vec::new(),
         };
         run_to_files(&mut stream, cfg(dest.as_ref(), &cols, FormatType::Csv, 10)).unwrap();
-        let csv = std::fs::read_to_string(dir.path().join("cdc-000000.csv")).unwrap();
+        let csv = std::fs::read_to_string(dir.path().join("cdc-r-000000.csv")).unwrap();
         assert!(csv.contains("delete"), "row marked __op=delete:\n{csv}");
         assert!(
             csv.lines().any(|l| l.contains("delete") && l.contains('7')),
@@ -587,9 +1010,9 @@ mod tests {
             acked: Vec::new(),
         };
         let manifest =
-            run_to_files(&mut stream, cfg(dest.as_ref(), &cols, FormatType::Csv, 10)).unwrap();
+            &run_to_files(&mut stream, cfg(dest.as_ref(), &cols, FormatType::Csv, 10)).unwrap()[0];
         assert_eq!(manifest.row_count, 2);
-        let csv = std::fs::read_to_string(dir.path().join("cdc-000000.csv")).unwrap();
+        let csv = std::fs::read_to_string(dir.path().join("cdc-r-000000.csv")).unwrap();
         let lines: Vec<&str> = csv.lines().collect();
         assert_eq!(lines.len(), 3, "header + 2 data rows:\n{csv}");
         assert!(
@@ -611,11 +1034,11 @@ mod tests {
             events: VecDeque::new(),
             acked: Vec::new(),
         };
-        let manifest = run_to_files(
+        let manifest = &run_to_files(
             &mut stream,
             cfg(dest.as_ref(), &cols, FormatType::Parquet, 10),
         )
-        .unwrap();
+        .unwrap()[0];
         assert_eq!(manifest.row_count, 0);
         assert_eq!(manifest.part_count, 0);
         assert!(
@@ -640,12 +1063,172 @@ mod tests {
             events: VecDeque::from(vec![ev(1, "t"), ev(2, "other"), ev(3, "t")]),
             acked: Vec::new(),
         };
-        let mut c = cfg(dest.as_ref(), &cols, FormatType::Parquet, 10);
-        c.tables = vec!["t".into()];
-        let manifest = run_to_files(&mut stream, c).unwrap();
+        // cfg() wires an output for table "t" only — routing IS the filter.
+        let c = cfg(dest.as_ref(), &cols, FormatType::Parquet, 10);
+        let manifest = &run_to_files(&mut stream, c).unwrap()[0];
         assert_eq!(
             manifest.row_count, 2,
             "only the two 't' changes are kept; 'other' is filtered out"
+        );
+    }
+
+    // ── Multi-table stream (slot multiplexing) invariants ─────────────────────
+
+    fn ev_for(id: i64, table: &str, committed: bool) -> ChangeEvent {
+        ChangeEvent {
+            table: table.into(),
+            committed,
+            ..insert(id)
+        }
+    }
+
+    fn two_outputs<'a>(
+        dest_a: &'a dyn crate::destination::Destination,
+        dest_b: &'a dyn crate::destination::Destination,
+        cols: &[TypeMapping],
+        format: FormatType,
+        rollover: usize,
+    ) -> SinkConfig<'a> {
+        SinkConfig {
+            outputs: vec![
+                TableOutput {
+                    table: "a".into(),
+                    columns: cols.to_vec(),
+                    dest: dest_a,
+                    dest_uri: "a".into(),
+                },
+                TableOutput {
+                    table: "b".into(),
+                    columns: cols.to_vec(),
+                    dest: dest_b,
+                    dest_uri: "b".into(),
+                },
+            ],
+            engine: crate::source::cdc::CdcEngine::Mysql,
+            format,
+            checkpoint: None,
+            max_events: None,
+            rollover,
+            rollover_memory_bytes: None,
+            started_at: "2026-06-23T00:00:00Z".into(),
+            run_id: "r".into(),
+        }
+    }
+
+    #[test]
+    fn multi_table_stream_routes_to_per_table_outputs_with_own_manifests() {
+        // Two tables through ONE stream: each table's changes land in its own
+        // destination with its own manifest + _SUCCESS — the point of slot
+        // multiplexing (N tables ≠ N slots).
+        let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (dest_a, dest_b) = (local_dest(&da), local_dest(&db));
+        let cols = int_col();
+        let mut stream = FakeStream {
+            events: VecDeque::from(vec![
+                ev_for(1, "a", true),
+                ev_for(2, "b", true),
+                ev_for(3, "a", true),
+            ]),
+            acked: Vec::new(),
+        };
+        let manifests = run_to_files(
+            &mut stream,
+            two_outputs(
+                dest_a.as_ref(),
+                dest_b.as_ref(),
+                &cols,
+                FormatType::Csv,
+                100,
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(manifests.len(), 2, "one manifest per table");
+        assert_eq!(manifests[0].export_name, "a");
+        assert_eq!(manifests[0].row_count, 2);
+        assert_eq!(manifests[1].export_name, "b");
+        assert_eq!(manifests[1].row_count, 1);
+        assert!(da.path().join("_SUCCESS").exists());
+        assert!(db.path().join("_SUCCESS").exists());
+        assert_eq!(
+            stream.acked.len(),
+            1,
+            "one final roll ⇒ one ack for the whole stream"
+        );
+    }
+
+    #[test]
+    fn multi_table_roll_flushes_every_table_before_the_single_ack() {
+        // The multiplexing safety invariant: the stream position is global, so a
+        // roll must flush BOTH tables' buffers before the one ack — acking after
+        // flushing only one table would advance past the other's buffered rows.
+        // rollover=3 ⇒ the roll fires at event 3 (committed) while table 'b'
+        // still has its row in the buffer; that row must be durable at ack time.
+        let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (dest_a, dest_b) = (local_dest(&da), local_dest(&db));
+        let cols = int_col();
+        let mut stream = FakeStream {
+            events: VecDeque::from(vec![
+                ev_for(1, "a", false),
+                ev_for(2, "b", false),
+                ev_for(3, "a", true), // the commit that triggers the roll
+            ]),
+            acked: Vec::new(),
+        };
+        let manifests = run_to_files(
+            &mut stream,
+            two_outputs(dest_a.as_ref(), dest_b.as_ref(), &cols, FormatType::Csv, 3),
+        )
+        .unwrap();
+
+        assert_eq!(manifests[0].row_count, 2, "table a: both rows in its part");
+        assert_eq!(
+            manifests[1].row_count, 1,
+            "table b: flushed at the same roll"
+        );
+        assert_eq!(stream.acked.len(), 1, "exactly one ack for the roll");
+        // The ack is at the COMMIT event's position (event 3).
+        assert_eq!(
+            stream.acked[0].0.get("lsn").and_then(|v| v.as_str()),
+            Some(format!("{:08X}", 3).as_str()),
+            "acked at the commit boundary"
+        );
+    }
+
+    #[test]
+    fn multi_table_trailing_uncommitted_tail_is_flushed_but_not_acked_past() {
+        // A committed tx, then a trailing HALF-transaction when the bounded drain
+        // ends: the tail is flushed (durable, deduped downstream on re-read) but
+        // the ack stays at the last commit boundary — never past it.
+        let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (dest_a, dest_b) = (local_dest(&da), local_dest(&db));
+        let cols = int_col();
+        let mut stream = FakeStream {
+            events: VecDeque::from(vec![
+                ev_for(1, "a", true),  // committed
+                ev_for(2, "b", false), // trailing, tx never commits before EOF
+            ]),
+            acked: Vec::new(),
+        };
+        let manifests = run_to_files(
+            &mut stream,
+            two_outputs(
+                dest_a.as_ref(),
+                dest_b.as_ref(),
+                &cols,
+                FormatType::Csv,
+                100,
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(manifests[0].row_count, 1);
+        assert_eq!(manifests[1].row_count, 1, "the tail is still made durable");
+        assert_eq!(stream.acked.len(), 1);
+        assert_eq!(
+            stream.acked[0].0.get("lsn").and_then(|v| v.as_str()),
+            Some(format!("{:08X}", 1).as_str()),
+            "ack stays at the last commit boundary, not the uncommitted tail"
         );
     }
 

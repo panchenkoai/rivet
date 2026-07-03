@@ -87,6 +87,14 @@ pub(crate) struct ChangeEvent {
     /// it at the XID/commit marker; the poll-based PG / SQL Server adapters only
     /// ever read already-committed data, so every change is a commit boundary.
     pub(crate) committed: bool,
+    /// Column NAMES of this event's image, when the engine carries them
+    /// (PostgreSQL wire text names every column; SQL Server change-table rows
+    /// are name-addressable). With names present the sink maps the image BY
+    /// NAME into the resolved schema — the positional-mapping corruption
+    /// class (findings #37/#41/#42: mid-window DDL shifts, non-first PK
+    /// deletes) is unrepresentable. `None` ⇒ positional full row (MySQL
+    /// binlog carries no names; its arity guard stays load-bearing).
+    pub(crate) image_names: Option<std::sync::Arc<[String]>>,
 }
 
 impl ChangeEvent {
@@ -139,7 +147,20 @@ pub(crate) fn run(
     let mut emitted = 0usize;
     while let Some(ev) = stream.next_change() {
         let ev = ev?;
-        if !tables.is_empty() && !tables.iter().any(|t| t == &ev.table) {
+        // Checkpoint at every commit boundary BEFORE the table filter — the
+        // resume position is a stream property; a transaction whose last
+        // event lands on an unlisted table must still advance it (mirrors
+        // the file sink).
+        if ev.committed
+            && let Some(p) = &checkpoint
+        {
+            ev.position.save(p)?;
+        }
+        if !tables.is_empty()
+            && !tables
+                .iter()
+                .any(|t| sink::table_matches(t, &ev.schema, &ev.table))
+        {
             continue;
         }
         let to_json = |img: &Option<Vec<RivetValue>>| {
@@ -155,13 +176,6 @@ pub(crate) fn run(
             "pos": ev.position.0,
         });
         println!("{line}");
-        // Checkpoint only at a transaction boundary — resuming mid-transaction
-        // would replay a partial transaction downstream.
-        if ev.committed
-            && let Some(p) = &checkpoint
-        {
-            ev.position.save(p)?;
-        }
         emitted += 1;
         if max_events.is_some_and(|m| emitted >= m) {
             break;
@@ -192,20 +206,102 @@ pub(crate) struct CdcConfig {
     pub tls: Option<crate::config::TlsConfig>,
 }
 
-/// The engine label for a CDC source URL's scheme — the one place scheme→engine
-/// lives, shared by the metric/run record and any caller needing the name (the
-/// stream/source constructors still branch because they build different types).
-pub(crate) fn engine_label(url: &str) -> Result<&'static str> {
-    if url.starts_with("mysql://") {
-        Ok("mysql")
-    } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-        Ok("postgres")
-    } else if url.starts_with("sqlserver://") || url.starts_with("mssql://") {
-        Ok("mssql")
-    } else {
-        anyhow::bail!(
-            "rivet cdc: unsupported source url — expected mysql:// / postgresql:// / sqlserver://"
-        )
+/// The CDC engine, resolved ONCE from the source URL's scheme. Every
+/// downstream dispatch matches on this enum — never on the URL string — so
+/// adding engine #4 is one variant plus compiler-led match arms, and a
+/// mistyped scheme fails in exactly one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CdcEngine {
+    Mysql,
+    Postgres,
+    Mssql,
+}
+
+impl CdcEngine {
+    pub(crate) fn from_url(url: &str) -> Result<Self> {
+        if url.starts_with("mysql://") {
+            Ok(Self::Mysql)
+        } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+            Ok(Self::Postgres)
+        } else if url.starts_with("sqlserver://") || url.starts_with("mssql://") {
+            Ok(Self::Mssql)
+        } else {
+            anyhow::bail!(
+                "rivet cdc: unsupported source url — expected mysql:// / postgresql:// / sqlserver://"
+            )
+        }
+    }
+
+    /// Stable lowercase label for metrics / run records / hints.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Mysql => "mysql",
+            Self::Postgres => "postgres",
+            Self::Mssql => "mssql",
+        }
+    }
+
+    /// Ensure the resume anchor EXISTS — `initial: snapshot` step ① and the
+    /// single entry point for anchor creation (idempotent: a present anchor is
+    /// never moved). The per-engine anchor models (see CLAUDE.md):
+    /// PG pins server-side at slot creation; MySQL has NO server-side anchor —
+    /// the checkpoint is pinned at first open; MSSQL floors at
+    /// `fn_cdc_get_min_lsn` without one (over-reads, never skips).
+    /// `resume_expected` = prior-run evidence exists — a missing server-side
+    /// anchor then fails LOUDLY instead of silently re-anchoring at "current".
+    pub(crate) fn ensure_anchor(
+        self,
+        url: &str,
+        slot: &str,
+        checkpoint: Option<&std::path::Path>,
+        tls: Option<&crate::config::TlsConfig>,
+        resume_expected: bool,
+    ) -> Result<()> {
+        match self {
+            Self::Postgres => {
+                // Slot creation IS the anchor; open() creates it only on a
+                // genuine FIRST run (resume_expected=false).
+                drop(crate::source::postgres::cdc::PgChangeStream::open(
+                    url,
+                    slot,
+                    resume_expected,
+                    tls,
+                )?);
+                Ok(())
+            }
+            Self::Mysql | Self::Mssql => {
+                let ckpt = checkpoint.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{} cdc: an anchor needs cdc.checkpoint (no server-side anchor exists)",
+                        self.label()
+                    )
+                })?;
+                if Position::load(ckpt)?.is_some() {
+                    return Ok(()); // anchored already — never move it
+                }
+                if resume_expected {
+                    // Prior-run evidence (a completed snapshot marker) with a
+                    // MISSING checkpoint: pinning "current" would silently skip
+                    // everything since the loss — and on MSSQL would actively
+                    // destroy the min-LSN over-read floor. Fail loudly.
+                    anyhow::bail!(
+                        "{} cdc: checkpoint '{}' is missing but prior-run evidence exists — \
+                         re-snapshot (delete the snapshot/_SUCCESS markers) to accept a new \
+                         anchor, or restore the checkpoint file",
+                        self.label(),
+                        ckpt.display()
+                    );
+                }
+                match self {
+                    Self::Mysql => {
+                        crate::source::mysql::cdc::MysqlChangeStream::pin_checkpoint_at_current(
+                            url, ckpt, tls,
+                        )
+                    }
+                    _ => crate::source::mssql::cdc::pin_checkpoint_at_max_lsn(url, ckpt, tls),
+                }
+            }
+        }
     }
 }
 
@@ -223,8 +319,8 @@ pub(crate) fn create_change_stream(cfg: &CdcConfig) -> Result<Box<dyn ChangeStre
     use anyhow::Context;
     let url = cfg.url.as_str();
     let tls = cfg.tls.as_ref();
-    if url.starts_with("mysql://") {
-        Ok(Box::new(
+    match CdcEngine::from_url(url)? {
+        CdcEngine::Mysql => Ok(Box::new(
             crate::source::mysql::cdc::MysqlChangeStream::open_or_resume(
                 url,
                 cfg.server_id,
@@ -233,54 +329,137 @@ pub(crate) fn create_change_stream(cfg: &CdcConfig) -> Result<Box<dyn ChangeStre
                 tls,
             )
             .context(MYSQL_CDC_HINT)?,
-        ))
-    } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-        Ok(Box::new(
-            crate::source::postgres::cdc::PgChangeStream::open(url, &cfg.slot, tls)
+        )),
+        CdcEngine::Postgres => {
+            // A persisted checkpoint proves a prior run happened — if the slot is
+            // then MISSING, it was dropped/invalidated and silently recreating it
+            // at the current position would skip everything since (a silent gap).
+            let resume_expected = cfg
+                .checkpoint
+                .as_deref()
+                .and_then(|p| Position::load(p).ok().flatten())
+                .is_some();
+            Ok(Box::new(
+                crate::source::postgres::cdc::PgChangeStream::open(
+                    url,
+                    &cfg.slot,
+                    resume_expected,
+                    tls,
+                )
                 .context(PG_CDC_HINT)?,
-        ))
-    } else if url.starts_with("sqlserver://") || url.starts_with("mssql://") {
-        let ci = cfg.capture_instance.as_deref().ok_or_else(|| {
-            anyhow::anyhow!("sqlserver cdc requires --capture-instance (e.g. dbo_orders)")
-        })?;
-        // Resume from the checkpoint's LSN if one was persisted (SQL Server has no
-        // server-side cursor — the from-LSN is what makes it at-least-once instead
-        // of re-reading the whole change table each run).
-        let from_lsn = cfg
-            .checkpoint
-            .as_deref()
-            .and_then(|p| Position::load(p).ok().flatten())
-            .and_then(|pos| {
-                pos.0
-                    .get("lsn")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-            });
-        Ok(Box::new(
-            crate::source::mssql::cdc::MssqlChangeStream::from_url(url, ci, from_lsn, tls)
-                .context(MSSQL_CDC_HINT)?,
-        ))
-    } else {
-        anyhow::bail!(
-            "rivet cdc: unsupported source url — expected mysql:// / postgresql:// / sqlserver://"
-        )
+            ))
+        }
+        CdcEngine::Mssql => {
+            let ci = cfg.capture_instance.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("sqlserver cdc requires --capture-instance (e.g. dbo_orders)")
+            })?;
+            // Resume from the checkpoint's LSN if one was persisted (SQL Server has no
+            // server-side cursor — the from-LSN is what makes it at-least-once instead
+            // of re-reading the whole change table each run).
+            let from_lsn = cfg
+                .checkpoint
+                .as_deref()
+                .and_then(|p| Position::load(p).ok().flatten())
+                .and_then(|pos| {
+                    pos.0
+                        .get("lsn")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                });
+            Ok(Box::new(
+                crate::source::mssql::cdc::MssqlChangeStream::from_url(url, ci, from_lsn, tls)
+                    .context(MSSQL_CDC_HINT)?,
+            ))
+        }
     }
 }
 
-/// Resolve a CDC table's column type mappings from the source — the **same**
+/// Resolve CDC tables' column type mappings from the source — the **same**
 /// `RivetType` → Arrow pipeline the batch export uses — so the typed file sink
 /// writes identical columns (logical types `json`/`uuid`/…, real int widths, …)
-/// via [`crate::types::build_arrow_field`]. `tls` is threaded through the same
-/// gate as the streaming connection.
+/// via [`crate::types::build_arrow_field`]. Session-based: ONE source
+/// connection (plus, for MySQL, one enrichment connection) serves every table
+/// of a multi-table export — the per-table constructor cost was 2 connections
+/// per table per run.
+pub(crate) struct CdcSchemaResolver {
+    src: Box<dyn crate::source::Source>,
+    /// MySQL-only: one connection for the `information_schema.COLUMN_TYPE`
+    /// enrichment (wire metadata has no widths/labels for BIT/BINARY/ENUM/SET).
+    enrich: Option<mysql::PooledConn>,
+}
+
+impl CdcSchemaResolver {
+    pub(crate) fn connect(url: &str, tls: Option<&crate::config::TlsConfig>) -> Result<Self> {
+        let engine = CdcEngine::from_url(url)?;
+        let src: Box<dyn crate::source::Source> = match engine {
+            CdcEngine::Mysql => Box::new(crate::source::mysql::MysqlSource::connect_with_tls(
+                url, tls,
+            )?),
+            CdcEngine::Postgres => Box::new(
+                crate::source::postgres::PostgresSource::connect_with_tls(url, tls)?,
+            ),
+            CdcEngine::Mssql => Box::new(crate::source::mssql::MssqlSource::connect_with_tls(
+                url, tls,
+            )?),
+        };
+        let enrich = match engine {
+            CdcEngine::Mysql => Some(crate::source::mysql::connect_pool(url, tls)?.get_conn()?),
+            _ => None,
+        };
+        Ok(Self { src, enrich })
+    }
+
+    /// One table's mappings. `overrides` are the export's `columns:`
+    /// declarations for THIS table (already narrowed by
+    /// `types::overrides_for_table`) — the same override surface batch honours.
+    pub(crate) fn resolve(
+        &mut self,
+        table: &str,
+        overrides: &crate::types::ColumnOverrides,
+    ) -> Result<Vec<crate::types::TypeMapping>> {
+        validate_table_ident(table)?;
+        let mut mappings = self
+            .src
+            .type_mappings(&format!("SELECT * FROM {table}"), overrides)?;
+        // MySQL: enrich `source_native_type` with the full
+        // `information_schema.COLUMN_TYPE` ("bit(8)", "binary(4)",
+        // "enum('a','b','c')") — the binlog cell fixes need widths + labels the
+        // wire metadata lacks. CDC-only; batch's contract-pinned native names
+        // stay untouched.
+        if let Some(conn) = self.enrich.as_mut() {
+            use mysql::prelude::Queryable;
+            let bare = table.rsplit('.').next().unwrap_or(table);
+            let full: Vec<(String, String)> = conn.exec(
+                "SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.COLUMNS \
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
+                (bare,),
+            )?;
+            for m in &mut mappings {
+                if let Some((_, ct)) = full.iter().find(|(n, _)| *n == m.column_name) {
+                    m.source_native_type = ct.clone();
+                }
+            }
+        }
+        Ok(mappings)
+    }
+}
+
+/// Single-table convenience over [`CdcSchemaResolver`] (CLI path + tests).
 pub(crate) fn resolve_cdc_columns(
     url: &str,
     table: &str,
     tls: Option<&crate::config::TlsConfig>,
+    overrides: &crate::types::ColumnOverrides,
 ) -> Result<Vec<crate::types::TypeMapping>> {
-    use crate::source::Source;
-    // The table name is interpolated into `SELECT * FROM {table}` for the schema
-    // probe, so validate it to a plain `[schema.]table` identifier — no quote,
-    // paren, semicolon, or space can break out (mirrors the capture-instance check).
+    // Validate BEFORE connecting, so a hostile table name needs no database.
+    validate_table_ident(table)?;
+    CdcSchemaResolver::connect(url, tls)?.resolve(table, overrides)
+}
+
+/// The table name is interpolated into `SELECT * FROM {table}` for the schema
+/// probe — refuse anything but a plain `[schema.]table` identifier (no quote,
+/// paren, semicolon, or space can break out).
+fn validate_table_ident(table: &str) -> Result<()> {
     if table.is_empty()
         || !table
             .chars()
@@ -291,34 +470,29 @@ pub(crate) fn resolve_cdc_columns(
              refusing to interpolate it into SQL"
         );
     }
-    let mut src: Box<dyn Source> = if url.starts_with("mysql://") {
-        Box::new(crate::source::mysql::MysqlSource::connect_with_tls(
-            url, tls,
-        )?)
-    } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-        Box::new(crate::source::postgres::PostgresSource::connect_with_tls(
-            url, tls,
-        )?)
-    } else {
-        Box::new(crate::source::mssql::MssqlSource::connect_with_tls(
-            url, tls,
-        )?)
-    };
-    src.type_mappings(
-        &format!("SELECT * FROM {table}"),
-        &crate::types::ColumnOverrides::new(),
-    )
+    Ok(())
+}
+
+/// One table's destination wiring for a capture — see [`CdcCapture::outputs`].
+pub(crate) struct CaptureOutput<'a> {
+    pub table: String,
+    pub dest: &'a dyn crate::destination::Destination,
+    pub dest_uri: String,
+    /// The export's `columns:` type overrides for THIS table — already
+    /// narrowed by `types::overrides_for_table` (bare keys apply everywhere;
+    /// `"table.column"` keys target one table and win over bare).
+    pub overrides: crate::types::ColumnOverrides,
 }
 
 /// Everything needed to capture a change stream to typed files, assembled once —
 /// the source/output differ between the `rivet cdc` CLI and a `mode: cdc` run, but
-/// the capture itself (open the stream, resolve the schema, drive the file sink)
+/// the capture itself (open the stream, resolve the schemas, drive the file sink)
 /// is identical. Both entry points fill this in and call [`run_capture`].
+/// `outputs` carries one entry per captured table: several tables ride ONE stream
+/// (one slot / one binlog connection) and one checkpoint.
 pub(crate) struct CdcCapture<'a> {
     pub cdc_cfg: CdcConfig,
-    pub table: String,
-    pub dest: &'a dyn crate::destination::Destination,
-    pub dest_uri: String,
+    pub outputs: Vec<CaptureOutput<'a>>,
     pub format: crate::config::FormatType,
     pub max_events: Option<usize>,
     pub rollover: usize,
@@ -328,24 +502,36 @@ pub(crate) struct CdcCapture<'a> {
     pub started_at: String,
 }
 
-/// Open the change stream (with the engine's permission/TLS gate), resolve the
+/// Open the change stream (with the engine's permission/TLS gate), resolve each
 /// table's typed schema, and drive the commit-seam file sink — the single place
-/// the typed CDC capture is assembled. Returns the run's `RunManifest`.
-pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<crate::manifest::RunManifest> {
+/// the typed CDC capture is assembled. Returns one `RunManifest` per output, in
+/// `outputs` order.
+pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<Vec<crate::manifest::RunManifest>> {
     let url = cap.cdc_cfg.url.clone();
     let tls = cap.cdc_cfg.tls.clone();
     let checkpoint = cap.cdc_cfg.checkpoint.clone();
     let mut stream = create_change_stream(&cap.cdc_cfg)?;
-    let columns = resolve_cdc_columns(&url, &cap.table, tls.as_ref())?;
-    let engine = engine_label(&url)?;
+    // Fault point: stream (and any server-side anchor) opened, nothing read.
+    crate::test_hook::maybe_panic_at("cdc_after_open");
+    let engine = CdcEngine::from_url(&url)?;
+    let mut outputs = Vec::with_capacity(cap.outputs.len());
+    // ONE resolver session serves every table (was: 2 fresh connections per
+    // table per run — the multi-table per-cycle cost the roast flagged).
+    crate::test_hook::maybe_panic_at("cdc_before_resolve");
+    let mut resolver = CdcSchemaResolver::connect(&url, tls.as_ref())?;
+    for o in cap.outputs {
+        let columns = resolver.resolve(&o.table, &o.overrides)?;
+        outputs.push(sink::TableOutput {
+            table: o.table,
+            columns,
+            dest: o.dest,
+            dest_uri: o.dest_uri,
+        });
+    }
     let sink_cfg = sink::SinkConfig {
-        columns: &columns,
-        dest: cap.dest,
-        dest_uri: cap.dest_uri,
+        outputs,
         engine,
-        table: &cap.table,
         format: cap.format,
-        tables: vec![cap.table.clone()],
         checkpoint,
         max_events: cap.max_events,
         rollover: cap.rollover,
@@ -360,14 +546,46 @@ pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<crate::manifest::RunMan
 mod tests {
     use super::*;
 
+    // Ultrareview bug_001: the loud-fail-on-missing-anchor promise held only
+    // for PostgreSQL. On MySQL/MSSQL a deleted checkpoint with prior-run
+    // evidence behind it silently re-pinned at "current" (and on MSSQL that
+    // pin actively destroys the min-LSN over-read floor). The bail must fire
+    // BEFORE any connection — so this needs no live database.
+    #[test]
+    fn ensure_anchor_missing_checkpoint_with_evidence_fails_loudly() {
+        let d = tempfile::tempdir().unwrap();
+        let missing = d.path().join("nonexistent.ckpt");
+        for engine in [CdcEngine::Mysql, CdcEngine::Mssql] {
+            let err = engine
+                .ensure_anchor(
+                    "mysql://u:p@127.0.0.1:1/db",
+                    "unused",
+                    Some(&missing),
+                    None,
+                    true, // resume evidence exists
+                )
+                .expect_err("missing checkpoint + evidence must bail, not re-pin");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("prior-run evidence"),
+                "{engine:?}: must explain the evidence: {msg}"
+            );
+        }
+    }
+
     #[test]
     fn resolve_cdc_columns_rejects_a_non_identifier_table() {
         // The table is interpolated into `SELECT * FROM {table}` for the schema
         // probe — a name carrying a quote / paren / semicolon / space must be
         // refused *before* any connection, so this needs no live database.
         for bad in ["orders; DROP TABLE x", "orders WHERE 1=1", "a b", "o'r", ""] {
-            let err = resolve_cdc_columns("mysql://u:p@127.0.0.1:3306/db", bad, None)
-                .expect_err(&format!("{bad:?} must be rejected"));
+            let err = resolve_cdc_columns(
+                "mysql://u:p@127.0.0.1:3306/db",
+                bad,
+                None,
+                &crate::types::ColumnOverrides::new(),
+            )
+            .expect_err(&format!("{bad:?} must be rejected"));
             assert!(
                 err.to_string().contains("plain [schema.]table identifier"),
                 "{bad:?} → {err}"

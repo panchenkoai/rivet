@@ -173,3 +173,58 @@ Task IDs in tables above are historical QA labels. **Trust & reproducibility**
 [`tests/live_type_golden.rs`](../../tests/live_type_golden.rs) and is described
 above. Strategic tracking: [`rivet_roadmap.md`](../../rivet_roadmap.md) §Phase 1
 (Epic 14 / execution status).
+
+## CDC conformance gate
+
+`tests/cdc_conformance_gate.rs` runs in plain `cargo test` and enforces two
+hard rules over the live CDC suite's SOURCES:
+
+1. **Every engine × every conformance case** (resume, idle-first-run,
+   crash-before-ack, full type matrix, update/delete, initial snapshot,
+   vanished anchor, mixed-transaction boundary, schema-qualified routing,
+   non-UTC session, …) must have a live test — or an explicit `NA("reason")`
+   in the matrix. A new engine cannot merge with a coverage hole; a new case
+   must decide for all engines. Motivation: per-engine coverage drifts
+   silently, and each engine's missing case is exactly where a real bug lived
+   (mixed-transaction existed only for MySQL, qualified-name only for
+   PostgreSQL — ultrareview found the two matching bugs).
+2. **Every live CDC test that runs a capture must read back an outcome**
+   (manifest rows, a batch comparison, a destination listing, the state DB) —
+   a bare exit-0 assertion would wave a 0-row silent success through, which
+   is how three of the campaign's worst bugs hid.
+
+## Mutation testing (nightly)
+
+`mutants-cdc` in `nightly-live.yml` runs `cargo-mutants` over the CDC value /
+sink / parser / checksum / decimal modules against the offline suite. A
+surviving mutant is a named test blind spot — the meta-gate that finds holes
+in the gates above.
+
+## Config-key composition gate (per PR)
+
+`config-key-composition` in `ci.yml` diffs `schemas/rivet.schema.json` against
+the PR base: a NEW config key must be named by at least one test. The
+campaign's worst bugs lived at the intersection of two individually-correct
+knobs (`initial` × vanished-slot, `initial` × `skip_empty`) — a new knob
+enters review with its interaction tests or not at all.
+
+## CDC gremlins (real faults)
+
+`tests/live/gremlin_cdc.rs` (+ the capture-job stall in `live_cdc_mssql.rs`)
+injects REAL fault classes — SIGKILL, a TCP cut mid-binlog-stream, a hard
+destination outage, a failed checkpoint write, a stalled capture job — and
+asserts the at-least-once contract from the outside: the failure is loud, and
+after healing the union of all parts holds every source row (overlap fine,
+gap never). Panic-hook tests cannot cover these: a panic unwinds and runs
+`Drop` guards; none of the above do. Requires toxiproxy + fake-gcs from the
+compose stack; each case is a row in the conformance matrix.
+
+### Known-equivalent mutants (decimal canon)
+
+The six surviving mutants in `src/types/decimal.rs` are all `<` → `<=` on
+branch guards where BOTH branches compute identical values at the boundary
+(e.g. `scale < 0` vs `scale <= 0`: at scale 0 the negative-scale arm divides
+by 10⁰ = 1 — the same result as the plain path; `frac.len() < scale` vs `<=`:
+at equality the pad loop pads zero characters). They are mathematically
+unkillable; do not write pseudo-tests for them. Everything else in the file
+is caught (92) or timeouts-as-caught (4).

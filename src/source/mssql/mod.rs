@@ -817,6 +817,81 @@ impl MssqlSource {
             row.get::<i32, _>(0).map(|v| v == 1)
         })
     }
+
+    /// One-shot CDC health probe for `rivet doctor` (see
+    /// `preflight::cdc_health`): is CDC enabled on the database, does the
+    /// capture instance exist (its min LSN), and is the Agent service running.
+    /// The Agent query needs `VIEW SERVER STATE` — a permission failure yields
+    /// `agent_running: None` (report "could not verify"), never an error.
+    pub(crate) fn cdc_health(&mut self, capture_instance: Option<&str>) -> Result<MssqlCdcProbe> {
+        let Self { rt, client, .. } = self;
+        rt.block_on(async {
+            // max LSN: NULL ⇒ sp_cdc_enable_db has not run.
+            let max: Option<String> = client
+                .query(
+                    "SELECT CONVERT(varchar(24), sys.fn_cdc_get_max_lsn(), 1)",
+                    &[],
+                )
+                .await?
+                .into_row()
+                .await?
+                .and_then(|r| r.get::<&str, _>(0).map(|s| s.to_string()));
+
+            // min LSN of the capture instance: NULL ⇒ the instance is unknown.
+            let min: Option<String> = match capture_instance {
+                None => None,
+                Some(ci) => client
+                    .query(
+                        "SELECT CONVERT(varchar(24), sys.fn_cdc_get_min_lsn(@P1), 1)",
+                        &[&ci],
+                    )
+                    .await?
+                    .into_row()
+                    .await?
+                    .and_then(|r| r.get::<&str, _>(0).map(|s| s.to_string()))
+                    // an all-zero min LSN is the same "no such instance" signal.
+                    .filter(|s| s.trim_start_matches("0x").chars().any(|c| c != '0')),
+            };
+
+            // Agent service state — permission-gated, so failures are `None`.
+            let agent: Option<bool> = async {
+                let row = client
+                    .query(
+                        "SELECT status_desc FROM sys.dm_server_services \
+                         WHERE servicename LIKE 'SQL Server Agent%'",
+                        &[],
+                    )
+                    .await
+                    .ok()?
+                    .into_row()
+                    .await
+                    .ok()??;
+                row.get::<&str, _>(0)
+                    .map(|s| s.eq_ignore_ascii_case("Running"))
+            }
+            .await;
+
+            Ok(MssqlCdcProbe {
+                cdc_enabled: max.is_some(),
+                max_lsn_hex: max.clone(),
+                instance_min_lsn: min,
+                agent_running: agent,
+            })
+        })
+    }
+}
+
+/// Result of [`MssqlSource::cdc_health`].
+pub(crate) struct MssqlCdcProbe {
+    pub cdc_enabled: bool,
+    /// The database's current max LSN (`0x…` hex) — the `initial: snapshot`
+    /// anchor position. `None` ⇔ CDC not enabled.
+    pub max_lsn_hex: Option<String>,
+    /// Hex LSN (`0x…`) of the capture instance's retained minimum; `None` ⇒
+    /// the instance does not exist (or none was configured).
+    pub instance_min_lsn: Option<String>,
+    /// `None` ⇒ could not verify (no `VIEW SERVER STATE`).
+    pub agent_running: Option<bool>,
 }
 
 /// Connect and snapshot MSSQL harm counters; see [`MssqlSource::harm_counters`].

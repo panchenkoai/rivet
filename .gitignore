@@ -102,3 +102,4 @@ pilot_bench.yaml
 # docker-compose.yaml).
 /tests/.live-tmp/
 .claude/
+mutants.out/

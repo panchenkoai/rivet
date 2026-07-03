@@ -5,13 +5,13 @@ use crate::error::Result;
 /// text path prints the same data as `[OK]/[FAIL] <name>` lines (byte-identical
 /// to before — the `println!`s are unchanged, just gated on `!json`).
 #[derive(Debug, Clone, serde::Serialize)]
-struct DoctorCheck {
-    name: String,
-    ok: bool,
+pub(super) struct DoctorCheck {
+    pub(super) name: String,
+    pub(super) ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    detail: Option<String>,
+    pub(super) detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    hint: Option<String>,
+    pub(super) hint: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -42,7 +42,14 @@ fn print_doctor_json(config_path: &str, all_ok: bool, checks: &[DoctorCheck]) {
 fn emit_check(checks: &mut Vec<DoctorCheck>, json: bool, check: DoctorCheck) {
     if !json {
         if check.ok {
-            println!("[OK]  {}", check.name);
+            // Every pre-existing OK check carries `detail: None`, so this line is
+            // byte-identical for them; the CDC health checks put their value in
+            // the detail (retained WAL, backlog, abandoned-slot names) and print
+            // it inline.
+            match &check.detail {
+                Some(d) => println!("[OK]  {} — {}", check.name, d),
+                None => println!("[OK]  {}", check.name),
+            }
         } else {
             println!(
                 "[FAIL] {}: {}",
@@ -212,6 +219,16 @@ pub fn doctor(config_path: &str, json: bool) -> Result<()> {
                 );
             }
         }
+    }
+
+    // CDC health — only when the config has `mode: cdc` exports. Automates the
+    // slot / binlog-retention / capture-job monitoring the CDC reference asks
+    // operators to do by hand.
+    for c in super::cdc_health::collect(&config) {
+        if !c.ok {
+            all_ok = false;
+        }
+        emit_check(&mut checks, json, c);
     }
 
     if json {
@@ -386,7 +403,7 @@ fn remove_destination_probe(dest: &crate::config::DestinationConfig, probe_key: 
 /// marker, collapse any embedded newlines, and cap the length as a backstop.
 /// Categorisation still runs on the full `{:#}` chain elsewhere — this only
 /// shapes what is *printed*, never what is matched.
-fn trim_probe_error(err: &anyhow::Error) -> String {
+pub(super) fn trim_probe_error(err: &anyhow::Error) -> String {
     // Use the full `{:#}` cause chain, not the top-level Display: Postgres
     // surfaces a wrong password as the bare wrapper `db error` and buries
     // `password authentication failed for user …` in `.source()`. The alternate

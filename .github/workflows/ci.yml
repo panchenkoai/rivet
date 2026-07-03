@@ -26,6 +26,37 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 1
 
 jobs:
+  # Composition gate: a NEW config key is a new feature surface — the 2026-07
+  # campaign's worst bugs (initial×vanished-slot, initial×skip_empty) lived at
+  # the INTERSECTION of two individually-correct knobs. A PR that adds a key
+  # to the JSON schema must also add/extend a test that names that key.
+  config-key-composition:
+    name: New config keys carry tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: New schema keys must appear in tests
+        run: |
+          git fetch origin ${{ github.base_ref }} --depth=1
+          # Only PROPERTY names (keys directly under a "properties" object) —
+          # definition/type names (e.g. CdcInitialMode) are not user-facing
+          # config keys and false-positived on the gate's own first run.
+          KEYS='[paths | select(length>=2 and .[-2]=="properties") | .[-1] | select(type=="string")] | unique | .[]'
+          NEW_KEYS=$(diff \
+            <(git show origin/${{ github.base_ref }}:schemas/rivet.schema.json | jq -r "$KEYS" 2>/dev/null || true) \
+            <(jq -r "$KEYS" schemas/rivet.schema.json) \
+            | grep '^>' | awk '{print $2}' || true)
+          FAIL=0
+          for key in $NEW_KEYS; do
+            if ! git grep -q -- "$key" -- tests/ src/config/tests/; then
+              echo "::error::new config key '$key' has no test naming it — add a test covering the key AND its interaction with at least one crash/empty/second-run case"
+              FAIL=1
+            fi
+          done
+          [ "$FAIL" = "0" ]
+
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
@@ -304,7 +335,14 @@ jobs:
         # profile and is required by the new MySQL `mysql_proxysql_*` tests in
         # tests/live_pool_safety.rs (added in 0.6.0); without it
         # `require_alive(LiveService::ProxySql)` panics before the test runs.
-        run: docker compose --profile pool --profile cdc --profile replica up -d postgres mysql mssql minio fake-gcs azurite toxiproxy pgbouncer proxysql postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica
+        run: |
+          # Same bind-mount dance as the round-trip job: pre-create the shared
+          # dir runner-owned (the daemon would root-own a missing mount source)…
+          mkdir -p tests/.live-tmp
+          docker compose --profile pool --profile cdc --profile replica up -d postgres mysql mssql minio fake-gcs azurite toxiproxy pgbouncer proxysql postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica duckdb clickhouse
+          # …then re-open it after ClickHouse chowns /work to uid 101 on boot,
+          # which propagates to the host on Linux and EACCESes the test writer.
+          sudo chmod -R 0777 tests/.live-tmp
 
       - name: Wait for services
         run: |

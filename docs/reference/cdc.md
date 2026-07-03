@@ -29,7 +29,7 @@ dev — the URL is otherwise visible in `ps` / shell history.
 | flag | meaning |
 | ------ | --------- |
 | `--server-id` | replica id for the binlog connection (MySQL). **Must be unique** — distinct from the source and every real replica. Default `4271`. |
-| `--checkpoint PATH` | persist/resume the log position. Omit to tail from the current position without checkpointing. |
+| `--checkpoint PATH` | persist/resume the log position. Omit to tail from the current position without checkpointing. On the **first** checkpointed MySQL run the open position is persisted immediately (the client-side analogue of PostgreSQL's slot pinning at creation), so an idle first run still anchors the resume position — without it, changes landing between two idle scheduler cycles would be skipped. |
 | `--table NAME` | only emit this table (repeatable for NDJSON; **exactly one** required for `--output`, whose schema is resolved from the source). |
 | `--output DIR` | write typed Parquet/CSV files instead of NDJSON. |
 | `--max-events N` | stop after N changes (otherwise stream until interrupted; the per-event checkpoint makes an interrupted run resumable). |
@@ -78,7 +78,93 @@ rivet metrics                    # the CDC run appears with mode=cdc, like a bat
 ```
 
 A `mode: cdc` export reuses the export's `table`, `destination`, and `format`; the
-`cdc:` block carries only the CDC-specific knobs. Each run produces the standard
+`cdc:` block carries only the CDC-specific knobs.
+
+**`initial: snapshot` — the safe switch, enforced by construction.** On the
+first run (no anchor yet) rivet performs, in order: ① create the resume anchor
+(PostgreSQL slot / MySQL binlog checkpoint / SQL Server max-LSN checkpoint),
+② run a full batch snapshot of each table into
+`<destination>[/<table>]/snapshot/` (its own parts + `manifest.json` +
+`_SUCCESS`), ③ drain the change stream. Because the anchor predates the
+snapshot read, a change landing mid-snapshot appears in **both** the snapshot
+and the stream — an overlap the PK + `__op` dedupe absorbs, never a gap.
+Subsequent runs see the `snapshot/_SUCCESS` marker and go straight to draining;
+a run that crashes mid-snapshot re-snapshots on retry (the anchor stays put, so
+nothing is lost). Once any snapshot completed, a MISSING server-side anchor
+(a dropped PostgreSQL slot) is a loud error, never a silent re-anchor — see
+"A vanished slot" below. Load order downstream: the snapshot prefix as the base table,
+then MERGE the CDC parts. MySQL / SQL Server require `cdc.checkpoint:` with
+`initial: snapshot` (it is the anchor); PostgreSQL anchors in the slot.
+
+```yaml
+  - name: orders_cdc
+    table: orders
+    mode: cdc
+    format: parquet
+    cdc: { initial: snapshot, checkpoint: /var/lib/rivet/orders.ckpt, until_current: true }
+    destination: { type: gcs, bucket: my-bucket, prefix: cdc/orders }
+```
+
+**Multiple CDC exports: each owns its stream resources.** A PostgreSQL slot has
+ONE consumer (a shared slot is advanced past changes the other export never
+read), a MySQL `server_id` has ONE connection (the server kills the older one),
+and a checkpoint file has ONE writer. Config validation rejects two `mode: cdc`
+exports that resolve to the same slot / `server_id` / checkpoint — **including
+the defaults** (`rivet_slot`, `4271`): a multi-table CDC config must set them
+explicitly per export:
+
+```yaml
+exports:
+  - name: orders_cdc
+    table: orders
+    mode: cdc
+    cdc: { slot: rivet_orders, checkpoint: /var/lib/rivet/orders.ckpt }
+    ...
+  - name: users_cdc
+    table: users
+    mode: cdc
+    cdc: { slot: rivet_users, checkpoint: /var/lib/rivet/users.ckpt }
+    ...
+```
+
+**Or multiplex: several tables through ONE stream (`tables:`).** N single-table
+exports cost N slots — and PostgreSQL decodes the WAL once **per slot** (MySQL:
+N binlog connections). One export with `tables:` rides a single slot/connection
+and a single checkpoint, and routes each table's changes to its own sub-prefix
+(`<destination>/<table>/`, each with its own parts + `manifest.json` +
+`_SUCCESS` — exactly like N exports, minus the N−1 slots):
+
+```yaml
+exports:
+  - name: app_cdc
+    tables: [orders, users, payments]
+    mode: cdc
+    format: parquet
+    cdc: { slot: rivet_app, checkpoint: /var/lib/rivet/app.ckpt, until_current: true }
+    destination: { type: local, path: /data/cdc }   # → /data/cdc/orders/, /data/cdc/users/, …
+```
+
+The resume position is a property of the *stream*, so the at-least-once
+sequence generalises: every table's buffered part is flushed **before** the one
+checkpoint/ack advances — a crash mid-roll re-reads for all tables rather than
+losing any one of them.
+
+**`columns:` overrides on a multi-table export** support two key shapes: a bare
+column name applies to **every** captured table that has it, and a qualified
+`"table.column"` key targets one table and **wins** over the bare key there —
+so same-named columns needing different treatments never collide:
+
+```yaml
+    columns:
+      amount: "decimal(20,4)"          # every table's `amount`
+      "legacy_orders.amount": text     # …except this one
+```
+
+A qualified key naming a table the export does not capture is a **config
+error** (a typo must fail at load, never silently miss its target). `tables:` is PostgreSQL/MySQL only for now — SQL Server
+capture instances are per-table (use one export per table there; sharing a
+`capture_instance` between exports is safe, since the change-table poll is
+read-only and resume state lives in the per-export checkpoint). Each run produces the standard
 per-export summary block and an `export_metrics` row (rows / files / bytes /
 duration / status), so CDC shows up in `rivet metrics` and the run aggregate
 exactly like a batch export. **TLS:** unlike the CLI (which is loopback-only),
@@ -281,6 +367,49 @@ With a full row image, *which* columns changed is irrelevant — the latest imag
 per key (highest `__pos`) already contains every prior change, so dedup-by-key +
 overwrite is correct. This is why `binlog_row_image = FULL` matters.
 
+### Deduplicating by position, per engine
+
+`__pos` granularity differs by engine, and the dedup recipe follows from it:
+
+| engine | `__pos` | unique per event? |
+| --- | --- | --- |
+| MySQL | `{file, pos}` — the transaction's **commit** position | per *statement* under autocommit; all events of one multi-statement transaction share it |
+| PostgreSQL | `{lsn}` — the transaction's **COMMIT LSN** | all events of one transaction share it |
+| SQL Server | `{lsn}` — `__$start_lsn` | per transaction (rows within share it) |
+
+Two distinct problems:
+
+1. **At-least-once re-delivery** (a crashed run's part re-read on resume): the
+   re-delivered event is **byte-identical** — same `__op`, `__pos`, and image —
+   so `SELECT DISTINCT` over the staged rows (or dedup on `(pk, __pos, __op)`)
+   removes it exactly.
+2. **Latest-image-per-key** (the MERGE): order by `__pos`, and break the
+   within-transaction tie with **file order** — rivet writes events to parts in
+   stream order, so `(file name, row number in file)` completes the total order:
+
+```sql
+-- DuckDB replay: newest surviving image per key.
+WITH ev AS (
+  SELECT *,
+         upper(lpad(split_part(__pos->>'lsn', '/', 1), 8, '0')) ||
+         upper(lpad(split_part(__pos->>'lsn', '/', 2), 8, '0')) AS lsn_key   -- PostgreSQL X/Y → sortable
+  FROM read_parquet('…/sessions/cdc-*.parquet', filename = true, file_row_number = true)
+), latest AS (
+  SELECT * FROM (
+    SELECT *, row_number() OVER (
+      PARTITION BY id
+      ORDER BY lsn_key DESC, filename DESC, file_row_number DESC) AS rn
+    FROM ev)
+  WHERE rn = 1
+)
+SELECT * FROM latest WHERE __op <> 'delete';
+```
+
+(MySQL: order by `(file, pos)` from `__pos` instead of `lsn_key`; SQL Server:
+the fixed-width hex `lsn` string is already lexically ordered.) In a warehouse
+MERGE, apply the same window to the staged batch first, then merge the winners
+by PK + `__op`.
+
 ### Downstream loading
 
 CDC output is the **same typed Parquet** the batch export writes (same
@@ -296,6 +425,14 @@ as `String` (`JSONExtract*` parses it), **BigQuery** as `BYTES` (`PARSE_JSON` af
 `SAFE_CONVERT_BYTES_TO_STRING`); integers keep their width (`INT32`/`INT64`) and
 timestamps their microseconds. The JSON text round-trips losslessly in all three — the
 type that auto-detects differs, the data does not.
+
+**Part naming.** Parts are run-stamped — `cdc-<run_id>-000000.parquet` — so a
+scheduler re-running into the same prefix **appends** each cycle's parts alongside
+the previous cycle's (nothing is overwritten). `manifest.json` / `_SUCCESS`
+describe the **latest** run only; a glob reader over the prefix sees the union of
+all cycles, which is the intended at-least-once stream — dedupe by PK + `__op` +
+`__pos` downstream, and archive parts you have already loaded if you want the
+prefix to stay small.
 
 Without `--output`, rivet emits the same information as NDJSON (one JSON object
 per change) to stdout.
@@ -350,10 +487,66 @@ behaviour depends on whether rivet is **running**:
   which **releases** WAL and relieves the pressure) or drop the slot. If PostgreSQL
   is too degraded to answer, rivet's query fails → the run fails → re-read next run.
 
+**Memory is O(largest transaction).** The MySQL adapter buffers a whole
+transaction until its COMMIT (parts never split a transaction — the resume
+invariant). Measured: ~1.4 KB of RSS per buffered row (~14× a 100-byte
+payload): a 100k-row transaction drains at ~170 MB RSS, 300k at ~440 MB —
+linear, so a 10M-row bulk backfill in ONE transaction will not fit. Run bulk
+backfills in batched transactions, or through `mode: full`/`initial: snapshot`
+(the batch path streams). Spilling oversized transactions to disk is roadmap.
+
+**DDL inside a capture window: safe where the engine names its columns, a
+LOUD ERROR where it does not.** PostgreSQL (wire text) and SQL Server (change
+tables) always name every image column, so rivet maps values by NAME and a
+mid-window `DROP`/`ADD COLUMN` captures correctly. MySQL's binlog carries
+names only when the server runs with **`binlog_row_metadata=FULL`** (8.0.1+ —
+strongly recommended; the compose test stack sets it):
+
+```ini
+# my.cnf — makes mid-stream DDL safe for rivet CDC
+binlog_row_metadata = FULL
+```
+
+Under the **default `MINIMAL` the binlog is nameless and positional — expect
+runs to FAIL with an explicit error** ("an event … carries N column(s) but the
+resolved schema has M") whenever a DDL lands inside a capture window. That is
+deliberate: mapping by position would put values into the wrong columns
+silently, and a loud stop is the only safe behavior. Recover by
+re-snapshotting the table (or resetting the checkpoint past the DDL), and set
+`binlog_row_metadata=FULL` to retire this error class. DDL *between* runs is
+always fine — each run resolves the schema fresh. A mid-window RENAME is safe
+in both modes (same arity ⇒ positional fallback keeps the value). Same-arity
+TYPE changes remain undetectable without schema history (roadmap) — run type
+migrations and their backfills through a re-snapshot.
+
+**The value checksum runs on CDC too.** The same always-on two-ended check the
+batch export performs — an independent fold of the decoded cells vs a fold of
+the built Arrow column — runs per column before every CDC part is written; a
+mismatch fails the run naming the column, never writes the corrupted part.
+Failure behaviour is also parity: a value unrepresentable in the declared
+column (PostgreSQL `'NaN'::numeric` in a Parquet decimal) fails loudly on both
+paths, never a silent NULL.
+
+**A vanished slot is a loud error, not a silent restart.** When a resume
+checkpoint exists but the slot is gone (dropped by an operator, or invalidated
+and removed), rivet refuses to re-create it — a fresh slot would anchor at the
+*current* position and silently skip everything since the drop. The run fails
+with the re-snapshot hint; delete the checkpoint file only when you explicitly
+accept a fresh anchor.
+
 **Bound the blast radius:** set `max_slot_wal_keep_size` (PG 13+). PostgreSQL then
 **invalidates the slot** rather than fill the disk; rivet's next run fails with a
 slot-invalidated error and you re-snapshot. **Monitor** `pg_replication_slots`
 (`active`, and `restart_lsn` vs the current LSN = how much WAL the slot is holding).
+
+> **`rivet doctor` automates this monitoring.** For a config with `mode: cdc`
+> exports, doctor probes the engine: PostgreSQL — the export's slot (retained
+> WAL, fails above 1 GiB) **and any other inactive slot pinning WAL** (the
+> abandoned-slot foot-gun); MySQL — `log_bin`/`binlog_format=ROW`/
+> `binlog_row_image=FULL`, and whether the checkpoint's binlog file is still
+> retained (a purged file is reported *before* the run fails with ERROR 1236);
+> SQL Server — CDC enabled, the capture instance exists, the checkpoint is
+> within retention, and the Agent service is running.
 
 ### MySQL — the binlog was purged
 
@@ -400,3 +593,8 @@ engines. What remains:
 - **Pre-image completeness** depends on the source config: full UPDATE/DELETE
   before-images need `binlog_row_image=FULL` (MySQL) / `REPLICA IDENTITY FULL`
   (PostgreSQL); otherwise only key columns are carried.
+- **Type parity with the batch export is total**: every Rivet-mapped type —
+  including PostgreSQL arrays (real `List` columns, inner NULLs preserved) and
+  `NUMERIC`/`DECIMAL` above precision 38 (`Decimal256`) — is byte-identical to
+  the batch export, enforced per engine by the live
+  `*_full_type_matrix_matches_batch` tests (ArrayData equality).

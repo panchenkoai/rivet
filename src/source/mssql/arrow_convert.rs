@@ -361,6 +361,16 @@ fn build_array(
                         rescale_i128(n.value(), n.scale(), scale)
                             .with_context(|| format!("mssql decimal column {idx} row {r}"))?,
                     ),
+                    // MONEY / SMALLMONEY: tiberius delivers the fixed-point
+                    // 1/10000 value as F64, so the value was silently NULLed
+                    // here. Render at the column's declared scale and parse the
+                    // digits exactly — a non-finite value fails LOUDLY. (The
+                    // f64 hop itself is exact up to ~9×10^11 currency units;
+                    // fidelity: compatible.)
+                    Some(ColumnData::F64(Some(v))) => b.append_value(
+                        f64_to_scaled_i128(*v, scale)
+                            .with_context(|| format!("mssql money column {idx} row {r}"))?,
+                    ),
                     _ => b.append_null(),
                 }
             }
@@ -449,6 +459,19 @@ fn build_array(
     Ok(arr)
 }
 
+/// An f64-delivered fixed-point value (MONEY/SMALLMONEY) as the unscaled i128
+/// of a `Decimal128(_, scale)` column: render at the declared scale, then the
+/// ONE decimal-string canon (`types::decimal`) parses the digits exactly.
+/// Non-finite input is a loud error, never a silent NULL.
+fn f64_to_scaled_i128(v: f64, scale: u8) -> Result<i128> {
+    if !v.is_finite() {
+        anyhow::bail!("non-finite money value {v:?}");
+    }
+    let txt = format!("{v:.prec$}", prec = scale as usize);
+    crate::types::decimal::decimal_str_to_scaled_i128(&txt, scale as i8)
+        .ok_or_else(|| anyhow::anyhow!("money render {txt:?} did not parse"))
+}
+
 /// Rescale an unscaled decimal from `from_scale` to `to_scale` (Arrow's fixed
 /// column scale). Loses no information when `to_scale >= from_scale`; a
 /// down-scale is accepted only when the dropped digits are all zero — anything
@@ -491,6 +514,11 @@ pub(super) fn mssql_rows_to_record_batch(
     rows: &[Row],
     max_value_bytes: Option<usize>,
 ) -> Result<arrow::record_batch::RecordBatch> {
+    if let Some(first) = rows.first() {
+        let expected: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        let wire: Vec<&str> = first.columns().iter().map(|c| c.name()).collect();
+        crate::source::verify_wire_columns(&expected, &wire)?;
+    }
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
     for (idx, field) in schema.fields().iter().enumerate() {
         arrays.push(
@@ -572,6 +600,9 @@ impl crate::source::value_checksum::CellSource for MssqlCellSource<'_> {
                     .0
                     .to_i128()
             }
+            // MONEY / SMALLMONEY arrive as F64 — fold the SAME scaled value the
+            // Arrow build writes, or the checksum flags a false mismatch.
+            Some(ColumnData::F64(Some(v))) => f64_to_scaled_i128(*v, scale.max(0) as u8).ok(),
             _ => None,
         }
     }
@@ -601,6 +632,34 @@ impl crate::source::value_checksum::CellSource for MssqlCellSource<'_> {
             Some(ColumnData::String(Some(v))) => Some(Cow::Borrowed(v.as_bytes())),
             _ => None,
         }
+    }
+    fn time64_micros(&self, col: usize, row: usize) -> Option<i64> {
+        self.rows[row]
+            .try_get::<chrono::NaiveTime, _>(col)
+            .ok()
+            .flatten()
+            .map(|t| {
+                t.num_seconds_from_midnight() as i64 * 1_000_000 + t.nanosecond() as i64 / 1000
+            })
+    }
+    fn fixed_binary(&self, col: usize, row: usize) -> Option<Cow<'_, [u8]>> {
+        match cell(&self.rows[row], col) {
+            Some(ColumnData::Guid(Some(g))) => Some(Cow::Owned(g.as_bytes().to_vec())),
+            _ => None,
+        }
+    }
+    fn decimal256(&self, _col: usize, _row: usize, _scale: i8) -> Option<arrow::datatypes::i256> {
+        // SQL Server DECIMAL caps at precision 38 — Decimal256 never resolves.
+        None
+    }
+    fn list(
+        &self,
+        _col: usize,
+        _row: usize,
+        _elem: &DataType,
+    ) -> Option<Vec<crate::source::value_checksum::ListElem>> {
+        // SQL Server has no array types.
+        None
     }
 }
 

@@ -262,10 +262,23 @@ Override the Arrow type Rivet infers for a specific column. Useful when:
 
 ```yaml
 columns:
-  <column_name>: decimal(<precision>,<scale>)
+  <column_name>: <type>          # applies to every captured table with the column
+  "<table>.<column>": <type>     # applies to ONE table, wins over the bare key
 ```
 
-`decimal(p,s)` is the only supported override today. Both precision and scale are required.
+Supported override types: `decimal(p,s)` / `numeric(p,s)` (both precision and
+scale required; precision > 38 produces `Decimal256`), integer widths
+(`smallint`/`int`/`bigint`/`int16`/`int32`/`int64`), floats
+(`real`/`float4`/`double`/`float8`), `bool`, `text`/`string`/`varchar`,
+`uuid`, `json`/`jsonb`, `date`, the `timestamp*` family (naive / `tz` /
+`_ns` variants), and binary (`bytea`/`binary`/`varbinary`/`blob`).
+
+Overrides apply to **batch and CDC identically** (the same resolution
+surface). Key shapes: a bare column name applies to every captured table that
+has the column — on a multi-table CDC export that means ALL of them; a
+qualified `"table.column"` key targets one table and **wins** over the bare
+key there. A qualified key naming a table the export does not capture — or
+used on a query-shaped export — is a config error at load.
 
 Example:
 

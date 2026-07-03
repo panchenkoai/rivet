@@ -438,3 +438,315 @@ fn missing_source_field_gets_a_remediation_hint() {
         "expected a `rivet init` remediation hint, got: {msg}"
     );
 }
+
+// ── CDC resource conflicts (slot / server_id / checkpoint) ────────────────────
+//
+// RED tests for the sharpest multi-table CDC edge: the per-engine stream
+// resources are per-export, and their DEFAULTS collide. Two PostgreSQL cdc
+// exports without an explicit `slot:` both resolve to `rivet_slot` — each ack
+// advances `confirmed_flush_lsn` past changes the other never read (mutual,
+// silent data loss). Two MySQL exports both default to `server_id: 4271` — the
+// server kills the older replica connection. A shared `checkpoint:` path makes
+// the exports overwrite each other's resume position on any engine.
+
+fn cdc_pair_yaml(source: &str, cdc_a: &str, cdc_b: &str) -> String {
+    format!(
+        r#"
+source:
+  type: {source}
+  url: "{source}://localhost/test"
+exports:
+  - name: orders_cdc
+    table: orders
+    mode: cdc
+    format: parquet
+    {cdc_a}
+    destination:
+      type: local
+      path: ./out/orders
+  - name: users_cdc
+    table: users
+    mode: cdc
+    format: parquet
+    {cdc_b}
+    destination:
+      type: local
+      path: ./out/users
+"#
+    )
+}
+
+#[test]
+fn two_pg_cdc_exports_defaulting_to_the_same_slot_are_rejected() {
+    let yaml = cdc_pair_yaml("postgres", "", "");
+    let err = Config::from_yaml(&yaml).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("rivet_slot") && msg.contains("slot"),
+        "expected a same-slot conflict naming the defaulted 'rivet_slot': {msg}"
+    );
+}
+
+#[test]
+fn two_cdc_exports_with_the_same_explicit_slot_are_rejected() {
+    let yaml = cdc_pair_yaml(
+        "postgres",
+        "cdc: { slot: shared_slot }",
+        "cdc: { slot: shared_slot }",
+    );
+    let err = Config::from_yaml(&yaml).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("shared_slot"),
+        "expected a same-slot conflict naming 'shared_slot': {msg}"
+    );
+}
+
+#[test]
+fn two_mysql_cdc_exports_defaulting_to_the_same_server_id_are_rejected() {
+    let yaml = cdc_pair_yaml("mysql", "", "");
+    let err = Config::from_yaml(&yaml).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("4271") && msg.contains("server_id"),
+        "expected a same-server_id conflict naming the defaulted 4271: {msg}"
+    );
+}
+
+#[test]
+fn two_cdc_exports_sharing_a_checkpoint_path_are_rejected() {
+    let yaml = cdc_pair_yaml(
+        "postgres",
+        "cdc: { slot: slot_a, checkpoint: /var/lib/rivet/same.ckpt }",
+        "cdc: { slot: slot_b, checkpoint: /var/lib/rivet/same.ckpt }",
+    );
+    let err = Config::from_yaml(&yaml).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("same.ckpt") && msg.contains("checkpoint"),
+        "expected a shared-checkpoint conflict naming the path: {msg}"
+    );
+}
+
+#[test]
+fn cdc_exports_with_distinct_resources_validate_fine() {
+    let yaml = cdc_pair_yaml(
+        "postgres",
+        "cdc: { slot: slot_orders, checkpoint: /var/lib/rivet/orders.ckpt }",
+        "cdc: { slot: slot_users, checkpoint: /var/lib/rivet/users.ckpt }",
+    );
+    Config::from_yaml(&yaml).expect("distinct slots + checkpoints must validate");
+}
+
+#[test]
+fn mysql_cdc_exports_with_distinct_server_ids_validate_fine() {
+    let yaml = cdc_pair_yaml(
+        "mysql",
+        "cdc: { server_id: 4271 }",
+        "cdc: { server_id: 4272 }",
+    );
+    Config::from_yaml(&yaml).expect("distinct server_ids must validate");
+}
+
+// ── CDC multi-table `tables:` shape ───────────────────────────────────────────
+
+#[test]
+fn cdc_table_and_tables_are_mutually_exclusive() {
+    let yaml = r#"
+source: { type: postgres, url: "postgresql://localhost/test" }
+exports:
+  - name: app_cdc
+    table: orders
+    tables: [orders, users]
+    mode: cdc
+    format: parquet
+    cdc: { slot: s1 }
+    destination: { type: local, path: ./out }
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(msg.contains("mutually exclusive"), "{msg}");
+}
+
+#[test]
+fn cdc_tables_must_be_nonempty_and_unique() {
+    let empty = r#"
+source: { type: postgres, url: "postgresql://localhost/test" }
+exports:
+  - name: app_cdc
+    tables: []
+    mode: cdc
+    format: parquet
+    destination: { type: local, path: ./out }
+"#;
+    let msg = format!("{:#}", Config::from_yaml(empty).unwrap_err());
+    assert!(msg.contains("at least one table"), "{msg}");
+
+    let dup = r#"
+source: { type: postgres, url: "postgresql://localhost/test" }
+exports:
+  - name: app_cdc
+    tables: [orders, orders]
+    mode: cdc
+    format: parquet
+    destination: { type: local, path: ./out }
+"#;
+    let msg = format!("{:#}", Config::from_yaml(dup).unwrap_err());
+    assert!(msg.contains("duplicate table"), "{msg}");
+}
+
+#[test]
+fn cdc_tables_on_mssql_is_rejected_for_now() {
+    let yaml = r#"
+source: { type: mssql, url: "sqlserver://sa:x@localhost:1434/rivet" }
+exports:
+  - name: app_cdc
+    tables: [orders, users]
+    mode: cdc
+    format: parquet
+    destination: { type: local, path: ./out }
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(msg.contains("not yet supported for SQL Server"), "{msg}");
+}
+
+#[test]
+fn cdc_tables_multi_table_stream_validates_on_postgres_and_mysql() {
+    for source in ["postgres", "mysql"] {
+        let yaml = format!(
+            r#"
+source: {{ type: {source}, url: "{source}://localhost/test" }}
+exports:
+  - name: app_cdc
+    tables: [orders, users]
+    mode: cdc
+    format: parquet
+    cdc: {{ slot: s1, server_id: 5000, checkpoint: /tmp/app.ckpt }}
+    destination: {{ type: local, path: ./out }}
+"#
+        );
+        Config::from_yaml(&yaml)
+            .unwrap_or_else(|e| panic!("{source} multi-table cdc must validate: {e:#}"));
+    }
+}
+
+#[test]
+fn tables_outside_cdc_mode_is_rejected() {
+    let yaml = r#"
+source: { type: postgres, url: "postgresql://localhost/test" }
+exports:
+  - name: orders
+    tables: [orders, users]
+    mode: full
+    format: parquet
+    destination: { type: local, path: ./out }
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(msg.contains("only valid with `mode: cdc`"), "{msg}");
+}
+
+// ── Table-qualified `columns:` override keys ─────────────────────────────────
+// Bare keys apply to every table of a multi-table export (the blast radius the
+// schema-wide user worries about); `"table.column"` targets one table and wins
+// over the bare key. A qualified key naming a table the export does NOT
+// capture is a config error — a typo must fail at load, never silently miss.
+
+#[test]
+fn qualified_override_for_unknown_table_is_rejected() {
+    let yaml = r#"
+source: { type: mysql, url: "mysql://localhost/test" }
+exports:
+  - name: app_cdc
+    tables: [orders, users]
+    mode: cdc
+    format: parquet
+    columns: { "ghost.v": "decimal(20,0)" }
+    cdc: { checkpoint: /tmp/a.ckpt, server_id: 5001 }
+    destination: { type: local, path: ./out }
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(
+        msg.contains("ghost") && msg.contains("does not capture"),
+        "a qualified override must name a captured table: {msg}"
+    );
+}
+
+#[test]
+fn qualified_override_on_query_export_is_rejected() {
+    let yaml = r#"
+source: { type: postgres, url: "postgresql://localhost/test" }
+exports:
+  - name: orders
+    query: "SELECT 1 AS v"
+    mode: full
+    format: parquet
+    columns: { "orders.v": "int8" }
+    destination: { type: local, path: ./out }
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(
+        msg.contains("query"),
+        "qualified overrides need a table-shaped export: {msg}"
+    );
+}
+
+#[test]
+fn qualified_override_matching_the_export_table_validates() {
+    let yaml = r#"
+source: { type: mysql, url: "mysql://localhost/test" }
+exports:
+  - name: app_cdc
+    tables: [orders, users]
+    mode: cdc
+    format: parquet
+    columns: { "orders.v": "decimal(20,0)", v: text }
+    cdc: { checkpoint: /tmp/a.ckpt, server_id: 5001 }
+    destination: { type: local, path: ./out }
+"#;
+    Config::from_yaml(yaml).expect("qualified + bare keys must validate");
+}
+
+// `initial: snapshot` reserves the `snapshot/` sub-prefix — a captured table
+// literally named "snapshot" would collide with it (roast finding).
+#[test]
+fn initial_snapshot_rejects_a_table_named_snapshot() {
+    let yaml = r#"
+source: { type: mysql, url: "mysql://localhost/test" }
+exports:
+  - name: app_cdc
+    tables: [orders, snapshot]
+    mode: cdc
+    format: parquet
+    cdc: { initial: snapshot, checkpoint: /tmp/a.ckpt, server_id: 5001 }
+    destination: { type: local, path: ./out }
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(msg.contains("snapshot"), "must name the collision: {msg}");
+}
+
+// Negative family #3 (hostile configs), generative flavour: arbitrary
+// bytes/fragments through the whole config parse+validate pipeline must
+// yield Ok or a graceful Err — never a panic. serde almost certainly holds;
+// the net is for OUR validation layers on top of it.
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig {
+        cases: 128, ..Default::default()
+    })]
+
+    #[test]
+    fn config_parse_is_total_over_arbitrary_yaml(junk in ".{0,300}") {
+        let _ = Config::from_yaml(&junk);
+    }
+
+    #[test]
+    fn config_parse_is_total_over_structured_hostility(
+        name in ".{0,30}",
+        table in ".{0,30}",
+        colkey in ".{0,20}",
+        colval in ".{0,20}",
+    ) {
+        let yaml = format!(
+            "source: {{ type: mysql, url: \"mysql://u:p@h/db\" }}\nexports:\n  - name: {name:?}\n    table: {table:?}\n    mode: cdc\n    format: parquet\n    columns: {{ {colkey:?}: {colval:?} }}\n    cdc: {{ checkpoint: /tmp/x, server_id: 5001 }}\n    destination: {{ type: local, path: ./out }}\n"
+        );
+        let _ = Config::from_yaml(&yaml);
+    }
+}

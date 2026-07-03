@@ -56,6 +56,31 @@ pub use source_column::ColumnOverride;
 /// declared precision/scale instead of autodetected (often unavailable) metadata.
 pub type ColumnOverrides = std::collections::HashMap<String, RivetType>;
 
+/// Narrow a parsed override map to ONE table: bare keys (`amount`) apply to
+/// every table; qualified keys (`orders.amount`) apply only to their table and
+/// WIN over a bare key for the same column. Foreign-qualified keys are
+/// excluded entirely. `table` is the bare table name (no schema part).
+/// This is what makes `columns:` safe on a schema-wide multi-table export —
+/// one table's override can never bleed into a same-named column elsewhere.
+pub fn overrides_for_table(all: &ColumnOverrides, table: &str) -> ColumnOverrides {
+    let mut out: ColumnOverrides = ColumnOverrides::new();
+    // Bare keys first…
+    for (k, v) in all {
+        if !k.contains('.') {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    // …then this table's qualified keys, overwriting.
+    for (k, v) in all {
+        if let Some((t, col)) = k.split_once('.')
+            && t == table
+        {
+            out.insert(col.to_string(), v.clone());
+        }
+    }
+    out
+}
+
 /// The override precedence shared by every source engine: a `columns:` override
 /// wins; otherwise fall back to the engine's autodetected type. Keeping it in
 /// one place is why PostgreSQL and MySQL resolution can't drift on precedence —
@@ -71,6 +96,20 @@ pub fn resolve_or(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overrides_for_table_bare_applies_qualified_wins_foreign_excluded() {
+        let mut all = ColumnOverrides::new();
+        all.insert("v".into(), RivetType::Text);
+        all.insert("orders.v".into(), RivetType::Int64);
+        all.insert("ghost.v".into(), RivetType::Bool);
+
+        let orders = overrides_for_table(&all, "orders");
+        assert_eq!(orders.get("v"), Some(&RivetType::Int64), "qualified wins");
+        let users = overrides_for_table(&all, "users");
+        assert_eq!(users.get("v"), Some(&RivetType::Text), "bare fallback");
+        assert_eq!(users.len(), 1, "foreign-qualified keys never leak");
+    }
 
     #[test]
     fn resolve_or_prefers_override_then_autodetect() {

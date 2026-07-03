@@ -1,0 +1,33 @@
+{
+  "manifest_version": 1,
+  "run_id": "compat_gen_20260703T104410508",
+  "export_name": "compat_gen",
+  "started_at": "2026-07-03T10:44:10.508508+00:00",
+  "finished_at": "compat_gen_20260703T104410508",
+  "status": "success",
+  "source": {
+    "engine": "mysql",
+    "schema": null,
+    "table": "compat_gen"
+  },
+  "destination": {
+    "kind": "cdc",
+    "uri": "/tmp/rivet-preso/compat_gen/out"
+  },
+  "format": "parquet",
+  "compression": "zstd",
+  "schema_fingerprint": "",
+  "row_count": 3,
+  "part_count": 1,
+  "parts": [
+    {
+      "part_id": 1,
+      "path": "cdc-compat_gen_20260703T104410508-000000.parquet",
+      "rows": 3,
+      "size_bytes": 1770,
+      "content_fingerprint": "xxh3:df9c53f4fc070b1b",
+      "content_md5": "yqZVziu4bFBDAfRBSi3Yiw==",
+      "status": "committed"
+    }
+  ]
+}

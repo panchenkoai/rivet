@@ -69,6 +69,15 @@ pub struct ExportConfig {
     /// Mutually exclusive with `query` and `query_file`.
     #[serde(default)]
     pub table: Option<String>,
+    /// CDC only: capture **several** tables through ONE change stream (one
+    /// PostgreSQL slot / one MySQL binlog connection) instead of one export —
+    /// and one slot — per table. Each table's parts land under
+    /// `<destination>/<table>/` with their own `manifest.json` + `_SUCCESS`;
+    /// the checkpoint (stream position) is shared. Mutually exclusive with
+    /// `table:`. Not yet supported for SQL Server (capture instances are
+    /// per-table).
+    #[serde(default)]
+    pub tables: Option<Vec<String>>,
     #[serde(default = "default_mode")]
     pub mode: ExportMode,
     /// Change-data-capture settings, required when `mode: cdc`. Reuses the
@@ -468,11 +477,38 @@ pub enum ExportMode {
     Cdc,
 }
 
+/// Default PostgreSQL logical slot when `cdc.slot` is omitted — shared by the
+/// runner ([`crate::pipeline`]'s cdc job) and config validation, so the
+/// same-slot conflict check sees the value that will actually be used.
+pub const DEFAULT_PG_SLOT: &str = "rivet_slot";
+/// Default MySQL replica `server_id` when `cdc.server_id` is omitted (see
+/// [`DEFAULT_PG_SLOT`] for why this is a shared const).
+pub const DEFAULT_MYSQL_SERVER_ID: u32 = 4271;
+
+/// What the FIRST CDC run does before draining changes.
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CdcInitialMode {
+    /// Anchor-then-snapshot: create the resume anchor (PostgreSQL slot /
+    /// MySQL binlog checkpoint / SQL Server LSN checkpoint) FIRST, then run a
+    /// full batch snapshot of each table into `<destination>[/<table>]/snapshot/`,
+    /// then drain CDC. Because the anchor predates the snapshot read, anything
+    /// changed during the snapshot also appears in the change stream — an
+    /// overlap (dedupe by PK + `__op`), never a gap. The safe switch ordering,
+    /// enforced by construction instead of operator discipline.
+    Snapshot,
+}
+
 /// Per-export CDC settings, required when `mode: cdc`. The output `table`,
 /// `destination`, and `format` come from the export itself; this carries only the
 /// CDC-specific knobs (resume + per-engine stream params).
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Default)]
 pub struct CdcExportConfig {
+    /// First-run behaviour: `snapshot` = anchor → full snapshot → drain (see
+    /// [`CdcInitialMode`]). Omitted ⇒ capture changes only (the default; the
+    /// operator owns the initial load).
+    #[serde(default)]
+    pub initial: Option<CdcInitialMode>,
     /// Persist/resume the source log position to this file. Omit to tail from the
     /// current position without checkpointing.
     pub checkpoint: Option<String>,
@@ -539,6 +575,7 @@ pub(crate) fn sample_export(name: &str) -> ExportConfig {
         query: Some("SELECT 1".into()),
         query_file: None,
         table: None,
+        tables: None,
         mode: ExportMode::Full,
         cdc: None,
         cursor_column: None,

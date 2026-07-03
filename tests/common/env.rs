@@ -117,8 +117,24 @@ pub fn live_container_path(host: &std::path::Path) -> String {
 /// Parquet / CSV, and pass the container path to the validator helpers.
 pub fn live_shared_workdir(label: &str) -> (std::path::PathBuf, String) {
     let host = live_shared_tmp_host().join(label);
-    let _ = std::fs::remove_dir_all(&host);
     std::fs::create_dir_all(&host).expect("create live-tmp workdir");
+    // Clear CONTENTS only — never remove_dir_all + recreate. On macOS Docker
+    // (gRPC-FUSE bind mounts) a container that has already resolved this path
+    // keeps the OLD directory inode after a recreate and sees an empty dir
+    // forever — the parquet the test then writes is invisible to the reader
+    // container and the oracle fails with "no files" only in parallel suites
+    // (reproduced with a bare mkdir/rm/exec probe). Keeping the inode stable
+    // keeps the container's view live.
+    if let Ok(entries) = std::fs::read_dir(&host) {
+        for e in entries.flatten() {
+            let p = e.path();
+            let _ = if p.is_dir() {
+                std::fs::remove_dir_all(&p)
+            } else {
+                std::fs::remove_file(&p)
+            };
+        }
+    }
     let container = live_container_path(&host);
     (host, container)
 }

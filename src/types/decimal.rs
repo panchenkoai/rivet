@@ -107,7 +107,7 @@ pub fn decimal_str_to_scaled_i128(s: &str, scale: i8) -> Option<i128> {
         // scale=2 and a DB value arrives with more digits, that is either a
         // type mismatch or a DB rounding artefact — we preserve the declared
         // scale rather than silently extending it.
-        frac_part[..scale_u as usize].parse().ok()?
+        frac_part.get(..scale_u as usize)?.parse().ok()?
     };
 
     let scale_factor = 10i128.pow(scale_u);
@@ -159,7 +159,7 @@ pub fn decimal_str_to_scaled_i256(s: &str, scale: i8) -> Option<i256> {
         }
         i256::from_string(&buf)?
     } else {
-        i256::from_string(&frac_part[..scale_u as usize])?
+        i256::from_string(frac_part.get(..scale_u as usize)?)?
     };
 
     let scale_factor = pow10_i256(scale_u)?;
@@ -361,5 +361,116 @@ mod tests {
         }
         assert!(pow10_i256(76).is_some(), "10^76 fits i256");
         assert!(pow10_i256(77).is_none(), "10^77 overflows i256 → None");
+    }
+}
+
+#[cfg(test)]
+mod fuzz {
+    use super::*;
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: 256, ..Default::default()
+        })]
+
+        // Total on arbitrary text; EXACT on well-formed digit strings — the
+        // one decimal canon must scale int_part·10^s + frac verbatim.
+        #[test]
+        fn decimal_parsers_total_and_exact(
+            junk in ".{0,60}",
+            int_part in 0u64..1_000_000_000_000,
+            frac in 0u32..10_000,
+            // The fraction's WIDTH varies independently of the scale — the
+            // first fuzz shape always rendered exactly scale digits, so the
+            // zero-PADDING arm (frac shorter than scale) was never entered
+            // and its `-`→`+` mutant survived.
+            frac_width in 0usize..=6,
+            neg in proptest::prelude::any::<bool>(),
+        ) {
+            let _ = decimal_str_to_scaled_i128(&junk, 4);
+            let _ = decimal_str_to_scaled_i256(&junk, 4);
+            let frac_str = format!("{frac:04}");
+            let frac_used: String = frac_str.chars().cycle().take(frac_width).collect();
+            let s = format!(
+                "{}{}{}{}",
+                if neg { "-" } else { "" },
+                int_part,
+                if frac_width > 0 { "." } else { "" },
+                frac_used
+            );
+            // Expected: pad-or-truncate frac_used to exactly 4 digits.
+            let aligned: String = frac_used
+                .chars()
+                .chain(std::iter::repeat('0'))
+                .take(4)
+                .collect();
+            let expect = {
+                let mag = int_part as i128 * 10_000 + aligned.parse::<i128>().unwrap();
+                if neg { -mag } else { mag }
+            };
+            proptest::prop_assert_eq!(decimal_str_to_scaled_i128(&s, 4), Some(expect));
+            proptest::prop_assert_eq!(
+                decimal_str_to_scaled_i256(&s, 4),
+                Some(arrow::datatypes::i256::from_i128(expect))
+            );
+        }
+
+        // scale_int_to_i256 is LIVE in the mysql batch Decimal256 path for
+        // integer wire cells — pin exact scaling + the negative-scale refusal
+        // (its guard's mutants survived: nothing exercised the function).
+        #[test]
+        fn scale_int_to_i256_scales_exactly(v in -1_000_000i128..1_000_000, scale in 0i8..10) {
+            let got = scale_int_to_i256(v, scale).expect("in range");
+            let expect = arrow::datatypes::i256::from_i128(v * 10i128.pow(scale as u32));
+            proptest::prop_assert_eq!(got, expect);
+            proptest::prop_assert_eq!(scale_int_to_i256(v, -1), None);
+        }
+    }
+}
+
+#[cfg(test)]
+mod mutant_kills {
+    //! Targeted kills for the cargo-mutants survivors (the meta-gate's first
+    //! harvest). Each test pins exactly the behaviour a surviving mutant
+    //! would corrupt — most sit on the NEGATIVE-scale arms (unreachable from
+    //! today's engine mappings, but live in the public CSV-render path) and
+    //! on the CSV renderer's digit arithmetic.
+    use super::*;
+
+    // Kills: `delete -` in both parses (a negative value must stay negative
+    // through the negative-scale arm), and `<`→`==`/`<=` on the arm guards.
+    #[test]
+    fn negative_scale_parse_keeps_the_sign_and_scales_down() {
+        assert_eq!(decimal_str_to_scaled_i128("1200", -2), Some(12));
+        assert_eq!(decimal_str_to_scaled_i128("-1200", -2), Some(-12));
+        assert_eq!(decimal_str_to_scaled_i128("-1200.99", -2), Some(-12));
+        assert_eq!(
+            decimal_str_to_scaled_i256("-3400", -2),
+            Some(arrow::datatypes::i256::from_i128(-34))
+        );
+        // scale == 0 must NOT take the negative-scale arm (kills < → <=).
+        assert_eq!(decimal_str_to_scaled_i128("-7", 0), Some(-7));
+        assert_eq!(
+            decimal_str_to_scaled_i256("-7", 0),
+            Some(arrow::datatypes::i256::from_i128(-7))
+        );
+    }
+
+    // Kills the renderer survivors: `*`→`+`/`/` on the negative-scale factor,
+    // `<`→`==`/`<=` on its guard, and the fraction zero-PADDING width (the
+    // CSV path — a mutant here writes corrupt decimals into every CSV export).
+    #[test]
+    fn csv_decimal_renderer_is_exact_for_every_scale_shape() {
+        // negative scale: stored 12 at scale -2 renders whole hundreds.
+        assert_eq!(scaled_i128_to_decimal_str(12, -2), "1200");
+        assert_eq!(scaled_i128_to_decimal_str(-12, -2), "-1200");
+        // zero scale: verbatim integer.
+        assert_eq!(scaled_i128_to_decimal_str(-7, 0), "-7");
+        // positive scale: exact digits, fraction padded to WIDTH — "1.05",
+        // never "1.5"; "1.230" would be a padding mutant, "1.23" is truth.
+        assert_eq!(scaled_i128_to_decimal_str(105, 2), "1.05");
+        assert_eq!(scaled_i128_to_decimal_str(123, 2), "1.23");
+        assert_eq!(scaled_i128_to_decimal_str(-1, 4), "-0.0001");
+        assert_eq!(scaled_i128_to_decimal_str(10, 2), "0.10");
     }
 }

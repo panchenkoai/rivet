@@ -168,9 +168,9 @@ services:
   # shared port + 1: PostgreSQL 5434, MySQL 3307, SQL Server 1434. Brought up
   # with `docker compose --profile cdc up -d postgres-cdc mysql-cdc mssql-cdc`.
   postgres-cdc:
-    image: postgres:16
+    image: postgres:${POSTGRES_CDC_TAG:-16}
     profiles: ["cdc"]
-    command: ["-c", "wal_level=logical"]
+    command: ["-c", "wal_level=logical", "-c", "max_replication_slots=32"]
     environment:
       POSTGRES_USER: rivet
       POSTGRES_PASSWORD: rivet
@@ -184,7 +184,9 @@ services:
       retries: 10
 
   mysql-cdc:
-    image: mysql:8.0
+    # Version-matrix knob (staff class #3): nightly runs the CDC
+    # conformance lane against other tags via MYSQL_CDC_TAG.
+    image: mysql:${MYSQL_CDC_TAG:-8.0}
     profiles: ["cdc"]
     # binlog is ON by default in MySQL 8 (ROW format); set a server id and grant
     # the REPLICATION privileges the binlog dump (`COM_BINLOG_DUMP`) needs.
@@ -193,6 +195,14 @@ services:
       - "--server-id=1"
       - "--log-bin=binlog"
       - "--binlog-format=ROW"
+      # The parallel live suite grew past the 151-connection default (MBT
+      # writer pools + gremlins + grant tests) — same environment-ceiling
+      # class as PG max_replication_slots.
+      - "--max-connections=400"
+      # FULL puts column NAMES into TABLE_MAP optional metadata (8.0.1+) —
+      # the sink then maps binlog images BY NAME, closing the positional
+      # class on MySQL (doctor recommends this in production too).
+      - "--binlog-row-metadata=FULL"
     environment:
       MYSQL_ROOT_PASSWORD: rivet
       MYSQL_USER: rivet
@@ -458,6 +468,8 @@ services:
       - "8474:8474"   # HTTP API
       - "15432:15432"  # proxied Postgres
       - "13306:13306"  # proxied MySQL
+      - "13307:13307"  # proxied mysql-cdc (gremlin: binlog cut mid-drain)
+      - "14443:14443"  # proxied fake-gcs (gremlin: upload cut mid-part)
     depends_on:
       - postgres
       - mysql

@@ -288,9 +288,13 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     crate::source::cdc::run_capture(crate::source::cdc::CdcCapture {
         cdc_cfg,
-        table: tbl,
-        dest: dest.as_ref(),
-        dest_uri: dir,
+        outputs: vec![crate::source::cdc::CaptureOutput {
+            table: tbl,
+            dest: dest.as_ref(),
+            dest_uri: dir,
+            // The ad-hoc CLI has no `columns:` surface; config-driven runs do.
+            overrides: crate::types::ColumnOverrides::new(),
+        }],
         format: fmt,
         max_events: a.max_events,
         rollover: a.rollover,

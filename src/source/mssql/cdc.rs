@@ -86,18 +86,41 @@ impl MssqlChangeStream {
         {
             anyhow::bail!("mssql cdc: malformed resume LSN {lsn:?}");
         }
-        // Heuristic schema/table from `<schema>_<table>` — robust resolution via
-        // cdc.change_tables metadata is the SQL Server completion step.
-        let (schema, table) = cfg
-            .capture_instance
-            .split_once('_')
-            .map(|(s, t)| (s.to_string(), t.to_string()))
-            .unwrap_or_else(|| (String::new(), cfg.capture_instance.clone()));
-
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        let client = rt.block_on(connect(cfg, tls))?;
+        let mut client = rt.block_on(connect(cfg, tls))?;
+
+        // Resolve the REAL schema/table from cdc.change_tables metadata. The
+        // previous `<schema>_<table>` name heuristic silently mis-tagged every
+        // event when the capture instance was named after an underscored table
+        // (`product_catalog` → schema "product", table "catalog"), so the
+        // sink's table routing dropped 100% of its changes while the run still
+        // reported success. The name is a label; the metadata is the truth.
+        // Fall back to the heuristic only if the metadata row is unreadable.
+        let meta: Option<(String, String)> = rt.block_on(async {
+            let row = client
+                .query(
+                    "SELECT OBJECT_SCHEMA_NAME(source_object_id), \
+                            OBJECT_NAME(source_object_id) \
+                     FROM cdc.change_tables WHERE capture_instance = @P1",
+                    &[&cfg.capture_instance.as_str()],
+                )
+                .await
+                .ok()?
+                .into_row()
+                .await
+                .ok()??;
+            let s: Option<&str> = row.get(0);
+            let t: Option<&str> = row.get(1);
+            Some((s?.to_string(), t?.to_string()))
+        });
+        let (schema, table) = meta.unwrap_or_else(|| {
+            cfg.capture_instance
+                .split_once('_')
+                .map(|(s, t)| (s.to_string(), t.to_string()))
+                .unwrap_or_else(|| (String::new(), cfg.capture_instance.clone()))
+        });
         Ok(Self {
             rt,
             client,
@@ -187,6 +210,10 @@ CDC change-table retention (the cleanup job removed it). Resuming would silently
             let mut op_code = 0i32;
             let mut lsn = String::new();
             let mut values: Vec<RivetValue> = Vec::new();
+            // Captured column NAMES ride along — the sink then maps this
+            // image by name, making the positional-corruption class
+            // (findings #37/#41) unrepresentable on SQL Server too.
+            let mut names: Vec<String> = Vec::new();
             for (idx, (col, data)) in r.cells().enumerate() {
                 match col.name() {
                     "__$operation" => {
@@ -200,7 +227,10 @@ CDC change-table retention (the cleanup job removed it). Resuming would silently
                         }
                     }
                     n if n.starts_with("__$") => {} // skip other metadata
-                    _ => values.push(cell_to_rivet(r, idx, data)),
+                    n => {
+                        names.push(n.to_string());
+                        values.push(cell_to_rivet(r, idx, data));
+                    }
                 }
             }
             let Some(op) = map_op(op_code) else { continue };
@@ -218,6 +248,7 @@ CDC change-table retention (the cleanup job removed it). Resuming would silently
                 position: Position(json!({ "lsn": lsn })),
                 // The change table only ever holds already-committed changes.
                 committed: true,
+                image_names: Some(std::sync::Arc::from(names)),
             });
         }
         Ok(())
@@ -352,6 +383,38 @@ async fn connect(
     let tcp = TcpStream::connect(config.get_addr()).await?;
     tcp.set_nodelay(true)?;
     Ok(Client::connect(config, tcp.compat_write()).await?)
+}
+
+/// Persist the database's CURRENT max LSN to `ckpt` — the anchor for
+/// `cdc.initial: snapshot`, taken BEFORE the snapshot read so the change
+/// stream overlaps the snapshot instead of gapping it. Fails loudly when CDC
+/// is not enabled on the database (no max LSN exists to anchor at).
+pub(crate) fn pin_checkpoint_at_max_lsn(
+    url: &str,
+    ckpt: &std::path::Path,
+    tls: Option<&TlsConfig>,
+) -> Result<()> {
+    let mut src = crate::source::mssql::MssqlSource::connect_with_tls(url, tls)?;
+    let probe = src.cdc_health(None)?;
+    let Some(max) = probe_max_lsn(&probe) else {
+        anyhow::bail!(
+            "mssql cdc initial snapshot: sys.fn_cdc_get_max_lsn() is NULL — enable CDC first \
+             (EXEC sys.sp_cdc_enable_db) so the anchor exists before the snapshot"
+        );
+    };
+    Position(serde_json::json!({ "lsn": max })).save(ckpt)
+}
+
+/// The probe's max LSN as the bare hex the checkpoint stores (strip `0x`).
+fn probe_max_lsn(probe: &crate::source::mssql::MssqlCdcProbe) -> Option<String> {
+    if !probe.cdc_enabled {
+        return None;
+    }
+    probe.max_lsn_hex.as_deref().map(|s| {
+        s.trim_start_matches("0x")
+            .trim_start_matches("0X")
+            .to_string()
+    })
 }
 
 #[cfg(test)]

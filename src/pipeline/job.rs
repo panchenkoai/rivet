@@ -310,6 +310,24 @@ pub(super) fn run_export_job(
     // plan/strategy machinery entirely and run through the dedicated CDC runner,
     // which produces the same (Result, RunSummary) contract + metric row.
     if export.mode == crate::config::ExportMode::Cdc {
+        // `initial: snapshot`: anchor first, then each pending table's full
+        // snapshot (a recursive `mode: full` run into `…/snapshot/`, with its
+        // own metric + journal), then the drain below. A failed snapshot fails
+        // the export — the anchor stays, so the retry resumes gap-free.
+        let pending = match super::cdc_job::initial_snapshot_pending(config, export) {
+            Ok(p) => p,
+            Err(e) => {
+                let summary = synthetic_failed_summary(&export.name, &e);
+                return (Err(e), summary);
+            }
+        };
+        for synth in &pending {
+            let (res, summary) =
+                run_export_job(config_path, config, synth, state, config_dir, opts);
+            if res.is_err() {
+                return (res, summary);
+            }
+        }
         return super::cdc_job::run_cdc_export(config_path, config, export, state);
     }
     let plan = match build_plan(

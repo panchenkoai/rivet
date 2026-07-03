@@ -379,6 +379,75 @@ impl Config {
         for export in &self.exports {
             self.validate_export(export)?;
         }
+        self.validate_cdc_resource_conflicts()?;
+        Ok(())
+    }
+
+    /// CDC stream resources are per-export and their **defaults collide**: two
+    /// PostgreSQL cdc exports without an explicit `slot:` both resolve to
+    /// `rivet_slot` — each export's ack advances `confirmed_flush_lsn` past
+    /// changes the *other* never read (mutual, silent data loss). Two MySQL
+    /// exports both default to `server_id: 4271` — the server kills the older
+    /// replica connection. A shared `checkpoint:` path makes exports overwrite
+    /// each other's resume position on any engine. All three are config bugs a
+    /// naive multi-table CDC config hits by default, so reject them at load, on
+    /// the RESOLVED values (defaults included). SQL Server `capture_instance`
+    /// sharing is deliberately allowed: the change-table poll is read-only and
+    /// resume state lives in the per-export checkpoint.
+    fn validate_cdc_resource_conflicts(&self) -> crate::error::Result<()> {
+        use std::collections::HashMap;
+
+        let mut slots: HashMap<String, &str> = HashMap::new();
+        let mut server_ids: HashMap<u32, &str> = HashMap::new();
+        let mut checkpoints: HashMap<&str, &str> = HashMap::new();
+
+        for e in self.exports.iter().filter(|e| e.mode == ExportMode::Cdc) {
+            let cdc = e.cdc.as_ref();
+            match self.source.source_type {
+                SourceType::Postgres => {
+                    let slot = cdc
+                        .and_then(|c| c.slot.clone())
+                        .unwrap_or_else(|| DEFAULT_PG_SLOT.to_string());
+                    if let Some(prev) = slots.insert(slot.clone(), &e.name) {
+                        crate::config_bail!(
+                            crate::error::codes::CONFIG_CDC_RESOURCE_CONFLICT,
+                            "exports '{prev}' and '{}': same PostgreSQL slot '{slot}' — a slot \
+                             has ONE consumer; each export's ack would advance it past changes \
+                             the other never read (silent data loss). Set a distinct `cdc.slot:` \
+                             per export (the default is '{DEFAULT_PG_SLOT}').",
+                            e.name
+                        );
+                    }
+                }
+                SourceType::Mysql => {
+                    let sid = cdc
+                        .and_then(|c| c.server_id)
+                        .unwrap_or(DEFAULT_MYSQL_SERVER_ID);
+                    if let Some(prev) = server_ids.insert(sid, &e.name) {
+                        crate::config_bail!(
+                            crate::error::codes::CONFIG_CDC_RESOURCE_CONFLICT,
+                            "exports '{prev}' and '{}': same MySQL server_id {sid} — the server \
+                             kills the older replica connection when a new one registers with \
+                             the same id. Set a distinct `cdc.server_id:` per export (the \
+                             default is {DEFAULT_MYSQL_SERVER_ID}).",
+                            e.name
+                        );
+                    }
+                }
+                SourceType::Mssql => {}
+            }
+            if let Some(ckpt) = cdc.and_then(|c| c.checkpoint.as_deref())
+                && let Some(prev) = checkpoints.insert(ckpt, &e.name)
+            {
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_CDC_RESOURCE_CONFLICT,
+                    "exports '{prev}' and '{}': same checkpoint path '{ckpt}' — each export \
+                     must own its resume position or they overwrite each other's. Set a \
+                     distinct `cdc.checkpoint:` per export.",
+                    e.name
+                );
+            }
+        }
         Ok(())
     }
 
@@ -525,17 +594,30 @@ impl Config {
             );
         }
 
+        // Before the generic exactly-one counting: the `table:`/`tables:` pair
+        // gets its specific message (the generic one doesn't mention `tables`).
+        if export.table.is_some() && export.tables.is_some() {
+            anyhow::bail!(
+                "export '{}': `table:` and `tables:` are mutually exclusive — use \
+                 `tables: [a, b]` for a multi-table stream",
+                export.name
+            );
+        }
+
         let set_count = [
             export.query.is_some(),
             export.query_file.is_some(),
             export.table.is_some(),
+            // A multi-table CDC stream (`tables:`) is that export's source
+            // specification — the CDC arm below owns its shape rules.
+            export.tables.is_some(),
         ]
         .iter()
         .filter(|b| **b)
         .count();
         if set_count == 0 {
             anyhow::bail!(
-                "export '{}': specify exactly one of 'query', 'query_file', or 'table'. \
+                "export '{}': specify exactly one of 'query', 'query_file', 'table', or 'tables'. \
                  Use table: <name> for a whole table (enables PK auto-chunking); \
                  query: \"SELECT …\" for an inline one-liner; \
                  query_file: <path> for SQL you keep in version control.",
@@ -544,7 +626,7 @@ impl Config {
         }
         if set_count > 1 {
             anyhow::bail!(
-                "export '{}': specify exactly one of 'query', 'query_file', or 'table' (got {} set)",
+                "export '{}': specify exactly one of 'query', 'query_file', 'table', or 'tables' (got {} set)",
                 export.name,
                 set_count
             );
@@ -835,11 +917,44 @@ impl Config {
             }
             ExportMode::Full => {}
             ExportMode::Cdc => {
-                if export.table.is_none() {
-                    anyhow::bail!(
-                        "export '{}': cdc mode requires `table:` (the source table to capture)",
+                match (&export.table, &export.tables) {
+                    (None, None) => anyhow::bail!(
+                        "export '{}': cdc mode requires `table:` (or `tables:` for a \
+                         multi-table stream)",
                         export.name
-                    );
+                    ),
+                    (Some(_), Some(_)) => anyhow::bail!(
+                        "export '{}': `table:` and `tables:` are mutually exclusive — \
+                         use `tables: [a, b]` for a multi-table stream",
+                        export.name
+                    ),
+                    (None, Some(ts)) => {
+                        if ts.is_empty() {
+                            anyhow::bail!(
+                                "export '{}': `tables:` must list at least one table",
+                                export.name
+                            );
+                        }
+                        let mut seen = std::collections::HashSet::new();
+                        for t in ts {
+                            if !seen.insert(t.as_str()) {
+                                anyhow::bail!(
+                                    "export '{}': duplicate table '{}' in `tables:`",
+                                    export.name,
+                                    t
+                                );
+                            }
+                        }
+                        if self.source.source_type == SourceType::Mssql {
+                            anyhow::bail!(
+                                "export '{}': `tables:` is not yet supported for SQL Server — \
+                                 its capture instances are per-table; use one cdc export per \
+                                 table (capture_instance each)",
+                                export.name
+                            );
+                        }
+                    }
+                    (Some(_), None) => {}
                 }
                 if export.query.is_some() || export.query_file.is_some() {
                     anyhow::bail!(
@@ -849,6 +964,14 @@ impl Config {
                     );
                 }
             }
+        }
+
+        if export.tables.is_some() && export.mode != ExportMode::Cdc {
+            anyhow::bail!(
+                "export '{}': `tables:` is only valid with `mode: cdc` (batch exports \
+                 are one query/table per export)",
+                export.name
+            );
         }
 
         if export.chunk_dense && export.mode != ExportMode::Chunked {
@@ -862,6 +985,75 @@ impl Config {
             anyhow::bail!(
                 "export '{}': a `cdc:` block is only valid with `mode: cdc`",
                 export.name
+            );
+        }
+
+        // Table-qualified `columns:` override keys ("table.column"): the named
+        // table must be one this export captures — a typo must fail at load,
+        // never silently miss its target. Bare keys stay export-wide.
+        {
+            for key in export.columns.keys() {
+                let Some((tbl, _col)) = key.split_once('.') else {
+                    continue;
+                };
+                if export.query.is_some() || export.query_file.is_some() {
+                    anyhow::bail!(
+                        "export '{}': qualified column override '{key}' needs a table-shaped \
+                         export (`table:`/`tables:`), not a query",
+                        export.name
+                    );
+                }
+                let bare = |t: &str| t.rsplit('.').next().unwrap_or(t).to_string();
+                let captures = export
+                    .table
+                    .as_deref()
+                    .map(bare)
+                    .into_iter()
+                    .chain(export.tables.iter().flatten().map(|t| bare(t)))
+                    .any(|t| t == tbl);
+                if !captures {
+                    anyhow::bail!(
+                        "export '{}': column override '{key}' names table '{tbl}', which this \
+                         export does not capture — fix the table name or use a bare column key \
+                         to apply it to every captured table",
+                        export.name
+                    );
+                }
+            }
+        }
+
+        // `initial: snapshot` writes each table's snapshot under the reserved
+        // sub-prefix `snapshot/` — a table actually NAMED "snapshot" would share
+        // a prefix with another table's marker. Refuse the collision at load.
+        if let Some(cdc) = &export.cdc
+            && cdc.initial == Some(CdcInitialMode::Snapshot)
+        {
+            let clashes = |t: &str| t.rsplit('.').next().unwrap_or(t) == "snapshot";
+            if export.table.as_deref().is_some_and(clashes)
+                || export.tables.iter().flatten().any(|t| clashes(t))
+            {
+                anyhow::bail!(
+                    "export '{}': a table named 'snapshot' collides with the reserved \
+                     `snapshot/` sub-prefix that `cdc.initial: snapshot` writes — rename \
+                     the table or use a separate export without `initial:`",
+                    export.name
+                );
+            }
+        }
+
+        // `initial: snapshot` needs a durable anchor BEFORE the snapshot reads.
+        // PostgreSQL pins server-side (the slot); MySQL / SQL Server have no
+        // server-side anchor, so the checkpoint file is mandatory there.
+        if let Some(cdc) = &export.cdc
+            && cdc.initial == Some(CdcInitialMode::Snapshot)
+            && self.source.source_type != SourceType::Postgres
+            && cdc.checkpoint.is_none()
+        {
+            anyhow::bail!(
+                "export '{}': `cdc.initial: snapshot` on {:?} requires `cdc.checkpoint:` — \
+                 the checkpoint file is the anchor that makes snapshot-then-stream gap-free",
+                export.name,
+                self.source.source_type
             );
         }
 

@@ -32,6 +32,27 @@ async fn connect_at(port: u16) -> Client<Compat<TcpStream>> {
         .expect("mssql: login")
 }
 
+/// Like `exec_at`, but tolerates server errors — for Agent job control, whose
+/// errors (22022 "already running"/"not running") are raised by the Agent
+/// process outside any T-SQL TRY/CATCH reach.
+fn try_exec_at(port: u16, sql: &str) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("mssql: tokio runtime");
+    rt.block_on(async {
+        let mut client = connect_at(port).await;
+        for batch in split_go(sql) {
+            if batch.trim().is_empty() {
+                continue;
+            }
+            if let Ok(r) = client.simple_query(batch.as_str()).await {
+                let _ = r.into_results().await;
+            }
+        }
+    });
+}
+
 fn exec_at(port: u16, sql: &str) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -82,6 +103,11 @@ pub fn mssql_exec(sql: &str) {
 /// As [`mssql_exec`], but against the CDC `mssql-cdc` instance (`:1434`).
 pub fn mssql_cdc_exec(sql: &str) {
     exec_at(1434, sql)
+}
+
+/// Error-tolerant twin of [`mssql_cdc_exec`] for Agent job control.
+pub fn mssql_cdc_try_exec(sql: &str) {
+    try_exec_at(1434, sql)
 }
 
 /// Scalar query → first column of the first row as `i64`, against the shared

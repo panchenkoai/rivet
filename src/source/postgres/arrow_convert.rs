@@ -325,7 +325,7 @@ impl<'a> postgres_types::FromSql<'a> for PgInterval {
 ///   months → years + months  (e.g. 14 → "P1Y2M")
 ///   days   → days            (e.g. 3  → "3D")
 ///   µs     → T…H…M…S        (e.g. 90_061_000_000 → "T25H1M1S")
-fn pg_interval_to_iso8601(months: i32, days: i32, microseconds: i64) -> String {
+pub(crate) fn pg_interval_to_iso8601(months: i32, days: i32, microseconds: i64) -> String {
     use std::fmt::Write as _;
     let years = months / 12;
     let m = months % 12;
@@ -392,6 +392,11 @@ pub(super) fn rows_to_record_batch_typed(
     rows: &[Row],
     max_value_bytes: Option<usize>,
 ) -> Result<RecordBatch> {
+    if let Some(first) = rows.first() {
+        let expected: Vec<&str> = columns.iter().map(|(n, _)| n.as_str()).collect();
+        let wire: Vec<&str> = first.columns().iter().map(|c| c.name()).collect();
+        crate::source::verify_wire_columns(&expected, &wire)?;
+    }
     let mut arrays: Vec<Arc<dyn Array>> = Vec::with_capacity(columns.len());
     for (col_idx, (name, pg_type)) in columns.iter().enumerate() {
         let target_type = schema.field(col_idx).data_type();
@@ -532,6 +537,61 @@ impl crate::source::value_checksum::CellSource for PgCellSource<'_> {
                 .ok()
                 .flatten()
                 .map(|s| Cow::Owned(s.0.into_bytes())),
+            _ => None,
+        }
+    }
+    fn time64_micros(&self, col: usize, row: usize) -> Option<i64> {
+        self.rows[row]
+            .try_get::<_, Option<chrono::NaiveTime>>(col)
+            .ok()
+            .flatten()
+            .map(|t| {
+                t.num_seconds_from_midnight() as i64 * 1_000_000 + t.nanosecond() as i64 / 1_000
+            })
+    }
+    fn fixed_binary(&self, col: usize, row: usize) -> Option<Cow<'_, [u8]>> {
+        match self.rows[row].try_get::<_, Option<PgUuidBytes>>(col) {
+            Ok(Some(PgUuidBytes(b))) => Some(Cow::Owned(b.to_vec())),
+            _ => None,
+        }
+    }
+    fn decimal256(&self, col: usize, row: usize, scale: i8) -> Option<arrow::datatypes::i256> {
+        use crate::types::decimal::decimal_str_to_scaled_i256;
+        match pg_numeric_optional_plain(&self.rows[row], col) {
+            Ok(Some(t)) => decimal_str_to_scaled_i256(&t, scale),
+            _ => None,
+        }
+    }
+    fn list(
+        &self,
+        col: usize,
+        row: usize,
+        elem: &DataType,
+    ) -> Option<Vec<crate::source::value_checksum::ListElem>> {
+        use crate::source::value_checksum::ListElem as E;
+        let r = &self.rows[row];
+        // Mirrors build_pg_list_array element-by-element: Vec<Option<T>> so
+        // inner NULLs survive, per the same element-type set.
+        macro_rules! l {
+            ($T:ty, $mk:expr) => {
+                r.try_get::<_, Option<Vec<Option<$T>>>>(col)
+                    .ok()
+                    .flatten()
+                    .map(|v| {
+                        v.into_iter()
+                            .map(|o| o.map($mk).unwrap_or(E::Null))
+                            .collect()
+                    })
+            };
+        }
+        match elem {
+            DataType::Boolean => l!(bool, E::Bool),
+            DataType::Int16 => l!(i16, E::I16),
+            DataType::Int32 => l!(i32, E::I32),
+            DataType::Int64 => l!(i64, E::I64),
+            DataType::Float32 => l!(f32, E::F32),
+            DataType::Float64 => l!(f64, E::F64),
+            DataType::Utf8 => l!(String, |s: String| E::Str(s.into_bytes())),
             _ => None,
         }
     }
