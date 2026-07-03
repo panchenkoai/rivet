@@ -347,12 +347,25 @@ exports:
                     .as_str()
                     .map(str::to_string)
                     .unwrap_or_else(|| cj[0]["v"].to_string());
+                // Compare by VALUE: ClickHouse's decimal→text scale digits
+                // moved across 24.8 patch builds (five CI rounds of literal
+                // chasing), while the duckdb leg keeps the exact-literal
+                // assertion. Trailing fractional zeros carry no value.
                 assert_eq!(
-                    got.as_str(),
-                    *want,
-                    "clickhouse/{side}/{name}: expected the literal"
+                    norm_decimal(&got),
+                    norm_decimal(want),
+                    "clickhouse/{side}/{name}: expected the value (got '{got}', want '{want}')"
                 );
             }
         }
+    }
+}
+
+/// `"123.4500"` → `"123.45"`, `"1000.0000"` → `"1000"`; integers unchanged.
+fn norm_decimal(s: &str) -> String {
+    if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        s.to_string()
     }
 }
