@@ -80,12 +80,20 @@ impl MysqlChangeStream {
         })
     }
 
-    /// The source's current `(binlog_file, position)` coordinate (`SHOW MASTER STATUS`).
+    /// The source's current `(binlog_file, position)` coordinate.
+    /// MySQL 8.4 REMOVED `SHOW MASTER STATUS` (finding #36, caught by the
+    /// version scout); its replacement `SHOW BINARY LOG STATUS` does not exist
+    /// before 8.2 — try the new form first, fall back to the old.
     fn current_coordinates(url: &str, tls: Option<&TlsConfig>) -> Result<(String, u64)> {
         let mut c = connect_conn(url, tls)?;
-        let row: mysql::Row = c
-            .query_first("SHOW MASTER STATUS")?
-            .ok_or_else(|| anyhow::anyhow!("mysql: binlog disabled (SHOW MASTER STATUS empty)"))?;
+        let row: mysql::Row = match c.query_first("SHOW BINARY LOG STATUS") {
+            Ok(Some(row)) => row,
+            // Err ⇒ pre-8.2 syntax error; Ok(None) ⇒ statement exists but
+            // returned nothing — both fall back to the legacy form.
+            _ => c
+                .query_first("SHOW MASTER STATUS")?
+                .ok_or_else(|| anyhow::anyhow!("mysql: binlog disabled (binlog status empty)"))?,
+        };
         let file: String = row.get(0).expect("binlog file column");
         let pos: u64 = row.get(1).expect("binlog pos column");
         Ok((file, pos))

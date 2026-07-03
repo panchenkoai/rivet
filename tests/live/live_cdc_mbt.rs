@@ -454,3 +454,172 @@ exports:
     let j: serde_json::Value = serde_json::from_slice(&doc.stdout).expect("doctor --json parses");
     assert_eq!(j["all_ok"], true, "healthy state must read green: {j}");
 }
+
+// Finding #37 — DDL inside the capture window. Binlog row events are
+// POSITIONAL and carry no column names; after `DROP COLUMN a` mid-window the
+// pre-DDL event's 'a' value landed in column 'b' (observed live, silently,
+// status success). The sink now refuses arity drift loudly. Three shapes:
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_mid_window_ddl_fails_loudly_never_misaligns() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_ddl_mid");
+    let mut c = mysql::Pool::new(MYSQL_CDC_URL).unwrap().get_conn().unwrap();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {tbl} (id INT PRIMARY KEY, a VARCHAR(10), b VARCHAR(10))"
+    ))
+    .unwrap();
+    let _guard = Table(tbl.clone());
+    let (cfg, out) = ddl_cfg(&d, &tbl);
+    run_ok(&cfg); // pin
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1,'AAA','BBB')"))
+        .unwrap();
+    c.query_drop(format!("ALTER TABLE {tbl} DROP COLUMN a"))
+        .unwrap();
+    c.query_drop(format!("INSERT INTO {tbl} (id,b) VALUES (2,'CCC')"))
+        .unwrap();
+
+    let res = std::process::Command::new(RIVET_BIN)
+        .args(["run", "--config", cfg.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!res.status.success(), "mid-window DDL must fail the run");
+    let err = String::from_utf8_lossy(&res.stderr);
+    assert!(
+        err.contains("WRONG columns"),
+        "the failure must explain the misalignment risk: {err}"
+    );
+    let parts = std::fs::read_dir(&out)
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|x| x == "parquet")
+        })
+        .count();
+    assert_eq!(parts, 0, "no misaligned part may reach the destination");
+}
+
+// DDL BETWEEN runs is fine by construction: each run resolves fresh.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_ddl_between_runs_is_captured_with_each_runs_schema() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_ddl_btw");
+    let mut c = mysql::Pool::new(MYSQL_CDC_URL).unwrap().get_conn().unwrap();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {tbl} (id INT PRIMARY KEY, a VARCHAR(10), b VARCHAR(10))"
+    ))
+    .unwrap();
+    let _guard = Table(tbl.clone());
+    let (cfg, out) = ddl_cfg(&d, &tbl);
+    run_ok(&cfg); // pin
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1,'AAA','BBB')"))
+        .unwrap();
+    run_ok(&cfg); // captures the 3-column shape
+    c.query_drop(format!("ALTER TABLE {tbl} DROP COLUMN a"))
+        .unwrap();
+    c.query_drop(format!("INSERT INTO {tbl} (id,b) VALUES (2,'CCC')"))
+        .unwrap();
+    run_ok(&cfg); // captures the 2-column shape
+    // Both rows present across parts; the post-DDL row is well-formed.
+    let ids = distinct_int_ids(&out);
+    assert_eq!(ids.len(), 2, "both shapes captured across their runs");
+}
+
+// RENAME is positionally safe: same arity, values stay in their columns.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_mid_window_rename_is_positionally_safe() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_ddl_ren");
+    let mut c = mysql::Pool::new(MYSQL_CDC_URL).unwrap().get_conn().unwrap();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {tbl} (id INT PRIMARY KEY, a VARCHAR(10))"
+    ))
+    .unwrap();
+    let _guard = Table(tbl.clone());
+    let (cfg, out) = ddl_cfg(&d, &tbl);
+    run_ok(&cfg); // pin
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1,'AAA')"))
+        .unwrap();
+    c.query_drop(format!("ALTER TABLE {tbl} RENAME COLUMN a TO a2"))
+        .unwrap();
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (2,'ZZZ')"))
+        .unwrap();
+    run_ok(&cfg);
+    // Both values land under the RESOLVED (new) name, positions intact.
+    use arrow::array::StringArray;
+    let mut vals = Vec::new();
+    for b in read_all_parts(&out) {
+        let a2 = b
+            .column(b.schema().index_of("a2").expect("resolved name a2"))
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .clone();
+        for r in 0..b.num_rows() {
+            vals.push(a2.value(r).to_string());
+        }
+    }
+    assert_eq!(
+        vals,
+        vec!["AAA", "ZZZ"],
+        "values stay in their column across a rename"
+    );
+}
+
+fn ddl_cfg(d: &tempfile::TempDir, tbl: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let out = d.path().join("out");
+    let ckpt = d.path().join("cdc.ckpt");
+    std::fs::create_dir_all(&out).unwrap();
+    let yaml = format!(
+        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
+exports:
+  - name: {tbl}
+    table: {tbl}
+    mode: cdc
+    format: parquet
+    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        ckpt = ckpt.display(),
+        out = out.display(),
+        sid = server_id_for(tbl),
+    );
+    (write_config(d, &yaml), out)
+}
+
+fn run_ok(cfg: &std::path::Path) {
+    let st = std::process::Command::new(RIVET_BIN)
+        .args(["run", "--config", cfg.to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(st.success());
+}
+
+fn read_all_parts(out: &std::path::Path) -> Vec<arrow::record_batch::RecordBatch> {
+    let mut parts: Vec<_> = std::fs::read_dir(out)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "parquet"))
+        .collect();
+    parts.sort();
+    let mut out_b = Vec::new();
+    for p in parts {
+        let f = std::fs::File::open(&p).unwrap();
+        let r = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
+            .unwrap()
+            .build()
+            .unwrap();
+        for b in r {
+            out_b.push(b.unwrap());
+        }
+    }
+    out_b
+}

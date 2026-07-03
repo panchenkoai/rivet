@@ -407,6 +407,35 @@ fn flush(
             .map(|e| Some(e.position.0.to_string()))
             .collect::<StringArray>(),
     );
+    // Finding #37: a mid-window DDL desynchronizes the event images from the
+    // resolved schema — positional mapping then puts a dropped column's value
+    // into its NEIGHBOR (observed live: after DROP COLUMN a, row1's 'AAA'
+    // landed in column b, silently, status success). Binlog row events carry
+    // no column names, so v1 is the honest loud check: any image whose arity
+    // differs from the resolved schema aborts the flush with the recovery
+    // path spelled out. (Same-arity DDL — rename — is positionally safe;
+    // type changes are a schema-history feature, see the docs limitation.)
+    for ev in events {
+        let img = match ev.op {
+            ChangeOp::Delete => ev.before.as_ref(),
+            _ => ev.after.as_ref(),
+        };
+        if let Some(vals) = img
+            && vals.len() != columns.len()
+        {
+            anyhow::bail!(
+                "cdc: an event for table '{}' carries {} column(s) but the resolved \
+                 schema has {} — a DDL landed inside this capture window, and mapping \
+                 by position would put values into the WRONG columns. Recover by \
+                 re-snapshotting the table (delete its snapshot/_SUCCESS marker under \
+                 `initial: snapshot`) or by resetting the checkpoint past the DDL.",
+                ev.table,
+                vals.len(),
+                columns.len()
+            );
+        }
+    }
+
     let mut arrays: Vec<ArrayRef> = vec![ops, poss];
     for (i, m) in columns.iter().enumerate() {
         // Engine/native-type cell normalisation (e.g. MySQL binlog quirks: BIT

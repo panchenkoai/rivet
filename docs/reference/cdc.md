@@ -487,6 +487,23 @@ behaviour depends on whether rivet is **running**:
   which **releases** WAL and relieves the pressure) or drop the slot. If PostgreSQL
   is too degraded to answer, rivet's query fails → the run fails → re-read next run.
 
+**Memory is O(largest transaction).** The MySQL adapter buffers a whole
+transaction until its COMMIT (parts never split a transaction — the resume
+invariant). Measured: ~1.4 KB of RSS per buffered row (~14× a 100-byte
+payload): a 100k-row transaction drains at ~170 MB RSS, 300k at ~440 MB —
+linear, so a 10M-row bulk backfill in ONE transaction will not fit. Run bulk
+backfills in batched transactions, or through `mode: full`/`initial: snapshot`
+(the batch path streams). Spilling oversized transactions to disk is roadmap.
+
+**DDL inside a capture window fails loudly (never misaligns).** Binlog row
+events are positional and carry no column names; a `DROP`/`ADD COLUMN` landing
+BETWEEN captured events would shift values into the wrong columns. The sink
+refuses arity drift with a recovery hint (re-snapshot the table, or reset the
+checkpoint past the DDL). DDL *between* runs is fine — each run resolves the
+schema fresh; column RENAME is positionally safe even mid-window. Same-arity
+type changes are undetectable without schema history (roadmap) — run DDL
+migrations and their backfills through a re-snapshot.
+
 **The value checksum runs on CDC too.** The same always-on two-ended check the
 batch export performs — an independent fold of the decoded cells vs a fold of
 the built Arrow column — runs per column before every CDC part is written; a

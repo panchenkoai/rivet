@@ -12,6 +12,19 @@
   encoding shared by both sides; a new accessor per engine, enforced at compile time). An offline matrix
   guard pins the CDC fold to the builder across every covered type with hostile cells (overflow
   narrowing, wrong-width binary, arrays with inner NULLs, NaN, u64::MAX, 50-digit decimals).
+- **MySQL 8.4 support: binlog coordinates via `SHOW BINARY LOG STATUS` with a legacy fallback.**
+  8.4 removed `SHOW MASTER STATUS` (the version scout's first empirical catch — every anchor/pin path
+  died on the first run); rivet now tries the 8.2+ form first and falls back for older servers. The
+  full pilot flow (`initial: snapshot` → stream → idle) verified live against 8.4.10 AND 5.7.44.
+- **DDL inside a capture window fails loudly instead of silently misaligning values.** Binlog row
+  events are positional and nameless; after a mid-window `DROP COLUMN a`, the pre-DDL event's `a`
+  value landed in column `b` — silently, status success (observed live). The sink now refuses any
+  event whose arity differs from the resolved schema, with the recovery path in the error
+  (re-snapshot / reset the checkpoint past the DDL); no misaligned part reaches the destination.
+  DDL between runs and mid-window RENAME are pinned as safe.
+- **Documented: CDC memory is O(largest transaction).** Measured ~1.4 KB RSS per buffered row
+  (100k-row single transaction ≈ 170 MB, 300k ≈ 440 MB, linear) — bulk backfills belong in batched
+  transactions or the batch path; transaction spilling is roadmap.
 - **Staff-review test program: seven verification classes added in one pass.** (1) Concurrent-writer
   model-based test — 4 threads × 250 randomized ops over shared keys; conservation (events == the
   writers' affected-row counts) and convergence (the documented merge reproduces the source's exact
