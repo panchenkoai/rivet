@@ -226,6 +226,80 @@ impl CdcEngine {
             Self::Mssql => "mssql",
         }
     }
+
+    /// This engine's resume-anchor model — the per-engine contract CLAUDE.md
+    /// documents in prose, as code. It decides idle-first-run behaviour and
+    /// what `initial: snapshot` must do before reading a single row.
+    pub(crate) fn anchor_model(self) -> AnchorModel {
+        match self {
+            // The slot pins server-side at creation; the server holds WAL.
+            Self::Postgres => AnchorModel::ServerSide,
+            // NO server-side anchor: the first checkpointed open must persist
+            // its coordinates immediately, or an idle bounded run leaves no
+            // anchor and the next run silently re-anchors at "current".
+            Self::Mysql => AnchorModel::CheckpointAtOpen,
+            // No checkpoint ⇒ floors at fn_cdc_get_min_lsn: over-reads,
+            // never skips.
+            Self::Mssql => AnchorModel::FloorAtMin,
+        }
+    }
+
+    /// Ensure the resume anchor EXISTS — the `initial: snapshot` step ① and the
+    /// single entry point for anchor creation (idempotent: a present anchor is
+    /// left untouched). Which mechanism runs is decided by [`Self::anchor_model`]:
+    /// server-side engines create their server object; checkpoint-anchored
+    /// engines pin the current position into `checkpoint` when the file is
+    /// absent.
+    pub(crate) fn ensure_anchor(
+        self,
+        url: &str,
+        slot: &str,
+        checkpoint: Option<&std::path::Path>,
+        tls: Option<&crate::config::TlsConfig>,
+    ) -> Result<()> {
+        match self.anchor_model() {
+            AnchorModel::ServerSide => {
+                // Slot creation IS the anchor; open() creates it when missing.
+                drop(crate::source::postgres::cdc::PgChangeStream::open(
+                    url, slot, false, tls,
+                )?);
+                Ok(())
+            }
+            AnchorModel::CheckpointAtOpen | AnchorModel::FloorAtMin => {
+                let ckpt = checkpoint.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{} cdc: an anchor needs cdc.checkpoint (no server-side anchor exists)",
+                        self.label()
+                    )
+                })?;
+                if Position::load(ckpt)?.is_some() {
+                    return Ok(()); // anchored already — never move it
+                }
+                match self {
+                    Self::Mysql => {
+                        crate::source::mysql::cdc::MysqlChangeStream::pin_checkpoint_at_current(
+                            url, ckpt, tls,
+                        )
+                    }
+                    Self::Mssql => {
+                        crate::source::mssql::cdc::pin_checkpoint_at_max_lsn(url, ckpt, tls)
+                    }
+                    Self::Postgres => unreachable!("ServerSide handled above"),
+                }
+            }
+        }
+    }
+}
+
+/// How an engine anchors its resume position — see [`CdcEngine::anchor_model`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnchorModel {
+    /// The server object (PG slot) pins the position at creation.
+    ServerSide,
+    /// Client-only anchor: the checkpoint file, persisted at first open.
+    CheckpointAtOpen,
+    /// No checkpoint ⇒ reads floor at the retained minimum (over-read, never skip).
+    FloorAtMin,
 }
 
 /// Setup/permission hints appended to a CDC start-up error — so a missing grant
@@ -297,23 +371,96 @@ pub(crate) fn create_change_stream(cfg: &CdcConfig) -> Result<Box<dyn ChangeStre
     }
 }
 
-/// Resolve a CDC table's column type mappings from the source — the **same**
+/// Resolve CDC tables' column type mappings from the source — the **same**
 /// `RivetType` → Arrow pipeline the batch export uses — so the typed file sink
 /// writes identical columns (logical types `json`/`uuid`/…, real int widths, …)
-/// via [`crate::types::build_arrow_field`]. `tls` is threaded through the same
-/// gate as the streaming connection. `overrides` are the export's `columns:`
-/// declarations — the SAME override surface the batch export honours (e.g.
-/// `bigu: decimal(20,0)` for a BigQuery-bound unsigned bigint).
+/// via [`crate::types::build_arrow_field`]. Session-based: ONE source
+/// connection (plus, for MySQL, one enrichment connection) serves every table
+/// of a multi-table export — the per-table constructor cost was 2 connections
+/// per table per run.
+pub(crate) struct CdcSchemaResolver {
+    src: Box<dyn crate::source::Source>,
+    /// MySQL-only: one connection for the `information_schema.COLUMN_TYPE`
+    /// enrichment (wire metadata has no widths/labels for BIT/BINARY/ENUM/SET).
+    enrich: Option<mysql::PooledConn>,
+}
+
+impl CdcSchemaResolver {
+    pub(crate) fn connect(url: &str, tls: Option<&crate::config::TlsConfig>) -> Result<Self> {
+        let engine = CdcEngine::from_url(url)?;
+        let src: Box<dyn crate::source::Source> = match engine {
+            CdcEngine::Mysql => Box::new(crate::source::mysql::MysqlSource::connect_with_tls(
+                url, tls,
+            )?),
+            CdcEngine::Postgres => Box::new(
+                crate::source::postgres::PostgresSource::connect_with_tls(url, tls)?,
+            ),
+            CdcEngine::Mssql => Box::new(crate::source::mssql::MssqlSource::connect_with_tls(
+                url, tls,
+            )?),
+        };
+        let enrich = match engine {
+            CdcEngine::Mysql => Some(crate::source::mysql::connect_pool(url, tls)?.get_conn()?),
+            _ => None,
+        };
+        Ok(Self { src, enrich })
+    }
+
+    /// One table's mappings. `overrides` are the export's `columns:`
+    /// declarations for THIS table (already narrowed by
+    /// `types::overrides_for_table`) — the same override surface batch honours.
+    pub(crate) fn resolve(
+        &mut self,
+        table: &str,
+        overrides: &crate::types::ColumnOverrides,
+    ) -> Result<Vec<crate::types::TypeMapping>> {
+        // The table name is interpolated into `SELECT * FROM {table}` for the
+        // schema probe, so validate it to a plain `[schema.]table` identifier —
+        // no quote, paren, semicolon, or space can break out.
+        if table.is_empty()
+            || !table
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        {
+            anyhow::bail!(
+                "rivet cdc table must be a plain [schema.]table identifier (got {table:?}); \
+                 refusing to interpolate it into SQL"
+            );
+        }
+        let mut mappings = self
+            .src
+            .type_mappings(&format!("SELECT * FROM {table}"), overrides)?;
+        // MySQL: enrich `source_native_type` with the full
+        // `information_schema.COLUMN_TYPE` ("bit(8)", "binary(4)",
+        // "enum('a','b','c')") — the binlog cell fixes need widths + labels the
+        // wire metadata lacks. CDC-only; batch's contract-pinned native names
+        // stay untouched.
+        if let Some(conn) = self.enrich.as_mut() {
+            use mysql::prelude::Queryable;
+            let bare = table.rsplit('.').next().unwrap_or(table);
+            let full: Vec<(String, String)> = conn.exec(
+                "SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.COLUMNS \
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
+                (bare,),
+            )?;
+            for m in &mut mappings {
+                if let Some((_, ct)) = full.iter().find(|(n, _)| *n == m.column_name) {
+                    m.source_native_type = ct.clone();
+                }
+            }
+        }
+        Ok(mappings)
+    }
+}
+
+/// Single-table convenience over [`CdcSchemaResolver`] (CLI path + tests).
 pub(crate) fn resolve_cdc_columns(
     url: &str,
     table: &str,
     tls: Option<&crate::config::TlsConfig>,
     overrides: &crate::types::ColumnOverrides,
 ) -> Result<Vec<crate::types::TypeMapping>> {
-    use crate::source::Source;
-    // The table name is interpolated into `SELECT * FROM {table}` for the schema
-    // probe, so validate it to a plain `[schema.]table` identifier — no quote,
-    // paren, semicolon, or space can break out (mirrors the capture-instance check).
+    // Validate BEFORE connecting, so a hostile table name needs no database.
     if table.is_empty()
         || !table
             .chars()
@@ -324,43 +471,7 @@ pub(crate) fn resolve_cdc_columns(
              refusing to interpolate it into SQL"
         );
     }
-    let engine = CdcEngine::from_url(url)?;
-    let mut src: Box<dyn Source> = match engine {
-        CdcEngine::Mysql => Box::new(crate::source::mysql::MysqlSource::connect_with_tls(
-            url, tls,
-        )?),
-        CdcEngine::Postgres => Box::new(crate::source::postgres::PostgresSource::connect_with_tls(
-            url, tls,
-        )?),
-        CdcEngine::Mssql => Box::new(crate::source::mssql::MssqlSource::connect_with_tls(
-            url, tls,
-        )?),
-    };
-    let mut mappings = src.type_mappings(&format!("SELECT * FROM {table}"), overrides)?;
-    // MySQL: the wire metadata the probe sees has no widths or labels for
-    // BIT/BINARY/ENUM/SET ("bit", "binary", "enum"), but the binlog cell fixes
-    // (`value::mysql_cell_fix`) need them — BINARY's pad width and ENUM's label
-    // list in particular. Enrich `source_native_type` with the full
-    // `information_schema.COLUMN_TYPE` ("bit(8)", "binary(4)",
-    // "enum('a','b','c')"); CDC-only, so the batch path's contract-pinned
-    // native names stay untouched.
-    if engine == CdcEngine::Mysql {
-        use mysql::prelude::Queryable;
-        let pool = crate::source::mysql::connect_pool(url, tls)?;
-        let mut conn = pool.get_conn()?;
-        let bare = table.rsplit('.').next().unwrap_or(table);
-        let full: Vec<(String, String)> = conn.exec(
-            "SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.COLUMNS \
-             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
-            (bare,),
-        )?;
-        for m in &mut mappings {
-            if let Some((_, ct)) = full.iter().find(|(n, _)| *n == m.column_name) {
-                m.source_native_type = ct.clone();
-            }
-        }
-    }
-    Ok(mappings)
+    CdcSchemaResolver::connect(url, tls)?.resolve(table, overrides)
 }
 
 /// One table's destination wiring for a capture — see [`CdcCapture::outputs`].
@@ -403,8 +514,11 @@ pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<Vec<crate::manifest::Ru
     let mut stream = create_change_stream(&cap.cdc_cfg)?;
     let engine = CdcEngine::from_url(&url)?;
     let mut outputs = Vec::with_capacity(cap.outputs.len());
+    // ONE resolver session serves every table (was: 2 fresh connections per
+    // table per run — the multi-table per-cycle cost the roast flagged).
+    let mut resolver = CdcSchemaResolver::connect(&url, tls.as_ref())?;
     for o in cap.outputs {
-        let columns = resolve_cdc_columns(&url, &o.table, tls.as_ref(), &o.overrides)?;
+        let columns = resolver.resolve(&o.table, &o.overrides)?;
         outputs.push(sink::TableOutput {
             table: o.table,
             columns,

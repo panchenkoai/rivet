@@ -118,40 +118,18 @@ pub(super) fn initial_snapshot_pending(
     let url = config.source.resolve_url()?;
     let tls = config.source.tls.as_ref();
 
-    // 1) The anchor, engine by engine (idempotent: only created when absent).
-    match CdcEngine::from_url(&url)? {
-        CdcEngine::Postgres => {
-            // Slot creation IS the anchor; open() creates it when missing.
-            let slot = cdc
-                .slot
-                .clone()
-                .unwrap_or_else(|| crate::config::DEFAULT_PG_SLOT.to_string());
-            drop(crate::source::postgres::cdc::PgChangeStream::open(
-                &url, &slot, false, tls,
-            )?);
-        }
-        engine @ (CdcEngine::Mysql | CdcEngine::Mssql) => {
-            // The checkpoint file is the anchor (validation guarantees it is
-            // configured for `initial: snapshot`).
-            let ckpt = PathBuf::from(cdc.checkpoint.as_deref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "export '{}': initial snapshot requires cdc.checkpoint",
-                    export.name
-                )
-            })?);
-            let anchored = crate::source::cdc::Position::load(&ckpt)?.is_some();
-            if !anchored {
-                match engine {
-                    CdcEngine::Mysql => {
-                        crate::source::mysql::cdc::MysqlChangeStream::pin_checkpoint_at_current(
-                            &url, &ckpt, tls,
-                        )?
-                    }
-                    _ => crate::source::mssql::cdc::pin_checkpoint_at_max_lsn(&url, &ckpt, tls)?,
-                }
-            }
-        }
-    }
+    // 1) The anchor — one entry point; the engine's AnchorModel decides the
+    //    mechanism (idempotent: a present anchor is never moved).
+    let slot = cdc
+        .slot
+        .clone()
+        .unwrap_or_else(|| crate::config::DEFAULT_PG_SLOT.to_string());
+    CdcEngine::from_url(&url)?.ensure_anchor(
+        &url,
+        &slot,
+        cdc.checkpoint.as_deref().map(std::path::Path::new),
+        tls,
+    )?;
 
     // 2) Which tables still need their snapshot (no `snapshot/_SUCCESS` yet).
     let (tables, multi) = match (&export.tables, &export.table) {
