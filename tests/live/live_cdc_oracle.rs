@@ -43,19 +43,10 @@ fn cdc_types_round_trip_via_duckdb_and_clickhouse() {
 
     // Capture into the shared bind mount both engines can read.
     let (host, container) = clickhouse_shared_workdir("cdc_oracle");
-    let yaml = format!(
-        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: {table}
-    table: {table}
-    mode: cdc
-    format: parquet
-    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: 8888 }}
-    destination: {{ type: local, path: "{host}" }}
-"#,
-        ckpt = ckpt.display(),
-        host = host.display(),
-    );
+    let yaml = Rig::mysql_cdc(table)
+        .checkpoint_path(ckpt.clone())
+        .dest_path(host.clone())
+        .yaml();
     let cfg = write_config(&d, &yaml);
     let res = Command::new(RIVET_BIN)
         .args(["run", "--config", cfg.to_str().unwrap()])

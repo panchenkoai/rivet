@@ -293,8 +293,14 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 .next()
                 .unwrap_or("?")
                 .to_string();
-            let runs_capture =
-                chunk.contains("run_cdc(") || chunk.contains("Command::new(RIVET_BIN)");
+            // Capture spellings: the rig's runners plus the two legacy
+            // forms (run_cdc helper, direct Command) bespoke sites keep.
+            let runs_capture = chunk.contains("run_cdc(")
+                || chunk.contains("Command::new(RIVET_BIN)")
+                || chunk.contains("run_ok(")
+                || chunk.contains("run_with_env(")
+                || chunk.contains("run_expect_fail(")
+                || chunk.contains("run_and_read(");
             // Outcome = the test READS BACK what the capture produced (files,
             // destination listing, or the state DB) — not merely that the
             // process exited 0.
@@ -306,7 +312,12 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 || chunk.contains("gcs list")
                 || chunk.contains("query_row")
                 || chunk.contains("status.success()")
-                // Read-back helpers the newer suites use:
+                // Read-back helpers the newer suites use. This dictionary
+                // is INTENTIONALLY wide: the read-backs differ because the
+                // oracles differ (manifest vs parquet vs csv vs gcs listing
+                // vs doctor json) — measured during the rig standardization:
+                // 16 of 17 markers are live. Do not collapse it into one
+                // canonical reader; oracle diversity is the defense.
                 || chunk.contains("distinct_ids(")
                 || chunk.contains("distinct_int_ids(")
                 || chunk.contains("read_all(")

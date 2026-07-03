@@ -1,9 +1,9 @@
 //! The canonical live-test rig: ONE way to build a config, run rivet, and
 //! read the output back. Replaces ~250 hand-rolled YAML templates and ~240
 //! inline `Command::new(RIVET_BIN)` sites (measured before the
-//! standardization pass) — and gives the conformance gate a single marker:
-//! a capture test is one that calls `Rig::run*`, an outcome is read via
-//! `read_*`/`run_and_read`.
+//! standardization pass). The conformance gate recognizes `Rig::run*` as its
+//! capture markers; outcome read-backs stay diverse on purpose (the oracle
+//! dictionary in cdc_conformance_gate.rs — measured live, not collapsible).
 
 use std::path::{Path, PathBuf};
 
