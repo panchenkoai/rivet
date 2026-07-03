@@ -199,7 +199,7 @@ fn parse_test_decoding(lsn: &str, data: &str) -> Option<ChangeEvent> {
     };
     let named = parse_columns(new_part);
     let old_named = old_key_part.map(parse_columns);
-    let names: Vec<String> = named.iter().map(|(n, _)| n.clone()).collect();
+    let names: std::sync::Arc<[String]> = named.iter().map(|(n, _)| n.clone()).collect();
     let cols: Vec<RivetValue> = named.into_iter().map(|(_, v)| v).collect();
     // The wire text names EVERY column — carry the names for every op, so
     // the sink maps by NAME and the whole positional-corruption class

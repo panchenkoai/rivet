@@ -1178,16 +1178,6 @@ fn pg_cdc_delete_with_non_first_pk_lands_in_the_pk_column() {
     assert!(checked_delete, "a delete event must be captured");
 }
 
-struct Slot(String);
-impl Drop for Slot {
-    fn drop(&mut self) {
-        use postgres::NoTls;
-        if let Ok(mut c) = postgres::Client::connect(POSTGRES_CDC_URL, NoTls) {
-            let _ = c.execute("SELECT pg_drop_replication_slot($1)", &[&self.0]);
-        }
-    }
-}
-
 fn pg_mbt_cfg(
     d: &tempfile::TempDir,
     tbl: &str,

@@ -248,7 +248,7 @@ CDC change-table retention (the cleanup job removed it). Resuming would silently
                 position: Position(json!({ "lsn": lsn })),
                 // The change table only ever holds already-committed changes.
                 committed: true,
-                image_names: Some(names),
+                image_names: Some(std::sync::Arc::from(names)),
             });
         }
         Ok(())

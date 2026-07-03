@@ -483,13 +483,18 @@ fn flush(
             i: usize,
             col: &str,
             ncols: usize,
+            memo: Option<(&std::sync::Arc<[String]>, Option<usize>)>,
         ) -> Option<&'e RivetValue> {
             let vals = match e.op {
                 ChangeOp::Delete => e.before.as_ref()?,
                 _ => e.after.as_ref()?,
             };
             match &e.image_names {
-                Some(names) => match names.iter().position(|n| n == col) {
+                Some(names) => match memo
+                    .filter(|(m, _)| std::sync::Arc::ptr_eq(m, names))
+                    .map(|(_, j)| j)
+                    .unwrap_or_else(|| names.iter().position(|n| n == col))
+                {
                     Some(j) => vals.get(j),
                     // Name absent: a mid-window RENAME leaves the value under
                     // its OLD name — when the arity still matches, position is
@@ -502,18 +507,25 @@ fn flush(
                 None => vals.get(i),
             }
         }
+        // O(1) name lookup for the common case: all events in a flush share
+        // one names-Arc (same TABLE_MAP / same wire session), so resolve this
+        // column's image index once and reuse it by pointer identity.
+        let memo_arc = events.iter().find_map(|e| e.image_names.as_ref());
+        let memo = memo_arc.map(|names| (names, names.iter().position(|n| n == &m.column_name)));
         let render = value::render_type(m.arrow_type.as_ref());
         let owned: Option<Vec<Option<RivetValue>>> = fix.as_ref().map(|fix| {
             events
                 .iter()
-                .map(|e| image_cell(e, i, &m.column_name, columns.len()).map(|v| fix.apply(v)))
+                .map(|e| {
+                    image_cell(e, i, &m.column_name, columns.len(), memo).map(|v| fix.apply(v))
+                })
                 .collect()
         });
         let cells: Vec<Option<&RivetValue>> = match &owned {
             Some(o) => o.iter().map(|c| c.as_ref()).collect(),
             None => events
                 .iter()
-                .map(|e| image_cell(e, i, &m.column_name, columns.len()))
+                .map(|e| image_cell(e, i, &m.column_name, columns.len(), memo))
                 .collect(),
         };
         let arr = value::build_column(&render, &cells)?;

@@ -201,7 +201,7 @@ impl MysqlChangeStream {
                 // class (findings #37/#41) closes on MySQL too. Under the
                 // MINIMAL default this yields None and the arity guard stays
                 // load-bearing; `rivet doctor` recommends FULL.
-                let image_names: Option<Vec<String>> =
+                let image_names: Option<std::sync::Arc<[String]>> =
                     tme.iter_optional_meta().find_map(|f| match f {
                         Ok(mysql::binlog::events::OptionalMetadataField::ColumnName(names)) => {
                             Some(

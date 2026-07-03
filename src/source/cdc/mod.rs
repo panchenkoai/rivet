@@ -94,7 +94,7 @@ pub(crate) struct ChangeEvent {
     /// class (findings #37/#41/#42: mid-window DDL shifts, non-first PK
     /// deletes) is unrepresentable. `None` ⇒ positional full row (MySQL
     /// binlog carries no names; its arity guard stays load-bearing).
-    pub(crate) image_names: Option<Vec<String>>,
+    pub(crate) image_names: Option<std::sync::Arc<[String]>>,
 }
 
 impl ChangeEvent {

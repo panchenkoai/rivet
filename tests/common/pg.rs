@@ -114,3 +114,16 @@ pub fn seed_pg_wide_table(row_count: i64, payload_len: usize) -> PgTable {
 
     PgTable { name }
 }
+
+/// RAII guard for a logical replication slot — drops it on scope exit so an
+/// aborted test never leaks a slot into `max_replication_slots`.
+pub struct Slot(pub String);
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let url = std::env::var("POSTGRES_CDC_URL")
+            .unwrap_or_else(|_| "postgresql://rivet:rivet@127.0.0.1:5434/rivet".to_string());
+        if let Ok(mut c) = postgres::Client::connect(&url, postgres::NoTls) {
+            let _ = c.execute("SELECT pg_drop_replication_slot($1)", &[&self.0]);
+        }
+    }
+}

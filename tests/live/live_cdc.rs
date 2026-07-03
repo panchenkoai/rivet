@@ -413,17 +413,6 @@ fn cdc_crash_after_flush_before_ack_re_reads_on_resume() {
 
 // ─── PostgreSQL: the slot-advance side of at-least-once ──────────────────────
 
-/// Drops the test's logical replication slot on teardown — a slot pins WAL until
-/// removed, so leaking one across runs would fill the dev disk.
-struct Slot(String);
-impl Drop for Slot {
-    fn drop(&mut self) {
-        if let Ok(mut c) = postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls) {
-            let _ = c.execute("SELECT pg_drop_replication_slot($1)", &[&self.0]);
-        }
-    }
-}
-
 fn pg_cdc_config(
     d: &tempfile::TempDir,
     tbl: &str,
