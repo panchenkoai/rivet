@@ -67,6 +67,8 @@ mod live_catalog_hints;
 mod live_cdc;
 #[path = "live/live_cdc_golden.rs"]
 mod live_cdc_golden;
+#[path = "live/live_cdc_mbt.rs"]
+mod live_cdc_mbt;
 #[path = "live/live_cdc_mssql.rs"]
 mod live_cdc_mssql;
 #[path = "live/live_cdc_oracle.rs"]

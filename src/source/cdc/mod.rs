@@ -503,10 +503,13 @@ pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<Vec<crate::manifest::Ru
     let tls = cap.cdc_cfg.tls.clone();
     let checkpoint = cap.cdc_cfg.checkpoint.clone();
     let mut stream = create_change_stream(&cap.cdc_cfg)?;
+    // Fault point: stream (and any server-side anchor) opened, nothing read.
+    crate::test_hook::maybe_panic_at("cdc_after_open");
     let engine = CdcEngine::from_url(&url)?;
     let mut outputs = Vec::with_capacity(cap.outputs.len());
     // ONE resolver session serves every table (was: 2 fresh connections per
     // table per run — the multi-table per-cycle cost the roast flagged).
+    crate::test_hook::maybe_panic_at("cdc_before_resolve");
     let mut resolver = CdcSchemaResolver::connect(&url, tls.as_ref())?;
     for o in cap.outputs {
         let columns = resolver.resolve(&o.table, &o.overrides)?;

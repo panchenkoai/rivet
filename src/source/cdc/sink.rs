@@ -179,7 +179,14 @@ fn roll_all(
         if let Some(ck) = checkpoint {
             p.save(ck)?;
         }
+        // Fault point: checkpoint persisted, source NOT acked — a crash here
+        // must re-read (PG would re-peek; the file checkpoint already moved,
+        // so MySQL resumes from it — both are at-least-once).
+        crate::test_hook::maybe_panic_at("cdc_after_checkpoint_before_ack");
         stream.ack(p)?;
+        // Fault point: fully durable + acked — a crash here loses nothing and
+        // must not duplicate on resume (the checkpoint already advanced).
+        crate::test_hook::maybe_panic_at("cdc_after_ack");
         *unacked_commit = false;
     }
     Ok(())
@@ -272,6 +279,11 @@ pub(crate) fn run_to_files(
             &mut unacked_commit,
         )?;
     }
+
+    // Fault point: all parts durable + acked, no manifest yet — a crash here
+    // leaves a resumable prefix (parts without _SUCCESS), and the retry must
+    // complete it without re-capturing acked data.
+    crate::test_hook::maybe_panic_at("cdc_before_manifest");
 
     // Clean end → write each table's run manifest + _SUCCESS (bounded-run concept).
     let mut manifests = Vec::with_capacity(sinks.len());
