@@ -106,12 +106,55 @@ const CASES: &[(&str, Expect, Expect, Expect)] = &[
             instance per stream)",
         ),
     ),
+    (
+        "gremlin_sigkill_mid_drain",
+        Test("fn gremlin_cdc_sigkill_mid_drain_recovers_without_gap"),
+        NA(
+            "the kill window exercises the shared sink/commit seam; pinned once \
+            on MySQL (the engine with the client-only anchor, the hardest case)",
+        ),
+        NA("same shared seam; MSSQL's poll model re-reads from LSN by design"),
+    ),
+    (
+        "gremlin_network_cut_mid_stream",
+        Test("fn gremlin_cdc_binlog_cut_mid_drain_fails_loud_then_recovers"),
+        NA(
+            "PG polls via SQL per cycle (no long-lived replication stream to \
+            cut); connection loss = a failed poll, covered by chaos suite",
+        ),
+        NA("MSSQL polls change tables via SQL; same as PG"),
+    ),
+    (
+        "gremlin_destination_outage_mid_drain",
+        Test("fn gremlin_cdc_gcs_upload_cut_fails_loud_then_recovers_without_clobber"),
+        NA(
+            "destination seam is engine-agnostic (shared commit path); pinned \
+            once via the MySQL stream",
+        ),
+        NA("same engine-agnostic destination seam"),
+    ),
+    (
+        "gremlin_checkpoint_write_failure",
+        Test("fn gremlin_cdc_checkpoint_write_failure_is_loud_and_lossless"),
+        NA(
+            "checkpoint save is the shared Position::save path; PG's primary \
+            anchor is the slot (server-side)",
+        ),
+        NA("same shared Position::save path; pinned once on MySQL"),
+    ),
+    (
+        "gremlin_capture_job_stall",
+        NA("MySQL has no external capture job — the binlog IS the capture"),
+        NA("PG has no external capture job — the slot decodes on read"),
+        Test("fn gremlin_mssql_capture_job_stall_loses_nothing"),
+    ),
 ];
 
 #[test]
 fn every_cdc_engine_covers_every_conformance_case() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mysql_pg = fs::read_to_string(root.join("tests/live/live_cdc.rs")).unwrap();
+    let mut mysql_pg = fs::read_to_string(root.join("tests/live/live_cdc.rs")).unwrap();
+    mysql_pg.push_str(&fs::read_to_string(root.join("tests/live/gremlin_cdc.rs")).unwrap());
     let mssql = fs::read_to_string(root.join("tests/live/live_cdc_mssql.rs")).unwrap();
 
     let mut missing = Vec::new();

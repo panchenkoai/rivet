@@ -458,6 +458,8 @@ services:
       - "8474:8474"   # HTTP API
       - "15432:15432"  # proxied Postgres
       - "13306:13306"  # proxied MySQL
+      - "13307:13307"  # proxied mysql-cdc (gremlin: binlog cut mid-drain)
+      - "14443:14443"  # proxied fake-gcs (gremlin: upload cut mid-part)
     depends_on:
       - postgres
       - mysql

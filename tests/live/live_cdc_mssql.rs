@@ -237,6 +237,119 @@ fn mssql_cdc_mixed_transaction_and_qualified_table_conformance() {
     );
 }
 
+// Gremlin CG4: the capture job (SQL Server Agent) stalls mid-life —
+// `sys.sp_cdc_stop_job` freezes the change tables. Changes landing during the
+// stall must NOT be lost: the stalled-window run captures nothing new (and
+// must not advance past it), and after the job restarts they all appear.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn gremlin_mssql_capture_job_stall_loses_nothing() {
+    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    // Self-heal first: an earlier aborted run of THIS test may have left the
+    // capture job disabled/stopped (the fault it injects is exactly that).
+    mssql_cdc_try_exec(
+        "EXEC msdb.dbo.sp_update_job @job_name = N'cdc.rivet_capture', @enabled = 1",
+    );
+    mssql_cdc_try_exec("EXEC sys.sp_cdc_start_job @job_type = N'capture'");
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("rivet_cdc_stall");
+    let ci = format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT)"
+    ));
+    enable_cdc(&table, &ci);
+    let _guard = CdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+    let ckpt = d.path().join("cdc.ckpt");
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (1,10)"));
+    wait_for_capture(&ci, 1);
+    let out1 = d.path().join("out1");
+    std::fs::create_dir_all(&out1).unwrap();
+    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out1));
+    assert_eq!(manifest_rows(&out1), 1);
+
+    // Stall the capture job: DISABLE it (so the scheduler cannot restart it)
+    // and stop it tolerantly — between polls the job is "not running" and a
+    // bare sp_cdc_stop_job refuses.
+    // Re-enable guard armed BEFORE the first manipulation — a panic anywhere
+    // in the stall sequence must never leave the SHARED capture job disabled
+    // (that cascades into every other mssql test's wait_for_capture).
+    struct JobGuard;
+    impl Drop for JobGuard {
+        fn drop(&mut self) {
+            mssql_cdc_try_exec(
+                "EXEC msdb.dbo.sp_update_job @job_name = N'cdc.rivet_capture', @enabled = 1",
+            );
+            mssql_cdc_try_exec("EXEC sys.sp_cdc_start_job @job_type = N'capture'");
+        }
+    }
+    let _job = JobGuard;
+    mssql_cdc_try_exec(
+        "EXEC msdb.dbo.sp_update_job @job_name = N'cdc.rivet_capture', @enabled = 0",
+    );
+    // The continuous job may be BETWEEN polls (stop refused) or mid-poll —
+    // retry the stop until msdb reports no running instance, or the "stall"
+    // never actually happened and the test is meaningless (the earlier flake).
+    let running = || -> i64 {
+        mssql_cdc_query_i64(
+            "SELECT COUNT(*) FROM msdb.dbo.sysjobactivity ja \
+             JOIN msdb.dbo.sysjobs j ON ja.job_id = j.job_id \
+             WHERE j.name = 'cdc.rivet_capture' \
+               AND ja.session_id = (SELECT MAX(session_id) FROM msdb.dbo.syssessions) \
+               AND ja.start_execution_date IS NOT NULL \
+               AND ja.stop_execution_date IS NULL",
+        )
+    };
+    let stop_deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while running() > 0 {
+        mssql_cdc_try_exec("EXEC sys.sp_cdc_stop_job @job_type = N'capture'");
+        assert!(
+            std::time::Instant::now() < stop_deadline,
+            "could not stop the capture job — the stall precondition never held"
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (2,20),(3,30)"));
+
+    // Run during the stall: nothing new to read — and that must be a plain
+    // 0-row run, never an advance past the uncaptured changes.
+    let out2 = d.path().join("out2");
+    std::fs::create_dir_all(&out2).unwrap();
+    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out2));
+    assert_eq!(manifest_rows(&out2), 0, "stalled job ⇒ nothing new visible");
+
+    // Job back: the changes must ALL appear on the next run.
+    mssql_cdc_try_exec(
+        "EXEC msdb.dbo.sp_update_job @job_name = N'cdc.rivet_capture', @enabled = 1",
+    );
+    mssql_cdc_try_exec("EXEC sys.sp_cdc_start_job @job_type = N'capture'");
+    // The continuous capture job takes noticeably longer to come back after a
+    // disable+stop than its steady-state poll cadence — give it up to 120 s.
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    while mssql_cdc_query_i64(&format!("SELECT COUNT(*) FROM cdc.{ci}_CT")) < 3 {
+        // Retry the start each pass — it can race an old instance winding
+        // down ("already running") and be refused transiently.
+        mssql_cdc_try_exec("EXEC sys.sp_cdc_start_job @job_type = N'capture'");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "capture job did not resume within 120s after re-enable"
+        );
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    let out3 = d.path().join("out3");
+    std::fs::create_dir_all(&out3).unwrap();
+    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out3));
+    assert_eq!(
+        manifest_rows(&out3),
+        2,
+        "changes landed during the stall must appear after the job restarts"
+    );
+}
+
 // UPDATE and DELETE through the typed surface (the matrix pins INSERTs only):
 // an UPDATE's after-image must equal a batch export of the post-update state,
 // column type for column type; a DELETE's image must carry the typed PK.

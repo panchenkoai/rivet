@@ -55,6 +55,8 @@ mod audit_target_typo;
 mod batch_memory_policy;
 #[path = "live/gremlin.rs"]
 mod gremlin;
+#[path = "live/gremlin_cdc.rs"]
+mod gremlin_cdc;
 #[path = "live/live_azure_multipart.rs"]
 mod live_azure_multipart;
 #[path = "live/live_catalog_hints.rs"]

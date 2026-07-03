@@ -207,3 +207,14 @@ the PR base: a NEW config key must be named by at least one test. The
 campaign's worst bugs lived at the intersection of two individually-correct
 knobs (`initial` × vanished-slot, `initial` × `skip_empty`) — a new knob
 enters review with its interaction tests or not at all.
+
+## CDC gremlins (real faults)
+
+`tests/live/gremlin_cdc.rs` (+ the capture-job stall in `live_cdc_mssql.rs`)
+injects REAL fault classes — SIGKILL, a TCP cut mid-binlog-stream, a hard
+destination outage, a failed checkpoint write, a stalled capture job — and
+asserts the at-least-once contract from the outside: the failure is loud, and
+after healing the union of all parts holds every source row (overlap fine,
+gap never). Panic-hook tests cannot cover these: a panic unwinds and runs
+`Drop` guards; none of the above do. Requires toxiproxy + fake-gcs from the
+compose stack; each case is a row in the conformance matrix.

@@ -103,6 +103,27 @@ pub fn toxi_add_latency(proxy: &str, latency_ms: u64) -> String {
     toxic_name
 }
 
+/// Cut the connection after `bytes` of downstream data — a DETERMINISTIC
+/// mid-stream network failure (unlike latency/timeout, the cut point does not
+/// depend on timing). Simulates a binlog/replication connection dying partway
+/// through a drain, or an upload dying partway through a part.
+/// `stream`: "downstream" cuts server→client (a binlog/replication read);
+/// "upstream" cuts client→server (an upload). NOTE: the byte budget is
+/// PER-CONNECTION — pick a limit smaller than a single transfer if the client
+/// may open a fresh connection per request.
+pub fn toxi_add_limit_data(proxy: &str, bytes: u64, stream: &str) -> String {
+    let toxic_name = unique_name("rivet_limit");
+    let payload = format!(
+        r#"{{"name":"{toxic_name}","type":"limit_data","stream":"{stream}","toxicity":1.0,"attributes":{{"bytes":{bytes}}}}}"#
+    );
+    let (code, body) = toxi_admin("POST", &format!("/proxies/{proxy}/toxics"), Some(&payload));
+    assert!(
+        code == 200,
+        "add limit_data to {proxy}: status {code}, body:\n{body}"
+    );
+    toxic_name
+}
+
 /// Disable the proxy — every open connection is closed and new ones refused
 /// until re-enabled.  Simulates a hard "database went away" event.
 pub fn toxi_disable(proxy: &str) {

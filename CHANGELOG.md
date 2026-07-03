@@ -12,6 +12,17 @@
   encoding shared by both sides; a new accessor per engine, enforced at compile time). An offline matrix
   guard pins the CDC fold to the builder across every covered type with hostile cells (overflow
   narrowing, wrong-width binary, arrays with inner NULLs, NaN, u64::MAX, 50-digit decimals).
+- **Gremlin suite for CDC: real faults, not panics.** Five fault classes the `RIVET_TEST_PANIC_AT`
+  matrix structurally cannot exercise (a panic unwinds and runs `Drop`; these do not): SIGKILL
+  mid-drain, the binlog TCP stream cut after N bytes (toxiproxy `limit_data` — deterministic), a hard
+  destination outage mid-drain (proxy disabled once the first part is up; a per-connection byte limit
+  is defeated by the destination retry layer — observed live), a checkpoint write failure (EACCES)
+  after a durable flush, and a SQL Server capture-job stall (`sp_update_job` disable + verified stop —
+  `sysjobactivity` keeps never-closed rows from PAST agent sessions, so the check is scoped to the
+  newest `syssessions` entry; the re-enable guard is armed BEFORE the first manipulation, or a panic
+  leaves the SHARED job disabled and cascades into every other test). Each asserts the at-least-once
+  contract from the outside: loud failure, then a healed retry whose union of parts holds every row —
+  overlap allowed, gap never. All five are rows in the conformance matrix.
 - **Test harness: three standing hard gates distilled from the campaign.** (1) A CDC engine
   conformance gate (offline, plain `cargo test`) requiring every engine to carry every conformance
   case — resume, idle-first-run, crash-before-ack, type matrix, update/delete, initial snapshot,
