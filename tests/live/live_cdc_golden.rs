@@ -267,6 +267,11 @@ fn cdc_golden_fixture_tables_calculated_metrics() {
         "audit_log",
         "orders_coalesce",
     ];
+    // The suite owns its fixture SCHEMAS (CI's mysql-cdc starts empty; the
+    // local stack happens to carry them in a persistent volume — a
+    // works-on-my-volume trap the first CI run exposed). Data is written by
+    // the test itself, so schemas are all that is needed.
+    ensure_fixture_schemas(&mut c);
     let mut names = std::collections::HashMap::new();
     let mut guards = Vec::new();
     for f in fixtures {
@@ -748,4 +753,41 @@ exports:
         last.0, 3,
         "latest-by-(__pos, order) is the true final image"
     );
+}
+
+/// The eight batch-fixture schemas, embedded so the golden suite runs on a
+/// FRESH server (CI) exactly as on the seeded local stack. `IF NOT EXISTS`:
+/// the local fixtures (with their seed data) win when present.
+fn ensure_fixture_schemas(c: &mut mysql::PooledConn) {
+    for ddl in [
+        "CREATE TABLE IF NOT EXISTS transactions (id BIGINT NOT NULL, user_id INT NOT NULL, \
+         amount DECIMAL(12,2) NOT NULL, status VARCHAR(16) NOT NULL, created_at DATETIME NOT \
+         NULL, updated_at DATETIME NOT NULL, PRIMARY KEY (id), KEY idx_transactions_updated_at \
+         (updated_at))",
+        "CREATE TABLE IF NOT EXISTS sessions (id BIGINT NOT NULL, session_uuid CHAR(36) NOT \
+         NULL, user_id INT NOT NULL, session_start DATETIME NOT NULL, session_end DATETIME NOT \
+         NULL, PRIMARY KEY (id), KEY idx_sessions_start (session_start))",
+        "CREATE TABLE IF NOT EXISTS email_queue (id BIGINT NOT NULL AUTO_INCREMENT, to_email \
+         VARCHAR(200) NOT NULL, subject VARCHAR(300) NOT NULL, body TEXT, status VARCHAR(20) \
+         NOT NULL DEFAULT 'pending', scheduled_at DATETIME NOT NULL, PRIMARY KEY (id))",
+        "CREATE TABLE IF NOT EXISTS product_catalog (sku VARCHAR(24) NOT NULL, name \
+         VARCHAR(200) NOT NULL, category VARCHAR(60) NOT NULL, price DECIMAL(10,2) NOT NULL, \
+         active TINYINT(1) NOT NULL DEFAULT 1, updated_at DATETIME NOT NULL, PRIMARY KEY (sku))",
+        "CREATE TABLE IF NOT EXISTS metric_samples (id BIGINT NOT NULL AUTO_INCREMENT, host \
+         VARCHAR(80) NOT NULL, metric_name VARCHAR(80) NOT NULL, value DOUBLE NOT NULL, \
+         captured_at DATETIME NOT NULL, PRIMARY KEY (id))",
+        "CREATE TABLE IF NOT EXISTS logs_archive (id BIGINT NOT NULL, payload TEXT, created_at \
+         DATETIME NOT NULL, updated_at DATETIME DEFAULT NULL, PRIMARY KEY (id), KEY \
+         idx_logs_archive_created (created_at))",
+        "CREATE TABLE IF NOT EXISTS audit_log (id BIGINT NOT NULL, actor_id INT NOT NULL, \
+         action_hash CHAR(32) NOT NULL, action VARCHAR(16) NOT NULL, logged_at DATETIME NOT \
+         NULL, PRIMARY KEY (id))",
+        "CREATE TABLE IF NOT EXISTS orders_coalesce (id BIGINT NOT NULL AUTO_INCREMENT, \
+         product VARCHAR(200) NOT NULL, quantity INT NOT NULL, price DECIMAL(10,2) NOT NULL, \
+         updated_at DATETIME DEFAULT NULL, created_at DATETIME NOT NULL, PRIMARY KEY (id), KEY \
+         idx_orders_coalesce_updated_at (updated_at), KEY idx_orders_coalesce_created_at \
+         (created_at))",
+    ] {
+        c.query_drop(ddl).unwrap();
+    }
 }

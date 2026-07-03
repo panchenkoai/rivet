@@ -335,7 +335,7 @@ jobs:
         # profile and is required by the new MySQL `mysql_proxysql_*` tests in
         # tests/live_pool_safety.rs (added in 0.6.0); without it
         # `require_alive(LiveService::ProxySql)` panics before the test runs.
-        run: docker compose --profile pool --profile cdc --profile replica up -d postgres mysql mssql minio fake-gcs azurite toxiproxy pgbouncer proxysql postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica
+        run: docker compose --profile pool --profile cdc --profile replica up -d postgres mysql mssql minio fake-gcs azurite toxiproxy pgbouncer proxysql postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica duckdb clickhouse
 
       - name: Wait for services
         run: |
