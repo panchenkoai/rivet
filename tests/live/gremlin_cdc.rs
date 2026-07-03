@@ -41,20 +41,12 @@ fn cdc_cfg(
     ckpt: &std::path::Path,
     out: &std::path::Path,
 ) -> std::path::PathBuf {
-    let yaml = format!(
-        r#"source: {{type: mysql, url: "{url}"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: cdc
-    format: parquet
-    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid}, rollover: 200 }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        ckpt = ckpt.display(),
-        out = out.display(),
-        sid = server_id_for(tbl),
-    );
+    let yaml = Rig::mysql_cdc(tbl)
+        .source_url(url)
+        .cdc("rollover: 200")
+        .checkpoint_path(ckpt.to_path_buf())
+        .dest_path(out.to_path_buf())
+        .yaml();
     write_config(d, &yaml)
 }
 

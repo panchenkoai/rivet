@@ -61,13 +61,36 @@ impl Rig {
         r
     }
 
+    /// Batch constructors — one per engine, main-stack URLs. `mode` defaults
+    /// to `full`; switch flows flip it via [`Rig::mode`].
     pub fn mysql_batch(table: &str) -> Self {
-        Self::new("mysql", super::env::MYSQL_CDC_URL, table)
+        Self::new("mysql", super::env::MYSQL_URL, table)
+    }
+
+    pub fn pg_batch(table: &str) -> Self {
+        Self::new("postgres", super::env::POSTGRES_URL, table)
+    }
+
+    pub fn mssql_batch(table: &str) -> Self {
+        Self::new("mssql", super::env::MSSQL_URL, table)
+    }
+
+    /// Export mode (`full` / `incremental`); CDC constructors set `cdc`.
+    pub fn mode(mut self, mode: &'static str) -> Self {
+        self.mode = mode;
+        self
     }
 
     /// Add tables to a multi-table CDC export.
     pub fn tables(mut self, tables: &[&str]) -> Self {
         self.tables = tables.iter().map(|t| t.to_string()).collect();
+        self
+    }
+
+    /// Point the source at a different URL (a toxiproxy front, a scout
+    /// container) while keeping the engine's config shape.
+    pub fn source_url(mut self, url: &str) -> Self {
+        self.source_url = url.to_string();
         self
     }
 
@@ -238,4 +261,49 @@ pub fn read_all_parts(dir: &Path) -> Vec<arrow::record_batch::RecordBatch> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod rig_render_goldens {
+    use super::*;
+
+    /// The full constructor surface, pinned as rendered YAML — the rig's own
+    /// contract test. Any drift in the render is a diff HERE first, offline,
+    /// before any live suite meets it.
+    #[test]
+    fn every_engine_constructor_renders_the_pinned_shape() {
+        let cases: [(&str, Rig, &str); 5] = [
+            (
+                "mysql_batch",
+                Rig::mysql_batch("t").dest_path("/tmp/o".into()),
+                "source: { type: mysql, url: \"mysql://rivet:rivet@127.0.0.1:3306/rivet\" }\nexports:\n  - name: t\n    table: t\n    mode: full\n    format: parquet\n    destination: { type: local, path: \"/tmp/o\" }\n",
+            ),
+            (
+                "pg_batch",
+                Rig::pg_batch("t").dest_path("/tmp/o".into()),
+                "source: { type: postgres, url: \"postgresql://rivet:rivet@127.0.0.1:5432/rivet\" }\nexports:\n  - name: t\n    table: t\n    mode: full\n    format: parquet\n    destination: { type: local, path: \"/tmp/o\" }\n",
+            ),
+            (
+                "mssql_batch",
+                Rig::mssql_batch("t").dest_path("/tmp/o".into()),
+                "source: { type: mssql, url: \"sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1433/rivet\" }\nexports:\n  - name: t\n    table: t\n    mode: full\n    format: parquet\n    destination: { type: local, path: \"/tmp/o\" }\n",
+            ),
+            (
+                "mysql_cdc",
+                Rig::mysql_cdc("t")
+                    .checkpoint_path("/tmp/ck".into())
+                    .dest_path("/tmp/o".into()),
+                "source: { type: mysql, url: \"mysql://rivet:rivet@127.0.0.1:3307/rivet\" }\nexports:\n  - name: t\n    table: t\n    mode: cdc\n    format: parquet\n    cdc: { until_current: true, checkpoint: \"/tmp/ck\", server_id: SID }\n    destination: { type: local, path: \"/tmp/o\" }\n",
+            ),
+            (
+                "pg_cdc",
+                Rig::pg_cdc("t", "s1").dest_path("/tmp/o".into()),
+                "source: { type: postgres, url: \"postgresql://rivet:rivet@127.0.0.1:5434/rivet\" }\nexports:\n  - name: t\n    table: t\n    mode: cdc\n    format: parquet\n    cdc: { until_current: true, slot: s1 }\n    destination: { type: local, path: \"/tmp/o\" }\n",
+            ),
+        ];
+        for (name, rig, want) in cases {
+            let want = want.replace("SID", &super::super::env::server_id_for("t").to_string());
+            assert_eq!(rig.yaml(), want, "constructor '{name}' drifted");
+        }
+    }
 }
