@@ -1,0 +1,21 @@
+--- src/types/decimal.rs
++++ replace * with / in scaled_i128_to_decimal_str
+@@ -32,17 +32,17 @@
+ /// assert_eq!(decimal_str_to_scaled_i128("-1.23",   2), Some(-123));
+ /// assert_eq!(decimal_str_to_scaled_i128("1200",   -2), Some(12));
+ /// assert_eq!(decimal_str_to_scaled_i128("",        2), None);
+ /// ```
+ /// Format a scaled `Decimal128` value as exact decimal text (no float).
+ pub fn scaled_i128_to_decimal_str(value: i128, scale: i8) -> String {
+     if scale < 0 {
+         let factor = 10i128.pow(scale.unsigned_abs() as u32);
+-        return (value * factor).to_string();
++        return (value / /* ~ changed by cargo-mutants ~ */ factor).to_string();
+     }
+     let scale_u = scale as u32;
+     if scale_u == 0 {
+         return value.to_string();
+     }
+     let factor = 10i128.pow(scale_u);
+     let negative = value < 0;
+     let abs = value.abs();

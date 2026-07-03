@@ -397,3 +397,50 @@ mod fuzz {
         }
     }
 }
+
+#[cfg(test)]
+mod mutant_kills {
+    //! Targeted kills for the cargo-mutants survivors (the meta-gate's first
+    //! harvest). Each test pins exactly the behaviour a surviving mutant
+    //! would corrupt — most sit on the NEGATIVE-scale arms (unreachable from
+    //! today's engine mappings, but live in the public CSV-render path) and
+    //! on the CSV renderer's digit arithmetic.
+    use super::*;
+
+    // Kills: `delete -` in both parses (a negative value must stay negative
+    // through the negative-scale arm), and `<`→`==`/`<=` on the arm guards.
+    #[test]
+    fn negative_scale_parse_keeps_the_sign_and_scales_down() {
+        assert_eq!(decimal_str_to_scaled_i128("1200", -2), Some(12));
+        assert_eq!(decimal_str_to_scaled_i128("-1200", -2), Some(-12));
+        assert_eq!(decimal_str_to_scaled_i128("-1200.99", -2), Some(-12));
+        assert_eq!(
+            decimal_str_to_scaled_i256("-3400", -2),
+            Some(arrow::datatypes::i256::from_i128(-34))
+        );
+        // scale == 0 must NOT take the negative-scale arm (kills < → <=).
+        assert_eq!(decimal_str_to_scaled_i128("-7", 0), Some(-7));
+        assert_eq!(
+            decimal_str_to_scaled_i256("-7", 0),
+            Some(arrow::datatypes::i256::from_i128(-7))
+        );
+    }
+
+    // Kills the renderer survivors: `*`→`+`/`/` on the negative-scale factor,
+    // `<`→`==`/`<=` on its guard, and the fraction zero-PADDING width (the
+    // CSV path — a mutant here writes corrupt decimals into every CSV export).
+    #[test]
+    fn csv_decimal_renderer_is_exact_for_every_scale_shape() {
+        // negative scale: stored 12 at scale -2 renders whole hundreds.
+        assert_eq!(scaled_i128_to_decimal_str(12, -2), "1200");
+        assert_eq!(scaled_i128_to_decimal_str(-12, -2), "-1200");
+        // zero scale: verbatim integer.
+        assert_eq!(scaled_i128_to_decimal_str(-7, 0), "-7");
+        // positive scale: exact digits, fraction padded to WIDTH — "1.05",
+        // never "1.5"; "1.230" would be a padding mutant, "1.23" is truth.
+        assert_eq!(scaled_i128_to_decimal_str(105, 2), "1.05");
+        assert_eq!(scaled_i128_to_decimal_str(123, 2), "1.23");
+        assert_eq!(scaled_i128_to_decimal_str(-1, 4), "-0.0001");
+        assert_eq!(scaled_i128_to_decimal_str(10, 2), "0.10");
+    }
+}

@@ -1,0 +1,21 @@
+--- src/types/decimal.rs
++++ replace + with - in decimal_str_to_scaled_i128
+@@ -76,17 +76,17 @@
+         let result = int_val.checked_div(divisor)?;
+         return Some(if negative { -result } else { result });
+     }
+ 
+     let scale_u = scale as u32;
+ 
+     // Split on the decimal point (may be absent for integer-valued decimals).
+     let (int_part, frac_part) = if let Some(dot) = s.find('.') {
+-        (&s[..dot], &s[dot + 1..])
++        (&s[..dot], &s[dot - /* ~ changed by cargo-mutants ~ */ 1..])
+     } else {
+         (s, "")
+     };
+ 
+     let int_val: i128 = if int_part.is_empty() {
+         0
+     } else {
+         int_part.parse().ok()?

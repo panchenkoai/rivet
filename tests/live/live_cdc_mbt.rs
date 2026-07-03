@@ -806,3 +806,296 @@ exports:
     );
     let _ = markers_before;
 }
+
+// Negative family #5 — corrupt CHECKPOINT files. The probe found the code
+// already loud on all four shapes (garbage JSON, truncated, wrong-engine
+// format, empty): serde/shape errors surface, no silent re-anchor. Pinned so
+// it can never regress into the #28 class (silent re-anchor = silent gap).
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_corrupt_checkpoint_fails_loudly_never_reanchors() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_badckpt");
+    let mut c = mysql::Pool::new(MYSQL_CDC_URL).unwrap().get_conn().unwrap();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let _guard = Table(tbl.clone());
+    let (cfg, out) = ddl_cfg(&d, &tbl);
+    let ckpt = d.path().join("cdc.ckpt");
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1, 10)"))
+        .unwrap();
+
+    for (name, body) in [
+        ("garbage", "{not json at all"),
+        ("truncated", "{\"file\":\"binlog.0000"),
+        ("wrong_engine", "{\"lsn\":\"0/1A2B3C4D\"}"),
+        ("empty", ""),
+    ] {
+        std::fs::write(&ckpt, body).unwrap();
+        let res = std::process::Command::new(RIVET_BIN)
+            .args(["run", "--config", cfg.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            !res.status.success(),
+            "{name}: a corrupt checkpoint must fail the run loudly, never \
+             silently re-anchor at current"
+        );
+        let parts = std::fs::read_dir(&out)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|x| x == "parquet")
+            })
+            .count();
+        assert_eq!(
+            parts, 0,
+            "{name}: nothing may be captured off a corrupt anchor"
+        );
+    }
+}
+
+// Finding #39b end-to-end: a UNICODE enum label must ride the whole pipe —
+// information_schema enrichment → label parse → index→label fix → parquet —
+// with no mojibake (the byte-as-char parser garbled every non-ASCII label).
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_unicode_enum_labels_survive_end_to_end() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_uenum");
+    let mut c = mysql::Pool::new(MYSQL_CDC_URL).unwrap().get_conn().unwrap();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {tbl} (id INT PRIMARY KEY, st ENUM('привет','мир','it''s'))"
+    ))
+    .unwrap();
+    let _guard = Table(tbl.clone());
+    let (cfg, out) = ddl_cfg(&d, &tbl);
+    run_ok(&cfg); // pin
+    c.query_drop(format!(
+        "INSERT INTO {tbl} VALUES (1,'привет'),(2,'мир'),(3,'it''s')"
+    ))
+    .unwrap();
+    run_ok(&cfg);
+
+    use arrow::array::StringArray;
+    let mut got = Vec::new();
+    for b in read_all_parts(&out) {
+        let a = b
+            .column(b.schema().index_of("st").unwrap())
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .clone();
+        for r in 0..b.num_rows() {
+            got.push(a.value(r).to_string());
+        }
+    }
+    assert_eq!(
+        got,
+        vec!["привет", "мир", "it's"],
+        "unicode + quoted enum labels must land exactly"
+    );
+}
+
+// Negative family #4 — the environment revokes rights mid-life: a DBA drops
+// the REPLICATION grants between scheduler cycles. The next run must fail
+// LOUDLY with the grants hint (never a 0-row success), the checkpoint must
+// not move, and restoring the grant must resume with zero loss.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_replication_grant_revoked_mid_life_fails_loud_and_resumes_after_regrant() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_grant");
+    let root_url = MYSQL_CDC_URL.replace("rivet:rivet@", "root:rivet@");
+    let mut root = mysql::Conn::new(mysql::Opts::from_url(&root_url).unwrap()).unwrap();
+    // A dedicated user so revoking cannot break the parallel suite.
+    let user = unique_name("cdc_u");
+    root.query_drop(format!("DROP USER IF EXISTS '{user}'@'%'"))
+        .unwrap();
+    root.query_drop(format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'pw'"))
+        .unwrap();
+    root.query_drop(format!(
+        "GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '{user}'@'%'"
+    ))
+    .unwrap();
+    struct UserGuard(String, String);
+    impl Drop for UserGuard {
+        fn drop(&mut self) {
+            if let Ok(mut c) = mysql::Conn::new(mysql::Opts::from_url(&self.1).unwrap()) {
+                use mysql::prelude::Queryable as _;
+                let _ = c.query_drop(format!("DROP USER IF EXISTS '{}'@'%'", self.0));
+            }
+        }
+    }
+    let _u = UserGuard(user.clone(), root_url.clone());
+
+    let mut c = mysql::Pool::new(MYSQL_CDC_URL).unwrap().get_conn().unwrap();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let _guard = Table(tbl.clone());
+
+    let out = d.path().join("out");
+    let ckpt = d.path().join("cdc.ckpt");
+    std::fs::create_dir_all(&out).unwrap();
+    let user_url = MYSQL_CDC_URL.replace("rivet:rivet@", &format!("{user}:pw@"));
+    let yaml = format!(
+        r#"source: {{type: mysql, url: "{user_url}"}}
+exports:
+  - name: {tbl}
+    table: {tbl}
+    mode: cdc
+    format: parquet
+    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        ckpt = ckpt.display(),
+        out = out.display(),
+        sid = server_id_for(&tbl),
+    );
+    let cfg = write_config(&d, &yaml);
+    run_ok(&cfg); // pin under full rights
+    let ckpt_before = std::fs::read_to_string(&ckpt).unwrap();
+
+    // The DBA takes the grants away; a change lands.
+    root.query_drop(format!(
+        "REVOKE REPLICATION SLAVE, REPLICATION CLIENT ON *.* FROM '{user}'@'%'"
+    ))
+    .unwrap();
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1, 10)"))
+        .unwrap();
+
+    let res = std::process::Command::new(RIVET_BIN)
+        .args(["run", "--config", cfg.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        !res.status.success(),
+        "revoked grants must fail the run loudly"
+    );
+    let err = String::from_utf8_lossy(&res.stderr).to_lowercase();
+    assert!(
+        err.contains("replication") || err.contains("grant") || err.contains("denied"),
+        "the failure must point at the grants: {err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&ckpt).unwrap(),
+        ckpt_before,
+        "a failed run must not move the checkpoint"
+    );
+
+    // Rights restored ⇒ the change is captured with zero loss.
+    root.query_drop(format!(
+        "GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '{user}'@'%'"
+    ))
+    .unwrap();
+    run_ok(&cfg);
+    assert_eq!(
+        distinct_int_ids(&out).len(),
+        1,
+        "the change lands after the re-grant — a rights outage is a delay, not a loss"
+    );
+}
+
+// Negative family #4 — destination disk full (ENOSPC, a different error path
+// than the checkpoint's EACCES gremlin). Verified live on a 2 MB volume with
+// incompressible payload: the run fails loudly ("No space left on device"),
+// the checkpoint does not move, and pointing the export at a roomy
+// destination captures the full backlog — a full disk is a delay, not a
+// loss. Needs a pre-mounted tiny filesystem, so it is env-gated:
+//   macOS: hdiutil create -size 2m -fs APFS ...; hdiutil attach ...
+//   Linux: mount -t tmpfs -o size=2m tmpfs <dir>
+//   RIVET_TINYFS_DIR=<mountpoint> cargo test ... cdc_destination_disk_full
+#[test]
+#[ignore = "live: requires mysql-cdc + RIVET_TINYFS_DIR pointing at a ~2MB filesystem"]
+fn cdc_destination_disk_full_is_loud_and_lossless() {
+    let Some(tiny) = std::env::var_os("RIVET_TINYFS_DIR") else {
+        eprintln!("RIVET_TINYFS_DIR not set — skipping (see the test doc for mounting)");
+        return;
+    };
+    let tiny = std::path::PathBuf::from(tiny);
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_enospc");
+    let mut c = mysql::Pool::new(MYSQL_CDC_URL).unwrap().get_conn().unwrap();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {tbl} (id INT PRIMARY KEY, pad VARBINARY(255))"
+    ))
+    .unwrap();
+    let _guard = Table(tbl.clone());
+
+    let ckpt = d.path().join("cdc.ckpt");
+    let out_tiny = tiny.join(unique_name("out"));
+    std::fs::create_dir_all(&out_tiny).unwrap();
+    let mk_cfg = |out: &std::path::Path| {
+        let yaml = format!(
+            r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
+exports:
+  - name: {tbl}
+    table: {tbl}
+    mode: cdc
+    format: parquet
+    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
+    destination: {{ type: local, path: "{o}" }}
+"#,
+            ckpt = ckpt.display(),
+            o = out.display(),
+            sid = server_id_for(&tbl),
+        );
+        write_config(&d, &yaml)
+    };
+    run_ok(&mk_cfg(&out_tiny)); // pin
+    let ckpt_before = std::fs::read_to_string(&ckpt).unwrap();
+
+    // ~2.4 MB of INCOMPRESSIBLE payload (zstd flattens repeats — the first
+    // probe of this scenario "passed" because 8 MB of 'x' fit in 200 KB).
+    for chunk in 0..20 {
+        let vals: Vec<String> = (1..=1000)
+            .map(|i| {
+                let id = chunk * 1000 + i;
+                // Pseudo-random hex from a cheap LCG — incompressible enough.
+                let mut x: u64 = 0x9E37 ^ (id as u64 * 2654435761);
+                let hex: String = (0..30)
+                    .map(|_| {
+                        x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        format!("{:08x}", (x >> 16) as u32)
+                    })
+                    .collect();
+                format!("({id}, UNHEX('{hex}'))")
+            })
+            .collect();
+        c.query_drop(format!("INSERT INTO {tbl} VALUES {}", vals.join(",")))
+            .unwrap();
+    }
+
+    let res = std::process::Command::new(RIVET_BIN)
+        .args(["run", "--config", mk_cfg(&out_tiny).to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!res.status.success(), "ENOSPC must fail the run loudly");
+    let err = String::from_utf8_lossy(&res.stderr);
+    assert!(
+        err.contains("No space left") || err.contains("os error 28"),
+        "the failure must name the full disk: {err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&ckpt).unwrap(),
+        ckpt_before,
+        "a failed run must not move the checkpoint"
+    );
+
+    // Heal: a roomy destination captures the FULL backlog.
+    let out_big = d.path().join("big");
+    std::fs::create_dir_all(&out_big).unwrap();
+    run_ok(&mk_cfg(&out_big));
+    assert_eq!(
+        distinct_int_ids(&out_big).len(),
+        20_000,
+        "a full disk is a delay, not a loss"
+    );
+}

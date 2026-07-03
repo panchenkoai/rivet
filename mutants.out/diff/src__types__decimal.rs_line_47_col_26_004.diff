@@ -1,0 +1,21 @@
+--- src/types/decimal.rs
++++ replace < with > in scaled_i128_to_decimal_str
+@@ -39,17 +39,17 @@
+         let factor = 10i128.pow(scale.unsigned_abs() as u32);
+         return (value * factor).to_string();
+     }
+     let scale_u = scale as u32;
+     if scale_u == 0 {
+         return value.to_string();
+     }
+     let factor = 10i128.pow(scale_u);
+-    let negative = value < 0;
++    let negative = value > /* ~ changed by cargo-mutants ~ */ 0;
+     let abs = value.abs();
+     let int_part = abs / factor;
+     let frac = abs % factor;
+     format!(
+         "{sign}{int_part}.{frac:0width$}",
+         sign = if negative { "-" } else { "" },
+         width = scale_u as usize
+     )

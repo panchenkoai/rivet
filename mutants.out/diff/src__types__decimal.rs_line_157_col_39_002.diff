@@ -1,0 +1,21 @@
+--- src/types/decimal.rs
++++ replace - with + in decimal_str_to_scaled_i256
+@@ -149,17 +149,17 @@
+     } else {
+         i256::from_string(int_part)?
+     };
+     let frac_aligned = if scale_u == 0 {
+         i256::ZERO
+     } else if frac_part.len() < scale_u as usize {
+         let mut buf = String::with_capacity(scale_u as usize);
+         buf.push_str(frac_part);
+-        for _ in 0..(scale_u as usize - frac_part.len()) {
++        for _ in 0..(scale_u as usize + /* ~ changed by cargo-mutants ~ */ frac_part.len()) {
+             buf.push('0');
+         }
+         i256::from_string(&buf)?
+     } else {
+         i256::from_string(frac_part.get(..scale_u as usize)?)?
+     };
+ 
+     let scale_factor = pow10_i256(scale_u)?;

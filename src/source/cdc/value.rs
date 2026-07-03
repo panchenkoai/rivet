@@ -755,33 +755,33 @@ pub(crate) fn mysql_cell_fix(
 }
 
 /// Labels from `enum('a','b','it''s')`, in declaration (index) order.
+/// TOTAL over arbitrary input (finding #39: the byte-sliced version panicked
+/// on a trailing `(` and on multibyte boundaries), and CHAR-wise (#39b: the
+/// `byte as char` loop mojibake'd every non-ASCII label — `ENUM('привет')`
+/// would have written garbled labels into the capture, silently).
 fn parse_enum_labels(native: &str) -> Vec<String> {
     let Some(start) = native.find('(') else {
         return Vec::new();
     };
-    let inner = &native[start + 1..native.len().saturating_sub(1)];
+    let end = native.rfind(')').unwrap_or(native.len());
+    let Some(inner) = native.get(start + 1..end.max(start + 1)) else {
+        return Vec::new();
+    };
     let mut labels = Vec::new();
-    let b = inner.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] != b'\'' {
-            i += 1;
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\'' {
             continue;
         }
         let mut label = String::new();
-        i += 1;
-        while i < b.len() {
-            if b[i] == b'\'' {
-                if b.get(i + 1) == Some(&b'\'') {
+        loop {
+            match chars.next() {
+                Some('\'') if chars.peek() == Some(&'\'') => {
+                    chars.next();
                     label.push('\'');
-                    i += 2;
-                } else {
-                    i += 1;
-                    break;
                 }
-            } else {
-                label.push(b[i] as char);
-                i += 1;
+                Some('\'') | None => break,
+                Some(other) => label.push(other),
             }
         }
         labels.push(label);
@@ -888,6 +888,90 @@ fn render_str(v: &RivetValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Finding #39/#39b regression pins: the enum-label parser must be total
+    // (trailing '(' / multibyte boundaries panicked) and CHAR-correct —
+    // non-ASCII labels were mojibake'd byte-by-byte, i.e. silent label
+    // corruption for any unicode ENUM.
+    #[test]
+    fn enum_labels_unicode_and_escapes_parse_exactly() {
+        assert_eq!(
+            parse_enum_labels("enum('привет','мир')"),
+            vec!["привет".to_string(), "мир".to_string()]
+        );
+        assert_eq!(
+            parse_enum_labels("enum('it''s','a')"),
+            vec!["it's".to_string(), "a".to_string()]
+        );
+        assert_eq!(parse_enum_labels("enum("), Vec::<String>::new());
+        assert_eq!(parse_enum_labels("enum('ok'"), vec!["ok".to_string()]);
+        assert_eq!(parse_enum_labels("garbage"), Vec::<String>::new());
+    }
+
+    // Negative family #2 at the MySQL BINARY level: every cell fix must be
+    // TOTAL over arbitrary wire bytes and arbitrary native-type strings — a
+    // corrupt binlog cell may carry anything, and the fix layer must degrade
+    // (Null / passthrough), never panic and never bring the stream down.
+    // (The PG text parsers got this net yesterday; this is the mysql floor.)
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: 256, ..Default::default()
+        })]
+
+        #[test]
+        fn cell_fixes_are_total_over_arbitrary_wire_values(
+            native in "[a-z0-9_() ',]{0,40}",
+            bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+            ival in proptest::prelude::any::<i64>(),
+            uval in proptest::prelude::any::<u64>(),
+        ) {
+            use crate::source::cdc::CdcEngine;
+            if let Some(fix) = mysql_cell_fix(CdcEngine::Mysql, &native) {
+                for v in [
+                    RivetValue::Bytes(bytes.clone()),
+                    RivetValue::Int(ival),
+                    RivetValue::UInt(uval),
+                    RivetValue::Float(f64::NAN),
+                    RivetValue::Null,
+                ] {
+                    let _ = fix.apply(&v);
+                }
+            }
+            // Label parsers over arbitrary native strings.
+            let _ = parse_enum_labels(&native);
+        }
+
+        #[test]
+        fn build_column_is_total_over_arbitrary_cells(
+            bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..48),
+            ival in proptest::prelude::any::<i64>(),
+        ) {
+            use arrow::datatypes::{DataType, TimeUnit};
+            let owned = [
+                Some(RivetValue::Bytes(bytes.clone())),
+                Some(RivetValue::Int(ival)),
+                Some(RivetValue::Float(f64::INFINITY)),
+                None,
+            ];
+            let cells: Vec<Option<&RivetValue>> = owned.iter().map(|c| c.as_ref()).collect();
+            for dt in [
+                DataType::Int32,
+                DataType::UInt64,
+                DataType::Float64,
+                DataType::Utf8,
+                DataType::Binary,
+                DataType::FixedSizeBinary(16),
+                DataType::Date32,
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                DataType::Time64(TimeUnit::Microsecond),
+                DataType::Boolean,
+            ] {
+                // Result may be Ok or a LOUD Err (decimal refuses NaN-likes);
+                // the property is: no panic, ever.
+                let _ = build_column(&dt, &cells);
+            }
+        }
+    }
 
     // The two-ended contract: the independent cell fold must equal the fold of
     // the BUILT array for EVERY covered type — including the hostile cells

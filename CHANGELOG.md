@@ -12,6 +12,18 @@
   encoding shared by both sides; a new accessor per engine, enforced at compile time). An offline matrix
   guard pins the CDC fold to the builder across every covered type with hostile cells (overflow
   narrowing, wrong-width binary, arrays with inner NULLs, NaN, u64::MAX, 50-digit decimals).
+- **Negative-scenario sweep: five hostile families closed, two more findings.** Binary-level fuzz over
+  the MySQL cell-fix layer found the enum-label parser PANICKING on malformed native strings and — worse
+  — silently MOJIBAKE-ing every non-ASCII label (`ENUM('привет')` byte-cast char-by-char; findings
+  #39/#39b): rewritten total and char-wise, pinned end-to-end (unicode + quoted labels through
+  enrichment→parse→fix→parquet). Corrupt checkpoint files (garbage/truncated/wrong-engine/empty) verified
+  LOUD on all shapes and pinned — no silent re-anchor. A revoked REPLICATION grant mid-life fails loudly,
+  freezes the checkpoint, and resumes lossless after the re-grant. Destination ENOSPC (incompressible
+  2.4 MB into a 2 MB volume) fails loudly naming the full disk, checkpoint frozen, full backlog captured
+  after healing (env-gated test: `RIVET_TINYFS_DIR`). Config parsing is proptest-total over arbitrary
+  YAML. Plus cargo-mutants' first harvest: the CSV decimal renderer and the negative-scale parse arms
+  had zero test sensitivity — killed with targeted units (sign preservation, padding width, exact
+  negative-scale rendering).
 - **`rivet validate` Form B now covers CDC prefixes.** The CDC manifest recorded
   `column_checksums: None`, so validate's value-checksum re-read silently skipped CDC outputs while
   reporting PASSED (finding #38). The sink already computed the arrow-side sum per column per part

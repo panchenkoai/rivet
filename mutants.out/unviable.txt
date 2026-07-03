@@ -1,0 +1,3 @@
+src/source/cdc/value.rs:31:8: replace - with + in epoch_days
+src/source/cdc/value.rs:31:8: replace - with / in epoch_days
+src/source/cdc/value.rs:59:9: replace RivetValue::from_mysql -> Self with Default::default()

@@ -1,0 +1,6 @@
+src/types/decimal.rs:71:14: replace < with == in decimal_str_to_scaled_i128
+src/types/decimal.rs:71:14: replace < with > in decimal_str_to_scaled_i128
+src/types/decimal.rs:135:14: replace < with == in decimal_str_to_scaled_i256
+src/types/decimal.rs:71:14: replace < with == in decimal_str_to_scaled_i128
+src/types/decimal.rs:71:14: replace < with > in decimal_str_to_scaled_i128
+src/types/decimal.rs:135:14: replace < with == in decimal_str_to_scaled_i256

@@ -722,3 +722,31 @@ exports:
     let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
     assert!(msg.contains("snapshot"), "must name the collision: {msg}");
 }
+
+// Negative family #3 (hostile configs), generative flavour: arbitrary
+// bytes/fragments through the whole config parse+validate pipeline must
+// yield Ok or a graceful Err — never a panic. serde almost certainly holds;
+// the net is for OUR validation layers on top of it.
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig {
+        cases: 128, ..Default::default()
+    })]
+
+    #[test]
+    fn config_parse_is_total_over_arbitrary_yaml(junk in ".{0,300}") {
+        let _ = Config::from_yaml(&junk);
+    }
+
+    #[test]
+    fn config_parse_is_total_over_structured_hostility(
+        name in ".{0,30}",
+        table in ".{0,30}",
+        colkey in ".{0,20}",
+        colval in ".{0,20}",
+    ) {
+        let yaml = format!(
+            "source: {{ type: mysql, url: \"mysql://u:p@h/db\" }}\nexports:\n  - name: {name:?}\n    table: {table:?}\n    mode: cdc\n    format: parquet\n    columns: {{ {colkey:?}: {colval:?} }}\n    cdc: {{ checkpoint: /tmp/x, server_id: 5001 }}\n    destination: {{ type: local, path: ./out }}\n"
+        );
+        let _ = Config::from_yaml(&yaml);
+    }
+}
