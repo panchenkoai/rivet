@@ -37,21 +37,15 @@ fn full_mode_repeated_run_accumulates_manifest_entries() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("qa12_full");
 
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, name, amount FROM {table_name}"
-    mode: full
-    format: parquet
-    columns:
-      amount: "decimal(12,2)"
-    destination: {{type: local, path: {dir}}}
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!(
+            r#"SELECT id, name, amount FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("full")
+        .export_line(r#"columns: { amount: "decimal(12,2)" }"#)
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let (_cfgdir, cfg) = cfg_dir_with(&yaml);
 
     let r1 = run_rivet_export(&cfg, &export_name);
@@ -115,19 +109,12 @@ fn incremental_second_run_on_unchanged_source_exports_zero_new_rows() {
 
     let export_name = unique_name("qa12_inc_exp");
     let out = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, updated_at FROM {table_name}"
-    mode: incremental
-    cursor_column: updated_at
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!(r#"SELECT id, updated_at FROM {table_name}"#))
+        .mode("incremental")
+        .export_line("cursor_column: updated_at")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let (_cfgdir, cfg) = cfg_dir_with(&yaml);
 
     // Run #1 — must pick up every row.
@@ -197,19 +184,12 @@ fn incremental_third_run_picks_up_newly_inserted_rows() {
 
     let export_name = unique_name("qa12_inc2_exp");
     let out = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, updated_at FROM {table_name}"
-    mode: incremental
-    cursor_column: updated_at
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!(r#"SELECT id, updated_at FROM {table_name}"#))
+        .mode("incremental")
+        .export_line("cursor_column: updated_at")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let (_cfgdir, cfg) = cfg_dir_with(&yaml);
 
     // Run #1 — exports rows 1..5.
@@ -261,22 +241,17 @@ fn chunked_resume_without_prior_run_fails_with_actionable_message() {
     let table = seed_pg_numeric_table(20);
     let export_name = unique_name("qa12_chunk");
     let out = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, name FROM {table_name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 5
-    chunk_checkpoint: true
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!(
+            r#"SELECT id, name FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 5")
+        .export_line("chunk_checkpoint: true")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let (_cfgdir, cfg) = cfg_dir_with(&yaml);
 
     let out = run_rivet(&[
@@ -309,22 +284,17 @@ fn chunked_resume_with_completed_run_gives_actionable_message() {
     let table = seed_pg_numeric_table(20);
     let export_name = unique_name("qa12_resume_done");
     let out = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, name FROM {table_name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 5
-    chunk_checkpoint: true
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!(
+            r#"SELECT id, name FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 5")
+        .export_line("chunk_checkpoint: true")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let (_cfgdir, cfg) = cfg_dir_with(&yaml);
 
     // First: run the full export to completion.
@@ -368,19 +338,14 @@ fn full_mode_resume_flag_is_rejected() {
     let table = seed_pg_numeric_table(10);
     let export_name = unique_name("qa12_full_resume");
     let out = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, name FROM {table_name}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!(
+            r#"SELECT id, name FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("full")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let (_cfgdir, cfg) = cfg_dir_with(&yaml);
 
     let result = run_rivet(&[
@@ -412,22 +377,17 @@ fn chunked_resume_force_overrides_success_gate() {
     let table = seed_pg_numeric_table(20);
     let export_name = unique_name("qa12_resume_force");
     let out = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, name FROM {table_name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 5
-    chunk_checkpoint: true
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!(
+            r#"SELECT id, name FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 5")
+        .export_line("chunk_checkpoint: true")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let (_cfgdir, cfg) = cfg_dir_with(&yaml);
 
     // Run to completion → `_SUCCESS` written, every chunk completed.

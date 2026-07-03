@@ -17,6 +17,8 @@ pub struct Rig {
     source_url: String,
     name: String,
     tables: Vec<String>,
+    query: Option<String>,
+    source_lines: Vec<String>,
     mode: &'static str,
     format: &'static str,
     cdc_lines: Vec<String>,
@@ -33,6 +35,8 @@ impl Rig {
             source_url: url.to_string(),
             name: table.to_string(),
             tables: vec![table.to_string()],
+            query: None,
+            source_lines: Vec::new(),
             mode: "full",
             format: "parquet",
             cdc_lines: Vec::new(),
@@ -72,12 +76,24 @@ impl Rig {
     }
 
     pub fn mssql_batch(table: &str) -> Self {
-        Self::new("mssql", super::env::MSSQL_URL, table)
+        let mut r = Self::new("mssql", super::env::MSSQL_URL, table);
+        // The test stack's SQL Server runs a self-signed cert — every mssql
+        // config needs the opt-in or the connection handshake fails.
+        r.source_lines.push("tls:".into());
+        r.source_lines.push("  accept_invalid_certs: true".into());
+        r
     }
 
-    /// Export mode (`full` / `incremental`); CDC constructors set `cdc`.
+    /// Export mode (`full` / `incremental` / `chunked`); CDC constructors
+    /// set `cdc`.
     pub fn mode(mut self, mode: &'static str) -> Self {
         self.mode = mode;
+        self
+    }
+
+    /// Query-based export (replaces the `table:` shortcut in the render).
+    pub fn query(mut self, sql: &str) -> Self {
+        self.query = Some(sql.to_string());
         self
     }
 
@@ -165,10 +181,10 @@ impl Rig {
     fn render(&self) -> String {
         let out = self.out_dir();
         std::fs::create_dir_all(&out).unwrap();
-        let tables = if self.tables.len() == 1 {
-            format!("table: {}", self.tables[0])
-        } else {
-            format!("tables: [{}]", self.tables.join(", "))
+        let tables = match &self.query {
+            Some(q) => format!("query: \"{q}\""),
+            None if self.tables.len() == 1 => format!("table: {}", self.tables[0]),
+            None => format!("tables: [{}]", self.tables.join(", ")),
         };
         let cdc_lines: Vec<String> = self
             .cdc_lines
@@ -191,10 +207,26 @@ impl Rig {
             .iter()
             .map(|l| format!("    {l}\n"))
             .collect();
+        let source = if self.source_lines.is_empty() {
+            format!(
+                "source: {{ type: {}, url: \"{}\" }}",
+                self.source_type, self.source_url
+            )
+        } else {
+            let extra: String = self
+                .source_lines
+                .iter()
+                .map(|l| format!("  {l}\n"))
+                .collect();
+            format!(
+                "source:\n  type: {}\n  url: \"{}\"\n{extra}",
+                self.source_type, self.source_url
+            )
+            .trim_end()
+            .to_string()
+        };
         let yaml = format!(
-            "source: {{ type: {st}, url: \"{url}\" }}\nexports:\n  - name: {name}\n    {tables}\n    mode: {mode}\n    format: {fmt}\n{cdc}{extra}    destination: {{ type: local, path: \"{out}\" }}\n",
-            st = self.source_type,
-            url = self.source_url,
+            "{source}\nexports:\n  - name: {name}\n    {tables}\n    mode: {mode}\n    format: {fmt}\n{cdc}{extra}    destination: {{ type: local, path: \"{out}\" }}\n",
             name = self.name,
             tables = tables,
             mode = self.mode,
@@ -286,7 +318,7 @@ mod rig_render_goldens {
             (
                 "mssql_batch",
                 Rig::mssql_batch("t").dest_path("/tmp/o".into()),
-                "source: { type: mssql, url: \"sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1433/rivet\" }\nexports:\n  - name: t\n    table: t\n    mode: full\n    format: parquet\n    destination: { type: local, path: \"/tmp/o\" }\n",
+                "source:\n  type: mssql\n  url: \"sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1433/rivet\"\n  tls:\n    accept_invalid_certs: true\nexports:\n  - name: t\n    table: t\n    mode: full\n    format: parquet\n    destination: { type: local, path: \"/tmp/o\" }\n",
             ),
             (
                 "mysql_cdc",
