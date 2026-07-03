@@ -335,7 +335,14 @@ jobs:
         # profile and is required by the new MySQL `mysql_proxysql_*` tests in
         # tests/live_pool_safety.rs (added in 0.6.0); without it
         # `require_alive(LiveService::ProxySql)` panics before the test runs.
-        run: docker compose --profile pool --profile cdc --profile replica up -d postgres mysql mssql minio fake-gcs azurite toxiproxy pgbouncer proxysql postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica duckdb clickhouse
+        run: |
+          # Same bind-mount dance as the round-trip job: pre-create the shared
+          # dir runner-owned (the daemon would root-own a missing mount source)…
+          mkdir -p tests/.live-tmp
+          docker compose --profile pool --profile cdc --profile replica up -d postgres mysql mssql minio fake-gcs azurite toxiproxy pgbouncer proxysql postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica duckdb clickhouse
+          # …then re-open it after ClickHouse chowns /work to uid 101 on boot,
+          # which propagates to the host on Linux and EACCESes the test writer.
+          sudo chmod -R 0777 tests/.live-tmp
 
       - name: Wait for services
         run: |
