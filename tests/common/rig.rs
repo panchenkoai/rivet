@@ -22,6 +22,7 @@ pub struct Rig {
     cdc_lines: Vec<String>,
     extra_lines: Vec<String>,
     dest_override: Option<PathBuf>,
+    ckpt_override: Option<PathBuf>,
     dir: tempfile::TempDir,
 }
 
@@ -37,6 +38,7 @@ impl Rig {
             cdc_lines: Vec::new(),
             extra_lines: Vec::new(),
             dest_override: None,
+            ckpt_override: None,
             dir: tempfile::tempdir().expect("rig tempdir"),
         }
     }
@@ -45,10 +47,7 @@ impl Rig {
         let mut r = Self::new("mysql", super::env::MYSQL_CDC_URL, table);
         r.mode = "cdc";
         r.cdc_lines.push("until_current: true".into());
-        r.cdc_lines.push(format!(
-            "checkpoint: \"{}\"",
-            r.dir.path().join("cdc.ckpt").display()
-        ));
+        r.cdc_lines.push("__CKPT__".into()); // resolved at render time
         r.cdc_lines
             .push(format!("server_id: {}", server_id_for(table)));
         r
@@ -108,12 +107,39 @@ impl Rig {
     }
 
     pub fn checkpoint(&self) -> PathBuf {
-        self.dir.path().join("cdc.ckpt")
+        self.ckpt_override
+            .clone()
+            .unwrap_or_else(|| self.dir.path().join("cdc.ckpt"))
+    }
+
+    /// Override the checkpoint path (resume/crash suites share one
+    /// checkpoint across several configs — the rig renders, the test owns
+    /// the file's lifetime).
+    pub fn checkpoint_path(mut self, path: PathBuf) -> Self {
+        self.ckpt_override = Some(path);
+        self
+    }
+
+    /// Output format (`csv`); parquet is the default.
+    pub fn with_format(mut self, fmt: &'static str) -> Self {
+        self.format = fmt;
+        self
+    }
+
+    /// The rendered YAML — for suites that own their config-file lifetime.
+    pub fn yaml(&self) -> String {
+        self.render()
     }
 
     /// Materialized config path — for bespoke invocations (`validate`,
     /// custom envs) the rig doesn't wrap.
     pub fn config_path(&self) -> PathBuf {
+        let cfg = self.dir.path().join("rig.yaml");
+        std::fs::write(&cfg, self.render()).unwrap();
+        cfg
+    }
+
+    fn render(&self) -> String {
         let out = self.out_dir();
         std::fs::create_dir_all(&out).unwrap();
         let tables = if self.tables.len() == 1 {
@@ -121,10 +147,21 @@ impl Rig {
         } else {
             format!("tables: [{}]", self.tables.join(", "))
         };
-        let cdc = if self.cdc_lines.is_empty() {
+        let cdc_lines: Vec<String> = self
+            .cdc_lines
+            .iter()
+            .map(|l| {
+                if l == "__CKPT__" {
+                    format!("checkpoint: \"{}\"", self.checkpoint().display())
+                } else {
+                    l.clone()
+                }
+            })
+            .collect();
+        let cdc = if cdc_lines.is_empty() {
             String::new()
         } else {
-            format!("    cdc: {{ {} }}\n", self.cdc_lines.join(", "))
+            format!("    cdc: {{ {} }}\n", cdc_lines.join(", "))
         };
         let extra: String = self
             .extra_lines
@@ -141,9 +178,7 @@ impl Rig {
             fmt = self.format,
             out = self.out_dir().display(),
         );
-        let cfg = self.dir.path().join("rig.yaml");
-        std::fs::write(&cfg, yaml).unwrap();
-        cfg
+        yaml
     }
 
     /// Run rivet; panic unless it succeeds.

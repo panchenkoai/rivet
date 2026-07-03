@@ -37,21 +37,30 @@ fn cdc_config(
     ckpt: &std::path::Path,
     out: &std::path::Path,
 ) -> std::path::PathBuf {
-    let yaml = format!(
-        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: cdc
-    format: parquet
-    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        ckpt = ckpt.display(),
-        out = out.display(),
-        sid = server_id_for(tbl),
-    );
+    let yaml = Rig::mysql_cdc(tbl)
+        .checkpoint_path(ckpt.to_path_buf())
+        .dest_path(out.to_path_buf())
+        .yaml();
     write_config(d, &yaml)
+}
+
+/// Template-equivalence golden: the rig must render EXACTLY the config the
+/// hand-rolled template produced — the contract guarantee for migrating this
+/// file's 20+ resume/crash tests without touching their plumbing semantics.
+#[test]
+fn rig_renders_the_exact_legacy_cdc_template() {
+    let yaml = Rig::mysql_cdc("t1")
+        .checkpoint_path("/tmp/ck".into())
+        .dest_path("/tmp/o".into())
+        .yaml();
+    let legacy = format!(
+        "source: {{ type: mysql, url: \"{MYSQL_CDC_URL}\" }}\nexports:\n  - name: t1\n    table: t1\n    mode: cdc\n    format: parquet\n    cdc: {{ until_current: true, checkpoint: \"/tmp/ck\", server_id: {} }}\n    destination: {{ type: local, path: \"/tmp/o\" }}\n",
+        server_id_for("t1"),
+    );
+    assert_eq!(
+        yaml, legacy,
+        "the rig must not drift from the proven template"
+    );
 }
 
 fn run_cdc(cfg: &std::path::Path) {
