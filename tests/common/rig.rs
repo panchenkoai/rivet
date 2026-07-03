@@ -90,7 +90,9 @@ impl Rig {
         self.dir.path().join("cdc.ckpt")
     }
 
-    fn config_path(&self) -> PathBuf {
+    /// Materialized config path — for bespoke invocations (`validate`,
+    /// custom envs) the rig doesn't wrap.
+    pub fn config_path(&self) -> PathBuf {
         let out = self.out_dir();
         std::fs::create_dir_all(&out).unwrap();
         let tables = if self.tables.len() == 1 {
