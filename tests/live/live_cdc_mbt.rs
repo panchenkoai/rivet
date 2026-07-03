@@ -1153,3 +1153,39 @@ fn cdc_scenario_smoke_pin_churn_drain() {
     let rows: usize = scn.drain_and_read().iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 3, "pin → churn → drain captures exactly the churn");
 }
+
+#[test]
+#[ignore = "live: requires docker compose postgres-cdc (wal_level=logical)"]
+fn cdc_scenario_smoke_pg() {
+    let mut scn = CdcScenario::pg("cdc_scn_pg", "id INT PRIMARY KEY, v BIGINT");
+    scn.sql(&format!(
+        "INSERT INTO {} VALUES (1, 10), (2, 20)",
+        scn.table
+    ));
+    let rows: usize = scn.drain_and_read().iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 2, "pg scenario: pin → churn → drain");
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mssql-cdc"]
+fn cdc_scenario_smoke_mssql() {
+    let mut scn = CdcScenario::mssql("cdc_scn_ms", "id INT PRIMARY KEY, v BIGINT");
+    scn.sql(&format!(
+        "INSERT INTO dbo.{} VALUES (1, 10), (2, 20)",
+        scn.table
+    ));
+    // The capture job is asynchronous — poll the drain until the rows land.
+    let mut rows = 0usize;
+    for _ in 0..15 {
+        rows += scn
+            .drain_and_read()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum::<usize>();
+        if rows >= 2 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    assert_eq!(rows, 2, "mssql scenario: pin → churn → drain (job-lagged)");
+}

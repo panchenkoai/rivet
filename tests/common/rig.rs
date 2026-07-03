@@ -358,8 +358,37 @@ pub fn cdc_conn() -> mysql::PooledConn {
 pub struct CdcScenario {
     pub rig: Rig,
     pub table: String,
-    conn: mysql::PooledConn,
-    _guard: super::mysql::CdcTable,
+    exec: ScnExec,
+    _guards: Vec<Box<dyn std::any::Any>>,
+}
+
+/// Engine-specific SQL executors for [`CdcScenario`].
+enum ScnExec {
+    MySql(mysql::PooledConn),
+    Pg(Box<postgres::Client>),
+    /// SQL Server churns through the shared sqlcmd helper.
+    Mssql,
+}
+
+/// Drops a SQL Server capture instance + table on teardown (a CDC-tracked
+/// table can't just be dropped — the change table would orphan).
+pub struct MssqlCdcTable {
+    pub table: String,
+    pub ci: String,
+}
+impl Drop for MssqlCdcTable {
+    fn drop(&mut self) {
+        let (table, ci) = (self.table.clone(), self.ci.clone());
+        let _ = std::panic::catch_unwind(move || {
+            super::mssql::mssql_cdc_exec(&format!(
+                "IF EXISTS(SELECT 1 FROM cdc.change_tables ct JOIN sys.tables t \
+                   ON ct.source_object_id=t.object_id WHERE t.name='{table}') \
+                 EXEC sys.sp_cdc_disable_table @source_schema=N'dbo', \
+                 @source_name=N'{table}', @capture_instance=N'{ci}';"
+            ));
+            super::mssql::mssql_cdc_drop_table(&format!("dbo.{table}"));
+        });
+    }
 }
 
 impl CdcScenario {
@@ -378,15 +407,77 @@ impl CdcScenario {
         Self {
             rig,
             table,
-            conn,
-            _guard: guard,
+            exec: ScnExec::MySql(conn),
+            _guards: vec![Box::new(guard)],
+        }
+    }
+
+    /// PostgreSQL: table + logical slot (both guarded) + pin.
+    pub fn pg(label: &str, cols: &str) -> Self {
+        let table = super::unique_name(label);
+        let slot = super::unique_name(&format!("{label}_slot"));
+        let mut client = postgres::Client::connect(super::env::POSTGRES_CDC_URL, postgres::NoTls)
+            .expect("connect postgres-cdc");
+        client
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS {table}; CREATE TABLE {table} ({cols})"
+            ))
+            .unwrap();
+        let tguard = super::pg::PgTable::adopt(table.clone());
+        client
+            .execute(
+                "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+                &[&slot],
+            )
+            .unwrap();
+        let sguard = super::pg::Slot(slot.clone());
+        let rig = Rig::pg_cdc(&table, &slot);
+        rig.run_ok(); // pin (PG anchors server-side at slot creation)
+        Self {
+            rig,
+            table,
+            exec: ScnExec::Pg(Box::new(client)),
+            _guards: vec![Box::new(tguard), Box::new(sguard)],
+        }
+    }
+
+    /// SQL Server: table + capture instance (guarded) + pin at max LSN.
+    pub fn mssql(label: &str, cols: &str) -> Self {
+        let table = super::unique_name(label);
+        let ci = format!("dbo_{table}");
+        super::mssql::mssql_cdc_exec(&format!("CREATE TABLE dbo.{table} ({cols})"));
+        super::mssql::mssql_cdc_exec(
+            "IF NOT EXISTS(SELECT 1 FROM sys.databases WHERE name='rivet' \
+              AND is_cdc_enabled=1) EXEC sys.sp_cdc_enable_db;",
+        );
+        super::mssql::mssql_cdc_exec(&format!(
+            "EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', \
+             @source_name=N'{table}', @role_name=NULL, @capture_instance=N'{ci}';"
+        ));
+        let guard = MssqlCdcTable {
+            table: table.clone(),
+            ci: ci.clone(),
+        };
+        let rig = Rig::mssql_cdc(&table, &ci);
+        rig.run_ok(); // pin
+        Self {
+            rig,
+            table,
+            exec: ScnExec::Mssql,
+            _guards: vec![Box::new(guard)],
         }
     }
 
     /// Execute source-side SQL (churn) against the scenario's table.
     pub fn sql(&mut self, q: &str) {
-        use mysql::prelude::Queryable as _;
-        self.conn.query_drop(q).expect("scenario sql");
+        match &mut self.exec {
+            ScnExec::MySql(conn) => {
+                use mysql::prelude::Queryable as _;
+                conn.query_drop(q).expect("scenario sql (mysql)");
+            }
+            ScnExec::Pg(client) => client.batch_execute(q).expect("scenario sql (pg)"),
+            ScnExec::Mssql => super::mssql::mssql_cdc_exec(q),
+        }
     }
 
     /// Drain the stream and read every part back.
