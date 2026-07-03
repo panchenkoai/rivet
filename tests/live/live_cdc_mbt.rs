@@ -1138,3 +1138,18 @@ fn pg_cdc_pk_changing_update_captures_and_does_not_brick() {
         "the update's after-image is the NEW tuple (id=2), stream not bricked"
     );
 }
+
+// CdcScenario's own live smoke — and the usage pattern for every future CDC
+// test: setup (table+guard+rig+PIN) is one constructor call, so the
+// idle-anchor discipline is inherited by construction, not by review.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_scenario_smoke_pin_churn_drain() {
+    let mut scn = CdcScenario::mysql("cdc_scn_smoke", "id INT PRIMARY KEY, v BIGINT");
+    scn.sql(&format!(
+        "INSERT INTO {} VALUES (1, 10), (2, 20), (3, 30)",
+        scn.table
+    ));
+    let rows: usize = scn.drain_and_read().iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 3, "pin → churn → drain captures exactly the churn");
+}

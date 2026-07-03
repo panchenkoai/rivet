@@ -351,6 +351,50 @@ pub fn cdc_conn() -> mysql::PooledConn {
         .expect("conn")
 }
 
+/// The CDC setup owner: unique table + connection + drop-guard + rig +
+/// checkpoint PIN in one call — the ~50-times-copied preamble, with the
+/// anchor-at-open discipline built in (a test cannot forget to pin; the
+/// idle-anchor loss class stays unrepresentable in new tests).
+pub struct CdcScenario {
+    pub rig: Rig,
+    pub table: String,
+    conn: mysql::PooledConn,
+    _guard: super::mysql::CdcTable,
+}
+
+impl CdcScenario {
+    /// `cols` is the column spec, e.g. `"id INT PRIMARY KEY, v BIGINT"`.
+    pub fn mysql(label: &str, cols: &str) -> Self {
+        use mysql::prelude::Queryable as _;
+        let table = super::unique_name(label);
+        let mut conn = cdc_conn();
+        conn.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+            .unwrap();
+        conn.query_drop(format!("CREATE TABLE {table} ({cols})"))
+            .unwrap();
+        let guard = super::mysql::CdcTable(table.clone());
+        let rig = Rig::mysql_cdc(&table);
+        rig.run_ok(); // pin: the checkpoint anchors BEFORE any churn
+        Self {
+            rig,
+            table,
+            conn,
+            _guard: guard,
+        }
+    }
+
+    /// Execute source-side SQL (churn) against the scenario's table.
+    pub fn sql(&mut self, q: &str) {
+        use mysql::prelude::Queryable as _;
+        self.conn.query_drop(q).expect("scenario sql");
+    }
+
+    /// Drain the stream and read every part back.
+    pub fn drain_and_read(&self) -> Vec<arrow::record_batch::RecordBatch> {
+        self.rig.run_and_read()
+    }
+}
+
 #[cfg(test)]
 mod rig_render_goldens {
     use super::*;
