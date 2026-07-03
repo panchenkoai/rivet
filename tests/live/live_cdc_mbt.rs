@@ -455,13 +455,14 @@ exports:
     assert_eq!(j["all_ok"], true, "healthy state must read green: {j}");
 }
 
-// Finding #37 — DDL inside the capture window. Binlog row events are
-// POSITIONAL and carry no column names; after `DROP COLUMN a` mid-window the
-// pre-DDL event's 'a' value landed in column 'b' (observed live, silently,
-// status success). The sink now refuses arity drift loudly. Three shapes:
+// Finding #37 → upgraded by binlog_row_metadata=FULL: with column NAMES in
+// the TABLE_MAP (compose sets FULL; 8.0.1+), a mid-window `DROP COLUMN` maps
+// the pre-DDL image BY NAME — the dropped column's value is ignored and every
+// surviving column lands correctly. (Under the MINIMAL default the arity
+// guard still fails the run loudly — pinned at the unit level in sink.rs.)
 #[test]
-#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
-fn cdc_mid_window_ddl_fails_loudly_never_misaligns() {
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc (binlog_row_metadata=FULL)"]
+fn cdc_mid_window_ddl_maps_by_name_under_full_metadata() {
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("cdc_ddl_mid");
     let mut c = mysql::Pool::new(MYSQL_CDC_URL).unwrap().get_conn().unwrap();
@@ -479,28 +480,26 @@ fn cdc_mid_window_ddl_fails_loudly_never_misaligns() {
         .unwrap();
     c.query_drop(format!("INSERT INTO {tbl} (id,b) VALUES (2,'CCC')"))
         .unwrap();
+    run_ok(&cfg);
 
-    let res = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", cfg.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(!res.status.success(), "mid-window DDL must fail the run");
-    let err = String::from_utf8_lossy(&res.stderr);
-    assert!(
-        err.contains("WRONG columns"),
-        "the failure must explain the misalignment risk: {err}"
+    use arrow::array::StringArray;
+    let mut got = Vec::new();
+    for b in read_all_parts(&out) {
+        let col = b
+            .column(b.schema().index_of("b").unwrap())
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .clone();
+        for r in 0..b.num_rows() {
+            got.push(col.value(r).to_string());
+        }
+    }
+    assert_eq!(
+        got,
+        vec!["BBB", "CCC"],
+        "name-mapping must put b's values in b — the positional bug wrote 'AAA' here"
     );
-    let parts = std::fs::read_dir(&out)
-        .unwrap()
-        .filter(|e| {
-            e.as_ref()
-                .unwrap()
-                .path()
-                .extension()
-                .is_some_and(|x| x == "parquet")
-        })
-        .count();
-    assert_eq!(parts, 0, "no misaligned part may reach the destination");
 }
 
 // DDL BETWEEN runs is fine by construction: each run resolves fresh.

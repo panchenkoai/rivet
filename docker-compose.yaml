@@ -199,6 +199,10 @@ services:
       # writer pools + gremlins + grant tests) — same environment-ceiling
       # class as PG max_replication_slots.
       - "--max-connections=400"
+      # FULL puts column NAMES into TABLE_MAP optional metadata (8.0.1+) —
+      # the sink then maps binlog images BY NAME, closing the positional
+      # class on MySQL (doctor recommends this in production too).
+      - "--binlog-row-metadata=FULL"
     environment:
       MYSQL_ROOT_PASSWORD: rivet
       MYSQL_USER: rivet

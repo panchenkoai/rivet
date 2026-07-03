@@ -195,6 +195,25 @@ impl MysqlChangeStream {
                 };
                 let schema = tme.database_name().to_string();
                 let table = tme.table_name().to_string();
+                // `binlog_row_metadata=FULL` (8.0.1+) puts every column NAME
+                // into the TABLE_MAP's optional metadata — with names present
+                // the sink maps images BY NAME and the positional-corruption
+                // class (findings #37/#41) closes on MySQL too. Under the
+                // MINIMAL default this yields None and the arity guard stays
+                // load-bearing; `rivet doctor` recommends FULL.
+                let image_names: Option<Vec<String>> =
+                    tme.iter_optional_meta().find_map(|f| match f {
+                        Ok(mysql::binlog::events::OptionalMetadataField::ColumnName(names)) => {
+                            Some(
+                                names
+                                    .iter_names()
+                                    .filter_map(|n| n.ok())
+                                    .map(|n| String::from_utf8_lossy(n.name_raw()).into_owned())
+                                    .collect(),
+                            )
+                        }
+                        _ => None,
+                    });
                 // Provisional position; rewritten to the commit position at XID.
                 let position = Position(json!({ "file": self.file, "pos": log_pos }));
                 for row in re.rows(&tme) {
@@ -207,7 +226,7 @@ impl MysqlChangeStream {
                         after: after.map(render_row),
                         position: position.clone(),
                         committed: false,
-                        image_names: None,
+                        image_names: image_names.clone(),
                     });
                 }
                 if self.tx.len() > MAX_TX_ROWS {
