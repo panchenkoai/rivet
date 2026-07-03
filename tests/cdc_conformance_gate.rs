@@ -17,7 +17,10 @@ enum Expect {
     /// A test fn whose name contains this substring must exist in the file.
     Test(&'static str),
     /// Deliberately not applicable — the reason is printed on failure so the
-    /// exemption stays justified, never silent.
+    /// exemption stays justified, never silent. HYGIENE (M6): an NA claiming
+    /// "shared/engine-agnostic path" rots the day that path forks per engine —
+    /// when touching engine dispatch in the sink/cdc_job, re-read every NA
+    /// below and convert the invalidated ones into Test rows.
     NA(&'static str),
 }
 use Expect::{NA, Test};
@@ -143,6 +146,27 @@ const CASES: &[(&str, Expect, Expect, Expect)] = &[
         NA("same shared Position::save path; pinned once on MySQL"),
     ),
     (
+        "cross_oracle_full_surface",
+        Test("fn cdc_full_surface_cross_oracle_matches_literals"),
+        NA(
+            "external-reader agreement is anchored once on the client engine; \
+            PG/MSSQL parquet passes the same readers via the batch \
+            type_roundtrip suites, and CDC==batch is their matrix contract",
+        ),
+        NA("same anchoring argument"),
+    ),
+    (
+        "event_ordering_commit_order",
+        Test("fn cdc_event_order_within_and_across_transactions_is_commit_order"),
+        NA(
+            "part/row ordering lives in the shared sink (pinned once on the \
+            client engine); PG's commit-LSN framing is unit-tested in its \
+            parser",
+        ),
+        NA("same shared sink ordering; MSSQL's per-row LSN framing is \
+            unit-tested in its adapter"),
+    ),
+    (
         "golden_calculated_metrics",
         Test("fn cdc_golden_fixture_tables_calculated_metrics"),
         NA(
@@ -169,6 +193,7 @@ fn every_cdc_engine_covers_every_conformance_case() {
     let mut mysql_pg = fs::read_to_string(root.join("tests/live/live_cdc.rs")).unwrap();
     mysql_pg.push_str(&fs::read_to_string(root.join("tests/live/gremlin_cdc.rs")).unwrap());
     mysql_pg.push_str(&fs::read_to_string(root.join("tests/live/live_cdc_golden.rs")).unwrap());
+    mysql_pg.push_str(&fs::read_to_string(root.join("tests/live/live_cdc_oracle.rs")).unwrap());
     let mssql = fs::read_to_string(root.join("tests/live/live_cdc_mssql.rs")).unwrap();
 
     let mut missing = Vec::new();
@@ -182,6 +207,24 @@ fn every_cdc_engine_covers_every_conformance_case() {
                 Test(needle) => {
                     if !hay.contains(needle) {
                         missing.push(format!("{engine} × {case}: no test matching `{needle}`"));
+                    } else {
+                        // Strength floor (M4): existence is not coverage — a
+                        // hollowed-out test (name kept, asserts removed) must
+                        // not satisfy the gate. Count assert tokens in the fn
+                        // body (up to the next fn at the same nesting).
+                        let start = hay.find(needle).unwrap();
+                        let body_end = hay[start + needle.len()..]
+                            .find("\n#[test]")
+                            .map(|o| start + needle.len() + o)
+                            .unwrap_or(hay.len());
+                        let body = &hay[start..body_end];
+                        let asserts = body.matches("assert").count();
+                        if asserts == 0 {
+                            missing.push(format!(
+                                "{engine} × {case}: `{needle}` exists but carries NO assert \
+                                 tokens — hollowed out?"
+                            ));
+                        }
                     }
                 }
                 NA(reason) => {

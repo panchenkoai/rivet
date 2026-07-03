@@ -90,6 +90,12 @@ struct Metrics {
     deleted_ids: HashSet<i64>,
     /// Occurrences of a probed string value over INSERT images.
     string_hits: i64,
+    /// Σ(id · unscaled decimal) over INSERT images — the SWAP detector: a
+    /// permutation of amounts across rows preserves the plain sum and the
+    /// id-set, but moves this (the goldens' answer to keyed checksums).
+    keyed_decimal_sum: i128,
+    /// (min, max) epoch-µs of the probed timestamp column over INSERT images.
+    ts_min_max: Option<(i64, i64)>,
 }
 
 /// Fold metrics over the captured parts. `decimal_col`/`double_col`/`int_col`/
@@ -132,14 +138,44 @@ fn collect(
         if let Some(name) = decimal_col
             && let Some(a) = col_i128(name)
         {
+            let ids = b
+                .schema()
+                .index_of(id_col)
+                .ok()
+                .and_then(|i| b.column(i).as_any().downcast_ref::<Int64Array>().cloned());
             for r in 0..b.num_rows() {
                 if a.is_null(r) {
                     continue;
                 }
                 match op.value(r) {
-                    "insert" => m.decimal_insert_sum += a.value(r),
+                    "insert" => {
+                        m.decimal_insert_sum += a.value(r);
+                        if let Some(ids) = &ids
+                            && !ids.is_null(r)
+                        {
+                            m.keyed_decimal_sum += ids.value(r) as i128 * a.value(r);
+                        }
+                    }
                     "update" => m.decimal_update_sum += a.value(r),
                     _ => {}
+                }
+            }
+        }
+        // Timestamp probe (M7): the goldens plant a single known instant —
+        // min==max==T0 catches any epoch shift the sums cannot see.
+        if let Ok(i) = b.schema().index_of("created_at")
+            && let Some(a) = b
+                .column(i)
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+        {
+            for r in 0..b.num_rows() {
+                if op.value(r) == "insert" && !a.is_null(r) {
+                    let v = a.value(r);
+                    m.ts_min_max = Some(match m.ts_min_max {
+                        None => (v, v),
+                        Some((lo, hi)) => (lo.min(v), hi.max(v)),
+                    });
                 }
             }
         }
@@ -437,6 +473,24 @@ exports:
         "Σ update-after amount = 10057.50"
     );
     assert_eq!(m.string_hits, 50, "50 chargebacks");
+    // Swap detector: Σ id·cents = 100·Σi² + 25·Σi over 1..100
+    //              = 100·338_350 + 25·5_050 = 33_961_250.
+    assert_eq!(
+        m.keyed_decimal_sum, 33_961_250,
+        "keyed Σ(id·amount-cents) — a cross-row amount swap moves this"
+    );
+    // Every golden insert carries the same instant: min == max == T0.
+    let t0 = chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
+        .unwrap()
+        .and_hms_opt(12, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_micros();
+    assert_eq!(
+        m.ts_min_max,
+        Some((t0, t0)),
+        "created_at pinned to T0 epoch"
+    );
     assert_eq!(
         m.deleted_ids,
         (91..=100).collect::<HashSet<i64>>(),
@@ -595,4 +649,104 @@ exports:
     );
 
     drop(guards);
+}
+
+// M1 — the ORDERING pin, absent everywhere else: downstream MERGE correctness
+// rests on (a) parts being seq-ordered by filename, (b) rows within a part
+// being commit-ordered, and (c) same-`__pos` events (one transaction) being
+// resolvable by intra-part row order. Three updates to ONE row — two inside a
+// single transaction (same commit position), one in the next — must read back
+// in exactly commit order, so "latest by (__pos, file, row_number)" yields
+// the true final image.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_event_order_within_and_across_transactions_is_commit_order() {
+    use arrow::array::Int32Array;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_order");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let _guard = Table(tbl.clone());
+
+    let out = d.path().join("out");
+    let ckpt = d.path().join("cdc.ckpt");
+    std::fs::create_dir_all(&out).unwrap();
+    let yaml = format!(
+        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
+exports:
+  - name: {tbl}
+    table: {tbl}
+    mode: cdc
+    format: parquet
+    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        ckpt = ckpt.display(),
+        out = out.display(),
+        sid = server_id_for(&tbl),
+    );
+    let cfg = write_config(&d, &yaml);
+    let run = || {
+        let st = std::process::Command::new(RIVET_BIN)
+            .args(["run", "--config", cfg.to_str().unwrap()])
+            .status()
+            .unwrap();
+        assert!(st.success());
+    };
+    run(); // pin
+
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1, 0)"))
+        .unwrap();
+    // ONE transaction, two updates to the same row — same commit __pos.
+    c.query_drop("START TRANSACTION").unwrap();
+    c.query_drop(format!("UPDATE {tbl} SET v = 1 WHERE id = 1"))
+        .unwrap();
+    c.query_drop(format!("UPDATE {tbl} SET v = 2 WHERE id = 1"))
+        .unwrap();
+    c.query_drop("COMMIT").unwrap();
+    // A second transaction — a later __pos.
+    c.query_drop(format!("UPDATE {tbl} SET v = 3 WHERE id = 1"))
+        .unwrap();
+    run();
+
+    // Read rows in (filename, row) order; collect (v, __pos) per after-image.
+    let mut seq: Vec<(i32, String)> = Vec::new();
+    for b in read_all(&out) {
+        let v = b
+            .column(b.schema().index_of("v").unwrap())
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .clone();
+        let pos = b
+            .column(b.schema().index_of("__pos").unwrap())
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .clone();
+        for r in 0..b.num_rows() {
+            seq.push((v.value(r), pos.value(r).to_string()));
+        }
+    }
+    let vs: Vec<i32> = seq.iter().map(|(v, _)| *v).collect();
+    assert_eq!(
+        vs,
+        vec![0, 1, 2, 3],
+        "images must read back in exact commit order (insert, u1, u2, u3)"
+    );
+    // Same transaction ⇒ same commit position; the NEXT transaction differs —
+    // so the documented dedupe (max __pos, then intra-part row order) resolves
+    // v=2 over v=1 by order, and v=3 over both by position.
+    assert_eq!(
+        seq[1].1, seq[2].1,
+        "u1 and u2 share their tx's commit __pos"
+    );
+    assert_ne!(seq[2].1, seq[3].1, "the next transaction has a later __pos");
+    let last = seq.last().unwrap();
+    assert_eq!(
+        last.0, 3,
+        "latest-by-(__pos, order) is the true final image"
+    );
 }
