@@ -272,7 +272,16 @@ fn every_cdc_engine_covers_every_conformance_case() {
 fn every_live_cdc_test_asserts_an_outcome() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut naked = Vec::new();
-    for file in ["tests/live/live_cdc.rs", "tests/live/live_cdc_mssql.rs"] {
+    for file in [
+        "tests/live/live_cdc.rs",
+        "tests/live/live_cdc_mssql.rs",
+        "tests/live/gremlin_cdc.rs",
+        "tests/live/live_cdc_golden.rs",
+        "tests/live/live_cdc_oracle.rs",
+        "tests/live/live_cdc_mbt.rs",
+        "tests/live/live_cdc_property.rs",
+        "tests/live/live_batch_switch_golden.rs",
+    ] {
         let src = fs::read_to_string(root.join(file)).unwrap();
         // Split on test attributes; each chunk is one test body (plus tail).
         for chunk in src.split("#[test]").skip(1) {
@@ -284,7 +293,8 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 .next()
                 .unwrap_or("?")
                 .to_string();
-            let runs_capture = chunk.contains("run_cdc(");
+            let runs_capture =
+                chunk.contains("run_cdc(") || chunk.contains("Command::new(RIVET_BIN)");
             // Outcome = the test READS BACK what the capture produced (files,
             // destination listing, or the state DB) — not merely that the
             // process exited 0.
@@ -295,7 +305,17 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 || chunk.contains("read_csv(")
                 || chunk.contains("gcs list")
                 || chunk.contains("query_row")
-                || chunk.contains("status.success()");
+                || chunk.contains("status.success()")
+                // Read-back helpers the newer suites use:
+                || chunk.contains("distinct_ids(")
+                || chunk.contains("distinct_int_ids(")
+                || chunk.contains("read_all(")
+                || chunk.contains("read_all_parts(")
+                || chunk.contains("stage_metrics(")
+                || chunk.contains("collect(") && chunk.contains("Metrics")
+                || chunk.contains("all_ok") // doctor --json contract
+                || chunk.contains("storage/v1") // GCS listing read-back
+                || chunk.contains("ParquetRecordBatchReaderBuilder"); // inline part read-back
             if runs_capture && !asserts_outcome {
                 naked.push(format!("{file}::{name}"));
             }

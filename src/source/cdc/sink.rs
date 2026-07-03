@@ -432,6 +432,9 @@ fn flush(
         // prefix; an image WIDER than the schema, or a non-delete image of
         // ANY other arity, proves a stale pre-DDL layout.
         let is_delete = ev.op == ChangeOp::Delete;
+        if is_delete && ev.image_names.is_some() {
+            continue; // named key image — mapped by name, arity-proof
+        }
         let img = if is_delete {
             ev.before.as_ref()
         } else {
@@ -467,29 +470,38 @@ fn flush(
         // bytes, ENUM indexes, epoch-text TIMESTAMPs, NUL-trimmed BINARY) —
         // computed once per column, applied per cell.
         let fix = value::mysql_cell_fix(engine, &m.source_native_type);
-        // after-image for insert/update; before-image (the key) for delete
-        fn image_of(e: &ChangeEvent) -> Option<&Vec<RivetValue>> {
+        // after-image for insert/update; before-image (the key) for delete.
+        // Finding #41: a NAMED key-only image (PG DELETE) maps by COLUMN NAME
+        // into the resolved schema — positional mapping put a non-first PK's
+        // value into column 0 and NULLed the PK, silently losing the delete
+        // downstream. Unnamed images stay positional (full rows).
+        fn image_cell<'e>(e: &'e ChangeEvent, i: usize, col: &str) -> Option<&'e RivetValue> {
             match e.op {
-                ChangeOp::Delete => e.before.as_ref(),
-                _ => e.after.as_ref(),
+                ChangeOp::Delete => {
+                    let vals = e.before.as_ref()?;
+                    match &e.image_names {
+                        Some(names) => names
+                            .iter()
+                            .position(|n| n == col)
+                            .and_then(|j| vals.get(j)),
+                        None => vals.get(i),
+                    }
+                }
+                _ => e.after.as_ref()?.get(i),
             }
         }
         let render = value::render_type(m.arrow_type.as_ref());
         let owned: Option<Vec<Option<RivetValue>>> = fix.as_ref().map(|fix| {
             events
                 .iter()
-                .map(|e| {
-                    image_of(e)
-                        .and_then(|vals| vals.get(i))
-                        .map(|v| fix.apply(v))
-                })
+                .map(|e| image_cell(e, i, &m.column_name).map(|v| fix.apply(v)))
                 .collect()
         });
         let cells: Vec<Option<&RivetValue>> = match &owned {
             Some(o) => o.iter().map(|c| c.as_ref()).collect(),
             None => events
                 .iter()
-                .map(|e| image_of(e).and_then(|vals| vals.get(i)))
+                .map(|e| image_cell(e, i, &m.column_name))
                 .collect(),
         };
         let arr = value::build_column(&render, &cells)?;
@@ -700,6 +712,7 @@ mod tests {
             after: Some(vec![RivetValue::Int(id)]),
             position: Position(serde_json::json!({ "lsn": format!("{id:08X}") })),
             committed: true,
+            image_names: None,
         }
     }
 
@@ -834,6 +847,7 @@ mod tests {
             ]),
             position: Position(serde_json::json!({})),
             committed: true,
+            image_names: None,
         };
         let mut cols = vec![
             decimal_col("placeholder", 38, 0), // SQL Server: scale unknown at resolve

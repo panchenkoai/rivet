@@ -87,6 +87,14 @@ pub(crate) struct ChangeEvent {
     /// it at the XID/commit marker; the poll-based PG / SQL Server adapters only
     /// ever read already-committed data, so every change is a commit boundary.
     pub(crate) committed: bool,
+    /// Column NAMES of this event's image, when the engine carries them
+    /// (PostgreSQL wire text names every column; SQL Server change-table rows
+    /// are name-addressable). With names present the sink maps the image BY
+    /// NAME into the resolved schema — the positional-mapping corruption
+    /// class (findings #37/#41/#42: mid-window DDL shifts, non-first PK
+    /// deletes) is unrepresentable. `None` ⇒ positional full row (MySQL
+    /// binlog carries no names; its arity guard stays load-bearing).
+    pub(crate) image_names: Option<Vec<String>>,
 }
 
 impl ChangeEvent {

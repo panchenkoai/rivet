@@ -218,3 +218,13 @@ after healing the union of all parts holds every source row (overlap fine,
 gap never). Panic-hook tests cannot cover these: a panic unwinds and runs
 `Drop` guards; none of the above do. Requires toxiproxy + fake-gcs from the
 compose stack; each case is a row in the conformance matrix.
+
+### Known-equivalent mutants (decimal canon)
+
+The six surviving mutants in `src/types/decimal.rs` are all `<` → `<=` on
+branch guards where BOTH branches compute identical values at the boundary
+(e.g. `scale < 0` vs `scale <= 0`: at scale 0 the negative-scale arm divides
+by 10⁰ = 1 — the same result as the plain path; `frac.len() < scale` vs `<=`:
+at equality the pad loop pads zero characters). They are mathematically
+unkillable; do not write pseudo-tests for them. Everything else in the file
+is caught (92) or timeouts-as-caught (4).

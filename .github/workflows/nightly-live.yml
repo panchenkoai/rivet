@@ -280,7 +280,12 @@ jobs:
       - name: Build + soak 45m
         if: steps.day.outputs.sunday == 'yes'
         run: |
-          sudo apt-get install -y duckdb 2>/dev/null || true
+          # duckdb is NOT in Ubuntu's apt archives — install the official
+          # binary and verify it, or the soak's gap check cannot run (and it
+          # now fails loud rather than silently skipping).
+          curl -fsSL https://install.duckdb.org | sh
+          export PATH="$HOME/.duckdb/cli/latest:$PATH"
+          duckdb --version
           cargo build --release
           scripts/soak_cdc.sh 45 target/release/rivet
       - name: Stop services

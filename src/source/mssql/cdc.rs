@@ -210,6 +210,10 @@ CDC change-table retention (the cleanup job removed it). Resuming would silently
             let mut op_code = 0i32;
             let mut lsn = String::new();
             let mut values: Vec<RivetValue> = Vec::new();
+            // Captured column NAMES ride along — the sink then maps this
+            // image by name, making the positional-corruption class
+            // (findings #37/#41) unrepresentable on SQL Server too.
+            let mut names: Vec<String> = Vec::new();
             for (idx, (col, data)) in r.cells().enumerate() {
                 match col.name() {
                     "__$operation" => {
@@ -223,7 +227,10 @@ CDC change-table retention (the cleanup job removed it). Resuming would silently
                         }
                     }
                     n if n.starts_with("__$") => {} // skip other metadata
-                    _ => values.push(cell_to_rivet(r, idx, data)),
+                    n => {
+                        names.push(n.to_string());
+                        values.push(cell_to_rivet(r, idx, data));
+                    }
                 }
             }
             let Some(op) = map_op(op_code) else { continue };
@@ -241,6 +248,7 @@ CDC change-table retention (the cleanup job removed it). Resuming would silently
                 position: Position(json!({ "lsn": lsn })),
                 // The change table only ever holds already-committed changes.
                 committed: true,
+                image_names: Some(names),
             });
         }
         Ok(())

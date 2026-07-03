@@ -12,6 +12,27 @@
   encoding shared by both sides; a new accessor per engine, enforced at compile time). An offline matrix
   guard pins the CDC fold to the builder across every covered type with hostile cells (overflow
   narrowing, wrong-width binary, arrays with inner NULLs, NaN, u64::MAX, 50-digit decimals).
+- **Positional column mapping eliminated wherever the engine names its columns.** Ultrareview round 2
+  found the class live (finding #41): a PostgreSQL DELETE under default REPLICA IDENTITY carries ONLY
+  the key columns — with names in the wire text that the parser discarded — so a non-first/compound PK's
+  value landed positionally in column 0 (rendered into a TEXT column!) and the PK became NULL: the
+  downstream MERGE matched nothing and the delete silently vanished (every campaign fixture had `id`
+  first — the shape-of-the-fixture blind spot). And #42: a PK-CHANGING update renders
+  `old-key: … new-tuple: …`; gluing the sections tripped the arity guard and permanently bricked the
+  stream on a legal operation behind a misleading "DDL" diagnosis. Both fixed at the root: PostgreSQL
+  events now carry their column NAMES for every op (old-key split into `before`), SQL Server images
+  carry the change-table column names, and the sink maps named images BY NAME — the positional
+  corruption class (#37/#41/#42) is unrepresentable on PG/MSSQL. MySQL binlog is nameless by protocol;
+  its arity guard stays load-bearing (schema history remains the roadmap answer there). Live pins:
+  non-first-PK delete, PK-changing update.
+- **Round-2 review nits fixed**: MySQL 8.4 + binlog-off now reports "binlog disabled" instead of a
+  masked syntax error; the outcome gate scans all eight CDC test files and recognizes direct
+  `Command::new(RIVET_BIN)` captures plus the newer read-back helpers; the soak script is
+  GNU/Linux-portable (`time -v`), fails LOUD when duckdb is missing instead of silently skipping the
+  gap check, and the CI lane installs duckdb by a verified method; a `.gitignore` append without a
+  trailing newline had glued `.claude/` + `mutants.out/` into one pattern, un-ignoring `.claude/` —
+  repaired and untracked; a contradictory golden comment corrected; the six surviving decimal mutants
+  are documented as boundary-equivalent (mathematically unkillable).
 - **Negative-scenario sweep: five hostile families closed, two more findings.** Binary-level fuzz over
   the MySQL cell-fix layer found the enum-label parser PANICKING on malformed native strings and — worse
   — silently MOJIBAKE-ing every non-ASCII label (`ENUM('привет')` byte-cast char-by-char; findings

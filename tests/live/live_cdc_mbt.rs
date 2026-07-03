@@ -1099,3 +1099,178 @@ exports:
         "a full disk is a delay, not a loss"
     );
 }
+
+// Ultrareview-2 bug_012 (finding #41): a PG DELETE under default REPLICA
+// IDENTITY carries ONLY the key columns — WITH their names in the wire text
+// — but the parser discarded the names and the sink mapped positionally, so
+// with a non-first PK the key value landed in column 0 (rendered into a TEXT
+// column!) and the PK itself became NULL: a downstream MERGE-by-PK matches
+// nothing and the DELETE is silently lost. Every fixture in the campaign had
+// `id` first — the shape-of-the-fixture blind spot in person.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_delete_with_non_first_pk_lands_in_the_pk_column() {
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_pk_mid");
+    let slot = unique_name("rivet_pkmid_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    // PK deliberately NOT first; a compound variant covers the PK-in-the-
+    // middle shape too.
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; \
+         CREATE TABLE {tbl} (name TEXT, id INT PRIMARY KEY)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+    c.batch_execute(&format!(
+        "INSERT INTO {tbl} VALUES ('alice', 42); DELETE FROM {tbl} WHERE id = 42;"
+    ))
+    .unwrap();
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    run_ok(&pg_mbt_cfg(&d, &tbl, &slot, &out));
+
+    use arrow::array::{Int32Array, StringArray};
+    let mut checked_delete = false;
+    for b in read_all_parts(&out) {
+        let op = b
+            .column(b.schema().index_of("__op").unwrap())
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .clone();
+        let id = b
+            .column(b.schema().index_of("id").unwrap())
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .clone();
+        let name = b
+            .column(b.schema().index_of("name").unwrap())
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .clone();
+        for r in 0..b.num_rows() {
+            if op.value(r) != "delete" {
+                continue;
+            }
+            checked_delete = true;
+            assert!(
+                !id.is_null(r),
+                "the DELETE's key must land in the PK column, not vanish"
+            );
+            assert_eq!(id.value(r), 42, "the typed PK value");
+            assert!(
+                name.is_null(r),
+                "the PK value must NOT bleed into column 0 ('name' got {:?})",
+                name.value(r)
+            );
+        }
+    }
+    assert!(checked_delete, "a delete event must be captured");
+}
+
+struct Slot(String);
+impl Drop for Slot {
+    fn drop(&mut self) {
+        use postgres::NoTls;
+        if let Ok(mut c) = postgres::Client::connect(POSTGRES_CDC_URL, NoTls) {
+            let _ = c.execute("SELECT pg_drop_replication_slot($1)", &[&self.0]);
+        }
+    }
+}
+
+fn pg_mbt_cfg(
+    d: &tempfile::TempDir,
+    tbl: &str,
+    slot: &str,
+    out: &std::path::Path,
+) -> std::path::PathBuf {
+    let yaml = format!(
+        r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
+exports:
+  - name: {tbl}
+    table: {tbl}
+    mode: cdc
+    format: parquet
+    cdc: {{ slot: {slot}, until_current: true }}
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        out = out.display(),
+    );
+    write_config(d, &yaml)
+}
+
+// Finding #42 (live): updating the PRIMARY KEY is a legal operation —
+// test_decoding renders `old-key: … new-tuple: …`, and gluing the sections
+// bricked the stream permanently behind a misleading "DDL" arity failure.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_pk_changing_update_captures_and_does_not_brick() {
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_pkupd");
+    let slot = unique_name("rivet_pkupd_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v TEXT)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+    c.batch_execute(&format!(
+        "INSERT INTO {tbl} VALUES (1,'a'); UPDATE {tbl} SET id = 2 WHERE id = 1;"
+    ))
+    .unwrap();
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    run_ok(&pg_mbt_cfg(&d, &tbl, &slot, &out));
+
+    use arrow::array::{Int32Array, StringArray};
+    let mut update_after: Option<(i32, String)> = None;
+    for b in read_all_parts(&out) {
+        let op = b
+            .column(b.schema().index_of("__op").unwrap())
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .clone();
+        let id = b
+            .column(b.schema().index_of("id").unwrap())
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .clone();
+        let v = b
+            .column(b.schema().index_of("v").unwrap())
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .clone();
+        for r in 0..b.num_rows() {
+            if op.value(r) == "update" {
+                update_after = Some((id.value(r), v.value(r).to_string()));
+            }
+        }
+    }
+    assert_eq!(
+        update_after,
+        Some((2, "a".to_string())),
+        "the update's after-image is the NEW tuple (id=2), stream not bricked"
+    );
+}

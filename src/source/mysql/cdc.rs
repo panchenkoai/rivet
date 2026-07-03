@@ -88,11 +88,14 @@ impl MysqlChangeStream {
         let mut c = connect_conn(url, tls)?;
         let row: mysql::Row = match c.query_first("SHOW BINARY LOG STATUS") {
             Ok(Some(row)) => row,
-            // Err ⇒ pre-8.2 syntax error; Ok(None) ⇒ statement exists but
-            // returned nothing — both fall back to the legacy form.
-            _ => c
-                .query_first("SHOW MASTER STATUS")?
-                .ok_or_else(|| anyhow::anyhow!("mysql: binlog disabled (binlog status empty)"))?,
+            // The 8.2+ statement EXISTS and returned nothing ⇒ binlog is
+            // definitively disabled — falling back would surface 8.4's
+            // "SHOW MASTER STATUS" syntax error instead of the real cause.
+            Ok(None) => anyhow::bail!("mysql: binlog disabled (binlog status empty)"),
+            // Err ⇒ pre-8.2 server without the new statement — legacy form.
+            Err(_) => c.query_first("SHOW MASTER STATUS")?.ok_or_else(|| {
+                anyhow::anyhow!("mysql: binlog disabled (SHOW MASTER STATUS empty)")
+            })?,
         };
         let file: String = row.get(0).expect("binlog file column");
         let pos: u64 = row.get(1).expect("binlog pos column");
@@ -204,6 +207,7 @@ impl MysqlChangeStream {
                         after: after.map(render_row),
                         position: position.clone(),
                         committed: false,
+                        image_names: None,
                     });
                 }
                 if self.tx.len() > MAX_TX_ROWS {

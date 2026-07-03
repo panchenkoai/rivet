@@ -432,8 +432,7 @@ exports:
 
     // orders_coalesce: 50 rows (id explicit 1..50, quantity = i); delete odd
     // (25); double the quantity of the surviving even ids ⇒ update
-    // after-image quantity sum = 2*(2+4+…+50) = 2_550... (2+4+..+50 = 650;
-    // ×2 = 1_300).
+    // after-image quantity sum: 2+4+…+50 = 650; ×2 = 1_300.
     let t = &names["orders_coalesce"];
     let vals: Vec<String> = (1..=50)
         .map(|i: i64| format!("({i}, 'prod {i}', {i}, {i}.00, NULL, '{T0}')"))

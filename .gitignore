@@ -101,4 +101,5 @@ pilot_bench.yaml
 # (DuckDB + ClickHouse read the same Parquet from here — see
 # docker-compose.yaml).
 /tests/.live-tmp/
-.claude/mutants.out/
+.claude/
+mutants.out/

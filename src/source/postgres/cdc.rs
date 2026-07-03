@@ -184,13 +184,36 @@ fn parse_test_decoding(lsn: &str, data: &str) -> Option<ChangeEvent> {
     };
     // After `<OP>: ` comes the `col[type]:value …` list (all columns for
     // INSERT/UPDATE; the key for DELETE).
-    let cols = tail
-        .split_once(": ")
-        .map(|(_, c)| parse_columns(c))
-        .unwrap_or_default();
-    let (before, after) = match op {
-        ChangeOp::Delete => (Some(cols), None),
-        _ => (None, Some(cols)),
+    let body = tail.split_once(": ").map(|(_, c)| c).unwrap_or("");
+    // Finding #42: an UPDATE that changes the PRIMARY KEY renders BOTH
+    // sections — `old-key: <cols> new-tuple: <cols>` — and a naive scan
+    // glues them into one over-long image (the arity guard then bricks the
+    // stream on a perfectly legal operation, permanently, with a misleading
+    // "DDL" diagnosis). Split them: old-key → before, new-tuple → after.
+    let (old_key_part, new_part) = match body.strip_prefix("old-key: ") {
+        Some(rest) => match rest.split_once(" new-tuple: ") {
+            Some((old, new)) => (Some(old), new),
+            None => (None, rest),
+        },
+        None => (None, body),
+    };
+    let named = parse_columns(new_part);
+    let old_named = old_key_part.map(parse_columns);
+    let names: Vec<String> = named.iter().map(|(n, _)| n.clone()).collect();
+    let cols: Vec<RivetValue> = named.into_iter().map(|(_, v)| v).collect();
+    // The wire text names EVERY column — carry the names for every op, so
+    // the sink maps by NAME and the whole positional-corruption class
+    // (findings #37/#41/#42) is unrepresentable on PostgreSQL.
+    let (before, after, image_names) = match op {
+        ChangeOp::Delete => (Some(cols), None, Some(names)),
+        // A PK-changing UPDATE carries its old key too; the after-image is
+        // the new tuple (its names). The old key rides `before`.
+        ChangeOp::Update => (
+            old_named.map(|o| o.into_iter().map(|(_, v)| v).collect()),
+            Some(cols),
+            Some(names),
+        ),
+        ChangeOp::Insert => (None, Some(cols), Some(names)),
     };
     Some(ChangeEvent {
         op,
@@ -198,6 +221,7 @@ fn parse_test_decoding(lsn: &str, data: &str) -> Option<ChangeEvent> {
         table,
         before,
         after,
+        image_names,
         position: Position(json!({ "lsn": lsn })),
         // The slot only ever yields already-committed changes.
         committed: true,
@@ -207,7 +231,7 @@ fn parse_test_decoding(lsn: &str, data: &str) -> Option<ChangeEvent> {
 /// Parse a `test_decoding` column list (`name[type]:value name[type]:value …`)
 /// into typed [`RivetValue`]s, in column order. Values are quoted with `''`
 /// escaping or unquoted (numbers / `t`/`f` / `null`).
-fn parse_columns(s: &str) -> Vec<RivetValue> {
+fn parse_columns(s: &str) -> Vec<(String, RivetValue)> {
     let mut out = Vec::new();
     let mut rest = s.trim_start();
     while !rest.is_empty() {
@@ -215,10 +239,13 @@ fn parse_columns(s: &str) -> Vec<RivetValue> {
         let Some(rel) = rest[lb..].find("]:") else {
             break;
         };
+        // The column NAME precedes '[' — it is DATA for key-only images
+        // (finding #41): a DELETE's key must map by name, not position.
+        let name = rest[..lb].trim().to_string();
         let typ = &rest[lb + 1..lb + rel];
         let after_colon = &rest[lb + rel + 2..];
         let (val, quoted, consumed) = parse_value(after_colon);
-        out.push(map_pg_value(typ, &val, quoted));
+        out.push((name, map_pg_value(typ, &val, quoted)));
         rest = after_colon[consumed..].trim_start();
     }
     out
@@ -588,6 +615,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    // Finding #42: a PK-changing UPDATE renders `old-key: … new-tuple: …`.
+    // The naive scan glued both sections into one over-long after-image and
+    // the arity guard then PERMANENTLY bricked the stream on a legal
+    // operation. The after-image must be exactly the new tuple; the old key
+    // rides `before`.
+    #[test]
+    fn pk_changing_update_splits_old_key_from_new_tuple() {
+        let line = "table public.t: UPDATE: old-key: id[integer]:1 \
+                    new-tuple: id[integer]:2 v[text]:'a'";
+        let ev = parse_test_decoding("0/ABC", line).unwrap();
+        assert_eq!(
+            ev.after,
+            Some(vec![RivetValue::Int(2), RivetValue::Bytes(b"a".to_vec())]),
+            "after-image is the NEW tuple only"
+        );
+        assert_eq!(
+            ev.before,
+            Some(vec![RivetValue::Int(1)]),
+            "the old key rides before"
+        );
+        // A normal (non-PK) update stays a plain after-image.
+        let ev = parse_test_decoding("0/ABC", "table public.t: UPDATE: id[integer]:1 v[text]:'b'")
+            .unwrap();
+        assert_eq!(
+            ev.after,
+            Some(vec![RivetValue::Int(1), RivetValue::Bytes(b"b".to_vec())])
+        );
+        assert_eq!(ev.before, None);
     }
 
     // RED for finding #24 (non-UTC session): test_decoding renders timestamptz

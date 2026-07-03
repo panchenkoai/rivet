@@ -49,11 +49,17 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
   $MYSQL "UPDATE soak_cdc SET v = v + 1 WHERE id % 7 = 0 AND id >= $NEXT_ID" 2>/dev/null
   $MYSQL "DELETE FROM soak_cdc WHERE id % 31 = 0 AND id >= $NEXT_ID" 2>/dev/null
   NEXT_ID=$((END_ID + 1))
-  # One bounded run, RSS sampled via /usr/bin/time.
-  /usr/bin/time -l "$BIN" run --config "$WORK/cfg.yaml" > "$WORK/run.log" 2> "$WORK/time.log" \
-    || { echo "soak: cycle $CYCLE FAILED"; tail -30 "$WORK/run.log"; exit 1; }
-  grep -E "maximum resident set size" "$WORK/time.log" | awk '{print $1}' >> "$RSS_LOG" \
-    || grep -oE "[0-9]+maxresident" "$WORK/time.log" | tr -d 'a-z' >> "$RSS_LOG" || true
+  # One bounded run, RSS sampled via /usr/bin/time. The flag is
+  # platform-split: BSD/macOS wants -l, GNU/Linux wants -v (the first CI
+  # attempt shipped -l unconditionally and GNU time exited 1 before the
+  # binary even ran — ultrareview finding).
+  if [ "$(uname)" = "Darwin" ]; then TFLAG=-l; else TFLAG=-v; fi
+  /usr/bin/time "$TFLAG" "$BIN" run --config "$WORK/cfg.yaml" > "$WORK/run.log" 2> "$WORK/time.log" \
+    || { echo "soak: cycle $CYCLE FAILED"; tail -30 "$WORK/run.log"; cat "$WORK/time.log" | tail -5; exit 1; }
+  # BSD: "NNN  maximum resident set size" (bytes); GNU -v:
+  # "Maximum resident set size (kbytes): NNN".
+  RSS_SAMPLE=$(grep -iE "maximum resident set size" "$WORK/time.log" | grep -oE "[0-9]+" | tail -1)
+  [ -n "$RSS_SAMPLE" ] && echo "$RSS_SAMPLE" >> "$RSS_LOG"
   sleep 2
 done
 
@@ -72,7 +78,13 @@ PY
 )
 EXPECTED=$((NEXT_ID - 1))
 echo "soak: cycles=$CYCLE, churned_ids=$EXPECTED, distinct_in_parts=$ROWS_SEEN"
-if [ "$ROWS_SEEN" != "-1" ] && [ "$ROWS_SEEN" -lt "$EXPECTED" ]; then
+if [ "$ROWS_SEEN" = "-1" ]; then
+  # A missing reader must be LOUD — a silently skipped gap check reads as
+  # "verified" when nothing was (ultrareview finding: the sentinel
+  # short-circuited the assertion and printed OK).
+  echo "soak: duckdb missing — cannot verify gap-freedom"; exit 1
+fi
+if [ "$ROWS_SEEN" -lt "$EXPECTED" ]; then
   echo "soak: GAP — $ROWS_SEEN < $EXPECTED"; exit 1
 fi
 Q=$(( $(wc -l < "$RSS_LOG") / 4 )); [ "$Q" -ge 1 ] || Q=1
