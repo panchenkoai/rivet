@@ -460,23 +460,16 @@ fn build_array(
 }
 
 /// An f64-delivered fixed-point value (MONEY/SMALLMONEY) as the unscaled i128
-/// of a `Decimal128(_, scale)` column. Renders at the declared scale and parses
-/// the digits exactly — no float `powi` rounding artefacts; non-finite input is
-/// a loud error, never a silent NULL.
+/// of a `Decimal128(_, scale)` column: render at the declared scale, then the
+/// ONE decimal-string canon (`types::decimal`) parses the digits exactly.
+/// Non-finite input is a loud error, never a silent NULL.
 fn f64_to_scaled_i128(v: f64, scale: u8) -> Result<i128> {
     if !v.is_finite() {
         anyhow::bail!("non-finite money value {v:?}");
     }
     let txt = format!("{v:.prec$}", prec = scale as usize);
-    let (neg, rest) = match txt.strip_prefix('-') {
-        Some(r) => (true, r),
-        None => (false, txt.as_str()),
-    };
-    let digits: String = rest.chars().filter(|c| *c != '.').collect();
-    let mag: i128 = digits
-        .parse()
-        .with_context(|| format!("money render {txt:?} did not parse"))?;
-    Ok(if neg { -mag } else { mag })
+    crate::types::decimal::decimal_str_to_scaled_i128(&txt, scale as i8)
+        .ok_or_else(|| anyhow::anyhow!("money render {txt:?} did not parse"))
 }
 
 /// Rescale an unscaled decimal from `from_scale` to `to_scale` (Arrow's fixed

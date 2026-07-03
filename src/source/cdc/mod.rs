@@ -227,29 +227,14 @@ impl CdcEngine {
         }
     }
 
-    /// This engine's resume-anchor model — the per-engine contract CLAUDE.md
-    /// documents in prose, as code. It decides idle-first-run behaviour and
-    /// what `initial: snapshot` must do before reading a single row.
-    pub(crate) fn anchor_model(self) -> AnchorModel {
-        match self {
-            // The slot pins server-side at creation; the server holds WAL.
-            Self::Postgres => AnchorModel::ServerSide,
-            // NO server-side anchor: the first checkpointed open must persist
-            // its coordinates immediately, or an idle bounded run leaves no
-            // anchor and the next run silently re-anchors at "current".
-            Self::Mysql => AnchorModel::CheckpointAtOpen,
-            // No checkpoint ⇒ floors at fn_cdc_get_min_lsn: over-reads,
-            // never skips.
-            Self::Mssql => AnchorModel::FloorAtMin,
-        }
-    }
-
-    /// Ensure the resume anchor EXISTS — the `initial: snapshot` step ① and the
+    /// Ensure the resume anchor EXISTS — `initial: snapshot` step ① and the
     /// single entry point for anchor creation (idempotent: a present anchor is
-    /// left untouched). Which mechanism runs is decided by [`Self::anchor_model`]:
-    /// server-side engines create their server object; checkpoint-anchored
-    /// engines pin the current position into `checkpoint` when the file is
-    /// absent.
+    /// never moved). The per-engine anchor models (see CLAUDE.md):
+    /// PG pins server-side at slot creation; MySQL has NO server-side anchor —
+    /// the checkpoint is pinned at first open; MSSQL floors at
+    /// `fn_cdc_get_min_lsn` without one (over-reads, never skips).
+    /// `resume_expected` = prior-run evidence exists — a missing server-side
+    /// anchor then fails LOUDLY instead of silently re-anchoring at "current".
     pub(crate) fn ensure_anchor(
         self,
         url: &str,
@@ -258,12 +243,10 @@ impl CdcEngine {
         tls: Option<&crate::config::TlsConfig>,
         resume_expected: bool,
     ) -> Result<()> {
-        match self.anchor_model() {
-            AnchorModel::ServerSide => {
+        match self {
+            Self::Postgres => {
                 // Slot creation IS the anchor; open() creates it only on a
-                // genuine FIRST run. With resume evidence behind us a missing
-                // slot means dropped/invalidated — open() then fails loudly
-                // instead of silently re-anchoring at the current position.
+                // genuine FIRST run (resume_expected=false).
                 drop(crate::source::postgres::cdc::PgChangeStream::open(
                     url,
                     slot,
@@ -272,7 +255,7 @@ impl CdcEngine {
                 )?);
                 Ok(())
             }
-            AnchorModel::CheckpointAtOpen | AnchorModel::FloorAtMin => {
+            Self::Mysql | Self::Mssql => {
                 let ckpt = checkpoint.ok_or_else(|| {
                     anyhow::anyhow!(
                         "{} cdc: an anchor needs cdc.checkpoint (no server-side anchor exists)",
@@ -288,25 +271,11 @@ impl CdcEngine {
                             url, ckpt, tls,
                         )
                     }
-                    Self::Mssql => {
-                        crate::source::mssql::cdc::pin_checkpoint_at_max_lsn(url, ckpt, tls)
-                    }
-                    Self::Postgres => unreachable!("ServerSide handled above"),
+                    _ => crate::source::mssql::cdc::pin_checkpoint_at_max_lsn(url, ckpt, tls),
                 }
             }
         }
     }
-}
-
-/// How an engine anchors its resume position — see [`CdcEngine::anchor_model`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AnchorModel {
-    /// The server object (PG slot) pins the position at creation.
-    ServerSide,
-    /// Client-only anchor: the checkpoint file, persisted at first open.
-    CheckpointAtOpen,
-    /// No checkpoint ⇒ reads floor at the retained minimum (over-read, never skip).
-    FloorAtMin,
 }
 
 /// Setup/permission hints appended to a CDC start-up error — so a missing grant
@@ -421,19 +390,7 @@ impl CdcSchemaResolver {
         table: &str,
         overrides: &crate::types::ColumnOverrides,
     ) -> Result<Vec<crate::types::TypeMapping>> {
-        // The table name is interpolated into `SELECT * FROM {table}` for the
-        // schema probe, so validate it to a plain `[schema.]table` identifier —
-        // no quote, paren, semicolon, or space can break out.
-        if table.is_empty()
-            || !table
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
-        {
-            anyhow::bail!(
-                "rivet cdc table must be a plain [schema.]table identifier (got {table:?}); \
-                 refusing to interpolate it into SQL"
-            );
-        }
+        validate_table_ident(table)?;
         let mut mappings = self
             .src
             .type_mappings(&format!("SELECT * FROM {table}"), overrides)?;
@@ -468,6 +425,14 @@ pub(crate) fn resolve_cdc_columns(
     overrides: &crate::types::ColumnOverrides,
 ) -> Result<Vec<crate::types::TypeMapping>> {
     // Validate BEFORE connecting, so a hostile table name needs no database.
+    validate_table_ident(table)?;
+    CdcSchemaResolver::connect(url, tls)?.resolve(table, overrides)
+}
+
+/// The table name is interpolated into `SELECT * FROM {table}` for the schema
+/// probe — refuse anything but a plain `[schema.]table` identifier (no quote,
+/// paren, semicolon, or space can break out).
+fn validate_table_ident(table: &str) -> Result<()> {
     if table.is_empty()
         || !table
             .chars()
@@ -478,7 +443,7 @@ pub(crate) fn resolve_cdc_columns(
              refusing to interpolate it into SQL"
         );
     }
-    CdcSchemaResolver::connect(url, tls)?.resolve(table, overrides)
+    Ok(())
 }
 
 /// One table's destination wiring for a capture — see [`CdcCapture::outputs`].
