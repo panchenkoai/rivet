@@ -476,15 +476,22 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// Parse a PostgreSQL timestamp rendering (`YYYY-MM-DD HH:MM:SS[.ffffff][+TZ]`).
-/// For `timestamptz` the offset is stripped to the instant's UTC wall-clock.
+/// Parse a PostgreSQL timestamp rendering (`YYYY-MM-DD HH:MM:SS[.ffffff][±TZ]`).
+/// For `timestamptz` the trailing offset is DATA, not decoration: test_decoding
+/// renders the instant in the polling session's zone, so at any non-UTC
+/// session the offset is non-zero ('… 12:00:00+09') — convert to the UTC
+/// instant. (The old code stripped '+…' and treated the wall-clock as UTC —
+/// +9h corruption at a Tokyo session — and failed outright on negative
+/// offsets, silently nulling every value at a western session.)
 fn parse_pg_timestamp(val: &str) -> RivetValue {
-    let naive = val
-        .split('+')
-        .next()
-        .unwrap_or(val)
-        .trim_end()
-        .trim_end_matches('Z');
+    let v = val.trim_end();
+    // tz-aware renderings first: %#z accepts +09 / +09:30 / +0930.
+    for fmt in ["%Y-%m-%d %H:%M:%S%.f%#z", "%Y-%m-%d %H:%M:%S%#z"] {
+        if let Ok(dt) = chrono::DateTime::parse_from_str(v, fmt) {
+            return RivetValue::DateTime(dt.naive_utc());
+        }
+    }
+    let naive = v.trim_end_matches('Z');
     for fmt in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M:%S"] {
         if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(naive, fmt) {
             return RivetValue::DateTime(dt);
@@ -502,6 +509,38 @@ mod tests {
     // The `postgres-cdc` instance (cdc profile, :5434) — wal_level=logical.
     const CONN: &str = "postgresql://rivet:rivet@127.0.0.1:5434/rivet";
     const SLOT: &str = "rivet_cdc_test";
+
+    // RED for finding #24 (non-UTC session): test_decoding renders timestamptz
+    // in the POLLING SESSION's zone — at a Tokyo session '03:00Z' renders as
+    // '2024-06-15 12:00:00+09'. The parser stripped the offset and treated the
+    // wall-clock as UTC (+9h corruption); a NEGATIVE offset ('-05') was not
+    // even stripped, so the parse failed and the value silently became NULL.
+    // Every prior test ran the session at UTC, where the offset is always +00
+    // and the bug is invisible.
+    #[test]
+    fn timestamptz_offset_is_data_not_decoration() {
+        use chrono::NaiveDate;
+        let cases = [
+            ("2024-06-15 12:00:00+09", (2024, 6, 15, 3, 0, 0, 0)),
+            ("2024-06-14 22:00:00-05", (2024, 6, 15, 3, 0, 0, 0)),
+            (
+                "2024-06-15 08:30:00.123456+05:30",
+                (2024, 6, 15, 3, 0, 0, 123_456),
+            ),
+            ("2024-06-15 03:00:00+00", (2024, 6, 15, 3, 0, 0, 0)),
+        ];
+        for (rendered, (y, mo, d, h, mi, s, us)) in cases {
+            let expected = NaiveDate::from_ymd_opt(y, mo, d)
+                .unwrap()
+                .and_hms_micro_opt(h, mi, s, us)
+                .unwrap();
+            assert_eq!(
+                parse_pg_timestamp(rendered),
+                RivetValue::DateTime(expected),
+                "offset must convert to the UTC instant for {rendered:?}"
+            );
+        }
+    }
 
     // RED tests for the all-types matrix audit findings: TIME arrived as text
     // (the "timestamp" prefix check does not match "time without time zone"),

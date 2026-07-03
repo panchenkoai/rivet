@@ -573,6 +573,267 @@ fn cdc_full_type_matrix_matches_batch() {
     assert_cdc_matches_batch(&cdc_out, &batch_out);
 }
 
+// CSV parity: the second (and last) CDC output format. The writer is shared
+// with batch, so given ArrayData parity this SHOULD follow — but "should
+// follow" is a construction argument, and the CSV renderer has its own
+// per-type formatting (decimal text, datetime text, NULL). Compare the
+// rendered text cell-for-cell. Values are comma/quote-free by construction so
+// a positional split is exact (the CDC line prefixes __op and a JSON __pos
+// that DO contain commas — compare from the right).
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_csv_rendering_matches_batch_csv() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_csv_my");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {tbl} (id INT PRIMARY KEY, amount DECIMAL(18,4), dt DATETIME(6), \
+         d DATE, t TIME(6), note VARCHAR(40))"
+    ))
+    .unwrap();
+    let _guard = Table(tbl.clone());
+
+    let out = d.path().join("out");
+    let batch_out = d.path().join("batch");
+    let ckpt = d.path().join("cdc.ckpt");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::create_dir_all(&batch_out).unwrap();
+    let cdc_yaml = format!(
+        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
+exports:
+  - name: {tbl}
+    table: {tbl}
+    mode: cdc
+    format: csv
+    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        ckpt = ckpt.display(),
+        out = out.display(),
+        sid = server_id_for(&tbl),
+    );
+    let cfg = write_config(&d, &cdc_yaml);
+    run_cdc(&cfg); // pin
+    c.query_drop(format!(
+        "INSERT INTO {tbl} VALUES \
+         (1, 999999999999.9999, '2035-08-07 09:08:07.987654', '2024-03-15', \
+          '23:59:59.999999', 'plain text'), \
+         (2, NULL, NULL, NULL, NULL, NULL)"
+    ))
+    .unwrap();
+    run_cdc(&cfg);
+    let batch_yaml = format!(
+        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
+exports:
+  - name: {tbl}_batch
+    query: "SELECT * FROM {tbl}"
+    mode: full
+    format: csv
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        out = batch_out.display(),
+    );
+    run_cdc(&write_config(&d, &batch_yaml));
+
+    let read_csv = |dir: &std::path::Path| -> Vec<String> {
+        let p = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| p.extension().is_some_and(|x| x == "csv"))
+            .expect("a .csv part");
+        std::fs::read_to_string(p)
+            .unwrap()
+            .lines()
+            .map(|l| l.to_string())
+            .collect()
+    };
+    let cdc_lines = read_csv(&out);
+    let batch_lines = read_csv(&batch_out);
+    assert_eq!(
+        cdc_lines.len(),
+        batch_lines.len(),
+        "same row count + header"
+    );
+    const DATA_COLS: usize = 6;
+    for (cl, bl) in cdc_lines.iter().zip(batch_lines.iter()) {
+        // Data columns are the LAST 6 fields of the CDC line (after __op and
+        // the comma-bearing quoted __pos) and the whole batch line.
+        let cdc_tail: Vec<&str> = cl.rsplitn(DATA_COLS + 1, ',').collect();
+        let cdc_data: Vec<&str> = cdc_tail[..DATA_COLS].iter().rev().cloned().collect();
+        let batch_data: Vec<&str> = bl.split(',').collect();
+        assert_eq!(
+            cdc_data, batch_data,
+            "CSV rendering differs between CDC and batch"
+        );
+    }
+}
+
+// Non-UTC source server, MySQL: the client's server runs in a local zone
+// (`SET GLOBAL time_zone`), sessions inherit it. TIMESTAMP is stored as a UTC
+// instant and rendered per session zone; rivet's batch session pins UTC and
+// the binlog carries the raw epoch — so BOTH paths must yield the same UTC
+// instant, and DATETIME (naive wall-clock) must stay the literal wall-clock.
+// Pinned because every existing test runs the server at UTC where a
+// zone-handling bug is invisible.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_non_utc_server_timezone_matches_batch_and_utc_instant() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_tz_my");
+    // SET GLOBAL needs SYSTEM_VARIABLES_ADMIN — use the container's root.
+    let root_url = MYSQL_CDC_URL.replace("rivet:rivet@", "root:rivet@");
+    let mut admin = mysql::Conn::new(mysql::Opts::from_url(&root_url).unwrap()).unwrap();
+    use mysql::prelude::Queryable as _;
+    let old_tz: String = admin
+        .query_first("SELECT @@global.time_zone")
+        .unwrap()
+        .unwrap();
+    admin
+        .query_drop("SET GLOBAL time_zone = '+09:00'")
+        .expect("set global tz");
+    struct TzGuard(String, String);
+    impl Drop for TzGuard {
+        fn drop(&mut self) {
+            if let Ok(mut c) = mysql::Conn::new(mysql::Opts::from_url(&self.1).unwrap()) {
+                use mysql::prelude::Queryable as _;
+                let _ = c.query_drop(format!("SET GLOBAL time_zone = '{}'", self.0));
+            }
+        }
+    }
+    let _tz = TzGuard(old_tz, root_url);
+
+    // A FRESH session (inherits the +09:00 global) creates and fills the table.
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {tbl} (id INT PRIMARY KEY, ts TIMESTAMP(6), dt DATETIME(6))"
+    ))
+    .unwrap();
+    let _guard = Table(tbl.clone());
+
+    let out = d.path().join("out");
+    let batch_out = d.path().join("batch");
+    let ckpt = d.path().join("cdc.ckpt");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::create_dir_all(&batch_out).unwrap();
+    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out)); // pin
+    // Wall-clock noon in +09:00 == 03:00:00Z.
+    c.query_drop(format!(
+        "INSERT INTO {tbl} VALUES (1, '2024-06-15 12:00:00', '2024-06-15 12:00:00')"
+    ))
+    .unwrap();
+    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out));
+    run_cdc(&full_config(&d, &tbl, &batch_out));
+    assert_cdc_matches_batch(&out, &batch_out);
+
+    use arrow::array::TimestampMicrosecondArray;
+    let b = read_one_batch(&out);
+    let val = |col: &str| -> i64 {
+        b.column(b.schema().index_of(col).unwrap())
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap()
+            .value(0)
+    };
+    // TIMESTAMP: the UTC instant (12:00+09 → 03:00Z), NOT the wall-clock.
+    assert_eq!(
+        val("ts"),
+        1_718_420_400_000_000,
+        "TIMESTAMP must be the UTC instant 2024-06-15T03:00:00Z"
+    );
+    // DATETIME: the naive wall-clock, zone-independent.
+    assert_eq!(
+        val("dt"),
+        1_718_452_800_000_000,
+        "DATETIME must stay the literal wall-clock 12:00:00"
+    );
+}
+
+// Non-UTC source server, PostgreSQL: test_decoding renders TIMESTAMPTZ in the
+// POLLING SESSION's zone — a non-UTC database default changes the rendered
+// offset ('… 12:00:00+09'), and the parser must still recover the same UTC
+// instant the batch path reads over the binary protocol.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_non_utc_database_timezone_matches_batch() {
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_tz_pg");
+    let slot = unique_name("rivet_tz_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute("ALTER DATABASE rivet SET timezone TO 'Asia/Tokyo'")
+        .expect("set db tz");
+    struct DbTzGuard;
+    impl Drop for DbTzGuard {
+        fn drop(&mut self) {
+            if let Ok(mut c) = postgres::Client::connect(POSTGRES_CDC_URL, NoTls) {
+                let _ = c.batch_execute("ALTER DATABASE rivet RESET timezone");
+            }
+        }
+    }
+    let _tz = DbTzGuard;
+
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (
+           id INT PRIMARY KEY, tstz TIMESTAMPTZ, ts TIMESTAMP)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+    c.batch_execute(&format!(
+        "INSERT INTO {tbl} VALUES (1, '2024-06-15T03:00:00Z', '2024-06-15 12:00:00')"
+    ))
+    .unwrap();
+
+    let out = d.path().join("out");
+    let batch_out = d.path().join("batch");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::create_dir_all(&batch_out).unwrap();
+    run_cdc(&pg_cdc_config(&d, &tbl, &slot, &out));
+    let batch_yaml = format!(
+        r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
+exports:
+  - name: {tbl}_batch
+    table: {tbl}
+    mode: full
+    format: parquet
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        out = batch_out.display(),
+    );
+    run_cdc(&write_config(&d, &batch_yaml));
+    assert_cdc_matches_batch(&out, &batch_out);
+
+    use arrow::array::TimestampMicrosecondArray;
+    let b = read_one_batch(&out);
+    let tstz = b
+        .column(b.schema().index_of("tstz").unwrap())
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .unwrap();
+    assert_eq!(
+        tstz.value(0),
+        1_718_420_400_000_000,
+        "TIMESTAMPTZ must be the UTC instant regardless of the rendered zone"
+    );
+    let ts = b
+        .column(b.schema().index_of("ts").unwrap())
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .unwrap();
+    assert_eq!(
+        ts.value(0),
+        1_718_452_800_000_000,
+        "naive TIMESTAMP must stay the literal wall-clock"
+    );
+}
+
 // UPDATE and DELETE through the typed surface — the matrix tests pin INSERT
 // after-images only; this pins that an UPDATE's after-image carries every
 // column type identically to a batch export of the post-update state, and a

@@ -238,3 +238,22 @@ lock without compiling. More generally: when a check's subject is mutated by the
 act of checking it (cargo reconciling the lock, a formatter rewriting the file),
 the runtime read is a no-op; assert against the committed state or the
 strict-mode tool, never the post-reconcile working tree.
+
+## Session-state-dependent renderings need a non-default-state test
+
+Any text rendering that embeds SESSION state is only exercised on the
+non-default state. The concrete bite (finding #24): `test_decoding`
+renders `timestamptz` in the polling session's zone; every test stack
+runs UTC, so the rendered offset was always `+00` — the parser that
+*stripped* the offset (treating Tokyo wall-clock as UTC, +9h corruption)
+and could not even parse negative offsets (silent NULL for every
+western-zone value) passed the full type matrix for weeks. The `+05` in
+the INSERT literal proved nothing: rendering happens at read time, in
+the reader's zone.
+
+Process rule: when a value crosses a TEXT rendering, enumerate the
+session/server state that shapes the text (timezone, locale/lc_*,
+datestyle, bytea_output, sql_mode) and add one live test that flips the
+state to a non-default (a `+09:00` global, an `Asia/Tokyo` database
+default) with a guard that resets it. Parity at default state is not
+evidence — the default is exactly where the bug hides.

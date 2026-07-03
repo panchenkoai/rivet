@@ -12,6 +12,15 @@
   encoding shared by both sides; a new accessor per engine, enforced at compile time). An offline matrix
   guard pins the CDC fold to the builder across every covered type with hostile cells (overflow
   narrowing, wrong-width binary, arrays with inner NULLs, NaN, u64::MAX, 50-digit decimals).
+- **PostgreSQL CDC: `timestamptz` no longer corrupts at a non-UTC session/database timezone.**
+  `test_decoding` renders the instant in the POLLING SESSION's zone; the parser stripped the trailing
+  offset and treated the wall-clock as UTC — a +9h value shift at an `Asia/Tokyo` default, and at any
+  western (negative-offset) zone the parse failed outright, silently nulling every `timestamptz`. The
+  offset is parsed as data now (`+09`, `-05`, `+05:30`) and converted to the UTC instant. Invisible in
+  every prior test because a UTC server always renders `+00`. Live pins on both engines: a `+09:00`
+  MySQL global (TIMESTAMP → UTC instant, DATETIME → wall-clock) and an `Asia/Tokyo` PostgreSQL database
+  default (`*_non_utc_*_matches_batch*`); CSV output parity is pinned separately
+  (`cdc_csv_rendering_matches_batch_csv`).
 - **CDC fails loudly on `'NaN'::numeric` — exactly like batch.** A non-null decimal cell that cannot be
   represented in a Parquet decimal (PG NaN/±Infinity NUMERIC) previously became a silent NULL on the CDC
   path while the batch export failed loudly; both now fail identically, naming the payload. Hostile-value
