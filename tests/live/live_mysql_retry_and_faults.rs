@@ -40,21 +40,15 @@ fn mysql_clean_via_toxi_works_as_a_baseline_and_exports_successfully() {
     let export_name = unique_name("qa41my_baseline");
     let out = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: mysql
-  url: "{MYSQL_TOXI_URL}"
-exports:
-  - name: {export_name}
-    query: "SELECT id FROM {table_name}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::mysql_batch(&export_name)
+        .source_url(MYSQL_TOXI_URL)
+        .query(&format!(
+            r#"SELECT id FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("full")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let cfg_path = write_config(&cfg_dir, &yaml);
     let out_run = run_rivet_export(&cfg_path, &export_name);
     assert!(
@@ -78,23 +72,17 @@ fn mysql_export_survives_transient_latency_added_via_toxiproxy() {
     let export_name = unique_name("qa41my_latency");
     let out = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: mysql
-  url: "{MYSQL_TOXI_URL}"
-exports:
-  - name: {export_name}
-    query: "SELECT id FROM {table_name}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    tuning:
-      max_retries: 2
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::mysql_batch(&export_name)
+        .source_url(MYSQL_TOXI_URL)
+        .query(&format!(
+            r#"SELECT id FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("full")
+        .export_line("tuning:")
+        .export_line("  max_retries: 2")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let cfg_path = write_config(&cfg_dir, &yaml);
     let out_run = run_rivet_export(&cfg_path, &export_name);
 
@@ -121,22 +109,14 @@ fn mysql_export_fails_cleanly_when_toxiproxy_is_disabled_before_run() {
     let export_name = unique_name("qa42my_disabled");
     let out = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: mysql
-  url: "{MYSQL_TOXI_URL}"
-exports:
-  - name: {export_name}
-    query: "SELECT 1 AS n"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    tuning:
-      max_retries: 0
-"#,
-        dir = out.path().display()
-    );
+    let yaml = Rig::mysql_batch(&export_name)
+        .source_url(MYSQL_TOXI_URL)
+        .query("SELECT 1 AS n")
+        .mode("full")
+        .export_line("tuning:")
+        .export_line("  max_retries: 0")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let cfg_path = write_config(&cfg_dir, &yaml);
     let out_run = run_rivet_export(&cfg_path, &export_name);
 
@@ -171,24 +151,18 @@ fn mysql_export_recovers_after_mid_stream_proxy_disable_then_enable_with_retries
     let export_name = unique_name("qa42my_midstream");
     let out = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: mysql
-  url: "{MYSQL_TOXI_URL}"
-exports:
-  - name: {export_name}
-    query: "SELECT id FROM {table_name}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    tuning:
-      max_retries: 3
-      retry_backoff_ms: 200
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::mysql_batch(&export_name)
+        .source_url(MYSQL_TOXI_URL)
+        .query(&format!(
+            r#"SELECT id FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("full")
+        .export_line("tuning:")
+        .export_line("  max_retries: 3")
+        .export_line("  retry_backoff_ms: 200")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let cfg_path = write_config(&cfg_dir, &yaml);
 
     let bg = std::thread::spawn(|| {
@@ -218,23 +192,15 @@ fn mysql_permanent_sql_error_fails_fast_without_exhausting_retries() {
     let export_name = unique_name("qa43my_permerr");
     let out = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: mysql
-  url: "{MYSQL_URL}"
-exports:
-  - name: {export_name}
-    query: "SELCT 1"  # intentional typo → SQL syntax error
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    tuning:
-      max_retries: 5
-      retry_backoff_ms: 5000
-"#,
-        dir = out.path().display()
-    );
+    let yaml = Rig::mysql_batch(&export_name)
+        // intentional typo → a permanent SQL syntax error
+        .query("SELCT 1")
+        .mode("full")
+        .export_line("tuning:")
+        .export_line("  max_retries: 5")
+        .export_line("  retry_backoff_ms: 5000")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let cfg_path = write_config(&cfg_dir, &yaml);
 
     let t0 = std::time::Instant::now();

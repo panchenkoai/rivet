@@ -68,21 +68,16 @@ fn gremlin_row_count_min_fires_on_empty_source_table() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("gr_empty");
 
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id FROM {table_name}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    quality:
-      row_count_min: 1
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!(
+            r#"SELECT id FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("full")
+        .export_line("quality:")
+        .export_line("  row_count_min: 1")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let (_cfgdir, cfgpath) = make_cfg(&yaml);
 
     let result = run_rivet_export(&cfgpath, &export_name);
@@ -190,22 +185,17 @@ fn gremlin_unique_max_entries_cap_emits_warn_and_export_succeeds() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("gr_ucap");
 
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id FROM {table_name}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    quality:
-      unique_columns: [id]
-      unique_max_entries: 10
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!(
+            r#"SELECT id FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("full")
+        .export_line("quality:")
+        .export_line("  unique_columns: [id]")
+        .export_line("  unique_max_entries: 10")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let (_cfgdir, cfgpath) = make_cfg(&yaml);
 
     // RUST_LOG=warn surfaces the quality Warn message in stderr.
@@ -249,24 +239,19 @@ fn gremlin_auto_shrink_total_rows_correct_under_quality_gate() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("gr_shrink");
 
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, payload FROM {table_name}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    tuning:
-      max_batch_memory_mb: 1
-      on_batch_memory_exceeded: auto_shrink
-    quality:
-      row_count_min: 2000
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!(
+            r#"SELECT id, payload FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("full")
+        .export_line("tuning:")
+        .export_line("  max_batch_memory_mb: 1")
+        .export_line("  on_batch_memory_exceeded: auto_shrink")
+        .export_line("quality:")
+        .export_line("  row_count_min: 2000")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let (_cfgdir, cfgpath) = make_cfg(&yaml);
 
     let result = run_rivet_export(&cfgpath, &export_name);
@@ -306,22 +291,17 @@ fn gremlin_crash_before_quality_check_recovery_re_evaluates_gate() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("gr_qcrash");
 
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, created_at FROM {table_name}"
-    mode: incremental
-    cursor_column: created_at
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    quality:
-      row_count_min: 5
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!(
+            r#"SELECT id, created_at FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("incremental")
+        .export_line("cursor_column: created_at")
+        .export_line("quality:")
+        .export_line("  row_count_min: 5")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let (_cfgdir, cfgpath) = make_cfg(&yaml);
 
     // Injected crash: source was read but writer was not finalised and quality
@@ -387,21 +367,16 @@ fn gremlin_row_count_max_fires_on_over_limit_source() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("gr_rmax");
 
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id FROM {table_name}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    quality:
-      row_count_max: 10
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!(
+            r#"SELECT id FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("full")
+        .export_line("quality:")
+        .export_line("  row_count_max: 10")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let (_cfgdir, cfgpath) = make_cfg(&yaml);
 
     let result = run_rivet_export(&cfgpath, &export_name);
@@ -499,21 +474,13 @@ fn gremlin_unique_columns_nullable_column_does_not_false_positive() {
     // Inject NULL values into a nullable column by issuing a follow-up UPDATE.
     // Use the `name` column which is NOT NULL by default — we union with a
     // SELECT-NULL projection in the export query to inject the NULLs.
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, name FROM {table_name} UNION ALL SELECT 100 AS id, NULL::text AS name UNION ALL SELECT 101 AS id, NULL::text AS name"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    quality:
-      unique_columns: [id]
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!(r#"SELECT id, name FROM {table_name} UNION ALL SELECT 100 AS id, NULL::text AS name UNION ALL SELECT 101 AS id, NULL::text AS name"#, table_name = table.name()))
+        .mode("full")
+        .export_line("quality:")
+        .export_line("  unique_columns: [id]")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let (_cfgdir, cfgpath) = make_cfg(&yaml);
 
     let result = run_rivet_export(&cfgpath, &export_name);
@@ -550,23 +517,15 @@ fn gremlin_chunked_empty_middle_chunk_does_not_false_fire_row_count_min() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("gr_chunk_empty");
 
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    table: {table_name}
-    mode: chunked
-    chunk_column: id
-    chunk_size: 10
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    quality:
-      row_count_min: 6
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export_name)
+        .tables(&[table.name()])
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 10")
+        .export_line("quality:")
+        .export_line("  row_count_min: 6")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let (_cfgdir, cfgpath) = make_cfg(&yaml);
 
     let result = run_rivet_export(&cfgpath, &export_name);
