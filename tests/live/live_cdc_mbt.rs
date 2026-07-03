@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use arrow::array::{Array, Int64Array, StringArray};
 use mysql::prelude::Queryable;
 
-use crate::common::CdcTable as Table;
+use crate::common::MysqlCdcTable as Table;
 use crate::common::read_all_parts;
 use crate::common::*;
 

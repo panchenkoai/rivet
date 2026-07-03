@@ -30,6 +30,16 @@ pub fn run_rivet(args: &[&str]) -> Output {
         .expect("spawn rivet binary")
 }
 
+/// `run_rivet` with extra environment variables (fault hooks, log levels).
+pub fn run_rivet_env(args: &[&str], envs: &[(&str, &str)]) -> Output {
+    let mut cmd = Command::new(RIVET_BIN);
+    cmd.args(args);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("spawn rivet binary")
+}
+
 /// Like `run_rivet` but sets `RUST_LOG=warn` so that `log::warn!` output is
 /// visible in stderr.  Use this when a test needs to assert on warning messages
 /// emitted via the log crate (plan validation warnings, quality warnings, etc.).

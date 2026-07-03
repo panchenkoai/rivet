@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use arrow::array::{Array, Decimal128Array, Int64Array};
 use mysql::prelude::Queryable;
 
-use crate::common::CdcTable as Table;
+use crate::common::MysqlCdcTable as Table;
 use crate::common::*;
 
 fn conn() -> mysql::PooledConn {

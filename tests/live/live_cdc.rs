@@ -8,7 +8,7 @@
 //!     docker compose --profile cdc up -d postgres-cdc mysql-cdc
 //!     cargo test --test live_suite -- --ignored
 
-use crate::common::CdcTable as Table;
+use crate::common::MysqlCdcTable as Table;
 use crate::common::*;
 use mysql::prelude::Queryable;
 

@@ -27,27 +27,6 @@ fn enable_cdc(table: &str, ci: &str) {
     ));
 }
 
-/// Drops the capture instance + the table on teardown (a CDC-tracked table can't
-/// just be dropped — its change table would be orphaned). Panic-safe in `Drop`.
-struct CdcTable {
-    table: String,
-    ci: String,
-}
-impl Drop for CdcTable {
-    fn drop(&mut self) {
-        let (table, ci) = (self.table.clone(), self.ci.clone());
-        let _ = std::panic::catch_unwind(move || {
-            mssql_cdc_exec(&format!(
-                "IF EXISTS(SELECT 1 FROM cdc.change_tables ct JOIN sys.tables t \
-                   ON ct.source_object_id=t.object_id WHERE t.name='{table}') \
-                 EXEC sys.sp_cdc_disable_table @source_schema=N'dbo', @source_name=N'{table}', \
-                 @capture_instance=N'{ci}';"
-            ));
-            mssql_cdc_drop_table(&format!("dbo.{table}"));
-        });
-    }
-}
-
 /// Block until the capture job has copied at least `want` rows into the change
 /// table — the job runs asynchronously, so the test must wait for it.
 fn wait_for_capture(ci: &str, want: i64) {
@@ -86,7 +65,7 @@ fn mssql_cdc_resume_captures_only_new_changes() {
         "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT)"
     ));
     enable_cdc(&table, &ci);
-    let _guard = CdcTable {
+    let _guard = MssqlCdcTable {
         table: table.clone(),
         ci: ci.clone(),
     };
@@ -131,7 +110,7 @@ fn mssql_cdc_idle_first_run_then_change_is_captured_not_skipped() {
         "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT)"
     ));
     enable_cdc(&table, &ci);
-    let _guard = CdcTable {
+    let _guard = MssqlCdcTable {
         table: table.clone(),
         ci: ci.clone(),
     };
@@ -175,11 +154,11 @@ fn mssql_cdc_mixed_transaction_and_qualified_table_conformance() {
     }
     enable_cdc(&orders, &ci_o);
     enable_cdc(&audit, &ci_a);
-    let _g1 = CdcTable {
+    let _g1 = MssqlCdcTable {
         table: orders.clone(),
         ci: ci_o.clone(),
     };
-    let _g2 = CdcTable {
+    let _g2 = MssqlCdcTable {
         table: audit.clone(),
         ci: ci_a.clone(),
     };
@@ -232,7 +211,7 @@ fn gremlin_mssql_capture_job_stall_loses_nothing() {
         "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT)"
     ));
     enable_cdc(&table, &ci);
-    let _guard = CdcTable {
+    let _guard = MssqlCdcTable {
         table: table.clone(),
         ci: ci.clone(),
     };
@@ -339,7 +318,7 @@ fn mssql_cdc_update_and_delete_carry_full_types() {
          dt2 DATETIME2, u UNIQUEIDENTIFIER, vb VARBINARY(8), m MONEY, note NVARCHAR(50))"
     ));
     enable_cdc(&table, &ci);
-    let _guard = CdcTable {
+    let _guard = MssqlCdcTable {
         table: table.clone(),
         ci: ci.clone(),
     };
@@ -411,7 +390,7 @@ fn mssql_cdc_initial_snapshot_covers_preexisting_rows_then_streams() {
         "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT)"
     ));
     enable_cdc(&table, &ci);
-    let _guard = CdcTable {
+    let _guard = MssqlCdcTable {
         table: table.clone(),
         ci: ci.clone(),
     };
@@ -456,7 +435,7 @@ fn mssql_money_values_survive_batch_and_cdc() {
         "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, m MONEY, sm SMALLMONEY)"
     ));
     enable_cdc(&table, &ci);
-    let _guard = CdcTable {
+    let _guard = MssqlCdcTable {
         table: table.clone(),
         ci: ci.clone(),
     };
@@ -528,7 +507,7 @@ fn mssql_cdc_capture_instance_name_must_not_decide_the_table() {
         "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT)"
     ));
     enable_cdc(&table, &ci);
-    let _guard = CdcTable {
+    let _guard = MssqlCdcTable {
         table: table.clone(),
         ci: ci.clone(),
     };
@@ -563,7 +542,7 @@ fn mssql_cdc_crash_before_checkpoint_re_reads_on_resume() {
         "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT)"
     ));
     enable_cdc(&table, &ci);
-    let _guard = CdcTable {
+    let _guard = MssqlCdcTable {
         table: table.clone(),
         ci: ci.clone(),
     };
@@ -625,7 +604,7 @@ fn mssql_cdc_datetimeoffset_value_is_preserved() {
         "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, dto DATETIMEOFFSET)"
     ));
     enable_cdc(&table, &ci);
-    let _guard = CdcTable {
+    let _guard = MssqlCdcTable {
         table: table.clone(),
         ci: ci.clone(),
     };
@@ -703,7 +682,7 @@ fn mssql_cdc_uniqueidentifier_value_is_preserved() {
         "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, u UNIQUEIDENTIFIER)"
     ));
     enable_cdc(&table, &ci);
-    let _guard = CdcTable {
+    let _guard = MssqlCdcTable {
         table: table.clone(),
         ci: ci.clone(),
     };
@@ -756,7 +735,7 @@ fn mssql_cdc_full_type_matrix_matches_batch() {
          fb BINARY(8), num NUMERIC(10,3), m MONEY, sm SMALLMONEY)"
     ));
     enable_cdc(&table, &ci);
-    let _guard = CdcTable {
+    let _guard = MssqlCdcTable {
         table: table.clone(),
         ci: ci.clone(),
     };
@@ -812,7 +791,7 @@ fn mssql_cdc_resume_past_retention_errors_not_a_silent_gap() {
         "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT)"
     ));
     enable_cdc(&table, &ci);
-    let _guard = CdcTable {
+    let _guard = MssqlCdcTable {
         table: table.clone(),
         ci: ci.clone(),
     };

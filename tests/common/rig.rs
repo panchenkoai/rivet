@@ -147,11 +147,8 @@ impl Rig {
     /// Run with an extra environment variable (fault injection); returns the
     /// raw output — the caller asserts success or failure.
     pub fn run_with_env(&self, key: &str, val: &str) -> std::process::Output {
-        std::process::Command::new(RIVET_BIN)
-            .args(["run", "--config", self.config_path().to_str().unwrap()])
-            .env(key, val)
-            .output()
-            .expect("spawn rivet")
+        let cfg = self.config_path();
+        super::runner::run_rivet_env(&["run", "--config", cfg.to_str().unwrap()], &[(key, val)])
     }
 
     pub fn checkpoint(&self) -> PathBuf {
@@ -182,14 +179,16 @@ impl Rig {
     /// Materialized config path — for bespoke invocations (`validate`,
     /// custom envs) the rig doesn't wrap.
     pub fn config_path(&self) -> PathBuf {
+        // Materialization point: the ONLY place the rig touches the
+        // filesystem (yaml()/render() stay pure — the offline goldens were
+        // mkdir-ing /tmp/o as a side effect of rendering a string).
+        std::fs::create_dir_all(self.out_dir()).unwrap();
         let cfg = self.dir.path().join("rig.yaml");
         std::fs::write(&cfg, self.render()).unwrap();
         cfg
     }
 
     fn render(&self) -> String {
-        let out = self.out_dir();
-        std::fs::create_dir_all(&out).unwrap();
         let tables = match &self.query {
             Some(q) => format!("query: \"{q}\""),
             None if self.tables.len() == 1 => format!("table: {}", self.tables[0]),
@@ -247,19 +246,20 @@ impl Rig {
 
     /// Run rivet; panic unless it succeeds.
     pub fn run_ok(&self) {
-        let st = std::process::Command::new(RIVET_BIN)
-            .args(["run", "--config", self.config_path().to_str().unwrap()])
-            .status()
-            .expect("spawn rivet");
-        assert!(st.success(), "rig run failed for '{}'", self.name);
+        let cfg = self.config_path();
+        let out = super::runner::run_rivet(&["run", "--config", cfg.to_str().unwrap()]);
+        assert!(
+            out.status.success(),
+            "rig run failed for '{}':\n{}",
+            self.name,
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// Run rivet expecting a loud failure; returns combined output.
     pub fn run_expect_fail(&self) -> String {
-        let out = std::process::Command::new(RIVET_BIN)
-            .args(["run", "--config", self.config_path().to_str().unwrap()])
-            .output()
-            .expect("spawn rivet");
+        let cfg = self.config_path();
+        let out = super::runner::run_rivet(&["run", "--config", cfg.to_str().unwrap()]);
         assert!(
             !out.status.success(),
             "rig run for '{}' was expected to fail",
@@ -307,10 +307,7 @@ pub fn read_all_parts(dir: &Path) -> Vec<arrow::record_batch::RecordBatch> {
 /// Run rivet against an explicit config path; panic with stderr on failure.
 /// (One home for the run_cdc/run_ok copies four suites grew.)
 pub fn run_rivet_ok(cfg: &Path) {
-    let out = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", cfg.to_str().unwrap()])
-        .output()
-        .expect("spawn rivet");
+    let out = super::runner::run_rivet(&["run", "--config", cfg.to_str().unwrap()]);
     assert!(
         out.status.success(),
         "rivet run failed:\n{}",
@@ -401,7 +398,7 @@ impl CdcScenario {
             .unwrap();
         conn.query_drop(format!("CREATE TABLE {table} ({cols})"))
             .unwrap();
-        let guard = super::mysql::CdcTable(table.clone());
+        let guard = super::mysql::MysqlCdcTable(table.clone());
         let rig = Rig::mysql_cdc(&table);
         rig.run_ok(); // pin: the checkpoint anchors BEFORE any churn
         Self {
