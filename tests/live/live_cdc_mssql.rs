@@ -67,19 +67,10 @@ fn mssql_cdc_config(
     ckpt: &std::path::Path,
     out: &std::path::Path,
 ) -> std::path::PathBuf {
-    let yaml = format!(
-        r#"source: {{type: mssql, url: "{MSSQL_CDC_URL}"}}
-exports:
-  - name: {table}
-    table: {table}
-    mode: cdc
-    format: parquet
-    cdc: {{ capture_instance: {ci}, checkpoint: "{ckpt}" }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        ckpt = ckpt.display(),
-        out = out.display(),
-    );
+    let yaml = Rig::mssql_cdc(table, ci)
+        .checkpoint_path(ckpt.to_path_buf())
+        .dest_path(out.to_path_buf())
+        .yaml();
     write_config(d, &yaml)
 }
 
@@ -445,23 +436,11 @@ fn mssql_cdc_initial_snapshot_covers_preexisting_rows_then_streams() {
     mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (1,10),(2,20)"));
     wait_for_capture(&ci, 2);
 
-    let out = d.path().join("out");
-    let ckpt = d.path().join("cdc.ckpt");
-    std::fs::create_dir_all(&out).unwrap();
-    let yaml = format!(
-        r#"source: {{type: mssql, url: "{MSSQL_CDC_URL}"}}
-exports:
-  - name: {table}
-    table: {table}
-    mode: cdc
-    format: parquet
-    cdc: {{ initial: snapshot, capture_instance: {ci}, checkpoint: "{ckpt}", until_current: true }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        ckpt = ckpt.display(),
-        out = out.display(),
-    );
-    let cfg = write_config(&d, &yaml);
+    let rig = Rig::mssql_cdc(&table, &ci)
+        .cdc("initial: snapshot")
+        .cdc("until_current: true");
+    let out = rig.out_dir();
+    let cfg = write_config(&d, &rig.yaml());
 
     run_cdc(&cfg);
     assert_eq!(manifest_rows(&out.join("snapshot")), 2);
@@ -765,17 +744,11 @@ fn mssql_full_config(
     table: &str,
     out: &std::path::Path,
 ) -> std::path::PathBuf {
-    let yaml = format!(
-        r#"source: {{type: mssql, url: "{MSSQL_CDC_URL}", tls: {{accept_invalid_certs: true}}}}
-exports:
-  - name: {table}_batch
-    query: "SELECT * FROM dbo.{table}"
-    mode: full
-    format: parquet
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        out = out.display(),
-    );
+    let yaml = Rig::mssql_batch(&format!("{table}_batch"))
+        .source_url(MSSQL_CDC_URL)
+        .query(&format!("SELECT * FROM dbo.{table}"))
+        .dest_path(out.to_path_buf())
+        .yaml();
     write_config(d, &yaml)
 }
 

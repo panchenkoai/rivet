@@ -33,24 +33,18 @@ fn unique_column_on_clean_data_passes() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("ql_uniq_ok");
 
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, name, amount FROM {table_name}"
-    mode: full
-    format: parquet
-    columns:
-      amount: "decimal(12,2)"
-    destination: {{type: local, path: {dir}}}
-    quality:
-      unique_columns: [id]
-      unique_max_entries: 1000
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!(
+            r#"SELECT id, name, amount FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("full")
+        .export_line(r#"columns: { amount: "decimal(12,2)" }"#)
+        .export_line("quality:")
+        .export_line("  unique_columns: [id]")
+        .export_line("  unique_max_entries: 1000")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let (_cfgdir, cfgpath) = cfg(&yaml);
 
     let result = run_rivet_export(&cfgpath, &export_name);
@@ -72,24 +66,16 @@ fn unique_column_on_duplicate_data_fails_export() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("ql_uniq_dup");
 
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: >
-      SELECT id FROM {table_name}
-      UNION ALL
-      SELECT id FROM {table_name}
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    quality:
-      unique_columns: [id]
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!(
+            "SELECT id FROM {t} UNION ALL SELECT id FROM {t}",
+            t = table.name()
+        ))
+        .mode("full")
+        .export_line("quality:")
+        .export_line("  unique_columns: [id]")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let (_cfgdir, cfgpath) = cfg(&yaml);
 
     let result = run_rivet_export(&cfgpath, &export_name);
@@ -115,21 +101,16 @@ fn unique_columns_without_cap_emits_plan_warning() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("ql_uniq_no_cap");
 
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id FROM {table_name}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    quality:
-      unique_columns: [id]
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!(
+            r#"SELECT id FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("full")
+        .export_line("quality:")
+        .export_line("  unique_columns: [id]")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let (_cfgdir, cfgpath) = cfg(&yaml);
 
     let result = run_rivet_with_warn_log(&[
@@ -162,21 +143,16 @@ fn row_count_min_gate_fails_when_below_threshold() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("ql_rowmin");
 
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id FROM {table_name}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    quality:
-      row_count_min: 100
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!(
+            r#"SELECT id FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("full")
+        .export_line("quality:")
+        .export_line("  row_count_min: 100")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let (_cfgdir, cfgpath) = cfg(&yaml);
 
     let result = run_rivet_export(&cfgpath, &export_name);
@@ -199,21 +175,16 @@ fn row_count_max_gate_fails_when_above_threshold() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("ql_rowmax");
 
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id FROM {table_name}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    quality:
-      row_count_max: 10
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!(
+            r#"SELECT id FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("full")
+        .export_line("quality:")
+        .export_line("  row_count_max: 10")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let (_cfgdir, cfgpath) = cfg(&yaml);
 
     let result = run_rivet_export(&cfgpath, &export_name);
@@ -258,21 +229,14 @@ fn null_ratio_max_gate_fails_when_exceeded() {
 
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("ql_null_exp");
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, val FROM {table_name}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    quality:
-      null_ratio_max:
-        val: 0.1
-"#,
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!(r#"SELECT id, val FROM {table_name}"#))
+        .mode("full")
+        .export_line("quality:")
+        .export_line("  null_ratio_max:")
+        .export_line("    val: 0.1")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let (_cfgdir, cfgpath) = cfg(&yaml);
 
     let result = run_rivet_export(&cfgpath, &export_name);

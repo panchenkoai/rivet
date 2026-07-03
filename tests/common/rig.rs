@@ -57,6 +57,15 @@ impl Rig {
         r
     }
 
+    pub fn mssql_cdc(table: &str, capture_instance: &str) -> Self {
+        let mut r = Self::new("mssql", super::env::MSSQL_CDC_URL, table);
+        r.mode = "cdc";
+        r.cdc_lines
+            .push(format!("capture_instance: {capture_instance}"));
+        r.cdc_lines.push("__CKPT__".into()); // resolved at render time
+        r
+    }
+
     pub fn pg_cdc(table: &str, slot: &str) -> Self {
         let mut r = Self::new("postgres", super::env::POSTGRES_CDC_URL, table);
         r.mode = "cdc";

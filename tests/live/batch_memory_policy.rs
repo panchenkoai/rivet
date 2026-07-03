@@ -36,24 +36,18 @@ fn batch_below_cap_succeeds_silently() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("bmp_below_cap");
 
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, name, amount FROM {table_name}"
-    mode: full
-    format: parquet
-    columns:
-      amount: "decimal(12,2)"
-    destination: {{type: local, path: {dir}}}
-    tuning:
-      max_batch_memory_mb: 512
-      on_batch_memory_exceeded: warn
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!(
+            r#"SELECT id, name, amount FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("full")
+        .export_line(r#"columns: { amount: "decimal(12,2)" }"#)
+        .export_line("tuning:")
+        .export_line("  max_batch_memory_mb: 512")
+        .export_line("  on_batch_memory_exceeded: warn")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let (_cfgdir, cfgpath) = cfg(&yaml);
 
     let result = run_rivet_export(&cfgpath, &export_name);
@@ -79,23 +73,18 @@ fn warn_policy_succeeds_and_emits_warning() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("bmp_warn");
 
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, payload FROM {table_name}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    tuning:
-      batch_size: 2000
-      max_batch_memory_mb: 1
-      on_batch_memory_exceeded: warn
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!(
+            r#"SELECT id, payload FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("full")
+        .export_line("tuning:")
+        .export_line("  batch_size: 2000")
+        .export_line("  max_batch_memory_mb: 1")
+        .export_line("  on_batch_memory_exceeded: warn")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let (_cfgdir, cfgpath) = cfg(&yaml);
 
     // Use RUST_LOG=warn so that log::warn! output is visible in stderr.
@@ -128,23 +117,18 @@ fn fail_policy_exits_nonzero_when_batch_exceeds_cap() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("bmp_fail");
 
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, payload FROM {table_name}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    tuning:
-      batch_size: 2000
-      max_batch_memory_mb: 1
-      on_batch_memory_exceeded: fail
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!(
+            r#"SELECT id, payload FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("full")
+        .export_line("tuning:")
+        .export_line("  batch_size: 2000")
+        .export_line("  max_batch_memory_mb: 1")
+        .export_line("  on_batch_memory_exceeded: fail")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let (_cfgdir, cfgpath) = cfg(&yaml);
 
     let result = run_rivet_export(&cfgpath, &export_name);
@@ -169,23 +153,18 @@ fn auto_shrink_parquet_output_is_complete_and_readable() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("bmp_shrink_pq");
 
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, payload FROM {table_name}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    tuning:
-      batch_size: 2000
-      max_batch_memory_mb: 1
-      on_batch_memory_exceeded: auto_shrink
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!(
+            r#"SELECT id, payload FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("full")
+        .export_line("tuning:")
+        .export_line("  batch_size: 2000")
+        .export_line("  max_batch_memory_mb: 1")
+        .export_line("  on_batch_memory_exceeded: auto_shrink")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let (_cfgdir, cfgpath) = cfg(&yaml);
 
     let result = run_rivet_export(&cfgpath, &export_name);
@@ -217,23 +196,19 @@ fn auto_shrink_csv_output_is_complete_and_valid() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("bmp_shrink_csv");
 
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, payload FROM {table_name}"
-    mode: full
-    format: csv
-    destination: {{type: local, path: {dir}}}
-    tuning:
-      batch_size: 2000
-      max_batch_memory_mb: 1
-      on_batch_memory_exceeded: auto_shrink
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!(
+            r#"SELECT id, payload FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("full")
+        .with_format("csv")
+        .export_line("tuning:")
+        .export_line("  batch_size: 2000")
+        .export_line("  max_batch_memory_mb: 1")
+        .export_line("  on_batch_memory_exceeded: auto_shrink")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let (_cfgdir, cfgpath) = cfg(&yaml);
 
     let result = run_rivet_export(&cfgpath, &export_name);
@@ -301,23 +276,18 @@ fn auto_shrink_incremental_cursor_is_correct() {
 
     let export_name = unique_name("bmp_inc_exp");
     let out = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, payload, updated_at FROM {table_name}"
-    mode: incremental
-    cursor_column: updated_at
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    tuning:
-      batch_size: 2000
-      max_batch_memory_mb: 1
-      on_batch_memory_exceeded: auto_shrink
-"#,
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!(
+            r#"SELECT id, payload, updated_at FROM {table_name}"#
+        ))
+        .mode("incremental")
+        .export_line("cursor_column: updated_at")
+        .export_line("tuning:")
+        .export_line("  batch_size: 2000")
+        .export_line("  max_batch_memory_mb: 1")
+        .export_line("  on_batch_memory_exceeded: auto_shrink")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let (_cfgdir, cfgpath) = cfg(&yaml);
 
     // Run #1 — must export all 2000 rows.
