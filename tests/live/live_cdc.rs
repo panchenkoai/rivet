@@ -1351,6 +1351,71 @@ exports:
     assert_eq!(snap_parts(), 1, "run 2 must NOT re-snapshot");
 }
 
+// Roast finding #28 (feature composition): ensure_anchor ran with
+// resume_expected=false on EVERY run of an `initial: snapshot` export — so a
+// VANISHED slot was silently recreated at the current position BEFORE the
+// vanished-slot protection could fire, and everything since the drop was
+// silently lost. With resume evidence present (a completed snapshot marker /
+// a checkpoint position), a missing slot must be a LOUD failure.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_initial_snapshot_vanished_slot_fails_loudly_not_recreates() {
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_init_vslot");
+    let slot = unique_name("rivet_initv_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT); \
+         INSERT INTO {tbl} VALUES (1,10)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let yaml = format!(
+        r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
+exports:
+  - name: {tbl}
+    table: {tbl}
+    mode: cdc
+    format: parquet
+    cdc: {{ initial: snapshot, slot: {slot}, until_current: true }}
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        out = out.display(),
+    );
+    let cfg = write_config(&d, &yaml);
+
+    // Run 1: anchor + snapshot(1 row) + drain(0).
+    run_cdc(&cfg);
+    assert_eq!(manifest_rows(&out.join("snapshot")), 1);
+
+    // The slot vanishes (admin cleanup / WAL-size invalidation), and a change
+    // lands that the dropped slot would have carried.
+    c.execute("SELECT pg_drop_replication_slot($1)", &[&slot])
+        .unwrap();
+    c.execute(&format!("INSERT INTO {tbl} VALUES (2,20)"), &[])
+        .unwrap();
+
+    // Run 2 MUST fail loudly — silently recreating the slot at the current
+    // position would skip row 2 forever while reporting success.
+    let res = std::process::Command::new(RIVET_BIN)
+        .args(["run", "--config", cfg.to_str().unwrap()])
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        !res.status.success(),
+        "a vanished slot with a completed snapshot behind it must FAIL, not silently re-anchor"
+    );
+    let stderr = String::from_utf8_lossy(&res.stderr);
+    assert!(
+        stderr.contains("slot") && (stderr.contains("missing") || stderr.contains("dropped")),
+        "the failure must explain the vanished slot: {stderr}"
+    );
+}
+
 // Roast finding #25: the snapshot synth export INHERITED skip_empty — an
 // EMPTY table with skip_empty=true wrote no snapshot/_SUCCESS, so the marker
 // check re-snapshotted on every run, forever. The handoff must converge: an

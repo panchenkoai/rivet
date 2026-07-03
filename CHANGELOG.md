@@ -12,6 +12,13 @@
   encoding shared by both sides; a new accessor per engine, enforced at compile time). An offline matrix
   guard pins the CDC fold to the builder across every covered type with hostile cells (overflow
   narrowing, wrong-width binary, arrays with inner NULLs, NaN, u64::MAX, 50-digit decimals).
+- **`initial: snapshot` no longer bypasses the vanished-slot protection.** The anchor step ran with
+  `resume_expected=false` on EVERY run, so a dropped/invalidated PostgreSQL slot was silently recreated
+  at the current position before the loud-failure path could fire — every change since the drop was
+  lost while the run reported success (a composition bug between two individually-correct features).
+  Resume evidence (a checkpoint position OR any completed `snapshot/_SUCCESS` marker) now makes a
+  missing server-side anchor a loud error with the re-snapshot hint. Live:
+  `pg_initial_snapshot_vanished_slot_fails_loudly_not_recreates`.
 - **PostgreSQL CDC: `timestamptz` no longer corrupts at a non-UTC session/database timezone.**
   `test_decoding` renders the instant in the POLLING SESSION's zone; the parser stripped the trailing
   offset and treated the wall-clock as UTC — a +9h value shift at an `Asia/Tokyo` default, and at any

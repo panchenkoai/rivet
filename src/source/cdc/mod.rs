@@ -256,12 +256,19 @@ impl CdcEngine {
         slot: &str,
         checkpoint: Option<&std::path::Path>,
         tls: Option<&crate::config::TlsConfig>,
+        resume_expected: bool,
     ) -> Result<()> {
         match self.anchor_model() {
             AnchorModel::ServerSide => {
-                // Slot creation IS the anchor; open() creates it when missing.
+                // Slot creation IS the anchor; open() creates it only on a
+                // genuine FIRST run. With resume evidence behind us a missing
+                // slot means dropped/invalidated — open() then fails loudly
+                // instead of silently re-anchoring at the current position.
                 drop(crate::source::postgres::cdc::PgChangeStream::open(
-                    url, slot, false, tls,
+                    url,
+                    slot,
+                    resume_expected,
+                    tls,
                 )?);
                 Ok(())
             }

@@ -124,20 +124,20 @@ pub(super) fn initial_snapshot_pending(
         .slot
         .clone()
         .unwrap_or_else(|| crate::config::DEFAULT_PG_SLOT.to_string());
-    CdcEngine::from_url(&url)?.ensure_anchor(
-        &url,
-        &slot,
-        cdc.checkpoint.as_deref().map(std::path::Path::new),
-        tls,
-    )?;
 
-    // 2) Which tables still need their snapshot (no `snapshot/_SUCCESS` yet).
+    // 1) Which tables still need their snapshot (no `snapshot/_SUCCESS` yet) —
+    //    scanned BEFORE the anchor step, because a completed marker is resume
+    //    EVIDENCE: it proves a prior run anchored and snapshotted, and a
+    //    missing server-side anchor after that must be a loud failure, never
+    //    a silent re-anchor at the current position (which would skip every
+    //    change since the drop while reporting success — finding #28).
     let (tables, multi) = match (&export.tables, &export.table) {
         (Some(ts), _) => (ts.clone(), true),
         (None, Some(t)) => (vec![t.clone()], false),
         (None, None) => anyhow::bail!("export '{}': cdc mode requires `table:`", export.name),
     };
-    let mut pending = Vec::new();
+    let mut pending_tables = Vec::new();
+    let mut any_marker = false;
     for t in &tables {
         let table_dcfg = if multi {
             dest_for_table(&export.destination, t)
@@ -147,12 +147,35 @@ pub(super) fn initial_snapshot_pending(
         let snap_dcfg = dest_for_table(&table_dcfg, "snapshot");
         let dest = crate::destination::create_destination(&snap_dcfg)?;
         if dest.head("_SUCCESS")?.is_some() {
-            continue; // this table's snapshot already completed
+            any_marker = true; // this table's snapshot already completed
+        } else {
+            pending_tables.push((t.clone(), snap_dcfg));
         }
+    }
+
+    // 2) The anchor — one entry point; the engine's AnchorModel decides the
+    //    mechanism. Resume evidence (a checkpoint position OR any completed
+    //    snapshot marker) makes a missing server-side anchor a LOUD error.
+    let ckpt_resume = cdc
+        .checkpoint
+        .as_deref()
+        .map(std::path::Path::new)
+        .and_then(|p| crate::source::cdc::Position::load(p).ok().flatten())
+        .is_some();
+    CdcEngine::from_url(&url)?.ensure_anchor(
+        &url,
+        &slot,
+        cdc.checkpoint.as_deref().map(std::path::Path::new),
+        tls,
+        ckpt_resume || any_marker,
+    )?;
+
+    let mut pending = Vec::new();
+    for (t, snap_dcfg) in pending_tables {
         let mut synth = export.clone();
         synth.name = format!("{}__snapshot_{t}", export.name);
         synth.mode = crate::config::ExportMode::Full;
-        synth.table = Some(t.clone());
+        synth.table = Some(t);
         synth.tables = None;
         synth.cdc = None;
         synth.destination = snap_dcfg;
