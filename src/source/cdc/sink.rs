@@ -455,7 +455,10 @@ fn flush(
                  schema has {} — a DDL landed inside this capture window, and mapping \
                  by position would put values into the WRONG columns. Recover by \
                  re-snapshotting the table (delete its snapshot/_SUCCESS marker under \
-                 `initial: snapshot`) or by resetting the checkpoint past the DDL.",
+                 `initial: snapshot`) or by resetting the checkpoint past the DDL. \
+                 To make mid-stream DDL safe going forward, set \
+                 binlog_row_metadata=FULL on the MySQL server (8.0.1+) — rivet then \
+                 maps binlog images by column NAME and this error class disappears.",
                 ev.table,
                 vals.len(),
                 columns.len()

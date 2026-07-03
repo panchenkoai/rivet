@@ -495,13 +495,28 @@ linear, so a 10M-row bulk backfill in ONE transaction will not fit. Run bulk
 backfills in batched transactions, or through `mode: full`/`initial: snapshot`
 (the batch path streams). Spilling oversized transactions to disk is roadmap.
 
-**DDL inside a capture window fails loudly (never misaligns).** Binlog row
-events are positional and carry no column names; a `DROP`/`ADD COLUMN` landing
-BETWEEN captured events would shift values into the wrong columns. The sink
-refuses arity drift with a recovery hint (re-snapshot the table, or reset the
-checkpoint past the DDL). DDL *between* runs is fine — each run resolves the
-schema fresh; column RENAME is positionally safe even mid-window. Same-arity
-type changes are undetectable without schema history (roadmap) — run DDL
+**DDL inside a capture window: safe where the engine names its columns, a
+LOUD ERROR where it does not.** PostgreSQL (wire text) and SQL Server (change
+tables) always name every image column, so rivet maps values by NAME and a
+mid-window `DROP`/`ADD COLUMN` captures correctly. MySQL's binlog carries
+names only when the server runs with **`binlog_row_metadata=FULL`** (8.0.1+ —
+strongly recommended; the compose test stack sets it):
+
+```ini
+# my.cnf — makes mid-stream DDL safe for rivet CDC
+binlog_row_metadata = FULL
+```
+
+Under the **default `MINIMAL` the binlog is nameless and positional — expect
+runs to FAIL with an explicit error** ("an event … carries N column(s) but the
+resolved schema has M") whenever a DDL lands inside a capture window. That is
+deliberate: mapping by position would put values into the wrong columns
+silently, and a loud stop is the only safe behavior. Recover by
+re-snapshotting the table (or resetting the checkpoint past the DDL), and set
+`binlog_row_metadata=FULL` to retire this error class. DDL *between* runs is
+always fine — each run resolves the schema fresh. A mid-window RENAME is safe
+in both modes (same arity ⇒ positional fallback keeps the value). Same-arity
+TYPE changes remain undetectable without schema history (roadmap) — run type
 migrations and their backfills through a re-snapshot.
 
 **The value checksum runs on CDC too.** The same always-on two-ended check the
