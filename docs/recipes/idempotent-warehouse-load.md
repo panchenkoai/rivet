@@ -137,6 +137,17 @@ prove which bytes were loaded.
 > per export.  Full table:
 > [type-mapping.md § BigQuery autoload & recovery](../type-mapping.md#bigquery-autoload--recovery-verified-live).
 
+> **Wide decimals (`NUMERIC`/`DECIMAL` precision > 38).**  The load's default
+> decimal target is `NUMERIC` (max precision 38, scale 9) and fails on wider
+> columns; pass `--decimal_target_types=NUMERIC,BIGNUMERIC,STRING` (repeated
+> flag in `bq`: one value per flag).  `BIGNUMERIC` still caps at ~5.79×10³⁸ —
+> **38 integer digits** — so a `DECIMAL(50,10)` *column* loads but a value with
+> 39+ integer digits does not fit ANY BigQuery numeric type; with `STRING` in
+> the list such columns load losslessly as text (verified live).  Caveat for
+> verification tooling: DuckDB misreads Parquet fixed-len-byte-array decimals
+> wider than 16 bytes as a garbage `DOUBLE` — cross-check wide-decimal columns
+> with ClickHouse or BigQuery, not DuckDB.
+
 ---
 
 ## Snowflake pattern
