@@ -59,6 +59,8 @@ mod gremlin;
 mod gremlin_cdc;
 #[path = "live/live_azure_multipart.rs"]
 mod live_azure_multipart;
+#[path = "live/live_batch_switch_golden.rs"]
+mod live_batch_switch_golden;
 #[path = "live/live_catalog_hints.rs"]
 mod live_catalog_hints;
 #[path = "live/live_cdc.rs"]
