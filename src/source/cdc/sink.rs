@@ -416,12 +416,26 @@ fn flush(
     // path spelled out. (Same-arity DDL — rename — is positionally safe;
     // type changes are a schema-history feature, see the docs limitation.)
     for ev in events {
-        let img = match ev.op {
-            ChangeOp::Delete => ev.before.as_ref(),
-            _ => ev.after.as_ref(),
+        // A DELETE's before-image may legitimately carry only the key
+        // columns (PostgreSQL test_decoding emits just the key; MySQL FULL
+        // row-image carries everything) — a SHORTER delete image maps by
+        // prefix; an image WIDER than the schema, or a non-delete image of
+        // ANY other arity, proves a stale pre-DDL layout.
+        let is_delete = ev.op == ChangeOp::Delete;
+        let img = if is_delete {
+            ev.before.as_ref()
+        } else {
+            ev.after.as_ref()
+        };
+        let bad = |n: usize| {
+            if is_delete {
+                n > columns.len()
+            } else {
+                n != columns.len()
+            }
         };
         if let Some(vals) = img
-            && vals.len() != columns.len()
+            && bad(vals.len())
         {
             anyhow::bail!(
                 "cdc: an event for table '{}' carries {} column(s) but the resolved \
