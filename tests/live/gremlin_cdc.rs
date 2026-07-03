@@ -21,6 +21,7 @@
 
 use mysql::prelude::Queryable;
 
+use crate::common::MysqlCdcTable as Table;
 use crate::common::*;
 
 fn conn() -> mysql::PooledConn {
@@ -28,24 +29,6 @@ fn conn() -> mysql::PooledConn {
         .expect("mysql pool")
         .get_conn()
         .expect("mysql conn")
-}
-
-struct Table(String);
-impl Drop for Table {
-    fn drop(&mut self) {
-        if let Ok(pool) = mysql::Pool::new(MYSQL_CDC_URL)
-            && let Ok(mut c) = pool.get_conn()
-        {
-            let _ = c.query_drop(format!("DROP TABLE IF EXISTS {}", self.0));
-        }
-    }
-}
-
-fn server_id_for(tbl: &str) -> u32 {
-    let h = tbl.bytes().fold(2_166_136_261u32, |a, b| {
-        (a ^ b as u32).wrapping_mul(16_777_619)
-    });
-    10_000 + (h % 50_000)
 }
 
 /// CDC config against an arbitrary source URL (direct or through toxiproxy),
@@ -58,20 +41,12 @@ fn cdc_cfg(
     ckpt: &std::path::Path,
     out: &std::path::Path,
 ) -> std::path::PathBuf {
-    let yaml = format!(
-        r#"source: {{type: mysql, url: "{url}"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: cdc
-    format: parquet
-    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid}, rollover: 200 }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        ckpt = ckpt.display(),
-        out = out.display(),
-        sid = server_id_for(tbl),
-    );
+    let yaml = Rig::mysql_cdc(tbl)
+        .source_url(url)
+        .cdc("rollover: 200")
+        .checkpoint_path(ckpt.to_path_buf())
+        .dest_path(out.to_path_buf())
+        .yaml();
     write_config(d, &yaml)
 }
 

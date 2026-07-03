@@ -128,22 +128,17 @@ fn chunked_crash_after_first_chunk_complete_resume_finishes_export() {
     let export = unique_name("c1_crash_complete");
     let out = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export}
-    query: "SELECT id, name FROM {table_name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 50
-    chunk_checkpoint: true
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export)
+        .query(&format!(
+            r#"SELECT id, name FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 50")
+        .export_line("chunk_checkpoint: true")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let cfg = write_config(&cfg_dir, &yaml);
 
     // ── Crash run ────────────────────────────────────────────────────────────
@@ -232,22 +227,17 @@ fn chunked_crash_after_chunk_file_before_commit_resume_reruns_chunk_atleastonce(
     let export = unique_name("c2_crash_file");
     let out = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export}
-    query: "SELECT id, name FROM {table_name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 50
-    chunk_checkpoint: true
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export)
+        .query(&format!(
+            r#"SELECT id, name FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 50")
+        .export_line("chunk_checkpoint: true")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let cfg = write_config(&cfg_dir, &yaml);
 
     // ── Crash run ────────────────────────────────────────────────────────────
@@ -410,23 +400,18 @@ fn parallel_chunked_crash_after_chunk_complete_resume_finishes_with_no_duplicate
     let export = unique_name("c3_parallel_crash_complete");
     let out = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export}
-    query: "SELECT id, name FROM {table_name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: {CHUNK_SIZE}
-    chunk_checkpoint: true
-    parallel: 4
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export)
+        .query(&format!(
+            r#"SELECT id, name FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line(&format!(r#"chunk_size: {CHUNK_SIZE}"#))
+        .export_line("chunk_checkpoint: true")
+        .export_line("parallel: 4")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let cfg = write_config(&cfg_dir, &yaml);
 
     // ── Crash run ────────────────────────────────────────────────────────────
@@ -559,23 +544,18 @@ fn parallel_chunked_crash_after_chunk_file_stuck_running_resume_reruns_chunk() {
     let export = unique_name("c4_parallel_stuck_running");
     let out = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export}
-    query: "SELECT id, name FROM {table_name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: {CHUNK_SIZE}
-    chunk_checkpoint: true
-    parallel: 1
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export)
+        .query(&format!(
+            r#"SELECT id, name FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line(&format!(r#"chunk_size: {CHUNK_SIZE}"#))
+        .export_line("chunk_checkpoint: true")
+        .export_line("parallel: 1")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let cfg = write_config(&cfg_dir, &yaml);
 
     // ── Crash run ────────────────────────────────────────────────────────────
@@ -710,22 +690,17 @@ fn chunked_sequential_checkpoint_validate_records_validated_metric() {
     let export = unique_name("c5_seq_validated");
     let out = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export}
-    query: "SELECT id, name FROM {table_name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 50
-    chunk_checkpoint: true
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
+    let yaml = Rig::pg_batch(&export)
+        .query(&format!(
+            r#"SELECT id, name FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 50")
+        .export_line("chunk_checkpoint: true")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
     let cfg = write_config(&cfg_dir, &yaml);
 
     let run = std::process::Command::new(RIVET_BIN)

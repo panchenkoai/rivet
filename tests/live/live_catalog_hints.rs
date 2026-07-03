@@ -395,21 +395,17 @@ fn chunked_nonsimple_query_resolves_numeric_via_base_catalog_hint() {
     require_alive(LiveService::Postgres);
     let tbl = seed_pg_numeric_table(60);
     let tmp = tempfile::tempdir().expect("tmpdir");
-    let yaml = format!(
-        r#"source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {name}
-    query: "SELECT id, amount FROM {name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 25
-    chunk_checkpoint: true
-    format: parquet
-    destination: {{type: local, path: {out}}}
-"#,
-        name = tbl.name(),
-        out = tmp.path().join("o").display(),
-    );
+    let yaml = Rig::pg_batch(tbl.name())
+        .query(&format!(
+            r#"SELECT id, amount FROM {name}"#,
+            name = tbl.name()
+        ))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 25")
+        .export_line("chunk_checkpoint: true")
+        .dest_path(tmp.path().join("o").to_path_buf())
+        .yaml();
     let cfg = write_config(&tmp, &yaml);
     let out = run_rivet(&["run", "-c", cfg.to_str().unwrap(), "--export", tbl.name()]);
     assert!(
@@ -430,22 +426,15 @@ fn chunked_dense_resolves_numeric_via_base_catalog_hint() {
     require_alive(LiveService::Postgres);
     let tbl = seed_pg_numeric_table(60);
     let tmp = tempfile::tempdir().expect("tmpdir");
-    let yaml = format!(
-        r#"source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {name}
-    query: "SELECT * FROM {name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 25
-    chunk_dense: true
-    chunk_checkpoint: true
-    format: parquet
-    destination: {{type: local, path: {out}}}
-"#,
-        name = tbl.name(),
-        out = tmp.path().join("o").display(),
-    );
+    let yaml = Rig::pg_batch(tbl.name())
+        .query(&format!(r#"SELECT * FROM {name}"#, name = tbl.name()))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 25")
+        .export_line("chunk_dense: true")
+        .export_line("chunk_checkpoint: true")
+        .dest_path(tmp.path().join("o").to_path_buf())
+        .yaml();
     let cfg = write_config(&tmp, &yaml);
     let out = run_rivet(&["run", "-c", cfg.to_str().unwrap(), "--export", tbl.name()]);
     assert!(
@@ -466,20 +455,16 @@ fn time_window_resolves_numeric_via_base_catalog_hint() {
     require_alive(LiveService::Postgres);
     let tbl = seed_pg_numeric_table(40);
     let tmp = tempfile::tempdir().expect("tmpdir");
-    let yaml = format!(
-        r#"source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {name}
-    query: "SELECT id, amount, created_at FROM {name}"
-    mode: time_window
-    time_column: created_at
-    days_window: 1
-    format: parquet
-    destination: {{type: local, path: {out}}}
-"#,
-        name = tbl.name(),
-        out = tmp.path().join("o").display(),
-    );
+    let yaml = Rig::pg_batch(tbl.name())
+        .query(&format!(
+            r#"SELECT id, amount, created_at FROM {name}"#,
+            name = tbl.name()
+        ))
+        .mode("time_window")
+        .export_line("time_column: created_at")
+        .export_line("days_window: 1")
+        .dest_path(tmp.path().join("o").to_path_buf())
+        .yaml();
     let cfg = write_config(&tmp, &yaml);
     let out = run_rivet(&["run", "-c", cfg.to_str().unwrap(), "--export", tbl.name()]);
     assert!(

@@ -38,9 +38,19 @@ use crate::source::require_tls_or_loopback;
 /// cached by `table_id` and applied to the following rows. `file` tracks the
 /// current binlog file across `ROTATE` events — it plus the event header's
 /// position form the [`Position`] checkpoint.
+/// One TABLE_MAP's decode context: the owned event + its parsed column names.
+type CachedTableMap = (
+    std::sync::Arc<TableMapEvent<'static>>,
+    Option<std::sync::Arc<[String]>>,
+);
+
 pub(crate) struct MysqlChangeStream {
     stream: BinlogStream,
-    tables: HashMap<u64, TableMapEvent<'static>>,
+    /// TABLE_MAP cache: the event (Arc — rows-event decode borrows it) plus
+    /// the column names parsed from its optional metadata ONCE. The first cut
+    /// re-parsed the metadata and re-allocated every name on EVERY rows-event
+    /// — thousands of identical parses inside a single large transaction.
+    tables: HashMap<u64, CachedTableMap>,
     pending: VecDeque<ChangeEvent>,
     /// The current transaction's rows, held until the `XID` (commit) event so the
     /// whole transaction is released atomically with the commit position.
@@ -181,27 +191,8 @@ impl MysqlChangeStream {
                 self.file = re.name().to_string();
             }
             Some(EventData::TableMapEvent(tme)) => {
-                self.tables.insert(tme.table_id(), tme.into_owned());
-            }
-            Some(EventData::RowsEvent(re)) => {
-                let op = match &re {
-                    RowsEventData::WriteRowsEvent(_) => ChangeOp::Insert,
-                    RowsEventData::UpdateRowsEvent(_) => ChangeOp::Update,
-                    RowsEventData::DeleteRowsEvent(_) => ChangeOp::Delete,
-                    _ => return Ok(true),
-                };
-                let Some(tme) = self.tables.get(&re.table_id()).cloned() else {
-                    return Ok(true); // started mid-stream, no TABLE_MAP yet — skip
-                };
-                let schema = tme.database_name().to_string();
-                let table = tme.table_name().to_string();
-                // `binlog_row_metadata=FULL` (8.0.1+) puts every column NAME
-                // into the TABLE_MAP's optional metadata — with names present
-                // the sink maps images BY NAME and the positional-corruption
-                // class (findings #37/#41) closes on MySQL too. Under the
-                // MINIMAL default this yields None and the arity guard stays
-                // load-bearing; `rivet doctor` recommends FULL.
-                let image_names: Option<std::sync::Arc<[String]>> =
+                let tme = tme.into_owned();
+                let names: Option<std::sync::Arc<[String]>> =
                     tme.iter_optional_meta().find_map(|f| match f {
                         Ok(mysql::binlog::events::OptionalMetadataField::ColumnName(names)) => {
                             Some(
@@ -214,6 +205,21 @@ impl MysqlChangeStream {
                         }
                         _ => None,
                     });
+                self.tables
+                    .insert(tme.table_id(), (std::sync::Arc::new(tme), names));
+            }
+            Some(EventData::RowsEvent(re)) => {
+                let op = match &re {
+                    RowsEventData::WriteRowsEvent(_) => ChangeOp::Insert,
+                    RowsEventData::UpdateRowsEvent(_) => ChangeOp::Update,
+                    RowsEventData::DeleteRowsEvent(_) => ChangeOp::Delete,
+                    _ => return Ok(true),
+                };
+                let Some((tme, image_names)) = self.tables.get(&re.table_id()).cloned() else {
+                    return Ok(true); // started mid-stream, no TABLE_MAP yet — skip
+                };
+                let schema = tme.database_name().to_string();
+                let table = tme.table_name().to_string();
                 // Provisional position; rewritten to the commit position at XID.
                 let position = Position(json!({ "file": self.file, "pos": log_pos }));
                 for row in re.rows(&tme) {

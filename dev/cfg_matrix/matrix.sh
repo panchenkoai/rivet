@@ -14,6 +14,10 @@
 set -u
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 R="${RIVET_BIN:-$ROOT/rivet}"
+# Fall back to the workspace build — no per-matrix binary copy needed (the
+# copies were 14 MB of stale artifacts each before the dev/ cleanup).
+[[ -x "$R" ]] || R="$ROOT/../../target/release/rivet"
+[[ -x "$R" ]] || R="$ROOT/../../target/debug/rivet"
 LM="$ROOT/logs"
 mkdir -p "$LM"
 if [[ ! -x "$R" ]]; then

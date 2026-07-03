@@ -24,25 +24,9 @@ use std::collections::HashMap;
 use arrow::array::{Array, Int64Array, StringArray};
 use mysql::prelude::Queryable;
 
+use crate::common::MysqlCdcTable as Table;
+use crate::common::read_all_parts;
 use crate::common::*;
-
-struct Table(String);
-impl Drop for Table {
-    fn drop(&mut self) {
-        if let Ok(pool) = mysql::Pool::new(MYSQL_CDC_URL)
-            && let Ok(mut c) = pool.get_conn()
-        {
-            let _ = c.query_drop(format!("DROP TABLE IF EXISTS {}", self.0));
-        }
-    }
-}
-
-fn server_id_for(tbl: &str) -> u32 {
-    let h = tbl.bytes().fold(2_166_136_261u32, |a, b| {
-        (a ^ b as u32).wrapping_mul(16_777_619)
-    });
-    10_000 + (h % 50_000)
-}
 
 /// Tiny deterministic PRNG (xorshift) — no rand dependency, fixed seeds.
 struct Rng(u64);
@@ -70,7 +54,6 @@ struct OpCounts {
 #[test]
 #[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
 fn cdc_concurrent_writers_capture_converges_to_source_state() {
-    let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("cdc_mbt");
     let mut c = mysql::Pool::new(MYSQL_CDC_URL)
         .expect("pool")
@@ -83,31 +66,9 @@ fn cdc_concurrent_writers_capture_converges_to_source_state() {
     .unwrap();
     let _guard = Table(tbl.clone());
 
-    let out = d.path().join("out");
-    let ckpt = d.path().join("cdc.ckpt");
-    std::fs::create_dir_all(&out).unwrap();
-    let yaml = format!(
-        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: cdc
-    format: parquet
-    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid}, rollover: 128 }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        ckpt = ckpt.display(),
-        out = out.display(),
-        sid = server_id_for(&tbl),
-    );
-    let cfg = write_config(&d, &yaml);
-    let run = || {
-        let st = std::process::Command::new(RIVET_BIN)
-            .args(["run", "--config", cfg.to_str().unwrap()])
-            .status()
-            .unwrap();
-        assert!(st.success());
-    };
+    let rig = Rig::mysql_cdc(&tbl).cdc("rollover: 128");
+    let out = rig.out_dir();
+    let run = || rig.run_ok();
     run(); // pin
 
     // ── 4 concurrent writers, shared key range 1..=60, 250 ops each. ──────
@@ -277,7 +238,6 @@ fn cdc_fault_point_sweep_every_phase_boundary_recovers() {
         "cdc_before_manifest",
     ];
     for point in POINTS {
-        let d = tempfile::tempdir().unwrap();
         let tbl = unique_name("cdc_sweep");
         let mut c = mysql::Pool::new(MYSQL_CDC_URL)
             .expect("pool")
@@ -288,40 +248,16 @@ fn cdc_fault_point_sweep_every_phase_boundary_recovers() {
             .unwrap();
         let _guard = Table(tbl.clone());
 
-        let out = d.path().join("out");
-        let ckpt = d.path().join("cdc.ckpt");
-        std::fs::create_dir_all(&out).unwrap();
-        let yaml = format!(
-            r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: cdc
-    format: parquet
-    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid}, rollover: 10 }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-            ckpt = ckpt.display(),
-            out = out.display(),
-            sid = server_id_for(&tbl),
-        );
-        let cfg = write_config(&d, &yaml);
+        let rig = Rig::mysql_cdc(&tbl).cdc("rollover: 10");
+        let out = rig.out_dir();
         // Pin cleanly, then a 30-row backlog (3 parts at rollover 10).
-        let st = std::process::Command::new(RIVET_BIN)
-            .args(["run", "--config", cfg.to_str().unwrap()])
-            .status()
-            .unwrap();
-        assert!(st.success());
+        rig.run_ok();
         let vals: Vec<String> = (1..=30).map(|i| format!("({i}, {i})")).collect();
         c.query_drop(format!("INSERT INTO {tbl} VALUES {}", vals.join(",")))
             .unwrap();
 
         // Faulted run: must crash (loudly), never report success.
-        let res = std::process::Command::new(RIVET_BIN)
-            .args(["run", "--config", cfg.to_str().unwrap()])
-            .env("RIVET_TEST_PANIC_AT", point)
-            .output()
-            .unwrap();
+        let res = rig.run_with_env("RIVET_TEST_PANIC_AT", point);
         assert!(
             !res.status.success(),
             "{point}: the faulted run must fail loudly"
@@ -330,11 +266,7 @@ exports:
         // Clean retries close the gap.
         let mut ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
         for _ in 0..3 {
-            let st = std::process::Command::new(RIVET_BIN)
-                .args(["run", "--config", cfg.to_str().unwrap()])
-                .status()
-                .unwrap();
-            assert!(st.success(), "{point}: recovery run must succeed");
+            rig.run_ok();
             ids = distinct_int_ids(&out);
             if ids.len() >= 30 {
                 break;
@@ -463,7 +395,6 @@ exports:
 #[test]
 #[ignore = "live: requires docker compose --profile cdc mysql-cdc (binlog_row_metadata=FULL)"]
 fn cdc_mid_window_ddl_maps_by_name_under_full_metadata() {
-    let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("cdc_ddl_mid");
     let mut c = mysql::Pool::new(MYSQL_CDC_URL).unwrap().get_conn().unwrap();
     c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
@@ -472,15 +403,16 @@ fn cdc_mid_window_ddl_maps_by_name_under_full_metadata() {
     ))
     .unwrap();
     let _guard = Table(tbl.clone());
-    let (cfg, out) = ddl_cfg(&d, &tbl);
-    run_ok(&cfg); // pin
+    let rig = ddl_cfg(&tbl);
+    let out = rig.out_dir();
+    rig.run_ok(); // pin
     c.query_drop(format!("INSERT INTO {tbl} VALUES (1,'AAA','BBB')"))
         .unwrap();
     c.query_drop(format!("ALTER TABLE {tbl} DROP COLUMN a"))
         .unwrap();
     c.query_drop(format!("INSERT INTO {tbl} (id,b) VALUES (2,'CCC')"))
         .unwrap();
-    run_ok(&cfg);
+    rig.run_ok();
 
     use arrow::array::StringArray;
     let mut got = Vec::new();
@@ -506,7 +438,6 @@ fn cdc_mid_window_ddl_maps_by_name_under_full_metadata() {
 #[test]
 #[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
 fn cdc_ddl_between_runs_is_captured_with_each_runs_schema() {
-    let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("cdc_ddl_btw");
     let mut c = mysql::Pool::new(MYSQL_CDC_URL).unwrap().get_conn().unwrap();
     c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
@@ -515,16 +446,17 @@ fn cdc_ddl_between_runs_is_captured_with_each_runs_schema() {
     ))
     .unwrap();
     let _guard = Table(tbl.clone());
-    let (cfg, out) = ddl_cfg(&d, &tbl);
-    run_ok(&cfg); // pin
+    let rig = ddl_cfg(&tbl);
+    let out = rig.out_dir();
+    rig.run_ok(); // pin
     c.query_drop(format!("INSERT INTO {tbl} VALUES (1,'AAA','BBB')"))
         .unwrap();
-    run_ok(&cfg); // captures the 3-column shape
+    rig.run_ok(); // captures the 3-column shape
     c.query_drop(format!("ALTER TABLE {tbl} DROP COLUMN a"))
         .unwrap();
     c.query_drop(format!("INSERT INTO {tbl} (id,b) VALUES (2,'CCC')"))
         .unwrap();
-    run_ok(&cfg); // captures the 2-column shape
+    rig.run_ok(); // captures the 2-column shape
     // Both rows present across parts; the post-DDL row is well-formed.
     let ids = distinct_int_ids(&out);
     assert_eq!(ids.len(), 2, "both shapes captured across their runs");
@@ -534,7 +466,6 @@ fn cdc_ddl_between_runs_is_captured_with_each_runs_schema() {
 #[test]
 #[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
 fn cdc_mid_window_rename_is_positionally_safe() {
-    let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("cdc_ddl_ren");
     let mut c = mysql::Pool::new(MYSQL_CDC_URL).unwrap().get_conn().unwrap();
     c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
@@ -543,15 +474,16 @@ fn cdc_mid_window_rename_is_positionally_safe() {
     ))
     .unwrap();
     let _guard = Table(tbl.clone());
-    let (cfg, out) = ddl_cfg(&d, &tbl);
-    run_ok(&cfg); // pin
+    let rig = ddl_cfg(&tbl);
+    let out = rig.out_dir();
+    rig.run_ok(); // pin
     c.query_drop(format!("INSERT INTO {tbl} VALUES (1,'AAA')"))
         .unwrap();
     c.query_drop(format!("ALTER TABLE {tbl} RENAME COLUMN a TO a2"))
         .unwrap();
     c.query_drop(format!("INSERT INTO {tbl} VALUES (2,'ZZZ')"))
         .unwrap();
-    run_ok(&cfg);
+    rig.run_ok();
     // Both values land under the RESOLVED (new) name, positions intact.
     use arrow::array::StringArray;
     let mut vals = Vec::new();
@@ -573,25 +505,8 @@ fn cdc_mid_window_rename_is_positionally_safe() {
     );
 }
 
-fn ddl_cfg(d: &tempfile::TempDir, tbl: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-    let out = d.path().join("out");
-    let ckpt = d.path().join("cdc.ckpt");
-    std::fs::create_dir_all(&out).unwrap();
-    let yaml = format!(
-        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: cdc
-    format: parquet
-    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        ckpt = ckpt.display(),
-        out = out.display(),
-        sid = server_id_for(tbl),
-    );
-    (write_config(d, &yaml), out)
+fn ddl_cfg(tbl: &str) -> Rig {
+    Rig::mysql_cdc(tbl)
 }
 
 fn run_ok(cfg: &std::path::Path) {
@@ -602,27 +517,6 @@ fn run_ok(cfg: &std::path::Path) {
     assert!(st.success());
 }
 
-fn read_all_parts(out: &std::path::Path) -> Vec<arrow::record_batch::RecordBatch> {
-    let mut parts: Vec<_> = std::fs::read_dir(out)
-        .unwrap()
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "parquet"))
-        .collect();
-    parts.sort();
-    let mut out_b = Vec::new();
-    for p in parts {
-        let f = std::fs::File::open(&p).unwrap();
-        let r = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
-            .unwrap()
-            .build()
-            .unwrap();
-        for b in r {
-            out_b.push(b.unwrap());
-        }
-    }
-    out_b
-}
-
 // Finding #38 — Form B was a silent no-op for CDC: the manifest recorded
 // `column_checksums: None`, so `rivet validate` skipped the value leg on CDC
 // prefixes while looking green. The sink already computed the arrow-side sum
@@ -631,7 +525,6 @@ fn read_all_parts(out: &std::path::Path) -> Vec<arrow::record_batch::RecordBatch
 #[test]
 #[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
 fn cdc_manifest_records_form_b_checksums_and_validate_verifies_them() {
-    let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("cdc_formb");
     let mut c = mysql::Pool::new(MYSQL_CDC_URL).unwrap().get_conn().unwrap();
     c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
@@ -640,11 +533,12 @@ fn cdc_manifest_records_form_b_checksums_and_validate_verifies_them() {
     ))
     .unwrap();
     let _guard = Table(tbl.clone());
-    let (cfg, out) = ddl_cfg(&d, &tbl);
-    run_ok(&cfg); // pin
+    let rig = ddl_cfg(&tbl);
+    let out = rig.out_dir();
+    rig.run_ok(); // pin
     c.query_drop(format!("INSERT INTO {tbl} VALUES (1,'aaa'),(2,'bbb')"))
         .unwrap();
-    run_ok(&cfg);
+    rig.run_ok();
 
     let manifest_path = out.join("manifest.json");
     let m: serde_json::Value =
@@ -659,7 +553,7 @@ fn cdc_manifest_records_form_b_checksums_and_validate_verifies_them() {
 
     // Clean validate passes…
     let ok = std::process::Command::new(RIVET_BIN)
-        .args(["validate", "--config", cfg.to_str().unwrap()])
+        .args(["validate", "--config", rig.config_path().to_str().unwrap()])
         .output()
         .unwrap();
     assert!(
@@ -677,7 +571,7 @@ fn cdc_manifest_records_form_b_checksums_and_validate_verifies_them() {
     }
     std::fs::write(&manifest_path, serde_json::to_string_pretty(&m2).unwrap()).unwrap();
     let bad = std::process::Command::new(RIVET_BIN)
-        .args(["validate", "--config", cfg.to_str().unwrap()])
+        .args(["validate", "--config", rig.config_path().to_str().unwrap()])
         .output()
         .unwrap();
     assert!(
@@ -813,15 +707,15 @@ exports:
 #[test]
 #[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
 fn cdc_corrupt_checkpoint_fails_loudly_never_reanchors() {
-    let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("cdc_badckpt");
     let mut c = mysql::Pool::new(MYSQL_CDC_URL).unwrap().get_conn().unwrap();
     c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
     c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
         .unwrap();
     let _guard = Table(tbl.clone());
-    let (cfg, out) = ddl_cfg(&d, &tbl);
-    let ckpt = d.path().join("cdc.ckpt");
+    let rig = ddl_cfg(&tbl);
+    let out = rig.out_dir();
+    let ckpt = rig.checkpoint();
     c.query_drop(format!("INSERT INTO {tbl} VALUES (1, 10)"))
         .unwrap();
 
@@ -833,7 +727,7 @@ fn cdc_corrupt_checkpoint_fails_loudly_never_reanchors() {
     ] {
         std::fs::write(&ckpt, body).unwrap();
         let res = std::process::Command::new(RIVET_BIN)
-            .args(["run", "--config", cfg.to_str().unwrap()])
+            .args(["run", "--config", rig.config_path().to_str().unwrap()])
             .output()
             .unwrap();
         assert!(
@@ -864,7 +758,6 @@ fn cdc_corrupt_checkpoint_fails_loudly_never_reanchors() {
 #[test]
 #[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
 fn cdc_unicode_enum_labels_survive_end_to_end() {
-    let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("cdc_uenum");
     let mut c = mysql::Pool::new(MYSQL_CDC_URL).unwrap().get_conn().unwrap();
     c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
@@ -873,13 +766,14 @@ fn cdc_unicode_enum_labels_survive_end_to_end() {
     ))
     .unwrap();
     let _guard = Table(tbl.clone());
-    let (cfg, out) = ddl_cfg(&d, &tbl);
-    run_ok(&cfg); // pin
+    let rig = ddl_cfg(&tbl);
+    let out = rig.out_dir();
+    rig.run_ok(); // pin
     c.query_drop(format!(
         "INSERT INTO {tbl} VALUES (1,'привет'),(2,'мир'),(3,'it''s')"
     ))
     .unwrap();
-    run_ok(&cfg);
+    rig.run_ok();
 
     use arrow::array::StringArray;
     let mut got = Vec::new();
@@ -1110,7 +1004,6 @@ exports:
 #[ignore = "live: requires docker compose postgres (wal_level=logical)"]
 fn pg_cdc_delete_with_non_first_pk_lands_in_the_pk_column() {
     use postgres::NoTls;
-    let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("cdc_pk_mid");
     let slot = unique_name("rivet_pkmid_slot");
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
@@ -1133,9 +1026,9 @@ fn pg_cdc_delete_with_non_first_pk_lands_in_the_pk_column() {
     ))
     .unwrap();
 
-    let out = d.path().join("out");
-    std::fs::create_dir_all(&out).unwrap();
-    run_ok(&pg_mbt_cfg(&d, &tbl, &slot, &out));
+    let rig = pg_mbt_cfg(&tbl, &slot);
+    let out = rig.out_dir();
+    rig.run_ok();
 
     use arrow::array::{Int32Array, StringArray};
     let mut checked_delete = false;
@@ -1178,25 +1071,8 @@ fn pg_cdc_delete_with_non_first_pk_lands_in_the_pk_column() {
     assert!(checked_delete, "a delete event must be captured");
 }
 
-fn pg_mbt_cfg(
-    d: &tempfile::TempDir,
-    tbl: &str,
-    slot: &str,
-    out: &std::path::Path,
-) -> std::path::PathBuf {
-    let yaml = format!(
-        r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: cdc
-    format: parquet
-    cdc: {{ slot: {slot}, until_current: true }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        out = out.display(),
-    );
-    write_config(d, &yaml)
+fn pg_mbt_cfg(tbl: &str, slot: &str) -> Rig {
+    Rig::pg_cdc(tbl, slot)
 }
 
 // Finding #42 (live): updating the PRIMARY KEY is a legal operation —
@@ -1206,7 +1082,6 @@ exports:
 #[ignore = "live: requires docker compose postgres (wal_level=logical)"]
 fn pg_cdc_pk_changing_update_captures_and_does_not_brick() {
     use postgres::NoTls;
-    let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("cdc_pkupd");
     let slot = unique_name("rivet_pkupd_slot");
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
@@ -1226,9 +1101,9 @@ fn pg_cdc_pk_changing_update_captures_and_does_not_brick() {
     ))
     .unwrap();
 
-    let out = d.path().join("out");
-    std::fs::create_dir_all(&out).unwrap();
-    run_ok(&pg_mbt_cfg(&d, &tbl, &slot, &out));
+    let rig = pg_mbt_cfg(&tbl, &slot);
+    let out = rig.out_dir();
+    rig.run_ok();
 
     use arrow::array::{Int32Array, StringArray};
     let mut update_after: Option<(i32, String)> = None;
@@ -1262,4 +1137,55 @@ fn pg_cdc_pk_changing_update_captures_and_does_not_brick() {
         Some((2, "a".to_string())),
         "the update's after-image is the NEW tuple (id=2), stream not bricked"
     );
+}
+
+// CdcScenario's own live smoke — and the usage pattern for every future CDC
+// test: setup (table+guard+rig+PIN) is one constructor call, so the
+// idle-anchor discipline is inherited by construction, not by review.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_scenario_smoke_pin_churn_drain() {
+    let mut scn = CdcScenario::mysql("cdc_scn_smoke", "id INT PRIMARY KEY, v BIGINT");
+    scn.sql(&format!(
+        "INSERT INTO {} VALUES (1, 10), (2, 20), (3, 30)",
+        scn.table
+    ));
+    let rows: usize = scn.drain_and_read().iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 3, "pin → churn → drain captures exactly the churn");
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres-cdc (wal_level=logical)"]
+fn cdc_scenario_smoke_pg() {
+    let mut scn = CdcScenario::pg("cdc_scn_pg", "id INT PRIMARY KEY, v BIGINT");
+    scn.sql(&format!(
+        "INSERT INTO {} VALUES (1, 10), (2, 20)",
+        scn.table
+    ));
+    let rows: usize = scn.drain_and_read().iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 2, "pg scenario: pin → churn → drain");
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mssql-cdc"]
+fn cdc_scenario_smoke_mssql() {
+    let mut scn = CdcScenario::mssql("cdc_scn_ms", "id INT PRIMARY KEY, v BIGINT");
+    scn.sql(&format!(
+        "INSERT INTO dbo.{} VALUES (1, 10), (2, 20)",
+        scn.table
+    ));
+    // The capture job is asynchronous — poll the drain until the rows land.
+    let mut rows = 0usize;
+    for _ in 0..15 {
+        rows += scn
+            .drain_and_read()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum::<usize>();
+        if rows >= 2 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    assert_eq!(rows, 2, "mssql scenario: pin → churn → drain (job-lagged)");
 }

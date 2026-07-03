@@ -16,6 +16,7 @@ use std::collections::HashSet;
 use arrow::array::{Array, Decimal128Array, Int64Array};
 use mysql::prelude::Queryable;
 
+use crate::common::MysqlCdcTable as Table;
 use crate::common::*;
 
 fn conn() -> mysql::PooledConn {
@@ -23,17 +24,6 @@ fn conn() -> mysql::PooledConn {
         .expect("mysql pool")
         .get_conn()
         .expect("mysql conn")
-}
-
-struct Table(String);
-impl Drop for Table {
-    fn drop(&mut self) {
-        if let Ok(pool) = mysql::Pool::new(MYSQL_CDC_URL)
-            && let Ok(mut c) = pool.get_conn()
-        {
-            let _ = c.query_drop(format!("DROP TABLE IF EXISTS {}", self.0));
-        }
-    }
 }
 
 /// (row_count, Σ unscaled cents of `amount`, distinct ids) over every part in `dir`.
@@ -109,25 +99,15 @@ fn batch_full_to_incremental_switch_golden_math() {
     insert(&mut c, 1, 40);
 
     // Same config DIR (⇒ same state DB / export name) — only mode+dest differ.
-    let stage_cfg = |mode: &str, out: &std::path::Path| -> std::path::PathBuf {
-        let cursor = if mode == "incremental" {
-            "\n    cursor_column: id"
-        } else {
-            ""
-        };
-        std::fs::create_dir_all(out).unwrap();
-        let yaml = format!(
-            r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: {mode}{cursor}
-    format: parquet
-    destination: {{ type: local, path: "{o}" }}
-"#,
-            o = out.display(),
-        );
-        write_config(&d, &yaml)
+    let stage_cfg = |mode: &'static str, out: &std::path::Path| -> std::path::PathBuf {
+        let mut rig = Rig::mysql_batch(&tbl)
+            .source_url(MYSQL_CDC_URL)
+            .mode(mode)
+            .dest_path(out.to_path_buf());
+        if mode == "incremental" {
+            rig = rig.export_line("cursor_column: id");
+        }
+        write_config(&d, &rig.yaml())
     };
 
     let out_full = d.path().join("full");
@@ -190,20 +170,12 @@ fn batch_incremental_datetime_cursor_captures_updates_golden_math() {
         .unwrap();
 
     let stage_cfg = |out: &std::path::Path| -> std::path::PathBuf {
-        std::fs::create_dir_all(out).unwrap();
-        let yaml = format!(
-            r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: incremental
-    cursor_column: updated_at
-    format: parquet
-    destination: {{ type: local, path: "{o}" }}
-"#,
-            o = out.display(),
-        );
-        write_config(&d, &yaml)
+        let rig = Rig::mysql_batch(&tbl)
+            .source_url(MYSQL_CDC_URL)
+            .mode("incremental")
+            .export_line("cursor_column: updated_at")
+            .dest_path(out.to_path_buf());
+        write_config(&d, &rig.yaml())
     };
 
     let out1 = d.path().join("r1");

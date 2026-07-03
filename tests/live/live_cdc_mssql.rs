@@ -27,27 +27,6 @@ fn enable_cdc(table: &str, ci: &str) {
     ));
 }
 
-/// Drops the capture instance + the table on teardown (a CDC-tracked table can't
-/// just be dropped — its change table would be orphaned). Panic-safe in `Drop`.
-struct CdcTable {
-    table: String,
-    ci: String,
-}
-impl Drop for CdcTable {
-    fn drop(&mut self) {
-        let (table, ci) = (self.table.clone(), self.ci.clone());
-        let _ = std::panic::catch_unwind(move || {
-            mssql_cdc_exec(&format!(
-                "IF EXISTS(SELECT 1 FROM cdc.change_tables ct JOIN sys.tables t \
-                   ON ct.source_object_id=t.object_id WHERE t.name='{table}') \
-                 EXEC sys.sp_cdc_disable_table @source_schema=N'dbo', @source_name=N'{table}', \
-                 @capture_instance=N'{ci}';"
-            ));
-            mssql_cdc_drop_table(&format!("dbo.{table}"));
-        });
-    }
-}
-
 /// Block until the capture job has copied at least `want` rows into the change
 /// table — the job runs asynchronously, so the test must wait for it.
 fn wait_for_capture(ci: &str, want: i64) {
@@ -67,38 +46,11 @@ fn mssql_cdc_config(
     ckpt: &std::path::Path,
     out: &std::path::Path,
 ) -> std::path::PathBuf {
-    let yaml = format!(
-        r#"source: {{type: mssql, url: "{MSSQL_CDC_URL}"}}
-exports:
-  - name: {table}
-    table: {table}
-    mode: cdc
-    format: parquet
-    cdc: {{ capture_instance: {ci}, checkpoint: "{ckpt}" }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        ckpt = ckpt.display(),
-        out = out.display(),
-    );
+    let yaml = Rig::mssql_cdc(table, ci)
+        .checkpoint_path(ckpt.to_path_buf())
+        .dest_path(out.to_path_buf())
+        .yaml();
     write_config(d, &yaml)
-}
-
-fn run_cdc(cfg: &std::path::Path) {
-    let out = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", cfg.to_str().unwrap()])
-        .output()
-        .expect("spawn rivet");
-    assert!(
-        out.status.success(),
-        "rivet run (cdc) failed:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-fn manifest_rows(out: &std::path::Path) -> i64 {
-    let body = std::fs::read_to_string(out.join("manifest.json")).expect("manifest.json");
-    let m: serde_json::Value = serde_json::from_str(&body).unwrap();
-    m["row_count"].as_i64().expect("row_count")
 }
 
 #[test]
@@ -113,7 +65,7 @@ fn mssql_cdc_resume_captures_only_new_changes() {
         "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT)"
     ));
     enable_cdc(&table, &ci);
-    let _guard = CdcTable {
+    let _guard = MssqlCdcTable {
         table: table.clone(),
         ci: ci.clone(),
     };
@@ -123,7 +75,7 @@ fn mssql_cdc_resume_captures_only_new_changes() {
     wait_for_capture(&ci, 2);
     let out1 = d.path().join("out1");
     std::fs::create_dir_all(&out1).unwrap();
-    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out1));
+    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out1));
     assert_eq!(manifest_rows(&out1), 2, "run 1 captures the 2 changes");
 
     // Resume: the checkpoint advanced past the first two, so run 2 must capture ONLY
@@ -132,7 +84,7 @@ fn mssql_cdc_resume_captures_only_new_changes() {
     wait_for_capture(&ci, 4);
     let out2 = d.path().join("out2");
     std::fs::create_dir_all(&out2).unwrap();
-    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out2));
+    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out2));
     assert_eq!(
         manifest_rows(&out2),
         2,
@@ -158,7 +110,7 @@ fn mssql_cdc_idle_first_run_then_change_is_captured_not_skipped() {
         "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT)"
     ));
     enable_cdc(&table, &ci);
-    let _guard = CdcTable {
+    let _guard = MssqlCdcTable {
         table: table.clone(),
         ci: ci.clone(),
     };
@@ -167,7 +119,7 @@ fn mssql_cdc_idle_first_run_then_change_is_captured_not_skipped() {
     let ckpt = d.path().join("cdc.ckpt");
     let out1 = d.path().join("out1");
     std::fs::create_dir_all(&out1).unwrap();
-    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out1));
+    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out1));
     assert_eq!(manifest_rows(&out1), 0, "idle run 1 captures nothing");
 
     // A change lands BETWEEN the idle run and the next scheduler cycle.
@@ -177,7 +129,7 @@ fn mssql_cdc_idle_first_run_then_change_is_captured_not_skipped() {
     // Run 2 must capture it — never skip past it to the current max LSN.
     let out2 = d.path().join("out2");
     std::fs::create_dir_all(&out2).unwrap();
-    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out2));
+    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out2));
     assert_eq!(
         manifest_rows(&out2),
         1,
@@ -202,11 +154,11 @@ fn mssql_cdc_mixed_transaction_and_qualified_table_conformance() {
     }
     enable_cdc(&orders, &ci_o);
     enable_cdc(&audit, &ci_a);
-    let _g1 = CdcTable {
+    let _g1 = MssqlCdcTable {
         table: orders.clone(),
         ci: ci_o.clone(),
     };
-    let _g2 = CdcTable {
+    let _g2 = MssqlCdcTable {
         table: audit.clone(),
         ci: ci_a.clone(),
     };
@@ -225,11 +177,11 @@ fn mssql_cdc_mixed_transaction_and_qualified_table_conformance() {
     std::fs::create_dir_all(&out1).unwrap();
     std::fs::create_dir_all(&out2).unwrap();
     let qualified = format!("dbo.{orders}");
-    run_cdc(&mssql_cdc_config(&d, &qualified, &ci_o, &ckpt, &out1));
+    run_rivet_ok(&mssql_cdc_config(&d, &qualified, &ci_o, &ckpt, &out1));
     assert_eq!(manifest_rows(&out1), 1, "qualified table: must capture");
 
     // And the checkpoint advanced past the mixed transaction.
-    run_cdc(&mssql_cdc_config(&d, &qualified, &ci_o, &ckpt, &out2));
+    run_rivet_ok(&mssql_cdc_config(&d, &qualified, &ci_o, &ckpt, &out2));
     assert_eq!(
         manifest_rows(&out2),
         0,
@@ -259,7 +211,7 @@ fn gremlin_mssql_capture_job_stall_loses_nothing() {
         "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT)"
     ));
     enable_cdc(&table, &ci);
-    let _guard = CdcTable {
+    let _guard = MssqlCdcTable {
         table: table.clone(),
         ci: ci.clone(),
     };
@@ -268,7 +220,7 @@ fn gremlin_mssql_capture_job_stall_loses_nothing() {
     wait_for_capture(&ci, 1);
     let out1 = d.path().join("out1");
     std::fs::create_dir_all(&out1).unwrap();
-    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out1));
+    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out1));
     assert_eq!(manifest_rows(&out1), 1);
 
     // Stall the capture job: DISABLE it (so the scheduler cannot restart it)
@@ -319,7 +271,7 @@ fn gremlin_mssql_capture_job_stall_loses_nothing() {
     // 0-row run, never an advance past the uncaptured changes.
     let out2 = d.path().join("out2");
     std::fs::create_dir_all(&out2).unwrap();
-    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out2));
+    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out2));
     assert_eq!(manifest_rows(&out2), 0, "stalled job ⇒ nothing new visible");
 
     // Job back: the changes must ALL appear on the next run.
@@ -342,7 +294,7 @@ fn gremlin_mssql_capture_job_stall_loses_nothing() {
     }
     let out3 = d.path().join("out3");
     std::fs::create_dir_all(&out3).unwrap();
-    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out3));
+    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out3));
     assert_eq!(
         manifest_rows(&out3),
         2,
@@ -366,7 +318,7 @@ fn mssql_cdc_update_and_delete_carry_full_types() {
          dt2 DATETIME2, u UNIQUEIDENTIFIER, vb VARBINARY(8), m MONEY, note NVARCHAR(50))"
     ));
     enable_cdc(&table, &ci);
-    let _guard = CdcTable {
+    let _guard = MssqlCdcTable {
         table: table.clone(),
         ci: ci.clone(),
     };
@@ -378,7 +330,7 @@ fn mssql_cdc_update_and_delete_carry_full_types() {
     wait_for_capture(&ci, 1);
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out));
+    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out));
 
     mssql_cdc_exec(&format!(
         "UPDATE dbo.{table} SET amount=99999999999999.9999, \
@@ -390,8 +342,8 @@ fn mssql_cdc_update_and_delete_carry_full_types() {
     let batch_out = d.path().join("batch");
     std::fs::create_dir_all(&upd_out).unwrap();
     std::fs::create_dir_all(&batch_out).unwrap();
-    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &upd_out));
-    run_cdc(&mssql_full_config(&d, &table, &batch_out));
+    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &upd_out));
+    run_rivet_ok(&mssql_full_config(&d, &table, &batch_out));
     let upd = read_one_batch(&upd_out);
     assert_eq!(upd.num_rows(), 1, "exactly the update after-image");
     let batch = read_one_batch(&batch_out);
@@ -410,7 +362,7 @@ fn mssql_cdc_update_and_delete_carry_full_types() {
     wait_for_capture(&ci, 4);
     let del_out = d.path().join("del");
     std::fs::create_dir_all(&del_out).unwrap();
-    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &del_out));
+    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &del_out));
     let del = read_one_batch(&del_out);
     assert_eq!(del.num_rows(), 1);
     use arrow::array::Int32Array;
@@ -438,32 +390,20 @@ fn mssql_cdc_initial_snapshot_covers_preexisting_rows_then_streams() {
         "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT)"
     ));
     enable_cdc(&table, &ci);
-    let _guard = CdcTable {
+    let _guard = MssqlCdcTable {
         table: table.clone(),
         ci: ci.clone(),
     };
     mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (1,10),(2,20)"));
     wait_for_capture(&ci, 2);
 
-    let out = d.path().join("out");
-    let ckpt = d.path().join("cdc.ckpt");
-    std::fs::create_dir_all(&out).unwrap();
-    let yaml = format!(
-        r#"source: {{type: mssql, url: "{MSSQL_CDC_URL}"}}
-exports:
-  - name: {table}
-    table: {table}
-    mode: cdc
-    format: parquet
-    cdc: {{ initial: snapshot, capture_instance: {ci}, checkpoint: "{ckpt}", until_current: true }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        ckpt = ckpt.display(),
-        out = out.display(),
-    );
-    let cfg = write_config(&d, &yaml);
+    let rig = Rig::mssql_cdc(&table, &ci)
+        .cdc("initial: snapshot")
+        .cdc("until_current: true");
+    let out = rig.out_dir();
+    let cfg = write_config(&d, &rig.yaml());
 
-    run_cdc(&cfg);
+    run_rivet_ok(&cfg);
     assert_eq!(manifest_rows(&out.join("snapshot")), 2);
     assert_eq!(
         manifest_rows(&out),
@@ -473,7 +413,7 @@ exports:
 
     mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (3,30)"));
     wait_for_capture(&ci, 3);
-    run_cdc(&cfg);
+    run_rivet_ok(&cfg);
     assert_eq!(manifest_rows(&out), 1, "the post-snapshot change streams");
 }
 
@@ -495,7 +435,7 @@ fn mssql_money_values_survive_batch_and_cdc() {
         "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, m MONEY, sm SMALLMONEY)"
     ));
     enable_cdc(&table, &ci);
-    let _guard = CdcTable {
+    let _guard = MssqlCdcTable {
         table: table.clone(),
         ci: ci.clone(),
     };
@@ -509,8 +449,8 @@ fn mssql_money_values_survive_batch_and_cdc() {
     let batch_out = d.path().join("batch");
     std::fs::create_dir_all(&cdc_out).unwrap();
     std::fs::create_dir_all(&batch_out).unwrap();
-    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &cdc_out));
-    run_cdc(&mssql_full_config(&d, &table, &batch_out));
+    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &cdc_out));
+    run_rivet_ok(&mssql_full_config(&d, &table, &batch_out));
 
     // Value-level check against the SOURCE literal (NULL == NULL between the
     // two exports would mask the loss — that is exactly how it hid).
@@ -567,7 +507,7 @@ fn mssql_cdc_capture_instance_name_must_not_decide_the_table() {
         "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT)"
     ));
     enable_cdc(&table, &ci);
-    let _guard = CdcTable {
+    let _guard = MssqlCdcTable {
         table: table.clone(),
         ci: ci.clone(),
     };
@@ -577,7 +517,7 @@ fn mssql_cdc_capture_instance_name_must_not_decide_the_table() {
     wait_for_capture(&ci, 2);
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out));
+    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out));
     assert_eq!(
         manifest_rows(&out),
         2,
@@ -602,7 +542,7 @@ fn mssql_cdc_crash_before_checkpoint_re_reads_on_resume() {
         "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT)"
     ));
     enable_cdc(&table, &ci);
-    let _guard = CdcTable {
+    let _guard = MssqlCdcTable {
         table: table.clone(),
         ci: ci.clone(),
     };
@@ -613,7 +553,7 @@ fn mssql_cdc_crash_before_checkpoint_re_reads_on_resume() {
     wait_for_capture(&ci, 2);
     let out1 = d.path().join("out1");
     std::fs::create_dir_all(&out1).unwrap();
-    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out1));
+    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out1));
     assert_eq!(manifest_rows(&out1), 2);
 
     // Two more changes; run crashes after the part is durable, before the checkpoint.
@@ -641,7 +581,7 @@ fn mssql_cdc_crash_before_checkpoint_re_reads_on_resume() {
     // not lost (would be 0 if the checkpoint had advanced) and not all four.
     let out2 = d.path().join("out2");
     std::fs::create_dir_all(&out2).unwrap();
-    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out2));
+    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out2));
     assert_eq!(
         manifest_rows(&out2),
         2,
@@ -664,7 +604,7 @@ fn mssql_cdc_datetimeoffset_value_is_preserved() {
         "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, dto DATETIMEOFFSET)"
     ));
     enable_cdc(&table, &ci);
-    let _guard = CdcTable {
+    let _guard = MssqlCdcTable {
         table: table.clone(),
         ci: ci.clone(),
     };
@@ -676,7 +616,7 @@ fn mssql_cdc_datetimeoffset_value_is_preserved() {
     wait_for_capture(&ci, 1);
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out));
+    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out));
 
     // tz-aware Timestamp carrying the UTC instant (10:00 +05:30 → 04:30:00 UTC).
     let dto = parquet_one_timestamp(&out, "dto");
@@ -742,7 +682,7 @@ fn mssql_cdc_uniqueidentifier_value_is_preserved() {
         "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, u UNIQUEIDENTIFIER)"
     ));
     enable_cdc(&table, &ci);
-    let _guard = CdcTable {
+    let _guard = MssqlCdcTable {
         table: table.clone(),
         ci: ci.clone(),
     };
@@ -753,7 +693,7 @@ fn mssql_cdc_uniqueidentifier_value_is_preserved() {
     wait_for_capture(&ci, 1);
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out));
+    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out));
     assert!(
         parquet_col0_present(&out, "u"),
         "uniqueidentifier must be captured (16 canonical bytes), not dropped to NULL"
@@ -765,35 +705,12 @@ fn mssql_full_config(
     table: &str,
     out: &std::path::Path,
 ) -> std::path::PathBuf {
-    let yaml = format!(
-        r#"source: {{type: mssql, url: "{MSSQL_CDC_URL}", tls: {{accept_invalid_certs: true}}}}
-exports:
-  - name: {table}_batch
-    query: "SELECT * FROM dbo.{table}"
-    mode: full
-    format: parquet
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        out = out.display(),
-    );
+    let yaml = Rig::mssql_batch(&format!("{table}_batch"))
+        .source_url(MSSQL_CDC_URL)
+        .query(&format!("SELECT * FROM dbo.{table}"))
+        .dest_path(out.to_path_buf())
+        .yaml();
     write_config(d, &yaml)
-}
-
-/// The single `.parquet` part under `dir`, read as one RecordBatch.
-fn read_one_batch(dir: &std::path::Path) -> arrow::record_batch::RecordBatch {
-    let part = std::fs::read_dir(dir)
-        .unwrap()
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .find(|p| p.extension().is_some_and(|x| x == "parquet"))
-        .expect("a .parquet part");
-    let f = std::fs::File::open(part).unwrap();
-    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
-        .unwrap()
-        .build()
-        .unwrap()
-        .next()
-        .expect("a row")
-        .unwrap()
 }
 
 #[test]
@@ -818,7 +735,7 @@ fn mssql_cdc_full_type_matrix_matches_batch() {
          fb BINARY(8), num NUMERIC(10,3), m MONEY, sm SMALLMONEY)"
     ));
     enable_cdc(&table, &ci);
-    let _guard = CdcTable {
+    let _guard = MssqlCdcTable {
         table: table.clone(),
         ci: ci.clone(),
     };
@@ -837,8 +754,8 @@ fn mssql_cdc_full_type_matrix_matches_batch() {
     let batch_out = d.path().join("batch");
     std::fs::create_dir_all(&cdc_out).unwrap();
     std::fs::create_dir_all(&batch_out).unwrap();
-    run_cdc(&mssql_cdc_config(&d, &table, &ci, &ckpt, &cdc_out));
-    run_cdc(&mssql_full_config(&d, &table, &batch_out));
+    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &cdc_out));
+    run_rivet_ok(&mssql_full_config(&d, &table, &batch_out));
 
     let batch = read_one_batch(&batch_out);
     let cdc = read_one_batch(&cdc_out);
@@ -874,7 +791,7 @@ fn mssql_cdc_resume_past_retention_errors_not_a_silent_gap() {
         "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT)"
     ));
     enable_cdc(&table, &ci);
-    let _guard = CdcTable {
+    let _guard = MssqlCdcTable {
         table: table.clone(),
         ci: ci.clone(),
     };
