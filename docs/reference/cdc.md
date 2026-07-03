@@ -90,7 +90,9 @@ snapshot read, a change landing mid-snapshot appears in **both** the snapshot
 and the stream — an overlap the PK + `__op` dedupe absorbs, never a gap.
 Subsequent runs see the `snapshot/_SUCCESS` marker and go straight to draining;
 a run that crashes mid-snapshot re-snapshots on retry (the anchor stays put, so
-nothing is lost). Load order downstream: the snapshot prefix as the base table,
+nothing is lost). Once any snapshot completed, a MISSING server-side anchor
+(a dropped PostgreSQL slot) is a loud error, never a silent re-anchor — see
+"A vanished slot" below. Load order downstream: the snapshot prefix as the base table,
 then MERGE the CDC parts. MySQL / SQL Server require `cdc.checkpoint:` with
 `initial: snapshot` (it is the anchor); PostgreSQL anchors in the slot.
 
@@ -484,6 +486,14 @@ behaviour depends on whether rivet is **running**:
 - **Source disk already full** — run rivet (it *reads* WAL to advance the slot,
   which **releases** WAL and relieves the pressure) or drop the slot. If PostgreSQL
   is too degraded to answer, rivet's query fails → the run fails → re-read next run.
+
+**The value checksum runs on CDC too.** The same always-on two-ended check the
+batch export performs — an independent fold of the decoded cells vs a fold of
+the built Arrow column — runs per column before every CDC part is written; a
+mismatch fails the run naming the column, never writes the corrupted part.
+Failure behaviour is also parity: a value unrepresentable in the declared
+column (PostgreSQL `'NaN'::numeric` in a Parquet decimal) fails loudly on both
+paths, never a silent NULL.
 
 **A vanished slot is a loud error, not a silent restart.** When a resume
 checkpoint exists but the slot is gone (dropped by an operator, or invalidated
