@@ -107,7 +107,7 @@ pub fn decimal_str_to_scaled_i128(s: &str, scale: i8) -> Option<i128> {
         // scale=2 and a DB value arrives with more digits, that is either a
         // type mismatch or a DB rounding artefact — we preserve the declared
         // scale rather than silently extending it.
-        frac_part[..scale_u as usize].parse().ok()?
+        frac_part.get(..scale_u as usize)?.parse().ok()?
     };
 
     let scale_factor = 10i128.pow(scale_u);
@@ -159,7 +159,7 @@ pub fn decimal_str_to_scaled_i256(s: &str, scale: i8) -> Option<i256> {
         }
         i256::from_string(&buf)?
     } else {
-        i256::from_string(&frac_part[..scale_u as usize])?
+        i256::from_string(frac_part.get(..scale_u as usize)?)?
     };
 
     let scale_factor = pow10_i256(scale_u)?;
@@ -361,5 +361,39 @@ mod tests {
         }
         assert!(pow10_i256(76).is_some(), "10^76 fits i256");
         assert!(pow10_i256(77).is_none(), "10^77 overflows i256 → None");
+    }
+}
+
+#[cfg(test)]
+mod fuzz {
+    use super::*;
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: 256, ..Default::default()
+        })]
+
+        // Total on arbitrary text; EXACT on well-formed digit strings — the
+        // one decimal canon must scale int_part·10^s + frac verbatim.
+        #[test]
+        fn decimal_parsers_total_and_exact(
+            junk in ".{0,60}",
+            int_part in 0u64..1_000_000_000_000,
+            frac in 0u32..10_000,
+            neg in proptest::prelude::any::<bool>(),
+        ) {
+            let _ = decimal_str_to_scaled_i128(&junk, 4);
+            let _ = decimal_str_to_scaled_i256(&junk, 4);
+            let s = format!("{}{}.{:04}", if neg { "-" } else { "" }, int_part, frac);
+            let expect = {
+                let mag = int_part as i128 * 10_000 + frac as i128;
+                if neg { -mag } else { mag }
+            };
+            proptest::prop_assert_eq!(decimal_str_to_scaled_i128(&s, 4), Some(expect));
+            proptest::prop_assert_eq!(
+                decimal_str_to_scaled_i256(&s, 4),
+                Some(arrow::datatypes::i256::from_i128(expect))
+            );
+        }
     }
 }

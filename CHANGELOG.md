@@ -12,6 +12,21 @@
   encoding shared by both sides; a new accessor per engine, enforced at compile time). An offline matrix
   guard pins the CDC fold to the builder across every covered type with hostile cells (overflow
   narrowing, wrong-width binary, arrays with inner NULLs, NaN, u64::MAX, 50-digit decimals).
+- **Staff-review test program: seven verification classes added in one pass.** (1) Concurrent-writer
+  model-based test — 4 threads × 250 randomized ops over shared keys; conservation (events == the
+  writers' affected-row counts) and convergence (the documented merge reproduces the source's exact
+  final state) under real interleaving. (2) Fault-point sweep — behavior-neutral hooks at every CDC
+  phase boundary + one parametrized test walking all of them (loud failure, gap-free recovery).
+  (3) Engine-version matrix — compose tags parametrized (`MYSQL_CDC_TAG`/`POSTGRES_CDC_TAG`) + a
+  nightly scout lane (MySQL 8.4/5.7, PG 13/17; findings, not blockers). (4) Artifact-compatibility
+  gate — v0.16 checkpoints/manifest/parquet committed as fixtures, parsed by every future binary.
+  (5) CDC soak (`scripts/soak_cdc.sh` + weekly CI): scheduler-style churn loop with gap and RSS-trend
+  assertions (54-cycle smoke: 10,800/10,800 ids, RSS flat). (6) Generative parser fuzzing (proptest,
+  stable toolchain): wire-facing parsers total on arbitrary input, exact on well-formed; **it caught a
+  real panic within its first run** — the shared decimal canon byte-sliced inside a multibyte UTF-8
+  char (`&frac[..4]` on emoji), so corrupt decimal wire text would crash the export; now rejects
+  gracefully. (7) Observability contracts — `rivet doctor --json` must SEE the gremlins' fault states
+  (purged-binlog checkpoint flagged; healthy baseline green).
 - **CDC golden suite: hand-calculated metrics over the batch fixture schemas.** The matrices prove
   CDC == batch; the goldens anchor CDC to ARITHMETIC — a deterministic insert/update/delete workload
   over golden copies of eight real batch-fixture schemas (decimal money, char(36) uuids,

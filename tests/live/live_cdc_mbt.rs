@@ -376,3 +376,81 @@ fn distinct_int_ids(out: &std::path::Path) -> std::collections::HashSet<i64> {
     }
     ids
 }
+
+// Staff class #7 — OBSERVABILITY contracts: it is not enough that a fault
+// state fails loudly at run time; the operator's standing sensor (`rivet
+// doctor`) must SEE it before/without a run. One fault state per engine
+// sensor family, asserted against doctor --json.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn doctor_sees_the_fault_states_the_gremlins_create() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_obs");
+    let mut c = mysql::Pool::new(MYSQL_CDC_URL)
+        .expect("pool")
+        .get_conn()
+        .expect("conn");
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let _guard = Table(tbl.clone());
+
+    // Fault state: a checkpoint pointing at a PURGED binlog file — the
+    // stalled/expired-resume condition the retention gremlins create.
+    let ckpt = d.path().join("cdc.ckpt");
+    std::fs::write(&ckpt, r#"{"file":"binlog.000000","pos":4}"#).unwrap();
+    // (binlog.000000 never exists — MySQL numbering starts at 000001 — so
+    // this is the purged-past-retention state regardless of instance age;
+    // the first attempt used 000001 and doctor CORRECTLY reported it healthy,
+    // because the shared instance still retains its first file.)
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let yaml = format!(
+        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
+exports:
+  - name: {tbl}
+    table: {tbl}
+    mode: cdc
+    format: parquet
+    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        ckpt = ckpt.display(),
+        out = out.display(),
+        sid = server_id_for(&tbl),
+    );
+    let cfg = write_config(&d, &yaml);
+
+    let doc = std::process::Command::new(RIVET_BIN)
+        .args(["doctor", "--config", cfg.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let j: serde_json::Value = serde_json::from_slice(&doc.stdout).expect("doctor --json parses");
+    let checks = j["checks"].as_array().expect("checks array");
+    // The sensor contract: SOME cdc check must be non-ok and name the binlog
+    // retention/checkpoint problem — the operator alerts on all_ok=false.
+    assert_eq!(
+        j["all_ok"], false,
+        "doctor must flag a checkpoint behind retention: {j}"
+    );
+    let flagged = checks.iter().any(|ch| {
+        ch["ok"] == false
+            && ch["name"]
+                .as_str()
+                .is_some_and(|n| n.contains("cdc") || n.contains("binlog"))
+    });
+    assert!(
+        flagged,
+        "a cdc/binlog-named check must carry the failure: {j}"
+    );
+
+    // And the healthy baseline: with a fresh checkpoint doctor is green again
+    // (the sensor has no stuck-at-fail failure mode).
+    std::fs::remove_file(&ckpt).unwrap();
+    let doc = std::process::Command::new(RIVET_BIN)
+        .args(["doctor", "--config", cfg.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let j: serde_json::Value = serde_json::from_slice(&doc.stdout).expect("doctor --json parses");
+    assert_eq!(j["all_ok"], true, "healthy state must read green: {j}");
+}

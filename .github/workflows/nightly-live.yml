@@ -218,3 +218,71 @@ jobs:
         with:
           name: mutants-out
           path: mutants.out
+
+  # Version-matrix scout lane (staff class #3): the CDC conformance subset
+  # against non-default engine tags. continue-on-error — a red cell here is a
+  # FINDING to triage (e.g. MySQL 8.4 removed SHOW MASTER STATUS), not a
+  # blocker; promote a tag to the main lane once green.
+  cdc-version-scout:
+    name: CDC vs ${{ matrix.engine }}:${{ matrix.tag }}
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { engine: mysql, tag: "8.4", env: MYSQL_CDC_TAG }
+          - { engine: mysql, tag: "5.7", env: MYSQL_CDC_TAG }
+          - { engine: postgres, tag: "13", env: POSTGRES_CDC_TAG }
+          - { engine: postgres, tag: "17", env: POSTGRES_CDC_TAG }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start the CDC stack at the scouted tag
+        run: |
+          export ${{ matrix.env }}=${{ matrix.tag }}
+          docker compose --profile cdc up -d mysql-cdc postgres-cdc
+      - name: Conformance subset
+        run: |
+          if [ "${{ matrix.engine }}" = "mysql" ]; then
+            FILTER="live_cdc::cdc_"
+          else
+            FILTER="live_cdc::pg_cdc_"
+          fi
+          cargo test --test live_suite -- --ignored "$FILTER" \
+            --skip gcs --skip toxiproxy 2>&1 | tail -20
+      - name: Stop services
+        if: always()
+        run: docker compose down -v
+
+  # Weekly 45-minute CDC soak (staff class #5): scheduler-style bounded runs
+  # against continuous churn; asserts zero gaps across the whole window and a
+  # flat RSS trend (last-quarter peak <= 1.5x first-quarter). Sundays only —
+  # gate on the schedule day so the nightly stays fast.
+  soak-cdc:
+    name: CDC soak (weekly)
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sunday gate
+        id: day
+        run: echo "sunday=$([ "$(date -u +%u)" = "7" ] && echo yes || echo no)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.day.outputs.sunday == 'yes'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.day.outputs.sunday == 'yes'
+      - name: Start CDC stack
+        if: steps.day.outputs.sunday == 'yes'
+        run: docker compose --profile cdc up -d mysql-cdc
+      - name: Build + soak 45m
+        if: steps.day.outputs.sunday == 'yes'
+        run: |
+          sudo apt-get install -y duckdb 2>/dev/null || true
+          cargo build --release
+          scripts/soak_cdc.sh 45 target/release/rivet
+      - name: Stop services
+        if: always()
+        run: docker compose down -v

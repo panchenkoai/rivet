@@ -510,6 +510,86 @@ mod tests {
     const CONN: &str = "postgresql://rivet:rivet@127.0.0.1:5434/rivet";
     const SLOT: &str = "rivet_cdc_test";
 
+    // Staff class #6 (generative fuzz, stable-toolchain flavour): the parsers
+    // that face WIRE TEXT must never panic on arbitrary input — they return
+    // Option/skip, loudly or silently, but never bring the stream down. The
+    // timestamptz-offset and array-escape bugs were classic fuzz shapes; this
+    // keeps a generative net under every future parser edit.
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: 256, ..Default::default()
+        })]
+
+        #[test]
+        fn parse_test_decoding_never_panics(s in ".{0,200}") {
+            let _ = parse_test_decoding("0/ABC", &s);
+        }
+
+        #[test]
+        fn map_pg_value_never_panics(
+            typ in "[a-z ]{1,20}(\\[\\])?",
+            val in ".{0,120}",
+            quoted in proptest::prelude::any::<bool>(),
+        ) {
+            let _ = map_pg_value(&typ, &val, quoted);
+        }
+
+        #[test]
+        fn pg_timestamp_parse_total_and_offset_correct(
+            h in 0u32..24, mi in 0u32..60, sec in 0u32..60,
+            off_h in -12i32..=14, junk in ".{0,40}",
+        ) {
+            // Total on junk:
+            let _ = parse_pg_timestamp(&junk);
+            // Correct on every well-formed offset rendering:
+            let rendered = format!("2024-06-15 {h:02}:{mi:02}:{sec:02}{off_h:+03}");
+            if let RivetValue::DateTime(dt) = parse_pg_timestamp(&rendered) {
+                let wall = chrono::NaiveDate::from_ymd_opt(2024, 6, 15)
+                    .unwrap()
+                    .and_hms_opt(h, mi, sec)
+                    .unwrap();
+                let expect = wall - chrono::Duration::hours(off_h as i64);
+                proptest::prop_assert_eq!(dt, expect);
+            } else {
+                proptest::prop_assert!(false, "well-formed rendering must parse: {}", rendered);
+            }
+        }
+
+        #[test]
+        fn array_literal_roundtrips_arbitrary_text_elements(
+            elems in proptest::collection::vec(
+                proptest::option::of("[^\u{0}]{0,24}"), 0..6
+            )
+        ) {
+            // Render the PG literal the way test_decoding would (quote +
+            // escape every non-NULL element), parse, and require the exact
+            // element vector back — inner NULLs included.
+            let body: Vec<String> = elems
+                .iter()
+                .map(|e| match e {
+                    None => "NULL".to_string(),
+                    Some(t) => format!(
+                        "\"{}\"",
+                        t.replace('\\', "\\\\").replace('"', "\\\"")
+                    ),
+                })
+                .collect();
+            let lit = format!("{{{}}}", body.join(","));
+            let parsed = parse_pg_array_literal("text", &lit)
+                .expect("a rendered literal always parses");
+            proptest::prop_assert_eq!(parsed.len(), elems.len());
+            for (p, e) in parsed.iter().zip(&elems) {
+                match (p, e) {
+                    (RivetValue::Null, None) => {}
+                    (RivetValue::Bytes(b), Some(t)) => {
+                        proptest::prop_assert_eq!(b.as_slice(), t.as_bytes())
+                    }
+                    other => proptest::prop_assert!(false, "mismatch: {:?}", other),
+                }
+            }
+        }
+    }
+
     // RED for finding #24 (non-UTC session): test_decoding renders timestamptz
     // in the POLLING SESSION's zone — at a Tokyo session '03:00Z' renders as
     // '2024-06-15 12:00:00+09'. The parser stripped the offset and treated the

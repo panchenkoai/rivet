@@ -146,6 +146,24 @@ const CASES: &[(&str, Expect, Expect, Expect)] = &[
         NA("same shared Position::save path; pinned once on MySQL"),
     ),
     (
+        "concurrent_writers_mbt",
+        Test("fn cdc_concurrent_writers_capture_converges_to_source_state"),
+        NA(
+            "interleaving pressure is anchored on the client engine; the sink \
+            merge logic under test is shared",
+        ),
+        NA("same shared merge; MSSQL's change-table ordering is server-side"),
+    ),
+    (
+        "fault_point_sweep",
+        Test("fn cdc_fault_point_sweep_every_phase_boundary_recovers"),
+        NA(
+            "the phase boundaries live in the shared sink/run_capture; swept \
+            once on the client engine",
+        ),
+        NA("same shared boundaries"),
+    ),
+    (
         "cross_oracle_full_surface",
         Test("fn cdc_full_surface_cross_oracle_matches_literals"),
         NA(
@@ -194,6 +212,7 @@ fn every_cdc_engine_covers_every_conformance_case() {
     mysql_pg.push_str(&fs::read_to_string(root.join("tests/live/gremlin_cdc.rs")).unwrap());
     mysql_pg.push_str(&fs::read_to_string(root.join("tests/live/live_cdc_golden.rs")).unwrap());
     mysql_pg.push_str(&fs::read_to_string(root.join("tests/live/live_cdc_oracle.rs")).unwrap());
+    mysql_pg.push_str(&fs::read_to_string(root.join("tests/live/live_cdc_mbt.rs")).unwrap());
     let mssql = fs::read_to_string(root.join("tests/live/live_cdc_mssql.rs")).unwrap();
 
     let mut missing = Vec::new();

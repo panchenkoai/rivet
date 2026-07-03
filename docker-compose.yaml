@@ -168,7 +168,7 @@ services:
   # shared port + 1: PostgreSQL 5434, MySQL 3307, SQL Server 1434. Brought up
   # with `docker compose --profile cdc up -d postgres-cdc mysql-cdc mssql-cdc`.
   postgres-cdc:
-    image: postgres:16
+    image: postgres:${POSTGRES_CDC_TAG:-16}
     profiles: ["cdc"]
     command: ["-c", "wal_level=logical", "-c", "max_replication_slots=32"]
     environment:
@@ -184,7 +184,9 @@ services:
       retries: 10
 
   mysql-cdc:
-    image: mysql:8.0
+    # Version-matrix knob (staff class #3): nightly runs the CDC
+    # conformance lane against other tags via MYSQL_CDC_TAG.
+    image: mysql:${MYSQL_CDC_TAG:-8.0}
     profiles: ["cdc"]
     # binlog is ON by default in MySQL 8 (ROW format); set a server id and grant
     # the REPLICATION privileges the binlog dump (`COM_BINLOG_DUMP`) needs.
