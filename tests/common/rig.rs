@@ -304,6 +304,53 @@ pub fn read_all_parts(dir: &Path) -> Vec<arrow::record_batch::RecordBatch> {
     out
 }
 
+/// Run rivet against an explicit config path; panic with stderr on failure.
+/// (One home for the run_cdc/run_ok copies four suites grew.)
+pub fn run_rivet_ok(cfg: &Path) {
+    let out = std::process::Command::new(RIVET_BIN)
+        .args(["run", "--config", cfg.to_str().unwrap()])
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        out.status.success(),
+        "rivet run failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `row_count` from the manifest under `out`.
+pub fn manifest_rows(out: &Path) -> i64 {
+    let body = std::fs::read_to_string(out.join("manifest.json")).expect("manifest.json");
+    let m: serde_json::Value = serde_json::from_str(&body).unwrap();
+    m["row_count"].as_i64().expect("row_count")
+}
+
+/// The single `.parquet` part under `dir`, read as one RecordBatch.
+pub fn read_one_batch(dir: &Path) -> arrow::record_batch::RecordBatch {
+    let part = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "parquet"))
+        .expect("a .parquet part");
+    let f = std::fs::File::open(part).unwrap();
+    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
+        .unwrap()
+        .build()
+        .unwrap()
+        .next()
+        .expect("a row")
+        .unwrap()
+}
+
+/// A connection to the mysql-cdc instance (the boilerplate 18 call sites
+/// hand-rolled).
+pub fn cdc_conn() -> mysql::PooledConn {
+    mysql::Pool::new(super::env::MYSQL_CDC_URL)
+        .expect("pool")
+        .get_conn()
+        .expect("conn")
+}
+
 #[cfg(test)]
 mod rig_render_goldens {
     use super::*;

@@ -217,15 +217,7 @@ fn null_ratio_max_gate_fails_when_exceeded() {
     ))
     .unwrap();
 
-    struct Cleanup(String);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            if let Ok(mut c) = postgres::Client::connect(POSTGRES_URL, postgres::NoTls) {
-                let _ = c.execute(&format!("DROP TABLE IF EXISTS {}", self.0), &[]);
-            }
-        }
-    }
-    let _guard = Cleanup(table_name.clone());
+    let _guard = PgTable::adopt(table_name.clone());
 
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("ql_null_exp");

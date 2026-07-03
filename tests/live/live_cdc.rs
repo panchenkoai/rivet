@@ -63,24 +63,6 @@ fn rig_renders_the_exact_legacy_cdc_template() {
     );
 }
 
-fn run_cdc(cfg: &std::path::Path) {
-    let out = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", cfg.to_str().unwrap()])
-        .output()
-        .expect("spawn rivet");
-    assert!(
-        out.status.success(),
-        "rivet run (cdc) failed:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-fn manifest_rows(out: &std::path::Path) -> i64 {
-    let body = std::fs::read_to_string(out.join("manifest.json")).expect("manifest.json");
-    let m: serde_json::Value = serde_json::from_str(&body).unwrap();
-    m["row_count"].as_i64().expect("row_count")
-}
-
 /// The single `.parquet` part written under `dir` (CDC + batch each write one for
 /// these small fixtures).
 fn find_parquet_part(dir: &std::path::Path) -> std::path::PathBuf {
@@ -168,8 +150,8 @@ fn cdc_column_types_match_a_batch_full_export() {
     let batch_out = d.path().join("batch");
     std::fs::create_dir_all(&cdc_out).unwrap();
     std::fs::create_dir_all(&batch_out).unwrap();
-    run_cdc(&cdc_config(&d, &tbl, &ckpt, &cdc_out));
-    run_cdc(&full_config(&d, &tbl, &batch_out)); // run_cdc just runs `rivet run`
+    run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &cdc_out));
+    run_rivet_ok(&full_config(&d, &tbl, &batch_out)); // run_cdc just runs `rivet run`
 
     let cdc: std::collections::HashMap<_, _> = parquet_fields(&cdc_out).into_iter().collect();
     for (name, batch_ty) in parquet_fields(&batch_out) {
@@ -207,7 +189,7 @@ fn cdc_captures_json_as_valid_json() {
 
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out));
+    run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &out));
 
     let json = parquet_one_string(&out, "meta");
     let parsed: serde_json::Value = serde_json::from_str(&json)
@@ -237,7 +219,7 @@ fn cdc_picks_up_a_column_added_between_runs() {
         .unwrap();
     let out1 = d.path().join("out1");
     std::fs::create_dir_all(&out1).unwrap();
-    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out1));
+    run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &out1));
     let f1: std::collections::HashMap<_, _> = parquet_fields(&out1).into_iter().collect();
     assert!(!f1.contains_key("w"), "run 1 predates the added column");
 
@@ -250,7 +232,7 @@ fn cdc_picks_up_a_column_added_between_runs() {
     // Run 2 (resume): re-resolves the schema → the new column is captured.
     let out2 = d.path().join("out2");
     std::fs::create_dir_all(&out2).unwrap();
-    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out2));
+    run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &out2));
     let f2: std::collections::HashMap<_, _> = parquet_fields(&out2).into_iter().collect();
     assert!(
         f2.contains_key("w"),
@@ -291,7 +273,7 @@ fn cdc_throughput_drains_a_large_backlog() {
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
     let t = std::time::Instant::now();
-    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out));
+    run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &out));
     let secs = t.elapsed().as_secs_f64();
 
     // Correctness at scale: nothing dropped under volume.
@@ -331,7 +313,7 @@ fn cdc_idle_first_run_then_change_is_captured_not_skipped() {
     let ckpt = d.path().join("cdc.ckpt");
     let out1 = d.path().join("out1");
     std::fs::create_dir_all(&out1).unwrap();
-    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out1));
+    run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &out1));
     assert_eq!(manifest_rows(&out1), 0, "idle run 1 captures nothing");
     assert!(
         ckpt.exists(),
@@ -345,7 +327,7 @@ fn cdc_idle_first_run_then_change_is_captured_not_skipped() {
     // Run 2 resumes from the pinned position and must capture it.
     let out2 = d.path().join("out2");
     std::fs::create_dir_all(&out2).unwrap();
-    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out2));
+    run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &out2));
     assert_eq!(
         manifest_rows(&out2),
         1,
@@ -392,7 +374,7 @@ fn cdc_crash_after_flush_before_ack_re_reads_on_resume() {
     // position and re-reads both changes — nothing was lost to the crash.
     let out2 = d.path().join("out2");
     std::fs::create_dir_all(&out2).unwrap();
-    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out2));
+    run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &out2));
     assert_eq!(
         manifest_rows(&out2),
         2,
@@ -448,7 +430,7 @@ fn pg_cdc_resume_captures_only_new_changes() {
         .unwrap();
     let out1 = d.path().join("out1");
     std::fs::create_dir_all(&out1).unwrap();
-    run_cdc(&pg_cdc_config(&d, &tbl, &slot, &out1));
+    run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &out1));
     assert_eq!(manifest_rows(&out1), 2, "run 1 drains the 2 changes");
 
     // Resume: the slot's confirmed_flush advanced after the durable write, so run 2
@@ -457,23 +439,12 @@ fn pg_cdc_resume_captures_only_new_changes() {
         .unwrap();
     let out2 = d.path().join("out2");
     std::fs::create_dir_all(&out2).unwrap();
-    run_cdc(&pg_cdc_config(&d, &tbl, &slot, &out2));
+    run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &out2));
     assert_eq!(
         manifest_rows(&out2),
         2,
         "resume drains only the 2 new changes (slot advanced, no re-read)"
     );
-}
-
-/// Read the (single) parquet part under `dir` into one RecordBatch.
-fn read_one_batch(dir: &std::path::Path) -> arrow::record_batch::RecordBatch {
-    let f = std::fs::File::open(find_parquet_part(dir)).unwrap();
-    let mut r = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
-        .unwrap()
-        .with_batch_size(usize::MAX)
-        .build()
-        .unwrap();
-    r.next().expect("at least one row").unwrap()
 }
 
 /// Assert every source column of the batch export is byte-for-byte identical
@@ -546,8 +517,8 @@ fn cdc_full_type_matrix_matches_batch() {
     let batch_out = d.path().join("batch");
     std::fs::create_dir_all(&cdc_out).unwrap();
     std::fs::create_dir_all(&batch_out).unwrap();
-    run_cdc(&cdc_config(&d, &tbl, &ckpt, &cdc_out));
-    run_cdc(&full_config(&d, &tbl, &batch_out));
+    run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &cdc_out));
+    run_rivet_ok(&full_config(&d, &tbl, &batch_out));
     assert_cdc_matches_batch(&cdc_out, &batch_out);
 }
 
@@ -592,7 +563,7 @@ exports:
         sid = server_id_for(&tbl),
     );
     let cfg = write_config(&d, &cdc_yaml);
-    run_cdc(&cfg); // pin
+    run_rivet_ok(&cfg); // pin
     c.query_drop(format!(
         "INSERT INTO {tbl} VALUES \
          (1, 999999999999.9999, '2035-08-07 09:08:07.987654', '2024-03-15', \
@@ -600,7 +571,7 @@ exports:
          (2, NULL, NULL, NULL, NULL, NULL)"
     ))
     .unwrap();
-    run_cdc(&cfg);
+    run_rivet_ok(&cfg);
     let batch_yaml = format!(
         r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
 exports:
@@ -612,7 +583,7 @@ exports:
 "#,
         out = batch_out.display(),
     );
-    run_cdc(&write_config(&d, &batch_yaml));
+    run_rivet_ok(&write_config(&d, &batch_yaml));
 
     let read_csv = |dir: &std::path::Path| -> Vec<String> {
         let p = std::fs::read_dir(dir)
@@ -695,14 +666,14 @@ fn cdc_non_utc_server_timezone_matches_batch_and_utc_instant() {
     let ckpt = d.path().join("cdc.ckpt");
     std::fs::create_dir_all(&out).unwrap();
     std::fs::create_dir_all(&batch_out).unwrap();
-    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out)); // pin
+    run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &out)); // pin
     // Wall-clock noon in +09:00 == 03:00:00Z.
     c.query_drop(format!(
         "INSERT INTO {tbl} VALUES (1, '2024-06-15 12:00:00', '2024-06-15 12:00:00')"
     ))
     .unwrap();
-    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out));
-    run_cdc(&full_config(&d, &tbl, &batch_out));
+    run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &out));
+    run_rivet_ok(&full_config(&d, &tbl, &batch_out));
     assert_cdc_matches_batch(&out, &batch_out);
 
     use arrow::array::TimestampMicrosecondArray;
@@ -773,7 +744,7 @@ fn pg_cdc_non_utc_database_timezone_matches_batch() {
     let batch_out = d.path().join("batch");
     std::fs::create_dir_all(&out).unwrap();
     std::fs::create_dir_all(&batch_out).unwrap();
-    run_cdc(&pg_cdc_config(&d, &tbl, &slot, &out));
+    run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &out));
     let batch_yaml = format!(
         r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
 exports:
@@ -785,7 +756,7 @@ exports:
 "#,
         out = batch_out.display(),
     );
-    run_cdc(&write_config(&d, &batch_yaml));
+    run_rivet_ok(&write_config(&d, &batch_yaml));
     assert_cdc_matches_batch(&out, &batch_out);
 
     use arrow::array::TimestampMicrosecondArray;
@@ -837,13 +808,13 @@ fn cdc_update_and_delete_carry_full_types() {
     let ckpt = d.path().join("cdc.ckpt");
     std::fs::create_dir_all(&out).unwrap();
     std::fs::create_dir_all(&batch_out).unwrap();
-    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out)); // pin
+    run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &out)); // pin
     c.query_drop(format!(
         "INSERT INTO {tbl} VALUES (1, 1.5000, '2024-01-01 00:00:00', '01:02:03', \
          'a', 'x', 0xAA, 1, 'v1')"
     ))
     .unwrap();
-    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out));
+    run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &out));
 
     // UPDATE every column; the after-image must equal a batch export of the
     // post-update state, type for type, value for value.
@@ -855,8 +826,8 @@ fn cdc_update_and_delete_carry_full_types() {
     .unwrap();
     let upd_out = d.path().join("upd");
     std::fs::create_dir_all(&upd_out).unwrap();
-    run_cdc(&cdc_config(&d, &tbl, &ckpt, &upd_out));
-    run_cdc(&full_config(&d, &tbl, &batch_out));
+    run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &upd_out));
+    run_rivet_ok(&full_config(&d, &tbl, &batch_out));
     let upd = read_one_batch(&upd_out);
     assert_eq!(upd.num_rows(), 1, "exactly the update event");
     assert_eq!(parquet_one_string(&upd_out, "__op"), "update");
@@ -877,7 +848,7 @@ fn cdc_update_and_delete_carry_full_types() {
         .unwrap();
     let del_out = d.path().join("del");
     std::fs::create_dir_all(&del_out).unwrap();
-    run_cdc(&cdc_config(&d, &tbl, &ckpt, &del_out));
+    run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &del_out));
     let del = read_one_batch(&del_out);
     assert_eq!(del.num_rows(), 1);
     assert_eq!(parquet_one_string(&del_out, "__op"), "delete");
@@ -921,7 +892,7 @@ fn pg_cdc_update_and_delete_carry_full_types() {
     .unwrap();
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    run_cdc(&pg_cdc_config(&d, &tbl, &slot, &out));
+    run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &out));
 
     c.batch_execute(&format!(
         "UPDATE {tbl} SET amount=999999999999.99, ts='2035-08-07T09:08:07.987654Z',
@@ -934,7 +905,7 @@ fn pg_cdc_update_and_delete_carry_full_types() {
     let batch_out = d.path().join("batch");
     std::fs::create_dir_all(&upd_out).unwrap();
     std::fs::create_dir_all(&batch_out).unwrap();
-    run_cdc(&pg_cdc_config(&d, &tbl, &slot, &upd_out));
+    run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &upd_out));
     let batch_yaml = format!(
         r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
 exports:
@@ -946,7 +917,7 @@ exports:
 "#,
         out = batch_out.display(),
     );
-    run_cdc(&write_config(&d, &batch_yaml));
+    run_rivet_ok(&write_config(&d, &batch_yaml));
     let upd = read_one_batch(&upd_out);
     assert_eq!(upd.num_rows(), 1, "exactly the update event");
     assert_eq!(parquet_one_string(&upd_out, "__op"), "update");
@@ -966,7 +937,7 @@ exports:
         .unwrap();
     let del_out = d.path().join("del");
     std::fs::create_dir_all(&del_out).unwrap();
-    run_cdc(&pg_cdc_config(&d, &tbl, &slot, &del_out));
+    run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &del_out));
     let del = read_one_batch(&del_out);
     assert_eq!(del.num_rows(), 1);
     assert_eq!(parquet_one_string(&del_out, "__op"), "delete");
@@ -1018,7 +989,7 @@ fn pg_cdc_hostile_floats_match_batch_and_nan_numeric_fails_loudly() {
     let batch_out = d.path().join("batch");
     std::fs::create_dir_all(&cdc_out).unwrap();
     std::fs::create_dir_all(&batch_out).unwrap();
-    run_cdc(&pg_cdc_config(&d, &tbl, &slot, &cdc_out));
+    run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &cdc_out));
     let batch_yaml = format!(
         r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
 exports:
@@ -1030,7 +1001,7 @@ exports:
 "#,
         out = batch_out.display(),
     );
-    run_cdc(&write_config(&d, &batch_yaml));
+    run_rivet_ok(&write_config(&d, &batch_yaml));
     assert_cdc_matches_batch(&cdc_out, &batch_out);
 
     // Leg 2: 'NaN'::NUMERIC — the CDC run must FAIL, naming the payload.
@@ -1080,15 +1051,15 @@ fn cdc_hostile_zero_date_and_nul_string_match_batch() {
     let ckpt = d.path().join("cdc.ckpt");
     std::fs::create_dir_all(&out).unwrap();
     std::fs::create_dir_all(&batch_out).unwrap();
-    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out)); // pin
+    run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &out)); // pin
     c.query_drop("SET SESSION sql_mode=''").unwrap();
     c.query_drop(format!(
         "INSERT INTO {tbl} VALUES (1, '0000-00-00 00:00:00', CONCAT('a', CHAR(0), 'b')), \
          (2, '2024-03-15 12:00:00', 'plain')"
     ))
     .unwrap();
-    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out));
-    run_cdc(&full_config(&d, &tbl, &batch_out));
+    run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &out));
+    run_rivet_ok(&full_config(&d, &tbl, &batch_out));
     assert_cdc_matches_batch(&out, &batch_out);
 
     // And pin the zero-date outcome explicitly: NULL, not epoch garbage.
@@ -1147,12 +1118,12 @@ exports:
     );
     let cfg = write_config(&d, &yaml);
 
-    run_cdc(&cfg); // pin
+    run_rivet_ok(&cfg); // pin
     c.query_drop(format!("INSERT INTO {ta} VALUES (1, -42)"))
         .unwrap();
     c.query_drop(format!("INSERT INTO {tb} VALUES (1, 7)"))
         .unwrap();
-    run_cdc(&cfg);
+    run_rivet_ok(&cfg);
 
     let ty_of = |t: &str| {
         parquet_fields(&out.join(t))
@@ -1223,14 +1194,14 @@ exports:
     );
     let cfg = write_config(&d, &yaml);
 
-    run_cdc(&cfg); // pin
+    run_rivet_ok(&cfg); // pin
     c.query_drop(format!("INSERT INTO {ta} VALUES (1, -42)"))
         .unwrap();
     c.query_drop(format!("INSERT INTO {tb} VALUES (1, 13.37)"))
         .unwrap();
     c.query_drop(format!("INSERT INTO {tc} VALUES (1, 'off')"))
         .unwrap();
-    run_cdc(&cfg);
+    run_rivet_ok(&cfg);
 
     let ty_of = |t: &str| {
         parquet_fields(&out.join(t))
@@ -1299,7 +1270,7 @@ exports:
     let cfg = write_config(&d, &yaml);
 
     // Run 1: anchor → snapshot(2 rows) → drain(0).
-    run_cdc(&cfg);
+    run_rivet_ok(&cfg);
     let snap = out.join("snapshot");
     assert_eq!(
         manifest_rows(&snap),
@@ -1324,7 +1295,7 @@ exports:
     // A change AFTER the snapshot → the stream, not a re-snapshot.
     c.query_drop(format!("INSERT INTO {tbl} VALUES (3,30)"))
         .unwrap();
-    run_cdc(&cfg);
+    run_rivet_ok(&cfg);
     assert_eq!(manifest_rows(&out), 1, "the post-snapshot change streams");
     assert_eq!(snap_parts(), 1, "run 2 must NOT re-snapshot");
 }
@@ -1367,7 +1338,7 @@ exports:
     let cfg = write_config(&d, &yaml);
 
     // Run 1: anchor + snapshot(1 row) + drain(0).
-    run_cdc(&cfg);
+    run_rivet_ok(&cfg);
     assert_eq!(manifest_rows(&out.join("snapshot")), 1);
 
     // The slot vanishes (admin cleanup / WAL-size invalidation), and a change
@@ -1418,7 +1389,7 @@ fn cdc_mixed_transaction_ending_on_uncaptured_table_advances_checkpoint() {
     let ckpt = d.path().join("cdc.ckpt");
     std::fs::create_dir_all(&out1).unwrap();
     std::fs::create_dir_all(&out2).unwrap();
-    run_cdc(&cdc_config(&d, &orders, &ckpt, &out1)); // pin
+    run_rivet_ok(&cdc_config(&d, &orders, &ckpt, &out1)); // pin
 
     // ONE transaction: captured table first, uncaptured table LAST.
     c.query_drop("START TRANSACTION").unwrap();
@@ -1428,12 +1399,12 @@ fn cdc_mixed_transaction_ending_on_uncaptured_table_advances_checkpoint() {
         .unwrap();
     c.query_drop("COMMIT").unwrap();
 
-    run_cdc(&cdc_config(&d, &orders, &ckpt, &out1));
+    run_rivet_ok(&cdc_config(&d, &orders, &ckpt, &out1));
     assert_eq!(manifest_rows(&out1), 1, "the captured row lands");
 
     // Run 3 with NO new changes must capture ZERO — a stalled checkpoint
     // would re-read the same transaction and duplicate the row.
-    run_cdc(&cdc_config(&d, &orders, &ckpt, &out2));
+    run_rivet_ok(&cdc_config(&d, &orders, &ckpt, &out2));
     assert_eq!(
         manifest_rows(&out2),
         0,
@@ -1478,9 +1449,9 @@ fn pg_cdc_mixed_transaction_ending_on_uncaptured_table_advances_checkpoint() {
     let out2 = d.path().join("out2");
     std::fs::create_dir_all(&out1).unwrap();
     std::fs::create_dir_all(&out2).unwrap();
-    run_cdc(&pg_cdc_config(&d, &orders, &slot, &out1));
+    run_rivet_ok(&pg_cdc_config(&d, &orders, &slot, &out1));
     assert_eq!(manifest_rows(&out1), 1, "the captured row lands");
-    run_cdc(&pg_cdc_config(&d, &orders, &slot, &out2));
+    run_rivet_ok(&pg_cdc_config(&d, &orders, &slot, &out2));
     assert_eq!(
         manifest_rows(&out2),
         0,
@@ -1505,10 +1476,10 @@ fn cdc_schema_qualified_table_config_captures_events() {
     let ckpt = d.path().join("cdc.ckpt");
     std::fs::create_dir_all(&out).unwrap();
     let qualified = format!("rivet.{tbl}");
-    run_cdc(&cdc_config(&d, &qualified, &ckpt, &out)); // pin
+    run_rivet_ok(&cdc_config(&d, &qualified, &ckpt, &out)); // pin
     c.query_drop(format!("INSERT INTO {tbl} VALUES (1, 10)"))
         .unwrap();
-    run_cdc(&cdc_config(&d, &qualified, &ckpt, &out));
+    run_rivet_ok(&cdc_config(&d, &qualified, &ckpt, &out));
     assert_eq!(
         manifest_rows(&out),
         1,
@@ -1544,7 +1515,7 @@ fn pg_cdc_schema_qualified_table_config_captures_events() {
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
     let qualified = format!("public.{tbl}");
-    run_cdc(&pg_cdc_config(&d, &qualified, &slot, &out));
+    run_rivet_ok(&pg_cdc_config(&d, &qualified, &slot, &out));
     assert_eq!(
         manifest_rows(&out),
         1,
@@ -1588,7 +1559,7 @@ exports:
     );
     let cfg = write_config(&d, &yaml);
 
-    run_cdc(&cfg);
+    run_rivet_ok(&cfg);
     let marker = out.join("snapshot").join("_SUCCESS");
     assert!(
         marker.exists(),
@@ -1599,7 +1570,7 @@ exports:
     // Run 2 must NOT re-snapshot (marker untouched) and must drain the change.
     c.query_drop(format!("INSERT INTO {tbl} VALUES (1, 10)"))
         .unwrap();
-    run_cdc(&cfg);
+    run_rivet_ok(&cfg);
     assert_eq!(
         std::fs::metadata(&marker).unwrap().modified().unwrap(),
         stamp,
@@ -1640,14 +1611,14 @@ exports:
     );
     let cfg = write_config(&d, &yaml);
 
-    run_cdc(&cfg);
+    run_rivet_ok(&cfg);
     let _slot = Slot(slot.clone());
     assert_eq!(manifest_rows(&out.join("snapshot")), 2);
     assert_eq!(manifest_rows(&out), 0);
 
     c.execute(&format!("INSERT INTO {tbl} VALUES (3,30)"), &[])
         .unwrap();
-    run_cdc(&cfg);
+    run_rivet_ok(&cfg);
     assert_eq!(manifest_rows(&out), 1, "the post-snapshot change streams");
 }
 
@@ -1706,8 +1677,8 @@ exports:
 "#,
         batch_out = batch_out.display(),
     );
-    run_cdc(&write_config(&d, &cdc_yaml));
-    run_cdc(&write_config(&d, &batch_yaml));
+    run_rivet_ok(&write_config(&d, &cdc_yaml));
+    run_rivet_ok(&write_config(&d, &batch_yaml));
 
     let fields: std::collections::HashMap<_, _> = parquet_fields(&cdc_out).into_iter().collect();
     assert_eq!(
@@ -1778,7 +1749,7 @@ fn pg_cdc_full_type_matrix_matches_batch() {
     let batch_out = d.path().join("batch");
     std::fs::create_dir_all(&cdc_out).unwrap();
     std::fs::create_dir_all(&batch_out).unwrap();
-    run_cdc(&pg_cdc_config(&d, &tbl, &slot, &cdc_out));
+    run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &cdc_out));
     let batch_yaml = format!(
         r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
 exports:
@@ -1790,7 +1761,7 @@ exports:
 "#,
         out = batch_out.display(),
     );
-    run_cdc(&write_config(&d, &batch_yaml));
+    run_rivet_ok(&write_config(&d, &batch_yaml));
     assert_cdc_matches_batch(&cdc_out, &batch_out);
 }
 
@@ -1831,7 +1802,7 @@ exports:
     let cfg = write_config(&d, &yaml);
 
     // Run 1 creates the ONE slot and drains nothing.
-    run_cdc(&cfg);
+    run_rivet_ok(&cfg);
     let _slot = Slot(slot.clone());
     let n: i64 = c
         .query_one(
@@ -1847,12 +1818,12 @@ exports:
         .unwrap();
     c.execute(&format!("INSERT INTO {t2} VALUES (7,70)"), &[])
         .unwrap();
-    run_cdc(&cfg);
+    run_rivet_ok(&cfg);
     assert_eq!(manifest_rows(&out.join(&t1)), 2, "table 1 sub-prefix");
     assert_eq!(manifest_rows(&out.join(&t2)), 1, "table 2 sub-prefix");
 
     // Resume: the shared position advanced once for both tables.
-    run_cdc(&cfg);
+    run_rivet_ok(&cfg);
     assert_eq!(manifest_rows(&out.join(&t1)), 0, "no re-read for table 1");
     assert_eq!(manifest_rows(&out.join(&t2)), 0, "no re-read for table 2");
 }
@@ -1893,18 +1864,18 @@ exports:
     let cfg = write_config(&d, &yaml);
 
     // Run 1: pins the checkpoint (idle-first-run) with zero captures.
-    run_cdc(&cfg);
+    run_rivet_ok(&cfg);
     assert!(ckpt.exists(), "idle first run pins the shared checkpoint");
 
     c.query_drop(format!("INSERT INTO {ta} VALUES (1,10),(2,20)"))
         .unwrap();
     c.query_drop(format!("INSERT INTO {tb} VALUES (7,70)"))
         .unwrap();
-    run_cdc(&cfg);
+    run_rivet_ok(&cfg);
     assert_eq!(manifest_rows(&out.join(&ta)), 2);
     assert_eq!(manifest_rows(&out.join(&tb)), 1);
 
-    run_cdc(&cfg);
+    run_rivet_ok(&cfg);
     assert_eq!(manifest_rows(&out.join(&ta)), 0, "resume: no re-read");
     assert_eq!(manifest_rows(&out.join(&tb)), 0, "resume: no re-read");
 }
@@ -1952,12 +1923,12 @@ exports:
     );
     let cfg = write_config(&d, &yaml);
 
-    run_cdc(&cfg); // pin
+    run_rivet_ok(&cfg); // pin
     c.query_drop(format!("INSERT INTO {ta} VALUES (1,10),(2,20)"))
         .unwrap();
     c.query_drop(format!("INSERT INTO {tb} VALUES (7,70)"))
         .unwrap();
-    run_cdc(&cfg); // capture → upload
+    run_rivet_ok(&cfg); // capture → upload
 
     // List the object keys under the prefix via the GCS JSON API.
     let body = reqwest::blocking::get(format!(
@@ -2072,12 +2043,12 @@ exports:
             out = out.display(),
         )
     };
-    run_cdc(&write_config(&d, &yaml(&out1)));
+    run_rivet_ok(&write_config(&d, &yaml(&out1)));
     c.execute(&format!("INSERT INTO {tbl} VALUES (1,10)"), &[])
         .unwrap();
     let out2 = d.path().join("out2");
     std::fs::create_dir_all(&out2).unwrap();
-    run_cdc(&write_config(&d, &yaml(&out2)));
+    run_rivet_ok(&write_config(&d, &yaml(&out2)));
     assert_eq!(manifest_rows(&out2), 1, "run 2 captured the change");
     assert!(ckpt.exists(), "checkpoint persisted");
 
@@ -2196,7 +2167,7 @@ fn pg_cdc_idle_first_run_then_change_is_captured_not_skipped() {
     // Run 1: the slot does not exist yet — rivet creates it and drains nothing.
     let out1 = d.path().join("out1");
     std::fs::create_dir_all(&out1).unwrap();
-    run_cdc(&pg_cdc_config(&d, &tbl, &slot, &out1));
+    run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &out1));
     let _slot = Slot(slot.clone());
     assert_eq!(manifest_rows(&out1), 0, "idle run 1 drains nothing");
 
@@ -2207,7 +2178,7 @@ fn pg_cdc_idle_first_run_then_change_is_captured_not_skipped() {
     // Run 2 must capture it — the slot created in run 1 pinned the position.
     let out2 = d.path().join("out2");
     std::fs::create_dir_all(&out2).unwrap();
-    run_cdc(&pg_cdc_config(&d, &tbl, &slot, &out2));
+    run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &out2));
     assert_eq!(
         manifest_rows(&out2),
         1,
@@ -2260,7 +2231,7 @@ fn pg_cdc_crash_after_flush_before_ack_does_not_advance_the_slot() {
     // Run 2: the slot never advanced, so the peek still sees both changes.
     let out2 = d.path().join("out2");
     std::fs::create_dir_all(&out2).unwrap();
-    run_cdc(&pg_cdc_config(&d, &tbl, &slot, &out2));
+    run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &out2));
     assert_eq!(
         manifest_rows(&out2),
         2,
@@ -2320,8 +2291,8 @@ fn pg_cdc_column_types_match_batch_export() {
     let batch_out = d.path().join("batch");
     std::fs::create_dir_all(&cdc_out).unwrap();
     std::fs::create_dir_all(&batch_out).unwrap();
-    run_cdc(&pg_cdc_config(&d, &tbl, &slot, &cdc_out));
-    run_cdc(&pg_full_config(&d, &tbl, &batch_out));
+    run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &cdc_out));
+    run_rivet_ok(&pg_full_config(&d, &tbl, &batch_out));
 
     let cdc: std::collections::HashMap<_, _> = parquet_fields(&cdc_out).into_iter().collect();
     let batch: std::collections::HashMap<_, _> = parquet_fields(&batch_out).into_iter().collect();
@@ -2352,7 +2323,7 @@ fn cdc_resume_captures_only_new_changes() {
         .unwrap();
     let out1 = d.path().join("out1");
     std::fs::create_dir_all(&out1).unwrap();
-    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out1));
+    run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &out1));
     assert_eq!(
         manifest_rows(&out1),
         2,
@@ -2366,7 +2337,7 @@ fn cdc_resume_captures_only_new_changes() {
         .unwrap();
     let out2 = d.path().join("out2");
     std::fs::create_dir_all(&out2).unwrap();
-    run_cdc(&cdc_config(&d, &tbl, &ckpt, &out2));
+    run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &out2));
     assert_eq!(
         manifest_rows(&out2),
         2,
@@ -2391,7 +2362,7 @@ fn cdc_run_is_recorded_in_state_db() {
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
     let cfg = cdc_config(&d, &tbl, &ckpt, &out);
-    run_cdc(&cfg);
+    run_rivet_ok(&cfg);
 
     // A CDC run must show up like a batch run: an export_metrics row with mode=cdc,
     // and a run_journal entry (FileWritten + RunCompleted) so `rivet journal` works.

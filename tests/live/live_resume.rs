@@ -97,15 +97,7 @@ fn incremental_second_run_on_unchanged_source_exports_zero_new_rows() {
         SELECT g, now() - (interval '1 minute') * g FROM generate_series(1, 15) g;"
     ))
     .unwrap();
-    struct Cleanup(String);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            if let Ok(mut c) = postgres::Client::connect(POSTGRES_URL, postgres::NoTls) {
-                let _ = c.execute(&format!("DROP TABLE IF EXISTS {}", self.0), &[]);
-            }
-        }
-    }
-    let _guard = Cleanup(table_name.clone());
+    let _guard = PgTable::adopt(table_name.clone());
 
     let export_name = unique_name("qa12_inc_exp");
     let out = tempfile::tempdir().unwrap();
@@ -172,15 +164,7 @@ fn incremental_third_run_picks_up_newly_inserted_rows() {
         SELECT g, now() - (interval '1 minute') * (20 - g) FROM generate_series(1, 5) g;"
     ))
     .unwrap();
-    struct Cleanup(String);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            if let Ok(mut c) = postgres::Client::connect(POSTGRES_URL, postgres::NoTls) {
-                let _ = c.execute(&format!("DROP TABLE IF EXISTS {}", self.0), &[]);
-            }
-        }
-    }
-    let _guard = Cleanup(table_name.clone());
+    let _guard = PgTable::adopt(table_name.clone());
 
     let export_name = unique_name("qa12_inc2_exp");
     let out = tempfile::tempdir().unwrap();
