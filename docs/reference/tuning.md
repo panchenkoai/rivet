@@ -43,13 +43,23 @@ A profile sets sensible defaults for all tuning parameters. Individual fields ov
 
 | Parameter | `fast` | `balanced` (default) | `safe` |
 |-----------|--------|---------------------|--------|
-| `batch_size` | 50,000 | 10,000 | 2,000 |
+| `batch_size` | adaptive: 64 MB/flush¹ | adaptive: 32 MB/flush¹ | 2,000 (static) |
 | `throttle_ms` | 0 | 50 | 500 |
 | `statement_timeout_s` | 0 (none) | 300 | 120 |
 | `max_retries` | 1 | 3 | 5 |
 | `retry_backoff_ms` | 1,000 | 2,000 | 5,000 |
 | `lock_timeout_s` | 0 (none) | 30 | 10 |
 | `memory_threshold_mb` | 0 (none) | 4,096 | 2,048 |
+
+¹ `fast` and `balanced` size the batch from **memory, not a row count**:
+`batch = target_mb / estimated_row_bytes`, clamped to 1,000–150,000 rows. A
+~320-byte row therefore batches at ~100k rows under `balanced`; a 4 KB row at
+~8k. The static bases (50,000 / 10,000) apply only when the schema is not yet
+known (e.g. `plan` before resolve) and as the advisory base in reports. An
+explicit `batch_size:` disables adaptive sizing. Either way the batch is a
+CLIENT-side fetch window — it never enters the source SQL (page size is
+`chunk_size`), so a larger batch shortens cursor hold-time without adding
+server work.
 
 ### When to use each profile
 
@@ -64,7 +74,7 @@ A profile sets sensible defaults for all tuning parameters. Individual fields ov
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `profile` | `fast` \| `balanced` \| `safe` | `balanced` | Base profile (sets defaults for all other fields) |
-| `batch_size` | integer | profile default | Number of rows fetched per query batch |
+| `batch_size` | integer | profile default | Rows fetched per query batch. Explicit value disables the profile's adaptive (memory-based) sizing — see footnote ¹ above |
 | `batch_size_memory_mb` | integer | — | Target memory per batch in MB (adaptive sizing; mutually exclusive with `batch_size`) |
 | `throttle_ms` | integer | profile default | Delay in ms between batches (reduces source load) |
 | `statement_timeout_s` | integer | profile default | Database statement timeout in seconds (0 = no timeout) |
