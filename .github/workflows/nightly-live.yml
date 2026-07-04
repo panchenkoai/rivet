@@ -196,7 +196,10 @@ jobs:
   # only — live tests are #[ignore]d, so mutants runs the cheap suite.
   mutants-cdc:
     name: cargo-mutants (CDC modules)
-    timeout-minutes: 50
+    # 50 min hit the ceiling on the first real run: decimal.rs ALONE takes
+    # ~49 min locally on a faster box (108 mutants x offline suite), and this
+    # job also covers cdc/value.rs on a 2-core runner. Nightly has the budget.
+    timeout-minutes: 180
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
