@@ -1189,3 +1189,52 @@ fn cdc_scenario_smoke_mssql() {
     }
     assert_eq!(rows, 2, "mssql scenario: pin → churn → drain (job-lagged)");
 }
+
+// Finding #44: a batch and a CDC export sharing one prefix silently
+// destroyed each other's manifest.json (last writer wins — the batch part
+// vanished from validate's view in the GCS walkthrough that surfaced this).
+// Two layers, both pinned here: the scaffolds now separate the prefixes, and
+// the manifest writer refuses an EXPLICIT cross-shape overwrite.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_scaffold_gets_its_own_prefix_and_cross_shape_overwrite_is_refused() {
+    let mut scn = CdcScenario::mysql("cdc_shape", "id INT PRIMARY KEY, v INT");
+
+    // Layer 1: the scaffolds separate prefixes out of the box.
+    let d = tempfile::tempdir().unwrap();
+    let out = std::process::Command::new(RIVET_BIN)
+        .args([
+            "init",
+            "--source-env",
+            "RIVET_SHAPE_URL",
+            "--table",
+            &scn.table,
+            "--mode",
+            "cdc",
+            "-o",
+            d.path().join("cdc.yaml").to_str().unwrap(),
+        ])
+        .env("RIVET_SHAPE_URL", MYSQL_CDC_URL)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let yaml = std::fs::read_to_string(d.path().join("cdc.yaml")).unwrap();
+    assert!(
+        yaml.contains(&format!("./output/{}/cdc/", scn.table)),
+        "cdc scaffold must use its own sub-prefix: {yaml}"
+    );
+
+    // Layer 2: the writer refuses a cross-shape manifest overwrite. The
+    // scenario's rig wrote a CDC manifest into its out dir; a batch export
+    // pointed at the SAME prefix must fail loudly.
+    scn.sql(&format!("INSERT INTO {} VALUES (1, 10)", scn.table));
+    scn.rig.run_ok(); // cdc manifest now present at the prefix
+    let batch_rig = Rig::mysql_batch(&scn.table)
+        .source_url(MYSQL_CDC_URL)
+        .dest_path(scn.rig.out_dir());
+    let err = batch_rig.run_expect_fail();
+    assert!(
+        err.contains("refusing to") && err.contains("'cdc' manifest"),
+        "cross-shape overwrite must refuse loudly, naming the shapes: {err}"
+    );
+}

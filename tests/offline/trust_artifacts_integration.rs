@@ -142,6 +142,7 @@ fn build_manifest(run_id: &str, status: ManifestStatus, parts: Vec<ManifestPart>
         .filter(|p| p.status == PartStatus::Committed)
         .count() as u32;
     RunManifest {
+        mode: "batch".to_string(),
         manifest_version: MANIFEST_VERSION,
         run_id: run_id.into(),
         export_name: "public.orders".into(),

@@ -160,6 +160,7 @@ impl ManifestBuilder {
         let finished_at = chrono::Utc::now();
         RunManifest {
             manifest_version: crate::manifest::MANIFEST_VERSION,
+            mode: "batch".to_string(),
             run_id: self.run_id,
             export_name: self.export_name,
             started_at: self.started_at.to_rfc3339(),
@@ -304,6 +305,12 @@ pub fn write_manifest(dest: &dyn Destination, manifest: &RunManifest) -> Result<
         );
         return Ok(WriteOutcome::SkippedStreaming);
     }
+
+    // Finding #44: a batch and a CDC export sharing one prefix silently
+    // destroyed each other's manifest (last writer wins, prior parts orphaned
+    // from validate). Refuse cross-shape overwrites at the ONE seam both
+    // pipelines write through.
+    crate::manifest::guard_manifest_mode(dest, &manifest.mode)?;
 
     let bytes = serde_json::to_vec_pretty(manifest)?;
 
