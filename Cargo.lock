@@ -3051,7 +3051,7 @@ dependencies = [
 
 [[package]]
 name = "rivet-cli"
-version = "0.16.4"
+version = "0.16.5"
 dependencies = [
  "anyhow",
  "arrow",
