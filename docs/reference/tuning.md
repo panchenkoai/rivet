@@ -61,6 +61,18 @@ CLIENT-side fetch window — it never enters the source SQL (page size is
 `chunk_size`), so a larger batch shortens cursor hold-time without adding
 server work.
 
+**What stays open on the server while a chunk drains** (per-engine hold
+model): PostgreSQL reads through a server cursor — between `FETCH N` calls
+nothing executes, but the snapshot transaction stays open (vacuum-horizon
+cost); MySQL and SQL Server hold one streaming `SELECT` per chunk, drained
+under socket flow control — the query stays visible (`Sending data`) for the
+chunk's drain duration and holds the MVCC read view. Consequence:
+`throttle_ms` lowers burst IO but **lengthens** per-chunk hold time on
+MySQL/MSSQL and the snapshot window on PostgreSQL. For hold-time-sensitive
+primaries prefer `fast` in an off-peak window or a replica; reserve `safe`
+throttling for replicas and IO-sensitive hosts. `chunk_size` bounds the
+worst case held by any single query.
+
 ### When to use each profile
 
 | Profile | Use case |
