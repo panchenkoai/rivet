@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **First CDC run no longer fails when the scaffolded checkpoint directory doesn't exist.** `rivet init
+  --mode cdc` scaffolds `checkpoint: ./cdc/<table>.ckpt`, but nothing created `./cdc/` — the very first
+  `rivet run` (the README CDC quickstart, step 3) died with an ENOENT dressed in the grants hint. Found
+  by a fresh-client dress rehearsal of the released 0.16.4 binary; the checkpoint save now creates
+  parent directories and carries an honest per-step error context (`creating checkpoint directory …`)
+  instead of the misleading permissions framing.
+
 ## 0.16.4 — 2026-07-03
 
 ### Added
