@@ -252,6 +252,10 @@ fn run_cdc_inner(
             export.destination.clone()
         };
         let dest = crate::destination::create_destination(&dcfg)?;
+        // Finding #44, early check: refuse BEFORE the first part lands if the
+        // prefix belongs to the other pipeline shape (config error, fail the
+        // run cleanly — the write-seam guard stays as the backstop).
+        crate::manifest::guard_manifest_mode(dest.as_ref(), "cdc")?;
         let uri = dcfg
             .path
             .clone()

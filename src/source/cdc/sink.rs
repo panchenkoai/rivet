@@ -577,6 +577,7 @@ fn build_manifest(
 ) -> RunManifest {
     RunManifest {
         manifest_version: MANIFEST_VERSION,
+        mode: "cdc".to_string(),
         run_id: run_id.to_string(),
         export_name: out.table.clone(),
         started_at: started_at.to_string(),

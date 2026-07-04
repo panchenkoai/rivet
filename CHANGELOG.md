@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A batch and a CDC export sharing one prefix no longer destroy each other's manifest** (finding
+  #44, caught during a live GCS walkthrough: the CDC run's `manifest.json` silently replaced the batch
+  export's, orphaning its parts from `rivet validate`). Two layers: the CDC scaffold now gets its own
+  sub-prefix (`exports/<table>/cdc/`, local `./output/<table>/cdc/`), and every write path refuses an
+  EXPLICIT cross-shape manifest overwrite BEFORE the first part lands — a clean config error naming
+  both shapes and the fix. Manifests now carry a `mode` field (`batch`/`cdc`); manifests written by
+  older versions have no `mode` and are always allowed, so existing CDC deployments keep resuming
+  after the upgrade.
+
 ## 0.16.5 — 2026-07-04
 
 ### Fixed

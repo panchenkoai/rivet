@@ -214,6 +214,7 @@ mod tests {
 
     fn manifest(parts: Vec<ManifestPart>) -> RunManifest {
         RunManifest {
+            mode: "batch".to_string(),
             manifest_version: MANIFEST_VERSION,
             run_id: "r".into(),
             export_name: "e".into(),

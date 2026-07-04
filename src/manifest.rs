@@ -128,6 +128,13 @@ pub struct RunManifest {
     pub manifest_version: u32,
     pub run_id: String,
     pub export_name: String,
+    /// Which pipeline shape wrote this manifest — `batch` or `cdc`. Guards a
+    /// prefix against silent cross-shape clobbering (finding #44: a CDC run
+    /// overwrote a batch export's manifest at a shared prefix, orphaning its
+    /// parts from `rivet validate`). Defaults to `batch` for manifests
+    /// written before this field existed.
+    #[serde(default = "default_manifest_mode")]
+    pub mode: String,
     pub started_at: String,
     pub finished_at: String,
     pub status: ManifestStatus,
@@ -334,6 +341,7 @@ mod tests {
             .filter(|p| p.status == PartStatus::Committed)
             .count() as u32;
         RunManifest {
+            mode: "batch".to_string(),
             manifest_version: MANIFEST_VERSION,
             run_id: "orders_20260521T120000.000".into(),
             export_name: "public.orders".into(),
@@ -556,5 +564,97 @@ mod tests {
         let parsed: RunManifest = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.run_id, "r1");
         assert_eq!(parsed.validate_self_consistency(), Ok(()));
+    }
+}
+
+fn default_manifest_mode() -> String {
+    "batch".to_string()
+}
+
+/// Finding #44 guard: refuse to overwrite a manifest written by the OTHER
+/// pipeline shape. Same-shape overwrites stay allowed (a batch full re-run
+/// replaces its own manifest by design; CDC extends its own). A missing or
+/// unreadable manifest is not this guard's business — corruption surfaces in
+/// `rivet validate`, and first runs must not require a read round-trip.
+pub fn guard_manifest_mode(
+    dest: &dyn crate::destination::Destination,
+    new_mode: &str,
+) -> anyhow::Result<()> {
+    let Ok(bytes) = dest.read("manifest.json") else {
+        return Ok(());
+    };
+    let Ok(existing) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Ok(());
+    };
+    // A manifest WITHOUT the field predates 0.16.6 — every live CDC
+    // deployment's prefix looks like that after an upgrade, and refusing it
+    // would brick their own resume. Absent mode ⇒ unknown ⇒ allow; only an
+    // EXPLICIT cross-shape mismatch refuses.
+    let Some(existing_mode) = existing.get("mode").and_then(|m| m.as_str()) else {
+        return Ok(());
+    };
+    if existing_mode != new_mode {
+        anyhow::bail!(
+            "destination already holds a '{existing_mode}' manifest (run_id {run}); refusing to \
+             overwrite it with a '{new_mode}' manifest — a batch export and a CDC export sharing \
+             one prefix silently destroy each other's audit trail. Give this export its own \
+             prefix (the scaffold now uses exports/<table>/cdc/ for CDC).",
+            run = existing
+                .get("run_id")
+                .and_then(|r| r.as_str())
+                .unwrap_or("unknown"),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod mode_guard_tests {
+    use super::*;
+
+    #[test]
+    fn pre_mode_manifests_default_to_batch() {
+        // The REAL committed v0.16 manifest (compat fixture) predates the
+        // `mode` field — it must parse and read as batch.
+        let old = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/compat/v0.16/cdc_manifest.json"),
+        )
+        .expect("compat fixture");
+        let m: RunManifest = serde_json::from_str(&old).expect("old manifests parse");
+        assert_eq!(m.mode, "batch");
+    }
+
+    #[test]
+    fn cross_shape_overwrite_is_refused_same_shape_allowed() {
+        let d = tempfile::tempdir().unwrap();
+        let dest = crate::destination::create_destination(&crate::config::DestinationConfig {
+            destination_type: crate::config::DestinationType::Local,
+            path: Some(d.path().to_str().unwrap().to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        // empty prefix: any mode fine
+        guard_manifest_mode(dest.as_ref(), "batch").unwrap();
+        std::fs::write(
+            d.path().join("manifest.json"),
+            r#"{"mode":"batch","run_id":"r1"}"#,
+        )
+        .unwrap();
+        guard_manifest_mode(dest.as_ref(), "batch").expect("same shape re-run allowed");
+        let err = guard_manifest_mode(dest.as_ref(), "cdc")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("refusing to"), "loud refusal: {err}");
+        assert!(
+            err.contains("exports/<table>/cdc/"),
+            "carries the recovery: {err}"
+        );
+        // A pre-0.16.6 manifest (no mode field) must be ALLOWED — every live
+        // CDC deployment's prefix looks like that right after an upgrade, and
+        // refusing would brick their own resume. Unknown ⇒ pass.
+        std::fs::write(d.path().join("manifest.json"), r#"{"run_id":"legacy"}"#).unwrap();
+        guard_manifest_mode(dest.as_ref(), "cdc").expect("legacy prefixes must keep resuming");
+        guard_manifest_mode(dest.as_ref(), "batch").expect("in either direction");
     }
 }

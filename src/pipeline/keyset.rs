@@ -108,6 +108,10 @@ pub(crate) fn run_keyset(
             fmt.file_extension()
         );
         let dest = destination::create_destination(&plan.destination)?;
+        // Finding #44, early check: fail cleanly before the first part if this
+        // prefix already belongs to a CDC export (cross-shape manifests clobber
+        // each other; the write-seam guard is the backstop).
+        crate::manifest::guard_manifest_mode(dest.as_ref(), "batch")?;
         // Shared commit path (I1→I2→I7 + counters + journal + fault hooks).
         // write_sink_parts drains every part the sink produced — the final
         // temp file plus anything maybe_split rotated at max_file_size — so

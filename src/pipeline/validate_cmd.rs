@@ -652,6 +652,7 @@ mod tests {
         let row_count: i64 = parts.iter().map(|p| p.rows).sum();
         let part_count = parts.len() as u32;
         RunManifest {
+            mode: "batch".to_string(),
             manifest_version: MANIFEST_VERSION,
             run_id: "r-validate-cmd".into(),
             export_name: "orders".into(),

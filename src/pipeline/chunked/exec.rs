@@ -112,6 +112,7 @@ pub(crate) fn run_chunked_sequential(
                 format::create_format(plan.format, plan.compression, plan.compression_level, None);
             let base = super::chunk_part_filename(&plan.export_name, i, fmt.file_extension());
             let dest = destination::create_destination(&plan.destination)?;
+            crate::manifest::guard_manifest_mode(dest.as_ref(), "batch")?;
             // Shared commit path (I1→I2→I7 + counters + journal + fault hooks).
             // write_sink_parts drains every part the sink produced — the
             // final temp file plus anything maybe_split rotated at
@@ -260,6 +261,8 @@ pub(crate) fn run_chunked_parallel(
     // (`dispatch task is gone: runtime dropped` from the HTTP client).
     let shared_destination =
         std::sync::Arc::new(destination::create_destination(&plan.destination)?);
+    // Finding #44 early check (see single.rs) — chunked writes share the fate.
+    crate::manifest::guard_manifest_mode(&**shared_destination, "batch")?;
     destination::log_capabilities(
         &plan.export_name,
         &**shared_destination,

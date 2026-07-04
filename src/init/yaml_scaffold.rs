@@ -213,9 +213,19 @@ fn export_segment(info: &TableInfo, source_type: &str) -> String {
     }
 }
 
-/// `exports/<table>/` in the bucket, or `exports/<schema>__<table>/` for non-`public` PostgreSQL.
-fn table_export_prefix(info: &TableInfo, source_type: &str) -> String {
-    format!("exports/{}/", export_segment(info, source_type))
+/// `exports/<table>/` in the bucket, or `exports/<schema>__<table>/` for
+/// non-`public` PostgreSQL. CDC scaffolds get `exports/<table>/cdc/` — a batch
+/// and a CDC export of the SAME table would otherwise share a prefix and
+/// clobber each other's `manifest.json`/`_SUCCESS` (finding #44: the batch
+/// manifest silently vanished under the CDC run's, orphaning its parts from
+/// `rivet validate`).
+fn table_export_prefix(info: &TableInfo, source_type: &str, mode: &str) -> String {
+    let seg = export_segment(info, source_type);
+    if mode == "cdc" {
+        format!("exports/{seg}/cdc/")
+    } else {
+        format!("exports/{seg}/")
+    }
 }
 
 /// Emit a YAML scalar that is unambiguous for any plain-text value the user
@@ -497,7 +507,7 @@ fn export_block_lines(
     lines.push(
         "      row_hash: true  # _rivet_row_hash: per-row hash for change detection".to_string(),
     );
-    lines.extend(destination_scaffold(info, source_type, dest));
+    lines.extend(destination_scaffold(info, source_type, dest, mode));
 
     lines.extend(decimal_override_lines(info));
 
@@ -543,7 +553,7 @@ fn cdc_export_lines(
         )),
         _ => {}
     }
-    lines.extend(destination_scaffold(info, source_type, dest));
+    lines.extend(destination_scaffold(info, source_type, dest, "cdc"));
     lines.extend(decimal_override_lines(info));
     lines
 }
@@ -592,8 +602,9 @@ fn destination_scaffold(
     info: &TableInfo,
     source_type: &str,
     dest: &InitYamlDestination,
+    mode: &str,
 ) -> Vec<String> {
-    let prefix = yaml_quote_if_needed(&table_export_prefix(info, source_type));
+    let prefix = yaml_quote_if_needed(&table_export_prefix(info, source_type, mode));
     if let Some(bucket) = &dest.gcs_bucket {
         let bucket = yaml_quote_if_needed(bucket);
         let mut v = vec![
@@ -626,8 +637,12 @@ fn destination_scaffold(
         // a schema-wide init's exports don't all share ./output — that collides
         // their manifest.json / _SUCCESS and makes a second run read a sibling's
         // parts (the scary double-count WARN).
-        let path =
-            yaml_quote_if_needed(&format!("./output/{}/", export_segment(info, source_type)));
+        let seg = export_segment(info, source_type);
+        let path = if mode == "cdc" {
+            yaml_quote_if_needed(&format!("./output/{seg}/cdc/"))
+        } else {
+            yaml_quote_if_needed(&format!("./output/{seg}/"))
+        };
         vec![
             "    destination:".to_string(),
             "      type: local".to_string(),

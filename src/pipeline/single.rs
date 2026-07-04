@@ -343,6 +343,10 @@ pub(super) fn run_single_export(
     let fmt = format::create_format(plan.format, plan.compression, plan.compression_level, None);
     let ext = fmt.file_extension();
     let dest = destination::create_destination(&plan.destination)?;
+    // Finding #44, early check: fail cleanly before the first part if this
+    // prefix already belongs to a CDC export (cross-shape manifests clobber
+    // each other; the write-seam guard is the backstop).
+    crate::manifest::guard_manifest_mode(dest.as_ref(), "batch")?;
 
     // ADR-0004: log backend capabilities; warn when non-retry-safe destination is configured with retries.
     destination::log_capabilities(
