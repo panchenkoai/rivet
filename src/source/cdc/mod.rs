@@ -60,11 +60,24 @@ impl Position {
     }
 
     /// Persist atomically (temp file + rename) so a crash never leaves a torn
-    /// checkpoint that would resume from a corrupt position.
+    /// checkpoint that would resume from a corrupt position. Creates the
+    /// parent directory: `rivet init --mode cdc` scaffolds
+    /// `checkpoint: ./cdc/<table>.ckpt`, and the first client-flow rehearsal
+    /// (finding #43) died on the missing `./cdc/` with an ENOENT dressed in
+    /// the grants hint — a quickstart-blocking wall for every fresh user.
     pub(crate) fn save(&self, path: &Path) -> Result<()> {
+        use anyhow::Context as _;
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating checkpoint directory '{}'", parent.display()))?;
+        }
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, serde_json::to_vec(&self.0)?)?;
-        std::fs::rename(&tmp, path)?;
+        std::fs::write(&tmp, serde_json::to_vec(&self.0)?)
+            .with_context(|| format!("writing checkpoint '{}'", path.display()))?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("committing checkpoint '{}'", path.display()))?;
         Ok(())
     }
 }
@@ -544,6 +557,30 @@ pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<Vec<crate::manifest::Ru
 
 #[cfg(test)]
 mod tests {
+    /// Finding #43: `rivet init --mode cdc` scaffolds
+    /// `checkpoint: ./cdc/<table>.ckpt`; the first save must create the
+    /// parent, or every fresh quickstart dies on ENOENT dressed in the
+    /// grants hint.
+    #[test]
+    fn checkpoint_save_creates_missing_parent_directories() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("cdc").join("nested").join("orders.ckpt");
+        let pos = Position(serde_json::json!({"file": "binlog.000001", "pos": 4}));
+        pos.save(&path).expect("save must create parents");
+        let loaded = Position::load(&path).unwrap().expect("roundtrip");
+        assert_eq!(loaded.0["pos"], 4);
+        // And the error context names the path, not the grants, when the
+        // parent CANNOT be created (a file where the dir should be).
+        let blocker = d.path().join("blocked");
+        std::fs::write(&blocker, b"file").unwrap();
+        let bad = blocker.join("x.ckpt");
+        let err = pos.save(&bad).unwrap_err().to_string();
+        assert!(
+            err.contains("checkpoint directory"),
+            "the failure must name the real cause: {err}"
+        );
+    }
+
     use super::*;
 
     // Ultrareview bug_001: the loud-fail-on-missing-anchor promise held only
