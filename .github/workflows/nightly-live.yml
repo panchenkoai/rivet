@@ -69,7 +69,15 @@ jobs:
         # them the `--ignored` run fails 13 tests with `No such object:
         # rivet-duckdb` / `ClickHouse reachable on 127.0.0.1:8123` (pyarrow_*
         # cases also go through the shared rivet-duckdb exec helper).
-        run: docker compose --profile pool --profile loaders --profile cdc --profile replica up -d postgres mysql mssql minio fake-gcs azurite toxiproxy pgbouncer proxysql duckdb clickhouse postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica
+        run: |
+          # Same .live-tmp prolog as ci.yml's jobs: pre-create runner-owned
+          # (the daemon would root-own a missing bind-mount source), then
+          # re-open after ClickHouse chowns /work to uid 101 on boot. Without
+          # it every test that writes a shared workdir EACCESes — the first
+          # nightly after the cdc-oracle suite landed failed exactly there.
+          mkdir -p tests/.live-tmp
+          docker compose --profile pool --profile loaders --profile cdc --profile replica up -d postgres mysql mssql minio fake-gcs azurite toxiproxy pgbouncer proxysql duckdb clickhouse postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica
+          sudo chmod -R 0777 tests/.live-tmp
 
       - name: Wait for services
         run: |
@@ -153,17 +161,10 @@ jobs:
         # Skips the 1M-row "max_pressure" test that genuinely takes 3–5 min
         # even when seeded; leave that one for manual runs.
         #
-        # `validates`, `edge_cases`, and the `via_duckdb` differential tests are
-        # skipped: each writes a per-test workdir under the shared tests/.live-tmp
-        # bind mount, which the docker daemon first creates root:root on `compose
-        # up` and ClickHouse then chowns to its uid 101 on startup — so the
-        # runner-owned `create_dir_all` EACCESes (tests/common/env.rs:121). Even
-        # though this job *does* start duckdb/clickhouse (for type_roundtrip), it
-        # never `chmod`s the mount, so the workdir create still fails. (`edge_cases`
-        # covers BOTH pg_edge_cases and mysql_edge_cases — the latter is duckdb-
-        # backed too; `via_duckdb` is tests/live_differential.rs.) All three have a
-        # dedicated, correctly provisioned home in ci.yml's `test-type-validators`
-        # job (pre-create + `chmod 0777` the mount, start the readers) on every PR.
+        # `validates`, `edge_cases`, and the `via_duckdb` differential tests
+        # stay skipped for TIME, not permissions (the .live-tmp prolog above
+        # now provisions the shared mount here too): all three have a
+        # dedicated home in ci.yml's `test-type-validators` job on every PR.
         run: |
           cargo test --release -- --ignored \
             --skip full_content_export_max_pressure \
