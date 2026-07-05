@@ -80,3 +80,33 @@ Steps 1–2: byte-equal both sides. One row mutated on the source
 (`UPDATE … WHERE id = 4321`): global fold diverged, bucket scan flagged
 exactly bucket 4, row scan named id 4321 with both hashes. Detection →
 localization → pinpoint, zero code.
+
+## Warehouse-side duplicate check (post-merge)
+
+rivet delivers at-least-once: a crash-resumed CDC run can re-emit rows, and a
+merge is the warehouse's job. After the MERGE, assert the target has no
+duplicate primary keys — the same check `pip_db_replicator` runs in BigQuery
+(`duplicates_check.sql`). This belongs HERE, not in `rivet validate`: inside a
+single batch run a duplicate PK is already prevented (the wire-name guard +
+chunk-boundary hardening), and on CDC parts pre-merge, overlaps are
+*expected* (at-least-once), so an extractor-side dup check would false-alarm.
+
+```sql
+-- composite PK: CONCAT the key columns
+SELECT COUNT(*) - COUNT(DISTINCT CONCAT(CAST(id AS STRING))) AS duplicate_rows
+FROM `project.dataset.target_table`;
+-- 0 ⇒ the merge deduplicated correctly.
+```
+
+## Cross-run gap check (from the manifest, no source needed)
+
+The manifest's `source.extraction` ships the cursor RANGE each run covered.
+Continuity is verifiable from manifests ALONE — run N+1's `cursor_low` must
+equal run N's `cursor_high`; a gap is a silently-skipped range:
+
+```bash
+# for two consecutive incremental runs' manifests:
+jq -r '.source.extraction | "\(.cursor_low // "-") .. \(.cursor_high)"' run_N/manifest.json
+jq -r '.source.extraction | "\(.cursor_low) .. \(.cursor_high)"'       run_N1/manifest.json
+# run_N1.cursor_low MUST equal run_N.cursor_high — else the ids between were never extracted.
+```

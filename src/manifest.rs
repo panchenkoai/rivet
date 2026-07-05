@@ -181,6 +181,44 @@ pub struct ManifestSource {
     pub engine: String,
     pub schema: Option<String>,
     pub table: Option<String>,
+    /// The extraction contract this run fulfilled — strategy, cursor identity,
+    /// and the cursor RANGE this extract covered. Ported from the
+    /// pip_db_replicator meta-catalog idea: cursor metadata travels WITH the
+    /// extract so a downstream warehouse can reconcile continuity
+    /// (`run N+1.cursor_low` must follow `run N.cursor_high` — a gap is a
+    /// silently-skipped range) without querying rivet's private state.
+    /// `None` on manifests written before this field existed, and on paths
+    /// that carry no cursor (a full snapshot records only the strategy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extraction: Option<ExtractionMetadata>,
+}
+
+/// Cursor/strategy metadata shipped in the manifest for warehouse-side
+/// reconciliation. Cursor bounds are STRING-encoded and type-tagged: a lexical
+/// order lies on numbers (the same trap as a binlog `__pos` string), so the
+/// consumer compares by `cursor_type`, not by raw string order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExtractionMetadata {
+    /// `full` / `incremental` / `chunked` / `keyset` / `timewindow`.
+    pub strategy: String,
+    /// Resolved cursor/key column, when the strategy has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_column: Option<String>,
+    /// Source type of the cursor column (for typed range comparison).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_type: Option<String>,
+    /// Lowest cursor value covered by THIS extract (the prior run's high, or
+    /// the min seen this run). `None` for a full snapshot / first run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_low: Option<String>,
+    /// Highest cursor value covered — the value the NEXT run must resume from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_high: Option<String>,
+    /// Source-side row count at extraction time, when cheaply known — distinct
+    /// from the manifest's `row_count` (rows EXTRACTED). A divergence is the
+    /// reconciliation signal. `None` when not probed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_row_count: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -352,6 +390,7 @@ mod tests {
                 engine: "postgres".into(),
                 schema: Some("public".into()),
                 table: Some("orders".into()),
+                extraction: None,
             },
             destination: ManifestDestination {
                 kind: "gcs".into(),
@@ -611,6 +650,38 @@ pub fn guard_manifest_mode(
 #[cfg(test)]
 mod mode_guard_tests {
     use super::*;
+
+    #[test]
+    fn pre_extraction_manifests_parse_with_none() {
+        // Manifests written before the extraction section (the real v0.16
+        // fixture) must parse — the field is opt-in.
+        let old = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/compat/v0.16/cdc_manifest.json"),
+        )
+        .expect("compat fixture");
+        let m: RunManifest = serde_json::from_str(&old).expect("parses");
+        assert!(m.source.extraction.is_none());
+    }
+
+    #[test]
+    fn extraction_roundtrips_and_omits_none_fields() {
+        let ex = ExtractionMetadata {
+            strategy: "incremental".into(),
+            cursor_column: Some("id".into()),
+            cursor_type: None,
+            cursor_low: Some("1000".into()),
+            cursor_high: Some("2000".into()),
+            source_row_count: None,
+        };
+        let j = serde_json::to_string(&ex).unwrap();
+        // skip_serializing_if omits the None fields entirely.
+        assert!(!j.contains("cursor_type"), "None fields omitted: {j}");
+        assert!(!j.contains("source_row_count"), "{j}");
+        assert!(j.contains("\"cursor_low\":\"1000\""), "{j}");
+        let back: ExtractionMetadata = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, ex);
+    }
 
     #[test]
     fn pre_mode_manifests_default_to_batch() {

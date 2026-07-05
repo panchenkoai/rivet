@@ -89,6 +89,14 @@ impl ManifestBuilder {
                 engine: source_engine.to_string(),
                 schema: source_schema,
                 table: source_table,
+                extraction: Some(crate::manifest::ExtractionMetadata {
+                    strategy: plan.strategy.clone(),
+                    cursor_column: None,
+                    cursor_type: None,
+                    cursor_low: None,
+                    cursor_high: None,
+                    source_row_count: None,
+                }),
             },
             destination: ManifestDestination {
                 kind: plan.destination_type.clone(),
@@ -145,6 +153,27 @@ impl ManifestBuilder {
     ///
     /// `status` reflects the overall run outcome — `Success` is the only
     /// status that licenses the `_SUCCESS` marker (M2).
+    /// Record the cursor range this run covered (incremental strategies) so
+    /// the warehouse can prove continuity across runs. `low` is the prior
+    /// run's high (or the min seen this run); `high` is the value the next run
+    /// resumes from. No-op if there is no extraction section.
+    pub fn set_cursor_range(
+        &mut self,
+        column: Option<String>,
+        cursor_type: Option<String>,
+        low: Option<String>,
+        high: Option<String>,
+        source_row_count: Option<i64>,
+    ) {
+        if let Some(ex) = self.source.extraction.as_mut() {
+            ex.cursor_column = column;
+            ex.cursor_type = cursor_type;
+            ex.cursor_low = low;
+            ex.cursor_high = high;
+            ex.source_row_count = source_row_count;
+        }
+    }
+
     pub fn finalize(self, status: ManifestStatus) -> RunManifest {
         let row_count: i64 = self
             .parts

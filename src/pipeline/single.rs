@@ -401,12 +401,26 @@ pub(super) fn run_single_export(
     // hook now fires inside `RunStore::commit()` so every runner that uses
     // the facade inherits it.
     if let (Some(last_val), Some(st)) = (&sink.last_cursor_value, state) {
+        // Capture the value this run resumed FROM (the low) BEFORE the commit
+        // overwrites it with the new high — the cursor RANGE ships to the
+        // manifest for warehouse-side continuity (low..high, next run resumes
+        // from high; a non-contiguous low next time is a skipped range).
+        let prior_low = st
+            .get(&plan.export_name)
+            .ok()
+            .and_then(|e| e.last_cursor_value.clone());
         super::run_store::RunStore::finalize(st, plan, summary)
             .with_cursor(last_val.clone())
             .with_progression(super::run_store::Progression::Incremental {
                 last_value: last_val.clone(),
             })
             .commit()?;
+        summary.cursor_column = plan
+            .strategy
+            .incremental_plan()
+            .map(|p| p.column_for_storage_extract().to_string());
+        summary.cursor_low = prior_low;
+        summary.cursor_high = Some(last_val.clone());
     }
 
     // ADR-0012 M3: pin the dest schema fingerprint on the summary so
