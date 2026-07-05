@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.16.7 — 2026-07-05
+
+### Fixed
+
+- **CDC drain memory is now bounded — O(part rollover), not O(backlog) — on PostgreSQL and SQL Server.**
+  Both poll-model adapters read their entire pending backlog into memory in one query
+  (`pg_logical_slot_peek_changes(slot, NULL, NULL)` / `fn_cdc_get_all_changes(@from, max_lsn)`), so a large
+  replication lag spiked drain RSS. Measured draining a 1M-change backlog (5000-row transactions):
+  PostgreSQL 900 MB, SQL Server 1150 MB — against MySQL's streamed binlog at 76 MB. Both now read in
+  **bounded batches**: PostgreSQL peeks `upto_nchanges` = the part `rollover` and dedupes transactions by a
+  COMMIT-LSN frontier (refilling once the sink's ack advances the slot); SQL Server bounds the window to the
+  batch-th change's start LSN (a transaction boundary, so whole transactions only) and advances an internal
+  cursor. Drain RSS drops to **95 MB** (PostgreSQL) / **105 MB** (SQL Server), in line with MySQL. All CDC
+  invariants are unchanged — at-least-once, no split transactions, commit-boundary ack, the
+  retention-exhausted error, and NDJSON's single non-advancing peek — verified live (pg_cdc 15/15,
+  mssql_cdc 11/11). MySQL (already streamed) is untouched.
+
 ## 0.16.6 — 2026-07-05
 
 ### Added

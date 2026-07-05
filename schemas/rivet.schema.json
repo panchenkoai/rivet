@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Rivet config (rivet-cli 0.16.6)",
+  "title": "Rivet config (rivet-cli 0.16.7)",
   "description": "Top-level Rivet configuration root.\n\nOperators write this struct as YAML (typically `rivet.yaml`).  The\n`JsonSchema` derive is the source of truth for the `schemas/rivet.schema.json`\nartifact and the `rivet schema config` command's output (v0.7.3 P0).",
   "type": "object",
   "properties": {
