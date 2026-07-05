@@ -527,6 +527,8 @@ Failure behaviour is also parity: a value unrepresentable in the declared
 column (PostgreSQL `'NaN'::numeric` in a Parquet decimal) fails loudly on both
 paths, never a silent NULL.
 
+For the full operational failure playbook — every symptom, what rivet does, how to recover, how to prevent — see [cdc-failure-modes.md](cdc-failure-modes.md).
+
 **A vanished slot is a loud error, not a silent restart.** When a resume
 checkpoint exists but the slot is gone (dropped by an operator, or invalidated
 and removed), rivet refuses to re-create it — a fresh slot would anchor at the
