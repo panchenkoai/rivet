@@ -4,7 +4,8 @@
 //! LSN window — plain T-SQL over `tiberius` (no CDC-specific crate exists or is
 //! needed).
 //!
-//! `next_change` polls the change function once into a buffer and drains it; a
+//! `next_change` polls the change function in bounded LSN batches into a buffer
+//! and drains it (memory is O(batch), not O(total window)); a
 //! continuous daemon wraps [`crate::source::cdc::run`] in an outer poll loop. The
 //! runtime + connection are held by the stream (paid once, not per poll).
 //!
@@ -60,15 +61,28 @@ pub(crate) struct MssqlChangeStream {
     capture_instance: String,
     schema: String,
     table: String,
+    /// Internal read cursor — advanced per bounded batch so the next poll reads
+    /// the following window. NOT the durable resume position: that is the sink's
+    /// checkpoint (advanced only after a durable part), so a crash re-reads from
+    /// there (at-least-once) regardless of how far this cursor has moved.
     from_lsn: Option<String>,
     pending: VecDeque<ChangeEvent>,
-    drained: bool,
+    /// Max changes to pull per poll — bounds drain memory to O(batch) instead of
+    /// O(total change-table window). See [`crate::source::cdc::CdcConfig::peek_batch`].
+    batch_limit: i64,
+    /// A poll that returns no rows has drained the window up to the current max
+    /// LSN — the stream ends (the next scheduler run resumes from the checkpoint).
+    exhausted: bool,
 }
 
 impl MssqlChangeStream {
     /// Connect and bind to a capture instance. Holds the runtime + connection for
     /// the life of the stream (folds the per-poll runtime/connect smell away).
-    pub(crate) fn open(cfg: &MssqlCdcConfig, tls: Option<&TlsConfig>) -> Result<Self> {
+    pub(crate) fn open(
+        cfg: &MssqlCdcConfig,
+        tls: Option<&TlsConfig>,
+        peek_batch: usize,
+    ) -> Result<Self> {
         if !cfg
             .capture_instance
             .bytes()
@@ -129,7 +143,8 @@ impl MssqlChangeStream {
             table,
             from_lsn: cfg.from_lsn.clone(),
             pending: VecDeque::new(),
-            drained: false,
+            batch_limit: peek_batch.clamp(1, i32::MAX as usize) as i64,
+            exhausted: false,
         })
     }
 
@@ -140,6 +155,7 @@ impl MssqlChangeStream {
         capture_instance: &str,
         from_lsn: Option<String>,
         tls: Option<&TlsConfig>,
+        peek_batch: usize,
     ) -> Result<Self> {
         // Refuse remote plaintext / unauthenticated TLS before any dial (the gate
         // the batch MssqlSource uses).
@@ -156,56 +172,61 @@ impl MssqlChangeStream {
                 from_lsn,
             },
             tls,
+            peek_batch,
         )
     }
 
-    /// Poll the change table once over `[min_lsn, max_lsn]` into `pending`.
+    /// Poll ONE **bounded batch** of the change table into `pending`. `@to` is the
+    /// `__$start_lsn` of the `batch_limit`-th change, so the window `[@from, @to]`
+    /// returns only **whole transactions** (`fn_cdc_get_all_changes` never splits a
+    /// `__$start_lsn` group) — memory is O(batch), never O(total window). The
+    /// internal cursor then advances to `@to`; the next poll continues past it. A
+    /// poll that returns no rows has drained the window up to the current max LSN.
     fn fill(&mut self) -> Result<()> {
-        let Self {
-            rt,
-            client,
-            capture_instance,
-            schema,
-            table,
-            from_lsn,
-            pending,
-            ..
-        } = self;
-        // Resume window: read changes *after* the last durably-written LSN
-        // (`fn_cdc_increment_lsn`); on the first run (no checkpoint) start at the
-        // change table's min LSN. The guard skips the query when there is nothing
-        // new (`@from > @to`) or nothing captured yet (NULL LSNs) — calling
-        // `fn_cdc_get_all_changes` with those raises an error rather than 0 rows.
-        //
-        // If the resume LSN has fallen BELOW the min LSN, the cleanup job removed
-        // the changes between them — resuming from min would silently skip them. So
-        // we THROW instead, forcing a re-snapshot, rather than hide a gap. (First run
-        // sets `@from = @min`, so `@from < @min` is false there — only a stale resume
-        // checkpoint trips it.)
-        let from_expr = match from_lsn {
+        if self.exhausted {
+            return Ok(());
+        }
+        let ci = self.capture_instance.clone();
+        // Resume window: read changes *after* the last cursor LSN
+        // (`fn_cdc_increment_lsn`); on the first poll (no cursor) start at the
+        // change table's min LSN. If the cursor has fallen BELOW the min LSN the
+        // cleanup job removed the changes — THROW (forcing a re-snapshot) rather
+        // than silently skip. `@to` bounds the batch at a real transaction
+        // boundary (the batch_limit-th change's start LSN); NULL LSNs / nothing
+        // new leave `@to` NULL and the final SELECT returns zero rows.
+        let from_expr = match &self.from_lsn {
             Some(hex) => format!("sys.fn_cdc_increment_lsn(0x{hex})"),
-            None => format!("sys.fn_cdc_get_min_lsn('{ci}')", ci = capture_instance),
+            None => format!("sys.fn_cdc_get_min_lsn('{ci}')"),
         };
         let sql = format!(
             "DECLARE @from binary(10) = {from_expr}; \
              DECLARE @min binary(10) = sys.fn_cdc_get_min_lsn('{ci}'); \
-             DECLARE @to binary(10) = sys.fn_cdc_get_max_lsn(); \
+             DECLARE @max binary(10) = sys.fn_cdc_get_max_lsn(); \
              IF @from IS NOT NULL AND @min IS NOT NULL AND @from < @min \
                 THROW 51000, 'rivet cdc: the resume position is older than the SQL Server \
 CDC change-table retention (the cleanup job removed it). Resuming would silently skip changes \
 — re-snapshot the table (mode: full) and restart CDC from a fresh checkpoint.', 1; \
-             IF @from IS NOT NULL AND @to IS NOT NULL AND @from <= @to \
+             DECLARE @to binary(10) = NULL; \
+             IF @from IS NOT NULL AND @max IS NOT NULL AND @from <= @max \
+                SELECT @to = MAX(s) FROM (SELECT TOP ({batch}) __$start_lsn AS s \
+                    FROM cdc.fn_cdc_get_all_changes_{ci}(@from, @max, N'all') \
+                    ORDER BY __$start_lsn) q; \
+             IF @to IS NOT NULL \
                 SELECT * FROM cdc.fn_cdc_get_all_changes_{ci}(@from, @to, N'all') \
                 ORDER BY __$start_lsn, __$seqval;",
-            ci = capture_instance,
-            from_expr = from_expr,
+            batch = self.batch_limit,
         );
         // The most common SQL Server gotcha — "Invalid object name
         // cdc.fn_cdc_get_all_changes_…" — surfaces here, at the first poll, not at
         // connect. Append the setup hint so the missing CDC enable is obvious.
-        let rows = rt
-            .block_on(async { client.simple_query(sql).await?.into_first_result().await })
-            .map_err(|e| anyhow::Error::new(e).context(crate::source::cdc::MSSQL_CDC_HINT))?;
+        let rows = {
+            let Self { rt, client, .. } = self;
+            rt.block_on(async { client.simple_query(sql).await?.into_first_result().await })
+                .map_err(|e| anyhow::Error::new(e).context(crate::source::cdc::MSSQL_CDC_HINT))?
+        };
+        // Rows are ordered ascending by start LSN, so the last one's `__$start_lsn`
+        // is `@to` — the cursor advances there regardless of each row's op.
+        let mut max_lsn: Option<String> = None;
         for r in &rows {
             let mut op_code = 0i32;
             let mut lsn = String::new();
@@ -233,16 +254,19 @@ CDC change-table retention (the cleanup job removed it). Resuming would silently
                     }
                 }
             }
+            if !lsn.is_empty() {
+                max_lsn = Some(lsn.clone());
+            }
             let Some(op) = map_op(op_code) else { continue };
             // after-image for insert/update; the key (before-image) for delete
             let (before, after) = match op {
                 ChangeOp::Delete => (Some(values), None),
                 _ => (None, Some(values)),
             };
-            pending.push_back(ChangeEvent {
+            self.pending.push_back(ChangeEvent {
                 op,
-                schema: schema.clone(),
-                table: table.clone(),
+                schema: self.schema.clone(),
+                table: self.table.clone(),
                 before,
                 after,
                 position: Position(json!({ "lsn": lsn })),
@@ -251,14 +275,21 @@ CDC change-table retention (the cleanup job removed it). Resuming would silently
                 image_names: Some(std::sync::Arc::from(names)),
             });
         }
+        match max_lsn {
+            // Advance the internal cursor to @to; the next poll reads past it.
+            Some(l) => self.from_lsn = Some(l),
+            // No rows ⇒ the window is drained up to the current max LSN.
+            None => self.exhausted = true,
+        }
         Ok(())
     }
 }
 
 impl ChangeStream for MssqlChangeStream {
     fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
-        if self.pending.is_empty() && !self.drained {
-            self.drained = true;
+        // Refill a bounded batch whenever the buffer drains, advancing the cursor
+        // each time, until a poll returns nothing (window drained to the max LSN).
+        while self.pending.is_empty() && !self.exhausted {
             if let Err(e) = self.fill() {
                 return Some(Err(e));
             }
@@ -482,7 +513,7 @@ mod tests {
         // let the capture Agent job scan the log (~5 s cycle)
         std::thread::sleep(std::time::Duration::from_secs(8));
 
-        let mut s = MssqlChangeStream::open(&cfg("dbo_cdc_unit"), None).unwrap();
+        let mut s = MssqlChangeStream::open(&cfg("dbo_cdc_unit"), None, 10_000).unwrap();
         let mut ops = Vec::new();
         while let Some(ev) = s.next_change() {
             ops.push(ev.unwrap().op);

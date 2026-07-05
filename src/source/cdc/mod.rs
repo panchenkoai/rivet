@@ -217,6 +217,13 @@ pub(crate) struct CdcConfig {
     /// `require_tls_or_loopback` gate the batch path uses (refuse remote
     /// plaintext / unauthenticated TLS). `None` ⇒ loopback-only (the CLI default).
     pub tls: Option<crate::config::TlsConfig>,
+    /// Max changes the PostgreSQL adapter pulls per `peek` — the memory bound of
+    /// the drain (O(batch), not O(total backlog)). A durable (acking) sink sets
+    /// this to its part `rollover` so each peeked batch is flushed + acked before
+    /// the next; the NDJSON path (which never advances the slot) sets it huge so
+    /// one peek drains everything and the LSN-frontier check ends the stream.
+    /// Ignored by the MySQL (streaming) and SQL Server adapters.
+    pub peek_batch: usize,
 }
 
 /// The CDC engine, resolved ONCE from the source URL's scheme. Every
@@ -274,11 +281,14 @@ impl CdcEngine {
             Self::Postgres => {
                 // Slot creation IS the anchor; open() creates it only on a
                 // genuine FIRST run (resume_expected=false).
+                // Anchor-only open: it creates the slot and is dropped without
+                // reading, so the peek batch is irrelevant (any valid value).
                 drop(crate::source::postgres::cdc::PgChangeStream::open(
                     url,
                     slot,
                     resume_expected,
                     tls,
+                    1,
                 )?);
                 Ok(())
             }
@@ -358,6 +368,7 @@ pub(crate) fn create_change_stream(cfg: &CdcConfig) -> Result<Box<dyn ChangeStre
                     &cfg.slot,
                     resume_expected,
                     tls,
+                    cfg.peek_batch,
                 )
                 .context(PG_CDC_HINT)?,
             ))
@@ -380,8 +391,14 @@ pub(crate) fn create_change_stream(cfg: &CdcConfig) -> Result<Box<dyn ChangeStre
                         .map(str::to_string)
                 });
             Ok(Box::new(
-                crate::source::mssql::cdc::MssqlChangeStream::from_url(url, ci, from_lsn, tls)
-                    .context(MSSQL_CDC_HINT)?,
+                crate::source::mssql::cdc::MssqlChangeStream::from_url(
+                    url,
+                    ci,
+                    from_lsn,
+                    tls,
+                    cfg.peek_batch,
+                )
+                .context(MSSQL_CDC_HINT)?,
             ))
         }
     }

@@ -246,7 +246,7 @@ struct CdcArgs {
 fn dispatch_cdc(a: CdcArgs) -> Result<()> {
     let (url, _prov) = resolve_init_source(a.source, a.source_env, a.source_file)?;
     let ckpt = a.checkpoint.map(std::path::PathBuf::from);
-    let cdc_cfg = crate::source::cdc::CdcConfig {
+    let mut cdc_cfg = crate::source::cdc::CdcConfig {
         url: url.clone(),
         server_id: a.server_id,
         slot: a.slot,
@@ -256,6 +256,10 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
         // The CLI carries no TlsConfig; `None` ⇒ the require_tls_or_loopback gate
         // refuses a remote host (config-driven `rivet run` supplies source.tls).
         tls: None,
+        // NDJSON never advances the slot, so it cannot page: one huge peek drains
+        // the whole backlog and the LSN-frontier check ends the stream. The
+        // `--output` sink overrides this with its part `rollover` below.
+        peek_batch: usize::MAX,
     };
     let Some(dir) = a.output else {
         // NDJSON to stdout: no durable sink, so the slot is deliberately not
@@ -285,6 +289,8 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
         path: Some(dir.clone()),
         ..Default::default()
     })?;
+    // The file sink acks per part, so it CAN page: bound the peek to the part size.
+    cdc_cfg.peek_batch = a.rollover;
     let now = chrono::Utc::now().to_rfc3339();
     crate::source::cdc::run_capture(crate::source::cdc::CdcCapture {
         cdc_cfg,

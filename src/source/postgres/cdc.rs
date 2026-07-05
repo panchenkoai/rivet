@@ -36,7 +36,17 @@ pub(crate) struct PgChangeStream {
     client: Client,
     slot: String,
     pending: VecDeque<ChangeEvent>,
-    drained: bool,
+    /// Max changes to pull per `peek` — the memory bound of the drain
+    /// (O(batch), not O(total backlog)). See [`crate::source::cdc::CdcConfig::peek_batch`].
+    batch_limit: i32,
+    /// Largest COMMIT LSN already yielded THIS run. A refill re-peeks from the
+    /// slot's (un-acked) `restart_lsn`, so any transaction at/below this was
+    /// already delivered — it is dropped, making the refill idempotent.
+    frontier: u64,
+    /// A peek that yields no NEW transaction, or returns fewer than a full
+    /// batch, has drained everything past the ack frontier — the stream ends
+    /// (a non-acking consumer, e.g. NDJSON, ends here after its one big peek).
+    exhausted: bool,
 }
 
 impl PgChangeStream {
@@ -52,6 +62,7 @@ impl PgChangeStream {
         slot: &str,
         resume_expected: bool,
         tls: Option<&TlsConfig>,
+        peek_batch: usize,
     ) -> Result<Self> {
         // Same gate the batch path uses: refuse remote plaintext (CWE-319), and
         // use a verifying TLS connector when a TlsConfig is enforced.
@@ -90,33 +101,55 @@ impl PgChangeStream {
             client,
             slot: slot.to_string(),
             pending: VecDeque::new(),
-            drained: false,
+            // A logical slot never has 2^31 pending changes in one peek; clamp to
+            // the `pg_logical_slot_peek_changes` int4 arg and keep it >= 1.
+            batch_limit: peek_batch.clamp(1, i32::MAX as usize) as i32,
+            frontier: 0,
+            exhausted: false,
         })
     }
 
-    /// Poll the slot once into `pending` **without consuming it**
-    /// (`pg_logical_slot_peek_changes`). The slot is only advanced later, in
-    /// [`ChangeStream::ack`], once the changes are durably written — so a crash
-    /// before durability re-reads them (at-least-once) instead of losing them.
+    /// Peek **one bounded batch** into `pending` **without consuming it**
+    /// (`pg_logical_slot_peek_changes(slot, NULL, batch_limit)`). `upto_nchanges`
+    /// caps the batch at a **commit boundary** (PostgreSQL only stops after a
+    /// whole transaction), so memory is O(batch), never O(total backlog). The
+    /// slot is advanced later, in [`ChangeStream::ack`], once the changes are
+    /// durably written — a crash before durability re-reads them (at-least-once).
+    ///
+    /// Refill safety: a peek always starts at the slot's `restart_lsn`, which the
+    /// consumer's ack advances between batches. Until that ack lands the same
+    /// changes are visible again, so this drops any transaction whose COMMIT LSN
+    /// is at or below [`Self::frontier`] (already yielded). A peek that adds no
+    /// new transaction — or returns less than a full batch — has drained
+    /// everything past the ack frontier and marks the stream [`Self::exhausted`].
     fn fill(&mut self) -> Result<()> {
         let rows = self.client.query(
-            "SELECT lsn::text, data FROM pg_logical_slot_peek_changes($1, NULL, NULL)",
-            &[&self.slot],
+            "SELECT lsn::text, data FROM pg_logical_slot_peek_changes($1, NULL, $2)",
+            &[&self.slot, &self.batch_limit],
         )?;
+        let n_rows = rows.len();
         // Frame transactions (BEGIN … changes … COMMIT) and stamp every change with
-        // its transaction's COMMIT LSN — that is the only valid slot-advance
-        // boundary (advancing to a change's own mid-transaction LSN re-reads the
-        // whole transaction) and the commit-boundary resume position. Logical
-        // decoding only ever emits complete, committed transactions.
+        // its transaction's COMMIT LSN — the only valid slot-advance boundary and
+        // the commit-boundary resume position. Logical decoding only ever emits
+        // complete, committed transactions.
         let mut tx: Vec<ChangeEvent> = Vec::new();
+        let mut yielded_any = false;
         for r in rows {
             let lsn: String = r.get(0);
             let data: String = r.get(1);
             if data.starts_with("COMMIT") {
-                let commit = Position(json!({ "lsn": lsn }));
-                for mut ev in tx.drain(..) {
-                    ev.position = commit.clone();
-                    self.pending.push_back(ev);
+                let commit_lsn = parse_lsn(&lsn).unwrap_or(0);
+                // Already yielded on a prior (un-acked) peek ⇒ drop, idempotent.
+                if commit_lsn > self.frontier {
+                    let commit = Position(json!({ "lsn": lsn }));
+                    for mut ev in tx.drain(..) {
+                        ev.position = commit.clone();
+                        self.pending.push_back(ev);
+                    }
+                    self.frontier = commit_lsn;
+                    yielded_any = true;
+                } else {
+                    tx.clear();
                 }
             } else if data.starts_with("BEGIN") {
                 tx.clear();
@@ -124,14 +157,31 @@ impl PgChangeStream {
                 tx.push(ev);
             }
         }
+        // No new transaction (a non-acking consumer's second peek re-reads the
+        // same rows) or a short batch (backlog fit in one peek) ⇒ drained.
+        if !yielded_any || n_rows < self.batch_limit as usize {
+            self.exhausted = true;
+        }
         Ok(())
     }
 }
 
+/// Parse a `pg_lsn` rendering `X/Y` (two hex halves of a 64-bit position) into a
+/// comparable `u64`. `None` on a malformed value — the frontier check then treats
+/// it as `0` (never drops a real transaction on a parse miss).
+fn parse_lsn(lsn: &str) -> Option<u64> {
+    let (hi, lo) = lsn.split_once('/')?;
+    let hi = u32::from_str_radix(hi.trim(), 16).ok()?;
+    let lo = u32::from_str_radix(lo.trim(), 16).ok()?;
+    Some((u64::from(hi) << 32) | u64::from(lo))
+}
+
 impl ChangeStream for PgChangeStream {
     fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
-        if self.pending.is_empty() && !self.drained {
-            self.drained = true;
+        // Refill a bounded batch whenever the buffer drains — the ack (from the
+        // sink, after a durable part) has advanced the slot, so the next peek
+        // reads fresh changes. `fill` marks `exhausted` once nothing new remains.
+        while self.pending.is_empty() && !self.exhausted {
             if let Err(e) = self.fill() {
                 return Some(Err(e));
             }
@@ -801,7 +851,7 @@ mod tests {
             .unwrap();
 
         // Slot must exist BEFORE the changes for them to be captured.
-        let mut s = PgChangeStream::open(CONN, SLOT, false, None).unwrap();
+        let mut s = PgChangeStream::open(CONN, SLOT, false, None, 10_000).unwrap();
         admin
             .batch_execute(
                 "DROP TABLE IF EXISTS cdc_unit; CREATE TABLE cdc_unit (id INT PRIMARY KEY, v INT)",
