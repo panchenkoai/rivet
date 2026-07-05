@@ -153,6 +153,7 @@ fn build_manifest(run_id: &str, status: ManifestStatus, parts: Vec<ManifestPart>
             engine: "postgres".into(),
             schema: Some("public".into()),
             table: Some("orders".into()),
+            extraction: None,
         },
         destination: ManifestDestination {
             kind: "local".into(),

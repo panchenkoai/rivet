@@ -191,6 +191,15 @@ pub(super) fn finalize_manifest(
             summary.checksum_key_column.clone(),
         );
     }
+    if summary.cursor_column.is_some() || summary.cursor_high.is_some() {
+        builder.set_cursor_range(
+            summary.cursor_column.clone(),
+            None, // cursor_type: follow-up (needs source-type plumbing)
+            summary.cursor_low.clone(),
+            summary.cursor_high.clone(),
+            None, // source_row_count: follow-up (needs a source COUNT)
+        );
+    }
     let manifest = builder.finalize(status);
 
     let dest = match crate::destination::create_destination(&plan.destination) {

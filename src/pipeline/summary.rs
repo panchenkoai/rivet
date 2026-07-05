@@ -88,6 +88,13 @@ pub struct RunSummary {
     pub column_checksums: Vec<crate::manifest::ColumnChecksum>,
     /// The column the Form B checksum is keyed to (cursor/key column); `None` = un-keyed.
     pub checksum_key_column: Option<String>,
+    /// Cursor range this run covered (incremental strategies) — travels to the
+    /// manifest's extraction section for warehouse-side continuity checks.
+    /// v1 ships column + low + high; cursor_type / source_row_count are
+    /// follow-ups (they need extra source plumbing).
+    pub cursor_column: Option<String>,
+    pub cursor_low: Option<String>,
+    pub cursor_high: Option<String>,
     pub error_message: Option<String>,
     /// `profile` from YAML, or `balanced (default)` if omitted.
     pub tuning_profile: String,
@@ -211,6 +218,9 @@ impl RunSummary {
             apply_context: None,
             column_checksums: Vec::new(),
             checksum_key_column: None,
+            cursor_column: None,
+            cursor_low: None,
+            cursor_high: None,
             journal,
         }
     }
@@ -273,6 +283,9 @@ impl RunSummary {
             apply_context: None,
             column_checksums: Vec::new(),
             checksum_key_column: None,
+            cursor_column: None,
+            cursor_low: None,
+            cursor_high: None,
             journal,
         }
     }

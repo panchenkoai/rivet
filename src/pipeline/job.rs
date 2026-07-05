@@ -262,6 +262,9 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
     );
     let journal = crate::journal::RunJournal::new(&run_id, export_name);
     RunSummary {
+        cursor_column: None,
+        cursor_low: None,
+        cursor_high: None,
         run_id,
         export_name: export_name.to_string(),
         status: "failed".into(),

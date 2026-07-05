@@ -424,3 +424,57 @@ fn chunked_resume_force_overrides_success_gate() {
         "--force should reach the real 'nothing to resume' state past the gate; stderr:\n{forced_err}"
     );
 }
+
+/// The manifest's extraction section must ship the cursor RANGE and prove
+/// continuity across runs: run N+1's cursor_low equals run N's cursor_high
+/// (a non-contiguous low would be a silently-skipped range). Ported from the
+/// pip_db_replicator meta-catalog idea.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn incremental_manifest_ships_contiguous_cursor_range() {
+    require_alive(LiveService::Postgres);
+    let table_name = unique_name("qa12_curmeta");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {table_name} (id BIGINT PRIMARY KEY, v INT NOT NULL);
+         INSERT INTO {table_name} SELECT g, g*10 FROM generate_series(1,3) g;"
+    ))
+    .unwrap();
+    let _guard = PgTable::adopt(table_name.clone());
+    let export_name = unique_name("qa12_curmeta_exp");
+    let out = tempfile::tempdir().unwrap();
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!(r#"SELECT id, v FROM {table_name}"#))
+        .mode("incremental")
+        .export_line("cursor_column: id")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
+    let (_cfgdir, cfg) = cfg_dir_with(&yaml);
+
+    let read_ex = || -> serde_json::Value {
+        let m: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(out.path().join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        m["source"]["extraction"].clone()
+    };
+
+    assert!(run_rivet_export(&cfg, &export_name).status.success());
+    let e1 = read_ex();
+    assert_eq!(e1["strategy"], "incremental");
+    assert_eq!(e1["cursor_column"], "id");
+    assert_eq!(e1["cursor_high"], "3", "run 1 covered up to id 3");
+
+    c.batch_execute(&format!(
+        "INSERT INTO {table_name} SELECT g, g*10 FROM generate_series(4,7) g;"
+    ))
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    assert!(run_rivet_export(&cfg, &export_name).status.success());
+    let e2 = read_ex();
+    assert_eq!(
+        e2["cursor_low"], e1["cursor_high"],
+        "continuity: run 2's low must equal run 1's high (no skipped range)"
+    );
+    assert_eq!(e2["cursor_high"], "7", "run 2 covered up to id 7");
+}

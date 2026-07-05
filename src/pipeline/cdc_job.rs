@@ -324,6 +324,9 @@ fn cdc_summary(
     // Only the fields a CDC run has; the batch-specific rest (cursor, quality,
     // chunk, reconcile, …) stay at RunSummary::default() (None / 0 / empty).
     RunSummary {
+        cursor_column: None,
+        cursor_low: None,
+        cursor_high: None,
         run_id: run_id.to_string(),
         export_name: export.name.clone(),
         status: status.to_string(),

@@ -225,6 +225,7 @@ mod tests {
                 engine: "pg".into(),
                 schema: None,
                 table: None,
+                extraction: None,
             },
             destination: ManifestDestination {
                 kind: "local".into(),

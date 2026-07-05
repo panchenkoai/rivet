@@ -211,6 +211,7 @@ mod tests {
                 engine: "postgres".into(),
                 schema: Some("public".into()),
                 table: Some("orders".into()),
+                extraction: None,
             },
             destination: ManifestDestination {
                 kind: "local".into(),

@@ -44,6 +44,7 @@ fn empty_success_manifest(run_id: &str, export_name: &str) -> RunManifest {
             engine: "postgres".into(),
             schema: Some("public".into()),
             table: Some(export_name.into()),
+            extraction: None,
         },
         destination: ManifestDestination {
             kind: "local".into(),

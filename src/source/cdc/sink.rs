@@ -584,6 +584,14 @@ fn build_manifest(
         finished_at: run_id.to_string(),
         status: ManifestStatus::Success,
         source: ManifestSource {
+            extraction: Some(crate::manifest::ExtractionMetadata {
+                strategy: "cdc".to_string(),
+                cursor_column: None,
+                cursor_type: None,
+                cursor_low: None,
+                cursor_high: None,
+                source_row_count: None,
+            }),
             engine: engine.label().to_string(),
             schema: None,
             table: Some(out.table.clone()),
