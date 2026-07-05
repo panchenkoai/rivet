@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.16.6 — 2026-07-05
+
+### Added
+
+- **The manifest ships the cursor RANGE as a reconciliation contract.** An incremental export's
+  `source.extraction` now records the strategy, cursor column, and the `cursor_low..cursor_high` range
+  the run covered. Continuity is verifiable from manifests alone — run N+1's `cursor_low` must equal
+  run N's `cursor_high`; a non-contiguous low is a silently-skipped range — without querying rivet's
+  private state. The field is opt-in (older manifests parse with no extraction section). Ported from
+  the pip_db_replicator meta-catalog idea; `cursor_type` / `source_row_count` are follow-ups.
 
 ### Fixed
 
