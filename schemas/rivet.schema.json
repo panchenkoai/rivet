@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Rivet config (rivet-cli 0.16.7)",
+  "title": "Rivet config (rivet-cli 0.16.8)",
   "description": "Top-level Rivet configuration root.\n\nOperators write this struct as YAML (typically `rivet.yaml`).  The\n`JsonSchema` derive is the source of truth for the `schemas/rivet.schema.json`\nartifact and the `rivet schema config` command's output (v0.7.3 P0).",
   "type": "object",
   "properties": {
@@ -757,7 +757,7 @@
           "minimum": 0
         },
         "rollover": {
-          "description": "Rows per output part file (default 10000). A part also rolls at a\ntransaction boundary, so it never splits a transaction.",
+          "description": "Rows per output part file (default 100000). A part also rolls at a\ntransaction boundary, so it never splits a transaction. Larger ⇒ fewer,\nbigger files but more drain memory — the PostgreSQL peek reads a part's\nworth per batch, so drain RSS is O(rollover). Tune per workload: raise it\nto cut file count, lower it to cap memory on a small extractor.",
           "type": [
             "integer",
             "null"

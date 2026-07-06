@@ -37,7 +37,7 @@ pub(crate) struct PgChangeStream {
     slot: String,
     pending: VecDeque<ChangeEvent>,
     /// Max changes to pull per `peek` — the memory bound of the drain
-    /// (O(batch), not O(total backlog)). See [`crate::source::cdc::CdcConfig::peek_batch`].
+    /// (O(batch), not O(total backlog)). See [`crate::source::cdc::PeekBound`].
     batch_limit: i32,
     /// Largest COMMIT LSN already yielded THIS run. A refill re-peeks from the
     /// slot's (un-acked) `restart_lsn`, so any transaction at/below this was
@@ -62,7 +62,7 @@ impl PgChangeStream {
         slot: &str,
         resume_expected: bool,
         tls: Option<&TlsConfig>,
-        peek_batch: usize,
+        peek: crate::source::cdc::PeekBound,
     ) -> Result<Self> {
         // Same gate the batch path uses: refuse remote plaintext (CWE-319), and
         // use a verifying TLS connector when a TlsConfig is enforced.
@@ -101,9 +101,10 @@ impl PgChangeStream {
             client,
             slot: slot.to_string(),
             pending: VecDeque::new(),
-            // A logical slot never has 2^31 pending changes in one peek; clamp to
-            // the `pg_logical_slot_peek_changes` int4 arg and keep it >= 1.
-            batch_limit: peek_batch.clamp(1, i32::MAX as usize) as i32,
+            // `PeekBound::Sized` carries the sink's part rollover (so peek ≥
+            // rollover, never starves); `Unbounded` is the i32 ceiling. Either
+            // way it fits the `pg_logical_slot_peek_changes` int4 arg.
+            batch_limit: peek.rows_capped() as i32,
             frontier: 0,
             exhausted: false,
         })
@@ -851,7 +852,14 @@ mod tests {
             .unwrap();
 
         // Slot must exist BEFORE the changes for them to be captured.
-        let mut s = PgChangeStream::open(CONN, SLOT, false, None, 10_000).unwrap();
+        let mut s = PgChangeStream::open(
+            CONN,
+            SLOT,
+            false,
+            None,
+            crate::source::cdc::PeekBound::Sized(10_000),
+        )
+        .unwrap();
         admin
             .batch_execute(
                 "DROP TABLE IF EXISTS cdc_unit; CREATE TABLE cdc_unit (id INT PRIMARY KEY, v INT)",

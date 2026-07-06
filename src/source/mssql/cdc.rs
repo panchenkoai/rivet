@@ -68,7 +68,7 @@ pub(crate) struct MssqlChangeStream {
     from_lsn: Option<String>,
     pending: VecDeque<ChangeEvent>,
     /// Max changes to pull per poll — bounds drain memory to O(batch) instead of
-    /// O(total change-table window). See [`crate::source::cdc::CdcConfig::peek_batch`].
+    /// O(total change-table window). See [`crate::source::cdc::PeekBound`].
     batch_limit: i64,
     /// A poll that returns no rows has drained the window up to the current max
     /// LSN — the stream ends (the next scheduler run resumes from the checkpoint).
@@ -81,7 +81,7 @@ impl MssqlChangeStream {
     pub(crate) fn open(
         cfg: &MssqlCdcConfig,
         tls: Option<&TlsConfig>,
-        peek_batch: usize,
+        peek: crate::source::cdc::PeekBound,
     ) -> Result<Self> {
         if !cfg
             .capture_instance
@@ -143,7 +143,7 @@ impl MssqlChangeStream {
             table,
             from_lsn: cfg.from_lsn.clone(),
             pending: VecDeque::new(),
-            batch_limit: peek_batch.clamp(1, i32::MAX as usize) as i64,
+            batch_limit: peek.rows_capped() as i64,
             exhausted: false,
         })
     }
@@ -155,7 +155,7 @@ impl MssqlChangeStream {
         capture_instance: &str,
         from_lsn: Option<String>,
         tls: Option<&TlsConfig>,
-        peek_batch: usize,
+        peek: crate::source::cdc::PeekBound,
     ) -> Result<Self> {
         // Refuse remote plaintext / unauthenticated TLS before any dial (the gate
         // the batch MssqlSource uses).
@@ -172,7 +172,7 @@ impl MssqlChangeStream {
                 from_lsn,
             },
             tls,
-            peek_batch,
+            peek,
         )
     }
 
@@ -183,9 +183,8 @@ impl MssqlChangeStream {
     /// internal cursor then advances to `@to`; the next poll continues past it. A
     /// poll that returns no rows has drained the window up to the current max LSN.
     fn fill(&mut self) -> Result<()> {
-        if self.exhausted {
-            return Ok(());
-        }
+        // Only ever called from `next_change` under `!self.exhausted`, so no
+        // early-return guard here (matches the PostgreSQL adapter).
         let ci = self.capture_instance.clone();
         // Resume window: read changes *after* the last cursor LSN
         // (`fn_cdc_increment_lsn`); on the first poll (no cursor) start at the
@@ -513,7 +512,12 @@ mod tests {
         // let the capture Agent job scan the log (~5 s cycle)
         std::thread::sleep(std::time::Duration::from_secs(8));
 
-        let mut s = MssqlChangeStream::open(&cfg("dbo_cdc_unit"), None, 10_000).unwrap();
+        let mut s = MssqlChangeStream::open(
+            &cfg("dbo_cdc_unit"),
+            None,
+            crate::source::cdc::PeekBound::Sized(10_000),
+        )
+        .unwrap();
         let mut ops = Vec::new();
         while let Some(ev) = s.next_change() {
             ops.push(ev.unwrap().op);

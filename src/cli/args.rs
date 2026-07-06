@@ -183,8 +183,10 @@ pub enum Commands {
         /// Output file format when `--output` is set: `parquet` (default) or `csv`.
         #[arg(long, value_name = "FORMAT", default_value = "parquet")]
         format: String,
-        /// Rows per output file (rollover) when `--output` is set.
-        #[arg(long, value_name = "N", default_value_t = 10_000)]
+        /// Rows per output file (rollover) when `--output` is set. Larger ⇒ fewer,
+        /// bigger files but more drain memory (the PostgreSQL peek reads a part's
+        /// worth per batch: memory is O(rollover)). Turn it up/down per workload.
+        #[arg(long, value_name = "N", default_value_t = 100_000)]
         rollover: usize,
         /// PostgreSQL logical slot name (CDC; created if absent).
         #[arg(long, value_name = "NAME", default_value = "rivet_slot")]

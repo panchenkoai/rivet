@@ -20,7 +20,7 @@ rivet cdc --source 'mysql://rivet_cdc:***@db:3306/app' --table orders
 # write typed Parquet files (one row per change, after-image / upsert shape)
 rivet cdc --source 'mysql://rivet_cdc:***@db:3306/app' \
           --table orders --output ./cdc-out --format parquet \
-          --checkpoint ./orders.ckpt --rollover 10000
+          --checkpoint ./orders.ckpt --rollover 100000
 ```
 
 Prefer `--source-env VAR` or `--source-file path` over an inline URL outside local
@@ -33,6 +33,7 @@ dev — the URL is otherwise visible in `ps` / shell history.
 | `--table NAME` | only emit this table (repeatable for NDJSON; **exactly one** required for `--output`, whose schema is resolved from the source). |
 | `--output DIR` | write typed Parquet/CSV files instead of NDJSON. |
 | `--max-events N` | stop after N changes (otherwise stream until interrupted; the per-event checkpoint makes an interrupted run resumable). |
+| `--rollover N` | rows per output part file (default `100000`); also rolls at a transaction boundary, never splitting one. **This is the file-size ⇄ memory dial**: larger ⇒ fewer, bigger files but more drain memory (the PostgreSQL peek reads a part's worth per batch, so drain RSS is O(rollover) — ≈`28 MB + 1.3 KB × rollover`). Raise it to cut file count on a big host; lower it to cap memory on a small extractor. (Config: `cdc.rollover`.) |
 | `--slot NAME` | PostgreSQL logical slot (default `rivet_slot`; created if absent). |
 | `--capture-instance NAME` | SQL Server CDC capture instance (e.g. `dbo_orders`) — required for `sqlserver://`. |
 | `--until-current` | Catch up to the source's current log end, then **exit** instead of streaming. For MySQL this sets `BINLOG_DUMP_NON_BLOCK`; PostgreSQL / SQL Server already drain-and-exit. With `--max-events N`, the run stops at the smaller of "N events" or "end of log" — so it never blocks waiting for the N-th event. Ideal for a scheduler. |

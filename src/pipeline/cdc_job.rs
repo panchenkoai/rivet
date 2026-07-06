@@ -297,14 +297,11 @@ fn run_cdc_inner(
             checkpoint: cdc.checkpoint.as_ref().map(PathBuf::from),
             until_current: cdc.until_current,
             tls: config.source.tls.clone(),
-            // Bound the PostgreSQL peek to the part size: each peeked batch is
-            // flushed + acked before the next, so drain memory is O(rollover).
-            peek_batch: cdc.rollover.unwrap_or(10_000),
         },
         outputs,
         format: export.format,
         max_events: cdc.max_events,
-        rollover: cdc.rollover.unwrap_or(10_000),
+        rollover: cdc.rollover.unwrap_or(100_000),
         rollover_memory_bytes: cdc.rollover_memory_mb.map(|mb| mb * 1024 * 1024),
         run_id: run_id.to_string(),
         started_at: now,

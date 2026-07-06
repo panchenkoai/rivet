@@ -519,8 +519,11 @@ pub struct CdcExportConfig {
     pub until_current: bool,
     /// Stop after N change events (default: until end of stream / interrupted).
     pub max_events: Option<usize>,
-    /// Rows per output part file (default 10000). A part also rolls at a
-    /// transaction boundary, so it never splits a transaction.
+    /// Rows per output part file (default 100000). A part also rolls at a
+    /// transaction boundary, so it never splits a transaction. Larger ⇒ fewer,
+    /// bigger files but more drain memory — the PostgreSQL peek reads a part's
+    /// worth per batch, so drain RSS is O(rollover). Tune per workload: raise it
+    /// to cut file count, lower it to cap memory on a small extractor.
     pub rollover: Option<usize>,
     /// Roll a part once its buffered changes reach this many MB, whichever comes
     /// first with `rollover`. Caps the in-memory buffer and the part file size by
