@@ -409,6 +409,13 @@ fn check_plan_compatibility(
         Some(name) => config.exports.iter().filter(|e| e.name == name).collect(),
         None => config.exports.iter().collect(),
     };
+    // CDC exports are not plannable — plan/apply is the batch path; CDC runs via
+    // `rivet run`. Skipping them here avoids a misleading "plan did not build"
+    // WARN for a valid `mode: cdc` export (which has `tables:`/`table:`, no query).
+    let selected: Vec<&crate::config::ExportConfig> = selected
+        .into_iter()
+        .filter(|e| e.mode != crate::config::ExportMode::Cdc)
+        .collect();
     let mut rejected: Option<String> = None;
     for export in selected {
         // `--validate`/`--reconcile`/`--resume` are run-only flags; `check`

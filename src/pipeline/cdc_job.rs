@@ -193,7 +193,7 @@ pub(super) fn initial_snapshot_pending(
 /// export's destination (`<base>/<table>/`), so every table's prefix is
 /// self-describing (its own parts + `manifest.json` + `_SUCCESS`), exactly like
 /// N single-table exports — minus the N−1 extra slots/connections.
-fn dest_for_table(
+pub(crate) fn dest_for_table(
     base: &crate::config::DestinationConfig,
     table: &str,
 ) -> crate::config::DestinationConfig {

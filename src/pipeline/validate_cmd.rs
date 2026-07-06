@@ -137,108 +137,61 @@ pub fn run_validate_command(
             expanded_dest.path = Some(p.clone());
             expanded_dest.prefix = Some(p.clone());
         }
-        let resolved_prefix = resolved_prefix_for_display(&expanded_dest);
-        let dest = match crate::destination::create_destination(&expanded_dest) {
-            Ok(d) => d,
-            Err(e) => {
-                let msg = format!(
-                    "export '{}' (prefix: {}): could not open destination: {:#}",
-                    export.name, resolved_prefix, e
-                );
-                hard_failures.push(msg);
-                continue;
-            }
+        // A CDC export's output is one table prefix per captured table: a
+        // `tables:` stream fans each out under `<base>/<table>/` (via
+        // `cdc_job::dest_for_table`), a single-table export uses its prefix
+        // directly. Either way the change parts live at the table prefix with an
+        // optional nested `snapshot/` dataset, and a fanned-out base holds no
+        // manifest of its own — so descend per table (using the writer's builder)
+        // rather than verifying the base, which would read back "legacy_run" and
+        // fail the `__pos` check on a missing part.
+        let multiplex = if export.mode == crate::config::ExportMode::Cdc {
+            export.tables.as_deref().filter(|t| !t.is_empty())
+        } else {
+            None
         };
-        // Streaming destinations have no prefix to verify — note and skip.
-        if dest.capabilities().commit_protocol == crate::destination::WriteCommitProtocol::Streaming
-        {
-            log::info!(
-                "export '{}': streaming destination, skipping (nothing to verify)",
-                export.name
-            );
-            continue;
-        }
-        match verify_at_destination(&*dest, "", target.depth) {
-            Ok(mut v) => {
-                // Apply this export's `verify` policy: `content` fails the
-                // verdict when any part is only size-verified (review D).
-                v.enforce_content_policy(export.verify.requires_content());
-                // Finding #20: when the operator pinned a literal `--prefix`,
-                // they asserted a real dataset lives here. An absent manifest is
-                // then NOT the benign M6 legacy-run case (exit 0) — it almost
-                // always means the prefix was never written (a misconfigured CI
-                // gate `rivet validate && deploy` sailing past nothing). Escalate
-                // that exact shape (no manifest, no other failure) to a fatal
-                // `ManifestRequiredButAbsent` so the exit gate refuses it loudly
-                // instead of silently passing. No-op for every other shape (a
-                // real manifest, or an absent one already carrying a read error).
-                if target.prefix_override.is_some() {
-                    v.require_manifest_present(&resolved_prefix);
-                }
-                // Capture the verdict before `v` is moved into the result: the
-                // deeper Form B checksum re-read below must run *only* on a
-                // manifest that was found and passed the standard checks.
-                let manifest_verified = v.manifest_found && v.passed;
-                all_results.push(ExportVerdict {
-                    name: export.name.clone(),
-                    resolved_prefix,
-                    verification: v,
-                });
-                // CDC-specific: re-read the parts and confirm `__pos` stayed in
-                // source-log order (no reorder / no part-boundary overlap). The
-                // manifest check above already covered per-part MD5 / size / _SUCCESS.
-                // Full-depth only — like Form B below it downloads every part, so a
-                // light/sample run skips it (keeps the depth contract consistent).
-                if target.depth.runs_part_download()
-                    && export.mode == crate::config::ExportMode::Cdc
-                    && export.format == crate::config::FormatType::Parquet
-                {
-                    match crate::source::cdc::validate::check_positions(&*dest, "") {
-                        Ok(pc) if pc.is_ok() => log::info!(
-                            "export '{}': cdc __pos continuity OK — {} changes across {} parts, range {:?}..{:?}",
-                            export.name,
-                            pc.rows,
-                            pc.parts,
-                            pc.first,
-                            pc.last
-                        ),
-                        Ok(pc) => {
-                            for v in &pc.violations {
-                                hard_failures
-                                    .push(format!("export '{}': cdc __pos: {}", export.name, v));
-                            }
-                        }
-                        Err(e) => hard_failures.push(format!(
-                            "export '{}': cdc __pos check failed: {:#}",
-                            export.name, e
-                        )),
-                    }
-                }
-                // Form B: re-read the parts and verify the per-column value
-                // checksums recorded in the manifest (catches an Arrow→Parquet
-                // encode / post-write fault the in-process Form A cannot see).
-                // Gated on a found+passed manifest: an absent (legacy pass) or
-                // unreadable manifest is already accounted for above, so re-reading
-                // it here would either break the legacy pass or double-count.
-                //
-                // Graded depth: Form B is the **only** part-download step, so it
-                // runs at `--depth full` alone.  `light` and `sample` deliberately
-                // skip it — `sample` is "all structural checks, no part bodies".
-                if target.depth.runs_part_download()
-                    && manifest_verified
-                    && export.format == crate::config::FormatType::Parquet
-                    && let Err(e) =
-                        crate::source::value_checksum::validate_manifest_checksums(&*dest, "")
-                {
-                    hard_failures
-                        .push(format!("export '{}': value checksum: {:#}", export.name, e));
+        let has_snapshot = export.mode == crate::config::ExportMode::Cdc
+            && export.cdc.as_ref().and_then(|c| c.initial)
+                == Some(crate::config::CdcInitialMode::Snapshot);
+        match multiplex {
+            Some(tables) => {
+                for table in tables {
+                    verify_cdc_table(
+                        crate::pipeline::cdc_job::dest_for_table(&expanded_dest, table),
+                        format!("{}/{}", export.name, table),
+                        export,
+                        &target,
+                        has_snapshot,
+                        &mut all_results,
+                        &mut hard_failures,
+                    );
                 }
             }
-            Err(e) => {
-                hard_failures.push(format!(
-                    "export '{}' (prefix: {}): verify_at_destination failed: {:#}",
-                    export.name, resolved_prefix, e
-                ));
+            None if export.mode == crate::config::ExportMode::Cdc => {
+                // Single-table CDC: the export prefix IS the one table prefix.
+                verify_cdc_table(
+                    expanded_dest,
+                    export.name.clone(),
+                    export,
+                    &target,
+                    has_snapshot,
+                    &mut all_results,
+                    &mut hard_failures,
+                );
+            }
+            None => {
+                // Batch export: verify the prefix directly — no CDC `__pos`
+                // continuity, no nested snapshot dataset.
+                verify_one_prefix(
+                    expanded_dest,
+                    export.name.clone(),
+                    export,
+                    &target,
+                    false,
+                    false,
+                    &mut all_results,
+                    &mut hard_failures,
+                );
             }
         }
     }
@@ -324,6 +277,186 @@ fn resolved_prefix_for_display(dest: &crate::config::DestinationConfig) -> Strin
         .clone()
         .or_else(|| dest.path.clone())
         .unwrap_or_else(|| "<unresolved>".into())
+}
+
+/// Verify one CDC table's output at `table_dest`: its initial-snapshot dataset
+/// (when `has_snapshot`, a nested `snapshot/` prefix with its OWN manifest) plus
+/// its change parts. Shared by each table of a `tables:` stream AND a
+/// single-table CDC export — both write the same `<prefix>/{snapshot/, cdc-*}`
+/// shape, so both certify the snapshot and drop its (separately-verified) files
+/// from the change prefix's untracked-surplus advisory.
+#[allow(clippy::too_many_arguments)]
+fn verify_cdc_table(
+    table_dest: crate::config::DestinationConfig,
+    display_name: String,
+    export: &crate::config::ExportConfig,
+    target: &ValidateTarget,
+    has_snapshot: bool,
+    all_results: &mut Vec<ExportVerdict>,
+    hard_failures: &mut Vec<String>,
+) {
+    // The snapshot is a batch dataset with its own manifest — verify it, but with
+    // no `__pos` continuity check (snapshot rows carry no log position).
+    if has_snapshot {
+        let snap = crate::pipeline::cdc_job::dest_for_table(&table_dest, "snapshot");
+        verify_one_prefix(
+            snap,
+            format!("{display_name}/snapshot"),
+            export,
+            target,
+            false,
+            false,
+            all_results,
+            hard_failures,
+        );
+    }
+    verify_one_prefix(
+        table_dest,
+        display_name,
+        export,
+        target,
+        true,
+        has_snapshot,
+        all_results,
+        hard_failures,
+    );
+}
+
+/// Verify ONE resolved prefix (an export's whole destination, or one table's
+/// sub-prefix of a `tables:` CDC stream) and append its verdict / failures.
+/// `display_name` labels the verdict (`export` or `export/table[/snapshot]`);
+/// `run_cdc_pos_check` gates the CDC `__pos`-continuity re-read (off for a
+/// snapshot sub-prefix, whose batch rows carry no log position).
+#[allow(clippy::too_many_arguments)]
+fn verify_one_prefix(
+    expanded_dest: crate::config::DestinationConfig,
+    display_name: String,
+    export: &crate::config::ExportConfig,
+    target: &ValidateTarget,
+    run_cdc_pos_check: bool,
+    drop_snapshot_untracked: bool,
+    all_results: &mut Vec<ExportVerdict>,
+    hard_failures: &mut Vec<String>,
+) {
+    let resolved_prefix = resolved_prefix_for_display(&expanded_dest);
+    let dest = match crate::destination::create_destination(&expanded_dest) {
+        Ok(d) => d,
+        Err(e) => {
+            hard_failures.push(format!(
+                "export '{}' (prefix: {}): could not open destination: {:#}",
+                display_name, resolved_prefix, e
+            ));
+            return;
+        }
+    };
+    // Streaming destinations have no prefix to verify — note and skip.
+    if dest.capabilities().commit_protocol == crate::destination::WriteCommitProtocol::Streaming {
+        log::info!(
+            "export '{}': streaming destination, skipping (nothing to verify)",
+            display_name
+        );
+        return;
+    }
+    match verify_at_destination(&*dest, "", target.depth) {
+        Ok(mut v) => {
+            // Apply this export's `verify` policy: `content` fails the
+            // verdict when any part is only size-verified (review D).
+            v.enforce_content_policy(export.verify.requires_content());
+            // A `tables:` CDC table prefix holds its initial snapshot under a
+            // nested `snapshot/` dataset with its OWN manifest (verified as a
+            // separate prefix above). The listing here therefore sees those files
+            // as "untracked" surplus — but they are a known, separately-certified
+            // dataset, not orphans. Drop that advisory so the operator isn't told
+            // real data is stray. (Non-fatal already, so `passed` is unaffected.)
+            if drop_snapshot_untracked {
+                v.failures.retain(|f| {
+                    !matches!(
+                        f,
+                        crate::pipeline::validate_manifest::Failure::UntrackedObject { key, .. }
+                            if key.starts_with("snapshot/")
+                    )
+                });
+            }
+            // Finding #20: when the operator pinned a literal `--prefix`,
+            // they asserted a real dataset lives here. An absent manifest is
+            // then NOT the benign M6 legacy-run case (exit 0) — it almost
+            // always means the prefix was never written (a misconfigured CI
+            // gate `rivet validate && deploy` sailing past nothing). Escalate
+            // that exact shape (no manifest, no other failure) to a fatal
+            // `ManifestRequiredButAbsent` so the exit gate refuses it loudly
+            // instead of silently passing. No-op for every other shape (a
+            // real manifest, or an absent one already carrying a read error).
+            if target.prefix_override.is_some() {
+                v.require_manifest_present(&resolved_prefix);
+            }
+            // Capture the verdict before `v` is moved into the result: the
+            // deeper Form B checksum re-read below must run *only* on a
+            // manifest that was found and passed the standard checks.
+            let manifest_verified = v.manifest_found && v.passed;
+            all_results.push(ExportVerdict {
+                name: display_name.clone(),
+                resolved_prefix,
+                verification: v,
+            });
+            // CDC-specific: re-read the parts and confirm `__pos` stayed in
+            // source-log order (no reorder / no part-boundary overlap). The
+            // manifest check above already covered per-part MD5 / size / _SUCCESS.
+            // Full-depth only — like Form B below it downloads every part, so a
+            // light/sample run skips it (keeps the depth contract consistent).
+            if target.depth.runs_part_download()
+                && run_cdc_pos_check
+                && export.format == crate::config::FormatType::Parquet
+            {
+                match crate::source::cdc::validate::check_positions(&*dest, "") {
+                    Ok(pc) if pc.is_ok() => log::info!(
+                        "export '{}': cdc __pos continuity OK — {} changes across {} parts, range {:?}..{:?}",
+                        display_name,
+                        pc.rows,
+                        pc.parts,
+                        pc.first,
+                        pc.last
+                    ),
+                    Ok(pc) => {
+                        for viol in &pc.violations {
+                            hard_failures
+                                .push(format!("export '{}': cdc __pos: {}", display_name, viol));
+                        }
+                    }
+                    Err(e) => hard_failures.push(format!(
+                        "export '{}': cdc __pos check failed: {:#}",
+                        display_name, e
+                    )),
+                }
+            }
+            // Form B: re-read the parts and verify the per-column value
+            // checksums recorded in the manifest (catches an Arrow→Parquet
+            // encode / post-write fault the in-process Form A cannot see).
+            // Gated on a found+passed manifest: an absent (legacy pass) or
+            // unreadable manifest is already accounted for above, so re-reading
+            // it here would either break the legacy pass or double-count.
+            //
+            // Graded depth: Form B is the **only** part-download step, so it
+            // runs at `--depth full` alone.  `light` and `sample` deliberately
+            // skip it — `sample` is "all structural checks, no part bodies".
+            if target.depth.runs_part_download()
+                && manifest_verified
+                && export.format == crate::config::FormatType::Parquet
+                && let Err(e) =
+                    crate::source::value_checksum::validate_manifest_checksums(&*dest, "")
+            {
+                hard_failures.push(format!(
+                    "export '{}': value checksum: {:#}",
+                    display_name, e
+                ));
+            }
+        }
+        Err(e) => {
+            hard_failures.push(format!(
+                "export '{}' (prefix: {}): verify_at_destination failed: {:#}",
+                display_name, resolved_prefix, e
+            ));
+        }
+    }
 }
 
 fn render_pretty(results: &[ExportVerdict], hard_failures: &[String]) {
@@ -816,6 +949,117 @@ mod tests {
             0,
             "no surplus → no warnings"
         );
+    }
+
+    #[test]
+    fn multiplex_cdc_validates_each_table_sub_prefix() {
+        // Regression: a `tables:` CDC stream lands each table under its OWN
+        // sub-prefix (`<base>/<table>/`, via `cdc_job::dest_for_table`). The base
+        // prefix holds no manifest, so validating it alone read back as an empty
+        // "legacy_run" and produced a single base verdict — the operator could
+        // not certify the stream. The command must descend into each table.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("cdc");
+        stage_dataset(&base.join("alpha"), &success_manifest(Vec::new()));
+        stage_dataset(&base.join("beta"), &success_manifest(Vec::new()));
+        let cfg = write_multiplex_cfg(dir.path(), &base);
+
+        let report = dir.path().join("report.json");
+        run_validate_command(
+            cfg.to_str().unwrap(),
+            None,
+            ValidateOutputFormat::Json(Some(report.to_string_lossy().into_owned())),
+            // Sample depth: exercise the per-table descent + manifest verify
+            // without the full-depth part download (empty datasets carry no
+            // parquet to __pos-check).
+            ValidateTarget {
+                depth: ValidateDepth::Sample,
+                ..Default::default()
+            },
+        )
+        .expect("both table sub-prefixes are complete — the stream must validate");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+        let names: Vec<&str> = json["exports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["export_name"].as_str().unwrap())
+            .collect();
+        // ONE verdict per table, named `<export>/<table>` — proof the descent
+        // ran (the un-fixed command produced a single "cdc" verdict at the base).
+        assert_eq!(names, vec!["cdc/alpha", "cdc/beta"], "per-table descent");
+        for e in json["exports"].as_array().unwrap() {
+            assert_eq!(e["verification"]["passed"], true, "each table passes");
+        }
+    }
+
+    fn write_multiplex_cfg(dir: &Path, base: &Path) -> std::path::PathBuf {
+        let cfg = dir.join("rivet-cdc.yaml");
+        let yaml = format!(
+            "source:\n  type: mysql\n  url: mysql://nobody@localhost/nope\nexports:\n  - name: cdc\n    tables: [alpha, beta]\n    mode: cdc\n    format: parquet\n    cdc:\n      server_id: 1\n    destination:\n      type: local\n      path: \"{}\"\n",
+            base.to_string_lossy()
+        );
+        std::fs::write(&cfg, yaml).unwrap();
+        cfg
+    }
+
+    #[test]
+    fn single_table_cdc_certifies_snapshot_and_hides_its_untracked() {
+        // A single-table CDC export with `initial: snapshot` lands its snapshot as
+        // a nested `snapshot/` dataset under the change prefix. Validate must
+        // (a) give the snapshot its OWN verdict (so a missing/broken snapshot is
+        // caught) and (b) NOT flag the snapshot files as "untracked" at the change
+        // prefix — they are a separately-verified dataset, not orphans.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("cdc");
+        stage_dataset(&base, &success_manifest(Vec::new()));
+        stage_dataset(&base.join("snapshot"), &success_manifest(Vec::new()));
+        let cfg = write_single_cdc_cfg(dir.path(), &base);
+
+        let report = dir.path().join("report.json");
+        run_validate_command(
+            cfg.to_str().unwrap(),
+            None,
+            ValidateOutputFormat::Json(Some(report.to_string_lossy().into_owned())),
+            ValidateTarget {
+                depth: ValidateDepth::Sample,
+                ..Default::default()
+            },
+        )
+        .expect("snapshot + change datasets are complete");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+        let exports = json["exports"].as_array().unwrap();
+        let names: Vec<&str> = exports
+            .iter()
+            .map(|e| e["export_name"].as_str().unwrap())
+            .collect();
+        // The snapshot got its own verdict, and the change prefix its own.
+        assert!(
+            names.contains(&"cdc/snapshot"),
+            "snapshot certified: {names:?}"
+        );
+        assert!(names.contains(&"cdc"), "change-prefix verdict: {names:?}");
+        // The change-prefix verdict carries NO untracked-snapshot advisory.
+        let change = exports.iter().find(|e| e["export_name"] == "cdc").unwrap();
+        let failures = change["verification"]["failures"].as_array().unwrap();
+        assert!(
+            failures.iter().all(|f| f["kind"] != "untracked_object"),
+            "snapshot files must not read as untracked surplus: {failures:?}"
+        );
+    }
+
+    fn write_single_cdc_cfg(dir: &Path, base: &Path) -> std::path::PathBuf {
+        let cfg = dir.join("rivet-single-cdc.yaml");
+        let yaml = format!(
+            "source:\n  type: mysql\n  url: mysql://nobody@localhost/nope\nexports:\n  - name: cdc\n    table: t\n    mode: cdc\n    format: parquet\n    cdc:\n      initial: snapshot\n      server_id: 1\n      checkpoint: ./ck\n    destination:\n      type: local\n      path: \"{}\"\n",
+            base.to_string_lossy()
+        );
+        std::fs::write(&cfg, yaml).unwrap();
+        cfg
     }
 
     #[test]

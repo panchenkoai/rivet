@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.16.9 — 2026-07-06
+
+### Changed
+
+- **`rivet init --mode cdc` scaffolds whole-database CDC in one step.** Without `--table`, it now emits a
+  single `tables:` multiplex export on MySQL/PostgreSQL (one slot / one `server_id`, and per-table decimal
+  overrides as qualified `"table.column"` keys) instead of N per-table exports that collided on the MySQL
+  `server_id`. SQL Server stays per-table — its capture instances are per-table by engine design (see the
+  new "Whole-database CDC across engines" section in `docs/reference/cdc.md`). You no longer hand-list
+  tables or deconflict stream resources for a whole-database CDC export.
+
+### Fixed
+
+- **`rivet validate` now certifies a whole CDC stream.** For a `tables:` multiplex — and any CDC export
+  with `initial: snapshot` — it descends into each table's sub-prefix and its `snapshot/` sub-dataset,
+  emitting one verdict per table. Previously, validating a multiplex read the (manifest-less) base prefix
+  back as an empty "legacy_run" and failed the `__pos` check on a missing part; the snapshot dataset went
+  uncertified and its files were mislabelled as "untracked" surplus.
+
+### Internal
+
+- `rivet check` skips the plan-compatibility probe for `mode: cdc` exports (CDC runs via `rivet run`, not
+  the plan/apply batch path), removing a misleading "plan did not build" warning for a valid CDC config.
+
 ## 0.16.8 — 2026-07-06
 
 ### Changed

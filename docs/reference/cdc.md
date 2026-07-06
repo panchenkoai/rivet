@@ -162,10 +162,39 @@ so same-named columns needing different treatments never collide:
 ```
 
 A qualified key naming a table the export does not capture is a **config
-error** (a typo must fail at load, never silently miss its target). `tables:` is PostgreSQL/MySQL only for now — SQL Server
-capture instances are per-table (use one export per table there; sharing a
-`capture_instance` between exports is safe, since the change-table poll is
-read-only and resume state lives in the per-export checkpoint). Each run produces the standard
+error** (a typo must fail at load, never silently miss its target).
+
+**Whole-database CDC across engines — and why the config shape differs.**
+`tables:` multiplexing is **PostgreSQL/MySQL only**, and that is a property of the
+*engine*, not a rivet or driver limit. MySQL exposes one server-wide binlog and
+PostgreSQL one logical slot — a single stream carrying every table's changes, so
+rivet reads it once and routes by table (and two exports sharing the
+slot/`server_id` would collide — exactly the scarce resource the one-stream form
+conserves). SQL Server has no such stream: CDC is enabled **per table**
+(`sys.sp_cdc_enable_table`) and read through a **per-capture-instance** function
+(`cdc.fn_cdc_get_all_changes_<instance>`) — there is no server-wide "all changes"
+surface to tap, so capture is inherently per-table. Use **one export per table**
+there, each with its own `capture_instance`; sharing a `capture_instance` between
+exports is safe (the change-table poll is read-only and resume state lives in the
+per-export checkpoint), and per-table exports never collide (no slot / `server_id`
+— the change tables are populated by one shared capture Agent regardless of how
+many readers).
+
+The **operator flow is identical across all three engines**, only the config
+shape differs:
+
+- `rivet init --mode cdc` (no `--table`) scaffolds the whole database on every
+  engine — **one** `tables:` export on MySQL/PostgreSQL, **one export per table**
+  (distinct `capture_instance`) on SQL Server — so you never hand-list tables.
+- `rivet run -c <config>` drains the whole set; add `--parallel-export-processes`
+  to run SQL Server's per-table exports concurrently.
+- `rivet validate -c <config>` descends into every table's prefix **and** its
+  `initial: snapshot` sub-dataset on every engine, so one command certifies the
+  whole stream.
+
+The per-table vs one-stream split is connection/resource **topology**, not
+throughput or memory: drain RSS is O(part `rollover`) per stream on all three
+engines, independent of table count. Each run produces the standard
 per-export summary block and an `export_metrics` row (rows / files / bytes /
 duration / status), so CDC shows up in `rivet metrics` and the run aggregate
 exactly like a batch export. **TLS:** unlike the CLI (which is loopback-only),
