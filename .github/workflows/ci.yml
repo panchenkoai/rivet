@@ -57,6 +57,29 @@ jobs:
           done
           [ "$FAIL" = "0" ]
 
+  boundary:
+    name: OSS must not depend on rivet-pro (one-way seam, ADR-0026)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: No rivet-pro references in OSS sources
+        # The paid tier (rivet-pro, private/BSL) depends on this engine — never
+        # the reverse. A `use rivet_pro` or a Cargo.toml dependency would make
+        # the MIT binary unbuildable without the private crate and leak paid
+        # code into an MIT distribution. docs/ may name it (ADR-0026); code and
+        # manifest may not.
+        # `-w` (whole word) is used deliberately: a plain substring match
+        # false-positives on identifiers like `_rivet_probe` (an SQL alias in
+        # src/preflight/mssql.rs). `git grep -E` does NOT support `\b` portably,
+        # so `-w` is the portable word-boundary. It still matches both real
+        # forms — `rivet_pro` (Rust) and `rivet-pro` (Cargo/repo).
+        run: |
+          if git grep -nwE 'rivet[_-]pro' -- src/ Cargo.toml; then
+            echo "::error::OSS tree references the private rivet-pro crate — the extension seam is one-way (ADR-0026). Remove it."
+            exit 1
+          fi
+          echo "ok: no rivet-pro references in src/ or Cargo.toml"
+
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest

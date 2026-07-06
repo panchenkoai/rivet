@@ -71,6 +71,7 @@ harness needs it", not "public API".
 - **Docs reflect intent**: `cargo doc` will not generate docs for `pub(crate)` modules, reducing confusion about the intended API surface.
 - **Binary compilation path**: `src/main.rs` declares all modules privately via `mod` — it never uses the library crate. The two targets are independent compilation units that happen to share source files.
 - **Future library path**: If Rivet ever offers a stable embedding API, a separate `rivet-engine` crate should be extracted with its own semver-tracked surface, rather than promoting internal types to `pub`.
+  - *Amended by [ADR-0026](0026-first-party-extension-seam.md)*: a minimal **first-party** extension seam (the `types`/`types::target` resolution items) is now stability-tracked in-crate for the private `rivet-pro` companion. The full `rivet-engine` extraction is deferred until a *non-first-party* external consumer appears.
 
 ---
 
