@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.16.8 — 2026-07-06
+
+### Changed
+
+- **CDC part `rollover` default is now 100000 rows (was 10000)** — ~10× fewer output files per drain,
+  at the cost of more drain memory. The PostgreSQL peek reads a part's worth per batch, so drain RSS is
+  O(rollover) (≈ `28 MB + 1.3 KB × rollover` ≈ 166 MB at 100k). It stays a knob: raise `cdc.rollover` /
+  `--rollover` to cut file count further on a big host, or lower it to cap memory on a small extractor.
+  (A byte-size `max_file_size` target for CDC was prototyped and rejected: on PostgreSQL, paging the slot
+  IS the ack IS the durability point, so accumulating a large multi-batch part either loses the ability
+  to page — data loss — or requires holding the whole part's worth in memory, the very cost the 0.16.7
+  bounded-peek fix removed.)
+
+### Internal
+
+- **The CDC peek bound is derived from the part `rollover` by type, not by convention.** `peek_batch`
+  (a free `usize` three call sites kept equal to `rollover` by hand) becomes
+  `PeekBound { Sized(rollover) | Unbounded }`, so a PostgreSQL peek smaller than the part rollover —
+  which silently starves and drops the backlog — is now unrepresentable. Also removed a dead `exhausted`
+  guard in the SQL Server adapter, and recorded ADR-0025 on why the poll adapters' byte-identical refill
+  loop stays inlined per adapter (extracting it fights the borrow checker for < 10 lines).
+
 ## 0.16.7 — 2026-07-05
 
 ### Fixed
