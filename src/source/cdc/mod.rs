@@ -217,13 +217,36 @@ pub(crate) struct CdcConfig {
     /// `require_tls_or_loopback` gate the batch path uses (refuse remote
     /// plaintext / unauthenticated TLS). `None` ⇒ loopback-only (the CLI default).
     pub tls: Option<crate::config::TlsConfig>,
-    /// Max changes the PostgreSQL adapter pulls per `peek` — the memory bound of
-    /// the drain (O(batch), not O(total backlog)). A durable (acking) sink sets
-    /// this to its part `rollover` so each peeked batch is flushed + acked before
-    /// the next; the NDJSON path (which never advances the slot) sets it huge so
-    /// one peek drains everything and the LSN-frontier check ends the stream.
-    /// Ignored by the MySQL (streaming) and SQL Server adapters.
-    pub peek_batch: usize,
+}
+
+/// How many changes a poll adapter pulls per `peek` — the drain's memory bound.
+/// It is NOT a free number: on PostgreSQL the peek is non-consuming and pages
+/// forward only when the sink acks (advances the slot) at a `rollover` boundary,
+/// so a peek SMALLER than the part rollover starves — the second peek re-reads
+/// the same changes, trips `exhausted`, and drops the rest of the backlog. This
+/// enum makes that unrepresentable: the acking sink builds [`PeekBound::Sized`]
+/// **from its own rollover** (so peek == rollover, always ≥), and the NDJSON
+/// driver — which never acks — is [`PeekBound::Unbounded`] (one peek drains
+/// everything; the LSN-frontier check ends the stream). There is no way to hand
+/// the stream a bare "peek 500" that undershoots the rollover.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PeekBound {
+    /// Peek at most this many changes per batch — the sink passes its part
+    /// `rollover`, so it is ≥ rollover by construction.
+    Sized(usize),
+    /// One peek pulls the whole backlog (the non-acking NDJSON path).
+    Unbounded,
+}
+
+impl PeekBound {
+    /// Resolve to a positive `upto_nchanges`-style row cap the adapters clamp to
+    /// their SQL arg width. `Unbounded` ⇒ the i32 ceiling (effectively "all").
+    pub(crate) fn rows_capped(self) -> usize {
+        match self {
+            PeekBound::Sized(n) => n.clamp(1, i32::MAX as usize),
+            PeekBound::Unbounded => i32::MAX as usize,
+        }
+    }
 }
 
 /// The CDC engine, resolved ONCE from the source URL's scheme. Every
@@ -282,13 +305,13 @@ impl CdcEngine {
                 // Slot creation IS the anchor; open() creates it only on a
                 // genuine FIRST run (resume_expected=false).
                 // Anchor-only open: it creates the slot and is dropped without
-                // reading, so the peek batch is irrelevant (any valid value).
+                // reading, so the peek bound is irrelevant.
                 drop(crate::source::postgres::cdc::PgChangeStream::open(
                     url,
                     slot,
                     resume_expected,
                     tls,
-                    1,
+                    PeekBound::Unbounded,
                 )?);
                 Ok(())
             }
@@ -338,7 +361,10 @@ pub(crate) const MSSQL_CDC_HINT: &str = "if this is a permissions/setup error: S
 /// Construct the right [`ChangeStream`] adapter for the source URL's scheme —
 /// dispatching by engine exactly as [`crate::source::create_source`] does for the
 /// batch path.
-pub(crate) fn create_change_stream(cfg: &CdcConfig) -> Result<Box<dyn ChangeStream>> {
+pub(crate) fn create_change_stream(
+    cfg: &CdcConfig,
+    peek: PeekBound,
+) -> Result<Box<dyn ChangeStream>> {
     use anyhow::Context;
     let url = cfg.url.as_str();
     let tls = cfg.tls.as_ref();
@@ -368,7 +394,7 @@ pub(crate) fn create_change_stream(cfg: &CdcConfig) -> Result<Box<dyn ChangeStre
                     &cfg.slot,
                     resume_expected,
                     tls,
-                    cfg.peek_batch,
+                    peek,
                 )
                 .context(PG_CDC_HINT)?,
             ))
@@ -392,11 +418,7 @@ pub(crate) fn create_change_stream(cfg: &CdcConfig) -> Result<Box<dyn ChangeStre
                 });
             Ok(Box::new(
                 crate::source::mssql::cdc::MssqlChangeStream::from_url(
-                    url,
-                    ci,
-                    from_lsn,
-                    tls,
-                    cfg.peek_batch,
+                    url, ci, from_lsn, tls, peek,
                 )
                 .context(MSSQL_CDC_HINT)?,
             ))
@@ -540,7 +562,10 @@ pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<Vec<crate::manifest::Ru
     let url = cap.cdc_cfg.url.clone();
     let tls = cap.cdc_cfg.tls.clone();
     let checkpoint = cap.cdc_cfg.checkpoint.clone();
-    let mut stream = create_change_stream(&cap.cdc_cfg)?;
+    // Derive the peek bound from the ONE rollover the sink also uses — so the
+    // PG peek is always ≥ the part rollover (never starves). The single source
+    // of truth for both is `cap.rollover`.
+    let mut stream = create_change_stream(&cap.cdc_cfg, PeekBound::Sized(cap.rollover))?;
     // Fault point: stream (and any server-side anchor) opened, nothing read.
     crate::test_hook::maybe_panic_at("cdc_after_open");
     let engine = CdcEngine::from_url(&url)?;
