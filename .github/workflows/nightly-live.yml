@@ -32,7 +32,7 @@ jobs:
     timeout-minutes: 60
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6.0.3
+      - uses: actions/checkout@v7
 
       # ubuntu-latest ships ~14 GB free. This job runs a release build +
       # release test rebuild + 7 docker images + the 60K-row content_items
@@ -202,7 +202,7 @@ jobs:
     timeout-minutes: 180
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-mutants
@@ -218,7 +218,7 @@ jobs:
             -- --tests
       - name: Upload mutants report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mutants-out
           path: mutants.out
@@ -241,7 +241,7 @@ jobs:
           - { engine: postgres, tag: "13", env: POSTGRES_CDC_TAG }
           - { engine: postgres, tag: "17", env: POSTGRES_CDC_TAG }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Start the CDC stack at the scouted tag
@@ -270,7 +270,7 @@ jobs:
     timeout-minutes: 60
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Sunday gate
         id: day
         run: echo "sunday=$([ "$(date -u +%u)" = "7" ] && echo yes || echo no)" >> "$GITHUB_OUTPUT"
