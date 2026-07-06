@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Internal
+
+- **First-party extension seam (ADR-0026).** Named a minimal, stability-tracked subset of the library —
+  the `types` / `types::target` resolution items (`TypeMapping`, `ExportTarget::resolve_table` /
+  `resolve_column`, `TargetColumnSpec`, `TargetInput`) — as the contract the private `rivet-pro` crate
+  (paid tier, BSL 1.1) builds on. These stay `pub`; a shape change is now deliberate (update `rivet-pro`
+  + a `Breaking (extension seam)` note). Amends ADR-0002: the full `rivet-engine` extraction is deferred
+  until a non-first-party consumer appears. Enforced by a compile-canary (`tests/offline/extension_seam.rs`)
+  and a CI `boundary` job that forbids any `rivet-pro` reference in `src/` — the dependency is one-way.
+  No user-facing or runtime change.
+
 ## 0.16.9 — 2026-07-06
 
 ### Changed

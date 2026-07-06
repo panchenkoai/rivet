@@ -26,6 +26,8 @@ mod config_parse_errors;
 mod config_secrets;
 #[path = "offline/examples_parse.rs"]
 mod examples_parse;
+#[path = "offline/extension_seam.rs"]
+mod extension_seam;
 #[path = "offline/format_fuzz.rs"]
 mod format_fuzz;
 #[path = "offline/planner_fuzz.rs"]
