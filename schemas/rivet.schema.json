@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Rivet config (rivet-cli 0.16.9)",
+  "title": "Rivet config (rivet-cli 0.17.0)",
   "description": "Top-level Rivet configuration root.\n\nOperators write this struct as YAML (typically `rivet.yaml`).  The\n`JsonSchema` derive is the source of truth for the `schemas/rivet.schema.json`\nartifact and the `rivet schema config` command's output (v0.7.3 P0).",
   "type": "object",
   "properties": {
@@ -30,6 +30,10 @@
     "parallel_export_processes": {
       "type": "boolean",
       "default": false
+    },
+    "load": {
+      "description": "Reserved for a downstream, first-party warehouse loader: the load target\nlives here so ONE config can drive both the export and a\ndownstream load. Rivet stops at \"file in a bucket\" and **does not\ninterpret** this block — it is accepted and ignored, present only so\n`rivet check` / `run` / `apply` don't reject a config that carries it.",
+      "default": null
     }
   },
   "additionalProperties": false,

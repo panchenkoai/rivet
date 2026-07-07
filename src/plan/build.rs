@@ -543,6 +543,7 @@ mod tests {
             notifications: None,
             parallel_exports: false,
             parallel_export_processes: false,
+            load: None,
         }
     }
 

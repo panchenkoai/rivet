@@ -29,6 +29,18 @@ use Expect::{NA, Test};
 /// (mysql + pg) and tests/live/live_cdc_mssql.rs.
 const CASES: &[(&str, Expect, Expect, Expect)] = &[
     (
+        "intra_transaction_seq",
+        Test("fn cdc_intra_transaction_updates_get_distinct_seq"),
+        Test("fn pg_cdc_intra_transaction_updates_get_distinct_seq"),
+        Test("fn mssql_cdc_intra_transaction_updates_get_distinct_seq"),
+    ),
+    (
+        "sum_reconciles_intra_txn",
+        Test("fn cdc_sum_reconciles_across_intra_txn_updates"),
+        Test("fn pg_cdc_sum_reconciles_across_intra_txn_updates"),
+        Test("fn mssql_cdc_sum_reconciles_across_intra_txn_updates"),
+    ),
+    (
         "resume_two_run",
         Test("fn cdc_resume_captures_only_new_changes"),
         Test("fn pg_cdc_resume_captures_only_new_changes"),

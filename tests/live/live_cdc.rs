@@ -291,6 +291,90 @@ fn cdc_throughput_drains_a_large_backlog() {
     );
 }
 
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_intra_transaction_updates_get_distinct_seq() {
+    // A PK updated many times in ONE transaction: every change shares the commit
+    // __pos, so ordering a current-state dedup by __pos alone picks an ARBITRARY
+    // row (observed live: `counter = 1` for a row whose committed value was N).
+    // `__seq` — the intra-transaction ordinal — restores the total order.
+    // Regression for the silently-wrong current-state class.
+    const N: i64 = 200;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_cdc_seq");
+    let _drop = Table(tbl.clone());
+    let mut c = conn();
+    c.query_drop(format!(
+        "CREATE TABLE {tbl} (id INT PRIMARY KEY, counter BIGINT)"
+    ))
+    .unwrap();
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1, 0)"))
+        .unwrap();
+    let ckpt = d.path().join("cdc.ckpt");
+    write_checkpoint(&mut c, &ckpt);
+
+    // N updates of the SAME row in a SINGLE transaction.
+    c.query_drop("START TRANSACTION").unwrap();
+    for i in 1..=N {
+        c.query_drop(format!("UPDATE {tbl} SET counter = {i} WHERE id = 1"))
+            .unwrap();
+    }
+    c.query_drop("COMMIT").unwrap();
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &out));
+
+    assert_intra_transaction_seq(&out, N);
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_sum_reconciles_across_intra_txn_updates() {
+    // The strong end-to-end oracle: SUM(v) on the source must equal SUM(v) on
+    // the target deduped STRICTLY by (__pos, __seq), row order discarded (as an
+    // unordered warehouse table forces). Every transaction updates one PK 2–4
+    // times, so a __pos-only dedup would pick an intermediate `v` and skew the
+    // sum — this reconciles only because __seq totally-orders the log.
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_cdc_sum");
+    let _drop = Table(tbl.clone());
+    let mut c = conn();
+    c.query_drop(format!(
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)"
+    ))
+    .unwrap();
+    let ckpt = d.path().join("cdc.ckpt");
+    write_checkpoint(&mut c, &ckpt);
+
+    for txn in cdc_sum_workload(&tbl) {
+        c.query_drop("START TRANSACTION").unwrap();
+        for stmt in txn {
+            c.query_drop(stmt).unwrap();
+        }
+        c.query_drop("COMMIT").unwrap();
+    }
+    let source_sum: i64 = c
+        .query_first(format!("SELECT COALESCE(SUM(v), 0) FROM {tbl}"))
+        .unwrap()
+        .unwrap();
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &out));
+
+    let changes = read_cdc_changes(&out);
+    assert!(
+        intra_txn_multi_change_count(&changes) > 0,
+        "workload must exercise intra-transaction multi-updates or the sum passes vacuously"
+    );
+    let target_sum = deduped_current_sum(changes, CdcEngine::MySql);
+    assert_eq!(
+        source_sum, target_sum,
+        "deduped-by-(__pos,__seq) SUM(v) must equal the source's SUM(v)"
+    );
+}
+
 // Idle-first-run anchor model (per-engine, see CLAUDE.md): MySQL's ONLY resume
 // anchor is the client checkpoint file, and the sink writes it at part commits —
 // so the first checkpointed open must persist its coordinates immediately, or an
@@ -444,6 +528,94 @@ fn pg_cdc_resume_captures_only_new_changes() {
         manifest_rows(&out2),
         2,
         "resume drains only the 2 new changes (slot advanced, no re-read)"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_intra_transaction_updates_get_distinct_seq() {
+    // Peer of cdc_intra_transaction_updates_get_distinct_seq. PostgreSQL emits
+    // every change of a transaction at the COMMIT lsn (and marks each
+    // `committed`), so __pos ties them — __seq restores the order.
+    use postgres::NoTls;
+    const N: i64 = 200;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_cdc_pg_seq");
+    let slot = unique_name("rivet_seq_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, counter BIGINT); \
+         ALTER TABLE {tbl} REPLICA IDENTITY FULL; INSERT INTO {tbl} VALUES (1, 0)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+
+    // N updates of the SAME row in ONE transaction (a DO block is one txn).
+    c.batch_execute(&format!(
+        "DO $$ BEGIN FOR i IN 1..{N} LOOP UPDATE {tbl} SET counter = i WHERE id = 1; END LOOP; END $$"
+    ))
+    .unwrap();
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &out));
+
+    assert_intra_transaction_seq(&out, N);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_sum_reconciles_across_intra_txn_updates() {
+    // Peer of cdc_sum_reconciles_across_intra_txn_updates for PostgreSQL.
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_cdc_pg_sum");
+    let slot = unique_name("rivet_sum_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v BIGINT NOT NULL); \
+         ALTER TABLE {tbl} REPLICA IDENTITY FULL"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+
+    for txn in cdc_sum_workload(&tbl) {
+        c.batch_execute(&format!("BEGIN; {}; COMMIT", txn.join("; ")))
+            .unwrap();
+    }
+    let source_sum: i64 = c
+        .query_one(
+            &format!("SELECT COALESCE(SUM(v), 0)::bigint FROM {tbl}"),
+            &[],
+        )
+        .unwrap()
+        .get::<_, i64>(0);
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &out));
+
+    let changes = read_cdc_changes(&out);
+    assert!(
+        intra_txn_multi_change_count(&changes) > 0,
+        "workload must exercise intra-transaction multi-updates or the sum passes vacuously"
+    );
+    let target_sum = deduped_current_sum(changes, CdcEngine::Postgres);
+    assert_eq!(
+        source_sum, target_sum,
+        "deduped-by-(__pos,__seq) SUM(v) must equal the source's SUM(v)"
     );
 }
 

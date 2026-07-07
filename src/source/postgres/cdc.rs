@@ -276,6 +276,7 @@ fn parse_test_decoding(lsn: &str, data: &str) -> Option<ChangeEvent> {
         position: Position(json!({ "lsn": lsn })),
         // The slot only ever yields already-committed changes.
         committed: true,
+        seq: 0, // stamped by TxnSeq as the stream is consumed
     })
 }
 
