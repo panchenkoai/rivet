@@ -1,9 +1,19 @@
 # Changelog
 
-## Unreleased
+## 0.17.0 — 2026-07-07
 
 ### Added
 
+- **CDC emits a `__seq` column** — the change's ordinal within its source
+  transaction. `__pos` is the commit position, so every change of one
+  transaction shares it; `(__pos, __seq)` is the total change order. A
+  current-state dedup can no longer pick an arbitrary row when a primary key is
+  updated more than once in a single transaction (verified live on all three
+  engines: 8000 updates of one PK in one transaction produced a single `__pos`,
+  and an ordered-by-`__pos`-only dedup returned the wrong committed value).
+  Per-engine live conformance tests plus a `SUM(v)` source-vs-target
+  reconciliation over an intra-transaction workload. Both `rivet cdc` outputs
+  (NDJSON + Parquet) carry `__seq`.
 - **Config accepts an optional top-level `load:` block** for a downstream loader
   (the `rivet-pro` warehouse load): the load target lives in the same config so
   ONE file drives both export and load. Rivet does not interpret it — accepted
