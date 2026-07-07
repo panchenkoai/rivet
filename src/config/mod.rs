@@ -38,8 +38,8 @@ pub struct Config {
     pub parallel_exports: bool,
     #[serde(default)]
     pub parallel_export_processes: bool,
-    /// Reserved for a downstream loader (e.g. the `rivet-pro` warehouse load):
-    /// the load target lives here so ONE config can drive both the export and a
+    /// Reserved for a downstream, first-party warehouse loader: the load target
+    /// lives here so ONE config can drive both the export and a
     /// downstream load. Rivet stops at "file in a bucket" and **does not
     /// interpret** this block — it is accepted and ignored, present only so
     /// `rivet check` / `run` / `apply` don't reject a config that carries it.
@@ -1338,7 +1338,7 @@ mod audit_csv_compression {
 
 #[cfg(test)]
 mod reserved_load_extension {
-    //! A downstream loader (rivet-pro) carries its warehouse target in a
+    //! A downstream first-party loader carries its warehouse target in a
     //! top-level `load:` block so ONE config drives export + load. OSS must
     //! accept and ignore it — otherwise `check`/`run`/`apply` would reject the
     //! single-file config. Reverting the reserved field turns this red.

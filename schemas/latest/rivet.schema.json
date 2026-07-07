@@ -32,7 +32,7 @@
       "default": false
     },
     "load": {
-      "description": "Reserved for a downstream loader (e.g. the `rivet-pro` warehouse load):\nthe load target lives here so ONE config can drive both the export and a\ndownstream load. Rivet stops at \"file in a bucket\" and **does not\ninterpret** this block — it is accepted and ignored, present only so\n`rivet check` / `run` / `apply` don't reject a config that carries it.",
+      "description": "Reserved for a downstream, first-party warehouse loader: the load target\nlives here so ONE config can drive both the export and a\ndownstream load. Rivet stops at \"file in a bucket\" and **does not\ninterpret** this block — it is accepted and ignored, present only so\n`rivet check` / `run` / `apply` don't reject a config that carries it.",
       "default": null
     }
   },
