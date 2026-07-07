@@ -92,6 +92,45 @@ fn mssql_cdc_resume_captures_only_new_changes() {
     );
 }
 
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_intra_transaction_updates_get_distinct_seq() {
+    // Peer of cdc_intra_transaction_updates_get_distinct_seq. SQL Server stamps
+    // every change of a transaction with the same __$start_lsn (what rivet emits
+    // as __pos), so __pos ties them — __seq restores the intra-transaction order.
+    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    const N: i64 = 200;
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("rivet_cdc_ms_seq");
+    let ci = format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, counter BIGINT)"
+    ));
+    // The seed INSERT precedes CDC enable, so only the N updates are captured.
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (1, 0)"));
+    enable_cdc(&table, &ci);
+    let _guard = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+
+    let ckpt = d.path().join("cdc.ckpt");
+    // N updates of the SAME row in a SINGLE transaction.
+    mssql_cdc_exec(&format!(
+        "BEGIN TRAN; DECLARE @i INT = 1; WHILE @i <= {N} BEGIN \
+         UPDATE dbo.{table} SET counter = @i WHERE id = 1; SET @i = @i + 1; END; COMMIT;"
+    ));
+    // SQL Server records each UPDATE as two CT rows (before + after image).
+    wait_for_capture(&ci, 2 * N);
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out));
+
+    assert_intra_transaction_seq(&out, N);
+}
+
 // Idle-first-run anchor model (per-engine, see CLAUDE.md): SQL Server has no
 // client-side anchor to pin — a run without a checkpoint floors at
 // `fn_cdc_get_min_lsn` (over-reads, never skips). This test pins that property:

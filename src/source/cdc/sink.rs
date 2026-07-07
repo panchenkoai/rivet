@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, StringArray};
+use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::DataType;
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -36,7 +36,7 @@ use crate::manifest::{
 use crate::pipeline::commit::{PartRecord, write_part_file};
 use crate::pipeline::manifest_writer::write_manifest;
 use crate::source::cdc::value::{self, RivetValue};
-use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, Position};
+use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, Position, TxnSeq};
 use crate::types::{TypeMapping, build_arrow_field};
 
 /// One table's wiring in a (possibly multi-table) CDC run: where its parts go
@@ -234,9 +234,14 @@ pub(crate) fn run_to_files(
     // since the last ack — the only position it is ever valid to advance to.
     let mut last_commit: Option<Position> = None;
     let mut unacked_commit = false;
+    // Stamp each change with its intra-transaction ordinal (`__seq`) over the
+    // WHOLE stream, before routing — a `(position, seq)` total order the load
+    // dedup can trust even when a PK is touched twice in one transaction.
+    let mut txn_seq = TxnSeq::default();
 
     while let Some(ev) = stream.next_change() {
-        let ev = ev?;
+        let mut ev = ev?;
+        txn_seq.stamp(&mut ev);
         // The commit boundary is a property of the STREAM, not of any routed
         // table — record it BEFORE the routing filter. MySQL marks only the
         // LAST event of a transaction committed; if that event lands on an
@@ -324,6 +329,9 @@ fn ensure_schema(
         let mut fields = vec![
             Field::new("__op", DataType::Utf8, false),
             Field::new("__pos", DataType::Utf8, false),
+            // Intra-transaction ordinal — `(__pos, __seq)` is the total change
+            // order the load dedup sorts by (see `TxnSeq`).
+            Field::new("__seq", DataType::Int64, false),
         ];
         for m in columns.iter() {
             // Reuse the batch path's field builder so json/uuid/enum carry their
@@ -417,6 +425,7 @@ fn flush(
             .map(|e| Some(e.position.0.to_string()))
             .collect::<StringArray>(),
     );
+    let seqs: ArrayRef = Arc::new(events.iter().map(|e| e.seq as i64).collect::<Int64Array>());
     // Finding #37: a mid-window DDL desynchronizes the event images from the
     // resolved schema — positional mapping then puts a dropped column's value
     // into its NEIGHBOR (observed live: after DROP COLUMN a, row1's 'AAA'
@@ -466,7 +475,7 @@ fn flush(
         }
     }
 
-    let mut arrays: Vec<ArrayRef> = vec![ops, poss];
+    let mut arrays: Vec<ArrayRef> = vec![ops, poss, seqs];
     let mut col_sums: Vec<(String, u64)> = Vec::with_capacity(columns.len());
     for (i, m) in columns.iter().enumerate() {
         // Engine/native-type cell normalisation (e.g. MySQL binlog quirks: BIT
@@ -769,6 +778,7 @@ mod tests {
             position: Position(serde_json::json!({ "lsn": format!("{id:08X}") })),
             committed: true,
             image_names: None,
+            seq: 0,
         }
     }
 
@@ -904,6 +914,7 @@ mod tests {
             position: Position(serde_json::json!({})),
             committed: true,
             image_names: None,
+            seq: 0,
         };
         let mut cols = vec![
             decimal_col("placeholder", 38, 0), // SQL Server: scale unknown at resolve

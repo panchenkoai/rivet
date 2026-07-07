@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+
+- **Config accepts an optional top-level `load:` block** for a downstream loader
+  (the `rivet-pro` warehouse load): the load target lives in the same config so
+  ONE file drives both export and load. Rivet does not interpret it — accepted
+  and ignored. Regenerated `schemas/rivet.schema.json`.
+
 ### Internal
 
 - **First-party extension seam (ADR-0026).** Named a minimal, stability-tracked subset of the library —

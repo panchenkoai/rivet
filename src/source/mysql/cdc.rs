@@ -233,6 +233,7 @@ impl MysqlChangeStream {
                         position: position.clone(),
                         committed: false,
                         image_names: image_names.clone(),
+                        seq: 0, // stamped by TxnSeq as the stream is consumed
                     });
                 }
                 if self.tx.len() > MAX_TX_ROWS {

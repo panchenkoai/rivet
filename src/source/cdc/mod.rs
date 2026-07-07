@@ -108,6 +108,45 @@ pub(crate) struct ChangeEvent {
     /// deletes) is unrepresentable. `None` ⇒ positional full row (MySQL
     /// binlog carries no names; its arity guard stays load-bearing).
     pub(crate) image_names: Option<std::sync::Arc<[String]>>,
+    /// Ordinal of this change **within its source transaction** (0-based),
+    /// stamped by [`TxnSeq`] as the stream is consumed. `position` alone is the
+    /// commit position — every change in one transaction shares it — so ordering
+    /// a current-state dedup by `position` picks an arbitrary row when a PK is
+    /// touched more than once per transaction. `(position, seq)` is the total
+    /// order; being log-derived it is identical on an at-least-once re-emit.
+    pub(crate) seq: u64,
+}
+
+/// Stamps each change with its intra-transaction ordinal ([`ChangeEvent::seq`]).
+/// The ordinal resets whenever the change's `position` (the commit position)
+/// changes — every change in one transaction shares that position, so this is
+/// the reliable transaction boundary on ALL engines. (`committed` cannot serve:
+/// the poll-based PostgreSQL / SQL Server adapters read already-committed data
+/// and mark EVERY change `committed`, which would reset the ordinal every row.)
+/// Being derived from `position` + log order, the ordinal is reproduced exactly
+/// on an at-least-once replay.
+#[derive(Default)]
+pub(crate) struct TxnSeq {
+    counter: u64,
+    prev: Option<Position>,
+}
+
+impl TxnSeq {
+    /// Ordinal for a change at commit `position`: 0 when `position` differs from
+    /// the previous change (a new transaction), else one more than the last.
+    pub(crate) fn next(&mut self, position: &Position) -> u64 {
+        if self.prev.as_ref() == Some(position) {
+            self.counter += 1;
+        } else {
+            self.counter = 0;
+            self.prev = Some(position.clone());
+        }
+        self.counter
+    }
+
+    pub(crate) fn stamp(&mut self, ev: &mut ChangeEvent) {
+        ev.seq = self.next(&ev.position);
+    }
 }
 
 impl ChangeEvent {
@@ -158,8 +197,10 @@ pub(crate) fn run(
     max_events: Option<usize>,
 ) -> Result<()> {
     let mut emitted = 0usize;
+    let mut txn_seq = TxnSeq::default();
     while let Some(ev) = stream.next_change() {
-        let ev = ev?;
+        let mut ev = ev?;
+        txn_seq.stamp(&mut ev);
         // Checkpoint at every commit boundary BEFORE the table filter — the
         // resume position is a stream property; a transaction whose last
         // event lands on an unlisted table must still advance it (mirrors
@@ -187,6 +228,7 @@ pub(crate) fn run(
             "before": to_json(&ev.before),
             "after": to_json(&ev.after),
             "pos": ev.position.0,
+            "seq": ev.seq,
         });
         println!("{line}");
         emitted += 1;
@@ -670,5 +712,27 @@ mod tests {
                 "{bad:?} → {err}"
             );
         }
+    }
+
+    #[test]
+    fn txn_seq_ordinals_reset_when_commit_position_changes() {
+        // `position` (commit-scoped) alone ties every change in a transaction;
+        // `__seq` restores intra-transaction order and RESETS when the commit
+        // position changes — the reliable txn boundary on every engine (PG/MSSQL
+        // mark every change `committed`, so `committed` can't be it).
+        let mut ts = TxnSeq::default();
+        let pa = Position(serde_json::json!({ "lsn": "A" })); // transaction A
+        let pb = Position(serde_json::json!({ "lsn": "B" })); // transaction B
+        // A = 3 changes, B = 2 changes.
+        let seqs: Vec<u64> = [&pa, &pa, &pa, &pb, &pb]
+            .iter()
+            .map(|p| ts.next(p))
+            .collect();
+        assert_eq!(seqs, vec![0, 1, 2, 0, 1]);
+
+        // Same position again after B still counts up within B.
+        assert_eq!(ts.next(&pb), 2);
+        // A new position resets.
+        assert_eq!(ts.next(&Position(serde_json::json!({ "lsn": "C" }))), 0);
     }
 }

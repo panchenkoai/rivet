@@ -272,6 +272,7 @@ CDC change-table retention (the cleanup job removed it). Resuming would silently
                 // The change table only ever holds already-committed changes.
                 committed: true,
                 image_names: Some(std::sync::Arc::from(names)),
+                seq: 0, // stamped by TxnSeq as the stream is consumed
             });
         }
         match max_lsn {

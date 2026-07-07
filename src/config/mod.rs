@@ -38,6 +38,16 @@ pub struct Config {
     pub parallel_exports: bool,
     #[serde(default)]
     pub parallel_export_processes: bool,
+    /// Reserved for a downstream loader (e.g. the `rivet-pro` warehouse load):
+    /// the load target lives here so ONE config can drive both the export and a
+    /// downstream load. Rivet stops at "file in a bucket" and **does not
+    /// interpret** this block — it is accepted and ignored, present only so
+    /// `rivet check` / `run` / `apply` don't reject a config that carries it.
+    // Deliberately never read by OSS — it is a reserved passthrough for a
+    // downstream loader; only serde (accept) and schemars (document) touch it.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub load: Option<serde_json::Value>,
 }
 
 impl Config {
@@ -1323,6 +1333,24 @@ mod audit_csv_compression {
                 ct.label()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod reserved_load_extension {
+    //! A downstream loader (rivet-pro) carries its warehouse target in a
+    //! top-level `load:` block so ONE config drives export + load. OSS must
+    //! accept and ignore it — otherwise `check`/`run`/`apply` would reject the
+    //! single-file config. Reverting the reserved field turns this red.
+    use super::*;
+
+    #[test]
+    fn reserved_top_level_load_block_is_accepted_and_ignored() {
+        let yaml = "source:\n  type: postgres\n  url: \"postgresql://localhost/test\"\n\
+             exports:\n  - name: t\n    query: \"SELECT 1\"\n    format: parquet\n    destination:\n      type: gcs\n      bucket: b\n      prefix: \"t/\"\n\
+             load:\n  project: p\n  dataset: d\n  cleanup_source: true\n";
+        let cfg = Config::from_yaml(yaml).expect("config with a reserved `load:` block must parse");
+        assert!(cfg.load.is_some(), "the load block is captured opaquely");
     }
 }
 
