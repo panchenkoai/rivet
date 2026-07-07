@@ -147,11 +147,20 @@
       ]
     },
     "SourceType": {
-      "type": "string",
-      "enum": [
-        "postgres",
-        "mysql",
-        "mssql"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "postgres",
+            "mysql",
+            "mssql"
+          ]
+        },
+        {
+          "description": "Document store. Unlike the three SQL engines, MongoDB has no SQL, no\nfixed per-collection schema, and no `information_schema` — so the\nSQL-shaped read seam (chunked/keyset planning, incremental predicate\nbuilding, catalog introspection) does not apply. The OSS source is the\nJSON-blob model: each document exports as `_id` + a `document` JSON\ncolumn, typing punted downstream. Change streams (CDC) map onto the\ncanonical `ChangeStream` seam separately.",
+          "type": "string",
+          "const": "mongo"
+        }
       ]
     },
     "SourceEnvironment": {

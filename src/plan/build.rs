@@ -288,6 +288,10 @@ fn resolve_chunked_strategy(
                 tbl,
             )
         }
+        crate::config::SourceType::Mongo => anyhow::bail!(
+            "chunked mode is not supported for MongoDB — use `mode: full` (the whole \
+             collection is read as `_id` + `document` JSON)"
+        ),
     }
     .map_err(|e| {
         anyhow::anyhow!(

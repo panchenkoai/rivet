@@ -69,6 +69,10 @@ pub(super) fn collect(config: &Config) -> Vec<DoctorCheck> {
         SourceType::Postgres => pg_checks(&url, tls, &cdc),
         SourceType::Mysql => mysql_checks(&url, tls, &cdc),
         SourceType::Mssql => mssql_checks(&url, tls, &cdc),
+        // MongoDB CDC (change streams) is not yet implemented; no preflight
+        // checks to run. `mode: cdc` on a Mongo source is rejected at config
+        // validation, so this arm is effectively unreachable in practice.
+        SourceType::Mongo => Ok(Vec::new()),
     };
     result.unwrap_or_else(|e| vec![probe_failed(&e)])
 }

@@ -233,6 +233,7 @@ impl SourceConfig {
             SourceType::Postgres => 5432,
             SourceType::Mysql => 3306,
             SourceType::Mssql => 1433,
+            SourceType::Mongo => 27017,
         };
         let port = self.port.unwrap_or(default_port);
 
@@ -240,6 +241,7 @@ impl SourceConfig {
             SourceType::Postgres => "postgresql",
             SourceType::Mysql => "mysql",
             SourceType::Mssql => "sqlserver",
+            SourceType::Mongo => "mongodb",
         };
 
         if password.is_empty() {
@@ -362,6 +364,25 @@ pub enum SourceType {
     Postgres,
     Mysql,
     Mssql,
+    /// Document store. Unlike the three SQL engines, MongoDB has no SQL, no
+    /// fixed per-collection schema, and no `information_schema` — so the
+    /// SQL-shaped read seam (chunked/keyset planning, incremental predicate
+    /// building, catalog introspection) does not apply. The OSS source is the
+    /// JSON-blob model: each document exports as `_id` + a `document` JSON
+    /// column, typing punted downstream. Change streams (CDC) map onto the
+    /// canonical `ChangeStream` seam separately.
+    Mongo,
+}
+
+impl SourceType {
+    /// Whether this engine speaks SQL (the relational read seam: `SELECT`
+    /// queries, `information_schema` introspection, chunked/keyset/incremental
+    /// SQL builders). `false` for document stores like MongoDB, whose adapter
+    /// reads via the driver's native query API instead. Used at the match sites
+    /// that would otherwise have to special-case every non-SQL engine.
+    pub fn is_sql(self) -> bool {
+        !matches!(self, SourceType::Mongo)
+    }
 }
 
 /// Locate `user[:password]@` userinfo inside a standard URL.

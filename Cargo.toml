@@ -60,6 +60,13 @@ log = "0.4"
 # crate panics at connect time with "Client had asked for TLS connection
 # but TLS support is disabled" — operator-facing panic, no recoverable error.
 mysql = { version = "28", default-features = false, features = ["minimal", "native-tls", "binlog"] }
+# MongoDB source driver (async, tokio). Bridged to the sync `Source` trait via a
+# per-source tokio runtime + `block_on`, exactly like the MSSQL/tiberius engine
+# (ADR-0011 keeps `Source` sync). Default features pull `rustls-tls` — the SAME
+# TLS stack tiberius/opendal/reqwest already link, so no second TLS tree is
+# added. `bson` is re-exported as `mongodb::bson` (no separate dep). One driver
+# crate + one wire protocol (OP_MSG) covers the whole MongoDB 4.2–8.0 range.
+mongodb = "3"
 opendal = { version = "0.55", features = ["blocking", "services-fs", "services-s3", "services-gcs", "services-azblob"] }
 # `arrow_canonical_extension_types` enables parquet-rs to emit native Parquet
 # `LogicalType::Uuid` / `LogicalType::Json` whenever an Arrow field carries the

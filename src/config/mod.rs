@@ -390,6 +390,35 @@ impl Config {
             self.validate_export(export)?;
         }
         self.validate_cdc_resource_conflicts()?;
+        self.validate_non_sql_source_modes()?;
+        Ok(())
+    }
+
+    /// Non-SQL sources (MongoDB) support only `mode: full` today. Chunked /
+    /// incremental / keyset / time-window all build SQL predicates over an
+    /// introspectable columnar schema, and CDC (change streams) is a separate,
+    /// not-yet-implemented seam. Rejecting the other modes here is precisely
+    /// what makes the SQL-only builders' `unreachable!` arms
+    /// (`sql::quote_ident`, `query::cursor_rhs`, …) provably unreachable for a
+    /// document-store source.
+    fn validate_non_sql_source_modes(&self) -> crate::error::Result<()> {
+        if self.source.source_type.is_sql() {
+            return Ok(());
+        }
+        for e in &self.exports {
+            if e.mode != ExportMode::Full {
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_SOURCE_MODE_UNSUPPORTED,
+                    "export '{}': source type '{:?}' supports only `mode: full` today \
+                     (got `mode: {:?}`). MongoDB has no SQL, so chunked / incremental / \
+                     keyset / time-window / cdc are not available; every document exports \
+                     as `_id` + a `document` JSON column.",
+                    e.name,
+                    self.source.source_type,
+                    e.mode
+                );
+            }
+        }
         Ok(())
     }
 
@@ -445,6 +474,10 @@ impl Config {
                     }
                 }
                 SourceType::Mssql => {}
+                // MongoDB CDC is not yet implemented; `mode: cdc` on a Mongo
+                // source is rejected earlier, so no slot/server_id conflict can
+                // arise here.
+                SourceType::Mongo => {}
             }
             if let Some(ckpt) = cdc.and_then(|c| c.checkpoint.as_deref())
                 && let Some(prev) = checkpoints.insert(ckpt, &e.name)

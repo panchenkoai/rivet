@@ -1,5 +1,6 @@
 pub(crate) mod batch_controller;
 pub(crate) mod cdc;
+pub mod mongo;
 pub mod mssql;
 pub mod mysql;
 pub(crate) mod pg_numeric_wire;
@@ -277,6 +278,10 @@ pub fn create_source(config: &SourceConfig) -> Result<Box<dyn Source>> {
             config.tls.as_ref(),
         )?)),
         SourceType::Mssql => Ok(Box::new(mssql::MssqlSource::connect_with_tls(
+            &url,
+            config.tls.as_ref(),
+        )?)),
+        SourceType::Mongo => Ok(Box::new(mongo::MongoSource::connect_with_tls(
             &url,
             config.tls.as_ref(),
         )?)),
