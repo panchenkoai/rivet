@@ -131,6 +131,70 @@ fn mssql_cdc_intra_transaction_updates_get_distinct_seq() {
     assert_intra_transaction_seq(&out, N);
 }
 
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_sum_reconciles_across_intra_txn_updates() {
+    // Peer of cdc_sum_reconciles_across_intra_txn_updates for SQL Server.
+    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("rivet_cdc_ms_sum");
+    let ci = format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id BIGINT PRIMARY KEY, v BIGINT NOT NULL)"
+    ));
+    enable_cdc(&table, &ci);
+    let _guard = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+
+    for txn in cdc_sum_workload(&table) {
+        mssql_cdc_exec(&format!("BEGIN TRAN; {}; COMMIT;", txn.join("; ")));
+    }
+    // A sentinel (v=0, does not move the sum) as the final change: once the
+    // capture job has it, every prior change is captured too (LSN order) — a
+    // robust drain signal when the exact CT row count is hard to predict
+    // (0-row UPDATEs/DELETEs produce no CT rows).
+    const SENTINEL: i64 = 9_000_000;
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES ({SENTINEL}, 0)"));
+    let mut drained = false;
+    for _ in 0..120 {
+        if mssql_cdc_query_i64(&format!(
+            "SELECT COUNT(*) FROM cdc.{ci}_CT WHERE id = {SENTINEL}"
+        )) >= 1
+        {
+            drained = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(drained, "capture job did not reach the sentinel in 60s");
+
+    // The query helper reads an INT column; the deterministic workload's sum is
+    // a few tens of thousands, so CAST to INT is exact (and guards against a
+    // silent widening bug better than a BIGINT the helper would misread).
+    let source_sum = mssql_cdc_query_i64(&format!(
+        "SELECT CAST(COALESCE(SUM(v), 0) AS INT) FROM dbo.{table}"
+    ));
+
+    let ckpt = d.path().join("cdc.ckpt");
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out));
+
+    let changes = read_cdc_changes(&out);
+    assert!(
+        intra_txn_multi_change_count(&changes) > 0,
+        "workload must exercise intra-transaction multi-updates or the sum passes vacuously"
+    );
+    let target_sum = deduped_current_sum(changes, CdcEngine::SqlServer);
+    assert_eq!(
+        source_sum, target_sum,
+        "deduped-by-(__pos,__seq) SUM(v) must equal the source's SUM(v)"
+    );
+}
+
 // Idle-first-run anchor model (per-engine, see CLAUDE.md): SQL Server has no
 // client-side anchor to pin — a run without a checkpoint floors at
 // `fn_cdc_get_min_lsn` (over-reads, never skips). This test pins that property:

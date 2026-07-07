@@ -10,7 +10,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -181,4 +181,185 @@ pub fn assert_intra_transaction_seq(out: &Path, n: i64) {
         .map(|(i, _)| counters[i])
         .unwrap();
     assert_eq!(latest, n, "the max-__seq change must carry counter = n");
+}
+
+// ── CDC current-state SUM reconciliation (source == deduped target) ──────────
+//
+// The strong end-to-end oracle: apply a workload of many transactions (some
+// updating one PK several times in ONE transaction) and assert the source's
+// final `SUM(v)` equals the target's, where the target is deduped STRICTLY by
+// `(__pos, __seq)` — with row order discarded, exactly as an unordered warehouse
+// table forces. Fails without `__seq` (the intra-transaction `__pos` tie makes
+// the dedup pick an arbitrary version, skewing the sum); passes with it.
+
+/// A captured change: the columns the reconciliation needs (`id BIGINT, v
+/// BIGINT` + the CDC meta). `v` on a delete is the (irrelevant) before-image.
+pub struct CdcChange {
+    pub id: i64,
+    pub v: i64,
+    pub op: String,
+    pub pos: String,
+    pub seq: i64,
+}
+
+/// Source engine — selects how `__pos` parses into a monotonic position.
+#[derive(Clone, Copy)]
+pub enum CdcEngine {
+    MySql,
+    Postgres,
+    SqlServer,
+}
+
+/// Read every CDC change (`id, v, __op, __pos, __seq`) from the `.parquet`
+/// parts under `dir`.
+pub fn read_cdc_changes(dir: &Path) -> Vec<CdcChange> {
+    use arrow::array::{Array, AsArray};
+    let mut out = Vec::new();
+    for path in files_with_extension(dir, "parquet") {
+        for batch in reader(&path) {
+            let b = batch.unwrap();
+            let col_i64 = |name: &str| {
+                b.column_by_name(name)
+                    .unwrap_or_else(|| panic!("{name} column present"))
+                    .as_primitive::<arrow::datatypes::Int64Type>()
+                    .clone()
+            };
+            let col_str = |name: &str| {
+                b.column_by_name(name)
+                    .unwrap_or_else(|| panic!("{name} column present"))
+                    .as_string::<i32>()
+                    .clone()
+            };
+            let (id, v, seq) = (col_i64("id"), col_i64("v"), col_i64("__seq"));
+            let (op, pos) = (col_str("__op"), col_str("__pos"));
+            for r in 0..b.num_rows() {
+                out.push(CdcChange {
+                    id: id.value(r),
+                    v: v.value(r),
+                    op: op.value(r).to_string(),
+                    pos: pos.value(r).to_string(),
+                    seq: seq.value(r),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// `__pos` → a single monotonic `u128`, per engine (`__seq` is the lower-order
+/// tiebreak, applied separately). MySQL `{file,pos}`; PostgreSQL `{lsn:"hi/lo"}`
+/// (hex halves); SQL Server `{lsn:"<fixed-width hex>"}`.
+fn pos_u128(engine: CdcEngine, pos: &str) -> u128 {
+    let j: serde_json::Value =
+        serde_json::from_str(pos).unwrap_or_else(|_| panic!("__pos is not JSON: {pos}"));
+    match engine {
+        CdcEngine::MySql => {
+            let file = j["file"].as_str().expect("__pos.file");
+            let file_num: u128 = file
+                .rsplit('.')
+                .next()
+                .and_then(|s| s.parse().ok())
+                .expect("binlog file number");
+            let p = j["pos"].as_u64().expect("__pos.pos") as u128;
+            (file_num << 64) | p
+        }
+        CdcEngine::Postgres => {
+            let lsn = j["lsn"].as_str().expect("__pos.lsn");
+            let (hi, lo) = lsn.split_once('/').expect("lsn hi/lo");
+            let hi = u128::from_str_radix(hi, 16).expect("lsn hi hex");
+            let lo = u128::from_str_radix(lo, 16).expect("lsn lo hex");
+            (hi << 32) | lo
+        }
+        CdcEngine::SqlServer => {
+            let lsn = j["lsn"].as_str().expect("__pos.lsn");
+            u128::from_str_radix(lsn, 16).expect("lsn hex")
+        }
+    }
+}
+
+/// Dedup the change log to current state by `(__pos, __seq)` — row order
+/// DISCARDED (the log is scrambled first, as an unordered warehouse table
+/// leaves it) — and `SUM(v)` over the surviving (non-deleted) rows.
+pub fn deduped_current_sum(mut changes: Vec<CdcChange>, engine: CdcEngine) -> i64 {
+    // Deterministic scramble: only (__pos, __seq) may decide the latest row.
+    use std::hash::{Hash, Hasher};
+    changes.sort_by_key(|c| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (c.id, c.seq, &c.pos).hash(&mut h);
+        h.finish()
+    });
+    let mut best: HashMap<i64, ((u128, i64), i64, bool)> = HashMap::new();
+    for c in changes {
+        let key = (pos_u128(engine, &c.pos), c.seq);
+        let is_delete = c.op == "delete";
+        match best.get(&c.id) {
+            Some((k, _, _)) if *k >= key => {}
+            _ => {
+                best.insert(c.id, (key, c.v, is_delete));
+            }
+        }
+    }
+    best.values()
+        .filter(|(_, _, del)| !del)
+        .map(|(_, v, _)| *v)
+        .sum()
+}
+
+/// Count of `(transaction, PK)` pairs touched more than once — i.e. a PK updated
+/// several times in one transaction. A reconciliation workload MUST produce some,
+/// else the intra-transaction case is untested and the sum passes vacuously.
+pub fn intra_txn_multi_change_count(changes: &[CdcChange]) -> usize {
+    let mut per: HashMap<(&str, i64), usize> = HashMap::new();
+    for c in changes {
+        *per.entry((c.pos.as_str(), c.id)).or_default() += 1;
+    }
+    per.values().filter(|&&n| n > 1).count()
+}
+
+/// A deterministic reconciliation workload as transactions of engine-agnostic
+/// SQL statements (`id BIGINT, v BIGINT`). EVERY transaction updates one PK 2–4
+/// times (`v = v + delta`), so the committed `v` differs from every intermediate
+/// version — a dedup that ordered by `__pos` alone would skew `SUM(v)`. Mixed
+/// with fresh inserts and deletes. The caller wraps each inner `Vec` in its
+/// engine's `BEGIN`/`COMMIT`.
+pub fn cdc_sum_workload(tbl: &str) -> Vec<Vec<String>> {
+    const K: i64 = 25; // shared key range 1..=K
+    const M: i64 = 200; // transactions
+    let mut txns: Vec<Vec<String>> = Vec::new();
+    // Seed the shared keys with v = 0.
+    txns.push(
+        (1..=K)
+            .map(|k| format!("INSERT INTO {tbl} (id, v) VALUES ({k}, 0)"))
+            .collect(),
+    );
+    let mut rng: u64 = 0x1234_5678_9abc_def0;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let mut extra_key = K;
+    for t in 0..M {
+        let mut stmts = Vec::new();
+        let key = (next() % K as u64) as i64 + 1;
+        let r = 2 + next() % 3; // 2..=4 updates to the SAME key in this txn
+        for _ in 0..r {
+            let delta = (next() % 100) as i64 + 1;
+            stmts.push(format!("UPDATE {tbl} SET v = v + {delta} WHERE id = {key}"));
+        }
+        if t % 4 == 0 {
+            extra_key += 1;
+            let val = (next() % 500) as i64;
+            stmts.push(format!(
+                "INSERT INTO {tbl} (id, v) VALUES ({extra_key}, {val})"
+            ));
+        }
+        if t % 5 == 0 {
+            let dk = (next() % K as u64) as i64 + 1;
+            stmts.push(format!("DELETE FROM {tbl} WHERE id = {dk}"));
+        }
+        txns.push(stmts);
+    }
+    txns
 }
