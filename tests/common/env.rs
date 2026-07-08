@@ -227,6 +227,10 @@ pub enum LiveService {
     MysqlToxi,
     /// SQL Server source engine. TCP :1433.
     Mssql,
+    /// MongoDB standalone source engine (batch JSON-blob). TCP :27017.
+    Mongo,
+    /// MongoDB single-node replica set (change-stream CDC). TCP :27018.
+    MongoRs,
     Minio,
     FakeGcs,
     /// Azure Blob emulator (Azurite). Blob endpoint :10000.
@@ -261,6 +265,12 @@ impl LiveService {
             ),
             LiveService::Mysql => ("127.0.0.1", 3306, "service `mysql` in docker-compose.yaml"),
             LiveService::Mssql => ("127.0.0.1", 1433, "service `mssql` in docker-compose.yaml"),
+            LiveService::Mongo => ("127.0.0.1", 27017, "service `mongo` in docker-compose.yaml"),
+            LiveService::MongoRs => (
+                "127.0.0.1",
+                27018,
+                "service `mongo-rs` (single-node replica set) in docker-compose.yaml",
+            ),
             LiveService::MysqlToxi => (
                 "127.0.0.1",
                 13306,

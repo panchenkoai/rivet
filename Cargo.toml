@@ -145,6 +145,10 @@ proptest = "1"
 tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono", "rustls"] }
 tokio = { version = "1.50.0", features = ["rt-multi-thread", "net", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }
+# MongoDB live-test helper (tests/common/mongo.rs) seeds fixtures + drives
+# transactions through the async driver directly — same crate the lib uses.
+mongodb = "3"
+futures-util = "0.3"
 
 [[bench]]
 name = "hot_paths"

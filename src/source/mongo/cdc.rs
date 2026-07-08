@@ -68,6 +68,39 @@ fn token_data(v: &serde_json::Value) -> Option<String> {
     v.get("_data").and_then(|d| d.as_str()).map(String::from)
 }
 
+/// Persist a resume token as a [`Position`] LOSSLESSLY. A token can carry a BSON
+/// binary `_typeBits` field (for typed sort keys — e.g. an integer `_id`), and a
+/// plain `serde_json` round-trip mangles that binary, so the server rejects it on
+/// resume (`Bad resume token`, error 40648). We store the token's raw BSON bytes
+/// (hex) — a faithful round-trip — plus the order-preserving `_data` keystring
+/// for the `until_current` bound. See the version-matrix live test that caught it.
+fn encode_resume_token(token: &mongodb::change_stream::event::ResumeToken) -> Result<Position> {
+    let bson = mongodb::bson::to_bson(token)?;
+    let doc = bson
+        .as_document()
+        .ok_or_else(|| anyhow::anyhow!("mongodb cdc: resume token is not a BSON document"))?;
+    let mut buf = Vec::new();
+    doc.to_writer(&mut buf)?;
+    let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+    let data = doc.get_str("_data").ok();
+    Ok(Position(serde_json::json!({ "rt": hex, "_data": data })))
+}
+
+/// Inverse of [`encode_resume_token`], with a fallback to the pre-lossless
+/// `serde_json` form so an older checkpoint still resolves.
+fn decode_resume_token(
+    v: &serde_json::Value,
+) -> Result<mongodb::change_stream::event::ResumeToken> {
+    if let Some(hex) = v.get("rt").and_then(|x| x.as_str()) {
+        let bytes = super::hex_to_bytes(hex)?;
+        let doc = Document::from_reader(&bytes[..])?;
+        return Ok(mongodb::bson::from_bson(mongodb::bson::Bson::Document(
+            doc,
+        ))?);
+    }
+    Ok(serde_json::from_value(v.clone())?)
+}
+
 impl MongoChangeStream {
     /// Open a database-wide change stream, resuming from `checkpoint` when one
     /// exists (else starting at the current oplog position). `UpdateLookup` fills
@@ -84,7 +117,7 @@ impl MongoChangeStream {
         // The resume token persisted by a prior run (opaque JSON → driver token).
         let resume = checkpoint
             .and_then(|p| Position::load(p).ok().flatten())
-            .map(|pos| serde_json::from_value(pos.0))
+            .map(|pos| decode_resume_token(&pos.0))
             .transpose()?;
         // A checkpoint path with NO persisted position ⇒ a fresh checkpointed
         // run: it must pin its anchor at open (see below).
@@ -156,8 +189,7 @@ impl MongoChangeStream {
     pub(crate) fn anchor_position(&self) -> Option<Position> {
         self.stream
             .resume_token()
-            .and_then(|t| serde_json::to_value(&t).ok())
-            .map(Position)
+            .and_then(|t| encode_resume_token(&t).ok())
     }
 }
 
@@ -291,7 +323,7 @@ fn to_change_event(
         before,
         after,
         // The per-event resume token is the exact re-open position.
-        position: Position(serde_json::to_value(&cse.id)?),
+        position: encode_resume_token(&cse.id)?,
         // Every change-stream event is already committed (post-commit oplog).
         committed: true,
         image_names: Some(std::sync::Arc::clone(&IMAGE_NAMES)),

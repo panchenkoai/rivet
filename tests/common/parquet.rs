@@ -363,3 +363,88 @@ pub fn cdc_sum_workload(tbl: &str) -> Vec<Vec<String>> {
     }
     txns
 }
+
+// ── Mongo CDC dedup oracle (distinct __pos per event; __seq unused) ──────────
+//
+// Unlike the SQL engines, a MongoDB change stream gives every event a DISTINCT,
+// order-preserving resume token (`__pos`) — even within ONE transaction — so the
+// total order is `__pos` ALONE (`__seq` is always 0). The `document` blob is the
+// image; the dedup keeps the last per `_id` by `__pos` and reads `field` from it.
+
+pub struct MongoCdcChange {
+    pub id: String,
+    pub document: String,
+    pub op: String,
+    pub pos: String,
+    pub seq: i64,
+}
+
+/// Read every Mongo CDC change (`_id, document, __op, __pos, __seq`) from the
+/// `.parquet` parts under `dir`.
+pub fn read_mongo_cdc_changes(dir: &Path) -> Vec<MongoCdcChange> {
+    use arrow::array::{Array, AsArray};
+    let mut out = Vec::new();
+    for path in files_with_extension(dir, "parquet") {
+        for batch in reader(&path) {
+            let b = batch.unwrap();
+            let s = |n: &str| {
+                b.column_by_name(n)
+                    .unwrap_or_else(|| panic!("{n} column present"))
+                    .as_string::<i32>()
+                    .clone()
+            };
+            let (id, document, op, pos) = (s("_id"), s("document"), s("__op"), s("__pos"));
+            let seq = b
+                .column_by_name("__seq")
+                .expect("__seq column present")
+                .as_primitive::<arrow::datatypes::Int64Type>()
+                .clone();
+            for r in 0..b.num_rows() {
+                out.push(MongoCdcChange {
+                    id: id.value(r).to_string(),
+                    document: if document.is_null(r) {
+                        String::new()
+                    } else {
+                        document.value(r).to_string()
+                    },
+                    op: op.value(r).to_string(),
+                    pos: pos.value(r).to_string(),
+                    seq: seq.value(r),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Dedup the Mongo CDC log to the current `_id → document.field` state, ordering
+/// STRICTLY by `(__pos, __seq)` (row order discarded, as an unordered warehouse
+/// table forces) with deletes removed. Integer `_id` only. The oracle a captured
+/// change log must reproduce exactly.
+pub fn mongo_deduped_field(
+    mut changes: Vec<MongoCdcChange>,
+    field: &str,
+) -> std::collections::BTreeMap<i64, String> {
+    changes.sort_by(|a, b| (&a.pos, a.seq).cmp(&(&b.pos, b.seq)));
+    let mut state: std::collections::BTreeMap<i64, String> = std::collections::BTreeMap::new();
+    for c in &changes {
+        let id: i64 = match c.id.parse() {
+            Ok(i) => i,
+            Err(_) => continue,
+        };
+        if c.op == "delete" {
+            state.remove(&id);
+            continue;
+        }
+        let doc: serde_json::Value =
+            serde_json::from_str(&c.document).unwrap_or(serde_json::Value::Null);
+        if let Some(v) = doc.get(field) {
+            let vs = match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            state.insert(id, vs);
+        }
+    }
+    state
+}
