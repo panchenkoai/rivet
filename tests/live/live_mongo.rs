@@ -171,3 +171,40 @@ fn mongo_batch_type_fidelity_document_is_verbatim_extjson() {
         "Decimal128 must be verbatim (type-tagged), got: {doc_text}"
     );
 }
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn mongo_run_reconcile_matches_source_count() {
+    require_alive(LiveService::Mongo);
+    let db = unique_name("mrecon");
+    let m = MongoTest::connect(PORT, &db);
+    m.seed_int_id("bench", 3000);
+
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(
+        cfg_dir.path(),
+        &db,
+        "bench",
+        out.path(),
+        ", mongo: { page_size: 1000 }",
+        "",
+    );
+    // `rivet run --reconcile` is Mongo's whole-export count check — the source
+    // `count_documents` vs the destination row count. (The partition-level
+    // `rivet reconcile` / `rivet repair` commands are N/A for keyset: it has no
+    // natural partitions, and the CLI says so rather than guessing.)
+    let r = run_rivet(&["run", "-c", cfg.to_str().unwrap(), "--reconcile"]);
+    assert!(
+        r.status.success(),
+        "run --reconcile must exit 0 on a match; stderr:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    // The reconcile verdict rides the run summary on stderr (like the per-export
+    // progress line), not stdout.
+    let summary = String::from_utf8_lossy(&r.stderr);
+    assert!(
+        summary.contains("MATCH"),
+        "reconcile must report a source/dest MATCH, got:\n{summary}"
+    );
+}
