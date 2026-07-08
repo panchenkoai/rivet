@@ -275,7 +275,14 @@ fn encode_id_cursor(id: &Bson) -> String {
     doc! { "_id": id.clone() }
         .to_writer(&mut buf)
         .expect("a one-field BSON document always serializes");
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+    bytes_to_hex(&buf)
+}
+
+/// Lower-case hex of raw bytes — the string half of the BSON-token round-trip
+/// (paired with [`hex_to_bytes`]), used to carry a lossless BSON value across a
+/// string-typed seam (the keyset cursor and the CDC resume token).
+pub(super) fn bytes_to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Inverse of [`encode_id_cursor`]. Falls back to a bare 24-char ObjectId hex so

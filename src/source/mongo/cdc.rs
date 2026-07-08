@@ -81,7 +81,7 @@ fn encode_resume_token(token: &mongodb::change_stream::event::ResumeToken) -> Re
         .ok_or_else(|| anyhow::anyhow!("mongodb cdc: resume token is not a BSON document"))?;
     let mut buf = Vec::new();
     doc.to_writer(&mut buf)?;
-    let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+    let hex = super::bytes_to_hex(&buf);
     let data = doc.get_str("_data").ok();
     Ok(Position(serde_json::json!({ "rt": hex, "_data": data })))
 }
