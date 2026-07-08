@@ -139,6 +139,18 @@
             }
           ],
           "default": null
+        },
+        "mongo": {
+          "description": "MongoDB-specific read options (`source.mongo:`). Honoured only when\n`type: mongo`; ignored by the SQL engines. See [`MongoConfig`].",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MongoConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "additionalProperties": false,
@@ -388,6 +400,68 @@
           "description": "TLS + verify chain **and** hostname against the server cert's SAN/CN.\nRecommended default for production.",
           "type": "string",
           "const": "verify-full"
+        }
+      ]
+    },
+    "MongoConfig": {
+      "description": "MongoDB read-path knobs. All three address completeness/fidelity of a `full`\ncollection export that the SQL engines get for free from SQL semantics.",
+      "type": "object",
+      "properties": {
+        "json": {
+          "description": "JSON rendering of the `document` column. `relaxed` (default) keeps common\nscalars native (`42`, `\"x\"`); `canonical` wraps every number\n(`{\"$numberLong\":\"…\"}`) so Int64/Double round-trip losslessly through a\nJSON-number parser that would otherwise clamp values beyond 2^53.",
+          "$ref": "#/$defs/MongoJsonMode",
+          "default": "relaxed"
+        },
+        "read_concern": {
+          "description": "Read concern for the collection scan. `snapshot` gives a **point-in-time\nconsistent** full export (no doc missed/double-read under concurrent\nwrites) — requires MongoDB 5.0+ on a replica set; a standalone rejects it.\nDefault (`server`) uses the server's default read concern.",
+          "$ref": "#/$defs/MongoReadConcern",
+          "default": "server"
+        },
+        "no_cursor_timeout": {
+          "description": "Keep the scan cursor alive past the server's idle timeout (default 10 min)\nso a slow destination cannot let the server reap the cursor mid-scan and\nsilently drop the tail of a large collection. Default: `true`.",
+          "type": "boolean",
+          "default": true
+        },
+        "page_size": {
+          "description": "When set, read the collection with **keyset (seek) pagination** on `_id`\ninstead of one long-held cursor: each page is a bounded\n`find({_id: {$gt: last}}).sort({_id: 1}).limit(page_size)` — an indexed\nrange scan that becomes one output part file. Bounds longest-query time\n(no 35-minute cursor to hit a timeout / snapshot window) and is the base\nfor parallel `_id`-range reads. Requires an **ObjectId** `_id` (the\ndefault); a non-ObjectId key errors with a clear message. Unset ⇒ the\nsingle-cursor full scan.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "MongoJsonMode": {
+      "description": "Extended-JSON rendering mode for the `document` column.",
+      "oneOf": [
+        {
+          "description": "Native scalars where possible; `{\"$oid\":…}`/`{\"$date\":…}` only for exotic\nBSON. Friendliest for `PARSE_JSON`, but Int64 renders as a bare number.",
+          "type": "string",
+          "const": "relaxed"
+        },
+        {
+          "description": "Every value type-tagged (`{\"$numberLong\":…}`, `{\"$numberInt\":…}`) — a\nlossless, bulkier form that survives a double-based JSON-number parser.",
+          "type": "string",
+          "const": "canonical"
+        }
+      ]
+    },
+    "MongoReadConcern": {
+      "description": "Read concern applied to the collection scan.",
+      "oneOf": [
+        {
+          "description": "The server's default read concern — no point-in-time guarantee across the\nscan (a plain `find`, like today).",
+          "type": "string",
+          "const": "server"
+        },
+        {
+          "description": "`snapshot` — a consistent point-in-time read for the whole cursor\n(MongoDB 5.0+ replica set only).",
+          "type": "string",
+          "const": "snapshot"
         }
       ]
     },

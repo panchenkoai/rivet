@@ -164,6 +164,13 @@ pub struct ExportRequest<'a> {
     /// (`WHERE key > cursor ORDER BY key LIMIT n`) instead of the unbounded
     /// incremental/snapshot query. The keyset runner drives the outer loop.
     pub page_limit: Option<usize>,
+    /// The bare source relation this export reads, when it is a `table:`
+    /// shortcut (`SELECT * FROM <ident>`) — the structured read-intent behind the
+    /// SQL string. Computed once via [`crate::sql::strip_select_star_from`], so a
+    /// non-SQL adapter (MongoDB reads a collection) uses it directly instead of
+    /// re-parsing `query`. `None` for a hand-written `query:` / any wrapped or
+    /// filtered form. SQL engines ignore it (they run `query`). See ADR-0027.
+    pub base_relation: Option<&'a str>,
 }
 
 impl<'a> ExportRequest<'a> {
@@ -185,6 +192,9 @@ impl<'a> ExportRequest<'a> {
             tuning,
             column_overrides,
             page_limit: None,
+            // `query` is the unwrapped base here, so the relation (if this is a
+            // `table:` shortcut) is visible directly in it.
+            base_relation: crate::sql::strip_select_star_from(query),
         }
     }
 
@@ -208,6 +218,8 @@ impl<'a> ExportRequest<'a> {
             tuning,
             column_overrides,
             page_limit: None,
+            // `query` is a table-hiding wrapper; the relation lives in `base`.
+            base_relation: crate::sql::strip_select_star_from(base),
         }
     }
 
@@ -281,9 +293,10 @@ pub fn create_source(config: &SourceConfig) -> Result<Box<dyn Source>> {
             &url,
             config.tls.as_ref(),
         )?)),
-        SourceType::Mongo => Ok(Box::new(mongo::MongoSource::connect_with_tls(
+        SourceType::Mongo => Ok(Box::new(mongo::MongoSource::connect(
             &url,
             config.tls.as_ref(),
+            config.mongo.as_ref(),
         )?)),
     }
 }

@@ -455,8 +455,8 @@ fn init_yaml(
                 mssql::introspect(&mut conn, &mssql_table_schema(&sch), table_name)?
             }
             "mongo" => {
-                let mut conn = mongo::connect(source_url)?;
-                mongo::introspect(&mut conn, table_name)?
+                let conn = mongo::connect(source_url)?;
+                mongo::introspect(&conn, table_name)?
             }
             _ => unreachable!(),
         };
@@ -506,8 +506,8 @@ fn init_discovery_json(
                 mssql::introspect(&mut conn, &mssql_table_schema(&sch), table_name)?
             }
             "mongo" => {
-                let mut conn = mongo::connect(source_url)?;
-                mongo::introspect(&mut conn, table_name)?
+                let conn = mongo::connect(source_url)?;
+                mongo::introspect(&conn, table_name)?
             }
             _ => unreachable!(),
         };
@@ -630,11 +630,11 @@ fn introspect_all(
             Ok(out)
         }
         "mongo" => {
-            let mut conn = mongo::connect(source_url)?;
-            let names = retain_filtered(mongo::list_tables(&mut conn)?, filter);
+            let conn = mongo::connect(source_url)?;
+            let names = retain_filtered(mongo::list_tables(&conn)?, filter);
             let mut out = Vec::with_capacity(names.len());
             for n in names {
-                out.push(mongo::introspect(&mut conn, &n)?);
+                out.push(mongo::introspect(&conn, &n)?);
             }
             Ok(out)
         }

@@ -59,7 +59,7 @@ pub fn build_plan(
     };
 
     let strategy = match export.mode {
-        ExportMode::Full => ExtractionStrategy::Snapshot,
+        ExportMode::Full => full_strategy(config),
         ExportMode::Incremental => {
             let primary_column = export.cursor_column.clone().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -144,6 +144,23 @@ pub fn build_plan(
         shape_drift_warn_factor: export.shape_drift_warn_factor.unwrap_or(2.0),
         parquet: export.parquet.clone(),
     })
+}
+
+/// The strategy for `mode: full`. Source-aware: a MongoDB source with
+/// `source.mongo.page_size` reads by `_id`-keyset pages (bounded query time,
+/// per-page parts, the base for parallel `_id`-range reads) instead of one
+/// long-held cursor. Every SQL engine — and MongoDB without `page_size` — uses
+/// the single-cursor snapshot.
+fn full_strategy(config: &Config) -> ExtractionStrategy {
+    if config.source.source_type == crate::config::SourceType::Mongo
+        && let Some(page) = config.source.mongo.as_ref().and_then(|m| m.page_size)
+    {
+        return ExtractionStrategy::Keyset(KeysetPlan {
+            key_column: "_id".to_string(),
+            chunk_size: page.max(1),
+        });
+    }
+    ExtractionStrategy::Snapshot
 }
 
 /// Resolve the strategy for `mode: chunked`.
@@ -537,6 +554,7 @@ mod tests {
             environment: None,
             tuning: None,
             tls: None,
+            mongo: None,
         }
     }
 

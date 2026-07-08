@@ -92,7 +92,7 @@ pub fn collect_report(
         )?),
         SourceType::Mysql => Box::new(source::mysql::MysqlSource::connect_with_tls(&url, tls)?),
         SourceType::Mssql => Box::new(source::mssql::MssqlSource::connect_with_tls(&url, tls)?),
-        SourceType::Mongo => Box::new(source::mongo::MongoSource::connect_with_tls(&url, tls)?),
+        SourceType::Mongo => Box::new(source::mongo::MongoSource::connect(&url, tls, None)?),
     };
 
     let mut mappings = src.type_mappings(&query, column_overrides)?;

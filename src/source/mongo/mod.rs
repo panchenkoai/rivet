@@ -33,70 +33,104 @@ use arrow::array::{ArrayRef, StringBuilder};
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use futures_util::TryStreamExt;
+use mongodb::Client;
+use mongodb::bson::oid::ObjectId;
 use mongodb::bson::{Bson, Document, doc};
-use mongodb::{Client, options::ClientOptions};
+use mongodb::options::{ClientOptions, CollectionOptions, ReadConcern};
 use tokio::runtime::Runtime;
 
-use crate::config::TlsConfig;
+use crate::config::{MongoConfig, MongoJsonMode, MongoReadConcern, TlsConfig};
 use crate::error::Result;
 use crate::source::{BatchSink, ExportRequest, Source};
 use crate::types::{ColumnOverrides, RivetType, SourceColumn, TypeMapping};
 
-/// Rows accumulated into one Arrow batch before it is handed to the sink. The
-/// sink owns file rollover / memory budgeting; the source only needs to emit
-/// reasonably-sized batches. TODO: honour `tuning.effective_batch_size`.
-const BATCH_ROWS: usize = 10_000;
-
-/// MongoDB source. Owns the async driver client + the runtime that drives it.
-pub struct MongoSource {
+/// A connected MongoDB session: the async client plus the tokio runtime that
+/// drives it, so the sync `Source` trait can `block_on` every driver call
+/// (ADR-0011, mirrors MSSQL/tiberius). This is the **one** place that owns the
+/// async→sync bridge — the SDAM-needs-a-worker-thread runtime, the connect +
+/// ping handshake, the borrow dance — reused by the source, the harm / count
+/// probes, and `rivet init`.
+pub struct MongoSession {
     rt: Runtime,
     client: Client,
-    /// Default database resolved from the connection URL path
-    /// (`mongodb://host:27017/<db>`).
-    database: String,
+    /// Database resolved from the connection URL path (`mongodb://…/<db>`).
+    db: String,
 }
 
-impl MongoSource {
-    /// Connect to MongoDB, honouring the shared TLS gate. `url` is the resolved
-    /// `mongodb://user:pass@host:port/db` (or `mongodb+srv://…`) form. A
-    /// successful return has completed a `ping` round-trip.
-    pub fn connect_with_tls(url: &str, tls: Option<&TlsConfig>) -> Result<Self> {
-        // Refuse plaintext to a remote (non-loopback) host with no `tls:` block
-        // (CWE-319), exactly as the SQL engines do. A `mongodb://` URL can also
-        // carry `?tls=true`; full mapping of every `TlsConfig` knob onto the
-        // driver's `TlsOptions` is a follow-up — today the gate is the guard and
-        // loopback/dev connects in plaintext.
-        crate::source::require_tls_or_loopback(url, tls)?;
-
-        // A small multi-thread runtime (not current-thread): the mongodb driver
-        // spawns background SDAM/heartbeat tasks that must make progress
-        // independently of our `block_on` calls, or connection monitoring
-        // starves. Two workers is plenty for one source connection.
+impl MongoSession {
+    /// Connect + `ping`. `gate` applies the shared remote-plaintext TLS refusal
+    /// (`require_tls_or_loopback`, CWE-319); `rivet init` passes `false` (dev
+    /// convenience, like the SQL init helpers), every other caller `true`.
+    pub fn connect(url: &str, tls: Option<&TlsConfig>, gate: bool) -> Result<Self> {
+        if gate {
+            crate::source::require_tls_or_loopback(url, tls)?;
+        }
+        // Small multi-thread runtime (not current-thread): the driver spawns
+        // background SDAM/heartbeat tasks that must make progress independently
+        // of our `block_on` calls, or connection monitoring starves.
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()?;
-
-        let (client, database) = rt.block_on(async {
+        let (client, db) = rt.block_on(async {
             let opts = ClientOptions::parse(url).await?;
-            let database = opts.default_database.clone().ok_or_else(|| {
+            let db = opts.default_database.clone().ok_or_else(|| {
                 anyhow::anyhow!(
                     "mongodb url must include a database: mongodb://user:pass@host:port/<db>"
                 )
             })?;
             let client = Client::with_options(opts)?;
             // Round-trip so a bad host/auth fails at connect, not first read.
-            client
-                .database(&database)
-                .run_command(doc! { "ping": 1 })
-                .await?;
-            Ok::<_, anyhow::Error>((client, database))
+            client.database(&db).run_command(doc! { "ping": 1 }).await?;
+            Ok::<_, anyhow::Error>((client, db))
         })?;
+        Ok(Self { rt, client, db })
+    }
 
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+    pub fn db(&self) -> &str {
+        &self.db
+    }
+    /// Drive a future to completion on the owned runtime.
+    pub fn block_on<T>(&self, fut: impl std::future::Future<Output = T>) -> T {
+        self.rt.block_on(fut)
+    }
+}
+
+/// MongoDB source over a [`MongoSession`], carrying the resolved `source.mongo:`
+/// read options `export` applies.
+pub struct MongoSource {
+    session: MongoSession,
+    /// Render the `document` column as canonical (type-tagged) extended JSON.
+    canonical_json: bool,
+    /// Scan under `readConcern: snapshot` (point-in-time; 5.0+ replica set).
+    snapshot: bool,
+    /// Set `noCursorTimeout` on the scan cursor.
+    no_cursor_timeout: bool,
+}
+
+impl MongoSource {
+    /// Connect, resolving the optional `source.mongo:` read options (absent ⇒
+    /// relaxed JSON, server read concern, cursor kept alive). Used by
+    /// `create_source` (with the config block) and the `doctor` / type-report
+    /// probes (with `None`).
+    pub fn connect(url: &str, tls: Option<&TlsConfig>, cfg: Option<&MongoConfig>) -> Result<Self> {
+        let session = MongoSession::connect(url, tls, true)?;
+        let (canonical_json, snapshot, no_cursor_timeout) = match cfg {
+            None => (false, false, true),
+            Some(c) => (
+                matches!(c.json, MongoJsonMode::Canonical),
+                matches!(c.read_concern, MongoReadConcern::Snapshot),
+                c.no_cursor_timeout,
+            ),
+        };
         Ok(Self {
-            rt,
-            client,
-            database,
+            session,
+            canonical_json,
+            snapshot,
+            no_cursor_timeout,
         })
     }
 }
@@ -128,38 +162,6 @@ fn blob_schema() -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
-/// Extract the collection name from the query rivet's `table:` shortcut
-/// produces (`SELECT * FROM <collection>`). Any other shape — a SQL `query:`, or
-/// an incremental/chunked/keyset wrapper (`SELECT * FROM (<base>) …`) — is
-/// refused with an actionable message, because MongoDB has no SQL and this
-/// adapter only supports `mode: full`.
-fn collection_from_query(query: &str) -> Result<&str> {
-    const PREFIX: &str = "select * from ";
-    let q = query.trim();
-    let matches_prefix = q.len() >= PREFIX.len() && q[..PREFIX.len()].eq_ignore_ascii_case(PREFIX);
-    if !matches_prefix {
-        anyhow::bail!(
-            "MongoDB source supports only `table: <collection>` with `mode: full`; the SQL \
-             `query:` form is not available (MongoDB has no SQL). Got: {query}"
-        );
-    }
-    let coll = q[PREFIX.len()..].trim();
-    // A plain collection name is a single bare identifier; the charset check
-    // rejects anything else (parens, whitespace, trailing SQL clauses), so an
-    // incremental/chunked/keyset wrapper can never pass as a collection.
-    if coll.is_empty()
-        || !coll
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
-    {
-        anyhow::bail!(
-            "MongoDB source supports only `mode: full` on a plain `table: <collection>`; \
-             incremental / chunked / keyset are not available for MongoDB. Got: {query}"
-        );
-    }
-    Ok(coll)
-}
-
 /// Stringify a document `_id` for the `_id` column. ObjectId → 24-char hex;
 /// string/number keys → their natural text; anything exotic (binary, compound)
 /// → its relaxed extended JSON, so the column is always populated and never
@@ -178,13 +180,20 @@ fn id_to_string(id: Option<&Bson>) -> String {
     }
 }
 
-/// Render a whole BSON document as a relaxed-extended-JSON string. Relaxed (not
-/// canonical) keeps common scalars as native JSON (`42`, `"x"`, `true`, nested
+/// Render a whole BSON document as an extended-JSON string. `canonical=false`
+/// (relaxed) keeps common scalars native (`42`, `"x"`, `true`, nested
 /// objects/arrays) while still wrapping exotic BSON types losslessly
-/// (`{"$oid":…}`, `{"$date":…}`, `{"$numberDecimal":…}`) — the friendliest shape
-/// for a downstream `PARSE_JSON`.
-fn document_to_json(doc: &Document) -> Result<String> {
-    let value = Bson::Document(doc.clone()).into_relaxed_extjson();
+/// (`{"$oid":…}`, `{"$date":…}`, `{"$numberDecimal":…}`) — friendliest for a
+/// downstream `PARSE_JSON`. `canonical=true` type-tags every value
+/// (`{"$numberLong":…}`) so Int64/Double survive a double-based JSON-number
+/// parser that would otherwise clamp values beyond 2^53.
+fn document_to_json(doc: &Document, canonical: bool) -> Result<String> {
+    let bson = Bson::Document(doc.clone());
+    let value = if canonical {
+        bson.into_canonical_extjson()
+    } else {
+        bson.into_relaxed_extjson()
+    };
     Ok(serde_json::to_string(&value)?)
 }
 
@@ -203,29 +212,97 @@ fn flush(
 
 impl Source for MongoSource {
     fn export(&mut self, request: &ExportRequest<'_>, sink: &mut dyn BatchSink) -> Result<()> {
-        let coll_name = collection_from_query(request.query)?;
+        // The structured read-intent: the bare collection behind the `table:`
+        // shortcut (ADR-0027). `None` ⇒ a hand-written `query:` or a
+        // filtered/wrapped form, which has no MongoDB equivalent.
+        let coll_name = request.base_relation.ok_or_else(|| {
+            anyhow::anyhow!(
+                "MongoDB source supports only `table: <collection>` with `mode: full` — a \
+                 hand-written `query:` or a filtered/wrapped form has no MongoDB equivalent. \
+                 Got query: {}",
+                request.query
+            )
+        })?;
         let schema = blob_schema();
         sink.on_schema(schema.clone())?;
 
-        let coll = self
-            .client
-            .database(&self.database)
-            .collection::<Document>(coll_name);
+        // `readConcern: snapshot` must ride the collection handle; a plain scan
+        // uses the default handle. The scalar opts are copied into locals so the
+        // async scan closure doesn't borrow `self`.
+        let db = self.session.client().database(self.session.db());
+        let coll = if self.snapshot {
+            db.collection_with_options::<Document>(
+                coll_name,
+                CollectionOptions::builder()
+                    .read_concern(ReadConcern::snapshot())
+                    .build(),
+            )
+        } else {
+            db.collection::<Document>(coll_name)
+        };
+        let canonical = self.canonical_json;
+        let no_cursor_timeout = self.no_cursor_timeout;
+        // Source-side batch = the RSS lever. Two caps, whichever trips first:
+        //   • `tuning.batch_size` — a row count (schema-based memory budget for a
+        //     document store is unreliable: the `document` column is variable
+        //     length, so a row estimate off the Arrow schema misfires);
+        //   • `tuning.max_batch_memory_mb` — a hard byte budget on the batch,
+        //     the *correct* RSS knob for a JSON blob (flush by accumulated bytes,
+        //     independent of how big each document is).
+        let batch_rows = request.tuning.effective_batch_size(Some(&schema)).max(1);
+        let batch_byte_cap = request
+            .tuning
+            .max_batch_memory_mb
+            .map(|mb| mb.saturating_mul(1024 * 1024));
 
-        let total = self.rt.block_on(async {
-            let mut cursor = coll.find(doc! {}).await?;
+        // Keyset (seek) pagination: the keyset runner drives the outer loop and
+        // hands us one page's `page_limit` plus the previous page's max `_id`
+        // (as its hex string). We page `find({_id:{$gt:after}}).sort({_id:1})
+        // .limit(n)` — a bounded, index-driven range scan. `page_limit` unset ⇒
+        // one full scan. Keyset needs an ObjectId `_id` (its hex sorts in the
+        // same order as the binary key, so the round-trip through the string
+        // column preserves order); a non-ObjectId key errors, actionably.
+        let page_limit = request.page_limit;
+        let after_id = match request.cursor.and_then(|c| c.last_cursor_value.as_deref()) {
+            Some(hex) => Some(ObjectId::parse_str(hex).map_err(|_| {
+                anyhow::anyhow!(
+                    "MongoDB keyset paging requires an ObjectId `_id`; got the non-ObjectId key \
+                     '{hex}'. Remove `source.mongo.page_size` to use a single-cursor full scan."
+                )
+            })?),
+            None => None,
+        };
+
+        let total = self.session.block_on(async {
+            let filter = match &after_id {
+                Some(oid) => doc! { "_id": { "$gt": oid } },
+                None => doc! {},
+            };
+            let mut find = coll.find(filter);
+            if let Some(page) = page_limit {
+                find = find.sort(doc! { "_id": 1 }).limit(page as i64);
+            }
+            if no_cursor_timeout {
+                find = find.no_cursor_timeout(true);
+            }
+            let mut cursor = find.await?;
             let mut ids = StringBuilder::new();
             let mut docs = StringBuilder::new();
             let mut in_batch = 0usize;
+            let mut batch_bytes = 0usize;
             let mut total = 0usize;
             while let Some(d) = cursor.try_next().await? {
-                ids.append_value(id_to_string(d.get("_id")));
-                docs.append_value(document_to_json(&d)?);
+                let id = id_to_string(d.get("_id"));
+                let json = document_to_json(&d, canonical)?;
+                batch_bytes += id.len() + json.len();
+                ids.append_value(&id);
+                docs.append_value(&json);
                 in_batch += 1;
                 total += 1;
-                if in_batch >= BATCH_ROWS {
+                if in_batch >= batch_rows || batch_byte_cap.is_some_and(|cap| batch_bytes >= cap) {
                     flush(&schema, &mut ids, &mut docs, sink)?;
                     in_batch = 0;
+                    batch_bytes = 0;
                 }
             }
             if in_batch > 0 {
@@ -262,11 +339,12 @@ impl Source for MongoSource {
             return Ok(None);
         };
         let coll = self
-            .client
-            .database(&self.database)
+            .session
+            .client()
+            .database(self.session.db())
             .collection::<Document>(coll_name);
         let n = self
-            .rt
+            .session
             .block_on(async move { coll.count_documents(doc! {}).await })?;
         Ok(Some(n.to_string()))
     }
@@ -276,9 +354,12 @@ impl Source for MongoSource {
 /// string — the reconcile count wraps the base as
 /// `SELECT COUNT(*) FROM (SELECT * FROM <coll>) AS _rivet_reconcile`, so the
 /// *last* `FROM` names the collection. `None` if no bare identifier follows.
-/// (This is the same "un-parse SQL back to intent" tax the batch path pays in
-/// `collection_from_query` — a symptom of the SQL-shaped `Source` seam, tracked
-/// as the architecture review's candidate A.)
+///
+/// The batch export path no longer un-parses SQL — it reads the structured
+/// `ExportRequest::base_relation` (ADR-0027). This un-parser survives only
+/// because `query_scalar` receives a bare SQL string with no structured
+/// counterpart yet; giving the reconcile count a typed request would delete it
+/// too (the remaining tail of ADR-0027).
 fn last_from_identifier(sql: &str) -> Option<&str> {
     const MARKER: &str = "from ";
     let start = sql.to_ascii_lowercase().rfind(MARKER)? + MARKER.len();
@@ -355,10 +436,11 @@ pub(crate) fn sample_harm_counters(
     url: &str,
     tls: Option<&TlsConfig>,
 ) -> Option<Vec<(String, i64)>> {
-    let (rt, client, db) = connect_blocking(url, tls)?;
-    rt.block_on(async move {
-        let status = client
-            .database(&db)
+    let session = MongoSession::connect(url, tls, true).ok()?;
+    session.block_on(async {
+        let status = session
+            .client()
+            .database(session.db())
             .run_command(doc! { "serverStatus": 1 })
             .await
             .ok()?;
@@ -372,10 +454,11 @@ pub(crate) fn sample_harm_counters(
 /// collection. `None` on any failure — the diagnostic then shows an unknown
 /// row count, exactly as MySQL does when its estimate is untrustworthy.
 pub(crate) fn estimated_count(url: &str, tls: Option<&TlsConfig>, collection: &str) -> Option<i64> {
-    let (rt, client, db) = connect_blocking(url, tls)?;
-    rt.block_on(async move {
-        let n = client
-            .database(&db)
+    let session = MongoSession::connect(url, tls, true).ok()?;
+    session.block_on(async {
+        let n = session
+            .client()
+            .database(session.db())
             .collection::<Document>(collection)
             .estimated_document_count()
             .await
@@ -384,67 +467,10 @@ pub(crate) fn estimated_count(url: &str, tls: Option<&TlsConfig>, collection: &s
     })
 }
 
-/// Build a runtime + connected client + resolved database for the standalone
-/// (non-`MongoSource`) entry points — the harm sampler and the preflight count
-/// estimate. `None` on any connect failure (both callers are best-effort).
-/// Defaults the database to `admin` when the URL omits one; the harm sampler's
-/// `serverStatus` is cluster-scoped, and a Mongo source URL always carries a
-/// database, so the fallback only affects the never-scans harm path.
-fn connect_blocking(url: &str, tls: Option<&TlsConfig>) -> Option<(Runtime, Client, String)> {
-    crate::source::require_tls_or_loopback(url, tls).ok()?;
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .build()
-        .ok()?;
-    let (client, db) = rt.block_on(async {
-        let opts = ClientOptions::parse(url).await.ok()?;
-        let db = opts
-            .default_database
-            .clone()
-            .unwrap_or_else(|| "admin".to_string());
-        let client = Client::with_options(opts).ok()?;
-        Some((client, db))
-    })?;
-    Some((rt, client, db))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use mongodb::bson::oid::ObjectId;
-
-    #[test]
-    fn collection_parsed_from_table_shortcut_query() {
-        assert_eq!(
-            collection_from_query("SELECT * FROM orders").unwrap(),
-            "orders"
-        );
-        // Case-insensitive: rivet lowercases nothing here, but be robust.
-        assert_eq!(
-            collection_from_query("select * from Users").unwrap(),
-            "Users"
-        );
-        assert_eq!(
-            collection_from_query("  SELECT * FROM events  ").unwrap(),
-            "events"
-        );
-    }
-
-    #[test]
-    fn collection_rejects_non_full_and_raw_sql_shapes() {
-        // Incremental / chunked / keyset wrap the base in a subquery — must be
-        // refused, never mistaken for a collection named "(".
-        assert!(
-            collection_from_query("SELECT * FROM (SELECT * FROM orders) AS _rivet WHERE id > 5")
-                .is_err()
-        );
-        // A hand-written SQL query has no MongoDB meaning.
-        assert!(collection_from_query("SELECT id, name FROM orders WHERE id > 10").is_err());
-        // A `WHERE` on the table shortcut is still a query, not a bare collection.
-        assert!(collection_from_query("SELECT * FROM orders WHERE x = 1").is_err());
-        assert!(collection_from_query("SELECT * FROM ").is_err());
-    }
 
     #[test]
     fn id_string_covers_common_key_types() {
@@ -461,17 +487,32 @@ mod tests {
     }
 
     #[test]
-    fn document_renders_as_relaxed_extended_json() {
+    fn document_renders_relaxed_and_canonical() {
         let d = doc! {
             "a": 1i32,
             "b": "x",
+            "big": 9_223_372_036_854_775_807i64,
             "nested": doc! { "d": true },
         };
-        let json = document_to_json(&d).unwrap();
-        // Relaxed extjson keeps common scalars native (not `{"$numberInt":…}`).
-        assert!(json.contains("\"a\":1"), "got: {json}");
-        assert!(json.contains("\"b\":\"x\""), "got: {json}");
-        assert!(json.contains("\"nested\":{\"d\":true}"), "got: {json}");
+        // Relaxed: common scalars native, Int64 as a bare JSON number.
+        let relaxed = document_to_json(&d, false).unwrap();
+        assert!(relaxed.contains("\"a\":1"), "got: {relaxed}");
+        assert!(relaxed.contains("\"b\":\"x\""), "got: {relaxed}");
+        assert!(
+            relaxed.contains("\"nested\":{\"d\":true}"),
+            "got: {relaxed}"
+        );
+        assert!(
+            relaxed.contains("\"big\":9223372036854775807"),
+            "int64 is a bare number in relaxed: {relaxed}"
+        );
+        // Canonical: every number type-tagged so a double-based JSON parser can't
+        // clamp an Int64 beyond 2^53.
+        let canonical = document_to_json(&d, true).unwrap();
+        assert!(
+            canonical.contains("\"$numberLong\":\"9223372036854775807\""),
+            "int64 is type-tagged in canonical: {canonical}"
+        );
     }
 
     #[test]

@@ -284,7 +284,7 @@ fn check_source_auth(config: &Config) -> Result<()> {
         SourceType::Mongo => {
             // `connect_with_tls` runs a connect + `ping` round-trip itself, so a
             // successful construction is a green health-check.
-            crate::source::mongo::MongoSource::connect_with_tls(&url, tls)?;
+            crate::source::mongo::MongoSource::connect(&url, tls, None)?;
             Ok(())
         }
     }
