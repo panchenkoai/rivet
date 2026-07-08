@@ -269,6 +269,76 @@ from the millisecond `run_id`, consecutive runs into the same destination prefix
 
 ---
 
+## Scenario C — many collections: source impact & parallel tuning
+
+A config can export many collections at once (one `- name:` block each). `rivet
+plan` then writes **one plan file per collection** (`plan.<name>.json`), and — a
+difference from SQL sources — every collection gets the **same strategy shape**:
+`keyset` on `_id`. Mongo's `_id` is always present and always indexed, so there
+is no per-table strategy diversity to discover (no "table without a primary key",
+no chunk-vs-cursor choice). Files scale with size: `files = ceil(rows / page_size)`.
+
+### What a full export does to the source
+
+Measured over a 13-collection export (~800K documents, `parallel: 1`):
+
+| source metric | value | meaning |
+| ------------- | ----- | ------- |
+| query plan | `LIMIT → FETCH → IXSCAN(_id)` | every page rides the `_id` index — **never a collection scan** |
+| docs examined ÷ returned | **1.000** | each document is read **exactly once** — zero wasted scan |
+| queries issued | ~43 | 13 collections paged (`find({_id:{$gt:…}}).limit(page_size)`) |
+| peak connections | 8 | modest |
+| per-page latency | ~17 ms | for a 25K page |
+
+Why this is gentle on a production Mongo:
+
+- **Index-bound.** The seek `find({_id:{$gt: last}}).sort({_id:1}).limit(N)` uses
+  the `_id_` index — `examined == returned`, no over-scan, on any collection.
+- **No long-lived cursor.** Keyset issues a *fresh bounded query per page*, not one
+  cursor held open for the whole scan. Nothing is pinned in server memory for
+  minutes, and there is no cursor-timeout risk (this is why `no_cursor_timeout`
+  is irrelevant to keyset). A naive `find()` export would hold one cursor for the
+  entire scan; `skip`/`limit` paging would be O(n²) (re-scanning each page's
+  prefix). Keyset is O(n) with a page-lived cursor.
+
+### `parallel: N` — the trade
+
+`parallel: N` splits a collection into N disjoint `_id` ranges (quantile
+boundaries found with `$sample`, **not** a full-scan `$bucketAuto`) and scans them
+concurrently. Same 8 heavy/medium collections, varying N:
+
+| `parallel` | wall-time | speed-up | peak connections | docs examined ÷ returned |
+| ---------: | --------: | -------: | ---------------: | -----------------------: |
+| **1** | 35.7 s | 1.0× | 8 | 1.000 |
+| **4** | 12.4 s | 2.9× | 20 | 1.042 |
+| **6** | 8.3 s | 4.3× | 26 | 1.042 |
+| **8** | 7.1 s | 5.0× | 32 | 1.042 |
+
+Reading the curve:
+
+- **The scan cost is flat.** From `parallel: 4` up, `examined ÷ returned` sits at
+  **1.042** and does not move — the only overhead is the one-time `$sample`
+  boundary probe (~+4%, fixed *per collection*, independent of N). More workers do
+  **not** scan the source harder; the range scans stay index-bound and disjoint.
+- **Connections grow linearly** (~3 per unit of `N`): 8 → 20 → 26 → 32.
+- **Speed-up has a knee at ~6.** 1→4 is 2.9×, 4→6 adds 1.5×, but 6→8 adds only
+  1.17× (+23% wall improvement for +23% connections — parity). Below the knee,
+  connections buy speed cheaply; above it, they don't.
+
+So the choice is purely **Mongo's connection budget vs. desired wall-time** — the
+scan footprint barely changes:
+
+| setting | when |
+| ------- | ---- |
+| `parallel: 1` | a production Mongo under load — smallest footprint (8 conns, `examined ÷ returned = 1.000`) |
+| **`parallel: 6`** | the sweet spot — 4.3× at 26 connections |
+| `parallel: 8` | only when Mongo has connection headroom — 5× at 32 connections |
+
+The bigger the collection, the more `parallel` pays off — the fixed ~+4% `$sample`
+cost amortises better over 300K rows than over 30K.
+
+---
+
 ## Config reference — `source.mongo.*`
 
 | key | values | default | effect |
