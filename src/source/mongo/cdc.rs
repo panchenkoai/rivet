@@ -19,10 +19,10 @@
 //! binlog adapter's continuous model.
 
 use futures_util::StreamExt;
-use mongodb::bson::Document;
+use mongodb::bson::{Document, doc};
 use mongodb::change_stream::ChangeStream as DriverStream;
 use mongodb::change_stream::event::{ChangeStreamEvent, OperationType};
-use mongodb::options::FullDocumentType;
+use mongodb::options::{FullDocumentBeforeChangeType, FullDocumentType};
 
 use super::{MongoSession, document_to_json, id_to_string};
 use crate::config::TlsConfig;
@@ -30,8 +30,13 @@ use crate::error::Result;
 use crate::source::cdc::value::RivetValue;
 use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, Position};
 
-/// The two fixed image columns, matching the batch JSON-blob schema.
-const IMAGE_NAMES: [&str; 2] = ["_id", "document"];
+/// The two fixed image columns, matching the batch JSON-blob schema. Built once
+/// (a change stream emits millions of events) and cloned per event — a refcount
+/// bump, not a fresh Vec+Arc of the same two constant strings each time.
+static IMAGE_NAMES: std::sync::LazyLock<std::sync::Arc<[String]>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Arc::from(vec!["_id".to_string(), "document".to_string()])
+    });
 
 pub(crate) struct MongoChangeStream {
     session: MongoSession,
@@ -59,12 +64,26 @@ impl MongoChangeStream {
             .and_then(|p| Position::load(p).ok().flatten())
             .map(|pos| serde_json::from_value(pos.0))
             .transpose()?;
+        // Declare the capture fidelity tier UP FRONT (never a silent degrade): a
+        // sub-6.0 server gives current-state UpdateLookup post-images and no delete
+        // pre-image, so a null `document` on an update/delete means "this tier
+        // can't provide it", not "the value was null". doctor surfaces the same.
+        let cap = probe_capability_on(&session);
+        log::info!(
+            "mongodb cdc: server {} — capture tier: {}",
+            cap.server_version,
+            cap.tier()
+        );
         let stream = session.block_on(async {
             session
                 .client()
                 .database(&db_name)
                 .watch()
+                // Post-image for insert/update (current-state lookup).
                 .full_document(FullDocumentType::UpdateLookup)
+                // Delete/update PRE-image when the server carries it (6.0+ with
+                // `changeStreamPreAndPostImages`); silently absent otherwise.
+                .full_document_before_change(FullDocumentBeforeChangeType::WhenAvailable)
                 .resume_after(resume)
                 .await
         })?;
@@ -103,6 +122,64 @@ pub(crate) fn pin_checkpoint_at_current(
             "mongodb cdc: the server returned no resume token to anchor at — is this a replica set?"
         ),
     }
+}
+
+/// What a MongoDB CDC run actually delivers — probed from the server so the tier
+/// is DECLARED, never silently assumed. `major < 6` ⇒ current-state UpdateLookup
+/// post-images and key-only deletes; `>= 6` ⇒ full pre/post-images ride when the
+/// collection has `changeStreamPreAndPostImages` enabled.
+pub(crate) struct MongoCdcCapability {
+    pub(crate) server_version: String,
+    pub(crate) major: u32,
+    pub(crate) is_replica_set: bool,
+}
+
+impl MongoCdcCapability {
+    /// One-line fidelity declaration for the log / `doctor`.
+    pub(crate) fn tier(&self) -> &'static str {
+        if self.major >= 6 {
+            "full-image-capable (6.0+) — delete/update pre-images ride when \
+             changeStreamPreAndPostImages is enabled on the collection"
+        } else {
+            "current-state (UpdateLookup) — update post-images are current-state \
+             (not point-in-time) and deletes carry _id only; upgrade to 6.0+ for pre/post-images"
+        }
+    }
+}
+
+/// Probe server version + replica-set membership on an existing session. Best
+/// effort: a failed command degrades to `unknown`/`false` rather than erroring
+/// the open — the tier line is informational, the watch itself is the gate.
+fn probe_capability_on(session: &MongoSession) -> MongoCdcCapability {
+    session.block_on(async {
+        let db = session.client().database(session.db());
+        let version = db
+            .run_command(doc! { "buildInfo": 1 })
+            .await
+            .ok()
+            .and_then(|d| d.get_str("version").ok().map(str::to_string))
+            .unwrap_or_else(|| "unknown".to_string());
+        let major = version
+            .split('.')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let is_replica_set = db
+            .run_command(doc! { "hello": 1 })
+            .await
+            .is_ok_and(|d| d.get_str("setName").is_ok());
+        MongoCdcCapability {
+            server_version: version,
+            major,
+            is_replica_set,
+        }
+    })
+}
+
+/// Connect + probe (for `rivet doctor` — a fresh connection).
+pub(crate) fn probe_capability(url: &str, tls: Option<&TlsConfig>) -> Result<MongoCdcCapability> {
+    let session = MongoSession::connect(url, tls, true)?;
+    Ok(probe_capability_on(&session))
 }
 
 /// Map one driver change event to the canonical [`ChangeEvent`] (JSON-blob image).
@@ -162,9 +239,7 @@ fn to_change_event(
         position: Position(serde_json::to_value(&cse.id)?),
         // Every change-stream event is already committed (post-commit oplog).
         committed: true,
-        image_names: Some(std::sync::Arc::from(
-            IMAGE_NAMES.map(str::to_string).to_vec(),
-        )),
+        image_names: Some(std::sync::Arc::clone(&IMAGE_NAMES)),
         seq: 0, // stamped by TxnSeq as the stream is consumed
     })
 }

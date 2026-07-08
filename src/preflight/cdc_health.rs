@@ -69,10 +69,9 @@ pub(super) fn collect(config: &Config) -> Vec<DoctorCheck> {
         SourceType::Postgres => pg_checks(&url, tls, &cdc),
         SourceType::Mysql => mysql_checks(&url, tls, &cdc),
         SourceType::Mssql => mssql_checks(&url, tls, &cdc),
-        // MongoDB CDC (change streams) is not yet implemented; no preflight
-        // checks to run. `mode: cdc` on a Mongo source is rejected at config
-        // validation, so this arm is effectively unreachable in practice.
-        SourceType::Mongo => Ok(Vec::new()),
+        // Change streams: probe the replica-set requirement + declare the capture
+        // fidelity tier (6.0+ pre/post-images vs current-state UpdateLookup).
+        SourceType::Mongo => mongo_checks(&url, tls, &cdc),
     };
     result.unwrap_or_else(|e| vec![probe_failed(&e)])
 }
@@ -513,6 +512,52 @@ fn mssql_checks(
         };
         checks.extend(mssql_verdicts(&e.name, ci, &mssql_health, ckpt_state));
     }
+    Ok(checks)
+}
+
+// ─── MongoDB ─────────────────────────────────────────────────────────────────
+
+/// Change-stream health: the replica-set requirement (a standalone cannot
+/// `watch()`) and the DECLARED capture-fidelity tier — so an operator learns
+/// before the run that a sub-6.0 server gives current-state post-images and
+/// key-only deletes, never discovering it as a silent null in the output.
+fn mongo_checks(
+    url: &str,
+    tls: Option<&crate::config::TlsConfig>,
+    _exports: &[&ExportConfig],
+) -> Result<Vec<DoctorCheck>> {
+    let cap = crate::source::mongo::cdc::probe_capability(url, tls)?;
+    let mut checks = Vec::new();
+    // Hard requirement: change streams need a replica set.
+    checks.push(check(
+        "CDC replica set".into(),
+        cap.is_replica_set,
+        Some(if cap.is_replica_set {
+            format!("replica set (server {})", cap.server_version)
+        } else {
+            format!(
+                "server {} is standalone — change streams unavailable",
+                cap.server_version
+            )
+        }),
+        (!cap.is_replica_set).then(|| {
+            "MongoDB change streams require a replica set (a single-node one is fine): restart \
+             mongod with --replSet and run rs.initiate()"
+                .to_string()
+        }),
+    ));
+    // The fidelity tier — informational (never a failure), but hinted for upgrade
+    // on the degraded tier so the degrade is declared, not silent.
+    checks.push(check(
+        "CDC capture tier".into(),
+        true,
+        Some(cap.tier().to_string()),
+        (cap.major < 6).then(|| {
+            "upgrade to MongoDB 6.0+ and enable changeStreamPreAndPostImages for point-in-time \
+             post-images and delete pre-images"
+                .to_string()
+        }),
+    ));
     Ok(checks)
 }
 
