@@ -439,6 +439,13 @@ Deliberately **N/A** (not gaps):
   the change log, order by `__pos` alone and keep the last row per `_id` (deletes
   remove). Unlike SQL engines, Mongo gives **every** event a distinct `__pos`
   even inside one transaction, so `__seq` is always `0`.
-- **`parallel` needs a comparable `_id`.** The `_id`-range fan-out works for
-  ObjectId and other ordered `_id` types; a collection with mixed `_id` types
-  falls back to single-worker keyset.
+- **Keyset needs a single `_id` type.** Keyset paging (and `parallel`) seeks with
+  `$gt`, which MongoDB **type-brackets** — it cannot cross from one BSON `_id`
+  type to another (a numeric cursor never matches a string `_id`, even though
+  strings sort after numbers). rivet detects a heterogeneous-`_id` collection up
+  front (int + string, …) and **refuses `page_size`/`parallel` with a clear
+  error** rather than silently dropping every type but one; omit `page_size` to
+  use a full scan — its single cursor *does* cross types. The four numeric types
+  (Int32/Int64/Double/Decimal128) share one bracket, so a mixed-numeric `_id`
+  keysets fine, and `parallel` tiles any single ordered type (ObjectId, int,
+  string).

@@ -257,3 +257,33 @@ datestyle, bytea_output, sql_mode) and add one live test that flips the
 state to a non-default (a `+09:00` global, an `Asia/Tokyo` database
 default) with a guard that resets it. Parity at default state is not
 evidence — the default is exactly where the bug hides.
+
+## Keyset seek is type-bracketed — a heterogeneous key silently loses all but one type
+
+A keyset/seek paginator that advances with `col > cursor` assumes the key
+space is ONE totally-ordered domain. On a store where the comparison operator
+is **type-bracketed**, that assumption fails silently. MongoDB's `$gt`/`$lt`
+compare only WITHIN a BSON type bracket (numbers, then strings, then …): once a
+keyset cursor reaches the last number, `{_id: {$gt: 2000}}` matches **zero**
+string `_id`s even though strings sort *after* numbers — so a collection mixing
+`_id` types pages only the first bracket and drops the rest. Verified: an
+int+string collection read 2000/4000 single-worker (parallel varied ~3000/4000,
+because `$sample` boundaries then straddle the type gap). Every count/sum check
+that trusts the paginator passes — the loss is 100% invisible without a
+per-type re-read of the destination.
+
+The full-scan path (a single unbounded cursor sorted by `_id`, no `$gt` seek)
+is immune — it crosses brackets. So the fix is not to make keyset cross types
+(the index seek fundamentally can't) but to **detect the heterogeneous key up
+front and refuse keyset/parallel loudly**, pointing at the full scan. The
+detector compares the BSON *bracket* (not the raw type) of the min and max
+`_id` — the four numeric types share a bracket, so a mixed Int32/Int64/Double
+`_id` still keysets (`src/source/mongo/mod.rs::ensure_uniform_id_type`,
+`id_bracket`).
+
+Process rule: **any seek/keyset paginator on a store whose range operator is
+type-bracketed (Mongo `$gt`, and check before assuming any document/columnar
+store isn't) needs a heterogeneous-key guard + a live test that seeds two key
+types and asserts the paginator ERRORS (never silently exports one bracket),
+while the unbounded scan stays complete.** Counts/sums are not evidence here —
+the dropped bracket is a clean, self-consistent subset.

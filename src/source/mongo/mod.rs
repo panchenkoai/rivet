@@ -157,6 +157,44 @@ impl MongoSource {
         self
     }
 
+    /// Guard against silent loss on a heterogeneous-`_id` collection. Keyset
+    /// paging seeks with `$gt`/`$lt`, which MongoDB **type-brackets**: a numeric
+    /// cursor never matches a string `_id` even though strings sort after numbers,
+    /// so a collection mixing `_id` types would page only the first bracket and
+    /// silently drop the rest (verified: an int+string collection reads 50%). We
+    /// compare the BSON bracket of the min and max `_id` (a single bracket is a
+    /// contiguous band, so differing endpoints ⟺ a bracket jump exists) and refuse
+    /// keyset/parallel, pointing at the full scan — a single ordered cursor, which
+    /// DOES cross brackets. Numeric types share bracket 0, so a mixed
+    /// Int32/Int64/Double `_id` still keysets fine.
+    pub(crate) fn ensure_uniform_id_type(&self, collection: &str) -> Result<()> {
+        let coll = self
+            .session
+            .client()
+            .database(self.session.db())
+            .collection::<Document>(collection);
+        let span = self.session.block_on(async {
+            let lo = coll.find_one(doc! {}).sort(doc! { "_id": 1 }).await?;
+            let hi = coll.find_one(doc! {}).sort(doc! { "_id": -1 }).await?;
+            Ok::<_, anyhow::Error>(lo.zip(hi))
+        })?;
+        if let Some((lo, hi)) = span
+            && let (Some(lo_id), Some(hi_id)) = (lo.get("_id"), hi.get("_id"))
+            && id_bracket(lo_id) != id_bracket(hi_id)
+        {
+            anyhow::bail!(
+                "collection '{collection}' has heterogeneous `_id` types \
+                 ({:?} … {:?}): MongoDB keyset paging seeks with `$gt`, which is \
+                 BSON-type-bracketed and would silently skip every `_id` type but \
+                 one. Remove `page_size` and `parallel` to use a full ordered scan \
+                 (a single cursor crosses BSON types), or normalise `_id` to one type.",
+                lo_id.element_type(),
+                hi_id.element_type(),
+            );
+        }
+        Ok(())
+    }
+
     /// Split the collection's `_id` space into `n` disjoint, size-balanced
     /// ranges `[lo, hi)` whose union tiles the whole BSON key space (so the union
     /// read is the complete collection, no overlap) — for ANY `_id` type, not
@@ -166,6 +204,7 @@ impl MongoSource {
     /// sorted sample. Outer bounds are `MinKey`/`MaxKey`, which sort before/after
     /// every value, so the first/last range cannot miss the true extremes.
     pub fn sample_id_ranges(&self, collection: &str, n: usize) -> Result<Vec<(Bson, Bson)>> {
+        self.ensure_uniform_id_type(collection)?;
         let n = n.max(1);
         let full_range = || vec![(Bson::MinKey, Bson::MaxKey)];
         if n == 1 {
@@ -273,6 +312,24 @@ fn id_to_string(id: Option<&Bson>) -> String {
 /// (hex/text — type-ambiguous, e.g. integer `1001` vs string `"1001"`), this
 /// preserves the exact BSON type across the string-typed cursor seam, so keyset
 /// paging + resume work for ANY `_id`, not just ObjectId.
+/// The BSON comparison *bracket* an `_id` falls in for a `$gt`/`$lt` keyset seek.
+/// MongoDB only compares within a bracket, so the four numeric types share
+/// bracket 0 (a mixed Int32/Int64/Double `_id` keysets fine), while a number vs a
+/// string is a bracket jump the seek cannot cross. Two `_id`s in different
+/// brackets ⟹ the collection is un-keyset-able. See `ensure_uniform_id_type`.
+fn id_bracket(v: &Bson) -> u8 {
+    match v {
+        Bson::Double(_) | Bson::Int32(_) | Bson::Int64(_) | Bson::Decimal128(_) => 0,
+        Bson::String(_) => 1,
+        Bson::ObjectId(_) => 2,
+        Bson::Boolean(_) => 3,
+        Bson::DateTime(_) => 4,
+        Bson::Binary(_) => 5,
+        Bson::Timestamp(_) => 6,
+        _ => 7,
+    }
+}
+
 fn encode_id_cursor(id: &Bson) -> String {
     let mut buf = Vec::new();
     doc! { "_id": id.clone() }
@@ -403,6 +460,15 @@ impl Source for MongoSource {
                 Some(token) => Some(decode_id_cursor(token)?),
                 None => None,
             };
+
+        // Single-worker keyset, first page: refuse a heterogeneous-`_id`
+        // collection up front — `$gt` is type-bracketed and would silently drop
+        // every `_id` type but the cursor's. (Parallel checks this in
+        // `sample_id_ranges`; a full scan — `page_limit` unset — is exempt because
+        // its single cursor crosses brackets.)
+        if page_limit.is_some() && after_id.is_none() && id_range.is_none() {
+            self.ensure_uniform_id_type(coll_name)?;
+        }
 
         let total = self.session.block_on(async {
             // Lower bound: the keyset cursor (`$gt: after`) when resuming a page,

@@ -251,3 +251,90 @@ fn mongo_batch_resume_reads_only_new_since_last_run() {
         "resume must add only the new rows — 4500 would mean run 2 rescanned"
     );
 }
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn mongo_batch_parallel_objectid_and_string_id() {
+    require_alive(LiveService::Mongo);
+    // ObjectId (the Mongo default) and String `_id` — the `$sample` `_id`-range
+    // fan-out must tile either ordered type completely, not just integers.
+    for (seed_objectid, tag) in [(true, "mpoid"), (false, "mpstr")] {
+        let db = unique_name(tag);
+        let m = MongoTest::connect(PORT, &db);
+        if seed_objectid {
+            m.seed_objectid("bench", 5000);
+        } else {
+            m.seed_string_id("bench", 5000);
+        }
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let cfg = write_cfg(
+            cfg_dir.path(),
+            &db,
+            "bench",
+            out.path(),
+            ", mongo: { page_size: 1000 }",
+            ", parallel: 4",
+        );
+        assert!(run_export(&cfg).status.success());
+        assert_eq!(
+            dir_parquet_distinct_strings(out.path(), "_id").len(),
+            5000,
+            "parallel over {} _id must read the whole collection",
+            if seed_objectid { "ObjectId" } else { "String" }
+        );
+    }
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn mongo_keyset_on_heterogeneous_id_errors_loudly_full_scan_still_works() {
+    require_alive(LiveService::Mongo);
+    use mongodb::bson::doc;
+    let db = unique_name("mhetero");
+    let m = MongoTest::connect(PORT, &db);
+    m.drop_collection("t");
+    // int + string `_id` in one collection: `$gt` is type-bracketed, so a keyset
+    // seek that reaches the last int silently returns nothing for the strings.
+    let mut docs = Vec::new();
+    for i in 1..=1000_i64 {
+        docs.push(doc! { "_id": i, "v": "n" });
+    }
+    for i in 1..=1000_i64 {
+        docs.push(doc! { "_id": format!("s-{i:04}"), "v": "s" });
+    }
+    m.insert_many("t", docs);
+
+    // Keyset MUST refuse loudly — never silently export one bracket.
+    let ks_dir = tempfile::tempdir().unwrap();
+    let ks_out = tempfile::tempdir().unwrap();
+    let ks_cfg = write_cfg(
+        ks_dir.path(),
+        &db,
+        "t",
+        ks_out.path(),
+        ", mongo: { page_size: 400 }",
+        "",
+    );
+    let r = run_rivet(&["run", "-c", ks_cfg.to_str().unwrap()]);
+    assert!(
+        !r.status.success(),
+        "keyset on heterogeneous _id must FAIL, not silently drop a type"
+    );
+    assert!(
+        String::from_utf8_lossy(&r.stderr).contains("heterogeneous"),
+        "the error must name the cause; stderr:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // Full scan (no page_size) — a single cursor crosses BSON brackets — is whole.
+    let fs_dir = tempfile::tempdir().unwrap();
+    let fs_out = tempfile::tempdir().unwrap();
+    let fs_cfg = write_cfg(fs_dir.path(), &db, "t", fs_out.path(), "", "");
+    assert!(run_export(&fs_cfg).status.success());
+    assert_eq!(
+        dir_parquet_distinct_strings(fs_out.path(), "_id").len(),
+        2000,
+        "full scan must read every _id across both types"
+    );
+}
