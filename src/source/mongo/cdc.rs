@@ -45,6 +45,13 @@ pub(crate) struct MongoChangeStream {
     canonical: bool,
     /// The watched database — the `schema` field of every emitted change.
     db_name: String,
+    /// Bounded "catch up to the current oplog end and exit" run (the scheduler
+    /// model). A tailable change stream never ends on its own, so `next_change`
+    /// polls with [`ChangeStream::next_if_any`] and returns `None` the moment the
+    /// stream drains (`max_await_time` elapsed with nothing new) — matching the
+    /// poll-based PG / SQL Server drain. `false` ⇒ block for the next change (a
+    /// continuous daemon, the MySQL binlog model).
+    until_current: bool,
 }
 
 impl MongoChangeStream {
@@ -56,6 +63,7 @@ impl MongoChangeStream {
         tls: Option<&TlsConfig>,
         checkpoint: Option<&std::path::Path>,
         canonical: bool,
+        until_current: bool,
     ) -> Result<Self> {
         let session = MongoSession::connect(url, tls, true)?;
         let db_name = session.db().to_string();
@@ -87,6 +95,10 @@ impl MongoChangeStream {
                 // Delete/update PRE-image when the server carries it (6.0+ with
                 // `changeStreamPreAndPostImages`); silently absent otherwise.
                 .full_document_before_change(FullDocumentBeforeChangeType::WhenAvailable)
+                // Bound how long the server holds a getMore open for a new change.
+                // Short so a bounded (`until_current`) run detects "drained" quickly
+                // via `next_if_any`; harmless for the daemon (`next` just re-polls).
+                .max_await_time(std::time::Duration::from_millis(500))
                 .resume_after(resume)
                 .await
         })?;
@@ -95,6 +107,7 @@ impl MongoChangeStream {
             stream,
             canonical,
             db_name,
+            until_current,
         };
         // Idle-first-run anchor (MongoDB has no server-side anchor — the MySQL
         // model): a fresh checkpointed open persists its current resume token NOW.
@@ -133,13 +146,12 @@ pub(crate) fn pin_checkpoint_at_current(
     tls: Option<&TlsConfig>,
     checkpoint: &std::path::Path,
 ) -> Result<()> {
-    let stream = MongoChangeStream::open(url, tls, None, false)?;
-    match stream.anchor_position() {
-        Some(pos) => pos.save(checkpoint),
-        None => anyhow::bail!(
-            "mongodb cdc: the server returned no resume token to anchor at — is this a replica set?"
-        ),
-    }
+    // Anchoring IS just a fresh checkpointed open: `open` pins the current resume
+    // token when it finds a checkpoint path with no prior position (the idle-
+    // first-run anchor). One mechanism, one place — this is the `ensure_anchor`
+    // entry into it. (A non-replica-set can't `watch()`, so open fails loudly
+    // before any pin.) The stream is opened only to anchor, then dropped.
+    MongoChangeStream::open(url, tls, Some(checkpoint), false, false).map(|_| ())
 }
 
 /// What a MongoDB CDC run actually delivers — probed from the server so the tier
@@ -265,14 +277,28 @@ fn to_change_event(
 impl ChangeStream for MongoChangeStream {
     fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
         let canonical = self.canonical;
+        let until_current = self.until_current;
         // Split the borrow: `block_on` reads `&session`, the future drives
         // `&mut stream` — disjoint fields.
         let session = &self.session;
         let stream = &mut self.stream;
-        match session.block_on(async { stream.next().await }) {
-            Some(Ok(cse)) => Some(to_change_event(cse, canonical, &self.db_name)),
-            Some(Err(e)) => Some(Err(anyhow::Error::from(e))),
-            None => None, // stream closed
+        if until_current {
+            // Bounded run: drain what's available now; `next_if_any` returns
+            // `None` once a `max_await_time` window passes with nothing new —
+            // i.e. we've caught up to the current oplog end, so end the stream.
+            match session.block_on(async { stream.next_if_any().await }) {
+                Ok(Some(cse)) => Some(to_change_event(cse, canonical, &self.db_name)),
+                Ok(None) => None, // caught up to current → stop
+                Err(e) => Some(Err(anyhow::Error::from(e))),
+            }
+        } else {
+            // Daemon: block for the next change (the tailable stream only ends
+            // when the connection closes).
+            match session.block_on(async { stream.next().await }) {
+                Some(Ok(cse)) => Some(to_change_event(cse, canonical, &self.db_name)),
+                Some(Err(e)) => Some(Err(anyhow::Error::from(e))),
+                None => None, // stream closed
+            }
         }
     }
 

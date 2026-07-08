@@ -246,19 +246,27 @@ struct CdcArgs {
 fn dispatch_cdc(a: CdcArgs) -> Result<()> {
     let (url, _prov) = resolve_init_source(a.source, a.source_env, a.source_file)?;
     let ckpt = a.checkpoint.map(std::path::PathBuf::from);
+    use crate::source::cdc::{CdcEngine, CdcEngineOpts};
     let cdc_cfg = crate::source::cdc::CdcConfig {
         url: url.clone(),
-        server_id: a.server_id,
-        slot: a.slot,
-        capture_instance: a.capture_instance,
         checkpoint: ckpt.clone(),
         until_current: a.until_current,
         // The CLI carries no TlsConfig; `None` ⇒ the require_tls_or_loopback gate
         // refuses a remote host (config-driven `rivet run` supplies source.tls).
         tls: None,
-        // The CLI has no source config block; relaxed JSON (the batch default).
-        // `source.mongo.json: canonical` rides the config-driven `rivet run` path.
-        mongo_canonical: false,
+        // The engine's knobs come from the CLI flags for the URL's engine; the CLI
+        // has no source config block, so Mongo defaults to relaxed JSON (canonical
+        // rides the config-driven `rivet run` path via `source.mongo.json`).
+        engine: match CdcEngine::from_url(&url)? {
+            CdcEngine::Mysql => CdcEngineOpts::Mysql {
+                server_id: a.server_id,
+            },
+            CdcEngine::Postgres => CdcEngineOpts::Postgres { slot: a.slot },
+            CdcEngine::Mssql => CdcEngineOpts::Mssql {
+                capture_instance: a.capture_instance,
+            },
+            CdcEngine::Mongo => CdcEngineOpts::Mongo { canonical: false },
+        },
     };
     let Some(dir) = a.output else {
         // NDJSON to stdout: no durable sink, so the slot is deliberately not
