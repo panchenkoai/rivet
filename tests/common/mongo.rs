@@ -131,6 +131,35 @@ impl MongoTest {
         });
     }
 
+    /// One transaction upserting into TWO collections — the boundary ends on the
+    /// second (the "uncaptured" one). Exercises a CDC config that routes only the
+    /// first collection while a transaction spans both.
+    pub fn txn_two_collections(&self, a: &str, a_id: i64, b: &str, b_id: i64) {
+        self.rt.block_on(async {
+            let mut s = self
+                .client
+                .start_session()
+                .await
+                .expect("mongo: start_session");
+            s.start_transaction()
+                .await
+                .expect("mongo: start_transaction");
+            self.coll(a)
+                .update_one(doc! { "_id": a_id }, doc! { "$set": { "v": "in_txn" } })
+                .upsert(true)
+                .session(&mut s)
+                .await
+                .expect("mongo: txn coll a");
+            self.coll(b)
+                .update_one(doc! { "_id": b_id }, doc! { "$set": { "v": "in_txn" } })
+                .upsert(true)
+                .session(&mut s)
+                .await
+                .expect("mongo: txn coll b");
+            s.commit_transaction().await.expect("mongo: commit");
+        });
+    }
+
     pub fn count(&self, name: &str) -> u64 {
         self.rt.block_on(async {
             self.coll(name)

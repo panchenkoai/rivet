@@ -201,3 +201,180 @@ fn mongo_cdc_soak_dedup_matches_source_current_state() {
     );
     assert_eq!(source.len(), 40, "all 40 _ids present");
 }
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-rs"]
+fn mongo_cdc_idle_first_run_then_change_is_captured() {
+    require_alive(LiveService::MongoRs);
+    let db = unique_name("cdc_idle");
+    let m = MongoTest::connect(PORT, &db);
+    let url = MongoTest::url(PORT, &db);
+    let tbl = "t";
+    m.drop_collection(tbl);
+
+    let ck = tempfile::tempdir().unwrap();
+    let ckpt = ck.path().join("c.ckpt");
+
+    // Enable CDC over a QUIET collection: the first run captures zero changes but
+    // MUST pin its anchor (Mongo has no server-side anchor — the MySQL model), or
+    // the next run would re-anchor at "current" and skip everything since.
+    let out0 = tempfile::tempdir().unwrap();
+    assert!(cdc_run(&url, tbl, &ckpt, out0.path()).status.success());
+    assert!(ckpt.exists(), "an idle first run must still pin the anchor");
+
+    // A single change lands during the quiet period.
+    m.upsert_set(tbl, 42, "v", "after_quiet_enable");
+
+    // The next run resumes from the pinned anchor and captures it — not skipped.
+    let out1 = tempfile::tempdir().unwrap();
+    assert!(cdc_run(&url, tbl, &ckpt, out1.path()).status.success());
+    assert!(
+        dir_parquet_distinct_strings(out1.path(), "_id").contains("42"),
+        "the change made during a quiet first run must be captured on resume"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-rs"]
+fn mongo_cdc_update_and_delete_carry_document() {
+    require_alive(LiveService::MongoRs);
+    let db = unique_name("cdc_ud");
+    let m = MongoTest::connect(PORT, &db);
+    let url = MongoTest::url(PORT, &db);
+    let tbl = "t";
+    m.drop_collection(tbl);
+
+    let ck = tempfile::tempdir().unwrap();
+    let ckpt = ck.path().join("c.ckpt");
+    let out = tempfile::tempdir().unwrap();
+    assert!(cdc_run(&url, tbl, &ckpt, out.path()).status.success()); // pin
+
+    // Phase 1 — insert + update, captured WHILE the doc still exists, so the
+    // update's UpdateLookup returns the post-image (a later delete would make it
+    // current-state NULL — the documented UpdateLookup caveat, not a loss).
+    m.upsert_set(tbl, 7, "v", "created");
+    m.upsert_set(tbl, 7, "v", "updated");
+    assert!(cdc_run(&url, tbl, &ckpt, out.path()).status.success());
+    // Phase 2 — delete, captured after. `document` is NULL (no pre-image
+    // configured) — the schema MUST allow it (regression: a non-nullable
+    // `document` errored the whole run on this exact delete).
+    m.delete_one(tbl, 7);
+    assert!(cdc_run(&url, tbl, &ckpt, out.path()).status.success());
+
+    let changes = read_mongo_cdc_changes(out.path());
+    let ops: Vec<&str> = changes.iter().map(|c| c.op.as_str()).collect();
+    assert!(ops.contains(&"insert"), "insert op captured: {ops:?}");
+    assert!(ops.contains(&"update"), "update op captured: {ops:?}");
+    assert!(ops.contains(&"delete"), "delete op captured: {ops:?}");
+    // The UPDATE (captured before the delete) carries the post-image document.
+    let upd = changes.iter().find(|c| c.op == "update").unwrap();
+    assert!(
+        upd.document.contains("updated"),
+        "update must carry the post-image document, got: {}",
+        upd.document
+    );
+    let del = changes.iter().find(|c| c.op == "delete").unwrap();
+    assert_eq!(del.id, "7", "delete must carry the _id");
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-rs"]
+fn mongo_cdc_initial_snapshot_covers_preexisting_rows() {
+    require_alive(LiveService::MongoRs);
+    let db = unique_name("cdc_snap");
+    let m = MongoTest::connect(PORT, &db);
+    let url = MongoTest::url(PORT, &db);
+    let tbl = "t";
+    // Pre-existing rows the stream alone would NOT see (they predate the anchor);
+    // `initial: snapshot` must copy them before the CDC drain.
+    m.seed_int_id(tbl, 500);
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let ckpt = dir.path().join("c.ckpt");
+    let cfg = dir.path().join("cfg.yaml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "source: {{ type: mongo, url: \"{url}\" }}\n\
+             exports:\n  - name: t_cdc\n    mode: cdc\n    table: {tbl}\n\
+             \x20   cdc: {{ checkpoint: \"{}\", initial: snapshot, max_events: 1, until_current: true }}\n\
+             \x20   format: parquet\n    destination: {{ type: local, path: \"{}\" }}\n",
+            ckpt.display(),
+            out.path().display(),
+        ),
+    )
+    .unwrap();
+    // A change so the bounded CDC leg has something to drain and exit on.
+    m.upsert_set(tbl, 1, "v", "touched");
+    assert!(
+        run_rivet(&["run", "-c", cfg.to_str().unwrap()])
+            .status
+            .success()
+    );
+
+    // The snapshot leg wrote the pre-existing rows under `<dest>/snapshot/`.
+    let snap_ids: std::collections::BTreeSet<String> = walkdir_parquet_ids(out.path(), "snapshot");
+    assert_eq!(
+        snap_ids.len(),
+        500,
+        "initial snapshot must cover all pre-existing rows"
+    );
+}
+
+/// Distinct `_id` values across `.parquet` files under any subdir of `root`
+/// whose path contains `marker` (e.g. the `snapshot/` handoff dir).
+fn walkdir_parquet_ids(root: &std::path::Path, marker: &str) -> std::collections::BTreeSet<String> {
+    let mut ids = std::collections::BTreeSet::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "parquet")
+                && p.to_string_lossy().contains(marker)
+            {
+                for id in dir_parquet_distinct_strings(p.parent().unwrap(), "_id") {
+                    ids.insert(id);
+                }
+            }
+        }
+    }
+    ids
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-rs"]
+fn mongo_cdc_mixed_transaction_ending_on_uncaptured_table() {
+    require_alive(LiveService::MongoRs);
+    let db = unique_name("cdc_mix");
+    let m = MongoTest::connect(PORT, &db);
+    let url = MongoTest::url(PORT, &db);
+    let captured = "orders";
+    let uncaptured = "audit";
+    m.drop_collection(captured);
+    m.drop_collection(uncaptured);
+
+    let ck = tempfile::tempdir().unwrap();
+    let ckpt = ck.path().join("c.ckpt");
+    let out = tempfile::tempdir().unwrap();
+    // Watch is whole-database; the `--table orders` config filters routing to it.
+    assert!(cdc_run(&url, captured, &ckpt, out.path()).status.success()); // pin
+
+    // ONE transaction touching the CAPTURED collection then ending on an
+    // UNCAPTURED one — the captured change must appear, the uncaptured must not
+    // leak into the orders output, and the run must not stall on the boundary.
+    m.txn_two_collections(captured, 1, uncaptured, 99);
+
+    assert!(cdc_run(&url, captured, &ckpt, out.path()).status.success());
+    let ids = dir_parquet_distinct_strings(out.path(), "_id");
+    assert!(
+        ids.contains("1"),
+        "the captured-collection change must appear"
+    );
+    assert!(
+        !ids.contains("99"),
+        "the uncaptured collection must NOT leak into the orders stream"
+    );
+}

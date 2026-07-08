@@ -229,7 +229,10 @@ fn blob_mappings() -> Vec<TypeMapping> {
             RivetType::String,
         ),
         TypeMapping::from_source(
-            &SourceColumn::simple("document", "document", false),
+            // Nullable: a CDC DELETE with no pre-image (pre/post-images not
+            // enabled, or < 6.0) carries only `_id`, so `document` is NULL. A
+            // batch export never writes a null here — nullable is a safe superset.
+            &SourceColumn::simple("document", "document", true),
             RivetType::Json,
         ),
     ]
