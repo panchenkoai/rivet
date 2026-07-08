@@ -109,6 +109,13 @@ pub struct MongoSource {
     snapshot: bool,
     /// Set `noCursorTimeout` on the scan cursor.
     no_cursor_timeout: bool,
+    /// A disjoint `_id` slice `[lo, hi)` for ONE parallel worker. When `Some`,
+    /// every scan (keyset page or full) is bounded to `{_id: {$gte: lo, $lt:
+    /// hi}}` (composed with the keyset `$gt` cursor). Set per-worker by the
+    /// parallel runner; ranges tile the whole ObjectId space so their union is
+    /// the full collection with no overlap. `_id` is immutable ⇒ no doc migrates
+    /// between ranges. `None` ⇒ the whole collection (the normal single reader).
+    id_range: Option<(ObjectId, ObjectId)>,
 }
 
 impl MongoSource {
@@ -131,7 +138,86 @@ impl MongoSource {
             canonical_json,
             snapshot,
             no_cursor_timeout,
+            id_range: None,
         })
+    }
+
+    /// Bind this reader to one disjoint `_id` slice `[lo, hi)` (a parallel
+    /// worker). Consuming builder — each worker owns its own `MongoSource`.
+    pub fn with_id_range(mut self, lo: ObjectId, hi: ObjectId) -> Self {
+        self.id_range = Some((lo, hi));
+        self
+    }
+
+    /// Split the collection's `_id` space into `n` disjoint, size-balanced
+    /// ranges `[lo, hi)` whose union tiles the whole ObjectId key space (so the
+    /// union read is the complete collection, no overlap). Boundaries come from a
+    /// `$sample` of the `_id`s (a WiredTiger random cursor — O(sample), NOT a
+    /// collection scan, unlike `$bucketAuto` which examines every doc), then the
+    /// N−1 quantiles of the sorted sample. Outer bounds are the min/max ObjectId
+    /// so the first/last range cannot miss the true extremes. Requires ObjectId
+    /// `_id` (same constraint as keyset paging).
+    pub fn sample_id_ranges(
+        &self,
+        collection: &str,
+        n: usize,
+    ) -> Result<Vec<(ObjectId, ObjectId)>> {
+        let n = n.max(1);
+        if n == 1 {
+            return Ok(vec![(
+                ObjectId::from_bytes([0; 12]),
+                ObjectId::from_bytes([0xff; 12]),
+            )]);
+        }
+        // ~250 samples per target range (min 2000), capped so a huge N stays well
+        // under the 5%-of-collection threshold that flips $sample to a full sort.
+        let sample_size = (n * 250).clamp(2000, 50_000);
+        let coll = self
+            .session
+            .client()
+            .database(self.session.db())
+            .collection::<Document>(collection);
+        let ids: Vec<ObjectId> = self.session.block_on(async move {
+            let mut cursor = coll
+                .aggregate(vec![
+                    doc! { "$sample": { "size": sample_size as i64 } },
+                    doc! { "$sort": { "_id": 1 } },
+                    doc! { "$project": { "_id": 1 } },
+                ])
+                .await?;
+            let mut ids = Vec::new();
+            while let Some(d) = cursor.try_next().await? {
+                match d.get("_id") {
+                    Some(Bson::ObjectId(oid)) => ids.push(*oid),
+                    other => anyhow::bail!(
+                        "parallel `_id`-range reads require an ObjectId `_id`; sampled a \
+                         non-ObjectId key ({other:?}). Remove `parallel` (or `page_size`) to \
+                         read with a single cursor."
+                    ),
+                }
+            }
+            Ok::<_, anyhow::Error>(ids)
+        })?;
+        if ids.len() < 2 {
+            // Too few docs to split meaningfully — one range over everything.
+            return Ok(vec![(
+                ObjectId::from_bytes([0; 12]),
+                ObjectId::from_bytes([0xff; 12]),
+            )]);
+        }
+        // N−1 interior quantile boundaries → N ranges, min/max ObjectId at the ends.
+        let mut bounds = vec![ObjectId::from_bytes([0; 12])];
+        for i in 1..n {
+            bounds.push(ids[i * ids.len() / n]);
+        }
+        bounds.push(ObjectId::from_bytes([0xff; 12]));
+        // Adjacent quantiles can collide on a skewed sample; drop empty ranges so
+        // a worker never gets `[x, x)`.
+        Ok(bounds
+            .windows(2)
+            .filter(|w| w[0] < w[1])
+            .map(|w| (w[0], w[1]))
+            .collect())
     }
 }
 
@@ -242,6 +328,7 @@ impl Source for MongoSource {
         };
         let canonical = self.canonical_json;
         let no_cursor_timeout = self.no_cursor_timeout;
+        let id_range = self.id_range;
         // Source-side batch = the RSS lever. Two caps, whichever trips first:
         //   • `tuning.batch_size` — a row count (schema-based memory budget for a
         //     document store is unreliable: the `document` column is variable
@@ -274,9 +361,29 @@ impl Source for MongoSource {
         };
 
         let total = self.session.block_on(async {
-            let filter = match &after_id {
-                Some(oid) => doc! { "_id": { "$gt": oid } },
-                None => doc! {},
+            // Lower bound: the keyset cursor (`$gt: after`) when resuming a page,
+            // else this worker's range floor (`$gte: lo`). Upper bound: the range
+            // ceiling (`$lt: hi`). A worker with no range and no cursor scans all.
+            let filter = {
+                let mut cond = Document::new();
+                match &after_id {
+                    Some(oid) => {
+                        cond.insert("$gt", *oid);
+                    }
+                    None => {
+                        if let Some((lo, _)) = id_range {
+                            cond.insert("$gte", lo);
+                        }
+                    }
+                }
+                if let Some((_, hi)) = id_range {
+                    cond.insert("$lt", hi);
+                }
+                if cond.is_empty() {
+                    doc! {}
+                } else {
+                    doc! { "_id": cond }
+                }
             };
             let mut find = coll.find(filter);
             if let Some(page) = page_limit {

@@ -41,6 +41,12 @@ pub struct KeysetPlan {
     /// so a pre-existing plan artifact (no field) deserializes as non-resumable.
     #[serde(default)]
     pub checkpoint: bool,
+    /// Concurrent `_id`-range workers for a MongoDB parallel read (`export.
+    /// parallel`): each worker keyset-pages a disjoint `$sample`-bounded slice.
+    /// Only the Mongo reader acts on it; SQL keyset stays sequential and ignores
+    /// it. `#[serde(default)]` ⇒ absent/0 reads with a single cursor (`.max(1)`).
+    #[serde(default)]
+    pub parallel: usize,
 }
 
 /// Fully resolved execution plan for a single export.

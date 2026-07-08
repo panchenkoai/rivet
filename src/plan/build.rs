@@ -59,7 +59,7 @@ pub fn build_plan(
     };
 
     let strategy = match export.mode {
-        ExportMode::Full => full_strategy(config),
+        ExportMode::Full => full_strategy(config, export),
         ExportMode::Incremental => {
             let primary_column = export.cursor_column.clone().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -151,7 +151,7 @@ pub fn build_plan(
 /// per-page parts, the base for parallel `_id`-range reads) instead of one
 /// long-held cursor. Every SQL engine — and MongoDB without `page_size` — uses
 /// the single-cursor snapshot.
-fn full_strategy(config: &Config) -> ExtractionStrategy {
+fn full_strategy(config: &Config, export: &ExportConfig) -> ExtractionStrategy {
     if config.source.source_type == crate::config::SourceType::Mongo
         && let Some(mongo) = config.source.mongo.as_ref()
         && let Some(page) = mongo.page_size
@@ -161,6 +161,8 @@ fn full_strategy(config: &Config) -> ExtractionStrategy {
             chunk_size: page.max(1),
             // Resume is opt-in: default keeps `mode: full` re-reading each run.
             checkpoint: mongo.resume,
+            // `parallel: N` fans N `_id`-range workers (Mongo reader only).
+            parallel: export.parallel,
         });
     }
     ExtractionStrategy::Snapshot
@@ -408,6 +410,8 @@ fn resolve_chunked_strategy(
             chunk_size,
             // SQL keyset is a full re-read each run (no cross-run resume).
             checkpoint: false,
+            // SQL keyset is sequential; parallel `_id`-range is a Mongo capability.
+            parallel: 1,
         }));
     }
 
@@ -463,6 +467,7 @@ fn resolve_chunked_strategy(
                         key_column: key.to_string(),
                         chunk_size,
                         checkpoint: false,
+                        parallel: 1,
                     }));
                 }
                 anyhow::bail!(

@@ -18,6 +18,7 @@ mod job;
 mod keyset;
 mod manifest_reconcile;
 pub(crate) mod manifest_writer;
+mod mongo_parallel;
 mod parallel_children;
 pub(crate) mod parent_ui;
 mod partition_expand;
