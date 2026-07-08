@@ -576,5 +576,24 @@ services:
       retries: 30
       start_period: 10s
 
+  # Auth-enabled Mongo (root + a least-privilege read-only `reader` created by
+  # dev/mongo/init-auth.js) for the harm-permission test: a login without
+  # clusterMonitor cannot run serverStatus, so the source-harm probe must degrade
+  # to absent rather than fail the export.
+  mongo-auth:
+    image: mongo:${MONGO_VERSION:-7}
+    ports:
+      - "27020:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: rootpass
+    volumes:
+      - ./dev/mongo/init-auth.js:/docker-entrypoint-initdb.d/init-auth.js:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.runCommand({ping:1})' || mongo --quiet --eval 'db.runCommand({ping:1})'"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
 volumes:
   postgres_state_data:

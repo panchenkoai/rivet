@@ -113,6 +113,8 @@ mod live_metrics_persist;
 mod live_mongo;
 #[path = "live/live_mongo_crash_recovery.rs"]
 mod live_mongo_crash_recovery;
+#[path = "live/live_mongo_harm_permission.rs"]
+mod live_mongo_harm_permission;
 #[path = "live/live_mongo_retry_and_faults.rs"]
 mod live_mongo_retry_and_faults;
 #[path = "live/live_mssql_chunked.rs"]

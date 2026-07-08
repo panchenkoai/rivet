@@ -61,6 +61,15 @@ pub fn mongo_toxi_url(db: &str) -> String {
     format!("mongodb://127.0.0.1:27019/{db}?directConnection=true&serverSelectionTimeoutMS=5000")
 }
 
+/// The least-privilege read-only login on the auth-enabled `mongo-auth` service
+/// (:27020, created by dev/mongo/init-auth.js). `read` on `harmdb` only — no
+/// `clusterMonitor`, so `serverStatus` (the source-harm probe) is denied. For the
+/// harm-permission test: the export must succeed, the harm counters just absent.
+pub fn mongo_auth_reader_url() -> String {
+    "mongodb://reader:readpass@127.0.0.1:27020/harmdb?authSource=harmdb&directConnection=true"
+        .to_string()
+}
+
 pub const MINIO_ENDPOINT: &str = "http://127.0.0.1:9000";
 pub const MINIO_ACCESS_KEY: &str = "minioadmin";
 pub const MINIO_SECRET_KEY: &str = "minioadmin";
@@ -243,6 +252,8 @@ pub enum LiveService {
     Mongo,
     /// MongoDB single-node replica set (change-stream CDC). TCP :27018.
     MongoRs,
+    /// Auth-enabled MongoDB with a least-privilege read-only user. TCP :27020.
+    MongoAuth,
     Minio,
     FakeGcs,
     /// Azure Blob emulator (Azurite). Blob endpoint :10000.
@@ -282,6 +293,11 @@ impl LiveService {
                 "127.0.0.1",
                 27018,
                 "service `mongo-rs` (single-node replica set) in docker-compose.yaml",
+            ),
+            LiveService::MongoAuth => (
+                "127.0.0.1",
+                27020,
+                "service `mongo-auth` (auth-enabled) in docker-compose.yaml",
             ),
             LiveService::MysqlToxi => (
                 "127.0.0.1",
