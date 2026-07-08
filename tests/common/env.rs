@@ -49,6 +49,18 @@ pub const MSSQL_CDC_URL: &str = "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1434/r
 /// Backend forwards to the same `mysql` service used by `MYSQL_URL`.
 pub const PROXYSQL_URL: &str = "mysql://rivet:rivet@127.0.0.1:6033/rivet";
 
+/// Standalone Mongo (`mongo` service :27017) routed through Toxiproxy on :27019 —
+/// for retry / fault-injection tests. Seed via the direct :27017 driver
+/// (`MongoTest::connect(27017, …)`); point rivet at this URL so its reads cross
+/// the proxy and can be cut / delayed mid-scan. Proxy is created on demand with
+/// `ensure_toxi_proxy("mongo", 27019, "mongo:27017")`.
+pub fn mongo_toxi_url(db: &str) -> String {
+    // serverSelectionTimeoutMS bounds how long a connect waits on a dead upstream
+    // (the `..._fails_cleanly..` test) — 5s is well above the ~600ms mid-scan
+    // outage window the recovery test needs to survive.
+    format!("mongodb://127.0.0.1:27019/{db}?directConnection=true&serverSelectionTimeoutMS=5000")
+}
+
 pub const MINIO_ENDPOINT: &str = "http://127.0.0.1:9000";
 pub const MINIO_ACCESS_KEY: &str = "minioadmin";
 pub const MINIO_SECRET_KEY: &str = "minioadmin";

@@ -104,6 +104,14 @@ pub fn classify_error(err: &anyhow::Error) -> RetryClass {
         return result;
     }
 
+    // --- MongoDB: network / server-selection / retryable-read command codes ---
+    if let Some(result) = err
+        .downcast_ref::<mongodb::error::Error>()
+        .and_then(classify_mongo_error)
+    {
+        return result;
+    }
+
     // --- Fallback: string-based classification ---
     let msg = format!("{:#}", err).to_lowercase();
 
@@ -310,6 +318,63 @@ fn classify_mysql_error(err: &mysql::Error) -> Option<RetryClass> {
             _ => None,
         },
         mysql::Error::IoError(_) => Some(TRANSIENT_RECONNECT),
+        _ => None,
+    }
+}
+
+/// Classify a MongoDB driver error — the typed primary path, mirroring the
+/// Postgres SQLSTATE / MySQL-code classifiers above (the string fallback is only
+/// a backup). The driver's own retryable-read handling (`retryReads`, on by
+/// default) retries a transient read exactly ONCE; this lets rivet's chunk retry
+/// loop ride out failures *past* that single attempt.
+///
+/// Coverage note: the `Io` / `DnsResolve` / `ServerSelection` branches OVERLAP
+/// the string fallback (a dropped socket renders "connection reset" / "unexpected
+/// eof", which the string path already catches — verified: the toxiproxy
+/// mid-scan test passes even with this arm stubbed out). The branch that is NOT
+/// redundant is the retryable-read COMMAND CODES: a replica-set failover mid-scan
+/// surfaces `ErrorKind::Command{code: 189/10107/11602/…}` ("not primary",
+/// "interrupted due to repl state change") whose wording the string path does
+/// NOT match — without this arm those abort the export as `PERMANENT`. Toxiproxy
+/// injects network faults, not server command errors, so that branch is covered
+/// by reasoning + the spec code list, not an isolating live test (and
+/// `ErrorKind` is `#[non_exhaustive]`, so it cannot be unit-constructed).
+///
+/// The read-retryable codes mirror the MongoDB spec; the driver's own list
+/// (`RETRYABLE_READ_CODES`) is `pub(crate)`, so it is duplicated here.
+fn classify_mongo_error(err: &mongodb::error::Error) -> Option<RetryClass> {
+    use mongodb::error::ErrorKind;
+    const RETRYABLE_READ_CODES: &[i32] = &[
+        6,     // HostUnreachable
+        7,     // HostNotFound
+        89,    // NetworkTimeout
+        91,    // ShutdownInProgress
+        134,   // ReadConcernMajorityNotAvailableYet
+        189,   // PrimarySteppedDown
+        262,   // ExceededTimeLimit
+        9001,  // SocketException
+        10107, // NotWritablePrimary
+        11600, // InterruptedAtShutdown
+        11602, // InterruptedDueToReplStateChange
+        13435, // NotPrimaryNoSecondaryOk
+        13436, // NotPrimaryOrSecondary
+    ];
+    match &*err.kind {
+        // A dropped/reset socket or a DNS blip — the connection is gone.
+        ErrorKind::Io(_) | ErrorKind::DnsResolve { .. } => Some(TRANSIENT_RECONNECT),
+        // No server selectable right now (primary election, all nodes down).
+        ErrorKind::ServerSelection { .. } => Some(TRANSIENT_RECONNECT),
+        // Pool cleared after a network error — a fresh connection is needed.
+        ErrorKind::ConnectionPoolCleared { .. } => Some(TRANSIENT_RECONNECT),
+        // A server command error is retryable only for the read-retryable codes
+        // (stepdown, shutdown-in-progress, not-primary, socket exception, …).
+        ErrorKind::Command(ce) if RETRYABLE_READ_CODES.contains(&ce.code) => {
+            Some(TRANSIENT_RECONNECT)
+        }
+        // Auth never fixes itself — retrying just burns the budget.
+        ErrorKind::Authentication { .. } => Some(PERMANENT),
+        // Everything else (malformed command, decode error, rivet-side shutdown)
+        // falls through to the string path / default.
         _ => None,
     }
 }

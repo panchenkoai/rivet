@@ -470,6 +470,7 @@ services:
       - "13306:13306"  # proxied MySQL
       - "13307:13307"  # proxied mysql-cdc (gremlin: binlog cut mid-drain)
       - "14443:14443"  # proxied fake-gcs (gremlin: upload cut mid-part)
+      - "27019:27019"  # proxied Mongo (retry/faults: RST + latency mid-scan)
     depends_on:
       - postgres
       - mysql
