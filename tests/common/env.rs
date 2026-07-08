@@ -61,6 +61,12 @@ pub fn mongo_toxi_url(db: &str) -> String {
     format!("mongodb://127.0.0.1:27019/{db}?directConnection=true&serverSelectionTimeoutMS=5000")
 }
 
+/// Base URLs for the Rig's Mongo constructors. Batch tests override the db via
+/// `.source_url(&MongoTest::url(PORT, &db))` (each uses a unique db); the replica
+/// set needs `directConnection=true` (port-mapped single node).
+pub const MONGO_URL: &str = "mongodb://127.0.0.1:27017";
+pub const MONGO_RS_URL: &str = "mongodb://127.0.0.1:27018/?directConnection=true";
+
 /// The least-privilege read-only login on the auth-enabled `mongo-auth` service
 /// (:27020, created by dev/mongo/init-auth.js). `read` on `harmdb` only — no
 /// `clusterMonitor`, so `serverStatus` (the source-harm probe) is denied. For the

@@ -380,8 +380,7 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 || chunk.contains("run_ok(")
                 || chunk.contains("run_with_env(")
                 || chunk.contains("run_expect_fail(")
-                || chunk.contains("run_and_read(")
-                || chunk.contains("cdc_run("); // Mongo live-CDC helper
+                || chunk.contains("run_and_read(");
             // Outcome = the test READS BACK what the capture produced (files,
             // destination listing, or the state DB) — not merely that the
             // process exited 0.
@@ -401,6 +400,8 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 // canonical reader; oracle diversity is the defense.
                 || chunk.contains("distinct_ids(")
                 || chunk.contains("distinct_int_ids(")
+                || chunk.contains("read_mongo_cdc_changes(") // Mongo blob-CDC oracle
+                || chunk.contains("dir_parquet_distinct_strings(")
                 || chunk.contains("read_all(")
                 || chunk.contains("read_all_parts(")
                 || chunk.contains("stage_metrics(")

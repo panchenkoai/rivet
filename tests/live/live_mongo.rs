@@ -1,7 +1,7 @@
-//! Live coverage for the MongoDB BATCH read path (JSON-blob model). Requires the
-//! standalone mongo (`docker compose up -d mongo`). Every check re-reads the
-//! destination Parquet (distinct `_id` set / verbatim document text), never
-//! rivet's own counters — the test-self-oracle rule.
+//! Live coverage for the MongoDB BATCH read path (JSON-blob model), built on the
+//! canonical [`Rig`]. Requires the standalone mongo (`docker compose up -d
+//! mongo`). Every check re-reads the destination Parquet (distinct `_id` set /
+//! verbatim document text), never rivet's own counters — the test-self-oracle rule.
 //!
 //! Invariants proven:
 //! - **blob round-trip** — every document exports as `_id` + `document`, the
@@ -9,37 +9,21 @@
 //! - **keyset no loss/dup** — `page_size` paging over the whole collection loses
 //!   and duplicates nothing across page boundaries.
 //! - **parallel any-`_id`** — `parallel: N` `_id`-range fan-out reads the whole
-//!   collection with no gap/overlap, for integer `_id` (not just ObjectId).
+//!   collection with no gap/overlap, for integer / String / ObjectId `_id`.
 //! - **typed cursor** — keyset pages a STRING `_id` collection (impossible before
 //!   the typed-cursor token; the display-column round-trip would mis-order it).
 //! - **type fidelity** — a document of tricky BSON types exports with the exact
 //!   extended-JSON TEXT (large `Int64 > 2^53`, `Decimal128`) verbatim, so a
 //!   downstream `PARSE_JSON` (BigQuery / Snowflake) reconstructs it losslessly.
+//! - **reconcile / resume / heterogeneous-`_id` guard** — the operational surface.
 
 use crate::common::*;
 
 const PORT: u16 = 27017; // standalone mongo
 
-fn write_cfg(
-    dir: &std::path::Path,
-    db: &str,
-    table: &str,
-    out: &std::path::Path,
-    extra_mongo: &str,
-    extra_export: &str,
-) -> std::path::PathBuf {
-    write_mongo_config(
-        dir,
-        &MongoTest::url(PORT, db),
-        table,
-        out,
-        extra_mongo,
-        extra_export,
-    )
-}
-
-fn run_export(cfg: &std::path::Path) -> std::process::Output {
-    run_rivet(&["run", "-c", cfg.to_str().unwrap()])
+/// A batch Rig pointed at collection `table` in a fresh per-test db.
+fn batch(db: &str, table: &str) -> Rig {
+    Rig::mongo_batch(table).source_url(&MongoTest::url(PORT, db))
 }
 
 #[test]
@@ -47,30 +31,19 @@ fn run_export(cfg: &std::path::Path) -> std::process::Output {
 fn mongo_batch_keyset_no_loss_or_dup() {
     require_alive(LiveService::Mongo);
     let db = unique_name("mkeyset");
-    let m = MongoTest::connect(PORT, &db);
-    m.seed_int_id("bench", 5000);
+    MongoTest::connect(PORT, &db).seed_int_id("bench", 5000);
 
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out = tempfile::tempdir().unwrap();
     // page_size 2000 → 3 pages: exercises page boundaries.
-    let cfg = write_cfg(
-        cfg_dir.path(),
-        &db,
-        "bench",
-        out.path(),
-        ", mongo: { page_size: 2000 }",
-        "",
-    );
-    assert!(run_export(&cfg).status.success());
+    let rig = batch(&db, "bench").mongo("page_size: 2000");
+    rig.run_ok();
 
-    let ids = dir_parquet_distinct_strings(out.path(), "_id");
     assert_eq!(
-        ids.len(),
+        dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
         5000,
         "distinct _id must equal source (no loss/dup)"
     );
     assert!(
-        dir_parquet_has_column(out.path(), "document"),
+        dir_parquet_has_column(&rig.out_dir(), "document"),
         "blob document column present"
     );
 }
@@ -80,25 +53,16 @@ fn mongo_batch_keyset_no_loss_or_dup() {
 fn mongo_batch_parallel_integer_id_no_loss_or_dup() {
     require_alive(LiveService::Mongo);
     let db = unique_name("mpar");
-    let m = MongoTest::connect(PORT, &db);
-    m.seed_int_id("bench", 5000);
+    MongoTest::connect(PORT, &db).seed_int_id("bench", 5000);
 
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out = tempfile::tempdir().unwrap();
     // parallel: 4 on an INTEGER _id — impossible before Bson range bounds.
-    let cfg = write_cfg(
-        cfg_dir.path(),
-        &db,
-        "bench",
-        out.path(),
-        ", mongo: { page_size: 1000 }",
-        ", parallel: 4",
-    );
-    assert!(run_export(&cfg).status.success());
+    let rig = batch(&db, "bench")
+        .mongo("page_size: 1000")
+        .export_line("parallel: 4");
+    rig.run_ok();
 
-    let ids = dir_parquet_distinct_strings(out.path(), "_id");
     assert_eq!(
-        ids.len(),
+        dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
         5000,
         "parallel _id-range union must be the whole collection"
     );
@@ -109,28 +73,45 @@ fn mongo_batch_parallel_integer_id_no_loss_or_dup() {
 fn mongo_batch_typed_cursor_pages_string_id() {
     require_alive(LiveService::Mongo);
     let db = unique_name("mstr");
-    let m = MongoTest::connect(PORT, &db);
-    m.seed_string_id("bench", 4000);
+    MongoTest::connect(PORT, &db).seed_string_id("bench", 4000);
 
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out = tempfile::tempdir().unwrap();
     // Keyset a STRING _id — the typed cursor token round-trips it; a display-only
     // cursor would mis-order (was an actionable error before A').
-    let cfg = write_cfg(
-        cfg_dir.path(),
-        &db,
-        "bench",
-        out.path(),
-        ", mongo: { page_size: 1500 }",
-        "",
-    );
-    assert!(run_export(&cfg).status.success());
+    let rig = batch(&db, "bench").mongo("page_size: 1500");
+    rig.run_ok();
 
     assert_eq!(
-        dir_parquet_distinct_strings(out.path(), "_id").len(),
+        dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
         4000,
         "string-_id keyset must read the whole collection with no loss/dup"
     );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn mongo_batch_parallel_objectid_and_string_id() {
+    require_alive(LiveService::Mongo);
+    // ObjectId (the Mongo default) and String `_id` — the `$sample` `_id`-range
+    // fan-out must tile either ordered type completely, not just integers.
+    for (seed_objectid, tag) in [(true, "mpoid"), (false, "mpstr")] {
+        let db = unique_name(tag);
+        let m = MongoTest::connect(PORT, &db);
+        if seed_objectid {
+            m.seed_objectid("bench", 5000);
+        } else {
+            m.seed_string_id("bench", 5000);
+        }
+        let rig = batch(&db, "bench")
+            .mongo("page_size: 1000")
+            .export_line("parallel: 4");
+        rig.run_ok();
+        assert_eq!(
+            dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
+            5000,
+            "parallel over {} _id must read the whole collection",
+            if seed_objectid { "ObjectId" } else { "String" }
+        );
+    }
 }
 
 #[test]
@@ -153,12 +134,10 @@ fn mongo_batch_type_fidelity_document_is_verbatim_extjson() {
         }],
     );
 
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out = tempfile::tempdir().unwrap();
-    let cfg = write_cfg(cfg_dir.path(), &db, "t", out.path(), "", "");
-    assert!(run_export(&cfg).status.success());
+    let rig = batch(&db, "t");
+    rig.run_ok();
 
-    let docs = dir_parquet_distinct_strings(out.path(), "document");
+    let docs = dir_parquet_distinct_strings(&rig.out_dir(), "document");
     let doc_text = docs.iter().next().expect("one document");
     assert!(
         doc_text.contains("9007199254740993"),
@@ -175,31 +154,25 @@ fn mongo_batch_type_fidelity_document_is_verbatim_extjson() {
 fn mongo_run_reconcile_matches_source_count() {
     require_alive(LiveService::Mongo);
     let db = unique_name("mrecon");
-    let m = MongoTest::connect(PORT, &db);
-    m.seed_int_id("bench", 3000);
+    MongoTest::connect(PORT, &db).seed_int_id("bench", 3000);
 
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out = tempfile::tempdir().unwrap();
-    let cfg = write_cfg(
-        cfg_dir.path(),
-        &db,
-        "bench",
-        out.path(),
-        ", mongo: { page_size: 1000 }",
-        "",
-    );
+    let rig = batch(&db, "bench").mongo("page_size: 1000");
     // `rivet run --reconcile` is Mongo's whole-export count check — the source
     // `count_documents` vs the destination row count. (The partition-level
     // `rivet reconcile` / `rivet repair` commands are N/A for keyset: it has no
-    // natural partitions, and the CLI says so rather than guessing.)
-    let r = run_rivet(&["run", "-c", cfg.to_str().unwrap(), "--reconcile"]);
+    // natural partitions.) The rig builds the config; the flag rides a bespoke run.
+    let r = run_rivet(&[
+        "run",
+        "-c",
+        rig.config_path().to_str().unwrap(),
+        "--reconcile",
+    ]);
     assert!(
         r.status.success(),
         "run --reconcile must exit 0 on a match; stderr:\n{}",
         String::from_utf8_lossy(&r.stderr)
     );
-    // The reconcile verdict rides the run summary on stderr (like the per-export
-    // progress line), not stdout.
+    // The reconcile verdict rides the run summary on stderr.
     let summary = String::from_utf8_lossy(&r.stderr);
     assert!(
         summary.contains("MATCH"),
@@ -215,21 +188,14 @@ fn mongo_batch_resume_reads_only_new_since_last_run() {
     let m = MongoTest::connect(PORT, &db);
     m.seed_int_id("t", 2000);
 
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out = tempfile::tempdir().unwrap(); // SAME dest across both runs — the
-    // keyset checkpoint persists in its state.
-    let cfg = write_cfg(
-        cfg_dir.path(),
-        &db,
-        "t",
-        out.path(),
-        ", mongo: { page_size: 500, resume: true }",
-        "",
+    // The SAME rig across both runs — the keyset checkpoint persists in the
+    // export state keyed by its (stable) config + destination.
+    let rig = batch(&db, "t").mongo("page_size: 500, resume: true");
+    rig.run_ok();
+    assert_eq!(
+        dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
+        2000
     );
-
-    // Run 1 exports all 2000 and persists the keyset cursor at the max _id.
-    assert!(run_export(&cfg).status.success());
-    assert_eq!(dir_parquet_distinct_strings(out.path(), "_id").len(), 2000);
 
     // 500 new docs arrive with higher _id.
     for i in 2001..=2500 {
@@ -237,51 +203,17 @@ fn mongo_batch_resume_reads_only_new_since_last_run() {
     }
 
     // Run 2 (resume) must read ONLY the 500 new — not rescan the first 2000.
-    assert!(run_export(&cfg).status.success());
+    rig.run_ok();
     assert_eq!(
-        dir_parquet_distinct_strings(out.path(), "_id").len(),
+        dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
         2500,
         "resume must union to the full set with no loss"
     );
     assert_eq!(
-        total_parquet_rows(out.path()),
+        total_parquet_rows(&rig.out_dir()),
         2500,
         "resume must add only the new rows — 4500 would mean run 2 rescanned"
     );
-}
-
-#[test]
-#[ignore = "live: requires docker compose up -d mongo"]
-fn mongo_batch_parallel_objectid_and_string_id() {
-    require_alive(LiveService::Mongo);
-    // ObjectId (the Mongo default) and String `_id` — the `$sample` `_id`-range
-    // fan-out must tile either ordered type completely, not just integers.
-    for (seed_objectid, tag) in [(true, "mpoid"), (false, "mpstr")] {
-        let db = unique_name(tag);
-        let m = MongoTest::connect(PORT, &db);
-        if seed_objectid {
-            m.seed_objectid("bench", 5000);
-        } else {
-            m.seed_string_id("bench", 5000);
-        }
-        let cfg_dir = tempfile::tempdir().unwrap();
-        let out = tempfile::tempdir().unwrap();
-        let cfg = write_cfg(
-            cfg_dir.path(),
-            &db,
-            "bench",
-            out.path(),
-            ", mongo: { page_size: 1000 }",
-            ", parallel: 4",
-        );
-        assert!(run_export(&cfg).status.success());
-        assert_eq!(
-            dir_parquet_distinct_strings(out.path(), "_id").len(),
-            5000,
-            "parallel over {} _id must read the whole collection",
-            if seed_objectid { "ObjectId" } else { "String" }
-        );
-    }
 }
 
 #[test]
@@ -304,34 +236,17 @@ fn mongo_keyset_on_heterogeneous_id_errors_loudly_full_scan_still_works() {
     m.insert_many("t", docs);
 
     // Keyset MUST refuse loudly — never silently export one bracket.
-    let ks_dir = tempfile::tempdir().unwrap();
-    let ks_out = tempfile::tempdir().unwrap();
-    let ks_cfg = write_cfg(
-        ks_dir.path(),
-        &db,
-        "t",
-        ks_out.path(),
-        ", mongo: { page_size: 400 }",
-        "",
-    );
-    let r = run_rivet(&["run", "-c", ks_cfg.to_str().unwrap()]);
+    let stderr = batch(&db, "t").mongo("page_size: 400").run_expect_fail();
     assert!(
-        !r.status.success(),
-        "keyset on heterogeneous _id must FAIL, not silently drop a type"
-    );
-    assert!(
-        String::from_utf8_lossy(&r.stderr).contains("heterogeneous"),
-        "the error must name the cause; stderr:\n{}",
-        String::from_utf8_lossy(&r.stderr)
+        stderr.contains("heterogeneous"),
+        "keyset on heterogeneous _id must fail naming the cause; stderr:\n{stderr}"
     );
 
     // Full scan (no page_size) — a single cursor crosses BSON brackets — is whole.
-    let fs_dir = tempfile::tempdir().unwrap();
-    let fs_out = tempfile::tempdir().unwrap();
-    let fs_cfg = write_cfg(fs_dir.path(), &db, "t", fs_out.path(), "", "");
-    assert!(run_export(&fs_cfg).status.success());
+    let fs = batch(&db, "t");
+    fs.run_ok();
     assert_eq!(
-        dir_parquet_distinct_strings(fs_out.path(), "_id").len(),
+        dir_parquet_distinct_strings(&fs.out_dir(), "_id").len(),
         2000,
         "full scan must read every _id across both types"
     );

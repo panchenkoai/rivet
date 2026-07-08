@@ -287,3 +287,36 @@ store isn't) needs a heterogeneous-key guard + a live test that seeds two key
 types and asserts the paginator ERRORS (never silently exports one bracket),
 while the unbounded scan stays complete.** Counts/sums are not evidence here —
 the dropped bracket is a clean, self-consistent subset.
+
+## Every engine's live tests go through the canonical Rig — no bespoke harness
+
+There is ONE way to build a config, run rivet, and read the output back in a
+live test: the `Rig` (`tests/common/rig.rs`). It owns its tempdir (no leaks),
+renders the config for any `source.type`, drives batch (`run_ok` /
+`run_expect_fail` / `run_and_read`) and CDC (`mode: cdc` via `mongo_cdc`/
+`mysql_cdc`/… + `checkpoint_path`), injects faults (`run_with_env`), and the
+CDC conformance gate recognises `Rig::run*` as its capture markers. It exists
+because ~250 hand-rolled YAML templates + ~240 inline `Command::new(RIVET_BIN)`
+sites drifted apart; the rig re-converged them.
+
+When a NEW source engine lands (the Mongo pass was the reminder), wire its live
+tests through the rig, do NOT stand up a parallel path:
+
+- Add `Rig::<engine>_batch(table)` (+ `Rig::<engine>_cdc(table)` if it has CDC)
+  and any engine-specific option method (`.mongo("page_size: 500")`), rather
+  than a per-file `write_cfg` / `run_export` / `cdc_run` helper. A private
+  config-writer that `format!`s the YAML — and worse, a `std::mem::forget`
+  tempdir to keep the path alive — is the exact smell the rig removes (the rig
+  already owns the tempdir).
+- Drive CDC through **config mode** (`mode: cdc`) like the SQL engines, not the
+  `rivet cdc` CLI subcommand, so all engines share one CDC path and the gate's
+  `Rig::run*` capture markers apply without a bespoke addition.
+- If the engine's read-back oracle is new (Mongo's `read_mongo_cdc_changes`),
+  add that ONE marker to `every_live_cdc_test_asserts_an_outcome`'s dictionary —
+  don't route captures around the gate.
+
+Process rule: **a new engine's test PR that introduces a `write_cfg`-style YAML
+builder or a `*_run`/`cdc_run` command wrapper instead of a `Rig::<engine>_*`
+constructor is incomplete** — the review asks for the rig constructor. The rig
+is the seam; per-file config builders are the ~250 templates it replaced coming
+back one engine at a time.

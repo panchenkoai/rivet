@@ -1,6 +1,6 @@
-//! Runtime retry + mid-scan fault injection for the MongoDB batch read path —
-//! the Mongo twin of `live_retry_and_faults.rs` (PG) and
-//! `live_mysql_retry_and_faults.rs`. Requires the `mongo` service + Toxiproxy
+//! Runtime retry + mid-scan fault injection for the MongoDB batch read path, on
+//! the canonical [`Rig`] — the Mongo twin of `live_retry_and_faults.rs` (PG) and
+//! `live_mysql_retry_and_faults.rs`. Requires `mongo` + Toxiproxy
 //! (`docker compose up -d mongo toxiproxy`).
 //!
 //! These prove the Mongo batch read path RECOVERS from a mid-scan transport
@@ -13,7 +13,6 @@
 //! isolate the typed `classify_mongo_error` arm — its non-redundant value is the
 //! retryable-read COMMAND CODES (replica-set failover: stepdown / election),
 //! which Toxiproxy (network faults, not server command errors) cannot induce.
-//! See the coverage note on `classify_mongo_error`.
 //!
 //! Reads cross Toxiproxy (`:27019` → `mongo:27017`); the collection is seeded
 //! over the DIRECT `:27017` driver so the fault only ever hits rivet's reads.
@@ -33,15 +32,12 @@ fn reset_mongo_proxy() {
     toxi_enable("mongo");
 }
 
-fn mongo_cfg(dir: &std::path::Path, db: &str, out: &std::path::Path) -> std::path::PathBuf {
-    write_mongo_config(
-        dir,
-        &mongo_toxi_url(db),
-        "t",
-        out,
-        ", mongo: { page_size: 2000 }",
-        ", tuning: { max_retries: 4, retry_backoff_ms: 200 }",
-    )
+/// A batch Rig whose reads cross the toxi proxy, with a bounded retry budget.
+fn proxied(db: &str) -> Rig {
+    Rig::mongo_batch("t")
+        .source_url(&mongo_toxi_url(db))
+        .mongo("page_size: 2000")
+        .export_line("tuning: { max_retries: 4, retry_backoff_ms: 200 }")
 }
 
 #[test]
@@ -51,26 +47,15 @@ fn mongo_export_survives_transient_latency_added_via_toxiproxy() {
     require_alive(LiveService::Toxiproxy);
     reset_mongo_proxy();
     let db = unique_name("rt_lat");
-    let m = MongoTest::connect(DIRECT_PORT, &db);
-    m.seed_int_id("t", 8000);
+    MongoTest::connect(DIRECT_PORT, &db).seed_int_id("t", 8000);
 
     // A per-read delay slows the scan but must not fail it.
     toxi_add_latency("mongo", 25);
 
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out = tempfile::tempdir().unwrap();
-    let r = run_rivet(&[
-        "run",
-        "-c",
-        mongo_cfg(cfg_dir.path(), &db, out.path()).to_str().unwrap(),
-    ]);
-    assert!(
-        r.status.success(),
-        "export through added latency must still complete; stderr:\n{}",
-        String::from_utf8_lossy(&r.stderr)
-    );
+    let rig = proxied(&db);
+    rig.run_ok();
     assert_eq!(
-        dir_parquet_distinct_strings(out.path(), "_id").len(),
+        dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
         8000,
         "latency must not lose rows"
     );
@@ -83,10 +68,9 @@ fn mongo_export_recovers_after_mid_stream_proxy_disable_then_enable_with_retries
     require_alive(LiveService::Toxiproxy);
     reset_mongo_proxy();
     let db = unique_name("rt_mid");
-    let m = MongoTest::connect(DIRECT_PORT, &db);
     // Large enough (100K / 2K page = 50 pages) that the scan is still in flight
     // when the proxy drops at 80 ms — so a real mid-scan socket death is retried.
-    m.seed_int_id("t", 100_000);
+    MongoTest::connect(DIRECT_PORT, &db).seed_int_id("t", 100_000);
 
     let bg = std::thread::spawn(|| {
         std::thread::sleep(Duration::from_millis(80));
@@ -95,23 +79,12 @@ fn mongo_export_recovers_after_mid_stream_proxy_disable_then_enable_with_retries
         toxi_enable("mongo"); // rivet's retry reconnects here
     });
 
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out = tempfile::tempdir().unwrap();
-    let r = run_rivet(&[
-        "run",
-        "-c",
-        mongo_cfg(cfg_dir.path(), &db, out.path()).to_str().unwrap(),
-    ]);
+    let rig = proxied(&db);
+    rig.run_ok(); // recovers via the chunk retry loop, or panics with the output
     let _ = bg.join();
 
-    assert!(
-        r.status.success(),
-        "export must RECOVER from a mid-scan proxy outage via the chunk retry \
-         loop; stderr:\n{}",
-        String::from_utf8_lossy(&r.stderr)
-    );
     assert_eq!(
-        dir_parquet_distinct_strings(out.path(), "_id").len(),
+        dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
         100_000,
         "recovery must be complete — every row present after the outage"
     );
@@ -124,22 +97,11 @@ fn mongo_export_fails_cleanly_when_proxy_is_disabled_before_run() {
     require_alive(LiveService::Toxiproxy);
     reset_mongo_proxy();
     let db = unique_name("rt_dead");
-    let m = MongoTest::connect(DIRECT_PORT, &db);
-    m.seed_int_id("t", 100);
+    MongoTest::connect(DIRECT_PORT, &db).seed_int_id("t", 100);
 
     toxi_disable("mongo"); // upstream unreachable for the whole run
 
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out = tempfile::tempdir().unwrap();
-    let r = run_rivet(&[
-        "run",
-        "-c",
-        mongo_cfg(cfg_dir.path(), &db, out.path()).to_str().unwrap(),
-    ]);
     // A permanently-dead upstream must fail (a non-zero exit), not hang — the
     // retry budget is finite and server-selection failure is terminal after it.
-    assert!(
-        !r.status.success(),
-        "a fully-disabled proxy must fail the run, not hang or silently pass"
-    );
+    let _stderr = proxied(&db).run_expect_fail();
 }

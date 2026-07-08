@@ -1,14 +1,13 @@
-//! Batch crash-recovery for the MongoDB keyset export — the Mongo twin of
-//! `live_mysql_crash_recovery.rs`. Requires the `mongo` service.
+//! Batch crash-recovery for the MongoDB keyset export, on the canonical [`Rig`]
+//! — the Mongo twin of `live_mysql_crash_recovery.rs`. Requires the `mongo`
+//! service.
 //!
 //! The crash windows are the engine-agnostic sink hooks in `pipeline::commit`
 //! (`after_file_write`, `after_manifest_update`) — verified empirically to fire
-//! on the Mongo keyset path (a full-mode keyset export routes through the same
-//! commit seam). Contract on recovery: **no data loss** — every source `_id` is
-//! present after the re-run — at **at-least-once** (a keyset full export keeps no
-//! mid-run checkpoint, so the re-run rescans from the start; the orphaned
-//! crash-page's rows survive as duplicates, deduped downstream by `_id`). This
-//! mirrors the SQL engines' at-least-once crash contract and the CDC sink rule.
+//! on the Mongo keyset path. Contract on recovery: **no data loss** — every source
+//! `_id` is present after the re-run — at **at-least-once** (a keyset full export
+//! keeps no mid-run checkpoint, so the re-run rescans and the orphaned crash
+//! page's rows survive as duplicates, deduped downstream by `_id`).
 
 use crate::common::*;
 
@@ -19,45 +18,30 @@ const PORT: u16 = 27017;
 fn crash_then_recover_is_lossless(hook: &str, tag: &str) {
     require_alive(LiveService::Mongo);
     let db = unique_name(tag);
-    let m = MongoTest::connect(PORT, &db);
-    m.seed_int_id("t", 5000); // 5 keyset pages at page_size 1000
+    MongoTest::connect(PORT, &db).seed_int_id("t", 5000); // 5 keyset pages
 
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out = tempfile::tempdir().unwrap();
-    let cfg = write_mongo_config(
-        cfg_dir.path(),
-        &MongoTest::url(PORT, &db),
-        "t",
-        out.path(),
-        ", mongo: { page_size: 1000 }",
-        "",
-    );
+    let rig = Rig::mongo_batch("t")
+        .source_url(&MongoTest::url(PORT, &db))
+        .mongo("page_size: 1000");
 
     // Crash mid-export: a file (and, for after_manifest_update, a manifest row)
     // exists, but the run aborts before finalising.
-    let crashed = run_rivet_env(
-        &["run", "-c", cfg.to_str().unwrap()],
-        &[("RIVET_TEST_PANIC_AT", hook)],
-    );
+    let crashed = rig.run_with_env("RIVET_TEST_PANIC_AT", hook);
     assert!(
         !crashed.status.success(),
         "RIVET_TEST_PANIC_AT={hook} must crash the export (non-zero exit)"
     );
 
-    // Recover: a clean re-run must complete and surface EVERY source row.
-    let rec = run_rivet(&["run", "-c", cfg.to_str().unwrap()]);
-    assert!(
-        rec.status.success(),
-        "recovery run must succeed; stderr:\n{}",
-        String::from_utf8_lossy(&rec.stderr)
-    );
+    // Recover: a clean re-run (same rig → same config + destination) must
+    // complete and surface EVERY source row.
+    rig.run_ok();
     assert_eq!(
-        dir_parquet_distinct_strings(out.path(), "_id").len(),
+        dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
         5000,
         "recovery must lose NOTHING — every source _id present after the crash"
     );
     assert!(
-        total_parquet_rows(out.path()) >= 5000,
+        total_parquet_rows(&rig.out_dir()) >= 5000,
         "recovery is at-least-once — the orphaned crash page may duplicate, never lose"
     );
 }
