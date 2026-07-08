@@ -21,11 +21,15 @@
 //! `&mut self`. Like the MSSQL/tiberius engine, each [`MongoSource`] owns a tokio
 //! runtime and `block_on`s every driver call — no async leaks into the runner.
 //!
-//! ## Scope of this first slice
+//! ## Scope
 //!
-//! `mode: full` only. Incremental / chunked / keyset are SQL-runner concepts and
-//! are refused here with an actionable error. CDC (change streams) rides the
-//! canonical `ChangeStream` seam and is added separately.
+//! `mode: full` only (incremental / chunked / time-window are SQL-runner concepts
+//! and are refused with an actionable error). Within full mode, `source.mongo.
+//! page_size` opts into **keyset (seek) paging** on `_id` — bounded query time,
+//! per-page parts, optional cross-run **resume** (`resume: true`, typed BSON
+//! checkpoint), and `parallel: N` **`_id`-range fan-out** (any BSON `_id`). CDC
+//! (change streams) rides the canonical `ChangeStream` seam and is added
+//! separately.
 
 use std::sync::Arc;
 
@@ -111,11 +115,13 @@ pub struct MongoSource {
     no_cursor_timeout: bool,
     /// A disjoint `_id` slice `[lo, hi)` for ONE parallel worker. When `Some`,
     /// every scan (keyset page or full) is bounded to `{_id: {$gte: lo, $lt:
-    /// hi}}` (composed with the keyset `$gt` cursor). Set per-worker by the
-    /// parallel runner; ranges tile the whole ObjectId space so their union is
-    /// the full collection with no overlap. `_id` is immutable ⇒ no doc migrates
-    /// between ranges. `None` ⇒ the whole collection (the normal single reader).
-    id_range: Option<(ObjectId, ObjectId)>,
+    /// hi}}` (composed with the keyset `$gt` cursor). Bounds are `Bson` — a slice
+    /// works for ANY `_id` type (ObjectId, integer, string), with `MinKey`/
+    /// `MaxKey` as the outer sentinels. Set per-worker by the parallel runner;
+    /// ranges tile the whole BSON key space so their union is the full collection
+    /// with no overlap. `_id` is immutable ⇒ no doc migrates between ranges.
+    /// `None` ⇒ the whole collection (the normal single reader).
+    id_range: Option<(Bson, Bson)>,
 }
 
 impl MongoSource {
@@ -144,30 +150,24 @@ impl MongoSource {
 
     /// Bind this reader to one disjoint `_id` slice `[lo, hi)` (a parallel
     /// worker). Consuming builder — each worker owns its own `MongoSource`.
-    pub fn with_id_range(mut self, lo: ObjectId, hi: ObjectId) -> Self {
+    pub fn with_id_range(mut self, lo: Bson, hi: Bson) -> Self {
         self.id_range = Some((lo, hi));
         self
     }
 
     /// Split the collection's `_id` space into `n` disjoint, size-balanced
-    /// ranges `[lo, hi)` whose union tiles the whole ObjectId key space (so the
-    /// union read is the complete collection, no overlap). Boundaries come from a
-    /// `$sample` of the `_id`s (a WiredTiger random cursor — O(sample), NOT a
-    /// collection scan, unlike `$bucketAuto` which examines every doc), then the
-    /// N−1 quantiles of the sorted sample. Outer bounds are the min/max ObjectId
-    /// so the first/last range cannot miss the true extremes. Requires ObjectId
-    /// `_id` (same constraint as keyset paging).
-    pub fn sample_id_ranges(
-        &self,
-        collection: &str,
-        n: usize,
-    ) -> Result<Vec<(ObjectId, ObjectId)>> {
+    /// ranges `[lo, hi)` whose union tiles the whole BSON key space (so the union
+    /// read is the complete collection, no overlap) — for ANY `_id` type, not
+    /// just ObjectId. Boundaries come from a `$sample` of the `_id`s (a
+    /// WiredTiger random cursor — O(sample), NOT a collection scan, unlike
+    /// `$bucketAuto` which examines every doc), then the N−1 quantiles of the
+    /// sorted sample. Outer bounds are `MinKey`/`MaxKey`, which sort before/after
+    /// every value, so the first/last range cannot miss the true extremes.
+    pub fn sample_id_ranges(&self, collection: &str, n: usize) -> Result<Vec<(Bson, Bson)>> {
         let n = n.max(1);
+        let full_range = || vec![(Bson::MinKey, Bson::MaxKey)];
         if n == 1 {
-            return Ok(vec![(
-                ObjectId::from_bytes([0; 12]),
-                ObjectId::from_bytes([0xff; 12]),
-            )]);
+            return Ok(full_range());
         }
         // ~250 samples per target range (min 2000), capped so a huge N stays well
         // under the 5%-of-collection threshold that flips $sample to a full sort.
@@ -177,7 +177,7 @@ impl MongoSource {
             .client()
             .database(self.session.db())
             .collection::<Document>(collection);
-        let ids: Vec<ObjectId> = self.session.block_on(async move {
+        let ids: Vec<Bson> = self.session.block_on(async move {
             let mut cursor = coll
                 .aggregate(vec![
                     doc! { "$sample": { "size": sample_size as i64 } },
@@ -187,36 +187,33 @@ impl MongoSource {
                 .await?;
             let mut ids = Vec::new();
             while let Some(d) = cursor.try_next().await? {
-                match d.get("_id") {
-                    Some(Bson::ObjectId(oid)) => ids.push(*oid),
-                    other => anyhow::bail!(
-                        "parallel `_id`-range reads require an ObjectId `_id`; sampled a \
-                         non-ObjectId key ({other:?}). Remove `parallel` (or `page_size`) to \
-                         read with a single cursor."
-                    ),
+                // `$sort` yields the sampled `_id`s in BSON order; any type is fine
+                // (the range filter compares by the same order the server sorts by).
+                if let Some(id) = d.get("_id") {
+                    ids.push(id.clone());
                 }
             }
             Ok::<_, anyhow::Error>(ids)
         })?;
         if ids.len() < 2 {
             // Too few docs to split meaningfully — one range over everything.
-            return Ok(vec![(
-                ObjectId::from_bytes([0; 12]),
-                ObjectId::from_bytes([0xff; 12]),
-            )]);
+            return Ok(full_range());
         }
-        // N−1 interior quantile boundaries → N ranges, min/max ObjectId at the ends.
-        let mut bounds = vec![ObjectId::from_bytes([0; 12])];
+        // N−1 interior quantile boundaries → N ranges; MinKey/MaxKey at the ends
+        // sort before/after every value, so the outer slices cover the extremes
+        // for ANY `_id` type.
+        let mut bounds = vec![Bson::MinKey];
         for i in 1..n {
-            bounds.push(ids[i * ids.len() / n]);
+            bounds.push(ids[i * ids.len() / n].clone());
         }
-        bounds.push(ObjectId::from_bytes([0xff; 12]));
-        // Adjacent quantiles can collide on a skewed sample; drop empty ranges so
-        // a worker never gets `[x, x)`.
+        bounds.push(Bson::MaxKey);
+        // Adjacent quantiles can land on the same value in a skewed sample; drop
+        // the resulting empty `[x, x)` so a worker never gets a no-op range (the
+        // dropped value is still covered by the next range's `$gte`).
         Ok(bounds
             .windows(2)
-            .filter(|w| w[0] < w[1])
-            .map(|w| (w[0], w[1]))
+            .filter(|w| w[0] != w[1])
+            .map(|w| (w[0].clone(), w[1].clone()))
             .collect())
     }
 }
@@ -366,7 +363,7 @@ impl Source for MongoSource {
         };
         let canonical = self.canonical_json;
         let no_cursor_timeout = self.no_cursor_timeout;
-        let id_range = self.id_range;
+        let id_range = self.id_range.clone();
         // Source-side batch = the RSS lever. Two caps, whichever trips first:
         //   • `tuning.batch_size` — a row count (schema-based memory budget for a
         //     document store is unreliable: the `document` column is variable
@@ -406,13 +403,13 @@ impl Source for MongoSource {
                         cond.insert("$gt", id.clone());
                     }
                     None => {
-                        if let Some((lo, _)) = id_range {
-                            cond.insert("$gte", lo);
+                        if let Some((lo, _)) = &id_range {
+                            cond.insert("$gte", lo.clone());
                         }
                     }
                 }
-                if let Some((_, hi)) = id_range {
-                    cond.insert("$lt", hi);
+                if let Some((_, hi)) = &id_range {
+                    cond.insert("$lt", hi.clone());
                 }
                 if cond.is_empty() {
                     doc! {}

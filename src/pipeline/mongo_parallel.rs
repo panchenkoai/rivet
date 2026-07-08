@@ -19,14 +19,12 @@
 //! thread drains them through the shared `commit::record_part` so the
 //! I2→I7→counters/journal ordering stays single-threaded and race-free.
 
-use super::{RunSummary, commit, sink::ExportSink};
+use super::{RunSummary, commit};
 use crate::config::IncrementalCursorMode;
 use crate::error::Result;
 use crate::plan::{IncrementalCursorPlan, KeysetPlan, ResolvedRunPlan};
 use crate::source::mongo::MongoSource;
-use crate::source::{self, Source};
 use crate::state::StateStore;
-use crate::types::CursorState;
 use crate::{destination, format};
 
 pub(crate) fn run_mongo_parallel(
@@ -77,10 +75,12 @@ pub(crate) fn run_mongo_parallel(
         let handles: Vec<_> = ranges
             .iter()
             .enumerate()
-            .map(|(w, &(lo, hi))| {
+            .map(|(w, range)| {
                 let url = &url;
                 let key_plan = &key_plan;
                 let stamp = &stamp;
+                // Bson bounds aren't Copy — clone the slice into the worker.
+                let (lo, hi) = (range.0.clone(), range.1.clone());
                 s.spawn(move || range_worker(url, plan, key_plan, kp, stamp, w, lo, hi))
             })
             .collect();
@@ -140,13 +140,16 @@ fn range_worker(
     kp: &KeysetPlan,
     stamp: &str,
     worker: usize,
-    lo: mongodb::bson::oid::ObjectId,
-    hi: mongodb::bson::oid::ObjectId,
+    lo: mongodb::bson::Bson,
+    hi: mongodb::bson::Bson,
 ) -> Result<WorkerOutput> {
     let mut src = MongoSource::connect(url, plan.source.tls.as_ref(), plan.source.mongo.as_ref())?
         .with_id_range(lo, hi);
     let dest = destination::create_destination(&plan.destination)?;
     crate::manifest::guard_manifest_mode(dest.as_ref(), "batch")?;
+    let ext = format::create_format(plan.format, plan.compression, plan.compression_level, None)
+        .file_extension()
+        .to_string();
 
     let mut out = WorkerOutput {
         rows: 0,
@@ -157,62 +160,37 @@ fn range_worker(
     let mut page = 0usize;
 
     loop {
-        let cursor = last.as_ref().map(|v| CursorState {
-            export_name: plan.export_name.clone(),
-            last_cursor_value: Some(v.clone()),
-            last_run_at: None,
-        });
-        let mut sink = ExportSink::new(plan)?;
-        src.export(
-            &source::ExportRequest::unwrapped(
-                &plan.base_query,
-                &plan.tuning,
-                &plan.column_overrides,
-            )
-            .with_incremental(Some(key_plan))
-            .with_cursor(cursor.as_ref())
-            .with_page_limit(kp.chunk_size),
-            &mut sink,
-        )?;
-        if let Some(w) = sink.writer.take() {
-            w.finish()?;
-        }
-        if out.schema.is_none()
-            && let Some(sc) = sink.dest_schema.as_deref()
-        {
-            out.schema = Some(sc.clone());
-        }
-
-        let rows = sink.total_rows;
-        if rows == 0 {
-            break;
-        }
-        out.rows += rows as i64;
-
-        let fmt =
-            format::create_format(plan.format, plan.compression, plan.compression_level, None);
         // run-unique (stamp) + worker-unique (w{worker}) + page-unique.
         let base = format!(
             "{}_{}_w{}_keyset{}.{}",
-            plan.export_name,
-            stamp,
-            worker,
-            page,
-            fmt.file_extension()
+            plan.export_name, stamp, worker, page, ext
         );
-        let recs = commit::write_sink_parts(
+        // Deferred commit: the worker collects its parts (the main thread drains
+        // them through `record_part`), unlike the sequential runner which commits
+        // each page as it arrives — the one axis the two callers differ on.
+        let Some(p) = super::keyset::read_keyset_page(
+            &mut src,
+            plan,
+            key_plan,
+            kp.chunk_size,
+            last.as_deref(),
             dest.as_ref(),
-            &mut sink,
-            plan.validate.then_some(plan.format),
-            |idx, count| commit::part_indexed_name(&base, idx, count),
-        )?;
-        out.parts.extend(recs);
+            &base,
+        )?
+        else {
+            break;
+        };
+        out.rows += p.rows as i64;
+        if out.schema.is_none() {
+            out.schema = p.schema;
+        }
+        out.parts.extend(p.parts);
         page += 1;
 
-        if rows < kp.chunk_size {
+        if p.rows < kp.chunk_size {
             break;
         }
-        match sink.effective_cursor() {
+        match p.next_cursor {
             Some(v) => last = Some(v),
             None => anyhow::bail!(
                 "export '{}': parallel worker {} could not read the '{}' value to advance keyset \
