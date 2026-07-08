@@ -48,6 +48,8 @@ use crate::error::Result;
 use crate::source::{BatchSink, ExportRequest, Source};
 use crate::types::{ColumnOverrides, RivetType, SourceColumn, TypeMapping};
 
+pub(crate) mod cdc;
+
 /// A connected MongoDB session: the async client plus the tokio runtime that
 /// drives it, so the sync `Source` trait can `block_on` every driver call
 /// (ADR-0011, mirrors MSSQL/tiberius). This is the **one** place that owns the

@@ -300,6 +300,7 @@ pub(crate) enum CdcEngine {
     Mysql,
     Postgres,
     Mssql,
+    Mongo,
 }
 
 impl CdcEngine {
@@ -310,9 +311,11 @@ impl CdcEngine {
             Ok(Self::Postgres)
         } else if url.starts_with("sqlserver://") || url.starts_with("mssql://") {
             Ok(Self::Mssql)
+        } else if url.starts_with("mongodb://") || url.starts_with("mongodb+srv://") {
+            Ok(Self::Mongo)
         } else {
             anyhow::bail!(
-                "rivet cdc: unsupported source url — expected mysql:// / postgresql:// / sqlserver://"
+                "rivet cdc: unsupported source url — expected mysql:// / postgresql:// / sqlserver:// / mongodb://"
             )
         }
     }
@@ -323,6 +326,7 @@ impl CdcEngine {
             Self::Mysql => "mysql",
             Self::Postgres => "postgres",
             Self::Mssql => "mssql",
+            Self::Mongo => "mongo",
         }
     }
 
@@ -357,7 +361,7 @@ impl CdcEngine {
                 )?);
                 Ok(())
             }
-            Self::Mysql | Self::Mssql => {
+            Self::Mysql | Self::Mssql | Self::Mongo => {
                 let ckpt = checkpoint.ok_or_else(|| {
                     anyhow::anyhow!(
                         "{} cdc: an anchor needs cdc.checkpoint (no server-side anchor exists)",
@@ -386,7 +390,10 @@ impl CdcEngine {
                             url, ckpt, tls,
                         )
                     }
-                    _ => crate::source::mssql::cdc::pin_checkpoint_at_max_lsn(url, ckpt, tls),
+                    Self::Mssql => {
+                        crate::source::mssql::cdc::pin_checkpoint_at_max_lsn(url, ckpt, tls)
+                    }
+                    _ => crate::source::mongo::cdc::pin_checkpoint_at_current(url, tls, ckpt),
                 }
             }
         }
@@ -399,6 +406,7 @@ impl CdcEngine {
 pub(crate) const MYSQL_CDC_HINT: &str = "if this is a permissions/setup error: MySQL CDC needs binlog_format=ROW plus a REPLICATION SLAVE + REPLICATION CLIENT grant (and SELECT on the table) — see the 'MySQL — the binlog grants' section of docs/reference/cdc.md";
 pub(crate) const PG_CDC_HINT: &str = "if this is a permissions/setup error: PostgreSQL CDC needs wal_level=logical and a role with the REPLICATION attribute — see the 'PostgreSQL — the logical slot' section of docs/reference/cdc.md";
 pub(crate) const MSSQL_CDC_HINT: &str = "if this is a permissions/setup error: SQL Server CDC must be enabled on the table (sys.sp_cdc_enable_table) with SQL Server Agent running, and the reader needs SELECT on the cdc schema — see the 'SQL Server — CDC change tables' section of docs/reference/cdc.md";
+pub(crate) const MONGO_CDC_HINT: &str = "if this is a setup error: MongoDB change streams require a replica set (a single-node replica set is fine) — a standalone mongod cannot watch(); the reader needs a role that can run changeStream (readAnyDatabase / read on the db) — see the 'MongoDB — change streams' section of docs/reference/cdc.md";
 
 /// Construct the right [`ChangeStream`] adapter for the source URL's scheme —
 /// dispatching by engine exactly as [`crate::source::create_source`] does for the
@@ -465,6 +473,19 @@ pub(crate) fn create_change_stream(
                 .context(MSSQL_CDC_HINT)?,
             ))
         }
+        CdcEngine::Mongo => Ok(Box::new(
+            // Whole-database change stream; resumes from the persisted token when
+            // one exists. `canonical: false` (relaxed extended JSON) mirrors the
+            // batch default — wiring the `source.mongo.json` mode through is a
+            // follow-up.
+            crate::source::mongo::cdc::MongoChangeStream::open(
+                url,
+                tls,
+                cfg.checkpoint.as_deref(),
+                false,
+            )
+            .context(MONGO_CDC_HINT)?,
+        )),
     }
 }
 
@@ -495,6 +516,11 @@ impl CdcSchemaResolver {
             CdcEngine::Mssql => Box::new(crate::source::mssql::MssqlSource::connect_with_tls(
                 url, tls,
             )?),
+            // The JSON-blob model has a fixed 2-column schema (`_id`, `document`),
+            // resolved by `MongoSource::type_mappings` — same as the batch path.
+            CdcEngine::Mongo => {
+                Box::new(crate::source::mongo::MongoSource::connect(url, tls, None)?)
+            }
         };
         let enrich = match engine {
             CdcEngine::Mysql => Some(crate::source::mysql::connect_pool(url, tls)?.get_conn()?),
