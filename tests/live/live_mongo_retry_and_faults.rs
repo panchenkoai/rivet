@@ -33,21 +33,15 @@ fn reset_mongo_proxy() {
     toxi_enable("mongo");
 }
 
-fn mongo_cfg(db: &str, name: &str, out: &std::path::Path) -> std::path::PathBuf {
-    let url = mongo_toxi_url(db);
-    let cfg = format!(
-        "source: {{ type: mongo, url: \"{url}\", mongo: {{ page_size: 2000 }} }}\n\
-         exports:\n  - name: {name}\n    table: t\n    mode: full\n    format: parquet\n\
-         \x20   tuning: {{ max_retries: 4, retry_backoff_ms: 200 }}\n\
-         \x20   destination: {{ type: local, path: \"{}\" }}\n",
-        out.display(),
-    );
-    let dir = tempfile::tempdir().unwrap();
-    let p = dir.path().join("cfg.yaml");
-    std::fs::write(&p, cfg).unwrap();
-    // Leak the tempdir so the path outlives this fn (the process reads it later).
-    std::mem::forget(dir);
-    p
+fn mongo_cfg(dir: &std::path::Path, db: &str, out: &std::path::Path) -> std::path::PathBuf {
+    write_mongo_config(
+        dir,
+        &mongo_toxi_url(db),
+        "t",
+        out,
+        ", mongo: { page_size: 2000 }",
+        ", tuning: { max_retries: 4, retry_backoff_ms: 200 }",
+    )
 }
 
 #[test]
@@ -63,12 +57,12 @@ fn mongo_export_survives_transient_latency_added_via_toxiproxy() {
     // A per-read delay slows the scan but must not fail it.
     toxi_add_latency("mongo", 25);
 
+    let cfg_dir = tempfile::tempdir().unwrap();
     let out = tempfile::tempdir().unwrap();
-    let name = unique_name("mongo_rt_lat");
     let r = run_rivet(&[
         "run",
         "-c",
-        mongo_cfg(&db, &name, out.path()).to_str().unwrap(),
+        mongo_cfg(cfg_dir.path(), &db, out.path()).to_str().unwrap(),
     ]);
     assert!(
         r.status.success(),
@@ -101,12 +95,12 @@ fn mongo_export_recovers_after_mid_stream_proxy_disable_then_enable_with_retries
         toxi_enable("mongo"); // rivet's retry reconnects here
     });
 
+    let cfg_dir = tempfile::tempdir().unwrap();
     let out = tempfile::tempdir().unwrap();
-    let name = unique_name("mongo_rt_mid");
     let r = run_rivet(&[
         "run",
         "-c",
-        mongo_cfg(&db, &name, out.path()).to_str().unwrap(),
+        mongo_cfg(cfg_dir.path(), &db, out.path()).to_str().unwrap(),
     ]);
     let _ = bg.join();
 
@@ -135,12 +129,12 @@ fn mongo_export_fails_cleanly_when_proxy_is_disabled_before_run() {
 
     toxi_disable("mongo"); // upstream unreachable for the whole run
 
+    let cfg_dir = tempfile::tempdir().unwrap();
     let out = tempfile::tempdir().unwrap();
-    let name = unique_name("mongo_rt_dead");
     let r = run_rivet(&[
         "run",
         "-c",
-        mongo_cfg(&db, &name, out.path()).to_str().unwrap(),
+        mongo_cfg(cfg_dir.path(), &db, out.path()).to_str().unwrap(),
     ]);
     // A permanently-dead upstream must fail (a non-zero exit), not hang — the
     // retry budget is finite and server-selection failure is terminal after it.

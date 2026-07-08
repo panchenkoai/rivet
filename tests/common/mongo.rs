@@ -13,6 +13,30 @@ use futures_util::TryStreamExt;
 use mongodb::bson::{Bson, Document, doc};
 use mongodb::{Client, Collection};
 
+/// Write a Mongo `mode: full` config to `dir/cfg.yaml` and return the path. The
+/// CALLER owns `dir` (a `tempfile::tempdir()`), so the file lives exactly as long
+/// as the test — no leak. `extra_mongo` injects `source.mongo.*`
+/// (e.g. `", mongo: { page_size: 500 }"`); `extra_export` injects export fields
+/// (e.g. `", parallel: 4"` or `", tuning: { max_retries: 4 }"`).
+pub fn write_mongo_config(
+    dir: &std::path::Path,
+    url: &str,
+    table: &str,
+    out: &std::path::Path,
+    extra_mongo: &str,
+    extra_export: &str,
+) -> std::path::PathBuf {
+    let cfg = format!(
+        "source: {{ type: mongo, url: \"{url}\"{extra_mongo} }}\n\
+         exports:\n  - {{ name: {table}, table: {table}, mode: full, format: parquet{extra_export}, \
+         destination: {{ type: local, path: \"{}\" }} }}\n",
+        out.display(),
+    );
+    let p = dir.join("cfg.yaml");
+    std::fs::write(&p, cfg).unwrap();
+    p
+}
+
 pub struct MongoTest {
     rt: tokio::runtime::Runtime,
     client: Client,

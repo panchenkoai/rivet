@@ -17,17 +17,7 @@ fn mongo_readonly_login_exports_despite_denied_harm_probe() {
 
     let out = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = cfg_dir.path().join("cfg.yaml");
-    std::fs::write(
-        &cfg,
-        format!(
-            "source: {{ type: mongo, url: \"{url}\" }}\n\
-             exports:\n  - {{ name: t, table: t, mode: full, format: parquet, \
-             destination: {{ type: local, path: \"{}\" }} }}\n",
-            out.path().display(),
-        ),
-    )
-    .unwrap();
+    let cfg = write_mongo_config(cfg_dir.path(), &url, "t", out.path(), "", "");
 
     // The `reader` login has `read` on harmdb but NOT `clusterMonitor`, so the
     // Tier-2 source-harm probe (serverStatus) is Unauthorized. The export must

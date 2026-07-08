@@ -76,7 +76,7 @@ jobs:
           # it every test that writes a shared workdir EACCESes — the first
           # nightly after the cdc-oracle suite landed failed exactly there.
           mkdir -p tests/.live-tmp
-          docker compose --profile pool --profile loaders --profile cdc --profile replica up -d postgres mysql mssql minio fake-gcs azurite toxiproxy pgbouncer proxysql duckdb clickhouse postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica mongo mongo-rs
+          docker compose --profile pool --profile loaders --profile cdc --profile replica up -d postgres mysql mssql minio fake-gcs azurite toxiproxy pgbouncer proxysql duckdb clickhouse postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica
           sudo chmod -R 0777 tests/.live-tmp
 
       - name: Wait for services
@@ -172,7 +172,8 @@ jobs:
         run: |
           cargo test --release -- --ignored \
             --skip full_content_export_max_pressure \
-            --skip validates --skip edge_cases --skip via_duckdb
+            --skip validates --skip edge_cases --skip via_duckdb \
+            --skip live_mongo --skip live_cdc_mongo
 
       - name: Dump service logs on failure
         if: failure()

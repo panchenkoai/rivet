@@ -14,21 +14,6 @@ use crate::common::*;
 
 const PORT: u16 = 27017;
 
-fn crash_cfg(db: &str, name: &str, out: &std::path::Path) -> std::path::PathBuf {
-    let url = MongoTest::url(PORT, db);
-    let cfg = format!(
-        "source: {{ type: mongo, url: \"{url}\", mongo: {{ page_size: 1000 }} }}\n\
-         exports:\n  - name: {name}\n    table: t\n    mode: full\n    format: parquet\n\
-         \x20   destination: {{ type: local, path: \"{}\" }}\n",
-        out.display(),
-    );
-    let dir = tempfile::tempdir().unwrap();
-    let p = dir.path().join("cfg.yaml");
-    std::fs::write(&p, cfg).unwrap();
-    std::mem::forget(dir);
-    p
-}
-
 /// Seed → crash at `hook` (mid-export) → re-run → assert completeness (every
 /// `_id`) and at-least-once (rows ≥ source). Shared by both crash-window tests.
 fn crash_then_recover_is_lossless(hook: &str, tag: &str) {
@@ -37,9 +22,16 @@ fn crash_then_recover_is_lossless(hook: &str, tag: &str) {
     let m = MongoTest::connect(PORT, &db);
     m.seed_int_id("t", 5000); // 5 keyset pages at page_size 1000
 
+    let cfg_dir = tempfile::tempdir().unwrap();
     let out = tempfile::tempdir().unwrap();
-    let name = unique_name("mongo_crash");
-    let cfg = crash_cfg(&db, &name, out.path());
+    let cfg = write_mongo_config(
+        cfg_dir.path(),
+        &MongoTest::url(PORT, &db),
+        "t",
+        out.path(),
+        ", mongo: { page_size: 1000 }",
+        "",
+    );
 
     // Crash mid-export: a file (and, for after_manifest_update, a manifest row)
     // exists, but the run aborts before finalising.

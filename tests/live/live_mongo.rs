@@ -28,16 +28,14 @@ fn write_cfg(
     extra_mongo: &str,
     extra_export: &str,
 ) -> std::path::PathBuf {
-    let url = MongoTest::url(PORT, db);
-    let cfg = format!(
-        "source: {{ type: mongo, url: \"{url}\"{extra_mongo} }}\n\
-         exports:\n  - {{ name: {table}, table: {table}, mode: full, format: parquet, \
-         destination: {{ type: local, path: \"{}\" }}{extra_export} }}\n",
-        out.display(),
-    );
-    let p = dir.join("cfg.yaml");
-    std::fs::write(&p, cfg).unwrap();
-    p
+    write_mongo_config(
+        dir,
+        &MongoTest::url(PORT, db),
+        table,
+        out,
+        extra_mongo,
+        extra_export,
+    )
 }
 
 fn run_export(cfg: &std::path::Path) -> std::process::Output {
