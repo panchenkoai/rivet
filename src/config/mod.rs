@@ -406,13 +406,13 @@ impl Config {
             return Ok(());
         }
         for e in &self.exports {
-            if e.mode != ExportMode::Full {
+            if !matches!(e.mode, ExportMode::Full | ExportMode::Cdc) {
                 crate::config_bail!(
                     crate::error::codes::CONFIG_SOURCE_MODE_UNSUPPORTED,
-                    "export '{}': source type '{:?}' supports only `mode: full` today \
-                     (got `mode: {:?}`). MongoDB has no SQL, so chunked / incremental / \
-                     keyset / time-window / cdc are not available; every document exports \
-                     as `_id` + a `document` JSON column.",
+                    "export '{}': source type '{:?}' supports `mode: full` (batch) and \
+                     `mode: cdc` (change streams) (got `mode: {:?}`). MongoDB has no SQL, so \
+                     chunked / incremental / keyset / time-window are not available; every \
+                     document exports as `_id` + a `document` JSON column.",
                     e.name,
                     self.source.source_type,
                     e.mode
@@ -474,9 +474,10 @@ impl Config {
                     }
                 }
                 SourceType::Mssql => {}
-                // MongoDB CDC is not yet implemented; `mode: cdc` on a Mongo
-                // source is rejected earlier, so no slot/server_id conflict can
-                // arise here.
+                // MongoDB change streams watch the whole database — no per-export
+                // slot or server_id to collide. Two Mongo CDC exports sharing a
+                // `checkpoint:` path IS still a conflict, caught by the shared
+                // checkpoint check below.
                 SourceType::Mongo => {}
             }
             if let Some(ckpt) = cdc.and_then(|c| c.checkpoint.as_deref())

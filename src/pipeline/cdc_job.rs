@@ -297,6 +297,11 @@ fn run_cdc_inner(
             checkpoint: cdc.checkpoint.as_ref().map(PathBuf::from),
             until_current: cdc.until_current,
             tls: config.source.tls.clone(),
+            mongo_canonical: config
+                .source
+                .mongo
+                .as_ref()
+                .is_some_and(|m| matches!(m.json, crate::config::MongoJsonMode::Canonical)),
         },
         outputs,
         format: export.format,

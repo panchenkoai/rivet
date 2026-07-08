@@ -64,6 +64,9 @@ impl MongoChangeStream {
             .and_then(|p| Position::load(p).ok().flatten())
             .map(|pos| serde_json::from_value(pos.0))
             .transpose()?;
+        // A checkpoint path with NO persisted position ⇒ a fresh checkpointed
+        // run: it must pin its anchor at open (see below).
+        let is_fresh = resume.is_none();
         // Declare the capture fidelity tier UP FRONT (never a silent degrade): a
         // sub-6.0 server gives current-state UpdateLookup post-images and no delete
         // pre-image, so a null `document` on an update/delete means "this tier
@@ -87,12 +90,27 @@ impl MongoChangeStream {
                 .resume_after(resume)
                 .await
         })?;
-        Ok(Self {
+        let this = Self {
             session,
             stream,
             canonical,
             db_name,
-        })
+        };
+        // Idle-first-run anchor (MongoDB has no server-side anchor — the MySQL
+        // model): a fresh checkpointed open persists its current resume token NOW.
+        // A first run that captures ZERO changes writes no per-event checkpoint,
+        // so without this the NEXT run would open with no token, re-anchor at
+        // "current", and skip everything inserted meanwhile — exactly the
+        // "enable CDC during a quiet period" ops sequence. Pinning at open makes
+        // the idle first run at-least-once like every other.
+        if is_fresh
+            && let Some(ckpt) = checkpoint
+            && let Some(pos) = this.anchor_position()
+        {
+            pos.save(ckpt)?;
+            log::info!("mongodb cdc: pinned resume anchor at open (fresh checkpoint)");
+        }
+        Ok(this)
     }
 
     /// The resume token to open from right now — used to pin a client-side anchor

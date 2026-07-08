@@ -256,6 +256,9 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
         // The CLI carries no TlsConfig; `None` ⇒ the require_tls_or_loopback gate
         // refuses a remote host (config-driven `rivet run` supplies source.tls).
         tls: None,
+        // The CLI has no source config block; relaxed JSON (the batch default).
+        // `source.mongo.json: canonical` rides the config-driven `rivet run` path.
+        mongo_canonical: false,
     };
     let Some(dir) = a.output else {
         // NDJSON to stdout: no durable sink, so the slot is deliberately not

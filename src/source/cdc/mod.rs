@@ -259,6 +259,11 @@ pub(crate) struct CdcConfig {
     /// `require_tls_or_loopback` gate the batch path uses (refuse remote
     /// plaintext / unauthenticated TLS). `None` ⇒ loopback-only (the CLI default).
     pub tls: Option<crate::config::TlsConfig>,
+    /// MongoDB-only: render the `document` blob as canonical (type-tagged)
+    /// extended JSON — the `source.mongo.json: canonical` mode. Matches the batch
+    /// reader so a CDC stream and a full export produce identical `document`
+    /// text. Config-driven only; the `rivet cdc` CLI defaults to relaxed.
+    pub mongo_canonical: bool,
 }
 
 /// How many changes a poll adapter pulls per `peek` — the drain's memory bound.
@@ -475,14 +480,13 @@ pub(crate) fn create_change_stream(
         }
         CdcEngine::Mongo => Ok(Box::new(
             // Whole-database change stream; resumes from the persisted token when
-            // one exists. `canonical: false` (relaxed extended JSON) mirrors the
-            // batch default — wiring the `source.mongo.json` mode through is a
-            // follow-up.
+            // one exists. `document` JSON fidelity follows `source.mongo.json`
+            // (canonical vs relaxed), so CDC and batch render it identically.
             crate::source::mongo::cdc::MongoChangeStream::open(
                 url,
                 tls,
                 cfg.checkpoint.as_deref(),
-                false,
+                cfg.mongo_canonical,
             )
             .context(MONGO_CDC_HINT)?,
         )),
