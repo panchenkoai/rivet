@@ -337,6 +337,36 @@ scan footprint barely changes:
 The bigger the collection, the more `parallel` pays off — the fixed ~+4% `$sample`
 cost amortises better over 300K rows than over 30K.
 
+### Connection pool
+
+There is no external pooler (no pgBouncer/ProxySQL analog) — the **MongoDB driver
+pools connections itself**, one pool per `Client`, and rivet passes the pool
+knobs straight through from the connection URL (it sets none of its own):
+
+| URL param | driver default | effect |
+| --------- | -------------- | ------ |
+| `maxPoolSize` | **10** | hard cap on connections per client |
+| `minPoolSize` | 0 | keep-warm minimum |
+| `maxIdleTimeMS` | ∞ | idle connection TTL |
+| `maxConnecting` | 2 | concurrent handshakes |
+
+The one thing to know: **`parallel: N` opens N independent clients — N pools.**
+So the connection ceiling is `N × maxPoolSize`. In practice each worker runs a
+*sequential* keyset scan and holds only ~1–2 connections (the measured peak was
+20 at `parallel: 4`, not 4 × 10 = 40 — workers don't saturate their pools), but
+`N × maxPoolSize` is the ceiling to size against the server's budget:
+
+```yaml
+source:
+  type: mongo
+  # cap each worker's pool; with parallel: 4 the ceiling is 4 × 5 = 20
+  url: "mongodb://host/db?maxPoolSize=5"
+```
+
+`directConnection=true` (needed for a port-mapped replica set) does **not**
+disable the pool — it still holds up to `maxPoolSize` connections to the single
+server, just without topology discovery.
+
 ---
 
 ## Config reference — `source.mongo.*`
