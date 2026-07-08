@@ -208,3 +208,46 @@ fn mongo_run_reconcile_matches_source_count() {
         "reconcile must report a source/dest MATCH, got:\n{summary}"
     );
 }
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn mongo_batch_resume_reads_only_new_since_last_run() {
+    require_alive(LiveService::Mongo);
+    let db = unique_name("mresume");
+    let m = MongoTest::connect(PORT, &db);
+    m.seed_int_id("t", 2000);
+
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap(); // SAME dest across both runs — the
+    // keyset checkpoint persists in its state.
+    let cfg = write_cfg(
+        cfg_dir.path(),
+        &db,
+        "t",
+        out.path(),
+        ", mongo: { page_size: 500, resume: true }",
+        "",
+    );
+
+    // Run 1 exports all 2000 and persists the keyset cursor at the max _id.
+    assert!(run_export(&cfg).status.success());
+    assert_eq!(dir_parquet_distinct_strings(out.path(), "_id").len(), 2000);
+
+    // 500 new docs arrive with higher _id.
+    for i in 2001..=2500 {
+        m.upsert_set("t", i, "v", "new");
+    }
+
+    // Run 2 (resume) must read ONLY the 500 new — not rescan the first 2000.
+    assert!(run_export(&cfg).status.success());
+    assert_eq!(
+        dir_parquet_distinct_strings(out.path(), "_id").len(),
+        2500,
+        "resume must union to the full set with no loss"
+    );
+    assert_eq!(
+        total_parquet_rows(out.path()),
+        2500,
+        "resume must add only the new rows — 4500 would mean run 2 rescanned"
+    );
+}

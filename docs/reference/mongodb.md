@@ -399,6 +399,32 @@ The change-stream feature set depends on the server version — `doctor` reports
 
 ---
 
+## Operational parity
+
+The batch read path carries the same reliability surface as the SQL engines
+(each row is a live test in `live_mongo*.rs`):
+
+| concern | Mongo behavior |
+| ------- | -------------- |
+| **retry** | transient errors are classified and retried on a fresh connection — network drops, `ServerSelection`, pool-cleared, and the retryable-read command codes (a replica-set failover / stepdown mid-scan). See `classify_mongo_error`. |
+| **crash-recovery** | a crash mid-export (any commit window) + a clean re-run loses **nothing** — every `_id` is present — at **at-least-once**: a keyset full export keeps no mid-run checkpoint, so the re-run rescans and the orphaned crash page's rows survive as duplicates, deduped downstream by `_id`. |
+| **reconcile** | `rivet run --reconcile` — source `count_documents` vs destination rows, reports `MATCH`. |
+| **resume** | `source.mongo.resume: true` — the export persists the keyset cursor; the next run reads only `_id` greater than last time (incremental append-by-`_id`, no rescan). |
+| **harm metrics** | source-impact counters come from `serverStatus` (needs the `clusterMonitor` role / `serverStatus` action). A read-only login without it degrades gracefully — the counters are simply absent, the export is unaffected. |
+
+Deliberately **N/A** (not gaps):
+
+- **`rivet reconcile` / `rivet repair` (partition-level)** — keyset has no natural
+  partitions, so the CLI routes you to `rivet run --reconcile` rather than
+  guessing a partition scheme. (Chunked SQL exports have numeric-range partitions;
+  a document store does not.)
+- **schema drift** — the blob schema is fixed at two columns (`_id`, `document`); a
+  new field in a document lands *inside* the `document` JSON, so the Parquet
+  schema never changes and there is nothing to drift. (Contrast the SQL engines,
+  where an `ALTER TABLE ADD COLUMN` shifts the column set.)
+- **connection pooler / `proxy.rs`** — the MongoDB driver pools connections itself
+  (and `mongos` is transparent), so there is no pgBouncer/ProxySQL analog to test.
+
 ## Caveats
 
 - **`UpdateLookup` is current-state, not point-in-time.** An update's captured
@@ -416,4 +442,3 @@ The change-stream feature set depends on the server version — `doctor` reports
 - **`parallel` needs a comparable `_id`.** The `_id`-range fan-out works for
   ObjectId and other ordered `_id` types; a collection with mixed `_id` types
   falls back to single-worker keyset.
-```
