@@ -47,11 +47,25 @@ pub(crate) struct MongoChangeStream {
     db_name: String,
     /// Bounded "catch up to the current oplog end and exit" run (the scheduler
     /// model). A tailable change stream never ends on its own, so `next_change`
-    /// polls with [`ChangeStream::next_if_any`] and returns `None` the moment the
-    /// stream drains (`max_await_time` elapsed with nothing new) — matching the
-    /// poll-based PG / SQL Server drain. `false` ⇒ block for the next change (a
-    /// continuous daemon, the MySQL binlog model).
+    /// polls with [`ChangeStream::next_if_any`] and stops once the stream's
+    /// position advances PAST `target_data` — matching the poll-based PG / SQL
+    /// Server drain. `false` ⇒ block for the next change (a continuous daemon,
+    /// the MySQL binlog model).
     until_current: bool,
+    /// The stream's resume-token `_data` at open — the "current end" a bounded run
+    /// drains up to. A single empty poll can precede the backlog's getMore (the
+    /// server returns an empty first batch, seen intermittently and worst on 4.4),
+    /// and that empty poll does NOT advance the position past this target — so
+    /// `next_change` keeps polling instead of prematurely declaring "caught up"
+    /// and dropping the backlog. `None` unless `until_current`.
+    target_data: Option<String>,
+}
+
+/// The `_data` hex of a change-stream resume token — an order-preserving keystring
+/// (`{"_data": "82…"}`), so lexical comparison is oplog order. Used to tell a
+/// bounded run whether the stream has advanced past its open-time target.
+fn token_data(v: &serde_json::Value) -> Option<String> {
+    v.get("_data").and_then(|d| d.as_str()).map(String::from)
 }
 
 impl MongoChangeStream {
@@ -102,12 +116,23 @@ impl MongoChangeStream {
                 .resume_after(resume)
                 .await
         })?;
+        // The "current end" a bounded (`until_current`) run drains up to.
+        let target_data = if until_current {
+            stream
+                .resume_token()
+                .and_then(|t| serde_json::to_value(&t).ok())
+                .as_ref()
+                .and_then(token_data)
+        } else {
+            None
+        };
         let this = Self {
             session,
             stream,
             canonical,
             db_name,
             until_current,
+            target_data,
         };
         // Idle-first-run anchor (MongoDB has no server-side anchor — the MySQL
         // model): a fresh checkpointed open persists its current resume token NOW.
@@ -283,13 +308,34 @@ impl ChangeStream for MongoChangeStream {
         let session = &self.session;
         let stream = &mut self.stream;
         if until_current {
-            // Bounded run: drain what's available now; `next_if_any` returns
-            // `None` once a `max_await_time` window passes with nothing new —
-            // i.e. we've caught up to the current oplog end, so end the stream.
-            match session.block_on(async { stream.next_if_any().await }) {
-                Ok(Some(cse)) => Some(to_change_event(cse, canonical, &self.db_name)),
-                Ok(None) => None, // caught up to current → stop
-                Err(e) => Some(Err(anyhow::Error::from(e))),
+            let target = self.target_data.clone();
+            let db_name = &self.db_name;
+            // Bounded run: drain up to the open-time target. `next_if_any` returns
+            // `None` when nothing is available in a `max_await_time` window — but a
+            // single empty poll can precede the backlog's getMore (the stream's
+            // position has NOT advanced past the target yet), so only stop once the
+            // position IS past the target. Otherwise poll again — this is the fix
+            // for the intermittent backlog-drop the version matrix caught on 4.4.
+            loop {
+                match session.block_on(async { stream.next_if_any().await }) {
+                    Ok(Some(cse)) => return Some(to_change_event(cse, canonical, db_name)),
+                    Ok(None) => {
+                        let advanced = stream
+                            .resume_token()
+                            .and_then(|t| serde_json::to_value(&t).ok())
+                            .as_ref()
+                            .and_then(token_data);
+                        match (&advanced, &target) {
+                            // Position moved past the open-time end → drained, stop.
+                            (Some(cur), Some(tgt)) if cur > tgt => return None,
+                            // No target (shouldn't happen) → fall back to first-None.
+                            (_, None) => return None,
+                            // Not yet past the target — the backlog is still coming.
+                            _ => continue,
+                        }
+                    }
+                    Err(e) => return Some(Err(anyhow::Error::from(e))),
+                }
             }
         } else {
             // Daemon: block for the next change (the tailable stream only ends
