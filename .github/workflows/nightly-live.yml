@@ -76,13 +76,17 @@ jobs:
           # it every test that writes a shared workdir EACCESes — the first
           # nightly after the cdc-oracle suite landed failed exactly there.
           mkdir -p tests/.live-tmp
-          docker compose --profile pool --profile loaders --profile cdc --profile replica up -d postgres mysql mssql minio fake-gcs azurite toxiproxy pgbouncer proxysql duckdb clickhouse postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica
+          docker compose --profile pool --profile loaders --profile cdc --profile replica up -d postgres mysql mssql minio fake-gcs azurite toxiproxy pgbouncer proxysql duckdb clickhouse postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica mongo mongo-rs
           sudo chmod -R 0777 tests/.live-tmp
 
       - name: Wait for services
         run: |
           echo "Waiting for Postgres..."
           for i in $(seq 1 30); do docker compose exec -T postgres pg_isready -U rivet && break || sleep 2; done
+          echo "Waiting for MongoDB (standalone + replica set)..."
+          for i in $(seq 1 40); do docker compose exec -T mongo mongosh --quiet --eval 'db.runCommand({ping:1})' >/dev/null 2>&1 && break || sleep 2; done
+          # rs.status().ok is 1 only once the healthcheck has run rs.initiate.
+          for i in $(seq 1 40); do docker compose exec -T mongo-rs mongosh --quiet --eval 'rs.status().ok' 2>/dev/null | grep -q 1 && break || sleep 2; done
           echo "Waiting for MySQL..."
           for i in $(seq 1 30); do docker compose exec -T mysql mysqladmin ping -h localhost -uroot -privet 2>/dev/null && break || sleep 2; done
           echo "Waiting for pgBouncer..."
