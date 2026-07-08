@@ -34,6 +34,13 @@ pub struct ChunkedPlan {
 pub struct KeysetPlan {
     pub key_column: String,
     pub chunk_size: usize,
+    /// Persist the page's max key after each commit and resume from it next run
+    /// (crash-recovery / incremental-append). Opt-in — default `false` keeps
+    /// `mode: full` re-reading the whole key range every run (full semantics).
+    /// Set for a MongoDB source via `source.mongo.resume`. `#[serde(default)]`
+    /// so a pre-existing plan artifact (no field) deserializes as non-resumable.
+    #[serde(default)]
+    pub checkpoint: bool,
 }
 
 /// Fully resolved execution plan for a single export.
@@ -149,6 +156,7 @@ impl ExtractionStrategy {
     /// strategies restart from scratch on retry.
     pub fn is_resumable(&self) -> bool {
         matches!(self, ExtractionStrategy::Chunked(cp) if cp.checkpoint)
+            || matches!(self, ExtractionStrategy::Keyset(kp) if kp.checkpoint)
     }
 
     /// Primary cursor column name for incremental exports (`None` for other strategies).

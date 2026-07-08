@@ -153,11 +153,14 @@ pub fn build_plan(
 /// the single-cursor snapshot.
 fn full_strategy(config: &Config) -> ExtractionStrategy {
     if config.source.source_type == crate::config::SourceType::Mongo
-        && let Some(page) = config.source.mongo.as_ref().and_then(|m| m.page_size)
+        && let Some(mongo) = config.source.mongo.as_ref()
+        && let Some(page) = mongo.page_size
     {
         return ExtractionStrategy::Keyset(KeysetPlan {
             key_column: "_id".to_string(),
             chunk_size: page.max(1),
+            // Resume is opt-in: default keeps `mode: full` re-reading each run.
+            checkpoint: mongo.resume,
         });
     }
     ExtractionStrategy::Snapshot
@@ -403,6 +406,8 @@ fn resolve_chunked_strategy(
         return Ok(ExtractionStrategy::Keyset(KeysetPlan {
             key_column: key.to_string(),
             chunk_size,
+            // SQL keyset is a full re-read each run (no cross-run resume).
+            checkpoint: false,
         }));
     }
 
@@ -457,6 +462,7 @@ fn resolve_chunked_strategy(
                     return Ok(ExtractionStrategy::Keyset(KeysetPlan {
                         key_column: key.to_string(),
                         chunk_size,
+                        checkpoint: false,
                     }));
                 }
                 anyhow::bail!(

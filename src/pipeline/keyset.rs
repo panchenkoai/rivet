@@ -58,7 +58,21 @@ pub(crate) fn run_keyset(
         kp.chunk_size
     );
 
-    let mut last: Option<String> = None;
+    // RESUME (opt-in via `kp.checkpoint`): continue from the last DURABLY
+    // committed key so a crashed run picks up where it left off instead of
+    // re-reading the whole collection. Reuses the incremental `export_state`
+    // store. Default OFF keeps `mode: full` re-reading the whole key range every
+    // run — resume is only correct when the caller wants it (a plain re-run of a
+    // full export must NOT silently skip already-exported rows). Lossless for
+    // keys whose output-column string uniquely and order-preservingly identifies
+    // the source key (integers, strings, timestamps, UUIDs, ObjectId hex).
+    let mut last: Option<String> = if kp.checkpoint {
+        state
+            .and_then(|s| s.get(&plan.export_name).ok())
+            .and_then(|cs| cs.last_cursor_value)
+    } else {
+        None
+    };
     let mut pages: usize = 0;
 
     loop {
@@ -135,6 +149,16 @@ pub(crate) fn run_keyset(
                     page_index: pages as i64,
                 },
             );
+        }
+        // Persist the page's max key AFTER its parts are durably committed, so a
+        // resume continues from committed data (peek→flush→ack ordering). Cost of
+        // the crash window between the commit and this line is at-least-once: the
+        // last page is re-read (a downstream dedup / reconcile absorbs it), never
+        // lost. Only when resume is opted in, and only when we read the key.
+        if kp.checkpoint
+            && let (Some(st), Some(v)) = (state, &sink.last_cursor_value)
+        {
+            st.update(&plan.export_name, v)?;
         }
         log::info!(
             "export '{}': keyset page {} — {} rows",

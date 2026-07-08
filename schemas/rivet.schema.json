@@ -431,6 +431,11 @@
           "format": "uint",
           "minimum": 0,
           "default": null
+        },
+        "resume": {
+          "description": "With keyset paging (`page_size`), persist the last committed `_id` and\n**resume** from it next run — a crashed export continues where it left\noff, and a re-run captures only documents inserted since (ObjectId `_id`\nis time-ordered). Default `false` re-reads the whole collection each run\n(plain `mode: full` semantics). No effect without `page_size`.",
+          "type": "boolean",
+          "default": false
         }
       },
       "additionalProperties": false
