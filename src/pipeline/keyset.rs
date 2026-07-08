@@ -150,13 +150,15 @@ pub(crate) fn run_keyset(
                 },
             );
         }
-        // Persist the page's max key AFTER its parts are durably committed, so a
-        // resume continues from committed data (peek→flush→ack ordering). Cost of
-        // the crash window between the commit and this line is at-least-once: the
-        // last page is re-read (a downstream dedup / reconcile absorbs it), never
-        // lost. Only when resume is opted in, and only when we read the key.
+        // The keyset high-water mark: the source's own lossless token (Mongo BSON
+        // `_id`) when it reported one, else the column-extracted string (SQL).
+        let advanced = sink.effective_cursor();
+        // Persist it AFTER the parts are durably committed, so a resume continues
+        // from committed data (peek→flush→ack ordering). The crash window between
+        // the commit and this line is at-least-once: the last page is re-read (a
+        // downstream dedup / reconcile absorbs it), never lost. Resume opt-in only.
         if kp.checkpoint
-            && let (Some(st), Some(v)) = (state, &sink.last_cursor_value)
+            && let (Some(st), Some(v)) = (state, advanced.as_ref())
         {
             st.update(&plan.export_name, v)?;
         }
@@ -173,10 +175,10 @@ pub(crate) fn run_keyset(
         if rows < kp.chunk_size {
             break;
         }
-        // Advance. The sink extracts the page's max key; if it could not (NULL
-        // or an unsupported Arrow type), we must NOT loop on the same bound —
-        // that would re-read the same page forever.
-        match sink.last_cursor_value.clone() {
+        // Advance to the page's max key; if it could not be read (NULL or an
+        // unsupported type), we must NOT loop on the same bound — that would
+        // re-read the same page forever.
+        match advanced {
             Some(v) => last = Some(v),
             None => anyhow::bail!(
                 "export '{}': keyset could not read the '{}' value from the last row of page {} \

@@ -212,7 +212,7 @@ fn range_worker(
         if rows < kp.chunk_size {
             break;
         }
-        match sink.last_cursor_value.clone() {
+        match sink.effective_cursor() {
             Some(v) => last = Some(v),
             None => anyhow::bail!(
                 "export '{}': parallel worker {} could not read the '{}' value to advance keyset \

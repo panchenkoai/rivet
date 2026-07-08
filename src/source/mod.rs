@@ -129,6 +129,14 @@ impl TableIntrospection {
 pub trait BatchSink {
     fn on_schema(&mut self, schema: SchemaRef) -> Result<()>;
     fn on_batch(&mut self, batch: &RecordBatch) -> Result<()>;
+    /// A source whose key type is richer than its output column can express
+    /// reports its own keyset high-water mark here, as a lossless,
+    /// engine-decodable token. The keyset/parallel runners prefer it over the
+    /// string extracted from the output column — this is how MongoDB pages by a
+    /// non-ObjectId BSON `_id` (int, string, …) whose hex/text rendering in the
+    /// `_id` column would be type-ambiguous on the round-trip. No-op default:
+    /// SQL engines carry their cursor losslessly in the column already.
+    fn set_source_cursor(&mut self, _token: String) {}
 }
 
 /// Read-only inputs for a single export call.

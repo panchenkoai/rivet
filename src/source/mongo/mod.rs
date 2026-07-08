@@ -266,6 +266,44 @@ fn id_to_string(id: Option<&Bson>) -> String {
     }
 }
 
+/// Encode a BSON `_id` as a lossless, engine-decodable keyset token: the raw
+/// BSON bytes of `{_id: <value>}`, hex-encoded. Unlike the display `_id` column
+/// (hex/text — type-ambiguous, e.g. integer `1001` vs string `"1001"`), this
+/// preserves the exact BSON type across the string-typed cursor seam, so keyset
+/// paging + resume work for ANY `_id`, not just ObjectId.
+fn encode_id_cursor(id: &Bson) -> String {
+    let mut buf = Vec::new();
+    doc! { "_id": id.clone() }
+        .to_writer(&mut buf)
+        .expect("a one-field BSON document always serializes");
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Inverse of [`encode_id_cursor`]. Falls back to a bare 24-char ObjectId hex so
+/// a cursor written before the typed token (or a value read from the display
+/// column) still resolves.
+fn decode_id_cursor(token: &str) -> Result<Bson> {
+    if let Ok(bytes) = hex_to_bytes(token)
+        && let Ok(doc) = Document::from_reader(&bytes[..])
+        && let Some(id) = doc.get("_id")
+    {
+        return Ok(id.clone());
+    }
+    ObjectId::parse_str(token).map(Bson::ObjectId).map_err(|_| {
+        anyhow::anyhow!("MongoDB keyset cursor '{token}' is neither a typed token nor ObjectId hex")
+    })
+}
+
+fn hex_to_bytes(s: &str) -> Result<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        anyhow::bail!("odd-length hex cursor token");
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| anyhow::anyhow!(e)))
+        .collect()
+}
+
 /// Render a whole BSON document as an extended-JSON string. `canonical=false`
 /// (relaxed) keeps common scalars native (`42`, `"x"`, `true`, nested
 /// objects/arrays) while still wrapping exotic BSON types losslessly
@@ -344,21 +382,18 @@ impl Source for MongoSource {
 
         // Keyset (seek) pagination: the keyset runner drives the outer loop and
         // hands us one page's `page_limit` plus the previous page's max `_id`
-        // (as its hex string). We page `find({_id:{$gt:after}}).sort({_id:1})
-        // .limit(n)` — a bounded, index-driven range scan. `page_limit` unset ⇒
-        // one full scan. Keyset needs an ObjectId `_id` (its hex sorts in the
-        // same order as the binary key, so the round-trip through the string
-        // column preserves order); a non-ObjectId key errors, actionably.
+        // as a lossless typed token (`set_source_cursor` → `decode_id_cursor`).
+        // We page `find({_id:{$gt:after}}).sort({_id:1}).limit(n)` — a bounded,
+        // index-driven range scan. `page_limit` unset ⇒ one full scan. Because
+        // the token carries the exact BSON type (not a type-ambiguous hex/text
+        // rendering), keyset works for ANY `_id` — ObjectId, integer, string —
+        // and MongoDB's own `$gt`/`sort` provide the ordering.
         let page_limit = request.page_limit;
-        let after_id = match request.cursor.and_then(|c| c.last_cursor_value.as_deref()) {
-            Some(hex) => Some(ObjectId::parse_str(hex).map_err(|_| {
-                anyhow::anyhow!(
-                    "MongoDB keyset paging requires an ObjectId `_id`; got the non-ObjectId key \
-                     '{hex}'. Remove `source.mongo.page_size` to use a single-cursor full scan."
-                )
-            })?),
-            None => None,
-        };
+        let after_id: Option<Bson> =
+            match request.cursor.and_then(|c| c.last_cursor_value.as_deref()) {
+                Some(token) => Some(decode_id_cursor(token)?),
+                None => None,
+            };
 
         let total = self.session.block_on(async {
             // Lower bound: the keyset cursor (`$gt: after`) when resuming a page,
@@ -367,8 +402,8 @@ impl Source for MongoSource {
             let filter = {
                 let mut cond = Document::new();
                 match &after_id {
-                    Some(oid) => {
-                        cond.insert("$gt", *oid);
+                    Some(id) => {
+                        cond.insert("$gt", id.clone());
                     }
                     None => {
                         if let Some((lo, _)) = id_range {
@@ -398,12 +433,19 @@ impl Source for MongoSource {
             let mut in_batch = 0usize;
             let mut batch_bytes = 0usize;
             let mut total = 0usize;
+            // The page's max `_id` (the last row, since keyset sorts `_id` asc).
+            // Reported to the sink as a typed token so the runner advances by the
+            // exact BSON value, not the type-ambiguous display string.
+            let mut max_id: Option<Bson> = None;
             while let Some(d) = cursor.try_next().await? {
                 let id = id_to_string(d.get("_id"));
                 let json = document_to_json(&d, canonical)?;
                 batch_bytes += id.len() + json.len();
                 ids.append_value(&id);
                 docs.append_value(&json);
+                if page_limit.is_some() {
+                    max_id = d.get("_id").cloned();
+                }
                 in_batch += 1;
                 total += 1;
                 if in_batch >= batch_rows || batch_byte_cap.is_some_and(|cap| batch_bytes >= cap) {
@@ -414,6 +456,10 @@ impl Source for MongoSource {
             }
             if in_batch > 0 {
                 flush(&schema, &mut ids, &mut docs, sink)?;
+            }
+            // Keyset only: hand the runner the exact BSON high-water mark.
+            if let Some(id) = &max_id {
+                sink.set_source_cursor(encode_id_cursor(id));
             }
             Ok::<usize, anyhow::Error>(total)
         })?;
@@ -591,6 +637,36 @@ mod tests {
         assert_eq!(id_to_string(Some(&Bson::Int32(7))), "7");
         // Never panic / never silently vanish on a missing id.
         assert_eq!(id_to_string(None), "");
+    }
+
+    #[test]
+    fn id_cursor_token_roundtrips_every_bson_type_losslessly() {
+        // The whole point of the typed token (A′): the display column can't tell
+        // integer `1001` from string `"1001"`, but the cursor MUST — otherwise a
+        // keyset `$gt` on the wrong BSON type mis-pages. Prove the round-trip
+        // preserves the exact type for each `_id` shape keyset supports.
+        let oid = Bson::ObjectId(ObjectId::parse_str("64b8f0000000000000000000").unwrap());
+        for id in [
+            oid.clone(),
+            Bson::Int32(1001),
+            Bson::Int64(9_000_000_000),
+            Bson::String("1001".to_string()), // same text as Int32(1001) — must NOT collide
+            Bson::String("sku-00042".to_string()),
+        ] {
+            let token = encode_id_cursor(&id);
+            assert_eq!(
+                decode_id_cursor(&token).unwrap(),
+                id,
+                "typed cursor round-trip lost the type for {id:?}"
+            );
+        }
+        // Int32(1001) and String("1001") encode to DIFFERENT tokens (no ambiguity).
+        assert_ne!(
+            encode_id_cursor(&Bson::Int32(1001)),
+            encode_id_cursor(&Bson::String("1001".to_string()))
+        );
+        // Legacy / display fallback: a bare 24-char ObjectId hex still decodes.
+        assert_eq!(decode_id_cursor("64b8f0000000000000000000").unwrap(), oid);
     }
 
     #[test]
