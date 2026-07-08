@@ -114,6 +114,48 @@ $ rivet run -c batch.yaml --validate
 `--validate` re-reads the output and checks the row counts. Add `--reconcile` to
 compare the destination against a fresh `countDocuments` on the source.
 
+### 4b. Or: plan → apply (freeze, review, execute)
+
+`rivet run` decides the strategy and executes in one shot. To **separate the
+decision from the execution** — review it, check it into a PR, run it later or on
+another host — split it into `plan` + `apply`:
+
+```console
+$ rivet plan -c batch.yaml --format json -o plan.json
+Plan written to: plan.json
+```
+
+`plan.json` is the frozen, self-describing strategy — reviewable and tamper-evident:
+
+```jsonc
+{
+  "export_name": "products",
+  "expires_at": "2026-07-09T12:13:22Z",       // stale plans (>24h) are rejected
+  "integrity": "xxh3:0f4e1be244bc0845",       // apply verifies this checksum
+  "resolved_plan": {
+    "strategy": { "Keyset": { "key_column": "_id", "chunk_size": 5000, "parallel": 4 } },
+    "format": "parquet",
+    "compression": "zstd"
+  }
+}
+```
+
+```console
+$ rivet apply plan.json
+
+── products ──────────────────────────
+  run_id:  products_20260708T121322.293
+  rows:    20,000
+  files:   6
+  verify:  not run — add `--reconcile` or `rivet validate`
+```
+
+`apply` executes **exactly** the frozen plan (it re-checks the `integrity`
+checksum and the expiry first). Same result as `run`; the difference is that the
+strategy was pinned and reviewable in between. (One cosmetic note: the plan's
+`base_query` renders as `SELECT * FROM products` — a logical placeholder; Mongo
+does not run SQL.)
+
 ### 5. What landed
 
 ```console
