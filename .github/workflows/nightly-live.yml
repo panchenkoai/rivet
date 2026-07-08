@@ -194,6 +194,54 @@ jobs:
         if: always()
         run: docker compose down -v
 
+  # MongoDB is version-sensitive where the SQL engines are not: the CDC
+  # capability tier (4.4/5.0 current-state vs 6.0+ full-image pre-images) and the
+  # until_current drain race behave differently per server version. This job runs
+  # ONLY the Mongo live tests against each supported server, on a slim stack (no
+  # SQL engines, no 2M-row fixture) so five versions stay cheap. `--wait` honors
+  # the compose healthchecks, which fall back from `mongosh` to the legacy `mongo`
+  # shell on 4.x.
+  mongo-versions:
+    name: Mongo live (v${{ matrix.mongo_version }})
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mongo_version: ["4.4", "5.0", "6.0", "7.0", "8.0"]
+    env:
+      MONGO_VERSION: ${{ matrix.mongo_version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start Mongo stack
+        run: |
+          mkdir -p tests/.live-tmp
+          docker compose up -d --wait mongo mongo-rs mongo-auth toxiproxy
+          sudo chmod -R 0777 tests/.live-tmp
+
+      - name: Run Mongo live tests
+        # `live_mongo` matches every live_mongo* module (batch, crash-recovery,
+        # harm-permission, retry-and-faults); `live_cdc_mongo` the CDC suite.
+        run: |
+          cargo test --release --test live_suite -- --ignored \
+            live_mongo live_cdc_mongo
+
+      - name: Dump Mongo logs on failure
+        if: failure()
+        run: |
+          for s in mongo mongo-rs mongo-auth; do
+            echo "::group::$s"; docker compose logs --no-color "$s" | tail -100; echo "::endgroup::"
+          done
+
+      - name: Stop services
+        if: always()
+        run: docker compose down -v
+
   # Mutation testing over the CDC surface — the meta-gate: a surviving mutant
   # names a test blind spot. Scoped to the modules where the 2026-07 campaign
   # found 33 defects (whole-crate mutants would take hours). Offline tests
