@@ -1,5 +1,12 @@
 # CDC change ordering: `__pos` is not a total order — add `__seq`
 
+> **Shipped in 0.17.0 — this page is the design rationale, not a proposal.** `__seq`
+> is a live CDC output column; the current reference is
+> [reference/cdc.md § Output shape](reference/cdc.md#output-shape). This page records
+> *why* `(__pos, __seq)` is the total change order. The per-engine population below
+> covers the three SQL engines; **MongoDB** (added later) gives every change-stream
+> event a distinct `__pos`, so its `__seq` is always `0`.
+
 ## Problem (verified live on all three engines)
 
 The CDC output columns are `__op`, `__pos`, and the after-image. `__pos` is the
