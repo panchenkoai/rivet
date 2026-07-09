@@ -111,13 +111,13 @@ duckdb in the same container). Each reader catches what the others cannot:
 | ClickHouse | Independent confirmation of the above through a second decoder; native `UInt64` round-trip for `BIGINT UNSIGNED`; tz-aware timestamps as `DateTime64(6, 'UTC')` |
 | pyarrow | Arrow field metadata (`rivet.*` keys) reaches the Parquet footer; row-group statistics (`min`/`max`/`null_count`) are correct; Decimal256 (precision > 38) round-trips exactly where DuckDB downgrades to DOUBLE |
 
-A fourth reader — **BigQuery** — is exercised by a separate harness
-(`docs/bench/harness/type_bench_bq.sh`) that requires a Google Cloud
-project + `bq` CLI auth. It loads each Rivet-produced Parquet via
-`bq load --autodetect --source_format=PARQUET`, captures the
-BigQuery-inferred schema, and asserts decimal sums round-trip through
-`bq query`. See [`docs/bench/reports/REPORT_types_bigquery.md`](bench/reports/REPORT_types_bigquery.md)
-for the per-column table and BigQuery-specific findings (notably:
+Local-reader type fidelity is now covered by the cross-tool harness'
+**type-loss matrix** ([`dev/bench/smoke.py`](../dev/bench/smoke.py), rendered in
+[`report.html`](bench/report.html)): every source column vs each tool's Parquet
+type family. A BigQuery cloud-load type-diff (load each Rivet Parquet via
+`bq load --autodetect`, assert decimal sums round-trip) is **not** currently in
+the harness — it needs a GCP project + `bq` auth and is tracked for a future
+cloud dimension (notably the earlier findings were:
 `LogicalType::Json` does **not** autoload as native BQ `JSON` — it
 falls back to `BYTES`/`STRING`; values are valid JSON but operators
 need an explicit `--schema='attrs:JSON,...'` to query the structure).

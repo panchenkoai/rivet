@@ -142,7 +142,7 @@ hashes, random text) compresses poorly regardless of level. Low-entropy data
 (repeated values, sequential IDs, timestamps) compresses exceptionally well
 even at level 3.
 
-Run `./dev/bench/run_bench.sh compression` against your own tables for concrete
+Run the cross-tool harness (`dev/bench/smoke.py`, see [`docs/bench/README.md`](../bench/README.md)) against your own tables for concrete
 numbers.
 
 ---
