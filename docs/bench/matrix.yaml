@@ -121,31 +121,46 @@ tools:
     latest: "cargo install odbc2parquet"
     steelman: { config: "--batch-size-memory 256Mb" }   # tuned; one SELECT * per table
 
-# ─── Harm matrix (metrics) ───────────────────────────────────────────────────
-# Captured per (tool × database × table). The report renders this as matrices by
-# table, by framework, and by database.
-metrics:
-  - { key: wall_s,          unit: s,     desc: "total wall time" }
-  - { key: peak_rss_mb,     unit: MB,    desc: "peak resident memory" }
-  - { key: longest_query_s, unit: s,     desc: "longest single query held on the source (source-safety)" }
-  - { key: rows,            unit: count, desc: "rows exported (correctness gate — must equal source)" }
-  - { key: output_bytes,    unit: bytes, desc: "parquet output size (*.parquet only)" }
-  - { key: type_deg,        unit: count, desc: "columns whose parquet type family drifts from the source (jsonb→text, naive-ts→timestamptz, decimal→float) — type fidelity" }
-  - { key: status,          unit: enum,  desc: "ok | OOM | DNF | error" }
+# ─── Metric catalog — the SINGLE SOURCE for what the harness reports ──────────
+# The run harness (dev/bench/smoke.py) READS this: `key` names the value its
+# capture registry produces, `label` is how it prints. A guard fails the run if a
+# declared key has no capture (or a captured metric is undeclared) — no drift
+# between the yaml and the code. Three matrices come straight from here.
 
-# ─── Source-harm metrics (the POINT of the bench) ────────────────────────────
-# How much each tool HURTS the source DB. Sampled before → after the extraction
-# and reported as the DELTA, per engine (the counters differ by engine). These
-# are what separates a source-safe chunked read from a `SELECT *` that spills.
+# Matrix 1 — benchmark: throughput + correctness (one row per tool).
+benchmark_metrics:
+  - { key: status,      label: status, desc: "ok | mismatch | error" }
+  - { key: wall_s,      label: wall_s, unit: s,     desc: "total wall time" }
+  - { key: rows,        label: rows,   unit: count, desc: "rows exported (correctness gate — must equal source)" }
+  - { key: rows_s,      label: rows_s, unit: count, desc: "extraction throughput (rows/wall)" }
+  - { key: peak_rss_mb, label: peak_mb, unit: MB,   desc: "peak resident memory of the tool process" }
+  - { key: out_mb,      label: out_mb, unit: MB,    desc: "parquet output size (*.parquet only)" }
+  - { key: type_deg,    label: type_deg, unit: count, desc: "columns whose parquet type family drifts from the source — the matrix-3 headline" }
+
+# Matrix 2 — harm to the source (one row per metric, one column per tool),
+# grouped by blast surface. `universal` axes are the same CONCEPT on every engine
+# (each implements them via its own DMVs); the per-engine blocks are the native
+# counters that differ. smoke.py (postgres) renders universal + postgres.
 harm_metrics:
-  postgres:     # pg_stat_database / pg_stat_io / pg_stat_bgwriter
-    - { key: tup_returned,     desc: "tuples read from the source (read amplification)" }
-    - { key: tup_fetched,      desc: "tuples fetched" }
-    - { key: temp_bytes,       desc: "temp-file spill (a naive SELECT * spills; chunked does not)" }
-    - { key: blks_read,        desc: "disk blocks read" }
-    - { key: blk_read_time_ms, desc: "time spent reading blocks" }
-    - { key: peak_connections, desc: "peak concurrent source connections held" }
-    - { key: longest_xact_s,   desc: "longest single open transaction on the source" }
+  universal:    # measurable on every engine — the cross-engine harm axes
+    - { key: oltp_x,   label: oltp_p99_x, group: "ground truth", desc: "co-running OLTP point-read probe: p99 latency during the extract ÷ idle baseline (the number a DBA signs off)" }
+    - { key: cache_mb, label: cache_mb,   group: "cache",        desc: "buffer-pool pages holding the table after the run — the hot working set the extract displaced" }
+    - { key: locks,    label: locks_peak, group: "contention",   desc: "peak locks held on the source" }
+    - { key: blocked,  label: blocked_peak, group: "contention", desc: "peak OTHER sessions blocked by the tool (locks only harm when they block)" }
+    - { key: longq,    label: longq_s,    group: "query hold",   desc: "longest single active query held (source-safety)" }
+    - { key: q_p50,    label: q_p50_s,    group: "query hold",   desc: "median active query duration" }
+    - { key: longtxn,  label: longtxn_s,  group: "query hold",   desc: "longest open transaction" }
+    - { key: conns,    label: conns_peak, group: "query hold",   desc: "peak concurrent connections held" }
+    - { key: cpu_ms,   label: cpu_ms,     group: "resource",     desc: "source CPU consumed (cgroup v2 cpu.stat)" }
+  postgres:     # pg_stat_database deltas + pg-native gauges
+    - { key: xmin_age,      label: xmin_held_xid, group: "mvcc/vacuum", desc: "xid age the tool pins backend_xmin to — how far back it starves VACUUM (DB-wide bloat)" }
+    - { key: dead,          label: dead_tup,   group: "mvcc/vacuum", desc: "dead tuples created (≈0 for a pure read)" }
+    - { key: tup_returned,  label: tup_read,   group: "i/o",  desc: "tuples read from the source (read amplification, incl. catalog)" }
+    - { key: tup_fetched,   label: tup_fetch,  group: "i/o",  desc: "tuples fetched" }
+    - { key: temp_mb,       label: temp_mb,    group: "i/o",  desc: "temp-file spill (a naive SELECT * spills; chunked does not)" }
+    - { key: blks_read,     label: blks_read,  group: "i/o",  desc: "disk blocks read" }
+    - { key: blk_read_time, label: blkread_ms, group: "i/o",  desc: "time spent reading blocks" }
+    - { key: wal_kb,        label: wal_kb,     group: "resource", desc: "WAL generated (≈0 for reads; matters for CDC)" }
   mysql:        # SHOW GLOBAL STATUS deltas
     - { key: Innodb_rows_read,                 desc: "rows read from InnoDB" }
     - { key: Innodb_buffer_pool_reads,         desc: "physical page reads (cache miss)" }

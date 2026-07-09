@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """Benchmark smoke runner — reads docs/bench/matrix.yaml, runs each tool over the
-seeded smoke fixture, and prints a comparison table.
+seeded smoke fixture, and prints THREE matrices: benchmark, harm, type-loss.
 
-Smokes first: a tiny fixture on one DB, every tool, so a full round-trip is a
-couple of minutes. A tool that errors is a RESULT (status=error), not a stop —
-the harness records it and moves on.
+The metric SET lives once in matrix.yaml (benchmark_metrics + harm_metrics); this
+file provides the capture per key and a guard that fails if the two drift. Run
+with the system python — it has PyYAML + dlt (the homebrew pythons don't):
 
-    python3 dev/bench/smoke.py                 # postgres content_items, all tools
-    python3 dev/bench/smoke.py --table orders  # a different smoke table
+    /usr/bin/python3 dev/bench/smoke.py                 # content_items, all tools
+    /usr/bin/python3 dev/bench/smoke.py --table orders  # a different smoke table
 
-Measures per run: wall seconds, peak RSS (MB), output rows, output bytes.
-Peak RSS comes from `/usr/bin/time -l` (macOS, bytes) so it isolates the tool
-process; rows are counted from the emitted parquet via the duckdb CLI.
+Each tool runs once, serially, capturing in that one pass: perf (wall via
+`/usr/bin/time -l`, rows, rows/s, peak RSS, out MB), source-harm (cumulative
+counters + gauge peaks + a co-running OLTP p99 probe), and type fidelity
+(parquet column family vs the source). Smokes first: a tiny fixture, so a full
+round-trip is a couple of minutes; harm signals that need scale (temp spill,
+xmin hold) stay ~0 until the full run.
 """
 import argparse
 import os
@@ -158,16 +161,16 @@ class GaugePoller(threading.Thread):
     """Samples the source gauges ~every 50 ms until stopped; reports peak + p50."""
     def __init__(self):
         super().__init__(daemon=True)
-        self._stop = threading.Event()
+        self._halt = threading.Event()
         self.samples = []
 
     def run(self):
-        while not self._stop.is_set():
+        while not self._halt.is_set():
             self.samples.append(gauge_once())
-            self._stop.wait(0.05)
+            self._halt.wait(0.05)
 
     def stop(self):
-        self._stop.set()
+        self._halt.set()
         self.join(timeout=2)
 
     def result(self) -> dict:
@@ -185,7 +188,7 @@ class OltpProbe(threading.Thread):
     latency, not docker/network. Harm = p99 during the extract ÷ idle p99."""
     def __init__(self):
         super().__init__(daemon=True)
-        self._stop = threading.Event()
+        self._halt = threading.Event()
         self.latencies = []
         self.proc = None
 
@@ -198,7 +201,7 @@ class OltpProbe(threading.Thread):
         self.proc.stdin.write("SET application_name='harness_probe';\n\\timing on\n")
         self.proc.stdin.flush()
         i = 0
-        while not self._stop.is_set():
+        while not self._halt.is_set():
             i = i % 1000 + 1
             try:
                 self.proc.stdin.write(f"SELECT v FROM bench_probe WHERE id={i};\n")
@@ -212,7 +215,7 @@ class OltpProbe(threading.Thread):
                     break
 
     def stop(self):
-        self._stop.set()
+        self._halt.set()
         if self.proc:
             try:
                 self.proc.stdin.close()
@@ -413,38 +416,41 @@ ADAPTERS = {
 }
 
 
-# Harm matrix rows (transposed: one row per metric, one column per tool). Grouped
-# by blast surface. Each entry: (label, key, formatter).
-HARM_ROWS = [
-    ("— ground truth —", None, None),
-    ("oltp_p99_x", "oltp_x", lambda v: f"{v:.1f}x"),
-    ("— mvcc/vacuum —", None, None),
-    ("xmin_held_xid", "xmin_age", lambda v: f"{v:.0f}"),
-    ("dead_tup", "dead", lambda v: f"{v:.0f}"),
-    ("— cache —", None, None),
-    ("cache_mb", "cache_mb", lambda v: f"{v:.0f}"),
-    ("— contention —", None, None),
-    ("locks_peak", "locks", lambda v: f"{v:.0f}"),
-    ("blocked_peak", "blocked", lambda v: f"{v:.0f}"),
-    ("— query hold —", None, None),
-    ("longq_s", "longq", lambda v: f"{v:.2f}"),
-    ("q_p50_s", "q_p50", lambda v: f"{v:.2f}"),
-    ("longtxn_s", "longtxn", lambda v: f"{v:.2f}"),
-    ("conns_peak", "conns", lambda v: f"{v:.0f}"),
-    ("— i/o —", None, None),
-    ("tup_read", "tup_returned", lambda v: f"{v:.0f}"),
-    ("tup_fetch", "tup_fetched", lambda v: f"{v:.0f}"),
-    ("temp_mb", "temp_mb", lambda v: f"{v:.1f}"),
-    ("blks_read", "blks_read", lambda v: f"{v:.0f}"),
-    ("blkread_ms", "blk_read_time", lambda v: f"{v:.0f}"),
-    ("— resource —", None, None),
-    ("wal_kb", "wal_kb", lambda v: f"{v:.0f}"),
-    ("cpu_ms", "cpu_ms", lambda v: f"{v:.0f}"),
-]
+MATRIX_YAML = ROOT / "docs" / "bench" / "matrix.yaml"
+
+# The catalog in matrix.yaml owns WHICH metrics, their labels, order, and harm
+# grouping — one source. Only the presentation FORMAT is cosmetic and stays here.
+FMT = {
+    "oltp_x": lambda v: f"{v:.1f}x",
+    "wall_s": lambda v: f"{v:.1f}", "rows_s": lambda v: f"{v:.0f}",
+    "peak_rss_mb": lambda v: f"{v:.0f}", "out_mb": lambda v: f"{v:.1f}",
+    "temp_mb": lambda v: f"{v:.1f}", "cache_mb": lambda v: f"{v:.0f}",
+    "cpu_ms": lambda v: f"{v:.0f}",
+    "longq": lambda v: f"{v:.2f}", "q_p50": lambda v: f"{v:.2f}",
+    "longtxn": lambda v: f"{v:.2f}",
+}
+
+
+def fmt(key, v):
+    f = FMT.get(key)
+    if f:
+        return f(v)
+    if isinstance(v, float):  # counts: drop the trailing .0
+        return f"{v:.0f}" if v == int(v) else f"{v:.1f}"
+    return str(v)
 
 
 def ta(t):
     return TOOL_ABBR.get(t, t)[:9]
+
+
+def load_catalog() -> dict:
+    try:
+        import yaml
+    except ModuleNotFoundError:
+        sys.exit("smoke.py reads docs/bench/matrix.yaml and needs PyYAML — run it "
+                 "with the system python that has it: /usr/bin/python3 dev/bench/smoke.py")
+    return yaml.safe_load(MATRIX_YAML.read_text())
 
 
 def main():
@@ -452,6 +458,11 @@ def main():
     ap.add_argument("--table", default="content_items")
     ap.add_argument("--tools", default=",".join(ADAPTERS))
     args = ap.parse_args()
+
+    catalog = load_catalog()
+    bench_defs = catalog["benchmark_metrics"]
+    harm_defs = catalog["harm_metrics"]["universal"] + catalog["harm_metrics"]["postgres"]
+    declared = {d["key"] for d in bench_defs + harm_defs}
 
     if OUT.exists():
         shutil.rmtree(OUT)
@@ -473,7 +484,7 @@ def main():
     print(f"\nSmoke: postgres.{args.table}  (source rows={truth}, {len(src_types)} cols, "
           f"OLTP baseline p99={base_p99:.2f}ms)")
 
-    results = []  # (tool, status, bench, harm, pqfam)
+    results = []  # (tool, m_dict, pqfam)
     for tool in args.tools.split(","):
         tool = tool.strip()
         if tool not in ADAPTERS:
@@ -501,7 +512,17 @@ def main():
         c1, cpu1 = pg_counters(), cgroup_cpu_usec()
 
         g = poller.result()
-        harm = {
+        rows = parquet_rows(path) if rc == 0 else -1
+        mb = out_bytes(path) / 1_048_576 if rc == 0 else 0
+        pqfam = parquet_families(path) if rc == 0 else {}
+        status = "ok" if rc == 0 and rows == truth else ("mismatch" if rc == 0 else "error")
+        # One value dict keyed by the matrix.yaml metric keys (bench + harm).
+        m = {
+            "status": status, "wall_s": wall, "rows": rows,
+            "rows_s": (rows / wall) if wall > 0 and rows > 0 else 0,
+            "peak_rss_mb": rss, "out_mb": mb,
+            "type_deg": sum(1 for c in src_types
+                            if c in pqfam and pqfam[c] != srcfam[c]),
             "oltp_x": (probe.p99() / base_p99) if probe.p99() else 0.0,
             "xmin_age": g["xmin_age"], "dead": dead_tuples(args.table) - dead0,
             "cache_mb": cache_footprint_mb(args.table),
@@ -516,46 +537,53 @@ def main():
             "wal_kb": (c1.get("wal_bytes", 0) - c0.get("wal_bytes", 0)) / 1024,
             "cpu_ms": (cpu1 - cpu0) / 1000,
         }
-        rows = parquet_rows(path) if rc == 0 else -1
-        mb = out_bytes(path) / 1_048_576 if rc == 0 else 0
-        pqfam = parquet_families(path) if rc == 0 else {}
-        status = "ok" if rc == 0 and rows == truth else ("mismatch" if rc == 0 else "error")
-        bench = {"wall": wall, "rss": rss, "rows": rows, "out_mb": mb,
-                 "rows_s": (rows / wall) if wall > 0 and rows > 0 else 0}
-        results.append((tool, status, bench, harm, pqfam))
+        # Anti-drift guard: every metric matrix.yaml declares must be captured.
+        gap = declared - set(m)
+        if gap:
+            sys.exit(f"metric drift: matrix.yaml declares {sorted(gap)} with no "
+                     f"capture in smoke.py — reconcile the two.")
+        results.append((tool, m, pqfam))
         tail = "" if rc == 0 else " · " + (err.strip().splitlines() or ["?"])[-1][:60]
-        print(f"  {tool:<16} {status:<9} wall={wall:5.1f}s  oltp={harm['oltp_x']:.1f}x{tail}")
+        print(f"  {tool:<16} {status:<9} wall={wall:5.1f}s  oltp={m['oltp_x']:.1f}x{tail}")
 
-    ok = [r for r in results if r[1] != "error"]
+    ok = [r for r in results if r[1]["status"] != "error"]
 
-    # ── Matrix 1 — Benchmark (perf + correctness) ────────────────────────────
+    # ── Matrix 1 — Benchmark (from catalog: benchmark_metrics) ────────────────
     print("\n### 1. benchmark — throughput & correctness\n")
-    bcols = [("tool", 18, "<"), ("status", 9, "<"), ("wall_s", 8, ">"),
-             ("rows", 8, ">"), ("rows_s", 9, ">"), ("peak_mb", 9, ">"),
-             ("out_mb", 8, ">")]
-    print("".join(f"{n:{a}{w}}" for n, w, a in bcols))
-    print("-" * sum(w for _, w, _ in bcols))
-    for tool, status, b, _h, _f in results:
-        vals = [tool, status, f"{b['wall']:.1f}", b["rows"], f"{b['rows_s']:.0f}",
-                f"{b['rss']:.0f}", f"{b['out_mb']:.1f}"]
-        print("".join(f"{str(v):{a}{w}}" for v, (n, w, a) in zip(vals, bcols)))
+    widths = [18] + [max(len(d["label"]) + 2, 9) for d in bench_defs]
+    head = f"{'tool':<18}" + "".join(f"{d['label']:>{w}}"
+                                     for d, w in zip(bench_defs, widths[1:]))
+    print(head); print("-" * len(head))
+    for tool, m, _pf in results:
+        line = f"{tool:<18}" + "".join(f"{fmt(d['key'], m[d['key']]):>{w}}"
+                                       for d, w in zip(bench_defs, widths[1:]))
+        print(line)
 
-    # ── Matrix 2 — Harm (metric rows × tool columns) ─────────────────────────
+    # ── Matrix 2 — Harm (from catalog: harm_metrics, grouped by surface) ──────
     if ok:
         print("\n### 2. harm to the source — how much each tool hurts the DB\n")
         w0, wt = 16, 9
         print(f"{'harm metric':<{w0}}" + "".join(f"{ta(t):>{wt}}" for t, *_ in ok))
         print("-" * (w0 + wt * len(ok)))
-        for label, key, fmt in HARM_ROWS:
-            if key is None:
-                print(label); continue
-            line = f"{label:<{w0}}"
-            for _t, _s, _b, h, _f in ok:
-                line += f"{fmt(h.get(key, 0)):>{wt}}"
-            print(line)
+        # Group by blast surface — merge same-group metrics across the
+        # universal/per-engine split so each surface prints once, contiguously.
+        order, by_group = [], {}
+        for d in harm_defs:
+            grp = d.get("group", "")
+            if grp not in by_group:
+                by_group[grp] = []; order.append(grp)
+            by_group[grp].append(d)
+        for grp in order:
+            if grp:
+                print(f"— {grp} —")
+            for d in by_group[grp]:
+                line = f"{d['label']:<{w0}}"
+                for _t, m, _pf in ok:
+                    line += f"{fmt(d['key'], m[d['key']]):>{wt}}"
+                print(line)
 
-    # ── Matrix 3 — Type loss (source column rows × tool columns) ─────────────
-    fam_by_tool = [(t, f) for t, _s, _b, _h, f in ok]
+    # ── Matrix 3 — Type loss (source column × tool parquet family) ────────────
+    fam_by_tool = [(t, pf) for t, _m, pf in ok]
     disc = [c for c in src_types
             if any(pf.get(c, srcfam[c]) != srcfam[c] for _, pf in fam_by_tool)]
     if disc and fam_by_tool:
