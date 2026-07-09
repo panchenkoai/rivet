@@ -108,10 +108,10 @@ tools:
   - name: clickhouse-local
     role: competitor
     lang: C++
-    version: "25.8-LTS"
+    version: "26.6.1"
     version_date: "2026-07-09"
-    latest: "clickhouse local --version   # curl https://clickhouse.com/ | sh"
-    steelman: { note: "OOMs (code 241) below its floor; give it its lowest completing max_memory_usage" }
+    latest: "brew install clickhouse   # unsigned cask: xattr -dr com.apple.quarantine <bin>; codesign -s - <bin>"
+    steelman: { note: "OOMs (code 241) below its floor; give it its lowest completing max_memory_usage. Reads pg via the postgresql() table function INTO OUTFILE ... FORMAT Parquet" }
 
   - name: odbc2parquet
     role: competitor

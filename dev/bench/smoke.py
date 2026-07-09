@@ -126,6 +126,12 @@ def a_duckdb(table, dest: Path):
     return out, lambda: timed(["duckdb", "-c", sql])
 
 
+# clickhouse's brew cask is an unsigned Apple-Silicon binary; if `which` misses
+# it (or Gatekeeper removed it) fall back to the homebrew path. Dequarantine +
+# ad-hoc sign it once: `xattr -dr com.apple.quarantine <bin>; codesign -s - <bin>`.
+CH_BIN = shutil.which("clickhouse") or "/opt/homebrew/bin/clickhouse"
+
+
 def a_clickhouse(table, dest: Path):
     dest.mkdir(parents=True, exist_ok=True)
     out = dest / f"{table}.parquet"
@@ -134,7 +140,7 @@ def a_clickhouse(table, dest: Path):
     q = (f"SELECT * FROM postgresql('{PG['host']}:{PG['port']}', '{PG['db']}', "
          f"'{table}', '{PG['user']}', '{PG['pw']}') "
          f"INTO OUTFILE '{out}' FORMAT Parquet")
-    return out, lambda: timed(["clickhouse", "local", "--query", q])
+    return out, lambda: timed([CH_BIN, "local", "--query", q])
 
 
 def a_odbc2parquet(table, dest: Path):
@@ -220,9 +226,15 @@ def main():
         tool = tool.strip()
         if tool not in ADAPTERS:
             continue
-        # dlt runs via `python -m` (no `dlt` binary needed); the rest need a bin.
-        probe = {"clickhouse-local": "clickhouse", "dlt": None}.get(tool, tool)
-        if probe and shutil.which(probe) is None:
+        # dlt runs via `python -m` (no `dlt` binary needed); clickhouse resolves
+        # to CH_BIN (may be an absolute path); the rest need a bin on PATH.
+        if tool == "clickhouse-local":
+            available = Path(CH_BIN).exists()
+        elif tool == "dlt":
+            available = True
+        else:
+            available = shutil.which(tool) is not None
+        if not available:
             print(f"{tool:<18}{'missing':<9}"); continue
         path, run = ADAPTERS[tool](args.table, OUT / tool)
         before = pg_harm()
