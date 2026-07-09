@@ -87,9 +87,9 @@ tools:
     version_date: "2026-07-09"
     latest: "rivet --version"
     steelman:
-      applied: "mode: full, compression: zstd — one clean parquet file, streamed (bounded memory)"
-      knobs:   "mode (full/chunked/date-chunked), chunk_size (default 100k), chunk_size_memory_mb, chunk_count, tuning.profile (safe/balanced/fast), batch_size, compression, parallel_exports, meta_columns"
-      note:    "batch snapshot = mode:full (1 file). chunked mode is the source-safety option for huge/resumable tables (short queries) at the cost of one file per chunk — a separate scenario, benched apart"
+      applied: "mode: full, tuning.profile: fast, compression: zstd — one clean file, cursor-streamed"
+      knobs:   "mode (full/chunked/date-chunked), tuning.profile (safe/balanced/fast — default balanced throttles 50ms/batch), chunk_size (default 100k), chunk_size_memory_mb, chunk_count, batch_size, compression, parallel_exports, meta_columns"
+      note:    "profile:fast drops the Balanced 50ms/batch throttle — MEASURED +24% rows/s, -13% source CPU, -12s open-txn, same 56MB peak / 0 type-loss; only cost oltp_p99 4.0→5.1x. zstd is free here (same speed as snappy/none, 4-18x smaller). chunked mode = source-safety for huge tables (separate scenario)"
 
   - name: sling
     role: competitor
