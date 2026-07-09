@@ -42,6 +42,22 @@ impl MongoTest {
         format!("mongodb://127.0.0.1:{port}/{db}?directConnection=true")
     }
 
+    /// Server major version via `buildInfo` (4, 5, 6, 7, 8); `0` if unavailable.
+    /// Used to skip version-gated tests — e.g. `read_concern: snapshot` needs 5.0+,
+    /// so on 4.4 the snapshot test self-skips rather than failing the matrix.
+    pub fn server_major(&self) -> u32 {
+        self.rt.block_on(async {
+            self.client
+                .database("admin")
+                .run_command(doc! { "buildInfo": 1 })
+                .await
+                .ok()
+                .and_then(|d| d.get_str("version").ok().map(str::to_string))
+                .and_then(|v| v.split('.').next().and_then(|s| s.parse().ok()))
+                .unwrap_or(0)
+        })
+    }
+
     fn coll(&self, name: &str) -> Collection<Document> {
         self.client.database(&self.db).collection(name)
     }

@@ -254,6 +254,12 @@ fn mongo_batch_read_concern_snapshot_empty_first_run_then_populated() {
     const RS_PORT: u16 = 27018;
     let db = unique_name("mrc_snap");
     let m = MongoTest::connect(RS_PORT, &db);
+    // `read_concern: snapshot` for a find requires MongoDB 5.0+; on 4.4 it is
+    // unsupported, so self-skip rather than fail the version matrix.
+    if m.server_major() < 5 {
+        eprintln!("skipping: read_concern: snapshot needs MongoDB 5.0+ (server is 4.x)");
+        return;
+    }
     m.drop_collection("t");
 
     let rig = Rig::mongo_batch("t")
