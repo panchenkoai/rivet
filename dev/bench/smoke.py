@@ -321,11 +321,15 @@ def timed(cmd, cwd=None, env=None) -> tuple[float, float, int, str]:
 def a_rivet(table, dest: Path):
     dest.mkdir(parents=True, exist_ok=True)
     cfg = dest / "rivet.yaml"
+    # Batch snapshot export: mode:full → one clean parquet file, still streamed
+    # (bounded memory via a server-side cursor). chunked mode fragments output
+    # (one file per chunk) and is the source-safety option for huge/resumable
+    # tables — a separate scenario, not this apples-to-apples one-file bench.
     cfg.write_text(
         f"source:\n  type: postgres\n  url: \"{PG_URL}\"\n"
         f"exports:\n  - name: {table}\n"
         f"    query: \"SELECT * FROM {table}\"\n"
-        f"    mode: chunked\n    chunk_column: id\n    chunk_size: 25000\n"
+        f"    mode: full\n"
         f"    format: parquet\n    compression: zstd\n"
         f"    destination:\n      type: local\n      path: {dest}\n"
     )
@@ -358,11 +362,12 @@ def a_clickhouse(table, dest: Path):
     q = (f"SELECT * FROM postgresql('{PG['host']}:{PG['port']}', '{PG['db']}', "
          f"'{table}', '{PG['user']}', '{PG['pw']}') "
          f"INTO OUTFILE '{out}' FORMAT Parquet")
-    # steelman: cap memory (OOMs below its floor) + bound threads — passed as CLI
-    # settings (clickhouse-local accepts any setting as --<name>=<value>).
+    # steelman: cap memory to its lowest completing floor (OOMs below) — this is
+    # the min-memory goal, and it LOWERS clickhouse's RSS (flatters it), not a
+    # handicap. Threads left at default (all cores): capping them would only slow
+    # it, which the min-memory goal doesn't require. CLI settings = --<name>=<val>.
     return out, lambda: timed([
-        CH_BIN, "local", "--max_memory_usage=4000000000", "--max_threads=4",
-        "--query", q])
+        CH_BIN, "local", "--max_memory_usage=4000000000", "--query", q])
 
 
 def a_odbc2parquet(table, dest: Path):
@@ -378,12 +383,16 @@ def a_odbc2parquet(table, dest: Path):
 def a_sling(table, dest: Path):
     dest.mkdir(parents=True, exist_ok=True)
     out = dest / f"{table}.parquet"
+    # sling has no native parquet writer — it streams source→CSV→local HTTP→duckdb
+    # read_csv→parquet, which TIMES OUT on a single 2M-row stream. file_max_rows
+    # rotates the output so each duckdb COPY is bounded — its steelman for scale.
     env = dict(os.environ, SMOKE_PG=PG_URL_NOSSL)
-    return out, lambda: timed([
+    dest = out.parent / table  # a directory of rotated parts
+    return dest, lambda: timed([
         "sling", "run",
         "--src-conn", "SMOKE_PG", "--src-stream", f"public.{table}",
-        "--tgt-object", f"file://{out}",
-        "--tgt-options", '{"format": "parquet"}'], env=env)
+        "--tgt-object", f"file://{dest}",
+        "--tgt-options", '{"format": "parquet", "file_max_rows": 250000}'], env=env)
 
 
 def a_ingestr(table, dest: Path):

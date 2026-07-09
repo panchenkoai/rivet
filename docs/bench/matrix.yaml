@@ -62,7 +62,18 @@ seed:
 
 # ─── Tools ───────────────────────────────────────────────────────────────────
 # `steelman` gives each competitor its FAIREST shot — we run only steelman (no
-# strawman default column; no point running the same tool twice). Per tool:
+# strawman default column; no point running the same tool twice).
+#
+# THE GOAL, applied identically to EVERY tool (not just rivet): the lowest-memory
+# config at which the tool still COMPLETES the export. This is the honest bench:
+#   • memory caps on competitors LOWER their RSS — they flatter the competitor,
+#     they do not handicap it (a capped duckdb reports LESS peak_mb, not more);
+#   • no arbitrary throttles (e.g. thread caps) that only slow a tool without
+#     serving the min-memory goal;
+#   • every axis is reported side by side (matrix 1 throughput + matrix 2 harm),
+#     so any config trade-off is visible — rivet is NOT the fastest (duckdb /
+#     clickhouse / ingestr beat its rows/s); it wins memory, query-hold, types.
+# That transparency is the fairness. Per tool:
 #   applied — the exact tuned settings the harness invokes it with;
 #   knobs   — the FULL tuning surface the tool exposes (so the fairness is
 #             auditable: every memory/chunk/parallelism lever it has is listed);
@@ -76,9 +87,9 @@ tools:
     version_date: "2026-07-09"
     latest: "rivet --version"
     steelman:
-      applied: "mode: chunked, chunk_column: id, chunk_size: 25000, compression: zstd"
-      knobs:   "mode (full/chunked/date-chunked), chunk_size, chunk_column, tuning.profile (safe/balanced/fast), batch_size, compression, parallel_exports, meta_columns"
-      note:    "~128 MB, throughput intact — the only tool source-safe at defaults (steelman ≈ default)"
+      applied: "mode: full, compression: zstd — one clean parquet file, streamed (bounded memory)"
+      knobs:   "mode (full/chunked/date-chunked), chunk_size (default 100k), chunk_size_memory_mb, chunk_count, tuning.profile (safe/balanced/fast), batch_size, compression, parallel_exports, meta_columns"
+      note:    "batch snapshot = mode:full (1 file). chunked mode is the source-safety option for huge/resumable tables (short queries) at the cost of one file per chunk — a separate scenario, benched apart"
 
   - name: sling
     role: competitor
@@ -87,9 +98,9 @@ tools:
     version_date: "2026-07-09"
     latest: "sling --version   # brew install slingdata-io/sling/sling"
     steelman:
-      applied: "default streaming (Go, low-memory by construction); tgt format parquet"
+      applied: "tgt format parquet, file_max_rows=250000 (rotate parts — required to complete at scale)"
       knobs:   "chunk_size (Pro/paywalled), target file_max_rows / file_max_bytes, SLING_THREADS, source range/limit, sslmode=disable"
-      note:    "built-in row chunking is Pro-only; min-memory otherwise needs a hand-written id-range backfill loop"
+      note:    "no native parquet writer — streams source→CSV→local HTTP→duckdb read_csv→parquet, which TIMES OUT on a single 2M-row stream; file_max_rows rotation is what makes it complete"
 
   - name: ingestr
     role: competitor
@@ -131,9 +142,9 @@ tools:
     version_date: "2026-07-09"
     latest: "brew install clickhouse   # unsigned cask: xattr -dr com.apple.quarantine <bin>; codesign -s - <bin>"
     steelman:
-      applied: "SETTINGS max_memory_usage=4000000000, max_threads=4; postgresql() → INTO OUTFILE FORMAT Parquet"
+      applied: "--max_memory_usage=4000000000 (lowest completing floor); threads at default (all cores); postgresql() → INTO OUTFILE FORMAT Parquet"
       knobs:   "max_memory_usage, max_threads, max_block_size, max_bytes_before_external_group_by, output_format_parquet_row_group_size"
-      note:    "OOMs (code 241) below its floor; give it its lowest completing max_memory_usage"
+      note:    "OOMs (code 241) below its floor; the memory cap lowers its RSS (flatters it). No thread cap — that would only slow it without serving the min-memory goal"
 
   - name: odbc2parquet
     role: competitor
