@@ -130,6 +130,7 @@ metrics:
   - { key: longest_query_s, unit: s,     desc: "longest single query held on the source (source-safety)" }
   - { key: rows,            unit: count, desc: "rows exported (correctness gate — must equal source)" }
   - { key: output_bytes,    unit: bytes, desc: "parquet output size (*.parquet only)" }
+  - { key: type_deg,        unit: count, desc: "columns whose parquet type family drifts from the source (jsonb→text, naive-ts→timestamptz, decimal→float) — type fidelity" }
   - { key: status,          unit: enum,  desc: "ok | OOM | DNF | error" }
 
 # ─── Source-harm metrics (the POINT of the bench) ────────────────────────────
