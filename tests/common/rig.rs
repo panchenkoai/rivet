@@ -295,6 +295,14 @@ impl Rig {
         )
     }
 
+    /// Run rivet; return the raw output without asserting either way — for tests
+    /// whose VALID outcomes include both success and a loud failure (e.g. a
+    /// mid-stream outage that rivet may either retry through or safely refuse).
+    pub fn run(&self) -> std::process::Output {
+        let cfg = self.config_path();
+        super::runner::run_rivet(&["run", "--config", cfg.to_str().unwrap()])
+    }
+
     /// Run and read every parquet part back — the canonical
     /// capture-and-verify shape the outcome gate keys on.
     pub fn run_and_read(&self) -> Vec<arrow::record_batch::RecordBatch> {
