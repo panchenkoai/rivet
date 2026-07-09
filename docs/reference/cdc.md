@@ -43,7 +43,7 @@ dev — the URL is otherwise visible in `ps` / shell history.
 | `--until-current` | Catch up to the source's current log end, then **exit** instead of streaming. For MySQL this sets `BINLOG_DUMP_NON_BLOCK`; PostgreSQL / SQL Server already drain-and-exit. With `--max-events N`, the run stops at the smaller of "N events" or "end of log" — so it never blocks waiting for the N-th event. Ideal for a scheduler. |
 
 The engine is chosen from the URL scheme (`mysql://` / `postgresql://` /
-`sqlserver://`) by `create_change_stream`, the CDC sibling of the batch
+`sqlserver://` / `mongodb://`) by `create_change_stream`, the CDC sibling of the batch
 `create_source`. With `--output`, each part is uploaded through the same commit
 path the batch export uses (destination + content-MD5 + transit-integrity check,
 ADR-0004) and a `manifest.json` + `_SUCCESS` is written at clean end — so a
@@ -184,8 +184,9 @@ per-export checkpoint), and per-table exports never collide (no slot / `server_i
 — the change tables are populated by one shared capture Agent regardless of how
 many readers).
 
-The **operator flow is identical across all three engines**, only the config
-shape differs:
+The **operator flow is identical across the three SQL engines**, only the config
+shape differs (MongoDB's whole-database change stream uses the same `mode: cdc`
+config shape — see [mongodb.md](mongodb.md)):
 
 - `rivet init --mode cdc` (no `--table`) scaffolds the whole database on every
   engine — **one** `tables:` export on MySQL/PostgreSQL, **one export per table**

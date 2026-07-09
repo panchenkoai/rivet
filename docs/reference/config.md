@@ -114,7 +114,7 @@ Each entry in the `exports` list defines one export job.
 | `name` | string | **yes** | — | Unique identifier for this export |
 | `query` | string | one of query/query_file | — | SQL SELECT query |
 | `query_file` | string | | — | Path to `.sql` file (relative to config dir) |
-| `mode` | `full` \| `incremental` \| `chunked` \| `time_window` | no | `full` | Export mode |
+| `mode` | `full` \| `incremental` \| `chunked` \| `time_window` \| `cdc` | no | `full` | Export mode. `cdc` = log-based change data capture ([cdc.md](cdc.md)). MongoDB supports `full` + `cdc` only (a document store has no chunked/incremental/time_window). |
 | `format` | `parquet` \| `csv` | **yes** | — | Output format |
 | `compression` | `zstd` \| `snappy` \| `gzip` \| `lz4` \| `none` | no | `zstd` | Compression codec (low-level; prefer `compression_profile`) |
 | `compression_level` | integer | no | codec default | Compression level (low-level; prefer `compression_profile`) |
@@ -425,7 +425,7 @@ quality:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `type` | `local` \| `s3` \| `gcs` \| `stdout` | **yes** | Destination type |
+| `type` | `local` \| `s3` \| `gcs` \| `azure` \| `stdout` | **yes** | Destination type |
 
 ### Local
 
@@ -455,6 +455,19 @@ quality:
 | `credentials_file` | string | no | Path to service account JSON (otherwise ADC / `GOOGLE_APPLICATION_CREDENTIALS`) |
 | `endpoint` | string | no | Custom GCS endpoint (fake-gcs-server, test doubles) |
 | `allow_anonymous` | boolean | no | Skip authentication (public bucket / emulator) |
+
+### Azure
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `bucket` | string | **yes** | Blob container name |
+| `prefix` | string | no | Blob prefix |
+| `account_name` | string | **yes** | Storage account (`<account>.blob.core.windows.net`) — not a secret |
+| `account_key_env` | string | one of key/SAS | Env var holding the account key |
+| `sas_token_env` | string | one of key/SAS | Env var holding a SAS token (mutually exclusive with `account_key_env`; a leading `?` is trimmed) |
+| `allow_anonymous` | boolean | no | Skip authentication (public container / emulator) |
+
+Full auth-flow matrix (account key vs SAS, `endpoint` override, RBAC): [destinations/azure.md](../destinations/azure.md).
 
 ### Stdout
 
