@@ -77,6 +77,73 @@ def pg_harm() -> dict:
         return {}
 
 
+# ─── Type fidelity ───────────────────────────────────────────────────────────
+# Compare each tool's parquet column types against the SOURCE postgres types by
+# semantic family. A mismatch is a real fidelity loss: jsonb flattened to a plain
+# string (loses the JSON logical type a downstream reader needs), a naive
+# timestamp promoted to timestamptz (the naive→instant ambiguity — a silent wall-
+# clock shift), a decimal collapsed to a float (precision loss). Same run.
+def family(t: str) -> str:
+    t = t.upper()
+    if "TIMESTAMP" in t and "WITH TIME ZONE" in t:
+        return "timestamptz"
+    if "TIMESTAMP" in t or t.startswith("DATETIME"):
+        return "timestamp"
+    if t == "DATE":
+        return "date"
+    if "JSON" in t:
+        return "json"
+    if "UUID" in t:
+        return "uuid"
+    if "BOOL" in t:
+        return "bool"
+    if "DECIMAL" in t or "NUMERIC" in t:
+        return "decimal"
+    if "DOUBLE" in t or "REAL" in t or "FLOAT" in t:
+        return "float"
+    if "INT" in t:  # BIGINT / INTEGER / SMALLINT / TINYINT / HUGEINT
+        return "int"
+    if "BLOB" in t or "BYTEA" in t or "BINARY" in t:
+        return "binary"
+    return "text"  # VARCHAR / TEXT / CHAR / …
+
+
+def col_types(desc_sql: list) -> dict:
+    d = {}
+    for line in desc_sql:
+        if "=" in line:
+            k, v = line.split("=", 1)
+            d[k] = v
+    return d
+
+
+def pg_types(table: str) -> dict:
+    q = (f"SELECT column_name||'='||data_type FROM information_schema.columns "
+         f"WHERE table_name='{table}' ORDER BY ordinal_position")
+    r = sh(["docker", "exec", PG_CONTAINER, "psql", "-U", PG["user"],
+            "-d", PG["db"], "-tAc", q])
+    return col_types(r.stdout.strip().splitlines())
+
+
+def type_degrades(src: dict, path: Path) -> list:
+    """[(col, src_family, parquet_family)] for every SOURCE column whose parquet
+    type family differs. Only source columns are checked (tool-added bookkeeping
+    columns like dlt's _dlt_id are ignored)."""
+    files = list(path.rglob("*.parquet")) if path.is_dir() else [path]
+    if not files:
+        return [("<no parquet>", "", "")]
+    r = sh(["duckdb", "-noheader", "-list", "-c",
+            f"SELECT column_name||'='||column_type FROM "
+            f"(DESCRIBE SELECT * FROM read_parquet('{files[0]}'))"])
+    pq = col_types(r.stdout.strip().splitlines())
+    out = []
+    for col, st in src.items():
+        pt = pq.get(col)
+        if pt and family(st) != family(pt):
+            out.append((col, family(st), family(pt)))
+    return out
+
+
 def clean_stderr(err: str) -> str:
     """Drop the trailing /usr/bin/time -l rusage block so the tool's own error
     is what survives (time's lines are `<ws><number> <label>` or `... real`)."""
@@ -215,13 +282,21 @@ def main():
     m = re.search(r"\d+", r.stdout or "")
     truth = int(m.group()) if m else -1
 
-    print(f"\nSmoke: postgres.{args.table}  (source rows = {truth})")
-    print("perf (wall/peak_rss/out) + source-harm (tup_read/temp/blks) — one run each\n")
-    hdr = (f"{'tool':<18}{'status':<9}{'wall_s':>8}{'peak_mb':>9}{'rows':>8}{'out_mb':>8}"
-           f"{'tup_read':>10}{'temp_mb':>9}{'blks_rd':>9}")
+    src_types = pg_types(args.table)
+
+    # One matrix, every comparison axis as a column:
+    #   correctness (status/rows) · perf (wall/peak_rss/out) ·
+    #   source-harm (tup_read/temp/blks) · type fidelity (type_deg)
+    print(f"\nSmoke: postgres.{args.table}  (source rows = {truth}, {len(src_types)} cols)")
+    print("all axes, one run each — correctness · perf · source-harm · type fidelity\n")
+    cols = [("tool", 18, "<"), ("status", 9, "<"), ("wall_s", 8, ">"),
+            ("peak_mb", 9, ">"), ("rows", 8, ">"), ("out_mb", 8, ">"),
+            ("tup_read", 10, ">"), ("temp_mb", 9, ">"), ("blks_rd", 9, ">"),
+            ("type_deg", 10, ">")]
+    hdr = "".join(f"{n:{a}{w}}" for n, w, a in cols)
     print(hdr); print("-" * len(hdr))
 
-    rows_out = []
+    rows_out, legend = [], []
     for tool in args.tools.split(","):
         tool = tool.strip()
         if tool not in ADAPTERS:
@@ -246,15 +321,24 @@ def main():
         harm = {k: pg_harm().get(k, 0) - before.get(k, 0) for k in HARM_KEYS}
         rows = parquet_rows(path) if rc == 0 else -1
         mb = out_bytes(path) / 1_048_576 if rc == 0 else 0
+        degr = type_degrades(src_types, path) if rc == 0 else []
         status = "ok" if rc == 0 and rows == truth else ("mismatch" if rc == 0 else "error")
         print(f"{tool:<18}{status:<9}{wall:>8.1f}{rss:>9.0f}{rows:>8}{mb:>8.1f}"
               f"{harm['tup_returned']:>10.0f}{harm['temp_bytes']/1e6:>9.1f}"
-              f"{harm['blks_read']:>9.0f}")
+              f"{harm['blks_read']:>9.0f}{len(degr):>10}")
         if rc != 0:
             tail = (err.strip().splitlines() or ["(no stderr)"])[-1][:90]
             print(f"{'':<18}└─ {tail}")
-        rows_out.append((tool, status, wall, rss, rows, mb, harm))
+        if degr:
+            legend.append((tool, degr))
+        rows_out.append((tool, status, wall, rss, rows, mb, harm, degr))
 
+    if legend:
+        print("\ntype_deg detail (source_family → parquet_family):")
+        for tool, degr in legend:
+            shown = ", ".join(f"{c}:{s}→{p}" for c, s, p in degr[:6])
+            more = f" (+{len(degr) - 6})" if len(degr) > 6 else ""
+            print(f"  {tool:<16} {shown}{more}")
     print()
 
 
