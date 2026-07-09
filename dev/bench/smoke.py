@@ -184,7 +184,69 @@ MY_ENGINE = {
     "dlt_schema": "rivet_bench",
 }
 
-ENGINES = {"postgres": PG_ENGINE, "mysql": MY_ENGINE}
+def _ms_sql(q):
+    return sh(["docker", "exec", "rivet-mongo-mssql-1", "/opt/mssql-tools18/bin/sqlcmd",
+               "-S", "localhost", "-U", "sa", "-P", "Rivet_Passw0rd!", "-C",
+               "-d", "rivet_bench", "-h", "-1", "-W", "-Q", q]).stdout.strip()
+
+
+# ── SQL Server engine ────────────────────────────────────────────────────────
+# Counters from sys.dm_exec_query_stats (cumulative per cached plan; SUM≈global —
+# before/after captures the tool's plan). Gauges from the DMVs the old harm_ab.sh
+# used: longest request / open txn / peak user locks. No duckdb/clickhouse native
+# reader → those tools skip. Probe: sqlcmd per-query (client-timed, like mysql).
+MS_ENGINE = {
+    "name": "mssql",
+    "sql": _ms_sql,
+    "container": "rivet-mongo-mssql-1",
+    "counter_keys": ["logical_reads", "physical_reads", "worker_time_ms"],
+    "counters_sql": (
+        "SET NOCOUNT ON; SELECT CONCAT("
+        "ISNULL(SUM(total_logical_reads),0),',',"
+        "ISNULL(SUM(total_physical_reads),0),',',"
+        "ISNULL(SUM(total_worker_time)/1000,0)) FROM sys.dm_exec_query_stats"),
+    "gauge_sql": (
+        "SET NOCOUNT ON; SELECT CONCAT_WS(',',"
+        "ISNULL((SELECT MAX(r.total_elapsed_time)/1000.0 FROM sys.dm_exec_requests r "
+        "JOIN sys.dm_exec_sessions s ON s.session_id=r.session_id "
+        "WHERE s.is_user_process=1 AND r.session_id<>@@SPID AND r.database_id=DB_ID('rivet_bench')),0),"
+        "ISNULL((SELECT MAX(DATEDIFF(SECOND,t.transaction_begin_time,SYSUTCDATETIME())) "
+        "FROM sys.dm_tran_active_transactions t JOIN sys.dm_tran_session_transactions st "
+        "ON st.transaction_id=t.transaction_id JOIN sys.dm_exec_sessions s3 "
+        "ON s3.session_id=st.session_id WHERE s3.is_user_process=1 AND s3.session_id<>@@SPID),0),"
+        "(SELECT COUNT(DISTINCT s.session_id) FROM sys.dm_exec_sessions s "
+        "WHERE s.is_user_process=1 AND s.session_id<>@@SPID AND s.database_id=DB_ID('rivet_bench')),"
+        "(SELECT COUNT(*) FROM sys.dm_tran_locks l JOIN sys.dm_exec_sessions s2 "
+        "ON s2.session_id=l.request_session_id WHERE s2.is_user_process=1 AND s2.session_id<>@@SPID),"
+        "0,0)"),
+    "cache_sql": None,
+    "dead_sql": None,
+    "types_sql": ("SET NOCOUNT ON; SELECT CONCAT(column_name,'=',data_type) "
+                  "FROM information_schema.columns WHERE table_name='{t}' "
+                  "ORDER BY ordinal_position"),
+    "setup": lambda: [
+        _ms_sql("IF OBJECT_ID('bench_probe','U') IS NULL CREATE TABLE bench_probe(id int PRIMARY KEY, v int)"),
+        _ms_sql("IF NOT EXISTS(SELECT 1 FROM bench_probe) INSERT INTO bench_probe "
+                "SELECT value, value FROM GENERATE_SERIES(1,1000)")],
+    "probe_mode": "perquery",
+    "probe_cmd": ["docker", "exec", "rivet-mongo-mssql-1", "/opt/mssql-tools18/bin/sqlcmd",
+                  "-S", "localhost", "-U", "sa", "-P", "Rivet_Passw0rd!", "-C",
+                  "-d", "rivet_bench", "-h", "-1", "-Q", "SELECT v FROM bench_probe WHERE id={i}"],
+    "url": lambda tool: "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1433/rivet_bench",
+    "rivet_type": "mssql",
+    "duckdb_install": None,      # no native mssql scanner → duckdb skips
+    "duckdb_attach": None,
+    "clickhouse_fn": None,       # mssql only via ODBC → clickhouse skips
+    "odbc_conn": ("Driver={ODBC Driver 18 for SQL Server};Server=127.0.0.1,1433;"
+                  "Database=rivet_bench;Uid=sa;Pwd=Rivet_Passw0rd!;TrustServerCertificate=yes;"),
+    "sling_url": "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1433/rivet_bench",
+    "ingestr_url": "mssql://sa:Rivet_Passw0rd!@127.0.0.1:1433/rivet_bench",
+    "qualify": lambda t: f"dbo.{t}",
+    "dlt_url": "mssql+pyodbc://sa:Rivet_Passw0rd!@127.0.0.1:1433/rivet_bench?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes",
+    "dlt_schema": "dbo",
+}
+
+ENGINES = {"postgres": PG_ENGINE, "mysql": MY_ENGINE, "mssql": MS_ENGINE}
 
 
 def sh(cmd, **kw):
@@ -661,6 +723,12 @@ def main():
         tool = tool.strip()
         if tool not in ADAPTERS:
             continue
+        # Skip tools the CURRENT engine has no native reader for (duckdb/clickhouse
+        # can't read mssql/mongo) — a real coverage fact, not a failure.
+        if tool == "duckdb" and not ENG.get("duckdb_attach"):
+            print(f"  {tool:<16} n/a ({ENG['name']})"); continue
+        if tool == "clickhouse-local" and not ENG.get("clickhouse_fn"):
+            print(f"  {tool:<16} n/a ({ENG['name']})"); continue
         if tool == "clickhouse-local":
             available = Path(CH_BIN).exists()
         elif tool == "dlt":
