@@ -6,10 +6,14 @@ tails the log that the database already writes for replication and durability, i
 adds almost no load to the OLTP path: no table scan, no locks, no read snapshot
 (see [Why CDC is gentle on the source](#why-cdc-is-gentle-on-the-source)).
 
-> **Status.** All three engines support NDJSON streaming and typed Parquet/CSV
+> **Status.** All three SQL engines support NDJSON streaming and typed Parquet/CSV
 > `--output` (real `Timestamp` / `Date32` / `Decimal128` columns). This page
 > documents all three so the **permissions** are clear up front — they are the
 > part operators most need to get right.
+>
+> **MongoDB** also has CDC — via change streams, with a different setup (a replica
+> set, not per-table grants) and the JSON-blob document image rather than typed
+> columns. It has its own reference: [mongodb.md](mongodb.md#scenario-b--cdc-change-capture).
 
 ## The command
 

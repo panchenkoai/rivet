@@ -2,7 +2,7 @@ _Last updated: 2026-06-13._
 
 # Getting Started
 
-Rivet exports tables from PostgreSQL, MySQL, or SQL Server to Parquet (or CSV) files — locally, to S3, GCS, or Azure Blob Storage. Point it at a database, scaffold a config from your real tables, then run.
+Rivet exports tables from PostgreSQL, MySQL, and SQL Server (and collections from MongoDB) to Parquet (or CSV) files — locally, to S3, GCS, or Azure Blob Storage. Point it at a database, scaffold a config from your real tables, then run. (MongoDB has its own reference: [reference/mongodb.md](reference/mongodb.md).)
 
 ```bash
 brew install panchenkoai/rivet/rivet

@@ -12,7 +12,7 @@
 
 <p align="center"><strong>Make database extraction boring.</strong></p>
 
-<p align="center">One Rust binary, ~18 MB. Extracts PostgreSQL, MySQL, and SQL Server to Parquet/CSV — locally or to S3 / GCS / Azure — without holding long queries open on your production database (chunked reads keep each query short; on PostgreSQL a full export still runs inside one snapshot transaction for consistency — for multi-hour fulls, read from a replica). <strong>Batch snapshots or log-based change data capture.</strong> Resumable, auditable, source-safe.</p>
+<p align="center">One Rust binary, ~18 MB. Extracts PostgreSQL, MySQL, SQL Server, and MongoDB to Parquet/CSV — locally or to S3 / GCS / Azure — without holding long queries open on your production database (chunked/keyset reads keep each query short; on PostgreSQL a full export still runs inside one snapshot transaction for consistency — for multi-hour fulls, read from a replica). <strong>Batch snapshots or log-based change data capture.</strong> Resumable, auditable, source-safe.</p>
 
 > Not sure if Rivet fits your problem? [docs/who-is-this-for.md](docs/who-is-this-for.md) is a 60-second fit-check.
 
@@ -49,7 +49,7 @@ The execution contract behind each of these — what is guaranteed, what is at-l
 
 ## Change data capture
 
-Beyond batch snapshots, Rivet reads the source's **transaction log** — MySQL binlog, a PostgreSQL logical slot, SQL Server change tables — and writes every INSERT / UPDATE / DELETE as typed Parquet/CSV through the same commit seam (destination + content-MD5 + manifest + `_SUCCESS`) the batch path uses. A CDC export lands in your bucket and shows up in `rivet metrics` exactly like a batch one.
+Beyond batch snapshots, Rivet reads the source's **transaction log** — MySQL binlog, a PostgreSQL logical slot, SQL Server change tables, MongoDB change streams — and writes every INSERT / UPDATE / DELETE as typed Parquet/CSV (or, for MongoDB, the JSON-blob document image) through the same commit seam (destination + content-MD5 + manifest + `_SUCCESS`) the batch path uses. A CDC export lands in your bucket and shows up in `rivet metrics` exactly like a batch one.
 
 ![rivet CDC — scaffold a cdc config, capture binlog changes to typed Parquet, read them back as typed rows](https://raw.githubusercontent.com/panchenkoai/rivet/main/docs/gifs/cdc.gif)
 
