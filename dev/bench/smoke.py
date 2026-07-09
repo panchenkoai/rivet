@@ -239,7 +239,8 @@ MS_ENGINE = {
     "clickhouse_fn": None,       # mssql only via ODBC → clickhouse skips
     "odbc_conn": ("Driver={ODBC Driver 18 for SQL Server};Server=127.0.0.1,1433;"
                   "Database=rivet_bench;Uid=sa;Pwd=Rivet_Passw0rd!;TrustServerCertificate=yes;"),
-    "sling_url": "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1433/rivet_bench",
+    # sling's sqlserver connector wants the db as a query param, not a path.
+    "sling_url": "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1433?database=rivet_bench",
     "ingestr_url": "mssql://sa:Rivet_Passw0rd!@127.0.0.1:1433/rivet_bench",
     "qualify": lambda t: f"dbo.{t}",
     "dlt_url": "mssql+pyodbc://sa:Rivet_Passw0rd!@127.0.0.1:1433/rivet_bench?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes",
