@@ -424,8 +424,17 @@ pub(crate) fn host_is_loopback(url: &str) -> bool {
         Some((_, hp)) => hp,
         None => authority,
     };
-    // Host vs port. IPv6 literals are bracketed (`[::1]:5432`); for those the
-    // host is the bracketed span, and any `:` inside is part of the address.
+    // A comma seedlist (`host1:p1,host2:p2` — valid for MongoDB AND multi-host
+    // PostgreSQL) is loopback ONLY if EVERY host is: reading just the first host
+    // let `127.0.0.1:5432,evil.com:5432` dial evil.com in plaintext under the
+    // gate (bug-hunt find). Empty authority ⇒ not loopback (fail closed).
+    !host_port.is_empty() && host_port.split(',').all(one_host_is_loopback)
+}
+
+/// Loopback test for a single `host[:port]` (or bracketed `[ipv6][:port]`).
+fn one_host_is_loopback(host_port: &str) -> bool {
+    // IPv6 literals are bracketed (`[::1]:5432`); the host is the bracketed span,
+    // and any `:` inside is part of the address.
     let host = if let Some(rest) = host_port.strip_prefix('[') {
         match rest.split_once(']') {
             Some((h, _)) => h,
@@ -500,6 +509,26 @@ mod tls_gate_tests {
         assert!(host_is_loopback("mysql://root@LOCALHOST"));
         // An `@` inside the password must not be mistaken for the host boundary.
         assert!(host_is_loopback("postgresql://u:p@ss@127.0.0.1:5432/db"));
+    }
+
+    #[test]
+    fn roast_seedlist_with_any_remote_host_is_not_loopback() {
+        // Multi-host / seedlist authority (`host1:p1,host2:p2`): the TLS gate must
+        // treat it as loopback ONLY if EVERY host is loopback. Reading just the
+        // first host let `127.0.0.1:5432,evil.com:5432` (a valid PostgreSQL and
+        // MongoDB seedlist) pass the gate and dial evil.com in plaintext
+        // (bug-hunt find; the shared gate reaches every engine, PG supports
+        // multi-host URLs).
+        assert!(!host_is_loopback(
+            "postgresql://u:p@127.0.0.1:5432,evil.com:5432/db"
+        ));
+        assert!(!host_is_loopback(
+            "mongodb://u:p@127.0.0.1:27017,evil.com:27017/db"
+        ));
+        // All-loopback seedlist stays loopback.
+        assert!(host_is_loopback(
+            "mongodb://u:p@127.0.0.1:27017,[::1]:27018/db"
+        ));
     }
 
     #[test]

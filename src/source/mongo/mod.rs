@@ -50,6 +50,28 @@ use crate::types::{ColumnOverrides, RivetType, SourceColumn, TypeMapping};
 
 pub(crate) mod cdc;
 
+/// Map rivet's [`TlsConfig`] onto the mongodb driver's `Tls`, mirroring the SQL
+/// engines' posture: `Disable` = plaintext; `Require` = TLS but accept any cert
+/// (sniff-proof, not MITM-proof); `VerifyCa` = verify chain, skip hostname;
+/// `VerifyFull` = verify both. The per-field `accept_invalid_*` flags widen (but
+/// never narrow) the mode. Without this the driver ignored the block entirely.
+fn tls_to_mongo(cfg: &TlsConfig) -> mongodb::options::Tls {
+    use crate::config::TlsMode;
+    use mongodb::options::{Tls, TlsOptions};
+    if matches!(cfg.mode, TlsMode::Disable) {
+        return Tls::Disabled;
+    }
+    // Only `Require` waives certificate verification; `VerifyCa`/`VerifyFull`
+    // both verify the chain. (This driver exposes no hostname-only toggle, so
+    // `VerifyCa` verifies the hostname too — stricter than the SQL engines, never
+    // weaker.) The per-field `accept_invalid_certs` flag widens, never narrows.
+    let mode_invalid_cert = matches!(cfg.mode, TlsMode::Require);
+    let mut o = TlsOptions::default();
+    o.ca_file_path = cfg.ca_file.as_ref().map(std::path::PathBuf::from);
+    o.allow_invalid_certificates = Some(mode_invalid_cert || cfg.accept_invalid_certs);
+    Tls::Enabled(o)
+}
+
 /// A connected MongoDB session: the async client plus the tokio runtime that
 /// drives it, so the sync `Source` trait can `block_on` every driver call
 /// (ADR-0011, mirrors MSSQL/tiberius). This is the **one** place that owns the
@@ -79,7 +101,14 @@ impl MongoSession {
             .enable_all()
             .build()?;
         let (client, db) = rt.block_on(async {
-            let opts = ClientOptions::parse(url).await?;
+            let mut opts = ClientOptions::parse(url).await?;
+            // Honor the `tls:` block. Without this the driver used only the URL's
+            // `?tls=` — so `tls: { mode: verify-full }` on a URL that didn't opt
+            // in connected in PLAINTEXT, the exact posture the operator asked to
+            // forbid (bug-hunt find). `None` ⇒ leave the URL's own tls setting.
+            if let Some(cfg) = tls {
+                opts.tls = Some(tls_to_mongo(cfg));
+            }
             let db = opts.default_database.clone().ok_or_else(|| {
                 anyhow::anyhow!(
                     "mongodb url must include a database: mongodb://user:pass@host:port/<db>"
@@ -758,6 +787,39 @@ mod tests {
         assert_eq!(id_to_string(Some(&Bson::Int32(7))), "7");
         // Never panic / never silently vanish on a missing id.
         assert_eq!(id_to_string(None), "");
+    }
+
+    #[test]
+    fn roast_tls_config_is_honored_not_ignored() {
+        use crate::config::{TlsConfig, TlsMode};
+        use mongodb::options::Tls;
+        let cfg = |mode, ca: Option<&str>| TlsConfig {
+            mode,
+            ca_file: ca.map(String::from),
+            accept_invalid_certs: false,
+            accept_invalid_hostnames: false,
+        };
+        // verify-full: TLS on, verify chain AND hostname, ca wired.
+        match tls_to_mongo(&cfg(TlsMode::VerifyFull, Some("/ca.pem"))) {
+            Tls::Enabled(o) => {
+                assert_eq!(
+                    o.ca_file_path.as_deref(),
+                    Some(std::path::Path::new("/ca.pem"))
+                );
+                assert_eq!(o.allow_invalid_certificates, Some(false));
+            }
+            Tls::Disabled => panic!("verify-full must ENABLE tls, not ignore it"),
+        }
+        // require: TLS on but cert unverified.
+        match tls_to_mongo(&cfg(TlsMode::Require, None)) {
+            Tls::Enabled(o) => assert_eq!(o.allow_invalid_certificates, Some(true)),
+            Tls::Disabled => panic!("require must enable tls"),
+        }
+        // disable: explicit plaintext opt-in.
+        assert!(matches!(
+            tls_to_mongo(&cfg(TlsMode::Disable, None)),
+            Tls::Disabled
+        ));
     }
 
     #[test]
