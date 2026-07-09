@@ -10,8 +10,8 @@ The matrix is derived from the workflows in [.github/workflows/](../.github/work
 
 | Tier | What runs | Trigger | Wall time budget |
 |---|---|---|---|
-| **PR CI** | unit + integration + named semantic gates + e2e + type-golden against live PG/MySQL | every push and PR to `main` | ~10 min |
-| **Nightly** | full live suite incl. content_load against ~60k-row fixture; pgBouncer profile | 03:30 UTC cron + manual dispatch | up to 60 min |
+| **PR CI** | unit + integration + named semantic gates + e2e (incl. PG / MySQL / SQL Server CDC) + type-golden against live PG / MySQL / SQL Server | every push and PR to `main` | ~10 min |
+| **Nightly** | full live suite incl. content_load against ~60k-row fixture; pgBouncer profile; MongoDB version matrix (4.4 → 8.0, batch + CDC) | 03:30 UTC cron + manual dispatch | up to 60 min |
 | **Manual** | 1M-row stress, full legacy DB matrix (PG 12–15, MySQL 5.7), wide-table memory benchmarks | operator-invoked from `dev/` scripts | varies |
 
 PR CI defines branch protection — the named gates (`fmt`, `clippy`, `test`, `test-invariants`, `test-recovery`, `test-compatibility`, `test-stability`) block merges on regression.
@@ -33,6 +33,13 @@ PR CI defines branch protection — the named gates (`fmt`, `clippy`, `test`, `t
 | SQL Server — full export | ✅ | ✅ | ✅ | `live_mssql_resume` (full), `live_mssql_crash_recovery` |
 | SQL Server — incremental (cursor) | ✅ | ✅ | ✅ | `live_mssql_resume`, `live_mssql_crash_recovery` |
 | SQL Server — chunked (range + keyset/seek) | ✅ | ✅ | ✅ | `live_mssql_chunked`, `live_mssql_chunked_recovery` |
+| MongoDB — full snapshot (batch) | — | ✅ | — | `live_mongo`, `live_mongo_crash_recovery` (nightly `mongo-versions` 4.4→8.0) |
+| MongoDB — keyset / parallel / resume | — | ✅ | — | `live_mongo` (JSON-blob model; `mode: full` only) |
+| CDC — PostgreSQL (logical replication slot) | ✅ | ✅ | — | `live_cdc` (PG cases) |
+| CDC — MySQL (binlog) | ✅ | ✅ | — | `live_cdc` (MySQL cases) |
+| CDC — SQL Server (change tables / from-LSN) | ✅ | ✅ | — | `live_cdc_mssql` |
+| CDC — MongoDB (change stream, replica set) | — | ✅ | — | `live_cdc_mongo` (nightly `mongo-versions`) |
+| CDC engine conformance gate (per-engine × case) | ✅ gate | ✅ | — | `cdc_conformance_gate` (offline; fails on missing engine/case) |
 | Cross-DB parity (PG ↔ MySQL same query) | ✅ | ✅ | — | `live_cross_db_parity` |
 
 ---
@@ -119,6 +126,8 @@ Per-backend commit contracts: [ADR-0004](adr/0004-destination-write-contracts.md
 | MySQL | 8.0 | ✅ | ✅ | Primary target |
 | MySQL | 5.7 | — | ✅ | `dev/legacy/run_full_matrix.sh` — known view-syntax gap in `init.sql`, see [reference/compatibility.md](reference/compatibility.md#mysql-57--window-functions) |
 | SQL Server | 2022 | ✅ | ✅ | Primary target; `test-type-validators` (type matrix) + `e2e` (live_mssql_* recovery/resume/reconcile) jobs |
+| MongoDB | 7.0 | — | ✅ | Primary target; nightly `mongo-versions` matrix (dispatchable) |
+| MongoDB | 4.4, 5.0, 6.0, 8.0 | — | ✅ | Nightly `mongo-versions` matrix (batch + CDC); CDC capability tiers — 4.4/5.0 current-state, 6.0+ full pre-images |
 
 Each legacy target runs the full 83-assertion e2e suite when selected. Status table in [reference/compatibility.md](reference/compatibility.md).
 

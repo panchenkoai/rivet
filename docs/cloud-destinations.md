@@ -38,8 +38,8 @@ it over `GET manifest.json` for the "data ready?" signal.
 
 Schema and resume semantics:
 
-- `schema.json` is reserved for v0.9.0 (per-run schema snapshot — see
-  the roadmap).  Today the schema fingerprint lives inside
+- `schema.json` is reserved for a future release (per-run schema
+  snapshot — see the roadmap).  Today the schema fingerprint lives inside
   `manifest.json` under `schema_fingerprint`.
 - `_quarantine/<run_id>/` lands on resume when M9 finds an untracked or
   corrupt part.  The original byte location is preserved under that
@@ -83,7 +83,7 @@ vars; required otherwise.  `endpoint:` overrides the resolved S3 endpoint
 | Mode | Fields | Notes |
 |---|---|---|
 | Account key | `account_name` + `account_key_env` | Long-lived storage-account key. |
-| **SAS token** *(v0.7.2)* | `account_name` + `sas_token_env` | Short-lived, scope-limited credential issued out-of-band. |
+| **SAS token** | `account_name` + `sas_token_env` | Short-lived, scope-limited credential issued out-of-band. |
 | Anonymous | `allow_anonymous: true` | Azurite emulator and public read-only containers only. |
 
 `account_key_env` and `sas_token_env` are **mutually exclusive** — picking
@@ -97,7 +97,7 @@ The Azure SAS-token body may be pasted with or without the leading `?`
 both accepted.
 
 Future Azure modes (Managed Identity, Service Principal, workload
-identity federation) are tracked in the v0.8+ roadmap, not v0.7.x.
+identity federation) are on the roadmap but not yet supported.
 
 ---
 
@@ -146,7 +146,7 @@ recent verified dataset.
 **never queries the source**: only `HEAD` / `GET _SUCCESS` /
 `GET manifest.json` against the resolved destination.
 
-v0.7.2 historical flags:
+Validate flags:
 
 - `--date YYYY-MM-DD` — resolve `{date}` against the given day instead of
   today.  The flag a "did yesterday's run land cleanly?" Airflow sensor
@@ -201,7 +201,7 @@ next resume and the orphan eventually gets moved.
 | Local | path  | ✅ | ✅ | ✅ | ✅ | ✅ |
 | S3    | env / profile / session-token | ✅ | ✅ | ✅ | ✅ | ✅ |
 | GCS   | service-account / env / ADC | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Azure | account-key / **SAS** *(0.7.2)* / anonymous | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Azure | account-key / **SAS** / anonymous | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Stdout | — | — | — | — | — | — |
 
 ---

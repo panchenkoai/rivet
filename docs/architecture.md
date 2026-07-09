@@ -13,7 +13,7 @@ export, start with [getting-started.md](getting-started.md).
 Every export, regardless of mode, follows the same streaming shape:
 
 ```
-Source (PG / MySQL)
+Source (PostgreSQL / MySQL / SQL Server / MongoDB)
   │
   ├─ begin_query / DECLARE CURSOR
   │
@@ -97,10 +97,40 @@ Implementations:
 
 | Trait | Concrete types |
 |-------|----------------|
-| `Source` | `PostgresSource` (DECLARE CURSOR + FETCH N), `MysqlSource` (`query_iter`) |
+| `Source` | `PostgresSource` (DECLARE CURSOR + FETCH N), `MysqlSource` (`query_iter`), `MssqlSource` (tiberius; `OFFSET … FETCH NEXT`), `MongoSource` (JSON-blob: `_id` + `document`) |
 | `Format` | `CsvFormat`, `ParquetFormat` |
 | `FormatWriter` | `CsvWriter` (`csv::Writer`), `ParquetArrowWriter` |
 | `Destination` | `LocalDest`, `S3Dest` (OpenDAL), `GcsDest` (OpenDAL), `AzureDest` (OpenDAL), `StdoutDest` |
+
+---
+
+## Change-data capture seam
+
+Batch export is one shape; log-based change-data capture (`mode: cdc`, and
+the `rivet cdc` command) is the other. It has its own pluggable seam, parallel
+to `Source`: the `ChangeStream` trait in `src/source/cdc/mod.rs`.
+
+```rust
+// A blocking pull of canonical changes. `None` ⇒ no more changes right now.
+pub(crate) trait ChangeStream {
+    fn next_change(&mut self) -> Option<Result<ChangeEvent>>;
+    // Acknowledge that every change up to `position` is durably persisted.
+    // Consume-on-read engines (PostgreSQL slot advance) defer the real consume
+    // here so a crash before a durable write re-reads (at-least-once).
+    fn ack(&mut self, _position: &Position) -> Result<()> { Ok(()) }
+}
+```
+
+All four engines implement it — `PgChangeStream` (logical replication slot),
+`MysqlChangeStream` (binlog), `MssqlChangeStream` (change tables / from-LSN),
+`MongoChangeStream` (change stream, requires a replica set). The factory
+`create_change_stream` dispatches by engine exactly as `create_source` does for
+the batch path. Each adapter yields a canonical `ChangeEvent` (op, schema,
+table, before/after image, resume position); the CDC sink writes the
+after-image typed, prefixed with the meta columns `__op` / `__pos` / `__seq`
+(`__seq` is the total intra-transaction change order for correct current-state
+dedup). Resume is per-engine — PostgreSQL slot, MySQL binlog checkpoint file,
+SQL Server from-LSN, MongoDB resume token — and each is at-least-once.
 
 ---
 
@@ -139,19 +169,19 @@ max_execution_time`, `SET time_zone = '+00:00'`, server-side cursors
 different backend connection — silently making those primitives
 ineffective.
 
-So both drivers detect the wire-level shape of the connection at open
-time and warn once when it is a pooler / proxy, rather than letting the
-operator find out later through an inexplicably long-running query or
-session-state leak:
+So the SQL drivers (PostgreSQL, MySQL, SQL Server) detect the wire-level
+shape of the connection at open time and warn once when it is a pooler /
+proxy / gateway, rather than letting the operator find out later through
+an inexplicably long-running query or session-state leak:
 
 - **Postgres** — `detect_pg_transaction_pooler` in
-  `src/source/postgres.rs` compares `pg_backend_pid()` across two
+  `src/source/postgres/mod.rs` compares `pg_backend_pid()` across two
   consecutive queries. Different PIDs imply transaction-mode pooling
   (pgBouncer, Odyssey). The warning explicitly names what does not
   work: `SET LOCAL` is transaction-scoped, advisory locks / `LISTEN`
   are unavailable.
 
-- **MySQL** — `classify_mysql_proxy` in `src/source/mysql.rs` is a pure
+- **MySQL** — `classify_mysql_proxy` in `src/source/mysql/proxy.rs` is a pure
   classifier over four signals, in this precedence order:
   1. `PROXYSQL INTERNAL SESSION` accepted as a query (strongest —
      ProxySQL intercepts this on its client port; vanilla MySQL returns
@@ -167,6 +197,18 @@ session-state leak:
   Multiplexed }`. The non-`Direct` variants log a one-time warning
   describing the specific risk (session-state non-persistence, query
   rewriting, etc.).
+
+- **SQL Server** — `classify_mssql_proxy` in `src/source/mssql/proxy.rs`
+  is a pure classifier over the same shape, in precedence order:
+  1. `@@SPID` differs across two consecutive queries → `Multiplexed`
+     (statement-level connection multiplexing — the session-scoped
+     primitives do not persist).
+  2. `SERVERPROPERTY('EngineEdition')` of `5` (Azure SQL DB) or `8`
+     (Managed Instance), or an Azure `@@VERSION` banner → `AzureGateway`
+     (the connection may be redirected through the gateway).
+
+  It yields `MssqlProxyKind { Direct, Multiplexed, AzureGateway }`; the
+  non-`Direct` variants log a one-time warning as above.
 
 This detection is best-effort and intentionally never fails an export —
 it gives the operator one observable line in the logs. The session
@@ -218,15 +260,26 @@ src/
     memory.rs               estimate_row_bytes + compute_batch_size_from_memory
     adaptive.rs             ADAPTIVE_SAMPLE_INTERVAL + next_adaptive_batch_size feedback loop
 
-  source/                 Database drivers, query shaping, pooler detection
+  source/                 Database drivers, query shaping, pooler detection, CDC
     mod.rs                  Source / BatchSink traits; ExportRequest; TableIntrospection;
                               create_source factory; warn_if_tls_disabled
-    postgres.rs             DECLARE CURSOR + FETCH N; PgTxnGuard (RAII); detect_pg_transaction_pooler
-    mysql.rs                query_iter; MysqlProxyKind (Direct/ProxySql/MaxScale/Multiplexed);
-                              classify_mysql_proxy 4-signal classifier
+    batch_controller.rs     Shared batch-loop driver (fetch → sink → throttle) across engines
+    postgres/               DECLARE CURSOR + FETCH N; PgTxnGuard (RAII); detect_pg_transaction_pooler
+      mod.rs, arrow_convert.rs, from_parse.rs, cdc.rs (PgChangeStream — logical slot)
+    mysql/                  query_iter; MysqlProxyKind (Direct/ProxySql/MaxScale/Multiplexed)
+      mod.rs, arrow_convert.rs, proxy.rs (classify_mysql_proxy), cdc.rs (MysqlChangeStream — binlog)
+    mssql/                  tiberius OFFSET/FETCH + keyset; MssqlProxyKind (Direct/Multiplexed/AzureGateway)
+      mod.rs, arrow_convert.rs, proxy.rs (classify_mssql_proxy), cdc.rs (MssqlChangeStream — change tables)
+    mongo/                  JSON-blob model (_id + document); keyset / parallel / resume; full + cdc only
+      mod.rs, cdc.rs (MongoChangeStream — change stream, replica set)
+    cdc/                    Engine-neutral CDC seam
+      mod.rs                  ChangeStream trait + ChangeEvent + create_change_stream factory
+      sink.rs                 Typed after-image sink (__op / __pos / __seq meta columns)
+      validate.rs, value.rs   Descent validation + canonical RivetValue → JSON rendering
     pg_numeric_wire.rs      NUMERIC wire-format decoding (preserves precision through subquery wrap)
     query.rs                build_incremental_query (dialect-specific WHERE/ORDER BY injection)
     tls.rs                  Postgres native-tls connector builder (verify-full / verify-ca / require)
+    value_checksum.rs       Per-value integrity checksum (decoded-value → file)
 
   format/                 Streaming writers
     mod.rs, csv.rs, parquet.rs
@@ -304,12 +357,15 @@ docs/                     User-facing documentation (this tree)
 ```
 
 The shape of this tree is mostly stable — feature work usually extends
-an existing module. Recent moves (v0.5.3 → v0.6.0) reduced the
+an existing module. Earlier moves (v0.5.3 → v0.6.0) reduced the
 number of multi-purpose files: `tuning.rs` (678 LoC) → `tuning/` (4
 files), `cli/mod.rs` (~1000 LoC) → `cli/` (4 files), `journal.rs`
 moved from `pipeline/` to a top-level crate module, and `mcp.rs` now
 ships as a separate `rivet-mcp` binary rather than a `rivet mcp`
-subcommand.
+subcommand. The `source/` tree since grew from two flat driver files
+(`postgres.rs`, `mysql.rs`) into a per-engine directory each with its
+own `arrow_convert.rs` and `cdc.rs`, plus SQL Server (`mssql/`),
+MongoDB (`mongo/`), and the engine-neutral `cdc/` seam.
 
 ---
 

@@ -8,6 +8,12 @@ Use `mode: full` when you want a complete snapshot of the query result set every
 - Reference/dimension tables that need a fresh copy each day
 - One-time data migrations
 
+> **MongoDB.** `full` is MongoDB's primary batch mode — the SQL-runner modes
+> (`incremental` / `chunked` / `time_window`) do not apply to a document store.
+> Within `full`, MongoDB adds keyset (seek) paging, `parallel: N` `_id`-range
+> fan-out, and resume — all keyed on `_id` (`source.mongo.page_size` /
+> `parallel`). See [../reference/mongodb.md](../reference/mongodb.md).
+
 ## Minimal config
 
 ```yaml

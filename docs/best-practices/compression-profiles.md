@@ -1,7 +1,7 @@
 # Compression Profiles
 
-Rivet v0.5.0 adds `compression_profile` — a high-level intent-based way to
-choose a compression codec without knowing the specific codec name or level.
+Rivet's `compression_profile` is a high-level, intent-based way to choose a
+compression codec without knowing the specific codec name or level.
 
 ---
 

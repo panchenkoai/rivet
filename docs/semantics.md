@@ -10,7 +10,7 @@ This page is a user-facing summary. The binding contracts live in the [ADRs](adr
 
 This document describes guarantees and known non-guarantees for:
 
-- single-table exports (full, incremental, chunked, time-window),
+- single-table exports (full, incremental, chunked, time-window, cdc),
 - destination writes (local, S3, GCS, Azure Blob Storage, stdout),
 - state and journal updates,
 - automatic retries and `--resume` after crashes,
@@ -27,7 +27,7 @@ It does not cover database / network / disk failures whose mode is external to R
 |---|---|
 | **Run** | One invocation of `rivet run`. Has a unique `run_id`. Produces zero or more output files. |
 | **Export** | A named entry in `rivet.yaml` — a query + cursor + destination triple. One run executes one or many exports. |
-| **Mode** | `full`, `incremental`, `chunked`, `time_window`. See [docs/modes/](modes/). |
+| **Mode** | `full`, `incremental`, `chunked`, `time_window`, `cdc`. See [docs/modes/](modes/). |
 | **Batch** | One `FETCH` worth of rows materialized as an Arrow `RecordBatch`. Streamed; never accumulated in memory. |
 | **Chunk** | A row range (chunked mode) processed as one unit. Produces one output file. Has a checkpoint row in the state DB. |
 | **Cursor** | The last extracted value for incremental exports. Stored in `export_state.last_cursor_value`. |
@@ -60,12 +60,12 @@ The exact state-write ordering is defined by **[ADR-0001 — State Update Invari
 
 Retries are classified by error type in [src/pipeline/retry.rs](../src/pipeline/retry.rs):
 
+The classifier (`RetryClass`) has two outcomes — `Transient` (retry) and `Permanent` (propagate):
+
 | Class | Examples | Retried? |
 |---|---|---|
-| `Transient` | connection reset, server timeout, S3 5xx | Yes — exponential backoff up to `tuning.max_retries` |
-| `RateLimit` | 429, S3 SlowDown | Yes — backoff respects retry-after when present |
-| `Fatal` | syntax error, auth failure, schema mismatch | No — bubble up immediately |
-| `Unknown` | uncategorized | Yes — bounded retries with backoff |
+| `Transient` | connection reset, "server has gone away", lock-wait timeout, deadlock / serialization failure, "too many connections", cloud `(temporary)` writes (S3 / GCS) | Yes — exponential backoff up to `tuning.max_retries`. The variant carries `needs_reconnect` (reopen the source connection first — e.g. a network reset or `08xxx` SQLSTATE) and `extra_delay_ms` (an added settling delay for capacity errors like "too many connections" / "database system is starting up") |
+| `Permanent` | syntax error, auth failure, missing table / column, a statement-*duration* timeout (`statement_timeout` / `max_execution_time`) | No — propagates immediately. **Uncategorized errors default to `Permanent`** (they are *not* retried) |
 
 A retried batch starts from the **same cursor position** as the failed attempt — see ADR-0001 I3 (Write Before Cursor). At-least-once delivery to the destination is therefore possible: on retry after a destination write succeeded but the cursor failed to advance, the same rows are written again, producing a duplicate file.
 

@@ -8,14 +8,14 @@ Rivet's test suite is organised into two tiers, selected by the standard
 | Tier | Selection | Infrastructure required | What it covers |
 |------|-----------|-------------------------|----------------|
 | **Offline** | `cargo test` | none | Unit tests, pure-function property/fuzz smoke, state-layer contracts, format round-trip, CLI help snapshots, invariants I1–I7, F1–F5 crash-boundary F-matrix, validation regressions |
-| **Live** | `cargo test -- --ignored` | `docker compose up -d` | Full rivet binary against real Postgres/MySQL, MinIO (S3), fake-gcs, Toxiproxy; Parquet round-trip E2E; **type/trust golden** DB → rivet → Parquet → Arrow read-back (postgres + mysql); cross-database parity; destination parity; resume; retry and mid-stream faults; schema drift; performance smoke; crash-point recovery matrix |
+| **Live** | `cargo test -- --ignored` | `docker compose up -d` | Full rivet binary against real Postgres/MySQL/SQL Server/MongoDB, MinIO (S3), fake-gcs, Toxiproxy; Parquet round-trip E2E; **type/trust golden** DB → rivet → Parquet → Arrow read-back (postgres + mysql); cross-database parity; destination parity; resume; retry and mid-stream faults; schema drift; performance smoke; crash-point recovery matrix |
 
 Both tiers run in CI (`.github/workflows/ci.yml`):
 
 - Offline suite runs in the `test` / `test-invariants` / `test-recovery` / `test-compatibility` jobs on every push and PR.
 - Live suite runs in two dedicated jobs:
   - **`test-type-golden`** — starts only Postgres + MySQL, runs `--test live_type_golden -- --ignored`. Named branch-protection gate for type-contract regressions.
-  - **`e2e`** — full stack (Postgres, MySQL, MinIO, fake-gcs, Toxiproxy); seeds databases, builds release binary, runs `dev/e2e/run_e2e.sh`, then runs all remaining `--ignored` tests.
+  - **`e2e`** — full stack (Postgres, MySQL, SQL Server, MinIO, fake-gcs, Azurite, Toxiproxy, plus DuckDB/ClickHouse targets and the `cdc` / `replica` / `pool` compose profiles); seeds databases, builds release binary, runs `dev/e2e/run_e2e.sh`, then runs all remaining `--ignored` tests **except the MongoDB suites** (`live_mongo*` / `live_cdc_mongo`), which run in the dedicated nightly `mongo-versions` matrix (4.4 → 8.0, `nightly-live.yml`).
 
 ## Offline suite
 
@@ -71,7 +71,7 @@ cargo test -- --ignored
 | File | Domain | QA backlog task |
 |------|--------|-----------------|
 | `live_harness_canary.rs` | Reachability probe for every service (Postgres primary + via Toxiproxy, MySQL primary + via Toxiproxy, MinIO, fake-gcs, Toxiproxy admin); harness sanity (`PgTable`/`MysqlTable` RAII guards, `unique_name` no-collision, `CARGO_BIN_EXE_rivet` visibility) | Phase A |
-| [`type_roundtrip`](../tests/type_roundtrip/) (`make test-types` / `make test-types-live`) | v0.7.8 type matrix: offline YAML contracts + live PG/MySQL × Parquet/CSV | [`docs/type-mapping.md`](../type-mapping.md) |
+| [`type_roundtrip`](../tests/type_roundtrip/) (`make test-types` / `make test-types-live`) | 0.18.0 type matrix: offline YAML contracts + live PG/MySQL × Parquet/CSV | [`docs/type-mapping.md`](../type-mapping.md) |
 | [`live_type_golden.rs`](#trust-milestone-type-golden-round-trip) | Trust & reproducibility: **paired** Postgres *and* MySQL golden pipelines | Trust milestone §1 (“Golden E2E for type safety”); complements `live_parquet_roundtrip.rs` |
 | `live_parquet_roundtrip.rs` | Postgres → rivet → Parquet → reader; schema/row-count/nullability/unicode/empty-dataset contracts; `--validate` flag | Task 2.2 |
 | `live_cross_db_parity.rs` | Same dataset via Postgres vs MySQL under full and chunked modes; row-count and id-set equivalence | Task 3.3 |
@@ -82,6 +82,9 @@ cargo test -- --ignored
 | `live_schema_drift.rs` | Added column / removed column / stable schema — detection flag in `export_metrics.schema_changed` | Task 7.1, 7.2 |
 | `live_performance_smoke.rs` | 5 000-row + 200B payload finishes within 30 s; split-by-size produces multiple files with no row loss; parallel-4 chunked export materialises every id exactly once | Task 9.1, 9.2 |
 | `live_crash_recovery.rs` | Four fault points (`after_source_read`, `after_file_write`, `after_manifest_update`, `after_cursor_commit`) × expected post-crash state × recovery run | Task 1.1 |
+| `live_mongo*.rs` | MongoDB batch (JSON-blob `_id` + `document`): distinct-`_id` set vs source, verbatim document round-trip, crash recovery, retry/faults, permission-harm | – |
+| `live_mssql_*.rs` | SQL Server batch: chunked (range + keyset), resume, crash recovery, reconcile/repair — twins of the Postgres/MySQL suites | – |
+| `live_cdc*.rs` | CDC capture/resume for all four engines (`live_cdc.rs`, `live_cdc_mongo.rs`, `live_cdc_mssql.rs`, plus golden/oracle/property/MBT) — at-least-once, no gap/dup | – |
 
 ### Trust milestone: type golden round-trip
 
@@ -153,7 +156,7 @@ check `.github/workflows/ci.yml` for the exact invocation.
 
 ## Shell regression matrices
 
-Binary-level regression guards under [`dev/matrices/`](../dev/matrices/README.md)
+Binary-level regression guards under [`dev/matrices/`](../../dev/matrices/README.md)
 complement the Rust integration tests above. They drive the release `rivet`
 binary through fixture scenarios and diff stdout/stderr/exit codes, file
 layouts, EXPLAIN plans, and perf thresholds against committed baselines.
@@ -163,7 +166,7 @@ bash dev/matrices/setup_links.sh   # one-time
 dev/matrices/run.sh --tier=pr      # cli + cfg + path (PR CI)
 ```
 
-See [`dev/matrices/README.md`](../dev/matrices/README.md) for the full taxonomy
+See [`dev/matrices/README.md`](../../dev/matrices/README.md) for the full taxonomy
 and tier map.
 
 ## QA / roadmap alignment

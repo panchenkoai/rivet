@@ -1,7 +1,7 @@
 # Cloud destination authentication
 
 Rivet talks to S3 / GCS / Azure Blob Storage via [opendal](https://opendal.apache.org/).
-Three supported AWS auth flows, three GCS flows, and two Azure flows are
+Three supported AWS auth flows, three GCS flows, and three Azure flows are
 documented below, each with the exact rivet config + shell setup, plus
 a "what NOT to use" note for the common confused-by-AWS-CLI-v2 case.
 
@@ -200,7 +200,7 @@ field carries the container name (rivet keeps a single field for the
 
 ### Path A — Storage account name + account key
 
-The primary auth flow for the 0.7.1 MVP.  Account key is a long-lived
+The primary, simplest auth flow.  Account key is a long-lived
 secret string from the Azure portal (Storage account → Access keys → key1
 or key2).  Rotate it via the portal; rivet wipes the in-memory copy on
 drop via `Zeroizing`.
@@ -246,19 +246,48 @@ destination:
 Use it only for emulators or genuinely public read-only containers; rivet
 will refuse to combine `allow_anonymous: true` with explicit credentials.
 
-### What NOT to use yet (planned for 0.7.2)
+### Path C — SAS token
 
-The 0.7.1 release only ships the static account-key path.  These flows
-will land in 0.7.2 as additive config fields (no breaking changes):
+A Shared Access Signature (SAS) token scopes access to a specific
+container and time window — useful when you can't or shouldn't hand out
+the full account key.  `account_key_env` and `sas_token_env` are
+**mutually exclusive**; rivet refuses a config that sets both.
 
-- **SAS token** (`sas_token_env`) — pre-signed URLs, time-limited scope.
+Shell:
+
+```bash
+export AZURE_STORAGE_SAS_TOKEN="sv=2021-08-06&ss=b&srt=o&sp=rwdlacupitfx&se=2026-06-01T00:00:00Z&spr=https&sig=..."
+```
+
+Rivet config:
+
+```yaml
+destination:
+  type: azure
+  bucket: my-container
+  account_name: mystorageacct
+  sas_token_env: AZURE_STORAGE_SAS_TOKEN
+```
+
+The leading `?` is stripped automatically if you paste the token straight
+from the Azure portal.  Rivet parses the `se=` (signed-expiry) field at
+startup and fails fast on an already-expired token (and warns within 60
+minutes of expiry) — see
+[destinations/azure.md](destinations/azure.md#option-3-sas-token-added-in-072)
+for the full preflight behaviour.
+
+### Not yet supported
+
+These AAD-based flows are on the roadmap but not yet shipped; use Path A
+or Path C today:
+
 - **Service principal** (`tenant_id`, `client_id`, `client_secret_env`) — for unattended automation.
 - **Managed identity** — for rivet running inside Azure VMs / AKS / Functions.
 - **Connection string** (`connection_string_env`) — the all-in-one
   `DefaultEndpointsProtocol=https;AccountName=…;AccountKey=…` blob.
 
-Until those land, the bridge from any of the above to rivet is: extract
-the `AccountKey` value into an env var and use Path A.
+To bridge a connection string today, extract the `AccountKey` value into
+an env var and use Path A.
 
 ---
 
@@ -305,4 +334,4 @@ S3-compatible API gives them all the same authentication path.
 - **Local dev → real GCS**: Path A with `gcloud auth application-default login`.
 - **Production → GCS**: Path B with a service account JSON.
 - **Local dev → Azurite**: Azure Path B (`allow_anonymous: true`, `endpoint: http://127.0.0.1:10000/devstoreaccount1`).
-- **Production → Azure Blob Storage**: Azure Path A with `account_key_env` sourced from your secret store (Key Vault, doppler, sops, etc.).  SAS / Service Principal flows land in 0.7.2.
+- **Production → Azure Blob Storage**: Azure Path A with `account_key_env` sourced from your secret store (Key Vault, doppler, sops, etc.), or Path C with a scoped SAS token.  Service Principal / Managed Identity are not yet supported.

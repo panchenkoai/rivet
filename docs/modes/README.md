@@ -9,6 +9,7 @@ guide for the mode you land on.
 - **Append-only or has an `updated_at`, want only new/changed rows** → [`incremental`](incremental.md)
 - **Millions+ of rows, want speed and crash-resume** → [`chunked`](chunked.md)
 - **Only the last N days matter (event/log table)** → [`time_window`](time-window.md)
+- **Continuous low-latency replication from the WAL / binlog / oplog** → [`cdc`](../reference/cdc.md)
 
 When in doubt, `rivet init` inspects the table and picks a sensible default for
 you (small → `full`, large with an integer key → `chunked`).
@@ -21,6 +22,7 @@ you (small → `full`, large with an integer key → `chunked`).
 | [**incremental**](incremental.md) | only rows past the saved cursor | yes (cursor) | no | exports everything, then deltas |
 | [**chunked**](chunked.md) | tables too large for one `full` scan | yes (checkpoint, `--resume`) | yes | full, split into ranges |
 | [**time_window**](time-window.md) | rolling N-day window | no (recomputed each run) | no | the window only |
+| [**cdc**](../reference/cdc.md) | continuous log-based change capture | yes (resume checkpoint) | yes (multiplexed streams) | optional initial snapshot, then stream |
 
 Notes worth knowing before you run:
 
@@ -33,5 +35,9 @@ Notes worth knowing before you run:
 - **Composite cursors** are an `incremental` variant, not a separate mode — see
   [incremental-coalesce.md](incremental-coalesce.md) when one timestamp column
   isn't enough.
+- **Source engine matters.** The SQL sources (PostgreSQL, MySQL, SQL Server)
+  support every mode. **MongoDB**, a document store, supports only `full` (with
+  keyset / parallel / resume paging on `_id`) and `cdc` — see
+  [../reference/mongodb.md](../reference/mongodb.md).
 
 Full configuration reference: [../reference/](../reference/).

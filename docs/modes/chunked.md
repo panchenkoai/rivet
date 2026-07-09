@@ -250,6 +250,11 @@ snapshot. That left a real hole: such tables could only be exported as one
 long-held `SELECT *` (the exact "don't hold a long query on prod" risk Rivet
 exists to avoid).
 
+> **MongoDB** has the same shape, but under `mode: full` (a document store has
+> no `chunked` mode): `source.mongo.page_size` enables keyset (seek) paging on
+> `_id`, `parallel: N` fans out over disjoint `_id` ranges, and both resume on
+> `_id`. See [../reference/mongodb.md](../reference/mongodb.md).
+
 **Keyset pagination** closes it. Rivet pages the table by a unique, NOT NULL,
 **index-backed** key:
 

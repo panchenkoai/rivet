@@ -1,6 +1,6 @@
 # Resource-Aware Extraction
 
-Rivet v0.5.0 added explicit controls over how much memory a single export is
+Rivet gives you explicit controls over how much memory a single export is
 allowed to use. This guide explains the mental model, the available knobs, and
 the recommended defaults for common scenarios.
 

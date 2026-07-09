@@ -1,4 +1,4 @@
-_Last updated: 2026-06-13._
+_Last updated: 2026-07-09._
 
 # Getting Started
 
@@ -181,7 +181,7 @@ More failure modes (retries, schema drift, crash/resume) and exactly what rivet 
 
 | When you need to … | Go to |
 |---|---|
-| Pick the right export mode for each table | [modes/](modes/) — full · incremental · chunked · time_window |
+| Pick the right export mode for each table | [modes/](modes/) — full · incremental · chunked · time_window · cdc |
 | Configure S3 / GCS / Azure / stdout destinations | [destinations/](destinations/) |
 | Look up a YAML field or a CLI flag | [reference/config.md](reference/config.md) · [reference/cli.md](reference/cli.md) |
 | Understand `run_id` / cursor / chunk / manifest / journal | [concepts.md](concepts.md) |

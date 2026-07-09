@@ -4,6 +4,11 @@ Practical guidance for using Rivet's resource-aware extraction capabilities.
 These guides go beyond the reference documentation to explain *why* settings
 matter and *when* to use them.
 
+The tuning, quality, and compression settings shown here apply to every Rivet
+source (PostgreSQL, MySQL, SQL Server, MongoDB) and every mode (`full`,
+`incremental`, `chunked`, `time_window`, `cdc`) — the quick-start examples below
+use PostgreSQL + `incremental` only for concreteness.
+
 | Guide | What it covers |
 |---|---|
 | [Resource-aware extraction](resource-aware-extraction.md) | Memory budgets, batch cap policies (`warn`/`fail`/`auto_shrink`), RSS formula |

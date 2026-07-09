@@ -37,7 +37,7 @@ Enough for a serious first pass: validated config, successful run, optional plan
 
 1. **Read once:** [Production checklist](production-checklist.md) — access model, TLS, pooler/proxy detection, tuning, destinations. Skim before pointing at production.
 2. **Scaffold:** `rivet init` → YAML + optional `discovery.json` (walkthrough Step 1).
-3. **Author config:** match mode to the table — `full` / `incremental` / `chunked` / `time_window`. For reconcile + repair later, use `chunked` with `chunk_checkpoint: true` (walkthrough Step 2).
+3. **Author config:** match mode to the table — `full` / `incremental` / `chunked` / `time_window` / `cdc`. For reconcile + repair later, use `chunked` with `chunk_checkpoint: true` (walkthrough Step 2).
 4. **Preflight:** `rivet doctor` + `rivet check` on the final YAML.
 5. **Execute:** `rivet plan` → `rivet run` and/or `rivet apply` (walkthrough Steps 3–4).
 

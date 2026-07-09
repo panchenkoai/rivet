@@ -36,12 +36,14 @@ For the full internal acceptance test plan with detailed suites and smoke-test s
 - [ ] Incremental mode: only new/updated rows on subsequent runs
 - [ ] Chunked mode: all chunks complete, `rivet state chunks` shows no pending tasks
 - [ ] Time-window mode: only rows within the configured window
+- [ ] CDC mode (if used): changes streamed to the destination as they occur; a second run resumes from the checkpoint and captures only new changes (PostgreSQL / MySQL / SQL Server / MongoDB)
 
 ## Destinations
 
 - [ ] Local: files written to correct path
 - [ ] S3 (if used): files visible in bucket with correct prefix
 - [ ] GCS (if used): files visible in bucket with correct prefix
+- [ ] Azure (if used): files visible in container with correct prefix
 
 ## Plan/Apply (if using auditable execution)
 

@@ -210,7 +210,7 @@ For most real tables the actual per-row size falls between these two bounds. The
 | Compression buffers in the Parquet writer | Adds 50–200 MB on top of the Arrow batch size |
 | Tokio runtime, connection pool, jemalloc | Adds 50–150 MB baseline overhead |
 
-**How to get a precise number:** run `rivet run` once with `RUST_LOG=info` against a representative sample, then check the `peak_rss` in the logged summary or in `rivet state metrics`. That measured value from your actual data is more reliable than any pre-run estimate.
+**How to get a precise number:** run `rivet run` once with `RUST_LOG=info` against a representative sample, then check the `peak_rss` in the logged summary or in `rivet metrics`. That measured value from your actual data is more reliable than any pre-run estimate.
 
 **Planned enhancement:** a future `rivet plan --sample N` flag will query up to N rows to compute a data-driven row-width estimate. This will narrow the uncertainty for variable-width schemas without a full table scan.
 

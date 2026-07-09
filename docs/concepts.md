@@ -1,4 +1,4 @@
-_Last updated: 2026-05-19._
+_Last updated: 2026-07-09._
 
 # Concepts
 
@@ -21,7 +21,7 @@ The same export can be extracted by many runs over time. Each run gets its own `
 
 | Term | What it is | Used by |
 |---|---|---|
-| **Mode** | The extraction strategy: `full` (re-export everything), `incremental` (only rows newer than the last cursor), `chunked` (split a big table into N range chunks), `time_window` (rolling N-day window). | One per export. See [modes/](modes/). |
+| **Mode** | The extraction strategy: `full` (re-export everything), `incremental` (only rows newer than the last cursor), `chunked` (split a big table into N range chunks), `time_window` (rolling N-day window), `cdc` (change data capture — inserts/updates/deletes captured to Parquet/CSV files from the source's replication log, resuming from the last committed log position each run). | One per export. See [modes/](modes/). |
 | **Batch** | One `FETCH` worth of rows materialised as an Arrow `RecordBatch`. Streamed and discarded — never accumulated in memory. Controlled by `tuning.batch_size` (rows) or `tuning.batch_size_memory_mb` (memory budget). | Every mode. The `batch_size` setting is what protects your source DB from a single huge fetch. |
 | **Chunk** | A row-range slice of a chunked export (e.g. `id BETWEEN 0 AND 50000`). Each chunk runs as its own SQL `SELECT` and produces its own output file. Has a checkpoint row in the state DB so a crashed chunked run can `--resume` without re-exporting completed chunks. | Only `mode: chunked`. |
 | **Cursor** | The last extracted value for incremental exports (a number, timestamp, or composite tuple). Next run starts from `> cursor`. | Only `mode: incremental` and the after-the-fact cursor recorded by `mode: chunked` runs. |
@@ -31,7 +31,7 @@ The same export can be extracted by many runs over time. Each run gets its own `
 
 | Term | What it is | Table in `.rivet_state.db` | CLI |
 |---|---|---|---|
-| **File log** | The per-export ledger of files actually written — file name, row count, bytes, format, compression. Authoritative answer to "what files did this export produce?" Renamed from `file_manifest` in schema v8; the **Manifest** term is reserved for the forthcoming 0.7.0 cloud-output JSON contract. | `file_log` | `rivet state files --export NAME` |
+| **File log** | The per-export ledger of files actually written — file name, row count, bytes, format, compression. Authoritative answer to "what files did this export produce?" Renamed from `file_manifest` in schema v8; the **Manifest** term now names the per-output-prefix `manifest.json` cloud-output contract that ships today (written alongside `_SUCCESS` in each destination prefix; carries per-part `content_fingerprint` for idempotent downstream loads). | `file_log` | `rivet state files --export NAME` |
 | **Metrics** | One row per run per export — `run_id`, status, rows, bytes, duration, peak RSS, retries, validation / reconcile result. Authoritative answer to "how did this export perform over time?" | `export_metrics` | `rivet metrics --export NAME --last N` |
 | **Journal** | Per-run event stream — every chunk start / complete / fail, every retry, every quality-gate decision, the first-line error text. Authoritative answer to "what happened during this *specific* run?" | `run_journal` table + per-run `*.jsonl` on disk | `rivet journal --export NAME --run_id ID` |
 | **Progression** | The committed / verified boundary per export — for chunked, the highest contiguous chunk index that fully succeeded; for incremental, the high-water cursor value that has been reconciled. **Advisory only** (operator-readable; nothing in the pipeline depends on it). | `export_progression` | `rivet state progression` |
@@ -62,7 +62,7 @@ You can stick with `rivet run` for everything; plan/apply is only there when you
 
 | Term | What it is |
 |---|---|
-| **Pool detector** | At connect time Rivet probes for connection pooling and warns about subtle failure modes. PG: a PID-flip probe (`pg_backend_pid()` twice) flags pgBouncer / Odyssey in **transaction** mode — LISTEN/NOTIFY and advisory locks won't survive. MySQL: a 4-signal classifier (`PROXYSQL INTERNAL SESSION` accepted · `@@version_comment` banner · `@@proxy_version` presence · `CONNECTION_ID()` drift) distinguishes `Direct` / `ProxySql` / `MaxScale` / `Multiplexed`. All Postgres tuning uses `SET LOCAL` inside an RAII-guarded `BEGIN…COMMIT` so session state is never leaked into the pool. Demo: [pool-detect.gif](gifs/pool-detect.gif). |
+| **Pool detector** | At connect time Rivet probes for connection pooling and warns about subtle failure modes. PG: a PID-flip probe (`pg_backend_pid()` twice) flags pgBouncer / Odyssey in **transaction** mode — LISTEN/NOTIFY and advisory locks won't survive. MySQL: a 4-signal classifier (`PROXYSQL INTERNAL SESSION` accepted · `@@version_comment` banner · `@@proxy_version` presence · `CONNECTION_ID()` drift) distinguishes `Direct` / `ProxySql` / `MaxScale` / `Multiplexed`. SQL Server: `@@SPID` drift across two consecutive queries on one connection flags a transaction-mode multiplexer (`Multiplexed`); `SERVERPROPERTY('EngineEdition')` of `5` / `8` (or an Azure `@@VERSION` banner) flags the `AzureGateway` fronting Azure SQL DB / Managed Instance. All Postgres tuning uses `SET LOCAL` inside an RAII-guarded `BEGIN…COMMIT` so session state is never leaked into the pool. Demo: [pool-detect.gif](gifs/pool-detect.gif). |
 | **MCP server** | A separate binary, `rivet-mcp`, that speaks Model Context Protocol over stdin/stdout. Exposes read-only DB introspection tools (`pg_stat_activity`, checkpoint pressure, `pg_stat_statements` I/O, MySQL processlist, pgBouncer diagnostics) to MCP clients like Claude Desktop and Claude Code. Read-only — no DDL, no writes. Source: `src/bin/rivet-mcp.rs` + `src/mcp.rs`. |
 
 ## Where each concept is exercised in the code
@@ -82,5 +82,5 @@ If you want to track a concept from this glossary back to the implementation:
 
 - [getting-started.md](getting-started.md) — the 5-minute install + first export, if you skipped it
 - [semantics.md](semantics.md) — the binding execution contract (what's at-least-once, what survives crashes)
-- [modes/](modes/) — when to pick `full` vs `incremental` vs `chunked` vs `time_window`
+- [modes/](modes/) — when to pick `full` vs `incremental` vs `chunked` vs `time_window` vs `cdc`
 - [adr/](adr/) — every contract in this glossary has a numbered ADR with the rationale

@@ -2,6 +2,8 @@
 
 Tuning controls how Rivet queries the source database: batch sizes, timeouts, throttling, and retries.
 
+> **MongoDB sources** don't use the SQL tuning on this page — a document store has no chunked mode, `batch_size`, or `chunk_size`. Mongo's tuning levers are the driver connection pool and `parallel: N` `_id`-range fan-out; see [MongoDB → Connection pool & parallel tuning](mongodb.md#connection-pool).
+
 ## Where to place tuning
 
 Tuning can be set at two levels:
