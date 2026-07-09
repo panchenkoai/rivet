@@ -53,6 +53,13 @@ fn parse_pos(s: &str) -> Option<PosKey> {
         let pos = pos.as_u64()?;
         return Some(PosKey::Binlog(file.to_string(), pos));
     }
+    // MongoDB change-stream position `{"_data": <hex>, "rt": <hex>}`: `_data` is
+    // the resume-token keystring, order-preserving under lexical compare (oplog
+    // order). Key on it — a `Utf8` string key, like a generic LSN. Without this
+    // arm `rivet validate --depth full` failed on every healthy mongo CDC output.
+    if let Some(data) = v.get("_data").and_then(|x| x.as_str()) {
+        return Some(PosKey::Lsn(data.to_string()));
+    }
     let lsn = v.get("lsn").and_then(|x| x.as_str())?;
     if let Some((hi, lo)) = lsn.split_once('/') {
         let hi = u64::from_str_radix(hi, 16).ok()?;
@@ -167,6 +174,20 @@ mod tests {
             parse_pos(r#"{"lsn":"3C/FFFFFFFF"}"#).unwrap()
                 < parse_pos(r#"{"lsn":"3D/0"}"#).unwrap()
         );
+    }
+
+    #[test]
+    fn roast_mongo_pos_parses_and_orders_by_data_keystring() {
+        // MongoDB `__pos` is `{"_data": <hex>, "rt": <hex>}` — before the mongo
+        // arm parse_pos returned None and `validate` hard-failed every healthy
+        // mongo CDC output. Key on `_data`, the order-preserving resume keystring.
+        let a = r#"{"_data":"826A4E0001","rt":"0eFFFFFF"}"#;
+        let b = r#"{"_data":"826A4E0002","rt":"0e00"}"#;
+        assert!(parse_pos(a).is_some(), "mongo __pos must parse");
+        // Ordering follows `_data`, NOT `rt`: here b's `_data` > a's `_data` even
+        // though b's `rt` sorts before a's — the exact mis-order a rt-first
+        // `__pos` would produce.
+        assert!(parse_pos(a).unwrap() < parse_pos(b).unwrap());
     }
 
     #[test]

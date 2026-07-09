@@ -83,7 +83,14 @@ fn encode_resume_token(token: &mongodb::change_stream::event::ResumeToken) -> Re
     doc.to_writer(&mut buf)?;
     let hex = super::bytes_to_hex(&buf);
     let data = doc.get_str("_data").ok();
-    Ok(Position(serde_json::json!({ "rt": hex, "_data": data })))
+    // `_data` FIRST so the `__pos` column string-sorts in oplog order: `_data` is
+    // the order-preserving resume keystring, whereas `rt` is the full token (with
+    // `_typeBits`) whose hex is NOT length-stable across events, so a `rt`-first
+    // `__pos` mis-orders the downstream MERGE dedup when token lengths differ
+    // (bug-hunt). Robust to serde_json's preserve_order either way: with it on,
+    // insertion order wins (`_data` first); with it off, keys sort (`"_data"` <
+    // `"rt"`). See `cdc::validate::parse_pos` which keys on `_data`.
+    Ok(Position(serde_json::json!({ "_data": data, "rt": hex })))
 }
 
 /// Inverse of [`encode_resume_token`], with a fallback to the pre-lossless
@@ -115,10 +122,16 @@ impl MongoChangeStream {
         let session = MongoSession::connect(url, tls, true)?;
         let db_name = session.db().to_string();
         // The resume token persisted by a prior run (opaque JSON → driver token).
-        let resume = checkpoint
-            .and_then(|p| Position::load(p).ok().flatten())
-            .map(|pos| decode_resume_token(&pos.0))
-            .transpose()?;
+        // A corrupt / unreadable checkpoint is a LOUD error, never silently
+        // treated as "no checkpoint" — that would re-anchor at now and leave a
+        // silent gap (`Position::load` returns Ok(None) only when the file is
+        // absent, Err when present-but-unparseable; bug-hunt find).
+        let resume = match checkpoint {
+            Some(p) => Position::load(p)?,
+            None => None,
+        }
+        .map(|pos| decode_resume_token(&pos.0))
+        .transpose()?;
         // A checkpoint path with NO persisted position ⇒ a fresh checkpointed
         // run: it must pin its anchor at open (see below).
         let is_fresh = resume.is_none();

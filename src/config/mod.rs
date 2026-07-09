@@ -1116,6 +1116,28 @@ impl Config {
             );
         }
 
+        // MongoDB change streams have NO server-side resume anchor (unlike a
+        // PostgreSQL slot): the checkpoint file IS the anchor. Without it, every
+        // run re-anchors at "now" and silently loses every change since the last
+        // run — so `mode: cdc` on mongo requires `cdc.checkpoint:` ALWAYS, not
+        // only under `initial: snapshot` (bug-hunt find).
+        if export.mode == ExportMode::Cdc
+            && self.source.source_type == SourceType::Mongo
+            && export
+                .cdc
+                .as_ref()
+                .and_then(|c| c.checkpoint.as_ref())
+                .is_none()
+        {
+            anyhow::bail!(
+                "export '{}': MongoDB `mode: cdc` requires `cdc.checkpoint:` — a change \
+                 stream has no server-side resume anchor, so without the checkpoint file \
+                 each run re-anchors at the current time and silently loses every change \
+                 between runs.",
+                export.name
+            );
+        }
+
         if let Some(days) = export.chunk_by_days {
             if export.mode != ExportMode::Chunked {
                 anyhow::bail!(

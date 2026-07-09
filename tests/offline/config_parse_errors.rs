@@ -222,3 +222,27 @@ exports:
         "the error must name the conflicting pair; got: {err}"
     );
 }
+
+#[test]
+fn roast_mongo_cdc_requires_checkpoint() {
+    // A change stream has no server-side resume anchor, so `mode: cdc` without
+    // `cdc.checkpoint:` re-anchors at "now" every run and silently loses all
+    // changes between runs. Must be rejected at load (bug-hunt find).
+    let yaml = r#"
+source:
+  type: mongo
+  url: "mongodb://localhost:27017/db"
+exports:
+  - name: t
+    table: t
+    mode: cdc
+    format: parquet
+    cdc: { until_current: true }
+    destination: { type: local, path: "/tmp/x" }
+"#;
+    let err = parse_err(yaml);
+    assert!(
+        err.contains("checkpoint"),
+        "the error must require cdc.checkpoint; got: {err}"
+    );
+}

@@ -283,3 +283,56 @@ fn mongo_cdc_mixed_transaction_ending_on_uncaptured_table() {
         "the uncaptured collection must NOT leak into the orders stream"
     );
 }
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-rs"]
+fn roast_corrupt_checkpoint_fails_loudly_not_silent_reanchor() {
+    // A corrupt / unreadable checkpoint was swallowed (`.ok().flatten()`) and
+    // treated as "no checkpoint" → re-anchor at now → silent gap. It must fail
+    // loudly instead (bug-hunt find).
+    require_alive(LiveService::MongoRs);
+    let db = unique_name("cdc_corrupt");
+    let m = MongoTest::connect(PORT, &db);
+    m.drop_collection("t");
+
+    let rig = cdc(&db, "t");
+    rig.run_ok(); // pin — writes the checkpoint
+    assert!(rig.checkpoint().exists(), "run pins a checkpoint");
+
+    // Corrupt it, then produce a change the re-anchor would skip.
+    std::fs::write(rig.checkpoint(), b"{ not valid json at all").unwrap();
+    m.upsert_set("t", 1, "v", "a");
+
+    // The run must FAIL — never exit 0 having silently re-anchored past the change.
+    let _stderr = rig.run_expect_fail();
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-rs"]
+fn roast_pos_column_leads_with_data_for_downstream_sort() {
+    // `__pos` must lead with `{"_data"` so a downstream MERGE that `ORDER BY
+    // __pos` sorts in oplog order — `_data` is the order-preserving resume
+    // keystring, whereas a `rt`-first `__pos` sorts by the full token (whose hex
+    // is not length-stable) and mis-orders the dedup (bug-hunt find).
+    require_alive(LiveService::MongoRs);
+    let db = unique_name("cdc_posdata");
+    let m = MongoTest::connect(PORT, &db);
+    m.drop_collection("t");
+
+    let rig = cdc(&db, "t");
+    rig.run_ok(); // pin
+    for i in 1..=4 {
+        m.upsert_set("t", i, "v", "x");
+    }
+    rig.run_ok();
+
+    let changes = read_mongo_cdc_changes(&rig.out_dir());
+    assert!(!changes.is_empty(), "changes captured");
+    for c in &changes {
+        assert!(
+            c.pos.starts_with("{\"_data\""),
+            "__pos must be _data-first for a correct downstream sort, got: {}",
+            c.pos
+        );
+    }
+}
