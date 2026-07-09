@@ -28,6 +28,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / "dev" / "bench" / ".smoke-out"
+# Prefer the worktree build (has the mongo source); fall back to PATH rivet.
+RIVET_BIN = (str(ROOT / "target/release/rivet")
+             if (ROOT / "target/release/rivet").exists() else "rivet")
 
 # Bench fixtures live in a dedicated `rivet_bench` DB per engine so the live-test
 # `rivet` fixtures are never touched. Host → docker-mapped ports.
@@ -247,7 +250,55 @@ MS_ENGINE = {
     "dlt_schema": "dbo",
 }
 
-ENGINES = {"postgres": PG_ENGINE, "mysql": MY_ENGINE, "mssql": MS_ENGINE}
+def _mongo_sql(js):
+    return sh(["docker", "exec", "rivet-mongo-mongo-rs-1", "mongosh", "--quiet",
+               "mongodb://127.0.0.1:27017/rivet_bench?directConnection=true",
+               "--eval", js]).stdout.strip()
+
+
+# ── MongoDB engine ───────────────────────────────────────────────────────────
+# Non-SQL: mongosh runner, serverStatus counters, $currentOp longest-op gauge.
+# No type_deg (JSON-blob model — rivet emits _id + document, not typed columns).
+# OLTP probe skipped: mongosh cold-start (~1 s) would swamp any point-read signal.
+# Readers: rivet / sling / ingestr only (duckdb/clickhouse/odbc/dlt-sql have no
+# native mongo reader). Harm/counters go through the RS container (27017);
+# tools connect on the host-mapped 27018.
+MG_ENGINE = {
+    "name": "mongo",
+    "sql": _mongo_sql,
+    "container": "rivet-mongo-mongo-rs-1",
+    "counter_keys": ["mongo_docs_scanned", "mongo_keys_scanned", "mongo_docs_returned",
+                     "mongo_op_query", "mongo_op_getmore", "mongo_wt_cache_bytes_read"],
+    "counters_sql": (
+        "var s=db.serverStatus();"
+        "print([s.metrics.queryExecutor.scannedObjects,s.metrics.queryExecutor.scanned,"
+        "s.metrics.document.returned,s.opcounters.query,s.opcounters.getmore,"
+        "s.wiredTiger.cache['bytes read into cache']].join(','))"),
+    "gauge_sql": (
+        "var mx=0;db.getSiblingDB('admin').aggregate([{$currentOp:{allUsers:true}}])"
+        ".forEach(function(o){var r=o.secs_running||0;"
+        "if((o.ns||'').indexOf('rivet_bench')===0&&r>mx)mx=r;});"
+        "print([mx,0,db.serverStatus().connections.current,0,0,0].join(','))"),
+    "cache_sql": None,
+    "dead_sql": None,
+    "count_sql": lambda t: f"print(db.{t}.countDocuments())",
+    "types_sql": "print('')",     # schemaless → no column types → type_deg 0
+    "setup": lambda: [_mongo_sql(
+        "if(db.bench_probe.countDocuments()===0){var b=[];"
+        "for(var i=1;i<=1000;i++)b.push({_id:i,v:i});db.bench_probe.insertMany(b);}")],
+    "probe_mode": "none",         # mongosh cold-start too slow to probe meaningfully
+    "url": lambda tool: "mongodb://127.0.0.1:27018/rivet_bench?directConnection=true",
+    "rivet_type": "mongo",
+    "duckdb_install": None, "duckdb_attach": None, "clickhouse_fn": None,
+    "odbc_conn": None,
+    "sling_url": "mongodb://127.0.0.1:27018/rivet_bench?directConnection=true",
+    "ingestr_url": "mongodb://127.0.0.1:27018/rivet_bench?directConnection=true",
+    "qualify": lambda t: t,       # collection name, no schema
+    "dlt_url": None, "dlt_schema": None,   # dlt needs its mongo source, not sql_table
+}
+
+ENGINES = {"postgres": PG_ENGINE, "mysql": MY_ENGINE, "mssql": MS_ENGINE,
+           "mongo": MG_ENGINE}
 
 
 def sh(cmd, **kw):
@@ -381,6 +432,8 @@ class OltpProbe(threading.Thread):
         self.proc = None
 
     def run(self):
+        if ENG.get("probe_mode") == "none":
+            return                      # engine can't be probed cheaply (mongo)
         if ENG.get("probe_mode") == "perquery":
             self._run_perquery()
         else:
@@ -527,16 +580,20 @@ def a_rivet(table, dest: Path):
     # +24% rows/s, -13% source CPU, -12s open-txn, same 56 MB peak / 0 type-loss;
     # the only cost is oltp_p99 4.0→5.1x (no concurrent-load rate-limit). chunked
     # mode is the source-safety option for huge/resumable tables (separate).
+    if ENG["rivet_type"] == "mongo":
+        # Mongo isn't SQL: name the collection via `table:`, mode:full only.
+        select = f"    table: {table}\n    mode: full\n"
+    else:
+        select = (f"    query: \"SELECT * FROM {table}\"\n    mode: full\n"
+                  f"    tuning:\n      profile: fast\n")
     cfg.write_text(
         f"source:\n  type: {ENG['rivet_type']}\n  url: \"{ENG['url']('rivet')}\"\n"
         f"exports:\n  - name: {table}\n"
-        f"    query: \"SELECT * FROM {table}\"\n"
-        f"    mode: full\n"
+        f"{select}"
         f"    format: parquet\n    compression: zstd\n"
-        f"    tuning:\n      profile: fast\n"
         f"    destination:\n      type: local\n      path: {dest}\n"
     )
-    return dest, lambda: timed(["rivet", "run", "-c", str(cfg)])
+    return dest, lambda: timed([RIVET_BIN, "run", "-c", str(cfg)])
 
 
 def a_rivet_chunked(table, dest: Path):
@@ -553,7 +610,7 @@ def a_rivet_chunked(table, dest: Path):
         f"    format: parquet\n    compression: zstd\n"
         f"    destination:\n      type: local\n      path: {dest}\n"
     )
-    return dest, lambda: timed(["rivet", "run", "-c", str(cfg)])
+    return dest, lambda: timed([RIVET_BIN, "run", "-c", str(cfg)])
 
 
 def a_duckdb(table, dest: Path):
@@ -708,7 +765,8 @@ def main():
     OUT.mkdir(parents=True)
     setup_harm()
 
-    mt = re.search(r"\d+", _psql(f"SELECT COUNT(*) FROM {args.table}") or "")
+    count_q = ENG.get("count_sql", lambda t: f"SELECT COUNT(*) FROM {t}")(args.table)
+    mt = re.search(r"\d+", _psql(count_q) or "")
     truth = int(mt.group()) if mt else -1
     src_types = pg_types(args.table)
     srcfam = {c: family(t) for c, t in src_types.items()}
@@ -724,18 +782,22 @@ def main():
         tool = tool.strip()
         if tool not in ADAPTERS:
             continue
-        # Skip tools the CURRENT engine has no native reader for (duckdb/clickhouse
-        # can't read mssql/mongo) — a real coverage fact, not a failure.
-        if tool == "duckdb" and not ENG.get("duckdb_attach"):
-            print(f"  {tool:<16} n/a ({ENG['name']})"); continue
-        if tool == "clickhouse-local" and not ENG.get("clickhouse_fn"):
+        # Skip tools the CURRENT engine has no native reader for — a real
+        # coverage fact, not a failure. (duckdb/clickhouse can't read mssql/mongo;
+        # odbc/dlt-sql can't read mongo; chunked mode is SQL-only.)
+        na = ((tool == "duckdb" and not ENG.get("duckdb_attach"))
+              or (tool == "clickhouse-local" and not ENG.get("clickhouse_fn"))
+              or (tool == "odbc2parquet" and not ENG.get("odbc_conn"))
+              or (tool == "dlt" and not ENG.get("dlt_url"))
+              or (tool == "rivet-chunked" and ENG["name"] == "mongo"))
+        if na:
             print(f"  {tool:<16} n/a ({ENG['name']})"); continue
         if tool == "clickhouse-local":
             available = Path(CH_BIN).exists()
         elif tool == "dlt":
             available = True
-        elif tool == "rivet-chunked":
-            available = shutil.which("rivet") is not None
+        elif tool in ("rivet", "rivet-chunked"):
+            available = Path(RIVET_BIN).exists() or shutil.which(RIVET_BIN) is not None
         else:
             available = shutil.which(tool) is not None
         if not available:
