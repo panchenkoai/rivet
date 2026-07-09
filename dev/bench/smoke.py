@@ -57,57 +57,105 @@ def out_bytes(path: Path) -> int:
     return path.stat().st_size if path.exists() else 0
 
 
-# ─── Source-harm counters ────────────────────────────────────────────────────
-# Sampled before → after each tool's run. Tools run SERIALLY, so the delta is
-# attributable to that one tool. pg_stat_database is cumulative and db-wide; the
-# delta is the read amplification (tup_returned), temp-file spill (temp_bytes)
-# and disk reads (blks_read) a tool inflicts — captured in the SAME run as
-# wall/RSS, which is the whole point (harm + perf, one pass).
-HARM_KEYS = ["tup_returned", "tup_fetched", "temp_bytes", "blks_read", "blk_read_time"]
+# ─── Source-harm capture ─────────────────────────────────────────────────────
+# Every axis a principal DBA needs to judge how much an extraction HURTS the
+# source, captured in the SAME serial run as perf. Three kinds:
+#   • cumulative counters (before→after delta): read amplification, temp spill,
+#     disk reads/time, WAL generated, source CPU.
+#   • point-in-time gauges (peak + p50 over a 50 ms poller): longest query / txn,
+#     held locks, blocked sessions, connections, xmin horizon held back (vacuum
+#     starvation), buffer-cache footprint.
+#   • ground truth: a co-running OLTP probe — p99 latency degradation of a real
+#     point-read workload while the extraction runs (the number a DBA signs off).
 PG_CONTAINER = "rivet-mongo-postgres-1"
+HARM_KEYS = ["tup_returned", "tup_fetched", "temp_bytes", "blks_read", "blk_read_time"]
 
 
-def pg_harm() -> dict:
+def _psql(q: str) -> str:
+    return sh(["docker", "exec", PG_CONTAINER, "psql", "-U", PG["user"],
+               "-d", PG["db"], "-tAc", q]).stdout.strip()
+
+
+def setup_harm():
+    """Idempotent prerequisites: buffer-cache view + OLTP probe table."""
+    _psql("CREATE EXTENSION IF NOT EXISTS pg_buffercache")
+    _psql("CREATE TABLE IF NOT EXISTS bench_probe(id int PRIMARY KEY, v int)")
+    if _psql("SELECT count(*) FROM bench_probe") in ("", "0"):
+        _psql("INSERT INTO bench_probe SELECT g, g FROM generate_series(1,1000) g")
+
+
+def pg_counters() -> dict:
+    """Cumulative counters for before/after deltas: pg_stat_database + WAL lsn."""
     q = ("SELECT tup_returned||','||tup_fetched||','||temp_bytes||','||blks_read"
-         f"||','||blk_read_time FROM pg_stat_database WHERE datname='{PG['db']}'")
-    r = sh(["docker", "exec", PG_CONTAINER, "psql", "-U", PG["user"],
-            "-d", PG["db"], "-tAc", q])
+         "||','||blk_read_time||','||pg_wal_lsn_diff(pg_current_wal_lsn(),'0/0') "
+         f"FROM pg_stat_database WHERE datname='{PG['db']}'")
     try:
-        return dict(zip(HARM_KEYS, [float(v) for v in r.stdout.strip().split(",")]))
+        return dict(zip(HARM_KEYS + ["wal_bytes"], [float(v) for v in _psql(q).split(",")]))
     except (ValueError, AttributeError):
         return {}
 
 
-# ─── Point-in-time harm gauges (the old harm_ab.sh signals) ──────────────────
-# The cumulative counters above are before/after deltas; the gauges below —
-# longest running query, longest open transaction, held locks, live connections
-# — are instantaneous, so they need a background sampler that records the PEAK
-# during the tool's run (harm_ab.sh polled @50ms; same idea). These are the
-# source-safety headlines: a chunked reader holds short queries and few locks; a
-# `SELECT *` that buffers holds one long query and pins a transaction.
+def cgroup_cpu_usec() -> int:
+    """Source-container CPU microseconds consumed (cgroup v2 cpu.stat)."""
+    r = sh(["docker", "exec", PG_CONTAINER, "sh", "-c",
+            "awk '/usage_usec/{print $2}' /sys/fs/cgroup/cpu.stat"])
+    try:
+        return int(r.stdout.strip() or 0)
+    except ValueError:
+        return 0
+
+
+def cache_footprint_mb(table: str) -> float:
+    """MB of shared_buffers holding the table's pages after the run — the cache
+    the extract polluted (pages that displaced the hot OLTP working set)."""
+    n = _psql("SELECT count(*) FROM pg_buffercache b JOIN pg_class c "
+              "ON b.relfilenode = pg_relation_filenode(c.oid) "
+              f"WHERE c.relname='{table}'")
+    try:
+        return int(n) * 8 / 1024
+    except ValueError:
+        return 0.0
+
+
+def dead_tuples(table: str) -> int:
+    n = _psql(f"SELECT COALESCE(n_dead_tup,0) FROM pg_stat_user_tables WHERE relname='{table}'")
+    try:
+        return int(n or 0)
+    except ValueError:
+        return 0
+
+
+# ── Point-in-time gauges (peak + p50 over a background poller) ───────────────
+# Each sample: longest active query (s), longest open txn (s), connections, held
+# locks, blocked sessions, xmin horizon held (xid age — how far back the tool
+# pins VACUUM). The probe connection (application_name='harness_probe') is
+# excluded so gauges reflect the TOOL, not the probe.
+GAUGE_FIELDS = ["longq", "longtxn", "conns", "locks", "blocked", "xmin_age"]
 GAUGE_SQL = (
-    "SELECT COALESCE(EXTRACT(EPOCH FROM "
-    "max(now()-query_start) FILTER (WHERE state='active')),0)||','||"
+    "SELECT COALESCE(EXTRACT(EPOCH FROM max(now()-query_start) "
+    "FILTER (WHERE state='active')),0)||','||"
     "COALESCE(EXTRACT(EPOCH FROM max(now()-xact_start)),0)||','||count(*)||','||"
     "(SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a2 ON l.pid=a2.pid "
-    f"WHERE a2.datname='{PG['db']}' AND a2.pid<>pg_backend_pid()) "
-    f"FROM pg_stat_activity WHERE datname='{PG['db']}' "
-    "AND pid<>pg_backend_pid() AND backend_type='client backend'"
+    f"WHERE a2.datname='{PG['db']}' AND a2.pid<>pg_backend_pid() "
+    "AND a2.application_name<>'harness_probe')||','||"
+    f"(SELECT count(*) FROM pg_stat_activity a3 WHERE a3.datname='{PG['db']}' "
+    "AND cardinality(pg_blocking_pids(a3.pid))>0)||','||"
+    "COALESCE(max(age(backend_xmin)),0) "
+    f"FROM pg_stat_activity WHERE datname='{PG['db']}' AND pid<>pg_backend_pid() "
+    "AND backend_type='client backend' AND application_name<>'harness_probe'"
 )
 
 
 def gauge_once() -> tuple:
-    r = sh(["docker", "exec", PG_CONTAINER, "psql", "-U", PG["user"],
-            "-d", PG["db"], "-tAc", GAUGE_SQL])
     try:
-        lq, lx, cn, lk = r.stdout.strip().split(",")
-        return (float(lq), float(lx), int(cn), int(lk))
-    except (ValueError, AttributeError):
-        return (0.0, 0.0, 0, 0)
+        v = _psql(GAUGE_SQL).split(",")
+        return (float(v[0]), float(v[1]), int(v[2]), int(v[3]), int(v[4]), int(float(v[5])))
+    except (ValueError, IndexError, AttributeError):
+        return (0.0, 0.0, 0, 0, 0, 0)
 
 
 class GaugePoller(threading.Thread):
-    """Samples the source gauges ~every 50 ms until stopped; reports the peak."""
+    """Samples the source gauges ~every 50 ms until stopped; reports peak + p50."""
     def __init__(self):
         super().__init__(daemon=True)
         self._stop = threading.Event()
@@ -122,20 +170,62 @@ class GaugePoller(threading.Thread):
         self._stop.set()
         self.join(timeout=2)
 
-    def peak(self) -> tuple:
+    def result(self) -> dict:
         if not self.samples:
-            return (0.0, 0.0, 0, 0)
-        return tuple(max(s[i] for s in self.samples) for i in range(4))
+            return {f: 0 for f in GAUGE_FIELDS} | {"q_p50": 0.0}
+        d = {f: max(s[i] for s in self.samples) for i, f in enumerate(GAUGE_FIELDS)}
+        active = sorted(s[0] for s in self.samples if s[0] > 0)
+        d["q_p50"] = active[len(active) // 2] if active else 0.0
+        return d
 
 
-def dead_tuples(table: str) -> int:
-    r = sh(["docker", "exec", PG_CONTAINER, "psql", "-U", PG["user"], "-d", PG["db"],
-            "-tAc", f"SELECT COALESCE(n_dead_tup,0) FROM pg_stat_user_tables "
-                    f"WHERE relname='{table}'"])
-    try:
-        return int(r.stdout.strip() or 0)
-    except ValueError:
-        return 0
+class OltpProbe(threading.Thread):
+    """Ground truth: a persistent connection hammering point-reads on bench_probe
+    while the tool runs. Latency is server-side (psql \\timing), so it is DB
+    latency, not docker/network. Harm = p99 during the extract ÷ idle p99."""
+    def __init__(self):
+        super().__init__(daemon=True)
+        self._stop = threading.Event()
+        self.latencies = []
+        self.proc = None
+
+    def run(self):
+        self.proc = subprocess.Popen(
+            ["docker", "exec", "-i", PG_CONTAINER, "psql", "-U", PG["user"],
+             "-d", PG["db"], "-qAt"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        self.proc.stdin.write("SET application_name='harness_probe';\n\\timing on\n")
+        self.proc.stdin.flush()
+        i = 0
+        while not self._stop.is_set():
+            i = i % 1000 + 1
+            try:
+                self.proc.stdin.write(f"SELECT v FROM bench_probe WHERE id={i};\n")
+                self.proc.stdin.flush()
+            except (BrokenPipeError, ValueError):
+                break
+            for line in self.proc.stdout:
+                m = re.search(r"Time:\s+([\d.]+)\s+ms", line)
+                if m:
+                    self.latencies.append(float(m.group(1)))
+                    break
+
+    def stop(self):
+        self._stop.set()
+        if self.proc:
+            try:
+                self.proc.stdin.close()
+                self.proc.terminate()
+            except Exception:  # noqa
+                pass
+        self.join(timeout=2)
+
+    def p99(self) -> float:
+        if not self.latencies:
+            return 0.0
+        s = sorted(self.latencies)
+        return s[min(len(s) - 1, int(len(s) * 0.99))]
 
 
 # ─── Type fidelity ───────────────────────────────────────────────────────────
@@ -323,6 +413,40 @@ ADAPTERS = {
 }
 
 
+# Harm matrix rows (transposed: one row per metric, one column per tool). Grouped
+# by blast surface. Each entry: (label, key, formatter).
+HARM_ROWS = [
+    ("— ground truth —", None, None),
+    ("oltp_p99_x", "oltp_x", lambda v: f"{v:.1f}x"),
+    ("— mvcc/vacuum —", None, None),
+    ("xmin_held_xid", "xmin_age", lambda v: f"{v:.0f}"),
+    ("dead_tup", "dead", lambda v: f"{v:.0f}"),
+    ("— cache —", None, None),
+    ("cache_mb", "cache_mb", lambda v: f"{v:.0f}"),
+    ("— contention —", None, None),
+    ("locks_peak", "locks", lambda v: f"{v:.0f}"),
+    ("blocked_peak", "blocked", lambda v: f"{v:.0f}"),
+    ("— query hold —", None, None),
+    ("longq_s", "longq", lambda v: f"{v:.2f}"),
+    ("q_p50_s", "q_p50", lambda v: f"{v:.2f}"),
+    ("longtxn_s", "longtxn", lambda v: f"{v:.2f}"),
+    ("conns_peak", "conns", lambda v: f"{v:.0f}"),
+    ("— i/o —", None, None),
+    ("tup_read", "tup_returned", lambda v: f"{v:.0f}"),
+    ("tup_fetch", "tup_fetched", lambda v: f"{v:.0f}"),
+    ("temp_mb", "temp_mb", lambda v: f"{v:.1f}"),
+    ("blks_read", "blks_read", lambda v: f"{v:.0f}"),
+    ("blkread_ms", "blk_read_time", lambda v: f"{v:.0f}"),
+    ("— resource —", None, None),
+    ("wal_kb", "wal_kb", lambda v: f"{v:.0f}"),
+    ("cpu_ms", "cpu_ms", lambda v: f"{v:.0f}"),
+]
+
+
+def ta(t):
+    return TOOL_ABBR.get(t, t)[:9]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--table", default="content_items")
@@ -332,45 +456,28 @@ def main():
     if OUT.exists():
         shutil.rmtree(OUT)
     OUT.mkdir(parents=True)
+    setup_harm()
 
-    src_rows = parquet_rows  # noqa (placeholder to keep name)
-    # source truth for the correctness gate
     r = sh(["duckdb", "-noheader", "-list", "-c",
-            f"ATTACH 'host={PG['host']} port={PG['port']} dbname={PG['db']} user={PG['user']} password={PG['pw']}' AS pg (TYPE postgres, READ_ONLY); SELECT count(*) FROM pg.{args.table};"])
+            f"ATTACH 'host={PG['host']} port={PG['port']} dbname={PG['db']} "
+            f"user={PG['user']} password={PG['pw']}' AS pg (TYPE postgres, READ_ONLY); "
+            f"SELECT count(*) FROM pg.{args.table};"])
     m = re.search(r"\d+", r.stdout or "")
     truth = int(m.group()) if m else -1
-
     src_types = pg_types(args.table)
-
-    # One matrix, every comparison axis as a column:
-    #   correctness (status/rows) · perf (wall/peak_rss/out) ·
-    #   source-harm (tup_read/temp/blks) · type fidelity (type_deg)
     srcfam = {c: family(t) for c, t in src_types.items()}
 
-    # One matrix, every comparison axis as a column:
-    #   correctness (status/rows) · perf (wall/peak_rss/out) ·
-    #   source-harm cumulative (tup_read/temp) + gauge peaks (longq_s/locks/dead) ·
-    #   type fidelity (type_deg).
-    print(f"\nSmoke: postgres.{args.table}  (source rows = {truth}, {len(src_types)} cols)")
-    print("all axes, one run each — correctness · perf · source-harm · type fidelity\n")
-    cols = [("tool", 18, "<"), ("status", 9, "<"), ("wall_s", 8, ">"),
-            ("peak_mb", 9, ">"), ("rows", 7, ">"), ("out_mb", 8, ">"),
-            ("tup_read", 9, ">"), ("temp_mb", 8, ">"), ("longq_s", 9, ">"),
-            ("locks", 7, ">"), ("dead", 7, ">"), ("type_deg", 9, ">")]
-    hdr = "".join(f"{n:{a}{w}}" for n, w, a in cols)
+    # Idle OLTP baseline (p99 of the probe with nothing else running).
+    base = OltpProbe(); base.start(); time.sleep(1.5); base.stop()
+    base_p99 = base.p99() or 1e-9
+    print(f"\nSmoke: postgres.{args.table}  (source rows={truth}, {len(src_types)} cols, "
+          f"OLTP baseline p99={base_p99:.2f}ms)")
 
-    def row(vals):
-        return "".join(f"{str(v):{a}{w}}" for v, (n, w, a) in zip(vals, cols))
-
-    print(hdr); print("-" * len(hdr))
-
-    fam_by_tool = []
+    results = []  # (tool, status, bench, harm, pqfam)
     for tool in args.tools.split(","):
         tool = tool.strip()
         if tool not in ADAPTERS:
             continue
-        # dlt runs via `python -m` (no `dlt` binary needed); clickhouse resolves
-        # to CH_BIN (may be an absolute path); the rest need a bin on PATH.
         if tool == "clickhouse-local":
             available = Path(CH_BIN).exists()
         elif tool == "dlt":
@@ -378,53 +485,89 @@ def main():
         else:
             available = shutil.which(tool) is not None
         if not available:
-            print(f"{tool:<18}{'missing':<9}"); continue
+            print(f"  {tool:<16} missing"); continue
+
         path, run = ADAPTERS[tool](args.table, OUT / tool)
-        dead0 = dead_tuples(args.table)
-        before = pg_harm()
-        poller = GaugePoller(); poller.start()
+        c0, cpu0, dead0 = pg_counters(), cgroup_cpu_usec(), dead_tuples(args.table)
+        poller, probe = GaugePoller(), OltpProbe()
+        poller.start(); probe.start()
         try:
             wall, rss, rc, err = run()
         except Exception as e:  # noqa
-            poller.stop(); print(f"{tool:<18}{'error':<9}  {str(e)[:50]}"); continue
-        poller.stop()
+            poller.stop(); probe.stop()
+            print(f"  {tool:<16} error: {str(e)[:50]}"); continue
+        poller.stop(); probe.stop()
         time.sleep(0.4)  # let the stats collector flush this tool's reads
-        harm = {k: pg_harm().get(k, 0) - before.get(k, 0) for k in HARM_KEYS}
-        longq, _longx, _conns, locks = poller.peak()
-        dead = dead_tuples(args.table) - dead0
+        c1, cpu1 = pg_counters(), cgroup_cpu_usec()
+
+        g = poller.result()
+        harm = {
+            "oltp_x": (probe.p99() / base_p99) if probe.p99() else 0.0,
+            "xmin_age": g["xmin_age"], "dead": dead_tuples(args.table) - dead0,
+            "cache_mb": cache_footprint_mb(args.table),
+            "locks": g["locks"], "blocked": g["blocked"],
+            "longq": g["longq"], "q_p50": g["q_p50"], "longtxn": g["longtxn"],
+            "conns": g["conns"],
+            "tup_returned": c1.get("tup_returned", 0) - c0.get("tup_returned", 0),
+            "tup_fetched": c1.get("tup_fetched", 0) - c0.get("tup_fetched", 0),
+            "temp_mb": (c1.get("temp_bytes", 0) - c0.get("temp_bytes", 0)) / 1e6,
+            "blks_read": c1.get("blks_read", 0) - c0.get("blks_read", 0),
+            "blk_read_time": c1.get("blk_read_time", 0) - c0.get("blk_read_time", 0),
+            "wal_kb": (c1.get("wal_bytes", 0) - c0.get("wal_bytes", 0)) / 1024,
+            "cpu_ms": (cpu1 - cpu0) / 1000,
+        }
         rows = parquet_rows(path) if rc == 0 else -1
         mb = out_bytes(path) / 1_048_576 if rc == 0 else 0
         pqfam = parquet_families(path) if rc == 0 else {}
-        degr = [(c, srcfam[c], pqfam[c]) for c in src_types
-                if c in pqfam and pqfam[c] != srcfam[c]]
         status = "ok" if rc == 0 and rows == truth else ("mismatch" if rc == 0 else "error")
-        print(row([tool, status, f"{wall:.1f}", f"{rss:.0f}", rows, f"{mb:.1f}",
-                   f"{harm['tup_returned']:.0f}", f"{harm['temp_bytes'] / 1e6:.1f}",
-                   f"{longq:.2f}", locks, dead, len(degr)]))
-        if rc != 0:
-            tail = (err.strip().splitlines() or ["(no stderr)"])[-1][:90]
-            print(f"{'':<18}└─ {tail}")
-        if rc == 0:
-            fam_by_tool.append((tool, pqfam))
+        bench = {"wall": wall, "rss": rss, "rows": rows, "out_mb": mb,
+                 "rows_s": (rows / wall) if wall > 0 and rows > 0 else 0}
+        results.append((tool, status, bench, harm, pqfam))
+        tail = "" if rc == 0 else " · " + (err.strip().splitlines() or ["?"])[-1][:60]
+        print(f"  {tool:<16} {status:<9} wall={wall:5.1f}s  oltp={harm['oltp_x']:.1f}x{tail}")
 
-    # ── Second matrix: which type degraded, per column × tool ────────────────
+    ok = [r for r in results if r[1] != "error"]
+
+    # ── Matrix 1 — Benchmark (perf + correctness) ────────────────────────────
+    print("\n### 1. benchmark — throughput & correctness\n")
+    bcols = [("tool", 18, "<"), ("status", 9, "<"), ("wall_s", 8, ">"),
+             ("rows", 8, ">"), ("rows_s", 9, ">"), ("peak_mb", 9, ">"),
+             ("out_mb", 8, ">")]
+    print("".join(f"{n:{a}{w}}" for n, w, a in bcols))
+    print("-" * sum(w for _, w, _ in bcols))
+    for tool, status, b, _h, _f in results:
+        vals = [tool, status, f"{b['wall']:.1f}", b["rows"], f"{b['rows_s']:.0f}",
+                f"{b['rss']:.0f}", f"{b['out_mb']:.1f}"]
+        print("".join(f"{str(v):{a}{w}}" for v, (n, w, a) in zip(vals, bcols)))
+
+    # ── Matrix 2 — Harm (metric rows × tool columns) ─────────────────────────
+    if ok:
+        print("\n### 2. harm to the source — how much each tool hurts the DB\n")
+        w0, wt = 16, 9
+        print(f"{'harm metric':<{w0}}" + "".join(f"{ta(t):>{wt}}" for t, *_ in ok))
+        print("-" * (w0 + wt * len(ok)))
+        for label, key, fmt in HARM_ROWS:
+            if key is None:
+                print(label); continue
+            line = f"{label:<{w0}}"
+            for _t, _s, _b, h, _f in ok:
+                line += f"{fmt(h.get(key, 0)):>{wt}}"
+            print(line)
+
+    # ── Matrix 3 — Type loss (source column rows × tool columns) ─────────────
+    fam_by_tool = [(t, f) for t, _s, _b, _h, f in ok]
     disc = [c for c in src_types
             if any(pf.get(c, srcfam[c]) != srcfam[c] for _, pf in fam_by_tool)]
     if disc and fam_by_tool:
-        def fa(f):
-            return FAM_ABBR.get(f, f)
-
-        def ta(t):
-            return TOOL_ABBR.get(t, t)[:9]
-        print("\ntype fidelity — source vs each tool's parquet family (* = drift):\n")
+        print("\n### 3. type loss — source vs each tool's parquet family (* = drift)\n")
         tcols = [("column", 16, "<"), ("source", 8, "<")] + \
                 [(ta(t), 10, "<") for t, _ in fam_by_tool]
         print("".join(f"{n:{a}{w}}" for n, w, a in tcols))
         for c in disc:
-            cells = [c, fa(srcfam[c])]
+            cells = [c, FAM_ABBR.get(srcfam[c], srcfam[c])]
             for _, pf in fam_by_tool:
                 v = pf.get(c)
-                cells.append(fa(v) + ("*" if v != srcfam[c] else "") if v else "-")
+                cells.append(FAM_ABBR.get(v, v) + ("*" if v != srcfam[c] else "") if v else "-")
             print("".join(f"{str(v):{a}{w}}" for v, (n, w, a) in zip(cells, tcols)))
     print()
 
