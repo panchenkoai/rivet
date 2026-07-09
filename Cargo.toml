@@ -1,11 +1,11 @@
 [package]
 name = "rivet-cli"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
 repository = "https://github.com/panchenkoai/rivet"
-description = "Rivet: PostgreSQL/MySQL/SQL Server → Parquet/CSV (local, S3, GCS, Azure). Crate name rivet-cli; binary rivet."
+description = "Rivet: PostgreSQL/MySQL/SQL Server/MongoDB → Parquet/CSV (local, S3, GCS, Azure). Crate name rivet-cli; binary rivet."
 readme = "README.md"
 default-run = "rivet"
 exclude = ["dev/", "USER_TEST_PLAN.md", "tests/", ".github/", "docs/gifs/"]

@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.18.0 — 2026-07-09
+
+### Added
+
+- **MongoDB source (OSS) — batch + CDC.** A fourth source engine alongside
+  PostgreSQL / MySQL / SQL Server. MongoDB has no SQL and no fixed per-collection
+  schema, so rivet reads each collection as a **JSON-blob** table: two columns,
+  `_id` (stringified key) and `document` (the whole BSON document as extended
+  JSON), typed downstream by the warehouse's `PARSE_JSON`. Schema drift is
+  impossible — a new field lands *inside* `document`, never changing the Parquet
+  schema. (Per-field/typed-column discovery is deliberately paid-tier, not OSS.)
+  - **Batch** — full snapshot, optional **keyset (seek) paging** on `_id`
+    (bounded query time, per-page parts), **`parallel: N`** `_id`-range fan-out
+    (`$sample` quantile boundaries, any BSON `_id` type), and cross-run **resume**
+    (`source.mongo.resume: true`, lossless typed BSON checkpoint). Index-bound —
+    `examined ÷ returned = 1.0`, never a collection scan.
+  - **CDC** — whole-database change streams (`db.watch()`), resumable via a
+    persisted resume token, `initial: snapshot` + stream, and a bounded
+    `until_current` drain for the scheduler model. Client-side anchor (the MySQL
+    model): a fresh checkpointed open pins its position immediately so an idle
+    first run never skips changes.
+  - **Reliability parity** with the SQL engines: retry classification, at-least-
+    once crash recovery, `--reconcile` (source `countDocuments` vs destination),
+    harm metrics (`serverStatus`), TLS (`require_tls_or_loopback`), and full
+    `doctor` / `check` / `plan` / `apply` support. Live-tested through the
+    canonical `Rig` across a MongoDB **4.4 → 8.0** version matrix.
+- **Heterogeneous-`_id` warning + warehouse merge guidance.** A collection that
+  mixes `_id` BSON types (int `1001` and string `"1001"`, or an ObjectId and its
+  hex as a string) stringifies them to the same flat `_id` text — a downstream
+  `MERGE ON _id` would conflate distinct documents (verified live on BigQuery).
+  A full scan or CDC run now warns and points at the type-exact `document._id`;
+  `docs/reference/mongodb.md` documents the verified BigQuery MERGE recipe and the
+  `document`-loads-as-`BYTES` gotcha.
+
 ## 0.17.0 — 2026-07-07
 
 ### Added
@@ -175,7 +209,7 @@
   are documented as boundary-equivalent (mathematically unkillable).
 - **Negative-scenario sweep: five hostile families closed, two more findings.** Binary-level fuzz over
   the MySQL cell-fix layer found the enum-label parser PANICKING on malformed native strings and — worse
-  — silently MOJIBAKE-ing every non-ASCII label (`ENUM('привет')` byte-cast char-by-char; findings
+  — silently MOJIBAKE-ing every non-ASCII label (`ENUM('привіт')` byte-cast char-by-char; findings
   #39/#39b): rewritten total and char-wise, pinned end-to-end (unicode + quoted labels through
   enrichment→parse→fix→parquet). Corrupt checkpoint files (garbage/truncated/wrong-engine/empty) verified
   LOUD on all shapes and pinned — no silent re-anchor. A revoked REPLICATION grant mid-life fails loudly,
