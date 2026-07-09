@@ -291,9 +291,10 @@ MG_ENGINE = {
     "rivet_type": "mongo",
     "duckdb_install": None, "duckdb_attach": None, "clickhouse_fn": None,
     "odbc_conn": None,
-    "sling_url": "mongodb://127.0.0.1:27018/rivet_bench?directConnection=true",
-    "ingestr_url": "mongodb://127.0.0.1:27018/rivet_bench?directConnection=true",
-    "qualify": lambda t: t,       # collection name, no schema
+    # mongo: db goes in the stream name (db.collection), not the URL path.
+    "sling_url": "mongodb://127.0.0.1:27018/?directConnection=true",
+    "ingestr_url": "mongodb://127.0.0.1:27018/?directConnection=true",
+    "qualify": lambda t: f"rivet_bench.{t}",
     "dlt_url": None, "dlt_schema": None,   # dlt needs its mongo source, not sql_table
 }
 
