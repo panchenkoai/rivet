@@ -358,7 +358,11 @@ def a_clickhouse(table, dest: Path):
     q = (f"SELECT * FROM postgresql('{PG['host']}:{PG['port']}', '{PG['db']}', "
          f"'{table}', '{PG['user']}', '{PG['pw']}') "
          f"INTO OUTFILE '{out}' FORMAT Parquet")
-    return out, lambda: timed([CH_BIN, "local", "--query", q])
+    # steelman: cap memory (OOMs below its floor) + bound threads — passed as CLI
+    # settings (clickhouse-local accepts any setting as --<name>=<value>).
+    return out, lambda: timed([
+        CH_BIN, "local", "--max_memory_usage=4000000000", "--max_threads=4",
+        "--query", q])
 
 
 def a_odbc2parquet(table, dest: Path):
@@ -521,6 +525,7 @@ def main():
             "status": status, "wall_s": wall, "rows": rows,
             "rows_s": (rows / wall) if wall > 0 and rows > 0 else 0,
             "peak_rss_mb": rss, "out_mb": mb,
+            "out_files": len(list((OUT / tool).rglob("*.parquet"))) if rc == 0 else 0,
             "type_deg": sum(1 for c in src_types
                             if c in pqfam and pqfam[c] != srcfam[c]),
             "oltp_x": (probe.p99() / base_p99) if probe.p99() else 0.0,

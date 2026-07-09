@@ -61,9 +61,13 @@ seed:
       - { name: users,         docs: 100000,   shape: "profile document" }
 
 # ─── Tools ───────────────────────────────────────────────────────────────────
-# `steelman` = the tuned, best-effort config that gives each competitor its
-# fairest shot (min-memory / source-friendly), so the comparison is not a
-# strawman. Verified 2026-07-09.
+# `steelman` gives each competitor its FAIREST shot — we run only steelman (no
+# strawman default column; no point running the same tool twice). Per tool:
+#   applied — the exact tuned settings the harness invokes it with;
+#   knobs   — the FULL tuning surface the tool exposes (so the fairness is
+#             auditable: every memory/chunk/parallelism lever it has is listed);
+#   note    — caveats (paywalled knobs, OOM floors, quirks).
+# Verified 2026-07-09.
 tools:
   - name: rivet
     role: subject
@@ -71,7 +75,10 @@ tools:
     version: "0.18.0"
     version_date: "2026-07-09"
     latest: "rivet --version"
-    steelman: { config: "mode: chunked, chunk_size: 25000" }   # ~128 MB, throughput intact
+    steelman:
+      applied: "mode: chunked, chunk_column: id, chunk_size: 25000, compression: zstd"
+      knobs:   "mode (full/chunked/date-chunked), chunk_size, chunk_column, tuning.profile (safe/balanced/fast), batch_size, compression, parallel_exports, meta_columns"
+      note:    "~128 MB, throughput intact — the only tool source-safe at defaults (steelman ≈ default)"
 
   - name: sling
     role: competitor
@@ -79,7 +86,10 @@ tools:
     version: "1.5.20"
     version_date: "2026-07-09"
     latest: "sling --version   # brew install slingdata-io/sling/sling"
-    steelman: { note: "built-in chunk_size is paywalled (Pro); min-memory only via a hand-written 20× id-range backfill loop" }
+    steelman:
+      applied: "default streaming (Go, low-memory by construction); tgt format parquet"
+      knobs:   "chunk_size (Pro/paywalled), target file_max_rows / file_max_bytes, SLING_THREADS, source range/limit, sslmode=disable"
+      note:    "built-in row chunking is Pro-only; min-memory otherwise needs a hand-written id-range backfill loop"
 
   - name: ingestr
     role: competitor
@@ -87,7 +97,10 @@ tools:
     version: "1.0.73"
     version_date: "2026-07-09"
     latest: "curl -LsSf https://getbruin.com/install/ingestr | sh   # or download the Darwin_arm64 release tarball"
-    steelman: { note: "single-binary Go CLI; writes a local parquet file via the parquet:// dest scheme (1.0.73+); source needs sslmode=disable on the loopback pg" }
+    steelman:
+      applied: "default streaming; parquet:// dest, sslmode=disable"
+      knobs:   "--loader-file-size, --interval-start/--interval-end (incremental), --sql-limit, --page-size (source cursor)"
+      note:    "single-binary Go CLI; streams by construction; parquet:// local dest since 1.0.73"
 
   - name: dlt
     role: competitor
@@ -95,7 +108,10 @@ tools:
     version: "1.28.1"
     version_date: "2026-07-09"
     latest: "pip install -U dlt"
-    steelman: { config: "buffer_max_items=5000" }   # ~1.27 GB tuned
+    steelman:
+      applied: "DATA_WRITER__BUFFER_MAX_ITEMS=5000; loader_file_format=parquet"
+      knobs:   "buffer_max_items, file_max_items, file_max_bytes, DATA_WRITER__*, LOAD__WORKERS, extract/normalize parallelism"
+      note:    "~1.27 GB tuned; Python + sqlalchemy overhead dominates CPU"
 
   - name: duckdb
     role: competitor
@@ -103,7 +119,10 @@ tools:
     version: "1.5.4"
     version_date: "2026-07-09"
     latest: "pip install -U duckdb"
-    steelman: { config: "memory_limit=4GB", note: "lowest COMPLETING limit; OOMs at 512MB/2GB (its floor, not a choice)" }
+    steelman:
+      applied: "SET memory_limit='4GB'; postgres_scanner ATTACH READ_ONLY; COPY … TO parquet (zstd)"
+      knobs:   "memory_limit, threads, preserve_insertion_order, temp_directory, max_temp_directory_size, parquet row_group_size"
+      note:    "lowest COMPLETING limit; OOMs at 512MB/2GB (its floor, not a choice)"
 
   - name: clickhouse-local
     role: competitor
@@ -111,7 +130,10 @@ tools:
     version: "26.6.1"
     version_date: "2026-07-09"
     latest: "brew install clickhouse   # unsigned cask: xattr -dr com.apple.quarantine <bin>; codesign -s - <bin>"
-    steelman: { note: "OOMs (code 241) below its floor; give it its lowest completing max_memory_usage. Reads pg via the postgresql() table function INTO OUTFILE ... FORMAT Parquet" }
+    steelman:
+      applied: "SETTINGS max_memory_usage=4000000000, max_threads=4; postgresql() → INTO OUTFILE FORMAT Parquet"
+      knobs:   "max_memory_usage, max_threads, max_block_size, max_bytes_before_external_group_by, output_format_parquet_row_group_size"
+      note:    "OOMs (code 241) below its floor; give it its lowest completing max_memory_usage"
 
   - name: odbc2parquet
     role: competitor
@@ -119,7 +141,10 @@ tools:
     version: "11.0.1"
     version_date: "2026-07-09"
     latest: "cargo install odbc2parquet"
-    steelman: { config: "--batch-size-memory 256Mb" }   # tuned; one SELECT * per table
+    steelman:
+      applied: "--batch-size-memory 256Mb; one SELECT * per table"
+      knobs:   "--batch-size-memory, --batch-size-row, --row-groups-per-file, --file-size-threshold"
+      note:    "tuned; PostgreSQL Unicode ODBC driver"
 
 # ─── Metric catalog — the SINGLE SOURCE for what the harness reports ──────────
 # The run harness (dev/bench/smoke.py) READS this: `key` names the value its
@@ -135,6 +160,7 @@ benchmark_metrics:
   - { key: rows_s,      label: rows_s, unit: count, desc: "extraction throughput (rows/wall)" }
   - { key: peak_rss_mb, label: peak_mb, unit: MB,   desc: "peak resident memory of the tool process" }
   - { key: out_mb,      label: out_mb, unit: MB,    desc: "parquet output size (*.parquet only)" }
+  - { key: out_files,   label: out_files, unit: count, desc: "parquet files written (1 = single file; many = row-group/partition split — affects downstream small-file overhead)" }
   - { key: type_deg,    label: type_deg, unit: count, desc: "columns whose parquet type family drifts from the source — the matrix-3 headline" }
 
 # Matrix 2 — harm to the source (one row per metric, one column per tool),
