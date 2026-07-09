@@ -418,6 +418,21 @@ impl Config {
                     e.mode
                 );
             }
+            // An impossible combination must be a config error, not a silent
+            // behavior downgrade: the parallel `_id`-range path keeps NO keyset
+            // checkpoint, so `resume: true` was silently ignored — the whole
+            // collection re-read every run with no warning (bug-hunt find).
+            if e.parallel > 1 && self.source.mongo.as_ref().is_some_and(|m| m.resume) {
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_SOURCE_MODE_UNSUPPORTED,
+                    "export '{}': `source.mongo.resume: true` cannot be combined with \
+                     `parallel: {}` — the parallel `_id`-range fan-out keeps no keyset \
+                     checkpoint, so resume would be silently ignored. Drop `parallel` \
+                     to keep cross-run resume, or drop `resume` to keep the fan-out.",
+                    e.name,
+                    e.parallel
+                );
+            }
         }
         Ok(())
     }

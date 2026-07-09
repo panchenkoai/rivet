@@ -194,3 +194,31 @@ exports:
         "should not fall through to the generic did-you-mean path: {msg}",
     );
 }
+
+// ── mongo semantic validation (bug-hunt find) ─────────────────────────────────
+
+#[test]
+fn roast_mongo_resume_with_parallel_is_rejected() {
+    // `resume: true` + `parallel: N` parsed fine but the parallel _id-range
+    // path keeps NO keyset checkpoint: resume was silently ignored — the whole
+    // collection re-read every run, with no warning anywhere. An impossible
+    // combination must be a config error, not a silent behavior downgrade.
+    let yaml = r#"
+source:
+  type: mongo
+  url: "mongodb://localhost:27017/db"
+  mongo: { resume: true, page_size: 100 }
+exports:
+  - name: t
+    table: t
+    mode: full
+    format: parquet
+    parallel: 4
+    destination: { type: local, path: "/tmp/x" }
+"#;
+    let err = parse_err(yaml);
+    assert!(
+        err.contains("resume") && err.contains("parallel"),
+        "the error must name the conflicting pair; got: {err}"
+    );
+}
