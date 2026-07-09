@@ -418,6 +418,81 @@ integers.
 
 ---
 
+## Consuming in the warehouse
+
+The two-column blob (`_id` + `document`) loads into any warehouse, but two things
+are worth knowing before you write the `MERGE`.
+
+### `document` is JSON — but BigQuery loads it as `BYTES`
+
+Rivet tags the `document` column with the Arrow `arrow.json` extension. Snowflake
+and a direct `PARSE_JSON` pick this up, but **BigQuery's Parquet loader does not
+recognise the extension** — the column lands as `BYTES`, not `JSON`. Convert on
+read (verified against a live BigQuery load):
+
+```sql
+PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING(document))   -- BigQuery
+```
+
+Snowflake autoloads `document` as `TEXT`, so `PARSE_JSON(document)` is direct —
+see `rivet check --target snowflake`.
+
+### Merging on `_id`
+
+For the common case — a collection with a **single `_id` type** (the MongoDB
+convention: ObjectId by default, or a consistent int/string) — the flat `_id`
+column is a perfect merge key:
+
+```sql
+MERGE INTO target T USING source S ON T._id = S._id ...   -- uniform _id
+```
+
+### <a id="heterogeneous-id"></a>Merging a heterogeneous-`_id` collection
+
+If one collection mixes `_id` **types** (int `1001` *and* string `"1001"`, or an
+ObjectId *and* its hex stored as a string), the flat `_id` column **stringifies
+them to the same text**. A `MERGE ON _id` then matches one source row against
+*both* target rows and silently overwrites one with the other — a real data loss,
+confirmed on a live BigQuery merge. Rivet exports both rows correctly (the export
+never loses data) and **warns** when a full scan or CDC run sees a heterogeneous
+`_id`; the fix is in the merge key, downstream.
+
+The typed value is always in `document._id`. On BigQuery, `JSON_QUERY` preserves
+the type (`1001` and `"1001"` render as *different* JSON text — `1001` vs
+`"1001"`), so a type-exact key is:
+
+```sql
+-- distinguishes int 1001 from string "1001"; correct on ANY collection
+TO_JSON_STRING(JSON_QUERY(PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING(document)), '$._id'))
+```
+
+A CDC merge keyed on it, deduped by the order-preserving `__pos` (latest wins):
+
+```sql
+MERGE INTO `dataset.target` T
+USING (
+  SELECT
+    PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING(document)) AS document,
+    TO_JSON_STRING(JSON_QUERY(
+      PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING(document)), '$._id')) AS id_key,
+    __op
+  FROM `dataset.cdc_stream`
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY id_key ORDER BY __pos DESC) = 1
+) S
+ON TO_JSON_STRING(JSON_QUERY(T.document, '$._id')) = S.id_key
+WHEN MATCHED AND S.__op = 'delete' THEN DELETE
+WHEN MATCHED THEN UPDATE SET document = S.document
+WHEN NOT MATCHED AND S.__op != 'delete' THEN INSERT (document) VALUES (S.document);
+```
+
+Heterogeneous `_id` in one collection is **rare and discouraged** — it usually
+signals an app bug or a botched migration. Keyset paging and `parallel` reject it
+outright (see the caveat below), so it only ever reaches a full scan or CDC. The
+`document._id` key above is also correct on **uniform** collections, so it is a
+safe default if you would rather not special-case.
+
+---
+
 ## Capability tiers
 
 The change-stream feature set depends on the server version — `doctor` reports it:
@@ -478,4 +553,7 @@ Deliberately **N/A** (not gaps):
   use a full scan — its single cursor *does* cross types. The four numeric types
   (Int32/Int64/Double/Decimal128) share one bracket, so a mixed-numeric `_id`
   keysets fine, and `parallel` tiles any single ordered type (ObjectId, int,
-  string).
+  string). A full scan (or CDC) over such a collection reads everything, but the
+  flat `_id` *display* column can collide across types — rivet warns, and
+  [Consuming in the warehouse](#consuming-in-the-warehouse) shows the type-exact
+  merge key.

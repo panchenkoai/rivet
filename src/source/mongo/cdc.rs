@@ -66,6 +66,13 @@ pub(crate) struct MongoChangeStream {
     /// never fires, and the run never terminates (bug-hunt hang). `None` unless
     /// `until_current`, or when the server did not report `operationTime`.
     until_current_ts: Option<mongodb::bson::Timestamp>,
+    /// Heterogeneous-`_id` warn state, mirroring the batch full-scan warning
+    /// ([`super::MongoSource::warn_if_heterogeneous_id`]): a whole-db change stream
+    /// can carry mixed `_id` BSON types across events, and the flat `_id` column
+    /// then collides downstream just like a batch full scan. `hetero_first` is the
+    /// first `_id` bracket seen; the warning fires once when a second appears.
+    hetero_first: Option<Option<u8>>,
+    hetero_warned: bool,
 }
 
 /// How a whole-db change-stream operation is handled: a document change we emit,
@@ -224,6 +231,8 @@ impl MongoChangeStream {
             until_current,
             target_data,
             until_current_ts,
+            hetero_first: None,
+            hetero_warned: false,
         };
         // Idle-first-run anchor (MongoDB has no server-side anchor — the MySQL
         // model): a fresh checkpointed open persists its current resume token NOW.
@@ -400,6 +409,10 @@ impl ChangeStream for MongoChangeStream {
         let session = &self.session;
         let stream = &mut self.stream;
         let db_name = &self.db_name;
+        // Disjoint field borrows (distinct from session/stream/db_name) so the
+        // heterogeneous-`_id` observation below can mutate warn state in-loop.
+        let hetero_first = &mut self.hetero_first;
+        let hetero_warned = &mut self.hetero_warned;
         loop {
             // Pull one raw event (or terminate). Bounded run: drain up to the
             // open-time target; `next_if_any` returns `None` on an empty poll, but a
@@ -448,7 +461,32 @@ impl ChangeStream for MongoChangeStream {
             // (even uncaptured) collection. `invalidate` genuinely ends the stream
             // (dropDatabase / a collection-stream drop) → a loud terminal error.
             match classify_op(&cse.operation_type) {
-                OpClass::Row => return Some(to_change_event(cse, canonical, db_name)),
+                OpClass::Row => {
+                    // Heterogeneous-`_id` display-collision warning (once per
+                    // stream), mirroring the batch full-scan guard: the flat `_id`
+                    // column can render distinct BSON types to the same text, so a
+                    // downstream merge keyed on `_id` conflates them.
+                    if !*hetero_warned {
+                        let b = cse
+                            .document_key
+                            .as_ref()
+                            .and_then(|dk| dk.get("_id"))
+                            .and_then(super::id_bracket);
+                        match *hetero_first {
+                            None => *hetero_first = Some(b),
+                            Some(first) if first != b => {
+                                log::warn!(
+                                    "mongodb cdc: heterogeneous `_id` types across the \
+                                     change stream: {}",
+                                    super::hetero_id_guidance()
+                                );
+                                *hetero_warned = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                    return Some(to_change_event(cse, canonical, db_name));
+                }
                 OpClass::Skip => continue,
                 OpClass::Invalidate => {
                     return Some(Err(anyhow::anyhow!(

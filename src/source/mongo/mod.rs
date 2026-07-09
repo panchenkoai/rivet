@@ -208,6 +208,25 @@ impl MongoSource {
         self
     }
 
+    /// The min and max `_id` of `collection` by BSON sort order (one index-bound
+    /// `find_one` each), or `None` if the collection is empty. Brackets are
+    /// *contiguous* in BSON sort order, so the endpoints span every bracket
+    /// present — comparing them detects any heterogeneous-`_id` mix. Shared by the
+    /// keyset *refusal* ([`Self::ensure_uniform_id_type`]) and the full-scan
+    /// *warning* ([`Self::warn_if_heterogeneous_id`]).
+    fn id_span(&self, collection: &str) -> Result<Option<(Document, Document)>> {
+        let coll = self
+            .session
+            .client()
+            .database(self.session.db())
+            .collection::<Document>(collection);
+        self.session.block_on(async {
+            let lo = coll.find_one(doc! {}).sort(doc! { "_id": 1 }).await?;
+            let hi = coll.find_one(doc! {}).sort(doc! { "_id": -1 }).await?;
+            Ok::<_, anyhow::Error>(lo.zip(hi))
+        })
+    }
+
     /// Guard against silent loss on a heterogeneous-`_id` collection. Keyset
     /// paging seeks with `$gt`/`$lt`, which MongoDB **type-brackets**: a numeric
     /// cursor never matches a string `_id` even though strings sort after numbers,
@@ -219,17 +238,7 @@ impl MongoSource {
     /// DOES cross brackets. Numeric types share bracket 0, so a mixed
     /// Int32/Int64/Double `_id` still keysets fine.
     pub(crate) fn ensure_uniform_id_type(&self, collection: &str) -> Result<()> {
-        let coll = self
-            .session
-            .client()
-            .database(self.session.db())
-            .collection::<Document>(collection);
-        let span = self.session.block_on(async {
-            let lo = coll.find_one(doc! {}).sort(doc! { "_id": 1 }).await?;
-            let hi = coll.find_one(doc! {}).sort(doc! { "_id": -1 }).await?;
-            Ok::<_, anyhow::Error>(lo.zip(hi))
-        })?;
-        if let Some((lo, hi)) = span
+        if let Some((lo, hi)) = self.id_span(collection)?
             && let (Some(lo_id), Some(hi_id)) = (lo.get("_id"), hi.get("_id"))
         {
             // NaN never matches $gt/$gte/$lt against a non-NaN operand: a keyset
@@ -248,10 +257,10 @@ impl MongoSource {
                     );
                 }
             }
-            let (lo_b, hi_b) = (id_bracket(lo_id), id_bracket(hi_id));
-            // Unknown band (None) is refused too: if we cannot place the type we
-            // cannot promise the seek crosses it — loud beats a silent gap.
-            if lo_b.is_none() || hi_b.is_none() || lo_b != hi_b {
+            // Unknown band is refused too (see `id_types_collide`): if we cannot
+            // place the type we cannot promise the seek crosses it — loud beats a
+            // silent gap.
+            if id_types_collide(lo_id, hi_id) {
                 anyhow::bail!(
                     "collection '{collection}' has heterogeneous `_id` types \
                      ({:?} … {:?}): MongoDB keyset paging seeks with `$gt`, which is \
@@ -264,6 +273,30 @@ impl MongoSource {
             }
         }
         Ok(())
+    }
+
+    /// Advisory sibling of [`Self::ensure_uniform_id_type`] for the **full-scan**
+    /// path (no `page_size`, no `parallel`): a full ordered cursor DOES cross BSON
+    /// brackets, so a heterogeneous-`_id` collection is read completely — no loss.
+    /// But the flat `_id` **display column** stringifies distinct BSON types to
+    /// possibly-colliding text (int `1001` and string `"1001"` both → `"1001"`), so
+    /// a warehouse merge keyed on `_id` would conflate them. Warn once, up front,
+    /// and point at the typed `document._id` (see docs). Best-effort: a probe
+    /// failure is silent (advisory, never a gate).
+    pub(crate) fn warn_if_heterogeneous_id(&self, collection: &str) {
+        let Ok(Some((lo, hi))) = self.id_span(collection) else {
+            return;
+        };
+        if let (Some(lo_id), Some(hi_id)) = (lo.get("_id"), hi.get("_id"))
+            && id_types_collide(lo_id, hi_id)
+        {
+            log::warn!(
+                "collection '{collection}' has heterogeneous `_id` types ({:?} … {:?}): {}",
+                lo_id.element_type(),
+                hi_id.element_type(),
+                hetero_id_guidance()
+            );
+        }
     }
 
     /// Split the collection's `_id` space into `n` disjoint, size-balanced
@@ -408,6 +441,29 @@ fn id_bracket(v: &Bson) -> Option<u8> {
         Bson::RegularExpression(_) => 10,
         _ => return None,
     })
+}
+
+/// Whether two `_id` values fall in DIFFERENT keyset brackets — i.e. the
+/// collection mixes BSON `_id` types. An unplaceable type (`id_bracket` = `None`)
+/// counts as colliding: we can neither seek across it (keyset) nor vouch its
+/// display text won't collide (full scan). Pure, so the keyset refusal and the
+/// full-scan warning share one notion of "heterogeneous `_id`".
+fn id_types_collide(lo: &Bson, hi: &Bson) -> bool {
+    match (id_bracket(lo), id_bracket(hi)) {
+        (Some(a), Some(b)) => a != b,
+        _ => true,
+    }
+}
+
+/// The shared downstream-guidance tail of the heterogeneous-`_id` warning (batch
+/// full scan and CDC both emit it). The flat `_id` column renders different BSON
+/// types to possibly-colliding text, so a warehouse merge keyed on `_id` conflates
+/// distinct documents — the typed value is always in `document._id`.
+pub(super) fn hetero_id_guidance() -> &'static str {
+    "the flat `_id` column renders different BSON types to possibly-colliding text \
+     (int 1001 and string \"1001\" both become \"1001\"), so a downstream merge keyed \
+     on `_id` conflates distinct documents — key on the typed `document._id` instead \
+     (see docs/reference/mongodb.md#consuming-in-the-warehouse)"
 }
 
 fn encode_id_cursor(id: &Bson) -> String {
@@ -555,6 +611,15 @@ impl Source for MongoSource {
         {
             self.ensure_uniform_id_type(coll_name)?;
             self.id_guard_checked.insert(coll_name.to_string());
+        }
+
+        // Full scan (no page_size, not a parallel worker) is the ONE path that
+        // permits a heterogeneous-`_id` collection — its single cursor crosses BSON
+        // brackets, so the read is complete (keyset/parallel refuse it above). But
+        // the flat `_id` display column can collide across types downstream, so warn
+        // once, up front. Advisory only — never gates the run.
+        if page_limit.is_none() && id_range.is_none() {
+            self.warn_if_heterogeneous_id(coll_name);
         }
 
         let total = self.session.block_on(async {
@@ -799,6 +864,27 @@ mod tests {
         assert_eq!(id_to_string(Some(&Bson::Int32(7))), "7");
         // Never panic / never silently vanish on a missing id.
         assert_eq!(id_to_string(None), "");
+    }
+
+    #[test]
+    fn heterogeneous_id_detection_is_bracket_based() {
+        let int1001 = Bson::Int32(1001);
+        let str1001 = Bson::String("1001".to_string());
+        let oid = Bson::ObjectId(ObjectId::parse_str("64b8f0000000000000000000").unwrap());
+        // The exact collision the warehouse MERGE guards against: int and string
+        // that stringify to the SAME `_id` text but are distinct documents.
+        assert!(id_types_collide(&int1001, &str1001));
+        // ObjectId vs a string (e.g. its own hex stored as a string _id): cross-bracket.
+        assert!(id_types_collide(&oid, &str1001));
+        // Uniform is NOT flagged — same type, and the four numeric types share
+        // bracket 0 (a mixed Int32/Int64 `_id` is not a display collision).
+        assert!(!id_types_collide(&int1001, &Bson::Int32(2002)));
+        assert!(!id_types_collide(&int1001, &Bson::Int64(9_000_000_000)));
+        assert!(!id_types_collide(&oid, &oid));
+        assert!(!id_types_collide(
+            &str1001,
+            &Bson::String("abc".to_string())
+        ));
     }
 
     #[test]
