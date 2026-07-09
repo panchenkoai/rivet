@@ -23,7 +23,7 @@ fn default_workers() -> usize {
     about = "Generate test data for rivet (v2: fast SQL profile + COPY bulk load)"
 )]
 pub struct Args {
-    /// Target database: postgres, mysql, or both
+    /// Target database: postgres, mysql, sqlserver, both (pg+mysql), or all
     #[arg(short, long, default_value = "both")]
     pub target: String,
 
@@ -62,6 +62,13 @@ pub struct Args {
     /// MySQL connection URL
     #[arg(long, default_value = "mysql://rivet:rivet@localhost:3306/rivet")]
     pub mysql_url: String,
+
+    /// SQL Server connection URL (sqlserver://user:pass@host:port/db)
+    #[arg(
+        long,
+        default_value = "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1433/rivet"
+    )]
+    pub mssql_url: String,
 
     /// Batch size for realistic INSERT path (Postgres realistic uses COPY instead)
     #[arg(long, default_value = "1000")]
