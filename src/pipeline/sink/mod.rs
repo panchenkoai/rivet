@@ -45,6 +45,10 @@ pub(crate) struct ExportSink {
     pub(in crate::pipeline) cursor_column: Option<String>,
     /// Last extracted cursor value — set by `on_batch`, consumed by `run_single_export`.
     pub(in crate::pipeline) last_cursor_value: Option<String>,
+    /// A lossless keyset token the SOURCE reported via `set_source_cursor`
+    /// (MongoDB's BSON `_id`), overriding the type-ambiguous string extracted
+    /// from the output column. `effective_cursor()` prefers it. `None` for SQL.
+    pub(in crate::pipeline) source_cursor: Option<String>,
     /// Schema WITH internal columns — used in `on_batch` for inline cursor extraction.
     pub(in crate::pipeline) schema: Option<SchemaRef>,
     /// Destination-facing schema (stripped of internal columns). Used for schema-change
@@ -135,6 +139,7 @@ impl ExportSink {
             part_rows: 0,
             cursor_column: plan.strategy.cursor_extract_column().map(str::to_string),
             last_cursor_value: None,
+            source_cursor: None,
             schema: None,
             dest_schema: None,
             meta: plan.meta_columns.clone(),
@@ -717,6 +722,21 @@ impl BatchSink for ExportSink {
             self.last_cursor_value = extract_last_cursor_value(batch, col, schema);
         }
         Ok(())
+    }
+
+    fn set_source_cursor(&mut self, token: String) {
+        self.source_cursor = Some(token);
+    }
+}
+
+impl ExportSink {
+    /// The keyset high-water mark to advance/checkpoint from: the source's own
+    /// lossless token when it reported one (MongoDB BSON `_id`), else the string
+    /// extracted from the output column (every SQL engine).
+    pub(in crate::pipeline) fn effective_cursor(&self) -> Option<String> {
+        self.source_cursor
+            .clone()
+            .or_else(|| self.last_cursor_value.clone())
     }
 }
 

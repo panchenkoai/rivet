@@ -221,6 +221,9 @@ fn page_limit_clause(source_type: SourceType, limit: usize) -> String {
     match source_type {
         SourceType::Postgres | SourceType::Mysql => format!("LIMIT {limit}"),
         SourceType::Mssql => format!("OFFSET 0 ROWS FETCH NEXT {limit} ROWS ONLY"),
+        SourceType::Mongo => unreachable!(
+            "page_limit_clause: MongoDB keyset paging is not a SQL path (guarded by full-mode-only validation)"
+        ),
     }
 }
 
@@ -241,6 +244,9 @@ fn cursor_rhs(source_type: SourceType, value: &str) -> (String, Option<String>) 
         // be int, datetime2, uniqueidentifier, …). No backslash escaping in
         // T-SQL; only `'` is doubled.
         SourceType::Mssql => (escape_mssql_literal(value), None),
+        SourceType::Mongo => unreachable!(
+            "cursor_rhs: MongoDB incremental cursor is not a SQL path (guarded by full-mode-only validation)"
+        ),
     }
 }
 

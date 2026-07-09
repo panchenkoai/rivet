@@ -142,6 +142,7 @@ fn harm_snapshot(plan: &ResolvedRunPlan) -> Option<Vec<(String, i64)>> {
         }
         crate::config::SourceType::Mysql => crate::source::mysql::sample_harm_counters(&url, tls),
         crate::config::SourceType::Mssql => crate::source::mssql::sample_harm_counters(&url, tls),
+        crate::config::SourceType::Mongo => crate::source::mongo::sample_harm_counters(&url, tls),
     }
 }
 
@@ -775,6 +776,7 @@ mod tests {
                 environment: None,
                 tuning: None,
                 tls: None,
+                mongo: None,
             },
             column_overrides: Default::default(),
             verify: crate::config::VerifyMode::Size,

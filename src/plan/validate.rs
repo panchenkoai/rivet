@@ -261,6 +261,7 @@ mod tests {
                 environment: None,
                 tuning: None,
                 tls: None,
+                mongo: None,
             },
             column_overrides: Default::default(),
             verify: crate::config::VerifyMode::Size,
@@ -848,6 +849,8 @@ mod tests {
         ExtractionStrategy::Keyset(crate::plan::KeysetPlan {
             key_column: "uuid_pk".into(),
             chunk_size: 10_000,
+            checkpoint: false,
+            parallel: 1,
         })
     }
 

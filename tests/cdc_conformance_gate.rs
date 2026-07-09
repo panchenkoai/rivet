@@ -25,74 +25,102 @@ enum Expect {
 }
 use Expect::{NA, Test};
 
-/// (case, mysql, postgres, mssql). Test names live in tests/live/live_cdc.rs
-/// (mysql + pg) and tests/live/live_cdc_mssql.rs.
-const CASES: &[(&str, Expect, Expect, Expect)] = &[
+/// (case, mysql, postgres, mssql, mongo). Test names live in
+/// tests/live/live_cdc.rs (mysql + pg), tests/live/live_cdc_mssql.rs, and
+/// tests/live/live_cdc_mongo.rs.
+const CASES: &[(&str, Expect, Expect, Expect, Expect)] = &[
     (
         "intra_transaction_seq",
         Test("fn cdc_intra_transaction_updates_get_distinct_seq"),
         Test("fn pg_cdc_intra_transaction_updates_get_distinct_seq"),
         Test("fn mssql_cdc_intra_transaction_updates_get_distinct_seq"),
+        NA(
+            "a Mongo change stream gives EVERY event a distinct, order-preserving \
+            resume token (__pos), even within one transaction, so __seq is always \
+            0 and the total order is __pos alone — the SQL shared-__pos + __seq \
+            tiebreak is unrepresentable (mongo_cdc_soak proves __pos-only dedup)",
+        ),
     ),
     (
         "sum_reconciles_intra_txn",
         Test("fn cdc_sum_reconciles_across_intra_txn_updates"),
         Test("fn pg_cdc_sum_reconciles_across_intra_txn_updates"),
         Test("fn mssql_cdc_sum_reconciles_across_intra_txn_updates"),
+        Test("fn mongo_cdc_soak_dedup_matches_source"),
     ),
     (
         "resume_two_run",
         Test("fn cdc_resume_captures_only_new_changes"),
         Test("fn pg_cdc_resume_captures_only_new_changes"),
         Test("fn mssql_cdc_resume_captures_only_new_changes"),
+        Test("fn mongo_cdc_capture_resume"),
     ),
     (
         "idle_first_run",
         Test("fn cdc_idle_first_run_then_change_is_captured"),
         Test("fn pg_cdc_idle_first_run_then_change_is_captured"),
         Test("fn mssql_cdc_idle_first_run_then_change_is_captured"),
+        Test("fn mongo_cdc_idle_first_run_then_change_is_captured"),
     ),
     (
         "crash_before_ack",
         Test("fn cdc_crash_after_flush_before_ack"),
         Test("fn pg_cdc_crash_after_flush_before_ack"),
         Test("fn mssql_cdc_crash_before_checkpoint"),
+        Test("fn mongo_cdc_crash_after_flush_before_ack"),
     ),
     (
         "full_type_matrix",
         Test("fn cdc_full_type_matrix_matches_batch"),
         Test("fn pg_cdc_full_type_matrix_matches_batch"),
         Test("fn mssql_cdc_full_type_matrix_matches_batch"),
+        NA(
+            "CDC and batch render `document` through the SAME `document_to_json` \
+            blob serializer — the batch mongo_batch_type_fidelity test pins the \
+            type surface (large Int64 / Decimal128 verbatim); there is no per-op \
+            typing that could diverge CDC from batch",
+        ),
     ),
     (
         "update_delete_typed",
         Test("fn cdc_update_and_delete_carry_full_types"),
         Test("fn pg_cdc_update_and_delete_carry_full_types"),
         Test("fn mssql_cdc_update_and_delete_carry_full_types"),
+        Test("fn mongo_cdc_update_and_delete_carry_document"),
     ),
     (
         "initial_snapshot",
         Test("fn cdc_initial_snapshot_covers_preexisting_rows"),
         Test("fn pg_cdc_initial_snapshot_covers_preexisting_rows"),
         Test("fn mssql_cdc_initial_snapshot_covers_preexisting_rows"),
+        Test("fn mongo_cdc_initial_snapshot_covers_preexisting_rows"),
     ),
     (
         "vanished_anchor_loud",
         Test("fn cdc_resume_from_missing_binlog_fails_loudly"),
         Test("fn pg_cdc_vanished_slot_with_checkpoint_fails_loudly"),
         Test("fn mssql_cdc_resume_past_retention_errors"),
+        NA("a resume token older than the oplog surfaces the server's \
+            ChangeStreamHistoryLost error DIRECTLY (rivet does not swallow it, no \
+            silent re-anchor); forcing an oplog rollover in the gate is \
+            impractical — the loud failure is the driver's"),
     ),
     (
         "mixed_transaction_boundary",
         Test("fn cdc_mixed_transaction_ending_on_uncaptured_table"),
         Test("fn pg_cdc_mixed_transaction_ending_on_uncaptured_table"),
         Test("fn mssql_cdc_mixed_transaction_and_qualified_table"),
+        Test("fn mongo_cdc_mixed_transaction_ending_on_uncaptured_table"),
     ),
     (
         "schema_qualified_table",
         Test("fn cdc_schema_qualified_table_config_captures_events"),
         Test("fn pg_cdc_schema_qualified_table_config_captures_events"),
         Test("fn mssql_cdc_mixed_transaction_and_qualified_table"),
+        NA(
+            "Mongo addresses a collection by name within the URL's database — no \
+            schema.table qualifier to parse or route",
+        ),
     ),
     (
         "non_utc_session",
@@ -101,6 +129,11 @@ const CASES: &[(&str, Expect, Expect, Expect)] = &[
         NA(
             "datetime is naive and datetimeoffset carries its offset explicitly — \
             no MSSQL rendering is shaped by session/server timezone",
+        ),
+        NA(
+            "BSON dates are UTC milliseconds rendered as ISO-8601 in extended \
+            JSON — no session/server timezone shapes the document text (unlike \
+            test_decoding's session-zone rendering)",
         ),
     ),
     (
@@ -111,6 +144,7 @@ const CASES: &[(&str, Expect, Expect, Expect)] = &[
             code, pinned once on MySQL",
         ),
         NA("same engine-agnostic path, pinned once on MySQL"),
+        NA("same engine-agnostic cdc_job marker path, pinned once on MySQL"),
     ),
     (
         "multi_table_one_stream",
@@ -119,6 +153,11 @@ const CASES: &[(&str, Expect, Expect, Expect)] = &[
         NA(
             "config validation rejects `tables:` for MSSQL (one capture \
             instance per stream)",
+        ),
+        NA(
+            "db.watch() is a single WHOLE-DATABASE stream by construction — a \
+            `tables:` config routes the one stream to N collections; the \
+            one-stream property is structural, not per-engine connection plumbing",
         ),
     ),
     (
@@ -129,6 +168,10 @@ const CASES: &[(&str, Expect, Expect, Expect)] = &[
             on MySQL (the engine with the client-only anchor, the hardest case)",
         ),
         NA("same shared seam; MSSQL's poll model re-reads from LSN by design"),
+        NA(
+            "same shared sink/commit seam; Mongo is a client-anchor engine like \
+            MySQL (crash_before_ack re-read is proven in mongo_cdc_crash)",
+        ),
     ),
     (
         "gremlin_network_cut_mid_stream",
@@ -138,6 +181,11 @@ const CASES: &[(&str, Expect, Expect, Expect)] = &[
             cut); connection loss = a failed poll, covered by chaos suite",
         ),
         NA("MSSQL polls change tables via SQL; same as PG"),
+        NA(
+            "a cut on the tailable stream surfaces as a failed next_change, loud, \
+            then resumes from the persisted token — the drain/recover seam is \
+            shared, pinned once on MySQL",
+        ),
     ),
     (
         "gremlin_destination_outage_mid_drain",
@@ -147,6 +195,7 @@ const CASES: &[(&str, Expect, Expect, Expect)] = &[
             once via the MySQL stream",
         ),
         NA("same engine-agnostic destination seam"),
+        NA("same engine-agnostic destination seam (shared commit path)"),
     ),
     (
         "gremlin_checkpoint_write_failure",
@@ -156,6 +205,7 @@ const CASES: &[(&str, Expect, Expect, Expect)] = &[
             anchor is the slot (server-side)",
         ),
         NA("same shared Position::save path; pinned once on MySQL"),
+        NA("same shared Position::save path (Mongo persists the token there too)"),
     ),
     (
         "concurrent_writers_mbt",
@@ -165,6 +215,10 @@ const CASES: &[(&str, Expect, Expect, Expect)] = &[
             merge logic under test is shared",
         ),
         NA("same shared merge; MSSQL's change-table ordering is server-side"),
+        NA(
+            "the shared merge; Mongo's convergence-to-source under mixed \
+            transactional writes is proven in mongo_cdc_soak",
+        ),
     ),
     (
         "fault_point_sweep",
@@ -174,6 +228,7 @@ const CASES: &[(&str, Expect, Expect, Expect)] = &[
             once on the client engine",
         ),
         NA("same shared boundaries"),
+        NA("same shared sink/run_capture boundaries"),
     ),
     (
         "cross_oracle_full_surface",
@@ -184,6 +239,10 @@ const CASES: &[(&str, Expect, Expect, Expect)] = &[
             type_roundtrip suites, and CDC==batch is their matrix contract",
         ),
         NA("same anchoring argument"),
+        NA(
+            "same anchoring; Mongo's blob passes the same readers via the batch \
+            type-fidelity test, and CDC shares the document_to_json renderer",
+        ),
     ),
     (
         "event_ordering_commit_order",
@@ -195,6 +254,10 @@ const CASES: &[(&str, Expect, Expect, Expect)] = &[
         ),
         NA("same shared sink ordering; MSSQL's per-row LSN framing is \
             unit-tested in its adapter"),
+        NA(
+            "Mongo's __pos (resume token) IS commit order by construction — \
+            mongo_cdc_soak's __pos-ordered dedup matching source proves it",
+        ),
     ),
     (
         "golden_calculated_metrics",
@@ -208,12 +271,14 @@ const CASES: &[(&str, Expect, Expect, Expect)] = &[
             "same — one arithmetic anchor suffices; MSSQL values ride the \
             matrix + oracle contracts",
         ),
+        NA("same one-arithmetic-anchor argument; Mongo values ride the blob"),
     ),
     (
         "gremlin_capture_job_stall",
         NA("MySQL has no external capture job — the binlog IS the capture"),
         NA("PG has no external capture job — the slot decodes on read"),
         Test("fn gremlin_mssql_capture_job_stall_loses_nothing"),
+        NA("Mongo has no external capture job — the oplog IS the capture, like MySQL"),
     ),
 ];
 
@@ -226,13 +291,15 @@ fn every_cdc_engine_covers_every_conformance_case() {
     mysql_pg.push_str(&fs::read_to_string(root.join("tests/live/live_cdc_oracle.rs")).unwrap());
     mysql_pg.push_str(&fs::read_to_string(root.join("tests/live/live_cdc_mbt.rs")).unwrap());
     let mssql = fs::read_to_string(root.join("tests/live/live_cdc_mssql.rs")).unwrap();
+    let mongo = fs::read_to_string(root.join("tests/live/live_cdc_mongo.rs")).unwrap();
 
     let mut missing = Vec::new();
-    for (case, my, pg, ms) in CASES {
+    for (case, my, pg, ms, mo) in CASES {
         for (engine, expect, hay) in [
             ("mysql", my, &mysql_pg),
             ("postgres", pg, &mysql_pg),
             ("mssql", ms, &mssql),
+            ("mongo", mo, &mongo),
         ] {
             match expect {
                 Test(needle) => {
@@ -293,6 +360,7 @@ fn every_live_cdc_test_asserts_an_outcome() {
         "tests/live/live_cdc_mbt.rs",
         "tests/live/live_cdc_property.rs",
         "tests/live/live_batch_switch_golden.rs",
+        "tests/live/live_cdc_mongo.rs",
     ] {
         let src = fs::read_to_string(root.join(file)).unwrap();
         // Split on test attributes; each chunk is one test body (plus tail).
@@ -332,13 +400,25 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 // canonical reader; oracle diversity is the defense.
                 || chunk.contains("distinct_ids(")
                 || chunk.contains("distinct_int_ids(")
+                || chunk.contains("read_mongo_cdc_changes(") // Mongo blob-CDC oracle
+                || chunk.contains("dir_parquet_distinct_strings(")
                 || chunk.contains("read_all(")
                 || chunk.contains("read_all_parts(")
                 || chunk.contains("stage_metrics(")
                 || chunk.contains("collect(") && chunk.contains("Metrics")
                 || chunk.contains("all_ok") // doctor --json contract
                 || chunk.contains("storage/v1") // GCS listing read-back
-                || chunk.contains("ParquetRecordBatchReaderBuilder"); // inline part read-back
+                || chunk.contains("ParquetRecordBatchReaderBuilder") // inline part read-back
+                // A must-fail capture asserts the NEGATIVE outcome: `run_expect_fail`
+                // requires a non-zero exit, so a silent 0-row success CANNOT satisfy
+                // it (the exact risk this gate guards). E.g. the corrupt-checkpoint
+                // roast — the run must fail loudly, not re-anchor and exit 0.
+                || chunk.contains("run_expect_fail(")
+                // Reads the persisted CDC checkpoint/anchor bytes back
+                // (`std::fs::read(rig.checkpoint())`) — the client-anchor engines'
+                // state-DB oracle. A checkpoint-advance/pin assertion is a real
+                // outcome (the committed log position), distinct from row read-back.
+                || chunk.contains("checkpoint())");
             if runs_capture && !asserts_outcome {
                 naked.push(format!("{file}::{name}"));
             }

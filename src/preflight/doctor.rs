@@ -281,6 +281,12 @@ fn check_source_auth(config: &Config) -> Result<()> {
             crate::source::mssql::MssqlSource::connect_with_tls(&url, tls)?;
             Ok(())
         }
+        SourceType::Mongo => {
+            // `connect_with_tls` runs a connect + `ping` round-trip itself, so a
+            // successful construction is a green health-check.
+            crate::source::mongo::MongoSource::connect(&url, tls, None)?;
+            Ok(())
+        }
     }
 }
 
@@ -579,6 +585,9 @@ pub(crate) fn source_error_hint(
             SourceType::Mssql => {
                 "TLS handshake failed. SQL Server forces TLS on the login handshake; set `tls.ca_file: /path/to/ca-bundle.pem` to trust a private CA, or `tls.accept_invalid_certs: true` for a self-signed dev cert."
             }
+            SourceType::Mongo => {
+                "TLS handshake failed. For MongoDB, enable TLS in the connection string (`?tls=true`) and set `tls.ca_file: /path/to/ca-bundle.pem` for a private CA, or `tls.accept_invalid_certs: true` for a self-signed dev cert."
+            }
         });
     }
 
@@ -592,6 +601,9 @@ pub(crate) fn source_error_hint(
             }
             SourceType::Mssql => {
                 "Verify the SQL login/password and that the login maps to a database user with SELECT on the target tables (`GRANT SELECT ON dbo.tbl TO [user]`). Check you are pointed at the right database — contained-DB users and server logins are resolved differently."
+            }
+            SourceType::Mongo => {
+                "Verify the user/password and `authSource`. MongoDB scopes users to an auth database — add `?authSource=admin` (or the DB where the user was created) to the connection URL, and grant the user the `read` role on the target database."
             }
         }),
         "connectivity error" => Some(

@@ -13,7 +13,7 @@ use super::finalize::finalize_run_report;
 use super::summary::RunSummary;
 use crate::config::{Config, ExportConfig};
 use crate::error::Result;
-use crate::source::cdc::{CdcCapture, CdcConfig, CdcEngine, run_capture};
+use crate::source::cdc::{CdcCapture, CdcConfig, CdcEngine, CdcEngineOpts, run_capture};
 use crate::state::StateStore;
 
 /// Run one `mode: cdc` export end to end, then record + report it like a batch
@@ -286,17 +286,32 @@ fn run_cdc_inner(
     run_capture(CdcCapture {
         cdc_cfg: CdcConfig {
             url,
-            server_id: cdc
-                .server_id
-                .unwrap_or(crate::config::DEFAULT_MYSQL_SERVER_ID),
-            slot: cdc
-                .slot
-                .clone()
-                .unwrap_or_else(|| crate::config::DEFAULT_PG_SLOT.to_string()),
-            capture_instance: cdc.capture_instance.clone(),
             checkpoint: cdc.checkpoint.as_ref().map(PathBuf::from),
             until_current: cdc.until_current,
             tls: config.source.tls.clone(),
+            engine: match config.source.source_type {
+                crate::config::SourceType::Mysql => CdcEngineOpts::Mysql {
+                    server_id: cdc
+                        .server_id
+                        .unwrap_or(crate::config::DEFAULT_MYSQL_SERVER_ID),
+                },
+                crate::config::SourceType::Postgres => CdcEngineOpts::Postgres {
+                    slot: cdc
+                        .slot
+                        .clone()
+                        .unwrap_or_else(|| crate::config::DEFAULT_PG_SLOT.to_string()),
+                },
+                crate::config::SourceType::Mssql => CdcEngineOpts::Mssql {
+                    capture_instance: cdc.capture_instance.clone(),
+                },
+                crate::config::SourceType::Mongo => {
+                    CdcEngineOpts::Mongo {
+                        canonical: config.source.mongo.as_ref().is_some_and(|m| {
+                            matches!(m.json, crate::config::MongoJsonMode::Canonical)
+                        }),
+                    }
+                }
+            },
         },
         outputs,
         format: export.format,

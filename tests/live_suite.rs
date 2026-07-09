@@ -69,6 +69,8 @@ mod live_cdc;
 mod live_cdc_golden;
 #[path = "live/live_cdc_mbt.rs"]
 mod live_cdc_mbt;
+#[path = "live/live_cdc_mongo.rs"]
+mod live_cdc_mongo;
 #[path = "live/live_cdc_mssql.rs"]
 mod live_cdc_mssql;
 #[path = "live/live_cdc_oracle.rs"]
@@ -107,6 +109,14 @@ mod live_init_extended;
 mod live_keyset;
 #[path = "live/live_metrics_persist.rs"]
 mod live_metrics_persist;
+#[path = "live/live_mongo.rs"]
+mod live_mongo;
+#[path = "live/live_mongo_crash_recovery.rs"]
+mod live_mongo_crash_recovery;
+#[path = "live/live_mongo_harm_permission.rs"]
+mod live_mongo_harm_permission;
+#[path = "live/live_mongo_retry_and_faults.rs"]
+mod live_mongo_retry_and_faults;
 #[path = "live/live_mssql_chunked.rs"]
 mod live_mssql_chunked;
 #[path = "live/live_mssql_chunked_recovery.rs"]

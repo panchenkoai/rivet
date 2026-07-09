@@ -257,3 +257,66 @@ datestyle, bytea_output, sql_mode) and add one live test that flips the
 state to a non-default (a `+09:00` global, an `Asia/Tokyo` database
 default) with a guard that resets it. Parity at default state is not
 evidence — the default is exactly where the bug hides.
+
+## Keyset seek is type-bracketed — a heterogeneous key silently loses all but one type
+
+A keyset/seek paginator that advances with `col > cursor` assumes the key
+space is ONE totally-ordered domain. On a store where the comparison operator
+is **type-bracketed**, that assumption fails silently. MongoDB's `$gt`/`$lt`
+compare only WITHIN a BSON type bracket (numbers, then strings, then …): once a
+keyset cursor reaches the last number, `{_id: {$gt: 2000}}` matches **zero**
+string `_id`s even though strings sort *after* numbers — so a collection mixing
+`_id` types pages only the first bracket and drops the rest. Verified: an
+int+string collection read 2000/4000 single-worker (parallel varied ~3000/4000,
+because `$sample` boundaries then straddle the type gap). Every count/sum check
+that trusts the paginator passes — the loss is 100% invisible without a
+per-type re-read of the destination.
+
+The full-scan path (a single unbounded cursor sorted by `_id`, no `$gt` seek)
+is immune — it crosses brackets. So the fix is not to make keyset cross types
+(the index seek fundamentally can't) but to **detect the heterogeneous key up
+front and refuse keyset/parallel loudly**, pointing at the full scan. The
+detector compares the BSON *bracket* (not the raw type) of the min and max
+`_id` — the four numeric types share a bracket, so a mixed Int32/Int64/Double
+`_id` still keysets (`src/source/mongo/mod.rs::ensure_uniform_id_type`,
+`id_bracket`).
+
+Process rule: **any seek/keyset paginator on a store whose range operator is
+type-bracketed (Mongo `$gt`, and check before assuming any document/columnar
+store isn't) needs a heterogeneous-key guard + a live test that seeds two key
+types and asserts the paginator ERRORS (never silently exports one bracket),
+while the unbounded scan stays complete.** Counts/sums are not evidence here —
+the dropped bracket is a clean, self-consistent subset.
+
+## Every engine's live tests go through the canonical Rig — no bespoke harness
+
+There is ONE way to build a config, run rivet, and read the output back in a
+live test: the `Rig` (`tests/common/rig.rs`). It owns its tempdir (no leaks),
+renders the config for any `source.type`, drives batch (`run_ok` /
+`run_expect_fail` / `run_and_read`) and CDC (`mode: cdc` via `mongo_cdc`/
+`mysql_cdc`/… + `checkpoint_path`), injects faults (`run_with_env`), and the
+CDC conformance gate recognises `Rig::run*` as its capture markers. It exists
+because ~250 hand-rolled YAML templates + ~240 inline `Command::new(RIVET_BIN)`
+sites drifted apart; the rig re-converged them.
+
+When a NEW source engine lands (the Mongo pass was the reminder), wire its live
+tests through the rig, do NOT stand up a parallel path:
+
+- Add `Rig::<engine>_batch(table)` (+ `Rig::<engine>_cdc(table)` if it has CDC)
+  and any engine-specific option method (`.mongo("page_size: 500")`), rather
+  than a per-file `write_cfg` / `run_export` / `cdc_run` helper. A private
+  config-writer that `format!`s the YAML — and worse, a `std::mem::forget`
+  tempdir to keep the path alive — is the exact smell the rig removes (the rig
+  already owns the tempdir).
+- Drive CDC through **config mode** (`mode: cdc`) like the SQL engines, not the
+  `rivet cdc` CLI subcommand, so all engines share one CDC path and the gate's
+  `Rig::run*` capture markers apply without a bespoke addition.
+- If the engine's read-back oracle is new (Mongo's `read_mongo_cdc_changes`),
+  add that ONE marker to `every_live_cdc_test_asserts_an_outcome`'s dictionary —
+  don't route captures around the gate.
+
+Process rule: **a new engine's test PR that introduces a `write_cfg`-style YAML
+builder or a `*_run`/`cdc_run` command wrapper instead of a `Rig::<engine>_*`
+constructor is incomplete** — the review asks for the rig constructor. The rig
+is the seam; per-file config builders are the ~250 templates it replaced coming
+back one engine at a time.

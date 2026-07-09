@@ -168,7 +168,13 @@ pub(crate) fn run_export(
     config_path: &str,
 ) -> Result<()> {
     // Keyset (seek) pagination owns its own sequential paging loop (OPT-4).
-    if matches!(plan.strategy, ExtractionStrategy::Keyset(_)) {
+    if let ExtractionStrategy::Keyset(kp) = &plan.strategy {
+        // A MongoDB keyset export with `parallel: N` fans N disjoint `_id`-range
+        // workers (each keyset-paging its slice); every other keyset stays the
+        // single sequential seek loop.
+        if plan.source.source_type == crate::config::SourceType::Mongo && kp.parallel.max(1) > 1 {
+            return super::mongo_parallel::run_mongo_parallel(plan, summary, state, kp);
+        }
         return super::keyset::run_keyset(src, plan, summary, Some(state));
     }
 
@@ -640,6 +646,7 @@ mod tests {
                 environment: None,
                 tuning: None,
                 tls: None,
+                mongo: None,
             },
             column_overrides: Default::default(),
             verify: crate::config::VerifyMode::Size,

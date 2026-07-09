@@ -390,6 +390,50 @@ impl Config {
             self.validate_export(export)?;
         }
         self.validate_cdc_resource_conflicts()?;
+        self.validate_non_sql_source_modes()?;
+        Ok(())
+    }
+
+    /// Non-SQL sources (MongoDB) support only `mode: full` today. Chunked /
+    /// incremental / keyset / time-window all build SQL predicates over an
+    /// introspectable columnar schema, and CDC (change streams) is a separate,
+    /// not-yet-implemented seam. Rejecting the other modes here is precisely
+    /// what makes the SQL-only builders' `unreachable!` arms
+    /// (`sql::quote_ident`, `query::cursor_rhs`, …) provably unreachable for a
+    /// document-store source.
+    fn validate_non_sql_source_modes(&self) -> crate::error::Result<()> {
+        if self.source.source_type.is_sql() {
+            return Ok(());
+        }
+        for e in &self.exports {
+            if !matches!(e.mode, ExportMode::Full | ExportMode::Cdc) {
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_SOURCE_MODE_UNSUPPORTED,
+                    "export '{}': source type '{:?}' supports `mode: full` (batch) and \
+                     `mode: cdc` (change streams) (got `mode: {:?}`). MongoDB has no SQL, so \
+                     chunked / incremental / keyset / time-window are not available; every \
+                     document exports as `_id` + a `document` JSON column.",
+                    e.name,
+                    self.source.source_type,
+                    e.mode
+                );
+            }
+            // An impossible combination must be a config error, not a silent
+            // behavior downgrade: the parallel `_id`-range path keeps NO keyset
+            // checkpoint, so `resume: true` was silently ignored — the whole
+            // collection re-read every run with no warning (bug-hunt find).
+            if e.parallel > 1 && self.source.mongo.as_ref().is_some_and(|m| m.resume) {
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_SOURCE_MODE_UNSUPPORTED,
+                    "export '{}': `source.mongo.resume: true` cannot be combined with \
+                     `parallel: {}` — the parallel `_id`-range fan-out keeps no keyset \
+                     checkpoint, so resume would be silently ignored. Drop `parallel` \
+                     to keep cross-run resume, or drop `resume` to keep the fan-out.",
+                    e.name,
+                    e.parallel
+                );
+            }
+        }
         Ok(())
     }
 
@@ -445,6 +489,11 @@ impl Config {
                     }
                 }
                 SourceType::Mssql => {}
+                // MongoDB change streams watch the whole database — no per-export
+                // slot or server_id to collide. Two Mongo CDC exports sharing a
+                // `checkpoint:` path IS still a conflict, caught by the shared
+                // checkpoint check below.
+                SourceType::Mongo => {}
             }
             if let Some(ckpt) = cdc.and_then(|c| c.checkpoint.as_deref())
                 && let Some(prev) = checkpoints.insert(ckpt, &e.name)
@@ -1065,6 +1114,47 @@ impl Config {
                 export.name,
                 self.source.source_type
             );
+        }
+
+        // MongoDB change streams have NO server-side resume anchor (unlike a
+        // PostgreSQL slot): the checkpoint file IS the anchor. Without it, every
+        // run re-anchors at "now" and silently loses every change since the last
+        // run — so `mode: cdc` on mongo requires `cdc.checkpoint:` ALWAYS, not
+        // only under `initial: snapshot` (bug-hunt find).
+        if export.mode == ExportMode::Cdc
+            && self.source.source_type == SourceType::Mongo
+            && export
+                .cdc
+                .as_ref()
+                .and_then(|c| c.checkpoint.as_ref())
+                .is_none()
+        {
+            anyhow::bail!(
+                "export '{}': MongoDB `mode: cdc` requires `cdc.checkpoint:` — a change \
+                 stream has no server-side resume anchor, so without the checkpoint file \
+                 each run re-anchors at the current time and silently loses every change \
+                 between runs.",
+                export.name
+            );
+        }
+
+        // A collection whose name contains a dot does not route through the
+        // change-stream capture — its events are silently dropped. Refuse loudly
+        // rather than report 0-row success forever (bug-hunt find). Batch handles
+        // dotted names fine, so this is CDC-only.
+        if export.mode == ExportMode::Cdc && self.source.source_type == SourceType::Mongo {
+            let dotted = |t: &str| t.contains('.');
+            if export.table.as_deref().is_some_and(dotted)
+                || export.tables.iter().flatten().any(|t| dotted(t))
+            {
+                anyhow::bail!(
+                    "export '{}': MongoDB `mode: cdc` does not support a collection name \
+                     containing a dot — the change-stream router cannot address it and its \
+                     events would be silently dropped. Rename the collection, or capture it \
+                     with `mode: full` (batch handles dotted names).",
+                    export.name
+                );
+            }
         }
 
         if let Some(days) = export.chunk_by_days {

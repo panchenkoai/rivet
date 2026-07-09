@@ -242,6 +242,7 @@ fn reject_unrecoverable_inline_url(artifact: &PlanArtifact) -> Result<()> {
             crate::config::SourceType::Postgres => "postgres",
             crate::config::SourceType::Mysql => "mysql",
             crate::config::SourceType::Mssql => "mssql",
+            crate::config::SourceType::Mongo => "mongo",
         },
     )
 }
@@ -302,6 +303,7 @@ mod tests {
                 environment: None,
                 tuning: None,
                 tls: None,
+                mongo: None,
             },
             column_overrides: Default::default(),
             verify: crate::config::VerifyMode::Size,

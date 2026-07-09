@@ -2,6 +2,7 @@ mod analysis;
 mod cdc_health;
 pub(crate) mod cursor_expr;
 mod doctor;
+mod mongo;
 mod mssql;
 mod mysql;
 mod postgres;
@@ -169,6 +170,7 @@ pub(crate) fn get_export_diagnostic(
         SourceType::Postgres => postgres::diagnose_export_pg(&url, tls, export),
         SourceType::Mysql => mysql::diagnose_export_mysql(&url, tls, export),
         SourceType::Mssql => mssql::diagnose_export_mssql(&url, tls, export),
+        SourceType::Mongo => mongo::diagnose_export_mongo(&url, tls, export),
     }
 }
 
@@ -255,6 +257,7 @@ pub fn check(
         SourceType::Postgres => postgres::check_postgres(&url, tls, &exports)?,
         SourceType::Mysql => mysql::check_mysql(&url, tls, &exports)?,
         SourceType::Mssql => mssql::check_mssql(&url, tls, &exports)?,
+        SourceType::Mongo => mongo::check_mongo(&url, tls, &exports)?,
     };
     if !json_output {
         for diag in &diagnostics {

@@ -31,6 +31,12 @@ pub(crate) fn quote_ident(source_type: SourceType, name: &str) -> String {
         SourceType::Mysql => format!("`{}`", name.replace('`', "``")),
         // SQL Server bracket-quoting: `[col]`; internal `]` doubled (`[a]]b]`).
         SourceType::Mssql => format!("[{}]", name.replace(']', "]]")),
+        // MongoDB has no SQL identifier dialect. Every SQL builder is guarded by
+        // full-mode-only validation, so this arm is unreachable — panic loudly
+        // if a future path ever routes a Mongo source through SQL.
+        SourceType::Mongo => unreachable!(
+            "quote_ident: MongoDB has no SQL dialect (guarded by full-mode-only validation)"
+        ),
     }
 }
 
@@ -204,6 +210,11 @@ pub(crate) fn null_key_probe_sql(source_type: SourceType, col: &str, base_query:
         SourceType::Postgres | SourceType::Mysql => {
             format!("SELECT 1 FROM {from} WHERE {q} IS NULL LIMIT 1")
         }
+        // Unreachable: the null-key probe is a chunked-mode concern, and chunked
+        // mode is rejected for MongoDB at config validation.
+        SourceType::Mongo => unreachable!(
+            "null_key_probe_sql: MongoDB has no SQL (chunked mode is rejected for Mongo)"
+        ),
     }
 }
 
@@ -242,6 +253,10 @@ pub(crate) fn row_estimate_sql(source_type: SourceType, table_ident: &str) -> Op
             "SELECT SUM(p.row_count) FROM sys.dm_db_partition_stats p \
              WHERE p.object_id = OBJECT_ID('{table_ident}') AND p.index_id IN (0,1)"
         )),
+        // No scan-free row estimate for MongoDB in this SQL helper — the
+        // chunk-sparsity diagnostic is a SQL/chunked concern Mongo never reaches.
+        // `None` = "unknown", which the caller already tolerates.
+        SourceType::Mongo => None,
     }
 }
 

@@ -18,8 +18,8 @@ Every field Rivet accepts in a config YAML, grouped by section.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `type` | `postgres` \| `mysql` \| `mssql` | **yes** | — | Database type. `mssql` = SQL Server (URL scheme `sqlserver://`). |
-| `url` | string | one of url/url_env/url_file or structured | — | Full connection URL (`postgresql://` / `mysql://` / `sqlserver://`) |
+| `type` | `postgres` \| `mysql` \| `mssql` \| `mongo` | **yes** | — | Database type. `mssql` = SQL Server (URL scheme `sqlserver://`); `mongo` = MongoDB (URL scheme `mongodb://`, see [mongodb.md](mongodb.md)). |
+| `url` | string | one of url/url_env/url_file or structured | — | Full connection URL (`postgresql://` / `mysql://` / `sqlserver://` / `mongodb://`) |
 | `url_env` | string | | — | Env var name containing the URL |
 | `url_file` | string | | — | Path to file containing the URL |
 | `host` | string | for structured | — | Database hostname |

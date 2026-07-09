@@ -148,9 +148,17 @@ impl TableSink<'_> {
 /// and table separately; comparing the config string verbatim against the
 /// bare event table silently routed ZERO events for qualified configs.
 pub(super) fn table_matches(cfg: &str, schema: &str, table: &str) -> bool {
+    // Full-name match FIRST: a MongoDB collection name may contain dots
+    // (`my.coll`) and has no schema qualifier, so splitting it into a bogus
+    // `schema.table` dropped every event (bug-hunt: 0-row success forever). This
+    // is safe for SQL — no real table is literally named `schema.table`.
+    if cfg == table {
+        return true;
+    }
+    // Otherwise a SQL `schema.table` qualifier.
     match cfg.split_once('.') {
         Some((cs, ct)) => cs == schema && ct == table,
-        None => cfg == table,
+        None => false,
     }
 }
 
@@ -281,7 +289,15 @@ pub(crate) fn run_to_files(
             break;
         }
     }
-    if sinks.iter().any(|s| !s.buf.is_empty()) {
+    // Final roll fires when a captured table has buffered rows OR when a commit
+    // boundary is unacked. The latter is the fix for a stream whose ONLY traffic
+    // was uncaptured tables: `last_commit`/`unacked_commit` advanced (before the
+    // routing filter) but no captured buffer ever triggered a roll, so without
+    // this the checkpoint never moved — every scheduler cycle re-read the whole
+    // uncaptured backlog until the log rolled past it (bug-hunt K, cross-engine).
+    // `roll_all` flushes nothing when the buffers are empty; it just persists the
+    // checkpoint + acks.
+    if unacked_commit || sinks.iter().any(|s| !s.buf.is_empty()) {
         roll_all(
             &mut sinks,
             stream,
@@ -743,6 +759,16 @@ mod tests {
             !table_matches("orders", "public", "users"),
             "different table differs"
         );
+    }
+
+    #[test]
+    fn roast_dotted_collection_name_routes_by_full_name() {
+        // A MongoDB collection literally named `my.data` (dots are legal, no
+        // schema concept) must route by its FULL name — before this it was
+        // mis-split into schema=`my`, table=`data` and routed ZERO events forever.
+        assert!(table_matches("my.data", "shopdb", "my.data"));
+        // Still distinguishes a genuinely different collection.
+        assert!(!table_matches("my.data", "shopdb", "my.other"));
     }
 
     // The nameless (binlog_row_metadata=MINIMAL) guard path: an image whose

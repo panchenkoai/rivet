@@ -414,11 +414,15 @@ fn export_block_lines(
     let mode = mode_override.unwrap_or_else(|| info.suggest_mode());
     let columns: Vec<&str> = info.columns.iter().map(|c| c.name.as_str()).collect();
     let col_list = columns.join(", ");
-    let qualified_table = if info.schema == "public" || source_type == "mysql" {
-        info.table.clone()
-    } else {
-        format!("{}.{}", info.schema, info.table)
-    };
+    let qualified_table =
+        if info.schema == "public" || source_type == "mysql" || source_type == "mongo" {
+            // Mongo: `info.schema` is the database and the export targets the bare
+            // collection name (the URL already selects the database), so it is never
+            // qualified — same as a MySQL table or a PG `public` table.
+            info.table.clone()
+        } else {
+            format!("{}.{}", info.schema, info.table)
+        };
 
     // CDC reads the transaction log, not a query — a wholly different block
     // (no cursor/chunk/meta_columns; engine-specific stream knobs instead).
@@ -435,7 +439,13 @@ fn export_block_lines(
     // form: those modes usually start from a curated column set and benefit from
     // a self-documenting YAML.
     let mut lines = vec![format!("  - name: {}", yaml_quote_if_needed(&info.table))];
-    if mode == "full" && source_type == "postgres" && is_simple_pg_ident(&qualified_table) {
+    if mode == "full"
+        && (source_type == "postgres" || source_type == "mongo")
+        && is_simple_pg_ident(&qualified_table)
+    {
+        // MongoDB has no SQL: the `table:` shortcut (→ collection scan) is the
+        // ONLY export form it accepts, and it is schemaless so there is no
+        // column list to spell out. Always emit `table:` for a Mongo source.
         lines.push(format!("    table: {qualified_table}"));
     } else {
         lines.push("    query: >".to_string());

@@ -168,6 +168,7 @@ mod tests {
                 environment: None,
                 tuning: None,
                 tls: None,
+                mongo: None,
             },
             column_overrides: Default::default(),
             verify: crate::config::VerifyMode::Size,

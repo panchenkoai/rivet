@@ -93,6 +93,23 @@ impl Rig {
         r
     }
 
+    /// Mongo batch (standalone :27017). The db varies per test — chain
+    /// `.source_url(&MongoTest::url(PORT, &db))`.
+    pub fn mongo_batch(table: &str) -> Self {
+        Self::new("mongo", super::env::MONGO_URL, table)
+    }
+
+    /// Mongo CDC (change stream — replica set :27018), `until_current` + a
+    /// checkpoint, like the SQL CDC constructors. Override the db with
+    /// `.source_url(&MongoTest::url(PORT, &db))`.
+    pub fn mongo_cdc(table: &str) -> Self {
+        let mut r = Self::new("mongo", super::env::MONGO_RS_URL, table);
+        r.mode = "cdc";
+        r.cdc_lines.push("until_current: true".into());
+        r.cdc_lines.push("__CKPT__".into()); // resolved at render time
+        r
+    }
+
     /// Export mode (`full` / `incremental` / `chunked`); CDC constructors
     /// set `cdc`.
     pub fn mode(mut self, mode: &'static str) -> Self {
@@ -122,6 +139,12 @@ impl Rig {
     /// Extra `cdc:` map entries, e.g. `initial: snapshot`.
     pub fn cdc(mut self, line: &str) -> Self {
         self.cdc_lines.push(line.to_string());
+        self
+    }
+
+    /// `source.mongo.*` options, e.g. `.mongo("page_size: 500, resume: true")`.
+    pub fn mongo(mut self, opts: &str) -> Self {
+        self.source_lines.push(format!("mongo: {{ {opts} }}"));
         self
     }
 

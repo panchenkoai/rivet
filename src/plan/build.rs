@@ -59,7 +59,7 @@ pub fn build_plan(
     };
 
     let strategy = match export.mode {
-        ExportMode::Full => ExtractionStrategy::Snapshot,
+        ExportMode::Full => full_strategy(config, export),
         ExportMode::Incremental => {
             let primary_column = export.cursor_column.clone().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -144,6 +144,28 @@ pub fn build_plan(
         shape_drift_warn_factor: export.shape_drift_warn_factor.unwrap_or(2.0),
         parquet: export.parquet.clone(),
     })
+}
+
+/// The strategy for `mode: full`. Source-aware: a MongoDB source with
+/// `source.mongo.page_size` reads by `_id`-keyset pages (bounded query time,
+/// per-page parts, the base for parallel `_id`-range reads) instead of one
+/// long-held cursor. Every SQL engine — and MongoDB without `page_size` — uses
+/// the single-cursor snapshot.
+fn full_strategy(config: &Config, export: &ExportConfig) -> ExtractionStrategy {
+    if config.source.source_type == crate::config::SourceType::Mongo
+        && let Some(mongo) = config.source.mongo.as_ref()
+        && let Some(page) = mongo.page_size
+    {
+        return ExtractionStrategy::Keyset(KeysetPlan {
+            key_column: "_id".to_string(),
+            chunk_size: page.max(1),
+            // Resume is opt-in: default keeps `mode: full` re-reading each run.
+            checkpoint: mongo.resume,
+            // `parallel: N` fans N `_id`-range workers (Mongo reader only).
+            parallel: export.parallel,
+        });
+    }
+    ExtractionStrategy::Snapshot
 }
 
 /// Resolve the strategy for `mode: chunked`.
@@ -288,6 +310,10 @@ fn resolve_chunked_strategy(
                 tbl,
             )
         }
+        crate::config::SourceType::Mongo => anyhow::bail!(
+            "chunked mode is not supported for MongoDB — use `mode: full` (the whole \
+             collection is read as `_id` + `document` JSON)"
+        ),
     }
     .map_err(|e| {
         anyhow::anyhow!(
@@ -382,6 +408,10 @@ fn resolve_chunked_strategy(
         return Ok(ExtractionStrategy::Keyset(KeysetPlan {
             key_column: key.to_string(),
             chunk_size,
+            // SQL keyset is a full re-read each run (no cross-run resume).
+            checkpoint: false,
+            // SQL keyset is sequential; parallel `_id`-range is a Mongo capability.
+            parallel: 1,
         }));
     }
 
@@ -436,6 +466,8 @@ fn resolve_chunked_strategy(
                     return Ok(ExtractionStrategy::Keyset(KeysetPlan {
                         key_column: key.to_string(),
                         chunk_size,
+                        checkpoint: false,
+                        parallel: 1,
                     }));
                 }
                 anyhow::bail!(
@@ -533,6 +565,7 @@ mod tests {
             environment: None,
             tuning: None,
             tls: None,
+            mongo: None,
         }
     }
 

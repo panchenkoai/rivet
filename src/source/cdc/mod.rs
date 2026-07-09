@@ -239,26 +239,44 @@ pub(crate) fn run(
     Ok(())
 }
 
+/// The per-engine CDC knobs — each variant carries ONLY the parameters its
+/// engine reads, so the live set is obvious at a glance (a MySQL run has no
+/// `slot`, a Mongo run has no `server_id`) and a new engine adds a self-contained
+/// variant instead of a field every other engine ignores. The engine identity is
+/// the variant itself — [`create_change_stream`] matches it directly, no
+/// re-resolution from the URL.
+#[derive(Debug, Clone)]
+pub(crate) enum CdcEngineOpts {
+    /// MySQL replica id (the binlog `server_id`).
+    Mysql { server_id: u32 },
+    /// PostgreSQL logical slot name.
+    Postgres { slot: String },
+    /// SQL Server capture instance (required for `sqlserver://`).
+    Mssql { capture_instance: Option<String> },
+    /// Render the `document` blob as canonical (type-tagged) extended JSON — the
+    /// `source.mongo.json: canonical` mode, so a CDC stream and a full export
+    /// produce identical text. Config-driven only; the CLI defaults to relaxed.
+    Mongo { canonical: bool },
+}
+
 /// Connection + resume parameters for `rivet cdc`, across engines — the CDC
-/// sibling of [`crate::source::create_source`]'s `SourceConfig`.
+/// sibling of [`crate::source::create_source`]'s `SourceConfig`. The fields here
+/// are engine-agnostic; per-engine knobs live in [`CdcEngineOpts`].
 pub(crate) struct CdcConfig {
     pub url: String,
-    /// MySQL replica id.
-    pub server_id: u32,
-    /// PostgreSQL logical slot name.
-    pub slot: String,
-    /// SQL Server capture instance (required for `sqlserver://`).
-    pub capture_instance: Option<String>,
-    /// MySQL checkpoint file (PG resumes via the slot; SQL Server via its LSN).
+    /// MySQL checkpoint file (PG resumes via the slot; SQL Server via its LSN;
+    /// MongoDB via the resume token).
     pub checkpoint: Option<PathBuf>,
     /// Catch up to the source's current end and exit, instead of streaming
-    /// indefinitely. For MySQL this sets `BINLOG_DUMP_NON_BLOCK`; PostgreSQL /
-    /// SQL Server already drain their backlog and exit, so it is a no-op there.
+    /// indefinitely. MySQL sets `BINLOG_DUMP_NON_BLOCK`; PG / SQL Server drain
+    /// their backlog and exit; MongoDB polls with `next_if_any` to "current".
     pub until_current: bool,
     /// Transport security, applied by every adapter through the same
     /// `require_tls_or_loopback` gate the batch path uses (refuse remote
     /// plaintext / unauthenticated TLS). `None` ⇒ loopback-only (the CLI default).
     pub tls: Option<crate::config::TlsConfig>,
+    /// The engine + its knobs — the CDC engine identity for dispatch.
+    pub engine: CdcEngineOpts,
 }
 
 /// How many changes a poll adapter pulls per `peek` — the drain's memory bound.
@@ -300,6 +318,7 @@ pub(crate) enum CdcEngine {
     Mysql,
     Postgres,
     Mssql,
+    Mongo,
 }
 
 impl CdcEngine {
@@ -310,9 +329,11 @@ impl CdcEngine {
             Ok(Self::Postgres)
         } else if url.starts_with("sqlserver://") || url.starts_with("mssql://") {
             Ok(Self::Mssql)
+        } else if url.starts_with("mongodb://") || url.starts_with("mongodb+srv://") {
+            Ok(Self::Mongo)
         } else {
             anyhow::bail!(
-                "rivet cdc: unsupported source url — expected mysql:// / postgresql:// / sqlserver://"
+                "rivet cdc: unsupported source url — expected mysql:// / postgresql:// / sqlserver:// / mongodb://"
             )
         }
     }
@@ -323,6 +344,7 @@ impl CdcEngine {
             Self::Mysql => "mysql",
             Self::Postgres => "postgres",
             Self::Mssql => "mssql",
+            Self::Mongo => "mongo",
         }
     }
 
@@ -357,7 +379,7 @@ impl CdcEngine {
                 )?);
                 Ok(())
             }
-            Self::Mysql | Self::Mssql => {
+            Self::Mysql | Self::Mssql | Self::Mongo => {
                 let ckpt = checkpoint.ok_or_else(|| {
                     anyhow::anyhow!(
                         "{} cdc: an anchor needs cdc.checkpoint (no server-side anchor exists)",
@@ -386,7 +408,10 @@ impl CdcEngine {
                             url, ckpt, tls,
                         )
                     }
-                    _ => crate::source::mssql::cdc::pin_checkpoint_at_max_lsn(url, ckpt, tls),
+                    Self::Mssql => {
+                        crate::source::mssql::cdc::pin_checkpoint_at_max_lsn(url, ckpt, tls)
+                    }
+                    _ => crate::source::mongo::cdc::pin_checkpoint_at_current(url, tls, ckpt),
                 }
             }
         }
@@ -399,6 +424,7 @@ impl CdcEngine {
 pub(crate) const MYSQL_CDC_HINT: &str = "if this is a permissions/setup error: MySQL CDC needs binlog_format=ROW plus a REPLICATION SLAVE + REPLICATION CLIENT grant (and SELECT on the table) — see the 'MySQL — the binlog grants' section of docs/reference/cdc.md";
 pub(crate) const PG_CDC_HINT: &str = "if this is a permissions/setup error: PostgreSQL CDC needs wal_level=logical and a role with the REPLICATION attribute — see the 'PostgreSQL — the logical slot' section of docs/reference/cdc.md";
 pub(crate) const MSSQL_CDC_HINT: &str = "if this is a permissions/setup error: SQL Server CDC must be enabled on the table (sys.sp_cdc_enable_table) with SQL Server Agent running, and the reader needs SELECT on the cdc schema — see the 'SQL Server — CDC change tables' section of docs/reference/cdc.md";
+pub(crate) const MONGO_CDC_HINT: &str = "if this is a setup error: MongoDB change streams require a replica set (a single-node replica set is fine) — a standalone mongod cannot watch(); the reader needs a role that can run changeStream (readAnyDatabase / read on the db) — see the 'MongoDB — change streams' section of docs/reference/cdc.md";
 
 /// Construct the right [`ChangeStream`] adapter for the source URL's scheme —
 /// dispatching by engine exactly as [`crate::source::create_source`] does for the
@@ -410,18 +436,19 @@ pub(crate) fn create_change_stream(
     use anyhow::Context;
     let url = cfg.url.as_str();
     let tls = cfg.tls.as_ref();
-    match CdcEngine::from_url(url)? {
-        CdcEngine::Mysql => Ok(Box::new(
+    // The engine identity IS the opts variant — no re-resolution from the URL.
+    match &cfg.engine {
+        CdcEngineOpts::Mysql { server_id } => Ok(Box::new(
             crate::source::mysql::cdc::MysqlChangeStream::open_or_resume(
                 url,
-                cfg.server_id,
+                *server_id,
                 cfg.checkpoint.as_deref(),
                 cfg.until_current,
                 tls,
             )
             .context(MYSQL_CDC_HINT)?,
         )),
-        CdcEngine::Postgres => {
+        CdcEngineOpts::Postgres { slot } => {
             // A persisted checkpoint proves a prior run happened — if the slot is
             // then MISSING, it was dropped/invalidated and silently recreating it
             // at the current position would skip everything since (a silent gap).
@@ -433,7 +460,7 @@ pub(crate) fn create_change_stream(
             Ok(Box::new(
                 crate::source::postgres::cdc::PgChangeStream::open(
                     url,
-                    &cfg.slot,
+                    slot,
                     resume_expected,
                     tls,
                     peek,
@@ -441,8 +468,8 @@ pub(crate) fn create_change_stream(
                 .context(PG_CDC_HINT)?,
             ))
         }
-        CdcEngine::Mssql => {
-            let ci = cfg.capture_instance.as_deref().ok_or_else(|| {
+        CdcEngineOpts::Mssql { capture_instance } => {
+            let ci = capture_instance.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("sqlserver cdc requires --capture-instance (e.g. dbo_orders)")
             })?;
             // Resume from the checkpoint's LSN if one was persisted (SQL Server has no
@@ -465,6 +492,19 @@ pub(crate) fn create_change_stream(
                 .context(MSSQL_CDC_HINT)?,
             ))
         }
+        CdcEngineOpts::Mongo { canonical } => Ok(Box::new(
+            // Whole-database change stream; resumes from the persisted token when
+            // one exists. `document` JSON fidelity follows `source.mongo.json`
+            // (canonical vs relaxed), so CDC and batch render it identically.
+            crate::source::mongo::cdc::MongoChangeStream::open(
+                url,
+                tls,
+                cfg.checkpoint.as_deref(),
+                *canonical,
+                cfg.until_current,
+            )
+            .context(MONGO_CDC_HINT)?,
+        )),
     }
 }
 
@@ -495,6 +535,11 @@ impl CdcSchemaResolver {
             CdcEngine::Mssql => Box::new(crate::source::mssql::MssqlSource::connect_with_tls(
                 url, tls,
             )?),
+            // The JSON-blob model has a fixed 2-column schema (`_id`, `document`),
+            // resolved by `MongoSource::type_mappings` — same as the batch path.
+            CdcEngine::Mongo => {
+                Box::new(crate::source::mongo::MongoSource::connect(url, tls, None)?)
+            }
         };
         let enrich = match engine {
             CdcEngine::Mysql => Some(crate::source::mysql::connect_pool(url, tls)?.get_conn()?),

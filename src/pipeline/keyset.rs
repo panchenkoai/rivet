@@ -36,6 +36,79 @@ fn keyset_plan(plan: &ResolvedRunPlan) -> &KeysetPlan {
     }
 }
 
+/// One keyset page produced by [`read_keyset_page`]: the parts written to the
+/// destination, the row count, the dest schema (for the run fingerprint), and
+/// the typed high-water cursor to advance from. The two runners
+/// ([`run_keyset`] sequential, `mongo_parallel::range_worker` parallel) share
+/// the page READ; they differ only in WHEN the parts commit, which stays each
+/// caller's business.
+pub(crate) struct KeysetPage {
+    pub(crate) parts: Vec<super::commit::PartRecord>,
+    pub(crate) rows: usize,
+    pub(crate) schema: Option<arrow::datatypes::Schema>,
+    pub(crate) next_cursor: Option<String>,
+}
+
+/// Read ONE seek page: `find`-and-seek from `cursor` (or the range floor), write
+/// its parts to `dest` named by `part_base`, and report the page + the typed
+/// high-water cursor. Returns `None` when the page is empty (range exhausted).
+///
+/// Paging control stays with the caller via the returned `rows`/`next_cursor`:
+/// a page shorter than `page_size` is the last one; a full page whose
+/// `next_cursor` is `None` cannot advance (the caller must bail rather than
+/// re-read the same bound forever).
+pub(crate) fn read_keyset_page(
+    src: &mut dyn Source,
+    plan: &ResolvedRunPlan,
+    key_plan: &IncrementalCursorPlan,
+    page_size: usize,
+    cursor: Option<&str>,
+    dest: &dyn destination::Destination,
+    part_base: &str,
+) -> Result<Option<KeysetPage>> {
+    let cursor_state = cursor.map(|v| CursorState {
+        export_name: plan.export_name.clone(),
+        last_cursor_value: Some(v.to_string()),
+        last_run_at: None,
+    });
+    let mut sink = ExportSink::new(plan)?;
+    src.export(
+        // `query` is the unwrapped base; the driver wraps it with the keyset
+        // predicate internally, so the catalog parser still sees the source
+        // table and hints resolve from `query` (`unwrapped`).
+        &source::ExportRequest::unwrapped(&plan.base_query, &plan.tuning, &plan.column_overrides)
+            .with_incremental(Some(key_plan))
+            .with_cursor(cursor_state.as_ref())
+            .with_page_limit(page_size),
+        &mut sink,
+    )?;
+    if let Some(w) = sink.writer.take() {
+        w.finish()?;
+    }
+    let rows = sink.total_rows;
+    if rows == 0 {
+        return Ok(None); // range exhausted, or an exact-multiple last page
+    }
+    let schema = sink.dest_schema.as_deref().cloned();
+    // Shared commit path (I1→I2→I7 + counters + journal + fault hooks).
+    // write_sink_parts drains every part the sink produced — the final temp file
+    // plus anything maybe_split rotated at max_file_size — so rotation can't drop.
+    let parts = super::commit::write_sink_parts(
+        dest,
+        &mut sink,
+        plan.validate.then_some(plan.format),
+        |idx, count| super::commit::part_indexed_name(part_base, idx, count),
+    )?;
+    Ok(Some(KeysetPage {
+        parts,
+        rows,
+        schema,
+        // The source's own lossless token (Mongo BSON `_id`) when it reported
+        // one, else the column-extracted string (every SQL engine).
+        next_cursor: sink.effective_cursor(),
+    }))
+}
+
 pub(crate) fn run_keyset(
     src: &mut dyn Source,
     plan: &ResolvedRunPlan,
@@ -58,74 +131,56 @@ pub(crate) fn run_keyset(
         kp.chunk_size
     );
 
-    let mut last: Option<String> = None;
+    // RESUME (opt-in via `kp.checkpoint`): continue from the last DURABLY
+    // committed key so a crashed run picks up where it left off instead of
+    // re-reading the whole collection. Reuses the incremental `export_state`
+    // store. Default OFF keeps `mode: full` re-reading the whole key range every
+    // run — resume is only correct when the caller wants it (a plain re-run of a
+    // full export must NOT silently skip already-exported rows).
+    let mut last: Option<String> = if kp.checkpoint {
+        state
+            .and_then(|s| s.get(&plan.export_name).ok())
+            .and_then(|cs| cs.last_cursor_value)
+    } else {
+        None
+    };
     let mut pages: usize = 0;
 
-    loop {
-        let cursor = last.as_ref().map(|v| CursorState {
-            export_name: plan.export_name.clone(),
-            last_cursor_value: Some(v.clone()),
-            last_run_at: None,
-        });
+    // Destination + manifest-mode guard (Finding #44) + run-unique part stamp are
+    // fixed for the whole run — hoisted out of the page loop. Millisecond stamp:
+    // two runs into the same prefix must not clobber (run-unique part-name rule).
+    let dest = destination::create_destination(&plan.destination)?;
+    crate::manifest::guard_manifest_mode(dest.as_ref(), "batch")?;
+    let ext = format::create_format(plan.format, plan.compression, plan.compression_level, None)
+        .file_extension()
+        .to_string();
+    let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
 
-        let mut sink = ExportSink::new(plan)?;
-        src.export(
-            // `query` is the unwrapped base; the driver wraps it with the keyset
-            // predicate internally, so the catalog parser still sees the source
-            // table and hints resolve from `query` (`unwrapped`).
-            &source::ExportRequest::unwrapped(
-                &plan.base_query,
-                &plan.tuning,
-                &plan.column_overrides,
-            )
-            .with_incremental(Some(&key_plan))
-            .with_cursor(cursor.as_ref())
-            .with_page_limit(kp.chunk_size),
-            &mut sink,
-        )?;
-        if let Some(w) = sink.writer.take() {
-            w.finish()?;
-        }
+    loop {
+        let base = format!("{}_{}_keyset{}.{}", plan.export_name, stamp, pages, ext);
+        let Some(page) = read_keyset_page(
+            src,
+            plan,
+            &key_plan,
+            kp.chunk_size,
+            last.as_deref(),
+            dest.as_ref(),
+            &base,
+        )?
+        else {
+            break;
+        };
+
         // ADR-0012 M3: capture the dest schema fingerprint from the first
         // non-empty page; idempotent run-wide.
-        if let Some(s) = sink.dest_schema.as_deref() {
-            manifest_writer::record_run_schema_fingerprint(summary, s);
+        if let Some(sc) = &page.schema {
+            manifest_writer::record_run_schema_fingerprint(summary, sc);
         }
-
-        let rows = sink.total_rows;
-        if rows == 0 {
-            break; // empty page (table exhausted, or an exact-multiple last page)
-        }
-        summary.total_rows += rows as i64;
-
-        let fmt =
-            format::create_format(plan.format, plan.compression, plan.compression_level, None);
-        let base = format!(
-            "{}_{}_keyset{}.{}",
-            plan.export_name,
-            chrono::Utc::now().format("%Y%m%d_%H%M%S"),
-            pages,
-            fmt.file_extension()
-        );
-        let dest = destination::create_destination(&plan.destination)?;
-        // Finding #44, early check: fail cleanly before the first part if this
-        // prefix already belongs to a CDC export (cross-shape manifests clobber
-        // each other; the write-seam guard is the backstop).
-        crate::manifest::guard_manifest_mode(dest.as_ref(), "batch")?;
-        // Shared commit path (I1→I2→I7 + counters + journal + fault hooks).
-        // write_sink_parts drains every part the sink produced — the final
-        // temp file plus anything maybe_split rotated at max_file_size — so
-        // rotation cannot drop data.
-        let recs = super::commit::write_sink_parts(
-            dest.as_ref(),
-            &mut sink,
-            plan.validate.then_some(plan.format),
-            |idx, count| super::commit::part_indexed_name(&base, idx, count),
-        )?;
+        summary.total_rows += page.rows as i64;
         if plan.validate {
             summary.validated = Some(true);
         }
-        for rec in &recs {
+        for rec in &page.parts {
             super::commit::record_part(
                 plan,
                 summary,
@@ -136,23 +191,32 @@ pub(crate) fn run_keyset(
                 },
             );
         }
+        // Persist the high-water mark AFTER the parts are durably committed, so a
+        // resume continues from committed data (peek→flush→ack). The crash window
+        // between the commit and this line is at-least-once: the last page is
+        // re-read (downstream dedup / reconcile absorbs it), never lost.
+        if kp.checkpoint
+            && let (Some(st), Some(v)) = (state, page.next_cursor.as_ref())
+        {
+            st.update(&plan.export_name, v)?;
+        }
         log::info!(
             "export '{}': keyset page {} — {} rows",
             plan.export_name,
             pages,
-            rows
+            page.rows
         );
         pages += 1;
 
         // A short page means the index range is exhausted — stop without an
         // extra empty round-trip.
-        if rows < kp.chunk_size {
+        if page.rows < kp.chunk_size {
             break;
         }
-        // Advance. The sink extracts the page's max key; if it could not (NULL
-        // or an unsupported Arrow type), we must NOT loop on the same bound —
-        // that would re-read the same page forever.
-        match sink.last_cursor_value.clone() {
+        // Advance to the page's max key; if it could not be read (NULL or an
+        // unsupported type), we must NOT loop on the same bound — that would
+        // re-read the same page forever.
+        match page.next_cursor {
             Some(v) => last = Some(v),
             None => anyhow::bail!(
                 "export '{}': keyset could not read the '{}' value from the last row of page {} \

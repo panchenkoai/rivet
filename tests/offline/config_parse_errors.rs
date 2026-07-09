@@ -194,3 +194,79 @@ exports:
         "should not fall through to the generic did-you-mean path: {msg}",
     );
 }
+
+// ── mongo semantic validation (bug-hunt find) ─────────────────────────────────
+
+#[test]
+fn roast_mongo_resume_with_parallel_is_rejected() {
+    // `resume: true` + `parallel: N` parsed fine but the parallel _id-range
+    // path keeps NO keyset checkpoint: resume was silently ignored — the whole
+    // collection re-read every run, with no warning anywhere. An impossible
+    // combination must be a config error, not a silent behavior downgrade.
+    let yaml = r#"
+source:
+  type: mongo
+  url: "mongodb://localhost:27017/db"
+  mongo: { resume: true, page_size: 100 }
+exports:
+  - name: t
+    table: t
+    mode: full
+    format: parquet
+    parallel: 4
+    destination: { type: local, path: "/tmp/x" }
+"#;
+    let err = parse_err(yaml);
+    assert!(
+        err.contains("resume") && err.contains("parallel"),
+        "the error must name the conflicting pair; got: {err}"
+    );
+}
+
+#[test]
+fn roast_mongo_cdc_requires_checkpoint() {
+    // A change stream has no server-side resume anchor, so `mode: cdc` without
+    // `cdc.checkpoint:` re-anchors at "now" every run and silently loses all
+    // changes between runs. Must be rejected at load (bug-hunt find).
+    let yaml = r#"
+source:
+  type: mongo
+  url: "mongodb://localhost:27017/db"
+exports:
+  - name: t
+    table: t
+    mode: cdc
+    format: parquet
+    cdc: { until_current: true }
+    destination: { type: local, path: "/tmp/x" }
+"#;
+    let err = parse_err(yaml);
+    assert!(
+        err.contains("checkpoint"),
+        "the error must require cdc.checkpoint; got: {err}"
+    );
+}
+
+#[test]
+fn roast_mongo_cdc_rejects_dotted_collection_name() {
+    // A dotted collection name does not route through the change-stream capture —
+    // its events are silently dropped (0-row success forever). Refuse at load
+    // (bug-hunt find); batch handles dotted names, so this is CDC-only.
+    let yaml = r#"
+source:
+  type: mongo
+  url: "mongodb://localhost:27017/db"
+exports:
+  - name: t
+    table: "orders.2026"
+    mode: cdc
+    format: parquet
+    cdc: { checkpoint: "/tmp/ck", until_current: true }
+    destination: { type: local, path: "/tmp/x" }
+"#;
+    let err = parse_err(yaml);
+    assert!(
+        err.contains("dot"),
+        "dotted collection in mongo CDC must be rejected naming the dot; got: {err}"
+    );
+}

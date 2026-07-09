@@ -200,6 +200,7 @@ fn pg_content_export_under_update_pressure() {
             tuning: &tuning,
             column_overrides: &ColumnOverrides::default(),
             page_limit: None,
+            base_relation: None,
         },
         &mut sink,
     );
@@ -317,6 +318,7 @@ fn pg_full_content_export_max_pressure() {
             tuning: &tuning,
             column_overrides: &ColumnOverrides::default(),
             page_limit: None,
+            base_relation: None,
         },
         &mut sink,
     );

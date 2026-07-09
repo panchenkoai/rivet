@@ -147,6 +147,7 @@ pub(super) fn finalize_manifest(
         crate::config::SourceType::Postgres => "postgres",
         crate::config::SourceType::Mysql => "mysql",
         crate::config::SourceType::Mssql => "mssql",
+        crate::config::SourceType::Mongo => "mongo",
     };
 
     // `export_name` is often `schema.table`; split for the manifest fields

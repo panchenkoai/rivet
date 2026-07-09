@@ -45,6 +45,98 @@ pub struct SourceConfig {
     /// without TLS — a warning is emitted so operators are aware. See [`TlsConfig`].
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+
+    /// MongoDB-specific read options (`source.mongo:`). Honoured only when
+    /// `type: mongo`; ignored by the SQL engines. See [`MongoConfig`].
+    #[serde(default)]
+    pub mongo: Option<MongoConfig>,
+}
+
+/// MongoDB read-path knobs. All three address completeness/fidelity of a `full`
+/// collection export that the SQL engines get for free from SQL semantics.
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct MongoConfig {
+    /// JSON rendering of the `document` column. `relaxed` (default) keeps common
+    /// scalars native (`42`, `"x"`); `canonical` wraps every number
+    /// (`{"$numberLong":"…"}`) so Int64/Double round-trip losslessly through a
+    /// JSON-number parser that would otherwise clamp values beyond 2^53.
+    #[serde(default)]
+    pub json: MongoJsonMode,
+
+    /// Read concern for the collection scan. `snapshot` gives a **point-in-time
+    /// consistent** full export (no doc missed/double-read under concurrent
+    /// writes) — requires MongoDB 5.0+ on a replica set; a standalone rejects it.
+    /// Default (`server`) uses the server's default read concern.
+    #[serde(default)]
+    pub read_concern: MongoReadConcern,
+
+    /// Keep the scan cursor alive past the server's idle timeout (default 10 min)
+    /// so a slow destination cannot let the server reap the cursor mid-scan and
+    /// silently drop the tail of a large collection. Default: `true`.
+    #[serde(default = "default_true")]
+    pub no_cursor_timeout: bool,
+
+    /// When set, read the collection with **keyset (seek) pagination** on `_id`
+    /// instead of one long-held cursor: each page is a bounded
+    /// `find({_id: {$gt: last}}).sort({_id: 1}).limit(page_size)` — an indexed
+    /// range scan that becomes one output part file. Bounds longest-query time
+    /// (no 35-minute cursor to hit a timeout / snapshot window) and is the base
+    /// for parallel `_id`-range reads. Requires an **ObjectId** `_id` (the
+    /// default); a non-ObjectId key errors with a clear message. Unset ⇒ the
+    /// single-cursor full scan.
+    #[serde(default)]
+    pub page_size: Option<usize>,
+
+    /// With keyset paging (`page_size`), persist the last committed `_id` and
+    /// **resume** from it next run — a crashed export continues where it left
+    /// off, and a re-run captures only documents inserted since (ObjectId `_id`
+    /// is time-ordered). Default `false` re-reads the whole collection each run
+    /// (plain `mode: full` semantics). No effect without `page_size`.
+    #[serde(default)]
+    pub resume: bool,
+}
+
+impl Default for MongoConfig {
+    fn default() -> Self {
+        Self {
+            json: MongoJsonMode::default(),
+            read_concern: MongoReadConcern::default(),
+            no_cursor_timeout: true,
+            page_size: None,
+            resume: false,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Extended-JSON rendering mode for the `document` column.
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MongoJsonMode {
+    /// Native scalars where possible; `{"$oid":…}`/`{"$date":…}` only for exotic
+    /// BSON. Friendliest for `PARSE_JSON`, but Int64 renders as a bare number.
+    #[default]
+    Relaxed,
+    /// Every value type-tagged (`{"$numberLong":…}`, `{"$numberInt":…}`) — a
+    /// lossless, bulkier form that survives a double-based JSON-number parser.
+    Canonical,
+}
+
+/// Read concern applied to the collection scan.
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MongoReadConcern {
+    /// The server's default read concern — no point-in-time guarantee across the
+    /// scan (a plain `find`, like today).
+    #[default]
+    Server,
+    /// `snapshot` — a consistent point-in-time read for the whole cursor
+    /// (MongoDB 5.0+ replica set only).
+    Snapshot,
 }
 
 /// Operational environment of the source database — drives the default tuning
@@ -233,6 +325,7 @@ impl SourceConfig {
             SourceType::Postgres => 5432,
             SourceType::Mysql => 3306,
             SourceType::Mssql => 1433,
+            SourceType::Mongo => 27017,
         };
         let port = self.port.unwrap_or(default_port);
 
@@ -240,6 +333,7 @@ impl SourceConfig {
             SourceType::Postgres => "postgresql",
             SourceType::Mysql => "mysql",
             SourceType::Mssql => "sqlserver",
+            SourceType::Mongo => "mongodb",
         };
 
         if password.is_empty() {
@@ -362,6 +456,25 @@ pub enum SourceType {
     Postgres,
     Mysql,
     Mssql,
+    /// Document store. Unlike the three SQL engines, MongoDB has no SQL, no
+    /// fixed per-collection schema, and no `information_schema` — so the
+    /// SQL-shaped read seam (chunked/keyset planning, incremental predicate
+    /// building, catalog introspection) does not apply. The OSS source is the
+    /// JSON-blob model: each document exports as `_id` + a `document` JSON
+    /// column, typing punted downstream. Change streams (CDC) map onto the
+    /// canonical `ChangeStream` seam separately.
+    Mongo,
+}
+
+impl SourceType {
+    /// Whether this engine speaks SQL (the relational read seam: `SELECT`
+    /// queries, `information_schema` introspection, chunked/keyset/incremental
+    /// SQL builders). `false` for document stores like MongoDB, whose adapter
+    /// reads via the driver's native query API instead. Used at the match sites
+    /// that would otherwise have to special-case every non-SQL engine.
+    pub fn is_sql(self) -> bool {
+        !matches!(self, SourceType::Mongo)
+    }
 }
 
 /// Locate `user[:password]@` userinfo inside a standard URL.
@@ -421,6 +534,7 @@ mod tests {
             environment: None,
             tuning: None,
             tls: None,
+            mongo: None,
         }
     }
 

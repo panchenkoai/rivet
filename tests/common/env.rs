@@ -49,6 +49,33 @@ pub const MSSQL_CDC_URL: &str = "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1434/r
 /// Backend forwards to the same `mysql` service used by `MYSQL_URL`.
 pub const PROXYSQL_URL: &str = "mysql://rivet:rivet@127.0.0.1:6033/rivet";
 
+/// Standalone Mongo (`mongo` service :27017) routed through Toxiproxy on :27019 —
+/// for retry / fault-injection tests. Seed via the direct :27017 driver
+/// (`MongoTest::connect(27017, …)`); point rivet at this URL so its reads cross
+/// the proxy and can be cut / delayed mid-scan. Proxy is created on demand with
+/// `ensure_toxi_proxy("mongo", 27019, "mongo:27017")`.
+pub fn mongo_toxi_url(db: &str) -> String {
+    // serverSelectionTimeoutMS bounds how long a connect waits on a dead upstream
+    // (the `..._fails_cleanly..` test) — 5s is well above the ~600ms mid-scan
+    // outage window the recovery test needs to survive.
+    format!("mongodb://127.0.0.1:27019/{db}?directConnection=true&serverSelectionTimeoutMS=5000")
+}
+
+/// Base URLs for the Rig's Mongo constructors. Batch tests override the db via
+/// `.source_url(&MongoTest::url(PORT, &db))` (each uses a unique db); the replica
+/// set needs `directConnection=true` (port-mapped single node).
+pub const MONGO_URL: &str = "mongodb://127.0.0.1:27017";
+pub const MONGO_RS_URL: &str = "mongodb://127.0.0.1:27018/?directConnection=true";
+
+/// The least-privilege read-only login on the auth-enabled `mongo-auth` service
+/// (:27020, created by dev/mongo/init-auth.js). `read` on `harmdb` only — no
+/// `clusterMonitor`, so `serverStatus` (the source-harm probe) is denied. For the
+/// harm-permission test: the export must succeed, the harm counters just absent.
+pub fn mongo_auth_reader_url() -> String {
+    "mongodb://reader:readpass@127.0.0.1:27020/harmdb?authSource=harmdb&directConnection=true"
+        .to_string()
+}
+
 pub const MINIO_ENDPOINT: &str = "http://127.0.0.1:9000";
 pub const MINIO_ACCESS_KEY: &str = "minioadmin";
 pub const MINIO_SECRET_KEY: &str = "minioadmin";
@@ -227,6 +254,12 @@ pub enum LiveService {
     MysqlToxi,
     /// SQL Server source engine. TCP :1433.
     Mssql,
+    /// MongoDB standalone source engine (batch JSON-blob). TCP :27017.
+    Mongo,
+    /// MongoDB single-node replica set (change-stream CDC). TCP :27018.
+    MongoRs,
+    /// Auth-enabled MongoDB with a least-privilege read-only user. TCP :27020.
+    MongoAuth,
     Minio,
     FakeGcs,
     /// Azure Blob emulator (Azurite). Blob endpoint :10000.
@@ -261,6 +294,17 @@ impl LiveService {
             ),
             LiveService::Mysql => ("127.0.0.1", 3306, "service `mysql` in docker-compose.yaml"),
             LiveService::Mssql => ("127.0.0.1", 1433, "service `mssql` in docker-compose.yaml"),
+            LiveService::Mongo => ("127.0.0.1", 27017, "service `mongo` in docker-compose.yaml"),
+            LiveService::MongoRs => (
+                "127.0.0.1",
+                27018,
+                "service `mongo-rs` (single-node replica set) in docker-compose.yaml",
+            ),
+            LiveService::MongoAuth => (
+                "127.0.0.1",
+                27020,
+                "service `mongo-auth` (auth-enabled) in docker-compose.yaml",
+            ),
             LiveService::MysqlToxi => (
                 "127.0.0.1",
                 13306,

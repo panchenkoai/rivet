@@ -19,6 +19,7 @@ fn src_with_password(password: Option<&str>, url: Option<&str>) -> SourceConfig 
         environment: None,
         tuning: None,
         tls: None,
+        mongo: None,
     }
 }
 
@@ -87,6 +88,7 @@ fn redact_env_references_are_preserved() {
         environment: None,
         tuning: None,
         tls: None,
+        mongo: None,
     };
     let (safe, redacted) = src.redact_for_artifact();
     assert!(!redacted, "env-only config has nothing to redact");

@@ -18,6 +18,7 @@ mod job;
 mod keyset;
 mod manifest_reconcile;
 pub(crate) mod manifest_writer;
+mod mongo_parallel;
 mod parallel_children;
 pub(crate) mod parent_ui;
 mod partition_expand;
@@ -301,6 +302,7 @@ mod tests {
                 environment: None,
                 tuning: None,
                 tls: None,
+                mongo: None,
             },
             column_overrides: Default::default(),
             verify: crate::config::VerifyMode::Size,

@@ -8,6 +8,11 @@ scenarios, state management, date-chunking, and `rivet init` — against each
 version. No version-specific code paths are skipped; the same Rust driver
 builds and the same YAML configs drive every target.
 
+**MongoDB** (the OSS JSON-blob source — batch + CDC) rides its own dedicated CI
+matrix across 4.4 → 8.0, live-tested through the canonical test rig, rather than
+the SQL e2e suite above (a document store has no chunked / incremental /
+time_window modes). See [mongodb.md](mongodb.md).
+
 ## Supported versions
 
 | Engine     | Versions | Status |
@@ -20,9 +25,14 @@ builds and the same YAML configs drive every target.
 | MySQL      |      5.7 | Supported (EOL upstream Oct 2023) |
 | MySQL      |      8.0 | Supported (primary target) |
 | SQL Server |     2022 | **Beta** (source engine; see scope + advisory below) |
+| MongoDB    |      4.4 | Supported |
+| MongoDB    |      5.0 | Supported |
+| MongoDB    |      6.0 | Supported |
+| MongoDB    |      7.0 | Supported (primary target) |
+| MongoDB    |      8.0 | Supported |
 
 "Primary target" means the version that runs the e2e suite by default in the
-local `docker-compose.yaml` top-level `postgres` / `mysql` / `mssql` services.
+local `docker-compose.yaml` top-level `postgres` / `mysql` / `mssql` / `mongo` services.
 "Legacy" versions are opt-in under the `legacy` compose profile (see below).
 
 ### SQL Server (MSSQL) — current scope

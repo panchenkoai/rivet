@@ -6,10 +6,14 @@ tails the log that the database already writes for replication and durability, i
 adds almost no load to the OLTP path: no table scan, no locks, no read snapshot
 (see [Why CDC is gentle on the source](#why-cdc-is-gentle-on-the-source)).
 
-> **Status.** All three engines support NDJSON streaming and typed Parquet/CSV
+> **Status.** All three SQL engines support NDJSON streaming and typed Parquet/CSV
 > `--output` (real `Timestamp` / `Date32` / `Decimal128` columns). This page
 > documents all three so the **permissions** are clear up front — they are the
 > part operators most need to get right.
+>
+> **MongoDB** also has CDC — via change streams, with a different setup (a replica
+> set, not per-table grants) and the JSON-blob document image rather than typed
+> columns. It has its own reference: [mongodb.md](mongodb.md#scenario-b--cdc-change-capture).
 
 ## The command
 
@@ -373,14 +377,22 @@ identical to running against a primary.
 `--output` writes one row per change in the **typed after-image (upsert)** shape:
 
 ```
-__op     __pos                              id   name    amount
-insert   {"file":"binlog.000046","pos":681} 1    alice   100
-update   {"file":"binlog.000046","pos":682} 1    alice   150
-delete   {"file":"binlog.000046","pos":683} 2    bob     200
+__op     __pos                              __seq  id   name    amount
+insert   {"file":"binlog.000046","pos":681} 0      1    alice   100
+update   {"file":"binlog.000046","pos":682} 0      1    alice   150
+delete   {"file":"binlog.000046","pos":683} 0      2    bob     200
 ```
 
 - `__op` — `insert` / `update` / `delete`.
-- `__pos` — the engine resume position (the same value rivet checkpoints).
+- `__pos` — the transaction's **commit position** (the same value rivet
+  checkpoints). Every change of one transaction shares it — it is *not* a total
+  order over changes.
+- `__seq` — the change's **ordinal within its transaction** (0-based, log order),
+  so `(__pos, __seq)` *is* a total order. It is the tiebreak when one transaction
+  touches a key more than once and, being a column, survives the load into an
+  (unordered) warehouse table (Parquet row order does not). See
+  [CDC change ordering](../cdc-seq-ordering.md). (MongoDB gives every event a
+  distinct `__pos`, so its `__seq` is always `0`.)
 - the source columns, **typed** (resolved from the source schema), carrying the
   **after-image** for insert/update and the **key (before-image)** for delete.
 
@@ -394,8 +406,10 @@ WHEN NOT MATCHED AND s.__op <> 'delete' THEN INSERT (...);
 ```
 
 With a full row image, *which* columns changed is irrelevant — the latest image
-per key (highest `__pos`) already contains every prior change, so dedup-by-key +
-overwrite is correct. This is why `binlog_row_image = FULL` matters.
+per key already contains every prior change, so dedup-by-key + overwrite is
+correct. "Latest" is the highest `(__pos, __seq)` — the commit position, then the
+intra-transaction ordinal (a transaction that updates one key twice shares
+`__pos`, so `__seq` breaks the tie). This is why `binlog_row_image = FULL` matters.
 
 ### Deduplicating by position, per engine
 
@@ -413,9 +427,11 @@ Two distinct problems:
    re-delivered event is **byte-identical** — same `__op`, `__pos`, and image —
    so `SELECT DISTINCT` over the staged rows (or dedup on `(pk, __pos, __op)`)
    removes it exactly.
-2. **Latest-image-per-key** (the MERGE): order by `__pos`, and break the
-   within-transaction tie with **file order** — rivet writes events to parts in
-   stream order, so `(file name, row number in file)` completes the total order:
+2. **Latest-image-per-key** (the MERGE): order by `(__pos, __seq)` — the commit
+   position, then the intra-transaction ordinal. `__seq` breaks the tie when a
+   transaction touches one key more than once (those changes share `__pos`); it is
+   a column, so — unlike Parquet row order — it survives the load. See
+   [CDC change ordering](../cdc-seq-ordering.md).
 
 ```sql
 -- DuckDB replay: newest surviving image per key.
@@ -423,22 +439,22 @@ WITH ev AS (
   SELECT *,
          upper(lpad(split_part(__pos->>'lsn', '/', 1), 8, '0')) ||
          upper(lpad(split_part(__pos->>'lsn', '/', 2), 8, '0')) AS lsn_key   -- PostgreSQL X/Y → sortable
-  FROM read_parquet('…/sessions/cdc-*.parquet', filename = true, file_row_number = true)
+  FROM read_parquet('…/sessions/cdc-*.parquet')
 ), latest AS (
   SELECT * FROM (
     SELECT *, row_number() OVER (
       PARTITION BY id
-      ORDER BY lsn_key DESC, filename DESC, file_row_number DESC) AS rn
+      ORDER BY lsn_key DESC, __seq DESC) AS rn        -- (__pos, __seq) = total order
     FROM ev)
   WHERE rn = 1
 )
 SELECT * FROM latest WHERE __op <> 'delete';
 ```
 
-(MySQL: order by `(file, pos)` from `__pos` instead of `lsn_key`; SQL Server:
-the fixed-width hex `lsn` string is already lexically ordered.) In a warehouse
-MERGE, apply the same window to the staged batch first, then merge the winners
-by PK + `__op`.
+(MySQL: order by `(file, pos)` parsed from `__pos`, then `__seq`; SQL Server: the
+fixed-width hex `lsn` string is already lexically ordered, then `__seq`.) In a
+warehouse MERGE, apply the same window to the staged batch first, then merge the
+winners by PK + `__op`.
 
 ### Downstream loading
 

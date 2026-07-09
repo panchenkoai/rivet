@@ -1,5 +1,6 @@
 mod artifact;
 mod candidates;
+mod mongo;
 mod mssql;
 mod mysql;
 mod postgres;
@@ -196,9 +197,11 @@ pub(super) fn source_type(source_url: &str) -> Result<&'static str> {
         Ok("mysql")
     } else if source_url.starts_with("sqlserver") || source_url.starts_with("mssql") {
         Ok("mssql")
+    } else if source_url.starts_with("mongodb") {
+        Ok("mongo")
     } else {
         anyhow::bail!(
-            "Unsupported source URL scheme. Expected postgresql://, mysql://, or sqlserver://, got: {}",
+            "Unsupported source URL scheme. Expected postgresql://, mysql://, sqlserver://, or mongodb://, got: {}",
             source_url
         )
     }
@@ -451,6 +454,10 @@ fn init_yaml(
                 let mut conn = mssql::connect(source_url)?;
                 mssql::introspect(&mut conn, &mssql_table_schema(&sch), table_name)?
             }
+            "mongo" => {
+                let conn = mongo::connect(source_url)?;
+                mongo::introspect(&conn, table_name)?
+            }
             _ => unreachable!(),
         };
         let hint = yaml_scaffold::table_has_unbounded_decimal_columns(&info);
@@ -498,12 +505,17 @@ fn init_discovery_json(
                 let mut conn = mssql::connect(source_url)?;
                 mssql::introspect(&mut conn, &mssql_table_schema(&sch), table_name)?
             }
+            "mongo" => {
+                let conn = mongo::connect(source_url)?;
+                mongo::introspect(&conn, table_name)?
+            }
             _ => unreachable!(),
         };
         let scope = match source_type(source_url)? {
             "postgres" => format!("table \"{}\".\"{}\"", info.schema, info.table),
             "mysql" => format!("table `{}`", info.table),
             "mssql" => format!("table [{}].[{}]", info.schema, info.table),
+            "mongo" => format!("collection {}", info.table),
             _ => unreachable!(),
         };
         (vec![info], scope)
@@ -617,6 +629,15 @@ fn introspect_all(
             }
             Ok(out)
         }
+        "mongo" => {
+            let conn = mongo::connect(source_url)?;
+            let names = retain_filtered(mongo::list_tables(&conn)?, filter);
+            let mut out = Vec::with_capacity(names.len());
+            for n in names {
+                out.push(mongo::introspect(&conn, &n)?);
+            }
+            Ok(out)
+        }
         _ => unreachable!(),
     }
 }
@@ -650,6 +671,16 @@ fn schema_scope_label(source_url: &str, schema: Option<&str>, n: usize) -> Resul
                 .filter(|s| !s.is_empty())
                 .unwrap_or("dbo");
             format!("SQL Server schema \"{sch}\" ({n} {obj})")
+        }
+        "mongo" => {
+            // Database name from the URL path: mongodb://[user@]host[:port]/<db>[?opts]
+            let db = source_url
+                .split_once("://")
+                .and_then(|(_, rest)| rest.split('/').nth(1))
+                .map(|seg| seg.split('?').next().unwrap_or(seg))
+                .filter(|s| !s.is_empty())
+                .unwrap_or("(default)");
+            format!("MongoDB database \"{db}\" ({n} {obj})")
         }
         _ => unreachable!(),
     })

@@ -463,7 +463,15 @@ jobs:
         # It runs in the `test-type-validators` job instead (which has both).
         # live_crash_soak.rs stays here — it re-reads the destination in-process
         # (arrow/parquet-rs), no duckdb needed.
-        run: cargo test -- --ignored --skip content_export --skip validates --skip edge_cases --skip via_duckdb
+        #
+        # Skip the MongoDB suites (`live_mongo*` + `live_cdc_mongo`): they need the
+        # mongo / mongo-rs / mongo-auth stack this job does not start. MongoDB is a
+        # document store with its own heavy 3-container stack (standalone + replica
+        # set + auth), so — exactly like live-full in nightly-live — it is owned by
+        # the dedicated `mongo-versions` matrix job (4.4 → 8.0) instead. `--skip
+        # live_mongo` covers every live_mongo* module (batch, crash-recovery, harm,
+        # retry-and-faults); `--skip live_cdc_mongo` the CDC suite.
+        run: cargo test -- --ignored --skip content_export --skip validates --skip edge_cases --skip via_duckdb --skip live_mongo --skip live_cdc_mongo
 
       - name: Stop services
         if: always()
