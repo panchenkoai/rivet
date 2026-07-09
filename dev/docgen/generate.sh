@@ -27,10 +27,14 @@ gen docs/reference/cli-reference.md "$RIVET" schema cli
 GENERATED="docs/reference/config-reference.md docs/reference/cli-reference.md"
 
 if [ "${1:-}" = "--check" ]; then
+  # Shared prose fragments (docs/shared/*) must be expanded into their consumers.
+  python3 dev/docgen/expand_includes.py --check
   if ! git diff --quiet -- $GENERATED; then
     echo "::error::generated docs are stale — run 'bash dev/docgen/generate.sh' and commit"
     git --no-pager diff -- $GENERATED | head -60
     exit 1
   fi
   echo "docs-gen: up to date"
+else
+  python3 dev/docgen/expand_includes.py
 fi

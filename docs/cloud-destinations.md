@@ -80,6 +80,8 @@ vars; required otherwise.  `endpoint:` overrides the resolved S3 endpoint
 
 ### Azure Blob Storage
 
+<!-- include: shared/azure-auth-modes.md -->
+
 | Mode | Fields | Notes |
 |---|---|---|
 | Account key | `account_name` + `account_key_env` | Long-lived storage-account key. |
@@ -95,6 +97,8 @@ sovereign clouds) takes precedence over the derived URL.
 The Azure SAS-token body may be pasted with or without the leading `?`
 — Rivet trims it transparently so `sv=…&sig=…` and `?sv=…&sig=…` are
 both accepted.
+
+<!-- /include: shared/azure-auth-modes.md -->
 
 Future Azure modes (Managed Identity, Service Principal, workload
 identity federation) are on the roadmap but not yet supported.
