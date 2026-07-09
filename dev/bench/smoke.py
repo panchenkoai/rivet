@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -77,6 +78,66 @@ def pg_harm() -> dict:
         return {}
 
 
+# ─── Point-in-time harm gauges (the old harm_ab.sh signals) ──────────────────
+# The cumulative counters above are before/after deltas; the gauges below —
+# longest running query, longest open transaction, held locks, live connections
+# — are instantaneous, so they need a background sampler that records the PEAK
+# during the tool's run (harm_ab.sh polled @50ms; same idea). These are the
+# source-safety headlines: a chunked reader holds short queries and few locks; a
+# `SELECT *` that buffers holds one long query and pins a transaction.
+GAUGE_SQL = (
+    "SELECT COALESCE(EXTRACT(EPOCH FROM "
+    "max(now()-query_start) FILTER (WHERE state='active')),0)||','||"
+    "COALESCE(EXTRACT(EPOCH FROM max(now()-xact_start)),0)||','||count(*)||','||"
+    "(SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a2 ON l.pid=a2.pid "
+    f"WHERE a2.datname='{PG['db']}' AND a2.pid<>pg_backend_pid()) "
+    f"FROM pg_stat_activity WHERE datname='{PG['db']}' "
+    "AND pid<>pg_backend_pid() AND backend_type='client backend'"
+)
+
+
+def gauge_once() -> tuple:
+    r = sh(["docker", "exec", PG_CONTAINER, "psql", "-U", PG["user"],
+            "-d", PG["db"], "-tAc", GAUGE_SQL])
+    try:
+        lq, lx, cn, lk = r.stdout.strip().split(",")
+        return (float(lq), float(lx), int(cn), int(lk))
+    except (ValueError, AttributeError):
+        return (0.0, 0.0, 0, 0)
+
+
+class GaugePoller(threading.Thread):
+    """Samples the source gauges ~every 50 ms until stopped; reports the peak."""
+    def __init__(self):
+        super().__init__(daemon=True)
+        self._stop = threading.Event()
+        self.samples = []
+
+    def run(self):
+        while not self._stop.is_set():
+            self.samples.append(gauge_once())
+            self._stop.wait(0.05)
+
+    def stop(self):
+        self._stop.set()
+        self.join(timeout=2)
+
+    def peak(self) -> tuple:
+        if not self.samples:
+            return (0.0, 0.0, 0, 0)
+        return tuple(max(s[i] for s in self.samples) for i in range(4))
+
+
+def dead_tuples(table: str) -> int:
+    r = sh(["docker", "exec", PG_CONTAINER, "psql", "-U", PG["user"], "-d", PG["db"],
+            "-tAc", f"SELECT COALESCE(n_dead_tup,0) FROM pg_stat_user_tables "
+                    f"WHERE relname='{table}'"])
+    try:
+        return int(r.stdout.strip() or 0)
+    except ValueError:
+        return 0
+
+
 # ─── Type fidelity ───────────────────────────────────────────────────────────
 # Compare each tool's parquet column types against the SOURCE postgres types by
 # semantic family. A mismatch is a real fidelity loss: jsonb flattened to a plain
@@ -125,23 +186,20 @@ def pg_types(table: str) -> dict:
     return col_types(r.stdout.strip().splitlines())
 
 
-def type_degrades(src: dict, path: Path) -> list:
-    """[(col, src_family, parquet_family)] for every SOURCE column whose parquet
-    type family differs. Only source columns are checked (tool-added bookkeeping
-    columns like dlt's _dlt_id are ignored)."""
+def parquet_families(path: Path) -> dict:
+    """{column: semantic_family} for a tool's output parquet."""
     files = list(path.rglob("*.parquet")) if path.is_dir() else [path]
     if not files:
-        return [("<no parquet>", "", "")]
+        return {}
     r = sh(["duckdb", "-noheader", "-list", "-c",
             f"SELECT column_name||'='||column_type FROM "
             f"(DESCRIBE SELECT * FROM read_parquet('{files[0]}'))"])
-    pq = col_types(r.stdout.strip().splitlines())
-    out = []
-    for col, st in src.items():
-        pt = pq.get(col)
-        if pt and family(st) != family(pt):
-            out.append((col, family(st), family(pt)))
-    return out
+    return {c: family(t) for c, t in col_types(r.stdout.strip().splitlines()).items()}
+
+
+# Short labels for the type matrix so it fits a terminal.
+FAM_ABBR = {"timestamp": "ts", "timestamptz": "tstz", "decimal": "dec", "binary": "bin"}
+TOOL_ABBR = {"clickhouse-local": "click", "odbc2parquet": "odbc"}
 
 
 def clean_stderr(err: str) -> str:
@@ -287,16 +345,26 @@ def main():
     # One matrix, every comparison axis as a column:
     #   correctness (status/rows) · perf (wall/peak_rss/out) ·
     #   source-harm (tup_read/temp/blks) · type fidelity (type_deg)
+    srcfam = {c: family(t) for c, t in src_types.items()}
+
+    # One matrix, every comparison axis as a column:
+    #   correctness (status/rows) · perf (wall/peak_rss/out) ·
+    #   source-harm cumulative (tup_read/temp) + gauge peaks (longq_s/locks/dead) ·
+    #   type fidelity (type_deg).
     print(f"\nSmoke: postgres.{args.table}  (source rows = {truth}, {len(src_types)} cols)")
     print("all axes, one run each — correctness · perf · source-harm · type fidelity\n")
     cols = [("tool", 18, "<"), ("status", 9, "<"), ("wall_s", 8, ">"),
-            ("peak_mb", 9, ">"), ("rows", 8, ">"), ("out_mb", 8, ">"),
-            ("tup_read", 10, ">"), ("temp_mb", 9, ">"), ("blks_rd", 9, ">"),
-            ("type_deg", 10, ">")]
+            ("peak_mb", 9, ">"), ("rows", 7, ">"), ("out_mb", 8, ">"),
+            ("tup_read", 9, ">"), ("temp_mb", 8, ">"), ("longq_s", 9, ">"),
+            ("locks", 7, ">"), ("dead", 7, ">"), ("type_deg", 9, ">")]
     hdr = "".join(f"{n:{a}{w}}" for n, w, a in cols)
+
+    def row(vals):
+        return "".join(f"{str(v):{a}{w}}" for v, (n, w, a) in zip(vals, cols))
+
     print(hdr); print("-" * len(hdr))
 
-    rows_out, legend = [], []
+    fam_by_tool = []
     for tool in args.tools.split(","):
         tool = tool.strip()
         if tool not in ADAPTERS:
@@ -312,33 +380,52 @@ def main():
         if not available:
             print(f"{tool:<18}{'missing':<9}"); continue
         path, run = ADAPTERS[tool](args.table, OUT / tool)
+        dead0 = dead_tuples(args.table)
         before = pg_harm()
+        poller = GaugePoller(); poller.start()
         try:
             wall, rss, rc, err = run()
         except Exception as e:  # noqa
-            print(f"{tool:<18}{'error':<9}  {str(e)[:50]}"); continue
+            poller.stop(); print(f"{tool:<18}{'error':<9}  {str(e)[:50]}"); continue
+        poller.stop()
         time.sleep(0.4)  # let the stats collector flush this tool's reads
         harm = {k: pg_harm().get(k, 0) - before.get(k, 0) for k in HARM_KEYS}
+        longq, _longx, _conns, locks = poller.peak()
+        dead = dead_tuples(args.table) - dead0
         rows = parquet_rows(path) if rc == 0 else -1
         mb = out_bytes(path) / 1_048_576 if rc == 0 else 0
-        degr = type_degrades(src_types, path) if rc == 0 else []
+        pqfam = parquet_families(path) if rc == 0 else {}
+        degr = [(c, srcfam[c], pqfam[c]) for c in src_types
+                if c in pqfam and pqfam[c] != srcfam[c]]
         status = "ok" if rc == 0 and rows == truth else ("mismatch" if rc == 0 else "error")
-        print(f"{tool:<18}{status:<9}{wall:>8.1f}{rss:>9.0f}{rows:>8}{mb:>8.1f}"
-              f"{harm['tup_returned']:>10.0f}{harm['temp_bytes']/1e6:>9.1f}"
-              f"{harm['blks_read']:>9.0f}{len(degr):>10}")
+        print(row([tool, status, f"{wall:.1f}", f"{rss:.0f}", rows, f"{mb:.1f}",
+                   f"{harm['tup_returned']:.0f}", f"{harm['temp_bytes'] / 1e6:.1f}",
+                   f"{longq:.2f}", locks, dead, len(degr)]))
         if rc != 0:
             tail = (err.strip().splitlines() or ["(no stderr)"])[-1][:90]
             print(f"{'':<18}└─ {tail}")
-        if degr:
-            legend.append((tool, degr))
-        rows_out.append((tool, status, wall, rss, rows, mb, harm, degr))
+        if rc == 0:
+            fam_by_tool.append((tool, pqfam))
 
-    if legend:
-        print("\ntype_deg detail (source_family → parquet_family):")
-        for tool, degr in legend:
-            shown = ", ".join(f"{c}:{s}→{p}" for c, s, p in degr[:6])
-            more = f" (+{len(degr) - 6})" if len(degr) > 6 else ""
-            print(f"  {tool:<16} {shown}{more}")
+    # ── Second matrix: which type degraded, per column × tool ────────────────
+    disc = [c for c in src_types
+            if any(pf.get(c, srcfam[c]) != srcfam[c] for _, pf in fam_by_tool)]
+    if disc and fam_by_tool:
+        def fa(f):
+            return FAM_ABBR.get(f, f)
+
+        def ta(t):
+            return TOOL_ABBR.get(t, t)[:9]
+        print("\ntype fidelity — source vs each tool's parquet family (* = drift):\n")
+        tcols = [("column", 16, "<"), ("source", 8, "<")] + \
+                [(ta(t), 10, "<") for t, _ in fam_by_tool]
+        print("".join(f"{n:{a}{w}}" for n, w, a in tcols))
+        for c in disc:
+            cells = [c, fa(srcfam[c])]
+            for _, pf in fam_by_tool:
+                v = pf.get(c)
+                cells.append(fa(v) + ("*" if v != srcfam[c] else "") if v else "-")
+            print("".join(f"{str(v):{a}{w}}" for v, (n, w, a) in zip(cells, tcols)))
     print()
 
 
