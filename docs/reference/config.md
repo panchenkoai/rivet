@@ -1,6 +1,13 @@
-# Complete YAML Config Reference
+# YAML Config Guide
 
-Every field Rivet accepts in a config YAML, grouped by section.
+> **📌 The exhaustive, always-current field reference is generated from the code:
+> [config-reference.md](config-reference.md)** — rendered from `rivet schema config`
+> (the schemars-derived JSON Schema), so it cannot drift and needs no manual
+> verification. **This page is the guide**: the same options with defaults,
+> rationale, and worked examples. For the guaranteed-current field/type/enum list,
+> trust the generated reference.
+
+The most-used options, grouped by section, with the *why* and examples.
 
 ---
 
@@ -423,55 +430,13 @@ quality:
 
 ## `exports[].destination`
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `type` | `local` \| `s3` \| `gcs` \| `azure` \| `stdout` | **yes** | Destination type |
-
-### Local
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `path` | string | **yes** | Output directory |
-
-### S3
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `bucket` | string | **yes** | S3 bucket name |
-| `prefix` | string | no | Key prefix |
-| `region` | string | **yes** | AWS region |
-| `endpoint` | string | no | Custom S3 endpoint (MinIO, R2) |
-| `access_key_env` | string | no | Env var for access key |
-| `secret_key_env` | string | no | Env var for secret key |
-| `aws_profile` | string | no | AWS credentials profile name |
-| `allow_anonymous` | boolean | no | Skip authentication |
-
-### GCS
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `bucket` | string | **yes** | GCS bucket name |
-| `prefix` | string | no | Object prefix |
-| `credentials_file` | string | no | Path to service account JSON (otherwise ADC / `GOOGLE_APPLICATION_CREDENTIALS`) |
-| `endpoint` | string | no | Custom GCS endpoint (fake-gcs-server, test doubles) |
-| `allow_anonymous` | boolean | no | Skip authentication (public bucket / emulator) |
-
-### Azure
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `bucket` | string | **yes** | Blob container name |
-| `prefix` | string | no | Blob prefix |
-| `account_name` | string | **yes** | Storage account (`<account>.blob.core.windows.net`) — not a secret |
-| `account_key_env` | string | one of key/SAS | Env var holding the account key |
-| `sas_token_env` | string | one of key/SAS | Env var holding a SAS token (mutually exclusive with `account_key_env`; a leading `?` is trimmed) |
-| `allow_anonymous` | boolean | no | Skip authentication (public container / emulator) |
-
-Full auth-flow matrix (account key vs SAS, `endpoint` override, RBAC): [destinations/azure.md](../destinations/azure.md).
-
-### Stdout
-
-No additional fields. Only `type: stdout` is needed.
+The complete per-backend field list (`local` / `s3` / `gcs` / `azure` / `stdout`)
+is in the generated [config-reference.md](config-reference.md) (section
+`exports[].destination`). Per-backend setup, auth flows, and permissions:
+[destinations/](../destinations/) — [local](../destinations/local.md) ·
+[s3](../destinations/s3.md) · [gcs](../destinations/gcs.md) ·
+[azure](../destinations/azure.md) · [stdout](../destinations/stdout.md), plus the
+[cloud auth matrix](../cloud-auth.md).
 
 ### Path and prefix placeholders
 

@@ -1,4 +1,11 @@
-# CLI Reference
+# CLI Guide
+
+> **📌 The exhaustive command/flag reference is generated from the code:
+> [cli-reference.md](cli-reference.md)** — rendered from the clap definitions (the
+> same source as `--help`), so it cannot drift and needs no manual verification.
+> **This page is the guide**: the same commands with worked examples, output
+> samples, and the *why*. For the guaranteed-current flag list of any command,
+> trust the generated reference (or run `rivet <command> --help`).
 
 ## Global
 
