@@ -570,14 +570,14 @@ services:
     ports:
       - "27018:27017"
     healthcheck:
-      # Healthy ONLY when this node is an elected PRIMARY, not merely when
-      # rs.status() responds — `rs.initiate()` returns ok immediately but the
-      # primary election lags (seconds, worst on 4.4). Gating `--wait` on
-      # `isMaster().ismaster` (cross-version 4.4→8.0; `hello` is 5.0+) is what
-      # stops `db.watch()` from racing the election and failing with error 13436
-      # NotPrimaryOrSecondary. Initiate on first poll (catch), then report
-      # unhealthy until primary so `--wait` keeps polling.
-      test: ["CMD-SHELL", "mongosh --quiet --eval 'try{rs.status()}catch(e){rs.initiate({_id:\"rs0\",members:[{_id:0,host:\"127.0.0.1:27017\"}]})}; db.isMaster().ismaster?quit(0):quit(1)' || mongo --quiet --eval 'try{rs.status()}catch(e){rs.initiate({_id:\"rs0\",members:[{_id:0,host:\"127.0.0.1:27017\"}]})}; db.isMaster().ismaster?quit(0):quit(1)'"]
+      # Healthy ONLY when this node is an elected PRIMARY, so `--wait` blocks until
+      # `db.watch()` can actually run (else error 13436 NotPrimaryOrSecondary).
+      # Initiate on `!rs.status().ok`, NOT on a thrown error: on 4.4's legacy `mongo`
+      # shell rs.status() RETURNS `{ok:0}` on an uninitiated RS without throwing, so a
+      # `catch`-based initiate never fires and the RS is never initiated (verified on
+      # a real mongo:4.4). `hello` is 5.0+, so gate on `isMaster().ismaster`
+      # (cross-version 4.4→8.0). `mongo` is the 4.4 fallback (no mongosh there).
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'var st; try{st=rs.status()}catch(e){st={ok:0}}; if(!st.ok){try{rs.initiate({_id:\"rs0\",members:[{_id:0,host:\"127.0.0.1:27017\"}]})}catch(e){}}; db.isMaster().ismaster?quit(0):quit(1)' || mongo --quiet --eval 'var st; try{st=rs.status()}catch(e){st={ok:0}}; if(!st.ok){try{rs.initiate({_id:\"rs0\",members:[{_id:0,host:\"127.0.0.1:27017\"}]})}catch(e){}}; db.isMaster().ismaster?quit(0):quit(1)'"]
       interval: 5s
       timeout: 5s
       retries: 30
