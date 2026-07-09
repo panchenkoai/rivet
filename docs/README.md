@@ -103,14 +103,14 @@ Practical guides explaining *why* settings matter and *when* to use them.
 | [Low-memory runners](best-practices/low-memory-runners.md) | Settings for 512 MB–4 GB hosts; `auto_shrink` guarantees and caveats |
 | [Recovery and resume](best-practices/recovery-and-resume.md) | `--resume` semantics, crash recovery, state inspection |
 | [Benchmark methodology](best-practices/benchmark-methodology.md) | How to run and interpret E2E and Criterion benchmarks; version comparison |
-| [Benchmark report v0.5.x](benchmark_report_v0.5.x.md) | Measured results: compression profiles, row group targets, batch memory policies, quality uniqueness |
+| [Benchmark report v0.5.0 (historical)](archive/benchmark_report_v0.5.0.md) | Measured results — **v0.5.0, pre-streaming; pending a 0.18 re-measure**: compression profiles, row group targets, batch memory policies |
 
 ## Architecture
 
 | Topic | Guide |
 |-------|-------|
 | Data flow, pluggable traits, memory model, source layout | [architecture.md](architecture.md) |
-| Source-aware extraction prioritization (advisory) | [planning/prioritization.md](planning/prioritization.md) |
+| Source-aware extraction prioritization (advisory) | [reference/prioritization.md](reference/prioritization.md) |
 
 ## Production
 

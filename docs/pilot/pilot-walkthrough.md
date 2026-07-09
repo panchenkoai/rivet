@@ -328,4 +328,4 @@ rivet apply plan.json
 - [Production checklist](production-checklist.md) — hardening before real workloads.
 - [UAT checklist](uat-checklist.md) — pilot sign-off structure.
 - [Tuning](../reference/tuning.md) — profiles, batch_size, memory-aware FETCH.
-- [Planning / prioritization](../planning/prioritization.md) — reading and trusting the advisory block.
+- [Prioritization](../reference/prioritization.md) — reading and trusting the advisory block.

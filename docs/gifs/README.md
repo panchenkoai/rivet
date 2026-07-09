@@ -148,7 +148,7 @@ deterministic regardless of the user's shell rc.
 - [docs/reference/init.md](../reference/init.md) —
   `init-scaffold.gif` in "Single table"; `discover-artifact.gif` in
   "Discovery artifact".
-- [docs/planning/prioritization.md](../planning/prioritization.md) —
+- [docs/reference/prioritization.md](../reference/prioritization.md) —
   `plan-campaign.gif` in "Viewing the output".
 - [docs/pilot/pilot-walkthrough.md](../pilot/pilot-walkthrough.md) —
   `init-scaffold.gif` (Step 1), `plan-apply.gif` (Step 3),
