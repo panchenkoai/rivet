@@ -40,7 +40,15 @@ fn mongo_batch_keyset_no_loss_or_dup() {
     assert_eq!(
         dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
         5000,
-        "distinct _id must equal source (no loss/dup)"
+        "distinct _id must equal source (no loss)"
+    );
+    // Distinct count alone hides duplicates (a doc emitted twice keeps the same
+    // distinct set) — assert total == distinct so a dup fails loudly (bug-hunt:
+    // the four 'no loss OR dup' tests only checked distinct).
+    assert_eq!(
+        total_parquet_rows(&rig.out_dir()),
+        5000,
+        "total rows must equal distinct — no duplicate export"
     );
     assert!(
         dir_parquet_has_column(&rig.out_dir(), "document"),
@@ -66,6 +74,11 @@ fn mongo_batch_parallel_integer_id_no_loss_or_dup() {
         5000,
         "parallel _id-range union must be the whole collection"
     );
+    assert_eq!(
+        total_parquet_rows(&rig.out_dir()),
+        5000,
+        "parallel ranges must not double-count at a boundary (total == distinct)"
+    );
 }
 
 #[test]
@@ -83,7 +96,12 @@ fn mongo_batch_typed_cursor_pages_string_id() {
     assert_eq!(
         dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
         4000,
-        "string-_id keyset must read the whole collection with no loss/dup"
+        "string-_id keyset must read the whole collection (no loss)"
+    );
+    assert_eq!(
+        total_parquet_rows(&rig.out_dir()),
+        4000,
+        "no duplicate rows across string-_id page boundaries (total == distinct)"
     );
 }
 
@@ -105,11 +123,16 @@ fn mongo_batch_parallel_objectid_and_string_id() {
             .mongo("page_size: 1000")
             .export_line("parallel: 4");
         rig.run_ok();
+        let kind = if seed_objectid { "ObjectId" } else { "String" };
         assert_eq!(
             dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
             5000,
-            "parallel over {} _id must read the whole collection",
-            if seed_objectid { "ObjectId" } else { "String" }
+            "parallel over {kind} _id must read the whole collection"
+        );
+        assert_eq!(
+            total_parquet_rows(&rig.out_dir()),
+            5000,
+            "parallel over {kind} _id must not duplicate at a range boundary"
         );
     }
 }
@@ -172,11 +195,14 @@ fn mongo_run_reconcile_matches_source_count() {
         "run --reconcile must exit 0 on a match; stderr:\n{}",
         String::from_utf8_lossy(&r.stderr)
     );
-    // The reconcile verdict rides the run summary on stderr.
+    // The reconcile verdict rides the run summary on stderr. NB: a bare
+    // `.contains("MATCH")` is vacuous — "MISMATCH" contains "MATCH" — so a real
+    // mismatch would pass it too. Assert the positive verdict AND the absence of
+    // "MISMATCH" (bug-hunt: the oracle was self-satisfying).
     let summary = String::from_utf8_lossy(&r.stderr);
     assert!(
-        summary.contains("MATCH"),
-        "reconcile must report a source/dest MATCH, got:\n{summary}"
+        summary.contains("MATCH") && !summary.contains("MISMATCH"),
+        "reconcile must report a source/dest MATCH (not MISMATCH), got:\n{summary}"
     );
 }
 
