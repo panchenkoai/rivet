@@ -336,3 +336,122 @@ fn roast_pos_column_leads_with_data_for_downstream_sort() {
         );
     }
 }
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-rs"]
+fn roast_until_current_terminates_under_sustained_writes_and_keeps_backlog() {
+    // A bounded run must (1) TERMINATE at the open-time cluster-time bound even
+    // while writes keep arriving — the drain loop used to check its stop
+    // condition only on an empty poll, so continuous writes hung it forever
+    // (bug-hunt H) — and (2) still capture the pre-open backlog (a naive bound
+    // dropped it). Assert both.
+    require_alive(LiveService::MongoRs);
+    let db = unique_name("cdc_hbound");
+    let m = MongoTest::connect(PORT, &db);
+    m.drop_collection("t");
+
+    let rig = cdc(&db, "t");
+    rig.run_ok(); // pin
+    for i in 0..30 {
+        m.upsert_set("t", i, "v", "backlog"); // pre-open backlog: _id 0..29
+    }
+
+    let bg_db = db.clone();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_bg = stop.clone();
+    let bg = std::thread::spawn(move || {
+        let w = MongoTest::connect(PORT, &bg_db);
+        let mut i = 10_000;
+        while !stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
+            w.upsert_set("t", i, "v", "live");
+            i += 1;
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+    });
+
+    let start = std::time::Instant::now();
+    rig.run_ok(); // must return at the time bound, not hang until the writer stops
+    let elapsed = start.elapsed();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = bg.join();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(6),
+        "until_current must terminate under sustained writes, took {elapsed:?}"
+    );
+    // The whole pre-open backlog (0..29) must be present — termination must NOT
+    // come from dropping the backlog.
+    let ids = dir_parquet_distinct_strings(&rig.out_dir(), "_id");
+    for i in 0..30 {
+        assert!(
+            ids.contains(&i.to_string()),
+            "backlog _id {i} must be captured, got {} ids",
+            ids.len()
+        );
+    }
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-rs"]
+fn roast_uncaptured_collection_drop_does_not_wedge_capture() {
+    // A whole-db watch also sees DDL (`drop`/`rename`) for OTHER collections.
+    // The op mapping used to `bail!` on any non-row op, so dropping an uncaptured
+    // collection failed the whole run — and every resume re-hit it: a wedge
+    // (bug-hunt G). DDL is now skipped; the captured collection keeps flowing.
+    require_alive(LiveService::MongoRs);
+    let db = unique_name("cdc_ddl");
+    let m = MongoTest::connect(PORT, &db);
+    m.drop_collection("orders");
+    m.drop_collection("scratch");
+    m.upsert_set("scratch", 1, "v", "x"); // exists so the drop is a real DDL event
+
+    let rig = cdc(&db, "orders");
+    rig.run_ok(); // pin
+
+    // A change to the captured collection, then a DROP of the UNCAPTURED one.
+    m.upsert_set("orders", 1, "v", "a");
+    m.drop_collection("scratch"); // DDL event on the shared db-watch
+    m.upsert_set("orders", 2, "v", "b");
+
+    // Must NOT bail on the drop — both orders changes captured.
+    rig.run_ok();
+    let ids = dir_parquet_distinct_strings(&rig.out_dir(), "_id");
+    assert!(
+        ids.contains("1") && ids.contains("2"),
+        "captured collection must keep flowing across an uncaptured drop, got: {ids:?}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-rs"]
+fn roast_checkpoint_advances_on_uncaptured_only_traffic() {
+    // The whole-db watch sees commits for UNCAPTURED collections too. The commit
+    // boundary advances `last_commit` before routing, but no captured buffer ever
+    // rolled — so the checkpoint never moved and every cycle re-read the whole
+    // uncaptured backlog until the oplog rolled past it (bug-hunt K). The final
+    // roll now fires on an unacked commit even with empty buffers.
+    require_alive(LiveService::MongoRs);
+    let db = unique_name("cdc_kstall");
+    let m = MongoTest::connect(PORT, &db);
+    m.drop_collection("orders");
+    m.drop_collection("audit");
+
+    let rig = cdc(&db, "orders");
+    rig.run_ok(); // pin — writes the checkpoint at the current position
+    let ckpt_after_pin = std::fs::read(rig.checkpoint()).unwrap();
+
+    // Traffic on the UNCAPTURED collection only.
+    for i in 0..20 {
+        m.upsert_set("audit", i, "v", "log");
+    }
+
+    // A bounded run captures nothing for `orders`, but MUST advance the checkpoint
+    // past the audit commits — otherwise the next run re-reads them forever.
+    rig.run_ok();
+    let ckpt_after_run = std::fs::read(rig.checkpoint()).unwrap();
+
+    assert_ne!(
+        ckpt_after_pin, ckpt_after_run,
+        "the checkpoint must advance past uncaptured-only traffic, not stall"
+    );
+}

@@ -59,6 +59,35 @@ pub(crate) struct MongoChangeStream {
     /// `next_change` keeps polling instead of prematurely declaring "caught up"
     /// and dropping the backlog. `None` unless `until_current`.
     target_data: Option<String>,
+    /// Cluster time at open — the UPPER time bound for a bounded run. An event
+    /// whose `cluster_time` is past this arrived AFTER we opened, so the bounded
+    /// run stops there. Without it, SUSTAINED concurrent writes keep
+    /// `next_if_any` returning events, the empty-poll (`Ok(None)`) target check
+    /// never fires, and the run never terminates (bug-hunt hang). `None` unless
+    /// `until_current`, or when the server did not report `operationTime`.
+    until_current_ts: Option<mongodb::bson::Timestamp>,
+}
+
+/// How a whole-db change-stream operation is handled: a document change we emit,
+/// a DDL event we skip (a `drop`/`rename`/`dropDatabase` is not a row change — it
+/// must NOT bail the whole run, especially for an uncaptured collection), or an
+/// `invalidate` that genuinely ended the stream.
+enum OpClass {
+    Row,
+    Skip,
+    Invalidate,
+}
+
+fn classify_op(op: &OperationType) -> OpClass {
+    match op {
+        OperationType::Insert
+        | OperationType::Update
+        | OperationType::Replace
+        | OperationType::Delete => OpClass::Row,
+        OperationType::Invalidate => OpClass::Invalidate,
+        // Drop, Rename, DropDatabase, and any future non-row op: skip.
+        _ => OpClass::Skip,
+    }
 }
 
 /// The `_data` hex of a change-stream resume token — an order-preserving keystring
@@ -162,13 +191,28 @@ impl MongoChangeStream {
                 .resume_after(resume)
                 .await
         })?;
-        // The "current end" a bounded (`until_current`) run drains up to.
+        // The "current end" a bounded (`until_current`) run drains up to (the
+        // resume-token `_data`, for the empty-poll race), plus the cluster time at
+        // open (the strict upper bound that terminates under sustained writes).
         let target_data = if until_current {
             stream
                 .resume_token()
                 .and_then(|t| serde_json::to_value(&t).ok())
                 .as_ref()
                 .and_then(token_data)
+        } else {
+            None
+        };
+        let until_current_ts = if until_current {
+            session.block_on(async {
+                session
+                    .client()
+                    .database(&db_name)
+                    .run_command(doc! { "hello": 1 })
+                    .await
+                    .ok()
+                    .and_then(|d| d.get_timestamp("operationTime").ok())
+            })
         } else {
             None
         };
@@ -179,6 +223,7 @@ impl MongoChangeStream {
             db_name,
             until_current,
             target_data,
+            until_current_ts,
         };
         // Idle-first-run anchor (MongoDB has no server-side anchor — the MySQL
         // model): a fresh checkpointed open persists its current resume token NOW.
@@ -348,22 +393,21 @@ impl ChangeStream for MongoChangeStream {
     fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
         let canonical = self.canonical;
         let until_current = self.until_current;
+        let target = self.target_data.clone();
+        let bound_ts = self.until_current_ts;
         // Split the borrow: `block_on` reads `&session`, the future drives
         // `&mut stream` — disjoint fields.
         let session = &self.session;
         let stream = &mut self.stream;
-        if until_current {
-            let target = self.target_data.clone();
-            let db_name = &self.db_name;
-            // Bounded run: drain up to the open-time target. `next_if_any` returns
-            // `None` when nothing is available in a `max_await_time` window — but a
-            // single empty poll can precede the backlog's getMore (the stream's
-            // position has NOT advanced past the target yet), so only stop once the
-            // position IS past the target. Otherwise poll again — this is the fix
-            // for the intermittent backlog-drop the version matrix caught on 4.4.
-            loop {
+        let db_name = &self.db_name;
+        loop {
+            // Pull one raw event (or terminate). Bounded run: drain up to the
+            // open-time target; `next_if_any` returns `None` on an empty poll, but a
+            // single empty poll can precede the backlog's getMore (worst on 4.4), so
+            // only stop once the position IS past the target. Daemon: block.
+            let cse = if until_current {
                 match session.block_on(async { stream.next_if_any().await }) {
-                    Ok(Some(cse)) => return Some(to_change_event(cse, canonical, db_name)),
+                    Ok(Some(cse)) => cse,
                     Ok(None) => {
                         let advanced = stream
                             .resume_token()
@@ -371,24 +415,49 @@ impl ChangeStream for MongoChangeStream {
                             .as_ref()
                             .and_then(token_data);
                         match (&advanced, &target) {
-                            // Position moved past the open-time end → drained, stop.
                             (Some(cur), Some(tgt)) if cur > tgt => return None,
-                            // No target (shouldn't happen) → fall back to first-None.
                             (_, None) => return None,
-                            // Not yet past the target — the backlog is still coming.
-                            _ => continue,
+                            _ => continue, // backlog still coming — poll again
                         }
                     }
                     Err(e) => return Some(Err(anyhow::Error::from(e))),
                 }
+            } else {
+                match session.block_on(async { stream.next().await }) {
+                    Some(Ok(cse)) => cse,
+                    Some(Err(e)) => return Some(Err(anyhow::Error::from(e))),
+                    None => return None, // stream closed
+                }
+            };
+
+            // H — time bound: an event past the open-time cluster time is a NEW
+            // write (arrived after we opened), so a bounded run stops there.
+            // Without it, sustained writes keep `next_if_any` returning events and
+            // the run never terminates (the `_data` target only fires on an empty
+            // poll, which never happens under continuous writes).
+            if until_current
+                && let (Some(ct), Some(bound)) = (cse.cluster_time, bound_ts)
+                && ct > bound
+            {
+                return None;
             }
-        } else {
-            // Daemon: block for the next change (the tailable stream only ends
-            // when the connection closes).
-            match session.block_on(async { stream.next().await }) {
-                Some(Ok(cse)) => Some(to_change_event(cse, canonical, &self.db_name)),
-                Some(Err(e)) => Some(Err(anyhow::Error::from(e))),
-                None => None, // stream closed
+
+            // G — operation classification: a whole-db watch also sees DDL
+            // (`drop`, `rename`, `dropDatabase`) that is NOT a row change — SKIP it
+            // and keep draining rather than bailing the whole run on a drop of any
+            // (even uncaptured) collection. `invalidate` genuinely ends the stream
+            // (dropDatabase / a collection-stream drop) → a loud terminal error.
+            match classify_op(&cse.operation_type) {
+                OpClass::Row => return Some(to_change_event(cse, canonical, db_name)),
+                OpClass::Skip => continue,
+                OpClass::Invalidate => {
+                    return Some(Err(anyhow::anyhow!(
+                        "mongodb cdc: the change stream was INVALIDATED (the watched \
+                         database was dropped, or a captured collection dropped/renamed). \
+                         The resume token is no longer usable — re-create the capture from \
+                         a fresh checkpoint after confirming the source state."
+                    )));
+                }
             }
         }
     }

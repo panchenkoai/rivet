@@ -289,7 +289,15 @@ pub(crate) fn run_to_files(
             break;
         }
     }
-    if sinks.iter().any(|s| !s.buf.is_empty()) {
+    // Final roll fires when a captured table has buffered rows OR when a commit
+    // boundary is unacked. The latter is the fix for a stream whose ONLY traffic
+    // was uncaptured tables: `last_commit`/`unacked_commit` advanced (before the
+    // routing filter) but no captured buffer ever triggered a roll, so without
+    // this the checkpoint never moved — every scheduler cycle re-read the whole
+    // uncaptured backlog until the log rolled past it (bug-hunt K, cross-engine).
+    // `roll_all` flushes nothing when the buffers are empty; it just persists the
+    // checkpoint + acks.
+    if unacked_commit || sinks.iter().any(|s| !s.buf.is_empty()) {
         roll_all(
             &mut sinks,
             stream,
