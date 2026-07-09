@@ -148,9 +148,17 @@ impl TableSink<'_> {
 /// and table separately; comparing the config string verbatim against the
 /// bare event table silently routed ZERO events for qualified configs.
 pub(super) fn table_matches(cfg: &str, schema: &str, table: &str) -> bool {
+    // Full-name match FIRST: a MongoDB collection name may contain dots
+    // (`my.coll`) and has no schema qualifier, so splitting it into a bogus
+    // `schema.table` dropped every event (bug-hunt: 0-row success forever). This
+    // is safe for SQL — no real table is literally named `schema.table`.
+    if cfg == table {
+        return true;
+    }
+    // Otherwise a SQL `schema.table` qualifier.
     match cfg.split_once('.') {
         Some((cs, ct)) => cs == schema && ct == table,
-        None => cfg == table,
+        None => false,
     }
 }
 
@@ -743,6 +751,16 @@ mod tests {
             !table_matches("orders", "public", "users"),
             "different table differs"
         );
+    }
+
+    #[test]
+    fn roast_dotted_collection_name_routes_by_full_name() {
+        // A MongoDB collection literally named `my.data` (dots are legal, no
+        // schema concept) must route by its FULL name — before this it was
+        // mis-split into schema=`my`, table=`data` and routed ZERO events forever.
+        assert!(table_matches("my.data", "shopdb", "my.data"));
+        // Still distinguishes a genuinely different collection.
+        assert!(!table_matches("my.data", "shopdb", "my.other"));
     }
 
     // The nameless (binlog_row_metadata=MINIMAL) guard path: an image whose

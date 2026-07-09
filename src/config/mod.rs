@@ -1138,6 +1138,25 @@ impl Config {
             );
         }
 
+        // A collection whose name contains a dot does not route through the
+        // change-stream capture — its events are silently dropped. Refuse loudly
+        // rather than report 0-row success forever (bug-hunt find). Batch handles
+        // dotted names fine, so this is CDC-only.
+        if export.mode == ExportMode::Cdc && self.source.source_type == SourceType::Mongo {
+            let dotted = |t: &str| t.contains('.');
+            if export.table.as_deref().is_some_and(dotted)
+                || export.tables.iter().flatten().any(|t| dotted(t))
+            {
+                anyhow::bail!(
+                    "export '{}': MongoDB `mode: cdc` does not support a collection name \
+                     containing a dot — the change-stream router cannot address it and its \
+                     events would be silently dropped. Rename the collection, or capture it \
+                     with `mode: full` (batch handles dotted names).",
+                    export.name
+                );
+            }
+        }
+
         if let Some(days) = export.chunk_by_days {
             if export.mode != ExportMode::Chunked {
                 anyhow::bail!(

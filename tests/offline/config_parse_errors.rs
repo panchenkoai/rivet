@@ -246,3 +246,27 @@ exports:
         "the error must require cdc.checkpoint; got: {err}"
     );
 }
+
+#[test]
+fn roast_mongo_cdc_rejects_dotted_collection_name() {
+    // A dotted collection name does not route through the change-stream capture —
+    // its events are silently dropped (0-row success forever). Refuse at load
+    // (bug-hunt find); batch handles dotted names, so this is CDC-only.
+    let yaml = r#"
+source:
+  type: mongo
+  url: "mongodb://localhost:27017/db"
+exports:
+  - name: t
+    table: "orders.2026"
+    mode: cdc
+    format: parquet
+    cdc: { checkpoint: "/tmp/ck", until_current: true }
+    destination: { type: local, path: "/tmp/x" }
+"#;
+    let err = parse_err(yaml);
+    assert!(
+        err.contains("dot"),
+        "dotted collection in mongo CDC must be rejected naming the dot; got: {err}"
+    );
+}
