@@ -48,7 +48,7 @@ seed:
     orders_per_user: 10           # orders ≈ 1,000,000
     events_per_user: 50           # events ≈ 5,000,000
     page_views: 2000000           # wide table (degraded / memory-pressure scenario)
-    content_items: 200000         # heavy text (worst case for peak RSS)
+    content_items: 2000000        # heavy text (worst case for peak RSS)
     coalesce_rows: 2000           # composite-cursor demo (NULL updated_at)
     coalesce_null_ratio: 0.35
   # MongoDB is a document store — the SQL schema does not apply. Its fixture is a
@@ -84,10 +84,10 @@ tools:
   - name: ingestr
     role: competitor
     lang: Go
-    version: "1.0.72"
+    version: "1.0.73"
     version_date: "2026-07-09"
-    latest: "curl -LsSf https://getbruin.com/install/ingestr | sh"
-    steelman: { note: "single-binary CLI, DB→DB; measure default + best available chunking/interval flags" }
+    latest: "curl -LsSf https://getbruin.com/install/ingestr | sh   # or download the Darwin_arm64 release tarball"
+    steelman: { note: "single-binary Go CLI; writes a local parquet file via the parquet:// dest scheme (1.0.73+); source needs sslmode=disable on the loopback pg" }
 
   - name: dlt
     role: competitor

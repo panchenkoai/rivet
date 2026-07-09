@@ -1,0 +1,3 @@
+# Downloaded tool binaries (ingestr tarball, etc.) and smoke output — never committed.
+.tools/
+.smoke-out/
