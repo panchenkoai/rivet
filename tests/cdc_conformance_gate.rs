@@ -408,7 +408,17 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 || chunk.contains("collect(") && chunk.contains("Metrics")
                 || chunk.contains("all_ok") // doctor --json contract
                 || chunk.contains("storage/v1") // GCS listing read-back
-                || chunk.contains("ParquetRecordBatchReaderBuilder"); // inline part read-back
+                || chunk.contains("ParquetRecordBatchReaderBuilder") // inline part read-back
+                // A must-fail capture asserts the NEGATIVE outcome: `run_expect_fail`
+                // requires a non-zero exit, so a silent 0-row success CANNOT satisfy
+                // it (the exact risk this gate guards). E.g. the corrupt-checkpoint
+                // roast — the run must fail loudly, not re-anchor and exit 0.
+                || chunk.contains("run_expect_fail(")
+                // Reads the persisted CDC checkpoint/anchor bytes back
+                // (`std::fs::read(rig.checkpoint())`) — the client-anchor engines'
+                // state-DB oracle. A checkpoint-advance/pin assertion is a real
+                // outcome (the committed log position), distinct from row read-back.
+                || chunk.contains("checkpoint())");
             if runs_capture && !asserts_outcome {
                 naked.push(format!("{file}::{name}"));
             }
