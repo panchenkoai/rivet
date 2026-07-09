@@ -169,7 +169,9 @@ MY_ENGINE = {
     "duckdb_install": "INSTALL mysql; LOAD mysql;",
     "duckdb_attach": ("ATTACH 'host=localhost port=3306 user=rivet password=rivet "
                       "database=rivet_bench' AS src (TYPE mysql, READ_ONLY)"),
-    "clickhouse_fn": (lambda t: f"mysql('localhost:3306', 'rivet_bench', '{t}', "
+    # 127.0.0.1 (not localhost) forces TCP — 'localhost' makes clickhouse try the
+    # unix socket /tmp/mysql.sock, which the docker mysql doesn't expose to the host.
+    "clickhouse_fn": (lambda t: f"mysql('127.0.0.1:3306', 'rivet_bench', '{t}', "
                                 "'rivet', 'rivet')"),
     "odbc_conn": ("Driver={MySQL ODBC 9.0 Unicode Driver};Server=localhost;Port=3306;"
                   "Database=rivet_bench;User=rivet;Password=rivet;"),
