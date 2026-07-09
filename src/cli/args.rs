@@ -145,13 +145,18 @@ pub enum Commands {
     },
     /// Stream change data capture (CDC) from a source's transaction log.
     ///
-    /// Experimental — MySQL binlog only. Emits one JSON object per row change to
-    /// stdout (NDJSON) and, with `--checkpoint`, persists a resume position.
-    /// Requires the source at `binlog_format = ROW` with a `REPLICATION SLAVE`
-    /// grant.
+    /// The engine is chosen from the URL scheme: `mysql://` (binlog),
+    /// `postgresql://` (logical slot), `sqlserver://` (change tables), or
+    /// `mongodb://` (change stream). Emits one JSON object per row change to
+    /// stdout (NDJSON) and, with `--checkpoint`, persists a resume position;
+    /// `--output` writes typed Parquet/CSV instead. Per-engine prerequisites
+    /// (ROW binlog + REPLICATION grant, `wal_level=logical`, enabled CDC, a
+    /// replica set) are in docs/reference/cdc.md. The fuller, config-driven path
+    /// is `rivet run` with `mode: cdc`.
     #[command(group = clap::ArgGroup::new("cdc_source").required(true).multiple(false))]
     Cdc {
-        /// Database URL (mysql:// only for now). Visible in `ps`; prefer
+        /// Database URL — `postgresql://`, `mysql://`, `sqlserver://`, or
+        /// `mongodb://` (engine chosen from the scheme). Visible in `ps`; prefer
         /// `--source-env`/`--source-file` outside local dev.
         #[arg(long, group = "cdc_source")]
         source: Option<String>,
