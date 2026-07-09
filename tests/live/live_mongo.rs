@@ -243,6 +243,74 @@ fn mongo_batch_resume_reads_only_new_since_last_run() {
 }
 
 #[test]
+#[ignore = "live: requires docker compose up -d mongo-rs (snapshot needs a replica set)"]
+fn mongo_batch_read_concern_snapshot_empty_first_run_then_populated() {
+    // `read_concern: snapshot` is a point-in-time read (5.0+ replica set), so it
+    // rides the RS, not the standalone. Cover the key AND an empty→second-run
+    // interaction: an EMPTY first run under snapshot must succeed reading 0 (a
+    // 0-doc collection must not wedge), and a second run after the collection is
+    // populated must read every doc under snapshot.
+    require_alive(LiveService::MongoRs);
+    const RS_PORT: u16 = 27018;
+    let db = unique_name("mrc_snap");
+    let m = MongoTest::connect(RS_PORT, &db);
+    m.drop_collection("t");
+
+    let rig = Rig::mongo_batch("t")
+        .source_url(&MongoTest::url(RS_PORT, &db))
+        .mongo("read_concern: snapshot");
+
+    // Empty first run: snapshot read of a 0-doc collection reads nothing, cleanly.
+    rig.run_ok();
+    assert_eq!(
+        total_parquet_rows(&rig.out_dir()),
+        0,
+        "empty snapshot run must read 0, not hang or phantom-read"
+    );
+
+    // Populate, then a second run: snapshot must read the full collection.
+    m.seed_int_id("t", 1500);
+    rig.run_ok();
+    assert_eq!(
+        dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
+        1500,
+        "snapshot read_concern must read the whole collection on the second run"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn mongo_batch_no_cursor_timeout_false_empty_first_run_then_populated() {
+    // `no_cursor_timeout: false` is the NON-default (default `true`): it flips the
+    // scan cursor's `noCursorTimeout` OFF. Cover the key AND an empty→second-run
+    // interaction: an empty first run reads 0, and a second run over a populated,
+    // page_size-paged collection reads everything — the flag must not truncate the
+    // scan.
+    require_alive(LiveService::Mongo);
+    let db = unique_name("mnct");
+    let m = MongoTest::connect(PORT, &db);
+    m.drop_collection("t");
+
+    // page_size forces a paged (multi-cursor) scan — where the cursor flag applies.
+    let rig = batch(&db, "t").mongo("page_size: 400, no_cursor_timeout: false");
+
+    rig.run_ok();
+    assert_eq!(
+        total_parquet_rows(&rig.out_dir()),
+        0,
+        "empty first run reads 0 with no_cursor_timeout: false"
+    );
+
+    m.seed_int_id("t", 1200);
+    rig.run_ok();
+    assert_eq!(
+        dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
+        1200,
+        "no_cursor_timeout: false must not truncate the paged scan on the populated run"
+    );
+}
+
+#[test]
 #[ignore = "live: requires docker compose up -d mongo"]
 fn mongo_keyset_on_heterogeneous_id_errors_loudly_full_scan_still_works() {
     require_alive(LiveService::Mongo);
