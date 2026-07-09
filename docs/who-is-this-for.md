@@ -5,7 +5,7 @@ to do one thing well, not to be the only data tool you need.  This
 page exists so you can decide in 60 seconds whether to keep reading,
 or whether something else is a better fit for your problem.
 
-If you came here from a search for "Postgres / MySQL → Parquet"
+If you came here from a search for "Postgres / MySQL / SQL Server / MongoDB → Parquet"
 or "extract a big SQL table without an OOM", you are probably in the
 right place.
 
@@ -36,7 +36,7 @@ right place.
 
 | You actually need… | Use this instead |
 |---|---|
-| **Change Data Capture / streaming** — every insert/update/delete as it happens, fed into Kafka or Kinesis | [Debezium](https://debezium.io/), [Estuary](https://estuary.dev/), [Materialize](https://materialize.com/), or your cloud's native CDC (`AWS DMS`, `GCP Datastream`) |
+| **Always-on live streaming** — every insert/update/delete pushed continuously into Kafka or Kinesis as it happens | [Debezium](https://debezium.io/), [Estuary](https://estuary.dev/), [Materialize](https://materialize.com/), or your cloud's native CDC (`AWS DMS`, `GCP Datastream`). *(Rivet does capture CDC — inserts/updates/deletes — but to **files**: `mode: cdc`, resumable, per-invocation, not a live stream. See [semantics.md](semantics.md).)* |
 | **A SaaS connector marketplace** — pre-built connectors for Salesforce, Stripe, NetSuite, Shopify, Hubspot, etc. | [Airbyte](https://airbyte.com/), [Fivetran](https://www.fivetran.com/), [Stitch](https://www.stitchdata.com/) |
 | **A managed warehouse loader** — extract from operational DB and load into BigQuery / Snowflake / Redshift / Databricks **as one product** | [Fivetran](https://www.fivetran.com/), [Airbyte](https://airbyte.com/) (cloud), [dlt](https://dlthub.com/) (self-hosted with destinations), [Sling](https://slingdata.io/) |
 | **In-warehouse transformation** — modeling, joins, materializations, lineage | [dbt](https://www.getdbt.com/), [SQLMesh](https://sqlmesh.com/) |
@@ -88,7 +88,8 @@ become any of those, and shoehorning will be painful.
 ## Decision shortcut
 
 ```text
-Need CDC?                                      → Debezium / Estuary
+Need always-on live streaming (into Kafka)?    → Debezium / Estuary
+Need CDC captured to files (resumable)?        → Rivet  (mode: cdc)
 Need a connector for a non-DB SaaS source?     → Airbyte / Fivetran
 Need a managed extract+load product?           → Fivetran / Airbyte Cloud
 Need a SQL-based transformation framework?     → dbt

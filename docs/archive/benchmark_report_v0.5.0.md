@@ -1,5 +1,11 @@
 # Rivet v0.5.x Benchmark Report
 
+> **⚠️ HISTORICAL — archived.** These numbers are from **v0.5.0 (2026-05-15)**,
+> pre-dating the streaming read path that changed every RSS/throughput figure in
+> the newer reports. Retained only as the *pattern* for config-tuning reports and
+> as the cited evidence behind older best-practices claims. **Pending a 0.18
+> re-measure** — do not quote these figures as current.
+
 Measured on: 2026-05-15  
 Binary: `target/release/rivet` (v0.5.0)  
 Host: macOS Darwin 25.4.0, Apple Silicon  

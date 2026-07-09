@@ -1,12 +1,14 @@
 # Database version support
 
-Rivet is tested against every PostgreSQL and MySQL version listed in the table
-below. Each release runs the **full end-to-end suite** — `doctor`, `check`,
-every export mode (full / incremental / chunked / time_window), every output
-format (CSV / Parquet) with every compression codec, `reconcile`, recovery
-scenarios, state management, date-chunking, and `rivet init` — against each
-version. No version-specific code paths are skipped; the same Rust driver
-builds and the same YAML configs drive every target.
+Rivet supports four source engines — **PostgreSQL**, **MySQL**, **SQL Server**,
+and **MongoDB** — every supported version of which is listed in the table below.
+PostgreSQL and MySQL run the **full end-to-end suite** on each release —
+`doctor`, `check`, every export mode (full / incremental / chunked / time_window),
+every output format (CSV / Parquet) with every compression codec, `reconcile`,
+recovery scenarios, state management, date-chunking, and `rivet init` — against
+each version. No version-specific code paths are skipped; the same Rust driver
+builds and the same YAML configs drive every target. **SQL Server** (Beta) and
+**MongoDB** carry their own scope and CI coverage, detailed below.
 
 **MongoDB** (the OSS JSON-blob source — batch + CDC) rides its own dedicated CI
 matrix across 4.4 → 8.0, live-tested through the canonical test rig, rather than
@@ -58,9 +60,11 @@ local `docker-compose.yaml` top-level `postgres` / `mysql` / `mssql` / `mongo` s
 SQL Server is a source engine (`source.type: mssql`, scheme `sqlserver://`,
 default port 1433), driven by the async `tiberius` client. Supported today:
 
-- **Modes**: `full` / snapshot, `incremental`, `chunked` (range + dense), and
+- **Modes**: `full` / snapshot, `incremental`, `chunked` (range + dense),
   **keyset (seek)** via explicit `chunk_by_key` — the ideal shape for a
-  non-integer PK (UUID / string). The page builder emits the T-SQL
+  non-integer PK (UUID / string) — and **CDC** (`mode: cdc` / `rivet cdc`,
+  reading SQL Server change tables via the Agent capture job; see
+  [cdc.md](cdc.md)). The page builder emits the T-SQL
   `OFFSET 0 ROWS FETCH NEXT n ROWS ONLY` clause (T-SQL has no `LIMIT`).
 - **Types** (live-validated through the DuckDB + ClickHouse Parquet oracles):
   `int`/`bigint`/`smallint`/`tinyint`, `bit`, `decimal`/`numeric`,

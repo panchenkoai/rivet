@@ -7,109 +7,38 @@ Rivet has two benchmark layers:
 | Layer | Tool | Purpose |
 |-------|------|---------|
 | **Micro-benchmarks** | Criterion (`benches/`) | Hot-path throughput, compilation check, per-function regression gate |
-| **E2E benchmarks** | Shell runner (`dev/bench/`) | Wall time, peak RSS, output size for full pipeline runs |
+| **Cross-tool / cross-engine E2E** | `dev/bench/smoke.py` + `docs/bench/matrix.yaml` | rivet vs 7 other tools on Postgres / MySQL / SQL Server / MongoDB — throughput, peak RSS, source-harm, type fidelity |
 
 ---
 
-## E2E benchmark runner
+## Cross-tool / cross-engine E2E harness
 
-The E2E runner measures complete pipeline runs — source query, batching, writing, file output — against a live Postgres instance seeded with representative datasets.
-
-### Prerequisites
-
-```bash
-# 1. Start Postgres
-docker compose up -d postgres
-
-# 2. Seed benchmark datasets
-PGPASSWORD=rivet psql -h localhost -U rivet -d rivet -f dev/bench/seed_bench_pg.sql
-
-# 3. Build release binary
-cargo build --release
-
-# 4. Run all suites
-RIVET=./target/release/rivet POSTGRES_URL=postgres://rivet:rivet@localhost:5432/rivet \
-  bash dev/bench/run_bench.sh all | tee bench_report.md
-```
-
-To run a single suite:
+The E2E harness compares rivet to duckdb, clickhouse-local, sling, ingestr, dlt,
+and odbc2parquet exporting the same fixture to Parquet, and captures what each
+tool does to the source (a co-running OLTP probe, longest query/txn, locks,
+native engine counters). It is a **single source of truth**: everything is
+driven from [`docs/bench/matrix.yaml`](../bench/matrix.yaml) by the runner
+[`dev/bench/smoke.py`](../../dev/bench/smoke.py), which fails if the yaml declares
+a metric the code doesn't capture. See [`docs/bench/README.md`](../bench/README.md)
+for prerequisites and [`docs/bench/report.html`](../bench/report.html) for the
+rendered results.
 
 ```bash
-bash dev/bench/run_bench.sh compression
-bash dev/bench/run_bench.sh row_group
-bash dev/bench/run_bench.sh batch_memory
-bash dev/bench/run_bench.sh quality
+# system python has PyYAML + dlt; the homebrew pythons ship a broken pyexpat
+/usr/bin/python3 dev/bench/smoke.py --engine postgres --table content_items
+/usr/bin/python3 dev/bench/smoke.py --engine mysql --table content_items
+/usr/bin/python3 dev/bench/smoke.py --engine mssql --table orders
 ```
 
-### Datasets
+Fixtures are seeded into a dedicated `rivet_bench` per engine (via the Rust
+`seed` tool; sizes in `matrix.yaml`) so the live-test fixtures are untouched.
+Three matrices print per run: benchmark, harm, type-loss.
 
-| Table | Rows | Description |
-|-------|------|-------------|
-| `bench_narrow` | 500,000 | INT / BIGINT / TIMESTAMPTZ — baseline throughput |
-| `bench_wide` | 100,000 | 10 TEXT columns × ~200 B each — memory pressure |
-| `bench_json` | 50,000 | JSONB payload column — CPU/string pressure |
-| `bench_hc` | 200,000 | UUID + email + phone — quality uniqueness RAM risk |
-| `bench_decimal` | 200,000 | NUMERIC(12,2) columns — type conversion pressure |
-| `bench_sparse` | 10,000 | Many nullable columns — low-density export |
-
-### Output format
-
-The runner emits a Markdown table:
-
-```
-## Compression profiles — bench_narrow
-
-| Profile | Compression | Wall(s) | User(s) | Sys(s) | RSS(MB) | Files | Size(MB) |
-|---------|-------------|---------|---------|--------|---------|-------|----------|
-| none    | uncompressed | 4.2   |   3.8   |  0.4   |  210    |  1    |  38.2    |
-| fast    | snappy       | 4.5   |   4.1   |  0.4   |  215    |  1    |  21.4    |
-| balanced| zstd-3       | 5.1   |   4.7   |  0.4   |  218    |  1    |  14.8    |
-| compact | zstd-9       | 8.3   |   7.9   |  0.4   |  219    |  1    |  13.1    |
-```
-
-### Metrics
-
-| Metric | Meaning | Notes |
-|--------|---------|-------|
-| `Wall(s)` | Total elapsed seconds | Most user-facing metric; includes all phases |
-| `User(s)` | User-space CPU seconds | Compression, Arrow serialization, hashing |
-| `Sys(s)` | Kernel CPU seconds | File I/O, syscalls |
-| `RSS(MB)` | Peak resident set size | Captured via GNU `time -v` or `gtime -v` |
-| `Files` | Output file count | > 1 means file splitting occurred |
-| `Size(MB)` | Total output file size | Compressed size on disk |
-
-**RSS note:** RSS is captured by the shell runner via the `/usr/bin/time -v` (Linux) or `gtime -v` (macOS) wrapper. It reflects the high-water mark for the entire process, including the Parquet writer buffer, the Arrow batch in flight, the source connection pool, and the OS heap. It is **not** the same as the Arrow `get_array_memory_size()` value that `max_batch_memory_mb` checks — expect RSS to be 50–200 MB higher.
-
----
-
-## How to compare two versions
-
-To compare `v0.4.0` vs `v0.5.0` (or any two builds):
-
-```bash
-# Build the reference binary
-git checkout v0.4.0
-cargo build --release
-cp target/release/rivet /tmp/rivet_v040
-
-# Build the current binary
-git checkout main
-cargo build --release
-cp target/release/rivet /tmp/rivet_v050
-
-# Run both against the same seed
-RIVET=/tmp/rivet_v040 bash dev/bench/run_bench.sh all > bench_v040.md
-RIVET=/tmp/rivet_v050 bash dev/bench/run_bench.sh all > bench_v050.md
-```
-
-Then diff the wall time and RSS columns. Key claims to validate:
-
-| Claim | Suite | Metric to compare |
-|-------|-------|-------------------|
-| Row group auto-tuning reduces RSS on wide tables | `row_group` on `bench_wide` | `RSS(MB)` |
-| `balanced` profile compression is good default | `compression` on `bench_narrow` | `Wall(s)`, `Size(MB)` |
-| `auto_shrink` has tolerable overhead | `batch_memory` on `bench_wide` | `Wall(s)` vs no-cap baseline |
-| Typed hashing reduces quality check overhead | `quality` on `bench_hc` | `User(s)` |
+**Comparing rivet versions** is a special case of the same harness — point
+`RIVET_BIN` (or `$PATH` `rivet`) at each build and re-run; the benchmark matrix's
+`rows_s` / `peak_mb` columns are the comparison. rivet's own steelman
+(`mode: full, tuning.profile: fast, zstd`) was chosen this way — a measured +24 %
+rows/s from dropping the `balanced` 50 ms/batch throttle.
 
 ---
 
@@ -152,17 +81,15 @@ Criterion saves HTML reports to `target/criterion/`. Open `target/criterion/inde
 
 ## CI integration
 
-The nightly workflow runs both layers automatically:
+Only the **Criterion micro-benchmark** layer belongs in CI — it compiles and
+smoke-samples the Rust hot paths (a compile/panic check, not a regression gate).
+The cross-tool E2E harness is **run manually**: it needs four live database
+engines and per-engine vendor drivers, so it is not a CI job — reproduce it from
+[`docs/bench/README.md`](../bench/README.md) and publish
+[`docs/bench/report.html`](../bench/report.html).
 
-```yaml
-# .github/workflows/nightly.yml
-bench-smoke:    # Criterion: compile + 1 sample (not a regression gate)
-bench-e2e:      # run_bench.sh all → uploads bench_report.md as artifact
-```
-
-The `bench-smoke` job verifies that benchmarks compile and do not panic — it is not a regression gate. The `bench-e2e` job captures a full report and uploads it as a GitHub Actions artifact named `bench-report-<run_id>`. Download it from the Actions UI to inspect current numbers.
-
-To add a regression gate in the future, save a `--baseline` from a release tag and add a Criterion comparison step to `ci.yml`.
+To add a micro-bench regression gate in the future, save a Criterion `--baseline`
+from a release tag and add a comparison step to `ci.yml`.
 
 ---
 
@@ -199,5 +126,6 @@ The narrow bound assumes ~200 B/row; the wide bound assumes ~10 KB/row. The E2E 
 - [Parquet tuning](parquet-tuning.md) — row group targets and downstream read implications
 - [Compression profiles](compression-profiles.md) — codec mapping and trade-offs
 - [Low-memory runners](low-memory-runners.md) — settings for constrained environments
-- [`dev/bench/run_bench.sh`](../../dev/bench/run_bench.sh) — the E2E runner script
-- [`benches/`](../../benches/) — Criterion benchmark sources
+- [`dev/bench/smoke.py`](../../dev/bench/smoke.py) + [`docs/bench/matrix.yaml`](../bench/matrix.yaml) — the unified cross-tool / cross-engine harness
+- [`docs/bench/report.html`](../bench/report.html) — the rendered results
+- [`benches/`](../../benches/) — Criterion micro-benchmark sources (Rust hot paths, separate layer)

@@ -1,7 +1,7 @@
 # Compression Profiles
 
-Rivet v0.5.0 adds `compression_profile` — a high-level intent-based way to
-choose a compression codec without knowing the specific codec name or level.
+Rivet's `compression_profile` is a high-level, intent-based way to choose a
+compression codec without knowing the specific codec name or level.
 
 ---
 
@@ -142,7 +142,7 @@ hashes, random text) compresses poorly regardless of level. Low-entropy data
 (repeated values, sequential IDs, timestamps) compresses exceptionally well
 even at level 3.
 
-Run `./dev/bench/run_bench.sh compression` against your own tables for concrete
+Run the cross-tool harness (`dev/bench/smoke.py`, see [`docs/bench/README.md`](../bench/README.md)) against your own tables for concrete
 numbers.
 
 ---

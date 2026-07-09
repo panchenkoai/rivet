@@ -1,6 +1,6 @@
 # Recovery and Resume
 
-Rivet stores export progress in a SQLite state file (`rivet_state.db`) located
+Rivet stores export progress in a SQLite state file (`.rivet_state.db`) located
 next to the config file. This guide covers how to inspect, resume, and reset
 export state correctly.
 
@@ -12,7 +12,7 @@ The state file is always created next to the config file:
 
 ```
 ./rivet.yaml          ← config
-./rivet_state.db      ← state (created automatically on first run)
+./.rivet_state.db     ← state (created automatically on first run)
 ```
 
 To use a different location, point `--config` at the desired directory.
@@ -26,6 +26,8 @@ To use a different location, point `--config` at the desired directory.
 | `full` | Completed file list (manifest) | No resume needed — re-run starts a fresh export |
 | `incremental` | Last cursor value | Re-run starts from where it left off |
 | `chunked` | Per-chunk completion status | `--resume` continues from the last completed chunk |
+| `time_window` | Nothing — no cursor is stored | Each re-run re-evaluates the rolling window from `NOW()`; windows overlap by design |
+| `cdc` | Log position (PostgreSQL slot / MySQL binlog checkpoint / SQL Server LSN / MongoDB resume token) | Resumes streaming from the last committed change position |
 
 ---
 
@@ -85,11 +87,13 @@ The export proceeds normally. The flag is ignored.
 ## Inspecting state
 
 ```bash
-rivet state inspect --config rivet.yaml --export big_table
+rivet state show --config rivet.yaml
 ```
 
-This shows the current state: cursor value for incremental exports, chunk
-completion status for chunked exports, and the run history.
+This shows the current cursor value for each incremental export. For chunk
+completion status use `rivet state chunks --config rivet.yaml --export big_table`,
+and for per-run history (rows, bytes, duration, peak RSS) use
+`rivet metrics --config rivet.yaml`.
 
 ---
 

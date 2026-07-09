@@ -1,6 +1,13 @@
-# Complete YAML Config Reference
+# YAML Config Guide
 
-Every field Rivet accepts in a config YAML, grouped by section.
+> **📌 The exhaustive, always-current field reference is generated from the code:
+> [config-reference.md](config-reference.md)** — rendered from `rivet schema config`
+> (the schemars-derived JSON Schema), so it cannot drift and needs no manual
+> verification. **This page is the guide**: the same options with defaults,
+> rationale, and worked examples. For the guaranteed-current field/type/enum list,
+> trust the generated reference.
+
+The most-used options, grouped by section, with the *why* and examples.
 
 ---
 
@@ -114,7 +121,7 @@ Each entry in the `exports` list defines one export job.
 | `name` | string | **yes** | — | Unique identifier for this export |
 | `query` | string | one of query/query_file | — | SQL SELECT query |
 | `query_file` | string | | — | Path to `.sql` file (relative to config dir) |
-| `mode` | `full` \| `incremental` \| `chunked` \| `time_window` | no | `full` | Export mode |
+| `mode` | `full` \| `incremental` \| `chunked` \| `time_window` \| `cdc` | no | `full` | Export mode. `cdc` = log-based change data capture ([cdc.md](cdc.md)). MongoDB supports `full` + `cdc` only (a document store has no chunked/incremental/time_window). |
 | `format` | `parquet` \| `csv` | **yes** | — | Output format |
 | `compression` | `zstd` \| `snappy` \| `gzip` \| `lz4` \| `none` | no | `zstd` | Compression codec (low-level; prefer `compression_profile`) |
 | `compression_level` | integer | no | codec default | Compression level (low-level; prefer `compression_profile`) |
@@ -423,42 +430,13 @@ quality:
 
 ## `exports[].destination`
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `type` | `local` \| `s3` \| `gcs` \| `stdout` | **yes** | Destination type |
-
-### Local
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `path` | string | **yes** | Output directory |
-
-### S3
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `bucket` | string | **yes** | S3 bucket name |
-| `prefix` | string | no | Key prefix |
-| `region` | string | **yes** | AWS region |
-| `endpoint` | string | no | Custom S3 endpoint (MinIO, R2) |
-| `access_key_env` | string | no | Env var for access key |
-| `secret_key_env` | string | no | Env var for secret key |
-| `aws_profile` | string | no | AWS credentials profile name |
-| `allow_anonymous` | boolean | no | Skip authentication |
-
-### GCS
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `bucket` | string | **yes** | GCS bucket name |
-| `prefix` | string | no | Object prefix |
-| `credentials_file` | string | no | Path to service account JSON (otherwise ADC / `GOOGLE_APPLICATION_CREDENTIALS`) |
-| `endpoint` | string | no | Custom GCS endpoint (fake-gcs-server, test doubles) |
-| `allow_anonymous` | boolean | no | Skip authentication (public bucket / emulator) |
-
-### Stdout
-
-No additional fields. Only `type: stdout` is needed.
+The complete per-backend field list (`local` / `s3` / `gcs` / `azure` / `stdout`)
+is in the generated [config-reference.md](config-reference.md) (section
+`exports[].destination`). Per-backend setup, auth flows, and permissions:
+[destinations/](../destinations/) — [local](../destinations/local.md) ·
+[s3](../destinations/s3.md) · [gcs](../destinations/gcs.md) ·
+[azure](../destinations/azure.md) · [stdout](../destinations/stdout.md), plus the
+[cloud auth matrix](../cloud-auth.md).
 
 ### Path and prefix placeholders
 

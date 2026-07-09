@@ -1,4 +1,11 @@
-# CLI Reference
+# CLI Guide
+
+> **📌 The exhaustive command/flag reference is generated from the code:
+> [cli-reference.md](cli-reference.md)** — rendered from the clap definitions (the
+> same source as `--help`), so it cannot drift and needs no manual verification.
+> **This page is the guide**: the same commands with worked examples, output
+> samples, and the *why*. For the guaranteed-current flag list of any command,
+> trust the generated reference (or run `rivet <command> --help`).
 
 ## Global
 
@@ -104,6 +111,26 @@ silent crash never leaves the run looking healthy.
 
 ---
 
+## `rivet cdc`
+
+Stream log-based change data capture directly (without a config). The engine is
+chosen from the URL scheme — `mysql://` (binlog) / `postgresql://` (logical slot) /
+`sqlserver://` (change tables) / `mongodb://` (change stream). Emits NDJSON to
+stdout by default, or typed Parquet/CSV with `--output`; `--checkpoint` persists a
+resume position.
+
+```bash
+rivet cdc --source-env DATABASE_URL --table orders                 # NDJSON to stdout
+rivet cdc --source-env DATABASE_URL --output ./cdc --format parquet --checkpoint ./o.ckpt
+```
+
+The full reference — per-engine prerequisites, `--slot` / `--capture-instance` /
+`--server-id`, `--until-current`, the config-driven `rivet run` + `mode: cdc` path
+(the fuller path, all four engines incl. MongoDB), and the failure/recovery
+playbook — is in [cdc.md](cdc.md).
+
+---
+
 ## `rivet plan`
 
 ![Plan / apply walkthrough](../gifs/plan-apply.gif)
@@ -190,7 +217,7 @@ For most real tables the actual per-row size falls between these two bounds. The
 | Compression buffers in the Parquet writer | Adds 50–200 MB on top of the Arrow batch size |
 | Tokio runtime, connection pool, jemalloc | Adds 50–150 MB baseline overhead |
 
-**How to get a precise number:** run `rivet run` once with `RUST_LOG=info` against a representative sample, then check the `peak_rss` in the logged summary or in `rivet state metrics`. That measured value from your actual data is more reliable than any pre-run estimate.
+**How to get a precise number:** run `rivet run` once with `RUST_LOG=info` against a representative sample, then check the `peak_rss` in the logged summary or in `rivet metrics`. That measured value from your actual data is more reliable than any pre-run estimate.
 
 **Planned enhancement:** a future `rivet plan --sample N` flag will query up to N rows to compute a data-driven row-width estimate. This will narrow the uncertainty for variable-width schemas without a full table scan.
 
@@ -200,7 +227,7 @@ The JSON artifact (`--format json`) contains:
 
 ```json
 {
-  "rivet_version": "0.4.0",
+  "rivet_version": "0.18.0",
   "plan_id": "a1b2c3d4...",
   "created_at": "2026-04-14T10:00:00Z",
   "expires_at": "2026-04-15T10:00:00Z",
@@ -451,7 +478,7 @@ rivet check --config <PATH> [OPTIONS]
 | `--type-report` | | bool | Run a type fidelity report: show each column's source type, Rivet type, Arrow type, and fidelity |
 | `--strict` | | bool | Exit non-zero if any column mapping is lossy or unsupported (use with `--type-report`) |
 | `--json` | | bool | Emit type report as newline-delimited JSON instead of a table |
-| `--target` | | string | Validate types against a warehouse target. Currently supported: `bigquery` |
+| `--target` | | string | Validate types against a warehouse target: `bigquery` \| `snowflake` \| `duckdb` \| `clickhouse` |
 
 ### Examples
 
@@ -547,7 +574,7 @@ Exactly one of `--source`, `--source-env`, `--source-file` must be provided (enf
 
 | Flag | Short | Type | Description |
 |------|-------|------|-------------|
-| `--source` | | string | Connection URL: `postgresql://` or `mysql://`. **Visible in shell history / `ps`** — avoid in production |
+| `--source` | | string | Connection URL: `postgresql://` \| `mysql://` \| `sqlserver://` \| `mongodb://`. **Visible in shell history / `ps`** — avoid in production |
 | `--source-env` | | env var name | Name of an env var that holds the URL (e.g. `DATABASE_URL`). URL never hits the command line. **Recommended.** |
 | `--source-file` | | path | Path to a file containing just the URL on one line. Credentials stay on disk |
 | `--table` | | string | Single table; optional `schema.table` on PostgreSQL. Omit to scaffold **all** tables/views in a Postgres schema or MySQL database |

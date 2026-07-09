@@ -16,7 +16,7 @@ Complete this checklist before running Rivet against a production database.
 
 - [ ] **`rivet doctor`** passes for all destinations
 - [ ] **Network**: Rivet host can reach the database and destination (S3/GCS) endpoints
-- [ ] **Firewall / security groups**: ports are open (5432 for Postgres, 3306 for MySQL, 443 for S3/GCS)
+- [ ] **Firewall / security groups**: ports are open (5432 for Postgres, 3306 for MySQL, 1433 for SQL Server, 27017 for MongoDB, 443 for S3/GCS/Azure)
 
 ## Configuration
 
@@ -36,6 +36,7 @@ Complete this checklist before running Rivet against a production database.
   | Append-only events | `incremental` |
   | Large table, initial load | `chunked` |
   | Rolling window analytics | `time_window` |
+  | Continuous low-latency replication | `cdc` |
 - [ ] **Query optimization**: test your queries with `EXPLAIN ANALYZE` first
 - [ ] **Indexes**: ensure `cursor_column`, `chunk_column`, and `time_column` are indexed
 - [ ] **`skip_empty: true`**: avoid creating empty files on incremental runs with no new data

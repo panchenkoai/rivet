@@ -9,6 +9,10 @@ Use `mode: incremental` when you only want to export rows that are new or update
 - Tables with a monotonically increasing ID
 - Daily/hourly syncs where re-exporting everything is wasteful
 
+> **SQL sources only** (PostgreSQL, MySQL, SQL Server). `incremental` does not
+> apply to MongoDB, a document store — use `full` or `cdc` there
+> ([../reference/mongodb.md](../reference/mongodb.md)).
+
 ## Required fields
 
 - `cursor_column` -- the column used to track progress (must be monotonically increasing)

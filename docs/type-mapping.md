@@ -22,7 +22,7 @@ out?" — the short answer is no:
 
 The per-engine tables below are the precise contract; this is just the gist.
 
-## Guarantees (v0.7.8)
+## Guarantees (v0.18.0)
 
 - **DECIMAL / NUMERIC** are never silently converted to float. They export as
   Arrow `Decimal128` / `Decimal256` in Parquet when precision and scale are known
@@ -57,11 +57,11 @@ type in the resulting Parquet depends on whether the source server
 values, by design (a wrong guess is silent corruption; an honest "I don't
 know" is a config knob).
 
-| Semantic | PostgreSQL | MySQL |
-|----------|------------|-------|
-| `JSON` / `JSONB` | **auto** — `Type::JSON` (OID 114) and `Type::JSONB` (OID 3802) are native PG wire types. | **auto** — `MYSQL_TYPE_JSON` is native since MySQL 5.7. |
-| `UUID` | **auto** — `Type::UUID` (OID 2950) is a native PG type. | **manual override required.** MySQL has no native UUID; they are stored in `VARCHAR(36)` or `BINARY(16)`. The catalog reports only `varchar`/`binary` — semantic UUID information is gone before the driver ever sees the column. Operators add an explicit override (see below). |
-| `DECIMAL(p,s)` | **auto when declared** — PG's catalog returns `numeric_precision`/`numeric_scale` for table-qualified queries; ad-hoc `numeric` expressions need an override. | **manual override required** for ad-hoc queries — the mysql wire protocol does not expose precision/scale on the column descriptor. Required for any column the user wants exact-decimal for. |
+| Semantic | PostgreSQL | MySQL | SQL Server | MongoDB |
+|----------|------------|-------|------------|---------|
+| `JSON` / `JSONB` | **auto** — `Type::JSON` (OID 114) and `Type::JSONB` (OID 3802) are native PG wire types. | **auto** — `MYSQL_TYPE_JSON` is native since MySQL 5.7. | **manual override required** — SQL Server stores JSON in `nvarchar`; the catalog reports only `nvarchar`. | **always** — the whole document exports as one `document` column (`Utf8` + `arrow.json`), typed downstream by `PARSE_JSON`. |
+| `UUID` | **auto** — `Type::UUID` (OID 2950) is a native PG type. | **manual override required.** MySQL has no native UUID; they are stored in `VARCHAR(36)` or `BINARY(16)`. The catalog reports only `varchar`/`binary` — semantic UUID information is gone before the driver ever sees the column. Operators add an explicit override (see below). | **auto** — `uniqueidentifier` is a native type; exports as `FixedSizeBinary(16)` + `LogicalType::Uuid`. | n/a — MongoDB does no per-field typing; `_id` is a stringified `Utf8` key, values live inside the blob. |
+| `DECIMAL(p,s)` | **auto when declared** — PG's catalog returns `numeric_precision`/`numeric_scale` for table-qualified queries; ad-hoc `numeric` expressions need an override. | **manual override required** for ad-hoc queries — the mysql wire protocol does not expose precision/scale on the column descriptor. Required for any column the user wants exact-decimal for. | **auto** — precision/scale recovered from the data (tiberius drops the declared scale). | n/a — numbers stay inside the JSON `document` blob. |
 
 Adding overrides looks like:
 
@@ -111,13 +111,13 @@ duckdb in the same container). Each reader catches what the others cannot:
 | ClickHouse | Independent confirmation of the above through a second decoder; native `UInt64` round-trip for `BIGINT UNSIGNED`; tz-aware timestamps as `DateTime64(6, 'UTC')` |
 | pyarrow | Arrow field metadata (`rivet.*` keys) reaches the Parquet footer; row-group statistics (`min`/`max`/`null_count`) are correct; Decimal256 (precision > 38) round-trips exactly where DuckDB downgrades to DOUBLE |
 
-A fourth reader — **BigQuery** — is exercised by a separate harness
-(`docs/bench/harness/type_bench_bq.sh`) that requires a Google Cloud
-project + `bq` CLI auth. It loads each Rivet-produced Parquet via
-`bq load --autodetect --source_format=PARQUET`, captures the
-BigQuery-inferred schema, and asserts decimal sums round-trip through
-`bq query`. See [`docs/bench/reports/REPORT_types_bigquery.md`](bench/reports/REPORT_types_bigquery.md)
-for the per-column table and BigQuery-specific findings (notably:
+Local-reader type fidelity is now covered by the cross-tool harness'
+**type-loss matrix** ([`dev/bench/smoke.py`](../dev/bench/smoke.py), rendered in
+[`report.html`](bench/report.html)): every source column vs each tool's Parquet
+type family. A BigQuery cloud-load type-diff (load each Rivet Parquet via
+`bq load --autodetect`, assert decimal sums round-trip) is **not** currently in
+the harness — it needs a GCP project + `bq` auth and is tracked for a future
+cloud dimension (notably the earlier findings were:
 `LogicalType::Json` does **not** autoload as native BQ `JSON` — it
 falls back to `BYTES`/`STRING`; values are valid JSON but operators
 need an explicit `--schema='attrs:JSON,...'` to query the structure).
@@ -282,6 +282,25 @@ defects in the PG / MySQL drivers; all have been fixed in v0.7.8:
 Unmapped SQL Server types resolve to `Unsupported` and fail loudly at schema
 build unless a `columns:` override maps them.
 
+## MongoDB (JSON-blob model)
+
+MongoDB has no fixed per-collection schema and no `information_schema`, so Rivet
+does not map per-field SQL types the way the three SQL engines do. Every document
+exports as exactly two columns:
+
+| Source | Rivet logical | Parquet (Arrow) | CSV | Notes | Tested |
+|--------|---------------|-----------------|-----|-------|--------|
+| document key (`_id`) | `string` | `Utf8` | stringified key | ObjectId → hex, int → decimal string, … | live |
+| whole document | `json` | `Utf8` + Parquet `LogicalType::Json` (via `arrow.json` extension) | JSON string | full BSON as extended JSON — relaxed by default, canonical opt-in (`source.mongo.json`) | live |
+
+Per-field typing is deferred to the warehouse (`PARSE_JSON` → `VARIANT` on
+Snowflake, native `JSON` on BigQuery / DuckDB). This is lossless and
+schema-drift-proof: a new field in a document never breaks a load. Schema
+inference / auto-discovery into typed columns is deliberately out of OSS scope.
+CDC (change streams) emits the same two-column shape prefixed with the
+`__op` / `__pos` / `__seq` meta columns. See
+[reference/mongodb.md](reference/mongodb.md) for the full contract.
+
 ## Known gaps (tracked)
 
 1. **Nested arrays, ranges, inet, PostGIS, geometry**: not in the type matrix —
@@ -380,7 +399,7 @@ See [ADR-0014: Target type materialization](adr/0014-target-type-materialization
 the full matrix (DuckDB, BigQuery, Snowflake, ClickHouse) and planned
 `rivet check --type-report --target <engine>` extensions.
 
-### Verified physical autoload (DuckDB + ClickHouse, v0.7.8)
+### Verified physical autoload (DuckDB + ClickHouse, v0.18.0)
 
 `make test-types-validators` re-reads every PG / MySQL matrix column through
 two independent engines and pins the autoload type. The full matrix:

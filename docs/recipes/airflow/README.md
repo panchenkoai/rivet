@@ -6,6 +6,12 @@ tables run one at a time, a barrier between waves — with per-table retries, lo
 and alerting for free, and a real `rivet` binary doing the work. It builds **one
 DAG per source database** (PostgreSQL, MySQL, SQL Server) from a single factory.
 
+> **MongoDB fits the same pattern.** MongoDB is a first-class Rivet source
+> (full + CDC), so a `mongo.yaml` config yields a `rivet_waves_mongo` DAG
+> analogous to the relational ones — same factory, same plan → waves → graph.
+> The checked-in demo ships the three relational engines; add a Mongo config to
+> extend it.
+
 ```
 docs/recipes/airflow/
 ├── Dockerfile                 # apache/airflow + the rivet release binary baked in
@@ -33,7 +39,8 @@ docker compose -f docker-compose.2.10.yaml up --build      # Airflow 2.10.5
 First boot builds the image and migrates the metadata DB (~2-3 min). Then open
 <http://localhost:8080> (login **`airflow`** / **`airflow`**). There are three DAGs
 — **`rivet_waves_postgres`**, **`rivet_waves_mysql`**, **`rivet_waves_mssql`** —
-one per source. Un-pause and trigger one, and open **Graph**:
+one per source (a MongoDB config would add a fourth, `rivet_waves_mongo`, from the
+same factory). Un-pause and trigger one, and open **Graph**:
 
 ```
 plan ──> wave_2 ──────────> wave_3 ───────────────> wave_4

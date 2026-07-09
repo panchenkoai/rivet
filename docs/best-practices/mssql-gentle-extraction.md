@@ -31,9 +31,9 @@ do not use `chunk_size_memory_mb`.** Everything else is the usual chunked export
 
 ## Gentle to the source — what rivet does, and the lever you have
 
-Measured against live SQL Server 2022 (see
-[`REPORT_mssql.md`](../bench/reports/REPORT_mssql.md), harness
-[`mssql_db_bench.sh`](../bench/harness/mssql_db_bench.sh)), a **properly chunked**
+Measured against live SQL Server 2022 (the cross-tool harness —
+[`dev/bench/smoke.py`](../../dev/bench/smoke.py) `--engine mssql`, results in
+[`report.html`](../bench/report.html)), a **properly chunked**
 rivet export is a quiet tenant:
 
 | Signal | rivet (chunked) | Why |
@@ -108,8 +108,8 @@ the downstream file layout; memory stays put.
 - **Worker:** run under `/usr/bin/time -v` (or `gtime -v`) and watch
   *Maximum resident set size* — it should track `batch_size × row_bytes`, flat
   across `chunk_size` and table size.
-- **Source:** run [`mssql_db_bench.sh`](../bench/harness/mssql_db_bench.sh) — it
-  reports longest open txn, lock count, and Log Flush Waits delta during a live
+- **Source:** run the harness (`smoke.py --engine mssql`) — its harm matrix
+  reports longest open txn, lock count, and worker-time delta during a live
   export.
 
 ## Roadmap

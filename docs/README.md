@@ -1,6 +1,6 @@
 # Rivet Documentation
 
-Rivet exports data from PostgreSQL and MySQL to Parquet/CSV files on local disk, S3, GCS, Azure Blob Storage, or stdout.
+Rivet exports data from PostgreSQL, MySQL, SQL Server, and MongoDB to Parquet/CSV files on local disk, S3, GCS, Azure Blob Storage, or stdout.
 
 Install from Rust: `cargo install rivet-cli` (crates.io name is `rivet-cli`; the binary is `rivet`). Other install options live in the repo [README](../README.md).
 
@@ -8,12 +8,15 @@ This folder contains modular guides for running exports, a complete configuratio
 
 ## Supported database versions
 
-Every release is exercised against the full end-to-end suite on each of the following:
+PostgreSQL and MySQL run the full end-to-end suite on each release; SQL Server
+(Beta) and MongoDB carry their own scope and CI coverage:
 
 | Engine     | Versions covered by CI matrix |
 |------------|-------------------------------|
 | PostgreSQL | **12, 13, 14, 15, 16**        |
 | MySQL      | **5.7, 8.0**                  |
+| SQL Server | **2022** (Beta)               |
+| MongoDB    | **4.4, 5.0, 6.0, 7.0, 8.0** (dedicated nightly matrix; batch + CDC) |
 
 See [reference/compatibility.md](reference/compatibility.md) for the version-support policy, the exact test matrix, and notes on engine-specific features.
 
@@ -54,6 +57,8 @@ Short terminal walkthroughs in [gifs/](gifs/):
 | Azure Blob Storage | [destinations/azure.md](destinations/azure.md) |
 | Stdout (pipe) | [destinations/stdout.md](destinations/stdout.md) |
 
+Cloud auth & trust: [cloud-auth.md](cloud-auth.md) — per-backend credential-flow matrix (AWS / GCS / Azure incl. SAS) · [cloud-destinations.md](cloud-destinations.md) — the cloud write trust contract (manifest, quarantine, support matrix).
+
 ### Output layout
 
 | Feature | What | Guide |
@@ -72,7 +77,10 @@ Short terminal walkthroughs in [gifs/](gifs/):
 | `rivet init` — scaffold YAML from the database | [reference/init.md](reference/init.md) |
 | `rivet init --discover` — machine-readable JSON discovery artifact (ranked cursor / chunk candidates, row estimates, on-disk sizes) for automation and code review | [reference/init.md#discovery-artifact---discover](reference/init.md#discovery-artifact---discover) · [gifs/discover-artifact.gif](gifs/discover-artifact.gif) |
 | `rivet check --type-report --target bigquery` — per-column type fidelity report + warehouse compatibility (NUMERIC / BIGNUMERIC / TIMESTAMP overflow warnings); `--strict` exits non-zero on lossy mappings | [reference/cli.md#rivet-check](reference/cli.md#rivet-check) |
-| Supported PostgreSQL / MySQL versions and test matrix | [reference/compatibility.md](reference/compatibility.md) |
+| Type mapping — per-engine source-type → Arrow/Parquet contract + warehouse-target fidelity (BigQuery / Snowflake / DuckDB / ClickHouse) | [type-mapping.md](type-mapping.md) |
+| CDC failure modes & recovery — symptom → cause → fix per engine (slot / binlog / LSN / resume-token) | [reference/cdc-failure-modes.md](reference/cdc-failure-modes.md) |
+| CDC change ordering — why `(__pos, __seq)` is the total change order (design rationale) | [cdc-seq-ordering.md](cdc-seq-ordering.md) |
+| Supported PostgreSQL / MySQL / SQL Server / MongoDB versions and test matrix | [reference/compatibility.md](reference/compatibility.md) |
 | Offline + live test matrix, harness, fault-injection hook | [reference/testing.md](reference/testing.md) |
 
 ## Trust contracts
@@ -87,7 +95,7 @@ The five surfaces a serious operator inspects before adopting Rivet. Same five r
 | **Release checklist** — every gate every tag must clear before publish | [release-checklist.md](release-checklist.md) |
 | **Cloud permissions** — least-privilege IAM / RBAC / SAS scopes for each backend | [cloud-permissions.md](cloud-permissions.md) |
 | **Security policy** — what Rivet can access, sensitive artifacts, credential handling, reporting | [../SECURITY.md](../SECURITY.md) |
-| **Compatibility matrix** — PG 12–16, MySQL 5.7 / 8.0 versions actually exercised in CI | [reference/compatibility.md](reference/compatibility.md) |
+| **Compatibility matrix** — PG 12–16, MySQL 5.7 / 8.0, SQL Server 2022, MongoDB 4.4–8.0 actually exercised in CI | [reference/compatibility.md](reference/compatibility.md) |
 | **Cross-tool benchmark harness** — reproducible PG/MySQL → Parquet vs sling, dlt, duckdb, clickhouse-local, odbc2parquet (defaults + steelman) | [bench/README.md](bench/README.md) |
 
 ## Best Practices
@@ -103,14 +111,14 @@ Practical guides explaining *why* settings matter and *when* to use them.
 | [Low-memory runners](best-practices/low-memory-runners.md) | Settings for 512 MB–4 GB hosts; `auto_shrink` guarantees and caveats |
 | [Recovery and resume](best-practices/recovery-and-resume.md) | `--resume` semantics, crash recovery, state inspection |
 | [Benchmark methodology](best-practices/benchmark-methodology.md) | How to run and interpret E2E and Criterion benchmarks; version comparison |
-| [Benchmark report v0.5.x](benchmark_report_v0.5.x.md) | Measured results: compression profiles, row group targets, batch memory policies, quality uniqueness |
+| [Benchmark report v0.5.0 (historical)](archive/benchmark_report_v0.5.0.md) | Measured results — **v0.5.0, pre-streaming; pending a 0.18 re-measure**: compression profiles, row group targets, batch memory policies |
 
 ## Architecture
 
 | Topic | Guide |
 |-------|-------|
 | Data flow, pluggable traits, memory model, source layout | [architecture.md](architecture.md) |
-| Source-aware extraction prioritization (advisory) | [planning/prioritization.md](planning/prioritization.md) |
+| Source-aware extraction prioritization (advisory) | [reference/prioritization.md](reference/prioritization.md) |
 
 ## Production
 

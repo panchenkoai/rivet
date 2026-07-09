@@ -57,6 +57,25 @@ jobs:
           done
           [ "$FAIL" = "0" ]
 
+  # docs-as-code gate: docs/reference/{config,cli}-reference.md are GENERATED from
+  # the binary (schemars Config + clap Cli), so the reference cannot drift from the
+  # code. If a struct field / flag / enum changes, the committed reference must be
+  # regenerated. Mirrors the schema_drift test's role for rivet.schema.json — the
+  # whole point is to retire manual doc-vs-code verification (the 0.18 docs pass).
+  docs-generated:
+    name: Generated docs are in sync (docs-as-code)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+      - name: Reference docs are regenerated from code (clap + schema)
+        run: |
+          cargo build --bin rivet
+          bash dev/docgen/generate.sh --check
+
   boundary:
     name: OSS must not depend on rivet-pro (one-way seam, ADR-0026)
     runs-on: ubuntu-latest

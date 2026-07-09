@@ -43,7 +43,7 @@ dev — the URL is otherwise visible in `ps` / shell history.
 | `--until-current` | Catch up to the source's current log end, then **exit** instead of streaming. For MySQL this sets `BINLOG_DUMP_NON_BLOCK`; PostgreSQL / SQL Server already drain-and-exit. With `--max-events N`, the run stops at the smaller of "N events" or "end of log" — so it never blocks waiting for the N-th event. Ideal for a scheduler. |
 
 The engine is chosen from the URL scheme (`mysql://` / `postgresql://` /
-`sqlserver://`) by `create_change_stream`, the CDC sibling of the batch
+`sqlserver://` / `mongodb://`) by `create_change_stream`, the CDC sibling of the batch
 `create_source`. With `--output`, each part is uploaded through the same commit
 path the batch export uses (destination + content-MD5 + transit-integrity check,
 ADR-0004) and a `manifest.json` + `_SUCCESS` is written at clean end — so a
@@ -184,8 +184,9 @@ per-export checkpoint), and per-table exports never collide (no slot / `server_i
 — the change tables are populated by one shared capture Agent regardless of how
 many readers).
 
-The **operator flow is identical across all three engines**, only the config
-shape differs:
+The **operator flow is identical across the three SQL engines**, only the config
+shape differs (MongoDB's whole-database change stream uses the same `mode: cdc`
+config shape — see [mongodb.md](mongodb.md)):
 
 - `rivet init --mode cdc` (no `--table`) scaffolds the whole database on every
   engine — **one** `tables:` export on MySQL/PostgreSQL, **one export per table**
@@ -206,15 +207,16 @@ the config path passes `source.tls` to the change stream — so a remote source 
 TLS requires the `tls:` block, and a remote host without it is refused before any
 connection (the same gate the batch path uses).
 
-## The three models
+## The four models
 
-Rivet normalises three different source mechanisms behind one `ChangeStream`:
+Rivet normalises four different source mechanisms behind one `ChangeStream`:
 
 | engine | mechanism | model |
 | -------- | ----------- | ------- |
 | **MySQL** | binlog (ROW) streamed as a replica | push — the client reads the log directly |
 | **PostgreSQL** | logical replication slot (`test_decoding`) | poll the slot via `pg_logical_slot_get_changes()` |
 | **SQL Server** | `cdc.*` change tables the capture Agent extracts | poll the change function by LSN window |
+| **MongoDB** | whole-database change stream (`db.watch()` over the oplog) | tailable stream; the resume token checkpoints the position (JSON-blob image — see [mongodb.md](mongodb.md)) |
 
 MySQL and PostgreSQL expose the log to the client; SQL Server does not — there a
 server-side Agent extracts the log into change tables that rivet polls.

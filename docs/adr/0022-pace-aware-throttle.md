@@ -27,8 +27,10 @@ counters, was **~0**: with `throttle_ms: 50` vs `0` the source returned the same
 153 040), and spilled zero temp files — identical cumulative harm, output
 byte-identical. Worse, the throttled run held the cursor's MVCC snapshot **6×
 longer** (270 s vs 42 s), which on a busy OLTP source blocks vacuum and widens
-replication lag — the *opposite* of gentleness. Full data:
-`docs/bench/reports/REPORT_throttle_vs_harm.md`.
+replication lag — the *opposite* of gentleness. Re-measured by the cross-tool
+harness (`dev/bench/smoke.py`): dropping the `balanced` 50 ms/batch throttle
+(`tuning.profile: fast`) buys +24 % rows/s with no worse harm — see
+[`docs/bench/report.html`](../bench/report.html).
 
 The throttle was targeting the wrong variable. Cumulative source harm tracks the
 *query* (a full scan), and a sensible rate limit tracks *rows (or bytes) per
@@ -82,5 +84,5 @@ is a one-line semantic change at the point of use.
 
 ## References
 
-- `docs/bench/reports/REPORT_throttle_vs_harm.md` — the measurement that motivated this.
+- [`docs/bench/report.html`](../bench/report.html) — the cross-tool harness that re-measures the throttle's cost.
 - ADR-0019 — the governor (adaptive *concurrency*); this is the per-batch *pacing* knob, a separate lever.

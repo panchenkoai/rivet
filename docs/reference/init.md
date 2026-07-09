@@ -1,6 +1,6 @@
 # `rivet init` — config scaffolding
 
-`rivet init` connects to PostgreSQL or MySQL, introspects tables, and prints a **YAML scaffold** you can save and edit before running `rivet check` / `rivet run`.
+`rivet init` connects to PostgreSQL, MySQL, SQL Server, or MongoDB, introspects tables (collections on MongoDB), and prints a **YAML scaffold** you can save and edit before running `rivet check` / `rivet run`.
 
 Generated configs use `url_env: DATABASE_URL` so secrets are not embedded in the file. Set `DATABASE_URL` (or switch to `url:` / structured credentials) before running exports.
 
@@ -69,6 +69,12 @@ rivet init --source 'mysql://user:pass@localhost:3306/' --schema rivet -o rivet_
 | Rows > 100k and integer PK (or first integer column) | `chunked` with `chunk_column` / `chunk_size`, **`chunk_checkpoint: true` by default**, and sometimes `parallel` |
 | Rows > 100k, no suitable integer chunk key, but a timestamp column | `incremental` with `cursor_column` (`updated_at` / `created_at` preferred) |
 
+The table above applies to the SQL engines (PostgreSQL / MySQL / SQL Server).
+**MongoDB** is schemaless — `rivet init` introspects no columns, primary keys,
+or cursor / chunk candidates — so every collection scaffolds **`mode: full`**
+(one export per collection), regardless of document count. MongoDB's only batch
+mode is `full`; use `--mode cdc` for change capture.
+
 ### Chunked exports and checkpointing
 
 When the suggested mode is **`chunked`**, the scaffold always includes **`chunk_checkpoint: true`**. That enables resumable chunk runs after crashes or transient errors (`rivet run --resume`), chunk state in `rivet state chunks`, and reconcile/repair workflows. Set it to `false` only if you intentionally do not want checkpoint state on disk.
@@ -117,13 +123,14 @@ If the column is declared as plain `NUMERIC` (no precision / scale in the DDL), 
 
 | Flag | Required | Description |
 |------|----------|-------------|
-| `--source` | one-of `--source*` | `postgresql://` or `mysql://` URL — **visible in shell history / `ps` output; avoid in production** |
+| `--source` | one-of `--source*` | `postgresql://`, `mysql://`, `sqlserver://`, or `mongodb://` URL — **visible in shell history / `ps` output; avoid in production** |
 | `--source-env` | one-of `--source*` | Name of an env var holding the URL (e.g. `DATABASE_URL`). URL never hits the command line. **Recommended.** |
 | `--source-file` | one-of `--source*` | Path to a file containing just the URL on one line. Credentials stay on disk. |
 | `--table` | no | Single table; omit for schema-wide / database-wide scaffold |
-| `--schema` | no | **PostgreSQL:** schema to scan (default `public`). **MySQL:** database name if missing from URL or to override URL database |
+| `--schema` | no | **PostgreSQL:** schema to scan (default `public`). **SQL Server:** schema (default `dbo`). **MySQL:** database name if missing from URL or to override URL database |
 | `-o` / `--output` | no | Write output to file; default is stdout |
 | `--discover` | no | Emit a **JSON discovery artifact** (Epic B) instead of a YAML scaffold — see below |
+| `--mode` | no | Override the suggested mode for every scaffolded export. **`--mode cdc`** scaffolds a change-data-capture config (`mode: cdc` + an engine-specific `cdc:` block) instead of a batch query — see [cdc.md](cdc.md). Other values (`full` / `incremental` / `chunked` / `time_window`) just override the auto-suggested mode |
 
 ### Avoiding credentials on the command line
 

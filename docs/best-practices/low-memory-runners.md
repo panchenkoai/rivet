@@ -53,7 +53,7 @@ What each setting does:
 | `memory_threshold_mb: 512` | Pauses fetching when process RSS reaches 512 MB |
 | `target_row_group_mb: 32` | Writes smaller Parquet row groups — reduces Parquet writer peak RSS |
 
-On a wide-text table (200K rows, avg 3 KB/row, 12 columns), this combination measured **154 MB peak RSS** — compared to 878 MB without the cap. Actual RSS on your table will depend on row width and column count; use `rivet state metrics` to validate after the first run.
+On a wide-text table (200K rows, avg 3 KB/row, 12 columns), this combination measured **154 MB peak RSS** — compared to 878 MB without the cap. Actual RSS on your table will depend on row width and column count; use `rivet metrics` to validate after the first run.
 
 ---
 
@@ -172,7 +172,7 @@ The `RSS` value is sampled by a background thread during the run, so it reflects
 The same value is stored in the state DB and accessible via:
 
 ```bash
-rivet state metrics --config rivet.yaml --export events
+rivet metrics --config rivet.yaml --export events
 ```
 
 Use these to validate that RSS stays within your host budget across different table sizes. The first run on a new table is the most reliable baseline — query planner cache, filesystem buffer, and jemalloc slab warmth all affect subsequent runs.

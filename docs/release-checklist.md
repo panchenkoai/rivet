@@ -6,9 +6,6 @@ already enforced by automated gates (PR CI, nightly, semantic gates).  The
 checklist names them so a release reviewer can see *what was confirmed* and
 *how* without grepping the workflows.
 
-For the historical v0.5.x perf/quality gate, see
-[best-practices/release-gate.md](best-practices/release-gate.md).
-
 ---
 
 ## Scope of this document
@@ -141,7 +138,7 @@ The point of being explicit:
 
 This document is intentionally evergreen.  Per-version perf evidence and
 exhaustive test counts belong in the changelog or a dedicated report
-(see `docs/benchmark_report_v0.5.x.md` for the pattern).  Edit this file
+(see `docs/archive/benchmark_report_v0.5.0.md` for the pattern).  Edit this file
 only when:
 
 1. A new gate becomes mandatory (add the row, link the test file).
