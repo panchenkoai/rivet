@@ -122,7 +122,7 @@ tools:
     steelman:
       applied: "DATA_WRITER__BUFFER_MAX_ITEMS=5000; loader_file_format=parquet"
       knobs:   "buffer_max_items, file_max_items, file_max_bytes, DATA_WRITER__*, LOAD__WORKERS, extract/normalize parallelism"
-      note:    "~1.27 GB tuned; Python + sqlalchemy overhead dominates CPU"
+      note:    "~1.27 GB tuned; Python + sqlalchemy overhead dominates CPU. Needs a per-engine SQLAlchemy driver: postgres = psycopg2, mysql = pymysql, mssql = pyodbc — pip install alongside dlt[sql_database]"
 
   - name: duckdb
     role: competitor
@@ -155,7 +155,7 @@ tools:
     steelman:
       applied: "--batch-size-memory 256Mb; one SELECT * per table"
       knobs:   "--batch-size-memory, --batch-size-row, --row-groups-per-file, --file-size-threshold"
-      note:    "tuned; PostgreSQL Unicode ODBC driver"
+      note:    "needs a VENDOR ODBC DRIVER per engine (portability cost): postgres = PostgreSQL Unicode (psqlodbc); mysql = MariaDB Unicode (brew install mariadb-connector-odbc, register the .dylib via odbcinst -i -d), Server=127.0.0.1 to force TCP; mssql = ODBC Driver 18 for SQL Server. No mongo (not SQL)."
 
 # ─── Metric catalog — the SINGLE SOURCE for what the harness reports ──────────
 # The run harness (dev/bench/smoke.py) READS this: `key` names the value its

@@ -173,7 +173,9 @@ MY_ENGINE = {
     # unix socket /tmp/mysql.sock, which the docker mysql doesn't expose to the host.
     "clickhouse_fn": (lambda t: f"mysql('127.0.0.1:3306', 'rivet_bench', '{t}', "
                                 "'rivet', 'rivet')"),
-    "odbc_conn": ("Driver={MySQL ODBC 9.0 Unicode Driver};Server=localhost;Port=3306;"
+    # MariaDB Unicode ODBC driver (MySQL-compatible): brew install
+    # mariadb-connector-odbc, then register the .dylib with `odbcinst -i -d`.
+    "odbc_conn": ("Driver={MariaDB Unicode};Server=127.0.0.1;Port=3306;"
                   "Database=rivet_bench;User=rivet;Password=rivet;"),
     "sling_url": "mysql://rivet:rivet@localhost:3306/rivet_bench",
     "ingestr_url": "mysql://rivet:rivet@localhost:3306/rivet_bench",
