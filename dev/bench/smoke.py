@@ -100,6 +100,7 @@ PG_ENGINE = {
     # OLTP probe: persistent psql, server-side \timing (DB latency, not docker).
     "probe_argv": ["docker", "exec", "-i", "rivet-mongo-postgres-1", "psql", "-U",
                    "rivet", "-d", "rivet_bench", "-qAt"],
+    "probe_mode": "persistent",
     "probe_init": "SET application_name='harness_probe';\n\\timing on\n",
     "probe_query": "SELECT v FROM bench_probe WHERE id={i};\n",
     "probe_time_re": r"Time:\s+([\d.]+)\s+ms",
@@ -155,12 +156,13 @@ MY_ENGINE = {
                       _my_sql("INSERT IGNORE INTO bench_probe (id,v) SELECT n,n FROM "
                               "(WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n<1000) "
                               "SELECT n FROM s) x")],
-    # OLTP probe: persistent mysql client; client-side timed in Python (no \timing).
-    "probe_argv": ["docker", "exec", "-i", "rivet-mongo-mysql-1", "mysql", "-urivet",
-                   "-privet", "rivet_bench", "-NB"],
-    "probe_init": "",
-    "probe_query": "SELECT v FROM bench_probe WHERE id={i};\n",
-    "probe_time_re": None,   # None → time the round-trip client-side
+    # OLTP probe: per-query docker exec, client-timed (mysql batch-buffers a
+    # persistent stdin, so the psql line-protocol can't be reused). The idle
+    # baseline carries the same docker overhead, so the ratio isolates the DB.
+    "probe_mode": "perquery",
+    "probe_cmd": ["docker", "exec", "rivet-mongo-mysql-1", "mysql", "-urivet",
+                  "-privet", "rivet_bench", "-NB", "-e",
+                  "SELECT v FROM bench_probe WHERE id={i}"],
     "container": "rivet-mongo-mysql-1",
     "url": lambda tool: "mysql://rivet:rivet@localhost:3306/rivet_bench",
     "rivet_type": "mysql",
@@ -312,6 +314,24 @@ class OltpProbe(threading.Thread):
         self.proc = None
 
     def run(self):
+        if ENG.get("probe_mode") == "perquery":
+            self._run_perquery()
+        else:
+            self._run_persistent()
+
+    def _run_perquery(self):
+        """Fresh client per query, client-timed (docker overhead cancels in the
+        ratio). Used where a persistent stdin protocol isn't reliable (mysql)."""
+        i = 0
+        while not self._halt.is_set():
+            i = i % 1000 + 1
+            cmd = [a.format(i=i) for a in ENG["probe_cmd"]]
+            t0 = time.monotonic()
+            subprocess.run(cmd, capture_output=True)
+            self.latencies.append((time.monotonic() - t0) * 1000)
+
+    def _run_persistent(self):
+        """Persistent connection, server-side \\timing parsed (DB latency)."""
         self.proc = subprocess.Popen(
             ENG["probe_argv"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, bufsize=1)
@@ -321,19 +341,15 @@ class OltpProbe(threading.Thread):
         i = 0
         while not self._halt.is_set():
             i = i % 1000 + 1
-            t0 = time.monotonic()
             try:
                 self.proc.stdin.write(ENG["probe_query"].format(i=i))
                 self.proc.stdin.flush()
             except (BrokenPipeError, ValueError):
                 break
             for line in self.proc.stdout:
-                if time_re:
-                    m = re.search(time_re, line)
-                    if m:
-                        self.latencies.append(float(m.group(1))); break
-                elif line.strip() != "":  # client-side round-trip (first row line)
-                    self.latencies.append((time.monotonic() - t0) * 1000); break
+                if re.search(time_re, line):
+                    self.latencies.append(float(re.search(time_re, line).group(1)))
+                    break
 
     def stop(self):
         self._halt.set()
