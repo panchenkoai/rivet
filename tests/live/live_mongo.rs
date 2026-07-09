@@ -251,3 +251,140 @@ fn mongo_keyset_on_heterogeneous_id_errors_loudly_full_scan_still_works() {
         "full scan must read every _id across both types"
     );
 }
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn roast_resume_must_not_bypass_heterogeneous_id_guard() {
+    // The untested CROSS-PRODUCT of two green tests (resume × hetero-guard),
+    // found by the multi-agent hunt: the guard is gated on `after_id.is_none()`,
+    // and with `resume: true` every run after the first supplies a persisted
+    // cursor — so the guard never runs again. A string `_id` inserted after
+    // run 1 is then PERMANENTLY unexportable: the resumed filter
+    // `{_id: {$gt: <int cursor>}}` is type-bracketed and matches none of them,
+    // and every future run reports success with 0 rows — a forever-silent gap.
+    require_alive(LiveService::Mongo);
+    use mongodb::bson::doc;
+    let db = unique_name("mresumeht");
+    let m = MongoTest::connect(PORT, &db);
+    m.seed_int_id("t", 100); // uniform int _id — run 1 passes the guard
+
+    // SAME rig across runs: the keyset checkpoint persists in export_state.
+    let rig = batch(&db, "t").mongo("page_size: 40, resume: true");
+    rig.run_ok();
+    assert_eq!(
+        dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
+        100
+    );
+
+    // The collection turns heterogeneous AFTER the cursor was pinned.
+    m.insert_many("t", vec![doc! { "_id": "zzz", "v": "s" }]);
+
+    // The resumed run must fail LOUDLY (same contract as the first-run guard) —
+    // never exit 0 having silently skipped the new bracket forever.
+    let stderr = rig.run_expect_fail();
+    assert!(
+        stderr.contains("heterogeneous"),
+        "a resumed keyset run over a now-heterogeneous _id collection must fail \
+         naming the cause, not succeed with a silent permanent gap; stderr:\n{stderr}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn roast_null_and_object_id_must_not_slip_past_the_bracket_guard() {
+    // id_bracket's catch-all arm lumped Null, Object, Array, Regex … into ONE
+    // bracket, so a collection whose min `_id` is null and max is an object
+    // compared equal and slipped past ensure_uniform_id_type — while `$gt`
+    // still cannot cross those BSON bands: the same silent loss the guard
+    // exists to stop, in a new disguise (multi-agent hunt, confirmed live).
+    require_alive(LiveService::Mongo);
+    use mongodb::bson::{Bson, doc};
+    let db = unique_name("mnullobj");
+    let m = MongoTest::connect(PORT, &db);
+    m.drop_collection("t");
+    m.insert_many(
+        "t",
+        vec![
+            doc! { "_id": Bson::Null, "v": "null-id" },
+            doc! { "_id": { "a": 1 }, "v": "obj1" },
+            doc! { "_id": { "a": 2 }, "v": "obj2" },
+            doc! { "_id": { "a": 3 }, "v": "obj3" },
+        ],
+    );
+
+    // Keyset must refuse loudly — min/max sit in DIFFERENT BSON bands even
+    // though both landed in the old catch-all bracket.
+    let stderr = batch(&db, "t").mongo("page_size: 1").run_expect_fail();
+    assert!(
+        stderr.contains("heterogeneous"),
+        "null+object _id must be refused as heterogeneous, not silently paged; \
+         stderr:\n{stderr}"
+    );
+
+    // Full scan stays the remediation: all 4 docs, both bands.
+    let fs = batch(&db, "t");
+    fs.run_ok();
+    assert_eq!(
+        dir_parquet_distinct_strings(&fs.out_dir(), "_id").len(),
+        4,
+        "full scan must read every doc across the null and object bands"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn roast_nan_id_refused_for_keyset_and_parallel_full_scan_complete() {
+    // MongoDB comparison operators NEVER match NaN against a non-NaN operand,
+    // and NaN sorts first within the numeric band. Found by the multi-agent
+    // hunt, two silent-loss prongs (both bracket-0 numeric, so the heterogeneous
+    // guard passes today):
+    //  (a) keyset: a page boundary landing ON the NaN row makes the next filter
+    //      `{_id: {$gt: NaN}}` match NOTHING → the whole remaining collection is
+    //      silently dropped ("range exhausted");
+    //  (b) parallel: every worker range `{$gte: lo, $lt: hi}` fails both bounds
+    //      for NaN → the union of ranges is NOT the whole collection, the NaN
+    //      doc silently vanishes while the run reports success.
+    require_alive(LiveService::Mongo);
+    use mongodb::bson::doc;
+    let db = unique_name("mnan");
+    let m = MongoTest::connect(PORT, &db);
+    m.drop_collection("t");
+    m.insert_many(
+        "t",
+        vec![
+            doc! { "_id": f64::NAN, "v": "nan" },
+            doc! { "_id": 1_i64, "v": "a" },
+            doc! { "_id": 2_i64, "v": "b" },
+            doc! { "_id": 3_i64, "v": "c" },
+        ],
+    );
+
+    // (a) keyset with the page boundary right after the NaN row (NaN sorts
+    // first, page_size 1 ⇒ cursor == NaN) must refuse loudly, not truncate.
+    let stderr = batch(&db, "t").mongo("page_size: 1").run_expect_fail();
+    assert!(
+        stderr.contains("NaN"),
+        "keyset over a NaN _id must fail naming NaN, not silently lose the tail; \
+         stderr:\n{stderr}"
+    );
+
+    // (b) parallel range fan-out must refuse loudly too, not drop the NaN doc.
+    let stderr = batch(&db, "t")
+        .mongo("page_size: 2")
+        .export_line("parallel: 2")
+        .run_expect_fail();
+    assert!(
+        stderr.contains("NaN"),
+        "parallel ranges over a NaN _id must fail naming NaN, not drop the doc; \
+         stderr:\n{stderr}"
+    );
+
+    // Remediation path: the full scan (single cursor, no seek) reads all 4.
+    let fs = batch(&db, "t");
+    fs.run_ok();
+    assert_eq!(
+        dir_parquet_distinct_strings(&fs.out_dir(), "_id").len(),
+        4,
+        "full scan must read every doc including the NaN _id"
+    );
+}

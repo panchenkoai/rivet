@@ -124,6 +124,12 @@ pub struct MongoSource {
     /// with no overlap. `_id` is immutable ⇒ no doc migrates between ranges.
     /// `None` ⇒ the whole collection (the normal single reader).
     id_range: Option<(Bson, Bson)>,
+    /// Collections already vetted by [`Self::ensure_uniform_id_type`] this run —
+    /// the guard runs on the FIRST keyset page of every run, including a
+    /// checkpointed resume (`after_id` present). Gating it on `after_id.is_none()`
+    /// let `resume: true` bypass it forever: an `_id` of a new BSON band inserted
+    /// after run 1 was silently unreachable on every later run (bug-hunt find).
+    id_guard_checked: std::collections::HashSet<String>,
 }
 
 impl MongoSource {
@@ -147,6 +153,7 @@ impl MongoSource {
             snapshot,
             no_cursor_timeout,
             id_range: None,
+            id_guard_checked: std::collections::HashSet::new(),
         })
     }
 
@@ -180,17 +187,37 @@ impl MongoSource {
         })?;
         if let Some((lo, hi)) = span
             && let (Some(lo_id), Some(hi_id)) = (lo.get("_id"), hi.get("_id"))
-            && id_bracket(lo_id) != id_bracket(hi_id)
         {
-            anyhow::bail!(
-                "collection '{collection}' has heterogeneous `_id` types \
-                 ({:?} … {:?}): MongoDB keyset paging seeks with `$gt`, which is \
-                 BSON-type-bracketed and would silently skip every `_id` type but \
-                 one. Remove `page_size` and `parallel` to use a full ordered scan \
-                 (a single cursor crosses BSON types), or normalise `_id` to one type.",
-                lo_id.element_type(),
-                hi_id.element_type(),
-            );
+            // NaN never matches $gt/$gte/$lt against a non-NaN operand: a keyset
+            // page boundary landing ON the NaN row drops the whole remaining
+            // collection, and every parallel range excludes it. NaN sorts FIRST
+            // in the numeric band, so the min probe always sees it (the max
+            // probe covers the all-NaN corner).
+            for id in [lo_id, hi_id] {
+                if matches!(id, Bson::Double(f) if f.is_nan()) {
+                    anyhow::bail!(
+                        "collection '{collection}' has a NaN `_id`: MongoDB range \
+                         operators never match NaN, so keyset paging / parallel \
+                         ranges would silently skip documents. Remove `page_size` \
+                         and `parallel` to use a full ordered scan (a single \
+                         cursor reads every document), or fix the `_id`."
+                    );
+                }
+            }
+            let (lo_b, hi_b) = (id_bracket(lo_id), id_bracket(hi_id));
+            // Unknown band (None) is refused too: if we cannot place the type we
+            // cannot promise the seek crosses it — loud beats a silent gap.
+            if lo_b.is_none() || hi_b.is_none() || lo_b != hi_b {
+                anyhow::bail!(
+                    "collection '{collection}' has heterogeneous `_id` types \
+                     ({:?} … {:?}): MongoDB keyset paging seeks with `$gt`, which is \
+                     BSON-type-bracketed and would silently skip every `_id` type but \
+                     one. Remove `page_size` and `parallel` to use a full ordered scan \
+                     (a single cursor crosses BSON types), or normalise `_id` to one type.",
+                    lo_id.element_type(),
+                    hi_id.element_type(),
+                );
+            }
         }
         Ok(())
     }
@@ -312,22 +339,31 @@ fn id_to_string(id: Option<&Bson>) -> String {
 /// (hex/text — type-ambiguous, e.g. integer `1001` vs string `"1001"`), this
 /// preserves the exact BSON type across the string-typed cursor seam, so keyset
 /// paging + resume work for ANY `_id`, not just ObjectId.
-/// The BSON comparison *bracket* an `_id` falls in for a `$gt`/`$lt` keyset seek.
-/// MongoDB only compares within a bracket, so the four numeric types share
-/// bracket 0 (a mixed Int32/Int64/Double `_id` keysets fine), while a number vs a
-/// string is a bracket jump the seek cannot cross. Two `_id`s in different
-/// brackets ⟹ the collection is un-keyset-able. See `ensure_uniform_id_type`.
-fn id_bracket(v: &Bson) -> u8 {
-    match v {
+/// The BSON comparison *band* an `_id` falls in for a `$gt`/`$lt` keyset seek.
+/// MongoDB only compares within a band; the server's sort order is
+/// `MinKey < Null < Numbers < String/Symbol < Object < Array < BinData <
+/// ObjectId < Boolean < Date < Timestamp < Regex < MaxKey`. The four numeric
+/// types share one band (a mixed Int32/Int64/Double `_id` keysets fine); every
+/// other band is its own bracket — a former catch-all arm lumped Null, Object,
+/// Array and Regex together, so a `null` + `{…}` collection slipped past the
+/// guard and silently lost a band (bug-hunt find). `None` = a type we cannot
+/// place (MinKey/MaxKey/JS/DbPointer/…) — the caller refuses keyset rather than
+/// guessing. Two `_id`s in different brackets ⟹ un-keyset-able.
+fn id_bracket(v: &Bson) -> Option<u8> {
+    Some(match v {
         Bson::Double(_) | Bson::Int32(_) | Bson::Int64(_) | Bson::Decimal128(_) => 0,
-        Bson::String(_) => 1,
-        Bson::ObjectId(_) => 2,
-        Bson::Boolean(_) => 3,
-        Bson::DateTime(_) => 4,
+        Bson::Null => 1,
+        Bson::String(_) | Bson::Symbol(_) => 2,
+        Bson::Document(_) => 3,
+        Bson::Array(_) => 4,
         Bson::Binary(_) => 5,
-        Bson::Timestamp(_) => 6,
-        _ => 7,
-    }
+        Bson::ObjectId(_) => 6,
+        Bson::Boolean(_) => 7,
+        Bson::DateTime(_) => 8,
+        Bson::Timestamp(_) => 9,
+        Bson::RegularExpression(_) => 10,
+        _ => return None,
+    })
 }
 
 fn encode_id_cursor(id: &Bson) -> String {
@@ -361,6 +397,11 @@ fn decode_id_cursor(token: &str) -> Result<Bson> {
 }
 
 fn hex_to_bytes(s: &str) -> Result<Vec<u8>> {
+    // The 2-byte slices below index by BYTE; a multi-byte char boundary would
+    // panic. A corrupted / foreign token is an error, never a panic.
+    if !s.is_ascii() {
+        anyhow::bail!("invalid hex cursor token (non-ASCII)");
+    }
     if !s.len().is_multiple_of(2) {
         anyhow::bail!("odd-length hex cursor token");
     }
@@ -461,13 +502,18 @@ impl Source for MongoSource {
                 None => None,
             };
 
-        // Single-worker keyset, first page: refuse a heterogeneous-`_id`
-        // collection up front — `$gt` is type-bracketed and would silently drop
-        // every `_id` type but the cursor's. (Parallel checks this in
-        // `sample_id_ranges`; a full scan — `page_limit` unset — is exempt because
-        // its single cursor crosses brackets.)
-        if page_limit.is_some() && after_id.is_none() && id_range.is_none() {
+        // Single-worker keyset, first page of THIS run — including a checkpointed
+        // resume: refuse a heterogeneous-`_id` collection up front. `$gt` is
+        // type-bracketed and would silently drop every `_id` band but the
+        // cursor's; a resume whose cursor predates newly-inserted documents of a
+        // different band would otherwise skip them forever while reporting
+        // success (the guard must NOT be gated on `after_id.is_none()`).
+        // (Parallel checks this in `sample_id_ranges`; a full scan — `page_limit`
+        // unset — is exempt because its single cursor crosses brackets.)
+        if page_limit.is_some() && id_range.is_none() && !self.id_guard_checked.contains(coll_name)
+        {
             self.ensure_uniform_id_type(coll_name)?;
+            self.id_guard_checked.insert(coll_name.to_string());
         }
 
         let total = self.session.block_on(async {
@@ -712,6 +758,16 @@ mod tests {
         assert_eq!(id_to_string(Some(&Bson::Int32(7))), "7");
         // Never panic / never silently vanish on a missing id.
         assert_eq!(id_to_string(None), "");
+    }
+
+    #[test]
+    fn roast_non_ascii_cursor_token_is_a_clean_error_not_a_panic() {
+        // A corrupted / foreign checkpoint token must surface as Err — never a
+        // byte-boundary panic. '€' is 3 bytes: "€€" is 6 bytes (even, so it
+        // passes the odd-length check) and the 2-byte hex slice at [0..2] cuts
+        // the char in half — which panicked before hex_to_bytes rejected
+        // non-ASCII input up front.
+        assert!(decode_id_cursor("€€").is_err());
     }
 
     #[test]
