@@ -29,8 +29,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / "dev" / "bench" / ".smoke-out"
 
-# Smoke fixture lives in a dedicated DB so the live-test `rivet` fixture is never
-# touched (see the seed step). Host → docker-mapped ports.
+# Bench fixtures live in a dedicated `rivet_bench` DB per engine so the live-test
+# `rivet` fixtures are never touched. Host → docker-mapped ports.
 PG = {
     "host": "localhost", "port": "5432", "db": "rivet_bench",
     "user": "rivet", "pw": "rivet",
@@ -39,6 +39,146 @@ PG_URL = f"postgresql://{PG['user']}:{PG['pw']}@{PG['host']}:{PG['port']}/{PG['d
 # Docker postgres has no TLS; sling/ingestr default to sslmode=require and must
 # be told to disable it (rivet/duckdb/odbc2parquet don't force TLS on loopback).
 PG_URL_NOSSL = PG_URL + "?sslmode=disable"
+
+# The engine under test is chosen with --engine and stamped into ENG at startup.
+# Each engine config carries its container, admin SQL runner, harm SQL (counters
+# / gauges / cache / dead), source-types query, OLTP-probe client, and the
+# per-tool connection URL. The harness logic is engine-agnostic; only these
+# strings differ. Postgres is the reference; mysql/mssql/mongo slot in beside it.
+ENG = {}  # set in main() from ENGINES[args.engine]
+
+
+def _docker_sql(container, argv, q):
+    return sh(["docker", "exec", "-i", container] + argv, input=q).stdout.strip()
+
+
+# ── PostgreSQL engine ────────────────────────────────────────────────────────
+_PG_ADMIN = ["psql", "-U", "rivet", "-d", "rivet_bench", "-tAqc", ""]  # q via stdin
+
+
+def _pg_sql(q):
+    return sh(["docker", "exec", "rivet-mongo-postgres-1", "psql", "-U", "rivet",
+               "-d", "rivet_bench", "-tAc", q]).stdout.strip()
+
+
+def _my_sql(q):  # root — perf_schema / data_locks need it; tools connect as rivet
+    return sh(["docker", "exec", "rivet-mongo-mysql-1", "mysql", "-uroot", "-privet",
+               "rivet_bench", "-N", "-e", q], input="").stdout.strip()
+
+
+PG_ENGINE = {
+    "name": "postgres",
+    "sql": _pg_sql,
+    "counter_keys": ["tup_returned", "tup_fetched", "temp_bytes", "blks_read",
+                     "blk_read_time", "wal_bytes"],
+    "counters_sql": (
+        "SELECT tup_returned||','||tup_fetched||','||temp_bytes||','||blks_read"
+        "||','||blk_read_time||','||pg_wal_lsn_diff(pg_current_wal_lsn(),'0/0') "
+        "FROM pg_stat_database WHERE datname='rivet_bench'"),
+    "gauge_sql": (
+        "SELECT COALESCE(EXTRACT(EPOCH FROM max(now()-query_start) "
+        "FILTER (WHERE state='active')),0)||','||"
+        "COALESCE(EXTRACT(EPOCH FROM max(now()-xact_start)),0)||','||count(*)||','||"
+        "(SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a2 ON l.pid=a2.pid "
+        "WHERE a2.datname='rivet_bench' AND a2.pid<>pg_backend_pid() "
+        "AND a2.application_name<>'harness_probe')||','||"
+        "(SELECT count(*) FROM pg_stat_activity a3 WHERE a3.datname='rivet_bench' "
+        "AND cardinality(pg_blocking_pids(a3.pid))>0)||','||"
+        "COALESCE(max(age(backend_xmin)),0) "
+        "FROM pg_stat_activity WHERE datname='rivet_bench' AND pid<>pg_backend_pid() "
+        "AND backend_type='client backend' AND application_name<>'harness_probe'"),
+    "cache_sql": ("SELECT count(*)*8/1024.0 FROM pg_buffercache b JOIN pg_class c "
+                  "ON b.relfilenode = pg_relation_filenode(c.oid) WHERE c.relname='{t}'"),
+    "dead_sql": ("SELECT COALESCE(n_dead_tup,0) FROM pg_stat_user_tables "
+                 "WHERE relname='{t}'"),
+    "types_sql": ("SELECT column_name||'='||data_type FROM information_schema.columns "
+                  "WHERE table_name='{t}' ORDER BY ordinal_position"),
+    "setup": lambda: [_pg_sql("CREATE EXTENSION IF NOT EXISTS pg_buffercache"),
+                      _pg_sql("CREATE TABLE IF NOT EXISTS bench_probe(id int PRIMARY KEY, v int)"),
+                      _pg_sql("INSERT INTO bench_probe SELECT g,g FROM generate_series(1,1000) g "
+                              "ON CONFLICT DO NOTHING")],
+    # OLTP probe: persistent psql, server-side \timing (DB latency, not docker).
+    "probe_argv": ["docker", "exec", "-i", "rivet-mongo-postgres-1", "psql", "-U",
+                   "rivet", "-d", "rivet_bench", "-qAt"],
+    "probe_init": "SET application_name='harness_probe';\n\\timing on\n",
+    "probe_query": "SELECT v FROM bench_probe WHERE id={i};\n",
+    "probe_time_re": r"Time:\s+([\d.]+)\s+ms",
+    "container": "rivet-mongo-postgres-1",
+    "url": lambda tool: PG_URL_NOSSL if tool in ("sling", "ingestr") else PG_URL,
+    # Per-tool connection recipes (how each tool READS this engine).
+    "rivet_type": "postgres",
+    "duckdb_install": "INSTALL postgres; LOAD postgres;",
+    "duckdb_attach": (f"ATTACH 'host={PG['host']} port={PG['port']} dbname={PG['db']} "
+                      f"user={PG['user']} password={PG['pw']}' AS src (TYPE postgres, READ_ONLY)"),
+    "clickhouse_fn": (lambda t: f"postgresql('{PG['host']}:{PG['port']}', '{PG['db']}', "
+                                f"'{t}', '{PG['user']}', '{PG['pw']}')"),
+    "odbc_conn": (f"Driver={{PostgreSQL Unicode}};Server={PG['host']};Port={PG['port']};"
+                  f"Database={PG['db']};Uid={PG['user']};Pwd={PG['pw']};"),
+    "sling_url": PG_URL_NOSSL,
+    "ingestr_url": PG_URL_NOSSL,
+    "qualify": lambda t: f"public.{t}",       # sling/ingestr stream name
+    "dlt_url": PG_URL, "dlt_schema": "public",
+}
+
+# ── MySQL engine ─────────────────────────────────────────────────────────────
+MY_ENGINE = {
+    "name": "mysql",
+    "sql": _my_sql,
+    # SHOW GLOBAL STATUS deltas (the matrix.yaml harm_metrics.mysql set).
+    "counter_keys": ["Innodb_rows_read", "Innodb_buffer_pool_reads",
+                     "Innodb_buffer_pool_read_requests", "Innodb_log_waits",
+                     "tmp_disk_tables", "Handler_read_rnd_next"],
+    "counters_sql": (
+        "SELECT CONCAT_WS(',',"
+        "(SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME='Innodb_rows_read'),"
+        "(SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME='Innodb_buffer_pool_reads'),"
+        "(SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME='Innodb_buffer_pool_read_requests'),"
+        "(SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME='Innodb_log_waits'),"
+        "(SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME='Created_tmp_disk_tables'),"
+        "(SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME='Handler_read_rnd_next'))"),
+    # gauge: longest active query (s), longest txn (s), conns, locks, blocked, xmin(0)
+    "gauge_sql": (
+        "SELECT CONCAT_WS(',',"
+        "IFNULL((SELECT MAX(esc.TIMER_WAIT)/1e12 FROM performance_schema.events_statements_current esc "
+        "JOIN performance_schema.threads t ON t.thread_id=esc.thread_id "
+        "WHERE t.processlist_db='rivet_bench' AND t.processlist_user='rivet'),0),"
+        "IFNULL((SELECT MAX(TIMESTAMPDIFF(SECOND,trx_started,NOW())) FROM information_schema.innodb_trx),0),"
+        "(SELECT COUNT(*) FROM information_schema.processlist WHERE db='rivet_bench' AND user='rivet'),"
+        "(SELECT COUNT(*) FROM performance_schema.data_locks WHERE object_schema='rivet_bench'),"
+        "(SELECT COUNT(*) FROM performance_schema.data_lock_waits),"
+        "0)"),
+    "cache_sql": None,   # innodb buffer-page introspection is heavy; skip (→0)
+    "dead_sql": None,    # no dead-tuple concept exposed like pg
+    "types_sql": ("SELECT CONCAT(column_name,'=',data_type) FROM information_schema.columns "
+                  "WHERE table_schema='rivet_bench' AND table_name='{t}' ORDER BY ordinal_position"),
+    "setup": lambda: [_my_sql("CREATE TABLE IF NOT EXISTS bench_probe(id int PRIMARY KEY, v int)"),
+                      _my_sql("INSERT IGNORE INTO bench_probe (id,v) SELECT n,n FROM "
+                              "(WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n<1000) "
+                              "SELECT n FROM s) x")],
+    # OLTP probe: persistent mysql client; client-side timed in Python (no \timing).
+    "probe_argv": ["docker", "exec", "-i", "rivet-mongo-mysql-1", "mysql", "-urivet",
+                   "-privet", "rivet_bench", "-NB"],
+    "probe_init": "",
+    "probe_query": "SELECT v FROM bench_probe WHERE id={i};\n",
+    "probe_time_re": None,   # None → time the round-trip client-side
+    "container": "rivet-mongo-mysql-1",
+    "url": lambda tool: "mysql://rivet:rivet@localhost:3306/rivet_bench",
+    "rivet_type": "mysql",
+    "duckdb_install": "INSTALL mysql; LOAD mysql;",
+    "duckdb_attach": ("ATTACH 'host=localhost port=3306 user=rivet password=rivet "
+                      "database=rivet_bench' AS src (TYPE mysql, READ_ONLY)"),
+    "clickhouse_fn": (lambda t: f"mysql('localhost:3306', 'rivet_bench', '{t}', "
+                                "'rivet', 'rivet')"),
+    "odbc_conn": ("Driver={MySQL ODBC 9.0 Unicode Driver};Server=localhost;Port=3306;"
+                  "Database=rivet_bench;User=rivet;Password=rivet;"),
+    "sling_url": "mysql://rivet:rivet@localhost:3306/rivet_bench",
+    "ingestr_url": "mysql://rivet:rivet@localhost:3306/rivet_bench",
+    "qualify": lambda t: f"rivet_bench.{t}",
+    "dlt_url": "mysql+pymysql://rivet:rivet@localhost:3306/rivet_bench",
+    "dlt_schema": "rivet_bench",
+}
+
+ENGINES = {"postgres": PG_ENGINE, "mysql": MY_ENGINE}
 
 
 def sh(cmd, **kw):
@@ -70,37 +210,27 @@ def out_bytes(path: Path) -> int:
 #     starvation), buffer-cache footprint.
 #   • ground truth: a co-running OLTP probe — p99 latency degradation of a real
 #     point-read workload while the extraction runs (the number a DBA signs off).
-PG_CONTAINER = "rivet-mongo-postgres-1"
-HARM_KEYS = ["tup_returned", "tup_fetched", "temp_bytes", "blks_read", "blk_read_time"]
-
-
-def _psql(q: str) -> str:
-    return sh(["docker", "exec", PG_CONTAINER, "psql", "-U", PG["user"],
-               "-d", PG["db"], "-tAc", q]).stdout.strip()
+def _psql(q: str) -> str:          # name kept; delegates to the selected engine
+    return ENG["sql"](q)
 
 
 def setup_harm():
-    """Idempotent prerequisites: buffer-cache view + OLTP probe table."""
-    _psql("CREATE EXTENSION IF NOT EXISTS pg_buffercache")
-    _psql("CREATE TABLE IF NOT EXISTS bench_probe(id int PRIMARY KEY, v int)")
-    if _psql("SELECT count(*) FROM bench_probe") in ("", "0"):
-        _psql("INSERT INTO bench_probe SELECT g, g FROM generate_series(1,1000) g")
+    """Idempotent prerequisites (OLTP probe table + any cache view), per engine."""
+    ENG["setup"]()
 
 
-def pg_counters() -> dict:
-    """Cumulative counters for before/after deltas: pg_stat_database + WAL lsn."""
-    q = ("SELECT tup_returned||','||tup_fetched||','||temp_bytes||','||blks_read"
-         "||','||blk_read_time||','||pg_wal_lsn_diff(pg_current_wal_lsn(),'0/0') "
-         f"FROM pg_stat_database WHERE datname='{PG['db']}'")
+def counters() -> dict:
+    """Cumulative engine counters for before/after deltas — keys per engine."""
     try:
-        return dict(zip(HARM_KEYS + ["wal_bytes"], [float(v) for v in _psql(q).split(",")]))
+        vals = [float(v) for v in _psql(ENG["counters_sql"]).split(",")]
+        return dict(zip(ENG["counter_keys"], vals))
     except (ValueError, AttributeError):
         return {}
 
 
 def cgroup_cpu_usec() -> int:
     """Source-container CPU microseconds consumed (cgroup v2 cpu.stat)."""
-    r = sh(["docker", "exec", PG_CONTAINER, "sh", "-c",
+    r = sh(["docker", "exec", ENG["container"], "sh", "-c",
             "awk '/usage_usec/{print $2}' /sys/fs/cgroup/cpu.stat"])
     try:
         return int(r.stdout.strip() or 0)
@@ -109,21 +239,21 @@ def cgroup_cpu_usec() -> int:
 
 
 def cache_footprint_mb(table: str) -> float:
-    """MB of shared_buffers holding the table's pages after the run — the cache
-    the extract polluted (pages that displaced the hot OLTP working set)."""
-    n = _psql("SELECT count(*) FROM pg_buffercache b JOIN pg_class c "
-              "ON b.relfilenode = pg_relation_filenode(c.oid) "
-              f"WHERE c.relname='{table}'")
+    """MB of the buffer pool holding the table after the run (cache pollution).
+    None for engines whose buffer-page introspection is too heavy → 0."""
+    if not ENG.get("cache_sql"):
+        return 0.0
     try:
-        return int(n) * 8 / 1024
-    except ValueError:
+        return float(_psql(ENG["cache_sql"].format(t=table)) or 0)
+    except (ValueError, TypeError):
         return 0.0
 
 
 def dead_tuples(table: str) -> int:
-    n = _psql(f"SELECT COALESCE(n_dead_tup,0) FROM pg_stat_user_tables WHERE relname='{table}'")
+    if not ENG.get("dead_sql"):
+        return 0
     try:
-        return int(n or 0)
+        return int(_psql(ENG["dead_sql"].format(t=table)) or 0)
     except ValueError:
         return 0
 
@@ -134,24 +264,11 @@ def dead_tuples(table: str) -> int:
 # pins VACUUM). The probe connection (application_name='harness_probe') is
 # excluded so gauges reflect the TOOL, not the probe.
 GAUGE_FIELDS = ["longq", "longtxn", "conns", "locks", "blocked", "xmin_age"]
-GAUGE_SQL = (
-    "SELECT COALESCE(EXTRACT(EPOCH FROM max(now()-query_start) "
-    "FILTER (WHERE state='active')),0)||','||"
-    "COALESCE(EXTRACT(EPOCH FROM max(now()-xact_start)),0)||','||count(*)||','||"
-    "(SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a2 ON l.pid=a2.pid "
-    f"WHERE a2.datname='{PG['db']}' AND a2.pid<>pg_backend_pid() "
-    "AND a2.application_name<>'harness_probe')||','||"
-    f"(SELECT count(*) FROM pg_stat_activity a3 WHERE a3.datname='{PG['db']}' "
-    "AND cardinality(pg_blocking_pids(a3.pid))>0)||','||"
-    "COALESCE(max(age(backend_xmin)),0) "
-    f"FROM pg_stat_activity WHERE datname='{PG['db']}' AND pid<>pg_backend_pid() "
-    "AND backend_type='client backend' AND application_name<>'harness_probe'"
-)
 
 
 def gauge_once() -> tuple:
     try:
-        v = _psql(GAUGE_SQL).split(",")
+        v = _psql(ENG["gauge_sql"]).split(",")
         return (float(v[0]), float(v[1]), int(v[2]), int(v[3]), int(v[4]), int(float(v[5])))
     except (ValueError, IndexError, AttributeError):
         return (0.0, 0.0, 0, 0, 0, 0)
@@ -183,9 +300,11 @@ class GaugePoller(threading.Thread):
 
 
 class OltpProbe(threading.Thread):
-    """Ground truth: a persistent connection hammering point-reads on bench_probe
-    while the tool runs. Latency is server-side (psql \\timing), so it is DB
-    latency, not docker/network. Harm = p99 during the extract ÷ idle p99."""
+    """Ground truth: a persistent client hammering point-reads on bench_probe
+    while the tool runs. When the engine CLI exposes server-side timing (psql
+    \\timing) it is parsed (DB latency, not docker); otherwise the round-trip is
+    timed client-side — the idle baseline carries the same overhead, so the ratio
+    still isolates the extract's impact. Harm = p99 during ÷ idle p99."""
     def __init__(self):
         super().__init__(daemon=True)
         self._halt = threading.Event()
@@ -194,25 +313,27 @@ class OltpProbe(threading.Thread):
 
     def run(self):
         self.proc = subprocess.Popen(
-            ["docker", "exec", "-i", PG_CONTAINER, "psql", "-U", PG["user"],
-             "-d", PG["db"], "-qAt"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            ENG["probe_argv"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, bufsize=1)
-        self.proc.stdin.write("SET application_name='harness_probe';\n\\timing on\n")
-        self.proc.stdin.flush()
+        if ENG["probe_init"]:
+            self.proc.stdin.write(ENG["probe_init"]); self.proc.stdin.flush()
+        time_re = ENG["probe_time_re"]
         i = 0
         while not self._halt.is_set():
             i = i % 1000 + 1
+            t0 = time.monotonic()
             try:
-                self.proc.stdin.write(f"SELECT v FROM bench_probe WHERE id={i};\n")
+                self.proc.stdin.write(ENG["probe_query"].format(i=i))
                 self.proc.stdin.flush()
             except (BrokenPipeError, ValueError):
                 break
             for line in self.proc.stdout:
-                m = re.search(r"Time:\s+([\d.]+)\s+ms", line)
-                if m:
-                    self.latencies.append(float(m.group(1)))
-                    break
+                if time_re:
+                    m = re.search(time_re, line)
+                    if m:
+                        self.latencies.append(float(m.group(1))); break
+                elif line.strip() != "":  # client-side round-trip (first row line)
+                    self.latencies.append((time.monotonic() - t0) * 1000); break
 
     def stop(self):
         self._halt.set()
@@ -271,12 +392,8 @@ def col_types(desc_sql: list) -> dict:
     return d
 
 
-def pg_types(table: str) -> dict:
-    q = (f"SELECT column_name||'='||data_type FROM information_schema.columns "
-         f"WHERE table_name='{table}' ORDER BY ordinal_position")
-    r = sh(["docker", "exec", PG_CONTAINER, "psql", "-U", PG["user"],
-            "-d", PG["db"], "-tAc", q])
-    return col_types(r.stdout.strip().splitlines())
+def pg_types(table: str) -> dict:  # name kept; source-column types for the engine
+    return col_types(_psql(ENG["types_sql"].format(t=table)).splitlines())
 
 
 def parquet_families(path: Path) -> dict:
@@ -328,7 +445,7 @@ def a_rivet(table, dest: Path):
     # the only cost is oltp_p99 4.0→5.1x (no concurrent-load rate-limit). chunked
     # mode is the source-safety option for huge/resumable tables (separate).
     cfg.write_text(
-        f"source:\n  type: postgres\n  url: \"{PG_URL}\"\n"
+        f"source:\n  type: {ENG['rivet_type']}\n  url: \"{ENG['url']('rivet')}\"\n"
         f"exports:\n  - name: {table}\n"
         f"    query: \"SELECT * FROM {table}\"\n"
         f"    mode: full\n"
@@ -346,7 +463,7 @@ def a_rivet_chunked(table, dest: Path):
     dest.mkdir(parents=True, exist_ok=True)
     cfg = dest / "rivet.yaml"
     cfg.write_text(
-        f"source:\n  type: postgres\n  url: \"{PG_URL}\"\n"
+        f"source:\n  type: {ENG['rivet_type']}\n  url: \"{ENG['url']('rivet')}\"\n"
         f"exports:\n  - name: {table}\n"
         f"    query: \"SELECT * FROM {table}\"\n"
         f"    mode: chunked\n    chunk_column: id\n    chunk_size: 500000\n"
@@ -360,10 +477,9 @@ def a_duckdb(table, dest: Path):
     dest.mkdir(parents=True, exist_ok=True)
     out = dest / f"{table}.parquet"
     sql = (
-        "INSTALL postgres; LOAD postgres; SET memory_limit='4GB'; "
-        f"ATTACH 'host={PG['host']} port={PG['port']} dbname={PG['db']} "
-        f"user={PG['user']} password={PG['pw']}' AS pg (TYPE postgres, READ_ONLY); "
-        f"COPY (SELECT * FROM pg.{table}) TO '{out}' (FORMAT parquet, COMPRESSION zstd);"
+        f"{ENG['duckdb_install']} SET memory_limit='4GB'; "
+        f"{ENG['duckdb_attach']}; "
+        f"COPY (SELECT * FROM src.{table}) TO '{out}' (FORMAT parquet, COMPRESSION zstd);"
     )
     return out, lambda: timed(["duckdb", "-c", sql])
 
@@ -379,8 +495,7 @@ def a_clickhouse(table, dest: Path):
     out = dest / f"{table}.parquet"
     if out.exists():
         out.unlink()
-    q = (f"SELECT * FROM postgresql('{PG['host']}:{PG['port']}', '{PG['db']}', "
-         f"'{table}', '{PG['user']}', '{PG['pw']}') "
+    q = (f"SELECT * FROM {ENG['clickhouse_fn'](table)} "
          f"INTO OUTFILE '{out}' FORMAT Parquet")
     # steelman: cap memory to its lowest completing floor (OOMs below) — this is
     # the min-memory goal, and it LOWERS clickhouse's RSS (flatters it), not a
@@ -393,8 +508,7 @@ def a_clickhouse(table, dest: Path):
 def a_odbc2parquet(table, dest: Path):
     dest.mkdir(parents=True, exist_ok=True)
     out = dest / f"{table}.parquet"
-    conn = (f"Driver={{PostgreSQL Unicode}};Server={PG['host']};Port={PG['port']};"
-            f"Database={PG['db']};Uid={PG['user']};Pwd={PG['pw']};")
+    conn = ENG["odbc_conn"]
     return out, lambda: timed([
         "odbc2parquet", "query", "--connection-string", conn,
         "--batch-size-memory", "256Mb", str(out), f"SELECT * FROM {table}"])
@@ -406,11 +520,11 @@ def a_sling(table, dest: Path):
     # sling has no native parquet writer — it streams source→CSV→local HTTP→duckdb
     # read_csv→parquet, which TIMES OUT on a single 2M-row stream. file_max_rows
     # rotates the output so each duckdb COPY is bounded — its steelman for scale.
-    env = dict(os.environ, SMOKE_PG=PG_URL_NOSSL)
+    env = dict(os.environ, SMOKE_SRC=ENG["sling_url"])
     dest = out.parent / table  # a directory of rotated parts
     return dest, lambda: timed([
         "sling", "run",
-        "--src-conn", "SMOKE_PG", "--src-stream", f"public.{table}",
+        "--src-conn", "SMOKE_SRC", "--src-stream", ENG["qualify"](table),
         "--tgt-object", f"file://{dest}",
         "--tgt-options", '{"format": "parquet", "file_max_rows": 250000}'], env=env)
 
@@ -421,7 +535,7 @@ def a_ingestr(table, dest: Path):
     out = dest / f"{table}.parquet"
     return out, lambda: timed([
         "ingestr", "ingest",
-        "--source-uri", PG_URL_NOSSL, "--source-table", f"public.{table}",
+        "--source-uri", ENG["ingestr_url"], "--source-table", ENG["qualify"](table),
         "--dest-uri", f"parquet://{out}", "--yes"])
 
 
@@ -432,7 +546,7 @@ def a_dlt(table, dest: Path):
         "import os, dlt\n"
         "from dlt.sources.sql_database import sql_table\n"
         f"os.environ['DATA_WRITER__BUFFER_MAX_ITEMS'] = '5000'\n"
-        f"tbl = sql_table(credentials='{PG_URL}', table='{table}', schema='public')\n"
+        f"tbl = sql_table(credentials='{ENG['dlt_url']}', table='{table}', schema='{ENG['dlt_schema']}')\n"
         f"p = dlt.pipeline(pipeline_name='smoke_{table}', destination=dlt.destinations.filesystem('file://{dest}'), dataset_name='smoke')\n"
         "p.run(tbl, loader_file_format='parquet')\n"
     )
@@ -488,14 +602,22 @@ def load_catalog() -> dict:
 
 
 def main():
+    global ENG
     ap = argparse.ArgumentParser()
+    ap.add_argument("--engine", default="postgres", choices=list(ENGINES))
     ap.add_argument("--table", default="content_items")
     ap.add_argument("--tools", default=",".join(ADAPTERS))
     args = ap.parse_args()
+    ENG = ENGINES[args.engine]
 
     catalog = load_catalog()
     bench_defs = catalog["benchmark_metrics"]
-    harm_defs = catalog["harm_metrics"]["universal"] + catalog["harm_metrics"]["postgres"]
+    # universal harm axes + THIS engine's native counters. Engines whose harm
+    # entries lack label/group (mysql/mssql/mongo) default to key + a counters group.
+    eng_harm = [{"key": d["key"], "label": d.get("label", d["key"]),
+                 "group": d.get("group", f"{args.engine} counters")}
+                for d in catalog["harm_metrics"].get(args.engine, [])]
+    harm_defs = catalog["harm_metrics"]["universal"] + eng_harm
     declared = {d["key"] for d in bench_defs + harm_defs}
 
     if OUT.exists():
@@ -503,19 +625,15 @@ def main():
     OUT.mkdir(parents=True)
     setup_harm()
 
-    r = sh(["duckdb", "-noheader", "-list", "-c",
-            f"ATTACH 'host={PG['host']} port={PG['port']} dbname={PG['db']} "
-            f"user={PG['user']} password={PG['pw']}' AS pg (TYPE postgres, READ_ONLY); "
-            f"SELECT count(*) FROM pg.{args.table};"])
-    m = re.search(r"\d+", r.stdout or "")
-    truth = int(m.group()) if m else -1
+    mt = re.search(r"\d+", _psql(f"SELECT COUNT(*) FROM {args.table}") or "")
+    truth = int(mt.group()) if mt else -1
     src_types = pg_types(args.table)
     srcfam = {c: family(t) for c, t in src_types.items()}
 
     # Idle OLTP baseline (p99 of the probe with nothing else running).
     base = OltpProbe(); base.start(); time.sleep(1.5); base.stop()
     base_p99 = base.p99() or 1e-9
-    print(f"\nSmoke: postgres.{args.table}  (source rows={truth}, {len(src_types)} cols, "
+    print(f"\n{args.engine}.{args.table}  (source rows={truth}, {len(src_types)} cols, "
           f"OLTP baseline p99={base_p99:.2f}ms)")
 
     results = []  # (tool, m_dict, pqfam)
@@ -535,7 +653,7 @@ def main():
             print(f"  {tool:<16} missing"); continue
 
         path, run = ADAPTERS[tool](args.table, OUT / tool)
-        c0, cpu0, dead0 = pg_counters(), cgroup_cpu_usec(), dead_tuples(args.table)
+        c0, cpu0, dead0 = counters(), cgroup_cpu_usec(), dead_tuples(args.table)
         poller, probe = GaugePoller(), OltpProbe()
         poller.start(); probe.start()
         try:
@@ -545,7 +663,7 @@ def main():
             print(f"  {tool:<16} error: {str(e)[:50]}"); continue
         poller.stop(); probe.stop()
         time.sleep(0.4)  # let the stats collector flush this tool's reads
-        c1, cpu1 = pg_counters(), cgroup_cpu_usec()
+        c1, cpu1 = counters(), cgroup_cpu_usec()
 
         g = poller.result()
         rows = parquet_rows(path) if rc == 0 else -1
@@ -565,15 +683,21 @@ def main():
             "cache_mb": cache_footprint_mb(args.table),
             "locks": g["locks"], "blocked": g["blocked"],
             "longq": g["longq"], "q_p50": g["q_p50"], "longtxn": g["longtxn"],
-            "conns": g["conns"],
-            "tup_returned": c1.get("tup_returned", 0) - c0.get("tup_returned", 0),
-            "tup_fetched": c1.get("tup_fetched", 0) - c0.get("tup_fetched", 0),
-            "temp_mb": (c1.get("temp_bytes", 0) - c0.get("temp_bytes", 0)) / 1e6,
-            "blks_read": c1.get("blks_read", 0) - c0.get("blks_read", 0),
-            "blk_read_time": c1.get("blk_read_time", 0) - c0.get("blk_read_time", 0),
-            "wal_kb": (c1.get("wal_bytes", 0) - c0.get("wal_bytes", 0)) / 1024,
-            "cpu_ms": (cpu1 - cpu0) / 1000,
+            "conns": g["conns"], "cpu_ms": (cpu1 - cpu0) / 1000,
         }
+        # Engine-native counter deltas keyed to matrix.yaml harm_metrics.<engine>.
+        if ENG["name"] == "postgres":
+            m.update({
+                "tup_returned": c1.get("tup_returned", 0) - c0.get("tup_returned", 0),
+                "tup_fetched": c1.get("tup_fetched", 0) - c0.get("tup_fetched", 0),
+                "temp_mb": (c1.get("temp_bytes", 0) - c0.get("temp_bytes", 0)) / 1e6,
+                "blks_read": c1.get("blks_read", 0) - c0.get("blks_read", 0),
+                "blk_read_time": c1.get("blk_read_time", 0) - c0.get("blk_read_time", 0),
+                "wal_kb": (c1.get("wal_bytes", 0) - c0.get("wal_bytes", 0)) / 1024,
+            })
+        else:  # mysql/mssql/mongo: raw native counter deltas
+            for k in ENG["counter_keys"]:
+                m[k] = c1.get(k, 0) - c0.get(k, 0)
         # Anti-drift guard: every metric matrix.yaml declares must be captured.
         gap = declared - set(m)
         if gap:
