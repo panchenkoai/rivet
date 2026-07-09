@@ -50,6 +50,21 @@ use crate::types::{ColumnOverrides, RivetType, SourceColumn, TypeMapping};
 
 pub(crate) mod cdc;
 
+/// The byte budget at which a document batch flushes. The `document` column is an
+/// Arrow `Utf8` (i32 offsets): a batch accumulating > 2 GiB panics ("byte array
+/// offset overflow"). Large documents (up to 16 MB each) hit that far before the
+/// row cap (~65 K rows), so a row-only limit is unsafe for a document store —
+/// `None` (the default in every tuning profile) MUST NOT mean "unbounded".
+/// Default 256 MiB: bounds RSS (the correct blob knob) and keeps every batch well
+/// under the i32 ceiling (bug-hunt: 2300×1 MB docs panicked on the default).
+fn mongo_batch_byte_cap(max_batch_memory_mb: Option<usize>) -> usize {
+    const DEFAULT: usize = 256 * 1024 * 1024;
+    max_batch_memory_mb
+        .map(|mb| mb.saturating_mul(1024 * 1024))
+        .filter(|&b| b > 0)
+        .unwrap_or(DEFAULT)
+}
+
 /// Map rivet's [`TlsConfig`] onto the mongodb driver's `Tls`, mirroring the SQL
 /// engines' posture: `Disable` = plaintext; `Require` = TLS but accept any cert
 /// (sniff-proof, not MITM-proof); `VerifyCa` = verify chain, skip hostname;
@@ -511,10 +526,7 @@ impl Source for MongoSource {
         //     the *correct* RSS knob for a JSON blob (flush by accumulated bytes,
         //     independent of how big each document is).
         let batch_rows = request.tuning.effective_batch_size(Some(&schema)).max(1);
-        let batch_byte_cap = request
-            .tuning
-            .max_batch_memory_mb
-            .map(|mb| mb.saturating_mul(1024 * 1024));
+        let batch_byte_cap = mongo_batch_byte_cap(request.tuning.max_batch_memory_mb);
 
         // Keyset (seek) pagination: the keyset runner drives the outer loop and
         // hands us one page's `page_limit` plus the previous page's max `_id`
@@ -598,7 +610,7 @@ impl Source for MongoSource {
                 }
                 in_batch += 1;
                 total += 1;
-                if in_batch >= batch_rows || batch_byte_cap.is_some_and(|cap| batch_bytes >= cap) {
+                if in_batch >= batch_rows || batch_bytes >= batch_byte_cap {
                     flush(&schema, &mut ids, &mut docs, sink)?;
                     in_batch = 0;
                     batch_bytes = 0;
@@ -820,6 +832,22 @@ mod tests {
             tls_to_mongo(&cfg(TlsMode::Disable, None)),
             Tls::Disabled
         ));
+    }
+
+    #[test]
+    fn roast_default_batch_byte_cap_is_bounded_not_unlimited() {
+        // The whole point of the fix: with no user budget the cap must be a
+        // finite byte value (≤ the Arrow i32 ceiling), never "unbounded" — an
+        // unbounded batch of large documents panics ("byte array offset
+        // overflow"). Verified live at 2300×1 MB before this guard.
+        let cap = mongo_batch_byte_cap(None);
+        assert!(
+            cap > 0 && cap < (i32::MAX as usize),
+            "cap must be finite + sub-2GiB"
+        );
+        // A user budget is honored (MiB → bytes); 0 falls back to the default.
+        assert_eq!(mongo_batch_byte_cap(Some(64)), 64 * 1024 * 1024);
+        assert_eq!(mongo_batch_byte_cap(Some(0)), mongo_batch_byte_cap(None));
     }
 
     #[test]
