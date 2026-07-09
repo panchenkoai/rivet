@@ -21,12 +21,15 @@ gen() { # <outfile> <generator-cmd...>
 gen docs/reference/config-reference.md \
   bash -c "$RIVET schema config | python3 dev/docgen/config_md.py"
 
-# CLI reference — added in step 2 (clap-markdown).
+# CLI reference — from the clap `Cli` derive (same source as `--help`).
+gen docs/reference/cli-reference.md "$RIVET" schema cli
+
+GENERATED="docs/reference/config-reference.md docs/reference/cli-reference.md"
 
 if [ "${1:-}" = "--check" ]; then
-  if ! git diff --quiet -- docs/reference/config-reference.md; then
+  if ! git diff --quiet -- $GENERATED; then
     echo "::error::generated docs are stale — run 'bash dev/docgen/generate.sh' and commit"
-    git --no-pager diff -- docs/reference/config-reference.md | head -40
+    git --no-pager diff -- $GENERATED | head -60
     exit 1
   fi
   echo "docs-gen: up to date"

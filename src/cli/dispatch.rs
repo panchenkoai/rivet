@@ -219,6 +219,12 @@ fn dispatch_schema(what: SchemaKind) -> Result<()> {
             print!("{schema}");
             Ok(())
         }
+        SchemaKind::Cli => {
+            // CLI reference straight from the clap `Cli` derive — the same
+            // source as `--help`, so it cannot drift from the actual commands.
+            print!("{}", clap_markdown::help_markdown::<Cli>());
+            Ok(())
+        }
     }
 }
 

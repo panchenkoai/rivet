@@ -483,6 +483,12 @@ pub enum SchemaKind {
     ///
     ///     rivet schema config > rivet.schema.json
     Config,
+    /// Print a Markdown CLI reference (every command + flag) to stdout,
+    /// generated from the clap definitions — the same source as `--help`, so it
+    /// cannot drift from the actual commands.
+    ///
+    ///     rivet schema cli > docs/reference/cli-reference.md
+    Cli,
 }
 
 #[derive(Subcommand)]
