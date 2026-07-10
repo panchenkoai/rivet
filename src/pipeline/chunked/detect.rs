@@ -140,6 +140,62 @@ fn log_chunk_sparsity_at_run(
     }
 }
 
+/// Below this many windows, per-chunk round-trips are cheap enough that a sparse
+/// key isn't worth a warning even over a slow link.
+const SPARSE_WARN_MIN_CHUNKS: usize = 64;
+/// With no scan-free row estimate (MySQL / curated query) we can't compute the
+/// dense-vs-actual ratio, so we only flag an *egregious* absolute window count.
+const NO_ESTIMATE_WARN_CHUNKS: usize = 1000;
+
+/// Loud, actionable advice when a `chunk_size` range plan produces far more
+/// windows than the row count justifies — a sparse / huge / gappy key. Each
+/// window is a separate source query; N thousand of them dominate wall-clock,
+/// especially over a high-latency link (SSH/SSM tunnel, VPN). Pure + testable;
+/// the caller emits it at `warn` level. Returns `None` when nothing is wrong.
+///
+/// Two regimes: with a scan-free row estimate (PG/MSSQL) we compare against the
+/// dense window count and flag a ≥4× blow-up; without one (MySQL — `TABLE_ROWS`
+/// is too unreliable) we can only flag an egregious absolute count, hedged on
+/// "if the key is sparse".
+fn sparse_chunk_warning(
+    chunk_count: usize,
+    row_estimate: Option<i64>,
+    chunk_size: usize,
+) -> Option<String> {
+    if chunk_count < SPARSE_WARN_MIN_CHUNKS {
+        return None;
+    }
+    let cs = chunk_size.max(1);
+    match row_estimate.filter(|&r| r > 0) {
+        Some(rows) => {
+            let dense_windows = ((rows as usize) / cs).max(1);
+            if chunk_count < dense_windows.saturating_mul(4) {
+                return None; // roughly dense — the windows are earning their keep
+            }
+            let avg = (rows as usize) / chunk_count.max(1);
+            Some(format!(
+                "sparse key range — {chunk_count} chunk windows for ~{rows} rows \
+                 (~{avg} rows/window vs chunk_size {cs}). `chunk_size` divides the KEY \
+                 RANGE, not the row count, so most windows are near-empty and each is a \
+                 separate source query: {chunk_count} round-trips, very slow over a \
+                 tunnel/VPN. Use `chunk_dense: true` (dense keyset paging → ~{dense_windows} \
+                 windows), `chunk_count: N`, or `mode: full`."
+            ))
+        }
+        None => {
+            if chunk_count < NO_ESTIMATE_WARN_CHUNKS {
+                return None;
+            }
+            Some(format!(
+                "{chunk_count} chunk windows on a range key (no scan-free row estimate to \
+                 confirm density). If the key is sparse (large / gappy ids), most windows are \
+                 near-empty and this is {chunk_count} source round-trips — very slow over a \
+                 tunnel/VPN. If so, use `chunk_dense: true`, `chunk_count: N`, or `mode: full`."
+            ))
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn detect_and_generate_chunks(
     src: &mut dyn Source,
@@ -284,6 +340,19 @@ pub(crate) fn detect_and_generate_chunks(
                 .and_then(|s| s.trim().parse::<i64>().ok())
                 .filter(|&n| n > 0)
         });
+
+    // Loud, actionable headline BEFORE the chunks run: when the auto-window plan
+    // (chunk_size, not an explicit chunk_count) blows up into far more windows
+    // than the rows justify, each is a separate source round-trip — the failure
+    // mode behind a 520 k-row table taking 30 min over an SSM tunnel (3428 near-
+    // empty windows on a sparse id). The `info`-level density readout below is
+    // detail; this `warn` is what the user actually sees at default log level.
+    if chunk_count.is_none()
+        && let Some(msg) = sparse_chunk_warning(chunks.len(), row_estimate, chunk_size)
+    {
+        log::warn!("export '{export_name}': {msg}");
+    }
+
     match row_estimate {
         Some(est) => log_chunk_sparsity_at_run(
             export_name,
@@ -755,6 +824,47 @@ mod tests {
             "got: {}",
             src.seen_sql[0]
         );
+    }
+
+    // ── sparse_chunk_warning (the loud actionable headline) ─────────────────
+
+    #[test]
+    fn sparse_with_estimate_warns_and_names_chunk_dense() {
+        // The 520k-over-a-tunnel shape: ~520k rows, chunk_size 100k → 5 dense
+        // windows, but a huge/gappy id span produced 3428 BETWEEN windows.
+        let msg =
+            sparse_chunk_warning(3428, Some(520_789), 100_000).expect("685x blow-up must warn");
+        assert!(msg.contains("chunk_dense: true"), "not actionable: {msg}");
+        assert!(msg.contains("3428"), "should cite the window count: {msg}");
+    }
+
+    #[test]
+    fn dense_with_estimate_does_not_warn() {
+        // 2M rows / 100k = 20 dense windows, 20 actual → not sparse, silent.
+        assert!(sparse_chunk_warning(20, Some(2_000_000), 100_000).is_none());
+    }
+
+    #[test]
+    fn no_estimate_egregious_count_warns_hedged() {
+        // MySQL (no scan-free estimate): can't confirm density, so only an
+        // egregious absolute count trips it — and the advice is hedged on "if".
+        let msg = sparse_chunk_warning(3428, None, 100_000).expect("3428 windows must warn");
+        assert!(msg.contains("chunk_dense: true"), "not actionable: {msg}");
+        assert!(msg.contains("If the key is sparse"), "must hedge: {msg}");
+    }
+
+    #[test]
+    fn no_estimate_moderate_count_is_silent() {
+        // A legit large dense MySQL table (e.g. 900 windows) must NOT be nagged —
+        // below the no-estimate egregious bar.
+        assert!(sparse_chunk_warning(900, None, 100_000).is_none());
+    }
+
+    #[test]
+    fn small_window_count_never_warns() {
+        // Round-trips are cheap below the floor, sparse or not.
+        assert!(sparse_chunk_warning(40, Some(10), 100_000).is_none());
+        assert!(sparse_chunk_warning(40, None, 100_000).is_none());
     }
 
     #[test]
