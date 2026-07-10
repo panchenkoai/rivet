@@ -439,9 +439,14 @@ fn export_block_lines(
     // form: those modes usually start from a curated column set and benefit from
     // a self-documenting YAML.
     let mut lines = vec![format!("  - name: {}", yaml_quote_if_needed(&info.table))];
-    if mode == "full"
-        && (source_type == "postgres" || source_type == "mongo")
-        && is_simple_pg_ident(&qualified_table)
+    // Keyset (`chunk_by_key`, chosen below for a single-column PK) REQUIRES the
+    // `table:` shortcut — the planner introspects the unique index behind the key
+    // from the relation, which a curated `query:` hides (`plan::build` bails
+    // "needs the table: shortcut"). So a keyset export must emit `table:`, not
+    // `SELECT … FROM`, on every engine.
+    let is_keyset = mode == "chunked" && info.single_pk_column().is_some();
+    if is_simple_pg_ident(&qualified_table)
+        && (is_keyset || (mode == "full" && (source_type == "postgres" || source_type == "mongo")))
     {
         // MongoDB has no SQL: the `table:` shortcut (→ collection scan) is the
         // ONLY export form it accepts, and it is schemaless so there is no
@@ -460,47 +465,71 @@ fn export_block_lines(
 
     match mode {
         "chunked" => {
-            let chunk_col = info.best_chunk_column().unwrap_or("id");
-            let parallel = suggest_parallel(info.row_estimate, info.avg_row_bytes(), source_type);
             let chunk_size = info.suggest_chunk_size();
-            lines.push(format!(
-                "    chunk_column: {}",
-                yaml_quote_if_needed(chunk_col)
-            ));
-            // Scale chunk_size by row estimate so the per-table file count
-            // stays in a humane range. See `TableInfo::suggest_chunk_size`
-            // for the bands. A 10 M-row export used to produce 100 files;
-            // it now lands at ~10. Operators who want different geometry
-            // override this line directly.
-            lines.push(format!("    chunk_size: {chunk_size}"));
-            lines.push(
-                "    chunk_checkpoint: true  # record per-chunk progress so `rivet run --resume` can finish a crashed run"
-                    .to_string(),
-            );
-            if parallel.workers > 1 {
-                // Correction #5: show the predicted peak so the operator can
-                // trade memory for speed without guessing. RSS scales with
-                // worker count × row width (not chunk_size). See the sweep in
-                // docs/bench/reports/REPORT_full_vs_parallel.md.
-                if let Some(b) = info.avg_row_bytes() {
-                    lines.push(format!(
-                        "    # est. peak RSS ≈ {} MB ({} workers × ~{} MB/worker @ ~{} B/row); lower `parallel` to spend less memory",
-                        estimate_peak_rss_mb(parallel.workers, b),
-                        parallel.workers,
-                        per_worker_rss_mb(b),
-                        b,
-                    ));
-                }
-                lines.push(format!("    parallel: {}", parallel.workers));
-            } else if parallel.wide_mysql_single {
-                // Wide MySQL: a single sequential scan beats parallel chunks
-                // (the range-chunk contention regresses throughput). Left at
-                // parallel: 1 on purpose — raise it only if you've measured a
-                // gain on your hardware.
+            if let Some(pk) = info.single_pk_column() {
+                // Single-column PK → keyset (seek) pagination: `WHERE pk > last
+                // ORDER BY pk LIMIT n` pages by ROWS, immune to sparse/huge/gappy
+                // keys — no BETWEEN over the key SPAN, which blows up into
+                // thousands of near-empty windows on a distributed/uuid id. This
+                // is the ADR-0020 explicit `chunk_by_key` path (the planner does
+                // not auto-select it on PG, but honours it when asked).
+                lines.push(format!(
+                    "    chunk_by_key: {}  # keyset (seek) — pages by ROWS, immune to sparse/huge/gappy keys",
+                    yaml_quote_if_needed(pk)
+                ));
+                lines.push(format!("    chunk_size: {chunk_size}"));
                 lines.push(
-                    "    # parallel: 1 (wide rows on MySQL: single scan is faster than chunks)"
+                    "    # add `chunk_checkpoint: true` to resume a crashed run + pull only new keys each run (append-only tables)"
                         .to_string(),
                 );
+                lines.push(
+                    "    # keyset is sequential; for a DENSE key where you want parallel workers, use `chunk_column: <key>` + `chunk_size` instead"
+                        .to_string(),
+                );
+            } else {
+                // No single-column PK → range chunk on the best integer column.
+                let chunk_col = info.best_chunk_column().unwrap_or("id");
+                let parallel =
+                    suggest_parallel(info.row_estimate, info.avg_row_bytes(), source_type);
+                lines.push(format!(
+                    "    chunk_column: {}",
+                    yaml_quote_if_needed(chunk_col)
+                ));
+                // Scale chunk_size by row estimate so the per-table file count
+                // stays in a humane range. See `TableInfo::suggest_chunk_size`
+                // for the bands. A 10 M-row export used to produce 100 files;
+                // it now lands at ~10. Operators who want different geometry
+                // override this line directly.
+                lines.push(format!("    chunk_size: {chunk_size}"));
+                lines.push(
+                    "    chunk_checkpoint: true  # record per-chunk progress so `rivet run --resume` can finish a crashed run"
+                        .to_string(),
+                );
+                if parallel.workers > 1 {
+                    // Correction #5: show the predicted peak so the operator can
+                    // trade memory for speed without guessing. RSS scales with
+                    // worker count × row width (not chunk_size). See the sweep in
+                    // docs/bench/reports/REPORT_full_vs_parallel.md.
+                    if let Some(b) = info.avg_row_bytes() {
+                        lines.push(format!(
+                            "    # est. peak RSS ≈ {} MB ({} workers × ~{} MB/worker @ ~{} B/row); lower `parallel` to spend less memory",
+                            estimate_peak_rss_mb(parallel.workers, b),
+                            parallel.workers,
+                            per_worker_rss_mb(b),
+                            b,
+                        ));
+                    }
+                    lines.push(format!("    parallel: {}", parallel.workers));
+                } else if parallel.wide_mysql_single {
+                    // Wide MySQL: a single sequential scan beats parallel chunks
+                    // (the range-chunk contention regresses throughput). Left at
+                    // parallel: 1 on purpose — raise it only if you've measured a
+                    // gain on your hardware.
+                    lines.push(
+                        "    # parallel: 1 (wide rows on MySQL: single scan is faster than chunks)"
+                            .to_string(),
+                    );
+                }
             }
         }
         "incremental" => {
