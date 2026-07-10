@@ -168,29 +168,40 @@ fn sparse_chunk_warning(
     let cs = chunk_size.max(1);
     match row_estimate.filter(|&r| r > 0) {
         Some(rows) => {
-            let dense_windows = ((rows as usize) / cs).max(1);
+            let dense_windows = (rows as usize).div_ceil(cs).max(1);
             if chunk_count < dense_windows.saturating_mul(4) {
                 return None; // roughly dense — the windows are earning their keep
             }
             let avg = (rows as usize) / chunk_count.max(1);
+            // Exact reduction: dense keyset paging tracks ROWS, so it collapses to
+            // rows/chunk_size windows — chunk_count/dense_windows fewer round-trips.
+            let factor = chunk_count / dense_windows.max(1);
             Some(format!(
                 "sparse key range — {chunk_count} chunk windows for ~{rows} rows \
                  (~{avg} rows/window vs chunk_size {cs}). `chunk_size` divides the KEY \
                  RANGE, not the row count, so most windows are near-empty and each is a \
                  separate source query: {chunk_count} round-trips, very slow over a \
-                 tunnel/VPN. Use `chunk_dense: true` (dense keyset paging → ~{dense_windows} \
-                 windows), `chunk_count: N`, or `mode: full`."
+                 tunnel/VPN. `chunk_dense: true` (dense keyset paging) collapses this to \
+                 ~{dense_windows} windows (~{factor}× fewer round-trips); or `chunk_count: N`, \
+                 or `mode: full`."
             ))
         }
         None => {
             if chunk_count < NO_ESTIMATE_WARN_CHUNKS {
                 return None;
             }
+            // No row estimate ⇒ can't name the dense window count, but `chunk_count`
+            // is deterministic (exactly N windows), so quantify the win against a
+            // modest concrete N (the same floor below which round-trips are cheap).
+            let example_n = SPARSE_WARN_MIN_CHUNKS;
+            let factor = chunk_count / example_n;
             Some(format!(
                 "{chunk_count} chunk windows on a range key (no scan-free row estimate to \
                  confirm density). If the key is sparse (large / gappy ids), most windows are \
                  near-empty and this is {chunk_count} source round-trips — very slow over a \
-                 tunnel/VPN. If so, use `chunk_dense: true`, `chunk_count: N`, or `mode: full`."
+                 tunnel/VPN. If so: `chunk_dense: true` makes windows track ROWS not the id \
+                 span; or `chunk_count: {example_n}` → {example_n} windows (~{factor}× fewer \
+                 round-trips); or `mode: full`."
             ))
         }
     }
@@ -830,12 +841,18 @@ mod tests {
 
     #[test]
     fn sparse_with_estimate_warns_and_names_chunk_dense() {
-        // The 520k-over-a-tunnel shape: ~520k rows, chunk_size 100k → 5 dense
+        // The 520k-over-a-tunnel shape: ~520k rows, chunk_size 100k → 6 dense
         // windows, but a huge/gappy id span produced 3428 BETWEEN windows.
         let msg =
-            sparse_chunk_warning(3428, Some(520_789), 100_000).expect("685x blow-up must warn");
+            sparse_chunk_warning(3428, Some(520_789), 100_000).expect("571x blow-up must warn");
         assert!(msg.contains("chunk_dense: true"), "not actionable: {msg}");
         assert!(msg.contains("3428"), "should cite the window count: {msg}");
+        // ceil(520789/100000)=6 dense windows → 3428/6 = 571× fewer round-trips.
+        assert!(
+            msg.contains("~6 windows"),
+            "should name the dense count: {msg}"
+        );
+        assert!(msg.contains("571"), "should quantify the reduction: {msg}");
     }
 
     #[test]
@@ -851,6 +868,12 @@ mod tests {
         let msg = sparse_chunk_warning(3428, None, 100_000).expect("3428 windows must warn");
         assert!(msg.contains("chunk_dense: true"), "not actionable: {msg}");
         assert!(msg.contains("If the key is sparse"), "must hedge: {msg}");
+        // No estimate → quantify via chunk_count: 3428/64 = 53× fewer round-trips.
+        assert!(
+            msg.contains("chunk_count: 64"),
+            "should give a concrete N: {msg}"
+        );
+        assert!(msg.contains("53"), "should quantify the reduction: {msg}");
     }
 
     #[test]
