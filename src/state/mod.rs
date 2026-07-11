@@ -233,17 +233,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
         );
         CREATE INDEX IF NOT EXISTS idx_export_harm_run ON export_harm(run_id);",
     ),
-    // v12: chunking diagnostics — the chunk KEY column and whether that key is a
-    // known UNIQUE/PK. (The resolved strategy is already the `mode` column —
-    // `summary.mode` is `strategy.mode_label()`, "keyset"/"chunked"/etc.) Turns a
-    // sparse-key post-mortem into one SELECT: mode='chunked' + chunk_key='id' +
-    // chunk_key_is_unique_pk=1 → "range-chunked a PK that should have keyset-paged".
-    // The span/window count are already derivable from chunk_task, so no new field.
-    (
-        12,
-        "ALTER TABLE export_metrics ADD COLUMN chunk_key TEXT;
-        ALTER TABLE export_metrics ADD COLUMN chunk_key_is_unique_pk INTEGER;",
-    ),
+    // v12: chunking diagnostics — the chunk KEY column. (The resolved strategy is
+    // already the `mode` column — `summary.mode` is `strategy.mode_label()`,
+    // "keyset"/"chunked"/etc. — and the span/window count are derivable from
+    // chunk_task.) A sparse-key post-mortem: mode='chunked' + chunk_key='id' →
+    // "which column was range-chunked". Whether that key is a PK (the "should have
+    // keyset-paged" signal) needs a run-time PK probe — a follow-up, so no field
+    // that would merely restate mode='keyset'.
+    (12, "ALTER TABLE export_metrics ADD COLUMN chunk_key TEXT;"),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -429,11 +426,7 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
         CREATE INDEX IF NOT EXISTS idx_export_harm_run ON export_harm(run_id);",
     ),
     // v12: chunking diagnostics (see the SQLite array for rationale).
-    (
-        12,
-        "ALTER TABLE export_metrics ADD COLUMN chunk_key TEXT;
-        ALTER TABLE export_metrics ADD COLUMN chunk_key_is_unique_pk BOOLEAN;",
-    ),
+    (12, "ALTER TABLE export_metrics ADD COLUMN chunk_key TEXT;"),
 ];
 
 // ─── SQL helpers ──────────────────────────────────────────────────────────────

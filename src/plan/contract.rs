@@ -177,18 +177,6 @@ impl ExtractionStrategy {
         }
     }
 
-    /// Whether the chunk key is known to be a single-column UNIQUE/PRIMARY key.
-    /// `Some(true)` for keyset (the planner validated `is_usable_keyset_key`);
-    /// `None` for range chunking — the fast path does not probe, so PK-ness is
-    /// UNVERIFIED there (exactly the blind spot behind "was `id` a PK we could
-    /// have keyset-paged?"). A run-time PK probe can later upgrade the range case.
-    pub fn chunk_key_is_unique_pk(&self) -> Option<bool> {
-        match self {
-            ExtractionStrategy::Keyset(_) => Some(true),
-            _ => None,
-        }
-    }
-
     /// Primary cursor column name for incremental exports (`None` for other strategies).
     pub fn cursor_column(&self) -> Option<&str> {
         match self {

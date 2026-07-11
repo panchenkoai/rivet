@@ -270,18 +270,28 @@ fn run_chunk_count(eng: Eng, n: usize) {
 
 /// Seed a table keyed by a DATE column `d` spanning `days` distinct days
 /// (id BIGINT PK, d DATE NOT NULL), for `chunk_by_days` date-window chunking.
-fn seed_dated(eng: Eng, rows: i64, days: i64) -> (String, StandCleanup) {
+fn seed_dated(eng: Eng, rows: i64, days: i64, recent: bool) -> (String, StandCleanup) {
     let table = unique_name("stand_dated");
     let guard = StandCleanup(eng, table.clone());
+    // Row `i`'s date, per engine. `recent` → the last `days` days from today
+    // (time_window anchors on today, so 2023 dates fall outside its window); else a
+    // fixed 2023 span (chunk_by_days only cares about the span width).
+    let d = |i: &str| match (eng, recent) {
+        (Eng::Pg, true) => format!("CURRENT_DATE - (({i} % {days}) || ' days')::interval"),
+        (Eng::Pg, false) => format!("DATE '2023-01-01' + (({i} % {days}) || ' days')::interval"),
+        (Eng::My, true) => format!("DATE_SUB(CURDATE(), INTERVAL ({i} % {days}) DAY)"),
+        (Eng::My, false) => format!("DATE_ADD('2023-01-01', INTERVAL ({i} % {days}) DAY)"),
+        (Eng::Ms, true) => format!("DATEADD(day, -({i} % {days}), CAST(GETDATE() AS DATE))"),
+        (Eng::Ms, false) => format!("DATEADD(day, {i} % {days}, CAST('2023-01-01' AS DATE))"),
+    };
     match eng {
         Eng::Pg => {
             let mut c = pg_connect();
             c.batch_execute(&format!(
                 "CREATE TABLE {table} (id BIGINT PRIMARY KEY, d DATE NOT NULL);
-                 INSERT INTO {table} (id, d)
-                 SELECT g, DATE '2023-01-01' + ((g % {days}) || ' days')::interval
-                 FROM generate_series(1, {rows}) g;
-                 ANALYZE {table};"
+                 INSERT INTO {table} (id, d) SELECT g, {} FROM generate_series(1, {rows}) g;
+                 ANALYZE {table};",
+                d("g")
             ))
             .unwrap();
         }
@@ -299,7 +309,8 @@ fn seed_dated(eng: Eng, rows: i64, days: i64) -> (String, StandCleanup) {
             c.query_drop(format!(
                 "INSERT INTO {table} (id, d) \
                  WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < {rows}) \
-                 SELECT n, DATE_ADD('2023-01-01', INTERVAL (n % {days}) DAY) FROM seq"
+                 SELECT n, {} FROM seq",
+                d("n")
             ))
             .unwrap();
         }
@@ -309,8 +320,8 @@ fn seed_dated(eng: Eng, rows: i64, days: i64) -> (String, StandCleanup) {
             ));
             mssql_exec(&format!(
                 "INSERT INTO {table} (id, d) \
-                 SELECT value, DATEADD(day, value % {days}, CAST('2023-01-01' AS DATE)) \
-                 FROM GENERATE_SERIES(CAST(1 AS BIGINT), CAST({rows} AS BIGINT))"
+                 SELECT value, {} FROM GENERATE_SERIES(CAST(1 AS BIGINT), CAST({rows} AS BIGINT))",
+                d("value")
             ));
             mssql_exec(&format!("UPDATE STATISTICS {table}"));
         }
@@ -322,7 +333,7 @@ fn seed_dated(eng: Eng, rows: i64, days: i64) -> (String, StandCleanup) {
 /// the run succeeds and emits exactly 5 parts on every engine.
 fn run_chunk_by_days(eng: Eng) {
     eng.require();
-    let (table, _guard) = seed_dated(eng, 350, 35);
+    let (table, _guard) = seed_dated(eng, 350, 35, false);
     let rig = eng
         .rig(&table)
         .mode("chunked")
@@ -347,64 +358,13 @@ fn run_chunk_by_days(eng: Eng) {
     );
 }
 
-/// Seed a table dated across the LAST `days` days from today (`d = today - i%days`),
-/// so a recent time_window captures it. `time_window` anchors on the current date,
-/// not on `max(d)`, so the fixed-2023 `seed_dated` falls outside any recent window.
-fn seed_recent_dated(eng: Eng, rows: i64, days: i64) -> (String, StandCleanup) {
-    let table = unique_name("stand_recent");
-    let guard = StandCleanup(eng, table.clone());
-    match eng {
-        Eng::Pg => {
-            let mut c = pg_connect();
-            c.batch_execute(&format!(
-                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, d DATE NOT NULL);
-                 INSERT INTO {table} (id, d)
-                 SELECT g, CURRENT_DATE - ((g % {days}) || ' days')::interval
-                 FROM generate_series(1, {rows}) g;
-                 ANALYZE {table};"
-            ))
-            .unwrap();
-        }
-        Eng::My => {
-            let mut c = mysql_connect();
-            c.query_drop(format!(
-                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, d DATE NOT NULL)"
-            ))
-            .unwrap();
-            c.query_drop(format!(
-                "SET SESSION cte_max_recursion_depth = {}",
-                rows + 10
-            ))
-            .unwrap();
-            c.query_drop(format!(
-                "INSERT INTO {table} (id, d) \
-                 WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < {rows}) \
-                 SELECT n, DATE_SUB(CURDATE(), INTERVAL (n % {days}) DAY) FROM seq"
-            ))
-            .unwrap();
-        }
-        Eng::Ms => {
-            mssql_exec(&format!(
-                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, d DATE NOT NULL)"
-            ));
-            mssql_exec(&format!(
-                "INSERT INTO {table} (id, d) \
-                 SELECT value, DATEADD(day, -(value % {days}), CAST(GETDATE() AS DATE)) \
-                 FROM GENERATE_SERIES(CAST(1 AS BIGINT), CAST({rows} AS BIGINT))"
-            ));
-            mssql_exec(&format!("UPDATE STATISTICS {table}"));
-        }
-    }
-    (table, guard)
-}
-
 /// `mode: time_window` — a bounded date scan (`time_column` + `days_window`)
 /// anchored on today. A 40-day window over rows dated in the last 30 days
 /// captures every one. Also re-exercises the MSSQL DATE-scalar min/max path (the
 /// fix in this branch). Asserts the run succeeds and every row lands.
 fn run_time_window(eng: Eng) {
     eng.require();
-    let (table, _guard) = seed_recent_dated(eng, 300, 30);
+    let (table, _guard) = seed_dated(eng, 300, 30, true);
     let rig = eng
         .rig(&table)
         .mode("time_window")

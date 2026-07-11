@@ -65,10 +65,10 @@ pub struct MetricRow {
     pub rivet_version: Option<String>,
     // ── v10: timing ──
     pub longest_chunk_ms: Option<i64>,
-    // ── v12: chunking diagnostics — which key was chunked and is it a PK? (the
-    // resolved strategy is already the `mode` column) ──
+    // ── v12: chunking diagnostics — which key was chunked (the resolved strategy
+    // is already the `mode` column; whether the key is a PK is a follow-up that
+    // needs a run-time probe, so it is not derived-from-strategy here) ──
     pub chunk_key: Option<String>,
-    pub chunk_key_is_unique_pk: Option<bool>,
 }
 
 /// Metrics store — reads and writes `export_metrics`.
@@ -135,10 +135,10 @@ impl StateStore {
              files_committed, reconciled, source_count, quality_passed, pg_temp_bytes_delta,
              batch_size, batch_size_memory_mb, skip_reason, schema_fingerprint,
              chunk_size, parallel, source_type, destination_type, rivet_version,
-             longest_chunk_ms, chunk_key, chunk_key_is_unique_pk)
+             longest_chunk_ms, chunk_key)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
              ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31,
-             ?32, ?33)";
+             ?32)";
         match &self.conn {
             StateConn::Sqlite(c) => {
                 c.execute(
@@ -175,8 +175,7 @@ impl StateStore {
                         m.destination_type,
                         m.rivet_version,
                         m.longest_chunk_ms,
-                        m.chunk_key,
-                        m.chunk_key_is_unique_pk
+                        m.chunk_key
                     ],
                 )?;
             }
@@ -217,7 +216,6 @@ impl StateStore {
                         &m.rivet_version,
                         &m.longest_chunk_ms,
                         &m.chunk_key,
-                        &m.chunk_key_is_unique_pk,
                     ],
                 )?;
             }

@@ -39,11 +39,11 @@ struct Matrix {
 
 /// Every scenario names all four engine cells explicitly, so a missing engine is
 /// a deserialization error, not a silent hole.
+// `what:` in the YAML is human-facing documentation; serde ignores unknown keys,
+// so the struct needn't carry it.
 #[derive(Deserialize)]
 struct Scenario {
     id: String,
-    #[allow(dead_code)]
-    what: String,
     postgres: Cell,
     mysql: Cell,
     mssql: Cell,
