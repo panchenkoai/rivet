@@ -495,10 +495,19 @@ mod duckdb {
                 } else if *precision <= 38 {
                     Resolved::ok(format!("DECIMAL({precision},{scale})"))
                 } else {
-                    // DuckDB DECIMAL maxes at precision 38; wider rides as HUGEINT/DOUBLE.
-                    Resolved::warn(
+                    // DuckDB DECIMAL maxes at precision 38; a wider decimal autoloads
+                    // as DOUBLE (lossy past 2^53, verified live). Tell that truth as a
+                    // divergence, not a same-type warn — and no cast recovers a DOUBLE,
+                    // so the recovery is upstream (narrow the source precision).
+                    Resolved::diverge(
                         "DECIMAL(38,*)",
-                        format!("decimal({precision},{scale}) exceeds DuckDB DECIMAL(38); widens"),
+                        "DOUBLE",
+                        format!(
+                            "decimal({precision},{scale}) exceeds DuckDB DECIMAL(38); autoloads \
+                             as DOUBLE (lossy past 2^53) — narrow the source precision if exact \
+                             decimals matter"
+                        ),
+                        None,
                     )
                 }
             }
@@ -568,6 +577,15 @@ mod snowflake {
                             "Snowflake NUMBER has no negative scale; decimal({precision},{scale}) loads via cast"
                         ),
                     )
+                } else if *precision > 38 {
+                    // Snowflake NUMBER maxes at precision 38 — NUMBER(50,10) is not a
+                    // valid type. Never claim Ok for something the warehouse rejects;
+                    // past 38 is a Fail, the same discipline BigQuery applies past its
+                    // BIGNUMERIC ceiling.
+                    Resolved::fail(format!(
+                        "decimal({precision},{scale}) exceeds Snowflake NUMBER (max precision 38); \
+                         narrow the source precision, or load as FLOAT via a declared schema (lossy)"
+                    ))
                 } else {
                     Resolved::ok(format!("NUMBER({precision},{scale})"))
                 }
@@ -1156,12 +1174,56 @@ mod tests {
     }
 
     #[test]
-    fn duckdb_decimal_over_38_warns_not_silently_clamps() {
+    fn duckdb_decimal_over_38_autoloads_as_double_not_a_false_native_decimal() {
+        // DuckDB DECIMAL maxes at precision 38; a wider decimal autoloads as DOUBLE
+        // (lossy past 2^53) — verified live (pg_edge_decimal_boundaries_round_trip).
+        // The resolver must tell that truth: autoload_type = DOUBLE, flagged as a
+        // DIVERGENCE (target != autoload), and NO cast_sql — DOUBLE has already lost
+        // precision at autoload, so a SELECT-time cast recovers nothing (narrow the
+        // source precision instead).
         let s = duck(&RivetType::Decimal {
             precision: 40,
             scale: 2,
         });
         assert_eq!(s.status, TargetStatus::Warn);
+        assert_eq!(
+            s.autoload_type, "DOUBLE",
+            "autoload_type must tell the truth (real DuckDB autoloads wide decimals as DOUBLE)"
+        );
+        assert_ne!(
+            s.target_type, s.autoload_type,
+            "a lossy autoload must be flagged as a divergence, not autoload==target"
+        );
+        assert!(
+            s.cast_sql.is_none(),
+            "DOUBLE is already lossy — no post-load cast recovers the dropped precision"
+        );
+    }
+
+    #[test]
+    fn snowflake_decimal_over_38_fails_not_falsely_ok() {
+        // Snowflake NUMBER maxes at precision 38 — NUMBER(50,10) is not a valid
+        // type. The resolver must NOT claim Ok for a type Snowflake would reject;
+        // past 38 is a Fail (narrow precision at source, or load as FLOAT via a
+        // declared schema), the same discipline BigQuery applies past BIGNUMERIC.
+        assert_eq!(
+            sf(&RivetType::Decimal {
+                precision: 50,
+                scale: 10
+            })
+            .status,
+            TargetStatus::Fail,
+            "p>38 has no exact Snowflake NUMBER type"
+        );
+        // The boundary is exactly 38: precision 38 is still ok.
+        assert_eq!(
+            sf(&RivetType::Decimal {
+                precision: 38,
+                scale: 10
+            })
+            .status,
+            TargetStatus::Ok
+        );
     }
 
     // ── L5 recovery SQL (the post-load transform for BigQuery autoload) ───────

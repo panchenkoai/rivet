@@ -9,12 +9,13 @@
 # after_source_read → after_file_write → after_manifest_update → after_cursor_commit:
 # a crash before a boundary must leave recoverable state, never lose or double.
 #
-# NOTE (surfaced by this matrix, tracked as a bug): the batch full/incremental part-name
-# stamp in src/pipeline/single.rs is SECOND-granularity (%Y%m%d_%H%M%S, no run id) while
-# keyset / mongo_parallel / cdc all use millisecond precision. Two sub-second runs into
-# the same prefix collide → silent overwrite (LocalDestination idempotent_overwrite). The
-# part_name_no_clobber_batch_full row's tests pass only by sleeping 1100ms between runs —
-# they document the gap rather than close it. Fix = align single.rs with keyset.rs:157.
+# BUG this matrix caught + FIXED: the batch full/incremental part-name stamp in
+# src/pipeline/single.rs was SECOND-granularity (%Y%m%d_%H%M%S, no run id) while keyset /
+# mongo_parallel / cdc all used millisecond precision. Two sub-second runs into the same
+# prefix collided → silent overwrite (LocalDestination idempotent_overwrite); an
+# incremental delta's rows were lost. Proven live (roast_rapid_incremental_runs_... lost
+# 3 of 6 deltas RED), fixed by aligning single.rs with keyset.rs (%3f). The full-mode
+# clobber tests no longer need their 1100ms sleep workaround.
 
 engines: [postgres, mysql, mssql, mongo]
 
@@ -71,9 +72,9 @@ scenarios:
     mongo:    { na: "no SQL-style chunked path on Mongo" }
 
   # ── run-uniqueness: consecutive runs into the same prefix must not clobber ─
-  - id: part_name_no_clobber_batch_full
-    what: "two full-mode runs into the same prefix accumulate parts (WEAK: single.rs second-granularity — passes only by sleeping 1100ms; see header note)"
-    postgres: { test: full_mode_repeated_run_accumulates_manifest_entries }
+  - id: part_name_no_clobber_batch
+    what: "rapid consecutive runs into the same prefix don't clobber — millisecond part stamp (single.rs), proven under sub-second incremental deltas"
+    postgres: { test: roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts }
     mysql:    { test: mysql_full_mode_repeated_run_accumulates_manifest_entries }
     mssql:    { test: mssql_full_mode_repeated_run_accumulates_manifest_entries }
     mongo:    { gap: "no Mongo batch-mode two-runs-into-same-prefix test (Mongo batch uses the millisecond-stamped mongo_parallel path — should be immune, but unproven)" }
