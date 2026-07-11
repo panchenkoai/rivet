@@ -471,6 +471,87 @@ fn keyset_checkpoint_resume_pg_second_run_captures_only_new_keys() {
     );
 }
 
+/// SQL Server twin of the keyset-resume two-run test. Per the "one engine passing
+/// proves nothing about another" resume discipline, pin `chunk_by_key` +
+/// `chunk_checkpoint` resume on MSSQL too. Same running-row-TOTAL discriminator
+/// (1000 → 1000 → 1500, never 2500). Keys are 6-digit zero-padded so lexical
+/// keyset order == numeric order.
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn keyset_checkpoint_resume_mssql_second_run_captures_only_new_keys() {
+    require_alive(LiveService::Mssql);
+
+    let table = unique_name("ms_keyset_ckpt");
+    struct MsDrop(String);
+    impl Drop for MsDrop {
+        fn drop(&mut self) {
+            mssql_drop_table(&self.0);
+        }
+    }
+    let _guard = MsDrop(format!("dbo.{table}"));
+
+    mssql_exec(&format!(
+        "CREATE TABLE dbo.{table} (uid VARCHAR(40) NOT NULL PRIMARY KEY, payload INT NOT NULL)"
+    ));
+    let seed = |lo: i64, hi: i64| {
+        mssql_exec(&format!(
+            "INSERT INTO dbo.{table} (uid, payload) \
+             SELECT RIGHT('000000' + CAST(value AS VARCHAR(10)), 6), value \
+             FROM GENERATE_SERIES(CAST({lo} AS BIGINT), CAST({hi} AS BIGINT))"
+        ));
+    };
+    seed(1, 1000);
+
+    let export = unique_name("ms_keyset_ckpt_exp");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "source:\n  type: mssql\n  url: \"{MSSQL_URL}\"\n  tls:\n    accept_invalid_certs: true\n\
+         exports:\n  - name: {export}\n    table: dbo.{table}\n    mode: chunked\n    \
+         chunk_by_key: uid\n    chunk_checkpoint: true\n    chunk_size: 300\n    format: parquet\n    \
+         destination:\n      type: local\n      path: {out}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    let run = |label: &str| {
+        let out = run_rivet_export(&cfg, &export);
+        assert!(
+            out.status.success(),
+            "{label} failed; stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+
+    run("run 1");
+    assert_eq!(
+        read_uid_set(out_dir.path()).0,
+        1000,
+        "run 1 exports all 1000"
+    );
+
+    run("run 2 (unchanged)");
+    assert_eq!(
+        read_uid_set(out_dir.path()).0,
+        1000,
+        "unchanged resume adds zero rows — a re-read would double it"
+    );
+
+    seed(1001, 1500);
+    run("run 3 (after insert)");
+    let (count3, keys3) = read_uid_set(out_dir.path());
+    assert_eq!(
+        count3, 1500,
+        "resume adds ONLY the 500 new keys (got {count3}); 2500 would mean a full re-read"
+    );
+    let expected: BTreeSet<String> = (1..=1500).map(|n| format!("{n:06}")).collect();
+    assert_eq!(
+        keys3, expected,
+        "union of all runs equals the full source key set"
+    );
+}
+
 /// Companion to `snapshot_pg_uuid_pk_roundtrips_full_uuid_set` for the
 /// **explicit `chunk_by_key:` path**. PG's planner intentionally does not
 /// auto-keyset for non-int PKs (the "PG keeps refusing" branch in

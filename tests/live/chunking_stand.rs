@@ -124,6 +124,57 @@ fn seed_sparse(eng: Eng, rows: i64, step: i64) -> (String, StandCleanup) {
     (table, guard)
 }
 
+/// Seed a table whose intended chunk key `k` is NULLABLE and actually CONTAINS
+/// NULLs (every other row). Range chunking filters `WHERE k BETWEEN min AND max`,
+/// which excludes NULL — so those rows would silently vanish. The planner must
+/// refuse (`bail_if_null_keyed`). `id` is a NOT NULL PK so the table is otherwise
+/// well-formed. Small is fine: the NULL guard fires before chunk generation.
+fn seed_nullable_key(eng: Eng, rows: i64) -> (String, StandCleanup) {
+    let table = unique_name("stand_nullkey");
+    let guard = StandCleanup(eng, table.clone());
+    match eng {
+        Eng::Pg => {
+            let mut c = pg_connect();
+            c.batch_execute(&format!(
+                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, k INT);
+                 INSERT INTO {table} (id, k)
+                 SELECT g, CASE WHEN g % 2 = 0 THEN NULL ELSE g END
+                 FROM generate_series(1, {rows}) g;"
+            ))
+            .unwrap();
+        }
+        Eng::My => {
+            let mut c = mysql_connect();
+            c.query_drop(format!(
+                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, k INT NULL)"
+            ))
+            .unwrap();
+            c.query_drop(format!(
+                "SET SESSION cte_max_recursion_depth = {}",
+                rows + 10
+            ))
+            .unwrap();
+            c.query_drop(format!(
+                "INSERT INTO {table} (id, k) \
+                 WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < {rows}) \
+                 SELECT n, IF(n % 2 = 0, NULL, n) FROM seq"
+            ))
+            .unwrap();
+        }
+        Eng::Ms => {
+            mssql_exec(&format!(
+                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, k INT NULL)"
+            ));
+            mssql_exec(&format!(
+                "INSERT INTO {table} (id, k) \
+                 SELECT value, IIF(value % 2 = 0, NULL, value) \
+                 FROM GENERATE_SERIES(CAST(1 AS BIGINT), CAST({rows} AS BIGINT))"
+            ));
+        }
+    }
+    (table, guard)
+}
+
 /// The stand body: seed sparse, run a range plan (`chunk_column: id`,
 /// `chunk_size` small enough to blow the span into many windows), assert the
 /// engine's expected outcome. PG/MSSQL PROVE sparseness from a scan-free estimate
@@ -189,4 +240,48 @@ fn stand_sparse_guard_mysql() {
 #[ignore = "live: requires docker compose up -d mssql"]
 fn stand_sparse_guard_mssql() {
     run_sparse_guard(Eng::Ms);
+}
+
+/// NULL-keyed range bail: range-chunking a nullable key with actual NULLs must
+/// refuse on every engine — the NULL rows would be silently excluded by BETWEEN.
+fn run_null_keyed_bail(eng: Eng) {
+    eng.require();
+    let (table, _guard) = seed_nullable_key(eng, 200);
+    let rig = eng
+        .rig(&table)
+        .mode("chunked")
+        .export_line("chunk_column: k")
+        .export_line("chunk_size: 50");
+    let cfg = rig.config_path();
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a NULL-keyed range plan must BAIL (BETWEEN drops NULL rows); stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("found NULL in chunk_column"),
+        "bail must be the NULL-keyed refusal; stderr:\n{stderr}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn stand_null_keyed_bail_postgres() {
+    run_null_keyed_bail(Eng::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_null_keyed_bail_mysql() {
+    run_null_keyed_bail(Eng::My);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_null_keyed_bail_mssql() {
+    run_null_keyed_bail(Eng::Ms);
 }

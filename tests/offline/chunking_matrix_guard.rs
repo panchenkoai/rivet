@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 /// Admitted-gap ceiling. LOWER this each time a gap flips to a test; never raise
-/// it. 18 at introduction (after the sparse-guard row was filled by the stand).
-const MAX_GAPS: usize = 18;
+/// it. 18 at introduction; 14 after null-keyed-bail (×3) + MSSQL keyset-resume.
+const MAX_GAPS: usize = 14;
 
 #[derive(Deserialize)]
 struct Matrix {

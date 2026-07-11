@@ -41,7 +41,7 @@ scenarios:
     what: "keyset + chunk_checkpoint: persist max key, a re-run captures ONLY new keys (run→unchanged=0→insert→resume)"
     postgres: { test: keyset_checkpoint_resume_pg_second_run_captures_only_new_keys }
     mysql:    { test: keyset_checkpoint_resume_second_run_captures_only_new_keys }
-    mssql:    { gap: "no keyset checkpoint two-run test on MSSQL — only range-chunk resume exists" }
+    mssql:    { test: keyset_checkpoint_resume_mssql_second_run_captures_only_new_keys }
     mongo:    { test: mongo_batch_resume_reads_only_new_since_last_run }
 
   - id: keyset_init_generates_for_pk
@@ -126,9 +126,9 @@ scenarios:
 
   - id: guard_null_keyed_range_bail
     what: "range/date chunk over a nullable key with actual NULLs → bail (BETWEEN would silently drop NULL rows)"
-    postgres: { gap: "bail_if_null_keyed has no live test — unit-only in detect.rs" }
-    mysql:    { gap: "bail_if_null_keyed has no live test on MySQL — unit-only" }
-    mssql:    { gap: "bail_if_null_keyed has no live test on MSSQL — unit-only" }
+    postgres: { test: stand_null_keyed_bail_postgres }
+    mysql:    { test: stand_null_keyed_bail_mysql }
+    mssql:    { test: stand_null_keyed_bail_mssql }
     mongo:    { na: "no BETWEEN key predicate on Mongo" }
 
   - id: guard_keyset_non_usable_key_bail
