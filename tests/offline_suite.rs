@@ -16,6 +16,8 @@
 mod audit_validate_warning_label;
 #[path = "offline/cargo_manifest_chef.rs"]
 mod cargo_manifest_chef;
+#[path = "offline/chunking_matrix_guard.rs"]
+mod chunking_matrix_guard;
 #[path = "offline/cli_contract.rs"]
 mod cli_contract;
 #[path = "offline/config_fuzz.rs"]
