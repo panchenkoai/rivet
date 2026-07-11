@@ -87,5 +87,5 @@ scenarios:
     what: "same seed on two engines → equal row count + equal PK id-set + identical empty-export behaviour"
     postgres: { test: pg_and_mysql_full_exports_agree_on_row_count_and_id_set }
     mysql:    { test: pg_and_mysql_chunked_exports_agree_on_row_count_and_id_set }
-    mssql:    { gap: "MSSQL is absent from the head-to-head parity file (only its own independent differential)" }
+    mssql:    { test: pg_and_mssql_full_exports_agree_on_row_count_and_id_set }
     mongo:    { na: "Mongo's JSON-blob model has no row-for-row SQL parity to compare against" }
