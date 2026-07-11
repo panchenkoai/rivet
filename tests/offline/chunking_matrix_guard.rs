@@ -21,9 +21,11 @@ use serde::Deserialize;
 /// it. 18 at introduction; 14 after null-keyed-bail (×3) + MSSQL keyset-resume;
 /// 12 after chunk_count (MySQL + MSSQL); 7 after chunk_by_days (×3) +
 /// keyset-non-usable (×2); 3 after sparse-gappy (×2) + memory_mb-PG + keyset-auto-MSSQL→na;
-/// 1 after small-table-escape (×2 → na, escape verified PG-only). The last gap is
-/// chunk_count on Mongo (needs the Mongo stack, not up in the SQL matrix).
-const MAX_GAPS: usize = 1;
+/// 1 after small-table-escape (×2 → na, escape verified PG-only); 0 after
+/// chunk_count-Mongo → na (Mongo has no chunk_count; parallel-N is its analogue,
+/// already tested). The chunking matrix is now FULLY covered — every cell is a
+/// test or a justified n/a.
+const MAX_GAPS: usize = 0;
 
 #[derive(Deserialize)]
 struct Matrix {
@@ -164,15 +166,14 @@ fn chunking_matrix_gaps_do_not_exceed_ratchet() {
         .flat_map(|sc| sc.cells())
         .filter(|(_, c)| c.gap.is_some())
         .count();
-    assert!(
-        gaps <= MAX_GAPS,
-        "chunking-matrix.yaml has {gaps} admitted gaps but the ratchet ceiling is {MAX_GAPS}. \
-         You cannot ADD a gap — fill it with a test. (When you flip a gap to a test, LOWER \
-         MAX_GAPS to match.)"
-    );
-    // Nudge the ceiling down as gaps are filled: if this fires, lower MAX_GAPS.
+    // Exactly-equal is the ratchet in BOTH directions: `> MAX_GAPS` means a gap
+    // was ADDED (fill it — gaps can't grow); `< MAX_GAPS` means one was FILLED
+    // (lower MAX_GAPS to lock the win). A plain `==` avoids the absurd `<= 0`
+    // comparison now that the matrix is fully covered (MAX_GAPS = 0).
     assert_eq!(
         gaps, MAX_GAPS,
-        "gaps ({gaps}) dropped below the ratchet ({MAX_GAPS}) — lower MAX_GAPS to {gaps} to lock in the win"
+        "chunking-matrix.yaml has {gaps} admitted gaps; the ratchet expects exactly {MAX_GAPS}. \
+         If {gaps} > {MAX_GAPS}: you ADDED a gap — fill it with a test (gaps cannot grow). \
+         If {gaps} < {MAX_GAPS}: you FILLED one — lower MAX_GAPS to {gaps} to lock in the win."
     );
 }

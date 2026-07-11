@@ -93,7 +93,7 @@ scenarios:
     postgres: { test: roast_small_table_escape_respects_explicit_chunk_count }
     mysql:    { test: stand_chunk_count_mysql }
     mssql:    { test: stand_chunk_count_mssql }
-    mongo:    { gap: "no chunk_count/parallel-N assertion on Mongo _id-range" }
+    mongo:    { na: "Mongo has no chunk_count knob; the analogue is parallel: N _id-range fan-out, covered by mongo_batch_parallel_integer_id_no_loss_or_dup" }
 
   - id: chunk_by_days
     what: "chunk_by_days: date-window chunking on a date/timestamp key"
