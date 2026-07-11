@@ -859,6 +859,141 @@ fn run_codec_matrix(eng: Eng) {
     }
 }
 
+/// The source YAML block + the table reference for `eng` (for raw-YAML tests that
+/// the Rig can't render — cloud destinations, environment).
+fn source_block(eng: Eng, table: &str) -> (String, String) {
+    match eng {
+        Eng::Pg => (
+            format!("source:\n  type: postgres\n  url: \"{POSTGRES_URL}\""),
+            format!("public.{table}"),
+        ),
+        Eng::My => (
+            format!("source:\n  type: mysql\n  url: \"{MYSQL_URL}\""),
+            table.to_string(),
+        ),
+        Eng::Ms => (
+            format!(
+                "source:\n  type: mssql\n  url: \"{MSSQL_URL}\"\n  tls:\n    accept_invalid_certs: true"
+            ),
+            format!("dbo.{table}"),
+        ),
+    }
+}
+
+/// Count `.parquet` objects fake-gcs holds under `bucket/prefix` (its JSON list API).
+fn count_gcs_parquet(bucket: &str, prefix: &str) -> usize {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect("127.0.0.1:4443").unwrap();
+    let req = format!(
+        "GET /storage/v1/b/{bucket}/o?prefix={prefix} HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    );
+    s.write_all(req.as_bytes()).unwrap();
+    let mut resp = String::new();
+    let _ = s.read_to_string(&mut resp);
+    resp.matches(".parquet").count()
+}
+
+/// `destination: gcs` (fake-gcs) — the export lands a parquet in the bucket.
+fn run_dest_gcs(eng: Eng) {
+    eng.require();
+    require_alive(LiveService::FakeGcs);
+    let (table, _guard) = seed_dense(eng, 100);
+    let (src, tbl) = source_block(eng, &table);
+    let bucket = "rivet-qa-stand-gcs";
+    ensure_gcs_bucket(bucket);
+    let prefix = unique_name("stand_gcs");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "{src}\nexports:\n  - name: cg\n    table: {tbl}\n    mode: full\n    format: parquet\n    \
+         destination:\n      type: gcs\n      bucket: {bucket}\n      prefix: {prefix}\n      \
+         endpoint: {FAKE_GCS_ENDPOINT}\n      allow_anonymous: true\n"
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+    assert!(
+        out.status.success(),
+        "gcs run failed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        count_gcs_parquet(bucket, &prefix) >= 1,
+        "fake-gcs bucket must hold >=1 parquet under {prefix}"
+    );
+}
+
+/// `destination: s3` (MinIO) — the export lands a parquet in the bucket (mc ls).
+fn run_dest_s3(eng: Eng) {
+    eng.require();
+    require_alive(LiveService::Minio);
+    let (table, _guard) = seed_dense(eng, 100);
+    let (src, tbl) = source_block(eng, &table);
+    let bucket = "rivet-qa-stand-s3";
+    ensure_minio_bucket(bucket);
+    let prefix = unique_name("stand_s3");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "{src}\nexports:\n  - name: cs\n    table: {tbl}\n    mode: full\n    format: parquet\n    \
+         destination:\n      type: s3\n      bucket: {bucket}\n      prefix: {prefix}\n      \
+         region: us-east-1\n      endpoint: {MINIO_ENDPOINT}\n      \
+         access_key_env: RIVET_TEST_MINIO_AK\n      secret_key_env: RIVET_TEST_MINIO_SK\n"
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[
+            ("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY),
+            ("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY),
+            ("AWS_EC2_METADATA_DISABLED", "true"),
+            ("RUST_LOG", "warn"),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "s3 run failed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let script = format!(
+        "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
+         mc ls --recursive local/{bucket}/{prefix} 2>/dev/null"
+    );
+    let ls = std::process::Command::new("docker")
+        .args(["compose", "exec", "-T", "minio", "sh", "-c", &script])
+        .output()
+        .expect("mc ls");
+    let listing = String::from_utf8_lossy(&ls.stdout);
+    assert!(
+        listing.matches(".parquet").count() >= 1,
+        "minio must hold >=1 parquet under {prefix}; got:\n{listing}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql fake-gcs"]
+fn stand_dest_gcs_mysql() {
+    run_dest_gcs(Eng::My);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql fake-gcs"]
+fn stand_dest_gcs_mssql() {
+    run_dest_gcs(Eng::Ms);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql minio"]
+fn stand_dest_s3_mysql() {
+    run_dest_s3(Eng::My);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql minio"]
+fn stand_dest_s3_mssql() {
+    run_dest_s3(Eng::Ms);
+}
+
 #[test]
 #[ignore = "live: requires docker compose up -d mysql"]
 fn stand_compression_codecs_mysql() {

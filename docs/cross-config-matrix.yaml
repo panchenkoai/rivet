@@ -21,15 +21,15 @@ scenarios:
   - id: dest_gcs
     what: "destination: gcs — fake-GCS round-trip, all rows"
     postgres: { test: gcs_fake_destination_produces_one_parquet_with_all_rows }
-    mysql:    { gap: "no GCS destination test on MySQL" }
-    mssql:    { gap: "no GCS destination test on MSSQL" }
+    mysql:    { test: stand_dest_gcs_mysql }
+    mssql:    { test: stand_dest_gcs_mssql }
     mongo:    { gap: "no GCS destination test on Mongo" }
 
   - id: dest_s3
     what: "destination: s3 — MinIO round-trip, all rows"
     postgres: { test: s3_minio_destination_produces_one_parquet_with_all_rows }
-    mysql:    { gap: "no S3 destination test on MySQL" }
-    mssql:    { gap: "no S3 destination test on MSSQL" }
+    mysql:    { test: stand_dest_s3_mysql }
+    mssql:    { test: stand_dest_s3_mssql }
     mongo:    { gap: "no S3 destination test on Mongo" }
 
   # ── format / compression ──────────────────────────────────────────────────
