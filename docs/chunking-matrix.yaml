@@ -91,8 +91,8 @@ scenarios:
   - id: chunk_count_n
     what: "chunk_count: N divides the key range into exactly N windows"
     postgres: { test: roast_small_table_escape_respects_explicit_chunk_count }
-    mysql:    { gap: "no chunk_count runtime test on MySQL" }
-    mssql:    { gap: "no chunk_count runtime test on MSSQL" }
+    mysql:    { test: stand_chunk_count_mysql }
+    mssql:    { test: stand_chunk_count_mssql }
     mongo:    { gap: "no chunk_count/parallel-N assertion on Mongo _id-range" }
 
   - id: chunk_by_days

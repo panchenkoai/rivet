@@ -175,6 +175,82 @@ fn seed_nullable_key(eng: Eng, rows: i64) -> (String, StandCleanup) {
     (table, guard)
 }
 
+/// Seed a DENSE contiguous integer-PK table (`id` = 1..rows), the well-behaved
+/// shape for range chunking / chunk_count.
+fn seed_dense(eng: Eng, rows: i64) -> (String, StandCleanup) {
+    let table = unique_name("stand_dense");
+    let guard = StandCleanup(eng, table.clone());
+    match eng {
+        Eng::Pg => {
+            let mut c = pg_connect();
+            c.batch_execute(&format!(
+                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL);
+                 INSERT INTO {table} (id, payload) SELECT g, g FROM generate_series(1, {rows}) g;
+                 ANALYZE {table};"
+            ))
+            .unwrap();
+        }
+        Eng::My => {
+            let mut c = mysql_connect();
+            c.query_drop(format!(
+                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL)"
+            ))
+            .unwrap();
+            c.query_drop(format!(
+                "SET SESSION cte_max_recursion_depth = {}",
+                rows + 10
+            ))
+            .unwrap();
+            c.query_drop(format!(
+                "INSERT INTO {table} (id, payload) \
+                 WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < {rows}) \
+                 SELECT n, n FROM seq"
+            ))
+            .unwrap();
+        }
+        Eng::Ms => {
+            mssql_exec(&format!(
+                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL)"
+            ));
+            mssql_exec(&format!(
+                "INSERT INTO {table} (id, payload) \
+                 SELECT value, value FROM GENERATE_SERIES(CAST(1 AS BIGINT), CAST({rows} AS BIGINT))"
+            ));
+            mssql_exec(&format!("UPDATE STATISTICS {table}"));
+        }
+    }
+    (table, guard)
+}
+
+/// `chunk_count: N` divides the key range into EXACTLY N windows → N part files
+/// on a dense key. Assert the run succeeds and emits exactly N parquet parts.
+fn run_chunk_count(eng: Eng, n: usize) {
+    eng.require();
+    let (table, _guard) = seed_dense(eng, 4000);
+    let rig = eng
+        .rig(&table)
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line(&format!("chunk_count: {n}"));
+    let cfg = rig.config_path();
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+    assert!(
+        out.status.success(),
+        "chunk_count run must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let files = files_with_extension(&rig.out_dir(), "parquet");
+    assert_eq!(
+        files.len(),
+        n,
+        "chunk_count: {n} must emit exactly {n} part files on a dense key; got {}: {files:?}",
+        files.len()
+    );
+}
+
 /// The stand body: seed sparse, run a range plan (`chunk_column: id`,
 /// `chunk_size` small enough to blow the span into many windows), assert the
 /// engine's expected outcome. PG/MSSQL PROVE sparseness from a scan-free estimate
@@ -284,4 +360,16 @@ fn stand_null_keyed_bail_mysql() {
 #[ignore = "live: requires docker compose up -d mssql"]
 fn stand_null_keyed_bail_mssql() {
     run_null_keyed_bail(Eng::Ms);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_chunk_count_mysql() {
+    run_chunk_count(Eng::My, 4);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_chunk_count_mssql() {
+    run_chunk_count(Eng::Ms, 4);
 }
