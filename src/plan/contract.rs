@@ -165,6 +165,30 @@ impl ExtractionStrategy {
             || matches!(self, ExtractionStrategy::Keyset(kp) if kp.checkpoint)
     }
 
+    /// The key column that drives chunking: the range/dense `chunk_column`, or the
+    /// keyset `chunk_by_key`. `None` for snapshot/incremental/time-window. Recorded
+    /// per run so a post-mortem knows WHICH column was chunked (the state DB
+    /// otherwise keeps only the chunk *values*, never the column name).
+    pub fn chunk_key(&self) -> Option<&str> {
+        match self {
+            ExtractionStrategy::Chunked(cp) => Some(cp.column.as_str()),
+            ExtractionStrategy::Keyset(kp) => Some(kp.key_column.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Whether the chunk key is known to be a single-column UNIQUE/PRIMARY key.
+    /// `Some(true)` for keyset (the planner validated `is_usable_keyset_key`);
+    /// `None` for range chunking — the fast path does not probe, so PK-ness is
+    /// UNVERIFIED there (exactly the blind spot behind "was `id` a PK we could
+    /// have keyset-paged?"). A run-time PK probe can later upgrade the range case.
+    pub fn chunk_key_is_unique_pk(&self) -> Option<bool> {
+        match self {
+            ExtractionStrategy::Keyset(_) => Some(true),
+            _ => None,
+        }
+    }
+
     /// Primary cursor column name for incremental exports (`None` for other strategies).
     pub fn cursor_column(&self) -> Option<&str> {
         match self {
