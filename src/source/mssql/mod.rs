@@ -981,6 +981,21 @@ fn scalar_to_string(row: &tiberius::Row) -> Option<String> {
             }
         }),
         ColumnData::Guid(v) => v.map(|g| g.to_string()),
+        // Date/time: the Debug fallback rendered these as `Date(Some(Date(738520)))`,
+        // which `scalar::parse_date_flexible` (chunk_by_days / date-keyset min/max)
+        // cannot read — so date-window chunking on an MSSQL DATE key failed the run.
+        // Decode via tiberius' chrono `FromSql` (`try_get`, the same path
+        // arrow_convert uses) and render ISO: `YYYY-MM-DD` / `YYYY-MM-DD HH:MM:SS`.
+        ColumnData::Date(_) => row
+            .try_get::<chrono::NaiveDate, _>(0)
+            .ok()
+            .flatten()
+            .map(|d| d.format("%Y-%m-%d").to_string()),
+        ColumnData::DateTime(_) | ColumnData::DateTime2(_) | ColumnData::SmallDateTime(_) => row
+            .try_get::<chrono::NaiveDateTime, _>(0)
+            .ok()
+            .flatten()
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
         other => Some(format!("{other:?}")),
     }
 }

@@ -1,0 +1,60 @@
+# Behaviour coverage matrix — extraction MODES + config FEATURES beyond chunking.
+# Same shape + drift-guard (tests/offline/chunking_matrix_guard.rs) as
+# docs/chunking-matrix.yaml; chunking strategies live in their own matrix. Each
+# cell is { test: <fn> } | { gap: "<why>" } | { na: "<why>" }.
+#
+# Config-layer features (variable substitution, url_env) are engine-AGNOSTIC — one
+# offline test covers every engine — so they carry the test in the `postgres` cell
+# and na the rest with an explicit "engine-agnostic" reason, rather than pretending
+# to run four times.
+#
+# Growth path (next categories, each a new scenario block): types / type-fidelity
+# (decimal(p,s), uuid, json, tstz, binary per engine), formats (parquet/csv),
+# destinations (local/gcs/s3), reconcile.
+
+engines: [postgres, mysql, mssql, mongo]
+
+scenarios:
+  # ── extraction modes ──────────────────────────────────────────────────────
+  - id: mode_full
+    what: "mode: full — one bounded cursor, one file, re-read each run"
+    postgres: { test: full_mode_repeated_run_accumulates_manifest_entries }
+    mysql:    { test: mysql_full_mode_repeated_run_accumulates_manifest_entries }
+    mssql:    { test: mssql_full_mode_repeated_run_accumulates_manifest_entries }
+    mongo:    { test: mongo_batch_type_fidelity_document_is_verbatim_extjson }
+
+  - id: mode_incremental
+    what: "mode: incremental — WHERE cursor > last_value; re-run picks up only new rows"
+    postgres: { test: incremental_third_run_picks_up_newly_inserted_rows }
+    mysql:    { test: mysql_incremental_third_run_picks_up_newly_inserted_rows }
+    mssql:    { test: mssql_incremental_third_run_picks_up_newly_inserted_rows }
+    mongo:    { na: "Mongo has no SQL cursor-column incremental; keyset resume (chunking matrix) fills the role" }
+
+  - id: mode_time_window
+    what: "mode: time_window — bounded date scan (time_column + days_window), anchored on today"
+    postgres: { test: time_window_resolves_numeric_via_base_catalog_hint }
+    mysql:    { test: stand_time_window_mysql }
+    mssql:    { test: stand_time_window_mssql }
+    mongo:    { na: "no SQL date-window mode on Mongo" }
+
+  # ── config features (engine-agnostic: one offline test covers all engines) ──
+  - id: config_var_substitution
+    what: "${VAR} substitution from params/env; strict mode errors on an unresolved ref (no silent empty-string in a URL)"
+    postgres: { test: resolve_query_inline_with_params_substitutes_vars }
+    mysql:    { na: "engine-agnostic config-layer feature (src/config/resolve.rs); one offline test covers every engine — see the postgres cell" }
+    mssql:    { na: "engine-agnostic — see the postgres cell" }
+    mongo:    { na: "engine-agnostic — see the postgres cell" }
+
+  - id: config_var_substitution_strict_unset
+    what: "an unresolved ${VAR} (neither param nor env) is a hard error, not a silent substitution"
+    postgres: { test: resolve_query_inline_with_params_substitutes_vars }
+    mysql:    { na: "engine-agnostic — the strict-mode assertion lives in the same offline test module" }
+    mssql:    { na: "engine-agnostic — see the postgres cell" }
+    mongo:    { na: "engine-agnostic — see the postgres cell" }
+
+  - id: config_query_from_file
+    what: "query loaded from a file (query_file) with ${VAR} substitution applied to the file contents"
+    postgres: { test: resolve_query_file_with_params_substitutes }
+    mysql:    { na: "engine-agnostic config-layer feature; one offline test covers every engine" }
+    mssql:    { na: "engine-agnostic — see the postgres cell" }
+    mongo:    { na: "engine-agnostic — see the postgres cell" }

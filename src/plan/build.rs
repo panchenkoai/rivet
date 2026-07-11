@@ -408,8 +408,13 @@ fn resolve_chunked_strategy(
         return Ok(ExtractionStrategy::Keyset(KeysetPlan {
             key_column: key.to_string(),
             chunk_size,
-            // SQL keyset is a full re-read each run (no cross-run resume).
-            checkpoint: false,
+            // `chunk_checkpoint: true` makes SQL keyset resumable/incremental-by-key:
+            // the runner persists the last committed key and continues from it next
+            // run (crash-recovery + append). This is engine-agnostic — the same
+            // `keyset.rs` path Mongo uses, keyed off `export_state`. Default false =
+            // full re-read each run (snapshot semantics; a plain re-run must not
+            // silently skip already-exported rows).
+            checkpoint: export.chunk_checkpoint,
             // SQL keyset is sequential; parallel `_id`-range is a Mongo capability.
             parallel: 1,
         }));
@@ -466,7 +471,9 @@ fn resolve_chunked_strategy(
                     return Ok(ExtractionStrategy::Keyset(KeysetPlan {
                         key_column: key.to_string(),
                         chunk_size,
-                        checkpoint: false,
+                        // Same as the explicit `chunk_by_key` path: `chunk_checkpoint`
+                        // opts into resumable/incremental-by-key keyset.
+                        checkpoint: export.chunk_checkpoint,
                         parallel: 1,
                     }));
                 }

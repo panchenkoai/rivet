@@ -51,6 +51,24 @@ impl TableInfo {
             .map(|c| c.name.as_str())
     }
 
+    /// The single-column primary key, if the table has exactly one PK column.
+    ///
+    /// Keyset (`chunk_by_key`) pages by one index-backed unique key of ANY
+    /// orderable type — int, uuid, string, timestamp — so, unlike
+    /// [`best_chunk_column`](Self::best_chunk_column) (integer-only, for range
+    /// chunking), this returns the PK regardless of type. `None` for a composite
+    /// PK (keyset is single-column only) or a table with no PK — those fall back
+    /// to range chunking on an integer column.
+    pub(crate) fn single_pk_column(&self) -> Option<&str> {
+        let mut pks = self.columns.iter().filter(|c| c.is_primary_key);
+        let first = pks.next()?;
+        // A composite PK has no single keyset key — fall back to range.
+        if pks.next().is_some() {
+            return None;
+        }
+        Some(first.name.as_str())
+    }
+
     /// Best candidate for `cursor_column`: prefer updated_at, then created_at, then any timestamp.
     pub(crate) fn best_cursor_column(&self) -> Option<&str> {
         let ts_cols: Vec<&ColumnInfo> = self
@@ -800,7 +818,10 @@ mod tests {
     }
 
     #[test]
-    fn generate_config_chunked_contains_key_fields() {
+    fn generate_config_chunked_single_pk_uses_keyset() {
+        // A single-column PK → keyset (`chunk_by_key`), immune to sparse keys —
+        // NOT range `chunk_column` (which blows up on a huge/gappy id). Sequential,
+        // so no `parallel:`; checkpoint is a commented opt-in, not on by default.
         let info = make_table(
             2_000_000,
             vec![col("id", "bigint", true), col("name", "text", false)],
@@ -814,13 +835,72 @@ mod tests {
         )
         .unwrap();
         assert!(yaml.contains("mode: chunked"), "got:\n{yaml}");
-        assert!(yaml.contains("chunk_column: id"), "got:\n{yaml}");
-        assert!(yaml.contains("chunk_checkpoint: true"), "got:\n{yaml}");
-        assert!(yaml.contains("parallel: 2"), "got:\n{yaml}");
-        assert!(yaml.contains("SELECT id, name"), "got:\n{yaml}");
+        assert!(yaml.contains("chunk_by_key: id"), "got:\n{yaml}");
+        // No ACTIVE `chunk_column:` line (the keyset hint comment mentions it).
+        assert!(
+            !yaml.contains("\n    chunk_column:"),
+            "PK must keyset, not range-chunk:\n{yaml}"
+        );
+        // keyset is sequential — no parallel workers emitted, and checkpoint is a
+        // commented opt-in (snapshot semantics by default), never an active knob.
+        assert!(
+            !yaml.contains("\n    parallel:"),
+            "keyset must not emit parallel:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("# add `chunk_checkpoint: true`"),
+            "should hint the resume opt-in:\n{yaml}"
+        );
+        // Keyset needs the `table:` shortcut (planner introspects the unique index),
+        // so the export emits `table:`, not a `SELECT … FROM` query.
+        assert!(yaml.contains("table: orders"), "got:\n{yaml}");
+        assert!(
+            !yaml.contains("query:"),
+            "keyset must use table:, not query:\n{yaml}"
+        );
         assert!(yaml.contains("meta_columns:"), "got:\n{yaml}");
-        assert!(yaml.contains("exported_at: true"), "got:\n{yaml}");
-        assert!(yaml.contains("row_hash: true"), "got:\n{yaml}");
+    }
+
+    #[test]
+    fn generate_config_chunked_no_single_pk_uses_range_column() {
+        // No single-column PK (here: no PK at all) → range chunk on the best
+        // integer column, with `chunk_checkpoint: true` and parallel as before.
+        let info = make_table(
+            2_000_000,
+            vec![col("region_id", "int", false), col("name", "text", false)],
+        );
+        let yaml = yaml_scaffold::generate_config(
+            &info,
+            "postgresql://localhost/db",
+            &super::SourceProvenance::Inline,
+            &InitYamlDestination::default(),
+            None,
+        )
+        .unwrap();
+        assert!(yaml.contains("mode: chunked"), "got:\n{yaml}");
+        assert!(yaml.contains("chunk_column: region_id"), "got:\n{yaml}");
+        assert!(
+            !yaml.contains("chunk_by_key:"),
+            "no PK → range, not keyset:\n{yaml}"
+        );
+        assert!(yaml.contains("chunk_checkpoint: true"), "got:\n{yaml}");
+    }
+
+    #[test]
+    fn single_pk_column_detects_single_composite_and_none() {
+        // Exactly one PK column → that column.
+        let one = make_table(1, vec![col("id", "bigint", true), col("n", "text", false)]);
+        assert_eq!(one.single_pk_column(), Some("id"));
+        // Composite PK → None (keyset is single-column only).
+        let composite = make_table(1, vec![col("a", "bigint", true), col("b", "bigint", true)]);
+        assert_eq!(composite.single_pk_column(), None);
+        // No PK → None.
+        let none = make_table(1, vec![col("x", "int", false)]);
+        assert_eq!(none.single_pk_column(), None);
+        // Non-integer single PK still keysets (unlike best_chunk_column).
+        let uuid = make_table(1, vec![col("id", "uuid", true)]);
+        assert_eq!(uuid.single_pk_column(), Some("id"));
+        assert_eq!(uuid.best_chunk_column(), None);
     }
 
     #[test]
@@ -1143,8 +1223,12 @@ mod tests {
         let exp = &parsed["exports"][0];
         assert_eq!(exp["name"].as_str(), Some("orders"));
         assert_eq!(exp["mode"].as_str(), Some("chunked"));
-        assert_eq!(exp["chunk_column"].as_str(), Some("id"));
-        assert_eq!(exp["chunk_checkpoint"].as_bool(), Some(true));
+        // Single-column PK → keyset via the `table:` shortcut; checkpoint is a
+        // commented opt-in, so it is absent from the parsed (active) config.
+        assert_eq!(exp["chunk_by_key"].as_str(), Some("id"));
+        assert_eq!(exp["table"].as_str(), Some("orders"));
+        assert!(exp["chunk_column"].is_null());
+        assert!(exp["chunk_checkpoint"].is_null());
         assert_eq!(exp["meta_columns"]["row_hash"].as_bool(), Some(true));
         assert_eq!(exp["destination"]["type"].as_str(), Some("s3"));
         assert_eq!(exp["destination"]["bucket"].as_str(), Some("ok-bucket"));

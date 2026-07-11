@@ -129,6 +129,100 @@ fn keyset_varchar_pk_roundtrips_full_keyset_across_pages() {
     );
 }
 
+/// Two-run keyset RESUME (`chunk_checkpoint: true` — OPT-4 + Phase 2). Run 1
+/// exports the whole key set and persists the high-water key; an UNCHANGED
+/// re-run exports ZERO new rows; after inserting rows with higher keys, the next
+/// run exports ONLY those — it resumes from the last committed key rather than
+/// re-reading the table. The SQL analogue of Mongo keyset resume, enabled by
+/// threading `chunk_checkpoint` into the SQL `KeysetPlan` (was hardcoded
+/// `checkpoint: false` in `plan::build`).
+///
+/// Discriminator = the TOTAL row count across all page files: with resume it is
+/// 1000 → 1000 → 1500 (run 3 adds only the 500 new keys); without resume a
+/// re-read would inflate it to 2500. The union-of-keys alone cannot tell the two
+/// apart (a set dedups), so we assert the running row TOTAL, not just the keys —
+/// the exact "capture-works ≠ resume-works" trap the two-run test exists to close.
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn keyset_checkpoint_resume_second_run_captures_only_new_keys() {
+    require_alive(LiveService::Mysql);
+
+    let table = unique_name("keyset_ckpt");
+    let _guard = DropTable(table.clone());
+
+    let mut conn = mysql_connect();
+    conn.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    conn.query_drop(format!(
+        "CREATE TABLE {table} (uid VARCHAR(40) NOT NULL PRIMARY KEY, payload INT NOT NULL)"
+    ))
+    .unwrap();
+    conn.query_drop("SET SESSION cte_max_recursion_depth = 20000")
+        .unwrap();
+    let seed = |conn: &mut mysql::PooledConn, lo: usize, hi: usize| {
+        conn.query_drop(format!(
+            "INSERT INTO {table} (uid, payload) \
+             WITH RECURSIVE seq AS (SELECT {lo} n UNION ALL SELECT n+1 FROM seq WHERE n < {hi}) \
+             SELECT CONCAT('id-', LPAD(n, 6, '0')), n FROM seq"
+        ))
+        .unwrap();
+    };
+    seed(&mut conn, 1, 1000);
+
+    // Explicit keyset key + checkpoint. Same cfg dir across runs so the
+    // `.rivet_state.db` (written next to the config) is shared → run 2/3 resume.
+    let export = unique_name("keyset_ckpt_exp");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\nexports:\n  - name: {export}\n    \
+         table: {table}\n    mode: chunked\n    chunk_by_key: uid\n    chunk_checkpoint: true\n    \
+         chunk_size: 300\n    format: parquet\n    destination:\n      type: local\n      path: {out}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    let run = |label: &str| {
+        let out = run_rivet_export(&cfg, &export);
+        assert!(
+            out.status.success(),
+            "{label} failed; stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // Distinct millisecond part stamp so a resumed run's parts never clobber
+        // the prior run's (run-uniqueness rule).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+
+    // Run 1: exports all 1000, persists high-water key id-001000.
+    run("run 1");
+    let (count1, _) = read_uid_set(out_dir.path());
+    assert_eq!(count1, 1000, "run 1 must export all seeded rows");
+
+    // Run 2 on the UNCHANGED source: resume floor is id-001000 → ZERO new rows,
+    // no file written; the total across files stays 1000 (no re-read).
+    run("run 2 (unchanged)");
+    let (count2, _) = read_uid_set(out_dir.path());
+    assert_eq!(
+        count2, 1000,
+        "unchanged resume must add zero rows (got {count2}) — a re-read would double it"
+    );
+
+    // Insert 500 rows with HIGHER keys, then resume: only those 500 are read.
+    seed(&mut conn, 1001, 1500);
+    run("run 3 (after insert)");
+    let (count3, keys3) = read_uid_set(out_dir.path());
+    assert_eq!(
+        count3, 1500,
+        "resume must add ONLY the 500 new keys (got {count3}); 2500 would mean a full re-read"
+    );
+    let expected: BTreeSet<String> = (1..=1500).map(|n| format!("id-{n:06}")).collect();
+    assert_eq!(
+        keys3, expected,
+        "the union of all runs must equal the full source key set"
+    );
+}
+
 /// PostgreSQL UUID PK is the most common non-integer PK in production
 /// (`id UUID PRIMARY KEY DEFAULT gen_random_uuid()` is the canonical
 /// shape after `gen_random_uuid()` landed in core). The documented path
@@ -295,6 +389,166 @@ fn keyset_mysql_uuid_pk_roundtrips_full_keyset_across_pages() {
     assert_eq!(
         keys, expected,
         "the exported UUID set must equal the source UUID set"
+    );
+}
+
+/// PostgreSQL twin of `keyset_checkpoint_resume_second_run_captures_only_new_keys`.
+/// The resume logic in `pipeline::keyset` is engine-agnostic (persist the max key
+/// to `export_state`, read it back next run), but per the project's resume
+/// discipline "one engine passing proves nothing about another" — so pin it on PG
+/// too, via explicit `chunk_by_key` (PG does not auto-keyset). Same discriminator:
+/// the running row TOTAL is 800 → 800 → 1200, never 2000.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn keyset_checkpoint_resume_pg_second_run_captures_only_new_keys() {
+    require_alive(LiveService::Postgres);
+
+    let table = unique_name("pg_keyset_ckpt");
+    struct PgDropTable(String);
+    impl Drop for PgDropTable {
+        fn drop(&mut self) {
+            if let Ok(mut c) = postgres::Client::connect(POSTGRES_URL, postgres::NoTls) {
+                let _ = c.execute(&format!("DROP TABLE IF EXISTS {}", self.0), &[]);
+            }
+        }
+    }
+    let _guard = PgDropTable(table.clone());
+
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {table} (uid TEXT PRIMARY KEY, payload INT NOT NULL);
+         INSERT INTO {table} (uid, payload)
+         SELECT 'id-' || LPAD(g::text, 6, '0'), g FROM generate_series(1, 800) g;"
+    ))
+    .unwrap();
+
+    let export = unique_name("pg_keyset_ckpt_exp");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "source:\n  type: postgres\n  url: \"{POSTGRES_URL}\"\nexports:\n  - name: {export}\n    \
+         table: public.{table}\n    mode: chunked\n    chunk_by_key: uid\n    chunk_checkpoint: true\n    \
+         chunk_size: 300\n    format: parquet\n    destination:\n      type: local\n      path: {out}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    let run = |label: &str| {
+        let out = run_rivet_export(&cfg, &export);
+        assert!(
+            out.status.success(),
+            "{label} failed; stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+
+    run("run 1");
+    assert_eq!(read_uid_set(out_dir.path()).0, 800, "run 1 exports all 800");
+
+    run("run 2 (unchanged)");
+    assert_eq!(
+        read_uid_set(out_dir.path()).0,
+        800,
+        "unchanged resume adds zero rows — a re-read would double it"
+    );
+
+    c.batch_execute(&format!(
+        "INSERT INTO {table} (uid, payload) \
+         SELECT 'id-' || LPAD(g::text, 6, '0'), g FROM generate_series(801, 1200) g;"
+    ))
+    .unwrap();
+    run("run 3 (after insert)");
+    let (count3, keys3) = read_uid_set(out_dir.path());
+    assert_eq!(
+        count3, 1200,
+        "resume adds ONLY the 400 new keys (got {count3}); 2000 would mean a full re-read"
+    );
+    let expected: BTreeSet<String> = (1..=1200).map(|n| format!("id-{n:06}")).collect();
+    assert_eq!(
+        keys3, expected,
+        "union of all runs equals the full source key set"
+    );
+}
+
+/// SQL Server twin of the keyset-resume two-run test. Per the "one engine passing
+/// proves nothing about another" resume discipline, pin `chunk_by_key` +
+/// `chunk_checkpoint` resume on MSSQL too. Same running-row-TOTAL discriminator
+/// (1000 → 1000 → 1500, never 2500). Keys are 6-digit zero-padded so lexical
+/// keyset order == numeric order.
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn keyset_checkpoint_resume_mssql_second_run_captures_only_new_keys() {
+    require_alive(LiveService::Mssql);
+
+    let table = unique_name("ms_keyset_ckpt");
+    struct MsDrop(String);
+    impl Drop for MsDrop {
+        fn drop(&mut self) {
+            mssql_drop_table(&self.0);
+        }
+    }
+    let _guard = MsDrop(format!("dbo.{table}"));
+
+    mssql_exec(&format!(
+        "CREATE TABLE dbo.{table} (uid VARCHAR(40) NOT NULL PRIMARY KEY, payload INT NOT NULL)"
+    ));
+    let seed = |lo: i64, hi: i64| {
+        mssql_exec(&format!(
+            "INSERT INTO dbo.{table} (uid, payload) \
+             SELECT RIGHT('000000' + CAST(value AS VARCHAR(10)), 6), value \
+             FROM GENERATE_SERIES(CAST({lo} AS BIGINT), CAST({hi} AS BIGINT))"
+        ));
+    };
+    seed(1, 1000);
+
+    let export = unique_name("ms_keyset_ckpt_exp");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "source:\n  type: mssql\n  url: \"{MSSQL_URL}\"\n  tls:\n    accept_invalid_certs: true\n\
+         exports:\n  - name: {export}\n    table: dbo.{table}\n    mode: chunked\n    \
+         chunk_by_key: uid\n    chunk_checkpoint: true\n    chunk_size: 300\n    format: parquet\n    \
+         destination:\n      type: local\n      path: {out}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    let run = |label: &str| {
+        let out = run_rivet_export(&cfg, &export);
+        assert!(
+            out.status.success(),
+            "{label} failed; stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+
+    run("run 1");
+    assert_eq!(
+        read_uid_set(out_dir.path()).0,
+        1000,
+        "run 1 exports all 1000"
+    );
+
+    run("run 2 (unchanged)");
+    assert_eq!(
+        read_uid_set(out_dir.path()).0,
+        1000,
+        "unchanged resume adds zero rows — a re-read would double it"
+    );
+
+    seed(1001, 1500);
+    run("run 3 (after insert)");
+    let (count3, keys3) = read_uid_set(out_dir.path());
+    assert_eq!(
+        count3, 1500,
+        "resume adds ONLY the 500 new keys (got {count3}); 2500 would mean a full re-read"
+    );
+    let expected: BTreeSet<String> = (1..=1500).map(|n| format!("{n:06}")).collect();
+    assert_eq!(
+        keys3, expected,
+        "union of all runs equals the full source key set"
     );
 }
 

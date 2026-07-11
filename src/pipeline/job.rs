@@ -61,6 +61,10 @@ fn build_metric_row(
         destination_type: Some(plan.destination.destination_type.label().to_string()),
         rivet_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         longest_chunk_ms: summary.journal.longest_chunk_ms(),
+        // v12 chunking diagnostics: which key was chunked. (The resolved strategy
+        // is already `mode` = strategy.mode_label.) A sparse-key post-mortem is now
+        // one SELECT: mode + chunk_key (+ chunk_task for span/windows).
+        chunk_key: plan.strategy.chunk_key().map(str::to_string),
     }
 }
 
@@ -1012,6 +1016,7 @@ mod tests {
             destination_type,
             rivet_version,
             longest_chunk_ms,
+            chunk_key,
         } = build_metric_row(&summary, &plan, "safe");
 
         // ── core (v1) ──
@@ -1049,6 +1054,9 @@ mod tests {
         // ── v10: delegated to the journal (pinned to the injected span) ──
         assert_eq!(longest_chunk_ms, Some(640));
         assert_eq!(longest_chunk_ms, summary.journal.longest_chunk_ms());
+        // ── v12: chunking diagnostics — the chunk key column. The plan is a range
+        // Chunked on "id"; the resolved strategy is the `mode` column ("chunked").
+        assert_eq!(chunk_key.as_deref(), Some("id"));
     }
 
     #[test]

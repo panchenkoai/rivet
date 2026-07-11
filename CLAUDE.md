@@ -320,3 +320,37 @@ builder or a `*_run`/`cdc_run` command wrapper instead of a `Rig::<engine>_*`
 constructor is incomplete** — the review asks for the rig constructor. The rig
 is the seam; per-file config builders are the ~250 templates it replaced coming
 back one engine at a time.
+
+## A sparse chunk key is a silent 100× slowdown — warn at run start, not info
+
+`chunk_size` in range chunking divides the **key span** `(min..max)/chunk_size`,
+NOT the row count. On a sparse / huge / gappy key the window count explodes far
+past what the rows justify — a real 520 k-row MySQL table over an SSM tunnel took
+**31 min** because `id` spanned 950 M→1.29 B: `342.7 M / 100 000 = 3428` near-
+empty BETWEEN windows, each a separate source query paying the tunnel round-trip
+(~152 real rows/window). Nothing was wrong with capture; the plan was pathological
+and **rivet said nothing the user could see**. The density diagnostic existed
+(`detect.rs::log_chunk_sparsity_at_run`) but logged at **`info`** (invisible at
+default level), and for **MySQL it was skipped entirely** — `TABLE_ROWS` is too
+unreliable, so `row_estimate` is `None` and the whole sparsity check fell through
+to an info-level "skipped". The one engine most likely to hit it got the least
+warning.
+
+The fix (`detect.rs::sparse_chunk_warning`, pure + unit-tested): a **`warn`**-level,
+actionable headline emitted right after chunk generation, **before** the windows
+execute, naming the escape (`chunk_dense: true` / `chunk_count: N` / `mode: full`).
+Two regimes because only some engines have a scan-free row count: **with** an
+estimate (PG/MSSQL `reltuples` / `dm_db_partition_stats`) flag a ≥4× blow-up over
+the dense window count; **without** one (MySQL, curated query) flag only an
+egregious absolute count (≥1000), hedged on "if the key is sparse". This is cheap
+to detect — min/max on the PK is a single index-boundary seek per side (MySQL
+"optimized away", PG index InitPlan), and the range path issues **no** `COUNT(*)`
+— so the warning genuinely fires within the first round-trips, not after the run.
+
+Process rule: **any run-start diagnostic that tells the user their config will be
+slow must be `warn`, not `info`** (default log level hides `info`, so an
+info-level "this will be slow" is functionally silent), **and must degrade to a
+count-only heuristic on engines with no trustworthy scan-free row estimate**
+rather than skipping — the engine with the weakest catalog stats (MySQL) is
+exactly where the pathology is least visible. A sparsity/cost check gated behind
+`row_estimate.is_some()` is a check that abandons the user who needs it most.
