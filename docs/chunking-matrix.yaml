@@ -27,7 +27,7 @@ scenarios:
     what: "chunked + no chunk_column → auto-keyset on a single-column non-int unique/PK key"
     postgres: { na: "PG refuses auto-keyset for non-int PK by design (ADR-0020); mode:full or explicit chunk_by_key" }
     mysql:    { test: keyset_varchar_pk_roundtrips_full_keyset_across_pages }
-    mssql:    { gap: "no auto-keyset run test on MSSQL non-int PK" }
+    mssql:    { na: "auto-keyset is MySQL-only (OPT-4/ADR-0020); MSSQL non-int PK needs explicit chunk_by_key or mode:full, like PG" }
     mongo:    { test: mongo_batch_keyset_no_loss_or_dup }
 
   - id: keyset_explicit_chunk_by_key
@@ -61,7 +61,7 @@ scenarios:
 
   - id: range_chunk_size_memory_mb
     what: "chunk_size_memory_mb derives the row-count chunk_size from a byte budget"
-    postgres: { gap: "chunk_size_memory_mb runtime test only exists for MySQL/MSSQL" }
+    postgres: { test: stand_chunk_size_memory_mb_postgres }
     mysql:    { test: mysql_chunk_size_memory_mb_derives_chunk_size }
     mssql:    { test: mssql_chunk_size_memory_mb_derives_chunk_size }
     mongo:    { na: "no byte-budget chunking on Mongo" }
@@ -69,8 +69,8 @@ scenarios:
   - id: range_sparse_gappy_key
     what: "range chunk over a sparse/gappy integer key: empty middle windows do not lose or false-fail"
     postgres: { test: gremlin_chunked_empty_middle_chunk_does_not_false_fire_row_count_min }
-    mysql:    { gap: "no sparse/gappy-key range run test on MySQL" }
-    mssql:    { gap: "no sparse/gappy-key range run test on MSSQL" }
+    mysql:    { test: stand_range_gappy_mysql }
+    mssql:    { test: stand_range_gappy_mssql }
     mongo:    { na: "Mongo pages _id; no BETWEEN-over-span shape" }
 
   - id: range_crash_resume_checkpoint

@@ -19,6 +19,23 @@
 use crate::common::*;
 
 use mysql::prelude::Queryable;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+/// Total rows across every parquet part under `dir` — for "no row loss" asserts.
+fn count_parquet_rows(dir: &std::path::Path) -> usize {
+    let mut n = 0;
+    for path in files_with_extension(dir, "parquet") {
+        let bytes = std::fs::read(&path).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+            .unwrap()
+            .build()
+            .unwrap();
+        for batch in reader {
+            n += batch.unwrap().num_rows();
+        }
+    }
+    n
+}
 
 /// The three SQL engines the stand runs a scenario across. (Mongo pages `_id`
 /// and has no BETWEEN-over-span shape, so the sparse guard is n/a there.)
@@ -356,6 +373,109 @@ fn run_keyset_non_usable_bail(eng: Eng) {
     );
 }
 
+/// Seed a GAPPY-but-not-egregious key: two clusters (id 1..50 and 1001..1050)
+/// with a large empty gap between them, 100 rows total. Range chunking at
+/// chunk_size 100 → ~11 windows (span 1..1050), several of them EMPTY (in the
+/// gap) — below the sparse-guard floor so it runs, exercising the empty-window
+/// path. No row may be lost at an empty window boundary.
+fn seed_gappy(eng: Eng) -> (String, StandCleanup) {
+    let table = unique_name("stand_gappy");
+    let guard = StandCleanup(eng, table.clone());
+    // id = g for g<=50, else 950+g (so 51..100 → 1001..1050).
+    match eng {
+        Eng::Pg => {
+            let mut c = pg_connect();
+            c.batch_execute(&format!(
+                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL);
+                 INSERT INTO {table} (id, payload)
+                 SELECT CASE WHEN g <= 50 THEN g ELSE 950 + g END, g
+                 FROM generate_series(1, 100) g;
+                 ANALYZE {table};"
+            ))
+            .unwrap();
+        }
+        Eng::My => {
+            let mut c = mysql_connect();
+            c.query_drop(format!(
+                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL)"
+            ))
+            .unwrap();
+            c.query_drop(format!(
+                "INSERT INTO {table} (id, payload) \
+                 WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < 100) \
+                 SELECT IF(n <= 50, n, 950 + n), n FROM seq"
+            ))
+            .unwrap();
+        }
+        Eng::Ms => {
+            mssql_exec(&format!(
+                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL)"
+            ));
+            mssql_exec(&format!(
+                "INSERT INTO {table} (id, payload) \
+                 SELECT IIF(value <= 50, value, 950 + value), value \
+                 FROM GENERATE_SERIES(CAST(1 AS BIGINT), CAST(100 AS BIGINT))"
+            ));
+            mssql_exec(&format!("UPDATE STATISTICS {table}"));
+        }
+    }
+    (table, guard)
+}
+
+/// Range chunk over a gappy key: empty middle windows must not lose rows and must
+/// not false-fail. The run completes and all 100 rows reach the destination.
+fn run_range_gappy(eng: Eng) {
+    eng.require();
+    let (table, _guard) = seed_gappy(eng);
+    let rig = eng
+        .rig(&table)
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 100");
+    let cfg = rig.config_path();
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+    assert!(
+        out.status.success(),
+        "gappy-key range must complete (below the sparse floor); stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        count_parquet_rows(&rig.out_dir()),
+        100,
+        "all 100 rows must survive the empty middle windows"
+    );
+}
+
+/// `chunk_size_memory_mb` derives the row-count chunk_size from a byte budget
+/// (needs the introspected avg_row_bytes). The run completes with all rows.
+fn run_chunk_size_memory_mb(eng: Eng) {
+    eng.require();
+    let (table, _guard) = seed_dense(eng, 4000);
+    let rig = eng
+        .rig(&table)
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size_memory_mb: 1");
+    let cfg = rig.config_path();
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+    assert!(
+        out.status.success(),
+        "chunk_size_memory_mb run must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        count_parquet_rows(&rig.out_dir()),
+        4000,
+        "the byte-budget-derived chunk plan must export every row"
+    );
+}
+
 /// The stand body: seed sparse, run a range plan (`chunk_column: id`,
 /// `chunk_size` small enough to blow the span into many windows), assert the
 /// engine's expected outcome. PG/MSSQL PROVE sparseness from a scan-free estimate
@@ -507,4 +627,22 @@ fn stand_keyset_non_usable_bail_postgres() {
 #[ignore = "live: requires docker compose up -d mysql"]
 fn stand_keyset_non_usable_bail_mysql() {
     run_keyset_non_usable_bail(Eng::My);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_range_gappy_mysql() {
+    run_range_gappy(Eng::My);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_range_gappy_mssql() {
+    run_range_gappy(Eng::Ms);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn stand_chunk_size_memory_mb_postgres() {
+    run_chunk_size_memory_mb(Eng::Pg);
 }
