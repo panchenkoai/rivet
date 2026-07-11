@@ -26,7 +26,7 @@ scenarios:
     postgres: { test: crash_after_source_read_leaves_state_completely_clean }
     mysql:    { test: mysql_crash_after_source_read_leaves_state_completely_clean }
     mssql:    { test: mssql_crash_after_source_read_leaves_state_completely_clean }
-    mongo:    { gap: "no Mongo batch crash-after-source-read test; the other three engines each have one, no NA rationale documented" }
+    mongo:    { na: "after_source_read fires only in src/pipeline/single.rs; the Mongo batch export runs the keyset path (mongo_parallel), whose crash boundaries are the shared pipeline::commit hooks (after_file_write / after_manifest_update, tested below) — it has no single.rs source-read boundary" }
 
   - id: batch_crash_after_file_write
     what: "crash after the part file, before the manifest → file present, no manifest/cursor, recoverable"
@@ -77,7 +77,7 @@ scenarios:
     postgres: { test: roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts }
     mysql:    { test: mysql_full_mode_repeated_run_accumulates_manifest_entries }
     mssql:    { test: mssql_full_mode_repeated_run_accumulates_manifest_entries }
-    mongo:    { gap: "no Mongo batch-mode two-runs-into-same-prefix test (Mongo batch uses the millisecond-stamped mongo_parallel path — should be immune, but unproven)" }
+    mongo:    { test: mongo_batch_two_rapid_runs_into_same_prefix_do_not_clobber }
 
   - id: part_name_no_clobber_keyset_checkpoint
     what: "keyset/chunk-checkpoint resume: second run captures only new keys, prior parts survive (ms-stamped, run-unique)"

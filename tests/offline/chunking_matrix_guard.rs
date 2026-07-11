@@ -41,9 +41,10 @@ const MATRICES: &[(&str, usize)] = &[
     // MSSQL, until_current-terminates-under-load on the three SQL engines) are now
     // filled — every cell is a test or a justified n/a.
     ("docs/cdc-matrix.yaml", 0),
-    // Resilience / crash-recovery (BATCH + cross-cutting). 2 Mongo holes: batch
-    // crash-after-source-read + batch two-runs-no-clobber.
-    ("docs/resilience-matrix.yaml", 2),
+    // Resilience / crash-recovery (BATCH + cross-cutting). Both Mongo holes closed:
+    // batch-clobber filled with a live test; crash-after-source-read is na (that
+    // hook is single.rs-only, and Mongo runs the keyset path).
+    ("docs/resilience-matrix.yaml", 0),
     // Warehouse-load — the Parquet→warehouse-autoload axis, keyed on the 4
     // ExportTarget variants (duckdb/bigquery/snowflake/clickhouse), not source
     // engines. Caught + fixed 3 resolver bugs (SF/DuckDB/CH decimal ceilings). 0

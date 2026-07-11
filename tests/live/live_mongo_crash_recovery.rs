@@ -57,3 +57,35 @@ fn mongo_crash_after_file_write_recovers_without_loss() {
 fn mongo_crash_after_manifest_update_recovers_without_loss() {
     crash_then_recover_is_lossless("after_manifest_update", "crash_amu");
 }
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn mongo_batch_two_rapid_runs_into_same_prefix_do_not_clobber() {
+    // Run-uniqueness for the Mongo batch path (mongo_parallel.rs millisecond part
+    // stamp). Two rapid full runs into one prefix — no sleep — must EACH
+    // materialise their files; the later must not silently overwrite the earlier
+    // (LocalDestination idempotent_overwrite). The batch-mode twin of the SQL
+    // full_mode_repeated_run tests and the CDC roast_second_run clobber test.
+    require_alive(LiveService::Mongo);
+    let db = unique_name("mongo_clobber");
+    MongoTest::connect(PORT, &db).seed_int_id("t", 100);
+    let rig = Rig::mongo_batch("t")
+        .source_url(&MongoTest::url(PORT, &db))
+        .mongo("page_size: 50");
+
+    rig.run_ok();
+    rig.run_ok(); // rapid second run into the SAME prefix, no sleep
+
+    // Two full snapshots of 100 rows → 200 physical rows if neither run clobbered
+    // the other, and every source _id is still present.
+    assert_eq!(
+        total_parquet_rows(&rig.out_dir()),
+        200,
+        "two rapid full runs must each materialise all 100 rows — no clobber"
+    );
+    assert_eq!(
+        dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
+        100,
+        "both snapshots hold every source _id"
+    );
+}
