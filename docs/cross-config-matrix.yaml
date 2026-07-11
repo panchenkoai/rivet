@@ -23,14 +23,14 @@ scenarios:
     postgres: { test: gcs_fake_destination_produces_one_parquet_with_all_rows }
     mysql:    { test: stand_dest_gcs_mysql }
     mssql:    { test: stand_dest_gcs_mssql }
-    mongo:    { gap: "no GCS destination test on Mongo" }
+    mongo:    { test: stand_dest_gcs_mongo }
 
   - id: dest_s3
     what: "destination: s3 — MinIO round-trip, all rows"
     postgres: { test: s3_minio_destination_produces_one_parquet_with_all_rows }
     mysql:    { test: stand_dest_s3_mysql }
     mssql:    { test: stand_dest_s3_mssql }
-    mongo:    { gap: "no S3 destination test on Mongo" }
+    mongo:    { test: stand_dest_s3_mongo }
 
   # ── format / compression ──────────────────────────────────────────────────
   - id: format_parquet
@@ -45,14 +45,14 @@ scenarios:
     postgres: { test: postgres_type_matrix_csv_decimal_and_row_count }
     mysql:    { test: mysql_type_matrix_csv_decimal_text_preserved }
     mssql:    { test: stand_format_csv_mssql }
-    mongo:    { gap: "no CSV export test on Mongo" }
+    mongo:    { test: stand_format_csv_mongo }
 
   - id: compression_codecs
     what: "compression: full codec matrix (zstd/snappy/gzip/none) reads back correctly"
     postgres: { test: duckdb_validates_postgres_parquet_compression_codecs }
     mysql:    { test: stand_compression_codecs_mysql }
     mssql:    { test: stand_compression_codecs_mssql }
-    mongo:    { gap: "Mongo exercises the default codec only — no codec-matrix parity test" }
+    mongo:    { test: stand_compression_codecs_mongo }
 
   # ── enrichment / verification / tuning ────────────────────────────────────
   - id: meta_columns

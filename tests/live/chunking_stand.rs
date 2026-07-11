@@ -994,6 +994,150 @@ fn stand_dest_s3_mssql() {
     run_dest_s3(Eng::Ms);
 }
 
+// ── Mongo cross-config (Mongo is not a SQL `Eng`; its config shape differs) ──
+
+const MONGO_PORT: u16 = 27017;
+
+/// Seed a fresh Mongo db with `n` int-`_id` docs; returns the db name.
+fn mongo_seed(n: i64) -> String {
+    let db = unique_name("stand_mg");
+    MongoTest::connect(MONGO_PORT, &db).seed_int_id("c", n);
+    db
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn stand_format_csv_mongo() {
+    require_alive(LiveService::Mongo);
+    let db = mongo_seed(200);
+    let rig = Rig::mongo_batch("c")
+        .source_url(&MongoTest::url(MONGO_PORT, &db))
+        .with_format("csv");
+    let cfg = rig.config_path();
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+    assert!(
+        out.status.success(),
+        "mongo csv run must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let csvs = files_with_extension(&rig.out_dir(), "csv");
+    assert!(!csvs.is_empty(), "mongo csv export must write a .csv");
+    let lines = std::fs::read_to_string(&csvs[0]).unwrap().lines().count();
+    assert!(
+        lines > 100,
+        "mongo csv must have header + rows; got {lines}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn stand_compression_codecs_mongo() {
+    require_alive(LiveService::Mongo);
+    let db = mongo_seed(200);
+    for codec in ["zstd", "snappy", "gzip", "none"] {
+        let rig = Rig::mongo_batch("c")
+            .source_url(&MongoTest::url(MONGO_PORT, &db))
+            .export_line(&format!("compression: {codec}"));
+        let cfg = rig.config_path();
+        let out = run_rivet_env(
+            &["run", "--config", cfg.to_str().unwrap()],
+            &[("RUST_LOG", "warn")],
+        );
+        assert!(
+            out.status.success(),
+            "mongo codec `{codec}` run must succeed; stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            count_parquet_rows(&rig.out_dir()),
+            200,
+            "mongo codec `{codec}` must round-trip all docs"
+        );
+    }
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo fake-gcs"]
+fn stand_dest_gcs_mongo() {
+    require_alive(LiveService::Mongo);
+    require_alive(LiveService::FakeGcs);
+    let db = mongo_seed(100);
+    let url = MongoTest::url(MONGO_PORT, &db);
+    let bucket = "rivet-qa-stand-gcs";
+    ensure_gcs_bucket(bucket);
+    let prefix = unique_name("stand_gcs_mg");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "source:\n  type: mongo\n  url: \"{url}\"\nexports:\n  - name: cg\n    table: c\n    \
+         mode: full\n    format: parquet\n    destination:\n      type: gcs\n      bucket: {bucket}\n      \
+         prefix: {prefix}\n      endpoint: {FAKE_GCS_ENDPOINT}\n      allow_anonymous: true\n"
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+    assert!(
+        out.status.success(),
+        "mongo gcs run failed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        count_gcs_parquet(bucket, &prefix) >= 1,
+        "fake-gcs must hold >=1 parquet under {prefix}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo minio"]
+fn stand_dest_s3_mongo() {
+    require_alive(LiveService::Mongo);
+    require_alive(LiveService::Minio);
+    let db = mongo_seed(100);
+    let url = MongoTest::url(MONGO_PORT, &db);
+    let bucket = "rivet-qa-stand-s3";
+    ensure_minio_bucket(bucket);
+    let prefix = unique_name("stand_s3_mg");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "source:\n  type: mongo\n  url: \"{url}\"\nexports:\n  - name: cs\n    table: c\n    \
+         mode: full\n    format: parquet\n    destination:\n      type: s3\n      bucket: {bucket}\n      \
+         prefix: {prefix}\n      region: us-east-1\n      endpoint: {MINIO_ENDPOINT}\n      \
+         access_key_env: RIVET_TEST_MINIO_AK\n      secret_key_env: RIVET_TEST_MINIO_SK\n"
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[
+            ("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY),
+            ("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY),
+            ("AWS_EC2_METADATA_DISABLED", "true"),
+            ("RUST_LOG", "warn"),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "mongo s3 run failed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let script = format!(
+        "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
+         mc ls --recursive local/{bucket}/{prefix} 2>/dev/null"
+    );
+    let ls = std::process::Command::new("docker")
+        .args(["compose", "exec", "-T", "minio", "sh", "-c", &script])
+        .output()
+        .expect("mc ls");
+    let listing = String::from_utf8_lossy(&ls.stdout);
+    assert!(
+        listing.matches(".parquet").count() >= 1,
+        "minio must hold >=1 parquet under {prefix}; got:\n{listing}"
+    );
+}
+
 #[test]
 #[ignore = "live: requires docker compose up -d mysql"]
 fn stand_compression_codecs_mysql() {
