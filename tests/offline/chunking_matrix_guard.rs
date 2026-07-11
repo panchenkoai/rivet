@@ -20,8 +20,10 @@ use serde::Deserialize;
 /// Admitted-gap ceiling. LOWER this each time a gap flips to a test; never raise
 /// it. 18 at introduction; 14 after null-keyed-bail (×3) + MSSQL keyset-resume;
 /// 12 after chunk_count (MySQL + MSSQL); 7 after chunk_by_days (×3) +
-/// keyset-non-usable (×2); 3 after sparse-gappy (×2) + memory_mb-PG + keyset-auto-MSSQL→na.
-const MAX_GAPS: usize = 3;
+/// keyset-non-usable (×2); 3 after sparse-gappy (×2) + memory_mb-PG + keyset-auto-MSSQL→na;
+/// 1 after small-table-escape (×2 → na, escape verified PG-only). The last gap is
+/// chunk_count on Mongo (needs the Mongo stack, not up in the SQL matrix).
+const MAX_GAPS: usize = 1;
 
 #[derive(Deserialize)]
 struct Matrix {

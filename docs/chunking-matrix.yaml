@@ -141,6 +141,6 @@ scenarios:
   - id: guard_small_table_snapshot_escape
     what: "chunked on a table whose reltuples < chunk_size downgrades to Snapshot (one file), unless an explicit knob pins chunked"
     postgres: { test: roast_small_table_escape_respects_explicit_chunk_checkpoint }
-    mysql:    { gap: "small-table Snapshot-escape guard is PG-only" }
-    mssql:    { gap: "small-table Snapshot-escape guard is PG-only" }
+    mysql:    { na: "escape is PG-only (build.rs step 3, reltuples-based); verified live — a 100-row MySQL table stays mode=chunked" }
+    mssql:    { na: "escape is PG-only; verified live — a 100-row MSSQL table stays mode=chunked" }
     mongo:    { na: "no reltuples-based escape in the Mongo reader" }
