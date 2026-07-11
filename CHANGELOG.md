@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.19.0 — 2026-07-11
+
+### Fixed
+
+- **Sparse-key range chunking no longer silently blows up.** `chunk_size` in range
+  chunking divides the KEY SPAN (`min..max`), not the row count — on a sparse /
+  huge / gappy integer key that explodes into thousands of near-empty windows,
+  each its own source query (a real 520 k-row table over an SSH tunnel took 31 min
+  at 3428 windows). rivet now **refuses** the run where a scan-free row estimate
+  *proves* the blow-up (PostgreSQL / SQL Server) and **warns** where it can only
+  suspect it (MySQL — `information_schema.TABLE_ROWS` is too unreliable to prove),
+  naming the fix in both: `chunk_dense: true`, `chunk_count: N`, or `mode: full`.
+- **SQL Server DATE / DATETIME scalars now render as ISO.** `chunk_by_days` and
+  `mode: time_window` on an MSSQL DATE key failed the run — the `min`/`max` scalar
+  came back as the driver's Debug representation, which the date parser could not
+  read.
+
+### Added
+
+- **`rivet init` scaffolds keyset (`chunk_by_key`) for single-column-PK tables**
+  instead of range `chunk_column`. Keyset pages by rows
+  (`WHERE pk > last ORDER BY pk LIMIT n`) and is immune to a sparse / huge / gappy
+  key. No PK (or a composite PK) → range chunking as before.
+- **SQL keyset is now resumable via `chunk_checkpoint: true`** — it persists the
+  last committed key and resumes there (crash recovery + incremental-by-key), the
+  engine-agnostic mechanism previously reachable only for MongoDB. The
+  immune-*and*-resumable shape for a large key over a flaky link.
+- **Post-mortem telemetry:** `export_metrics.chunk_key` records which column a run
+  chunked on (the span / window count remain derivable from `chunk_task`).
+
+### Internal
+
+- Engine-agnostic chunking + behaviour coverage matrices
+  (`docs/chunking-matrix.yaml`, `docs/behaviour-matrix.yaml`) driven by a live
+  scenario stand, with a drift-guard that fails CI on an uncovered scenario cell.
+
 ## 0.18.0 — 2026-07-09
 
 ### Added
