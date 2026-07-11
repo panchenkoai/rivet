@@ -830,6 +830,47 @@ fn run_environment_profile(eng: Eng) {
     );
 }
 
+/// `compression:` codec matrix — every codec (zstd/snappy/gzip/none) writes a
+/// parquet that reads back with all rows. The Arrow reader decompresses each
+/// codec natively, so this needs no external reader.
+fn run_codec_matrix(eng: Eng) {
+    eng.require();
+    let (table, _guard) = seed_dense(eng, 200);
+    for codec in ["zstd", "snappy", "gzip", "none"] {
+        let rig = eng
+            .rig(&table)
+            .mode("full")
+            .export_line(&format!("compression: {codec}"));
+        let cfg = rig.config_path();
+        let out = run_rivet_env(
+            &["run", "--config", cfg.to_str().unwrap()],
+            &[("RUST_LOG", "warn")],
+        );
+        assert!(
+            out.status.success(),
+            "codec `{codec}` run must succeed; stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            count_parquet_rows(&rig.out_dir()),
+            200,
+            "codec `{codec}` must round-trip all rows"
+        );
+    }
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_compression_codecs_mysql() {
+    run_codec_matrix(Eng::My);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_compression_codecs_mssql() {
+    run_codec_matrix(Eng::Ms);
+}
+
 #[test]
 #[ignore = "live: requires docker compose up -d mysql"]
 fn stand_environment_profile_mysql() {

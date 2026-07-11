@@ -50,8 +50,8 @@ scenarios:
   - id: compression_codecs
     what: "compression: full codec matrix (zstd/snappy/gzip/none) reads back correctly"
     postgres: { test: duckdb_validates_postgres_parquet_compression_codecs }
-    mysql:    { gap: "MySQL exercises zstd only — no codec-matrix parity test" }
-    mssql:    { gap: "MSSQL exercises zstd only — no codec-matrix parity test" }
+    mysql:    { test: stand_compression_codecs_mysql }
+    mssql:    { test: stand_compression_codecs_mssql }
     mongo:    { gap: "Mongo exercises the default codec only — no codec-matrix parity test" }
 
   # ── enrichment / verification / tuning ────────────────────────────────────
