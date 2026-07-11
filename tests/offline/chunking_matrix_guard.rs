@@ -34,6 +34,10 @@ const MATRICES: &[(&str, usize)] = &[
     // Cross config × db: 15 honest holes on the non-PG engines (cloud dests, codec
     // parity, csv, tuning profile) — visible + un-growable; fill by writing the test.
     ("docs/cross-config-matrix.yaml", 0),
+    // CDC — the most engine-divergent surface (12 scenarios × 4 engines). Complements
+    // tests/cdc_conformance_gate.rs. 5 honest holes it surfaced: schema-drift on PG +
+    // MSSQL, and dedicated until_current-terminates-under-load on the three SQL engines.
+    ("docs/cdc-matrix.yaml", 5),
 ];
 
 #[derive(Deserialize)]

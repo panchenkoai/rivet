@@ -1,0 +1,100 @@
+# CDC (change-data-capture) coverage matrix — the most engine-divergent, correctness-
+# critical surface. Each engine captures by a different mechanism: PostgreSQL logical
+# replication SLOT, MySQL BINLOG, SQL Server fn_cdc_get_all_changes (from-LSN), MongoDB
+# change streams (db.watch + resume token). Same shape + drift-guard as the other
+# matrices. Cell = { test } | { gap } | { na }.
+#
+# COMPLEMENTS tests/cdc_conformance_gate.rs — that offline gate is the authoritative
+# per-(engine × conformance-case) ledger with its own drift-guard; this file is the
+# human-readable per-scenario view, and it surfaces holes the gate's "anchored once on
+# MySQL" NA rows can obscure (schema-drift PG/MSSQL, until_current-under-load on SQL).
+#
+# CDC live tests need the `cdc` docker profile (postgres-cdc:5434 / mysql-cdc:3307 /
+# mssql-cdc:1434 / mongo-rs): `docker compose --profile cdc up -d`.
+
+engines: [postgres, mysql, mssql, mongo]
+
+scenarios:
+  - id: cdc_initial_snapshot_then_stream
+    what: "initial: snapshot covers pre-existing rows, then streams live changes"
+    postgres: { test: pg_cdc_initial_snapshot_covers_preexisting_rows_then_streams }
+    mysql:    { test: cdc_initial_snapshot_covers_preexisting_rows_then_streams }
+    mssql:    { test: mssql_cdc_initial_snapshot_covers_preexisting_rows_then_streams }
+    mongo:    { test: mongo_cdc_initial_snapshot_covers_preexisting_rows }
+
+  - id: cdc_insert_capture
+    what: "an INSERT is captured (op sequence / after-image)"
+    postgres: { test: streams_insert_update_delete }
+    mysql:    { test: streams_typed_insert_update_delete }
+    mssql:    { test: streams_change_operations }
+    mongo:    { test: mongo_cdc_capture_resume_and_until_current_drain }
+
+  - id: cdc_update_capture
+    what: "an UPDATE is captured with the full after-image (and before, where relevant)"
+    postgres: { test: pg_cdc_update_and_delete_carry_full_types }
+    mysql:    { test: cdc_update_and_delete_carry_full_types }
+    mssql:    { test: mssql_cdc_update_and_delete_carry_full_types }
+    mongo:    { test: mongo_cdc_update_and_delete_carry_document }
+
+  - id: cdc_delete_capture
+    what: "a DELETE is captured with its before-image (not an empty after)"
+    postgres: { test: pg_cdc_update_and_delete_carry_full_types }
+    mysql:    { test: cdc_update_and_delete_carry_full_types }
+    mssql:    { test: mssql_cdc_update_and_delete_carry_full_types }
+    mongo:    { test: mongo_cdc_update_and_delete_carry_document }
+
+  - id: cdc_resume_only_new_changes
+    what: "resume from the per-engine anchor (slot advance / binlog ckpt / from-LSN / resume token) — 2nd run captures ONLY new changes"
+    postgres: { test: pg_cdc_resume_captures_only_new_changes }
+    mysql:    { test: cdc_resume_captures_only_new_changes }
+    mssql:    { test: mssql_cdc_resume_captures_only_new_changes }
+    mongo:    { test: mongo_cdc_capture_resume_and_until_current_drain }
+
+  - id: cdc_resume_idle_first_run
+    what: "idle first run captures 0 → change → next run captures it (no re-anchor to current)"
+    postgres: { test: pg_cdc_idle_first_run_then_change_is_captured_not_skipped }
+    mysql:    { test: cdc_idle_first_run_then_change_is_captured_not_skipped }
+    mssql:    { test: mssql_cdc_idle_first_run_then_change_is_captured_not_skipped }
+    mongo:    { test: mongo_cdc_idle_first_run_then_change_is_captured }
+
+  - id: cdc_crash_at_least_once
+    what: "crash before checkpoint/ack (cdc_after_flush_before_ack hook) → re-read on resume, never lose"
+    postgres: { test: pg_cdc_crash_after_flush_before_ack_does_not_advance_the_slot }
+    mysql:    { test: cdc_crash_after_flush_before_ack_re_reads_on_resume }
+    mssql:    { test: mssql_cdc_crash_before_checkpoint_re_reads_on_resume }
+    mongo:    { test: mongo_cdc_crash_after_flush_before_ack_re_reads_on_resume }
+
+  - id: cdc_schema_drift
+    what: "a column added / renamed mid-stream is handled (re-resolve schema, map by name)"
+    postgres: { gap: "no PG mid-stream ADD/RENAME COLUMN CDC test — the pgoutput/test_decoding column-add path is never exercised live" }
+    mysql:    { test: cdc_picks_up_a_column_added_between_runs }
+    mssql:    { gap: "no MSSQL schema-drift CDC test — a column add needs a NEW capture instance, and CDC keeps reading the old shape: a correctness cliff with zero coverage" }
+    mongo:    { na: "schemaless — a new field rides the verbatim document blob; no fixed per-collection schema to drift" }
+
+  - id: cdc_whole_db_multiplex
+    what: "one stream over many tables/collections, one anchor, resumes"
+    postgres: { test: pg_cdc_multi_table_stream_uses_one_slot_and_resumes }
+    mysql:    { test: cdc_multi_table_stream_one_binlog_connection_and_resumes }
+    mssql:    { na: "MSSQL CDC is one capture instance per stream; config validation rejects `tables:` — mixed-txn routing covered by mssql_cdc_mixed_transaction_and_qualified_table_conformance" }
+    mongo:    { na: "db.watch() is inherently a single whole-database stream; multi-collection routing is structural (mongo_cdc_mixed_transaction_ending_on_uncaptured_table)" }
+
+  - id: cdc_seq_total_order
+    what: "__seq gives a total change order (shared commit position + intra-txn tiebreak) for correct current-state dedup"
+    postgres: { test: pg_cdc_intra_transaction_updates_get_distinct_seq }
+    mysql:    { test: cdc_intra_transaction_updates_get_distinct_seq }
+    mssql:    { test: mssql_cdc_intra_transaction_updates_get_distinct_seq }
+    mongo:    { na: "every change-stream event carries a distinct order-preserving resume token, so __seq is always 0; total order is __pos alone (mongo_cdc_soak_dedup_matches_source_current_state)" }
+
+  - id: cdc_until_current_bounded
+    what: "until_current: true — a bounded run TERMINATES when caught up, even under sustained concurrent writes"
+    postgres: { gap: "until_current bounded-exit is only asserted transitively (every cfg uses it); no dedicated terminates-under-sustained-writes test on PG" }
+    mysql:    { gap: "until_current bounded-exit is only transitive on MySQL; no dedicated stop-under-load test" }
+    mssql:    { gap: "until_current bounded-exit is only transitive on MSSQL; no dedicated stop-under-load test" }
+    mongo:    { test: roast_until_current_terminates_under_sustained_writes_and_keeps_backlog }
+
+  - id: cdc_type_fidelity
+    what: "values captured through CDC match the batch export (timestamps/decimals/uuid/json)"
+    postgres: { test: pg_cdc_full_type_matrix_matches_batch }
+    mysql:    { test: cdc_full_type_matrix_matches_batch }
+    mssql:    { test: mssql_cdc_full_type_matrix_matches_batch }
+    mongo:    { na: "CDC and batch share the identical document_to_json serializer, so no per-op typing can diverge them — pinned once on the batch side (mongo_batch_type_fidelity_document_is_verbatim_extjson)" }
