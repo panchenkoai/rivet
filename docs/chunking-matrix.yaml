@@ -1,0 +1,146 @@
+# Chunking behaviour coverage matrix — SINGLE SOURCE of what the chunking planner
+# (src/plan/build.rs::resolve_chunked_strategy + src/pipeline/chunked/detect.rs)
+# must do, per engine, mapped to the test that FIXES it.
+#
+# Rows = a chunking scenario (strategy or guard × table shape). Columns = engine.
+# Each cell is exactly one of:
+#   { test: <fn_name> }   a live/unit test fn that pins this cell (guard greps for `fn <name>`)
+#   { gap:  "<why>"   }   an ADMITTED hole — allowed, but counted and ratcheted (no NEW gaps)
+#   { na:   "<why>"   }   not applicable to this engine by design (not counted)
+#
+# The drift-guard (tests/offline/chunking_matrix_guard.rs) fails if:
+#   (a) a mapped `test:` fn no longer exists anywhere under tests/ or src/  (renamed/deleted),
+#   (b) the number of `gap:` cells exceeds the ratchet baseline in the guard,
+#   (c) a scenario is missing a cell for any listed engine.
+# Fill a gap: write the test, then replace `gap:` with `test:` and lower the baseline.
+#
+# This file exists because the sparse-key footgun (range chunking divides the KEY
+# SPAN, not the row count → 3428 near-empty windows on a 520k/343M-span table →
+# 31 min over a tunnel) shipped with ZERO engine-level test coverage of its guard.
+# The empty cell is now a red CI, not a production surprise.
+
+engines: [postgres, mysql, mssql, mongo]
+
+scenarios:
+  # ── keyset (seek) pagination ──────────────────────────────────────────────
+  - id: keyset_auto_non_int_pk
+    what: "chunked + no chunk_column → auto-keyset on a single-column non-int unique/PK key"
+    postgres: { na: "PG refuses auto-keyset for non-int PK by design (ADR-0020); mode:full or explicit chunk_by_key" }
+    mysql:    { test: keyset_varchar_pk_roundtrips_full_keyset_across_pages }
+    mssql:    { gap: "no auto-keyset run test on MSSQL non-int PK" }
+    mongo:    { test: mongo_batch_keyset_no_loss_or_dup }
+
+  - id: keyset_explicit_chunk_by_key
+    what: "explicit chunk_by_key: pages by an index-backed unique key (any orderable type)"
+    postgres: { test: keyset_pg_uuid_pk_via_explicit_chunk_by_key_roundtrips_full_set }
+    mysql:    { na: "auto-keyset path already covers MySQL non-int PK; explicit == same plan" }
+    mssql:    { test: mssql_keyset_on_non_pk_unique_index }
+    mongo:    { na: "Mongo always pages by _id; there is no user chunk_by_key knob" }
+
+  - id: keyset_resume_two_run
+    what: "keyset + chunk_checkpoint: persist max key, a re-run captures ONLY new keys (run→unchanged=0→insert→resume)"
+    postgres: { test: keyset_checkpoint_resume_pg_second_run_captures_only_new_keys }
+    mysql:    { test: keyset_checkpoint_resume_second_run_captures_only_new_keys }
+    mssql:    { gap: "no keyset checkpoint two-run test on MSSQL — only range-chunk resume exists" }
+    mongo:    { test: mongo_batch_resume_reads_only_new_since_last_run }
+
+  - id: keyset_init_generates_for_pk
+    what: "rivet init on a single-column-PK table scaffolds chunk_by_key (keyset), not range chunk_column"
+    postgres: { test: generate_config_chunked_single_pk_uses_keyset }
+    mysql:    { test: generate_config_chunked_single_pk_uses_keyset }
+    mssql:    { test: generate_config_chunked_single_pk_uses_keyset }
+    mongo:    { na: "Mongo init scaffolds a collection scan, not a SQL keyset key" }
+
+  # ── range chunking (WHERE key BETWEEN a AND b) ────────────────────────────
+  - id: range_auto_single_int_pk
+    what: "chunked + table: shortcut, no chunk_column → auto range-chunk on the single-integer PK"
+    postgres: { test: plan_and_apply_chunked_export_round_trip_uses_precomputed_ranges }
+    mysql:    { test: mysql_chunked_auto_resolves_chunk_column_from_pk }
+    mssql:    { test: mssql_chunked_auto_resolves_chunk_column_from_pk }
+    mongo:    { test: mongo_batch_parallel_integer_id_no_loss_or_dup }
+
+  - id: range_chunk_size_memory_mb
+    what: "chunk_size_memory_mb derives the row-count chunk_size from a byte budget"
+    postgres: { gap: "chunk_size_memory_mb runtime test only exists for MySQL/MSSQL" }
+    mysql:    { test: mysql_chunk_size_memory_mb_derives_chunk_size }
+    mssql:    { test: mssql_chunk_size_memory_mb_derives_chunk_size }
+    mongo:    { na: "no byte-budget chunking on Mongo" }
+
+  - id: range_sparse_gappy_key
+    what: "range chunk over a sparse/gappy integer key: empty middle windows do not lose or false-fail"
+    postgres: { test: gremlin_chunked_empty_middle_chunk_does_not_false_fire_row_count_min }
+    mysql:    { gap: "no sparse/gappy-key range run test on MySQL" }
+    mssql:    { gap: "no sparse/gappy-key range run test on MSSQL" }
+    mongo:    { na: "Mongo pages _id; no BETWEEN-over-span shape" }
+
+  - id: range_crash_resume_checkpoint
+    what: "range chunk + chunk_checkpoint: a crash mid-run resumes and re-runs the interrupted chunk at-least-once"
+    postgres: { test: chunked_crash_after_chunk_file_before_commit_resume_reruns_chunk_atleastonce }
+    mysql:    { test: mysql_chunked_crash_after_chunk_file_before_commit_resume_reruns_chunk_atleastonce }
+    mssql:    { test: mssql_chunked_crash_after_chunk_file_before_commit_resume_reruns_chunk_atleastonce }
+    mongo:    { test: mongo_crash_after_file_write_recovers_without_loss }
+
+  # ── other strategies ──────────────────────────────────────────────────────
+  - id: dense_chunk_dense
+    what: "chunk_dense: ROW_NUMBER windows on a non-unique chunk column (null-safe, tie-safe)"
+    postgres: { test: dense_ties_pg_sequential_no_loss_no_dup }
+    mysql:    { test: dense_ties_mysql_sequential_no_loss_no_dup }
+    mssql:    { test: dense_ties_mssql_sequential_no_loss_no_dup }
+    mongo:    { na: "no ROW_NUMBER / dense concept in the Mongo reader" }
+
+  - id: chunk_count_n
+    what: "chunk_count: N divides the key range into exactly N windows"
+    postgres: { test: roast_small_table_escape_respects_explicit_chunk_count }
+    mysql:    { gap: "no chunk_count runtime test on MySQL" }
+    mssql:    { gap: "no chunk_count runtime test on MSSQL" }
+    mongo:    { gap: "no chunk_count/parallel-N assertion on Mongo _id-range" }
+
+  - id: chunk_by_days
+    what: "chunk_by_days: date-window chunking on a date/timestamp key"
+    postgres: { gap: "chunk_by_days has no live test on any engine (only time_window MODE + offline SQL goldens)" }
+    mysql:    { gap: "chunk_by_days has no live test on MySQL" }
+    mssql:    { gap: "chunk_by_days has no live test on MSSQL" }
+    mongo:    { na: "no date-window chunking on Mongo" }
+
+  - id: snapshot_full
+    what: "mode: full — one bounded cursor, one file, re-read each run"
+    postgres: { test: full_mode_repeated_run_accumulates_manifest_entries }
+    mysql:    { test: mysql_full_mode_repeated_run_accumulates_manifest_entries }
+    mssql:    { test: mssql_full_mode_repeated_run_accumulates_manifest_entries }
+    mongo:    { test: mongo_batch_type_fidelity_document_is_verbatim_extjson }
+
+  - id: incremental_cursor
+    what: "mode: incremental — WHERE cursor > last_value, re-run picks up only new rows"
+    postgres: { test: incremental_third_run_picks_up_newly_inserted_rows }
+    mysql:    { test: mysql_incremental_third_run_picks_up_newly_inserted_rows }
+    mssql:    { test: mssql_incremental_third_run_picks_up_newly_inserted_rows }
+    mongo:    { na: "Mongo has no SQL cursor-column incremental; keyset resume fills this role" }
+
+  # ── guards / refusals ─────────────────────────────────────────────────────
+  - id: guard_sparse_bail_warn
+    what: "range on a PROVEN sparse key → bail (PG/MSSQL estimate) / warn (MySQL, unprovable) — the footgun guard"
+    postgres: { test: stand_sparse_guard_postgres }
+    mysql:    { test: stand_sparse_guard_mysql }
+    mssql:    { test: stand_sparse_guard_mssql }
+    mongo:    { na: "Mongo pages _id; the BSON hetero/NaN guard is a separate family" }
+
+  - id: guard_null_keyed_range_bail
+    what: "range/date chunk over a nullable key with actual NULLs → bail (BETWEEN would silently drop NULL rows)"
+    postgres: { gap: "bail_if_null_keyed has no live test — unit-only in detect.rs" }
+    mysql:    { gap: "bail_if_null_keyed has no live test on MySQL — unit-only" }
+    mssql:    { gap: "bail_if_null_keyed has no live test on MSSQL — unit-only" }
+    mongo:    { na: "no BETWEEN key predicate on Mongo" }
+
+  - id: guard_keyset_non_usable_key_bail
+    what: "chunk_by_key on a non-unique / nullable / heterogeneous key → loud refusal, not a filesort/silent-loss"
+    postgres: { gap: "no test asserts the keyset usable-key refusal on PG" }
+    mysql:    { gap: "no test asserts the keyset usable-key refusal on MySQL" }
+    mssql:    { na: "only the ACCEPT side is tested (mssql_keyset_on_non_pk_unique_index); refusal is engine-agnostic plan logic" }
+    mongo:    { test: mongo_keyset_on_heterogeneous_id_errors_loudly_full_scan_still_works }
+
+  - id: guard_small_table_snapshot_escape
+    what: "chunked on a table whose reltuples < chunk_size downgrades to Snapshot (one file), unless an explicit knob pins chunked"
+    postgres: { test: roast_small_table_escape_respects_explicit_chunk_checkpoint }
+    mysql:    { gap: "small-table Snapshot-escape guard is PG-only" }
+    mssql:    { gap: "small-table Snapshot-escape guard is PG-only" }
+    mongo:    { na: "no reltuples-based escape in the Mongo reader" }
