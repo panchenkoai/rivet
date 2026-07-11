@@ -724,6 +724,14 @@ mod clickhouse {
                             "ClickHouse Decimal has no negative scale; decimal({precision},{scale}) needs a declared schema"
                         ),
                     )
+                } else if *precision > 76 {
+                    // ClickHouse Decimal caps at precision 76 (Decimal256) — the same
+                    // silent-Ok class as Snowflake past 38: never claim a type the
+                    // engine rejects. Fail past the ceiling.
+                    Resolved::fail(format!(
+                        "decimal({precision},{scale}) exceeds ClickHouse Decimal (max precision 76); \
+                         narrow the source precision"
+                    ))
                 } else {
                     Resolved::ok(format!("Decimal({precision}, {scale})"))
                 }
@@ -814,6 +822,9 @@ mod tests {
     }
     fn sf(rt: &RivetType) -> TargetColumnSpec {
         ExportTarget::Snowflake.resolve_column(input(rt))
+    }
+    fn ch(rt: &RivetType) -> TargetColumnSpec {
+        ExportTarget::ClickHouse.resolve_column(input(rt))
     }
 
     // ── nanosecond timestamp (`timestamp_ns` override) per-target autoload ────
@@ -1223,6 +1234,74 @@ mod tests {
             })
             .status,
             TargetStatus::Ok
+        );
+    }
+
+    #[test]
+    fn clickhouse_decimal_over_76_fails() {
+        // ClickHouse Decimal caps at precision 76 (Decimal256) — past it is a Fail,
+        // not a false Ok, mirroring the Snowflake(>38) / BigQuery(>76,38) guards.
+        assert_eq!(
+            ch(&RivetType::Decimal {
+                precision: 80,
+                scale: 2
+            })
+            .status,
+            TargetStatus::Fail
+        );
+        // 76 (the Decimal256 ceiling) is still ok.
+        assert_eq!(
+            ch(&RivetType::Decimal {
+                precision: 76,
+                scale: 2
+            })
+            .status,
+            TargetStatus::Ok
+        );
+    }
+
+    #[test]
+    fn clickhouse_time_autoloads_as_int64() {
+        // ClickHouse has no TIME type; time-of-day autoloads as Int64 (µs of day).
+        let s = ch(&RivetType::Time {
+            unit: super::super::TimeUnit::Microsecond,
+        });
+        assert_eq!(s.autoload_type, "Int64");
+        assert_eq!(s.status, TargetStatus::Warn);
+    }
+
+    #[test]
+    fn clickhouse_nanosecond_timestamp_is_datetime64_9() {
+        // DateTime64 holds a nanosecond naive timestamp natively at scale 9.
+        let s = ch(&RivetType::Timestamp {
+            unit: super::super::TimeUnit::Nanosecond,
+            timezone: None,
+        });
+        assert_eq!(s.target_type, "DateTime64(9)");
+        assert_eq!(s.status, TargetStatus::Ok);
+    }
+
+    #[test]
+    fn clickhouse_enum_autoloads_as_text() {
+        // Enum labels ride as text (String), no divergence.
+        let s = ch(&RivetType::Enum);
+        assert_eq!(s.target_type, "String");
+        assert_eq!(s.status, TargetStatus::Ok);
+    }
+
+    #[test]
+    fn snowflake_enum_autoloads_as_text() {
+        // Enum labels ride as text on Snowflake too — pins the SF Enum arm the
+        // type-matrix live test never asserts.
+        let s = sf(&RivetType::Enum);
+        assert_eq!(
+            s.status,
+            TargetStatus::Ok,
+            "enum labels are a clean text autoload"
+        );
+        assert_eq!(
+            s.autoload_type, s.target_type,
+            "a text enum has no autoload divergence"
         );
     }
 
