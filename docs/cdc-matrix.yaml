@@ -66,9 +66,9 @@ scenarios:
 
   - id: cdc_schema_drift
     what: "a column added / renamed mid-stream is handled (re-resolve schema, map by name)"
-    postgres: { gap: "no PG mid-stream ADD/RENAME COLUMN CDC test — the pgoutput/test_decoding column-add path is never exercised live" }
+    postgres: { test: pg_cdc_column_added_mid_stream_is_captured }
     mysql:    { test: cdc_picks_up_a_column_added_between_runs }
-    mssql:    { gap: "no MSSQL schema-drift CDC test — a column add needs a NEW capture instance, and CDC keeps reading the old shape: a correctness cliff with zero coverage" }
+    mssql:    { test: mssql_cdc_column_added_via_new_capture_instance_is_captured }
     mongo:    { na: "schemaless — a new field rides the verbatim document blob; no fixed per-collection schema to drift" }
 
   - id: cdc_whole_db_multiplex
@@ -87,9 +87,9 @@ scenarios:
 
   - id: cdc_until_current_bounded
     what: "until_current: true — a bounded run TERMINATES when caught up, even under sustained concurrent writes"
-    postgres: { gap: "until_current bounded-exit is only asserted transitively (every cfg uses it); no dedicated terminates-under-sustained-writes test on PG" }
-    mysql:    { gap: "until_current bounded-exit is only transitive on MySQL; no dedicated stop-under-load test" }
-    mssql:    { gap: "until_current bounded-exit is only transitive on MSSQL; no dedicated stop-under-load test" }
+    postgres: { test: pg_cdc_until_current_terminates_under_sustained_writes }
+    mysql:    { test: cdc_until_current_terminates_under_sustained_writes }
+    mssql:    { test: mssql_cdc_until_current_terminates_under_sustained_writes }
     mongo:    { test: roast_until_current_terminates_under_sustained_writes_and_keeps_backlog }
 
   - id: cdc_type_fidelity

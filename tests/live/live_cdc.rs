@@ -2563,3 +2563,184 @@ fn cdc_run_is_recorded_in_state_db() {
         "cdc journal must carry FileWritten + RunCompleted, got: {journal}"
     );
 }
+
+// ─── schema drift + bounded-run termination (coverage-matrix gap fills) ──────
+
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_column_added_mid_stream_is_captured() {
+    // Schema-drift peer of cdc_picks_up_a_column_added_between_runs for PostgreSQL.
+    // The sink re-resolves the table schema at the start of each run, and
+    // test_decoding renders each change against the table's CURRENT column list,
+    // so a column added between runs is captured on the next run — the pgoutput/
+    // test_decoding column-add path the matrix flagged as never live-exercised.
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_cdc_pgdrift");
+    let slot = unique_name("rivet_drift_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+
+    // Run 1: capture a row under the original (id, v) schema.
+    c.execute(&format!("INSERT INTO {tbl} VALUES (1, 10)"), &[])
+        .unwrap();
+    let out1 = d.path().join("out1");
+    std::fs::create_dir_all(&out1).unwrap();
+    run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &out1));
+    assert!(
+        !dir_parquet_has_column(&out1, "w"),
+        "run 1 predates the added column"
+    );
+
+    // Add a column, then a row that uses it.
+    c.batch_execute(&format!(
+        "ALTER TABLE {tbl} ADD COLUMN w TEXT; INSERT INTO {tbl} VALUES (2, 20, 'hello')"
+    ))
+    .unwrap();
+
+    // Run 2 (resume, same slot): re-resolves the schema → the new column is captured.
+    let out2 = d.path().join("out2");
+    std::fs::create_dir_all(&out2).unwrap();
+    run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &out2));
+    assert!(
+        dir_parquet_has_column(&out2, "w"),
+        "run 2 must re-resolve and pick up the column added between runs"
+    );
+    assert_eq!(parquet_one_string(&out2, "w"), "hello");
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_until_current_terminates_under_sustained_writes() {
+    // Peer of the Mongo roast_until_current_terminates_under_sustained_writes.
+    // A bounded run must (1) TERMINATE at the open-time WAL bound even while a
+    // writer keeps committing — a drain loop that chases a moving "current" hangs
+    // forever — and (2) still capture the pre-open backlog. Assert both.
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_cdc_pghb");
+    let slot = unique_name("rivet_hb_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+
+    // Pre-open backlog: ids 0..30 (the slot captures them because it exists first).
+    for i in 0..30i64 {
+        c.execute(&format!("INSERT INTO {tbl} VALUES ({i},{i})"), &[])
+            .unwrap();
+    }
+
+    // A writer committing continuously while the bounded run drains.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_bg = stop.clone();
+    let tbl_bg = tbl.clone();
+    let bg = std::thread::spawn(move || {
+        let mut w = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("bg connect");
+        let mut i = 10_000i64;
+        while !stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = w.execute(&format!("INSERT INTO {tbl_bg} VALUES ({i},{i})"), &[]);
+            i += 1;
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+    });
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let elapsed = run_rivet_bounded(
+        &pg_cdc_config(&d, &tbl, &slot, &out),
+        std::time::Duration::from_secs(30),
+    );
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = bg.join();
+
+    assert!(
+        elapsed.is_some(),
+        "until_current must terminate under sustained writes (killed at the 30s ceiling)"
+    );
+    // Termination must NOT come from dropping the backlog.
+    let ids: std::collections::BTreeSet<i64> = dir_parquet_i64(&out, "id").into_iter().collect();
+    for i in 0..30 {
+        assert!(
+            ids.contains(&i),
+            "backlog id {i} must be captured, got {} ids",
+            ids.len()
+        );
+    }
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_until_current_terminates_under_sustained_writes() {
+    // MySQL peer: the binlog is a live tail, so this is the engine most at risk of
+    // a drain loop that never reaches its stop condition under continuous writes.
+    // The bound must be pinned at the open-time binlog position; the backlog must
+    // still survive.
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_cdc_myhb");
+    let _drop = Table(tbl.clone());
+    let mut c = conn();
+    c.query_drop(format!("CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let ckpt = d.path().join("cdc.ckpt");
+    write_checkpoint(&mut c, &ckpt); // pin before the backlog
+
+    // Pre-open backlog: ids 0..30.
+    let vals: Vec<String> = (0..30).map(|i| format!("({i},{i})")).collect();
+    c.query_drop(format!("INSERT INTO {tbl} VALUES {}", vals.join(",")))
+        .unwrap();
+
+    // A writer committing continuously while the bounded run drains.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_bg = stop.clone();
+    let tbl_bg = tbl.clone();
+    let bg = std::thread::spawn(move || {
+        let mut w = conn();
+        let mut i = 10_000i64;
+        while !stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = w.query_drop(format!("INSERT INTO {tbl_bg} VALUES ({i},{i})"));
+            i += 1;
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+    });
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let elapsed = run_rivet_bounded(
+        &cdc_config(&d, &tbl, &ckpt, &out),
+        std::time::Duration::from_secs(30),
+    );
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = bg.join();
+
+    assert!(
+        elapsed.is_some(),
+        "until_current must terminate under sustained writes (killed at the 30s ceiling)"
+    );
+    let ids: std::collections::BTreeSet<i64> = dir_parquet_i64(&out, "id").into_iter().collect();
+    for i in 0..30 {
+        assert!(
+            ids.contains(&i),
+            "backlog id {i} must be captured, got {} ids",
+            ids.len()
+        );
+    }
+}

@@ -35,9 +35,10 @@ const MATRICES: &[(&str, usize)] = &[
     // parity, csv, tuning profile) — visible + un-growable; fill by writing the test.
     ("docs/cross-config-matrix.yaml", 0),
     // CDC — the most engine-divergent surface (12 scenarios × 4 engines). Complements
-    // tests/cdc_conformance_gate.rs. 5 honest holes it surfaced: schema-drift on PG +
-    // MSSQL, and dedicated until_current-terminates-under-load on the three SQL engines.
-    ("docs/cdc-matrix.yaml", 5),
+    // tests/cdc_conformance_gate.rs. The 5 holes it surfaced (schema-drift on PG +
+    // MSSQL, until_current-terminates-under-load on the three SQL engines) are now
+    // filled — every cell is a test or a justified n/a.
+    ("docs/cdc-matrix.yaml", 0),
 ];
 
 #[derive(Deserialize)]

@@ -40,6 +40,35 @@ pub fn run_rivet_env(args: &[&str], envs: &[(&str, &str)]) -> Output {
     cmd.output().expect("spawn rivet binary")
 }
 
+/// Spawn `rivet run --config <cfg>` and wait up to `timeout` for it to exit on
+/// its own. Returns the elapsed time if it terminated within the budget (and
+/// asserts a clean exit), or `None` if it had to be killed. This is what makes a
+/// `until_current`-terminates-under-load assertion possible without risking a
+/// suite-wide hang: a drain loop that never reaches its stop condition fails the
+/// test (returns `None`) instead of blocking `output()` forever.
+pub fn run_rivet_bounded(
+    cfg: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Option<std::time::Duration> {
+    let start = std::time::Instant::now();
+    let mut child = Command::new(RIVET_BIN)
+        .args(["run", "--config", cfg.to_str().unwrap()])
+        .spawn()
+        .expect("spawn rivet binary");
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait rivet") {
+            assert!(status.success(), "bounded rivet run exited non-zero");
+            return Some(start.elapsed());
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// Like `run_rivet` but sets `RUST_LOG=warn` so that `log::warn!` output is
 /// visible in stderr.  Use this when a test needs to assert on warning messages
 /// emitted via the log crate (plan validation warnings, quality warnings, etc.).
