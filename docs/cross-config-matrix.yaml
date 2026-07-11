@@ -1,0 +1,91 @@
+# Cross config × database coverage matrix — cross-cutting config options /
+# behaviours, is each proven per engine? Same shape + drift-guard as the other
+# matrices. Cell = { test } | { gap } | { na }.
+#
+# Many gaps here are honest holes (cloud destinations, codec parity, csv, tuning
+# profile) on the non-PostgreSQL engines — PG has the deepest coverage, the others
+# ride the shared matrix/differential harness for the happy path. The ratchet makes
+# the holes visible and un-growable; fill them by writing the per-engine test.
+
+engines: [postgres, mysql, mssql, mongo]
+
+scenarios:
+  # ── destinations ──────────────────────────────────────────────────────────
+  - id: dest_local
+    what: "destination: local — one/many parquet parts with all rows"
+    postgres: { test: local_destination_produces_one_parquet_with_all_rows }
+    mysql:    { test: mysql_full_mode_repeated_run_accumulates_manifest_entries }
+    mssql:    { test: mssql_full_mode_repeated_run_accumulates_manifest_entries }
+    mongo:    { test: mongo_batch_keyset_no_loss_or_dup }
+
+  - id: dest_gcs
+    what: "destination: gcs — fake-GCS round-trip, all rows"
+    postgres: { test: gcs_fake_destination_produces_one_parquet_with_all_rows }
+    mysql:    { gap: "no GCS destination test on MySQL" }
+    mssql:    { gap: "no GCS destination test on MSSQL" }
+    mongo:    { gap: "no GCS destination test on Mongo" }
+
+  - id: dest_s3
+    what: "destination: s3 — MinIO round-trip, all rows"
+    postgres: { test: s3_minio_destination_produces_one_parquet_with_all_rows }
+    mysql:    { gap: "no S3 destination test on MySQL" }
+    mssql:    { gap: "no S3 destination test on MSSQL" }
+    mongo:    { gap: "no S3 destination test on Mongo" }
+
+  # ── format / compression ──────────────────────────────────────────────────
+  - id: format_parquet
+    what: "format: parquet — the default, exercised by every matrix export"
+    postgres: { test: pg_golden_full_type_matrix_schema_coverage }
+    mysql:    { test: mysql_golden_full_type_matrix_schema_coverage }
+    mssql:    { test: duckdb_validates_mssql_type_matrix_parquet }
+    mongo:    { test: mongo_batch_keyset_no_loss_or_dup }
+
+  - id: format_csv
+    what: "format: csv — decimal-as-text, unicode/newline escaping"
+    postgres: { test: postgres_type_matrix_csv_decimal_and_row_count }
+    mysql:    { test: mysql_type_matrix_csv_decimal_text_preserved }
+    mssql:    { gap: "no CSV export test on MSSQL" }
+    mongo:    { gap: "no CSV export test on Mongo" }
+
+  - id: compression_codecs
+    what: "compression: full codec matrix (zstd/snappy/gzip/none) reads back correctly"
+    postgres: { test: duckdb_validates_postgres_parquet_compression_codecs }
+    mysql:    { gap: "MySQL exercises zstd only — no codec-matrix parity test" }
+    mssql:    { gap: "MSSQL exercises zstd only — no codec-matrix parity test" }
+    mongo:    { gap: "Mongo exercises the default codec only — no codec-matrix parity test" }
+
+  # ── enrichment / verification / tuning ────────────────────────────────────
+  - id: meta_columns
+    what: "meta_columns — _rivet_exported_at + _rivet_row_hash land in the output"
+    postgres: { gap: "no e2e test proves meta_columns land in a real export — only unit (src/enrich.rs)" }
+    mysql:    { na: "engine-agnostic post-read enrichment (src/enrich.rs); one e2e test covers every engine" }
+    mssql:    { na: "engine-agnostic — see the postgres cell" }
+    mongo:    { na: "engine-agnostic — see the postgres cell" }
+
+  - id: reconcile
+    what: "--reconcile — destination count matches source (exit 0), mismatch exits nonzero"
+    postgres: { test: reconcile_all_match_exits_zero_with_pretty_output }
+    mysql:    { test: mysql_reconcile_all_match_exits_zero_with_pretty_output }
+    mssql:    { test: mssql_reconcile_all_match_exits_zero_with_pretty_output }
+    mongo:    { test: mongo_run_reconcile_matches_source_count }
+
+  - id: parallel_n
+    what: "parallel: N — concurrent workers, no loss or dup"
+    postgres: { test: dense_ties_pg_parallel_no_loss_no_dup }
+    mysql:    { test: dense_ties_mysql_parallel_no_loss_no_dup }
+    mssql:    { test: dense_ties_mssql_parallel_no_loss_no_dup }
+    mongo:    { test: mongo_batch_parallel_integer_id_no_loss_or_dup }
+
+  - id: environment_tuning_profile
+    what: "source.environment → tuning profile default (local → fast)"
+    postgres: { test: source_environment_local_runs_fast_profile_by_default }
+    mysql:    { gap: "MySQL exercises tuning but never asserts the environment-derived profile" }
+    mssql:    { gap: "MSSQL exercises tuning but never asserts the environment-derived profile" }
+    mongo:    { na: "the tuning-profile governor (Log Flush Waits back-pressure) is SQL-only; no Mongo analogue" }
+
+  - id: cross_db_parity
+    what: "same seed on two engines → equal row count + equal PK id-set + identical empty-export behaviour"
+    postgres: { test: pg_and_mysql_full_exports_agree_on_row_count_and_id_set }
+    mysql:    { test: pg_and_mysql_chunked_exports_agree_on_row_count_and_id_set }
+    mssql:    { gap: "MSSQL is absent from the head-to-head parity file (only its own independent differential)" }
+    mongo:    { na: "Mongo's JSON-blob model has no row-for-row SQL parity to compare against" }

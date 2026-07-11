@@ -30,6 +30,10 @@ use serde::Deserialize;
 const MATRICES: &[(&str, usize)] = &[
     ("docs/chunking-matrix.yaml", 0),
     ("docs/behaviour-matrix.yaml", 0),
+    ("docs/type-fidelity-matrix.yaml", 0),
+    // Cross config × db: 15 honest holes on the non-PG engines (cloud dests, codec
+    // parity, csv, tuning profile) — visible + un-growable; fill by writing the test.
+    ("docs/cross-config-matrix.yaml", 15),
 ];
 
 #[derive(Deserialize)]
