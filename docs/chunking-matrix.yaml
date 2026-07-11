@@ -97,9 +97,9 @@ scenarios:
 
   - id: chunk_by_days
     what: "chunk_by_days: date-window chunking on a date/timestamp key"
-    postgres: { gap: "chunk_by_days has no live test on any engine (only time_window MODE + offline SQL goldens)" }
-    mysql:    { gap: "chunk_by_days has no live test on MySQL" }
-    mssql:    { gap: "chunk_by_days has no live test on MSSQL" }
+    postgres: { test: stand_chunk_by_days_postgres }
+    mysql:    { test: stand_chunk_by_days_mysql }
+    mssql:    { test: stand_chunk_by_days_mssql }   # found+fixed the MSSQL DATE-scalar bug
     mongo:    { na: "no date-window chunking on Mongo" }
 
   - id: snapshot_full
@@ -133,8 +133,8 @@ scenarios:
 
   - id: guard_keyset_non_usable_key_bail
     what: "chunk_by_key on a non-unique / nullable / heterogeneous key → loud refusal, not a filesort/silent-loss"
-    postgres: { gap: "no test asserts the keyset usable-key refusal on PG" }
-    mysql:    { gap: "no test asserts the keyset usable-key refusal on MySQL" }
+    postgres: { test: stand_keyset_non_usable_bail_postgres }
+    mysql:    { test: stand_keyset_non_usable_bail_mysql }
     mssql:    { na: "only the ACCEPT side is tested (mssql_keyset_on_non_pk_unique_index); refusal is engine-agnostic plan logic" }
     mongo:    { test: mongo_keyset_on_heterogeneous_id_errors_loudly_full_scan_still_works }
 

@@ -251,6 +251,111 @@ fn run_chunk_count(eng: Eng, n: usize) {
     );
 }
 
+/// Seed a table keyed by a DATE column `d` spanning `days` distinct days
+/// (id BIGINT PK, d DATE NOT NULL), for `chunk_by_days` date-window chunking.
+fn seed_dated(eng: Eng, rows: i64, days: i64) -> (String, StandCleanup) {
+    let table = unique_name("stand_dated");
+    let guard = StandCleanup(eng, table.clone());
+    match eng {
+        Eng::Pg => {
+            let mut c = pg_connect();
+            c.batch_execute(&format!(
+                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, d DATE NOT NULL);
+                 INSERT INTO {table} (id, d)
+                 SELECT g, DATE '2023-01-01' + ((g % {days}) || ' days')::interval
+                 FROM generate_series(1, {rows}) g;
+                 ANALYZE {table};"
+            ))
+            .unwrap();
+        }
+        Eng::My => {
+            let mut c = mysql_connect();
+            c.query_drop(format!(
+                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, d DATE NOT NULL)"
+            ))
+            .unwrap();
+            c.query_drop(format!(
+                "SET SESSION cte_max_recursion_depth = {}",
+                rows + 10
+            ))
+            .unwrap();
+            c.query_drop(format!(
+                "INSERT INTO {table} (id, d) \
+                 WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < {rows}) \
+                 SELECT n, DATE_ADD('2023-01-01', INTERVAL (n % {days}) DAY) FROM seq"
+            ))
+            .unwrap();
+        }
+        Eng::Ms => {
+            mssql_exec(&format!(
+                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, d DATE NOT NULL)"
+            ));
+            mssql_exec(&format!(
+                "INSERT INTO {table} (id, d) \
+                 SELECT value, DATEADD(day, value % {days}, CAST('2023-01-01' AS DATE)) \
+                 FROM GENERATE_SERIES(CAST(1 AS BIGINT), CAST({rows} AS BIGINT))"
+            ));
+            mssql_exec(&format!("UPDATE STATISTICS {table}"));
+        }
+    }
+    (table, guard)
+}
+
+/// `chunk_by_days: 7` on a 35-day span → 5 weekly windows → 5 part files. Assert
+/// the run succeeds and emits exactly 5 parts on every engine.
+fn run_chunk_by_days(eng: Eng) {
+    eng.require();
+    let (table, _guard) = seed_dated(eng, 350, 35);
+    let rig = eng
+        .rig(&table)
+        .mode("chunked")
+        .export_line("chunk_column: d")
+        .export_line("chunk_by_days: 7");
+    let cfg = rig.config_path();
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+    assert!(
+        out.status.success(),
+        "chunk_by_days run must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let files = files_with_extension(&rig.out_dir(), "parquet");
+    assert_eq!(
+        files.len(),
+        5,
+        "chunk_by_days: 7 over a 35-day span must emit 5 weekly parts; got {}: {files:?}",
+        files.len()
+    );
+}
+
+/// `chunk_by_key` pointed at a NON-unique column (`payload`, no unique index)
+/// must REFUSE — an unindexed ORDER BY key would filesort the whole table and a
+/// non-unique key drops/dupes rows at a page boundary.
+fn run_keyset_non_usable_bail(eng: Eng) {
+    eng.require();
+    let (table, _guard) = seed_dense(eng, 200);
+    let rig = eng
+        .rig(&table)
+        .mode("chunked")
+        .export_line("chunk_by_key: payload");
+    let cfg = rig.config_path();
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "chunk_by_key on a non-unique column must BAIL; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("not a usable keyset key"),
+        "bail must be the keyset usable-key refusal; stderr:\n{stderr}"
+    );
+}
+
 /// The stand body: seed sparse, run a range plan (`chunk_column: id`,
 /// `chunk_size` small enough to blow the span into many windows), assert the
 /// engine's expected outcome. PG/MSSQL PROVE sparseness from a scan-free estimate
@@ -372,4 +477,34 @@ fn stand_chunk_count_mysql() {
 #[ignore = "live: requires docker compose up -d mssql"]
 fn stand_chunk_count_mssql() {
     run_chunk_count(Eng::Ms, 4);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn stand_chunk_by_days_postgres() {
+    run_chunk_by_days(Eng::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_chunk_by_days_mysql() {
+    run_chunk_by_days(Eng::My);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_chunk_by_days_mssql() {
+    run_chunk_by_days(Eng::Ms);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn stand_keyset_non_usable_bail_postgres() {
+    run_keyset_non_usable_bail(Eng::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_keyset_non_usable_bail_mysql() {
+    run_keyset_non_usable_bail(Eng::My);
 }
