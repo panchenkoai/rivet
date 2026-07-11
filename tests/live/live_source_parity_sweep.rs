@@ -22,6 +22,14 @@ fn run_sweep(script: &str) {
         .expect("spawn sweep script");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // exit 2 = environment/setup missing (duckdb CLI not on PATH, rivet not built,
+    // a service down). That is NOT a corruption signal — skip rather than fail, so
+    // this test is inert in jobs that don't provide the sweep's deps (e.g. the E2E
+    // matrix has no host `duckdb` CLI). Corruption is exit 1; a clean run is exit 0.
+    if out.status.code() == Some(2) {
+        eprintln!("SKIP {script}: sweep dependencies unavailable in this environment:\n{stdout}");
+        return;
+    }
     assert!(
         !stdout.contains("MISMATCH"),
         "source-parity sweep found a column that diverged from the source \

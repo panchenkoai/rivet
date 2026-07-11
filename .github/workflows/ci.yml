@@ -488,9 +488,10 @@ jobs:
         # document store with its own heavy 3-container stack (standalone + replica
         # set + auth), so — exactly like live-full in nightly-live — it is owned by
         # the dedicated `mongo-versions` matrix job (4.4 → 8.0) instead. `--skip
-        # live_mongo` covers every live_mongo* module (batch, crash-recovery, harm,
-        # retry-and-faults); `--skip live_cdc_mongo` the CDC suite.
-        run: cargo test -- --ignored --skip content_export --skip validates --skip edge_cases --skip via_duckdb --skip live_mongo --skip live_cdc_mongo
+        # mongo` covers every Mongo test by substring — the live_mongo* / live_cdc_mongo
+        # modules AND the Mongo cells of the engine-agnostic chunking_stand
+        # (`stand_*_mongo`), which a module-prefix skip like `--skip live_mongo` misses.
+        run: cargo test -- --ignored --skip content_export --skip validates --skip edge_cases --skip via_duckdb --skip mongo
 
       - name: Stop services
         if: always()
