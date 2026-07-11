@@ -21,6 +21,26 @@ use crate::common::*;
 use mysql::prelude::Queryable;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
+/// Column names of the first parquet part under `dir` — for schema-shape asserts.
+fn parquet_columns(dir: &std::path::Path) -> Vec<String> {
+    for path in files_with_extension(dir, "parquet") {
+        let bytes = std::fs::read(&path).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+            .unwrap()
+            .build()
+            .unwrap();
+        if let Some(Ok(batch)) = reader.into_iter().next() {
+            return batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+        }
+    }
+    vec![]
+}
+
 /// Total rows across every parquet part under `dir` — for "no row loss" asserts.
 fn count_parquet_rows(dir: &std::path::Path) -> usize {
     let mut n = 0;
@@ -697,4 +717,127 @@ fn stand_time_window_mysql() {
 #[ignore = "live: requires docker compose up -d mssql"]
 fn stand_time_window_mssql() {
     run_time_window(Eng::Ms);
+}
+
+// ── cross-config scenarios (docs/cross-config-matrix.yaml) ──────────────────
+
+/// `meta_columns` — the export gains `_rivet_exported_at` + `_rivet_row_hash`.
+/// Engine-agnostic post-read enrichment (src/enrich.rs), so one e2e run proves
+/// the columns actually land in a real export (previously unit-only).
+fn run_meta_columns(eng: Eng) {
+    eng.require();
+    let (table, _guard) = seed_dense(eng, 200);
+    let rig = eng
+        .rig(&table)
+        .mode("full")
+        .export_line("meta_columns:")
+        .export_line("  exported_at: true")
+        .export_line("  row_hash: true");
+    let cfg = rig.config_path();
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+    assert!(
+        out.status.success(),
+        "meta_columns run must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cols = parquet_columns(&rig.out_dir());
+    assert!(
+        cols.iter().any(|c| c == "_rivet_exported_at"),
+        "output must carry _rivet_exported_at; got {cols:?}"
+    );
+    assert!(
+        cols.iter().any(|c| c == "_rivet_row_hash"),
+        "output must carry _rivet_row_hash; got {cols:?}"
+    );
+}
+
+/// `format: csv` — the export writes a non-empty `.csv` (header + rows), not parquet.
+fn run_csv(eng: Eng) {
+    eng.require();
+    let (table, _guard) = seed_dense(eng, 200);
+    let rig = eng.rig(&table).mode("full").with_format("csv");
+    let cfg = rig.config_path();
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+    assert!(
+        out.status.success(),
+        "csv run must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let csvs = files_with_extension(&rig.out_dir(), "csv");
+    assert!(!csvs.is_empty(), "csv export must write a .csv file");
+    let lines = std::fs::read_to_string(&csvs[0]).unwrap().lines().count();
+    assert!(
+        lines > 100,
+        "csv must have a header + rows; got {lines} lines"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn stand_meta_columns_postgres() {
+    run_meta_columns(Eng::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_format_csv_mssql() {
+    run_csv(Eng::Ms);
+}
+
+/// `source.environment: local` → the tuning profile defaults to `fast`; the run
+/// summary names the env-derived profile on stderr. Source-level, so raw YAML
+/// (the Rig has no environment knob). PG is covered in live_catalog_hints.
+fn run_environment_profile(eng: Eng) {
+    eng.require();
+    let (table, _guard) = seed_dense(eng, 50);
+    let (src, tbl_ref) = match eng {
+        Eng::My => (
+            format!("source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\n  environment: local"),
+            table.clone(),
+        ),
+        Eng::Ms => (
+            format!(
+                "source:\n  type: mssql\n  url: \"{MSSQL_URL}\"\n  tls:\n    \
+                 accept_invalid_certs: true\n  environment: local"
+            ),
+            format!("dbo.{table}"),
+        ),
+        Eng::Pg => unreachable!("PG environment→profile is covered in live_catalog_hints"),
+    };
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "{src}\nexports:\n  - name: env_prof\n    table: {tbl_ref}\n    mode: full\n    \
+         format: parquet\n    destination: {{ type: local, path: {out} }}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let out = run_rivet_with_warn_log(&["run", "-c", cfg.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "env-profile run failed; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("fast") && stderr.contains("environment: local"),
+        "expected the env-derived fast profile on stderr; got:\n{stderr}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_environment_profile_mysql() {
+    run_environment_profile(Eng::My);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_environment_profile_mssql() {
+    run_environment_profile(Eng::Ms);
 }

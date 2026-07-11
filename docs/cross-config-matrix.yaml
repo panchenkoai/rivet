@@ -44,7 +44,7 @@ scenarios:
     what: "format: csv — decimal-as-text, unicode/newline escaping"
     postgres: { test: postgres_type_matrix_csv_decimal_and_row_count }
     mysql:    { test: mysql_type_matrix_csv_decimal_text_preserved }
-    mssql:    { gap: "no CSV export test on MSSQL" }
+    mssql:    { test: stand_format_csv_mssql }
     mongo:    { gap: "no CSV export test on Mongo" }
 
   - id: compression_codecs
@@ -57,7 +57,7 @@ scenarios:
   # ── enrichment / verification / tuning ────────────────────────────────────
   - id: meta_columns
     what: "meta_columns — _rivet_exported_at + _rivet_row_hash land in the output"
-    postgres: { gap: "no e2e test proves meta_columns land in a real export — only unit (src/enrich.rs)" }
+    postgres: { test: stand_meta_columns_postgres }
     mysql:    { na: "engine-agnostic post-read enrichment (src/enrich.rs); one e2e test covers every engine" }
     mssql:    { na: "engine-agnostic — see the postgres cell" }
     mongo:    { na: "engine-agnostic — see the postgres cell" }
@@ -79,8 +79,8 @@ scenarios:
   - id: environment_tuning_profile
     what: "source.environment → tuning profile default (local → fast)"
     postgres: { test: source_environment_local_runs_fast_profile_by_default }
-    mysql:    { gap: "MySQL exercises tuning but never asserts the environment-derived profile" }
-    mssql:    { gap: "MSSQL exercises tuning but never asserts the environment-derived profile" }
+    mysql:    { test: stand_environment_profile_mysql }
+    mssql:    { test: stand_environment_profile_mssql }
     mongo:    { na: "the tuning-profile governor (Log Flush Waits back-pressure) is SQL-only; no Mongo analogue" }
 
   - id: cross_db_parity
