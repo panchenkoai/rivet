@@ -1,0 +1,101 @@
+# Resilience / crash-recovery coverage matrix — BATCH + cross-cutting fault surface
+# (CDC-side resilience lives in docs/cdc-matrix.yaml + tests/cdc_conformance_gate.rs;
+# this matrix complements them for the batch/chunked/clobber/destination paths, which
+# have no gate). Cell = { test } | { gap } | { na }.
+#
+# The fault-injection engine is src/test_hook.rs: RIVET_TEST_PANIC_AT=<point> panics at
+# a named boundary, RIVET_TEST_BLOCK_AT holds the process for a real external SIGKILL.
+# The batch at-least-once contract is the 4-boundary sweep
+# after_source_read → after_file_write → after_manifest_update → after_cursor_commit:
+# a crash before a boundary must leave recoverable state, never lose or double.
+#
+# NOTE (surfaced by this matrix, tracked as a bug): the batch full/incremental part-name
+# stamp in src/pipeline/single.rs is SECOND-granularity (%Y%m%d_%H%M%S, no run id) while
+# keyset / mongo_parallel / cdc all use millisecond precision. Two sub-second runs into
+# the same prefix collide → silent overwrite (LocalDestination idempotent_overwrite). The
+# part_name_no_clobber_batch_full row's tests pass only by sleeping 1100ms between runs —
+# they document the gap rather than close it. Fix = align single.rs with keyset.rs:157.
+
+engines: [postgres, mysql, mssql, mongo]
+
+scenarios:
+  # ── batch at-least-once: the 4 crash boundaries ───────────────────────────
+  - id: batch_crash_after_source_read
+    what: "crash after reading the source, before any write → state stays completely clean"
+    postgres: { test: crash_after_source_read_leaves_state_completely_clean }
+    mysql:    { test: mysql_crash_after_source_read_leaves_state_completely_clean }
+    mssql:    { test: mssql_crash_after_source_read_leaves_state_completely_clean }
+    mongo:    { gap: "no Mongo batch crash-after-source-read test; the other three engines each have one, no NA rationale documented" }
+
+  - id: batch_crash_after_file_write
+    what: "crash after the part file, before the manifest → file present, no manifest/cursor, recoverable"
+    postgres: { test: crash_after_file_write_leaves_file_but_no_manifest_or_cursor }
+    mysql:    { test: mysql_crash_after_file_write_leaves_file_but_no_manifest_or_cursor }
+    mssql:    { test: mssql_crash_after_file_write_leaves_file_but_no_manifest_or_cursor }
+    mongo:    { test: mongo_crash_after_file_write_recovers_without_loss }
+
+  - id: batch_crash_after_manifest_update
+    what: "crash after the manifest, before the cursor → file+manifest present, no cursor, recoverable"
+    postgres: { test: crash_after_manifest_update_leaves_file_and_manifest_but_no_cursor }
+    mysql:    { test: mysql_crash_after_manifest_update_leaves_file_and_manifest_but_no_cursor }
+    mssql:    { test: mssql_crash_after_manifest_update_leaves_file_and_manifest_but_no_cursor }
+    mongo:    { test: mongo_crash_after_manifest_update_recovers_without_loss }
+
+  - id: batch_crash_after_cursor_commit
+    what: "crash after the cursor commit → fully recoverable with complete state"
+    postgres: { test: crash_after_cursor_commit_is_recoverable_with_full_state }
+    mysql:    { test: mysql_crash_after_cursor_commit_is_recoverable_with_full_state }
+    mssql:    { test: mssql_crash_after_cursor_commit_is_recoverable_with_full_state }
+    mongo:    { na: "Mongo's keyset full export has no cursor-commit boundary of this shape (documented in live_mongo_crash_recovery.rs) — the file/manifest boundaries above cover it" }
+
+  # ── chunked (checkpoint) at-least-once ────────────────────────────────────
+  - id: chunked_crash_after_chunk_complete
+    what: "crash after a chunk completes → resume finishes the export, no gap"
+    postgres: { test: chunked_crash_after_first_chunk_complete_resume_finishes_export }
+    mysql:    { test: mysql_chunked_crash_after_first_chunk_complete_resume_finishes_export }
+    mssql:    { test: mssql_chunked_crash_after_first_chunk_complete_resume_finishes_export }
+    mongo:    { na: "Mongo has no SQL-style chunked path — it uses keyset/parallel (covered by the batch + keyset rows)" }
+
+  - id: chunked_crash_after_chunk_file_atleastonce
+    what: "crash after a chunk file, before its commit → resume re-runs the chunk (at-least-once, no loss)"
+    postgres: { test: chunked_crash_after_chunk_file_before_commit_resume_reruns_chunk_atleastonce }
+    mysql:    { test: mysql_chunked_crash_after_chunk_file_before_commit_resume_reruns_chunk_atleastonce }
+    mssql:    { test: mssql_chunked_crash_after_chunk_file_before_commit_resume_reruns_chunk_atleastonce }
+    mongo:    { na: "no SQL-style chunked path on Mongo" }
+
+  - id: parallel_chunked_crash_recovery
+    what: "crash mid parallel-chunked run → resume finishes with no duplicates"
+    postgres: { test: parallel_chunked_crash_after_chunk_complete_resume_finishes_with_no_duplicates }
+    mysql:    { test: mysql_parallel_chunked_crash_after_chunk_complete_resume_finishes_with_no_duplicates }
+    mssql:    { test: mssql_parallel_chunked_crash_after_chunk_complete_resume_finishes_with_no_duplicates }
+    mongo:    { na: "no SQL-style chunked path on Mongo" }
+
+  # ── run-uniqueness: consecutive runs into the same prefix must not clobber ─
+  - id: part_name_no_clobber_batch_full
+    what: "two full-mode runs into the same prefix accumulate parts (WEAK: single.rs second-granularity — passes only by sleeping 1100ms; see header note)"
+    postgres: { test: full_mode_repeated_run_accumulates_manifest_entries }
+    mysql:    { test: mysql_full_mode_repeated_run_accumulates_manifest_entries }
+    mssql:    { test: mssql_full_mode_repeated_run_accumulates_manifest_entries }
+    mongo:    { gap: "no Mongo batch-mode two-runs-into-same-prefix test (Mongo batch uses the millisecond-stamped mongo_parallel path — should be immune, but unproven)" }
+
+  - id: part_name_no_clobber_keyset_checkpoint
+    what: "keyset/chunk-checkpoint resume: second run captures only new keys, prior parts survive (ms-stamped, run-unique)"
+    postgres: { test: keyset_checkpoint_resume_pg_second_run_captures_only_new_keys }
+    mysql:    { test: keyset_checkpoint_resume_second_run_captures_only_new_keys }
+    mssql:    { test: keyset_checkpoint_resume_mssql_second_run_captures_only_new_keys }
+    mongo:    { test: mongo_batch_resume_reads_only_new_since_last_run }
+
+  # ── real-signal faults (not panic hooks) ──────────────────────────────────
+  - id: sigkill_commit_window
+    what: "real SIGKILL in the commit window → temp+rename leaves no half-committed file"
+    postgres: { test: sigkill_in_commit_window_leaves_no_committed_file }
+    mysql:    { na: "the commit seam (temp file + atomic rename, src/destination/local.rs + pipeline/commit.rs) is engine-agnostic — pinned once on PostgreSQL" }
+    mssql:    { na: "same engine-agnostic commit seam; pinned once on PostgreSQL" }
+    mongo:    { na: "same engine-agnostic commit seam; pinned once on PostgreSQL" }
+
+  - id: destination_outage_loud
+    what: "destination outage (bucket down / transient) → fails loud, then recovers on retry without loss"
+    postgres: { test: s3_export_recovers_when_destination_comes_back_after_transient_outage }
+    mysql:    { na: "the destination write seam (destination::create_destination / commit::write_part_file) is engine-agnostic — pinned once on PostgreSQL" }
+    mssql:    { na: "same engine-agnostic destination seam; pinned once on PostgreSQL" }
+    mongo:    { na: "same engine-agnostic destination seam; pinned once on PostgreSQL" }

@@ -39,6 +39,9 @@ const MATRICES: &[(&str, usize)] = &[
     // MSSQL, until_current-terminates-under-load on the three SQL engines) are now
     // filled — every cell is a test or a justified n/a.
     ("docs/cdc-matrix.yaml", 0),
+    // Resilience / crash-recovery (BATCH + cross-cutting). 2 Mongo holes: batch
+    // crash-after-source-read + batch two-runs-no-clobber.
+    ("docs/resilience-matrix.yaml", 2),
 ];
 
 #[derive(Deserialize)]
