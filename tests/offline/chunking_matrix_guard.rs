@@ -1,7 +1,8 @@
-//! Drift-guard for `docs/chunking-matrix.yaml` — the chunking coverage ledger.
+//! Drift-guard for the coverage ledgers — `docs/chunking-matrix.yaml` and
+//! `docs/behaviour-matrix.yaml` (see [`MATRICES`]).
 //!
 //! The sparse-key footgun shipped because a whole guard had ZERO engine-level
-//! tests and nobody noticed. This guard makes the ledger self-protecting:
+//! tests and nobody noticed. This guard makes the ledgers self-protecting:
 //!
 //! 1. Every scenario MUST carry a cell for every engine (deserialization fails
 //!    otherwise) — no silently-missing engine.
@@ -17,15 +18,19 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-/// Admitted-gap ceiling. LOWER this each time a gap flips to a test; never raise
-/// it. 18 at introduction; 14 after null-keyed-bail (×3) + MSSQL keyset-resume;
-/// 12 after chunk_count (MySQL + MSSQL); 7 after chunk_by_days (×3) +
-/// keyset-non-usable (×2); 3 after sparse-gappy (×2) + memory_mb-PG + keyset-auto-MSSQL→na;
-/// 1 after small-table-escape (×2 → na, escape verified PG-only); 0 after
-/// chunk_count-Mongo → na (Mongo has no chunk_count; parallel-N is its analogue,
-/// already tested). The chunking matrix is now FULLY covered — every cell is a
-/// test or a justified n/a.
-const MAX_GAPS: usize = 0;
+/// The coverage ledgers and each one's admitted-gap ratchet ceiling. LOWER a
+/// ceiling every time a gap flips to a test; never raise it (the ratchet only
+/// tightens). Both matrices are currently at 0 — every cell is a test or a
+/// justified n/a, so any new gap fails CI outright.
+///
+/// chunking-matrix ratchet history: 18 → 14 (null-keyed ×3 + MSSQL keyset-resume)
+/// → 12 (chunk_count ×2) → 7 (chunk_by_days ×3 + keyset-non-usable ×2) → 3
+/// (sparse-gappy ×2 + memory_mb-PG + keyset-auto-MSSQL→na) → 1 (small-table-escape
+/// ×2→na) → 0 (chunk_count-Mongo→na).
+const MATRICES: &[(&str, usize)] = &[
+    ("docs/chunking-matrix.yaml", 0),
+    ("docs/behaviour-matrix.yaml", 0),
+];
 
 #[derive(Deserialize)]
 struct Matrix {
@@ -74,11 +79,11 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn load_matrix() -> Matrix {
-    let path = repo_root().join("docs/chunking-matrix.yaml");
+fn load_matrix(rel: &str) -> Matrix {
+    let path = repo_root().join(rel);
     let text =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    serde_yaml_ng::from_str(&text).unwrap_or_else(|e| panic!("parse chunking-matrix.yaml: {e}"))
+    serde_yaml_ng::from_str(&text).unwrap_or_else(|e| panic!("parse {rel}: {e}"))
 }
 
 /// Every `fn <name>` defined anywhere under src/ or tests/. Built once so the
@@ -120,37 +125,18 @@ fn collect_fn_names(dir: &Path, out: &mut HashSet<String>) {
 }
 
 #[test]
-fn chunking_matrix_every_cell_is_exactly_one_kind() {
-    let matrix = load_matrix();
-    assert!(!matrix.scenarios.is_empty(), "matrix has no scenarios");
-    for sc in &matrix.scenarios {
-        for (eng, cell) in sc.cells() {
-            assert_eq!(
-                cell.kind_count(),
-                1,
-                "scenario '{}' engine '{}': a cell must be exactly one of test/gap/na",
-                sc.id,
-                eng
-            );
-        }
-    }
-}
-
-#[test]
-fn chunking_matrix_every_mapped_test_exists() {
-    let matrix = load_matrix();
-    let fns = all_fn_names();
-    for sc in &matrix.scenarios {
-        for (eng, cell) in sc.cells() {
-            if let Some(test) = &cell.test {
-                assert!(
-                    fns.contains(test),
-                    "scenario '{}' engine '{}' maps to test `{}`, but no `fn {}` exists under \
-                     src/ or tests/ — a renamed/deleted test orphaned a matrix cell",
+fn matrix_every_cell_is_exactly_one_kind() {
+    for (path, _) in MATRICES {
+        let matrix = load_matrix(path);
+        assert!(!matrix.scenarios.is_empty(), "{path} has no scenarios");
+        for sc in &matrix.scenarios {
+            for (eng, cell) in sc.cells() {
+                assert_eq!(
+                    cell.kind_count(),
+                    1,
+                    "{path} scenario '{}' engine '{}': a cell must be exactly one of test/gap/na",
                     sc.id,
-                    eng,
-                    test,
-                    test
+                    eng
                 );
             }
         }
@@ -158,22 +144,46 @@ fn chunking_matrix_every_mapped_test_exists() {
 }
 
 #[test]
-fn chunking_matrix_gaps_do_not_exceed_ratchet() {
-    let matrix = load_matrix();
-    let gaps: usize = matrix
-        .scenarios
-        .iter()
-        .flat_map(|sc| sc.cells())
-        .filter(|(_, c)| c.gap.is_some())
-        .count();
-    // Exactly-equal is the ratchet in BOTH directions: `> MAX_GAPS` means a gap
-    // was ADDED (fill it — gaps can't grow); `< MAX_GAPS` means one was FILLED
-    // (lower MAX_GAPS to lock the win). A plain `==` avoids the absurd `<= 0`
-    // comparison now that the matrix is fully covered (MAX_GAPS = 0).
-    assert_eq!(
-        gaps, MAX_GAPS,
-        "chunking-matrix.yaml has {gaps} admitted gaps; the ratchet expects exactly {MAX_GAPS}. \
-         If {gaps} > {MAX_GAPS}: you ADDED a gap — fill it with a test (gaps cannot grow). \
-         If {gaps} < {MAX_GAPS}: you FILLED one — lower MAX_GAPS to {gaps} to lock in the win."
-    );
+fn matrix_every_mapped_test_exists() {
+    let fns = all_fn_names();
+    for (path, _) in MATRICES {
+        let matrix = load_matrix(path);
+        for sc in &matrix.scenarios {
+            for (eng, cell) in sc.cells() {
+                if let Some(test) = &cell.test {
+                    assert!(
+                        fns.contains(test),
+                        "{path} scenario '{}' engine '{}' maps to test `{}`, but no `fn {}` exists \
+                         under src/ or tests/ — a renamed/deleted test orphaned a matrix cell",
+                        sc.id,
+                        eng,
+                        test,
+                        test
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn matrix_gaps_do_not_exceed_ratchet() {
+    for (path, ceiling) in MATRICES {
+        let matrix = load_matrix(path);
+        let gaps: usize = matrix
+            .scenarios
+            .iter()
+            .flat_map(|sc| sc.cells())
+            .filter(|(_, c)| c.gap.is_some())
+            .count();
+        // Exactly-equal is the ratchet in BOTH directions: `> ceiling` means a gap
+        // was ADDED (fill it — gaps can't grow); `< ceiling` means one was FILLED
+        // (lower the ceiling in MATRICES to lock the win).
+        assert_eq!(
+            gaps, *ceiling,
+            "{path} has {gaps} admitted gaps; the ratchet expects exactly {ceiling}. \
+             If {gaps} > {ceiling}: you ADDED a gap — fill it with a test (gaps cannot grow). \
+             If {gaps} < {ceiling}: you FILLED one — lower the ceiling in MATRICES to {gaps}."
+        );
+    }
 }
