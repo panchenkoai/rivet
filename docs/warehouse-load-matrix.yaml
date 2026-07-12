@@ -14,9 +14,10 @@
 # PG/MySQL/MSSQL; Snowflake has a live validator for PostgreSQL only. Cells marked with
 # an offline resolver/oracle test (all_types_oracle.rs, target.rs mod tests) are
 # CONTRACT-verified but not always live-round-tripped — a deliberate ratchet target for
-# later live Snowflake(MySQL) coverage, tracked in the inventory. Scope: the reachable,
-# degradation-prone type surface; the resolver-only defensive arms (List<Unsupported>,
-# Interval, negative-scale decimal — unreachable via a real Parquet write) are omitted.
+# later live Snowflake(MySQL) coverage, tracked in the inventory. The resolver-only
+# defensive arms (List<Unsupported>, Interval, negative-scale decimal — unreachable via a
+# real Parquet write today) are pinned by offline unit tests so a future arm edit can't
+# silently drop them.
 
 engines: [duckdb, bigquery, snowflake, clickhouse]
 
@@ -111,3 +112,24 @@ scenarios:
     bigquery:   { test: bq_unsupported_is_fail_row_not_panic }
     snowflake:  { test: resolver_remediation_contract_holds_across_all_targets }
     clickhouse: { test: resolver_remediation_contract_holds_across_all_targets }
+
+  - id: interval
+    what: "interval maps to a text/native type per target (BQ STRING / DuckDB INTERVAL / SF TEXT / CH String), never silently dropped to Fail"
+    duckdb:     { test: interval_resolves_to_a_text_or_native_type_per_target }
+    bigquery:   { test: interval_resolves_to_a_text_or_native_type_per_target }
+    snowflake:  { test: interval_resolves_to_a_text_or_native_type_per_target }
+    clickhouse: { test: interval_resolves_to_a_text_or_native_type_per_target }
+
+  - id: list_of_unsupported
+    what: "a list whose element type has no mapping must be a Fail row — not a panic, not a dropped column (the nested-fail arm, per target)"
+    duckdb:     { test: list_of_unsupported_element_fails_on_every_target }
+    bigquery:   { test: list_of_unsupported_element_fails_on_every_target }
+    snowflake:  { test: list_of_unsupported_element_fails_on_every_target }
+    clickhouse: { test: list_of_unsupported_element_fails_on_every_target }
+
+  - id: decimal_negative_scale
+    what: "negative-scale decimal (resolver-only — the Parquet writer rejects it today, but the arm is live code): BQ fails, DuckDB/SF/CH warn + declared schema"
+    duckdb:     { test: decimal_negative_scale_is_handled_not_dropped_per_target }
+    bigquery:   { test: decimal_negative_scale_is_handled_not_dropped_per_target }
+    snowflake:  { test: decimal_negative_scale_is_handled_not_dropped_per_target }
+    clickhouse: { test: decimal_negative_scale_is_handled_not_dropped_per_target }

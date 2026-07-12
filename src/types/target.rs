@@ -1305,6 +1305,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn list_of_unsupported_element_fails_on_every_target() {
+        // A nested unsupported element must be a Fail row (not a panic, not a
+        // silently-dropped column) on every target — the arms exist per target
+        // but were untested. `List<Unsupported>` is the only way to reach them.
+        let bad = RivetType::List {
+            inner: Box::new(RivetType::Unsupported {
+                native_type: "geometry".into(),
+                reason: "no Arrow mapping".into(),
+            }),
+        };
+        for spec in [bq(&bad), duck(&bad), sf(&bad), ch(&bad)] {
+            assert_eq!(
+                spec.status,
+                TargetStatus::Fail,
+                "a list of an unsupported element must fail cleanly"
+            );
+        }
+    }
+
+    #[test]
+    fn interval_resolves_to_a_text_or_native_type_per_target() {
+        // Interval maps per target (BQ STRING / DuckDB INTERVAL / SF TEXT / CH String)
+        // — pin it so a future arm edit can't silently drop it to Fail.
+        assert_eq!(bq(&RivetType::Interval).target_type, "STRING");
+        assert_eq!(duck(&RivetType::Interval).target_type, "INTERVAL");
+        assert_eq!(sf(&RivetType::Interval).target_type, "TEXT");
+        assert_eq!(ch(&RivetType::Interval).target_type, "String");
+        for spec in [
+            bq(&RivetType::Interval),
+            duck(&RivetType::Interval),
+            sf(&RivetType::Interval),
+            ch(&RivetType::Interval),
+        ] {
+            assert_eq!(spec.status, TargetStatus::Ok);
+        }
+    }
+
+    #[test]
+    fn decimal_negative_scale_is_handled_not_dropped_per_target() {
+        // Negative-scale decimals are rejected by the Parquet writer today, so this
+        // arm is resolver-only — but it is live code and must not silently vanish.
+        // BigQuery fails (no negative scale); DuckDB/Snowflake/ClickHouse warn +
+        // route via a declared schema.
+        let neg = RivetType::Decimal {
+            precision: 10,
+            scale: -2,
+        };
+        assert_eq!(bq(&neg).status, TargetStatus::Fail);
+        assert_eq!(duck(&neg).status, TargetStatus::Warn);
+        assert_eq!(sf(&neg).status, TargetStatus::Warn);
+        assert_eq!(ch(&neg).status, TargetStatus::Warn);
+    }
+
     // ── L5 recovery SQL (the post-load transform for BigQuery autoload) ───────
 
     #[test]
@@ -1422,6 +1476,54 @@ mod tests {
         assert!(body.contains("TO_HEX(uid) AS uid"));
         assert!(body.contains("DATETIME(created_at) AS created_at"));
         assert!(body.contains("UNNEST(tags) AS el) AS tags"));
+    }
+
+    #[test]
+    fn clickhouse_recovery_sql_casts_uuid_from_its_own_cast_sql() {
+        use super::super::SourceColumn;
+        // The live clickhouse_load test hand-writes a toUUID expr; this pins the
+        // resolver's OWN emitted recovery SQL so a regression in the Rust string is
+        // caught offline. uuid diverges (FixedString(16) -> toUUID); json is a
+        // load-schema note (cast_sql=None) so it passes through; scalars pass through.
+        let cols: [(&str, RivetType); 4] = [
+            ("id", RivetType::Int64),
+            ("attrs", RivetType::Json),
+            ("uid", RivetType::Uuid),
+            ("k", RivetType::Int32),
+        ];
+        let mappings: Vec<_> = cols
+            .iter()
+            .cloned()
+            .map(|(n, rt)| TypeMapping::from_source(&SourceColumn::simple(n, "x", true), rt))
+            .collect();
+        let specs = ExportTarget::ClickHouse.resolve_table(&mappings);
+        let sql = ExportTarget::ClickHouse
+            .recovery_sql(&specs, "events")
+            .expect("ClickHouse has a recovery SQL");
+
+        // uuid recovers via the resolver's emitted cast, not a hand-written expr.
+        assert!(
+            sql.contains("toUUID(concat(") && sql.contains("hex(uid)") && sql.contains("AS uid"),
+            "uuid must recover via the emitted toUUID cast:\n{sql}"
+        );
+        // json has no lossless SELECT-time cast (declared at load) — passes through.
+        assert!(sql.contains("  attrs") && !sql.contains("AS attrs"));
+        // scalars pass through unchanged.
+        assert!(sql.contains("  id") && !sql.contains("AS id"));
+        // Reads the autoload staging table, writes the recovered MergeTree table.
+        assert!(sql.contains("CREATE TABLE events ENGINE = MergeTree"));
+        assert!(sql.contains("FROM events__staging"));
+        // Exactly one projection per column — nothing dropped or duplicated.
+        let body = sql
+            .split("SELECT\n")
+            .nth(1)
+            .and_then(|s| s.split("\nFROM").next())
+            .expect("recovery SQL has a SELECT … FROM body");
+        assert_eq!(
+            body.split(",\n").count(),
+            cols.len(),
+            "one projection per column:\n{body}"
+        );
     }
 
     // ── Snowflake (verified live 2026-06-01) ─────────────────────────────────
