@@ -11,8 +11,10 @@
 # mislabeled DECIMAL instead of DOUBLE; ClickHouse decimal>76 falsely Ok) — all fixed.
 #
 # Coverage depth note: DuckDB/ClickHouse/BigQuery have live round-trip validators for
-# PG/MySQL/MSSQL; Snowflake has a live validator for PostgreSQL only. Cells marked with
-# an offline resolver/oracle test (all_types_oracle.rs, target.rs mod tests) are
+# PG/MySQL/MSSQL; Snowflake has a live PostgreSQL matrix validator plus a live MySQL
+# UInt64-overflow test (the one type PG can't produce — the overflow class is now
+# live-proven, not offline-only). Cells marked with an offline resolver/oracle test
+# (all_types_oracle.rs, target.rs mod tests) are
 # CONTRACT-verified but not always live-round-tripped — a deliberate ratchet target for
 # later live Snowflake(MySQL) coverage, tracked in the inventory. The resolver-only
 # defensive arms (List<Unsupported>, Interval, negative-scale decimal — unreachable via a
@@ -33,7 +35,7 @@ scenarios:
     what: "unsigned 64-bit: overflow class — BQ/SF degrade to a load-schema note, DuckDB/CH hold it natively"
     duckdb:     { test: duckdb_reads_everything_natively }
     bigquery:   { test: bq_uint64_recommends_numeric_warns_overflow }
-    snowflake:  { test: uint64_overflow_is_upstream_only_never_a_select_cast }
+    snowflake:  { test: snowflake_validates_mysql_uint64_overflow_survives_via_decimal_override }
     clickhouse: { test: clickhouse_holds_uint64_and_naive_timestamp_natively }
 
   - id: decimal_normal
