@@ -25,6 +25,66 @@ fn cfg_dir_with(yaml: &str) -> (tempfile::TempDir, std::path::PathBuf) {
 
 #[test]
 #[ignore = "live: requires docker compose postgres"]
+fn incremental_export_with_unwritable_state_db_fails_loud_not_silent() {
+    // A state-store write failure must fail the run LOUDLY — never a silent
+    // success that skips persisting the cursor (that would break at-least-once:
+    // the operator believes the cursor advanced when it did not). rivet writes
+    // rivet_state.db next to the config; a read-only config dir makes the store
+    // unwritable. The state store is engine-agnostic (SQLite), so this is pinned
+    // once on Postgres.
+    require_alive(LiveService::Postgres);
+    let table_name = unique_name("state_wf");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {table_name} (id BIGINT PRIMARY KEY, updated_at TIMESTAMPTZ NOT NULL); \
+         INSERT INTO {table_name} \
+           SELECT g, now() - (interval '1 min') * g FROM generate_series(1,5) g"
+    ))
+    .unwrap();
+    let _guard = PgTable::adopt(table_name.clone());
+
+    let export_name = unique_name("state_wf_exp");
+    let out = tempfile::tempdir().unwrap();
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!("SELECT id, updated_at FROM {table_name}"))
+        .mode("incremental")
+        .export_line("cursor_column: updated_at")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
+    let cfgdir = tempfile::tempdir().unwrap();
+    let cfg = write_config(&cfgdir, &yaml);
+
+    // Make the state-DB directory unwritable — rivet can neither create nor write
+    // rivet_state.db, and must surface that loudly, not swallow it.
+    let mut ro = std::fs::metadata(cfgdir.path()).unwrap().permissions();
+    ro.set_readonly(true);
+    std::fs::set_permissions(cfgdir.path(), ro).unwrap();
+
+    let res = run_rivet_export(&cfg, &export_name);
+
+    // Restore write perms BEFORE asserting so TempDir cleanup always succeeds.
+    use std::os::unix::fs::PermissionsExt;
+    let mut rw = std::fs::metadata(cfgdir.path()).unwrap().permissions();
+    rw.set_mode(0o755);
+    std::fs::set_permissions(cfgdir.path(), rw).unwrap();
+
+    assert!(
+        !res.status.success(),
+        "an unwritable state store must fail the run loudly, not silently succeed"
+    );
+    let stderr = String::from_utf8_lossy(&res.stderr).to_lowercase();
+    assert!(
+        stderr.contains("state")
+            || stderr.contains("readonly")
+            || stderr.contains("read-only")
+            || stderr.contains("permission")
+            || stderr.contains("denied"),
+        "the error must name the state store / the write failure:\n{stderr}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
 fn full_mode_repeated_run_accumulates_manifest_entries() {
     // rivet names output files `<export>_<YYYYMMDD_HHMMSS_mmm>.parquet` with
     // MILLISECOND granularity, so two back-to-back full runs get distinct names

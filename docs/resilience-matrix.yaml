@@ -100,3 +100,10 @@ scenarios:
     mysql:    { na: "the destination write seam (destination::create_destination / commit::write_part_file) is engine-agnostic — pinned once on PostgreSQL" }
     mssql:    { na: "same engine-agnostic destination seam; pinned once on PostgreSQL" }
     mongo:    { na: "same engine-agnostic destination seam; pinned once on PostgreSQL" }
+
+  - id: state_store_write_fail_loud
+    what: "an unwritable state store (SQLite rivet_state.db) fails the run LOUD, never a silent success that skips persisting the cursor"
+    postgres: { test: incremental_export_with_unwritable_state_db_fails_loud_not_silent }
+    mysql:    { na: "the state store is engine-agnostic SQLite (src/state) — pinned once on PostgreSQL" }
+    mssql:    { na: "same engine-agnostic SQLite state store; pinned once on PostgreSQL" }
+    mongo:    { na: "same engine-agnostic SQLite state store; pinned once on PostgreSQL" }
