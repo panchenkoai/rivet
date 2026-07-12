@@ -87,6 +87,21 @@ upstream (load-schema) note, and never a silent no-op. When self-review
 catches a bug of this shape, add the edge-case test alongside the fix,
 not just the fix.
 
+Two sibling facets the coverage matrix later caught in the **same** resolver
+— the `target_type` / `autoload_type` fields must tell the truth, not just
+the `cast_sql`. (1) **Never claim `Ok` for a native type the warehouse
+cannot hold.** Snowflake's decimal arm returned `Ok("NUMBER(50,10)")` with
+no precision ceiling, but Snowflake `NUMBER` maxes at precision 38 — the
+load would reject it; guard the ceiling and `Fail` past it, the way BigQuery
+already does past BIGNUMERIC. (2) **`autoload_type` must be the EMPIRICAL
+autoload, flagged as a divergence when it differs from the target.** DuckDB's
+wide-decimal arm labelled the autoload `"DECIMAL(38,*)"` (== target, so *not*
+counted a divergence), but real DuckDB autoloads `decimal(50,10)` as `DOUBLE`
+(lossy past 2^53). A `warn(t)` that sets `autoload == target` hides a real
+divergence — use `diverge(target, autoload, note, None)` with the true
+autoload when it's lossy. Both were silent: a preflight report confidently
+describing a type the warehouse would reject or silently coerce.
+
 ## CDC resume is per-engine — verify it empirically, twice
 
 A CDC adapter that **captures** correctly can still fail to **resume**:
@@ -131,17 +146,25 @@ CDC sink shipped this way: run N+1's first part clobbered run N's
 so the data was gone from both the source log and the destination — the
 stream-level at-least-once guarantee (peek → flush → ack, fault-hook
 tested) was fully correct and the data was still lost, one layer up. The
-batch path was already immune (run-timestamp part names + a finalize WARN
-on prior `_SUCCESS`); the CDC sink reimplemented naming and silently
-dropped both defenses.
+keyset / mongo_parallel paths were immune (millisecond part stamp) — but the
+plain batch full/incremental path (`src/pipeline/single.rs`) was **NOT**: an
+earlier version of this rule wrongly claimed "the batch path was already
+immune". It stamped parts `%Y%m%d_%H%M%S` (second-granularity, no run id), so
+two sub-second runs into one prefix collided and the later silently
+overwrote the earlier via `idempotent_overwrite`. The resilience coverage
+matrix caught it; a live test lost **3 of 6 incremental deltas** (RED) before
+the one-line fix (`single.rs` → `%3f`, matching `keyset.rs`).
 
 Process rule: **every new sink/writer gets a two-consecutive-runs-into-
 the-same-prefix test** asserting the union of both runs' rows is readable
-afterwards (`roast_second_run_into_same_prefix_must_not_clobber_prior_parts`
-in `src/source/cdc/sink.rs` is the template). Run-uniqueness needs
-sub-second precision: in live verification two scheduler cycles landed
-125 ms apart — a `%Y%m%d_%H%M%S` stamp would have collided; derive the
-name from the millisecond `run_id`, filename-sanitized.
+afterwards. Templates: `roast_second_run_into_same_prefix_must_not_clobber_prior_parts`
+(`src/source/cdc/sink.rs`) and `roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts`
+(`tests/live/live_resume.rs`, the batch path). Run-uniqueness needs sub-second
+precision: two scheduler cycles landed 125 ms apart live — a `%Y%m%d_%H%M%S`
+stamp collides; derive the name from a millisecond stamp or the `run_id`,
+filename-sanitized. **A test that passes only by sleeping ≥1s between runs is
+documenting the gap, not closing it** — the batch clobber hid behind exactly
+such a `sleep(1100ms)` for months.
 
 ## Silent-loss classes from the live GCS run: cells, and names
 
@@ -257,6 +280,18 @@ datestyle, bytea_output, sql_mode) and add one live test that flips the
 state to a non-default (a `+09:00` global, an `Asia/Tokyo` database
 default) with a guard that resets it. Parity at default state is not
 evidence — the default is exactly where the bug hides.
+
+The tz find was only the first bracket. The source-parity sweep under a
+flipped session later caught two MORE on the same `test_decoding` reader:
+`datestyle='German, DMY'` nulled **every** timestamp (the ISO parser choked
+on DMY text) and `bytea_output='escape'` corrupted **every** bytea (the
+reader assumes hex). The fix is not to teach the parser every format — it's
+to **pin the formats on the reader's own connection**
+(`SET datestyle='ISO, MDY'; SET bytea_output='hex'; SET intervalstyle='postgres'`
+in `src/source/postgres/cdc.rs::open`), immune to the DB default. Binary
+readers (MySQL binlog, MSSQL CT, the PG *batch* binary protocol) are exempt
+by construction — this class is text-decode-only. Regression:
+`pg_cdc_non_iso_datestyle_and_escape_bytea_match_batch`.
 
 ## Keyset seek is type-bracketed — a heterogeneous key silently loses all but one type
 

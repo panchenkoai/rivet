@@ -21,6 +21,26 @@ use crate::common::*;
 use mysql::prelude::Queryable;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
+/// Column names of the first parquet part under `dir` — for schema-shape asserts.
+fn parquet_columns(dir: &std::path::Path) -> Vec<String> {
+    for path in files_with_extension(dir, "parquet") {
+        let bytes = std::fs::read(&path).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+            .unwrap()
+            .build()
+            .unwrap();
+        if let Some(Ok(batch)) = reader.into_iter().next() {
+            return batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+        }
+    }
+    vec![]
+}
+
 /// Total rows across every parquet part under `dir` — for "no row loss" asserts.
 fn count_parquet_rows(dir: &std::path::Path) -> usize {
     let mut n = 0;
@@ -697,4 +717,447 @@ fn stand_time_window_mysql() {
 #[ignore = "live: requires docker compose up -d mssql"]
 fn stand_time_window_mssql() {
     run_time_window(Eng::Ms);
+}
+
+// ── cross-config scenarios (docs/cross-config-matrix.yaml) ──────────────────
+
+/// `meta_columns` — the export gains `_rivet_exported_at` + `_rivet_row_hash`.
+/// Engine-agnostic post-read enrichment (src/enrich.rs), so one e2e run proves
+/// the columns actually land in a real export (previously unit-only).
+fn run_meta_columns(eng: Eng) {
+    eng.require();
+    let (table, _guard) = seed_dense(eng, 200);
+    let rig = eng
+        .rig(&table)
+        .mode("full")
+        .export_line("meta_columns:")
+        .export_line("  exported_at: true")
+        .export_line("  row_hash: true");
+    let cfg = rig.config_path();
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+    assert!(
+        out.status.success(),
+        "meta_columns run must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cols = parquet_columns(&rig.out_dir());
+    assert!(
+        cols.iter().any(|c| c == "_rivet_exported_at"),
+        "output must carry _rivet_exported_at; got {cols:?}"
+    );
+    assert!(
+        cols.iter().any(|c| c == "_rivet_row_hash"),
+        "output must carry _rivet_row_hash; got {cols:?}"
+    );
+}
+
+/// `format: csv` — the export writes a non-empty `.csv` (header + rows), not parquet.
+fn run_csv(eng: Eng) {
+    eng.require();
+    let (table, _guard) = seed_dense(eng, 200);
+    let rig = eng.rig(&table).mode("full").with_format("csv");
+    let cfg = rig.config_path();
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+    assert!(
+        out.status.success(),
+        "csv run must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let csvs = files_with_extension(&rig.out_dir(), "csv");
+    assert!(!csvs.is_empty(), "csv export must write a .csv file");
+    let lines = std::fs::read_to_string(&csvs[0]).unwrap().lines().count();
+    assert!(
+        lines > 100,
+        "csv must have a header + rows; got {lines} lines"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn stand_meta_columns_postgres() {
+    run_meta_columns(Eng::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_format_csv_mssql() {
+    run_csv(Eng::Ms);
+}
+
+/// `source.environment: local` → the tuning profile defaults to `fast`; the run
+/// summary names the env-derived profile on stderr. Source-level, so raw YAML
+/// (the Rig has no environment knob). PG is covered in live_catalog_hints.
+fn run_environment_profile(eng: Eng) {
+    eng.require();
+    let (table, _guard) = seed_dense(eng, 50);
+    let (src, tbl_ref) = match eng {
+        Eng::My => (
+            format!("source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\n  environment: local"),
+            table.clone(),
+        ),
+        Eng::Ms => (
+            format!(
+                "source:\n  type: mssql\n  url: \"{MSSQL_URL}\"\n  tls:\n    \
+                 accept_invalid_certs: true\n  environment: local"
+            ),
+            format!("dbo.{table}"),
+        ),
+        Eng::Pg => unreachable!("PG environment→profile is covered in live_catalog_hints"),
+    };
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "{src}\nexports:\n  - name: env_prof\n    table: {tbl_ref}\n    mode: full\n    \
+         format: parquet\n    destination: {{ type: local, path: {out} }}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let out = run_rivet_with_warn_log(&["run", "-c", cfg.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "env-profile run failed; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("fast") && stderr.contains("environment: local"),
+        "expected the env-derived fast profile on stderr; got:\n{stderr}"
+    );
+}
+
+/// `compression:` codec matrix — every codec (zstd/snappy/gzip/none) writes a
+/// parquet that reads back with all rows. The Arrow reader decompresses each
+/// codec natively, so this needs no external reader.
+fn run_codec_matrix(eng: Eng) {
+    eng.require();
+    let (table, _guard) = seed_dense(eng, 200);
+    for codec in ["zstd", "snappy", "gzip", "none"] {
+        let rig = eng
+            .rig(&table)
+            .mode("full")
+            .export_line(&format!("compression: {codec}"));
+        let cfg = rig.config_path();
+        let out = run_rivet_env(
+            &["run", "--config", cfg.to_str().unwrap()],
+            &[("RUST_LOG", "warn")],
+        );
+        assert!(
+            out.status.success(),
+            "codec `{codec}` run must succeed; stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            count_parquet_rows(&rig.out_dir()),
+            200,
+            "codec `{codec}` must round-trip all rows"
+        );
+    }
+}
+
+/// The source YAML block + the table reference for `eng` (for raw-YAML tests that
+/// the Rig can't render — cloud destinations, environment).
+fn source_block(eng: Eng, table: &str) -> (String, String) {
+    match eng {
+        Eng::Pg => (
+            format!("source:\n  type: postgres\n  url: \"{POSTGRES_URL}\""),
+            format!("public.{table}"),
+        ),
+        Eng::My => (
+            format!("source:\n  type: mysql\n  url: \"{MYSQL_URL}\""),
+            table.to_string(),
+        ),
+        Eng::Ms => (
+            format!(
+                "source:\n  type: mssql\n  url: \"{MSSQL_URL}\"\n  tls:\n    accept_invalid_certs: true"
+            ),
+            format!("dbo.{table}"),
+        ),
+    }
+}
+
+/// Count `.parquet` objects fake-gcs holds under `bucket/prefix` (its JSON list API).
+fn count_gcs_parquet(bucket: &str, prefix: &str) -> usize {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect("127.0.0.1:4443").unwrap();
+    let req = format!(
+        "GET /storage/v1/b/{bucket}/o?prefix={prefix} HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    );
+    s.write_all(req.as_bytes()).unwrap();
+    let mut resp = String::new();
+    let _ = s.read_to_string(&mut resp);
+    resp.matches(".parquet").count()
+}
+
+/// `destination: gcs` (fake-gcs) — the export lands a parquet in the bucket.
+fn run_dest_gcs(eng: Eng) {
+    eng.require();
+    require_alive(LiveService::FakeGcs);
+    let (table, _guard) = seed_dense(eng, 100);
+    let (src, tbl) = source_block(eng, &table);
+    let bucket = "rivet-qa-stand-gcs";
+    ensure_gcs_bucket(bucket);
+    let prefix = unique_name("stand_gcs");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "{src}\nexports:\n  - name: cg\n    table: {tbl}\n    mode: full\n    format: parquet\n    \
+         destination:\n      type: gcs\n      bucket: {bucket}\n      prefix: {prefix}\n      \
+         endpoint: {FAKE_GCS_ENDPOINT}\n      allow_anonymous: true\n"
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+    assert!(
+        out.status.success(),
+        "gcs run failed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        count_gcs_parquet(bucket, &prefix) >= 1,
+        "fake-gcs bucket must hold >=1 parquet under {prefix}"
+    );
+}
+
+/// `destination: s3` (MinIO) — the export lands a parquet in the bucket (mc ls).
+fn run_dest_s3(eng: Eng) {
+    eng.require();
+    require_alive(LiveService::Minio);
+    let (table, _guard) = seed_dense(eng, 100);
+    let (src, tbl) = source_block(eng, &table);
+    let bucket = "rivet-qa-stand-s3";
+    ensure_minio_bucket(bucket);
+    let prefix = unique_name("stand_s3");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "{src}\nexports:\n  - name: cs\n    table: {tbl}\n    mode: full\n    format: parquet\n    \
+         destination:\n      type: s3\n      bucket: {bucket}\n      prefix: {prefix}\n      \
+         region: us-east-1\n      endpoint: {MINIO_ENDPOINT}\n      \
+         access_key_env: RIVET_TEST_MINIO_AK\n      secret_key_env: RIVET_TEST_MINIO_SK\n"
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[
+            ("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY),
+            ("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY),
+            ("AWS_EC2_METADATA_DISABLED", "true"),
+            ("RUST_LOG", "warn"),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "s3 run failed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let script = format!(
+        "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
+         mc ls --recursive local/{bucket}/{prefix} 2>/dev/null"
+    );
+    let ls = std::process::Command::new("docker")
+        .args(["compose", "exec", "-T", "minio", "sh", "-c", &script])
+        .output()
+        .expect("mc ls");
+    let listing = String::from_utf8_lossy(&ls.stdout);
+    assert!(
+        listing.matches(".parquet").count() >= 1,
+        "minio must hold >=1 parquet under {prefix}; got:\n{listing}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql fake-gcs"]
+fn stand_dest_gcs_mysql() {
+    run_dest_gcs(Eng::My);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql fake-gcs"]
+fn stand_dest_gcs_mssql() {
+    run_dest_gcs(Eng::Ms);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql minio"]
+fn stand_dest_s3_mysql() {
+    run_dest_s3(Eng::My);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql minio"]
+fn stand_dest_s3_mssql() {
+    run_dest_s3(Eng::Ms);
+}
+
+// ── Mongo cross-config (Mongo is not a SQL `Eng`; its config shape differs) ──
+
+const MONGO_PORT: u16 = 27017;
+
+/// Seed a fresh Mongo db with `n` int-`_id` docs; returns the db name.
+fn mongo_seed(n: i64) -> String {
+    let db = unique_name("stand_mg");
+    MongoTest::connect(MONGO_PORT, &db).seed_int_id("c", n);
+    db
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn stand_format_csv_mongo() {
+    require_alive(LiveService::Mongo);
+    let db = mongo_seed(200);
+    let rig = Rig::mongo_batch("c")
+        .source_url(&MongoTest::url(MONGO_PORT, &db))
+        .with_format("csv");
+    let cfg = rig.config_path();
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+    assert!(
+        out.status.success(),
+        "mongo csv run must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let csvs = files_with_extension(&rig.out_dir(), "csv");
+    assert!(!csvs.is_empty(), "mongo csv export must write a .csv");
+    let lines = std::fs::read_to_string(&csvs[0]).unwrap().lines().count();
+    assert!(
+        lines > 100,
+        "mongo csv must have header + rows; got {lines}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn stand_compression_codecs_mongo() {
+    require_alive(LiveService::Mongo);
+    let db = mongo_seed(200);
+    for codec in ["zstd", "snappy", "gzip", "none"] {
+        let rig = Rig::mongo_batch("c")
+            .source_url(&MongoTest::url(MONGO_PORT, &db))
+            .export_line(&format!("compression: {codec}"));
+        let cfg = rig.config_path();
+        let out = run_rivet_env(
+            &["run", "--config", cfg.to_str().unwrap()],
+            &[("RUST_LOG", "warn")],
+        );
+        assert!(
+            out.status.success(),
+            "mongo codec `{codec}` run must succeed; stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            count_parquet_rows(&rig.out_dir()),
+            200,
+            "mongo codec `{codec}` must round-trip all docs"
+        );
+    }
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo fake-gcs"]
+fn stand_dest_gcs_mongo() {
+    require_alive(LiveService::Mongo);
+    require_alive(LiveService::FakeGcs);
+    let db = mongo_seed(100);
+    let url = MongoTest::url(MONGO_PORT, &db);
+    let bucket = "rivet-qa-stand-gcs";
+    ensure_gcs_bucket(bucket);
+    let prefix = unique_name("stand_gcs_mg");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "source:\n  type: mongo\n  url: \"{url}\"\nexports:\n  - name: cg\n    table: c\n    \
+         mode: full\n    format: parquet\n    destination:\n      type: gcs\n      bucket: {bucket}\n      \
+         prefix: {prefix}\n      endpoint: {FAKE_GCS_ENDPOINT}\n      allow_anonymous: true\n"
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+    assert!(
+        out.status.success(),
+        "mongo gcs run failed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        count_gcs_parquet(bucket, &prefix) >= 1,
+        "fake-gcs must hold >=1 parquet under {prefix}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo minio"]
+fn stand_dest_s3_mongo() {
+    require_alive(LiveService::Mongo);
+    require_alive(LiveService::Minio);
+    let db = mongo_seed(100);
+    let url = MongoTest::url(MONGO_PORT, &db);
+    let bucket = "rivet-qa-stand-s3";
+    ensure_minio_bucket(bucket);
+    let prefix = unique_name("stand_s3_mg");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "source:\n  type: mongo\n  url: \"{url}\"\nexports:\n  - name: cs\n    table: c\n    \
+         mode: full\n    format: parquet\n    destination:\n      type: s3\n      bucket: {bucket}\n      \
+         prefix: {prefix}\n      region: us-east-1\n      endpoint: {MINIO_ENDPOINT}\n      \
+         access_key_env: RIVET_TEST_MINIO_AK\n      secret_key_env: RIVET_TEST_MINIO_SK\n"
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[
+            ("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY),
+            ("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY),
+            ("AWS_EC2_METADATA_DISABLED", "true"),
+            ("RUST_LOG", "warn"),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "mongo s3 run failed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let script = format!(
+        "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
+         mc ls --recursive local/{bucket}/{prefix} 2>/dev/null"
+    );
+    let ls = std::process::Command::new("docker")
+        .args(["compose", "exec", "-T", "minio", "sh", "-c", &script])
+        .output()
+        .expect("mc ls");
+    let listing = String::from_utf8_lossy(&ls.stdout);
+    assert!(
+        listing.matches(".parquet").count() >= 1,
+        "minio must hold >=1 parquet under {prefix}; got:\n{listing}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_compression_codecs_mysql() {
+    run_codec_matrix(Eng::My);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_compression_codecs_mssql() {
+    run_codec_matrix(Eng::Ms);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_environment_profile_mysql() {
+    run_environment_profile(Eng::My);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_environment_profile_mssql() {
+    run_environment_profile(Eng::Ms);
 }

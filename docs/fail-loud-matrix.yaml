@@ -1,0 +1,73 @@
+# Fail-loud / error-surface coverage matrix — the inverse of silent corruption:
+# for each degradation or unrecoverable failure, does rivet fail LOUD (non-zero
+# exit / bail / an actionable message) rather than silently skip, null, truncate,
+# or report success? Cell = { test } | { gap } | { na }.
+#
+# The worst failure is a SILENT one — a degradation that reports success while
+# dropping data. rivet's design goal is that every unrecoverable degradation is
+# loud, so an operator knows. This matrix pins that per condition.
+#
+# Cross-references (conditions also ledgered elsewhere, cited here for the unified
+# fail-loud view): CDC vanished-anchor has a stricter gate in
+# tests/cdc_conformance_gate.rs; sparse/keyset guards are in docs/chunking-matrix.yaml;
+# destination-outage + state-store-write-fail are in docs/resilience-matrix.yaml;
+# UInt64 overflow is a target-axis WARN (not a bail) in docs/warehouse-load-matrix.yaml.
+
+engines: [postgres, mysql, mssql, mongo]
+
+scenarios:
+  - id: cdc_vanished_anchor_loud
+    what: "CDC resume anchor gone (slot dropped / binlog purged / LSN past retention) → loud error naming re-snapshot, never a silent re-anchor that skips changes"
+    postgres: { test: pg_cdc_vanished_slot_with_checkpoint_fails_loudly_not_recreates }
+    mysql:    { test: cdc_resume_from_missing_binlog_fails_loudly_not_silently }
+    mssql:    { test: mssql_cdc_resume_past_retention_errors_not_a_silent_gap }
+    mongo:    { na: "an oplog-rolled-past resume token surfaces the driver's ChangeStreamHistoryLost directly (rivet does not swallow it — src/source/mongo/cdc.rs); forcing an oplog rollover live is impractical (documented NA in cdc_conformance_gate.rs). The adjacent corrupt-checkpoint case IS tested: roast_corrupt_checkpoint_fails_loudly_not_silent_reanchor" }
+
+  - id: hostile_numeric_value_loud
+    what: "a non-finite value (NaN/Inf) in a lossy fixed-point numeric → loud error, never a silent NULL / truncate-to-zero"
+    postgres: { test: pg_cdc_hostile_floats_match_batch_and_nan_numeric_fails_loudly }
+    mysql:    { na: "MySQL DECIMAL cannot hold NaN/Inf; float NaN is representable in Parquet (preserved, not degraded) — no lossy-numeric bail path" }
+    mssql:    { test: non_finite_money_is_a_loud_error_not_a_silent_null }
+    mongo:    { na: "BSON double NaN is representable in Parquet; the NaN-as-_id keyset refusal is a separate row (unusable_keyset_key_loud)" }
+
+  - id: sparse_range_plan_guard
+    what: "a sparse range-chunk key that would blow up into thousands of near-empty windows → bail (PG/MSSQL, scan-free estimate proves ≥4×) or loud warn (MySQL, no trustworthy estimate)"
+    postgres: { test: stand_sparse_guard_postgres }
+    mysql:    { test: stand_sparse_guard_mysql }
+    mssql:    { test: stand_sparse_guard_mssql }
+    mongo:    { na: "Mongo pages _id with a keyset seek — no BETWEEN key-span to divide; its guard family is the heterogeneous/NaN _id detector" }
+
+  - id: unusable_keyset_key_loud
+    what: "keyset requested on a key that isn't single-column NOT NULL UNIQUE/PK (or a heterogeneous BSON _id on Mongo) → bail pointing at the fix; the full scan stays the working remediation"
+    postgres: { test: stand_keyset_non_usable_bail_postgres }
+    mysql:    { test: stand_keyset_non_usable_bail_mysql }
+    mssql:    { na: "the refusal is engine-agnostic plan logic (src/plan/build.rs, is_usable_keyset_key); only the ACCEPT side is engine-specific (mssql_keyset_on_non_pk_unique_index) — pinned once on PG+MySQL" }
+    mongo:    { test: mongo_keyset_on_heterogeneous_id_errors_loudly_full_scan_still_works }
+
+  - id: strict_mode_unsafe_type_gates
+    what: "--strict + an unsafe/unsupported source type (or a target-Fail type) → non-zero exit naming the column; without --strict, a printed un-gated note"
+    postgres: { test: check_strict_exits_nonzero_for_unsafe_type }
+    mysql:    { na: "the --strict gate is engine-agnostic (src/preflight) — it gates on the type report, not the source engine; the PG unsafe-type fixture pins the gate" }
+    mssql:    { na: "same engine-agnostic strict gate; pinned once on Postgres" }
+    mongo:    { na: "same engine-agnostic strict gate; pinned once on Postgres" }
+
+  - id: cross_shape_manifest_clobber_refused
+    what: "a batch export and a CDC export sharing one destination prefix → refused (their manifests would clobber), never a silent overwrite"
+    postgres: { test: cross_shape_overwrite_is_refused_same_shape_allowed }
+    mysql:    { test: cdc_scaffold_gets_its_own_prefix_and_cross_shape_overwrite_is_refused }
+    mssql:    { na: "guard_manifest_mode is engine-agnostic (src/manifest.rs), reached from every pipeline path — pinned by the PG offline unit + the MySQL live test" }
+    mongo:    { na: "same engine-agnostic manifest-mode guard; pinned once" }
+
+  - id: remote_plaintext_tls_refused
+    what: "a remote (non-loopback) plaintext connection with no tls: block → refused on policy (CWE-319), not attempted; loopback plaintext stays allowed"
+    postgres: { test: sec_remote_plaintext_pg_is_loud }
+    mysql:    { na: "require_tls_or_loopback is one shared gate reached from every engine's connect path (src/source/mod.rs) — pinned by the PG live test + offline units gate_refuses_remote_plaintext_only" }
+    mssql:    { na: "same engine-agnostic TLS gate; pinned once on Postgres" }
+    mongo:    { na: "same engine-agnostic TLS gate; pinned once on Postgres" }
+
+  - id: uint64_overflow_is_warn_not_bail
+    what: "UInt64 > INT64_MAX is NOT a fail-loud condition by design — Parquet holds it losslessly (TypeFidelity::Exact); the divergence is warehouse autoload, a WARN + load-schema note, excluded from --strict's fatal gate"
+    postgres: { na: "target-axis condition, not a source-engine one — tracked in docs/warehouse-load-matrix.yaml row 'uint64'; a WARN, never a bail" }
+    mysql:    { na: "see postgres — UInt64 rides losslessly as decimal(20,0); the note is advisory, not loud" }
+    mssql:    { na: "SQL Server has no unsigned-64 type; NA by construction" }
+    mongo:    { na: "target-axis condition; tracked in the warehouse-load matrix, not here" }

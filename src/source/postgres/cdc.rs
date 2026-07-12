@@ -77,6 +77,14 @@ impl PgChangeStream {
             }
             _ => Client::connect(conn_str, NoTls)?,
         };
+        // test_decoding renders values as TEXT in the polling SESSION's format, so
+        // pin the formats this reader's parser assumes — otherwise a non-default
+        // database `datestyle` (e.g. 'German, DMY') nulls every timestamp and a
+        // non-hex `bytea_output` corrupts every bytea, silently (verified via the
+        // source-parity sweep under a flipped session). Immune to the DB default.
+        client.batch_execute(
+            "SET datestyle = 'ISO, MDY'; SET bytea_output = 'hex'; SET intervalstyle = 'postgres';",
+        )?;
         let exists: bool = client
             .query_one(
                 "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",

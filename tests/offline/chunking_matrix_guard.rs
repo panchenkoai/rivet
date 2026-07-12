@@ -4,8 +4,10 @@
 //! The sparse-key footgun shipped because a whole guard had ZERO engine-level
 //! tests and nobody noticed. This guard makes the ledgers self-protecting:
 //!
-//! 1. Every scenario MUST carry a cell for every engine (deserialization fails
-//!    otherwise) — no silently-missing engine.
+//! 1. Every scenario MUST carry a cell for every column the matrix declares in
+//!    its `engines:` list — no silently-missing column. Columns are dynamic
+//!    (engine names like `postgres`, or warehouse targets like `bigquery`), so
+//!    one guard covers ledgers keyed on either axis.
 //! 2. Every cell is EXACTLY one of `test:` / `gap:` / `na:`.
 //! 3. Every `test:` fn named in the ledger MUST exist in the repo — a renamed or
 //!    deleted test can't silently orphan a matrix cell.
@@ -13,7 +15,7 @@
 //!    cannot ADD a gap. Filling a gap (gap → test) lets you lower the baseline;
 //!    the ratchet only ever tightens.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -30,35 +32,49 @@ use serde::Deserialize;
 const MATRICES: &[(&str, usize)] = &[
     ("docs/chunking-matrix.yaml", 0),
     ("docs/behaviour-matrix.yaml", 0),
+    ("docs/type-fidelity-matrix.yaml", 0),
+    // Cross config × db: 15 honest holes on the non-PG engines (cloud dests, codec
+    // parity, csv, tuning profile) — visible + un-growable; fill by writing the test.
+    ("docs/cross-config-matrix.yaml", 0),
+    // CDC — the most engine-divergent surface (12 scenarios × 4 engines). Complements
+    // tests/cdc_conformance_gate.rs. The 5 holes it surfaced (schema-drift on PG +
+    // MSSQL, until_current-terminates-under-load on the three SQL engines) are now
+    // filled — every cell is a test or a justified n/a.
+    ("docs/cdc-matrix.yaml", 0),
+    // Resilience / crash-recovery (BATCH + cross-cutting). Both Mongo holes closed:
+    // batch-clobber filled with a live test; crash-after-source-read is na (that
+    // hook is single.rs-only, and Mongo runs the keyset path).
+    ("docs/resilience-matrix.yaml", 0),
+    // Warehouse-load — the Parquet→warehouse-autoload axis, keyed on the 4
+    // ExportTarget variants (duckdb/bigquery/snowflake/clickhouse), not source
+    // engines. Caught + fixed 3 resolver bugs (SF/DuckDB/CH decimal ceilings). 0
+    // gaps: every reachable degradation-prone (type × target) cell is tested.
+    ("docs/warehouse-load-matrix.yaml", 0),
+    // Fail-loud / error-surface — the inverse of silent corruption: every
+    // unrecoverable degradation fails LOUD, not silently. Cross-references the CDC
+    // conformance gate + chunking/resilience/warehouse ledgers for the unified view.
+    ("docs/fail-loud-matrix.yaml", 0),
 ];
 
 #[derive(Deserialize)]
 struct Matrix {
+    /// The column set — every scenario must carry a cell for each. Declared
+    /// per-matrix so a ledger can be keyed on engines (postgres/mysql/…) or on
+    /// warehouse targets (duckdb/bigquery/…) with the same guard.
+    engines: Vec<String>,
     scenarios: Vec<Scenario>,
 }
 
-/// Every scenario names all four engine cells explicitly, so a missing engine is
-/// a deserialization error, not a silent hole.
-// `what:` in the YAML is human-facing documentation; serde ignores unknown keys,
-// so the struct needn't carry it.
+/// `id` + `what:` (docs) are named fields; every other key flattens into
+/// `cells` as one Cell per column. A missing column is caught at validation
+/// (against `Matrix::engines`), a malformed cell at deserialization.
 #[derive(Deserialize)]
 struct Scenario {
     id: String,
-    postgres: Cell,
-    mysql: Cell,
-    mssql: Cell,
-    mongo: Cell,
-}
-
-impl Scenario {
-    fn cells(&self) -> [(&str, &Cell); 4] {
-        [
-            ("postgres", &self.postgres),
-            ("mysql", &self.mysql),
-            ("mssql", &self.mssql),
-            ("mongo", &self.mongo),
-        ]
-    }
+    #[serde(default, rename = "what")]
+    _what: Option<String>,
+    #[serde(flatten)]
+    cells: HashMap<String, Cell>,
 }
 
 #[derive(Deserialize)]
@@ -72,6 +88,23 @@ impl Cell {
     /// Exactly one of test/gap/na must be set.
     fn kind_count(&self) -> usize {
         self.test.is_some() as usize + self.gap.is_some() as usize + self.na.is_some() as usize
+    }
+}
+
+impl Scenario {
+    /// `(column, cell)` for every column the matrix declares; panics if a
+    /// column is absent (a silently-missing column is exactly the hole the
+    /// guard exists to catch).
+    fn resolved_cells<'a>(&'a self, engines: &'a [String], path: &str) -> Vec<(&'a str, &'a Cell)> {
+        engines
+            .iter()
+            .map(|eng| {
+                let cell = self.cells.get(eng).unwrap_or_else(|| {
+                    panic!("{path} scenario '{}' is missing column '{}'", self.id, eng)
+                });
+                (eng.as_str(), cell)
+            })
+            .collect()
     }
 }
 
@@ -129,12 +162,16 @@ fn matrix_every_cell_is_exactly_one_kind() {
     for (path, _) in MATRICES {
         let matrix = load_matrix(path);
         assert!(!matrix.scenarios.is_empty(), "{path} has no scenarios");
+        assert!(
+            !matrix.engines.is_empty(),
+            "{path} declares no engines/columns"
+        );
         for sc in &matrix.scenarios {
-            for (eng, cell) in sc.cells() {
+            for (eng, cell) in sc.resolved_cells(&matrix.engines, path) {
                 assert_eq!(
                     cell.kind_count(),
                     1,
-                    "{path} scenario '{}' engine '{}': a cell must be exactly one of test/gap/na",
+                    "{path} scenario '{}' column '{}': a cell must be exactly one of test/gap/na",
                     sc.id,
                     eng
                 );
@@ -149,11 +186,11 @@ fn matrix_every_mapped_test_exists() {
     for (path, _) in MATRICES {
         let matrix = load_matrix(path);
         for sc in &matrix.scenarios {
-            for (eng, cell) in sc.cells() {
+            for (eng, cell) in sc.resolved_cells(&matrix.engines, path) {
                 if let Some(test) = &cell.test {
                     assert!(
                         fns.contains(test),
-                        "{path} scenario '{}' engine '{}' maps to test `{}`, but no `fn {}` exists \
+                        "{path} scenario '{}' column '{}' maps to test `{}`, but no `fn {}` exists \
                          under src/ or tests/ — a renamed/deleted test orphaned a matrix cell",
                         sc.id,
                         eng,
@@ -173,7 +210,7 @@ fn matrix_gaps_do_not_exceed_ratchet() {
         let gaps: usize = matrix
             .scenarios
             .iter()
-            .flat_map(|sc| sc.cells())
+            .flat_map(|sc| sc.resolved_cells(&matrix.engines, path))
             .filter(|(_, c)| c.gap.is_some())
             .count();
         // Exactly-equal is the ratchet in BOTH directions: `> ceiling` means a gap

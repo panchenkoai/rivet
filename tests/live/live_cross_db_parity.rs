@@ -313,3 +313,63 @@ exports:
         "mysql chunked id-set must equal source 0..{ROWS} — a missing id is a boundary DROP"
     );
 }
+
+/// Head-to-head parity extended to SQL Server: PG and MSSQL, seeded identically
+/// (`id 0..ROWS`, `amount = id*1.5`), must export the same row count and the same
+/// `id`-set. Closes the MSSQL cell of `docs/cross-config-matrix.yaml::cross_db_parity`
+/// — previously MSSQL only had its own independent differential, never a
+/// cross-engine agreement check.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres mssql"]
+fn pg_and_mssql_full_exports_agree_on_row_count_and_id_set() {
+    require_alive(LiveService::Postgres);
+    require_alive(LiveService::Mssql);
+    const ROWS: i64 = 500;
+
+    let pg_table = seed_pg_numeric_table(ROWS);
+    let ms_table = seed_mssql_numeric_table(ROWS);
+
+    let pg_out = tempfile::tempdir().unwrap();
+    let pg_path = export_to_parquet_local(
+        POSTGRES_URL,
+        "postgres",
+        &format!("SELECT id, name, amount FROM {}", pg_table.name()),
+        pg_out.path(),
+    );
+
+    // MSSQL needs the tls opt-in, which `export_to_parquet_local` doesn't render.
+    let ms_out = tempfile::tempdir().unwrap();
+    let ms_path = {
+        let export_name = unique_name("qa33ms");
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            "source:\n  type: mssql\n  url: \"{MSSQL_URL}\"\n  tls:\n    accept_invalid_certs: true\n\
+             exports:\n  - name: {export_name}\n    query: \"SELECT id, name, amount FROM dbo.{tbl}\"\n    \
+             mode: full\n    format: parquet\n    destination:\n      type: local\n      path: {out}\n",
+            tbl = ms_table.name(),
+            out = ms_out.path().display(),
+        );
+        let cfg = write_config(&cfg_dir, &yaml);
+        let out = run_rivet_export(&cfg, &export_name);
+        assert!(
+            out.status.success(),
+            "mssql export failed; stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        files_with_extension(ms_out.path(), "parquet")
+            .into_iter()
+            .next()
+            .expect("one mssql parquet")
+    };
+
+    assert_eq!(
+        read_total_rows(&pg_path),
+        read_total_rows(&ms_path),
+        "PG and MSSQL must export equal row counts"
+    );
+    assert_eq!(
+        read_id_set(&pg_path),
+        read_id_set(&ms_path),
+        "PG and MSSQL must export equal id-sets"
+    );
+}

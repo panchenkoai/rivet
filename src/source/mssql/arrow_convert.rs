@@ -686,6 +686,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn non_finite_money_is_a_loud_error_not_a_silent_null() {
+        // MONEY/SMALLMONEY arrive as f64 from tiberius; a NaN/Inf (a corrupt or
+        // hostile wire payload) must bail LOUD, never silently NULL or truncate
+        // to 0. The bail existed but was untested (fail-loud coverage matrix).
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                f64_to_scaled_i128(bad, 4).is_err(),
+                "non-finite money {bad:?} must be a loud error, not a silent null"
+            );
+        }
+        // Guard-rail: the finite happy path still works (the bail didn't over-reach).
+        assert!(f64_to_scaled_i128(12.34, 4).is_ok());
+    }
+
     // ROAST-RED mssql-rescale-loud: lossless guards — these already pass and
     // must keep passing once the lossy-down-scale fix lands (the fix must only
     // reject down-scales with a non-zero remainder, not all down-scales).

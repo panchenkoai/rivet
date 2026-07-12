@@ -927,3 +927,143 @@ fn mssql_cdc_resume_past_retention_errors_not_a_silent_gap() {
         "the error must name the retention gap + the re-snapshot remedy, got:\n{stderr}"
     );
 }
+
+// ─── schema drift + bounded-run termination (coverage-matrix gap fills) ──────
+
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_column_added_via_new_capture_instance_is_captured() {
+    // Schema-drift on SQL Server is a correctness cliff: `ALTER TABLE ADD COLUMN`
+    // does NOT widen the existing capture instance — its `cdc.<ci>_CT` keeps the
+    // old columns, so a run pointed at the old instance never sees the new column.
+    // The documented recovery is a SECOND capture instance (SQL Server allows two
+    // per table). This proves rivet, pointed at the new instance, resolves and
+    // emits the WIDER schema — reading the old instance would silently drop `w`.
+    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("rivet_cdc_msdrift");
+    let ci1 = format!("dbo_{table}_v1");
+    let ci2 = format!("dbo_{table}_v2");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id BIGINT PRIMARY KEY, v INT)"
+    ));
+    mssql_cdc_exec(
+        "IF NOT EXISTS(SELECT 1 FROM sys.databases WHERE name='rivet' AND is_cdc_enabled=1) \
+         EXEC sys.sp_cdc_enable_db;",
+    );
+    mssql_cdc_exec(&format!(
+        "EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'{table}', \
+         @role_name=NULL, @capture_instance=N'{ci1}';"
+    ));
+    let _g1 = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci1.clone(),
+    };
+
+    // A change under the original (id, v) schema, captured by ci1.
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (1,10)"));
+    wait_for_capture(&ci1, 1);
+    let ckpt1 = d.path().join("cdc1.ckpt");
+    let out1 = d.path().join("out1");
+    std::fs::create_dir_all(&out1).unwrap();
+    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci1, &ckpt1, &out1));
+    assert!(
+        !dir_parquet_has_column(&out1, "w"),
+        "ci1 predates the added column"
+    );
+
+    // Add a column; ci1 CANNOT widen — create a SECOND capture instance for the
+    // (id, v, w) shape (this is the documented drift-recovery path).
+    mssql_cdc_exec(&format!("ALTER TABLE dbo.{table} ADD w VARCHAR(20)"));
+    mssql_cdc_exec(&format!(
+        "EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'{table}', \
+         @role_name=NULL, @capture_instance=N'{ci2}';"
+    ));
+    let _g2 = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci2.clone(),
+    };
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (2,20,'hello')"));
+    wait_for_capture(&ci2, 1);
+
+    // A run pointed at the NEW instance must expose the added column.
+    let ckpt2 = d.path().join("cdc2.ckpt");
+    let out2 = d.path().join("out2");
+    std::fs::create_dir_all(&out2).unwrap();
+    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci2, &ckpt2, &out2));
+    assert!(
+        dir_parquet_has_column(&out2, "w"),
+        "the new capture instance must expose the column added after ci1"
+    );
+    assert!(
+        dir_parquet_distinct_strings(&out2, "w").contains("hello"),
+        "the added column's value must be captured, not nulled"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_until_current_terminates_under_sustained_writes() {
+    // Peer of the Mongo roast_until_current_terminates_under_sustained_writes.
+    // The `until_current` bound is `get_max_lsn()` pinned at open; a writer that
+    // keeps committing advances the DB LSN, but the bounded run must still stop at
+    // the open-time bound (not chase it) and keep the pre-open backlog.
+    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("rivet_cdc_mshb");
+    let ci = format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id BIGINT PRIMARY KEY, v INT)"
+    ));
+    enable_cdc(&table, &ci);
+    let _guard = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+
+    // Pre-open backlog: ids 0..30 (wait for the async capture job to copy them).
+    let vals: Vec<String> = (0..30).map(|i| format!("({i},{i})")).collect();
+    mssql_cdc_exec(&format!(
+        "INSERT INTO dbo.{table} VALUES {}",
+        vals.join(",")
+    ));
+    wait_for_capture(&ci, 30);
+
+    // A writer committing continuously while the bounded run drains.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_bg = stop.clone();
+    let table_bg = table.clone();
+    let bg = std::thread::spawn(move || {
+        let mut i = 10_000i64;
+        while !stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
+            mssql_cdc_try_exec(&format!("INSERT INTO dbo.{table_bg} VALUES ({i},{i})"));
+            i += 1;
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+
+    let ckpt = d.path().join("cdc.ckpt");
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let elapsed = run_rivet_bounded(
+        &mssql_cdc_config(&d, &table, &ci, &ckpt, &out),
+        Duration::from_secs(30),
+    );
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = bg.join();
+
+    assert!(
+        elapsed.is_some(),
+        "until_current must terminate under sustained writes (killed at the 30s ceiling)"
+    );
+    let ids: std::collections::BTreeSet<i64> = dir_parquet_i64(&out, "id").into_iter().collect();
+    for i in 0..30 {
+        assert!(
+            ids.contains(&i),
+            "backlog id {i} must be captured, got {} ids",
+            ids.len()
+        );
+    }
+}

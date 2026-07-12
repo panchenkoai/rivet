@@ -25,13 +25,73 @@ fn cfg_dir_with(yaml: &str) -> (tempfile::TempDir, std::path::PathBuf) {
 
 #[test]
 #[ignore = "live: requires docker compose postgres"]
+fn incremental_export_with_unwritable_state_db_fails_loud_not_silent() {
+    // A state-store write failure must fail the run LOUDLY — never a silent
+    // success that skips persisting the cursor (that would break at-least-once:
+    // the operator believes the cursor advanced when it did not). rivet writes
+    // rivet_state.db next to the config; a read-only config dir makes the store
+    // unwritable. The state store is engine-agnostic (SQLite), so this is pinned
+    // once on Postgres.
+    require_alive(LiveService::Postgres);
+    let table_name = unique_name("state_wf");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {table_name} (id BIGINT PRIMARY KEY, updated_at TIMESTAMPTZ NOT NULL); \
+         INSERT INTO {table_name} \
+           SELECT g, now() - (interval '1 min') * g FROM generate_series(1,5) g"
+    ))
+    .unwrap();
+    let _guard = PgTable::adopt(table_name.clone());
+
+    let export_name = unique_name("state_wf_exp");
+    let out = tempfile::tempdir().unwrap();
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!("SELECT id, updated_at FROM {table_name}"))
+        .mode("incremental")
+        .export_line("cursor_column: updated_at")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
+    let cfgdir = tempfile::tempdir().unwrap();
+    let cfg = write_config(&cfgdir, &yaml);
+
+    // Make the state-DB directory unwritable — rivet can neither create nor write
+    // rivet_state.db, and must surface that loudly, not swallow it.
+    let mut ro = std::fs::metadata(cfgdir.path()).unwrap().permissions();
+    ro.set_readonly(true);
+    std::fs::set_permissions(cfgdir.path(), ro).unwrap();
+
+    let res = run_rivet_export(&cfg, &export_name);
+
+    // Restore write perms BEFORE asserting so TempDir cleanup always succeeds.
+    use std::os::unix::fs::PermissionsExt;
+    let mut rw = std::fs::metadata(cfgdir.path()).unwrap().permissions();
+    rw.set_mode(0o755);
+    std::fs::set_permissions(cfgdir.path(), rw).unwrap();
+
+    assert!(
+        !res.status.success(),
+        "an unwritable state store must fail the run loudly, not silently succeed"
+    );
+    let stderr = String::from_utf8_lossy(&res.stderr).to_lowercase();
+    assert!(
+        stderr.contains("state")
+            || stderr.contains("readonly")
+            || stderr.contains("read-only")
+            || stderr.contains("permission")
+            || stderr.contains("denied"),
+        "the error must name the state store / the write failure:\n{stderr}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
 fn full_mode_repeated_run_accumulates_manifest_entries() {
-    // rivet names output files `<export>_<YYYYMMDD_HHMMSS>.parquet` (1-second
-    // granularity).  Two full runs in the *same* second therefore produce
-    // identical names and the local backend (idempotent_overwrite=true)
-    // collapses them into one file on disk.  Sleep between runs so each
-    // produces a uniquely-named artefact — that lets us assert both runs
-    // were independently materialised, which is the real contract.
+    // rivet names output files `<export>_<YYYYMMDD_HHMMSS_mmm>.parquet` with
+    // MILLISECOND granularity, so two back-to-back full runs get distinct names
+    // and neither clobbers the other (LocalDestination idempotent_overwrite would
+    // otherwise collapse a same-name pair). No sleep needed — that this passes
+    // rapid-fire is the run-uniqueness contract (regressed for months at
+    // second-granularity; see roast_rapid_incremental_runs_...).
     require_alive(LiveService::Postgres);
     let table = seed_pg_numeric_table(10);
     let out = tempfile::tempdir().unwrap();
@@ -50,8 +110,6 @@ fn full_mode_repeated_run_accumulates_manifest_entries() {
 
     let r1 = run_rivet_export(&cfg, &export_name);
     assert!(r1.status.success(), "first full run failed");
-
-    std::thread::sleep(std::time::Duration::from_millis(1100));
 
     let r2 = run_rivet_export(&cfg, &export_name);
     assert!(r2.status.success(), "second full run failed");
@@ -74,6 +132,65 @@ fn full_mode_repeated_run_accumulates_manifest_entries() {
         dir_parquet_id_set(out.path()),
         (0..10).collect::<std::collections::BTreeSet<i64>>(),
         "full re-export must hold every source id (0..10)"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts() {
+    // Run-uniqueness for the batch incremental path (the src/pipeline/single.rs
+    // part-name stamp). Several incremental runs land in the same wall-clock
+    // SECOND; each exports a different delta (one new row). If the stamp is
+    // second-granularity the later run's file OVERWRITES the earlier's
+    // (LocalDestination idempotent_overwrite) and the earlier delta's rows are
+    // silently LOST — the CDC/keyset/mongo_parallel paths already use a
+    // millisecond stamp to prevent exactly this. N rapid runs cannot each occupy
+    // a distinct second, so a second-granularity stamp is guaranteed to lose at
+    // least one delta. Assert the union of every run's rows survives.
+    require_alive(LiveService::Postgres);
+    const N: i64 = 6;
+    let table_name = unique_name("clobber_inc");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {table_name} (id BIGINT PRIMARY KEY, updated_at TIMESTAMPTZ NOT NULL)"
+    ))
+    .unwrap();
+    let _guard = PgTable::adopt(table_name.clone());
+
+    let export_name = unique_name("clobber_inc_exp");
+    let out = tempfile::tempdir().unwrap();
+    let yaml = Rig::pg_batch(&export_name)
+        .query(&format!(r#"SELECT id, updated_at FROM {table_name}"#))
+        .mode("incremental")
+        .export_line("cursor_column: updated_at")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
+    let (_cfgdir, cfg) = cfg_dir_with(&yaml);
+
+    // Each run inserts one new row (strictly increasing cursor) then exports just
+    // that delta — back to back, no sleep, so multiple runs share a second.
+    for k in 0..N {
+        c.execute(
+            &format!(
+                "INSERT INTO {table_name} (id, updated_at) \
+                 VALUES ({k}, now() + interval '{k} seconds')"
+            ),
+            &[],
+        )
+        .unwrap();
+        let r = run_rivet_export(&cfg, &export_name);
+        assert!(
+            r.status.success(),
+            "incremental run {k} failed:\n{}",
+            String::from_utf8_lossy(&r.stderr)
+        );
+    }
+
+    // The union of all deltas must be every id — no run's part was clobbered.
+    assert_eq!(
+        dir_parquet_id_set(out.path()),
+        (0..N).collect::<std::collections::BTreeSet<i64>>(),
+        "every incremental delta must survive; a clobbered part is silent data loss"
     );
 }
 

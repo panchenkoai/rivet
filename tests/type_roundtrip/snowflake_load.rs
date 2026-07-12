@@ -285,3 +285,105 @@ fn snowflake_validates_postgres_type_matrix_parquet() {
     assert_eq!(r["TAGS_0"], "alpha", "tags[0] element survives");
     assert_eq!(r["NUMS_LEN"], 3, "nums recovers to a 3-element ARRAY");
 }
+
+// ─── MySQL UInt64 overflow → Snowflake (the warehouse-matrix live gap) ──────
+
+#[test]
+#[ignore = "live: requires SNOWFLAKE_TEST_CONNECTION env + snow CLI + docker mysql"]
+fn snowflake_validates_mysql_uint64_overflow_survives_via_decimal_override() {
+    use mysql::prelude::Queryable;
+    require_alive(LiveService::Mysql);
+    let Some(cfg) = sf_config() else {
+        eprintln!("snowflake_load: skipping (SNOWFLAKE_TEST_CONNECTION not set)");
+        return;
+    };
+
+    // The exact gap the warehouse matrix flagged: UInt64 > INT64_MAX had zero LIVE
+    // Snowflake proof (PostgreSQL has no unsigned-64 type; only MySQL produces it,
+    // and there was no snowflake_validates_mysql test). u64::MAX overflows a Parquet
+    // INT64 read, so it MUST ride as decimal(20,0) — the documented override — and
+    // land as Snowflake NUMBER with the value intact, never a silent overflow.
+    const U64_MAX: &str = "18446744073709551615";
+    let tbl = unique_name("sf_u64");
+    let mut c = mysql_connect();
+    c.query_drop(format!(
+        "CREATE TABLE {tbl} (id INT PRIMARY KEY, c_bigint_u BIGINT UNSIGNED NOT NULL)"
+    ))
+    .unwrap();
+    let _tbl = MysqlTable::adopt(tbl.clone());
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1, {U64_MAX})"))
+        .unwrap();
+
+    // Export with the decimal(20,0) override → Parquet DECIMAL(20,0).
+    let out_dir = tempfile::tempdir().unwrap();
+    let d = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        r#"source: {{ type: mysql, url: "{MYSQL_URL}" }}
+exports:
+  - name: {tbl}
+    query: "SELECT id, c_bigint_u FROM {tbl}"
+    mode: full
+    format: parquet
+    columns: {{ c_bigint_u: "decimal(20,0)" }}
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        out = out_dir.path().display(),
+    );
+    run_rivet_ok(&write_config(&d, &yaml));
+    let parquet = files_with_extension(out_dir.path(), "parquet")
+        .into_iter()
+        .next()
+        .expect("one parquet part");
+
+    let tag = unique_name("sfu64");
+    let stage = format!("rivet_stage_{tag}");
+    let file_format = format!("rivet_pq_{tag}");
+    let staging = format!("rivet_stg_{tag}");
+    let _objs = SfObjectsGuard {
+        cfg: &cfg,
+        stage: stage.clone(),
+        file_format: file_format.clone(),
+        staging: staging.clone(),
+    };
+    cfg.run_sql(&format!(
+        "CREATE OR REPLACE FILE FORMAT {file_format} TYPE=PARQUET BINARY_AS_TEXT=FALSE"
+    ));
+    cfg.run_sql(&format!(
+        "CREATE OR REPLACE STAGE {stage} FILE_FORMAT={file_format}"
+    ));
+    cfg.put(&parquet, &stage);
+
+    // Autoload: decimal(20,0) lands as NUMBER — not a truncated/overflowed INT.
+    let inferred = cfg.run_sql(&format!(
+        "SELECT COLUMN_NAME, TYPE FROM TABLE(INFER_SCHEMA(\
+         LOCATION=>'@{stage}', FILE_FORMAT=>'{file_format}'))"
+    ));
+    assert!(
+        infer_type(&inferred, "c_bigint_u").starts_with("NUMBER"),
+        "u64 via decimal(20,0) must autoload as Snowflake NUMBER, got {}",
+        infer_type(&inferred, "c_bigint_u")
+    );
+
+    // Load + read back — the whole point: u64::MAX survives, no overflow.
+    cfg.run_sql(&format!(
+        "CREATE OR REPLACE TABLE {staging} USING TEMPLATE (\
+         SELECT ARRAY_AGG(OBJECT_CONSTRUCT(*)) FROM TABLE(INFER_SCHEMA(\
+         LOCATION=>'@{stage}', FILE_FORMAT=>'{file_format}')))"
+    ));
+    cfg.run_sql(&format!(
+        "COPY INTO {staging} FROM @{stage} FILE_FORMAT=(FORMAT_NAME='{file_format}') \
+         MATCH_BY_COLUMN_NAME=CASE_INSENSITIVE"
+    ));
+    let rows = cfg.run_sql(&format!(
+        r#"SELECT "c_bigint_u"::VARCHAR AS V FROM {staging}"#
+    ));
+    let got = rows
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|r| r["V"].as_str())
+        .unwrap_or("<none>");
+    assert_eq!(
+        got, U64_MAX,
+        "u64::MAX must survive the round-trip into Snowflake NUMBER, not overflow"
+    );
+}

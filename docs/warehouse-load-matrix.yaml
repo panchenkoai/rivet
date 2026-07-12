@@ -1,0 +1,137 @@
+# Warehouse-load coverage matrix — the OTHER axis from type-fidelity: not
+# "does the type survive source→Parquet" but "does it survive Parquet→WAREHOUSE
+# AUTOLOAD". Columns are the four ExportTarget variants (src/types/target.rs), not
+# source engines. Cell = { test } | { gap } | { na }.
+#
+# The bug class this guards (CLAUDE.md "Remediation hints must recover from the
+# degraded state" + its native/autoload-truth extension): the resolver must never
+# claim a native type the warehouse cannot hold, autoload_type must be the EMPIRICAL
+# autoload, and any lossy divergence gets cast_sql only where recovery is real. This
+# matrix caught 3 such bugs (Snowflake decimal>38 falsely Ok; DuckDB decimal>38
+# mislabeled DECIMAL instead of DOUBLE; ClickHouse decimal>76 falsely Ok) — all fixed.
+#
+# Coverage depth note: DuckDB/ClickHouse/BigQuery have live round-trip validators for
+# PG/MySQL/MSSQL; Snowflake has a live PostgreSQL matrix validator plus a live MySQL
+# UInt64-overflow test (the one type PG can't produce — the overflow class is now
+# live-proven, not offline-only). Cells marked with an offline resolver/oracle test
+# (all_types_oracle.rs, target.rs mod tests) are
+# CONTRACT-verified but not always live-round-tripped — a deliberate ratchet target for
+# later live Snowflake(MySQL) coverage, tracked in the inventory. The resolver-only
+# defensive arms (List<Unsupported>, Interval, negative-scale decimal — unreachable via a
+# real Parquet write today) are pinned by offline unit tests so a future arm edit can't
+# silently drop them.
+
+engines: [duckdb, bigquery, snowflake, clickhouse]
+
+scenarios:
+  - id: standard_scalars
+    what: "bool / int / float / date / string / binary — the clean-autoload baseline"
+    duckdb:     { test: duckdb_validates_postgres_type_matrix_parquet }
+    bigquery:   { test: bq_standard_scalars_ok }
+    snowflake:  { test: snowflake_validates_postgres_type_matrix_parquet }
+    clickhouse: { test: clickhouse_validates_postgres_type_matrix_parquet }
+
+  - id: uint64
+    what: "unsigned 64-bit: overflow class — BQ/SF degrade to a load-schema note, DuckDB/CH hold it natively"
+    duckdb:     { test: duckdb_reads_everything_natively }
+    bigquery:   { test: bq_uint64_recommends_numeric_warns_overflow }
+    snowflake:  { test: snowflake_validates_mysql_uint64_overflow_survives_via_decimal_override }
+    clickhouse: { test: clickhouse_holds_uint64_and_naive_timestamp_natively }
+
+  - id: decimal_normal
+    what: "decimal(p,s) within every target's precision — native NUMBER/NUMERIC/DECIMAL"
+    duckdb:     { test: duckdb_native_type_names }
+    bigquery:   { test: bq_decimal_within_numeric_is_numeric }
+    snowflake:  { test: snowflake_autoload_degradations_and_native_casts }
+    clickhouse: { test: clickhouse_validates_postgres_type_matrix_parquet }
+
+  - id: decimal_over_ceiling
+    what: "decimal precision past the target's ceiling — must NOT falsely claim Ok (the bug this matrix caught, 3 engines)"
+    duckdb:     { test: duckdb_decimal_over_38_autoloads_as_double_not_a_false_native_decimal }
+    bigquery:   { test: bq_decimal_limit_boundaries }
+    snowflake:  { test: snowflake_decimal_over_38_fails_not_falsely_ok }
+    clickhouse: { test: clickhouse_decimal_over_76_fails }
+
+  - id: time_of_day
+    what: "Time64 — no native warehouse TIME type on SF/CH (autoloads as NUMBER/Int64)"
+    duckdb:     { test: duckdb_validates_postgres_type_matrix_parquet }
+    bigquery:   { test: bigquery_validates_postgres_type_matrix_parquet }
+    snowflake:  { test: snowflake_autoload_degradations_and_native_casts }
+    clickhouse: { test: clickhouse_time_autoloads_as_int64 }
+
+  - id: timestamp_naive
+    what: "naive timestamp — BQ/SF autoload as INT64/NUMBER (recover via cast), DuckDB/CH native"
+    duckdb:     { test: duckdb_reads_everything_natively }
+    bigquery:   { test: bq_naive_timestamp_is_datetime_native_timestamp_autoload }
+    snowflake:  { test: snowflake_autoload_degradations_and_native_casts }
+    clickhouse: { test: clickhouse_holds_uint64_and_naive_timestamp_natively }
+
+  - id: timestamp_tz
+    what: "tz timestamp — carries the UTC instant; SF needs a session-TZ note"
+    duckdb:     { test: duckdb_validates_postgres_type_matrix_parquet }
+    bigquery:   { test: bq_tz_timestamp_is_timestamp_ok }
+    snowflake:  { test: snowflake_validates_postgres_type_matrix_parquet }
+    clickhouse: { test: clickhouse_validates_postgres_type_matrix_parquet }
+
+  - id: timestamp_nanosecond
+    what: "nanosecond timestamp (datetime2(7) / timestamp_ns override) — the ns autoload truth per target"
+    duckdb:     { test: duckdb_nanosecond_timestamp_is_native_timestamp_ns }
+    bigquery:   { test: bq_nanosecond_timestamp_autoloads_as_int64 }
+    snowflake:  { test: snowflake_nanosecond_timestamp_recovers_losslessly_at_scale_9 }
+    clickhouse: { test: clickhouse_nanosecond_timestamp_is_datetime64_9 }
+
+  - id: json
+    what: "JSON — DuckDB/CH hold it, BQ/SF autoload as bytes/string and recover via PARSE_JSON"
+    duckdb:     { test: duckdb_reads_everything_natively }
+    bigquery:   { test: bq_json_native_is_json_autoload_is_bytes }
+    snowflake:  { test: snowflake_autoload_degradations_and_native_casts }
+    clickhouse: { test: clickhouse_validates_postgres_type_matrix_parquet }
+
+  - id: uuid
+    what: "UUID — autoloads as bytes on BQ/SF/CH, recover via TO_HEX/toUUID; DuckDB native"
+    duckdb:     { test: duckdb_reads_everything_natively }
+    bigquery:   { test: bq_uuid_resolves_not_fails }
+    snowflake:  { test: snowflake_autoload_degradations_and_native_casts }
+    clickhouse: { test: clickhouse_validates_postgres_type_matrix_parquet }
+
+  - id: list_scalar
+    what: "array of a scalar — REPEATED/ARRAY per target, flatten note where autoload nests"
+    duckdb:     { test: duckdb_reads_everything_natively }
+    bigquery:   { test: bq_list_is_repeated_native_record_autoload }
+    snowflake:  { test: snowflake_autoload_degradations_and_native_casts }
+    clickhouse: { test: clickhouse_validates_postgres_type_matrix_parquet }
+
+  - id: enum
+    what: "enum labels ride as text (VARCHAR/String) — no divergence"
+    duckdb:     { test: duckdb_validates_postgres_type_matrix_parquet }
+    bigquery:   { test: bq_standard_scalars_ok }
+    snowflake:  { test: snowflake_enum_autoloads_as_text }
+    clickhouse: { test: clickhouse_enum_autoloads_as_text }
+
+  - id: unsupported
+    what: "a source type with no target mapping is a Fail row, not a panic; the generic remediation contract holds"
+    duckdb:     { test: resolver_remediation_contract_holds_across_all_targets }
+    bigquery:   { test: bq_unsupported_is_fail_row_not_panic }
+    snowflake:  { test: resolver_remediation_contract_holds_across_all_targets }
+    clickhouse: { test: resolver_remediation_contract_holds_across_all_targets }
+
+  - id: interval
+    what: "interval maps to a text/native type per target (BQ STRING / DuckDB INTERVAL / SF TEXT / CH String), never silently dropped to Fail"
+    duckdb:     { test: interval_resolves_to_a_text_or_native_type_per_target }
+    bigquery:   { test: interval_resolves_to_a_text_or_native_type_per_target }
+    snowflake:  { test: interval_resolves_to_a_text_or_native_type_per_target }
+    clickhouse: { test: interval_resolves_to_a_text_or_native_type_per_target }
+
+  - id: list_of_unsupported
+    what: "a list whose element type has no mapping must be a Fail row — not a panic, not a dropped column (the nested-fail arm, per target)"
+    duckdb:     { test: list_of_unsupported_element_fails_on_every_target }
+    bigquery:   { test: list_of_unsupported_element_fails_on_every_target }
+    snowflake:  { test: list_of_unsupported_element_fails_on_every_target }
+    clickhouse: { test: list_of_unsupported_element_fails_on_every_target }
+
+  - id: decimal_negative_scale
+    what: "negative-scale decimal (resolver-only — the Parquet writer rejects it today, but the arm is live code): BQ fails, DuckDB/SF/CH warn + declared schema"
+    duckdb:     { test: decimal_negative_scale_is_handled_not_dropped_per_target }
+    bigquery:   { test: decimal_negative_scale_is_handled_not_dropped_per_target }
+    snowflake:  { test: decimal_negative_scale_is_handled_not_dropped_per_target }
+    clickhouse: { test: decimal_negative_scale_is_handled_not_dropped_per_target }

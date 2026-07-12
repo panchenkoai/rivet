@@ -363,7 +363,11 @@ pub(super) fn run_single_export(
     );
 
     let has_parts = sink.completed_parts.len() > 1;
-    let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+    // Millisecond precision (matches keyset.rs / mongo_parallel.rs / cdc sink):
+    // two runs into the same prefix within the same SECOND must not produce
+    // identical part names, or the later run silently clobbers the earlier's file
+    // (LocalDestination idempotent_overwrite) — a real incremental-delta loss.
+    let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
 
     for (part_idx, part) in sink.completed_parts.iter().enumerate() {
         if plan.validate {

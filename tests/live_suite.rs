@@ -171,6 +171,8 @@ mod live_resume;
 mod live_retry_and_faults;
 #[path = "live/live_schema_drift.rs"]
 mod live_schema_drift;
+#[path = "live/live_source_parity_sweep.rs"]
+mod live_source_parity_sweep;
 #[path = "live/live_temp_spill.rs"]
 mod live_temp_spill;
 #[path = "live/live_wave_apply.rs"]
