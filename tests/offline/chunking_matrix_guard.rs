@@ -50,6 +50,10 @@ const MATRICES: &[(&str, usize)] = &[
     // engines. Caught + fixed 3 resolver bugs (SF/DuckDB/CH decimal ceilings). 0
     // gaps: every reachable degradation-prone (type × target) cell is tested.
     ("docs/warehouse-load-matrix.yaml", 0),
+    // Fail-loud / error-surface — the inverse of silent corruption: every
+    // unrecoverable degradation fails LOUD, not silently. Cross-references the CDC
+    // conformance gate + chunking/resilience/warehouse ledgers for the unified view.
+    ("docs/fail-loud-matrix.yaml", 0),
 ];
 
 #[derive(Deserialize)]
