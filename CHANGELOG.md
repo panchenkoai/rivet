@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.19.1 — 2026-07-12
+
+### Fixed
+
+- **Batch incremental exports no longer silently lose a delta on sub-second
+  reruns.** The full / incremental part-name stamp was second-granularity
+  (`%Y%m%d_%H%M%S`) while keyset / CDC / mongo-parallel already used milliseconds.
+  Two runs into the same destination prefix within the same second produced
+  identical file names, and the local backend (`idempotent_overwrite`) silently
+  overwrote the earlier run's part — an incremental delta's rows were lost (a live
+  test lost 3 of 6). Now millisecond-stamped, matching the other writers.
+- **PostgreSQL CDC under a non-default database `datestyle` / `bytea_output`.**
+  `test_decoding` renders values as TEXT in the polling session's format, and the
+  CDC reader inherited the database default — so `datestyle='German, DMY'` nulled
+  **every** timestamp and `bytea_output='escape'` corrupted **every** bytea,
+  silently. The CDC connection now pins the formats it parses (`SET
+  datestyle='ISO, MDY'`, `bytea_output='hex'`, `intervalstyle='postgres'`), immune
+  to the database default. Binary readers (MySQL binlog, SQL Server change tables,
+  the batch binary protocol) were never affected.
+- **Warehouse `--target` preflight no longer over-promises decimal types.** The
+  type resolver claimed native types the warehouse cannot hold: Snowflake
+  `NUMBER(50,10)` (max precision 38) and ClickHouse `Decimal(80,2)` (max 76) were
+  reported `Ok`, and DuckDB labeled a wide decimal `DECIMAL(38,*)` when it really
+  autoloads as `DOUBLE` (lossy). The resolver now fails / diverges honestly past
+  each ceiling, so the preflight report reflects what the warehouse will actually do.
+
+### Internal
+
+- Six more drift-guarded coverage matrices — type-fidelity, cross-config, CDC,
+  resilience, fail-loud, warehouse-load — join chunking + behaviour for **eight**
+  in all (`docs/*-matrix.yaml`), each `scenario × engine|target → test | gap | na`
+  behind one generalized guard that fails CI on an uncovered or renamed cell.
+  Building them is what surfaced the fixes above.
+- An **independent source-parity sweep** (`dev/sweep/`, wrapped as live tests):
+  per-column count / non-null / distinct / sum of the source (direct query) vs the
+  destination parquet (DuckDB) — not rivet's own counters — across batch + CDC on
+  all three SQL engines. The strongest silent-corruption oracle rivet has.
+
 ## 0.19.0 — 2026-07-11
 
 ### Fixed
