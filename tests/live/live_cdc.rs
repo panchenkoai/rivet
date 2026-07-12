@@ -955,6 +955,77 @@ exports:
     );
 }
 
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_non_iso_datestyle_and_escape_bytea_match_batch() {
+    // Session-state rendering (CLAUDE.md): test_decoding renders values in the
+    // polling session's FORMAT, not just its timezone. A non-default database
+    // `datestyle` ('German, DMY') nulled every timestamp (rivet's ISO parser
+    // failed on DMY text) and a non-hex `bytea_output` ('escape') corrupted every
+    // bytea — both silent, found by the source-parity sweep under a flipped
+    // session. The CDC reader now pins datestyle/bytea_output on connect, so CDC
+    // matches a batch export (binary protocol, format-immune) regardless.
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_fmt_pg");
+    let slot = unique_name("rivet_fmt_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(
+        "ALTER DATABASE rivet SET datestyle TO 'German, DMY'; \
+         ALTER DATABASE rivet SET bytea_output TO 'escape'",
+    )
+    .expect("set db formats");
+    struct DbFmtGuard;
+    impl Drop for DbFmtGuard {
+        fn drop(&mut self) {
+            if let Ok(mut c) = postgres::Client::connect(POSTGRES_CDC_URL, NoTls) {
+                let _ = c.batch_execute(
+                    "ALTER DATABASE rivet RESET datestyle; ALTER DATABASE rivet RESET bytea_output",
+                );
+            }
+        }
+    }
+    let _fmt = DbFmtGuard;
+
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (
+           id INT PRIMARY KEY, d DATE, ts TIMESTAMP, blob BYTEA)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+    c.batch_execute(&format!(
+        "INSERT INTO {tbl} VALUES (1, '2024-03-05', '2024-03-05 12:00:00', '\\xdeadbeef')"
+    ))
+    .unwrap();
+
+    let out = d.path().join("out");
+    let batch_out = d.path().join("batch");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::create_dir_all(&batch_out).unwrap();
+    run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &out));
+    let batch_yaml = format!(
+        r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
+exports:
+  - name: {tbl}_batch
+    table: {tbl}
+    mode: full
+    format: parquet
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        out = batch_out.display(),
+    );
+    run_rivet_ok(&write_config(&d, &batch_yaml));
+    // Batch reads via the binary protocol (format-immune); CDC via test_decoding
+    // TEXT. Equal ⇒ the session-state pin held: date not nulled, bytea not mangled.
+    assert_cdc_matches_batch(&out, &batch_out);
+}
+
 // UPDATE and DELETE through the typed surface — the matrix tests pin INSERT
 // after-images only; this pins that an UPDATE's after-image carries every
 // column type identically to a batch export of the post-update state, and a

@@ -281,6 +281,18 @@ state to a non-default (a `+09:00` global, an `Asia/Tokyo` database
 default) with a guard that resets it. Parity at default state is not
 evidence — the default is exactly where the bug hides.
 
+The tz find was only the first bracket. The source-parity sweep under a
+flipped session later caught two MORE on the same `test_decoding` reader:
+`datestyle='German, DMY'` nulled **every** timestamp (the ISO parser choked
+on DMY text) and `bytea_output='escape'` corrupted **every** bytea (the
+reader assumes hex). The fix is not to teach the parser every format — it's
+to **pin the formats on the reader's own connection**
+(`SET datestyle='ISO, MDY'; SET bytea_output='hex'; SET intervalstyle='postgres'`
+in `src/source/postgres/cdc.rs::open`), immune to the DB default. Binary
+readers (MySQL binlog, MSSQL CT, the PG *batch* binary protocol) are exempt
+by construction — this class is text-decode-only. Regression:
+`pg_cdc_non_iso_datestyle_and_escape_bytea_match_batch`.
+
 ## Keyset seek is type-bracketed — a heterogeneous key silently loses all but one type
 
 A keyset/seek paginator that advances with `col > cursor` assumes the key
