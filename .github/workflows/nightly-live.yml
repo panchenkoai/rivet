@@ -169,11 +169,17 @@ jobs:
         # stay skipped for TIME, not permissions (the .live-tmp prolog above
         # now provisions the shared mount here too): all three have a
         # dedicated home in ci.yml's `test-type-validators` job on every PR.
+        # `--skip mongo` (substring), NOT `--skip live_mongo --skip live_cdc_mongo`
+        # (module prefixes): the prefix form missed the engine-agnostic
+        # `chunking_stand::stand_*_mongo` tests, which were then SELECTED on this
+        # mongo-less stack and panicked at require_alive — the exact latent
+        # failure the matrix audit predicted. Every Mongo test (module-named or
+        # stand_*) is owned by the `mongo-versions` job, same as ci.yml's e2e.
         run: |
           cargo test --release -- --ignored \
             --skip full_content_export_max_pressure \
             --skip validates --skip edge_cases --skip via_duckdb \
-            --skip live_mongo --skip live_cdc_mongo
+            --skip mongo
 
       - name: Dump service logs on failure
         if: failure()
