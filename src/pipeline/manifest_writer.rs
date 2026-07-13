@@ -611,6 +611,110 @@ mod tests {
         b.finalize(status)
     }
 
+    // ── mutation-pilot gap closures ──────────────────────────────────────────
+    // The cargo-mutants pilot found these three silent-loss paths unguarded:
+    // a mutant emptying set_column_checksums / set_cursor_range, or corrupting
+    // the max+1 part-id arithmetic, survived the whole lib suite.
+
+    #[test]
+    fn builder_carries_column_checksums_and_key_into_the_manifest() {
+        // Mutant killed: `set_column_checksums with ()` — Form B checksums
+        // silently absent from the manifest strips validate of its value leg.
+        let mut b = ManifestBuilder::new(
+            &plan_snapshot(),
+            "run_ck",
+            chrono::Utc::now(),
+            "xxh3:0".into(),
+            "postgres",
+            None,
+            None,
+            "file:///tmp/out/".into(),
+        );
+        b.set_column_checksums(
+            vec![ColumnChecksum {
+                name: "id".into(),
+                checksum: "42".into(),
+            }],
+            Some("id".into()),
+        );
+        let m = b.finalize(ManifestStatus::Success);
+        assert_eq!(
+            m.column_checksums,
+            Some(vec![ColumnChecksum {
+                name: "id".into(),
+                checksum: "42".into(),
+            }]),
+            "recorded column checksums must land in the manifest"
+        );
+        assert_eq!(m.checksum_key_column, Some("id".into()));
+    }
+
+    #[test]
+    fn builder_carries_cursor_range_into_the_extraction_section() {
+        // Mutant killed: `set_cursor_range with ()` — a silently absent cursor
+        // range breaks the incremental continuity audit trail.
+        let mut b = ManifestBuilder::new(
+            &plan_snapshot(),
+            "run_cr",
+            chrono::Utc::now(),
+            "xxh3:0".into(),
+            "postgres",
+            None,
+            None,
+            "file:///tmp/out/".into(),
+        );
+        b.set_cursor_range(
+            Some("updated_at".into()),
+            Some("timestamptz".into()),
+            Some("2026-01-01".into()),
+            Some("2026-02-01".into()),
+            Some(123),
+        );
+        let m = b.finalize(ManifestStatus::Success);
+        let ex = m.source.extraction.expect("extraction section present");
+        assert_eq!(ex.cursor_column.as_deref(), Some("updated_at"));
+        assert_eq!(ex.cursor_type.as_deref(), Some("timestamptz"));
+        assert_eq!(ex.cursor_low.as_deref(), Some("2026-01-01"));
+        assert_eq!(ex.cursor_high.as_deref(), Some("2026-02-01"));
+        assert_eq!(ex.source_row_count, Some(123));
+    }
+
+    #[test]
+    fn record_committed_part_assigns_max_plus_one_over_id_gaps() {
+        // Mutants killed: `m + 1` → `m - 1` / `m * 1` in the part-id
+        // computation. The doc comment describes the exact hazard (hydrated
+        // ids [1,2,4] must yield 5, never a duplicate) — this pins it.
+        let mut s = crate::pipeline::summary::RunSummary::stub_for_testing(
+            "run_pid",
+            String::from("orders"),
+        );
+        for id in [1u32, 2, 4] {
+            s.manifest_parts.push(ManifestPart {
+                part_id: id,
+                path: format!("part-{id:06}.parquet"),
+                rows: 1,
+                size_bytes: 1,
+                content_fingerprint: "xxh3:0".into(),
+                content_md5: String::new(),
+                status: PartStatus::Committed,
+            });
+        }
+        record_committed_part_with_fingerprint(
+            &mut s,
+            "part-next.parquet".into(),
+            1,
+            1,
+            "xxh3:1".into(),
+            String::new(),
+        );
+        let ids: Vec<u32> = s.manifest_parts.iter().map(|p| p.part_id).collect();
+        assert_eq!(
+            ids,
+            vec![1, 2, 4, 5],
+            "next part id must be max+1 (5) — len-based or max-1 numbering collides"
+        );
+    }
+
     #[test]
     fn write_manifest_leaves_a_run_unique_copy_beside_the_canonical() {
         // The shared seam every pipeline shape writes through must leave an
