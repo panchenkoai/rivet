@@ -51,6 +51,22 @@ Narrow live filters for Tier 3 (mutate X → run only its guards):
   buffer size in `compute_part_checksums`: any chunking yields the same
   digest). Excluded with a reason.
 
+## Disk hygiene (learned the expensive way)
+
+Each `-j N` run keeps N private tree copies with their own `target/` — ~10 GB
+each with default debuginfo, and `target/incremental` GROWS over hundreds of
+mutants. A killed run leaks its copies (a killed tier run left a 26 GB orphan
+in `$TMPDIR/cargo-mutants-rivet-*.tmp`). Rules for every runner:
+
+- `export CARGO_PROFILE_DEV_DEBUG=0` — mutants never need debuginfo; halves
+  the build dirs and speeds the link.
+- Clean `$TMPDIR/cargo-mutants-rivet-*.tmp` before AND after (nightly job
+  step, not trust in graceful exit).
+- `mutants.out/` is gitignored; the committed artifact is only the triaged
+  baseline list.
+- Budget check before launch: N jobs × ~5 GB (debug=0) + headroom; refuse on
+  low disk rather than fill it.
+
 ## Pilot facts (2026-07, devbox M2 Max)
 
 - `--lib` cycle: build 13-27s + test 3-5s per mutant; -j2 ≈ 12-18s wall each.
