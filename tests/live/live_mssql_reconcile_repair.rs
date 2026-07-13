@@ -89,7 +89,7 @@ exports:
 fn mssql_reconcile_all_match_exits_zero_with_pretty_output() {
     require_alive(LiveService::Mssql);
 
-    let (table, _out, _cfg_dir, cfg) = seed_and_run_chunked(100, 50);
+    let (table, out, _cfg_dir, cfg) = seed_and_run_chunked(100, 50);
 
     let result = std::process::Command::new(RIVET_BIN)
         .args([
@@ -116,6 +116,14 @@ fn mssql_reconcile_all_match_exits_zero_with_pretty_output() {
     assert!(
         stdout.contains("100"),
         "reconcile output must mention row count 100; got:\n{stdout}"
+    );
+    // Independent oracle: rivet's reconcile verdict is rivet's OWN counter
+    // chain. Re-read the destination parquet and count physically (matrix
+    // audit: self-oracle class) — the verdict and the physical rows must agree.
+    assert_eq!(
+        total_parquet_rows(out.path()),
+        100,
+        "destination parquet must physically hold every source row, independent of the reconcile verdict"
     );
 }
 

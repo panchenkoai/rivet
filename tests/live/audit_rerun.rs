@@ -132,10 +132,9 @@ fn audit_full_rerun_does_not_orphan_parts() {
         String::from_utf8_lossy(&first.stderr)
     );
 
-    // Sleep past a second boundary so the second run's %Y%m%d_%H%M%S timestamp
-    // differs from the first — otherwise the full-mode filename collides and the
-    // second write simply overwrites the first (no observable orphan).
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
+    // back-to-back sub-second runs must not collide — sleeping here would
+    // mask exactly that regression (matrix audit: sleep-masked class).
 
     // Second run to the SAME prefix, no --resume.
     let second = run_rivet_with_warn_log(&[

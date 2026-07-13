@@ -95,7 +95,9 @@ exports:
     ))
     .unwrap();
 
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
+    // back-to-back sub-second runs must not collide — sleeping here would
+    // mask exactly that regression (matrix audit: sleep-masked class).
 
     let r2 = run_rivet_export(&cfg, &export_name);
     assert!(
@@ -158,7 +160,9 @@ exports:
 
     c.query_drop(format!("ALTER TABLE {table_name} DROP COLUMN tmp_col;"))
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
+    // back-to-back sub-second runs must not collide — sleeping here would
+    // mask exactly that regression (matrix audit: sleep-masked class).
 
     let r2 = run_rivet_export(&cfg, &export_name);
     assert!(
@@ -203,7 +207,9 @@ exports:
     let cfg = write_config(&cfg_dir, &yaml);
 
     assert!(run_rivet_export(&cfg, &export_name).status.success());
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
+    // back-to-back sub-second runs must not collide — sleeping here would
+    // mask exactly that regression (matrix audit: sleep-masked class).
     assert!(run_rivet_export(&cfg, &export_name).status.success());
 
     let state_db = cfg.parent().unwrap().join(".rivet_state.db");

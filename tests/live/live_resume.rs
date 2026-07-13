@@ -326,7 +326,9 @@ fn incremental_third_run_picks_up_newly_inserted_rows() {
 
     // Sleep so file-name timestamp is distinct from run #1 (see
     // full_mode_repeated_run_accumulates_manifest_entries for rationale).
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
+    // back-to-back sub-second runs must not collide — sleeping here would
+    // mask exactly that regression (matrix audit: sleep-masked class).
 
     // Run #2 — must pick up rows 6..10.
     assert!(run_rivet_export(&cfg, &export_name).status.success());
@@ -606,7 +608,9 @@ fn incremental_manifest_ships_contiguous_cursor_range() {
         "INSERT INTO {table_name} SELECT g, g*10 FROM generate_series(4,7) g;"
     ))
     .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
+    // back-to-back sub-second runs must not collide — sleeping here would
+    // mask exactly that regression (matrix audit: sleep-masked class).
     assert!(run_rivet_export(&cfg, &export_name).status.success());
     let e2 = read_ex();
     assert_eq!(

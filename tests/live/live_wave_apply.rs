@@ -154,8 +154,9 @@ exports:
     // filename is second-granularity (`<export>_<YYYYMMDD_HHMMSS>.parquet`), so
     // wait past the current second to guarantee a distinct name rather than an
     // overwrite of Phase 1's file (the failure when all three phases land in one
-    // second).
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
+    // back-to-back sub-second runs must not collide — sleeping here would
+    // mask exactly that regression (matrix audit: sleep-masked class).
     let rerun = run(&[]);
     assert!(
         rerun.status.success(),

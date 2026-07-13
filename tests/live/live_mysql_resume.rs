@@ -123,6 +123,62 @@ fn mysql_full_mode_repeated_run_accumulates_manifest_entries() {
 
 #[test]
 #[ignore = "live: requires docker compose mysql"]
+fn mysql_roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts() {
+    // MySQL twin of the pg roast_rapid test: run-uniqueness for the batch
+    // incremental path under SUB-SECOND back-to-back runs. The resilience
+    // matrix cell previously stood on the two-full-runs test, which never
+    // exercises rapid incremental deltas — the exact regime where a
+    // second-granularity part stamp silently loses a delta.
+    require_alive(LiveService::Mysql);
+    const N: i64 = 6;
+    let name = unique_name("my_clobber_inc");
+    let mut c = mysql_connect();
+    c.query_drop(format!(
+        "CREATE TABLE {name} (id BIGINT PRIMARY KEY, updated_at DATETIME(6) NOT NULL) ENGINE=InnoDB"
+    ))
+    .unwrap();
+    let _guard = MysqlCleanup(name.clone());
+
+    let export_name = unique_name("my_clobber_exp");
+    let out = tempfile::tempdir().unwrap();
+    let yaml = Rig::mysql_batch(&export_name)
+        .query(&format!("SELECT id, updated_at FROM {name}"))
+        .mode("incremental")
+        .export_line("cursor_column: updated_at")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
+    let (_cfgdir, cfg) = cfg_dir_with(&yaml);
+
+    // Each run inserts one new row (strictly increasing cursor) then exports
+    // just that delta — back to back, no sleep, so several runs share a second.
+    for k in 0..N {
+        c.query_drop(format!(
+            "INSERT INTO {name} (id, updated_at) \
+             VALUES ({k}, DATE_ADD(NOW(6), INTERVAL {k} SECOND))"
+        ))
+        .unwrap();
+        let r = run_rivet_export(&cfg, &export_name);
+        assert!(
+            r.status.success(),
+            "incremental run {k} failed:\n{}",
+            String::from_utf8_lossy(&r.stderr)
+        );
+    }
+
+    assert_eq!(
+        dir_parquet_id_set(out.path()),
+        (0..N).collect::<std::collections::BTreeSet<i64>>(),
+        "every incremental delta must survive; a clobbered part is silent data loss"
+    );
+    assert_eq!(
+        dir_manifest_copy_total_rows(out.path()),
+        N,
+        "run-unique manifest copies must sum every rapid run's row"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
 fn mysql_incremental_second_run_on_unchanged_source_exports_zero_new_rows() {
     require_alive(LiveService::Mysql);
 
@@ -186,7 +242,9 @@ fn mysql_incremental_third_run_picks_up_newly_inserted_rows() {
     ))
     .expect("insert new mysql rows");
 
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
+    // back-to-back sub-second runs must not collide — sleeping here would
+    // mask exactly that regression (matrix audit: sleep-masked class).
 
     assert!(run_rivet_export(&cfg, &export_name).status.success());
     let files_2 = files_with_extension(out.path(), "parquet").len();

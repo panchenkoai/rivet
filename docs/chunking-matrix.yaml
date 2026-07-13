@@ -107,7 +107,7 @@ scenarios:
     postgres: { test: full_mode_repeated_run_accumulates_manifest_entries }
     mysql:    { test: mysql_full_mode_repeated_run_accumulates_manifest_entries }
     mssql:    { test: mssql_full_mode_repeated_run_accumulates_manifest_entries }
-    mongo:    { test: mongo_batch_type_fidelity_document_is_verbatim_extjson }
+    mongo:    { test: mongo_batch_two_rapid_runs_into_same_prefix_do_not_clobber }
 
   - id: incremental_cursor
     what: "mode: incremental — WHERE cursor > last_value, re-run picks up only new rows"

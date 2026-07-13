@@ -191,7 +191,9 @@ fn keyset_checkpoint_resume_second_run_captures_only_new_keys() {
         );
         // Distinct millisecond part stamp so a resumed run's parts never clobber
         // the prior run's (run-uniqueness rule).
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
+        // back-to-back sub-second runs must not collide — sleeping here would
+        // mask exactly that regression (matrix audit: sleep-masked class).
     };
 
     // Run 1: exports all 1000, persists high-water key id-001000.
@@ -448,7 +450,9 @@ fn keyset_checkpoint_resume_pg_second_run_captures_only_new_keys() {
             "{label} failed; stderr:\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
+        // back-to-back sub-second runs must not collide — sleeping here would
+        // mask exactly that regression (matrix audit: sleep-masked class).
     };
 
     run("run 1");
@@ -535,7 +539,9 @@ fn keyset_checkpoint_resume_mssql_second_run_captures_only_new_keys() {
             "{label} failed; stderr:\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
+        // back-to-back sub-second runs must not collide — sleeping here would
+        // mask exactly that regression (matrix audit: sleep-masked class).
     };
 
     run("run 1");

@@ -264,7 +264,9 @@ exports:
         "exactly 1 manifest entry must exist after crash (chunk 0 file was recorded)"
     );
 
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
+    // back-to-back sub-second runs must not collide — sleeping here would
+    // mask exactly that regression (matrix audit: sleep-masked class).
 
     let resume = std::process::Command::new(RIVET_BIN)
         .args([
@@ -395,7 +397,9 @@ exports:
         "no chunk_task should be 'failed' from a panic; got failed={failed_pre}"
     );
 
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
+    // back-to-back sub-second runs must not collide — sleeping here would
+    // mask exactly that regression (matrix audit: sleep-masked class).
 
     let resume = std::process::Command::new(RIVET_BIN)
         .args([
@@ -528,7 +532,9 @@ exports:
         "exactly 1 manifest entry must exist after crash (chunk 0 file was recorded before panic)"
     );
 
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
+    // back-to-back sub-second runs must not collide — sleeping here would
+    // mask exactly that regression (matrix audit: sleep-masked class).
 
     // Resume with parallel: 2 — proves reset works regardless of worker
     // count change between crash and resume.

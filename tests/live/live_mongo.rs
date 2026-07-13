@@ -154,6 +154,10 @@ fn mongo_batch_type_fidelity_document_is_verbatim_extjson() {
             "_id": 1_i64,
             "i64_big": 9_007_199_254_740_993_i64, // 2^53 + 1
             "dec": mongodb::bson::Bson::Decimal128("123456789.987654321012345".parse().unwrap()),
+            // Nested document — the `type_json` cell's claim (content fidelity
+            // of structured JSON through Parquet) needs its own evidence, not a
+            // ride on the scalar asserts.
+            "nested": doc! { "k": "v-\u{00e9}\u{4e2d}", "arr": [1_i32, 2_i32, 3_i32] },
         }],
     );
 
@@ -169,6 +173,11 @@ fn mongo_batch_type_fidelity_document_is_verbatim_extjson() {
     assert!(
         doc_text.contains("123456789.987654321012345"),
         "Decimal128 must be verbatim (type-tagged), got: {doc_text}"
+    );
+    // type_json: nested structure + non-ASCII content survive verbatim.
+    assert!(
+        doc_text.contains("v-\u{00e9}\u{4e2d}") && doc_text.contains("arr"),
+        "nested JSON (unicode value + array) must be verbatim, got: {doc_text}"
     );
 }
 
@@ -203,6 +212,13 @@ fn mongo_run_reconcile_matches_source_count() {
     assert!(
         summary.contains("MATCH") && !summary.contains("MISMATCH"),
         "reconcile must report a source/dest MATCH (not MISMATCH), got:\n{summary}"
+    );
+    // Independent oracle: the verdict is rivet's own counter chain — also
+    // physically re-read the destination (matrix audit: self-oracle class).
+    assert_eq!(
+        total_parquet_rows(&rig.out_dir()),
+        3000,
+        "destination parquet must physically hold every source document, independent of the reconcile verdict"
     );
 }
 

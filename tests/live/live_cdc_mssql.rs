@@ -90,6 +90,11 @@ fn mssql_cdc_resume_captures_only_new_changes() {
         2,
         "resume must capture only the 2 new changes (LSN resume), not re-read all 4"
     );
+    assert_eq!(
+        cdc_id_ops(&out2),
+        vec![(3, "insert".to_string()), (4, "insert".to_string())],
+        "the resumed parquet must hold exactly the NEW changes (count 2 cannot tell new-2 from wrong-2)"
+    );
 }
 
 #[test]
@@ -237,6 +242,11 @@ fn mssql_cdc_idle_first_run_then_change_is_captured_not_skipped() {
         manifest_rows(&out2),
         1,
         "the change between an idle run and the next run must be captured, not skipped"
+    );
+    assert_eq!(
+        cdc_id_ops(&out2),
+        vec![(1, "insert".to_string())],
+        "the captured parquet must hold exactly THE change (a count of 1 could be a wrong row)"
     );
 }
 
@@ -509,6 +519,13 @@ fn mssql_cdc_initial_snapshot_covers_preexisting_rows_then_streams() {
     run_rivet_ok(&cfg);
     assert_eq!(manifest_rows(&out.join("snapshot")), 2);
     assert_eq!(
+        dir_parquet_id_set(&out.join("snapshot"))
+            .into_iter()
+            .collect::<Vec<i64>>(),
+        vec![1, 2],
+        "snapshot parquet must hold exactly the pre-existing ids (independent re-read)"
+    );
+    assert_eq!(
         manifest_rows(&out),
         0,
         "anchor at max LSN ⇒ nothing to drain"
@@ -518,6 +535,11 @@ fn mssql_cdc_initial_snapshot_covers_preexisting_rows_then_streams() {
     wait_for_capture(&ci, 3);
     run_rivet_ok(&cfg);
     assert_eq!(manifest_rows(&out), 1, "the post-snapshot change streams");
+    assert_eq!(
+        cdc_id_ops(&out),
+        vec![(3, "insert".to_string())],
+        "streamed parquet must hold exactly the post-snapshot change (not just a count of 1)"
+    );
 }
 
 // RED test for the finding: MONEY/SMALLMONEY were typed correctly
@@ -689,6 +711,11 @@ fn mssql_cdc_crash_before_checkpoint_re_reads_on_resume() {
         manifest_rows(&out2),
         2,
         "crash before the checkpoint → resume re-reads exactly the 2 un-checkpointed changes"
+    );
+    assert_eq!(
+        cdc_id_ops(&out2),
+        vec![(3, "insert".to_string()), (4, "insert".to_string())],
+        "the re-read parquet must hold exactly the un-acked changes"
     );
 }
 

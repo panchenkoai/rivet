@@ -303,8 +303,9 @@ fn auto_shrink_incremental_cursor_is_correct() {
         "first incremental run must produce exactly one file"
     );
 
-    // Sleep 1 s so the second run's file timestamp differs (file name includes seconds).
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
+    // back-to-back sub-second runs must not collide — sleeping here would
+    // mask exactly that regression (matrix audit: sleep-masked class).
 
     // Run #2 — source unchanged, cursor should be at last updated_at → zero new rows → no new file.
     let r2 = run_rivet_export(&cfgpath, &export_name);

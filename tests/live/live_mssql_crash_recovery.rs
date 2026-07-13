@@ -258,10 +258,9 @@ fn mssql_crash_after_file_write_leaves_file_but_no_manifest_or_cursor() {
     );
     assert_eq!(cursor_value(&cfg, &export), None);
 
-    // Recovery: second run sees no cursor so it re-exports everything,
-    // producing a second file (different timestamp). Sleep to ensure a
-    // distinct timestamp (rivet uses 1-second granularity).
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
+    // back-to-back sub-second runs must not collide — sleeping here would
+    // mask exactly that regression (matrix audit: sleep-masked class).
     let rec = std::process::Command::new(RIVET_BIN)
         .args([
             "run",
@@ -321,7 +320,9 @@ fn mssql_crash_after_manifest_update_leaves_file_and_manifest_but_no_cursor() {
     );
 
     // Recovery: re-run. No cursor → full re-export; manifest grows by 1.
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
+    // back-to-back sub-second runs must not collide — sleeping here would
+    // mask exactly that regression (matrix audit: sleep-masked class).
     let rec = std::process::Command::new(RIVET_BIN)
         .args([
             "run",
@@ -375,7 +376,9 @@ fn mssql_crash_after_cursor_commit_is_recoverable_with_full_state() {
     let _metric_after_crash = metric_count(&cfg, &export);
 
     // Recovery: re-run must see the cursor and export zero additional rows.
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
+    // back-to-back sub-second runs must not collide — sleeping here would
+    // mask exactly that regression (matrix audit: sleep-masked class).
     let rec = std::process::Command::new(RIVET_BIN)
         .args([
             "run",
