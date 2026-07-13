@@ -91,10 +91,10 @@ fn mysql_full_mode_repeated_run_accumulates_manifest_entries() {
     let r1 = run_rivet_export(&cfg, &export_name);
     assert!(r1.status.success(), "first full run failed");
 
-    // Sleep so each run produces a distinct timestamped filename (rivet uses
-    // 1-second granularity in `<export>_<YYYYMMDD_HHMMSS>.parquet`).
-    std::thread::sleep(std::time::Duration::from_millis(1100));
-
+    // No sleep: `single.rs` stamps parts at millisecond granularity (`%3f`), so
+    // two back-to-back sub-second runs still get distinct names — that they do
+    // not clobber IS the run-uniqueness contract. A `sleep(1s)` here would only
+    // document the second-granularity gap the `%3f` fix already closed.
     let r2 = run_rivet_export(&cfg, &export_name);
     assert!(r2.status.success(), "second full run failed");
 
@@ -103,6 +103,21 @@ fn mysql_full_mode_repeated_run_accumulates_manifest_entries() {
         files.len(),
         2,
         "full mode must produce one file per run; got {files:?}"
+    );
+    // Files-count alone is the weakest oracle: assert the payload (both runs'
+    // rows survive) AND the dest manifest COPIES (`manifest-<run>.json`, what
+    // reconcile / a warehouse autoloader read) — a parquet re-read passes even
+    // when the manifest sidecar clobbers; the copies' summed row_count is RED
+    // pre-fix (one clobbered manifest.json held only the last run's rows).
+    assert_eq!(
+        total_parquet_rows(out.path()),
+        20,
+        "two full runs of 10 rows must materialise 20 physical rows"
+    );
+    assert_eq!(
+        dir_manifest_copy_total_rows(out.path()),
+        20,
+        "run-unique manifest copies must sum both runs' rows; a clobbered manifest is silent to a parquet re-read"
     );
 }
 

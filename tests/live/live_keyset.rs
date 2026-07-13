@@ -221,6 +221,14 @@ fn keyset_checkpoint_resume_second_run_captures_only_new_keys() {
         keys3, expected,
         "the union of all runs must equal the full source key set"
     );
+    // `read_uid_set` is a parquet re-read; assert the dest manifest COPIES
+    // (`manifest-<run>.json`, reconcile's artifact) span every run — a resumed
+    // run clobbering a prior manifest is silent to the parquet re-read.
+    assert_eq!(
+        dir_manifest_copy_total_rows(out_dir.path()),
+        1500,
+        "run-unique manifest copies must sum run 1 (1000) + run 3 (500); a clobbered manifest is silent to the parquet re-read"
+    );
 }
 
 /// PostgreSQL UUID PK is the most common non-integer PK in production
@@ -469,6 +477,12 @@ fn keyset_checkpoint_resume_pg_second_run_captures_only_new_keys() {
         keys3, expected,
         "union of all runs equals the full source key set"
     );
+    // Dest manifest copies (reconcile's artifact), not just the parquet re-read.
+    assert_eq!(
+        dir_manifest_copy_total_rows(out_dir.path()),
+        1200,
+        "run-unique manifest copies must sum run 1 (800) + run 3 (400); a clobbered manifest is silent to the parquet re-read"
+    );
 }
 
 /// SQL Server twin of the keyset-resume two-run test. Per the "one engine passing
@@ -549,6 +563,12 @@ fn keyset_checkpoint_resume_mssql_second_run_captures_only_new_keys() {
     assert_eq!(
         keys3, expected,
         "union of all runs equals the full source key set"
+    );
+    // Dest manifest copies (reconcile's artifact), not just the parquet re-read.
+    assert_eq!(
+        dir_manifest_copy_total_rows(out_dir.path()),
+        1500,
+        "run-unique manifest copies must sum run 1 (1000) + run 3 (500); a clobbered manifest is silent to the parquet re-read"
     );
 }
 

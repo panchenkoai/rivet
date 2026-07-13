@@ -134,6 +134,34 @@ pub fn dir_parquet_distinct_strings(dir: &Path, col: &str) -> BTreeSet<String> {
     out
 }
 
+/// Sum `row_count` across the run-unique manifest COPIES (`manifest-<run>.json`)
+/// in `dir` — the dest sidecars a cross-run consumer (the Pro loader's reconcile,
+/// a warehouse autoloader) reads. Unlike a parquet re-read, this goes **RED when
+/// a run's manifest CLOBBERS**: the payload survives (run-unique parts) but its
+/// manifest entry is lost, so pre-fix a shared prefix held ONE clobbered
+/// `manifest.json` and the sum was the LAST run's rows, not every run's. This is
+/// the oracle a run-uniqueness / accumulation claim must use — the `file_log`
+/// state-DB ledger accumulates regardless of the sidecar clobber, and a parquet
+/// re-read cannot see it. Ignores the canonical `manifest.json` pointer (it
+/// duplicates the latest copy; counting it would double the latest run).
+pub fn dir_manifest_copy_total_rows(dir: &Path) -> i64 {
+    let mut total = 0;
+    for path in files_with_extension(dir, "json") {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        if !(name.starts_with("manifest-") && name.ends_with(".json")) {
+            continue; // the bare `manifest.json` pointer, or a foreign file
+        }
+        let bytes = std::fs::read(&path).expect("read manifest copy");
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("parse manifest copy JSON");
+        total += v
+            .get("row_count")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+    }
+    total
+}
+
 /// True if any `.parquet` under `dir` carries a column named `col`.
 pub fn dir_parquet_has_column(dir: &Path, col: &str) -> bool {
     files_with_extension(dir, "parquet").iter().any(|p| {

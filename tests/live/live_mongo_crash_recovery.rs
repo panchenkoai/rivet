@@ -88,4 +88,13 @@ fn mongo_batch_two_rapid_runs_into_same_prefix_do_not_clobber() {
         100,
         "both snapshots hold every source _id"
     );
+    // The parquet re-read above is a proxy; assert the dest manifest COPIES
+    // (`manifest-<run>.json`, what reconcile / a warehouse autoloader read) also
+    // span both runs. Summed row_count (not a file count) is robust to
+    // parts-per-run (page_size), and RED pre-fix (one clobbered manifest.json).
+    assert_eq!(
+        dir_manifest_copy_total_rows(&rig.out_dir()),
+        200,
+        "run-unique manifest copies must sum both rapid runs' rows; a clobbered manifest is silent to the parquet re-read"
+    );
 }

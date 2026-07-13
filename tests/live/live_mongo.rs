@@ -240,6 +240,14 @@ fn mongo_batch_resume_reads_only_new_since_last_run() {
         2500,
         "resume must add only the new rows — 4500 would mean run 2 rescanned"
     );
+    // Dest manifest copies (reconcile's artifact), not just the parquet re-read:
+    // must span both runs (2000 + 500) — a resumed run clobbering a prior
+    // manifest is silent to the re-read but breaks reconcile.
+    assert_eq!(
+        dir_manifest_copy_total_rows(&rig.out_dir()),
+        2500,
+        "run-unique manifest copies must sum run 1 (2000) + run 2 (500); a clobbered manifest is silent to the parquet re-read"
+    );
 }
 
 #[test]
