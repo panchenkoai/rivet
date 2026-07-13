@@ -205,6 +205,16 @@ mod tests {
     }
 
     #[test]
+    fn scaled_zero_formats_unsigned() {
+        // Mutation-pilot find: `negative = value < 0` mutated to `<=` survived
+        // the suite — zero would render as "-0.00" (the sign is computed before
+        // formatting). A signed zero leaks into CSV output and checksum inputs.
+        assert_eq!(scaled_i128_to_decimal_str(0, 2), "0.00");
+        assert_eq!(scaled_i128_to_decimal_str(0, 0), "0");
+        assert_eq!(scaled_i128_to_decimal_str(0, 6), "0.000000");
+    }
+
+    #[test]
     fn standard_financial_values() {
         assert_eq!(decimal_str_to_scaled_i128("0.10", 2), Some(10));
         assert_eq!(decimal_str_to_scaled_i128("0.20", 2), Some(20));
