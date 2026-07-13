@@ -34,7 +34,7 @@ use crate::manifest::{
     PartStatus, RunManifest,
 };
 use crate::pipeline::commit::{PartRecord, write_part_file};
-use crate::pipeline::manifest_writer::{write_manifest, write_run_unique_manifest_copy};
+use crate::pipeline::manifest_writer::write_manifest;
 use crate::source::cdc::value::{self, RivetValue};
 use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, Position, TxnSeq};
 use crate::types::{TypeMapping, build_arrow_field};
@@ -327,11 +327,10 @@ pub(crate) fn run_to_files(
             &cfg.started_at,
             &s.parts,
         );
+        // write_manifest leaves the canonical `manifest.json` (latest-run pointer)
+        // AND an immutable run-unique copy, so a prefix accumulating several
+        // `until_current` cycles keeps EACH run's manifest for cross-run reconcile.
         write_manifest(s.out.dest, &manifest)?;
-        // The canonical `manifest.json` above is last-writer-wins; leave an
-        // immutable run-unique copy so a prefix accumulating several `until_current`
-        // cycles keeps EACH run's manifest for the Pro loader's cross-run reconcile.
-        write_run_unique_manifest_copy(s.out.dest, &manifest)?;
         manifests.push(manifest);
     }
     Ok(manifests)

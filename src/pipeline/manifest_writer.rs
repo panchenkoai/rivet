@@ -29,7 +29,8 @@ use crate::error::Result;
 use crate::journal::PlanSnapshot;
 use crate::manifest::{
     ColumnChecksum, MANIFEST_FILENAME, ManifestDestination, ManifestPart, ManifestSource,
-    ManifestStatus, PartStatus, RunManifest, SUCCESS_FILENAME, success_marker_body,
+    ManifestStatus, PartStatus, RunManifest, SUCCESS_FILENAME, run_unique_manifest_name,
+    success_marker_body,
 };
 use crate::pipeline::summary::RunSummary;
 
@@ -346,6 +347,19 @@ pub fn write_manifest(dest: &dyn Destination, manifest: &RunManifest) -> Result<
     let manifest_tmp = tempfile::NamedTempFile::new()?;
     std::fs::write(manifest_tmp.path(), &bytes)?;
     dest.write(manifest_tmp.path(), MANIFEST_FILENAME)?;
+    // Immutable per-run copy beside the canonical (last-writer-wins) pointer.
+    // Consecutive runs into one prefix — a CDC soak, incremental batch, the
+    // scheduler's `until_current` model — each clobber `manifest.json`,
+    // orphaning every prior run's manifest from a consumer that sums row counts
+    // ACROSS runs (the Pro loader's reconcile). The parts already carry the run
+    // id in their names (`<export>_<stamp>.parquet`, `cdc-<run_token>-NNNN`);
+    // the manifest sidecar must too. Additive and mode-agnostic: guard / validate
+    // / resume / repair keep reading the canonical name unchanged, so no consumer
+    // moves — this is the ONE seam every pipeline shape writes through.
+    dest.write(
+        manifest_tmp.path(),
+        &run_unique_manifest_name(&manifest.run_id),
+    )?;
 
     let success_marker = matches!(manifest.status, ManifestStatus::Success);
     if success_marker {
@@ -356,47 +370,6 @@ pub fn write_manifest(dest: &dyn Destination, manifest: &RunManifest) -> Result<
     }
 
     Ok(WriteOutcome::Written { success_marker })
-}
-
-/// `manifest-<sanitized run_id>.json` — the run-token discipline the PARTS
-/// already follow (`cdc-<run_token>-NNNN.parquet`) applied to the manifest
-/// sidecar. Same sanitizer: an RFC3339 run id carries `:`/`+`, illegal in a
-/// Windows filename, so map anything outside `[A-Za-z0-9._-]` to `-`.
-pub fn run_unique_manifest_name(run_id: &str) -> String {
-    let token: String = run_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    format!("manifest-{token}.json")
-}
-
-/// Write an immutable, run-unique COPY of the manifest alongside the canonical
-/// [`MANIFEST_FILENAME`]. The canonical name is last-writer-wins — a pointer to
-/// the LATEST run, which is what guard/validate/resume/repair want. But
-/// consecutive runs into one prefix (a CDC soak, the scheduler's
-/// `until_current` model) each clobber it, orphaning every prior run's manifest
-/// from any consumer that sums row counts ACROSS runs (the Pro loader's
-/// `reconcile`). The per-run copy survives, exactly as the run-token-named
-/// parts do. No guard / no `_SUCCESS`: this is a sidecar audit record, not the
-/// canonical pointer, so it must not gate on (or advance) run-shape state.
-pub fn write_run_unique_manifest_copy(
-    dest: &dyn Destination,
-    manifest: &RunManifest,
-) -> Result<()> {
-    if dest.capabilities().commit_protocol == WriteCommitProtocol::Streaming {
-        return Ok(());
-    }
-    let bytes = serde_json::to_vec_pretty(manifest)?;
-    let tmp = tempfile::NamedTempFile::new()?;
-    std::fs::write(tmp.path(), &bytes)?;
-    dest.write(tmp.path(), &run_unique_manifest_name(&manifest.run_id))?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -605,9 +578,13 @@ mod tests {
     // ── write_manifest ──────────────────────────────────────────────────────
 
     fn build_manifest(status: ManifestStatus) -> RunManifest {
+        build_manifest_with_run(status, "run_001")
+    }
+
+    fn build_manifest_with_run(status: ManifestStatus, run_id: &str) -> RunManifest {
         let mut b = ManifestBuilder::new(
             &plan_snapshot(),
-            "run_001",
+            run_id,
             chrono::Utc::now(),
             "xxh3:0123456789abcdef".into(),
             "postgres",
@@ -632,6 +609,73 @@ mod tests {
             String::new(),
         );
         b.finalize(status)
+    }
+
+    #[test]
+    fn write_manifest_leaves_a_run_unique_copy_beside_the_canonical() {
+        // The shared seam every pipeline shape writes through must leave an
+        // immutable per-run copy next to the last-writer-wins `manifest.json`,
+        // so a prefix accumulating several runs keeps EACH run's manifest for a
+        // cross-run consumer that sums row counts (the Pro loader's reconcile).
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(dir.path());
+        let m = build_manifest(ManifestStatus::Success);
+        write_manifest(&dest, &m).unwrap();
+        assert!(
+            dir.path().join(MANIFEST_FILENAME).exists(),
+            "canonical latest-run pointer"
+        );
+        assert!(
+            dir.path()
+                .join(run_unique_manifest_name(&m.run_id))
+                .exists(),
+            "run-unique copy beside it"
+        );
+    }
+
+    #[test]
+    fn two_runs_into_one_prefix_leave_two_run_unique_manifests() {
+        // The canonical `manifest.json` is clobbered by the second run (fine —
+        // it is the latest-run pointer); the run-unique copies must BOTH survive
+        // so reconcile sums across runs. Mode-agnostic regression for the
+        // manifest-clobber the Pro oracle-fixture harness caught: a live soak
+        // loaded 30 parts (3599 rows) but the one surviving manifest declared 55.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(dir.path());
+        write_manifest(
+            &dest,
+            &build_manifest_with_run(ManifestStatus::Success, "run_aaa"),
+        )
+        .unwrap();
+        write_manifest(
+            &dest,
+            &build_manifest_with_run(ManifestStatus::Success, "run_bbb"),
+        )
+        .unwrap();
+
+        assert!(
+            dir.path()
+                .join(run_unique_manifest_name("run_aaa"))
+                .exists()
+        );
+        assert!(
+            dir.path()
+                .join(run_unique_manifest_name("run_bbb"))
+                .exists()
+        );
+        let copies = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n.starts_with("manifest-") && n.ends_with(".json")
+            })
+            .count();
+        assert_eq!(
+            copies, 2,
+            "each run leaves its own run-unique manifest copy"
+        );
     }
 
     #[test]

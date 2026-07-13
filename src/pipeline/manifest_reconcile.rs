@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use crate::destination::ObjectMeta;
 use crate::manifest::{
     DOCTOR_PROBE_FILENAME, MANIFEST_FILENAME, PartStatus, QUARANTINE_PREFIX, RunManifest,
-    SUCCESS_FILENAME, join_key,
+    SUCCESS_FILENAME, is_run_unique_manifest_name, join_key,
 };
 
 /// Normalise a stored MD5 to its 16 raw digest bytes so encodings from
@@ -179,7 +179,11 @@ pub fn reconcile_manifest_against_listing(
         if *key == manifest_key || *key == success_key {
             continue;
         }
-        if key.rsplit('/').next() == Some(DOCTOR_PROBE_FILENAME) {
+        // Run-unique manifest copies (`manifest-<run_id>.json`) are Rivet
+        // sidecars written beside the canonical manifest so a cross-run consumer
+        // can sum across runs — not foreign data.
+        let base = key.rsplit('/').next().unwrap_or("");
+        if base == DOCTOR_PROBE_FILENAME || is_run_unique_manifest_name(base) {
             continue;
         }
         out.untracked.push((*meta).clone());
@@ -293,6 +297,10 @@ mod tests {
             obj(SUCCESS_FILENAME, 20),
             obj(DOCTOR_PROBE_FILENAME, 1),
             obj("_quarantine/r/old.parquet", 100),
+            // Run-unique manifest copies (this run's + a prior run's, sharing the
+            // prefix) are sidecars, not surplus.
+            obj("manifest-run_001.json", 50),
+            obj("manifest-run_000.json", 50),
             obj("stray.parquet", 7), // the only real surplus
         ];
         let rec = reconcile_manifest_against_listing(&m, &listing, "");
