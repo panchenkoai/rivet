@@ -34,7 +34,7 @@ use crate::manifest::{
     PartStatus, RunManifest,
 };
 use crate::pipeline::commit::{PartRecord, write_part_file};
-use crate::pipeline::manifest_writer::write_manifest;
+use crate::pipeline::manifest_writer::{write_manifest, write_run_unique_manifest_copy};
 use crate::source::cdc::value::{self, RivetValue};
 use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, Position, TxnSeq};
 use crate::types::{TypeMapping, build_arrow_field};
@@ -328,6 +328,10 @@ pub(crate) fn run_to_files(
             &s.parts,
         );
         write_manifest(s.out.dest, &manifest)?;
+        // The canonical `manifest.json` above is last-writer-wins; leave an
+        // immutable run-unique copy so a prefix accumulating several `until_current`
+        // cycles keeps EACH run's manifest for the Pro loader's cross-run reconcile.
+        write_run_unique_manifest_copy(s.out.dest, &manifest)?;
         manifests.push(manifest);
     }
     Ok(manifests)
@@ -910,6 +914,59 @@ mod tests {
             data_rows, 3,
             "run 2 must append its parts alongside run 1's in the same prefix — \
              a fixed part name silently overwrites already-acked changes"
+        );
+    }
+
+    // Sibling to the parts test above: the PARTS are run-token-named (they
+    // survive), but the manifest SIDECAR was fixed-name (`manifest.json`), so
+    // the second cycle clobbered the first's manifest. A consumer summing row
+    // counts ACROSS runs (the Pro loader's reconcile) then saw only the LAST
+    // run's `row_count` — a live 45-min soak loaded 30 parts (1650 rows) but the
+    // surviving manifest declared 55, and the count gate refused the load.
+    // Each run must leave its own immutable run-unique manifest copy.
+    #[test]
+    fn roast_second_run_into_same_prefix_must_not_clobber_prior_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(&dir);
+        let cols = int_col();
+
+        let mut run1 = FakeStream {
+            events: VecDeque::from(vec![insert(1), insert(2)]),
+            acked: Vec::new(),
+        };
+        run_to_files(
+            &mut run1,
+            SinkConfig {
+                run_id: "t_cdc_20260702T100000000".into(),
+                ..cfg(dest.as_ref(), &cols, FormatType::Csv, 10)
+            },
+        )
+        .unwrap();
+
+        let mut run2 = FakeStream {
+            events: VecDeque::from(vec![insert(3)]),
+            acked: Vec::new(),
+        };
+        run_to_files(
+            &mut run2,
+            SinkConfig {
+                run_id: "t_cdc_20260702T100500000".into(),
+                ..cfg(dest.as_ref(), &cols, FormatType::Csv, 10)
+            },
+        )
+        .unwrap();
+
+        let run_unique: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("manifest-") && n.ends_with(".json"))
+            .collect();
+        assert_eq!(
+            run_unique.len(),
+            2,
+            "each cycle must leave its own run-unique manifest copy so a \
+             cross-run consumer sums both — got {run_unique:?}"
         );
     }
 

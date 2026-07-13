@@ -358,6 +358,47 @@ pub fn write_manifest(dest: &dyn Destination, manifest: &RunManifest) -> Result<
     Ok(WriteOutcome::Written { success_marker })
 }
 
+/// `manifest-<sanitized run_id>.json` — the run-token discipline the PARTS
+/// already follow (`cdc-<run_token>-NNNN.parquet`) applied to the manifest
+/// sidecar. Same sanitizer: an RFC3339 run id carries `:`/`+`, illegal in a
+/// Windows filename, so map anything outside `[A-Za-z0-9._-]` to `-`.
+pub fn run_unique_manifest_name(run_id: &str) -> String {
+    let token: String = run_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    format!("manifest-{token}.json")
+}
+
+/// Write an immutable, run-unique COPY of the manifest alongside the canonical
+/// [`MANIFEST_FILENAME`]. The canonical name is last-writer-wins — a pointer to
+/// the LATEST run, which is what guard/validate/resume/repair want. But
+/// consecutive runs into one prefix (a CDC soak, the scheduler's
+/// `until_current` model) each clobber it, orphaning every prior run's manifest
+/// from any consumer that sums row counts ACROSS runs (the Pro loader's
+/// `reconcile`). The per-run copy survives, exactly as the run-token-named
+/// parts do. No guard / no `_SUCCESS`: this is a sidecar audit record, not the
+/// canonical pointer, so it must not gate on (or advance) run-shape state.
+pub fn write_run_unique_manifest_copy(
+    dest: &dyn Destination,
+    manifest: &RunManifest,
+) -> Result<()> {
+    if dest.capabilities().commit_protocol == WriteCommitProtocol::Streaming {
+        return Ok(());
+    }
+    let bytes = serde_json::to_vec_pretty(manifest)?;
+    let tmp = tempfile::NamedTempFile::new()?;
+    std::fs::write(tmp.path(), &bytes)?;
+    dest.write(tmp.path(), &run_unique_manifest_name(&manifest.run_id))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
