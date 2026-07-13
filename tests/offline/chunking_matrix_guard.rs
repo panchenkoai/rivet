@@ -143,8 +143,24 @@ fn collect_fn_names(dir: &Path, out: &mut HashSet<String>) {
             };
             for line in text.lines() {
                 // Cheap `fn <ident>` scan — good enough to catch a mapped test
-                // name that no longer exists (the failure mode we guard).
-                if let Some(rest) = line.trim_start().strip_prefix("fn ")
+                // name that no longer exists (the failure mode we guard). Strip
+                // visibility/async modifiers first: a bare `fn `-only scan
+                // would false-orphan a matrix test declared `pub fn`/`async fn`
+                // (latent fragility the matrix audit flagged).
+                let mut rest = line.trim_start();
+                for prefix in [
+                    "pub(crate) ",
+                    "pub(super) ",
+                    "pub ",
+                    "async ",
+                    "const ",
+                    "unsafe ",
+                ] {
+                    if let Some(r) = rest.strip_prefix(prefix) {
+                        rest = r;
+                    }
+                }
+                if let Some(rest) = rest.strip_prefix("fn ")
                     && let Some(name) = rest
                         .split(|c: char| !c.is_alphanumeric() && c != '_')
                         .next()

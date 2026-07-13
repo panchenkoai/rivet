@@ -220,17 +220,27 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Start Mongo stack
+        # minio + fake-gcs ride along for the engine-agnostic chunking_stand
+        # Mongo cells (dest_gcs/dest_s3) — no other job has BOTH a Mongo server
+        # and these tests selected (e2e `--skip mongo` excludes them; the matrix
+        # audit found all four cells never ran in any CI job).
         run: |
           mkdir -p tests/.live-tmp
-          docker compose up -d --wait mongo mongo-rs mongo-auth toxiproxy
+          docker compose up -d --wait mongo mongo-rs mongo-auth toxiproxy minio fake-gcs
           sudo chmod -R 0777 tests/.live-tmp
 
       - name: Run Mongo live tests
         # `live_mongo` matches every live_mongo* module (batch, crash-recovery,
         # harm-permission, retry-and-faults); `live_cdc_mongo` the CDC suite.
+        # The four `stand_*_mongo` names are the chunking_stand Mongo cells —
+        # positional filters are substrings, so they are named EXACTLY (a bare
+        # `stand_` would also select the mysql/mssql stand tests, whose engines
+        # this slim stack does not run).
         run: |
           cargo test --release --test live_suite -- --ignored \
-            live_mongo live_cdc_mongo
+            live_mongo live_cdc_mongo \
+            stand_dest_gcs_mongo stand_dest_s3_mongo \
+            stand_format_csv_mongo stand_compression_codecs_mongo
 
       - name: Dump Mongo logs on failure
         if: failure()
