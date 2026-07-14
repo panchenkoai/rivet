@@ -1,0 +1,4 @@
+title: Rivet
+description: Fast, safe, zero-copy database exports — PostgreSQL / MySQL / SQL Server / MongoDB to Parquet, CSV, and cloud warehouses.
+theme: jekyll-theme-cayman
+# Matrices and reports are static assets; Jekyll copies non-markdown verbatim.
