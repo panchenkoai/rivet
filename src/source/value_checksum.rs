@@ -540,6 +540,289 @@ mod tests {
         ]))
     }
 
+    // ── mutation-tier2 gap closures ──────────────────────────────────────────
+    // cargo-mutants found 78 missed mutants here — in the INTEGRITY layer whose
+    // last line of defense is exactly these lib tests. The four tests below
+    // pin: (1) source(A)↔arrow(B) parity per covered type through INDEPENDENT
+    // code paths, (2) the fold is XOR (an `|=` mutant saturates and passes any
+    // corruption), (3) the cross-part fold in validate is XOR too (a single-part
+    // fixture folds once — `0^s == 0|s` — and cannot see the operator), (4) the
+    // List coverage gate skips unmatched element types with the exact reason.
+
+    /// Fake source cells mirroring `covered_arrays()` row-for-row: 3 rows per
+    /// column, row 2 null. Each column has a distinct type, so each accessor
+    /// serves exactly one column and may ignore `col`.
+    struct FakeCells;
+
+    impl CellSource for FakeCells {
+        fn num_rows(&self) -> usize {
+            3
+        }
+        fn int16(&self, _c: usize, r: usize) -> Option<i16> {
+            [Some(1), Some(-2), None][r]
+        }
+        fn int32(&self, _c: usize, r: usize) -> Option<i32> {
+            [Some(3), Some(-4), None][r]
+        }
+        fn int64(&self, _c: usize, r: usize) -> Option<i64> {
+            [Some(5), Some(-6), None][r]
+        }
+        fn uint64(&self, _c: usize, r: usize) -> Option<u64> {
+            [Some(u64::MAX), Some(7), None][r]
+        }
+        fn float32(&self, _c: usize, r: usize) -> Option<f32> {
+            [Some(1.5), Some(-2.25), None][r]
+        }
+        fn float64(&self, _c: usize, r: usize) -> Option<f64> {
+            [Some(3.5), Some(-4.75), None][r]
+        }
+        fn decimal128(&self, _c: usize, r: usize, scale: i8) -> Option<i128> {
+            assert_eq!(scale, 2, "fixture declares Decimal128(10,2)");
+            [Some(12345), Some(-678), None][r]
+        }
+        fn date32(&self, _c: usize, r: usize) -> Option<i32> {
+            [Some(19000), Some(1), None][r]
+        }
+        fn ts_micros(&self, _c: usize, r: usize) -> Option<i64> {
+            [Some(1_700_000_000_000_000), Some(1), None][r]
+        }
+        fn boolean(&self, _c: usize, r: usize) -> Option<bool> {
+            [Some(true), Some(false), None][r]
+        }
+        fn utf8(&self, _c: usize, r: usize) -> Option<std::borrow::Cow<'_, [u8]>> {
+            ["h\u{e9}llo".as_bytes(), b"", b""]
+                .get(r)
+                .filter(|_| r < 2)
+                .map(|b| std::borrow::Cow::Borrowed(*b))
+        }
+        fn binary(&self, _c: usize, r: usize) -> Option<std::borrow::Cow<'_, [u8]>> {
+            [&[0xde_u8, 0xad][..], &[][..], &[][..]]
+                .get(r)
+                .filter(|_| r < 2)
+                .map(|b| std::borrow::Cow::Borrowed(*b))
+        }
+        fn time64_micros(&self, _c: usize, r: usize) -> Option<i64> {
+            [Some(86_399_999_999), Some(0), None][r]
+        }
+        fn fixed_binary(&self, _c: usize, r: usize) -> Option<std::borrow::Cow<'_, [u8]>> {
+            [&[1_u8, 2, 3, 4][..], &[5, 6, 7, 8][..], &[][..]]
+                .get(r)
+                .filter(|_| r < 2)
+                .map(|b| std::borrow::Cow::Borrowed(*b))
+        }
+        fn decimal256(&self, _c: usize, r: usize, scale: i8) -> Option<arrow::datatypes::i256> {
+            assert_eq!(scale, 10, "fixture declares Decimal256(50,10)");
+            [
+                Some(arrow::datatypes::i256::from_i128(123)),
+                Some(arrow::datatypes::i256::from_i128(-9)),
+                None,
+            ][r]
+        }
+        fn list(&self, _c: usize, r: usize, elem: &DataType) -> Option<Vec<ListElem>> {
+            assert_eq!(elem, &DataType::Int64, "fixture declares List<Int64>");
+            match r {
+                0 => Some(vec![ListElem::I64(1), ListElem::I64(2)]),
+                1 => Some(vec![]),
+                _ => None,
+            }
+        }
+    }
+
+    /// The arrow-side twins of [`FakeCells`], one array per covered type.
+    fn covered_arrays() -> (SchemaRef, Vec<arrow::array::ArrayRef>) {
+        use arrow::array::{
+            BinaryArray, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
+            FixedSizeBinaryArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Builder,
+            ListBuilder, StringArray, Time64MicrosecondArray, TimestampMicrosecondArray,
+            UInt64Array,
+        };
+        use arrow::datatypes::i256;
+
+        let mut lb = ListBuilder::new(Int64Builder::new());
+        lb.values().append_value(1);
+        lb.values().append_value(2);
+        lb.append(true);
+        lb.append(true); // empty, non-null
+        lb.append(false); // null list cell
+        let list = lb.finish();
+        let list_dt = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
+
+        let arrays: Vec<arrow::array::ArrayRef> = vec![
+            Arc::new(Int16Array::from(vec![Some(1), Some(-2), None])),
+            Arc::new(Int32Array::from(vec![Some(3), Some(-4), None])),
+            Arc::new(Int64Array::from(vec![Some(5), Some(-6), None])),
+            Arc::new(UInt64Array::from(vec![Some(u64::MAX), Some(7), None])),
+            Arc::new(Float32Array::from(vec![Some(1.5), Some(-2.25), None])),
+            Arc::new(Float64Array::from(vec![Some(3.5), Some(-4.75), None])),
+            Arc::new(
+                Decimal128Array::from(vec![Some(12345), Some(-678), None])
+                    .with_precision_and_scale(10, 2)
+                    .unwrap(),
+            ),
+            Arc::new(Date32Array::from(vec![Some(19000), Some(1), None])),
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                Some(1_700_000_000_000_000),
+                Some(1),
+                None,
+            ])),
+            Arc::new(BooleanArray::from(vec![Some(true), Some(false), None])),
+            Arc::new(StringArray::from(vec![Some("h\u{e9}llo"), Some(""), None])),
+            Arc::new(BinaryArray::from(vec![
+                Some(&[0xde_u8, 0xad][..]),
+                Some(&[][..]),
+                None,
+            ])),
+            Arc::new(Time64MicrosecondArray::from(vec![
+                Some(86_399_999_999),
+                Some(0),
+                None,
+            ])),
+            Arc::new(
+                FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                    vec![Some([1_u8, 2, 3, 4]), Some([5, 6, 7, 8]), None].into_iter(),
+                    4,
+                )
+                .unwrap(),
+            ),
+            Arc::new(
+                Decimal256Array::from(vec![
+                    Some(i256::from_i128(123)),
+                    Some(i256::from_i128(-9)),
+                    None,
+                ])
+                .with_precision_and_scale(50, 10)
+                .unwrap(),
+            ),
+            Arc::new(list),
+        ];
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("c_i16", DataType::Int16, true),
+            Field::new("c_i32", DataType::Int32, true),
+            Field::new("c_i64", DataType::Int64, true),
+            Field::new("c_u64", DataType::UInt64, true),
+            Field::new("c_f32", DataType::Float32, true),
+            Field::new("c_f64", DataType::Float64, true),
+            Field::new("c_dec", DataType::Decimal128(10, 2), true),
+            Field::new("c_date", DataType::Date32, true),
+            Field::new(
+                "c_ts",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new("c_bool", DataType::Boolean, true),
+            Field::new("c_str", DataType::Utf8, true),
+            Field::new("c_bin", DataType::Binary, true),
+            Field::new("c_time", DataType::Time64(TimeUnit::Microsecond), true),
+            Field::new("c_fsb", DataType::FixedSizeBinary(4), true),
+            Field::new("c_dec256", DataType::Decimal256(50, 10), true),
+            Field::new("c_list", list_dt, true),
+        ]));
+        (schema, arrays)
+    }
+
+    #[test]
+    fn source_checksums_match_arrow_side_for_every_covered_type() {
+        // Kills the 50+ missed mutants in `source_checksums` (stub -> vec![],
+        // every deleted per-type match arm): the source(A) pass must reproduce
+        // the arrow(B) fold for EVERY covered type, through independent code.
+        let (schema, arrays) = covered_arrays();
+        let a = source_checksums(&schema, &FakeCells);
+        assert_eq!(a.len(), arrays.len(), "one checksum per column");
+        for (i, arr) in arrays.iter().enumerate() {
+            let b = column_xxh3(arr.as_ref(), None);
+            assert_eq!(
+                a[i],
+                b,
+                "column {} ({:?}): source(A) != arrow(B)",
+                schema.field(i).name(),
+                schema.field(i).data_type()
+            );
+            assert_ne!(
+                a[i],
+                0,
+                "column {} must actually hash — a deleted match arm folds nothing and yields 0",
+                schema.field(i).name()
+            );
+        }
+    }
+
+    #[test]
+    fn column_fold_is_xor_of_per_cell_hashes() {
+        // Kills `^= -> |=` in column_xxh3: an OR fold saturates towards
+        // all-ones after a few rows and then ANY corruption produces the same
+        // "checksum" — false security. Pin the exact XOR fold and its
+        // order-independence.
+        use xxhash_rust::xxh3::xxh3_64;
+        let expect = xxh3_64(&10_i64.to_le_bytes())
+            ^ xxh3_64(&20_i64.to_le_bytes())
+            ^ xxh3_64(&30_i64.to_le_bytes());
+        let arr = Int64Array::from(vec![10_i64, 20, 30]);
+        assert_eq!(column_xxh3(&arr, None), expect, "fold must be XOR");
+        let shuffled = Int64Array::from(vec![30_i64, 10, 20]);
+        assert_eq!(
+            column_xxh3(&shuffled, None),
+            expect,
+            "XOR fold is order-independent"
+        );
+        let or_fold = xxh3_64(&10_i64.to_le_bytes())
+            | xxh3_64(&20_i64.to_le_bytes())
+            | xxh3_64(&30_i64.to_le_bytes());
+        assert_ne!(
+            expect, or_fold,
+            "fixture sanity: XOR and OR must differ here"
+        );
+    }
+
+    #[test]
+    fn validate_folds_multiple_parts_by_xor() {
+        // Kills `^= -> |=` in validate_recorded_checksums' cross-part fold: a
+        // one-part fixture folds once into 0 (`0^s == 0|s`) and cannot see the
+        // operator. Two parts with different rows expose it.
+        let b1 = batch3(2);
+        let b2 = batch3(7);
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = dir.path().join("part1.parquet");
+        let p2 = dir.path().join("part2.parquet");
+        write_parquet(&b1, &p1);
+        write_parquet(&b2, &p2);
+        let s1 = arrow_batch_checksums(&b1);
+        let s2 = arrow_batch_checksums(&b2);
+        let recorded: Vec<crate::manifest::ColumnChecksum> = s1
+            .iter()
+            .zip(s2.iter())
+            .zip(b1.schema().fields())
+            .map(|((a, b), f)| crate::manifest::ColumnChecksum {
+                name: f.name().clone(),
+                checksum: (a ^ b).to_string(),
+            })
+            .collect();
+        validate_recorded_checksums(&recorded, &[p1, p2], None)
+            .expect("two matching parts must validate — the cross-part fold is XOR");
+    }
+
+    #[test]
+    fn check_rule_gates_list_element_types() {
+        // Kills the List-arm mutants in check_rule: dropping the guard (every
+        // list "covered") silently checksums lists the encoder can't represent;
+        // dropping the arm changes the skip REASON (lists must be named as
+        // list-skips, not lumped into the generic uncovered bucket).
+        let covered = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
+        assert!(
+            matches!(check_rule(&covered), CheckRule::Covered),
+            "List<Int64> is covered"
+        );
+        let uncovered = DataType::List(Arc::new(Field::new("item", DataType::Binary, true)));
+        match check_rule(&uncovered) {
+            CheckRule::Skipped(reason) => assert_eq!(reason, "List element type not matched"),
+            CheckRule::Covered => panic!("List<Binary> must be Skipped, got Covered"),
+        }
+        let large = DataType::LargeList(Arc::new(Field::new("item", DataType::Int64, true)));
+        match check_rule(&large) {
+            CheckRule::Skipped(reason) => assert_eq!(reason, "List element type not matched"),
+            CheckRule::Covered => panic!("LargeList must be Skipped, got Covered"),
+        }
+    }
+
     #[test]
     fn coverage_skips_names_uncovered_columns_and_they_contribute_zero() {
         use arrow::array::TimestampNanosecondArray;
