@@ -1,0 +1,914 @@
+# Mutation-testing baseline — the ADJUDICATED missed-mutant ledger.
+#
+# Every line is a mutant the lib cycle does not catch, with a standing verdict:
+# either LIVE-GUARDED (orchestration / CDC adapters / arrow_convert — their
+# oracles are the live suites, exercised by the weekly live-cycle runs) or
+# ACCEPTED (operator-UX output, Display impls, log-only paths). Equivalent
+# mutants are NOT here — they are excluded with reasons in .cargo/mutants.toml.
+#
+# The nightly mutants job diffs its missed list against this file: a missed
+# mutant NOT listed here fails the job. This file only ever SHRINKS (delete
+# lines as tests close them); adding a line requires the same adjudication.
+# Corpus: 3766 mutants over 3 tiers, 2026-07-14 (docs/mutation-plan.md).
+src/manifest.rs:362:9: replace <impl std::fmt::Display for ManifestInconsistency>::fmt -> std::fmt::Result with Ok(Default::default())
+src/pipeline/chunked/resume_m8.rs:286:22: replace > with >= in apply_m8_resume_decisions
+src/pipeline/chunked/resume_m8.rs:296:22: replace > with >= in apply_m8_resume_decisions
+src/pipeline/finalize.rs:124:9: delete match arm "success" in finalize_manifest
+src/pipeline/finalize.rs:125:9: delete match arm "failed" in finalize_manifest
+src/pipeline/finalize.rs:156:25: delete ! in finalize_manifest
+src/pipeline/finalize.rs:156:25: replace match guard !s.is_empty() && !t.is_empty() with false in finalize_manifest
+src/pipeline/finalize.rs:156:25: replace match guard !s.is_empty() && !t.is_empty() with true in finalize_manifest
+src/pipeline/finalize.rs:156:39: replace && with || in finalize_manifest
+src/pipeline/finalize.rs:156:42: delete ! in finalize_manifest
+src/pipeline/finalize.rs:189:8: delete ! in finalize_manifest
+src/pipeline/finalize.rs:195:40: replace || with && in finalize_manifest
+src/pipeline/finalize.rs:262:5: replace finalize_validate_manifest with ()
+src/pipeline/finalize.rs:277:44: replace == with != in finalize_validate_manifest
+src/pipeline/finalize.rs:298:16: delete ! in finalize_validate_manifest
+src/pipeline/finalize.rs:298:26: replace && with || in finalize_validate_manifest
+src/pipeline/finalize.rs:298:46: replace && with || in finalize_validate_manifest
+src/pipeline/finalize.rs:298:67: replace == with != in finalize_validate_manifest
+src/pipeline/finalize.rs:344:5: replace check_success_gate_for_resume -> Result<()> with Ok(())
+src/pipeline/finalize.rs:348:44: replace == with != in check_success_gate_for_resume
+src/pipeline/finalize.rs:390:5: replace warn_if_prefix_has_completed_run with ()
+src/pipeline/finalize.rs:39:5: replace finalize_run_report with ()
+src/pipeline/finalize.rs:404:44: replace == with != in warn_if_prefix_has_completed_run
+src/pipeline/finalize.rs:453:5: replace destination_has_success -> bool with false
+src/pipeline/finalize.rs:453:5: replace destination_has_success -> bool with true
+src/pipeline/finalize.rs:458:41: replace == with != in destination_has_success
+src/pipeline/finalize.rs:67:16: replace && with || in finalize_run_report
+src/pipeline/finalize.rs:67:19: delete ! in finalize_run_report
+src/pipeline/finalize.rs:70:23: replace == with != in finalize_run_report
+src/pipeline/finalize.rs:70:35: replace && with || in finalize_run_report
+src/pipeline/finalize.rs:70:62: replace > with < in finalize_run_report
+src/pipeline/finalize.rs:70:62: replace > with == in finalize_run_report
+src/pipeline/finalize.rs:70:62: replace > with >= in finalize_run_report
+src/pipeline/finalize.rs:93:5: replace finalize_manifest with ()
+src/pipeline/keyset.rs:118:5: replace run_keyset -> Result<()> with Ok(())
+src/pipeline/keyset.rs:179:28: replace += with *= in run_keyset
+src/pipeline/keyset.rs:179:28: replace += with -= in run_keyset
+src/pipeline/keyset.rs:209:15: replace += with *= in run_keyset
+src/pipeline/keyset.rs:209:15: replace += with -= in run_keyset
+src/pipeline/keyset.rs:213:22: replace < with <= in run_keyset
+src/pipeline/keyset.rs:213:22: replace < with == in run_keyset
+src/pipeline/keyset.rs:213:22: replace < with > in run_keyset
+src/pipeline/keyset.rs:34:9: delete match arm ExtractionStrategy::Keyset(kp) in keyset_plan
+src/pipeline/keyset.rs:69:5: replace read_keyset_page -> Result<Option<KeysetPage>> with Ok(None)
+src/pipeline/keyset.rs:89:13: replace == with != in read_keyset_page
+src/pipeline/single.rs:171:5: replace run_export -> Result<()> with Ok(())
+src/pipeline/single.rs:175:36: replace == with != in run_export
+src/pipeline/single.rs:175:72: replace && with || in run_export
+src/pipeline/single.rs:175:94: replace > with < in run_export
+src/pipeline/single.rs:175:94: replace > with == in run_export
+src/pipeline/single.rs:175:94: replace > with >= in run_export
+src/pipeline/single.rs:274:24: replace += with *= in run_single_export
+src/pipeline/single.rs:274:24: replace += with -= in run_single_export
+src/pipeline/single.rs:28:5: replace run_with_reconnect -> Result<()> with Ok(())
+src/pipeline/single.rs:31:20: replace > with < in run_with_reconnect
+src/pipeline/single.rs:31:20: replace > with == in run_with_reconnect
+src/pipeline/single.rs:31:20: replace > with >= in run_with_reconnect
+src/pipeline/single.rs:342:23: replace > with < in run_single_export
+src/pipeline/single.rs:342:23: replace > with == in run_single_export
+src/pipeline/single.rs:342:23: replace > with >= in run_single_export
+src/pipeline/single.rs:365:48: replace > with < in run_single_export
+src/pipeline/single.rs:365:48: replace > with == in run_single_export
+src/pipeline/single.rs:365:48: replace > with >= in run_single_export
+src/pipeline/single.rs:38:46: replace * with + in run_with_reconnect
+src/pipeline/single.rs:38:46: replace * with / in run_with_reconnect
+src/pipeline/single.rs:38:65: replace - with + in run_with_reconnect
+src/pipeline/single.rs:38:65: replace - with / in run_with_reconnect
+src/pipeline/single.rs:38:70: replace + with * in run_with_reconnect
+src/pipeline/single.rs:38:70: replace + with - in run_with_reconnect
+src/pipeline/single.rs:460:8: delete ! in run_single_export
+src/pipeline/single.rs:473:37: replace > with < in run_single_export
+src/pipeline/single.rs:473:37: replace > with == in run_single_export
+src/pipeline/single.rs:473:37: replace > with >= in run_single_export
+src/pipeline/single.rs:474:12: delete ! in run_single_export
+src/pipeline/single.rs:538:9: replace || with && in is_port_closed
+src/pipeline/single.rs:539:9: replace || with && in is_port_closed
+src/pipeline/single.rs:540:9: replace || with && in is_port_closed
+src/pipeline/single.rs:541:9: replace || with && in is_port_closed
+src/pipeline/single.rs:74:28: replace == with != in run_with_reconnect
+src/pipeline/single.rs:74:33: replace && with || in run_with_reconnect
+src/pipeline/single.rs:79:28: replace < with <= in run_with_reconnect
+src/pipeline/single.rs:79:28: replace < with == in run_with_reconnect
+src/pipeline/single.rs:79:28: replace < with > in run_with_reconnect
+src/pipeline/single.rs:79:54: replace && with || in run_with_reconnect
+src/pipeline/validate_manifest.rs:141:32: replace > with >= in read_capped
+src/pipeline/validate_manifest.rs:210:5: replace default_depth_level -> String with "xyzzy".into()
+src/pipeline/validate_manifest.rs:210:5: replace default_depth_level -> String with String::new()
+src/pipeline/validate_manifest.rs:324:9: replace <impl std::fmt::Display for Failure>::fmt -> std::fmt::Result with Ok(Default::default())
+src/pipeline/validate_manifest.rs:55:47: replace * with +
+src/pipeline/validate_manifest.rs:55:54: replace * with +
+src/pipeline/validate_manifest.rs:565:17: delete field manifest_found from struct ManifestVerification expression in verify_at_destination
+src/pipeline/validate_manifest.rs:566:17: delete field failures from struct ManifestVerification expression in verify_at_destination
+src/pipeline/validate_manifest.rs:642:48: replace += with *= in verify_at_destination
+src/pipeline/validate_manifest.rs:642:48: replace += with -= in verify_at_destination
+src/pipeline/validate_manifest.rs:646:38: replace += with *= in verify_at_destination
+src/pipeline/validate_manifest.rs:662:38: replace += with *= in verify_at_destination
+src/pipeline/validate_manifest.rs:662:38: replace += with -= in verify_at_destination
+src/pipeline/validate_manifest.rs:762:5: replace preview -> String with "xyzzy".into()
+src/pipeline/validate_manifest.rs:762:5: replace preview -> String with String::new()
+src/pipeline/validate_manifest.rs:763:26: replace > with < in preview
+src/pipeline/validate_manifest.rs:763:26: replace > with == in preview
+src/pipeline/validate_manifest.rs:763:26: replace > with >= in preview
+src/source/cdc/value.rs:100:9: replace RivetValue::to_json -> Json with Default::default()
+src/source/cdc/value.rs:222:21: delete match arm Some(V::UInt(u)) in build_column
+src/source/cdc/value.rs:222:59: replace != with == in build_column
+src/source/cdc/value.rs:242:21: delete match arm Some(V::UInt(u)) in build_column
+src/source/cdc/value.rs:253:21: delete match arm Some(V::Int(i)) in build_column
+src/source/cdc/value.rs:31:5: replace epoch_days -> i32 with -1
+src/source/cdc/value.rs:31:5: replace epoch_days -> i32 with 0
+src/source/cdc/value.rs:31:5: replace epoch_days -> i32 with 1
+src/source/cdc/value.rs:357:21: delete match arm Some(V::Bytes(by)) in build_column
+src/source/cdc/value.rs:438:21: delete match arm V::UInt(u) in cells_checksum
+src/source/cdc/value.rs:438:43: replace != with == in cells_checksum
+src/source/cdc/value.rs:473:25: replace ^= with |= in cells_checksum
+src/source/cdc/value.rs:476:35: replace ^= with |= in cells_checksum
+src/source/cdc/value.rs:479:25: replace ^= with |= in cells_checksum
+src/source/cdc/value.rs:486:25: replace ^= with |= in cells_checksum
+src/source/cdc/value.rs:495:29: delete match arm (DataType::Boolean, V::Bool(b)) in cells_checksum
+src/source/cdc/value.rs:496:29: delete match arm (DataType::Int16, V::Int(i)) in cells_checksum
+src/source/cdc/value.rs:502:29: delete match arm (DataType::Int64, V::Int(i)) in cells_checksum
+src/source/cdc/value.rs:503:29: delete match arm (DataType::Float32, V::Float(x)) in cells_checksum
+src/source/cdc/value.rs:504:29: delete match arm (DataType::Float64, V::Float(x)) in cells_checksum
+src/source/cdc/value.rs:505:29: delete match arm (DataType::Float64, V::Int(i)) in cells_checksum
+src/source/cdc/value.rs:527:9: delete match arm RivetValue::Bool(b) in int_of
+src/source/cdc/value.rs:535:9: delete match arm RivetValue::Int(i) in float_of
+src/source/cdc/value.rs:649:5: replace decimal_to_i256 -> Option<arrow::datatypes::i256> with Some(Default::default())
+src/source/cdc/value.rs:651:9: delete match arm RivetValue::Int(i) in decimal_to_i256
+src/source/cdc/value.rs:652:9: delete match arm RivetValue::UInt(u) in decimal_to_i256
+src/source/cdc/value.rs:653:33: replace match guard f.is_finite() with false in decimal_to_i256
+src/source/cdc/value.rs:653:33: replace match guard f.is_finite() with true in decimal_to_i256
+src/source/cdc/value.rs:667:9: delete match arm RivetValue::UInt(u) in decimal_to_i128
+src/source/cdc/value.rs:671:33: replace match guard f.is_finite() with false in decimal_to_i128
+src/source/cdc/value.rs:671:33: replace match guard f.is_finite() with true in decimal_to_i128
+src/source/cdc/value.rs:73:36: replace * with + in RivetValue::from_mysql
+src/source/cdc/value.rs:73:36: replace * with / in RivetValue::from_mysql
+src/source/cdc/value.rs:73:45: replace + with * in RivetValue::from_mysql
+src/source/cdc/value.rs:73:45: replace + with - in RivetValue::from_mysql
+src/source/cdc/value.rs:73:57: replace * with + in RivetValue::from_mysql
+src/source/cdc/value.rs:73:57: replace * with / in RivetValue::from_mysql
+src/source/cdc/value.rs:73:65: replace + with * in RivetValue::from_mysql
+src/source/cdc/value.rs:73:65: replace + with - in RivetValue::from_mysql
+src/source/cdc/value.rs:73:78: replace * with + in RivetValue::from_mysql
+src/source/cdc/value.rs:73:78: replace * with / in RivetValue::from_mysql
+src/source/cdc/value.rs:73:83: replace + with * in RivetValue::from_mysql
+src/source/cdc/value.rs:73:83: replace + with - in RivetValue::from_mysql
+src/source/cdc/value.rs:74:25: replace * with + in RivetValue::from_mysql
+src/source/cdc/value.rs:74:25: replace * with / in RivetValue::from_mysql
+src/source/cdc/value.rs:75:25: replace + with * in RivetValue::from_mysql
+src/source/cdc/value.rs:75:25: replace + with - in RivetValue::from_mysql
+src/source/cdc/value.rs:767:40: replace + with * in parse_enum_labels
+src/source/cdc/value.rs:767:59: replace + with * in parse_enum_labels
+src/source/cdc/value.rs:76:50: delete - in RivetValue::from_mysql
+src/source/cdc/value.rs:814:62: replace != with == in MysqlCellFix::apply
+src/source/cdc/value.rs:815:63: replace != with == in MysqlCellFix::apply
+src/source/cdc/value.rs:816:53: replace match guard b.len() <= 8 with true in MysqlCellFix::apply
+src/source/cdc/value.rs:817:59: replace << with >> in MysqlCellFix::apply
+src/source/cdc/value.rs:817:65: replace | with ^ in MysqlCellFix::apply
+src/source/cdc/value.rs:826:29: replace >= with < in MysqlCellFix::apply
+src/source/cdc/value.rs:826:35: replace << with >> in MysqlCellFix::apply
+src/source/cdc/value.rs:826:46: replace - with + in MysqlCellFix::apply
+src/source/cdc/value.rs:826:46: replace - with / in MysqlCellFix::apply
+src/source/cdc/value.rs:826:51: replace << with >> in MysqlCellFix::apply
+src/source/cdc/value.rs:830:63: replace match guard b.len() <= 8 with true in MysqlCellFix::apply
+src/source/cdc/value.rs:835:51: replace | with ^ in MysqlCellFix::apply
+src/source/cdc/value.rs:835:66: replace << with >> in MysqlCellFix::apply
+src/source/cdc/value.rs:840:58: replace match guard b.len() < *w with true in MysqlCellFix::apply
+src/source/cdc/value.rs:840:66: replace < with <= in MysqlCellFix::apply
+src/source/cdc/value.rs:85:9: replace RivetValue::estimated_bytes -> usize with 0
+src/source/cdc/value.rs:85:9: replace RivetValue::estimated_bytes -> usize with 1
+src/source/cdc/value.rs:872:5: replace render_str -> String with "xyzzy".into()
+src/source/cdc/value.rs:872:5: replace render_str -> String with String::new()
+src/source/cdc/value.rs:93:94: replace + with * in RivetValue::estimated_bytes
+src/source/cdc/value.rs:93:94: replace + with - in RivetValue::estimated_bytes
+src/source/mssql/arrow_convert.rs:142:21: delete match arm RivetType::Unsupported{reason, ..} in mssql_columns_to_schema
+src/source/mssql/arrow_convert.rs:154:8: delete ! in mssql_columns_to_schema
+src/source/mssql/arrow_convert.rs:170:5: replace mssql_type_mappings -> Vec<TypeMapping> with vec![]
+src/source/mssql/arrow_convert.rs:230:5: replace cell -> Option<&ColumnData<'static>> with None
+src/source/mssql/arrow_convert.rs:237:5: replace decimal_scale_from_rows -> Option<u8> with None
+src/source/mssql/arrow_convert.rs:237:5: replace decimal_scale_from_rows -> Option<u8> with Some(0)
+src/source/mssql/arrow_convert.rs:237:5: replace decimal_scale_from_rows -> Option<u8> with Some(1)
+src/source/mssql/arrow_convert.rs:238:9: delete match arm Some(ColumnData::Numeric(Some(n))) in decimal_scale_from_rows
+src/source/mssql/arrow_convert.rs:320:21: delete match arm Some(ColumnData::String(Some(s))) in build_array
+src/source/mssql/arrow_convert.rs:336:21: delete match arm Some(ColumnData::Binary(Some(bytes))) in build_array
+src/source/mssql/arrow_convert.rs:349:21: delete match arm Some(ColumnData::Guid(Some(g))) in build_array
+src/source/mssql/arrow_convert.rs:360:21: delete match arm Some(ColumnData::Numeric(Some(n))) in build_array
+src/source/mssql/arrow_convert.rs:370:21: delete match arm Some(ColumnData::F64(Some(v))) in build_array
+src/source/mssql/arrow_convert.rs:385:29: replace + with * in build_array
+src/source/mssql/arrow_convert.rs:385:29: replace + with - in build_array
+src/source/mssql/arrow_convert.rs:448:62: replace * with + in build_array
+src/source/mssql/arrow_convert.rs:448:62: replace * with / in build_array
+src/source/mssql/arrow_convert.rs:449:29: replace + with * in build_array
+src/source/mssql/arrow_convert.rs:449:29: replace + with - in build_array
+src/source/mssql/arrow_convert.rs:449:54: replace / with % in build_array
+src/source/mssql/arrow_convert.rs:449:54: replace / with * in build_array
+src/source/mssql/arrow_convert.rs:485:47: replace - with + in rescale_i128
+src/source/mssql/arrow_convert.rs:494:49: replace - with + in rescale_i128
+src/source/mssql/arrow_convert.rs:550:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::num_rows -> usize with 0
+src/source/mssql/arrow_convert.rs:550:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::num_rows -> usize with 1
+src/source/mssql/arrow_convert.rs:553:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::boolean -> Option<bool> with None
+src/source/mssql/arrow_convert.rs:553:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::boolean -> Option<bool> with Some(false)
+src/source/mssql/arrow_convert.rs:553:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::boolean -> Option<bool> with Some(true)
+src/source/mssql/arrow_convert.rs:554:13: delete match arm Some(ColumnData::Bit(Some(v))) in <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::boolean
+src/source/mssql/arrow_convert.rs:559:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::int16 -> Option<i16> with None
+src/source/mssql/arrow_convert.rs:559:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::int16 -> Option<i16> with Some(-1)
+src/source/mssql/arrow_convert.rs:559:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::int16 -> Option<i16> with Some(0)
+src/source/mssql/arrow_convert.rs:559:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::int16 -> Option<i16> with Some(1)
+src/source/mssql/arrow_convert.rs:560:13: delete match arm Some(ColumnData::I16(Some(v))) in <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::int16
+src/source/mssql/arrow_convert.rs:561:13: delete match arm Some(ColumnData::U8(Some(v))) in <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::int16
+src/source/mssql/arrow_convert.rs:566:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::int32 -> Option<i32> with None
+src/source/mssql/arrow_convert.rs:566:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::int32 -> Option<i32> with Some(-1)
+src/source/mssql/arrow_convert.rs:566:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::int32 -> Option<i32> with Some(0)
+src/source/mssql/arrow_convert.rs:566:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::int32 -> Option<i32> with Some(1)
+src/source/mssql/arrow_convert.rs:567:13: delete match arm Some(ColumnData::I32(Some(v))) in <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::int32
+src/source/mssql/arrow_convert.rs:572:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::int64 -> Option<i64> with None
+src/source/mssql/arrow_convert.rs:572:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::int64 -> Option<i64> with Some(-1)
+src/source/mssql/arrow_convert.rs:572:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::int64 -> Option<i64> with Some(0)
+src/source/mssql/arrow_convert.rs:572:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::int64 -> Option<i64> with Some(1)
+src/source/mssql/arrow_convert.rs:573:13: delete match arm Some(ColumnData::I64(Some(v))) in <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::int64
+src/source/mssql/arrow_convert.rs:578:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::uint64 -> Option<u64> with Some(0)
+src/source/mssql/arrow_convert.rs:578:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::uint64 -> Option<u64> with Some(1)
+src/source/mssql/arrow_convert.rs:581:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::float32 -> Option<f32> with None
+src/source/mssql/arrow_convert.rs:581:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::float32 -> Option<f32> with Some(-1.0)
+src/source/mssql/arrow_convert.rs:581:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::float32 -> Option<f32> with Some(0.0)
+src/source/mssql/arrow_convert.rs:581:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::float32 -> Option<f32> with Some(1.0)
+src/source/mssql/arrow_convert.rs:582:13: delete match arm Some(ColumnData::F32(Some(v))) in <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::float32
+src/source/mssql/arrow_convert.rs:587:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::float64 -> Option<f64> with None
+src/source/mssql/arrow_convert.rs:587:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::float64 -> Option<f64> with Some(-1.0)
+src/source/mssql/arrow_convert.rs:587:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::float64 -> Option<f64> with Some(0.0)
+src/source/mssql/arrow_convert.rs:587:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::float64 -> Option<f64> with Some(1.0)
+src/source/mssql/arrow_convert.rs:588:13: delete match arm Some(ColumnData::F64(Some(v))) in <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::float64
+src/source/mssql/arrow_convert.rs:593:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::decimal128 -> Option<i128> with None
+src/source/mssql/arrow_convert.rs:593:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::decimal128 -> Option<i128> with Some(-1)
+src/source/mssql/arrow_convert.rs:593:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::decimal128 -> Option<i128> with Some(0)
+src/source/mssql/arrow_convert.rs:593:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::decimal128 -> Option<i128> with Some(1)
+src/source/mssql/arrow_convert.rs:596:13: delete match arm Some(ColumnData::Numeric(Some(n))) in <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::decimal128
+src/source/mssql/arrow_convert.rs:605:13: delete match arm Some(ColumnData::F64(Some(v))) in <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::decimal128
+src/source/mssql/arrow_convert.rs:610:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::date32 -> Option<i32> with None
+src/source/mssql/arrow_convert.rs:610:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::date32 -> Option<i32> with Some(-1)
+src/source/mssql/arrow_convert.rs:610:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::date32 -> Option<i32> with Some(0)
+src/source/mssql/arrow_convert.rs:610:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::date32 -> Option<i32> with Some(1)
+src/source/mssql/arrow_convert.rs:612:44: replace + with * in <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::date32
+src/source/mssql/arrow_convert.rs:612:44: replace + with - in <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::date32
+src/source/mssql/arrow_convert.rs:615:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::ts_micros -> Option<i64> with None
+src/source/mssql/arrow_convert.rs:615:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::ts_micros -> Option<i64> with Some(-1)
+src/source/mssql/arrow_convert.rs:615:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::ts_micros -> Option<i64> with Some(0)
+src/source/mssql/arrow_convert.rs:615:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::ts_micros -> Option<i64> with Some(1)
+src/source/mssql/arrow_convert.rs:625:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::binary -> Option<Cow<'_, [u8]>> with None
+src/source/mssql/arrow_convert.rs:625:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::binary -> Option<Cow<'_, [u8]>> with Some(Cow::Borrowed(Vec::leak(Vec::new())))
+src/source/mssql/arrow_convert.rs:625:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::binary -> Option<Cow<'_, [u8]>> with Some(Cow::Borrowed(Vec::leak(vec![0])))
+src/source/mssql/arrow_convert.rs:625:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::binary -> Option<Cow<'_, [u8]>> with Some(Cow::Borrowed(Vec::leak(vec![1])))
+src/source/mssql/arrow_convert.rs:625:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::binary -> Option<Cow<'_, [u8]>> with Some(Cow::Owned(Vec::leak(Vec::new()).to_owned()))
+src/source/mssql/arrow_convert.rs:625:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::binary -> Option<Cow<'_, [u8]>> with Some(Cow::Owned(Vec::leak(vec![0]).to_owned()))
+src/source/mssql/arrow_convert.rs:625:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::binary -> Option<Cow<'_, [u8]>> with Some(Cow::Owned(Vec::leak(vec![1]).to_owned()))
+src/source/mssql/arrow_convert.rs:626:13: delete match arm Some(ColumnData::Binary(Some(v))) in <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::binary
+src/source/mssql/arrow_convert.rs:631:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::utf8 -> Option<Cow<'_, [u8]>> with None
+src/source/mssql/arrow_convert.rs:631:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::utf8 -> Option<Cow<'_, [u8]>> with Some(Cow::Borrowed(Vec::leak(Vec::new())))
+src/source/mssql/arrow_convert.rs:631:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::utf8 -> Option<Cow<'_, [u8]>> with Some(Cow::Borrowed(Vec::leak(vec![0])))
+src/source/mssql/arrow_convert.rs:631:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::utf8 -> Option<Cow<'_, [u8]>> with Some(Cow::Borrowed(Vec::leak(vec![1])))
+src/source/mssql/arrow_convert.rs:631:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::utf8 -> Option<Cow<'_, [u8]>> with Some(Cow::Owned(Vec::leak(Vec::new()).to_owned()))
+src/source/mssql/arrow_convert.rs:631:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::utf8 -> Option<Cow<'_, [u8]>> with Some(Cow::Owned(Vec::leak(vec![0]).to_owned()))
+src/source/mssql/arrow_convert.rs:631:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::utf8 -> Option<Cow<'_, [u8]>> with Some(Cow::Owned(Vec::leak(vec![1]).to_owned()))
+src/source/mssql/arrow_convert.rs:632:13: delete match arm Some(ColumnData::String(Some(v))) in <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::utf8
+src/source/mssql/arrow_convert.rs:637:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::time64_micros -> Option<i64> with None
+src/source/mssql/arrow_convert.rs:637:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::time64_micros -> Option<i64> with Some(-1)
+src/source/mssql/arrow_convert.rs:637:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::time64_micros -> Option<i64> with Some(0)
+src/source/mssql/arrow_convert.rs:637:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::time64_micros -> Option<i64> with Some(1)
+src/source/mssql/arrow_convert.rs:642:54: replace * with + in <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::time64_micros
+src/source/mssql/arrow_convert.rs:642:54: replace * with / in <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::time64_micros
+src/source/mssql/arrow_convert.rs:642:66: replace + with * in <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::time64_micros
+src/source/mssql/arrow_convert.rs:642:66: replace + with - in <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::time64_micros
+src/source/mssql/arrow_convert.rs:642:90: replace / with % in <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::time64_micros
+src/source/mssql/arrow_convert.rs:642:90: replace / with * in <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::time64_micros
+src/source/mssql/arrow_convert.rs:646:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::fixed_binary -> Option<Cow<'_, [u8]>> with None
+src/source/mssql/arrow_convert.rs:646:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::fixed_binary -> Option<Cow<'_, [u8]>> with Some(Cow::Borrowed(Vec::leak(Vec::new())))
+src/source/mssql/arrow_convert.rs:646:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::fixed_binary -> Option<Cow<'_, [u8]>> with Some(Cow::Borrowed(Vec::leak(vec![0])))
+src/source/mssql/arrow_convert.rs:646:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::fixed_binary -> Option<Cow<'_, [u8]>> with Some(Cow::Borrowed(Vec::leak(vec![1])))
+src/source/mssql/arrow_convert.rs:646:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::fixed_binary -> Option<Cow<'_, [u8]>> with Some(Cow::Owned(Vec::leak(Vec::new()).to_owned()))
+src/source/mssql/arrow_convert.rs:646:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::fixed_binary -> Option<Cow<'_, [u8]>> with Some(Cow::Owned(Vec::leak(vec![0]).to_owned()))
+src/source/mssql/arrow_convert.rs:646:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::fixed_binary -> Option<Cow<'_, [u8]>> with Some(Cow::Owned(Vec::leak(vec![1]).to_owned()))
+src/source/mssql/arrow_convert.rs:647:13: delete match arm Some(ColumnData::Guid(Some(g))) in <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::fixed_binary
+src/source/mssql/arrow_convert.rs:653:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::decimal256 -> Option<arrow::datatypes::i256> with Some(Default::default())
+src/source/mssql/arrow_convert.rs:662:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::list -> Option<Vec<crate::source::value_checksum::ListElem>> with Some(vec![])
+src/source/mssql/cdc.rs:188:9: replace MssqlChangeStream::fill -> Result<()> with Ok(())
+src/source/mssql/cdc.rs:249:26: replace match guard n.starts_with("__$") with false in MssqlChangeStream::fill
+src/source/mssql/cdc.rs:249:26: replace match guard n.starts_with("__$") with true in MssqlChangeStream::fill
+src/source/mssql/cdc.rs:256:16: delete ! in MssqlChangeStream::fill
+src/source/mssql/cdc.rs:262:17: delete match arm ChangeOp::Delete in MssqlChangeStream::fill
+src/source/mssql/cdc.rs:292:39: replace && with || in <impl ChangeStream for MssqlChangeStream>::next_change
+src/source/mssql/cdc.rs:292:42: delete ! in <impl ChangeStream for MssqlChangeStream>::next_change
+src/source/mssql/cdc.rs:292:9: replace <impl ChangeStream for MssqlChangeStream>::next_change -> Option<Result<ChangeEvent>> with None
+src/source/mssql/cdc.rs:304:5: replace map_op -> Option<ChangeOp> with None
+src/source/mssql/cdc.rs:305:9: delete match arm 1 in map_op
+src/source/mssql/cdc.rs:306:9: delete match arm 2 in map_op
+src/source/mssql/cdc.rs:307:9: delete match arm 4 in map_op
+src/source/mssql/cdc.rs:318:9: delete match arm ColumnData::Bit(Some(b)) in cell_to_rivet
+src/source/mssql/cdc.rs:319:9: delete match arm ColumnData::U8(Some(v)) in cell_to_rivet
+src/source/mssql/cdc.rs:320:9: delete match arm ColumnData::I16(Some(v)) in cell_to_rivet
+src/source/mssql/cdc.rs:321:9: delete match arm ColumnData::I32(Some(v)) in cell_to_rivet
+src/source/mssql/cdc.rs:322:9: delete match arm ColumnData::I64(Some(v)) in cell_to_rivet
+src/source/mssql/cdc.rs:323:9: delete match arm ColumnData::F32(Some(v)) in cell_to_rivet
+src/source/mssql/cdc.rs:324:9: delete match arm ColumnData::F64(Some(v)) in cell_to_rivet
+src/source/mssql/cdc.rs:325:9: delete match arm ColumnData::String(Some(s)) in cell_to_rivet
+src/source/mssql/cdc.rs:329:9: delete match arm ColumnData::Guid(Some(g)) in cell_to_rivet
+src/source/mssql/cdc.rs:330:9: delete match arm ColumnData::Binary(Some(b)) in cell_to_rivet
+src/source/mssql/cdc.rs:331:9: delete match arm ColumnData::Numeric(Some(n)) in cell_to_rivet
+src/source/mssql/cdc.rs:338:9: delete match arm ColumnData::DateTimeOffset(_) in cell_to_rivet
+src/source/mssql/cdc.rs:343:9: delete match arm ColumnData::DateTime(_) | ColumnData::DateTime2(_) | ColumnData::SmallDateTime(_) in cell_to_rivet
+src/source/mssql/cdc.rs:348:9: delete match arm ColumnData::Date(_) in cell_to_rivet
+src/source/mssql/cdc.rs:354:9: delete match arm ColumnData::Time(_) in cell_to_rivet
+src/source/mssql/cdc.rs:360:62: replace * with + in cell_to_rivet
+src/source/mssql/cdc.rs:360:62: replace * with / in cell_to_rivet
+src/source/mssql/cdc.rs:361:29: replace + with * in cell_to_rivet
+src/source/mssql/cdc.rs:361:29: replace + with - in cell_to_rivet
+src/source/mssql/cdc.rs:361:53: replace / with % in cell_to_rivet
+src/source/mssql/cdc.rs:361:53: replace / with * in cell_to_rivet
+src/source/mssql/cdc.rs:376:21: replace < with <= in numeric_to_decimal_string
+src/source/mssql/cdc.rs:388:5: replace hex -> String with "xyzzy".into()
+src/source/mssql/cdc.rs:388:5: replace hex -> String with String::new()
+src/source/mssql/cdc.rs:406:20: replace match guard c.mode == TlsMode::Disable || c.accept_invalid_certs with false in connect
+src/source/mssql/cdc.rs:406:20: replace match guard c.mode == TlsMode::Disable || c.accept_invalid_certs with true in connect
+src/source/mssql/cdc.rs:406:27: replace == with != in connect
+src/source/mssql/cdc.rs:406:47: replace || with && in connect
+src/source/mssql/cdc.rs:428:5: replace pin_checkpoint_at_max_lsn -> Result<()> with Ok(())
+src/source/mssql/cdc.rs:441:5: replace probe_max_lsn -> Option<String> with None
+src/source/mssql/cdc.rs:441:5: replace probe_max_lsn -> Option<String> with Some("xyzzy".into())
+src/source/mssql/cdc.rs:441:5: replace probe_max_lsn -> Option<String> with Some(String::new())
+src/source/mssql/cdc.rs:441:8: delete ! in probe_max_lsn
+src/source/mssql/cdc.rs:86:12: delete ! in MssqlChangeStream::open
+src/source/mssql/cdc.rs:89:48: replace || with && in MssqlChangeStream::open
+src/source/mssql/cdc.rs:89:53: replace == with != in MssqlChangeStream::open
+src/source/mssql/cdc.rs:99:32: replace || with && in MssqlChangeStream::open
+src/source/mssql/cdc.rs:99:45: replace % with + in MssqlChangeStream::open
+src/source/mssql/cdc.rs:99:45: replace % with / in MssqlChangeStream::open
+src/source/mssql/cdc.rs:99:49: replace != with == in MssqlChangeStream::open
+src/source/mssql/cdc.rs:99:54: replace || with && in MssqlChangeStream::open
+src/source/mssql/cdc.rs:99:57: delete ! in MssqlChangeStream::open
+src/source/mysql/arrow_convert.rs:1009:13: delete match arm Some(Value::Int(v)) in mysql_decimal_to_decimal256
+src/source/mysql/arrow_convert.rs:100:9: delete match arm MYSQL_TYPE_TIMESTAMP | MYSQL_TYPE_TIMESTAMP2 in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:1020:13: delete match arm Some(Value::UInt(v)) in mysql_decimal_to_decimal256
+src/source/mysql/arrow_convert.rs:103:27: replace match guard col.column_length() == 1 with false in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:103:27: replace match guard col.column_length() == 1 with true in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:103:47: replace == with != in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:104:9: delete match arm MYSQL_TYPE_BIT in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:105:9: delete match arm MYSQL_TYPE_YEAR in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:149:28: replace match guard col.column_length() == 1 with false in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:149:28: replace match guard col.column_length() == 1 with true in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:149:48: replace == with != in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:150:9: delete match arm MYSQL_TYPE_TINY in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:151:29: replace match guard col.flags().contains(ColumnFlags::UNSIGNED_FLAG) with false in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:151:29: replace match guard col.flags().contains(ColumnFlags::UNSIGNED_FLAG) with true in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:152:9: delete match arm MYSQL_TYPE_SHORT in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:153:29: replace match guard col.flags().contains(ColumnFlags::UNSIGNED_FLAG) with false in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:153:29: replace match guard col.flags().contains(ColumnFlags::UNSIGNED_FLAG) with true in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:154:28: replace match guard col.flags().contains(ColumnFlags::UNSIGNED_FLAG) with false in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:154:28: replace match guard col.flags().contains(ColumnFlags::UNSIGNED_FLAG) with true in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:155:9: delete match arm MYSQL_TYPE_INT24 in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:156:9: delete match arm MYSQL_TYPE_LONG in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:157:32: replace match guard col.flags().contains(ColumnFlags::UNSIGNED_FLAG) with false in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:157:32: replace match guard col.flags().contains(ColumnFlags::UNSIGNED_FLAG) with true in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:160:9: delete match arm MYSQL_TYPE_LONGLONG in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:161:9: delete match arm MYSQL_TYPE_FLOAT in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:162:9: delete match arm MYSQL_TYPE_DOUBLE in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:171:9: delete match arm MYSQL_TYPE_DECIMAL | MYSQL_TYPE_NEWDECIMAL in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:172:26: delete ! in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:189:16: replace match guard col.flags().contains(ColumnFlags::ENUM_FLAG) || col.flags().contains(ColumnFlags::SET_FLAG) with false in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:189:16: replace match guard col.flags().contains(ColumnFlags::ENUM_FLAG) || col.flags().contains(ColumnFlags::SET_FLAG) with true in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:190:17: replace || with && in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:194:9: delete match arm MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:197:36: replace == with != in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:206:9: delete match arm MYSQL_TYPE_ENUM | MYSQL_TYPE_SET in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:207:9: delete match arm MYSQL_TYPE_JSON in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:209:9: delete match arm MYSQL_TYPE_TINY_BLOB | MYSQL_TYPE_MEDIUM_BLOB | MYSQL_TYPE_LONG_BLOB | MYSQL_TYPE_BLOB in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:211:36: replace == with != in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:218:9: delete match arm MYSQL_TYPE_DATE | MYSQL_TYPE_NEWDATE in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:220:9: delete match arm MYSQL_TYPE_TIME | MYSQL_TYPE_TIME2 in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:225:9: delete match arm MYSQL_TYPE_DATETIME | MYSQL_TYPE_DATETIME2 in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:232:9: delete match arm MYSQL_TYPE_TIMESTAMP | MYSQL_TYPE_TIMESTAMP2 in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:241:27: replace match guard col.column_length() == 1 with false in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:243:9: delete match arm MYSQL_TYPE_YEAR in mysql_type_to_rivet
+src/source/mysql/arrow_convert.rs:281:21: delete match arm RivetType::Unsupported{reason, ..} in mysql_schema_and_arrow_types
+src/source/mysql/arrow_convert.rs:361:9: replace MysqlCellSource<'_>::is_bit -> bool with true
+src/source/mysql/arrow_convert.rs:371:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::num_rows -> usize with 1
+src/source/mysql/arrow_convert.rs:374:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::boolean -> Option<bool> with None
+src/source/mysql/arrow_convert.rs:374:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::boolean -> Option<bool> with Some(false)
+src/source/mysql/arrow_convert.rs:374:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::boolean -> Option<bool> with Some(true)
+src/source/mysql/arrow_convert.rs:375:13: delete match arm Some(Value::Int(v)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::boolean
+src/source/mysql/arrow_convert.rs:375:44: replace != with == in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::boolean
+src/source/mysql/arrow_convert.rs:376:13: delete match arm Some(Value::UInt(v)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::boolean
+src/source/mysql/arrow_convert.rs:376:45: replace != with == in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::boolean
+src/source/mysql/arrow_convert.rs:377:13: delete match arm Some(Value::Bytes(bv)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::boolean
+src/source/mysql/arrow_convert.rs:377:65: replace != with == in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::boolean
+src/source/mysql/arrow_convert.rs:382:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::int16 -> Option<i16> with None
+src/source/mysql/arrow_convert.rs:382:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::int16 -> Option<i16> with Some(-1)
+src/source/mysql/arrow_convert.rs:382:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::int16 -> Option<i16> with Some(0)
+src/source/mysql/arrow_convert.rs:382:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::int16 -> Option<i16> with Some(1)
+src/source/mysql/arrow_convert.rs:383:13: delete match arm Some(Value::Int(v)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::int16
+src/source/mysql/arrow_convert.rs:384:13: delete match arm Some(Value::UInt(v)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::int16
+src/source/mysql/arrow_convert.rs:385:13: delete match arm Some(Value::Bytes(bv)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::int16
+src/source/mysql/arrow_convert.rs:390:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::int32 -> Option<i32> with None
+src/source/mysql/arrow_convert.rs:390:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::int32 -> Option<i32> with Some(-1)
+src/source/mysql/arrow_convert.rs:390:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::int32 -> Option<i32> with Some(0)
+src/source/mysql/arrow_convert.rs:390:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::int32 -> Option<i32> with Some(1)
+src/source/mysql/arrow_convert.rs:391:13: delete match arm Some(Value::Int(v)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::int32
+src/source/mysql/arrow_convert.rs:392:13: delete match arm Some(Value::UInt(v)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::int32
+src/source/mysql/arrow_convert.rs:393:13: delete match arm Some(Value::Bytes(bv)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::int32
+src/source/mysql/arrow_convert.rs:399:13: delete match arm Some(Value::Int(v)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::int64
+src/source/mysql/arrow_convert.rs:400:13: delete match arm Some(Value::UInt(v)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::int64
+src/source/mysql/arrow_convert.rs:406:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::uint64 -> Option<u64> with None
+src/source/mysql/arrow_convert.rs:406:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::uint64 -> Option<u64> with Some(0)
+src/source/mysql/arrow_convert.rs:406:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::uint64 -> Option<u64> with Some(1)
+src/source/mysql/arrow_convert.rs:407:13: delete match arm Some(Value::UInt(v)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::uint64
+src/source/mysql/arrow_convert.rs:408:36: replace match guard *v >= 0 with false in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::uint64
+src/source/mysql/arrow_convert.rs:408:36: replace match guard *v >= 0 with true in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::uint64
+src/source/mysql/arrow_convert.rs:408:39: replace >= with < in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::uint64
+src/source/mysql/arrow_convert.rs:409:13: delete match arm Some(Value::Bytes(bv)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::uint64
+src/source/mysql/arrow_convert.rs:414:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::float32 -> Option<f32> with None
+src/source/mysql/arrow_convert.rs:414:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::float32 -> Option<f32> with Some(-1.0)
+src/source/mysql/arrow_convert.rs:414:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::float32 -> Option<f32> with Some(0.0)
+src/source/mysql/arrow_convert.rs:414:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::float32 -> Option<f32> with Some(1.0)
+src/source/mysql/arrow_convert.rs:415:13: delete match arm Some(Value::Float(v)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::float32
+src/source/mysql/arrow_convert.rs:416:13: delete match arm Some(Value::Double(v)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::float32
+src/source/mysql/arrow_convert.rs:417:13: delete match arm Some(Value::Bytes(bv)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::float32
+src/source/mysql/arrow_convert.rs:422:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::float64 -> Option<f64> with None
+src/source/mysql/arrow_convert.rs:422:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::float64 -> Option<f64> with Some(-1.0)
+src/source/mysql/arrow_convert.rs:422:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::float64 -> Option<f64> with Some(0.0)
+src/source/mysql/arrow_convert.rs:422:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::float64 -> Option<f64> with Some(1.0)
+src/source/mysql/arrow_convert.rs:423:13: delete match arm Some(Value::Float(v)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::float64
+src/source/mysql/arrow_convert.rs:424:13: delete match arm Some(Value::Double(v)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::float64
+src/source/mysql/arrow_convert.rs:425:13: delete match arm Some(Value::Bytes(bv)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::float64
+src/source/mysql/arrow_convert.rs:430:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::decimal128 -> Option<i128> with None
+src/source/mysql/arrow_convert.rs:430:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::decimal128 -> Option<i128> with Some(-1)
+src/source/mysql/arrow_convert.rs:430:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::decimal128 -> Option<i128> with Some(0)
+src/source/mysql/arrow_convert.rs:430:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::decimal128 -> Option<i128> with Some(1)
+src/source/mysql/arrow_convert.rs:432:13: delete match arm Some(Value::Bytes(bv)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::decimal128
+src/source/mysql/arrow_convert.rs:433:13: delete match arm Some(Value::Int(v)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::decimal128
+src/source/mysql/arrow_convert.rs:434:13: delete match arm Some(Value::UInt(v)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::decimal128
+src/source/mysql/arrow_convert.rs:443:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::date32 -> Option<i32> with None
+src/source/mysql/arrow_convert.rs:443:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::date32 -> Option<i32> with Some(-1)
+src/source/mysql/arrow_convert.rs:443:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::date32 -> Option<i32> with Some(0)
+src/source/mysql/arrow_convert.rs:443:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::date32 -> Option<i32> with Some(1)
+src/source/mysql/arrow_convert.rs:444:13: delete match arm Some(Value::Date(y, m, d, _, _, _, _)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::date32
+src/source/mysql/arrow_convert.rs:447:13: delete match arm Some(Value::Bytes(bv)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::date32
+src/source/mysql/arrow_convert.rs:456:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::ts_micros -> Option<i64> with None
+src/source/mysql/arrow_convert.rs:456:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::ts_micros -> Option<i64> with Some(-1)
+src/source/mysql/arrow_convert.rs:456:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::ts_micros -> Option<i64> with Some(0)
+src/source/mysql/arrow_convert.rs:456:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::ts_micros -> Option<i64> with Some(1)
+src/source/mysql/arrow_convert.rs:457:13: delete match arm Some(Value::Date(y, mo, d, h, mi, sx, us)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::ts_micros
+src/source/mysql/arrow_convert.rs:461:13: delete match arm Some(Value::Bytes(bv)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::ts_micros
+src/source/mysql/arrow_convert.rs:468:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::binary -> Option<Cow<'_, [u8]>> with None
+src/source/mysql/arrow_convert.rs:468:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::binary -> Option<Cow<'_, [u8]>> with Some(Cow::Borrowed(Vec::leak(Vec::new())))
+src/source/mysql/arrow_convert.rs:468:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::binary -> Option<Cow<'_, [u8]>> with Some(Cow::Borrowed(Vec::leak(vec![0])))
+src/source/mysql/arrow_convert.rs:468:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::binary -> Option<Cow<'_, [u8]>> with Some(Cow::Borrowed(Vec::leak(vec![1])))
+src/source/mysql/arrow_convert.rs:468:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::binary -> Option<Cow<'_, [u8]>> with Some(Cow::Owned(Vec::leak(Vec::new()).to_owned()))
+src/source/mysql/arrow_convert.rs:468:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::binary -> Option<Cow<'_, [u8]>> with Some(Cow::Owned(Vec::leak(vec![0]).to_owned()))
+src/source/mysql/arrow_convert.rs:468:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::binary -> Option<Cow<'_, [u8]>> with Some(Cow::Owned(Vec::leak(vec![1]).to_owned()))
+src/source/mysql/arrow_convert.rs:469:13: delete match arm Some(Value::Bytes(bv)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::binary
+src/source/mysql/arrow_convert.rs:474:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::utf8 -> Option<Cow<'_, [u8]>> with None
+src/source/mysql/arrow_convert.rs:474:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::utf8 -> Option<Cow<'_, [u8]>> with Some(Cow::Borrowed(Vec::leak(Vec::new())))
+src/source/mysql/arrow_convert.rs:474:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::utf8 -> Option<Cow<'_, [u8]>> with Some(Cow::Borrowed(Vec::leak(vec![0])))
+src/source/mysql/arrow_convert.rs:474:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::utf8 -> Option<Cow<'_, [u8]>> with Some(Cow::Borrowed(Vec::leak(vec![1])))
+src/source/mysql/arrow_convert.rs:474:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::utf8 -> Option<Cow<'_, [u8]>> with Some(Cow::Owned(Vec::leak(Vec::new()).to_owned()))
+src/source/mysql/arrow_convert.rs:474:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::utf8 -> Option<Cow<'_, [u8]>> with Some(Cow::Owned(Vec::leak(vec![0]).to_owned()))
+src/source/mysql/arrow_convert.rs:474:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::utf8 -> Option<Cow<'_, [u8]>> with Some(Cow::Owned(Vec::leak(vec![1]).to_owned()))
+src/source/mysql/arrow_convert.rs:475:13: delete match arm Some(Value::Bytes(bv)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::utf8
+src/source/mysql/arrow_convert.rs:479:13: delete match arm Some(Value::Int(v)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::utf8
+src/source/mysql/arrow_convert.rs:47:5: replace mysql_native_type_name -> String with "xyzzy".into()
+src/source/mysql/arrow_convert.rs:47:5: replace mysql_native_type_name -> String with String::new()
+src/source/mysql/arrow_convert.rs:480:13: delete match arm Some(Value::UInt(v)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::utf8
+src/source/mysql/arrow_convert.rs:481:13: delete match arm Some(Value::Float(v)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::utf8
+src/source/mysql/arrow_convert.rs:482:13: delete match arm Some(Value::Double(v)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::utf8
+src/source/mysql/arrow_convert.rs:483:13: delete match arm Some(Value::Date(y, m, d, hh, mi, sx, us)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::utf8
+src/source/mysql/arrow_convert.rs:490:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::time64_micros -> Option<i64> with None
+src/source/mysql/arrow_convert.rs:490:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::time64_micros -> Option<i64> with Some(-1)
+src/source/mysql/arrow_convert.rs:490:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::time64_micros -> Option<i64> with Some(0)
+src/source/mysql/arrow_convert.rs:490:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::time64_micros -> Option<i64> with Some(1)
+src/source/mysql/arrow_convert.rs:491:13: delete match arm Some(Value::Time(neg, days, h, m, s, us)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::time64_micros
+src/source/mysql/arrow_convert.rs:493:35: replace * with + in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::time64_micros
+src/source/mysql/arrow_convert.rs:493:35: replace * with / in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::time64_micros
+src/source/mysql/arrow_convert.rs:493:44: replace + with * in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::time64_micros
+src/source/mysql/arrow_convert.rs:493:44: replace + with - in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::time64_micros
+src/source/mysql/arrow_convert.rs:493:56: replace * with + in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::time64_micros
+src/source/mysql/arrow_convert.rs:493:56: replace * with / in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::time64_micros
+src/source/mysql/arrow_convert.rs:493:64: replace + with * in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::time64_micros
+src/source/mysql/arrow_convert.rs:493:64: replace + with - in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::time64_micros
+src/source/mysql/arrow_convert.rs:493:76: replace * with + in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::time64_micros
+src/source/mysql/arrow_convert.rs:493:76: replace * with / in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::time64_micros
+src/source/mysql/arrow_convert.rs:493:81: replace + with * in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::time64_micros
+src/source/mysql/arrow_convert.rs:493:81: replace + with - in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::time64_micros
+src/source/mysql/arrow_convert.rs:494:25: replace * with + in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::time64_micros
+src/source/mysql/arrow_convert.rs:494:25: replace * with / in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::time64_micros
+src/source/mysql/arrow_convert.rs:495:25: replace + with * in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::time64_micros
+src/source/mysql/arrow_convert.rs:495:25: replace + with - in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::time64_micros
+src/source/mysql/arrow_convert.rs:496:32: delete - in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::time64_micros
+src/source/mysql/arrow_convert.rs:498:13: delete match arm Some(Value::Bytes(bv)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::time64_micros
+src/source/mysql/arrow_convert.rs:505:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::fixed_binary -> Option<Cow<'_, [u8]>> with None
+src/source/mysql/arrow_convert.rs:505:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::fixed_binary -> Option<Cow<'_, [u8]>> with Some(Cow::Borrowed(Vec::leak(Vec::new())))
+src/source/mysql/arrow_convert.rs:505:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::fixed_binary -> Option<Cow<'_, [u8]>> with Some(Cow::Borrowed(Vec::leak(vec![0])))
+src/source/mysql/arrow_convert.rs:505:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::fixed_binary -> Option<Cow<'_, [u8]>> with Some(Cow::Borrowed(Vec::leak(vec![1])))
+src/source/mysql/arrow_convert.rs:505:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::fixed_binary -> Option<Cow<'_, [u8]>> with Some(Cow::Owned(Vec::leak(Vec::new()).to_owned()))
+src/source/mysql/arrow_convert.rs:505:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::fixed_binary -> Option<Cow<'_, [u8]>> with Some(Cow::Owned(Vec::leak(vec![0]).to_owned()))
+src/source/mysql/arrow_convert.rs:505:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::fixed_binary -> Option<Cow<'_, [u8]>> with Some(Cow::Owned(Vec::leak(vec![1]).to_owned()))
+src/source/mysql/arrow_convert.rs:506:39: replace match guard bv.len() == 16 with false in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::fixed_binary
+src/source/mysql/arrow_convert.rs:506:39: replace match guard bv.len() == 16 with true in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::fixed_binary
+src/source/mysql/arrow_convert.rs:506:48: replace == with != in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::fixed_binary
+src/source/mysql/arrow_convert.rs:507:13: delete match arm Some(Value::Bytes(bv)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::fixed_binary
+src/source/mysql/arrow_convert.rs:514:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::decimal256 -> Option<arrow::datatypes::i256> with None
+src/source/mysql/arrow_convert.rs:514:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::decimal256 -> Option<arrow::datatypes::i256> with Some(Default::default())
+src/source/mysql/arrow_convert.rs:516:13: delete match arm Some(Value::Bytes(bv)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::decimal256
+src/source/mysql/arrow_convert.rs:519:13: delete match arm Some(Value::Int(v)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::decimal256
+src/source/mysql/arrow_convert.rs:520:13: delete match arm Some(Value::UInt(v)) in <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::decimal256
+src/source/mysql/arrow_convert.rs:531:9: replace <impl crate::source::value_checksum::CellSource for MysqlCellSource<'_>>::list -> Option<Vec<crate::source::value_checksum::ListElem>> with Some(vec![])
+src/source/mysql/arrow_convert.rs:536:5: replace bytes_to_str -> Option<&str> with None
+src/source/mysql/arrow_convert.rs:556:47: replace | with ^ in bit_bytes_to_u64
+src/source/mysql/arrow_convert.rs:581:5: replace parse_time_str_to_micros -> Option<i64> with None
+src/source/mysql/arrow_convert.rs:581:5: replace parse_time_str_to_micros -> Option<i64> with Some(-1)
+src/source/mysql/arrow_convert.rs:581:5: replace parse_time_str_to_micros -> Option<i64> with Some(0)
+src/source/mysql/arrow_convert.rs:581:5: replace parse_time_str_to_micros -> Option<i64> with Some(1)
+src/source/mysql/arrow_convert.rs:587:32: replace + with * in parse_time_str_to_micros
+src/source/mysql/arrow_convert.rs:587:32: replace + with - in parse_time_str_to_micros
+src/source/mysql/arrow_convert.rs:590:34: replace - with + in parse_time_str_to_micros
+src/source/mysql/arrow_convert.rs:590:34: replace - with / in parse_time_str_to_micros
+src/source/mysql/arrow_convert.rs:591:27: replace * with + in parse_time_str_to_micros
+src/source/mysql/arrow_convert.rs:591:27: replace * with / in parse_time_str_to_micros
+src/source/mysql/arrow_convert.rs:599:20: replace * with + in parse_time_str_to_micros
+src/source/mysql/arrow_convert.rs:599:20: replace * with / in parse_time_str_to_micros
+src/source/mysql/arrow_convert.rs:599:28: replace + with * in parse_time_str_to_micros
+src/source/mysql/arrow_convert.rs:599:28: replace + with - in parse_time_str_to_micros
+src/source/mysql/arrow_convert.rs:599:32: replace * with + in parse_time_str_to_micros
+src/source/mysql/arrow_convert.rs:599:32: replace * with / in parse_time_str_to_micros
+src/source/mysql/arrow_convert.rs:599:37: replace + with * in parse_time_str_to_micros
+src/source/mysql/arrow_convert.rs:599:37: replace + with - in parse_time_str_to_micros
+src/source/mysql/arrow_convert.rs:599:42: replace * with + in parse_time_str_to_micros
+src/source/mysql/arrow_convert.rs:599:42: replace * with / in parse_time_str_to_micros
+src/source/mysql/arrow_convert.rs:599:54: replace + with * in parse_time_str_to_micros
+src/source/mysql/arrow_convert.rs:599:54: replace + with - in parse_time_str_to_micros
+src/source/mysql/arrow_convert.rs:600:19: delete - in parse_time_str_to_micros
+src/source/mysql/arrow_convert.rs:619:9: delete match arm DataType::Boolean in build_array
+src/source/mysql/arrow_convert.rs:623:21: delete match arm Some(Value::Int(v)) in build_array
+src/source/mysql/arrow_convert.rs:623:62: replace != with == in build_array
+src/source/mysql/arrow_convert.rs:624:21: delete match arm Some(Value::UInt(v)) in build_array
+src/source/mysql/arrow_convert.rs:624:63: replace != with == in build_array
+src/source/mysql/arrow_convert.rs:626:21: delete match arm Some(Value::Bytes(bv)) in build_array
+src/source/mysql/arrow_convert.rs:626:83: replace != with == in build_array
+src/source/mysql/arrow_convert.rs:62:28: replace match guard col.column_length() == 1 with false in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:62:28: replace match guard col.column_length() == 1 with true in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:62:48: replace == with != in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:632:9: delete match arm DataType::Int16 in build_array
+src/source/mysql/arrow_convert.rs:636:21: delete match arm Some(Value::Int(v)) in build_array
+src/source/mysql/arrow_convert.rs:637:21: delete match arm Some(Value::UInt(v)) in build_array
+src/source/mysql/arrow_convert.rs:63:9: delete match arm MYSQL_TYPE_TINY in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:640:21: delete match arm Some(Value::Bytes(bv)) in build_array
+src/source/mysql/arrow_convert.rs:649:9: delete match arm DataType::Int32 in build_array
+src/source/mysql/arrow_convert.rs:64:9: delete match arm MYSQL_TYPE_SHORT in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:653:21: delete match arm Some(Value::Int(v)) in build_array
+src/source/mysql/arrow_convert.rs:654:21: delete match arm Some(Value::UInt(v)) in build_array
+src/source/mysql/arrow_convert.rs:655:21: delete match arm Some(Value::Bytes(bv)) in build_array
+src/source/mysql/arrow_convert.rs:65:9: delete match arm MYSQL_TYPE_INT24 | MYSQL_TYPE_LONG in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:664:9: delete match arm DataType::UInt64 in build_array
+src/source/mysql/arrow_convert.rs:668:21: delete match arm Some(Value::UInt(v)) in build_array
+src/source/mysql/arrow_convert.rs:669:44: replace match guard *v >= 0 with false in build_array
+src/source/mysql/arrow_convert.rs:669:44: replace match guard *v >= 0 with true in build_array
+src/source/mysql/arrow_convert.rs:669:47: replace >= with < in build_array
+src/source/mysql/arrow_convert.rs:66:9: delete match arm MYSQL_TYPE_LONGLONG in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:670:21: delete match arm Some(Value::Bytes(bv)) in build_array
+src/source/mysql/arrow_convert.rs:67:9: delete match arm MYSQL_TYPE_FLOAT in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:686:21: delete match arm Some(Value::Int(v)) in build_array
+src/source/mysql/arrow_convert.rs:68:9: delete match arm MYSQL_TYPE_DOUBLE in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:690:21: delete match arm Some(Value::UInt(v)) in build_array
+src/source/mysql/arrow_convert.rs:69:9: delete match arm MYSQL_TYPE_DECIMAL | MYSQL_TYPE_NEWDECIMAL in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:700:9: delete match arm DataType::Float32 in build_array
+src/source/mysql/arrow_convert.rs:704:21: delete match arm Some(Value::Float(v)) in build_array
+src/source/mysql/arrow_convert.rs:705:21: delete match arm Some(Value::Double(v)) in build_array
+src/source/mysql/arrow_convert.rs:706:21: delete match arm Some(Value::Bytes(bv)) in build_array
+src/source/mysql/arrow_convert.rs:715:9: delete match arm DataType::Float64 in build_array
+src/source/mysql/arrow_convert.rs:719:21: delete match arm Some(Value::Float(v)) in build_array
+src/source/mysql/arrow_convert.rs:720:21: delete match arm Some(Value::Double(v)) in build_array
+src/source/mysql/arrow_convert.rs:721:21: delete match arm Some(Value::Bytes(bv)) in build_array
+src/source/mysql/arrow_convert.rs:730:9: delete match arm DataType::Utf8 in build_array
+src/source/mysql/arrow_convert.rs:740:21: delete match arm Some(Value::Bytes(bv)) in build_array
+src/source/mysql/arrow_convert.rs:750:21: delete match arm Some(Value::Int(v)) in build_array
+src/source/mysql/arrow_convert.rs:751:21: delete match arm Some(Value::UInt(v)) in build_array
+src/source/mysql/arrow_convert.rs:752:21: delete match arm Some(Value::Float(v)) in build_array
+src/source/mysql/arrow_convert.rs:753:21: delete match arm Some(Value::Double(v)) in build_array
+src/source/mysql/arrow_convert.rs:754:21: delete match arm Some(Value::Date(y, m, d, h, mi, s, us)) in build_array
+src/source/mysql/arrow_convert.rs:764:9: delete match arm DataType::Binary in build_array
+src/source/mysql/arrow_convert.rs:768:21: delete match arm Some(Value::Bytes(bv)) in build_array
+src/source/mysql/arrow_convert.rs:76:16: replace match guard col.flags().contains(ColumnFlags::ENUM_FLAG) with false in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:76:16: replace match guard col.flags().contains(ColumnFlags::ENUM_FLAG) with true in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:784:9: delete match arm DataType::FixedSizeBinary(16) in build_array
+src/source/mysql/arrow_convert.rs:788:47: replace match guard bv.len() == 16 with false in build_array
+src/source/mysql/arrow_convert.rs:788:47: replace match guard bv.len() == 16 with true in build_array
+src/source/mysql/arrow_convert.rs:788:56: replace == with != in build_array
+src/source/mysql/arrow_convert.rs:793:21: delete match arm Some(Value::Bytes(bv)) in build_array
+src/source/mysql/arrow_convert.rs:807:9: delete match arm DataType::Time64(TimeUnit::Microsecond) in build_array
+src/source/mysql/arrow_convert.rs:812:21: delete match arm Some(Value::Time(neg, days, h, m, s, us)) in build_array
+src/source/mysql/arrow_convert.rs:813:54: replace * with + in build_array
+src/source/mysql/arrow_convert.rs:813:54: replace * with / in build_array
+src/source/mysql/arrow_convert.rs:814:29: replace + with * in build_array
+src/source/mysql/arrow_convert.rs:814:29: replace + with - in build_array
+src/source/mysql/arrow_convert.rs:814:41: replace * with + in build_array
+src/source/mysql/arrow_convert.rs:814:41: replace * with / in build_array
+src/source/mysql/arrow_convert.rs:815:29: replace + with * in build_array
+src/source/mysql/arrow_convert.rs:815:29: replace + with - in build_array
+src/source/mysql/arrow_convert.rs:815:41: replace * with + in build_array
+src/source/mysql/arrow_convert.rs:815:41: replace * with / in build_array
+src/source/mysql/arrow_convert.rs:816:29: replace + with * in build_array
+src/source/mysql/arrow_convert.rs:816:29: replace + with - in build_array
+src/source/mysql/arrow_convert.rs:817:29: replace * with + in build_array
+src/source/mysql/arrow_convert.rs:817:29: replace * with / in build_array
+src/source/mysql/arrow_convert.rs:818:29: replace + with * in build_array
+src/source/mysql/arrow_convert.rs:818:29: replace + with - in build_array
+src/source/mysql/arrow_convert.rs:819:50: delete - in build_array
+src/source/mysql/arrow_convert.rs:81:16: replace match guard col.flags().contains(ColumnFlags::SET_FLAG) with false in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:81:16: replace match guard col.flags().contains(ColumnFlags::SET_FLAG) with true in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:821:21: delete match arm Some(Value::Bytes(bv)) in build_array
+src/source/mysql/arrow_convert.rs:834:9: delete match arm DataType::Date32 in build_array
+src/source/mysql/arrow_convert.rs:838:21: delete match arm Some(Value::Date(y, m, d, _, _, _, _)) in build_array
+src/source/mysql/arrow_convert.rs:841:21: delete match arm Some(Value::Bytes(bv)) in build_array
+src/source/mysql/arrow_convert.rs:864:9: delete match arm DataType::Timestamp(TimeUnit::Microsecond, tz) in build_array
+src/source/mysql/arrow_convert.rs:869:21: delete match arm Some(Value::Date(y, mo, d, h, mi, s, us)) in build_array
+src/source/mysql/arrow_convert.rs:873:21: delete match arm Some(Value::Bytes(bv)) in build_array
+src/source/mysql/arrow_convert.rs:87:30: replace match guard col.character_set() == 63 with false in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:87:30: replace match guard col.character_set() == 63 with true in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:87:50: replace == with != in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:88:34: replace match guard col.character_set() == 63 with false in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:88:34: replace match guard col.character_set() == 63 with true in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:88:54: replace == with != in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:892:9: delete match arm DataType::Decimal128(p, s) in build_array
+src/source/mysql/arrow_convert.rs:893:9: delete match arm DataType::Decimal256(p, s) in build_array
+src/source/mysql/arrow_convert.rs:89:9: delete match arm MYSQL_TYPE_STRING in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:90:9: delete match arm MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:91:9: delete match arm MYSQL_TYPE_ENUM in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:924:13: delete match arm Some(Value::Bytes(bv)) in mysql_decimal_to_decimal128
+src/source/mysql/arrow_convert.rs:92:9: delete match arm MYSQL_TYPE_SET in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:938:13: delete match arm Some(Value::Int(v)) in mysql_decimal_to_decimal128
+src/source/mysql/arrow_convert.rs:93:9: delete match arm MYSQL_TYPE_JSON in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:949:13: delete match arm Some(Value::UInt(v)) in mysql_decimal_to_decimal128
+src/source/mysql/arrow_convert.rs:94:9: delete match arm MYSQL_TYPE_TINY_BLOB | MYSQL_TYPE_MEDIUM_BLOB | MYSQL_TYPE_LONG_BLOB | MYSQL_TYPE_BLOB in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:97:9: delete match arm MYSQL_TYPE_DATE | MYSQL_TYPE_NEWDATE in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:98:9: delete match arm MYSQL_TYPE_TIME | MYSQL_TYPE_TIME2 in mysql_native_type_name
+src/source/mysql/arrow_convert.rs:995:13: delete match arm Some(Value::Bytes(bv)) in mysql_decimal_to_decimal256
+src/source/mysql/arrow_convert.rs:99:9: delete match arm MYSQL_TYPE_DATETIME | MYSQL_TYPE_DATETIME2 in mysql_native_type_name
+src/source/mysql/cdc.rs:124:9: replace MysqlChangeStream::pin_checkpoint_at_current -> Result<()> with Ok(())
+src/source/mysql/cdc.rs:183:9: replace MysqlChangeStream::fill -> Result<bool> with Ok(false)
+src/source/mysql/cdc.rs:183:9: replace MysqlChangeStream::fill -> Result<bool> with Ok(true)
+src/source/mysql/cdc.rs:190:13: delete match arm Some(EventData::RotateEvent(re)) in MysqlChangeStream::fill
+src/source/mysql/cdc.rs:193:13: delete match arm Some(EventData::TableMapEvent(tme)) in MysqlChangeStream::fill
+src/source/mysql/cdc.rs:197:25: delete match arm Ok(mysql::binlog::events::OptionalMetadataField::ColumnName(names)) in MysqlChangeStream::fill
+src/source/mysql/cdc.rs:211:13: delete match arm Some(EventData::RowsEvent(re)) in MysqlChangeStream::fill
+src/source/mysql/cdc.rs:213:21: delete match arm RowsEventData::WriteRowsEvent(_) in MysqlChangeStream::fill
+src/source/mysql/cdc.rs:214:21: delete match arm RowsEventData::UpdateRowsEvent(_) in MysqlChangeStream::fill
+src/source/mysql/cdc.rs:215:21: delete match arm RowsEventData::DeleteRowsEvent(_) in MysqlChangeStream::fill
+src/source/mysql/cdc.rs:239:34: replace > with < in MysqlChangeStream::fill
+src/source/mysql/cdc.rs:239:34: replace > with == in MysqlChangeStream::fill
+src/source/mysql/cdc.rs:239:34: replace > with >= in MysqlChangeStream::fill
+src/source/mysql/cdc.rs:250:13: delete match arm Some(EventData::XidEvent(_)) in MysqlChangeStream::fill
+src/source/mysql/cdc.rs:256:38: replace + with * in MysqlChangeStream::fill
+src/source/mysql/cdc.rs:256:38: replace + with - in MysqlChangeStream::fill
+src/source/mysql/cdc.rs:256:42: replace == with != in MysqlChangeStream::fill
+src/source/mysql/cdc.rs:272:22: replace match guard cfg.mode.is_enforced() with false in connect_conn
+src/source/mysql/cdc.rs:272:22: replace match guard cfg.mode.is_enforced() with true in connect_conn
+src/source/mysql/cdc.rs:301:5: replace render_row -> Vec<RivetValue> with vec![]
+src/source/mysql/cdc.rs:324:5: replace mysql_style_json -> String with "xyzzy".into()
+src/source/mysql/cdc.rs:324:5: replace mysql_style_json -> String with String::new()
+src/source/mysql/cdc.rs:331:13: replace mysql_style_json::<impl serde_json::ser::Formatter for MySqlFmt>::begin_array_value -> std::io::Result<()> with Ok(())
+src/source/mysql/cdc.rs:331:16: delete ! in mysql_style_json::<impl serde_json::ser::Formatter for MySqlFmt>::begin_array_value
+src/source/mysql/cdc.rs:341:13: replace mysql_style_json::<impl serde_json::ser::Formatter for MySqlFmt>::begin_object_key -> std::io::Result<()> with Ok(())
+src/source/mysql/cdc.rs:341:16: delete ! in mysql_style_json::<impl serde_json::ser::Formatter for MySqlFmt>::begin_object_key
+src/source/mysql/cdc.rs:350:13: replace mysql_style_json::<impl serde_json::ser::Formatter for MySqlFmt>::begin_object_value -> std::io::Result<()> with Ok(())
+src/source/mysql/cdc.rs:366:9: replace <impl Iterator for MysqlChangeStream>::next -> Option<Self::Item> with None
+src/source/mysql/cdc.rs:381:9: replace <impl ChangeStream for MysqlChangeStream>::next_change -> Option<Result<ChangeEvent>> with None
+src/source/mysql/cdc.rs:98:9: replace MysqlChangeStream::current_coordinates -> Result<(String, u64)> with Ok(("xyzzy".into(), 0))
+src/source/mysql/cdc.rs:98:9: replace MysqlChangeStream::current_coordinates -> Result<(String, u64)> with Ok(("xyzzy".into(), 1))
+src/source/mysql/cdc.rs:98:9: replace MysqlChangeStream::current_coordinates -> Result<(String, u64)> with Ok((String::new(), 0))
+src/source/mysql/cdc.rs:98:9: replace MysqlChangeStream::current_coordinates -> Result<(String, u64)> with Ok((String::new(), 1))
+src/source/postgres/arrow_convert.rs:101:12: replace == with != in <impl PgFromSql<'a> for PgJsonRawText<'a>>::accepts
+src/source/postgres/arrow_convert.rs:101:27: replace || with && in <impl PgFromSql<'a> for PgJsonRawText<'a>>::accepts
+src/source/postgres/arrow_convert.rs:101:33: replace == with != in <impl PgFromSql<'a> for PgJsonRawText<'a>>::accepts
+src/source/postgres/arrow_convert.rs:101:9: replace <impl PgFromSql<'a> for PgJsonRawText<'a>>::accepts -> bool with false
+src/source/postgres/arrow_convert.rs:101:9: replace <impl PgFromSql<'a> for PgJsonRawText<'a>>::accepts -> bool with true
+src/source/postgres/arrow_convert.rs:108:30: replace == with != in <impl PgFromSql<'a> for PgJsonRawText<'a>>::from_sql
+src/source/postgres/arrow_convert.rs:110:17: delete match arm Some((&1, rest)) in <impl PgFromSql<'a> for PgJsonRawText<'a>>::from_sql
+src/source/postgres/arrow_convert.rs:121:5: replace pg_numeric_optional_utf8_string -> Result<Option<String>> with Ok(None)
+src/source/postgres/arrow_convert.rs:121:5: replace pg_numeric_optional_utf8_string -> Result<Option<String>> with Ok(Some("xyzzy".into()))
+src/source/postgres/arrow_convert.rs:121:5: replace pg_numeric_optional_utf8_string -> Result<Option<String>> with Ok(Some(String::new()))
+src/source/postgres/arrow_convert.rs:128:5: replace numeric_raw_to_optional_decimal_text -> Option<String> with None
+src/source/postgres/arrow_convert.rs:128:5: replace numeric_raw_to_optional_decimal_text -> Option<String> with Some("xyzzy".into())
+src/source/postgres/arrow_convert.rs:128:5: replace numeric_raw_to_optional_decimal_text -> Option<String> with Some(String::new())
+src/source/postgres/arrow_convert.rs:130:10: delete ! in numeric_raw_to_optional_decimal_text
+src/source/postgres/arrow_convert.rs:151:9: delete match arm Type::BOOL in pg_type_to_rivet
+src/source/postgres/arrow_convert.rs:152:9: delete match arm Type::INT2 in pg_type_to_rivet
+src/source/postgres/arrow_convert.rs:153:9: delete match arm Type::INT4 in pg_type_to_rivet
+src/source/postgres/arrow_convert.rs:154:9: delete match arm Type::INT8 in pg_type_to_rivet
+src/source/postgres/arrow_convert.rs:157:9: delete match arm Type::OID in pg_type_to_rivet
+src/source/postgres/arrow_convert.rs:158:9: delete match arm Type::FLOAT4 in pg_type_to_rivet
+src/source/postgres/arrow_convert.rs:159:9: delete match arm Type::FLOAT8 in pg_type_to_rivet
+src/source/postgres/arrow_convert.rs:165:9: delete match arm Type::NUMERIC in pg_type_to_rivet
+src/source/postgres/arrow_convert.rs:174:9: delete match arm Type::DATE in pg_type_to_rivet
+src/source/postgres/arrow_convert.rs:175:9: delete match arm Type::TIME in pg_type_to_rivet
+src/source/postgres/arrow_convert.rs:178:9: delete match arm Type::TIMESTAMP in pg_type_to_rivet
+src/source/postgres/arrow_convert.rs:183:9: delete match arm Type::TIMESTAMPTZ in pg_type_to_rivet
+src/source/postgres/arrow_convert.rs:188:9: delete match arm Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME in pg_type_to_rivet
+src/source/postgres/arrow_convert.rs:189:9: delete match arm Type::BYTEA in pg_type_to_rivet
+src/source/postgres/arrow_convert.rs:192:9: delete match arm Type::JSON | Type::JSONB in pg_type_to_rivet
+src/source/postgres/arrow_convert.rs:194:9: delete match arm Type::UUID in pg_type_to_rivet
+src/source/postgres/arrow_convert.rs:197:9: delete match arm Type::INTERVAL in pg_type_to_rivet
+src/source/postgres/arrow_convert.rs:201:13: delete match arm Kind::Enum(_) in pg_type_to_rivet
+src/source/postgres/arrow_convert.rs:203:13: delete match arm Kind::Array(elem_type) in pg_type_to_rivet
+src/source/postgres/arrow_convert.rs:226:25: replace == with != in rivet_type_for_pg_column
+src/source/postgres/arrow_convert.rs:265:21: delete match arm RivetType::Unsupported{reason, ..} in pg_columns_to_schema
+src/source/postgres/arrow_convert.rs:276:8: delete ! in pg_columns_to_schema
+src/source/postgres/arrow_convert.rs:304:22: replace != with == in <impl postgres_types::FromSql<'a> for PgInterval>::from_sql
+src/source/postgres/arrow_convert.rs:317:13: replace == with != in <impl postgres_types::FromSql<'a> for PgInterval>::accepts
+src/source/postgres/arrow_convert.rs:317:9: replace <impl postgres_types::FromSql<'a> for PgInterval>::accepts -> bool with false
+src/source/postgres/arrow_convert.rs:317:9: replace <impl postgres_types::FromSql<'a> for PgInterval>::accepts -> bool with true
+src/source/postgres/arrow_convert.rs:343:32: replace < with <= in pg_interval_to_iso8601
+src/source/postgres/arrow_convert.rs:343:32: replace < with == in pg_interval_to_iso8601
+src/source/postgres/arrow_convert.rs:361:23: replace != with == in pg_interval_to_iso8601
+src/source/postgres/arrow_convert.rs:361:28: replace || with && in pg_interval_to_iso8601
+src/source/postgres/arrow_convert.rs:361:34: replace == with != in pg_interval_to_iso8601
+src/source/postgres/arrow_convert.rs:361:39: replace && with || in pg_interval_to_iso8601
+src/source/postgres/arrow_convert.rs:361:45: replace == with != in pg_interval_to_iso8601
+src/source/postgres/arrow_convert.rs:383:9: replace <impl postgres_types::FromSql<'a> for AnyAsString>::accepts -> bool with false
+src/source/postgres/arrow_convert.rs:410:28: replace != with == in rows_to_record_batch_typed
+src/source/postgres/arrow_convert.rs:447:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::num_rows -> usize with 0
+src/source/postgres/arrow_convert.rs:447:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::num_rows -> usize with 1
+src/source/postgres/arrow_convert.rs:450:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::int16 -> Option<i16> with None
+src/source/postgres/arrow_convert.rs:450:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::int16 -> Option<i16> with Some(-1)
+src/source/postgres/arrow_convert.rs:450:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::int16 -> Option<i16> with Some(0)
+src/source/postgres/arrow_convert.rs:450:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::int16 -> Option<i16> with Some(1)
+src/source/postgres/arrow_convert.rs:453:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::int32 -> Option<i32> with None
+src/source/postgres/arrow_convert.rs:453:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::int32 -> Option<i32> with Some(-1)
+src/source/postgres/arrow_convert.rs:453:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::int32 -> Option<i32> with Some(0)
+src/source/postgres/arrow_convert.rs:453:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::int32 -> Option<i32> with Some(1)
+src/source/postgres/arrow_convert.rs:456:32: replace == with != in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::int64
+src/source/postgres/arrow_convert.rs:456:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::int64 -> Option<i64> with None
+src/source/postgres/arrow_convert.rs:456:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::int64 -> Option<i64> with Some(-1)
+src/source/postgres/arrow_convert.rs:456:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::int64 -> Option<i64> with Some(0)
+src/source/postgres/arrow_convert.rs:456:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::int64 -> Option<i64> with Some(1)
+src/source/postgres/arrow_convert.rs:465:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::uint64 -> Option<u64> with Some(0)
+src/source/postgres/arrow_convert.rs:465:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::uint64 -> Option<u64> with Some(1)
+src/source/postgres/arrow_convert.rs:468:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::float32 -> Option<f32> with None
+src/source/postgres/arrow_convert.rs:468:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::float32 -> Option<f32> with Some(-1.0)
+src/source/postgres/arrow_convert.rs:468:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::float32 -> Option<f32> with Some(0.0)
+src/source/postgres/arrow_convert.rs:468:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::float32 -> Option<f32> with Some(1.0)
+src/source/postgres/arrow_convert.rs:471:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::float64 -> Option<f64> with None
+src/source/postgres/arrow_convert.rs:471:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::float64 -> Option<f64> with Some(-1.0)
+src/source/postgres/arrow_convert.rs:471:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::float64 -> Option<f64> with Some(0.0)
+src/source/postgres/arrow_convert.rs:471:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::float64 -> Option<f64> with Some(1.0)
+src/source/postgres/arrow_convert.rs:474:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::decimal128 -> Option<i128> with None
+src/source/postgres/arrow_convert.rs:474:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::decimal128 -> Option<i128> with Some(-1)
+src/source/postgres/arrow_convert.rs:474:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::decimal128 -> Option<i128> with Some(0)
+src/source/postgres/arrow_convert.rs:474:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::decimal128 -> Option<i128> with Some(1)
+src/source/postgres/arrow_convert.rs:483:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::date32 -> Option<i32> with None
+src/source/postgres/arrow_convert.rs:483:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::date32 -> Option<i32> with Some(-1)
+src/source/postgres/arrow_convert.rs:483:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::date32 -> Option<i32> with Some(0)
+src/source/postgres/arrow_convert.rs:483:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::date32 -> Option<i32> with Some(1)
+src/source/postgres/arrow_convert.rs:488:32: replace == with != in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::ts_micros
+src/source/postgres/arrow_convert.rs:488:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::ts_micros -> Option<i64> with None
+src/source/postgres/arrow_convert.rs:488:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::ts_micros -> Option<i64> with Some(-1)
+src/source/postgres/arrow_convert.rs:488:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::ts_micros -> Option<i64> with Some(0)
+src/source/postgres/arrow_convert.rs:488:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::ts_micros -> Option<i64> with Some(1)
+src/source/postgres/arrow_convert.rs:499:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::boolean -> Option<bool> with None
+src/source/postgres/arrow_convert.rs:499:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::boolean -> Option<bool> with Some(false)
+src/source/postgres/arrow_convert.rs:499:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::boolean -> Option<bool> with Some(true)
+src/source/postgres/arrow_convert.rs:502:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::binary -> Option<Cow<'_, [u8]>> with None
+src/source/postgres/arrow_convert.rs:502:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::binary -> Option<Cow<'_, [u8]>> with Some(Cow::Borrowed(Vec::leak(Vec::new())))
+src/source/postgres/arrow_convert.rs:502:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::binary -> Option<Cow<'_, [u8]>> with Some(Cow::Borrowed(Vec::leak(vec![0])))
+src/source/postgres/arrow_convert.rs:502:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::binary -> Option<Cow<'_, [u8]>> with Some(Cow::Borrowed(Vec::leak(vec![1])))
+src/source/postgres/arrow_convert.rs:502:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::binary -> Option<Cow<'_, [u8]>> with Some(Cow::Owned(Vec::leak(Vec::new()).to_owned()))
+src/source/postgres/arrow_convert.rs:502:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::binary -> Option<Cow<'_, [u8]>> with Some(Cow::Owned(Vec::leak(vec![0]).to_owned()))
+src/source/postgres/arrow_convert.rs:502:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::binary -> Option<Cow<'_, [u8]>> with Some(Cow::Owned(Vec::leak(vec![1]).to_owned()))
+src/source/postgres/arrow_convert.rs:507:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::utf8 -> Option<Cow<'_, [u8]>> with None
+src/source/postgres/arrow_convert.rs:507:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::utf8 -> Option<Cow<'_, [u8]>> with Some(Cow::Borrowed(Vec::leak(Vec::new())))
+src/source/postgres/arrow_convert.rs:507:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::utf8 -> Option<Cow<'_, [u8]>> with Some(Cow::Borrowed(Vec::leak(vec![0])))
+src/source/postgres/arrow_convert.rs:507:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::utf8 -> Option<Cow<'_, [u8]>> with Some(Cow::Borrowed(Vec::leak(vec![1])))
+src/source/postgres/arrow_convert.rs:507:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::utf8 -> Option<Cow<'_, [u8]>> with Some(Cow::Owned(Vec::leak(Vec::new()).to_owned()))
+src/source/postgres/arrow_convert.rs:507:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::utf8 -> Option<Cow<'_, [u8]>> with Some(Cow::Owned(Vec::leak(vec![0]).to_owned()))
+src/source/postgres/arrow_convert.rs:507:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::utf8 -> Option<Cow<'_, [u8]>> with Some(Cow::Owned(Vec::leak(vec![1]).to_owned()))
+src/source/postgres/arrow_convert.rs:509:13: delete match arm Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::utf8
+src/source/postgres/arrow_convert.rs:512:13: delete match arm Type::JSON | Type::JSONB in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::utf8
+src/source/postgres/arrow_convert.rs:513:17: delete match arm Ok(Some(PgJsonRawText(t))) in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::utf8
+src/source/postgres/arrow_convert.rs:516:13: delete match arm Type::NUMERIC in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::utf8
+src/source/postgres/arrow_convert.rs:517:17: delete match arm Ok(Some(t)) in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::utf8
+src/source/postgres/arrow_convert.rs:520:13: delete match arm Type::UUID in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::utf8
+src/source/postgres/arrow_convert.rs:521:17: delete match arm Ok(Some(PgUuidBytes(b))) in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::utf8
+src/source/postgres/arrow_convert.rs:526:13: delete match arm Type::INTERVAL in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::utf8
+src/source/postgres/arrow_convert.rs:535:22: replace match guard matches!(t.kind(), Kind::Enum(_)) with false in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::utf8
+src/source/postgres/arrow_convert.rs:535:22: replace match guard matches!(t.kind(), Kind::Enum(_)) with true in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::utf8
+src/source/postgres/arrow_convert.rs:544:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::time64_micros -> Option<i64> with None
+src/source/postgres/arrow_convert.rs:544:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::time64_micros -> Option<i64> with Some(-1)
+src/source/postgres/arrow_convert.rs:544:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::time64_micros -> Option<i64> with Some(0)
+src/source/postgres/arrow_convert.rs:544:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::time64_micros -> Option<i64> with Some(1)
+src/source/postgres/arrow_convert.rs:549:54: replace * with + in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::time64_micros
+src/source/postgres/arrow_convert.rs:549:54: replace * with / in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::time64_micros
+src/source/postgres/arrow_convert.rs:549:66: replace + with * in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::time64_micros
+src/source/postgres/arrow_convert.rs:549:66: replace + with - in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::time64_micros
+src/source/postgres/arrow_convert.rs:549:90: replace / with % in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::time64_micros
+src/source/postgres/arrow_convert.rs:549:90: replace / with * in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::time64_micros
+src/source/postgres/arrow_convert.rs:553:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::fixed_binary -> Option<Cow<'_, [u8]>> with None
+src/source/postgres/arrow_convert.rs:553:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::fixed_binary -> Option<Cow<'_, [u8]>> with Some(Cow::Borrowed(Vec::leak(Vec::new())))
+src/source/postgres/arrow_convert.rs:553:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::fixed_binary -> Option<Cow<'_, [u8]>> with Some(Cow::Borrowed(Vec::leak(vec![0])))
+src/source/postgres/arrow_convert.rs:553:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::fixed_binary -> Option<Cow<'_, [u8]>> with Some(Cow::Borrowed(Vec::leak(vec![1])))
+src/source/postgres/arrow_convert.rs:553:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::fixed_binary -> Option<Cow<'_, [u8]>> with Some(Cow::Owned(Vec::leak(Vec::new()).to_owned()))
+src/source/postgres/arrow_convert.rs:553:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::fixed_binary -> Option<Cow<'_, [u8]>> with Some(Cow::Owned(Vec::leak(vec![0]).to_owned()))
+src/source/postgres/arrow_convert.rs:553:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::fixed_binary -> Option<Cow<'_, [u8]>> with Some(Cow::Owned(Vec::leak(vec![1]).to_owned()))
+src/source/postgres/arrow_convert.rs:554:13: delete match arm Ok(Some(PgUuidBytes(b))) in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::fixed_binary
+src/source/postgres/arrow_convert.rs:559:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::decimal256 -> Option<arrow::datatypes::i256> with None
+src/source/postgres/arrow_convert.rs:559:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::decimal256 -> Option<arrow::datatypes::i256> with Some(Default::default())
+src/source/postgres/arrow_convert.rs:561:13: delete match arm Ok(Some(t)) in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::decimal256
+src/source/postgres/arrow_convert.rs:571:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::list -> Option<Vec<crate::source::value_checksum::ListElem>> with None
+src/source/postgres/arrow_convert.rs:571:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::list -> Option<Vec<crate::source::value_checksum::ListElem>> with Some(vec![])
+src/source/postgres/arrow_convert.rs:588:13: delete match arm DataType::Boolean in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::list
+src/source/postgres/arrow_convert.rs:589:13: delete match arm DataType::Int16 in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::list
+src/source/postgres/arrow_convert.rs:590:13: delete match arm DataType::Int32 in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::list
+src/source/postgres/arrow_convert.rs:591:13: delete match arm DataType::Int64 in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::list
+src/source/postgres/arrow_convert.rs:592:13: delete match arm DataType::Float32 in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::list
+src/source/postgres/arrow_convert.rs:593:13: delete match arm DataType::Float64 in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::list
+src/source/postgres/arrow_convert.rs:594:13: delete match arm DataType::Utf8 in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::list
+src/source/postgres/arrow_convert.rs:639:25: replace == with != in build_array
+src/source/postgres/arrow_convert.rs:66:12: replace == with != in <impl PgFromSql<'a> for PgUuidBytes>::accepts
+src/source/postgres/arrow_convert.rs:66:9: replace <impl PgFromSql<'a> for PgUuidBytes>::accepts -> bool with false
+src/source/postgres/arrow_convert.rs:66:9: replace <impl PgFromSql<'a> for PgUuidBytes>::accepts -> bool with true
+src/source/postgres/arrow_convert.rs:702:75: replace * with + in build_array
+src/source/postgres/arrow_convert.rs:702:75: replace * with / in build_array
+src/source/postgres/arrow_convert.rs:703:29: replace + with * in build_array
+src/source/postgres/arrow_convert.rs:703:29: replace + with - in build_array
+src/source/postgres/arrow_convert.rs:703:53: replace / with % in build_array
+src/source/postgres/arrow_convert.rs:703:53: replace / with * in build_array
+src/source/postgres/arrow_convert.rs:716:25: replace == with != in build_array
+src/source/postgres/arrow_convert.rs:73:22: replace == with != in <impl PgFromSql<'a> for PgUuidBytes>::from_sql
+src/source/postgres/arrow_convert.rs:777:9: delete match arm Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME in build_pg_text_array
+src/source/postgres/arrow_convert.rs:799:9: delete match arm Type::JSON | Type::JSONB in build_pg_text_array
+src/source/postgres/arrow_convert.rs:811:9: delete match arm Type::NUMERIC in build_pg_text_array
+src/source/postgres/arrow_convert.rs:818:9: delete match arm Type::UUID in build_pg_text_array
+src/source/postgres/arrow_convert.rs:829:9: delete match arm Type::INTERVAL in build_pg_text_array
+src/source/postgres/arrow_convert.rs:840:14: replace match guard matches!(pg_type.kind(), Kind::Enum(_)) with false in build_pg_text_array
+src/source/postgres/arrow_convert.rs:840:14: replace match guard matches!(pg_type.kind(), Kind::Enum(_)) with true in build_pg_text_array
+src/source/postgres/arrow_convert.rs:964:5: replace pg_numeric_optional_plain -> Result<Option<String>> with Ok(None)
+src/source/postgres/arrow_convert.rs:964:5: replace pg_numeric_optional_plain -> Result<Option<String>> with Ok(Some("xyzzy".into()))
+src/source/postgres/arrow_convert.rs:964:5: replace pg_numeric_optional_plain -> Result<Option<String>> with Ok(Some(String::new()))
+src/source/postgres/arrow_convert.rs:968:21: delete ! in pg_numeric_optional_plain
+src/source/postgres/arrow_convert.rs:979:28: delete ! in pg_numeric_optional_plain
+src/source/postgres/arrow_convert.rs:987:5: replace pg_numeric_optional_scaled_i128 -> Result<Option<i128>> with Ok(None)
+src/source/postgres/arrow_convert.rs:987:5: replace pg_numeric_optional_scaled_i128 -> Result<Option<i128>> with Ok(Some(-1))
+src/source/postgres/arrow_convert.rs:987:5: replace pg_numeric_optional_scaled_i128 -> Result<Option<i128>> with Ok(Some(0))
+src/source/postgres/arrow_convert.rs:987:5: replace pg_numeric_optional_scaled_i128 -> Result<Option<i128>> with Ok(Some(1))
+src/source/postgres/cdc.rs:135:9: replace PgChangeStream::fill -> Result<()> with Ok(())
+src/source/postgres/cdc.rs:152:31: replace > with < in PgChangeStream::fill
+src/source/postgres/cdc.rs:152:31: replace > with == in PgChangeStream::fill
+src/source/postgres/cdc.rs:152:31: replace > with >= in PgChangeStream::fill
+src/source/postgres/cdc.rs:171:12: delete ! in PgChangeStream::fill
+src/source/postgres/cdc.rs:171:25: replace || with && in PgChangeStream::fill
+src/source/postgres/cdc.rs:171:35: replace < with <= in PgChangeStream::fill
+src/source/postgres/cdc.rs:171:35: replace < with == in PgChangeStream::fill
+src/source/postgres/cdc.rs:171:35: replace < with > in PgChangeStream::fill
+src/source/postgres/cdc.rs:182:5: replace parse_lsn -> Option<u64> with None
+src/source/postgres/cdc.rs:182:5: replace parse_lsn -> Option<u64> with Some(0)
+src/source/postgres/cdc.rs:182:5: replace parse_lsn -> Option<u64> with Some(1)
+src/source/postgres/cdc.rs:185:25: replace << with >> in parse_lsn
+src/source/postgres/cdc.rs:185:32: replace | with & in parse_lsn
+src/source/postgres/cdc.rs:185:32: replace | with ^ in parse_lsn
+src/source/postgres/cdc.rs:193:39: replace && with || in <impl ChangeStream for PgChangeStream>::next_change
+src/source/postgres/cdc.rs:193:42: delete ! in <impl ChangeStream for PgChangeStream>::next_change
+src/source/postgres/cdc.rs:193:9: replace <impl ChangeStream for PgChangeStream>::next_change -> Option<Result<ChangeEvent>> with None
+src/source/postgres/cdc.rs:205:9: replace <impl ChangeStream for PgChangeStream>::ack -> Result<()> with Ok(())
+src/source/postgres/cdc.rs:214:27: replace || with && in <impl ChangeStream for PgChangeStream>::ack
+src/source/postgres/cdc.rs:214:30: delete ! in <impl ChangeStream for PgChangeStream>::ack
+src/source/postgres/cdc.rs:214:73: replace || with && in <impl ChangeStream for PgChangeStream>::ack
+src/source/postgres/cdc.rs:214:78: replace == with != in <impl ChangeStream for PgChangeStream>::ack
+src/source/postgres/cdc.rs:324:13: replace < with <= in parse_value
+src/source/postgres/cdc.rs:330:36: replace + with * in parse_value
+src/source/postgres/cdc.rs:330:36: replace + with - in parse_value
+src/source/postgres/cdc.rs:343:16: replace < with <= in utf8_len
+src/source/postgres/cdc.rs:354:8: delete ! in map_pg_value
+src/source/postgres/cdc.rs:367:40: replace || with && in map_pg_value
+src/source/postgres/cdc.rs:367:59: replace || with && in map_pg_value
+src/source/postgres/cdc.rs:370:33: replace || with && in map_pg_value
+src/source/postgres/cdc.rs:374:51: replace == with != in map_pg_value
+src/source/postgres/cdc.rs:376:32: replace || with && in map_pg_value
+src/source/postgres/cdc.rs:449:21: replace < with <= in parse_pg_array_literal
+src/source/postgres/cdc.rs:450:39: replace + with * in parse_pg_array_literal
+src/source/postgres/cdc.rs:450:39: replace + with - in parse_pg_array_literal
+src/source/postgres/cdc.rs:450:43: replace < with <= in parse_pg_array_literal
+src/source/postgres/cdc.rs:493:31: replace || with && in parse_pg_time_micros
+src/source/postgres/cdc.rs:502:30: replace + with - in parse_pg_time_micros
+src/source/postgres/cdc.rs:515:29: delete - in parse_pg_interval
+src/source/postgres/cdc.rs:526:18: replace match guard u.starts_with("day") with true in parse_pg_interval
+src/source/postgres/cdc.rs:71:26: replace match guard cfg.mode.is_enforced() with false in PgChangeStream::open
+src/source/postgres/cdc.rs:71:26: replace match guard cfg.mode.is_enforced() with true in PgChangeStream::open
+src/source/postgres/cdc.rs:94:12: delete ! in PgChangeStream::open
+src/types/target.rs:141:9: replace TargetStatus::label -> &'static str with ""
+src/types/target.rs:141:9: replace TargetStatus::label -> &'static str with "xyzzy"
+src/types/target.rs:266:5: replace unsupported_reason -> String with "xyzzy".into()
+src/types/target.rs:266:5: replace unsupported_reason -> String with String::new()
+src/types/target.rs:267:9: delete match arm RivetType::Unsupported{reason, ..} in unsupported_reason
+src/types/target.rs:488:27: replace < with <= in duckdb::native
+src/types/target.rs:573:27: replace < with <= in snowflake::native
+src/types/target.rs:720:27: replace < with <= in clickhouse::native
+src/types/target.rs:77:9: replace ExportTarget::label -> &'static str with ""
+src/types/target.rs:77:9: replace ExportTarget::label -> &'static str with "xyzzy"
+src/types/target.rs:96:70: replace == with != in ExportTarget::resolve_column

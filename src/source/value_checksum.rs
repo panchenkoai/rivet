@@ -801,6 +801,169 @@ mod tests {
     }
 
     #[test]
+    fn list_parity_holds_for_every_covered_element_type() {
+        // Verify-run find: the A<->B parity fixture exercised only List<Int64>,
+        // so deleting the Bool/I16/F32/F64 arms in `list_cell_elems` (the
+        // arrow-side list extraction) survived. One list column per covered
+        // element type, hashed through both independent paths.
+        use arrow::array::{
+            BooleanBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder,
+            ListBuilder, StringBuilder,
+        };
+
+        struct ListCells;
+        impl CellSource for ListCells {
+            fn num_rows(&self) -> usize {
+                1
+            }
+            fn int16(&self, _c: usize, _r: usize) -> Option<i16> {
+                None
+            }
+            fn int32(&self, _c: usize, _r: usize) -> Option<i32> {
+                None
+            }
+            fn int64(&self, _c: usize, _r: usize) -> Option<i64> {
+                None
+            }
+            fn uint64(&self, _c: usize, _r: usize) -> Option<u64> {
+                None
+            }
+            fn float32(&self, _c: usize, _r: usize) -> Option<f32> {
+                None
+            }
+            fn float64(&self, _c: usize, _r: usize) -> Option<f64> {
+                None
+            }
+            fn decimal128(&self, _c: usize, _r: usize, _s: i8) -> Option<i128> {
+                None
+            }
+            fn date32(&self, _c: usize, _r: usize) -> Option<i32> {
+                None
+            }
+            fn ts_micros(&self, _c: usize, _r: usize) -> Option<i64> {
+                None
+            }
+            fn boolean(&self, _c: usize, _r: usize) -> Option<bool> {
+                None
+            }
+            fn utf8(&self, _c: usize, _r: usize) -> Option<std::borrow::Cow<'_, [u8]>> {
+                None
+            }
+            fn binary(&self, _c: usize, _r: usize) -> Option<std::borrow::Cow<'_, [u8]>> {
+                None
+            }
+            fn time64_micros(&self, _c: usize, _r: usize) -> Option<i64> {
+                None
+            }
+            fn fixed_binary(&self, _c: usize, _r: usize) -> Option<std::borrow::Cow<'_, [u8]>> {
+                None
+            }
+            fn decimal256(&self, _c: usize, _r: usize, _s: i8) -> Option<arrow::datatypes::i256> {
+                None
+            }
+            fn list(&self, c: usize, _r: usize, _elem: &DataType) -> Option<Vec<ListElem>> {
+                Some(match c {
+                    0 => vec![ListElem::Bool(true), ListElem::Bool(false), ListElem::Null],
+                    1 => vec![ListElem::I16(7), ListElem::I16(-8)],
+                    2 => vec![ListElem::I32(9), ListElem::I32(-10)],
+                    3 => vec![ListElem::F32(1.5), ListElem::F32(-2.5)],
+                    4 => vec![ListElem::F64(3.5), ListElem::F64(-4.5)],
+                    _ => vec![
+                        ListElem::Str("h\u{e9}y".as_bytes().to_vec()),
+                        ListElem::Null,
+                    ],
+                })
+            }
+        }
+
+        // Arrow-side twins, one ListArray per element type, same values.
+        let mut b_bool = ListBuilder::new(BooleanBuilder::new());
+        b_bool.values().append_value(true);
+        b_bool.values().append_value(false);
+        b_bool.values().append_null();
+        b_bool.append(true);
+        let mut b_i16 = ListBuilder::new(Int16Builder::new());
+        b_i16.values().append_value(7);
+        b_i16.values().append_value(-8);
+        b_i16.append(true);
+        let mut b_i32 = ListBuilder::new(Int32Builder::new());
+        b_i32.values().append_value(9);
+        b_i32.values().append_value(-10);
+        b_i32.append(true);
+        let mut b_f32 = ListBuilder::new(Float32Builder::new());
+        b_f32.values().append_value(1.5);
+        b_f32.values().append_value(-2.5);
+        b_f32.append(true);
+        let mut b_f64 = ListBuilder::new(Float64Builder::new());
+        b_f64.values().append_value(3.5);
+        b_f64.values().append_value(-4.5);
+        b_f64.append(true);
+        let mut b_str = ListBuilder::new(StringBuilder::new());
+        b_str.values().append_value("h\u{e9}y");
+        b_str.values().append_null();
+        b_str.append(true);
+
+        let arrays: Vec<arrow::array::ArrayRef> = vec![
+            Arc::new(b_bool.finish()),
+            Arc::new(b_i16.finish()),
+            Arc::new(b_i32.finish()),
+            Arc::new(b_f32.finish()),
+            Arc::new(b_f64.finish()),
+            Arc::new(b_str.finish()),
+        ];
+        let elem_types = [
+            DataType::Boolean,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Float32,
+            DataType::Float64,
+            DataType::Utf8,
+        ];
+        let fields: Vec<Field> = elem_types
+            .iter()
+            .enumerate()
+            .map(|(i, dt)| {
+                Field::new(
+                    format!("l{i}"),
+                    DataType::List(Arc::new(Field::new("item", dt.clone(), true))),
+                    true,
+                )
+            })
+            .collect();
+        let schema: SchemaRef = Arc::new(Schema::new(fields));
+
+        let a = source_checksums(&schema, &ListCells);
+        for (i, arr) in arrays.iter().enumerate() {
+            let b = column_xxh3(arr.as_ref(), None);
+            assert_eq!(
+                a[i], b,
+                "List<{:?}> column {i}: source(A) != arrow(B)",
+                elem_types[i]
+            );
+            assert_ne!(a[i], 0, "List<{:?}> must actually hash", elem_types[i]);
+        }
+    }
+
+    #[test]
+    fn is_covered_rejects_skipped_types() {
+        // `is_covered -> true` survived: the CDC sink consults this to keep
+        // its skip set aligned with the batch pass — a hardwired `true` makes
+        // the sink hash types the batch side skips, guaranteeing a false
+        // checksum mismatch on the next ns-timestamp/exotic-list export.
+        assert!(is_covered(&DataType::Int64));
+        assert!(is_covered(&DataType::Utf8));
+        assert!(!is_covered(&DataType::Timestamp(
+            TimeUnit::Nanosecond,
+            None
+        )));
+        assert!(!is_covered(&DataType::LargeList(Arc::new(Field::new(
+            "item",
+            DataType::Int64,
+            true
+        )))));
+    }
+
+    #[test]
     fn check_rule_gates_list_element_types() {
         // Kills the List-arm mutants in check_rule: dropping the guard (every
         // list "covered") silently checksums lists the encoder can't represent;

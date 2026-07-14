@@ -582,6 +582,45 @@ mod tests {
         assert_eq!(status_of(2), "pending", "quarantine resets the task");
     }
 
+    /// The fingerprint hydration guard is `summary is None AND manifest is not
+    /// the placeholder` — an `&& -> ||` mutant overwrites a LIVE summary's
+    /// fingerprint with the prior manifest's, silently rewriting this run's
+    /// schema evidence.
+    #[test]
+    fn apply_m8_never_overwrites_a_live_schema_fingerprint() {
+        let run_id = "m8run";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("part-a.parquet"), b"AAAAA").unwrap();
+        let mut parts = vec![m8_part("part-a.parquet", 10, 5)];
+        parts[0].part_id = 1;
+        let manifest = m8_manifest(run_id, parts); // fingerprint xxh3:00000000deadbeef
+        std::fs::write(
+            dir.path().join(MANIFEST_FILENAME),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let state =
+            crate::state::StateStore::open_at_path(&state_dir.path().join("state.db")).unwrap();
+        state.insert_chunk_tasks(run_id, &[(0, 10)]).unwrap();
+        state.claim_next_chunk_task(run_id).unwrap();
+        state
+            .complete_chunk_task(run_id, 0, 10, Some("part-a.parquet"))
+            .unwrap();
+
+        let plan = m8_plan(dir.path());
+        let mut summary =
+            crate::pipeline::summary::RunSummary::stub_for_testing(run_id, String::from("orders"));
+        summary.schema_fingerprint = Some("xxh3:1111111111111111".into()); // LIVE evidence
+        apply_m8_resume_decisions(&state, run_id, &plan, &mut summary).unwrap();
+        assert_eq!(
+            summary.schema_fingerprint.as_deref(),
+            Some("xxh3:1111111111111111"),
+            "a live fingerprint must never be overwritten by the prior manifest's"
+        );
+    }
+
     /// A manifest from a DIFFERENT run_id must be ignored wholesale — resetting
     /// chunk_tasks off a foreign manifest could destroy a healthy resume.
     #[test]
