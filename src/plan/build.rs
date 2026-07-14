@@ -323,6 +323,27 @@ fn resolve_chunked_strategy(
         )
     })?;
 
+    chunked_strategy_from_introspection(
+        config.source.source_type,
+        export,
+        tbl,
+        max_attempts,
+        &introspection,
+    )
+}
+
+/// Decision half of [`resolve_chunked_strategy`], split at the introspection
+/// seam so strategy selection is unit-testable with a synthetic
+/// [`crate::source::TableIntrospection`]. The W5 mutation run found its guards
+/// unguarded offline: the keyset-key refusal `!`, the ADR-0020 MySQL-only
+/// auto-keyset gate, the small-table escape, and the memory->rows arithmetic.
+fn chunked_strategy_from_introspection(
+    source_type: crate::config::SourceType,
+    export: &ExportConfig,
+    tbl: &str,
+    max_attempts: u32,
+    introspection: &crate::source::TableIntrospection,
+) -> Result<ExtractionStrategy> {
     // (1) Resolve chunk_size — explicit overrides the budget; otherwise compute
     // from the memory budget and the planner's row-width estimate. Shared by the
     // range-chunked and keyset paths.
@@ -457,7 +478,7 @@ fn resolve_chunked_strategy(
                 // of 'we technically can'." The escape hatch is explicit
                 // `chunk_by_key:` (which works since Layer 2). Do not flip
                 // without re-opening ADR-0020.
-                if config.source.source_type == crate::config::SourceType::Mysql
+                if source_type == crate::config::SourceType::Mysql
                     && let Some(key) = introspection.auto_keyset_key()
                 {
                     log::warn!(
@@ -920,6 +941,101 @@ mod tests {
         e.mode = ExportMode::Chunked;
         e.chunk_column = Some("id".into());
         e
+    }
+
+    // ── mutation-W5 gap closure ──────────────────────────────────────────────
+    // The strategy-selection guards had no offline test (the probe needed a
+    // live DB until the introspection seam split). Each case pins a decision
+    // whose mutant survived W5.
+    fn intro(
+        single_int_pk: Option<&str>,
+        keyset_keys: &[&str],
+        row_estimate: i64,
+        avg_row_bytes: Option<i64>,
+    ) -> crate::source::TableIntrospection {
+        crate::source::TableIntrospection {
+            single_int_pk: single_int_pk.map(str::to_string),
+            keyset_keys: keyset_keys.iter().map(|s| s.to_string()).collect(),
+            row_estimate,
+            avg_row_bytes,
+        }
+    }
+
+    #[test]
+    fn chunked_strategy_decision_gates() {
+        use crate::config::SourceType;
+        let resolve =
+            |source_type, export: &ExportConfig, i: &crate::source::TableIntrospection| {
+                chunked_strategy_from_introspection(source_type, export, "public.t", 3, i)
+            };
+        let base = || {
+            let mut e = chunked_export();
+            e.chunk_column = None; // let the resolver decide
+            e
+        };
+
+        // Small-table escape: rows <= chunk_size downgrades to Snapshot —
+        // INCLUSIVE boundary (row_estimate == chunk_size still snapshots).
+        let e = base();
+        let i = intro(Some("id"), &["id"], e.chunk_size as i64, Some(100));
+        assert!(matches!(
+            resolve(SourceType::Postgres, &e, &i).unwrap(),
+            ExtractionStrategy::Snapshot
+        ));
+        // …but any explicit chunk-shape knob must NOT be collapsed silently.
+        let mut e = base();
+        e.chunk_checkpoint = true;
+        assert!(
+            !matches!(
+                resolve(SourceType::Postgres, &e, &i).unwrap(),
+                ExtractionStrategy::Snapshot
+            ),
+            "chunk_checkpoint asks for resumability a snapshot cannot provide"
+        );
+
+        // Explicit chunk_by_key: a usable key keysets; an unknown key REFUSES
+        // (deleting the `!` accepts a full-scan+filesort key).
+        let mut e = base();
+        e.chunk_by_key = Some("uid".into());
+        let i = intro(None, &["uid"], 1_000_000, Some(100));
+        match resolve(SourceType::Postgres, &e, &i).unwrap() {
+            ExtractionStrategy::Keyset(k) => assert_eq!(k.key_column, "uid"),
+            other => panic!("usable chunk_by_key must keyset, got {other:?}"),
+        }
+        let mut e = base();
+        e.chunk_by_key = Some("nope".into());
+        let err =
+            resolve(SourceType::Postgres, &e, &i).expect_err("unusable chunk_by_key must refuse");
+        assert!(err.to_string().contains("not a usable keyset key"));
+
+        // Memory-budget chunk_size: 100 MB at 1024 B/row = 102_400 rows — the
+        // exact value pins the *,/ arithmetic; a 0-byte estimate must fall back
+        // to the defensive 512 B (100 MB / 512 = 204_800), never divide by 0.
+        let mut e = base();
+        e.chunk_size_memory_mb = Some(100);
+        let i = intro(Some("id"), &["id"], 10_000_000, Some(1024));
+        match resolve(SourceType::Postgres, &e, &i).unwrap() {
+            ExtractionStrategy::Chunked(p) => assert_eq!(p.chunk_size, 102_400),
+            other => panic!("expected chunked, got {other:?}"),
+        }
+        let i = intro(Some("id"), &["id"], 10_000_000, Some(0));
+        match resolve(SourceType::Postgres, &e, &i).unwrap() {
+            ExtractionStrategy::Chunked(p) => assert_eq!(p.chunk_size, 204_800),
+            other => panic!("expected chunked, got {other:?}"),
+        }
+
+        // ADR-0020: auto-keyset on a no-int-PK table is MYSQL-ONLY. The same
+        // introspection on Postgres must refuse with the no-safe-shape error —
+        // an `==` -> `!=` mutant flips the gate for every engine.
+        let e = base();
+        let i = intro(None, &["uuid_col"], 1_000_000, Some(100));
+        match resolve(SourceType::Mysql, &e, &i).unwrap() {
+            ExtractionStrategy::Keyset(k) => assert_eq!(k.key_column, "uuid_col"),
+            other => panic!("mysql auto-keyset expected, got {other:?}"),
+        }
+        let err =
+            resolve(SourceType::Postgres, &e, &i).expect_err("PG must not auto-keyset (ADR-0020)");
+        assert!(err.to_string().contains("no safe shape"));
     }
 
     #[test]
