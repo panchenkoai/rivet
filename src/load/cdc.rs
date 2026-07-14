@@ -39,6 +39,11 @@ pub enum SourceEngine {
     Postgres,
     /// `{"lsn":"0000002d000000d80194"}` — fixed-width hex; lexical == numeric.
     SqlServer,
+    /// `{"_data":"826A4E0001..."}` — the change-stream resume token. `_data` is
+    /// an order-preserving hex keystring (compared lexically, like SQL Server's
+    /// lsn); the primary key is the document's `_id` column. See
+    /// `source::cdc::validate::parse_pos`, which keys Mongo `__pos` on `_data`.
+    Mongo,
 }
 
 /// The warehouse the view is defined in — selects the JSON-parse dialect and
@@ -90,6 +95,9 @@ impl SourceEngine {
             (Warehouse::BigQuery, SourceEngine::SqlServer) => {
                 vec!["JSON_VALUE(__pos,'$.lsn')".into()]
             }
+            (Warehouse::BigQuery, SourceEngine::Mongo) => {
+                vec!["JSON_VALUE(__pos,'$._data')".into()]
+            }
             // ── Snowflake: PARSE_JSON(__pos):path::type + SPLIT_PART(...,n)
             (Warehouse::Snowflake, SourceEngine::MySql) => vec![
                 "PARSE_JSON(__pos):file::string".into(),
@@ -101,6 +109,9 @@ impl SourceEngine {
             ],
             (Warehouse::Snowflake, SourceEngine::SqlServer) => {
                 vec!["PARSE_JSON(__pos):lsn::string".into()]
+            }
+            (Warehouse::Snowflake, SourceEngine::Mongo) => {
+                vec!["PARSE_JSON(__pos):_data::string".into()]
             }
         };
         // `__seq` is always the final, least-significant tiebreak: it orders
@@ -199,10 +210,11 @@ mod tests {
     use super::*;
 
     const WAREHOUSES: [Warehouse; 2] = [Warehouse::BigQuery, Warehouse::Snowflake];
-    const ENGINES: [SourceEngine; 3] = [
+    const ENGINES: [SourceEngine; 4] = [
         SourceEngine::MySql,
         SourceEngine::Postgres,
         SourceEngine::SqlServer,
+        SourceEngine::Mongo,
     ];
 
     #[test]
@@ -292,6 +304,25 @@ mod tests {
             SourceEngine::SqlServer,
         );
         assert!(sf.contains("PARSE_JSON(__pos):lsn::string DESC, __seq DESC"));
+    }
+
+    #[test]
+    fn mongo_orders_by_resume_token_data_and_partitions_by_id() {
+        // Mongo's `_id` is the dedup PK; `__pos` orders on the `_data` resume
+        // token (single string key + `__seq` tiebreak, like SQL Server's lsn).
+        let bq = dedup_view_sql(Warehouse::BigQuery, "v", "c", &["_id"], SourceEngine::Mongo);
+        assert!(bq.contains("JSON_VALUE(__pos,'$._data') DESC, __seq DESC"));
+        assert!(bq.contains("PARTITION BY _id"));
+        let sf = dedup_view_sql(
+            Warehouse::Snowflake,
+            "v",
+            "c",
+            &["_id"],
+            SourceEngine::Mongo,
+        );
+        assert!(sf.contains("PARSE_JSON(__pos):_data::string DESC, __seq DESC"));
+        // Soft-delete parity holds for Mongo too.
+        assert!(sf.contains("(__op = 'delete') AS __is_deleted"));
     }
 
     #[test]

@@ -188,9 +188,10 @@ pub fn plan_loads(config_path: &str, rivet_bin: &str) -> Result<Vec<LoadPlan>> {
 
 /// Resolve the config's source engine into the CDC [`SourceEngine`] the dedup
 /// view's `__pos` parse is keyed on. One config has one source, so this is a
-/// job-wide property. MongoDB has no SQL/primary-key model, so its CDC does not
-/// map onto the relational dedup view — it is refused here rather than silently
-/// producing a wrong view.
+/// job-wide property. MongoDB is supported too: its change stream carries a
+/// document `_id` (the dedup partition key) and an order-preserving `_data`
+/// resume token in `__pos`, so the current-state view applies just as it does to
+/// the relational engines.
 pub fn source_engine(config_path: &str) -> Result<crate::load::cdc::SourceEngine> {
     use crate::config::SourceType;
     use crate::load::cdc::SourceEngine;
@@ -202,10 +203,7 @@ pub fn source_engine(config_path: &str) -> Result<crate::load::cdc::SourceEngine
         SourceType::Postgres => Ok(SourceEngine::Postgres),
         SourceType::Mysql => Ok(SourceEngine::MySql),
         SourceType::Mssql => Ok(SourceEngine::SqlServer),
-        SourceType::Mongo => bail!(
-            "MongoDB CDC has no relational primary-key model, so the current-state dedup view \
-             (`--cdc`) does not apply to it"
-        ),
+        SourceType::Mongo => Ok(SourceEngine::Mongo),
     }
 }
 
