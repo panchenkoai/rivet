@@ -1110,10 +1110,65 @@ pub(crate) fn introspect_mssql_table_for_chunking(
 
 #[cfg(test)]
 mod tests {
-    use super::{catalog_decimal_to_params, parse_mssql_simple_from_table};
+    use super::{
+        catalog_decimal_to_params, mssql_find_outer_from_keyword, parse_mssql_simple_from_table,
+        sql_keyword_at,
+    };
 
     fn parse(q: &str) -> Option<(String, String)> {
         parse_mssql_simple_from_table(q)
+    }
+
+    // ── mutation-W4 gap closure ──────────────────────────────────────────────
+    // 18 mutants survived in the FROM-finder (quote escapes, paren depth,
+    // identifier boundaries) — no direct test existed. A mis-found FROM feeds
+    // the table extraction for catalog lookups; golden byte OFFSETS pin the
+    // arithmetic, tricky shapes pin the state machine.
+    #[test]
+    fn outer_from_finder_golden_offsets() {
+        let f = mssql_find_outer_from_keyword;
+        // Exact offset (kills index arithmetic): "SELECT a " = 9 bytes.
+        assert_eq!(f("SELECT a FROM t"), Some(9));
+        // Case-insensitive.
+        assert_eq!(f("select a frOm t"), Some(9));
+        // Subquery FROM is nested — only the outer one counts.
+        let q = "SELECT (SELECT x FROM i) FROM t";
+        assert_eq!(f(q), Some(q.rfind("FROM").unwrap()));
+        // 'from' inside a string literal is skipped…
+        let q = "SELECT 'from' FROM t";
+        assert_eq!(f(q), Some(q.rfind("FROM").unwrap()));
+        // …including with a doubled-quote escape swallowing a fake closer.
+        let q = "SELECT 'it''s from x' FROM t";
+        assert_eq!(f(q), Some(q.rfind("FROM").unwrap()));
+        // Escape-skip arithmetic: with a long prefix the escape index i has
+        // 2*i PAST the string end, so an `i += 2` -> `i *= 2` mutant runs off
+        // the buffer and returns None (short fixtures let 2*i coincidentally
+        // land back on the closing quote — the fixture must break the
+        // coincidence, not rely on it).
+        let q = "SELECT aaaaaaaaaaaaaaaaaaaaaaaaaaaa, 'it''s' FROM t";
+        assert!(2 * q.find("''").unwrap() > q.len(), "fixture invariant");
+        assert_eq!(f(q), Some(q.rfind("FROM").unwrap()));
+        // Identifier boundaries: neither `a_from` nor `fromage` match.
+        let q = "SELECT a_from, fromage FROM t";
+        assert_eq!(f(q), Some(q.rfind("FROM").unwrap()));
+        // Unbalanced-close before FROM must not underflow depth below zero and
+        // hide the keyword.
+        assert_eq!(f(") FROM t"), Some(2));
+        // No FROM at all.
+        assert_eq!(f("SELECT 1"), None);
+        // FROM stuck inside parens only -> nested, not outer.
+        assert_eq!(f("SELECT (x FROM t)"), None);
+    }
+
+    #[test]
+    fn keyword_at_checks_both_identifier_boundaries() {
+        let k = |h: &str, i: usize| sql_keyword_at(h.as_bytes(), i, b"from");
+        assert!(k("from t", 0), "start of string is a boundary");
+        assert!(k("x from", 2), "end of string is a boundary");
+        assert!(!k("xfrom t", 1), "preceded by an identifier byte");
+        assert!(!k("from_x", 0), "followed by an identifier byte");
+        assert!(!k("fro", 0), "keyword longer than the remaining haystack");
+        assert!(k("x FROM y", 2), "case-insensitive");
     }
 
     #[test]
