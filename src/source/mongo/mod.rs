@@ -852,6 +852,17 @@ mod tests {
     use super::*;
     use mongodb::bson::oid::ObjectId;
 
+    // W4: the byte-cap multiplications had no exact-value test — `mb * 1024 *
+    // 1024` mutating to `+` or `/` silently shrinks (or explodes) the flush
+    // budget that keeps document batches under the i32 offset ceiling.
+    #[test]
+    fn batch_byte_cap_is_exact_mib() {
+        assert_eq!(super::mongo_batch_byte_cap(Some(10)), 10 * 1024 * 1024);
+        assert_eq!(super::mongo_batch_byte_cap(None), 256 * 1024 * 1024);
+        // Zero is not a valid budget — falls back to the default.
+        assert_eq!(super::mongo_batch_byte_cap(Some(0)), 256 * 1024 * 1024);
+    }
+
     // ── mutation-W4 gap closure ──────────────────────────────────────────────
     // Deleting any `id_bracket` arm survived the suite: the type falls to the
     // `None` catch-all and keyset is (conservatively) refused — a false refusal
