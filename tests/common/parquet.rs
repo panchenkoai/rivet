@@ -35,8 +35,8 @@ pub fn parquet_rows_from_bytes(bytes: Vec<u8>) -> usize {
 }
 
 /// The `i64` `id` column values of a single `.parquet` file, WITH multiplicity
-/// (so duplicates are observable). Panics if there is no `id` column or it does
-/// not decode as `Int64` — the canonical seeders all use a `BIGINT id`.
+/// (so duplicates are observable). Accepts `Int64` (the canonical `BIGINT id`
+/// seeders) or `Int32` (an `INT id` source column) — panics on anything else.
 pub fn parquet_ids(path: &Path) -> Vec<i64> {
     use arrow::array::{Array, AsArray};
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
@@ -48,13 +48,24 @@ pub fn parquet_ids(path: &Path) -> Vec<i64> {
     for batch in reader {
         let batch = batch.unwrap();
         let col = batch.column_by_name("id").expect("id column present");
-        let a = col
-            .as_primitive_opt::<arrow::datatypes::Int64Type>()
-            .expect("id column decodes as Int64");
-        for i in 0..a.len() {
-            if !a.is_null(i) {
-                out.push(a.value(i));
+        match col.data_type() {
+            arrow::datatypes::DataType::Int64 => {
+                let a = col.as_primitive::<arrow::datatypes::Int64Type>();
+                for i in 0..a.len() {
+                    if !a.is_null(i) {
+                        out.push(a.value(i));
+                    }
+                }
             }
+            arrow::datatypes::DataType::Int32 => {
+                let a = col.as_primitive::<arrow::datatypes::Int32Type>();
+                for i in 0..a.len() {
+                    if !a.is_null(i) {
+                        out.push(i64::from(a.value(i)));
+                    }
+                }
+            }
+            other => panic!("id column: expected Int32/Int64, got {other:?}"),
         }
     }
     out
@@ -132,6 +143,34 @@ pub fn dir_parquet_distinct_strings(dir: &Path, col: &str) -> BTreeSet<String> {
         }
     }
     out
+}
+
+/// Sum `row_count` across the run-unique manifest COPIES (`manifest-<run>.json`)
+/// in `dir` — the dest sidecars a cross-run consumer (the Pro loader's reconcile,
+/// a warehouse autoloader) reads. Unlike a parquet re-read, this goes **RED when
+/// a run's manifest CLOBBERS**: the payload survives (run-unique parts) but its
+/// manifest entry is lost, so pre-fix a shared prefix held ONE clobbered
+/// `manifest.json` and the sum was the LAST run's rows, not every run's. This is
+/// the oracle a run-uniqueness / accumulation claim must use — the `file_log`
+/// state-DB ledger accumulates regardless of the sidecar clobber, and a parquet
+/// re-read cannot see it. Ignores the canonical `manifest.json` pointer (it
+/// duplicates the latest copy; counting it would double the latest run).
+pub fn dir_manifest_copy_total_rows(dir: &Path) -> i64 {
+    let mut total = 0;
+    for path in files_with_extension(dir, "json") {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        if !(name.starts_with("manifest-") && name.ends_with(".json")) {
+            continue; // the bare `manifest.json` pointer, or a foreign file
+        }
+        let bytes = std::fs::read(&path).expect("read manifest copy");
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("parse manifest copy JSON");
+        total += v
+            .get("row_count")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+    }
+    total
 }
 
 /// True if any `.parquet` under `dir` carries a column named `col`.
@@ -218,11 +257,25 @@ pub fn read_cdc_changes(dir: &Path) -> Vec<CdcChange> {
     for path in files_with_extension(dir, "parquet") {
         for batch in reader(&path) {
             let b = batch.unwrap();
-            let col_i64 = |name: &str| {
-                b.column_by_name(name)
-                    .unwrap_or_else(|| panic!("{name} column present"))
-                    .as_primitive::<arrow::datatypes::Int64Type>()
-                    .clone()
+            // Int32 OR Int64 → i64: an `INT` source column lands as Int32 in
+            // the CDC parquet; the original Int64-only downcast panicked on it.
+            let col_i64 = |name: &str| -> Vec<i64> {
+                let col = b
+                    .column_by_name(name)
+                    .unwrap_or_else(|| panic!("{name} column present"));
+                match col.data_type() {
+                    arrow::datatypes::DataType::Int64 => col
+                        .as_primitive::<arrow::datatypes::Int64Type>()
+                        .values()
+                        .to_vec(),
+                    arrow::datatypes::DataType::Int32 => col
+                        .as_primitive::<arrow::datatypes::Int32Type>()
+                        .values()
+                        .iter()
+                        .map(|v| i64::from(*v))
+                        .collect(),
+                    other => panic!("{name}: expected Int32/Int64, got {other:?}"),
+                }
             };
             let col_str = |name: &str| {
                 b.column_by_name(name)
@@ -234,16 +287,29 @@ pub fn read_cdc_changes(dir: &Path) -> Vec<CdcChange> {
             let (op, pos) = (col_str("__op"), col_str("__pos"));
             for r in 0..b.num_rows() {
                 out.push(CdcChange {
-                    id: id.value(r),
-                    v: v.value(r),
+                    id: id[r],
+                    v: v[r],
                     op: op.value(r).to_string(),
                     pos: pos.value(r).to_string(),
-                    seq: seq.value(r),
+                    seq: seq[r],
                 });
             }
         }
     }
     out
+}
+
+/// Sorted `(id, op)` pairs from the CDC parquet under `dir` — the independent
+/// re-read a capture-count assert needs. `manifest_rows(out) == 2` is rivet's
+/// OWN summary and cannot tell "the right 2 changes" from "the wrong 2"; this
+/// reads the payload itself (matrix audit: self-oracle class).
+pub fn cdc_id_ops(dir: &Path) -> Vec<(i64, String)> {
+    let mut v: Vec<(i64, String)> = read_cdc_changes(dir)
+        .into_iter()
+        .map(|c| (c.id, c.op))
+        .collect();
+    v.sort();
+    v
 }
 
 /// `__pos` → a single monotonic `u128`, per engine (`__seq` is the lower-order

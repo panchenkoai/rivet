@@ -75,8 +75,8 @@ scenarios:
   - id: part_name_no_clobber_batch
     what: "rapid consecutive runs into the same prefix don't clobber — millisecond part stamp (single.rs), proven under sub-second incremental deltas"
     postgres: { test: roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts }
-    mysql:    { test: mysql_full_mode_repeated_run_accumulates_manifest_entries }
-    mssql:    { test: mssql_full_mode_repeated_run_accumulates_manifest_entries }
+    mysql:    { test: mysql_roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts }
+    mssql:    { test: mssql_roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts }
     mongo:    { test: mongo_batch_two_rapid_runs_into_same_prefix_do_not_clobber }
 
   - id: part_name_no_clobber_keyset_checkpoint

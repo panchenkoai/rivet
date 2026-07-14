@@ -166,6 +166,20 @@ filename-sanitized. **A test that passes only by sleeping ≥1s between runs is
 documenting the gap, not closing it** — the batch clobber hid behind exactly
 such a `sleep(1100ms)` for months.
 
+The rule extends past the parts to **every per-run SIDECAR**. The CDC sink
+named its parts run-uniquely but wrote the manifest to the fixed
+`manifest.json` — N `until_current` runs into one prefix clobbered it (parts
+accumulated, manifest didn't), and the first consumer that summed manifests
+across runs (the Pro loader's reconcile) under-counted 30 parts as 55 rows.
+No OSS test saw it because every "repeated run" test re-read the PARQUET —
+the artifact that survives — never the manifest. Fix: `write_manifest` leaves
+an immutable `manifest-<run_id>.json` copy beside the canonical last-writer-
+wins pointer (`run_unique_manifest_name` / `is_run_unique_manifest_name` in
+`src/manifest.rs`); guard/validate/resume keep reading the canonical name.
+Process rule: **a "repeated runs accumulate" claim must be asserted on the
+manifest copies (`dir_manifest_copy_total_rows`), not a data re-read** — the
+data surviving is exactly what makes a sidecar clobber invisible.
+
 ## Silent-loss classes from the live GCS run: cells, and names
 
 Two same-day bugs, one lesson each — both survived every count/sum check
@@ -389,3 +403,51 @@ count-only heuristic on engines with no trustworthy scan-free row estimate**
 rather than skipping — the engine with the weakest catalog stats (MySQL) is
 exactly where the pathology is least visible. A sparsity/cost check gated behind
 `row_estimate.is_some()` is a check that abandons the user who needs it most.
+
+## A green test that was never RED is unverified — mutate the product to prove it
+
+The 2026-07 audit found **63 green tests that could not fail against the exact
+bug they guarded**: sleeps masking a fixed granularity contract, CDC tests
+trusting `manifest_rows()` (rivet's own summary), cloud-dest "all rows" cells
+asserting file PRESENCE (`mc ls | wc -l`), reconcile tests trusting rivet's own
+verdict. A 3766-mutant corpus then measured the same defect from the other
+side: whole functions stubbed to `Ok(Default::default())` —
+`finalize_manifest`, `apply_m8_resume_decisions`, `source_checksums` — survived
+the full lib suite. 23 real gaps were closed the same day, every closure
+RED-proven. Three rules fell out, each bitten at least twice:
+
+1. **RED-prove every data-loss/integrity test before committing it.** Apply
+   the mutant (stub the function, flip the operator), watch the NEW test fail,
+   revert. One of the audit's own fixes was vacuous against its intended
+   mutant (`recompute_passed()` masked it — the mutant proved EQUIVALENT, a
+   different verdict entirely); another assert was fix-invariant (`file_log`
+   accumulates whether or not the manifest sidecar clobbers) and passed both
+   pre- and post-fix. Reading the test cannot tell you this; only the mutant
+   can. Enforcement: `cargo mutants --in-diff` gates PRs (ci.yml), the nightly
+   tier rotation ratchets against `docs/mutants-baseline.txt` (shrink-only),
+   equivalents live in `.cargo/mutants.toml` with reasons.
+
+2. **Fixtures must cross the mechanism's activation threshold.** A fold over
+   ONE element makes every fold operator identical (`0^s == 0|s` — the
+   single-part form-B fixture hid `^=`→`|=` in validate's cross-part fold);
+   a single run makes any part-name granularity collision-free (the
+   `sleep(1100ms)`s hid the second-granularity clobber); a single row hides
+   accumulation arithmetic. If the mechanism under test folds/accumulates/
+   collides, the fixture needs ≥2 of the thing — same family as the
+   "engineer fixtures past activation thresholds" self-oracle rule.
+
+3. **A sleep (or any workaround) in a test that compensates for PRODUCT
+   behaviour is a product bug report, not a test fix.** The `sleep(1100ms)`
+   authors knew rivet stamped filenames at second granularity — the comment
+   said so — and routed the test around a real data-loss bug instead of
+   filing it. 29 such sleeps also INVERTED over time: after the `%3f` fix
+   they made the tests permanently unable to catch a regression back.
+   When a test needs artificial separation (time, ordering, uniqueness) that
+   the product claims to provide, stop and check the product first.
+
+Scope honesty: mutation testing measures assertion SENSITIVITY on code that
+exists. It cannot see a missing behaviour (the manifest-clobber fix itself was
+invisible to it — an independent-oracle harness caught that), nor a test and
+code that agree on a wrong spec. Layers: matrices (coverage exists) → mutants
+(assertions bite) → live suites (integration) → independent-oracle harness
+(absent behaviour). One layer's green is not another layer's proof.

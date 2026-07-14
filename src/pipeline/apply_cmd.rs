@@ -341,6 +341,54 @@ mod tests {
         path.to_str().unwrap().to_string()
     }
 
+    // ── mutation-W6 gap closure ──────────────────────────────────────────────
+    // The unrecoverable-credentials gate (PA9) had no direct test: stubbing it
+    // to Ok(()) let a credential-stripped plan sail into an opaque driver auth
+    // error at apply time — the exact failure the gate exists to pre-empt.
+    #[test]
+    fn redacted_url_gate_requires_a_recovery_path() {
+        let set = |url: Option<&str>,
+                   url_env: Option<&str>,
+                   password_env: Option<&str>,
+                   host: Option<&str>,
+                   user: Option<&str>| {
+            let mut a = fresh_artifact();
+            let s = &mut a.resolved_plan.source;
+            s.url = url.map(str::to_string);
+            s.url_env = url_env.map(str::to_string);
+            s.url_file = None;
+            s.password_env = password_env.map(str::to_string);
+            s.host = host.map(str::to_string);
+            s.user = user.map(str::to_string);
+            a
+        };
+        let redacted = Some("postgresql://REDACTED@h/db");
+
+        // Un-redacted URL passes untouched.
+        reject_unrecoverable_inline_url(&set(
+            Some("postgresql://u:p@h/db"),
+            None,
+            None,
+            None,
+            None,
+        ))
+        .expect("plain url is appliable");
+        // Redacted with NO recovery path must refuse loudly.
+        let err = reject_unrecoverable_inline_url(&set(redacted, None, None, None, None))
+            .expect_err("stripped credentials with no recovery must refuse");
+        assert!(err.to_string().contains("cannot be"), "actionable: {err:#}");
+        // Each recovery path independently unblocks (`||` chain, not `&&`)…
+        reject_unrecoverable_inline_url(&set(redacted, Some("DB_URL"), None, None, None))
+            .expect("url_env recovers");
+        reject_unrecoverable_inline_url(&set(redacted, None, Some("PGPASS"), None, None))
+            .expect("password_env recovers");
+        reject_unrecoverable_inline_url(&set(redacted, None, None, Some("h"), Some("u")))
+            .expect("host+user recovers");
+        // …but host WITHOUT user is not enough (`&&`, not `||`).
+        reject_unrecoverable_inline_url(&set(redacted, None, None, Some("h"), None))
+            .expect_err("host without user cannot rebuild the connection");
+    }
+
     // ── staleness enforcement ────────────────────────────────────────────────
 
     #[test]

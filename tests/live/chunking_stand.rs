@@ -922,6 +922,11 @@ fn run_dest_gcs(eng: Eng) {
         count_gcs_parquet(bucket, &prefix) >= 1,
         "fake-gcs bucket must hold >=1 parquet under {prefix}"
     );
+    assert_eq!(
+        fake_gcs_parquet_total_rows(bucket, &prefix),
+        100,
+        "all rows: the downloaded gcs parquet must hold every seeded row (presence is not content)"
+    );
 }
 
 /// `destination: s3` (MinIO) — the export lands a parquet in the bucket (mc ls).
@@ -967,6 +972,11 @@ fn run_dest_s3(eng: Eng) {
     assert!(
         listing.matches(".parquet").count() >= 1,
         "minio must hold >=1 parquet under {prefix}; got:\n{listing}"
+    );
+    assert_eq!(
+        minio_parquet_total_rows(bucket, &prefix),
+        100,
+        "all rows: the downloaded s3 parquet must hold every seeded row (presence is not content)"
     );
 }
 
@@ -1089,6 +1099,11 @@ fn stand_dest_gcs_mongo() {
         count_gcs_parquet(bucket, &prefix) >= 1,
         "fake-gcs must hold >=1 parquet under {prefix}"
     );
+    assert_eq!(
+        fake_gcs_parquet_total_rows(bucket, &prefix),
+        100,
+        "all rows: the downloaded gcs parquet must hold every seeded row (presence is not content)"
+    );
 }
 
 #[test]
@@ -1135,6 +1150,11 @@ fn stand_dest_s3_mongo() {
     assert!(
         listing.matches(".parquet").count() >= 1,
         "minio must hold >=1 parquet under {prefix}; got:\n{listing}"
+    );
+    assert_eq!(
+        minio_parquet_total_rows(bucket, &prefix),
+        100,
+        "all rows: the downloaded s3 parquet must hold every seeded row (presence is not content)"
     );
 }
 

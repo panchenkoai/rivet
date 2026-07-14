@@ -29,7 +29,8 @@ use crate::error::Result;
 use crate::journal::PlanSnapshot;
 use crate::manifest::{
     ColumnChecksum, MANIFEST_FILENAME, ManifestDestination, ManifestPart, ManifestSource,
-    ManifestStatus, PartStatus, RunManifest, SUCCESS_FILENAME, success_marker_body,
+    ManifestStatus, PartStatus, RunManifest, SUCCESS_FILENAME, run_unique_manifest_name,
+    success_marker_body,
 };
 use crate::pipeline::summary::RunSummary;
 
@@ -346,6 +347,19 @@ pub fn write_manifest(dest: &dyn Destination, manifest: &RunManifest) -> Result<
     let manifest_tmp = tempfile::NamedTempFile::new()?;
     std::fs::write(manifest_tmp.path(), &bytes)?;
     dest.write(manifest_tmp.path(), MANIFEST_FILENAME)?;
+    // Immutable per-run copy beside the canonical (last-writer-wins) pointer.
+    // Consecutive runs into one prefix — a CDC soak, incremental batch, the
+    // scheduler's `until_current` model — each clobber `manifest.json`,
+    // orphaning every prior run's manifest from a consumer that sums row counts
+    // ACROSS runs (the Pro loader's reconcile). The parts already carry the run
+    // id in their names (`<export>_<stamp>.parquet`, `cdc-<run_token>-NNNN`);
+    // the manifest sidecar must too. Additive and mode-agnostic: guard / validate
+    // / resume / repair keep reading the canonical name unchanged, so no consumer
+    // moves — this is the ONE seam every pipeline shape writes through.
+    dest.write(
+        manifest_tmp.path(),
+        &run_unique_manifest_name(&manifest.run_id),
+    )?;
 
     let success_marker = matches!(manifest.status, ManifestStatus::Success);
     if success_marker {
@@ -564,9 +578,13 @@ mod tests {
     // ── write_manifest ──────────────────────────────────────────────────────
 
     fn build_manifest(status: ManifestStatus) -> RunManifest {
+        build_manifest_with_run(status, "run_001")
+    }
+
+    fn build_manifest_with_run(status: ManifestStatus, run_id: &str) -> RunManifest {
         let mut b = ManifestBuilder::new(
             &plan_snapshot(),
-            "run_001",
+            run_id,
             chrono::Utc::now(),
             "xxh3:0123456789abcdef".into(),
             "postgres",
@@ -591,6 +609,177 @@ mod tests {
             String::new(),
         );
         b.finalize(status)
+    }
+
+    // ── mutation-pilot gap closures ──────────────────────────────────────────
+    // The cargo-mutants pilot found these three silent-loss paths unguarded:
+    // a mutant emptying set_column_checksums / set_cursor_range, or corrupting
+    // the max+1 part-id arithmetic, survived the whole lib suite.
+
+    #[test]
+    fn builder_carries_column_checksums_and_key_into_the_manifest() {
+        // Mutant killed: `set_column_checksums with ()` — Form B checksums
+        // silently absent from the manifest strips validate of its value leg.
+        let mut b = ManifestBuilder::new(
+            &plan_snapshot(),
+            "run_ck",
+            chrono::Utc::now(),
+            "xxh3:0".into(),
+            "postgres",
+            None,
+            None,
+            "file:///tmp/out/".into(),
+        );
+        b.set_column_checksums(
+            vec![ColumnChecksum {
+                name: "id".into(),
+                checksum: "42".into(),
+            }],
+            Some("id".into()),
+        );
+        let m = b.finalize(ManifestStatus::Success);
+        assert_eq!(
+            m.column_checksums,
+            Some(vec![ColumnChecksum {
+                name: "id".into(),
+                checksum: "42".into(),
+            }]),
+            "recorded column checksums must land in the manifest"
+        );
+        assert_eq!(m.checksum_key_column, Some("id".into()));
+    }
+
+    #[test]
+    fn builder_carries_cursor_range_into_the_extraction_section() {
+        // Mutant killed: `set_cursor_range with ()` — a silently absent cursor
+        // range breaks the incremental continuity audit trail.
+        let mut b = ManifestBuilder::new(
+            &plan_snapshot(),
+            "run_cr",
+            chrono::Utc::now(),
+            "xxh3:0".into(),
+            "postgres",
+            None,
+            None,
+            "file:///tmp/out/".into(),
+        );
+        b.set_cursor_range(
+            Some("updated_at".into()),
+            Some("timestamptz".into()),
+            Some("2026-01-01".into()),
+            Some("2026-02-01".into()),
+            Some(123),
+        );
+        let m = b.finalize(ManifestStatus::Success);
+        let ex = m.source.extraction.expect("extraction section present");
+        assert_eq!(ex.cursor_column.as_deref(), Some("updated_at"));
+        assert_eq!(ex.cursor_type.as_deref(), Some("timestamptz"));
+        assert_eq!(ex.cursor_low.as_deref(), Some("2026-01-01"));
+        assert_eq!(ex.cursor_high.as_deref(), Some("2026-02-01"));
+        assert_eq!(ex.source_row_count, Some(123));
+    }
+
+    #[test]
+    fn record_committed_part_assigns_max_plus_one_over_id_gaps() {
+        // Mutants killed: `m + 1` → `m - 1` / `m * 1` in the part-id
+        // computation. The doc comment describes the exact hazard (hydrated
+        // ids [1,2,4] must yield 5, never a duplicate) — this pins it.
+        let mut s = crate::pipeline::summary::RunSummary::stub_for_testing(
+            "run_pid",
+            String::from("orders"),
+        );
+        for id in [1u32, 2, 4] {
+            s.manifest_parts.push(ManifestPart {
+                part_id: id,
+                path: format!("part-{id:06}.parquet"),
+                rows: 1,
+                size_bytes: 1,
+                content_fingerprint: "xxh3:0".into(),
+                content_md5: String::new(),
+                status: PartStatus::Committed,
+            });
+        }
+        record_committed_part_with_fingerprint(
+            &mut s,
+            "part-next.parquet".into(),
+            1,
+            1,
+            "xxh3:1".into(),
+            String::new(),
+        );
+        let ids: Vec<u32> = s.manifest_parts.iter().map(|p| p.part_id).collect();
+        assert_eq!(
+            ids,
+            vec![1, 2, 4, 5],
+            "next part id must be max+1 (5) — len-based or max-1 numbering collides"
+        );
+    }
+
+    #[test]
+    fn write_manifest_leaves_a_run_unique_copy_beside_the_canonical() {
+        // The shared seam every pipeline shape writes through must leave an
+        // immutable per-run copy next to the last-writer-wins `manifest.json`,
+        // so a prefix accumulating several runs keeps EACH run's manifest for a
+        // cross-run consumer that sums row counts (the Pro loader's reconcile).
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(dir.path());
+        let m = build_manifest(ManifestStatus::Success);
+        write_manifest(&dest, &m).unwrap();
+        assert!(
+            dir.path().join(MANIFEST_FILENAME).exists(),
+            "canonical latest-run pointer"
+        );
+        assert!(
+            dir.path()
+                .join(run_unique_manifest_name(&m.run_id))
+                .exists(),
+            "run-unique copy beside it"
+        );
+    }
+
+    #[test]
+    fn two_runs_into_one_prefix_leave_two_run_unique_manifests() {
+        // The canonical `manifest.json` is clobbered by the second run (fine —
+        // it is the latest-run pointer); the run-unique copies must BOTH survive
+        // so reconcile sums across runs. Mode-agnostic regression for the
+        // manifest-clobber the Pro oracle-fixture harness caught: a live soak
+        // loaded 30 parts (3599 rows) but the one surviving manifest declared 55.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(dir.path());
+        write_manifest(
+            &dest,
+            &build_manifest_with_run(ManifestStatus::Success, "run_aaa"),
+        )
+        .unwrap();
+        write_manifest(
+            &dest,
+            &build_manifest_with_run(ManifestStatus::Success, "run_bbb"),
+        )
+        .unwrap();
+
+        assert!(
+            dir.path()
+                .join(run_unique_manifest_name("run_aaa"))
+                .exists()
+        );
+        assert!(
+            dir.path()
+                .join(run_unique_manifest_name("run_bbb"))
+                .exists()
+        );
+        let copies = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n.starts_with("manifest-") && n.ends_with(".json")
+            })
+            .count();
+        assert_eq!(
+            copies, 2,
+            "each run leaves its own run-unique manifest copy"
+        );
     }
 
     #[test]

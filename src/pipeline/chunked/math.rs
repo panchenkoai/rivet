@@ -146,6 +146,48 @@ pub(crate) fn chunk_plan_fingerprint(
 mod tests {
     use super::*;
 
+    // ── mutation-W4 gap closure ──────────────────────────────────────────────
+    // The chunk_by_days date arithmetic had NO test (the BETWEEN branch did):
+    // `end + 1 -> end - 1` on the exclusive upper bound silently DROPS the
+    // last day of every window — the off-by-one row-loss class. Golden dates
+    // pin both the fast (table-ident) and the subquery-wrap branches.
+    #[test]
+    fn chunk_by_days_windows_use_exclusive_upper_bound() {
+        use crate::config::SourceType;
+        // Fast path: `SELECT * FROM t` keeps the bare-table form. A single-day
+        // window (start == end == day 0) must span exactly [1970-01-01,
+        // 1970-01-02) — an `end - 1` mutant produces an EMPTY window.
+        let q = build_chunk_query_sql(
+            "SELECT * FROM t",
+            "d",
+            0,
+            0,
+            false,
+            true,
+            SourceType::Postgres,
+        );
+        assert!(
+            q.contains(">= '1970-01-01'") && q.contains("< '1970-01-02'"),
+            "single-day window must be [day, day+1): {q}"
+        );
+        // Subquery-wrap path (arbitrary query), non-zero offsets: day 19000 =
+        // 2022-01-08 (start arithmetic), end 19001 -> upper bound 19002 =
+        // 2022-01-10.
+        let q = build_chunk_query_sql(
+            "SELECT a, d FROM t WHERE a > 0",
+            "d",
+            19000,
+            19001,
+            false,
+            true,
+            SourceType::Postgres,
+        );
+        assert!(
+            q.contains(">= '2022-01-08'") && q.contains("< '2022-01-10'"),
+            "window [19000, 19001] must render as [2022-01-08, 2022-01-10): {q}"
+        );
+    }
+
     #[test]
     fn test_generate_chunks() {
         let chunks = generate_chunks(1, 100, 30);

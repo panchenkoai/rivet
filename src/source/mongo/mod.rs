@@ -852,6 +852,82 @@ mod tests {
     use super::*;
     use mongodb::bson::oid::ObjectId;
 
+    // W4: the byte-cap multiplications had no exact-value test — `mb * 1024 *
+    // 1024` mutating to `+` or `/` silently shrinks (or explodes) the flush
+    // budget that keeps document batches under the i32 offset ceiling.
+    #[test]
+    fn batch_byte_cap_is_exact_mib() {
+        assert_eq!(super::mongo_batch_byte_cap(Some(10)), 10 * 1024 * 1024);
+        assert_eq!(super::mongo_batch_byte_cap(None), 256 * 1024 * 1024);
+        // Zero is not a valid budget — falls back to the default.
+        assert_eq!(super::mongo_batch_byte_cap(Some(0)), 256 * 1024 * 1024);
+    }
+
+    // ── mutation-W4 gap closure ──────────────────────────────────────────────
+    // Deleting any `id_bracket` arm survived the suite: the type falls to the
+    // `None` catch-all and keyset is (conservatively) refused — a false refusal
+    // no test noticed. The same blindness would pass the DANGEROUS neighbour: a
+    // MERGE regression (two types sharing a band number) makes collide=false
+    // and keysets across a real server band — the silent bracket-loss class the
+    // heterogeneous-`_id` guard exists to prevent. Pin the WHOLE map.
+    #[test]
+    fn id_bracket_map_matches_the_server_sort_bands() {
+        use mongodb::bson::spec::BinarySubtype;
+        use mongodb::bson::{Binary, DateTime, Decimal128, Regex, Timestamp, doc};
+        let b = |v: &Bson| id_bracket(v);
+
+        // The four numeric types share band 0 — a mixed Int32/Int64/Double
+        // `_id` keysets fine by design.
+        assert_eq!(b(&Bson::Int32(1)), Some(0));
+        assert_eq!(b(&Bson::Int64(1)), Some(0));
+        assert_eq!(b(&Bson::Double(1.0)), Some(0));
+        assert_eq!(
+            b(&Bson::Decimal128("1".parse::<Decimal128>().unwrap())),
+            Some(0)
+        );
+        // Every other placeable type is its OWN band, in server sort order.
+        assert_eq!(b(&Bson::Null), Some(1));
+        assert_eq!(b(&Bson::String("s".into())), Some(2));
+        assert_eq!(b(&Bson::Document(doc! {"k": 1})), Some(3));
+        assert_eq!(b(&Bson::Array(vec![Bson::Int32(1)])), Some(4));
+        assert_eq!(
+            b(&Bson::Binary(Binary {
+                subtype: BinarySubtype::Generic,
+                bytes: vec![1],
+            })),
+            Some(5)
+        );
+        assert_eq!(b(&Bson::ObjectId(ObjectId::new())), Some(6));
+        assert_eq!(b(&Bson::Boolean(true)), Some(7));
+        assert_eq!(b(&Bson::DateTime(DateTime::from_millis(0))), Some(8));
+        assert_eq!(
+            b(&Bson::Timestamp(Timestamp {
+                time: 0,
+                increment: 0
+            })),
+            Some(9)
+        );
+        assert_eq!(
+            b(&Bson::RegularExpression(Regex {
+                pattern: "a".into(),
+                options: String::new(),
+            })),
+            Some(10)
+        );
+        // Unplaceable types refuse keyset rather than guess.
+        assert_eq!(b(&Bson::MaxKey), None);
+
+        // The collide relation derives from the map: same band never collides,
+        // different bands always do, unplaceable collides with everything.
+        assert!(!id_types_collide(&Bson::Int32(1), &Bson::Double(2.0)));
+        assert!(id_types_collide(
+            &Bson::Int64(2000),
+            &Bson::String("id-1".into())
+        ));
+        assert!(id_types_collide(&Bson::Null, &Bson::Document(doc! {})));
+        assert!(id_types_collide(&Bson::MaxKey, &Bson::MaxKey));
+    }
+
     #[test]
     fn id_string_covers_common_key_types() {
         let oid = ObjectId::parse_str("64b8f0000000000000000000").unwrap();

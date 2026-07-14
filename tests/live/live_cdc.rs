@@ -417,6 +417,11 @@ fn cdc_idle_first_run_then_change_is_captured_not_skipped() {
         1,
         "the change between an idle run and the next run must be captured, not skipped"
     );
+    assert_eq!(
+        cdc_id_ops(&out2),
+        vec![(1, "insert".to_string())],
+        "the captured parquet must hold exactly THE change (a count of 1 could be a wrong row)"
+    );
 }
 
 #[test]
@@ -463,6 +468,11 @@ fn cdc_crash_after_flush_before_ack_re_reads_on_resume() {
         manifest_rows(&out2),
         2,
         "resume after a crash before the checkpoint re-reads both changes (no loss)"
+    );
+    assert_eq!(
+        cdc_id_ops(&out2),
+        vec![(1, "insert".to_string()), (2, "insert".to_string())],
+        "the re-read parquet must hold exactly the un-acked changes"
     );
 }
 
@@ -528,6 +538,11 @@ fn pg_cdc_resume_captures_only_new_changes() {
         manifest_rows(&out2),
         2,
         "resume drains only the 2 new changes (slot advanced, no re-read)"
+    );
+    assert_eq!(
+        cdc_id_ops(&out2),
+        vec![(3, "insert".to_string()), (4, "insert".to_string())],
+        "the resumed parquet must hold exactly the NEW changes (count 2 cannot tell new-2 from wrong-2)"
     );
 }
 
@@ -1521,6 +1536,11 @@ exports:
         "pre-existing rows land in snapshot/"
     );
     assert_eq!(manifest_rows(&out), 0, "nothing to drain yet");
+    assert_eq!(
+        dir_parquet_id_set(&snap).into_iter().collect::<Vec<i64>>(),
+        vec![1, 2],
+        "snapshot parquet must hold exactly the pre-existing ids (independent re-read)"
+    );
     let snap_parts = || {
         std::fs::read_dir(&snap)
             .unwrap()
@@ -1540,6 +1560,11 @@ exports:
         .unwrap();
     run_rivet_ok(&cfg);
     assert_eq!(manifest_rows(&out), 1, "the post-snapshot change streams");
+    assert_eq!(
+        cdc_id_ops(&out),
+        vec![(3, "insert".to_string())],
+        "streamed parquet must hold exactly the post-snapshot change (not just a count of 1)"
+    );
     assert_eq!(snap_parts(), 1, "run 2 must NOT re-snapshot");
 }
 
@@ -1857,12 +1882,24 @@ exports:
     run_rivet_ok(&cfg);
     let _slot = Slot(slot.clone());
     assert_eq!(manifest_rows(&out.join("snapshot")), 2);
+    assert_eq!(
+        dir_parquet_id_set(&out.join("snapshot"))
+            .into_iter()
+            .collect::<Vec<i64>>(),
+        vec![1, 2],
+        "snapshot parquet must hold exactly the pre-existing ids (independent re-read)"
+    );
     assert_eq!(manifest_rows(&out), 0);
 
     c.execute(&format!("INSERT INTO {tbl} VALUES (3,30)"), &[])
         .unwrap();
     run_rivet_ok(&cfg);
     assert_eq!(manifest_rows(&out), 1, "the post-snapshot change streams");
+    assert_eq!(
+        cdc_id_ops(&out),
+        vec![(3, "insert".to_string())],
+        "streamed parquet must hold exactly the post-snapshot change (not just a count of 1)"
+    );
 }
 
 // `columns:` type overrides must apply to CDC exactly like batch — pinned for
@@ -2064,6 +2101,16 @@ exports:
     run_rivet_ok(&cfg);
     assert_eq!(manifest_rows(&out.join(&t1)), 2, "table 1 sub-prefix");
     assert_eq!(manifest_rows(&out.join(&t2)), 1, "table 2 sub-prefix");
+    assert_eq!(
+        cdc_id_ops(&out.join(&t1)),
+        vec![(1, "insert".to_string()), (2, "insert".to_string())],
+        "table 1 parquet holds exactly its own changes (routing, not just counts)"
+    );
+    assert_eq!(
+        cdc_id_ops(&out.join(&t2)),
+        vec![(7, "insert".to_string())],
+        "table 2 parquet holds exactly its own changes (routing, not just counts)"
+    );
 
     // Resume: the shared position advanced once for both tables.
     run_rivet_ok(&cfg);
@@ -2117,6 +2164,16 @@ exports:
     run_rivet_ok(&cfg);
     assert_eq!(manifest_rows(&out.join(&ta)), 2);
     assert_eq!(manifest_rows(&out.join(&tb)), 1);
+    assert_eq!(
+        cdc_id_ops(&out.join(&ta)),
+        vec![(1, "insert".to_string()), (2, "insert".to_string())],
+        "table a parquet holds exactly its own changes (routing, not just counts)"
+    );
+    assert_eq!(
+        cdc_id_ops(&out.join(&tb)),
+        vec![(7, "insert".to_string())],
+        "table b parquet holds exactly its own changes (routing, not just counts)"
+    );
 
     run_rivet_ok(&cfg);
     assert_eq!(manifest_rows(&out.join(&ta)), 0, "resume: no re-read");
@@ -2427,6 +2484,11 @@ fn pg_cdc_idle_first_run_then_change_is_captured_not_skipped() {
         1,
         "the change between an idle run and the next run must be captured, not skipped"
     );
+    assert_eq!(
+        cdc_id_ops(&out2),
+        vec![(1, "insert".to_string())],
+        "the captured parquet must hold exactly THE change (a count of 1 could be a wrong row)"
+    );
 }
 
 #[test]
@@ -2479,6 +2541,11 @@ fn pg_cdc_crash_after_flush_before_ack_does_not_advance_the_slot() {
         manifest_rows(&out2),
         2,
         "the slot stayed put across the crash → resume re-reads both (no loss)"
+    );
+    assert_eq!(
+        cdc_id_ops(&out2),
+        vec![(1, "insert".to_string()), (2, "insert".to_string())],
+        "the re-read parquet must hold exactly the un-acked changes"
     );
 }
 
@@ -2585,6 +2652,11 @@ fn cdc_resume_captures_only_new_changes() {
         manifest_rows(&out2),
         2,
         "resume must capture exactly the 2 changes since the checkpoint (no gap, no dup)"
+    );
+    assert_eq!(
+        cdc_id_ops(&out2),
+        vec![(3, "insert".to_string()), (4, "insert".to_string())],
+        "the resumed parquet must hold exactly the NEW changes (count 2 cannot tell new-2 from wrong-2)"
     );
 }
 

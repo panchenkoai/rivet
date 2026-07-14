@@ -340,6 +340,78 @@ mod tests {
         String::from_utf8(buf).unwrap()
     }
 
+    // ── mutation-W5 gap closures ─────────────────────────────────────────────
+
+    #[test]
+    fn time64_renders_exact_wall_clock() {
+        // W5: the µs → hh:mm:ss.ffffff arithmetic (/, %) had no golden — a
+        // mutated divisor silently corrupts every TIME cell in CSV output.
+        use arrow::array::Time64MicrosecondArray;
+        assert_eq!(
+            cell(Time64MicrosecondArray::from(vec![86_399_999_999_i64]), 0),
+            "23:59:59.999999"
+        );
+        assert_eq!(
+            cell(Time64MicrosecondArray::from(vec![3_661_000_001_i64]), 0),
+            "01:01:01.000001"
+        );
+        assert_eq!(
+            cell(Time64MicrosecondArray::from(vec![0_i64]), 0),
+            "00:00:00.000000"
+        );
+    }
+
+    #[test]
+    fn write_batch_layout_and_byte_accounting_are_exact() {
+        // W5: `col_idx > 0` mutating to `>=` puts a LEADING comma on every row
+        // (corrupt CSV); the header `len + 1` and `bytes_written +=` mutants
+        // desync the rotation accounting. Pin the exact output AND the count.
+        use arrow::array::Int64Array;
+        use std::sync::{Arc as SArc, Mutex};
+
+        #[derive(Clone)]
+        struct SharedBuf(SArc<Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let sink = SharedBuf(SArc::new(Mutex::new(Vec::new())));
+        use crate::format::Format as _;
+        let mut w = CsvFormat
+            .create_writer(&schema, Box::new(sink.clone()))
+            .unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![10, 20])),
+            ],
+        )
+        .unwrap();
+        w.write_batch(&batch).unwrap();
+
+        let text = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            text, "a,b\n1,10\n2,20\n",
+            "exact CSV layout (no leading commas)"
+        );
+        assert_eq!(
+            w.bytes_written(),
+            text.len() as u64,
+            "byte accounting must equal the physical output"
+        );
+    }
+
     // ── null handling ────────────────────────────────────────────────────────
 
     #[test]

@@ -82,8 +82,9 @@ exports:
         String::from_utf8_lossy(&crash.stderr)
     );
 
-    // Distinct filename timestamps for any re-run within the same second.
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
+    // back-to-back sub-second runs must not collide — sleeping here would
+    // mask exactly that regression (matrix audit: sleep-masked class).
 
     // Resume to completion.
     let resume = rivet(&cfg, &export, true, None);

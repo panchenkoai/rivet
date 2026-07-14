@@ -144,6 +144,13 @@ fn s3_minio_destination_produces_one_parquet_with_all_rows() {
         parquet_count, 1,
         "s3 (MinIO) must produce exactly one parquet under the prefix;\nmc ls output:\n{listing}"
     );
+    // "all rows" needs a CONTENT oracle, not file presence: download the
+    // object(s) and count the physical rows (matrix audit: wrong-artifact).
+    assert_eq!(
+        minio_parquet_total_rows(bucket, &prefix),
+        25,
+        "the downloaded s3 parquet must hold every seeded row"
+    );
 }
 
 #[test]
@@ -191,6 +198,13 @@ fn gcs_fake_destination_produces_one_parquet_with_all_rows() {
     assert!(
         parquet_count >= 1,
         "fake-gcs bucket must contain at least one .parquet; response:\n{resp}"
+    );
+    // "all rows" needs a CONTENT oracle, not file presence: download the
+    // object(s) and count the physical rows (matrix audit: wrong-artifact).
+    assert_eq!(
+        fake_gcs_parquet_total_rows(bucket, &prefix),
+        25,
+        "the downloaded gcs parquet must hold every seeded row"
     );
 }
 
@@ -286,7 +300,11 @@ fn destination_parity_row_counts_match_across_local_s3_gcs() {
         assert!(ok, "gcs failed: {err}");
     }
 
-    // Structural parity: each backend must report at least one file.
+    // TRUE parity: the same physical row count downloaded back from every
+    // backend. The prior version counted FILES for s3 ("mc ls | wc -l") and
+    // settled for "no error" on gcs — trusting rivet's own summary is exactly
+    // the self-oracle the audit flagged; a backend silently writing a short
+    // parquet passed. Every leg now downloads and counts rows.
     assert_eq!(
         local_rows, ROWS as usize,
         "local backend row count mismatch"
@@ -295,6 +313,14 @@ fn destination_parity_row_counts_match_across_local_s3_gcs() {
         s3_file_count >= 1,
         "s3 backend must have at least one object under {s3_prefix}"
     );
-    // GCS file count checked via the dedicated test above; here we settle
-    // for "no error".
+    assert_eq!(
+        minio_parquet_total_rows(s3_bucket, &s3_prefix),
+        ROWS as usize,
+        "s3 (MinIO) downloaded row count must equal the seed"
+    );
+    assert_eq!(
+        fake_gcs_parquet_total_rows(gcs_bucket, &gcs_prefix),
+        ROWS as usize,
+        "gcs (fake-gcs) downloaded row count must equal the seed"
+    );
 }

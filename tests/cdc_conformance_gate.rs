@@ -351,18 +351,26 @@ fn every_cdc_engine_covers_every_conformance_case() {
 fn every_live_cdc_test_asserts_an_outcome() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut naked = Vec::new();
-    for file in [
-        "tests/live/live_cdc.rs",
-        "tests/live/live_cdc_mssql.rs",
-        "tests/live/gremlin_cdc.rs",
-        "tests/live/live_cdc_golden.rs",
-        "tests/live/live_cdc_oracle.rs",
-        "tests/live/live_cdc_mbt.rs",
-        "tests/live/live_cdc_property.rs",
-        "tests/live/live_batch_switch_golden.rs",
-        "tests/live/live_cdc_mongo.rs",
-    ] {
-        let src = fs::read_to_string(root.join(file)).unwrap();
+    // Every `tests/live/*cdc*.rs` file is scanned AUTOMATICALLY — a hardcoded
+    // list silently exempted `live_cdc_replica.rs` (its capture ran outside the
+    // gate for months; the matrix audit caught it). Files whose name does not
+    // carry `cdc` but still run CDC captures are listed explicitly.
+    let mut files: Vec<String> = fs::read_dir(root.join("tests/live"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".rs") && n.contains("cdc"))
+        .map(|n| format!("tests/live/{n}"))
+        .collect();
+    files.push("tests/live/live_batch_switch_golden.rs".to_string());
+    files.sort();
+    assert!(
+        files.len() >= 10,
+        "glob found only {} cdc files — the discovery itself regressed",
+        files.len()
+    );
+    for file in files {
+        let src = fs::read_to_string(root.join(&file)).unwrap();
         // Split on test attributes; each chunk is one test body (plus tail).
         for chunk in src.split("#[test]").skip(1) {
             let name = chunk
@@ -391,7 +399,21 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 || chunk.contains("read_csv(")
                 || chunk.contains("gcs list")
                 || chunk.contains("query_row")
-                || chunk.contains("status.success()")
+                // NOTE: `status.success()` is deliberately NOT a marker — it is
+                // exactly the "process exited 0" non-outcome this gate exists to
+                // reject (a 0-row capture exits 0). It sat in this dictionary for
+                // months, hollowing the gate; the matrix audit removed it. A
+                // must-fail test's NEGATIVE exit assert IS an outcome (below).
+                || chunk.contains("!out.status.success()")
+                || chunk.contains("!res.status.success()")
+                || chunk.contains("read_cdc_rows(") // replica-suite replay oracle
+                // `rivet validate` re-reads the destination (parts + manifest +
+                // checksums) — an independent read-back, not the capture's exit.
+                || chunk.contains("args([\"validate\"")
+                // External-warehouse oracles (the strongest read-back in the
+                // suite): the CDC parquet is loaded and queried by another engine.
+                || chunk.contains("duckdb_run_sql_json(")
+                || chunk.contains("clickhouse_run_sql_json(")
                 // Read-back helpers the newer suites use. This dictionary
                 // is INTENTIONALLY wide: the read-backs differ because the
                 // oracles differ (manifest vs parquet vs csv vs gcs listing

@@ -44,6 +44,35 @@ pub const SUCCESS_FILENAME: &str = "_SUCCESS";
 /// Layout: `<prefix>/_quarantine/<run_id>/<original-name>`.
 pub const QUARANTINE_PREFIX: &str = "_quarantine";
 
+/// `manifest-<sanitized run_id>.json` — the immutable per-run COPY written
+/// beside the canonical [`MANIFEST_FILENAME`]. The canonical name is
+/// last-writer-wins (a pointer to the latest run); consecutive runs into one
+/// prefix would clobber it, so this copy preserves EACH run's manifest for a
+/// consumer that sums row counts across runs. Same run-token sanitizer the
+/// parts use: an RFC3339 run id carries `:`/`+` (illegal on Windows), so map
+/// anything outside `[A-Za-z0-9._-]` to `-`.
+pub fn run_unique_manifest_name(run_id: &str) -> String {
+    let token: String = run_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    format!("manifest-{token}.json")
+}
+
+/// True if `name` (a final path segment) is a [`run_unique_manifest_name`] copy
+/// — a Rivet-internal sidecar the validate/reconcile paths must NOT flag as an
+/// untracked foreign object. Excludes the canonical `manifest.json` (`manifest.`
+/// prefix, not `manifest-`).
+pub fn is_run_unique_manifest_name(name: &str) -> bool {
+    name.starts_with("manifest-") && name.ends_with(".json")
+}
+
 /// Writability probe `rivet doctor` drops at the destination prefix.  It is a
 /// Rivet-internal sidecar (like [`MANIFEST_FILENAME`] / [`SUCCESS_FILENAME`]),
 /// so the manifest-aware `--validate` pass must not flag it as an untracked
@@ -419,6 +448,18 @@ mod tests {
         assert_eq!(MANIFEST_FILENAME, "manifest.json");
         assert_eq!(SUCCESS_FILENAME, "_SUCCESS");
         assert_eq!(QUARANTINE_PREFIX, "_quarantine");
+    }
+
+    #[test]
+    fn run_unique_manifest_name_sanitizes_and_is_recognised() {
+        // A real CLI run id is RFC3339 — `:` and `+` are not filename-safe (`:`
+        // is illegal on Windows), so they map to `-`.
+        let n = run_unique_manifest_name("orders_2026-07-13T12:00:00+00:00");
+        assert_eq!(n, "manifest-orders_2026-07-13T12-00-00-00-00.json");
+        assert!(is_run_unique_manifest_name(&n));
+        // The canonical pointer is NOT a per-run copy (its stem is `manifest.`,
+        // not `manifest-`), so validate/reconcile still treat it distinctly.
+        assert!(!is_run_unique_manifest_name(MANIFEST_FILENAME));
     }
 
     // ── self-consistency ────────────────────────────────────────────────────

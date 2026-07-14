@@ -1,0 +1,33 @@
+# cargo-mutants configuration (docs/mutation-plan.md).
+#
+# `exclude_re` entries are TRIAGED equivalent mutants — mutations that are
+# semantically identical to the original code, so no test can (or should)
+# distinguish them. Every entry carries its reason; adding one without a
+# reason comment is a review defect. Accepted-but-real behaviours (operator
+# UX, log lines) belong in docs/mutants-baseline.txt, not here.
+
+exclude_re = [
+    # 64*1024 is a streaming READ BUFFER size in compute_part_checksums —
+    # any chunking yields byte-identical digests; 64+1024 only changes I/O
+    # granularity. Verified by hand (matrix audit, 2026-07-13).
+    "replace \\* with \\+ in compute_part_checksums",
+    # `scale < 0` vs `scale <= 0` in the decimal str<->scaled converters:
+    # at scale == 0 the negative-scale branch (factor = 10^0 = 1) computes
+    # exactly what the scale_u == 0 fast path returns — branch parity makes
+    # the boundary invisible by construction. The REAL neighbour bug at
+    # `value < 0` (signed zero) is covered by scaled_zero_formats_unsigned.
+    "replace < with <= in scaled_i128_to_decimal_str",
+    "replace < with <= in decimal_str_to_scaled_i128",
+    "replace < with <= in decimal_str_to_scaled_i256",
+    # The optimistic base's `passed: true` in verify_at_destination is
+    # overwritten by recompute_passed() on EVERY exit path (verified by
+    # running the whole module against the deleted-field mutant) — the
+    # initial value is unobservable.
+    "delete field passed from struct ManifestVerification expression in verify_at_destination",
+    # scalar_to_string takes a `tiberius::Row`, which cannot be constructed
+    # outside the driver — its dispatch stubs are unkillable offline. The
+    # value logic was extracted into `numeric_to_display` (unit-tested,
+    # RED-proven); the dispatch itself is live-guarded (query_scalar feeds
+    # min/max bounds exercised by the live planner suites).
+    "replace scalar_to_string -> Option<String>",
+]

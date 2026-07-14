@@ -191,7 +191,9 @@ fn keyset_checkpoint_resume_second_run_captures_only_new_keys() {
         );
         // Distinct millisecond part stamp so a resumed run's parts never clobber
         // the prior run's (run-uniqueness rule).
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
+        // back-to-back sub-second runs must not collide — sleeping here would
+        // mask exactly that regression (matrix audit: sleep-masked class).
     };
 
     // Run 1: exports all 1000, persists high-water key id-001000.
@@ -220,6 +222,14 @@ fn keyset_checkpoint_resume_second_run_captures_only_new_keys() {
     assert_eq!(
         keys3, expected,
         "the union of all runs must equal the full source key set"
+    );
+    // `read_uid_set` is a parquet re-read; assert the dest manifest COPIES
+    // (`manifest-<run>.json`, reconcile's artifact) span every run — a resumed
+    // run clobbering a prior manifest is silent to the parquet re-read.
+    assert_eq!(
+        dir_manifest_copy_total_rows(out_dir.path()),
+        1500,
+        "run-unique manifest copies must sum run 1 (1000) + run 3 (500); a clobbered manifest is silent to the parquet re-read"
     );
 }
 
@@ -440,7 +450,9 @@ fn keyset_checkpoint_resume_pg_second_run_captures_only_new_keys() {
             "{label} failed; stderr:\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
+        // back-to-back sub-second runs must not collide — sleeping here would
+        // mask exactly that regression (matrix audit: sleep-masked class).
     };
 
     run("run 1");
@@ -468,6 +480,12 @@ fn keyset_checkpoint_resume_pg_second_run_captures_only_new_keys() {
     assert_eq!(
         keys3, expected,
         "union of all runs equals the full source key set"
+    );
+    // Dest manifest copies (reconcile's artifact), not just the parquet re-read.
+    assert_eq!(
+        dir_manifest_copy_total_rows(out_dir.path()),
+        1200,
+        "run-unique manifest copies must sum run 1 (800) + run 3 (400); a clobbered manifest is silent to the parquet re-read"
     );
 }
 
@@ -521,7 +539,9 @@ fn keyset_checkpoint_resume_mssql_second_run_captures_only_new_keys() {
             "{label} failed; stderr:\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
+        // back-to-back sub-second runs must not collide — sleeping here would
+        // mask exactly that regression (matrix audit: sleep-masked class).
     };
 
     run("run 1");
@@ -549,6 +569,12 @@ fn keyset_checkpoint_resume_mssql_second_run_captures_only_new_keys() {
     assert_eq!(
         keys3, expected,
         "union of all runs equals the full source key set"
+    );
+    // Dest manifest copies (reconcile's artifact), not just the parquet re-read.
+    assert_eq!(
+        dir_manifest_copy_total_rows(out_dir.path()),
+        1500,
+        "run-unique manifest copies must sum run 1 (1000) + run 3 (500); a clobbered manifest is silent to the parquet re-read"
     );
 }
 

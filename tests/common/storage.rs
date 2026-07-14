@@ -62,6 +62,86 @@ pub fn ensure_gcs_bucket(bucket: &str) {
     );
 }
 
+/// Download every `.parquet` under `bucket/prefix` from MinIO (via `mc cat`
+/// inside the container) and sum their row counts — the independent oracle an
+/// "all rows" claim on an S3 destination needs. An `mc ls | wc -l` file count
+/// proves presence, not content (matrix audit: wrong-artifact class).
+pub fn minio_parquet_total_rows(bucket: &str, prefix: &str) -> usize {
+    // List at BUCKET level: `mc ls` prints names relative to the listed path,
+    // and that differs between a directory-style prefix (`prefix/file`) and
+    // rivet's string-style concatenation (`prefixfile`). Bucket-level names are
+    // always full keys; filter by prefix ourselves.
+    let ls_script = format!(
+        "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
+         mc ls --recursive local/{bucket} 2>/dev/null"
+    );
+    let ls = Command::new("docker")
+        .args(["compose", "exec", "-T", "minio", "sh", "-c", &ls_script])
+        .output()
+        .expect("mc ls");
+    assert!(ls.status.success(), "mc ls failed");
+    let mut total = 0usize;
+    for line in String::from_utf8_lossy(&ls.stdout).lines() {
+        // `mc ls` line: `[date] [time TZ] [size] [class] name` — name is last,
+        // and for a STRING prefix (rivet concatenates `{prefix}{file}`, no `/`)
+        // it is the full BUCKET-relative key, so cat under the bucket, not the
+        // prefix (double-prefixing 404s).
+        let Some(name) = line.split_whitespace().last() else {
+            continue;
+        };
+        if !name.starts_with(prefix) || !name.ends_with(".parquet") {
+            continue;
+        }
+        let cat_script = format!(
+            "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
+             mc cat local/{bucket}/{name}"
+        );
+        let cat = Command::new("docker")
+            .args(["compose", "exec", "-T", "minio", "sh", "-c", &cat_script])
+            .output()
+            .expect("mc cat");
+        assert!(cat.status.success(), "mc cat {name} failed");
+        total += super::parquet_rows_from_bytes(cat.stdout);
+    }
+    total
+}
+
+/// Same independent oracle for fake-gcs: list the objects via the JSON API,
+/// then `GET ?alt=media` each `.parquet` and sum the row counts.
+pub fn fake_gcs_parquet_total_rows(bucket: &str, prefix: &str) -> usize {
+    use std::io::{Read, Write};
+    let http = |req: String| -> Vec<u8> {
+        let mut s = TcpStream::connect("127.0.0.1:4443").expect("connect fake-gcs");
+        s.write_all(req.as_bytes()).expect("write fake-gcs req");
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf);
+        // Strip the HTTP/1.0 header block: body starts after the first CRLFCRLF.
+        let sep = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("http header separator");
+        buf.split_off(sep + 4)
+    };
+    let list = http(format!(
+        "GET /storage/v1/b/{bucket}/o?prefix={prefix} HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    ));
+    let list: serde_json::Value = serde_json::from_slice(&list).expect("fake-gcs list JSON");
+    let mut total = 0usize;
+    for item in list["items"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+        let name = item["name"].as_str().expect("object name");
+        if !name.ends_with(".parquet") {
+            continue;
+        }
+        // Object names carry `/`; the JSON API path wants them %2F-escaped.
+        let escaped = name.replace('/', "%2F");
+        let bytes = http(format!(
+            "GET /storage/v1/b/{bucket}/o/{escaped}?alt=media HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        ));
+        total += super::parquet_rows_from_bytes(bytes);
+    }
+    total
+}
+
 /// Idempotently create `container` in the local Azurite emulator via the `az`
 /// CLI + the well-known dev connection string, with CONTAINER-level public
 /// read access. opendal's Azblob backend does not create the container, so

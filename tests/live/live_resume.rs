@@ -133,6 +133,17 @@ fn full_mode_repeated_run_accumulates_manifest_entries() {
         (0..10).collect::<std::collections::BTreeSet<i64>>(),
         "full re-export must hold every source id (0..10)"
     );
+    // The parquet re-read above passes even if the manifest sidecar clobbered.
+    // Assert the dest manifest COPIES (`manifest-<run>.json`, what reconcile / a
+    // warehouse autoloader read) sum BOTH runs: pre-fix a shared prefix held one
+    // clobbered `manifest.json` (last run's rows only) → RED. This is the oracle
+    // the cell's name ("accumulates manifest entries") demands — and it is
+    // fix-sensitive, unlike the `file_log` ledger which accumulates regardless.
+    assert_eq!(
+        dir_manifest_copy_total_rows(out.path()),
+        20,
+        "run-unique manifest copies must sum both runs' rows; a clobbered manifest is silent to the parquet re-read"
+    );
 }
 
 #[test]
@@ -191,6 +202,15 @@ fn roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts() 
         dir_parquet_id_set(out.path()),
         (0..N).collect::<std::collections::BTreeSet<i64>>(),
         "every incremental delta must survive; a clobbered part is silent data loss"
+    );
+    // Data survival above is a proxy: a manifest clobber leaves the parquet but
+    // loses the sidecar a warehouse autoloader reads. Sum the dest manifest
+    // copies — N rapid runs, 1 row each → N. Pre-fix the shared prefix held one
+    // clobbered manifest → RED.
+    assert_eq!(
+        dir_manifest_copy_total_rows(out.path()),
+        N,
+        "run-unique manifest copies must sum every rapid run's row; a clobbered manifest is silent to the parquet re-read"
     );
 }
 
@@ -306,7 +326,9 @@ fn incremental_third_run_picks_up_newly_inserted_rows() {
 
     // Sleep so file-name timestamp is distinct from run #1 (see
     // full_mode_repeated_run_accumulates_manifest_entries for rationale).
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
+    // back-to-back sub-second runs must not collide — sleeping here would
+    // mask exactly that regression (matrix audit: sleep-masked class).
 
     // Run #2 — must pick up rows 6..10.
     assert!(run_rivet_export(&cfg, &export_name).status.success());
@@ -586,7 +608,9 @@ fn incremental_manifest_ships_contiguous_cursor_range() {
         "INSERT INTO {table_name} SELECT g, g*10 FROM generate_series(4,7) g;"
     ))
     .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
+    // back-to-back sub-second runs must not collide — sleeping here would
+    // mask exactly that regression (matrix audit: sleep-masked class).
     assert!(run_rivet_export(&cfg, &export_name).status.success());
     let e2 = read_ex();
     assert_eq!(

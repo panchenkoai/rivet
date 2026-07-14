@@ -913,6 +913,39 @@ mod tests {
         assert!(sparse_chunk_action(40, None, 100_000).is_none());
     }
 
+    // ── mutation-W4 boundary rows ────────────────────────────────────────────
+    // Every surviving mutant sat ON a threshold the tests jumped over. This is
+    // the CLAUDE.md sparse-key WARN rule's own guard: a `<` -> `<=` here
+    // silences the warning at exactly the documented floor.
+    #[test]
+    fn sparse_thresholds_are_exact() {
+        // chunk_count == SPARSE_WARN_MIN_CHUNKS (64) is the FIRST flaggable
+        // count: 64 windows for 10 rows is grossly sparse and must Bail.
+        assert!(
+            sparse_chunk_action(64, Some(10), 100_000).is_some(),
+            "exactly-at-floor sparse plan must flag (`<`, not `<=`)"
+        );
+        // A zero row estimate is NOT proof of density — it degrades to the
+        // no-estimate branch (silent at 64, needs the 1000 floor).
+        assert!(sparse_chunk_action(64, Some(0), 100_000).is_none());
+        // Exactly 4x the dense window count is the first provable blow-up:
+        // 100k rows / 1k = 100 dense windows; 400 actual must Bail…
+        assert!(sparse_chunk_action(400, Some(100_000), 1_000).is_some());
+        // …399 is "roughly dense" and stays silent.
+        assert!(sparse_chunk_action(399, Some(100_000), 1_000).is_none());
+        // The Bail message quantifies avg rows/window EXACTLY (rows / count):
+        // 100k rows over 400 windows = 250 — kills `/` -> `*` in the avg.
+        match sparse_chunk_action(400, Some(100_000), 1_000).unwrap() {
+            SparseAction::Bail(m) => {
+                assert!(m.contains("~250 rows/window"), "avg must be exact: {m}")
+            }
+            SparseAction::Warn(m) => panic!("provable blow-up must bail: {m}"),
+        }
+        // No estimate: exactly 1000 windows is the first warnable count.
+        assert!(sparse_chunk_action(1000, None, 100_000).is_some());
+        assert!(sparse_chunk_action(999, None, 100_000).is_none());
+    }
+
     #[test]
     fn chunk_count_larger_than_range_caps_at_range_size() {
         // min=1, max=5 (5 values), chunk_count=100 → chunk_size=1 → 5 chunks

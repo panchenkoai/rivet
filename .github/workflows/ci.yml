@@ -131,6 +131,41 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
 
+  # Mutation PR gate (docs/mutation-plan.md): mutate ONLY the lines this PR
+  # changed and run the lib suite against each mutant. A missed mutant in your
+  # own diff = your new code has an assertion gap — fail here, in minutes,
+  # instead of surfacing in the nightly tier runs. Equivalent mutants are
+  # excluded via .cargo/mutants.toml (with reasons).
+  mutants-in-diff:
+    name: Mutants (changed lines)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    # First live run: 52 mutants took 42m on the 2-core runner (cold baseline
+    # build 270s + ~80s/mutant) — 45m was one flaky rebuild away from a
+    # spurious timeout on a large PR.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mutants
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+      - name: Mutate the PR diff
+        env:
+          # Mutants never need debuginfo — halves build dirs, speeds links.
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: |
+          git diff "origin/${{ github.base_ref }}"...HEAD > pr.diff
+          # Exit code 2 = missed mutants (the gate's failure); 0 = all caught
+          # or nothing to mutate in this diff.
+          cargo mutants --in-diff pr.diff -j 2 -- --lib
+
   test:
     name: Tests
     runs-on: ubuntu-latest

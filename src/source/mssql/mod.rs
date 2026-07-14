@@ -951,6 +951,24 @@ fn emit_mssql_batch(
     Ok(0)
 }
 
+/// Render a T-SQL `NUMERIC` as exact decimal text: the unscaled value with a
+/// decimal point inserted at `scale` (zero-padded so `(5, scale 3)` is
+/// `"0.005"`, not `".5"`). Extracted from the `ColumnData::Numeric` arm so the
+/// digit arithmetic is unit-testable — `tiberius::Row` cannot be constructed
+/// outside the driver, and the W4 mutation run showed the split/pad arithmetic
+/// unguarded.
+fn numeric_to_display(raw: i128, scale: usize) -> String {
+    if scale == 0 {
+        raw.to_string()
+    } else {
+        let neg = raw < 0;
+        let digits = raw.unsigned_abs().to_string();
+        let digits = format!("{digits:0>width$}", width = scale + 1);
+        let (int, frac) = digits.split_at(digits.len() - scale);
+        format!("{}{int}.{frac}", if neg { "-" } else { "" })
+    }
+}
+
 /// Render a row's first column as a display string for `query_scalar`
 /// (min/max bounds, COUNT(*), SELECT 1). Covers the scalar shapes the planner
 /// asks for; richer typing flows through the export path, not here.
@@ -966,20 +984,7 @@ fn scalar_to_string(row: &tiberius::Row) -> Option<String> {
         ColumnData::F64(v) => v.map(|x| x.to_string()),
         ColumnData::Bit(v) => v.map(|x| x.to_string()),
         ColumnData::String(v) => v.as_ref().map(|s| s.to_string()),
-        ColumnData::Numeric(v) => v.map(|n| {
-            // unscaled value with an inserted decimal point at `scale`.
-            let raw = n.value();
-            let scale = n.scale() as usize;
-            if scale == 0 {
-                raw.to_string()
-            } else {
-                let neg = raw < 0;
-                let digits = raw.unsigned_abs().to_string();
-                let digits = format!("{digits:0>width$}", width = scale + 1);
-                let (int, frac) = digits.split_at(digits.len() - scale);
-                format!("{}{int}.{frac}", if neg { "-" } else { "" })
-            }
-        }),
+        ColumnData::Numeric(v) => v.map(|n| numeric_to_display(n.value(), n.scale() as usize)),
         ColumnData::Guid(v) => v.map(|g| g.to_string()),
         // Date/time: the Debug fallback rendered these as `Date(Some(Date(738520)))`,
         // which `scalar::parse_date_flexible` (chunk_by_days / date-keyset min/max)
@@ -1110,10 +1115,80 @@ pub(crate) fn introspect_mssql_table_for_chunking(
 
 #[cfg(test)]
 mod tests {
-    use super::{catalog_decimal_to_params, parse_mssql_simple_from_table};
+    use super::{
+        catalog_decimal_to_params, mssql_find_outer_from_keyword, parse_mssql_simple_from_table,
+        sql_keyword_at,
+    };
 
     fn parse(q: &str) -> Option<(String, String)> {
         parse_mssql_simple_from_table(q)
+    }
+
+    // ── mutation-W4 gap closure ──────────────────────────────────────────────
+    // 18 mutants survived in the FROM-finder (quote escapes, paren depth,
+    // identifier boundaries) — no direct test existed. A mis-found FROM feeds
+    // the table extraction for catalog lookups; golden byte OFFSETS pin the
+    // arithmetic, tricky shapes pin the state machine.
+    #[test]
+    fn outer_from_finder_golden_offsets() {
+        let f = mssql_find_outer_from_keyword;
+        // Exact offset (kills index arithmetic): "SELECT a " = 9 bytes.
+        assert_eq!(f("SELECT a FROM t"), Some(9));
+        // Case-insensitive.
+        assert_eq!(f("select a frOm t"), Some(9));
+        // Subquery FROM is nested — only the outer one counts.
+        let q = "SELECT (SELECT x FROM i) FROM t";
+        assert_eq!(f(q), Some(q.rfind("FROM").unwrap()));
+        // 'from' inside a string literal is skipped…
+        let q = "SELECT 'from' FROM t";
+        assert_eq!(f(q), Some(q.rfind("FROM").unwrap()));
+        // …including with a doubled-quote escape swallowing a fake closer.
+        let q = "SELECT 'it''s from x' FROM t";
+        assert_eq!(f(q), Some(q.rfind("FROM").unwrap()));
+        // Escape-skip arithmetic: with a long prefix the escape index i has
+        // 2*i PAST the string end, so an `i += 2` -> `i *= 2` mutant runs off
+        // the buffer and returns None (short fixtures let 2*i coincidentally
+        // land back on the closing quote — the fixture must break the
+        // coincidence, not rely on it).
+        let q = "SELECT aaaaaaaaaaaaaaaaaaaaaaaaaaaa, 'it''s' FROM t";
+        assert!(2 * q.find("''").unwrap() > q.len(), "fixture invariant");
+        assert_eq!(f(q), Some(q.rfind("FROM").unwrap()));
+        // Identifier boundaries: neither `a_from` nor `fromage` match.
+        let q = "SELECT a_from, fromage FROM t";
+        assert_eq!(f(q), Some(q.rfind("FROM").unwrap()));
+        // Unbalanced-close before FROM must not underflow depth below zero and
+        // hide the keyword.
+        assert_eq!(f(") FROM t"), Some(2));
+        // No FROM at all.
+        assert_eq!(f("SELECT 1"), None);
+        // FROM stuck inside parens only -> nested, not outer.
+        assert_eq!(f("SELECT (x FROM t)"), None);
+    }
+
+    #[test]
+    fn numeric_display_inserts_the_point_exactly() {
+        // W4: the split/pad arithmetic (digits.len() - scale, width scale+1)
+        // had no direct test. Goldens over the tricky shapes: sub-1 values
+        // needing zero-pad, negatives, scale 0.
+        use super::numeric_to_display as n;
+        assert_eq!(n(12345, 2), "123.45");
+        assert_eq!(n(5, 3), "0.005", "zero-pad below 1");
+        assert_eq!(n(-12345, 2), "-123.45");
+        assert_eq!(n(-5, 3), "-0.005");
+        assert_eq!(n(42, 0), "42", "scale 0 is the bare integer");
+        assert_eq!(n(0, 2), "0.00");
+        assert_eq!(n(10, 1), "1.0");
+    }
+
+    #[test]
+    fn keyword_at_checks_both_identifier_boundaries() {
+        let k = |h: &str, i: usize| sql_keyword_at(h.as_bytes(), i, b"from");
+        assert!(k("from t", 0), "start of string is a boundary");
+        assert!(k("x from", 2), "end of string is a boundary");
+        assert!(!k("xfrom t", 1), "preceded by an identifier byte");
+        assert!(!k("from_x", 0), "followed by an identifier byte");
+        assert!(!k("fro", 0), "keyword longer than the remaining haystack");
+        assert!(k("x FROM y", 2), "case-insensitive");
     }
 
     #[test]
