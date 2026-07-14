@@ -116,6 +116,35 @@ fn smoke_cdc_mysql() {
 }
 
 #[test]
+#[ignore = "live smoke: postgres cdc soak → BigQuery"]
+fn smoke_cdc_pg() {
+    let v = Verification::new(Engine::Postgres, Mode::Cdc, Fixture::smoke("content_items"));
+    assert_all_pass(
+        v.run_soak(
+            &SoakConfig::quick(),
+            &[WarehouseOracle::TypeFidelity],
+            &[SoakOracle::FlatRss, SoakOracle::ZeroGap],
+        )
+        .expect("soak"),
+    );
+}
+
+#[test]
+#[ignore = "live smoke: postgres cdc soak → Snowflake"]
+fn smoke_cdc_pg_snowflake() {
+    let v = Verification::new(Engine::Postgres, Mode::Cdc, Fixture::smoke("content_items"))
+        .warehouse(Warehouse::Snowflake);
+    assert_all_pass(
+        v.run_soak(
+            &SoakConfig::quick(),
+            &[WarehouseOracle::TypeFidelity],
+            &[SoakOracle::FlatRss, SoakOracle::ZeroGap],
+        )
+        .expect("soak"),
+    );
+}
+
+#[test]
 #[ignore = "live smoke: mysql cdc soak → Snowflake"]
 fn smoke_cdc_mysql_snowflake() {
     let v = Verification::new(Engine::Mysql, Mode::Cdc, Fixture::smoke("content_items"))
