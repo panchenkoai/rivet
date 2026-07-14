@@ -951,6 +951,24 @@ fn emit_mssql_batch(
     Ok(0)
 }
 
+/// Render a T-SQL `NUMERIC` as exact decimal text: the unscaled value with a
+/// decimal point inserted at `scale` (zero-padded so `(5, scale 3)` is
+/// `"0.005"`, not `".5"`). Extracted from the `ColumnData::Numeric` arm so the
+/// digit arithmetic is unit-testable — `tiberius::Row` cannot be constructed
+/// outside the driver, and the W4 mutation run showed the split/pad arithmetic
+/// unguarded.
+fn numeric_to_display(raw: i128, scale: usize) -> String {
+    if scale == 0 {
+        raw.to_string()
+    } else {
+        let neg = raw < 0;
+        let digits = raw.unsigned_abs().to_string();
+        let digits = format!("{digits:0>width$}", width = scale + 1);
+        let (int, frac) = digits.split_at(digits.len() - scale);
+        format!("{}{int}.{frac}", if neg { "-" } else { "" })
+    }
+}
+
 /// Render a row's first column as a display string for `query_scalar`
 /// (min/max bounds, COUNT(*), SELECT 1). Covers the scalar shapes the planner
 /// asks for; richer typing flows through the export path, not here.
@@ -966,20 +984,7 @@ fn scalar_to_string(row: &tiberius::Row) -> Option<String> {
         ColumnData::F64(v) => v.map(|x| x.to_string()),
         ColumnData::Bit(v) => v.map(|x| x.to_string()),
         ColumnData::String(v) => v.as_ref().map(|s| s.to_string()),
-        ColumnData::Numeric(v) => v.map(|n| {
-            // unscaled value with an inserted decimal point at `scale`.
-            let raw = n.value();
-            let scale = n.scale() as usize;
-            if scale == 0 {
-                raw.to_string()
-            } else {
-                let neg = raw < 0;
-                let digits = raw.unsigned_abs().to_string();
-                let digits = format!("{digits:0>width$}", width = scale + 1);
-                let (int, frac) = digits.split_at(digits.len() - scale);
-                format!("{}{int}.{frac}", if neg { "-" } else { "" })
-            }
-        }),
+        ColumnData::Numeric(v) => v.map(|n| numeric_to_display(n.value(), n.scale() as usize)),
         ColumnData::Guid(v) => v.map(|g| g.to_string()),
         // Date/time: the Debug fallback rendered these as `Date(Some(Date(738520)))`,
         // which `scalar::parse_date_flexible` (chunk_by_days / date-keyset min/max)
@@ -1158,6 +1163,21 @@ mod tests {
         assert_eq!(f("SELECT 1"), None);
         // FROM stuck inside parens only -> nested, not outer.
         assert_eq!(f("SELECT (x FROM t)"), None);
+    }
+
+    #[test]
+    fn numeric_display_inserts_the_point_exactly() {
+        // W4: the split/pad arithmetic (digits.len() - scale, width scale+1)
+        // had no direct test. Goldens over the tricky shapes: sub-1 values
+        // needing zero-pad, negatives, scale 0.
+        use super::numeric_to_display as n;
+        assert_eq!(n(12345, 2), "123.45");
+        assert_eq!(n(5, 3), "0.005", "zero-pad below 1");
+        assert_eq!(n(-12345, 2), "-123.45");
+        assert_eq!(n(-5, 3), "-0.005");
+        assert_eq!(n(42, 0), "42", "scale 0 is the bare integer");
+        assert_eq!(n(0, 2), "0.00");
+        assert_eq!(n(10, 1), "1.0");
     }
 
     #[test]

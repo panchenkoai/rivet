@@ -805,6 +805,20 @@ mod tests {
         assert!(catalog_numeric_to_decimal_params(0, 2).is_none());
         assert!(catalog_numeric_to_decimal_params(77, 0).is_none());
         assert!(catalog_numeric_to_decimal_params(18, 19).is_none());
+        // W4 boundary rows — the mutants lived exactly ON the bounds:
+        // precision 76 is the LAST valid (a `> 76` -> `>= 76` mutant rejects it);
+        assert_eq!(catalog_numeric_to_decimal_params(76, 0), Some((76, 0)));
+        // scale == precision is valid (`>` not `>=` on the third check);
+        assert_eq!(catalog_numeric_to_decimal_params(18, 18), Some((18, 18)));
+        // scale == i8::MIN is the last valid negative;
+        assert_eq!(
+            catalog_numeric_to_decimal_params(10, -128),
+            Some((10, -128))
+        );
+        assert!(catalog_numeric_to_decimal_params(10, -129).is_none());
+        // an `|| -> &&` mutant on the range check lets scale=200 reach the
+        // `as i8` cast, wrapping to -56 and CORRUPTING the params silently.
+        assert!(catalog_numeric_to_decimal_params(76, 200).is_none());
     }
 
     #[test]
@@ -822,5 +836,17 @@ mod tests {
         assert_eq!(parse_work_mem("garbage"), None);
         // We don't accept seconds / units PG would never emit for work_mem.
         assert_eq!(parse_work_mem("4s"), None);
+        // W4: the TB arm and the zero guard had no rows — deleting the "tb"
+        // arm and every `*` in its multiplier survived.
+        assert_eq!(
+            parse_work_mem("2TB"),
+            Some(2 * 1024 * 1024 * 1024 * 1024),
+            "terabytes are 1024^4"
+        );
+        // Fractional values exercise the float multiply exactly.
+        assert_eq!(parse_work_mem("0.5MB"), Some(512 * 1024));
+        // Zero is rejected (`> 0`, not `>= 0`) — callers fall back.
+        assert_eq!(parse_work_mem("0"), None);
+        assert_eq!(parse_work_mem("0MB"), None);
     }
 }
