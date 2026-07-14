@@ -207,6 +207,42 @@ pub enum Commands {
         #[arg(long)]
         until_current: bool,
     },
+    /// Load an export's Parquet into a warehouse (BigQuery / Snowflake)
+    ///
+    /// The native column schema, target table, partition, and source URIs are
+    /// all derived from the config's top-level `load:` block — nothing is
+    /// hand-typed. A multi-table config loads every export into the shared
+    /// target, one after another.
+    Load {
+        /// Path to YAML config file — extraction PLUS a top-level `load:` block
+        /// (target + cleanup). ONE file drives both the export and the load.
+        #[arg(short = 'c', long)]
+        config: String,
+        /// Path to the `rivet` binary used for the type-report subprocess.
+        #[arg(long, default_value = "rivet")]
+        rivet_bin: String,
+        /// Correlation id stamped on every warehouse job/query of this load run
+        /// (BigQuery `rivet_run` label / Snowflake `QUERY_TAG`), so cost slices
+        /// per run as well as per table. Defaults to a generated id.
+        #[arg(long, env = "RIVET_RUN_ID")]
+        run_id: Option<String>,
+        /// Load even when a run manifest's source count disagrees with what it
+        /// extracted (source→file drift): print a warning instead of blocking.
+        /// The file→warehouse count gate and manifest gates still apply.
+        #[arg(long)]
+        allow_source_drift: bool,
+        /// Load a CDC change log instead of a batch snapshot: append the change
+        /// Parquet into `<table>__changes` and (re)build the current-state dedup
+        /// view `<table>` over it. Requires `--pk`. The source engine (for the
+        /// `__pos` parse) is read from the config.
+        #[arg(long)]
+        cdc: bool,
+        /// The change log's primary key column(s) — the dedup view's partition
+        /// key. Required with `--cdc`. Comma-separated for a composite key,
+        /// e.g. `--pk tenant,id`.
+        #[arg(long, value_delimiter = ',')]
+        pk: Vec<String>,
+    },
     /// Manage export state
     State {
         #[command(subcommand)]

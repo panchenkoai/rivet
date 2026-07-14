@@ -16,7 +16,7 @@ use super::params::{parse_params, resolve_init_source};
 use super::validate::validate_cli;
 use crate::config::Config;
 use crate::error::Result;
-use crate::{init, pipeline, preflight};
+use crate::{init, load, pipeline, preflight};
 
 /// Validate a `--export <name>` selection against the loaded config and, on a
 /// miss, bail with the sorted list of declared export names — so a typo
@@ -117,6 +117,21 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             slot,
             capture_instance,
             until_current,
+        }),
+        Commands::Load {
+            config,
+            rivet_bin,
+            run_id,
+            allow_source_drift,
+            cdc,
+            pk,
+        } => dispatch_load(LoadArgs {
+            config,
+            rivet_bin,
+            run_id,
+            allow_source_drift,
+            cdc,
+            pk,
         }),
         Commands::Init {
             source,
@@ -666,4 +681,151 @@ fn dispatch_state(action: StateAction) -> Result<()> {
             pipeline::show_progression(&config, export.as_deref())
         }
     }
+}
+
+struct LoadArgs {
+    config: String,
+    rivet_bin: String,
+    run_id: Option<String>,
+    allow_source_drift: bool,
+    cdc: bool,
+    pk: Vec<String>,
+}
+
+/// `rivet load`: config-driven warehouse load. The top-level `load:` block
+/// declares the target once, and each export resolves to a table. A multi-table
+/// config loads every export into the shared target, one after another.
+fn dispatch_load(args: LoadArgs) -> Result<()> {
+    let plans = load::plan::plan_loads(&args.config, &args.rivet_bin)?;
+    // One run id for the whole invocation, shared across every table — so warehouse
+    // cost slices per load run (all tables together) as well as per table.
+    let run_id = args.run_id.clone().unwrap_or_else(generate_run_id);
+    let tables: Vec<&str> = plans.iter().map(|p| p.table.as_str()).collect();
+    eprintln!(
+        "{}: resolved {} table(s) → {} [run_id={}]: {}",
+        args.config,
+        plans.len(),
+        plans.first().map(|p| p.load.target.name()).unwrap_or("?"),
+        run_id,
+        tables.join(", ")
+    );
+
+    if args.cdc {
+        if args.pk.is_empty() {
+            anyhow::bail!(
+                "`--cdc` needs `--pk <col>[,<col>]` — the change log's primary key for the dedup view"
+            );
+        }
+        let engine = load::plan::source_engine(&args.config)?;
+        for plan in &plans {
+            let report = load_one_cdc(plan, &run_id, engine, &args.pk, args.allow_source_drift)?;
+            println!("CDC LOAD OK [{}]: {report:#?}", plan.table);
+        }
+        return Ok(());
+    }
+
+    for plan in &plans {
+        let report = load_one(plan, &run_id, args.allow_source_drift)?;
+        println!("LOAD OK [{}]: {report:#?}", plan.table);
+    }
+    Ok(())
+}
+
+/// Load a single export's CDC change log: reconcile the run manifests, **append**
+/// the change Parquet into `<table>__changes`, and rebuild the current-state
+/// dedup view over it. The manifests' summed `row_count` gates the rows *this*
+/// load appends (before/after the append) — the file→warehouse leg for an
+/// accumulating, at-least-once log.
+fn load_one_cdc(
+    plan: &load::plan::LoadPlan,
+    run_id: &str,
+    engine: load::cdc::SourceEngine,
+    pk: &[String],
+    allow_source_drift: bool,
+) -> Result<load::CdcLoadReport> {
+    let manifests = load::reconcile::fetch_manifests(&plan.gcs_prefix)?;
+    let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
+    let uris = load::plan::list_gcs_uris(&plan.gcs_prefix)?;
+    eprintln!(
+        "  cdc load {} → {} | engine={:?} pk={} manifests={} parquet_files={} expected_delta={}",
+        plan.table,
+        plan.load.target.name(),
+        engine,
+        pk.join(","),
+        integrity.manifests,
+        uris.len(),
+        integrity.file_rows,
+    );
+    // build_loader's batch `expected_rows` gate does not fit an accumulating
+    // log, so pass `None`; `load_cdc` enforces the append delta itself.
+    let report = load::build_loader(plan, run_id, None).load_cdc(
+        &plan.table,
+        &plan.specs,
+        &uris,
+        pk,
+        engine,
+        Some(integrity.file_rows),
+    )?;
+    eprintln!(
+        "  integrity ✓ {} → appended {} to {}",
+        integrity.chain_prefix(),
+        report.rows_appended,
+        report.changes_table,
+    );
+    Ok(report)
+}
+
+/// Load a single resolved table into its warehouse target, reconciling
+/// **source → file → warehouse** row counts end-to-end.
+///
+/// The run manifests under the export prefix are the file-side source of truth:
+/// they must describe a complete, self-consistent `Success` export, and their
+/// summed `row_count` becomes the loader's `expected_rows` gate — so the load
+/// `bail!`s unless the warehouse `COUNT(*)` matches. Loading unverified Parquet
+/// "because it's in the bucket" is exactly what this prevents.
+fn load_one(
+    plan: &load::plan::LoadPlan,
+    run_id: &str,
+    allow_source_drift: bool,
+) -> Result<load::LoadReport> {
+    let manifests = load::reconcile::fetch_manifests(&plan.gcs_prefix)?;
+    let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
+    let uris = load::plan::list_gcs_uris(&plan.gcs_prefix)?;
+    eprintln!(
+        "  load {} → {} | columns={} partition={:?} manifests={} parquet_files={} expected_rows={}",
+        plan.table,
+        plan.load.target.name(),
+        plan.specs.len(),
+        plan.partition_by,
+        integrity.manifests,
+        uris.len(),
+        integrity.file_rows,
+    );
+    let report = load::build_loader(plan, run_id, Some(integrity.file_rows)).load(
+        &plan.table,
+        &plan.specs,
+        &uris,
+    )?;
+    // The full chain, now that the warehouse leg is known. The loader already
+    // proved `warehouse == file` (its count gate) before returning, so this is
+    // an all-green trace, not an unchecked assertion.
+    eprintln!(
+        "  integrity ✓ {} → warehouse {}",
+        integrity.chain_prefix(),
+        report.rows_loaded
+    );
+    Ok(report)
+}
+
+/// A per-invocation load-run id: microsecond-since-epoch hex + zero-padded pid
+/// hex. Pure lowercase hex, so it survives both BigQuery's `[a-z0-9_-]` label
+/// charset and Snowflake's alphanumeric `QUERY_TAG` sanitizer unchanged — the
+/// same id reads back identically from either warehouse's cost views.
+fn generate_run_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros())
+        .unwrap_or(0);
+    format!("{micros:x}{:08x}", std::process::id())
 }

@@ -10,6 +10,12 @@ mod error;
 mod format;
 mod init;
 mod journal;
+// The load layer is a `pub` library API; the thin `rivet load` CLI path exercises
+// only part of it, so the loader's builder methods / report fields read back from
+// cost views are dead *in the binary* while live in the library. Allow it here so
+// the public API stays intact without a binary-only dead-code warning.
+#[allow(dead_code)]
+mod load;
 mod manifest;
 mod notify;
 mod pipeline;
