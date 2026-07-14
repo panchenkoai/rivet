@@ -375,6 +375,259 @@ mod tests {
     use super::*;
     use crate::state::ChunkTaskInfo;
 
+    // ── mutation-tier2 gap closure ───────────────────────────────────────────
+    // `apply_m8_resume_decisions` — the resume-decision CORE (skip / rewrite /
+    // quarantine per part) — had 38 missed mutants: even stubbing the whole
+    // function to `Ok(Default::default())` survived, because no test drove the
+    // full flow (real local destination + state + manifest). A wrong skip is a
+    // silently missing part; a wrong rewrite is duplicates.
+
+    fn m8_manifest(run_id: &str, parts: Vec<crate::manifest::ManifestPart>) -> RunManifest {
+        use crate::manifest::{ManifestDestination, ManifestSource, ManifestStatus};
+        let row_count = parts.iter().map(|p| p.rows).sum();
+        let part_count = parts.len() as u32;
+        RunManifest {
+            mode: "batch".to_string(),
+            manifest_version: crate::manifest::MANIFEST_VERSION,
+            run_id: run_id.into(),
+            export_name: "orders".into(),
+            started_at: "2026-07-14T00:00:00Z".into(),
+            finished_at: "2026-07-14T00:01:00Z".into(),
+            status: ManifestStatus::Success,
+            source: ManifestSource {
+                engine: "postgres".into(),
+                schema: None,
+                table: Some("orders".into()),
+                extraction: None,
+            },
+            destination: ManifestDestination {
+                kind: "local".into(),
+                uri: "file:///tmp/out/".into(),
+            },
+            format: "parquet".into(),
+            compression: "zstd".into(),
+            schema_fingerprint: "xxh3:00000000deadbeef".into(),
+            row_count,
+            part_count,
+            parts,
+            column_checksums: None,
+            checksum_key_column: None,
+        }
+    }
+
+    fn m8_part(path: &str, rows: i64, size: u64) -> crate::manifest::ManifestPart {
+        crate::manifest::ManifestPart {
+            part_id: 0, // ids are irrelevant to the M8 path match; keep distinct below
+            path: path.into(),
+            rows,
+            size_bytes: size,
+            content_fingerprint: "xxh3:1".into(),
+            content_md5: String::new(),
+            status: crate::manifest::PartStatus::Committed,
+        }
+    }
+
+    fn m8_plan(dest: &std::path::Path) -> crate::plan::ResolvedRunPlan {
+        use crate::config::{DestinationConfig, DestinationType, SourceConfig, SourceType};
+        use crate::tuning::SourceTuning;
+        crate::plan::ResolvedRunPlan {
+            export_name: "orders".into(),
+            base_query: "SELECT 1".into(),
+            strategy: crate::plan::ExtractionStrategy::Snapshot,
+            format: crate::config::FormatType::Parquet,
+            compression: crate::config::CompressionType::None,
+            compression_level: None,
+            max_file_size_bytes: None,
+            skip_empty: false,
+            meta_columns: Default::default(),
+            destination: DestinationConfig {
+                destination_type: DestinationType::Local,
+                path: Some(dest.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            quality: None,
+            tuning: SourceTuning::from_config(None),
+            tuning_profile_label: "balanced".into(),
+            validate: false,
+            reconcile: false,
+            resume: true,
+            source: SourceConfig {
+                source_type: SourceType::Postgres,
+                url: Some("postgresql://nobody@127.0.0.1:9999/nonexistent".into()),
+                url_env: None,
+                url_file: None,
+                host: None,
+                port: None,
+                user: None,
+                password: None,
+                password_env: None,
+                database: None,
+                environment: None,
+                tuning: None,
+                tls: None,
+                mongo: None,
+            },
+            column_overrides: Default::default(),
+            verify: crate::config::VerifyMode::Size,
+            schema_drift_policy: Default::default(),
+            shape_drift_warn_factor: 0.0,
+            parquet: None,
+        }
+    }
+
+    /// Full-matrix flow: part A intact → Skip (+ summary hydration), part B
+    /// missing → Rewrite (task reset), part C size-diverged → Quarantine
+    /// (task reset + object moved), part D with no task → orphan. Also
+    /// hydrates the schema fingerprint from the prior manifest.
+    #[test]
+    fn apply_m8_full_matrix_skip_rewrite_quarantine_orphan() {
+        let run_id = "m8run";
+        let dir = tempfile::tempdir().unwrap();
+
+        // Destination objects: A matches its manifest size, C diverges, B absent.
+        std::fs::write(dir.path().join("part-a.parquet"), b"AAAAA").unwrap(); // 5
+        std::fs::write(dir.path().join("part-c.parquet"), b"CCC").unwrap(); // 3 != 9
+        let mut parts = vec![
+            m8_part("part-a.parquet", 10, 5),
+            m8_part("part-b.parquet", 10, 7),
+            m8_part("part-c.parquet", 10, 9),
+            m8_part("part-d.parquet", 10, 1), // no chunk_task → orphan
+        ];
+        for (i, p) in parts.iter_mut().enumerate() {
+            p.part_id = (i + 1) as u32;
+        }
+        let manifest = m8_manifest(run_id, parts);
+        std::fs::write(
+            dir.path().join(MANIFEST_FILENAME),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        // State: tasks 0..2 completed with file names a/b/c.
+        let state_dir = tempfile::tempdir().unwrap();
+        let state =
+            crate::state::StateStore::open_at_path(&state_dir.path().join("state.db")).unwrap();
+        state
+            .insert_chunk_tasks(run_id, &[(0, 10), (10, 20), (20, 30)])
+            .unwrap();
+        for (idx, name) in [
+            (0, "part-a.parquet"),
+            (1, "part-b.parquet"),
+            (2, "part-c.parquet"),
+        ] {
+            // claim → completed so file_name is recorded like a real run.
+            state.claim_next_chunk_task(run_id).unwrap();
+            state
+                .complete_chunk_task(run_id, idx, 10, Some(name))
+                .unwrap();
+        }
+
+        let plan = m8_plan(dir.path());
+        let mut summary =
+            crate::pipeline::summary::RunSummary::stub_for_testing(run_id, String::from("orders"));
+        assert!(summary.schema_fingerprint.is_none(), "fixture precondition");
+
+        let stats = apply_m8_resume_decisions(&state, run_id, &plan, &mut summary).unwrap();
+
+        assert_eq!(stats.skipped, 1, "part A (intact) is skipped");
+        assert_eq!(
+            stats.reset_for_rewrite, 1,
+            "part B (missing) resets its task"
+        );
+        assert_eq!(
+            stats.reset_for_quarantine, 1,
+            "part C (size-diverged) resets its task"
+        );
+        assert_eq!(
+            stats.quarantined_moved, 1,
+            "part C's divergent object is moved to _quarantine/<run_id>/"
+        );
+        assert_eq!(stats.quarantine_move_failures, 0);
+        assert_eq!(stats.orphan_parts, 1, "part D has no chunk_task");
+        assert!(
+            dir.path()
+                .join(format!("{QUARANTINE_PREFIX}/{run_id}/part-c.parquet"))
+                .exists(),
+            "quarantined object relocated"
+        );
+
+        // Skip hydration: the summary carries the prior manifest's part A.
+        assert_eq!(
+            summary
+                .manifest_parts
+                .iter()
+                .map(|p| p.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["part-a.parquet"],
+            "skipped parts hydrate into the resume summary (M4 cumulative manifest)"
+        );
+        assert_eq!(
+            summary.schema_fingerprint.as_deref(),
+            Some("xxh3:00000000deadbeef"),
+            "schema fingerprint hydrates from the prior manifest"
+        );
+
+        // State-side effects: A stays completed; B and C are pending again.
+        let tasks = state.list_chunk_tasks_for_run(run_id).unwrap();
+        let status_of = |i: i64| {
+            tasks
+                .iter()
+                .find(|t| t.chunk_index == i)
+                .unwrap()
+                .status
+                .clone()
+        };
+        assert_eq!(status_of(0), "completed");
+        assert_eq!(status_of(1), "pending", "rewrite resets the task");
+        assert_eq!(status_of(2), "pending", "quarantine resets the task");
+    }
+
+    /// A manifest from a DIFFERENT run_id must be ignored wholesale — resetting
+    /// chunk_tasks off a foreign manifest could destroy a healthy resume.
+    #[test]
+    fn apply_m8_ignores_foreign_manifest() {
+        let run_id = "m8run";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("part-a.parquet"), b"AAAAA").unwrap();
+        let mut parts = vec![m8_part("part-a.parquet", 10, 5)];
+        parts[0].part_id = 1;
+        let manifest = m8_manifest("SOMEONE_ELSES_RUN", parts);
+        std::fs::write(
+            dir.path().join(MANIFEST_FILENAME),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let state =
+            crate::state::StateStore::open_at_path(&state_dir.path().join("state.db")).unwrap();
+        state.insert_chunk_tasks(run_id, &[(0, 10)]).unwrap();
+        state.claim_next_chunk_task(run_id).unwrap();
+        state
+            .complete_chunk_task(run_id, 0, 10, Some("part-a.parquet"))
+            .unwrap();
+
+        let plan = m8_plan(dir.path());
+        let mut summary =
+            crate::pipeline::summary::RunSummary::stub_for_testing(run_id, String::from("orders"));
+        let stats = apply_m8_resume_decisions(&state, run_id, &plan, &mut summary).unwrap();
+
+        assert_eq!(
+            stats,
+            M8Stats::default(),
+            "foreign manifest: no action at all"
+        );
+        assert!(
+            summary.manifest_parts.is_empty(),
+            "no hydration from a foreign manifest"
+        );
+        assert_eq!(
+            state.list_chunk_tasks_for_run(run_id).unwrap()[0].status,
+            "completed",
+            "no task reset off a foreign manifest"
+        );
+    }
+
     #[test]
     fn m8stats_aggregates_default_to_zero() {
         // Pinning the wire shape — adding fields must not change the
