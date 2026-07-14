@@ -19,4 +19,9 @@ exclude_re = [
     "replace < with <= in scaled_i128_to_decimal_str",
     "replace < with <= in decimal_str_to_scaled_i128",
     "replace < with <= in decimal_str_to_scaled_i256",
+    # The optimistic base's `passed: true` in verify_at_destination is
+    # overwritten by recompute_passed() on EVERY exit path (verified by
+    # running the whole module against the deleted-field mutant) — the
+    # initial value is unobservable.
+    "delete field passed from struct ManifestVerification expression in verify_at_destination",
 ]

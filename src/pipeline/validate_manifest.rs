@@ -1072,6 +1072,77 @@ mod tests {
     // ── untracked objects ───────────────────────────────────────────────
 
     #[test]
+    fn verify_counters_track_present_and_failed_parts() {
+        // Mutation-tier2 gap: the verdict-shaping fields (manifest_found /
+        // passed / failures) and the per-part counters (parts_verified /
+        // parts_failed) had no assertion — `+= -> -=` survived. One present
+        // part + one missing part pin both counters and the verdict.
+        let dir = tempfile::tempdir().unwrap();
+        let m = build_manifest(
+            vec![
+                part(1, 10, 4, "xxh3:1111111111111111"),
+                part(2, 10, 4, "xxh3:2222222222222222"),
+            ],
+            ManifestStatus::Success,
+        );
+        // Only part 1 exists at the destination.
+        write_dataset(dir.path(), &m, &[("part-000001.parquet", b"AAAA")]);
+        let dest = local_dest(dir.path());
+
+        let v = verify_at_destination(&dest, "", ValidateDepth::Full).unwrap();
+        assert!(v.manifest_found, "manifest is at the prefix");
+        assert_eq!(v.parts_verified, 1, "part 1 is present at its size");
+        assert_eq!(v.parts_failed, 1, "part 2 is missing");
+        assert!(
+            v.failures
+                .iter()
+                .any(|f| matches!(f, Failure::PartMissing { part_id: 2, .. })),
+            "the missing part is named in failures: {:?}",
+            v.failures
+        );
+        assert!(!v.passed, "a missing part must fail the verdict");
+    }
+
+    #[test]
+    fn read_capped_boundary_is_exact() {
+        // `size > max` (not >=): a body exactly AT the cap must load; one
+        // byte over must be refused before materialising.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("at-cap.bin"), vec![0u8; 8]).unwrap();
+        std::fs::write(dir.path().join("over-cap.bin"), vec![0u8; 9]).unwrap();
+        let dest = local_dest(dir.path());
+        assert_eq!(
+            read_capped(&dest, "at-cap.bin", 8)
+                .expect("exactly at cap loads")
+                .len(),
+            8
+        );
+        let err = read_capped(&dest, "over-cap.bin", 8).expect_err("over cap refuses");
+        assert!(
+            err.to_string().contains("read cap"),
+            "actionable message: {err:#}"
+        );
+    }
+
+    #[test]
+    fn preview_truncates_only_past_forty_chars() {
+        let s39: String = "x".repeat(39);
+        let s40: String = "x".repeat(40);
+        let s41: String = "x".repeat(41);
+        assert_eq!(preview(&s39), s39, "under the limit: unchanged");
+        assert_eq!(
+            preview(&s40),
+            s40,
+            "exactly at the limit: unchanged (`>` not `>=`)"
+        );
+        assert_eq!(
+            preview(&s41),
+            format!("{s40}\u{2026}"),
+            "past the limit: 40 chars + ellipsis"
+        );
+    }
+
+    #[test]
     fn untracked_object_under_prefix_is_flagged() {
         let dir = tempfile::tempdir().unwrap();
         let m = build_manifest(
