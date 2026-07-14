@@ -115,6 +115,21 @@ fn smoke_cdc_mysql() {
     );
 }
 
+#[test]
+#[ignore = "live smoke: mysql cdc soak → Snowflake"]
+fn smoke_cdc_mysql_snowflake() {
+    let v = Verification::new(Engine::Mysql, Mode::Cdc, Fixture::smoke("content_items"))
+        .warehouse(Warehouse::Snowflake);
+    assert_all_pass(
+        v.run_soak(
+            &SoakConfig::quick(),
+            &[WarehouseOracle::TypeFidelity],
+            &[SoakOracle::FlatRss, SoakOracle::ZeroGap],
+        )
+        .expect("soak"),
+    );
+}
+
 // ── Snowflake parity: the same batch pipeline into a second warehouse ─────────
 #[test]
 #[ignore = "live smoke: postgres batch → Snowflake"]

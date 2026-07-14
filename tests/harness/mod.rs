@@ -718,6 +718,19 @@ impl Verification {
                 ])
                 .args(["--target", target, lane.seed_url_flag, &lane.url(db)])
                 .args(["--content-items", &self.fixture.rows.to_string()])
+                // The matrix reads only `content_items` (no FK to the other tables),
+                // so seed nothing else — skips ~8M unrelated rows the default profile
+                // would generate, keeping every cell fast.
+                .args([
+                    "--users",
+                    "0",
+                    "--orders-per-user",
+                    "0",
+                    "--events-per-user",
+                    "0",
+                    "--page-views",
+                    "0",
+                ])
                 .env("RIVET_SEED_I_KNOW", "1"),
             "seed",
         )
