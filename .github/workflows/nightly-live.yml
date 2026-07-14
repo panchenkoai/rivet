@@ -281,18 +281,28 @@ jobs:
         env:
           CARGO_PROFILE_DEV_DEBUG: "0" # mutants never need debuginfo
         run: |
-          if [ $(( $(date +%j) % 2 )) -eq 0 ]; then
-            echo "group: ledger/pipeline (Tier 0)"
-            FILES="-f src/pipeline/manifest_writer.rs -f src/pipeline/manifest_reconcile.rs \
-                   -f src/manifest.rs -f src/pipeline/finalize.rs -f src/pipeline/single.rs \
-                   -f src/pipeline/keyset.rs -f src/pipeline/resume_decisions.rs \
-                   -f src/pipeline/chunked/resume_m8.rs -f src/pipeline/validate_manifest.rs"
-          else
-            echo "group: CDC/value/integrity (Tier 1-2)"
-            FILES="-f src/source/cdc/value.rs -f src/source/cdc/sink.rs \
-                   -f src/source/postgres/cdc.rs -f src/source/value_checksum.rs \
-                   -f src/types/decimal.rs"
-          fi
+          case $(( $(date +%j) % 3 )) in
+            0)
+              echo "group: ledger/pipeline (Tier 0)"
+              FILES="-f src/pipeline/manifest_writer.rs -f src/pipeline/manifest_reconcile.rs \
+                     -f src/manifest.rs -f src/pipeline/finalize.rs -f src/pipeline/single.rs \
+                     -f src/pipeline/keyset.rs -f src/pipeline/resume_decisions.rs \
+                     -f src/pipeline/chunked/resume_m8.rs -f src/pipeline/validate_manifest.rs"
+              ;;
+            1)
+              echo "group: CDC/value/integrity (Tier 1-2)"
+              FILES="-f src/source/cdc/value.rs -f src/source/cdc/sink.rs \
+                     -f src/source/postgres/cdc.rs -f src/source/value_checksum.rs \
+                     -f src/types/decimal.rs"
+              ;;
+            2)
+              echo "group: planning/formats/gates (waves 4-6)"
+              FILES="-f src/pipeline/chunked/math.rs -f src/pipeline/chunked/detect.rs \
+                     -f src/plan/build.rs -f src/format/csv.rs -f src/source/mongo/mod.rs \
+                     -f src/source/mssql/mod.rs -f src/source/postgres/mod.rs \
+                     -f src/pipeline/apply_cmd.rs"
+              ;;
+          esac
           # `|| true`: known misses are adjudicated by the baseline diff below,
           # not by the raw exit code.
           cargo mutants --no-shuffle -j 2 $FILES -- --lib || true
