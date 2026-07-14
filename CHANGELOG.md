@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.19.2 — 2026-07-14
+
+### Fixed
+
+- **Repeated runs into one destination prefix no longer clobber the run
+  manifest.** Parts were already run-unique, but the `manifest.json` sidecar
+  was fixed-name: every `until_current` scheduler cycle (and every incremental
+  batch rerun) overwrote the prior run's manifest, silently under-counting the
+  prefix for any consumer that sums manifests across runs. `write_manifest`
+  now also leaves an immutable `manifest-<run_id>.json` copy per run; the
+  canonical `manifest.json` stays the latest-run pointer, so `validate`,
+  resume, and repair are unchanged. `rivet validate` recognises the new
+  sidecar (never flags it as an untracked object).
+- CDC conformance gate hardening: the outcome dictionary no longer accepts a
+  bare `status.success()` (a 0-row capture exits 0 — the exact non-outcome the
+  gate exists to reject), and CDC test files are discovered by glob so a new
+  suite cannot silently ship outside the gate.
+- Nightly CI no longer selects the engine-agnostic Mongo stand tests on a
+  stack with no Mongo service.
+
+### Testing
+
+- Coverage-matrix audit: 63 tests that could not fail against the exact bug
+  they guard were strengthened (masking sleeps removed, self-oracles replaced
+  with independent destination re-reads, cloud "all rows" cells now download
+  and count physical rows).
+- Mutation-testing program: 6,672 mutants across every matrix-bearing
+  surface; ~50 killer test classes added, each RED-proven against its mutant.
+  Enforcement: a `cargo mutants --in-diff` PR gate, a nightly 3-group tier
+  rotation ratcheting against `docs/mutants-baseline.txt`, and adjudicated
+  equivalents in `.cargo/mutants.toml`.
+
+
 ## 0.19.1 — 2026-07-12
 
 ### Fixed
