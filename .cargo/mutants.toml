@@ -24,4 +24,10 @@ exclude_re = [
     # running the whole module against the deleted-field mutant) — the
     # initial value is unobservable.
     "delete field passed from struct ManifestVerification expression in verify_at_destination",
+    # scalar_to_string takes a `tiberius::Row`, which cannot be constructed
+    # outside the driver — its dispatch stubs are unkillable offline. The
+    # value logic was extracted into `numeric_to_display` (unit-tested,
+    # RED-proven); the dispatch itself is live-guarded (query_scalar feeds
+    # min/max bounds exercised by the live planner suites).
+    "replace scalar_to_string -> Option<String>",
 ]

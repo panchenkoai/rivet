@@ -140,7 +140,10 @@ jobs:
     name: Mutants (changed lines)
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
-    timeout-minutes: 45
+    # First live run: 52 mutants took 42m on the 2-core runner (cold baseline
+    # build 270s + ~80s/mutant) — 45m was one flaky rebuild away from a
+    # spurious timeout on a large PR.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
         with:
