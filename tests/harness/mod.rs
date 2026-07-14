@@ -522,7 +522,7 @@ impl Verification {
             "rivet load --cdc",
         )?;
 
-        let view = self.warehouse_table_ref(&env, &format!("mongo_{coll}"))?;
+        let view = self.warehouse_table_ref(&env, &self.loaded_table_name())?;
         let t = self.wh_table(&view);
         let live = self.wh_scalar(&format!("SELECT COUNT(*) FROM {t} WHERE NOT __is_deleted"))?;
         let tombstoned = self.wh_scalar(&format!("SELECT COUNT(*) FROM {t} WHERE __is_deleted"))?;
@@ -749,7 +749,10 @@ impl Verification {
 
     // ── stage 3: rivet load → warehouse ──────────────────────────────────────
     fn load(&self, env: &HarnessEnv, work: &TempWork, _gcs_prefix: &str) -> Result<String> {
-        let table = format!("{}_{}", self.engine.source_type(), self.fixture.table);
+        // `rivet load` names the target after the export's `table:` when present,
+        // else its `name:`. Batch uses `query:` (no `table:`) so the engine-qualified
+        // `name` wins; CDC uses `table:` so the loaded object is the bare table name.
+        let table = self.loaded_table_name();
         // ONE config drives both extract and load — the same file, which carries
         // a top-level `load:` block. `rivet load` REPLACES the target from GCS
         // (storage is the source of truth). Free OSS command, no license.
@@ -759,6 +762,15 @@ impl Verification {
             "rivet load",
         )?;
         self.warehouse_table_ref(env, &table)
+    }
+
+    /// The unqualified name `rivet load` gives the target: the engine-qualified
+    /// export `name` for batch, the bare source `table` for CDC.
+    fn loaded_table_name(&self) -> String {
+        match self.mode {
+            Mode::Batch => format!("{}_{}", self.engine.source_type(), self.fixture.table),
+            Mode::Cdc => self.fixture.table.clone(),
+        }
     }
 
     /// The fully-qualified id of the loaded table for the cell's warehouse —
