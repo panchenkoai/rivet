@@ -204,8 +204,13 @@ impl TargetLoader for SnowflakeLoader {
         let stage = format!("rivet_stage_{}", sanitize_tag(table));
         let cluster = Self::cluster_clause(&self.cluster_by);
 
+        // Pin the session to UTC before the COPY: Snowflake stamps a Parquet
+        // timestamp with the *session* offset, so on a non-UTC account (default
+        // is often America/Los_Angeles) a `timestamptz` lands shifted by that
+        // offset. UTC keeps the instant byte-for-byte with the source.
         let sql = format!(
             "ALTER SESSION SET QUERY_TAG = '{tag}';\n\
+             ALTER SESSION SET TIMEZONE = 'UTC';\n\
              USE WAREHOUSE {wh};\n\
              USE SCHEMA {db}.{sc};\n\
              CREATE FILE FORMAT IF NOT EXISTS rivet_pq TYPE=PARQUET BINARY_AS_TEXT=FALSE;\n\
@@ -313,8 +318,11 @@ impl TargetLoader for SnowflakeLoader {
         // One script: ensure the log exists (clustered on PK), COUNT before,
         // append via COPY, COUNT after, then (re)build the dedup view. The
         // before/after delta is the file→warehouse gate for the append path.
+        // `TIMEZONE = 'UTC'` keeps `timestamptz` instants faithful — Snowflake
+        // otherwise stamps a Parquet timestamp with the session offset.
         let sql = format!(
             "ALTER SESSION SET QUERY_TAG = '{tag}';\n\
+             ALTER SESSION SET TIMEZONE = 'UTC';\n\
              USE WAREHOUSE {wh};\n\
              USE SCHEMA {db}.{sc};\n\
              CREATE FILE FORMAT IF NOT EXISTS rivet_pq TYPE=PARQUET BINARY_AS_TEXT=FALSE;\n\
