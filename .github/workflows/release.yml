@@ -205,7 +205,7 @@ jobs:
           echo "Extracted $(wc -l < release-notes.md) lines of notes for ${VERSION}."
 
       - name: Create release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@v3.0.1
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           name: ${{ env.RELEASE_TAG }}
