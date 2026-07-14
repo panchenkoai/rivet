@@ -145,3 +145,11 @@ fn mongo_cdc_delete_flag_snowflake() {
         .warehouse(Warehouse::Snowflake);
     assert_all_pass(v.run_mongo_cdc_delete().expect("mongo cdc delete"));
 }
+
+#[test]
+#[ignore = "live: needs the mongo replica-set devbox (rivet-mongo-rs-1) + BigQuery"]
+fn mongo_cdc_delete_flag_bigquery() {
+    let v = Verification::new(Engine::Mongo, Mode::Cdc, Fixture::smoke("cdc_del"))
+        .warehouse(Warehouse::BigQuery);
+    assert_all_pass(v.run_mongo_cdc_delete().expect("mongo cdc delete"));
+}
