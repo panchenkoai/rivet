@@ -539,6 +539,202 @@ mod tests {
         }
     }
 
+    // ── mutation-pilot gap closures ──────────────────────────────────────────
+    // finalize_manifest (18 missed) + the success gates (4) had NO driving
+    // test: stubbing finalize_manifest to () — i.e. never writing the manifest
+    // at end of run — survived the whole lib suite.
+
+    fn fin_plan(dest: &std::path::Path) -> crate::plan::ResolvedRunPlan {
+        use crate::config::{SourceConfig, SourceType};
+        crate::plan::ResolvedRunPlan {
+            export_name: "public.orders".into(),
+            base_query: "SELECT 1".into(),
+            strategy: crate::plan::ExtractionStrategy::Snapshot,
+            format: crate::config::FormatType::Parquet,
+            compression: crate::config::CompressionType::None,
+            compression_level: None,
+            max_file_size_bytes: None,
+            skip_empty: false,
+            meta_columns: Default::default(),
+            destination: cfg_local(Some(&dest.to_string_lossy()), None),
+            quality: None,
+            tuning: crate::tuning::SourceTuning::from_config(None),
+            tuning_profile_label: "balanced".into(),
+            validate: false,
+            reconcile: false,
+            resume: false,
+            source: SourceConfig {
+                source_type: SourceType::Postgres,
+                url: Some("postgresql://nobody@127.0.0.1:9999/nonexistent".into()),
+                url_env: None,
+                url_file: None,
+                host: None,
+                port: None,
+                user: None,
+                password: None,
+                password_env: None,
+                database: None,
+                environment: None,
+                tuning: None,
+                tls: None,
+                mongo: None,
+            },
+            column_overrides: Default::default(),
+            verify: crate::config::VerifyMode::Size,
+            schema_drift_policy: Default::default(),
+            shape_drift_warn_factor: 0.0,
+            parquet: None,
+        }
+    }
+
+    /// A summary that carries everything finalize_manifest is supposed to
+    /// surface into the manifest: a plan snapshot, one committed part, Form B
+    /// checksums, and a cursor range.
+    fn fin_summary(plan: &crate::plan::ResolvedRunPlan, status: &str) -> RunSummary {
+        let mut s = RunSummary::stub_for_testing("finrun", plan.export_name.clone());
+        s.status = status.into();
+        s.schema_fingerprint = Some("xxh3:00000000feedface".into());
+        s.manifest_parts.push(crate::manifest::ManifestPart {
+            part_id: 1,
+            path: "part-000001.parquet".into(),
+            rows: 5,
+            size_bytes: 7,
+            content_fingerprint: "xxh3:1".into(),
+            content_md5: String::new(),
+            status: crate::manifest::PartStatus::Committed,
+        });
+        s.column_checksums = vec![crate::manifest::ColumnChecksum {
+            name: "id".into(),
+            checksum: "42".into(),
+        }];
+        s.checksum_key_column = Some("id".into());
+        s.cursor_column = Some("updated_at".into());
+        s.cursor_low = Some("2026-01-01".into());
+        s.cursor_high = Some("2026-02-01".into());
+        s.journal.record(crate::journal::RunEvent::PlanResolved(
+            crate::journal::PlanSnapshot {
+                export_name: plan.export_name.clone(),
+                base_query: plan.base_query.clone(),
+                strategy: "snapshot".into(),
+                format: "parquet".into(),
+                compression: "none".into(),
+                destination_type: "local".into(),
+                tuning_profile: "balanced".into(),
+                batch_size: 1000,
+                validate: false,
+                reconcile: false,
+                resume: false,
+            },
+        ));
+        s
+    }
+
+    fn read_manifest(dir: &std::path::Path) -> crate::manifest::RunManifest {
+        serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn finalize_manifest_success_writes_full_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = fin_plan(dir.path());
+        let state = crate::state::StateStore::open_in_memory().unwrap();
+        let summary = fin_summary(&plan, "success");
+
+        finalize_manifest(&plan, &state, &summary, "export");
+
+        let m = read_manifest(dir.path());
+        assert_eq!(m.status, crate::manifest::ManifestStatus::Success);
+        assert_eq!(m.run_id, "finrun");
+        assert_eq!(m.parts.len(), 1);
+        assert_eq!(m.row_count, 5);
+        assert_eq!(m.schema_fingerprint, "xxh3:00000000feedface");
+        assert_eq!(
+            m.column_checksums.as_ref().map(|c| c.len()),
+            Some(1),
+            "Form B checksums must land in the manifest"
+        );
+        assert_eq!(m.checksum_key_column.as_deref(), Some("id"));
+        let ex = m.source.extraction.as_ref().expect("extraction section");
+        assert_eq!(ex.cursor_low.as_deref(), Some("2026-01-01"));
+        assert_eq!(ex.cursor_high.as_deref(), Some("2026-02-01"));
+        assert_eq!(m.source.engine, "postgres");
+        assert_eq!(m.source.schema.as_deref(), Some("public"));
+        assert_eq!(m.source.table.as_deref(), Some("orders"));
+        assert!(
+            dir.path().join("_SUCCESS").exists(),
+            "success run gets _SUCCESS"
+        );
+        assert!(
+            dir.path().join("manifest-finrun.json").exists(),
+            "run-unique manifest copy beside the canonical"
+        );
+    }
+
+    #[test]
+    fn finalize_manifest_failed_run_records_failed_and_no_success_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = fin_plan(dir.path());
+        let state = crate::state::StateStore::open_in_memory().unwrap();
+        let summary = fin_summary(&plan, "failed");
+
+        finalize_manifest(&plan, &state, &summary, "export");
+
+        let m = read_manifest(dir.path());
+        assert_eq!(m.status, crate::manifest::ManifestStatus::Failed);
+        assert!(
+            !dir.path().join("_SUCCESS").exists(),
+            "a failed run must never leave a _SUCCESS marker"
+        );
+    }
+
+    #[test]
+    fn finalize_manifest_splits_schema_table_only_on_a_real_dot() {
+        // "orders" (no dot) and "public." (empty table) must both yield
+        // None/None — a `guard -> true` or `&& -> ||` mutant fabricates
+        // Some("")/Some(...) fields from free-form export names.
+        for name in ["orders", "public.", ".orders"] {
+            let dir = tempfile::tempdir().unwrap();
+            let plan = fin_plan(dir.path());
+            let state = crate::state::StateStore::open_in_memory().unwrap();
+            let mut summary = fin_summary(&plan, "success");
+            summary.export_name = name.into();
+
+            finalize_manifest(&plan, &state, &summary, "export");
+
+            let m = read_manifest(dir.path());
+            assert_eq!(m.source.schema, None, "export_name {name:?}");
+            assert_eq!(m.source.table, None, "export_name {name:?}");
+        }
+    }
+
+    #[test]
+    fn success_gate_refuses_resume_over_a_completed_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = fin_plan(dir.path());
+        // Empty prefix: resume proceeds.
+        check_success_gate_for_resume(&plan).expect("no _SUCCESS -> gate passes");
+        // Completed prefix: refuse loudly.
+        std::fs::write(dir.path().join("_SUCCESS"), b"xxh3:0\n").unwrap();
+        let err = check_success_gate_for_resume(&plan)
+            .expect_err("_SUCCESS present -> resume must be refused");
+        assert!(
+            err.to_string().contains("refused"),
+            "the refusal must be operator-actionable, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn destination_has_success_probes_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_local(Some(&dir.path().to_string_lossy()), None);
+        assert!(!destination_has_success(&cfg), "no marker -> false");
+        std::fs::write(dir.path().join("_SUCCESS"), b"xxh3:0\n").unwrap();
+        assert!(destination_has_success(&cfg), "marker present -> true");
+        // An unopenable destination counts as "not complete" (re-run it).
+        let bad = cfg_local(Some("/nonexistent/definitely/missing"), None);
+        assert!(!destination_has_success(&bad));
+    }
+
     fn cfg_s3(bucket: &str, prefix: Option<&str>) -> DestinationConfig {
         DestinationConfig {
             destination_type: DestinationType::S3,
