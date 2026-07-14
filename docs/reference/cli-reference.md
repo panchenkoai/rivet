@@ -9,6 +9,7 @@ This document contains the help content for the `rivet` command-line program.
 * [`rivet check`↴](#rivet-check)
 * [`rivet doctor`↴](#rivet-doctor)
 * [`rivet cdc`↴](#rivet-cdc)
+* [`rivet load`↴](#rivet-load)
 * [`rivet state`↴](#rivet-state)
 * [`rivet state show`↴](#rivet-state-show)
 * [`rivet state reset`↴](#rivet-state-reset)
@@ -49,6 +50,7 @@ Docs: https://github.com/panchenkoai/rivet/blob/main/docs/getting-started.md
 * `check` — Column-type & schema report for each export (needs a working connection; run `doctor` first if it can't connect)
 * `doctor` — Verify source + destination auth/connectivity (run this first)
 * `cdc` — Stream change data capture (CDC) from a source's transaction log
+* `load` — Load an export's Parquet into a warehouse (BigQuery / Snowflake)
 * `state` — Manage export state
 * `completions` — Generate shell completions
 * `init` — Generate a config scaffold from a live database (connect + introspect)
@@ -153,6 +155,27 @@ The engine is chosen from the URL scheme: `mysql://` (binlog), `postgresql://` (
   Default value: `rivet_slot`
 * `--capture-instance <INSTANCE>` — SQL Server CDC capture instance, e.g. `dbo_orders` — required for `sqlserver://` sources
 * `--until-current` — Catch up to the source's current end and exit, instead of streaming indefinitely — the bounded "read to now and stop" model, ideal for a scheduler. For MySQL this is a non-blocking binlog dump; PostgreSQL / SQL Server already drain their backlog and exit
+
+
+
+## `rivet load`
+
+Load an export's Parquet into a warehouse (BigQuery / Snowflake)
+
+The native column schema, target table, partition, and source URIs are all derived from the config's top-level `load:` block — nothing is hand-typed. A multi-table config loads every export into the shared target, one after another.
+
+**Usage:** `rivet load [OPTIONS] --config <CONFIG>`
+
+###### **Options:**
+
+* `-c`, `--config <CONFIG>` — Path to YAML config file — extraction PLUS a top-level `load:` block (target + cleanup). ONE file drives both the export and the load
+* `--rivet-bin <RIVET_BIN>` — Path to the `rivet` binary used for the type-report subprocess
+
+  Default value: `rivet`
+* `--run-id <RUN_ID>` — Correlation id stamped on every warehouse job/query of this load run (BigQuery `rivet_run` label / Snowflake `QUERY_TAG`), so cost slices per run as well as per table. Defaults to a generated id
+* `--allow-source-drift` — Load even when a run manifest's source count disagrees with what it extracted (source→file drift): print a warning instead of blocking. The file→warehouse count gate and manifest gates still apply
+* `--cdc` — Load a CDC change log instead of a batch snapshot: append the change Parquet into `<table>__changes` and (re)build the current-state dedup view `<table>` over it. Requires `--pk`. The source engine (for the `__pos` parse) is read from the config
+* `--pk <PK>` — The change log's primary key column(s) — the dedup view's partition key. Required with `--cdc`. Comma-separated for a composite key, e.g. `--pk tenant,id`
 
 
 
