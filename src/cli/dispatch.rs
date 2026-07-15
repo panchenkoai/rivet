@@ -743,7 +743,7 @@ fn load_one_cdc(
     pk: &[String],
     allow_source_drift: bool,
 ) -> Result<load::CdcLoadReport> {
-    let store = crate::destination::gcs::GcsStore::new(&plan.destination)?;
+    let store = load::open_store(&plan.destination)?;
     let manifests = load::reconcile::fetch_manifests(&store, &plan.gcs_prefix)?;
     let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
     let uris = load::plan::list_gcs_uris(&store, &plan.gcs_prefix)?;
@@ -760,7 +760,10 @@ fn load_one_cdc(
     // The driver gates the appended delta against the manifests' summed
     // `row_count` and cleans up (only) after the gate passes.
     let loader = load::build_loader(plan, run_id);
-    let cleanup = plan.load.cleanup_source.then_some(plan.gcs_prefix.as_str());
+    let cleanup = plan
+        .load
+        .cleanup_source
+        .then_some((&store, plan.gcs_prefix.as_str()));
     let report = load::run_load_cdc(
         &*loader,
         &plan.table,
@@ -794,7 +797,7 @@ fn load_one(
     run_id: &str,
     allow_source_drift: bool,
 ) -> Result<load::LoadReport> {
-    let store = crate::destination::gcs::GcsStore::new(&plan.destination)?;
+    let store = load::open_store(&plan.destination)?;
     let manifests = load::reconcile::fetch_manifests(&store, &plan.gcs_prefix)?;
     let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
     let uris = load::plan::list_gcs_uris(&store, &plan.gcs_prefix)?;
@@ -809,7 +812,10 @@ fn load_one(
         integrity.file_rows,
     );
     let loader = load::build_loader(plan, run_id);
-    let cleanup = plan.load.cleanup_source.then_some(plan.gcs_prefix.as_str());
+    let cleanup = plan
+        .load
+        .cleanup_source
+        .then_some((&store, plan.gcs_prefix.as_str()));
     let report = load::run_load(
         &*loader,
         &plan.table,

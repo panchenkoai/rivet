@@ -47,9 +47,6 @@ pub struct SnowflakeLoader {
     /// so every statement of one `rivet load` invocation shares a run key —
     /// cost slices per run (across tables) as well as per table. `None` omits it.
     pub run_id: Option<String>,
-    /// The export's GCS destination — used only by `cleanup` to delete the
-    /// source prefix via the native opendal client. `None` outside the load path.
-    pub destination: Option<crate::config::DestinationConfig>,
 }
 
 impl SnowflakeLoader {
@@ -293,14 +290,6 @@ impl TargetLoader for SnowflakeLoader {
         );
         self.run_snow(&sql)?;
         Ok(())
-    }
-
-    fn cleanup(&self, prefix: &str) -> Result<()> {
-        let dest = self
-            .destination
-            .as_ref()
-            .context("Snowflake loader has no destination configured for cleanup")?;
-        super::delete_prefix(dest, prefix)
     }
 }
 

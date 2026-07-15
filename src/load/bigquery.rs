@@ -105,10 +105,6 @@ pub struct BigQueryLoader {
     /// this, the free load is split into several `LOAD DATA` jobs, each under
     /// the cap.
     pub max_partitions_per_job: usize,
-    /// The export's GCS destination — used only by `cleanup` to delete the
-    /// source prefix via the native opendal client. `None` outside the load
-    /// path (unit-constructed loaders never clean up).
-    pub destination: Option<crate::config::DestinationConfig>,
 }
 
 impl BigQueryLoader {
@@ -120,7 +116,6 @@ impl BigQueryLoader {
             cluster_by: Vec::new(),
             run_id: None,
             max_partitions_per_job: DEFAULT_MAX_PARTITIONS_PER_JOB,
-            destination: None,
         }
     }
 
@@ -292,14 +287,6 @@ impl TargetLoader for BigQueryLoader {
         );
         self.run_sql(&view_sql, "view", table)?;
         Ok(())
-    }
-
-    fn cleanup(&self, prefix: &str) -> Result<()> {
-        let dest = self
-            .destination
-            .as_ref()
-            .context("BigQuery loader has no destination configured for cleanup")?;
-        super::delete_prefix(dest, prefix)
     }
 }
 

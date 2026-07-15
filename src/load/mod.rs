@@ -9,6 +9,7 @@
 //! count-integrity gate, the dedup-view wiring, and cleanup ordering — so those
 //! invariants are exercised once through a fake adapter, not per warehouse.
 
+use crate::destination::gcs::GcsStore;
 use crate::types::target::{TargetColumnSpec, TargetStatus};
 use anyhow::{Context, Result, bail};
 
@@ -75,10 +76,6 @@ pub trait TargetLoader {
         pk: &[String],
         engine: cdc::SourceEngine,
     ) -> Result<()>;
-
-    /// Delete the export's source GCS `prefix` — called by the driver only after
-    /// a verified load.
-    fn cleanup(&self, prefix: &str) -> Result<()>;
 }
 
 /// Refuse a load whose specs can't materialize: empty, or any `Fail`-status
@@ -102,12 +99,13 @@ fn validate_specs(table: &str, specs: &[TargetColumnSpec]) -> Result<()> {
     Ok(())
 }
 
-/// Clean up iff `prefix` is `Some`, downgrading a failure to a warning — the
-/// data is loaded and gated, so a stuck delete must not fail the load. Returns
-/// whether the source was actually cleaned.
-fn maybe_cleanup(loader: &dyn TargetLoader, prefix: Option<&str>) -> bool {
-    match prefix {
-        Some(p) => match loader.cleanup(p) {
+/// Clean up iff `cleanup` is `Some`, downgrading a failure to a warning — the
+/// data is loaded and gated, so a stuck delete must not fail the load. Cleanup
+/// runs the driver's own [`delete_under`] over an injected [`GcsStore`], so no
+/// adapter owns a delete path. Returns whether the source was actually cleaned.
+fn maybe_cleanup(cleanup: Option<(&GcsStore, &str)>) -> bool {
+    match cleanup {
+        Some((store, prefix)) => match delete_under(store, prefix) {
             Ok(()) => true,
             Err(e) => {
                 eprintln!("warning: source cleanup failed (data is safely loaded): {e:#}");
@@ -120,14 +118,20 @@ fn maybe_cleanup(loader: &dyn TargetLoader, prefix: Option<&str>) -> bool {
 
 /// **Batch load driver.** Materialize `table` from `uris`, gate the landed rows
 /// against `expected_rows` (the reconciled file count; `None` skips the gate),
-/// and — only after the gate passes — clean up the source at `cleanup_prefix`.
+/// and — only after the gate passes — clean up the source via `cleanup`
+/// (`Some((store, gs_prefix))` to delete, `None` to keep it).
+///
+/// `#[allow(private_interfaces)]` for the injected `GcsStore` — same rationale as
+/// [`reconcile::fetch_manifests`]: a `pub` public-API root over a deliberately
+/// crate-private `destination` type.
+#[allow(private_interfaces)]
 pub fn run_load(
     loader: &dyn TargetLoader,
     table: &str,
     specs: &[TargetColumnSpec],
     uris: &[String],
     expected_rows: Option<u64>,
-    cleanup_prefix: Option<&str>,
+    cleanup: Option<(&GcsStore, &str)>,
 ) -> Result<LoadReport> {
     if uris.is_empty() {
         bail!("no Parquet URIs to load into `{table}`");
@@ -146,7 +150,7 @@ pub fn run_load(
         );
     }
 
-    let source_cleaned = maybe_cleanup(loader, cleanup_prefix);
+    let source_cleaned = maybe_cleanup(cleanup);
     Ok(LoadReport {
         rows_loaded,
         target_table: loader.fqtn(table),
@@ -158,9 +162,10 @@ pub fn run_load(
 /// `expected_delta` (`None` skips the gate), (re)build the current-state dedup
 /// view, then clean up the source.
 // The arity is the CDC load's real surface: adapter + table + specs + uris are
-// the load, pk + engine shape the dedup view, expected_delta + cleanup_prefix
-// are the gate and cleanup. Bundling them would only move the fields elsewhere.
-#[allow(clippy::too_many_arguments)]
+// the load, pk + engine shape the dedup view, expected_delta + cleanup are the
+// gate and cleanup. Bundling them would only move the fields elsewhere.
+// `allow(private_interfaces)` for the injected `GcsStore` — see [`run_load`].
+#[allow(clippy::too_many_arguments, private_interfaces)]
 pub fn run_load_cdc(
     loader: &dyn TargetLoader,
     table: &str,
@@ -169,7 +174,7 @@ pub fn run_load_cdc(
     pk: &[String],
     engine: cdc::SourceEngine,
     expected_delta: Option<u64>,
-    cleanup_prefix: Option<&str>,
+    cleanup: Option<(&GcsStore, &str)>,
 ) -> Result<CdcLoadReport> {
     if uris.is_empty() {
         bail!("no Parquet URIs to append into `{table}__changes`");
@@ -192,7 +197,7 @@ pub fn run_load_cdc(
     }
 
     loader.create_dedup_view(table, pk, engine)?;
-    let _ = maybe_cleanup(loader, cleanup_prefix);
+    let _ = maybe_cleanup(cleanup);
 
     Ok(CdcLoadReport {
         rows_appended,
@@ -209,14 +214,29 @@ pub(crate) fn split_gs_uri(uri: &str) -> Result<(&str, &str)> {
         .with_context(|| format!("not a `gs://bucket/path` URI: {uri}"))
 }
 
-/// Delete a whole export-dedicated `gs://…/` prefix — the shared cleanup every
-/// adapter's [`TargetLoader::cleanup`] routes through, over the same native
-/// opendal GCS client the export destination uses (no `gcloud`).
-pub(crate) fn delete_prefix(dest: &crate::config::DestinationConfig, prefix: &str) -> Result<()> {
-    let (_, rel) = split_gs_uri(prefix)?;
-    crate::destination::gcs::GcsStore::new(dest)?
+/// Recursively delete a whole export-dedicated `gs://…/` prefix through an
+/// injected [`GcsStore`] — the driver's post-gate source cleanup, over the same
+/// native opendal GCS client the export destination uses (no `gcloud`). Taking
+/// the store as an argument (rather than each adapter building one from a
+/// config) is what lets an fs-backed store exercise this delete offline.
+pub(crate) fn delete_under(store: &GcsStore, gs_prefix: &str) -> Result<()> {
+    let (_, rel) = split_gs_uri(gs_prefix)?;
+    store
         .remove_all(rel)
-        .with_context(|| format!("source cleanup (recursive delete of {prefix}) failed"))
+        .with_context(|| format!("source cleanup (recursive delete of {gs_prefix}) failed"))
+}
+
+/// Open the one [`GcsStore`] a load reuses for reconcile, URI listing, and
+/// post-gate cleanup — the single production constructor `cli::dispatch` calls.
+///
+/// `pub` (a public-API root the lib keeps alive) even though its only caller is
+/// the binary-only dispatch: it re-anchors `GcsStore`'s real-GCS constructor in
+/// the lib compilation unit, which no longer reaches it through a load adapter.
+/// `#[allow(private_interfaces)]` for the crate-private return — same rationale
+/// as [`reconcile::fetch_manifests`].
+#[allow(private_interfaces)]
+pub fn open_store(dest: &crate::config::DestinationConfig) -> Result<GcsStore> {
+    GcsStore::new(dest)
 }
 
 /// The one place a resolved plan's [`LoadTarget`](plan::LoadTarget) maps to a
@@ -235,7 +255,6 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
             if !load.cluster_by.is_empty() {
                 l = l.cluster_by(load.cluster_by.clone());
             }
-            l.destination = Some(plan.destination.clone());
             Box::new(l)
         }
         LoadTarget::Snowflake {
@@ -256,7 +275,6 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
             l.gcs_url = plan.gcs_prefix.replacen("gs://", "gcs://", 1);
             // The `snow` CLI does not expand `~`; pass an absolute key path.
             l.private_key_path = std::env::var("RIVET_SNOWFLAKE_KEY").ok();
-            l.destination = Some(plan.destination.clone());
             Box::new(l)
         }
     }
@@ -275,7 +293,6 @@ mod tests {
         materialized: RefCell<Vec<String>>,
         appended: RefCell<Vec<String>>,
         views: RefCell<Vec<String>>,
-        cleaned: RefCell<Vec<String>>,
     }
 
     impl TargetLoader for FakeLoader {
@@ -300,10 +317,22 @@ mod tests {
             self.views.borrow_mut().push(table.into());
             Ok(())
         }
-        fn cleanup(&self, prefix: &str) -> Result<()> {
-            self.cleaned.borrow_mut().push(prefix.into());
-            Ok(())
-        }
+    }
+
+    /// An fs-backed [`GcsStore`] seeded with one object under the bucket-relative
+    /// `rel` — stands in for the export's live GCS source prefix so the driver's
+    /// real delete path (`delete_under` → `remove_all`) runs offline. Returns the
+    /// store; the caller keeps `dir` alive for the store's lifetime.
+    fn fs_store_with_prefix(dir: &tempfile::TempDir, rel: &str) -> GcsStore {
+        let obj = dir.path().join(rel).join("x.parquet");
+        std::fs::create_dir_all(obj.parent().unwrap()).unwrap();
+        std::fs::write(obj, b"x").unwrap();
+        GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap()
+    }
+
+    /// Whether the fs store still holds an object under bucket-relative `rel`.
+    fn prefix_populated(store: &GcsStore, rel: &str) -> bool {
+        !store.list_files(rel).unwrap().is_empty()
     }
 
     fn spec(status: TargetStatus) -> Vec<TargetColumnSpec> {
@@ -319,7 +348,10 @@ mod tests {
     fn uris() -> Vec<String> {
         vec!["gs://b/p/x.parquet".into()]
     }
-    const PREFIX: &str = "gs://b/p/";
+    /// The cleanup prefix the driver receives (a `gs://bucket/…` URI) and its
+    /// bucket-relative form the fs store is keyed by.
+    const PREFIX: &str = "gs://b/p";
+    const REL: &str = "p";
 
     #[test]
     fn empty_uris_bail_before_materialize() {
@@ -344,20 +376,22 @@ mod tests {
             rows: 7,
             ..Default::default()
         };
+        let dir = tempfile::tempdir().unwrap();
+        let store = fs_store_with_prefix(&dir, REL);
         let err = run_load(
             &f,
             "t",
             &spec(TargetStatus::Ok),
             &uris(),
             Some(10),
-            Some(PREFIX),
+            Some((&store, PREFIX)),
         )
         .unwrap_err()
         .to_string();
         assert!(err.contains("count validation failed"), "{err}");
         assert!(
-            f.cleaned.borrow().is_empty(),
-            "cleanup must not run on a failed gate"
+            prefix_populated(&store, REL),
+            "cleanup must not run on a failed gate — the source prefix stays intact"
         );
     }
 
@@ -367,17 +401,22 @@ mod tests {
             rows: 10,
             ..Default::default()
         };
+        let dir = tempfile::tempdir().unwrap();
+        let store = fs_store_with_prefix(&dir, REL);
         let r = run_load(
             &f,
             "t",
             &spec(TargetStatus::Ok),
             &uris(),
             Some(10),
-            Some(PREFIX),
+            Some((&store, PREFIX)),
         )
         .unwrap();
         assert!(r.source_cleaned);
-        assert_eq!(*f.cleaned.borrow(), vec![PREFIX.to_string()]);
+        assert!(
+            !prefix_populated(&store, REL),
+            "a passed gate drains the source prefix through the injected store"
+        );
         assert_eq!(r.target_table, "db.t");
     }
 
@@ -389,7 +428,6 @@ mod tests {
         };
         let r = run_load(&f, "t", &spec(TargetStatus::Ok), &uris(), Some(10), None).unwrap();
         assert!(!r.source_cleaned);
-        assert!(f.cleaned.borrow().is_empty());
     }
 
     #[test]
@@ -408,6 +446,8 @@ mod tests {
             rows: 3,
             ..Default::default()
         };
+        let dir = tempfile::tempdir().unwrap();
+        let store = fs_store_with_prefix(&dir, REL);
         let err = run_load_cdc(
             &f,
             "t",
@@ -416,7 +456,7 @@ mod tests {
             &["id".into()],
             cdc::SourceEngine::MySql,
             Some(5),
-            Some(PREFIX),
+            Some((&store, PREFIX)),
         )
         .unwrap_err()
         .to_string();
@@ -425,7 +465,10 @@ mod tests {
             f.views.borrow().is_empty(),
             "view must not be built on a failed gate"
         );
-        assert!(f.cleaned.borrow().is_empty());
+        assert!(
+            prefix_populated(&store, REL),
+            "cleanup must not run on a failed gate"
+        );
     }
 
     #[test]
@@ -434,6 +477,8 @@ mod tests {
             rows: 5,
             ..Default::default()
         };
+        let dir = tempfile::tempdir().unwrap();
+        let store = fs_store_with_prefix(&dir, REL);
         let r = run_load_cdc(
             &f,
             "t",
@@ -442,13 +487,28 @@ mod tests {
             &["id".into()],
             cdc::SourceEngine::MySql,
             Some(5),
-            Some(PREFIX),
+            Some((&store, PREFIX)),
         )
         .unwrap();
         assert_eq!(r.rows_appended, 5);
         assert_eq!(*f.views.borrow(), vec!["t".to_string()]);
-        assert_eq!(*f.cleaned.borrow(), vec![PREFIX.to_string()]);
+        assert!(
+            !prefix_populated(&store, REL),
+            "a passed CDC gate drains the source prefix after the view is built"
+        );
         assert_eq!(r.changes_table, "db.t__changes");
+    }
+
+    #[test]
+    fn delete_under_drains_the_prefix_through_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fs_store_with_prefix(&dir, REL);
+        assert!(prefix_populated(&store, REL), "seeded object is present");
+        delete_under(&store, PREFIX).unwrap();
+        assert!(
+            !prefix_populated(&store, REL),
+            "delete_under recursively removes the bucket-relative prefix behind the gs:// URI"
+        );
     }
 
     #[test]

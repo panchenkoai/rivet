@@ -205,7 +205,7 @@ mod tests {
         write_at(root, "keep/c.parquet", b"c");
         let store = GcsStore::open_fs(root.to_str().unwrap()).unwrap();
 
-        // `delete_prefix` passes the bucket-relative prefix with no trailing
+        // `delete_under` passes the bucket-relative prefix with no trailing
         // slash — the recursive delete must still drain the whole subtree.
         store.remove_all("p").unwrap();
         assert!(
