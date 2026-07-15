@@ -176,6 +176,16 @@ mod tests {
             ],
             "every file under the prefix, recursively, keyed bucket-relative — dirs excluded, siblings excluded"
         );
+
+        // Real callers pass a trailing-slash prefix (`gs://bucket/base/`); it must
+        // list identically. Pins the `is_empty() || ends_with('/')` guard — an
+        // `&&` there would append a second slash (`base//`) and match nothing.
+        let mut with_slash = store.list_files("base/").unwrap();
+        with_slash.sort();
+        assert_eq!(
+            with_slash, got,
+            "a trailing-slash prefix lists the same files"
+        );
     }
 
     #[test]
