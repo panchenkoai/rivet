@@ -463,6 +463,14 @@ mod tests {
     }
 
     #[test]
+    fn fqtn_qualifies_database_schema_table() {
+        let mut l = SnowflakeLoader::new("c");
+        l.database = "DB".into();
+        l.schema = "SC".into();
+        assert_eq!(l.fqtn("orders"), "DB.SC.orders");
+    }
+
+    #[test]
     fn query_tag_carries_run_id_when_set_and_omits_it_otherwise() {
         let mut l = SnowflakeLoader::new("c");
         assert_eq!(

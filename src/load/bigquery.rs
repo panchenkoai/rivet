@@ -878,6 +878,12 @@ mod tests {
     }
 
     #[test]
+    fn fqtn_qualifies_project_dataset_table() {
+        let l = BigQueryLoader::new("proj", "ds");
+        assert_eq!(l.fqtn("orders"), "proj.ds.orders");
+    }
+
+    #[test]
     fn sanitize_label_coerces_to_bq_charset() {
         assert_eq!(sanitize_label("My.Table!"), "my_table_");
         assert_eq!(sanitize_label(""), "unnamed");
