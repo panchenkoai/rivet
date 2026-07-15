@@ -110,6 +110,7 @@ pub(super) fn run_cdc_export(
 pub(super) fn initial_snapshot_pending(
     config: &Config,
     export: &ExportConfig,
+    state: &StateStore,
 ) -> Result<Vec<ExportConfig>> {
     let cdc = export.cdc.clone().unwrap_or_default();
     if cdc.initial != Some(crate::config::CdcInitialMode::Snapshot) {
@@ -137,7 +138,7 @@ pub(super) fn initial_snapshot_pending(
         (None, None) => anyhow::bail!("export '{}': cdc mode requires `table:`", export.name),
     };
     let mut pending_tables = Vec::new();
-    let mut any_marker = false;
+    let mut any_snapshot_done = false;
     for t in &tables {
         let table_dcfg = if multi {
             dest_for_table(&export.destination, t)
@@ -146,8 +147,12 @@ pub(super) fn initial_snapshot_pending(
         };
         let snap_dcfg = dest_for_table(&table_dcfg, "snapshot");
         let dest = crate::destination::create_destination(&snap_dcfg)?;
-        if dest.head("_SUCCESS")?.is_some() {
-            any_marker = true; // this table's snapshot already completed
+        // The state DB is authoritative (survives `cleanup_source` wiping the
+        // bucket); the GCS `snapshot/_SUCCESS` marker stays a legacy co-signal so
+        // pre-v14 runs and setups without state still skip correctly.
+        let done = state.snapshot_done(&export.name, t)? || dest.head("_SUCCESS")?.is_some();
+        if done {
+            any_snapshot_done = true; // this table's snapshot already completed
         } else {
             pending_tables.push((t.clone(), snap_dcfg));
         }
@@ -167,7 +172,7 @@ pub(super) fn initial_snapshot_pending(
         &slot,
         cdc.checkpoint.as_deref().map(std::path::Path::new),
         tls,
-        ckpt_resume || any_marker,
+        ckpt_resume || any_snapshot_done,
     )?;
 
     let mut pending = Vec::new();

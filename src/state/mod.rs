@@ -2,6 +2,7 @@ use rusqlite::Connection;
 
 use crate::error::Result;
 
+mod cdc_snapshot_store;
 mod checkpoint;
 mod cursor;
 mod file_log;
@@ -270,6 +271,20 @@ const MIGRATIONS: &[(i64, &str)] = &[
             PRIMARY KEY (target_table, source_run_id)
         );",
     ),
+    // v14: cdc snapshot completion. `cdc.initial: snapshot` records that an
+    // export/table's backfill finished HERE, not only as a GCS `snapshot/_SUCCESS`
+    // marker — so `cleanup_source: true` wiping the bucket no longer looks like an
+    // un-snapshotted table and re-snapshots the whole thing on every run.
+    (
+        14,
+        "CREATE TABLE IF NOT EXISTS cdc_snapshot (
+            export_name TEXT NOT NULL,
+            table_name TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            completed_at TEXT NOT NULL,
+            PRIMARY KEY (export_name, table_name)
+        );",
+    ),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -478,6 +493,17 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
             load_id TEXT NOT NULL,
             loaded_at TEXT NOT NULL,
             PRIMARY KEY (target_table, source_run_id)
+        );",
+    ),
+    // v14: cdc snapshot completion (see the SQLite array for rationale).
+    (
+        14,
+        "CREATE TABLE IF NOT EXISTS cdc_snapshot (
+            export_name TEXT NOT NULL,
+            table_name TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            completed_at TEXT NOT NULL,
+            PRIMARY KEY (export_name, table_name)
         );",
     ),
 ];
@@ -1010,6 +1036,23 @@ mod tests {
                 .unwrap();
             assert!(exists, "v13 migration must create `{table}`");
         }
+    }
+
+    #[test]
+    fn v14_creates_the_cdc_snapshot_table() {
+        let s = StateStore::open_in_memory().unwrap();
+        let conn = match &s.conn {
+            StateConn::Sqlite(c) => c,
+            StateConn::Postgres(_) => unreachable!(),
+        };
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='cdc_snapshot'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(exists, "v14 migration must create the cdc_snapshot table");
     }
 
     #[test]
