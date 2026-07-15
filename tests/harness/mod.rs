@@ -351,6 +351,7 @@ pub struct Verification {
     pub mode: Mode,
     pub fixture: Fixture,
     pub warehouse: Warehouse,
+    initial_snapshot: bool,
 }
 
 /// Result of one oracle evaluation. `Skipped` when the oracle is a no-op for
@@ -369,12 +370,20 @@ impl Verification {
             mode,
             fixture,
             warehouse: Warehouse::BigQuery,
+            initial_snapshot: false,
         }
     }
 
     /// Select the warehouse this cell loads into and re-reads (default BigQuery).
     pub fn warehouse(mut self, warehouse: Warehouse) -> Self {
         self.warehouse = warehouse;
+        self
+    }
+
+    /// Turn on `cdc.initial: snapshot` — the first CDC run anchors, backfills
+    /// every preexisting row, then drains. Used by [`Self::run_cdc_backfill`].
+    pub fn initial_snapshot(mut self) -> Self {
+        self.initial_snapshot = true;
         self
     }
 
@@ -539,6 +548,122 @@ impl Verification {
                 compare("tombstone-count", tombstoned, 1),
             ),
         ])
+    }
+
+    /// A focused CDC **backfill** cell: turn CDC on for a PRE-EXISTING table via
+    /// `cdc.initial: snapshot`, apply live changes, load, and assert the
+    /// current-state view keeps the whole backfill.
+    ///
+    /// Pins the snapshot/stream seam: `initial: snapshot` rows load from a plain
+    /// full-snapshot parquet (NULL `__op`/`__pos` in `__changes`), so the view
+    /// must read them as live (`COALESCE(__op='delete',FALSE)`) and rank them
+    /// oldest — else `WHERE NOT __is_deleted` silently drops the entire backfill.
+    ///
+    /// Timeline: seed N rows → anchor+snapshot+drain → insert 1 / update 1 /
+    /// delete 1 → drain → load `--cdc --pk id`. Live must equal N (N−1 delete +1
+    /// insert), tombstoned 1, and an untouched mid-backfill row live.
+    pub fn run_cdc_backfill(&self) -> Result<Vec<(String, OracleOutcome)>> {
+        if self.mode != Mode::Cdc || !self.initial_snapshot {
+            bail!("run_cdc_backfill needs Mode::Cdc + .initial_snapshot()");
+        }
+        if !matches!(self.engine, Engine::Postgres | Engine::Mysql) {
+            bail!("run_cdc_backfill is a Postgres/MySQL cell (SQL source with a seed client)");
+        }
+        let env = HarnessEnv::load()?;
+        let work = TempWork::new("rivet-cdc-backfill")?;
+        let t = self.fixture.table.clone();
+        let n = self.fixture.rows as i64;
+
+        // The preexisting data that predates CDC being turned on.
+        self.seed_backfill_table(&t, n)?;
+
+        let prefix = format!("matrix/{}/{}/", self.engine.source_type(), t);
+        let full_prefix = format!("gs://{}/{}", env.gcs_bucket, prefix);
+        let _ = Command::new("gcloud")
+            .args(["storage", "rm", "-r", &format!("{full_prefix}**")])
+            .status();
+        let _ = std::fs::remove_file(
+            std::env::temp_dir().join(format!("ckpt-{}", prefix.replace('/', "_"))),
+        );
+
+        let cfg = work.write("extract.yaml", &self.extraction_yaml(&env, &prefix)?);
+        // Anchor → full snapshot of the N preexisting rows → drain (initial: snapshot).
+        run(
+            Command::new("rivet").args(["run", "-c"]).arg(&cfg),
+            "rivet run (snapshot)",
+        )?;
+        // Live changes AFTER the backfill: one insert, one update, one delete.
+        self.source_raw(&format!(
+            "INSERT INTO {t} (id, v) VALUES ({}, 'brand-new')",
+            n + 1
+        ))?;
+        self.source_raw(&format!(
+            "UPDATE {t} SET v = 'changed-after-snapshot' WHERE id = 1"
+        ))?;
+        self.source_raw(&format!("DELETE FROM {t} WHERE id = 2"))?;
+        run(
+            Command::new("rivet").args(["run", "-c"]).arg(&cfg),
+            "rivet run (drain)",
+        )?;
+        run(
+            Command::new("rivet")
+                .args(["load", "-c"])
+                .arg(&cfg)
+                .args(["--cdc", "--pk", "id"]),
+            "rivet load --cdc",
+        )?;
+
+        let view = self.warehouse_table_ref(&env, &self.loaded_table_name())?;
+        let vt = self.wh_table(&view);
+        let live = self.wh_scalar(&format!("SELECT COUNT(*) FROM {vt} WHERE NOT __is_deleted"))?;
+        let tombstoned =
+            self.wh_scalar(&format!("SELECT COUNT(*) FROM {vt} WHERE __is_deleted"))?;
+        // A middle backfill row the stream never touched — the class the bug hid.
+        let mid = n / 2;
+        let mid_live = self.wh_scalar(&format!(
+            "SELECT COUNT(*) FROM {vt} WHERE id = {mid} AND NOT __is_deleted"
+        ))?;
+
+        Ok(vec![
+            // N preexisting − 1 delete + 1 insert = N live rows: the backfill survives.
+            ("backfill_all_live".into(), compare("live-count", live, n)),
+            // The delete is an auditable tombstone, not a silent disappearance.
+            (
+                "delete_sets_is_deleted".into(),
+                compare("tombstone-count", tombstoned, 1),
+            ),
+            // The regression guard: an untouched snapshot row must read as live
+            // (NULL `__op` → `COALESCE(.., FALSE)`), not vanish from the live filter.
+            (
+                "untouched_backfill_row_live".into(),
+                compare("mid-row-live", mid_live, 1),
+            ),
+        ])
+    }
+
+    /// Drop + recreate the cell's table and seed `n` rows (`id` 1..=n) on the
+    /// source — the preexisting data `cdc.initial: snapshot` backfills.
+    fn seed_backfill_table(&self, table: &str, n: i64) -> Result<()> {
+        let sql = match self.engine {
+            Engine::Mysql => format!(
+                "DROP TABLE IF EXISTS {table}; \
+                 CREATE TABLE {table} (id INT PRIMARY KEY, v VARCHAR(48)); \
+                 SET SESSION cte_max_recursion_depth = {depth}; \
+                 INSERT INTO {table} (id, v) WITH RECURSIVE seq(n) AS \
+                 (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < {n}) \
+                 SELECT n, CONCAT('orig-', n) FROM seq;",
+                depth = n + 1,
+            ),
+            Engine::Postgres => format!(
+                "DROP TABLE IF EXISTS {table}; \
+                 CREATE TABLE {table} (id INT PRIMARY KEY, v VARCHAR(48)); \
+                 INSERT INTO {table} (id, v) \
+                 SELECT g, 'orig-' || g FROM generate_series(1, {n}) g;"
+            ),
+            _ => bail!("seed_backfill_table: unsupported engine"),
+        };
+        self.source_raw(&sql)?;
+        Ok(())
     }
 
     /// Run a `mongosh` snippet against the lane's Mongo container.
@@ -1049,11 +1174,18 @@ impl Verification {
                 // left off (the anchor-at-open discipline the OSS Rig follows).
                 let ckpt =
                     std::env::temp_dir().join(format!("ckpt-{}", gcs_prefix.replace('/', "_")));
+                // `initial: snapshot` backfills preexisting rows before draining.
+                let initial = if self.initial_snapshot {
+                    "      initial: snapshot\n"
+                } else {
+                    ""
+                };
                 (
                     "cdc",
                     format!(
-                        "    cdc:\n      until_current: true\n      checkpoint: {}\n{}",
+                        "    cdc:\n      until_current: true\n      checkpoint: {}\n{}{}",
                         ckpt.display(),
+                        initial,
                         lane.cdc_field
                     ),
                 )

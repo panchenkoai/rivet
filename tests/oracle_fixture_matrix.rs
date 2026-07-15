@@ -197,3 +197,13 @@ fn mongo_cdc_delete_flag_bigquery() {
         .warehouse(Warehouse::BigQuery);
     assert_all_pass(v.run_mongo_cdc_delete().expect("mongo cdc delete"));
 }
+
+// ── CDC backfill: initial:snapshot covers a preexisting table; the view keeps ─
+// every backfilled row live (the snapshot/stream seam — NULL __op/__pos rows).
+#[test]
+#[ignore = "live: needs devbox mysql-cdc stack + BigQuery creds"]
+fn cdc_backfill_snapshot_mysql() {
+    let v = Verification::new(Engine::Mysql, Mode::Cdc, Fixture::smoke("cdc_backfill"))
+        .initial_snapshot();
+    assert_all_pass(v.run_cdc_backfill().expect("cdc backfill"));
+}
