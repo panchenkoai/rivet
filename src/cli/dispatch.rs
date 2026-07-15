@@ -855,33 +855,123 @@ fn prepare_load(
     }
 }
 
-/// Best-effort ledger write — a state-DB failure warns but never fails a load.
-#[allow(clippy::too_many_arguments)]
-fn record_load(
-    state: Option<&StateStore>,
-    load_id: &str,
-    plan: &load::plan::LoadPlan,
-    target_fqtn: &str,
-    mode: &str,
-    source_run_ids: &[String],
-    rows_loaded: i64,
-    status: &str,
-) {
-    let Some(s) = state else { return };
-    let rec = LoadRecord {
-        load_id: load_id.to_string(),
-        export_name: plan.table.clone(),
-        target_table: target_fqtn.to_string(),
-        warehouse: plan.load.target.name().to_string(),
-        mode: mode.to_string(),
-        source_run_ids: source_run_ids.to_vec(),
-        rows_loaded,
-        status: status.to_string(),
-        finished_at: chrono::Utc::now().to_rfc3339(),
-    };
-    if let Err(e) = s.store_load(&rec) {
-        eprintln!("  warning: load ledger write failed (load itself proceeded): {e:#}");
+/// The inputs every load shares; the batch/CDC specifics are the three closures
+/// [`execute_load`] takes. `mode` is the ledger's `"batch"`/`"cdc"` discriminator.
+struct LoadJob<'a> {
+    plan: &'a load::plan::LoadPlan,
+    run_id: &'a str,
+    state: Option<&'a StateStore>,
+    load_id: &'a str,
+    allow_source_drift: bool,
+    mode: &'a str,
+}
+
+/// The audit + skip-ledger writer for one load. A struct (not a bare closure) so
+/// the "which exit path writes which ledger row" invariant is unit-testable with
+/// an in-memory [`StateStore`] — no live warehouse or bucket.
+struct LoadCtx<'a> {
+    state: Option<&'a StateStore>,
+    load_id: &'a str,
+    export_name: &'a str,
+    target_fqtn: &'a str,
+    warehouse: &'a str,
+    mode: &'a str,
+}
+
+impl LoadCtx<'_> {
+    /// Best-effort ledger write — a state-DB failure warns but never fails a load.
+    fn record(&self, source_run_ids: &[String], rows_loaded: i64, status: &str) {
+        let Some(s) = self.state else { return };
+        let rec = LoadRecord {
+            load_id: self.load_id.to_string(),
+            export_name: self.export_name.to_string(),
+            target_table: self.target_fqtn.to_string(),
+            warehouse: self.warehouse.to_string(),
+            mode: self.mode.to_string(),
+            source_run_ids: source_run_ids.to_vec(),
+            rows_loaded,
+            status: status.to_string(),
+            finished_at: chrono::Utc::now().to_rfc3339(),
+        };
+        if let Err(e) = s.store_load(&rec) {
+            eprintln!("  warning: load ledger write failed (load itself proceeded): {e:#}");
+        }
     }
+    /// Nothing new to load — the ledger already covers every run.
+    fn record_skip(&self) {
+        self.record(&[], 0, "success");
+    }
+    /// The load errored after consuming `run_ids`.
+    fn record_failed(&self, run_ids: &[String]) {
+        self.record(run_ids, 0, "failed");
+    }
+    /// The load appended/loaded `rows` from `run_ids`.
+    fn record_success(&self, run_ids: &[String], rows: i64) {
+        self.record(run_ids, rows, "success");
+    }
+}
+
+/// The shared load envelope: open the store, build the loader, reconcile via the
+/// ledger, then run + record. Batch vs CDC differ ONLY in `progress` (the
+/// per-load log line), `run` (the load call, returning its row count + report),
+/// and `done` (the success trace). Every exit path records the load EXACTLY once
+/// — skip ⇒ `success`/0, run-`Err` ⇒ `failed`, run-`Ok` ⇒ `success`/rows — the
+/// ledger invariant in one place instead of copy-pasted across batch and CDC.
+fn execute_load<R>(
+    job: LoadJob<'_>,
+    progress: impl FnOnce(&LoadInputs),
+    run: impl FnOnce(
+        &dyn load::TargetLoader,
+        &crate::destination::gcs::GcsStore,
+        &LoadInputs,
+    ) -> Result<(u64, R)>,
+    done: impl FnOnce(&LoadInputs, &R),
+) -> Result<Option<R>> {
+    let store = load::open_store(&job.plan.destination)?;
+    let loader = load::build_loader(job.plan, job.run_id);
+    let target_fqtn = loader.fqtn(&job.plan.table);
+    let ctx = LoadCtx {
+        state: job.state,
+        load_id: job.load_id,
+        export_name: job.plan.table.as_str(),
+        target_fqtn: target_fqtn.as_str(),
+        warehouse: job.plan.load.target.name(),
+        mode: job.mode,
+    };
+    let inputs = match prepare_load(
+        &store,
+        job.plan,
+        job.state,
+        &target_fqtn,
+        job.allow_source_drift,
+    )? {
+        Some(i) => i,
+        None => {
+            let label = if job.mode == "cdc" {
+                "cdc load"
+            } else {
+                "load"
+            };
+            eprintln!(
+                "  {label} {} → {}: up to date — every extraction run already loaded",
+                job.plan.table,
+                job.plan.load.target.name(),
+            );
+            ctx.record_skip();
+            return Ok(None);
+        }
+    };
+    progress(&inputs);
+    let (rows, report) = match run(&*loader, &store, &inputs) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.record_failed(&inputs.source_run_ids);
+            return Err(e);
+        }
+    };
+    ctx.record_success(&inputs.source_run_ids, rows as i64);
+    done(&inputs, &report);
+    Ok(Some(report))
 }
 
 /// Load a single export's CDC change log: reconcile the run manifests, **append**
@@ -889,7 +979,6 @@ fn record_load(
 /// dedup view over it. The manifests' summed `row_count` gates the rows *this*
 /// load appends (before/after the append) — the file→warehouse leg for an
 /// accumulating, at-least-once log.
-#[allow(clippy::too_many_arguments)]
 fn load_one_cdc(
     plan: &load::plan::LoadPlan,
     run_id: &str,
@@ -899,80 +988,57 @@ fn load_one_cdc(
     state: Option<&StateStore>,
     load_id: &str,
 ) -> Result<Option<load::CdcLoadReport>> {
-    let store = load::open_store(&plan.destination)?;
-    let loader = load::build_loader(plan, run_id);
-    let target_fqtn = loader.fqtn(&plan.table);
-    let inputs = match prepare_load(&store, plan, state, &target_fqtn, allow_source_drift)? {
-        Some(i) => i,
-        None => {
-            eprintln!(
-                "  cdc load {} → {}: up to date — every extraction run already loaded",
-                plan.table,
-                plan.load.target.name(),
-            );
-            record_load(state, load_id, plan, &target_fqtn, "cdc", &[], 0, "success");
-            return Ok(None);
-        }
-    };
-    eprintln!(
-        "  cdc load {} → {} | engine={:?} pk={} manifests={} parquet_files={} expected_delta={}",
-        plan.table,
-        plan.load.target.name(),
-        engine,
-        pk.join(","),
-        inputs.integrity.manifests,
-        inputs.uris.len(),
-        inputs.integrity.file_rows,
-    );
-    // The driver gates the appended delta against the manifests' summed
-    // `row_count` and cleans up (only) after the gate passes.
-    let cleanup = plan
-        .load
-        .cleanup_source
-        .then_some((&store, plan.gcs_prefix.as_str()));
-    let report = match load::run_load_cdc(
-        &*loader,
-        &plan.table,
-        &plan.specs,
-        &inputs.uris,
-        pk,
-        engine,
-        Some(inputs.integrity.file_rows),
-        cleanup,
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            record_load(
-                state,
-                load_id,
-                plan,
-                &target_fqtn,
-                "cdc",
-                &inputs.source_run_ids,
-                0,
-                "failed",
-            );
-            return Err(e);
-        }
-    };
-    record_load(
+    let job = LoadJob {
+        plan,
+        run_id,
         state,
         load_id,
-        plan,
-        &target_fqtn,
-        "cdc",
-        &inputs.source_run_ids,
-        report.rows_appended as i64,
-        "success",
-    );
-    eprintln!(
-        "  integrity ✓ {} → appended {} to {} | current-state view {}",
-        inputs.integrity.chain_prefix(),
-        report.rows_appended,
-        report.changes_table,
-        report.view,
-    );
-    Ok(Some(report))
+        allow_source_drift,
+        mode: "cdc",
+    };
+    execute_load(
+        job,
+        |inputs| {
+            eprintln!(
+                "  cdc load {} → {} | engine={:?} pk={} manifests={} parquet_files={} expected_delta={}",
+                plan.table,
+                plan.load.target.name(),
+                engine,
+                pk.join(","),
+                inputs.integrity.manifests,
+                inputs.uris.len(),
+                inputs.integrity.file_rows,
+            );
+        },
+        |loader, store, inputs| {
+            // The driver gates the appended delta against the manifests' summed
+            // `row_count` and cleans up (only) after the gate passes.
+            let cleanup = plan
+                .load
+                .cleanup_source
+                .then_some((store, plan.gcs_prefix.as_str()));
+            let report = load::run_load_cdc(
+                loader,
+                &plan.table,
+                &plan.specs,
+                &inputs.uris,
+                pk,
+                engine,
+                Some(inputs.integrity.file_rows),
+                cleanup,
+            )?;
+            Ok((report.rows_appended, report))
+        },
+        |inputs, report| {
+            eprintln!(
+                "  integrity ✓ {} → appended {} to {} | current-state view {}",
+                inputs.integrity.chain_prefix(),
+                report.rows_appended,
+                report.changes_table,
+                report.view,
+            );
+        },
+    )
 }
 
 /// Load a single resolved table into its warehouse target, reconciling
@@ -990,92 +1056,60 @@ fn load_one(
     state: Option<&StateStore>,
     load_id: &str,
 ) -> Result<Option<load::LoadReport>> {
-    let store = load::open_store(&plan.destination)?;
-    let loader = load::build_loader(plan, run_id);
-    let target_fqtn = loader.fqtn(&plan.table);
-    let inputs = match prepare_load(&store, plan, state, &target_fqtn, allow_source_drift)? {
-        Some(i) => i,
-        None => {
-            eprintln!(
-                "  load {} → {}: up to date — every extraction run already loaded",
-                plan.table,
-                plan.load.target.name(),
-            );
-            record_load(
-                state,
-                load_id,
-                plan,
-                &target_fqtn,
-                "batch",
-                &[],
-                0,
-                "success",
-            );
-            return Ok(None);
-        }
-    };
-    eprintln!(
-        "  load {} → {} | columns={} partition={:?} manifests={} parquet_files={} expected_rows={}",
-        plan.table,
-        plan.load.target.name(),
-        plan.specs.len(),
-        plan.partition_by,
-        inputs.integrity.manifests,
-        inputs.uris.len(),
-        inputs.integrity.file_rows,
-    );
-    let cleanup = plan
-        .load
-        .cleanup_source
-        .then_some((&store, plan.gcs_prefix.as_str()));
-    let report = match load::run_load(
-        &*loader,
-        &plan.table,
-        &plan.specs,
-        &inputs.uris,
-        Some(inputs.integrity.file_rows),
-        cleanup,
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            record_load(
-                state,
-                load_id,
-                plan,
-                &target_fqtn,
-                "batch",
-                &inputs.source_run_ids,
-                0,
-                "failed",
-            );
-            return Err(e);
-        }
-    };
-    record_load(
+    let job = LoadJob {
+        plan,
+        run_id,
         state,
         load_id,
-        plan,
-        &target_fqtn,
-        "batch",
-        &inputs.source_run_ids,
-        report.rows_loaded as i64,
-        "success",
-    );
-    // The full chain, now that the warehouse leg is known. The loader already
-    // proved `warehouse == file` (its count gate) before returning, so this is
-    // an all-green trace, not an unchecked assertion.
-    eprintln!(
-        "  integrity ✓ {} → warehouse {} rows in {}{}",
-        inputs.integrity.chain_prefix(),
-        report.rows_loaded,
-        report.target_table,
-        if report.source_cleaned {
-            " (source cleaned)"
-        } else {
-            ""
+        allow_source_drift,
+        mode: "batch",
+    };
+    execute_load(
+        job,
+        |inputs| {
+            eprintln!(
+                "  load {} → {} | columns={} partition={:?} manifests={} parquet_files={} expected_rows={}",
+                plan.table,
+                plan.load.target.name(),
+                plan.specs.len(),
+                plan.partition_by,
+                inputs.integrity.manifests,
+                inputs.uris.len(),
+                inputs.integrity.file_rows,
+            );
         },
-    );
-    Ok(Some(report))
+        |loader, store, inputs| {
+            let cleanup = plan
+                .load
+                .cleanup_source
+                .then_some((store, plan.gcs_prefix.as_str()));
+            let report = load::run_load(
+                loader,
+                &plan.table,
+                &plan.specs,
+                &inputs.uris,
+                Some(inputs.integrity.file_rows),
+                cleanup,
+            )?;
+            Ok((report.rows_loaded, report))
+        },
+        |inputs, report| {
+            // The full chain, now that the warehouse leg is known. The loader
+            // already proved `warehouse == file` (its count gate) before
+            // returning, so this is an all-green trace, not an assertion.
+            eprintln!(
+                "  integrity ✓ {} → warehouse {} rows in {}{}",
+                inputs.integrity.chain_prefix(),
+                report.rows_loaded,
+                report.target_table,
+                if report.source_cleaned {
+                    " (source cleaned)"
+                } else {
+                    ""
+                },
+            );
+        },
+    )
 }
 
 /// A per-invocation load-run id: microsecond-since-epoch hex + zero-padded pid
@@ -1089,4 +1123,80 @@ fn generate_run_id() -> String {
         .map(|d| d.as_micros())
         .unwrap_or(0);
     format!("{micros:x}{:08x}", std::process::id())
+}
+
+#[cfg(test)]
+mod load_ledger_tests {
+    use super::*;
+
+    const TARGET: &str = "proj.ds.orders";
+
+    fn ctx<'a>(state: &'a StateStore, load_id: &'a str) -> LoadCtx<'a> {
+        LoadCtx {
+            state: Some(state),
+            load_id,
+            export_name: "orders",
+            target_fqtn: TARGET,
+            warehouse: "bigquery",
+            mode: "cdc",
+        }
+    }
+
+    // The three `record_*` methods ARE the ledger invariant `execute_load`
+    // enforces per exit path — pinned here offline instead of only live.
+
+    #[test]
+    fn record_success_logs_the_load_and_marks_its_runs_loaded() {
+        let s = StateStore::open_in_memory().unwrap();
+        ctx(&s, "L1").record_success(&["r1".into(), "r2".into()], 5);
+        let loads = s.recent_loads(Some(TARGET), 10).unwrap();
+        assert_eq!(loads.len(), 1);
+        assert_eq!(loads[0].status, "success");
+        assert_eq!(loads[0].rows_loaded, 5);
+        let loaded = s.loaded_source_run_ids(TARGET).unwrap();
+        assert!(
+            loaded.contains("r1") && loaded.contains("r2"),
+            "a successful load marks its runs so the next load skips them"
+        );
+    }
+
+    #[test]
+    fn record_skip_logs_a_zero_row_success_and_marks_nothing() {
+        let s = StateStore::open_in_memory().unwrap();
+        ctx(&s, "L1").record_skip();
+        let loads = s.recent_loads(Some(TARGET), 10).unwrap();
+        assert_eq!(loads.len(), 1);
+        assert_eq!(loads[0].status, "success");
+        assert_eq!(loads[0].rows_loaded, 0);
+        assert!(
+            s.loaded_source_run_ids(TARGET).unwrap().is_empty(),
+            "an up-to-date no-op consumes no runs"
+        );
+    }
+
+    #[test]
+    fn record_failed_logs_a_failed_audit_row() {
+        let s = StateStore::open_in_memory().unwrap();
+        ctx(&s, "L1").record_failed(&["r1".into()]);
+        let loads = s.recent_loads(Some(TARGET), 10).unwrap();
+        assert_eq!(loads.len(), 1);
+        assert_eq!(loads[0].status, "failed");
+        assert_eq!(loads[0].rows_loaded, 0);
+    }
+
+    #[test]
+    fn record_is_a_noop_without_a_state_store() {
+        // Stateless load (state=None): recording must not panic and writes nothing.
+        let c = LoadCtx {
+            state: None,
+            load_id: "L1",
+            export_name: "orders",
+            target_fqtn: TARGET,
+            warehouse: "bigquery",
+            mode: "batch",
+        };
+        c.record_success(&["r1".into()], 3);
+        c.record_skip();
+        c.record_failed(&["r2".into()]);
+    }
 }
