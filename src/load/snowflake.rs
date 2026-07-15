@@ -16,8 +16,8 @@
 //! labels): the tag shows up in `ACCOUNT_USAGE.QUERY_HISTORY`, so per-`rivet_op`
 //! warehouse credits can be summed after the fact.
 
-use super::{LoadReport, TargetLoader, WriteMode};
-use crate::types::target::{ExportTarget, TargetColumnSpec, TargetStatus};
+use super::TargetLoader;
+use crate::types::target::TargetColumnSpec;
 use anyhow::{Context, Result, bail};
 use std::process::Command;
 
@@ -37,19 +37,12 @@ pub struct SnowflakeLoader {
     pub gcs_url: String,
     /// Clustering key — column(s)/expression(s) for `CLUSTER BY`, enabling
     /// background auto-clustering. Empty = no clustering key. Applies only at
-    /// table creation (a `CREATE OR REPLACE`, i.e. `WriteMode::Overwrite`).
+    /// table creation.
     pub cluster_by: Vec<String>,
-    pub write_mode: WriteMode,
     /// Absolute path to the connection's private key. The `snow` CLI does not
     /// expand `~`, so a `~`-relative `private_key_path` in the connection file
     /// must be overridden with an absolute path via env.
     pub private_key_path: Option<String>,
-    /// Delete the source GCS objects (via `gcloud`) after a verified load.
-    pub cleanup_source: bool,
-    /// `gs://…` prefix to delete recursively on cleanup (the export's prefix).
-    pub cleanup_prefix: Option<String>,
-    /// Expected row count (from the run manifest); verified post-load.
-    pub expected_rows: Option<u64>,
     /// Load-run correlation id, emitted in the `QUERY_TAG` JSON as `rivet_run`
     /// so every statement of one `rivet load` invocation shares a run key —
     /// cost slices per run (across tables) as well as per table. `None` omits it.
@@ -166,48 +159,28 @@ impl SnowflakeLoader {
 }
 
 impl TargetLoader for SnowflakeLoader {
-    fn target(&self) -> ExportTarget {
-        ExportTarget::Snowflake
+    fn fqtn(&self, table: &str) -> String {
+        format!("{}.{}.{}", self.database, self.schema, table)
     }
 
-    fn load(
-        &mut self,
+    fn materialize(
+        &self,
         table: &str,
         specs: &[TargetColumnSpec],
-        parquet_uris: &[String],
-    ) -> Result<LoadReport> {
-        if parquet_uris.is_empty() {
-            bail!("no Parquet URIs to load");
-        }
-        if specs.is_empty() {
-            bail!("no column specs — nothing to build a schema from");
-        }
-        if let Some(bad) = specs.iter().find(|s| s.status == TargetStatus::Fail) {
-            bail!(
-                "column `{}` resolves to a Fail status ({}) — refusing to load",
-                bad.column_name,
-                bad.target_type
-            );
-        }
-
+        _uris: &[String],
+    ) -> Result<u64> {
         let fqtn = self.fqtn(table);
         let ddl = Self::build_schema_ddl(specs);
         let select = Self::build_copy_select(specs);
         let columns = Self::build_column_list(specs);
-        let create_verb = match self.write_mode {
-            WriteMode::Overwrite => "CREATE OR REPLACE TABLE",
-            // Append: create if absent, then COPY appends into it.
-            WriteMode::Append => "CREATE TABLE IF NOT EXISTS",
-        };
-        // A per-load external stage over the export's GCS prefix. Uniquely named
-        // off the table so concurrent loads don't collide.
+        // A per-load external stage over the export's GCS prefix; the COPY loads
+        // every Parquet under it (`PATTERN`), so the explicit URI list is unused.
         let stage = format!("rivet_stage_{}", sanitize_tag(table));
         let cluster = Self::cluster_clause(&self.cluster_by);
 
-        // Pin the session to UTC before the COPY: Snowflake stamps a Parquet
-        // timestamp with the *session* offset, so on a non-UTC account (default
-        // is often America/Los_Angeles) a `timestamptz` lands shifted by that
-        // offset. UTC keeps the instant byte-for-byte with the source.
+        // `CREATE OR REPLACE` (overwrite): storage is the source of truth. Pin
+        // the session to UTC before the COPY — Snowflake otherwise stamps a
+        // Parquet timestamp with the session offset, shifting a `timestamptz`.
         let sql = format!(
             "ALTER SESSION SET QUERY_TAG = '{tag}';\n\
              ALTER SESSION SET TIMEZONE = 'UTC';\n\
@@ -215,7 +188,7 @@ impl TargetLoader for SnowflakeLoader {
              USE SCHEMA {db}.{sc};\n\
              CREATE FILE FORMAT IF NOT EXISTS rivet_pq TYPE=PARQUET BINARY_AS_TEXT=FALSE;\n\
              CREATE OR REPLACE STAGE {stage} URL='{url}' STORAGE_INTEGRATION={si} FILE_FORMAT=rivet_pq;\n\
-             {create_verb} {fqtn} (\n{ddl}\n){cluster};\n\
+             CREATE OR REPLACE TABLE {fqtn} (\n{ddl}\n){cluster};\n\
              COPY INTO {fqtn} ({columns})\n\
              \x20 FROM (SELECT {select} FROM @{stage})\n\
              \x20 FILE_FORMAT=(FORMAT_NAME=rivet_pq) PATTERN='.*[.]parquet';\n\
@@ -229,65 +202,20 @@ impl TargetLoader for SnowflakeLoader {
         );
 
         let result = self.run_snow(&sql)?;
-        let rows_loaded = extract_count(&result)
-            .context("COPY ran but the row count could not be read from snow output")?;
-
-        if let Some(expected) = self.expected_rows
-            && rows_loaded != expected
-        {
-            bail!(
-                "row count mismatch after load into {fqtn}: expected {expected}, got {rows_loaded} \
-                 — NOT cleaning up the source"
-            );
-        }
-
-        let mut source_cleaned = false;
-        if self.cleanup_source {
-            let prefix = self
-                .cleanup_prefix
-                .clone()
-                .or_else(|| common_prefix(parquet_uris));
-            match prefix {
-                Some(p) => match super::delete_prefix(&p) {
-                    Ok(()) => source_cleaned = true,
-                    Err(e) => eprintln!("warning: source cleanup failed (load OK): {e:#}"),
-                },
-                None => eprintln!("warning: no common prefix to clean up"),
-            }
-        }
-
-        Ok(LoadReport {
-            rows_loaded,
-            target_table: fqtn,
-            load_jobs: 1,
-            source_cleaned,
-        })
+        // ponytail: rows via COUNT(*); can become the COPY's `rows_loaded`
+        // (metadata) behind this seam, no driver change.
+        extract_count(&result)
+            .context("COPY ran but the row count could not be read from snow output")
     }
 
-    fn load_cdc(
-        &mut self,
+    fn append_changelog(
+        &self,
         table: &str,
         specs: &[TargetColumnSpec],
-        parquet_uris: &[String],
+        _uris: &[String],
         pk: &[String],
-        engine: crate::load::cdc::SourceEngine,
-        expected_delta: Option<u64>,
-    ) -> Result<super::CdcLoadReport> {
+    ) -> Result<u64> {
         use crate::load::cdc::Warehouse;
-
-        if parquet_uris.is_empty() {
-            bail!("no Parquet URIs to append into `{table}__changes`");
-        }
-        if pk.is_empty() {
-            bail!("CDC load of `{table}` needs a primary key for the dedup view (pass --pk)");
-        }
-        if let Some(bad) = specs.iter().find(|s| s.status == TargetStatus::Fail) {
-            bail!(
-                "column `{}` resolves to a Fail status ({}) — refusing to load",
-                bad.column_name,
-                bad.target_type
-            );
-        }
         // Full change-log schema: rivet's `__op`/`__pos`/`__seq` meta columns
         // (not reported by `rivet check`) ahead of the resolved data columns.
         let mut full = crate::load::cdc::meta_column_specs(Warehouse::Snowflake);
@@ -300,26 +228,14 @@ impl TargetLoader for SnowflakeLoader {
 
         let changes = format!("{table}__changes");
         let changes_fqtn = self.fqtn(&changes);
-        let view_fqtn = self.fqtn(table);
         let ddl = Self::build_schema_ddl(&full);
         let select = Self::build_copy_select(&full);
         let columns = Self::build_column_list(&full);
         let cluster = Self::cluster_clause(pk);
         let stage = format!("rivet_stage_{}", sanitize_tag(&changes));
-        let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
-        let view_sql = crate::load::cdc::dedup_view_sql(
-            Warehouse::Snowflake,
-            &view_fqtn,
-            &changes_fqtn,
-            &pk_refs,
-            engine,
-        );
 
-        // One script: ensure the log exists (clustered on PK), COUNT before,
-        // append via COPY, COUNT after, then (re)build the dedup view. The
-        // before/after delta is the file→warehouse gate for the append path.
-        // `TIMEZONE = 'UTC'` keeps `timestamptz` instants faithful — Snowflake
-        // otherwise stamps a Parquet timestamp with the session offset.
+        // Ensure the log exists (clustered on PK), COUNT before, append via COPY,
+        // COUNT after — the delta is what THIS load added; the driver gates it.
         let sql = format!(
             "ALTER SESSION SET QUERY_TAG = '{tag}';\n\
              ALTER SESSION SET TIMEZONE = 'UTC';\n\
@@ -332,8 +248,7 @@ impl TargetLoader for SnowflakeLoader {
              COPY INTO {changes_fqtn} ({columns})\n\
              \x20 FROM (SELECT {select} FROM @{stage})\n\
              \x20 FILE_FORMAT=(FORMAT_NAME=rivet_pq) PATTERN='.*[.]parquet';\n\
-             SELECT COUNT(*) AS AFTER_ FROM {changes_fqtn};\n\
-             {view_sql}",
+             SELECT COUNT(*) AS AFTER_ FROM {changes_fqtn};",
             tag = self.query_tag(&changes),
             wh = self.warehouse,
             db = self.database,
@@ -347,22 +262,38 @@ impl TargetLoader for SnowflakeLoader {
             .context("CDC load ran but the pre-append count (BEFORE_) could not be read")?;
         let after = extract_named(&result, "AFTER_")
             .context("CDC load ran but the post-append count (AFTER_) could not be read")?;
-        let rows_appended = after.saturating_sub(before);
+        Ok(after.saturating_sub(before))
+    }
 
-        if let Some(expected) = expected_delta
-            && rows_appended != expected
-        {
-            bail!(
-                "CDC count validation failed for {changes_fqtn}: appended {rows_appended} rows \
-                 (before={before}, after={after}), expected {expected} from the run manifests"
-            );
-        }
+    fn create_dedup_view(
+        &self,
+        table: &str,
+        pk: &[String],
+        engine: crate::load::cdc::SourceEngine,
+    ) -> Result<()> {
+        use crate::load::cdc::Warehouse;
+        let changes_fqtn = self.fqtn(&format!("{table}__changes"));
+        let view_fqtn = self.fqtn(table);
+        let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
+        let view_sql = crate::load::cdc::dedup_view_sql(
+            Warehouse::Snowflake,
+            &view_fqtn,
+            &changes_fqtn,
+            &pk_refs,
+            engine,
+        );
+        // Fully-qualified DDL; a QUERY_TAG keeps it cost-attributable. CREATE VIEW
+        // is metadata — no warehouse compute needed.
+        let sql = format!(
+            "ALTER SESSION SET QUERY_TAG = '{tag}';\n{view_sql}",
+            tag = self.query_tag(table),
+        );
+        self.run_snow(&sql)?;
+        Ok(())
+    }
 
-        Ok(super::CdcLoadReport {
-            rows_appended,
-            changes_table: changes_fqtn,
-            view: view_fqtn,
-        })
+    fn cleanup(&self, prefix: &str) -> Result<()> {
+        super::delete_prefix(prefix)
     }
 }
 
@@ -383,16 +314,6 @@ fn sanitize_tag(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()
-}
-
-/// The longest `gs://…/` prefix shared by all URIs (for cleanup fallback).
-fn common_prefix(uris: &[String]) -> Option<String> {
-    let first = uris.first()?;
-    let end = first.rfind('/').map(|i| i + 1)?;
-    let prefix = &first[..end];
-    uris.iter()
-        .all(|u| u.starts_with(prefix))
-        .then(|| prefix.to_string())
 }
 
 /// Pull the `ROWS_` count out of snow's JSON (array of statement result blocks).
@@ -420,6 +341,7 @@ fn extract_named(value: &serde_json::Value, key: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::target::TargetStatus;
 
     fn spec(name: &str, ty: &str) -> TargetColumnSpec {
         TargetColumnSpec {
@@ -517,17 +439,5 @@ mod tests {
         assert_eq!(extract_named(&v, "BEFORE_"), Some(10));
         assert_eq!(extract_named(&v, "AFTER_"), Some(35));
         assert_eq!(extract_named(&v, "MISSING_"), None);
-    }
-
-    #[test]
-    fn common_prefix_of_sibling_parquet() {
-        let uris = vec![
-            "gs://b/exports/orders/a.parquet".to_string(),
-            "gs://b/exports/orders/b.parquet".to_string(),
-        ];
-        assert_eq!(
-            common_prefix(&uris).as_deref(),
-            Some("gs://b/exports/orders/")
-        );
     }
 }

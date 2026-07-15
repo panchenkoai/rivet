@@ -37,15 +37,16 @@
 //!   you cannot convert an existing table by overwriting it, and clustering is
 //!   capped at 4 columns. The loader manages its own target table.
 //! - A single load *or* query job may modify at most **4,000 partitions**. A
-//!   partitioned load spanning more fails; [`BigQueryLoader::load`] surfaces an
-//!   actionable error telling you to split the URIs by partition range.
+//!   partitioned load spanning more is split into several `LOAD DATA` jobs, each
+//!   under the cap (see `plan_load_batches`); a non-splittable overflow surfaces
+//!   an actionable error telling you to split the URIs by partition range.
 //!
 //! ## Cost attribution via job labels
 //!
 //! Every BigQuery job the loader creates is labeled so its cost is
 //! automatically attributable: `managed_by:rivet`, `rivet_op:<load|count>`,
 //! `rivet_table:<table>`, `rivet_run:<id>` (the load-run correlation id, when
-//! set), plus any labels added via [`BigQueryLoader::label`].
+//! set).
 //! The batch ops are free load/metadata jobs (`total_bytes_billed = 0`); the
 //! CDC path adds billed `merge` / `compact` ops on the same `run_sql(sql, op,
 //! table)` seam, so a billed dedup step shows on its own cost line (see
@@ -70,8 +71,8 @@
 //! BigQuery live tests use, so auth is whatever `bq` is configured with (ADC /
 //! service account) and no credentials touch this crate.
 
-use super::{LoadReport, TargetLoader, WriteMode};
-use crate::types::target::{ExportTarget, TargetColumnSpec, TargetStatus};
+use super::TargetLoader;
+use crate::types::target::TargetColumnSpec;
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::process::{Command, Output};
@@ -93,11 +94,6 @@ pub struct BigQueryLoader {
     pub partition_by: Option<String>,
     /// Up to 4 clustering columns. Applied only when the table is created.
     pub cluster_by: Vec<String>,
-    pub write_mode: WriteMode,
-    /// Extra job labels applied to every BigQuery job, on top of the automatic
-    /// `managed_by:rivet` / `rivet_op:<op>` / `rivet_table:<table>` labels. Use
-    /// for cost attribution (`env:prod`, `team:analytics`, …).
-    pub labels: Vec<(String, String)>,
     /// Load-run correlation id, emitted as the automatic `rivet_run:<id>` job
     /// label so every job of one `rivet load` invocation shares a run key —
     /// cost slices per run (across tables) as well as per table. `None` omits
@@ -107,18 +103,8 @@ pub struct BigQueryLoader {
     /// limit is 4,000. When a daily-partitioned, Hive-prefixed input
     /// (`<col>=YYYY-MM-DD/…`, as rivet's `partition_by` writes) spans more than
     /// this, the free load is split into several `LOAD DATA` jobs, each under
-    /// the cap. Lower it only for testing.
+    /// the cap.
     pub max_partitions_per_job: usize,
-    /// If set, the load fails unless the target's final row count equals this
-    /// (from the run manifest) — a completeness gate checked before any cleanup.
-    pub expected_rows: Option<u64>,
-    /// Delete the source GCS objects after a verified load. Off by default —
-    /// deleting source data is destructive.
-    pub cleanup_source: bool,
-    /// When set, cleanup deletes this whole `gs://…/` prefix in one recursive
-    /// call (fast) instead of the loaded objects one chunk at a time. Only pass
-    /// a prefix dedicated to this export (rivet's per-export destination is).
-    pub cleanup_prefix: Option<String>,
 }
 
 impl BigQueryLoader {
@@ -128,54 +114,13 @@ impl BigQueryLoader {
             dataset: dataset.into(),
             partition_by: None,
             cluster_by: Vec::new(),
-            write_mode: WriteMode::default(),
-            labels: Vec::new(),
             run_id: None,
             max_partitions_per_job: DEFAULT_MAX_PARTITIONS_PER_JOB,
-            expected_rows: None,
-            cleanup_source: false,
-            cleanup_prefix: None,
         }
-    }
-
-    /// Require the loaded table to have exactly `n` rows (count validation).
-    /// The load fails on a mismatch and does not clean up the source.
-    pub fn expect_rows(mut self, n: u64) -> Self {
-        self.expected_rows = Some(n);
-        self
-    }
-
-    /// After a verified load, delete the source GCS objects (destructive; off
-    /// by default).
-    pub fn cleanup_source(mut self, yes: bool) -> Self {
-        self.cleanup_source = yes;
-        self
-    }
-
-    /// Delete this whole `gs://…/` prefix on cleanup (one fast recursive call)
-    /// instead of per-object. Pass only an export-dedicated prefix.
-    pub fn cleanup_prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.cleanup_prefix = Some(prefix.into());
-        self
     }
 
     pub fn partition_by(mut self, expr: impl Into<String>) -> Self {
         self.partition_by = Some(expr.into());
-        self
-    }
-
-    /// Override the per-job partition cap (default 4,000). For testing the
-    /// batch-split path without generating 4,000+ real partitions.
-    pub fn max_partitions_per_job(mut self, n: usize) -> Self {
-        self.max_partitions_per_job = n.max(1);
-        self
-    }
-
-    /// Attach an extra job label (for cost attribution) to every job. Key and
-    /// value are sanitized to BigQuery's `[a-z0-9_-]` label charset.
-    pub fn label(mut self, key: impl AsRef<str>, value: impl AsRef<str>) -> Self {
-        self.labels
-            .push((sanitize_label(key.as_ref()), sanitize_label(value.as_ref())));
         self
     }
 
@@ -188,15 +133,6 @@ impl BigQueryLoader {
     pub fn cluster_by(mut self, columns: Vec<String>) -> Self {
         self.cluster_by = columns;
         self
-    }
-
-    pub fn append(mut self) -> Self {
-        self.write_mode = WriteMode::Append;
-        self
-    }
-
-    fn fqtn(&self, table: &str) -> String {
-        format!("{}.{}.{}", self.project, self.dataset, table)
     }
 
     /// Run `bq --project_id=<p> <args…>`. On failure, `bq` prints the actual
@@ -227,7 +163,7 @@ impl BigQueryLoader {
 
     /// The automatic + user labels for a job, as repeated `--label k:v` args.
     fn label_flags(&self, op: &str, table: &str) -> Vec<String> {
-        build_label_flags(op, table, self.run_id.as_deref(), &self.labels)
+        build_label_flags(op, table, self.run_id.as_deref())
     }
 
     /// Run a SQL statement (free `LOAD DATA` load job or a billed CTAS/query),
@@ -257,99 +193,33 @@ impl BigQueryLoader {
             _ => vec![uris.to_vec()],
         }
     }
-
-    /// Delete the loaded source objects from GCS after a verified load. Chunked
-    /// to stay under argv limits. A failure is surfaced (the data is safely in
-    /// BigQuery, but the operator asked for cleanup and it didn't happen).
-    fn delete_source(&self, uris: &[String]) -> Result<()> {
-        for chunk in uris.chunks(100) {
-            // `--continue-on-error`: an already-gone object (a re-run, an
-            // eventual-consistency blip) must not abort the whole cleanup —
-            // its removal is exactly the goal.
-            let mut args = vec![
-                "storage".to_string(),
-                "rm".to_string(),
-                "-q".to_string(),
-                "--continue-on-error".to_string(),
-            ];
-            args.extend(chunk.iter().cloned());
-            let out = Command::new("gcloud")
-                .args(&args)
-                .output()
-                .context("failed to run `gcloud storage rm` for source cleanup")?;
-            if !out.status.success() {
-                bail!(
-                    "source cleanup (`gcloud storage rm`) failed: {}",
-                    clean_bq_output(&out.stderr)
-                );
-            }
-        }
-        Ok(())
-    }
 }
 
 impl TargetLoader for BigQueryLoader {
-    fn target(&self) -> ExportTarget {
-        ExportTarget::BigQuery
+    fn fqtn(&self, table: &str) -> String {
+        format!("{}.{}.{}", self.project, self.dataset, table)
     }
 
-    fn load(
-        &mut self,
-        table: &str,
-        specs: &[TargetColumnSpec],
-        parquet_uris: &[String],
-    ) -> Result<LoadReport> {
-        if parquet_uris.is_empty() {
-            bail!("no Parquet URIs to load into `{table}`");
-        }
-        if specs.is_empty() {
-            bail!(
-                "no column specs for `{table}` — resolve them with ExportTarget::BigQuery.resolve_table()"
-            );
-        }
+    fn materialize(&self, table: &str, specs: &[TargetColumnSpec], uris: &[String]) -> Result<u64> {
         if self.cluster_by.len() > MAX_CLUSTER_COLUMNS {
             bail!(
                 "BigQuery allows at most {MAX_CLUSTER_COLUMNS} clustering columns, got {}",
                 self.cluster_by.len()
             );
         }
-        // Never silently drop an unmappable column (CLAUDE.md: silent-loss
-        // classes). A `Fail` spec has no BigQuery type — refuse, name it.
-        let failed: Vec<&str> = specs
-            .iter()
-            .filter(|s| s.status == TargetStatus::Fail)
-            .map(|s| s.column_name.as_str())
-            .collect();
-        if !failed.is_empty() {
-            bail!(
-                "cannot load `{table}`: {} column(s) do not map to BigQuery: {}",
-                failed.len(),
-                failed.join(", ")
-            );
-        }
-
         let target = self.fqtn(table);
         let schema = build_schema(specs);
 
-        // ONE free path. Declaring each column's native `target_type` inline in
+        // ONE free path: declaring each column's native `target_type` inline in
         // LOAD DATA makes BigQuery coerce the Parquet on load — JSON, DATETIME,
-        // TIME, NUMERIC, … land natively for FREE (a load job, not a query), so
-        // no post-load CTAS is needed (verified live). A daily-partitioned,
-        // Hive-prefixed input over the per-job partition cap is split into
-        // several free LOAD DATA jobs.
-        let batches = self.plan_load_batches(parquet_uris);
-        let load_jobs = batches.len();
-        for (i, batch) in batches.iter().enumerate() {
-            // Batch 0 honors write_mode (OVERWRITE replaces the table); later
-            // batches append so they add to — not clobber — it.
-            let mode = if i == 0 {
-                self.write_mode
-            } else {
-                WriteMode::Append
-            };
+        // NUMERIC, … land natively for FREE (a load job, not a query). A
+        // daily-partitioned, Hive-prefixed input over the per-job partition cap
+        // is split into several free LOAD DATA jobs: batch 0 OVERWRITEs the
+        // table, later batches append so they add to — not clobber — it.
+        for (i, batch) in self.plan_load_batches(uris).iter().enumerate() {
             let sql = build_load_data_sql(
                 &target,
-                mode,
+                i == 0, // overwrite the first batch, append the rest
                 &schema,
                 &self.partition_by,
                 &self.cluster_by,
@@ -357,80 +227,22 @@ impl TargetLoader for BigQueryLoader {
             );
             self.run_sql(&sql, "load", table)?;
         }
-        let rows_loaded = self.count_rows(&target, table)?;
-
-        // Count validation: the loaded table must match the expected row count
-        // (from the run manifest) before we trust — or clean up — anything.
-        if let Some(expected) = self.expected_rows
-            && rows_loaded != expected
-        {
-            bail!(
-                "count validation failed for `{target}`: loaded {rows_loaded} rows, expected \
-                 {expected} — NOT cleaning up source; investigate before re-running"
-            );
-        }
-
-        // Source cleanup: only after a verified load, and only if opted in. A
-        // cleanup failure must NOT fail the load — the data is safely in
-        // BigQuery and the count is verified; surface it as a warning. A
-        // dedicated prefix deletes in one recursive call; otherwise fall back
-        // to per-object deletion of the loaded URIs.
-        let source_cleaned = if self.cleanup_source {
-            let result = match &self.cleanup_prefix {
-                Some(prefix) => super::delete_prefix(prefix),
-                None => self.delete_source(parquet_uris),
-            };
-            match result {
-                Ok(()) => true,
-                Err(e) => {
-                    eprintln!("warning: source cleanup failed (data is safely loaded): {e:#}");
-                    false
-                }
-            }
-        } else {
-            false
-        };
-
-        Ok(LoadReport {
-            rows_loaded,
-            target_table: target,
-            load_jobs,
-            source_cleaned,
-        })
+        // ponytail: rows via COUNT(*) (a 0-byte-billed metadata read); can become
+        // the load job's `outputRows` (also metadata) behind this seam, no driver
+        // change.
+        self.count_rows(&target, table)
     }
 
-    fn load_cdc(
-        &mut self,
+    fn append_changelog(
+        &self,
         table: &str,
         specs: &[TargetColumnSpec],
-        parquet_uris: &[String],
+        uris: &[String],
         pk: &[String],
-        engine: crate::load::cdc::SourceEngine,
-        expected_delta: Option<u64>,
-    ) -> Result<super::CdcLoadReport> {
+    ) -> Result<u64> {
         use crate::load::cdc::Warehouse;
-
-        if parquet_uris.is_empty() {
-            bail!("no Parquet URIs to append into `{table}__changes`");
-        }
-        if pk.is_empty() {
-            bail!("CDC load of `{table}` needs a primary key for the dedup view (pass --pk)");
-        }
-        // The full change-log schema is rivet's `__op`/`__pos`/`__seq` meta
-        // columns (which `rivet check` does not report) ahead of the resolved
-        // data columns. Refuse a `Fail` data column, as the batch path does.
-        let failed: Vec<&str> = specs
-            .iter()
-            .filter(|s| s.status == TargetStatus::Fail)
-            .map(|s| s.column_name.as_str())
-            .collect();
-        if !failed.is_empty() {
-            bail!(
-                "cannot load `{table}__changes`: {} column(s) do not map to BigQuery: {}",
-                failed.len(),
-                failed.join(", ")
-            );
-        }
+        // Full change-log schema: rivet's `__op`/`__pos`/`__seq` meta columns
+        // (not reported by `rivet check`) ahead of the resolved data columns.
         let mut full = crate::load::cdc::meta_column_specs(Warehouse::BigQuery);
         full.extend(
             specs
@@ -443,53 +255,42 @@ impl TargetLoader for BigQueryLoader {
         let changes = format!("{table}__changes");
         let changes_fqtn = self.fqtn(&changes);
 
-        // 1. Ensure the append-only log exists, clustered on the PK so the view
-        //    below prunes efficiently. Idempotent: created once, appended forever.
+        // Ensure the append-only log exists, clustered on the PK so the dedup
+        // view prunes efficiently. Idempotent: created once, appended forever.
         let create = build_create_changes_sql(&changes_fqtn, &schema, pk);
         self.run_sql(&create, "create", &changes)?;
 
-        // 2. Count before / append (free LOAD DATA INTO) / count after — the
-        //    delta is what THIS load added, gated against the manifest total.
+        // Count before / append (free LOAD DATA INTO) / count after — the delta
+        // is what THIS load added; the driver gates it against the manifest total.
         let before = self.count_rows(&changes_fqtn, &changes)?;
-        let load = build_load_data_sql(
-            &changes_fqtn,
-            WriteMode::Append,
-            &schema,
-            &None,
-            &[],
-            parquet_uris,
-        );
+        let load = build_load_data_sql(&changes_fqtn, false, &schema, &None, &[], uris);
         self.run_sql(&load, "load", &changes)?;
         let after = self.count_rows(&changes_fqtn, &changes)?;
-        let rows_appended = after.saturating_sub(before);
+        Ok(after.saturating_sub(before))
+    }
 
-        if let Some(expected) = expected_delta
-            && rows_appended != expected
-        {
-            bail!(
-                "CDC count validation failed for `{changes_fqtn}`: appended {rows_appended} rows \
-                 (before={before}, after={after}), expected {expected} from the run manifests — \
-                 investigate before trusting the view"
-            );
-        }
-
-        // 3. (Re)build the current-state dedup view over the log.
+    fn create_dedup_view(
+        &self,
+        table: &str,
+        pk: &[String],
+        engine: crate::load::cdc::SourceEngine,
+    ) -> Result<()> {
+        let changes_fqtn = self.fqtn(&format!("{table}__changes"));
         let view_fqtn = self.fqtn(table);
         let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
         let view_sql = crate::load::cdc::dedup_view_sql(
-            Warehouse::BigQuery,
+            crate::load::cdc::Warehouse::BigQuery,
             &view_fqtn,
             &changes_fqtn,
             &pk_refs,
             engine,
         );
         self.run_sql(&view_sql, "view", table)?;
+        Ok(())
+    }
 
-        Ok(super::CdcLoadReport {
-            rows_appended,
-            changes_table: changes_fqtn,
-            view: view_fqtn,
-        })
+    fn cleanup(&self, prefix: &str) -> Result<()> {
+        super::delete_prefix(prefix)
     }
 }
 
@@ -599,16 +400,13 @@ fn build_schema(specs: &[TargetColumnSpec]) -> String {
 /// BigQuery coerces the Parquet to native types on load.
 fn build_load_data_sql(
     fqtn: &str,
-    mode: WriteMode,
+    overwrite: bool,
     schema: &str,
     partition_by: &Option<String>,
     cluster_by: &[String],
     uris: &[String],
 ) -> String {
-    let kw = match mode {
-        WriteMode::Overwrite => "OVERWRITE",
-        WriteMode::Append => "INTO",
-    };
+    let kw = if overwrite { "OVERWRITE" } else { "INTO" };
     let clauses = table_shape_clauses(partition_by, cluster_by);
     format!(
         "LOAD DATA {kw} `{fqtn}` (\n{schema}\n){clauses}\n{};",
@@ -644,12 +442,7 @@ fn count_args(fqtn: &str, labels: &[String]) -> Vec<String> {
 /// when a run id is set, plus any `extra` (user) labels. These land in
 /// `INFORMATION_SCHEMA.JOBS.labels` and the billing export, so cost can be
 /// attributed per run and per table.
-fn build_label_flags(
-    op: &str,
-    table: &str,
-    run_id: Option<&str>,
-    extra: &[(String, String)],
-) -> Vec<String> {
+fn build_label_flags(op: &str, table: &str, run_id: Option<&str>) -> Vec<String> {
     let mut labels: Vec<(String, String)> = vec![
         ("managed_by".into(), "rivet".into()),
         ("rivet_op".into(), sanitize_label(op)),
@@ -658,7 +451,6 @@ fn build_label_flags(
     if let Some(id) = run_id {
         labels.push(("rivet_run".into(), sanitize_label(id)));
     }
-    labels.extend(extra.iter().cloned());
     labels
         .into_iter()
         .flat_map(|(k, v)| ["--label".to_string(), format!("{k}:{v}")])
@@ -725,6 +517,7 @@ fn augment_partition_limit(e: anyhow::Error) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::target::TargetStatus;
 
     fn spec(name: &str, cast: Option<&str>, status: TargetStatus) -> TargetColumnSpec {
         TargetColumnSpec {
@@ -767,14 +560,7 @@ mod tests {
     #[test]
     fn load_data_declares_native_schema_and_is_a_free_batch_load() {
         let schema = build_schema(&[typed("id", "INT64"), typed("json_col", "JSON")]);
-        let sql = build_load_data_sql(
-            "p.d.orders",
-            WriteMode::Overwrite,
-            &schema,
-            &None,
-            &[],
-            &uris(),
-        );
+        let sql = build_load_data_sql("p.d.orders", true, &schema, &None, &[], &uris());
         assert!(sql.starts_with("LOAD DATA OVERWRITE `p.d.orders` ("));
         // Native types declared inline → BigQuery coerces on load, for free.
         assert!(sql.contains("json_col JSON"));
@@ -786,14 +572,7 @@ mod tests {
     #[test]
     fn load_data_append_uses_into() {
         let schema = build_schema(&[typed("id", "INT64")]);
-        let sql = build_load_data_sql(
-            "p.d.orders",
-            WriteMode::Append,
-            &schema,
-            &None,
-            &[],
-            &uris(),
-        );
+        let sql = build_load_data_sql("p.d.orders", false, &schema, &None, &[], &uris());
         assert!(sql.starts_with("LOAD DATA INTO `p.d.orders`"));
     }
 
@@ -802,7 +581,7 @@ mod tests {
         let schema = build_schema(&[typed("id", "INT64")]);
         let sql = build_load_data_sql(
             "p.d.orders",
-            WriteMode::Overwrite,
+            true,
             &schema,
             &Some("DATE(created_at)".into()),
             &["customer_id".into(), "region".into()],
@@ -874,25 +653,19 @@ mod tests {
 
     #[test]
     fn job_labels_tag_managed_by_op_and_table() {
-        let flags = build_label_flags(
-            "recover",
-            "Orders",
-            Some("Run-7"),
-            &[("env".into(), "prod".into())],
-        );
+        let flags = build_label_flags("recover", "Orders", Some("Run-7"));
         let kv: Vec<&String> = flags.iter().skip(1).step_by(2).collect();
         assert!(kv.iter().any(|s| *s == "managed_by:rivet"));
         assert!(kv.iter().any(|s| *s == "rivet_op:recover"));
         assert!(kv.iter().any(|s| *s == "rivet_table:orders")); // sanitized to lowercase
         assert!(kv.iter().any(|s| *s == "rivet_run:run-7")); // sanitized to lowercase
-        assert!(kv.iter().any(|s| *s == "env:prod"));
         // Each label value is preceded by a `--label` flag.
         assert!(flags.iter().step_by(2).all(|s| s == "--label"));
     }
 
     #[test]
     fn no_run_id_omits_the_rivet_run_label() {
-        let flags = build_label_flags("load", "orders", None, &[]);
+        let flags = build_label_flags("load", "orders", None);
         let kv: Vec<&String> = flags.iter().skip(1).step_by(2).collect();
         assert!(kv.iter().any(|s| *s == "rivet_table:orders"));
         assert!(!kv.iter().any(|s| s.starts_with("rivet_run:")));
@@ -931,17 +704,11 @@ mod tests {
     }
 
     #[test]
-    fn load_refuses_empty_uris_before_touching_bq() {
-        let mut l = BigQueryLoader::new("p", "d");
-        assert!(
-            l.load("t", &[spec("id", None, TargetStatus::Ok)], &[])
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn load_refuses_too_many_cluster_columns() {
-        let mut l = BigQueryLoader::new("p", "d").cluster_by(vec![
+    fn materialize_refuses_too_many_cluster_columns() {
+        // A >4-column CLUSTER BY is a below-the-seam adapter limit (BigQuery's),
+        // caught in `materialize` before any `bq` call. (Empty-URI and Fail-spec
+        // refusals are the driver's — see `load::tests`.)
+        let l = BigQueryLoader::new("p", "d").cluster_by(vec![
             "a".into(),
             "b".into(),
             "c".into(),
@@ -949,24 +716,10 @@ mod tests {
             "e".into(),
         ]);
         let err = l
-            .load("t", &[spec("id", None, TargetStatus::Ok)], &uris())
+            .materialize("t", &[spec("id", None, TargetStatus::Ok)], &uris())
             .unwrap_err()
             .to_string();
         assert!(err.contains("clustering"), "{err}");
-    }
-
-    #[test]
-    fn load_refuses_unmappable_columns_before_touching_bq() {
-        let mut l = BigQueryLoader::new("p", "d");
-        let specs = vec![
-            spec("id", None, TargetStatus::Ok),
-            spec("weird", None, TargetStatus::Fail),
-        ];
-        let err = l.load("t", &specs, &uris()).unwrap_err().to_string();
-        assert!(
-            err.contains("weird"),
-            "error must name the failed column: {err}"
-        );
     }
 
     #[test]
@@ -1060,10 +813,12 @@ mod tests {
         // A plain column (no cast) exercises the FREE LOAD DATA path.
         let specs = vec![spec("id", None, TargetStatus::Ok)];
 
-        let mut loader = BigQueryLoader::new(project, dataset);
-        let report = loader
-            .load("rivet_bq_live_test", &specs, &[uri])
-            .expect("live load should succeed");
+        let loader = BigQueryLoader::new(project, dataset);
+        // Drive it through the real driver (no gate, no cleanup) — same path prod
+        // takes, exercising validate → materialize.
+        let report =
+            crate::load::run_load(&loader, "rivet_bq_live_test", &specs, &[uri], None, None)
+                .expect("live load should succeed");
         assert!(
             report.rows_loaded > 0,
             "expected rows, got {}",
@@ -1112,30 +867,32 @@ mod tests {
 
         let table = "rivet_bq_live_cdc_test";
         let pk_cols: Vec<String> = pk.split(',').map(str::to_string).collect();
-        let mut loader = BigQueryLoader::new(&project, &dataset);
+        let loader = BigQueryLoader::new(&project, &dataset);
 
         // Load the same change log twice (at-least-once). No delta gate here —
         // the fixture's row count is the operator's to assert externally.
-        loader
-            .load_cdc(
-                table,
-                &specs,
-                std::slice::from_ref(&uri),
-                &pk_cols,
-                crate::load::cdc::SourceEngine::MySql,
-                None,
-            )
-            .expect("first CDC append + view build should succeed");
-        let second = loader
-            .load_cdc(
-                table,
-                &specs,
-                &[uri],
-                &pk_cols,
-                crate::load::cdc::SourceEngine::MySql,
-                None,
-            )
-            .expect("second CDC append (at-least-once) should succeed");
+        crate::load::run_load_cdc(
+            &loader,
+            table,
+            &specs,
+            std::slice::from_ref(&uri),
+            &pk_cols,
+            crate::load::cdc::SourceEngine::MySql,
+            None,
+            None,
+        )
+        .expect("first CDC append + view build should succeed");
+        let second = crate::load::run_load_cdc(
+            &loader,
+            table,
+            &specs,
+            &[uri],
+            &pk_cols,
+            crate::load::cdc::SourceEngine::MySql,
+            None,
+            None,
+        )
+        .expect("second CDC append (at-least-once) should succeed");
         assert!(second.rows_appended > 0, "second append added rows");
 
         // The dedup VIEW must report the current state, independent of how many

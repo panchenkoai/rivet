@@ -756,21 +756,26 @@ fn load_one_cdc(
         uris.len(),
         integrity.file_rows,
     );
-    // build_loader's batch `expected_rows` gate does not fit an accumulating
-    // log, so pass `None`; `load_cdc` enforces the append delta itself.
-    let report = load::build_loader(plan, run_id, None).load_cdc(
+    // The driver gates the appended delta against the manifests' summed
+    // `row_count` and cleans up (only) after the gate passes.
+    let loader = load::build_loader(plan, run_id);
+    let cleanup = plan.load.cleanup_source.then_some(plan.gcs_prefix.as_str());
+    let report = load::run_load_cdc(
+        &*loader,
         &plan.table,
         &plan.specs,
         &uris,
         pk,
         engine,
         Some(integrity.file_rows),
+        cleanup,
     )?;
     eprintln!(
-        "  integrity ✓ {} → appended {} to {}",
+        "  integrity ✓ {} → appended {} to {} | current-state view {}",
         integrity.chain_prefix(),
         report.rows_appended,
         report.changes_table,
+        report.view,
     );
     Ok(report)
 }
@@ -801,18 +806,29 @@ fn load_one(
         uris.len(),
         integrity.file_rows,
     );
-    let report = load::build_loader(plan, run_id, Some(integrity.file_rows)).load(
+    let loader = load::build_loader(plan, run_id);
+    let cleanup = plan.load.cleanup_source.then_some(plan.gcs_prefix.as_str());
+    let report = load::run_load(
+        &*loader,
         &plan.table,
         &plan.specs,
         &uris,
+        Some(integrity.file_rows),
+        cleanup,
     )?;
     // The full chain, now that the warehouse leg is known. The loader already
     // proved `warehouse == file` (its count gate) before returning, so this is
     // an all-green trace, not an unchecked assertion.
     eprintln!(
-        "  integrity ✓ {} → warehouse {}",
+        "  integrity ✓ {} → warehouse {} rows in {}{}",
         integrity.chain_prefix(),
-        report.rows_loaded
+        report.rows_loaded,
+        report.target_table,
+        if report.source_cleaned {
+            " (source cleaned)"
+        } else {
+            ""
+        },
     );
     Ok(report)
 }
