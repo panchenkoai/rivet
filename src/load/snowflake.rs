@@ -463,6 +463,15 @@ mod tests {
     }
 
     #[test]
+    fn is_meta_column_matches_only_cdc_meta() {
+        assert!(is_meta_column("__op"));
+        assert!(is_meta_column("__pos"));
+        assert!(is_meta_column("__seq"));
+        assert!(!is_meta_column("id"));
+        assert!(!is_meta_column("__other"));
+    }
+
+    #[test]
     fn fqtn_qualifies_database_schema_table() {
         let mut l = SnowflakeLoader::new("c");
         l.database = "DB".into();

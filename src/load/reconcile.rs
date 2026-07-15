@@ -368,6 +368,30 @@ mod tests {
     }
 
     #[test]
+    fn is_run_unique_manifest_needs_both_prefix_and_json() {
+        assert!(is_run_unique_manifest("manifest-20260101T000000.json"));
+        assert!(!is_run_unique_manifest("manifest.json")); // no `-` after manifest
+        assert!(!is_run_unique_manifest("manifest-abc.txt")); // not .json
+        assert!(!is_run_unique_manifest("data.json")); // wrong prefix
+    }
+
+    #[test]
+    fn chain_prefix_renders_source_and_files() {
+        let known = LoadIntegrity {
+            source_rows: Some(100),
+            file_rows: 100,
+            manifests: 1,
+        };
+        assert_eq!(known.chain_prefix(), "source 100 → files 100");
+        let unknown = LoadIntegrity {
+            source_rows: None,
+            file_rows: 40,
+            manifests: 1,
+        };
+        assert_eq!(unknown.chain_prefix(), "source ? → files 40");
+    }
+
+    #[test]
     fn is_manifest_key_matches_only_the_final_segment() {
         assert!(is_manifest_key("gs://b/p/manifest.json"));
         assert!(is_manifest_key("manifest.json"));

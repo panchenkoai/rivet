@@ -842,6 +842,27 @@ mod tests {
     }
 
     #[test]
+    fn clean_bq_output_drops_standalone_status_and_waiting_lines() {
+        // A bare "Waiting on" line (no status) AND a bare "Current status:" line
+        // (not part of a Waiting line) must BOTH be dropped — pins each `&&` in
+        // the filter (an `||` there would leak one of them into the message).
+        let raw = b"Waiting on bqjob_x\nCurrent status: RUNNING\nError: boom\n";
+        assert_eq!(clean_bq_output(raw), "Error: boom");
+    }
+
+    #[test]
+    fn augment_partition_limit_fires_only_on_partition_plus_signal() {
+        let aug = |m: &str| augment_partition_limit(anyhow::anyhow!("{m}")).to_string();
+        // partition + exactly one of {4000, quota, exceed} → augmented (pins each `||`).
+        assert!(aug("too many partitions, allowed 4000").contains("split the"));
+        assert!(aug("partition quota reached").contains("split the"));
+        assert!(aug("partition count will exceed the limit").contains("split the"));
+        // partition alone, or a signal alone → NOT augmented (pins the outer `&&`).
+        assert!(!aug("partition pruning is disabled").contains("split the"));
+        assert!(!aug("row quota 4000 reached").contains("split the"));
+    }
+
+    #[test]
     fn partition_limit_error_is_augmented() {
         let raw = anyhow::anyhow!("Too many partitions: cannot modify more than 4000 partitions");
         let msg = augment_partition_limit(raw).to_string();
