@@ -6,6 +6,7 @@ mod checkpoint;
 mod cursor;
 mod file_log;
 mod journal_store;
+mod load_journal_store;
 mod metrics;
 mod progression;
 mod run_aggregate;
@@ -19,6 +20,7 @@ mod shape;
 pub use checkpoint::ChunkTaskInfo;
 #[allow(unused_imports)]
 pub use file_log::FileRecord;
+pub use load_journal_store::LoadRecord;
 #[allow(unused_imports)]
 pub use metrics::ExportMetric;
 pub use metrics::MetricRow;
@@ -241,6 +243,33 @@ const MIGRATIONS: &[(i64, &str)] = &[
     // keyset-paged" signal) needs a run-time PK probe — a follow-up, so no field
     // that would merely restate mode='keyset'.
     (12, "ALTER TABLE export_metrics ADD COLUMN chunk_key TEXT;"),
+    // v13: load ledger. `rivet load` is now stateful — `load_run` is the audit
+    // log (one row per invocation-table), `loaded_source_run` the skip ledger
+    // (which extraction run_ids have landed in which target) that makes loads
+    // incremental + idempotent instead of re-loading whatever sits in the bucket.
+    (
+        13,
+        "CREATE TABLE IF NOT EXISTS load_run (
+            load_id TEXT PRIMARY KEY,
+            export_name TEXT NOT NULL,
+            target_table TEXT NOT NULL,
+            warehouse TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            source_run_ids TEXT NOT NULL,
+            rows_loaded INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            finished_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_load_run_target
+            ON load_run(target_table, finished_at DESC);
+        CREATE TABLE IF NOT EXISTS loaded_source_run (
+            target_table TEXT NOT NULL,
+            source_run_id TEXT NOT NULL,
+            load_id TEXT NOT NULL,
+            loaded_at TEXT NOT NULL,
+            PRIMARY KEY (target_table, source_run_id)
+        );",
+    ),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -427,6 +456,30 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
     ),
     // v12: chunking diagnostics (see the SQLite array for rationale).
     (12, "ALTER TABLE export_metrics ADD COLUMN chunk_key TEXT;"),
+    // v13: load ledger (see the SQLite array for rationale). rows_loaded is BIGINT.
+    (
+        13,
+        "CREATE TABLE IF NOT EXISTS load_run (
+            load_id TEXT PRIMARY KEY,
+            export_name TEXT NOT NULL,
+            target_table TEXT NOT NULL,
+            warehouse TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            source_run_ids TEXT NOT NULL,
+            rows_loaded BIGINT NOT NULL,
+            status TEXT NOT NULL,
+            finished_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_load_run_target
+            ON load_run(target_table, finished_at DESC);
+        CREATE TABLE IF NOT EXISTS loaded_source_run (
+            target_table TEXT NOT NULL,
+            source_run_id TEXT NOT NULL,
+            load_id TEXT NOT NULL,
+            loaded_at TEXT NOT NULL,
+            PRIMARY KEY (target_table, source_run_id)
+        );",
+    ),
 ];
 
 // ─── SQL helpers ──────────────────────────────────────────────────────────────
@@ -938,6 +991,25 @@ mod tests {
             )
             .unwrap();
         assert!(exists, "v5 migration must create the run_aggregate table");
+    }
+
+    #[test]
+    fn v13_creates_the_load_ledger_tables() {
+        let s = StateStore::open_in_memory().unwrap();
+        let conn = match &s.conn {
+            StateConn::Sqlite(c) => c,
+            StateConn::Postgres(_) => unreachable!(),
+        };
+        for table in ["load_run", "loaded_source_run"] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "v13 migration must create `{table}`");
+        }
     }
 
     #[test]

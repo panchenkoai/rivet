@@ -71,15 +71,87 @@ impl LoadIntegrity {
 /// module note in `lib.rs`.
 #[allow(private_interfaces)]
 pub fn fetch_manifests(store: &GcsStore, gcs_prefix: &str) -> Result<Vec<RunManifest>> {
+    Ok(fetch_manifests_keyed(store, gcs_prefix)?
+        .into_iter()
+        .map(|(_, m)| m)
+        .collect())
+}
+
+/// Like [`fetch_manifests`] but keeps each manifest's bucket-relative storage
+/// key — needed to resolve a manifest's (relative) part paths back to full
+/// object keys for per-run incremental loading (see [`select_load_uris`]).
+#[allow(private_interfaces)]
+pub fn fetch_manifests_keyed(
+    store: &GcsStore,
+    gcs_prefix: &str,
+) -> Result<Vec<(String, RunManifest)>> {
     let (_, base) = crate::load::split_gs_uri(gcs_prefix)?;
     let keys = list_manifest_keys(store, base)?;
-    keys.iter()
+    keys.into_iter()
         .map(|key| {
-            let bytes = store.read(key)?;
-            serde_json::from_slice::<RunManifest>(&bytes)
-                .with_context(|| format!("parsing manifest {key}"))
+            let bytes = store.read(&key)?;
+            let m = serde_json::from_slice::<RunManifest>(&bytes)
+                .with_context(|| format!("parsing manifest {key}"))?;
+            Ok((key, m))
         })
         .collect()
+}
+
+/// Full `gs://` URIs of the parquet to load for `new` (the not-yet-loaded run
+/// manifests), preferring each manifest's own parts over a blanket listing.
+/// See [`select_load_keys`] for the selection rule.
+#[allow(private_interfaces)]
+pub fn select_load_uris(
+    store: &GcsStore,
+    gcs_prefix: &str,
+    new: &[(String, RunManifest)],
+) -> Result<Vec<String>> {
+    let (bucket, base) = crate::load::split_gs_uri(gcs_prefix)?;
+    let all_parquet: Vec<String> = store
+        .list_files(base)?
+        .into_iter()
+        .filter(|k| k.ends_with(".parquet"))
+        .collect();
+    Ok(select_load_keys(new, &all_parquet)
+        .into_iter()
+        .map(|k| format!("gs://{bucket}/{k}"))
+        .collect())
+}
+
+/// Pure selection: which bucket-relative parquet keys to load for the given
+/// (not-yet-loaded) run manifests.
+///
+/// Prefers each manifest's own parts, resolved as `<dir(manifest_key)>/<part>`
+/// and intersected with `all_parquet` — so a load pulls exactly the new runs'
+/// files, not every object under the prefix (the key to incremental loads once
+/// `cleanup_source` no longer wipes the bucket). Falls back to the whole
+/// `all_parquet` listing when ANY new manifest resolves to no present part
+/// (legacy/part-less manifests still load, at the cost of not pruning); the
+/// row-count gate then still guards correctness.
+pub fn select_load_keys(new: &[(String, RunManifest)], all_parquet: &[String]) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let present: std::collections::HashSet<&str> = all_parquet.iter().map(String::as_str).collect();
+    let mut selected: BTreeSet<String> = BTreeSet::new();
+    for (key, m) in new {
+        let dir = key.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let mut resolved_any = false;
+        for p in &m.parts {
+            let full = if dir.is_empty() {
+                p.path.clone()
+            } else {
+                format!("{dir}/{}", p.path)
+            };
+            if present.contains(full.as_str()) {
+                selected.insert(full);
+                resolved_any = true;
+            }
+        }
+        if !resolved_any {
+            // Can't resolve this run to files — don't risk a partial selection.
+            return all_parquet.to_vec();
+        }
+    }
+    selected.into_iter().collect()
 }
 
 /// Bucket-relative keys of every run manifest under `base` (recursive).
@@ -347,6 +419,57 @@ mod tests {
             got.source_rows,
             Some(120),
             "the probed source count is still surfaced"
+        );
+    }
+
+    /// A `(manifest_key, manifest)` pair with a single part named `part`.
+    fn keyed(key: &str, run: &str, part: &str) -> (String, RunManifest) {
+        let mut m = manifest(run, 10, Some(10));
+        m.parts[0].path = part.into();
+        (key.to_string(), m)
+    }
+
+    #[test]
+    fn select_load_keys_picks_only_the_new_runs_parts() {
+        // Two runs' files sit under the prefix; only r2 is "new".
+        let all = vec![
+            "base/r1-000.parquet".to_string(),
+            "base/r2-000.parquet".to_string(),
+        ];
+        let new = vec![keyed("base/manifest-r2.json", "r2", "r2-000.parquet")];
+        assert_eq!(
+            select_load_keys(&new, &all),
+            vec!["base/r2-000.parquet".to_string()],
+            "loads r2's part only — not r1's already-loaded file"
+        );
+    }
+
+    #[test]
+    fn select_load_keys_resolves_a_snapshot_subprefix_manifest() {
+        // A snapshot manifest lives under `base/snapshot/`; its part is relative
+        // to that dir. Resolution must reconstruct the full key.
+        let all = vec!["base/snapshot/snap-000.parquet".to_string()];
+        let new = vec![keyed(
+            "base/snapshot/manifest-r1.json",
+            "r1",
+            "snap-000.parquet",
+        )];
+        assert_eq!(
+            select_load_keys(&new, &all),
+            vec!["base/snapshot/snap-000.parquet".to_string()]
+        );
+    }
+
+    #[test]
+    fn select_load_keys_falls_back_to_full_listing_when_a_manifest_has_no_present_part() {
+        // A manifest whose part isn't in the listing (legacy / renamed) → don't
+        // risk a partial selection; load everything under the prefix.
+        let all = vec!["base/a.parquet".to_string(), "base/b.parquet".to_string()];
+        let new = vec![keyed("base/manifest-r1.json", "r1", "missing.parquet")];
+        assert_eq!(
+            select_load_keys(&new, &all),
+            all,
+            "unresolvable part → blanket fallback"
         );
     }
 

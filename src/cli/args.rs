@@ -607,6 +607,17 @@ pub enum StateAction {
         #[arg(short, long)]
         export: Option<String>,
     },
+    /// Show the load ledger (`rivet load` runs recorded in the state DB)
+    Loads {
+        #[arg(short, long)]
+        config: String,
+        /// Show only loads into this fully-qualified target (`proj.ds.table`)
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Number of recent loads to show
+        #[arg(short, long, default_value = "50")]
+        last: usize,
+    },
 }
 
 #[derive(clap::ValueEnum, Clone)]

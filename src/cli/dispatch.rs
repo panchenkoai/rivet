@@ -16,6 +16,7 @@ use super::params::{parse_params, resolve_init_source};
 use super::validate::validate_cli;
 use crate::config::Config;
 use crate::error::Result;
+use crate::state::{LoadRecord, StateStore};
 use crate::{init, load, pipeline, preflight};
 
 /// Validate a `--export <name>` selection against the loaded config and, on a
@@ -680,7 +681,40 @@ fn dispatch_state(action: StateAction) -> Result<()> {
         StateAction::Progression { config, export } => {
             pipeline::show_progression(&config, export.as_deref())
         }
+        StateAction::Loads {
+            config,
+            target,
+            last,
+        } => show_loads(&config, target.as_deref(), last),
     }
+}
+
+/// `rivet state loads`: print the load ledger — one row per recorded `rivet
+/// load`, newest first.
+fn show_loads(config: &str, target: Option<&str>, last: usize) -> Result<()> {
+    let store = StateStore::open(config)?;
+    let loads = store.recent_loads(target, last)?;
+    if loads.is_empty() {
+        println!("no loads recorded in the state DB yet");
+        return Ok(());
+    }
+    println!(
+        "{:<26} {:<10} {:<6} {:>10} {:<8} {:>4}  target",
+        "finished_at", "warehouse", "mode", "rows", "status", "runs"
+    );
+    for l in &loads {
+        println!(
+            "{:<26} {:<10} {:<6} {:>10} {:<8} {:>4}  {}",
+            l.finished_at,
+            l.warehouse,
+            l.mode,
+            l.rows_loaded,
+            l.status,
+            l.source_run_ids.len(),
+            l.target_table,
+        );
+    }
+    Ok(())
 }
 
 struct LoadArgs {
@@ -700,6 +734,18 @@ fn dispatch_load(args: LoadArgs) -> Result<()> {
     // One run id for the whole invocation, shared across every table — so warehouse
     // cost slices per load run (all tables together) as well as per table.
     let run_id = args.run_id.clone().unwrap_or_else(generate_run_id);
+    // The load ledger: log every load + skip extraction runs already loaded. A
+    // state-DB problem must never fail a load — degrade to the stateless path.
+    let state = match StateStore::open(&args.config) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!(
+                "  warning: state store unavailable ({e:#}); loading without a ledger \
+                 (no incremental skip / audit log)"
+            );
+            None
+        }
+    };
     let tables: Vec<&str> = plans.iter().map(|p| p.table.as_str()).collect();
     eprintln!(
         "{}: resolved {} table(s) → {} [run_id={}]: {}",
@@ -718,17 +764,124 @@ fn dispatch_load(args: LoadArgs) -> Result<()> {
         }
         let engine = load::plan::source_engine(&args.config)?;
         for plan in &plans {
-            let report = load_one_cdc(plan, &run_id, engine, &args.pk, args.allow_source_drift)?;
-            println!("CDC LOAD OK [{}]: {report:#?}", plan.table);
+            let load_id = format!("{run_id}:{}", plan.table);
+            match load_one_cdc(
+                plan,
+                &run_id,
+                engine,
+                &args.pk,
+                args.allow_source_drift,
+                state.as_ref(),
+                &load_id,
+            )? {
+                Some(report) => println!("CDC LOAD OK [{}]: {report:#?}", plan.table),
+                None => println!("CDC LOAD SKIP [{}]: up to date", plan.table),
+            }
         }
         return Ok(());
     }
 
     for plan in &plans {
-        let report = load_one(plan, &run_id, args.allow_source_drift)?;
-        println!("LOAD OK [{}]: {report:#?}", plan.table);
+        let load_id = format!("{run_id}:{}", plan.table);
+        match load_one(
+            plan,
+            &run_id,
+            args.allow_source_drift,
+            state.as_ref(),
+            &load_id,
+        )? {
+            Some(report) => println!("LOAD OK [{}]: {report:#?}", plan.table),
+            None => println!("LOAD SKIP [{}]: up to date", plan.table),
+        }
     }
     Ok(())
+}
+
+/// What a load will consume: the reconciled integrity, the parquet URIs to load,
+/// and the extraction run_ids covered. `None` from [`prepare_load`] means the
+/// ledger already has every run — nothing new to load.
+struct LoadInputs {
+    integrity: load::reconcile::LoadIntegrity,
+    uris: Vec<String>,
+    source_run_ids: Vec<String>,
+}
+
+/// Reconcile the manifests under a load's prefix into its [`LoadInputs`],
+/// filtered by the ledger when stateful.
+///
+/// - Stateless (`state == None`): today's exact behaviour — reconcile every
+///   manifest, blanket-list the prefix.
+/// - Stateful: drop manifests whose `run_id` is already in the ledger for this
+///   target; `Ok(None)` when none remain (nothing new), else reconcile the new
+///   set and select only its parts (blanket fallback).
+fn prepare_load(
+    store: &crate::destination::gcs::GcsStore,
+    plan: &load::plan::LoadPlan,
+    state: Option<&StateStore>,
+    target_fqtn: &str,
+    allow_source_drift: bool,
+) -> Result<Option<LoadInputs>> {
+    match state {
+        None => {
+            let manifests = load::reconcile::fetch_manifests(store, &plan.gcs_prefix)?;
+            let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
+            let uris = load::plan::list_gcs_uris(store, &plan.gcs_prefix)?;
+            Ok(Some(LoadInputs {
+                integrity,
+                uris,
+                source_run_ids: Vec::new(),
+            }))
+        }
+        Some(s) => {
+            let keyed = load::reconcile::fetch_manifests_keyed(store, &plan.gcs_prefix)?;
+            let loaded = s.loaded_source_run_ids(target_fqtn).unwrap_or_default();
+            let new: Vec<_> = keyed
+                .into_iter()
+                .filter(|(_, m)| !loaded.contains(&m.run_id))
+                .collect();
+            if new.is_empty() {
+                return Ok(None);
+            }
+            let manifests: Vec<_> = new.iter().map(|(_, m)| m.clone()).collect();
+            let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
+            let uris = load::reconcile::select_load_uris(store, &plan.gcs_prefix, &new)?;
+            let source_run_ids = new.iter().map(|(_, m)| m.run_id.clone()).collect();
+            Ok(Some(LoadInputs {
+                integrity,
+                uris,
+                source_run_ids,
+            }))
+        }
+    }
+}
+
+/// Best-effort ledger write — a state-DB failure warns but never fails a load.
+#[allow(clippy::too_many_arguments)]
+fn record_load(
+    state: Option<&StateStore>,
+    load_id: &str,
+    plan: &load::plan::LoadPlan,
+    target_fqtn: &str,
+    mode: &str,
+    source_run_ids: &[String],
+    rows_loaded: i64,
+    status: &str,
+) {
+    let Some(s) = state else { return };
+    let rec = LoadRecord {
+        load_id: load_id.to_string(),
+        export_name: plan.table.clone(),
+        target_table: target_fqtn.to_string(),
+        warehouse: plan.load.target.name().to_string(),
+        mode: mode.to_string(),
+        source_run_ids: source_run_ids.to_vec(),
+        rows_loaded,
+        status: status.to_string(),
+        finished_at: chrono::Utc::now().to_rfc3339(),
+    };
+    if let Err(e) = s.store_load(&rec) {
+        eprintln!("  warning: load ledger write failed (load itself proceeded): {e:#}");
+    }
 }
 
 /// Load a single export's CDC change log: reconcile the run manifests, **append**
@@ -736,52 +889,90 @@ fn dispatch_load(args: LoadArgs) -> Result<()> {
 /// dedup view over it. The manifests' summed `row_count` gates the rows *this*
 /// load appends (before/after the append) — the file→warehouse leg for an
 /// accumulating, at-least-once log.
+#[allow(clippy::too_many_arguments)]
 fn load_one_cdc(
     plan: &load::plan::LoadPlan,
     run_id: &str,
     engine: load::cdc::SourceEngine,
     pk: &[String],
     allow_source_drift: bool,
-) -> Result<load::CdcLoadReport> {
+    state: Option<&StateStore>,
+    load_id: &str,
+) -> Result<Option<load::CdcLoadReport>> {
     let store = load::open_store(&plan.destination)?;
-    let manifests = load::reconcile::fetch_manifests(&store, &plan.gcs_prefix)?;
-    let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
-    let uris = load::plan::list_gcs_uris(&store, &plan.gcs_prefix)?;
+    let loader = load::build_loader(plan, run_id);
+    let target_fqtn = loader.fqtn(&plan.table);
+    let inputs = match prepare_load(&store, plan, state, &target_fqtn, allow_source_drift)? {
+        Some(i) => i,
+        None => {
+            eprintln!(
+                "  cdc load {} → {}: up to date — every extraction run already loaded",
+                plan.table,
+                plan.load.target.name(),
+            );
+            record_load(state, load_id, plan, &target_fqtn, "cdc", &[], 0, "success");
+            return Ok(None);
+        }
+    };
     eprintln!(
         "  cdc load {} → {} | engine={:?} pk={} manifests={} parquet_files={} expected_delta={}",
         plan.table,
         plan.load.target.name(),
         engine,
         pk.join(","),
-        integrity.manifests,
-        uris.len(),
-        integrity.file_rows,
+        inputs.integrity.manifests,
+        inputs.uris.len(),
+        inputs.integrity.file_rows,
     );
     // The driver gates the appended delta against the manifests' summed
     // `row_count` and cleans up (only) after the gate passes.
-    let loader = load::build_loader(plan, run_id);
     let cleanup = plan
         .load
         .cleanup_source
         .then_some((&store, plan.gcs_prefix.as_str()));
-    let report = load::run_load_cdc(
+    let report = match load::run_load_cdc(
         &*loader,
         &plan.table,
         &plan.specs,
-        &uris,
+        &inputs.uris,
         pk,
         engine,
-        Some(integrity.file_rows),
+        Some(inputs.integrity.file_rows),
         cleanup,
-    )?;
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            record_load(
+                state,
+                load_id,
+                plan,
+                &target_fqtn,
+                "cdc",
+                &inputs.source_run_ids,
+                0,
+                "failed",
+            );
+            return Err(e);
+        }
+    };
+    record_load(
+        state,
+        load_id,
+        plan,
+        &target_fqtn,
+        "cdc",
+        &inputs.source_run_ids,
+        report.rows_appended as i64,
+        "success",
+    );
     eprintln!(
         "  integrity ✓ {} → appended {} to {} | current-state view {}",
-        integrity.chain_prefix(),
+        inputs.integrity.chain_prefix(),
         report.rows_appended,
         report.changes_table,
         report.view,
     );
-    Ok(report)
+    Ok(Some(report))
 }
 
 /// Load a single resolved table into its warehouse target, reconciling
@@ -796,40 +987,86 @@ fn load_one(
     plan: &load::plan::LoadPlan,
     run_id: &str,
     allow_source_drift: bool,
-) -> Result<load::LoadReport> {
+    state: Option<&StateStore>,
+    load_id: &str,
+) -> Result<Option<load::LoadReport>> {
     let store = load::open_store(&plan.destination)?;
-    let manifests = load::reconcile::fetch_manifests(&store, &plan.gcs_prefix)?;
-    let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
-    let uris = load::plan::list_gcs_uris(&store, &plan.gcs_prefix)?;
+    let loader = load::build_loader(plan, run_id);
+    let target_fqtn = loader.fqtn(&plan.table);
+    let inputs = match prepare_load(&store, plan, state, &target_fqtn, allow_source_drift)? {
+        Some(i) => i,
+        None => {
+            eprintln!(
+                "  load {} → {}: up to date — every extraction run already loaded",
+                plan.table,
+                plan.load.target.name(),
+            );
+            record_load(
+                state,
+                load_id,
+                plan,
+                &target_fqtn,
+                "batch",
+                &[],
+                0,
+                "success",
+            );
+            return Ok(None);
+        }
+    };
     eprintln!(
         "  load {} → {} | columns={} partition={:?} manifests={} parquet_files={} expected_rows={}",
         plan.table,
         plan.load.target.name(),
         plan.specs.len(),
         plan.partition_by,
-        integrity.manifests,
-        uris.len(),
-        integrity.file_rows,
+        inputs.integrity.manifests,
+        inputs.uris.len(),
+        inputs.integrity.file_rows,
     );
-    let loader = load::build_loader(plan, run_id);
     let cleanup = plan
         .load
         .cleanup_source
         .then_some((&store, plan.gcs_prefix.as_str()));
-    let report = load::run_load(
+    let report = match load::run_load(
         &*loader,
         &plan.table,
         &plan.specs,
-        &uris,
-        Some(integrity.file_rows),
+        &inputs.uris,
+        Some(inputs.integrity.file_rows),
         cleanup,
-    )?;
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            record_load(
+                state,
+                load_id,
+                plan,
+                &target_fqtn,
+                "batch",
+                &inputs.source_run_ids,
+                0,
+                "failed",
+            );
+            return Err(e);
+        }
+    };
+    record_load(
+        state,
+        load_id,
+        plan,
+        &target_fqtn,
+        "batch",
+        &inputs.source_run_ids,
+        report.rows_loaded as i64,
+        "success",
+    );
     // The full chain, now that the warehouse leg is known. The loader already
     // proved `warehouse == file` (its count gate) before returning, so this is
     // an all-green trace, not an unchecked assertion.
     eprintln!(
         "  integrity ✓ {} → warehouse {} rows in {}{}",
-        integrity.chain_prefix(),
+        inputs.integrity.chain_prefix(),
         report.rows_loaded,
         report.target_table,
         if report.source_cleaned {
@@ -838,7 +1075,7 @@ fn load_one(
             ""
         },
     );
-    Ok(report)
+    Ok(Some(report))
 }
 
 /// A per-invocation load-run id: microsecond-since-epoch hex + zero-padded pid
