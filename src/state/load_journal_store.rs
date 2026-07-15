@@ -24,11 +24,19 @@ pub struct LoadRecord {
 }
 
 impl StateStore {
-    /// Log one load into `load_run` and mark each consumed extraction run in
-    /// `loaded_source_run`. Idempotent: `load_id` and `(target_table,
-    /// source_run_id)` upsert, so a retried load never double-inserts.
+    /// Log one load into `load_run` and — only for a **successful** load — mark
+    /// each consumed extraction run in `loaded_source_run` (the skip set). A
+    /// FAILED load still records its audit row with the attempted run_ids but
+    /// marks none loaded, so the next load RETRIES those runs instead of
+    /// skipping their never-loaded data forever (silent loss). Idempotent:
+    /// `load_id` and `(target_table, source_run_id)` upsert, so a retried load
+    /// never double-inserts.
     pub fn store_load(&self, rec: &LoadRecord) -> Result<()> {
         let run_ids_json = serde_json::to_string(&rec.source_run_ids)?;
+        // A run is "loaded" only when its load succeeded; a failed load must
+        // leave its runs retryable, never mark them loaded (else their data is
+        // skipped on every subsequent load).
+        let mark_loaded = rec.status == "success";
         match &self.conn {
             StateConn::Sqlite(c) => {
                 c.execute(
@@ -48,13 +56,15 @@ impl StateStore {
                         rec.finished_at,
                     ],
                 )?;
-                for rid in &rec.source_run_ids {
-                    c.execute(
-                        "INSERT OR REPLACE INTO loaded_source_run
-                           (target_table, source_run_id, load_id, loaded_at)
-                         VALUES (?1, ?2, ?3, ?4)",
-                        rusqlite::params![rec.target_table, rid, rec.load_id, rec.finished_at],
-                    )?;
+                if mark_loaded {
+                    for rid in &rec.source_run_ids {
+                        c.execute(
+                            "INSERT OR REPLACE INTO loaded_source_run
+                               (target_table, source_run_id, load_id, loaded_at)
+                             VALUES (?1, ?2, ?3, ?4)",
+                            rusqlite::params![rec.target_table, rid, rec.load_id, rec.finished_at],
+                        )?;
+                    }
                 }
             }
             StateConn::Postgres(client) => {
@@ -85,16 +95,18 @@ impl StateStore {
                         &rec.finished_at,
                     ],
                 )?;
-                for rid in &rec.source_run_ids {
-                    c.execute(
-                        "INSERT INTO loaded_source_run
-                           (target_table, source_run_id, load_id, loaded_at)
-                         VALUES ($1, $2, $3, $4)
-                         ON CONFLICT (target_table, source_run_id) DO UPDATE SET
-                             load_id   = excluded.load_id,
-                             loaded_at = excluded.loaded_at",
-                        &[&rec.target_table, rid, &rec.load_id, &rec.finished_at],
-                    )?;
+                if mark_loaded {
+                    for rid in &rec.source_run_ids {
+                        c.execute(
+                            "INSERT INTO loaded_source_run
+                               (target_table, source_run_id, load_id, loaded_at)
+                             VALUES ($1, $2, $3, $4)
+                             ON CONFLICT (target_table, source_run_id) DO UPDATE SET
+                                 load_id   = excluded.load_id,
+                                 loaded_at = excluded.loaded_at",
+                            &[&rec.target_table, rid, &rec.load_id, &rec.finished_at],
+                        )?;
+                    }
                 }
             }
         }
@@ -267,6 +279,35 @@ mod tests {
         assert_eq!(loads.len(), 1);
         assert_eq!(loads[0].rows_loaded, 100);
         assert_eq!(loads[0].source_run_ids, vec!["r1", "r2"]);
+    }
+
+    #[test]
+    fn failed_load_leaves_its_source_runs_retryable() {
+        let s = StateStore::open_in_memory().unwrap();
+        // A failed load records its audit row (with the attempted runs) but must
+        // NOT mark them loaded — else the next load skips their never-loaded data.
+        s.store_load(&rec("L1", "p.d.t", &["r1", "r2"], 0, "failed"))
+            .unwrap();
+        assert!(
+            s.loaded_source_run_ids("p.d.t").unwrap().is_empty(),
+            "a failed load must leave its runs retryable, never mark them loaded"
+        );
+        let loads = s.recent_loads(Some("p.d.t"), 10).unwrap();
+        assert_eq!(loads.len(), 1);
+        assert_eq!(loads[0].status, "failed");
+        assert_eq!(
+            loads[0].source_run_ids,
+            vec!["r1", "r2"],
+            "the audit row still records what the failed load attempted"
+        );
+
+        // A later SUCCESS over the same runs marks them loaded (the retry landed).
+        s.store_load(&rec("L2", "p.d.t", &["r1", "r2"], 100, "success"))
+            .unwrap();
+        assert_eq!(
+            s.loaded_source_run_ids("p.d.t").unwrap(),
+            HashSet::from(["r1".to_string(), "r2".to_string()])
+        );
     }
 
     #[test]
