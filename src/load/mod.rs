@@ -11,7 +11,6 @@
 
 use crate::types::target::{TargetColumnSpec, TargetStatus};
 use anyhow::{Context, Result, bail};
-use std::process::Command;
 
 mod bigquery;
 pub mod cdc;
@@ -202,22 +201,22 @@ pub fn run_load_cdc(
     })
 }
 
-/// Delete a whole export-dedicated `gs://…/` prefix in one recursive `gcloud`
-/// call — the shared cleanup every adapter's [`TargetLoader::cleanup`] routes
-/// through. `--continue-on-error` so an already-gone object (a re-run) doesn't
-/// abort the cleanup.
-pub(crate) fn delete_prefix(prefix: &str) -> Result<()> {
-    let out = Command::new("gcloud")
-        .args(["storage", "rm", "-r", "-q", "--continue-on-error", prefix])
-        .output()
-        .context("running `gcloud storage rm -r` for source cleanup")?;
-    if !out.status.success() {
-        bail!(
-            "source cleanup (`gcloud storage rm -r {prefix}`) failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(())
+/// Split a `gs://bucket/path` URI into `(bucket, bucket-relative path)` — the
+/// shape opendal's bucket-scoped operator wants.
+pub(crate) fn split_gs_uri(uri: &str) -> Result<(&str, &str)> {
+    uri.strip_prefix("gs://")
+        .and_then(|rest| rest.split_once('/'))
+        .with_context(|| format!("not a `gs://bucket/path` URI: {uri}"))
+}
+
+/// Delete a whole export-dedicated `gs://…/` prefix — the shared cleanup every
+/// adapter's [`TargetLoader::cleanup`] routes through, over the same native
+/// opendal GCS client the export destination uses (no `gcloud`).
+pub(crate) fn delete_prefix(dest: &crate::config::DestinationConfig, prefix: &str) -> Result<()> {
+    let (_, rel) = split_gs_uri(prefix)?;
+    crate::destination::gcs::GcsStore::new(dest)?
+        .remove_all(rel)
+        .with_context(|| format!("source cleanup (recursive delete of {prefix}) failed"))
 }
 
 /// The one place a resolved plan's [`LoadTarget`](plan::LoadTarget) maps to a
@@ -236,6 +235,7 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
             if !load.cluster_by.is_empty() {
                 l = l.cluster_by(load.cluster_by.clone());
             }
+            l.destination = Some(plan.destination.clone());
             Box::new(l)
         }
         LoadTarget::Snowflake {
@@ -256,6 +256,7 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
             l.gcs_url = plan.gcs_prefix.replacen("gs://", "gcs://", 1);
             // The `snow` CLI does not expand `~`; pass an absolute key path.
             l.private_key_path = std::env::var("RIVET_SNOWFLAKE_KEY").ok();
+            l.destination = Some(plan.destination.clone());
             Box::new(l)
         }
     }

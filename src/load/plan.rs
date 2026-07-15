@@ -66,6 +66,9 @@ pub struct LoadPlan {
     /// `gs://bucket/base/` — the destination prefix up to the `{partition}`
     /// token, i.e. the root to list source Parquet under.
     pub gcs_prefix: String,
+    /// The export's GCS destination (bucket + auth) — the native opendal client
+    /// the load layer lists / reads / deletes through.
+    pub destination: crate::config::DestinationConfig,
     /// The `load:` target from the same config.
     pub load: LoadSection,
 }
@@ -180,6 +183,7 @@ pub fn plan_loads(config_path: &str, rivet_bin: &str) -> Result<Vec<LoadPlan>> {
             partition_by: export.partition_by.clone(),
             specs,
             gcs_prefix,
+            destination: export.destination.clone(),
             load: load.clone(),
         });
     }
@@ -207,23 +211,25 @@ pub fn source_engine(config_path: &str) -> Result<crate::load::cdc::SourceEngine
     }
 }
 
-/// List `*.parquet` object URIs under a `gs://` prefix (recursive), via the
-/// gcloud SDK — avoids a huge argv for exports with thousands of files.
-pub fn list_gcs_uris(gcs_prefix: &str) -> Result<Vec<String>> {
-    let out = Command::new("gcloud")
-        .args(["storage", "ls", &format!("{gcs_prefix}**")])
-        .output()
-        .context("running `gcloud storage ls`")?;
-    if !out.status.success() {
-        bail!(
-            "gcloud storage ls failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter(|l| l.ends_with(".parquet"))
-        .map(str::to_string)
+/// List the `*.parquet` object URIs under `gcs_prefix` (recursive), via the
+/// native opendal client. Returns full `gs://bucket/<key>` URIs — the warehouse
+/// (BigQuery `LOAD DATA` / Snowflake `COPY`) reads them, not opendal.
+///
+/// `pub` (public-API root, kept alive though only the binary-only
+/// `cli::dispatch` calls it) with `#[allow(private_interfaces)]` for the
+/// injected internal `GcsStore` — see the twin note on
+/// [`reconcile::fetch_manifests`](crate::load::reconcile::fetch_manifests).
+#[allow(private_interfaces)]
+pub fn list_gcs_uris(
+    store: &crate::destination::gcs::GcsStore,
+    gcs_prefix: &str,
+) -> Result<Vec<String>> {
+    let (bucket, base) = crate::load::split_gs_uri(gcs_prefix)?;
+    Ok(store
+        .list_files(base)?
+        .into_iter()
+        .filter(|k| k.ends_with(".parquet"))
+        .map(|k| format!("gs://{bucket}/{k}"))
         .collect())
 }
 
@@ -294,5 +300,37 @@ mod tests {
     fn unknown_target_is_rejected_at_deserialize() {
         let value = serde_json::json!({ "target": "redshift", "project": "p" });
         assert!(serde_json::from_value::<LoadSection>(value).is_err());
+    }
+
+    #[test]
+    fn list_gcs_uris_keeps_only_parquet_and_reconstructs_gs_uris() {
+        use crate::destination::gcs::GcsStore;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for rel in [
+            "data/part-0.parquet",
+            "data/part-1.parquet",
+            "data/sub/part-2.parquet",
+            "data/_SUCCESS",      // sentinel: not parquet
+            "data/manifest.json", // manifest: not parquet
+            "data/manifest-r1.json",
+        ] {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"x").unwrap();
+        }
+        let store = GcsStore::open_fs(root.to_str().unwrap()).unwrap();
+
+        let mut uris = list_gcs_uris(&store, "gs://my-bucket/data").unwrap();
+        uris.sort();
+        assert_eq!(
+            uris,
+            vec![
+                "gs://my-bucket/data/part-0.parquet".to_string(),
+                "gs://my-bucket/data/part-1.parquet".to_string(),
+                "gs://my-bucket/data/sub/part-2.parquet".to_string(),
+            ],
+            "only *.parquet objects, each reconstructed as gs://<bucket>/<key>"
+        );
     }
 }

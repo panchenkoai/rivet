@@ -743,9 +743,10 @@ fn load_one_cdc(
     pk: &[String],
     allow_source_drift: bool,
 ) -> Result<load::CdcLoadReport> {
-    let manifests = load::reconcile::fetch_manifests(&plan.gcs_prefix)?;
+    let store = crate::destination::gcs::GcsStore::new(&plan.destination)?;
+    let manifests = load::reconcile::fetch_manifests(&store, &plan.gcs_prefix)?;
     let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
-    let uris = load::plan::list_gcs_uris(&plan.gcs_prefix)?;
+    let uris = load::plan::list_gcs_uris(&store, &plan.gcs_prefix)?;
     eprintln!(
         "  cdc load {} → {} | engine={:?} pk={} manifests={} parquet_files={} expected_delta={}",
         plan.table,
@@ -793,9 +794,10 @@ fn load_one(
     run_id: &str,
     allow_source_drift: bool,
 ) -> Result<load::LoadReport> {
-    let manifests = load::reconcile::fetch_manifests(&plan.gcs_prefix)?;
+    let store = crate::destination::gcs::GcsStore::new(&plan.destination)?;
+    let manifests = load::reconcile::fetch_manifests(&store, &plan.gcs_prefix)?;
     let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
-    let uris = load::plan::list_gcs_uris(&plan.gcs_prefix)?;
+    let uris = load::plan::list_gcs_uris(&store, &plan.gcs_prefix)?;
     eprintln!(
         "  load {} → {} | columns={} partition={:?} manifests={} parquet_files={} expected_rows={}",
         plan.table,

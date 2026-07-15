@@ -23,9 +23,9 @@
 //! integrity is free (`rivet validate`); reconciling that the rows *arrived in
 //! the warehouse* is the paid last mile.
 
+use crate::destination::gcs::GcsStore;
 use crate::manifest::{MANIFEST_FILENAME, ManifestStatus, RunManifest};
 use anyhow::{Context, Result, bail};
-use std::process::Command;
 
 /// The reconciled row-count chain for one export's load, derived from the run
 /// manifests under its GCS prefix. `file_rows` is what the warehouse must end
@@ -60,36 +60,34 @@ impl LoadIntegrity {
 ///
 /// A rivet export writes one manifest per `run_id`; a prefix that has
 /// accumulated several incremental / CDC runs holds several. Transport is the
-/// `gcloud` CLI — the same tool the loaders' `ls`/`rm` already use, so auth is
-/// whatever `gcloud` is configured with and no credentials touch this crate.
-pub fn fetch_manifests(gcs_prefix: &str) -> Result<Vec<RunManifest>> {
-    let keys = list_manifest_uris(gcs_prefix)?;
+/// native opendal client the extraction destination already uses (`store`), so
+/// auth is the export's own GCS credentials and this is offline-testable over a
+/// filesystem-backed store.
+///
+/// `pub` (a public-API root the lib keeps alive) even though its only caller is
+/// the binary-only `cli::dispatch`; `#[allow(private_interfaces)]` because the
+/// injected `GcsStore` is deliberately an internal (`pub(crate)`) type — the
+/// `destination` module stays crate-private. Same rationale as the `preflight`
+/// module note in `lib.rs`.
+#[allow(private_interfaces)]
+pub fn fetch_manifests(store: &GcsStore, gcs_prefix: &str) -> Result<Vec<RunManifest>> {
+    let (_, base) = crate::load::split_gs_uri(gcs_prefix)?;
+    let keys = list_manifest_keys(store, base)?;
     keys.iter()
-        .map(|uri| {
-            let bytes = gcs_cat(uri)?;
+        .map(|key| {
+            let bytes = store.read(key)?;
             serde_json::from_slice::<RunManifest>(&bytes)
-                .with_context(|| format!("parsing manifest {uri}"))
+                .with_context(|| format!("parsing manifest {key}"))
         })
         .collect()
 }
 
-/// List every `manifest.json` object URI under `gcs_prefix` (recursive).
-fn list_manifest_uris(gcs_prefix: &str) -> Result<Vec<String>> {
-    let out = Command::new("gcloud")
-        .args(["storage", "ls", &format!("{gcs_prefix}**")])
-        .output()
-        .context("running `gcloud storage ls` to find manifests")?;
-    if !out.status.success() {
-        bail!(
-            "gcloud storage ls failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let all: Vec<String> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|l| is_manifest_key(l))
-        .map(str::to_string)
+/// Bucket-relative keys of every run manifest under `base` (recursive).
+fn list_manifest_keys(store: &GcsStore, base: &str) -> Result<Vec<String>> {
+    let all: Vec<String> = store
+        .list_files(base)?
+        .into_iter()
+        .filter(|k| is_manifest_key(k))
         .collect();
     // A run into a shared prefix leaves BOTH the canonical `manifest.json`
     // (last-writer-wins — a pointer to the LATEST run) and an immutable
@@ -123,21 +121,6 @@ fn is_manifest_key(key: &str) -> bool {
 /// writes alongside the canonical pointer so cross-run reconcile can sum it).
 fn is_run_unique_manifest(base: &str) -> bool {
     base.starts_with("manifest-") && base.ends_with(".json")
-}
-
-/// `gcloud storage cat <uri>` → raw bytes.
-fn gcs_cat(uri: &str) -> Result<Vec<u8>> {
-    let out = Command::new("gcloud")
-        .args(["storage", "cat", uri])
-        .output()
-        .with_context(|| format!("running `gcloud storage cat {uri}`"))?;
-    if !out.status.success() {
-        bail!(
-            "gcloud storage cat {uri} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(out.stdout)
 }
 
 /// Reconcile a run's manifests into the authoritative expected warehouse row
@@ -397,5 +380,90 @@ mod tests {
         assert!(is_manifest_key("manifest.json"));
         assert!(!is_manifest_key("gs://b/p/part-0.parquet"));
         assert!(!is_manifest_key("gs://b/p/x_manifest.json"));
+    }
+
+    // ---- offline (filesystem-backed store) transport tests ----
+
+    /// Build an fs-backed [`GcsStore`] over a fresh tempdir seeded with
+    /// `(bucket-relative-key, bytes)` objects. Returns the store and the guard —
+    /// hold the `TempDir` for the store's lifetime.
+    fn fs_store(files: &[(&str, Vec<u8>)]) -> (GcsStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        for (rel, bytes) in files {
+            let p = dir.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, bytes).unwrap();
+        }
+        let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
+        (store, dir)
+    }
+
+    fn manifest_bytes(run: &str, rows: i64, source: Option<i64>) -> Vec<u8> {
+        serde_json::to_vec(&manifest(run, rows, source)).unwrap()
+    }
+
+    #[test]
+    fn list_manifest_keys_prefers_run_unique_copies_over_the_canonical_pointer() {
+        // A shared prefix that accumulated two runs holds the last-writer-wins
+        // `manifest.json` pointer AND one immutable per-run copy each. Summing
+        // must count the two run copies, never the pointer (double-count guard).
+        let (store, _g) = fs_store(&[
+            ("base/manifest.json", b"{}".to_vec()),
+            ("base/manifest-r1.json", b"{}".to_vec()),
+            ("base/manifest-r2.json", b"{}".to_vec()),
+            ("base/part-0.parquet", b"x".to_vec()), // data file: not a manifest
+        ]);
+        let mut keys = list_manifest_keys(&store, "base").unwrap();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "base/manifest-r1.json".to_string(),
+                "base/manifest-r2.json".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn list_manifest_keys_falls_back_to_the_canonical_name_for_a_single_run() {
+        // A single batch run (or a legacy prefix) has only the canonical name —
+        // with no per-run copy, it must still be found.
+        let (store, _g) = fs_store(&[("base/manifest.json", b"{}".to_vec())]);
+        assert_eq!(
+            list_manifest_keys(&store, "base").unwrap(),
+            vec!["base/manifest.json".to_string()]
+        );
+    }
+
+    #[test]
+    fn fetch_manifests_reads_and_parses_every_run_copy_under_the_prefix() {
+        // Two runs' copies plus a canonical pointer to the latest: fetch returns
+        // exactly the two run copies, parsed — so reconcile sums 100 + 40 = 140
+        // without double-counting the pointer.
+        let (store, _g) = fs_store(&[
+            ("base/manifest.json", manifest_bytes("r2", 40, Some(40))),
+            (
+                "base/manifest-r1.json",
+                manifest_bytes("r1", 100, Some(100)),
+            ),
+            ("base/manifest-r2.json", manifest_bytes("r2", 40, Some(40))),
+        ]);
+        let manifests = fetch_manifests(&store, "gs://my-bucket/base").unwrap();
+        assert_eq!(manifests.len(), 2);
+        let integrity = reconcile(&manifests, false).unwrap();
+        assert_eq!(integrity.file_rows, 140);
+        assert_eq!(integrity.manifests, 2);
+    }
+
+    #[test]
+    fn fetch_manifests_names_the_key_when_a_manifest_is_unparseable() {
+        let (store, _g) = fs_store(&[("base/manifest.json", b"{ not json".to_vec())]);
+        let err = fetch_manifests(&store, "gs://my-bucket/base")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("parsing manifest") && err.contains("base/manifest.json"),
+            "error should name the offending key: {err}"
+        );
     }
 }
