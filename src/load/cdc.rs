@@ -167,6 +167,12 @@ pub const DELETE_FLAG_COLUMN: &str = "__is_deleted";
 /// a silent disappearance. Consumers read live state with
 /// `WHERE NOT __is_deleted`.
 ///
+/// **Backfill.** `cdc.initial: snapshot` preexisting rows load from a plain
+/// full-snapshot parquet, so their `__op`/`__pos` are NULL in `__changes`. The
+/// flag is `COALESCE(.. , FALSE)` (a NULL `__op` is a live snapshot insert, not a
+/// delete — otherwise `WHERE NOT __is_deleted` drops the whole backfill), and the
+/// order ranks NULL `__pos` last (see below) so a later change always wins.
+///
 /// The subquery + `__rn` structure (rather than a `QUALIFY`) is deliberate: the
 /// flag must reflect the *winning* row per PK, computed **after** `ROW_NUMBER`.
 /// Note `__op` is both dropped from the `*` expansion and referenced by the flag
@@ -180,16 +186,21 @@ pub fn dedup_view_sql(
     engine: SourceEngine,
 ) -> String {
     let partition = pk.join(", ");
-    let order = engine
-        .order_exprs(warehouse)
-        .into_iter()
+    // `initial: snapshot` backfill rows load as a plain full-snapshot parquet —
+    // no `__op`/`__pos`/`__seq` — so they land in `__changes` with those NULL.
+    // `__pos IS NOT NULL DESC` FIRST in the order ranks any real change above the
+    // snapshot baseline deterministically across dialects: without it BigQuery
+    // sorts a NULL `__pos` last (snapshot loses — correct by luck) but Snowflake
+    // sorts it first (snapshot would WIN a later update → stale current state).
+    let order = std::iter::once("__pos IS NOT NULL".to_string())
+        .chain(engine.order_exprs(warehouse))
         .map(|e| format!("{e} DESC"))
         .collect::<Vec<_>>()
         .join(", ");
     format!(
         "CREATE OR REPLACE VIEW {view} AS\n\
          SELECT * {except} (__op, __pos, __seq, __rn),\n\
-         \x20      (__op = 'delete') AS {flag}\n\
+         \x20      COALESCE(__op = 'delete', FALSE) AS {flag}\n\
          FROM (\n\
          \x20 SELECT *, ROW_NUMBER() OVER (\n\
          \x20   PARTITION BY {partition}\n\
@@ -239,7 +250,7 @@ mod tests {
                     "{wh:?}/{engine:?}: deletes must NOT be dropped"
                 );
                 assert!(
-                    sql.contains("(__op = 'delete') AS __is_deleted"),
+                    sql.contains("COALESCE(__op = 'delete', FALSE) AS __is_deleted"),
                     "{wh:?}/{engine:?}"
                 );
                 assert!(sql.contains("PARTITION BY id"), "{wh:?}/{engine:?}");
@@ -322,7 +333,43 @@ mod tests {
         );
         assert!(sf.contains("PARSE_JSON(__pos):_data::string DESC, __seq DESC"));
         // Soft-delete parity holds for Mongo too.
-        assert!(sf.contains("(__op = 'delete') AS __is_deleted"));
+        assert!(sf.contains("COALESCE(__op = 'delete', FALSE) AS __is_deleted"));
+    }
+
+    #[test]
+    fn snapshot_backfill_rows_are_live_and_rank_oldest_on_every_dialect() {
+        // `cdc.initial: snapshot` rows carry NULL __op/__pos in `__changes`. The
+        // view must (1) read a NULL __op as a live insert — not a NULL flag that
+        // `WHERE NOT __is_deleted` silently drops — and (2) rank a NULL __pos below
+        // any real change on BOTH dialects, not rely on the engine's NULL-order
+        // default (BigQuery NULLS-last vs Snowflake NULLS-first would disagree).
+        for wh in WAREHOUSES {
+            for engine in ENGINES {
+                let sql = dedup_view_sql(wh, "p.d.t", "p.d.t__changes", &["id"], engine);
+                assert!(
+                    sql.contains("COALESCE(__op = 'delete', FALSE) AS __is_deleted"),
+                    "{wh:?}/{engine:?}: NULL __op must read as not-deleted (live): {sql}"
+                );
+                // The null-rank guard is the FIRST, most-significant order key.
+                let order = sql.split("ORDER BY").nth(1).unwrap();
+                assert!(
+                    order.contains("__pos IS NOT NULL DESC"),
+                    "{wh:?}/{engine:?}: NULL __pos must be ranked, not left to engine default: {sql}"
+                );
+                let guard_at = order.find("__pos IS NOT NULL DESC").unwrap();
+                let parse_at = order.find(if wh == Warehouse::BigQuery {
+                    "JSON_VALUE"
+                } else {
+                    "PARSE_JSON"
+                });
+                if let Some(parse_at) = parse_at {
+                    assert!(
+                        guard_at < parse_at,
+                        "{wh:?}/{engine:?}: null-rank guard must precede the __pos parse: {sql}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
