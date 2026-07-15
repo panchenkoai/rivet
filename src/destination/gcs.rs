@@ -218,4 +218,36 @@ mod tests {
             "objects outside the prefix are untouched"
         );
     }
+
+    #[test]
+    fn remove_all_on_a_missing_prefix_is_a_no_op_not_an_error() {
+        // `cleanup_source` runs after a load; a retried load (or a crash between
+        // cleanup and the next run) can call it on an ALREADY-empty prefix. That
+        // must be a no-op `Ok(())`, never an error that fails the whole load.
+        let dir = tempfile::tempdir().unwrap();
+        write_at(dir.path(), "keep/c.parquet", b"c"); // a sibling, untouched
+        let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
+        store
+            .remove_all("never/existed")
+            .expect("deleting a nonexistent prefix must be a no-op");
+        assert_eq!(
+            store.list_files("keep").unwrap(),
+            vec!["keep/c.parquet".to_string()],
+            "a no-op delete touches nothing"
+        );
+    }
+
+    #[test]
+    fn list_files_on_a_missing_prefix_is_empty_not_an_error() {
+        // reconcile/plan list before they know a prefix has anything; a missing
+        // prefix must read as empty, not blow up the load.
+        let dir = tempfile::tempdir().unwrap();
+        let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
+        assert!(
+            store
+                .list_files("no/such/prefix")
+                .expect("listing a missing prefix must succeed")
+                .is_empty()
+        );
+    }
 }

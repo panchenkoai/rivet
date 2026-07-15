@@ -474,6 +474,22 @@ mod tests {
     }
 
     #[test]
+    fn select_load_keys_empty_new_set_selects_nothing_never_the_full_listing() {
+        // When every run is already in the ledger the "new" set is empty. That
+        // must resolve to ZERO uris — NOT the blanket fallback, which would
+        // re-load the whole prefix on every up-to-date run (double-load). The
+        // fallback fires only for an unresolvable NON-empty manifest.
+        let all = vec![
+            "base/r1-000.parquet".to_string(),
+            "base/r2-000.parquet".to_string(),
+        ];
+        assert!(
+            select_load_keys(&[], &all).is_empty(),
+            "no new runs ⇒ load nothing, not everything"
+        );
+    }
+
+    #[test]
     fn is_run_unique_manifest_needs_both_prefix_and_json() {
         assert!(is_run_unique_manifest("manifest-20260101T000000.json"));
         assert!(!is_run_unique_manifest("manifest.json")); // no `-` after manifest

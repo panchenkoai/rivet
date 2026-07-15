@@ -1161,6 +1161,25 @@ mod load_ledger_tests {
     }
 
     #[test]
+    fn record_success_marks_its_run_even_at_zero_rows() {
+        // A NEW run that legitimately produced 0 rows (an empty CDC drain) still
+        // SUCCEEDED — its run must be marked loaded, or every later load re-picks
+        // it forever. Guards the 0-row *success* (marks its run) vs *skip* (no
+        // new runs, marks nothing) distinction: marking is gated on status, not
+        // on rows > 0.
+        let s = StateStore::open_in_memory().unwrap();
+        ctx(&s, "L1").record_success(&["r_empty".into()], 0);
+        let loads = s.recent_loads(Some(TARGET), 10).unwrap();
+        assert_eq!(loads.len(), 1);
+        assert_eq!(loads[0].status, "success");
+        assert_eq!(loads[0].rows_loaded, 0);
+        assert!(
+            s.loaded_source_run_ids(TARGET).unwrap().contains("r_empty"),
+            "a 0-row successful load still marks its run — not re-processed forever"
+        );
+    }
+
+    #[test]
     fn record_skip_logs_a_zero_row_success_and_marks_nothing() {
         let s = StateStore::open_in_memory().unwrap();
         ctx(&s, "L1").record_skip();
