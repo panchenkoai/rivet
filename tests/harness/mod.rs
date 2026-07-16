@@ -310,6 +310,15 @@ struct HarnessEnv {
     sf: Option<SfEnv>,
 }
 
+/// The live matrix cells need a warehouse env (`RIVET_TEST_GCS_BUCKET` + creds).
+/// CI sweeps `cargo test -- --ignored` WITHOUT it, so each runner soft-skips
+/// there (returns no oracles → `assert_all_pass` passes) instead of panicking in
+/// `HarnessEnv::load`. On a box with creds the cells run for real. Mirrors the
+/// `src/load` live-test soft-skip.
+fn no_live_warehouse_env() -> bool {
+    std::env::var("RIVET_TEST_GCS_BUCKET").is_err()
+}
+
 impl HarnessEnv {
     fn load() -> Result<Self> {
         // The matrix now lives in the OSS crate, so the seed binary + init SQL are
@@ -398,6 +407,10 @@ impl Verification {
         &self,
         oracles: &[WarehouseOracle],
     ) -> Result<Vec<(WarehouseOracle, OracleOutcome)>> {
+        if no_live_warehouse_env() {
+            eprintln!("SKIP run: RIVET_TEST_GCS_BUCKET unset — no live warehouse env");
+            return Ok(Vec::new());
+        }
         if oracles.is_empty() {
             bail!("strength-floor: a `test:` case must declare ≥1 oracle (ADR-0001)");
         }
@@ -433,6 +446,10 @@ impl Verification {
         warehouse: &[WarehouseOracle],
         soak: &[SoakOracle],
     ) -> Result<Vec<(String, OracleOutcome)>> {
+        if no_live_warehouse_env() {
+            eprintln!("SKIP run_soak: RIVET_TEST_GCS_BUCKET unset — no live warehouse env");
+            return Ok(Vec::new());
+        }
         if self.mode != Mode::Cdc {
             bail!("run_soak requires Mode::Cdc");
         }
@@ -494,6 +511,10 @@ impl Verification {
     /// `_id:2` → capture CDC run → load `--cdc --pk _id`. The dedup view must show
     /// `_id:1` live and `_id:2` as a tombstone (`__is_deleted = true`).
     pub fn run_mongo_cdc_delete(&self) -> Result<Vec<(String, OracleOutcome)>> {
+        if no_live_warehouse_env() {
+            eprintln!("SKIP run_mongo_cdc_delete: RIVET_TEST_GCS_BUCKET unset");
+            return Ok(Vec::new());
+        }
         if self.engine != Engine::Mongo || self.mode != Mode::Cdc {
             bail!("run_mongo_cdc_delete is Mongo+Cdc only");
         }
@@ -569,6 +590,10 @@ impl Verification {
     /// via the warehouse with a bespoke oracle set (`evaluate()` assumes a SQL
     /// source + an `id` column — neither holds for Mongo's `_id`/JSON-blob model).
     pub fn run_mongo_batch(&self) -> Result<Vec<(String, OracleOutcome)>> {
+        if no_live_warehouse_env() {
+            eprintln!("SKIP run_mongo_batch: RIVET_TEST_GCS_BUCKET unset");
+            return Ok(Vec::new());
+        }
         if self.engine != Engine::Mongo || self.mode != Mode::Batch {
             bail!("run_mongo_batch is Mongo+Batch only");
         }
@@ -637,6 +662,10 @@ impl Verification {
     /// delete 1 → drain → load `--cdc --pk id`. Live must equal N (N−1 delete +1
     /// insert), tombstoned 1, and an untouched mid-backfill row live.
     pub fn run_cdc_backfill(&self) -> Result<Vec<(String, OracleOutcome)>> {
+        if no_live_warehouse_env() {
+            eprintln!("SKIP run_cdc_backfill: RIVET_TEST_GCS_BUCKET unset");
+            return Ok(Vec::new());
+        }
         if self.mode != Mode::Cdc || !self.initial_snapshot {
             bail!("run_cdc_backfill needs Mode::Cdc + .initial_snapshot()");
         }
@@ -745,6 +774,10 @@ impl Verification {
     /// ver-2 value (the cursor-ordered dedup), zero tombstones, and an empty
     /// bucket.
     pub fn run_incremental(&self) -> Result<Vec<(String, OracleOutcome)>> {
+        if no_live_warehouse_env() {
+            eprintln!("SKIP run_incremental: RIVET_TEST_GCS_BUCKET unset");
+            return Ok(Vec::new());
+        }
         let env = HarnessEnv::load()?;
         let work = TempWork::new("rivet-incremental")?;
         let t = self.fixture.table.clone();
