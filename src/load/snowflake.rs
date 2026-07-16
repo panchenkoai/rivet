@@ -163,19 +163,17 @@ impl TargetLoader for SnowflakeLoader {
         format!("{}.{}.{}", self.database, self.schema, table)
     }
 
-    fn materialize(
-        &self,
-        table: &str,
-        specs: &[TargetColumnSpec],
-        _uris: &[String],
-    ) -> Result<u64> {
+    fn materialize(&self, table: &str, specs: &[TargetColumnSpec], uris: &[String]) -> Result<u64> {
         let fqtn = self.fqtn(table);
         let ddl = Self::build_schema_ddl(specs);
         let select = Self::build_copy_select(specs);
         let columns = Self::build_column_list(specs);
         // A per-load external stage over the export's GCS prefix; the COPY loads
-        // every Parquet under it (`PATTERN`), so the explicit URI list is unused.
+        // exactly the driver-selected files (`FILES=(…)`), NOT every Parquet under
+        // the prefix — so the mode-aware/ledger per-run selection is honored (a
+        // `PATTERN` over the prefix would load stale runs and fail the count gate).
         let stage = format!("rivet_stage_{}", sanitize_tag(table));
+        let files = copy_files_clause(&self.gcs_url, uris)?;
         let cluster = Self::cluster_clause(&self.cluster_by);
 
         // `CREATE OR REPLACE` (overwrite): storage is the source of truth. Pin
@@ -191,7 +189,7 @@ impl TargetLoader for SnowflakeLoader {
              CREATE OR REPLACE TABLE {fqtn} (\n{ddl}\n){cluster};\n\
              COPY INTO {fqtn} ({columns})\n\
              \x20 FROM (SELECT {select} FROM @{stage})\n\
-             \x20 FILE_FORMAT=(FORMAT_NAME=rivet_pq) PATTERN='.*[.]parquet';\n\
+             \x20 FILE_FORMAT=(FORMAT_NAME=rivet_pq) {files};\n\
              SELECT COUNT(*) AS ROWS_ FROM {fqtn};",
             tag = self.query_tag(table),
             wh = self.warehouse,
@@ -212,7 +210,7 @@ impl TargetLoader for SnowflakeLoader {
         &self,
         table: &str,
         specs: &[TargetColumnSpec],
-        _uris: &[String],
+        uris: &[String],
         pk: &[String],
     ) -> Result<u64> {
         use crate::load::cdc::Warehouse;
@@ -233,6 +231,7 @@ impl TargetLoader for SnowflakeLoader {
         let columns = Self::build_column_list(&full);
         let cluster = Self::cluster_clause(pk);
         let stage = format!("rivet_stage_{}", sanitize_tag(&changes));
+        let files = copy_files_clause(&self.gcs_url, uris)?;
 
         // Ensure the log exists (clustered on PK), COUNT before, append via COPY,
         // COUNT after — the delta is what THIS load added; the driver gates it.
@@ -247,7 +246,7 @@ impl TargetLoader for SnowflakeLoader {
              SELECT COUNT(*) AS BEFORE_ FROM {changes_fqtn};\n\
              COPY INTO {changes_fqtn} ({columns})\n\
              \x20 FROM (SELECT {select} FROM @{stage})\n\
-             \x20 FILE_FORMAT=(FORMAT_NAME=rivet_pq) PATTERN='.*[.]parquet';\n\
+             \x20 FILE_FORMAT=(FORMAT_NAME=rivet_pq) {files};\n\
              SELECT COUNT(*) AS AFTER_ FROM {changes_fqtn};",
             tag = self.query_tag(&changes),
             wh = self.warehouse,
@@ -332,6 +331,36 @@ fn sanitize_tag(s: &str) -> String {
         .collect()
 }
 
+/// Build the COPY `FILES=('a.parquet', 'b/c.parquet', …)` clause from the
+/// driver-selected `uris`, each made relative to the stage URL (`gcs_url`). This
+/// is what makes Snowflake honor the mode-aware/ledger per-run selection instead
+/// of loading every Parquet under the prefix — a `PATTERN` over the prefix would
+/// re-load stale/already-loaded runs and fail the count gate.
+fn copy_files_clause(gcs_url: &str, uris: &[String]) -> Result<String> {
+    if uris.is_empty() {
+        bail!("Snowflake COPY: no Parquet URIs selected to load");
+    }
+    // Snowflake caps an explicit FILES=() list at 1000 entries; a normal run is a
+    // handful. Batching past that is a follow-up — fail loud rather than silently
+    // fall back to a whole-prefix PATTERN (the bug this fix closes).
+    if uris.len() > 1000 {
+        bail!(
+            "Snowflake COPY FILES=() caps at 1000 files, got {} — batch the load or reduce parallelism",
+            uris.len()
+        );
+    }
+    let base = gcs_url.trim_end_matches('/');
+    let files = uris
+        .iter()
+        .map(|u| {
+            let rel = u.strip_prefix(base).unwrap_or(u).trim_start_matches('/');
+            format!("'{rel}'")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!("FILES=({files})"))
+}
+
 /// Pull the `ROWS_` count out of snow's JSON (array of statement result blocks).
 fn extract_count(value: &serde_json::Value) -> Option<u64> {
     extract_named(value, "ROWS_")
@@ -368,6 +397,38 @@ mod tests {
             note: None,
             cast_sql: None,
         }
+    }
+
+    #[test]
+    fn copy_files_clause_lists_the_selected_files_relative_to_the_stage() {
+        // The COPY must name exactly the driver-selected files (not a whole-prefix
+        // PATTERN), each relative to the stage URL — so Snowflake honors the
+        // mode-aware/ledger per-run selection.
+        let clause = copy_files_clause(
+            "gs://bucket/exports/orders/",
+            &[
+                "gs://bucket/exports/orders/part-0.parquet".to_string(),
+                "gs://bucket/exports/orders/snapshot/part-1.parquet".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            clause, "FILES=('part-0.parquet', 'snapshot/part-1.parquet')",
+            "each uri stripped to a stage-relative path; no PATTERN"
+        );
+        assert!(!clause.contains("PATTERN"));
+        // A stage URL without a trailing slash still strips cleanly.
+        assert_eq!(
+            copy_files_clause("gs://b/p", &["gs://b/p/f.parquet".to_string()]).unwrap(),
+            "FILES=('f.parquet')"
+        );
+        // Empty selection and the 1000-file cap both bail (never a silent
+        // whole-prefix fallback).
+        assert!(copy_files_clause("gs://b/p/", &[]).is_err());
+        let many: Vec<String> = (0..1001)
+            .map(|i| format!("gs://b/p/f{i}.parquet"))
+            .collect();
+        assert!(copy_files_clause("gs://b/p/", &many).is_err());
     }
 
     #[test]
