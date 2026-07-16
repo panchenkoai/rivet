@@ -123,16 +123,10 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             config,
             rivet_bin,
             run_id,
-            allow_source_drift,
-            cdc,
-            pk,
         } => dispatch_load(LoadArgs {
             config,
             rivet_bin,
             run_id,
-            allow_source_drift,
-            cdc,
-            pk,
         }),
         Commands::Init {
             source,
@@ -721,9 +715,6 @@ struct LoadArgs {
     config: String,
     rivet_bin: String,
     run_id: Option<String>,
-    allow_source_drift: bool,
-    cdc: bool,
-    pk: Vec<String>,
 }
 
 /// `rivet load`: config-driven warehouse load. The top-level `load:` block
@@ -758,67 +749,45 @@ fn dispatch_load(args: LoadArgs) -> Result<()> {
         tables.join(", ")
     );
 
-    if args.cdc {
-        if args.pk.is_empty() {
-            anyhow::bail!(
-                "`--cdc` needs `--pk <col>[,<col>]` — the change log's primary key for the dedup view"
-            );
-        }
-        let engine = load::plan::source_engine(&args.config)?;
-        for plan in &plans {
-            let load_id = format!("{run_id}:{}", plan.table);
-            match load_one_cdc(
-                plan,
-                &run_id,
-                engine,
-                &args.pk,
-                args.allow_source_drift,
-                state.as_ref(),
-                &load_id,
-            )? {
-                Some(report) => println!("CDC LOAD OK [{}]: {report:#?}", plan.table),
-                None => println!("CDC LOAD SKIP [{}]: up to date", plan.table),
-            }
-            if plan.load.gc_orphans {
-                maybe_gc_orphans(plan);
-            }
-        }
-        return Ok(());
-    }
-
+    // The `__pos` parse engine is config-level — resolve it once, and only if a
+    // table actually needs it (a `mode: cdc` export).
+    let engine = if plans.iter().any(|p| p.mode == load::plan::LoadMode::Cdc) {
+        Some(load::plan::source_engine(&args.config)?)
+    } else {
+        None
+    };
+    // Route each table by its declared `mode:`; `pk:` and `allow_source_drift:`
+    // come from the `load:` block, so the CLI carries no per-mode flags.
     for plan in &plans {
         let load_id = format!("{run_id}:{}", plan.table);
+        let drift = plan.load.allow_source_drift;
         match plan.mode {
-            // Incremental: APPEND the delta + a cursor-ordered current-state view
-            // (the delta accumulates like CDC, so needs a PK for the dedup).
-            load::plan::LoadMode::Incremental => {
-                if args.pk.is_empty() {
-                    anyhow::bail!(
-                        "incremental load of `{}` needs `--pk <col>[,<col>]` — the current-state \
-                         view's dedup key",
-                        plan.table
-                    );
-                }
-                match load_one_incremental(
+            // CDC: APPEND the change log + rebuild the current-state dedup view.
+            load::plan::LoadMode::Cdc => {
+                let pk = require_pk(plan, "cdc")?;
+                match load_one_cdc(
                     plan,
                     &run_id,
-                    &args.pk,
-                    args.allow_source_drift,
+                    engine.expect("engine resolved above for a cdc plan"),
+                    pk,
+                    drift,
                     state.as_ref(),
                     &load_id,
                 )? {
+                    Some(report) => println!("CDC LOAD OK [{}]: {report:#?}", plan.table),
+                    None => println!("CDC LOAD SKIP [{}]: up to date", plan.table),
+                }
+            }
+            // Incremental: APPEND the delta + a cursor-ordered current-state view.
+            load::plan::LoadMode::Incremental => {
+                let pk = require_pk(plan, "incremental")?;
+                match load_one_incremental(plan, &run_id, pk, drift, state.as_ref(), &load_id)? {
                     Some(report) => println!("INCREMENTAL LOAD OK [{}]: {report:#?}", plan.table),
                     None => println!("INCREMENTAL LOAD SKIP [{}]: up to date", plan.table),
                 }
             }
             // Full/chunked: ledger-driven latest-run OVERWRITE.
-            _ => match load_one(
-                plan,
-                &run_id,
-                args.allow_source_drift,
-                state.as_ref(),
-                &load_id,
-            )? {
+            _ => match load_one(plan, &run_id, drift, state.as_ref(), &load_id)? {
                 Some(report) => println!("LOAD OK [{}]: {report:#?}", plan.table),
                 None => println!("LOAD SKIP [{}]: up to date", plan.table),
             },
@@ -828,6 +797,19 @@ fn dispatch_load(args: LoadArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The dedup view's primary key for an append mode (`cdc` / `incremental`), read
+/// from the export's `load:` block. Bails with a config-fix hint when absent.
+fn require_pk<'a>(plan: &'a load::plan::LoadPlan, mode: &str) -> Result<&'a [String]> {
+    if plan.load.pk.is_empty() {
+        anyhow::bail!(
+            "export `{}` is mode: {mode} but its `load:` block has no `pk:` — the current-state \
+             dedup view needs a primary key (e.g. `pk: [id]`)",
+            plan.table
+        );
+    }
+    Ok(&plan.load.pk)
 }
 
 /// Best-effort orphan-Parquet GC for one table's prefix (config `gc_orphans`):

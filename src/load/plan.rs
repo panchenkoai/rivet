@@ -24,6 +24,17 @@ pub struct LoadSection {
     pub target: LoadTarget,
     #[serde(default)]
     pub cleanup_source: bool,
+    /// Primary key column(s) for the incremental/CDC current-state dedup view —
+    /// the view's PARTITION BY. Required for `mode: incremental` / `mode: cdc`;
+    /// ignored for `full` (which overwrites, no view). Composite key = several
+    /// columns, e.g. `pk: [tenant, id]`.
+    #[serde(default)]
+    pub pk: Vec<String>,
+    /// Load even when a run manifest's source count disagrees with what it
+    /// extracted (source→file drift): warn instead of blocking. The
+    /// file→warehouse count gate and manifest gates still apply.
+    #[serde(default)]
+    pub allow_source_drift: bool,
     /// After a successful load, delete staged Parquet under the export prefix
     /// that no `Success` manifest references — crash leftovers from an
     /// interrupted extract. Keeps the current run's files, manifests, and

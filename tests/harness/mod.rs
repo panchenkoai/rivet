@@ -522,13 +522,11 @@ impl Verification {
             "rivet run (capture)",
         )?;
 
-        // Load the change log + (re)build the current-state dedup view (pk = _id).
+        // Load the change log + (re)build the current-state dedup view. Mode
+        // (cdc) and the pk (_id) come from the config's `load:` block.
         run(
-            Command::new("rivet")
-                .args(["load", "-c"])
-                .arg(&cfg)
-                .args(["--cdc", "--pk", "_id"]),
-            "rivet load --cdc",
+            Command::new("rivet").args(["load", "-c"]).arg(&cfg),
+            "rivet load (cdc)",
         )?;
 
         let view = self.warehouse_table_ref(&env, &self.loaded_table_name())?;
@@ -616,12 +614,10 @@ impl Verification {
             Command::new("rivet").args(["run", "-c"]).arg(&cfg),
             "rivet run (drain)",
         )?;
+        // Mode (cdc) + the pk come from the config's `load:` block now.
         run(
-            Command::new("rivet")
-                .args(["load", "-c"])
-                .arg(&cfg)
-                .args(["--cdc", "--pk", pk]),
-            "rivet load --cdc",
+            Command::new("rivet").args(["load", "-c"]).arg(&cfg),
+            "rivet load (cdc)",
         )?;
 
         let view = self.warehouse_table_ref(&env, &self.loaded_table_name())?;
@@ -1230,6 +1226,17 @@ impl Verification {
                     si = sf.storage_integration,
                 )
             }
+        };
+        // CDC/incremental loads carry the dedup view's PK in the `load:` block —
+        // the CLI no longer takes `--pk`. SQL sources key on `id`, Mongo on `_id`.
+        let load_block = if self.mode == Mode::Cdc {
+            let pk = match self.engine {
+                Engine::Mongo => "_id",
+                _ => "id",
+            };
+            format!("{load_block}  pk: [{pk}]\n")
+        } else {
+            load_block
         };
         let (mode, cdc_fields) = match self.mode {
             Mode::Batch => ("full", String::new()),
