@@ -787,8 +787,13 @@ mod tests {
     #[test]
     #[ignore = "live: needs bq CLI + ADC + a GCS Parquet fixture"]
     fn bigquery_live_load_round_trips() {
-        let project = std::env::var("BIGQUERY_TEST_PROJECT")
-            .expect("set BIGQUERY_TEST_PROJECT for the live BigQuery test");
+        // Soft-skip when the live BigQuery project isn't configured: CI sweeps
+        // `--ignored` (ci.yml) without warehouse creds, so a hard `.expect` here
+        // would fail the run. With the project set (a live/nightly box) it runs.
+        let Ok(project) = std::env::var("BIGQUERY_TEST_PROJECT") else {
+            eprintln!("skipping bigquery_live_load_round_trips: BIGQUERY_TEST_PROJECT unset");
+            return;
+        };
         let dataset =
             std::env::var("RIVET_BQ_TEST_DATASET").unwrap_or_else(|_| "rivet_test".to_string());
         let uri = std::env::var("RIVET_BQ_TEST_PARQUET_URI").expect(
@@ -827,8 +832,13 @@ mod tests {
     #[test]
     #[ignore = "live: needs bq CLI + ADC + a CDC change-log Parquet fixture"]
     fn bigquery_live_cdc_view_dedups_at_least_once() {
-        let project = std::env::var("BIGQUERY_TEST_PROJECT")
-            .expect("set BIGQUERY_TEST_PROJECT for the live BigQuery CDC test");
+        // Soft-skip when unconfigured — see bigquery_live_load_round_trips.
+        let Ok(project) = std::env::var("BIGQUERY_TEST_PROJECT") else {
+            eprintln!(
+                "skipping bigquery_live_cdc_view_dedups_at_least_once: BIGQUERY_TEST_PROJECT unset"
+            );
+            return;
+        };
         let dataset =
             std::env::var("RIVET_BQ_TEST_DATASET").unwrap_or_else(|_| "rivet_test".to_string());
         let uri = std::env::var("RIVET_BQ_CDC_PARQUET_URI")
