@@ -203,7 +203,10 @@ fn mongo_cdc_delete_flag_bigquery() {
 #[test]
 #[ignore = "live: needs devbox mysql-cdc stack + BigQuery creds"]
 fn cdc_backfill_snapshot_mysql() {
-    let v = Verification::new(Engine::Mysql, Mode::Cdc, Fixture::smoke("cdc_backfill"))
+    // Engine-distinct table: CDC names the target from `table:`, so every engine's
+    // backfill cell must own a table or they collide on `rivet_matrix.<t>__changes`
+    // (an `id` vs `_id` schema clash, or silent cross-engine row contamination).
+    let v = Verification::new(Engine::Mysql, Mode::Cdc, Fixture::smoke("cdc_bf_mysql"))
         .initial_snapshot();
     assert_all_pass(v.run_cdc_backfill().expect("cdc backfill"));
 }
@@ -213,7 +216,7 @@ fn cdc_backfill_snapshot_mysql() {
 #[test]
 #[ignore = "live: needs devbox postgres-cdc stack + BigQuery creds"]
 fn cdc_backfill_snapshot_pg() {
-    let v = Verification::new(Engine::Postgres, Mode::Cdc, Fixture::smoke("cdc_backfill"))
+    let v = Verification::new(Engine::Postgres, Mode::Cdc, Fixture::smoke("cdc_bf_pg"))
         .initial_snapshot();
     assert_all_pass(v.run_cdc_backfill().expect("cdc backfill"));
 }
@@ -223,7 +226,7 @@ fn cdc_backfill_snapshot_pg() {
 #[test]
 #[ignore = "live: needs the mongo replica-set devbox (rivet-mongo-rs-1) + BigQuery"]
 fn cdc_backfill_snapshot_mongo() {
-    let v = Verification::new(Engine::Mongo, Mode::Cdc, Fixture::smoke("cdc_backfill"))
+    let v = Verification::new(Engine::Mongo, Mode::Cdc, Fixture::smoke("cdc_bf_mongo"))
         .initial_snapshot();
     assert_all_pass(v.run_cdc_backfill().expect("cdc backfill"));
 }
@@ -233,7 +236,9 @@ fn cdc_backfill_snapshot_mongo() {
 #[test]
 #[ignore = "live: needs devbox mysql-cdc stack + Snowflake (RIVET_SF_* + snow CLI)"]
 fn cdc_backfill_snapshot_mysql_snowflake() {
-    let v = Verification::new(Engine::Mysql, Mode::Cdc, Fixture::smoke("cdc_backfill"))
+    // Shares the MySQL source table with the BigQuery cell (different warehouse ⇒
+    // no target collision); run one at a time.
+    let v = Verification::new(Engine::Mysql, Mode::Cdc, Fixture::smoke("cdc_bf_mysql"))
         .initial_snapshot()
         .warehouse(Warehouse::Snowflake);
     assert_all_pass(v.run_cdc_backfill().expect("cdc backfill"));
