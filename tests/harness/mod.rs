@@ -631,8 +631,15 @@ impl Verification {
             self.wh_scalar(&format!("SELECT COUNT(*) FROM {vt} WHERE __is_deleted"))?;
         // A middle backfill row the stream never touched — the class the bug hid.
         let mid = n / 2;
+        // Mongo serialises `_id` to a STRING in the warehouse (SQL sources keep a
+        // numeric `id`), so the mid-row literal must be quoted for Mongo or the
+        // `_id = <int>` comparison is a type error.
+        let mid_lit = match self.engine {
+            Engine::Mongo => format!("'{mid}'"),
+            _ => mid.to_string(),
+        };
         let mid_live = self.wh_scalar(&format!(
-            "SELECT COUNT(*) FROM {vt} WHERE {pk} = {mid} AND NOT __is_deleted"
+            "SELECT COUNT(*) FROM {vt} WHERE {pk} = {mid_lit} AND NOT __is_deleted"
         ))?;
 
         Ok(vec![
