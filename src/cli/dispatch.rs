@@ -785,16 +785,40 @@ fn dispatch_load(args: LoadArgs) -> Result<()> {
 
     for plan in &plans {
         let load_id = format!("{run_id}:{}", plan.table);
-        // Full loads are ledger-driven (latest run + skip re-load + safe cleanup);
-        // incremental still takes the stateless overwrite path until its own
-        // append+dedup path lands (next commit).
-        let st = match plan.mode {
-            load::plan::LoadMode::Full => state.as_ref(),
-            _ => None,
-        };
-        match load_one(plan, &run_id, args.allow_source_drift, st, &load_id)? {
-            Some(report) => println!("LOAD OK [{}]: {report:#?}", plan.table),
-            None => println!("LOAD SKIP [{}]: up to date", plan.table),
+        match plan.mode {
+            // Incremental: APPEND the delta + a cursor-ordered current-state view
+            // (the delta accumulates like CDC, so needs a PK for the dedup).
+            load::plan::LoadMode::Incremental => {
+                if args.pk.is_empty() {
+                    anyhow::bail!(
+                        "incremental load of `{}` needs `--pk <col>[,<col>]` — the current-state \
+                         view's dedup key",
+                        plan.table
+                    );
+                }
+                match load_one_incremental(
+                    plan,
+                    &run_id,
+                    &args.pk,
+                    args.allow_source_drift,
+                    state.as_ref(),
+                    &load_id,
+                )? {
+                    Some(report) => println!("INCREMENTAL LOAD OK [{}]: {report:#?}", plan.table),
+                    None => println!("INCREMENTAL LOAD SKIP [{}]: up to date", plan.table),
+                }
+            }
+            // Full/chunked: ledger-driven latest-run OVERWRITE.
+            _ => match load_one(
+                plan,
+                &run_id,
+                args.allow_source_drift,
+                state.as_ref(),
+                &load_id,
+            )? {
+                Some(report) => println!("LOAD OK [{}]: {report:#?}", plan.table),
+                None => println!("LOAD SKIP [{}]: up to date", plan.table),
+            },
         }
     }
     Ok(())
@@ -1033,6 +1057,77 @@ fn load_one_cdc(
                 &inputs.uris,
                 pk,
                 engine,
+                Some(inputs.integrity.file_rows),
+                cleanup,
+            )?;
+            Ok((report.rows_appended, report))
+        },
+        |inputs, report| {
+            eprintln!(
+                "  integrity ✓ {} → appended {} to {} | current-state view {}",
+                inputs.integrity.chain_prefix(),
+                report.rows_appended,
+                report.changes_table,
+                report.view,
+            );
+        },
+    )
+}
+
+/// Load a single export's INCREMENTAL delta: APPEND the delta Parquet into
+/// `<table>__changes` and (re)build a current-state view deduped to the latest
+/// row per PK by the export's `cursor_column`. Ledger-driven exactly like CDC —
+/// only the not-yet-loaded runs are appended, so re-loads don't double and
+/// `cleanup_source` is safe.
+fn load_one_incremental(
+    plan: &load::plan::LoadPlan,
+    run_id: &str,
+    pk: &[String],
+    allow_source_drift: bool,
+    state: Option<&StateStore>,
+    load_id: &str,
+) -> Result<Option<load::CdcLoadReport>> {
+    let cursor = plan.cursor_column.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "incremental load of `{}` needs the export's `cursor_column:` — the current-state \
+             view's latest-per-PK ordering key",
+            plan.table
+        )
+    })?;
+    let job = LoadJob {
+        plan,
+        run_id,
+        state,
+        load_id,
+        allow_source_drift,
+        mode: "incremental",
+    };
+    execute_load(
+        job,
+        |inputs| {
+            eprintln!(
+                "  incremental load {} → {} | pk={} cursor={} manifests={} parquet_files={} expected_delta={}",
+                plan.table,
+                plan.load.target.name(),
+                pk.join(","),
+                cursor,
+                inputs.integrity.manifests,
+                inputs.uris.len(),
+                inputs.integrity.file_rows,
+            );
+        },
+        |loader, store, inputs| {
+            let cleanup = plan
+                .load
+                .cleanup_source
+                .then_some((store, plan.gcs_prefix.as_str()));
+            let report = load::run_load_incremental(
+                loader,
+                &plan.table,
+                &plan.specs,
+                &inputs.uris,
+                pk,
+                &cursor,
                 Some(inputs.integrity.file_rows),
                 cleanup,
             )?;

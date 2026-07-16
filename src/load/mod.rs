@@ -76,6 +76,11 @@ pub trait TargetLoader {
         pk: &[String],
         engine: cdc::SourceEngine,
     ) -> Result<()>;
+
+    /// `CREATE OR REPLACE` the INCREMENTAL current-state view `<table>` over its
+    /// change log — deduped to the latest row per PK by `cursor_column` (no
+    /// tombstones), via [`cdc::inc_dedup_view_sql`].
+    fn create_inc_dedup_view(&self, table: &str, pk: &[String], cursor_column: &str) -> Result<()>;
 }
 
 /// Refuse a load whose specs can't materialize: empty, or any `Fail`-status
@@ -206,6 +211,61 @@ pub fn run_load_cdc(
     })
 }
 
+/// Load an INCREMENTAL export's delta: APPEND the parquet into `<table>__changes`
+/// (reusing the CDC changelog append — the delta's rows land with NULL `__op`/
+/// `__pos`/`__seq`, which the view drops) and (re)build a current-state view
+/// deduped to the latest row per PK by `cursor_column`. The manifests' summed
+/// `row_count` gates the appended delta, and cleanup runs (only) after the gate —
+/// safe because the ledger, not the file prefix, records what's loaded.
+// Same arity shape as [`run_load_cdc`] (the cursor replaces the engine);
+// `allow(private_interfaces)` for the injected `GcsStore` — see [`run_load`].
+#[allow(clippy::too_many_arguments, private_interfaces)]
+pub fn run_load_incremental(
+    loader: &dyn TargetLoader,
+    table: &str,
+    specs: &[TargetColumnSpec],
+    uris: &[String],
+    pk: &[String],
+    cursor_column: &str,
+    expected_delta: Option<u64>,
+    cleanup: Option<(&GcsStore, &str)>,
+) -> Result<CdcLoadReport> {
+    if uris.is_empty() {
+        bail!("no Parquet URIs to append into `{table}__changes`");
+    }
+    if pk.is_empty() {
+        bail!("incremental load of `{table}` needs a primary key for the dedup view (pass --pk)");
+    }
+    if cursor_column.is_empty() {
+        bail!(
+            "incremental load of `{table}` needs a cursor column (the export's `cursor_column:`) \
+             for the dedup view's latest-per-PK ordering"
+        );
+    }
+    validate_specs(&format!("{table}__changes"), specs)?;
+
+    let rows_appended = loader.append_changelog(table, specs, uris, pk)?;
+
+    if let Some(expected) = expected_delta
+        && rows_appended != expected
+    {
+        bail!(
+            "incremental count validation failed for `{}__changes`: appended {rows_appended} rows, \
+             expected {expected} from the run manifests — investigate before trusting the view",
+            table
+        );
+    }
+
+    loader.create_inc_dedup_view(table, pk, cursor_column)?;
+    let _ = maybe_cleanup(cleanup);
+
+    Ok(CdcLoadReport {
+        rows_appended,
+        changes_table: loader.fqtn(&format!("{table}__changes")),
+        view: loader.fqtn(table),
+    })
+}
+
 /// Split a `gs://bucket/path` URI into `(bucket, bucket-relative path)` — the
 /// shape opendal's bucket-scoped operator wants.
 pub(crate) fn split_gs_uri(uri: &str) -> Result<(&str, &str)> {
@@ -314,6 +374,10 @@ mod tests {
             Ok(self.rows)
         }
         fn create_dedup_view(&self, table: &str, _: &[String], _: cdc::SourceEngine) -> Result<()> {
+            self.views.borrow_mut().push(table.into());
+            Ok(())
+        }
+        fn create_inc_dedup_view(&self, table: &str, _: &[String], _: &str) -> Result<()> {
             self.views.borrow_mut().push(table.into());
             Ok(())
         }

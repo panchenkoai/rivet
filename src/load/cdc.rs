@@ -216,6 +216,41 @@ pub fn dedup_view_sql(
     )
 }
 
+/// Build the current-state dedup view for an **incremental** load's change log.
+/// Unlike CDC ([`dedup_view_sql`]), an incremental delta has no `__op`/`__pos`/
+/// `__seq` (the change log reuses the CDC append so those columns exist but are
+/// NULL): current state is simply the row with the greatest `cursor_column` per
+/// PK. Incremental can't observe deletes, so [`DELETE_FLAG_COLUMN`] is a constant
+/// `FALSE` — the view SHAPE matches CDC so downstream reads `WHERE NOT
+/// __is_deleted` uniformly across both modes.
+pub fn inc_dedup_view_sql(
+    warehouse: Warehouse,
+    view_fqtn: &str,
+    changes_fqtn: &str,
+    pk: &[&str],
+    cursor_column: &str,
+) -> String {
+    let partition = pk.join(", ");
+    format!(
+        "CREATE OR REPLACE VIEW {view} AS\n\
+         SELECT * {except} (__op, __pos, __seq, __rn),\n\
+         \x20      FALSE AS {flag}\n\
+         FROM (\n\
+         \x20 SELECT *, ROW_NUMBER() OVER (\n\
+         \x20   PARTITION BY {partition}\n\
+         \x20   ORDER BY {cursor} DESC\n\
+         \x20 ) AS __rn\n\
+         \x20 FROM {changes}\n\
+         )\n\
+         WHERE __rn = 1;",
+        view = warehouse.quote_fqtn(view_fqtn),
+        changes = warehouse.quote_fqtn(changes_fqtn),
+        except = warehouse.except_keyword(),
+        cursor = cursor_column,
+        flag = DELETE_FLAG_COLUMN,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,6 +429,59 @@ mod tests {
         assert!(!sf.contains('`'), "snowflake view must not back-tick: {sf}");
         assert!(sf.contains("VIEW db.sc.orders AS"));
         assert!(sf.contains("FROM db.sc.orders__changes"));
+    }
+
+    #[test]
+    fn inc_dedup_view_orders_by_cursor_and_never_tombstones_on_every_dialect() {
+        for wh in WAREHOUSES {
+            let sql = inc_dedup_view_sql(
+                wh,
+                "p.d.orders",
+                "p.d.orders__changes",
+                &["id"],
+                "updated_at",
+            );
+            assert!(sql.contains("PARTITION BY id"), "{wh:?}: {sql}");
+            // Latest-per-PK is the greatest cursor value.
+            assert!(sql.contains("ORDER BY updated_at DESC"), "{wh:?}: {sql}");
+            // Incremental can't observe deletes → the flag is a constant FALSE,
+            // with none of CDC's `__op = 'delete'` logic.
+            assert!(sql.contains("FALSE AS __is_deleted"), "{wh:?}: {sql}");
+            assert!(
+                !sql.contains("'delete'"),
+                "{wh:?}: no CDC delete logic: {sql}"
+            );
+            let kw = match wh {
+                Warehouse::BigQuery => "EXCEPT",
+                Warehouse::Snowflake => "EXCLUDE",
+            };
+            assert!(
+                sql.contains(&format!("{kw} (__op, __pos, __seq, __rn)")),
+                "{wh:?}: drops the (reused) CDC meta columns: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn inc_dedup_view_quotes_identifiers_per_dialect() {
+        let bq = inc_dedup_view_sql(
+            Warehouse::BigQuery,
+            "p.d.o",
+            "p.d.o__changes",
+            &["id"],
+            "ts",
+        );
+        assert!(bq.contains("VIEW `p.d.o` AS"));
+        assert!(bq.contains("FROM `p.d.o__changes`"));
+        let sf = inc_dedup_view_sql(
+            Warehouse::Snowflake,
+            "db.sc.o",
+            "db.sc.o__changes",
+            &["id"],
+            "ts",
+        );
+        assert!(!sf.contains('`'), "snowflake bare identifiers: {sf}");
+        assert!(sf.contains("VIEW db.sc.o AS"));
     }
 
     #[test]

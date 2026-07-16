@@ -291,6 +291,26 @@ impl TargetLoader for SnowflakeLoader {
         self.run_snow(&sql)?;
         Ok(())
     }
+
+    fn create_inc_dedup_view(&self, table: &str, pk: &[String], cursor_column: &str) -> Result<()> {
+        use crate::load::cdc::Warehouse;
+        let changes_fqtn = self.fqtn(&format!("{table}__changes"));
+        let view_fqtn = self.fqtn(table);
+        let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
+        let view_sql = crate::load::cdc::inc_dedup_view_sql(
+            Warehouse::Snowflake,
+            &view_fqtn,
+            &changes_fqtn,
+            &pk_refs,
+            cursor_column,
+        );
+        let sql = format!(
+            "ALTER SESSION SET QUERY_TAG = '{tag}';\n{view_sql}",
+            tag = self.query_tag(table),
+        );
+        self.run_snow(&sql)?;
+        Ok(())
+    }
 }
 
 /// Whether a column name is one of rivet's CDC meta columns.

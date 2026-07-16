@@ -89,9 +89,6 @@ pub struct LoadPlan {
     pub mode: LoadMode,
     /// The incremental cursor column (from `cursor_column:`) — the dedup view's
     /// latest-per-PK ordering key. `Some` only for [`LoadMode::Incremental`].
-    // Read by the incremental load path (next commit); populated here so the
-    // plan is complete.
-    #[allow(dead_code)]
     pub cursor_column: Option<String>,
 }
 
