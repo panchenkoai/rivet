@@ -1,2 +1,0 @@
-src/load/plan.rs:332:21: delete match arm "fail" in build_plans
-src/load/plan.rs:333:21: delete match arm "warn" in build_plans

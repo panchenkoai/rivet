@@ -103,3 +103,6 @@ pilot_bench.yaml
 /tests/.live-tmp/
 .claude/
 mutants.out/
+
+# cargo-mutants output
+/mutants.out*
