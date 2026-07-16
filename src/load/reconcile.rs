@@ -159,14 +159,17 @@ pub fn select_load_keys(new: &[(String, RunManifest)], all_parquet: &[String]) -
 /// `run_id` is already in `loaded`, in which case the target is current and this
 /// returns empty (a skip). Returns a 0-or-1 element `Vec` so [`prepare_load`]
 /// treats it uniformly with the append modes' "all new runs".
-pub fn latest_unloaded_full(
-    keyed: Vec<(String, RunManifest)>,
-    loaded: &std::collections::HashSet<String>,
-) -> Vec<(String, RunManifest)> {
+/// Full loads OVERWRITE, so exactly ONE snapshot may be loaded — the LATEST by
+/// `finished_at` (loading every accumulated run would duplicate rows). It is
+/// deliberately **not** ledger-gated: full re-materializes the latest snapshot
+/// on *every* load, so a re-load self-heals a drifted target and full stays
+/// resilient to hidden in-place source updates — its whole guarantee. An empty
+/// input (no staged run — e.g. the staging was cleaned with no fresh extract)
+/// yields an empty selection, so the caller no-ops WITHOUT truncating the target.
+pub fn latest_full(keyed: Vec<(String, RunManifest)>) -> Vec<(String, RunManifest)> {
     keyed
         .into_iter()
         .max_by(|a, b| a.1.finished_at.cmp(&b.1.finished_at))
-        .filter(|(_, m)| !loaded.contains(&m.run_id))
         .into_iter()
         .collect()
 }
@@ -513,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_unloaded_full_picks_the_newest_snapshot_not_all() {
+    fn latest_full_picks_the_newest_snapshot_not_all() {
         // Full loads OVERWRITE, so only the LATEST snapshot may be loaded —
         // selecting all accumulated runs would load duplicate snapshots.
         let keyed = vec![
@@ -521,37 +524,32 @@ mod tests {
             keyed_at("r3", "2026-01-03T00:00:00Z"),
             keyed_at("r2", "2026-01-02T00:00:00Z"),
         ];
-        let sel = latest_unloaded_full(keyed, &std::collections::HashSet::new());
+        let sel = latest_full(keyed);
         assert_eq!(sel.len(), 1, "exactly one snapshot, never all");
         assert_eq!(sel[0].1.run_id, "r3", "the newest by finished_at");
     }
 
     #[test]
-    fn latest_unloaded_full_skips_when_the_latest_is_already_loaded() {
-        // The newest run is in the ledger → the target is current → skip (empty),
-        // so a re-load without a fresh extract does not re-OVERWRITE.
+    fn latest_full_re_materializes_even_when_the_latest_is_already_loaded() {
+        // Full is NOT ledger-skipped: a re-load re-OVERWRITEs from the latest
+        // snapshot, self-healing a drifted target and staying resilient to hidden
+        // in-place updates. The ledger must NOT suppress the re-materialization —
+        // full has to stay full (the old `latest_unloaded_full` skip was the bug).
         let keyed = vec![
             keyed_at("r1", "2026-01-01T00:00:00Z"),
             keyed_at("r2", "2026-01-02T00:00:00Z"),
         ];
-        let loaded = std::collections::HashSet::from(["r2".to_string()]);
-        assert!(
-            latest_unloaded_full(keyed, &loaded).is_empty(),
-            "latest already loaded ⇒ skip, not re-overwrite"
-        );
+        // r2 is "already loaded" in the caller's ledger, yet full still selects it.
+        let sel = latest_full(keyed);
+        assert_eq!(sel.len(), 1);
+        assert_eq!(sel[0].1.run_id, "r2", "always the latest, loaded or not");
     }
 
     #[test]
-    fn latest_unloaded_full_loads_a_newer_run_over_an_older_loaded_one() {
-        // A fresh full extract (r2) after r1 was loaded → load r2 (overwrite).
-        let keyed = vec![
-            keyed_at("r1", "2026-01-01T00:00:00Z"),
-            keyed_at("r2", "2026-01-02T00:00:00Z"),
-        ];
-        let loaded = std::collections::HashSet::from(["r1".to_string()]);
-        let sel = latest_unloaded_full(keyed, &loaded);
-        assert_eq!(sel.len(), 1);
-        assert_eq!(sel[0].1.run_id, "r2");
+    fn latest_full_of_no_staged_runs_is_empty_so_the_caller_no_ops_without_truncating() {
+        // Empty staging (e.g. cleaned, no fresh extract) → empty selection → the
+        // caller returns None and never truncates the target to empty.
+        assert!(latest_full(Vec::new()).is_empty());
     }
 
     #[test]

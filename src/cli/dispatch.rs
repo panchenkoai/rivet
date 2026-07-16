@@ -863,9 +863,11 @@ fn prepare_load(
             let keyed = load::reconcile::fetch_manifests_keyed(store, &plan.gcs_prefix)?;
             let loaded = s.loaded_source_run_ids(target_fqtn).unwrap_or_default();
             let new: Vec<_> = match plan.mode {
-                // Full/chunked is a complete snapshot — OVERWRITE with the LATEST
-                // run only, unless it's the one already loaded (→ skip).
-                load::plan::LoadMode::Full => load::reconcile::latest_unloaded_full(keyed, &loaded),
+                // Full is a complete snapshot — OVERWRITE with the LATEST run,
+                // ALWAYS (never ledger-skipped): a re-load re-materializes the
+                // snapshot, self-healing a drifted target and staying resilient to
+                // hidden in-place updates. Only an empty staging → a no-op below.
+                load::plan::LoadMode::Full => load::reconcile::latest_full(keyed),
                 // Incremental/CDC accumulate — APPEND every run not yet loaded.
                 _ => keyed
                     .into_iter()
