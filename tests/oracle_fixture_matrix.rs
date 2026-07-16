@@ -233,6 +233,25 @@ fn mongo_cdc_delete_flag_bigquery() {
     assert_all_pass(v.run_mongo_cdc_delete().expect("mongo cdc delete"));
 }
 
+// ── Mongo full/batch: the JSON-blob (_id, document) model into each warehouse ──
+// Mongo's ONLY non-CDC mode is `mode: full` (incremental is a SQL-cursor concept
+// Mongo has no analogue for), so there is no Mongo incremental cell by design.
+// Uses the standalone `rivet-mongo-1` (no replica set needed for a full scan).
+#[test]
+#[ignore = "live: needs the mongo devbox (rivet-mongo-1) + BigQuery"]
+fn smoke_batch_mongo_bigquery() {
+    let v = Verification::new(Engine::Mongo, Mode::Batch, Fixture::smoke("mongo_full"));
+    assert_all_pass(v.run_mongo_batch().expect("mongo batch"));
+}
+
+#[test]
+#[ignore = "live: needs the mongo devbox (rivet-mongo-1) + Snowflake"]
+fn smoke_batch_mongo_snowflake() {
+    let v = Verification::new(Engine::Mongo, Mode::Batch, Fixture::smoke("mongo_full"))
+        .warehouse(Warehouse::Snowflake);
+    assert_all_pass(v.run_mongo_batch().expect("mongo batch"));
+}
+
 // ── CDC backfill: initial:snapshot covers a preexisting table; the view keeps ─
 // every backfilled row live (the snapshot/stream seam — NULL __op/__pos rows).
 #[test]

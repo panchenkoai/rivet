@@ -561,6 +561,69 @@ impl Verification {
         ])
     }
 
+    /// A focused Mongo BATCH cell: seed N docs via `mongosh`, full-scan extract
+    /// (`mode: full` — Mongo's ONLY non-CDC mode; incremental is a SQL-cursor
+    /// concept Mongo has no analogue for), load (OVERWRITE), and assert row count
+    /// / distinct `_id` / the staging wipe. Mongo has no SQL client, so it drives
+    /// `mongosh` directly (the generic `run()` seed is SQL-only) and reads back
+    /// via the warehouse with a bespoke oracle set (`evaluate()` assumes a SQL
+    /// source + an `id` column — neither holds for Mongo's `_id`/JSON-blob model).
+    pub fn run_mongo_batch(&self) -> Result<Vec<(String, OracleOutcome)>> {
+        if self.engine != Engine::Mongo || self.mode != Mode::Batch {
+            bail!("run_mongo_batch is Mongo+Batch only");
+        }
+        let env = HarnessEnv::load()?;
+        let work = TempWork::new("rivet-mongo-batch")?;
+        let coll = self.fixture.table.clone();
+        let n = self.fixture.rows;
+        let db = "rivet_bench";
+
+        // Fresh collection with N docs (PK `_id` 1..=N).
+        self.mongosh(
+            db,
+            &format!(
+                "db.{coll}.drop(); let d = []; \
+                 for (let i = 1; i <= {n}; i++) d.push({{_id: i, v: 'doc-' + i}}); \
+                 db.{coll}.insertMany(d);"
+            ),
+        )?;
+
+        let prefix = format!("matrix/mongo/{coll}/");
+        let full_prefix = format!("gs://{}/{}", env.gcs_bucket, prefix);
+        let _ = Command::new("gcloud")
+            .args(["storage", "rm", "-r", &format!("{full_prefix}**")])
+            .status();
+
+        // ONE config drives extract + load; the Mongo batch source_ref is a
+        // `table:` (collection), not a SQL query (see extraction_yaml).
+        let cfg = work.write("extract.yaml", &self.extraction_yaml(&env, &prefix)?);
+        run(
+            Command::new("rivet").args(["run", "-c"]).arg(&cfg),
+            "rivet run (mongo batch extract)",
+        )?;
+        run(
+            Command::new("rivet").args(["load", "-c"]).arg(&cfg),
+            "rivet load (mongo batch)",
+        )?;
+
+        // For a Mongo batch the export's `table:` (the collection) IS the load
+        // target table — plan_loads names it from the `table:` field, which wins
+        // over the export name — so read back `coll`, NOT the engine-prefixed
+        // `loaded_table_name()` the SQL batch path (which has no `table:`) uses.
+        let table = self.warehouse_table_ref(&env, &coll)?;
+        let t = self.wh_table(&table);
+        let rows = self.wh_scalar(&format!("SELECT COUNT(*) FROM {t}"))?;
+        let distinct = self.wh_scalar(&format!("SELECT COUNT(DISTINCT _id) FROM {t}"))?;
+        let n = n as i64;
+        Ok(vec![
+            // The full scan lands every seeded doc, exactly once.
+            ("RowCount".into(), compare("row-count", rows, n)),
+            ("DistinctId".into(), compare("distinct-_id", distinct, n)),
+            // cleanup_source wiped the staging prefix after the verified load.
+            ("StagingWiped".into(), self.staging_wiped(&full_prefix)?),
+        ])
+    }
+
     /// A focused CDC **backfill** cell: turn CDC on for a PRE-EXISTING table via
     /// `cdc.initial: snapshot`, apply live changes, load, and assert the
     /// current-state view keeps the whole backfill.
@@ -1421,10 +1484,13 @@ impl Verification {
         // engine so `mysql`/`pg` runs don't collide, and so the oracle (which
         // queries `{engine}_{table}`) reads exactly what `load` created.
         let name = format!("{}_{}", lane.source_type, self.fixture.table);
-        // CDC captures a TABLE (via binlog/slot); batch runs a query.
-        let source_ref = match self.mode {
-            Mode::Batch => format!("query: \"SELECT * FROM {}\"", self.fixture.table),
-            Mode::Cdc => format!("table: {}", self.fixture.table),
+        // CDC captures a TABLE (via binlog/slot); a SQL batch runs a query; Mongo
+        // has no SQL, so a Mongo batch names the collection via `table:` too
+        // (`mode: full` is Mongo's only non-CDC mode).
+        let source_ref = match (self.mode, self.engine) {
+            (Mode::Batch, Engine::Mongo) => format!("table: {}", self.fixture.table),
+            (Mode::Batch, _) => format!("query: \"SELECT * FROM {}\"", self.fixture.table),
+            (Mode::Cdc, _) => format!("table: {}", self.fixture.table),
         };
         // ONE config: source + exports + destination + a top-level `load:` block.
         // `rivet run` ignores `load:` (extract); `rivet load` reads it (load).
