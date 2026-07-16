@@ -1,0 +1,322 @@
+[
+  {
+    "diff": "--- src/load/plan.rs\n+++ replace build_plans -> Result<Vec<LoadPlan>> with Ok(vec![])\n@@ -291,102 +291,17 @@\n /// match, `target_status`→[`TargetStatus`] mapping, [`ExportMode`]→[`LoadMode`]\n /// mapping, the `gs://` prefix, the per-export `load:` override, and the\n /// duplicate-target guard.\n fn build_plans(\n     cfg: &crate::config::Config,\n     load: &LoadSection,\n     reports: Vec<ExportReport>,\n ) -> Result<Vec<LoadPlan>> {\n-    let mut plans = Vec::with_capacity(reports.len());\n-    for report in reports {\n-        let export = cfg\n-            .exports\n-            .iter()\n-            .find(|e| e.name == report.export)\n-            .with_context(|| {\n-                format!(\n-                    \"rivet check reported export `{}` not found in config\",\n-                    report.export\n-                )\n-            })?;\n-        let table = export.table.clone().unwrap_or_else(|| export.name.clone());\n-\n-        let dest = &export.destination;\n-        let bucket = dest.bucket.as_deref().with_context(|| {\n-            format!(\n-                \"export `{}` has no destination `bucket` — a GCS destination is required\",\n-                export.name\n-            )\n-        })?;\n-        let prefix = dest.prefix.as_deref().unwrap_or(\"\");\n-        let base = prefix.split(\"{partition}\").next().unwrap_or(prefix);\n-        let gcs_prefix = format!(\"gs://{bucket}/{base}\");\n-\n-        let specs = report\n-            .columns\n-            .into_iter()\n-            .map(|c| TargetColumnSpec {\n-                column_name: c.column,\n-                target_type: c.target_type,\n-                autoload_type: String::new(),\n-                status: match c.target_status.as_str() {\n-                    \"fail\" => TargetStatus::Fail,\n-                    \"warn\" => TargetStatus::Warn,\n-                    _ => TargetStatus::Ok,\n-                },\n-                note: None,\n-                cast_sql: None,\n-            })\n-            .collect();\n-\n-        // Complete-snapshot modes → overwrite the latest run; delta modes → their\n-        // own append path. Exhaustive (no `_`) on purpose: a future delta-style\n-        // ExportMode then fails to COMPILE here until someone picks its load\n-        // semantics, instead of silently defaulting to OVERWRITE (the\n-        // incremental-overwrite data-loss class).\n-        let mode = match export.mode {\n-            crate::config::ExportMode::Cdc => LoadMode::Cdc,\n-            crate::config::ExportMode::Incremental => LoadMode::Incremental,\n-            crate::config::ExportMode::Full => LoadMode::Full, // whole result set\n-            crate::config::ExportMode::Chunked => LoadMode::Full, // parallel full snapshot\n-            crate::config::ExportMode::TimeWindow => LoadMode::Full, // whole rolling window\n-        };\n-        // Effective load config: the shared top-level `load:`, with this export's\n-        // own `load:` block overriding the table-specific fields (pk, cleanup, …).\n-        // The warehouse `target` is shared and cannot be re-targeted per export.\n-        let eff_load = match &export.load {\n-            Some(v) => {\n-                let o: LoadOverride = serde_json::from_value(v.clone()).with_context(|| {\n-                    format!(\"parsing export `{}` `load:` override\", export.name)\n-                })?;\n-                if o.target.is_some() {\n-                    bail!(\n-                        \"export `{}`: a per-export `load:` cannot override `target:` — the \\\n-                         warehouse is shared; set `target:` in the top-level `load:` block only\",\n-                        export.name\n-                    );\n-                }\n-                load.with_override(&o)\n-            }\n-            None => load.clone(),\n-        };\n-        plans.push(LoadPlan {\n-            table,\n-            partition_by: export.partition_by.clone(),\n-            specs,\n-            gcs_prefix,\n-            destination: export.destination.clone(),\n-            load: eff_load,\n-            mode,\n-            cursor_column: export.cursor_column.clone(),\n-        });\n-    }\n-    reject_duplicate_target_tables(&plans.iter().map(|p| p.table.as_str()).collect::<Vec<_>>())?;\n-    Ok(plans)\n+    Ok(vec![]) /* ~ changed by cargo-mutants ~ */\n }\n \n /// Reject two exports that resolve to the SAME warehouse table. The `target:` is\n /// shared, so two exports whose `table:` (or `name:`) resolves alike land on one\n /// warehouse object — a full OVERWRITE would clobber what a cdc/incremental\n /// export appends a `<table>__changes` view over, and they'd share one ledger\n /// skip-set. Pure + unit-testable; caught here, not silently at load time.\n fn reject_duplicate_target_tables(tables: &[&str]) -> Result<()> {\n",
+    "file": "src/load/plan.rs",
+    "function": {
+      "function_name": "build_plans",
+      "return_type": "-> Result<Vec<LoadPlan>>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 385
+        },
+        "start": {
+          "column": 1,
+          "line": 285
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/load/plan.rs:299:5: replace build_plans -> Result<Vec<LoadPlan>> with Ok(vec![])",
+    "package": "rivet-cli",
+    "replacement": "Ok(vec![])",
+    "span": {
+      "end": {
+        "column": 14,
+        "line": 384
+      },
+      "start": {
+        "column": 5,
+        "line": 299
+      }
+    }
+  },
+  {
+    "diff": "--- src/load/plan.rs\n+++ replace build_plans -> Result<Vec<LoadPlan>> with Ok(vec![Default::default()])\n@@ -291,102 +291,17 @@\n /// match, `target_status`→[`TargetStatus`] mapping, [`ExportMode`]→[`LoadMode`]\n /// mapping, the `gs://` prefix, the per-export `load:` override, and the\n /// duplicate-target guard.\n fn build_plans(\n     cfg: &crate::config::Config,\n     load: &LoadSection,\n     reports: Vec<ExportReport>,\n ) -> Result<Vec<LoadPlan>> {\n-    let mut plans = Vec::with_capacity(reports.len());\n-    for report in reports {\n-        let export = cfg\n-            .exports\n-            .iter()\n-            .find(|e| e.name == report.export)\n-            .with_context(|| {\n-                format!(\n-                    \"rivet check reported export `{}` not found in config\",\n-                    report.export\n-                )\n-            })?;\n-        let table = export.table.clone().unwrap_or_else(|| export.name.clone());\n-\n-        let dest = &export.destination;\n-        let bucket = dest.bucket.as_deref().with_context(|| {\n-            format!(\n-                \"export `{}` has no destination `bucket` — a GCS destination is required\",\n-                export.name\n-            )\n-        })?;\n-        let prefix = dest.prefix.as_deref().unwrap_or(\"\");\n-        let base = prefix.split(\"{partition}\").next().unwrap_or(prefix);\n-        let gcs_prefix = format!(\"gs://{bucket}/{base}\");\n-\n-        let specs = report\n-            .columns\n-            .into_iter()\n-            .map(|c| TargetColumnSpec {\n-                column_name: c.column,\n-                target_type: c.target_type,\n-                autoload_type: String::new(),\n-                status: match c.target_status.as_str() {\n-                    \"fail\" => TargetStatus::Fail,\n-                    \"warn\" => TargetStatus::Warn,\n-                    _ => TargetStatus::Ok,\n-                },\n-                note: None,\n-                cast_sql: None,\n-            })\n-            .collect();\n-\n-        // Complete-snapshot modes → overwrite the latest run; delta modes → their\n-        // own append path. Exhaustive (no `_`) on purpose: a future delta-style\n-        // ExportMode then fails to COMPILE here until someone picks its load\n-        // semantics, instead of silently defaulting to OVERWRITE (the\n-        // incremental-overwrite data-loss class).\n-        let mode = match export.mode {\n-            crate::config::ExportMode::Cdc => LoadMode::Cdc,\n-            crate::config::ExportMode::Incremental => LoadMode::Incremental,\n-            crate::config::ExportMode::Full => LoadMode::Full, // whole result set\n-            crate::config::ExportMode::Chunked => LoadMode::Full, // parallel full snapshot\n-            crate::config::ExportMode::TimeWindow => LoadMode::Full, // whole rolling window\n-        };\n-        // Effective load config: the shared top-level `load:`, with this export's\n-        // own `load:` block overriding the table-specific fields (pk, cleanup, …).\n-        // The warehouse `target` is shared and cannot be re-targeted per export.\n-        let eff_load = match &export.load {\n-            Some(v) => {\n-                let o: LoadOverride = serde_json::from_value(v.clone()).with_context(|| {\n-                    format!(\"parsing export `{}` `load:` override\", export.name)\n-                })?;\n-                if o.target.is_some() {\n-                    bail!(\n-                        \"export `{}`: a per-export `load:` cannot override `target:` — the \\\n-                         warehouse is shared; set `target:` in the top-level `load:` block only\",\n-                        export.name\n-                    );\n-                }\n-                load.with_override(&o)\n-            }\n-            None => load.clone(),\n-        };\n-        plans.push(LoadPlan {\n-            table,\n-            partition_by: export.partition_by.clone(),\n-            specs,\n-            gcs_prefix,\n-            destination: export.destination.clone(),\n-            load: eff_load,\n-            mode,\n-            cursor_column: export.cursor_column.clone(),\n-        });\n-    }\n-    reject_duplicate_target_tables(&plans.iter().map(|p| p.table.as_str()).collect::<Vec<_>>())?;\n-    Ok(plans)\n+    Ok(vec![Default::default()]) /* ~ changed by cargo-mutants ~ */\n }\n \n /// Reject two exports that resolve to the SAME warehouse table. The `target:` is\n /// shared, so two exports whose `table:` (or `name:`) resolves alike land on one\n /// warehouse object — a full OVERWRITE would clobber what a cdc/incremental\n /// export appends a `<table>__changes` view over, and they'd share one ledger\n /// skip-set. Pure + unit-testable; caught here, not silently at load time.\n fn reject_duplicate_target_tables(tables: &[&str]) -> Result<()> {\n",
+    "file": "src/load/plan.rs",
+    "function": {
+      "function_name": "build_plans",
+      "return_type": "-> Result<Vec<LoadPlan>>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 385
+        },
+        "start": {
+          "column": 1,
+          "line": 285
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/load/plan.rs:299:5: replace build_plans -> Result<Vec<LoadPlan>> with Ok(vec![Default::default()])",
+    "package": "rivet-cli",
+    "replacement": "Ok(vec![Default::default()])",
+    "span": {
+      "end": {
+        "column": 14,
+        "line": 384
+      },
+      "start": {
+        "column": 5,
+        "line": 299
+      }
+    }
+  },
+  {
+    "diff": "--- src/load/plan.rs\n+++ replace == with != in build_plans\n@@ -296,17 +296,17 @@\n     load: &LoadSection,\n     reports: Vec<ExportReport>,\n ) -> Result<Vec<LoadPlan>> {\n     let mut plans = Vec::with_capacity(reports.len());\n     for report in reports {\n         let export = cfg\n             .exports\n             .iter()\n-            .find(|e| e.name == report.export)\n+            .find(|e| e.name != /* ~ changed by cargo-mutants ~ */ report.export)\n             .with_context(|| {\n                 format!(\n                     \"rivet check reported export `{}` not found in config\",\n                     report.export\n                 )\n             })?;\n         let table = export.table.clone().unwrap_or_else(|| export.name.clone());\n \n",
+    "file": "src/load/plan.rs",
+    "function": {
+      "function_name": "build_plans",
+      "return_type": "-> Result<Vec<LoadPlan>>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 385
+        },
+        "start": {
+          "column": 1,
+          "line": 285
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "src/load/plan.rs:304:30: replace == with != in build_plans",
+    "package": "rivet-cli",
+    "replacement": "!=",
+    "span": {
+      "end": {
+        "column": 32,
+        "line": 304
+      },
+      "start": {
+        "column": 30,
+        "line": 304
+      }
+    }
+  },
+  {
+    "diff": "--- src/load/plan.rs\n+++ delete match arm \"fail\" in build_plans\n@@ -324,17 +324,17 @@\n         let specs = report\n             .columns\n             .into_iter()\n             .map(|c| TargetColumnSpec {\n                 column_name: c.column,\n                 target_type: c.target_type,\n                 autoload_type: String::new(),\n                 status: match c.target_status.as_str() {\n-                    \"fail\" => TargetStatus::Fail,\n+                     /* ~ changed by cargo-mutants ~ */\n                     \"warn\" => TargetStatus::Warn,\n                     _ => TargetStatus::Ok,\n                 },\n                 note: None,\n                 cast_sql: None,\n             })\n             .collect();\n \n",
+    "file": "src/load/plan.rs",
+    "function": {
+      "function_name": "build_plans",
+      "return_type": "-> Result<Vec<LoadPlan>>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 385
+        },
+        "start": {
+          "column": 1,
+          "line": 285
+        }
+      }
+    },
+    "genre": "MatchArm",
+    "name": "src/load/plan.rs:332:21: delete match arm \"fail\" in build_plans",
+    "package": "rivet-cli",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 50,
+        "line": 332
+      },
+      "start": {
+        "column": 21,
+        "line": 332
+      }
+    }
+  },
+  {
+    "diff": "--- src/load/plan.rs\n+++ delete match arm \"warn\" in build_plans\n@@ -325,17 +325,17 @@\n             .columns\n             .into_iter()\n             .map(|c| TargetColumnSpec {\n                 column_name: c.column,\n                 target_type: c.target_type,\n                 autoload_type: String::new(),\n                 status: match c.target_status.as_str() {\n                     \"fail\" => TargetStatus::Fail,\n-                    \"warn\" => TargetStatus::Warn,\n+                     /* ~ changed by cargo-mutants ~ */\n                     _ => TargetStatus::Ok,\n                 },\n                 note: None,\n                 cast_sql: None,\n             })\n             .collect();\n \n         // Complete-snapshot modes → overwrite the latest run; delta modes → their\n",
+    "file": "src/load/plan.rs",
+    "function": {
+      "function_name": "build_plans",
+      "return_type": "-> Result<Vec<LoadPlan>>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 385
+        },
+        "start": {
+          "column": 1,
+          "line": 285
+        }
+      }
+    },
+    "genre": "MatchArm",
+    "name": "src/load/plan.rs:333:21: delete match arm \"warn\" in build_plans",
+    "package": "rivet-cli",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 50,
+        "line": 333
+      },
+      "start": {
+        "column": 21,
+        "line": 333
+      }
+    }
+  },
+  {
+    "diff": "--- src/load/plan.rs\n+++ replace build_plans -> Result<Vec<LoadPlan>> with Ok(vec![])\n@@ -291,102 +291,17 @@\n /// match, `target_status`→[`TargetStatus`] mapping, [`ExportMode`]→[`LoadMode`]\n /// mapping, the `gs://` prefix, the per-export `load:` override, and the\n /// duplicate-target guard.\n fn build_plans(\n     cfg: &crate::config::Config,\n     load: &LoadSection,\n     reports: Vec<ExportReport>,\n ) -> Result<Vec<LoadPlan>> {\n-    let mut plans = Vec::with_capacity(reports.len());\n-    for report in reports {\n-        let export = cfg\n-            .exports\n-            .iter()\n-            .find(|e| e.name == report.export)\n-            .with_context(|| {\n-                format!(\n-                    \"rivet check reported export `{}` not found in config\",\n-                    report.export\n-                )\n-            })?;\n-        let table = export.table.clone().unwrap_or_else(|| export.name.clone());\n-\n-        let dest = &export.destination;\n-        let bucket = dest.bucket.as_deref().with_context(|| {\n-            format!(\n-                \"export `{}` has no destination `bucket` — a GCS destination is required\",\n-                export.name\n-            )\n-        })?;\n-        let prefix = dest.prefix.as_deref().unwrap_or(\"\");\n-        let base = prefix.split(\"{partition}\").next().unwrap_or(prefix);\n-        let gcs_prefix = format!(\"gs://{bucket}/{base}\");\n-\n-        let specs = report\n-            .columns\n-            .into_iter()\n-            .map(|c| TargetColumnSpec {\n-                column_name: c.column,\n-                target_type: c.target_type,\n-                autoload_type: String::new(),\n-                status: match c.target_status.as_str() {\n-                    \"fail\" => TargetStatus::Fail,\n-                    \"warn\" => TargetStatus::Warn,\n-                    _ => TargetStatus::Ok,\n-                },\n-                note: None,\n-                cast_sql: None,\n-            })\n-            .collect();\n-\n-        // Complete-snapshot modes → overwrite the latest run; delta modes → their\n-        // own append path. Exhaustive (no `_`) on purpose: a future delta-style\n-        // ExportMode then fails to COMPILE here until someone picks its load\n-        // semantics, instead of silently defaulting to OVERWRITE (the\n-        // incremental-overwrite data-loss class).\n-        let mode = match export.mode {\n-            crate::config::ExportMode::Cdc => LoadMode::Cdc,\n-            crate::config::ExportMode::Incremental => LoadMode::Incremental,\n-            crate::config::ExportMode::Full => LoadMode::Full, // whole result set\n-            crate::config::ExportMode::Chunked => LoadMode::Full, // parallel full snapshot\n-            crate::config::ExportMode::TimeWindow => LoadMode::Full, // whole rolling window\n-        };\n-        // Effective load config: the shared top-level `load:`, with this export's\n-        // own `load:` block overriding the table-specific fields (pk, cleanup, …).\n-        // The warehouse `target` is shared and cannot be re-targeted per export.\n-        let eff_load = match &export.load {\n-            Some(v) => {\n-                let o: LoadOverride = serde_json::from_value(v.clone()).with_context(|| {\n-                    format!(\"parsing export `{}` `load:` override\", export.name)\n-                })?;\n-                if o.target.is_some() {\n-                    bail!(\n-                        \"export `{}`: a per-export `load:` cannot override `target:` — the \\\n-                         warehouse is shared; set `target:` in the top-level `load:` block only\",\n-                        export.name\n-                    );\n-                }\n-                load.with_override(&o)\n-            }\n-            None => load.clone(),\n-        };\n-        plans.push(LoadPlan {\n-            table,\n-            partition_by: export.partition_by.clone(),\n-            specs,\n-            gcs_prefix,\n-            destination: export.destination.clone(),\n-            load: eff_load,\n-            mode,\n-            cursor_column: export.cursor_column.clone(),\n-        });\n-    }\n-    reject_duplicate_target_tables(&plans.iter().map(|p| p.table.as_str()).collect::<Vec<_>>())?;\n-    Ok(plans)\n+    Ok(vec![]) /* ~ changed by cargo-mutants ~ */\n }\n \n /// Reject two exports that resolve to the SAME warehouse table. The `target:` is\n /// shared, so two exports whose `table:` (or `name:`) resolves alike land on one\n /// warehouse object — a full OVERWRITE would clobber what a cdc/incremental\n /// export appends a `<table>__changes` view over, and they'd share one ledger\n /// skip-set. Pure + unit-testable; caught here, not silently at load time.\n fn reject_duplicate_target_tables(tables: &[&str]) -> Result<()> {\n",
+    "file": "src/load/plan.rs",
+    "function": {
+      "function_name": "build_plans",
+      "return_type": "-> Result<Vec<LoadPlan>>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 385
+        },
+        "start": {
+          "column": 1,
+          "line": 285
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/load/plan.rs:299:5: replace build_plans -> Result<Vec<LoadPlan>> with Ok(vec![])",
+    "package": "rivet-cli",
+    "replacement": "Ok(vec![])",
+    "span": {
+      "end": {
+        "column": 14,
+        "line": 384
+      },
+      "start": {
+        "column": 5,
+        "line": 299
+      }
+    }
+  },
+  {
+    "diff": "--- src/load/plan.rs\n+++ replace build_plans -> Result<Vec<LoadPlan>> with Ok(vec![Default::default()])\n@@ -291,102 +291,17 @@\n /// match, `target_status`→[`TargetStatus`] mapping, [`ExportMode`]→[`LoadMode`]\n /// mapping, the `gs://` prefix, the per-export `load:` override, and the\n /// duplicate-target guard.\n fn build_plans(\n     cfg: &crate::config::Config,\n     load: &LoadSection,\n     reports: Vec<ExportReport>,\n ) -> Result<Vec<LoadPlan>> {\n-    let mut plans = Vec::with_capacity(reports.len());\n-    for report in reports {\n-        let export = cfg\n-            .exports\n-            .iter()\n-            .find(|e| e.name == report.export)\n-            .with_context(|| {\n-                format!(\n-                    \"rivet check reported export `{}` not found in config\",\n-                    report.export\n-                )\n-            })?;\n-        let table = export.table.clone().unwrap_or_else(|| export.name.clone());\n-\n-        let dest = &export.destination;\n-        let bucket = dest.bucket.as_deref().with_context(|| {\n-            format!(\n-                \"export `{}` has no destination `bucket` — a GCS destination is required\",\n-                export.name\n-            )\n-        })?;\n-        let prefix = dest.prefix.as_deref().unwrap_or(\"\");\n-        let base = prefix.split(\"{partition}\").next().unwrap_or(prefix);\n-        let gcs_prefix = format!(\"gs://{bucket}/{base}\");\n-\n-        let specs = report\n-            .columns\n-            .into_iter()\n-            .map(|c| TargetColumnSpec {\n-                column_name: c.column,\n-                target_type: c.target_type,\n-                autoload_type: String::new(),\n-                status: match c.target_status.as_str() {\n-                    \"fail\" => TargetStatus::Fail,\n-                    \"warn\" => TargetStatus::Warn,\n-                    _ => TargetStatus::Ok,\n-                },\n-                note: None,\n-                cast_sql: None,\n-            })\n-            .collect();\n-\n-        // Complete-snapshot modes → overwrite the latest run; delta modes → their\n-        // own append path. Exhaustive (no `_`) on purpose: a future delta-style\n-        // ExportMode then fails to COMPILE here until someone picks its load\n-        // semantics, instead of silently defaulting to OVERWRITE (the\n-        // incremental-overwrite data-loss class).\n-        let mode = match export.mode {\n-            crate::config::ExportMode::Cdc => LoadMode::Cdc,\n-            crate::config::ExportMode::Incremental => LoadMode::Incremental,\n-            crate::config::ExportMode::Full => LoadMode::Full, // whole result set\n-            crate::config::ExportMode::Chunked => LoadMode::Full, // parallel full snapshot\n-            crate::config::ExportMode::TimeWindow => LoadMode::Full, // whole rolling window\n-        };\n-        // Effective load config: the shared top-level `load:`, with this export's\n-        // own `load:` block overriding the table-specific fields (pk, cleanup, …).\n-        // The warehouse `target` is shared and cannot be re-targeted per export.\n-        let eff_load = match &export.load {\n-            Some(v) => {\n-                let o: LoadOverride = serde_json::from_value(v.clone()).with_context(|| {\n-                    format!(\"parsing export `{}` `load:` override\", export.name)\n-                })?;\n-                if o.target.is_some() {\n-                    bail!(\n-                        \"export `{}`: a per-export `load:` cannot override `target:` — the \\\n-                         warehouse is shared; set `target:` in the top-level `load:` block only\",\n-                        export.name\n-                    );\n-                }\n-                load.with_override(&o)\n-            }\n-            None => load.clone(),\n-        };\n-        plans.push(LoadPlan {\n-            table,\n-            partition_by: export.partition_by.clone(),\n-            specs,\n-            gcs_prefix,\n-            destination: export.destination.clone(),\n-            load: eff_load,\n-            mode,\n-            cursor_column: export.cursor_column.clone(),\n-        });\n-    }\n-    reject_duplicate_target_tables(&plans.iter().map(|p| p.table.as_str()).collect::<Vec<_>>())?;\n-    Ok(plans)\n+    Ok(vec![Default::default()]) /* ~ changed by cargo-mutants ~ */\n }\n \n /// Reject two exports that resolve to the SAME warehouse table. The `target:` is\n /// shared, so two exports whose `table:` (or `name:`) resolves alike land on one\n /// warehouse object — a full OVERWRITE would clobber what a cdc/incremental\n /// export appends a `<table>__changes` view over, and they'd share one ledger\n /// skip-set. Pure + unit-testable; caught here, not silently at load time.\n fn reject_duplicate_target_tables(tables: &[&str]) -> Result<()> {\n",
+    "file": "src/load/plan.rs",
+    "function": {
+      "function_name": "build_plans",
+      "return_type": "-> Result<Vec<LoadPlan>>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 385
+        },
+        "start": {
+          "column": 1,
+          "line": 285
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/load/plan.rs:299:5: replace build_plans -> Result<Vec<LoadPlan>> with Ok(vec![Default::default()])",
+    "package": "rivet-cli",
+    "replacement": "Ok(vec![Default::default()])",
+    "span": {
+      "end": {
+        "column": 14,
+        "line": 384
+      },
+      "start": {
+        "column": 5,
+        "line": 299
+      }
+    }
+  },
+  {
+    "diff": "--- src/load/plan.rs\n+++ replace == with != in build_plans\n@@ -296,17 +296,17 @@\n     load: &LoadSection,\n     reports: Vec<ExportReport>,\n ) -> Result<Vec<LoadPlan>> {\n     let mut plans = Vec::with_capacity(reports.len());\n     for report in reports {\n         let export = cfg\n             .exports\n             .iter()\n-            .find(|e| e.name == report.export)\n+            .find(|e| e.name != /* ~ changed by cargo-mutants ~ */ report.export)\n             .with_context(|| {\n                 format!(\n                     \"rivet check reported export `{}` not found in config\",\n                     report.export\n                 )\n             })?;\n         let table = export.table.clone().unwrap_or_else(|| export.name.clone());\n \n",
+    "file": "src/load/plan.rs",
+    "function": {
+      "function_name": "build_plans",
+      "return_type": "-> Result<Vec<LoadPlan>>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 385
+        },
+        "start": {
+          "column": 1,
+          "line": 285
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "src/load/plan.rs:304:30: replace == with != in build_plans",
+    "package": "rivet-cli",
+    "replacement": "!=",
+    "span": {
+      "end": {
+        "column": 32,
+        "line": 304
+      },
+      "start": {
+        "column": 30,
+        "line": 304
+      }
+    }
+  },
+  {
+    "diff": "--- src/load/plan.rs\n+++ delete match arm \"fail\" in build_plans\n@@ -324,17 +324,17 @@\n         let specs = report\n             .columns\n             .into_iter()\n             .map(|c| TargetColumnSpec {\n                 column_name: c.column,\n                 target_type: c.target_type,\n                 autoload_type: String::new(),\n                 status: match c.target_status.as_str() {\n-                    \"fail\" => TargetStatus::Fail,\n+                     /* ~ changed by cargo-mutants ~ */\n                     \"warn\" => TargetStatus::Warn,\n                     _ => TargetStatus::Ok,\n                 },\n                 note: None,\n                 cast_sql: None,\n             })\n             .collect();\n \n",
+    "file": "src/load/plan.rs",
+    "function": {
+      "function_name": "build_plans",
+      "return_type": "-> Result<Vec<LoadPlan>>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 385
+        },
+        "start": {
+          "column": 1,
+          "line": 285
+        }
+      }
+    },
+    "genre": "MatchArm",
+    "name": "src/load/plan.rs:332:21: delete match arm \"fail\" in build_plans",
+    "package": "rivet-cli",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 50,
+        "line": 332
+      },
+      "start": {
+        "column": 21,
+        "line": 332
+      }
+    }
+  },
+  {
+    "diff": "--- src/load/plan.rs\n+++ delete match arm \"warn\" in build_plans\n@@ -325,17 +325,17 @@\n             .columns\n             .into_iter()\n             .map(|c| TargetColumnSpec {\n                 column_name: c.column,\n                 target_type: c.target_type,\n                 autoload_type: String::new(),\n                 status: match c.target_status.as_str() {\n                     \"fail\" => TargetStatus::Fail,\n-                    \"warn\" => TargetStatus::Warn,\n+                     /* ~ changed by cargo-mutants ~ */\n                     _ => TargetStatus::Ok,\n                 },\n                 note: None,\n                 cast_sql: None,\n             })\n             .collect();\n \n         // Complete-snapshot modes → overwrite the latest run; delta modes → their\n",
+    "file": "src/load/plan.rs",
+    "function": {
+      "function_name": "build_plans",
+      "return_type": "-> Result<Vec<LoadPlan>>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 385
+        },
+        "start": {
+          "column": 1,
+          "line": 285
+        }
+      }
+    },
+    "genre": "MatchArm",
+    "name": "src/load/plan.rs:333:21: delete match arm \"warn\" in build_plans",
+    "package": "rivet-cli",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 50,
+        "line": 333
+      },
+      "start": {
+        "column": 21,
+        "line": 333
+      }
+    }
+  }
+]

@@ -1,0 +1,447 @@
+{
+  "outcomes": [
+    {
+      "scenario": "Baseline",
+      "summary": "Success",
+      "log_path": "log/baseline.log",
+      "diff_path": null,
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 107.016279,
+          "process_status": "Success",
+          "argv": [
+            "/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=rivet-cli@0.19.2"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 5.182026667,
+          "process_status": "Success",
+          "argv": [
+            "/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=rivet-cli@0.19.2",
+            "--lib"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/load/plan.rs:304:30: replace == with != in build_plans",
+          "package": "rivet-cli",
+          "file": "src/load/plan.rs",
+          "function": {
+            "function_name": "build_plans",
+            "return_type": "-> Result<Vec<LoadPlan>>",
+            "span": {
+              "start": {
+                "line": 285,
+                "column": 1
+              },
+              "end": {
+                "line": 385,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 304,
+              "column": 30
+            },
+            "end": {
+              "line": 304,
+              "column": 32
+            }
+          },
+          "replacement": "!=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/src__load__plan.rs_line_304_col_30.log",
+      "diff_path": "diff/src__load__plan.rs_line_304_col_30.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 36.921774209,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=rivet-cli@0.19.2"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/load/plan.rs:299:5: replace build_plans -> Result<Vec<LoadPlan>> with Ok(vec![])",
+          "package": "rivet-cli",
+          "file": "src/load/plan.rs",
+          "function": {
+            "function_name": "build_plans",
+            "return_type": "-> Result<Vec<LoadPlan>>",
+            "span": {
+              "start": {
+                "line": 285,
+                "column": 1
+              },
+              "end": {
+                "line": 385,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 299,
+              "column": 5
+            },
+            "end": {
+              "line": 384,
+              "column": 14
+            }
+          },
+          "replacement": "Ok(vec![])",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/src__load__plan.rs_line_299_col_5.log",
+      "diff_path": "diff/src__load__plan.rs_line_299_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 39.09487625,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=rivet-cli@0.19.2"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/load/plan.rs:299:5: replace build_plans -> Result<Vec<LoadPlan>> with Ok(vec![Default::default()])",
+          "package": "rivet-cli",
+          "file": "src/load/plan.rs",
+          "function": {
+            "function_name": "build_plans",
+            "return_type": "-> Result<Vec<LoadPlan>>",
+            "span": {
+              "start": {
+                "line": 285,
+                "column": 1
+              },
+              "end": {
+                "line": 385,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 299,
+              "column": 5
+            },
+            "end": {
+              "line": 384,
+              "column": 14
+            }
+          },
+          "replacement": "Ok(vec![Default::default()])",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/src__load__plan.rs_line_299_col_5_001.log",
+      "diff_path": "diff/src__load__plan.rs_line_299_col_5_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 38.127906209,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=rivet-cli@0.19.2"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/load/plan.rs:299:5: replace build_plans -> Result<Vec<LoadPlan>> with Ok(vec![])",
+          "package": "rivet-cli",
+          "file": "src/load/plan.rs",
+          "function": {
+            "function_name": "build_plans",
+            "return_type": "-> Result<Vec<LoadPlan>>",
+            "span": {
+              "start": {
+                "line": 285,
+                "column": 1
+              },
+              "end": {
+                "line": 385,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 299,
+              "column": 5
+            },
+            "end": {
+              "line": 384,
+              "column": 14
+            }
+          },
+          "replacement": "Ok(vec![])",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/src__load__plan.rs_line_299_col_5_002.log",
+      "diff_path": "diff/src__load__plan.rs_line_299_col_5_002.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.608499416,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=rivet-cli@0.19.2"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/load/plan.rs:304:30: replace == with != in build_plans",
+          "package": "rivet-cli",
+          "file": "src/load/plan.rs",
+          "function": {
+            "function_name": "build_plans",
+            "return_type": "-> Result<Vec<LoadPlan>>",
+            "span": {
+              "start": {
+                "line": 285,
+                "column": 1
+              },
+              "end": {
+                "line": 385,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 304,
+              "column": 30
+            },
+            "end": {
+              "line": 304,
+              "column": 32
+            }
+          },
+          "replacement": "!=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/src__load__plan.rs_line_304_col_30_001.log",
+      "diff_path": "diff/src__load__plan.rs_line_304_col_30_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 24.044383,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=rivet-cli@0.19.2"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/load/plan.rs:332:21: delete match arm \"fail\" in build_plans",
+          "package": "rivet-cli",
+          "file": "src/load/plan.rs",
+          "function": {
+            "function_name": "build_plans",
+            "return_type": "-> Result<Vec<LoadPlan>>",
+            "span": {
+              "start": {
+                "line": 285,
+                "column": 1
+              },
+              "end": {
+                "line": 385,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 332,
+              "column": 21
+            },
+            "end": {
+              "line": 332,
+              "column": 50
+            }
+          },
+          "replacement": "",
+          "genre": "MatchArm"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__load__plan.rs_line_332_col_21_001.log",
+      "diff_path": "diff/src__load__plan.rs_line_332_col_21_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 27.98896675,
+          "process_status": "Success",
+          "argv": [
+            "/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=rivet-cli@0.19.2"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 5.760080959,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=rivet-cli@0.19.2",
+            "--lib"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/load/plan.rs:333:21: delete match arm \"warn\" in build_plans",
+          "package": "rivet-cli",
+          "file": "src/load/plan.rs",
+          "function": {
+            "function_name": "build_plans",
+            "return_type": "-> Result<Vec<LoadPlan>>",
+            "span": {
+              "start": {
+                "line": 285,
+                "column": 1
+              },
+              "end": {
+                "line": 385,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 333,
+              "column": 21
+            },
+            "end": {
+              "line": 333,
+              "column": 50
+            }
+          },
+          "replacement": "",
+          "genre": "MatchArm"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__load__plan.rs_line_333_col_21_001.log",
+      "diff_path": "diff/src__load__plan.rs_line_333_col_21_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 19.930160459,
+          "process_status": "Success",
+          "argv": [
+            "/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=rivet-cli@0.19.2"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 5.5553427079999995,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=rivet-cli@0.19.2",
+            "--lib"
+          ]
+        }
+      ]
+    }
+  ],
+  "total_mutants": 7,
+  "missed": 0,
+  "caught": 2,
+  "timeout": 0,
+  "unviable": 5,
+  "success": 0,
+  "start_time": "2026-07-16T19:23:14.603663Z",
+  "end_time": null,
+  "cargo_mutants_version": "27.1.0"
+}

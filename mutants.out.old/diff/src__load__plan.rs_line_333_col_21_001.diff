@@ -1,0 +1,21 @@
+--- src/load/plan.rs
++++ delete match arm "warn" in build_plans
+@@ -325,17 +325,17 @@
+             .columns
+             .into_iter()
+             .map(|c| TargetColumnSpec {
+                 column_name: c.column,
+                 target_type: c.target_type,
+                 autoload_type: String::new(),
+                 status: match c.target_status.as_str() {
+                     "fail" => TargetStatus::Fail,
+-                    "warn" => TargetStatus::Warn,
++                     /* ~ changed by cargo-mutants ~ */
+                     _ => TargetStatus::Ok,
+                 },
+                 note: None,
+                 cast_sql: None,
+             })
+             .collect();
+ 
+         // Complete-snapshot modes → overwrite the latest run; delta modes → their

@@ -279,6 +279,23 @@ pub fn plan_loads(config_path: &str, rivet_bin: &str) -> Result<Vec<LoadPlan>> {
         .collect::<Result<_, _>>()
         .context("parsing `rivet check --json` (one document per export)")?;
 
+    build_plans(&cfg, &load, reports)
+}
+
+/// The **pure core** of [`plan_loads`]: map the parsed `rivet check` reports onto
+/// one [`LoadPlan`] per export, given the config and the shared `load:` section.
+///
+/// No I/O — the subprocess and filesystem work is done by [`plan_loads`], and
+/// everything they produced arrives in the args. That makes the per-export
+/// resolution unit-testable without a `rivet` binary: the export→report name
+/// match, `target_status`→[`TargetStatus`] mapping, [`ExportMode`]→[`LoadMode`]
+/// mapping, the `gs://` prefix, the per-export `load:` override, and the
+/// duplicate-target guard.
+fn build_plans(
+    cfg: &crate::config::Config,
+    load: &LoadSection,
+    reports: Vec<ExportReport>,
+) -> Result<Vec<LoadPlan>> {
     let mut plans = Vec::with_capacity(reports.len());
     for report in reports {
         let export = cfg
@@ -419,6 +436,111 @@ mod tests {
         assert_eq!(LoadMode::Full.ledger_str(), "full");
         assert_eq!(LoadMode::Incremental.ledger_str(), "incremental");
         assert_eq!(LoadMode::Cdc.ledger_str(), "cdc");
+    }
+
+    /// A `ColReport` with an explicit `target_status`.
+    fn col(name: &str, status: &str) -> ColReport {
+        ColReport {
+            column: name.into(),
+            target_type: "STRING".into(),
+            target_status: status.into(),
+        }
+    }
+
+    /// Drive the PURE `build_plans` (no `rivet` subprocess) — the deepened core
+    /// of `plan_loads`. Kills the mutation survivors that live in the per-export
+    /// resolution: the export→report name match (`==`→`!=`) and the `fail`/`warn`
+    /// `target_status` arms. Also pins mode mapping, the `gs://` prefix, table
+    /// resolution, and the cursor column.
+    #[test]
+    fn build_plans_matches_by_name_maps_statuses_and_mode() {
+        let cfg = crate::config::Config::from_yaml(
+            r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: alpha
+    table: alpha_tbl
+    mode: full
+    format: parquet
+    destination:
+      type: gcs
+      bucket: b1
+      prefix: exports/alpha/
+  - name: beta
+    table: beta_tbl
+    mode: incremental
+    cursor_column: updated_at
+    format: parquet
+    destination:
+      type: gcs
+      bucket: b2
+      prefix: exports/beta/
+load:
+  target: bigquery
+  project: p
+  dataset: d
+"#,
+        )
+        .unwrap();
+        let load: LoadSection = serde_json::from_value(cfg.load.clone().unwrap()).unwrap();
+
+        // Reports arrive in the OPPOSITE order to the exports, so a plan only
+        // lands on the right table if its export is found by NAME, not position.
+        let reports = vec![
+            ExportReport {
+                export: "beta".into(),
+                columns: vec![col("id", "ok"), col("f", "fail"), col("w", "warn")],
+            },
+            ExportReport {
+                export: "alpha".into(),
+                columns: vec![col("id", "ok")],
+            },
+        ];
+
+        let plans = build_plans(&cfg, &load, reports).unwrap();
+        assert_eq!(plans.len(), 2);
+
+        // reports[0] = beta → matched by name to the 2nd export (kills `==`→`!=`,
+        // which would resolve the first NON-matching export instead).
+        assert_eq!(
+            plans[0].table, "beta_tbl",
+            "found beta by name, not position"
+        );
+        assert_eq!(plans[0].mode, LoadMode::Incremental);
+        assert_eq!(plans[0].cursor_column.as_deref(), Some("updated_at"));
+        assert_eq!(plans[0].gcs_prefix, "gs://b2/exports/beta/");
+        // target_status → spec.status (kills the `fail`/`warn` arm deletions,
+        // which would collapse those columns to Ok and load an unmappable column).
+        let statuses: Vec<_> = plans[0].specs.iter().map(|s| s.status).collect();
+        assert_eq!(
+            statuses,
+            vec![TargetStatus::Ok, TargetStatus::Fail, TargetStatus::Warn]
+        );
+
+        // reports[1] = alpha → the full-snapshot export.
+        assert_eq!(plans[1].table, "alpha_tbl");
+        assert_eq!(plans[1].mode, LoadMode::Full);
+        assert_eq!(plans[1].gcs_prefix, "gs://b1/exports/alpha/");
+    }
+
+    #[test]
+    fn build_plans_bails_on_a_report_for_an_unknown_export() {
+        let cfg = crate::config::Config::from_yaml(
+            "source:\n  type: postgres\n  url: \"postgresql://localhost/test\"\n\
+             exports:\n  - name: a\n    query: \"SELECT 1\"\n    format: parquet\n    \
+             destination:\n      type: gcs\n      bucket: b\n      prefix: p/\nload:\n  \
+             target: bigquery\n  project: p\n  dataset: d\n",
+        )
+        .unwrap();
+        let load: LoadSection = serde_json::from_value(cfg.load.clone().unwrap()).unwrap();
+        let reports = vec![ExportReport {
+            export: "ghost".into(),
+            columns: vec![],
+        }];
+        let err = build_plans(&cfg, &load, reports).unwrap_err().to_string();
+        assert!(err.contains("ghost") && err.contains("not found"), "{err}");
     }
 
     #[test]

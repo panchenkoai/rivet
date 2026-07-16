@@ -1,0 +1,5 @@
+src/load/plan.rs:304:30: replace == with != in build_plans
+src/load/plan.rs:299:5: replace build_plans -> Result<Vec<LoadPlan>> with Ok(vec![])
+src/load/plan.rs:299:5: replace build_plans -> Result<Vec<LoadPlan>> with Ok(vec![Default::default()])
+src/load/plan.rs:299:5: replace build_plans -> Result<Vec<LoadPlan>> with Ok(vec![])
+src/load/plan.rs:304:30: replace == with != in build_plans

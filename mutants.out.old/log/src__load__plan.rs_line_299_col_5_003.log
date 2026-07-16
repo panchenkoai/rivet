@@ -1,0 +1,1318 @@
+
+*** src/load/plan.rs:299:5: replace build_plans -> Result<Vec<LoadPlan>> with Ok(vec![Default::default()])
+
+*** mutation diff:
+--- src/load/plan.rs
++++ replace build_plans -> Result<Vec<LoadPlan>> with Ok(vec![Default::default()])
+@@ -291,102 +291,17 @@
+ /// match, `target_status`→[`TargetStatus`] mapping, [`ExportMode`]→[`LoadMode`]
+ /// mapping, the `gs://` prefix, the per-export `load:` override, and the
+ /// duplicate-target guard.
+ fn build_plans(
+     cfg: &crate::config::Config,
+     load: &LoadSection,
+     reports: Vec<ExportReport>,
+ ) -> Result<Vec<LoadPlan>> {
+-    let mut plans = Vec::with_capacity(reports.len());
+-    for report in reports {
+-        let export = cfg
+-            .exports
+-            .iter()
+-            .find(|e| e.name == report.export)
+-            .with_context(|| {
+-                format!(
+-                    "rivet check reported export `{}` not found in config",
+-                    report.export
+-                )
+-            })?;
+-        let table = export.table.clone().unwrap_or_else(|| export.name.clone());
+-
+-        let dest = &export.destination;
+-        let bucket = dest.bucket.as_deref().with_context(|| {
+-            format!(
+-                "export `{}` has no destination `bucket` — a GCS destination is required",
+-                export.name
+-            )
+-        })?;
+-        let prefix = dest.prefix.as_deref().unwrap_or("");
+-        let base = prefix.split("{partition}").next().unwrap_or(prefix);
+-        let gcs_prefix = format!("gs://{bucket}/{base}");
+-
+-        let specs = report
+-            .columns
+-            .into_iter()
+-            .map(|c| TargetColumnSpec {
+-                column_name: c.column,
+-                target_type: c.target_type,
+-                autoload_type: String::new(),
+-                status: match c.target_status.as_str() {
+-                    "fail" => TargetStatus::Fail,
+-                    "warn" => TargetStatus::Warn,
+-                    _ => TargetStatus::Ok,
+-                },
+-                note: None,
+-                cast_sql: None,
+-            })
+-            .collect();
+-
+-        // Complete-snapshot modes → overwrite the latest run; delta modes → their
+-        // own append path. Exhaustive (no `_`) on purpose: a future delta-style
+-        // ExportMode then fails to COMPILE here until someone picks its load
+-        // semantics, instead of silently defaulting to OVERWRITE (the
+-        // incremental-overwrite data-loss class).
+-        let mode = match export.mode {
+-            crate::config::ExportMode::Cdc => LoadMode::Cdc,
+-            crate::config::ExportMode::Incremental => LoadMode::Incremental,
+-            crate::config::ExportMode::Full => LoadMode::Full, // whole result set
+-            crate::config::ExportMode::Chunked => LoadMode::Full, // parallel full snapshot
+-            crate::config::ExportMode::TimeWindow => LoadMode::Full, // whole rolling window
+-        };
+-        // Effective load config: the shared top-level `load:`, with this export's
+-        // own `load:` block overriding the table-specific fields (pk, cleanup, …).
+-        // The warehouse `target` is shared and cannot be re-targeted per export.
+-        let eff_load = match &export.load {
+-            Some(v) => {
+-                let o: LoadOverride = serde_json::from_value(v.clone()).with_context(|| {
+-                    format!("parsing export `{}` `load:` override", export.name)
+-                })?;
+-                if o.target.is_some() {
+-                    bail!(
+-                        "export `{}`: a per-export `load:` cannot override `target:` — the \
+-                         warehouse is shared; set `target:` in the top-level `load:` block only",
+-                        export.name
+-                    );
+-                }
+-                load.with_override(&o)
+-            }
+-            None => load.clone(),
+-        };
+-        plans.push(LoadPlan {
+-            table,
+-            partition_by: export.partition_by.clone(),
+-            specs,
+-            gcs_prefix,
+-            destination: export.destination.clone(),
+-            load: eff_load,
+-            mode,
+-            cursor_column: export.cursor_column.clone(),
+-        });
+-    }
+-    reject_duplicate_target_tables(&plans.iter().map(|p| p.table.as_str()).collect::<Vec<_>>())?;
+-    Ok(plans)
++    Ok(vec![Default::default()]) /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// Reject two exports that resolve to the SAME warehouse table. The `target:` is
+ /// shared, so two exports whose `table:` (or `name:`) resolves alike land on one
+ /// warehouse object — a full OVERWRITE would clobber what a cdc/incremental
+ /// export appends a `<table>__changes` view over, and they'd share one ledger
+ /// skip-set. Pure + unit-testable; caught here, not silently at load time.
+ fn reject_duplicate_target_tables(tables: &[&str]) -> Result<()> {
+
+
+*** /Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/cargo test --no-run --verbose --package=rivet-cli@0.19.2
+    Blocking waiting for file lock on package cache
+       Fresh unicode-ident v1.0.24
+       Fresh cfg-if v1.0.4
+       Fresh autocfg v1.5.1
+       Fresh libc v0.2.186
+       Fresh memchr v2.8.1
+       Fresh proc-macro2 v1.0.106
+       Fresh serde_core v1.0.228
+       Fresh jobserver v0.1.34
+       Fresh shlex v1.3.0
+       Fresh quote v1.0.45
+       Fresh libm v0.2.16
+       Fresh find-msvc-tools v0.1.9
+       Fresh version_check v0.9.5
+       Fresh bytes v1.11.1
+       Fresh itoa v1.0.18
+       Fresh syn v2.0.117
+       Fresh num-traits v0.2.19
+       Fresh cc v1.2.62
+       Fresh typenum v1.20.0
+       Fresh equivalent v1.0.2
+       Fresh critical-section v1.2.0
+       Fresh serde_derive v1.0.228
+       Fresh hashbrown v0.17.1
+       Fresh core-foundation-sys v0.8.7
+       Fresh zerocopy-derive v0.8.49
+       Fresh serde v1.0.228
+       Fresh portable-atomic v1.13.1
+       Fresh indexmap v2.14.0
+       Fresh bitflags v2.11.1
+       Fresh zerocopy v0.8.49
+       Fresh zmij v1.0.21
+       Fresh errno v0.3.14
+       Fresh pin-project-lite v0.2.17
+       Fresh serde_json v1.0.150
+       Fresh synstructure v0.13.2
+       Fresh num-integer v0.1.46
+       Fresh smallvec v1.15.1
+       Fresh rand_core v0.10.1
+       Fresh generic-array v0.14.7
+       Fresh zerofrom-derive v0.1.7
+       Fresh yoke-derive v0.8.2
+       Fresh socket2 v0.6.3
+       Fresh getrandom v0.4.2
+       Fresh zerofrom v0.1.8
+       Fresh futures-core v0.3.32
+       Fresh stable_deref_trait v1.2.1
+       Fresh crypto-common v0.1.7
+       Fresh num-bigint v0.4.6
+       Fresh getrandom v0.3.4
+       Fresh yoke v0.8.2
+       Fresh signal-hook-registry v1.4.8
+       Fresh tokio-macros v2.7.0
+       Fresh mio v1.2.0
+       Fresh base64 v0.22.1
+       Fresh subtle v2.6.1
+       Fresh tokio v1.52.3
+       Fresh iana-time-zone v0.1.65
+       Fresh zerovec-derive v0.11.3
+       Fresh futures-sink v0.3.32
+       Fresh log v0.4.32
+       Fresh displaydoc v0.2.6
+       Fresh const-oid v0.9.6
+       Fresh chrono v0.4.45
+       Fresh zerovec v0.11.6
+       Fresh futures-channel v0.3.32
+       Fresh futures-macro v0.3.32
+       Fresh futures-io v0.3.32
+       Fresh futures-task v0.3.32
+       Fresh slab v0.4.12
+       Fresh block-buffer v0.10.4
+       Fresh half v2.7.1
+       Fresh pkg-config v0.3.33
+       Fresh zeroize v1.8.2
+       Fresh percent-encoding v2.3.2
+       Fresh futures-util v0.3.32
+       Fresh digest v0.10.7
+       Fresh tinystr v0.8.3
+       Fresh writeable v0.6.3
+       Fresh litemap v0.8.2
+       Fresh icu_locale_core v2.2.0
+       Fresh potential_utf v0.1.5
+       Fresh zerotrie v0.2.4
+       Fresh untrusted v0.9.0
+       Fresh utf8_iter v1.0.4
+       Fresh semver v1.0.28
+       Fresh ring v0.17.14
+       Fresh ahash v0.8.12
+       Fresh icu_provider v2.2.0
+       Fresh icu_collections v2.2.0
+       Fresh rustc_version v0.4.1
+       Fresh crunchy v0.2.4
+       Fresh arrow-buffer v59.0.0
+       Fresh tiny-keccak v2.0.2
+       Fresh icu_properties_data v2.2.0
+       Fresh icu_normalizer_data v2.2.0
+       Fresh arrow-schema v59.0.0
+       Fresh getrandom v0.2.17
+       Fresh cpufeatures v0.2.17
+       Fresh once_cell v1.21.4
+       Fresh icu_normalizer v2.2.0
+       Fresh arrow-data v59.0.0
+       Fresh icu_properties v2.2.0
+       Fresh block-padding v0.3.3
+       Fresh num-complex v0.4.6
+       Fresh const-random-macro v0.1.16
+       Fresh tinyvec_macros v0.1.1
+       Fresh inout v0.1.4
+       Fresh crossbeam-utils v0.8.21
+       Fresh idna_adapter v1.2.2
+       Fresh arrow-array v59.0.0
+       Fresh tinyvec v1.11.0
+       Fresh const-random v0.1.18
+       Fresh form_urlencoded v1.2.2
+       Fresh ppv-lite86 v0.2.21
+       Fresh tracing-core v0.1.36
+       Fresh tracing-attributes v0.1.31
+       Fresh hybrid-array v0.4.12
+       Fresh thiserror-impl v2.0.18
+       Fresh vcpkg v0.2.15
+       Fresh regex-syntax v0.8.10
+       Fresh strsim v0.11.1
+       Fresh tracing v0.1.44
+       Fresh idna v1.1.0
+       Fresh thiserror v2.0.18
+       Fresh cipher v0.4.4
+       Fresh sha2 v0.10.9
+       Fresh chacha20 v0.10.0
+       Fresh ipnet v2.12.0
+       Fresh aho-corasick v1.1.4
+       Fresh ryu v1.0.23
+       Fresh cmov v0.5.3
+       Fresh rand v0.10.1
+       Fresh regex-automata v0.4.14
+       Fresh crypto-common v0.2.2
+       Fresh block-buffer v0.12.0
+       Fresh url v2.5.8
+       Fresh hmac v0.12.1
+       Fresh ctutils v0.4.2
+       Fresh rustls-pki-types v1.14.1
+       Fresh rand_core v0.6.4
+       Fresh async-trait v0.1.89
+       Fresh http v1.4.1
+       Fresh either v1.16.0
+       Fresh fastrand v2.4.1
+       Fresh lexical-util v1.0.7
+       Fresh const-oid v0.10.2
+       Fresh base64ct v1.8.3
+       Fresh http-body v1.0.1
+       Fresh digest v0.11.3
+       Fresh pem-rfc7468 v0.7.0
+       Fresh pbkdf2 v0.12.2
+       Fresh regex v1.12.3
+   Compiling arrow-select v59.0.0
+       Fresh tokio-util v0.7.18
+       Fresh uuid v1.23.1
+       Fresh security-framework-sys v2.17.0
+       Fresh powerfmt v0.2.0
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name arrow_select --edition=2024 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-select-59.0.0/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=910d68d77ce25679 -C extra-filename=-7047d30163190451 --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern ahash=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libahash-0e993e4a36a2c5dc.rmeta --extern arrow_array=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libarrow_array-bbd43e09e5f8a353.rmeta --extern arrow_buffer=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libarrow_buffer-85febca3c0b60055.rmeta --extern arrow_data=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libarrow_data-77ad011fcb25c751.rmeta --extern arrow_schema=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libarrow_schema-74342c2851bd5b65.rmeta --extern num_traits=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libnum_traits-67f8adb5ac981e83.rmeta --cap-lints allow`
+       Fresh num-conv v0.2.2
+       Fresh scopeguard v1.2.0
+       Fresh byteorder v1.5.0
+       Fresh utf8parse v0.2.2
+       Fresh lock_api v0.4.14
+       Fresh time-macros v0.2.27
+       Fresh anstyle-parse v1.0.0
+   Compiling zstd-sys v2.0.16+zstd.1.5.7
+       Fresh deranged v0.5.8
+       Fresh crossbeam-epoch v0.9.20
+       Fresh parking_lot_core v0.9.12
+       Fresh rustix v1.1.4
+       Fresh der v0.7.10
+     Running `/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/zstd-sys-dad49165cb1bb3be/build-script-build`
+       Fresh rustls-webpki v0.103.13
+       Fresh salsa20 v0.10.2
+       Fresh unicode-normalization v0.1.25
+       Fresh unicode-properties v0.1.4
+       Fresh colorchoice v1.0.5
+       Fresh anstyle v1.0.14
+       Fresh try-lock v0.2.5
+       Fresh unicode-bidi v0.3.18
+       Fresh tower-service v0.3.3
+       Fresh is_terminal_polyfill v1.70.2
+       Fresh anstyle-query v1.1.5
+       Fresh time-core v0.1.8
+       Fresh want v0.3.1
+       Fresh anstream v1.0.0
+       Fresh time v0.3.47
+       Fresh stringprep v0.1.5
+       Fresh rustls v0.23.40
+       Fresh scrypt v0.11.0
+       Fresh tempfile v3.27.0
+       Fresh parking_lot v0.12.5
+       Fresh spki v0.7.3
+       Fresh httparse v1.10.1
+       Fresh lexical-write-integer v1.0.6
+       Fresh lexical-parse-integer v1.0.6
+       Fresh aes v0.8.4
+       Fresh cbc v0.1.2
+       Fresh rand_core v0.9.5
+       Fresh core-foundation v0.9.4
+       Fresh derive-syn-parse v0.2.0
+       Fresh macro_magic_core_macros v0.5.1
+       Fresh cpufeatures v0.3.0
+       Fresh ident_case v1.0.1
+       Fresh atomic-waker v1.1.2
+       Fresh tap v1.0.1
+       Fresh sha2 v0.11.0
+       Fresh hyper v1.10.0
+       Fresh wyz v0.5.1
+       Fresh macro_magic_core v0.5.1
+       Fresh darling_core v0.23.0
+       Fresh pkcs5 v0.7.1
+       Fresh lexical-parse-float v1.0.6
+       Fresh lexical-write-float v1.0.6
+       Fresh tokio-rustls v0.26.4
+       Fresh radium v0.7.0
+       Fresh md-5 v0.11.0
+       Fresh hmac v0.13.0
+       Fresh rand_chacha v0.3.1
+       Fresh webpki-roots v1.0.7
+       Fresh sha1 v0.10.6
+       Fresh sync_wrapper v1.0.2
+       Fresh objc2-core-foundation v0.3.2
+       Fresh core-foundation v0.10.1
+       Fresh tower-layer v0.3.3
+       Fresh funty v2.0.0
+       Fresh clap_lex v1.1.0
+       Fresh heck v0.5.0
+       Fresh siphasher v1.0.3
+       Fresh fallible-iterator v0.2.0
+       Fresh spin v0.9.8
+       Fresh postgres-protocol v0.6.12
+       Fresh clap_derive v4.6.1
+       Fresh lazy_static v1.5.0
+       Fresh phf_shared v0.13.1
+       Fresh clap_builder v4.6.0
+       Fresh tower v0.5.3
+       Fresh bitvec v1.1.1
+       Fresh objc2-system-configuration v0.3.2
+       Fresh security-framework v3.7.0
+       Fresh rand v0.8.6
+       Fresh lexical-core v1.0.6
+       Fresh pkcs8 v0.10.2
+       Fresh libz-sys v1.1.28
+       Fresh crc32fast v1.5.0
+       Fresh darling_macro v0.23.0
+       Fresh hyper-util v0.1.20
+       Fresh macro_magic_macros v0.5.1
+       Fresh rand_chacha v0.9.0
+       Fresh prefix-trie v0.8.4
+       Fresh dlv-list v0.5.2
+       Fresh pem v3.0.6
+       Fresh num-iter v0.1.45
+       Fresh serde_spanned v0.6.9
+       Fresh toml_datetime v0.6.11
+       Fresh atoi v2.0.0
+       Fresh uuid v0.8.2
+       Fresh hex v0.4.3
+       Fresh alloc-no-stdlib v2.0.4
+       Fresh data-encoding v2.11.0
+       Fresh winnow v0.7.15
+   Compiling zlib-rs v0.6.3
+       Fresh unicode-segmentation v1.13.3
+       Fresh hashbrown v0.14.5
+       Fresh toml_write v0.1.2
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name zlib_rs --edition=2021 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zlib-rs-0.6.3/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --deny=unsafe_op_in_unsafe_fn --cfg 'feature="rust-allocator"' --cfg 'feature="std"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("ZLIB_DEBUG", "__internal-api", "__internal-fuzz", "__internal-fuzz-disable-checksum", "__internal-test", "arbitrary", "avx512", "c-allocator", "default", "quickcheck", "rust-allocator", "std", "vpclmulqdq"))' -C metadata=7d1351c9bf2d9412 -C extra-filename=-533da47211eb1512 --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --cap-lints allow`
+   Compiling toml_edit v0.22.27
+       Fresh convert_case v0.10.0
+       Fresh ordered-multimap v0.7.3
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name toml_edit --edition=2021 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/toml_edit-0.22.27/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=rust_2018_idioms '--warn=clippy::zero_sized_map_values' '--warn=clippy::wildcard_imports' '--warn=clippy::verbose_file_reads' --warn=unused_qualifications --warn=unused_macro_rules --warn=unused_lifetimes --warn=unsafe_op_in_unsafe_fn --warn=unreachable_pub --allow=unnameable_types '--warn=clippy::uninlined_format_args' '--warn=clippy::trait_duplication_in_bounds' '--warn=clippy::todo' '--warn=clippy::string_to_string' '--warn=clippy::string_lit_as_bytes' '--warn=clippy::string_add_assign' '--warn=clippy::string_add' '--warn=clippy::str_to_string' '--warn=clippy::semicolon_if_nothing_returned' '--warn=clippy::self_named_module_files' '--warn=clippy::same_functions_in_if_condition' '--allow=clippy::result_large_err' '--warn=clippy::rest_pat_in_fully_bound_structs' '--warn=clippy::ref_option_ref' '--warn=clippy::redundant_feature_names' '--warn=clippy::rc_mutex' '--warn=clippy::ptr_as_ptr' '--warn=clippy::path_buf_push_overwrite' '--warn=clippy::negative_feature_names' '--warn=clippy::needless_for_each' '--allow=clippy::needless_continue' '--warn=clippy::mutex_integer' '--warn=clippy::mem_forget' '--warn=clippy::macro_use_imports' '--warn=clippy::lossy_float_literal' '--warn=clippy::linkedlist' '--allow=clippy::let_and_return' '--warn=clippy::large_types_passed_by_value' '--warn=clippy::large_stack_arrays' '--warn=clippy::large_digit_groups' '--warn=clippy::invalid_upcast_comparisons' '--warn=clippy::infinite_loop' '--warn=clippy::inefficient_to_string' '--warn=clippy::inconsistent_struct_constructor' '--warn=clippy::imprecise_flops' '--warn=clippy::implicit_clone' '--allow=clippy::if_same_then_else' '--warn=clippy::from_iter_instead_of_collect' '--warn=clippy::fn_params_excessive_bools' '--warn=clippy::float_cmp_const' '--warn=clippy::flat_map_option' '--warn=clippy::filter_map_next' '--warn=clippy::fallible_impl_from' '--warn=clippy::explicit_into_iter_loop' '--warn=clippy::explicit_deref_methods' '--warn=clippy::expl_impl_clone_on_copy' '--warn=clippy::enum_glob_use' '--warn=clippy::empty_enum' '--warn=clippy::doc_markdown' '--warn=clippy::debug_assert_with_mut_call' '--warn=clippy::dbg_macro' '--warn=clippy::create_dir' '--allow=clippy::collapsible_else_if' '--warn=clippy::checked_conversions' '--allow=clippy::branches_sharing_code' '--allow=clippy::bool_assert_comparison' --cfg 'feature="display"' --cfg 'feature="parse"' --cfg 'feature="serde"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "display", "parse", "perf", "serde", "unbounded", "unstable-debug"))' -C metadata=c11f5195c9fb2620 -C extra-filename=-755818a0d15c4dce --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern indexmap=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libindexmap-5323448a262ac5ba.rmeta --extern serde=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libserde-fee0454088b7e585.rmeta --extern serde_spanned=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libserde_spanned-6f73ecd0709034c7.rmeta --extern toml_datetime=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libtoml_datetime-77f3920b82304a86.rmeta --extern toml_write=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libtoml_write-e2f49efff87d9633.rmeta --extern winnow=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libwinnow-eae74977e8064d24.rmeta --cap-lints allow`
+       Fresh alloc-stdlib v0.2.2
+   Compiling hickory-proto v0.26.1
+       Fresh num-bigint-dig v0.8.6
+       Fresh postgres-types v0.2.14
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name hickory_proto --edition=2021 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hickory-proto-0.26.1/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked '--warn=clippy::use_self' '--allow=clippy::upper_case_acronyms' --warn=unused_qualifications --warn=unused_import_braces --warn=unused_extern_crates --warn=unreachable_pub --warn=unnameable_types '--warn=clippy::unimplemented' --warn=unexpected_cfgs '--allow=clippy::single_component_path_imports' --warn=rust_2018_idioms '--warn=clippy::or_fun_call' --warn=non_upper_case_globals --warn=non_snake_case '--warn=clippy::manual_let_else' '--warn=clippy::default_trait_access' '--allow=clippy::bool_to_int_with_if' --check-cfg 'cfg(nightly)' --cfg 'feature="access-control"' --cfg 'feature="default"' --cfg 'feature="std"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("__dnssec", "access-control", "default", "dnssec-aws-lc-rs", "dnssec-ring", "mdns", "no-std-rand", "serde", "std", "testing", "wasm-bindgen"))' -C metadata=e1d1f655e067f62d -C extra-filename=-3ab577c93b93b375 --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern data_encoding=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libdata_encoding-c1718b0718b069b5.rmeta --extern idna=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libidna-f7af3a6a9ce21d07.rmeta --extern ipnet=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libipnet-3225b1034cf8def2.rmeta --extern once_cell=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libonce_cell-f999915dc5ca2e45.rmeta --extern prefix_trie=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libprefix_trie-6692635e8f02a6b7.rmeta --extern rand=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/librand-0060a56125ccf978.rmeta --extern thiserror=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libthiserror-e47add28aeff3944.rmeta --extern tinyvec=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libtinyvec-20c330aca7e3e65d.rmeta --extern tracing=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libtracing-bcec8683fef869e5.rmeta --extern url=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/liburl-754dfa2e3685f3be.rmeta --cap-lints allow`
+       Fresh rand v0.9.4
+       Fresh hyper-rustls v0.27.9
+       Fresh darling v0.23.0
+       Fresh pkcs1 v0.7.5
+       Fresh native-tls v0.2.18
+       Fresh flatbuffers v25.12.19
+       Fresh whoami v2.1.2
+       Fresh clap v4.6.1
+       Fresh tower-http v0.6.11
+       Fresh system-configuration-sys v0.6.0
+       Fresh phf v0.13.1
+       Fresh simple_asn1 v0.6.4
+       Fresh http-body-util v0.1.3
+       Fresh signature v2.2.0
+       Fresh serde_urlencoded v0.7.1
+       Fresh crossbeam-channel v0.5.16
+       Fresh rustls-webpki v0.101.7
+       Fresh sct v0.7.1
+   Compiling tikv-jemalloc-sys v0.7.1+5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8
+   Compiling csv-core v0.1.13
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name build_script_build --edition=2018 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tikv-jemalloc-sys-0.7.1+5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8/build.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type bin --emit=dep-info,link -C embed-bitcode=no --allow=unexpected_cfgs --check-cfg 'cfg(jemallocator_docs)' --check-cfg 'cfg(prefixed)' --cfg 'feature="background_threads_runtime_support"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("background_threads", "background_threads_runtime_support", "debug", "default", "disable_cache_oblivious", "disable_initial_exec_tls", "override_allocator_on_supported_platforms", "profiling", "profiling_libunwind", "stats", "unprefixed_malloc_on_supported_platforms"))' -C metadata=ce62696d2a15b653 -C extra-filename=-eed40b9d08e4fab3 --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/tikv-jemalloc-sys-eed40b9d08e4fab3 -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern cc=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libcc-fed72d5311999ba8.rlib --cap-lints allow`
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name csv_core --edition=2018 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/csv-core-0.1.13/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --cfg 'feature="default"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "libc"))' -C metadata=81f091b3987f0b76 -C extra-filename=-d64d9b17b51b39f4 --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern memchr=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libmemchr-4ec095df68000796.rmeta --cap-lints allow`
+   Compiling mysql_common v0.37.2
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name build_script_build --edition=2024 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mysql_common-0.37.2/build.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type bin --emit=dep-info,link -C embed-bitcode=no --cfg 'feature="binlog"' --cfg 'feature="bitvec"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("bigdecimal", "bindgen", "binlog", "bitvec", "chrono", "client_ed25519", "client_parsec", "default", "derive", "frunk", "mysql-common-derive", "nightly", "rust_decimal", "test", "time"))' -C metadata=220ef264674899ab -C extra-filename=-e27c19285d952471 --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/mysql_common-e27c19285d952471 -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --cap-lints allow`
+   Compiling thiserror v1.0.69
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name build_script_build --edition=2021 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-1.0.69/build.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type bin --emit=dep-info,link -C embed-bitcode=no --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=febb7693bebb4e46 -C extra-filename=-a2a75705d94d177f --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/thiserror-a2a75705d94d177f -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --cap-lints allow`
+   Compiling paste v1.0.15
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name build_script_build --edition=2018 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/paste-1.0.15/build.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type bin --emit=dep-info,link -C embed-bitcode=no --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=9719fc0cee06badc -C extra-filename=-9ab7e4b72c951f53 --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/paste-9ab7e4b72c951f53 -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --cap-lints allow`
+   Compiling ref-cast v1.0.25
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name build_script_build --edition=2021 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ref-cast-1.0.25/build.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type bin --emit=dep-info,link -C embed-bitcode=no --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=922af59cbe9d791f -C extra-filename=-57fdd3313a9a205d --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/ref-cast-57fdd3313a9a205d -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --cap-lints allow`
+   Compiling twox-hash v2.1.2
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name twox_hash --edition=2021 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/twox-hash-2.1.2/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(_internal_xxhash3_force_scalar)' --check-cfg 'cfg(_internal_xxhash3_force_neon)' --check-cfg 'cfg(_internal_xxhash3_force_sse2)' --check-cfg 'cfg(_internal_xxhash3_force_avx2)' --cfg 'feature="xxhash32"' --cfg 'feature="xxhash64"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("alloc", "default", "random", "serialize", "std", "xxhash32", "xxhash3_128", "xxhash3_64", "xxhash64"))' -C metadata=814949cf2b6fdd55 -C extra-filename=-62d829d9df1be20a --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --cap-lints allow`
+   Compiling foldhash v0.2.0
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name foldhash --edition=2021 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "nightly", "std"))' -C metadata=a0d9d2744663cc5b -C extra-filename=-deacc44699942f0e --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --cap-lints allow`
+   Compiling simdutf8 v0.1.5
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name simdutf8 --edition=2018 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/simdutf8-0.1.5/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --cfg 'feature="default"' --cfg 'feature="std"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("aarch64_neon", "aarch64_neon_prefetch", "default", "hints", "public_imp", "std"))' -C metadata=a000774ccc905dd8 -C extra-filename=-3dea65e684f04385 --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --cap-lints allow`
+   Compiling snap v1.1.1
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name build_script_build --edition=2018 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snap-1.1.1/build.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type bin --emit=dep-info,link -C embed-bitcode=no --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=a2ed08197436e5b1 -C extra-filename=-23f6cd0f73cf9bca --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/snap-23f6cd0f73cf9bca -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --cap-lints allow`
+   Compiling tagptr v0.2.0
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name tagptr --edition=2018 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tagptr-0.2.0/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=93635014ab6bca68 -C extra-filename=-ffb2933a90bba889 --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --cap-lints allow`
+   Compiling base64 v0.21.7
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name base64 --edition=2018 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base64-0.21.7/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --cfg 'feature="alloc"' --cfg 'feature="default"' --cfg 'feature="std"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("alloc", "default", "std"))' -C metadata=6e98540b0e7ded8e -C extra-filename=-b0bacb645f1195d6 --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --cap-lints allow`
+   Compiling unicode-xid v0.2.6
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name unicode_xid --edition=2015 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-xid-0.2.6/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --cfg 'feature="default"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("bench", "default", "no_std"))' -C metadata=a0a3abd081b59d83 -C extra-filename=-908c554825d22d19 --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --cap-lints allow`
+   Compiling derive_more-impl v2.1.1
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name derive_more_impl --edition=2021 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/derive_more-impl-2.1.1/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type proc-macro --emit=dep-info,link -C prefer-dynamic -C embed-bitcode=no --warn=unexpected_cfgs --check-cfg 'cfg(ci)' --check-cfg 'cfg(error_generic_member_access)' --check-cfg 'cfg(nightly)' --cfg 'feature="default"' --cfg 'feature="display"' --cfg 'feature="from"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("add", "add_assign", "as_ref", "constructor", "debug", "default", "deref", "deref_mut", "display", "eq", "error", "from", "from_str", "full", "index", "index_mut", "into", "into_iterator", "is_variant", "mul", "mul_assign", "not", "sum", "testing-helpers", "try_from", "try_into", "try_unwrap", "unwrap"))' -C metadata=07b9258e66046bca -C extra-filename=-35a5b3bc3813056a --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern convert_case=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libconvert_case-676b06b092b4ff4f.rlib --extern proc_macro2=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libproc_macro2-bc8e63d3fdc6c233.rlib --extern quote=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libquote-853fa6697aa57409.rlib --extern syn=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libsyn-388ae711efb148de.rlib --extern unicode_xid=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libunicode_xid-908c554825d22d19.rlib --extern proc_macro --cap-lints allow`
+   Compiling rustls-pemfile v1.0.4
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name rustls_pemfile --edition=2018 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustls-pemfile-1.0.4/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=7863f78fba0157b5 -C extra-filename=-720be551a9ba709f --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern base64=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libbase64-b0bacb645f1195d6.rmeta --cap-lints allow`
+   Compiling arrow-ord v59.0.0
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name arrow_ord --edition=2024 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-ord-59.0.0/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=859b8e1bc9c3b63d -C extra-filename=-f8379251f2404305 --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern arrow_array=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libarrow_array-bbd43e09e5f8a353.rmeta --extern arrow_buffer=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libarrow_buffer-85febca3c0b60055.rmeta --extern arrow_data=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libarrow_data-77ad011fcb25c751.rmeta --extern arrow_schema=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libarrow_schema-74342c2851bd5b65.rmeta --extern arrow_select=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libarrow_select-7047d30163190451.rmeta --cap-lints allow`
+   Compiling hickory-net v0.26.1
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name hickory_net --edition=2021 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hickory-net-0.26.1/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked '--warn=clippy::use_self' '--allow=clippy::upper_case_acronyms' --warn=unused_qualifications --warn=unused_import_braces --warn=unused_extern_crates --warn=unreachable_pub --warn=unnameable_types '--warn=clippy::unimplemented' --warn=unexpected_cfgs '--allow=clippy::single_component_path_imports' --warn=rust_2018_idioms '--warn=clippy::or_fun_call' --warn=non_upper_case_globals --warn=non_snake_case '--warn=clippy::manual_let_else' '--warn=clippy::default_trait_access' '--allow=clippy::bool_to_int_with_if' --check-cfg 'cfg(nightly)' --cfg 'feature="default"' --cfg 'feature="tokio"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("__dnssec", "__h3", "__https", "__quic", "__tls", "default", "dnssec-aws-lc-rs", "dnssec-ring", "h3-aws-lc-rs", "h3-ring", "https-aws-lc-rs", "https-ring", "mdns", "quic-aws-lc-rs", "quic-ring", "rustls-platform-verifier", "serde", "socket2", "tls-aws-lc-rs", "tls-ring", "tokio", "webpki-roots"))' -C metadata=c1fa8bc3316177c0 -C extra-filename=-50e9292bf9455290 --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern async_trait=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libasync_trait-4d24afdfaf5578bb.dylib --extern cfg_if=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libcfg_if-a63920a22c723b43.rmeta --extern data_encoding=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libdata_encoding-c1718b0718b069b5.rmeta --extern futures_channel=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libfutures_channel-ca5690ee1d99a386.rmeta --extern futures_io=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libfutures_io-dede9b639a01814e.rmeta --extern futures_util=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libfutures_util-d203774d4418243a.rmeta --extern hickory_proto=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libhickory_proto-3ab577c93b93b375.rmeta --extern idna=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libidna-f7af3a6a9ce21d07.rmeta --extern ipnet=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libipnet-3225b1034cf8def2.rmeta --extern rand=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/librand-0060a56125ccf978.rmeta --extern thiserror=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libthiserror-e47add28aeff3944.rmeta --extern tinyvec=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libtinyvec-20c330aca7e3e65d.rmeta --extern tokio=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libtokio-00eb14ef97131818.rmeta --extern tracing=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libtracing-bcec8683fef869e5.rmeta --extern url=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/liburl-754dfa2e3685f3be.rmeta --cap-lints allow`
+   Compiling arrow-cast v59.0.0
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name arrow_cast --edition=2024 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-cast-59.0.0/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("comfy-table", "force_validate", "prettyprint"))' -C metadata=411d324f86d6fdee -C extra-filename=-84a71a2387153626 --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern arrow_array=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libarrow_array-bbd43e09e5f8a353.rmeta --extern arrow_buffer=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libarrow_buffer-85febca3c0b60055.rmeta --extern arrow_data=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libarrow_data-77ad011fcb25c751.rmeta --extern arrow_ord=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libarrow_ord-f8379251f2404305.rmeta --extern arrow_schema=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libarrow_schema-74342c2851bd5b65.rmeta --extern arrow_select=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libarrow_select-7047d30163190451.rmeta --extern atoi=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libatoi-bd1e2aac5933c277.rmeta --extern base64=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libbase64-a2c323877c4533ad.rmeta --extern chrono=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libchrono-4520092902badfb3.rmeta --extern half=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libhalf-d187eb58594faf8e.rmeta --extern lexical_core=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/liblexical_core-2d2d47efd2196eab.rmeta --extern num_traits=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libnum_traits-67f8adb5ac981e83.rmeta --extern ryu=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libryu-3cb0eb828507dd57.rmeta --cap-lints allow`
+   Compiling arrow-ipc v59.0.0
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name arrow_ipc --edition=2024 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-ipc-59.0.0/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --cfg 'feature="default"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "lz4", "lz4_flex", "zstd"))' -C metadata=355bf718ef37c8c7 -C extra-filename=-eaac61b6c1de848e --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern arrow_array=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libarrow_array-bbd43e09e5f8a353.rmeta --extern arrow_buffer=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libarrow_buffer-85febca3c0b60055.rmeta --extern arrow_data=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libarrow_data-77ad011fcb25c751.rmeta --extern arrow_schema=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libarrow_schema-74342c2851bd5b65.rmeta --extern arrow_select=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libarrow_select-7047d30163190451.rmeta --extern flatbuffers=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libflatbuffers-c9eceb3ed88e8e64.rmeta --cap-lints allow`
+   Compiling flate2 v1.1.9
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name flate2 --edition=2018 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/flate2-1.1.9/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --cfg 'feature="any_c_zlib"' --cfg 'feature="any_impl"' --cfg 'feature="any_zlib"' --cfg 'feature="libz-sys"' --cfg 'feature="zlib"' --cfg 'feature="zlib-rs"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("any_c_zlib", "any_impl", "any_zlib", "cloudflare-zlib-sys", "cloudflare_zlib", "default", "document-features", "libz-ng-sys", "libz-sys", "miniz-sys", "miniz_oxide", "rust_backend", "zlib", "zlib-default", "zlib-ng", "zlib-ng-compat", "zlib-rs"))' -C metadata=006d293c74d1292a -C extra-filename=-224e76ac91997673 --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern crc32fast=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libcrc32fast-a3eb51766abb8d60.rmeta --extern libz_sys=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/liblibz_sys-1dacc9d52b383ceb.rmeta --extern zlib_rs=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libzlib_rs-533da47211eb1512.rmeta --cap-lints allow`
+   Compiling toml v0.8.23
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name toml --edition=2021 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/toml-0.8.23/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=rust_2018_idioms '--warn=clippy::zero_sized_map_values' '--warn=clippy::wildcard_imports' '--warn=clippy::verbose_file_reads' --warn=unused_qualifications --warn=unused_macro_rules --warn=unused_lifetimes --warn=unsafe_op_in_unsafe_fn --warn=unreachable_pub --allow=unnameable_types '--warn=clippy::uninlined_format_args' '--warn=clippy::trait_duplication_in_bounds' '--warn=clippy::todo' '--warn=clippy::string_to_string' '--warn=clippy::string_lit_as_bytes' '--warn=clippy::string_add_assign' '--warn=clippy::string_add' '--warn=clippy::str_to_string' '--warn=clippy::semicolon_if_nothing_returned' '--warn=clippy::self_named_module_files' '--warn=clippy::same_functions_in_if_condition' '--allow=clippy::result_large_err' '--warn=clippy::rest_pat_in_fully_bound_structs' '--warn=clippy::ref_option_ref' '--warn=clippy::redundant_feature_names' '--warn=clippy::rc_mutex' '--warn=clippy::ptr_as_ptr' '--warn=clippy::path_buf_push_overwrite' '--warn=clippy::negative_feature_names' '--warn=clippy::needless_for_each' '--allow=clippy::needless_continue' '--warn=clippy::mutex_integer' '--warn=clippy::mem_forget' '--warn=clippy::macro_use_imports' '--warn=clippy::lossy_float_literal' '--warn=clippy::linkedlist' '--allow=clippy::let_and_return' '--warn=clippy::large_types_passed_by_value' '--warn=clippy::large_stack_arrays' '--warn=clippy::large_digit_groups' '--warn=clippy::invalid_upcast_comparisons' '--warn=clippy::infinite_loop' '--warn=clippy::inefficient_to_string' '--warn=clippy::inconsistent_struct_constructor' '--warn=clippy::imprecise_flops' '--warn=clippy::implicit_clone' '--allow=clippy::if_same_then_else' '--warn=clippy::from_iter_instead_of_collect' '--warn=clippy::fn_params_excessive_bools' '--warn=clippy::float_cmp_const' '--warn=clippy::flat_map_option' '--warn=clippy::filter_map_next' '--warn=clippy::fallible_impl_from' '--warn=clippy::explicit_into_iter_loop' '--warn=clippy::explicit_deref_methods' '--warn=clippy::expl_impl_clone_on_copy' '--warn=clippy::enum_glob_use' '--warn=clippy::empty_enum' '--warn=clippy::doc_markdown' '--warn=clippy::debug_assert_with_mut_call' '--warn=clippy::dbg_macro' '--warn=clippy::create_dir' '--allow=clippy::collapsible_else_if' '--warn=clippy::checked_conversions' '--allow=clippy::branches_sharing_code' '--allow=clippy::bool_assert_comparison' --cfg 'feature="default"' --cfg 'feature="display"' --cfg 'feature="parse"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "display", "indexmap", "parse", "preserve_order", "unbounded"))' -C metadata=7bf421b8643aded8 -C extra-filename=-665fa29724414ea1 --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern serde=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libserde-fee0454088b7e585.rmeta --extern serde_spanned=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libserde_spanned-6f73ecd0709034c7.rmeta --extern toml_datetime=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libtoml_datetime-77f3920b82304a86.rmeta --extern toml_edit=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libtoml_edit-755818a0d15c4dce.rmeta --cap-lints allow`
+     Running `/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/snap-23f6cd0f73cf9bca/build-script-build`
+   Compiling moka v0.12.15
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name moka --edition=2021 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/moka-0.12.15/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(armv5te)' --check-cfg 'cfg(beta_clippy)' --check-cfg 'cfg(kani)' --check-cfg 'cfg(moka_loom)' --check-cfg 'cfg(mips)' --check-cfg 'cfg(run_flaky_tests)' --check-cfg 'cfg(skip_large_mem_tests)' --check-cfg 'cfg(trybuild)' --cfg 'feature="default"' --cfg 'feature="sync"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("atomic64", "default", "future", "logging", "quanta", "sync", "unstable-debug-counters"))' -C metadata=28b006c16fffa549 -C extra-filename=-543b0170d81d82e4 --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern crossbeam_channel=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libcrossbeam_channel-8370b77b561c1c05.rmeta --extern crossbeam_epoch=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libcrossbeam_epoch-cfe434a547e1ffc2.rmeta --extern crossbeam_utils=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libcrossbeam_utils-448407712430e560.rmeta --extern equivalent=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libequivalent-3142557ee15390fc.rmeta --extern parking_lot=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libparking_lot-7e70df789a53f33c.rmeta --extern portable_atomic=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libportable_atomic-e06ac0d880560d06.rmeta --extern smallvec=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libsmallvec-d37cfeb0b273ffb5.rmeta --extern tagptr=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libtagptr-ffb2933a90bba889.rmeta --extern uuid=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libuuid-1c59cdda64d07847.rmeta --cap-lints allow`
+   Compiling hashbrown v0.16.1
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name hashbrown --edition=2021 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hashbrown-0.16.1/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --cfg 'feature="default-hasher"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("alloc", "allocator-api2", "core", "default", "default-hasher", "equivalent", "inline-more", "nightly", "raw-entry", "rayon", "rustc-dep-of-std", "rustc-internal-api", "serde"))' -C metadata=fcf2eecbed308cfa -C extra-filename=-203d762900d6c985 --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern foldhash=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libfoldhash-deacc44699942f0e.rmeta --cap-lints allow`
+     Running `/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/ref-cast-57fdd3313a9a205d/build-script-build`
+     Running `/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/paste-9ab7e4b72c951f53/build-script-build`
+     Running `/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/thiserror-a2a75705d94d177f/build-script-build`
+     Running `/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/mysql_common-e27c19285d952471/build-script-build`
+     Running `/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/tikv-jemalloc-sys-eed40b9d08e4fab3/build-script-build`
+   Compiling csv v1.4.0
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name csv --edition=2021 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/csv-1.4.0/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=5a8d68481528e6dd -C extra-filename=-dac5d62fd25b933d --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern csv_core=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libcsv_core-d64d9b17b51b39f4.rmeta --extern itoa=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libitoa-0fdcf4600e15f669.rmeta --extern ryu=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libryu-3cb0eb828507dd57.rmeta --extern serde_core=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libserde_core-4ddc89c76799af6e.rmeta --cap-lints allow`
+   Compiling rustls v0.21.12
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name rustls --edition=2021 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustls-0.21.12/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --cfg 'feature="dangerous_configuration"' --cfg 'feature="log"' --cfg 'feature="logging"' --cfg 'feature="tls12"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("dangerous_configuration", "default", "log", "logging", "quic", "read_buf", "rustversion", "secret_extraction", "tls12"))' -C metadata=c0b9d16178f782eb -C extra-filename=-2ae6cb7b02a4c936 --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern log=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/liblog-0a71766aa2219278.rmeta --extern ring=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libring-9a2e29b1f04b6bde.rmeta --extern webpki=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libwebpki-246a404571dcbbb0.rmeta --extern sct=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libsct-f7570c47ad48a462.rmeta --cap-lints allow -L native=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/ring-4f91ebd9b9b2884e/out`
+   Compiling rustc_version_runtime v0.3.0
+     Running `/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/rustc_version_runtime-394e94f999a994d1/build-script-build`
+   Compiling crc32c v0.6.8
+     Running `/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/crc32c-1f63bc636e9ee0fd/build-script-build`
+   Compiling reqwest v0.12.28
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name reqwest --edition=2021 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/reqwest-0.12.28/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --warn=unexpected_cfgs --check-cfg 'cfg(reqwest_unstable)' --cfg 'feature="__rustls"' --cfg 'feature="__rustls-ring"' --cfg 'feature="__tls"' --cfg 'feature="blocking"' --cfg 'feature="json"' --cfg 'feature="rustls-tls"' --cfg 'feature="rustls-tls-webpki-roots"' --cfg 'feature="rustls-tls-webpki-roots-no-provider"' --cfg 'feature="stream"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("__rustls", "__rustls-ring", "__tls", "blocking", "brotli", "charset", "cookies", "default", "default-tls", "deflate", "gzip", "h2", "hickory-dns", "http2", "http3", "json", "macos-system-configuration", "multipart", "native-tls", "native-tls-alpn", "native-tls-vendored", "rustls-tls", "rustls-tls-manual-roots", "rustls-tls-manual-roots-no-provider", "rustls-tls-native-roots", "rustls-tls-native-roots-no-provider", "rustls-tls-no-provider", "rustls-tls-webpki-roots", "rustls-tls-webpki-roots-no-provider", "socks", "stream", "system-proxy", "trust-dns", "zstd"))' -C metadata=1620cfceabedfa7e -C extra-filename=-ed8467dea1f79e6f --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern base64=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libbase64-a2c323877c4533ad.rmeta --extern bytes=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libbytes-90e86e4880046216.rmeta --extern futures_channel=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libfutures_channel-ca5690ee1d99a386.rmeta --extern futures_core=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libfutures_core-1ee414d76cfc9a1f.rmeta --extern futures_util=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libfutures_util-d203774d4418243a.rmeta --extern http=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libhttp-2ceb21ca207289f3.rmeta --extern http_body=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libhttp_body-b6da0f971869800f.rmeta --extern http_body_util=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libhttp_body_util-31d33d4fc0e6e57e.rmeta --extern hyper=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libhyper-406b2f414058cc2a.rmeta --extern hyper_rustls=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libhyper_rustls-56e1f7a7917cd549.rmeta --extern hyper_util=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libhyper_util-bb941d833b52538f.rmeta --extern log=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/liblog-0a71766aa2219278.rmeta --extern percent_encoding=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libpercent_encoding-4b5f734338ed5dd8.rmeta --extern pin_project_lite=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libpin_project_lite-be6884d87439ebf7.rmeta --extern rustls=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/librustls-a33c505696e7e6ae.rmeta --extern rustls_pki_types=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/librustls_pki_types-0814fecbb6ce23e2.rmeta --extern serde=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libserde-fee0454088b7e585.rmeta --extern serde_json=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libserde_json-dcf6a5f9876f1d6f.rmeta --extern serde_urlencoded=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libserde_urlencoded-603635e6dd0f07e3.rmeta --extern sync_wrapper=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libsync_wrapper-eda1751ddce3705e.rmeta --extern tokio=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libtokio-00eb14ef97131818.rmeta --extern tokio_rustls=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libtokio_rustls-13f76c0747e39067.rmeta --extern tokio_util=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libtokio_util-7a32a3d84ef2b31b.rmeta --extern tower=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libtower-1e130fc5fdc41892.rmeta --extern tower_http=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libtower_http-8fb085362096c517.rmeta --extern tower_service=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libtower_service-448b9c3a7d7e07ca.rmeta --extern url=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/liburl-754dfa2e3685f3be.rmeta --extern webpki_roots=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libwebpki_roots-8b4e5a25f54f5873.rmeta --cap-lints allow -L native=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/ring-4f91ebd9b9b2884e/out`
+   Compiling libsqlite3-sys v0.37.0
+     Running `/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/libsqlite3-sys-06e4405d5e9f4050/build-script-build`
+   Compiling rsa v0.9.10
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name rsa --edition=2021 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rsa-0.9.10/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --cfg 'feature="default"' --cfg 'feature="pem"' --cfg 'feature="pkcs5"' --cfg 'feature="sha2"' --cfg 'feature="std"' --cfg 'feature="u64_digit"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "getrandom", "hazmat", "nightly", "pem", "pkcs5", "serde", "sha1", "sha2", "std", "u64_digit"))' -C metadata=6611c439b4371479 -C extra-filename=-b86c5262c87d530d --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern const_oid=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libconst_oid-81864d95bf0116f5.rmeta --extern digest=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libdigest-adf3d00edff2c9b6.rmeta --extern num_bigint=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libnum_bigint_dig-4df5ea2300ba8d72.rmeta --extern num_integer=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libnum_integer-552d1f9206f801c1.rmeta --extern num_traits=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libnum_traits-67f8adb5ac981e83.rmeta --extern pkcs1=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libpkcs1-962f167eb3d1d26f.rmeta --extern pkcs8=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libpkcs8-88e4be7cfaba2205.rmeta --extern rand_core=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/librand_core-477a55de42448d82.rmeta --extern sha2=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libsha2-39f69e0bd95e3d8e.rmeta --extern signature=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libsignature-542aac51e44b2279.rmeta --extern spki=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libspki-5610a4ecfb039cd2.rmeta --extern subtle=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libsubtle-a47ce9cb90366555.rmeta --extern zeroize=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libzeroize-871b0770fea1a572.rmeta --cap-lints allow`
+   Compiling jsonwebtoken v9.3.1
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name jsonwebtoken --edition=2021 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/jsonwebtoken-9.3.1/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --cfg 'feature="default"' --cfg 'feature="pem"' --cfg 'feature="simple_asn1"' --cfg 'feature="use_pem"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "pem", "simple_asn1", "use_pem"))' -C metadata=5e1f8a8a9bb7b70a -C extra-filename=-484147539bab5eae --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern base64=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libbase64-a2c323877c4533ad.rmeta --extern pem=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libpem-e9002d6926d16371.rmeta --extern ring=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libring-9a2e29b1f04b6bde.rmeta --extern serde=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libserde-fee0454088b7e585.rmeta --extern serde_json=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libserde_json-dcf6a5f9876f1d6f.rmeta --extern simple_asn1=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libsimple_asn1-b909dbc05e65dc66.rmeta --cap-lints allow -L native=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/ring-4f91ebd9b9b2884e/out`
+   Compiling tokio-postgres v0.7.18
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name tokio_postgres --edition=2024 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-postgres-0.7.18/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --cfg 'feature="default"' --cfg 'feature="runtime"' --cfg 'feature="with-chrono-0_4"' --cfg 'feature="with-serde_json-1"' --cfg 'feature="with-uuid-0_8"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("array-impls", "default", "js", "runtime", "with-bit-vec-0_6", "with-bit-vec-0_7", "with-bit-vec-0_8", "with-bit-vec-0_9", "with-chrono-0_4", "with-cidr-0_2", "with-cidr-0_3", "with-eui48-0_4", "with-eui48-1", "with-geo-types-0_6", "with-geo-types-0_7", "with-jiff-0_1", "with-jiff-0_2", "with-serde_json-1", "with-smol_str-01", "with-time-0_2", "with-time-0_3", "with-uuid-0_8", "with-uuid-1"))' -C metadata=563e5c917d0c6803 -C extra-filename=-15db27fd60da7193 --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern async_trait=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libasync_trait-4d24afdfaf5578bb.dylib --extern byteorder=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libbyteorder-f3dfc189390b5ea1.rmeta --extern bytes=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libbytes-90e86e4880046216.rmeta --extern fallible_iterator=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libfallible_iterator-5fed51adf3ca7cd2.rmeta --extern futures_channel=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libfutures_channel-ca5690ee1d99a386.rmeta --extern futures_util=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libfutures_util-d203774d4418243a.rmeta --extern log=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/liblog-0a71766aa2219278.rmeta --extern parking_lot=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libparking_lot-7e70df789a53f33c.rmeta --extern percent_encoding=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libpercent_encoding-4b5f734338ed5dd8.rmeta --extern phf=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libphf-139379a00582eb2d.rmeta --extern pin_project_lite=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libpin_project_lite-be6884d87439ebf7.rmeta --extern postgres_protocol=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libpostgres_protocol-f5ea2bdae0aebed8.rmeta --extern postgres_types=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libpostgres_types-8f9300a3c63e18eb.rmeta --extern rand=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/librand-0060a56125ccf978.rmeta --extern socket2=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libsocket2-379f808fcbe07462.rmeta --extern tokio=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libtokio-00eb14ef97131818.rmeta --extern tokio_util=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libtokio_util-7a32a3d84ef2b31b.rmeta --extern whoami=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libwhoami-eb6461b42c2807fe.rmeta --cap-lints allow`
+   Compiling system-configuration v0.7.0
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name system_configuration --edition=2021 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/system-configuration-0.7.0/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=80206473fad963e0 -C extra-filename=-5a8a8635e437824a --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern bitflags=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libbitflags-e689042721705856.rmeta --extern core_foundation=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libcore_foundation-ea29e3bac5ab81c8.rmeta --extern system_configuration_sys=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libsystem_configuration_sys-88eb1075c8336221.rmeta --cap-lints allow`
+   Compiling serde_with_macros v3.21.0
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name serde_with_macros --edition=2021 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde_with_macros-3.21.0/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type proc-macro --emit=dep-info,link -C prefer-dynamic -C embed-bitcode=no --warn=rust_2018_idioms --warn=variant_size_differences --warn=unused_qualifications --warn=unused_import_braces --warn=unused_extern_crates --warn=unexpected_cfgs --warn=trivial_numeric_casts --warn=trivial_casts '--warn=clippy::semicolon_if_nothing_returned' '--warn=clippy::redundant_closure_for_method_calls' --warn=missing_docs '--warn=rustdoc::missing_crate_level_docs' '--allow=clippy::manual-unwrap-or-default' '--allow=clippy::explicit_auto_deref' '--warn=clippy::doc_markdown' '--warn=clippy::disallowed_methods' '--warn=clippy::default_trait_access' '--warn=clippy::cloned_instead_of_copied' --check-cfg 'cfg(tarpaulin)' --check-cfg 'cfg(tarpaulin_include)' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("schemars_0_8", "schemars_0_9", "schemars_1"))' -C metadata=732b65065d3e8fea -C extra-filename=-0389e23672af9e35 --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern darling=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libdarling-6c0c764fe6671588.rlib --extern proc_macro2=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libproc_macro2-bc8e63d3fdc6c233.rlib --extern quote=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libquote-853fa6697aa57409.rlib --extern syn=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libsyn-388ae711efb148de.rlib --extern proc_macro --cap-lints allow`
+   Compiling brotli-decompressor v5.0.1
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name brotli_decompressor --edition=2015 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/brotli-decompressor-5.0.1/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --cfg 'feature="alloc-stdlib"' --cfg 'feature="std"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("alloc-stdlib", "benchmark", "default", "disable-timer", "ffi-api", "pass-through-ffi-panics", "seccomp", "std", "unsafe"))' -C metadata=3d0fc98931ed1c6a -C extra-filename=-d3904fbee9af6326 --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern alloc_no_stdlib=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/liballoc_no_stdlib-5b1055d4e7313ecd.rmeta --extern alloc_stdlib=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/liballoc_stdlib-8e6d275341c02de0.rmeta --cap-lints allow`
+   Compiling anyhow v1.0.103
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name anyhow --edition=2021 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anyhow-1.0.103/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --cfg 'feature="default"' --cfg 'feature="std"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("backtrace", "default", "std"))' -C metadata=123d1de14edee39a -C extra-filename=-6222100110158231 --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --cap-lints allow --check-cfg 'cfg(anyhow_build_probe)' --check-cfg 'cfg(anyhow_nightly_testing)' --check-cfg 'cfg(anyhow_no_clippy_format_args)' --check-cfg 'cfg(anyhow_no_core_error)' --check-cfg 'cfg(error_generic_member_access)'`
+   Compiling rust-ini v0.21.3
+     Running `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name ini --edition=2018 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rust-ini-0.21.3/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --cfg 'feature="default"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("brackets-in-section-names", "case-insensitive", "default", "inline-comment", "unicase"))' -C metadata=28d91c6ca3a19023 -C extra-filename=-1e73ce655857946c --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern cfg_if=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libcfg_if-a63920a22c723b43.rmeta --extern ordered_multimap=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libordered_multimap-efdb1253f5b095d5.rmeta --cap-lints allow`
+error: failed to build archive at `/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libarrow_cast-84a71a2387153626.rlib`: No space left on device (os error 28)
+
+error: could not compile `arrow-cast` (lib) due to 1 previous error
+
+Caused by:
+  process didn't exit successfully: `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name arrow_cast --edition=2024 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/arrow-cast-59.0.0/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("comfy-table", "force_validate", "prettyprint"))' -C metadata=411d324f86d6fdee -C extra-filename=-84a71a2387153626 --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern arrow_array=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libarrow_array-bbd43e09e5f8a353.rmeta --extern arrow_buffer=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libarrow_buffer-85febca3c0b60055.rmeta --extern arrow_data=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libarrow_data-77ad011fcb25c751.rmeta --extern arrow_ord=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libarrow_ord-f8379251f2404305.rmeta --extern arrow_schema=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libarrow_schema-74342c2851bd5b65.rmeta --extern arrow_select=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libarrow_select-7047d30163190451.rmeta --extern atoi=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libatoi-bd1e2aac5933c277.rmeta --extern base64=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libbase64-a2c323877c4533ad.rmeta --extern chrono=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libchrono-4520092902badfb3.rmeta --extern half=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libhalf-d187eb58594faf8e.rmeta --extern lexical_core=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/liblexical_core-2d2d47efd2196eab.rmeta --extern num_traits=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libnum_traits-67f8adb5ac981e83.rmeta --extern ryu=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libryu-3cb0eb828507dd57.rmeta --cap-lints allow` (exit status: 1)
+warning: build failed, waiting for other jobs to finish...
+error: linking with `cc` failed: exit status: 1
+  |
+  = note:  "cc" "-Wl,-exported_symbols_list" "-Wl,/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/rustcIyrqFD/list" "/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/rustcIyrqFD/symbols.o" "<10 object files omitted>" "/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/rustcIyrqFD/rmeta.o" "<1 object files omitted>" "/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/{libdarling-6c0c764fe6671588,libdarling_core-ca062905c930ed00,libstrsim-9c7bfa5b34a86833,libident_case-2792dc43b48cb3ca,libsyn-388ae711efb148de,libquote-853fa6697aa57409,libproc_macro2-bc8e63d3fdc6c233,libunicode_ident-a19fae25a22ef471}.rlib" "<sysroot>/lib/rustlib/aarch64-apple-darwin/lib/{libproc_macro-*,librustc_literal_escaper-*,libstd-*,libpanic_unwind-*,libobject-*,libmemchr-*,libaddr2line-*,libgimli-*,libcfg_if-*,librustc_demangle-*,libstd_detect-*,libhashbrown-*,librustc_std_workspace_alloc-*,libminiz_oxide-*,libadler2-*,libunwind-*,liblibc-*,librustc_std_workspace_core-*,liballoc-*,libcore-*,libcompiler_builtins-*}.rlib" "-lSystem" "-lc" "-lm" "-arch" "arm64" "-mmacosx-version-min=11.0.0" "-o" "/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libserde_with_macros-0389e23672af9e35.dylib" "-Wl,-dead_strip" "-dynamiclib" "-nodefaultlibs"
+  = note: some arguments are omitted. use `--verbose` to show all linker arguments
+  = note: ld: write() failed, errno=28
+          clang: error: linker command failed with exit code 1 (use -v to see invocation)
+          
+
+error: could not compile `serde_with_macros` (lib) due to 1 previous error
+
+Caused by:
+  process didn't exit successfully: `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name serde_with_macros --edition=2021 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde_with_macros-3.21.0/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type proc-macro --emit=dep-info,link -C prefer-dynamic -C embed-bitcode=no --warn=rust_2018_idioms --warn=variant_size_differences --warn=unused_qualifications --warn=unused_import_braces --warn=unused_extern_crates --warn=unexpected_cfgs --warn=trivial_numeric_casts --warn=trivial_casts '--warn=clippy::semicolon_if_nothing_returned' '--warn=clippy::redundant_closure_for_method_calls' --warn=missing_docs '--warn=rustdoc::missing_crate_level_docs' '--allow=clippy::manual-unwrap-or-default' '--allow=clippy::explicit_auto_deref' '--warn=clippy::doc_markdown' '--warn=clippy::disallowed_methods' '--warn=clippy::default_trait_access' '--warn=clippy::cloned_instead_of_copied' --check-cfg 'cfg(tarpaulin)' --check-cfg 'cfg(tarpaulin_include)' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("schemars_0_8", "schemars_0_9", "schemars_1"))' -C metadata=732b65065d3e8fea -C extra-filename=-0389e23672af9e35 --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern darling=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libdarling-6c0c764fe6671588.rlib --extern proc_macro2=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libproc_macro2-bc8e63d3fdc6c233.rlib --extern quote=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libquote-853fa6697aa57409.rlib --extern syn=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libsyn-388ae711efb148de.rlib --extern proc_macro --cap-lints allow` (exit status: 1)
+error: failed to write /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/rustczKBqV8/lib.rmeta: No space left on device (os error 28)
+
+error: could not compile `brotli-decompressor` (lib) due to 1 previous error
+
+Caused by:
+  process didn't exit successfully: `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name brotli_decompressor --edition=2015 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/brotli-decompressor-5.0.1/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --cfg 'feature="alloc-stdlib"' --cfg 'feature="std"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("alloc-stdlib", "benchmark", "default", "disable-timer", "ffi-api", "pass-through-ffi-panics", "seccomp", "std", "unsafe"))' -C metadata=3d0fc98931ed1c6a -C extra-filename=-d3904fbee9af6326 --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern alloc_no_stdlib=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/liballoc_no_stdlib-5b1055d4e7313ecd.rmeta --extern alloc_stdlib=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/liballoc_stdlib-8e6d275341c02de0.rmeta --cap-lints allow` (exit status: 1)
+rustc-LLVM ERROR: IO failure on output stream: No space left on device
+error: could not compile `tokio-postgres` (lib)
+
+Caused by:
+  process didn't exit successfully: `/Users/andriipanchenko/.rustup/toolchains/1.94-aarch64-apple-darwin/bin/rustc --crate-name tokio_postgres --edition=2024 /Users/andriipanchenko/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-postgres-0.7.18/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --cfg 'feature="default"' --cfg 'feature="runtime"' --cfg 'feature="with-chrono-0_4"' --cfg 'feature="with-serde_json-1"' --cfg 'feature="with-uuid-0_8"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("array-impls", "default", "js", "runtime", "with-bit-vec-0_6", "with-bit-vec-0_7", "with-bit-vec-0_8", "with-bit-vec-0_9", "with-chrono-0_4", "with-cidr-0_2", "with-cidr-0_3", "with-eui48-0_4", "with-eui48-1", "with-geo-types-0_6", "with-geo-types-0_7", "with-jiff-0_1", "with-jiff-0_2", "with-serde_json-1", "with-smol_str-01", "with-time-0_2", "with-time-0_3", "with-uuid-0_8", "with-uuid-1"))' -C metadata=563e5c917d0c6803 -C extra-filename=-15db27fd60da7193 --out-dir /private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps -L dependency=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps --extern async_trait=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libasync_trait-4d24afdfaf5578bb.dylib --extern byteorder=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libbyteorder-f3dfc189390b5ea1.rmeta --extern bytes=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libbytes-90e86e4880046216.rmeta --extern fallible_iterator=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libfallible_iterator-5fed51adf3ca7cd2.rmeta --extern futures_channel=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libfutures_channel-ca5690ee1d99a386.rmeta --extern futures_util=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libfutures_util-d203774d4418243a.rmeta --extern log=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/liblog-0a71766aa2219278.rmeta --extern parking_lot=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libparking_lot-7e70df789a53f33c.rmeta --extern percent_encoding=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libpercent_encoding-4b5f734338ed5dd8.rmeta --extern phf=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libphf-139379a00582eb2d.rmeta --extern pin_project_lite=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libpin_project_lite-be6884d87439ebf7.rmeta --extern postgres_protocol=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libpostgres_protocol-f5ea2bdae0aebed8.rmeta --extern postgres_types=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libpostgres_types-8f9300a3c63e18eb.rmeta --extern rand=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/librand-0060a56125ccf978.rmeta --extern socket2=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libsocket2-379f808fcbe07462.rmeta --extern tokio=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libtokio-00eb14ef97131818.rmeta --extern tokio_util=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libtokio_util-7a32a3d84ef2b31b.rmeta --extern whoami=/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/deps/libwhoami-eb6461b42c2807fe.rmeta --cap-lints allow` (exit status: 101)
+warning: zstd-sys@2.0.16+zstd.1.5.7: fatal error: /Library/Developer/CommandLineTools/usr/bin/ranlib: can't write to output file (No space left on device)
+warning: zstd-sys@2.0.16+zstd.1.5.7: /Library/Developer/CommandLineTools/usr/bin/ar: internal ranlib command failed
+error: failed to run custom build command for `zstd-sys v2.0.16+zstd.1.5.7`
+
+Caused by:
+  process didn't exit successfully: `/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/zstd-sys-dad49165cb1bb3be/build-script-build` (exit status: 1)
+  --- stdout
+  cargo:rerun-if-env-changed=ZSTD_SYS_USE_PKG_CONFIG
+  cargo:rerun-if-env-changed=CC_FORCE_DISABLE
+  CC_FORCE_DISABLE = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CC_ENABLE_DEBUG_OUTPUT
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET
+  MACOSX_DEPLOYMENT_TARGET = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_ENABLE_DEBUG_OUTPUT
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET
+  MACOSX_DEPLOYMENT_TARGET = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_ENABLE_DEBUG_OUTPUT
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET
+  MACOSX_DEPLOYMENT_TARGET = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_ENABLE_DEBUG_OUTPUT
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET
+  MACOSX_DEPLOYMENT_TARGET = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  exit status: 0
+  exit status: 0
+  exit status: 0
+  exit status: 0
+  exit status: 0
+  exit status: 0
+  exit status: 0
+  exit status: 0
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  exit status: 0
+  exit status: 0
+  exit status: 0
+  exit status: 0
+  exit status: 0
+  exit status: 0
+  exit status: 0
+  exit status: 0
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  exit status: 0
+  exit status: 0
+  exit status: 0
+  exit status: 0
+  exit status: 0
+  exit status: 0
+  exit status: 0
+  exit status: 0
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  exit status: 0
+  exit status: 0
+  exit status: 0
+  exit status: 0
+  exit status: 0
+  exit status: 0
+  exit status: 0
+  exit status: 0
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  exit status: 0
+  exit status: 0
+  exit status: 0
+  exit status: 0
+  exit status: 0
+  cargo:rerun-if-env-changed=AR_aarch64-apple-darwin
+  AR_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=AR_aarch64_apple_darwin
+  AR_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_AR
+  HOST_AR = None
+  cargo:rerun-if-env-changed=AR
+  AR = None
+  cargo:rerun-if-env-changed=ARFLAGS
+  ARFLAGS = None
+  cargo:rerun-if-env-changed=HOST_ARFLAGS
+  HOST_ARFLAGS = None
+  cargo:rerun-if-env-changed=ARFLAGS_aarch64_apple_darwin
+  ARFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=ARFLAGS_aarch64-apple-darwin
+  ARFLAGS_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=AR_aarch64-apple-darwin
+  AR_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=AR_aarch64_apple_darwin
+  AR_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_AR
+  HOST_AR = None
+  cargo:rerun-if-env-changed=AR
+  AR = None
+  cargo:rerun-if-env-changed=ARFLAGS
+  ARFLAGS = None
+  cargo:rerun-if-env-changed=HOST_ARFLAGS
+  HOST_ARFLAGS = None
+  cargo:rerun-if-env-changed=ARFLAGS_aarch64_apple_darwin
+  ARFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=ARFLAGS_aarch64-apple-darwin
+  ARFLAGS_aarch64-apple-darwin = None
+  cargo:warning=fatal error: /Library/Developer/CommandLineTools/usr/bin/ranlib: can't write to output file (No space left on device)
+  cargo:warning=/Library/Developer/CommandLineTools/usr/bin/ar: internal ranlib command failed
+
+  --- stderr
+
+
+  error occurred in cc-rs: command did not execute successfully (status code exit status: 1): ZERO_AR_DATE="1" "ar" "cq" "/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/zstd-sys-82db388029ac2051/out/libzstd.a" "/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/zstd-sys-82db388029ac2051/out/44ff4c55aa9e5133-debug.o" "/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/zstd-sys-82db388029ac2051/out/44ff4c55aa9e5133-entropy_common.o" "/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/zstd-sys-82db388029ac2051/out/44ff4c55aa9e5133-error_private.o" "/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/zstd-sys-82db388029ac2051/out/44ff4c55aa9e5133-fse_decompress.o" "/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/zstd-sys-82db388029ac2051/out/44ff4c55aa9e5133-pool.o" "/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/zstd-sys-82db388029ac2051/out/44ff4c55aa9e5133-threading.o" "/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/zstd-sys-82db388029ac2051/out/44ff4c55aa9e5133-zstd_common.o" "/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/zstd-sys-82db388029ac2051/out/fb80479a5fb81f6a-fse_compress.o" "/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/zstd-sys-82db388029ac2051/out/fb80479a5fb81f6a-hist.o" "/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/zstd-sys-82db388029ac2051/out/fb80479a5fb81f6a-huf_compress.o" "/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/zstd-sys-82db388029ac2051/out/fb80479a5fb81f6a-zstd_compress.o" "/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/zstd-sys-82db388029ac2051/out/fb80479a5fb81f6a-zstd_compress_literals.o" "/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/zstd-sys-82db388029ac2051/out/fb80479a5fb81f6a-zstd_compress_sequences.o" "/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/zstd-sys-82db388029ac2051/out/fb80479a5fb81f6a-zstd_compress_superblock.o" "/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/zstd-sys-82db388029ac2051/out/fb80479a5fb81f6a-zstd_double_fast.o" "/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/zstd-sys-82db388029ac2051/out/fb80479a5fb81f6a-zstd_fast.o" "/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/zstd-sys-82db388029ac2051/out/fb80479a5fb81f6a-zstd_lazy.o" "/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/zstd-sys-82db388029ac2051/out/fb80479a5fb81f6a-zstd_ldm.o" "/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/zstd-sys-82db388029ac2051/out/fb80479a5fb81f6a-zstd_opt.o" "/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/zstd-sys-82db388029ac2051/out/fb80479a5fb81f6a-zstd_preSplit.o" "/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/zstd-sys-82db388029ac2051/out/fb80479a5fb81f6a-zstdmt_compress.o" "/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/zstd-sys-82db388029ac2051/out/88f362f13b0528ed-huf_decompress.o" "/private/var/folders/75/65wdhmn561n65s2z7q8j7vgr0000gn/T/cargo-mutants-rivet-HFr0j4.tmp/target/debug/build/zstd-sys-82db388029ac2051/out/88f362f13b0528ed-zstd_ddict.o"
+
+
+error: failed to run custom build command for `tikv-jemalloc-sys v0.7.1+5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8`
+
+Caused by:
+
+*** result: Failure(101)
