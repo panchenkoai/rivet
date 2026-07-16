@@ -299,6 +299,15 @@ fn sanitize_tag(s: &str) -> String {
         .collect()
 }
 
+/// Strip either GCS URI scheme — `gcs://` (Snowflake's stage scheme) or `gs://`
+/// (what the load driver hands us) — so a stage URL and a driver-selected URI
+/// compare on bucket/key alone, not scheme. Without this the two never matched.
+fn strip_gcs_scheme(s: &str) -> &str {
+    s.strip_prefix("gcs://")
+        .or_else(|| s.strip_prefix("gs://"))
+        .unwrap_or(s)
+}
+
 /// Build the COPY `FILES=('a.parquet', 'b/c.parquet', …)` clause from the
 /// driver-selected `uris`, each made relative to the stage URL (`gcs_url`). This
 /// is what makes Snowflake honor the mode-aware/ledger per-run selection instead
@@ -317,11 +326,20 @@ fn copy_files_clause(gcs_url: &str, uris: &[String]) -> Result<String> {
             uris.len()
         );
     }
-    let base = gcs_url.trim_end_matches('/');
+    // Scheme-blind: the stage URL is `gcs://` (Snowflake's scheme) but the driver
+    // hands `gs://` uris. Strip both before matching so FILES entries come out
+    // stage-RELATIVE — else strip_prefix never matches, the FULL uri leaks into
+    // FILES=(), and Snowflake resolves it relative to the stage → a doubled
+    // `gcs://…/gs://…` path (the live-caught "file not found" bug).
+    let base = strip_gcs_scheme(gcs_url).trim_end_matches('/');
     let files = uris
         .iter()
         .map(|u| {
-            let rel = u.strip_prefix(base).unwrap_or(u).trim_start_matches('/');
+            let stripped = strip_gcs_scheme(u);
+            let rel = stripped
+                .strip_prefix(base)
+                .unwrap_or(stripped)
+                .trim_start_matches('/');
             format!("'{rel}'")
         })
         .collect::<Vec<_>>()
@@ -369,11 +387,14 @@ mod tests {
 
     #[test]
     fn copy_files_clause_lists_the_selected_files_relative_to_the_stage() {
-        // The COPY must name exactly the driver-selected files (not a whole-prefix
-        // PATTERN), each relative to the stage URL — so Snowflake honors the
-        // mode-aware/ledger per-run selection.
+        // PRODUCTION REALITY: the stage URL is `gcs://` (Snowflake's scheme) while
+        // the driver hands `gs://` uris. FILES must still come out stage-RELATIVE
+        // across the scheme gap — a scheme-blind strip_prefix leaks the FULL uri,
+        // which Snowflake resolves relative to the stage → a doubled
+        // `gcs://…/gs://…` path ("file not found", caught live). This test now
+        // mixes the schemes so it reproduces that bug.
         let clause = copy_files_clause(
-            "gs://bucket/exports/orders/",
+            "gcs://bucket/exports/orders/",
             &[
                 "gs://bucket/exports/orders/part-0.parquet".to_string(),
                 "gs://bucket/exports/orders/snapshot/part-1.parquet".to_string(),
@@ -382,21 +403,25 @@ mod tests {
         .unwrap();
         assert_eq!(
             clause, "FILES=('part-0.parquet', 'snapshot/part-1.parquet')",
-            "each uri stripped to a stage-relative path; no PATTERN"
+            "each uri stripped to a stage-relative path across schemes; no PATTERN"
         );
         assert!(!clause.contains("PATTERN"));
-        // A stage URL without a trailing slash still strips cleanly.
+        assert!(
+            !clause.contains("gs://") && !clause.contains("gcs://"),
+            "no absolute URI may leak into FILES=() — that doubles the stage prefix"
+        );
+        // A `gcs://` stage URL without a trailing slash still strips a `gs://` uri.
         assert_eq!(
-            copy_files_clause("gs://b/p", &["gs://b/p/f.parquet".to_string()]).unwrap(),
+            copy_files_clause("gcs://b/p", &["gs://b/p/f.parquet".to_string()]).unwrap(),
             "FILES=('f.parquet')"
         );
         // Empty selection and the 1000-file cap both bail (never a silent
         // whole-prefix fallback).
-        assert!(copy_files_clause("gs://b/p/", &[]).is_err());
+        assert!(copy_files_clause("gcs://b/p/", &[]).is_err());
         let many: Vec<String> = (0..1001)
             .map(|i| format!("gs://b/p/f{i}.parquet"))
             .collect();
-        assert!(copy_files_clause("gs://b/p/", &many).is_err());
+        assert!(copy_files_clause("gcs://b/p/", &many).is_err());
     }
 
     #[test]

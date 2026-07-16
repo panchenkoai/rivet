@@ -196,6 +196,26 @@ fn smoke_batch_pg_snowflake() {
     );
 }
 
+// ── MySQL parity: the same full/batch pipeline into Snowflake (COPY FILES) ─────
+// Mirrors smoke_batch_pg_snowflake with a MySQL source (engine-prefixed table
+// `mysql_content_items`, so no collision with the PG cell). Validates the COPY
+// FILES materialize path + type fidelity for a MySQL-sourced snapshot.
+#[test]
+#[ignore = "live smoke: mysql batch → Snowflake"]
+fn smoke_batch_mysql_snowflake() {
+    let v = Verification::new(Engine::Mysql, Mode::Batch, Fixture::smoke("content_items"))
+        .warehouse(Warehouse::Snowflake);
+    assert_all_pass(
+        v.run(&[
+            WarehouseOracle::RowCount,
+            WarehouseOracle::DistinctId,
+            WarehouseOracle::NullProfile,
+            WarehouseOracle::TypeFidelity,
+        ])
+        .expect("pipeline"),
+    );
+}
+
 // ── Mongo CDC: soft-delete tombstone in the current-state view ────────────────
 #[test]
 #[ignore = "live: needs the mongo replica-set devbox (rivet-mongo-rs-1) + Snowflake"]
