@@ -168,3 +168,92 @@ fn pg_chunk_checkpoint_claim_complete() {
     // Cleanup
     s.reset_chunk_checkpoint("pg_orders").unwrap();
 }
+
+// ── v13/v14 load layer: the ledger + snapshot-completion on the Postgres arm ──
+// These exercise the `StateConn::Postgres` branches of load_journal_store (v13)
+// and cdc_snapshot_store (v14) — arms that the SQLite unit tests never run.
+
+#[test]
+#[ignore]
+fn pg_load_ledger_round_trip() {
+    use rivet::state::LoadRecord;
+    let Some(s) = pg_store() else { return };
+    let target = format!("pg.d.load_ledger_{}", chrono::Utc::now().timestamp_micros());
+    let rec = LoadRecord {
+        load_id: format!("Lpg_{}", chrono::Utc::now().timestamp_micros()),
+        export_name: "pg_orders".into(),
+        target_table: target.clone(),
+        warehouse: "bigquery".into(),
+        mode: "cdc".into(),
+        source_run_ids: vec!["r1".into(), "r2".into()],
+        rows_loaded: 100,
+        status: "success".into(),
+        finished_at: "2026-01-01T00:00:00Z".into(),
+    };
+    s.store_load(&rec).unwrap();
+
+    let loaded = s.loaded_source_run_ids(&target).unwrap();
+    assert!(
+        loaded.contains("r1") && loaded.contains("r2"),
+        "a successful load marks its runs loaded on Postgres"
+    );
+    let loads = s.recent_loads(Some(&target), 10).unwrap();
+    assert_eq!(loads.len(), 1);
+    assert_eq!(loads[0].rows_loaded, 100);
+    assert_eq!(loads[0].source_run_ids, vec!["r1", "r2"]);
+
+    // ON CONFLICT DO UPDATE — a replayed load never double-inserts.
+    s.store_load(&rec).unwrap();
+    assert_eq!(s.recent_loads(Some(&target), 10).unwrap().len(), 1);
+    assert_eq!(s.loaded_source_run_ids(&target).unwrap().len(), 2);
+}
+
+#[test]
+#[ignore]
+fn pg_failed_load_leaves_runs_retryable() {
+    use rivet::state::LoadRecord;
+    let Some(s) = pg_store() else { return };
+    let target = format!("pg.d.retry_{}", chrono::Utc::now().timestamp_micros());
+    let rec = |id: &str, status: &str, rows: i64| LoadRecord {
+        load_id: id.into(),
+        export_name: "pg_orders".into(),
+        target_table: target.clone(),
+        warehouse: "bigquery".into(),
+        mode: "cdc".into(),
+        source_run_ids: vec!["rA".into(), "rB".into()],
+        rows_loaded: rows,
+        status: status.into(),
+        finished_at: "2026-01-01T00:00:00Z".into(),
+    };
+    // A FAILED load records its audit row but marks NO runs loaded (the
+    // data-loss guard) — verified here on the Postgres arm specifically.
+    s.store_load(&rec("Lfail", "failed", 0)).unwrap();
+    assert!(
+        s.loaded_source_run_ids(&target).unwrap().is_empty(),
+        "a failed load must leave its runs retryable on Postgres"
+    );
+    // A later SUCCESS over the same runs marks them (the retry landed).
+    s.store_load(&rec("Lok", "success", 50)).unwrap();
+    let loaded = s.loaded_source_run_ids(&target).unwrap();
+    assert!(loaded.contains("rA") && loaded.contains("rB"));
+}
+
+#[test]
+#[ignore]
+fn pg_cdc_snapshot_completion_round_trip() {
+    let Some(s) = pg_store() else { return };
+    let export = format!("pg_snap_{}", chrono::Utc::now().timestamp_micros());
+    assert!(
+        !s.snapshot_done(&export, "t1").unwrap(),
+        "not done before mark"
+    );
+    s.mark_snapshot_done(&export, "t1", "run_pg_1").unwrap();
+    assert!(s.snapshot_done(&export, "t1").unwrap(), "done after mark");
+    assert!(
+        !s.snapshot_done(&export, "t2").unwrap(),
+        "a different table is still not done"
+    );
+    // Idempotent upsert on (export, table).
+    s.mark_snapshot_done(&export, "t1", "run_pg_2").unwrap();
+    assert!(s.snapshot_done(&export, "t1").unwrap());
+}
