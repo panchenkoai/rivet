@@ -862,13 +862,15 @@ struct LoadInputs {
 }
 
 /// Reconcile the manifests under a load's prefix into its [`LoadInputs`],
-/// filtered by the ledger when stateful.
+/// mode-aware and ledger-filtered.
 ///
-/// - Stateless (`state == None`): today's exact behaviour — reconcile every
-///   manifest, blanket-list the prefix.
-/// - Stateful: drop manifests whose `run_id` is already in the ledger for this
-///   target; `Ok(None)` when none remain (nothing new), else reconcile the new
-///   set and select only its parts (blanket fallback).
+/// The mode→run selection ([`load::reconcile::select_runs`]) runs on BOTH the
+/// stateful and stateless paths — they differ ONLY in whether `loaded` is the
+/// ledger's set or empty. So Full always OVERWRITEs with the LATEST run (a
+/// stateless Full never blanket-loads every accumulated snapshot = the
+/// duplicate-rows bug), and Incremental/Cdc append the not-yet-loaded runs
+/// (all of them when stateless — absorbed by the dedup view). `Ok(None)` = an
+/// empty selection (nothing new / empty staging → the caller no-ops).
 fn prepare_load(
     store: &crate::destination::gcs::GcsStore,
     plan: &load::plan::LoadPlan,
@@ -876,46 +878,26 @@ fn prepare_load(
     target_fqtn: &str,
     allow_source_drift: bool,
 ) -> Result<Option<LoadInputs>> {
-    match state {
-        None => {
-            let manifests = load::reconcile::fetch_manifests(store, &plan.gcs_prefix)?;
-            let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
-            let uris = load::plan::list_gcs_uris(store, &plan.gcs_prefix)?;
-            Ok(Some(LoadInputs {
-                integrity,
-                uris,
-                source_run_ids: Vec::new(),
-            }))
-        }
-        Some(s) => {
-            let keyed = load::reconcile::fetch_manifests_keyed(store, &plan.gcs_prefix)?;
-            let loaded = s.loaded_source_run_ids(target_fqtn).unwrap_or_default();
-            let new: Vec<_> = match plan.mode {
-                // Full is a complete snapshot — OVERWRITE with the LATEST run,
-                // ALWAYS (never ledger-skipped): a re-load re-materializes the
-                // snapshot, self-healing a drifted target and staying resilient to
-                // hidden in-place updates. Only an empty staging → a no-op below.
-                load::plan::LoadMode::Full => load::reconcile::latest_full(keyed),
-                // Incremental/CDC accumulate — APPEND every run not yet loaded.
-                _ => keyed
-                    .into_iter()
-                    .filter(|(_, m)| !loaded.contains(&m.run_id))
-                    .collect(),
-            };
-            if new.is_empty() {
-                return Ok(None);
-            }
-            let manifests: Vec<_> = new.iter().map(|(_, m)| m.clone()).collect();
-            let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
-            let uris = load::reconcile::select_load_uris(store, &plan.gcs_prefix, &new)?;
-            let source_run_ids = new.iter().map(|(_, m)| m.run_id.clone()).collect();
-            Ok(Some(LoadInputs {
-                integrity,
-                uris,
-                source_run_ids,
-            }))
-        }
+    let keyed = load::reconcile::fetch_manifests_keyed(store, &plan.gcs_prefix)?;
+    // The ledger's already-loaded run_ids — empty when stateless (no state DB),
+    // so `select_runs` degrades safely rather than dropping the mode selection.
+    let loaded = match state {
+        Some(s) => s.loaded_source_run_ids(target_fqtn).unwrap_or_default(),
+        None => std::collections::HashSet::new(),
+    };
+    let new = load::reconcile::select_runs(keyed, &loaded, plan.mode);
+    if new.is_empty() {
+        return Ok(None);
     }
+    let manifests: Vec<_> = new.iter().map(|(_, m)| m.clone()).collect();
+    let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
+    let uris = load::reconcile::select_load_uris(store, &plan.gcs_prefix, &new)?;
+    let source_run_ids = new.iter().map(|(_, m)| m.run_id.clone()).collect();
+    Ok(Some(LoadInputs {
+        integrity,
+        uris,
+        source_run_ids,
+    }))
 }
 
 /// The inputs every load shares; the batch/CDC specifics are the three closures

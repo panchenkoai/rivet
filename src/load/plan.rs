@@ -329,7 +329,9 @@ pub fn source_engine(config_path: &str) -> Result<crate::load::cdc::SourceEngine
 /// `cli::dispatch` calls it) with `#[allow(private_interfaces)]` for the
 /// injected internal `GcsStore` — see the twin note on
 /// [`reconcile::fetch_manifests`](crate::load::reconcile::fetch_manifests).
-#[allow(private_interfaces)]
+// dead_code: `prepare_load` now selects per-run via `select_load_uris`; this
+// blanket lister survives for its own test — a deletion candidate for cleanup.
+#[allow(private_interfaces, dead_code)]
 pub fn list_gcs_uris(
     store: &crate::destination::gcs::GcsStore,
     gcs_prefix: &str,

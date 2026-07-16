@@ -69,7 +69,10 @@ impl LoadIntegrity {
 /// injected `GcsStore` is deliberately an internal (`pub(crate)`) type — the
 /// `destination` module stays crate-private. Same rationale as the `preflight`
 /// module note in `lib.rs`.
-#[allow(private_interfaces)]
+// dead_code: `prepare_load` now goes through `fetch_manifests_keyed`; this
+// key-dropping wrapper survives for its own manifest-parse/error tests — a
+// deletion candidate for the ponytail cleanup.
+#[allow(private_interfaces, dead_code)]
 pub fn fetch_manifests(store: &GcsStore, gcs_prefix: &str) -> Result<Vec<RunManifest>> {
     Ok(fetch_manifests_keyed(store, gcs_prefix)?
         .into_iter()
@@ -217,6 +220,29 @@ pub fn latest_full(keyed: Vec<(String, RunManifest)>) -> Vec<(String, RunManifes
         .max_by(|a, b| a.1.finished_at.cmp(&b.1.finished_at))
         .into_iter()
         .collect()
+}
+
+/// Which run manifests to load for `mode`, given the ledger's already-`loaded`
+/// run_ids. The single mode→selection decision, pure and testable so the load's
+/// central invariant isn't buried in dispatch I/O:
+/// - `Full` → the single LATEST run ([`latest_full`]) — ledger-INDEPENDENT, so a
+///   re-load re-materializes the snapshot (self-heal) and, crucially, the
+///   STATELESS path (empty `loaded`) still picks the latest instead of blanket-
+///   loading every accumulated snapshot (the duplicate-rows bug).
+/// - `Incremental`/`Cdc` → every run not yet in `loaded` (append). Stateless →
+///   `loaded` empty → load all; at-least-once, absorbed by the dedup view.
+pub fn select_runs(
+    keyed: Vec<(String, RunManifest)>,
+    loaded: &std::collections::HashSet<String>,
+    mode: crate::load::plan::LoadMode,
+) -> Vec<(String, RunManifest)> {
+    match mode {
+        crate::load::plan::LoadMode::Full => latest_full(keyed),
+        _ => keyed
+            .into_iter()
+            .filter(|(_, m)| !loaded.contains(&m.run_id))
+            .collect(),
+    }
 }
 
 /// Bucket-relative keys of every run manifest under `base` (recursive).
@@ -653,6 +679,48 @@ mod tests {
         // Empty staging (e.g. cleaned, no fresh extract) → empty selection → the
         // caller returns None and never truncates the target to empty.
         assert!(latest_full(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn select_runs_full_picks_the_latest_even_when_loaded_and_even_when_stateless() {
+        use crate::load::plan::LoadMode;
+        use std::collections::HashSet;
+        let keyed = vec![
+            keyed_at("r1", "2026-01-01T00:00:00Z"),
+            keyed_at("r2", "2026-01-02T00:00:00Z"),
+        ];
+        // Stateful, r2 already loaded → still selects r2 (re-materialize/self-heal).
+        let loaded = HashSet::from(["r2".to_string()]);
+        let sel = select_runs(keyed.clone(), &loaded, LoadMode::Full);
+        assert_eq!(sel.len(), 1);
+        assert_eq!(sel[0].1.run_id, "r2", "Full picks latest, loaded or not");
+        // STATELESS (empty loaded) → the latest, NEVER a blanket load of both
+        // snapshots (the duplicate-rows bug this fix closes).
+        let sel = select_runs(keyed, &HashSet::new(), LoadMode::Full);
+        assert_eq!(sel.len(), 1, "stateless Full is not a blanket load");
+        assert_eq!(sel[0].1.run_id, "r2");
+    }
+
+    #[test]
+    fn select_runs_append_modes_filter_loaded_and_load_all_when_stateless() {
+        use crate::load::plan::LoadMode;
+        use std::collections::HashSet;
+        let keyed = vec![
+            keyed_at("r1", "2026-01-01T00:00:00Z"),
+            keyed_at("r2", "2026-01-02T00:00:00Z"),
+        ];
+        let loaded = HashSet::from(["r1".to_string()]);
+        for mode in [LoadMode::Incremental, LoadMode::Cdc] {
+            let sel = select_runs(keyed.clone(), &loaded, mode);
+            assert_eq!(sel.len(), 1, "{mode:?}: only the unloaded run");
+            assert_eq!(sel[0].1.run_id, "r2");
+            // Stateless → empty loaded → load all (at-least-once, dedup absorbs).
+            assert_eq!(
+                select_runs(keyed.clone(), &HashSet::new(), mode).len(),
+                2,
+                "{mode:?}: stateless loads every run"
+            );
+        }
     }
 
     #[test]
