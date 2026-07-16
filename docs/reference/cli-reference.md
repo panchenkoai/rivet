@@ -17,6 +17,7 @@ This document contains the help content for the `rivet` command-line program.
 * [`rivet state reset-chunks`↴](#rivet-state-reset-chunks)
 * [`rivet state chunks`↴](#rivet-state-chunks)
 * [`rivet state progression`↴](#rivet-state-progression)
+* [`rivet state loads`↴](#rivet-state-loads)
 * [`rivet completions`↴](#rivet-completions)
 * [`rivet init`↴](#rivet-init)
 * [`rivet plan`↴](#rivet-plan)
@@ -168,14 +169,11 @@ The native column schema, target table, partition, and source URIs are all deriv
 
 ###### **Options:**
 
-* `-c`, `--config <CONFIG>` — Path to YAML config file — extraction PLUS a top-level `load:` block (target + cleanup). ONE file drives both the export and the load
+* `-c`, `--config <CONFIG>` — Path to YAML config file — extraction PLUS a top-level `load:` block. ONE file drives both the export and the load: the mode (`full`/`incremental`/`cdc`), `pk:`, `cleanup_source:`, `gc_orphans:` and `allow_source_drift:` all live in the config, not on the CLI
 * `--rivet-bin <RIVET_BIN>` — Path to the `rivet` binary used for the type-report subprocess
 
   Default value: `rivet`
 * `--run-id <RUN_ID>` — Correlation id stamped on every warehouse job/query of this load run (BigQuery `rivet_run` label / Snowflake `QUERY_TAG`), so cost slices per run as well as per table. Defaults to a generated id
-* `--allow-source-drift` — Load even when a run manifest's source count disagrees with what it extracted (source→file drift): print a warning instead of blocking. The file→warehouse count gate and manifest gates still apply
-* `--cdc` — Load a CDC change log instead of a batch snapshot: append the change Parquet into `<table>__changes` and (re)build the current-state dedup view `<table>` over it. Requires `--pk`. The source engine (for the `__pos` parse) is read from the config
-* `--pk <PK>` — The change log's primary key column(s) — the dedup view's partition key. Required with `--cdc`. Comma-separated for a composite key, e.g. `--pk tenant,id`
 
 
 
@@ -193,6 +191,7 @@ Manage export state
 * `reset-chunks` — Clear persisted chunk checkpoint rows (`chunk_run` / `chunk_task`)
 * `chunks` — Show chunk checkpoint status for an export
 * `progression` — Show committed / verified export boundaries (the last fully-exported cursor position)
+* `loads` — Show the load ledger (`rivet load` runs recorded in the state DB)
 
 
 
@@ -281,6 +280,22 @@ Show committed / verified export boundaries (the last fully-exported cursor posi
 
 * `-c`, `--config <CONFIG>`
 * `-e`, `--export <EXPORT>` — Show progression for a specific export
+
+
+
+## `rivet state loads`
+
+Show the load ledger (`rivet load` runs recorded in the state DB)
+
+**Usage:** `rivet state loads [OPTIONS] --config <CONFIG>`
+
+###### **Options:**
+
+* `-c`, `--config <CONFIG>`
+* `-t`, `--target <TARGET>` — Show only loads into this fully-qualified target (`proj.ds.table`)
+* `-l`, `--last <LAST>` — Number of recent loads to show
+
+  Default value: `50`
 
 
 
