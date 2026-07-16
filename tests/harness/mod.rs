@@ -591,6 +591,18 @@ impl Verification {
         let _ = std::fs::remove_file(
             std::env::temp_dir().join(format!("ckpt-{}", prefix.replace('/', "_"))),
         );
+        // Postgres anchors CDC by CREATING the replication slot, so a slot left
+        // by a prior run means `initial: snapshot` gets no fresh anchor and
+        // resumes from a stale position instead of snapshotting. Drop it — the
+        // slot IS the PG equivalent of the MySQL checkpoint file removed above.
+        // (MySQL keys on server_id, Mongo on a resume token — no server-side
+        // anchor to clear.)
+        if self.engine == Engine::Postgres {
+            let _ = self.source_raw(
+                "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots \
+                 WHERE slot_name = 'rivet_matrix_soak'",
+            );
+        }
 
         let cfg = work.write("extract.yaml", &self.extraction_yaml(&env, &prefix)?);
         // Anchor → full snapshot of the N preexisting rows → drain (initial: snapshot).
