@@ -207,3 +207,54 @@ fn cdc_backfill_snapshot_mysql() {
         .initial_snapshot();
     assert_all_pass(v.run_cdc_backfill().expect("cdc backfill"));
 }
+
+// Postgres parity: the slot-anchor CDC path (the config carries `slot:` from the
+// PG lane, not `server_id:`) backfills the same way — anchor = slot creation.
+#[test]
+#[ignore = "live: needs devbox postgres-cdc stack + BigQuery creds"]
+fn cdc_backfill_snapshot_pg() {
+    let v = Verification::new(Engine::Postgres, Mode::Cdc, Fixture::smoke("cdc_backfill"))
+        .initial_snapshot();
+    assert_all_pass(v.run_cdc_backfill().expect("cdc backfill"));
+}
+
+// Mongo parity: no SQL client — seed/churn go through `mongosh`, `_id` is the
+// dedup PK, and `initial: snapshot` covers the pre-existing documents.
+#[test]
+#[ignore = "live: needs the mongo replica-set devbox (rivet-mongo-rs-1) + BigQuery"]
+fn cdc_backfill_snapshot_mongo() {
+    let v = Verification::new(Engine::Mongo, Mode::Cdc, Fixture::smoke("cdc_backfill"))
+        .initial_snapshot();
+    assert_all_pass(v.run_cdc_backfill().expect("cdc backfill"));
+}
+
+// Snowflake parity for the backfill: the dedup view uses PARSE_JSON(__pos) and
+// the `COALESCE(__op='delete',FALSE)` guard must keep the backfill live there too.
+#[test]
+#[ignore = "live: needs devbox mysql-cdc stack + Snowflake (RIVET_SF_* + snow CLI)"]
+fn cdc_backfill_snapshot_mysql_snowflake() {
+    let v = Verification::new(Engine::Mysql, Mode::Cdc, Fixture::smoke("cdc_backfill"))
+        .initial_snapshot()
+        .warehouse(Warehouse::Snowflake);
+    assert_all_pass(v.run_cdc_backfill().expect("cdc backfill"));
+}
+
+// MSSQL backfill: BLOCKED — the SQL Server CDC lane is not wired in the harness
+// (`Lane::of` gives it an empty `client: &[]` and no seed/anchor path), so
+// `run_cdc_backfill` bails by design. This cell documents the gap so the missing
+// engine is VISIBLE in the matrix, and pins that the bail is a clear MSSQL error
+// rather than a silent skip; unignore once the MSSQL CDC lane is built out.
+#[test]
+#[ignore = "blocked: MSSQL CDC lane not wired in the harness (empty Lane client)"]
+fn cdc_backfill_snapshot_mssql() {
+    let v = Verification::new(Engine::Mssql, Mode::Cdc, Fixture::smoke("cdc_backfill"))
+        .initial_snapshot();
+    let err = v
+        .run_cdc_backfill()
+        .expect_err("MSSQL backfill must bail, not run")
+        .to_string();
+    assert!(
+        err.contains("MSSQL"),
+        "expected a clear MSSQL-not-wired bail: {err}"
+    );
+}

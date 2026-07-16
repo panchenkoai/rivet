@@ -566,16 +566,22 @@ impl Verification {
         if self.mode != Mode::Cdc || !self.initial_snapshot {
             bail!("run_cdc_backfill needs Mode::Cdc + .initial_snapshot()");
         }
-        if !matches!(self.engine, Engine::Postgres | Engine::Mysql) {
-            bail!("run_cdc_backfill is a Postgres/MySQL cell (SQL source with a seed client)");
-        }
+        // The dedup PK: SQL sources key on `id`, Mongo on `_id`. MSSQL's CDC lane
+        // is not wired in the harness (empty `Lane` client), so it has no cell.
+        let pk = match self.engine {
+            Engine::Postgres | Engine::Mysql => "id",
+            Engine::Mongo => "_id",
+            Engine::Mssql => {
+                bail!("run_cdc_backfill: MSSQL CDC is not wired in the harness (empty Lane client)")
+            }
+        };
         let env = HarnessEnv::load()?;
         let work = TempWork::new("rivet-cdc-backfill")?;
         let t = self.fixture.table.clone();
         let n = self.fixture.rows as i64;
 
         // The preexisting data that predates CDC being turned on.
-        self.seed_backfill_table(&t, n)?;
+        self.seed_backfill(&t, n)?;
 
         let prefix = format!("matrix/{}/{}/", self.engine.source_type(), t);
         let full_prefix = format!("gs://{}/{}", env.gcs_bucket, prefix);
@@ -593,14 +599,7 @@ impl Verification {
             "rivet run (snapshot)",
         )?;
         // Live changes AFTER the backfill: one insert, one update, one delete.
-        self.source_raw(&format!(
-            "INSERT INTO {t} (id, v) VALUES ({}, 'brand-new')",
-            n + 1
-        ))?;
-        self.source_raw(&format!(
-            "UPDATE {t} SET v = 'changed-after-snapshot' WHERE id = 1"
-        ))?;
-        self.source_raw(&format!("DELETE FROM {t} WHERE id = 2"))?;
+        self.churn_backfill(&t, n)?;
         run(
             Command::new("rivet").args(["run", "-c"]).arg(&cfg),
             "rivet run (drain)",
@@ -609,7 +608,7 @@ impl Verification {
             Command::new("rivet")
                 .args(["load", "-c"])
                 .arg(&cfg)
-                .args(["--cdc", "--pk", "id"]),
+                .args(["--cdc", "--pk", pk]),
             "rivet load --cdc",
         )?;
 
@@ -621,7 +620,7 @@ impl Verification {
         // A middle backfill row the stream never touched — the class the bug hid.
         let mid = n / 2;
         let mid_live = self.wh_scalar(&format!(
-            "SELECT COUNT(*) FROM {vt} WHERE id = {mid} AND NOT __is_deleted"
+            "SELECT COUNT(*) FROM {vt} WHERE {pk} = {mid} AND NOT __is_deleted"
         ))?;
 
         Ok(vec![
@@ -641,7 +640,53 @@ impl Verification {
         ])
     }
 
-    /// Drop + recreate the cell's table and seed `n` rows (`id` 1..=n) on the
+    /// Seed `n` preexisting rows/docs (PK `1..=n`) — the data `initial: snapshot`
+    /// backfills. SQL sources go through the `id` seed client; Mongo has no SQL
+    /// client so it seeds `_id` documents via `mongosh`.
+    fn seed_backfill(&self, table: &str, n: i64) -> Result<()> {
+        match self.engine {
+            Engine::Postgres | Engine::Mysql => self.seed_backfill_table(table, n),
+            Engine::Mongo => self.mongosh(
+                "rivet_bench",
+                &format!(
+                    "db.{table}.drop(); let d = []; \
+                     for (let i = 1; i <= {n}; i++) d.push({{_id: i, v: 'orig-' + i}}); \
+                     db.{table}.insertMany(d);"
+                ),
+            ),
+            Engine::Mssql => bail!("seed_backfill: MSSQL not wired in the harness"),
+        }
+    }
+
+    /// The post-backfill churn — insert PK `n+1`, update PK `1`, delete PK `2` —
+    /// the live changes the drain captures on top of the snapshot.
+    fn churn_backfill(&self, table: &str, n: i64) -> Result<()> {
+        match self.engine {
+            Engine::Postgres | Engine::Mysql => {
+                self.source_raw(&format!(
+                    "INSERT INTO {table} (id, v) VALUES ({}, 'brand-new')",
+                    n + 1
+                ))?;
+                self.source_raw(&format!(
+                    "UPDATE {table} SET v = 'changed-after-snapshot' WHERE id = 1"
+                ))?;
+                self.source_raw(&format!("DELETE FROM {table} WHERE id = 2"))?;
+                Ok(())
+            }
+            Engine::Mongo => self.mongosh(
+                "rivet_bench",
+                &format!(
+                    "db.{table}.insertOne({{_id: {}, v: 'brand-new'}}); \
+                     db.{table}.updateOne({{_id: 1}}, {{$set: {{v: 'changed-after-snapshot'}}}}); \
+                     db.{table}.deleteOne({{_id: 2}});",
+                    n + 1
+                ),
+            ),
+            Engine::Mssql => bail!("churn_backfill: MSSQL not wired in the harness"),
+        }
+    }
+
+    /// Drop + recreate the cell's table and seed `n` rows (`id` 1..=n) on a SQL
     /// source — the preexisting data `cdc.initial: snapshot` backfills.
     fn seed_backfill_table(&self, table: &str, n: i64) -> Result<()> {
         let sql = match self.engine {
