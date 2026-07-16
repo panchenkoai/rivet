@@ -948,6 +948,59 @@ mod tests {
     }
 
     #[test]
+    fn upgrading_from_v12_adds_the_ledger_and_snapshot_tables_and_keeps_data() {
+        // Stage a database at EXACTLY v12 — a user on the release before the load
+        // ledger (v13) and cdc_snapshot (v14). Apply only migrations up to v12,
+        // exactly as the older rivet that wrote their `.rivet_state.db` did.
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_schema_version_table(&conn);
+        for &(ver, sql) in MIGRATIONS {
+            if ver <= 12 {
+                conn.execute_batch(&format!(
+                    "BEGIN;\n{sql}\nINSERT INTO schema_version (version) VALUES ({ver});\nCOMMIT;"
+                ))
+                .unwrap();
+            }
+        }
+        assert_eq!(get_current_version(&conn), 12, "staged at v12");
+        // Pre-existing state that MUST survive the upgrade.
+        conn.execute(
+            "INSERT INTO export_state (export_name, last_cursor_value, last_run_at) \
+             VALUES ('orders', '42', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        // Upgrade the existing DB to the current schema (the v13 + v14 path).
+        migrate(&conn).unwrap();
+        assert_eq!(get_current_version(&conn), SCHEMA_VERSION);
+
+        // The v13/v14 tables now exist on the upgraded-in-place DB.
+        for t in ["load_run", "loaded_source_run", "cdc_snapshot"] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name = ?1",
+                    [t],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                exists,
+                "{t} missing after the v12→v{SCHEMA_VERSION} upgrade"
+            );
+        }
+        // The v12 data survived the added migrations (not dropped/recreated).
+        let cursor: String = conn
+            .query_row(
+                "SELECT last_cursor_value FROM export_state WHERE export_name = 'orders'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor, "42", "pre-upgrade data must survive");
+    }
+
+    #[test]
     fn v8_renames_file_manifest_to_file_log() {
         let s = StateStore::open_in_memory().unwrap();
         let conn = match &s.conn {
